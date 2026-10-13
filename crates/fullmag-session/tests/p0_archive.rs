@@ -158,6 +158,7 @@ fn archive_roundtrip_preserves_independent_coordinator_attempts() {
         heartbeat_at: now,
         heartbeat_sequence: 0,
         released_at: None,
+        host_launch_binding: None,
     };
     let mut catalog = FmsRunCatalog {
         schema_version: FMS_RUN_CATALOG_SCHEMA.into(),
@@ -874,6 +875,7 @@ fn archive_roundtrip_preserves_task_scoped_accepted_preparation_receipt() {
         heartbeat_at: now,
         heartbeat_sequence: 0,
         released_at: None,
+        host_launch_binding: None,
     };
     assert_eq!(
         store.commit_task_admission(&admission_lease).unwrap(),

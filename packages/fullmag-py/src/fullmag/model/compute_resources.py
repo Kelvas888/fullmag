@@ -7,7 +7,7 @@ runtime can satisfy the request or that a scheduler has allocated resources.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Mapping
 
 _U32_MAX = (1 << 32) - 1
 _U64_MAX = (1 << 64) - 1
@@ -59,6 +59,27 @@ def _identity(value: object, field_name: str) -> str:
             "(max 256 UTF-8 bytes)"
         )
     return value
+
+
+def _wire_object(
+    value: object,
+    context: str,
+    *,
+    allowed: frozenset[str],
+    required: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{context} must be an object")
+    result = dict(value)
+    unknown = set(result) - allowed
+    if unknown:
+        names = ", ".join(sorted(str(name) for name in unknown))
+        raise ValueError(f"{context} has unsupported fields: {names}")
+    missing = required - set(result)
+    if missing:
+        names = ", ".join(sorted(missing))
+        raise ValueError(f"{context} is missing required fields: {names}")
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,3 +368,155 @@ class ComputeResources:
         if self.gpu is not None:
             result["gpu"] = self.gpu.to_ir()
         return result
+
+    @classmethod
+    def from_ir(cls, value: object) -> ComputeResources:
+        """Decode the canonical v1 request while preserving explicit intent."""
+        request = _wire_object(
+            value,
+            "compute_resources",
+            allowed=frozenset(
+                {
+                    "schema_version",
+                    "target",
+                    "cpu",
+                    "gpu",
+                    "ram",
+                    "scratch",
+                    "parallelism",
+                    "placement",
+                }
+            ),
+            required=frozenset(
+                {
+                    "schema_version",
+                    "target",
+                    "cpu",
+                    "ram",
+                    "scratch",
+                    "parallelism",
+                    "placement",
+                }
+            ),
+        )
+        schema_version = request["schema_version"]
+        if schema_version != _SCHEMA_VERSION:
+            raise ValueError(f"unsupported compute resources schema {schema_version!r}")
+
+        target = _wire_object(
+            request["target"],
+            "compute_resources.target",
+            allowed=frozenset({"kind", "id"}),
+            required=frozenset({"kind"}),
+        )
+        cpu = _wire_object(
+            request["cpu"],
+            "compute_resources.cpu",
+            allowed=frozenset(
+                {
+                    "threads",
+                    "core_policy",
+                    "affinity",
+                    "numa_node",
+                    "native_threads",
+                    "blas_threads",
+                }
+            ),
+            required=frozenset(
+                {"threads", "affinity", "native_threads", "blas_threads"}
+            ),
+        )
+        ram = _wire_object(
+            request["ram"],
+            "compute_resources.ram",
+            allowed=frozenset({"reservation_bytes"}),
+        )
+        scratch = _wire_object(
+            request["scratch"],
+            "compute_resources.scratch",
+            allowed=frozenset({"reservation_bytes"}),
+        )
+        parallelism = _wire_object(
+            request["parallelism"],
+            "compute_resources.parallelism",
+            allowed=frozenset(
+                {"kind", "ranks", "threads_per_rank", "ranks_per_node", "gpus_per_rank"}
+            ),
+            required=frozenset({"kind"}),
+        )
+        parallelism_kind = _choice(
+            parallelism["kind"],
+            "compute_resources.parallelism.kind",
+            ("single_process", "distributed"),
+        )
+        if parallelism_kind == "single_process":
+            if set(parallelism) != {"kind"}:
+                raise ValueError(
+                    "compute_resources.parallelism single_process must not include distributed fields"
+                )
+            parsed_parallelism = None
+        else:
+            required_parallel_fields = frozenset(
+                {"kind", "ranks", "threads_per_rank", "ranks_per_node", "gpus_per_rank"}
+            )
+            missing = required_parallel_fields - set(parallelism)
+            if missing:
+                names = ", ".join(sorted(missing))
+                raise ValueError(
+                    f"compute_resources.parallelism is missing required fields: {names}"
+                )
+            parsed_parallelism = DistributedResources(
+                ranks=parallelism["ranks"],  # type: ignore[arg-type]
+                threads_per_rank=parallelism["threads_per_rank"],  # type: ignore[arg-type]
+                ranks_per_node=parallelism["ranks_per_node"],  # type: ignore[arg-type]
+                gpus_per_rank=parallelism["gpus_per_rank"],  # type: ignore[arg-type]
+            )
+
+        gpu_value = request.get("gpu")
+        gpu = None
+        if gpu_value is not None:
+            gpu_fields = _wire_object(
+                gpu_value,
+                "compute_resources.gpu",
+                allowed=frozenset(
+                    {
+                        "selector",
+                        "device_uuids",
+                        "devices_per_task",
+                        "vram_per_device_bytes",
+                    }
+                ),
+                required=frozenset(
+                    {"selector", "device_uuids", "devices_per_task"}
+                ),
+            )
+            gpu = GpuResources(
+                selector=gpu_fields["selector"],  # type: ignore[arg-type]
+                device_uuids=gpu_fields["device_uuids"],  # type: ignore[arg-type]
+                devices_per_task=gpu_fields["devices_per_task"],  # type: ignore[arg-type]
+                vram_per_device_bytes=gpu_fields.get("vram_per_device_bytes"),  # type: ignore[arg-type]
+            )
+
+        return cls(
+            target=ComputeTarget(
+                kind=target["kind"],  # type: ignore[arg-type]
+                id=target.get("id"),  # type: ignore[arg-type]
+            ),
+            cpu=CpuResources(
+                threads=cpu["threads"],  # type: ignore[arg-type]
+                core_policy=cpu.get("core_policy"),  # type: ignore[arg-type]
+                affinity=cpu["affinity"],  # type: ignore[arg-type]
+                numa_node=cpu.get("numa_node"),  # type: ignore[arg-type]
+                native_threads=cpu["native_threads"],  # type: ignore[arg-type]
+                blas_threads=cpu["blas_threads"],  # type: ignore[arg-type]
+            ),
+            gpu=gpu,
+            ram=MemoryReservation(
+                reservation_bytes=ram.get("reservation_bytes")  # type: ignore[arg-type]
+            ),
+            scratch=MemoryReservation(
+                reservation_bytes=scratch.get("reservation_bytes")  # type: ignore[arg-type]
+            ),
+            parallelism=parsed_parallelism,
+            placement=request["placement"],  # type: ignore[arg-type]
+        )

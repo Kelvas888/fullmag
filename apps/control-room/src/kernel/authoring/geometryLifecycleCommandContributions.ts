@@ -66,6 +66,27 @@ import {
   resolveActiveLaneOperation,
 } from "../resources/useActiveLaneCapabilities";
 
+function deleteObjectBlockedReason(context: CommandContext, ignoreReservation = false): string | null {
+  const controller = context.objectEditSession;
+  const scope = context.sessionScopeKey ?? null;
+  if (controller) {
+    if (!scope) return "Wait for the current project session before deleting.";
+    if (!ignoreReservation && controller.hasPendingWrite(scope)) {
+      return "Wait for the pending scene change before deleting.";
+    }
+    if (controller.hasActiveGesture(scope)) return "Finish the active move before deleting.";
+    const draft = controller.getSnapshot();
+    if (draft.identity?.sessionScopeKey === scope && draft.dirty) {
+      return "Apply or revert geometry changes before deleting.";
+    }
+  }
+  const forms = context.pendingForms?.getTransitionSnapshot();
+  if (forms && (forms.applyingOwnerCount > 0 || forms.dirtyOwnerCount > 0 || forms.guarded || forms.preparing)) {
+    return "Apply or revert Inspector changes before deleting.";
+  }
+  return null;
+}
+
 type JsonRecord = Record<string, unknown>;
 
 function asRecord(value: unknown): JsonRecord | null {
@@ -671,8 +692,6 @@ function meshCommandKindMatches(actual: string, expected: ObservableMeshCommandK
   return actual === expected || (expected === "mesh_build" && actual === "remesh");
 }
 
-const MAX_RECONCILE_MESH_COMMANDS = 8;
-
 async function reconcileMeshSubmission(
   api: MeshCommandApi,
   operation: MeshBuildOperation,
@@ -682,8 +701,7 @@ async function reconcileMeshSubmission(
   const candidates = queue.commands.filter((entry) =>
     meshCommandKindMatches(entry.kind, operation.commandKind),
   )
-    .sort((left, right) => right.seq - left.seq)
-    .slice(0, MAX_RECONCILE_MESH_COMMANDS);
+    .sort((left, right) => right.seq - left.seq);
   for (const entry of candidates) {
     const detail = requestOptions
       ? await api.detail(entry.command_id, requestOptions)
@@ -1612,8 +1630,8 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
     category: "Geometry",
     group: "geometry",
     scope: "selection",
-    isEnabled: (context) => Boolean(selectedObjectId(context)),
-    disabledReason: selectedObjectDisabledReason,
+    isEnabled: (context) => Boolean(selectedObjectId(context)) && !deleteObjectBlockedReason(context),
+    disabledReason: (context) => selectedObjectDisabledReason(context) ?? deleteObjectBlockedReason(context),
     run: async (context) => {
       const obsolete = obsoleteSessionResult(context);
       if (obsolete) return obsolete;
@@ -1625,33 +1643,46 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
         return { message: "Control-room API is unavailable.", status: "failed" };
       }
 
-      const preparation = await prepareAuthoringMutation(context);
-      assertCurrentSessionScope(context);
-      const response = await deleteObjectTransaction(
-        context.api,
-        objectId,
-        {},
-        sessionRequestOptions(context),
-      );
-      const obsoleteAfterWrite = obsoleteSessionResult(context);
-      if (obsoleteAfterWrite) return obsoleteAfterWrite;
-      let selectionClearedByMutation = false;
-      if (context.selection?.get().objectId === objectId) {
-        context.selection.clear("geometry-authoring");
-        selectionClearedByMutation = true;
+      const blocked = deleteObjectBlockedReason(context);
+      if (blocked) return { message: blocked, status: "failed" };
+      const controller = context.objectEditSession;
+      const lease = controller?.beginSceneMutation(context.sessionScopeKey ?? null, objectId) ?? null;
+      if (controller && lease === null) {
+        return { message: "Wait for the pending scene change before deleting.", status: "failed" };
       }
-      await recordAuthoringMutationHistory(
-        context,
-        `Delete ${objectId}`,
-        preparation,
-        response.committed_scene,
-        selectionClearedByMutation
-          ? captureAuthoringHistoryWorkspaceState(context)
-          : preparation.beforeWorkspaceState ?? null,
-      );
-      assertCurrentSessionScope(context);
-      invalidateSceneAuthoringResources(context, response.scene_revision);
-      return { status: "completed" };
+      try {
+        const preparation = await prepareAuthoringMutation(context);
+        assertCurrentSessionScope(context);
+        const blockedBeforeWrite = deleteObjectBlockedReason(context, true);
+        if (blockedBeforeWrite) return { message: blockedBeforeWrite, status: "failed" };
+        const response = await deleteObjectTransaction(
+          context.api,
+          objectId,
+          {},
+          sessionRequestOptions(context),
+        );
+        const obsoleteAfterWrite = obsoleteSessionResult(context);
+        if (obsoleteAfterWrite) return obsoleteAfterWrite;
+        let selectionClearedByMutation = false;
+        if (context.selection?.get().objectId === objectId) {
+          context.selection.clear("geometry-authoring");
+          selectionClearedByMutation = true;
+        }
+        await recordAuthoringMutationHistory(
+          context,
+          `Delete ${objectId}`,
+          preparation,
+          response.committed_scene,
+          selectionClearedByMutation
+            ? captureAuthoringHistoryWorkspaceState(context)
+            : preparation.beforeWorkspaceState ?? null,
+        );
+        assertCurrentSessionScope(context);
+        invalidateSceneAuthoringResources(context, response.scene_revision);
+        return { status: "completed" };
+      } finally {
+        if (lease !== null) controller?.endSceneMutation(lease);
+      }
     },
   },
   {

@@ -2,6 +2,14 @@ import { existsSync, readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+import { EventBus } from "@/kernel/events/EventBus";
+import type { KernelEventMap } from "@/kernel/events/eventTypes";
+import { SelectionController } from "@/kernel/selection/SelectionController";
+import type { KernelApi } from "@/kernel/types";
+import { resolveVisualizationTargetFromSelection } from "@/kernel/visualization/ObjectVisualizationController";
+import { selectExplorerNode } from "../explorer/explorerSelection";
+import type { ExplorerNode } from "../explorer/explorerTypes";
+
 import type {
   FrequencyDomainManifestResource,
   FrequencyDomainSweepProgressResource,
@@ -673,5 +681,35 @@ describe("inspector route coverage", () => {
     ]) {
       expect(existsSync(new URL(legacyFile, import.meta.url))).toBe(false);
     }
+  });
+});
+
+
+describe("semantic Inspector routing through actual Explorer selection", () => {
+  it("keeps the unassigned overview and part detail distinct without changing the carrier ref", () => {
+    const selection = new SelectionController(new EventBus<KernelEventMap>());
+    const kernel = { selection } as KernelApi;
+    const parent: ExplorerNode = {
+      id: "model:mesh:unassigned", kind: "mesh.unassigned",
+      label: "Unassigned mesh parts", parentId: "model:mesh",
+    };
+    selectExplorerNode(kernel, parent, "explorer");
+    expect(resolveInspectorPanel(selection.get())?.id).toBe("mesh-unassigned");
+    expect(selection.get().ref?.type).toBe("mesh-part");
+
+    const part: ExplorerNode = {
+      id: "model:mesh:unassigned:part%3Aorphan", kind: "mesh.unassigned.part",
+      label: "Recovered volume", parentId: parent.id,
+      meshPartId: "part:orphan", visualizationTargetId: "part:part:orphan",
+    };
+    selectExplorerNode(kernel, part, "explorer");
+    expect(resolveInspectorPanel(selection.get())?.id).toBe("mesh-unassigned-part");
+    expect(selection.get().ref).toMatchObject({
+      type: "mesh-part", kind: "mesh-part", carrierPartId: "part:orphan",
+      visualizationTargetId: "part:part:orphan",
+    });
+    expect(resolveVisualizationTargetFromSelection(selection.get())).toEqual({
+      id: "part:part:orphan", kind: "part", label: "Recovered volume",
+    });
   });
 });

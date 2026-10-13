@@ -28,6 +28,7 @@ import {
 import { OrthographicCamera, PerspectiveCamera } from "@react-three/drei";
 import { useThree } from "@react-three/fiber";
 import {
+  useCallback,
   useEffect,
   useEffectEvent,
   useLayoutEffect,
@@ -264,6 +265,8 @@ interface Viewport3DSceneProps {
     translation: Translation3,
     baseRevision: number,
   ) => Promise<boolean | void> | boolean | void;
+  onBeginGesture?: () => boolean;
+  onMoveGestureActiveChange?: (active: boolean) => void;
   moveToolObjectId: string | null;
   moveDraftResetRevision: number;
   orbitDebugAngles: Viewport3DOrbitDebugAngles;
@@ -1144,6 +1147,7 @@ function Viewport3DModelLayerStack({
   onInspectClear,
   onInspectSample,
   onMoveCommit,
+  onBeginGesture,
   moveToolObjectId,
   moveDraftResetRevision,
   onMoveGestureActiveChange,
@@ -1207,6 +1211,8 @@ function Viewport3DModelLayerStack({
   | "onInspectClear"
   | "onInspectSample"
   | "onMoveCommit"
+  | "onBeginGesture"
+  | "onMoveGestureActiveChange"
   | "moveToolObjectId"
   | "moveDraftResetRevision"
   | "onSelectDomain"
@@ -1236,7 +1242,6 @@ function Viewport3DModelLayerStack({
   savedViewportActive: boolean;
   sceneLayersEnabled: boolean;
   stageVisibility: Viewport3DModelLayerStageVisibility;
-  onMoveGestureActiveChange: (active: boolean) => void;
 }) {
   const hasMeshBackedRegionOverlays = meshRegionOverlays.length > 0;
   const overlayLayersEnabled = viewport3DOverlayLayersEnabledFromBrowserConfig();
@@ -1463,6 +1468,7 @@ function Viewport3DModelLayerStack({
         moveDraftResetRevision={moveDraftResetRevision}
         moveToolObjectId={moveToolObjectId}
         onCommit={onMoveCommit}
+        onBeginGesture={onBeginGesture}
         onGestureActiveChange={onMoveGestureActiveChange}
         primitiveModel={primitiveModel}
         selectedObjectId={selectedObjectId}
@@ -1820,6 +1826,8 @@ export function Viewport3DScene({
   onInspectClear,
   onInspectSample,
   onMoveCommit,
+  onBeginGesture,
+  onMoveGestureActiveChange,
   moveToolObjectId,
   moveDraftResetRevision,
   scaleLabelsVisible,
@@ -1838,6 +1846,10 @@ export function Viewport3DScene({
   } | null>(null);
   const cameraGestureRef = useMemo(() => createViewport3DCameraGestureRef(), []);
   const [moveGestureActive, setMoveGestureActive] = useState(false);
+  const handleMoveGestureActiveChange = useCallback((active: boolean) => {
+    onMoveGestureActiveChange?.(active);
+    setMoveGestureActive(active);
+  }, [onMoveGestureActiveChange]);
   const inspectClearArbitrator = useMemo(
     () =>
       createFdmInspectClearArbitrator({
@@ -2095,9 +2107,10 @@ export function Viewport3DScene({
         onInspectClear={inspectClearArbitrator.clear}
         onInspectSample={handleArbitratedInspectSample}
         onMoveCommit={onMoveCommit}
+        onBeginGesture={onBeginGesture}
         moveToolObjectId={moveToolObjectId}
         moveDraftResetRevision={moveDraftResetRevision}
-        onMoveGestureActiveChange={setMoveGestureActive}
+        onMoveGestureActiveChange={handleMoveGestureActiveChange}
         onSelectDomain={onSelectDomain}
         onSelectFdmTarget={onSelectFdmTarget}
         onSelectFdmUniverseOutsideSupport={onSelectFdmUniverseOutsideSupport}

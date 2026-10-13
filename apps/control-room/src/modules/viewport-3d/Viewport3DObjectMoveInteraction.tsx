@@ -7,11 +7,11 @@ import { useObjectMoveTool } from "@/kernel/authoring/ObjectMoveToolController";
 import { useObjectEditSelector } from "@/kernel/authoring/object-edit/useObjectEditSelector";
 import type { ObjectTranslation } from "@/kernel/authoring/objectTranslationMutation";
 import {
-  formatObjectEditNumber,
   geometryDraftTranslationEquals,
   geometryObjectEditSessionTargetKey,
   resolveCommittedGeometryObjectDraft,
 } from "@/kernel/authoring/object-edit/objectEditDraftModel";
+import { updateQuantityFieldSI } from "@/kernel/authoring/object-edit/quantityDraftFields";
 import type { GeometryObjectDraft } from "@/kernel/authoring/object-edit/objectEditTypes";
 import { useSceneResource } from "@/kernel/resources/geometryLifecycleResources";
 import {
@@ -84,6 +84,7 @@ export function useViewport3DObjectMoveInteraction({
   const sessionScopeKey = sessionRequestScopeKey(sessionIdentity);
   const activationIdentityRef = useRef<ActiveMoveIdentity | null>(null);
   const selectionEpochRef = useRef(0);
+  const gestureTokenRef = useRef<number | null>(null);
   const selectionSnapshotRef = useRef<ReturnType<typeof kernel.selection.get> | null>(null);
   const [, forceSelectionRender] = useState(0);
   const [moveStatus, setMoveStatus] = useState<{
@@ -182,6 +183,54 @@ export function useViewport3DObjectMoveInteraction({
     [kernel.objectMoveTool],
   );
 
+  const onBeginGesture = useCallback(() => {
+    const current = currentContextRef.current;
+    const currentScene = sceneSnapshotRef.current;
+    const activeIdentity = activationIdentityRef.current;
+    const activeTool = kernel.objectMoveTool.getSnapshot();
+    const selection = kernel.selection.get();
+    if (
+      gestureTokenRef.current !== null ||
+      !current?.sessionIdentity ||
+      !current.sessionIdentityKey ||
+      !current.sessionScopeKey ||
+      !current.selectedObjectId ||
+      current.sessionId !== current.sessionIdentity.sessionId ||
+      !current.moveTargetEligible ||
+      currentScene.status !== "ready" ||
+      !activeTool ||
+      activeTool.objectId !== current.selectedObjectId ||
+      !activeIdentity ||
+      activeIdentity.activationId !== activeTool.activationId ||
+      activeIdentity.sessionIdentityKey !== current.sessionIdentityKey ||
+      activeIdentity.selectionEpoch !== selectionEpochRef.current ||
+      !selectionSnapshotEquals(activeIdentity.selection, selection) ||
+      selection.objectId !== current.selectedObjectId
+    ) return false;
+
+    const canonicalDraft = resolveCommittedGeometryObjectDraft(
+      currentScene.data,
+      current.selectedObjectId,
+    );
+    if (!canonicalDraft || canonicalDraft.baseRevision === null) return false;
+
+    const token = kernel.objectEditSession.beginGesture(
+      current.sessionScopeKey,
+      current.selectedObjectId,
+    );
+    if (token === null) return false;
+    gestureTokenRef.current = token;
+    return true;
+  }, [kernel.objectEditSession, kernel.objectMoveTool, kernel.selection]);
+
+  const onGestureActiveChange = useCallback((active: boolean) => {
+    if (active) return;
+    const token = gestureTokenRef.current;
+    if (token === null) return;
+    gestureTokenRef.current = null;
+    kernel.objectEditSession.endGesture(token);
+  }, [kernel.objectEditSession]);
+
   const isCurrentSessionScope = useCallback((fence: MoveRequestFence) => {
     const current = currentContextRef.current;
     if (
@@ -248,6 +297,8 @@ export function useViewport3DObjectMoveInteraction({
       selection.objectId !== objectId
     ) return true;
 
+    if (kernel.objectEditSession.hasPendingWrite(current.sessionScopeKey)) return true;
+
     const fence: MoveRequestFence = {
       activationId,
       objectId,
@@ -280,6 +331,7 @@ export function useViewport3DObjectMoveInteraction({
 
     try {
       if (!isMoveRequestCurrent(fence)) return true;
+      if (kernel.objectEditSession.hasPendingWrite(fence.sessionScopeKey)) return true;
       const currentScene = sceneSnapshotRef.current;
       if (currentScene.status !== "ready") {
         reportError("The scene is not ready. Refresh it, then move the object again.");
@@ -319,12 +371,10 @@ export function useViewport3DObjectMoveInteraction({
         return true;
       }
 
-      const nextTranslation: GeometryObjectDraft["translation"] = [
-        formatObjectEditNumber(translation[0]),
-        formatObjectEditNumber(translation[1]),
-        formatObjectEditNumber(translation[2]),
-      ];
-      const nextDraft = { ...currentDraft, translation: nextTranslation };
+      const withMoveTranslation = (draft: GeometryObjectDraft) =>
+        ([0, 1, 2] as const).reduce((next, axis) =>
+          updateQuantityFieldSI(next, `translation.${axis}`, translation[axis]), draft);
+      const nextDraft = withMoveTranslation(currentDraft);
       if (geometryDraftTranslationEquals(currentDraft, nextDraft)) {
         setMoveStatus({
           error: null,
@@ -333,12 +383,12 @@ export function useViewport3DObjectMoveInteraction({
         });
         return true;
       }
-      if (!isMoveRequestCurrent(fence)) return true;
+      if (
+        !isMoveRequestCurrent(fence) ||
+        kernel.objectEditSession.hasPendingWrite(fence.sessionScopeKey)
+      ) return true;
 
-      const updated = kernel.objectEditSession.updateDraft(identity, (draft) => ({
-        ...draft,
-        translation: nextTranslation,
-      }));
+      const updated = kernel.objectEditSession.updateDraft(identity, withMoveTranslation);
       if (!updated) {
         reportError("The object draft changed before the move could be staged. Try the move again.");
         return true;
@@ -365,6 +415,8 @@ export function useViewport3DObjectMoveInteraction({
 
   return {
     commitMove,
+    onBeginGesture,
+    onGestureActiveChange,
     moveDraftResetRevision: NO_MOVE_DRAFT_RESET,
     moveError,
     moveToolObjectId: moveTool?.objectId ?? null,
@@ -411,7 +463,12 @@ export function Viewport3DObjectMoveResourceSurface() {
     selectedObjectId,
     sessionId: sessionIdentity?.sessionId ?? null,
   });
+  const onInteractionGestureActiveChange = interaction.onGestureActiveChange;
   const [orbitBlocked, setOrbitBlocked] = useState(false);
+  const handleGestureActiveChange = useCallback((active: boolean) => {
+    onInteractionGestureActiveChange(active);
+    setOrbitBlocked(active);
+  }, [onInteractionGestureActiveChange]);
 
   return (
     <div
@@ -424,7 +481,8 @@ export function Viewport3DObjectMoveResourceSurface() {
         moveDraftResetRevision={interaction.moveDraftResetRevision}
         moveToolObjectId={interaction.moveToolObjectId}
         onCommit={interaction.commitMove}
-        onGestureActiveChange={setOrbitBlocked}
+        onBeginGesture={interaction.onBeginGesture}
+        onGestureActiveChange={handleGestureActiveChange}
         primitiveModel={primitiveModelWithPlacementDraft ?? null}
         selectedObjectId={selectedObjectId}
       />

@@ -36,6 +36,19 @@ const MAX_LEDGER_RECORDS: usize = 4096;
 const MAX_MARKER_BYTES: usize = 4096;
 const MAX_RELEASE_PROOF_BYTES: usize = 64 * 1024;
 
+/// Ordinary contention in a validated host ledger. Corruption and fencing
+/// failures remain errors; schedulers may wait only for this admission outcome.
+#[derive(Debug)]
+pub struct HostResourceCapacityUnavailable(pub String);
+
+impl std::fmt::Display for HostResourceCapacityUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostResourceCapacityUnavailable {}
+
 /// Explicit operator configuration for one shared host ledger.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -54,7 +67,7 @@ pub struct HostResourceLedgerPolicy {
 }
 
 impl HostResourceLedgerPolicy {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.schema_version != HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V1 {
             bail!("unsupported host resource ledger policy schema");
         }
@@ -287,6 +300,58 @@ pub enum HostResourceReservationState {
     Released,
 }
 
+/// A consumed permit means process creation may have happened. Neither a
+/// missing PID nor a missing Started event can put it back into Pending.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostWorkerLaunchGate {
+    Pending,
+    Consumed { token: String },
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostTaskAdmissionReconciliation {
+    Committed,
+    MissingLocalIntent,
+    Superseded,
+    LocalClaimUnavailable,
+    NotTentative,
+}
+
+/// The process that actually consumed the preparation permit. The immutable
+/// local launch retains its original intent publisher when recovery adopts it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostPreparationLaunchOwner {
+    pub schema_version: String,
+    pub launch_id: String,
+    pub launch_sha256: String,
+    pub supervisor_process_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_start_token: Option<String>,
+}
+
+impl HostPreparationLaunchOwner {
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != "host_preparation_launch_owner.v1"
+            || self.supervisor_process_id == 0
+        {
+            bail!("invalid preparation launch owner schema or process ID");
+        }
+        crate::repository_path::validate_store_id(&self.launch_id)?;
+        validate_sha256(&self.launch_sha256, "preparation launch digest")?;
+        if self
+            .supervisor_start_token
+            .as_deref()
+            .is_none_or(|token| token.trim().is_empty() || token.len() > 256)
+        {
+            bail!("invalid preparation launch owner start token");
+        }
+        Ok(())
+    }
+}
+
 /// One held resource allocation. A released record requires a proof-backed
 /// transition; ledger v1 exposes no release operation and rejects that state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -310,6 +375,13 @@ pub struct HostResourceReservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_proof_sha256: Option<String>,
     pub state: HostResourceReservationState,
+    /// Missing on pre-gate records: migration is explicit, never Pending by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_launch_gate: Option<HostWorkerLaunchGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_launch_gate: Option<HostWorkerLaunchGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_launch_owner: Option<HostPreparationLaunchOwner>,
 }
 
 impl HostResourceReservation {
@@ -327,6 +399,15 @@ impl HostResourceReservation {
             cpu_ids: request.cpu_ids.clone(),
             release_proof_sha256: None,
             state: HostResourceReservationState::Tentative,
+            worker_launch_gate: match request.identity.owner {
+                HostReservationOwner::Solver { .. } => Some(HostWorkerLaunchGate::Pending),
+                HostReservationOwner::Preparation { .. } => None,
+            },
+            preparation_launch_owner: None,
+            preparation_launch_gate: match request.identity.owner {
+                HostReservationOwner::Preparation { .. } => Some(HostWorkerLaunchGate::Pending),
+                HostReservationOwner::Solver { .. } => None,
+            },
         })
     }
 
@@ -344,6 +425,40 @@ impl HostResourceReservation {
     }
 
     fn validate(&self, policy: &HostResourceLedgerPolicy) -> Result<()> {
+        match (&self.identity.owner, &self.worker_launch_gate) {
+            (HostReservationOwner::Preparation { .. }, Some(_)) => {
+                bail!("preparation reservation cannot carry a solver launch gate")
+            }
+            (_, Some(HostWorkerLaunchGate::Consumed { token })) => {
+                crate::repository_path::validate_store_id(token)?;
+                if uuid::Uuid::parse_str(token)?.to_string() != *token {
+                    bail!("worker launch token must be a full canonical UUID");
+                }
+            }
+            _ => {}
+        }
+        if matches!(self.identity.owner, HostReservationOwner::Solver { .. })
+            && self.preparation_launch_gate.is_some()
+        {
+            bail!("solver reservation cannot carry a preparation launch gate");
+        }
+        if let Some(HostWorkerLaunchGate::Consumed { token }) = &self.preparation_launch_gate {
+            if uuid::Uuid::parse_str(token)?.to_string() != *token {
+                bail!("preparation launch token must be a full canonical UUID");
+            }
+        }
+        if let Some(owner) = &self.preparation_launch_owner {
+            owner.validate()?;
+            if !matches!(
+                &self.identity.owner,
+                HostReservationOwner::Preparation { .. }
+            ) || !matches!(
+                &self.preparation_launch_gate,
+                Some(HostWorkerLaunchGate::Consumed { .. })
+            ) {
+                bail!("preparation launch owner requires a consumed preparation permit");
+            }
+        }
         if self.host_id != policy.host_id
             || self.policy_revision != policy.revision
             || self.host_owner_epoch != policy.owner_epoch
@@ -400,6 +515,10 @@ struct HostResourceLedgerMarker {
 enum HostResourceReleaseProofKind {
     Worker,
     Preparation,
+    WorkerNoSpawn,
+    AdmissionAbsent,
+    PreparationAdmissionAbsent,
+    PreparationNoSpawn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -418,6 +537,10 @@ struct HostResourceReleaseProof {
     preparation_receipt: Option<FmsPreparationProcessExitReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     released_preparation_lease: Option<FmsPreparationResourceLease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unadmitted_task: Option<crate::FmsTaskCatalogEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preparation_launch_owner: Option<HostPreparationLaunchOwner>,
 }
 
 /// A validated read of the complete ledger and its pinned policy.
@@ -435,6 +558,1080 @@ pub struct HostResourceLedger {
 }
 
 impl HostResourceLedger {
+    /// Finish an exact persisted local admission before promoting its tentative
+    /// host reservation. Missing intent is an unknown outcome, never a release.
+    pub fn reconcile_solver_admission(
+        &self,
+        store: &SessionStore,
+        identity: &HostReservationIdentity,
+    ) -> Result<HostTaskAdmissionReconciliation> {
+        identity.validate()?;
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let store_id = Self::store_id(store.root())?;
+        if identity.store_id != store_id {
+            bail!("host admission reconciliation belongs to another SessionStore");
+        }
+        let HostReservationOwner::Solver { attempt_id, .. } = &identity.owner else {
+            bail!("solver admission reconciliation requires a solver owner");
+        };
+        let mut document = self.read_document_locked()?;
+        let index = document
+            .reservations
+            .iter()
+            .position(|row| &row.identity == identity)
+            .context("admission reconciliation has no exact host reservation")?;
+        if document.reservations[index].state != HostResourceReservationState::Tentative
+            || document.reservations[index].worker_launch_gate
+                != Some(HostWorkerLaunchGate::Pending)
+        {
+            return Ok(HostTaskAdmissionReconciliation::NotTentative);
+        }
+        let Some(record) =
+            store.read_task_admission(&identity.run_id, &identity.task_id, attempt_id)?
+        else {
+            return Ok(HostTaskAdmissionReconciliation::MissingLocalIntent);
+        };
+        if record.lease.host_launch_binding.as_ref() != Some(&self.worker_launch_binding()) {
+            bail!("admission intent differs from its pinned host launch binding");
+        }
+        validate_reservation_matches_worker_lease(
+            &document.reservations[index],
+            &document.policy,
+            &store_id,
+            &record.lease,
+        )?;
+        let disposition = store
+            .reconcile_task_admission(&identity.run_id, &identity.task_id, attempt_id)?
+            .context("admission intent disappeared during locked reconciliation")?;
+        if disposition == TaskAdmissionCommitDisposition::Superseded {
+            return Ok(HostTaskAdmissionReconciliation::Superseded);
+        }
+        let Some(lease) = store.read_resource_lease(
+            &identity.run_id,
+            &identity.resource_id,
+            &identity.lease_token,
+        )?
+        else {
+            return Ok(HostTaskAdmissionReconciliation::LocalClaimUnavailable);
+        };
+        if lease.state != FmsResourceLeaseState::Active {
+            return Ok(HostTaskAdmissionReconciliation::LocalClaimUnavailable);
+        }
+        self.worker_launch_index(&document, store, &lease)?;
+        let catalog = store
+            .read_run_catalog(&identity.run_id)?
+            .context("reconciled admission has no current catalog")?;
+        let task = catalog
+            .tasks
+            .iter()
+            .find(|task| task.task_id == identity.task_id)
+            .context("reconciled admission task is missing")?;
+        if !matches!(
+            task.lifecycle,
+            crate::FmsTaskLifecycle::Preparing | crate::FmsTaskLifecycle::Stopping
+        ) || task.readiness != crate::FmsTaskReadiness::Ready
+            || task.attempt_id.as_deref() != Some(lease.attempt_id.as_str())
+            || task.ownership_epoch != Some(lease.ownership_epoch)
+            || task.resource_id.as_deref() != Some(lease.resource_id.as_str())
+        {
+            return Ok(HostTaskAdmissionReconciliation::LocalClaimUnavailable);
+        }
+        document.reservations[index].state = HostResourceReservationState::Committed;
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)?;
+        Ok(HostTaskAdmissionReconciliation::Committed)
+    }
+
+    /// Revoke an unpublished admission only under both writer locks and an
+    /// exact, still-unclaimed queued-task epoch. Missing state alone is not proof.
+    pub fn rollback_unpublished_solver_admission(
+        &self,
+        store: &SessionStore,
+        identity: &HostReservationIdentity,
+    ) -> Result<bool> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let store_id = Self::store_id(store.root())?;
+        if store_id != identity.store_id {
+            bail!("unpublished admission belongs to a different store");
+        }
+        let mut document = self.read_document_locked()?;
+        let index = document
+            .reservations
+            .iter()
+            .position(|row| &row.identity == identity)
+            .context("unpublished admission has no exact host reservation")?;
+        let reservation = &document.reservations[index];
+        if reservation.state != HostResourceReservationState::Tentative
+            || reservation.worker_launch_gate != Some(HostWorkerLaunchGate::Pending)
+        {
+            return Ok(false);
+        }
+        let HostReservationOwner::Solver { attempt_id, .. } = &identity.owner else {
+            bail!("unpublished admission rollback requires a solver owner");
+        };
+        if store
+            .read_task_admission(&identity.run_id, &identity.task_id, attempt_id)?
+            .is_some()
+            || store
+                .read_resource_lease(
+                    &identity.run_id,
+                    &identity.resource_id,
+                    &identity.lease_token,
+                )?
+                .is_some()
+            || store
+                .has_active_solver_lease_for_task_unlocked(&identity.run_id, &identity.task_id)?
+        {
+            return Ok(false);
+        }
+        let Some(catalog) = store.read_run_catalog(&identity.run_id)? else {
+            return Ok(false);
+        };
+        let Some(task) = catalog
+            .tasks
+            .iter()
+            .find(|task| task.task_id == identity.task_id)
+        else {
+            return Ok(false);
+        };
+        if !unadmitted_task_matches_reservation(task, reservation)? {
+            return Ok(false);
+        }
+        if store
+            .read_coordinator_journal(&identity.run_id)?
+            .iter()
+            .any(|entry| entry.task_id == identity.task_id && entry.attempt_id == *attempt_id)
+        {
+            return Ok(false);
+        }
+        let proof = HostResourceReleaseProof {
+            schema_version: HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V1.into(),
+            kind: HostResourceReleaseProofKind::AdmissionAbsent,
+            host_id: document.policy.host_id.clone(),
+            store_id,
+            request_sha256: reservation.request_sha256.clone(),
+            worker_receipt: None,
+            released_worker_lease: None,
+            preparation_receipt: None,
+            released_preparation_lease: None,
+            unadmitted_task: Some(task.clone()),
+            preparation_launch_owner: None,
+        };
+        let bytes = bounded_json_bytes(
+            &proof,
+            MAX_RELEASE_PROOF_BYTES,
+            "unpublished admission proof",
+        )?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let relative = release_proof_relative_path(&digest)?;
+        crate::repository_path::create_parent(&self.root, &relative)?;
+        publish_immutable_exact(&self.root, &relative, &bytes, MAX_RELEASE_PROOF_BYTES)?;
+        let reservation = &mut document.reservations[index];
+        reservation.worker_launch_gate = Some(HostWorkerLaunchGate::Closed);
+        reservation.release_proof_sha256 = Some(digest);
+        reservation.state = HostResourceReservationState::Released;
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)?;
+        Ok(true)
+    }
+
+    pub fn worker_launch_binding(&self) -> crate::FmsHostLaunchBinding {
+        crate::FmsHostLaunchBinding {
+            schema_version: "host_launch_binding.v1".into(),
+            ledger_root: self.root.clone(),
+            policy: self.policy.clone(),
+        }
+    }
+
+    fn worker_launch_index(
+        &self,
+        document: &HostResourceLedgerDocument,
+        store: &SessionStore,
+        lease: &FmsResourceLease,
+    ) -> Result<usize> {
+        lease.validate()?;
+        let current = store
+            .read_resource_lease(&lease.run_id, &lease.resource_id, &lease.lease_token)?
+            .context("worker launch requires its durable local lease")?;
+        if current.state != FmsResourceLeaseState::Active
+            || !current.identity_matches(lease)
+            || current.kind != lease.kind
+            || current.budget != lease.budget
+            || current.heartbeat_sequence < lease.heartbeat_sequence
+            || current.host_launch_binding.as_ref() != Some(&self.worker_launch_binding())
+        {
+            bail!("worker launch requires the exact active host-bound local lease");
+        }
+        let store_id = Self::store_id(store.root())?;
+        let index = document
+            .reservations
+            .iter()
+            .position(|reservation| {
+                reservation.identity == worker_lease_identity(&store_id, &current)
+            })
+            .context("worker launch has no exact host reservation")?;
+        validate_reservation_matches_worker_lease(
+            &document.reservations[index],
+            &document.policy,
+            &store_id,
+            &current,
+        )?;
+        Ok(index)
+    }
+
+    /// Consume once before calling process creation. Publication uncertainty
+    /// retains capacity; a replay must reconcile rather than spawn again.
+    pub fn authorize_worker_launch(
+        &self,
+        store: &SessionStore,
+        lease: &FmsResourceLease,
+    ) -> Result<String> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        if store
+            .read_task_cancellation_intent(&lease.run_id, &lease.task_id)?
+            .is_some()
+        {
+            bail!("pending task cancellation fences solver spawn");
+        }
+        let mut document = self.read_document_locked()?;
+        let index = self.worker_launch_index(&document, store, lease)?;
+        let catalog = store
+            .read_run_catalog(&lease.run_id)?
+            .context("worker launch requires its current task catalog")?;
+        let task = catalog
+            .tasks
+            .iter()
+            .find(|task| task.task_id == lease.task_id)
+            .context("worker launch task is missing from its catalog")?;
+        if task.lifecycle != crate::FmsTaskLifecycle::Preparing
+            || task.readiness != crate::FmsTaskReadiness::Ready
+            || task.attempt_id.as_deref() != Some(lease.attempt_id.as_str())
+            || task.ownership_epoch != Some(lease.ownership_epoch)
+            || task.resource_id.as_deref() != Some(lease.resource_id.as_str())
+        {
+            bail!("worker launch requires its exact preparing task; Stop or a newer owner fences spawn");
+        }
+        let reservation = &mut document.reservations[index];
+        if reservation.state != HostResourceReservationState::Committed
+            || reservation.worker_launch_gate != Some(HostWorkerLaunchGate::Pending)
+        {
+            bail!("worker launch permit is not pending and committed; reconcile before spawning");
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        reservation.worker_launch_gate = Some(HostWorkerLaunchGate::Consumed {
+            token: token.clone(),
+        });
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)?;
+        Ok(token)
+    }
+
+    /// Recovery may repair the read-only handoff only while the exact launch
+    /// permit remains unused. This query itself never grants a second spawn.
+    pub fn worker_has_pending_launch(
+        &self,
+        store: &SessionStore,
+        lease: &FmsResourceLease,
+    ) -> Result<bool> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let document = self.read_document_locked()?;
+        let index = self.worker_launch_index(&document, store, lease)?;
+        Ok(
+            document.reservations[index].state == HostResourceReservationState::Committed
+                && document.reservations[index].worker_launch_gate
+                    == Some(HostWorkerLaunchGate::Pending),
+        )
+    }
+
+    /// Every host-bound worker checks the durable lease binding, including a
+    /// worker invoked directly without the managed supervisor's arguments.
+    pub fn validate_worker_launch(
+        &self,
+        store: &SessionStore,
+        lease: &FmsResourceLease,
+        token: &str,
+    ) -> Result<HostResourceReservation> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let document = self.read_document_locked()?;
+        let index = self.worker_launch_index(&document, store, lease)?;
+        let reservation = &document.reservations[index];
+        if reservation.state != HostResourceReservationState::Committed
+            || reservation.worker_launch_gate
+                != Some(HostWorkerLaunchGate::Consumed {
+                    token: token.to_owned(),
+                })
+        {
+            bail!("worker process has no matching durable host launch permit");
+        }
+        Ok(reservation.clone())
+    }
+
+    /// Close the still-unused launch gate under host→store locks. A consumed
+    /// gate may represent a live process even when Started was never published.
+    pub fn close_worker_launch_before_spawn(
+        &self,
+        store: &SessionStore,
+        lease: &FmsResourceLease,
+    ) -> Result<()> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let mut document = self.read_document_locked()?;
+        let index = self.worker_launch_index(&document, store, lease)?;
+        if document.reservations[index].state == HostResourceReservationState::Released {
+            bail!("released reservation cannot close a launch permit");
+        }
+        match document.reservations[index].worker_launch_gate.as_ref() {
+            Some(HostWorkerLaunchGate::Closed) => return Ok(()),
+            Some(HostWorkerLaunchGate::Pending) => {}
+            _ => bail!("no-spawn closure requires an unused durable launch permit"),
+        }
+        document.reservations[index].worker_launch_gate = Some(HostWorkerLaunchGate::Closed);
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)
+    }
+
+    /// Complete a cancellation interrupted after catalog publication but before
+    /// local lease release. Closed proves that the launch permit was never used.
+    /// This only repairs the local projection; immutable host release follows.
+    pub fn reconcile_closed_cancelled_worker(
+        &self,
+        store: &SessionStore,
+        identity: &HostReservationIdentity,
+    ) -> Result<bool> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let document = self.read_document_locked()?;
+        let reservation = document
+            .reservations
+            .iter()
+            .find(|reservation| &reservation.identity == identity)
+            .context("cancelled worker recovery has no exact host reservation")?;
+        if reservation.state != HostResourceReservationState::Committed
+            || reservation.worker_launch_gate != Some(HostWorkerLaunchGate::Closed)
+        {
+            return Ok(false);
+        }
+        let Some(lease) = store.read_resource_lease(
+            &identity.run_id,
+            &identity.resource_id,
+            &identity.lease_token,
+        )?
+        else {
+            return Ok(false);
+        };
+        if lease.state != FmsResourceLeaseState::Active {
+            return Ok(false);
+        }
+        let store_id = Self::store_id(store.root())?;
+        validate_reservation_matches_worker_lease(
+            reservation,
+            &document.policy,
+            &store_id,
+            &lease,
+        )?;
+        self.worker_launch_index(&document, store, &lease)?;
+        let catalog = store
+            .read_run_catalog(&identity.run_id)?
+            .context("cancelled worker recovery requires a durable run catalog")?;
+        let task = catalog
+            .tasks
+            .iter()
+            .find(|task| task.task_id == identity.task_id)
+            .context("cancelled worker recovery task is missing")?;
+        if task.lifecycle != crate::FmsTaskLifecycle::Cancelled
+            || task.attempt_id.as_deref() != Some(lease.attempt_id.as_str())
+            || task.ownership_epoch != Some(lease.ownership_epoch)
+            || task.resource_id.as_deref() != Some(lease.resource_id.as_str())
+        {
+            return Ok(false);
+        }
+        store.release_resource_lease_unlocked(&lease)?;
+        Ok(true)
+    }
+
+    fn preparation_launch_index(
+        &self,
+        document: &HostResourceLedgerDocument,
+        store: &SessionStore,
+        lease: &FmsPreparationResourceLease,
+    ) -> Result<usize> {
+        lease.validate()?;
+        let current = store
+            .read_preparation_resource_lease(&lease.run_id, &lease.resource_id, &lease.lease_token)?
+            .context("preparation launch requires its durable local lease")?;
+        if current.state != FmsResourceLeaseState::Active
+            || !current.identity_matches(lease)
+            || current.budget != lease.budget
+            || current.heartbeat_sequence < lease.heartbeat_sequence
+            || current.host_launch_binding.as_ref() != Some(&self.worker_launch_binding())
+        {
+            bail!("preparation launch requires the exact active host-bound lease");
+        }
+        let store_id = Self::store_id(store.root())?;
+        let identity = HostReservationIdentity {
+            store_id: store_id.clone(),
+            run_id: current.run_id.clone(),
+            task_id: current.task_id.clone(),
+            resource_id: current.resource_id.clone(),
+            lease_token: current.lease_token.clone(),
+            owner: HostReservationOwner::Preparation {
+                preparation_attempt_id: current.preparation_attempt_id.clone(),
+            },
+        };
+        let index = document
+            .reservations
+            .iter()
+            .position(|row| row.identity == identity)
+            .context("preparation launch has no exact host reservation")?;
+        let row = &document.reservations[index];
+        let request = HostReservationRequest {
+            identity: row.identity.clone(),
+            expected_host_id: row.host_id.clone(),
+            expected_policy_revision: row.policy_revision,
+            expected_owner_epoch: row.host_owner_epoch,
+            expected_topology_sha256: row.topology_sha256.clone(),
+            budget: row.budget.clone(),
+            cpu_ids: row.cpu_ids.clone(),
+            exclusive_gpu_uuids: row.exclusive_gpu_uuids.clone(),
+            gpu_vram_bytes_by_uuid: row.gpu_vram_bytes_by_uuid.clone(),
+        };
+        validate_request_matches_preparation_lease(&request, &current, &store_id)?;
+        Ok(index)
+    }
+
+    /// Repair host promotion after the exact preparation lease became durable.
+    /// Absence or released local state never authorizes a new claim or capacity release.
+    pub fn reconcile_preparation_admission(
+        &self,
+        store: &SessionStore,
+        identity: &HostReservationIdentity,
+    ) -> Result<bool> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        if Self::store_id(store.root())? != identity.store_id {
+            bail!("preparation admission recovery belongs to another store");
+        }
+        let mut document = self.read_document_locked()?;
+        let index = document
+            .reservations
+            .iter()
+            .position(|row| &row.identity == identity)
+            .context("preparation admission recovery has no exact host reservation")?;
+        if !matches!(&identity.owner, HostReservationOwner::Preparation { .. }) {
+            bail!("preparation admission recovery requires a preparation owner");
+        }
+        if document.reservations[index].state != HostResourceReservationState::Tentative
+            || document.reservations[index].preparation_launch_gate
+                != Some(HostWorkerLaunchGate::Pending)
+        {
+            return Ok(false);
+        }
+        let Some(lease) = store.read_preparation_resource_lease(
+            &identity.run_id,
+            &identity.resource_id,
+            &identity.lease_token,
+        )?
+        else {
+            return Ok(false);
+        };
+        if lease.state != FmsResourceLeaseState::Active {
+            return Ok(false);
+        }
+        let matching_index = self.preparation_launch_index(&document, store, &lease)?;
+        if matching_index != index {
+            bail!("preparation admission recovery lease differs from the reserved identity");
+        }
+        let catalog = store
+            .read_run_catalog(&identity.run_id)?
+            .context("preparation admission recovery requires its run catalog")?;
+        if catalog
+            .tasks
+            .iter()
+            .find(|task| task.task_id == lease.task_id)
+            .map(|task| cancelled_preparation_task_matches_lease(task, &lease))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        lease.validate_for_catalog(&catalog)?;
+        if store
+            .read_task_preparation_receipt(&identity.run_id, &identity.task_id)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let lease_path = checked_path(store.root(), &lease.relative_path()?)?;
+        confirm_publication(&lease_path)?;
+        document.reservations[index].state = HostResourceReservationState::Committed;
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)?;
+        Ok(true)
+    }
+
+    /// Revoke a provisional preparation allocation only from positive accepted
+    /// task state and absence of every local side-effect record, under both locks.
+    pub fn rollback_unpublished_preparation_admission(
+        &self,
+        store: &SessionStore,
+        identity: &HostReservationIdentity,
+    ) -> Result<bool> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let store_id = Self::store_id(store.root())?;
+        if store_id != identity.store_id {
+            bail!("preparation rollback belongs to another store");
+        }
+        let mut document = self.read_document_locked()?;
+        let index = document
+            .reservations
+            .iter()
+            .position(|row| &row.identity == identity)
+            .context("preparation rollback has no exact host reservation")?;
+        let row = &document.reservations[index];
+        if row.state != HostResourceReservationState::Tentative
+            || row.preparation_launch_gate != Some(HostWorkerLaunchGate::Pending)
+        {
+            return Ok(false);
+        }
+        let HostReservationOwner::Preparation {
+            preparation_attempt_id,
+        } = &identity.owner
+        else {
+            bail!("preparation rollback requires a preparation owner");
+        };
+        if store
+            .read_preparation_resource_lease(
+                &identity.run_id,
+                &identity.resource_id,
+                &identity.lease_token,
+            )?
+            .is_some()
+            || store
+                .list_active_preparation_resource_leases()?
+                .iter()
+                .any(|lease| lease.run_id == identity.run_id && lease.task_id == identity.task_id)
+            || store
+                .has_active_solver_lease_for_task_unlocked(&identity.run_id, &identity.task_id)?
+            || store
+                .read_task_preparation_receipt(&identity.run_id, &identity.task_id)?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        if store
+            .list_preparation_process_launches(&identity.run_id)?
+            .iter()
+            .any(|launch| {
+                launch.task_id == identity.task_id
+                    && launch.preparation_attempt_id == *preparation_attempt_id
+            })
+            || store
+                .list_preparation_process_exit_receipts(&identity.run_id)?
+                .iter()
+                .any(|receipt| {
+                    receipt.task_id == identity.task_id
+                        && receipt.preparation_attempt_id == *preparation_attempt_id
+                })
+        {
+            return Ok(false);
+        }
+        let Some(catalog) = store.read_run_catalog(&identity.run_id)? else {
+            return Ok(false);
+        };
+        let Some(task) = catalog
+            .tasks
+            .iter()
+            .find(|task| task.task_id == identity.task_id)
+        else {
+            return Ok(false);
+        };
+        if !unprepared_task_matches_reservation(task, row)? {
+            return Ok(false);
+        }
+        let proof = HostResourceReleaseProof {
+            schema_version: HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V1.into(),
+            kind: HostResourceReleaseProofKind::PreparationAdmissionAbsent,
+            host_id: document.policy.host_id.clone(),
+            store_id,
+            request_sha256: row.request_sha256.clone(),
+            worker_receipt: None,
+            released_worker_lease: None,
+            preparation_receipt: None,
+            released_preparation_lease: None,
+            unadmitted_task: Some(task.clone()),
+            preparation_launch_owner: None,
+        };
+        let bytes = bounded_json_bytes(
+            &proof,
+            MAX_RELEASE_PROOF_BYTES,
+            "unpublished preparation proof",
+        )?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let relative = release_proof_relative_path(&digest)?;
+        crate::repository_path::create_parent(&self.root, &relative)?;
+        publish_immutable_exact(&self.root, &relative, &bytes, MAX_RELEASE_PROOF_BYTES)?;
+        let row = &mut document.reservations[index];
+        row.preparation_launch_gate = Some(HostWorkerLaunchGate::Closed);
+        row.release_proof_sha256 = Some(digest);
+        row.state = HostResourceReservationState::Released;
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)?;
+        Ok(true)
+    }
+
+    /// Project a durable pre-claim cancellation only after fencing every host
+    /// owner for this task. Consumed or uncertain owners retain task and capacity.
+    pub fn project_unclaimed_task_cancellation(
+        &self,
+        store: &SessionStore,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<bool> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let store_id = Self::store_id(store.root())?;
+        let Some(intent) = store.read_task_cancellation_intent(run_id, task_id)? else {
+            return Ok(false);
+        };
+        let mut catalog = store
+            .read_run_catalog(run_id)?
+            .context("cancellation projection requires its run catalog")?;
+        let index = catalog
+            .tasks
+            .iter()
+            .position(|task| task.task_id == task_id)
+            .context("cancellation projection task is missing")?;
+        let task = &catalog.tasks[index];
+        if task.input_fingerprint != intent.task.input_fingerprint {
+            bail!("cancellation projection input fingerprint changed");
+        }
+        if !matches!(
+            task.lifecycle,
+            crate::FmsTaskLifecycle::Accepted | crate::FmsTaskLifecycle::Queued
+        ) || task.attempt_id.is_some()
+            || task.resource_id.is_some()
+            || task.ownership_epoch != intent.task.ownership_epoch
+            || task.coordinator_genesis.is_some()
+            || task.coordinator_watermark.is_some()
+        {
+            return Ok(false);
+        }
+        if store.has_active_solver_lease_for_task_unlocked(run_id, task_id)? {
+            return Ok(false);
+        }
+        let admissions = checked_path(
+            store.root(),
+            &format!("runs/{run_id}/task_admissions/{task_id}"),
+        )?;
+        match fs::symlink_metadata(&admissions) {
+            Ok(metadata) if metadata.is_dir() => {
+                for entry in fs::read_dir(&admissions)? {
+                    let entry = entry?;
+                    crate::repository_path::reject_link(&entry.path())?;
+                    if !entry.file_type()?.is_file() {
+                        bail!("task admission entry is not a regular file");
+                    }
+                    let name = entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("non-UTF8 task admission filename"))?;
+                    let attempt = name
+                        .strip_suffix(".json")
+                        .context("task admission must be JSON")?;
+                    let record = store
+                        .read_task_admission(run_id, task_id, attempt)?
+                        .context("task admission disappeared during cancellation")?;
+                    if record.queued_task == *task {
+                        // A published claim must be repaired by its owner before
+                        // cancellation can dispatch a real Stop command.
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(_) => bail!("task admissions path is not a directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut document = self.read_document_locked()?;
+        let held = document
+            .reservations
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.identity.store_id == store_id
+                    && row.identity.run_id == run_id
+                    && row.identity.task_id == task_id
+                    && row.state != HostResourceReservationState::Released
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if held.len() > 1 {
+            bail!("cancellation projection found multiple host owners for one unclaimed task");
+        }
+        let active = store
+            .list_active_preparation_resource_leases()?
+            .into_iter()
+            .filter(|lease| lease.run_id == run_id && lease.task_id == task_id)
+            .collect::<Vec<_>>();
+        if let Some(&row_index) = held.first() {
+            let row = &document.reservations[row_index];
+            if !matches!(
+                &row.identity.owner,
+                HostReservationOwner::Preparation { .. }
+            ) || !matches!(
+                row.state,
+                HostResourceReservationState::Tentative | HostResourceReservationState::Committed
+            ) || !matches!(
+                row.preparation_launch_gate,
+                Some(HostWorkerLaunchGate::Pending | HostWorkerLaunchGate::Closed)
+            ) || row.preparation_launch_owner.is_some()
+            {
+                return Ok(false);
+            }
+            let Some(lease) = store.read_preparation_resource_lease(
+                run_id,
+                &row.identity.resource_id,
+                &row.identity.lease_token,
+            )?
+            else {
+                return Ok(false);
+            };
+            validate_preparation_request_identity_and_budget(
+                &reservation_request(row),
+                &lease,
+                &store_id,
+            )?;
+            lease.validate_for_catalog(&catalog)?;
+            if lease.host_launch_binding.as_ref() != Some(&self.worker_launch_binding())
+                || lease.state != FmsResourceLeaseState::Active
+                || active.len() != 1
+                || !active[0].identity_matches(&lease)
+            {
+                return Ok(false);
+            }
+            if store
+                .read_task_preparation_receipt(run_id, task_id)?
+                .is_some()
+                || store
+                    .list_preparation_process_exit_receipts(run_id)?
+                    .iter()
+                    .any(|receipt| {
+                        receipt.task_id == task_id
+                            && receipt.preparation_attempt_id == lease.preparation_attempt_id
+                    })
+            {
+                return Ok(false);
+            }
+            // Publish Closed before the terminal task projection. A crash here
+            // leaves capacity held and the same intent can finish the projection.
+            document.reservations[row_index].preparation_launch_gate =
+                Some(HostWorkerLaunchGate::Closed);
+            validate_ledger_document(&document, &self.root)?;
+            self.publish_document_locked(&document)?;
+        } else if !active.is_empty() {
+            return Ok(false);
+        }
+        confirm_publication(&checked_path(
+            store.root(),
+            &format!("runs/{run_id}/task_cancellation_intents/{task_id}.json",),
+        )?)?;
+        catalog.tasks[index].lifecycle = crate::FmsTaskLifecycle::Cancelled;
+        catalog.revision = catalog
+            .revision
+            .checked_add(1)
+            .context("cancellation catalog revision exhausted")?;
+        catalog.updated_at = chrono::Utc::now();
+        store.commit_run_catalog(&catalog)?;
+        confirm_publication(&checked_path(
+            store.root(),
+            &format!("runs/{run_id}/run_catalog.json"),
+        )?)?;
+        Ok(true)
+    }
+
+    /// Finish cancellation only from an unused preparation permit and a durable
+    /// unclaimed Cancelled task. A consumed permit never becomes no-spawn proof.
+    pub fn release_cancelled_preparation_without_spawn(
+        &self,
+        store: &SessionStore,
+        identity: &HostReservationIdentity,
+    ) -> Result<bool> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let store_id = Self::store_id(store.root())?;
+        if store_id != identity.store_id {
+            bail!("preparation cancellation belongs to another store");
+        }
+        let mut document = self.read_document_locked()?;
+        let index = document
+            .reservations
+            .iter()
+            .position(|row| &row.identity == identity)
+            .context("preparation cancellation has no exact host reservation")?;
+        let row = &document.reservations[index];
+        if !matches!(
+            row.state,
+            HostResourceReservationState::Tentative | HostResourceReservationState::Committed
+        ) || !matches!(
+            &row.preparation_launch_gate,
+            Some(HostWorkerLaunchGate::Pending | HostWorkerLaunchGate::Closed)
+        ) {
+            return Ok(false);
+        }
+        let HostReservationOwner::Preparation {
+            preparation_attempt_id,
+        } = &identity.owner
+        else {
+            bail!("preparation cancellation requires a preparation owner");
+        };
+        let Some(lease) = store.read_preparation_resource_lease(
+            &identity.run_id,
+            &identity.resource_id,
+            &identity.lease_token,
+        )?
+        else {
+            return Ok(false);
+        };
+        validate_preparation_request_identity_and_budget(
+            &reservation_request(row),
+            &lease,
+            &store_id,
+        )?;
+        if lease.host_launch_binding.as_ref() != Some(&self.worker_launch_binding()) {
+            bail!("preparation cancellation requires its exact host binding");
+        }
+        let Some(catalog) = store.read_run_catalog(&identity.run_id)? else {
+            return Ok(false);
+        };
+        let Some(task) = catalog
+            .tasks
+            .iter()
+            .find(|task| task.task_id == identity.task_id)
+        else {
+            return Ok(false);
+        };
+        if !cancelled_preparation_task_matches_lease(task, &lease)? {
+            return Ok(false);
+        }
+        if store.has_active_solver_lease_for_task_unlocked(&identity.run_id, &identity.task_id)?
+            || store
+                .list_active_preparation_resource_leases()?
+                .iter()
+                .any(|other| {
+                    other.run_id == identity.run_id
+                        && other.task_id == identity.task_id
+                        && !other.identity_matches(&lease)
+                })
+            || store
+                .read_task_preparation_receipt(&identity.run_id, &identity.task_id)?
+                .is_some()
+            || store
+                .list_preparation_process_exit_receipts(&identity.run_id)?
+                .iter()
+                .any(|receipt| {
+                    receipt.task_id == identity.task_id
+                        && receipt.preparation_attempt_id == *preparation_attempt_id
+                })
+        {
+            return Ok(false);
+        }
+        confirm_publication(&checked_path(
+            store.root(),
+            &format!("runs/{}/run_catalog.json", identity.run_id),
+        )?)?;
+        document.reservations[index].preparation_launch_gate = Some(HostWorkerLaunchGate::Closed);
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)?;
+        if lease.state == FmsResourceLeaseState::Active {
+            store.release_preparation_resource_lease_unlocked(&lease)?;
+        }
+        let released = store
+            .read_preparation_resource_lease(
+                &identity.run_id,
+                &identity.resource_id,
+                &identity.lease_token,
+            )?
+            .context("cancelled preparation lease disappeared during release")?;
+        confirm_publication(&checked_path(store.root(), &released.relative_path()?)?)?;
+        validate_no_spawn_preparation_lease(
+            &self.root,
+            &document.policy,
+            &document.reservations[index],
+            &store_id,
+            &released,
+            task,
+        )?;
+        let proof = HostResourceReleaseProof {
+            schema_version: HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V1.into(),
+            kind: HostResourceReleaseProofKind::PreparationNoSpawn,
+            host_id: document.policy.host_id.clone(),
+            store_id,
+            request_sha256: document.reservations[index].request_sha256.clone(),
+            worker_receipt: None,
+            released_worker_lease: None,
+            preparation_receipt: None,
+            released_preparation_lease: Some(released),
+            unadmitted_task: Some(task.clone()),
+            preparation_launch_owner: None,
+        };
+        let bytes = bounded_json_bytes(
+            &proof,
+            MAX_RELEASE_PROOF_BYTES,
+            "preparation no-spawn proof",
+        )?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let relative = release_proof_relative_path(&digest)?;
+        crate::repository_path::create_parent(&self.root, &relative)?;
+        publish_immutable_exact(&self.root, &relative, &bytes, MAX_RELEASE_PROOF_BYTES)?;
+        document.reservations[index].release_proof_sha256 = Some(digest);
+        document.reservations[index].state = HostResourceReservationState::Released;
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)?;
+        Ok(true)
+    }
+
+    /// Non-consuming preflight before publishing a one-shot local launch record.
+    /// The later authorization must still recheck and consume atomically.
+    pub fn preparation_lease_has_pending_launch(
+        &self,
+        store: &SessionStore,
+        lease: &FmsPreparationResourceLease,
+    ) -> Result<bool> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let document = self.read_document_locked()?;
+        let index = self.preparation_launch_index(&document, store, lease)?;
+        let row = &document.reservations[index];
+        if row.state != HostResourceReservationState::Committed
+            || row.preparation_launch_gate != Some(HostWorkerLaunchGate::Pending)
+        {
+            return Ok(false);
+        }
+        let catalog = store
+            .read_run_catalog(&lease.run_id)?
+            .context("preparation launch preflight requires its run catalog")?;
+        lease.validate_for_catalog(&catalog)?;
+        Ok(true)
+    }
+
+    /// Consume once before preparation process creation; ambiguity never reissues it.
+    pub fn authorize_preparation_launch(
+        &self,
+        store: &SessionStore,
+        lease: &FmsPreparationResourceLease,
+        launch: &crate::FmsPreparationProcessLaunch,
+        supervisor_start_token: Option<String>,
+    ) -> Result<String> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        if store
+            .read_task_cancellation_intent(&lease.run_id, &lease.task_id)?
+            .is_some()
+        {
+            bail!("pending task cancellation fences preparation spawn");
+        }
+        let mut document = self.read_document_locked()?;
+        let index = self.preparation_launch_index(&document, store, lease)?;
+        if document.reservations[index].state != HostResourceReservationState::Committed
+            || document.reservations[index].preparation_launch_gate
+                != Some(HostWorkerLaunchGate::Pending)
+        {
+            bail!("preparation spawn requires an unused committed launch permit; explicit recovery is required");
+        }
+        let catalog = store
+            .read_run_catalog(&lease.run_id)?
+            .context("preparation launch requires its run catalog")?;
+        lease.validate_for_catalog(&catalog)?;
+        launch.validate_for_lease(lease)?;
+        let related = store
+            .list_preparation_process_launches(&lease.run_id)?
+            .into_iter()
+            .filter(|row| {
+                row.task_id == lease.task_id
+                    && row.preparation_attempt_id == lease.preparation_attempt_id
+            })
+            .collect::<Vec<_>>();
+        if related.len() != 1 || related[0] != *launch {
+            bail!("preparation permit requires exactly one matching durable launch intent");
+        }
+        if store
+            .list_preparation_process_exit_receipts(&lease.run_id)?
+            .iter()
+            .any(|row| {
+                row.task_id == lease.task_id
+                    && row.preparation_attempt_id == lease.preparation_attempt_id
+            })
+        {
+            bail!("preparation attempt already has process exit evidence");
+        }
+        if store
+            .read_task_preparation_receipt(&lease.run_id, &lease.task_id)?
+            .is_some()
+        {
+            bail!("preparation permit cannot repeat already-published preparation work");
+        }
+        store.commit_preparation_process_launch(launch)?;
+        let owner = HostPreparationLaunchOwner {
+            schema_version: "host_preparation_launch_owner.v1".into(),
+            launch_id: launch.launch_id.clone(),
+            launch_sha256: crate::canonical_json_sha256(&serde_json::to_value(launch)?),
+            supervisor_process_id: std::process::id(),
+            supervisor_start_token,
+        };
+        owner.validate()?;
+        document.reservations[index].preparation_launch_owner = Some(owner);
+        let token = uuid::Uuid::new_v4().to_string();
+        document.reservations[index].preparation_launch_gate =
+            Some(HostWorkerLaunchGate::Consumed {
+                token: token.clone(),
+            });
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)?;
+        Ok(token)
+    }
+
+    pub fn validate_preparation_launch(
+        &self,
+        store: &SessionStore,
+        lease: &FmsPreparationResourceLease,
+        token: &str,
+    ) -> Result<HostResourceReservation> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let document = self.read_document_locked()?;
+        let index = self.preparation_launch_index(&document, store, lease)?;
+        let reservation = &document.reservations[index];
+        if reservation.state != HostResourceReservationState::Committed
+            || reservation.preparation_launch_gate
+                != Some(HostWorkerLaunchGate::Consumed {
+                    token: token.to_owned(),
+                })
+        {
+            bail!("preparation process has no matching durable host launch permit");
+        }
+        let owner = reservation.preparation_launch_owner.as_ref().context(
+            "consumed preparation permit has no durable spawn owner; explicit migration required",
+        )?;
+        let launch = store
+            .read_preparation_process_launch(&lease.run_id, &owner.launch_id)?
+            .context("preparation permit's original launch intent is missing")?;
+        if crate::canonical_json_sha256(&serde_json::to_value(&launch)?) != owner.launch_sha256
+            || launch.lease_heartbeat_sequence > lease.heartbeat_sequence
+        {
+            bail!("preparation launch owner differs from the durable intent");
+        }
+        let mut launch_lease = lease.clone();
+        launch_lease.heartbeat_sequence = launch.lease_heartbeat_sequence;
+        launch.validate_for_lease(&launch_lease)?;
+        Ok(reservation.clone())
+    }
+
     /// Create the exact ledger namespace once, or validate an existing one
     /// against the supplied policy. Existing budgets are never resampled.
     pub fn initialize(root: impl AsRef<Path>, policy: HostResourceLedgerPolicy) -> Result<Self> {
@@ -533,7 +1730,7 @@ impl HostResourceLedger {
         let _host_writer = self.writer.acquire()?;
         let mut document = self.read_document_locked()?;
         request.validate(&document.policy)?;
-        let (reservation, changed) = insert_tentative(&mut document, request)?;
+        let (reservation, changed) = insert_tentative(&mut document, request, &self.root)?;
         if changed {
             self.publish_document_locked(&document)?;
         }
@@ -578,15 +1775,48 @@ impl HostResourceLedger {
         request: &HostReservationRequest,
         store: &SessionStore,
         lease: &FmsResourceLease,
+        inputs: &crate::FmsResolvedInputsSnapshot,
     ) -> Result<TaskAdmissionCommitDisposition> {
+        self.try_commit_task_admission(request, store, lease, inputs)?
+            .ok_or_else(|| {
+                HostResourceCapacityUnavailable(
+                    "host capacity is occupied; task admission was not committed".into(),
+                )
+                .into()
+            })
+    }
+
+    /// Return None only for contention of the new provisional allocation.
+    /// Invalid stored state or unknown publication remains an error.
+    pub fn try_commit_task_admission(
+        &self,
+        request: &HostReservationRequest,
+        store: &SessionStore,
+        lease: &FmsResourceLease,
+        inputs: &crate::FmsResolvedInputsSnapshot,
+    ) -> Result<Option<TaskAdmissionCommitDisposition>> {
+        inputs.validate()?;
         let _host_writer = self.writer.acquire()?;
         let _store_writer = store.write_transaction()?;
         let canonical_store_id = Self::store_id(store.root())?;
         validate_request_matches_store_claim(request, lease, &canonical_store_id)?;
 
+        if store
+            .read_task_cancellation_intent(&lease.run_id, &lease.task_id)?
+            .is_some()
+            && store
+                .read_task_admission(&lease.run_id, &lease.task_id, &lease.attempt_id)?
+                .is_none()
+        {
+            return Ok(None);
+        }
         let mut document = self.read_document_locked()?;
         request.validate(&document.policy)?;
-        let (reservation, changed) = insert_tentative(&mut document, request)?;
+        let Some((reservation, changed)) =
+            try_insert_admission(&mut document, request, &self.root)?
+        else {
+            return Ok(None);
+        };
         if changed {
             self.publish_document_locked(&document)?;
         }
@@ -600,7 +1830,24 @@ impl HostResourceLedger {
             HostResourceReservationState::Tentative | HostResourceReservationState::Committed => {}
         }
 
-        let disposition = store.commit_task_admission(lease)?;
+        if reservation.worker_launch_gate.is_none()
+            || reservation.worker_launch_gate == Some(HostWorkerLaunchGate::Closed)
+        {
+            bail!("host admission requires an open versioned solver launch gate");
+        }
+
+        let mut host_lease = lease.clone();
+        let binding = self.worker_launch_binding();
+        if host_lease
+            .host_launch_binding
+            .as_ref()
+            .is_some_and(|supplied| supplied != &binding)
+        {
+            bail!("task lease is already bound to another host launch owner");
+        }
+        host_lease.host_launch_binding = Some(binding);
+        let disposition =
+            store.commit_task_admission_with_inputs(&host_lease, &Some(inputs.clone()))?;
         if disposition == TaskAdmissionCommitDisposition::Superseded {
             bail!("task admission was superseded; host reservation remains held for reconciliation")
         }
@@ -615,7 +1862,7 @@ impl HostResourceLedger {
             validate_ledger_document(&document, &self.root)?;
             self.publish_document_locked(&document)?;
         }
-        Ok(disposition)
+        Ok(Some(disposition))
     }
 
     /// Atomically connect a tentative host reservation to an accepted-task
@@ -635,9 +1882,26 @@ impl HostResourceLedger {
         let canonical_store_id = Self::store_id(store.root())?;
         validate_request_matches_preparation_lease(request, lease, &canonical_store_id)?;
 
+        if store
+            .read_task_cancellation_intent(&lease.run_id, &lease.task_id)?
+            .is_some()
+            && store
+                .read_preparation_resource_lease(
+                    &lease.run_id,
+                    &lease.resource_id,
+                    &lease.lease_token,
+                )?
+                .is_none()
+        {
+            return Ok(None);
+        }
         let mut document = self.read_document_locked()?;
         request.validate(&document.policy)?;
-        let (reservation, changed) = insert_tentative(&mut document, request)?;
+        let Some((reservation, changed)) =
+            try_insert_admission(&mut document, request, &self.root)?
+        else {
+            return Ok(None);
+        };
         if changed {
             self.publish_document_locked(&document)?;
         }
@@ -651,11 +1915,26 @@ impl HostResourceLedger {
             HostResourceReservationState::Tentative | HostResourceReservationState::Committed => {}
         }
 
+        if reservation.preparation_launch_gate.is_none()
+            || reservation.preparation_launch_gate == Some(HostWorkerLaunchGate::Closed)
+        {
+            bail!("host preparation admission requires an open versioned launch gate");
+        }
+        let mut host_lease = lease.clone();
+        let binding = self.worker_launch_binding();
+        if host_lease
+            .host_launch_binding
+            .as_ref()
+            .is_some_and(|supplied| supplied != &binding)
+        {
+            bail!("preparation lease is bound to another host launch owner");
+        }
+        host_lease.host_launch_binding = Some(binding);
         let disposition = store.try_commit_preparation_resource_lease_from_pool(
             pool_id,
             generation,
             expected_authorization_sequence,
-            lease,
+            &host_lease,
         )?;
         let Some(disposition) = disposition else {
             return Ok(None);
@@ -733,6 +2012,8 @@ impl HostResourceLedger {
             released_worker_lease: Some(lease),
             preparation_receipt: None,
             released_preparation_lease: None,
+            unadmitted_task: None,
+            preparation_launch_owner: None,
         };
         let proof_bytes =
             bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "worker release proof")?;
@@ -764,6 +2045,68 @@ impl HostResourceLedger {
         Ok(released)
     }
 
+    /// Release only after a durable no-spawn closure and exact local release.
+    /// A missing local lease or consumed permit is never a no-spawn proof.
+    pub fn release_worker_without_spawn(
+        &self,
+        store: &SessionStore,
+        identity: &HostReservationIdentity,
+    ) -> Result<HostResourceReservation> {
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let store_id = Self::store_id(store.root())?;
+        let mut document = self.read_document_locked()?;
+        let index = document
+            .reservations
+            .iter()
+            .position(|reservation| &reservation.identity == identity)
+            .context("no-spawn release has no exact host reservation")?;
+        let lease = store
+            .read_resource_lease(
+                &identity.run_id,
+                &identity.resource_id,
+                &identity.lease_token,
+            )?
+            .context("no-spawn release requires a durable released local lease")?;
+        validate_no_spawn_worker_lease(
+            &self.root,
+            &document.reservations[index],
+            &document.policy,
+            &store_id,
+            &lease,
+        )?;
+        let proof = HostResourceReleaseProof {
+            schema_version: HOST_RESOURCE_RELEASE_PROOF_SCHEMA_V1.into(),
+            kind: HostResourceReleaseProofKind::WorkerNoSpawn,
+            host_id: document.policy.host_id.clone(),
+            store_id,
+            request_sha256: document.reservations[index].request_sha256.clone(),
+            worker_receipt: None,
+            released_worker_lease: Some(lease),
+            preparation_receipt: None,
+            released_preparation_lease: None,
+            unadmitted_task: None,
+            preparation_launch_owner: None,
+        };
+        let bytes = bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "worker no-spawn proof")?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        if document.reservations[index].state == HostResourceReservationState::Released {
+            if document.reservations[index].release_proof_sha256.as_deref() != Some(&digest) {
+                bail!("no-spawn replay differs from the durable release proof");
+            }
+            validate_release_proof(&self.root, &document.policy, &document.reservations[index])?;
+            return Ok(document.reservations[index].clone());
+        }
+        let relative = release_proof_relative_path(&digest)?;
+        crate::repository_path::create_parent(&self.root, &relative)?;
+        publish_immutable_exact(&self.root, &relative, &bytes, MAX_RELEASE_PROOF_BYTES)?;
+        document.reservations[index].release_proof_sha256 = Some(digest);
+        document.reservations[index].state = HostResourceReservationState::Released;
+        validate_ledger_document(&document, &self.root)?;
+        self.publish_document_locked(&document)?;
+        Ok(document.reservations[index].clone())
+    }
+
     /// Finalize an accepted-task preparation process exit under the same
     /// host→store lock order, then release host capacity only from the exact
     /// released preparation lease and immutable typed proof.
@@ -773,6 +2116,21 @@ impl HostResourceLedger {
         run_id: &str,
         receipt_id: &str,
     ) -> Result<HostResourceReservation> {
+        self.release_preparation_after_exit_with_finalization(store, run_id, receipt_id)
+            .map(|(reservation, _)| reservation)
+    }
+
+    /// Preserve the exact local finalizer disposition while publishing the
+    /// proof-backed host release in the same host-before-store transaction.
+    pub fn release_preparation_after_exit_with_finalization(
+        &self,
+        store: &SessionStore,
+        run_id: &str,
+        receipt_id: &str,
+    ) -> Result<(
+        HostResourceReservation,
+        PreparationProcessFinalizationDisposition,
+    )> {
         let _host_writer = self.writer.acquire()?;
         let _store_writer = store.write_transaction()?;
         let store_id = Self::store_id(store.root())?;
@@ -823,7 +2181,13 @@ impl HostResourceLedger {
                 &store_id,
                 &receipt,
                 &lease,
-            );
+            )
+            .map(|reservation| {
+                (
+                    reservation,
+                    PreparationProcessFinalizationDisposition::Replayed,
+                )
+            });
         }
 
         let matching_launches = store
@@ -836,19 +2200,41 @@ impl HostResourceLedger {
                     && launch.lease_token == receipt.lease_token
                     && launch.lease_heartbeat_sequence <= receipt.lease_heartbeat_sequence
             })
-            .count();
-        if matching_launches > 1 {
+            .collect::<Vec<_>>();
+        if matching_launches.len() > 1 {
             bail!("preparation exit receipt has multiple matching durable launches");
         }
-        if matching_launches == 0 && lease.state == FmsResourceLeaseState::Active {
+        if matching_launches.is_empty() && lease.state == FmsResourceLeaseState::Active {
             bail!("active preparation lease has no exact durable matching launch");
         }
-        let finalization = store.finalize_preparation_process_exit(&receipt)?;
-        if matching_launches == 0
-            && finalization != PreparationProcessFinalizationDisposition::Replayed
-        {
-            bail!("preparation exit receipt has no durable launch or prior finalization");
+        if let Some(owner) = &document.reservations[index].preparation_launch_owner {
+            let launch = matching_launches
+                .first()
+                .context("bound preparation release has no original launch")?;
+            if launch.launch_id != owner.launch_id
+                || crate::canonical_json_sha256(&serde_json::to_value(launch)?)
+                    != owner.launch_sha256
+            {
+                bail!("preparation exit proof differs from the spawn owner's original launch");
+            }
         }
+        if lease
+            .host_launch_binding
+            .as_ref()
+            .is_some_and(|binding| binding.ledger_root != self.root)
+        {
+            bail!("preparation exit lease is bound to another ledger root");
+        }
+        let finalization = if lease.state == FmsResourceLeaseState::Active {
+            store.finalize_preparation_process_exit(&receipt)?
+        } else if matching_launches.is_empty() {
+            // A released local lease may already have advanced its task to the
+            // solver queue after a crash before host proof publication. Never
+            // rerun that earlier finalizer against the later task phase.
+            bail!("released preparation lease has no exact durable launch proof");
+        } else {
+            PreparationProcessFinalizationDisposition::Replayed
+        };
 
         let released_lease = store
             .read_preparation_resource_lease(
@@ -879,6 +2265,10 @@ impl HostResourceLedger {
             released_worker_lease: None,
             preparation_receipt: Some(receipt),
             released_preparation_lease: Some(released_lease),
+            unadmitted_task: None,
+            preparation_launch_owner: document.reservations[index]
+                .preparation_launch_owner
+                .clone(),
         };
         let proof_bytes =
             bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "preparation release proof")?;
@@ -897,7 +2287,7 @@ impl HostResourceLedger {
         let released = reservation.clone();
         validate_ledger_document(&document, &self.root)?;
         self.publish_document_locked(&document)?;
-        Ok(released)
+        Ok((released, finalization))
     }
 
     fn new(root: PathBuf, policy: HostResourceLedgerPolicy) -> Self {
@@ -1160,6 +2550,7 @@ fn task_key(identity: &HostReservationIdentity) -> (String, String, String) {
 fn insert_tentative(
     document: &mut HostResourceLedgerDocument,
     request: &HostReservationRequest,
+    root: &Path,
 ) -> Result<(HostResourceReservation, bool)> {
     request.validate(&document.policy)?;
     let request_sha256 = host_request_sha256(request)?;
@@ -1187,13 +2578,18 @@ fn insert_tentative(
             );
         }
         if existing.state != HostResourceReservationState::Released {
-            bail!("host task already has a nonreleased reservation with a different identity");
+            return Err(HostResourceCapacityUnavailable(
+                "host task already has a nonreleased reservation with a different identity".into(),
+            )
+            .into());
         }
         if let (Some(request_epoch), Some(existing_epoch)) = (
             request.identity.owner.solver_epoch(),
             existing.identity.owner.solver_epoch(),
         ) {
-            if request_epoch <= existing_epoch {
+            if reservation_consumes_solver_epoch(root, &document.policy, existing)?
+                && request_epoch <= existing_epoch
+            {
                 bail!("host reservation task ownership epoch is stale");
             }
         }
@@ -1202,6 +2598,28 @@ fn insert_tentative(
     let reservation = HostResourceReservation::from_request(request)?;
     document.reservations.push(reservation.clone());
     Ok((reservation, true))
+}
+
+fn try_insert_admission(
+    document: &mut HostResourceLedgerDocument,
+    request: &HostReservationRequest,
+    root: &Path,
+) -> Result<Option<(HostResourceReservation, bool)>> {
+    // Authoritative state was already validated under the host lock. Only
+    // contention introduced by this request may return None before publication.
+    let original_len = document.reservations.len();
+    let provisional = insert_tentative(document, request, root).and_then(|reservation| {
+        validate_ledger_document(document, root)?;
+        Ok(reservation)
+    });
+    match provisional {
+        Ok(reservation) => Ok(Some(reservation)),
+        Err(error) if error.is::<HostResourceCapacityUnavailable>() => {
+            document.reservations.truncate(original_len);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn validate_ledger_document(document: &HostResourceLedgerDocument, root: &Path) -> Result<()> {
@@ -1250,10 +2668,14 @@ fn validate_ledger_document(document: &HostResourceLedgerDocument, root: &Path) 
                 );
             }
         }
-        if let Some(epoch) = reservation.identity.owner.solver_epoch() {
-            let epochs = task_epochs.entry(task.clone()).or_default();
-            if !epochs.insert(epoch) {
-                bail!("host resource ledger contains conflicting ownership epochs for one task");
+        if reservation_consumes_solver_epoch(root, &document.policy, reservation)? {
+            if let Some(epoch) = reservation.identity.owner.solver_epoch() {
+                let epochs = task_epochs.entry(task.clone()).or_default();
+                if !epochs.insert(epoch) {
+                    bail!(
+                        "host resource ledger contains conflicting ownership epochs for one task"
+                    );
+                }
             }
         }
 
@@ -1269,18 +2691,24 @@ fn validate_ledger_document(document: &HostResourceLedgerDocument, root: &Path) 
         if reservation.budget.cpu_millis > 0 {
             let aggregate_only = reservation.cpu_ids.is_empty();
             if cpu_allocation_mode.is_some_and(|mode| mode != aggregate_only) {
-                bail!("host resource ledger cannot mix aggregate CPU reservations with pinned CPU IDs");
+                return Err(HostResourceCapacityUnavailable("host resource ledger cannot mix aggregate CPU reservations with pinned CPU IDs".into()).into());
             }
             cpu_allocation_mode = Some(aggregate_only);
         }
         for cpu_id in &reservation.cpu_ids {
             if !used_cpus.insert(*cpu_id) {
-                bail!("host resource ledger assigns CPU ID {cpu_id} more than once");
+                return Err(HostResourceCapacityUnavailable(format!(
+                    "host resource ledger assigns CPU ID {cpu_id} more than once"
+                ))
+                .into());
             }
         }
         for uuid in &reservation.exclusive_gpu_uuids {
             if !used_gpus.insert(uuid.clone()) {
-                bail!("host resource ledger assigns exclusive GPU UUID `{uuid}` more than once");
+                return Err(HostResourceCapacityUnavailable(format!(
+                    "host resource ledger assigns exclusive GPU UUID `{uuid}` more than once"
+                ))
+                .into());
             }
         }
         for (uuid, bytes) in &reservation.gpu_vram_bytes_by_uuid {
@@ -1306,13 +2734,22 @@ fn validate_ledger_document(document: &HostResourceLedgerDocument, root: &Path) 
         }
     }
     if cpu_millis > document.policy.total_budget.cpu_millis {
-        bail!("host resource ledger CPU reservations exceed configured capacity");
+        return Err(HostResourceCapacityUnavailable(
+            "host resource ledger CPU reservations exceed configured capacity".into(),
+        )
+        .into());
     }
     if memory_bytes > document.policy.total_budget.memory_bytes {
-        bail!("host resource ledger RAM reservations exceed configured capacity");
+        return Err(HostResourceCapacityUnavailable(
+            "host resource ledger RAM reservations exceed configured capacity".into(),
+        )
+        .into());
     }
     if storage_bytes > document.policy.total_budget.storage_bytes {
-        bail!("host resource ledger scratch reservations exceed configured capacity");
+        return Err(HostResourceCapacityUnavailable(
+            "host resource ledger scratch reservations exceed configured capacity".into(),
+        )
+        .into());
     }
     for (uuid, bytes) in gpu_vram_bytes {
         let capacity = document
@@ -1321,7 +2758,10 @@ fn validate_ledger_document(document: &HostResourceLedgerDocument, root: &Path) 
             .get(&uuid)
             .context("host resource ledger VRAM record has no configured GPU capacity")?;
         if bytes > *capacity {
-            bail!("host resource ledger VRAM reservations exceed capacity for GPU `{uuid}`");
+            return Err(HostResourceCapacityUnavailable(format!(
+                "host resource ledger VRAM reservations exceed capacity for GPU `{uuid}`"
+            ))
+            .into());
         }
     }
     Ok(())
@@ -1391,6 +2831,15 @@ fn validate_request_matches_preparation_lease(
     if lease.state != FmsResourceLeaseState::Active {
         bail!("host preparation admission requires an active preparation lease");
     }
+    validate_preparation_request_identity_and_budget(request, lease, expected_store_id)
+}
+
+fn validate_preparation_request_identity_and_budget(
+    request: &HostReservationRequest,
+    lease: &FmsPreparationResourceLease,
+    expected_store_id: &str,
+) -> Result<()> {
+    lease.validate()?;
     if request.identity.store_id != expected_store_id
         || request.identity.run_id != lease.run_id
         || request.identity.task_id != lease.task_id
@@ -1448,16 +2897,49 @@ fn validate_reservation_matches_worker_exit(
     lease: &FmsResourceLease,
 ) -> Result<()> {
     validate_worker_exit_receipt_lease(receipt, lease)?;
+    if reservation.worker_launch_gate == Some(HostWorkerLaunchGate::Closed)
+        || (lease.host_launch_binding.is_some()
+            && !matches!(
+                reservation.worker_launch_gate,
+                Some(HostWorkerLaunchGate::Consumed { .. })
+            ))
+    {
+        bail!("worker process-exit proof contradicts the durable host launch gate");
+    }
+    validate_reservation_matches_worker_lease(reservation, policy, store_id, lease)
+}
+
+fn worker_lease_identity(store_id: &str, lease: &FmsResourceLease) -> HostReservationIdentity {
+    HostReservationIdentity {
+        store_id: store_id.to_owned(),
+        run_id: lease.run_id.clone(),
+        task_id: lease.task_id.clone(),
+        resource_id: lease.resource_id.clone(),
+        lease_token: lease.lease_token.clone(),
+        owner: HostReservationOwner::Solver {
+            attempt_id: lease.attempt_id.clone(),
+            ownership_epoch: lease.ownership_epoch,
+        },
+    }
+}
+
+fn validate_reservation_matches_worker_lease(
+    reservation: &HostResourceReservation,
+    policy: &HostResourceLedgerPolicy,
+    store_id: &str,
+    lease: &FmsResourceLease,
+) -> Result<()> {
+    lease.validate()?;
     if reservation.identity.store_id != store_id
-        || reservation.identity.run_id != receipt.run_id
-        || reservation.identity.task_id != receipt.task_id
-        || reservation.identity.resource_id != receipt.resource_id
+        || reservation.identity.run_id != lease.run_id
+        || reservation.identity.task_id != lease.task_id
+        || reservation.identity.resource_id != lease.resource_id
         || reservation.identity.owner
             != (HostReservationOwner::Solver {
-                attempt_id: receipt.attempt_id.clone(),
-                ownership_epoch: receipt.ownership_epoch,
+                attempt_id: lease.attempt_id.clone(),
+                ownership_epoch: lease.ownership_epoch,
             })
-        || reservation.identity.lease_token != receipt.lease_token
+        || reservation.identity.lease_token != lease.lease_token
         || reservation.host_id != policy.host_id
         || reservation.policy_revision != policy.revision
         || reservation.host_owner_epoch != policy.owner_epoch
@@ -1488,6 +2970,151 @@ fn validate_reservation_matches_worker_exit(
         || !reservation.gpu_vram_bytes_by_uuid.is_empty()
     {
         bail!("released non-GPU lease cannot carry GPU resource reservations");
+    }
+    Ok(())
+}
+
+/// A revoked admission never established a task claim. Its epoch may be
+/// claimed by a fresh attempt, while its old identity/attempt remains fenced.
+fn reservation_consumes_solver_epoch(
+    root: &Path,
+    policy: &HostResourceLedgerPolicy,
+    reservation: &HostResourceReservation,
+) -> Result<bool> {
+    if reservation.state != HostResourceReservationState::Released {
+        return Ok(true);
+    }
+    validate_release_proof(root, policy, reservation)?;
+    let digest = reservation
+        .release_proof_sha256
+        .as_ref()
+        .context("released reservation has no proof digest")?;
+    let bytes = read_bounded_regular_file(
+        root,
+        &release_proof_relative_path(digest)?,
+        MAX_RELEASE_PROOF_BYTES,
+    )?;
+    if format!("{:x}", Sha256::digest(&bytes)) != *digest {
+        bail!("released reservation epoch certificate digest mismatch");
+    }
+    let proof: HostResourceReleaseProof = serde_json::from_slice(&bytes)?;
+    Ok(proof.kind != HostResourceReleaseProofKind::AdmissionAbsent)
+}
+
+fn reservation_request(row: &HostResourceReservation) -> HostReservationRequest {
+    HostReservationRequest {
+        identity: row.identity.clone(),
+        expected_host_id: row.host_id.clone(),
+        expected_policy_revision: row.policy_revision,
+        expected_owner_epoch: row.host_owner_epoch,
+        expected_topology_sha256: row.topology_sha256.clone(),
+        budget: row.budget.clone(),
+        cpu_ids: row.cpu_ids.clone(),
+        exclusive_gpu_uuids: row.exclusive_gpu_uuids.clone(),
+        gpu_vram_bytes_by_uuid: row.gpu_vram_bytes_by_uuid.clone(),
+    }
+}
+
+fn cancelled_preparation_task_matches_lease(
+    task: &crate::FmsTaskCatalogEntry,
+    lease: &FmsPreparationResourceLease,
+) -> Result<bool> {
+    task.validate(&lease.run_id)?;
+    Ok(task.task_id == lease.task_id
+        && task.lifecycle == crate::FmsTaskLifecycle::Cancelled
+        && task.attempt_id.is_none()
+        && task.ownership_epoch.is_none()
+        && task.resource_id.is_none()
+        && task.coordinator_genesis.is_none()
+        && task.coordinator_watermark.is_none())
+}
+
+fn validate_no_spawn_preparation_lease(
+    root: &Path,
+    policy: &HostResourceLedgerPolicy,
+    row: &HostResourceReservation,
+    store_id: &str,
+    lease: &FmsPreparationResourceLease,
+    task: &crate::FmsTaskCatalogEntry,
+) -> Result<()> {
+    validate_preparation_request_identity_and_budget(&reservation_request(row), lease, store_id)?;
+    let binding = lease
+        .host_launch_binding
+        .as_ref()
+        .context("no-spawn preparation requires its host binding")?;
+    if row.preparation_launch_gate != Some(HostWorkerLaunchGate::Closed)
+        || row.preparation_launch_owner.is_some()
+        || lease.state != FmsResourceLeaseState::Released
+        || binding.ledger_root != root
+        || binding.policy != *policy
+        || !cancelled_preparation_task_matches_lease(task, lease)?
+    {
+        bail!("preparation no-spawn proof requires a closed gate, released bound lease and cancelled unclaimed task");
+    }
+    Ok(())
+}
+
+fn unprepared_task_matches_reservation(
+    task: &crate::FmsTaskCatalogEntry,
+    reservation: &HostResourceReservation,
+) -> Result<bool> {
+    task.validate(&reservation.identity.run_id)?;
+    Ok(matches!(
+        &reservation.identity.owner,
+        HostReservationOwner::Preparation { .. }
+    ) && task.task_id == reservation.identity.task_id
+        && task.lifecycle == crate::FmsTaskLifecycle::Accepted
+        && matches!(&task.readiness, crate::FmsTaskReadiness::Blocked { reason }
+            if reason == crate::FMS_TASK_AWAITING_PREPARATION_REASON)
+        && task.attempt_id.is_none()
+        && task.ownership_epoch.is_none()
+        && task.resource_id.is_none()
+        && task.coordinator_genesis.is_none()
+        && task.coordinator_watermark.is_none())
+}
+
+fn unadmitted_task_matches_reservation(
+    task: &crate::FmsTaskCatalogEntry,
+    reservation: &HostResourceReservation,
+) -> Result<bool> {
+    task.validate(&reservation.identity.run_id)?;
+    let HostReservationOwner::Solver {
+        ownership_epoch, ..
+    } = &reservation.identity.owner
+    else {
+        return Ok(false);
+    };
+    Ok(task.task_id == reservation.identity.task_id
+        && task.lifecycle == crate::FmsTaskLifecycle::Queued
+        && task.readiness == crate::FmsTaskReadiness::Ready
+        && task.attempt_id.is_none()
+        && task.resource_id.is_none()
+        && task.coordinator_genesis.is_none()
+        && task.coordinator_watermark.is_none()
+        && task
+            .ownership_epoch
+            .map_or(Some(1), |epoch| epoch.checked_add(1))
+            == Some(*ownership_epoch))
+}
+
+fn validate_no_spawn_worker_lease(
+    root: &Path,
+    reservation: &HostResourceReservation,
+    policy: &HostResourceLedgerPolicy,
+    store_id: &str,
+    lease: &FmsResourceLease,
+) -> Result<()> {
+    validate_reservation_matches_worker_lease(reservation, policy, store_id, lease)?;
+    let binding = lease
+        .host_launch_binding
+        .as_ref()
+        .context("no-spawn proof requires a host-bound lease")?;
+    if reservation.worker_launch_gate != Some(HostWorkerLaunchGate::Closed)
+        || lease.state != FmsResourceLeaseState::Released
+        || binding.ledger_root != root
+        || binding.policy != *policy
+    {
+        bail!("no-spawn release requires a closed launch gate and exact released host-bound lease");
     }
     Ok(())
 }
@@ -1538,6 +3165,26 @@ fn validate_preparation_reservation_identity_and_budget(
     lease: &FmsPreparationResourceLease,
 ) -> Result<()> {
     validate_preparation_exit_receipt_lease(receipt, lease)?;
+    if reservation.preparation_launch_gate.is_some() || lease.host_launch_binding.is_some() {
+        reservation
+            .preparation_launch_owner
+            .as_ref()
+            .context("versioned preparation exit requires its durable spawn owner")?
+            .validate()?;
+        let binding = lease
+            .host_launch_binding
+            .as_ref()
+            .context("versioned preparation exit requires its host binding")?;
+        if binding.policy != *policy
+            || !matches!(
+                &reservation.preparation_launch_gate,
+                Some(HostWorkerLaunchGate::Consumed { .. })
+            )
+        {
+            bail!("preparation process exit requires a consumed matching host launch permit");
+        }
+    }
+
     if reservation.identity.store_id != store_id
         || reservation.identity.run_id != receipt.run_id
         || reservation.identity.task_id != receipt.task_id
@@ -1583,6 +3230,8 @@ fn replay_released_preparation_reservation(
         released_worker_lease: None,
         preparation_receipt: Some(receipt.clone()),
         released_preparation_lease: Some(lease.clone()),
+        unadmitted_task: None,
+        preparation_launch_owner: reservation.preparation_launch_owner.clone(),
     };
     let proof_bytes = bounded_json_bytes(
         &proof,
@@ -1623,7 +3272,95 @@ fn validate_release_proof(
     {
         bail!("host release proof differs from the pinned host reservation");
     }
+    if !matches!(
+        proof.kind,
+        HostResourceReleaseProofKind::AdmissionAbsent
+            | HostResourceReleaseProofKind::PreparationAdmissionAbsent
+            | HostResourceReleaseProofKind::PreparationNoSpawn
+    ) && proof.unadmitted_task.is_some()
+    {
+        bail!("process release proof cannot contain unpublished admission evidence");
+    }
+    if proof.kind != HostResourceReleaseProofKind::Preparation
+        && proof.preparation_launch_owner.is_some()
+    {
+        bail!("non-preparation proof cannot contain a preparation spawn owner");
+    }
     match proof.kind {
+        HostResourceReleaseProofKind::PreparationNoSpawn => {
+            if proof.worker_receipt.is_some()
+                || proof.released_worker_lease.is_some()
+                || proof.preparation_receipt.is_some()
+            {
+                bail!("preparation no-spawn proof cannot contain process-exit evidence");
+            }
+            let lease = proof
+                .released_preparation_lease
+                .as_ref()
+                .context("preparation no-spawn proof lacks released lease")?;
+            let task = proof
+                .unadmitted_task
+                .as_ref()
+                .context("preparation no-spawn proof lacks cancelled task certificate")?;
+            validate_no_spawn_preparation_lease(
+                root,
+                policy,
+                reservation,
+                &proof.store_id,
+                lease,
+                task,
+            )
+        }
+        HostResourceReleaseProofKind::PreparationAdmissionAbsent => {
+            if proof.worker_receipt.is_some()
+                || proof.released_worker_lease.is_some()
+                || proof.preparation_receipt.is_some()
+                || proof.released_preparation_lease.is_some()
+                || reservation.preparation_launch_gate != Some(HostWorkerLaunchGate::Closed)
+                || reservation.preparation_launch_owner.is_some()
+            {
+                bail!("unpublished preparation proof requires a closed unused gate and no process evidence");
+            }
+            let task = proof
+                .unadmitted_task
+                .as_ref()
+                .context("unpublished preparation proof has no accepted task certificate")?;
+            if !unprepared_task_matches_reservation(task, reservation)? {
+                bail!("unpublished preparation certificate differs from the reserved task");
+            }
+            Ok(())
+        }
+        HostResourceReleaseProofKind::AdmissionAbsent => {
+            if proof.worker_receipt.is_some()
+                || proof.released_worker_lease.is_some()
+                || proof.preparation_receipt.is_some()
+                || proof.released_preparation_lease.is_some()
+                || reservation.worker_launch_gate != Some(HostWorkerLaunchGate::Closed)
+            {
+                bail!("unpublished admission proof requires a closed gate and no process evidence");
+            }
+            let task = proof
+                .unadmitted_task
+                .as_ref()
+                .context("unpublished admission proof has no queued task certificate")?;
+            if !unadmitted_task_matches_reservation(task, reservation)? {
+                bail!("unpublished admission certificate differs from the reserved task epoch");
+            }
+            Ok(())
+        }
+        HostResourceReleaseProofKind::WorkerNoSpawn => {
+            if proof.worker_receipt.is_some()
+                || proof.preparation_receipt.is_some()
+                || proof.released_preparation_lease.is_some()
+            {
+                bail!("worker no-spawn proof cannot contain process-exit evidence");
+            }
+            let lease = proof
+                .released_worker_lease
+                .as_ref()
+                .context("worker no-spawn proof has no released lease")?;
+            validate_no_spawn_worker_lease(root, reservation, policy, &proof.store_id, lease)
+        }
         HostResourceReleaseProofKind::Worker => {
             let receipt = proof
                 .worker_receipt
@@ -1645,6 +3382,9 @@ fn validate_release_proof(
             )
         }
         HostResourceReleaseProofKind::Preparation => {
+            if proof.preparation_launch_owner != reservation.preparation_launch_owner {
+                bail!("preparation release proof differs from its durable spawn owner");
+            }
             let receipt = proof
                 .preparation_receipt
                 .as_ref()
@@ -1655,6 +3395,13 @@ fn validate_release_proof(
                 .context("preparation release proof has no typed released resource lease")?;
             if proof.worker_receipt.is_some() || proof.released_worker_lease.is_some() {
                 bail!("preparation release proof contains worker evidence");
+            }
+            if lease
+                .host_launch_binding
+                .as_ref()
+                .is_some_and(|binding| binding.ledger_root != root)
+            {
+                bail!("preparation release proof is bound to another ledger root");
             }
             validate_reservation_matches_preparation_exit(
                 reservation,
@@ -1751,6 +3498,7 @@ mod tests {
             heartbeat_at: now,
             heartbeat_sequence: 4,
             released_at: Some(now),
+            host_launch_binding: None,
         };
         let receipt = FmsWorkerProcessExitReceipt {
             schema_version: crate::types::FMS_WORKER_PROCESS_EXIT_RECEIPT_SCHEMA.to_string(),
@@ -1792,7 +3540,9 @@ mod tests {
             budget(1000, 2000, 1000),
             &[0],
         );
-        let reservation = HostResourceReservation::from_request(&request).unwrap();
+        let mut reservation = HostResourceReservation::from_request(&request).unwrap();
+        // Legacy unbound exit evidence predates versioned preparation permits.
+        reservation.preparation_launch_gate = None;
         let now = chrono::Utc::now();
         let lease = FmsPreparationResourceLease {
             schema_version: crate::types::FMS_PREPARATION_RESOURCE_LEASE_SCHEMA.to_string(),
@@ -1807,6 +3557,7 @@ mod tests {
             heartbeat_at: now,
             heartbeat_sequence: 3,
             released_at: Some(now),
+            host_launch_binding: None,
         };
         let receipt = FmsPreparationProcessExitReceipt {
             schema_version: crate::types::FMS_PREPARATION_PROCESS_EXIT_RECEIPT_SCHEMA.to_string(),
@@ -1826,6 +3577,119 @@ mod tests {
             observed_at: now,
         };
         (policy, request, reservation, receipt, lease)
+    }
+
+    struct PreparationAdmissionFixture {
+        _directory: tempfile::TempDir,
+        store: SessionStore,
+        ledger: HostResourceLedger,
+        request: HostReservationRequest,
+        pool: crate::FmsPreparationResourcePool,
+        lease: FmsPreparationResourceLease,
+    }
+
+    fn preparation_admission_fixture() -> PreparationAdmissionFixture {
+        let (policy, mut request, _reservation, _receipt, mut lease) =
+            preparation_release_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        let ledger_root = directory.path().join("host-ledger");
+        let ledger = HostResourceLedger::initialize(&ledger_root, policy.clone()).unwrap();
+
+        request.identity.store_id = HostResourceLedger::store_id(store.root()).unwrap();
+        lease.state = FmsResourceLeaseState::Active;
+        lease.heartbeat_sequence = 0;
+        lease.released_at = None;
+        lease.host_launch_binding = Some(ledger.worker_launch_binding());
+        store
+            .commit_run_catalog(&crate::FmsRunCatalog {
+                schema_version: crate::FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: lease.run_id.clone(),
+                revision: 1,
+                updated_at: chrono::Utc::now(),
+                tasks: vec![crate::FmsTaskCatalogEntry {
+                    task_id: lease.task_id.clone(),
+                    input_fingerprint: "a".repeat(64),
+                    lifecycle: crate::FmsTaskLifecycle::Accepted,
+                    readiness: crate::FmsTaskReadiness::Blocked {
+                        reason: crate::FMS_TASK_AWAITING_PREPARATION_REASON.into(),
+                    },
+                    observation: None,
+                    attempt_id: None,
+                    ownership_epoch: None,
+                    resolved_input_fingerprint: None,
+                    artifact_ids: Vec::new(),
+                    resource_id: None,
+                    coordinator_watermark: None,
+                    coordinator_genesis: None,
+                }],
+            })
+            .unwrap();
+        let pool = crate::FmsPreparationResourcePool {
+            schema_version: crate::FMS_PREPARATION_RESOURCE_POOL_SCHEMA.into(),
+            pool_id: "prep-pool".into(),
+            generation: 1,
+            resources: vec![crate::FmsPreparationResourceOffer {
+                resource_id: lease.resource_id.clone(),
+                budget: lease.budget.clone(),
+            }],
+        };
+        store.commit_preparation_resource_pool(0, &pool).unwrap();
+
+        PreparationAdmissionFixture {
+            _directory: directory,
+            store,
+            ledger,
+            request,
+            pool,
+            lease,
+        }
+    }
+
+    fn promote_preparation_fixture(
+        fixture: &PreparationAdmissionFixture,
+    ) -> FmsPreparationResourceLease {
+        assert!(fixture
+            .ledger
+            .try_commit_preparation_resource_lease_from_pool(
+                &fixture.request,
+                &fixture.store,
+                &fixture.pool.pool_id,
+                fixture.pool.generation,
+                0,
+                &fixture.lease,
+            )
+            .unwrap()
+            .is_some());
+        fixture
+            .store
+            .read_preparation_resource_lease(
+                &fixture.lease.run_id,
+                &fixture.lease.resource_id,
+                &fixture.lease.lease_token,
+            )
+            .unwrap()
+            .unwrap()
+    }
+
+    fn cancel_preparation_fixture_task(fixture: &PreparationAdmissionFixture) {
+        let mut catalog = fixture
+            .store
+            .read_run_catalog(&fixture.lease.run_id)
+            .unwrap()
+            .unwrap();
+        catalog.revision += 1;
+        catalog.updated_at = chrono::Utc::now();
+        let task = catalog
+            .tasks
+            .iter_mut()
+            .find(|task| task.task_id == fixture.lease.task_id)
+            .unwrap();
+        task.lifecycle = crate::FmsTaskLifecycle::Cancelled;
+        task.attempt_id = None;
+        task.ownership_epoch = None;
+        task.resource_id = None;
+        fixture.store.commit_run_catalog(&catalog).unwrap();
     }
 
     fn preparation_request(
@@ -1900,6 +3764,49 @@ mod tests {
         let root = base.join(name);
         fs::create_dir(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn provisional_capacity_wait_preserves_snapshot_but_corruption_is_not_a_wait() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = policy();
+        let root = ledger_root(directory.path());
+        let ledger = HostResourceLedger::initialize(&root, policy.clone()).unwrap();
+        let store_id = format!("sha256:{}", "1".repeat(64));
+        let first = request(
+            &policy,
+            &store_id,
+            "first",
+            budget(4000, 1000, 1000),
+            &[],
+            &[],
+            &[],
+        );
+        ledger.reserve(&first).unwrap();
+        let persisted = std::fs::read(root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap();
+        let mut candidate = ledger.read_document_locked().unwrap();
+        let waiting = request(
+            &policy,
+            &store_id,
+            "waiting",
+            budget(1, 1, 1),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(try_insert_admission(&mut candidate, &waiting, &root)
+            .unwrap()
+            .is_none());
+        assert_eq!(candidate.reservations.len(), 1);
+        assert_eq!(
+            std::fs::read(root.join(HOST_RESOURCE_LEDGER_FILE)).unwrap(),
+            persisted
+        );
+
+        candidate.reservations[0].request_sha256 = "0".repeat(64);
+        let error = try_insert_admission(&mut candidate, &waiting, &root).unwrap_err();
+        assert!(!error.is::<HostResourceCapacityUnavailable>());
+        assert!(error.to_string().contains("digest"));
     }
 
     #[test]
@@ -2154,6 +4061,91 @@ mod tests {
     }
 
     #[test]
+    fn no_spawn_proof_requires_closed_gate_and_exact_released_host_binding() {
+        let (policy, request, mut reservation, receipt, mut lease) = worker_release_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("host");
+        reservation.worker_launch_gate = Some(HostWorkerLaunchGate::Closed);
+        lease.host_launch_binding = Some(crate::FmsHostLaunchBinding {
+            schema_version: "host_launch_binding.v1".into(),
+            ledger_root: root.clone(),
+            policy: policy.clone(),
+        });
+        assert!(validate_no_spawn_worker_lease(
+            &root,
+            &reservation,
+            &policy,
+            &request.identity.store_id,
+            &lease
+        )
+        .is_ok());
+        assert!(validate_reservation_matches_worker_exit(
+            &reservation,
+            &policy,
+            &request.identity.store_id,
+            &receipt,
+            &lease
+        )
+        .is_err());
+        let mut consumed = reservation.clone();
+        consumed.worker_launch_gate = Some(HostWorkerLaunchGate::Consumed {
+            token: uuid::Uuid::new_v4().to_string(),
+        });
+        assert!(validate_reservation_matches_worker_exit(
+            &consumed,
+            &policy,
+            &request.identity.store_id,
+            &receipt,
+            &lease
+        )
+        .is_ok());
+        assert!(validate_no_spawn_worker_lease(
+            &root,
+            &consumed,
+            &policy,
+            &request.identity.store_id,
+            &lease
+        )
+        .is_err());
+        let mut active = lease.clone();
+        active.state = FmsResourceLeaseState::Active;
+        active.released_at = None;
+        assert!(validate_no_spawn_worker_lease(
+            &root,
+            &reservation,
+            &policy,
+            &request.identity.store_id,
+            &active
+        )
+        .is_err());
+        let mut wrong_binding = lease.clone();
+        wrong_binding
+            .host_launch_binding
+            .as_mut()
+            .unwrap()
+            .policy
+            .owner_epoch += 1;
+        assert!(validate_no_spawn_worker_lease(
+            &root,
+            &reservation,
+            &policy,
+            &request.identity.store_id,
+            &wrong_binding
+        )
+        .is_err());
+        let mut unbound = lease.clone();
+        unbound.host_launch_binding = None;
+        assert!(validate_no_spawn_worker_lease(
+            &root,
+            &reservation,
+            &policy,
+            &request.identity.store_id,
+            &unbound
+        )
+        .is_err());
+    }
+
+    #[test]
     fn worker_admission_pins_local_resource_id_and_owner_epoch() {
         let (_policy, request, _reservation, _receipt, mut lease) = worker_release_fixture();
         lease.state = FmsResourceLeaseState::Active;
@@ -2193,6 +4185,8 @@ mod tests {
             released_worker_lease: Some(lease.clone()),
             preparation_receipt: None,
             released_preparation_lease: None,
+            unadmitted_task: None,
+            preparation_launch_owner: None,
         };
         let proof_bytes = bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "proof").unwrap();
         let proof_sha256 = format!("{:x}", Sha256::digest(&proof_bytes));
@@ -2410,6 +4404,557 @@ mod tests {
     }
 
     #[test]
+    fn preparation_admission_reconciles_exact_bound_local_lease_once() {
+        let fixture = preparation_admission_fixture();
+        fixture.ledger.reserve(&fixture.request).unwrap();
+        let tentative = fixture
+            .ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity == fixture.request.identity)
+            .unwrap();
+        assert_eq!(tentative.state, HostResourceReservationState::Tentative);
+        assert_eq!(
+            tentative.preparation_launch_gate,
+            Some(HostWorkerLaunchGate::Pending)
+        );
+        assert!(tentative.preparation_launch_owner.is_none());
+
+        assert_eq!(
+            fixture
+                .store
+                .commit_preparation_resource_lease(&fixture.lease)
+                .unwrap(),
+            PreparationResourceLeaseCommitDisposition::Acquired
+        );
+        assert_eq!(
+            fixture
+                .store
+                .read_preparation_resource_lease(
+                    &fixture.lease.run_id,
+                    &fixture.lease.resource_id,
+                    &fixture.lease.lease_token,
+                )
+                .unwrap(),
+            Some(fixture.lease.clone())
+        );
+
+        assert!(fixture
+            .ledger
+            .reconcile_preparation_admission(&fixture.store, &fixture.request.identity)
+            .unwrap());
+        let committed = fixture
+            .ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity == fixture.request.identity)
+            .unwrap();
+        assert_eq!(committed.state, HostResourceReservationState::Committed);
+        assert_eq!(
+            committed.preparation_launch_gate,
+            Some(HostWorkerLaunchGate::Pending)
+        );
+        assert!(committed.preparation_launch_owner.is_none());
+        assert!(fixture
+            .store
+            .list_preparation_process_launches(&fixture.lease.run_id)
+            .unwrap()
+            .is_empty());
+        assert!(!fixture
+            .ledger
+            .reconcile_preparation_admission(&fixture.store, &fixture.request.identity)
+            .unwrap());
+        assert_eq!(
+            fixture
+                .ledger
+                .read()
+                .unwrap()
+                .reservations
+                .into_iter()
+                .find(|reservation| reservation.identity == fixture.request.identity)
+                .unwrap(),
+            committed
+        );
+    }
+
+    #[test]
+    fn preparation_admission_keeps_tentative_reservation_for_wrong_lease_binding() {
+        let fixture = preparation_admission_fixture();
+        fixture.ledger.reserve(&fixture.request).unwrap();
+        let mut wrong_binding_lease = fixture.lease.clone();
+        wrong_binding_lease
+            .host_launch_binding
+            .as_mut()
+            .unwrap()
+            .policy
+            .revision += 1;
+        fixture
+            .store
+            .commit_preparation_resource_lease(&wrong_binding_lease)
+            .unwrap();
+
+        assert!(fixture
+            .ledger
+            .reconcile_preparation_admission(&fixture.store, &fixture.request.identity)
+            .is_err());
+        let retained = fixture
+            .ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity == fixture.request.identity)
+            .unwrap();
+        assert_eq!(retained.state, HostResourceReservationState::Tentative);
+        assert_eq!(
+            retained.preparation_launch_gate,
+            Some(HostWorkerLaunchGate::Pending)
+        );
+        assert!(retained.preparation_launch_owner.is_none());
+    }
+
+    #[test]
+    fn cancellation_intent_prevents_new_host_reservation_before_projection() {
+        let fixture = preparation_admission_fixture();
+        let lease = &fixture.lease;
+        fixture
+            .store
+            .request_task_cancellation_intent(
+                &lease.run_id,
+                &lease.task_id,
+                "cancel-new-reservation",
+                1,
+                "cancel before admission",
+            )
+            .unwrap();
+        assert!(fixture
+            .ledger
+            .try_commit_preparation_resource_lease_from_pool(
+                &fixture.request,
+                &fixture.store,
+                &fixture.pool.pool_id,
+                fixture.pool.generation,
+                0,
+                lease,
+            )
+            .unwrap()
+            .is_none());
+        assert!(fixture.ledger.read().unwrap().reservations.is_empty());
+        assert!(fixture
+            .ledger
+            .project_unclaimed_task_cancellation(&fixture.store, &lease.run_id, &lease.task_id,)
+            .unwrap());
+        assert_eq!(
+            fixture
+                .store
+                .read_run_catalog(&lease.run_id)
+                .unwrap()
+                .unwrap()
+                .tasks[0]
+                .lifecycle,
+            crate::FmsTaskLifecycle::Cancelled
+        );
+        assert!(!fixture
+            .ledger
+            .project_unclaimed_task_cancellation(&fixture.store, &lease.run_id, &lease.task_id,)
+            .unwrap());
+    }
+
+    #[test]
+    fn cancellation_intent_fences_preparation_spawn_without_releasing_capacity() {
+        let fixture = preparation_admission_fixture();
+        let lease = promote_preparation_fixture(&fixture);
+        let launch = crate::FmsPreparationProcessLaunch {
+            schema_version: crate::FMS_PREPARATION_PROCESS_LAUNCH_SCHEMA.into(),
+            launch_id: "prep-launch-cancel-intent".into(),
+            run_id: lease.run_id.clone(),
+            task_id: lease.task_id.clone(),
+            preparation_attempt_id: lease.preparation_attempt_id.clone(),
+            resource_id: lease.resource_id.clone(),
+            lease_token: lease.lease_token.clone(),
+            lease_heartbeat_sequence: lease.heartbeat_sequence,
+            supervisor_process_id: 41,
+            supervisor_start_token: Some("fixture-publisher".into()),
+            created_at: chrono::Utc::now(),
+        };
+        fixture
+            .store
+            .commit_preparation_process_launch(&launch)
+            .unwrap();
+        let revision = fixture
+            .store
+            .read_run_catalog(&lease.run_id)
+            .unwrap()
+            .unwrap()
+            .revision;
+        fixture
+            .store
+            .request_task_cancellation_intent(
+                &lease.run_id,
+                &lease.task_id,
+                "cancel-before-spawn",
+                revision,
+                "cancel preparation",
+            )
+            .unwrap();
+        assert!(fixture
+            .ledger
+            .authorize_preparation_launch(
+                &fixture.store,
+                &lease,
+                &launch,
+                Some("fixture-current".into()),
+            )
+            .is_err());
+        let held = fixture
+            .ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|row| row.identity == fixture.request.identity)
+            .unwrap();
+        assert_eq!(held.state, HostResourceReservationState::Committed);
+        assert_eq!(
+            held.preparation_launch_gate,
+            Some(HostWorkerLaunchGate::Pending)
+        );
+        assert!(held.preparation_launch_owner.is_none());
+        assert!(held.release_proof_sha256.is_none());
+        assert_eq!(
+            fixture
+                .store
+                .read_preparation_resource_lease(
+                    &lease.run_id,
+                    &lease.resource_id,
+                    &lease.lease_token,
+                )
+                .unwrap()
+                .unwrap()
+                .state,
+            FmsResourceLeaseState::Active
+        );
+        assert_eq!(
+            fixture
+                .store
+                .read_run_catalog(&lease.run_id)
+                .unwrap()
+                .unwrap()
+                .tasks[0]
+                .lifecycle,
+            crate::FmsTaskLifecycle::Accepted
+        );
+        assert!(fixture
+            .ledger
+            .project_unclaimed_task_cancellation(&fixture.store, &lease.run_id, &lease.task_id,)
+            .unwrap());
+        let closed = fixture
+            .ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|row| row.identity == fixture.request.identity)
+            .unwrap();
+        assert_eq!(
+            closed.preparation_launch_gate,
+            Some(HostWorkerLaunchGate::Closed)
+        );
+        assert_eq!(closed.state, HostResourceReservationState::Committed);
+        assert!(closed.release_proof_sha256.is_none());
+        assert!(fixture
+            .ledger
+            .release_cancelled_preparation_without_spawn(&fixture.store, &fixture.request.identity,)
+            .unwrap());
+        assert!(!fixture
+            .ledger
+            .release_cancelled_preparation_without_spawn(&fixture.store, &fixture.request.identity,)
+            .unwrap());
+    }
+
+    #[test]
+    fn cancelled_preparation_releases_only_when_launch_permit_is_unused() {
+        let unused = preparation_admission_fixture();
+        let unused_lease = promote_preparation_fixture(&unused);
+        cancel_preparation_fixture_task(&unused);
+
+        assert!(unused
+            .ledger
+            .release_cancelled_preparation_without_spawn(&unused.store, &unused.request.identity,)
+            .unwrap());
+        let released = unused
+            .ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity == unused.request.identity)
+            .unwrap();
+        assert_eq!(released.state, HostResourceReservationState::Released);
+        assert_eq!(
+            released.preparation_launch_gate,
+            Some(HostWorkerLaunchGate::Closed)
+        );
+        assert!(released.preparation_launch_owner.is_none());
+        assert!(released.release_proof_sha256.is_some());
+        assert_eq!(
+            unused
+                .store
+                .read_preparation_resource_lease(
+                    &unused_lease.run_id,
+                    &unused_lease.resource_id,
+                    &unused_lease.lease_token,
+                )
+                .unwrap()
+                .unwrap()
+                .state,
+            FmsResourceLeaseState::Released
+        );
+        assert!(!unused
+            .ledger
+            .release_cancelled_preparation_without_spawn(&unused.store, &unused.request.identity,)
+            .unwrap());
+
+        let consumed = preparation_admission_fixture();
+        let consumed_lease = promote_preparation_fixture(&consumed);
+        let launch = crate::FmsPreparationProcessLaunch {
+            schema_version: crate::FMS_PREPARATION_PROCESS_LAUNCH_SCHEMA.into(),
+            launch_id: "prep-launch-cancel-consumed".into(),
+            run_id: consumed_lease.run_id.clone(),
+            task_id: consumed_lease.task_id.clone(),
+            preparation_attempt_id: consumed_lease.preparation_attempt_id.clone(),
+            resource_id: consumed_lease.resource_id.clone(),
+            lease_token: consumed_lease.lease_token.clone(),
+            lease_heartbeat_sequence: consumed_lease.heartbeat_sequence,
+            supervisor_process_id: std::process::id(),
+            supervisor_start_token: Some("fixture-current-start".into()),
+            created_at: chrono::Utc::now(),
+        };
+        consumed
+            .store
+            .commit_preparation_process_launch(&launch)
+            .unwrap();
+        let launch_token = consumed
+            .ledger
+            .authorize_preparation_launch(
+                &consumed.store,
+                &consumed_lease,
+                &launch,
+                Some("fixture-current-start".into()),
+            )
+            .unwrap();
+        let revision = consumed
+            .store
+            .read_run_catalog(&consumed_lease.run_id)
+            .unwrap()
+            .unwrap()
+            .revision;
+        consumed
+            .store
+            .request_task_cancellation_intent(
+                &consumed_lease.run_id,
+                &consumed_lease.task_id,
+                "cancel-consumed",
+                revision,
+                "cancel active preparation",
+            )
+            .unwrap();
+        assert!(!consumed
+            .ledger
+            .project_unclaimed_task_cancellation(
+                &consumed.store,
+                &consumed_lease.run_id,
+                &consumed_lease.task_id,
+            )
+            .unwrap());
+        assert_eq!(
+            consumed
+                .store
+                .read_run_catalog(&consumed_lease.run_id)
+                .unwrap()
+                .unwrap()
+                .tasks[0]
+                .lifecycle,
+            crate::FmsTaskLifecycle::Accepted
+        );
+        cancel_preparation_fixture_task(&consumed);
+
+        assert!(!consumed
+            .ledger
+            .release_cancelled_preparation_without_spawn(
+                &consumed.store,
+                &consumed.request.identity,
+            )
+            .unwrap());
+        let retained = consumed
+            .ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity == consumed.request.identity)
+            .unwrap();
+        assert_eq!(retained.state, HostResourceReservationState::Committed);
+        assert_eq!(
+            retained.preparation_launch_gate,
+            Some(HostWorkerLaunchGate::Consumed {
+                token: launch_token,
+            })
+        );
+        assert!(retained.preparation_launch_owner.is_some());
+        assert!(retained.release_proof_sha256.is_none());
+        assert_eq!(
+            consumed
+                .store
+                .read_preparation_resource_lease(
+                    &consumed_lease.run_id,
+                    &consumed_lease.resource_id,
+                    &consumed_lease.lease_token,
+                )
+                .unwrap()
+                .unwrap()
+                .state,
+            FmsResourceLeaseState::Active
+        );
+    }
+
+    #[test]
+    fn preparation_launch_adopts_existing_intent_with_current_owner_once() {
+        let fixture = preparation_admission_fixture();
+        let store = &fixture.store;
+        let ledger = &fixture.ledger;
+        let request = &fixture.request;
+        let lease = &fixture.lease;
+        assert!(ledger
+            .try_commit_preparation_resource_lease_from_pool(
+                request,
+                store,
+                &fixture.pool.pool_id,
+                fixture.pool.generation,
+                0,
+                lease,
+            )
+            .unwrap()
+            .is_some());
+
+        let bound_lease = store
+            .read_preparation_resource_lease(&lease.run_id, &lease.resource_id, &lease.lease_token)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound_lease.state, FmsResourceLeaseState::Active);
+        assert_eq!(
+            bound_lease.host_launch_binding.as_ref(),
+            Some(&ledger.worker_launch_binding())
+        );
+        let launch = crate::FmsPreparationProcessLaunch {
+            schema_version: crate::FMS_PREPARATION_PROCESS_LAUNCH_SCHEMA.into(),
+            launch_id: "prep-launch-old".into(),
+            run_id: bound_lease.run_id.clone(),
+            task_id: bound_lease.task_id.clone(),
+            preparation_attempt_id: bound_lease.preparation_attempt_id.clone(),
+            resource_id: bound_lease.resource_id.clone(),
+            lease_token: bound_lease.lease_token.clone(),
+            lease_heartbeat_sequence: bound_lease.heartbeat_sequence,
+            supervisor_process_id: 41,
+            supervisor_start_token: Some("fixture-old".into()),
+            created_at: chrono::Utc::now(),
+        };
+        store.commit_preparation_process_launch(&launch).unwrap();
+
+        let pending = ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity == request.identity)
+            .unwrap();
+        assert_eq!(pending.state, HostResourceReservationState::Committed);
+        assert_eq!(
+            pending.preparation_launch_gate,
+            Some(HostWorkerLaunchGate::Pending)
+        );
+        assert!(pending.preparation_launch_owner.is_none());
+        assert!(ledger
+            .authorize_preparation_launch(&store, &bound_lease, &launch, None)
+            .is_err());
+        let after_missing_start_token = ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity == request.identity)
+            .unwrap();
+        assert_eq!(
+            after_missing_start_token.preparation_launch_gate,
+            Some(HostWorkerLaunchGate::Pending)
+        );
+        assert!(after_missing_start_token.preparation_launch_owner.is_none());
+        assert_eq!(
+            store
+                .read_preparation_process_launch(&launch.run_id, &launch.launch_id)
+                .unwrap(),
+            Some(launch.clone())
+        );
+
+        let launch_token = ledger
+            .authorize_preparation_launch(
+                &store,
+                &bound_lease,
+                &launch,
+                Some("fixture-current-start".into()),
+            )
+            .unwrap();
+        let consumed = ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity == request.identity)
+            .unwrap();
+        assert_eq!(
+            consumed.preparation_launch_gate,
+            Some(HostWorkerLaunchGate::Consumed {
+                token: launch_token.clone(),
+            })
+        );
+        let owner = consumed.preparation_launch_owner.as_ref().unwrap();
+        assert_eq!(owner.launch_id, launch.launch_id);
+        assert_eq!(
+            owner.launch_sha256,
+            crate::canonical_json_sha256(&serde_json::to_value(&launch).unwrap())
+        );
+        assert_eq!(owner.supervisor_process_id, std::process::id());
+        assert_eq!(
+            owner.supervisor_start_token.as_deref(),
+            Some("fixture-current-start")
+        );
+        assert!(ledger
+            .validate_preparation_launch(&store, &bound_lease, &launch_token)
+            .is_ok());
+        assert!(ledger
+            .validate_preparation_launch(&store, &bound_lease, "wrong-launch-token")
+            .is_err());
+        assert!(ledger
+            .authorize_preparation_launch(
+                &store,
+                &bound_lease,
+                &launch,
+                Some("second-start-token".into()),
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .read_preparation_process_launch(&launch.run_id, &launch.launch_id)
+                .unwrap(),
+            Some(launch)
+        );
+    }
+
+    #[test]
     fn preparation_release_requires_exact_released_lease_and_all_identity_fences() {
         let (policy, _request, reservation, receipt, lease) = preparation_release_fixture();
         let store_id = reservation.identity.store_id.clone();
@@ -2485,6 +5030,93 @@ mod tests {
     }
 
     #[test]
+    fn preparation_exit_requires_matching_consumed_gate_for_bound_lease() {
+        let (policy, _request, legacy_reservation, receipt, legacy_lease) =
+            preparation_release_fixture();
+        let store_id = legacy_reservation.identity.store_id.clone();
+        assert!(validate_reservation_matches_preparation_exit(
+            &legacy_reservation,
+            &policy,
+            &store_id,
+            &receipt,
+            &legacy_lease,
+        )
+        .is_ok());
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut bound_lease = legacy_lease.clone();
+        bound_lease.host_launch_binding = Some(crate::FmsHostLaunchBinding {
+            schema_version: crate::FMS_HOST_LAUNCH_BINDING_SCHEMA.into(),
+            ledger_root: directory.path().join("host-ledger"),
+            policy: policy.clone(),
+        });
+        let consumed_gate = HostWorkerLaunchGate::Consumed {
+            token: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        };
+        let mut bound_reservation = legacy_reservation.clone();
+        bound_reservation.preparation_launch_gate = Some(consumed_gate.clone());
+        bound_reservation.preparation_launch_owner = Some(HostPreparationLaunchOwner {
+            schema_version: "host_preparation_launch_owner.v1".into(),
+            launch_id: "launch-1".into(),
+            launch_sha256: "a".repeat(64),
+            supervisor_process_id: 41,
+            supervisor_start_token: Some("supervisor-bound".into()),
+        });
+        assert!(validate_reservation_matches_preparation_exit(
+            &bound_reservation,
+            &policy,
+            &store_id,
+            &receipt,
+            &bound_lease,
+        )
+        .is_ok());
+
+        for gate in [
+            Some(HostWorkerLaunchGate::Pending),
+            Some(HostWorkerLaunchGate::Closed),
+            None,
+        ] {
+            let mut invalid_reservation = bound_reservation.clone();
+            invalid_reservation.preparation_launch_gate = gate;
+            assert!(validate_reservation_matches_preparation_exit(
+                &invalid_reservation,
+                &policy,
+                &store_id,
+                &receipt,
+                &bound_lease,
+            )
+            .is_err());
+        }
+
+        let mut changed_policy_lease = bound_lease.clone();
+        changed_policy_lease
+            .host_launch_binding
+            .as_mut()
+            .unwrap()
+            .policy
+            .revision += 1;
+        assert!(validate_reservation_matches_preparation_exit(
+            &bound_reservation,
+            &policy,
+            &store_id,
+            &receipt,
+            &changed_policy_lease,
+        )
+        .is_err());
+
+        let mut wrong_attempt = receipt.clone();
+        wrong_attempt.preparation_attempt_id = "prep-attempt-other".to_string();
+        assert!(validate_reservation_matches_preparation_exit(
+            &bound_reservation,
+            &policy,
+            &store_id,
+            &wrong_attempt,
+            &bound_lease,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn preparation_release_proof_is_required_immutable_and_frees_capacity_only_after_validation() {
         let (policy, _request, mut released, receipt, lease) = preparation_release_fixture();
         let directory = tempfile::tempdir().unwrap();
@@ -2498,6 +5130,8 @@ mod tests {
             released_worker_lease: None,
             preparation_receipt: Some(receipt.clone()),
             released_preparation_lease: Some(lease.clone()),
+            unadmitted_task: None,
+            preparation_launch_owner: released.preparation_launch_owner.clone(),
         };
         let proof_bytes = bounded_json_bytes(&proof, MAX_RELEASE_PROOF_BYTES, "proof").unwrap();
         let proof_sha256 = format!("{:x}", Sha256::digest(&proof_bytes));

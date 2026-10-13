@@ -26,7 +26,7 @@ function selectedObject(): Selection {
 }
 
 describe("Object General authoring mutations", () => {
-  it("records identity edits against the captured scene revision and session", async () => {
+  it("keeps the draft revision as the identity edit CAS precondition", async () => {
     const before = scene(7);
     const after = scene(8);
     const record = vi.fn();
@@ -47,7 +47,7 @@ describe("Object General authoring mutations", () => {
 
     expect(sceneRead).toHaveBeenCalledWith({ sessionScopeKey: "session=test&epoch=1" });
     expect(patchObject).toHaveBeenCalledWith("magnet", {
-      base_revision: 7,
+      base_revision: 6,
       name: "Updated magnet",
       notes: "new notes",
     }, { sessionScopeKey: "session=test&epoch=1" });
@@ -57,6 +57,58 @@ describe("Object General authoring mutations", () => {
       committedRevision: 8,
       label: "Edit identity Updated magnet",
     }));
+  });
+
+  it("does not replace a stale identity draft CAS revision with a fresher history read", async () => {
+    const freshScene = scene(11);
+    const after = scene(12);
+    const patchObject = vi.fn(async () => after);
+
+    await patchObjectIdentityWithHistory({
+      api: { model: { patchObject, scene: vi.fn(async () => freshScene) } } as never,
+      authoringHistory: { record: vi.fn() } as never,
+      sessionScopeKey: "session=test&epoch=1",
+      source: "inspector",
+    } as never, {
+      baseRevision: 10,
+      name: "Draft name",
+      notes: "Draft notes",
+      objectId: "magnet",
+    });
+
+    expect(patchObject).toHaveBeenCalledWith("magnet", {
+      base_revision: 10,
+      name: "Draft name",
+      notes: "Draft notes",
+    }, { sessionScopeKey: "session=test&epoch=1" });
+  });
+
+  it("sends optional material and region metadata while preserving explicit clears", async () => {
+    const before = scene(7);
+    const after = scene(8);
+    const patchObject = vi.fn(async () => after);
+
+    await patchObjectIdentityWithHistory({
+      api: { model: { patchObject, scene: vi.fn(async () => before) } } as never,
+      authoringHistory: { record: vi.fn() } as never,
+      sessionScopeKey: "session=test&epoch=1",
+      source: "inspector",
+    } as never, {
+      baseRevision: 7,
+      materialRef: null,
+      name: "Updated magnet",
+      notes: "new notes",
+      objectId: "magnet",
+      regionName: "core",
+    });
+
+    expect(patchObject).toHaveBeenCalledWith("magnet", {
+      base_revision: 7,
+      material_ref: null,
+      name: "Updated magnet",
+      notes: "new notes",
+      region_name: "core",
+    }, { sessionScopeKey: "session=test&epoch=1" });
   });
 
   it("clears the deleted object's selection before recording history", async () => {

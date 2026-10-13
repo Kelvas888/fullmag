@@ -25,6 +25,12 @@ import type {
   SimulationPreparationResource,
   AnalysisResultPageQuery,
   OutputStorageSettings,
+  ProjectBatchCasesQuery,
+  ProjectBatchCasesResource,
+  ProjectBatchListQuery,
+  ProjectBatchListResource,
+  ProjectBatchSubmitRequest,
+  ProjectBatchSubmitResource,
 } from "./apiTypes";
 import {
   ANALYSIS_RESULT_BRANCH_POINTS_PATH,
@@ -5328,6 +5334,85 @@ describe("ControlRoomApi", () => {
     expect(url.pathname).toBe("/v2/persistence/projects/project-1/runs");
     expect(url.searchParams.get("limit")).toBe("10");
     expect(url.searchParams.get("cursor")).toBe("run-prev");
+  });
+
+  it("submits and pages project batches through the typed persistence facade", async () => {
+    const requests: Array<{ body: unknown; method: string | undefined; url: string }> = [];
+    const batchRequest: ProjectBatchSubmitRequest = {
+      archive_base64: "Zg==",
+      idempotency_key: "submit-batch-1",
+      batch_request: { batch_id: "batch-1" },
+      study_plan: { schema_version: "study_plan.v2" },
+      study_problem_catalog: { schema_version: "study_problem_catalog.v3" },
+      asset_paths: {},
+    };
+    const accepted: ProjectBatchSubmitResource = {
+      disposition: "accepted",
+      batch_id: "batch-1",
+      manifest_sha256: "a".repeat(64),
+      case_count: 2,
+    };
+    const batchPage: ProjectBatchListResource = {
+      project_id: "project-1",
+      batches: [{
+        batch_id: "batch-1",
+        accepted_at: "2026-10-07T00:00:00Z",
+        manifest_sha256: accepted.manifest_sha256,
+        case_count: 2,
+        max_parallel_cases: 2,
+        failure_policy: "continue_independent",
+        published_case_count: 0,
+        expansion_state: "pending",
+      }],
+      next_cursor: null,
+    };
+    const casesPage: ProjectBatchCasesResource = {
+      batch_id: "batch-1",
+      axes: [{ name: "field_z", canonical_unit: "T" }],
+      cases: [{
+        case_id: "case-" + "b".repeat(64),
+        planned_run_id: "run-planned-1",
+        parameter_tuple: { field_z: -0.01 },
+        state: "pending_expansion",
+      }],
+      next_cursor: null,
+    };
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          body: init?.body ? parseRequestBody(init.body) : null,
+          method: init?.method,
+          url,
+        });
+        if (init?.method === "POST") return jsonResponse(accepted, { status: 201 });
+        if (url.includes("/cases")) return jsonResponse(casesPage);
+        return jsonResponse(batchPage);
+      },
+    });
+
+    const submitted = await api.persistence.projects.submitBatch("project-1", batchRequest);
+    const batchQuery: ProjectBatchListQuery = { limit: 25, cursor: "batch-prev" };
+    const listed = await api.persistence.projects.listBatches("project-1", batchQuery);
+    const casesQuery: ProjectBatchCasesQuery = { limit: 10 };
+    const cases = await api.persistence.projects.listBatchCases(
+      "project-1", "batch-1", casesQuery,
+    );
+
+    expect(submitted).toEqual(accepted);
+    expect(listed).toEqual(batchPage);
+    expect(cases).toEqual(casesPage);
+    expect(requests.map(({ method, url }) => ({ method, url: new URL(url).pathname }))).toEqual([
+      { method: "POST", url: "/v2/persistence/projects/project-1/batches" },
+      { method: "GET", url: "/v2/persistence/projects/project-1/batches" },
+      { method: "GET", url: "/v2/persistence/projects/project-1/batches/batch-1/cases" },
+    ]);
+    expect(requests[0]?.body).toEqual(batchRequest);
+    const batchListUrl = new URL(requests[1]!.url);
+    expect(batchListUrl.searchParams.get("limit")).toBe("25");
+    expect(batchListUrl.searchParams.get("cursor")).toBe("batch-prev");
+    expect(new URL(requests[2]!.url).searchParams.get("limit")).toBe("10");
   });
 
   it("loads and patches object interaction resources through v2 model facade methods", async () => {

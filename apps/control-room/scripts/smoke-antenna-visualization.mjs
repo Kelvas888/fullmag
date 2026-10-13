@@ -32,9 +32,9 @@ try {
     if (ready) await page.waitForFunction(() => document.querySelector('[data-inspector-owner="object.antenna.visualization"] button[aria-label="Toggle Points"]')?.matches(":enabled"));
     assert.equal(await root.locator('[data-slot="object-visualization-overview"]').count(), 1);
     assert.equal(await root.getByRole("radiogroup", { name: "Render mode", exact: true }).count(), 1);
-    for (const label of ["Surface", "Wireframe"]) assert.equal(await root.getByRole("button", { name: `Toggle ${label}`, exact: true }).isEnabled(), false);
-    for (const label of ["Points", "Vectors"]) assert.equal(await root.getByRole("button", { name: `Toggle ${label}`, exact: true }).isEnabled(), ready);
-    for (const label of ["Carrier", "Color source", "Color range", "Vector component"]) assert.equal(await root.getByRole("combobox", { name: label, exact: true }).isEnabled(), false);
+    for (const enabled of await Promise.all(["Surface", "Wireframe"].map((label) => root.getByRole("button", { name: `Toggle ${label}`, exact: true }).isEnabled()))) assert.equal(enabled, false);
+    for (const enabled of await Promise.all(["Points", "Vectors"].map((label) => root.getByRole("button", { name: `Toggle ${label}`, exact: true }).isEnabled()))) assert.equal(enabled, ready);
+    for (const enabled of await Promise.all(["Carrier", "Color source", "Color range", "Vector component"].map((label) => root.getByRole("combobox", { name: label, exact: true }).isEnabled()))) assert.equal(enabled, false);
     assert.equal(await root.getByRole("combobox", { name: "Component", exact: true }).isEnabled(), ready);
     assert.equal(await root.getByRole("checkbox", { name: "Show vectors", exact: true }).isEnabled(), ready);
     assert.ok((await root.innerText()).includes("conductor primitive is never recolored"));

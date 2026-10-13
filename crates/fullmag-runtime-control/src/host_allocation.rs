@@ -3,21 +3,94 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use fullmag_application::{ResourceKind, TaskClaim};
 use fullmag_session::host_resource_ledger::{
     HostReservationIdentity, HostReservationOwner, HostReservationRequest, HostResourceLedger,
 };
 use fullmag_session::{FmsPreparationResourceLease, FmsResourceBudget, SessionStore};
-use serde::{Deserialize, Serialize};
-
 /// Placement supplied by the configured topology owner. Empty CPU IDs mean
 /// aggregate budgeting, not evidence of affinity or OS enforcement.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub type HostTaskPlacement = fullmag_session::runtime_service_host::RuntimeServiceHostPlacement;
+
+/// Preserve the authored ordinal. Its physical identity must have been captured
+/// in the importing process before the child receives a UUID visibility mask.
+pub fn legacy_cuda_device_index(problem: &fullmag_ir::ProblemIR) -> Result<Option<usize>> {
+    let index = problem
+        .problem_meta
+        .runtime_metadata
+        .get("runtime_selection")
+        .and_then(|selection| selection.get("device_index"))
+        .filter(|index| !index.is_null());
+    index
+        .map(|value| {
+            let ordinal = value.as_u64().ok_or_else(|| {
+                anyhow::anyhow!("legacy CUDA device_index must be a nonnegative integer")
+            })?;
+            usize::try_from(ordinal).map_err(anyhow::Error::from)
+        })
+        .transpose()
+}
+
+#[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HostTaskPlacement {
-    pub cpu_ids: BTreeSet<u32>,
-    pub gpu_uuid: Option<String>,
+struct LegacyCudaBinding {
+    schema_version: String,
+    ordinal: usize,
+    cuda_visible_devices: Option<String>,
+    gpu_uuid: Option<String>,
+    #[serde(default)]
+    resolution_error: Option<String>,
+}
+
+/// A different eligible offer is a scheduling mismatch, not an intent rewrite.
+/// Require the importer's frozen UUID; scheduler ordering may have changed.
+pub fn host_gpu_ordinal_matches_placement(
+    problem: &fullmag_ir::ProblemIR,
+    visible_uuids: &[String],
+    policy_uuids: &BTreeMap<String, u64>,
+    placement: &HostTaskPlacement,
+) -> Result<bool> {
+    let Some(ordinal) = legacy_cuda_device_index(problem)? else {
+        return Ok(true);
+    };
+    let value = problem.problem_meta.runtime_metadata
+        .get("runtime_selection")
+        .and_then(|selection| selection.get("legacy_cuda_binding"))
+        .ok_or_else(|| anyhow::anyhow!("legacy CUDA ordinal {ordinal} has no importer UUID binding; choose a physical GPU explicitly"))?;
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("cuda_visible_devices"))
+    {
+        bail!("legacy CUDA binding is missing the importing process visibility mask");
+    }
+    let binding: LegacyCudaBinding = serde_json::from_value(value.clone())?;
+    if binding.schema_version != "legacy_cuda_binding.v1" || binding.ordinal != ordinal {
+        bail!("legacy CUDA binding differs from the authored ordinal or schema");
+    }
+    // The mask is provenance for the import, not an environment override.
+    let _import_visibility = binding.cuda_visible_devices;
+    if binding.resolution_error.is_some() {
+        bail!("legacy CUDA ordinal {ordinal} could not be resolved by the importer; choose a physical GPU explicitly");
+    }
+    let uuid = binding
+        .gpu_uuid
+        .context("legacy CUDA importer binding has no physical UUID")?;
+    let suffix = uuid
+        .strip_prefix("GPU-")
+        .context("legacy CUDA binding requires a full GPU UUID")?;
+    if uuid::Uuid::parse_str(suffix)?.to_string() != suffix {
+        bail!("legacy CUDA importer UUID must be canonical and complete");
+    }
+    if !visible_uuids.contains(&uuid) {
+        bail!(
+            "imported CUDA ordinal {ordinal} is pinned to {uuid}, which is not currently visible"
+        );
+    }
+    if !policy_uuids.contains_key(&uuid) {
+        bail!("legacy CUDA ordinal {ordinal} resolves to {uuid}, which is excluded from the physical host policy");
+    }
+    Ok(placement.gpu_uuid.as_ref() == Some(&uuid))
 }
 
 /// Pin the claim's local offer, attempt and budget to one physical host request.
@@ -183,6 +256,90 @@ mod tests {
                 },
             )
             .unwrap(),
+        }
+    }
+
+    #[test]
+    fn explicit_legacy_ordinals_select_only_the_matching_physical_offer() {
+        let other = "GPU-00000000-0000-4000-8000-000000000002".to_owned();
+        let visible = vec![GPU.to_owned(), other.clone()];
+        let allowed = BTreeMap::from([(GPU.to_owned(), 8192), (other.clone(), 8192)]);
+        let placement = HostTaskPlacement {
+            cpu_ids: BTreeSet::new(),
+            gpu_uuid: Some(GPU.to_owned()),
+        };
+        for ordinal in [0, 1] {
+            let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+            problem.problem_meta.runtime_metadata.insert(
+                "runtime_selection".into(),
+                serde_json::json!({
+                    "device": "cuda", "device_index": ordinal, "gpu_count": 1,
+                    "legacy_cuda_binding": {
+                        "schema_version": "legacy_cuda_binding.v1",
+                        "ordinal": ordinal,
+                        "cuda_visible_devices": null,
+                        "gpu_uuid": visible[ordinal],
+                    }
+                }),
+            );
+            assert_eq!(
+                host_gpu_ordinal_matches_placement(&problem, &visible, &allowed, &placement)
+                    .unwrap(),
+                ordinal == 0
+            );
+            let reordered = vec![other.clone(), GPU.to_owned()];
+            assert_eq!(
+                host_gpu_ordinal_matches_placement(&problem, &reordered, &allowed, &placement)
+                    .unwrap(),
+                ordinal == 0
+            );
+            assert!(host_gpu_ordinal_matches_placement(
+                &problem,
+                &visible,
+                &BTreeMap::new(),
+                &placement
+            )
+            .is_err());
+            assert!(
+                host_gpu_ordinal_matches_placement(&problem, &[], &allowed, &placement).is_err()
+            );
+        }
+        let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        problem.problem_meta.runtime_metadata.insert(
+            "runtime_selection".into(),
+            serde_json::json!({"device": "gpu", "device_index": null}),
+        );
+        assert!(host_gpu_ordinal_matches_placement(&problem, &[], &allowed, &placement).unwrap());
+    }
+
+    #[test]
+    fn indexed_requests_cannot_be_reinterpreted_without_a_successful_import_binding() {
+        let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        let visible = vec![GPU.to_owned()];
+        let allowed = BTreeMap::from([(GPU.to_owned(), 8192)]);
+        let placement = HostTaskPlacement {
+            cpu_ids: BTreeSet::new(),
+            gpu_uuid: Some(GPU.to_owned()),
+        };
+        let bindings = [
+            serde_json::Value::Null,
+            serde_json::json!({"schema_version": "legacy_cuda_binding.v1", "ordinal": 1,
+                "cuda_visible_devices": null, "gpu_uuid": GPU}),
+            serde_json::json!({"schema_version": "legacy_cuda_binding.v1", "ordinal": 0,
+                "cuda_visible_devices": null, "gpu_uuid": null, "resolution_error": "no driver"}),
+            serde_json::json!({"schema_version": "legacy_cuda_binding.v1", "ordinal": 0,
+                "gpu_uuid": GPU}),
+        ];
+        for binding in bindings {
+            problem.problem_meta.runtime_metadata.insert(
+                "runtime_selection".into(),
+                serde_json::json!({"device": "cuda", "device_index": 0,
+                    "legacy_cuda_binding": binding}),
+            );
+            assert!(
+                host_gpu_ordinal_matches_placement(&problem, &visible, &allowed, &placement)
+                    .is_err()
+            );
         }
     }
 

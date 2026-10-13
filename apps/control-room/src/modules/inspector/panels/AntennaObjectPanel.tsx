@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { MODEL_READINESS_PATH, MODEL_SCENE_PATH } from "@/kernel/api/apiPaths";
 import type { JsonObject, RegionalFieldDriveResource } from "@/kernel/api/apiTypes";
@@ -9,6 +9,7 @@ import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus"
 import { useSceneResource } from "@/kernel/resources/geometryLifecycleResources";
 import { Button } from "@/shared/ui/Button";
 
+import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import type { InspectorPanelProps } from "../inspectorTypes";
 import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FieldRow } from "../primitives/FieldRow";
@@ -86,7 +87,7 @@ function invalidateSceneResource(
 }
 
 export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
-  const { api, authoringHistory, resources } = useKernel();
+  const { api, authoringHistory, commands, resources } = useKernel();
   const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
   const scene = useSceneResource();
   const model = resolveAntennaObjectPanelModel(selection, scene.data);
@@ -94,7 +95,13 @@ export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
     () => resolveAntennaObjectDraft(selection, scene.data),
     [scene.data, selection],
   );
-  const draftKey = antennaObjectDraftKey(selection, scene.data);
+  const draftKey = `${sessionScopeKey ?? "none"}:${antennaObjectDraftKey(selection, scene.data)}`;
+  const [acknowledgedBase, setAcknowledgedBase] = useState<{
+    draft: AntennaObjectDraft; key: string; revision: number;
+  } | null>(null);
+  const baselineDraft = acknowledgedBase?.key === draftKey &&
+    (scene.data?.revision ?? -1) < acknowledgedBase.revision
+    ? acknowledgedBase.draft : baseDraft;
   const [draftState, setDraftState] = useState<DraftState>({
     draft: baseDraft,
     dirtyKeys: [],
@@ -108,26 +115,38 @@ export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
   const [pending, setPending] = useState(false);
   const [revisionConflictState, setRevisionConflictState] =
     useState<RevisionConflictState | null>(null);
-  const baseRevision = sceneRevision(scene.data?.revision);
+  const baseRevision = acknowledgedBase?.key === draftKey
+    ? Math.max(sceneRevision(scene.data?.revision) ?? -1, acknowledgedBase.revision)
+    : sceneRevision(scene.data?.revision);
   const canCommit =
     scene.status === "ready" && baseRevision !== null && model.mode !== "missing";
   const draft: AntennaObjectDraft =
     draftState.key === draftKey
       ? {
-          ...baseDraft,
+          ...baselineDraft,
           ...Object.fromEntries(
             draftState.dirtyKeys.map((key) => [key, draftState.draft[key]]),
           ),
         }
-      : baseDraft;
+      : baselineDraft;
   const locallyConflictingKeys =
     draftState.key === draftKey
       ? draftState.dirtyKeys.filter(
           (key) =>
-            draftState.editedAgainst[key] !== baseDraft[key] &&
-            draftState.draft[key] !== baseDraft[key],
+            draftState.editedAgainst[key] !== baselineDraft[key] &&
+            draftState.draft[key] !== baselineDraft[key],
         )
       : [];
+  const applyInFlight = useRef(false);
+  const draftRef = useRef(draft);
+  const activeDraftKeyRef = useRef(draftKey);
+  useLayoutEffect(() => { activeDraftKeyRef.current = draftKey; }, [draftKey]);
+  useLayoutEffect(() => { draftRef.current = draft; }, [draft]);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(baselineDraft);
+  const validation = model.mode === "canonical"
+    ? buildAntennaCanonicalFieldDrive(selection, scene.data, draft)
+    : model.mode === "legacy" ? buildAntennaLegacyMigrationPatch(selection, scene.data, draft) : null;
+  const valid = Boolean(validation && !validation.error);
   const feedback =
     feedbackState.key === draftKey ? feedbackState.feedback : null;
   const revisionConflict =
@@ -146,18 +165,31 @@ export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
           : "refreshing"
       : conflictPhase;
 
+  const acknowledgeAntennaDraft = useRegisterInspectorEditSession(
+    model.mode === "missing" ? null : "staged",
+    pending,
+    dirty,
+    valid,
+    undefined,
+    commitDraft,
+    resetDraft,
+    { historyMode: "mutation-owned" },
+  );
+
   function updateDraft(patch: Partial<AntennaObjectDraft>): void {
+    draftRef.current = { ...draftRef.current, ...patch };
     setDraftState((current) => {
       const dirtyKeys = current.key === draftKey ? current.dirtyKeys : [];
+      const dirtyKeySet = new Set(dirtyKeys);
       const patchKeys = Object.keys(patch) as Array<keyof AntennaObjectDraft>;
       const editedAgainst = current.key === draftKey ? { ...current.editedAgainst } : {};
       for (const key of patchKeys) {
-        if (!dirtyKeys.includes(key) || current.draft[key] === baseDraft[key]) {
-          Object.assign(editedAgainst, { [key]: baseDraft[key] });
+        if (!dirtyKeySet.has(key) || current.draft[key] === baselineDraft[key]) {
+          Object.assign(editedAgainst, { [key]: baselineDraft[key] });
         }
       }
       return {
-        draft: { ...(current.key === draftKey ? current.draft : baseDraft), ...patch },
+        draft: { ...(current.key === draftKey ? current.draft : baselineDraft), ...patch },
         dirtyKeys: [...new Set([...dirtyKeys, ...patchKeys])],
         editedAgainst,
         key: draftKey,
@@ -169,44 +201,75 @@ export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
     setFeedbackState({ feedback: feedbackValue, key: draftKey });
   }
 
-  async function commitDraft(): Promise<void> {
+  function resetDraft(): void {
+    draftRef.current = baselineDraft;
+    setDraftState({ draft: baselineDraft, dirtyKeys: [], editedAgainst: {}, key: draftKey });
+    setRevisionConflictState(null);
+    setFeedback(null);
+  }
+
+  async function commitDraft(): Promise<boolean> {
+    if (applyInFlight.current) return false;
     if (!canCommit || baseRevision === null) {
       setFeedback({
         kind: "error",
         message: "Scene revision is unavailable; refresh before saving.",
       });
-      return;
+      return false;
     }
     if (locallyConflictingKeys.length > 0) {
       setFeedback({
         kind: "error",
         message: "The server changed an edited field. Compare and rebase before saving.",
       });
-      return;
+      return false;
     }
     if (revisionConflict && revisionConflict.phase !== "rebased") {
       setFeedback({
         kind: "error",
         message: "Refetch and rebase the server change before saving again.",
       });
-      return;
+      return false;
     }
+    if (!sessionScopeKey || !valid) return false;
+    const submittedDraft = draft;
+    applyInFlight.current = true;
     setPending(true);
+    const historyGeneration = authoringHistory?.getGeneration?.();
+    const historyContext = {
+        api,
+        authoringHistory,
+        sessionScopeKey,
+        isCurrentSessionScope: () =>
+          commands.getSessionScopeKey() === sessionScopeKey &&
+          activeDraftKeyRef.current === draftKey &&
+          (historyGeneration === undefined ||
+            authoringHistory?.getGeneration?.() === historyGeneration),
+      };
     try {
       const response = await runAuthoringMutationWithHistory(
-        { api, authoringHistory, sessionScopeKey },
+        historyContext,
         model.mode === "canonical"
           ? `Update antenna drive ${model.objectId}`
           : `Migrate antenna drive ${model.objectId}`,
         async () =>
           model.mode === "canonical"
-            ? saveCanonicalDrive(baseRevision)
-            : migrateLegacyDrive(baseRevision),
+            ? saveCanonicalDrive(baseRevision, submittedDraft)
+            : migrateLegacyDrive(baseRevision, submittedDraft),
       );
+      if (historyContext.isCurrentSessionScope() === false) return false;
       invalidateSceneResource(resources, response.scene_revision);
       setRevisionConflictState(null);
+      setAcknowledgedBase({ draft: submittedDraft, key: draftKey, revision: response.scene_revision });
+      const latestDraft = draftRef.current;
+      const dirtyKeys = (Object.keys(submittedDraft) as Array<keyof AntennaObjectDraft>)
+        .filter((key) => latestDraft[key] !== submittedDraft[key]);
+      setDraftState({ draft: latestDraft, dirtyKeys, editedAgainst: submittedDraft, key: draftKey });
+      if (dirtyKeys.length === 0 && !acknowledgeAntennaDraft()) return false;
       setFeedback({ kind: "success", message: model.mode === "legacy" ? "Legacy source migrated to a regional field drive." : "Antenna field drive committed." });
+      return true;
     } catch (error) {
+      if (!historyContext.isCurrentSessionScope()) return false;
       if (isAntennaObjectRevisionConflict(error) && baseRevision !== null) {
         setRevisionConflictState({
           baseRevision,
@@ -220,7 +283,9 @@ export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
       } else {
         setFeedback({ kind: "error", message: errorMessage(error) });
       }
+      return false;
     } finally {
+      applyInFlight.current = false;
       setPending(false);
     }
   }
@@ -274,8 +339,8 @@ export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
     });
   }
 
-  async function saveCanonicalDrive(baseRevisionValue: number) {
-    const patch = buildAntennaCanonicalFieldDrive(selection, scene.data, draft);
+  async function saveCanonicalDrive(baseRevisionValue: number, submittedDraft: AntennaObjectDraft) {
+    const patch = buildAntennaCanonicalFieldDrive(selection, scene.data, submittedDraft);
     if (patch.error || !patch.drive) throw new Error(patch.error ?? "Invalid antenna drive draft.");
     const drive = patch.drive as unknown as RegionalFieldDriveResource;
     return api.model.replaceFieldDrive(
@@ -288,8 +353,8 @@ export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
     );
   }
 
-  async function migrateLegacyDrive(baseRevisionValue: number) {
-    const patch = buildAntennaLegacyMigrationPatch(selection, scene.data, draft);
+  async function migrateLegacyDrive(baseRevisionValue: number, submittedDraft: AntennaObjectDraft) {
+    const patch = buildAntennaLegacyMigrationPatch(selection, scene.data, submittedDraft);
     if (patch.error || !patch.drives || !patch.modules) throw new Error(patch.error ?? "Invalid legacy antenna migration.");
     return api.model.commitTransaction({
       base_revision: baseRevisionValue,

@@ -345,6 +345,14 @@ pub(crate) enum RuntimeCommand {
     /// Initialize only a new explicitly scoped accepted store.
     #[command(hide = true)]
     InitializeScopedAcceptedStore,
+    /// Initialize a pinned host policy for a never-started application store.
+    #[command(hide = true)]
+    InitializeHostApplication {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        config_sha256: String,
+    },
     /// Internal managed proof of one-shot durable handoff acceptance.
     #[command(hide = true)]
     VerifyDevelopmentHandoffCommit {

@@ -10,9 +10,11 @@ import {
 
 export interface ObjectIdentityMutation {
   baseRevision: number | null;
+  materialRef?: string | null;
   name: string;
   notes: string;
   objectId: string;
+  regionName?: string | null;
 }
 
 export interface ObjectDeleteMutation {
@@ -41,9 +43,15 @@ export async function patchObjectIdentityWithHistory(
       context.api!,
       mutation.objectId,
       {
-        base_revision: preparation.baseRevision ?? mutation.baseRevision,
+        base_revision: mutation.baseRevision ?? preparation.baseRevision,
         name: mutation.name,
         notes: mutation.notes,
+        ...(mutation.materialRef === undefined
+          ? {}
+          : { material_ref: mutation.materialRef }),
+        ...(mutation.regionName === undefined
+          ? {}
+          : { region_name: mutation.regionName }),
       },
       reqOptions,
     ),

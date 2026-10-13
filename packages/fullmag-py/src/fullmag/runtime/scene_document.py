@@ -5,6 +5,7 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from fullmag.model.compute_resources import ComputeResources
 from fullmag.model.output_storage import OutputStorage
 from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer
 from fullmag.runtime.output_storage_lowering import (
@@ -188,6 +189,18 @@ def _execution_profile_fields(
     if layers:
         result["execution_layers"] = [layer.to_ir() for layer in layers]
     return result
+
+
+def _compute_resources_fields(
+    source: Mapping[str, object],
+    context: str,
+) -> dict[str, object]:
+    if "compute_resources" not in source:
+        return {}
+    if not isinstance(source["compute_resources"], Mapping):
+        raise ValueError(f"{context}.compute_resources must be an object")
+    resources = ComputeResources.from_ir(source["compute_resources"])
+    return {"compute_resources": resources.to_ir()}
 
 
 def _reject_unknown_fields(
@@ -1714,6 +1727,7 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
     if "fdm" in builder:
         document["study"]["fdm"] = copy.deepcopy(builder.get("fdm"))
     document["study"].update(_execution_profile_fields(builder, "builder"))
+    document["study"].update(_compute_resources_fields(builder, "builder"))
     if "spin_torques" in builder:
         document["spin_torques"] = _canonical_spin_torques(
             builder["spin_torques"], scene_ids=True
@@ -1990,6 +2004,7 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         "requested_mode": study.get("requested_mode", "strict"),
         "cpu_threads": study.get("requested_cpu_threads"),
         **_execution_profile_fields(study, "SceneDocument.study"),
+        **_compute_resources_fields(study, "SceneDocument.study"),
         "fem_demag_solver_policy": study.get("fem_demag_solver_policy"),
         "exchange_enabled": bool(study.get("exchange_enabled", True)),
         "demag_enabled": bool(study.get("demag_enabled", True)),
@@ -2330,6 +2345,7 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
                     }
         overrides["fdm"] = fdm
     overrides.update(_execution_profile_fields(builder, "SceneDocument.study"))
+    overrides.update(_compute_resources_fields(builder, "SceneDocument.study"))
     return overrides
 
 

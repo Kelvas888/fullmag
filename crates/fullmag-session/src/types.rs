@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, PathBuf};
 use utoipa::ToSchema;
 
 // ── Save profiles ──────────────────────────────────────────────────────
@@ -70,6 +71,9 @@ pub struct FmsSessionManifest {
     pub description: Option<String>,
     /// References to run manifests.
     pub run_refs: Vec<String>,
+    /// References to durable accepted batch intents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batch_refs: Vec<String>,
     /// Reference to workspace manifest.
     pub workspace_ref: String,
     /// Reference to export profile.
@@ -93,6 +97,7 @@ impl FmsSessionManifest {
             saved_at: now,
             description: None,
             run_refs: Vec::new(),
+            batch_refs: Vec::new(),
             workspace_ref: "manifest/workspace.json".into(),
             export_profile_ref: "manifest/export_profile.json".into(),
         }
@@ -373,6 +378,525 @@ impl FmsRunIntent {
 pub enum RunIntentCommitDisposition {
     Accepted,
     Replayed { run_id: String },
+}
+
+/// Schema version for the durable parent record of an independent batch.
+pub const FMS_BATCH_INTENT_SCHEMA: &str = "batch_intent.v1";
+pub const FMS_BATCH_SUBMIT_SNAPSHOT_LEGACY_SCHEMA: &str = "batch_submit_snapshot.v1";
+pub const FMS_BATCH_SUBMIT_SNAPSHOT_SCHEMA: &str = "batch_submit_snapshot.v2";
+pub const FMS_BATCH_OUTPUT_STORAGE_SNAPSHOT_LEGACY_SCHEMA: &str =
+    "batch_output_storage_snapshot.v1";
+pub const FMS_BATCH_OUTPUT_STORAGE_SNAPSHOT_SCHEMA: &str = "batch_output_storage_snapshot.v2";
+pub const FMS_BATCH_EXPANSION_MANIFEST_SCHEMA: &str = "batch_expansion_manifest.v2";
+pub const FMS_BATCH_EXPANSION_PROGRESS_SCHEMA: &str = "batch_expansion_progress.v1";
+const FMS_BATCH_EXPANSION_MAX_CASES: usize = 10_000;
+
+/// Immutable accepted batch intent, published before any child run is
+/// acknowledged. The application owns the typed request and expansion
+/// manifest; this envelope pins their exact source objects in the session CAS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FmsBatchIntent {
+    pub schema_version: String,
+    pub batch_id: String,
+    pub idempotency_key: String,
+    pub payload_sha256: String,
+    pub accepted_at: DateTime<Utc>,
+    /// Versioned batch Submit snapshot containing the typed request and
+    /// logical expansion-manifest digest. Version 2 pins OutputStorage;
+    /// version 1 remains readable for already accepted batches.
+    pub specification: Value,
+    pub manifest_object_ref: String,
+    pub definition_object_ref: String,
+    pub study_object_ref: String,
+    pub study_catalog_object_ref: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub asset_object_refs: BTreeMap<String, String>,
+}
+
+impl FmsBatchIntent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        batch_id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        specification: Value,
+        manifest_object_ref: impl Into<String>,
+        definition_object_ref: impl Into<String>,
+        study_object_ref: impl Into<String>,
+        study_catalog_object_ref: impl Into<String>,
+        asset_object_refs: BTreeMap<String, String>,
+    ) -> Self {
+        let payload_sha256 = canonical_json_sha256(&specification);
+        Self {
+            schema_version: FMS_BATCH_INTENT_SCHEMA.into(),
+            batch_id: batch_id.into(),
+            idempotency_key: idempotency_key.into(),
+            payload_sha256,
+            accepted_at: Utc::now(),
+            specification,
+            manifest_object_ref: manifest_object_ref.into(),
+            definition_object_ref: definition_object_ref.into(),
+            study_object_ref: study_object_ref.into(),
+            study_catalog_object_ref: study_catalog_object_ref.into(),
+            asset_object_refs,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != FMS_BATCH_INTENT_SCHEMA {
+            bail!("unsupported batch intent schema `{}`", self.schema_version);
+        }
+        crate::repository_path::validate_store_id(&self.batch_id)?;
+        crate::repository_path::validate_store_id(&self.idempotency_key)?;
+        validate_sha256(&self.payload_sha256, "payload_sha256")?;
+        validate_sha256(&self.manifest_object_ref, "manifest_object_ref")?;
+        validate_sha256(&self.definition_object_ref, "definition_object_ref")?;
+        validate_sha256(&self.study_object_ref, "study_object_ref")?;
+        validate_sha256(
+            &self.study_catalog_object_ref,
+            "study_catalog_object_ref",
+        )?;
+
+        let snapshot_schema = self
+            .specification
+            .get("schema_version")
+            .and_then(Value::as_str)
+            .context("batch intent specification has no schema_version")?;
+        let output_storage = self.specification.get("output_storage");
+        if snapshot_schema == FMS_BATCH_SUBMIT_SNAPSHOT_SCHEMA {
+            validate_batch_output_storage_snapshot(
+                output_storage.context(
+                    "batch_submit_snapshot.v2 requires an output_storage snapshot",
+                )?,
+            )?;
+        } else if snapshot_schema == FMS_BATCH_SUBMIT_SNAPSHOT_LEGACY_SCHEMA {
+            if let Some(snapshot) = output_storage {
+                validate_batch_output_storage_snapshot(snapshot)?;
+            }
+        } else {
+            bail!("unsupported batch submit snapshot schema `{snapshot_schema}`");
+        }
+        if self.specification.get("batch_id").and_then(Value::as_str)
+            != Some(self.batch_id.as_str())
+        {
+            bail!("batch intent specification batch_id does not match its envelope");
+        }
+        let manifest_sha256 = self
+            .specification
+            .get("manifest_sha256")
+            .and_then(Value::as_str)
+            .context("batch intent specification has no manifest_sha256")?;
+        validate_sha256(manifest_sha256, "manifest_sha256")?;
+
+        let request = self
+            .specification
+            .get("request")
+            .context("batch intent specification has no request")?;
+        if request.get("batch_id").and_then(Value::as_str) != Some(self.batch_id.as_str()) {
+            bail!("batch request batch_id does not match its envelope");
+        }
+        let template = request
+            .get("template")
+            .context("batch request has no template RunSpecification")?;
+        if template
+            .pointer("/snapshot/definition_sha256")
+            .and_then(Value::as_str)
+            != Some(self.definition_object_ref.as_str())
+        {
+            bail!("batch definition object does not match template snapshot digest");
+        }
+        if template
+            .pointer("/study/plan_sha256")
+            .and_then(Value::as_str)
+            != Some(self.study_object_ref.as_str())
+        {
+            bail!("batch study object does not match template plan digest");
+        }
+        if template.get("study_catalog_sha256").and_then(Value::as_str)
+            != Some(self.study_catalog_object_ref.as_str())
+        {
+            bail!("batch study catalog object does not match template catalog digest");
+        }
+
+        let assets = template
+            .get("immutable_assets")
+            .and_then(Value::as_array)
+            .context("batch template has no immutable_assets array")?;
+        if assets.len() != self.asset_object_refs.len() {
+            bail!("batch asset object count differs from immutable_assets");
+        }
+        let mut seen = BTreeSet::new();
+        for asset in assets {
+            let asset_id = asset
+                .get("asset_id")
+                .and_then(Value::as_str)
+                .context("batch immutable asset has no asset_id")?;
+            let content_sha256 = asset
+                .get("content_sha256")
+                .and_then(Value::as_str)
+                .context("batch immutable asset has no content_sha256")?;
+            if !seen.insert(asset_id)
+                || self.asset_object_refs.get(asset_id).map(String::as_str)
+                    != Some(content_sha256)
+            {
+                bail!("batch asset object does not match immutable asset reference");
+            }
+            validate_sha256(content_sha256, "asset_object_ref")?;
+        }
+
+        let actual = canonical_json_sha256(&self.specification);
+        if actual != self.payload_sha256 {
+            bail!(
+                "batch intent payload digest mismatch: expected {}, got {}",
+                self.payload_sha256,
+                actual
+            );
+        }
+        Ok(())
+    }
+
+    /// Verify that the pinned CAS bytes are the exact expansion manifest
+    /// described by the logical digest in the immutable submit snapshot.
+    pub fn validate_manifest_bytes(&self, bytes: &[u8]) -> Result<()> {
+        self.validate()?;
+        if crate::cas::hex_sha256(bytes) != self.manifest_object_ref {
+            bail!("batch expansion manifest object digest mismatch");
+        }
+        let mut manifest: Value = serde_json::from_slice(bytes)
+            .context("batch expansion manifest object is not valid JSON")?;
+        if manifest.get("schema_version").and_then(Value::as_str)
+            != Some(FMS_BATCH_EXPANSION_MANIFEST_SCHEMA)
+        {
+            bail!("unsupported batch expansion manifest schema");
+        }
+        if manifest.get("batch_id").and_then(Value::as_str) != Some(self.batch_id.as_str()) {
+            bail!("batch expansion manifest batch_id does not match its intent");
+        }
+        let case_count = manifest
+            .get("cases")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .context("batch expansion manifest has no cases array")?;
+        if case_count == 0 || case_count > FMS_BATCH_EXPANSION_MAX_CASES {
+            bail!(
+                "batch expansion manifest case count must be between 1 and {FMS_BATCH_EXPANSION_MAX_CASES}"
+            );
+        }
+        let recorded_digest = manifest
+            .get("manifest_sha256")
+            .and_then(Value::as_str)
+            .context("batch expansion manifest has no manifest_sha256")?
+            .to_string();
+        validate_sha256(&recorded_digest, "manifest_sha256")?;
+        let object = manifest
+            .as_object_mut()
+            .context("batch expansion manifest must be a JSON object")?;
+        object.remove("manifest_sha256");
+        let calculated_digest = canonical_json_sha256(&manifest);
+        if calculated_digest != recorded_digest
+            || self
+                .specification
+                .get("manifest_sha256")
+                .and_then(Value::as_str)
+                != Some(calculated_digest.as_str())
+        {
+            bail!("batch expansion manifest does not match its accepted logical digest");
+        }
+        Ok(())
+    }
+}
+
+fn validate_batch_output_storage_snapshot(snapshot: &Value) -> Result<()> {
+    let schema = snapshot
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .context("batch output_storage snapshot has no schema_version")?;
+    match schema {
+        FMS_BATCH_OUTPUT_STORAGE_SNAPSHOT_LEGACY_SCHEMA => {
+            validate_legacy_batch_output_storage_snapshot(snapshot)
+        }
+        FMS_BATCH_OUTPUT_STORAGE_SNAPSHOT_SCHEMA => {
+            validate_resolved_batch_output_storage_snapshot(snapshot)
+        }
+        _ => bail!("unsupported batch output_storage schema `{schema}`"),
+    }
+}
+
+fn validate_legacy_batch_output_storage_snapshot(snapshot: &Value) -> Result<()> {
+    if snapshot.get("source").and_then(Value::as_str) != Some("workspace_defaults") {
+        bail!("batch output_storage source must be `workspace_defaults`");
+    }
+    let settings_value = snapshot
+        .get("settings")
+        .filter(|value| value.is_object())
+        .context("batch output_storage snapshot has no settings object")?;
+    let settings: BatchOutputStorageSettings = serde_json::from_value(settings_value.clone())
+        .context("batch output_storage settings do not match the defaults contract")?;
+    let ir = fullmag_ir::OutputStorageIR {
+        output_dir: Some(settings.output_parent.clone()),
+        temp_dir: settings.temp_parent.clone(),
+        data_format: settings.data_format,
+        cleanup: settings.cleanup,
+        existing_output: settings.existing_output,
+    };
+    ir.validate()
+        .map_err(|errors| anyhow::anyhow!(errors.join("; ")))
+        .context("invalid batch output_storage paths")?;
+    if !PathBuf::from(&settings.output_parent).is_absolute() {
+        bail!("batch output_storage output_parent must be an absolute path");
+    }
+    if settings
+        .temp_parent
+        .as_deref()
+        .is_some_and(|path| !PathBuf::from(path).is_absolute())
+    {
+        bail!("batch output_storage temp_parent must be an absolute path");
+    }
+    let expected = snapshot
+        .get("settings_sha256")
+        .and_then(Value::as_str)
+        .context("batch output_storage snapshot has no settings_sha256")?;
+    validate_sha256(expected, "output_storage.settings_sha256")?;
+    if canonical_json_sha256(settings_value) != expected {
+        bail!("batch output_storage settings digest does not match its snapshot");
+    }
+    Ok(())
+}
+
+fn validate_resolved_batch_output_storage_snapshot(snapshot: &Value) -> Result<()> {
+    let source = snapshot
+        .get("source")
+        .and_then(Value::as_str)
+        .context("batch output_storage snapshot has no source")?;
+    if !matches!(source, "workspace_defaults" | "project_authoring") {
+        bail!("unsupported batch output_storage source `{source}`");
+    }
+    let settings_value = snapshot
+        .get("settings")
+        .filter(|value| value.is_object())
+        .context("batch output_storage snapshot has no settings object")?;
+    let settings: fullmag_ir::OutputStorageIR = serde_json::from_value(settings_value.clone())
+        .context("batch output_storage settings do not match the resolved OutputStorage contract")?;
+    settings
+        .validate()
+        .map_err(|errors| anyhow::anyhow!(errors.join("; ")))
+        .context("invalid resolved batch output_storage paths")?;
+    let output_dir = settings
+        .output_dir
+        .as_deref()
+        .context("resolved batch output_storage requires output_dir")?;
+    if !PathBuf::from(output_dir).is_absolute() {
+        bail!("resolved batch output_storage output_dir must be an absolute path");
+    }
+    if settings
+        .temp_dir
+        .as_deref()
+        .is_some_and(|path| !PathBuf::from(path).is_absolute())
+    {
+        bail!("resolved batch output_storage temp_dir must be an absolute path");
+    }
+
+    for field in ["settings_sha256", "workspace_defaults_sha256"] {
+        let digest = snapshot
+            .get(field)
+            .and_then(Value::as_str)
+            .with_context(|| format!("batch output_storage snapshot has no {field}"))?;
+        validate_sha256(digest, &format!("output_storage.{field}"))?;
+    }
+    let expected = snapshot
+        .get("settings_sha256")
+        .and_then(Value::as_str)
+        .context("batch output_storage snapshot has no settings_sha256")?;
+    if canonical_json_sha256(settings_value) != expected {
+        bail!("batch output_storage settings digest does not match its snapshot");
+    }
+    match (source, snapshot.get("authoring_policy_sha256")) {
+        ("workspace_defaults", None) => {}
+        ("project_authoring", Some(Value::String(digest))) => {
+            validate_sha256(digest, "output_storage.authoring_policy_sha256")?;
+        }
+        ("workspace_defaults", Some(_)) => {
+            bail!("workspace-default output_storage cannot include an authoring policy digest")
+        }
+        ("project_authoring", _) => {
+            bail!("project-authoring output_storage requires an authoring policy digest")
+        }
+        _ => bail!("unsupported batch output_storage source `{source}`"),
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchOutputStorageSettings {
+    output_parent: String,
+    #[serde(default)]
+    temp_parent: Option<String>,
+    #[serde(default)]
+    data_format: fullmag_ir::OutputDataFormatIR,
+    #[serde(default)]
+    cleanup: fullmag_ir::TempCleanupIR,
+    #[serde(default)]
+    existing_output: fullmag_ir::ExistingOutputIR,
+}
+
+/// Durable expansion cursor for publishing deterministic child run intents.
+/// `next_case_index` is a prefix length: cases before it must already have
+/// idempotently published child intents, while cases at and after it remain
+/// eligible for recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FmsBatchExpansionProgress {
+    pub schema_version: String,
+    pub batch_id: String,
+    pub manifest_object_ref: String,
+    pub manifest_sha256: String,
+    pub total_cases: u64,
+    pub next_case_index: u64,
+    pub sequence: u64,
+    pub state: FmsBatchExpansionState,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FmsBatchExpansionState {
+    Pending,
+    Expanding,
+    Complete,
+    Stopped,
+}
+
+impl FmsBatchExpansionProgress {
+    pub fn new(
+        intent: &FmsBatchIntent,
+        total_cases: u64,
+        next_case_index: u64,
+        sequence: u64,
+    ) -> Result<Self> {
+        let manifest_sha256 = intent
+            .specification
+            .get("manifest_sha256")
+            .and_then(Value::as_str)
+            .context("batch intent has no manifest digest")?
+            .to_string();
+        let state = if next_case_index == 0 {
+            FmsBatchExpansionState::Pending
+        } else if next_case_index == total_cases {
+            FmsBatchExpansionState::Complete
+        } else {
+            FmsBatchExpansionState::Expanding
+        };
+        let progress = Self {
+            schema_version: FMS_BATCH_EXPANSION_PROGRESS_SCHEMA.into(),
+            batch_id: intent.batch_id.clone(),
+            manifest_object_ref: intent.manifest_object_ref.clone(),
+            manifest_sha256,
+            total_cases,
+            next_case_index,
+            sequence,
+            state,
+            updated_at: Utc::now(),
+        };
+        progress.validate()?;
+        Ok(progress)
+    }
+
+    pub fn new_stopped(
+        intent: &FmsBatchIntent,
+        total_cases: u64,
+        next_case_index: u64,
+        sequence: u64,
+    ) -> Result<Self> {
+        if next_case_index == 0 || next_case_index >= total_cases {
+            bail!("stopped batch expansion must have a published, incomplete prefix");
+        }
+        let mut progress = Self::new(intent, total_cases, next_case_index, sequence)?;
+        progress.state = FmsBatchExpansionState::Stopped;
+        progress.validate()?;
+        Ok(progress)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != FMS_BATCH_EXPANSION_PROGRESS_SCHEMA {
+            bail!(
+                "unsupported batch expansion progress schema `{}`",
+                self.schema_version
+            );
+        }
+        crate::repository_path::validate_store_id(&self.batch_id)?;
+        validate_sha256(&self.manifest_object_ref, "manifest_object_ref")?;
+        validate_sha256(&self.manifest_sha256, "manifest_sha256")?;
+        if self.total_cases == 0
+            || self.total_cases > FMS_BATCH_EXPANSION_MAX_CASES as u64
+            || self.next_case_index > self.total_cases
+            || self.sequence == 0
+        {
+            bail!("batch expansion progress counters are outside their valid range");
+        }
+        let expected_state = if self.next_case_index == 0 {
+            FmsBatchExpansionState::Pending
+        } else if self.next_case_index == self.total_cases {
+            FmsBatchExpansionState::Complete
+        } else {
+            FmsBatchExpansionState::Expanding
+        };
+        let valid_stopped_state = self.state == FmsBatchExpansionState::Stopped
+            && self.next_case_index > 0
+            && self.next_case_index < self.total_cases;
+        if self.state != expected_state && !valid_stopped_state {
+            bail!("batch expansion progress state does not match its cursor");
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_manifest(
+        &self,
+        intent: &FmsBatchIntent,
+        manifest_bytes: &[u8],
+    ) -> Result<()> {
+        self.validate()?;
+        intent.validate_manifest_bytes(manifest_bytes)?;
+        let manifest: Value = serde_json::from_slice(manifest_bytes)
+            .context("batch expansion manifest object is not valid JSON")?;
+        if self.state == FmsBatchExpansionState::Stopped
+            && manifest.get("failure_policy").and_then(Value::as_str)
+                != Some("stop_admission")
+        {
+            bail!("stopped batch expansion requires stop_admission failure policy");
+        }
+        let total_cases = manifest
+            .get("cases")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .context("batch expansion manifest has no cases array")?;
+        let manifest_sha256 = intent
+            .specification
+            .get("manifest_sha256")
+            .and_then(Value::as_str)
+            .context("batch intent has no manifest digest")?;
+        if self.batch_id != intent.batch_id
+            || self.manifest_object_ref != intent.manifest_object_ref
+            || self.manifest_sha256 != manifest_sha256
+            || self.total_cases != u64::try_from(total_cases)?
+        {
+            bail!("batch expansion progress differs from its immutable intent");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchExpansionProgressCommitDisposition {
+    Accepted,
+    Replayed,
+}
+
+/// Result of publishing an immutable batch parent intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchIntentCommitDisposition {
+    Accepted,
+    Replayed { batch_id: String },
 }
 
 pub const FMS_SCHEDULER_POOL_CHECKPOINT_SCHEMA: &str = "scheduler_pool_checkpoint.v1";
@@ -1154,7 +1678,7 @@ pub struct FmsTaskCatalogEntry {
 }
 
 impl FmsTaskCatalogEntry {
-    fn validate(&self, run_id: &str) -> Result<()> {
+    pub(crate) fn validate(&self, run_id: &str) -> Result<()> {
         crate::repository_path::validate_store_id(&self.task_id)?;
         validate_sha256(&self.input_fingerprint, "input_fingerprint")?;
         match (&self.attempt_id, self.ownership_epoch) {
@@ -2251,6 +2775,7 @@ impl FmsArtifactCatalog {
 
 /// Schema version for the durable resource lease record.
 pub const FMS_RESOURCE_LEASE_SCHEMA: &str = "resource_lease.v1";
+pub const FMS_HOST_LAUNCH_BINDING_SCHEMA: &str = "host_launch_binding.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2290,6 +2815,44 @@ pub enum FmsResourceLeaseState {
     Released,
 }
 
+/// Immutable host configuration captured when a physical resource lease is admitted.
+///
+/// Workers can use this durable binding to find the host launch fence without
+/// trusting process arguments or performing host discovery themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FmsHostLaunchBinding {
+    pub schema_version: String,
+    pub ledger_root: PathBuf,
+    pub policy: crate::host_resource_ledger::HostResourceLedgerPolicy,
+}
+
+impl FmsHostLaunchBinding {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != FMS_HOST_LAUNCH_BINDING_SCHEMA {
+            bail!(
+                "unsupported host launch binding schema `{}`",
+                self.schema_version
+            );
+        }
+        if !self.ledger_root.is_absolute() {
+            bail!("host launch binding ledger_root must be an explicit absolute path");
+        }
+        if self
+            .ledger_root
+            .components()
+            .any(|component| component == Component::ParentDir)
+        {
+            bail!("host launch binding ledger_root must not contain parent-directory components");
+        }
+        if self.ledger_root.file_name().is_none() {
+            bail!("host launch binding ledger_root must name a dedicated directory");
+        }
+        self.policy.validate()?;
+        Ok(())
+    }
+}
+
 /// Durable ownership record for one physical resource.
 ///
 /// An active record is intentionally not expired by wall-clock age.  Missing
@@ -2314,6 +2877,8 @@ pub struct FmsResourceLease {
     pub heartbeat_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_launch_binding: Option<FmsHostLaunchBinding>,
 }
 
 impl FmsResourceLease {
@@ -2338,6 +2903,11 @@ impl FmsResourceLease {
             bail!("resource lease ownership_epoch must be greater than zero");
         }
         self.budget.validate()?;
+        if let Some(binding) = &self.host_launch_binding {
+            binding
+                .validate()
+                .context("invalid resource lease host launch binding")?;
+        }
         match (self.state, self.released_at.is_some()) {
             (FmsResourceLeaseState::Active, true) => {
                 bail!("active resource lease must not have released_at")
@@ -2357,6 +2927,7 @@ impl FmsResourceLease {
             && self.attempt_id == other.attempt_id
             && self.ownership_epoch == other.ownership_epoch
             && self.lease_token == other.lease_token
+            && self.host_launch_binding == other.host_launch_binding
     }
 }
 
@@ -2387,6 +2958,8 @@ pub struct FmsPreparationResourceLease {
     pub heartbeat_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_launch_binding: Option<FmsHostLaunchBinding>,
 }
 
 impl FmsPreparationResourceLease {
@@ -2411,6 +2984,11 @@ impl FmsPreparationResourceLease {
                 .with_context(|| format!("invalid preparation resource lease {field}"))?;
         }
         self.budget.validate()?;
+        if let Some(binding) = &self.host_launch_binding {
+            binding
+                .validate()
+                .context("invalid preparation host launch binding")?;
+        }
         if self.budget.cpu_millis == 0
             || self.budget.memory_bytes == 0
             || self.budget.storage_bytes == 0
@@ -2462,6 +3040,7 @@ impl FmsPreparationResourceLease {
             && self.task_id == other.task_id
             && self.preparation_attempt_id == other.preparation_attempt_id
             && self.lease_token == other.lease_token
+            && self.host_launch_binding == other.host_launch_binding
     }
 
     pub fn relative_path(&self) -> Result<String> {
@@ -2486,6 +3065,113 @@ pub enum PreparationResourceLeaseCommitDisposition {
 /// admission without inventing a new attempt or lease token.
 pub const FMS_TASK_ADMISSION_SCHEMA: &str = "task_admission.v1";
 
+pub const FMS_RESOLVED_INPUTS_SNAPSHOT_SCHEMA: &str = "resolved_inputs_snapshot.v1";
+const MAX_RESOLVED_INPUT_SNAPSHOT_ENTRIES: usize = 256;
+const MAX_RESOLVED_INPUT_SNAPSHOT_BYTES: usize = 128 * 1024;
+
+/// Bounded, hashed copy of the resolved-input map captured with an admission.
+///
+/// This persistence layer checks the envelope and hash only. The application
+/// layer owns validation of each serialized `ResolvedInput` domain value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FmsResolvedInputsSnapshot {
+    pub schema_version: String,
+    pub inputs: Value,
+    pub content_sha256: String,
+}
+
+impl FmsResolvedInputsSnapshot {
+    pub fn new(inputs: Value) -> Result<Self> {
+        let snapshot = Self {
+            schema_version: FMS_RESOLVED_INPUTS_SNAPSHOT_SCHEMA.into(),
+            content_sha256: canonical_json_sha256(&inputs),
+            inputs,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != FMS_RESOLVED_INPUTS_SNAPSHOT_SCHEMA {
+            bail!(
+                "unsupported resolved-input snapshot schema `{}`",
+                self.schema_version
+            );
+        }
+        let inputs = self
+            .inputs
+            .as_object()
+            .context("resolved-input snapshot inputs must be a JSON object")?;
+        if inputs.len() > MAX_RESOLVED_INPUT_SNAPSHOT_ENTRIES {
+            bail!(
+                "resolved-input snapshot has {} entries, exceeding the limit of {}",
+                inputs.len(),
+                MAX_RESOLVED_INPUT_SNAPSHOT_ENTRIES
+            );
+        }
+        let canonical_inputs = canonical_json_bytes(&self.inputs);
+        if canonical_inputs.len() > MAX_RESOLVED_INPUT_SNAPSHOT_BYTES {
+            bail!(
+                "resolved-input snapshot metadata exceeds the {}-byte limit",
+                MAX_RESOLVED_INPUT_SNAPSHOT_BYTES
+            );
+        }
+        validate_sha256(
+            &self.content_sha256,
+            "resolved-input snapshot content_sha256",
+        )?;
+        let actual = format!("{:x}", Sha256::digest(&canonical_inputs));
+        if self.content_sha256 != actual {
+            bail!("resolved-input snapshot content_sha256 does not match its inputs");
+        }
+        self.collect_object_refs()?;
+        Ok(())
+    }
+
+    /// Return only CAS references declared under `study_artifact.object_ref`.
+    /// `content_sha256` values identify resolved metadata and are not object roots.
+    pub fn object_refs(&self) -> Result<BTreeSet<String>> {
+        self.validate()?;
+        self.collect_object_refs()
+    }
+
+    fn collect_object_refs(&self) -> Result<BTreeSet<String>> {
+        let inputs = self
+            .inputs
+            .as_object()
+            .context("resolved-input snapshot inputs must be a JSON object")?;
+        let mut object_refs = BTreeSet::new();
+        for (port_id, descriptor) in inputs {
+            let descriptor = descriptor.as_object().with_context(|| {
+                format!("resolved-input snapshot entry `{port_id}` must be an object")
+            })?;
+            let Some(study_artifact) = descriptor.get("study_artifact") else {
+                continue;
+            };
+            if study_artifact.is_null() {
+                continue;
+            }
+            let study_artifact = study_artifact.as_object().with_context(|| {
+                format!(
+                    "resolved-input snapshot entry `{port_id}` study_artifact must be an object"
+                )
+            })?;
+            let object_ref = study_artifact
+                .get("object_ref")
+                .and_then(Value::as_str)
+                .with_context(|| {
+                    format!(
+                        "resolved-input snapshot entry `{port_id}` study_artifact.object_ref must be a SHA-256 string"
+                    )
+                })?;
+            validate_sha256(object_ref, "resolved-input study_artifact.object_ref")?;
+            object_refs.insert(object_ref.to_owned());
+        }
+        Ok(object_refs)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FmsTaskAdmissionRecord {
@@ -2494,6 +3180,8 @@ pub struct FmsTaskAdmissionRecord {
     pub queued_task: FmsTaskCatalogEntry,
     pub task: FmsTaskCatalogEntry,
     pub lease: FmsResourceLease,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_inputs_snapshot: Option<FmsResolvedInputsSnapshot>,
 }
 
 impl FmsTaskAdmissionRecord {
@@ -2508,6 +3196,11 @@ impl FmsTaskAdmissionRecord {
             bail!("task admission expected catalog revision must be positive");
         }
         self.lease.validate()?;
+        if let Some(snapshot) = &self.resolved_inputs_snapshot {
+            snapshot
+                .validate()
+                .context("invalid task admission resolved-input snapshot")?;
+        }
         self.queued_task.validate(&self.lease.run_id)?;
         self.task.validate(&self.lease.run_id)?;
         if self.queued_task.task_id != self.task.task_id
@@ -3007,5 +3700,303 @@ mod graph_schema_tests {
             "backend_family": "fdm", "extra": {"step": 0},
             "hidden_object_ref": "a".repeat(64)});
         assert!(serde_json::from_value::<BackendStatePayload>(backend).is_err());
+    }
+}
+
+#[cfg(test)]
+mod host_launch_binding_tests {
+    use super::{
+        FmsHostLaunchBinding, FmsResourceBudget, FmsResourceKind, FmsResourceLease,
+        FmsResourceLeaseState, FMS_HOST_LAUNCH_BINDING_SCHEMA, FMS_RESOURCE_LEASE_SCHEMA,
+    };
+    use crate::host_resource_ledger::{
+        HostResourceLedgerPolicy, HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V1,
+    };
+    use chrono::Utc;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
+
+    fn absolute_test_root() -> PathBuf {
+        #[cfg(windows)]
+        {
+            PathBuf::from(r"C:\fullmag\host-ledger")
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from("/tmp/fullmag-host-ledger")
+        }
+    }
+
+    fn binding(ledger_root: PathBuf) -> FmsHostLaunchBinding {
+        FmsHostLaunchBinding {
+            schema_version: FMS_HOST_LAUNCH_BINDING_SCHEMA.into(),
+            ledger_root,
+            policy: HostResourceLedgerPolicy {
+                schema_version: HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V1.into(),
+                host_id: "test-host".into(),
+                topology_sha256: "a".repeat(64),
+                revision: 1,
+                owner_epoch: 1,
+                total_budget: FmsResourceBudget {
+                    cpu_millis: 1_000,
+                    memory_bytes: 1_024,
+                    gpu_memory_bytes: 0,
+                    storage_bytes: 0,
+                },
+                gpu_vram_bytes_by_uuid: BTreeMap::new(),
+                allowed_cpu_ids: BTreeSet::new(),
+            },
+        }
+    }
+
+    fn lease(host_launch_binding: Option<FmsHostLaunchBinding>) -> FmsResourceLease {
+        let now = Utc::now();
+        FmsResourceLease {
+            schema_version: FMS_RESOURCE_LEASE_SCHEMA.into(),
+            resource_id: "cpu-0".into(),
+            kind: FmsResourceKind::Cpu,
+            budget: FmsResourceBudget {
+                cpu_millis: 1_000,
+                memory_bytes: 1_024,
+                gpu_memory_bytes: 0,
+                storage_bytes: 0,
+            },
+            run_id: "run".into(),
+            task_id: "task".into(),
+            attempt_id: "attempt".into(),
+            ownership_epoch: 1,
+            lease_token: "lease-token".into(),
+            state: FmsResourceLeaseState::Active,
+            acquired_at: now,
+            heartbeat_at: now,
+            heartbeat_sequence: 0,
+            released_at: None,
+            host_launch_binding,
+        }
+    }
+
+    #[test]
+    fn binding_validates_absolute_non_traversing_root_and_policy() {
+        assert!(binding(absolute_test_root()).validate().is_ok());
+        assert!(binding(PathBuf::from("relative/ledger"))
+            .validate()
+            .is_err());
+        assert!(binding(absolute_test_root().join("..").join("ledger"))
+            .validate()
+            .is_err());
+
+        let mut invalid_policy = binding(absolute_test_root());
+        invalid_policy.policy.revision = 0;
+        assert!(invalid_policy.validate().is_err());
+    }
+
+    #[test]
+    fn absent_binding_stays_absent_and_binding_is_part_of_lease_identity() {
+        let legacy = lease(None);
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_json.get("host_launch_binding").is_none());
+        let decoded: FmsResourceLease = serde_json::from_value(legacy_json).unwrap();
+        assert!(decoded.host_launch_binding.is_none());
+
+        let bound = lease(Some(binding(absolute_test_root())));
+        assert!(bound.validate().is_ok());
+        let bound_json = serde_json::to_value(&bound).unwrap();
+        assert!(bound_json.get("host_launch_binding").is_some());
+        let decoded_bound: FmsResourceLease = serde_json::from_value(bound_json).unwrap();
+        assert_eq!(decoded_bound.host_launch_binding, bound.host_launch_binding);
+        assert!(!legacy.identity_matches(&bound));
+        assert!(bound.identity_matches(&bound.clone()));
+    }
+}
+
+#[cfg(test)]
+mod resolved_inputs_snapshot_tests {
+    use super::{
+        canonical_json_sha256, FmsResolvedInputsSnapshot, FMS_RESOLVED_INPUTS_SNAPSHOT_SCHEMA,
+    };
+    use serde_json::{json, Map, Value};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn snapshot_round_trips_canonical_hash_and_rejects_tampering() {
+        let inputs = json!({
+            "step_output": {"source": "artifact-a", "content_sha256": "a".repeat(64)},
+            "pinned": {"source": "artifact-b", "content_sha256": "b".repeat(64)}
+        });
+        let snapshot = FmsResolvedInputsSnapshot::new(inputs).unwrap();
+        assert_eq!(snapshot.schema_version, FMS_RESOLVED_INPUTS_SNAPSHOT_SCHEMA);
+        assert_eq!(
+            snapshot.content_sha256,
+            canonical_json_sha256(&snapshot.inputs)
+        );
+
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let decoded: FmsResolvedInputsSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, snapshot);
+        decoded.validate().unwrap();
+
+        let mut tampered = decoded;
+        tampered.inputs["pinned"]["source"] = json!("different-artifact");
+        assert!(tampered.validate().is_err());
+    }
+
+    #[test]
+    fn snapshot_bounds_entry_count_and_metadata_size() {
+        let mut too_many = Map::new();
+        for index in 0..=256 {
+            too_many.insert(format!("port-{index}"), json!({}));
+        }
+        assert!(FmsResolvedInputsSnapshot::new(Value::Object(too_many)).is_err());
+
+        let too_large = json!({"port": {"value": "x".repeat(128 * 1024)}});
+        assert!(FmsResolvedInputsSnapshot::new(too_large).is_err());
+    }
+
+    #[test]
+    fn snapshot_object_refs_follow_study_artifacts_not_content_hashes() {
+        let inline_hash = "a".repeat(64);
+        let artifact_hash = "b".repeat(64);
+        let snapshot = FmsResolvedInputsSnapshot::new(json!({
+            "inline": {
+                "source": "input-data",
+                "content_sha256": inline_hash,
+                "study_artifact": null
+            },
+            "artifact": {
+                "source": "artifact-id",
+                "content_sha256": "c".repeat(64),
+                "study_artifact": {"object_ref": artifact_hash}
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            snapshot.object_refs().unwrap(),
+            BTreeSet::from(["b".repeat(64)])
+        );
+        assert!(FmsResolvedInputsSnapshot::new(json!({
+            "artifact": {"study_artifact": {"object_ref": "not-a-sha256"}}
+        }))
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod batch_output_storage_snapshot_tests {
+    use super::{
+        canonical_json_sha256, validate_batch_output_storage_snapshot,
+        FMS_BATCH_OUTPUT_STORAGE_SNAPSHOT_LEGACY_SCHEMA,
+        FMS_BATCH_OUTPUT_STORAGE_SNAPSHOT_SCHEMA,
+    };
+    use serde_json::{json, Value};
+
+    fn legacy_snapshot(settings: Value) -> Value {
+        json!({
+            "schema_version": FMS_BATCH_OUTPUT_STORAGE_SNAPSHOT_LEGACY_SCHEMA,
+            "source": "workspace_defaults",
+            "settings_sha256": canonical_json_sha256(&settings),
+            "settings": settings
+        })
+    }
+
+    fn resolved_snapshot(settings: Value, source: &str) -> Value {
+        let mut snapshot = json!({
+            "schema_version": FMS_BATCH_OUTPUT_STORAGE_SNAPSHOT_SCHEMA,
+            "source": source,
+            "settings_sha256": canonical_json_sha256(&settings),
+            "workspace_defaults_sha256": canonical_json_sha256(&json!({"defaults": true})),
+            "settings": settings
+        });
+        if source == "project_authoring" {
+            snapshot["authoring_policy_sha256"] =
+                json!(canonical_json_sha256(&json!({"authoring": true})));
+        }
+        snapshot
+    }
+
+    #[test]
+    fn validates_settings_shape_paths_and_enum_values() {
+        #[cfg(windows)]
+        let output_parent = r"C:\fullmag\outputs";
+        #[cfg(not(windows))]
+        let output_parent = "/tmp/fullmag/outputs";
+
+        let valid = json!({
+            "output_parent": output_parent,
+            "temp_parent": null,
+            "data_format": "zarr",
+            "cleanup": "on_success",
+            "existing_output": "timestamp"
+        });
+        assert!(validate_batch_output_storage_snapshot(&legacy_snapshot(valid.clone())).is_ok());
+
+        assert!(validate_batch_output_storage_snapshot(&legacy_snapshot(json!({}))).is_err());
+
+        let mut relative = valid.clone();
+        relative["output_parent"] = json!("outputs");
+        assert!(validate_batch_output_storage_snapshot(&legacy_snapshot(relative)).is_err());
+
+        let mut traversal = valid.clone();
+        traversal["output_parent"] = json!(format!("{output_parent}/../escape"));
+        assert!(validate_batch_output_storage_snapshot(&legacy_snapshot(traversal)).is_err());
+
+        let mut unsupported_format = valid;
+        unsupported_format["data_format"] = json!("csv");
+        assert!(
+            validate_batch_output_storage_snapshot(&legacy_snapshot(unsupported_format)).is_err()
+        );
+    }
+
+    #[test]
+    fn validates_resolved_settings_and_provenance_digests() {
+        #[cfg(windows)]
+        let output_dir = r"C:\fullmag\outputs";
+        #[cfg(not(windows))]
+        let output_dir = "/tmp/fullmag/outputs";
+
+        let settings = json!({
+            "output_dir": output_dir,
+            "temp_dir": null,
+            "data_format": "zarr",
+            "cleanup": "on_success",
+            "existing_output": "timestamp"
+        });
+        assert!(validate_batch_output_storage_snapshot(&resolved_snapshot(
+            settings.clone(),
+            "workspace_defaults"
+        ))
+        .is_ok());
+        assert!(validate_batch_output_storage_snapshot(&resolved_snapshot(
+            settings.clone(),
+            "project_authoring"
+        ))
+        .is_ok());
+
+        let mut relative = settings.clone();
+        relative["output_dir"] = json!("results");
+        assert!(validate_batch_output_storage_snapshot(&resolved_snapshot(
+            relative,
+            "workspace_defaults"
+        ))
+        .is_err());
+
+        let mut traversal = settings.clone();
+        traversal["output_dir"] = json!(format!("{output_dir}/../escape"));
+        assert!(validate_batch_output_storage_snapshot(&resolved_snapshot(
+            traversal,
+            "workspace_defaults"
+        ))
+        .is_err());
+
+        let mut missing_policy_digest = resolved_snapshot(settings.clone(), "project_authoring");
+        missing_policy_digest
+            .as_object_mut()
+            .unwrap()
+            .remove("authoring_policy_sha256");
+        assert!(validate_batch_output_storage_snapshot(&missing_policy_digest).is_err());
+
+        let mut tampered = resolved_snapshot(settings, "workspace_defaults");
+        tampered["settings"]["cleanup"] = json!("always");
+        assert!(validate_batch_output_storage_snapshot(&tampered).is_err());
     }
 }

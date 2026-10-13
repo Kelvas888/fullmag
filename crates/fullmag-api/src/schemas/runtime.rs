@@ -131,6 +131,8 @@ pub struct StageExecutionRecordResource {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_step: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_to_tolerance_seconds: Option<f64>,
@@ -486,6 +488,8 @@ pub struct CommandDetailResource {
     pub started_at_unix_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_step: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_step: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_time_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

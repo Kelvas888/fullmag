@@ -176,9 +176,10 @@ try {
     await page.getByRole("listbox").waitFor({ state: "visible", timeout });
     const options = page.getByRole("option");
     assert.equal(await options.count(), 2, "Only exact mapped executions may appear as options");
-    for (const id of ["runtime-stage-009", "duplicate-stage-010"]) {
-      assert.match(await options.filter({ hasText: id }).innerText(), /completed/);
-    }
+    const optionTexts = await Promise.all(
+      ["runtime-stage-009", "duplicate-stage-010"].map((id) => options.filter({ hasText: id }).innerText()),
+    );
+    for (const text of optionTexts) assert.match(text, /completed/);
     await page.keyboard.press(stageId === "duplicate-stage-010" ? "End" : "Home");
     // Radix schedules keyboard focus movement; commit only after the exact
     // intended option owns focus, not while the previously focused item does.

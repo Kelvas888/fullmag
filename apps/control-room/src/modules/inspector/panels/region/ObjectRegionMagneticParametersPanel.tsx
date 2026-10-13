@@ -1,7 +1,7 @@
 "use client";
 
 import type { ChangeEvent } from "react";
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { MaterialParameterFieldListResource, SceneResource } from "@/kernel/api/apiTypes";
 import {
   authoringWriteOptions,
@@ -22,6 +22,7 @@ import {
   ObjectRegionMetadataSection,
   ObjectRegionActionsSection,
   ObjectRegionInlineDiagnostics,
+  type RegionAuxiliaryDraftSession,
   type RegionSubPanelProps,
 } from "./shared";
 import {
@@ -126,6 +127,7 @@ function useObjectRegionMagneticParametersPanelView({
   model,
   draft,
   pending,
+  draftApplyPending = false,
   sessionAvailable,
   draftDirty,
   buildRegion,
@@ -143,6 +145,8 @@ function useObjectRegionMagneticParametersPanelView({
   deleteRegion,
   feedback,
   materialFields,
+  auxiliaryDraftOwnerKey,
+  reportAuxiliaryDraftSession,
 }: RegionSubPanelProps) {
   const { api, authoringHistory, commands, resources } = useKernel();
   const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
@@ -189,28 +193,45 @@ function useObjectRegionMagneticParametersPanelView({
     fieldDraftState.key === fieldDraftKey
       ? fieldDraftState.fields
       : baseFieldDrafts;
+  const fieldDraftRef = useRef(fieldDrafts);
+  useLayoutEffect(() => {
+    fieldDraftRef.current = fieldDrafts;
+  }, [fieldDrafts]);
+  const resourceRevision = sceneData?.revision ?? model.revision ?? -1;
+  const [acknowledgedFieldBaseline, setAcknowledgedFieldBaseline] = useState<{
+    fields: MaterialFieldDraft[];
+    identityKey: string;
+    revision: number;
+  } | null>(null);
+  const fieldBaseline = acknowledgedFieldBaseline?.identityKey === `${model.objectId}:${model.regionId}` &&
+    resourceRevision < acknowledgedFieldBaseline.revision
+    ? acknowledgedFieldBaseline.fields
+    : baseFieldDrafts;
+  const fieldDraftDirty = JSON.stringify(fieldDrafts) !== JSON.stringify(fieldBaseline);
+  const fieldMutationInFlight = useRef(false);
+
+  function replaceFieldDrafts(fields: MaterialFieldDraft[]): void {
+    fieldDraftRef.current = fields;
+    setFieldDraftState({ fields, key: fieldDraftKey });
+  }
 
   function updateMaterialFieldDraft(
     index: number,
     patch: Partial<MaterialFieldDraft>,
   ): void {
-    setFieldDraftState((current) => {
-      const fields = current.key === fieldDraftKey ? current.fields : baseFieldDrafts;
-      return {
-        fields: fields.map((field, fieldIndex) =>
-          fieldIndex === index
-            ? {
-                ...field,
-                ...patch,
-                unit: patch.parameter
-                  ? unitForMaterialParameter(patch.parameter)
-                  : (patch.unit ?? field.unit),
-              }
-            : field,
-        ),
-        key: fieldDraftKey,
-      };
-    });
+    if (fieldMutationInFlight.current) return;
+    const next = fieldDraftRef.current.map((field, fieldIndex) =>
+      fieldIndex === index
+        ? {
+            ...field,
+            ...patch,
+            unit: patch.parameter
+              ? unitForMaterialParameter(patch.parameter)
+              : (patch.unit ?? field.unit),
+          }
+        : field,
+    );
+    replaceFieldDrafts(next);
     setFieldFeedback(null);
   }
 
@@ -228,33 +249,28 @@ function useObjectRegionMagneticParametersPanelView({
   }
 
   function addMaterialField(): void {
-    setFieldDraftState((current) => {
-      const fields = current.key === fieldDraftKey ? current.fields : baseFieldDrafts;
-      return {
-        fields: [...fields, defaultMaterialFieldDraft(model)],
-        key: fieldDraftKey,
-      };
-    });
+    if (fieldMutationInFlight.current) return;
+    replaceFieldDrafts([...fieldDraftRef.current, defaultMaterialFieldDraft(model)]);
     setFieldFeedback(null);
   }
 
   function removeMaterialField(index: number): void {
-    setFieldDraftState((current) => {
-      const fields = current.key === fieldDraftKey ? current.fields : baseFieldDrafts;
-      return {
-        fields: fields.filter((_field, fieldIndex) => fieldIndex !== index),
-        key: fieldDraftKey,
-      };
-    });
+    if (fieldMutationInFlight.current) return;
+    replaceFieldDrafts(
+      fieldDraftRef.current.filter((_field, fieldIndex) => fieldIndex !== index),
+    );
     setFieldFeedback(null);
   }
 
-  async function applyMaterialFields(): Promise<void> {
+  async function applyMaterialFields(
+    submittedFieldDrafts: MaterialFieldDraft[] = fieldDrafts,
+  ): Promise<boolean> {
+    if (fieldMutationInFlight.current) return false;
     if (!canWriteRegion) {
       setFieldFeedback({ kind: "error", message: "Select an authored object region." });
-      return;
+      return false;
     }
-    const invalid = fieldDrafts.find(
+    const invalid = submittedFieldDrafts.find(
       (field) =>
         !Number.isFinite(field.priority) ||
         (field.kind === "radial" && (!Number.isFinite(field.radius) || field.radius <= 0)),
@@ -264,7 +280,7 @@ function useObjectRegionMagneticParametersPanelView({
         kind: "error",
         message: "Material field priority and radial radius must be finite values.",
       });
-      return;
+      return false;
     }
 
     const operationSessionScopeKey = sessionScopeKey;
@@ -273,7 +289,7 @@ function useObjectRegionMagneticParametersPanelView({
         kind: "error",
         message: "Session identity is not ready. Try again after it loads.",
       });
-      return;
+      return false;
     }
     const historyGeneration = authoringHistory?.getGeneration?.();
     const historyContext = {
@@ -286,6 +302,7 @@ function useObjectRegionMagneticParametersPanelView({
         (historyGeneration === undefined ||
           authoringHistory?.getGeneration?.() === historyGeneration),
     };
+    fieldMutationInFlight.current = true;
     const operationId = ++nextFieldOperationId.current;
     setPendingFieldOperation({
       id: operationId,
@@ -298,7 +315,7 @@ function useObjectRegionMagneticParametersPanelView({
       );
       const fields = [
         ...retainedFields,
-        ...fieldDrafts.map((field) =>
+        ...submittedFieldDrafts.map((field) =>
           materialFieldFromDraft(field, model, { meshPolicyLane: meshLane }),
         ),
       ];
@@ -324,7 +341,7 @@ function useObjectRegionMagneticParametersPanelView({
           return api.model.patchObjectMaterialFields(model.objectId, fields, options);
         },
       );
-      if (historyContext.isCurrentSessionScope() === false) return;
+      if (historyContext.isCurrentSessionScope() === false) return false;
       publishRegionAuthoringScene(
         resources,
         response.committed_scene,
@@ -333,16 +350,76 @@ function useObjectRegionMagneticParametersPanelView({
         operationSessionScopeKey,
         api.resourceCacheScope,
       );
+      setAcknowledgedFieldBaseline({
+        fields: submittedFieldDrafts,
+        identityKey: `${model.objectId}:${model.regionId}`,
+        revision: response.scene_revision,
+      });
+      if (fieldDraftRef.current === submittedFieldDrafts) {
+        replaceFieldDrafts(submittedFieldDrafts);
+      }
       setFieldFeedback({ kind: "success", message: "Material fields updated." });
+      return true;
     } catch (error) {
-      if (historyContext.isCurrentSessionScope() === false) return;
+      if (historyContext.isCurrentSessionScope() === false) return false;
       setFieldFeedback({ kind: "error", message: errorMessage(error) });
+      return false;
     } finally {
+      fieldMutationInFlight.current = false;
       setPendingFieldOperation((current) =>
         current?.id === operationId ? null : current,
       );
     }
   }
+
+  function resetMaterialFields(): void {
+    if (fieldMutationInFlight.current) return;
+    replaceFieldDrafts(fieldBaseline);
+    setFieldFeedback(null);
+  }
+
+  const fieldDraftErrors = fieldDrafts.some(
+    (field) =>
+      !Number.isFinite(field.priority) ||
+      (field.kind === "radial" && (!Number.isFinite(field.radius) || field.radius <= 0)),
+  );
+  const fieldDraftValid = canWriteRegion && Boolean(sessionScopeKey) && !fieldDraftErrors;
+  const auxiliaryApplyRef = useRef(applyMaterialFields);
+  const auxiliaryResetRef = useRef(resetMaterialFields);
+  // Publish the latest handler closures after every committed render.
+  useLayoutEffect(() => {
+    auxiliaryApplyRef.current = applyMaterialFields;
+    auxiliaryResetRef.current = resetMaterialFields;
+  });
+  const applyAuxiliaryDraft = useCallback(
+    () => auxiliaryApplyRef.current(fieldDrafts),
+    [fieldDrafts],
+  );
+  const resetAuxiliaryDraft = useCallback(
+    () => auxiliaryResetRef.current(),
+    [],
+  );
+  useEffect(() => {
+    if (!auxiliaryDraftOwnerKey || !reportAuxiliaryDraftSession) return;
+    const session: RegionAuxiliaryDraftSession = {
+      applying: draftApplyPending || fieldPending,
+      apply: applyAuxiliaryDraft,
+      dirty: fieldDraftDirty,
+      reset: resetAuxiliaryDraft,
+      valid: fieldDraftValid,
+    };
+    reportAuxiliaryDraftSession(auxiliaryDraftOwnerKey, session);
+    return () => reportAuxiliaryDraftSession(auxiliaryDraftOwnerKey, null);
+  }, [
+    applyAuxiliaryDraft,
+    auxiliaryDraftOwnerKey,
+    fieldDraftDirty,
+    fieldDraftValid,
+    fieldPending,
+    draftApplyPending,
+    reportAuxiliaryDraftSession,
+    resetAuxiliaryDraft,
+  ]);
 
   const overriddenParams = new Set(
     draft.materialOverrides.map((override) => override.parameter),
@@ -705,7 +782,7 @@ function useObjectRegionMagneticParametersPanelView({
             Add Field
           </Button>
           <Button
-            disabled={fieldPending || !canWriteRegion}
+            disabled={fieldPending || !canWriteRegion || !fieldDraftDirty}
             size="sm"
             type="button"
             variant="primary"
@@ -718,10 +795,7 @@ function useObjectRegionMagneticParametersPanelView({
             size="sm"
             type="button"
             variant="ghost"
-            onClick={() => {
-              setFieldDraftState({ fields: baseFieldDrafts, key: fieldDraftKey });
-              setFieldFeedback(null);
-            }}
+            onClick={resetMaterialFields}
           >
             Revert Fields
           </Button>

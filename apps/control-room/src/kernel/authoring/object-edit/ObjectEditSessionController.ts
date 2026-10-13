@@ -20,6 +20,10 @@ export class ObjectEditSessionController<TDraft> {
   private draftSequence = 0;
   private epochSequence = 0;
   private operationSequence = 0;
+  private gestureSequence = 0;
+  private sceneMutationSequence = 0;
+  private sceneMutations = new Map<number, { sessionScopeKey: string | null; objectId: string }>();
+  private activeGestures = new Map<number, { sessionScopeKey: string | null; objectId: string }>();
   private pendingOperations = new Map<
     string,
     ObjectEditApplyOperation<TDraft>
@@ -105,13 +109,62 @@ export class ObjectEditSessionController<TDraft> {
     return true;
   }
 
+  /** Scene writes serialize within a session, while owners remain per object. */
+  hasPendingApply(sessionScopeKey: string | null): boolean {
+    return [...this.pendingOperations.values()].some(
+      (operation) => operation.identity.sessionScopeKey === sessionScopeKey,
+    );
+  }
+
+  hasPendingWrite(sessionScopeKey: string | null): boolean {
+    return this.hasPendingApply(sessionScopeKey) || [...this.sceneMutations.values()].some(
+      (mutation) => mutation.sessionScopeKey === sessionScopeKey,
+    );
+  }
+
+  /** A client-side reservation for existing single-object writes, not an API transaction. */
+  beginSceneMutation(sessionScopeKey: string | null, objectId: string): number | null {
+    if (this.hasPendingWrite(sessionScopeKey) || this.hasActiveGesture(sessionScopeKey)) return null;
+    const token = ++this.sceneMutationSequence;
+    this.sceneMutations.set(token, { sessionScopeKey, objectId });
+    this.publish({ ...this.snapshot });
+    return token;
+  }
+
+  endSceneMutation(token: number): boolean {
+    if (!this.sceneMutations.delete(token)) return false;
+    this.publish({ ...this.snapshot });
+    return true;
+  }
+
+  hasActiveGesture(sessionScopeKey: string | null): boolean {
+    return [...this.activeGestures.values()].some(
+      (gesture) => gesture.sessionScopeKey === sessionScopeKey,
+    );
+  }
+
+  beginGesture(sessionScopeKey: string | null, objectId: string): number | null {
+    if (this.hasPendingWrite(sessionScopeKey) || this.hasActiveGesture(sessionScopeKey)) return null;
+    const token = ++this.gestureSequence;
+    this.activeGestures.set(token, { sessionScopeKey, objectId });
+    this.publish({ ...this.snapshot });
+    return token;
+  }
+
+  endGesture(token: number): boolean {
+    if (!this.activeGestures.delete(token)) return false;
+    this.publish({ ...this.snapshot });
+    return true;
+  }
+
   beginApply(
     identity: ObjectEditSessionIdentity,
   ): ObjectEditApplyOperation<TDraft> | null {
     if (
       !this.matches(identity) ||
       this.snapshot.draft === null ||
-      this.pendingOperations.has(this.pendingOperationKey(identity))
+      this.hasPendingWrite(identity.sessionScopeKey) ||
+      this.hasActiveGesture(identity.sessionScopeKey)
     ) {
       return null;
     }
@@ -134,6 +187,7 @@ export class ObjectEditSessionController<TDraft> {
       submittedDraft: TDraft,
       canonicalDraft: TDraft,
     ) => { dirty: boolean; draft: TDraft },
+    options: { reconcileUnchangedDraft?: boolean } = {},
   ): boolean {
     const opKey = this.pendingOperationKey(operation.identity);
     const pending = this.pendingOperations.get(opKey);
@@ -146,17 +200,18 @@ export class ObjectEditSessionController<TDraft> {
       this.snapshot.applyOperationId === operation.id &&
       this.snapshot.draft !== null;
     if (!ownsCurrentDraft) {
-      if (
-        ownsPending &&
-        this.snapshot.identity?.sessionScopeKey === operation.identity.sessionScopeKey &&
-        this.snapshot.applyOperationId === operation.id
-      ) {
-        this.publish({ ...this.snapshot, applyOperationId: null });
+      if (ownsPending && this.snapshot.identity?.sessionScopeKey === operation.identity.sessionScopeKey) {
+        this.publish({
+          ...this.snapshot,
+          applyOperationId: this.snapshot.applyOperationId === operation.id
+            ? null
+            : this.snapshot.applyOperationId,
+        });
       }
       return false;
     }
     const reconciled =
-      this.snapshot.editVersion === operation.submittedVersion
+      this.snapshot.editVersion === operation.submittedVersion && !options.reconcileUnchangedDraft
         ? { dirty: false, draft: canonicalDraft }
         : reconcile(
             this.snapshot.draft as TDraft,
@@ -182,12 +237,13 @@ export class ObjectEditSessionController<TDraft> {
     const ownsCurrentDraft =
       this.matches(operation.identity) &&
       this.snapshot.applyOperationId === operation.id;
-    if (
-      ownsPending &&
-      this.snapshot.identity?.sessionScopeKey === operation.identity.sessionScopeKey &&
-      this.snapshot.applyOperationId === operation.id
-    ) {
-      this.publish({ ...this.snapshot, applyOperationId: null });
+    if (ownsPending && this.snapshot.identity?.sessionScopeKey === operation.identity.sessionScopeKey) {
+      this.publish({
+        ...this.snapshot,
+        applyOperationId: this.snapshot.applyOperationId === operation.id
+          ? null
+          : this.snapshot.applyOperationId,
+      });
     }
     return ownsCurrentDraft;
   }
@@ -195,7 +251,8 @@ export class ObjectEditSessionController<TDraft> {
   reset(identity: ObjectEditSessionIdentity, initialDraft: TDraft): boolean {
     if (
       !this.matches(identity) ||
-      this.pendingOperations.has(this.pendingOperationKey(identity))
+      this.hasPendingWrite(identity.sessionScopeKey) ||
+      this.hasActiveGesture(identity.sessionScopeKey)
     ) {
       return false;
     }
@@ -210,9 +267,13 @@ export class ObjectEditSessionController<TDraft> {
   }
 
   clear(): void {
+    const hadReservations = this.pendingOperations.size > 0 ||
+      this.activeGestures.size > 0 || this.sceneMutations.size > 0;
     this.epochSequence += 1;
     this.pendingOperations.clear();
-    if (this.snapshot.identity === null && this.snapshot.draft === null) return;
+    this.activeGestures.clear();
+    this.sceneMutations.clear();
+    if (!hadReservations && this.snapshot.identity === null && this.snapshot.draft === null) return;
     this.publish(EMPTY_SNAPSHOT as ObjectEditSessionSnapshot<TDraft>);
   }
 

@@ -62,6 +62,7 @@ _STUDY_FIELDS = frozenset(
         "requested_cpu_threads",
         "execution_profile",
         "execution_layers",
+        "compute_resources",
         "fem_demag_solver_policy",
         "exchange_enabled",
         "demag_enabled",

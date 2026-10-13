@@ -49,6 +49,7 @@ pub fn application_service_config(
         heartbeat_interval_milliseconds: 1000,
         startup_timeout_seconds: 60,
         drain_timeout_seconds: 1800,
+        host_execution: None,
     };
     config.validate()?;
     Ok(config)

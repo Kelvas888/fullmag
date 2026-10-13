@@ -896,6 +896,15 @@ export type ProjectRunMaterializationResource =
 export type ProjectRunResource = components["schemas"]["ProjectRunResource"];
 export type ProjectRunListQuery = components["schemas"]["ProjectRunListQuery"];
 export type ProjectRunListResource = components["schemas"]["ProjectRunListResource"];
+export type ProjectBatchSubmitRequest = components["schemas"]["ProjectBatchSubmitRequest"];
+export type ProjectBatchSubmitResource = components["schemas"]["ProjectBatchSubmitResource"];
+export type ProjectBatchListQuery = components["schemas"]["ProjectBatchListQuery"];
+export type ProjectBatchListResource = components["schemas"]["ProjectBatchListResource"];
+export type ProjectBatchSummaryResource = components["schemas"]["ProjectBatchSummaryResource"];
+export type ProjectBatchAxisSummaryResource = components["schemas"]["ProjectBatchAxisSummaryResource"];
+export type ProjectBatchCasesQuery = components["schemas"]["ProjectBatchCasesQuery"];
+export type ProjectBatchCasesResource = components["schemas"]["ProjectBatchCasesResource"];
+export type ProjectBatchCaseSummaryResource = components["schemas"]["ProjectBatchCaseSummaryResource"];
 export type ProjectRunTaskCancellationRequest =
   components["schemas"]["ProjectRunTaskCancellationRequest"];
 export type ProjectRunTaskCancellationResource =

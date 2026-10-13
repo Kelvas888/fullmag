@@ -87,9 +87,25 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
         active_run_refusal_owner_bundle: str | None = None,
         active_run_scenario: str = "running",
         start_freeze_race_only: bool = False,
+        compute_cancellation_only: bool = False,
+        compute_host_initialization_only: bool = False,
+        compute_scheduler_cancellation_only: bool = False,
         archive_frozen_bundle: bool = False) -> int:
     if archive_frozen_bundle and (not project_document_only or frozen_native_build_id is None):
         raise storage.StorageError("Native bundle archive requires the frozen project-document verification scope")
+    compute_scope_count = sum((compute_cancellation_only, compute_host_initialization_only,
+                               compute_scheduler_cancellation_only))
+    if compute_scope_count and (
+        cross_build_bundle or project_document_only or restart_transport_only
+        or observer_pause_only or restart_consumer_only or consumer_readiness_only
+        or consumer_pump_owner_bundle is not None or candidate_preparation_only
+        or workspace_browser_owner_bundle is not None
+        or active_run_refusal_owner_bundle is not None or start_freeze_race_only
+        or compute_scope_count > 1
+    ):
+        raise storage.StorageError(
+            "Compute verification requires one separate native verification scope"
+        )
     active_run_refusal = active_run_refusal_owner_bundle is not None
     _validate_start_freeze_race_scope(
         start_freeze_race_only,
@@ -294,6 +310,37 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
             receipt["checkout_source_sha256_before"] = checkout_source_before
             receipt["source_binding"] = "verified_frozen_native_package"
             receipt["scope"] = "owned A-to-B native restart with real nonempty scene and browser dirty-document hydration; private eligibility only, no public capability, solver or release qualification"
+        if compute_cancellation_only:
+            receipt["compute_cancellation_only"] = True
+            if frozen_native_build_id is not None:
+                receipt["checkout_source_sha256_before"] = checkout_source_before
+                receipt["source_binding"] = "verified_frozen_native_package"
+            receipt["scope"] = (
+                "production native API durable pre-claim cancellation request, retry, "
+                "revision/identity conflicts and real store-writer contention using a "
+                "fixture-seeded accepted run; no Submit, worker claim, solver execution, "
+                "terminal cancellation, resource-release, physics or release qualification"
+            )
+        if compute_host_initialization_only:
+            receipt["compute_host_initialization_only"] = True
+            if frozen_native_build_id is not None:
+                receipt["checkout_source_sha256_before"] = checkout_source_before
+                receipt["source_binding"] = "verified_frozen_native_package"
+            receipt["scope"] = (
+                "production native operator host-config and ledger initialization, "
+                "exact replay and refusal cases using explicit fixture policy; "
+                "no physical topology, service lifecycle, scheduler or solver proof"
+            )
+        if compute_scheduler_cancellation_only:
+            receipt["compute_scheduler_cancellation_only"] = True
+            if frozen_native_build_id is not None:
+                receipt["checkout_source_sha256_before"] = checkout_source_before
+                receipt["source_binding"] = "verified_frozen_native_package"
+            receipt["scope"] = (
+                "production native API cancellation and standalone scheduler projection "
+                "with explicit component drain using fixture metadata and policy; "
+                "no runtime-service lifecycle, physical topology, enforcement or solver proof"
+            )
         storage.atomic_json(receipt_path, receipt)
         code = 1
         try:
@@ -378,6 +425,15 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
                 )
             elif start_freeze_race_only:
                 exercise(api, repo, run_root, receipt, start_freeze_race_only=True)
+            elif compute_cancellation_only:
+                from windows.verify_compute_cancellation_api import exercise as exercise_compute_cancellation_api
+                exercise_compute_cancellation_api(api, repo, run_root, receipt)
+            elif compute_host_initialization_only:
+                from windows.verify_compute_host_initialization import exercise as exercise_compute_host_initialization
+                exercise_compute_host_initialization(api, repo, run_root, receipt)
+            elif compute_scheduler_cancellation_only:
+                from windows.verify_compute_scheduler_cancellation import exercise as exercise_compute_scheduler_cancellation
+                exercise_compute_scheduler_cancellation(api, repo, run_root, receipt)
             else:
                 exercise(api, repo, run_root, receipt, project_document_only=project_document_only,
                          project_source_root=project_source_root,
@@ -385,6 +441,9 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
                          consumer_readiness_only=consumer_readiness_only)
             if (not project_document_only and not restart_transport_only and not observer_pause_only
                     and not restart_consumer_only and not consumer_readiness_only
+                    and not compute_cancellation_only
+                    and not compute_host_initialization_only
+                    and not compute_scheduler_cancellation_only
                     and not frozen_probe):
                 exercise_service(repo, run_root, manifest, receipt, api.parent)
             # Use the canonical codegen branch rather than persisting the live
@@ -2619,6 +2678,9 @@ if __name__ == "__main__":
     parser.add_argument("--workspace-browser-owner-bundle")
     parser.add_argument("--frozen-native-build-id")
     parser.add_argument("--archive-frozen-bundle", action="store_true")
+    parser.add_argument("--compute-cancellation-only", action="store_true")
+    parser.add_argument("--compute-host-initialization-only", action="store_true")
+    parser.add_argument("--compute-scheduler-cancellation-only", action="store_true")
     args = parser.parse_args()
     try:
         raise SystemExit(run(args.repo_root, args.cross_build_bundle, args.project_document_only,
@@ -2627,7 +2689,9 @@ if __name__ == "__main__":
                              args.consumer_pump_owner_bundle, args.candidate_preparation_only,
                              args.workspace_browser_owner_bundle, args.frozen_native_build_id,
                               args.active_run_refusal_owner_bundle, args.active_run_scenario,
-                              args.start_freeze_race_only,
+                              args.start_freeze_race_only, args.compute_cancellation_only,
+                              args.compute_host_initialization_only,
+                              args.compute_scheduler_cancellation_only,
                               archive_frozen_bundle=args.archive_frozen_bundle))
     except Exception as error:
         print(f"Native development resource verification failed: {error}", file=sys.stderr)

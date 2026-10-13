@@ -8,12 +8,11 @@ Nie są to utworzone PR-y. Identyfikatory PR01–PR20 oznaczają propozycje mał
 |---|---|---|---|
 | Spójny Apply geometry+translation | R1 | PR02/05/06/07 | T01/T02/T51/T52 |
 | Powtarzalne Create, Revert, konflikty, późny ACK | R1 | PR02/04/06/07 | T01/T03–T07/T53–T55 |
-| Move myszą, single object - immediate commit safety | R0 | PR03 | T18 (R0)/T19 (R0)/T20 (R0)/T21/T22/T26 (R0) |
-| Move numeryczny i myszą, single object - staged draft + Apply | R1 | PR04/07 | T18 (R1)/T19 (R1)/T20 (R1)/T21 (R1)/T22 (R1)/T25/T26 (R1)/T56 |
+| Move numeryczny i myszą, single object | R1 | PR03/07 | T18–T22/T25 |
 | First-build, wspólna aktualność, Build Selected scope | R1 | PR08–PR12 | T33–T44/T58/T60 |
 | Portable recovery receipts zwykłych mutacji | R1 | PR05/06 | T53/T65; brak pełnej trwałej historii Undo |
 | Numeric Rotate/Scale, canonical pivot, World/Local | R2-T | PR13–PR15 | T13–T17/T23/T64 |
-| Snap translation/rotation/scale | R2-T | PR15 | T24; OFF domyślnie |
+| Snap translation/rotation/scale | R2-T | PR15 | T24/T56; OFF domyślnie |
 | Anchor center/bottom/custom i ustawienie Position | R2-T | PR13/15 | T14/T15; zero pierwotnych pól transformu nie dodawane ponownie |
 | STL staged import, source units, construction-only | R2-I | PR16–PR18 | T27–T31/T72 |
 | STL occupancy/volume i reimport | R2-I | PR17/18 + kwalifikacja właściwej lane | T29/T32/T59/T64 |
@@ -105,7 +104,7 @@ PR08 może wejść bez ukończonego PR07; nie trzeba czekać na TRS/import. PR02
 
 **Wejściowy kontrakt:** R0 jest wewnętrznym hotfiksem. Zachowuje istniejące zakończenie gestu, lecz fence/serializacja i error handling są obowiązkowe.
 
-**Odbiór R0:** PR03 utrzymuje immediate commit, serializuje zapisy i blokuje BeginGesture B do terminalnego wyniku A; no-op nie wysyła mutacji ani nie tworzy historii; błędy commitu wyzwolonego przez pointerup są przechwycone i widoczne, bez unhandled rejection; błąd capture historii jest jawnie oznaczony jako degraded. Testy: T18 (R0), T19 (R0), T20 (R0), T21, T22, T26 (R0). Ten hotfix nie kwalifikuje staged R1.
+**Odbiór:** Nie rozpoczyna gestu B przed ACK A; zero commit dla no-op, brak unhandled rejection, historia degraded jawna. Brak kwalifikacji staged R1 tym hotfiksem. Testy: T18, T19, T20, T21, T22, T25, T26, T56.
 
 **Wycofanie / migracja:** Nowe narzędzie można wyłączyć, pozostawiając naprawiony numeric Inspector; PR07 usuwa immediate compatibility path.
 
@@ -119,7 +118,7 @@ PR08 może wejść bez ukończonego PR07; nie trzeba czekać na TRS/import. PR02
 
 **Wejściowy kontrakt:** Gramatyka i no-op D04; znane kształty są rozróżniane od fallbacku.
 
-**Odbiór:** Empty nie staje się 0, unsupported nie udaje Box, cylinder h≠2r ma właściwe bounds; nieznana walidacja nie jest pass. T56 używa NUM-01 dla parsera i no-op SI. Testy: T08, T09, T10, T11, T12, T56.
+**Odbiór:** Empty nie staje się 0, unsupported nie udaje Box, cylinder h≠2r ma właściwe bounds. Nieznana walidacja nie jest pass. Testy: T08, T09, T10, T11, T12, T56.
 
 **Wycofanie / migracja:** Parser adapter ma jednego ownera; nie utrzymywać dwóch parserów po migracji paneli.
 
@@ -133,7 +132,7 @@ PR08 może wejść bez ukończonego PR07; nie trzeba czekać na TRS/import. PR02
 
 **Wejściowy kontrakt:** ADR02 i ADR04 zaakceptowane. Reuse patch_object_geometry; review końcowego committera, walidatora i storage przed zmianą.
 
-**Odbiór:** Jeden przegrany writer dostaje conflict; effect+receipt po crash są rozstrzygalne; run admission sprawdzony przy commit; delete-vs-patch rozstrzyga TARGET_DELETED albo commit receipt zgodnie z kolejnością. Brak nowego generic batch. Testy: T06, T51, T52, T53, T61, T63, T65.
+**Odbiór:** Jeden przegrany writer dostaje conflict; effect+receipt po crash są rozstrzygalne; run admission sprawdzony przy commit. Brak nowego generic batch. Testy: T51, T52, T53, T61, T63, T65.
 
 **Wycofanie / migracja:** Receipts nie usuwać przy rollback. Stary klient może pracować tylko według wersjonowanej compatibility; nie downgrade’ować zapisanych semantyk.
 
@@ -161,7 +160,7 @@ PR08 może wejść bez ukończonego PR07; nie trzeba czekać na TRS/import. PR02
 
 **Wejściowy kontrakt:** ADR01 zaakceptowany. Jeden shell/viewport. Jeden draft/kernel-instance; istniejąca stopka jest adapterem.
 
-**Odbiór R1:** Pointerup ustawia wspólny kernel-owned draft i wykonuje 0 requestów; jeden Apply wysyła jedną intencję PatchObjectGeometry z geometrią i pełnym istniejącym Transform3D. Geometry→Placement nie gubi draftu; ACK A zachowuje nowszy raw/patch B; inne scope respektują guard. Wszystkie wejścia wywołują ten sam intent. T25 kwalifikuje Move draft→Apply→Undo→Redo tylko tutaj i w PR12. Testy: T02, T03, T04, T05, T06, T18 (R1), T19 (R1), T20 (R1), T21 (R1), T22 (R1), T25, T26 (R1), T34, T50, T54, T55, T56, T57, T67.
+**Odbiór:** Pointerup 0 HTTP; jeden Apply zapisuje wymiary+pełny transform. Geometry→Placement nie gubi draftu; inne scope respektują guard. Wszystkie przyciski/skrót/paleta używają tego samego intent. Testy: T02, T03, T04, T05, T06, T18, T20, T25, T34, T50, T54, T55, T57, T67.
 
 **Wycofanie / migracja:** Flaga owner=frontend authoring. Brak dual-write; wyłączenie myszy zostawia numeric staged UI. Immediate shim z PR03 usunąć przed R1.
 
@@ -241,7 +240,7 @@ PR08 może wejść bez ukończonego PR07; nie trzeba czekać na TRS/import. PR02
 
 **Owner:** geometry + Python/IR + physics. **Mapowanie v1:** C1-contract. **Depends:** PR05, PR07.
 
-**Pliki/granice:** `crates/fullmag-authoring scene/geometry/adapters/validation`; `packages/fullmag-py runtime/scene_document.py`; mapowanie canonical geometry do istniejącego ProblemIR/DTO i migracja [trace matrix D13]; `docs/physics transform-frame note`.
+**Pliki/granice:** `crates/fullmag-authoring scene/geometry/adapters/validation`; `packages/fullmag-py runtime/scene_document.py`; `ProblemIR/export/evaluator [trace matrix D13]`; `docs/physics transform-frame note + schema migration`.
 
 **Wejściowy kontrakt:** ADR03/04 akceptacja; fixture points i legacy nonzero pivot. Nie dodawać drugiego Transform3D.
 
@@ -255,9 +254,9 @@ PR08 może wejść bez ukończonego PR07; nie trzeba czekać na TRS/import. PR02
 
 **Owner:** FDM/FEM backend + physics. **Mapowanie v1:** C1-lowering. **Depends:** PR13, PR10.
 
-**Pliki/granice:** konsumenci canonical geometry/IR dla `FDM membership/evaluator CPU + GPU`; `FEM geometry realization + backend consumers`; `backend lane capability qualification records`.
+**Pliki/granice:** `Python→IR canonical geometry owner`; `FDM membership/evaluator CPU + GPU`; `FEM geometry realization + backend consumers`; `backend lane capability qualification records`.
 
-**Wejściowy kontrakt:** PR13 dostarcza mapowanie canonical geometry do istniejącego ProblemIR/DTO; PR14 kwalifikuje jego konsumentów. Każda z 4 lanes ma osobny owner i dowody. Nie utożsamiać CPU meshera z CPU solver lane.
+**Wejściowy kontrakt:** Każda z 4 lanes ma osobny owner i dowody. Nie utożsamiać CPU meshera z CPU solver lane.
 
 **Odbiór:** Points/AABB, region ownership, occupancy/mesh i nauka per lane; explicit GPU nigdy fallbackCPU. Testy: T14, T15, T47, T62, T64, T71.
 
@@ -273,7 +272,7 @@ PR08 może wejść bez ukończonego PR07; nie trzeba czekać na TRS/import. PR02
 
 **Wejściowy kontrakt:** Qualified capability danej lane; math D13; brak prywatnych HTTP/historii w gizmo.
 
-**Odbiór:** Ray/ortho/perspective, screen-size handles, staged preview równoważny wpisowi liczbowemu. Brak autocommit po pointerup. Testy: T13, T14, T15, T17, T20, T21, T22, T23, T24, T50, T55.
+**Odbiór:** Ray/ortho/perspective, screen-size handles, staged preview równoważny wpisowi liczbowemu. Brak autocommit po pointerup. Testy: T13, T14, T15, T17, T20, T21, T22, T23, T24, T50, T55, T56.
 
 **Wycofanie / migracja:** Flaga owner=viewport authoring; możliwość wyłączyć drag i używać tych samych numeric fields; journal/draft nieusuwany.
 

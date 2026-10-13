@@ -1,6 +1,7 @@
 import type { SceneResource } from "@/kernel/api/apiTypes";
 
-import type { GeometryObjectDraft } from "./objectEditTypes";
+import type { GeometryObjectDraft, QuantityDraftField } from "./objectEditTypes";
+import { parseDraftQuantityField } from "./quantityDraftFields";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -103,20 +104,24 @@ export function geometryObjectEditSessionTargetKey(
   return JSON.stringify([sessionScopeKey, `${draft.mode}:${draft.objectId}`]);
 }
 
-function numericDraftValue(value: string): number | null {
-  if (!value.trim()) return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
+function numericDraftValue(
+  draft: GeometryObjectDraft,
+  field: QuantityDraftField,
+): number | null {
+  const parsed = parseDraftQuantityField(draft, field);
+  return parsed.parseStatus === "valid" ? parsed.parsedSI : null;
 }
 
 function geometryCharacteristicLength(draft: GeometryObjectDraft): number {
   const values = [
-    ...draft.size.map(numericDraftValue),
-    numericDraftValue(draft.radius),
-    numericDraftValue(draft.height),
-    numericDraftValue(draft.length),
-    numericDraftValue(draft.width),
-    numericDraftValue(draft.archHeight),
+    numericDraftValue(draft, "size.0"),
+    numericDraftValue(draft, "size.1"),
+    numericDraftValue(draft, "size.2"),
+    numericDraftValue(draft, "radius"),
+    numericDraftValue(draft, "height"),
+    numericDraftValue(draft, "length"),
+    numericDraftValue(draft, "width"),
+    numericDraftValue(draft, "archHeight"),
   ].filter((value): value is number => value !== null);
   const positive = values.map(Math.abs).filter((value) => value > 0);
   return positive.length > 0 ? Math.max(...positive) : 0;
@@ -128,23 +133,61 @@ function float64Ulp(value: number): number {
   return 2 ** (Math.floor(Math.log2(magnitude)) - 52);
 }
 
-function sameLengthValue(left: string, right: string, characteristicLength: number): boolean {
-  const a = numericDraftValue(left);
-  const b = numericDraftValue(right);
+export function geometryDraftLengthValuesEqual(
+  left: number,
+  right: number,
+  characteristicLength = 0,
+): boolean {
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
+  const finiteCharacteristicLength = Number.isFinite(characteristicLength)
+    ? Math.abs(characteristicLength)
+    : 0;
+  const magnitude = Math.max(
+    Math.abs(left),
+    Math.abs(right),
+    finiteCharacteristicLength,
+  );
+  return Math.abs(left - right) <= 8 * float64Ulp(magnitude);
+}
+
+function sameLengthValue(
+  left: GeometryObjectDraft,
+  leftField: QuantityDraftField,
+  right: GeometryObjectDraft,
+  rightField: QuantityDraftField,
+  characteristicLength: number,
+): boolean {
+  const a = numericDraftValue(left, leftField);
+  const b = numericDraftValue(right, rightField);
   if (a === null || b === null) return false;
-  const magnitude = Math.max(Math.abs(a), Math.abs(b), characteristicLength);
-  return Math.abs(a - b) <= 8 * float64Ulp(magnitude);
+  return geometryDraftLengthValuesEqual(a, b, characteristicLength);
 }
 
 function sameLengthVector(
-  left: readonly string[],
-  right: readonly string[],
+  left: GeometryObjectDraft,
+  right: GeometryObjectDraft,
+  field: "size" | "translation",
   characteristicLength: number,
 ): boolean {
-  return left.length === right.length &&
-    left.every((value, index) =>
-      sameLengthValue(value, right[index], characteristicLength),
-    );
+  const fields: readonly QuantityDraftField[] = field === "size"
+    ? ["size.0", "size.1", "size.2"]
+    : ["translation.0", "translation.1", "translation.2"];
+  return fields.every((axisField) =>
+    sameLengthValue(left, axisField, right, axisField, characteristicLength),
+  );
+}
+
+/** Compares one length field using each draft's selected unit and SI value. */
+export function geometryDraftQuantityEquals(
+  left: GeometryObjectDraft,
+  right: GeometryObjectDraft,
+  field: QuantityDraftField,
+): boolean {
+  const characteristicLength = Math.max(
+    geometryCharacteristicLength(left),
+    geometryCharacteristicLength(right),
+  );
+  return sameLengthValue(left, field, right, field, characteristicLength);
 }
 
 function normalizedDraftGeometryKind(
@@ -175,20 +218,20 @@ export function geometryDraftGeometryEquals(
     geometryCharacteristicLength(right),
   );
   if (leftKind === "Box") {
-    return sameLengthVector(left.size, right.size, characteristicLength);
+    return sameLengthVector(left, right, "size", characteristicLength);
   }
   if (leftKind === "Cylinder") {
-    return sameLengthValue(left.radius, right.radius, characteristicLength) &&
-      sameLengthValue(left.height, right.height, characteristicLength);
+    return sameLengthValue(left, "radius", right, "radius", characteristicLength) &&
+      sameLengthValue(left, "height", right, "height", characteristicLength);
   }
   if (leftKind === "Sphere") {
-    return sameLengthValue(left.radius, right.radius, characteristicLength);
+    return sameLengthValue(left, "radius", right, "radius", characteristicLength);
   }
-  return sameLengthValue(left.length, right.length, characteristicLength) &&
-    sameLengthValue(left.width, right.width, characteristicLength) &&
-    sameLengthValue(left.height, right.height, characteristicLength) &&
-    sameLengthValue(left.archHeight, right.archHeight, characteristicLength) &&
-    sameLengthValue(left.z0, right.z0, characteristicLength);
+  return sameLengthValue(left, "length", right, "length", characteristicLength) &&
+    sameLengthValue(left, "width", right, "width", characteristicLength) &&
+    sameLengthValue(left, "height", right, "height", characteristicLength) &&
+    sameLengthValue(left, "archHeight", right, "archHeight", characteristicLength) &&
+    sameLengthValue(left, "z0", right, "z0", characteristicLength);
 }
 
 export function geometryDraftTranslationEquals(
@@ -199,5 +242,5 @@ export function geometryDraftTranslationEquals(
     geometryCharacteristicLength(left),
     geometryCharacteristicLength(right),
   );
-  return sameLengthVector(left.translation, right.translation, characteristicLength);
+  return sameLengthVector(left, right, "translation", characteristicLength);
 }

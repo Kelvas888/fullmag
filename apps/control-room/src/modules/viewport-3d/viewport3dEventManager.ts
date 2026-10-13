@@ -10,6 +10,7 @@ const VIEWPORT_3D_EVENT_HANDLER_KEYS = [
   "onClick",
   "onPointerDown",
   "onPointerMove",
+  "onPointerUp",
   "onPointerLeave",
   "onPointerCancel",
   "onLostPointerCapture",
@@ -90,7 +91,9 @@ export function createViewport3DClickSelectionHandler({
   pointerDownHandler,
   pointerDownDispatch,
   store,
+  pointerDownAlreadyHandled = () => false,
 }: {
+  pointerDownAlreadyHandled?: () => boolean;
   clickHandler?: EventListener;
   pointerDownHandler?: EventListener;
   pointerDownDispatch?: Viewport3DPointerDownDispatch;
@@ -103,6 +106,7 @@ export function createViewport3DClickSelectionHandler({
       return;
     }
 
+    if (pointerDownAlreadyHandled()) return;
     if (!alreadyDispatched) pointerDownHandler?.(event);
     if (store.getState().internal.initialHits.length > 0) return;
     clickHandler?.(event);
@@ -111,27 +115,69 @@ export function createViewport3DClickSelectionHandler({
 
 export function createViewport3DPointerMoveHandler(
   handler: EventListener | undefined,
+  isPointerCaptured: (pointerId: number) => boolean = () => false,
 ): EventListener | undefined {
   if (!handler) return undefined;
 
   return (event) => {
     const pointerEvent = event as PointerEvent;
-    if (pointerEvent.buttons !== 0) return;
+    if (pointerEvent.buttons !== 0 && !isPointerCaptured(pointerEvent.pointerId)) return;
     handler(event);
   };
 }
 
 export function createViewport3DEventManager(
   store: Parameters<typeof createPointerEvents>[0],
+  isMoveToolActive: () => boolean = () => false,
 ): EventManager<HTMLElement> {
   const manager = createPointerEvents(store);
   const pickedHandlers = pickViewport3DEventHandlers(manager.handlers);
   const pointerDownDispatch: Viewport3DPointerDownDispatch = { immediate: false };
+  let probingMoveHandle = false;
+  let movePointerDownHandled = false;
+  let connectedTarget: HTMLElement | null = null;
+  const originalFilter = manager.filter;
+  const handleMovePointerDownCapture = (event: PointerEvent) => {
+    movePointerDownHandled = false;
+    if (!isMoveToolActive() || event.button !== 0 || isViewport3DImmediatePointerDownRegion(event)) return;
+    probingMoveHandle = true;
+    try {
+      pickedHandlers?.onPointerDown?.(event);
+    } finally {
+      probingMoveHandle = false;
+    }
+    // Only gizmo intersections participate in this probe. Ordinary object
+    // selection stays deferred until click, and a miss remains an Orbit drag.
+    movePointerDownHandled = store.getState().internal.initialHits.length > 0;
+    if (!movePointerDownHandled) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+  };
   return {
     ...manager,
+    filter: (intersections, state) => {
+      const filtered = originalFilter?.(intersections, state) ?? intersections;
+      return probingMoveHandle
+        ? filtered.filter((hit) => hit.object.userData.gizmo === "move-axis")
+        : filtered;
+    },
+    connect: (target) => {
+      connectedTarget?.removeEventListener("pointerdown", handleMovePointerDownCapture, true);
+      manager.connect?.(target);
+      connectedTarget = target;
+      target.addEventListener("pointerdown", handleMovePointerDownCapture, true);
+    },
+    disconnect: () => {
+      connectedTarget?.removeEventListener("pointerdown", handleMovePointerDownCapture, true);
+      connectedTarget = null;
+      movePointerDownHandled = false;
+      manager.disconnect?.();
+    },
     handlers: {
       ...pickedHandlers,
       onClick: createViewport3DClickSelectionHandler({
+        pointerDownAlreadyHandled: () => movePointerDownHandled,
         clickHandler: pickedHandlers?.onClick,
         pointerDownHandler: pickedHandlers?.onPointerDown,
         pointerDownDispatch,
@@ -144,6 +190,7 @@ export function createViewport3DEventManager(
       ),
       onPointerMove: createViewport3DPointerMoveHandler(
         pickedHandlers?.onPointerMove,
+        (pointerId) => store.getState().internal.capturedMap.has(pointerId),
       ),
       onWheel: () => {
         // Native wheel event is allowed to propagate for camera controls, but we

@@ -13,14 +13,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::{
-    BootstrapProcessGuard, ChildProcess, ControlRoomGuard, api_port, configure_child_process,
-    emit_development_restart_probe_progress, emit_owner_probe_process_started, init_api_port,
-    repo_root, runtime_state_root,
+    api_port, configure_child_process, emit_development_restart_probe_progress,
+    emit_owner_probe_process_started, init_api_port, repo_root, runtime_state_root,
+    BootstrapProcessGuard, ChildProcess, ControlRoomGuard,
 };
 use crate::{
     development_api_owner::{ConsumerReadinessStatus, OwnerLaunch},

@@ -1100,6 +1100,8 @@ pub(crate) struct ControlWaitQuery {
     pub timeout_ms: u64,
     #[serde(rename = "sessionId")]
     pub session_id: Option<String>,
+    #[serde(rename = "gridRefreshCommandId", default)]
+    pub grid_refresh_command_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1334,6 +1336,8 @@ pub(crate) struct StageExecutionRecord {
     pub started_at_unix_ms: Option<u64>,
     #[serde(default)]
     pub applied_step: Option<u64>,
+    #[serde(default)]
+    pub completed_step: Option<u64>,
     #[serde(default)]
     pub applied_time_seconds: Option<f64>,
     #[serde(default)]
@@ -1906,6 +1910,20 @@ mod tests {
         assert!(value.get("builder_adapter").is_none());
         assert!(value.get("script_builder").is_none());
         assert!(value.get("model_builder_graph").is_none());
+    }
+
+    #[test]
+    fn control_wait_query_accepts_grid_refresh_command_pin() {
+        let query: ControlWaitQuery = serde_json::from_value(serde_json::json!({
+            "afterSeq": 4,
+            "timeoutMs": 1000,
+            "sessionId": "session-a",
+            "gridRefreshCommandId": "cmd-grid-a"
+        }))
+        .expect("control wait query should deserialize the internal grid refresh pin");
+
+        assert_eq!(query.after_seq, 4);
+        assert_eq!(query.grid_refresh_command_id.as_deref(), Some("cmd-grid-a"));
     }
 
     #[test]

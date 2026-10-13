@@ -135,6 +135,18 @@ fn main() -> Result<()> {
         Command::Runtime(RuntimeCommand::InitializeScopedAcceptedStore) => {
             control_room::initialize_scoped_accepted_store()?;
         }
+        Command::Runtime(RuntimeCommand::InitializeHostApplication {
+            config,
+            config_sha256,
+        }) => {
+            println!(
+                "{}",
+                serde_json::to_string(&runtime_service_client::initialize_host_application(
+                    &config,
+                    &config_sha256,
+                )?)?
+            );
+        }
         Command::Runtime(RuntimeCommand::VerifyDevelopmentHandoffCommit {
             store,
             corrupt_store,

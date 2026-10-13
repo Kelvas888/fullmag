@@ -7,9 +7,29 @@ import type {
 import type { ComputeEnvironment, ComputeRuntimeLane, GpuInfo } from "./types";
 
 const MEBIBYTE = 1024 * 1024;
+export const COMPUTE_TELEMETRY_MAX_AGE_MS = 30_000;
 const positive = (value: number): boolean => Number.isFinite(value) && value > 0;
 const clampPercent = (value: number): number | undefined =>
   Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : undefined;
+
+export function isTelemetrySampleStale(
+  timestamp: number | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (timestamp === undefined) return false;
+  if (!Number.isFinite(timestamp) || timestamp <= 0 || !Number.isFinite(now)) return true;
+  return timestamp > now || now - timestamp > COMPUTE_TELEMETRY_MAX_AGE_MS;
+}
+
+export function formatTelemetrySampleTime(timestamp: number | undefined): {
+  readonly dateTime: string;
+  readonly label: string;
+} | null {
+  if (typeof timestamp !== "number" || !Number.isFinite(timestamp) || timestamp <= 0) return null;
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return null;
+  return { dateTime: date.toISOString(), label: date.toLocaleString() };
+}
 
 /** Hardware inventory and registered solver lanes are separate observations. */
 export function describeRuntimeLanes(
@@ -72,7 +92,11 @@ export function computeFromTelemetry(
   ];
   const memoryTotalBytes = cpuReady && positive(cpu.memory_total_mb)
     ? cpu.memory_total_mb * MEBIBYTE : undefined;
-  const sampledAt = gpuReady ? gpu.sample_time_unix_ms : cpu?.sample_time_unix_ms;
+  const sampleTimes = [
+    cpuReady && cpu && positive(cpu.sample_time_unix_ms) ? cpu.sample_time_unix_ms : undefined,
+    gpuReady && gpu && positive(gpu.sample_time_unix_ms) ? gpu.sample_time_unix_ms : undefined,
+  ].filter((timestamp): timestamp is number => timestamp !== undefined);
+  const sampledAt = sampleTimes.length > 0 ? Math.max(...sampleTimes) : undefined;
   return {
     source: "runtime",
     gpus,
@@ -84,7 +108,7 @@ export function computeFromTelemetry(
     memoryTotalBytes,
     memoryUsedBytes: memoryTotalBytes !== undefined && cpu && Number.isFinite(cpu.memory_used_mb)
       ? Math.min(memoryTotalBytes, Math.max(0, cpu.memory_used_mb * MEBIBYTE)) : undefined,
-    sampledAt: sampledAt !== undefined && positive(sampledAt) ? sampledAt : undefined,
+    sampledAt,
     preferredBackend: gpus.length ? "cuda" : "cpu",
     runtimeLanes: describeRuntimeLanes(capabilities),
     warnings,

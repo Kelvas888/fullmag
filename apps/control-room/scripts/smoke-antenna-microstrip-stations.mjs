@@ -324,13 +324,14 @@ try {
   assert.equal(afterCreation.unexpected.length, 0);
   const details = page.getByTestId("antenna-created-details");
   await page.waitForFunction((id) => document.querySelector('[data-testid="antenna-created-details"]')?.getAttribute("data-object-id") === id, created.id, { timeout });
-  assert.ok((await details.innerText()).includes(created.geometry.geometry_kind));
+  const createdDetailsText = await details.innerText();
+  assert.ok(createdDetailsText.includes(created.geometry.geometry_kind));
   if (createLayout === "cpw") {
-    for (const label of ["1 · Signal width", "1 · Left gap", "1 · Right gap", "1 · Left ground", "1 · Right ground"]) assert.ok((await details.innerText()).includes(label));
-    assert.ok(!(await details.innerText()).includes("Return width"));
+    for (const label of ["1 · Signal width", "1 · Left gap", "1 · Right gap", "1 · Left ground", "1 · Right ground"]) assert.ok(createdDetailsText.includes(label));
+    assert.ok(!createdDetailsText.includes("Return width"));
     const clipped = await details.locator(".fm-inspector-field-row__value").evaluateAll((values) => values.filter((value) => value.scrollWidth > value.clientWidth + 1).length);
     assert.equal(clipped, 0, "CPW conductor summary clips scientific values");
-  } else assert.ok((await details.innerText()).includes("Return width"));
+  } else assert.ok(createdDetailsText.includes("Return width"));
   await details.scrollIntoViewIfNeeded();
   await screenshot(`15-created-${createLayout}-details`);
   assert.equal(pageErrors.length, 0, pageErrors.join(" | "));

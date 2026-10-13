@@ -11,7 +11,7 @@ use fullmag_authoring::{
 };
 use fullmag_ir::{ComputeResourcesIR, ExecutionDevice, MaterializedExecutionRequestIR, ProblemIR};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::study_lowering::{lower_study_plan, StudyExecutionPlan, StudyLoweringError};
 
@@ -390,6 +390,103 @@ impl StudyProblemCatalog {
         &self.entries
     }
 
+    /// Derive a case-local study and catalog with explicitly replaced
+    /// ProblemIR snapshots. Captured references are recomputed from each
+    /// replacement while the catalog schema and execution profile snapshots
+    /// remain unchanged. Replaced v1/v2 entries require a stable source ID in
+    /// `captured_source_ids`; v3 entries keep the source ID already captured.
+    pub fn with_problem_replacements(
+        &self,
+        study: &StudyPlan,
+        replacements: &BTreeMap<String, ProblemIR>,
+        captured_source_ids: &BTreeMap<String, String>,
+    ) -> Result<(StudyPlan, Self), StudyCatalogError> {
+        self.validate_for(study)?;
+
+        let step_indexes = study
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step.enabled)
+            .map(|(index, step)| (step.step_id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        for step_id in replacements.keys() {
+            if !step_indexes.contains_key(step_id) {
+                return Err(StudyCatalogError::Contract(format!(
+                    "replacement step `{step_id}` is unknown or disabled in the study"
+                )));
+            }
+        }
+        for step_id in captured_source_ids.keys() {
+            if !replacements.contains_key(step_id) {
+                return Err(StudyCatalogError::Contract(format!(
+                    "captured source_id was supplied without a ProblemIR replacement for step `{step_id}`"
+                )));
+            }
+        }
+
+        let mut derived_study = study.clone();
+        let mut derived_catalog = self.clone();
+        for (step_id, problem) in replacements {
+            if let Err(reasons) = problem.validate() {
+                return Err(StudyCatalogError::InvalidProblem {
+                    step_id: step_id.clone(),
+                    reasons,
+                });
+            }
+
+            let entry_index = derived_catalog
+                .entries
+                .iter()
+                .position(|entry| entry.step_id == *step_id)
+                .ok_or_else(|| StudyCatalogError::MissingStep {
+                    step_id: step_id.clone(),
+                })?;
+            let entry = &derived_catalog.entries[entry_index];
+            let source_id = match &entry.captured_input_identity {
+                Some(identity) => {
+                    if let Some(provided_source_id) = captured_source_ids.get(step_id) {
+                        if provided_source_id != &identity.source_id {
+                            return Err(StudyCatalogError::Contract(format!(
+                                "captured source_id for v3 step `{step_id}` must preserve the catalog identity"
+                            )));
+                        }
+                    }
+                    identity.source_id.clone()
+                }
+                None => captured_source_ids.get(step_id).cloned().ok_or_else(|| {
+                    StudyCatalogError::Contract(format!(
+                        "replacement for step `{step_id}` requires a stable captured source_id"
+                    ))
+                })?,
+            };
+            let references = capture_study_input_references(&source_id, problem)?;
+
+            let study_step_index = step_indexes[step_id];
+            let study_step = &mut derived_study.steps[study_step_index];
+            study_step.model = references.model.clone();
+            study_step.solver_config = references.solver_config.clone();
+            study_step.discretization = references.discretization.clone();
+
+            let entry = &mut derived_catalog.entries[entry_index];
+            entry.model = references.model;
+            entry.solver_config = references.solver_config;
+            entry.discretization = references.discretization;
+            entry.problem = problem.clone();
+            if entry.captured_input_identity.is_some() {
+                entry.captured_input_identity = Some(references.identity);
+            }
+        }
+
+        derived_catalog.study_id = derived_study.study_id.clone();
+        derived_catalog.study_revision = derived_study.revision;
+        derived_catalog.study_plan_sha256 = derived_study
+            .canonical_sha256()
+            .map_err(|error| StudyCatalogError::Contract(error.to_string()))?;
+        derived_catalog.validate_for(&derived_study)?;
+        Ok((derived_study, derived_catalog))
+    }
+
     /// Check that this catalog is still bound to the exact study bytes and
     /// contains exactly the enabled executable steps.
     pub fn validate_for(&self, study: &StudyPlan) -> Result<(), StudyCatalogError> {
@@ -579,7 +676,12 @@ mod tests {
         PrimitiveStageNode, StudyPipelineDocument, StudyPipelineNode, StudyPipelineNodeSource,
         StudyPlanMigrationDefaults, StudyPrimitiveStageKind, StudySolverConfigReference,
     };
+    use fullmag_ir::{
+        ComputeResourcesIR, ExecutionDevice, ExecutionProfileIR, ExecutionRequestIR,
+        MaterializedExecutionRequestIR, EXECUTION_REQUEST_SCHEMA,
+    };
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn study() -> StudyPlan {
         StudyPlan::from_pipeline(
@@ -631,6 +733,48 @@ mod tests {
         entry.discretization = references.discretization;
         entry.captured_input_identity = Some(references.identity);
         entry
+    }
+
+    fn materialized_problem() -> ProblemIR {
+        let mut problem = ProblemIR::bootstrap_example();
+        problem.problem_meta.runtime_metadata.insert(
+            "compute_resources".into(),
+            serde_json::to_value(ComputeResourcesIR::default()).unwrap(),
+        );
+        problem
+    }
+
+    fn materialization(
+        step: &StudyStep,
+        problem: &ProblemIR,
+    ) -> MaterializedExecutionRequestIR {
+        let profile = ExecutionProfileIR {
+            profile_id: step.execution_profile.profile_id.clone(),
+            version: step.execution_profile.version.clone(),
+            ..ExecutionProfileIR::default()
+        };
+        MaterializedExecutionRequestIR {
+            schema_version: EXECUTION_REQUEST_SCHEMA.into(),
+            profile_sha256: Some(profile.canonical_sha256().unwrap()),
+            profile: Some(profile),
+            layers: Vec::new(),
+            requested: ExecutionRequestIR {
+                backend: problem.backend_policy.requested_backend,
+                device: ExecutionDevice::Auto,
+                precision: problem.backend_policy.execution_precision,
+                mode: problem.validation_profile.execution_mode,
+                resources: ComputeResourcesIR::from_problem(problem)
+                    .unwrap()
+                    .unwrap(),
+            },
+            origins: BTreeMap::new(),
+        }
+    }
+
+    fn replacement_problem() -> ProblemIR {
+        let mut problem = materialized_problem();
+        problem.problem_meta.description = Some("Case-local replacement.".into());
+        problem
     }
 
     #[test]
@@ -788,6 +932,184 @@ mod tests {
             schema_version_for_entries(&[captured.clone(), legacy_entry]),
             STUDY_PROBLEM_CATALOG_SCHEMA_V3
         );
+    }
+
+    #[test]
+    fn v1_problem_replacement_rebinds_references_and_preserves_untouched_entries() {
+        let mut plan = study();
+        let mut untouched_step = plan.steps[0].clone();
+        untouched_step.step_id = "step:untouched".into();
+        untouched_step.label = "Untouched".into();
+        plan.steps.push(untouched_step);
+        let original_problem = ProblemIR::bootstrap_example();
+        let original_catalog = StudyProblemCatalog::from_entries(
+            &plan,
+            vec![
+                StudyProblemCatalogEntry::from_step(
+                    &plan.steps[0],
+                    original_problem.clone(),
+                ),
+                StudyProblemCatalogEntry::from_step(
+                    &plan.steps[1],
+                    original_problem,
+                ),
+            ],
+        )
+        .unwrap();
+        let untouched_entry = original_catalog.entries()[1].clone();
+        let replacement = replacement_problem();
+        let expected = capture_study_input_references("scene:case:1", &replacement).unwrap();
+        let replacements = [("step:run".to_string(), replacement.clone())]
+            .into_iter()
+            .collect();
+
+        let missing_source_id = original_catalog
+            .with_problem_replacements(&plan, &replacements, &BTreeMap::new())
+            .unwrap_err();
+        assert!(missing_source_id
+            .to_string()
+            .contains("requires a stable captured source_id"));
+
+        let captured_source_ids = [("step:run".to_string(), "scene:case:1".to_string())]
+            .into_iter()
+            .collect();
+        let (derived_plan, derived_catalog) = original_catalog
+            .with_problem_replacements(&plan, &replacements, &captured_source_ids)
+            .unwrap();
+
+        assert_eq!(derived_catalog.schema_version, STUDY_PROBLEM_CATALOG_SCHEMA_V1);
+        assert_eq!(derived_plan.study_id, plan.study_id);
+        assert_eq!(derived_plan.revision, plan.revision);
+        assert_eq!(derived_plan.schema_version, plan.schema_version);
+        assert_eq!(derived_plan.steps[0].model, expected.model);
+        assert_eq!(derived_plan.steps[0].solver_config, expected.solver_config);
+        assert_eq!(derived_plan.steps[0].discretization, expected.discretization);
+        assert_eq!(derived_catalog.entries()[0].problem(), &replacement);
+        assert_eq!(derived_catalog.entries()[0].model, expected.model);
+        assert_eq!(derived_catalog.entries()[0].solver_config, expected.solver_config);
+        assert_eq!(derived_catalog.entries()[0].discretization, expected.discretization);
+        assert!(derived_catalog.entries()[0]
+            .captured_input_identity()
+            .is_none());
+        assert_eq!(derived_catalog.entries()[1], untouched_entry);
+        assert_eq!(derived_plan.steps[1], plan.steps[1]);
+        assert_ne!(derived_catalog.study_plan_sha256, original_catalog.study_plan_sha256);
+    }
+
+    #[test]
+    fn v2_problem_replacement_preserves_execution_materialization() {
+        let plan = study();
+        let original_problem = materialized_problem();
+        let original_materialization = materialization(&plan.steps[0], &original_problem);
+        let original_catalog = StudyProblemCatalog::from_entries(
+            &plan,
+            vec![StudyProblemCatalogEntry::from_materialized_step(
+                &plan.steps[0],
+                original_problem,
+                original_materialization.clone(),
+            )],
+        )
+        .unwrap();
+        let replacement = replacement_problem();
+        let expected = capture_study_input_references("scene:case:2", &replacement).unwrap();
+        let replacements = [("step:run".to_string(), replacement.clone())]
+            .into_iter()
+            .collect();
+        let captured_source_ids = [("step:run".to_string(), "scene:case:2".to_string())]
+            .into_iter()
+            .collect();
+
+        let (derived_plan, derived_catalog) = original_catalog
+            .with_problem_replacements(&plan, &replacements, &captured_source_ids)
+            .unwrap();
+
+        assert_eq!(derived_catalog.schema_version, STUDY_PROBLEM_CATALOG_SCHEMA);
+        assert_eq!(derived_plan.steps[0].model, expected.model);
+        assert_eq!(derived_plan.steps[0].solver_config, expected.solver_config);
+        assert_eq!(derived_plan.steps[0].discretization, expected.discretization);
+        assert_eq!(derived_catalog.entries()[0].problem(), &replacement);
+        assert_eq!(
+            derived_catalog.entries()[0].execution_materialization(),
+            Some(&original_materialization)
+        );
+        assert!(derived_catalog.entries()[0]
+            .captured_input_identity()
+            .is_none());
+    }
+
+    #[test]
+    fn v3_problem_replacement_preserves_source_id_and_recomputes_digest_references() {
+        let mut plan = study();
+        let source_problem = materialized_problem();
+        let source_id = "scene:document:42";
+        let source_references = capture_study_input_references(source_id, &source_problem).unwrap();
+        plan.steps[0].model = source_references.model.clone();
+        plan.steps[0].solver_config = source_references.solver_config.clone();
+        plan.steps[0].discretization = source_references.discretization.clone();
+        let original_materialization = materialization(&plan.steps[0], &source_problem);
+        let entry = StudyProblemCatalogEntry::from_captured_materialized_step(
+            &plan.steps[0],
+            source_problem,
+            original_materialization.clone(),
+            source_references.identity,
+        )
+        .unwrap();
+        let original_catalog = StudyProblemCatalog::from_entries(&plan, vec![entry]).unwrap();
+
+        let replacement = replacement_problem();
+        let expected = capture_study_input_references(source_id, &replacement).unwrap();
+        let replacements = [("step:run".to_string(), replacement.clone())]
+            .into_iter()
+            .collect();
+        let (derived_plan, derived_catalog) = original_catalog
+            .with_problem_replacements(&plan, &replacements, &BTreeMap::new())
+            .unwrap();
+
+        let identity = derived_catalog.entries()[0]
+            .captured_input_identity()
+            .unwrap();
+        assert_eq!(derived_catalog.schema_version, STUDY_PROBLEM_CATALOG_SCHEMA_V3);
+        assert_eq!(identity.source_id, source_id);
+        assert_eq!(identity, &expected.identity);
+        assert_eq!(derived_plan.steps[0].model, expected.model);
+        assert_eq!(derived_plan.steps[0].solver_config, expected.solver_config);
+        assert_eq!(derived_plan.steps[0].discretization, expected.discretization);
+        assert_eq!(derived_catalog.entries()[0].problem(), &replacement);
+        assert_eq!(
+            derived_catalog.entries()[0].execution_materialization(),
+            Some(&original_materialization)
+        );
+        assert_ne!(
+            identity.problem_sha256,
+            original_catalog.entries()[0]
+                .captured_input_identity()
+                .unwrap()
+                .problem_sha256
+        );
+    }
+
+    #[test]
+    fn problem_replacement_rejects_unknown_step_ids() {
+        let plan = study();
+        let catalog = StudyProblemCatalog::from_entries(
+            &plan,
+            vec![StudyProblemCatalogEntry::from_step(
+                &plan.steps[0],
+                ProblemIR::bootstrap_example(),
+            )],
+        )
+        .unwrap();
+        let replacements = [("step:missing".to_string(), replacement_problem())]
+            .into_iter()
+            .collect();
+
+        let error = catalog
+            .with_problem_replacements(&plan, &replacements, &BTreeMap::new())
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("replacement step `step:missing` is unknown or disabled"));
     }
 
     #[test]

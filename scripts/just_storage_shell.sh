@@ -176,7 +176,31 @@ case "${recipe}" in
       fi
       exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --project-document-only --frozen-native-build-id "${BASH_REMATCH[1]}" "${archive_args[@]}"
     fi
+    compute_cancellation_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --compute-cancellation-only --frozen-native-build-id "([0-9a-f]{64})"$'
+    if [[ "${recipe}" =~ ${compute_cancellation_pattern} ]]; then
+      if ! is_windows_shell; then
+        echo "[fullmag just] compute cancellation API verification requires Windows" >&2
+        exit 2
+      fi
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --compute-cancellation-only --frozen-native-build-id "${BASH_REMATCH[1]}"
+    fi
     frozen_native_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --frozen-native-build-id "([0-9a-f]{64})"$'
+    compute_host_initialization_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --compute-host-initialization-only --frozen-native-build-id "([0-9a-f]{64})"$'
+    compute_scheduler_cancellation_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --compute-scheduler-cancellation-only --frozen-native-build-id "([0-9a-f]{64})"$'
+    if [[ "${recipe}" =~ ${compute_scheduler_cancellation_pattern} ]]; then
+      if ! is_windows_shell; then
+        echo "[fullmag just] compute scheduler cancellation verification requires Windows" >&2
+        exit 2
+      fi
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --compute-scheduler-cancellation-only --frozen-native-build-id "${BASH_REMATCH[1]}"
+    fi
+    if [[ "${recipe}" =~ ${compute_host_initialization_pattern} ]]; then
+      if ! is_windows_shell; then
+        echo "[fullmag just] compute host initialization verification requires Windows" >&2
+        exit 2
+      fi
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --compute-host-initialization-only --frozen-native-build-id "${BASH_REMATCH[1]}"
+    fi
     if [[ "${recipe}" =~ ${frozen_native_pattern} ]]; then
       if ! is_windows_shell; then
         echo "[fullmag just] frozen native package verification requires Windows" >&2
@@ -390,6 +414,10 @@ case "${recipe}" in
     if [[ "${recipe}" =~ ${port_editor_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3264 --scenario antenna-port-editor
     fi
+    inspector_actions_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3257 --scenario inspector-actions$'
+    if [[ "${recipe}" =~ ${inspector_actions_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3257 --scenario inspector-actions
+    fi
     primitive_color_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3257 --scenario primitive-color-inspector$'
     if [[ "${recipe}" =~ ${primitive_color_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3257 --scenario primitive-color-inspector
@@ -485,6 +513,9 @@ case "${recipe}" in
     ;;
   *"scripts/verify_session_persistence.py"*"--route api-source-check"*)
     exec "${python_cmd}" "${script_dir}/verify_session_persistence.py" --route api-source-check --repo-root "${repo_root}"
+    ;;
+  *"scripts/verify_session_persistence.py"*"--route api-service-source-check"*)
+    exec "${python_cmd}" "${script_dir}/verify_session_persistence.py" --route api-service-source-check --repo-root "${repo_root}"
     ;;
   *"scripts/verify_session_persistence.py"*"--route api-resource-pool-check"*)
     exec "${python_cmd}" "${script_dir}/verify_session_persistence.py" --route api-resource-pool-check --repo-root "${repo_root}"

@@ -2415,7 +2415,7 @@ export function resolveVisualizationTargetFromSelection(
     };
   }
 
-  if (selection.kind === "mesh-part" && selection.nodeId) {
+  if ((selection.ref?.type === "mesh-part" || selection.kind === "mesh-part") && selection.nodeId) {
     return {
       id:
         selection.ref?.type === "mesh-part"

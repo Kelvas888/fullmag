@@ -36,7 +36,7 @@ import { ObjectAbsorbingBoundaryPanel } from "./ObjectAbsorbingBoundaryPanel";
 import {
   initialInspectorDraftState,
   resolveInspectorDraftState,
-  updateInspectorDraftState,
+  updateResolvedInspectorDraftState,
   type InspectorDraftState,
 } from "./inspectorDraftState";
 import { resolveGeometryObjectDraft } from "./geometryObjectPanelModel";
@@ -372,16 +372,18 @@ function useObjectMaterialPanelState(selection: InspectorPanelProps["selection"]
       }
     : null;
   const draftTransactionRevisionRef = useRef(0);
-  const draftStateForResolution = useMemo(() => {
+  function draftStateForResolution(
+    state: InspectorDraftState<MagneticParametersDraft>,
+  ): InspectorDraftState<MagneticParametersDraft> {
     if (assignmentBaseDecision !== "rebase" || !assignmentBaseOverrideState ||
-      draftState.identityKey !== assignmentBaseOverrideState.identityKey) {
-      return draftState;
+      state.identityKey !== assignmentBaseOverrideState.identityKey) {
+      return state;
     }
     const revisions = new Map(scope.draftFieldRevisions);
     const rebasedDraft = rebaseMagneticParametersDraftAfterAssignment({
       previousBaseDraft: assignmentBaseOverrideState.baseDraft,
-      draftAtStart: draftState.draft,
-      currentDraft: draftState.draft,
+      draftAtStart: state.draft,
+      currentDraft: state.draft,
       committedBaseDraft: resourceBaseDraft,
       startingRevisions: revisions,
       currentRevisions: revisions,
@@ -392,21 +394,15 @@ function useObjectMaterialPanelState(selection: InspectorPanelProps["selection"]
       draft: rebasedDraft,
       identityKey: assignmentBaseOverrideState.identityKey,
     };
-  }, [
-    assignmentBaseDecision,
-    assignmentBaseOverrideState,
-    draftState,
-    resourceBaseDraft,
-    resourceDraftKey,
-    scope,
-  ]);
+  }
+  const resolvedDraftState = draftStateForResolution(draftState);
 
   const { draft } = resolveInspectorDraftState({
     baseDraft,
     baseKey: draftKey,
     identityKey: draftIdentityKey,
     isDirty: magneticParametersDraftDirty,
-    state: draftStateForResolution,
+    state: resolvedDraftState,
   });
   const draftMaterialId = normalizeMaterialRef(draft.materialRef);
   const parametersTargetChanged = draftMaterialId !== materialId;
@@ -536,11 +532,10 @@ function useObjectMaterialPanelState(selection: InspectorPanelProps["selection"]
       );
     }
     setDraftState((current) =>
-      updateInspectorDraftState({
+      updateResolvedInspectorDraftState({
         baseDraft,
         baseKey: draftKey,
-        currentDraft:
-          current.identityKey === draftIdentityKey ? draftStateForResolution.draft : baseDraft,
+        currentState: draftStateForResolution(current),
         identityKey: draftIdentityKey,
         isDirty: magneticParametersDraftDirty,
         patch,

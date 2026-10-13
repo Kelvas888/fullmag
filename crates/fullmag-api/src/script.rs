@@ -413,7 +413,7 @@ pub(crate) fn render_scene_document_via_python_helper(
         workspace_root,
         output_path,
         scene_document,
-        PythonHelperOutputPolicy::Capture,
+        PythonHelperOutputPolicy::Bounded { workspace_root },
         false,
     )
 }

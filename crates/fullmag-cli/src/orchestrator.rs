@@ -192,12 +192,48 @@ fn prepare_script_output_storage(
     Ok((storage_lease, settings, resolved))
 }
 
+fn prepare_grid_operation_storage(
+    workspace_dir: &Path,
+    command_id: &str,
+    script_path: &Path,
+) -> Result<(ScriptOutputStorageLease, OutputStorageIR, serde_json::Value)> {
+    let operation_id = format!("grid-{}", fullmag_session::hex_sha256(command_id.as_bytes()));
+    let operation_root = workspace_dir.join("grid-preparations").join(&operation_id);
+    let settings = OutputStorageIR {
+        output_dir: Some(operation_root.join("workspace").to_string_lossy().into_owned()),
+        temp_dir: Some(operation_root.join("temporary").to_string_lossy().into_owned()),
+        data_format: OutputDataFormatIR::Zarr,
+        cleanup: fullmag_ir::TempCleanupIR::Never,
+        existing_output: fullmag_ir::ExistingOutputIR::Error,
+    };
+    let source_dir = script_path.parent().context("grid source has no parent")?;
+    let lease = fullmag_runner::project_storage::ProjectStorageLease::prepare(
+        &settings, &operation_root.join("workspace"), source_dir, &operation_id,
+    ).map_err(|error| anyhow!("failed to prepare private grid operation storage: {error}"))?;
+    let lease = ScriptOutputStorageLease::new(lease);
+    let resolved = serde_json::to_value(lease.resolved())?;
+    Ok((lease, settings, resolved))
+}
+
 fn attached_session_id_or(generated: String) -> String {
     std::env::var("FULLMAG_ATTACHED_SESSION_ID")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or(generated)
+}
+
+fn attached_session_started_at_or(generated: u128) -> Result<u128> {
+    if std::env::var("FULLMAG_ATTACHED_SESSION_ID")
+        .ok().is_none_or(|value| value.trim().is_empty())
+    {
+        return Ok(generated);
+    }
+    let raw = std::env::var("FULLMAG_ATTACHED_SESSION_STARTED_AT_UNIX_MS")
+        .context("attached session requires its authoritative start timestamp")?;
+    let timestamp = raw.parse::<u128>().context("invalid attached session start timestamp")?;
+    anyhow::ensure!(timestamp > 0 && timestamp.to_string() == raw, "invalid attached session start timestamp");
+    Ok(timestamp)
 }
 
 fn control_room_bootstrap_disabled() -> bool {
@@ -5176,6 +5212,7 @@ fn scripted_stage_execution_state(
             mesh_revision: None,
             started_at_unix_ms: None,
             applied_step: None,
+            completed_step: None,
             applied_time_seconds: None,
             segment_id: None,
             completed_at_unix_ms: None,
@@ -5313,6 +5350,26 @@ fn attach_stage_fem_mesh_identity(
     ));
 }
 
+fn publish_scripted_stages_awaiting_command(execution: &mut CurrentLiveStageExecutionState) {
+    // Completed stages are history; the interactive owner still accepts commands.
+    *execution = stage_execution_from_records(&execution.stages, None, None, "awaiting_command");
+}
+
+fn attach_scripted_stage_solver_steps(
+    execution: &mut CurrentLiveStageExecutionState,
+    stage_index: usize,
+    boundary: Option<&CommandApplicationBoundary>,
+    completed_step: Option<u64>,
+) {
+    let Some(record) = execution.stages.get_mut(stage_index) else {
+        return;
+    };
+    record.applied_step = boundary.map(|boundary| boundary.applied_step);
+    record.applied_time_seconds = boundary.map(|boundary| boundary.applied_time_seconds);
+    record.segment_id = boundary.map(|boundary| boundary.segment_id.clone());
+    record.completed_step = completed_step;
+}
+
 fn preserve_terminal_stage_history(
     next: &mut CurrentLiveStageExecutionState,
     previous: Option<&CurrentLiveStageExecutionState>,
@@ -5394,6 +5451,7 @@ fn stage_record(index: usize, kind: Option<&str>) -> CurrentLiveStageExecutionRe
         mesh_revision: None,
         started_at_unix_ms: None,
         applied_step: None,
+        completed_step: None,
         applied_time_seconds: None,
         segment_id: None,
         completed_at_unix_ms: None,
@@ -5600,6 +5658,7 @@ impl ActiveSequenceState {
                 mesh_revision: previous.mesh_revision,
                 started_at_unix_ms: previous.started_at_unix_ms,
                 applied_step: previous.applied_step,
+                completed_step: previous.completed_step,
                 applied_time_seconds: previous.applied_time_seconds,
                 segment_id: previous.segment_id,
                 completed_at_unix_ms: completed_at_unix_ms
@@ -8491,7 +8550,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     }
     crate::live_workspace::init_feature_flags(feature_flags);
 
-    let started_at_unix_ms = unix_time_millis()?;
+    let started_at_unix_ms = attached_session_started_at_or(unix_time_millis()?)?;
     let script_path = args
         .script
         .canonicalize()
@@ -8562,7 +8621,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     let preview_every_n_override = preview_every_n_override_raw
         .as_ref()
         .map(|_| field_every_n as u32);
-    let current_live_publisher = CurrentLivePublisher::spawn(&session_id);
+    let grid_refresh_command_id = std::env::var("FULLMAG_ATTACHED_GRID_REFRESH_COMMAND_ID").ok();
+    let current_live_publisher = if grid_refresh_command_id.is_some() {
+        CurrentLivePublisher::unpublished_grid_refresh()
+    } else {
+        CurrentLivePublisher::spawn(&session_id)
+    };
     let bootstrapping_runtime = requested_runtime_selection(
         &requested_backend_name,
         false,
@@ -8619,8 +8683,11 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         },
         current_live_publisher.clone(),
     );
-    let display_selection_handle =
-        CurrentLiveDisplaySelectionHandle::spawn_for_session(Some(session_id.clone()));
+    let display_selection_handle = if let Some(command_id) = grid_refresh_command_id.as_ref() {
+        CurrentLiveDisplaySelectionHandle::spawn_for_grid_refresh(session_id.clone(), command_id.clone())
+    } else {
+        CurrentLiveDisplaySelectionHandle::spawn_for_session(Some(session_id.clone()))
+    };
     live_workspace.push_log(
         "system",
         format!(
@@ -9019,8 +9086,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             return Err(error);
         }
     };
+    // Grid authoring must not reserve the user's next scientific output path
+    // or modify its existing-output policy in the canonical script/IR.
     let (mut storage_lease, storage_settings, resolved_storage) =
-        prepare_script_output_storage(&mut script_config, &args, &script_path, &run_id)?;
+        if let Some(command_id) = grid_refresh_command_id.as_deref() {
+            prepare_grid_operation_storage(&workspace_dir, command_id, &script_path)?
+        } else {
+            prepare_script_output_storage(&mut script_config, &args, &script_path, &run_id)?
+        };
     workspace_dir = storage_lease.resolved().output_dir.clone();
     crate::script_launch::note_results_dir(&workspace_dir);
     crate::script_launch::note_source_hash(script_config.ir.problem_meta.source_hash.as_deref());
@@ -9241,7 +9314,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         script_requested_interactive,
         args.headless,
     );
-    let final_session_runtime = stages
+    let mut final_session_runtime = stages
         .last()
         .map(|stage| {
             session_runtime_selection_for_problem(
@@ -9766,6 +9839,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             .unwrap_or(false);
     let _is_fem_backend = matches!(&initial_execution_plan.backend_plan, BackendPlanIR::Fem(_));
     let wait_for_solve_supported = wait_for_solve_supported(&initial_execution_plan.backend_plan);
+    if let Some(command_id) = grid_refresh_command_id.as_deref() {
+        anyhow::ensure!(
+            !command_id.is_empty()
+                && wait_for_solve_should_block(wait_for_solve_requested, wait_for_solve_supported, args.headless)
+                && matches!(&initial_execution_plan.backend_plan, BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_)),
+            "grid-only attached runtime requires an interactive FDM wait-for-solve command pin"
+        );
+    }
 
     if wait_for_solve_should_block(
         wait_for_solve_requested,
@@ -10091,6 +10172,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         }
 
         loop {
+            if display_selection_handle.grid_refresh_command_refused() {
+                bail!("grid-only control receiver refused an unpinned command");
+            }
             if display_selection_handle.owner_session_lost() {
                 live_workspace.push_log(
                     "warning",
@@ -10255,6 +10339,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     continue;
                 }
                 WaitForSolveCommandAction::StartSolver => {
+                    anyhow::ensure!(grid_refresh_command_id.is_none(), "grid-only runtime cannot execute a solver command");
                     if matches!(cmd.kind.as_str(), "relax" | "run" | "solve") {
                         let frozen_binding_summary = cmd
                             .frozen_spins_runtime_plan_binding
@@ -10288,7 +10373,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                     continue;
                                 }
                             };
-                        let Some(mut command_stage) = (match build_interactive_command_stage(
+                        let Some(mut command_stage) = (match crate::step_utils::build_initial_interactive_command_stage(
+                            &stages[0],
                             &command_base_ir,
                             &cmd,
                         ) {
@@ -10409,7 +10495,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     break;
                 }
                 WaitForSolveCommandAction::Remesh => {
-                    if let Some(summary) = execute_manual_interactive_remesh(
+                    if let Some(expected_id) = grid_refresh_command_id.as_deref() {
+                        anyhow::ensure!(
+                            cmd.kind == "fdm_grid_refresh" && cmd.command_id == expected_id,
+                            "grid-only runtime received a different command"
+                        );
+                    }
+                    let remesh_summary = execute_manual_interactive_remesh(
                         &cmd,
                         &mut stages,
                         &mut stage_execution_plans,
@@ -10425,9 +10517,17 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         &mut continuation_completion,
                         None,
                         args.backend.map(BackendTarget::from),
-                    ) {
+                    );
+                    let remesh_succeeded = remesh_summary.is_some();
+                    if let Some(summary) = remesh_summary {
                         current_plan_summary = summary;
                         continuation_relax_handoff = None;
+                    }
+                    if grid_refresh_command_id.is_some() {
+                        let payload = live_workspace.grid_refresh_snapshot()?;
+                        sync_current_live_snapshot(&session_id, &payload)?;
+                        storage_lease.finish(remesh_succeeded)?;
+                        return Ok(());
                     }
                 }
                 WaitForSolveCommandAction::Stop => {
@@ -10705,6 +10805,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 stage.entrypoint_kind
             ),
         );
+        let stage_application_boundary = start_solver_command_id.as_deref().map(|command_id| {
+            CommandApplicationBoundary::new(
+                &run_id,
+                command_id,
+                stage_initial_update.stats.step,
+                stage_initial_update.stats.time,
+            )
+        });
         live_workspace.update(|state| {
             let stage_runtime = session_runtime_selection_for_problem(
                 &stage.ir,
@@ -10754,6 +10862,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 Some(current_stage_artifact_dir.display().to_string()),
                 None,
                 stage.incoming_transition.as_ref(),
+            );
+            attach_scripted_stage_solver_steps(
+                &mut next_stage_execution,
+                stage_index,
+                stage_application_boundary.as_ref(),
+                None,
             );
             preserve_terminal_stage_history(
                 &mut next_stage_execution,
@@ -11019,6 +11133,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     stage_index,
                     stage_fem_mesh_asset.as_ref(),
                 );
+                if interactive_requested && is_session_final_stage {
+                    publish_scripted_stages_awaiting_command(&mut next_stage_execution);
+                }
                 state.stage_execution = Some(next_stage_execution);
                 if antenna_external_lead_inspection::is_carrier(&execution_plan) {
                     antenna_external_lead_inspection::clear_magnetic_snapshot(state);
@@ -11471,6 +11588,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         }
 
         let offset_steps = offset_step_stats(&stage_result.steps, step_offset, runner_time_offset);
+        let completed_step = offset_steps.last().map(|last| last.step);
         if let Some(last) = offset_steps.last() {
             step_offset = last.step;
             time_offset = last.time;
@@ -11708,12 +11826,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         {
             let final_step = stage_result.steps.last();
             eprintln!(
-                "[fullmag] stage {}/{} ({}) {} — steps={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
+                "[fullmag] stage {}/{} ({}) {} — samples={}  final_step={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
                 stage_index + 1,
                 stage_count,
                 stage.entrypoint_kind,
                 stage_status,
                 stage_result.steps.len(),
+                final_step.map(|s| s.step).unwrap_or(0),
                 final_step.map(|s| s.time).unwrap_or(0.0),
                 final_step.map(|s| s.max_torque_T).unwrap_or(0.0),
                 format_stop_reason(stage_result.completion.as_ref()),
@@ -11744,6 +11863,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 stage_result.completion.as_ref(),
                 stage.incoming_transition.as_ref(),
             );
+            attach_scripted_stage_solver_steps(
+                &mut next_stage_execution,
+                stage_index,
+                stage_application_boundary.as_ref(),
+                completed_step,
+            );
             preserve_terminal_stage_history(
                 &mut next_stage_execution,
                 previous_stage_execution.as_ref(),
@@ -11758,6 +11883,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 stage_index,
                 stage_fem_mesh_asset.as_ref(),
             );
+            if interactive_requested && is_session_final_stage && !stage_failed {
+                publish_scripted_stages_awaiting_command(&mut next_stage_execution);
+            }
             state.stage_execution = Some(next_stage_execution);
             if stage_failed {
                 state.session.status = "failed".to_string();
@@ -11796,15 +11924,15 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         );
 
         // Build session context for interactive command loop
-        let ctx = crate::runtime_supervisor::InteractiveSessionContext {
+        let mut ctx = crate::runtime_supervisor::InteractiveSessionContext {
             session_id: session_id.clone(),
             run_id: run_id.clone(),
             interactive_requested,
             script_path: script_path.clone(),
             final_problem_name: final_problem_name.clone(),
-            requested_backend: final_requested_backend,
-            execution_mode: final_execution_mode,
-            precision: final_precision,
+            runtime_selection: crate::runtime_supervisor::runtime_selection_from_manifest(
+                &live_workspace.snapshot().session,
+            ),
             artifact_dir: artifact_dir.clone(),
             workspace_dir: workspace_dir.clone(),
             started_at_unix_ms,
@@ -11813,6 +11941,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
 
         if paused_stage.is_none() {
             live_workspace.update(|state| {
+                if let Some(execution) = state.stage_execution.as_mut() {
+                    publish_scripted_stages_awaiting_command(execution);
+                }
                 state.session = ctx.build_session(
                     "awaiting_command",
                     &plan_summary_json(&current_plan_summary),
@@ -12553,6 +12684,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 .map_err(join_errors)?;
             let mut execution_plan =
                 fullmag_plan::plan(&stage.ir).map_err(|error| anyhow!(error.to_string()))?;
+            ctx.runtime_selection = session_runtime_selection_for_problem(
+                &stage.ir,
+                Some(&execution_plan),
+                field_every_n,
+                backend_target_name(stage.ir.backend_policy.requested_backend),
+                execution_mode_name(stage.ir.validation_profile.execution_mode),
+                execution_precision_name(stage.ir.backend_policy.execution_precision),
+            );
             attach_solved_antenna_drive_bases(&stage.ir, &mut execution_plan, &artifact_dir)?;
             let stage_time_frame = fullmag_runner::stage_step_time_frame(&stage.ir, &execution_plan)
                 .map_err(|error| anyhow!(error.message))?;
@@ -13411,6 +13550,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             }
 
             let offset_steps = offset_step_stats(&stage_result.steps, step_offset, runner_time_offset);
+            let completed_step = offset_steps.last().map(|last| last.step);
             if let Some(last) = offset_steps.last() {
                 step_offset = last.step;
                 time_offset = last.time;
@@ -13438,9 +13578,10 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 {
                     let final_step = stage_result.steps.last();
                     eprintln!(
-                        "[fullmag] {} — steps={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
+                        "[fullmag] {} — samples={}  final_step={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
                         stage_message,
                         stage_result.steps.len(),
+                        final_step.map(|s| s.step).unwrap_or(0),
                         final_step.map(|s| s.time).unwrap_or(0.0),
                         final_step.map(|s| s.max_torque_T).unwrap_or(0.0),
                         format_stop_reason(stage_result.completion.as_ref()),
@@ -13451,6 +13592,10 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
 
             // ── Sequence continuation: if there are more stages, advance ──
             if let Some(sequence) = active_sequence.as_mut() {
+                let current_stage_index = sequence.current_stage_index();
+                if let Some(record) = sequence.stages.get_mut(current_stage_index) {
+                    record.completed_step = completed_step;
+                }
                 sequence.mark_current(
                     "completed",
                     stage_result.completion.as_ref(),
@@ -13516,6 +13661,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 .enter_awaiting_command(continuation_magnetization.clone(), &live_workspace);
             paused_stage = None;
         }
+        final_session_runtime = ctx.runtime_selection.clone();
         interactive_runtime_host.mark_closed(&live_workspace);
         if display_selection_handle.owner_session_lost() {
             return Ok(());
@@ -13660,6 +13806,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     };
 
     live_workspace.update(|state| {
+        if let Some(execution) = state.stage_execution.as_mut() {
+            *execution = stage_execution_from_records(
+                &execution.stages,
+                None,
+                None,
+                &summary.status,
+            );
+        }
         state.session = build_session_manifest(
             &session_id,
             &run_id,
@@ -13881,6 +14035,7 @@ mod tests {
         default_domain_region_markers,
         deferred_mesh_failure_stage,
         attach_solved_antenna_drive_bases,
+        attach_scripted_stage_solver_steps,
         discard_active_paused_stage_execution,
         ensure_frequency_response_relaxed_continuation_is_qualified, execute_synthetic_stage,
         fail_owned_preparation_stage, fem_gpu_memory_preflight_message,
@@ -13893,8 +14048,10 @@ mod tests {
         mesh_source_scene_revision, offset_step_update, own_preparation_boundary_failure,
         plan_materialized_stage_snapshot, prepare_remesh_stage_transaction,
         preserve_terminal_stage_history, project_script_export_failure,
-        relative_artifact_ref, replace_continuation_after_synthetic_stage,
+        relative_artifact_ref,
+        replace_continuation_after_synthetic_stage,
         requested_execution_device_for_overrides,
+        publish_scripted_stages_awaiting_command,
         resolve_adaptive_convergence_metric, resolve_preview_field_every_n,
         resolve_rayon_cpu_threads, resolved_shared_domain_object_region_markers,
         run_active_preparation_operation, run_owned_preparation_stage,
@@ -18256,6 +18413,42 @@ mod tests {
     }
 
     #[test]
+    fn completed_scripted_stages_keep_interactive_owner_awaiting_commands() {
+        let mut execution = scripted_stage_execution_state(
+            1,
+            0,
+            "flat_run",
+            "completed",
+            Some("cmd-solve"),
+            Some(1_700_000_000_000),
+            Some(1_700_000_001_000),
+            Some("artifacts/stage-000".to_string()),
+            Some(fullmag_ir::StageStopReason::MaxPhysicalTime),
+            None,
+        );
+        let boundary = CommandApplicationBoundary::new("run-1", "cmd-solve", 0, 0.0);
+        attach_scripted_stage_solver_steps(&mut execution, 0, Some(&boundary), Some(10));
+        assert_eq!(execution.stages[0].applied_step, Some(0));
+        assert_eq!(execution.stages[0].completed_step, Some(10));
+        assert_eq!(execution.stages[0].segment_id, Some(boundary.segment_id));
+        let terminal_history = serde_json::to_value(&execution.stages).unwrap();
+
+        publish_scripted_stages_awaiting_command(&mut execution);
+
+        assert_eq!(execution.runtime_state, "awaiting_command");
+        assert_eq!(execution.active_stage_index, None);
+        assert_eq!(execution.active_stage_kind, None);
+        assert_eq!(execution.completed_stage_indexes, vec![0]);
+        assert_eq!(execution.stage_statuses, vec!["completed"]);
+        assert_eq!(serde_json::to_value(&execution.stages).unwrap(), terminal_history);
+
+        // A later explicit close must publish terminal ownership, not idle ownership.
+        execution = super::stage_execution_from_records(&execution.stages, None, None, "completed");
+        assert_eq!(execution.runtime_state, "completed");
+        assert_eq!(serde_json::to_value(&execution.stages).unwrap(), terminal_history);
+    }
+
+    #[test]
     fn scripted_stage_execution_does_not_mark_pipeline_completed_between_stages() {
         let execution = scripted_stage_execution_state(
             2,
@@ -18702,7 +18895,7 @@ mod tests {
             .find("problem_with_frozen_spins_runtime_plan_binding(")
             .expect("initial solver command must consume the Frozen Spins binding");
         let stage_index = branch
-            .find("build_interactive_command_stage(")
+            .find("build_initial_interactive_command_stage(")
             .expect("initial solver command must build a stage");
 
         assert!(

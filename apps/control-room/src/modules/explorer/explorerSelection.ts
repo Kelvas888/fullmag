@@ -849,7 +849,9 @@ export function selectExplorerNode(
         ref?.type === "cross-section-draft" ||
         ref?.type === "cross-section-plot" ||
         ref?.type === "planar-monitor-draft" ||
-        ref?.type === "mesh-part" ||
+        (ref?.type === "mesh-part" &&
+          node.kind !== "mesh.unassigned" &&
+          node.kind !== "mesh.unassigned.part") ||
         ref?.type === "current-transport" ||
         ref?.type === "spin-transport" ||
         ref?.type === "spin-interface" ||

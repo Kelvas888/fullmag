@@ -1,3 +1,25 @@
+import type { QuantityUnit } from "./quantityInput";
+
+export type LengthQuantityUnit = Extract<
+  QuantityUnit,
+  "m" | "mm" | "um" | "µm" | "μm" | "nm"
+>;
+
+export type QuantityDraftField =
+  | `size.${0 | 1 | 2}`
+  | `translation.${0 | 1 | 2}`
+  | "radius"
+  | "height"
+  | "length"
+  | "width"
+  | "archHeight"
+  | "z0";
+
+export interface QuantityDraftFieldMetadata {
+  unit: LengthQuantityUnit;
+  lastValidSI: number | null;
+}
+
 export interface GeometryObjectDraft {
   archHeight: string;
   baseRevision: number | null;
@@ -15,6 +37,7 @@ export interface GeometryObjectDraft {
   scale: [string, string, string];
   size: [string, string, string];
   translation: [string, string, string];
+  quantityFields?: Partial<Record<QuantityDraftField, QuantityDraftFieldMetadata>>;
   width: string;
   z0: string;
 }
