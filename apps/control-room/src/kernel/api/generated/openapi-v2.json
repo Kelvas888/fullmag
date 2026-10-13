@@ -3600,6 +3600,14 @@
               "null"
             ]
           },
+          "completed_step": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "completion_status": {
             "type": [
               "string",
@@ -37550,6 +37558,14 @@
             ]
           },
           "completed_at_unix_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "completed_step": {
             "format": "int64",
             "minimum": 0,
             "type": [

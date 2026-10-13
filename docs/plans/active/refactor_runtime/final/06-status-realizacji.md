@@ -1,5 +1,16 @@
 # Status realizacji całego planu refaktoryzacji
 
+Najnowszy checkpoint 13.10.2026: **P8-53BE CLOSED — pierwsza bramka FDM CPU**.
+Build K completed exit 0, frozen-native API gate 296 kontroli PASS,
+OpenAPI/client generation i import checks PASS. Browser F→K
+`01ad57bafdca4a89881a4138c1fdbfcd`: completed exit 0, 9 kontroli;
+identyczna scena i dirty document po restore, normalne Grid, Compute
+Study 10 kroków / 1 ps, requested/resolved FDM CPU strict double,
+jawny Close i normalny solver wait exit 0 bez kill. Pozostałe bramki
+P8-53 oraz publiczny restart pozostają otwarte. Procentów całego planu
+nie przeliczono na podstawie tego pojedynczego dowodu. Poniższe wpisy
+są wcześniejszymi checkpointami. [Dowody](p8/53bg-acquisition-refusal-diagnostics.md).
+
 Checkpoint po próbie `523affb9b5dd4a13820b33e52171b550`: dziesięć
 produkcyjnych przypadków plannera oraz Grid 4×4×1 PASS, normalny child wait
 exit 0. Poprawka admission jest na lokalnym i remote master:

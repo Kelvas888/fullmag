@@ -1,5 +1,14 @@
 # P8-53 — bezpieczne zastosowanie nowego backendu w workspace
 
+[P8-53BE](53be-compute-after-workspace-restore.md), 13.10.2026:
+Compute po restore dla FDM CPU strict double **CLOSED**. Browser F→K
+`01ad57bafdca4a89881a4138c1fdbfcd`, exit 0, potwierdza niezmienioną
+scenę/dirty document, normalne Grid, Run 10 kroków / 1 ps oraz jawny
+Close z normalnym wait solvera. Requested/resolved provenance zachowane,
+canvas aktywny bez utraty WebGL. Publiczny restart, ponowny restart,
+pełna macierz Inspector Apply/Save/Cancel, fault coverage i warm-service
+ownership nadal wymagają dowodów. Nie zamyka to całego P8-53 ani P8.
+
 [P8-53BC](53bc-real-active-run-restart-refusal.md), 06.10.2026:
 bramka odmowy restartu podczas rzeczywistego FDM CPU solve **CLOSED**.
 Trzy managed receipts z manifestu

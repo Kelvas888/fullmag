@@ -1335,6 +1335,8 @@ pub(crate) struct StageExecutionRecord {
     #[serde(default)]
     pub applied_step: Option<u64>,
     #[serde(default)]
+    pub completed_step: Option<u64>,
+    #[serde(default)]
     pub applied_time_seconds: Option<f64>,
     #[serde(default)]
     pub segment_id: Option<String>,

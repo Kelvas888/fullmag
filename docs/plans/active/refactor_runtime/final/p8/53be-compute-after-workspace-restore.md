@@ -1,9 +1,24 @@
 # P8-53BE — Compute po odtworzeniu workspace
 
-Status: **OPEN**, checkpoint 13.10.2026. Kontynuacja P8-53 po zamknięciu
+Status: **CLOSED — bramka FDM CPU**, checkpoint 13.10.2026. Kontynuacja P8-53 po zamknięciu
 [P8-53BD](53bd-incomplete-physics-project-persistence.md).
 
-Najnowszy stan: build H zakończył się exit 0. Próba F→H
+Najnowszy stan: build K exit 0; frozen-native API gate 296 kontroli PASS;
+generacja klienta i 17 interpretowanych kontroli importu OpenAPI PASS.
+Rzeczywista próba F→K `01ad57bafdca4a89881a4138c1fdbfcd` zakończyła się
+completed, exit 0, 9 kontroli. Potwierdza wszystkie siedem wymagań
+poniższej pierwszej bramki: identyczna scena i dirty document, świeże
+API/session scope, normalne Grid, Compute Study z krokiem 0→10,
+ukończony etap, requested/resolved FDM CPU strict double, jawny Close
+i normalny wait solvera, aktywny canvas WebGL. Szczegóły i hashes w
+[checkpointcie BG](53bg-acquisition-refusal-diagnostics.md).
+
+To zamyka wyłącznie Compute po restore dla tej legalnej trasy.
+Publiczny restart, pozostałe lane'y, kwalifikacja fizyki i wydania oraz
+pozostałe bramki P8-53 pozostają otwarte. Poniższe wcześniejsze próby
+stanowią historię diagnozy i nie cofają najnowszego wyniku.
+
+Build H zakończył się exit 0. Próba F→H
 `11caba0f12ac4e7c8ba39ca7ee4ae342` potwierdziła odtworzenie sceny i dokumentu,
 oba normalne Grid, wykonanie Run 1 ps i zachowanie timestampu sesji przy
 starcie child. Brakuje kompletnego command/stage/execution provenance;

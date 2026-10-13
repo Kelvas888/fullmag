@@ -243,6 +243,7 @@ def read_execution_scope(api_port, api_instance_id):
             or not session["session_epoch"][len(session_id) + 1:]
             or session.get("request_scope_epoch") != f"{api_instance_id}:{identity['session_epoch']}"):
         raise storage.StorageError("Execution status is not bound to the observed API/session transition")
+    parse_session_resource_epoch(session_id, session["session_epoch"])
     return {
         "api_instance_id": api_instance_id,
         "session_id": session_id,
@@ -469,9 +470,15 @@ def completed_command_detail(frame, command_id, command_kind):
         "stage_id": frame.get("stage_id"),
         "stage_index": frame.get("stage_index"),
         "applied_step": frame.get("applied_step"),
+        "completed_step": frame.get("completed_step"),
         "requested_execution": frame.get("requested_execution"),
         "resolved_execution": frame.get("resolved_execution"),
     }
+
+
+def has_positive_solver_execution(evidence):
+    applied, completed = evidence.get("applied_step"), evidence.get("completed_step")
+    return type(applied) is int and applied >= 0 and type(completed) is int and completed > applied
 
 
 def completed_scratch_entry(entry, api_instance_id, scope):
@@ -494,6 +501,40 @@ def completed_scratch_entry(entry, api_instance_id, scope):
 def same_execution_scope(left, right):
     return isinstance(left, dict) and isinstance(right, dict) and all(
         left.get(key) == right.get(key) for key in EXECUTION_SCOPE_KEYS)
+
+
+def parse_session_resource_epoch(session_id, value):
+    prefix = session_id + "@"
+    if not isinstance(value, str) or not value.startswith(prefix):
+        raise storage.StorageError("Session resource epoch has a different session identity")
+    parts = value[len(prefix):].split(":tombstone:")
+    if len(parts) not in (1, 2) or any(
+            len(part) > 39 or not part.isascii() or not part.isdecimal() or not 0 < int(part) < 2**128
+            or str(int(part)) != part for part in parts):
+        raise storage.StorageError("Session resource epoch is not canonical")
+    started = int(parts[0])
+    finished = int(parts[1]) if len(parts) == 2 else None
+    if finished is not None and finished < started:
+        raise storage.StorageError("Session tombstone precedes its start")
+    return started, finished
+
+
+def validate_terminal_execution_scope(scope, restored, lifecycle, earliest_finish, observed_at):
+    for key in EXECUTION_SCOPE_KEYS:
+        if key != "session_resource_epoch" and scope.get(key) != restored.get(key):
+            raise storage.StorageError("Terminal execution changed its API/session owner")
+    started, previous_finish = parse_session_resource_epoch(
+        restored["session_id"], restored["session_resource_epoch"])
+    next_started, finished = parse_session_resource_epoch(
+        scope["session_id"], scope["session_resource_epoch"])
+    if (previous_finish is not None or next_started != started or finished is None
+            or type(earliest_finish) is not int or type(observed_at) is not int
+            or not earliest_finish <= finished <= observed_at
+            or not isinstance(lifecycle, dict) or lifecycle.get("solver") != "completed"
+            or lifecycle.get("session_resource") != "tombstoned"
+            or lifecycle.get("commandability") != "read_only"):
+        raise storage.StorageError("Execution has no exact completed session tombstone")
+    return finished
 
 
 def owned_scratch_entry_in_scope(entry, api_instance_id, scope):
@@ -711,7 +752,7 @@ class ProofBridge:
         if (not isinstance(compute_evidence["run_id"], str) or not compute_evidence["run_id"].strip()
                 or not ((isinstance(compute_evidence["stage_id"], str) and compute_evidence["stage_id"].strip())
                         or (type(compute_evidence["stage_index"]) is int and compute_evidence["stage_index"] >= 0))
-                or type(compute_evidence["applied_step"]) is not int or compute_evidence["applied_step"] <= 0
+                or not has_positive_solver_execution(compute_evidence)
                 or not isinstance(compute_evidence["requested_execution"], dict)
                 or not isinstance(compute_evidence["resolved_execution"], dict)):
             raise storage.StorageError("Completed Compute command lacks positive stage-step and execution provenance")
@@ -735,6 +776,8 @@ class ProofBridge:
                                         for item in stages["stages"]):
             raise storage.StorageError("Close requires all authored stages to be completed")
         stage = matching_stages[0]
+        if stage.get("completed_step") != compute_evidence["completed_step"]:
+            raise storage.StorageError("Compute stage and command differ on the completed solver step")
         stage_index = stage.get("index")
         completed_indexes = stages["completed_stage_indexes"]
         if (not isinstance(stage.get("stage_id"), str) or not stage["stage_id"].strip()
@@ -768,8 +811,36 @@ class ProofBridge:
         scope_after = read_execution_scope(self.api_port, api_instance_id)
         if canonical(scope_after) != canonical(scope_before):
             raise storage.StorageError("API/session observation scope changed while reading execution receipts")
-        if not same_execution_scope(scope_after, restore.get("scope")):
-            raise storage.StorageError("Stable API/session execution scope changed after restore")
+        close_evidence = None
+        terminal_timestamp = None
+        if require_terminal:
+            if not isinstance(queue_before, dict) or not isinstance(queue_before.get("commands"), list):
+                raise storage.StorageError("Terminal execution has no command ledger")
+            closes = [item for item in queue_before.get("commands", [])
+                      if isinstance(item, dict) and item.get("kind") == "close"
+                      and type(item.get("created_at_unix_ms")) is int
+                      and item["created_at_unix_ms"] >= compute_evidence["completed_at_unix_ms"]]
+            if len(closes) != 1:
+                raise storage.StorageError("Terminal Compute has no unique explicit Close command")
+            close_id = closes[0].get("command_id")
+            if not isinstance(close_id, str) or not close_id.strip():
+                raise storage.StorageError("Terminal Close has no command identity")
+            close_detail = read_api(self.api_port, api_instance_id,
+                                   "/v2/sessions/current/simulation/commands/" + quote(close_id, safe=""))
+            close_evidence = completed_command_detail(close_detail, close_id, "close")
+            status = read_api(self.api_port, api_instance_id, "/v2/sessions/current/status")
+            if (status.get("session", {}).get("session_epoch") != scope_after["session_resource_epoch"]
+                    or canonical(read_execution_scope(self.api_port, api_instance_id)) != canonical(scope_after)
+                    or stages.get("runtime_state") != "completed"
+                    or any(not isinstance(item, dict) or item.get("status") != "completed"
+                           for item in stages["stages"])):
+                raise storage.StorageError("Terminal lifecycle changed while reading Close receipts")
+            terminal_timestamp = validate_terminal_execution_scope(
+                scope_after, restore["scope"], status.get("lifecycle"),
+                max(stage["completed_at_unix_ms"], close_evidence["created_at_unix_ms"]), utc_ms())
+        elif (not same_execution_scope(scope_after, restore.get("scope"))
+              or scope_after["session_resource_epoch"] != restore["scope"]["session_resource_epoch"]):
+            raise storage.StorageError("Stable API/session execution scope changed before Close")
         close_precondition = None
         if not require_terminal:
             queue_after = read_api(self.api_port, api_instance_id, "/v2/sessions/current/simulation/commands")
@@ -800,6 +871,8 @@ class ProofBridge:
             },
             "observation_scope": scope_after,
             "close_precondition": close_precondition,
+            "close": close_evidence,
+            "session_finished_at_unix_ms": terminal_timestamp,
             "grid": {**grid_evidence, "child_pid": grid_entry["record"]["pid"],
                      "child_exit_code": grid_entry["record"]["exit_code"],
                      "kill_requested": grid_entry["record"]["kill_requested"]},
