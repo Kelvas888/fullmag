@@ -200,7 +200,9 @@ CONTRACT_SCOPES = frozenset(
         "bias-field-artifacts",
         "browser",
         "positive-mass",
+        "floquet-source-moments",
         "native-modal",
+        "native-receipt",
         "floquet-modal-slepc",
         "generic-modal-slepc",
         "floquet-count-slepc",
@@ -281,6 +283,10 @@ def test_dispatch_scope_guards_reject_wrong_required_job_exclusions() -> None:
 
 def test_required_contexts_and_proof_output_are_fail_closed() -> None:
     bootstrap = load_workflow(REPO_ROOT / ".github/workflows/bootstrap.yml")
+    # PyYAML may parse the YAML 1.1 key "on" as boolean True.
+    events = bootstrap.get("on", bootstrap.get(True))
+    options = events["workflow_dispatch"]["inputs"]["contract_scope"]["options"]
+    assert set(options) == CONTRACT_SCOPES
     jobs = bootstrap["jobs"]
     required_jobs = {
         "rust-contracts",
