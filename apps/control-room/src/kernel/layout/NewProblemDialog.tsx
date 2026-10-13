@@ -92,8 +92,7 @@ export function NewProblemDialog({
   const canBrowse = useSyncExternalStore(subscribeDesktopAvailability, desktopPickerAvailable, noDesktopPicker);
   const [creationAccepted, setCreationAccepted] = useState(false);
   const [domainSetupChoice, setDomainSetupChoice] = useState<"now" | "later">("later");
-  const [pendingDomainNavigationSessionId, setPendingDomainNavigationSessionId] =
-    useState<string | null>(null);
+  const pendingDomainNavigationSessionIdRef = useRef<string | null>(null);
   const createdSessionIdRef = useRef<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const sessionCollection = useSessionCollection();
@@ -106,6 +105,7 @@ export function NewProblemDialog({
   const currentSessionId = currentSessionIdentity?.sessionId ?? null;
 
   useEffect(() => {
+    const pendingDomainNavigationSessionId = pendingDomainNavigationSessionIdRef.current;
     if (
       !pendingDomainNavigationSessionId ||
       currentSessionId !== pendingDomainNavigationSessionId ||
@@ -124,18 +124,18 @@ export function NewProblemDialog({
       },
       "ribbon",
     );
-    setPendingDomainNavigationSessionId(null);
+    pendingDomainNavigationSessionIdRef.current = null;
   }, [
     currentSessionId,
     currentSessionScopeKey,
     kernel,
-    pendingDomainNavigationSessionId,
+    open,
   ]);
 
   const requestOpenChange = (nextOpen: boolean) => {
     if (pending || browsing) return;
     if (!nextOpen && domainSetupChoice === "now" && createdSessionIdRef.current) {
-      setPendingDomainNavigationSessionId(createdSessionIdRef.current);
+      pendingDomainNavigationSessionIdRef.current = createdSessionIdRef.current;
     }
     onOpenChange(nextOpen);
   };
