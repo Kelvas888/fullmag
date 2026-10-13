@@ -68,7 +68,7 @@ export async function deleteObjectWithHistory(
         context.api!,
         mutation.objectId,
         { base_revision: preparation.baseRevision ?? mutation.baseRevision },
-        options,
+        reqOptions,
       );
       if (
         context.isCurrentSessionScope?.() !== false &&
@@ -80,6 +80,6 @@ export async function deleteObjectWithHistory(
       return response;
     },
     undefined,
-    { captureWorkspaceStateAfter: () => selectionClearedByMutation },
+    { captureWorkspaceStateAfter: () => selectionClearedByMutation, ...options },
   );
 }

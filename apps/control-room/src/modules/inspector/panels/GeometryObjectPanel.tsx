@@ -37,6 +37,7 @@ import {
   geometryDraftGeometryEquals,
   geometryDraftTranslationEquals,
   createDraftObjectId,
+  mergeGeometryDescriptor,
   resolveGeometryObjectDraft,
   resolveGeometryObjectPanelModel,
   resolvePrimitiveDraft,
@@ -47,7 +48,7 @@ import {
 } from "./geometryObjectPanelModel";
 
 type Feedback = {
-  kind: "error" | "success";
+  kind: "error" | "success" | "warning";
   message: string;
 };
 
@@ -116,20 +117,6 @@ function sameDraftValues(left: GeometryObjectDraft, right: GeometryObjectDraft):
   ]);
 }
 
-function mergeGeometryDescriptor(existing: JsonObject, edited: JsonObject): JsonObject {
-  const existingParams = existing.geometry_params;
-  const editedParams = edited.geometry_params;
-  const mergedParams =
-    existingParams && typeof existingParams === "object" && !Array.isArray(existingParams) &&
-    editedParams && typeof editedParams === "object" && !Array.isArray(editedParams)
-      ? { ...existingParams, ...editedParams }
-      : editedParams;
-  return {
-    ...existing,
-    ...edited,
-    ...(mergedParams ? { geometry_params: mergedParams } : {}),
-  };
-}
 
 function invalidateAuthoringResources(
   resources: ReturnType<typeof useKernel>["resources"],

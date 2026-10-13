@@ -13,6 +13,7 @@ import { patchObjectGeometryTransaction } from "@/kernel/authoring/geometryLifec
 import {
   geometryDraftGeometryEquals,
   geometryDraftTranslationEquals,
+  geometryObjectEditSessionTargetKey,
   resolveCommittedGeometryObjectDraft,
 } from "@/kernel/authoring/object-edit/objectEditDraftModel";
 import { useObjectEditSelector } from "@/kernel/authoring/object-edit/useObjectEditSelector";
@@ -50,7 +51,6 @@ import { InspectorGroup } from "../primitives/InspectorGroup";
 import {
   buildGeometryDraftPatch,
   buildTransformDraftPatch,
-  geometryObjectEditSessionTargetKey,
   mergeGeometryDescriptor,
 } from "./geometryObjectPanelModel";
 import {
@@ -176,11 +176,12 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
     feedback: null,
     key: draftKey,
   });
+  const currentSessionScopeKey = kernel.commands.getSessionScopeKey() ?? null;
   const [pendingState, setPendingState] = useState<PendingOperationState>({
     draftKey,
     operationId: 0,
     pending: false,
-    sessionScopeKey: kernel.commands.getSessionScopeKey() ?? null,
+    sessionScopeKey: currentSessionScopeKey,
   });
   const pendingOperationId = useRef(0);
   const editSnapshot = useObjectEditSelector(kernel.objectEditSession);
@@ -413,13 +414,13 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
       );
       if (historyContext.isCurrentSessionScope() === false) return false;
       const nextRevision =
-        typeof response.revision === "number"
-          ? response.revision
+        typeof response.scene_revision === "number"
+          ? response.scene_revision
           : (object.revision ?? 0) + 1;
       invalidateAuthoringResources(
         resources,
         nextRevision,
-        response,
+        response.committed_scene,
         historyContext.sessionScopeKey,
         api.resourceCacheScope,
       );
