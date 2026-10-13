@@ -11038,12 +11038,26 @@ fn eigen_path_returns_typed_partial_for_stop_and_pause_before_single_k_execution
 
         assert_eq!(run.result.status, expected_status);
         assert_eq!(phases, vec!["preparing_k_path_sample"]);
-        let partial = run
+        let partial_artifact = run
             .auxiliary_artifacts
             .iter()
             .find(|artifact| artifact.relative_path == "eigen/partial.v1.json")
             .expect("interrupted path should publish a partial diagnostic");
-        let partial: serde_json::Value = serde_json::from_slice(&partial.bytes).unwrap();
+        let raw_partial = run
+            .auxiliary_artifacts
+            .iter()
+            .find(|artifact| {
+                artifact
+                    .relative_path
+                    .starts_with("eigen/diagnostics/raw_single_k/sample_0000/")
+                    && artifact
+                        .relative_path
+                        .ends_with("/artifacts/eigen/partial.v1.json")
+            })
+            .expect("interrupted single-k partial diagnostic remains sample-namespaced");
+        assert_eq!(partial_artifact.bytes, raw_partial.bytes);
+        let partial: serde_json::Value =
+            serde_json::from_slice(&partial_artifact.bytes).unwrap();
         assert_eq!(partial["complete"], false);
         assert_eq!(partial["stop_reason"], expected_reason);
         assert_eq!(partial["preserved_mode_count"], 0);

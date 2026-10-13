@@ -223,6 +223,30 @@ fn interrupted_eigen_path_run(
         RunStatus::Cancelled | RunStatus::Paused
     ));
     let status = interrupted.status;
+    let mut auxiliary_artifacts = interrupted.diagnostic_artifacts;
+    // The empty-prefix path returns before the path manifest is assembled.
+    // Keep the interrupted single-k bytes namespaced, and also publish its
+    // partial diagnostic at the run-level canonical path for consumers.
+    if !auxiliary_artifacts
+        .iter()
+        .any(|artifact| artifact.relative_path == "eigen/partial.v1.json")
+    {
+        if let Some(partial_bytes) = auxiliary_artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.relative_path.starts_with("eigen/diagnostics/raw_single_k/")
+                    && artifact
+                        .relative_path
+                        .ends_with("/artifacts/eigen/partial.v1.json")
+            })
+            .map(|artifact| artifact.bytes.clone())
+        {
+            auxiliary_artifacts.push(AuxiliaryArtifact {
+                relative_path: "eigen/partial.v1.json".to_string(),
+                bytes: partial_bytes,
+            });
+        }
+    }
     ExecutedRun {
         result: crate::types::RunResult {
             status,
@@ -237,7 +261,7 @@ fn interrupted_eigen_path_run(
         initial_magnetization: plan.equilibrium_magnetization.clone(),
         field_snapshots: Vec::new(),
         field_snapshot_count: 0,
-        auxiliary_artifacts: interrupted.diagnostic_artifacts,
+        auxiliary_artifacts,
         provenance: interrupted.provenance,
     }
 }
