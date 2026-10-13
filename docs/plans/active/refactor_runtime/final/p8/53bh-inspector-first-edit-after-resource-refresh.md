@@ -141,3 +141,33 @@ w gate wykonania i finish porównuje oczekiwaną scenę po usunięciu samego
 udanej terminalnej obserwacji Grid i osobnego Compute oraz dokładnego scope.
 Interpretowane regression checks: 27 PASS, bez kompilowania testów.
 Ponowna realna próba jest wymagana przed zamknięciem całego punktu.
+
+## Ponowna próba L — terminalny Compute, pozostała bramka dokumentu
+
+Receipt `8c03ed8d9797405291a2bb65dc5e59bf` powtórzył pierwszą edycję oraz
+Apply→restart→restore z zachowaniem Name, Ms=800000, Aex=1.3e-11, alpha=0.02.
+Nowe API: `89cc53fd-6530-46ec-be99-b99755cd2a24`, session
+`session-18de1f3d1b3fe0940001fcc0`. Przygotowany grid 4×4×1 / 16 cells.
+Compute `fm-04373438-03c4-4fd9-a3fc-adc501a7c489` wykonał 10 kroków,
+stage-000 completed; requested/resolved FDM CPU double strict.
+Po normalnym Close dziecko PID 131492: waited=true, exit_code=0,
+kill_requested=false. Bramka przed Close potwierdziła Grid oraz ukończony Run.
+
+![Materiał po odtworzeniu i ukończonym Run](53bh-material-completed-run.jpg)
+
+Finish pozostał disabled: fixture `currentProofMatches` nadal porównuje cały
+`projectDocumentProof` dokładnie. Po Grid hashe scene_resource/scene_document
+zmieniają się z `c17f2cc7858df2e6c7fe366e3e81767a8e807777d31f262c29a38173b821ba58`
+na `60aa190cb38b38f572a9c1e6e61b2a3ce48013ee59c256a1091ef6a1bb370731`.
+Archiwum zachowuje hash
+`0b2eeb3c252548cfaeff03174c9988ff8d83c88063c439f7963e7a4480ab833c`,
+project_id, revision=2 i dirty=true. Przyczyną jest ta sama legalna zmiana
+mesh:dirty w zasobie sceny, a nie zmiana archiwum. Python finish również
+wymaga jeszcze dokładnego `project_document_after`.
+
+Następny krok: dopasować oba porównania dokumentu do jawnej, weryfikowanej
+transformacji po Grid, zachowując exact archive/metadata oraz exact immediate
+restore; nie ignorować dowolnych hashy ani zmian authoringu. Dodać regresję
+fałszywych zmian i ponowić pełny browser gate. Do tego czasu P8-53BH OPEN.
+Próbę normalnie anulowano po terminalnym Compute; terminal fixture failed,
+nie PASS całej bramki. Nie zmieniono publicznej dostępności restartu.
