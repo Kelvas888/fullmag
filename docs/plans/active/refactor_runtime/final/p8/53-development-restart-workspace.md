@@ -1,9 +1,48 @@
 # P8-53 — bezpieczne zastosowanie nowego backendu w workspace
 
-[P8-53BH](53bh-inspector-first-edit-after-resource-refresh.md): kontynuacja
-macierzy Inspector ujawniła utratę nietkniętych pól przy pierwszej edycji
-materiału po odświeżeniu zasobu. Restart odmawia i zachowuje scope;
-poprawka szkicu oraz Apply/restore wymagają ponownego dowodu. Bramka OPEN.
+[P8-53BM](53bm-camera-preservation.md), 13.10.2026:
+potwierdzono utratę projekcji kamery podczas rzeczywistego restartu.
+Owner v2 przenosi ścisły snapshot przez typowane API i wymaga zgodnego
+ACK/readback przed publikacją. Aktywna sesja bez zaobserwowanej kamery
+oraz replacement współdzielący stary rejestr są odrzucane.
+Managed Chrome fixture: 34/34 PASS. Natywny restart po poprawce,
+rewizja camera-only PATCH i czyszczenie skali null pozostają otwarte.
+
+[P8-53BL](53bl-inspector-owner-inventory.md), 13.10.2026:
+inwentaryzacja 23 zarejestrowanych ownerów Inspectora zakończona w źródłach.
+Nie wykazano brakującej ochrony standardowych staged formularzy.
+Stany natychmiastowe rozszerzeń i przekrojów oraz lokalne kontrolki zapytania
+Topological Charge wymagają odrębnego dowodu capture/restore.
+Pełna macierz browser i P8-53 pozostają otwarte.
+
+[P8-53BK](53bk-repeated-handoff-owner-chain.md), 13.10.2026:
+interpretowany łańcuch terminalnie odtworzonych kapsuł z nowym ownerem
+**PASS**, 162 kontrole bez pominięć, receipt `d061e0844b104248bf03fedb12ce3f34`.
+Nie zastępuje dwóch restartów A→B→C w jednej sesji przeglądarki;
+ta bramka oraz pozostałe wymagania P8-53 pozostają otwarte.
+
+[P8-53BJ](53bj-pending-inspector-save-cancel.md), 13.10.2026:
+Save/Cancel przy szkicu panelu materiału **CLOSED w opisanym zakresie**.
+Save pobrał zatwierdzone alpha=0.01, zachowując szkic alpha=0.03; Cancel
+dialogu New Problem zachował panel i scenę. Restart odmówił do jawnego Revert.
+Receipt `89e280c2a794426cb3a4e55127178bd1`: exit 0, dziewięć kontroli PASS,
+Grid i Compute zakończone normalnie, wszystkie 26 procesów odebrane.
+Pozostałe panele, powtórny restart i zapis desktop nadal pozostają otwarte.
+
+[P8-53BI](53bi-project-save-before-restart.md), 13.10.2026:
+Save Project w Chrome z czystym Inspectorem → restart → restore **CLOSED**.
+Rzeczywisty plik ZIP/CRC i skrypt potwierdzone; hash pobranego archiwum
+zgodny z dokumentem przed i po restarcie. Receipt
+`8ea73f1c32b1424a90a4d69906d5c665`, exit 0, dziewięć kontroli PASS,
+Grid i Compute normalnie zakończone, 26 procesów odebrane.
+Zapis desktop i Save/Cancel niezastosowanych szkiców pozostają otwarte.
+
+[P8-53BH](53bh-inspector-first-edit-after-resource-refresh.md), 13.10.2026:
+pierwsza edycja materiału po odświeżeniu, guard szkicu, Apply i restart/restore
+**CLOSED w opisanym zakresie**. Receipt `0349fe166bc24239b39ecf5260ad3fc5`:
+completed, exit 0, dziewięć kontroli, Grid i Compute zakończone normalnie,
+wszystkie 26 procesów odebrane. Save Project, Cancel, pozostałe panele
+Inspectora i powtórny restart pozostają otwarte. Nie zamyka całego P8-53.
 
 [P8-53BE](53be-compute-after-workspace-restore.md), 13.10.2026:
 Compute po restore dla FDM CPU strict double **CLOSED**. Browser F→K

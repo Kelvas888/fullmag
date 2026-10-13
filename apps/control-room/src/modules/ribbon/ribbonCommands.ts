@@ -18,10 +18,8 @@ import {
   VISUALIZATION_STATE_PATH,
 } from "@/kernel/api/apiPaths";
 import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus";
-import {
-  resolveActiveLaneDiscretization,
-  resolveActiveLaneOperation,
-} from "@/kernel/resources/useActiveLaneCapabilities";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
+import { resolveActiveLaneOperation } from "@/kernel/resources/useActiveLaneCapabilities";
 import { beginPlanarMonitorDraft } from "@/kernel/workspace/crossSectionWorkspace";
 import {
   BACKEND_INTERACTION_IDS,
@@ -1138,10 +1136,8 @@ function ribbonInteractionDiscretization(
   // therefore still fail closed while the lane is unresolved.
   if (rawResource === undefined) return "fem";
   const resource = asRecord(rawResource);
-  const status = (resource?.data ?? resource) as LiveStatusResource | null;
-  return resolveActiveLaneDiscretization(
-    status?.capabilities?.active_lane ?? null,
-  );
+  const status = asRecord(resource?.data ?? resource);
+  return normalizeInteractionDiscretization(resolveSessionDiscretization(status));
 }
 
 function airboxCommandDisabledReason(context: CommandContext): string | null {

@@ -81,6 +81,7 @@ import {
   useSessionStatusSelector,
 } from "@/kernel/resources/useSessionStatus";
 import type { ActiveLaneCapabilitySnapshot } from "@/kernel/resources/useActiveLaneCapabilities";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import { CommandDetailDialog } from "@/shared/runtime/CommandDetailDialog";
 import { Button } from "@/shared/ui/Button";
 import {
@@ -1140,7 +1141,7 @@ export function useStudyInspectorPanelController(
       executionProfileBound: profileBound,
       magneticObjectCount: magneticObjectCount(currentScene.scene),
       magneticObjectIds: magneticObjectIds(currentScene.scene),
-      sessionDiscretization: runtimeStatus?.domain.discretization,
+      sessionDiscretization: resolveSessionDiscretization(runtimeStatus),
     }).filter(
       (issue) => issue.severity === "error",
     );
@@ -1166,7 +1167,7 @@ export function useStudyInspectorPanelController(
           buildStudyGlobalMergePatch(state.globalDraft, {
             baseRevision,
             executionProfileBound: profileBound,
-            sessionDiscretization: runtimeStatus?.domain.discretization,
+            sessionDiscretization: resolveSessionDiscretization(runtimeStatus),
           }),
           sessionScopeKey ? { sessionScopeKey } : undefined,
         ),
@@ -1184,7 +1185,7 @@ export function useStudyInspectorPanelController(
         requestedBackend: profileBound
           ? null
           : state.globalDraft.requestedBackend,
-        sessionDiscretization: runtimeStatus?.domain.discretization,
+        sessionDiscretization: resolveSessionDiscretization(runtimeStatus),
       });
       if (explicitFdm) {
         invalidateFdmGridResources(kernel.resources, revision);
@@ -1466,7 +1467,7 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
       hasStudyExecutionProfile(scene.data) || profileEditState.profileBound,
     magneticObjectCount: sceneMagneticObjectCount,
     magneticObjectIds: sceneMagneticObjectIds,
-    sessionDiscretization: runtimeStatus?.domain.discretization,
+    sessionDiscretization: resolveSessionDiscretization(runtimeStatus),
   });
   const workflowValidation = validateStudyWorkflow(state.stageDrafts);
   const stageValidation = state.stageDrafts.flatMap((draft, index) => [
@@ -1569,7 +1570,7 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
           scene={scene.data}
           sceneRevision={sceneRevision}
           sceneStatus={scene.status}
-          sessionDiscretization={runtimeStatus?.domain.discretization}
+          sessionDiscretization={resolveSessionDiscretization(runtimeStatus)}
           snapshot={snapshot}
           onCommit={() => void commitGlobalDraft()}
           onUpdate={(patch) =>

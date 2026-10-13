@@ -1382,6 +1382,7 @@ interface Viewport3DFrameProps
   scalarColorPalette: string;
   savedViewportActive: boolean;
   sessionIdentity: SessionResourceIdentity | null;
+  sessionDiscretization: "fdm" | "fem" | null;
   selectedLabel: string;
   slotId: ModuleProps["slotId"];
   status: string;
@@ -1977,6 +1978,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   quantityId,
   savedViewportActive,
   sessionIdentity,
+  sessionDiscretization,
   selectedLabel,
   slotId,
   status,
@@ -2115,11 +2117,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     }),
     [initialCameraFit.far, initialCameraFit.near],
   );
-  const discretizationKind = sceneProps.fdmDomain
-    ? "FDM"
-    : sceneProps.femDomain.magneticParts.length > 0
-      ? "FEM"
-      : null;
+  const discretizationKind = sessionDiscretization?.toUpperCase() ?? null;
   const meshQualityLegend = resolveViewport3DMeshQualityLegend(
     sceneProps.meshQualityOverlayVisible,
     meshQualityMetric,

@@ -62,9 +62,9 @@ import {
 import { awaitMeshBuildConfirmation, type MeshBuildConfirmCommandId } from "./meshBuildConfirmation";
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import {
-  resolveActiveLaneDiscretization,
   resolveActiveLaneOperation,
 } from "../resources/useActiveLaneCapabilities";
+import { resolveSessionAuthoringDiscretization } from "../resources/sessionDiscretization";
 
 function deleteObjectBlockedReason(context: CommandContext, ignoreReservation = false): string | null {
   const controller = context.objectEditSession;
@@ -112,7 +112,8 @@ function sessionRequestOptions(
 }
 
 function sceneBaseRevision(context: CommandContext): number | null {
-  const revision = asRecord(resourceData(context, MODEL_SCENE_PATH))?.revision;
+  const scene = asRecord(resourceData(context, MODEL_SCENE_PATH));
+  const revision = scene?.revision ?? scene?.scene_revision;
   return typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0
     ? revision
     : null;
@@ -252,7 +253,7 @@ export const FDM_MESH_COMMAND_NOT_APPLICABLE_REASON =
   "FEM mesh commands are not applicable to an FDM structured-grid session.";
 
 export const UNKNOWN_MESH_COMMAND_LANE_REASON =
-  "Session discretization is unresolved; FEM mesh commands remain unavailable until an explicit FEM lane is published.";
+  "Choose FEM or FDM in Study settings. If a method is already selected, review session diagnostics before building a mesh.";
 
 /**
  * Resolve the current command lane from the session-status resource only.
@@ -269,8 +270,9 @@ export function resolveMeshCommandLane(
 }
 
 function meshCommandLane(context: CommandContext): MeshCommandLane {
-  const status = resourceData(context, SESSION_STATUS_RESOURCE_KEY) as LiveStatusResource | null;
-  return resolveActiveLaneDiscretization(status?.capabilities?.active_lane ?? null);
+  const status = asRecord(resourceData(context, SESSION_STATUS_RESOURCE_KEY));
+  const payload = asRecord(status?.data ?? status);
+  return resolveMeshCommandLane(resolveSessionAuthoringDiscretization(payload));
 }
 
 function femMeshCommandDisabledReason(context: CommandContext): string | null {
@@ -286,7 +288,7 @@ export const FEM_GRID_COMMAND_NOT_APPLICABLE_REASON =
   "Build Grid is only applicable to an FDM structured-grid session.";
 
 export const UNKNOWN_GRID_COMMAND_LANE_REASON =
-  "Session discretization is unresolved; Build Grid remains unavailable until an explicit FDM lane is published.";
+  "Choose FDM in Study settings to build a structured grid. If FDM is already selected, review session diagnostics.";
 
 function fdmGridBuildDisabledReason(context: CommandContext): string | null {
   if (!context.api) return "Control-room API is unavailable.";
@@ -1467,7 +1469,7 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
     scope: "workspace",
     isEnabled: (context) => fdmGridBuildDisabledReason(context) === null,
     disabledReason: fdmGridBuildDisabledReason,
-    run: (context) => {
+    run: async (context) => {
       const disabledReason = fdmGridBuildDisabledReason(context);
       if (disabledReason) {
         return { message: disabledReason, status: "failed" };
@@ -1480,9 +1482,18 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
           status: "failed",
         };
       }
+      const confirmation = await awaitMeshBuildConfirmation(context, "grid.build-fdm", {
+        ...asRecord(context.input),
+        kind: "fdm_grid_refresh",
+        reason: "explicit_build_grid",
+        scene_revision: sceneRevision,
+      });
+      if (!confirmation.confirmed) {
+        return { status: "cancelled" };
+      }
       return runFdmGridRefreshOperation(context, {
         kind: "fdm_grid_refresh",
-        precondition: { scene_revision: sceneRevision },
+        precondition: confirmation.precondition ?? { scene_revision: sceneRevision },
         reason: "explicit_build_grid",
       });
     },
