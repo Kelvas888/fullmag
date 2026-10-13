@@ -90,7 +90,7 @@ export function AntennaTerminalsPanel({ selection: selected }: InspectorPanelPro
       const actual = committed?.current_transports?.find((item) => item.name === port.current_transport_id);
       const stages = committed?.antenna_field_solve_stages?.filter((stage) => stage.current_transport_id === port.current_transport_id) ?? [];
       if (!committed || committed.scene?.id !== identity?.sessionId || committed.revision !== response.scene_revision || !actual ||
-        actual.boundaries?.length || actual.conservative_current_view || antennaPreparationIdentity(actual.external_lead_preparation) !== antennaPreparationIdentity(expected?.external_lead_preparation) ||
+        (actual.boundaries != null && (!Array.isArray(actual.boundaries) || actual.boundaries.length > 0)) || actual.conservative_current_view || antennaPreparationIdentity(actual.external_lead_preparation) !== antennaPreparationIdentity(expected?.external_lead_preparation) ||
         stages.length !== sourceScene.antenna_field_solve_stages?.filter((stage) => stage.current_transport_id === port.current_transport_id).length ||
         stages.some((stage) => stage.conservative_current_view_ref) || antennaTerminalGeometryBinding(committed, objectId) !== submitted.geometryBinding) {
         throw new Error("Terminal preparation ACK omitted or changed the submitted source. Refresh before retrying.");

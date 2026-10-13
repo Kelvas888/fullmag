@@ -67,7 +67,7 @@ export function antennaInspectionValidationMessages(stage: AntennaSolveStage, sc
   const transport = scene.current_transports?.find((item) => item.name === stage.current_transport_id);
   if (!transport) return [`missing current transport '${stage.current_transport_id}'`];
   if (!transport.external_lead_preparation && !transport.conservative_current_source) return ["Author external actuators and lead preparation before raw inspection."];
-  if (transport.boundaries?.length || transport.conservative_current_view || transport.structured_current_closure || stage.conservative_current_view_ref) return ["Inspection source conflicts with legacy boundaries/view/closure; apply explicit preparation."];
+  if ((transport.boundaries != null && (!Array.isArray(transport.boundaries) || transport.boundaries.length > 0)) || transport.conservative_current_view || transport.structured_current_closure || stage.conservative_current_view_ref) return ["Inspection source conflicts with legacy boundaries/view/closure; apply explicit preparation."];
   const messages: string[] = [];
   if (!stage.target_refs?.length) messages.push("Inspection requires explicitly authored field-sampling targets.");
   if (stage.port_mode_ids.length !== 1 || !scene.antenna_port_modes?.some((port) => port.id === stage.port_mode_ids[0] && port.source_object_id === stage.source_object_id && port.current_transport_id === stage.current_transport_id)) messages.push("Inspection requires one port bound to this source and transport.");
