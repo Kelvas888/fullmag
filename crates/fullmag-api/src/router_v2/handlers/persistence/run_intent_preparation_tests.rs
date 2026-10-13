@@ -1,15 +1,41 @@
 use super::*;
 use axum::http::StatusCode;
 use fullmag_application::{ProjectEnvelope, RunIntent};
+use fullmag_ir::{
+    FemConnectivityIR, FemFacetConnectivityIR, FemMeshAssetIR, GeometryAssetsIR, MeshIR,
+};
 use serde_json::Value;
 
 fn request() -> (ProjectId, ProjectRunIntentRequest) {
     // Structural identity fixture, not qualification of a physical scene.
-    let fixture: Value = serde_json::from_str(include_str!(concat!(
+    let mut fixture: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/fixtures/runtime/accepted-fem-preparation-run-v2.json"
     )))
     .unwrap();
+    // Inline structural mesh; no file reads, runtime session, or solver execution.
+    fixture["study_problem_catalog"]["entries"][0]["problem"]["geometry_assets"] =
+        serde_json::to_value(GeometryAssetsIR {
+            fem_mesh_assets: vec![FemMeshAssetIR {
+                geometry_name: "strip".into(),
+                mesh_source: None,
+                mesh: Some(MeshIR {
+                    mesh_name: "identity-fixture".into(),
+                    nodes: vec![
+                        [0.0, 0.0, 0.0],
+                        [1e-9, 0.0, 0.0],
+                        [0.0, 1e-9, 0.0],
+                        [0.0, 0.0, 1e-9],
+                    ],
+                    cells: FemConnectivityIR::from_tet4(vec![[0, 1, 2, 3]]),
+                    element_markers: vec![1],
+                    facets: FemFacetConnectivityIR::empty(),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
     let original: RunIntent = serde_json::from_value(fixture["run_intent"].clone()).unwrap();
     let authored = RunIntentAuthoring {
         run_id: original.specification.run_id,
@@ -122,4 +148,18 @@ fn preparation_rejects_unknown_authoring_fields_and_execution_conflicts() {
         prepare_identity(project_id, request).unwrap_err().status,
         StatusCode::BAD_REQUEST
     );
+}
+
+#[test]
+fn preparation_rejects_a_fem_catalog_without_a_mesh() {
+    let (project_id, mut request) = request();
+    request.study_problem_catalog.get_mut("entries").unwrap()[0]["problem"]
+        .as_object_mut()
+        .unwrap()
+        .remove("geometry_assets");
+    let error = prepare_identity(project_id, request).unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error
+        .message
+        .contains("requires a precomputed FEM mesh asset"));
 }
