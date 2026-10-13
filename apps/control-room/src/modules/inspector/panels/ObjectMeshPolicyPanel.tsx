@@ -15,6 +15,7 @@ import {
   resolveObjectMeshPolicyResourceKey,
   resolveObjectMeshQualityResourceKey,
   resolveObjectMeshReportResourceKey,
+  useMeshBuildHistoryResource,
   useMeshCapabilitiesResource,
   useObjectMeshPolicyResource,
   useObjectMeshQualityResource,
@@ -27,6 +28,10 @@ import {
   sessionRequestScopeKey,
 } from "@/kernel/resources/sessionResourceIdentity";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
+import {
+  normalizeMeshBuildHistory,
+  type MeshBuildHistoryEntry,
+} from "@/shared/domain/mesh/meshBuildHistory";
 import { normalizeMeshQualityStatistics } from "@/shared/domain/mesh/qualityStatistics";
 import { Tabs, TabsContent } from "@/shared/ui/Tabs";
 import { Button } from "@/shared/ui/Button";
@@ -51,6 +56,7 @@ import {
 import type { MeshSizeDistributionHoverBin } from "./MeshQualityChart";
 import { MeshQualityStatisticsView } from "./MeshQualityStatisticsView";
 import { emitMeshSizeHistogramHover } from "./meshSizeHistogramHover";
+import { MeshBuildHistorySection } from "./mesh-details/MeshBuildHistorySection";
 import {
   initialInspectorDraftState,
   resolveInspectorDraftState,
@@ -265,9 +271,11 @@ function ObjectMeshPolicySummarySection({
 export function FdmObjectMeshPolicySection({
   objectId,
   resources,
+  onRebuildGrid,
 }: {
   objectId: string | null | undefined;
   resources: FdmObjectMeshInspectorResources;
+  onRebuildGrid?: () => void;
 }) {
   const model = useMemo(
     () =>
@@ -312,6 +320,18 @@ export function FdmObjectMeshPolicySection({
           }
         />
         <FieldRow label="Grid fingerprint" value={model.gridFingerprint ?? "not materialized"} mono />
+        {onRebuildGrid ? (
+          <div className="flex justify-end pt-2">
+            <Button
+              size="sm"
+              type="button"
+              variant="secondary"
+              onClick={onRebuildGrid}
+            >
+              Re-voxelize / Build Grid
+            </Button>
+          </div>
+        ) : null}
       </InspectorGroup>
     </div>
   );
@@ -851,6 +871,7 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
     [fdmDomain, fdmMembership, fdmMembershipBinary],
   );
   const femResourcesEnabled = meshLane === "fem";
+  const buildHistory = useMeshBuildHistoryResource({ enabled: femResourcesEnabled });
   const policy = useObjectMeshPolicyResource(objectId, { enabled: femResourcesEnabled });
   const report = useObjectMeshReportResource(objectId, { enabled: femResourcesEnabled });
   const quality = useObjectMeshQualityResource(objectId, { enabled: femResourcesEnabled });
@@ -1003,6 +1024,50 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
     if (objectId && policy.status === "ready") kernel.bus.emit("mesh:build-history-editor-ready", { target: `object:${objectId}` });
     return offRestore;
   }, [baseDraft, draftKey, draftIdentityKey, effectiveTarget, kernel.bus, objectId, policy.status, resource, setFeedback]);
+
+  const buildHistoryEntries = useMemo(() => {
+    const all = normalizeMeshBuildHistory(buildHistory.data?.history);
+    if (!objectId) return all;
+    return all.filter((entry) => {
+      if (!entry.meshTarget || entry.meshTarget === "all") return true;
+      if (
+        entry.meshTarget === `object:${objectId}` ||
+        entry.meshTarget === `object_mesh:${objectId}`
+      ) {
+        return true;
+      }
+      const objectSnapshots = asRecord(entry.canonicalPolicySnapshot?.objects);
+      return objectSnapshots ? Object.hasOwn(objectSnapshots, objectId) : false;
+    });
+  }, [buildHistory.data?.history, objectId]);
+
+  const onRestoreBuildToDraft = useCallback((entry: MeshBuildHistoryEntry) => {
+    if (!objectId) return;
+    const objectSnapshots = asRecord(entry.canonicalPolicySnapshot?.objects);
+    if (!objectSnapshots || !Object.hasOwn(objectSnapshots, objectId)) {
+      setFeedback({
+        kind: "error",
+        message: `Build ${entry.id} contains no mesh snapshot for object ${objectId}.`,
+      });
+      return;
+    }
+    const snapshotValue = objectSnapshots[objectId];
+    const objectSnapshot = snapshotValue === null ? null : asRecord(snapshotValue);
+    const restored = draftFromObjectMeshPolicyResource(
+      { ...resource, config: objectSnapshot as JsonObject | null },
+      { effectiveTarget },
+    );
+    setDraftState({
+      baseKey: draftKey,
+      dirty: objectMeshPolicyDraftDirty(restored, baseDraft),
+      draft: restored,
+      identityKey: draftIdentityKey,
+    });
+    setFeedback({
+      kind: "success",
+      message: `Build ${entry.id} restored to the object draft. Apply the policy before building.`,
+    });
+  }, [baseDraft, draftIdentityKey, draftKey, effectiveTarget, objectId, resource, setFeedback]);
 
   const applyPolicy = useCallback(async ({
     silentSuccess = false,
@@ -1203,7 +1268,7 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
       }),
     );
     setFeedback(null);
-  }, [baseDraft, draftIdentityKey, draftKey]);
+  }, [baseDraft, draftIdentityKey, draftKey, setFeedback]);
   useRegisterInspectorEditSession(
     "staged",
     pending,
@@ -1216,11 +1281,27 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
   const activeTab = useInspectorActiveTab();
   const jsonError = objectMeshPolicyJsonError(draft.configText);
 
+  const executeFdmGridBuild = useCallback(async () => {
+    try {
+      const result = await commands.execute("grid.build-fdm", commandContext);
+      setFeedback({
+        kind: result.status === "completed" ? "success" : result.status === "failed" ? "error" : "warning",
+        message: result.message ?? (result.status === "completed"
+          ? "FDM grid refresh completed."
+          : result.status === "failed" ? "FDM grid refresh failed."
+          : "FDM grid refresh was not submitted."),
+      });
+    } catch (error) {
+      setFeedback({ kind: "error", message: errorMessage(error) });
+    }
+  }, [commands, commandContext, setFeedback]);
+
   if (explicitFdm) {
     return (
       <FdmObjectMeshPolicySection
         objectId={objectId}
         resources={fdmMeshResources}
+        onRebuildGrid={executeFdmGridBuild}
       />
     );
   }
@@ -1306,9 +1387,46 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
 
         <TabsContent value="history" className="fm-tabs-content">
           <div className="grid min-w-0 gap-fm-inspector-group">
-            <JsonResourceSection sectionValue="json-report" title="Object Mesh Report JSON" value={report.data} />
-            <JsonResourceSection sectionValue="json-quality" title="Object Mesh Quality JSON" value={quality.data} />
-            <JsonResourceSection sectionValue="json-size-field" title="Object Size Field JSON" value={sizeField.data} />
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-muted-foreground">
+                Showing build history entries affecting this object.
+              </span>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() =>
+                  kernel.selection.set(
+                    {
+                      kind: "mesh.builds",
+                      label: "Mesh Build Pipeline",
+                      nodeId: "model:mesh:builds",
+                      objectId: null,
+                      ref: null,
+                    },
+                    "mesh",
+                  )
+                }
+              >
+                View Mesh Pipeline
+              </Button>
+            </div>
+
+            <MeshBuildHistorySection
+              entries={buildHistoryEntries}
+              onRestore={onRestoreBuildToDraft}
+            />
+
+            <InspectorGroup
+              title="Diagnostics & Raw JSON Resources"
+              collapsible
+              defaultOpen={false}
+            >
+              <div className="grid min-w-0 gap-fm-inspector-group">
+                <JsonResourceSection sectionValue="json-report" title="Object Mesh Report JSON" value={report.data} />
+                <JsonResourceSection sectionValue="json-quality" title="Object Mesh Quality JSON" value={quality.data} />
+                <JsonResourceSection sectionValue="json-size-field" title="Object Size Field JSON" value={sizeField.data} />
+              </div>
+            </InspectorGroup>
           </div>
         </TabsContent>
       </Tabs>

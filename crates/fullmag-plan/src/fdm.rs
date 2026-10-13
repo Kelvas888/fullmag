@@ -8,40 +8,40 @@ use fullmag_ir::{
     DiscretizationHintsIR, EnergyTermIR, ExchangeBoundaryCondition, ExchangeCouplingModeIR,
     ExecutionPlanIR, ExecutionPrecision, FdmFftPlanIR, FdmGridCertificateIR, FdmLayerPlanIR,
     FdmMaterialIR, FdmMultilayerPlanIR, FdmMultilayerSummaryIR, FdmPlanIR, FdmPrecisionPolicyIR,
-    FrozenReferencePolicyIR, GeometryEntryIR, GridDimensions, IR_VERSION, InitialMagnetizationIR,
+    FrozenReferencePolicyIR, GeometryEntryIR, GridDimensions, InitialMagnetizationIR,
     IntegratorChoice, OutputPlanIR, ProblemIR, ProvenancePlanIR, RegionFrameIR, RegionShapeIR,
     RelaxationAlgorithmIR, SeedPolicy, SelectionMembershipPolicyIR, ThermalSeedConfig,
-    TimeDependenceIR,
+    TimeDependenceIR, IR_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::antenna_zeeman::{has_prescribed_zeeman_mask_source, resolve_prescribed_zeeman_masks};
 use crate::current_transport::{
-    CurrentTransportExecutableLane, resolve_current_transports,
-    resolve_fdm_gpu_charge_transports_with_active_graph,
+    resolve_current_transports, resolve_fdm_gpu_charge_transports_with_active_graph,
+    CurrentTransportExecutableLane,
 };
 use crate::error::PlanError;
 use crate::geometry::{
-    FDM_GRID_ESTIMATED_BYTES_PER_CELL, GeometryShape, LoweredBody, cell_for_magnet,
-    checked_fdm_grid_cost, extract_multilayer_geometry, fdm_default_cell, ir_to_shape,
-    shape_local_bounds, validate_realized_grid, voxelize_shape,
+    cell_for_magnet, checked_fdm_grid_cost, extract_multilayer_geometry, fdm_default_cell,
+    ir_to_shape, shape_local_bounds, validate_realized_grid, voxelize_shape, GeometryShape,
+    LoweredBody, FDM_GRID_ESTIMATED_BYTES_PER_CELL,
 };
 use crate::magnetization_textures::TextureSamplePoint;
 use crate::magnetization_textures_v2::sample_preset_texture_versioned;
-use crate::oersted::{ResolvedOerstedTerm, resolve_fdm_oersted_term};
-use crate::region_conflict::{RegionConflictCandidate, resolve_region_conflict};
+use crate::oersted::{resolve_fdm_oersted_term, ResolvedOerstedTerm};
+use crate::region_conflict::{resolve_region_conflict, RegionConflictCandidate};
 use crate::region_textures::sample_region_initial_on_mask;
 use crate::selection::geometry::{contains_point, geometry_entry_bounds, normalize_axis};
 use crate::selection::{
-    FdmFrozenSpinsDomain, FrozenSpinsCompileRequest, ResolvedFrozenSpinsReference,
-    SelectionDofMembership, compile_fdm_frozen_spins, compile_fdm_points_frozen_spins,
+    compile_fdm_frozen_spins, compile_fdm_points_frozen_spins, FdmFrozenSpinsDomain,
+    FrozenSpinsCompileRequest, ResolvedFrozenSpinsReference, SelectionDofMembership,
 };
 use crate::spin_torque::{
-    SpinTorqueExecutableLane, resolve_legacy_spin_torque, resolve_sot_fields,
+    resolve_legacy_spin_torque, resolve_sot_fields, SpinTorqueExecutableLane,
 };
 use crate::util::{
-    GRID_TOLERANCE, MU0, active_stage_id, generate_random_unit_vectors, runtime_device_request,
-    runtime_requests_cuda,
+    active_stage_id, generate_random_unit_vectors, runtime_device_request, runtime_requests_cuda,
+    GRID_TOLERANCE, MU0,
 };
 
 use crate::validate::{
@@ -2333,6 +2333,56 @@ fn transport_common_grid(
     ))
 }
 
+/// Match the scalar local terms instantiated by the FDM runtime. Only a
+/// material used by a magnet can provide an interaction for this problem.
+fn has_referenced_material_anisotropy(problem: &ProblemIR) -> bool {
+    let nonzero_finite = |coefficients: &[Option<f64>]| {
+        coefficients.iter().flatten().all(|value| value.is_finite())
+            && coefficients.iter().flatten().any(|value| *value != 0.0)
+    };
+    let unit_axis = |axis: [f64; 3]| {
+        let squared_norm = axis.iter().map(|value| value * value).sum::<f64>();
+        if !squared_norm.is_finite() || squared_norm <= 0.0 {
+            return None;
+        }
+        normalize_axis(axis).ok()
+    };
+    problem.magnets.iter().any(|magnet| {
+        let Some(material) = problem
+            .materials
+            .iter()
+            .find(|item| item.name == magnet.material)
+        else {
+            return false;
+        };
+        let has_uniaxial = material.uniaxial_anisotropy.is_some()
+            && nonzero_finite(&[
+                material.uniaxial_anisotropy,
+                material.uniaxial_anisotropy_k2,
+            ])
+            && unit_axis(material.anisotropy_axis.unwrap_or([0.0, 0.0, 1.0])).is_some();
+        let has_cubic = nonzero_finite(&[
+            material.cubic_anisotropy_kc1,
+            material.cubic_anisotropy_kc2,
+            material.cubic_anisotropy_kc3,
+        ]) && match (
+            unit_axis(material.cubic_anisotropy_axis1.unwrap_or([1.0, 0.0, 0.0])),
+            unit_axis(material.cubic_anisotropy_axis2.unwrap_or([0.0, 1.0, 0.0])),
+        ) {
+            (Some(first), Some(second)) => {
+                let cross = [
+                    first[1] * second[2] - first[2] * second[1],
+                    first[2] * second[0] - first[0] * second[2],
+                    first[0] * second[1] - first[1] * second[0],
+                ];
+                cross.iter().map(|value| value * value).sum::<f64>() > 0.0
+            }
+            _ => false,
+        };
+        has_uniaxial || has_cubic
+    })
+}
+
 pub(crate) fn plan_fdm(
     problem: &ProblemIR,
     resolved_backend: BackendTarget,
@@ -2489,10 +2539,11 @@ pub(crate) fn plan_fdm(
         || enable_demag
         || external_field.is_some()
         || has_static_field_map
-        || has_rotated_interfacial_dmi)
+        || has_rotated_interfacial_dmi
+        || has_referenced_material_anisotropy(problem))
     {
         errors.push(
-        "the current executable FDM path requires at least one of Exchange, Demag, Zeeman, StaticFieldMap, or RotatedInterfacialDmi"
+        "the current executable FDM path requires Exchange, Demag, Zeeman, StaticFieldMap, RotatedInterfacialDmi, or nonzero anisotropy in a referenced material"
                 .to_string(),
         );
     }
@@ -3071,7 +3122,11 @@ pub(crate) fn plan_fdm(
             let is_uniform = v
                 .iter()
                 .all(|&val| (val - material.saturation_magnetisation).abs() <= 1e-12);
-            if is_uniform { None } else { Some(v) }
+            if is_uniform {
+                None
+            } else {
+                Some(v)
+            }
         }
         Err(e) => {
             errors.push(e);
@@ -3104,7 +3159,11 @@ pub(crate) fn plan_fdm(
             let is_uniform = v
                 .iter()
                 .all(|&val| (val - material.exchange_stiffness).abs() <= 1e-12);
-            if is_uniform { None } else { Some(v) }
+            if is_uniform {
+                None
+            } else {
+                Some(v)
+            }
         }
         Err(e) => {
             errors.push(e);
@@ -3127,7 +3186,11 @@ pub(crate) fn plan_fdm(
     let alpha_field_opt = match alpha_field_resolved {
         Ok(v) => {
             let is_uniform = v.iter().all(|&val| (val - material.damping).abs() <= 1e-12);
-            if is_uniform { None } else { Some(v) }
+            if is_uniform {
+                None
+            } else {
+                Some(v)
+            }
         }
         Err(e) => {
             errors.push(e);
@@ -4282,10 +4345,11 @@ pub(crate) fn plan_fdm_multilayer(
     if !(enable_exchange
         || enable_demag
         || external_field.is_some()
-        || rotated_interfacial_dmi.is_some())
+        || rotated_interfacial_dmi.is_some()
+        || has_referenced_material_anisotropy(problem))
     {
         errors.push(
-            "the current executable multilayer FDM path requires at least one of Exchange, Demag, Zeeman, or RotatedInterfacialDmi"
+            "the current executable multilayer FDM path requires Exchange, Demag, Zeeman, RotatedInterfacialDmi, or nonzero anisotropy in a referenced material"
                 .to_string(),
         );
     }
@@ -4996,15 +5060,13 @@ pub(crate) fn plan_fdm_multilayer(
                 let pair_count =
                     u32::try_from(resolved.catalog.pair_bindings.len()).map_err(|_| PlanError {
                         reasons: vec![
-                            "multilayer_convolution pair kernel telemetry exceeds u32".to_string(),
+                            "multilayer_convolution pair kernel telemetry exceeds u32".to_string()
                         ],
                     })?;
                 let unique_count =
                     u32::try_from(resolved.catalog.keys.len()).map_err(|_| PlanError {
-                        reasons: vec![
-                            "multilayer_convolution unique kernel telemetry exceeds u32"
-                                .to_string(),
-                        ],
+                        reasons: vec!["multilayer_convolution unique kernel telemetry exceeds u32"
+                            .to_string()],
                     })?;
                 if resolved.aggregate_bytes > crate::FDM_GRID_MAX_BYTES {
                     errors.push(format!(

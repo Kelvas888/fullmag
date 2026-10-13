@@ -1,8 +1,8 @@
 //! Shared API error type.
 
-use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::Serialize;
 use std::fmt;
 
@@ -78,6 +78,19 @@ impl ApiError {
     ) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
+            code: Some(code.into()),
+            message: message.into(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn with_status_and_code(
+        status: StatusCode,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
             code: Some(code.into()),
             message: message.into(),
             diagnostics: Vec::new(),

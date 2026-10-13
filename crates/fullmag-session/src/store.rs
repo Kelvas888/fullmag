@@ -33,6 +33,17 @@ use crate::solution_set_catalog::SolutionSetCatalog;
 use crate::types::*;
 use crate::writer::{WriteTransaction, Writer};
 
+const MAX_TASK_ADMISSION_RECORD_BYTES: usize = 1024 * 1024;
+
+mod development_commit;
+mod development_completion;
+mod development_fence;
+pub use development_commit::DevelopmentHandoffCommit;
+pub use development_completion::{
+    DevelopmentHandoffCompletionAuthorization, DevelopmentReplacementIdentity,
+};
+pub use development_fence::DevelopmentAdmissionFence;
+
 /// Admission was refused because the durable non-terminal run backlog reached
 /// its configured bound. The check and accepted-intent publication happen
 /// under the same native writer lease.
@@ -53,6 +64,26 @@ impl std::fmt::Display for RunBacklogFull {
 }
 
 impl std::error::Error for RunBacklogFull {}
+
+/// A checkpoint cannot be deleted because a durable record still names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointStillReferenced {
+    pub run_id: String,
+    pub checkpoint_id: String,
+    pub referenced_by: String,
+}
+
+impl std::fmt::Display for CheckpointStillReferenced {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "checkpoint `{}` of run `{}` is still referenced by {}",
+            self.checkpoint_id, self.run_id, self.referenced_by
+        )
+    }
+}
+
+impl std::error::Error for CheckpointStillReferenced {}
 
 /// The internal session store backed by a directory tree and a CAS.
 pub struct SessionStore {
@@ -147,8 +178,7 @@ impl SessionStore {
         let root = fs::canonicalize(root)?;
         let writer = Writer::new(root.clone());
         let cas = CasStore::existing(checked_path(&root, "objects")?, writer.clone())?;
-        let solution_sets =
-            SolutionSetCatalog::with_existing_writer(root.clone(), writer.clone());
+        let solution_sets = SolutionSetCatalog::with_existing_writer(root.clone(), writer.clone());
         Ok(Self {
             root,
             cas,
@@ -183,14 +213,24 @@ impl SessionStore {
         for geometry in crate::solution_field_geometry::verify_field_geometries_for_solution(
             &self.root, &self.cas, solution,
         )? {
-            register_solution_object(&mut referenced_objects, &geometry.object_ref, geometry.byte_length)?;
+            register_solution_object(
+                &mut referenced_objects,
+                &geometry.object_ref,
+                geometry.byte_length,
+            )?;
         }
         for member in &solution.members {
             for artifact in &member.artifacts {
                 if artifact.schema_id == crate::solution_tensor_source::SOLUTION_TENSOR_SCHEMA {
-                    let descriptor = crate::solution_tensor_source::verify_solution_tensor_payload(&self.cas, artifact)?;
+                    let descriptor = crate::solution_tensor_source::verify_solution_tensor_payload(
+                        &self.cas, artifact,
+                    )?;
                     for chunk in &descriptor.chunks {
-                        register_solution_object(&mut referenced_objects, &chunk.object_ref, chunk.length as u64)?;
+                        register_solution_object(
+                            &mut referenced_objects,
+                            &chunk.object_ref,
+                            chunk.length as u64,
+                        )?;
                     }
                 }
                 register_solution_object(
@@ -362,6 +402,253 @@ impl SessionStore {
 
     // ── Runs ───────────────────────────────────────────────────────────
 
+    /// Publish the immutable parent intent for a batch before child runs are
+    /// acknowledged. The request snapshot and source/manifest CAS references
+    /// share one writer lease and one atomic record publication boundary.
+    pub fn commit_batch_intent(
+        &self,
+        intent: &FmsBatchIntent,
+    ) -> Result<BatchIntentCommitDisposition> {
+        intent.validate()?;
+        let json = serde_json::to_vec_pretty(intent)?;
+        if json.len() as u64 > crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES {
+            anyhow::bail!("batch intent exceeds metadata budget");
+        }
+
+        let _lease = self.write_transaction()?;
+        for object_ref in [
+            intent.definition_object_ref.as_str(),
+            intent.study_object_ref.as_str(),
+            intent.study_catalog_object_ref.as_str(),
+        ] {
+            self.cas
+                .get(object_ref)?
+                .with_context(|| format!("batch intent CAS object `{object_ref}` is missing"))?;
+        }
+        let manifest_bytes = self
+            .cas
+            .get(&intent.manifest_object_ref)?
+            .context("batch expansion manifest object is missing")?;
+        intent.validate_manifest_bytes(&manifest_bytes)?;
+        for object_ref in intent.asset_object_refs.values() {
+            self.cas
+                .get(object_ref)?
+                .with_context(|| format!("batch asset object `{object_ref}` is missing"))?;
+        }
+
+        if let Some(existing) = self.find_batch_intent_unlocked(&intent.idempotency_key)? {
+            // OutputStorage is resolved by the server at the first Submit.
+            // A retry of the same client request must replay that accepted
+            // snapshot even if workspace defaults have since changed.
+            if existing.batch_id == intent.batch_id
+                && existing.specification.get("request") == intent.specification.get("request")
+                && existing.specification.get("manifest_sha256")
+                    == intent.specification.get("manifest_sha256")
+                && existing.manifest_object_ref == intent.manifest_object_ref
+                && existing.definition_object_ref == intent.definition_object_ref
+                && existing.study_object_ref == intent.study_object_ref
+                && existing.study_catalog_object_ref == intent.study_catalog_object_ref
+                && existing.asset_object_refs == intent.asset_object_refs
+            {
+                return Ok(BatchIntentCommitDisposition::Replayed {
+                    batch_id: existing.batch_id,
+                });
+            }
+            anyhow::bail!(
+                "batch idempotency key `{}` was already accepted for another payload",
+                intent.idempotency_key
+            );
+        }
+
+        self.ensure_development_admission_open_unlocked()?;
+        let relative_path = format!("batches/{}/batch_intent.json", intent.batch_id);
+        let path = checked_path(&self.root, &relative_path)?;
+        if path.exists() {
+            anyhow::bail!("batch intent path already exists for batch `{}`", intent.batch_id);
+        }
+        let path = create_parent(&self.root, &relative_path)?;
+        atomic_write(&path, &json)?;
+        Ok(BatchIntentCommitDisposition::Accepted)
+    }
+
+    /// Read the durable parent intent for one batch, if present.
+    pub fn read_batch_intent(&self, batch_id: &str) -> Result<Option<FmsBatchIntent>> {
+        validate_store_id(batch_id)?;
+        let relative = format!("batches/{batch_id}/batch_intent.json");
+        let path = checked_path(&self.root, &relative)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        reject_link(&path)?;
+        let mut data = Vec::new();
+        fs::File::open(&path)?
+            .take(crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES + 1)
+            .read_to_end(&mut data)?;
+        if data.len() as u64 > crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES {
+            anyhow::bail!("batch intent exceeds metadata budget");
+        }
+        let intent: FmsBatchIntent = serde_json::from_slice(&data)?;
+        intent.validate()?;
+        if intent.batch_id != batch_id {
+            anyhow::bail!("batch intent identity does not match its path");
+        }
+        let manifest_bytes = self
+            .cas
+            .get(&intent.manifest_object_ref)?
+            .context("batch expansion manifest object is missing")?;
+        intent.validate_manifest_bytes(&manifest_bytes)?;
+        Ok(Some(intent))
+    }
+
+    /// Find an accepted batch intent by idempotency key after a process restart.
+    pub fn find_batch_intent(&self, idempotency_key: &str) -> Result<Option<FmsBatchIntent>> {
+        validate_store_id(idempotency_key)?;
+        self.find_batch_intent_unlocked(idempotency_key)
+    }
+
+    /// Enumerate durable batch parents and reject linked or malformed entries.
+    pub fn list_batch_intents(&self) -> Result<Vec<FmsBatchIntent>> {
+        let directory = checked_path(&self.root, "batches")?;
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut intents = Vec::new();
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            reject_link(&entry.path())?;
+            if !entry.file_type()?.is_dir() {
+                anyhow::bail!("unsupported batch entry `{}`", entry.path().display());
+            }
+            let batch_id = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 batch identifier"))?;
+            validate_store_id(&batch_id)?;
+            let intent = self
+                .read_batch_intent(&batch_id)?
+                .with_context(|| format!("batch directory `{batch_id}` has no intent"))?;
+            intents.push(intent);
+        }
+        intents.sort_by(|left, right| {
+            right
+                .accepted_at
+                .cmp(&left.accepted_at)
+                .then_with(|| right.batch_id.cmp(&left.batch_id))
+        });
+        Ok(intents)
+    }
+
+    fn find_batch_intent_unlocked(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<FmsBatchIntent>> {
+        let mut found = None;
+        for intent in self.list_batch_intents()? {
+            if intent.idempotency_key != idempotency_key {
+                continue;
+            }
+            if found.is_some() {
+                anyhow::bail!(
+                    "batch idempotency key `{idempotency_key}` appears more than once"
+                );
+            }
+            found = Some(intent);
+        }
+        Ok(found)
+    }
+
+    /// Read the durable expansion cursor for one accepted batch.
+    pub fn read_batch_expansion_progress(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<FmsBatchExpansionProgress>> {
+        validate_store_id(batch_id)?;
+        let relative = format!("batches/{batch_id}/expansion_progress.json");
+        let path = checked_path(&self.root, &relative)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        reject_link(&path)?;
+        let mut data = Vec::new();
+        fs::File::open(&path)?
+            .take(crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES + 1)
+            .read_to_end(&mut data)?;
+        if data.len() as u64 > crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES {
+            anyhow::bail!("batch expansion progress exceeds metadata budget");
+        }
+        let progress: FmsBatchExpansionProgress = serde_json::from_slice(&data)?;
+        let intent = self
+            .read_batch_intent(batch_id)?
+            .context("batch expansion progress has no parent intent")?;
+        let manifest_bytes = self
+            .cas
+            .get(&intent.manifest_object_ref)?
+            .context("batch expansion manifest object is missing")?;
+        progress.validate_for_manifest(&intent, &manifest_bytes)?;
+        Ok(Some(progress))
+    }
+
+    /// Advance a batch's durable child-publication cursor under a sequence
+    /// fence. Replaying the exact latest checkpoint is idempotent.
+    pub fn commit_batch_expansion_progress(
+        &self,
+        expected_sequence: u64,
+        progress: &FmsBatchExpansionProgress,
+    ) -> Result<BatchExpansionProgressCommitDisposition> {
+        progress.validate()?;
+        let json = serde_json::to_vec_pretty(progress)?;
+        if json.len() as u64 > crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES {
+            anyhow::bail!("batch expansion progress exceeds metadata budget");
+        }
+        let _lease = self.write_transaction()?;
+        let intent = self
+            .read_batch_intent(&progress.batch_id)?
+            .context("batch expansion progress parent intent is missing")?;
+        let manifest_bytes = self
+            .cas
+            .get(&intent.manifest_object_ref)?
+            .context("batch expansion manifest object is missing")?;
+        progress.validate_for_manifest(&intent, &manifest_bytes)?;
+
+        let relative = format!("batches/{}/expansion_progress.json", progress.batch_id);
+        let path = checked_path(&self.root, &relative)?;
+        if path.exists() {
+            reject_link(&path)?;
+            let mut data = Vec::new();
+            fs::File::open(&path)?
+                .take(crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES + 1)
+                .read_to_end(&mut data)?;
+            if data.len() as u64 > crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES {
+                anyhow::bail!("batch expansion progress exceeds metadata budget");
+            }
+            let current: FmsBatchExpansionProgress = serde_json::from_slice(&data)?;
+            current.validate_for_manifest(&intent, &manifest_bytes)?;
+            if current == *progress {
+                return Ok(BatchExpansionProgressCommitDisposition::Replayed);
+            }
+            if current.sequence != expected_sequence {
+                anyhow::bail!(
+                    "batch expansion progress sequence conflict: expected {expected_sequence}, found {}",
+                    current.sequence
+                );
+            }
+            if matches!(
+                current.state,
+                FmsBatchExpansionState::Complete | FmsBatchExpansionState::Stopped
+            )
+                || progress.sequence != current.sequence.checked_add(1).context("batch progress sequence overflow")?
+                || progress.next_case_index < current.next_case_index
+            {
+                anyhow::bail!("batch expansion progress cannot move backward or past completion");
+            }
+        } else if expected_sequence != 0 || progress.sequence != 1 {
+            anyhow::bail!("first batch expansion progress must start at sequence 1");
+        }
+        let path = create_parent(&self.root, &relative)?;
+        atomic_write(&path, &json)?;
+        Ok(BatchExpansionProgressCommitDisposition::Accepted)
+    }
+
     /// Publish an accepted Submit intent before acknowledging the request.
     ///
     /// The record is a single atomic JSON publication boundary.  Repeating
@@ -432,6 +719,7 @@ impl SessionStore {
             );
         }
 
+        self.ensure_development_admission_open_unlocked()?;
         let relative_path = format!("runs/{}/run_intent.json", intent.run_id);
         let path = checked_path(&self.root, &relative_path)?;
         if path.exists() {
@@ -586,10 +874,8 @@ impl SessionStore {
         let path = create_parent(&self.root, &relative)?;
         if path.exists() {
             reject_link(&path)?;
-            let existing: FmsSchedulerPoolCheckpoint =
-                serde_json::from_slice(&fs::read(&path)?).with_context(|| {
-                    format!("parsing scheduler pool checkpoint `{relative}`")
-                })?;
+            let existing: FmsSchedulerPoolCheckpoint = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| format!("parsing scheduler pool checkpoint `{relative}`"))?;
             existing.validate()?;
             if existing == *checkpoint {
                 return Ok(SchedulerPoolCheckpointCommitDisposition::Replayed);
@@ -626,9 +912,7 @@ impl SessionStore {
             })?;
         checkpoint.validate()?;
         if checkpoint.pool_id != pool_id {
-            anyhow::bail!(
-                "preparation scheduler pool checkpoint identity does not match its path"
-            );
+            anyhow::bail!("preparation scheduler pool checkpoint identity does not match its path");
         }
         Ok(Some(checkpoint))
     }
@@ -650,15 +934,12 @@ impl SessionStore {
             anyhow::bail!("preparation scheduler pool checkpoint sequence is not contiguous");
         }
         let _writer_lease = self.write_transaction()?;
-        let relative = format!(
-            "scheduler_pools/{}.preparation.json",
-            checkpoint.pool_id
-        );
+        let relative = format!("scheduler_pools/{}.preparation.json", checkpoint.pool_id);
         let path = create_parent(&self.root, &relative)?;
         if path.exists() {
             reject_link(&path)?;
-            let existing: FmsSchedulerPoolCheckpoint =
-                serde_json::from_slice(&fs::read(&path)?).with_context(|| {
+            let existing: FmsSchedulerPoolCheckpoint = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| {
                     format!("parsing preparation scheduler pool checkpoint `{relative}`")
                 })?;
             existing.validate()?;
@@ -716,17 +997,13 @@ impl SessionStore {
         let path = create_parent(&self.root, &relative)?;
         if path.exists() {
             reject_link(&path)?;
-            let existing: FmsSchedulerResourcePool =
-                serde_json::from_slice(&fs::read(&path)?).with_context(|| {
-                    format!("parsing scheduler resource pool `{relative}`")
-                })?;
+            let existing: FmsSchedulerResourcePool = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| format!("parsing scheduler resource pool `{relative}`"))?;
             existing.validate()?;
             if existing == *pool {
                 return Ok(SchedulerResourcePoolCommitDisposition::Replayed);
             }
-            if existing.pool_id != pool.pool_id
-                || existing.generation != expected_generation
-            {
+            if existing.pool_id != pool.pool_id || existing.generation != expected_generation {
                 anyhow::bail!("scheduler resource pool compare-and-swap conflict");
             }
         } else if expected_generation != 0 {
@@ -777,17 +1054,13 @@ impl SessionStore {
         let path = create_parent(&self.root, &relative)?;
         if path.exists() {
             reject_link(&path)?;
-            let existing: FmsPreparationResourcePool =
-                serde_json::from_slice(&fs::read(&path)?).with_context(|| {
-                    format!("parsing preparation resource pool `{relative}`")
-                })?;
+            let existing: FmsPreparationResourcePool = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| format!("parsing preparation resource pool `{relative}`"))?;
             existing.validate()?;
             if existing == *pool {
                 return Ok(PreparationResourcePoolCommitDisposition::Replayed);
             }
-            if existing.pool_id != pool.pool_id
-                || existing.generation != expected_generation
-            {
+            if existing.pool_id != pool.pool_id || existing.generation != expected_generation {
                 anyhow::bail!("preparation resource pool compare-and-swap conflict");
             }
         } else if expected_generation != 0 {
@@ -830,6 +1103,21 @@ impl SessionStore {
         catalog: &FmsRunCatalog,
         allow_genesis_publication: bool,
     ) -> Result<()> {
+        // Terminal projections and shutdown receipts remain writable while a
+        // development handoff fences every operation which creates work.
+        if catalog.tasks.is_empty()
+            || catalog.tasks.iter().any(|task| {
+                !matches!(
+                    task.lifecycle,
+                    FmsTaskLifecycle::Succeeded
+                        | FmsTaskLifecycle::Failed
+                        | FmsTaskLifecycle::Cancelled
+                        | FmsTaskLifecycle::Interrupted
+                )
+            })
+        {
+            self.ensure_development_admission_open_unlocked()?;
+        }
         let path = checked_path(
             &self.root,
             &format!("runs/{}/run_catalog.json", catalog.run_id),
@@ -1181,6 +1469,9 @@ impl SessionStore {
     ) -> Result<RetryDecisionCommitDisposition> {
         decision.validate()?;
         let _lease = self.write_transaction()?;
+        if decision.action == FmsRetryAction::Retry {
+            self.ensure_development_admission_open_unlocked()?;
+        }
         let mut catalog = self
             .read_run_catalog(&decision.run_id)?
             .context("retry decision requires a durable run catalog")?;
@@ -1240,6 +1531,9 @@ impl SessionStore {
     ) -> Result<RetryDecisionApplyDisposition> {
         decision.validate()?;
         let _lease = self.write_transaction()?;
+        if decision.action == FmsRetryAction::Retry {
+            self.ensure_development_admission_open_unlocked()?;
+        }
         let mut catalog = self
             .read_run_catalog(&decision.run_id)?
             .context("retry decision requires a durable run catalog")?;
@@ -1418,21 +1712,20 @@ impl SessionStore {
             .context("worker process exit receipt task is missing from the run catalog")?;
         receipt.validate_for_task(task)?;
         let lease = self
-            .read_resource_lease(
-                &receipt.run_id,
-                &receipt.resource_id,
-                &receipt.lease_token,
-            )?
+            .read_resource_lease(&receipt.run_id, &receipt.resource_id, &receipt.lease_token)?
             .context("worker process exit receipt requires its durable resource lease")?;
         receipt.validate_for_lease(&lease)?;
 
         let relative = receipt.relative_path()?;
         let path = checked_path(&self.root, &relative)?;
         if path.exists() {
-            let data = fs::read(&path)
-                .with_context(|| format!("reading worker process exit receipt {}", path.display()))?;
+            let data = fs::read(&path).with_context(|| {
+                format!("reading worker process exit receipt {}", path.display())
+            })?;
             let existing: FmsWorkerProcessExitReceipt = serde_json::from_slice(&data)
-                .with_context(|| format!("parsing worker process exit receipt {}", path.display()))?;
+                .with_context(|| {
+                    format!("parsing worker process exit receipt {}", path.display())
+                })?;
             existing.validate()?;
             if existing.relative_path()? != relative {
                 anyhow::bail!("worker process exit receipt identity does not match its path");
@@ -1458,9 +1751,7 @@ impl SessionStore {
     ) -> Result<Option<FmsWorkerProcessExitReceipt>> {
         validate_store_id(run_id)?;
         validate_store_id(receipt_id)?;
-        let relative = format!(
-            "runs/{run_id}/worker_process_exit_receipts/{receipt_id}.json"
-        );
+        let relative = format!("runs/{run_id}/worker_process_exit_receipts/{receipt_id}.json");
         let path = checked_path(&self.root, &relative)?;
         if !path.exists() {
             return Ok(None);
@@ -1527,11 +1818,9 @@ impl SessionStore {
             .find(|task| task.task_id == receipt.task_id)
             .context("worker process exit recovery task is missing from the run catalog")?;
         receipt.validate_for_task(task)?;
-        let Some(lease) = self.read_resource_lease(
-            &receipt.run_id,
-            &receipt.resource_id,
-            &receipt.lease_token,
-        )? else {
+        let Some(lease) =
+            self.read_resource_lease(&receipt.run_id, &receipt.resource_id, &receipt.lease_token)?
+        else {
             return Ok(None);
         };
         if lease.state == FmsResourceLeaseState::Released {
@@ -1551,6 +1840,7 @@ impl SessionStore {
     ) -> Result<PreparationProcessLaunchCommitDisposition> {
         launch.validate()?;
         let _writer_lease = self.write_transaction()?;
+        self.ensure_development_admission_open_unlocked()?;
         let catalog = self
             .read_run_catalog(&launch.run_id)?
             .context("preparation process launch requires a durable run catalog")?;
@@ -1578,15 +1868,16 @@ impl SessionStore {
         let relative = launch.relative_path()?;
         let path = checked_path(&self.root, &relative)?;
         if path.exists() {
-            let existing: FmsPreparationProcessLaunch =
-                serde_json::from_slice(&fs::read(&path)?).with_context(|| {
-                    format!("parsing preparation process launch {}", path.display())
-                })?;
+            let existing: FmsPreparationProcessLaunch = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| {
+                format!("parsing preparation process launch {}", path.display())
+            })?;
             existing.validate()?;
             if existing.relative_path()? != relative {
                 anyhow::bail!("preparation process launch identity does not match its path");
             }
             if existing == *launch {
+                confirm_publication(&path)?;
                 return Ok(PreparationProcessLaunchCommitDisposition::Replayed);
             }
             anyhow::bail!(
@@ -1725,13 +2016,14 @@ impl SessionStore {
         if path.exists() {
             let existing: FmsPreparationProcessExitReceipt =
                 serde_json::from_slice(&fs::read(&path)?).with_context(|| {
-                    format!("parsing preparation process exit receipt {}", path.display())
+                    format!(
+                        "parsing preparation process exit receipt {}",
+                        path.display()
+                    )
                 })?;
             existing.validate()?;
             if existing.relative_path()? != relative {
-                anyhow::bail!(
-                    "preparation process exit receipt identity does not match its path"
-                );
+                anyhow::bail!("preparation process exit receipt identity does not match its path");
             }
             if existing == *receipt {
                 return Ok(PreparationProcessExitReceiptCommitDisposition::Replayed);
@@ -1755,16 +2047,18 @@ impl SessionStore {
     ) -> Result<Option<FmsPreparationProcessExitReceipt>> {
         validate_store_id(run_id)?;
         validate_store_id(receipt_id)?;
-        let relative =
-            format!("runs/{run_id}/preparation_process_exit_receipts/{receipt_id}.json");
+        let relative = format!("runs/{run_id}/preparation_process_exit_receipts/{receipt_id}.json");
         let path = checked_path(&self.root, &relative)?;
         if !path.exists() {
             return Ok(None);
         }
         let receipt: FmsPreparationProcessExitReceipt = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| {
-                format!("parsing preparation process exit receipt {}", path.display())
-            })?;
+            format!(
+                "parsing preparation process exit receipt {}",
+                path.display()
+            )
+        })?;
         if receipt.relative_path()? != relative {
             anyhow::bail!("preparation process exit receipt identity does not match its path");
         }
@@ -1817,7 +2111,8 @@ impl SessionStore {
             &receipt.run_id,
             &receipt.resource_id,
             &receipt.lease_token,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         if lease.state == FmsResourceLeaseState::Released {
@@ -1954,10 +2249,10 @@ impl SessionStore {
         let path = checked_path(&self.root, &relative)?;
         if path.exists() {
             reject_link(&path)?;
-            let existing: FmsPreparationRetryDecision =
-                serde_json::from_slice(&fs::read(&path)?).with_context(|| {
-                    format!("parsing preparation retry decision {}", path.display())
-                })?;
+            let existing: FmsPreparationRetryDecision = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| {
+                format!("parsing preparation retry decision {}", path.display())
+            })?;
             existing.validate()?;
             if existing.relative_path()? != relative {
                 anyhow::bail!("preparation retry decision identity does not match its path");
@@ -1971,6 +2266,7 @@ impl SessionStore {
             );
         }
 
+        self.ensure_development_admission_open_unlocked()?;
         let catalog = self
             .read_run_catalog(&decision.run_id)?
             .context("preparation retry decision requires a durable run catalog")?;
@@ -2018,7 +2314,9 @@ impl SessionStore {
                 .insert(receipt.preparation_attempt_id.clone(), receipt)
                 .is_some()
             {
-                anyhow::bail!("preparation task has duplicate failed exit receipts for one attempt");
+                anyhow::bail!(
+                    "preparation task has duplicate failed exit receipts for one attempt"
+                );
             }
         }
         let target = failed_attempts
@@ -2081,9 +2379,7 @@ impl SessionStore {
     ) -> Result<Option<FmsPreparationRetryDecision>> {
         validate_store_id(run_id)?;
         validate_store_id(decision_id)?;
-        let relative = format!(
-            "runs/{run_id}/preparation_retry_decisions/{decision_id}.json"
-        );
+        let relative = format!("runs/{run_id}/preparation_retry_decisions/{decision_id}.json");
         let path = checked_path(&self.root, &relative)?;
         if !path.exists() {
             return Ok(None);
@@ -2168,7 +2464,9 @@ impl SessionStore {
             || task.attempt_id.is_some()
             || task.ownership_epoch.is_some()
             || task.resource_id.is_some()
-            || self.read_task_preparation_receipt(run_id, task_id)?.is_some()
+            || self
+                .read_task_preparation_receipt(run_id, task_id)?
+                .is_some()
             || self
                 .find_active_preparation_resource_lease_for_task_unlocked(run_id, task_id)?
                 .is_some()
@@ -2370,9 +2668,7 @@ impl SessionStore {
                 continue;
             }
             if existing.lease_token != entry.lease_token {
-                anyhow::bail!(
-                    "coordinator journal lease token changed within one task attempt"
-                );
+                anyhow::bail!("coordinator journal lease token changed within one task attempt");
             }
             match existing.direction {
                 FmsCoordinatorJournalDirection::Command => {
@@ -3008,16 +3304,27 @@ impl SessionStore {
         &self,
         lease: &FmsResourceLease,
     ) -> Result<TaskAdmissionCommitDisposition> {
+        self.commit_task_admission_with_inputs(lease, &None)
+    }
+
+    /// Durably admit a fresh claim together with its exact resolved inputs.
+    /// Replaying an attempt must supply the same captured input snapshot.
+    pub fn commit_task_admission_with_inputs(
+        &self,
+        lease: &FmsResourceLease,
+        resolved_inputs_snapshot: &Option<FmsResolvedInputsSnapshot>,
+    ) -> Result<TaskAdmissionCommitDisposition> {
         lease.validate()?;
+        if let Some(snapshot) = resolved_inputs_snapshot {
+            snapshot.validate()?;
+        }
         if lease.state != FmsResourceLeaseState::Active || lease.heartbeat_sequence != 0 {
             anyhow::bail!("task admission requires a fresh active resource lease");
         }
         let _writer_lease = self.write_transaction()?;
-        let record_path = self.task_admission_path(
-            &lease.run_id,
-            &lease.task_id,
-            &lease.attempt_id,
-        )?;
+        self.ensure_development_admission_open_unlocked()?;
+        let record_path =
+            self.task_admission_path(&lease.run_id, &lease.task_id, &lease.attempt_id)?;
         if record_path.exists() {
             let record: FmsTaskAdmissionRecord = serde_json::from_slice(&fs::read(&record_path)?)
                 .context("parsing durable task admission")?;
@@ -3027,10 +3334,19 @@ impl SessionStore {
                 || record.lease.budget != lease.budget
                 || record.lease.state != lease.state
                 || record.lease.heartbeat_sequence != lease.heartbeat_sequence
+                || record.resolved_inputs_snapshot != *resolved_inputs_snapshot
             {
-                anyhow::bail!("task admission attempt conflicts with its durable lease");
+                anyhow::bail!(
+                    "task admission attempt conflicts with its durable lease or resolved inputs"
+                );
             }
             return self.apply_task_admission_record_unlocked(&record);
+        }
+        if self
+            .read_task_cancellation_intent(&lease.run_id, &lease.task_id)?
+            .is_some()
+        {
+            anyhow::bail!("task cancellation intent blocks new solver admission");
         }
 
         let catalog = self
@@ -3078,6 +3394,7 @@ impl SessionStore {
             queued_task,
             task,
             lease: lease.clone(),
+            resolved_inputs_snapshot: resolved_inputs_snapshot.clone(),
         };
         record.validate()?;
 
@@ -3093,6 +3410,73 @@ impl SessionStore {
         )?;
         atomic_write(&record_path, &serde_json::to_vec_pretty(&record)?)?;
         self.apply_task_admission_record_unlocked(&record)
+    }
+
+    /// Read one durable task admission record by its exact run/task/attempt identity.
+    pub fn read_task_admission(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<FmsTaskAdmissionRecord>> {
+        let path = self.task_admission_path(run_id, task_id, attempt_id)?;
+        let relative_path = path
+            .strip_prefix(&self.root)
+            .context("task admission path is outside the session store")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let data = match crate::repository_path::read_bounded_regular_file(
+            &self.root,
+            &relative_path,
+            MAX_TASK_ADMISSION_RECORD_BYTES,
+        ) {
+            Ok(data) => data,
+            Err(error) => {
+                let is_not_found = error
+                    .downcast_ref::<std::io::Error>()
+                    .map(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    .unwrap_or(false);
+                if is_not_found {
+                    let root_metadata = fs::metadata(&self.root)
+                        .context("validating session store root after missing task admission")?;
+                    if !root_metadata.is_dir() {
+                        anyhow::bail!("session store root is not a directory");
+                    }
+                    return Ok(None);
+                }
+                return Err(error)
+                    .with_context(|| format!("reading task admission record {}", path.display()));
+            }
+        };
+        let record: FmsTaskAdmissionRecord = serde_json::from_slice(&data)
+            .with_context(|| format!("parsing task admission {}", path.display()))?;
+        record
+            .validate()
+            .with_context(|| format!("validating task admission {}", path.display()))?;
+        if record.lease.run_id != run_id
+            || record.lease.task_id != task_id
+            || record.task.task_id != task_id
+            || record.queued_task.task_id != task_id
+            || record.lease.attempt_id != attempt_id
+            || record.task.attempt_id.as_deref() != Some(attempt_id)
+        {
+            anyhow::bail!("task admission identity does not match its path");
+        }
+        Ok(Some(record))
+    }
+
+    /// Replay only the requested durable task admission record under the store writer lease.
+    pub fn reconcile_task_admission(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<TaskAdmissionCommitDisposition>> {
+        let _writer_lease = self.write_transaction()?;
+        let Some(record) = self.read_task_admission(run_id, task_id, attempt_id)? else {
+            return Ok(None);
+        };
+        self.apply_task_admission_record_unlocked(&record).map(Some)
     }
 
     /// Replay admission intents before scheduling after a process restart.
@@ -3135,8 +3519,10 @@ impl SessionStore {
                 if entry_path.extension().and_then(|value| value.to_str()) != Some("json") {
                     anyhow::bail!("task admission record must use the .json extension");
                 }
-                let record: FmsTaskAdmissionRecord = serde_json::from_slice(&fs::read(&entry_path)?)
-                    .with_context(|| format!("parsing task admission {}", entry_path.display()))?;
+                let record: FmsTaskAdmissionRecord =
+                    serde_json::from_slice(&fs::read(&entry_path)?).with_context(|| {
+                        format!("parsing task admission {}", entry_path.display())
+                    })?;
                 record.validate()?;
                 if record.lease.run_id != run_id
                     || record.task.task_id != task_id
@@ -3148,11 +3534,16 @@ impl SessionStore {
             }
         }
         records.sort_by(|left, right| {
-            (left.lease.ownership_epoch, &left.task.task_id, &left.lease.attempt_id).cmp(&(
-                right.lease.ownership_epoch,
-                &right.task.task_id,
-                &right.lease.attempt_id,
-            ))
+            (
+                left.lease.ownership_epoch,
+                &left.task.task_id,
+                &left.lease.attempt_id,
+            )
+                .cmp(&(
+                    right.lease.ownership_epoch,
+                    &right.task.task_id,
+                    &right.lease.attempt_id,
+                ))
         });
         records
             .iter()
@@ -3210,9 +3601,7 @@ impl SessionStore {
         if current.attempt_id.is_some() {
             anyhow::bail!("task admission conflicts with another current attempt");
         }
-        if catalog.revision < record.expected_catalog_revision
-            || current != &record.queued_task
-        {
+        if catalog.revision < record.expected_catalog_revision || current != &record.queued_task {
             anyhow::bail!("task admission source changed before replay");
         }
         if self
@@ -3267,6 +3656,7 @@ impl SessionStore {
             anyhow::bail!("resource lease acquisition requires active state");
         }
         let _writer_lease = self.write_transaction()?;
+        self.ensure_development_admission_open_unlocked()?;
         self.validate_resource_lease_owner_unlocked(lease, false)?;
         if self
             .find_active_preparation_resource_lease_unlocked(&lease.resource_id)?
@@ -3390,7 +3780,10 @@ impl SessionStore {
         let catalog = self
             .read_run_catalog(&lease.run_id)?
             .context("preparation resource lease requires a durable run catalog")?;
-        let task = catalog.tasks.iter().find(|task| task.task_id == lease.task_id);
+        let task = catalog
+            .tasks
+            .iter()
+            .find(|task| task.task_id == lease.task_id);
         let task_available = task.is_some_and(|task| {
             task.lifecycle == FmsTaskLifecycle::Accepted
                 && matches!(
@@ -3402,10 +3795,8 @@ impl SessionStore {
                 && task.ownership_epoch.is_none()
                 && task.resource_id.is_none()
         });
-        let authorization_sequence = self.preparation_attempt_authorization_sequence_unlocked(
-            &lease.run_id,
-            &lease.task_id,
-        )?;
+        let authorization_sequence = self
+            .preparation_attempt_authorization_sequence_unlocked(&lease.run_id, &lease.task_id)?;
         if !task_available
             || self
                 .read_task_preparation_receipt(&lease.run_id, &lease.task_id)?
@@ -3415,15 +3806,19 @@ impl SessionStore {
             return Ok(None);
         }
 
-        if let Some(existing) =
-            self.find_active_preparation_resource_lease_for_task_unlocked(
-                &lease.run_id,
-                &lease.task_id,
-            )?
-        {
+        if let Some(existing) = self.find_active_preparation_resource_lease_for_task_unlocked(
+            &lease.run_id,
+            &lease.task_id,
+        )? {
             if existing.identity_matches(lease) && existing.budget == lease.budget {
                 return Ok(Some(PreparationResourceLeaseCommitDisposition::Replayed));
             }
+            return Ok(None);
+        }
+        if self
+            .read_task_cancellation_intent(&lease.run_id, &lease.task_id)?
+            .is_some()
+        {
             return Ok(None);
         }
         if self
@@ -3443,13 +3838,12 @@ impl SessionStore {
         &self,
         lease: &FmsPreparationResourceLease,
     ) -> Result<PreparationResourceLeaseCommitDisposition> {
+        self.ensure_development_admission_open_unlocked()?;
         self.validate_preparation_resource_lease_owner_unlocked(lease)?;
-        if let Some(existing) =
-            self.find_active_preparation_resource_lease_for_task_unlocked(
-                &lease.run_id,
-                &lease.task_id,
-            )?
-        {
+        if let Some(existing) = self.find_active_preparation_resource_lease_for_task_unlocked(
+            &lease.run_id,
+            &lease.task_id,
+        )? {
             if existing.identity_matches(lease) && existing.budget == lease.budget {
                 return Ok(PreparationResourceLeaseCommitDisposition::Replayed);
             }
@@ -3484,6 +3878,12 @@ impl SessionStore {
                 lease.resource_id
             );
         }
+        if self
+            .read_task_cancellation_intent(&lease.run_id, &lease.task_id)?
+            .is_some()
+        {
+            anyhow::bail!("task cancellation intent blocks new preparation admission");
+        }
         let relative = lease.relative_path()?;
         let path = checked_path(&self.root, &relative)?;
         if path.exists() {
@@ -3508,9 +3908,8 @@ impl SessionStore {
         for value in [run_id, resource_id, lease_token] {
             validate_store_id(value)?;
         }
-        let relative = format!(
-            "runs/{run_id}/preparation_resource_leases/{resource_id}/{lease_token}.json"
-        );
+        let relative =
+            format!("runs/{run_id}/preparation_resource_leases/{resource_id}/{lease_token}.json");
         let path = checked_path(&self.root, &relative)?;
         if !path.exists() {
             return Ok(None);
@@ -3527,9 +3926,13 @@ impl SessionStore {
         &self,
     ) -> Result<Vec<FmsPreparationResourceLease>> {
         let runs = checked_path(&self.root, "runs")?;
-        if !runs.exists() {
-            return Ok(Vec::new());
+        match fs::symlink_metadata(&runs) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => anyhow::bail!("runs path is not a directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("reading runs directory metadata"),
         }
+        reject_link(&runs)?;
         let mut active = Vec::new();
         for run_entry in fs::read_dir(&runs)? {
             let run_entry = run_entry?;
@@ -3543,11 +3946,15 @@ impl SessionStore {
                 .map_err(|_| anyhow::anyhow!("non-UTF8 run identifier"))?;
             validate_store_id(&run_id)?;
             let root = run_entry.path().join("preparation_resource_leases");
-            if !root.exists() {
-                continue;
-            }
+            let metadata = match fs::symlink_metadata(&root) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).context("reading preparation lease directory metadata")
+                }
+            };
             reject_link(&root)?;
-            if !root.is_dir() {
+            if !metadata.is_dir() {
                 anyhow::bail!("preparation_resource_leases path is not a directory");
             }
             for resource_entry in fs::read_dir(&root)? {
@@ -3591,12 +3998,18 @@ impl SessionStore {
             }
         }
         active.sort_by(|left, right| {
-            (&left.run_id, &left.task_id, &left.resource_id, &left.lease_token).cmp(&(
-                &right.run_id,
-                &right.task_id,
-                &right.resource_id,
-                &right.lease_token,
-            ))
+            (
+                &left.run_id,
+                &left.task_id,
+                &left.resource_id,
+                &left.lease_token,
+            )
+                .cmp(&(
+                    &right.run_id,
+                    &right.task_id,
+                    &right.resource_id,
+                    &right.lease_token,
+                ))
         });
         Ok(active)
     }
@@ -3628,9 +4041,7 @@ impl SessionStore {
             anyhow::bail!("preparation resource lease heartbeat conflicts with durable payload");
         }
         if lease.heartbeat_sequence != current.heartbeat_sequence.saturating_add(1) {
-            anyhow::bail!(
-                "preparation resource lease heartbeat sequence must advance by one"
-            );
+            anyhow::bail!("preparation resource lease heartbeat sequence must advance by one");
         }
         atomic_write(&path, &serde_json::to_vec_pretty(lease)?)?;
         Ok(())
@@ -3645,6 +4056,19 @@ impl SessionStore {
             anyhow::bail!("preparation resource lease release requires active state");
         }
         let _writer_lease = self.write_transaction()?;
+        self.release_preparation_resource_lease_unlocked(lease)
+    }
+
+    /// Caller must hold the store writer transaction.
+    pub(crate) fn release_preparation_resource_lease_unlocked(
+        &self,
+        lease: &FmsPreparationResourceLease,
+    ) -> Result<()> {
+        lease.validate()?;
+        if lease.state != FmsResourceLeaseState::Active {
+            anyhow::bail!("preparation resource lease release requires active state");
+        }
+
         let relative = lease.relative_path()?;
         let path = checked_path(&self.root, &relative)?;
         let mut current: FmsPreparationResourceLease = serde_json::from_slice(&fs::read(&path)?)?;
@@ -3668,15 +4092,78 @@ impl SessionStore {
                     && receipt.lease_token == lease.lease_token
             })
         {
-            anyhow::bail!(
-                "preparation lease with a durable process exit must use finalization"
-            );
+            anyhow::bail!("preparation lease with a durable process exit must use finalization");
         }
         current.state = FmsResourceLeaseState::Released;
         current.released_at = Some(chrono::Utc::now());
         current.validate()?;
         atomic_write(&path, &serde_json::to_vec_pretty(&current)?)?;
         Ok(())
+    }
+
+    /// Scan durable files independently of the catalog projection. Caller must
+    /// hold the store writer; contradictory orphan leases still count as active.
+    pub(crate) fn has_active_solver_lease_for_task_unlocked(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<bool> {
+        validate_store_id(run_id)?;
+        validate_store_id(task_id)?;
+        let root = checked_path(&self.root, &format!("runs/{run_id}/resource_leases"))?;
+        let metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("reading solver lease directory metadata"),
+        };
+        reject_link(&root)?;
+        if !metadata.is_dir() {
+            anyhow::bail!("solver resource_leases path is not a directory");
+        }
+        let mut active = false;
+        for resource in fs::read_dir(&root)? {
+            let resource = resource?;
+            reject_link(&resource.path())?;
+            if !resource.file_type()?.is_dir() {
+                anyhow::bail!("solver lease resource entry is not a directory");
+            }
+            let resource_id = resource
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 solver lease resource identifier"))?;
+            validate_store_id(&resource_id)?;
+            for entry in fs::read_dir(resource.path())? {
+                let entry = entry?;
+                reject_link(&entry.path())?;
+                if !entry.file_type()?.is_file() {
+                    anyhow::bail!("solver lease entry is not a regular file");
+                }
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 solver lease filename"))?;
+                let token = name
+                    .strip_suffix(".json")
+                    .context("solver lease filename must end in .json")?;
+                validate_store_id(token)?;
+                let relative = format!("runs/{run_id}/resource_leases/{resource_id}/{name}");
+                let bytes = crate::repository_path::read_bounded_regular_file(
+                    &self.root,
+                    &relative,
+                    1024 * 1024,
+                )?;
+                let lease: FmsResourceLease = serde_json::from_slice(&bytes)?;
+                lease.validate()?;
+                if lease.run_id != run_id
+                    || lease.resource_id != resource_id
+                    || lease.lease_token != token
+                {
+                    anyhow::bail!("solver lease path identity mismatch");
+                }
+                active |= lease.task_id == task_id && lease.state == FmsResourceLeaseState::Active;
+            }
+        }
+        Ok(active)
     }
 
     /// Read the active lease for a task whose ownership is already recorded in
@@ -3872,6 +4359,15 @@ impl SessionStore {
             anyhow::bail!("resource lease release requires the active lease identity");
         }
         let _writer_lease = self.write_transaction()?;
+        self.release_resource_lease_unlocked(lease)
+    }
+
+    /// Caller must hold the store writer transaction.
+    pub(crate) fn release_resource_lease_unlocked(&self, lease: &FmsResourceLease) -> Result<()> {
+        lease.validate()?;
+        if lease.state != FmsResourceLeaseState::Active {
+            anyhow::bail!("resource lease release requires the active lease identity");
+        }
         let path = self.resource_lease_path(lease)?;
         let data = fs::read(&path)
             .with_context(|| format!("reading resource lease {}", path.display()))?;
@@ -3941,12 +4437,12 @@ impl SessionStore {
         }
         if !allow_terminal_reconciliation
             && matches!(
-            task.lifecycle,
-            FmsTaskLifecycle::Succeeded
-                | FmsTaskLifecycle::Failed
-                | FmsTaskLifecycle::Cancelled
-                | FmsTaskLifecycle::Interrupted
-        )
+                task.lifecycle,
+                FmsTaskLifecycle::Succeeded
+                    | FmsTaskLifecycle::Failed
+                    | FmsTaskLifecycle::Cancelled
+                    | FmsTaskLifecycle::Interrupted
+            )
         {
             anyhow::bail!("terminal task cannot acquire or renew a resource lease");
         }
@@ -4119,9 +4615,7 @@ impl SessionStore {
             .filter(|lease| lease.run_id == run_id && lease.task_id == task_id);
         let active = matching.next();
         if matching.next().is_some() {
-            anyhow::bail!(
-                "multiple active preparation leases found for task `{run_id}/{task_id}`"
-            );
+            anyhow::bail!("multiple active preparation leases found for task `{run_id}/{task_id}`");
         }
         Ok(active)
     }
@@ -4291,6 +4785,63 @@ impl SessionStore {
         }
         crate::reachability::walk_checkpoint(&self.root, &checkpoint)?.require_complete()?;
         Ok(Some(checkpoint))
+    }
+
+    /// Delete one committed checkpoint of a run under the writer lease.
+    ///
+    /// Returns `Ok(false)` when the checkpoint does not exist (idempotent).
+    /// Refuses with [`CheckpointStillReferenced`] while the run manifest names
+    /// it as the latest checkpoint. Only the checkpoint-owned directory
+    /// (`checkpoint.json`, `common_state.json`, per-checkpoint payload files)
+    /// is removed, with the commit marker first so an interrupted deletion
+    /// never leaves a readable checkpoint with missing payloads. CAS objects
+    /// are never removed here: reclaiming them is the job of `gc_preview` and
+    /// `gc_apply`, which re-mark reachability from the remaining roots.
+    pub fn delete_checkpoint(&self, run_id: &str, checkpoint_id: &str) -> Result<bool> {
+        validate_store_id(run_id)?;
+        validate_store_id(checkpoint_id)?;
+        let _lease = self.write_transaction()?;
+        let prefix = format!("runs/{run_id}/checkpoints/{checkpoint_id}");
+        let marker = checked_path(&self.root, &format!("{prefix}/checkpoint.json"))?;
+        if !marker.exists() {
+            return Ok(false);
+        }
+        // A checkpoint that fails its own integrity check is not silently dropped.
+        self.read_checkpoint(run_id, checkpoint_id)?
+            .context("checkpoint disappeared under the writer lease")?;
+        if let Some(run) = self.read_run(run_id)? {
+            if run.latest_checkpoint_ref.as_deref() == Some(&format!("{prefix}/checkpoint.json")) {
+                return Err(CheckpointStillReferenced {
+                    run_id: run_id.to_string(),
+                    checkpoint_id: checkpoint_id.to_string(),
+                    referenced_by: "the run manifest (latest checkpoint)".to_string(),
+                }
+                .into());
+            }
+        }
+        let dir = checked_path(&self.root, &prefix)?;
+        let mut children = Vec::new();
+        for child in fs::read_dir(&dir)? {
+            let child = child?;
+            reject_link(&child.path())?;
+            if !child.file_type()?.is_file() {
+                anyhow::bail!(
+                    "unsupported entry in checkpoint directory: {}",
+                    child.path().display()
+                );
+            }
+            children.push(child.path());
+        }
+        fs::remove_file(&marker)?;
+        sync_directory(&dir)?;
+        for child in children {
+            if child != marker {
+                fs::remove_file(&child)?;
+            }
+        }
+        fs::remove_dir(&dir)?;
+        sync_directory(dir.parent().expect("checkpoint directory has a parent"))?;
+        Ok(true)
     }
 
     // ── Tensor storage ─────────────────────────────────────────────────
@@ -4729,7 +5280,7 @@ fn validate_document_namespace(relative: &str) -> Result<()> {
     crate::repository_path::validate_relative_path(relative)?;
     if !matches!(
         relative.split('/').next(),
-        Some("project" | "manifest" | "runs" | "recovery" | "solutions")
+        Some("project" | "manifest" | "runs" | "recovery" | "solutions" | "batches")
     ) {
         anyhow::bail!("document writer cannot modify repository control files or CAS");
     }
@@ -4796,11 +5347,10 @@ mod tests {
                 .unwrap(),
             br#"{"revision":2}"#
         );
-        let generation_count = fs::read_dir(
-            root.join("live_command_journals/session-command-journal/generations"),
-        )
-        .unwrap()
-        .count();
+        let generation_count =
+            fs::read_dir(root.join("live_command_journals/session-command-journal/generations"))
+                .unwrap()
+                .count();
         assert_eq!(generation_count, 1);
 
         let report = crate::reachability::walk_store_root(
@@ -4811,9 +5361,8 @@ mod tests {
         assert!(report
             .file_refs
             .contains("live_command_journals/session-command-journal/CURRENT"));
-        assert!(report.file_refs.iter().any(|reference| reference.starts_with(
-            "live_command_journals/session-command-journal/generations/generation-"
-        )));
+        assert!(report.file_refs.iter().any(|reference| reference
+            .starts_with("live_command_journals/session-command-journal/generations/generation-")));
     }
 
     fn test_resource_lease(
@@ -4849,7 +5398,85 @@ mod tests {
             heartbeat_at: now,
             heartbeat_sequence: 0,
             released_at: None,
+            host_launch_binding: None,
         }
+    }
+
+    #[test]
+    fn raw_solver_lease_scan_finds_active_lease_after_catalog_claim_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path().join("session-store")).unwrap();
+        let run_id = "run-orphan-active-lease";
+        let task_id = "task-orphan-active-lease";
+        let now = Utc::now();
+        store
+            .commit_run_catalog(&FmsRunCatalog {
+                schema_version: FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: run_id.into(),
+                revision: 1,
+                updated_at: now,
+                tasks: vec![FmsTaskCatalogEntry {
+                    task_id: task_id.into(),
+                    input_fingerprint: "a".repeat(64),
+                    lifecycle: FmsTaskLifecycle::Queued,
+                    readiness: FmsTaskReadiness::Ready,
+                    observation: None,
+                    attempt_id: None,
+                    ownership_epoch: None,
+                    resolved_input_fingerprint: None,
+                    artifact_ids: Vec::new(),
+                    resource_id: None,
+                    coordinator_watermark: None,
+                    coordinator_genesis: None,
+                }],
+            })
+            .unwrap();
+
+        let lease = test_resource_lease(
+            run_id,
+            task_id,
+            "attempt-orphan-active-lease",
+            1,
+            "cpu-orphan-active-lease",
+            "lease-orphan-active-lease",
+            now,
+        );
+        assert_eq!(
+            store.commit_task_admission(&lease).unwrap(),
+            TaskAdmissionCommitDisposition::Admitted
+        );
+        assert_eq!(
+            store
+                .read_active_resource_lease_for_task(run_id, task_id)
+                .unwrap(),
+            Some(lease)
+        );
+
+        let mut contradictory_catalog = store.read_run_catalog(run_id).unwrap().unwrap();
+        contradictory_catalog.revision += 1;
+        contradictory_catalog.updated_at = Utc::now();
+        let task = contradictory_catalog
+            .tasks
+            .iter_mut()
+            .find(|task| task.task_id == task_id)
+            .unwrap();
+        task.lifecycle = FmsTaskLifecycle::Accepted;
+        task.readiness = FmsTaskReadiness::Blocked {
+            reason: FMS_TASK_AWAITING_PREPARATION_REASON.into(),
+        };
+        task.attempt_id = None;
+        task.ownership_epoch = None;
+        task.resource_id = None;
+        store.commit_run_catalog(&contradictory_catalog).unwrap();
+
+        assert!(store
+            .read_active_resource_lease_for_task(run_id, task_id)
+            .unwrap()
+            .is_none());
+        let _writer = store.write_transaction().unwrap();
+        assert!(store
+            .has_active_solver_lease_for_task_unlocked(run_id, task_id)
+            .unwrap());
     }
 
     #[test]
@@ -4955,6 +5582,183 @@ mod tests {
     }
 
     #[test]
+    fn durable_batch_intent_replays_original_batch_and_rejects_conflicts() {
+        #[cfg(windows)]
+        const OUTPUT_PARENT: &str = "C:/fullmag/results";
+        #[cfg(not(windows))]
+        const OUTPUT_PARENT: &str = "/tmp/fullmag/results";
+        #[cfg(windows)]
+        const CHANGED_OUTPUT_PARENT: &str = "C:/fullmag/new-results";
+        #[cfg(not(windows))]
+        const CHANGED_OUTPUT_PARENT: &str = "/tmp/fullmag/new-results";
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path().join("store")).unwrap();
+
+        let definition = store.cas().put(b"project definition").unwrap();
+        let study = store.cas().put(b"study plan").unwrap();
+        let study_catalog = store.cas().put(b"study catalog").unwrap();
+        let make_intent = |batch_id: &str, variant: &str| {
+            let mut manifest_value = serde_json::json!({
+                "schema_version": FMS_BATCH_EXPANSION_MANIFEST_SCHEMA,
+                "batch_id": batch_id,
+                "cases": [{ "case_id": "case-1" }],
+                "variant": variant,
+                "manifest_sha256": ""
+            });
+            let mut unsigned_manifest = manifest_value.clone();
+            unsigned_manifest
+                .as_object_mut()
+                .unwrap()
+                .remove("manifest_sha256");
+            let manifest_sha256 = canonical_json_sha256(&unsigned_manifest);
+            manifest_value["manifest_sha256"] = serde_json::json!(manifest_sha256);
+            let manifest_bytes = canonical_json_bytes(&manifest_value);
+            let manifest_object_ref = store.cas().put(&manifest_bytes).unwrap();
+            let output_settings = serde_json::json!({
+                "output_dir": OUTPUT_PARENT,
+                "temp_dir": null,
+                "data_format": "zarr",
+                "cleanup": "on_success",
+                "existing_output": "timestamp"
+            });
+            let workspace_defaults = serde_json::json!({
+                "output_parent": OUTPUT_PARENT,
+                "temp_parent": null,
+                "data_format": "zarr",
+                "cleanup": "on_success",
+                "existing_output": "timestamp"
+            });
+            let specification = serde_json::json!({
+                "schema_version": FMS_BATCH_SUBMIT_SNAPSHOT_SCHEMA,
+                "batch_id": batch_id,
+                "manifest_sha256": manifest_sha256,
+                "output_storage": {
+                    "schema_version": FMS_BATCH_OUTPUT_STORAGE_SNAPSHOT_SCHEMA,
+                    "source": "workspace_defaults",
+                    "settings_sha256": canonical_json_sha256(&output_settings),
+                    "workspace_defaults_sha256": canonical_json_sha256(&workspace_defaults),
+                    "settings": output_settings
+                },
+                "request": {
+                    "batch_id": batch_id,
+                    "template": {
+                        "snapshot": { "definition_sha256": definition },
+                        "study": { "plan_sha256": study },
+                        "study_catalog_sha256": study_catalog,
+                        "immutable_assets": []
+                    }
+                }
+            });
+            FmsBatchIntent::new(
+                batch_id,
+                "submit-batch-1",
+                specification,
+                manifest_object_ref,
+                definition.clone(),
+                study.clone(),
+                study_catalog.clone(),
+                BTreeMap::new(),
+            )
+        };
+        let first = make_intent("batch-1", "first");
+
+        assert_eq!(
+            store.commit_batch_intent(&first).unwrap(),
+            BatchIntentCommitDisposition::Accepted
+        );
+        assert_eq!(
+            store.commit_batch_intent(&first).unwrap(),
+            BatchIntentCommitDisposition::Replayed {
+                batch_id: "batch-1".into()
+            }
+        );
+        let mut replay_after_defaults_change = first.clone();
+        let changed_output_settings = serde_json::json!({
+            "output_dir": CHANGED_OUTPUT_PARENT,
+            "temp_dir": null,
+            "data_format": "zarr",
+            "cleanup": "always",
+            "existing_output": "error"
+        });
+        replay_after_defaults_change.specification["output_storage"]["settings"] =
+            changed_output_settings.clone();
+        replay_after_defaults_change.specification["output_storage"]["settings_sha256"] =
+            serde_json::json!(canonical_json_sha256(&changed_output_settings));
+        let changed_defaults = serde_json::json!({
+            "output_parent": CHANGED_OUTPUT_PARENT,
+            "temp_parent": null,
+            "data_format": "zarr",
+            "cleanup": "always",
+            "existing_output": "error"
+        });
+        replay_after_defaults_change.specification["output_storage"]
+            ["workspace_defaults_sha256"] =
+            serde_json::json!(canonical_json_sha256(&changed_defaults));
+        replay_after_defaults_change.payload_sha256 =
+            canonical_json_sha256(&replay_after_defaults_change.specification);
+        assert_ne!(
+            replay_after_defaults_change.payload_sha256,
+            first.payload_sha256
+        );
+        assert_eq!(
+            store.commit_batch_intent(&replay_after_defaults_change).unwrap(),
+            BatchIntentCommitDisposition::Replayed {
+                batch_id: "batch-1".into()
+            }
+        );
+        assert_eq!(
+            store.read_batch_intent("batch-1").unwrap(),
+            Some(first.clone())
+        );
+        let initial_progress = FmsBatchExpansionProgress::new(&first, 1, 0, 1).unwrap();
+        assert_eq!(
+            store
+                .commit_batch_expansion_progress(0, &initial_progress)
+                .unwrap(),
+            BatchExpansionProgressCommitDisposition::Accepted
+        );
+        assert_eq!(
+            store
+                .commit_batch_expansion_progress(0, &initial_progress)
+                .unwrap(),
+            BatchExpansionProgressCommitDisposition::Replayed
+        );
+        let completed_progress = FmsBatchExpansionProgress::new(&first, 1, 1, 2).unwrap();
+        assert_eq!(
+            store
+                .commit_batch_expansion_progress(1, &completed_progress)
+                .unwrap(),
+            BatchExpansionProgressCommitDisposition::Accepted
+        );
+        assert_eq!(
+            store.read_batch_expansion_progress("batch-1").unwrap(),
+            Some(completed_progress.clone())
+        );
+        let backwards_progress = FmsBatchExpansionProgress::new(&first, 1, 0, 3).unwrap();
+        assert!(store
+            .commit_batch_expansion_progress(2, &backwards_progress)
+            .is_err());
+        assert_eq!(store.find_batch_intent("submit-batch-1").unwrap(), Some(first.clone()));
+        assert_eq!(store.list_batch_intents().unwrap(), vec![first]);
+
+        let conflict = make_intent("batch-2", "different expansion");
+        assert!(store.commit_batch_intent(&conflict).is_err());
+        assert!(store.read_batch_intent("batch-2").unwrap().is_none());
+
+        let mut missing = make_intent("batch-3", "missing");
+        missing.manifest_object_ref = "f".repeat(64);
+        assert!(store.commit_batch_intent(&missing).is_err());
+        assert!(store.read_batch_intent("batch-3").unwrap().is_none());
+
+        let mut mismatched_manifest = make_intent("batch-4", "mismatched logical digest");
+        mismatched_manifest.specification["manifest_sha256"] = serde_json::json!("0".repeat(64));
+        mismatched_manifest.payload_sha256 = canonical_json_sha256(&mismatched_manifest.specification);
+        assert!(store.commit_batch_intent(&mismatched_manifest).is_err());
+        assert!(store.read_batch_intent("batch-4").unwrap().is_none());
+    }
+
+    #[test]
     fn durable_run_intent_read_rejects_oversized_control_documents() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("store");
@@ -4991,7 +5795,11 @@ mod tests {
         let error = store.commit_run_intent(&intent).unwrap_err();
         assert!(error.to_string().contains("metadata budget"));
         assert!(store.read_run_intent(run_id).unwrap().is_none());
-        assert!(!root.join("runs").join(run_id).join("run_intent.json").exists());
+        assert!(!root
+            .join("runs")
+            .join(run_id)
+            .join("run_intent.json")
+            .exists());
     }
 
     #[test]
@@ -5023,9 +5831,7 @@ mod tests {
             crate::reachability::ReachabilityMode::Export,
         )
         .unwrap();
-        assert!(report
-            .file_refs
-            .contains("scheduler_pools/pool-a.json"));
+        assert!(report.file_refs.contains("scheduler_pools/pool-a.json"));
 
         let mut second = first.clone();
         second.sequence = 2;
@@ -5157,6 +5963,7 @@ mod tests {
             heartbeat_at: now,
             heartbeat_sequence: 0,
             released_at: None,
+            host_launch_binding: None,
         };
         assert_eq!(
             store
@@ -5204,7 +6011,9 @@ mod tests {
             .commit_preparation_process_exit_receipt(&failed_exit)
             .unwrap();
         assert_eq!(
-            store.finalize_preparation_process_exit(&failed_exit).unwrap(),
+            store
+                .finalize_preparation_process_exit(&failed_exit)
+                .unwrap(),
             PreparationProcessFinalizationDisposition::Failed
         );
         assert_eq!(
@@ -5318,9 +6127,7 @@ mod tests {
             ..empty.clone()
         };
         assert_eq!(
-            store
-                .commit_scheduler_resource_pool(1, &populated)
-                .unwrap(),
+            store.commit_scheduler_resource_pool(1, &populated).unwrap(),
             SchedulerResourcePoolCommitDisposition::Accepted
         );
         let report = crate::reachability::walk_store_root(
@@ -5328,11 +6135,9 @@ mod tests {
             crate::reachability::ReachabilityMode::Export,
         )
         .unwrap();
-        assert!(
-            report
-                .file_refs
-                .contains("scheduler_pools/pool-dynamic.resources.json")
-        );
+        assert!(report
+            .file_refs
+            .contains("scheduler_pools/pool-dynamic.resources.json"));
         assert!(store.commit_scheduler_resource_pool(1, &empty).is_err());
 
         let mut invalid = populated;
@@ -5700,6 +6505,70 @@ mod tests {
     }
 
     #[test]
+    fn delete_checkpoint_is_idempotent_refuses_referenced_and_leaves_cas_to_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path().join("session-store")).unwrap();
+        let mut run = FmsRunManifest {
+            run_id: "run-001".into(),
+            status: RunStatus::Running,
+            study_kind: "time_evolution".into(),
+            backend: "cpu".into(),
+            precision: "f64".into(),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            total_steps: 0,
+            total_time_s: 0.0,
+            plan_ref: None,
+            live_state_ref: None,
+            latest_checkpoint_ref: None,
+            artifact_index_ref: None,
+        };
+        store.commit_run(&run).unwrap();
+        let m_hash = store
+            .store_magnetization(&vec![[1.0, 0.0, 0.0]; 8])
+            .unwrap();
+        let cp = FmsCheckpoint::new("run-001", 42, 1e-9, 1e-13);
+        let state = CommonSolverState {
+            step: 42,
+            time_s: 1e-9,
+            dt: 1e-13,
+            energies: SolverEnergies::default(),
+            magnetization_ref: Some(m_hash.clone()),
+        };
+        store.commit_checkpoint(&cp, &state).unwrap();
+
+        // The run manifest names it as the latest checkpoint: refuse, keep it.
+        run.latest_checkpoint_ref = Some(format!(
+            "runs/run-001/checkpoints/{}/checkpoint.json",
+            cp.checkpoint_id
+        ));
+        store.commit_run(&run).unwrap();
+        let refused = store
+            .delete_checkpoint("run-001", &cp.checkpoint_id)
+            .unwrap_err();
+        assert!(refused
+            .downcast_ref::<CheckpointStillReferenced>()
+            .is_some());
+        assert_eq!(store.list_checkpoints("run-001").unwrap().len(), 1);
+
+        // Ingest pins retire once the checkpoint root proves the object.
+        store.release_published_pins().unwrap();
+        run.latest_checkpoint_ref = None;
+        store.commit_run(&run).unwrap();
+        assert!(!store.delete_checkpoint("run-001", "cp-unknown").unwrap());
+        assert!(store
+            .delete_checkpoint("run-001", &cp.checkpoint_id)
+            .unwrap());
+        assert!(!store
+            .delete_checkpoint("run-001", &cp.checkpoint_id)
+            .unwrap());
+        assert!(store.list_checkpoints("run-001").unwrap().is_empty());
+        // The CAS object is not removed directly; GC finds it unreferenced.
+        assert!(store.load_magnetization(&m_hash).unwrap().is_some());
+        assert!(store.gc_preview().unwrap().candidates.contains(&m_hash));
+    }
+
+    #[test]
     fn durable_resource_lease_is_fenced_and_explicitly_released() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::open(dir.path().join("session-store")).unwrap();
@@ -5747,6 +6616,7 @@ mod tests {
             heartbeat_at: now,
             heartbeat_sequence: 0,
             released_at: None,
+            host_launch_binding: None,
         };
         assert_eq!(
             store.commit_resource_lease(&lease).unwrap(),
@@ -6057,6 +6927,7 @@ mod tests {
             heartbeat_at: now,
             heartbeat_sequence: 0,
             released_at: None,
+            host_launch_binding: None,
         };
         store.commit_resource_lease(&lease).unwrap();
         let mut heartbeat_lease = lease.clone();
@@ -6645,6 +7516,7 @@ mod admission_tests {
             heartbeat_at: now,
             heartbeat_sequence: 0,
             released_at: None,
+            host_launch_binding: None,
         }
     }
 
@@ -6658,6 +7530,290 @@ mod admission_tests {
                 tasks,
             })
             .unwrap();
+    }
+
+    fn admission_record(
+        task_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        resource_id: &str,
+    ) -> FmsTaskAdmissionRecord {
+        let queued_task = queued_task(task_id);
+        let mut task = queued_task.clone();
+        task.lifecycle = FmsTaskLifecycle::Preparing;
+        task.attempt_id = Some(attempt_id.into());
+        task.ownership_epoch = Some(1);
+        task.resource_id = Some(resource_id.into());
+        let mut lease = lease(task_id, attempt_id, lease_token);
+        lease.resource_id = resource_id.into();
+        FmsTaskAdmissionRecord {
+            schema_version: FMS_TASK_ADMISSION_SCHEMA.into(),
+            expected_catalog_revision: 1,
+            queued_task,
+            task,
+            lease,
+            resolved_inputs_snapshot: None,
+        }
+    }
+
+    fn write_admission_record_at(
+        store: &SessionStore,
+        path_run_id: &str,
+        path_task_id: &str,
+        path_attempt_id: &str,
+        record: &FmsTaskAdmissionRecord,
+    ) {
+        let relative =
+            format!("runs/{path_run_id}/task_admissions/{path_task_id}/{path_attempt_id}.json");
+        let path = crate::repository_path::create_parent(store.root(), &relative).unwrap();
+        atomic_write(&path, &serde_json::to_vec_pretty(record).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn cancellation_blocks_new_admission_but_repairs_prior_durable_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(temp.path().join("session-store")).unwrap();
+        seed_catalog(&store, vec![queued_task("task-cancel")]);
+        let prior = admission_record("task-cancel", "attempt-prior", "lease-prior", "cpu-0");
+        write_admission_record_at(
+            &store,
+            "run-admission",
+            "task-cancel",
+            "attempt-prior",
+            &prior,
+        );
+        store
+            .request_task_cancellation_intent(
+                "run-admission",
+                "task-cancel",
+                "cancel-a",
+                1,
+                "user requested stop",
+            )
+            .unwrap();
+        let fresh = lease("task-cancel", "attempt-new", "lease-new");
+        assert!(store.commit_task_admission(&fresh).is_err());
+        assert!(store
+            .read_task_admission("run-admission", "task-cancel", "attempt-new",)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.commit_task_admission(&prior.lease).unwrap(),
+            TaskAdmissionCommitDisposition::Admitted
+        );
+        assert_eq!(
+            store.commit_task_admission(&prior.lease).unwrap(),
+            TaskAdmissionCommitDisposition::Replayed
+        );
+        assert!(store
+            .read_task_cancellation_intent("run-admission", "task-cancel",)
+            .unwrap()
+            .is_some());
+        let (disposition, _, revision) = store
+            .request_task_cancellation_intent(
+                "run-admission",
+                "task-cancel",
+                "cancel-a",
+                1,
+                "user requested stop",
+            )
+            .unwrap();
+        assert_eq!(
+            disposition,
+            crate::TaskCancellationIntentCommitDisposition::Replayed
+        );
+        assert_eq!(
+            revision,
+            store
+                .read_run_catalog("run-admission")
+                .unwrap()
+                .unwrap()
+                .revision
+        );
+    }
+
+    #[test]
+    fn cancellation_blocks_new_preparation_but_preserves_exact_active_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(temp.path().join("session-store")).unwrap();
+        let mut task = queued_task("task-prep-cancel");
+        task.lifecycle = FmsTaskLifecycle::Accepted;
+        task.readiness = FmsTaskReadiness::Blocked {
+            reason: FMS_TASK_AWAITING_PREPARATION_REASON.into(),
+        };
+        seed_catalog(&store, vec![task]);
+        let now = Utc::now();
+        let prior = FmsPreparationResourceLease {
+            schema_version: FMS_PREPARATION_RESOURCE_LEASE_SCHEMA.into(),
+            resource_id: "cpu-prep".into(),
+            budget: FmsResourceBudget {
+                cpu_millis: 1000,
+                memory_bytes: 1024,
+                gpu_memory_bytes: 0,
+                storage_bytes: 1024,
+            },
+            run_id: "run-admission".into(),
+            task_id: "task-prep-cancel".into(),
+            preparation_attempt_id: "prep-prior".into(),
+            lease_token: "prep-lease".into(),
+            state: FmsResourceLeaseState::Active,
+            acquired_at: now,
+            heartbeat_at: now,
+            heartbeat_sequence: 0,
+            released_at: None,
+            host_launch_binding: None,
+        };
+        assert_eq!(
+            store.commit_preparation_resource_lease(&prior).unwrap(),
+            PreparationResourceLeaseCommitDisposition::Acquired
+        );
+        store
+            .request_task_cancellation_intent(
+                "run-admission",
+                "task-prep-cancel",
+                "cancel-prep",
+                1,
+                "user requested stop",
+            )
+            .unwrap();
+        assert_eq!(
+            store.commit_preparation_resource_lease(&prior).unwrap(),
+            PreparationResourceLeaseCommitDisposition::Replayed
+        );
+        let mut fresh = prior.clone();
+        fresh.task_id = "task-prep-new".into();
+        fresh.preparation_attempt_id = "prep-new".into();
+        fresh.lease_token = "prep-new-lease".into();
+        fresh.resource_id = "cpu-prep-new".into();
+        let mut catalog = store.read_run_catalog("run-admission").unwrap().unwrap();
+        let mut new_task = catalog.tasks[0].clone();
+        new_task.task_id = fresh.task_id.clone();
+        catalog.tasks.push(new_task);
+        catalog.revision += 1;
+        store.commit_run_catalog(&catalog).unwrap();
+        store
+            .request_task_cancellation_intent(
+                "run-admission",
+                &fresh.task_id,
+                "cancel-new",
+                catalog.revision,
+                "stop new task",
+            )
+            .unwrap();
+        assert!(store.commit_preparation_resource_lease(&fresh).is_err());
+        assert!(store
+            .read_preparation_resource_lease(
+                "run-admission",
+                &fresh.resource_id,
+                &fresh.lease_token,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn targeted_task_admission_read_distinguishes_missing_from_corrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(temp.path().join("session-store")).unwrap();
+
+        assert!(store
+            .read_task_admission("run-admission", "task-admission-a", "attempt-a")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .reconcile_task_admission("run-admission", "task-admission-a", "attempt-a")
+            .unwrap()
+            .is_none());
+
+        let path = store
+            .task_admission_path("run-admission", "task-admission-a", "attempt-a")
+            .unwrap();
+        let relative = path
+            .strip_prefix(store.root())
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let path = crate::repository_path::create_parent(store.root(), &relative).unwrap();
+        fs::write(path, b"not-json").unwrap();
+        assert!(store
+            .read_task_admission("run-admission", "task-admission-a", "attempt-a")
+            .is_err());
+    }
+
+    #[test]
+    fn targeted_task_admission_read_rejects_lease_identity_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(temp.path().join("session-store")).unwrap();
+        let mut record = admission_record("task-admission-a", "attempt-a", "lease-a", "cpu-0");
+        record.lease.task_id = "task-admission-other".into();
+        write_admission_record_at(
+            &store,
+            "run-admission",
+            "task-admission-a",
+            "attempt-a",
+            &record,
+        );
+
+        assert!(store
+            .read_task_admission("run-admission", "task-admission-a", "attempt-a")
+            .is_err());
+    }
+
+    #[test]
+    fn targeted_task_admission_replay_does_not_reconcile_sibling_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(temp.path().join("session-store")).unwrap();
+        seed_catalog(
+            &store,
+            vec![
+                queued_task("task-admission-a"),
+                queued_task("task-admission-b"),
+            ],
+        );
+        let record_a = admission_record(
+            "task-admission-a",
+            "attempt-admission-a",
+            "lease-admission-a",
+            "cpu-a",
+        );
+        let record_b = admission_record(
+            "task-admission-b",
+            "attempt-admission-b",
+            "lease-admission-b",
+            "cpu-b",
+        );
+        write_admission_record_at(
+            &store,
+            "run-admission",
+            "task-admission-a",
+            "attempt-admission-a",
+            &record_a,
+        );
+        write_admission_record_at(
+            &store,
+            "run-admission",
+            "task-admission-b",
+            "attempt-admission-b",
+            &record_b,
+        );
+
+        assert_eq!(
+            store
+                .reconcile_task_admission(
+                    "run-admission",
+                    "task-admission-a",
+                    "attempt-admission-a"
+                )
+                .unwrap(),
+            Some(TaskAdmissionCommitDisposition::Admitted)
+        );
+        let catalog = store.read_run_catalog("run-admission").unwrap().unwrap();
+        assert_eq!(catalog.tasks[0].lifecycle, FmsTaskLifecycle::Preparing);
+        assert_eq!(catalog.tasks[1].lifecycle, FmsTaskLifecycle::Queued);
+        assert!(store
+            .read_task_admission("run-admission", "task-admission-b", "attempt-admission-b")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -6692,15 +7848,11 @@ mod admission_tests {
         };
 
         assert_eq!(
-            store
-                .commit_worker_process_exit_receipt(&receipt)
-                .unwrap(),
+            store.commit_worker_process_exit_receipt(&receipt).unwrap(),
             WorkerProcessExitReceiptCommitDisposition::Accepted
         );
         assert_eq!(
-            store
-                .commit_worker_process_exit_receipt(&receipt)
-                .unwrap(),
+            store.commit_worker_process_exit_receipt(&receipt).unwrap(),
             WorkerProcessExitReceiptCommitDisposition::Replayed
         );
         assert_eq!(
@@ -6743,7 +7895,11 @@ mod admission_tests {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::open(temp.path().join("session-store")).unwrap();
         seed_catalog(&store, vec![queued_task("task-admission-a")]);
-        let claim_lease = lease("task-admission-a", "attempt-admission-a", "lease-admission-a");
+        let claim_lease = lease(
+            "task-admission-a",
+            "attempt-admission-a",
+            "lease-admission-a",
+        );
 
         assert_eq!(
             store.commit_task_admission(&claim_lease).unwrap(),
@@ -6759,7 +7915,10 @@ mod admission_tests {
         let catalog = store.read_run_catalog("run-admission").unwrap().unwrap();
         assert_eq!(catalog.revision, 2);
         assert_eq!(catalog.tasks[0].lifecycle, FmsTaskLifecycle::Preparing);
-        assert_eq!(catalog.tasks[0].attempt_id.as_deref(), Some("attempt-admission-a"));
+        assert_eq!(
+            catalog.tasks[0].attempt_id.as_deref(),
+            Some("attempt-admission-a")
+        );
         assert_eq!(
             store
                 .read_active_resource_lease_for_task("run-admission", "task-admission-a")
@@ -6772,9 +7931,7 @@ mod admission_tests {
         assert!(lease_path.starts_with(&canonical_temp_root));
         fs::remove_file(lease_path).unwrap();
         assert_eq!(
-            store
-                .reconcile_task_admissions("run-admission")
-                .unwrap(),
+            store.reconcile_task_admissions("run-admission").unwrap(),
             vec![TaskAdmissionCommitDisposition::Replayed]
         );
         assert_eq!(
@@ -6794,16 +7951,73 @@ mod admission_tests {
     }
 
     #[test]
+    fn task_admission_replay_requires_identical_resolved_inputs_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(temp.path().join("session-store")).unwrap();
+        seed_catalog(&store, vec![queued_task("task-admission-a")]);
+        let claim_lease = lease(
+            "task-admission-a",
+            "attempt-admission-a",
+            "lease-admission-a",
+        );
+        let captured = Some(
+            FmsResolvedInputsSnapshot::new(serde_json::json!({
+                "optional-input": {
+                    "source": "artifact-a",
+                    "content_sha256": "a".repeat(64)
+                }
+            }))
+            .unwrap(),
+        );
+
+        assert_eq!(
+            store
+                .commit_task_admission_with_inputs(&claim_lease, &captured)
+                .unwrap(),
+            TaskAdmissionCommitDisposition::Admitted
+        );
+        assert_eq!(
+            store
+                .commit_task_admission_with_inputs(&claim_lease, &captured)
+                .unwrap(),
+            TaskAdmissionCommitDisposition::Replayed
+        );
+
+        let changed = Some(
+            FmsResolvedInputsSnapshot::new(serde_json::json!({
+                "optional-input": {
+                    "source": "artifact-b",
+                    "content_sha256": "b".repeat(64)
+                }
+            }))
+            .unwrap(),
+        );
+        assert!(store
+            .commit_task_admission_with_inputs(&claim_lease, &changed)
+            .is_err());
+        assert!(store.commit_task_admission(&claim_lease).is_err());
+        assert_eq!(
+            store
+                .read_task_admission("run-admission", "task-admission-a", "attempt-admission-a")
+                .unwrap()
+                .unwrap()
+                .resolved_inputs_snapshot,
+            captured
+        );
+    }
+
+    #[test]
     fn task_admission_recovery_finishes_a_persisted_intent_before_projection() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::open(temp.path().join("session-store")).unwrap();
         seed_catalog(&store, vec![queued_task("task-admission-a")]);
-        let mut catalog = store
-            .read_run_catalog("run-admission")
-            .unwrap()
-            .unwrap();
+        let mut catalog = store.read_run_catalog("run-admission").unwrap().unwrap();
         let queued = catalog.tasks.remove(0);
-        let claim_lease = lease("task-admission-a", "attempt-admission-a", "lease-admission-a");
+        let claim_lease = lease(
+            "task-admission-a",
+            "attempt-admission-a",
+            "lease-admission-a",
+        );
         let mut admitted = queued.clone();
         admitted.lifecycle = FmsTaskLifecycle::Preparing;
         admitted.readiness = FmsTaskReadiness::Ready;
@@ -6816,6 +8030,7 @@ mod admission_tests {
             queued_task: queued,
             task: admitted,
             lease: claim_lease.clone(),
+            resolved_inputs_snapshot: None,
         };
         record.validate().unwrap();
         let path = create_parent(
@@ -6826,14 +8041,15 @@ mod admission_tests {
         atomic_write(&path, &serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 
         assert_eq!(
-            store
-                .reconcile_task_admissions("run-admission")
-                .unwrap(),
+            store.reconcile_task_admissions("run-admission").unwrap(),
             vec![TaskAdmissionCommitDisposition::Admitted]
         );
         let catalog = store.read_run_catalog("run-admission").unwrap().unwrap();
         assert_eq!(catalog.revision, 2);
-        assert_eq!(catalog.tasks[0].attempt_id.as_deref(), Some("attempt-admission-a"));
+        assert_eq!(
+            catalog.tasks[0].attempt_id.as_deref(),
+            Some("attempt-admission-a")
+        );
         assert_eq!(
             store
                 .read_active_resource_lease_for_task("run-admission", "task-admission-a")
@@ -6853,7 +8069,10 @@ mod admission_tests {
         let store = SessionStore::open(temp.path().join("session-store")).unwrap();
         seed_catalog(
             &store,
-            vec![queued_task("task-admission-a"), queued_task("task-admission-b")],
+            vec![
+                queued_task("task-admission-a"),
+                queued_task("task-admission-b"),
+            ],
         );
         store
             .commit_task_admission(&lease(

@@ -1022,26 +1022,25 @@ fn demag_runtime_metadata(
             let max_iterations =
                 resolved_policy.map_or(policy.max_iterations, |entry| entry.max_iterations);
             let amg_profile = demag_amg_profile_metadata(&preconditioner, last);
-            let (runtime_solver, runtime_preconditioner) =
-                if matches!(
-                    provenance.fem_demag_operator_mode.as_deref(),
-                    Some("device_hypre_poisson") | Some("device_hypre_fem_bem")
-                ) {
-                    let solver = match linear_solver.as_str() {
-                        "CG" => Some("HyprePCG"),
-                        "GMRES" => Some("HypreGMRES"),
-                        _ => None,
-                    };
-                    let preconditioner = match preconditioner.as_str() {
-                        "AMG" => Some("HypreBoomerAMG"),
-                        "JACOBI" => Some("HypreDiagScale"),
-                        "NONE" => Some("HypreIdentity"),
-                        _ => None,
-                    };
-                    (solver, preconditioner)
-                } else {
-                    (None, None)
+            let (runtime_solver, runtime_preconditioner) = if matches!(
+                provenance.fem_demag_operator_mode.as_deref(),
+                Some("device_hypre_poisson") | Some("device_hypre_fem_bem")
+            ) {
+                let solver = match linear_solver.as_str() {
+                    "CG" => Some("HyprePCG"),
+                    "GMRES" => Some("HypreGMRES"),
+                    _ => None,
                 };
+                let preconditioner = match preconditioner.as_str() {
+                    "AMG" => Some("HypreBoomerAMG"),
+                    "JACOBI" => Some("HypreDiagScale"),
+                    "NONE" => Some("HypreIdentity"),
+                    _ => None,
+                };
+                (solver, preconditioner)
+            } else {
+                (None, None)
+            };
 
             serde_json::json!({
                 "model": resolved_demag.model_name(),
@@ -2012,6 +2011,7 @@ pub(crate) fn write_artifacts(
 
     if streamed.is_none() {
         let fields_dir = output_dir.join("fields");
+        let mut frames_index = crate::frames_index::FramesIndexWriter::new(output_dir, None);
         for snapshot in &executed.field_snapshots {
             write_field_snapshot_artifact(
                 &fields_dir,
@@ -2019,7 +2019,23 @@ pub(crate) fn write_artifacts(
                 &execution_provenance,
                 snapshot,
             )?;
+            let relative =
+                crate::frames_index::snapshot_relative_path(&snapshot.name, snapshot.step, true);
+            let single_file = output_dir.join(&relative);
+            let bytes = fs::metadata(&single_file).ok().map(|meta| meta.len());
+            let path = if single_file.is_file() {
+                relative
+            } else {
+                // Multilayer snapshots are one file per layer under the observable folder.
+                format!("fields/{}", snapshot.name)
+            };
+            frames_index
+                .record(&snapshot.name, snapshot.step, snapshot.time, path, bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
         }
+        frames_index
+            .finish()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
     }
 
     let mut auxiliary_artifacts = executed.auxiliary_artifacts.clone();
@@ -9462,7 +9478,6 @@ mod tests {
 
         fs::remove_dir_all(root).expect("remove FEM field semantics error fixture");
     }
-
 
     #[test]
     fn fem_p1_magnetization_factory_rejects_invalid_execution_mesh() {

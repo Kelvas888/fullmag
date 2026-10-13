@@ -250,6 +250,7 @@ function Write-VersionMetadata {
     python_runtime = $pythonRuntimeInventory
     python_pe_dependency_audit = $pythonPeDependencyAudit
     python_pe_dependency_plan = $pythonPePlan
+    python_native_dependency_audit = $pythonNativeDependencyAudit
     python_packages = $pythonPackageInventory
     node_runtime = $nodeRuntimeInventory
     built_at_utc = $builtAt
@@ -313,6 +314,7 @@ function Write-StageManifest {
       "bin/fullmag-api-accepted-worker.exe",
       "bin/fullmag-api-accepted-supervisor.exe",
       "bin/fullmag-api-accepted-scheduler.exe",
+      "bin/fullmag-runtime-service.exe",
       "bin/fullmag-api-resource-pool.exe",
       "bin/fullmag-api-accepted-fem-preparer.exe",
       "bin/fullmag-api-accepted-fem-preparation-supervisor.exe",
@@ -331,6 +333,7 @@ function Write-StageManifest {
     python_runtime = $pythonRuntimeInventory
     python_pe_dependency_audit = $pythonPeDependencyAudit
     python_pe_dependency_plan = $pythonPePlan
+    python_native_dependency_audit = $pythonNativeDependencyAudit
     python_packages = $pythonPackageInventory
     share = @(
       "share/version.json",
@@ -350,6 +353,7 @@ function Test-StagedLayout {
     (Join-Path $StageRoot "bin\fullmag-api-accepted-worker.exe"),
     (Join-Path $StageRoot "bin\fullmag-api-accepted-supervisor.exe"),
     (Join-Path $StageRoot "bin\fullmag-api-accepted-scheduler.exe"),
+    (Join-Path $StageRoot "bin\fullmag-runtime-service.exe"),
     (Join-Path $StageRoot "bin\fullmag-api-resource-pool.exe"),
     (Join-Path $StageRoot "bin\fullmag-api-accepted-fem-preparer.exe"),
     (Join-Path $StageRoot "bin\fullmag-api-accepted-fem-preparation-supervisor.exe"),
@@ -358,6 +362,7 @@ function Test-StagedLayout {
     (Join-Path $StageRoot "bin\fullmag-api-preparation-retry.exe"),
     (Join-Path $StageRoot "bin\fullmag-ui.exe"),
     (Join-Path $StageRoot "web\index.html"),
+    (Join-Path $StageRoot "web\workspace\index.html"),
     (Join-Path $StageRoot "web\dev-server.mjs"),
     (Join-Path $StageRoot "web\scripts\dev-server-public-origin.mjs"),
     (Join-Path $StageRoot "web\scripts\resolve-pnpm-invocation.mjs"),
@@ -579,6 +584,7 @@ try {
     "fullmag-api-accepted-worker.exe",
     "fullmag-api-accepted-supervisor.exe",
     "fullmag-api-accepted-scheduler.exe",
+    "fullmag-runtime-service.exe",
     "fullmag-api-resource-pool.exe",
     "fullmag-api-accepted-fem-preparer.exe",
     "fullmag-api-accepted-fem-preparation-supervisor.exe",
@@ -702,6 +708,7 @@ try {
   }
 
   Require-File (Join-Path $RepoRoot "apps\control-room\out\index.html")
+  Require-File (Join-Path $RepoRoot "apps\control-room\out\workspace\index.html")
   Copy-Tree (Join-Path $RepoRoot "apps\control-room\out") $webDir
   & python (Join-Path $RepoRoot "scripts\stage_control_room_static_runtime.py") --source (Join-Path $RepoRoot "apps\control-room") --destination $webDir
   if ($LASTEXITCODE -ne 0) { throw "Static UI runtime staging failed with exit code $LASTEXITCODE" }
@@ -723,6 +730,14 @@ try {
   }
   & python (Join-Path $PSScriptRoot "stage_python_runtime.py") verify --inventory $pythonRuntimeStagedPath --destination $StageRoot --output (Join-Path $DistRoot "python-runtime-smoke.json")
   if ($LASTEXITCODE -ne 0) { throw "Bundled Python isolation smoke failed" }
+  $pythonNativeAuditPath = Join-Path $DistRoot "python-native-dependencies.json"
+  $pythonNativeAuditArgs = @((Join-Path $PSScriptRoot "verify_python_native_dependencies.py"),
+    "--stage", $StageRoot, "--dumpbin", (Get-Command dumpbin.exe).Source, "--output", $pythonNativeAuditPath)
+  if ($BuildCuda) { $pythonNativeAuditArgs += "--allow-cuda-driver" }
+  & python @pythonNativeAuditArgs
+  if ($LASTEXITCODE -ne 0) { throw "Recursive Python native dependency audit failed" }
+  $pythonNativeAuditHash = (Get-FileHash -LiteralPath $pythonNativeAuditPath -Algorithm SHA256).Hash
+  $pythonNativeDependencyAudit = Get-Content -LiteralPath $pythonNativeAuditPath -Raw | ConvertFrom-Json
   & (Join-Path $pythonDir "python.exe") -c "import fullmag, numpy, h5py, zarr, scipy, gmsh, manifold3d, meshio, trimesh; from PIL import Image"
   if ($LASTEXITCODE -ne 0) { throw "staged Python package import smoke failed with exit code $LASTEXITCODE" }
   foreach ($pythonInput in $pythonPackageInventory.inputs) {
@@ -730,7 +745,14 @@ try {
       throw "Python package input changed after wheel staging: $($pythonInput.path)"
     }
   }
-  foreach ($pythonImage in $pythonPeDependencyAudit.images) {
+  if ((Get-FileHash -LiteralPath $pythonNativeAuditPath -Algorithm SHA256).Hash -ne $pythonNativeAuditHash) {
+    throw "Python native audit inventory changed after import smoke"
+  }
+  & python (Join-Path $PSScriptRoot "verify_python_native_dependencies.py") --stage $StageRoot `
+    --dumpbin (Get-Command dumpbin.exe).Source --verify-inventory $pythonNativeAuditPath `
+    --output (Join-Path $DistRoot "python-native-post-smoke.json")
+  if ($LASTEXITCODE -ne 0) { throw "Python native image set changed after import smoke" }
+  foreach ($pythonImage in $pythonNativeDependencyAudit.images) {
     if ((Get-FileHash -LiteralPath (Join-Path $StageRoot $pythonImage.path) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pythonImage.sha256) {
       throw "Python native image changed after audit: $($pythonImage.path)"
     }

@@ -1,13 +1,13 @@
 //! Recover a current typed task claim from its durable catalog and lease.
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use fullmag_application::{
     AttemptId, LeaseToken, OwnershipEpoch, ResourceBudget, ResourceKind, ResourceLease, RunId,
     TaskClaim, TaskId, TaskLifecycle, TaskRecord,
 };
 use fullmag_ir::ExecutionDevice;
 use fullmag_session::{
-    FMS_RESOURCE_LEASE_SCHEMA, FmsResourceBudget, FmsResourceKind, FmsResourceLease,
-    FmsResourceLeaseState, FmsTaskLifecycle, FmsTaskReadiness, SessionStore,
+    FmsResourceBudget, FmsResourceKind, FmsResourceLease, FmsResourceLeaseState, FmsTaskLifecycle,
+    FmsTaskReadiness, SessionStore, FMS_RESOURCE_LEASE_SCHEMA,
 };
 
 /// Durably admit a claimed application task before publishing its worker
@@ -18,6 +18,66 @@ pub fn commit_claimed_task_admission(
     task: &TaskRecord,
     claim: &TaskClaim,
 ) -> Result<fullmag_session::TaskAdmissionCommitDisposition> {
+    commit_claimed_task_admission_with(store, task, claim, |lease| {
+        store.commit_task_admission(lease).map(Some)
+    })?
+    .context("local task admission unexpectedly returned no disposition")
+}
+
+/// Admit through the shared physical-host ledger when the caller has resolved
+/// an explicit host policy/allocation. The ledger owns the host-before-store
+/// transaction and retains reservations after an unknown publication outcome.
+/// This does not infer UUIDs from offer IDs or enable unsupported concurrency.
+pub fn commit_claimed_task_admission_with_host(
+    store: &SessionStore,
+    task: &TaskRecord,
+    claim: &TaskClaim,
+    ledger: &fullmag_session::host_resource_ledger::HostResourceLedger,
+    request: &fullmag_session::host_resource_ledger::HostReservationRequest,
+    inputs: &std::collections::BTreeMap<String, fullmag_application::ResolvedInput>,
+) -> Result<fullmag_session::TaskAdmissionCommitDisposition> {
+    let inputs = capture_admission_inputs(inputs)?;
+    commit_claimed_task_admission_with(store, task, claim, |lease| {
+        ledger
+            .commit_task_admission(request, store, lease, &inputs)
+            .map(Some)
+    })?
+    .context("host task admission unexpectedly returned no disposition")
+}
+
+/// Capacity contention leaves the ready task queued without publishing a local
+/// claim. Unknown publication, invalid state and fencing failures remain errors.
+pub fn try_commit_claimed_task_admission_with_host(
+    store: &SessionStore,
+    task: &TaskRecord,
+    claim: &TaskClaim,
+    ledger: &fullmag_session::host_resource_ledger::HostResourceLedger,
+    request: &fullmag_session::host_resource_ledger::HostReservationRequest,
+    inputs: &std::collections::BTreeMap<String, fullmag_application::ResolvedInput>,
+) -> Result<Option<fullmag_session::TaskAdmissionCommitDisposition>> {
+    let inputs = capture_admission_inputs(inputs)?;
+    commit_claimed_task_admission_with(store, task, claim, |lease| {
+        ledger.try_commit_task_admission(request, store, lease, &inputs)
+    })
+}
+
+fn capture_admission_inputs(
+    inputs: &std::collections::BTreeMap<String, fullmag_application::ResolvedInput>,
+) -> Result<fullmag_session::FmsResolvedInputsSnapshot> {
+    for input in inputs.values() {
+        input.validate().map_err(|error| anyhow::anyhow!(error))?;
+    }
+    fullmag_session::FmsResolvedInputsSnapshot::new(serde_json::to_value(inputs)?)
+}
+
+fn commit_claimed_task_admission_with(
+    store: &SessionStore,
+    task: &TaskRecord,
+    claim: &TaskClaim,
+    admit: impl FnOnce(
+        &FmsResourceLease,
+    ) -> Result<Option<fullmag_session::TaskAdmissionCommitDisposition>>,
+) -> Result<Option<fullmag_session::TaskAdmissionCommitDisposition>> {
     task.fence(claim)
         .context("application task does not own the supplied claim")?;
     if task.run_id != claim.run_id
@@ -105,13 +165,16 @@ pub fn commit_claimed_task_admission(
         heartbeat_at: now,
         heartbeat_sequence: claim.lease.heartbeat_sequence,
         released_at: None,
+        host_launch_binding: None,
     };
-    let disposition = store.commit_task_admission(&lease)?;
+    let Some(disposition) = admit(&lease)? else {
+        return Ok(None);
+    };
     let persisted_claim = load_current_task_claim(store, &claim.run_id, claim.task_id.as_str())?;
     if persisted_claim != *claim {
         bail!("durable admission recovered a claim different from the application claim");
     }
-    Ok(disposition)
+    Ok(Some(disposition))
 }
 
 /// Confirm the claimed resource realizes both the immutable RunSpec device
@@ -174,12 +237,48 @@ pub(crate) fn claimed_task_resource_compatibility(
         .as_ref()
         .and_then(|plan| plan.provenance.fem_eigen_execution_resolution.as_ref())
         .map(|resolution| resolution.resolved_device);
-    Ok(solver_resource_compatibility(
-        &specification.requested_execution.device,
+    let catalog_entry = accepted
+        .catalog
+        .entries()
+        .iter()
+        .find(|entry| entry.step_id() == study_step.step_id)
+        .context("accepted task claim has no immutable ProblemIR")?;
+    let task_request = specification
+        .requested_execution
+        .for_problem(catalog_entry.problem())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "accepted task `{}` execution request is invalid: {error}",
+                study_step.step_id
+            )
+        })?;
+    let compatibility = solver_resource_compatibility(
+        &task_request.device,
         &claim.lease.kind,
         &claim.lease.budget,
         planned_device,
-    )?)
+    )?;
+    if compatibility == ClaimedTaskResourceCompatibility::Compatible {
+        if let Some(required) = task_request.minimum_resources.as_ref() {
+            if !resource_budget_meets_requested_minimum(required, &claim.lease.budget) {
+                return Ok(ClaimedTaskResourceCompatibility::Incompatible(format!(
+                    "claimed resource budget does not meet the minimum resources for study step `{}`",
+                    study_step.step_id
+                )));
+            }
+        }
+    }
+    Ok(compatibility)
+}
+
+fn resource_budget_meets_requested_minimum(
+    required: &fullmag_application::RequestedResourceBudget,
+    offered: &ResourceBudget,
+) -> bool {
+    offered.cpu_millis >= required.cpu_millis
+        && offered.memory_bytes >= required.memory_bytes
+        && offered.gpu_memory_bytes >= required.gpu_memory_bytes
+        && offered.storage_bytes >= required.storage_bytes
 }
 
 fn validate_claimed_task_resource(store: &SessionStore, claim: &TaskClaim) -> Result<()> {
@@ -252,8 +351,11 @@ fn invalid_solver_resource_budget(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaimedTaskResourceCompatibility, solver_resource_compatibility};
-    use fullmag_application::{ResourceBudget, ResourceKind};
+    use super::{
+        resource_budget_meets_requested_minimum, solver_resource_compatibility,
+        ClaimedTaskResourceCompatibility,
+    };
+    use fullmag_application::{RequestedResourceBudget, ResourceBudget, ResourceKind};
 
     fn budget(
         cpu_millis: u64,
@@ -301,6 +403,36 @@ mod tests {
                 .unwrap(),
             ClaimedTaskResourceCompatibility::Compatible
         );
+    }
+
+    #[test]
+    fn direct_admission_checks_every_per_step_resource_minimum() {
+        let required = RequestedResourceBudget {
+            cpu_millis: 500,
+            memory_bytes: 2_000,
+            gpu_memory_bytes: 8_000,
+            storage_bytes: 4_000,
+        };
+        assert!(resource_budget_meets_requested_minimum(
+            &required,
+            &budget(500, 2_000, 8_000, 4_000)
+        ));
+        assert!(!resource_budget_meets_requested_minimum(
+            &required,
+            &budget(499, 2_000, 8_000, 4_000)
+        ));
+        assert!(!resource_budget_meets_requested_minimum(
+            &required,
+            &budget(500, 1_999, 8_000, 4_000)
+        ));
+        assert!(!resource_budget_meets_requested_minimum(
+            &required,
+            &budget(500, 2_000, 7_999, 4_000)
+        ));
+        assert!(!resource_budget_meets_requested_minimum(
+            &required,
+            &budget(500, 2_000, 8_000, 3_999)
+        ));
     }
 }
 

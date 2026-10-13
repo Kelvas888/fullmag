@@ -70,16 +70,13 @@ pub struct ProjectSnapshot {
 
 impl ProjectSnapshot {
     pub fn from_envelope(envelope: &ProjectEnvelope) -> Result<Self, RunSpecError> {
-        envelope
-            .validate_for_save()
-            .map_err(|error| RunSpecError::Invalid(format!("invalid project definition: {error}")))?;
+        envelope.validate_for_save().map_err(|error| {
+            RunSpecError::Invalid(format!("invalid project definition: {error}"))
+        })?;
         Ok(Self {
             project_id: envelope.definition.project_id.clone(),
             definition_revision: envelope.definition.revision,
-            definition_sha256: format!(
-                "{:x}",
-                Sha256::digest(envelope.raw_definition.raw_bytes())
-            ),
+            definition_sha256: format!("{:x}", Sha256::digest(envelope.raw_definition.raw_bytes())),
         })
     }
 
@@ -175,6 +172,86 @@ impl RequestedExecution {
         require_one_of(&self.mode, "mode", &["strict", "extended", "hybrid"])?;
         if let Some(resources) = &self.minimum_resources {
             resources.validate_for_device(&self.device)?;
+        }
+        Ok(())
+    }
+
+    /// Check the admission budget against the typed per-step request. A v1
+    /// run without a budget cannot claim to reserve newly authored resources.
+    pub fn validate_problem_resources(
+        &self,
+        problem: &fullmag_ir::ProblemIR,
+    ) -> Result<(), RunSpecError> {
+        let Some(resources) =
+            fullmag_ir::ComputeResourcesIR::from_problem(problem).map_err(RunSpecError::Invalid)?
+        else {
+            return Ok(());
+        };
+        resources
+            .validate()
+            .map_err(|errors| RunSpecError::Invalid(errors.join("; ")))?;
+        resources
+            .validate_legacy_selection(problem)
+            .map_err(|errors| RunSpecError::Invalid(errors.join("; ")))?;
+        self.validate()?;
+        if resources.gpu.is_some() && self.device == "cpu" {
+            return Err(RunSpecError::Invalid(
+                "execution_intent_conflict: compute_resources.gpu contradicts requested_execution.device=cpu".into()
+            ));
+        }
+        let budget = self.minimum_resources.as_ref().ok_or_else(|| {
+            RunSpecError::Invalid(
+                "compute_resources requires requested_execution.minimum_resources (run_spec.v2)"
+                    .into(),
+            )
+        })?;
+        let cpu_threads = match resources.parallelism {
+            fullmag_ir::ComputeParallelismIR::SingleProcess => {
+                resources.cpu.threads.count().map(u64::from)
+            }
+            fullmag_ir::ComputeParallelismIR::Distributed {
+                ranks,
+                threads_per_rank,
+                ..
+            } => Some(u64::from(ranks) * u64::from(threads_per_rank)),
+        };
+        if let Some(threads) = cpu_threads {
+            let required = threads.checked_mul(1000).ok_or_else(|| {
+                RunSpecError::Invalid("compute_resources CPU budget overflows cpu_millis".into())
+            })?;
+            if budget.cpu_millis < required {
+                return Err(RunSpecError::Invalid(format!(
+                    "execution_intent_conflict: minimum_resources.cpu_millis={} is below compute_resources requirement {required}", budget.cpu_millis
+                )));
+            }
+        }
+        for (field, available, required) in [
+            (
+                "memory_bytes",
+                budget.memory_bytes,
+                resources.ram.reservation_bytes,
+            ),
+            (
+                "storage_bytes",
+                budget.storage_bytes,
+                resources.scratch.reservation_bytes,
+            ),
+            (
+                "gpu_memory_bytes",
+                budget.gpu_memory_bytes,
+                resources
+                    .gpu
+                    .as_ref()
+                    .and_then(|gpu| gpu.vram_per_device_bytes),
+            ),
+        ] {
+            if let Some(required) = required {
+                if available < required {
+                    return Err(RunSpecError::Invalid(format!(
+                        "execution_intent_conflict: minimum_resources.{field}={available} is below compute_resources requirement {required}"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -655,8 +732,8 @@ mod tests {
 
     #[test]
     fn project_snapshot_binds_exact_definition_bytes() {
-        let mut envelope = ProjectEnvelope::blank(ProjectId::parse("project-test").unwrap(), "Test")
-            .unwrap();
+        let mut envelope =
+            ProjectEnvelope::blank(ProjectId::parse("project-test").unwrap(), "Test").unwrap();
         let snapshot = ProjectSnapshot::from_envelope(&envelope).unwrap();
         snapshot.verify_envelope(&envelope).unwrap();
         envelope.definition.revision += 1;

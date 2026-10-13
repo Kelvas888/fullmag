@@ -1,12 +1,13 @@
 "use client";
 
+import { useEffect } from "react";
+
 import {
   WorkspaceStartupGateView,
   useSimulationStartupOverlayState,
 } from "./SimulationStartupOverlay";
 import { useSessionCollection } from "../resources/useSessionCollection";
 import { useSessionResourceIdentity } from "../resources/useSessionStatus";
-import { EmptyWorkspace } from "./EmptyWorkspace";
 import { Button } from "@/shared/ui/Button";
 import { WorkspaceRenderProfiler } from "../performance/reactRenderProfiler";
 import { SlotHost } from "./SlotHost";
@@ -14,6 +15,8 @@ import { WorkspaceDockLayout } from "./WorkspaceDockLayout";
 import { WorkspaceContentScopeProvider } from "./WorkspaceContentScope";
 import { useProjectDocumentSnapshot } from "../persistence/ProjectDocumentStatus";
 import { useKernel } from "../KernelContext";
+import { sessionRequestScopeKey } from "../resources/sessionResourceIdentity";
+import { homeView, useHomeViewOpen } from "./homeView";
 import { useLayoutSelector } from "./useLayout";
 
 export function WorkspaceShellClient() {
@@ -21,6 +24,14 @@ export function WorkspaceShellClient() {
   const project = useProjectDocumentSnapshot();
   const identity = useSessionResourceIdentity();
   const sessionState = sessions.state === "ready" && !identity ? "loading" : sessions.state;
+  const sessionScopeKey = sessionRequestScopeKey(identity);
+  const startOwnsPage = sessionState !== "ready" && project.state !== "ready";
+
+  // The overlay is a visit, not a mode: starting or opening something, or the
+  // workspace going away, ends it so it cannot reappear on top of the next one.
+  useEffect(() => {
+    homeView.close();
+  }, [sessionScopeKey, startOwnsPage]);
 
   if (sessionState !== "ready" && project.state === "ready") {
     return <ProjectWorkspaceShell sessionState={sessionState} />;
@@ -30,11 +41,18 @@ export function WorkspaceShellClient() {
     <>
       <SlotHost slotId="app-menu" />
       {sessionState === "no-session" ? (
-        <EmptyWorkspace />
+        <div className="fm-start-host" data-state="no-session">
+          <SlotHost slotId="start-screen" />
+        </div>
       ) : sessionState === "error" ? (
         <SessionCollectionError onRetry={sessions.resource.refetch} />
       ) : (
         <SessionCollectionLoading />
+      )}
+      {sessionState === "loading" ? null : (
+        <div className="fm-workspace-overlay-host">
+          <SlotHost slotId="overlay" />
+        </div>
       )}
     </>
   );
@@ -49,6 +67,7 @@ function ProjectWorkspaceShell({
 }) {
   const kernel = useKernel();
   const panels = useLayoutSelector((layout) => layout.panelVisible);
+  const homeOpen = useHomeViewOpen();
   const detail = sessionState === "no-session"
     ? "No active session. Saved project results are available independently."
     : sessionState === "error"
@@ -74,6 +93,7 @@ function ProjectWorkspaceShell({
       <WorkspaceRenderProfiler id="WorkspaceDockLayout">
         <WorkspaceDockLayout />
       </WorkspaceRenderProfiler>
+      {homeOpen ? <HomeOverlay /> : null}
     </WorkspaceContentScopeProvider>
   );
 }
@@ -97,7 +117,7 @@ function SessionCollectionLoading() {
 
 function SessionCollectionError({ onRetry }: { readonly onRetry: () => void }) {
   return (
-    <div className="grid min-h-0 flex-1" data-state="session-error">
+    <div className="fm-start-host" data-state="session-error">
       <section
         className="border-b border-fm-border bg-fm-surface px-6 py-3"
         role="alert"
@@ -114,13 +134,14 @@ function SessionCollectionError({ onRetry }: { readonly onRetry: () => void }) {
           <Button type="button" onClick={onRetry}>Retry</Button>
         </div>
       </section>
-      <EmptyWorkspace />
+      <SlotHost slotId="start-screen" />
     </div>
   );
 }
 
 function ActiveWorkspaceShell() {
   const startupState = useSimulationStartupOverlayState();
+  const homeOpen = useHomeViewOpen();
 
   return (
     <>
@@ -134,10 +155,24 @@ function ActiveWorkspaceShell() {
           <WorkspaceDockLayout />
         </WorkspaceRenderProfiler>
         <SlotHost slotId="status-bar" />
+        {homeOpen ? <HomeOverlay /> : null}
         <div className="fm-workspace-overlay-host">
           <SlotHost slotId="overlay" />
         </div>
       </WorkspaceStartupGateView>
     </>
+  );
+}
+
+/**
+ * The start screen laid over a mounted workspace. Hiding the workspace with
+ * visibility (see layout.css) rather than unmounting keeps its WebGL context,
+ * drafts and undo history alive while the user looks at Home.
+ */
+function HomeOverlay() {
+  return (
+    <div className="fm-home-overlay" data-state="home-overlay">
+      <SlotHost slotId="start-screen" />
+    </div>
   );
 }

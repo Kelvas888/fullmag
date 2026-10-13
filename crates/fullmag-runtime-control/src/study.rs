@@ -1,18 +1,18 @@
 //! Resolve accepted study inputs without mutable session state.
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use fullmag_application::{
-    COORDINATOR_TRANSITION_SCHEMA, CoordinatorError, CoordinatorMessage, CoordinatorTransition,
-    DurableWorkerCoordinator, PreparationBinding, PreparationReceipt, ProjectId, ResolvedInput,
-    ResolvedStudyArtifact, ResolvedTaskInput, RunId, RunSpecification, TaskClaim, TaskRecord,
-    WorkerCommand, WorkerCommandEnvelope,
+    CoordinatorError, CoordinatorMessage, CoordinatorTransition, DurableWorkerCoordinator,
+    PreparationBinding, PreparationReceipt, ProjectId, ResolvedInput, ResolvedStudyArtifact,
+    ResolvedTaskInput, RunId, RunSpecification, TaskClaim, TaskRecord, WorkerCommand,
+    WorkerCommandEnvelope, COORDINATOR_TRANSITION_SCHEMA,
 };
 use fullmag_authoring::{
     StudyInputPort, StudyInputSource, StudyPlan, StudyPortDataKind, StudyStep,
 };
 use fullmag_ir::{ExecutionDevice, ExecutionMode, ExecutionPlanIR, ExecutionPrecision, ProblemIR};
 use fullmag_plan::{
-    PreparationMaterialization, PreparationPlanSource, StudyExecutionPlan, StudyProblemCatalog,
-    StudyStepLoweringStatus, lower_study_plan_with_catalog,
+    lower_study_plan_with_catalog, PreparationMaterialization, PreparationPlanSource,
+    StudyExecutionPlan, StudyProblemCatalog, StudyStepLoweringStatus,
 };
 use fullmag_session::SessionStore;
 use serde::Deserialize;
@@ -496,7 +496,10 @@ pub fn queue_accepted_study_task(
         && durable_task.coordinator_watermark.is_none()
         && durable_task.coordinator_genesis.is_none();
     let retry_queue_replay = if durable_task.lifecycle == fullmag_session::FmsTaskLifecycle::Queued
-        && matches!(&durable_task.readiness, fullmag_session::FmsTaskReadiness::Ready)
+        && matches!(
+            &durable_task.readiness,
+            fullmag_session::FmsTaskReadiness::Ready
+        )
         && durable_task.attempt_id.is_none()
         && durable_task.resolved_input_fingerprint.is_none()
         && durable_task.artifact_ids.is_empty()
@@ -578,8 +581,12 @@ pub fn queue_accepted_study_task(
     task.observation = durable_task.observation.map(|value| match value {
         fullmag_session::FmsObservationState::Live => fullmag_application::ObservationState::Live,
         fullmag_session::FmsObservationState::Stale => fullmag_application::ObservationState::Stale,
-        fullmag_session::FmsObservationState::Disconnected => fullmag_application::ObservationState::Disconnected,
-        fullmag_session::FmsObservationState::Reconciling => fullmag_application::ObservationState::Reconciling,
+        fullmag_session::FmsObservationState::Disconnected => {
+            fullmag_application::ObservationState::Disconnected
+        }
+        fullmag_session::FmsObservationState::Reconciling => {
+            fullmag_application::ObservationState::Reconciling
+        }
     });
     Ok(QueuedAcceptedStudyTask {
         task,
@@ -704,11 +711,13 @@ pub fn load_accepted_worker_step(
         || resolved_input.task_id.as_str() != task_id
         || resolved_input.attempt_id.as_str() != envelope.claim.attempt_id.as_str()
         || resolved_input.ownership_epoch != envelope.claim.ownership_epoch
-        || resolved_input.specification_fingerprint != accepted.run.specification.fingerprint()?
-        || resolved_input.requested_execution != accepted.run.specification.requested_execution
     {
         bail!("worker Prepare input differs from the accepted RunSpec or claim");
     }
+    resolved_input
+        .validate_execution_for_problem(&accepted.run.specification, &problem)
+        .map_err(anyhow::Error::msg)
+        .context("worker Prepare input execution differs from the accepted RunSpec or step")?;
     let plan_fingerprint =
         fullmag_session::canonical_json_sha256(&serde_json::to_value(execution_plan)?);
     if resolved_input.plan_fingerprint != plan_fingerprint {
@@ -1060,9 +1069,8 @@ pub fn load_study_observation_runtime(
         .cas()
         .get(manifest_ref)?
         .context("study observation source manifest is missing from CAS")?;
-    let manifest: fullmag_session::FmsStudyOutputManifest =
-        serde_json::from_slice(&manifest_bytes)
-            .context("study observation source manifest is not a typed document")?;
+    let manifest: fullmag_session::FmsStudyOutputManifest = serde_json::from_slice(&manifest_bytes)
+        .context("study observation source manifest is not a typed document")?;
     manifest.validate()?;
     if manifest.run_id != run_id
         || manifest.task_id != task_id
@@ -1428,8 +1436,8 @@ pub fn publish_study_outputs(
             schema_version: fullmag_session::FMS_OBSERVATION_SOURCE_SCHEMA.into(),
             adapter_id: fullmag_session::FMS_FDM_CPU_OBSERVATION_ADAPTER_ID.into(),
             accepted_state_ref: source.accepted_state_ref.clone(),
-            snapshot_schema_version:
-                fullmag_session::FMS_FDM_CPU_ACCEPTED_STATE_SNAPSHOT_SCHEMA.into(),
+            snapshot_schema_version: fullmag_session::FMS_FDM_CPU_ACCEPTED_STATE_SNAPSHOT_SCHEMA
+                .into(),
             snapshot_artifact_id,
             snapshot_object_ref,
             state_codec_id: fullmag_application::STUDY_MAGNETIZATION_CODEC_ID.into(),
@@ -1483,8 +1491,7 @@ pub fn publish_study_outputs(
         required: true,
         study_output: None,
     });
-    let catalog = store
-        .append_artifact_catalog_entries_for_lease(&durable_lease, &entries)?;
+    let catalog = store.append_artifact_catalog_entries_for_lease(&durable_lease, &entries)?;
     crate::solution_set::publish_open_study_solution(store, accepted, claim, step_id, &catalog)?;
     Ok(catalog)
 }
@@ -1940,7 +1947,11 @@ fn bind_step_output_manifests(
                 || output_artifact.content_sha256 != output.content_sha256
                 || output.object_ref != output.content_sha256
             {
-                bail!("study output manifest entry `{}/{}` differs from its published catalog artifact", output.port_id, output.case_id);
+                bail!(
+                    "study output manifest entry `{}/{}` differs from its published catalog artifact",
+                    output.port_id,
+                    output.case_id
+                );
             }
         }
         for catalog_entry in artifact_catalog.entries.iter().filter(|entry| {
@@ -2251,7 +2262,9 @@ fn validate_study_input_dependencies(
     Ok(())
 }
 
-fn resolve_accepted_study_inputs(
+/// Resolve the exact accepted step's declared inputs from durable artifact and
+/// run catalogs. This read-only projection does not create or claim a task.
+pub fn resolve_accepted_study_inputs(
     store: &SessionStore,
     run_id: &str,
     accepted_steps: &[StudyStep],
@@ -2782,6 +2795,11 @@ pub fn validate_requested_execution(
     plan: &StudyExecutionPlan,
 ) -> Result<()> {
     let requested = &specification.requested_execution;
+
+    // This check is deliberately snapshot-only. In particular, do not call
+    // the runner's host resolver here: submit validation must not inspect the
+    // current host or mutate process-wide device environment. Preparation has
+    // its own CPU lease and is not a solver-task execution lane.
     for step in plan
         .steps
         .iter()
@@ -2793,14 +2811,55 @@ pub fn validate_requested_execution(
                 step.step_id
             )
         })?;
-        if requested.backend != "auto"
-            && (execution.common.requested_backend.as_str() != requested.backend
-                || execution.common.resolved_backend.as_str() != requested.backend)
+        let entry = catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.step_id() == step.step_id)
+            .with_context(|| {
+                format!(
+                    "study step `{}` has no immutable catalog entry",
+                    step.step_id
+                )
+            })?;
+        let problem = entry.problem();
+        if let Some(materialization) = entry.execution_materialization() {
+            fullmag_application::validate_execution_materialization(materialization)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| {
+                    format!(
+                        "study step `{}` execution materialization is invalid",
+                        step.step_id
+                    )
+                })?;
+        }
+        let step_requested = requested.for_problem(problem).map_err(|error| {
+            anyhow::anyhow!(
+                "study step `{}` execution request is invalid: {error}",
+                step.step_id
+            )
+        })?;
+
+        if execution.common.requested_backend != problem.backend_policy.requested_backend {
+            bail!(
+                "study step `{}` execution plan requested backend differs from its immutable ProblemIR",
+                step.step_id
+            );
+        }
+        if step_requested.backend != "auto"
+            && (execution.common.requested_backend.as_str() != step_requested.backend
+                || execution.common.resolved_backend.as_str() != step_requested.backend)
         {
             bail!(
-                "study step `{}` backend differs from explicit RunSpec request `{}`",
+                "study step `{}` backend differs from its effective execution request `{}`",
                 step.step_id,
-                requested.backend
+                step_requested.backend
+            );
+        }
+
+        if execution.common.execution_mode != problem.validation_profile.execution_mode {
+            bail!(
+                "study step `{}` execution plan mode differs from its immutable ProblemIR",
+                step.step_id
             );
         }
         let planned_mode = match execution.common.execution_mode {
@@ -2808,46 +2867,136 @@ pub fn validate_requested_execution(
             ExecutionMode::Extended => "extended",
             ExecutionMode::Hybrid => "hybrid",
         };
-        if planned_mode != requested.mode {
+        if planned_mode != step_requested.mode {
             bail!(
-                "study step `{}` mode `{planned_mode}` differs from RunSpec request `{}`",
+                "study step `{}` mode `{planned_mode}` differs from its effective execution request `{}`",
                 step.step_id,
-                requested.mode
+                step_requested.mode
             );
         }
-        let problem = catalog
-            .entries()
-            .iter()
-            .find(|entry| entry.step_id() == step.step_id)
-            .with_context(|| format!("study step `{}` has no immutable ProblemIR", step.step_id))?
-            .problem();
-        let planned_precision = match problem.backend_policy.execution_precision {
+
+        let requested_precision = match problem.backend_policy.execution_precision {
             ExecutionPrecision::Single => "single",
             ExecutionPrecision::Double => "double",
         };
-        if planned_precision != requested.precision {
+        if requested_precision != step_requested.precision {
             bail!(
-                "study step `{}` precision `{planned_precision}` differs from RunSpec request `{}`",
+                "study step `{}` requested precision `{requested_precision}` differs from its effective execution request `{}`",
                 step.step_id,
-                requested.precision
+                step_requested.precision
             );
         }
+
+        let planned_precision = match &execution.backend_plan {
+            fullmag_ir::BackendPlanIR::Fdm(plan) => Some(plan.precision),
+            fullmag_ir::BackendPlanIR::FdmMultilayer(plan) => Some(plan.precision),
+            fullmag_ir::BackendPlanIR::FemEigen(plan) => Some(plan.precision),
+            fullmag_ir::BackendPlanIR::FemFrequencyResponse(plan) => Some(plan.precision),
+            // The current generic FEM plan has no separate resolved-precision
+            // field. Its planner validates the requested precision before it
+            // emits this plan; a typed execution receipt remains future work.
+            fullmag_ir::BackendPlanIR::Fem(_) => None,
+        };
+        if planned_precision
+            .is_some_and(|precision| precision_name(precision) != step_requested.precision)
+        {
+            bail!(
+                "study step `{}` resolved precision differs from its effective execution request `{}`",
+                step.step_id,
+                step_requested.precision
+            );
+        }
+
+        let step_requested_device = problem_requested_device(problem, &step.step_id)?;
+        let effective_requested_device = match step_requested.device.as_str() {
+            "auto" => ExecutionDevice::Auto,
+            "cpu" => ExecutionDevice::Cpu,
+            "gpu" => ExecutionDevice::Gpu,
+            _ => bail!(
+                "study step `{}` has an invalid effective device",
+                step.step_id
+            ),
+        };
+
         if let Some(resolution) = &execution.provenance.fem_eigen_execution_resolution {
-            let requested_device = match requested.device.as_str() {
-                "cpu" => Some(ExecutionDevice::Cpu),
-                "gpu" => Some(ExecutionDevice::Gpu),
-                _ => None,
-            };
-            if requested_device.is_some_and(|device| {
-                resolution.requested_device != device || resolution.resolved_device != device
-            }) {
+            if resolution.requested_device != step_requested_device {
                 bail!(
-                    "study step `{}` device resolution differs from explicit RunSpec request `{}`",
+                    "study step `{}` FEM eigen requested-device provenance differs from its immutable ProblemIR",
+                    step.step_id
+                );
+            }
+            if resolution.resolved_device == ExecutionDevice::Auto
+                || (resolution.requested_device != ExecutionDevice::Auto
+                    && resolution.resolved_device != resolution.requested_device)
+            {
+                bail!(
+                    "study step `{}` FEM eigen device resolution is inconsistent with its requested device",
+                    step.step_id
+                );
+            }
+            if resolution.requested_precision != problem.backend_policy.execution_precision
+                || resolution.resolved_precision != problem.backend_policy.execution_precision
+            {
+                bail!(
+                    "study step `{}` FEM eigen precision provenance differs from its immutable ProblemIR",
+                    step.step_id
+                );
+            }
+            if effective_requested_device != ExecutionDevice::Auto
+                && resolution.resolved_device != effective_requested_device
+            {
+                bail!(
+                    "study step `{}` resolved device `{}` differs from its effective execution request `{}`",
                     step.step_id,
-                    requested.device
+                    device_name(resolution.resolved_device),
+                    step_requested.device
                 );
             }
         }
     }
     Ok(())
 }
+
+fn problem_requested_device(problem: &ProblemIR, step_id: &str) -> Result<ExecutionDevice> {
+    let Some(selection) = problem
+        .problem_meta
+        .runtime_metadata
+        .get("runtime_selection")
+    else {
+        return Ok(ExecutionDevice::Auto);
+    };
+    let Some(selection) = selection.as_object() else {
+        bail!("study step `{step_id}` runtime_selection must be an object");
+    };
+    let Some(value) = selection.get("device") else {
+        return Ok(ExecutionDevice::Auto);
+    };
+    let Some(value) = value.as_str() else {
+        bail!("study step `{step_id}` runtime_selection.device must be a string");
+    };
+    match value {
+        "auto" => Ok(ExecutionDevice::Auto),
+        "cpu" => Ok(ExecutionDevice::Cpu),
+        "gpu" | "cuda" => Ok(ExecutionDevice::Gpu),
+        _ => bail!("study step `{step_id}` runtime_selection.device `{value}` is unsupported"),
+    }
+}
+
+fn precision_name(precision: ExecutionPrecision) -> &'static str {
+    match precision {
+        ExecutionPrecision::Single => "single",
+        ExecutionPrecision::Double => "double",
+    }
+}
+
+fn device_name(device: ExecutionDevice) -> &'static str {
+    match device {
+        ExecutionDevice::Auto => "auto",
+        ExecutionDevice::Cpu => "cpu",
+        ExecutionDevice::Gpu => "gpu",
+    }
+}
+
+#[cfg(test)]
+#[path = "study_tests.rs"]
+mod tests;

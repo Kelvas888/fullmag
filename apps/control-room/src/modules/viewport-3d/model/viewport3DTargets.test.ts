@@ -445,6 +445,46 @@ describe("viewport3DTargets", () => {
     });
   });
 
+  it("ignores element selection bounds when generationId mismatches active mesh generation", () => {
+    const selection: Selection = {
+      kind: "mesh.quality",
+      label: "Worst mesh element 7",
+      moduleSource: "mesh",
+      nodeId: "model:mesh:quality:element:7",
+      objectId: null,
+      ref: {
+        centroid: [1, 2, 3],
+        elementIndex: 7,
+        generationId: "gen-1",
+        kind: "mesh.quality.element",
+        nodeId: "model:mesh:quality:element:7",
+        type: "mesh-quality-element",
+        visualizationTargetId: "mesh:quality:element:7",
+      },
+    };
+
+    const bounds = resolveViewport3DSelectionBounds(
+      selection,
+      {
+        airboxParts: [],
+        magneticParts: [],
+        magneticSurfacePartsByPartId: new Map(),
+        objectPartIds: new Map(),
+        partsById: new Map(),
+      },
+      { center: [0, 0, 0], radius: 10, size: [20, 20, 20] },
+      null,
+      null,
+      "gen-2",
+    );
+
+    expect(bounds).toMatchObject({
+      center: [0, 0, 0],
+      radius: 10,
+      size: [20, 20, 20],
+    });
+  });
+
   it("fits an FDM grid node to structured-grid bounds without using FEM topology", () => {
     const selection: Selection = {
       kind: "mesh.grid.mask",

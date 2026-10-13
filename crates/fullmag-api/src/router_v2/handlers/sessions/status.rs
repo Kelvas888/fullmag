@@ -212,6 +212,11 @@ pub(crate) fn build_live_status(
         name: snapshot.session.problem_name.clone(),
         created_at: snapshot.session.started_at_unix_ms.to_string(),
         workspace_root: workspace_root.display().to_string(),
+        script: crate::script::session_script_summary(
+            workspace_root,
+            &snapshot.session.script_path,
+            false,
+        ),
     };
 
     let run = snapshot.run.as_ref().map(|r| {
@@ -395,7 +400,7 @@ pub(crate) fn build_live_status(
 
     LiveStatus {
         api_contract_version: "1.0.0".into(),
-        runtime_bundle_version: crate::build_info::backend_build_date().to_string(),
+        runtime_bundle_version: fullmag_build_info::version().to_string(),
         session,
         run,
         solver,

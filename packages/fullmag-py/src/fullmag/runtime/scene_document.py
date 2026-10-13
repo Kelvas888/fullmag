@@ -5,6 +5,13 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from fullmag.model.compute_resources import ComputeResources
+from fullmag.model.output_storage import OutputStorage
+from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer
+from fullmag.runtime.output_storage_lowering import (
+    configure_scene_stage_autosaves,
+    configure_study_pipeline_autosaves,
+)
 from fullmag.model.current_transport import (
     ConservativeCurrentBoundaryFace,
     ConservativeCurrentClosedGeometry,
@@ -150,6 +157,39 @@ def _mapping(value: object, context: str) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{context} must be an object")
     return dict(value)
+
+
+def _execution_profile_fields(
+    source: Mapping[str, object],
+    context: str,
+) -> dict[str, object]:
+    has_profile = "execution_profile" in source
+    raw_layers = source.get("execution_layers", [])
+    if not isinstance(raw_layers, list):
+        raise ValueError(f"{context}.execution_layers must be a list")
+    if not has_profile:
+        if raw_layers:
+            raise ValueError(f"{context}.execution_layers requires execution_profile")
+        return {}
+
+    profile = ExecutionProfile.from_ir(source["execution_profile"])
+    layers = [ExecutionRequestLayer.from_ir(layer) for layer in raw_layers]
+    result: dict[str, object] = {"execution_profile": profile.to_ir()}
+    if layers:
+        result["execution_layers"] = [layer.to_ir() for layer in layers]
+    return result
+
+
+def _compute_resources_fields(
+    source: Mapping[str, object],
+    context: str,
+) -> dict[str, object]:
+    if "compute_resources" not in source:
+        return {}
+    if not isinstance(source["compute_resources"], Mapping):
+        raise ValueError(f"{context}.compute_resources must be an object")
+    resources = ComputeResources.from_ir(source["compute_resources"])
+    return {"compute_resources": resources.to_ir()}
 
 
 def _reject_unknown_fields(
@@ -1550,10 +1590,19 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
             "mesh_defaults": builder.get("mesh") or {},
             "stages": [
                 _canonical_scene_stage(stage)
-                for stage in (builder.get("stages") or [])
+                for stage in configure_scene_stage_autosaves(
+                    builder.get("stages") or [],
+                    builder.get("output_storage"),
+                    table_autosave=builder.get("table_autosave"),
+                )
             ],
-            "study_pipeline": builder.get("study_pipeline"),
+            "study_pipeline": configure_study_pipeline_autosaves(
+                builder.get("study_pipeline"),
+                builder.get("output_storage"),
+                table_autosave=builder.get("table_autosave"),
+            ),
             "table_autosave": builder.get("table_autosave"),
+            "output_storage": builder.get("output_storage"),
             "initial_state": builder.get("initial_state"),
         },
         "outputs": {"items": []},
@@ -1572,6 +1621,8 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
     }
     if "fdm" in builder:
         document["study"]["fdm"] = copy.deepcopy(builder.get("fdm"))
+    document["study"].update(_execution_profile_fields(builder, "builder"))
+    document["study"].update(_compute_resources_fields(builder, "builder"))
     if "spin_torques" in builder:
         document["spin_torques"] = _canonical_spin_torques(
             builder["spin_torques"], scene_ids=True
@@ -1703,6 +1754,21 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         geometries.append(entry)
 
     study = dict(scene.get("study") or {})
+    output_storage = study.get("output_storage")
+    if output_storage is not None:
+        if not isinstance(output_storage, Mapping):
+            raise ValueError("SceneDocument.study.output_storage must be an object")
+        study["output_storage"] = OutputStorage.from_ir(output_storage).to_ir()
+        study["stages"] = configure_scene_stage_autosaves(
+            study.get("stages") or [],
+            study["output_storage"],
+            table_autosave=study.get("table_autosave"),
+        )
+        study["study_pipeline"] = configure_study_pipeline_autosaves(
+            study.get("study_pipeline"),
+            study["output_storage"],
+            table_autosave=study.get("table_autosave"),
+        )
     current_modules_value = scene.get("current_modules", {})
     if not isinstance(current_modules_value, Mapping):
         raise ValueError("SceneDocument.current_modules must be an object")
@@ -1813,6 +1879,8 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         "requested_precision": study.get("requested_precision", "double"),
         "requested_mode": study.get("requested_mode", "strict"),
         "cpu_threads": study.get("requested_cpu_threads"),
+        **_execution_profile_fields(study, "SceneDocument.study"),
+        **_compute_resources_fields(study, "SceneDocument.study"),
         "fem_demag_solver_policy": study.get("fem_demag_solver_policy"),
         "exchange_enabled": bool(study.get("exchange_enabled", True)),
         "demag_enabled": bool(study.get("demag_enabled", True)),
@@ -1825,6 +1893,7 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         "stages": study.get("stages") or [],
         "study_pipeline": study.get("study_pipeline"),
         "table_autosave": study.get("table_autosave"),
+        "output_storage": study.get("output_storage"),
         "initial_state": study.get("initial_state"),
         "geometries": geometries,
         "couplings": scene.get("couplings") or [],
@@ -2060,6 +2129,7 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
                     else {}
                 ),
                 "until_seconds": _number_or_none(stage.get("until_seconds")),
+                "autosave": copy.deepcopy(stage.get("autosave")),
                 "relax_algorithm": _stage_relax_algorithm(stage) or None,
                 "torque_tolerance": _number_or_none(stage.get("torque_tolerance")),
                 "energy_tolerance": _number_or_none(stage.get("energy_tolerance")),
@@ -2072,7 +2142,10 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
                     if isinstance(stage.get("eigen_include_demag"), bool)
                     else None
                 ),
-                "eigen_equilibrium_source": stage.get("eigen_equilibrium_source") or None,
+                "eigen_equilibrium_source": stage.get("eigen_equilibrium_source") or stage.get("equilibrium_source") or None,
+                "eigen_equilibrium_artifact": stage.get("eigen_equilibrium_artifact") or stage.get("equilibrium_artifact") or None,
+                "frequency_equilibrium_source": stage.get("frequency_equilibrium_source") or stage.get("equilibrium_source") or None,
+                "frequency_equilibrium_artifact": stage.get("frequency_equilibrium_artifact") or stage.get("equilibrium_artifact") or None,
                 "eigen_normalization": stage.get("eigen_normalization") or None,
                 "eigen_target_frequency": _number_or_none(stage.get("eigen_target_frequency")),
                 "eigen_frequency_min": _number_or_none(stage.get("eigen_frequency_min")),
@@ -2092,6 +2165,7 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
         ],
         "study_pipeline": builder.get("study_pipeline"),
         "table_autosave": builder.get("table_autosave"),
+        "output_storage": builder.get("output_storage"),
         "initial_state": builder.get("initial_state"),
         "geometries": builder.get("geometries") or [],
         "couplings": builder.get("couplings") or [],
@@ -2128,6 +2202,8 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
                         for key, value in raw_grid.items()
                     }
         overrides["fdm"] = fdm
+    overrides.update(_execution_profile_fields(builder, "SceneDocument.study"))
+    overrides.update(_compute_resources_fields(builder, "SceneDocument.study"))
     return overrides
 
 

@@ -25,6 +25,8 @@ pub(super) struct CurrentLiveDisplaySelectionHandle {
     running_interrupt: Arc<Mutex<Option<InteractiveStageInterrupt>>>,
     running_interrupt_requested: Arc<AtomicBool>,
     owner_session_id: Option<String>,
+    grid_refresh_command_id: Option<String>,
+    grid_refresh_command_refused: Arc<AtomicBool>,
     worker_owner: bool,
 }
 
@@ -38,6 +40,8 @@ impl Clone for CurrentLiveDisplaySelectionHandle {
             running_interrupt: Arc::clone(&self.running_interrupt),
             running_interrupt_requested: Arc::clone(&self.running_interrupt_requested),
             owner_session_id: self.owner_session_id.clone(),
+            grid_refresh_command_id: self.grid_refresh_command_id.clone(),
+            grid_refresh_command_refused: Arc::clone(&self.grid_refresh_command_refused),
             worker_owner: false,
         }
     }
@@ -54,6 +58,17 @@ pub(super) enum InteractiveStageInterrupt {
 
 impl CurrentLiveDisplaySelectionHandle {
     pub(super) fn spawn_for_session(session_id: Option<String>) -> Self {
+        Self::spawn_for_session_scoped(session_id, None)
+    }
+
+    pub(super) fn spawn_for_grid_refresh(session_id: String, command_id: String) -> Self {
+        Self::spawn_for_session_scoped(Some(session_id), Some(command_id))
+    }
+
+    fn spawn_for_session_scoped(
+        session_id: Option<String>,
+        grid_refresh_command_id: Option<String>,
+    ) -> Self {
         let initial_display_selection = current_live_display_selection().unwrap_or_default();
         let handle = Self {
             shared: Arc::new((
@@ -69,6 +84,8 @@ impl CurrentLiveDisplaySelectionHandle {
             running_interrupt: Arc::new(Mutex::new(None)),
             running_interrupt_requested: Arc::new(AtomicBool::new(false)),
             owner_session_id: session_id,
+            grid_refresh_command_id,
+            grid_refresh_command_refused: Arc::new(AtomicBool::new(false)),
             worker_owner: true,
         };
         let worker = handle.clone();
@@ -97,8 +114,21 @@ impl CurrentLiveDisplaySelectionHandle {
                     after_seq,
                     1_000,
                     worker.owner_session_id.as_deref(),
+                    worker.grid_refresh_command_id.as_deref(),
                 ) {
                     Ok(Some(command)) => {
+                        if let Some(expected_command_id) =
+                            worker.grid_refresh_command_id.as_deref()
+                        {
+                            if !is_expected_grid_refresh_command(&command, expected_command_id) {
+                                worker
+                                    .grid_refresh_command_refused
+                                    .store(true, Ordering::Release);
+                                worker.stop.store(true, Ordering::Release);
+                                break;
+                            }
+                            worker.stop.store(true, Ordering::Release);
+                        }
                         after_seq = after_seq.max(command.seq);
                         eprintln!(
                             "[fullmag-host] RX <- api command {} seq={} id={}",
@@ -117,6 +147,9 @@ impl CurrentLiveDisplaySelectionHandle {
                         let mut state = lock.lock().unwrap_or_else(|poison| poison.into_inner());
                         state.queue.push_back(command);
                         cvar.notify_all();
+                        if worker.grid_refresh_command_id.is_some() {
+                            break;
+                        }
                     }
                     Ok(None) => sync_display_selection_from_status(&worker.shared),
                     Err(_) => std::thread::sleep(Duration::from_millis(100)),
@@ -134,6 +167,10 @@ impl CurrentLiveDisplaySelectionHandle {
 
     pub(super) fn owner_session_lost(&self) -> bool {
         self.owner_lost.load(Ordering::Acquire)
+    }
+
+    pub(super) fn grid_refresh_command_refused(&self) -> bool {
+        self.grid_refresh_command_refused.load(Ordering::Acquire)
     }
 
     pub(super) fn display_selection_snapshot(&self) -> CurrentDisplaySelection {
@@ -1174,7 +1211,9 @@ fn idle_observation_quantities(display_selection: &CurrentDisplaySelection) -> V
     // Older control-plane payloads have no demand list. Keep their selected
     // spatial quantity working without eagerly materializing the whole catalog.
     if demand.observation_quantities.is_empty() {
-        demand.observation_quantities.push(display_selection.selection.quantity.clone());
+        demand
+            .observation_quantities
+            .push(display_selection.selection.quantity.clone());
     }
     demand.canonicalize_observation_quantities();
     demand.observation_quantities
@@ -1211,7 +1250,8 @@ fn apply_step_stats_to_idle_live_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_step_stats_to_idle_live_state, scalar_row_from_stats, CurrentLiveControlState,
+        apply_step_stats_to_idle_live_state, current_live_control_wait_query_parameters,
+        is_expected_grid_refresh_command, scalar_row_from_stats, CurrentLiveControlState,
         CurrentLiveDisplaySelectionHandle, InteractivePreviewStatus, InteractiveRuntimeHost,
     };
     use crate::live_workspace::{
@@ -1231,8 +1271,11 @@ mod tests {
     fn idle_observation_demand_is_canonical_and_not_eager() {
         let mut display = fullmag_runner::DisplaySelectionState::default();
         display.observation_quantities = vec![
-            "h_demag".into(), "H_demag".into(), "eden_total".into(),
-            "E_total".into(), "unknown".into(),
+            "h_demag".into(),
+            "H_demag".into(),
+            "eden_total".into(),
+            "E_total".into(),
+            "unknown".into(),
         ];
         assert_eq!(
             super::idle_observation_quantities(&display),
@@ -1374,8 +1417,44 @@ mod tests {
             running_interrupt: Arc::new(Mutex::new(None)),
             running_interrupt_requested: Arc::new(AtomicBool::new(false)),
             owner_session_id: None,
+            grid_refresh_command_id: None,
+            grid_refresh_command_refused: Arc::new(AtomicBool::new(false)),
             worker_owner: true,
         }
+    }
+
+    #[test]
+    fn pinned_control_wait_sends_only_the_requested_grid_refresh_pin() {
+        let query = current_live_control_wait_query_parameters(
+            7,
+            1_000,
+            Some("session-a"),
+            Some("cmd-grid-a"),
+        );
+
+        assert!(query.contains(&("afterSeq", "7".to_string())));
+        assert!(query.contains(&("sessionId", "session-a".to_string())));
+        assert!(query.contains(&("gridRefreshCommandId", "cmd-grid-a".to_string())));
+        assert!(!current_live_control_wait_query_parameters(0, 1_000, None, None)
+            .iter()
+            .any(|(key, _)| *key == "gridRefreshCommandId"));
+    }
+
+    #[test]
+    fn pinned_control_worker_accepts_only_exact_grid_refresh_identity() {
+        let exact = queued_command(2, "fdm_grid_refresh");
+        assert!(is_expected_grid_refresh_command(
+            &exact,
+            "cmd-2-fdm_grid_refresh"
+        ));
+        assert!(!is_expected_grid_refresh_command(
+            &queued_command(3, "fdm_grid_refresh"),
+            "cmd-2-fdm_grid_refresh"
+        ));
+        assert!(!is_expected_grid_refresh_command(
+            &queued_command(2, "solve"),
+            "cmd-2-solve"
+        ));
     }
 
     fn retained_preview_field(quantity: &str) -> fullmag_runner::LivePreviewField {
@@ -1488,6 +1567,8 @@ mod tests {
             running_interrupt: Arc::new(Mutex::new(None)),
             running_interrupt_requested: Arc::new(AtomicBool::new(false)),
             owner_session_id: None,
+            grid_refresh_command_id: None,
+            grid_refresh_command_refused: Arc::new(AtomicBool::new(false)),
             worker_owner: true,
         };
 
@@ -1570,6 +1651,8 @@ mod tests {
             running_interrupt: Arc::new(Mutex::new(None)),
             running_interrupt_requested: Arc::new(AtomicBool::new(false)),
             owner_session_id: None,
+            grid_refresh_command_id: None,
+            grid_refresh_command_refused: Arc::new(AtomicBool::new(false)),
             worker_owner: true,
         };
 
@@ -1792,16 +1875,17 @@ fn wait_for_current_live_control(
     after_seq: u64,
     timeout_ms: u64,
     session_id: Option<&str>,
+    grid_refresh_command_id: Option<&str>,
 ) -> Result<Option<SessionCommand>> {
-    let mut request = current_live_api_client()
+    let query = current_live_control_wait_query_parameters(
+        after_seq,
+        timeout_ms,
+        session_id,
+        grid_refresh_command_id,
+    );
+    let request = current_live_api_client()
         .get(internal_live_api_url("control/wait"))
-        .query(&[
-            ("afterSeq", after_seq.to_string()),
-            ("timeoutMs", timeout_ms.to_string()),
-        ]);
-    if let Some(session_id) = session_id {
-        request = request.query(&[("sessionId", session_id.to_string())]);
-    }
+        .query(&query);
     let response = match request.send() {
         Ok(response) => response,
         Err(_) => return Ok(None),
@@ -1819,6 +1903,29 @@ fn wait_for_current_live_control(
             status
         ),
     }
+}
+
+fn is_expected_grid_refresh_command(command: &SessionCommand, command_id: &str) -> bool {
+    command.command_id == command_id && command.kind == "fdm_grid_refresh"
+}
+
+fn current_live_control_wait_query_parameters(
+    after_seq: u64,
+    timeout_ms: u64,
+    session_id: Option<&str>,
+    grid_refresh_command_id: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut query = vec![
+        ("afterSeq", after_seq.to_string()),
+        ("timeoutMs", timeout_ms.to_string()),
+    ];
+    if let Some(session_id) = session_id {
+        query.push(("sessionId", session_id.to_string()));
+    }
+    if let Some(command_id) = grid_refresh_command_id {
+        query.push(("gridRefreshCommandId", command_id.to_string()));
+    }
+    query
 }
 
 fn current_live_session_matches(owner_session_id: &str) -> Option<bool> {

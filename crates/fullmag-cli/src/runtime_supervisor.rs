@@ -9,9 +9,6 @@
 
 use std::path::PathBuf;
 
-use fullmag_ir::{BackendTarget, ExecutionMode, ExecutionPrecision};
-
-use crate::args::{backend_target_name, execution_mode_name, execution_precision_name};
 use crate::step_utils::stage_artifact_dir;
 use crate::types::*;
 
@@ -25,9 +22,7 @@ pub(crate) struct InteractiveSessionContext {
     pub interactive_requested: bool,
     pub script_path: PathBuf,
     pub final_problem_name: String,
-    pub requested_backend: BackendTarget,
-    pub execution_mode: ExecutionMode,
-    pub precision: ExecutionPrecision,
+    pub runtime_selection: SessionRuntimeSelection,
     pub artifact_dir: PathBuf,
     #[allow(dead_code)]
     pub workspace_dir: PathBuf,
@@ -44,14 +39,6 @@ impl InteractiveSessionContext {
         plan_summary: &serde_json::Value,
         now_unix_ms: u128,
     ) -> SessionManifest {
-        let runtime = crate::orchestrator::requested_runtime_selection(
-            backend_target_name(self.requested_backend),
-            false,
-            "auto",
-            execution_precision_name(self.precision),
-            execution_mode_name(self.execution_mode),
-            None,
-        );
         crate::orchestrator::build_session_manifest(
             &self.session_id,
             &self.run_id,
@@ -59,7 +46,7 @@ impl InteractiveSessionContext {
             self.interactive_requested,
             &self.script_path,
             &self.final_problem_name,
-            &runtime,
+            &self.runtime_selection,
             &self.artifact_dir,
             self.started_at_unix_ms,
             now_unix_ms,
@@ -100,6 +87,35 @@ impl InteractiveSessionContext {
     }
 }
 
+/// Recover the full runtime selection already recorded in a session manifest.
+///
+/// Interactive transitions use this as their starting selection so publishing
+/// an awaiting or paused session does not replace the accepted device or its
+/// resolved execution provenance with a synthetic `auto` request.
+pub(crate) fn runtime_selection_from_manifest(
+    manifest: &SessionManifest,
+) -> SessionRuntimeSelection {
+    SessionRuntimeSelection {
+        requested_backend: manifest.requested_backend.clone(),
+        explicit_selection: manifest.explicit_selection,
+        authored_requested_device: manifest.authored_requested_device.clone(),
+        requested_device: manifest.requested_device.clone(),
+        requested_precision: manifest.requested_precision.clone(),
+        requested_mode: manifest.requested_mode.clone(),
+        requested_cpu_threads: manifest.requested_cpu_threads,
+        resolved_backend: manifest.resolved_backend.clone(),
+        resolved_device: manifest.resolved_device.clone(),
+        resolved_precision: manifest.resolved_precision.clone(),
+        resolved_mode: manifest.resolved_mode.clone(),
+        resolved_runtime_family: manifest.resolved_runtime_family.clone(),
+        resolved_engine_id: manifest.resolved_engine_id.clone(),
+        resolved_worker: manifest.resolved_worker.clone(),
+        resolved_cpu_threads: manifest.resolved_cpu_threads,
+        resolved_fallback: manifest.resolved_fallback.clone(),
+        fem_crossover_decision: manifest.fem_crossover_decision.clone(),
+    }
+}
+
 /// Outcome of a single iteration of the interactive command loop.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -115,4 +131,100 @@ pub(crate) enum InteractiveLoopOutcome {
 pub(crate) struct PausedInteractiveStage {
     pub command: SessionCommand,
     pub source_kind: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn awaiting_and_paused_manifests_keep_the_full_runtime_selection() {
+        let mut cpu_selection = crate::orchestrator::requested_runtime_selection(
+            "fdm",
+            true,
+            "cpu",
+            "double",
+            "strict",
+            Some(4),
+        );
+        cpu_selection.resolved_backend = Some("fdm".to_string());
+        cpu_selection.resolved_device = Some("cpu".to_string());
+        cpu_selection.resolved_precision = Some("double".to_string());
+        cpu_selection.resolved_mode = Some("strict".to_string());
+        cpu_selection.resolved_runtime_family = Some("fdm_cpu".to_string());
+        cpu_selection.resolved_engine_id = Some("fdm_cpu_reference".to_string());
+        cpu_selection.resolved_worker = Some("local".to_string());
+        cpu_selection.resolved_cpu_threads = Some(4);
+
+        let mut fallback_selection = crate::orchestrator::requested_runtime_selection(
+            "fdm",
+            false,
+            "auto",
+            "double",
+            "strict",
+            Some(8),
+        );
+        fallback_selection.resolved_backend = Some("fdm".to_string());
+        fallback_selection.resolved_device = Some("cpu".to_string());
+        fallback_selection.resolved_precision = Some("double".to_string());
+        fallback_selection.resolved_mode = Some("strict".to_string());
+        fallback_selection.resolved_runtime_family = Some("fdm_cpu".to_string());
+        fallback_selection.resolved_engine_id = Some("fdm_cpu_reference".to_string());
+        fallback_selection.resolved_worker = Some("local".to_string());
+        fallback_selection.resolved_cpu_threads = Some(8);
+        fallback_selection.resolved_fallback = Some(fullmag_runner::ResolvedFallback {
+            occurred: true,
+            original_engine: "fdm_cuda".to_string(),
+            fallback_engine: "fdm_cpu_reference".to_string(),
+            reason: "requested_engine_unavailable".to_string(),
+            message: "using the available CPU engine".to_string(),
+        });
+
+        for (selection, expected_requested_device, expected_explicit, expected_threads) in [
+            (cpu_selection, "cpu", true, 4),
+            (fallback_selection, "auto", false, 8),
+        ] {
+            let initial_manifest = crate::orchestrator::build_session_manifest(
+                "session-test",
+                "run-test",
+                "running",
+                true,
+                std::path::Path::new("fixture.py"),
+                "fixture",
+                &selection,
+                std::path::Path::new("artifacts"),
+                10,
+                10,
+                serde_json::json!({"status": "running"}),
+            );
+            let context = InteractiveSessionContext {
+                session_id: initial_manifest.session_id.clone(),
+                run_id: initial_manifest.run_id.clone(),
+                interactive_requested: initial_manifest.interactive_session_requested,
+                script_path: std::path::PathBuf::from(&initial_manifest.script_path),
+                final_problem_name: initial_manifest.problem_name.clone(),
+                runtime_selection: runtime_selection_from_manifest(&initial_manifest),
+                artifact_dir: std::path::PathBuf::from(&initial_manifest.artifact_dir),
+                workspace_dir: std::path::PathBuf::from("workspace"),
+                started_at_unix_ms: initial_manifest.started_at_unix_ms,
+                field_every_n: 1,
+            };
+
+            for status in ["awaiting_command", "paused"] {
+                let manifest =
+                    context.build_session(status, &serde_json::json!({"status": status}), 20);
+                assert_eq!(manifest.status, status);
+                assert_eq!(manifest.requested_device, expected_requested_device);
+                assert_eq!(manifest.explicit_selection, expected_explicit);
+                assert_eq!(manifest.resolved_device.as_deref(), Some("cpu"));
+                assert_eq!(manifest.requested_cpu_threads, Some(expected_threads));
+                assert_eq!(manifest.resolved_cpu_threads, Some(expected_threads));
+                assert_eq!(manifest.resolved_fallback, selection.resolved_fallback);
+                assert_eq!(
+                    manifest.resolved_engine_id.as_deref(),
+                    Some("fdm_cpu_reference")
+                );
+            }
+        }
+    }
 }

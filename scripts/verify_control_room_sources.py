@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import fullmag_storage as storage
 
 PROFILE = "windows-control-room-source-check"
-ROUTES = ("generate-client", "production-source", "api-hygiene", "lint")
+ROUTES = ("generate-client", "production-source", "api-hygiene", "lint", "openapi-import-check", "react-doctor", "development-restart-check", "resource-client-cache-check", "development-kernel-host-check", "development-transport-pause-check", "development-run-outcome-handoff-check", "development-run-outcome-handoff-lint", "development-restart-action-check", "development-restart-action-lint", "development-backend-build-action-check", "material-assignment-draft-check")
 
 
 def timestamp():
@@ -86,10 +86,79 @@ def run(repo: Path, route: str):
                 return [node, str(path)]
             if route == "generate-client":
                 commands = [cli("openapi-typescript", "bin/cli.js") + ["src/kernel/api/generated/openapi-v2.json", "--output", "src/kernel/api/generated/openapi-v2-types.ts"], [node, "scripts/generate-v2-client.mjs"]]
+            elif route == "openapi-import-check":
+                commands = [[node, "--test", "scripts/normalize-openapi-build-identity.node-test.mjs", "scripts/managed-openapi-import.node-test.mjs"]]
+                receipt["interpreted_node_checks"] = True
+                receipt["unit_tests"] = "interpreted_node_only_no_compilation"
+            elif route == "development-restart-check":
+                commands = [[node, "--experimental-vm-modules", "scripts/check-development-restart-controller.mjs"]]
+                receipt["interpreted_node_checks"] = True
+                receipt["unit_tests"] = "none_native_type_erasure_of_production_source_only"
+            elif route == "resource-client-cache-check":
+                commands = [[node, "--experimental-vm-modules", "scripts/check-resource-client-cache-scope.mjs"]]
+                receipt["interpreted_node_checks"] = True
+                receipt["unit_tests"] = "none_native_type_erasure_of_production_source_only"
+            elif route in {"development-kernel-host-check", "development-transport-pause-check", "development-run-outcome-handoff-check", "development-restart-action-check", "development-backend-build-action-check"}:
+                check = {"development-kernel-host-check": "check-development-kernel-host.mjs", "development-transport-pause-check": "check-development-transport-pause.mjs", "development-run-outcome-handoff-check": "check-development-run-outcome-handoff.mjs", "development-restart-action-check": "check-development-restart-action.mjs", "development-backend-build-action-check": "check-development-backend-build-action.mjs"}[route]
+                commands = [[node, "--experimental-vm-modules", "scripts/" + check]]
+                receipt["interpreted_node_checks"] = True
+                receipt["unit_tests"] = "none_native_type_erasure_of_production_source_only"
+                if route == "development-run-outcome-handoff-check":
+                    receipt["unit_tests"] = "none_interpreted_js_driver_no_unit_build"
+                    receipt["production_source_transform"] = "in_memory_parameter_property_support"
+            elif route == "material-assignment-draft-check":
+                commands = [[node, "scripts/check-material-assignment-draft.mjs"]]
+                receipt["interpreted_node_checks"] = True
+                receipt["unit_tests"] = "none_native_type_erasure_of_production_source_only"
             elif route == "api-hygiene":
                 commands = [[node, "scripts/check-api-hygiene.mjs"]]
             elif route == "lint":
                 commands = [cli("eslint", "bin/eslint.js") + [".", "--max-warnings=0"]]
+            elif route == "development-run-outcome-handoff-lint":
+                checked_files = [
+                    "src/kernel/KernelProvider.tsx",
+                    "src/kernel/persistence/ProjectDocumentController.ts",
+                    "src/kernel/persistence/RunOutcomeConnector.tsx",
+                    "scripts/check-development-run-outcome-handoff.mjs",
+                    "scripts/fixtures/development-run-outcome-handoff-page.tsx",
+                    "scripts/smoke-development-run-outcome-handoff.mjs",
+                ]
+                commands = [cli("eslint", "bin/eslint.js") + checked_files + ["--max-warnings=0"]]
+                receipt["lint_scope"] = "development_run_outcome_handoff_only"
+                receipt["checked_files"] = checked_files
+            elif route == "development-restart-action-lint":
+                checked_files = [
+                    "src/kernel/development/DevelopmentBackendBuildActionService.ts",
+                    "src/kernel/development/DevelopmentRestartActionService.ts",
+                    "src/kernel/development/DevelopmentKernelHost.ts",
+                    "src/kernel/development/DevelopmentKernelOwners.ts",
+                    "src/kernel/development/DevelopmentRestartController.ts",
+                    "src/kernel/layout/DevelopmentBackendBanner.tsx",
+                    "scripts/check-development-restart-action.mjs",
+                    "scripts/check-development-kernel-host.mjs",
+                    "scripts/check-development-restart-controller.mjs",
+                    "scripts/check-development-backend-build-action.mjs",
+                    "scripts/fixtures/development-restart-action-page.tsx",
+                    "scripts/smoke-development-restart-action.mjs",
+                ]
+                commands = [cli("eslint", "bin/eslint.js") + checked_files + ["--max-warnings=0"]]
+                receipt["lint_scope"] = "development_restart_action_and_backend_build_action"
+                receipt["lint_rationale"] = "The manual backend build action shares the workspace handoff gate and banner with restart custody."
+                receipt["checked_files"] = checked_files
+            elif route == "react-doctor":
+                # Reuse the repository-pinned tool without installing or
+                # contacting the score/supply-chain services. Dumps and caches
+                # inherit the managed storage environment of this source run.
+                doctor = repo / "node_modules/react-doctor/bin/react-doctor.js"
+                if not doctor.is_file():
+                    raise storage.StorageError("Repository-pinned React Doctor is unavailable")
+                env["NODE_DISABLE_COMPILE_CACHE"] = "1"
+                commands = [[node, str(doctor), ".", "--verbose", "--scope", "changed",
+                             "--base", "HEAD", "--no-score", "--no-supply-chain",
+                             "--no-dead-code", "--no-parallel", "--yes",
+                             "--output-dir", str(run_root / "diagnostics")]]
+                receipt["scope"] = "changed_against_HEAD"
+                receipt["online_services"] = "disabled_score_and_supply_chain"
             else:
                 # This is source checking, not compilation of test targets. UI
                 # route generation is unchanged and existing typegen is reused.

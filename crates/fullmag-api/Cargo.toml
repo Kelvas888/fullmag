@@ -40,6 +40,12 @@ name = "fullmag-api-accepted-scheduler"
 path = "src/accepted_scheduler_main.rs"
 
 [[bin]]
+name = "fullmag-runtime-service"
+path = "src/runtime_service_main.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "fullmag-api-resource-pool"
 path = "src/resource_pool_main.rs"
 
@@ -78,6 +84,7 @@ axum.workspace = true
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures-core = "0.3"
+crc32fast = "1"
 fullmag-build-info.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -93,6 +100,8 @@ fullmag-plan = { path = "../fullmag-plan" }
 fullmag-quantities = { path = "../fullmag-quantities" }
 fullmag-runner = { path = "../fullmag-runner" }
 fullmag-session = { path = "../fullmag-session" }
+fullmag-workspace = { path = "../fullmag-workspace" }
+fullmag-workspace-inspect = { path = "../fullmag-workspace-inspect", features = ["utoipa"] }
 fullmag-runtime-control = { path = "../fullmag-runtime-control" }
 png = "0.17"
 tiny-skia = "0.11"
@@ -102,10 +111,13 @@ utoipa-swagger-ui = { version = "8", features = ["axum"], optional = true }
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+rusqlite = "0.37"
+zip = { version = "2", default-features = false, features = ["deflate"] }

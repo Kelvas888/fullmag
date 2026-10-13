@@ -28,6 +28,7 @@ import {
 import { OrthographicCamera, PerspectiveCamera } from "@react-three/drei";
 import { useThree } from "@react-three/fiber";
 import {
+  useCallback,
   useEffect,
   useEffectEvent,
   useLayoutEffect,
@@ -85,6 +86,7 @@ import type {
 import type {
   Viewport3DCameraProjection,
   Viewport3DCameraState,
+  Viewport3DDimensionFrameAnnotation,
   Viewport3DDimensionFrameDensity,
   Viewport3DDimensionFrameMode,
   Viewport3DRotationMode,
@@ -186,6 +188,7 @@ interface Viewport3DSceneProps {
   crossSectionFrameClip: VisualizationStateResource["clip"] | null;
   crossSectionFrameRotationDegrees: number;
   planarMonitorFramePreview: PlanarMonitorFramePreview | null;
+  dimensionFrameAnnotation?: Viewport3DDimensionFrameAnnotation;
   dimensionFrameDensity: Viewport3DDimensionFrameDensity;
   dimensionFrameMode: Viewport3DDimensionFrameMode;
   fdmLaneActive: boolean;
@@ -259,6 +262,8 @@ interface Viewport3DSceneProps {
     translation: Translation3,
     baseRevision: number,
   ) => Promise<boolean | void> | boolean | void;
+  onBeginGesture?: () => boolean;
+  onMoveGestureActiveChange?: (active: boolean) => void;
   moveToolObjectId: string | null;
   moveDraftResetRevision: number;
   orbitDebugAngles: Viewport3DOrbitDebugAngles;
@@ -927,6 +932,7 @@ function Viewport3DOverlayLayerStack({
   crossSectionFrameClip,
   crossSectionFrameRotationDegrees,
   planarMonitorFramePreview,
+  dimensionFrameAnnotation,
   dimensionFrameDensity,
   dimensionFrameMode,
   fdmAirboxPassPlan,
@@ -956,6 +962,7 @@ function Viewport3DOverlayLayerStack({
   | "crossSectionFrameClip"
   | "crossSectionFrameRotationDegrees"
   | "planarMonitorFramePreview"
+  | "dimensionFrameAnnotation"
   | "dimensionFrameDensity"
   | "dimensionFrameMode"
   | "fdmAirboxPassPlan"
@@ -1053,6 +1060,7 @@ function Viewport3DOverlayLayerStack({
       ) : null}
       {viewport3DDimensionFrameEnabledFromBrowserConfig() ? (
         <DimensionFrameLayer
+          annotation={dimensionFrameAnnotation}
           bounds={bounds}
           cameraProjection={cameraProjection}
           cameraState={cameraState}
@@ -1136,6 +1144,7 @@ function Viewport3DModelLayerStack({
   onInspectClear,
   onInspectSample,
   onMoveCommit,
+  onBeginGesture,
   moveToolObjectId,
   moveDraftResetRevision,
   onMoveGestureActiveChange,
@@ -1199,6 +1208,8 @@ function Viewport3DModelLayerStack({
   | "onInspectClear"
   | "onInspectSample"
   | "onMoveCommit"
+  | "onBeginGesture"
+  | "onMoveGestureActiveChange"
   | "moveToolObjectId"
   | "moveDraftResetRevision"
   | "onSelectDomain"
@@ -1228,7 +1239,6 @@ function Viewport3DModelLayerStack({
   savedViewportActive: boolean;
   sceneLayersEnabled: boolean;
   stageVisibility: Viewport3DModelLayerStageVisibility;
-  onMoveGestureActiveChange: (active: boolean) => void;
 }) {
   const hasMeshBackedRegionOverlays = meshRegionOverlays.length > 0;
   const overlayLayersEnabled = viewport3DOverlayLayersEnabledFromBrowserConfig();
@@ -1455,6 +1465,7 @@ function Viewport3DModelLayerStack({
         moveDraftResetRevision={moveDraftResetRevision}
         moveToolObjectId={moveToolObjectId}
         onCommit={onMoveCommit}
+        onBeginGesture={onBeginGesture}
         onGestureActiveChange={onMoveGestureActiveChange}
         primitiveModel={primitiveModel}
         selectedObjectId={selectedObjectId}
@@ -1734,6 +1745,7 @@ export function Viewport3DScene({
   crossSectionFrameClip,
   crossSectionFrameRotationDegrees,
   planarMonitorFramePreview,
+  dimensionFrameAnnotation,
   dimensionFrameDensity,
   dimensionFrameMode,
   fdmLaneActive,
@@ -1809,6 +1821,8 @@ export function Viewport3DScene({
   onInspectClear,
   onInspectSample,
   onMoveCommit,
+  onBeginGesture,
+  onMoveGestureActiveChange,
   moveToolObjectId,
   moveDraftResetRevision,
   scaleLabelsVisible,
@@ -1827,6 +1841,10 @@ export function Viewport3DScene({
   } | null>(null);
   const cameraGestureRef = useMemo(() => createViewport3DCameraGestureRef(), []);
   const [moveGestureActive, setMoveGestureActive] = useState(false);
+  const handleMoveGestureActiveChange = useCallback((active: boolean) => {
+    onMoveGestureActiveChange?.(active);
+    setMoveGestureActive(active);
+  }, [onMoveGestureActiveChange]);
   const inspectClearArbitrator = useMemo(
     () =>
       createFdmInspectClearArbitrator({
@@ -2028,6 +2046,7 @@ export function Viewport3DScene({
         crossSectionFrameClip={crossSectionFrameClip}
         crossSectionFrameRotationDegrees={crossSectionFrameRotationDegrees}
         planarMonitorFramePreview={planarMonitorFramePreview}
+        dimensionFrameAnnotation={dimensionFrameAnnotation}
         dimensionFrameDensity={dimensionFrameDensity}
         dimensionFrameMode={dimensionFrameMode}
         fdmAirboxPassPlan={fdmAirboxPassPlan}
@@ -2082,9 +2101,10 @@ export function Viewport3DScene({
         onInspectClear={inspectClearArbitrator.clear}
         onInspectSample={handleArbitratedInspectSample}
         onMoveCommit={onMoveCommit}
+        onBeginGesture={onBeginGesture}
         moveToolObjectId={moveToolObjectId}
         moveDraftResetRevision={moveDraftResetRevision}
-        onMoveGestureActiveChange={setMoveGestureActive}
+        onMoveGestureActiveChange={handleMoveGestureActiveChange}
         onSelectDomain={onSelectDomain}
         onSelectFdmTarget={onSelectFdmTarget}
         onSelectFdmUniverseOutsideSupport={onSelectFdmUniverseOutsideSupport}

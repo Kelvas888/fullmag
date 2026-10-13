@@ -1,12 +1,12 @@
 //! One-shot native FEM preparation for an immutable accepted study task.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use fullmag_application::{RunId, RunSpecification};
 use fullmag_ir::{BackendPlanIR, BackendTarget};
 use fullmag_plan::StudyStepLoweringStatus;
 use fullmag_session::{
-    FmsResourceLeaseState, FmsTaskLifecycle, FmsTaskPreparationReceipt,
-    FmsTaskReadiness, PreparationReceiptCommitDisposition, SessionStore,
+    FmsResourceLeaseState, FmsTaskLifecycle, FmsTaskPreparationReceipt, FmsTaskReadiness,
+    PreparationReceiptCommitDisposition, SessionStore,
 };
 
 #[derive(Debug)]
@@ -71,6 +71,16 @@ pub(crate) fn prepare_accepted_fem_task(
         || preparation_lease.preparation_attempt_id != preparation_attempt_id
     {
         bail!("accepted FEM preparation lease belongs to another task attempt");
+    }
+
+    if let Some(binding) = &preparation_lease.host_launch_binding {
+        let token = std::env::var("FULLMAG_HOST_PREPARATION_LAUNCH_TOKEN")
+            .context("host-bound FEM preparer requires its supervisor launch permit")?;
+        let ledger = fullmag_session::host_resource_ledger::HostResourceLedger::open(
+            &binding.ledger_root,
+            binding.policy.clone(),
+        )?;
+        ledger.validate_preparation_launch(store, &preparation_lease, &token)?;
     }
 
     let step = accepted

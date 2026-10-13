@@ -27,9 +27,9 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use tokio::sync::{Mutex, RwLock, broadcast, watch};
+use std::sync::Arc;
+use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use utoipa::ToSchema;
 
 pub(crate) type CurrentPreviewConfig = LivePreviewRequest;
@@ -108,6 +108,20 @@ pub(crate) enum MeshCommandTarget {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppState {
+    /// Private pre-listener provenance. HTTP snapshots never carry this marker.
+    pub development_restored_authoring: Arc<std::sync::OnceLock<
+        crate::router_v2::handlers::platform::development_restore_input::RestoredAuthoringIdentity,
+    >>,
+    /// Lock order: mutation admission precedes the session-transition lock.
+    pub development_admission:
+        crate::router_v2::middleware::development_admission::DevelopmentAdmission,
+    /// Immutable native launcher binding; ordinary API startup leaves it disabled.
+    pub development_backend:
+        crate::router_v2::handlers::platform::development_backend::DevelopmentBackendConfig,
+    pub development_restart_transport:
+        crate::router_v2::handlers::platform::development_restart_request::DevelopmentRestartTransportConfig,
+    pub development_consumer_readiness:
+        crate::development_consumer_readiness::DevelopmentConsumerReadiness,
     pub repo_root: PathBuf,
     /// Managed, project-owned run storage resolved before this API starts.
     pub submit_store_root: Option<PathBuf>,
@@ -1086,6 +1100,8 @@ pub(crate) struct ControlWaitQuery {
     pub timeout_ms: u64,
     #[serde(rename = "sessionId")]
     pub session_id: Option<String>,
+    #[serde(rename = "gridRefreshCommandId", default)]
+    pub grid_refresh_command_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1113,11 +1129,25 @@ pub(crate) struct ScriptSyncRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ScriptSyncResponse {
+    /// Path of the file that received the canonical script. For a
+    /// `user_file` session this is the managed export copy, never the
+    /// user's own script.
     pub script_path: String,
     pub source_kind: String,
     pub entrypoint_kind: String,
     pub written: bool,
     pub bytes_written: usize,
+    /// `export_copy` (user file left untouched, copy written to managed
+    /// storage) or `script` (the session's managed script was written).
+    #[serde(default)]
+    pub written_to: String,
+    /// True only when the session's own source script file was rewritten.
+    /// Always false for `user_file` sessions.
+    #[serde(default)]
+    pub source_script_modified: bool,
+    /// Managed export copy path for `user_file` sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_copy_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1125,6 +1155,31 @@ pub(crate) struct ScriptSourceResponse {
     pub script_path: String,
     pub source: String,
     pub bytes: usize,
+    /// Script origin of the session: `user_file`, `generated` or `none`.
+    #[serde(default)]
+    pub origin: String,
+    /// Managed export copy path for `user_file` sessions (the response
+    /// carries the copy when it exists, otherwise the read-only original).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_copy_path: Option<String>,
+}
+
+/// Where the current session's Python script comes from and whether Fullmag
+/// may write to it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SessionScriptSummary {
+    /// `user_file` (a file the user owns; Fullmag never writes it),
+    /// `generated` (a script inside Fullmag-managed storage) or `none`.
+    pub origin: String,
+    pub path: String,
+    /// False for `user_file`: syncs go to `managed_copy_path` instead.
+    pub writable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_copy_path: Option<String>,
+    /// Content hash of the script at the time of the request; only present on
+    /// `GET /v2/sessions/current`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1279,6 +1334,8 @@ pub(crate) struct StageExecutionRecord {
     pub started_at_unix_ms: Option<u64>,
     #[serde(default)]
     pub applied_step: Option<u64>,
+    #[serde(default)]
+    pub completed_step: Option<u64>,
     #[serde(default)]
     pub applied_time_seconds: Option<f64>,
     #[serde(default)]
@@ -1620,6 +1677,8 @@ mod tests {
     fn sample_builder() -> ScriptBuilderState {
         ScriptBuilderState {
             revision: 3,
+            execution_profile: None,
+            execution_layers: vec![],
             backend: None,
             requested_mode: Some("strict".to_string()),
             cpu_threads: None,
@@ -1684,6 +1743,7 @@ mod tests {
             stages: Vec::new(),
             study_pipeline: None,
             table_autosave: None,
+            output_storage: None,
             initial_state: None,
             geometries: vec![fullmag_authoring::ScriptBuilderGeometryEntry {
                 name: "body".to_string(),
@@ -1843,6 +1903,20 @@ mod tests {
         assert!(value.get("builder_adapter").is_none());
         assert!(value.get("script_builder").is_none());
         assert!(value.get("model_builder_graph").is_none());
+    }
+
+    #[test]
+    fn control_wait_query_accepts_grid_refresh_command_pin() {
+        let query: ControlWaitQuery = serde_json::from_value(serde_json::json!({
+            "afterSeq": 4,
+            "timeoutMs": 1000,
+            "sessionId": "session-a",
+            "gridRefreshCommandId": "cmd-grid-a"
+        }))
+        .expect("control wait query should deserialize the internal grid refresh pin");
+
+        assert_eq!(query.after_seq, 4);
+        assert_eq!(query.grid_refresh_command_id.as_deref(), Some("cmd-grid-a"));
     }
 
     #[test]

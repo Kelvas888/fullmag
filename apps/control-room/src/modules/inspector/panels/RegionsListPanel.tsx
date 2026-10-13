@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { useKernel } from "@/kernel/KernelContext";
 import {
@@ -39,6 +39,7 @@ import {
 import { resolveMeshInspectorLane } from "./fdmMeshInspectorModel";
 import { publishRegionAuthoringScene } from "./regionAuthoringInvalidation";
 import { syncAuthoringScriptBestEffort } from "./ObjectMagneticTexturePanelViewModel";
+import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 
 type Feedback =
   | {
@@ -84,6 +85,7 @@ export function RegionsListPanel({ selection }: InspectorPanelProps) {
   const {
     api,
     authoringHistory,
+    commands,
     resources,
     selection: selectionController,
   } = useKernel();
@@ -108,11 +110,27 @@ export function RegionsListPanel({ selection }: InspectorPanelProps) {
   );
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState<NewRegionDraft>(defaultNewRegionDraft);
+  const draftRef = useRef(draft);
+  useLayoutEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [pending, setPending] = useState(false);
+  const createInFlight = useRef(false);
 
   function updateDraft(patch: Partial<NewRegionDraft>): void {
-    setDraft((current) => ({ ...current, ...patch }));
+    const next = { ...draftRef.current, ...patch };
+    draftRef.current = next;
+    setDraft(next);
+  }
+
+  function resetDraft(): void {
+    if (createInFlight.current) return;
+    const reset = defaultNewRegionDraft();
+    draftRef.current = reset;
+    setDraft(reset);
+    setAdding(false);
+    setFeedback(null);
   }
 
   function selectRegion(item: RegionsListItem): void {
@@ -139,74 +157,126 @@ export function RegionsListPanel({ selection }: InspectorPanelProps) {
     );
   }
 
-  async function createRegion(): Promise<void> {
+  const acknowledgeNewRegionDraft = useRegisterInspectorEditSession(
+    adding ? "staged" : null,
+    pending,
+    adding,
+    model.mode === "committed" && validateNewRegionDraft(draft).length === 0,
+    undefined,
+    createRegion,
+    resetDraft,
+    {
+      applyBlockReason: sessionScopeKey
+        ? undefined
+        : "Session identity is not ready.",
+      historyMode: "mutation-owned",
+    },
+  );
+
+  async function createRegion(): Promise<boolean> {
+    if (createInFlight.current) return false;
     if (model.mode !== "committed") {
       setFeedback({ kind: "error", message: "No committed scene object." });
-      return;
+      return false;
     }
-    const validationErrors = validateNewRegionDraft(draft);
+    const submittedDraft = draft;
+    const validationErrors = validateNewRegionDraft(submittedDraft);
     if (validationErrors.length > 0) {
       setFeedback({ kind: "error", message: validationErrors[0] ?? "Invalid region draft." });
-      return;
+      return false;
     }
 
+    const operationSessionScopeKey = sessionScopeKey;
+    if (!operationSessionScopeKey) {
+      setFeedback({ kind: "error", message: "Session identity is not ready. Try again after it loads." });
+      return false;
+    }
+    const historyGeneration = authoringHistory?.getGeneration?.();
+    const historyContext = {
+      api,
+      authoringHistory,
+      sessionScopeKey: operationSessionScopeKey,
+      isCurrentSessionScope: () =>
+        commands.getSessionScopeKey() === operationSessionScopeKey &&
+        (historyGeneration === undefined ||
+          authoringHistory?.getGeneration?.() === historyGeneration),
+    };
+    createInFlight.current = true;
     setPending(true);
     try {
       const response = await runAuthoringMutationWithHistory(
-        { api, authoringHistory },
-        `Create region ${draft.name.trim()}`,
+        historyContext,
+        `Create region ${submittedDraft.name.trim()}`,
         async ({ baseRevision }) => {
           const options = authoringWriteOptions(
             baseRevision ?? model.revision,
+            operationSessionScopeKey,
           );
-          return options
-            ? api.model.createRegion(
-                model.objectId,
-                buildNewRegionPayload(draft, model.ownerBounds),
-                options,
-              )
-            : api.model.createRegion(
-                model.objectId,
-                buildNewRegionPayload(draft, model.ownerBounds),
-              );
+          if (!options?.sessionScopeKey || options.baseRevision === undefined) {
+            throw new Error("A session-scoped scene revision is required to create a region.");
+          }
+          return api.model.createRegion(
+            model.objectId,
+            buildNewRegionPayload(submittedDraft, model.ownerBounds),
+            options,
+          );
         },
       );
+      if (historyContext.isCurrentSessionScope() === false) return false;
       const revision = revisionFromScene(response);
-      publishRegionAuthoringScene(resources, response, revision);
+      publishRegionAuthoringScene(
+        resources,
+        response,
+        revision,
+        undefined,
+        operationSessionScopeKey,
+        api.resourceCacheScope,
+      );
       const createdRegionId = findRegionIdByName(
         response,
         model.objectId,
-        draft.name,
+        submittedDraft.name,
       );
-      if (createdRegionId) {
+      const draftUnchanged = draftRef.current === submittedDraft;
+      if (draftUnchanged) {
+        if (!acknowledgeNewRegionDraft()) return false;
+        const reset = defaultNewRegionDraft();
+        draftRef.current = reset;
+        setDraft(reset);
+        setAdding(false);
+      }
+      if (createdRegionId && draftUnchanged) {
         selectRegion({
           colorIndex: 0,
           enabled: true,
-          name: draft.name.trim(),
+          name: submittedDraft.name.trim(),
           objectId: model.objectId,
-          priority: draft.priority,
+          priority: submittedDraft.priority,
           realizationPolicy: "inherit",
           realizationStatus: "authored_pending",
           regionId: createdRegionId,
-          shapeKind: draft.shapeKind,
+          shapeKind: submittedDraft.shapeKind,
           conflictCount: 0,
           diagnosticCount: 0,
           errorCount: 0,
           warningCount: 0,
         });
       }
-      setDraft(defaultNewRegionDraft());
-      setAdding(false);
       const syncWarning = await syncAuthoringScriptBestEffort(api, sessionScopeKey);
+      if (historyContext.isCurrentSessionScope() === false) return false;
       setFeedback({
         kind: "success",
         message: syncWarning
           ? `Object region created. Authoring script sync skipped: ${syncWarning}`
           : "Object region created.",
       });
+      return true;
     } catch (error) {
+      if (historyContext.isCurrentSessionScope() === false) return false;
       setFeedback({ kind: "error", message: errorMessage(error) });
+      return false;
     } finally {
+      createInFlight.current = false;
       setPending(false);
     }
   }
@@ -317,11 +387,7 @@ export function RegionsListPanel({ selection }: InspectorPanelProps) {
               size="sm"
               type="button"
               variant="ghost"
-              onClick={() => {
-                setAdding(false);
-                setDraft(defaultNewRegionDraft());
-                setFeedback(null);
-              }}
+              onClick={resetDraft}
             >
               Cancel
             </Button>

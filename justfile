@@ -127,6 +127,100 @@ windows-doctor:
 windows-setup:
     powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{repo_root}}/scripts/windows/setup_fullmag.ps1" -InstallMissing
 
+# Build a missing/stale native package, then open the empty authoring workspace.
+windows-ui frontend="dev" web_port="3197" build="auto" backend_profile="auto":
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{repo_root}}/scripts/windows/run_fullmag.ps1" -BuildMode "{{build}}" -Frontend "{{frontend}}" -BackendProfile "{{backend_profile}}" -RunMode workspace -WebPort "{{web_port}}"
+
+# Build the native workspace without starting the UI. The fixed storage action
+# owns preflight, the native heavy slot and the terminal receipt.
+windows-workspace-build backend_profile="dev" frontend="dev" web_port="3197" build="auto":
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{repo_root}}/scripts/windows/run_fullmag.ps1" -BuildMode "{{build}}" -Frontend "{{frontend}}" -BackendProfile "{{backend_profile}}" -RunMode workspace -WebPort "{{web_port}}" -BuildOnly
+
+# Recover a stale native workspace owner only after Windows process/listener checks.
+windows-runtime-recover port="3197":
+    @{{storage_python}} "{{repo_root}}/scripts/windows/recover_runtime.py" --repo-root "{{repo_root}}" --web-port "{{port}}"
+
+# Explicit one-shot backend rebuild; does not restart the active workspace.
+windows-backend-dev web_port="3197":
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{repo_root}}/scripts/windows/run_fullmag.ps1" -BuildMode "true" -Frontend "dev" -BackendProfile "dev" -RunMode workspace -WebPort "{{web_port}}" -BuildOnly
+
+# Fixed interpreted checks for development handoff persistence, without Cargo.
+verify-windows-development-handoff:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_handoff.py" --repo-root "{{repo_root}}"
+
+# Observe the development resource in an owned empty API; no unit compilation.
+verify-windows-development-backend-api cross_build_bundle="":
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --cross-build-bundle "{{cross_build_bundle}}"
+
+# Explicit frozen native package gate, pinned to the completed manifest digest.
+verify-windows-frozen-development-backend-api build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --frozen-native-build-id "{{build_id}}"
+
+# Owned HTTP cancellation protocol proof, pinned to a verified native package.
+# Uses fixture-seeded task catalogs; does not qualify Submit, solver, or host release.
+verify-compute-cancellation-api build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-cancellation-only --frozen-native-build-id "{{build_id}}"
+
+# Native operator initialization proof; fixture policy is not hardware evidence.
+verify-compute-host-initialization build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-host-initialization-only --frozen-native-build-id "{{build_id}}"
+
+# Standalone scheduler component cancellation/drain proof, not service v2 startup.
+verify-compute-scheduler-cancellation build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-scheduler-cancellation-only --frozen-native-build-id "{{build_id}}"
+
+# Native observer protocol proof; no unit-test compilation or user-session restart.
+verify-windows-development-observer-pause:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --observer-pause-only
+
+# Owned empty/scene consumer proof; never restarts a user's workspace.
+verify-windows-development-restart-consumer:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --restart-consumer-only
+
+# Owner-authenticated lease proof in separate owned APIs with controlled frames.
+verify-windows-development-consumer-readiness:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --consumer-readiness-only
+
+# Exercise the B consumer pump with an independently verified A API bundle.
+verify-windows-development-consumer-pump owner_bundle:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --consumer-pump-owner-bundle "{{owner_bundle}}"
+
+# Refuse native restart while a real FDM CPU run keeps progressing.
+verify-windows-development-active-run-refusal owner_bundle:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --active-run-refusal-owner-bundle "{{owner_bundle}}"
+
+# Refuse native restart while a real FDM CPU run is paused, then resume it.
+verify-windows-development-active-run-paused-refusal owner_bundle:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --active-run-refusal-owner-bundle "{{owner_bundle}}" --active-run-scenario "paused"
+
+# Exercise the concurrent API Solve versus restart-acquisition admission boundary.
+verify-windows-development-start-freeze-race:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --start-freeze-race-only
+
+# Owned native restart with a real nonempty browser workspace and unsaved draft.
+verify-windows-development-workspace-browser owner_bundle:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --workspace-browser-owner-bundle "{{owner_bundle}}"
+
+# Real candidate helper faults in owned processes; no API or unit compilation.
+verify-windows-candidate-preparation:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --candidate-preparation-only
+
+# Native request transport proof; no unit-test compilation or user-session restart.
+verify-windows-development-restart-transport:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --restart-transport-only
+
+# Observe actual runtime-free project archives without compiling unit tests.
+verify-windows-project-document:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only
+
+# Bind archive and scene-stage proof to one sealed package despite later checkout edits.
+verify-windows-project-document-frozen build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only --frozen-native-build-id "{{build_id}}"
+
+# Preserve a verified old API package for an owned subsequent restart proof.
+archive-windows-native-build build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only --frozen-native-build-id "{{build_id}}" --archive-frozen-bundle
+
 windows-build backend="fdm" device="cpu" frontend="dev" skip_local_changes="false":
     backend="{{backend}}"; device="{{device}}"; frontend="{{frontend}}"; skip_local_changes="{{skip_local_changes}}"; \
     case "$backend" in backend=*) backend="${backend#backend=}" ;; --backend=*) backend="${backend#--backend=}" ;; esac; \
@@ -233,6 +327,10 @@ check-session-persistence:
 # Source-only API check for application/session adapters; excludes test targets.
 check-api-source:
     {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-source-check --repo-root "{{repo_root}}"
+
+# Production API, service and scheduler source check; excludes test targets.
+check-api-service-source:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-service-source-check --repo-root "{{repo_root}}"
 
 # Source-only production CLI check; excludes unit tests and native solvers.
 check-cli-source:
@@ -341,6 +439,11 @@ verify-authoring-scene-adapter:
 generate-api-openapi:
     {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-openapi-codegen --repo-root "{{repo_root}}"
 
+# Read-only diagnostic export from a terminal, verified BuildRunner package.
+# This route builds nothing; the helper validates paths and records its result.
+export-runner-openapi job_id expected_commit:
+    {{storage_python}} "{{repo_root}}/scripts/export_runner_openapi.py" --repo-root "{{repo_root}}" --job-id "{{job_id}}" --expected-commit "{{expected_commit}}"
+
 # Lightweight generated client and production source checks; no unit builds.
 generate-control-room-client:
     {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route generate-client --repo-root "{{repo_root}}"
@@ -348,16 +451,71 @@ generate-control-room-client:
 check-control-room-production-source:
     {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route production-source --repo-root "{{repo_root}}"
 
+# Interpreted Node contract checks in isolated managed fixtures; no unit builds.
+verify-control-room-openapi-import:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route openapi-import-check --repo-root "{{repo_root}}"
+
 check-control-room-api-hygiene:
     {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route api-hygiene --repo-root "{{repo_root}}"
+
+verify-control-room-development-restart:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-restart-check --repo-root "{{repo_root}}"
+
+verify-control-room-resource-client-cache:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route resource-client-cache-check --repo-root "{{repo_root}}"
+
+verify-control-room-development-kernel-host:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-kernel-host-check --repo-root "{{repo_root}}"
+
+verify-control-room-development-transport-pause:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-transport-pause-check --repo-root "{{repo_root}}"
+
+verify-control-room-development-run-outcome-handoff:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-run-outcome-handoff-check --repo-root "{{repo_root}}"
+
+lint-control-room-development-run-outcome-handoff:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-run-outcome-handoff-lint --repo-root "{{repo_root}}"
+
+verify-control-room-development-restart-action:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-restart-action-check --repo-root "{{repo_root}}"
+
+lint-control-room-development-restart-action:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-restart-action-lint --repo-root "{{repo_root}}"
+
+verify-control-room-development-backend-build-action:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-backend-build-action-check --repo-root "{{repo_root}}"
 
 # Actual browser interaction on an isolated managed frontend source snapshot.
 # Responses are fixtures; this is neither a backend runtime nor a solver gate.
 verify-pinned-dataset-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}"
 
+# Production project controller in an isolated Next browser fixture; no unit builds.
+verify-project-document-handoff-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3251 --scenario project-document-handoff
+
+verify-development-kernel-host-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3252 --scenario development-kernel-host
+
+verify-development-run-outcome-handoff-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3253 --scenario development-run-outcome-handoff
+
+verify-development-restart-action-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3254 --scenario development-restart-action
+
+# Real Study profile component/facade against controlled HTTP; no solver gate.
+verify-study-execution-profile-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3256 --scenario study-execution-profile
+
+# Actual production Inspector actions against controlled staged/live/read-only sessions.
+verify-inspector-actions-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3257 --scenario inspector-actions
+
 lint-control-room-source:
     {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route lint --repo-root "{{repo_root}}"
+
+doctor-control-room-source:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route react-doctor --repo-root "{{repo_root}}"
 
 
 # Run only after the operator has allowed compilation of these regression tests.
@@ -406,6 +564,10 @@ verify-project-realtime-runtime:
 # Managed active-run runtime smoke with source identity and reconnect continuity.
 verify-project-active-run-runtime:
     {{storage_python}} "{{repo_root}}/scripts/verify_project_active_run_runtime.py" --repo-root "{{repo_root}}"
+
+# Real FDM CPU active-run smoke from an explicitly pinned native Windows package.
+verify-windows-frozen-active-run-runtime build_id:
+    {{storage_python}} "{{repo_root}}/scripts/verify_project_active_run_runtime.py" --repo-root "{{repo_root}}" --frozen-native-build-id "{{build_id}}"
 
 # Managed runtime-free CLI smoke for the shared project Open entrypoint.
 verify-project-entrypoint-runtime:
@@ -5625,6 +5787,7 @@ fullmag opt_1="" opt_2="" opt_3="" opt_4="" opt_5="" opt_6="" opt_7="" opt_8="":
         exec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$r/scripts/windows/run_fullmag_fem.ps1" -BuildMode "$build" -Frontend "$frontend" -Backend "$backend" -Device "$device" -RunMode "$run_mode" -ScriptPath "$script" -WebPort "$web_port" "${skip_local_changes_args[@]}"; \
       fi; \
       if [ "$windows" = "true" ] || [ "$host_windows" = "true" ]; then \
+        case ",$seen_options," in *",web_port,"*) ;; *) web_port="3100" ;; esac; \
         exec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$r/scripts/windows/run_fullmag.ps1" -BuildMode "$build" -Frontend "$frontend" -Backend "$backend" -Device "$device" -RunMode "$run_mode" -ScriptPath "$script" -WebPort "$web_port" "${skip_local_changes_args[@]}"; \
       fi; \
       if [ "$build" = "true" ]; then just ensure-python; elif [ ! -x "$r/.fullmag/local/python/bin/python" ]; then echo "Python env is missing; run with build=True or force=True once." >&2; exit 2; fi; \

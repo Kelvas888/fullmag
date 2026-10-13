@@ -673,11 +673,49 @@ struct HysteresisMagnetizationSnapshotArtifact {
 // ── Helpers ────────────────────────────────────────────────────────────
 
 fn session_store_root(state: &AppState) -> std::path::PathBuf {
-    state
-        .repo_root
-        .join(".fullmag")
-        .join("local-live")
-        .join("session-store")
+    session_store_path(
+        &state.repo_root,
+        state.current_command_journal_store_root.as_deref(),
+    )
+}
+
+fn session_store_path(
+    repo_root: &std::path::Path,
+    configured: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    // Startup resolves the writable state once. Checkpoints and the command
+    // journal must use that same store, including installed Windows packages.
+    configured
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| {
+            repo_root
+                .join(".fullmag")
+                .join("local-live")
+                .join("session-store")
+        })
+}
+
+#[cfg(test)]
+mod session_store_path_tests {
+    use super::session_store_path;
+
+    #[test]
+    fn checkpoint_store_uses_the_frozen_startup_state_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let install = directory.path().join("read-only-install");
+        let store = directory.path().join("user-state/local-live/session-store");
+        assert_eq!(session_store_path(&install, Some(&store)), store);
+        assert!(!install.exists());
+    }
+
+    #[test]
+    fn unconfigured_legacy_state_keeps_its_existing_store() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            session_store_path(directory.path(), None),
+            directory.path().join(".fullmag/local-live/session-store")
+        );
+    }
 }
 
 fn default_checkpoint_profile() -> SaveProfile {
@@ -1277,7 +1315,7 @@ fn scene_semantic_section(
 }
 
 fn execution_semantic_section(snapshot: &SessionStateResponse) -> serde_json::Value {
-    serde_json::json!({
+    let mut section = serde_json::json!({
         "requested_backend": snapshot.session.requested_backend,
         "authored_requested_device": snapshot.session.authored_requested_device,
         "requested_device": snapshot.session.requested_device,
@@ -1291,7 +1329,16 @@ fn execution_semantic_section(snapshot: &SessionStateResponse) -> serde_json::Va
         "resolved_engine_id": snapshot.session.resolved_engine_id,
         "plan_summary": snapshot.session.plan_summary,
         "runtime_status": snapshot.runtime_status,
-    })
+    });
+    if let Some(scene) = snapshot.scene_document.as_ref() {
+        if scene.study.execution_profile.is_some() || !scene.study.execution_layers.is_empty() {
+            section["authored_execution"] = serde_json::json!({
+                "execution_profile": scene.study.execution_profile,
+                "execution_layers": scene.study.execution_layers,
+            });
+        }
+    }
+    section
 }
 
 fn problem_ir_semantic_section(snapshot: &SessionStateResponse) -> Option<serde_json::Value> {
@@ -1606,11 +1653,9 @@ pub(crate) async fn import_session_commit_with_context(
     // Publishing an imported workspace replaces the mutable `current` root.
     // Revalidate the request identity after preflight and keep the transition
     // fence until the replacement and its realtime publication are complete.
-    let _transition = if request_context.is_some() {
-        Some(state.current_live_session_transition.lock().await)
-    } else {
-        None
-    };
+    // An import into an empty workspace has no request context to validate,
+    // but it still must be serialized against other session transitions.
+    let _transition = state.current_live_session_transition.lock().await;
     if let Some(context) = request_context {
         crate::validate_current_live_request_context(&state, context).await?;
     }
@@ -1877,6 +1922,99 @@ pub(crate) async fn create_checkpoint_with_context(
     Ok(Json(CheckpointCreateResponse {
         checkpoint: checkpoint_entry(capture.checkpoint, &context, req.reason),
     }))
+}
+
+/// `DELETE /v2/sessions/current/persistence/checkpoints/{checkpoint_id}`
+///
+/// Removes one checkpoint of the current session's run. Fail-closed: a
+/// checkpoint that a stage record uses as restore source or loaded state, or
+/// that the run manifest names as its latest checkpoint, is refused with 409.
+/// Only the checkpoint-owned files go; CAS objects are reclaimed by the
+/// store's reviewed GC, never here.
+pub(crate) async fn delete_checkpoint_with_context(
+    State(state): State<Arc<AppState>>,
+    checkpoint_id: String,
+    context: Option<&crate::types::CurrentLiveRequestContext>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let _transition = if context.is_some() {
+        Some(state.current_live_session_transition.lock().await)
+    } else {
+        None
+    };
+    if let Some(context) = context {
+        crate::validate_current_live_request_context(&state, context).await?;
+    }
+    let store = open_store(&state)?;
+
+    let mut guard = state.current_live_state.write().await;
+    let snapshot = guard
+        .as_mut()
+        .ok_or_else(|| ApiError::not_found("no active workspace"))?;
+    if let Some(context) = context {
+        crate::ensure_current_live_request_context(
+            snapshot,
+            context,
+            state
+                .current_live_session_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        )?;
+    }
+    let run_id = snapshot.session.run_id.clone();
+    let checkpoint = read_checkpoint_for_run(&store, &run_id, &checkpoint_id)?;
+
+    if let Some(stage_execution) = snapshot.stage_execution.as_ref() {
+        for (index, record) in stage_execution.stages.iter().enumerate() {
+            let restore_source = record.resume_from_checkpoint_ref.as_deref()
+                == Some(checkpoint_id.as_str());
+            let loaded_state = record.loaded_state_ref.as_deref()
+                == Some(checkpoint.common_state_ref.as_str());
+            if restore_source || loaded_state {
+                return Err(ApiError::conflict(format!(
+                    "checkpoint_delete_referenced: checkpoint {checkpoint_id} is the restore source of {}",
+                    stage_id_for_index(index)
+                )));
+            }
+        }
+    }
+
+    match store.delete_checkpoint(&run_id, &checkpoint_id) {
+        Ok(true) => {}
+        // Removed by a concurrent writer between the read and the lease.
+        Ok(false) => return Err(ApiError::not_found("checkpoint not found")),
+        Err(error) => {
+            return Err(
+                if error
+                    .downcast_ref::<fullmag_session::CheckpointStillReferenced>()
+                    .is_some()
+                {
+                    ApiError::conflict(format!("checkpoint_delete_referenced: {error}"))
+                } else {
+                    ApiError::internal(format!("deleting checkpoint: {error}"))
+                },
+            );
+        }
+    }
+
+    // The stage that saved the checkpoint no longer has a file to point at.
+    if let Some(stage_execution) = snapshot.stage_execution.as_mut() {
+        for record in &mut stage_execution.stages {
+            if record.checkpoint_ref.as_deref() == Some(checkpoint_id.as_str()) {
+                record.checkpoint_ref = None;
+                record
+                    .artifact_refs
+                    .retain(|artifact| artifact != &checkpoint.common_state_ref);
+                if record.state_transition_kind.as_deref() == Some("save_checkpoint") {
+                    record.state_transition = None;
+                    record.state_transition_kind = None;
+                    record.state_transition_reason = None;
+                    record.state_transition_ui_presentation = None;
+                }
+            }
+        }
+    }
+    // The catalogue's revision: clients refetch when the session state advances.
+    snapshot.state_version = snapshot.state_version.saturating_add(1);
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// `POST /v2/sessions/current/persistence/checkpoints/{checkpoint_id}/restore`
@@ -3484,7 +3622,7 @@ fn convert_field_state_with_python(
     repo_root: &std::path::Path,
     artifact_path: &std::path::Path,
 ) -> Result<FieldStateJsonArtifact, String> {
-    let workspace_root = fullmag_python_workspace_root(repo_root);
+    let workspace_root = crate::script::python_workspace_root(repo_root);
     let python_path = workspace_root.join("packages/fullmag-py/src");
     let existing_python_path = std::env::var_os("PYTHONPATH");
     let mut python_path_value = std::ffi::OsString::from(python_path.as_os_str());
@@ -3493,13 +3631,17 @@ fn convert_field_state_with_python(
         python_path_value.push(existing);
     }
 
-    let python_exe = crate::script::python_executable(repo_root);
-    let output = std::process::Command::new(&python_exe)
+    let mut command = crate::script::python_command(repo_root)
+        .map_err(|error| format!("configuring Python field-state loader failed: {error}"))?;
+    command
         .arg("-m")
         .arg("fullmag.init.field_state_cli")
         .arg(artifact_path)
-        .env("PYTHONPATH", python_path_value)
-        .current_dir(&workspace_root)
+        .current_dir(&workspace_root);
+    if fullmag_runtime_control::python_runtime::packaged_windows_python(&workspace_root).is_none() {
+        command.env("PYTHONPATH", python_path_value);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("running Python field-state loader failed: {error}"))?;
     if !output.status.success() {
@@ -3530,7 +3672,7 @@ fn write_field_state_with_python(
         ))
     })?;
 
-    let workspace_root = fullmag_python_workspace_root(repo_root);
+    let workspace_root = crate::script::python_workspace_root(repo_root);
     let python_path = workspace_root.join("packages/fullmag-py/src");
     let existing_python_path = std::env::var_os("PYTHONPATH");
     let mut python_path_value = std::ffi::OsString::from(python_path.as_os_str());
@@ -3539,20 +3681,26 @@ fn write_field_state_with_python(
         python_path_value.push(existing);
     }
 
-    let python_exe = crate::script::python_executable(repo_root);
-    let output = std::process::Command::new(&python_exe)
-        .arg("-m")
-        .arg("fullmag.init.field_state_cli")
-        .arg("write")
-        .arg(artifact_path)
-        .arg("--input-json")
-        .arg(&json_path)
-        .arg("--format")
-        .arg(format)
-        .env("PYTHONPATH", python_path_value)
-        .current_dir(&workspace_root)
-        .output()
-        .map_err(|error| ApiError::internal(format!("running Python field-state writer: {error}")));
+    let output = crate::script::python_command(repo_root).and_then(|mut command| {
+        command
+            .arg("-m")
+            .arg("fullmag.init.field_state_cli")
+            .arg("write")
+            .arg(artifact_path)
+            .arg("--input-json")
+            .arg(&json_path)
+            .arg("--format")
+            .arg(format)
+            .current_dir(&workspace_root);
+        if fullmag_runtime_control::python_runtime::packaged_windows_python(&workspace_root)
+            .is_none()
+        {
+            command.env("PYTHONPATH", python_path_value);
+        }
+        command.output().map_err(|error| {
+            ApiError::internal(format!("running Python field-state writer: {error}"))
+        })
+    });
 
     let _ = std::fs::remove_file(&json_path);
 
@@ -3566,16 +3714,6 @@ fn write_field_state_with_python(
         )));
     }
     Ok(())
-}
-
-fn fullmag_python_workspace_root(repo_root: &std::path::Path) -> std::path::PathBuf {
-    if repo_root.join("packages/fullmag-py/src/fullmag").exists() {
-        return repo_root.to_path_buf();
-    }
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf())
 }
 
 fn resolve_session_artifact_ref(
@@ -3801,6 +3939,94 @@ mod terminal_field_generation_persistence_tests {
     use super::*;
     use crate::session::{apply_current_live_field_frame, default_current_live_state};
     use crate::types::{CurrentLiveFieldFrameRequest, CurrentLiveSnapshotRequest};
+
+    #[test]
+    fn restore_execution_compatibility_includes_authored_profile_and_layers() {
+        let request: CurrentLiveSnapshotRequest =
+            serde_json::from_value(serde_json::json!({"session_id": "profile-restore"})).unwrap();
+        let mut original = default_current_live_state(&request);
+        let builder: fullmag_authoring::ScriptBuilderState =
+            serde_json::from_value(serde_json::json!({
+                "revision": 1,
+                "solver": {
+                    "integrator": "rk45",
+                    "fixed_timestep": "",
+                    "relax_algorithm": "llg_overdamped",
+                    "torque_tolerance": "1e-4",
+                    "energy_tolerance": "",
+                    "max_relax_steps": "1000"
+                },
+                "mesh": {
+                    "algorithm_2d": 6,
+                    "algorithm_3d": 1,
+                    "hmax": "",
+                    "hmin": "",
+                    "size_factor": 1.0,
+                    "size_from_curvature": 0,
+                    "smoothing_steps": 1,
+                    "optimize": "",
+                    "optimize_iterations": 1,
+                    "compute_quality": false,
+                    "per_element_quality": false
+                },
+                "geometries": []
+            }))
+            .expect("minimal builder state should deserialize");
+        original.scene_document = Some(fullmag_authoring::scene_document_from_script_builder(
+            &builder,
+        ));
+        assert!(execution_semantic_section(&original)
+            .get("authored_execution")
+            .is_none());
+        let mut changed = original.clone();
+        changed
+            .scene_document
+            .as_mut()
+            .unwrap()
+            .study
+            .execution_profile = Some(fullmag_ir::ExecutionProfileIR {
+            profile_id: "exec:restore".into(),
+            version: "1".into(),
+            ..Default::default()
+        });
+        assert!(!session_restore_compatibility(Some(&original), &changed)
+            .execution
+            .differences
+            .is_empty());
+        original = changed.clone();
+        changed
+            .scene_document
+            .as_mut()
+            .unwrap()
+            .study
+            .execution_profile
+            .as_mut()
+            .unwrap()
+            .version = "2".into();
+        assert!(!session_restore_compatibility(Some(&original), &changed)
+            .execution
+            .differences
+            .is_empty());
+        changed = original.clone();
+        changed
+            .scene_document
+            .as_mut()
+            .unwrap()
+            .study
+            .execution_layers = serde_json::from_value(serde_json::json!([{
+            "origin": {"kind": "study", "location": "scene.study"},
+            "request": {"device": "auto"}
+        }]))
+        .unwrap();
+        assert!(!session_restore_compatibility(Some(&original), &changed)
+            .execution
+            .differences
+            .is_empty());
+        assert!(session_restore_compatibility(Some(&original), &original)
+            .execution
+            .differences
+            .is_empty());
+    }
 
     fn terminal_frame(run_id: &str, sequence: u64) -> CurrentLiveFieldFrameRequest {
         serde_json::from_value(serde_json::json!({

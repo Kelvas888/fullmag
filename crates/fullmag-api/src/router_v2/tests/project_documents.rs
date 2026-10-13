@@ -196,6 +196,7 @@ async fn coordinator_transition_survives_store_reopen_and_writer_conflict() {
             heartbeat_at: now,
             heartbeat_sequence: claim.lease.heartbeat_sequence,
             released_at: None,
+            host_launch_binding: None,
         })
         .unwrap();
     let mut coordinator =
@@ -1011,9 +1012,8 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
     assert_eq!(second_run.status(), StatusCode::CREATED);
     let second_run = body_json(second_run).await;
     let second_run_id = second_run["run_id"].as_str().unwrap().to_string();
-    let second_materialization_route = format!(
-        "/v2/persistence/projects/project-submit/runs/{second_run_id}/materialization"
-    );
+    let second_materialization_route =
+        format!("/v2/persistence/projects/project-submit/runs/{second_run_id}/materialization");
     let second_materialization = app
         .clone()
         .oneshot(
@@ -1167,8 +1167,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         persisted_task.readiness,
         fullmag_session::FmsTaskReadiness::Blocked { .. }
     ));
-    let scheduler_e2e =
-        std::env::var("FULLMAG_ACCEPTED_SCHEDULER_E2E").as_deref() == Ok("1");
+    let scheduler_e2e = std::env::var("FULLMAG_ACCEPTED_SCHEDULER_E2E").as_deref() == Ok("1");
     let scheduler_pool_e2e =
         std::env::var("FULLMAG_ACCEPTED_SCHEDULER_POOL_E2E").as_deref() == Ok("1");
     let scheduler_discovery_e2e =
@@ -1176,13 +1175,11 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
     let scheduler_persistent_cursor_e2e =
         std::env::var("FULLMAG_ACCEPTED_SCHEDULER_PERSISTENT_CURSOR_E2E").as_deref() == Ok("1");
     let scheduler_parallel_resources_e2e =
-        std::env::var("FULLMAG_ACCEPTED_SCHEDULER_PARALLEL_RESOURCES_E2E").as_deref()
-            == Ok("1");
+        std::env::var("FULLMAG_ACCEPTED_SCHEDULER_PARALLEL_RESOURCES_E2E").as_deref() == Ok("1");
     let scheduler_resource_pool_e2e =
         std::env::var("FULLMAG_ACCEPTED_SCHEDULER_RESOURCE_POOL_E2E").as_deref() == Ok("1");
     let scheduler_dynamic_resource_pool_e2e =
-        std::env::var("FULLMAG_ACCEPTED_SCHEDULER_DYNAMIC_RESOURCE_POOL_E2E").as_deref()
-            == Ok("1");
+        std::env::var("FULLMAG_ACCEPTED_SCHEDULER_DYNAMIC_RESOURCE_POOL_E2E").as_deref() == Ok("1");
     let scheduler_resident_discovery_e2e =
         std::env::var("FULLMAG_ACCEPTED_SCHEDULER_RESIDENT_DISCOVERY_E2E").as_deref() == Ok("1");
     let scheduler_resident_drain_e2e =
@@ -1240,8 +1237,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         let mut first = scheduler_command(accepted_run_id.as_str(), "cpu-parallel-a")
             .spawn()
             .expect("spawn first parallel accepted scheduler");
-        let first_running_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let first_running_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let lifecycle = store
                 .read_run_catalog(accepted_run_id.as_str())
@@ -1274,8 +1270,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
             String::from_utf8_lossy(&conflict.stderr)
         );
 
-        let contention_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let contention_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let writer_contention = loop {
             match store.write_transaction() {
                 Ok(transaction) => break transaction,
@@ -1295,8 +1290,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
             .expect("spawn second parallel accepted scheduler");
         std::thread::sleep(std::time::Duration::from_millis(250));
         drop(writer_contention);
-        let overlap_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let overlap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let first_lifecycle = store
                 .read_run_catalog(accepted_run_id.as_str())
@@ -1401,7 +1395,9 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
                 .arg("--expected-generation")
                 .arg(expected_generation.to_string());
             if let Some(resource) = resource {
-                command.arg("--resource-offer").arg(resource_offer(resource));
+                command
+                    .arg("--resource-offer")
+                    .arg(resource_offer(resource));
             }
             let output = command.output().expect("publish scheduler resource pool");
             assert!(
@@ -1442,7 +1438,10 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
             .arg("250")
             .arg("--max-automatic-retries")
             .arg("0")
-            .env("FULLMAG_TEST_ACCEPTED_WORKER_AFTER_STARTED_DELAY_MS", "1000")
+            .env(
+                "FULLMAG_TEST_ACCEPTED_WORKER_AFTER_STARTED_DELAY_MS",
+                "1000",
+            )
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1457,8 +1456,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         let first = publish(1, Some("cpu-dynamic-a"));
         assert_eq!(first["generation"], 2);
 
-        let running_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let running_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let first_lifecycle = store
                 .read_run_catalog(accepted_run_id.as_str())
@@ -1524,10 +1522,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
                 fullmag_session::FmsTaskLifecycle::Succeeded
             );
             assert!(store
-                .read_active_resource_lease_for_task(
-                    run_id,
-                    catalog.tasks[0].task_id.as_str(),
-                )
+                .read_active_resource_lease_for_task(run_id, catalog.tasks[0].task_id.as_str(),)
                 .unwrap()
                 .is_none());
         }
@@ -1587,8 +1582,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn bounded resource pool scheduler");
-        let overlap_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let overlap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let first_lifecycle = store
                 .read_run_catalog(accepted_run_id.as_str())
@@ -1711,8 +1705,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
             .spawn()
             .expect("spawn resident accepted scheduler");
         let mut scheduler = KillOnDropChild::new(scheduler);
-        let initial_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let initial_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let first = store
                 .read_run_catalog(accepted_run_id.as_str())
@@ -1753,8 +1746,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         third_payload["run_intent"]["specification"]["run_id"] =
             serde_json::json!("run-http-resident-third");
         let third_body = third_payload.to_string();
-        let third_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let third_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let third_run = loop {
             let response = app
                 .clone()
@@ -1791,8 +1783,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
             .unwrap();
         assert_eq!(third_materialization.status(), StatusCode::OK);
 
-        let completion_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if scheduler.try_wait().unwrap().is_some() {
                 break;
@@ -1878,23 +1869,23 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
             .arg("250")
             .arg("--max-automatic-retries")
             .arg("0")
-            .env("FULLMAG_TEST_ACCEPTED_WORKER_AFTER_STARTED_DELAY_MS", "1500")
+            .env(
+                "FULLMAG_TEST_ACCEPTED_WORKER_AFTER_STARTED_DELAY_MS",
+                "1500",
+            )
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            command.creation_flags(
-                windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP,
-            );
+            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
         }
         let scheduler = command
             .spawn()
             .expect("spawn resident drain accepted scheduler");
         let mut scheduler = KillOnDropChild::new(scheduler);
-        let running_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let running_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let first = store
                 .read_run_catalog(accepted_run_id.as_str())
@@ -1975,35 +1966,63 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
             scheduler.arg("--pool-id").arg("scheduler-persistent-e2e");
         }
         let output = scheduler
-            .arg("--resource-id").arg("cpu-scheduler-e2e")
-            .arg("--resource-kind").arg("cpu")
-            .arg("--cpu-millis").arg("100")
-            .arg("--memory-bytes").arg("1048576")
-            .arg("--gpu-memory-bytes").arg("0")
-            .arg("--storage-bytes").arg("8388608")
-            .arg("--worker-executable").arg(&worker_executable)
-            .arg("--max-concurrency").arg("1")
-            .arg("--max-tasks").arg(if scheduler_multi_run_e2e { "3" } else { "1" })
-            .arg("--max-idle-polls").arg(if scheduler_multi_run_e2e { "1" } else { "0" })
-            .arg("--idle-poll-milliseconds").arg("10")
-            .arg("--worker-timeout-seconds").arg("30")
-            .arg("--heartbeat-interval-milliseconds").arg("500")
-            .arg("--max-automatic-retries").arg("0")
+            .arg("--resource-id")
+            .arg("cpu-scheduler-e2e")
+            .arg("--resource-kind")
+            .arg("cpu")
+            .arg("--cpu-millis")
+            .arg("100")
+            .arg("--memory-bytes")
+            .arg("1048576")
+            .arg("--gpu-memory-bytes")
+            .arg("0")
+            .arg("--storage-bytes")
+            .arg("8388608")
+            .arg("--worker-executable")
+            .arg(&worker_executable)
+            .arg("--max-concurrency")
+            .arg("1")
+            .arg("--max-tasks")
+            .arg(if scheduler_multi_run_e2e { "3" } else { "1" })
+            .arg("--max-idle-polls")
+            .arg(if scheduler_multi_run_e2e { "1" } else { "0" })
+            .arg("--idle-poll-milliseconds")
+            .arg("10")
+            .arg("--worker-timeout-seconds")
+            .arg("30")
+            .arg("--heartbeat-interval-milliseconds")
+            .arg("500")
+            .arg("--max-automatic-retries")
+            .arg("0")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
             .expect("run the built accepted scheduler");
-        assert!(output.status.success(), "accepted scheduler E2E failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "accepted scheduler E2E failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(summary["status"], "completed");
-        assert_eq!(summary["scheduled_count"], if scheduler_multi_run_e2e { 2 } else { 1 });
+        assert_eq!(
+            summary["scheduled_count"],
+            if scheduler_multi_run_e2e { 2 } else { 1 }
+        );
         assert_eq!(
             summary["run_source"],
-            if scheduler_discovery_e2e { "store" } else { "explicit" }
+            if scheduler_discovery_e2e {
+                "store"
+            } else {
+                "explicit"
+            }
         );
         assert_eq!(summary["executed"][0]["run_id"], accepted_run_id.as_str());
-        assert_eq!(summary["executed"][0]["task_id"], persisted_task.task_id.as_str());
+        assert_eq!(
+            summary["executed"][0]["task_id"],
+            persisted_task.task_id.as_str()
+        );
         assert_eq!(summary["executed"][0]["step_id"], step.step_id.as_str());
         assert_eq!(summary["executed"][0]["admission"], "admitted");
         assert_eq!(summary["executed"][0]["worker"]["status"], "completed");
@@ -2011,53 +2030,100 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
             assert_eq!(summary["pool_id"], "scheduler-persistent-e2e");
             assert_eq!(summary["pool_checkpoint_sequence"], 1);
         }
-        let catalog = store.read_run_catalog(accepted_run_id.as_str()).unwrap().unwrap();
-        let task = catalog.tasks.iter().find(|task| task.task_id == persisted_task.task_id).unwrap();
+        let catalog = store
+            .read_run_catalog(accepted_run_id.as_str())
+            .unwrap()
+            .unwrap();
+        let task = catalog
+            .tasks
+            .iter()
+            .find(|task| task.task_id == persisted_task.task_id)
+            .unwrap();
         assert_eq!(task.lifecycle, fullmag_session::FmsTaskLifecycle::Succeeded);
         assert_eq!(task.ownership_epoch, Some(1));
         assert!(!task.artifact_ids.is_empty());
-        assert!(store.read_active_resource_lease_for_task(accepted_run_id.as_str(), persisted_task.task_id.as_str()).unwrap().is_none());
+        assert!(store
+            .read_active_resource_lease_for_task(
+                accepted_run_id.as_str(),
+                persisted_task.task_id.as_str()
+            )
+            .unwrap()
+            .is_none());
         if scheduler_persistent_cursor_e2e {
             let second_output = std::process::Command::new(&scheduler_executable)
-                .arg("--store-root").arg(store.root())
-                .arg("--run-id").arg(accepted_run_id.as_str())
-                .arg("--run-id").arg(&second_run_id)
-                .arg("--pool-id").arg("scheduler-persistent-e2e")
-                .arg("--resource-id").arg("cpu-scheduler-e2e")
-                .arg("--resource-kind").arg("cpu")
-                .arg("--cpu-millis").arg("100")
-                .arg("--memory-bytes").arg("1048576")
-                .arg("--gpu-memory-bytes").arg("0")
-                .arg("--storage-bytes").arg("8388608")
-                .arg("--worker-executable").arg(&worker_executable)
-                .arg("--max-concurrency").arg("1")
-                .arg("--max-tasks").arg("1")
-                .arg("--max-idle-polls").arg("0")
-                .arg("--idle-poll-milliseconds").arg("10")
-                .arg("--worker-timeout-seconds").arg("30")
-                .arg("--heartbeat-interval-milliseconds").arg("500")
-                .arg("--max-automatic-retries").arg("0")
+                .arg("--store-root")
+                .arg(store.root())
+                .arg("--run-id")
+                .arg(accepted_run_id.as_str())
+                .arg("--run-id")
+                .arg(&second_run_id)
+                .arg("--pool-id")
+                .arg("scheduler-persistent-e2e")
+                .arg("--resource-id")
+                .arg("cpu-scheduler-e2e")
+                .arg("--resource-kind")
+                .arg("cpu")
+                .arg("--cpu-millis")
+                .arg("100")
+                .arg("--memory-bytes")
+                .arg("1048576")
+                .arg("--gpu-memory-bytes")
+                .arg("0")
+                .arg("--storage-bytes")
+                .arg("8388608")
+                .arg("--worker-executable")
+                .arg(&worker_executable)
+                .arg("--max-concurrency")
+                .arg("1")
+                .arg("--max-tasks")
+                .arg("1")
+                .arg("--max-idle-polls")
+                .arg("0")
+                .arg("--idle-poll-milliseconds")
+                .arg("10")
+                .arg("--worker-timeout-seconds")
+                .arg("30")
+                .arg("--heartbeat-interval-milliseconds")
+                .arg("500")
+                .arg("--max-automatic-retries")
+                .arg("0")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .output()
                 .expect("restart the accepted scheduler with its durable cursor");
-            assert!(second_output.status.success(), "accepted scheduler cursor restart E2E failed: {}", String::from_utf8_lossy(&second_output.stderr));
+            assert!(
+                second_output.status.success(),
+                "accepted scheduler cursor restart E2E failed: {}",
+                String::from_utf8_lossy(&second_output.stderr)
+            );
             let second_summary: serde_json::Value =
                 serde_json::from_slice(&second_output.stdout).unwrap();
             assert_eq!(second_summary["scheduled_count"], 1);
             assert_eq!(second_summary["pool_checkpoint_sequence"], 2);
-            assert_eq!(second_summary["executed"][0]["run_id"], second_run_id.as_str());
-            assert_eq!(second_summary["executed"][0]["worker"]["status"], "completed");
+            assert_eq!(
+                second_summary["executed"][0]["run_id"],
+                second_run_id.as_str()
+            );
+            assert_eq!(
+                second_summary["executed"][0]["worker"]["status"],
+                "completed"
+            );
             let checkpoint = store
                 .read_scheduler_pool_checkpoint("scheduler-persistent-e2e")
                 .unwrap()
                 .unwrap();
             assert_eq!(checkpoint.sequence, 2);
-            assert_eq!(checkpoint.next_run_id.as_deref(), Some(accepted_run_id.as_str()));
+            assert_eq!(
+                checkpoint.next_run_id.as_deref(),
+                Some(accepted_run_id.as_str())
+            );
             let second_catalog = store.read_run_catalog(&second_run_id).unwrap().unwrap();
             let second_task = second_catalog.tasks.first().unwrap();
-            assert_eq!(second_task.lifecycle, fullmag_session::FmsTaskLifecycle::Succeeded);
+            assert_eq!(
+                second_task.lifecycle,
+                fullmag_session::FmsTaskLifecycle::Succeeded
+            );
             assert!(store
                 .read_active_resource_lease_for_task(&second_run_id, second_task.task_id.as_str())
                 .unwrap()
@@ -2073,10 +2139,16 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
             );
             assert_eq!(summary["idle_poll_count"], 1);
             assert_eq!(summary["executed"][1]["run_id"], second_run_id.as_str());
-            assert_eq!(summary["executed"][1]["task_id"], second_task.task_id.as_str());
+            assert_eq!(
+                summary["executed"][1]["task_id"],
+                second_task.task_id.as_str()
+            );
             assert_eq!(summary["executed"][1]["admission"], "admitted");
             assert_eq!(summary["executed"][1]["worker"]["status"], "completed");
-            assert_eq!(second_task.lifecycle, fullmag_session::FmsTaskLifecycle::Succeeded);
+            assert_eq!(
+                second_task.lifecycle,
+                fullmag_session::FmsTaskLifecycle::Succeeded
+            );
             assert!(store
                 .read_active_resource_lease_for_task(&second_run_id, second_task.task_id.as_str())
                 .unwrap()
@@ -2858,9 +2930,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
                     .arg("500")
                     .arg("--max-automatic-retries")
                     .arg("1")
-                    .env_remove(
-                        "FULLMAG_TEST_ACCEPTED_SUPERVISOR_FAIL_AFTER_PROCESS_EXIT_RECEIPT",
-                    )
+                    .env_remove("FULLMAG_TEST_ACCEPTED_SUPERVISOR_FAIL_AFTER_PROCESS_EXIT_RECEIPT")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -2921,34 +2991,62 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
                 let scheduler_executable = std::env::var_os("FULLMAG_ACCEPTED_SCHEDULER_E2E_BIN")
                     .expect("scheduler retry E2E requires the built scheduler binary");
                 let retry = std::process::Command::new(scheduler_executable)
-                    .arg("--store-root").arg(store.root())
-                    .arg("--run-id").arg(accepted_run_id.as_str())
-                    .arg("--resource-id").arg("cpu-scheduler-retry-e2e")
-                    .arg("--resource-kind").arg("cpu")
-                    .arg("--cpu-millis").arg("100")
-                    .arg("--memory-bytes").arg("1048576")
-                    .arg("--gpu-memory-bytes").arg("0")
-                    .arg("--storage-bytes").arg("8388608")
-                    .arg("--worker-executable").arg(worker_executable)
-                    .arg("--max-concurrency").arg("1")
-                    .arg("--max-tasks").arg("1")
-                    .arg("--worker-timeout-seconds").arg("30")
-                    .arg("--heartbeat-interval-milliseconds").arg("5000")
-                    .arg("--max-automatic-retries").arg("0")
+                    .arg("--store-root")
+                    .arg(store.root())
+                    .arg("--run-id")
+                    .arg(accepted_run_id.as_str())
+                    .arg("--resource-id")
+                    .arg("cpu-scheduler-retry-e2e")
+                    .arg("--resource-kind")
+                    .arg("cpu")
+                    .arg("--cpu-millis")
+                    .arg("100")
+                    .arg("--memory-bytes")
+                    .arg("1048576")
+                    .arg("--gpu-memory-bytes")
+                    .arg("0")
+                    .arg("--storage-bytes")
+                    .arg("8388608")
+                    .arg("--worker-executable")
+                    .arg(worker_executable)
+                    .arg("--max-concurrency")
+                    .arg("1")
+                    .arg("--max-tasks")
+                    .arg("1")
+                    .arg("--worker-timeout-seconds")
+                    .arg("30")
+                    .arg("--heartbeat-interval-milliseconds")
+                    .arg("5000")
+                    .arg("--max-automatic-retries")
+                    .arg("0")
                     .env_remove("FULLMAG_TEST_ACCEPTED_WORKER_FAIL_BEFORE_EFFECT")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .output()
                     .expect("run scheduler for the durable retry");
-                assert!(retry.status.success(), "accepted scheduler retry E2E failed: {}", String::from_utf8_lossy(&retry.stderr));
-                let retry_summary: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
+                assert!(
+                    retry.status.success(),
+                    "accepted scheduler retry E2E failed: {}",
+                    String::from_utf8_lossy(&retry.stderr)
+                );
+                let retry_summary: serde_json::Value =
+                    serde_json::from_slice(&retry.stdout).unwrap();
                 assert_eq!(retry_summary["status"], "completed");
                 assert_eq!(retry_summary["scheduled_count"], 1);
                 assert_eq!(retry_summary["executed"][0]["ownership_epoch"], 2);
-                assert_eq!(retry_summary["executed"][0]["worker"]["status"], "completed");
-                let catalog = store.read_run_catalog(accepted_run_id.as_str()).unwrap().unwrap();
-                assert_eq!(catalog.tasks[0].lifecycle, fullmag_session::FmsTaskLifecycle::Succeeded);
+                assert_eq!(
+                    retry_summary["executed"][0]["worker"]["status"],
+                    "completed"
+                );
+                let catalog = store
+                    .read_run_catalog(accepted_run_id.as_str())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    catalog.tasks[0].lifecycle,
+                    fullmag_session::FmsTaskLifecycle::Succeeded
+                );
                 assert_eq!(catalog.tasks[0].ownership_epoch, Some(2));
                 assert!(!catalog.tasks[0].artifact_ids.is_empty());
             }
@@ -3188,7 +3286,8 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
                 .as_ref()
                 .expect("simple accepted FDM CPU worker retains its observation source");
             assert_eq!(observation_source.accepted_state_ref, *accepted_state_ref);
-            assert_eq!(observation_source.grid_cells, [1, 1, 1]);
+            // ProblemIR::bootstrap_example(): 200 x 20 x 6 nm strip on a 2 nm FDM grid.
+            assert_eq!(observation_source.grid_cells, [100, 10, 3]);
             observation_source.validate().unwrap();
 
             let mut recovered_inbox = fullmag_runtime_control::DurableWorkerInbox::recover(
@@ -3362,7 +3461,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         .as_ref()
         .expect("simple FDM CPU manifest pins its observation source");
     assert_eq!(observation_source.accepted_state_ref, *accepted_state_ref);
-    assert_eq!(observation_source.grid_cells, [1, 1, 1]);
+    assert_eq!(observation_source.grid_cells, [100, 10, 3]);
     assert_eq!(observation_source.quantity_ids, vec!["m".to_string()]);
     for (artifact_id, artifact_type, object_ref) in [
         (
@@ -3399,9 +3498,9 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         .get(&observation_source.snapshot_object_ref)
         .unwrap()
         .expect("observation accepted-state snapshot is stored in CAS");
-    let snapshot: fullmag_runner::FdmCpuAcceptedStateSnapshotV1 =
+    let state_snapshot: fullmag_runner::FdmCpuAcceptedStateSnapshotV1 =
         serde_json::from_slice(&snapshot_bytes).unwrap();
-    snapshot.validate().unwrap();
+    state_snapshot.validate().unwrap();
     fullmag_runtime_control::validate_study_task_completion(&store, &claim).unwrap();
     assert!(manifest.outputs.iter().any(|output| {
         output.port_id == "final_state"
@@ -3423,7 +3522,10 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
     assert_eq!(public_run.status(), StatusCode::OK);
     let public_run = body_json(public_run).await;
     let public_accepted_state = &public_run["tasks"][0]["accepted_state_ref"];
-    assert_eq!(public_accepted_state["id"]["run_id"], accepted_run_id.as_str());
+    assert_eq!(
+        public_accepted_state["id"]["run_id"],
+        accepted_run_id.as_str()
+    );
     assert_eq!(public_accepted_state["id"]["stage_id"], step.step_id);
     assert_eq!(
         public_accepted_state["id"]["state_digest"],
@@ -3488,7 +3590,10 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         .provenance
         .resolved_plan_digest
         .starts_with("sha256:"));
-    assert!(solution.provenance.acquisition_digest.starts_with("sha256:"));
+    assert!(solution
+        .provenance
+        .acquisition_digest
+        .starts_with("sha256:"));
     fullmag_runtime_control::reconcile_coordinator_catalog(&store, &claim).unwrap();
     assert_eq!(
         store
@@ -3512,13 +3617,36 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         .compute_quantities(&accepted_state_ref.id, &[fullmag_quantities::QuantityId::M])
         .expect("compute one atomic historical magnetization batch");
     assert_eq!(observation_batch.source, accepted_state_ref.id);
-    assert_eq!(observation_batch.quantity_ids, [fullmag_quantities::QuantityId::M]);
-    let fullmag_quantities::QuantityValue::VectorField(values) =
-        &observation_batch.values[0].1
+    assert_eq!(
+        observation_batch.quantity_ids,
+        [fullmag_quantities::QuantityId::M]
+    );
+    let fullmag_quantities::QuantityValue::VectorField(values) = &observation_batch.values[0].1
     else {
         panic!("historical m must remain a vector field");
     };
-    assert_eq!(values, &[1.0, 0.0, 0.0]);
+    let observed_cells = observation_source
+        .grid_cells
+        .iter()
+        .map(|cells| usize::try_from(*cells).unwrap())
+        .product::<usize>();
+    assert_eq!(observed_cells, 100 * 10 * 3);
+    assert_eq!(
+        values.len(),
+        3 * observed_cells,
+        "historical m must carry one vector per accepted FDM cell"
+    );
+    assert!(
+        values.chunks_exact(3).all(|vector| {
+            let norm = vector
+                .iter()
+                .map(|component| component * component)
+                .sum::<f64>()
+                .sqrt();
+            (norm - 1.0).abs() < 1.0e-6
+        }),
+        "historical m must remain unit-normalized in every cell"
+    );
     let mut stale_observation_source = accepted_state_ref.clone();
     stale_observation_source.generation.runtime_epoch += 1;
     assert!(fullmag_runtime_control::load_study_observation_runtime(
@@ -3630,6 +3758,210 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
     drop(store);
     drop(state);
     fs::remove_dir_all(repo_root).unwrap();
+}
+
+#[tokio::test]
+async fn project_batch_submit_replays_and_lists_durable_parent() {
+    use fullmag_application::{
+        BatchAxis, BatchAxisJoin, BatchAxisTarget, BatchAxisValueKind, BatchAxisValues,
+        BatchExecutionStrategy, BatchExpansionRequest, FileProjectRepository, ProjectEnvelope,
+        ProjectId, ProjectSnapshot, RequestedExecution, RequestedResourceBudget, StudyId,
+        StudyReference, RunSpecification,
+    };
+    use fullmag_authoring::{
+        PrimitiveStageNode, StudyDiscretizationReference, StudyExecutionProfileReference,
+        StudyModelReference, StudyPipelineDocument, StudyPipelineNode, StudyPipelineNodeSource,
+        StudyPlan, StudyPlanMigrationDefaults, StudyPrimitiveStageKind, StudySolverConfigReference,
+        STUDY_PLAN_SCHEMA_VERSION,
+    };
+    use fullmag_ir::ProblemIR;
+    use fullmag_plan::{StudyProblemCatalog, StudyProblemCatalogEntry};
+    use serde_json::json;
+
+    let (app, state, _repo_root) = test_router_with_session_store_state().await;
+    *state.current_live_state.write().await = None;
+    let definition = ProjectEnvelope::blank(
+        ProjectId::parse("project-batch-http").unwrap(),
+        "Batch",
+    )
+    .unwrap();
+    let archive = FileProjectRepository::new()
+        .encode_archive(&definition)
+        .unwrap();
+    let study = StudyPlan::from_pipeline(
+        "study-batch-http",
+        1,
+        &StudyPipelineDocument {
+            version: "study_pipeline.v2".into(),
+            nodes: vec![StudyPipelineNode::Primitive(PrimitiveStageNode {
+                id: "step:run".into(),
+                label: "Run".into(),
+                enabled: true,
+                notes: None,
+                source: Some(StudyPipelineNodeSource::UiAuthored),
+                stage_kind: StudyPrimitiveStageKind::Run,
+                payload: [("until_seconds".into(), json!("1e-9"))]
+                    .into_iter()
+                    .collect(),
+            })],
+        },
+        &StudyPlanMigrationDefaults {
+            model: StudyModelReference {
+                model_id: "model:batch".into(),
+                version: "v1".into(),
+            },
+            solver_config: StudySolverConfigReference {
+                preset_id: "solver:default".into(),
+                version: "v1".into(),
+            },
+            discretization: StudyDiscretizationReference {
+                recipe_id: "mesh:default".into(),
+                version: "v1".into(),
+            },
+            execution_profile: StudyExecutionProfileReference {
+                profile_id: "exec:auto".into(),
+                version: "v1".into(),
+            },
+        },
+    )
+    .unwrap();
+    let catalog = StudyProblemCatalog::from_entries(
+        &study,
+        vec![StudyProblemCatalogEntry::from_step(
+            &study.steps[0],
+            ProblemIR::bootstrap_example(),
+        )],
+    )
+    .unwrap();
+    let catalog_value = serde_json::to_value(&catalog).unwrap();
+    let template = RunSpecification::new(
+        ProjectSnapshot::from_envelope(&definition).unwrap(),
+        StudyReference {
+            study_id: StudyId::parse(study.study_id.clone()).unwrap(),
+            plan_version: STUDY_PLAN_SCHEMA_VERSION.into(),
+            plan_sha256: study.canonical_sha256().unwrap(),
+        },
+        fullmag_session::canonical_json_sha256(&catalog_value),
+        json!({}),
+        RequestedExecution {
+            backend: "fdm".into(),
+            device: "cpu".into(),
+            precision: "double".into(),
+            mode: "strict".into(),
+            minimum_resources: Some(RequestedResourceBudget {
+                cpu_millis: 100,
+                memory_bytes: 1,
+                gpu_memory_bytes: 0,
+                storage_bytes: 1,
+            }),
+        },
+    );
+    let batch_request = BatchExpansionRequest {
+        batch_id: "batch-http".into(),
+        strategy: BatchExecutionStrategy::Independent,
+        failure_policy: fullmag_application::BatchFailurePolicy::ContinueIndependent,
+        template,
+        axes: vec![BatchAxis {
+            name: "field_z".into(),
+            target: BatchAxisTarget::ExternalFieldB {
+                step_id: "step:run".into(),
+                direction: [0.0, 0.0, 1.0],
+            },
+            value_kind: BatchAxisValueKind::Number,
+            canonical_unit: "T".into(),
+            values: BatchAxisValues::List {
+                values: vec![json!(-0.01), json!(0.02)],
+            },
+            join: BatchAxisJoin::Cartesian,
+        }],
+        master_seed: 42,
+        seed_name: "batch_seed".into(),
+        max_cases: 16,
+        max_parallel_cases: Some(2),
+    };
+    let body = json!({
+        "archive_base64": base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &archive,
+        ),
+        "idempotency_key": "submit-batch-http",
+        "batch_request": batch_request,
+        "study_plan": study,
+        "study_problem_catalog": catalog,
+        "asset_paths": {},
+    });
+    let submit = |body: String| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v2/persistence/projects/project-batch-http/batches")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let first = app
+        .clone()
+        .oneshot(submit(body.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let accepted = body_json(first).await;
+    assert_eq!(accepted["disposition"], "accepted");
+    assert_eq!(accepted["batch_id"], "batch-http");
+    assert_eq!(accepted["case_count"], 2);
+
+    let replay = app
+        .clone()
+        .oneshot(submit(body.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(body_json(replay).await["disposition"], "replayed");
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v2/persistence/projects/project-batch-http/batches?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = body_json(listed).await;
+    assert_eq!(listed["batches"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["batches"][0]["manifest_sha256"], accepted["manifest_sha256"]);
+    assert_eq!(listed["batches"][0]["published_case_count"], 0);
+    assert_eq!(listed["batches"][0]["expansion_state"], "pending");
+
+    let cases = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v2/persistence/projects/project-batch-http/batches/batch-http/cases?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cases.status(), StatusCode::OK);
+    let cases = body_json(cases).await;
+    assert_eq!(cases["axes"][0]["name"], "field_z");
+    assert_eq!(cases["axes"][0]["canonical_unit"], "T");
+    assert_eq!(cases["cases"].as_array().unwrap().len(), 2);
+    assert_eq!(cases["cases"][0]["state"], "pending_expansion");
+    assert!(cases["cases"][0]["planned_run_id"].as_str().is_some());
+
+    let mut changed = body;
+    changed["batch_request"]["axes"][0]["values"]["values"][0] = json!(-0.02);
+    let conflict = app
+        .oneshot(submit(changed.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert!(state.current_live_state.read().await.is_none());
 }
 
 #[tokio::test]
@@ -3951,4 +4283,379 @@ fn worker_test_magnetization_artifact(
         "values": [value],
     }))
     .unwrap()
+}
+
+// ─── script to project (`POST /v2/persistence/projects/from-script`) ────────
+
+fn from_script_test_app() -> (axum::Router, PathBuf) {
+    // The clock is too coarse on Windows to keep parallel tests apart.
+    let unique = format!("{}-{}", std::process::id(), crate::uuid_v4_hex());
+    let root = std::env::temp_dir().join(format!("fullmag-api-from-script-{unique}"));
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace dir");
+    let mut state = test_app_state();
+    {
+        let state_mut = Arc::get_mut(&mut state).expect("test state should be uniquely owned");
+        state_mut.repo_root = crate::script::repo_root();
+        state_mut.current_workspace_root = workspace;
+    }
+    (build_v2_router().with_state(state), root)
+}
+
+async fn post_from_script(
+    app: &axum::Router,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/persistence/projects/from-script")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, body_json(response).await)
+}
+
+fn open_archive_documents(
+    archive_base64: &str,
+) -> (
+    fullmag_application::ProjectEnvelope,
+    std::collections::BTreeMap<String, Vec<u8>>,
+) {
+    use base64::Engine as _;
+    use fullmag_application::*;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(archive_base64)
+        .expect("archive is base64");
+    let opened = FileProjectRepository::new()
+        .open(ProjectSource::Bytes {
+            display_name: "from-script.fms".into(),
+            bytes,
+        })
+        .expect("archive reopens");
+    let documents = opened
+        .envelope
+        .opaque_documents
+        .iter()
+        .map(|document| (document.path().to_string(), document.bytes().to_vec()))
+        .collect();
+    (opened.envelope, documents)
+}
+
+const FROM_SCRIPT_VALID: &str = r#"
+import fullmag as fm
+
+print("script output that must not break the helper answer")
+study = fm.study("from_script_demo")
+study.engine("fem")
+
+body = study.geometry(fm.Box(100e-9, 40e-9, 5e-9), name="body")
+body.Ms = 800e3
+body.Aex = 13e-12
+body.alpha = 0.1
+body.m = fm.texture.uniform(1, 0, 0)
+
+study.run(1e-12)
+"#;
+
+#[tokio::test]
+async fn from_script_embeds_script_provenance_and_survives_open_and_authoring() {
+    let (app, root) = from_script_test_app();
+    let (status, json) = post_from_script(
+        &app,
+        serde_json::json!({
+            "source": {"name": "dir/from script demo.py", "text": FROM_SCRIPT_VALID},
+            "origin": "template:demo",
+            "consent": {"executed_by_user": true},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "from-script response: {json:?}"
+    );
+
+    let sha = format!("{:x}", Sha256::digest(FROM_SCRIPT_VALID.as_bytes()));
+    assert_eq!(json["name"], "from script demo");
+    assert_eq!(json["script_import"]["name"], "from script demo.py");
+    assert_eq!(json["script_import"]["sha256"], sha);
+    assert_eq!(json["script_import"]["origin"], "template:demo");
+    assert_eq!(
+        json["script_import"]["script_path"],
+        "project/source/script.py"
+    );
+    assert_eq!(json["script_import"]["fidelity"]["scene_exported"], true);
+    let round_trip = json["script_import"]["fidelity"]["round_trip"]
+        .as_str()
+        .unwrap();
+    assert!(
+        matches!(round_trip, "verified" | "failed" | "not_checked"),
+        "round_trip: {round_trip}"
+    );
+    assert!(
+        !json["script_import"]["fidelity"]["notes"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "fidelity must always explain itself: {json:?}"
+    );
+
+    let archive = json["archive_base64"].as_str().unwrap().to_string();
+    let (envelope, documents) = open_archive_documents(&archive);
+    assert_eq!(
+        documents["project/source/script.py"],
+        FROM_SCRIPT_VALID.as_bytes(),
+        "the original script is embedded byte for byte"
+    );
+    let meta: serde_json::Value =
+        serde_json::from_slice(&documents["project/source/script.json"]).unwrap();
+    assert_eq!(meta["sha256"], sha);
+    assert_eq!(meta["name"], "from script demo.py");
+    assert_eq!(meta["origin"], "template:demo");
+    assert_eq!(meta["fidelity"], json["script_import"]["fidelity"]);
+    let provenance = fullmag_workspace_inspect::provenance::parse_provenance(
+        &documents["project/provenance.json"],
+    )
+    .expect("provenance parses");
+    let history = provenance["history"].as_array().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["kind"], "import");
+    assert_eq!(
+        history[0]["summary"],
+        format!("Created from script from script demo.py ({})", &sha[..12])
+    );
+    // The scene is the exported SceneDocument, not a blank project.
+    assert!(envelope
+        .definition
+        .scene
+        .value()
+        .get("objects")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|objects| !objects.is_empty()));
+
+    // Open (definition only, nothing runs) returns the same documents.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/persistence/projects/open")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "display_name": "from-script.fms",
+                        "archive_base64": archive,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let reopened = body_json(response).await;
+    let (_, reopened_documents) =
+        open_archive_documents(reopened["archive_base64"].as_str().unwrap());
+    for path in [
+        "project/source/script.py",
+        "project/source/script.json",
+        "project/provenance.json",
+    ] {
+        assert_eq!(
+            reopened_documents[path], documents[path],
+            "{path} survives open"
+        );
+    }
+
+    // An authoring update replaces project/source.py, never the embedded script.
+    let scene = envelope.definition.scene.value().clone();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/persistence/projects/authoring")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "display_name": "from-script.fms",
+                        "archive_base64": reopened["archive_base64"],
+                        "expected_project_id": reopened["project_id"],
+                        "expected_revision": reopened["revision"],
+                        "scene_document": scene,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let authoring_status = response.status();
+    let authored = body_json(response).await;
+    assert_eq!(authoring_status, StatusCode::OK, "authoring: {authored:?}");
+    let (_, authored_documents) =
+        open_archive_documents(authored["archive_base64"].as_str().unwrap());
+    assert_eq!(
+        authored_documents["project/source/script.py"],
+        FROM_SCRIPT_VALID.as_bytes(),
+        "authoring never rewrites the embedded script"
+    );
+    assert_eq!(
+        authored_documents["project/provenance.json"],
+        documents["project/provenance.json"]
+    );
+
+    // Nothing is left behind in managed storage.
+    let leftovers = fs::read_dir(root.join("workspace"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fullmag-script-import-")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn from_script_reports_export_failure_as_422_and_keeps_nothing() {
+    let (app, root) = from_script_test_app();
+    let (status, json) = post_from_script(
+        &app,
+        serde_json::json!({
+            "source": {
+                "name": "broken.py",
+                "text": "import fullmag as fm\nraise RuntimeError('boom-marker-4711')\n",
+            },
+            "consent": {"executed_by_user": true},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json:?}");
+    assert_eq!(json["code"], "script_export_failed");
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("boom-marker-4711"),
+        "the helper's error is returned: {json:?}"
+    );
+    let leftovers = fs::read_dir(root.join("workspace")).unwrap().count();
+    assert_eq!(leftovers, 0, "a failed export keeps nothing");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn from_script_without_consent_is_refused_and_runs_nothing() {
+    let (app, root) = from_script_test_app();
+    let marker = root.join("executed.marker");
+    let text = format!(
+        "open({:?}, 'w').write('ran')\n",
+        marker.display().to_string()
+    );
+    for consent in [
+        serde_json::Value::Null,
+        serde_json::json!({"executed_by_user": false}),
+    ] {
+        let mut body = serde_json::json!({"source": {"name": "x.py", "text": text}});
+        if !consent.is_null() {
+            body["consent"] = consent;
+        }
+        let (status, json) = post_from_script(&app, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json:?}");
+        assert_eq!(json["code"], "consent_required");
+    }
+    assert!(!marker.exists(), "the script must not run without consent");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn from_script_rejects_oversized_text_and_unsupported_item_ids() {
+    let (app, root) = from_script_test_app();
+    let (status, json) = post_from_script(
+        &app,
+        serde_json::json!({
+            "source": {"name": "big.py", "text": "#".repeat(1024 * 1024 + 1)},
+            "consent": {"executed_by_user": true},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{json:?}");
+    assert_eq!(json["code"], "script_too_large");
+
+    let (status, json) = post_from_script(
+        &app,
+        serde_json::json!({
+            "script_item_id": "item-1",
+            "consent": {"executed_by_user": true},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "script_item_unsupported");
+
+    let (status, json) = post_from_script(
+        &app,
+        serde_json::json!({"consent": {"executed_by_user": true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "source_required");
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Survey fixture, not a gate: `FULLMAG_FROM_SCRIPT_SURVEY` lists script files
+/// separated by `;`. Each goes through the real endpoint and the verdict is
+/// printed (`--ignored --nocapture`).
+#[tokio::test]
+#[ignore = "survey over real example scripts; set FULLMAG_FROM_SCRIPT_SURVEY"]
+async fn from_script_survey_over_example_files() {
+    let list = std::env::var("FULLMAG_FROM_SCRIPT_SURVEY").expect("FULLMAG_FROM_SCRIPT_SURVEY");
+    let (app, root) = from_script_test_app();
+    for path in list.split(';').filter(|path| !path.trim().is_empty()) {
+        let text = fs::read_to_string(path).expect("script is readable UTF-8");
+        let name = Path::new(path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let started = std::time::Instant::now();
+        let (status, json) = post_from_script(
+            &app,
+            serde_json::json!({
+                "source": {"name": name, "text": text},
+                "consent": {"executed_by_user": true},
+            }),
+        )
+        .await;
+        let seconds = started.elapsed().as_secs_f32();
+        if status == StatusCode::CREATED {
+            let fidelity = &json["script_import"]["fidelity"];
+            println!(
+                "SURVEY {name} | 201 | round_trip={} | {seconds:.1}s | notes={}",
+                fidelity["round_trip"], fidelity["notes"]
+            );
+        } else {
+            println!(
+                "SURVEY {name} | {} | {} | {seconds:.1}s | {}",
+                status.as_u16(),
+                json["code"],
+                json["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .replace('\n', " ")
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(root);
 }

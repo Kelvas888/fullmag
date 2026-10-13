@@ -1,5 +1,101 @@
 # Fullmag — finalny audyt i plan refaktoryzacji
 
+Checkpoint P8-52/53, 03.10.2026: [przyrostowy backend Windows](p8/52-native-backend-dev.md)
+ma rzeczywiste buildy exit 0: pierwszy profil 600,11 s, bez zmian 10,50 s,
+przebudowa po zmianie 140,27 s; automatyczny build przy działającym edytorze
+102,72 s. Test w przeglądarce potwierdził identyczny model, niezmienione
+procesy/API UUID oraz działający WebGL. Własna sesja testowa zakończyła się
+exit 0 z potwierdzonym cleanupem; ponowny start użył nowych EXE bez Cargo,
+zsynchronizował metadane Python i uruchomił watcher. Automatyczne odtworzenie
+modelu pozostaje niewykonane. Użytkownik zatwierdził docelowy
+[restart w workspace](p8/53-development-restart-workspace.md): jawne zastosowanie
+nowej wersji, ochrona szkiców, odtworzenie edytowalnego modelu i blokada aktywnej
+symulacji. Kontrakt [ADR 0050](../../../../adr/0050-development-backend-restart.md)
+jest przyjęty; sam restart pozostaje planned/NOT VERIFIED. Procenty bez awansu.
+
+Checkpoint P8-50/51 i P6-78, 03.10.2026: natywny build Windows utworzył
+wersjonowane CLI/API/UI, pusty workspace i zapis zmienionej geometrii
+sprawdzono w przeglądarce na 3197. Cały własny przebieg zakończył się kodem 0;
+WebGL i HMR PASS. Naprawiono pętlę Tailwind oraz guard po ACK szkicu.
+[Launcher](p8/50-windows-empty-ui-just-route.md),
+[wersja](p8/51-development-build-version.md),
+[Inspector](p6/78-primitive-ack-selection.md).
+88 regresji Python i 4 Node PASS, produkcyjny source check PASS. Pełny produkt
+Windows, native FEM, science i cały plan nadal mają otwarte bramki;
+procenty etapów bez awansu.
+
+Checkpoint P8-49 / P6-76, 03.10.2026: rzeczywisty eksport OpenAPI z
+terminalnego buildu 218, weryfikacja tożsamości i hashy oraz cleanup PASS.
+25 interpretowanych regresji eksportera i 11 regresji importu PASS.
+Kontrakt scalar/runtime-service i klient zostały wygenerowane; produkcyjny
+source check baseline PASS. [Dowody i granice](p8/49-managed-package-openapi-export.md).
+Integracja skalarów w UI trwa; runtime, nauka, B-04–B-08 i Windows nadal
+wymagają odrębnych dowodów. Procenty etapów bez awansu.
+
+Checkpoint B-08: [właściciel pola zewnętrznego i regionalnego FDM CPU](b/08-fdm-cpu-zeeman-owner.md).
+Osiem metod zachowuje sygnatury i ciała; Oersted, SoA capability i fused loop
+pozostają bez zmian. Source comparison i review PASS.
+Build 218 zakończył się succeeded/exit 0: 120 artefaktów i 15 wymaganych wyjść
+zweryfikowano razem z kapsułą źródeł. Dotyczy źródła B-03; B-04–B-08, runtime,
+fizyka i produkt Windows nadal wymagają osobnych dowodów.
+
+Checkpoint B-07: [właściciel magnetoelastyczności FDM CPU](b/07-fdm-cpu-magnetoelastic-owner.md).
+Pięć metod zachowuje sygnatury i ciała; fused loop i wspólny moduł naukowy
+pozostają bez zmian. Source comparison i niezależny review PASS.
+Build 218 nie obejmuje późniejszych zmian B-04–B-07; runtime pozostaje otwarty.
+
+Checkpoint B-06: [właściciel DMI FDM CPU](b/06-fdm-cpu-dmi-owner.md).
+23 metody zachowują sygnatury i ciała; cztery metody spoza DMI oraz fused loop
+pozostają w rodzicu. Source comparison PASS; runtime i kwalifikacja otwarte.
+Build 218 jest aktywny: native-build exit 0, trwa instalacja zależności frontendu.
+Buduje źródło B-03, bez późniejszych B-04/B-05/B-06; pełny receipt jeszcze otwarty.
+
+Checkpoint P8-46: [odtwarzalny audyt execution](p8/46-read-only-execution-verifier.md).
+18 regresji i review PASS; pełny świeży dowód zachowany w storage. Kapsuły
+integralne, znane różnice jawne i skopiowane. Sprzątanie pozostaje niewykonane.
+
+Checkpoint B-05: [właściciel anizotropii FDM CPU](b/05-fdm-cpu-anisotropy-owner.md).
+Sześć metod zachowuje sygnatury i ciała; wspólny helper energii i fused loop
+pozostają przy dotychczasowych konsumentach. Runtime i kwalifikacja otwarte.
+
+Checkpoint P8-48: [dokładne kopie zmienionych plików execution](p8/48-execution-source-preservation.md).
+Dziesięć kopii i ich hashe zachowano w kanonicznym storage. Nie wykonano
+sprzątania. Historyczna blokada miejsca została usunięta poza tym zadaniem;
+bieżący stan audytu i buildu opisują nowsze checkpointy powyżej.
+
+Checkpoint P8-44/45: [audyt siedmiu zakończonych execution](p8/44-execution-cleanup-proposal.md)
+i [natywny Windows fixture usuwania samych linków](p8/45-windows-reparse-unlink-fixture.md).
+18 662 cele linków zbadane; dokładne tagi junction/Windows/LX przeszły fixture
+z zachowaniem celów. Niczego z jobów nie usunięto, bramka retencji pozostaje;
+produkcyjny cleanup i build 218 nadal otwarte.
+
+Checkpoint B-04: [właściciel pola wymiany FDM CPU](b/04-fdm-cpu-exchange-owner.md).
+Cztery sygnatury i ciała zachowane; source comparison/Rustfmt/review PASS.
+Przyrost jest późniejszy niż źródło queued buildu 218; runtime i kwalifikacja
+pozostają otwarte, bez awansu procentów.
+
+Checkpoint P8-43: [pełny kontrakt pakietu wdrożony do runnera](p8/43-package-contract-runner-overlay.md).
+Siedem interpretowanych regresji obrazu i niezależny review PASS; profile,
+mounty i queued job 218 zachowane. Kolejka zdrowa i wznowiona, build nadal
+blokuje storage; runtime i kwalifikacja pozostają otwarte.
+
+Checkpoint 03.10.2026: [P7-C/P8 — niezależny proces runtime](p8/18-native-runtime-service.md)
+— source owner lock, gated scheduler startup, loopback drain i packaging;
+49 lekkich testów pakowania PASS. UI attach/detach i runtime pozostają otwarte.
+
+Checkpoint 03.10.2026: [P7-C/P8 — kanał właściciela runtime](p8/17-native-runtime-owner-control.md)
+— oba schedulery mają prywatny drain niezależny od konsoli Windows;
+utrata właściciela drenuje i raportuje błąd. Usługa i UI attach/detach nadal
+pozostają do realizacji; runtime NOT VERIFIED, procenty bez zmiany.
+
+Checkpoint 02.10.2026: [P8-16 — drzewa procesów Windows](p8/16-windows-owned-worker-process-tree.md)
+obejmuje worker/preparer wspólną własnością OS przed uruchomieniem solvera.
+Usługa runtime niezależna od UI oraz native testy pozostają otwarte.
+
+Checkpoint 02.10.2026: [P8-15 — Submit zainstalowanego Windows](p8/15-installed-windows-submit-store.md)
+usuwa zależność wyboru magazynu runów produktu od konfiguracji checkoutu.
+Native Windows i trwałość pozostają NOT VERIFIED; procenty bez zmian.
+
 Data audytu: 20.09.2026. Rewalidacja checkpointu: 23.09.2026. Baza audytu: `14c8e73a6f3c55f4fc080835a6156f2a4db8f111`, lokalny `master`.
 
 **Werdykt:** zachować projektowy kierunek CAE, ale wdrażać go po zabezpieczeniu persystencji, uzgodnieniu istniejących kontraktów i ustaleniu jednej tożsamości wykonania. Refaktoryzacja obejmuje authoring, Python/IR, planowanie, wykonanie, FDM/FEM CPU/GPU, storage, API, Control Room, desktop oraz kwalifikację. Nie oznacza przepisywania wszystkich solverów ani automatycznego rozszerzenia zakresu fizyki.
@@ -14,6 +110,15 @@ przechodzą na identycznym źródle. Przyrost stabilizuje już policzony zakres,
 dlatego nie podnosi procentów P3/P5.
 
 ## Dokumenty finalne
+
+Checkpoint P8-41: [wdrożone sondy nightly](p8/41-nightly-probes-deployed.md).
+Kolejka zdrowa po kontrolowanej wymianie; pojemność Windows storage nadal blokuje build 218.
+
+Checkpoint B-03, 03.10.2026: [właściciel STT/SOT FDM CPU](b/03-fdm-cpu-direct-torques-owner.md).
+Ekstrakcja zachowuje dwadzieścia ciał funkcji i adapter FEM; kwalifikacja pozostaje otwarta.
+
+Checkpoint B-02, 03.10.2026: [właściciel pola demagnetyzacji FDM CPU](b/02-fdm-cpu-demag-owner.md).
+Siedem metod zachowuje sygnatury i ciała; weryfikacja produkcyjna pozostaje otwarta.
 
 Checkpoint domknięcia 02.10.2026: [warunki odbioru P1/P3/P3a/P5](07-domkniecie-etapow.md).
 Dodano bramkę stale scope ośmiu operacji workspace; 11 regresji skryptu PASS,
@@ -345,3 +450,88 @@ ma źródłowy staging x64 embeddable, izolowane ścieżki, minor ABI 3.12,
 licencję/hash inventory i płaski audyt standard-library PYD. 149 różnych
 lekkich regresji PASS; executable probe jest atrapą, realny runtime/MSI
 i scientific wheel graph pozostają NOT VERIFIED.
+
+[Polityka launchera Python](p8/09-bundled-python-launcher-policy.md)
+wspólna dla CLI/API wybiera bundled interpreter i odrzuca zewnętrzny
+fallback w pakiecie Windows. Produkcyjne source checks CLI/API PASS;
+Rust regresje niewykonane z powodu zakazu kompilacji unit tests.
+Gotowy MSI i runtime bez hostowego Python nadal NOT VERIFIED.
+
+[Rekurencyjny audyt Python PE](p8/10-recursive-python-native-audit.md)
+obejmuje także scientific wheel PYD/DLL i odróżnia dostępność bibliotek
+od kwalifikacji loadera/runtime. Nowe regresje interpretowane PASS;
+realny pakiet Windows i kwalifikacja nadal NOT VERIFIED.
+
+[Managed build aktualnego mastera, 210](p8/11-current-master-managed-build-210.md)
+ma terminalny SUCCEEDED/exit 0; 122 artefakty i niezmienna kapsuła PASS.
+Konsument gotowego pakietu potwierdził osiem binariów i bibliotekę FEM.
+Accepted FEM execution, realne HTTP/CAS i archive roundtrip pozostają otwarte.
+
+[Przygotowanie FEM z gotowego pakietu](p6/73-managed-preparation-package-reuse.md)
+dodaje zweryfikowany konsument receiptu i tryb bez kompilacji. 55 lekkich
+regresji PASS; managed runtime wrapper, pełny accepted solver i pin/archive
+nadal pozostają otwarte.
+
+[Driver accepted FEM CPU](p6/74-accepted-fem-cpu-runtime-driver.md) dodaje
+kontynuację przygotowania przez solver, trwały wynik, publiczny SolutionSet
+i pin z produkcyjną kontrolą native snapshot. 85 regresji PASS; rzeczywiste
+wykonanie w zweryfikowanym obrazie, archive i nauka nadal NOT VERIFIED.
+
+[Writable state desktopu Windows](p8/12-windows-desktop-writable-state.md)
+usuwa zapis logów obok instalacji i wiąże checkpointy z rootem stanu API.
+Kontrole źródłowe PASS; natywny pakiet, rzeczywisty zapis/restart/restore
+i wydanie pozostają NOT VERIFIED. Docker nie jest wymaganiem produktu Windows.
+
+[Wspólna walidacja katalogu danych](p8/13-shared-state-root-validation.md)
+odrzuca względny FULLMAG_STATE_ROOT w CLI, API i desktopie przed zapisem.
+Parser/review PASS; regresje Rust NOT RUN, Windows MSI PENDING bez wykonanego
+kroku. Pakiet i trwałość nadal wymagają rzeczywistego odbioru.
+
+[Build aktualnego runtime, 212](p8/14-managed-build-current-runtime-212.md)
+jest w istniejącej kolejce z przypiętego commita zawierającego późniejsze
+poprawki state i driver. QUEUED nie oznacza PASS; build 210 zachowuje swój
+oddzielny terminalny dowód, a runtime/Windows pozostają otwarte.
+
+Checkpoint P7-C: [19 — żywe discovery runtime](p8/19-native-runtime-discovery.md).
+
+Checkpoint P7-C: [20 — klient zgodności runtime](p8/20-native-runtime-client.md).
+
+Checkpoint P7-C: [21 — launcher niezależnego runtime](p8/21-native-runtime-launcher.md).
+
+Checkpoint P7-C: [22 — UI i kanoniczny accepted store](p8/22-native-ui-service-binding.md).
+
+Checkpoint P7-C: [23 — handshake store API](p8/23-api-accepted-store-handshake.md).
+
+Checkpoint P7-C: [24 — tożsamość procesu i HTTP fence](p8/24-api-instance-fence.md).
+
+Checkpoint P7-C: [25 — przypięcie native UI do API](p8/25-native-ui-instance-pinning.md).
+
+Checkpoint P8: [26 — lint i retencja mapy pola](p8/26-frontend-lint-and-frame-retention.md).
+
+Checkpoint P8-C: [27 — trasa workspace w pakiecie](p8/27-native-workspace-package.md).
+
+Checkpoint P8-C: [28 — natywny odczyt zasobów hosta](p8/28-native-capacity-observation.md).
+
+Checkpoint P8-C: [29 — stabilna konfiguracja usługi aplikacji](p8/29-stable-application-service-config.md).
+
+Checkpoint P8-C: [30 — domyślne budżety natywnej usługi](p8/30-native-service-resource-budgets.md).
+
+Checkpoint P8-C: [31 — inicjalizacja zasobów pakietu i handshake](p8/31-packaged-service-preparation.md).
+
+Checkpoint P8-C: [32 — rzeczywisty odczyt stanu natywnej usługi](p8/32-native-service-status-observer.md).
+
+Checkpoint P8-C: [33 — zasób API natywnej usługi](p8/33-native-service-api-resource.md).
+
+Checkpoint P8-C: [34 — import OpenAPI z przypiętego buildu](p8/34-managed-openapi-import.md).
+
+Checkpoint P8-C: [35 — regresja polecenia importu kontraktu](p8/35-managed-openapi-import-regression.md).
+
+Checkpoint P8-C: [36 — historyczny build i pauza runnera](p8/36-historical-build-and-runner-pause.md).
+
+Checkpoint P6-C/D: [75 — trwały skalar przez API](p6/75-durable-scalar-api.md).
+
+Checkpoint P8-C: [37 — authoring przed attach runtime](p8/37-authoring-before-runtime-attach.md).
+
+Checkpoint P8-C: [38 — wersje rzeczywistego toolchaina w receipt](p8/38-nightly-build-evidence.md).
+
+Checkpoint P8-C: [39 — ścieżki launchera pod właścicielem blokady](p8/39-launcher-path-ownership.md).

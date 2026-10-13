@@ -10,7 +10,6 @@ import {
   FilePlus2,
   Gauge,
   HelpCircle,
-  Info,
   LayoutDashboard,
   Layers3,
   ListChecks,
@@ -59,9 +58,6 @@ const HIDDEN_PLACEHOLDER_COMMAND_IDS = new Set([
   "workspace.diagnostics",
   "workspace.api-console",
   "workspace.script-view",
-  "workspace.search-docs",
-  "workspace.reference",
-  "workspace.about-help",
 ]);
 
 function hidePlaceholderMenuNodes(nodes: AppMenuNode[]): AppMenuNode[] {
@@ -77,13 +73,6 @@ function hidePlaceholderMenuNodes(nodes: AppMenuNode[]): AppMenuNode[] {
   });
 }
 
-const APP_DROPDOWN_ITEM_DEFINITIONS: AppMenuNode[] = [
-  { id: "workspace.theme-toggle", label: "Toggle Theme", icon: <Settings size={14} /> },
-  { id: "workspace.preferences", label: "Preferences", icon: <Settings size={14} /> },
-  { id: "workspace.docs", label: "Physics Documentation", icon: <BookOpen size={14} /> },
-  { id: "workspace.about", label: "About Fullmag", icon: <Info size={14} /> },
-];
-
 const MAIN_MENU_DEFINITIONS: AppMenuNode[] = [
   {
     id: "file",
@@ -95,7 +84,7 @@ const MAIN_MENU_DEFINITIONS: AppMenuNode[] = [
       { id: "study.import-state", label: "Restore Runtime State", icon: <Upload size={14} />, shortcut: "Ctrl+Shift+O" },
       { id: "workspace.save-project", label: "Save Project", icon: <Save size={14} />, shortcut: "Ctrl+S" },
       { id: "workspace.close-project", label: "Close Project", icon: <X size={14} />, shortcut: "Ctrl+W" },
-      { id: "workspace.export-python", label: "Export Python DSL", icon: <FileCode2 size={14} /> },
+      { id: "workspace.export-python", label: "Save canonical copy as…", icon: <FileCode2 size={14} /> },
     ],
   },
   {
@@ -181,10 +170,6 @@ const QUICK_ACTION_DEFINITIONS: HeaderQuickAction[] = [
   { id: "workspace.undo", label: "Undo", icon: <Undo2 size={14} /> },
   { id: "workspace.redo", label: "Redo", icon: <Redo2 size={14} /> },
 ];
-
-export const APP_DROPDOWN_ITEMS: AppMenuNode[] = hidePlaceholderMenuNodes(
-  APP_DROPDOWN_ITEM_DEFINITIONS,
-);
 
 export const MAIN_MENUS: AppMenuNode[] = hidePlaceholderMenuNodes(
   MAIN_MENU_DEFINITIONS,

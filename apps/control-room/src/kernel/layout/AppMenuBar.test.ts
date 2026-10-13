@@ -3,7 +3,6 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
-  APP_DROPDOWN_ITEMS,
   MAIN_MENUS,
   QUICK_ACTIONS,
   type AppMenuNode,
@@ -23,7 +22,6 @@ describe("AppMenuBar CSS contract", () => {
     expect(headerCss).toContain(".fm-header__title");
     expect(headerCss).toContain(".fm-header__nav");
     expect(headerCss).toContain(".fm-header__nav-item");
-    expect(headerCss).toContain(".fm-header__app-trigger");
     expect(headerCss).toContain(".fm-header__quick-actions");
     expect(headerCss).toContain(".fm-header__search");
     expect(headerCss).toContain(".fm-header__run-controls");
@@ -62,7 +60,6 @@ describe("app menu command model", () => {
       }
     }
     const exposedIds = [
-      ...flattenMenuIds(APP_DROPDOWN_ITEMS),
       ...flattenMenuIds(MAIN_MENUS),
       ...QUICK_ACTIONS.map((action) => action.id),
     ].filter((id) => placeholderIds.has(id));

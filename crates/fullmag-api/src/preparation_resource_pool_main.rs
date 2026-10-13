@@ -1,7 +1,9 @@
-use anyhow::{Context, Result, bail};
+mod worker_startup_gate;
+
+use anyhow::{bail, Context, Result};
 use fullmag_session::{
-    FMS_PREPARATION_RESOURCE_POOL_SCHEMA, FmsPreparationResourceOffer, FmsPreparationResourcePool,
-    PreparationResourcePoolCommitDisposition,
+    FmsPreparationResourceOffer, FmsPreparationResourcePool,
+    PreparationResourcePoolCommitDisposition, FMS_PREPARATION_RESOURCE_POOL_SCHEMA,
 };
 use std::path::PathBuf;
 
@@ -22,6 +24,7 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = parse_args()?;
+    worker_startup_gate::verify_runtime_owner_build()?;
     let pool = FmsPreparationResourcePool {
         schema_version: FMS_PREPARATION_RESOURCE_POOL_SCHEMA.into(),
         pool_id: args.pool_id,

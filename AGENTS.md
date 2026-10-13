@@ -46,7 +46,7 @@ Instrukcje dotyczą GPT-Astra, GPT-Sol, GPT-Luna oraz innych agentów pracujący
 ## Build i dowody
 
 - Tymczasowo nie buduj testów jednostkowych ani nie uruchamiaj zadań, których celem jest ich kompilacja; zakaz obowiązuje do odwołania przez użytkownika.
-- Na hoście z konfiguracją `Fullmag_build_runner` domyślnie zlecaj pełne buildy przez jego kolejkę — zarówno dla `mastera`, jak i branchy/worktree. Użyj skilla `local-build-runner` i [instrukcji runnera](docs/guides/local-container-runner.md). Jeden koordynator obsługuje cały projekt; nie twórz runnera per branch i nie uruchamiaj starego hostowego wykonawcy ani równoległego ciężkiego builda poza kolejką.
+- Na hoście z konfiguracją `Fullmag_build_runner` domyślnie zlecaj pełne buildy przez jego kolejkę — zarówno dla `mastera`, jak i branchy/worktree. Użyj skilla `local-build-runner` i [instrukcji runnera](docs/guides/local-container-runner.md). Jeden koordynator obsługuje cały projekt; nie twórz runnera per branch i nie uruchamiaj starego hostowego wykonawcy ani równoległego ciężkiego builda poza kolejką. Jawnie zatwierdzony wyjątek dla natywnego Windows workspace opisano poniżej.
 - Jawnie wybierz katalog źródeł oraz `snapshot` albo pełny SHA commita. Katalog klienta nie musi być katalogiem budowanego kodu: przy zewnętrznym kliencie podaj `--worktree <absolutny-checkout>`. Brak dostępnego zatwierdzonego klienta, niezdrowy runner lub nieobsługiwany profil oznacza blokadę tej trasy, nie zgodę na cichy fallback. Nie zamieniaj żądanego GPU na CPU. Testy lekkie i odrębne bramki runtime/nauki zachowują swoje recepty; sukces buildu nie zastępuje ich dowodów.
 
 - Nowy worktree na tym samym hoście nie potrzebuje własnego `.env`: resolver ustala główny checkout przez Git i czyta jego plik. Instrukcja i `.env.example` są wersjonowane; wartości hosta pozostają lokalne. Dla nowego klona na innym hoście przed pierwszym buildem skonfiguruj `.env` głównego checkoutu według `.env.example`, zachowując istniejące ustawienia. Jeśli lokalizacja storage nie została określona, uzyskaj ją od użytkownika; nie kopiuj ścieżki z innego hosta ani nie traktuj fallbacku resolvera jako konfiguracji operatora.
@@ -62,6 +62,58 @@ Instrukcje dotyczą GPT-Astra, GPT-Sol, GPT-Luna oraz innych agentów pracujący
 - Odczytaj wynik i exit code. Ponawiaj lub rozszerzaj zielone testy tylko po istotnej zmianie, awarii albo nierozstrzygniętej obawie. Wynik pozostaje dowodem dla niezmienionych źródeł, wejść i warunków; nie trzeba uruchamiać go ponownie w każdej wiadomości.
 - Rozdzielaj testy źródeł/kontraktów, managed runtime, browser/WebGL, walidację fizyki i kwalifikację wydania. Brakująca wymagana ścieżka to `NOT VERIFIED`. Testy lokalne, zbudowana siatka i wykryte GPU nie dowodzą wykonania ani parytetu.
 - Zmiany viewportu wymagają dowodu z przeglądarki: widoczny canvas, niezagubiony kontekst WebGL i niezerowy drawing buffer. Zmiany mutacji Inspectora wymagają stabilności panelu i kontroli Object/Airbox opisanych w regułach frontendowych.
+
+### Natywny Windows — szybka praca nad frontendem i backendem
+
+Użytkownik zatwierdził bezpośredni build natywnego Windows workspace na żądanie,
+bez kolejki Linux/Docker. Agenci mogą używać poniższych zarządzanych recept
+w zakresie autoryzowanego zadania. Nie wymaga to ponownej zgody na każdy build.
+Wyjątek dotyczy trasy `scripts/windows/run_fullmag.ps1` i nie rozszerza się na
+FEM/MFEM ani dowolny ręczny `cargo`, `cmake` lub Docker.
+
+| Polecenie | Działanie |
+|---|---|
+| `just windows-ui dev` | Uruchamia pusty workspace na porcie 3197, frontend Next.js z HMR i odbiornik jawnych żądań buildu backendu. Brakujący lub nieaktualny pakiet buduje przed startem. |
+| `just windows-ui dev 3197 auto dev` | Jawnie wybiera ten sam tryb: automatyczny wybór buildu i backendowy profil dev. |
+| `just windows-workspace-build dev dev 3197 auto` | Buduje brakujący lub nieaktualny pakiet dev bez uruchamiania UI. |
+| `just windows-runtime-recover 3197` | Odzyskuje niepotwierdzony owner record dopiero po sprawdzeniu braku procesów i zamkniętego portu; zachowuje oryginalny zapis. Nie zatrzymuje procesów ani nie odtwarza modelu. |
+| `just windows-backend-dev 3197` | Jednorazowo buduje backend dev na żądanie, bez restartu workspace. Nie uruchamia drugiego watchera. |
+| `just windows-ui static` | Uruchamia workspace z produkcyjnie zbudowanym frontendem i backendem release; brakujący lub nieaktualny pakiet buduje przed startem. |
+
+- Frontend reaguje na zapis plików przez HMR. Backend buduje się wyłącznie
+  na jawne żądanie (przycisk **Build backend** lub zarządzane polecenie),
+  z utrwalonej kopii źródeł. Późniejsze edycje checkoutu nie odrzucają wyniku
+  ani nie uruchamiają następnego buildu. Decyzja użytkownika z 05.10.2026
+  zastępuje wcześniejsze automatyczne odliczanie 120 sekund.
+  Profil Cargo `backend-dev` zachowuje target/cache; nie usuwaj ich dla
+  zwykłej iteracji. Zmiany zależności działającego workspace nadal wymagają
+  bezpiecznego zamknięcia, zgodnie z kontrolą `assert_frozen_dependencies`.
+- `build=auto` w receptach oznacza sprawdzenie tożsamości źródeł i pakietu;
+  `true` wymusza build, a `false` dopuszcza wyłącznie istniejący, zgodny pakiet.
+  Przyrostowy build nie oznacza ponownej kompilacji wszystkich zależności.
+- Działające procesy korzystają ze zweryfikowanej kopii EXE, odrębnej od
+  mutowalnego katalogu Cargo. Watcher kompiluje w tle, lecz **nie restartuje
+  backendu ani symulacji**. Nie zabijaj procesu tylko dlatego, że build się zakończył.
+- Kontrolowany restart z UI z zachowaniem modelu i szkiców jest realizowany
+  w [P8-53](docs/plans/active/refactor_runtime/final/p8/53-development-restart-workspace.md).
+  Dopóki jego bramki nie są potwierdzone, nie przedstawiaj go jako gotowego
+  ani nie obiecuj automatycznego odtworzenia niezapisanego workspace.
+- Recepty nadal wymagają resolvera storage, preflight, lease i terminalnego
+  receipt; natywny build korzysta z blokady ciężkich prac tego hosta.
+  Zachowuj tożsamość źródeł, profilu i pakietu. Zakaz kompilowania testów
+  jednostkowych pozostaje w mocy.
+
+Szczegóły i dowody:
+[Windows-first development](docs/guides/windows-first-development.md),
+[P8-52 — przyrostowy backend dev](docs/plans/active/refactor_runtime/final/p8/52-native-backend-dev.md),
+[P8-54 — build na żądanie](docs/plans/active/refactor_runtime/final/p8/54-manual-native-build-snapshot.md).
+
+## Sprzątanie danych po etapie deweloperskim
+
+- Po zakończeniu etapu (także błędem lub anulowaniem) i przed kolejnym ciężkim buildem oceń dane wygenerowane przez ten etap. Użyj skilla `fullmag-build-stage-cleanup`; jeżeli nie jest dostępny, zastosuj reguły retencji z build-storage governance i zgłoś brak skilla.
+- Najpierw kwalifikuj zakończone `execution`, następnie zbędny staging i kopie źródeł, a potem zastąpione pakiety runtime. Przestarzałość oznacza wykazaną zbędność: sam wiek, rozmiar lub nowszy commit nie wystarczają. Zachowaj używany cache przyrostowy, ostatni zweryfikowany pakiet i dane referencjonowane przez wyniki, projekty, sesje lub rollback.
+- Przed wykonaniem autoryzowanego planu ponownie sprawdź stan jobów, aktywne procesy, kontenery, mounty, lease oraz dokładne cele w rozwiązanym storage. Zachowaj wyniki, logi, receipty, manifesty i provenance. Nie rozszerzaj zgody na inne katalogi ani nie używaj globalnego prune.
+- W checkpointcie etapu zapisz decyzję dla każdego kandydata, dowód zbędności, zachowywane dane, plan/receipt i pomiar wolnego miejsca. Dla pozostawionych danych podaj warunek ponownej oceny. Preview ani zapis skilla nie dowodzą wykonania lub wdrożenia automatycznego sprzątania.
 
 ## Szczegółowe reguły — ładuj według zakresu
 

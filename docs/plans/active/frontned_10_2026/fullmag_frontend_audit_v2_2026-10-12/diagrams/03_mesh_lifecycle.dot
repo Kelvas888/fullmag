@@ -1,0 +1,31 @@
+digraph G {
+graph [bgcolor="#f7f9fc", fontname="DejaVu Sans", fontsize=20, fontcolor="#182e47", labelloc=t, labeljust=l, pad=0.4, nodesep=0.45, ranksep=0.75, splines=polyline, dpi=125];
+node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12, fillcolor="#e6edf5", color="#adc1d7", fontcolor="#142941", penwidth=1.2, margin="0.19,0.15"];
+edge [fontname="DejaVu Sans", fontsize=10, color="#6e89a7", fontcolor="#415c78", arrowsize=0.75, penwidth=1.2];
+rankdir=LR;
+
+label="D03 / MESH LIFECYCLE V2 — PROPOSED\nPolicy write + build are a saga, not one atomic transaction";
+recipe [label="Draft policy"];
+saved [label="Policy saved\nnew committed source"];
+confirm [label="Fresh confirmation\nactual FEM shared-domain scope\nFDM plan handled separately"];
+job [label="Accepted build intent\nobserve same command_id"];
+stage [label="Stage new generation\nimmutable topology + membership\nmandatory validation"];
+activate [label="Backend activation marker\nrequired resources complete"];
+deliver [label="Viewer delivery\nsame generation buffers"];
+ready [label="Current / Run readiness\nassessment + physics gate"];
+old [label="Previous artifact retained\nold identity + honest stale state"];
+partial [label="policy saved / build rejected\npolicy is not reverted"];
+optional [label="Optional quality / histograms\nindependent availability"];
+loaderr [label="Delivery error\nRetry Loading = 0 new builds"];
+recipe->saved [label="Apply Policy"];
+saved->confirm [label="Build"];
+confirm->job [label="preconditions / dedup intent"];
+confirm->partial [label="reject / source changed"];
+job->stage;stage->activate;activate->deliver;deliver->ready;
+stage->old [label="fail / crash before marker"];
+job->old [label="failure"];
+activate->optional;optional->ready [style=dashed,label="only when required by profile"];
+deliver->loaderr;loaderr->deliver [label="retry immutable resource"];
+old->confirm [label="explicit new build only"];
+
+}

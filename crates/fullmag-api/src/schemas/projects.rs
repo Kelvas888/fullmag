@@ -28,6 +28,24 @@ pub(crate) struct ProjectArchiveRequest {
     pub archive_base64: String,
 }
 
+/// Runtime-free authoring update for a portable project archive.  The scene
+/// map is parsed through the typed `fullmag_authoring::SceneDocument` contract
+/// by the handler; the surrounding archive remains source-preserving.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectAuthoringUpdateRequest {
+    /// Stable label used for diagnostics; it is not a filesystem path.
+    pub display_name: String,
+    /// Base64-encoded `.fms` archive bytes.
+    pub archive_base64: String,
+    /// Project identity observed by the caller.
+    pub expected_project_id: String,
+    /// Definition revision observed by the caller.
+    pub expected_revision: u64,
+    /// Complete typed `scene.v2` document supplied by the authoring surface.
+    pub scene_document: BTreeMap<String, serde_json::Value>,
+}
+
 /// Complete immutable submission inputs. The server parses the JSON objects
 /// into their versioned application, authoring and planner contracts.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -39,10 +57,119 @@ pub(crate) struct ProjectRunSubmitRequest {
     pub run_intent: BTreeMap<String, serde_json::Value>,
     /// Versioned `study_plan.v2` object with typed steps, references and runner controls.
     pub study_plan: BTreeMap<String, serde_json::Value>,
-    /// Versioned `study_problem_catalog.v1` object bound to the exact study digest.
+    /// Immutable study catalog: legacy v1, or v2 with pinned execution profiles and field origins.
     pub study_problem_catalog: BTreeMap<String, serde_json::Value>,
     /// Explicit immutable asset ID to path inside `project/assets/`.
     pub asset_paths: BTreeMap<String, String>,
+}
+
+/// Immutable independent batch submission. The server deserializes
+/// `batch_request` into the versioned application contract before accepting it.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectBatchSubmitRequest {
+    /// Exact base64-encoded portable project archive accepted for this batch.
+    pub archive_base64: String,
+    /// Client intent key used to recover an ACK after a timeout.
+    pub idempotency_key: String,
+    /// Versioned `BatchExpansionRequest` object, including template and axes.
+    pub batch_request: BTreeMap<String, serde_json::Value>,
+    /// Versioned immutable StudyPlan used by the batch template.
+    pub study_plan: BTreeMap<String, serde_json::Value>,
+    /// Immutable StudyProblemCatalog pinned by the batch template.
+    pub study_problem_catalog: BTreeMap<String, serde_json::Value>,
+    /// Explicit immutable asset ID to path inside `project/assets/`.
+    pub asset_paths: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchSubmitResource {
+    pub disposition: ProjectRunSubmitDisposition,
+    pub batch_id: String,
+    /// Logical digest stored in the expansion manifest.
+    pub manifest_sha256: String,
+    pub case_count: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams, ToSchema)]
+pub(crate) struct ProjectBatchListQuery {
+    /// Page size, from 1 to 100; defaults to 50.
+    pub limit: Option<u32>,
+    /// Last BatchId returned on the previous page.
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchListResource {
+    pub project_id: String,
+    pub batches: Vec<ProjectBatchSummaryResource>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchSummaryResource {
+    pub batch_id: String,
+    pub accepted_at: String,
+    pub manifest_sha256: String,
+    pub case_count: u64,
+    pub max_parallel_cases: Option<u32>,
+    pub failure_policy: ProjectBatchFailurePolicy,
+    pub published_case_count: u64,
+    pub expansion_state: ProjectBatchExpansionState,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectBatchFailurePolicy {
+    ContinueIndependent,
+    StopAdmission,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectBatchExpansionState {
+    Pending,
+    Expanding,
+    Complete,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams, ToSchema)]
+pub(crate) struct ProjectBatchCasesQuery {
+    /// Page size, from 1 to 100; defaults to 50.
+    pub limit: Option<u32>,
+    /// Last CaseId returned on the previous page.
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchCasesResource {
+    pub batch_id: String,
+    /// Axis names and canonical units for the parameter tuples in this manifest.
+    pub axes: Vec<ProjectBatchAxisSummaryResource>,
+    pub cases: Vec<ProjectBatchCaseSummaryResource>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchAxisSummaryResource {
+    pub name: String,
+    pub canonical_unit: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectBatchCaseState {
+    PendingExpansion,
+    PendingMaterialization,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchCaseSummaryResource {
+    pub case_id: String,
+    pub planned_run_id: String,
+    pub parameter_tuple: BTreeMap<String, serde_json::Value>,
+    pub state: ProjectBatchCaseState,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -130,6 +257,16 @@ pub(crate) struct ProjectRunTaskResource {
     pub artifact_ids: Vec<String>,
     pub resource_id: Option<String>,
     pub accepted_state_ref: Option<crate::schemas::common::AcceptedStateRefResource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_intent: Option<ProjectRunTaskCancellationSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectRunTaskCancellationSummary {
+    pub cancellation_id: String,
+    pub reason: String,
+    pub expected_catalog_revision: u64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
@@ -197,6 +334,7 @@ impl From<FmsTaskCatalogEntry> for ProjectRunTaskResource {
             artifact_ids: task.artifact_ids,
             resource_id: task.resource_id,
             accepted_state_ref: None,
+            cancellation_intent: None,
         }
     }
 }
@@ -213,12 +351,42 @@ pub(crate) struct ProjectRunMaterializationResource {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectRunTaskCancellationRequest {
-    /// Stable operator-visible reason persisted in the fenced Stop command.
+    /// Stable operator-visible reason persisted in the request or Stop command.
     pub reason: String,
+    /// Supply together with expected_catalog_revision for pre-claim cancellation.
+    #[serde(default)]
+    pub cancellation_id: Option<String>,
+    #[serde(default)]
+    pub expected_catalog_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub(crate) struct ProjectRunTaskCancellationResource {
+#[serde(untagged)]
+pub(crate) enum ProjectRunTaskCancellationResource {
+    Stop(ProjectRunTaskStopResource),
+    Requested(ProjectRunTaskCancellationIntentResource),
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectRunTaskCancellationIntentResource {
+    pub disposition: ProjectRunTaskCancellationDisposition,
+    pub run_id: String,
+    pub task_id: String,
+    pub cancellation_id: String,
+    pub cancellation_state: ProjectRunTaskCancellationState,
+    pub lifecycle: ProjectRunTaskLifecycle,
+    pub catalog_revision: u64,
+    pub expected_catalog_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectRunTaskCancellationState {
+    Requested,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectRunTaskStopResource {
     pub disposition: ProjectRunTaskCancellationDisposition,
     pub run_id: String,
     pub task_id: String,
@@ -286,4 +454,78 @@ pub(crate) struct ProjectDocumentResource {
     pub archive_base64: String,
     /// Bytes-only transport never claims filesystem or power-loss durability.
     pub durability: ProjectArchiveDurability,
+}
+
+/// Largest script text accepted by `POST /v2/persistence/projects/from-script`.
+pub(crate) const SCRIPT_IMPORT_MAX_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub(crate) struct ProjectFromScriptSource {
+    /// File name shown in provenance; it is not a filesystem path.
+    pub name: String,
+    /// UTF-8 Python source, at most 1 MiB.
+    pub text: String,
+}
+
+/// Explicit statement that the person agreed to run the script.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub(crate) struct ProjectFromScriptConsent {
+    /// Must be `true`: the operation executes the script in the Python helper.
+    pub executed_by_user: bool,
+}
+
+/// Turns a Python script into a project. The operation EXECUTES the script in
+/// the Python helper (same trust model as a script run), so the request must
+/// carry explicit consent.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub(crate) struct ProjectFromScriptRequest {
+    /// The script text. Required: the API cannot resolve workspace items.
+    pub source: Option<ProjectFromScriptSource>,
+    /// Workspace script item. Not supported by the API; the host reads the
+    /// file and sends its text as `source`. A request that sets it is refused.
+    pub script_item_id: Option<String>,
+    /// Project name; defaults to the script file stem.
+    pub project_name: Option<String>,
+    /// Where the script came from (for example `template:umag-sp1`,
+    /// `mx3:model.mx3`, `script_file`); recorded in `script.json`.
+    pub origin: Option<String>,
+    pub consent: Option<ProjectFromScriptConsent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ScriptRoundTripState {
+    /// The scene re-rendered to Python lowers to the same key physics fields.
+    Verified,
+    /// The re-rendered script differs or does not lower; the notes say how.
+    Failed,
+    /// The comparison could not run; the notes say why.
+    NotChecked,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ScriptFidelityResource {
+    /// The helper exported a SceneDocument from the script.
+    pub scene_exported: bool,
+    pub round_trip: ScriptRoundTripState,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectScriptImportResource {
+    pub name: String,
+    pub sha256: String,
+    pub origin: String,
+    pub exported_at: String,
+    /// Archive path of the embedded original script.
+    pub script_path: String,
+    pub fidelity: ScriptFidelityResource,
+}
+
+/// The created project (same fields as create/open) plus what was imported.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectFromScriptResource {
+    #[serde(flatten)]
+    pub project: ProjectDocumentResource,
+    pub script_import: ProjectScriptImportResource,
 }

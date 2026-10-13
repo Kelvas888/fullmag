@@ -23,6 +23,13 @@ import type {
   LivePreparationMaterializationResource,
   SimulationPreparationResource,
   AnalysisResultPageQuery,
+  OutputStorageSettings,
+  ProjectBatchCasesQuery,
+  ProjectBatchCasesResource,
+  ProjectBatchListQuery,
+  ProjectBatchListResource,
+  ProjectBatchSubmitRequest,
+  ProjectBatchSubmitResource,
 } from "./apiTypes";
 import {
   ANALYSIS_RESULT_BRANCH_POINTS_PATH,
@@ -1113,6 +1120,7 @@ describe("ControlRoomApi", () => {
       backend: "fdm" | "fem";
       device: "cpu";
       name: string;
+      output_storage?: OutputStorageSettings | null;
       precision: "double";
       replace_current?: boolean;
     }>();
@@ -3264,6 +3272,46 @@ describe("ControlRoomApi", () => {
     ]);
   });
 
+  it("deletes a checkpoint with DELETE and surfaces a 409 refusal with its message", async () => {
+    const calls: Array<{ method: string | undefined; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        calls.push({ method: init?.method, url: String(url) });
+        if (String(url).endsWith("/cp-busy")) {
+          return jsonResponse(
+            {
+              code: "conflict",
+              message: "checkpoint_delete_referenced: checkpoint cp-busy is the restore source",
+            },
+            { status: 409 },
+          );
+        }
+        return new Response(null, {
+          status: 204,
+          headers: { "x-api-contract-version": "1.0.0" },
+        });
+      },
+      retryDelayMs: 0,
+    });
+
+    await expect(api.persistence.checkpoints.delete("cp-000042")).resolves.toBeUndefined();
+    await expect(api.persistence.checkpoints.delete("cp-busy")).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining("checkpoint_delete_referenced"),
+    });
+    expect(calls).toEqual([
+      {
+        method: "DELETE",
+        url: "http://127.0.0.1:8765/v2/sessions/current/persistence/checkpoints/cp-000042",
+      },
+      {
+        method: "DELETE",
+        url: "http://127.0.0.1:8765/v2/sessions/current/persistence/checkpoints/cp-busy",
+      },
+    ]);
+  });
+
   it("loads selected object metrics through the v2 simulation object resource", async () => {
     let observedUrl = "";
     const api = new ControlRoomApi({
@@ -4957,6 +5005,46 @@ describe("ControlRoomApi", () => {
     }]);
   });
 
+  it("posts the script to the from-script resource with explicit consent and surfaces a typed 422", async () => {
+    const requests: Array<{ body: unknown; method: string | undefined; url: string }> = [];
+    let respondWithFailure = false;
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        requests.push({
+          body: init?.body ? parseRequestBody(init.body) : null,
+          method: init?.method,
+          url: String(url),
+        });
+        if (respondWithFailure) {
+          return jsonResponse(
+            { code: "script_export_failed", message: "script_export_failed: boom" },
+            { status: 422 },
+          );
+        }
+        return jsonResponse({ project_id: "project-1", name: "demo" });
+      },
+    });
+    const request = {
+      source: { name: "demo.py", text: "import fullmag as fm\n" },
+      project_name: "demo",
+      consent: { executed_by_user: true },
+    };
+
+    await api.persistence.projects.fromScript(request);
+    expect(requests).toEqual([{
+      body: request,
+      method: "POST",
+      url: "http://127.0.0.1:8765/v2/persistence/projects/from-script",
+    }]);
+
+    respondWithFailure = true;
+    await expect(api.persistence.projects.fromScript(request)).rejects.toMatchObject({
+      status: 422,
+      code: "script_export_failed",
+    });
+  });
+
   it("requests durable cancellation for the exact project run task", async () => {
     const requests: Array<{ body: unknown; method: string | undefined; url: string }> = [];
     const api = new ControlRoomApi({
@@ -5020,6 +5108,41 @@ describe("ControlRoomApi", () => {
     }]);
   });
 
+  it("reads a pinned historical scalar without using the current session", async () => {
+    const requests: Array<{ method: string | undefined; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        requests.push({ method: init?.method, url: String(url) });
+        return jsonResponse({
+          project_id: "project-1",
+          run_id: "run-1",
+          solution_set_id: "set-1",
+          revision: "9007199254740993",
+          member_id: "member-1",
+          artifact_id: "artifact-1",
+          value_si: -1,
+          unit: "J",
+        });
+      },
+    });
+
+    const result = await api.persistence.projects.solutionScalar(
+      "project-1",
+      "run-1",
+      "set-1",
+      "9007199254740993",
+      "member-1",
+      "artifact-1",
+    );
+    expect(result.revision).toBe("9007199254740993");
+    expect(result.value_si).toBe(-1);
+    expect(requests).toEqual([{
+      method: "GET",
+      url: "http://127.0.0.1:8765/v2/persistence/projects/project-1/runs/run-1/solution-sets/set-1/revisions/9007199254740993/members/member-1/artifacts/artifact-1/scalar",
+    }]);
+  });
+
   it("lists durable project runs with an explicit cursor", async () => {
     const requests: Array<{ method: string | undefined; url: string }> = [];
     const api = new ControlRoomApi({
@@ -5041,6 +5164,85 @@ describe("ControlRoomApi", () => {
     expect(url.pathname).toBe("/v2/persistence/projects/project-1/runs");
     expect(url.searchParams.get("limit")).toBe("10");
     expect(url.searchParams.get("cursor")).toBe("run-prev");
+  });
+
+  it("submits and pages project batches through the typed persistence facade", async () => {
+    const requests: Array<{ body: unknown; method: string | undefined; url: string }> = [];
+    const batchRequest: ProjectBatchSubmitRequest = {
+      archive_base64: "Zg==",
+      idempotency_key: "submit-batch-1",
+      batch_request: { batch_id: "batch-1" },
+      study_plan: { schema_version: "study_plan.v2" },
+      study_problem_catalog: { schema_version: "study_problem_catalog.v3" },
+      asset_paths: {},
+    };
+    const accepted: ProjectBatchSubmitResource = {
+      disposition: "accepted",
+      batch_id: "batch-1",
+      manifest_sha256: "a".repeat(64),
+      case_count: 2,
+    };
+    const batchPage: ProjectBatchListResource = {
+      project_id: "project-1",
+      batches: [{
+        batch_id: "batch-1",
+        accepted_at: "2026-10-07T00:00:00Z",
+        manifest_sha256: accepted.manifest_sha256,
+        case_count: 2,
+        max_parallel_cases: 2,
+        failure_policy: "continue_independent",
+        published_case_count: 0,
+        expansion_state: "pending",
+      }],
+      next_cursor: null,
+    };
+    const casesPage: ProjectBatchCasesResource = {
+      batch_id: "batch-1",
+      axes: [{ name: "field_z", canonical_unit: "T" }],
+      cases: [{
+        case_id: "case-" + "b".repeat(64),
+        planned_run_id: "run-planned-1",
+        parameter_tuple: { field_z: -0.01 },
+        state: "pending_expansion",
+      }],
+      next_cursor: null,
+    };
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          body: init?.body ? parseRequestBody(init.body) : null,
+          method: init?.method,
+          url,
+        });
+        if (init?.method === "POST") return jsonResponse(accepted, { status: 201 });
+        if (url.includes("/cases")) return jsonResponse(casesPage);
+        return jsonResponse(batchPage);
+      },
+    });
+
+    const submitted = await api.persistence.projects.submitBatch("project-1", batchRequest);
+    const batchQuery: ProjectBatchListQuery = { limit: 25, cursor: "batch-prev" };
+    const listed = await api.persistence.projects.listBatches("project-1", batchQuery);
+    const casesQuery: ProjectBatchCasesQuery = { limit: 10 };
+    const cases = await api.persistence.projects.listBatchCases(
+      "project-1", "batch-1", casesQuery,
+    );
+
+    expect(submitted).toEqual(accepted);
+    expect(listed).toEqual(batchPage);
+    expect(cases).toEqual(casesPage);
+    expect(requests.map(({ method, url }) => ({ method, url: new URL(url).pathname }))).toEqual([
+      { method: "POST", url: "/v2/persistence/projects/project-1/batches" },
+      { method: "GET", url: "/v2/persistence/projects/project-1/batches" },
+      { method: "GET", url: "/v2/persistence/projects/project-1/batches/batch-1/cases" },
+    ]);
+    expect(requests[0]?.body).toEqual(batchRequest);
+    const batchListUrl = new URL(requests[1]!.url);
+    expect(batchListUrl.searchParams.get("limit")).toBe("25");
+    expect(batchListUrl.searchParams.get("cursor")).toBe("batch-prev");
+    expect(new URL(requests[2]!.url).searchParams.get("limit")).toBe("10");
   });
 
   it("loads and patches object interaction resources through v2 model facade methods", async () => {
@@ -6235,5 +6437,65 @@ describe("ControlRoomApi", () => {
       "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/fmr/resonance-fits",
       "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/fmr/kittel-fit",
     ]);
+  });
+});
+
+
+describe("API instance fence", () => {
+  it("discards binary output when replacement is observed during decoding", async () => {
+    const pin = "12345678-1234-4234-8234-123456789abc";
+    let releaseDecode: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { releaseDecode = resolve; });
+    let decoding = false;
+    const api = new ControlRoomApi({
+      baseUrl: "http://localhost",
+      expectedApiInstance: pin,
+      binaryDecodeScheduler: async ({ buffer, decodeInline }) => {
+        decoding = true;
+        await gate;
+        return decodeInline(buffer);
+      },
+      fetchImpl: async (url) => new URL(String(url)).pathname.endsWith("/topology")
+        ? binaryResponse(makeTopologyBuffer(), { headers: { ...contractHeaders, "x-fullmag-api-instance": pin } })
+        : new Response("{}", { headers: { "x-fullmag-api-instance": "replacement" } }),
+    });
+    const pending = api.data.domain.topology();
+    await vi.waitFor(() => expect(decoding).toBe(true));
+    await expect(api.platform.health()).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    releaseDecode?.();
+    await rejected;
+  });
+
+  it("discards an in-flight old response after another request observes replacement", async () => {
+    const pin = "12345678-1234-4234-8234-123456789abc";
+    let releaseOld: ((response: Response) => void) | undefined;
+    const oldResponse = new Promise<Response>((resolve) => { releaseOld = resolve; });
+    const fetchImpl = vi.fn()
+      .mockImplementationOnce(() => oldResponse)
+      .mockResolvedValueOnce(new Response("{}", { headers: { "x-fullmag-api-instance": "replacement" } }));
+    const api = new ControlRoomApi({ expectedApiInstance: pin, fetchImpl });
+    const pending = api.sessions.current.status();
+    while (fetchImpl.mock.calls.length === 0) await Promise.resolve();
+    await expect(api.sessions.current.status()).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    releaseOld?.(new Response("{}", { headers: { "x-fullmag-api-instance": pin } }));
+    await rejected;
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("pins requests and permanently refuses a replacement without retries", async () => {
+    const pin = "12345678-1234-4234-8234-123456789abc";
+    const fetchImpl = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("x-fullmag-api-instance")).toBe(pin);
+      return new Response("{}", { headers: {
+        "x-api-contract-version": "1.0.0",
+        "x-fullmag-api-instance": "87654321-1234-4234-8234-123456789abc",
+      } });
+    });
+    const api = new ControlRoomApi({ expectedApiInstance: pin, fetchImpl });
+    await expect(api.sessions.current.status()).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    await expect(api.sessions.current.status()).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });

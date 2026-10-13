@@ -1,11 +1,14 @@
 //! Native OpenAPI v2 spec assembly.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        crate::router_v2::handlers::platform::compute_profiles::get_compute_profiles,
+        crate::router_v2::handlers::platform::compute_profiles::post_compute_profile,
+        crate::router_v2::handlers::platform::compute_preview::post_compute_preview,
         crate::router_v2::handlers::platform::realtime::get_asyncapi_document,
         crate::router_v2::handlers::platform::realtime::get_asyncapi_docs,
         crate::router_v2::handlers::platform::realtime::get_communication_policy,
@@ -85,6 +88,20 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::workspace::workspace::replace_workspace_ribbon,
         crate::router_v2::handlers::workspace::workspace::get_workspace_layout,
         crate::router_v2::handlers::workspace::workspace::replace_workspace_layout,
+        crate::router_v2::handlers::workspace_items::list_items,
+        crate::router_v2::handlers::workspace_items::post_item,
+        crate::router_v2::handlers::workspace_items::get_item,
+        crate::router_v2::handlers::workspace_items::get_item_thumbnail,
+        crate::router_v2::handlers::workspace_items::get_item_archive,
+        crate::router_v2::handlers::workspace_items::pin_item,
+        crate::router_v2::handlers::workspace_items::forget_item,
+        crate::router_v2::handlers::workspace_items::get_item_history,
+        crate::router_v2::handlers::workspace_items::get_item_frames,
+        crate::router_v2::handlers::workspace_items::get_setting,
+        crate::router_v2::handlers::workspace_items::put_setting,
+        crate::router_v2::handlers::workspace_items::get_roots,
+        crate::router_v2::handlers::workspace_items::put_roots,
+        crate::router_v2::handlers::workspace_items::post_scan,
         crate::router_v2::handlers::meshing::mesh::get_mesh_summary,
         crate::router_v2::handlers::meshing::mesh::get_mesh_capabilities,
         crate::router_v2::handlers::meshing::mesh::get_mesh_semantics,
@@ -212,7 +229,12 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::persistence::assets::import_asset,
         crate::router_v2::handlers::persistence::projects::create,
         crate::router_v2::handlers::persistence::projects::open,
+        crate::router_v2::handlers::persistence::projects::authoring_update,
+        crate::router_v2::handlers::persistence::script_project::from_script,
         crate::router_v2::handlers::persistence::projects::submit_run,
+        crate::router_v2::handlers::persistence::projects::submit_batch,
+        crate::router_v2::handlers::persistence::projects::list_batches,
+        crate::router_v2::handlers::persistence::projects::list_batch_cases,
         crate::router_v2::handlers::persistence::projects::list_runs,
         crate::router_v2::handlers::persistence::projects::get_run,
         crate::router_v2::handlers::persistence::projects::materialize_run,
@@ -278,6 +300,7 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::persistence::solutions::get_solution_revision,
         crate::router_v2::handlers::persistence::solutions::get_solution_members,
         crate::router_v2::handlers::persistence::solutions::get_solution_artifacts,
+        crate::router_v2::handlers::persistence::solutions::scalar::get_solution_scalar,
         crate::router_v2::handlers::persistence::solutions::get_materialized_dataset,
         crate::router_v2::handlers::persistence::solutions::get_materialized_dataset_slice,
         crate::router_v2::handlers::persistence::solutions::saved_geometry::get_saved_field_geometry,
@@ -310,6 +333,7 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::persistence::session::commit_session,
         crate::router_v2::handlers::persistence::session::list_checkpoints,
         crate::router_v2::handlers::persistence::session::get_checkpoint,
+        crate::router_v2::handlers::persistence::session::delete_checkpoint,
         crate::router_v2::handlers::persistence::session::create_checkpoint,
         crate::router_v2::handlers::persistence::session::restore_checkpoint,
         crate::router_v2::handlers::persistence::session::export_field_state,
@@ -319,8 +343,78 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::persistence::session::clear_recovery,
         crate::router_v2::handlers::platform::system::get_capabilities,
         crate::router_v2::handlers::platform::system::get_health,
+        crate::router_v2::handlers::platform::runtime_service::get_runtime_service,
+        crate::router_v2::handlers::platform::development_backend::get_development_backend,
+        crate::router_v2::handlers::platform::development_backend_build_request::post_development_backend_build_request,
+        crate::router_v2::handlers::platform::development_backend_build_request::get_development_backend_build_request,
+        crate::router_v2::handlers::platform::output_storage::get_output_storage_defaults,
+        crate::router_v2::handlers::platform::output_storage::put_output_storage_defaults,
+        crate::router_v2::handlers::platform::development_restart_request::post_development_restart_request,
+        crate::router_v2::handlers::platform::development_restart_request::get_development_restart_request,
     ),
     components(schemas(
+        crate::schemas::development_backend::DevelopmentBackendResource,
+        crate::schemas::development_backend::DevelopmentBackendState,
+        crate::schemas::development_backend::DevelopmentBackendReason,
+        crate::schemas::development_backend::DevelopmentBuildIdentity,
+        crate::schemas::development_backend::DevelopmentBackendWorkspaceIdentity,
+        crate::schemas::development_backend_build_request::DevelopmentBackendBuildRequest,
+        crate::schemas::development_backend_build_request::DevelopmentBackendBuildRequestResource,
+        crate::schemas::development_backend_build_request::DevelopmentBackendBuildRequestState,
+        crate::schemas::development_restart_request::DevelopmentRestartRequest,
+        crate::schemas::development_restart_request::DevelopmentRestartResource,
+        crate::schemas::development_restart_request::DevelopmentRestartState,
+        crate::schemas::runtime_service::RuntimeServiceStatusResource,
+        crate::schemas::runtime_service::RuntimeServiceStatusState,
+        crate::schemas::runtime_service::RuntimeServiceStatusReason,
+        crate::schemas::output_storage::OutputDataFormatSchema,
+        crate::schemas::output_storage::TempCleanupSchema,
+        crate::schemas::output_storage::ExistingOutputSchema,
+        crate::schemas::output_storage::OutputStorageSettingsSchema,
+        crate::schemas::output_storage::OutputStorageDefaultsRequest,
+        crate::schemas::output_storage::OutputStorageDefaultsResource,
+        crate::schemas::workspace_items::WorkspaceItemKind,
+        crate::schemas::workspace_items::WorkspaceItemStatus,
+        crate::schemas::workspace_items::WorkspaceItem,
+        crate::schemas::workspace_items::WorkspaceOpenState,
+        crate::schemas::workspace_items::WorkspaceOutcome,
+        crate::schemas::workspace_items::WorkspaceItemList,
+        crate::schemas::workspace_items::WorkspaceEvent,
+        crate::schemas::workspace_items::WorkspaceItemDetail,
+        crate::schemas::workspace_items::WorkspaceHistory,
+        crate::schemas::workspace_items::WorkspacePinRequest,
+        crate::schemas::workspace_items::WorkspaceForgetResult,
+        crate::schemas::workspace_items::WorkspaceAddRequest,
+        crate::schemas::workspace_items::WorkspaceRoot,
+        crate::schemas::workspace_items::WorkspaceRootsSource,
+        crate::schemas::workspace_items::WorkspaceRoots,
+        crate::schemas::workspace_items::WorkspaceRootsRequest,
+        crate::schemas::workspace_items::WorkspaceScanRequest,
+        crate::schemas::workspace_items::WorkspaceThumbnailOrigin,
+        crate::schemas::workspace_items::WorkspaceScanReport,
+        crate::schemas::workspace_items::ItemDetail,
+        crate::schemas::workspace_items::ProjectDetail,
+        crate::schemas::workspace_items::ProjectSummary,
+        crate::schemas::workspace_items::ModelSummary,
+        crate::schemas::workspace_items::ExecutionSummary,
+        crate::schemas::workspace_items::OutputsSummary,
+        crate::schemas::workspace_items::Author,
+        crate::schemas::workspace_items::Citation,
+        crate::schemas::workspace_items::HistoryEntry,
+        crate::schemas::workspace_items::ProjectRun,
+        crate::schemas::workspace_items::PreviewInfo,
+        crate::schemas::workspace_items::ScriptDetail,
+        crate::schemas::workspace_items::ResultDetail,
+        crate::schemas::workspace_items::ResultGrid,
+        crate::schemas::workspace_items::FrameEntry,
+        crate::schemas::workspace_items::FramesStageCount,
+        crate::schemas::workspace_items::FramesSummary,
+        crate::schemas::workspace_items::FramesPage,
+        crate::schemas::workspace_items::WorkspaceSetting,
+        crate::schemas::workspace_items::WorkspaceSettingRequest,
+        fullmag_workspace_inspect::manifest::RunSource,
+        fullmag_workspace_inspect::manifest::StageSummary,
+        fullmag_workspace_inspect::manifest::RunOutput,
         crate::schemas::sessions::CreateSessionRequest,
         crate::schemas::sessions::CreateSessionResponse,
         crate::schemas::sessions::SessionListResource,
@@ -388,6 +482,8 @@ use utoipa::OpenApi;
         crate::schemas::common::AcceptedObservationFrameRef,
         crate::schemas::common::AcceptedStateRefResource,
         crate::schemas::common::AcceptedStateIdResource,
+        crate::schemas::solutions::SolutionScalarResource,
+        crate::schemas::solutions::SolutionScalarIntegrityResource,
         crate::schemas::solutions::SolutionSetArtifactPageResource,
         crate::schemas::solutions::SolutionSetMemberPageResource,
         crate::schemas::solutions::SolutionSetArtifactResource,
@@ -602,11 +698,31 @@ use utoipa::OpenApi;
         crate::schemas::workspace::WorkspaceActiveNodeReplaceRequest,
         crate::schemas::projects::ProjectCreateRequest,
         crate::schemas::projects::ProjectArchiveRequest,
+        crate::schemas::projects::ProjectAuthoringUpdateRequest,
+        crate::schemas::projects::ProjectFromScriptRequest,
+        crate::schemas::projects::ProjectFromScriptSource,
+        crate::schemas::projects::ProjectFromScriptConsent,
+        crate::schemas::projects::ProjectFromScriptResource,
+        crate::schemas::projects::ProjectScriptImportResource,
+        crate::schemas::projects::ScriptFidelityResource,
+        crate::schemas::projects::ScriptRoundTripState,
         crate::schemas::projects::ProjectDocumentMode,
         crate::schemas::projects::ProjectMigrationResource,
         crate::schemas::projects::ProjectArchiveDurability,
         crate::schemas::projects::ProjectDocumentResource,
         crate::schemas::projects::ProjectRunSubmitRequest,
+        crate::schemas::projects::ProjectBatchSubmitRequest,
+        crate::schemas::projects::ProjectBatchSubmitResource,
+        crate::schemas::projects::ProjectBatchListQuery,
+        crate::schemas::projects::ProjectBatchListResource,
+        crate::schemas::projects::ProjectBatchSummaryResource,
+        crate::schemas::projects::ProjectBatchFailurePolicy,
+        crate::schemas::projects::ProjectBatchExpansionState,
+        crate::schemas::projects::ProjectBatchCasesQuery,
+        crate::schemas::projects::ProjectBatchCasesResource,
+        crate::schemas::projects::ProjectBatchAxisSummaryResource,
+        crate::schemas::projects::ProjectBatchCaseState,
+        crate::schemas::projects::ProjectBatchCaseSummaryResource,
         crate::schemas::projects::ProjectRunSubmitResource,
         crate::schemas::projects::ProjectRunResource,
         crate::schemas::projects::ProjectRunListQuery,
@@ -887,6 +1003,7 @@ use utoipa::OpenApi;
         crate::types::ScriptSyncRequest,
         crate::types::ScriptSyncResponse,
         crate::types::ScriptSourceResponse,
+        crate::types::SessionScriptSummary,
         crate::types::EngineLogEntry,
         crate::types::CpuTelemetryResponse,
         crate::types::GpuTelemetryDevice,
@@ -965,6 +1082,7 @@ use utoipa::OpenApi;
         (name = "data", description = "Quantities, fields, scalar histories, domain data, and artifacts"),
         (name = "visualization", description = "Renderer display selection and presentation state"),
         (name = "workspace", description = "Workspace shell state owned by the frontend"),
+        (name = "workspace_items", description = "Per-user recent projects, scripts and result folders (shared workspace database)"),
         (name = "analysis", description = "Analysis products such as eigenmodes and dispersion"),
         (name = "persistence", description = "Session checkpoints, exports, imports, assets, and recovery"),
         (name = "diagnostics", description = "Runtime diagnostics, GPU telemetry, and engine logs"),
@@ -1273,21 +1391,15 @@ mod tests {
         let document = openapi_json();
         let schemas = &document["components"]["schemas"];
 
-        assert!(
-            schemas["SamplingPeriodPolicyResource"]
-                .to_string()
-                .contains("auto_sinc_cutoff")
-        );
-        assert!(
-            schemas["AutomaticOutputSamplingResource"]
-                .to_string()
-                .contains("field_auto")
-        );
-        assert!(
-            schemas["AutomaticOutputSamplingResource"]
-                .to_string()
-                .contains("scalar_auto")
-        );
+        assert!(schemas["SamplingPeriodPolicyResource"]
+            .to_string()
+            .contains("auto_sinc_cutoff"));
+        assert!(schemas["AutomaticOutputSamplingResource"]
+            .to_string()
+            .contains("field_auto"));
+        assert!(schemas["AutomaticOutputSamplingResource"]
+            .to_string()
+            .contains("scalar_auto"));
     }
 
     #[test]
@@ -1298,23 +1410,19 @@ mod tests {
         assert!(stage.contains("target"));
         assert!(stage.contains("layout"));
         assert!(stage.contains("format"));
-        assert!(
-            schemas["StageAutosaveFormatResource"]
-                .to_string()
-                .contains("hdf5")
-        );
-        assert!(
-            schemas["StageAutosaveLayoutResource"]
-                .to_string()
-                .contains("continuous")
-        );
+        assert!(schemas["StageAutosaveFormatResource"]
+            .to_string()
+            .contains("hdf5"));
+        assert!(schemas["StageAutosaveLayoutResource"]
+            .to_string()
+            .contains("continuous"));
     }
 
     #[test]
     fn openapi_current_transport_preserves_conservative_current_view_payload() {
         let document = openapi_json();
-        let property = &document["components"]["schemas"]["KnownSceneCurrentTransport"]["properties"]
-            ["conservative_current_view"];
+        let property = &document["components"]["schemas"]["KnownSceneCurrentTransport"]
+            ["properties"]["conservative_current_view"];
 
         assert_eq!(
             property["additionalProperties"],
@@ -1330,32 +1438,25 @@ mod tests {
         let property =
             &schemas["KnownSceneCurrentTransport"]["properties"]["structured_current_closure"];
 
-        assert!(
-            property
-                .to_string()
-                .contains("#/components/schemas/SceneStructuredCurrentClosure")
-        );
-        assert!(
-            schemas["SceneStructuredCurrentClosure"]
-                .to_string()
-                .contains("closed_geometry")
-        );
-        assert!(
-            !schemas["SceneStructuredCurrentClosure"]
-                .to_string()
-                .contains("certified_import")
-        );
-        assert!(
-            schemas["SceneStructuredCurrentDrive"]
-                .to_string()
-                .contains("impressed_potential_jump")
-        );
+        assert!(property
+            .to_string()
+            .contains("#/components/schemas/SceneStructuredCurrentClosure"));
+        assert!(schemas["SceneStructuredCurrentClosure"]
+            .to_string()
+            .contains("closed_geometry"));
+        assert!(!schemas["SceneStructuredCurrentClosure"]
+            .to_string()
+            .contains("certified_import"));
+        assert!(schemas["SceneStructuredCurrentDrive"]
+            .to_string()
+            .contains("impressed_potential_jump"));
     }
 
     #[test]
     fn openapi_topological_charge_v2_is_closed_and_versioned() {
         let document = openapi_json();
-        let operation = &document["paths"]["/v2/sessions/current/analysis/extensions/objects/{object_id}/topological-charge"]
+        let operation = &document["paths"]
+            ["/v2/sessions/current/analysis/extensions/objects/{object_id}/topological-charge"]
             ["get"];
         let parameters = operation["parameters"]
             .as_array()

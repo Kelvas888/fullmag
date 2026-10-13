@@ -1,5 +1,34 @@
 # Windows-first development
 
+## Ulotne dane kompilacji na RAM-disku
+
+Opcjonalny `FULLMAG_WINDOWS_VOLATILE_ROOT` w lokalnym `.env` głównego
+checkoutu wskazuje absolutny katalog na lokalnym dysku Windows. Worktree
+dziedziczą tę konfigurację. Launcher tworzy tam oznaczony katalog osobno dla
+worktree i profilu: `builds/<worktree-id>/<profile>/compiler-inputs` oraz `tmp`.
+Katalog `tmp` służy jako `TEMP`, `TMP` i `TMPDIR` wyłącznie podczas
+wywołań Cargo. Zmienne są przywracane również po błędzie kompilacji;
+konfiguracja systemu nie jest zmieniana.
+
+Kopia źródeł kompilatora trafia na RAM-disk tylko wtedy, gdy jego sterownik
+obsługuje Windows `GetFinalPathNameByHandleW`, wymaganą przez Rust/Tauri.
+Przy błędzie `ERROR_INVALID_FUNCTION` launcher jawnie pozostawia jedną
+kopię źródeł w trwałym profilu. TEMP kompilatora nadal wskazuje RAM-disk.
+Jedna ścieżka źródeł dla backendu i desktopu zapobiega naprzemiennemu
+unieważnianiu cache Cargo. Inne błędy preflightu nie są ignorowane.
+
+Snapshoty źródeł i ich hashe, cache przyrostowy Cargo, Python, frontend,
+gotowe EXE, pakiety, manifesty, logi, receipts oraz dane sesji pozostają w
+`FULLMAG_PROJECT_STORAGE_ROOT`. Utrata RAM-diska nie usuwa tych danych.
+Kopia kompilatora powstaje ponownie ze zweryfikowanego snapshotu. Zmiana
+ścieżki kompilatora może jednorazowo przebudować część kodu projektu.
+
+Brak skonfigurowanego dysku blokuje nowy build; nie następuje cichy wybór
+innego katalogu. Uruchomienie istniejącego zgodnego pakietu z `build=false`
+nie wymaga RAM-diska. Nieoznaczony niepusty katalog, obcy profil, przekierowanie
+ścieżki lub nakładanie się na trwałe dane są odrzucane. Ustawienie nie
+przenosi buildów kontenerowego FEM ani Linuxa.
+
 Windows is the host build and orchestration environment. The current development routes are:
 
 | Lane | Build/runtime |
@@ -17,18 +46,87 @@ Tabela powyżej opisuje bieżące trasy rozwojowe; kontenerowy FEM nie realizuje
 docelowej bramki natywnego produktu. Pełny pakiet Windows pozostaje
 **NOT VERIFIED**. Osobny Linux/managed target zachowuje swoje bramki.
 
-Launcher deweloperski ma teraz jawny tryb pustego workspace:
+Launcher deweloperski ma jawny tryb pustego workspace. Kanoniczna recepta
+`just` uruchamia natywną trasę Windows bez skryptu wejściowego, a domyślnie
+wybiera developerski frontend, port 3197 i automatyczną decyzję o budowie:
 
 ```powershell
-.\scripts\windows\run_fullmag.ps1 -BuildMode false -Frontend static -RunMode workspace -WebPort 3197
+just windows-ui
 ```
 
-Wymaga wcześniej zbudowanego, zgodnego natywnego pakietu i statycznego UI;
-nie buduje brakującego pakietu ani nie obchodzi manifestu/hashów. Wywołuje
-`fullmag ui` bez skryptu. Backend i urządzenie wybiera się przy tworzeniu
-problemu w UI, więc ten tryb odrzuca parametry obliczeń zamiast je ignorować.
-Nie uruchomiono jeszcze tego polecenia z aktualnym natywnym pakietem:
-testy argumentów nie są dowodem startupu, zapisu ani wykonania FEM.
+Tryb developerski używa izolowanego workspace frontendu w storage: katalogi
+źródłowe są zwykłymi plikami synchronizowanymi z checkoutem przez watcher.
+Cache i wynik pracy pozostają w osobnym katalogu. Edycje React/CSS są
+widoczne bez unieważniania pakietu backendu; zmiany konfiguracji lub
+zależności wymagają ponownego przygotowania workspace. Tryb statyczny kopiuje źródła do izolowanego
+workspace przed zbudowaniem eksportu. Przykłady:
+
+```powershell
+just windows-ui dev 3197 auto
+just windows-ui static 3197 false
+just windows-ui dev 3197 true
+```
+
+Backend kompiluje się na żądanie: kliknij **Build backend** w workspace
+albo użyj polecenia:
+
+```powershell
+just windows-workspace-build dev dev 3197 auto
+```
+
+Przed kompilacją powstaje utrwalona kopia źródeł. Dalsze edycje agentów nie
+unieważniają tego buildu i nie uruchamiają kolejnego. Zmiana utrwalonej kopii
+jest błędem integralności. Frontend zachowuje automatyczne HMR.
+
+Testy w `packages/fullmag-py/tests/` nie są częścią instalowanego pakietu
+Python (`setuptools` pakuje `src/`). Ich edycje nie unieważniają runtime ani
+aktywnego środowiska. Snapshot nadal kopiuje i sprawdza ich rzeczywiste bajty;
+pełna tożsamość źródeł i jawne `qualification_inputs` zachowują dowody testów.
+Zmiany produkcyjnego `src/` i zależności nadal wymagają właściwego buildu oraz
+bezpiecznego zamknięcia używanego środowiska. Szczegóły: [P8-55](../plans/active/refactor_runtime/final/p8/55-python-test-runtime-input-classification.md).
+
+Build nie restartuje działającego backendu ani symulacji. Powstaje nowy
+pakiet do późniejszego zastosowania; kontrolowany restart z odtworzeniem
+workspace pozostaje osobną bramką P8-53. Pełny log kompilatora trafia do
+`logs/native-build-<id>.log` w rozwiązywanym katalogu buildu; jego ścieżkę
+zapisuje `build-status.json`, również gdy kompilacja się nie powiedzie.
+
+Ta decyzja z 05.10.2026 zastępuje automatyczny watcher i ustawienie
+`FULLMAG_BACKEND_DEV_DEBOUNCE_SECONDS`. Już działający starszy proces
+zachowuje stare zachowanie do zamknięcia i ponownego uruchomienia workspace.
+Aktualne dowody wdrożenia znajdują się w
+[P8-54](../plans/active/refactor_runtime/final/p8/54-manual-native-build-snapshot.md).
+
+Odpowiednik bezpośredni w PowerShell:
+
+```powershell
+.\scripts\windows\run_fullmag.ps1 -BuildMode auto -Frontend dev -RunMode workspace -WebPort 3197
+```
+
+`build=auto` buduje brakujący lub nieaktualny pakiet, `build=false` wymaga
+zgodnego istniejącego pakietu, a `build=true` wymusza budowę. Automatyczna
+budowa jest zamknięta w trasie `run-windows-workspace` resolvera i korzysta z
+odrębnego natywnego locka heavy; nie zmienia zasad ogólnej trasy Linuxowego
+runnera ani kolejki/job 219. Budowa na żądanie użytkownika jest dozwolona dla
+tej konkretnej natywnej trasy, przy zachowaniu preflightu storage, blokad,
+manifestu, hashów i terminalnego receiptu. `fullmag ui` otwiera pusty
+workspace; backend i urządzenie wybiera się przy tworzeniu problemu w UI,
+więc launcher odrzuca parametry obliczeń zamiast je ignorować.
+
+03.10.2026: 88 interpretowanych regresji, 2 pominięcia i 13 subtestów oraz
+4 kontrole Node synchronizacji źródeł i granicy Tailwind PASS. Natywny build
+wytworzył wersjonowane CLI/API/UI. Browser na 3197, utworzenie pustej sesji,
+boxa i zmienionego cylindra oraz działający WebGL PASS. Poprawka Inspectora
+dotarła przez HMR bez nowej kompilacji Rust. Cały przebieg po zamknięciu
+własnego okna zakończył się kodem 0. Save/restart, pełny authoring
+regionów/materiałów, inne porty, instalator i pełna kwalifikacja Windows
+pozostają **NOT VERIFIED**. [Dowody](../plans/active/refactor_runtime/final/p8/50-windows-empty-ui-just-route.md).
+
+Wersja bazowa Cargo pozostaje numerem planowanego wydania. Automatyczny
+rekord buildu dodaje datę UTC, commit i snapshot lokalnych zmian, np.
+`0.1.0-dev.20261003.gbdc8578d0493.dirty.s081c18f2caeb+9772`.
+Python otrzymuje równoważną wersję PEP 440; CLI/API/UI i metadata EXE
+korzystają z jednego rekordu. [Kontrakt wersji](../plans/active/refactor_runtime/final/p8/51-development-build-version.md).
 
 Build obejmujący Control Room musi wytworzyć również `fullmag-ui.exe`
 z pakietu `fullmag-desktop`. Manifest zapisuje `desktop_binary_sha256`,
@@ -145,6 +243,17 @@ project storage and keep Cargo outputs in that profile's build directory.
 
 ## Commands
 
+### Okno zapory przy uruchamianiu Windows
+
+Zapora przypisuje zgodę do pełnej ścieżki programu. Natywny launcher świeżego
+workspace publikuje sprawdzone EXE pod stałą ścieżką profilu
+`runtime_root/native-launch/dev/bin` lub `native-launch/release/bin`.
+Kopie UUID nadal służą do weryfikacji pochodzenia. Pierwsze uruchomienie nowej
+ścieżki może wymagać zgody; dev i release są odrębne. Launcher nie zmienia
+reguł zapory. Dla lokalnej pracy na localhost sieć publiczna nie jest potrzebna.
+
+Dowody i ograniczenia: [P8-53R](../plans/active/refactor_runtime/final/p8/53r-native-development-reliability.md).
+
 ```powershell
 just windows-doctor
 just windows-build fdm cpu dev
@@ -155,9 +264,9 @@ just fullmag build=True dev fdm cpu .\examples\example.py
 just fullmag build=True dev fem gpu .\examples\example.py
 ```
 
-When multiple agents are editing the same checkout during a build, pass
-`skip_local_changes=true` (or use `-SkipLocalChanges` on the PowerShell
-launcher):
+The legacy headless route offers `skip_local_changes=true` (or
+`-SkipLocalChanges` on the PowerShell launcher) for an explicitly unqualified
+diagnostic build from a changing checkout:
 
 ```text
 just fullmag build=True headless fdm gpu skip_local_changes=true .\path\case.py
@@ -169,6 +278,10 @@ still records both snapshots in the manifest and marks the receipt
 is explicitly unqualified for reproducibility. Reusing that manifest with
 `build=False` requires passing the same flag again. Binary hashes, backend,
 device, image, and storage checks remain enforced.
+
+Natywny workspace `just windows-ui dev` korzysta z utrwalonej kopii źródeł
+opisanej na początku dokumentu. Jego zwykła praca z wieloma agentami zachowuje
+kontrolę integralności i nie wymaga flagi `skip_local_changes`.
 
 Existing FEM images are reused. Set `FULLMAG_WINDOWS_REBUILD_FEM_IMAGE=1` for a
 deliberate image rebuild after changing a FEM Dockerfile or its dependencies.

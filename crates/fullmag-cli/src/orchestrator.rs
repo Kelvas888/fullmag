@@ -1,9 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use fullmag_ir::{
-    BackendPlanIR, BackendTarget, DiscretizationHintsIR, DynamicsIR, ExecutionPlanIR, FdmHintsIR,
-    FemHintsIR, GeometryEntryIR, MagnetIR, MaterialIR, ObjectRegionIR, ProblemIR, RegionIR,
-    RelaxationAlgorithmIR, StudyIR,
+    AutosaveFormatIR, BackendPlanIR, BackendTarget, DiscretizationHintsIR, DynamicsIR,
+    ExecutionPlanIR, FdmHintsIR, FemHintsIR, GeometryEntryIR, MagnetIR, MaterialIR, ObjectRegionIR,
+    OutputDataFormatIR, OutputStorageIR, ProblemIR, RegionIR, RelaxationAlgorithmIR, StudyIR,
 };
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -44,12 +44,194 @@ const DEFERRED_DOMAIN_COMPLETION_DETAIL: &str =
 const DEFERRED_MESH_COMPLETION_DETAIL: &str =
     "Mesh completed during deferred materialization; timing unavailable";
 
+struct ScriptOutputStorageLease {
+    lease: Option<fullmag_runner::project_storage::ProjectStorageLease>,
+}
+
+impl ScriptOutputStorageLease {
+    fn new(lease: fullmag_runner::project_storage::ProjectStorageLease) -> Self {
+        Self { lease: Some(lease) }
+    }
+
+    fn resolved(&self) -> &fullmag_runner::project_storage::ResolvedOutputStorage {
+        self.lease
+            .as_ref()
+            .expect("script storage lease is active")
+            .resolved()
+    }
+
+    fn finish(&mut self, success: bool) -> Result<()> {
+        let Some(mut lease) = self.lease.take() else {
+            bail!("script storage lease is already finalized");
+        };
+        lease
+            .finish(success)
+            .map_err(|error| anyhow!("failed to finalize project output storage: {error}"))
+    }
+}
+
+fn collect_authored_output_storage(
+    config: &ScriptExecutionConfig,
+) -> Result<Option<OutputStorageIR>> {
+    let mut candidates = Vec::new();
+    for problem in std::iter::once(&config.ir).chain(config.stages.iter().map(|stage| &stage.ir)) {
+        if let Some(value) = problem.problem_meta.runtime_metadata.get("output_storage") {
+            candidates.push(
+                serde_json::from_value::<OutputStorageIR>(value.clone())
+                    .context("invalid output_storage metadata")?,
+            );
+        }
+    }
+    let Some(first) = candidates.first().cloned() else {
+        return Ok(None);
+    };
+    if candidates.iter().any(|candidate| candidate != &first) {
+        bail!("script stages declare conflicting output_storage policies");
+    }
+    Ok(Some(first))
+}
+
+fn explicit_stage_output_format(problem: &ProblemIR) -> Option<OutputDataFormatIR> {
+    match problem.study.sampling().stage_autosave.as_ref()?.format {
+        AutosaveFormatIR::Zarr => Some(OutputDataFormatIR::Zarr),
+        AutosaveFormatIR::Hdf5 => Some(OutputDataFormatIR::Hdf5),
+        AutosaveFormatIR::Txt => None,
+    }
+}
+
+fn prepare_script_output_storage(
+    config: &mut ScriptExecutionConfig,
+    args: &ScriptCli,
+    script_path: &Path,
+    run_id: &str,
+) -> Result<(ScriptOutputStorageLease, OutputStorageIR, serde_json::Value)> {
+    let authored = collect_authored_output_storage(config)?;
+    let mut settings = authored.clone().unwrap_or_default();
+    if authored.is_none() && args.data_format.is_none() {
+        let mut stage_formats = std::iter::once(&config.ir)
+            .chain(config.stages.iter().map(|stage| &stage.ir))
+            .filter_map(explicit_stage_output_format);
+        if let Some(format) = stage_formats.next() {
+            if stage_formats.any(|other| other != format) {
+                bail!("script stages declare conflicting primary autosave formats");
+            }
+            settings.data_format = format;
+        }
+    }
+
+    if let Some(output_dir) = args.output_dir.as_ref() {
+        let path = if output_dir.is_absolute() {
+            output_dir.clone()
+        } else {
+            std::env::current_dir()?.join(output_dir)
+        };
+        settings.output_dir = Some(path.to_string_lossy().into_owned());
+    }
+    if let Some(temp_dir) = args.temp_dir.as_ref() {
+        let path = if temp_dir.is_absolute() {
+            temp_dir.clone()
+        } else {
+            std::env::current_dir()?.join(temp_dir)
+        };
+        settings.temp_dir = Some(path.to_string_lossy().into_owned());
+    }
+    if let Some(data_format) = args.data_format {
+        settings.data_format = data_format.into();
+    }
+    if let Some(cleanup) = args.temp_cleanup {
+        settings.cleanup = cleanup.into();
+    }
+    if let Some(existing_output) = args.existing_output {
+        settings.existing_output = existing_output.into();
+    }
+    settings
+        .validate()
+        .map_err(|errors| anyhow!(errors.join("; ")))?;
+
+    let script_dir = script_path.parent().unwrap_or_else(|| Path::new("."));
+    let extension = match settings.data_format {
+        OutputDataFormatIR::Zarr => "zarr",
+        OutputDataFormatIR::Hdf5 => "results",
+    };
+    let default_output_dir = script_path.with_extension(extension);
+    let lease = fullmag_runner::project_storage::ProjectStorageLease::prepare(
+        &settings,
+        &default_output_dir,
+        script_dir,
+        run_id,
+    )
+    .map_err(|error| anyhow!("failed to prepare project output storage: {error}"))?;
+    let storage_lease = ScriptOutputStorageLease::new(lease);
+    let resolved = serde_json::to_value(storage_lease.resolved())?;
+    let settings_value = serde_json::to_value(&settings)?;
+    let source_dir = script_dir.canonicalize()?.to_string_lossy().into_owned();
+    let source_stem = script_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("fullmag_script")
+        .to_string();
+    let attach_storage_metadata = |problem: &mut ProblemIR| {
+        let metadata = &mut problem.problem_meta.runtime_metadata;
+        metadata.insert("output_storage".to_string(), settings_value.clone());
+        metadata.insert("resolved_output_storage".to_string(), resolved.clone());
+        metadata.insert(
+            "output_storage_source_dir".to_string(),
+            serde_json::Value::String(source_dir.clone()),
+        );
+        metadata.insert(
+            "output_storage_source_stem".to_string(),
+            serde_json::Value::String(source_stem.clone()),
+        );
+    };
+    attach_storage_metadata(&mut config.ir);
+    for stage in &mut config.stages {
+        attach_storage_metadata(&mut stage.ir);
+    }
+    Ok((storage_lease, settings, resolved))
+}
+
+fn prepare_grid_operation_storage(
+    workspace_dir: &Path,
+    command_id: &str,
+    script_path: &Path,
+) -> Result<(ScriptOutputStorageLease, OutputStorageIR, serde_json::Value)> {
+    let operation_id = format!("grid-{}", fullmag_session::hex_sha256(command_id.as_bytes()));
+    let operation_root = workspace_dir.join("grid-preparations").join(&operation_id);
+    let settings = OutputStorageIR {
+        output_dir: Some(operation_root.join("workspace").to_string_lossy().into_owned()),
+        temp_dir: Some(operation_root.join("temporary").to_string_lossy().into_owned()),
+        data_format: OutputDataFormatIR::Zarr,
+        cleanup: fullmag_ir::TempCleanupIR::Never,
+        existing_output: fullmag_ir::ExistingOutputIR::Error,
+    };
+    let source_dir = script_path.parent().context("grid source has no parent")?;
+    let lease = fullmag_runner::project_storage::ProjectStorageLease::prepare(
+        &settings, &operation_root.join("workspace"), source_dir, &operation_id,
+    ).map_err(|error| anyhow!("failed to prepare private grid operation storage: {error}"))?;
+    let lease = ScriptOutputStorageLease::new(lease);
+    let resolved = serde_json::to_value(lease.resolved())?;
+    Ok((lease, settings, resolved))
+}
+
 fn attached_session_id_or(generated: String) -> String {
     std::env::var("FULLMAG_ATTACHED_SESSION_ID")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or(generated)
+}
+
+fn attached_session_started_at_or(generated: u128) -> Result<u128> {
+    if std::env::var("FULLMAG_ATTACHED_SESSION_ID")
+        .ok().is_none_or(|value| value.trim().is_empty())
+    {
+        return Ok(generated);
+    }
+    let raw = std::env::var("FULLMAG_ATTACHED_SESSION_STARTED_AT_UNIX_MS")
+        .context("attached session requires its authoritative start timestamp")?;
+    let timestamp = raw.parse::<u128>().context("invalid attached session start timestamp")?;
+    anyhow::ensure!(timestamp > 0 && timestamp.to_string() == raw, "invalid attached session start timestamp");
+    Ok(timestamp)
 }
 
 fn control_room_bootstrap_disabled() -> bool {
@@ -59,9 +241,11 @@ fn control_room_bootstrap_disabled() -> bool {
 }
 
 fn attached_wait_for_solve_enabled() -> bool {
-    std::env::var("FULLMAG_ATTACHED_WAIT_FOR_SOLVE")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
+    // `--wait-for-solve` is the flag form of the same gate.
+    crate::script_launch::wait_for_solve_flag()
+        || std::env::var("FULLMAG_ATTACHED_WAIT_FOR_SOLVE")
+            .ok()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
 }
 
 fn frozen_spins_checkpoint_from_stage_artifacts(
@@ -4225,6 +4409,7 @@ fn scripted_stage_execution_state(
             mesh_revision: None,
             started_at_unix_ms: None,
             applied_step: None,
+            completed_step: None,
             applied_time_seconds: None,
             segment_id: None,
             completed_at_unix_ms: None,
@@ -4340,6 +4525,26 @@ fn attach_stage_fem_mesh_identity(
     ));
 }
 
+fn publish_scripted_stages_awaiting_command(execution: &mut CurrentLiveStageExecutionState) {
+    // Completed stages are history; the interactive owner still accepts commands.
+    *execution = stage_execution_from_records(&execution.stages, None, None, "awaiting_command");
+}
+
+fn attach_scripted_stage_solver_steps(
+    execution: &mut CurrentLiveStageExecutionState,
+    stage_index: usize,
+    boundary: Option<&CommandApplicationBoundary>,
+    completed_step: Option<u64>,
+) {
+    let Some(record) = execution.stages.get_mut(stage_index) else {
+        return;
+    };
+    record.applied_step = boundary.map(|boundary| boundary.applied_step);
+    record.applied_time_seconds = boundary.map(|boundary| boundary.applied_time_seconds);
+    record.segment_id = boundary.map(|boundary| boundary.segment_id.clone());
+    record.completed_step = completed_step;
+}
+
 fn preserve_terminal_stage_history(
     next: &mut CurrentLiveStageExecutionState,
     previous: Option<&CurrentLiveStageExecutionState>,
@@ -4420,6 +4625,7 @@ fn stage_record(index: usize, kind: Option<&str>) -> CurrentLiveStageExecutionRe
         mesh_revision: None,
         started_at_unix_ms: None,
         applied_step: None,
+        completed_step: None,
         applied_time_seconds: None,
         segment_id: None,
         completed_at_unix_ms: None,
@@ -4625,6 +4831,7 @@ impl ActiveSequenceState {
                 mesh_revision: previous.mesh_revision,
                 started_at_unix_ms: previous.started_at_unix_ms,
                 applied_step: previous.applied_step,
+                completed_step: previous.completed_step,
                 applied_time_seconds: previous.applied_time_seconds,
                 segment_id: previous.segment_id,
                 completed_at_unix_ms: completed_at_unix_ms
@@ -5573,6 +5780,8 @@ pub(crate) fn build_session_manifest(
     finished_at_unix_ms: u128,
     plan_summary: serde_json::Value,
 ) -> SessionManifest {
+    // A managed run's receipt reports the latest requested/resolved selection.
+    crate::script_launch::note_runtime(runtime);
     SessionManifest {
         session_id: session_id.to_string(),
         run_id: run_id.to_string(),
@@ -5816,10 +6025,7 @@ fn print_script_summary(summary: &ScriptRunSummary) {
         println!("- final_E_dmi: {:.6e} J", final_e_dmi);
     }
     if let Some(final_e_rotated_dmi) = summary.final_e_rotated_dmi {
-        println!(
-            "- final_E_rotated_dmi: {:.6e} J",
-            final_e_rotated_dmi
-        );
+        println!("- final_E_rotated_dmi: {:.6e} J", final_e_rotated_dmi);
     }
     if let Some(final_e_total) = summary.final_e_total {
         println!("- final_E_total: {:.6e} J", final_e_total);
@@ -6636,11 +6842,23 @@ fn resolve_rayon_cpu_threads(
 }
 
 pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
-    let args = ScriptCli::parse_from(raw_args);
+    let mut args = ScriptCli::parse_from(raw_args);
+    let ui_plan = crate::script_launch::ui_plan(&args);
+    if ui_plan == crate::script_launch::UiPlan::None {
+        // `--ui none` is the headless web side.
+        args.headless = true;
+    }
+    if let Some(port) = args.api_port {
+        // `--api-port` replaces the FULLMAG_API_PORT convention for this run.
+        std::env::set_var("FULLMAG_API_PORT", port.to_string());
+    }
     if args.headless {
         init_headless_api_port()?;
     } else {
         init_api_port()?;
+    }
+    if crate::script_launch::is_managed_run() && api_port() != 0 {
+        crate::script_launch::note_api_port(api_port());
     }
 
     // Eagerly configure the global Rayon pool used by Rust-side control-plane
@@ -6695,12 +6913,16 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     }
     crate::live_workspace::init_feature_flags(feature_flags);
 
-    let started_at_unix_ms = unix_time_millis()?;
+    let started_at_unix_ms = attached_session_started_at_or(unix_time_millis()?)?;
     let script_path = args
         .script
         .canonicalize()
         .with_context(|| format!("failed to resolve script path {}", args.script.display()))?;
-    check_script_syntax_via_python(&script_path)?;
+    if let Err(error) = check_script_syntax_via_python(&script_path) {
+        crate::script_launch::mark_failure(crate::script_launch::ExitKind::Syntax);
+        return Err(error);
+    }
+    crate::script_launch::note_stage(crate::script_launch::Stage::Materializing);
     eprintln!("fullmag syntax check passed");
     eprintln!("- script: {}", script_path.display());
     let requested_backend_name = args
@@ -6722,6 +6944,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         std::process::id()
     ));
     let run_id = format!("run-{}", session_id);
+    crate::script_launch::note_ids(&session_id, &run_id);
     let default_session_root = runtime_state_root(&repo_root())
         .join("local-live")
         .join("history");
@@ -6730,23 +6953,21 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     } else {
         args.session_root.as_path()
     };
-    let output_paths = resolve_script_output_paths(
-        &script_path,
-        args.output_dir.as_deref(),
-        session_root,
-        &session_id,
-    );
-    let workspace_dir = output_paths.workspace_dir.clone();
-    let artifact_dir = output_paths.artifact_dir.clone();
-
-    if output_paths.is_sibling_zarr_bundle {
-        replace_and_initialize_script_result_bundle(&output_paths, &script_path, &session_id)?;
-        eprintln!("- result_bundle: {}", workspace_dir.display());
-    } else {
-        fs::create_dir_all(&workspace_dir).with_context(|| {
-            format!("failed to create workspace dir {}", workspace_dir.display())
-        })?;
-    }
+    // Keep preparation state in its session directory until authored storage has
+    // been captured and the shared lease reserves the actual result directory.
+    let mut output_paths = ScriptOutputPaths {
+        workspace_dir: session_root.join(&session_id),
+        artifact_dir: session_root.join(&session_id).join("artifacts"),
+        is_sibling_zarr_bundle: false,
+    };
+    let mut workspace_dir = output_paths.workspace_dir.clone();
+    let mut artifact_dir = output_paths.artifact_dir.clone();
+    fs::create_dir_all(&artifact_dir).with_context(|| {
+        format!(
+            "failed to create session artifact directory {}",
+            artifact_dir.display()
+        )
+    })?;
     // When 3D preview is disabled, set field_every_n to infinity to skip expensive computations.
     // Keep FEM cadence aligned with interactive control-room expectations:
     // too-large step intervals make 3D magnetization look "stuck" even while
@@ -6763,7 +6984,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     let preview_every_n_override = preview_every_n_override_raw
         .as_ref()
         .map(|_| field_every_n as u32);
-    let current_live_publisher = CurrentLivePublisher::spawn(&session_id);
+    let grid_refresh_command_id = std::env::var("FULLMAG_ATTACHED_GRID_REFRESH_COMMAND_ID").ok();
+    let current_live_publisher = if grid_refresh_command_id.is_some() {
+        CurrentLivePublisher::unpublished_grid_refresh()
+    } else {
+        CurrentLivePublisher::spawn(&session_id)
+    };
     let bootstrapping_runtime = requested_runtime_selection(
         &requested_backend_name,
         false,
@@ -6820,8 +7046,11 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         },
         current_live_publisher.clone(),
     );
-    let display_selection_handle =
-        CurrentLiveDisplaySelectionHandle::spawn_for_session(Some(session_id.clone()));
+    let display_selection_handle = if let Some(command_id) = grid_refresh_command_id.as_ref() {
+        CurrentLiveDisplaySelectionHandle::spawn_for_grid_refresh(session_id.clone(), command_id.clone())
+    } else {
+        CurrentLiveDisplaySelectionHandle::spawn_for_session(Some(session_id.clone()))
+    };
     live_workspace.push_log(
         "system",
         format!(
@@ -6877,6 +7106,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         let phase1_backend = args.backend;
         let phase1_mode = args.mode;
         let phase1_precision = args.precision;
+        let phase1_execution_layers = crate::python_bridge::script_cli_execution_layers(&args)?;
         let phase1_runtime_device = crate::python_bridge::managed_execution_device(
             phase1_backend,
             std::env::var("FULLMAG_FEM_EXECUTION").ok().as_deref(),
@@ -6930,8 +7160,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     let stdout = String::from_utf8(output.stdout)
                         .context("phase-1 output not valid UTF-8")?;
                     let json_str = crate::python_bridge::extract_json_from_stdout(&stdout)?;
-                    serde_json::from_str(json_str)
-                        .context("failed to deserialize phase-1 script execution config")
+                    let mut config = serde_json::from_str(json_str)
+                        .context("failed to deserialize phase-1 script execution config")?;
+                    crate::python_bridge::bind_script_execution_profiles(
+                        &mut config,
+                        &phase1_execution_layers,
+                        phase1_runtime_device,
+                    )?;
+                    Ok(config)
                 })
                 .context("failed to spawn phase-1 materialization thread"),
         )?)
@@ -6944,16 +7180,22 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             &live_workspace,
             "control_room_bootstrap_failed",
             "Control Room bootstrap failed",
-            spawn_control_room(&session_id, args.dev, args.web_port, &live_workspace).with_context(
-                || {
-                    format!(
-                        "failed to bootstrap control room for workspace {}",
-                        session_id
-                    )
-                },
-            ),
+            spawn_control_room(
+                &session_id,
+                args.dev,
+                args.web_port,
+                &live_workspace,
+                ui_plan,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to bootstrap control room for workspace {}",
+                    session_id
+                )
+            }),
         )?;
         eprintln!("fullmag control room bootstrap verified");
+        crate::script_launch::note_ui_ready();
         live_workspace.push_log("system", "Control room bootstrap verified");
         _control_room_guard = ControlRoomGuard::active(web_port, child, frontend_child);
         let failed_workspace = live_workspace.clone();
@@ -6969,9 +7211,28 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     // The bridge ignores this script-backed session and only attaches a fresh
     // runtime after the browser explicitly replaces it with a runnable scene.
     let _scratch_runtime = if !args.headless {
-        std::env::current_exe().ok().map(|executable| {
-            crate::scratch_runtime::spawn(api_port(), executable, Some(session_id.clone()))
-        })
+        std::env::current_exe()
+            .ok()
+            .map(|executable| {
+                fullmag_runtime_control::application_attach::prepare_for_authoring(
+                    &crate::control_room::repo_root(),
+                    &crate::control_room::runtime_state_root(&crate::control_room::repo_root()),
+                    api_port(),
+                )
+                .map(|binding| {
+                    crate::scratch_runtime::spawn(
+                        api_port(),
+                        executable,
+                        Some(session_id.clone()),
+                        binding.api_instance_id().to_owned(),
+                    )
+                })
+                .map_err(|error| {
+                    eprintln!("[fullmag] scratch observer identity unavailable: {error:#}")
+                })
+                .ok()
+            })
+            .flatten()
     } else {
         None
     };
@@ -7109,7 +7370,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         )
     };
     let script_export = authoritative_preflight_error.map_or_else(export_full_script, Err);
-    let script_config = match script_export {
+    let mut script_config = match script_export {
         Ok(config) => config,
         Err(error) => {
             let error =
@@ -7169,6 +7430,54 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             return Err(error);
         }
     };
+    // Grid authoring must not reserve the user's next scientific output path
+    // or modify its existing-output policy in the canonical script/IR.
+    let (mut storage_lease, storage_settings, resolved_storage) =
+        if let Some(command_id) = grid_refresh_command_id.as_deref() {
+            prepare_grid_operation_storage(&workspace_dir, command_id, &script_path)?
+        } else {
+            prepare_script_output_storage(&mut script_config, &args, &script_path, &run_id)?
+        };
+    workspace_dir = storage_lease.resolved().output_dir.clone();
+    crate::script_launch::note_results_dir(&workspace_dir);
+    crate::script_launch::note_source_hash(script_config.ir.problem_meta.source_hash.as_deref());
+    artifact_dir = workspace_dir.join("artifacts");
+    output_paths = ScriptOutputPaths {
+        workspace_dir: workspace_dir.clone(),
+        artifact_dir: artifact_dir.clone(),
+        is_sibling_zarr_bundle: storage_settings.data_format == OutputDataFormatIR::Zarr,
+    };
+    fs::create_dir_all(&artifact_dir).with_context(|| {
+        format!(
+            "failed to create project artifact directory {}",
+            artifact_dir.display()
+        )
+    })?;
+    fs::create_dir_all(workspace_dir.join("stages")).with_context(|| {
+        format!(
+            "failed to create project stage directory {}",
+            workspace_dir.join("stages").display()
+        )
+    })?;
+    if output_paths.is_sibling_zarr_bundle {
+        initialize_zarr_group(
+            &artifact_dir,
+            serde_json::json!({"fullmag_role": "final_stage_artifacts"}),
+        )?;
+        initialize_zarr_group(
+            &workspace_dir.join("stages"),
+            serde_json::json!({"fullmag_role": "stage_artifacts"}),
+        )?;
+        eprintln!("- result_bundle: {}", workspace_dir.display());
+    }
+    live_workspace.update(|state| {
+        state.session.artifact_dir = artifact_dir.display().to_string();
+        state.run.artifact_dir = artifact_dir.display().to_string();
+        state.metadata = Some(serde_json::json!({
+            "output_storage": storage_settings,
+            "resolved_output_storage": resolved_storage,
+        }));
+    });
     let mut stages = run_active_preparation_operation(
         &live_workspace,
         "script_materialization_failed",
@@ -7349,7 +7658,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         script_requested_interactive,
         args.headless,
     );
-    let final_session_runtime = stages
+    let mut final_session_runtime = stages
         .last()
         .map(|stage| {
             session_runtime_selection_for_problem(
@@ -7855,6 +8164,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             .unwrap_or(false);
     let _is_fem_backend = matches!(&initial_execution_plan.backend_plan, BackendPlanIR::Fem(_));
     let wait_for_solve_supported = wait_for_solve_supported(&initial_execution_plan.backend_plan);
+    if let Some(command_id) = grid_refresh_command_id.as_deref() {
+        anyhow::ensure!(
+            !command_id.is_empty()
+                && wait_for_solve_should_block(wait_for_solve_requested, wait_for_solve_supported, args.headless)
+                && matches!(&initial_execution_plan.backend_plan, BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_)),
+            "grid-only attached runtime requires an interactive FDM wait-for-solve command pin"
+        );
+    }
 
     if wait_for_solve_should_block(
         wait_for_solve_requested,
@@ -7864,6 +8181,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         let wait_message = wait_for_solve_prompt(&initial_execution_plan.backend_plan);
         eprintln!("[fullmag] {}", wait_message.to_lowercase());
         live_workspace.push_log("system", wait_message);
+        crate::script_launch::note_stage(crate::script_launch::Stage::WaitingForSolve);
         // Switch to slow publish mode — solver loop will produce its own cadenced updates.
         live_workspace.set_publish_fast_mode(false);
         live_workspace.update(|state| {
@@ -8179,6 +8497,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         }
 
         loop {
+            if display_selection_handle.grid_refresh_command_refused() {
+                bail!("grid-only control receiver refused an unpinned command");
+            }
             if display_selection_handle.owner_session_lost() {
                 live_workspace.push_log(
                     "warning",
@@ -8336,6 +8657,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     continue;
                 }
                 WaitForSolveCommandAction::StartSolver => {
+                    anyhow::ensure!(grid_refresh_command_id.is_none(), "grid-only runtime cannot execute a solver command");
                     if matches!(cmd.kind.as_str(), "relax" | "run" | "solve") {
                         let frozen_binding_summary = cmd
                             .frozen_spins_runtime_plan_binding
@@ -8369,7 +8691,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                     continue;
                                 }
                             };
-                        let Some(mut command_stage) = (match build_interactive_command_stage(
+                        let Some(mut command_stage) = (match crate::step_utils::build_initial_interactive_command_stage(
+                            &stages[0],
                             &command_base_ir,
                             &cmd,
                         ) {
@@ -8441,7 +8764,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                             command_stage.entrypoint_kind = stages[0].entrypoint_kind.clone();
                             command_stage.ir.problem_meta.entrypoint_kind =
                                 stages[0].ir.problem_meta.entrypoint_kind.clone();
-                            command_stage.incoming_transition = stages[0].incoming_transition.clone();
+                            command_stage.incoming_transition =
+                                stages[0].incoming_transition.clone();
                         }
                         stages[0] = command_stage;
                         stage_execution_plans[0] = command_plan.clone();
@@ -8489,7 +8813,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     break;
                 }
                 WaitForSolveCommandAction::Remesh => {
-                    if let Some(summary) = execute_manual_interactive_remesh(
+                    if let Some(expected_id) = grid_refresh_command_id.as_deref() {
+                        anyhow::ensure!(
+                            cmd.kind == "fdm_grid_refresh" && cmd.command_id == expected_id,
+                            "grid-only runtime received a different command"
+                        );
+                    }
+                    let remesh_summary = execute_manual_interactive_remesh(
                         &cmd,
                         &mut stages,
                         &mut stage_execution_plans,
@@ -8505,13 +8835,22 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         &mut continuation_completion,
                         None,
                         args.backend.map(BackendTarget::from),
-                    ) {
+                    );
+                    let remesh_succeeded = remesh_summary.is_some();
+                    if let Some(summary) = remesh_summary {
                         current_plan_summary = summary;
                         continuation_relax_handoff = None;
+                    }
+                    if grid_refresh_command_id.is_some() {
+                        let payload = live_workspace.grid_refresh_snapshot()?;
+                        sync_current_live_snapshot(&session_id, &payload)?;
+                        storage_lease.finish(remesh_succeeded)?;
+                        return Ok(());
                     }
                 }
                 WaitForSolveCommandAction::Stop => {
                     eprintln!("[fullmag] aborted by user during wait_for_solve");
+                    crate::script_launch::mark_failure(crate::script_launch::ExitKind::Stopped);
                     live_workspace.push_log("system", "Aborted by user");
                     live_workspace.update(|state| {
                         state.session.status = "stopped".to_string();
@@ -8542,6 +8881,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         );
     }
 
+    crate::script_launch::note_stage(crate::script_launch::Stage::Running);
     for (stage_index, (mut stage, materialized_execution_plan)) in stages
         .into_iter()
         .zip(stage_execution_plans.into_iter())
@@ -8719,6 +9059,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 stage.entrypoint_kind
             ),
         );
+        let stage_application_boundary = start_solver_command_id.as_deref().map(|command_id| {
+            CommandApplicationBoundary::new(
+                &run_id,
+                command_id,
+                stage_initial_update.stats.step,
+                stage_initial_update.stats.time,
+            )
+        });
         live_workspace.update(|state| {
             let stage_runtime = session_runtime_selection_for_problem(
                 &stage.ir,
@@ -8768,6 +9116,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 Some(current_stage_artifact_dir.display().to_string()),
                 None,
                 stage.incoming_transition.as_ref(),
+            );
+            attach_scripted_stage_solver_steps(
+                &mut next_stage_execution,
+                stage_index,
+                stage_application_boundary.as_ref(),
+                None,
             );
             preserve_terminal_stage_history(
                 &mut next_stage_execution,
@@ -8903,6 +9257,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     stage_index,
                     stage_fem_mesh_asset.as_ref(),
                 );
+                if interactive_requested && is_session_final_stage {
+                    publish_scripted_stages_awaiting_command(&mut next_stage_execution);
+                }
                 state.stage_execution = Some(next_stage_execution);
             });
 
@@ -9345,6 +9702,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         }
 
         let offset_steps = offset_step_stats(&stage_result.steps, step_offset, time_offset);
+        let completed_step = offset_steps.last().map(|last| last.step);
         if let Some(last) = offset_steps.last() {
             step_offset = last.step;
             time_offset = last.time;
@@ -9560,12 +9918,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         {
             let final_step = stage_result.steps.last();
             eprintln!(
-                "[fullmag] stage {}/{} ({}) {} — steps={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
+                "[fullmag] stage {}/{} ({}) {} — samples={}  final_step={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
                 stage_index + 1,
                 stage_count,
                 stage.entrypoint_kind,
                 stage_status,
                 stage_result.steps.len(),
+                final_step.map(|s| s.step).unwrap_or(0),
                 final_step.map(|s| s.time).unwrap_or(0.0),
                 final_step.map(|s| s.max_torque_T).unwrap_or(0.0),
                 format_stop_reason(stage_result.completion.as_ref()),
@@ -9596,6 +9955,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 stage_result.completion.as_ref(),
                 stage.incoming_transition.as_ref(),
             );
+            attach_scripted_stage_solver_steps(
+                &mut next_stage_execution,
+                stage_index,
+                stage_application_boundary.as_ref(),
+                completed_step,
+            );
             preserve_terminal_stage_history(
                 &mut next_stage_execution,
                 previous_stage_execution.as_ref(),
@@ -9605,6 +9970,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 stage_index,
                 stage_fem_mesh_asset.as_ref(),
             );
+            if interactive_requested && is_session_final_stage && !stage_failed {
+                publish_scripted_stages_awaiting_command(&mut next_stage_execution);
+            }
             state.stage_execution = Some(next_stage_execution);
             if stage_failed {
                 state.session.status = "failed".to_string();
@@ -9637,15 +10005,15 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         );
 
         // Build session context for interactive command loop
-        let ctx = crate::runtime_supervisor::InteractiveSessionContext {
+        let mut ctx = crate::runtime_supervisor::InteractiveSessionContext {
             session_id: session_id.clone(),
             run_id: run_id.clone(),
             interactive_requested,
             script_path: script_path.clone(),
             final_problem_name: final_problem_name.clone(),
-            requested_backend: final_requested_backend,
-            execution_mode: final_execution_mode,
-            precision: final_precision,
+            runtime_selection: crate::runtime_supervisor::runtime_selection_from_manifest(
+                &live_workspace.snapshot().session,
+            ),
             artifact_dir: artifact_dir.clone(),
             workspace_dir: workspace_dir.clone(),
             started_at_unix_ms,
@@ -9654,6 +10022,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
 
         if paused_stage.is_none() {
             live_workspace.update(|state| {
+                if let Some(execution) = state.stage_execution.as_mut() {
+                    publish_scripted_stages_awaiting_command(execution);
+                }
                 state.session = ctx.build_session(
                     "awaiting_command",
                     &plan_summary_json(&current_plan_summary),
@@ -10346,6 +10717,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 .map_err(join_errors)?;
             let execution_plan =
                 fullmag_plan::plan(&stage.ir).map_err(|error| anyhow!(error.to_string()))?;
+            ctx.runtime_selection = session_runtime_selection_for_problem(
+                &stage.ir,
+                Some(&execution_plan),
+                field_every_n,
+                backend_target_name(stage.ir.backend_policy.requested_backend),
+                execution_mode_name(stage.ir.validation_profile.execution_mode),
+                execution_precision_name(stage.ir.backend_policy.execution_precision),
+            );
             emit_initial_state_warnings(Some(&live_workspace), &stage.ir, &execution_plan)?;
             let use_live_callback = matches!(
                 &execution_plan.backend_plan,
@@ -11178,6 +11557,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             }
 
             let offset_steps = offset_step_stats(&stage_result.steps, step_offset, time_offset);
+            let completed_step = offset_steps.last().map(|last| last.step);
             if let Some(last) = offset_steps.last() {
                 step_offset = last.step;
                 time_offset = last.time;
@@ -11205,9 +11585,10 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 {
                     let final_step = stage_result.steps.last();
                     eprintln!(
-                        "[fullmag] {} — steps={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
+                        "[fullmag] {} — samples={}  final_step={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
                         stage_message,
                         stage_result.steps.len(),
+                        final_step.map(|s| s.step).unwrap_or(0),
                         final_step.map(|s| s.time).unwrap_or(0.0),
                         final_step.map(|s| s.max_torque_T).unwrap_or(0.0),
                         format_stop_reason(stage_result.completion.as_ref()),
@@ -11218,6 +11599,10 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
 
             // ── Sequence continuation: if there are more stages, advance ──
             if let Some(sequence) = active_sequence.as_mut() {
+                let current_stage_index = sequence.current_stage_index();
+                if let Some(record) = sequence.stages.get_mut(current_stage_index) {
+                    record.completed_step = completed_step;
+                }
                 sequence.mark_current(
                     "completed",
                     stage_result.completion.as_ref(),
@@ -11283,6 +11668,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 .enter_awaiting_command(continuation_magnetization.clone(), &live_workspace);
             paused_stage = None;
         }
+        final_session_runtime = ctx.runtime_selection.clone();
         interactive_runtime_host.mark_closed(&live_workspace);
         if display_selection_handle.owner_session_lost() {
             return Ok(());
@@ -11423,6 +11809,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     };
 
     live_workspace.update(|state| {
+        if let Some(execution) = state.stage_execution.as_mut() {
+            *execution = stage_execution_from_records(
+                &execution.stages,
+                None,
+                None,
+                &summary.status,
+            );
+        }
         state.session = build_session_manifest(
             &session_id,
             &run_id,
@@ -11490,6 +11884,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     } else {
         print_script_summary(&summary);
     }
+    storage_lease.finish(true)?;
 
     Ok(())
 }
@@ -11608,27 +12003,17 @@ pub(crate) fn prepare_live_workspace_for_ui(
 #[cfg(test)]
 mod tests {
     use super::{
-        accepted_relax_handoff_for_eigen_stage,
-        accepted_relax_handoff_from_completed_stage,
-        adaptive_remesh_backend_legality_reason,
-        adaptive_remesh_legality_reason,
-        apply_current_fem_overrides,
-        apply_initial_magnetization_state_override,
-        apply_live_step_update_to_workspace_state,
-        apply_remeshed_problem_snapshot_to_stages,
-        apply_scene_discretization_patch,
-        apply_stage_heartbeat_progress,
+        accepted_relax_handoff_for_eigen_stage, accepted_relax_handoff_from_completed_stage,
+        adaptive_remesh_backend_legality_reason, adaptive_remesh_legality_reason,
+        apply_current_fem_overrides, apply_initial_magnetization_state_override,
+        apply_live_step_update_to_workspace_state, apply_remeshed_problem_snapshot_to_stages,
+        apply_scene_discretization_patch, apply_stage_heartbeat_progress,
         apply_terminal_live_step_update_to_workspace_state,
-        attach_initial_magnetization_state_override_metadata,
-        attach_region_realization_revisions,
-        attach_stage_fem_mesh_identity,
+        attach_initial_magnetization_state_override_metadata, attach_region_realization_revisions,
+        attach_stage_fem_mesh_identity, attach_scripted_stage_solver_steps,
         classify_wait_for_solve_command,
-        continuation_source_from_backend_plan,
-        CommandApplicationBoundary,
-        cumulative_rhs_evals,
-        current_fdm_mesh_workspace,
-        default_domain_region_markers,
-        deferred_mesh_failure_stage,
+        continuation_source_from_backend_plan, cumulative_rhs_evals, current_fdm_mesh_workspace,
+        default_domain_region_markers, deferred_mesh_failure_stage,
         discard_active_paused_stage_execution,
         ensure_frequency_response_relaxed_continuation_is_qualified, execute_synthetic_stage,
         fail_owned_preparation_stage, fem_gpu_memory_preflight_message,
@@ -11641,6 +12026,7 @@ mod tests {
         mesh_source_scene_revision, offset_step_update, own_preparation_boundary_failure,
         plan_materialized_stage_snapshot, prepare_remesh_stage_transaction,
         preserve_terminal_stage_history, project_script_export_failure,
+        publish_scripted_stages_awaiting_command,
         replace_continuation_after_synthetic_stage, requested_execution_device_for_overrides,
         resolve_adaptive_convergence_metric, resolve_preview_field_every_n,
         resolve_rayon_cpu_threads, resolved_shared_domain_object_region_markers,
@@ -11652,10 +12038,11 @@ mod tests {
         step_update_has_frequency_response_progress, user_cancelled_stage_completion,
         validate_periodic_remesh_candidate, wait_for_failed_preparation_close,
         wait_for_solve_prompt, wait_for_solve_should_block, wait_for_solve_supported,
-        write_sampling_resolution_stage_record, ActiveSequenceState, ContinuationStageSource,
-        LiveProgressCadence, LoadedInitialMagnetizationState, RuntimeCommandPrecondition,
-        SceneProblemPatch, StageProgressHeartbeat, WaitForSolveCommandAction,
-        FEM_FREQUENCY_RESPONSE_PROGRESS_KEY, LIVE_PROGRESS_PUBLISH_INTERVAL,
+        write_sampling_resolution_stage_record, ActiveSequenceState, CommandApplicationBoundary,
+        ContinuationStageSource, LiveProgressCadence, LoadedInitialMagnetizationState,
+        RuntimeCommandPrecondition, SceneProblemPatch, StageProgressHeartbeat,
+        WaitForSolveCommandAction, FEM_FREQUENCY_RESPONSE_PROGRESS_KEY,
+        LIVE_PROGRESS_PUBLISH_INTERVAL,
     };
     use crate::live_workspace::{CurrentLivePublisher, LocalLiveWorkspace};
     use crate::simulation_preparation::{
@@ -11757,7 +12144,10 @@ mod tests {
         let certified_block = production
             .split("let next_continuation_certified_fields =")
             .nth(1)
-            .and_then(|tail| tail.split("let next_continuation_recomputed_certificate =").next())
+            .and_then(|tail| {
+                tail.split("let next_continuation_recomputed_certificate =")
+                    .next()
+            })
             .expect("certified FEM equilibrium field handoff block");
         let recomputed_block = production
             .split("let next_continuation_recomputed_certificate =")
@@ -12143,8 +12533,8 @@ mod tests {
         assert_eq!(stages[0].ir, stages_before[0].ir);
         assert_eq!(plans, plans_before);
 
-        let initial_plan = fullmag_plan::plan(&stages[0].ir)
-            .expect("bootstrap problem should plan");
+        let initial_plan =
+            fullmag_plan::plan(&stages[0].ir).expect("bootstrap problem should plan");
         let prepared = prepare_remesh_stage_transaction(
             &stages,
             &[initial_plan],
@@ -15512,6 +15902,42 @@ mod tests {
     }
 
     #[test]
+    fn completed_scripted_stages_keep_interactive_owner_awaiting_commands() {
+        let mut execution = scripted_stage_execution_state(
+            1,
+            0,
+            "flat_run",
+            "completed",
+            Some("cmd-solve"),
+            Some(1_700_000_000_000),
+            Some(1_700_000_001_000),
+            Some("artifacts/stage-000".to_string()),
+            Some(fullmag_ir::StageStopReason::MaxPhysicalTime),
+            None,
+        );
+        let boundary = CommandApplicationBoundary::new("run-1", "cmd-solve", 0, 0.0);
+        attach_scripted_stage_solver_steps(&mut execution, 0, Some(&boundary), Some(10));
+        assert_eq!(execution.stages[0].applied_step, Some(0));
+        assert_eq!(execution.stages[0].completed_step, Some(10));
+        assert_eq!(execution.stages[0].segment_id, Some(boundary.segment_id));
+        let terminal_history = serde_json::to_value(&execution.stages).unwrap();
+
+        publish_scripted_stages_awaiting_command(&mut execution);
+
+        assert_eq!(execution.runtime_state, "awaiting_command");
+        assert_eq!(execution.active_stage_index, None);
+        assert_eq!(execution.active_stage_kind, None);
+        assert_eq!(execution.completed_stage_indexes, vec![0]);
+        assert_eq!(execution.stage_statuses, vec!["completed"]);
+        assert_eq!(serde_json::to_value(&execution.stages).unwrap(), terminal_history);
+
+        // A later explicit close must publish terminal ownership, not idle ownership.
+        execution = super::stage_execution_from_records(&execution.stages, None, None, "completed");
+        assert_eq!(execution.runtime_state, "completed");
+        assert_eq!(serde_json::to_value(&execution.stages).unwrap(), terminal_history);
+    }
+
+    #[test]
     fn scripted_stage_execution_does_not_mark_pipeline_completed_between_stages() {
         let execution = scripted_stage_execution_state(
             2,
@@ -15706,7 +16132,7 @@ mod tests {
             .find("problem_with_frozen_spins_runtime_plan_binding(")
             .expect("initial solver command must consume the Frozen Spins binding");
         let stage_index = branch
-            .find("build_interactive_command_stage(")
+            .find("build_initial_interactive_command_stage(")
             .expect("initial solver command must build a stage");
 
         assert!(
@@ -16374,6 +16800,10 @@ mod tests {
             mode: None,
             precision: None,
             output_dir: None,
+            temp_dir: None,
+            data_format: None,
+            temp_cleanup: None,
+            existing_output: None,
             initial_magnetization_state: Some(state_path.clone()),
             initial_magnetization_state_format: Some("json".to_string()),
             initial_magnetization_state_dataset: None,
@@ -16383,6 +16813,13 @@ mod tests {
             dev: false,
             json: true,
             web_port: None,
+            ui: None,
+            api_port: None,
+            wait_for_solve: false,
+            expect_script_sha256: None,
+            receipt: None,
+            launched_by: None,
+            python: None,
         };
 
         let loaded =

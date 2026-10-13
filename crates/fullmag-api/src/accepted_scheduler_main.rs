@@ -1,5 +1,15 @@
+mod scheduler_owner_control;
+mod worker_startup_gate;
+
 #[path = "accepted_study_supervisor.rs"]
 mod accepted_study_supervisor;
+#[path = "run_intent_persistence.rs"]
+mod run_intent_persistence;
+#[path = "schemas/output_storage.rs"]
+mod output_storage_schema;
+mod schemas {
+    pub(crate) use crate::output_storage_schema as output_storage;
+}
 
 use anyhow::{bail, Context, Result};
 use fullmag_application::{ResourceBudget, ResourceKind, ResourceLease, RunId, RunSpecification};
@@ -9,7 +19,7 @@ use fullmag_session::{
     FMS_SCHEDULER_POOL_CHECKPOINT_SCHEMA,
 };
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -30,6 +40,10 @@ struct SchedulerArgs {
     run_ids: Vec<String>,
     discover_runs: bool,
     resident: bool,
+    owner_control: bool,
+    startup_gate: bool,
+    host_service_config: Option<PathBuf>,
+    host_config_sha256: Option<String>,
     pool_id: Option<String>,
     discover_resources: bool,
     resources: Vec<SchedulerResourceOffer>,
@@ -170,29 +184,71 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = parse_args()?;
+    worker_startup_gate::verify_runtime_owner_build()?;
+    let host_admission = load_host_admission(&args)?;
+    if args.startup_gate {
+        scheduler_owner_control::announce("boot", "compute", None, None)?;
+        worker_startup_gate::wait_for_release(std::io::stdin().lock())
+            .context("wait for runtime service admission release")?;
+    }
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     if !args.resident {
-        return run_scheduler(args, shutdown_requested);
+        return run_scheduler(args, shutdown_requested, host_admission);
     }
+    let owner_control = args.owner_control;
+    let owner_observed = Arc::new(AtomicBool::new(false));
+    let mut owner_receiver = if owner_control {
+        Some(
+            scheduler_owner_control::monitor(
+                std::io::stdin(),
+                Arc::clone(&shutdown_requested),
+                Arc::clone(&owner_observed),
+            )
+            .context("start scheduler owner-control monitor")?,
+        )
+    } else {
+        None
+    };
+    let listen_signals = !owner_control || !cfg!(windows);
     let scheduler_shutdown = Arc::clone(&shutdown_requested);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
         .context("build resident scheduler signal runtime")?;
-    runtime.block_on(async move {
-        let mut scheduler =
-            tokio::task::spawn_blocking(move || run_scheduler(args, scheduler_shutdown));
+    let result = runtime.block_on(async move {
+        let mut scheduler = tokio::task::spawn_blocking(move || {
+            run_scheduler(args, scheduler_shutdown, host_admission)
+        });
         tokio::select! {
             result = &mut scheduler => {
+                // The monitor closes admission before sending its result. Preserve
+                // protocol errors even if the scheduler drains before notification.
+                if owner_observed.load(Ordering::Acquire) {
+                    scheduler_owner_control::wait(&mut owner_receiver).await?;
+                }
                 result.context("join resident scheduler loop")?
             }
-            signal = wait_for_shutdown_signal() => {
+            signal = wait_for_shutdown_signal(), if listen_signals => {
                 shutdown_requested.store(true, Ordering::Release);
+                let drained = scheduler.await.context("join draining resident scheduler loop")?;
+                if owner_observed.load(Ordering::Acquire) {
+                    scheduler_owner_control::wait(&mut owner_receiver).await?;
+                }
                 signal?;
-                scheduler.await.context("join draining resident scheduler loop")?
+                drained
+            }
+            owner = scheduler_owner_control::wait(&mut owner_receiver) => {
+                shutdown_requested.store(true, Ordering::Release);
+                let drained = scheduler.await.context("join owner-draining resident scheduler loop")?;
+                owner?;
+                drained
             }
         }
-    })
+    });
+    if owner_control && result.is_ok() {
+        scheduler_owner_control::announce("drained", "compute", None, None)?;
+    }
+    result
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {
@@ -236,7 +292,39 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     Ok(())
 }
 
-fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Result<()> {
+fn load_host_admission(
+    args: &SchedulerArgs,
+) -> Result<Option<fullmag_runtime_control::host_runtime::HostRuntimeAdmission>> {
+    match (
+        args.host_service_config.as_deref(),
+        args.host_config_sha256.as_deref(),
+    ) {
+        (Some(configuration_path), Some(configuration_sha256)) => {
+            let pool_id = args
+                .pool_id
+                .as_deref()
+                .context("host-bound scheduler requires its pinned compute pool id")?;
+            Ok(Some(
+                fullmag_runtime_control::host_runtime::HostRuntimeAdmission::for_scheduler(
+                    configuration_path,
+                    configuration_sha256,
+                    &args.store_root,
+                    pool_id,
+                    "compute",
+                    args.max_concurrency,
+                )?,
+            ))
+        }
+        (None, None) => Ok(None),
+        _ => bail!("host service configuration and digest must be supplied together"),
+    }
+}
+
+fn run_scheduler(
+    args: SchedulerArgs,
+    shutdown_requested: Arc<AtomicBool>,
+    host_admission: Option<fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
+) -> Result<()> {
     let store =
         retry_store_writer_busy(|| fullmag_session::SessionStore::open_existing(&args.store_root))
             .with_context(|| format!("open session store `{}`", args.store_root.display()))?;
@@ -311,12 +399,24 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
         if draining && active_workers.is_empty() {
             break;
         }
+        if let Some(host_admission) = host_admission.as_ref() {
+            retry_store_writer_busy(|| {
+                host_admission.reconcile_tentative_store_admissions(&store)
+            })?;
+            retry_store_writer_busy(|| {
+                host_admission.reconcile_released_store_reservations(&store)
+            })?;
+            retry_store_writer_busy(|| host_admission.reconcile_task_cancellations(&store))?;
+        }
         if args.discover_resources {
             let pool_id = args
                 .pool_id
                 .as_deref()
                 .context("dynamic resource discovery requires a scheduler pool id")?;
             if let Some(discovered) = store.read_scheduler_resource_pool(pool_id)? {
+                if let Some(host_admission) = host_admission.as_ref() {
+                    host_admission.validate_compute_pool(&discovered)?;
+                }
                 if let Some(previous) = &resource_pool {
                     if discovered.generation < previous.generation {
                         bail!("scheduler resource pool generation regressed");
@@ -343,6 +443,14 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
                         }
                         observed_resource_ids.insert(resource.resource_id.clone());
                     }
+                    if args.owner_control && resource_pool.is_none() {
+                        scheduler_owner_control::announce(
+                            "ready",
+                            "compute",
+                            Some(pool_id),
+                            Some(discovered.generation),
+                        )?;
+                    }
                     current_resources = resources;
                     resource_pool = Some(discovered);
                 }
@@ -351,6 +459,11 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
             }
         }
         let checkpoint_run_ids = if args.discover_runs {
+            run_intent_persistence::expand_pending_batch_children(
+                &store,
+                32,
+                run_intent_persistence::configured_submit_backlog_limit()?,
+            )?;
             let mut discovered = store
                 .list_run_intents()?
                 .into_iter()
@@ -400,6 +513,32 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
             {
                 continue;
             }
+            if let Some(host) = host_admission.as_ref() {
+                let mut resumed = None;
+                for run_id in &checkpoint_run_ids {
+                    if let Some(scheduled) =
+                        fullmag_runtime_control::resume_next_admitted_accepted_task_with_host(
+                            &store,
+                            run_id,
+                            &resource.resource_id,
+                            host,
+                        )?
+                    {
+                        resumed = Some((run_id.clone(), scheduled));
+                        break;
+                    }
+                }
+                if let Some((run_id, scheduled)) = resumed {
+                    scheduled_any = true;
+                    consecutive_idle_polls = 0;
+                    pending_workers.push(PendingWorker {
+                        resource: resource.clone(),
+                        run_id,
+                        scheduled,
+                    });
+                    continue;
+                }
+            }
             let mut selected = None;
             for (run_index, candidate) in queue.ordered.iter().enumerate() {
                 let offer = ResourceLease::new(
@@ -408,11 +547,21 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
                     resource.budget.clone(),
                 )
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                if let Some(scheduled) = fullmag_runtime_control::schedule_next_ready_accepted_task(
-                    &store,
-                    &candidate.run_id,
-                    offer,
-                )? {
+                let scheduled = if let Some(host_admission) = host_admission.as_ref() {
+                    fullmag_runtime_control::schedule_next_ready_accepted_task_with_host(
+                        &store,
+                        &candidate.run_id,
+                        offer,
+                        host_admission,
+                    )?
+                } else {
+                    fullmag_runtime_control::schedule_next_ready_accepted_task(
+                        &store,
+                        &candidate.run_id,
+                        offer,
+                    )?
+                };
+                if let Some(scheduled) = scheduled {
                     selected = Some((run_index, scheduled));
                     break;
                 }
@@ -443,6 +592,7 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
                 args.worker_timeout,
                 args.heartbeat_interval,
                 args.max_automatic_retries,
+                host_admission.clone(),
             );
             active_workers.insert(
                 resource_id,
@@ -640,12 +790,13 @@ fn spawn_supervised_worker(
     worker_timeout: Duration,
     heartbeat_interval: Duration,
     max_automatic_retries: usize,
+    host_admission: Option<fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
 ) -> JoinHandle<Result<CompletedWorker>> {
     std::thread::spawn(move || {
         let store =
             retry_store_writer_busy(|| fullmag_session::SessionStore::open_existing(&store_root))
                 .with_context(|| format!("open session store `{}`", store_root.display()))?;
-        let result = accepted_study_supervisor::run_supervised_accepted_worker(
+        let result = accepted_study_supervisor::run_supervised_accepted_worker_with_host(
             &store,
             run_id.as_str(),
             scheduled.claim.task_id.as_str(),
@@ -654,6 +805,7 @@ fn spawn_supervised_worker(
             worker_timeout,
             heartbeat_interval,
             max_automatic_retries,
+            host_admission.as_ref(),
         )?;
         Ok(CompletedWorker {
             resource_id,
@@ -710,6 +862,19 @@ fn parse_args() -> Result<SchedulerArgs> {
             }
         }
     }
+    let host_service_config = values.remove("--host-service-config").map(PathBuf::from);
+    let host_config_sha256 = values
+        .remove("--host-config-sha256")
+        .map(|value| {
+            value.into_string().map_err(|_| {
+                anyhow::anyhow!("scheduler option `--host-config-sha256` must be valid UTF-8")
+            })
+        })
+        .transpose()?;
+    validate_host_service_binding_pair(
+        host_service_config.as_deref(),
+        host_config_sha256.as_deref(),
+    )?;
     let discover_runs = values
         .remove("--discover-runs")
         .map(|value| parse_bool("--discover-runs", value))
@@ -723,6 +888,11 @@ fn parse_args() -> Result<SchedulerArgs> {
         .map(|value| parse_bool("--resident", value))
         .transpose()?
         .unwrap_or(false);
+    let owner_control = scheduler_owner_control::parse(values.remove("--owner-control"), resident)?;
+    let startup_gate = scheduler_owner_control::parse(values.remove("--startup-gate"), resident)?;
+    if startup_gate && !owner_control {
+        bail!("scheduler startup gate requires --owner-control stdin-v1");
+    }
     let pool_id = values
         .remove("--pool-id")
         .map(|value| {
@@ -744,6 +914,9 @@ fn parse_args() -> Result<SchedulerArgs> {
     }
     if discover_resources && pool_id.is_none() {
         bail!("dynamic resource discovery requires --pool-id");
+    }
+    if host_service_config.is_some() && !discover_resources {
+        bail!("host-bound scheduler requires --discover-resources true");
     }
     let store_root = PathBuf::from(take_required_string(&mut values, "--store-root")?);
     let legacy_resource_flags = [
@@ -880,6 +1053,10 @@ fn parse_args() -> Result<SchedulerArgs> {
         run_ids,
         discover_runs,
         resident,
+        owner_control,
+        startup_gate,
+        host_service_config,
+        host_config_sha256,
         pool_id,
         discover_resources,
         resources,
@@ -893,6 +1070,34 @@ fn parse_args() -> Result<SchedulerArgs> {
         heartbeat_interval: Duration::from_millis(heartbeat_interval_milliseconds),
         max_automatic_retries,
     })
+}
+
+fn validate_host_service_binding_pair(
+    configuration_path: Option<&Path>,
+    configuration_sha256: Option<&str>,
+) -> Result<()> {
+    match (configuration_path, configuration_sha256) {
+        (None, None) => Ok(()),
+        (Some(path), Some(digest)) => {
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+            {
+                bail!("host service configuration path must be absolute without parent traversal");
+            }
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                bail!("host configuration digest must be 64 lowercase hexadecimal characters");
+            }
+            Ok(())
+        }
+        (None, Some(_)) => bail!("--host-config-sha256 requires --host-service-config"),
+        (Some(_), None) => bail!("--host-service-config requires --host-config-sha256"),
+    }
 }
 
 fn take_required_string(
@@ -941,4 +1146,35 @@ fn parse_usize(flag: &str, value: std::ffi::OsString) -> Result<usize> {
         .map_err(|_| anyhow::anyhow!("scheduler option `{flag}` must be valid UTF-8"))?
         .parse::<usize>()
         .with_context(|| format!("scheduler option `{flag}` must be a non-negative integer"))
+}
+
+#[cfg(test)]
+mod host_service_binding_tests {
+    use super::*;
+
+    #[test]
+    fn host_service_flags_are_optional_only_as_a_pair_with_an_absolute_digest_bound_path() {
+        let digest = "a".repeat(64);
+        let absolute = std::env::current_dir().unwrap().join("service.json");
+        assert!(validate_host_service_binding_pair(None, None).is_ok());
+        assert!(validate_host_service_binding_pair(Some(&absolute), Some(&digest)).is_ok());
+        assert!(validate_host_service_binding_pair(None, Some(&digest)).is_err());
+        assert!(validate_host_service_binding_pair(Some(&absolute), None).is_err());
+        assert!(validate_host_service_binding_pair(
+            Some(Path::new("relative/service.json")),
+            Some(&digest),
+        )
+        .is_err());
+        let parent_traversal = std::env::current_dir()
+            .unwrap()
+            .join("..")
+            .join("service.json");
+        assert!(
+            validate_host_service_binding_pair(Some(&parent_traversal), Some(&digest),).is_err()
+        );
+        assert!(
+            validate_host_service_binding_pair(Some(&absolute), Some(&digest.to_uppercase()))
+                .is_err()
+        );
+    }
 }

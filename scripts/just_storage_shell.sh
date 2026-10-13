@@ -42,6 +42,191 @@ is_windows_shell() {
   return 1
 }
 
+# Admit this fixed helper before generic diagnostic substring handling, so a
+# composite command cannot use a diagnostic marker to bypass its argument check.
+case "${recipe}" in
+  *"scripts/windows/recover_runtime.py"*)
+    runtime_recovery_pattern='^[^[:space:]]+ "[^"]+/scripts/windows/recover_runtime.py" --repo-root "[^"]+" --web-port "([1-9][0-9]{0,4})"$'
+    if [[ ! "${recipe}" =~ ${runtime_recovery_pattern} ]]; then
+      echo "[fullmag just] invalid native runtime recovery recipe" >&2
+      exit 2
+    fi
+    web_port="${BASH_REMATCH[1]}"
+    if ! is_windows_shell || (( web_port > 65535 )); then
+      echo "[fullmag just] native runtime recovery requires Windows and a port from 1 to 65535" >&2
+      exit 2
+    fi
+    # This fixed helper owns resolver validation, both managed locks, process
+    # inspection and the exact-status archive/receipt transition.
+    exec "${python_cmd}" "${script_dir}/windows/recover_runtime.py" --repo-root "${repo_root}" --web-port "${web_port}"
+    ;;
+  *"scripts/windows/run_fullmag.ps1"*" -RunMode workspace "*)
+    windows_ui_pattern='^powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "[^"]+/scripts/windows/run_fullmag.ps1" -BuildMode "(auto|true|false)" -Frontend "(static|dev)" -BackendProfile "(auto|dev|release)" -RunMode workspace -WebPort "([1-9][0-9]{0,4})"( -BuildOnly)?$'
+    if [[ ! "${recipe}" =~ ${windows_ui_pattern} ]]; then
+      echo "[fullmag just] invalid native Windows workspace recipe" >&2
+      exit 2
+    fi
+    build_mode="${BASH_REMATCH[1]}"; frontend="${BASH_REMATCH[2]}"; backend_profile="${BASH_REMATCH[3]}"; web_port="${BASH_REMATCH[4]}"; build_only="${BASH_REMATCH[5]}"
+    if ! is_windows_shell || (( web_port > 65535 )); then
+      echo "[fullmag just] native Windows workspace requires Windows and a port from 1 to 65535" >&2
+      exit 2
+    fi
+    if [[ -n "${build_only}" && ( "${build_mode}" == "false" || "${backend_profile}" == "auto" ) ]]; then
+      echo "[fullmag just] build-only requires build=auto|true and backend_profile=dev|release" >&2
+      exit 2
+    fi
+    # The native launcher owns storage preflight, locking and terminal receipts.
+    # Dispatch only this checkout's launcher; never evaluate the recipe text.
+    launcher_arguments=(-NoLogo -NoProfile -ExecutionPolicy Bypass -File "${repo_root}/scripts/windows/run_fullmag.ps1" -BuildMode "${build_mode}" -Frontend "${frontend}" -BackendProfile "${backend_profile}" -RunMode workspace -WebPort "${web_port}")
+    if [[ -n "${build_only}" ]]; then launcher_arguments+=(-BuildOnly); fi
+    exec powershell.exe "${launcher_arguments[@]}"
+    ;;
+  *"scripts/windows/watch_backend.py"*)
+    backend_watch_pattern='^python "[^"]+/scripts/windows/watch_backend.py" --repo-root "[^"]+" --web-port "([1-9][0-9]{0,4})"$'
+    if [[ ! "${recipe}" =~ ${backend_watch_pattern} ]]; then
+      echo "[fullmag just] invalid native backend watcher recipe" >&2
+      exit 2
+    fi
+    web_port="${BASH_REMATCH[1]}"
+    if ! is_windows_shell || (( web_port > 65535 )); then
+      echo "[fullmag just] native backend watcher requires Windows and a port from 1 to 65535" >&2
+      exit 2
+    fi
+    # The watcher acquires its own closed watch lease and delegates each build
+    # to run-windows-workspace-build; do not wrap its lifetime in the generic
+    # worktree build lock.
+    exec "${python_cmd}" "${script_dir}/windows/watch_backend.py" --repo-root "${repo_root}" --web-port "${web_port}"
+    ;;
+  *"scripts/export_runner_openapi.py"*)
+    export_openapi_pattern='^[^[:space:]]+ "[^"]+/scripts/export_runner_openapi.py" --repo-root "[^"]+" --job-id "([0-9a-f]{32})" --expected-commit "([0-9a-f]{40})"$'
+    if [[ ! "${recipe}" =~ ${export_openapi_pattern} ]]; then
+      echo "[fullmag just] invalid managed OpenAPI export recipe" >&2
+      exit 2
+    fi
+    # The helper owns read-only admission, path checks and its terminal proof.
+    # Invoke only this checkout's helper, never the supplied recipe text.
+    exec "${python_cmd}" "${script_dir}/export_runner_openapi.py" --repo-root "${repo_root}" --job-id "${BASH_REMATCH[1]}" --expected-commit "${BASH_REMATCH[2]}"
+    ;;
+    *"scripts/verify_development_backend_api.py"*)
+    frozen_project_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --project-document-only --frozen-native-build-id "([0-9a-f]{64})"( --archive-frozen-bundle)?$'
+    if [[ "${recipe}" =~ ${frozen_project_pattern} ]]; then
+      if ! is_windows_shell; then
+        echo "[fullmag just] frozen project document verification requires Windows" >&2
+        exit 2
+      fi
+      archive_args=()
+      if [[ -n "${BASH_REMATCH[2]}" ]]; then
+        archive_args=(--archive-frozen-bundle)
+      fi
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --project-document-only --frozen-native-build-id "${BASH_REMATCH[1]}" "${archive_args[@]}"
+    fi
+    compute_cancellation_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --compute-cancellation-only --frozen-native-build-id "([0-9a-f]{64})"$'
+    if [[ "${recipe}" =~ ${compute_cancellation_pattern} ]]; then
+      if ! is_windows_shell; then
+        echo "[fullmag just] compute cancellation API verification requires Windows" >&2
+        exit 2
+      fi
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --compute-cancellation-only --frozen-native-build-id "${BASH_REMATCH[1]}"
+    fi
+    frozen_native_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --frozen-native-build-id "([0-9a-f]{64})"$'
+    compute_host_initialization_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --compute-host-initialization-only --frozen-native-build-id "([0-9a-f]{64})"$'
+    compute_scheduler_cancellation_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --compute-scheduler-cancellation-only --frozen-native-build-id "([0-9a-f]{64})"$'
+    if [[ "${recipe}" =~ ${compute_scheduler_cancellation_pattern} ]]; then
+      if ! is_windows_shell; then
+        echo "[fullmag just] compute scheduler cancellation verification requires Windows" >&2
+        exit 2
+      fi
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --compute-scheduler-cancellation-only --frozen-native-build-id "${BASH_REMATCH[1]}"
+    fi
+    if [[ "${recipe}" =~ ${compute_host_initialization_pattern} ]]; then
+      if ! is_windows_shell; then
+        echo "[fullmag just] compute host initialization verification requires Windows" >&2
+        exit 2
+      fi
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --compute-host-initialization-only --frozen-native-build-id "${BASH_REMATCH[1]}"
+    fi
+    if [[ "${recipe}" =~ ${frozen_native_pattern} ]]; then
+      if ! is_windows_shell; then
+        echo "[fullmag just] frozen native package verification requires Windows" >&2
+        exit 2
+      fi
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --frozen-native-build-id "${BASH_REMATCH[1]}"
+    fi
+      workspace_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --workspace-browser-owner-bundle "([0-9a-f]{32})"$'
+      if [[ "${recipe}" =~ ${workspace_browser_pattern} ]]; then
+        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --workspace-browser-owner-bundle "${BASH_REMATCH[1]}"
+      fi
+      candidate_preparation_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --candidate-preparation-only$'
+      if [[ "${recipe}" =~ ${candidate_preparation_pattern} ]]; then
+        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --candidate-preparation-only
+      fi
+      consumer_pump_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --consumer-pump-owner-bundle "([0-9a-f]{32})"$'
+      active_run_paused_refusal_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --active-run-refusal-owner-bundle "([0-9a-f]{32})" --active-run-scenario "paused"$'
+      if [[ "${recipe}" =~ ${active_run_paused_refusal_pattern} ]]; then
+        if ! is_windows_shell; then
+          echo "[fullmag just] active-run restart verification requires Windows" >&2
+          exit 2
+        fi
+        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --active-run-refusal-owner-bundle "${BASH_REMATCH[1]}" --active-run-scenario paused
+      fi
+      active_run_refusal_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --active-run-refusal-owner-bundle "([0-9a-f]{32})"$'
+      if [[ "${recipe}" =~ ${active_run_refusal_pattern} ]]; then
+        if ! is_windows_shell; then
+          echo "[fullmag just] active-run restart verification requires Windows" >&2
+          exit 2
+        fi
+        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --active-run-refusal-owner-bundle "${BASH_REMATCH[1]}"
+      fi
+      start_freeze_race_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --start-freeze-race-only$'
+      if [[ "${recipe}" =~ ${start_freeze_race_pattern} ]]; then
+        if ! is_windows_shell; then
+          echo "[fullmag just] Start/freeze race verification requires Windows" >&2
+          exit 2
+        fi
+        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --start-freeze-race-only
+      fi
+      if [[ "${recipe}" =~ ${consumer_pump_pattern} ]]; then
+        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --consumer-pump-owner-bundle "${BASH_REMATCH[1]}"
+      fi
+      consumer_readiness_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --consumer-readiness-only$'
+      if [[ "${recipe}" =~ ${consumer_readiness_pattern} ]]; then
+        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --consumer-readiness-only
+      fi
+      restart_consumer_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --restart-consumer-only$'
+      if [[ "${recipe}" =~ ${restart_consumer_pattern} ]]; then
+        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --restart-consumer-only
+      fi
+      observer_pause_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --observer-pause-only$'
+      if [[ "${recipe}" =~ ${observer_pause_pattern} ]]; then
+        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --observer-pause-only
+      fi
+      restart_transport_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --restart-transport-only$'
+      if [[ "${recipe}" =~ ${restart_transport_pattern} ]]; then
+        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --restart-transport-only
+      fi
+      project_document_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --project-document-only$'
+      if [[ "${recipe}" =~ ${project_document_pattern} ]]; then
+        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --project-document-only
+      fi
+      development_api_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --cross-build-bundle "([0-9a-f]{32})?"$'
+      if [[ ! "${recipe}" =~ ${development_api_pattern} ]]; then
+        echo "[fullmag just] invalid development API check recipe" >&2
+        exit 2
+      fi
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --cross-build-bundle "${BASH_REMATCH[1]:-}"
+      ;;
+    *"scripts/verify_development_handoff.py"*)
+    handoff_check_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_handoff.py" --repo-root "[^"]+"$'
+    if [[ ! "${recipe}" =~ ${handoff_check_pattern} ]]; then
+      echo "[fullmag just] invalid development handoff check recipe" >&2
+      exit 2
+    fi
+    # This fixed interpreted route owns preflight, its worktree lease and
+    # terminal evidence; it does not prepare or migrate compatibility links.
+    exec "${python_cmd}" "${script_dir}/verify_development_handoff.py" --repo-root "${repo_root}"
+    ;;
+esac
+
 # Read-only listing/help recipes must not create a storage marker or any
 # compatibility path.  The resolver's own read-only actions can therefore be
 # used for inspection even when the checkout has not been initialized yet.
@@ -104,6 +289,26 @@ case "${recipe}" in
     exec "${python_cmd}" "${script_dir}/verify_saved_fem_archive_roundtrip.py" --repo-root "${repo_root}"
     ;;
   *"scripts/verify_pinned_dataset_browser.py"*)
+    restart_action_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3254 --scenario development-restart-action$'
+    if [[ "${recipe}" =~ ${restart_action_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3254 --scenario development-restart-action
+    fi
+    outcome_handoff_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3253 --scenario development-run-outcome-handoff$'
+    if [[ "${recipe}" =~ ${outcome_handoff_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3253 --scenario development-run-outcome-handoff
+    fi
+    kernel_host_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3252 --scenario development-kernel-host$'
+    if [[ "${recipe}" =~ ${kernel_host_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3252 --scenario development-kernel-host
+    fi
+    project_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3251 --scenario project-document-handoff$'
+    if [[ "${recipe}" =~ ${project_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3251 --scenario project-document-handoff
+    fi
+    study_profile_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3256 --scenario study-execution-profile$'
+    if [[ "${recipe}" =~ ${study_profile_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3256 --scenario study-execution-profile
+    fi
     browser_recipe_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+"$'
     if [[ ! "${recipe}" =~ ${browser_recipe_pattern} ]]; then
       echo "[fullmag just] invalid pinned dataset browser recipe" >&2
@@ -114,7 +319,7 @@ case "${recipe}" in
   *"scripts/verify_control_room_sources.py"*)
     # Never execute the recipe text: accept only the fixed argument shape and
     # invoke the trusted helper from this checkout with the selected route.
-    source_recipe_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_control_room_sources.py" --route (generate-client|production-source|api-hygiene|lint) --repo-root "[^"]+"$'
+    source_recipe_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_control_room_sources.py" --route (generate-client|production-source|api-hygiene|lint|openapi-import-check|react-doctor|development-restart-check|resource-client-cache-check|development-kernel-host-check|development-transport-pause-check|development-run-outcome-handoff-check|development-run-outcome-handoff-lint|development-restart-action-check|development-restart-action-lint|development-backend-build-action-check) --repo-root "[^"]+"$'
     if [[ ! "${recipe}" =~ ${source_recipe_pattern} ]]; then
       echo "[fullmag just] invalid lightweight frontend recipe" >&2
       exit 2
@@ -143,6 +348,18 @@ case "${recipe}" in
     exec "${python_cmd}" "${script_dir}/verify_accepted_fdm_gpu_runtime.py" --repo-root "${repo_root}"
     ;;
   *"scripts/verify_project_active_run_runtime.py"*)
+    frozen_active_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_project_active_run_runtime.py" --repo-root "[^"]+" --frozen-native-build-id "([0-9a-f]{64})"$'
+    if [[ "${recipe}" =~ ${frozen_active_pattern} ]]; then
+      if ! is_windows_shell; then
+        echo "[fullmag just] frozen active-run verification requires Windows" >&2
+        exit 2
+      fi
+      exec "${python_cmd}" "${script_dir}/verify_project_active_run_runtime.py" --repo-root "${repo_root}" --frozen-native-build-id "${BASH_REMATCH[1]}"
+    fi
+    if [[ "${recipe}" == *"--frozen-native-build-id"* ]]; then
+      echo "[fullmag just] frozen active-run verification requires a lowercase SHA-256 build ID" >&2
+      exit 2
+    fi
     exec "${python_cmd}" "${script_dir}/verify_project_active_run_runtime.py" --repo-root "${repo_root}"
     ;;
   *"scripts/verify_session_persistence.py"*"--route project-application-check"*)
@@ -159,6 +376,9 @@ case "${recipe}" in
     ;;
   *"scripts/verify_session_persistence.py"*"--route api-source-check"*)
     exec "${python_cmd}" "${script_dir}/verify_session_persistence.py" --route api-source-check --repo-root "${repo_root}"
+    ;;
+  *"scripts/verify_session_persistence.py"*"--route api-service-source-check"*)
+    exec "${python_cmd}" "${script_dir}/verify_session_persistence.py" --route api-service-source-check --repo-root "${repo_root}"
     ;;
   *"scripts/verify_session_persistence.py"*"--route api-resource-pool-check"*)
     exec "${python_cmd}" "${script_dir}/verify_session_persistence.py" --route api-resource-pool-check --repo-root "${repo_root}"

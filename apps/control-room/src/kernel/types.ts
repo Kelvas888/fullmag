@@ -17,6 +17,8 @@ import type { SelectionController } from "./selection/SelectionController";
 import type { DiagnosticRecorderController } from "./performance/diagnostic-recorder/DiagnosticRecorderController";
 import type { ObjectMoveToolController } from "./authoring/ObjectMoveToolController";
 import type { AuthoringHistoryController } from "./authoring/AuthoringHistoryController";
+import type { ObjectEditSessionController } from "./authoring/object-edit/ObjectEditSessionController";
+import type { GeometryObjectDraft } from "./authoring/object-edit/objectEditTypes";
 import type { PendingFormRegistry } from "./authoring/PendingFormRegistry";
 import type { AnalysisFieldOverlayController } from "./visualization/AnalysisFieldOverlayController";
 import type { ChartViewportHandoffController } from "./visualization/ChartViewportHandoffController";
@@ -26,6 +28,7 @@ import type { ModeCompositionController } from "./visualization/ModeCompositionC
 import type { VisualizationDebugController } from "./visualization/VisualizationDebugController";
 import type { VisualizationRegistrySyncController } from "./visualization/VisualizationRegistrySyncController";
 import type { ProjectDocumentController } from "./persistence/ProjectDocumentController";
+import type { DevelopmentKernelHost } from "./development/DevelopmentKernelHost";
 
 export type SlotId =
   | "app-menu"
@@ -36,6 +39,7 @@ export type SlotId =
   | "panel-right"
   | "panel-bottom"
   | "status-bar"
+  | "start-screen"
   | "overlay";
 
 export type ModuleId = string;
@@ -68,9 +72,11 @@ export interface ModuleManifest {
 }
 
 export interface KernelApi {
+  readonly developmentWorkspace?: DevelopmentKernelHost;
   readonly api: ControlRoomApi;
   readonly analysisFieldOverlay: AnalysisFieldOverlayController;
   readonly authoringHistory?: AuthoringHistoryController;
+  readonly objectEditSession: ObjectEditSessionController<GeometryObjectDraft>;
   readonly pendingForms?: PendingFormRegistry;
   readonly bus: EventBus<KernelEventMap>;
   readonly chartViewportHandoff: ChartViewportHandoffController;

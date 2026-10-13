@@ -1,0 +1,27 @@
+digraph G {
+graph [bgcolor="#f7f9fc", fontname="DejaVu Sans", fontsize=20, fontcolor="#182e47", labelloc=t, labeljust=l, pad=0.4, nodesep=0.45, ranksep=0.75, splines=polyline, dpi=125];
+node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12, fillcolor="#e6edf5", color="#adc1d7", fontcolor="#142941", penwidth=1.2, margin="0.19,0.15"];
+edge [fontname="DejaVu Sans", fontsize=10, color="#6e89a7", fontcolor="#415c78", arrowsize=0.75, penwidth=1.2];
+rankdir=LR;
+
+label="D01 / ARCHITECTURE V2 — PROPOSED\nOne existing shell and viewport; kernel-owned draft; server-owned committed model";
+ui [label="Inspector views + ribbon\nshortcuts + command palette"];
+cmd [label="One CommandRegistry\nApply / Revert / gesture intents"];
+edit [label="kernel.objectEdits\nidentity + rawText + baseline\nsemantic edit versions + state"];
+resource [label="Existing scene resource owner\ncommitted SceneDocument\nSSR-neutral subscription"];
+viewport [label="Existing unified 3D viewport\nlocal preview / last-valid\nowns GPU + gesture resources"];
+transport [label="Typed facade + scoped journal\nclient_intent_id + request digest"];
+server [label="Existing patch_object_geometry\ngeometry + full transform\nfinal CAS / run admission gate"];
+receipt [label="PROPOSED durable receipt\neffect + receipt atomic recovery\ncapability required"];
+artifact [label="Server geometry / mesh pipeline\nimmutable mandatory resources\nactive generation marker"];
+assessment [label="One ArtifactAssessment\nFEM / FDM identity variants\nselection and Run gate"];
+ui->cmd;cmd->edit;edit->viewport [label="draft only"];
+resource->edit [label="canonical baseline / remote"];
+edit->transport [label="Apply only"];
+transport->server;server->receipt [label="commit point"];
+receipt->transport [label="ACK / reconciliation"];
+transport->resource [label="matched committed snapshot"];
+server->artifact [label="separate explicit build"];
+artifact->assessment;assessment->viewport;assessment->ui;
+
+}

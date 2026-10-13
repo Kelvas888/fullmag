@@ -108,6 +108,10 @@ import {
   type DecodedTopology,
 } from "../api/codecs";
 import { ControlRoomApiError } from "../api/ControlRoomApi";
+import {
+  resolveArtifactAssessment,
+  type ArtifactAssessment,
+} from "@/shared/domain/mesh/artifactAssessment";
 import { useKernel } from "../KernelContext";
 import type { ResourceInvalidationController } from "./ResourceInvalidationController";
 import {
@@ -115,6 +119,7 @@ import {
   type ResourceRuntimeStore,
 } from "./ResourceRuntimeStore";
 import { ResourceCache } from "./ResourceCache";
+import { resourceRuntimeKeyForClientScope } from "./resourceClientScope";
 export {
   VISUALIZATION_STATE_RESOURCE_KEY,
   resolveVisualizationStateRevision,
@@ -538,14 +543,25 @@ export function publishCommittedSceneResource(
     sharedResourceRuntimeStore as ResourceRuntimeStore<SceneResource>,
   invalidate = true,
   sessionScopeKey?: string | null,
+  resourceCacheScope?: string | null,
 ): void {
-  runtimeStore.updateData(SCENE_RESOURCE_KEY, scene, revision);
-  // A response without an owner may update the legacy alias, but it must not
-  // become the in-memory value for an arbitrary session. Canonical invalidation
-  // fans out to observed scoped subscribers so each owner can refetch safely.
+  const publish = resourceCacheScope
+    ? runtimeStore.updateObservedData.bind(runtimeStore)
+    : runtimeStore.updateData.bind(runtimeStore);
+  publish(
+    resourceRuntimeKeyForClientScope(SCENE_RESOURCE_KEY, resourceCacheScope),
+    scene,
+    revision,
+  );
+  // Client-owned publications must not create unobserved aliases or resurrect
+  // a disposed owner's snapshots. Canonical invalidation lets future observers
+  // fetch authoritative data through their own session and client scope.
   if (sessionScopeKey) {
-    runtimeStore.updateData(
-      `${sessionScopeKey}|${SCENE_RESOURCE_KEY}`,
+    publish(
+      resourceRuntimeKeyForClientScope(
+        `${sessionScopeKey}|${SCENE_RESOURCE_KEY}`,
+        resourceCacheScope,
+      ),
       scene,
       revision,
     );
@@ -1953,3 +1969,36 @@ function resolveRevisionProperty(
 
   return null;
 }
+
+/**
+ * Single shared artifact assessment selector across Control Room (PR08/PR10/D06).
+ */
+export function useMeshArtifactAssessment(
+  options: ResourceHookOptions = {},
+): ArtifactAssessment {
+  const scene = useSceneResource(options);
+  const manifest = useMeshSharedDomainManifestResource(options);
+  const activeBuild = useMeshBuildCurrent(options);
+  const latestBuild = useMeshBuildLatestSuccessful(options);
+  const summary = useMeshSummaryResource(options);
+
+  return useMemo(() => {
+    return resolveArtifactAssessment({
+      activeBuild: activeBuild.data?.active_build,
+      latestBuild: latestBuild.data?.last_success,
+      manifest: manifest.data as Record<string, unknown> | null | undefined,
+      resourceLoadState: manifest.status,
+      sceneRevision: scene.data?.revision ?? scene.data?.scene_revision,
+      statusMeshRevision: summary.data?.revision,
+    });
+  }, [
+    activeBuild.data?.active_build,
+    latestBuild.data?.last_success,
+    manifest.data,
+    manifest.status,
+    scene.data?.revision,
+    scene.data?.scene_revision,
+    summary.data?.revision,
+  ]);
+}
+

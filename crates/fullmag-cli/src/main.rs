@@ -12,6 +12,10 @@ mod command_bridge;
 mod communication_policy;
 mod control_room;
 mod dev_smoke;
+mod development_api_owner;
+mod development_api_replacement;
+mod development_api_supervisor;
+mod development_restart;
 mod diagnostics;
 mod feature_flags;
 mod formatting;
@@ -21,15 +25,20 @@ mod live_workspace;
 mod nvtx_range;
 mod orchestrator;
 mod python_bridge;
+mod run_manifest;
+mod runtime_service_client;
 mod runtime_supervisor;
 mod saved_fem_snapshot_gate;
 mod scratch_runtime;
+mod script_inspect;
+mod script_launch;
 mod simulation_preparation;
 mod solver_profile_persistence;
 mod stage_heartbeat;
 mod step_utils;
 mod terminal_logs;
 mod types;
+mod workspace_usage;
 
 use args::*;
 use formatting::*;
@@ -46,11 +55,19 @@ fn main() -> Result<()> {
         let script_mode = std::thread::Builder::new()
             .name("fullmag-script-mode".to_string())
             .stack_size(SCRIPT_MODE_STACK_SIZE_BYTES)
-            .spawn(move || orchestrator::run_script_mode(raw_args))
+            .spawn(move || script_launch::run_script_entry(raw_args))
             .context("failed to spawn script-mode worker")?;
-        return script_mode
+        let (result, exit_code) = script_mode
             .join()
             .map_err(|_| anyhow!("script-mode worker panicked"))?;
+        // Host-managed runs report the documented exit codes (08-script-open.md 6.2).
+        if let Some(code) = exit_code.filter(|code| *code != 0) {
+            if let Err(error) = &result {
+                eprintln!("Error: {error:?}");
+            }
+            std::process::exit(code);
+        }
+        return result;
     }
 
     #[cfg(windows)]
@@ -68,12 +85,78 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Runtime(RuntimeCommand::ServiceEnsure { config }) => {
+            let owner = runtime_service_client::ensure(&config)?;
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": "runtime_service_discovery.v1",
+                    "status": "ready", "owner": owner,
+                }))?
+            );
+        }
+        Command::Runtime(RuntimeCommand::ServiceStatus {
+            store,
+            target,
+            timeout_seconds,
+        }) => {
+            let owner = runtime_service_client::probe(&store, &target, timeout_seconds)?;
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": "runtime_service_discovery.v1",
+                    "status": "ready", "owner": owner,
+                }))?
+            );
+        }
         Command::Runtime(RuntimeCommand::VerifySavedFemSnapshot {
             store,
             source,
             source_artifact_id,
         }) => {
             saved_fem_snapshot_gate::verify(&store, &source, &source_artifact_id)?;
+        }
+        Command::Runtime(RuntimeCommand::VerifyDevelopmentObserverPause) => {
+            if std::env::var("FULLMAG_DEVELOPMENT_OWNER_PROBE").as_deref() != Ok("1") {
+                anyhow::bail!("observer pause verification requires an explicit managed fixture");
+            }
+            println!("{}", scratch_runtime::verify_idle_pause_control()?);
+        }
+        Command::Runtime(RuntimeCommand::VerifyDevelopmentApiOwner) => {
+            control_room::verify_development_api_owner()?;
+        }
+        Command::Runtime(RuntimeCommand::VerifyDevelopmentRestartConsumer) => {
+            control_room::verify_development_restart_consumer()?;
+        }
+        Command::Runtime(RuntimeCommand::VerifyDevelopmentCompletionOwner) => {
+            control_room::verify_development_completion_owner()?;
+        }
+        Command::Runtime(RuntimeCommand::InitializeScopedAcceptedStore) => {
+            control_room::initialize_scoped_accepted_store()?;
+        }
+        Command::Runtime(RuntimeCommand::InitializeHostApplication {
+            config,
+            config_sha256,
+        }) => {
+            println!(
+                "{}",
+                serde_json::to_string(&runtime_service_client::initialize_host_application(
+                    &config,
+                    &config_sha256,
+                )?)?
+            );
+        }
+        Command::Runtime(RuntimeCommand::VerifyDevelopmentHandoffCommit {
+            store,
+            corrupt_store,
+        }) => {
+            control_room::verify_development_handoff_commit(&store, &corrupt_store)?;
+        }
+        Command::Runtime(RuntimeCommand::VerifyDevelopmentColdIdle { config }) => {
+            control_room::verify_development_cold_idle(&config)?;
+        }
+        Command::Runtime(RuntimeCommand::VerifyDevelopmentServiceDrain { config }) => {
+            control_room::verify_development_service_drain(&config)?;
         }
         Command::Doctor => {
             println!("fullmag status");
@@ -193,6 +276,28 @@ fn main() -> Result<()> {
             execution_plan,
         } => {
             let mut ir = read_ir(&path)?;
+            if ir
+                .problem_meta
+                .runtime_metadata
+                .contains_key("execution_materialization")
+            {
+                if let Some(value) = backend {
+                    ir = fullmag_application::bind_declared_execution(
+                        &ir,
+                        vec![fullmag_ir::ExecutionRequestLayerIR {
+                            origin: fullmag_ir::ExecutionFieldOriginIR {
+                                kind: fullmag_ir::ExecutionOriginKindIR::Cli,
+                                location: "cli.plan-json.backend".into(),
+                            },
+                            request: fullmag_ir::ExecutionRequestPatchIR {
+                                backend: fullmag_ir::FieldPatch::Value(BackendTarget::from(value)),
+                                ..Default::default()
+                            },
+                        }],
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                }
+            }
             if execution_plan {
                 if let Some(backend) = backend {
                     ir.backend_policy.requested_backend = BackendTarget::from(backend);
@@ -342,6 +447,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Project(cmd) => handle_project(cmd)?,
+        Command::Script(cmd) => script_inspect::handle_script(cmd)?,
         Command::Session(cmd) => handle_session(cmd)?,
     }
 
@@ -357,6 +463,15 @@ fn handle_project(cmd: args::ProjectSubcommand) -> Result<()> {
         .open(ProjectSource::Path(path.clone()))
         .map_err(|error| anyhow!(error.to_string()))?;
     let view = opened.view;
+    workspace_usage::record_project_open(
+        &path,
+        Some(view.project_id.as_str()),
+        serde_json::json!({ "via": "project open" }),
+        serde_json::json!({
+            "schema_version": view.schema_version,
+            "revision": view.revision,
+        }),
+    );
     let mode = match view.mode {
         DocumentMode::ReadWrite => serde_json::json!({"kind": "read_write"}),
         DocumentMode::ReadOnly { reason } => {
@@ -484,11 +599,16 @@ fn handle_session(cmd: args::SessionSubcommand) -> Result<()> {
         SessionSubcommand::Open { path } => {
             let file = std::fs::File::open(&path)?;
             let reader = std::io::BufReader::new(file);
-            let decoding_root = default_store_root.parent().context("session storage parent is missing")?;
+            let decoding_root = default_store_root
+                .parent()
+                .context("session storage parent is missing")?;
             std::fs::create_dir_all(decoding_root)?;
             let preflight = preflight_fms_staged(reader, &[], decoding_root)?;
             if default_store_root.exists() {
-                bail!("session import destination already exists: {}", default_store_root.display());
+                bail!(
+                    "session import destination already exists: {}",
+                    default_store_root.display()
+                );
             }
             let staging = decoding_root.join(format!(".session-import-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&staging)?;
@@ -500,13 +620,30 @@ fn handle_session(cmd: args::SessionSubcommand) -> Result<()> {
                 Ok(session)
             })();
             let session = match result {
-                Ok(session) => session,
+                Ok(session) => {
+                    workspace_usage::record_project_open(
+                        &path,
+                        None,
+                        serde_json::json!({ "via": "session open" }),
+                        serde_json::Value::Null,
+                    );
+                    session
+                }
                 Err(error) => {
-                    if error.downcast_ref::<fullmag_session::PublicationUncertain>().is_none()
-                        && error.downcast_ref::<fullmag_session::WriterReleaseUnconfirmed>().is_none() {
+                    if error
+                        .downcast_ref::<fullmag_session::PublicationUncertain>()
+                        .is_none()
+                        && error
+                            .downcast_ref::<fullmag_session::WriterReleaseUnconfirmed>()
+                            .is_none()
+                    {
                         let _ = std::fs::remove_dir_all(&staging);
                     }
-                    return Err(error.context(format!("import staging: {}; destination: {}", staging.display(), default_store_root.display())));
+                    return Err(error.context(format!(
+                        "import staging: {}; destination: {}",
+                        staging.display(),
+                        default_store_root.display()
+                    )));
                 }
             };
 
@@ -518,7 +655,9 @@ fn handle_session(cmd: args::SessionSubcommand) -> Result<()> {
         SessionSubcommand::Inspect { path } => {
             let file = std::fs::File::open(&path)?;
             let reader = std::io::BufReader::new(file);
-            let decoding_root = default_store_root.parent().context("session storage parent is missing")?;
+            let decoding_root = default_store_root
+                .parent()
+                .context("session storage parent is missing")?;
             std::fs::create_dir_all(decoding_root)?;
             let staged = preflight_fms_staged(reader, &[], decoding_root)?;
             let info = &staged.inspection;
@@ -583,6 +722,7 @@ fn handle_session(cmd: args::SessionSubcommand) -> Result<()> {
 }
 
 fn launch_ui(ui: UiCli) -> Result<()> {
+    crate::control_room::development_restore_requested(ui.dev, ui.script.is_some())?;
     crate::control_room::init_api_port()?;
     let (session_id, live_workspace) = if let Some(script) = ui.script.as_ref() {
         let (session_id, live_workspace) =
@@ -604,31 +744,112 @@ fn launch_ui(ui: UiCli) -> Result<()> {
     } else {
         "hub"
     };
-    let ready = crate::control_room::bootstrap_control_plane(
+    let mut ready = crate::control_room::bootstrap_control_plane(
         &session_id,
         ui.dev,
         ui.web_port,
         live_workspace.as_ref(),
     )?;
-    let mut ui_child = crate::control_room::open_in_tauri(&ready, intent)?;
-    let scratch_runtime = if live_workspace.is_none() {
+    let owns_api = ready.api_child.is_some();
+    let owned_api_pid = ready.api_child.as_ref().map(std::process::Child::id);
+    let mut control_room_guard = crate::control_room::ControlRoomGuard::active(
+        ready.web_port,
+        ready.api_child.take(),
+        ready.frontend_child.take(),
+    );
+    let root = crate::control_room::repo_root();
+    let state_root = crate::control_room::runtime_state_root(&root);
+    let mut runtime_binding = fullmag_runtime_control::application_attach::prepare_for_authoring(
+        &root,
+        &state_root,
+        crate::control_room::api_port(),
+    )?;
+    let development_owner = match ready.development_owner.take() {
+        Some(owner) => Some(owner.confirm(
+            owned_api_pid.context("development owner requires an owned API child")?,
+            ready.api_port,
+            runtime_binding.api_instance_id(),
+        )?),
+        None => None,
+    };
+    if let Some(owner) = development_owner {
+        control_room_guard.adopt_development_owner(owner)?;
+        control_room_guard.enable_development_restart_transport(ready.web_port)?;
+    }
+    if !owns_api {
+        runtime_binding.disable_automatic_attach(
+            fullmag_runtime_control::application_attach::ApplicationAttachBlockReason::ApiNotOwned,
+        );
+    }
+    let initial_api_instance = runtime_binding.api_instance_id().to_owned();
+    let mut ui_child =
+        crate::control_room::open_in_tauri(&ready, intent, runtime_binding.api_instance_id())?;
+    // Native startup has an owned observer and cannot delay opening the window.
+    let mut runtime_attach = match runtime_binding.start() {
+        Ok(attach) => attach,
+        Err(error) => {
+            eprintln!("Native runtime attach unavailable: {error:#}");
+            None
+        }
+    };
+    let mut scratch_runtime = if live_workspace.is_none() {
         let executable = std::env::current_exe().context("failed to resolve fullmag executable")?;
         Some(crate::scratch_runtime::spawn(
             crate::control_room::api_port(),
             executable,
             None,
+            initial_api_instance,
         ))
     } else {
         None
     };
-    let control_room_guard = crate::control_room::ControlRoomGuard::active(
-        ready.web_port,
-        ready.api_child,
-        ready.frontend_child,
-    );
-    let _ = ui_child.wait();
-    drop(control_room_guard);
+    let mut restart_pump = crate::development_restart::NativeRestartPump::default();
+    let mut last_restart_error = None;
+    let mut ui_closed = false;
+    let mut retention_reported = false;
+    loop {
+        if !ui_closed {
+            match ui_child.try_wait() {
+                Ok(Some(_)) => ui_closed = true,
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("UI process observation unavailable: {error}");
+                    let _ = ui_child.wait();
+                    ui_closed = true;
+                }
+            }
+        }
+        if ui_closed {
+            if !control_room_guard.retains_unknown_development_custody() {
+                break;
+            }
+            if !retention_reported {
+                eprintln!("Development restart outcome is unknown; retaining launcher and API ownership after UI close for explicit recovery");
+                retention_reported = true;
+            }
+        }
+        match restart_pump.step(
+            &root,
+            &mut control_room_guard,
+            &mut runtime_attach,
+            &mut scratch_runtime,
+        ) {
+            Ok(()) => last_restart_error = None,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if last_restart_error.as_ref() != Some(&message) {
+                    eprintln!("Native restart observation unavailable: {message}");
+                    last_restart_error = Some(message);
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    // Join the observer before shutting down the API it is pinned to.
+    drop(runtime_attach);
     drop(scratch_runtime);
+    drop(restart_pump);
+    drop(control_room_guard);
     Ok(())
 }
 
@@ -707,8 +928,16 @@ fn is_script_mode(raw_args: &[OsString]) -> bool {
         "resolve-runtime-invocation",
         "session",
         "project",
+        "script",
     ];
-    const FLAG_ONLY: &[&str] = &["-i", "--interactive", "--headless", "--dev", "--json"];
+    const FLAG_ONLY: &[&str] = &[
+        "-i",
+        "--interactive",
+        "--headless",
+        "--dev",
+        "--json",
+        "--wait-for-solve",
+    ];
     const VALUE_FLAGS: &[&str] = &[
         "--backend",
         "--mode",
@@ -720,6 +949,12 @@ fn is_script_mode(raw_args: &[OsString]) -> bool {
         "--initial-magnetization-state-sample-index",
         "--workspace-root",
         "--web-port",
+        "--ui",
+        "--api-port",
+        "--expect-script-sha256",
+        "--receipt",
+        "--launched-by",
+        "--python",
     ];
 
     let mut index = 1usize;

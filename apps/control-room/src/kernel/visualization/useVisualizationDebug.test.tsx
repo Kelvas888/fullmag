@@ -16,6 +16,7 @@ import { RealtimeInvalidationBridge } from "../realtime/RealtimeInvalidationBrid
 import { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
 import { SelectionController } from "../selection/SelectionController";
 import { ObjectMoveToolController } from "../authoring/ObjectMoveToolController";
+import { ObjectEditSessionController } from "../authoring/object-edit/ObjectEditSessionController";
 import type { KernelApi } from "../types";
 import { AnalysisFieldOverlayController } from "./AnalysisFieldOverlayController";
 import { ModeCompositionController } from "./ModeCompositionController";
@@ -48,6 +49,7 @@ function makeKernel(): KernelApi {
     }),
     layout: new LayoutController(bus),
     modules: new ModuleRegistry(),
+    objectEditSession: new ObjectEditSessionController(),
     objectMoveTool: new ObjectMoveToolController(),
     modeComposition: new ModeCompositionController({
       getActiveModeComposition: (options) =>

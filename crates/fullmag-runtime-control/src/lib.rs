@@ -1,6 +1,15 @@
 //! Atomic journal adapter. A transition and its resulting application
 //! checkpoint share one payload and one session-store publication.
 use anyhow::{bail, Context, Result};
+pub mod accepted_store;
+pub mod application_attach;
+pub mod application_service_status;
+pub mod cuda_device_identity;
+pub mod development_cold_idle;
+pub mod host_allocation;
+pub mod host_runtime;
+pub mod local_resources;
+pub mod runtime_service_client;
 use fullmag_application::{
     CoordinatorMessage, CoordinatorTransition, WorkerEvent, COORDINATOR_TRANSITION_SCHEMA,
 };
@@ -436,6 +445,36 @@ pub fn request_accepted_task_stop(
     task_id: &str,
     reason: &str,
 ) -> Result<AcceptedTaskStop> {
+    request_accepted_task_stop_inner(store, run_id, task_id, reason, true)
+}
+
+/// A recorded pre-claim intent can stop its repaired, genuine admission
+/// before Start. This does not authorize the legacy public Stop branch.
+pub(crate) fn request_cancelled_admission_stop(
+    store: &SessionStore,
+    run_id: &fullmag_application::RunId,
+    task_id: &str,
+) -> Result<AcceptedTaskStop> {
+    let intent = store
+        .read_task_cancellation_intent(run_id.as_str(), task_id)?
+        .context("pre-Start admission cancellation requires its durable intent")?;
+    store.request_task_cancellation_intent(
+        run_id.as_str(),
+        task_id,
+        &intent.cancellation_id,
+        intent.expected_catalog_revision,
+        &intent.reason,
+    )?;
+    request_accepted_task_stop_inner(store, run_id, task_id, &intent.reason, false)
+}
+
+fn request_accepted_task_stop_inner(
+    store: &SessionStore,
+    run_id: &fullmag_application::RunId,
+    task_id: &str,
+    reason: &str,
+    require_start: bool,
+) -> Result<AcceptedTaskStop> {
     if reason.trim().is_empty() {
         bail!("accepted task stop reason must not be empty");
     }
@@ -469,13 +508,15 @@ pub fn request_accepted_task_stop(
             });
         }
         if recovered.coordinator.phase() == fullmag_application::CoordinatorPhase::Running
-            && recovered.events.iter().any(|event| {
-                matches!(&event.event, fullmag_application::WorkerEvent::Completing)
-            })
+            && recovered
+                .events
+                .iter()
+                .any(|event| matches!(&event.event, fullmag_application::WorkerEvent::Completing))
         {
             bail!("accepted task is already completing");
         }
-        if recovered.coordinator.phase() == fullmag_application::CoordinatorPhase::Preparing
+        if require_start
+            && recovered.coordinator.phase() == fullmag_application::CoordinatorPhase::Preparing
             && !matches!(
                 recovered.commands.last().map(|command| &command.command),
                 Some(fullmag_application::WorkerCommand::Start)
@@ -502,12 +543,12 @@ pub fn request_accepted_task_stop(
                 retry_store_writer_busy(|| {
                     commit_transition_with_catalog_revision(store, transition)
                 })
-                    .map(|(_, revision)| {
-                        catalog_revision = Some(revision);
-                    })
-                    .map_err(|error| {
-                        fullmag_application::CoordinatorError::Invalid(format!("{error:#}"))
-                    })
+                .map(|(_, revision)| {
+                    catalog_revision = Some(revision);
+                })
+                .map_err(|error| {
+                    fullmag_application::CoordinatorError::Invalid(format!("{error:#}"))
+                })
             },
         ) {
             Ok(command) => command,
@@ -573,28 +614,36 @@ pub fn load_accepted_run_snapshot(
     })
 }
 
+pub mod python_runtime;
+
 mod claim;
-pub use claim::{commit_claimed_task_admission, load_current_task_claim};
+pub use claim::{
+    commit_claimed_task_admission, commit_claimed_task_admission_with_host,
+    load_current_task_claim, try_commit_claimed_task_admission_with_host,
+};
 
 mod scheduler;
 pub use scheduler::{
-    accepted_run_has_scheduler_ready_task, schedule_next_ready_accepted_task,
+    accepted_run_has_scheduler_ready_task, resume_next_admitted_accepted_task_with_host,
+    schedule_next_ready_accepted_task, schedule_next_ready_accepted_task_with_host,
     ScheduledAcceptedTask,
 };
 
 mod solution_set;
 mod study_field_tensor;
-pub use study_field_tensor::{read_pinned_study_tensor_snapshot, verify_pinned_native_fem_snapshot};
+pub use study_field_tensor::{
+    read_pinned_study_tensor_snapshot, verify_pinned_native_fem_snapshot,
+};
 mod study_dataset;
 
 mod study;
 pub use study::{
     load_accepted_study_snapshot, load_accepted_worker_step, load_accepted_worker_step_for_start,
-    publish_accepted_task_prepare, publish_accepted_task_start, publish_study_outputs,
-    queue_accepted_study_task, validate_requested_execution, validate_study_task_completion,
-    AcceptedStudySnapshot, AcceptedWorkerStep, LoadedStudyObservationRuntime,
-    ObservationSourcePayload, QueuedAcceptedStudyTask, StudyOutputPayload,
-    ACCEPTED_TASK_AWAITING_DEPENDENCY_RESOLUTION, load_study_observation_runtime,
+    load_study_observation_runtime, publish_accepted_task_prepare, publish_accepted_task_start,
+    publish_study_outputs, queue_accepted_study_task, resolve_accepted_study_inputs,
+    validate_requested_execution, validate_study_task_completion, AcceptedStudySnapshot,
+    AcceptedWorkerStep, LoadedStudyObservationRuntime, ObservationSourcePayload,
+    QueuedAcceptedStudyTask, StudyOutputPayload, ACCEPTED_TASK_AWAITING_DEPENDENCY_RESOLUTION,
 };
 
 mod worker_inbox;
@@ -679,6 +728,7 @@ mod tests {
             heartbeat_at: now,
             heartbeat_sequence: 0,
             released_at: None,
+            host_launch_binding: None,
         };
         store.commit_resource_lease(&durable_lease).unwrap();
 

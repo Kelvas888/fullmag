@@ -47,6 +47,14 @@ kompatybilny z bootstrapem i klientami
 w migracji; nie jest dowodem ochrony wieloetapowej operacji. Szczegóły
 ograniczeń i usunięcia adaptera: ADR 0011, uzupełnienie P3a z 22.09.2026.
 
+Pierwsza zaakceptowana publikacja sesji przez wewnętrzny publisher solvera
+również zwiększa licznik inkarnacji API (`current_live_session_epoch`), nawet
+gdy sesja nie powstała przez komendę Create v2. Licznik jest publikowany pod
+blokadą transition razem z pierwszym snapshotem. Kolejne klatki tej samej
+sesji nie zwiększają licznika; odrzucona pierwsza klatka ani wyczerpanie
+licznika nie publikują sesji. Nie zmienia to naukowego `session_epoch`
+zapisanego w metadanych sesji ani kształtu zasobów OpenAPI.
+
 WebSocket nie przenosi scope w URL. Pierwszy `hello.payload.request_scope_epoch`
 jest wymagany i odpowiada inkarnacji przechwyconej przy upgrade. Klient ze
 znanym statusem nie przetwarza kolejnych zdarzeń przed zgodnym `hello`; przy
@@ -71,6 +79,49 @@ The API is organized by platform concepts, not by frontend screens:
 | `diagnostics` | GPU/CPU telemetry, engine logs, and revisioned solver/publisher performance diagnostics |
 
 The default frontend base path is `/v2/sessions/current`.
+
+### Status kompilacji backendu developerskiego (P8-53)
+
+Transport kontrolowanego zastosowania wersji obejmuje
+`POST /v2/platform/development-restart-requests` i
+`GET /v2/platform/development-restart-requests/{request_id}`. Jest domyślnie
+niedostępny, dopóki launcher nie podłączy pełnego koordynatora. POST wymaga
+bieżącego `x-fullmag-api-instance`, dokładnego Origin lokalnego UI i
+`Authorization: Bearer <token>`; token statusu powstaje przed żądaniem.
+Storage zapisuje tylko jego hash. Strict request przenosi osobno `editor`,
+`workspace` i `project_document`, wymagane nullable `session_id` i epoch;
+autorytatywną scenę pobiera prywatny owner. Limit zakodowanego request/result
+wynosi 32 MiB. Żądanie nie zawiera ścieżek hosta ani parametrów procesów.
+
+Token-bound GET działa bez starego pina HTTP, aby odczyt był możliwy po
+wymianie API; podanie niezgodnego pina nadal powoduje zwykłą odmowę.
+Zasób ma stany `pending`, `ready`, `failed`, `unknown` i `Cache-Control:
+no-store`. Dopiero `ready` zawiera świeży UUID API i dane odtworzenia UI.
+Nowy klient i scope cache powstają wyłącznie po sprawdzonym handoffie.
+Sam ACK 202, zapis requestu ani stan kompilacji nie oznaczają restartu.
+
+`GET /v2/platform/development-backend` obserwuje prywatny status natywnego
+watchera. Konfiguracja jest przechwytywana raz przy starcie API z launchera
+Windows dev. Bez niej zasób zwraca `disabled`; częściowa lub błędna konfiguracja
+zwraca `unknown`. Release nie uzyskuje konfiguracji dev.
+
+Zasób zawiera `schema_version`, `configured`, `revision`, `state`,
+`current_build`, `ready_build`, `restart_available` i zamknięty kod `reason`.
+Tożsamości buildów obejmują `id` i `source_sha256`: bieżący identyfikator to
+wersja zapieczętowanego procesu, gotowy to SHA256 zweryfikowanego manifestu.
+Nie są identyfikatorami sesji ani dowodem kwalifikacji solvera.
+
+Status prywatny musi mieć zgodny worktree i generację launchera, poprawny
+schemat oraz heartbeat młodszy niż 10 sekund. Brak, niezgodność, zbyt duży
+plik, niebezpieczna ścieżka lub stary heartbeat nie stają się `ready`.
+Heartbeat odświeża obserwację co około 2 sekundy również podczas kompilacji;
+sam nie zmienia publicznej rewizji ani ETag. GET wspiera `If-None-Match`/304.
+
+Publiczny zasób nie zawiera ścieżek hosta, generacji procesu, PID ani modelu.
+`ready` oznacza tylko ukończoną kompilację. Do integracji komendy handoffu
+`restart_available=false` oraz `reason=restart_integration_pending` przy
+gotowym buildzie. Ten odczyt nie wywołuje restartu, zapisu projektu ani
+przerwania symulacji. Kontrakt docelowego restartu określa ADR 0050.
 
 Jawne operacje `POST /v2/persistence/projects/{project_id}/runs` i
 `POST /v2/persistence/projects/{project_id}/runs/{run_id}/materialization`
@@ -272,6 +323,38 @@ An unknown schema remains read-only and is returned byte-for-byte. These
 endpoints are not runtime-session import or restore aliases; durable Save,
 host file selection, and the UI document lifecycle remain separate follow-up
 work.
+
+`POST /v2/persistence/projects/from-script` tworzy projekt ze skryptu Python i
+WYKONUJE ten skrypt w pomocniku Pythona (ten sam model zaufania co uruchomienie
+skryptu), dlatego żądanie musi zawierać `consent.executed_by_user: true`
+(inaczej 400 `consent_required`, bez uruchomienia). Treść `source.text` ma co
+najwyżej 1 MiB UTF-8 (413 `script_too_large`); `script_item_id` jest odrzucane
+(400 `script_item_unsupported`). Skrypt trafia do prywatnego katalogu w
+`current_workspace_root`, jest eksportowany przez `export-scene-document`
+(limit 30 s) i katalog jest usuwany. Błąd eksportu to 422
+(`script_export_failed`, `script_export_timeout`, `script_export_too_large`)
+z komunikatem pomocnika; nic nie jest zachowane. Sukces (201) zwraca kształt
+`ProjectDocumentResource` oraz `script_import { name, sha256, origin,
+exported_at, script_path, fidelity }`; archiwum zawiera wyeksportowany
+`scene.v2`, oryginalny skrypt jako opaque `project/source/script.py`,
+`project/source/script.json` i `project/provenance.json` (wpis historii
+`import`). `fidelity.round_trip` (`verified`, `failed`, `not_checked`) wynika z
+porównania ProblemIR oryginału z ProblemIR sceny wyrenderowanej z powrotem do
+Pythona (geometria, materiały, komórka FDM, dynamika i etapy badania);
+`verified` nie oznacza, że scena jest skryptem. Aktualizacja authoring, open i
+save nie zmieniają osadzonego skryptu. Odpowiedź ma `memory_only` durability.
+
+`POST /v2/persistence/projects/authoring` aktualizuje dostarczone archiwum
+przez ten sam use case dokumentu. Wymaga oczekiwanego ProjectId i rewizji oraz
+pełnego `scene.v2`; konflikt i read-only dają odmowę. Zapisuje surową scenę
+po walidacji typowanej, zachowuje dodatkowe pola i istniejące assets, generuje
+kanoniczny Python kompletnej sceny bez wykonania źródła użytkownika ani Compute
+i zachowuje poprzednie źródło jako
+opaque history. Zmiana zwiększa rewizję raz; identyczna scena i źródło są no-op.
+Odpowiedź nadal ma `memory_only` durability. Operacja nie wybiera sesji,
+nie importuje nowych plików hosta i nie uruchamia przygotowania ani Compute.
+Niekompletny szkic pozostaje zapisywalny z brakiem bieżącego źródła; stary
+Python zostaje w historii. Eksport Python szkicu wymaga odrębnej bramki.
 
 The durable run read model is `GET
 /v2/persistence/projects/{project_id}/runs/{run_id}`. It reads the accepted
@@ -1192,3 +1275,24 @@ FMMT jest projekcją MeshIR, bez pełnej semantyki periodic pairs. Nie wolno
 oraz `representation_evidence=not_verified` pozostają jawne. Kontrakt,
 ograniczenia cold decode i wymagane dalsze bramki opisuje
 [ADR 0041](../adr/0041-saved-field-geometry-root.md#transport-przypiętej-geometrii).
+
+### Trwały skalar SolutionSet
+
+`GET /v2/persistence/projects/{project_id}/runs/{run_id}/solution-sets/{solution_set_id}/revisions/{revision}/members/{member_id}/artifacts/{artifact_id}/scalar`
+zwraca `SolutionScalarResource` (`fullmag.analysis.solution_scalar.v1`).
+Projekt jest sprawdzany przez niezmienny RunSpec; run, rewizja, member i
+artefakt przez zapisany SolutionSet. Odczyt akceptuje wyłącznie Table o
+schemacie artefaktu `fullmag.study.scalar_json@v1` (payload `study_scalar.v1`), kontroluje CAS SHA-256, dokładną długość i
+limit 64 KiB przed dekodowaniem. Kanoniczny dekoder aplikacji zachowuje
+quantity_id, unit, value_si, step i time_s; step oraz revision są decimal
+u64 strings. Aktywna sesja nie jest źródłem tego odczytu.
+
+Odpowiedź zachowuje osobno stany wykonania i oceny naukowe SolutionSet
+oraz member, provenance i oryginalny accepted_state. Poprawny hash nie
+ustanawia akceptowanego stanu ani kwalifikacji naukowej. Brak właściciela
+lub artefaktu daje 404, obcy projekt/run lub inny rodzaj/schema 409,
+uszkodzony CAS albo niepoprawny scalar 500.
+
+Status implementacji: backend source i rejestracja OpenAPI. Managed export,
+generated transport, facade/hook i UI pozostają NOT VERIFIED; nie edytujemy
+ręcznie wygenerowanego kontraktu przed odbiorem buildu.
