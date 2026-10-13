@@ -1,5 +1,13 @@
 # Status realizacji całego planu refaktoryzacji
 
+Kontynuacja P8-53: [53BH — szkic materiału po odświeżeniu](p8/53bh-inspector-first-edit-after-resource-refresh.md).
+Realny browser potwierdził odmowę restartu przy szkicu nazwy i jawny Apply
+(rewizja 1→2), następnie odtworzył błąd pierwszej edycji materiału:
+zmiana alpha wyczyściła nietknięte pola. Próba diagnostyczna została jawnie
+anulowana, wszystkie 19 procesów odebrane; nie jest to PASS restartu.
+Poprawka źródeł, 20 interpretowanych przypadków i production typecheck PASS;
+ponowny browser proof w toku. Procenty planu bez zmiany.
+
 Najnowszy checkpoint 13.10.2026: **P8-53BE CLOSED — pierwsza bramka FDM CPU**.
 Build K completed exit 0, frozen-native API gate 296 kontroli PASS,
 OpenAPI/client generation i import checks PASS. Browser F→K
