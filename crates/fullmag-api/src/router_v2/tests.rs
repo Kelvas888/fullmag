@@ -14543,7 +14543,7 @@ async fn response_magnetic_sweep_v1_endpoint_returns_artifact_json() {
     )
     .expect("response sweep artifact should be written");
 
-    let response = app
+    let response = app.clone()
         .oneshot(
             Request::builder()
                 .uri("/v2/sessions/current/analysis/frequency-response/magnetic-sweep.v1")
@@ -14557,6 +14557,50 @@ async fn response_magnetic_sweep_v1_endpoint_returns_artifact_json() {
     let json = body_json(response).await;
     assert_eq!(json["schema_version"], "magnetic_response_sweep.v1");
     assert_eq!(json["frequencies_hz"][0], 1.0e9);
+
+    let catalog_response = app.clone().oneshot(
+        Request::builder()
+            .uri("/v2/sessions/current/analysis/results/runs/run:current/datasets")
+            .body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(catalog_response.status(), StatusCode::OK);
+    let catalog = body_json(catalog_response).await;
+    assert_eq!(catalog["total_count"], 1);
+    assert_eq!(catalog["items"][0]["product_kind"], "driven_response");
+    let dataset_id = catalog["items"][0]["dataset_id"].as_str().unwrap();
+    let manifest_response = app.clone().oneshot(
+        Request::builder()
+            .uri(format!("/v2/sessions/current/analysis/results/runs/run:current/datasets/{dataset_id}"))
+            .body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(manifest_response.status(), StatusCode::OK);
+    let manifest = body_json(manifest_response).await;
+    assert_eq!(manifest["source_artifacts"][0]["artifact"], "response/magnetic_response_sweep.v1.json");
+
+    // Both legal versions present: the preferred v2 owns dataset provenance.
+    let mut preferred: serde_json::Value = serde_json::from_slice(
+        &fs::read(response_dir.join("magnetic_response_sweep.v1.json")).unwrap(),
+    ).unwrap();
+    preferred["schema_version"] = serde_json::json!("magnetic_response_sweep.v2");
+    fs::write(response_dir.join("magnetic_response_sweep.v2.json"),
+        serde_json::to_vec(&preferred).unwrap()).unwrap();
+    let preferred_response = app.clone().oneshot(
+        Request::builder()
+            .uri(format!("/v2/sessions/current/analysis/results/runs/run:current/datasets/{dataset_id}"))
+            .body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(preferred_response.status(), StatusCode::OK);
+    let preferred_manifest = body_json(preferred_response).await;
+    assert_eq!(preferred_manifest["source_artifacts"][0]["artifact"], "response/magnetic_response_sweep.v2.json");
+
+    // Corrupt preferred bytes must fail closed rather than expose stale v1.
+    fs::write(response_dir.join("magnetic_response_sweep.v2.json"), b"{").unwrap();
+    let invalid_response = app.oneshot(
+        Request::builder()
+            .uri("/v2/sessions/current/analysis/results/runs/run:current/datasets")
+            .body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(invalid_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
     let _ = fs::remove_dir_all(&artifact_dir);
 }

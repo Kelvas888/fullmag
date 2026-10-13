@@ -1245,13 +1245,23 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
         )?);
     }
 
-    if let Some((value, digest)) = read_result_artifact_snapshot_in_generation(
+    // Prefer v2, but preserve the legal v1 publisher when v2 is absent.
+    // A present malformed v2 remains an error, never a reason to use stale v1.
+    let response_snapshot = match read_result_artifact_snapshot_in_generation(
         &artifact_dir,
         "response/magnetic_response_sweep.v2.json",
         generation.as_ref(),
     )? {
+        Some((value, digest)) => Some(("response/magnetic_response_sweep.v2.json", value, digest)),
+        None => read_result_artifact_snapshot_in_generation(
+            &artifact_dir,
+            "response/magnetic_response_sweep.v1.json",
+            generation.as_ref(),
+        )?.map(|(value, digest)| ("response/magnetic_response_sweep.v1.json", value, digest)),
+    };
+    if let Some((source_artifact, value, digest)) = response_snapshot {
         let payload = match decode_frequency_domain_artifact_payload(
-            "response/magnetic_response_sweep.v2.json",
+            source_artifact,
             value,
         )? {
             FrequencyDomainJsonArtifactPayload::ResponseSweep(payload) => payload,
@@ -1266,6 +1276,7 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
             digest,
             &run_id,
             default_stage_id.as_str(),
+            source_artifact,
         )?);
     }
 
@@ -2013,6 +2024,7 @@ fn build_response_index(
     source_digest: String,
     run_id: &str,
     stage_id: &str,
+    source_artifact: &str,
 ) -> Result<ResultDatasetIndex, ApiError> {
     let dataset_id = format!("result:{run_id}:{stage_id}:driven-response");
     let source_revision = source_digest.clone();
@@ -2086,7 +2098,7 @@ fn build_response_index(
         None,
     );
     let source_artifacts = vec![AnalysisResultSourceArtifactRef {
-        artifact: "response/magnetic_response_sweep.v2.json".to_string(),
+        artifact: source_artifact.to_string(),
         revision: source_digest,
         relation: "adapter_source".to_string(),
     }];

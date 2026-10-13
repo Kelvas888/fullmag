@@ -183,6 +183,9 @@ jobs:
           cargo test -p fullmag-plan eigen_output_validation_tests --lib
           cargo test -p fullmag-plan eigen_spectrum_quantity_validation_tests --lib
 
+      - name: Run response sweep legacy Results catalog contracts
+        run: cargo test -p fullmag-api response_magnetic_sweep_v1_endpoint_returns_artifact_json
+
       - name: Run modal solver policy planning contracts
         run: |
           cargo test -p fullmag-plan fem_eigen_modal_solver_policy --lib
