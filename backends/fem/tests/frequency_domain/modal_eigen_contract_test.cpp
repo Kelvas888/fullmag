@@ -8408,41 +8408,19 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
     if (count_certificate_only) {
         initialize_native_count_fixture(fixture);
         verify_native_count_fixture_composed_operator(fixture);
-    }
-
-    // The shared-domain production path consumes the full magnetic A_qq
-    // block from the immutable payload and does not materialize K/G through
-    // the legacy dense request fields. The default compact fixture retains
-    // its historical bounded diagonal carrier; the count case leaves the
-    // legacy CSR empty and consumes the native FIELD/DEMAG owner.
-    CsrOwned magnetic_stiffness{};
-    if (!count_certificate_only) {
-        // Keep a positive synthetic total A_qq in the minimal payload so the
-    // shared-domain sparse Floquet pencil has a spectrum. The descriptor
-    // advertises its supplied collinear static field but no Ku/anisotropy
-    // term; the production owner separately assembles geometric tangent mass
-    // from this mesh and its periodic classes.
-    magnetic_stiffness.rows = 10u;
-        magnetic_stiffness.columns = 10u;
-        magnetic_stiffness.row_offsets.push_back(0u);
-        for (std::uint32_t row = 0u; row < 10u; ++row) {
-            magnetic_stiffness.column_indices.push_back(row);
-            magnetic_stiffness.values.push_back(1.0);
-            magnetic_stiffness.row_offsets.push_back(
-                static_cast<std::uint32_t>(magnetic_stiffness.values.size()));
-        }
-        fixture.payload.magnetic_a_qq_csr = magnetic_stiffness.view();
-    }
-
-    // These private probes use the admissible FIELD descriptor. A successful
-    // pattern solve publishes its cached observer without requiring a failure.
-    if (fault_quarantine_only || borrowed_pmat_row_restore_fault_only ||
-        borrowed_pmat_primary_cleanup_fault_only || pattern_mismatch_fixture_only) {
+    } else {
+        // The compact fixture supplies a collinear static effective field.
+        // Advertise that existing term so native A_qq assembly receives a
+        // complete descriptor instead of the initializer's empty term mask.
         fixture.descriptor.term_presence_mask =
             FULLMAG_FEM_MODAL_LINEARIZATION_TERM_FIELD;
         fixture.descriptor.field_term_digest =
             fixture.descriptor.linearization_state_digest;
     }
+
+    // The shared-domain production path assembles native A_qq from this
+    // descriptor; it does not consume a caller CSR carrier or dense K/G.
+    // Count-certificate cases instead bind the native FIELD/DEMAG terms.
 
     FullmagFemModalEigenRequest request =
         make_floquet_contour_request(fixture, nullptr, nullptr);
