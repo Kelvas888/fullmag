@@ -1,5 +1,13 @@
 # P8-53 — bezpieczne zastosowanie nowego backendu w workspace
 
+[P8-53BI](53bi-project-save-before-restart.md), 13.10.2026:
+Save Project w Chrome z czystym Inspectorem → restart → restore **CLOSED**.
+Rzeczywisty plik ZIP/CRC i skrypt potwierdzone; hash pobranego archiwum
+zgodny z dokumentem przed i po restarcie. Receipt
+`8ea73f1c32b1424a90a4d69906d5c665`, exit 0, dziewięć kontroli PASS,
+Grid i Compute normalnie zakończone, 26 procesów odebrane.
+Zapis desktop i Save/Cancel niezastosowanych szkiców pozostają otwarte.
+
 [P8-53BH](53bh-inspector-first-edit-after-resource-refresh.md), 13.10.2026:
 pierwsza edycja materiału po odświeżeniu, guard szkicu, Apply i restart/restore
 **CLOSED w opisanym zakresie**. Receipt `0349fe166bc24239b39ecf5260ad3fc5`:
