@@ -8,7 +8,7 @@ import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus"
 import { useStageExecutionResource } from "@/kernel/resources/studyRuntimeResources";
 import { antennaInspectionDisplayMatchesOwner, useAntennaFieldSolutionResource, useAntennaStageOutputCatalogResource, useAntennaExternalLeadInspectionResource, useAntennaInspectionDisplayResource } from "@/kernel/resources/antennaResources";
 import { useObjectVisualizationController, useObjectVisualizationSelector } from "@/kernel/visualization/useObjectVisualization";
-import { antennaFieldDisplayLabel, antennaInspectionIntentMatchesOwner, type AntennaFieldIntent, type AntennaFieldQuantity } from "@/kernel/visualization/antennaFieldIntent";
+import { antennaFieldDisplayLabel, type AntennaFieldIntent, type AntennaFieldQuantity } from "@/kernel/visualization/antennaFieldIntent";
 import { antennaStageValidationMessages } from "@/shared/domain/physics/antennaStageValidation";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/Select";
 
@@ -22,7 +22,8 @@ import { VisualizationInspectorOverview } from "../ObjectVisualizationOverview";
 import { AntennaFieldBasisPreview } from "./AntennaFieldBasisPreview";
 import { ANTENNA_BASIS_QUANTITIES, type AntennaBasisQuantity } from "./AntennaFieldBasisPreviewModel";
 import { antennaFieldSolutionIdentityStatus, resolveAntennaRuntimeIds } from "./AntennaCompositionRuntime";
-import { ANTENNA_RAW_QUANTITIES, antennaInspectionHasCurrent, antennaVisualizationQuantity } from "./AntennaVisualizationQuantity";
+import { ANTENNA_RAW_QUANTITIES } from "./AntennaVisualizationQuantity";
+import { antennaVisualizationPresentation, resolveAntennaVisualizationSelection } from "./AntennaVisualizationModel";
 import { inspectionMatchesRuntimeStage, inspectionSelectionMatchesContext, resolveInspectionRuntimeStage, type InspectionRuntimeSelection } from "./AntennaExternalLeadInspectionModel";
 
 type SceneRead = ReturnType<typeof useSceneResource>;
@@ -83,21 +84,9 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
     inspectionMatchesRuntimeStage(raw, stageId ?? "", mapping, owner) && raw.outputs.length === 1 && raw.outputs[0].inspection_ref.content_digest === raw.manifest.content_digest;
   const rawDisplay = useAntennaInspectionDisplayResource(rawOwnerMatches ? raw : null);
   const rawAvailable = Boolean(rawOwnerMatches && raw && rawDisplay.status === "ready" && !rawDisplay.refreshError && rawDisplay.data && antennaInspectionDisplayMatchesOwner(raw, rawDisplay.data));
-  const inspectionMode = displaySource === "inspection" || (!basisAvailable && rawAvailable);
-  const available = inspectionMode ? rawAvailable : basisAvailable;
-  const ports = inspectionMode ? raw ? [raw.port_mode_id] : [] : field.data?.bases.map((basis) => basis.port_mode_id) ?? [];
-  const matchingIntent = requested?.sourceObjectId === objectId && requested.stageId === stageId
-    && requested.sessionId === owner?.sessionId && requested.sessionEpoch === owner?.sessionEpoch
-    && requested.requestScopeEpoch === owner?.requestScopeEpoch && requested.kind === (inspectionMode ? "inspection" : "basis")
-    && requested.contentDigest === (inspectionMode ? raw?.manifest?.content_digest : field.data?.content_digest)
-    && requested.solutionId === (inspectionMode ? raw?.output_id : field.data?.solution_id)
-    && (!inspectionMode || (rawOwnerMatches && raw && antennaInspectionIntentMatchesOwner(requested, raw))) ? requested : null;
-  const port = ports.includes(preferredPort) ? preferredPort : matchingIntent && ports.includes(matchingIntent.portModeId) ? matchingIntent.portModeId : ports.length === 1 ? ports[0] : "";
-  const currentAvailable = rawAvailable && antennaInspectionHasCurrent(rawDisplay.data);
-  const effectiveQuantity = antennaVisualizationQuantity(matchingIntent?.quantity ?? quantity, inspectionMode, currentAvailable);
-  const current = effectiveQuantity === "current_density";
-  const surfaceAvailable = inspectionMode && (effectiveQuantity === "device_potential" || current) && rawAvailable && (rawDisplay.data?.device_cell_count ?? 0) > 0 && (rawDisplay.data?.device_node_count ?? 0) > 0;
-  const active = matchingIntent?.quantity === effectiveQuantity && matchingIntent.portModeId === port ? matchingIntent : null;
+  const { inspectionMode, available, ports, port, currentAvailable, effectiveQuantity, current, surfaceAvailable, active } =
+    resolveAntennaVisualizationSelection({ objectId, stageId, owner, basisAvailable, rawAvailable, rawOwnerMatches,
+      raw, field: field.data, display: rawDisplay.data, requested, quantity, preferredPort, displaySource });
   const setDisplay = (patch: Partial<AntennaFieldIntent>) => {
     const selectedPort = patch.portModeId ?? port;
     if (!available || !owner || !objectId || !stageId || !selectedPort || !ports.includes(selectedPort)) return;
@@ -116,17 +105,8 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
     });
   };
   const unavailableReason = rawDisplay.error?.message ?? (!stageId ? "No configured antenna solve stage" : validation.join("; ") || (identity === "ready" && !sourceMatches ? "source/transport mismatch" : identity === "ready" && !ownerMatches ? "session owner mismatch" : sceneStatus !== "ready" ? `scene ${sceneStatus}` : identity));
-  const quantitySpec = effectiveQuantity === "device_potential" || effectiveQuantity === "magnetic_field" || effectiveQuantity === "current_density" ? ANTENNA_RAW_QUANTITIES[effectiveQuantity] : ANTENNA_BASIS_QUANTITIES[effectiveQuantity];
-  const magnetic = effectiveQuantity === "magnetic_field_per_ampere" || effectiveQuantity === "magnetic_field";
-  const carrier = magnetic ? inspectionMode ? raw?.manifest?.sampling_carrier : field.data?.sample_carrier : null;
-  const carrierLabel = magnetic
-    ? carrier ? `${carrier.carrier_kind} · ${carrier.location} · ${carrier.domain.kind}` : "Published field sampling domain (not available)"
-    : current ? `Device Tet4 cell centers / cell-local vertex traces · ${objectId ?? "not selected"}` : `Conductor nodes · ${objectId ?? "not selected"}`;
-  const renderReason = surfaceAvailable
-    ? current ? "Raw J uses the actual retained device Tet4 mesh and accepted RT0 cell-local vertex traces. The surface interpolates the Cartesian vector before evaluating magnitude or a component; traces are never averaged into nodal J. Points and full-XYZ vector glyphs use cell centers. Full reads are limited to 100000 cells / 400000 local vertices / 64 MiB; invalid or oversized data are rejected, not decimated."
-      : "Raw V uses the actual retained device Tet4 mesh: outward exterior faces, vertex colors and boundary wireframe. No primitive geometry is recolored. Full reads are limited to 100000 nodes / 100000 cells / 64 MiB; invalid topology or oversized datasets are rejected, not decimated."
-    : "No compatible surface topology is published for this carrier. Points and vectors use the actual complete sample positions; the conductor primitive is never recolored. Full reads are limited to 100000 samples / 64 MiB; oversized or incompatible datasets are rejected, not decimated.";
-  const rangeHint = current ? "Magnitude: zero to the global sampled maximum over all cell centers and cell-local vertex traces. Components: full sampled extrema over the same data. One shared range for all display passes." : "Full finite nodal/sample dataset range. Surface vertex colors share the same range as the device points; no guessed carrier.";
+  const { quantitySpec, carrierLabel, renderReason, rangeHint } =
+    antennaVisualizationPresentation({ objectId, effectiveQuantity, inspectionMode, surfaceAvailable, current, raw, field: field.data });
   return <>
     <VisualizationInspectorOverview
       dataState={available ? "Published snapshot" : "Unavailable"}
