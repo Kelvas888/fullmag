@@ -609,7 +609,7 @@ describe("AntennaCompositionPanel runtime results", () => {
       expect(container.textContent).toContain("requires a mesh-exact ConservativeCurrentView");
       expect(container.textContent).toContain("Runtime resultauthoring invalid");
       expect(container.textContent).not.toContain("Published solutionsolution-1");
-      expect(container.textContent).not.toContain("Direct antenna field");
+      expect(container.textContent).not.toContain("Oersted field H/I");
       expect(findGroupBadge(container, "invalid · result pending")).toBeDefined();
     } finally {
       await act(async () => root.unmount());
@@ -1126,7 +1126,7 @@ describe("AntennaCompositionPanel runtime results", () => {
       expect(container.textContent).toContain("Port port-1 normalization1.0000e+0 A");
       expect(container.textContent).toContain("Port port-1 current certificatesha256:certificate");
       expect(container.textContent).toContain("Port port-1 magnetic basisA/m/A · 6 values");
-      expect(container.textContent).toContain("Direct antenna field");
+      expect(container.textContent).toContain("Oersted field H/I");
       expect(container.textContent).toContain("Sample 1 H/I");
       expect(container.textContent).toContain("1.000e+0");
       expect(findGroupBadge(container, "ready")).toBeDefined();
@@ -1136,7 +1136,7 @@ describe("AntennaCompositionPanel runtime results", () => {
       ));
       expect(container.textContent).toContain("Runtime resultidentity mismatch");
       expect(container.textContent).not.toContain("Published solutionsolution-1");
-      expect(container.textContent).not.toContain("Direct antenna field");
+      expect(container.textContent).not.toContain("Oersted field H/I");
       expect(container.textContent).not.toContain("Port port-1 measured current");
       expect(findGroupBadge(container, "stale result")).toBeDefined();
       mocks.fieldSolution.data = fieldSolutionFixture();

@@ -215,12 +215,38 @@ export class TestElement extends TestNode {
     else this.removeAttribute("inputMode");
   }
 
+  private optionSelected = false;
+
+  get selected(): boolean {
+    return this.optionSelected;
+  }
+
+  set selected(value: boolean) {
+    this.optionSelected = Boolean(value);
+    if (this.optionSelected && this.parentNode instanceof TestElement
+      && this.parentNode.tagName === "SELECT" && !this.parentNode.hasAttribute("multiple")) {
+      for (const option of this.parentNode.options) {
+        if (option !== this) option.optionSelected = false;
+      }
+    }
+  }
+
   get value(): string {
+    if (this.tagName === "OPTION") return this.getAttribute("value") ?? this.textContent;
+    if (this.tagName === "SELECT") return this.options.find((option) => option.selected)?.value ?? "";
     return this.controlValue;
   }
 
   set value(value: string) {
-    this.controlValue = String(value);
+    if (this.tagName === "SELECT") {
+      let matched = false;
+      for (const option of this.options) {
+        option.selected = !matched && option.value === String(value);
+        matched ||= option.selected;
+      }
+    } else {
+      this.controlValue = String(value);
+    }
   }
 
   get innerHTML(): string {

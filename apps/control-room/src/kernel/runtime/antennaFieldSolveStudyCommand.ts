@@ -65,7 +65,7 @@ export function antennaFieldSolveStudyStages(
     throw new Error("The study pipeline is malformed; refresh or repair it before adding a stage.");
   }
   const stages = Array.isArray(rawStages) ? rawStages as JsonObject[] : [];
-  const matches = stages.filter((stage) => stage.stage_id === definition.id);
+  const matches = source.kind === "flat" ? stages.filter((stage) => stage.stage_id === definition.id) : [];
   const action: JsonObject = {
     kind: "antenna_field_solve",
     entrypoint_kind: "flat_antenna_field_solve",
