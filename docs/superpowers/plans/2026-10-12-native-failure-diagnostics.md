@@ -68,3 +68,14 @@ Składnię i filtr potwierdzono w pinned [PETSc3.24.6 verboseinfo.c](https://raw
 Na ebda5536f95993d86b76ba29f7bf172c3a248cf2 logging jest aktywne: 8130 MatInfo lines, 1468 phase lines (failure replay duplikuje część logu). Pełna bramka nadal10/12. W live_setup scope full case45 i mixed case74 (poprzednio73) `MatLUFactorNumeric_SeqAIJ_Inode` raportuje1shift_nz try i actualamount1.49012e-08. Bezpośrednio przed nim FactorLU wykrywa1inode obejmujący4wiersze. Jest9shift events w całym logu, żaden we fresh_setup scope; część pozostałych pochodzi z innego testu64.
 
 To wspiera hipotezę różnicy actual factorization, ale nie dowodzi jeszcze zero shift fresh ani przyczyny różnicy metadata/ordering. Potrzebne potwierdzenie numeric fresh logging i właściwej pary faktorów; nie zmieniono acceptance, tolerancji czy PC. Raw receipt/log hashes i bounded phase events zapisano w evidence `floquet-factor-shift-observation-38290669920.json`. Scientific/rootcause nadal NOT VERIFIED.
+
+
+## G5: kontrolowane odzyskiwanie GMRES — 13.10.2026
+
+GHA38369881646: 12/14 native cases PASS; full/mixed nadal FAIL. First B/C action binding i pomiar verified: live LU residual około 7.5e-8 i 7.8e-8, fresh LU około machine epsilon. Nie zmieniono tolerancji, shiftu ani ordering.
+
+Implementacja dodaje publiczny owner PREONLY/PCSHELL zachowujący STSINVERT i wewnętrzny GMRES/PCLU. Ponowna próba wymaga rzeczywistego residualu, cached rejection tego samego cyklu, BREAKDOWN, postępu i pozostałego wspólnego budżetu iteracji. Finalne b-Ax musi spełnić oryginalny próg. Negative inner reason pozostaje odrębny od certyfikatu ownera.
+
+Profil CI obejmuje 14 dotychczasowych przypadków i 3 nowe regresje: mixed recovery, wyczerpany budżet oraz dokładną granicę progu/zero RHS. Stan: SOURCE IMPLEMENTED, NATIVE VERIFICATION PENDING. Nie kwalifikuje managed sweep, COMSOL A1, browser ani GPU.
+
+G0: GHA38372200187 PASS, sześć regresji receiptów nieudanego wykonania; nie zmienia głównego błędu ani statusu kwalifikacji. C03 zachowuje fail-closed publication bez immutable history.

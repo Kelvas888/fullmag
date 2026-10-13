@@ -4183,6 +4183,30 @@
       "path": "scripts/ci/parse_floquet_factor_matrix_snapshots.py",
       "symbol": "_action_probe_pair_report",
       "responsibility": "Exact invocation/attempt/callback pairing, unavailable and contradiction rejection"
+    },
+    {
+      "id": "source-g5-certified-recovery-factory",
+      "path": "backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp",
+      "symbol": "create_floquet_shifted_ksp_certified_recovery_shell",
+      "responsibility": "Owned inner KSP reference, public PCSHELL setup and checked creation"
+    },
+    {
+      "id": "source-g5-certified-recovery-apply",
+      "path": "backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp",
+      "symbol": "floquet_shifted_certified_recovery_shell_apply",
+      "responsibility": "Independent final certificate on original RHS with shared cumulative iteration budget"
+    },
+    {
+      "id": "source-g5-certified-recovery-destroy",
+      "path": "backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp",
+      "symbol": "destroy_floquet_shifted_ksp_certified_recovery_shell",
+      "responsibility": "Checked ownership teardown and quarantine with first-error preservation"
+    },
+    {
+      "id": "source-g5-certified-recovery-eligibility",
+      "path": "backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp",
+      "symbol": "floquet_cached_true_gate_rejected_current_candidate",
+      "responsibility": "Retry only for the same-cycle rejected true residual, never generic divergence"
     }
   ],
   "public_api": {

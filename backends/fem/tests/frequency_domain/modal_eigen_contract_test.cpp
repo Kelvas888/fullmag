@@ -21,6 +21,10 @@
 #include "cpu/mfem/runtime/mfem_mesh_builder.hpp"
 #include "fullmag_fem.h"
 
+#if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
+#include "cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -4270,9 +4274,69 @@ void modal_floquet_shared_domain_original_descriptor_certification_is_fail_close
 #endif
 }
 
-void modal_shared_domain_floquet_mixed_dense_real_split_contract()
+void modal_shared_domain_floquet_mixed_dense_real_split_contract(
+    bool require_certified_recovery = false)
 {
 #if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
+    double recovered_solve_count = 0.0;
+    const auto check_recovery_provenance = [&](
+        const FullmagFemFrequencyDomainResult &value) {
+        if (!require_certified_recovery) {
+            return;
+        }
+        constexpr const char *scope = "ksp_certified_recovery";
+        const char *recovery_json = value.diagnostics_json != nullptr
+            ? std::strstr(value.diagnostics_json, "\"ksp_certified_recovery\":{")
+            : nullptr;
+        const char *criterion_json = value.diagnostics_json != nullptr
+            ? std::strstr(value.diagnostics_json, "\"ksp_true_residual_criterion\":{")
+            : nullptr;
+        check(recovery_json != nullptr && criterion_json != nullptr,
+              "mixed recovery publishes separate owner and final-certificate objects");
+        check(contains(value.diagnostics_json,
+                       "\"schema_version\":\"floquet_shifted_ksp_certified_recovery.v1\"") &&
+                  contains(value.diagnostics_json,
+                           "\"transport_ksp_type\":\"preonly\",\"transport_pc_type\":\"shell\"") &&
+                  contains(value.diagnostics_json,
+                           "\"inner_ksp_type\":\"gmres\",\"inner_pc_type\":\"lu\"") &&
+                  contains(value.diagnostics_json,
+                           "\"certificate_source\":\"owner_recomputed_true_residual\"") &&
+                  contains(value.diagnostics_json,
+                           "\"iteration_budget_semantics\":\"cumulative_per_original_rhs\""),
+              "mixed 4-by-4 recovery distinguishes ST transport, inner engine and physical certificate");
+        const double solves = extract_json_number(
+            recovery_json, "\"solve_count\":", scope);
+        const double certificates = extract_json_number(
+            recovery_json, "\"certified_count\":", scope);
+        const double failed = extract_json_number(
+            recovery_json, "\"failed_count\":", scope);
+        const double maximum_ratio = extract_json_number(
+            criterion_json, "\"maximum_tolerance_ratio\":",
+            "ksp_true_residual_criterion");
+        const double maximum_iterations = extract_json_number(
+            recovery_json, "\"max_cumulative_iterations_per_solve\":", scope);
+        const double configured_budget = extract_json_number(
+            value.diagnostics_json, "\"ksp_max_iterations\":", "");
+        check(solves > 0.0 && certificates == solves && failed == 0.0 &&
+                  std::isfinite(maximum_ratio) && maximum_ratio <= 1.0 &&
+                  maximum_iterations > 0.0 && configured_budget > 0.0 &&
+                  maximum_iterations <= configured_budget,
+              "every completed mixed ST action passes the original true threshold within its cumulative iteration budget");
+        check(extract_json_number(criterion_json, "\"measured_count\":", scope) == solves &&
+                  extract_json_number(criterion_json, "\"violation_count\":", scope) == 0.0 &&
+                  extract_json_number(criterion_json, "\"unavailable_count\":", scope) == 0.0,
+              "the final returned-vector observer measures every certificate without counting failed inner attempts as violations");
+        const double recovered = extract_json_number(
+            recovery_json, "\"recovered_solve_count\":", scope);
+        if (recovered > 0.0) {
+            check(extract_json_number(recovery_json, "\"failed_inner_attempt_count\":", scope) > 0.0 &&
+                      extract_json_number(recovery_json, "\"last_failed_inner_reason\":", scope) ==
+                          static_cast<double>(KSP_DIVERGED_BREAKDOWN) &&
+                      extract_json_number(recovery_json, "\"last_failed_inner_iterations\":", scope) > 0.0,
+                  "successful recovery retains the real rejected BREAKDOWN reason and iteration count");
+        }
+        recovered_solve_count += recovered;
+    };
     FloquetContourSharedDomainFixture fixture{};
     fixture.initialize();
     fixture.descriptor.term_presence_mask =
@@ -4392,6 +4456,7 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract()
               contains(payload_only_result.result_json,
                        "\"floquet_descriptor_certified\":true"),
           payload_only_failure.c_str());
+    check_recovery_provenance(payload_only_result);
     fullmag_fem_frequency_domain_result_destroy(&payload_only_result);
 
     FullmagFemModalEigenRequest mixed_request =
@@ -4400,6 +4465,7 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract()
         fullmag_fem_modal_eigen_solve(&mixed_request);
     check(mixed_result.status == FULLMAG_FEM_FD_OK,
           "mixed shared-domain Floquet request solves using caller K/G/M and provider K_demag");
+    check_recovery_provenance(mixed_result);
     check(contains(
               mixed_result.diagnostics_json,
               "\"deduplication_inner_product\":\"mfem_tangent_mass\"") &&
@@ -4513,6 +4579,10 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract()
     check(g_progress_event_count == 0,
           "invalid legacy dense dimensions do not publish solve progress");
     fullmag_fem_frequency_domain_result_destroy(&legacy_dimension_result);
+    if (require_certified_recovery) {
+        check(recovered_solve_count > 0.0,
+              "the original mixed 4-by-4 fixture actually recovers at least one rejected happy breakdown");
+    }
 #else
     std::printf("SKIP: modal_shared_domain_floquet_mixed_dense_real_split_requires_mfem_slepc\n");
 #endif
@@ -9836,10 +9906,198 @@ void modal_poisson_iteration_policy_preserves_lane_defaults()
     std::printf("PASS: modal_poisson_iteration_policy_preserves_lane_defaults\n");
 }
 
+#if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
+struct AlgebraicCertifiedRecoveryFixture {
+    Mat operator_matrix = nullptr;
+    Mat preconditioner_matrix = nullptr;
+    KSP inner = nullptr;
+    KSP outer = nullptr;
+    Vec rhs = nullptr;
+    Vec solution = nullptr;
+    std::unique_ptr<fd::detail::FloquetShiftedKspTrueConvergenceContext> true_context{};
+    fd::detail::FloquetShiftedKspCertifiedRecoveryContext *owner = nullptr;
+};
+
+void initialize_algebraic_certified_recovery_fixture(
+    AlgebraicCertifiedRecoveryFixture &fixture, PetscInt budget)
+{
+    // Algebraic contract only: diagonal A is nonsingular, P=I is approximate,
+    // and b=(1,1,1,1) needs more than one GMRES direction. No physical fixture
+    // or production solver policy is changed by these local test settings.
+    check(MatCreateSeqAIJ(PETSC_COMM_SELF, 4, 4, 1, nullptr,
+                         &fixture.operator_matrix) == PETSC_SUCCESS &&
+              MatCreateSeqAIJ(PETSC_COMM_SELF, 4, 4, 1, nullptr,
+                             &fixture.preconditioner_matrix) == PETSC_SUCCESS,
+          "create the algebraic A and identity preconditioner matrices");
+    for (PetscInt row = 0; row < 4; ++row) {
+        check(MatSetValue(fixture.operator_matrix, row, row,
+                          static_cast<PetscScalar>(row + 1), INSERT_VALUES) == PETSC_SUCCESS &&
+                  MatSetValue(fixture.preconditioner_matrix, row, row,
+                              static_cast<PetscScalar>(1), INSERT_VALUES) == PETSC_SUCCESS,
+              "populate nonsingular diagonal A and identity P");
+    }
+    for (Mat matrix : {fixture.operator_matrix, fixture.preconditioner_matrix}) {
+        check(MatAssemblyBegin(matrix, MAT_FINAL_ASSEMBLY) == PETSC_SUCCESS &&
+                  MatAssemblyEnd(matrix, MAT_FINAL_ASSEMBLY) == PETSC_SUCCESS,
+              "assemble the algebraic matrices");
+    }
+    PC inner_pc = nullptr;
+    check(KSPCreate(PETSC_COMM_SELF, &fixture.inner) == PETSC_SUCCESS &&
+              KSPSetType(fixture.inner, KSPGMRES) == PETSC_SUCCESS &&
+              KSPSetOperators(fixture.inner, fixture.operator_matrix,
+                              fixture.preconditioner_matrix) == PETSC_SUCCESS &&
+              KSPSetPCSide(fixture.inner, PC_RIGHT) == PETSC_SUCCESS &&
+              KSPSetNormType(fixture.inner, KSP_NORM_UNPRECONDITIONED) == PETSC_SUCCESS &&
+              KSPGMRESSetRestart(fixture.inner, 4) == PETSC_SUCCESS &&
+              KSPGetPC(fixture.inner, &inner_pc) == PETSC_SUCCESS &&
+              PCSetType(inner_pc, PCLU) == PETSC_SUCCESS &&
+              KSPSetTolerances(fixture.inner, 1.0e-12, 0.0, PETSC_DEFAULT,
+                               budget) == PETSC_SUCCESS &&
+              KSPSetUp(fixture.inner) == PETSC_SUCCESS,
+          "configure the separate algebraic GMRES with the original bounded budget");
+    fd::detail::FloquetShiftedKspTrueConvergenceContext *raw_context = nullptr;
+    check(fd::detail::create_floquet_shifted_ksp_true_convergence_context(
+              fixture.inner, &raw_context) == PETSC_SUCCESS && raw_context != nullptr,
+          "create the real production true-convergence callback context");
+    fixture.true_context.reset(raw_context);
+    check(KSPSetConvergenceTest(
+              fixture.inner, fd::detail::floquet_shifted_true_convergence_test,
+              raw_context, fd::detail::destroy_floquet_shifted_ksp_true_convergence_context) == PETSC_SUCCESS,
+          "install the production true-residual gate on the inner engine");
+    PC outer_pc = nullptr;
+    check(KSPCreate(PETSC_COMM_SELF, &fixture.outer) == PETSC_SUCCESS &&
+              KSPSetType(fixture.outer, KSPPREONLY) == PETSC_SUCCESS &&
+              KSPSetNormType(fixture.outer, KSP_NORM_NONE) == PETSC_SUCCESS &&
+              KSPSetOperators(fixture.outer, fixture.operator_matrix,
+                              fixture.preconditioner_matrix) == PETSC_SUCCESS &&
+              KSPGetPC(fixture.outer, &outer_pc) == PETSC_SUCCESS &&
+              PCSetType(outer_pc, PCSHELL) == PETSC_SUCCESS &&
+              fd::detail::create_floquet_shifted_ksp_certified_recovery_shell(
+                  outer_pc, fixture.inner, raw_context, &fixture.owner) == PETSC_SUCCESS &&
+              KSPSetUp(fixture.outer) == PETSC_SUCCESS &&
+              VecCreateSeq(PETSC_COMM_SELF, 4, &fixture.rhs) == PETSC_SUCCESS &&
+              VecDuplicate(fixture.rhs, &fixture.solution) == PETSC_SUCCESS &&
+              VecSet(fixture.rhs, static_cast<PetscScalar>(1)) == PETSC_SUCCESS,
+          "configure the public PREONLY/PCSHELL transport and RHS");
+}
+
+void modal_certified_recovery_exhausted_budget_contract()
+{
+    std::lock_guard<std::mutex> lock(fullmag::fem::runtime::petsc_slepc_process_mutex());
+    check(PetscInitializeNoArguments() == PETSC_SUCCESS &&
+              PetscPushErrorHandler(PetscReturnErrorHandler, nullptr) == PETSC_SUCCESS,
+          "initialize the isolated algebraic budget process");
+    AlgebraicCertifiedRecoveryFixture fixture{};
+    initialize_algebraic_certified_recovery_fixture(fixture, 1);
+    const PetscErrorCode solve_error = KSPSolve(fixture.outer, fixture.rhs, fixture.solution);
+    // Cached values only after the failed outer call. This selector deliberately
+    // makes no claim about teardown of a partially unwound PETSc solve graph.
+    const auto *snapshot = fd::detail::floquet_shifted_ksp_certified_recovery_snapshot(fixture.owner);
+    check(solve_error == PETSC_ERR_NOT_CONVERGED && snapshot != nullptr &&
+              !snapshot->unsafe && !snapshot->last_certified &&
+              snapshot->certified_count == 0 && snapshot->failed_count == 1 &&
+              snapshot->original_max_iterations == 1 &&
+              snapshot->inner_attempt_count == 1 &&
+              snapshot->last_cumulative_iterations == 1 &&
+              snapshot->max_cumulative_iterations_per_solve == 1 &&
+              snapshot->recovery_attempt_count == 0 &&
+              snapshot->last_inner_reason_available &&
+              snapshot->last_inner_reason == KSP_DIVERGED_ITS &&
+              snapshot->threshold_available && snapshot->threshold == 2.0e-12 &&
+              snapshot->final_residual_available &&
+              snapshot->final_residual > snapshot->threshold,
+          "budget exhaustion cannot grant a certificate, retry, or increase the original iteration budget");
+    std::printf("PASS: algebraic_certified_recovery_budget scope=isolated_numerical_failure cleanup_certification=not_claimed\n");
+    std::fflush(stdout);
+    std::_Exit(0);
+}
+
+void modal_certified_recovery_exact_threshold_contract()
+{
+    std::lock_guard<std::mutex> lock(fullmag::fem::runtime::petsc_slepc_process_mutex());
+    check(PetscInitializeNoArguments() == PETSC_SUCCESS,
+          "initialize the isolated exact-threshold process");
+    AlgebraicCertifiedRecoveryFixture fixture{};
+    initialize_algebraic_certified_recovery_fixture(fixture, 8);
+    check(VecSet(fixture.rhs, static_cast<PetscScalar>(0)) == PETSC_SUCCESS &&
+              KSPSolve(fixture.outer, fixture.rhs, fixture.solution) == PETSC_SUCCESS,
+          "the public transport certifies an exact zero RHS and returned solution");
+    const auto *snapshot = fd::detail::floquet_shifted_ksp_certified_recovery_snapshot(fixture.owner);
+    PetscReal solution_norm = PETSC_INFINITY;
+    check(snapshot != nullptr && snapshot->last_certified &&
+              snapshot->threshold_available && snapshot->threshold == 0.0 &&
+              snapshot->final_residual_available && snapshot->final_residual == 0.0 &&
+              snapshot->inner_attempt_count == 0 &&
+              std::strcmp(snapshot->certificate_source, "zero_rhs_certificate") == 0 &&
+              VecNorm(fixture.solution, NORM_2, &solution_norm) == PETSC_SUCCESS &&
+              solution_norm == 0.0,
+          "zero-RHS certificate requires exact zero residual and performs no inner iteration");
+    PetscReal threshold = 0.0;
+    KSPConvergedReason reason = KSP_CONVERGED_RTOL;
+    check(fd::detail::apply_floquet_shifted_true_residual_gate(
+              1, 2.0, 2.0e-12, &reason, 1.0e-12, 0.0, 8, &threshold) == PETSC_SUCCESS &&
+              reason == KSP_CONVERGED_RTOL && threshold == 2.0e-12,
+          "the exact unchanged original-RHS threshold is accepted");
+    reason = KSP_CONVERGED_RTOL;
+    check(fd::detail::apply_floquet_shifted_true_residual_gate(
+              1, 2.0, std::nextafter(threshold, PETSC_INFINITY), &reason,
+              1.0e-12, 0.0, 8) == PETSC_SUCCESS && reason == KSP_CONVERGED_ITERATING,
+          "one representable residual above the unchanged threshold is rejected");
+    reason = KSP_CONVERGED_ATOL;
+    check(fd::detail::apply_floquet_shifted_true_residual_gate(
+              1, 0.0, std::numeric_limits<PetscReal>::min(), &reason,
+              1.0e-12, 0.0, 8) == PETSC_SUCCESS && reason == KSP_CONVERGED_ITERATING,
+          "a nonzero residual cannot pass the exact zero-RHS threshold");
+    check(KSPDestroy(&fixture.outer) == PETSC_SUCCESS &&
+              KSPDestroy(&fixture.inner) == PETSC_SUCCESS,
+          "destroy the successful transport and its retained inner engine once");
+    fixture.true_context.reset();
+    check(VecDestroy(&fixture.rhs) == PETSC_SUCCESS &&
+              VecDestroy(&fixture.solution) == PETSC_SUCCESS &&
+              MatDestroy(&fixture.operator_matrix) == PETSC_SUCCESS &&
+              MatDestroy(&fixture.preconditioner_matrix) == PETSC_SUCCESS &&
+              fullmag::fem::runtime::petsc_slepc_global_finalization_allowed_locked() &&
+              PetscFinalize() == PETSC_SUCCESS,
+          "release the safe isolated exact-threshold fixture");
+    std::printf("PASS: algebraic_certified_recovery_exact_threshold\n");
+}
+#endif
+
 } // namespace
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--floquet-certified-recovery-mixed") == 0) {
+#if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
+        modal_shared_domain_floquet_mixed_dense_real_split_contract(true);
+        std::printf("PASS: native_floquet_mixed_4x4_certified_recovery\n");
+        return 0;
+#else
+        std::fprintf(stderr, "FAIL: certified recovery requires MFEM and SLEPc\n");
+        return 3;
+#endif
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--floquet-certified-recovery-budget") == 0) {
+#if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
+        modal_certified_recovery_exhausted_budget_contract();
+        return 0;
+#else
+        std::fprintf(stderr, "FAIL: certified recovery requires MFEM and SLEPc\n");
+        return 3;
+#endif
+    }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--floquet-certified-recovery-exact-threshold") == 0) {
+#if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
+        modal_certified_recovery_exact_threshold_contract();
+        return 0;
+#else
+        std::fprintf(stderr, "FAIL: certified recovery requires MFEM and SLEPc\n");
+        return 3;
+#endif
+    }
     if (argc == 2 && std::strcmp(argv[1], "--poisson-iteration-policy") == 0) {
         modal_poisson_iteration_policy_preserves_lane_defaults();
         return 0;

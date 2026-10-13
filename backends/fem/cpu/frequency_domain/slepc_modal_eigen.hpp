@@ -787,6 +787,50 @@ struct FloquetSchurActionDiagnostic {
     double max_rhs_l2_norm = std::numeric_limits<double>::quiet_NaN();
 };
 
+// Public scalar provenance for the certified STSINVERT transport. The engine
+// fields below continue to describe the independently owned inner GMRES/PCLU.
+struct FloquetShiftedKspCertifiedRecoveryProvenance {
+    bool available = false;
+    const char *transport_ksp_type = "preonly";
+    const char *transport_pc_type = "shell";
+    const char *inner_ksp_type = "gmres";
+    const char *inner_pc_type = "lu";
+    const char *certificate_source = "unavailable";
+    int transport_pc_side = -1;
+    int transport_norm_type = -1;
+    bool transport_converged_reason_available = false;
+    int transport_converged_reason = 0;
+    std::uint64_t solve_count = 0;
+    std::uint64_t certified_count = 0;
+    std::uint64_t failed_count = 0;
+    std::uint64_t recovery_attempt_count = 0;
+    std::uint64_t recovered_solve_count = 0;
+    std::uint64_t inner_attempt_count = 0;
+    std::uint64_t failed_inner_attempt_count = 0;
+    std::uint64_t cumulative_iterations_total = 0;
+    std::int64_t last_cumulative_iterations = 0;
+    std::int64_t last_cycle_count = 0;
+    std::int64_t max_cumulative_iterations_per_solve = 0;
+    bool last_certified = false;
+    bool last_recovered = false;
+    bool last_inner_reason_available = false;
+    int last_inner_reason = 0;
+    bool last_failed_inner_reason_available = false;
+    int last_failed_inner_reason = 0;
+    std::int64_t last_failed_inner_iterations = 0;
+    bool final_residual_available = false;
+    double final_residual = std::numeric_limits<double>::quiet_NaN();
+    bool last_rhs_norm_available = false;
+    double last_rhs_norm = std::numeric_limits<double>::quiet_NaN();
+    bool threshold_available = false;
+    double threshold = std::numeric_limits<double>::quiet_NaN();
+    bool max_tolerance_ratio_available = false;
+    double max_tolerance_ratio = std::numeric_limits<double>::quiet_NaN();
+    int primary_error = 0;
+    int cleanup_error = 0;
+    bool unsafe = false;
+};
+
 struct SLEPcTinyGyrotropicModalEigenResult {
     bool ok = false;
     // Internal terminal-state marker. A quarantined PETSc graph must not be
@@ -858,6 +902,7 @@ struct SLEPcTinyGyrotropicModalEigenResult {
     int eps_first_attempt_unique_certified_mode_count = 0;
     bool eps_outer_iteration_budget_exhausted = false;
     FloquetShiftedKspFailureProbe shifted_ksp_failure_probe{};
+    FloquetShiftedKspCertifiedRecoveryProvenance shifted_ksp_certified_recovery{};
     bool eps_iteration_budget_available = false;
     bool eps_cumulative_iterations_available = false;
     bool eps_cancellation_observed = false;

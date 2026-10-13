@@ -3713,3 +3713,14 @@ pierwszy cached live/fresh action probe z tą samą parą, bez nowych solves
 lub zmian tolerance. Nie jest to jeszcze naprawa solvera ani kwalifikacja.
 Receipt SHA256: 4ce12388b137aa664d2a518ab30b5ff6c1abce979f93e08b7259e7282012e4fc.
 Log SHA256: 88fd278a3107a7fe031d6f6c2c4cb5eb6c7869f9da3fa4d31ab102af7a6c62cc.
+
+
+## G5: kontrolowane odzyskiwanie GMRES — 13.10.2026
+
+GHA38369881646: 12/14 native cases PASS; full/mixed nadal FAIL. First B/C action binding i pomiar verified: live LU residual około 7.5e-8 i 7.8e-8, fresh LU około machine epsilon. Nie zmieniono tolerancji, shiftu ani ordering.
+
+Implementacja dodaje publiczny owner PREONLY/PCSHELL zachowujący STSINVERT i wewnętrzny GMRES/PCLU. Ponowna próba wymaga rzeczywistego residualu, cached rejection tego samego cyklu, BREAKDOWN, postępu i pozostałego wspólnego budżetu iteracji. Finalne b-Ax musi spełnić oryginalny próg. Negative inner reason pozostaje odrębny od certyfikatu ownera.
+
+Profil CI obejmuje 14 dotychczasowych przypadków i 3 nowe regresje: mixed recovery, wyczerpany budżet oraz dokładną granicę progu/zero RHS. Stan: SOURCE IMPLEMENTED, NATIVE VERIFICATION PENDING. Nie kwalifikuje managed sweep, COMSOL A1, browser ani GPU.
+
+G0: GHA38372200187 PASS, sześć regresji receiptów nieudanego wykonania; nie zmienia głównego błędu ani statusu kwalifikacji. C03 zachowuje fail-closed publication bez immutable history.

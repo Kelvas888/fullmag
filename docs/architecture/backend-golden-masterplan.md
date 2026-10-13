@@ -1067,3 +1067,20 @@ wolno tworzyć nowych ownerów fizyki w `Context`, `mfem_bridge.cpp`,
 runnerowym `dispatch.rs` ani ogólnym `execute.rs`. Source presence,
 executability, validation i production qualification pozostają czterema
 oddzielnymi osiami dowodu.
+
+
+### CPU Floquet — właściciel certyfikowanego shifted solve (G5)
+
+Odzyskanie po odrzuconym happy breakdown jest częścią natywnego workflow
+FEM CPU w `backends/fem/cpu/frequency_domain/modal`, a nie runnera lub UI.
+Kontrakt zapisano w `0831-fem-dynamic-pencil-modal-response-and-krylov.md`.
+Transport STSINVERT/PREONLY/PCSHELL i wewnętrzny GMRES/PCLU mają osobne
+provenance. Inner solver może być przybliżony lub zakończyć cykl BREAKDOWN;
+cały owner zwraca sukces tylko po niezależnym true-residual check i zachowaniu
+łącznego requested iteration budget. Nie ma cichego wyboru innego backendu,
+poluzowania tolerancji ani pominięcia dynamic demag.
+
+Implementacja i hosted dowody tego recovery są w toku; capability pozostaje
+source_visible / unvalidated. Solver-ownership nie zmienia publicznego
+Python/ProblemIR ani fizycznych definicji residualów. Pierwotne full/mixed,
+fault/quarantine i backing-byte guards pozostają obowiązkową bramką.

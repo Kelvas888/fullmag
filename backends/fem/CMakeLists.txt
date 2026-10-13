@@ -1152,6 +1152,26 @@ if(FULLMAG_USE_MFEM_STACK AND FULLMAG_FEM_WITH_SLEPC)
     target_link_libraries(fem_shifted_ksp_true_convergence_contract PRIVATE
         PETSC::petsc MPI::MPI_CXX
     )
+    # The isolated certified-recovery selectors use the real public PETSc API;
+    # preserve the original full and mixed selectors as independent gates.
+    target_link_libraries(fem_modal_eigen_contract PRIVATE PETSC::petsc MPI::MPI_CXX)
+    add_custom_target(fem_modal_eigen_certified_recovery_mixed_contract
+        DEPENDS fem_modal_eigen_contract)
+    add_test(NAME fem_modal_eigen_certified_recovery_mixed_contract
+        COMMAND fem_modal_eigen_contract --floquet-certified-recovery-mixed)
+    add_custom_target(fem_modal_eigen_certified_recovery_budget_contract
+        DEPENDS fem_modal_eigen_contract)
+    add_test(NAME fem_modal_eigen_certified_recovery_budget_contract
+        COMMAND fem_modal_eigen_contract --floquet-certified-recovery-budget)
+    add_custom_target(fem_modal_eigen_certified_recovery_exact_threshold_contract
+        DEPENDS fem_modal_eigen_contract)
+    add_test(NAME fem_modal_eigen_certified_recovery_exact_threshold_contract
+        COMMAND fem_modal_eigen_contract --floquet-certified-recovery-exact-threshold)
+    set_tests_properties(
+        fem_modal_eigen_certified_recovery_mixed_contract
+        fem_modal_eigen_certified_recovery_budget_contract
+        fem_modal_eigen_certified_recovery_exact_threshold_contract
+        PROPERTIES TIMEOUT 120)
     target_include_directories(fem_shifted_ksp_true_convergence_contract PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/cpu/frequency_domain/modal
     )

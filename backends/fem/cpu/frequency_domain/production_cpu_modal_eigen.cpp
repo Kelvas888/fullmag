@@ -871,6 +871,57 @@ std::string candidate_operator_diagnostic_json(
         std::to_string(diagnostic.last_error_code) + "}";
 }
 
+std::string floquet_certified_recovery_json(
+    const FloquetShiftedKspCertifiedRecoveryProvenance &value)
+{
+    const auto boolean = [](bool field) { return field ? "true" : "false"; };
+    return std::string("{\"schema_version\":\"floquet_shifted_ksp_certified_recovery.v1\",") +
+        "\"available\":" + boolean(value.available) +
+        ",\"transport_ksp_type\":\"" + value.transport_ksp_type +
+        "\",\"transport_pc_type\":\"" + value.transport_pc_type +
+        "\",\"transport_pc_side\":" + std::to_string(value.transport_pc_side) +
+        ",\"transport_norm_type\":" + std::to_string(value.transport_norm_type) +
+        ",\"transport_converged_reason\":" +
+        (value.transport_converged_reason_available
+            ? std::to_string(value.transport_converged_reason) : std::string("null")) +
+        ",\"inner_ksp_type\":\"" + value.inner_ksp_type +
+        "\",\"inner_pc_type\":\"" + value.inner_pc_type +
+        "\",\"certificate_source\":\"" + value.certificate_source +
+        "\",\"reference_norm\":\"original_rhs_norm\"," +
+        "\"iteration_budget_semantics\":\"cumulative_per_original_rhs\"," +
+        "\"solve_count\":" + std::to_string(value.solve_count) +
+        ",\"certified_count\":" + std::to_string(value.certified_count) +
+        ",\"failed_count\":" + std::to_string(value.failed_count) +
+        ",\"recovery_attempt_count\":" + std::to_string(value.recovery_attempt_count) +
+        ",\"recovered_solve_count\":" + std::to_string(value.recovered_solve_count) +
+        ",\"inner_attempt_count\":" + std::to_string(value.inner_attempt_count) +
+        ",\"failed_inner_attempt_count\":" + std::to_string(value.failed_inner_attempt_count) +
+        ",\"cumulative_iterations_total\":" + std::to_string(value.cumulative_iterations_total) +
+        ",\"last_cumulative_iterations\":" + std::to_string(value.last_cumulative_iterations) +
+        ",\"last_cycle_count\":" + std::to_string(value.last_cycle_count) +
+        ",\"max_cumulative_iterations_per_solve\":" + std::to_string(value.max_cumulative_iterations_per_solve) +
+        ",\"last_certified\":" + boolean(value.last_certified) +
+        ",\"last_recovered\":" + boolean(value.last_recovered) +
+        ",\"last_inner_reason\":" + (value.last_inner_reason_available
+            ? std::to_string(value.last_inner_reason) : std::string("null")) +
+        ",\"last_failed_inner_reason\":" + (value.last_failed_inner_reason_available
+            ? std::to_string(value.last_failed_inner_reason) : std::string("null")) +
+        ",\"last_failed_inner_iterations\":" + (value.last_failed_inner_reason_available
+            ? std::to_string(value.last_failed_inner_iterations) : std::string("null")) +
+        ",\"final_residual\":" + (value.final_residual_available
+            ? format_double(value.final_residual) : std::string("null")) +
+        ",\"original_rhs_norm\":" + (value.last_rhs_norm_available
+            ? format_double(value.last_rhs_norm) : std::string("null")) +
+        ",\"threshold\":" + (value.threshold_available
+            ? format_double(value.threshold) : std::string("null")) +
+        ",\"maximum_tolerance_ratio\":" + (value.max_tolerance_ratio_available
+            ? format_double(value.max_tolerance_ratio) : std::string("null")) +
+        ",\"maximum_tolerance_ratio_semantics\":\"all_inner_attempts\"," +
+        "\"primary_error\":" + std::to_string(value.primary_error) +
+        ",\"cleanup_error\":" + std::to_string(value.cleanup_error) +
+        ",\"unsafe\":" + boolean(value.unsafe) + "}";
+}
+
 // Serialize cached measurements only: a hard EPSSolve error can invalidate
 // the PETSc object graph, so publication must never query solver handles.
 std::string floquet_shifted_ksp_diagnostics_json_fields(
@@ -924,12 +975,17 @@ std::string floquet_shifted_ksp_diagnostics_json_fields(
         ",\"ksp_true_residual_criterion\":{"
         "\"schema_version\":\"floquet_shifted_ksp_true_residual_criterion.v1\","
         "\"reference_norm\":\"rhs_norm_zero_initial_guess\","
+        "\"solve_count_scope\":\"certified_outer_transport_actions\","
+        "\"configuration_source\":\"inner_gmres_original_policy\","
         "\"solve_count\":" + std::to_string(result.ksp_true_criterion_solve_count) +
         ",\"measured_count\":" + std::to_string(result.ksp_true_criterion_measured_count) +
         ",\"violation_count\":" + std::to_string(result.ksp_true_criterion_violation_count) +
         ",\"unavailable_count\":" + std::to_string(result.ksp_true_criterion_unavailable_count) +
         ",\"maximum_tolerance_ratio\":" + format_double(result.ksp_true_criterion_maximum_tolerance_ratio) +
-        "},\"ksp_last_iterations\":" +
+        "},\"ksp_certified_recovery\":" +
+        floquet_certified_recovery_json(result.shifted_ksp_certified_recovery) +
+        ",\"ksp_converged_reason_semantics\":\"inner_engine_reason\"," +
+        "\"ksp_last_iterations\":" +
         std::to_string(result.ksp_last_iterations) +
         ",\"ksp_last_true_residual_available\":" +
         std::string(result.ksp_last_true_residual_available

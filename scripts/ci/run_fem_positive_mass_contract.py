@@ -217,6 +217,36 @@ CONTRACT_PROFILES: dict[str, dict[str, Any]] = {
                     "-DFULLMAG_HAS_CUDA_RUNTIME=0",
                 ],
             },
+            {
+                "name": "fem_modal_eigen_certified_recovery_mixed_contract",
+                "source_suffix": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+                "marker": "PASS: native_floquet_mixed_4x4_certified_recovery",
+                "compile_definitions": [
+                    "-DFULLMAG_HAS_MFEM_STACK=1",
+                    "-DFULLMAG_FEM_WITH_SLEPC=1",
+                    "-DFULLMAG_HAS_CUDA_RUNTIME=0",
+                ],
+            },
+            {
+                "name": "fem_modal_eigen_certified_recovery_budget_contract",
+                "source_suffix": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+                "marker": "PASS: algebraic_certified_recovery_budget",
+                "compile_definitions": [
+                    "-DFULLMAG_HAS_MFEM_STACK=1",
+                    "-DFULLMAG_FEM_WITH_SLEPC=1",
+                    "-DFULLMAG_HAS_CUDA_RUNTIME=0",
+                ],
+            },
+            {
+                "name": "fem_modal_eigen_certified_recovery_exact_threshold_contract",
+                "source_suffix": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+                "marker": "PASS: algebraic_certified_recovery_exact_threshold",
+                "compile_definitions": [
+                    "-DFULLMAG_HAS_MFEM_STACK=1",
+                    "-DFULLMAG_FEM_WITH_SLEPC=1",
+                    "-DFULLMAG_HAS_CUDA_RUNTIME=0",
+                ],
+            },
         ],
         "uses_slepc": True,
         "timeout": {

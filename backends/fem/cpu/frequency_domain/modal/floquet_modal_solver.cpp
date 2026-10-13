@@ -27,6 +27,7 @@
 #include <petscksp.h>
 #include <slepceps.h>
 #include "cpu/frequency_domain/modal/shifted_ksp_true_convergence.hpp"
+#include "cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp"
 #endif
 
 namespace fullmag::fem::frequency_domain {
@@ -1456,6 +1457,8 @@ LivePcluShiftConfiguration query_live_pclu_shift_configuration(
     PC live_pc) noexcept;
 
 struct LastFloquetShiftedSolveSnapshot {
+    KSP inner_ksp = nullptr; // Borrowed from the certified recovery owner.
+    detail::FloquetShiftedKspCertifiedRecoveryContext *certified_recovery = nullptr;
     Mat shifted_operator = nullptr; // Owns one PETSc reference.
     Vec rhs = nullptr;
     Vec solution = nullptr;
@@ -1479,6 +1482,8 @@ struct LastFloquetShiftedSolveSnapshot {
     std::uint64_t criterion_violation_count = 0;
     std::uint64_t criterion_unavailable_count = 0;
     double criterion_maximum_tolerance_ratio = 0.0;
+    bool transport_reason_available = false;
+    int transport_reason = 0;
     PetscReal expected_rtol = 0.0;
     PetscReal expected_atol = 0.0;
 };
@@ -1489,6 +1494,12 @@ PetscErrorCode capture_last_floquet_shifted_solve(
     auto *snapshot = static_cast<LastFloquetShiftedSolveSnapshot *>(raw_snapshot);
     if (snapshot == nullptr) {
         return PETSC_ERR_ARG_NULL;
+    }
+    const auto *owner_state =
+        detail::floquet_shifted_ksp_certified_recovery_snapshot(
+            snapshot->certified_recovery);
+    if (owner_state != nullptr && owner_state->unsafe) {
+        return PETSC_ERR_ARG_WRONGSTATE;
     }
     ++snapshot->criterion_solve_count;
     snapshot->available = false;
@@ -1549,18 +1560,27 @@ PetscErrorCode capture_last_floquet_shifted_solve(
     PCSide actual_side = PC_SIDE_DEFAULT;
     KSPNormType actual_norm = KSP_NORM_DEFAULT;
     KSPConvergedReason reason = KSP_CONVERGED_ITERATING;
+    const auto *certificate =
+        detail::floquet_shifted_ksp_certified_recovery_snapshot(
+            snapshot->certified_recovery);
+    const bool certified_transport = certificate != nullptr;
+    KSP configuration_ksp = certified_transport ? snapshot->inner_ksp : ksp;
+    // Count only completed ST actions. Failed inner attempts and their negative
+    // reasons belong to recovery provenance, not the final returned certificate.
     const bool criterion_available = measured &&
+        configuration_ksp != nullptr &&
         KSPGetInitialGuessNonzero(ksp, &initial_guess_nonzero) == 0 &&
         initial_guess_nonzero == PETSC_FALSE &&
-        KSPGetTolerances(ksp, &actual_rtol, &actual_atol, nullptr, nullptr) == 0 &&
+        KSPGetTolerances(configuration_ksp, &actual_rtol, &actual_atol, nullptr, nullptr) == 0 &&
         std::isfinite(static_cast<double>(actual_rtol)) && actual_rtol > 0.0 &&
         std::isfinite(static_cast<double>(actual_atol)) && actual_atol >= 0.0 &&
         actual_rtol == snapshot->expected_rtol &&
         actual_atol == snapshot->expected_atol &&
-        KSPGetPCSide(ksp, &actual_side) == 0 && actual_side == PC_RIGHT &&
-        KSPGetNormType(ksp, &actual_norm) == 0 &&
+        KSPGetPCSide(configuration_ksp, &actual_side) == 0 && actual_side == PC_RIGHT &&
+        KSPGetNormType(configuration_ksp, &actual_norm) == 0 &&
         actual_norm == KSP_NORM_UNPRECONDITIONED &&
-        KSPGetConvergedReason(ksp, &reason) == 0;
+        KSPGetConvergedReason(ksp, &reason) == 0 &&
+        (!certified_transport || (certificate->last_certified && !certificate->unsafe));
     const double relative_threshold =
         static_cast<double>(actual_rtol) * static_cast<double>(rhs_norm);
     const double threshold = std::max(static_cast<double>(actual_atol),
@@ -1571,6 +1591,10 @@ PetscErrorCode capture_last_floquet_shifted_solve(
         return 0;
     }
     ++snapshot->criterion_measured_count;
+    if (certified_transport) {
+        snapshot->transport_reason_available = true;
+        snapshot->transport_reason = static_cast<int>(reason);
+    }
     if (reason <= 0 || static_cast<double>(residual_norm) > threshold) {
         ++snapshot->criterion_violation_count;
     }
@@ -7659,6 +7683,10 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
     LastFloquetShiftedSolveSnapshot last_shifted_solve{};
     std::unique_ptr<detail::FloquetShiftedKspTrueConvergenceContext>
         shifted_ksp_true_convergence_context{};
+    // Borrowed from the outer PCSHELL. Its retained inner reference keeps the
+    // configured GMRES, monitor and convergence callback alive after STSetKSP.
+    detail::FloquetShiftedKspCertifiedRecoveryContext *certified_recovery = nullptr;
+    KSP certified_transport_ksp = nullptr; // Owns the construction reference.
     bool shifted_ksp_true_convergence_test_registration_attempted = false;
     const auto quarantine_cleanup_failure = [&](const char *reason) noexcept {
         const bool primary_failure = result.status != nullptr &&
@@ -7714,6 +7742,16 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
                     : "floquet_eps_cleanup_failed");
             return false;
         }
+        if (certified_transport_ksp != nullptr) {
+            const PetscErrorCode transport_destroy_error =
+                KSPDestroy(&certified_transport_ksp);
+            if (transport_destroy_error != PETSC_SUCCESS ||
+                certified_transport_ksp != nullptr) {
+                quarantine_cleanup_failure("floquet_certified_transport_cleanup_failed");
+                return false;
+            }
+        }
+        certified_recovery = nullptr;
         if (shifted_ksp_true_convergence_context != nullptr) {
             if (!eps_cleanup_is_safe &&
                 shifted_ksp_true_convergence_test_registration_attempted) {
@@ -8096,6 +8134,9 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
         spectral_transform = nullptr;
         shifted_ksp = nullptr;
         shifted_pc = nullptr;
+        certified_recovery = nullptr;
+        certified_transport_ksp = nullptr;
+        result.shifted_ksp_certified_recovery = {};
         last_shifted_solve = {};
         last_shifted_solve.live_pclu_configuration_during_ksp_monitor.requested =
             candidate_diagnostic.requested;
@@ -8249,10 +8290,6 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
             PETSC_DEFAULT,
             PETSC_DEFAULT,
             requested_linear_iterations) != 0 ||
-        KSPSetPostSolve(
-            shifted_ksp,
-            capture_last_floquet_shifted_solve,
-            &last_shifted_solve) != 0 ||
         KSPSetErrorIfNotConverged(shifted_ksp, PETSC_TRUE) != 0 ||
         VecCreateSeq(PETSC_COMM_SELF, split_dimension, &xr) != 0 ||
         VecCreateSeq(PETSC_COMM_SELF, split_dimension, &xi) != 0) {
@@ -8499,6 +8536,117 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
             capture_floquet_shifted_ksp_progress,
             &last_shifted_solve,
             nullptr) == 0;
+    // EPSSetUp has materialized ST's shifted operator and configured the original
+    // GMRES/PCLU. STSetKSP does not transfer those operators or reset ST state,
+    // so explicitly seed the transport before replacing ST's retained KSP.
+    Mat certified_operator = nullptr;
+    Mat certified_pmat = nullptr;
+    PC certified_transport_pc = nullptr;
+    PetscErrorCode certified_setup_error =
+        KSPGetOperators(shifted_ksp, &certified_operator, &certified_pmat);
+    if (certified_setup_error == PETSC_SUCCESS &&
+        (certified_operator == nullptr || certified_pmat == nullptr)) {
+        certified_setup_error = PETSC_ERR_ARG_WRONGSTATE;
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        certified_setup_error = KSPCreate(PETSC_COMM_SELF, &certified_transport_ksp);
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        certified_setup_error = KSPSetType(certified_transport_ksp, KSPPREONLY);
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        certified_setup_error = KSPSetPCSide(certified_transport_ksp, PC_LEFT);
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        certified_setup_error = KSPSetNormType(certified_transport_ksp, KSP_NORM_NONE);
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        certified_setup_error = KSPGetPC(certified_transport_ksp, &certified_transport_pc);
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        certified_setup_error = PCSetType(certified_transport_pc, PCSHELL);
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        certified_setup_error = KSPSetOperators(
+            certified_transport_ksp, certified_operator, certified_pmat);
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        certified_setup_error =
+            detail::create_floquet_shifted_ksp_certified_recovery_shell(
+                certified_transport_pc, shifted_ksp,
+                shifted_ksp_true_convergence_context.get(), &certified_recovery);
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        last_shifted_solve.inner_ksp = shifted_ksp;
+        last_shifted_solve.certified_recovery = certified_recovery;
+        certified_setup_error = KSPSetPostSolve(
+            certified_transport_ksp, capture_last_floquet_shifted_solve,
+            &last_shifted_solve);
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        certified_setup_error = KSPSetErrorIfNotConverged(
+            certified_transport_ksp, PETSC_TRUE);
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        certified_setup_error = STSetKSP(spectral_transform, certified_transport_ksp);
+    }
+    if (certified_setup_error == PETSC_SUCCESS) {
+        certified_setup_error = KSPSetUp(certified_transport_ksp);
+    }
+    const auto *certified_setup_snapshot =
+        detail::floquet_shifted_ksp_certified_recovery_snapshot(certified_recovery);
+    if (certified_setup_error != PETSC_SUCCESS) {
+        result.status = "solve_error";
+        result.unsupported_reason = "floquet_certified_transport_setup_failed";
+        auto &failed_transport = result.shifted_ksp_certified_recovery;
+        failed_transport.available = certified_setup_snapshot != nullptr;
+        failed_transport.primary_error = static_cast<int>(certified_setup_error);
+        failed_transport.unsafe =
+            (certified_setup_snapshot != nullptr && certified_setup_snapshot->unsafe) ||
+            fullmag::fem::runtime::petsc_slepc_process_is_unsafe_locked();
+        if (certified_setup_snapshot != nullptr) {
+            failed_transport.cleanup_error =
+                static_cast<int>(certified_setup_snapshot->cleanup_error);
+        }
+        if ((certified_setup_snapshot != nullptr && certified_setup_snapshot->unsafe) ||
+            fullmag::fem::runtime::petsc_slepc_process_is_unsafe_locked()) {
+            eps_cleanup_is_safe = false;
+            quarantine_cleanup_failure("floquet_certified_transport_setup_unsafe");
+            return result;
+        }
+        destroy_all();
+        close_local_state_before_return();
+        return result;
+    }
+    const char *transport_type = nullptr;
+    const char *transport_pc_type = nullptr;
+    PCSide transport_side = PC_SIDE_DEFAULT;
+    KSPNormType transport_norm = KSP_NORM_DEFAULT;
+    const bool transport_configuration_available =
+        KSPGetType(certified_transport_ksp, &transport_type) == PETSC_SUCCESS &&
+        PCGetType(certified_transport_pc, &transport_pc_type) == PETSC_SUCCESS &&
+        KSPGetPCSide(certified_transport_ksp, &transport_side) == PETSC_SUCCESS &&
+        KSPGetNormType(certified_transport_ksp, &transport_norm) == PETSC_SUCCESS;
+    if (!transport_configuration_available) {
+        eps_cleanup_is_safe = false;
+        result.shifted_ksp_certified_recovery.unsafe = true;
+        quarantine_cleanup_failure("floquet_certified_transport_configuration_unavailable");
+        return result;
+    }
+    if (transport_type == nullptr || std::strcmp(transport_type, KSPPREONLY) != 0 ||
+        transport_pc_type == nullptr || std::strcmp(transport_pc_type, PCSHELL) != 0 ||
+        transport_side != PC_LEFT || transport_norm != KSP_NORM_NONE) {
+        result.status = "solve_error";
+        result.unsupported_reason = "floquet_certified_transport_configuration_mismatch";
+        destroy_all();
+        close_local_state_before_return();
+        return result;
+    }
+    result.shifted_ksp_certified_recovery.available = true;
+    result.shifted_ksp_certified_recovery.transport_pc_side =
+        static_cast<int>(transport_side);
+    result.shifted_ksp_certified_recovery.transport_norm_type =
+        static_cast<int>(transport_norm);
     cancellation_context_owner->observed = false;
     result.eps_monitor_iteration = 0;
     result.eps_first_unconverged_error_estimate =
@@ -8540,6 +8688,52 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
     // first error authoritative and leave this one process-bounded EPS object
     // for OS reclamation; the runtime fails closed immediately afterwards.
     eps_cleanup_is_safe = eps_solve_error == 0;
+    // The owner snapshot is ordinary cached data, including after an unsafe
+    // inner error. Never query a PETSc handle to fill recovery provenance here.
+    if (const auto *source =
+            detail::floquet_shifted_ksp_certified_recovery_snapshot(certified_recovery)) {
+        auto &target = result.shifted_ksp_certified_recovery;
+        target.solve_count = source->solve_count;
+        target.certified_count = source->certified_count;
+        target.failed_count = source->failed_count;
+        target.recovery_attempt_count = source->recovery_attempt_count;
+        target.recovered_solve_count = source->recovered_solve_count;
+        target.inner_attempt_count = source->inner_attempt_count;
+        target.failed_inner_attempt_count = source->failed_inner_attempt_count;
+        target.cumulative_iterations_total = source->cumulative_iterations_total;
+        target.last_cumulative_iterations =
+            static_cast<std::int64_t>(source->last_cumulative_iterations);
+        target.last_cycle_count = static_cast<std::int64_t>(source->last_cycle_count);
+        target.max_cumulative_iterations_per_solve =
+            static_cast<std::int64_t>(source->max_cumulative_iterations_per_solve);
+        target.last_certified = source->last_certified;
+        target.last_recovered = source->last_recovered;
+        target.last_inner_reason_available = source->last_inner_reason_available;
+        target.last_inner_reason = source->last_inner_reason;
+        target.last_failed_inner_reason_available =
+            source->last_failed_inner_reason_available;
+        target.last_failed_inner_reason = source->last_failed_inner_reason;
+        target.last_failed_inner_iterations =
+            static_cast<std::int64_t>(source->last_failed_inner_iterations);
+        target.final_residual_available = source->final_residual_available;
+        target.final_residual = static_cast<double>(source->final_residual);
+        target.last_rhs_norm_available = source->last_rhs_norm_available;
+        target.last_rhs_norm = static_cast<double>(source->last_rhs_norm);
+        target.threshold_available = source->threshold_available;
+        target.threshold = static_cast<double>(source->threshold);
+        target.max_tolerance_ratio_available = source->max_tolerance_ratio_available;
+        target.max_tolerance_ratio = static_cast<double>(source->max_tolerance_ratio);
+        target.certificate_source = source->certificate_source;
+        target.primary_error = static_cast<int>(source->primary_error);
+        target.cleanup_error = static_cast<int>(source->cleanup_error);
+        target.unsafe = source->unsafe;
+        target.transport_converged_reason_available =
+            last_shifted_solve.transport_reason_available;
+        target.transport_converged_reason = last_shifted_solve.transport_reason;
+        if (source->unsafe) {
+            eps_cleanup_is_safe = false;
+        }
+    }
     result.live_pclu_configuration_during_ksp_monitor =
         last_shifted_solve.live_pclu_configuration_during_ksp_monitor;
     // Copy only ordinary cached values here. In particular, a hard error
@@ -8661,7 +8855,11 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
         result.ksp_max_true_relative_residual =
             last_shifted_solve.maximum_true_relative_residual;
     }
-    if (eps_solve_error != 0) {
+    if (eps_solve_error != 0 || result.shifted_ksp_certified_recovery.unsafe) {
+        // An inner numerical failure can be safe in isolation while its error
+        // unwinds an EPS-owned DS view. This marks the retained transport graph,
+        // without changing the cached inner reason or certificate outcome.
+        result.shifted_ksp_certified_recovery.unsafe = true;
         result.eps_cumulative_iterations_available = false;
         result.status = "solve_error";
         result.unsupported_reason =

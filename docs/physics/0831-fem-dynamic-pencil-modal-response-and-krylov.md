@@ -5605,3 +5605,63 @@ obu oryginalnych full/mixed testów i wyjaśnieniem true-residual failure.
 | `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md` | `DOC-ANCHOR:c04-first-bound-action-probe` | Kontrakt sondy; hosted runtime pending |
 | `backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp` | `emit_floquet_factor_action_probe_marker` | Cached values; brak nowych operacji PETSc |
 | `scripts/ci/parse_floquet_factor_matrix_snapshots.py` | `_action_probe_pair_report` | Dokładne invocation/attempt/callback, osobny status action |
+
+
+### G5 — kontrakt odzyskania odrzuconego happy breakdown
+
+Problem potwierdzony w native logach GHA38364429802 (full1536, mixed10325):
+GMRES zeruje recursive norm przy happy breakdown, lecz independent true
+residual pozostaje ponad `max(atol, rtol*||b||_2)`. Callback prawidłowo odrzuca
+konwergencję; PETSc3.24.6 kończy BREAKDOWN zamiast automatycznego restartu.
+Approximate LU preconditioner jest dopuszczalny; jego błąd nie zastępuje
+błędu równania. Nie zmieniamy rtol/atol, shiftu, PC side, ordering, operatora,
+real-split lub kryteriów original-pencil/full-descriptor.
+
+Planowana realizacja CPU Floquet zachowuje STSINVERT. Publiczny owner solve
+(KSPPREONLY/PCSHELL outer) posiada oddzielny inner GMRES/PCLU. Inner ma
+error-if-not-converged=false, aby otrzymać committed candidate i reason;
+wrapper ponownie oblicza true residual. Jedynie odrzucony happy breakdown
+może uruchomić ponowienie z niezerowym initial guess. Sumaryczna liczba
+iteracji wszystkich cykli nie przekracza pierwotnego requested budget.
+Threshold odnosi się zawsze do pierwotnego RHS, również w następnych cyklach.
+Brak postępu, unavailable/nonfinite measurement, cancellation/divergence lub
+wyczerpany budget dają kontrolowany błąd. Callback nie wywołuje rekursywnie
+KSPSolve na tym samym KSP i nie nadpisuje reason na fikcyjny success.
+
+Owner zwraca sukces wyłącznie po pomiarze prawdziwego residualu; outer transport
+PREONLY nie jest deklarowany jako inner GMRES convergence. Provenance musi
+rozdzielać transport, inner engine, restart count, cumulative iterations,
+liczbę prób, ostatni reason, ostatni failed reason wraz z liczbą iteracji oraz ostateczną certyfikację. Nie przechowuje pełnej historii cykli. Quarantine/cleanup zachowują
+pierwotny błąd i żaden invalid graph nie jest ponownie używany.
+Wszystkie dotychczasowe native fault/pattern/C05 guards pozostają wymagane.
+Implementacja, happy-breakdown recovery, failure/no-budget i oba oryginalne
+full/mixed tests pozostają NOT VERIFIED przed nowym hosted receipt.
+
+Źródła kontraktu: [PETSc3.24.6 gmres.c](https://github.com/petsc/petsc/blob/v3.24.6/src/ksp/ksp/impls/gmres/gmres.c),
+[SLEPc3.24.3 stsles.c](https://github.com/slepc/slepc/blob/v3.24.3/src/sys/classes/st/interface/stsles.c).
+Publiczny Python/IR intent i jednostki pozostają bez zmian. Ta korekta dotyczy
+realizacji inner solve CPU Floquet, nie kwalifikacji FEM GPU/FDM/BEM ani A1.
+
+
+### Potwierdzenie pierwszego action binding — GHA38369881646
+
+Source `ac083edd374e0dac239c87095cce1ac85489c755`: build wykonany,
+12/14 CTest PASS, te same full/mixed FAIL. Parser ma39snapshotów i13action
+markers, exact pairing/config/action measurements VERIFIED, zero rejections.
+Full attempt11 callback3: live Pmat relative residual `7.542700548525e-8`,
+fresh `3.2583845792449657e-16`; shifted-action fresh `5.150782251730459e-16`.
+Mixed attempt2 callback3: live `7.838566796905665e-8`, fresh
+`2.3115593840242925e-16`, shifted-action fresh `1.201422675269101e-16`.
+To dowód różnicy działania approximate preconditionera na tym samym RHS,
+nie powód do usunięcia jego regularizacji. Ten log nadal zawiera odrzucony
+happy breakdown; proponowane recovery nie było w tym source SHA.
+Receipt SHA256 `ea0c133d5c947a35a745bc77d17889f4582640f19eaa3dfaa52aa3e2d77f9e33`;
+log SHA256 `db05b54dbe361a6ba77273e79721f60dd9ab233af3edee5c30a0a0ecb626ffd0`.
+[Hosted evidence](https://github.com/MateuszZelent/fullmag/actions/runs/38369881646).
+
+| Ścieżka | Symbol | Zakres |
+|---|---|---|
+| `backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp` | `create_floquet_shifted_ksp_certified_recovery_shell` | Public PETSc owner/reference; implementation pending hosted proof |
+| `backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp` | `floquet_shifted_certified_recovery_shell_apply` | Original RHS threshold i cumulative requested budget |
+| `backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp` | `destroy_floquet_shifted_ksp_certified_recovery_shell` | Checked destruction/quarantine; first/cleanup errors oddzielne |
+| `backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp` | `floquet_cached_true_gate_rejected_current_candidate` | Recovery eligibility wymaga cached rejection z bieżącego cyklu |
