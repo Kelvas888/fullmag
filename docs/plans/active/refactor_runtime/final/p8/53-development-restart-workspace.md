@@ -1,5 +1,13 @@
 # P8-53 — bezpieczne zastosowanie nowego backendu w workspace
 
+[P8-53BJ](53bj-pending-inspector-save-cancel.md), 13.10.2026:
+Save/Cancel przy szkicu panelu materiału **CLOSED w opisanym zakresie**.
+Save pobrał zatwierdzone alpha=0.01, zachowując szkic alpha=0.03; Cancel
+dialogu New Problem zachował panel i scenę. Restart odmówił do jawnego Revert.
+Receipt `89e280c2a794426cb3a4e55127178bd1`: exit 0, dziewięć kontroli PASS,
+Grid i Compute zakończone normalnie, wszystkie 26 procesów odebrane.
+Pozostałe panele, powtórny restart i zapis desktop nadal pozostają otwarte.
+
 [P8-53BI](53bi-project-save-before-restart.md), 13.10.2026:
 Save Project w Chrome z czystym Inspectorem → restart → restore **CLOSED**.
 Rzeczywisty plik ZIP/CRC i skrypt potwierdzone; hash pobranego archiwum
