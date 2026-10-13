@@ -33,6 +33,18 @@ describe("ObjectEditSessionController", () => {
     });
   });
 
+  it("can reconcile unsent fields even without edits during the submitted operation", () => {
+    const controller = new ObjectEditSessionController<{ name: string; position: number }>();
+    const identity = controller.activate({ objectId: "a", sessionScopeKey: "s", targetKey: "a" }, { name: "Unsent name", position: 1 });
+    const operation = controller.beginApply(identity)!;
+    let reconciliations = 0;
+    expect(controller.acknowledge(operation, { name: "Server name", position: 2 }, (current, _submitted, canonical) => {
+      reconciliations += 1;
+      return { dirty: true, draft: { ...canonical, name: current.name } };
+    }, { reconcileUnchangedDraft: true })).toBe(true);
+    expect(reconciliations).toBe(1);
+    expect(controller.getSnapshot()).toMatchObject({ applyOperationId: null, dirty: true, draft: { name: "Unsent name", position: 2 } });
+  });
   it("keeps edits made after Apply while adopting the acknowledged baseline", () => {
     const controller = new ObjectEditSessionController<{ value: number }>();
     const identity = controller.activate({
@@ -84,5 +96,87 @@ describe("ObjectEditSessionController", () => {
       draft: { value: 1 },
       identity: newIdentity,
     });
+  });
+
+  it("serializes Apply across objects in one session and notifies the new owner on release", () => {
+    const controller = new ObjectEditSessionController<{ value: number }>();
+    const target = (objectId: string) => ({ objectId, sessionScopeKey: "session-a", targetKey: objectId });
+    const a = controller.activate(target("a"), { value: 1 });
+    const operation = controller.beginApply(a)!;
+    const b = controller.activate(target("b"), { value: 2 });
+    expect(controller.getSnapshot().applyOperationId).toBeNull();
+    expect(controller.hasPendingApply("session-a")).toBe(true);
+    expect(controller.beginApply(b)).toBeNull();
+    const beforeRelease = controller.getSnapshot();
+    expect(controller.reject(operation)).toBe(false);
+    expect(controller.getSnapshot()).not.toBe(beforeRelease);
+    expect(controller.getSnapshot().draft).toEqual({ value: 2 });
+    expect(controller.hasPendingApply("session-a")).toBe(false);
+    expect(controller.beginApply(b)).not.toBeNull();
+  });
+
+  it("blocks both Apply during a gesture and gesture start during Apply", () => {
+    const controller = new ObjectEditSessionController<{ value: number }>();
+    const identity = controller.activate({ objectId: "a", sessionScopeKey: "scope-a", targetKey: "a" }, { value: 1 });
+    const gesture = controller.beginGesture("scope-a", "a")!;
+    expect(controller.hasActiveGesture("scope-a")).toBe(true);
+    expect(controller.beginGesture("scope-a", "b")).toBeNull();
+    expect(controller.beginApply(identity)).toBeNull();
+    expect(controller.reset(identity, { value: 0 })).toBe(false);
+    expect(controller.endGesture(gesture)).toBe(true);
+    const operation = controller.beginApply(identity)!;
+    expect(controller.beginGesture("scope-a", "a")).toBeNull();
+    expect(controller.beginGesture("scope-a", "b")).toBeNull();
+    controller.reject(operation);
+    expect(controller.beginGesture("scope-a", "a")).not.toBeNull();
+  });
+
+  it("keeps reservations scoped and ignores a stale gesture release after clear", () => {
+    const controller = new ObjectEditSessionController<{ value: number }>();
+    const oldGesture = controller.beginGesture("scope-a", "a")!;
+    const identity = controller.activate({ objectId: "b", sessionScopeKey: "scope-b", targetKey: "b" }, { value: 2 });
+    expect(controller.beginApply(identity)).not.toBeNull();
+    controller.clear();
+    const newGesture = controller.beginGesture("scope-a", "a")!;
+    expect(newGesture).not.toBe(oldGesture);
+    expect(controller.endGesture(oldGesture)).toBe(false);
+    expect(controller.hasActiveGesture("scope-a")).toBe(true);
+    expect(controller.endGesture(newGesture)).toBe(true);
+  });
+
+  it.each(["gesture", "mutation"] as const)("notifies on clear of a %s reservation without an active draft", (kind) => {
+    const controller = new ObjectEditSessionController<{ value: number }>();
+    const token = kind === "gesture"
+      ? controller.beginGesture("scope-a", "a")!
+      : controller.beginSceneMutation("scope-a", "a")!;
+    let notifications = 0;
+    controller.subscribe(() => { notifications += 1; });
+    const beforeClear = controller.getSnapshot();
+    controller.clear();
+    expect(notifications).toBe(1);
+    expect(controller.getSnapshot()).not.toBe(beforeClear);
+    expect(controller.hasActiveGesture("scope-a")).toBe(false);
+    expect(controller.hasPendingWrite("scope-a")).toBe(false);
+    expect(kind === "gesture" ? controller.endGesture(token) : controller.endSceneMutation(token)).toBe(false);
+  });
+
+  it("reserves identity and delete writes against Apply and gesture start", () => {
+    const controller = new ObjectEditSessionController<{ value: number }>();
+    const identity = controller.activate({ objectId: "a", sessionScopeKey: "scope-a", targetKey: "a" }, { value: 1 });
+    const deletion = controller.beginSceneMutation("scope-a", "a")!;
+    expect(controller.hasPendingWrite("scope-a")).toBe(true);
+    expect(controller.hasPendingApply("scope-a")).toBe(false);
+    expect(controller.beginApply(identity)).toBeNull();
+    expect(controller.beginGesture("scope-a", "b")).toBeNull();
+    expect(controller.beginSceneMutation("scope-a", "b")).toBeNull();
+    expect(controller.endSceneMutation(deletion)).toBe(true);
+    expect(controller.beginApply(identity)).not.toBeNull();
+    expect(controller.beginSceneMutation("scope-a", "a")).toBeNull();
+    controller.clear();
+    const newer = controller.beginSceneMutation("scope-a", "a")!;
+    expect(newer).not.toBe(deletion);
+    expect(controller.endSceneMutation(deletion)).toBe(false);
+    expect(controller.hasPendingWrite("scope-a")).toBe(true);
+    expect(controller.endSceneMutation(newer)).toBe(true);
   });
 });

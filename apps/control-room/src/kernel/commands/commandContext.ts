@@ -15,6 +15,7 @@ export function createCommandContext(
     analysisFieldOverlay: kernel.analysisFieldOverlay,
     authoringHistory: kernel.authoringHistory,
     pendingForms: kernel.pendingForms,
+    objectEditSession: kernel.objectEditSession,
     bus: kernel.bus,
     chartViewportHandoff: kernel.chartViewportHandoff,
     cameraRegistry: kernel.cameraRegistry,

@@ -1,6 +1,7 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { canonicalDraftInSelectedUnits, changeDraftQuantityUnit, updateRawQuantityField } from "@/kernel/authoring/object-edit/quantityDraftFields";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
-import type { JsonObject, SceneResource } from "@/kernel/api/apiTypes";
+import type { AuthoringTransactionResponse, JsonObject, SceneResource } from "@/kernel/api/apiTypes";
 import { MODEL_SCENE_PATH } from "@/kernel/api/apiPaths";
 import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
 import {
@@ -10,11 +11,15 @@ import {
 import {
   createObjectTransaction,
   patchObjectGeometryTransaction,
+  patchObjectTransaction,
   primitiveDraftOverlayStore,
 } from "@/kernel/authoring/geometryLifecycleCommands";
 import { useKernel } from "@/kernel/KernelContext";
 import { useObjectEditSelector } from "@/kernel/authoring/object-edit/useObjectEditSelector";
-import { geometryObjectEditSessionTargetKey } from "@/kernel/authoring/object-edit/objectEditDraftModel";
+import {
+  geometryObjectEditSessionTargetKey,
+  resolveCommittedGeometryObjectDraft,
+} from "@/kernel/authoring/object-edit/objectEditDraftModel";
 import {
   publishCommittedSceneResource,
   useGeometryValidationResource,
@@ -26,6 +31,8 @@ import type { InspectorPanelProps } from "../inspectorTypes";
 import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FieldRow } from "../primitives/FieldRow";
+import { DraftQuantityUnitSelect, type DraftUnitUpdater } from "../primitives/DraftQuantityUnitSelect";
+import type { QuantityDraftField } from "@/kernel/authoring/object-edit/objectEditTypes";
 import { FormField } from "../primitives/FormField";
 import { InspectorGroup } from "../primitives/InspectorGroup";
 import { useInspectorActiveTab } from "../InspectorTabState";
@@ -46,6 +53,7 @@ import {
   summarizeGeometryValidationMessages,
   type GeometryObjectDraft,
 } from "./geometryObjectPanelModel";
+import { objectEditMetadataEquals, reconcileObjectEditAck, reconcileObjectIdentityAck } from "./objectEditAckReconciliation";
 
 type Feedback = {
   kind: "error" | "success" | "warning";
@@ -91,32 +99,6 @@ function optionalRef(value: string): string | undefined {
   const trimmed = value.trim();
   return trimmed && trimmed !== "unassigned" ? trimmed : undefined;
 }
-
-function sameDraftFields(
-  left: GeometryObjectDraft,
-  right: GeometryObjectDraft,
-  fields: readonly (keyof GeometryObjectDraft)[],
-): boolean {
-  return fields.every((field) => JSON.stringify(left[field]) === JSON.stringify(right[field]));
-}
-
-function sameDraftValues(left: GeometryObjectDraft, right: GeometryObjectDraft): boolean {
-  return sameDraftFields(left, right, [
-    "archHeight",
-    "geometryKind",
-    "height",
-    "length",
-    "material",
-    "name",
-    "radius",
-    "region",
-    "size",
-    "translation",
-    "width",
-    "z0",
-  ]);
-}
-
 
 function invalidateAuthoringResources(
   resources: ReturnType<typeof useKernel>["resources"],
@@ -183,6 +165,21 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
       pendingState.draftKey === draftKey &&
       pendingState.sessionScopeKey === currentSessionScopeKey) ||
     (sessionMatchesTarget && editSnapshot.applyOperationId !== null);
+  const ownLocalMutationPending = Boolean(
+    pendingState.pending &&
+      pendingState.draftKey === draftKey &&
+      pendingState.sessionScopeKey === currentSessionScopeKey,
+  );
+  const ownObjectApplyPending = Boolean(
+    sessionMatchesTarget && editSnapshot.applyOperationId !== null,
+  );
+  const sceneWritePending = objectEditSession.hasPendingWrite(currentSessionScopeKey);
+  const placementGestureActive = objectEditSession.hasActiveGesture(currentSessionScopeKey);
+  const sceneMutationLockReason = placementGestureActive
+    ? "Finish or cancel the active placement gesture before applying or reverting scene changes."
+    : sceneWritePending && !ownObjectApplyPending && !ownLocalMutationPending
+      ? "Another scene-changing action is pending in this session."
+      : undefined;
   const [revisionConflictPhase, setRevisionConflictPhase] = useState<
     "conflict" | "refresh-error" | "refreshing" | "rebased" | "refetched" | null
   >(null);
@@ -206,7 +203,12 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
       sessionScopeKey: currentSessionScopeKey,
       targetKey,
     }, baseDraft);
-    objectEditSession.refreshCanonical(identity, baseDraft);
+    // ACK reconciliation may retain newer raw text that is semantically clean.
+    // Publishing the same confirmed revision must not normalize that text away.
+    const currentDraft = objectEditSession.getSnapshot().draft;
+    if (!Number.isFinite(baseDraft.baseRevision) || currentDraft?.baseRevision !== baseDraft.baseRevision) {
+      objectEditSession.refreshCanonical(identity, canonicalDraftInSelectedUnits(baseDraft, currentDraft ?? baseDraft));
+    }
   }, [baseDraft, currentSessionScopeKey, objectEditSession, targetKey]);
 
   function createHistoryMutationContext() {
@@ -313,7 +315,12 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
   }
 
   function updateField(field: DraftField, value: string): void {
-    updateDraft((current) => ({ ...current, [field]: value }));
+    updateDraft((current) => {
+      if (field === "name" || field === "notes" || field === "material" || field === "region") {
+        return { ...current, [field]: value };
+      }
+      return updateRawQuantityField(current, field, value);
+    });
   }
 
   function updateVector(
@@ -322,18 +329,33 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
     value: string,
   ): void {
     updateDraft((current) => {
+      if (field === "size" || field === "translation") {
+        return updateRawQuantityField(current, `${field}.${index}`, value);
+      }
       const next = [...current[field]] as [string, string, string];
       next[index] = value;
       return { ...current, [field]: next };
     });
   }
 
+  const updateUnit: DraftUnitUpdater = (field, unit) => {
+    updateDraft((current) => {
+      const result = changeDraftQuantityUnit(current, field, unit);
+      return result.ok ? result.draft : current;
+    });
+  };
+
   const geometryDraftChanged =
     draft.mode === "committed" && !geometryDraftGeometryEquals(draft, baseDraft);
   const transformDraftChanged =
     draft.mode === "committed" && !geometryDraftTranslationEquals(draft, baseDraft);
-  const newObjectDraftChanged = draft.mode === "draft-new" && !sameDraftValues(draft, baseDraft);
-  const inspectorDirty = geometryDraftChanged || transformDraftChanged || newObjectDraftChanged;
+  const newObjectDraftChanged = draft.mode === "draft-new" && (
+    !geometryDraftGeometryEquals(draft, baseDraft) ||
+    !geometryDraftTranslationEquals(draft, baseDraft) ||
+    !objectEditMetadataEquals(draft, baseDraft)
+  );
+  const metadataDraftChanged = draft.mode === "committed" && !objectEditMetadataEquals(draft, baseDraft);
+  const inspectorDirty = geometryDraftChanged || transformDraftChanged || metadataDraftChanged || newObjectDraftChanged;
   const geometryPatch = buildGeometryDraftPatch(draft);
   const existingObject = scene.data?.objects?.find((candidate) => candidate.id === draft.objectId);
   const transformPatch = buildTransformDraftPatch(
@@ -367,7 +389,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
     pending,
     inspectorDirty,
     inspectorValid,
-    undefined,
+    sceneMutationLockReason,
     applyRegisteredDraft,
     revertDraft,
     {
@@ -378,55 +400,104 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
 
 
   async function applyCreateDraft(): Promise<boolean> {
-    if (draft.baseRevision === null) {
+    if (typeof draft.baseRevision !== "number" || !Number.isFinite(draft.baseRevision)) {
       setFeedback({ kind: "error", message: "The canonical scene revision is unavailable. Refetch the scene before applying." });
       return false;
     }
-    const baseRevision = draft.baseRevision;
-    const geometry = buildGeometryDraftPatch(draft);
+    if (sceneMutationLockReason) return false;
+    const submittedDraft = draft;
+    const submittedIdentity = editIdentity;
+    const baseRevision = submittedDraft.baseRevision;
+    const geometry = buildGeometryDraftPatch(submittedDraft);
     const geometryPayload = geometry.geometry;
     if (geometry.error || !geometryPayload) {
       setFeedback({ kind: "error", message: geometry.error ?? "Invalid geometry draft." });
       return false;
     }
-    const transform = buildTransformDraftPatch(draft);
+    const transform = buildTransformDraftPatch(submittedDraft);
     const transformPayload = transform.transform;
     if (transform.error || !transformPayload) {
       setFeedback({ kind: "error", message: transform.error ?? "Invalid transform draft." });
       return false;
     }
 
+    const objectId = createDraftObjectId(submittedDraft);
+    const sceneMutationToken = objectEditSession.beginSceneMutation(
+      currentSessionScopeKey,
+      objectId,
+    );
+    if (sceneMutationToken === null) return false;
     const finishPending = beginPendingOperation();
     setRevisionConflictPhase(null);
     let isCurrentMutationContext: (() => boolean) | null = null;
     let selectedCreatedObject = false;
     try {
-      const objectId = createDraftObjectId(draft);
       const historyContext = createHistoryMutationContext();
       isCurrentMutationContext = historyContext.isCurrentSessionScope;
+      if (historyContext.sessionScopeKey !== currentSessionScopeKey) return false;
       const requestOptions = historyContext.sessionScopeKey
         ? { sessionScopeKey: historyContext.sessionScopeKey }
         : undefined;
       const response = await runAuthoringMutationWithHistory(
         historyContext,
-        `Create ${draft.name.trim() || objectId}`,
+        `Create ${submittedDraft.name.trim() || objectId}`,
         async () => {
           const created = await createObjectTransaction(api, {
             base_revision: baseRevision,
             geometry: geometryPayload,
-            material_ref: optionalRef(draft.material),
-            name: draft.name.trim() || objectId,
+            material_ref: optionalRef(submittedDraft.material),
+            name: submittedDraft.name.trim() || objectId,
             object_id: objectId,
-            region_name: optionalRef(draft.region),
+            region_name: optionalRef(submittedDraft.region),
             transform: transformPayload,
           }, requestOptions);
-          if (historyContext.isCurrentSessionScope() !== false && acknowledgeCommittedDraft()) {
-            objectEditSession.clear();
+          const currentSnapshot = objectEditSession.getSnapshot();
+          const resolvedCreatedDraft = resolveCommittedGeometryObjectDraft(
+            created.committed_scene,
+            objectId,
+          );
+          const createdDraft = resolvedCreatedDraft
+            ? {
+                ...resolvedCreatedDraft,
+                baseRevision: acknowledgedAuthoringSceneRevision(created),
+              }
+            : null;
+          if (
+            historyContext.isCurrentSessionScope() !== false &&
+            submittedIdentity !== null &&
+            currentSnapshot.identity === submittedIdentity &&
+            currentSnapshot.draft !== null &&
+            createdDraft &&
+            acknowledgeCommittedDraft()
+          ) {
             preConflictBaselineRef.current = null;
+            const rebased = reconcileObjectEditAck(
+              currentSnapshot.draft,
+              submittedDraft,
+              createdDraft,
+            );
+            // Publish the ACK before selecting its object. A selection render
+            // against the old scene would activate a missing target and reset
+            // edits made while create was pending.
+            publishCommittedSceneResource(resources, created.committed_scene,
+              acknowledgedAuthoringSceneRevision(created), undefined, false,
+              historyContext.sessionScopeKey, api.resourceCacheScope);
+            const committedIdentity = objectEditSession.activate({
+              objectId,
+              sessionScopeKey: historyContext.sessionScopeKey,
+              targetKey: geometryObjectEditSessionTargetKey(
+                historyContext.sessionScopeKey,
+                createdDraft,
+              ),
+            }, rebased.draft);
+            if (rebased.dirty) {
+              objectEditSession.updateDraft(committedIdentity, () => rebased.draft);
+              objectEditSession.setDirty(committedIdentity, rebased.dirty);
+            }
             selectionController.set(
               {
                 kind: "object.root",
-                label: draft.name.trim() || objectId,
+                label: submittedDraft.name.trim() || objectId,
                 nodeId: `model:object:${objectId}`,
                 objectId,
                 ref: {
@@ -447,11 +518,12 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
         { captureWorkspaceStateAfter: () => selectedCreatedObject },
       );
       if (historyContext.isCurrentSessionScope() === false) return false;
+      if (!selectedCreatedObject) return false;
       const revision = acknowledgedAuthoringSceneRevision(response);
       invalidateAuthoringResources(
         resources,
         revision,
-        response.committed_scene,
+        undefined,
         historyContext.sessionScopeKey,
         api.resourceCacheScope,
       );
@@ -464,12 +536,13 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
         preConflictBaselineRef.current = baseDraft;
         setConflictOperation("create");
         setRevisionConflictPhase("conflict");
-        setConflictBaseRevision(draft.baseRevision);
+        setConflictBaseRevision(submittedDraft.baseRevision);
         setRefreshSawLoading(false);
       }
       setFeedback({ kind: "error", message: errorMessage(error) });
       return false;
     } finally {
+      objectEditSession.endSceneMutation(sceneMutationToken);
       finishPending();
     }
   }
@@ -491,8 +564,8 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
   }
 
   async function applyObjectDraft(): Promise<boolean> {
-    if (draft.mode !== "committed" || !inspectorDirty) return false;
-    if (draft.baseRevision === null) {
+    if (draft.mode !== "committed" || !inspectorDirty || sceneMutationLockReason) return false;
+    if (typeof draft.baseRevision !== "number" || !Number.isFinite(draft.baseRevision)) {
       setFeedback({ kind: "error", message: "The canonical scene revision is unavailable. Refetch the scene before applying." });
       return false;
     }
@@ -501,77 +574,136 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
       return false;
     }
 
-    const editedGeometry = buildGeometryDraftPatch(draft);
-    if (geometryDraftChanged && (editedGeometry.error || !editedGeometry.geometry)) {
-      setFeedback({ kind: "error", message: editedGeometry.error ?? "Invalid geometry draft." });
-      return false;
-    }
-    const transform = buildTransformDraftPatch(draft, existingObject.transform);
-    if (transform.error || !transform.transform) {
-      setFeedback({ kind: "error", message: transform.error ?? "Invalid transform draft." });
-      return false;
-    }
-    const geometryPayload = geometryDraftChanged
-      ? mergeGeometryDescriptor(existingObject.geometry as unknown as JsonObject, editedGeometry.geometry as JsonObject)
-      : (existingObject.geometry as unknown as JsonObject);
     const operation = objectEditSession.beginApply(editIdentity);
     if (!operation) return false;
+    const submittedDraft = operation.submittedDraft;
+    if (typeof submittedDraft.baseRevision !== "number" || !Number.isFinite(submittedDraft.baseRevision)) {
+      const operationIsCurrent = objectEditSession.reject(operation);
+      if (operationIsCurrent) {
+        setFeedback({ kind: "error", message: "The canonical scene revision is unavailable. Refetch the scene before applying." });
+      }
+      return false;
+    }
+    const submittedBaseRevision = submittedDraft.baseRevision;
+    const submittedMetadataChanged = !objectEditMetadataEquals(submittedDraft, baseDraft);
+    const submittedTransformChanged = !geometryDraftTranslationEquals(submittedDraft, baseDraft);
+    const submittedObject = scene.data?.objects?.find(
+      (candidate) => candidate.id === operation.identity.objectId,
+    );
+    if (!submittedObject?.geometry) {
+      const operationIsCurrent = objectEditSession.reject(operation);
+      if (operationIsCurrent) {
+        setFeedback({ kind: "error", message: "The canonical object geometry or edit identity is unavailable. Refetch the scene before applying." });
+      }
+      return false;
+    }
+    const editedGeometry = buildGeometryDraftPatch(submittedDraft);
+    const submittedGeometryChanged = !geometryDraftGeometryEquals(submittedDraft, baseDraft);
+    if (submittedGeometryChanged && (editedGeometry.error || !editedGeometry.geometry)) {
+      const operationIsCurrent = objectEditSession.reject(operation);
+      if (operationIsCurrent) {
+        setFeedback({ kind: "error", message: editedGeometry.error ?? "Invalid geometry draft." });
+      }
+      return false;
+    }
+    const transform = buildTransformDraftPatch(submittedDraft, submittedObject.transform);
+    if (transform.error || !transform.transform) {
+      const operationIsCurrent = objectEditSession.reject(operation);
+      if (operationIsCurrent) {
+        setFeedback({ kind: "error", message: transform.error ?? "Invalid transform draft." });
+      }
+      return false;
+    }
+    const geometryPayload = submittedGeometryChanged
+      ? mergeGeometryDescriptor(submittedObject.geometry as unknown as JsonObject, editedGeometry.geometry as JsonObject)
+      : (submittedObject.geometry as unknown as JsonObject);
     const finishPending = beginPendingOperation();
     let isCurrentMutationContext: (() => boolean) | null = null;
+    let metadataAck: SceneResource | null = null;
     try {
       const historyContext = createHistoryMutationContext();
       isCurrentMutationContext = historyContext.isCurrentSessionScope;
+      if (
+        historyContext.sessionScopeKey !== operation.identity.sessionScopeKey ||
+        historyContext.isCurrentSessionScope() === false
+      ) {
+        objectEditSession.reject(operation);
+        return false;
+      }
       const requestOptions = historyContext.sessionScopeKey
         ? { sessionScopeKey: historyContext.sessionScopeKey }
         : undefined;
       let historyDegraded = false;
-      const response = await runAuthoringMutationWithHistory(
-        historyContext,
-        "Edit geometry and placement " + draft.name,
-        () => patchObjectGeometryTransaction(api, draft.objectId, {
-          base_revision: draft.baseRevision as number,
-          geometry: geometryPayload,
-          transform: transform.transform as JsonObject,
-        }, requestOptions),
-        undefined,
-        {
-          onHistoryDegraded: () => {
-            historyDegraded = true;
-          },
-        },
-      );
+      let geometryBaseRevision = submittedBaseRevision;
+      if (submittedMetadataChanged) {
+        metadataAck = await runAuthoringMutationWithHistory(
+          historyContext,
+          "Edit metadata " + submittedDraft.name,
+          () => patchObjectTransaction(api, operation.identity.objectId, {
+            base_revision: submittedBaseRevision,
+            name: submittedDraft.name,
+            notes: submittedDraft.notes,
+            material_ref: optionalRef(submittedDraft.material) ?? null,
+            region_name: optionalRef(submittedDraft.region) ?? null,
+          }, requestOptions),
+          undefined,
+          { onHistoryDegraded: () => { historyDegraded = true; } },
+        );
+        if (historyContext.isCurrentSessionScope() === false || !objectEditSession.isCurrent(operation.identity)) {
+          objectEditSession.reject(operation);
+          return false;
+        }
+        geometryBaseRevision = acknowledgedAuthoringSceneRevision(metadataAck);
+      }
+      const response: AuthoringTransactionResponse = submittedGeometryChanged || submittedTransformChanged
+        ? await runAuthoringMutationWithHistory(
+            historyContext,
+            "Edit geometry and placement " + submittedDraft.name,
+            () => patchObjectGeometryTransaction(api, operation.identity.objectId, {
+              base_revision: geometryBaseRevision,
+              geometry: geometryPayload,
+              transform: transform.transform as JsonObject,
+            }, requestOptions),
+            undefined,
+            { onHistoryDegraded: () => { historyDegraded = true; } },
+          )
+        : metadataAck
+          ? { committed_scene: metadataAck, scene_revision: geometryBaseRevision, transaction_kind: "patch_object" }
+          : (() => { throw new Error("There are no unapplied object changes."); })();
       if (historyContext.isCurrentSessionScope() === false) {
         objectEditSession.reject(operation);
         return false;
       }
-      const canonicalDraft = resolveGeometryObjectDraft(selection, response.committed_scene);
-      const currentEpoch = objectEditSession.acknowledge(
+      const revision = acknowledgedAuthoringSceneRevision(response);
+      const resolvedCanonicalDraft = resolveCommittedGeometryObjectDraft(
+        response.committed_scene,
+        operation.identity.objectId,
+      );
+      if (!resolvedCanonicalDraft) {
+        const operationIsCurrent = objectEditSession.reject(operation);
+        if (operationIsCurrent && historyContext.isCurrentSessionScope()) {
+          setFeedback({ kind: "error", message: "The acknowledged object is missing from the committed scene." });
+        }
+        return false;
+      }
+      const canonicalDraft = {
+        ...resolvedCanonicalDraft,
+        baseRevision: revision,
+      };
+      const acknowledgedCurrentDraft = objectEditSession.acknowledge(
         operation,
         canonicalDraft,
-        (currentDraft, submittedDraft, acknowledgedDraft) => {
-          const mergedDraft = { ...acknowledgedDraft };
-          for (const field of Object.keys(currentDraft) as (keyof GeometryObjectDraft)[]) {
-            if (
-              JSON.stringify(currentDraft[field]) !==
-              JSON.stringify(submittedDraft[field])
-            ) {
-              Object.assign(mergedDraft, { [field]: currentDraft[field] });
-            }
-          }
-          const dirty =
-            !geometryDraftGeometryEquals(mergedDraft, acknowledgedDraft) ||
-            !geometryDraftTranslationEquals(mergedDraft, acknowledgedDraft);
-          return { dirty, draft: mergedDraft };
-        },
+        reconcileObjectEditAck,
+        { reconcileUnchangedDraft: true },
       );
+      if (!acknowledgedCurrentDraft) return false;
       invalidateAuthoringResources(
         resources,
-        response.scene_revision,
+        revision,
         response.committed_scene,
         historyContext.sessionScopeKey,
         api.resourceCacheScope,
       );
-      if (!currentEpoch) return false;
       preConflictBaselineRef.current = null;
       setRevisionConflictPhase(null);
       setFeedback({
@@ -584,11 +716,27 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
     } catch (error) {
       const operationIsCurrent = objectEditSession.reject(operation);
       if (!operationIsCurrent || isCurrentMutationContext?.() === false) return false;
+      if (metadataAck) {
+        const metadataCanonical = resolveCommittedGeometryObjectDraft(metadataAck, operation.identity.objectId);
+        const currentDraft = objectEditSession.getSnapshot().draft;
+        if (metadataCanonical && currentDraft) {
+          const metadataRevision = acknowledgedAuthoringSceneRevision(metadataAck);
+          const rebased = reconcileObjectIdentityAck(currentDraft, submittedDraft, baseDraft, {
+            ...metadataCanonical, baseRevision: metadataRevision,
+          });
+          objectEditSession.updateDraft(operation.identity, () => rebased.draft);
+          objectEditSession.setDirty(operation.identity, rebased.dirty);
+          invalidateAuthoringResources(resources, metadataRevision, metadataAck,
+            operation.identity.sessionScopeKey, api.resourceCacheScope);
+          setFeedback({ kind: "error", message: "Metadata was committed; geometry remains unapplied. " + errorMessage(error) });
+          return false;
+        }
+      }
       if (isPrimitiveDraftRevisionConflict(error)) {
         preConflictBaselineRef.current = baseDraft;
         setConflictOperation("geometry");
         setRevisionConflictPhase("conflict");
-        setConflictBaseRevision(draft.baseRevision);
+        setConflictBaseRevision(submittedBaseRevision);
         setRefreshSawLoading(false);
       }
       setFeedback({ kind: "error", message: errorMessage(error) });
@@ -599,7 +747,11 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
   }
 
   function revertDraft(): void {
-    if (editIdentity) objectEditSession.reset(editIdentity, baseDraft);
+    if (
+      objectEditSession.hasPendingWrite(currentSessionScopeKey) ||
+      objectEditSession.hasActiveGesture(currentSessionScopeKey)
+    ) return;
+    if (editIdentity && !objectEditSession.reset(editIdentity, canonicalDraftInSelectedUnits(baseDraft, draft))) return;
     setRevisionConflictPhase(null);
     preConflictBaselineRef.current = null;
     setFeedback(null);
@@ -621,6 +773,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
           draft={draft}
           errors={primitiveDraft.errors}
           onVectorChange={updateVector}
+          onUnitChange={updateUnit}
         />
       ) : activeTab === "geometry" ? (
         <PrimitiveGeometrySection
@@ -628,6 +781,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
           errors={primitiveDraft.errors}
           onFieldChange={updateField}
           onVectorChange={updateVector}
+          onUnitChange={updateUnit}
         />
       ) : (
         <>
@@ -636,18 +790,25 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
             errors={primitiveDraft.errors}
             onFieldChange={updateField}
             onVectorChange={updateVector}
+            onUnitChange={updateUnit}
           />
           <ObjectPlacementPanel
             draft={draft}
             errors={primitiveDraft.errors}
             onVectorChange={updateVector}
+            onUnitChange={updateUnit}
           />
         </>
       )}
-      <DraftIdentitySection draft={draft} onFieldChange={updateField} />
+      {Object.keys(primitiveDraft.errors).length > 0 && draft.quantityFields &&
+        Object.values(draft.quantityFields).some((field) => field && field.lastValidSI !== null) ? (
+        <FeedbackBanner kind="warning" message="Preview retains the last valid values. Complete or revert invalid fields before applying." />
+      ) : null}
+      <DraftIdentitySection draft={draft} onFieldChange={updateField} showCommitted={draft.mode === "committed"} />
       <ActionsSection
         draft={draft}
         feedback={feedback}
+        sceneMutationLockReason={sceneMutationLockReason}
         pending={pending}
         onApplyCreateDraft={applyCreateDraft}
         onRebaseAfterConflict={rebaseAfterConflict}
@@ -670,11 +831,13 @@ function PrimitiveGeometrySection({
   errors,
   onFieldChange,
   onVectorChange,
+  onUnitChange,
 }: {
   draft: GeometryObjectDraft;
   errors: Readonly<Record<string, string>>;
   onFieldChange: DraftFieldUpdater;
   onVectorChange: VectorDraftUpdater;
+  onUnitChange: DraftUnitUpdater;
 }) {
   return (
     <InspectorGroup title="Primitive Geometry" collapsible defaultOpen>
@@ -684,6 +847,7 @@ function PrimitiveGeometrySection({
         errors={errors}
         onFieldChange={onFieldChange}
         onVectorChange={onVectorChange}
+        onUnitChange={onUnitChange}
       />
     </InspectorGroup>
   );
@@ -694,11 +858,13 @@ function PrimitiveGeometryFields({
   errors,
   onFieldChange,
   onVectorChange,
+  onUnitChange,
 }: {
   draft: GeometryObjectDraft;
   errors: Readonly<Record<string, string>>;
   onFieldChange: DraftFieldUpdater;
   onVectorChange: VectorDraftUpdater;
+  onUnitChange: DraftUnitUpdater;
 }) {
   const geometryKind = draft.geometryKind.toLowerCase();
   if (geometryKind === "cylinder") {
@@ -708,7 +874,7 @@ function PrimitiveGeometryFields({
           error={errors.radius}
           label="Radius"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="radius" label="Radius" onChange={onUnitChange} />}
           value={draft.radius}
           onChange={(event) => onFieldChange("radius", event.target.value)}
         />
@@ -716,7 +882,7 @@ function PrimitiveGeometryFields({
           error={errors.height}
           label="Height"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="height" label="Height" onChange={onUnitChange} />}
           value={draft.height}
           onChange={(event) => onFieldChange("height", event.target.value)}
         />
@@ -730,7 +896,7 @@ function PrimitiveGeometryFields({
         error={errors.radius}
         label="Radius"
         type="number"
-        unit="m"
+        unitControl={<DraftQuantityUnitSelect draft={draft} field="radius" label="Radius" onChange={onUnitChange} />}
         value={draft.radius}
         onChange={(event) => onFieldChange("radius", event.target.value)}
       />
@@ -743,35 +909,35 @@ function PrimitiveGeometryFields({
         <FormField
           label="Length"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="length" label="Length" onChange={onUnitChange} />}
           value={draft.length}
           onChange={(event) => onFieldChange("length", event.target.value)}
         />
         <FormField
           label="Width"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="width" label="Width" onChange={onUnitChange} />}
           value={draft.width}
           onChange={(event) => onFieldChange("width", event.target.value)}
         />
         <FormField
           label="Height"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="height" label="Height" onChange={onUnitChange} />}
           value={draft.height}
           onChange={(event) => onFieldChange("height", event.target.value)}
         />
         <FormField
           label="Arch height"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="archHeight" label="Arch height" onChange={onUnitChange} />}
           value={draft.archHeight}
           onChange={(event) => onFieldChange("archHeight", event.target.value)}
         />
         <FormField
           label="z0"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="z0" label="z0" onChange={onUnitChange} />}
           value={draft.z0}
           onChange={(event) => onFieldChange("z0", event.target.value)}
         />
@@ -783,7 +949,9 @@ function PrimitiveGeometryFields({
     <DraftVectorFormField
       errors={[errors["size.0"], errors["size.1"], errors["size.2"]]}
       label="Size"
-      unit="m"
+      draft={draft}
+      field="size"
+      onUnitChange={onUnitChange}
       values={draft.size}
       onChange={(index, value) => onVectorChange("size", index, value)}
     />
@@ -793,14 +961,16 @@ function PrimitiveGeometryFields({
 function DraftIdentitySection({
   draft,
   onFieldChange,
+  showCommitted = false,
 }: {
   draft: GeometryObjectDraft;
   onFieldChange: DraftFieldUpdater;
+  showCommitted?: boolean;
 }) {
-  if (draft.mode !== "draft-new") return null;
+  if (draft.mode !== "draft-new" && !showCommitted) return null;
 
   return (
-    <InspectorGroup title="Draft Identity" collapsible defaultOpen>
+    <InspectorGroup title={draft.mode === "draft-new" ? "Draft Identity" : "Identity and references"} collapsible defaultOpen>
       <FormField
         label="Name"
         mono={false}
@@ -829,6 +999,7 @@ function DraftIdentitySection({
 function ActionsSection({
   draft,
   feedback,
+  sceneMutationLockReason,
   onApplyCreateDraft,
   onRebaseAfterConflict,
   onRefetchAfterConflict,
@@ -838,6 +1009,7 @@ function ActionsSection({
 }: {
   draft: GeometryObjectDraft;
   feedback: Feedback | null;
+  sceneMutationLockReason?: string;
   onApplyCreateDraft: () => Promise<boolean>;
   onRebaseAfterConflict: () => void;
   onRefetchAfterConflict: () => void;
@@ -852,12 +1024,15 @@ function ActionsSection({
           <Button
             disabled={
               pending ||
-              draft.baseRevision === null ||
+              Boolean(sceneMutationLockReason) ||
+              typeof draft.baseRevision !== "number" ||
+              !Number.isFinite(draft.baseRevision) ||
               revisionConflictPhase !== null
             }
             size="sm"
             type="button"
             variant="primary"
+            title={sceneMutationLockReason}
             onClick={() => void onApplyCreateDraft()}
           >
             Apply Draft
@@ -888,7 +1063,7 @@ function ActionsSection({
             Rebase Draft
           </Button>
           <Button
-            disabled={pending || revisionConflictPhase !== "rebased"}
+            disabled={pending || Boolean(sceneMutationLockReason) || revisionConflictPhase !== "rebased"}
             size="sm"
             type="button"
             variant="primary"
@@ -937,12 +1112,18 @@ function DraftVectorFormField({
   onChange,
   unit,
   values,
+  draft,
+  field,
+  onUnitChange,
 }: {
+  draft?: GeometryObjectDraft;
+  field?: "size" | "translation";
+  onUnitChange?: DraftUnitUpdater;
   disabled?: boolean;
   errors?: readonly (string | undefined)[];
   label: string;
   onChange: (index: 0 | 1 | 2, value: string) => void;
-  unit: string;
+  unit?: string;
   values: readonly [string, string, string];
 }) {
   return (
@@ -951,6 +1132,12 @@ function DraftVectorFormField({
       errors={errors}
       label={label}
       unit={unit}
+      unitControls={draft && field && onUnitChange
+        ? ([0, 1, 2] as const).map((axis) => (
+            <DraftQuantityUnitSelect key={axis} draft={draft} field={`${field}.${axis}` as QuantityDraftField}
+              label={`${label} ${["X", "Y", "Z"][axis]}`} onChange={onUnitChange} />
+          )) as [ReactNode, ReactNode, ReactNode]
+        : undefined}
       values={values}
       onChange={onChange}
     />

@@ -152,6 +152,9 @@ function ProjectBatchesPage({ projectId }: { readonly projectId: string }) {
                                 {task.readiness.state === "blocked"
                                   ? ` · blocked: ${task.readiness.reason}`
                                   : " · ready"}
+                                <div className="truncate text-fm-muted" title={task.task_id}>
+                                  {task.task_id}
+                                </div>
                               </div>
                             ))}
                             {selectedRun.data.tasks.length === 0 ? <p>No tasks have been materialized.</p> : null}

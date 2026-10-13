@@ -4,6 +4,10 @@ import type {
 } from "@/kernel/api/apiTypes";
 import type { GeometryObjectDraft } from "@/kernel/authoring/object-edit/objectEditTypes";
 import {
+  geometryDraftLengthValuesEqual,
+} from "@/kernel/authoring/object-edit/objectEditDraftModel";
+import { parseDraftQuantityField } from "@/kernel/authoring/object-edit/quantityDraftFields";
+import {
   isVisualizationAirboxIdentity,
   type Selection,
 } from "@/kernel/selection/selectionTypes";
@@ -548,19 +552,50 @@ export function withObjectPlacementDraftPreview(
 
   const object = model.objects.find((candidate) => candidate.objectId === draft.objectId);
   if (!object) return model;
-  const translation = draft.translation.map(Number);
-  if (
-    translation.length !== 3 ||
-    !translation.every(Number.isFinite)
-  ) {
+  const translationFields = [
+    "translation.0",
+    "translation.1",
+    "translation.2",
+  ] as const;
+  const parsedTranslation = translationFields.map((field) =>
+    parseDraftQuantityField(draft, field),
+  );
+  const translation: [number | null, number | null, number | null] = [
+    parsedTranslation[0]?.parseStatus === "valid"
+      ? parsedTranslation[0].parsedSI
+      : parsedTranslation[0]?.lastValidSI ?? null,
+    parsedTranslation[1]?.parseStatus === "valid"
+      ? parsedTranslation[1].parsedSI
+      : parsedTranslation[1]?.lastValidSI ?? null,
+    parsedTranslation[2]?.parseStatus === "valid"
+      ? parsedTranslation[2].parsedSI
+      : parsedTranslation[2]?.lastValidSI ?? null,
+  ];
+  const [translationX, translationY, translationZ] = translation;
+  if (translationX === null || translationY === null || translationZ === null) {
     return model;
   }
+  const translatedValues: [number, number, number] = [
+    translationX,
+    translationY,
+    translationZ,
+  ];
   const currentTranslation = object.translation ?? [0, 0, 0];
-  if (translation.every((value, index) => value === currentTranslation[index])) {
+  const characteristicLength = Math.max(
+    ...object.bounds.size.map((value) => Math.abs(value)),
+    0,
+  );
+  if (translatedValues.every((value, index) =>
+    geometryDraftLengthValuesEqual(
+      value,
+      currentTranslation[index],
+      characteristicLength,
+    ),
+  )) {
     return model;
   }
 
-  const delta = translation.map((value, index) => value - currentTranslation[index]);
+  const delta = translatedValues.map((value, index) => value - currentTranslation[index]);
   const preview: Viewport3DPrimitiveObject = {
     ...object,
     bounds: {
@@ -569,8 +604,8 @@ export function withObjectPlacementDraftPreview(
         (value, index) => value + delta[index],
       ) as [number, number, number],
     },
-    geometryKey: `${object.geometryKey}|placement-draft:${translation.join(",")}`,
-    translation: translation as [number, number, number],
+    geometryKey: `${object.geometryKey}|placement-draft:${translatedValues.join(",")}`,
+    translation: translatedValues,
   };
 
   return {
