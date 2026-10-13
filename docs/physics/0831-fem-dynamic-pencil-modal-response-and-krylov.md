@@ -5862,3 +5862,31 @@ pozostają bez zmiany; jest to konsument dostarczonych widm numerycznych.
 |---|---|---|
 | `scripts/comsol_signed_k_replay.py` | `replay_signed_k_spectra` | Niezależne widma, pełne pokrycie wejść i pomiar błędów |
 | `scripts/test_comsol_signed_k_replay.py` | `test_distinct_raw_slots_and_degenerate_frequencies_preserve_multiplicity` | Degeneracje i różne numery raw bez fałszywej tożsamości |
+
+
+### G5 — certyfikowane kandydaty częściowego wyniku dense Floquet
+
+Hosted native38396790771 dla2b217f3 potwierdza exact-symmetric dodatnią masę,
+lecz mixed dense solve zachowuje certyfikowane kandydaty po dimension-limit
+ze statusem partial. Rekonstrukcja potencjału była zależna od `solved.ok`,
+więc pomijała te kandydaty, a wymagany transport phi kończył się błędem.
+Korekta ma rekonstruować i sprawdzać oryginalny descriptor także dla
+niepustego partial, przed publikacją. Hard failure, quarantine i inne
+nieobsługiwane statusy nie uprawniają do użycia obiektów ani certyfikacji.
+Nie zmienia się requested count, completeness, budżet ani tolerancje.
+Brakujące phi pozostaje błędem; częściowe wyniki nie stają się complete.
+
+Sparse fixture ma odczytywać `potential_relative_residual` zaakceptowanego
+modu z result JSON; telemetry subwindow może być niedostępna i nie jest
+certyfikatem tego modu. Dotychczasowe finite/typed/descriptor wymagania
+oraz próg1e-8 pozostają. FEM CPU: source implemented; hosted native pending i science
+NOT VERIFIED. FEM GPU bez nowej kwalifikacji; FDM CPU/GPU nie dotyczy.
+Python/ProblemIR, requested/resolved execution i fizyczne operatory bez zmian.
+
+| Źródło | Symbol | Zakres |
+|---|---|---|
+| `backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp` | `solve_modal_spectrum_for_request` | Potencjał i original descriptor dla certyfikowanych partial candidates |
+| `backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp` | `modal_floquet_shared_domain_original_descriptor_certification_is_fail_closed` | Akceptowany residual z pola wyniku, bez pożyczania unavailable telemetry |
+
+| `backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp` | `SLEPcTinyGyrotropicModalEigenResult solve_modal_spectrum_for_request` | Source-map certyfikacji partial |
+| `backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp` | `void modal_floquet_shared_domain_original_descriptor_certification_is_fail_closed` | Source-map zaakceptowanego residualu |

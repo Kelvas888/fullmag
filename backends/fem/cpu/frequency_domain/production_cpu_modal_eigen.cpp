@@ -2392,7 +2392,15 @@ SLEPcTinyGyrotropicModalEigenResult solve_modal_spectrum_for_request(
 {
     if (modal_request_is_nonzero_k_floquet(request)) {
         auto solved = solve_floquet_modal_spectrum(request, spectral_request);
-        if (reconstruction && solved.ok) {
+        // A partial result retains only candidates that passed the modal
+        // finalizer. Reconstruct those vectors for best-effort transport, but
+        // exclude other non-ok statuses and quarantined solver graphs.
+        const bool reconstructable_partial =
+            !solved.slepc_graph_quarantined &&
+            solved.status != nullptr &&
+            std::strcmp(solved.status, "partial") == 0 &&
+            !solved.accepted_modes.empty();
+        if (reconstruction && (solved.ok || reconstructable_partial)) {
             for (auto &mode : solved.accepted_modes) {
                 FloquetModalResidual residual;
                 if (certify_floquet_realified_mode(

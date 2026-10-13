@@ -4317,13 +4317,13 @@ void modal_floquet_shared_domain_original_descriptor_certification_is_fail_close
     }
     check(floquet_typed_values_finite,
           "shared-domain Floquet typed q and phi values remain finite through the C ABI");
-    // This request uses the sparse shared-domain descriptor.  The legacy
+    // This request uses the sparse shared-domain descriptor. The legacy
     // dense Schur provider certificate describes separate basis-RHS solves;
-    // it is not emitted by this route.  Require the accepted descriptor's
-    // actual potential residual instead of borrowing that legacy certificate.
+    // it is not emitted by this route. Require the residual serialized with
+    // the accepted mode instead of borrowing sparse subwindow telemetry.
     const double accepted_potential_residual = extract_json_number(
-        result.diagnostics_json,
-        "\"floquet_potential_relative_residual_max\":",
+        result.result_json,
+        "\"potential_relative_residual\":",
         "shared_domain_floquet_accepted_potential_residual");
     check(std::isfinite(accepted_potential_residual) &&
               accepted_potential_residual >= 0.0 &&
@@ -4694,6 +4694,19 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
     check(mixed_result.status == FULLMAG_FEM_FD_OK,
           "mixed shared-domain Floquet request solves using caller K/G/M and provider K_demag");
     check_recovery_provenance(mixed_result);
+    const char *partial_window = mixed_result.diagnostics_json != nullptr
+        ? std::strstr(mixed_result.diagnostics_json, "\"status\":\"partial\"")
+        : nullptr;
+    const double partial_candidate_count = partial_window != nullptr
+        ? extract_json_number(
+              partial_window,
+              "\"certified_partial_candidate_count\":",
+              "modal_shared_domain_floquet_mixed_dense_real_split_contract_partial")
+        : 0.0;
+    check(partial_window != nullptr &&
+              std::isfinite(partial_candidate_count) &&
+              partial_candidate_count > 0.0,
+          "mixed shared-domain Floquet regression transports a nonempty partial candidate");
     check(contains(
               mixed_result.diagnostics_json,
               "\"deduplication_inner_product\":\"mfem_tangent_mass\"") &&

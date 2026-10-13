@@ -4387,6 +4387,18 @@
       "path": "scripts/test_comsol_signed_k_replay.py",
       "symbol": "test_distinct_raw_slots_and_degenerate_frequencies_preserve_multiplicity",
       "responsibility": "Preserve multiplicity and independent raw-mode slots"
+    },
+    {
+      "id": "source-g5-partial-potential-reconstruction",
+      "path": "backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp",
+      "symbol": "SLEPcTinyGyrotropicModalEigenResult solve_modal_spectrum_for_request",
+      "responsibility": "Reconstruct and certify actual nonempty partial candidates while retaining partial status and excluding quarantine"
+    },
+    {
+      "id": "source-g5-accepted-mode-potential-residual",
+      "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+      "symbol": "void modal_floquet_shared_domain_original_descriptor_certification_is_fail_closed",
+      "responsibility": "Require the potential residual serialized with the accepted descriptor mode"
     }
   ],
   "public_api": {
