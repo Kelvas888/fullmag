@@ -5457,7 +5457,7 @@ fn response_field_payload_path_from_point_artifact(
     else {
         return Ok(None);
     };
-    point
+    payload
         .get("field_payload_path")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
