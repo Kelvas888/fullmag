@@ -1792,7 +1792,16 @@ pub(crate) async fn get_checkpoint_with_context(
             checkpoint_context_from_snapshot(snapshot, 0),
         )
     };
-    let store = open_store(&state)?;
+    // Inspect committed checkpoint bytes without acquiring a recovery writer lease.
+    let root = session_store_root(&state);
+    if !root
+        .try_exists()
+        .map_err(|error| ApiError::internal(error.to_string()))?
+    {
+        return Err(ApiError::not_found("checkpoint not found"));
+    }
+    let store = SessionStore::open_existing(root)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
 
     let checkpoint = read_checkpoint_for_run(&store, &run_id, &checkpoint_id)?;
     if let Some(context) = context {

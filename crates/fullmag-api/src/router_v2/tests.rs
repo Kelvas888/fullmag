@@ -28145,6 +28145,13 @@ async fn session_checkpoint_create_captures_live_magnetization() {
         .iter()
         .any(|value| value.as_str() == Some(checkpoint_artifact_ref.as_str())));
 
+    // A committed checkpoint read must remain available while another handle writes.
+    let store_root = state
+        .current_command_journal_store_root
+        .clone()
+        .unwrap_or_else(|| repo_root.join(".fullmag/local-live/session-store"));
+    let active_writer = fullmag_session::SessionStore::open_existing(store_root).unwrap();
+    let writer_lease = active_writer.write_transaction().unwrap();
     let detail_response = app
         .clone()
         .oneshot(
@@ -28158,7 +28165,16 @@ async fn session_checkpoint_create_captures_live_magnetization() {
         .await
         .unwrap();
 
-    assert_eq!(detail_response.status(), StatusCode::OK);
+    drop(writer_lease);
+    drop(active_writer);
+    if detail_response.status() != StatusCode::OK {
+        let status = detail_response.status();
+        let body = body_bytes(detail_response).await;
+        panic!(
+            "checkpoint detail returned {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
     let detail = body_json(detail_response).await;
     assert_eq!(detail["checkpoint_id"], checkpoint_id.as_str());
     assert_eq!(detail["vector_count"], 2);
