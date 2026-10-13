@@ -4346,7 +4346,7 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
     bool require_certified_recovery = false)
 {
 #if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
-    double recovered_solve_count = 0.0;
+    double sparse_recovered_solve_count = 0.0;
     const auto check_recovery_provenance = [&](
         const char *result_label,
         const FullmagFemFrequencyDomainResult &value) {
@@ -4365,7 +4365,7 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
         }
         const std::string provenance_presence_message =
             std::string(result_label) +
-            ": mixed recovery publishes separate owner and final-certificate objects";
+            ": sparse recovery publishes separate owner and final-certificate objects";
         check(recovery_json != nullptr && criterion_json != nullptr,
               provenance_presence_message.c_str());
         check(contains(value.diagnostics_json,
@@ -4386,7 +4386,7 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
                            "\"candidate_source\":\"") &&
                   contains(value.diagnostics_json,
                            "\"iteration_budget_semantics\":\"cumulative_per_original_rhs\""),
-              "mixed 4-by-4 recovery distinguishes ST transport, inner engine and physical certificate");
+              "sparse Floquet recovery distinguishes ST transport, inner engine and physical certificate");
         const double solves = extract_json_number(
             recovery_json, "\"solve_count\":", scope);
         const double certificates = extract_json_number(
@@ -4404,11 +4404,11 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
                   std::isfinite(maximum_ratio) && maximum_ratio <= 1.0 &&
                   maximum_iterations > 0.0 && configured_budget > 0.0 &&
                   maximum_iterations <= configured_budget,
-              "every completed mixed ST action passes the original true threshold within its cumulative iteration budget");
+              "every completed sparse Floquet ST action passes the original true threshold within its cumulative iteration budget");
         check(extract_json_number(criterion_json, "\"measured_count\":", scope) == solves &&
                   extract_json_number(criterion_json, "\"violation_count\":", scope) == 0.0 &&
                   extract_json_number(criterion_json, "\"unavailable_count\":", scope) == 0.0,
-              "the final returned-vector observer measures every certificate without counting failed inner attempts as violations");
+              "the sparse returned-vector observer measures every certificate without counting failed inner attempts as violations");
         const double recovered = extract_json_number(
             recovery_json, "\"recovered_solve_count\":", scope);
         if (recovered > 0.0) {
@@ -4418,8 +4418,35 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
                       extract_json_number(recovery_json, "\"last_failed_inner_iterations\":", scope) > 0.0,
                   "successful recovery retains the real rejected BREAKDOWN reason and iteration count");
         }
-        recovered_solve_count += recovered;
+        sparse_recovered_solve_count += recovered;
     };
+    const auto check_mixed_dense_lane_provenance = [&](
+        const char *result_label,
+        const FullmagFemFrequencyDomainResult &value) {
+        const char *diagnostics = value.diagnostics_json;
+        const bool reports_dense_preonly_lu =
+            diagnostics != nullptr &&
+            contains(diagnostics, "\"solver_adapter\":\"slepc_modal_eigen\"") &&
+            contains(diagnostics,
+                     "\"solver_model\":\"slepc_multi_shift_invert_production_cpu_dense\"") &&
+            contains(diagnostics, "\"ksp_type\":\"preonly\"") &&
+            contains(diagnostics, "\"pc_type\":\"lu\"");
+        const bool omits_sparse_recovery_certificate =
+            diagnostics != nullptr &&
+            !contains(diagnostics, "\"ksp_certified_recovery\":{") &&
+            !contains(diagnostics, "\"ksp_true_residual_criterion\":{") &&
+            !contains(diagnostics, "floquet_shifted_ksp_certified_recovery.v1") &&
+            !contains(diagnostics, "floquet_shifted_ksp_true_residual_criterion.v1");
+        if (!reports_dense_preonly_lu || !omits_sparse_recovery_certificate) {
+            print_bounded_cabi_modal_result(result_label, value);
+        }
+        const std::string message =
+            std::string(result_label) +
+            ": caller-dense lane reports PREONLY/LU without sparse recovery provenance";
+        check(reports_dense_preonly_lu && omits_sparse_recovery_certificate,
+              message.c_str());
+    };
+
     FloquetContourSharedDomainFixture fixture{};
     fixture.initialize();
     fixture.descriptor.term_presence_mask =
@@ -4702,7 +4729,7 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
     }
     check(mixed_result.status == FULLMAG_FEM_FD_OK,
           "mixed shared-domain Floquet request solves using caller K/G/M and provider K_demag");
-    check_recovery_provenance(
+    check_mixed_dense_lane_provenance(
         "mixed shared-domain Floquet result",
         mixed_result);
     const char *partial_window = mixed_result.diagnostics_json != nullptr
@@ -4832,8 +4859,8 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
           "invalid legacy dense dimensions do not publish solve progress");
     fullmag_fem_frequency_domain_result_destroy(&legacy_dimension_result);
     if (require_certified_recovery) {
-        check(recovered_solve_count > 0.0,
-              "the original mixed 4-by-4 fixture actually recovers at least one rejected happy breakdown");
+        check(sparse_recovered_solve_count > 0.0,
+              "the payload-only sparse Floquet result actually recovers at least one rejected happy breakdown");
     }
 #else
     std::printf("SKIP: modal_shared_domain_floquet_mixed_dense_real_split_requires_mfem_slepc\n");

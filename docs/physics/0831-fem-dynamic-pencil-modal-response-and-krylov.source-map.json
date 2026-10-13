@@ -4577,6 +4577,19 @@
       "path": "scripts/test_validate_comsol_dispersion_scientific_gate.py",
       "symbol": "test_mode_count_rotated_degenerate_cluster_compares_frequency_multisets",
       "responsibility": "Compare rotated degenerate cluster frequency multisets without member identity"
+    },
+    {
+      "id": "source-g5-recovery-lane-boundary",
+      "path": "docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md",
+      "symbol": "DOC-ANCHOR:g5-sparse-recovery-dense-bridge-boundary",
+      "responsibility": "User accepted separate sparse recovery and caller-dense descriptor validation; hosted proof pending",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "source-g5-mixed-bridge-recovery-test",
+      "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+      "symbol": "void modal_shared_domain_floquet_mixed_dense_real_split_contract",
+      "responsibility": "Sparse owner recovery certificate and count; separate caller-authoritative dense full descriptor residuals without fake certificate"
     }
   ],
   "public_api": {

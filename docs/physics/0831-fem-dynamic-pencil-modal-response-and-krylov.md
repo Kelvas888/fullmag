@@ -6117,3 +6117,37 @@ runtime i browser NOT VERIFIED; FDM CPU/GPU nie dotyczy. DSL/IR/operator bez zmi
 | `scripts/validate_comsol_dispersion_scientific_gate.py` | `_matched_frequency_multiset_comparison` | Pełne field assignment i częstości odpowiadających klastrów |
 | `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_mode_count_swapped_fields_reject_a_run_local_branch_id_false_pass` | Brak false PASS przez zgodność lokalnych slotów |
 | `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_mode_count_rotated_degenerate_cluster_compares_frequency_multisets` | Zdegenerowane podprzestrzenie i krotność częstości |
+
+
+(g5-sparse-recovery-dense-bridge-boundary)=
+### G5 — recovery sparse i osobna walidacja caller-dense
+
+Decyzja użytkownika z 2026-10-13 zachowuje mixed caller-dense jako bridge
+walidacyjny opisany w 0600. Jego K/G/M pozostają autorytatywne; rekonstrukcja
+potencjału, magnetic/potential/full-descriptor residuals oraz przesunięcie
+częstotliwości po zmianie caller K są odrębnymi obowiązkowymi oraclami.
+Dense adapter używa PREONLY/LU i nie publikuje certyfikatu inner-GMRES recovery.
+Residual odczytany z EPS/KSP nie zastępuje tych niezależnych residualów.
+
+Certyfikowane recovery testujemy na payload-only sparse Floquet owner lane,
+z rzeczywistym PREONLY/PCSHELL transportem, inner GMRES/LU, ponownym pomiarem
+true residual względem oryginalnego przesuniętego operatora i RHS oraz pełnym
+budżetem. Wymóg co najmniej jednego odzyskanego solve odnosi się wyłącznie do
+tego lane; nie sumujemy niecertyfikowanych dense solve jako dowodu recovery.
+
+Test mixed nie może żądać ani syntetyzować sparse recovery JSON dla dense LU.
+Sprawdza natomiast prawdziwy adapter, jego preonly/lu provenance i brak
+fałszywego certyfikatu. Nie zmienia to fizyki, macierzy, tolerancji ani residual
+acceptance. Rozszerzenie dense o owner-certified GMRES byłoby osobnym zadaniem.
+
+Mapa źródeł: `modal_shared_domain_floquet_mixed_dense_real_split_contract`,
+`solve_dense_production_modal_window_payload` oraz sparse owner recovery.
+Wynik pełnego hosted testu po rozdzieleniu pozostaje NOT VERIFIED do nowego
+receipt; source/doc decision nie dowodzi działania solvera ani naukowej
+kwalifikacji dynamic demag, DE/BV lub A1.
+
+
+| Źródło | Symbol / anchor | Zakres |
+|---|---|---|
+| `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md` | `DOC-ANCHOR:g5-sparse-recovery-dense-bridge-boundary` | Zatwierdzony kontrakt; runtime do oddzielnej weryfikacji |
+| `backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp` | `void modal_shared_domain_floquet_mixed_dense_real_split_contract` | Oddzielny sparse recovery i caller-dense descriptor validation |
