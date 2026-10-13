@@ -17,6 +17,7 @@ pub const MU0: f64 = 4.0 * std::f64::consts::PI * 1e-7;
 pub mod adaptive_resources;
 mod antenna_fields;
 pub mod artifact_pipeline;
+pub mod artifact_generation;
 mod artifacts;
 pub use artifacts::fem_p1_magnetization_field_semantics;
 #[cfg(feature = "stage-autosave-hdf5")]
@@ -2453,7 +2454,7 @@ fn bind_fem_execution_stage_identity<'a>(
 ) -> Result<std::borrow::Cow<'a, ProblemIR>, RunError> {
     let stage_kind = match &plan.backend_plan {
         BackendPlanIR::Fem(fem) if fem.relaxation.is_some() => "relaxation",
-        BackendPlanIR::FemEigen(eigen) if !eigen.bias_field_samples.is_empty() => "eigenmodes",
+        BackendPlanIR::FemEigen(_) => "eigenmodes",
         _ => return Ok(std::borrow::Cow::Borrowed(problem)),
     };
     let keys = ["producer_run_id", "producer_stage_id", "producer_stage_kind"];

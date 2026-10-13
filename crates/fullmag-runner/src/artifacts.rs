@@ -1960,6 +1960,15 @@ pub(crate) fn write_artifacts(
     executed: &ExecutedRun,
     streamed: Option<&ArtifactPipelineSummary>,
 ) -> std::io::Result<()> {
+    // Serialize final writes before any member is changed. No stale lease is
+    // automatically removed: recovery requires checking its active owner.
+    let _frequency_publication_lease = if executed.auxiliary_artifacts.iter().any(|artifact| {
+        artifact.relative_path.starts_with("eigen/") || artifact.relative_path.starts_with("response/")
+    }) {
+        Some(crate::artifact_generation::PublicationLease::acquire(output_dir)?)
+    } else {
+        None
+    };
     let diagnostic_steps = solver_diagnostic_steps(executed);
     let accepted_steps = diagnostic_steps
         .as_deref()
@@ -2234,6 +2243,45 @@ pub(crate) fn write_artifacts(
         &field_context,
         &execution_provenance,
     )?;
+
+    if auxiliary_artifacts.iter().any(|artifact| {
+        artifact.relative_path.starts_with("eigen/")
+            || artifact.relative_path.starts_with("response/")
+    }) {
+        let mut members = auxiliary_artifacts.iter()
+            .map(|artifact| artifact.relative_path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        members.insert("metadata.json".to_string());
+        if should_write_plan_periodic_pairs_artifact(plan, executed) {
+            members.insert("mesh/periodic_pairs.v1.json".to_string());
+        }
+        if matches!(&plan.backend_plan, BackendPlanIR::Fem(_))
+            && problem.problem_meta.runtime_metadata.get("periodic_antidot_relaxation")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|value| value.contains_key("supercell_repeat"))
+        {
+            members.insert("mesh/node_geometry.v1.json".to_string());
+        }
+        let metadata = &problem.problem_meta.runtime_metadata;
+        let owner_value = |key: &str| metadata.get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        let producer = match (
+            owner_value("producer_run_id"),
+            owner_value("producer_stage_id"),
+            owner_value("producer_stage_kind"),
+        ) {
+            (Some(run_id), Some(stage_id), Some(stage_kind)) => Some(
+                crate::artifact_generation::PublicationOwner {
+                    run_id: run_id.into(), stage_id: stage_id.into(), stage_kind: stage_kind.into(),
+                }),
+            (None, None, None) if ["producer_run_id", "producer_stage_id", "producer_stage_kind"]
+                .iter().all(|key| !metadata.contains_key(*key)) => None,
+            _ => return Err(Error::new(ErrorKind::InvalidData,
+                "incomplete frequency-domain publication owner")),
+        };
+        crate::artifact_generation::publish(output_dir, producer, members)?;
+    }
 
     Ok(())
 }

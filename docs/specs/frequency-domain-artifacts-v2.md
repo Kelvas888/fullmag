@@ -3015,3 +3015,8 @@ nie wprowadza nowego formatu real-only ani nie odcina części urojonej.
 Indeks `eigen/mode_output_selection.v1.json` mapuje każde żądanie
 field/sample_index/raw_mode_index na istniejące metadata i vector payload
 z ich SHA-256. Współdzielenie blobu nie znosi odrębności selektorów.
+
+
+## Addytywna generacja treści — C03 (ADR 0058)
+
+Kontrakt publikacji `frequency_domain_artifact_generation.v1` określa [ADR 0058](../adr/0058-frequency-domain-content-generation.md). Marker `frequency_domain/generation.v1.json` wiąże finalne length/SHA256 członków i jawnego publishera. Nie zastępuje spectrum schema, jednostek SI, certificate, scientific qualification ani directory artifact_set_id. Brak markera oznacza legacy_unverified, a brak producer — unbound. Zużyte bajty i końcowy marker muszą zgadzać się z jednym capture; mismatch nie może dawać ready ani verified multi-artifact join. Implementacja API/typed transport/UI w toku, runtime NOT VERIFIED.

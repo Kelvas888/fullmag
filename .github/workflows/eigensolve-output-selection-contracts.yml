@@ -5,6 +5,10 @@ on:
   push:
     branches: ['codex/**']
     paths:
+      - 'crates/fullmag-runner/src/artifact_generation.rs'
+      - 'crates/fullmag-runner/src/artifacts.rs'
+      - 'crates/fullmag-runner/src/autosave_zarr.rs'
+      - 'crates/fullmag-runner/src/lib.rs'
       - 'crates/fullmag-runner/src/eigen/output_selection.rs'
       - 'crates/fullmag-runner/src/eigen/k_process_pool.rs'
       - 'crates/fullmag-runner/src/eigen/orchestrator.rs'
@@ -34,6 +38,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Preserve exact source identity
         run: git rev-parse HEAD
+      - name: Verify exact-byte generation publication and lease contracts
+        run: cargo test --locked -p fullmag-runner --lib artifact_generation::tests -- --nocapture
       - name: Run output selection contracts
         run: cargo test --locked -p fullmag-runner --lib eigen::output_selection::tests -- --nocapture
       - name: Preserve adaptive pool control and planned prefix contracts
