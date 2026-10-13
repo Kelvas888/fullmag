@@ -79,3 +79,15 @@ Nie wykonano lokalnych buildów/testów ani mutacji chronionego HEAD/index/stash
 - `9f7baefcbcb809fcee3e4a587f0d8c4a001bef3f`: getter-only bounded C04 v2 IDs/configuration, parser i regresje. Parser w [GHA38364429802](https://github.com/MateuszZelent/fullmag/actions/runs/38364429802) PASS; native MFEM/SLEPc build jeszcze w toku w chwili wpisu. Nie uznano C04 full/mixed za naprawione.
 
 Publikacja C03 zachowuje fail-closed stale/conflict przy zmianie członka, bez immutable history. Ta granica ADR0058 pozostaje jawna. G0/G6/G7/G8, realny managed sweep, nauka, browser oraz integracja PR97 pozostają otwarte. A1=0.005 per pair i native tolerances nie zostały zmienione.
+
+
+## Wynik native C04 — 13.10.2026
+
+GHA38364429802 zakończył się FAILURE: build wykonał 14 CTest, 12 PASS i dwa
+oryginalne full/mixed FAIL. Parser ma 39 snapshotów i 13 prawidłowo sparowanych
+A/B/C; wejściowe wartości, zero-pivot i inode CSR nie wyjaśniają różnicy.
+Last true probe nie jest dowodem pierwszej pary B/C. Następny fragment wiąże
+pierwszy cached live/fresh action probe z tą samą parą, bez nowych solves
+lub zmian tolerance. Nie jest to jeszcze naprawa solvera ani kwalifikacja.
+Receipt SHA256: 4ce12388b137aa664d2a518ab30b5ff6c1abce979f93e08b7259e7282012e4fc.
+Log SHA256: 88fd278a3107a7fe031d6f6c2c4cb5eb6c7869f9da3fa4d31ab102af7a6c62cc.

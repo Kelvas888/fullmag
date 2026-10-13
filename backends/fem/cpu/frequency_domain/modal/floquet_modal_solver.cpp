@@ -2076,10 +2076,186 @@ struct FloquetCandidateOperatorDiagnosticWorkspace {
     PetscObjectId pmat_snapshot_copy_origin_id = 0;
     PetscErrorCode pmat_snapshot_copy_origin_error = PETSC_ERR_ARG_WRONGSTATE;
     std::int64_t pmat_snapshot_callback_ordinal = 0;
+    bool first_pmat_capture_callback_ordinal_available = false;
+    std::int64_t first_pmat_capture_callback_ordinal = 0;
     bool pmat_before_fresh_setup_snapshot_emitted = false;
+    bool factor_action_probe_marker_emitted = false;
     KSP live_pc_owned_pmat_ksp = nullptr;
     Vec live_pc_owned_pmat_solution = nullptr;
 };
+
+bool emit_floquet_factor_action_probe_marker(
+    FloquetCandidateOperatorDiagnosticWorkspace *workspace) noexcept
+{
+    if (workspace == nullptr || !floquet_factor_matrix_snapshot_requested() ||
+        workspace->factor_action_probe_marker_emitted ||
+        !workspace->pmat_before_duplicate_snapshot_emitted ||
+        !workspace->pmat_before_fresh_setup_snapshot_emitted ||
+        !workspace->first_pmat_capture_callback_ordinal_available ||
+        workspace->first_pmat_capture_callback_ordinal <= 0 ||
+        workspace->summary.callback_ordinal !=
+            static_cast<std::uint64_t>(workspace->first_pmat_capture_callback_ordinal) ||
+        workspace->production_context == nullptr ||
+        workspace->production_context->factor_snapshot_attempt_scope_id == 0 ||
+        fullmag::fem::runtime::petsc_slepc_process_is_unsafe_locked()) {
+        return false;
+    }
+    const auto &fresh = workspace->summary.live_pc_observation.borrowed_pmat_copy;
+    if (!fresh.cleanup_attempted || !fresh.cleanup_succeeded) {
+        return false;
+    }
+
+    // This marker serializes only values already measured by the private
+    // diagnostic. It deliberately makes no PETSc calls and makes no solver
+    // causality claim.
+    workspace->factor_action_probe_marker_emitted = true;
+    const auto &live = workspace->summary.live_pc_observation;
+    char json[4096] = {};
+    std::size_t used = 0;
+    bool overflow = false;
+    const auto append = [&](const char *format, auto... arguments) {
+        if (overflow) {
+            return;
+        }
+        const int written = std::snprintf(
+            json + used, sizeof(json) - used, format, arguments...);
+        if (written < 0 || static_cast<std::size_t>(written) >= sizeof(json) - used) {
+            overflow = true;
+            return;
+        }
+        used += static_cast<std::size_t>(written);
+    };
+    const auto append_measurement = [&append](
+        const char *name, bool available, double value) {
+        const bool finite_available = available && std::isfinite(value);
+        append(",\"%s_available\":%s,\"%s\":", name,
+            finite_available ? "true" : "false", name);
+        if (finite_available) {
+            append("%.17g", value);
+        } else {
+            append("null");
+        }
+    };
+    const char *live_shift_type = fresh.actual_factorization_shift_type_available
+        ? fresh.actual_factorization_shift_type : nullptr;
+    const bool live_shift_type_available = live_shift_type != nullptr;
+    const bool live_shift_amount_available =
+        fresh.actual_factorization_shift_amount_available &&
+        std::isfinite(fresh.actual_factorization_shift_amount);
+    const bool fresh_shift_type_available = fresh.fresh_shift_type_configured;
+    const bool fresh_shift_amount_available =
+        fresh.fresh_shift_amount_configured_available &&
+        std::isfinite(fresh.fresh_shift_amount_configured);
+
+    append("{\"schema\":\"fullmag.floquet-factor-action-probe.v1\","
+           "\"status\":\"captured\",\"truncated\":false,"
+           "\"attempt_scope_id\":%llu,\"attempt_scope_semantics\":"
+           "\"process_local_eps_setup_sequence\",\"capture_scope\":"
+           "\"first_b_c_snapshot_pair\",\"callback_ordinal\":%lld,"
+           "\"live_shift_measurement_scope\":"
+           "\"queried_live_PCLU_configuration_not_actual_factor_perturbation\","
+           "\"fresh_shift_measurement_scope\":"
+           "\"fresh_copy_configuration_inputs_only\","
+           "\"same_private_rhs_source\":\"live_pc_rhs_snapshot\","
+           "\"live_pmat_residual_l2_norm_available\":%s,"
+           "\"live_pmat_residual_l2_norm\":",
+        static_cast<unsigned long long>(
+            workspace->production_context->factor_snapshot_attempt_scope_id),
+        static_cast<long long>(workspace->first_pmat_capture_callback_ordinal),
+        live.pmat_residual_l2_norm_available &&
+                std::isfinite(live.pmat_residual_l2_norm) ? "true" : "false");
+    if (live.pmat_residual_l2_norm_available && std::isfinite(live.pmat_residual_l2_norm)) {
+        append("%.17g", live.pmat_residual_l2_norm);
+    } else {
+        append("null");
+    }
+    append_measurement("live_pmat_relative_residual",
+        live.pmat_relative_residual_available, live.pmat_relative_residual);
+    append_measurement("live_shifted_operator_residual_l2_norm",
+        live.shifted_operator_residual_l2_norm_available,
+        live.shifted_operator_residual_l2_norm);
+    append_measurement("live_shifted_operator_relative_residual",
+        live.shifted_operator_relative_residual_available,
+        live.shifted_operator_relative_residual);
+    append(",\"live_actual_shift_type_available\":%s,"
+           "\"live_actual_shift_type\":",
+        live_shift_type_available ? "true" : "false");
+    if (live_shift_type_available) {
+        append("\"%s\"", live_shift_type);
+    } else {
+        append("null");
+    }
+    append(",\"live_actual_shift_type_enum_available\":%s,"
+           "\"live_actual_shift_type_enum\":",
+        fresh.actual_factorization_shift_type_enum_value_available ? "true" : "false");
+    if (fresh.actual_factorization_shift_type_enum_value_available) {
+        append("%d", fresh.actual_factorization_shift_type_enum_value);
+    } else {
+        append("null");
+    }
+    append(",\"live_actual_shift_amount_available\":%s,"
+           "\"live_actual_shift_amount\":",
+        live_shift_amount_available ? "true" : "false");
+    if (live_shift_amount_available) {
+        append("%.17g", fresh.actual_factorization_shift_amount);
+    } else {
+        append("null");
+    }
+    append(",\"fresh_configured_shift_type_available\":%s,"
+           "\"fresh_configured_shift_type\":",
+        fresh_shift_type_available ? "true" : "false");
+    if (fresh_shift_type_available) {
+        append("\"MAT_SHIFT_NONZERO\"");
+    } else {
+        append("null");
+    }
+    append(",\"fresh_configured_shift_amount_available\":%s,"
+           "\"fresh_configured_shift_amount\":",
+        fresh_shift_amount_available ? "true" : "false");
+    if (fresh_shift_amount_available) {
+        append("%.17g", fresh.fresh_shift_amount_configured);
+    } else {
+        append("null");
+    }
+    append_measurement("same_private_rhs_l2_norm",
+        fresh.same_private_rhs_available, fresh.same_private_rhs_l2_norm);
+    append_measurement("fresh_pmat_residual_l2_norm",
+        fresh.fresh_pmat_residual_l2_norm_available,
+        fresh.fresh_pmat_residual_l2_norm);
+    append_measurement("fresh_pmat_relative_residual",
+        fresh.fresh_pmat_relative_residual_available,
+        fresh.fresh_pmat_relative_residual);
+    append_measurement("fresh_shifted_operator_residual_l2_norm",
+        fresh.fresh_shifted_operator_residual_l2_norm_available,
+        fresh.fresh_shifted_operator_residual_l2_norm);
+    append_measurement("fresh_shifted_operator_relative_residual",
+        fresh.fresh_shifted_operator_relative_residual_available,
+        fresh.fresh_shifted_operator_relative_residual);
+    append(",\"entry_comparison_available\":%s,"
+           "\"values_equal_available\":%s,\"values_equal\":",
+        fresh.full_explicit_entry_comparison_available ? "true" : "false",
+        fresh.values_equal_available ? "true" : "false");
+    if (fresh.values_equal_available) {
+        append("%s", fresh.values_equal ? "true" : "false");
+    } else {
+        append("null");
+    }
+    append("}");
+    if (overflow) {
+        std::fprintf(stderr,
+            "FULLMAG_FLOQUET_FACTOR_ACTION_PROBE {\"schema\":"
+            "\"fullmag.floquet-factor-action-probe.v1\",\"status\":"
+            "\"unavailable\",\"truncated\":true,\"attempt_scope_id\":%llu,"
+            "\"callback_ordinal\":%lld}\n",
+            static_cast<unsigned long long>(
+                workspace->production_context->factor_snapshot_attempt_scope_id),
+            static_cast<long long>(workspace->first_pmat_capture_callback_ordinal));
+    } else {
+        std::fprintf(stderr, "FULLMAG_FLOQUET_FACTOR_ACTION_PROBE %s\n", json);
+    }
+    std::fflush(stderr);
+    return true;
+}
 
 PetscErrorCode floquet_candidate_relative_vector_defect(
     Vec lhs,
@@ -2781,6 +2957,11 @@ PetscErrorCode prepare_candidate_owned_pmat_copy_and_lu(
                     "B_live_pc_pmat_before_duplicate", borrowed_pmat,
                     workspace->production_context->factor_snapshot_attempt_scope_id,
                     workspace->pmat_snapshot_callback_ordinal, 0, PETSC_ERR_ARG_WRONGSTATE, false, live_pc);
+                if (workspace->pmat_before_duplicate_snapshot_emitted) {
+                    workspace->first_pmat_capture_callback_ordinal_available = true;
+                    workspace->first_pmat_capture_callback_ordinal =
+                        workspace->pmat_snapshot_callback_ordinal;
+                }
             }
         }
         error = MatDuplicate(
@@ -2963,11 +3144,17 @@ PetscErrorCode prepare_candidate_owned_pmat_copy_and_lu(
                 workspace->live_pc_owned_pmat_ksp, PETSC_FALSE);
         }
         if (error == PETSC_SUCCESS) {
-            if (!workspace->pmat_before_fresh_setup_snapshot_emitted) {
+            const bool first_b_callback_matches =
+                workspace->pmat_before_duplicate_snapshot_emitted &&
+                workspace->first_pmat_capture_callback_ordinal_available &&
+                workspace->summary.callback_ordinal == static_cast<std::uint64_t>(
+                    workspace->first_pmat_capture_callback_ordinal);
+            if (!workspace->pmat_before_fresh_setup_snapshot_emitted &&
+                first_b_callback_matches) {
                 workspace->pmat_before_fresh_setup_snapshot_emitted = emit_floquet_factor_matrix_snapshot(
                     "C_owned_copy_before_fresh_setup", workspace->live_pc_owned_pmat_copy,
                     workspace->production_context->factor_snapshot_attempt_scope_id,
-                    workspace->pmat_snapshot_callback_ordinal,
+                    workspace->first_pmat_capture_callback_ordinal,
                     workspace->pmat_snapshot_copy_origin_id, workspace->pmat_snapshot_copy_origin_error,
                     workspace->pmat_before_duplicate_snapshot_emitted, fresh_pc);
             }
@@ -5047,6 +5234,7 @@ PetscErrorCode capture_candidate_operator_diagnostic_sample(
     if (live_pc_error != PETSC_SUCCESS) {
         return live_pc_error;
     }
+    (void)emit_floquet_factor_action_probe_marker(workspace);
 
     workspace->summary.sample_available = true;
     workspace->summary.status = "partial";

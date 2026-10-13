@@ -15,7 +15,10 @@ from pathlib import Path
 import re
 
 PREFIX = "FULLMAG_FLOQUET_FACTOR_MATRIX_SNAPSHOT "
+ACTION_PREFIX = "FULLMAG_FLOQUET_FACTOR_ACTION_PROBE "
 SCHEMA = "fullmag.floquet-factor-matrix-snapshot.v2"
+ACTION_SCHEMA = "fullmag.floquet-factor-action-probe.v1"
+ACTION_CAPTURE_SCOPE = "first_b_c_snapshot_pair"
 LEGACY_SCHEMA = "fullmag.floquet-factor-matrix-snapshot.v1"
 PHASES = (
     "A_shifted_pmat_before_live_setup",
@@ -37,6 +40,177 @@ INODE_METADATA_SCOPE = "pinned_3_24_6_input_matrix_size_csr_not_factor_or_use_fl
 PC_CONFIGURATION_SCOPE = "public_pc_getter_observations_only; no factor perturbation or causal explanation"
 INODE_COMPARISON_SCOPE = "input_matrix_inode_size_and_csr_metadata_only; never MAT_USE_INODES or factor-internal cache"
 ZERO_PIVOT_COMPARISON_SCOPE = "separate public zero-pivot getter readings for confirmed LU PCs; equality does not establish the same PC object, factor, or configuration; no factor perturbation or causal inference"
+ACTION_PROBE_SCOPE = "already-computed live/fresh action measurements bound to first B/C callback; no solver-cause or factor-perturbation claim"
+ACTION_VALUE_FIELDS = (
+    "live_pmat_residual_l2_norm", "live_pmat_relative_residual",
+    "live_shifted_operator_residual_l2_norm", "live_shifted_operator_relative_residual",
+    "live_actual_shift_amount", "fresh_configured_shift_amount",
+    "same_private_rhs_l2_norm", "fresh_pmat_residual_l2_norm",
+    "fresh_pmat_relative_residual", "fresh_shifted_operator_residual_l2_norm",
+    "fresh_shifted_operator_relative_residual",
+)
+
+
+def validate_action_probe(record: object) -> list[str]:
+    """Validate a separately bound action observation without changing matrix evidence."""
+    if not isinstance(record, dict):
+        return ["action probe root is not an object"]
+    errors = []
+    if record.get("schema") != ACTION_SCHEMA or record.get("status") != "captured" \
+            or record.get("truncated") is not False:
+        errors.append("action probe schema/status/truncation declaration is invalid")
+    if record.get("attempt_scope_semantics") != "process_local_eps_setup_sequence" \
+            or record.get("capture_scope") != ACTION_CAPTURE_SCOPE:
+        errors.append("action probe attempt/capture scope is invalid")
+    if record.get("live_shift_measurement_scope") != \
+            "queried_live_PCLU_configuration_not_actual_factor_perturbation" \
+            or record.get("fresh_shift_measurement_scope") != "fresh_copy_configuration_inputs_only" \
+            or record.get("same_private_rhs_source") != "live_pc_rhs_snapshot":
+        errors.append("action probe shift/RHS measurement scope is invalid")
+    for key in ("attempt_scope_id", "callback_ordinal"):
+        if type(record.get(key)) is not int or record[key] <= 0:
+            errors.append(f"action probe {key} is unavailable or invalid")
+
+    def boolean(name: str) -> bool | None:
+        value = record.get(name)
+        if type(value) is not bool:
+            errors.append(f"action probe {name} is not a boolean")
+            return None
+        return value
+
+    def available_value(name: str, *, nonnegative: bool = False) -> bool | None:
+        available = boolean(name + "_available")
+        value = record.get(name)
+        if available is True:
+            if type(value) not in (int, float):
+                errors.append(f"action probe {name} is marked available without a number")
+            else:
+                try:
+                    finite = math.isfinite(float(value))
+                except (OverflowError, ValueError):
+                    finite = False
+                if not finite or (nonnegative and value < 0):
+                    errors.append(f"action probe {name} is nonfinite or outside its range")
+        elif value is not None:
+            errors.append(f"unavailable action probe {name} must be null")
+        return available
+
+    for name in ACTION_VALUE_FIELDS:
+        available_value(name, nonnegative=name != "live_actual_shift_amount")
+
+    live_type_available = boolean("live_actual_shift_type_available")
+    live_type = record.get("live_actual_shift_type")
+    known_shift_types = {
+        "MAT_SHIFT_NONE", "MAT_SHIFT_NONZERO", "MAT_SHIFT_POSITIVE_DEFINITE", "MAT_SHIFT_INBLOCKS",
+    }
+    if live_type_available is True:
+        if not isinstance(live_type, str) or live_type not in known_shift_types:
+            errors.append("available live shift type is not a recognized PETSc shift type")
+    elif live_type is not None:
+        errors.append("unavailable live shift type must be null")
+
+    live_enum_available = boolean("live_actual_shift_type_enum_available")
+    live_enum = record.get("live_actual_shift_type_enum")
+    if live_enum_available is True:
+        if type(live_enum) is not int:
+            errors.append("available live shift type enum is not an integer")
+    elif live_enum is not None:
+        errors.append("unavailable live shift type enum must be null")
+    if live_type_available is True and live_enum_available is not True:
+        errors.append("available live shift type lacks its getter enum")
+
+    fresh_type_available = boolean("fresh_configured_shift_type_available")
+    fresh_type = record.get("fresh_configured_shift_type")
+    if fresh_type_available is True:
+        if fresh_type != "MAT_SHIFT_NONZERO":
+            errors.append("available fresh shift type contradicts configured policy")
+    elif fresh_type is not None:
+        errors.append("unavailable fresh shift type must be null")
+    fresh_amount_available = record.get("fresh_configured_shift_amount_available")
+    if fresh_amount_available is True and fresh_type_available is not True:
+        errors.append("fresh shift amount is available without configured shift type")
+
+    entry_available = boolean("entry_comparison_available")
+    equal_available = boolean("values_equal_available")
+    values_equal = record.get("values_equal")
+    if equal_available is True:
+        if type(values_equal) is not bool:
+            errors.append("available entry equality has no boolean value")
+        if entry_available is not True:
+            errors.append("entry equality is available without a full entry comparison")
+    elif values_equal is not None:
+        errors.append("unavailable entry equality must be null")
+    if entry_available is True and equal_available is not True:
+        errors.append("full entry comparison lacks an equality result")
+    return errors
+
+
+def _action_probe_pair_report(
+    items: list[dict], action_records: list[dict],
+) -> tuple[dict, list[dict]]:
+    """Bind an action marker to exact CTest invocation, attempt, and B/C ordinal."""
+    b = items[1]["snapshot"]
+    c = items[2]["snapshot"]
+    invocation = items[1].get("ctest_invocation")
+    attempt_id = b.get("attempt_scope_id")
+    callback = b.get("callback_ordinal")
+    candidates = [item for item in action_records
+                  if item.get("ctest_invocation") == invocation
+                  and isinstance(item.get("probe"), dict)
+                  and item["probe"].get("attempt_scope_id") == attempt_id]
+    exact = [item for item in candidates if item["probe"].get("callback_ordinal") == callback]
+    rejected = []
+    for item in candidates:
+        problems = validate_action_probe(item.get("probe"))
+        if item not in exact:
+            problems.append("action probe callback ordinal does not match B/C snapshots")
+        if item in exact and item.get("line", 0) <= items[2].get("line", 0):
+            problems.append("action probe was not emitted after the C snapshot")
+        if problems:
+            rejected.append({"line": item.get("line"), "reasons": problems})
+    if len(exact) != 1:
+        reason = "no exact invocation/attempt/callback action marker" if not exact \
+            else "multiple action markers match one B/C callback"
+        return ({
+            "binding_status": "NOT VERIFIED", "measurement_status": "NOT VERIFIED",
+            "reason": reason, "scope": ACTION_PROBE_SCOPE, "record": None,
+            "rejected_markers": rejected,
+        }, rejected)
+    if len(candidates) != 1:
+        return ({
+            "binding_status": "NOT VERIFIED", "measurement_status": "NOT VERIFIED",
+            "reason": "attempt has more than one action marker",
+            "scope": ACTION_PROBE_SCOPE, "record": None,
+            "rejected_markers": rejected,
+        }, rejected)
+    item = exact[0]
+    problems = validate_action_probe(item.get("probe"))
+    if item.get("line", 0) <= items[2].get("line", 0):
+        problems.append("action probe was not emitted after the C snapshot")
+    if problems:
+        if not rejected:
+            rejected.append({"line": item.get("line"), "reasons": problems})
+        return ({
+            "binding_status": "NOT VERIFIED", "measurement_status": "NOT VERIFIED",
+            "reason": "matching action marker failed schema/value validation",
+            "scope": ACTION_PROBE_SCOPE, "record": None,
+            "rejected_markers": rejected,
+        }, rejected)
+    probe = item["probe"]
+    all_values_available = all(probe.get(name + "_available") is True for name in ACTION_VALUE_FIELDS) \
+        and probe.get("live_actual_shift_type_available") is True \
+        and probe.get("live_actual_shift_type_enum_available") is True \
+        and probe.get("fresh_configured_shift_type_available") is True \
+        and probe.get("entry_comparison_available") is True \
+        and probe.get("values_equal_available") is True
+    return ({
+        "binding_status": "VERIFIED",
+        "measurement_status": "VERIFIED" if all_values_available else "NOT VERIFIED",
+        "reason": None if all_values_available else "one or more source measurements are truthfully unavailable",
+        "scope": ACTION_PROBE_SCOPE,
+        "record": probe,
+        "rejected_markers": rejected,
+    }, rejected)
 
 
 def _configuration_measurements(record: dict) -> tuple[dict | None, list[str]]:
@@ -379,8 +553,11 @@ def validate_snapshot(record: object) -> list[str]:
     return errors
 
 
-def pair_snapshots(selected: list[dict]) -> tuple[list[dict], list[str]]:
+def pair_snapshots(
+    selected: list[dict], action_records: list[dict] | None = None,
+) -> tuple[list[dict], list[str]]:
     """Bind IDs within one CTest process/attempt; never numerical acceptance."""
+    action_records = action_records or []
     attempts = {}
     issues = []
     for item in selected:
@@ -416,6 +593,7 @@ def pair_snapshots(selected: list[dict]) -> tuple[list[dict], list[str]]:
         configuration_a, _ = _configuration_measurements(a)
         configuration_b, _ = _configuration_measurements(b)
         configuration_c, _ = _configuration_measurements(c)
+        action_probe, _ = _action_probe_pair_report(items, action_records)
         paired.append({
             "ctest_invocation": attempt[0], "attempt_scope_id": attempt[1], "lines": [item["line"] for item in items],
             "a_object_id": a["object_id"], "b_object_id": b["object_id"], "c_object_id": c["object_id"],
@@ -426,6 +604,7 @@ def pair_snapshots(selected: list[dict]) -> tuple[list[dict], list[str]]:
             "b_to_c_copy_origin_verified": True, "b_to_c_raw_values_equal": raw_values(b) == raw_values(c),
             "last_true_probe_binding": "NOT VERIFIED: first-capture ordinal is explicit; last probe is not bound by this schema",
             **_configuration_pair_report(configuration_a, configuration_b, configuration_c),
+            "action_probe": action_probe,
         })
     if not paired:
         issues.append("no complete ID-bound attempts")
@@ -446,8 +625,12 @@ def parse_log(path: Path, required_tests: tuple[str, ...] = REQUIRED_TESTS) -> d
     names = {}
     invocations = {}
     records = []
+    action_records = []
     unscoped_markers = 0
     other_test_markers = 0
+    unscoped_action_markers = 0
+    other_test_action_markers = 0
+    action_marker_errors = []
     errors = []
     digest = hashlib.sha256()
     try:
@@ -459,29 +642,53 @@ def parse_log(path: Path, required_tests: tuple[str, ...] = REQUIRED_TESTS) -> d
                 if start:
                     names[int(start[1])] = start[2]
                     invocations[int(start[1])] = invocations.get(int(start[1]), 0) + 1
-                offset = line.find(PREFIX)
-                if offset < 0:
-                    continue
-                context = re.search(r"(?:^|\s)(\d+):\s*$", line[:offset])
-                if context is None:
-                    # CTest may repeat failed-test stderr without the verbose
-                    # test-ID prefix. Never assign those repeats to an attempt.
-                    unscoped_markers += 1
-                    continue
-                if names.get(int(context[1])) not in required_tests:
-                    other_test_markers += 1
-                    continue
-                if len(raw) > MAX_LINE_BYTES or len(records) >= MAX_RECORDS:
-                    errors.append(f"line {line_number}: diagnostic bound exceeded")
-                    continue
-                try:
-                    record = json.loads(line[offset + len(PREFIX):], parse_float=_finite_json_float,
-                                        parse_constant=_reject_json_constant)
-                except (ValueError, TypeError) as error:
-                    errors.append(f"line {line_number}: invalid snapshot JSON: {error}")
-                    continue
-                records.append({"line": line_number, "ctest_id": int(context[1]),
-                                "ctest_invocation": invocations.get(int(context[1])), "snapshot": record})
+                for marker_prefix, destination, marker_kind in (
+                    (PREFIX, records, "snapshot"),
+                    (ACTION_PREFIX, action_records, "action"),
+                ):
+                    offset = line.find(marker_prefix)
+                    if offset < 0:
+                        continue
+                    context = re.search(r"(?:^|\s)(\d+):\s*$", line[:offset])
+                    if context is None:
+                        # CTest may repeat failed-test stderr without the verbose
+                        # test-ID prefix. Never assign those repeats to an attempt.
+                        if marker_kind == "snapshot":
+                            unscoped_markers += 1
+                        else:
+                            unscoped_action_markers += 1
+                        continue
+                    if names.get(int(context[1])) not in required_tests:
+                        if marker_kind == "snapshot":
+                            other_test_markers += 1
+                        else:
+                            other_test_action_markers += 1
+                        continue
+                    if len(raw) > MAX_LINE_BYTES or len(records) + len(action_records) >= MAX_RECORDS:
+                        message = f"line {line_number}: diagnostic bound exceeded"
+                        if marker_kind == "snapshot":
+                            errors.append(message)
+                        else:
+                            action_marker_errors.append(message)
+                        continue
+                    try:
+                        record = json.loads(
+                            line[offset + len(marker_prefix):], parse_float=_finite_json_float,
+                            parse_constant=_reject_json_constant)
+                    except (ValueError, TypeError) as error:
+                        message = f"line {line_number}: invalid {marker_kind} JSON: {error}"
+                        if marker_kind == "snapshot":
+                            errors.append(message)
+                        else:
+                            action_marker_errors.append(message)
+                        continue
+                    item = {"line": line_number, "ctest_id": int(context[1]),
+                            "ctest_invocation": invocations.get(int(context[1]))}
+                    if marker_kind == "snapshot":
+                        item["snapshot"] = record
+                    else:
+                        item["probe"] = record
+                    destination.append(item)
         log_hash = digest.hexdigest()
     except OSError as error:
         errors.append(f"cannot read native log: {error}")
@@ -504,7 +711,8 @@ def parse_log(path: Path, required_tests: tuple[str, ...] = REQUIRED_TESTS) -> d
             errors.append(f"{name}: no valid measurement for {','.join(missing)}")
         if rejected:
             errors.append(f"{name}: {len(rejected)} invalid/unavailable snapshots")
-        bound, binding_issues = pair_snapshots(selected)
+        selected_actions = [item for item in action_records if names.get(item["ctest_id"]) == name]
+        bound, binding_issues = pair_snapshots(selected, selected_actions)
         pairing[name] = bound
         pairing_reasons.extend(f"{name}: {issue}" for issue in binding_issues)
         coverage[name] = {"measurement_status": "complete" if not missing and not rejected else "incomplete",
@@ -513,12 +721,30 @@ def parse_log(path: Path, required_tests: tuple[str, ...] = REQUIRED_TESTS) -> d
     all_pairs = [item for test_pairs in pairing.values() for item in test_pairs]
     configuration_status = "VERIFIED" if all_pairs and not errors and not pairing_reasons \
         and all(item["configuration_measurement_status"] == "VERIFIED" for item in all_pairs) else "NOT VERIFIED"
+    action_pairs = [item["action_probe"] for item in all_pairs]
+    action_binding_status = "VERIFIED" if action_pairs and all(
+        item["binding_status"] == "VERIFIED" for item in action_pairs) else "NOT VERIFIED"
+    action_measurement_status = "VERIFIED" if action_binding_status == "VERIFIED" and all(
+        item["measurement_status"] == "VERIFIED" for item in action_pairs) else "NOT VERIFIED"
+    action_rejections = list(action_marker_errors)
+    for item in action_records:
+        problems = validate_action_probe(item.get("probe"))
+        if problems:
+            action_rejections.append({"line": item.get("line"), "reasons": problems})
+    for action_pair in action_pairs:
+        action_rejections.extend(action_pair["rejected_markers"])
+    action_rejections = list({json.dumps(item, sort_keys=True, allow_nan=False): item
+                              for item in action_rejections}.values())
     return {
         "schema": "fullmag.ci.floquet-factor-matrix-snapshot-report.v1",
         "status": "failed" if errors else ("measured_bound" if not pairing_reasons else "measured_unpaired"),
         "measurement_status": "incomplete" if errors else "complete",
         "pairing_status": "VERIFIED" if not errors and not pairing_reasons else "NOT VERIFIED",
         "configuration_measurement_status": configuration_status,
+        "action_probe_binding_status": action_binding_status,
+        "action_probe_measurement_status": action_measurement_status,
+        "action_probe_scope": ACTION_PROBE_SCOPE,
+        "action_probe_rejections": action_rejections,
         "pairing": pairing, "pairing_reasons": pairing_reasons,
         "pairing_scope": "phase/attempt/object/copy binding only; no solver correctness or last-probe binding",
         "solver_failure_cause": "NOT VERIFIED",
@@ -526,9 +752,11 @@ def parse_log(path: Path, required_tests: tuple[str, ...] = REQUIRED_TESTS) -> d
         "ctest_result_modified": False,
         "log_path": str(path), "log_sha256": log_hash,
         "required_tests": list(required_tests), "coverage": coverage,
-        "records": records, "reasons": errors,
+        "records": records, "action_probe_records": action_records, "reasons": errors,
         "unscoped_markers_not_used_for_coverage": unscoped_markers,
         "other_test_markers_not_used_for_coverage": other_test_markers,
+        "unscoped_action_markers_not_used_for_coverage": unscoped_action_markers,
+        "other_test_action_markers_not_used_for_coverage": other_test_action_markers,
     }
 
 

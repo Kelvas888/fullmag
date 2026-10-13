@@ -5552,3 +5552,56 @@ C05 checkpoint GHA38357069909 na `6771daab6ee81c51133453795acbfef5c182cc66`:
 oba backing-byte harnessy PASS (32bytes rhs oraz32bytes solution), wraz z
 mutation controls. Zakres dowodu to production_backing_bytes_only. Cała suite
 12/14, full/mixed FAIL; nie jest to kwalifikacja wszystkich Vec lub solvera.
+
+
+### C04 — wynik sparowanych pomiarów GHA38364429802
+
+Clean source `9f7baefcbcb809fcee3e4a587f0d8c4a001bef3f`, CPU real-double,
+MFEM4.10, PETSc3.24.6, SLEPc3.24.3. Receipt SHA256
+`4ce12388b137aa664d2a518ab30b5ff6c1abce979f93e08b7259e7282012e4fc`;
+native log SHA256 `88fd278a3107a7fe031d6f6c2c4cb5eb6c7869f9da3fa4d31ab102af7a6c62cc`.
+[Hosted przebieg](https://github.com/MateuszZelent/fullmag/actions/runs/38364429802)
+zakończył się 12/14; oryginalne full/mixed nadal FAIL. C05 oba harnessy i
+pattern/quarantine nadal PASS. Finalizer failure nie oznacza braku wykonania:
+log zawiera rzeczywiste14CTest i terminalny exit8.
+
+Parser otrzymał39snapshotów i13sparowanych trójek (11full,2mixed).
+A/B to ten sam obiekt, raw entries A/B/C są równe, copy-origin B/C potwierdzony.
+Zmierzony B/C zero-pivot wynosi w obu przypadkach `2.220446049250313e-14`;
+wejściowa inode metadata ma count1, limit5, CSR `[0,4]` i jest równa A/B/C.
+To wyklucza te zmierzone różnice wejściowe, nie różnicę rzeczywistego działania
+faktora LU, jego perturbacji lub permutacji. Getter inode nie jest dowodem
+wewnętrznego factor-use flag ani stanu cache.
+
+Ostatnia sonda działania live/fresh nie jest powiązana z pierwszym capture
+macierzy: zachowujemy `last_true_probe_binding=NOT VERIFIED`. Kolejny bounded
+pomiar zapisze już obliczoną pierwszą obserwację działania przed cleanup,
+z dokładnym attempt/callback jak B/C. Nie wolno wykonywać nowych solve'ów,
+getters lub leases po quarantine ani poluzowywać tolerancji. Przyczyna C04
+oraz scientific qualification nadal NOT VERIFIED.
+
+
+### C04 — kontrakt pierwszej sparowanej sondy działania
+
+(c04-first-bound-action-probe)=
+<!-- DOC-ANCHOR:c04-first-bound-action-probe -->
+Marker `fullmag.floquet-factor-action-probe.v1` zapisuje wyłącznie cached
+pomiary z istniejącej obserwacji na tym samym prywatnym RHS. Stabilny ordinal
+pierwszego B/C jest niezależny od późniejszych odświeżeń kopii. Emisja wymaga
+successful cleanup i braku quarantine; nie dodaje PETSc getters, solve ani
+setterów. Brak pomiaru pozostaje null/unavailable. Konfiguracja shiftu nie
+jest pomiarem perturbacji faktora.
+
+Parser wiąże CTest invocation, EPS attempt i dokładny B/C callback, oraz
+kolejność emisji po C. Duplikaty, sprzeczne wartości i inny callback nie są
+akceptowanym dowodem działania. Stare logi bez markera zachowują poprawne
+matrix pairing, lecz action binding pozostaje NOT VERIFIED. Nowa hosted
+kompilacja i pomiar są wymagane; nie oznaczamy usunięcia C04 przed przejściem
+obu oryginalnych full/mixed testów i wyjaśnieniem true-residual failure.
+
+
+| Ścieżka | Symbol | Zakres dowodu |
+|---|---|---|
+| `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md` | `DOC-ANCHOR:c04-first-bound-action-probe` | Kontrakt sondy; hosted runtime pending |
+| `backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp` | `emit_floquet_factor_action_probe_marker` | Cached values; brak nowych operacji PETSc |
+| `scripts/ci/parse_floquet_factor_matrix_snapshots.py` | `_action_probe_pair_report` | Dokładne invocation/attempt/callback, osobny status action |

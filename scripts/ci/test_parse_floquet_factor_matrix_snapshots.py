@@ -85,9 +85,36 @@ def configured_observations():
     return records
 
 
-def write_log(path, records):
+def action_probe(*, callback=3):
+    probe = {
+        "schema": parser.ACTION_SCHEMA, "status": "captured", "truncated": False,
+        "attempt_scope_id": 1, "attempt_scope_semantics": "process_local_eps_setup_sequence",
+        "capture_scope": parser.ACTION_CAPTURE_SCOPE, "callback_ordinal": callback,
+        "live_shift_measurement_scope": "queried_live_PCLU_configuration_not_actual_factor_perturbation",
+        "fresh_shift_measurement_scope": "fresh_copy_configuration_inputs_only",
+        "same_private_rhs_source": "live_pc_rhs_snapshot",
+    }
+    for index, name in enumerate(parser.ACTION_VALUE_FIELDS, 1):
+        probe[name + "_available"] = True
+        probe[name] = float(index) / 10
+    probe.update({
+        "live_actual_shift_type_available": True,
+        "live_actual_shift_type": "MAT_SHIFT_NONZERO",
+        "live_actual_shift_type_enum_available": True,
+        "live_actual_shift_type_enum": 1,
+        "fresh_configured_shift_type_available": True,
+        "fresh_configured_shift_type": "MAT_SHIFT_NONZERO",
+        "entry_comparison_available": True,
+        "values_equal_available": True,
+        "values_equal": True,
+    })
+    return probe
+
+
+def write_log(path, records, actions=()):
     path.write_text("Start 45: synthetic\n" + "".join(
-        "45: " + parser.PREFIX + json.dumps(item["snapshot"]) + "\n" for item in records), encoding="utf-8")
+        "45: " + parser.PREFIX + json.dumps(item["snapshot"]) + "\n" for item in records) + "".join(
+        "45: " + parser.ACTION_PREFIX + json.dumps(item["probe"]) + "\n" for item in actions), encoding="utf-8")
 
 
 class SnapshotPairingTests(unittest.TestCase):
@@ -175,8 +202,73 @@ class SnapshotPairingTests(unittest.TestCase):
         self.assertEqual(report["measurement_status"], "complete")
         self.assertEqual(report["pairing_status"], "VERIFIED")
         self.assertEqual(report["configuration_measurement_status"], "NOT VERIFIED")
+        self.assertEqual(report["action_probe_binding_status"], "NOT VERIFIED")
         self.assertIsNone(report["pairing"]["synthetic"][0]["configuration"])
+        self.assertIsNone(report["pairing"]["synthetic"][0]["action_probe"]["record"])
         self.assertEqual(report["scientific_qualification"], "NOT VERIFIED")
+        self.assertEqual(report["solver_failure_cause"], "NOT VERIFIED")
+
+    def test_action_probe_requires_exact_first_bc_callback_binding(self):
+        records = observations()
+        matching = [{"line": 13, "ctest_id": 45, "ctest_invocation": 1,
+                     "probe": action_probe(callback=3)}]
+        pairs, issues = parser.pair_snapshots(records, matching)
+        self.assertEqual(issues, [])
+        self.assertEqual(pairs[0]["action_probe"]["binding_status"], "VERIFIED")
+        self.assertEqual(pairs[0]["action_probe"]["measurement_status"], "VERIFIED")
+        self.assertEqual(pairs[0]["action_probe"]["record"]["callback_ordinal"], 3)
+
+        different_callback = [{"line": 13, "ctest_id": 45, "ctest_invocation": 1,
+                               "probe": action_probe(callback=4)}]
+        pairs, issues = parser.pair_snapshots(records, different_callback)
+        self.assertEqual(issues, [])
+        self.assertEqual(pairs[0]["action_probe"]["binding_status"], "NOT VERIFIED")
+        self.assertIsNone(pairs[0]["action_probe"]["record"])
+
+        different_invocation = [{"line": 13, "ctest_id": 45, "ctest_invocation": 2,
+                                 "probe": action_probe(callback=3)}]
+        pairs, issues = parser.pair_snapshots(records, different_invocation)
+        self.assertEqual(issues, [])
+        self.assertEqual(pairs[0]["action_probe"]["binding_status"], "NOT VERIFIED")
+
+        pairs, issues = parser.pair_snapshots(records)
+        self.assertEqual(issues, [])
+        self.assertEqual(pairs[0]["action_probe"]["binding_status"], "NOT VERIFIED")
+
+    def test_action_probe_unavailable_and_contradictory_values_are_not_invented(self):
+        records = observations()
+        unavailable = action_probe()
+        unavailable["live_pmat_residual_l2_norm_available"] = False
+        unavailable["live_pmat_residual_l2_norm"] = None
+        actions = [{"line": 13, "ctest_id": 45, "ctest_invocation": 1, "probe": unavailable}]
+        pairs, issues = parser.pair_snapshots(records, actions)
+        self.assertEqual(issues, [])
+        action = pairs[0]["action_probe"]
+        self.assertEqual(action["binding_status"], "VERIFIED")
+        self.assertEqual(action["measurement_status"], "NOT VERIFIED")
+        self.assertIsNone(action["record"]["live_pmat_residual_l2_norm"])
+
+        contradictory = action_probe()
+        contradictory["fresh_pmat_residual_l2_norm_available"] = False
+        actions = [{"line": 13, "ctest_id": 45, "ctest_invocation": 1, "probe": contradictory}]
+        pairs, issues = parser.pair_snapshots(records, actions)
+        self.assertEqual(issues, [])
+        action = pairs[0]["action_probe"]
+        self.assertEqual(action["binding_status"], "NOT VERIFIED")
+        self.assertIsNone(action["record"])
+        self.assertTrue(action["rejected_markers"])
+
+    def test_action_probe_log_scope_uses_ctest_invocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "synthetic.log"
+            actions = [{"line": 13, "ctest_id": 45, "ctest_invocation": 1,
+                        "probe": action_probe()}]
+            write_log(log, observations(), actions)
+            report = parser.parse_log(log, ("synthetic",))
+        self.assertEqual(report["measurement_status"], "complete")
+        self.assertEqual(report["pairing_status"], "VERIFIED")
+        self.assertEqual(report["action_probe_binding_status"], "VERIFIED")
+        self.assertEqual(report["action_probe_measurement_status"], "VERIFIED")
         self.assertEqual(report["solver_failure_cause"], "NOT VERIFIED")
 
 

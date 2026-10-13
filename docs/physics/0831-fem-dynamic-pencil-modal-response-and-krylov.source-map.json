@@ -4164,6 +4164,25 @@
       "path": "scripts/ci/parse_floquet_factor_matrix_snapshots.py",
       "symbol": "pair_snapshots",
       "responsibility": "Bind public IDs and exact copy origin; raw value equality is not identity and first capture is not last probe"
+    },
+    {
+      "id": "source-c04-first-bound-action-contract",
+      "path": "docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md",
+      "symbol": "DOC-ANCHOR:c04-first-bound-action-probe",
+      "responsibility": "First B/C action evidence scope; no factor-perturbation or cause claim",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "source-c04-first-bound-action-emission",
+      "path": "backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp",
+      "symbol": "emit_floquet_factor_action_probe_marker",
+      "responsibility": "Cached bounded action marker only after safe cleanup and exact first B/C ordinal"
+    },
+    {
+      "id": "source-c04-first-bound-action-parser",
+      "path": "scripts/ci/parse_floquet_factor_matrix_snapshots.py",
+      "symbol": "_action_probe_pair_report",
+      "responsibility": "Exact invocation/attempt/callback pairing, unavailable and contradiction rejection"
     }
   ],
   "public_api": {
