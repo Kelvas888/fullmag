@@ -4348,6 +4348,7 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
 #if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
     double recovered_solve_count = 0.0;
     const auto check_recovery_provenance = [&](
+        const char *result_label,
         const FullmagFemFrequencyDomainResult &value) {
         if (!require_certified_recovery) {
             return;
@@ -4359,8 +4360,14 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
         const char *criterion_json = value.diagnostics_json != nullptr
             ? std::strstr(value.diagnostics_json, "\"ksp_true_residual_criterion\":{")
             : nullptr;
+        if (recovery_json == nullptr || criterion_json == nullptr) {
+            print_bounded_cabi_modal_result(result_label, value);
+        }
+        const std::string provenance_presence_message =
+            std::string(result_label) +
+            ": mixed recovery publishes separate owner and final-certificate objects";
         check(recovery_json != nullptr && criterion_json != nullptr,
-              "mixed recovery publishes separate owner and final-certificate objects");
+              provenance_presence_message.c_str());
         check(contains(value.diagnostics_json,
                        "\"schema_version\":\"floquet_shifted_ksp_certified_recovery.v1\"") &&
                   contains(value.diagnostics_json,
@@ -4679,7 +4686,9 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
               contains(payload_only_result.result_json,
                        "\"floquet_descriptor_certified\":true"),
           payload_only_failure.c_str());
-    check_recovery_provenance(payload_only_result);
+    check_recovery_provenance(
+        "payload-only shared-domain Floquet result",
+        payload_only_result);
     fullmag_fem_frequency_domain_result_destroy(&payload_only_result);
 
     FullmagFemModalEigenRequest mixed_request =
@@ -4693,7 +4702,9 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
     }
     check(mixed_result.status == FULLMAG_FEM_FD_OK,
           "mixed shared-domain Floquet request solves using caller K/G/M and provider K_demag");
-    check_recovery_provenance(mixed_result);
+    check_recovery_provenance(
+        "mixed shared-domain Floquet result",
+        mixed_result);
     const char *partial_window = mixed_result.diagnostics_json != nullptr
         ? std::strstr(mixed_result.diagnostics_json, "\"status\":\"partial\"")
         : nullptr;
@@ -7580,6 +7591,11 @@ void modal_nonzero_k_floquet_bloch_payload_reaches_production_solver()
 
     FullmagFemFrequencyDomainResult result = fullmag_fem_modal_eigen_solve(&request);
 #if FULLMAG_FEM_WITH_SLEPC
+    if (result.status != FULLMAG_FEM_FD_OK) {
+        print_bounded_cabi_modal_result(
+            "C ABI nonzero-k Floquet Bloch payload",
+            result);
+    }
     check(result.status == FULLMAG_FEM_FD_OK,
           "nonzero-k Floquet Bloch payload reaches the production SLEPc path");
     check(contains(result.diagnostics_json, "\"execution_lane\":\"production_cpu\""),
