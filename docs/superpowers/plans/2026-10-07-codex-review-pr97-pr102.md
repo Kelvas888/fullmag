@@ -3815,3 +3815,47 @@ Mixed typed mesh: legacy MeshTopology przed native single-k, equilibrium i consi
 - Dwa mixed caller/provider cases zwracają status2 / invalid_tangent_mass_metric przed solve. Nie są teraz dowodem braku zbieżności GMRES. Trwa diagnoza przekazania i walidacji dodatniej macierzy masy. Nie zmieniono progów ani warunku dodatniości.
 
 Retencja38389234232 SUCCESS Windows+Ubuntu. Rust38389038221 pozostaje in_progress; wykonane kroki do bias-field sample identity przeszły, bez deklarowania całego joba jako SUCCESS. Aktywny Stop/Pause i niezależny replay pełnego potencjału są nadal w pracy. Powyższy miniaturowy mod jest dowodem kontraktu native, nie benchmarkiem DE/BV ani kwalifikacją COMSOL A1.
+
+
+### Checkpoint — potwierdzone hosted gates i diagnoza macierzy masy
+
+- Rust [GHA38389038221](https://github.com/MateuszZelent/fullmag/actions/runs/38389038221), exact94873a7c105dfb0f65dae6724d278a58a652fae2: SUCCESS. Named worker-log/Results-owner/modal-policy/adaptive-pool/CLI kroki przeszły. Nie obejmuje native FEM, GPU ani browser.
+- Wybrany fazor modu b3f6ba0d571671bf0c67040eb4e9f38236025216: [GHA38392856904](https://github.com/MateuszZelent/fullmag/actions/runs/38392856904) SUCCESS. Inspector używa konwencji wybranego modu, a manifest pozostaje fallbackiem wyłącznie dla legacy bez wartości per-mode. Browser NOT VERIFIED.
+- Resource GET lifecycle 5a150a92337fc2ac25c1d09ec6244989b76f4d80: [GHA38393100973](https://github.com/MateuszZelent/fullmag/actions/runs/38393100973) SUCCESS Windows+Ubuntu. Brak elapsed timeout dla długiej inwentaryzacji; jawne abort, single-flight oraz zachowanie ostatnich dobrych danych są sprawdzone.
+- Native [GHA38391701157](https://github.com/MateuszZelent/fullmag/actions/runs/38391701157), exact2cfbb1df981251ab768042ba57a3d236c46dce0a: FAILURE, 14/17. Full case przechodzi physical-complex transport, lecz wymagał legacy dense-provider certificate na sparse descriptor route. ba08f4895affd544147e012e5d58476c0a5539ad sprawdza zamiast tego faktyczny accepted-mode potential residual <= istniejący próg1e-8 i pełny descriptor certificate; native rerun pending.
+- Dwa mixed cases: macierz finite, max_abs0.1436817819600737, asymetria3.4694469519536142e-18 w(0,2), pair-bound2.4651903288156619e-32. Jest to bezpośrednio zmierzone naruszenie symetrii przed solve, nie dowód braku zbieżności GMRES. Trwa review konstrukcji Hermitian C^H M C; nie zmieniono walidatora, tolerancji, fixture mass ani parametrów fizycznych.
+- Replay pełnego potencjału w review: C0 wyłącza dynamiczny demag i nie rozwiązuje psi, więc wymóg potencjału dotyczy C1/A1. Zerowy potencjał/zerowy ślad okresowy sam w sobie nie dowodzi błędnej fizyki ani poprawnego znaku Floqueta. Gauge i zewnętrzne artefakty nadal NOT VERIFIED.
+
+| ID / PR | Bieżący status | Dowód i pozostała bramka |
+|---|---|---|
+| 4241893348 / #97 | implemented | Portable logs6595421, named actual-bundle regressions38389038221 SUCCESS. |
+| 4251262132 / #97 | implemented | Ten sam zakres; interruption/oversize/duplicate/collision checked. |
+| 5483870930 / #97 | implemented | Exact per-artifact owner07773bdc, pięć named HTTP/resolver selectors38389038221 SUCCESS. |
+| 4242140002 / #97 | implemented_pending_browser | Selected-mode phasor b3f6ba0; hosted UI38392856904 SUCCESS; browser NOT VERIFIED. |
+
+Aktywne Stop/Pause, full-potential replay, signed-k/cross-run comparison, kwalifikacja mixed cells i runtime/scientific gates pozostają otwarte. PR97 nie jest gotowy do zamknięcia.
+
+
+## Checkpoint — następne korekty i aktualne dowody 2026-10-13
+
+| Zakres | Commit / dowód | Bieżący status |
+|---|---|---|
+| Masa Floqueta | 2b217f3f7e1b082e79bb094591f70e83ee93dcd7; [GHA38396800165](https://github.com/MateuszZelent/fullmag/actions/runs/38396800165) SUCCESS, exact source. `shared_domain_gilbert_mass_contract` i `floquet_positive_tangent_mass_matches_independent_phase_reduction` PASS. | Hermitian projection source/native assembly contract zweryfikowany; managed/science NOT VERIFIED. |
+| Pełny potencjał | 51578baa226ff16ae36236234f033ceef374c2c8; [GHA38400787950](https://github.com/MateuszZelent/fullmag/actions/runs/38400787950) SUCCESS na source8e81070fb20841359fcd0aca8b9667a34675184e:192 testy i149 podtestów PASS. | Actual-byte phase i pełne selection/mesh binding zaimplementowane; niezależny Poisson/gauge i real benchmark nadal NOT VERIFIED. |
+| Signed k | 89fc1a6fdf3884af9e8ebcae664686051212b83c; ta sama bramka obejmuje nowy helper i regresje. | Diagnostyka niezależnych widm ±k, bez syntetycznych punktów, branch-ID identity i nowej default tolerance. Podłączenie niezależnego negative bundle do pełnej bramki A1 nadal otwarte. |
+| Cross-run mode identity | bb9b4635144769948029df3b9912acd2b160cf9d i fixture consistency8e81070fb20841359fcd0aca8b9667a34675184e. | Numeric convergence oddzielona od physical identity, która pozostaje not_verified. Fizyczny matcher identycznych/nested mesh nie jest wdrożony; finding4080421130 niezamknięty. |
+| Konsumenci artefaktów | [GHA38400788048](https://github.com/MateuszZelent/fullmag/actions/runs/38400788048) SUCCESS, source8e81070.125+5+119 testów oraz156+70 podtestów, terminal publication44 Ubuntu/43 Windows PASS. | Hosted contract evidence, bez browser/solver scientific proof. |
+| Aktywne Stop/Pause | 09bd28e2cdd9ffec106d46bb95f429b38c724204: typed partial, prefix przed persistent control, preserved certified mode bytes, namespaced diagnostics i dominacja Stop.419a82a80b58beada20b7b6c2e744216d237756e poprawia E0425 widoczności dwóch helperów. | [GHA38401192500](https://github.com/MateuszZelent/fullmag/actions/runs/38401192500) pending. Poprzedni Rust38399893350 i method38399858095 FAIL w kompilacji fixture, nie zaliczone. |
+| Native full/mixed | [GHA38396790771](https://github.com/MateuszZelent/fullmag/actions/runs/38396790771), exact2b217f3: FAILURE14/17. Zmierzona mixed masa ma exact transpose symmetry, diagonal positive. | Dwa mixed cases znajdują mod0.51740552383475225Hz/residual4.3218654905806838e-17, lecz partial transport traci phi (`required_phi_vector_missing`). Sparse fixture odczytuje null subwindow telemetry zamiast accepted-mode residual. Korekty w toku; G5 nadal NOT VERIFIED. |
+
+Nie zmieniono rtol/atol, shiftu, preconditioning side, liczby iteracji ani metryk w celu zaliczenia testów. Success hosted contracts nie dowodzi pełnej dyspersji ani zgodności z COMSOL. Aktualny remote przed następną poprawką419a82a80b58beada20b7b6c2e744216d237756e. Chroniony localHEAD1827c3436f80ff17396c285d13c0e269eecf4b25 i indeks SHA256 D867F6996C4A8952B025F0B8644FE5E9806628C3A59706F2D87193AC81641144 są zachowane; dwa staged paths niezmienione. Nie wykonano fetch/pull/stage/local commit ani merge.
+
+Pozostają: G5 full/mixed native receipt; Stop/Pause hosted compilation/runtime; pełny hash-bound signed-k benchmark; niezależny cross-run field matching/transfer; Poisson/gauge replay; G6 nonuniform frames i directional-derivative oracle; immutable generation history; mixed-cell adapter/equilibrium/tracking; real DE/BV i A1 convergence oraz browser; odrębne rozszerzenia GPU/BEM/RF/exact-alpha. Nie przedstawiać G0–G8 ani PR97 jako ukończonych.
+
+### Aktualizacja wykonania — partial Floquet i aktywne przerwanie
+
+Commit `4232b846e22bb7c9f6984c93b06ac2863e34cc47` rekonstruuje potencjał dla niepustych, certyfikowanych wyników dense Floquet o statusie `partial`, zachowując niekompletność oraz odmowę po błędzie/quarantine. Sparse fixture odczytuje residual rzeczywiście zaakceptowanego modu; progi pozostają bez zmian. [Native GHA38402263882](https://github.com/MateuszZelent/fullmag/actions/runs/38402263882) trwa; nie jest dowodem PASS.
+
+[Rust GHA38401192500](https://github.com/MateuszZelent/fullmag/actions/runs/38401192500), source `419a82a80b58beada20b7b6c2e744216d237756e`: FAILURE. Kompilacja przeszła; regresja `eigen_path_returns_typed_partial_for_stop_and_pause_before_single_k_execution` nie znalazła oczekiwanego częściowego raportu diagnostycznego. Poprawka w toku, G2 pozostaje otwarte. Nie wolno zastąpić wymogu raportu samym statusem interrupted.
+
+Kolejne prace źródłowe: A1 konsumuje hash-bound negative bundle jako odrębny pomiar signed-k (pełna kwalifikacja pozostaje NOT VERIFIED); same-mesh matcher ma używać rzeczywistych pól, spójnej masy Tet4, głównych kątów podprzestrzeni i globalnego jednoznacznego przypisania. Zgodność częstotliwości ani branch ID nie ustalają tożsamości modów. Transfer między różnymi siatkami, replay Poissona/gauge oraz real benchmark są nadal osobnymi otwartymi zadaniami.
