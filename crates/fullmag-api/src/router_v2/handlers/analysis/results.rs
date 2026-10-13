@@ -7031,12 +7031,12 @@ mod generation_snapshot_tests {
                         "quantity_id": "m",
                         "quantity_symbol": "m",
                         "unit": "1",
-                        "component_basis": "global_xyz",
+                        "component_basis": "global_cartesian_xyz",
                         "integration_method": "not_available",
                         "qualification": "unvalidated",
                         "provenance": {"solver_device": "cpu", "observable_lane": "reference"},
                         "objects": [],
-                        "unavailable": {"reason_code": "not_computed", "detail": "fixture"}
+                        "unavailable": {"reason_code": "component_participation_unavailable", "detail": "fixture"}
                     }
                 }]
             }]
@@ -7082,6 +7082,18 @@ mod generation_snapshot_tests {
                 vector,
             ),
         ]
+    }
+
+    fn assert_valid_modal_field_generation_fixture(members: &[(String, Vec<u8>)]) {
+        let spectrum_bytes = members
+            .iter()
+            .find(|(path, _)| path == "eigen/spectrum.v3.json")
+            .map(|(_, bytes)| bytes.as_slice())
+            .expect("generation fixture should contain the V3 spectrum");
+        let spectrum: Value = serde_json::from_slice(spectrum_bytes)
+            .expect("generation fixture spectrum should be valid JSON");
+        decode_frequency_domain_artifact_payload("eigen/spectrum.v3.json", spectrum)
+            .expect("generation fixture should satisfy the production V3 spectrum validator");
     }
 
     #[tokio::test]
@@ -7141,9 +7153,11 @@ mod generation_snapshot_tests {
             stage_id: "eigen-stage".to_string(),
             stage_kind: "flat_eigenmodes".to_string(),
         });
+        let first_members = modal_field_generation_members(&topology_fingerprint, 1.0);
+        assert_valid_modal_field_generation_fixture(&first_members);
         let first_generation = write_immutable_result_generation_for_test(
             &artifact_root,
-            modal_field_generation_members(&topology_fingerprint, 1.0),
+            first_members,
             producer.clone(),
         );
         for (path, bytes) in [
@@ -7263,9 +7277,11 @@ mod generation_snapshot_tests {
             vec![1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0, 21.0, 23.0]
         );
 
+        let second_members = modal_field_generation_members(&topology_fingerprint, 100.0);
+        assert_valid_modal_field_generation_fixture(&second_members);
         let second_generation = write_immutable_result_generation_for_test(
             &artifact_root,
-            modal_field_generation_members(&topology_fingerprint, 100.0),
+            second_members,
             producer,
         );
         assert_ne!(
