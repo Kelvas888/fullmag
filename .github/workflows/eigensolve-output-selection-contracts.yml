@@ -5,6 +5,10 @@ on:
   push:
     branches: ['codex/**']
     paths:
+      - 'crates/fullmag-runner/src/adaptive_resources.rs'
+      - 'crates/fullmag-runner/src/adaptive_resources_linux.rs'
+      - 'crates/fullmag-runner/src/adaptive_resources_tests.rs'
+      - 'crates/fullmag-runner/src/fem/eigen_k_worker.rs'
       - 'crates/fullmag-runner/src/artifact_generation.rs'
       - 'crates/fullmag-runner/src/artifacts.rs'
       - 'crates/fullmag-runner/src/autosave_zarr.rs'
@@ -40,6 +44,12 @@ jobs:
         run: git rev-parse HEAD
       - name: Verify exact-byte generation publication and lease contracts
         run: cargo test --locked -p fullmag-runner --lib artifact_generation::tests -- --nocapture
+      - name: Verify Slurm allocation and child thread admission
+        run: |
+          cargo test --locked -p fullmag-runner --lib adaptive_resources -- --nocapture | tee "$RUNNER_TEMP/slurm-allocation.log"
+          grep -F "slurm_memory_headroom_uses_job_cgroup_usage_including_sibling_tasks ... ok" "$RUNNER_TEMP/slurm-allocation.log"
+          cargo test --locked -p fullmag-runner --lib eigen_k_worker -- --nocapture | tee "$RUNNER_TEMP/worker-allocation.log"
+          grep -F "worker_rejects_resolved_threads_above_declared_cpu_allocation ... ok" "$RUNNER_TEMP/worker-allocation.log"
       - name: Run output selection contracts
         run: cargo test --locked -p fullmag-runner --lib eigen::output_selection::tests -- --nocapture
       - name: Preserve adaptive pool control and planned prefix contracts

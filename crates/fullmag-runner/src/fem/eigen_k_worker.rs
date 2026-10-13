@@ -181,6 +181,7 @@ impl EigenKWorkerRequestV1 {
             || budget.cap_reason.trim().is_empty()
             || !budget.allocation_cpu_cores.is_finite()
             || budget.allocation_cpu_cores <= 0.0
+            || budget.resolved_threads as f64 > budget.allocation_cpu_cores
             || budget.host_cpu_cores == 0
             || (parent_admission_pending && budget.resolved_threads != 1)
         {
@@ -1089,6 +1090,22 @@ mod tests {
             response_path: PathBuf::from("worker-response.json"),
             cancel_path: None,
         }
+    }
+
+    #[test]
+    fn worker_rejects_resolved_threads_above_declared_cpu_allocation() {
+        let mut request = worker_request(crate::fem::eigen_tests::minimal_native_modal_plan());
+        request.parallel_policy.threads_per_worker = 8;
+        request.thread_budget = EigenKWorkerThreadBudgetV1 {
+            requested_threads: 8,
+            resolved_threads: 3,
+            cap_reason: "fixture_over_allocation".into(),
+            allocation_cpu_cores: 2.0,
+            host_cpu_cores: 32,
+        };
+
+        let error = request.validate().expect_err("child rejects an over-budget launch");
+        assert!(error.message.contains("invalid resolved thread budget"));
     }
 
     fn worker_request_v2(

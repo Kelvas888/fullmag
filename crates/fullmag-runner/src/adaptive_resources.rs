@@ -18,6 +18,54 @@ pub struct ResourceSnapshot {
     pub allocation_sources: Vec<String>,
 }
 
+pub(crate) fn allocation_integer(name: &str) -> Result<Option<u64>, String> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("invalid scheduler allocation {name}")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn slurm_task_cpu_allocation(
+    cpus_per_task: Option<u64>,
+) -> Result<(u64, &'static str), String> {
+    let (cores, source) = match cpus_per_task {
+        Some(cores) => (cores, "slurm_cpus_per_task"),
+        None => (1, "slurm_default_one_cpu_per_task"),
+    };
+    if cores == 0 {
+        return Err("zero Slurm CPU allocation per task".into());
+    }
+    Ok((cores, source))
+}
+
+/// Returns a scheduler's per-process CPU allocation, without substituting the
+/// host's visible CPU count. `SLURM_CPUS_ON_NODE` is intentionally excluded:
+/// it is a per-node/step count, while a Slurm task defaults to one CPU when
+/// `SLURM_CPUS_PER_TASK` was not requested.
+pub(crate) fn scheduler_process_cpu_allocation() -> Result<Option<(u64, &'static str)>, String> {
+    if std::env::var_os("SLURM_JOB_ID").is_some() {
+        return slurm_task_cpu_allocation(allocation_integer("SLURM_CPUS_PER_TASK")?).map(Some);
+    }
+
+    let scheduler_allocation = if std::env::var_os("PBS_JOBID").is_some() {
+        allocation_integer("PBS_NP")?.or(allocation_integer("NSLOTS")?)
+    } else if std::env::var_os("JOB_ID").is_some() {
+        allocation_integer("NSLOTS")?
+    } else {
+        return Ok(None);
+    };
+    let cores = scheduler_allocation
+        .ok_or("HPC job has no explicit per-process CPU allocation")?;
+    if cores == 0 {
+        return Err("zero scheduler CPU allocation".into());
+    }
+    Ok(Some((cores, "scheduler_process_cpu_allocation")))
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct WorkerPeak {
     /// CPU demand envelope for admission. A short or sparsely observed child

@@ -1,7 +1,9 @@
 use super::{
-    ResourceSnapshot, WorkerPeak, WorkerProcessExitRace, WorkerSample, WorkerSampleError,
+    allocation_integer, scheduler_process_cpu_allocation, ResourceSnapshot, WorkerPeak,
+    WorkerProcessExitRace, WorkerSample, WorkerSampleError,
 };
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -149,15 +151,88 @@ fn memory() -> Result<(u64, u64), String> {
     Ok((value("MemTotal:")?, value("MemAvailable:")?))
 }
 
-fn allocation_integer(name: &str) -> Result<Option<u64>, String> {
-    match std::env::var(name) {
-        Ok(value) => value
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|_| format!("invalid scheduler allocation {name}")),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(error.to_string()),
+fn slurm_memory_limit_mib(
+    memory_per_node: Option<u64>,
+    memory_per_cpu: Option<u64>,
+    cpus_on_node: Option<u64>,
+) -> Result<Option<u64>, String> {
+    if let Some(memory) = memory_per_node {
+        return Ok(Some(memory));
     }
+    let Some(memory_per_cpu) = memory_per_cpu else {
+        return Ok(None);
+    };
+    let node_cpus = cpus_on_node.ok_or("SLURM_MEM_PER_CPU requires SLURM_CPUS_ON_NODE")?;
+    if node_cpus == 0 {
+        return Err("zero Slurm CPUs available on this node".into());
+    }
+    memory_per_cpu
+        .checked_mul(node_cpus)
+        .map(Some)
+        .ok_or_else(|| "Slurm per-CPU memory allocation overflow".into())
+}
+
+fn slurm_job_memory_scope_index(
+    directories: &[PathBuf],
+    job_id: &str,
+    step_id: Option<&str>,
+) -> Option<(usize, &'static str)> {
+    let job_component = format!("job_{job_id}");
+    if let Some(index) = directories
+        .iter()
+        .position(|directory| directory.file_name() == Some(OsStr::new(job_component.as_str())))
+    {
+        return Some((index, "slurm_memory_scope_job_cgroup_by_job_id"));
+    }
+
+    // Slurm cgroup v2 uses an opaque SLUID for the job-level component by
+    // default. Its documented hierarchy is slurmstepd.scope/SLUID/step_<id>/...;
+    // accept the step parent only when both the exact environment step and the
+    // Slurm hierarchy marker are present in this process's cgroup ancestry.
+    if let Some(step_id) = step_id {
+        let step_component = format!("step_{step_id}");
+        if let Some(step_index) = directories
+            .iter()
+            .position(|directory| directory.file_name() == Some(OsStr::new(step_component.as_str())))
+        {
+            let job_index = step_index + 1;
+            let slurm_scope_parent = directories
+                .get(step_index + 2)
+                .and_then(|directory| directory.file_name())
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| {
+                    name == "slurmstepd.scope" || name.ends_with("_slurmstepd.scope")
+                });
+            if directories.get(job_index).is_some() && slurm_scope_parent {
+                return Some((
+                    job_index,
+                    "slurm_memory_scope_job_cgroup_by_step_parent",
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+fn memory_headroom_bytes(limit_bytes: u64, used_bytes: u64) -> u64 {
+    limit_bytes.saturating_sub(used_bytes)
+}
+
+fn cpu_quota_cores(value: &str) -> Result<Option<f64>, String> {
+    let fields: Vec<_> = value.split_whitespace().collect();
+    if fields.len() != 2 {
+        return Err("invalid cgroup CPU quota".into());
+    }
+    if fields[0] == "max" {
+        return Ok(None);
+    }
+    let quota: f64 = fields[0].parse().map_err(|_| "invalid CPU quota")?;
+    let period: f64 = fields[1].parse().map_err(|_| "invalid CPU period")?;
+    if !quota.is_finite() || !period.is_finite() || quota <= 0.0 || period <= 0.0 {
+        return Err("non-positive cgroup CPU quota".into());
+    }
+    Ok(Some(quota / period))
 }
 
 impl ResourceSampler {
@@ -185,6 +260,27 @@ impl ResourceSampler {
                 .collect(),
             ticks_per_second: ticks as f64,
         })
+    }
+
+    pub fn cpu_allocation_cores(
+        &self,
+        scheduler_cpu_cores: Option<u64>,
+    ) -> Result<f64, String> {
+        let mut cores = self.affinity_cores;
+        if let Some(allocated_cores) = scheduler_cpu_cores {
+            cores = cores.min(allocated_cores as f64);
+        }
+        for directory in &self.group_dirs {
+            if let Some(value) = read_optional(&directory.join("cpu.max"))? {
+                if let Some(quota_cores) = cpu_quota_cores(&value)? {
+                    cores = cores.min(quota_cores);
+                }
+            }
+        }
+        if !cores.is_finite() || cores <= 0.0 {
+            return Err("no positive effective CPU allocation is available".into());
+        }
+        Ok(cores)
     }
 
     pub fn sample(&mut self) -> Result<ResourceSnapshot, String> {
@@ -219,23 +315,14 @@ impl ResourceSampler {
         let mut available = host_available;
         let mut cores = self.affinity_cores;
         let mut cpu_scopes = Vec::new();
-        let mut finite_memory_authority = false;
+        let mut finite_memory_scopes = Vec::new();
         let mut sources = vec!["sched_getaffinity".into(), "proc_memavailable".into()];
-        for directory in &self.group_dirs {
+        for (index, directory) in self.group_dirs.iter().enumerate() {
             let mut quota_cores = None;
             if let Some(quota) = read_optional(&directory.join("cpu.max"))? {
-                let fields: Vec<_> = quota.split_whitespace().collect();
-                if fields.len() != 2 {
-                    return Err("invalid cgroup CPU quota".into());
-                }
-                if fields[0] != "max" {
-                    let quota: f64 = fields[0].parse().map_err(|_| "invalid CPU quota")?;
-                    let period: f64 = fields[1].parse().map_err(|_| "invalid CPU period")?;
-                    if !quota.is_finite() || !period.is_finite() || quota <= 0.0 || period <= 0.0 {
-                        return Err("non-positive cgroup CPU quota".into());
-                    }
-                    cores = cores.min(quota / period);
-                    quota_cores = Some(quota / period);
+                if let Some(allocated_cores) = cpu_quota_cores(&quota)? {
+                    cores = cores.min(allocated_cores);
+                    quota_cores = Some(allocated_cores);
                     sources.push("cgroup_v2_cpu_max".into());
                 }
             }
@@ -250,54 +337,75 @@ impl ResourceSampler {
                 if let Some(maximum) = read_u64(&directory.join("memory.max"))? {
                     let used = read_u64(&directory.join("memory.current"))?
                         .ok_or("invalid cgroup memory.current")?;
-                    finite_memory_authority = true;
+                    finite_memory_scopes.push(index);
                     limit = limit.min(maximum);
-                    available = available.min(maximum.saturating_sub(used));
+                    available = available.min(memory_headroom_bytes(maximum, used));
                     sources.push("cgroup_v2_memory_max".into());
+                    sources.push(if index == 0 {
+                        "cgroup_v2_memory_scope_leaf".into()
+                    } else {
+                        format!("cgroup_v2_memory_scope_ancestor_{index}")
+                    });
                 }
             }
         }
-        let scheduler_active = ["SLURM_JOB_ID", "PBS_JOBID", "JOB_ID"]
-            .iter()
-            .any(|name| std::env::var_os(name).is_some());
-        let scheduler_cpus = allocation_integer("SLURM_CPUS_PER_TASK")?
-            .or(allocation_integer("SLURM_CPUS_ON_NODE")?)
-            .or(allocation_integer("PBS_NP")?)
-            .or(allocation_integer("NSLOTS")?);
-        if let Some(cpus) = scheduler_cpus {
-            if cpus == 0 {
-                return Err("zero scheduler CPU allocation".into());
-            }
+        let scheduler_cpus = scheduler_process_cpu_allocation()?;
+        if let Some((cpus, source)) = scheduler_cpus {
             cores = cores.min(cpus as f64);
             sources.push("scheduler_cpu_allocation".into());
-        } else if scheduler_active {
-            return Err(
-                "HPC job has no explicit CPU allocation; refusing node-wide assumptions".into(),
-            );
+            sources.push(source.into());
         }
-        let slurm_memory = if std::env::var_os("SLURM_JOB_ID").is_some() {
-            allocation_integer("SLURM_MEM_PER_NODE")?
-                .or(allocation_integer("SLURM_MEM_PER_CPU")?.map(|value| {
-                    value.saturating_mul(scheduler_cpus.unwrap_or(self.affinity_cores as u64))
-                }))
+        let (slurm_memory, slurm_memory_source) = if std::env::var_os("SLURM_JOB_ID").is_some() {
+            let per_node = allocation_integer("SLURM_MEM_PER_NODE")?;
+            if let Some(mebibytes) = per_node {
+                (Some(mebibytes), Some("slurm_memory_per_node"))
+            } else {
+                let per_cpu = allocation_integer("SLURM_MEM_PER_CPU")?;
+                let node_cpus = if per_cpu.is_some() {
+                    allocation_integer("SLURM_CPUS_ON_NODE")?
+                } else {
+                    None
+                };
+                (
+                    slurm_memory_limit_mib(per_node, per_cpu, node_cpus)?,
+                    per_cpu.map(|_| "slurm_memory_per_cpu_x_cpus_on_node"),
+                )
+            }
         } else {
             // Inherited settings outside a Slurm job are not an allocation.
-            None
+            (None, None)
         };
-        if !finite_memory_authority && slurm_memory.is_none() {
+        if finite_memory_scopes.is_empty() && slurm_memory.is_none() {
             return Err("finite cgroup or scheduler memory allocation unavailable".into());
         }
         if let Some(mib) = slurm_memory {
-            let scheduler_limit = mib.saturating_mul(1024 * 1024);
+            let scheduler_limit = mib
+                .checked_mul(1024 * 1024)
+                .ok_or("Slurm memory allocation overflow")?;
             if scheduler_limit == 0 {
                 return Err("zero scheduler memory allocation".into());
             }
-            // Account the entire job/container group, including every worker and other consumers.
-            let self_rss = read_u64(&self.group_dirs[0].join("memory.current"))?
-                .ok_or("invalid cgroup memory accounting")?;
-            available = available.min(scheduler_limit.saturating_sub(self_rss));
+            let job_id = std::env::var("SLURM_JOB_ID")
+                .map_err(|_| "invalid SLURM_JOB_ID for memory accounting")?;
+            if job_id.trim().is_empty() {
+                return Err("empty SLURM_JOB_ID for memory accounting".into());
+            }
+            let step_id = std::env::var("SLURM_STEP_ID").ok();
+            let (scope_index, scope_source) = slurm_job_memory_scope_index(
+                &self.group_dirs,
+                &job_id,
+                step_id.as_deref(),
+            )
+            .ok_or("Slurm memory allocation cgroup scope unavailable; refusing unverified job usage")?;
+            let job_usage = read_u64(&self.group_dirs[scope_index].join("memory.current"))?
+                .ok_or("invalid Slurm job cgroup memory.current")?;
+            available = available.min(memory_headroom_bytes(scheduler_limit, job_usage));
             limit = limit.min(scheduler_limit);
             sources.push("slurm_memory_allocation".into());
+            sources.push(
+                slurm_memory_source.ok_or("Slurm memory allocation source unavailable")?.into(),
+            );
+            sources.push(scope_source.into());
         }
         let current = proc_cpu(&self.affinity_ids)?;
         let previous = self
@@ -488,6 +596,8 @@ fn process_measurement(pid: u32) -> Result<(u64, u64, u64), WorkerSampleError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     #[test]
     fn worker_owned_proc_not_found_is_a_typed_exit_race() {
         let pid = u32::MAX;
@@ -510,6 +620,94 @@ mod tests {
         assert_eq!(
             super::cpu_usage_scope_capacity(true, 4.0, Some(2.0)),
             Some(2.0)
+        );
+    }
+
+    #[test]
+    fn slurm_memory_per_cpu_uses_node_cpu_count_not_task_cpu_count() {
+        assert_eq!(
+            super::slurm_memory_limit_mib(None, Some(512), Some(16)).unwrap(),
+            Some(8192)
+        );
+        assert_eq!(
+            super::slurm_memory_limit_mib(Some(4096), Some(512), None).unwrap(),
+            Some(4096),
+            "a per-node memory request does not require a CPU multiplier"
+        );
+        assert!(super::slurm_memory_limit_mib(None, Some(512), None).is_err());
+    }
+
+    #[test]
+    fn cpu_quota_is_an_additional_effective_allocation_cap() {
+        assert_eq!(super::cpu_quota_cores("200000 100000").unwrap(), Some(2.0));
+        assert_eq!(super::cpu_quota_cores("max 100000").unwrap(), None);
+        assert!(super::cpu_quota_cores("invalid").is_err());
+    }
+
+    #[test]
+    fn slurm_memory_headroom_uses_job_cgroup_usage_including_sibling_tasks() {
+        let directories = vec![
+            PathBuf::from("/sys/fs/cgroup/slurm/uid_7/job_42/step_0/task_0"),
+            PathBuf::from("/sys/fs/cgroup/slurm/uid_7/job_42/step_0"),
+            PathBuf::from("/sys/fs/cgroup/slurm/uid_7/job_42"),
+            PathBuf::from("/sys/fs/cgroup/slurm/uid_7"),
+        ];
+        let scope = super::slurm_job_memory_scope_index(&directories, "42", Some("0"))
+            .expect("current cgroup ancestry includes the exact Slurm job");
+        assert_eq!(scope.0, 2);
+        assert_eq!(scope.1, "slurm_memory_scope_job_cgroup_by_job_id");
+
+        // memory.current at the job cgroup includes this task and its siblings.
+        let current_by_scope = [2_u64, 9, 15, 40];
+        let allocation = 20;
+        assert_eq!(
+            super::memory_headroom_bytes(allocation, current_by_scope[scope.0]),
+            5
+        );
+        assert_ne!(
+            super::memory_headroom_bytes(allocation, current_by_scope[0]),
+            5,
+            "the task leaf must not be subtracted from a job-wide allocation"
+        );
+    }
+
+    #[test]
+    fn slurm_step_parent_is_accepted_only_inside_slurmstepd_hierarchy() {
+        let directories = vec![
+            PathBuf::from("/sys/fs/cgroup/system.slice/slurmstepd.scope/sABC/step_batch/user/task_0"),
+            PathBuf::from("/sys/fs/cgroup/system.slice/slurmstepd.scope/sABC/step_batch/user"),
+            PathBuf::from("/sys/fs/cgroup/system.slice/slurmstepd.scope/sABC/step_batch"),
+            PathBuf::from("/sys/fs/cgroup/system.slice/slurmstepd.scope/sABC"),
+            PathBuf::from("/sys/fs/cgroup/system.slice/slurmstepd.scope"),
+            PathBuf::from("/sys/fs/cgroup/system.slice"),
+        ];
+        assert_eq!(
+            super::slurm_job_memory_scope_index(&directories, "42", Some("batch")),
+            Some((3, "slurm_memory_scope_job_cgroup_by_step_parent"))
+        );
+
+        let unrelated = vec![
+            PathBuf::from("/sys/fs/cgroup/container/step_0/task_0"),
+            PathBuf::from("/sys/fs/cgroup/container/step_0"),
+            PathBuf::from("/sys/fs/cgroup/container"),
+        ];
+        assert_eq!(
+            super::slurm_job_memory_scope_index(&unrelated, "42", Some("0")),
+            None,
+            "a leaf limit or a coincidentally named step is not job-wide authority"
+        );
+    }
+
+    #[test]
+    fn private_cgroup_root_without_job_provenance_is_unavailable() {
+        let directories = vec![
+            PathBuf::from("/sys/fs/cgroup/private/task_0"),
+            PathBuf::from("/sys/fs/cgroup/private"),
+        ];
+        assert_eq!(
+            super::slurm_job_memory_scope_index(&directories, "42", None),
+            None,
+            "a finite or unbounded private namespace root does not prove sibling scope"
         );
     }
 }

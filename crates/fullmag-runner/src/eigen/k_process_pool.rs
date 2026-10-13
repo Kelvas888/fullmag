@@ -33,6 +33,41 @@ const TELEMETRY_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WORKER_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_ADMISSION_JOURNAL_BYTES: usize = 4 * 1024 * 1024;
 
+fn resolve_serial_thread_budget(
+    requested_threads: u32,
+    allocation_cpu_cores: f64,
+    host_cpu_cores: u32,
+) -> Result<EigenKWorkerThreadBudgetV1, String> {
+    if requested_threads == 0
+        || !allocation_cpu_cores.is_finite()
+        || allocation_cpu_cores < 1.0
+        || host_cpu_cores == 0
+    {
+        return Err("serial worker thread budget requires positive task allocation and host capacity".into());
+    }
+    let allocation_cap = allocation_cpu_cores.floor().min(u32::MAX as f64) as u32;
+    let resolved_threads = requested_threads
+        .min(allocation_cap)
+        .min(host_cpu_cores)
+        .max(1);
+    let cap_reason = if resolved_threads < requested_threads {
+        if allocation_cap < host_cpu_cores {
+            "serial_process_pool_capped_by_cpu_allocation"
+        } else {
+            "serial_process_pool_capped_by_host_parallelism"
+        }
+    } else {
+        "serial_process_pool_requested_threads"
+    };
+    Ok(EigenKWorkerThreadBudgetV1 {
+        requested_threads,
+        resolved_threads,
+        cap_reason: cap_reason.into(),
+        allocation_cpu_cores,
+        host_cpu_cores,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingWorkerExitTelemetry {
     since: Instant,
@@ -1133,7 +1168,11 @@ impl EigenKProcessPool {
             return Err("cannot resolve worker threads without a positive CPU allocation".into());
         }
         let workers = workers_after_spawn.max(1) as f64;
-        let allocation_cap = (resources.allocated_cpu_cores / workers).floor().max(1.0);
+        let per_worker_allocation = resources.allocated_cpu_cores / workers;
+        if per_worker_allocation < 1.0 {
+            return Err("cannot admit an eigen worker without one allocated CPU per worker".into());
+        }
+        let allocation_cap = per_worker_allocation.floor();
         let allocation_cap = allocation_cap.min(u32::MAX as f64) as u32;
         let resolved = requested.min(host_cap).min(allocation_cap).max(1);
         let cap_reason = if resolved < requested {
@@ -1365,6 +1404,18 @@ impl EigenKProcessPool {
             let host_cpu_cores = std::thread::available_parallelism()
                 .map(|value| value.get().min(u32::MAX as usize) as u32)
                 .unwrap_or(1);
+            let scheduler_allocation =
+                crate::adaptive_resources::scheduler_process_cpu_allocation()?;
+            #[cfg(target_os = "linux")]
+            let allocation_cpu_cores = ResourceSampler::new()
+                .map_err(|error| {
+                    format!("serial pool cannot verify effective Linux CPU allocation: {error}")
+                })?
+                .cpu_allocation_cores(scheduler_allocation.map(|(cores, _source)| cores))?;
+            #[cfg(not(target_os = "linux"))]
+            let allocation_cpu_cores = scheduler_allocation
+                .map(|(cores, _source)| cores as f64)
+                .unwrap_or(host_cpu_cores as f64);
             for (index, request) in requests.iter().enumerate() {
                 if let Some(action) = requested_control_action(
                     &cancel,
@@ -1379,23 +1430,13 @@ impl EigenKProcessPool {
                     });
                 }
                 let requested_threads = self.policy.threads_per_worker;
-                let resolved_threads = requested_threads.min(host_cpu_cores).max(1);
-                let cap_reason = if resolved_threads < requested_threads {
-                    "serial_process_pool_capped_by_host_parallelism"
-                } else {
-                    "serial_process_pool_requested_threads"
-                };
-                let worker = self.spawn_worker(
-                    request,
-                    index,
-                    EigenKWorkerThreadBudgetV1 {
-                        requested_threads,
-                        resolved_threads,
-                        cap_reason: cap_reason.into(),
-                        allocation_cpu_cores: host_cpu_cores as f64,
-                        host_cpu_cores,
-                    },
+                let thread_budget = resolve_serial_thread_budget(
+                    requested_threads,
+                    allocation_cpu_cores,
+                    host_cpu_cores,
                 )?;
+                let worker =
+                    self.spawn_worker(request, index, thread_budget.clone())?;
                 report.resolved_workers = report.resolved_workers.max(1);
                 report.worker_logs.push(ProcessPoolWorkerLogV1 {
                     sample_index: request.sample_index,
@@ -1408,13 +1449,7 @@ impl EigenKProcessPool {
                 journal.update(&report);
                 report.thread_bindings.push(ProcessPoolThreadBindingV1 {
                     sample_index: request.sample_index,
-                    budget: EigenKWorkerThreadBudgetV1 {
-                        requested_threads,
-                        resolved_threads,
-                        cap_reason: cap_reason.into(),
-                        allocation_cpu_cores: host_cpu_cores as f64,
-                        host_cpu_cores,
-                    },
+                    budget: thread_budget,
                 });
                 let (response, after_response_action) = match self.finish_child_with_cancel(
                     worker,
@@ -1993,6 +2028,36 @@ mod tests {
             mode: ParallelExecutionModeIR::Serial,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn serial_thread_budget_uses_task_allocation_before_host_parallelism() {
+        let budget = super::resolve_serial_thread_budget(8, 2.0, 32).unwrap();
+        assert_eq!(budget.requested_threads, 8);
+        assert_eq!(budget.resolved_threads, 2);
+        assert_eq!(budget.allocation_cpu_cores, 2.0);
+        assert_eq!(budget.host_cpu_cores, 32);
+        assert_eq!(
+            budget.cap_reason,
+            "serial_process_pool_capped_by_cpu_allocation"
+        );
+    }
+
+    #[test]
+    fn serial_thread_budget_keeps_host_parallelism_as_an_additional_cap() {
+        let budget = super::resolve_serial_thread_budget(8, 8.0, 2).unwrap();
+        assert_eq!(budget.resolved_threads, 2);
+        assert_eq!(budget.allocation_cpu_cores, 8.0);
+        assert_eq!(budget.host_cpu_cores, 2);
+        assert_eq!(
+            budget.cap_reason,
+            "serial_process_pool_capped_by_host_parallelism"
+        );
+    }
+
+    #[test]
+    fn serial_thread_budget_rejects_fractional_allocation_below_one_thread() {
+        assert!(super::resolve_serial_thread_budget(8, 0.5, 32).is_err());
     }
 
     fn serial_test_pool(root: &Path) -> EigenKProcessPool {

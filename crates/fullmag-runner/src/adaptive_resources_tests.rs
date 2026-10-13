@@ -22,6 +22,18 @@ fn adaptive() -> AdaptiveAdmission {
 }
 
 #[test]
+fn slurm_process_budget_uses_per_task_cpu_count_and_documented_default() {
+    assert_eq!(
+        super::slurm_task_cpu_allocation(Some(2)).unwrap(),
+        (2, "slurm_cpus_per_task")
+    );
+    assert_eq!(
+        super::slurm_task_cpu_allocation(None).unwrap(),
+        (1, "slurm_default_one_cpu_per_task")
+    );
+}
+
+#[test]
 fn a_successful_whole_probe_is_required_before_ramping() {
     let mut admission = adaptive();
     let now = Instant::now();
