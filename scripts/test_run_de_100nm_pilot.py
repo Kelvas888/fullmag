@@ -395,19 +395,28 @@ class PilotTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             context = SimpleNamespace(
-                layout={"repo_root": str(root)}, image_digest="sha256:test"
+                layout={"repo_root": str(root)}, image_digest="sha256:test",
+                job={"job_id": "a" * 32}, source_tree=root, runtime_root=root,
             )
             with patch.object(pilot.managed, "_run_request", return_value={"source": {}, "job": {}, "runtime": {}}), \
                  patch.object(pilot.managed, "_compose_environment", return_value={}), \
                  patch.object(pilot.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(pilot.managed, "_inspect_benchmark_container", return_value={"status": "absent"}) as inspect, \
                  patch.object(pilot, "resolve_runtime_artifact_root", side_effect=_fake_runtime_artifact_resolver), \
                  patch.object(pilot.managed, "_validate_case_artifacts", return_value={}), \
                  patch.object(pilot, "validate_rows", side_effect=ValueError("missing DE-SMOKE samples")), \
                  patch("builtins.print"):
                 self.assertEqual(pilot.execute(context, root, ["docker"], "abc", pilot="de-smoke-two"), 1)
+            inspect.assert_called_once()
+            self.assertEqual(
+                inspect.call_args.args[:2],
+                (pilot.managed._container_identity(context, root),
+                 pilot.managed._expected_container_mounts(context, root)),
+            )
             result = json.loads((root / "run-result.json").read_text())
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["return_code"], 0)
+            self.assertEqual(result["container_cleanup"]["status"], "verified_absent")
             self.assertIn("missing DE-SMOKE samples", result["error"])
 
     def test_potential_reconstruction_requires_every_published_mode(self):
@@ -540,20 +549,29 @@ class PilotTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             context = SimpleNamespace(
-                layout={"repo_root": str(root)}, image_digest="sha256:test"
+                layout={"repo_root": str(root)}, image_digest="sha256:test",
+                job={"job_id": "a" * 32}, source_tree=root, runtime_root=root,
             )
             with patch.object(pilot.managed, "_run_request", return_value={"source": {}, "job": {}, "runtime": {}}), \
                  patch.object(pilot.managed, "_compose_environment", return_value={}), \
                  patch.object(pilot.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(pilot.managed, "_inspect_benchmark_container", return_value={"status": "absent"}) as inspect, \
                  patch.object(pilot, "resolve_runtime_artifact_root", side_effect=_fake_runtime_artifact_resolver), \
                  patch.object(pilot.managed, "_validate_case_artifacts", return_value={}), \
                  patch.object(pilot, "validate_rows", return_value={"sample_count": 2}), \
                  patch.object(pilot, "validate_smoke_potential_fields", side_effect=ValueError("gradient mismatch")), \
                  patch("builtins.print"):
                 self.assertEqual(pilot.execute(context, root, ["docker"], "abc", pilot="de-smoke-two"), 1)
+            inspect.assert_called_once()
+            self.assertEqual(
+                inspect.call_args.args[:2],
+                (pilot.managed._container_identity(context, root),
+                 pilot.managed._expected_container_mounts(context, root)),
+            )
             result = json.loads((root / "run-result.json").read_text())
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["return_code"], 0)
+            self.assertEqual(result["container_cleanup"]["status"], "verified_absent")
             self.assertIn("gradient mismatch", result["error"])
 
     def test_command_selects_numerical_pilot_without_case_override(self):
@@ -1527,7 +1545,7 @@ class PilotTests(unittest.TestCase):
             recorder = _FixtureDslRecorder()
             fullmag = types.ModuleType("fullmag")
             for name in ("study", "ParallelExecutionPolicy", "Box", "KPoint", "KPath",
-                         "PeriodicBC", "FloquetBC"):
+                         "PeriodicBC", "FloquetBC", "StageAutosave", "FieldAutosave"):
                 setattr(fullmag, name, _FixtureDslNode(recorder, name))
             fullmag.init = _FixtureDslNode(recorder, "init")
             with patch.dict(os.environ, environment, clear=True), \
@@ -1644,7 +1662,7 @@ class PilotTests(unittest.TestCase):
             gamma.assert_not_called()
             floquet.assert_called_once_with(
                 Path("case"), "k-10", "fgmres", "1e-9", spectral_target="nearest",
-                target_frequency_hz=11.2e9, gmres_restart=8)
+                target_frequency_hz=11.2e9, gmres_restart=8, bundle_reader=None)
             self.assertEqual(set(artifacts), {"shifted_ksp_trial"})
 
     def test_nearest_krylov_receipt_rejects_gamma_grouped_and_unknown_selection(self):

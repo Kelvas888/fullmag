@@ -4089,3 +4089,9 @@ Pierwszy hard opt-out wywołuje oczekiwany błąd EPSSolve/PCApply (log 13080–
 Remote6bf6b899: CI38456836046 Ubuntu SUCCESS (shared Rust reader4, inspector49, Pythonreader19 PASS). Pełny pilot/helper subset151PASS323subtests4FAIL: nieaktualny fake fullmag StageAutosave, mock bundle_reader=None i dwa niepełne context.job dla cleanup. Korekty fixture w toku; migracja nie jest jeszcze w całości zweryfikowana.
 
 Hard EPS opt-out/nearest/fresh-LU fault/window rozdzielono na cztery CLI selectory/CTest procesy; każdy kończy się przed następnym solver call. Root source review potwierdziło zachowanie każdej usuniętej linii starego bloku po normalizacji wcięć (poza rozszerzoną sygnaturą). Profil floquet-modal-slepc jawnie zawiera cztery nowe testy/markery. AST i diff checks PASS; runtime pending. Produkcyjna kwarantanna i residuale bez zmian.
+
+### Review fixture i uruchomienie izolowanej bramki
+
+Native38457679244 działa na exact ed322bf97255a873271237ad80967225a6b3101d (21 testów zamiast17); nie restartujemy go przy niezależnym commicie fixture. Migration38456836046: Ubuntu4/49/19, Windows4/48/19 PASS; subset144/162,248/4,214/70 PASS. Method38456836000, API38456835980, spectrum_scope38456835996 i output-selection38456835999 SUCCESS.
+
+Cztery fixture pilota poprawione: fake DSL obejmuje istniejące StageAutosave/FieldAutosave, nearest mock jawnie otrzymuje bundle_reader=None, błędna walidacja przechodzi przez real cleanup z kompletnym context i mockiem inspekcji kontenera absent. Root review wykryło i usunęło niedeterministyczny mock subprocess.run (default argument cleanup związany wcześniej); nowe asercje sprawdzają identity/mounts oraz verified_absent. Science refusal assertions zachowane. Nowe wykonanie tych fixture pending CI.
