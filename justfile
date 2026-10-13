@@ -26,8 +26,92 @@ storage-info:
 storage-inventory:
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_storage.py" inventory --repo-root "{{repo_root}}" --format json
 
+# Launch an already successful managed CPU release; never build or install.
+run-managed-browser job_id commit port="3104":
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_browser.py" --repo-root "{{repo_root}}" --job-id {{job_id}} --commit {{commit}} --port {{port}}
+
 storage-prepare:
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_storage.py" prepare-links --repo-root "{{repo_root}}" --compat --frontend
+
+# Diagnostic source-check worker; this is not a managed FEM qualification image.
+runner-image:
+    docker build --network none --pull=false -t fullmag/local-runner-source:development scripts/local_runner
+
+runner-build-image toolchain_image tag="fullmag/local-runner-build:development":
+    docker --context desktop-linux build --network none --pull=false --build-arg TOOLCHAIN_IMAGE={{quote(toolchain_image)}} -f scripts/local_runner/Dockerfile.build -t {{quote(tag)}} scripts/local_runner
+
+runner-coordinator-image:
+    docker --context desktop-linux build --network none --pull=false -f scripts/local_runner/Dockerfile.coordinator -t fullmag/build-runner:development scripts
+
+runner-container-configure image_id:
+    {{storage_python}} scripts/local_runner_cli.py container-configure --image-id {{quote(image_id)}}
+
+runner-container-start:
+    {{storage_python}} scripts/local_runner_cli.py container-start
+
+runner-container-status:
+    {{storage_python}} scripts/local_runner_cli.py container-status
+
+runner-container-stop:
+    {{storage_python}} scripts/local_runner_cli.py container-stop
+
+runner-test:
+    {{storage_python}} -m unittest discover -s scripts -p 'test_local_runner_*.py'
+    {{storage_python}} -m unittest discover -s scripts -p 'test_storage_capabilities.py'
+    {{storage_python}} -m unittest discover -s scripts/tests/local_runner -p 'test_*.py'
+
+# Diagnostic only: never enrolls a storage backend for FEM qualification.
+runner-storage-probe role="build":
+    {{storage_python}} scripts/probe_docker_storage.py --role {{quote(role)}}
+
+runner-storage-probe-case-sensitive:
+    {{storage_python}} scripts/probe_docker_storage.py --role build --case-sensitive
+
+runner-submit mode ref="":
+    {{storage_python}} scripts/local_runner_cli.py submit --source {{quote(mode)}} {{if ref == "" { "" } else { "--ref " + quote(ref) }}}
+
+runner-status job:
+    {{storage_python}} scripts/local_runner_cli.py status {{quote(job)}}
+
+runner-logs job:
+    {{storage_python}} scripts/local_runner_cli.py logs {{quote(job)}}
+
+runner-wait job timeout="30":
+    {{storage_python}} scripts/local_runner_cli.py wait {{quote(job)}} --timeout-seconds {{quote(timeout)}}
+
+runner-list:
+    {{storage_python}} scripts/local_runner_cli.py list
+
+runner-doctor:
+    {{storage_python}} scripts/local_runner_cli.py doctor
+
+runner-cancel job:
+    {{storage_python}} scripts/local_runner_cli.py cancel {{quote(job)}}
+
+runner-configure image_id:
+    {{storage_python}} scripts/local_runner_cli.py configure-image --image-id {{quote(image_id)}}
+
+runner-once:
+    {{storage_python}} scripts/local_runner_cli.py run-once
+
+# Build catalogue: immutable source selection, no user-supplied shell command.
+runner-build mode profile="fem-cpu-release" ref="":
+    {{storage_python}} scripts/local_runner_cli.py submit --operation build --profile {{quote(profile)}} --source {{quote(mode)}} {{if ref == "" { "" } else { "--ref " + quote(ref) }}}
+
+runner-configure-build profile image_id:
+    {{storage_python}} scripts/local_runner_cli.py configure-build --profile {{quote(profile)}} --image-id {{quote(image_id)}}
+
+runner-container-resume:
+    {{storage_python}} scripts/local_runner_cli.py container-resume
+
+runner-retention-plan:
+    {{storage_python}} scripts/local_runner_cli.py retention-plan
+
+runner-container-replace image_id:
+    {{storage_python}} scripts/local_runner_cli.py container-replace --image-id {{quote(image_id)}}
+
+runner-reconcile job:
+    {{storage_python}} scripts/local_runner_cli.py reconcile {{quote(job)}}
 
 # Explicit worktree ownership operations.  `quote()` keeps task metadata as
 # one shell argument even when owner/purpose contains spaces or apostrophes.
@@ -43,6 +127,100 @@ windows-doctor:
 windows-setup:
     powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{repo_root}}/scripts/windows/setup_fullmag.ps1" -InstallMissing
 
+# Build a missing/stale native package, then open the empty authoring workspace.
+windows-ui frontend="dev" web_port="3197" build="auto" backend_profile="auto":
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{repo_root}}/scripts/windows/run_fullmag.ps1" -BuildMode "{{build}}" -Frontend "{{frontend}}" -BackendProfile "{{backend_profile}}" -RunMode workspace -WebPort "{{web_port}}"
+
+# Build the native workspace without starting the UI. The fixed storage action
+# owns preflight, the native heavy slot and the terminal receipt.
+windows-workspace-build backend_profile="dev" frontend="dev" web_port="3197" build="auto":
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{repo_root}}/scripts/windows/run_fullmag.ps1" -BuildMode "{{build}}" -Frontend "{{frontend}}" -BackendProfile "{{backend_profile}}" -RunMode workspace -WebPort "{{web_port}}" -BuildOnly
+
+# Recover a stale native workspace owner only after Windows process/listener checks.
+windows-runtime-recover port="3197":
+    @{{storage_python}} "{{repo_root}}/scripts/windows/recover_runtime.py" --repo-root "{{repo_root}}" --web-port "{{port}}"
+
+# Explicit one-shot backend rebuild; does not restart the active workspace.
+windows-backend-dev web_port="3197":
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{repo_root}}/scripts/windows/run_fullmag.ps1" -BuildMode "true" -Frontend "dev" -BackendProfile "dev" -RunMode workspace -WebPort "{{web_port}}" -BuildOnly
+
+# Fixed interpreted checks for development handoff persistence, without Cargo.
+verify-windows-development-handoff:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_handoff.py" --repo-root "{{repo_root}}"
+
+# Observe the development resource in an owned empty API; no unit compilation.
+verify-windows-development-backend-api cross_build_bundle="":
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --cross-build-bundle "{{cross_build_bundle}}"
+
+# Explicit frozen native package gate, pinned to the completed manifest digest.
+verify-windows-frozen-development-backend-api build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --frozen-native-build-id "{{build_id}}"
+
+# Owned HTTP cancellation protocol proof, pinned to a verified native package.
+# Uses fixture-seeded task catalogs; does not qualify Submit, solver, or host release.
+verify-compute-cancellation-api build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-cancellation-only --frozen-native-build-id "{{build_id}}"
+
+# Native operator initialization proof; fixture policy is not hardware evidence.
+verify-compute-host-initialization build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-host-initialization-only --frozen-native-build-id "{{build_id}}"
+
+# Standalone scheduler component cancellation/drain proof, not service v2 startup.
+verify-compute-scheduler-cancellation build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-scheduler-cancellation-only --frozen-native-build-id "{{build_id}}"
+
+# Native observer protocol proof; no unit-test compilation or user-session restart.
+verify-windows-development-observer-pause:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --observer-pause-only
+
+# Owned empty/scene consumer proof; never restarts a user's workspace.
+verify-windows-development-restart-consumer:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --restart-consumer-only
+
+# Owner-authenticated lease proof in separate owned APIs with controlled frames.
+verify-windows-development-consumer-readiness:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --consumer-readiness-only
+
+# Exercise the B consumer pump with an independently verified A API bundle.
+verify-windows-development-consumer-pump owner_bundle:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --consumer-pump-owner-bundle "{{owner_bundle}}"
+
+# Refuse native restart while a real FDM CPU run keeps progressing.
+verify-windows-development-active-run-refusal owner_bundle:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --active-run-refusal-owner-bundle "{{owner_bundle}}"
+
+# Refuse native restart while a real FDM CPU run is paused, then resume it.
+verify-windows-development-active-run-paused-refusal owner_bundle:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --active-run-refusal-owner-bundle "{{owner_bundle}}" --active-run-scenario "paused"
+
+# Exercise the concurrent API Solve versus restart-acquisition admission boundary.
+verify-windows-development-start-freeze-race:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --start-freeze-race-only
+
+# Owned native restart with a real nonempty browser workspace and unsaved draft.
+verify-windows-development-workspace-browser owner_bundle:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --workspace-browser-owner-bundle "{{owner_bundle}}"
+
+# Real candidate helper faults in owned processes; no API or unit compilation.
+verify-windows-candidate-preparation:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --candidate-preparation-only
+
+# Native request transport proof; no unit-test compilation or user-session restart.
+verify-windows-development-restart-transport:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --restart-transport-only
+
+# Observe actual runtime-free project archives without compiling unit tests.
+verify-windows-project-document:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only
+
+# Bind archive and scene-stage proof to one sealed package despite later checkout edits.
+verify-windows-project-document-frozen build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only --frozen-native-build-id "{{build_id}}"
+
+# Preserve a verified old API package for an owned subsequent restart proof.
+archive-windows-native-build build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only --frozen-native-build-id "{{build_id}}" --archive-frozen-bundle
+
 windows-build backend="fdm" device="cpu" frontend="dev" skip_local_changes="false":
     backend="{{backend}}"; device="{{device}}"; frontend="{{frontend}}"; skip_local_changes="{{skip_local_changes}}"; \
     case "$backend" in backend=*) backend="${backend#backend=}" ;; --backend=*) backend="${backend#--backend=}" ;; esac; \
@@ -55,6 +233,14 @@ windows-build backend="fdm" device="cpu" frontend="dev" skip_local_changes="fals
     else \
       powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{repo_root}}/scripts/windows/run_fullmag.ps1" -BuildMode true -BuildOnly -Frontend "$frontend" -Backend "$backend" -Device "$device" "${skip_local_changes_args[@]}"; \
     fi
+
+# Run targeted Rust tests in the same Windows-managed FEM container lane.
+windows-test-fem device="cpu" package="fullmag-api" filter="remesh":
+    device="{{device}}"; package="{{package}}"; filter="{{filter}}"; \
+    case "$device" in device=*) device="${device#device=}" ;; --device=*) device="${device#--device=}" ;; esac; \
+    case "$package" in package=*) package="${package#package=}" ;; --package=*) package="${package#--package=}" ;; esac; \
+    case "$filter" in filter=*) filter="${filter#filter=}" ;; --filter=*) filter="${filter#--filter=}" ;; esac; \
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{repo_root}}/scripts/windows/run_fullmag_fem.ps1" -BuildMode true -BuildOnly -Backend fem -Device "$device" -TestPackage "$package" -TestFilter "$filter"
 
 ensure-python:
     @set -euo pipefail; \
@@ -77,7 +263,7 @@ ensure-python:
       if [ -f "$stamp" ] && cmp -s <(printf '%s\n' "$fingerprint") "$stamp"; then \
         echo "Reusing Fullmag Python dependencies (stamp unchanged)."; \
       else \
-        "{{repo_python}}" -m pip install 'numpy>=1.24' 'scipy>=1.10' 'gmsh>=4.12' 'meshio>=5.3' 'trimesh>=4.2' 'h5py>=3.8' 'zarr>=2.18,<3' 'rich>=13.7' 'matplotlib>=3.7' 'pytest>=9,<10'; \
+        "{{repo_python}}" -m pip install 'numpy>=1.24' 'scipy>=1.10' 'gmsh>=4.12' 'meshio>=5.3' 'trimesh>=4.2' 'h5py>=3.8' 'zarr>=2.18,<3' 'rich>=13.7' 'matplotlib>=3.7' 'Pillow>=10,<13' 'pytest>=9,<10'; \
         printf '%s\n' "$fingerprint" > "$stamp"; \
       fi
 
@@ -133,6 +319,263 @@ package target="fullmag":
 
 check:
     cargo +nightly check --locked --workspace --exclude fullmag-desktop
+
+# Source-only persistence check: does not compile unit/integration tests or solvers.
+check-session-persistence:
+    cargo check --locked -p fullmag-session --lib
+
+# Source-only API check for application/session adapters; excludes test targets.
+check-api-source:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-source-check --repo-root "{{repo_root}}"
+
+# Production API, service and scheduler source check; excludes test targets.
+check-api-service-source:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-service-source-check --repo-root "{{repo_root}}"
+
+# Source-only production CLI check; excludes unit tests and native solvers.
+check-cli-source:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route cli-source-check --repo-root "{{repo_root}}"
+
+# Cold archive integrity gate; config names exact managed build and saved source.
+verify-saved-fem-archive-roundtrip:
+    {{storage_python}} "{{repo_root}}/scripts/verify_saved_fem_archive_roundtrip.py" --repo-root "{{repo_root}}"
+
+# Source check for truthful local resource capacity discovery and publication.
+check-api-resource-pool:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-resource-pool-check --repo-root "{{repo_root}}"
+
+# Probe host CPU, RAM, storage and optional NVIDIA capacity without publishing.
+verify-api-resource-pool-discovery-smoke:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-resource-pool-discovery-smoke --repo-root "{{repo_root}}"
+
+# Run the durable coordinator/runtime-control regression suite through the
+# canonical project storage route.
+verify-runtime-control:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route runtime-control-tests --repo-root "{{repo_root}}"
+
+# Source check for the one-shot accepted-run worker process binary.
+check-api-accepted-worker:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-worker-check --repo-root "{{repo_root}}"
+
+# Compile and run the isolated supervisor slot/process reconciliation regressions.
+verify-api-accepted-supervisor:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-supervisor-tests --repo-root "{{repo_root}}"
+
+# Build both accepted-runtime binaries and run the durable subprocess E2E.
+verify-api-accepted-supervisor-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-supervisor-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-supervisor-cancel-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-supervisor-cancel-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-supervisor-prestart-cancel-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-supervisor-prestart-cancel-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-supervisor-automatic-retry-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-supervisor-automatic-retry-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-supervisor-retry-recovery-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-supervisor-retry-recovery-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-supervisor-process-exit-recovery-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-supervisor-process-exit-recovery-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-scheduler-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-scheduler-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-scheduler-pool-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-scheduler-pool-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-scheduler-discovery-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-scheduler-discovery-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-scheduler-persistent-cursor-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-scheduler-persistent-cursor-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-scheduler-parallel-resources-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-scheduler-parallel-resources-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-scheduler-resource-pool-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-scheduler-resource-pool-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-scheduler-dynamic-resource-pool-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-scheduler-dynamic-resource-pool-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-scheduler-resident-discovery-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-scheduler-resident-discovery-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-scheduler-resident-drain-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-scheduler-resident-drain-e2e --repo-root "{{repo_root}}"
+
+verify-api-accepted-scheduler-retry-e2e:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-accepted-scheduler-retry-e2e --repo-root "{{repo_root}}"
+
+# Run the narrowly scoped API preparation materialization route regressions.
+verify-api-preparation:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-preparation-tests --repo-root "{{repo_root}}"
+
+# Run runtime-free project document and durable Submit HTTP regressions.
+verify-api-project-runs:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-project-run-tests --repo-root "{{repo_root}}"
+
+# Run current-session recovery isolation HTTP regressions.
+verify-api-recovery:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-recovery-tests --repo-root "{{repo_root}}"
+
+# Run the SceneResource preservation contract through the API source test route.
+verify-api-scene-resource:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-scene-resource-tests --repo-root "{{repo_root}}"
+
+# Run the SceneDocument-to-builder preservation contract in fullmag-authoring.
+verify-authoring-contracts:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route authoring-contract-tests --repo-root "{{repo_root}}"
+
+# Run the SceneDocument-to-builder preservation contract in fullmag-authoring.
+verify-authoring-scene-adapter:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route authoring-scene-adapter-tests --repo-root "{{repo_root}}"
+
+# Managed OpenAPI source generation; the emitted JSON remains a versioned
+# frontend artifact, while all Cargo output stays under canonical storage.
+generate-api-openapi:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-openapi-codegen --repo-root "{{repo_root}}"
+
+# Read-only diagnostic export from a terminal, verified BuildRunner package.
+# This route builds nothing; the helper validates paths and records its result.
+export-runner-openapi job_id expected_commit:
+    {{storage_python}} "{{repo_root}}/scripts/export_runner_openapi.py" --repo-root "{{repo_root}}" --job-id "{{job_id}}" --expected-commit "{{expected_commit}}"
+
+# Lightweight generated client and production source checks; no unit builds.
+generate-control-room-client:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route generate-client --repo-root "{{repo_root}}"
+
+check-control-room-production-source:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route production-source --repo-root "{{repo_root}}"
+
+# Interpreted Node contract checks in isolated managed fixtures; no unit builds.
+verify-control-room-openapi-import:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route openapi-import-check --repo-root "{{repo_root}}"
+
+check-control-room-api-hygiene:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route api-hygiene --repo-root "{{repo_root}}"
+
+verify-control-room-development-restart:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-restart-check --repo-root "{{repo_root}}"
+
+verify-control-room-resource-client-cache:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route resource-client-cache-check --repo-root "{{repo_root}}"
+
+verify-control-room-development-kernel-host:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-kernel-host-check --repo-root "{{repo_root}}"
+
+verify-control-room-development-transport-pause:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-transport-pause-check --repo-root "{{repo_root}}"
+
+verify-control-room-development-run-outcome-handoff:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-run-outcome-handoff-check --repo-root "{{repo_root}}"
+
+lint-control-room-development-run-outcome-handoff:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-run-outcome-handoff-lint --repo-root "{{repo_root}}"
+
+verify-control-room-development-restart-action:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-restart-action-check --repo-root "{{repo_root}}"
+
+lint-control-room-development-restart-action:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-restart-action-lint --repo-root "{{repo_root}}"
+
+verify-control-room-development-backend-build-action:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-backend-build-action-check --repo-root "{{repo_root}}"
+
+# Actual browser interaction on an isolated managed frontend source snapshot.
+# Responses are fixtures; this is neither a backend runtime nor a solver gate.
+verify-pinned-dataset-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}"
+
+# Production project controller in an isolated Next browser fixture; no unit builds.
+verify-project-document-handoff-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3251 --scenario project-document-handoff
+
+verify-development-kernel-host-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3252 --scenario development-kernel-host
+
+verify-development-run-outcome-handoff-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3253 --scenario development-run-outcome-handoff
+
+verify-development-restart-action-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3254 --scenario development-restart-action
+
+# Real Study profile component/facade against controlled HTTP; no solver gate.
+verify-study-execution-profile-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3256 --scenario study-execution-profile
+
+# Actual production Inspector actions against controlled staged/live/read-only sessions.
+verify-inspector-actions-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3257 --scenario inspector-actions
+
+lint-control-room-source:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route lint --repo-root "{{repo_root}}"
+
+doctor-control-room-source:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route react-doctor --repo-root "{{repo_root}}"
+
+
+# Run only after the operator has allowed compilation of these regression tests.
+verify-session-persistence:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --repo-root "{{repo_root}}"
+
+# Source-only application crate check; uses the dedicated canonical-storage
+# route and does not compile unit/integration tests.
+check-project-application:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route project-application-check --repo-root "{{repo_root}}"
+
+# Reserved for explicit test permission; kept separate from the source check.
+verify-project-application:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route project-application-test --repo-root "{{repo_root}}"
+
+# Managed compile check for the shared CLI, Python and desktop Open entrypoints.
+check-project-entrypoints:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route project-entrypoint-check --repo-root "{{repo_root}}"
+
+# Managed runtime-free API smoke with source identity, bounded HTTP scope and
+# controlled process-restart project reconnect.
+verify-project-run-restart:
+    {{storage_python}} "{{repo_root}}/scripts/verify_project_api_runtime.py" --include-project-run --repo-root "{{repo_root}}"
+
+verify-project-api-runtime:
+    {{storage_python}} "{{repo_root}}/scripts/verify_project_api_runtime.py" --repo-root "{{repo_root}}"
+
+# Managed production-process proof for local capacity discovery, durable pool
+# publication, scheduler admission, worker execution, and exact lease release.
+verify-api-resource-discovery-runtime:
+    {{storage_python}} "{{repo_root}}/scripts/verify_resource_discovery_runtime.py" --repo-root "{{repo_root}}"
+
+# Managed production-process proof for immutable accepted-run FEM preparation,
+# its dedicated Meshing lease, native mesh/space receipt, and lease release.
+verify-api-accepted-fem-preparation-runtime:
+    docker compose run --rm --no-deps fem-cpu bash -lc 'set -euo pipefail; cd /workspace; route_root="${FULLMAG_BUILD_ROOT:-/workspace/.fullmag-build}/accepted-fem-preparation-runtime"; python3 scripts/verify_accepted_fem_preparation_runtime.py --repo-root /workspace --build-root "$route_root/build" --output-root "$route_root/evidence"'
+
+verify-api-accepted-fdm-gpu-runtime:
+    {{storage_python}} "{{repo_root}}/scripts/verify_accepted_fdm_gpu_runtime.py" --repo-root "{{repo_root}}"
+
+# Managed realtime transport smoke with an empty scratch session.  This checks
+# the websocket handshake and after_seq reconnect without starting a solver.
+verify-project-realtime-runtime:
+    {{storage_python}} "{{repo_root}}/scripts/verify_project_api_runtime.py" --include-websocket --repo-root "{{repo_root}}"
+
+# Managed active-run runtime smoke with source identity and reconnect continuity.
+verify-project-active-run-runtime:
+    {{storage_python}} "{{repo_root}}/scripts/verify_project_active_run_runtime.py" --repo-root "{{repo_root}}"
+
+# Real FDM CPU active-run smoke from an explicitly pinned native Windows package.
+verify-windows-frozen-active-run-runtime build_id:
+    {{storage_python}} "{{repo_root}}/scripts/verify_project_active_run_runtime.py" --repo-root "{{repo_root}}" --frozen-native-build-id "{{build_id}}"
+
+# Managed runtime-free CLI smoke for the shared project Open entrypoint.
+verify-project-entrypoint-runtime:
+    {{storage_python}} "{{repo_root}}/scripts/verify_project_entrypoint_runtime.py" --repo-root "{{repo_root}}"
+
+# Managed runtime-free Python binding smoke for the shared project Open entrypoint.
+verify-project-python-runtime:
+    {{storage_python}} "{{repo_root}}/scripts/verify_project_python_runtime.py" --repo-root "{{repo_root}}"
 
 test:
     cargo +nightly test --locked --workspace --exclude fullmag-desktop
@@ -213,9 +656,9 @@ verify-fem-meshing-production:
     bash scripts/verify_fem_meshing_production.sh
 
 verify-fem-mixed-p1-capability-contract:
-    python3 scripts/validate_mixed_p1_capability_contract.py
-    python3 -m unittest scripts.test_validate_mixed_p1_capability_contract
-    cargo test --locked -p fullmag-runner --no-default-features capabilities::tests::
+    {{storage_python}} scripts/validate_mixed_p1_capability_contract.py
+    {{storage_python}} -m unittest scripts.test_validate_mixed_p1_capability_contract
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route fem-capability-contract --repo-root "{{repo_root}}"
 
 verify-fem-mixed-prism-airbox-runtime:
     just ensure-managed-fem-runtime
@@ -3641,6 +4084,9 @@ verify-fem-preparation-clock-contract:
 verify-fem-preparation-api-contract:
     docker compose --profile fem-gpu run --rm --no-deps fem-gpu bash -lc 'FULLMAG_USE_MFEM_STACK=ON cargo +nightly test -p fullmag-api router_v2::tests::simulation_preparation_preserves_backward_clock_adjustment_evidence -- --exact --nocapture'
 
+verify-fem-mesh-space-preparation-contract:
+    COMPOSE_PROJECT_NAME="$(bash scripts/resolve_fullmag_compose_project.sh)" docker compose run --rm --no-deps fem-cpu bash -lc 'set -euo pipefail; cd /workspace; build_root="${FULLMAG_BUILD_ROOT:-/workspace/.fullmag-build}/fem-mesh-space-preparation"; build_dir="$build_root/native"; cargo_target="$build_root/cargo-target"; mkdir -p "$build_root"; cmake -S native -B "$build_dir" -DFULLMAG_ENABLE_CUDA=OFF -DFULLMAG_ENABLE_FEM_GPU=OFF -DFULLMAG_USE_MFEM_STACK=ON -DFULLMAG_FEM_WITH_SLEPC=OFF; cmake --build "$build_dir" --target fem_mesh_space_preparation_contract; ctest --test-dir "$build_dir/backends/fem" --output-on-failure --no-tests=error -R "^fem_mesh_space_preparation_contract$"; FULLMAG_FEM_LIB_DIR="$build_dir/backends/fem" LD_LIBRARY_PATH="$build_dir/backends/fem:/opt/fullmag-deps/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" CARGO_TARGET_DIR="$cargo_target" CARGO_INCREMENTAL=0 cargo +nightly test -p fullmag-runner --features fem-native native_fem::mesh_preparation::tests::runner_preparation_exercises_native_mesh_space_abi -- --exact --nocapture'
+
 verify-fem-preview-callback-source-contract:
     docker compose --profile fem-gpu run --rm --no-deps fem-gpu bash -lc 'FULLMAG_USE_MFEM_STACK=ON cargo +nightly test -p fullmag-runner --features fem-gpu tests::fem_preview_materialization_stays_outside_callback_deadline -- --exact --nocapture'
 
@@ -5273,7 +5719,7 @@ run-headless-bench script:
 
 fullmag opt_1="" opt_2="" opt_3="" opt_4="" opt_5="" opt_6="" opt_7="" opt_8="":
     bash -euo pipefail -c '\
-      build="false"; force="false"; windows="false"; frontend="dev"; backend="auto"; device="auto"; run_mode="interactive"; script=""; web_port="3100"; skip_local_changes="false"; seen_options=""; \
+      r="{{repo_root}}"; build="false"; force="false"; windows="false"; frontend="dev"; backend="auto"; device="auto"; run_mode="interactive"; script=""; web_port="0"; skip_local_changes="false"; seen_options=""; \
       for raw in "{{opt_1}}" "{{opt_2}}" "{{opt_3}}" "{{opt_4}}" "{{opt_5}}" "{{opt_6}}" "{{opt_7}}" "{{opt_8}}"; do \
         [ -n "$raw" ] || continue; \
         key="${raw%%=*}"; value="$raw"; if [ "$key" != "$raw" ]; then value="${raw#*=}"; fi; \
@@ -5337,19 +5783,21 @@ fullmag opt_1="" opt_2="" opt_3="" opt_4="" opt_5="" opt_6="" opt_7="" opt_8="":
       host_windows="false"; \
       case "$(uname -s 2>/dev/null || true)" in MINGW*|MSYS*|CYGWIN*) host_windows="true" ;; esac; \
       if [ "$backend" = "fem" ] && { [ "$windows" = "true" ] || [ "$host_windows" = "true" ]; }; then \
-        exec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{ repo_root }}/scripts/windows/run_fullmag_fem.ps1" -BuildMode "$build" -Frontend "$frontend" -Backend "$backend" -Device "$device" -RunMode "$run_mode" -ScriptPath "$script" -WebPort "$web_port" "${skip_local_changes_args[@]}"; \
+        case ",$seen_options," in *",web_port,"*) ;; *) web_port="0" ;; esac; \
+        exec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$r/scripts/windows/run_fullmag_fem.ps1" -BuildMode "$build" -Frontend "$frontend" -Backend "$backend" -Device "$device" -RunMode "$run_mode" -ScriptPath "$script" -WebPort "$web_port" "${skip_local_changes_args[@]}"; \
       fi; \
       if [ "$windows" = "true" ] || [ "$host_windows" = "true" ]; then \
-        exec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{ repo_root }}/scripts/windows/run_fullmag.ps1" -BuildMode "$build" -Frontend "$frontend" -Backend "$backend" -Device "$device" -RunMode "$run_mode" -ScriptPath "$script" -WebPort "$web_port" "${skip_local_changes_args[@]}"; \
+        case ",$seen_options," in *",web_port,"*) ;; *) web_port="3100" ;; esac; \
+        exec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$r/scripts/windows/run_fullmag.ps1" -BuildMode "$build" -Frontend "$frontend" -Backend "$backend" -Device "$device" -RunMode "$run_mode" -ScriptPath "$script" -WebPort "$web_port" "${skip_local_changes_args[@]}"; \
       fi; \
-      if [ "$build" = "true" ]; then just ensure-python; elif [ ! -x "{{repo_python}}" ]; then echo "Python env is missing; run with build=True or force=True once." >&2; exit 2; fi; \
+      if [ "$build" = "true" ]; then just ensure-python; elif [ ! -x "$r/.fullmag/local/python/bin/python" ]; then echo "Python env is missing; run with build=True or force=True once." >&2; exit 2; fi; \
       if [ "$frontend" = "static" ]; then \
         if [ "$force" = "true" ]; then make web-build-static; \
         elif [ "$build" = "true" ]; then just build-static-control-room; \
-        elif [ ! -f "{{local_web_root}}/index.html" ] && [ ! -f "{{control_room_static_out}}/index.html" ]; then echo "Static control room is missing; run with build=True or force=True once." >&2; exit 2; fi; \
+        elif [ ! -f "$r/.fullmag/local/web/index.html" ] && [ ! -f "$r/apps/control-room/out/index.html" ]; then echo "Static control room is missing; run with build=True or force=True once." >&2; exit 2; fi; \
       fi; \
       if [ "$backend" = "fem" ]; then \
-        runtime_copy_helper="{{repo_root}}/scripts/lib/runtime_bundle_copy.sh"; \
+        runtime_copy_helper="$r/scripts/lib/runtime_bundle_copy.sh"; \
         test -f "$runtime_copy_helper" || { echo "managed FEM runtime copy helper is missing: $runtime_copy_helper" >&2; exit 2; }; \
         if [ "$force" = "true" ]; then just rebuild-fem-runtime; else just ensure-managed-fem-runtime; fi; \
         bin="{{gpu_runtime_bin}}"; path_prefix=""; \
@@ -5358,10 +5806,10 @@ fullmag opt_1="" opt_2="" opt_3="" opt_4="" opt_5="" opt_6="" opt_7="" opt_8="":
           if [ "$backend" = "fdm" ]; then FULLMAG_SKIP_MANAGED_FEM_GPU_EXPORT=1 just build fullmag; else just build fullmag; fi; \
         elif [ "$build" = "true" ]; then \
           if [ "$backend" = "fdm" ]; then FULLMAG_SKIP_MANAGED_FEM_GPU_EXPORT=1 just build fullmag; else just build fullmag; fi; \
-        elif [ ! -x "{{local_bin}}/fullmag" ]; then echo "Fullmag binary is missing; run with build=True or force=True once." >&2; exit 2; fi; \
-        bin="{{local_bin}}/fullmag"; path_prefix="{{local_bin}}:$PATH"; \
+        elif [ ! -x "$r/.fullmag/local/bin/fullmag" ]; then echo "Fullmag binary is missing; run with build=True or force=True once." >&2; exit 2; fi; \
+        bin="$r/.fullmag/local/bin/fullmag"; path_prefix="$r/.fullmag/local/bin:$PATH"; \
       fi; \
-      env_args=(FULLMAG_PYTHON="{{repo_python}}"); \
+      env_args=(FULLMAG_PYTHON="$r/.fullmag/local/python/bin/python"); \
       if [ -n "$path_prefix" ]; then env_args+=(PATH="$path_prefix"); fi; \
       if [ "$run_mode" = "headless" ]; then env_args+=(FULLMAG_API_PORT=0); fi; \
       if [ "$backend" = "fem" ]; then env_args+=(FULLMAG_FDM_EXECUTION=cpu); fi; \

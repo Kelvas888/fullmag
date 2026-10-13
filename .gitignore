@@ -44,6 +44,7 @@ node_modules/
 /apps/control-room/out
 /apps/control-room/.artifacts
 /apps/control-room/storybook-static
+/apps/control-room/public/docs/
 storybook-static/
 out/
 *.tsbuildinfo
@@ -84,6 +85,7 @@ Thumbs.db
 
 # === Logs ===
 *.log
+!docs/plans/**/reproductions/*.log
 
 # === Data & artifacts ===
 artifacts/
@@ -125,6 +127,7 @@ apps/control-room/target-host/*
 target_agent/*
 target_tmp/debug/*
 target_host/*
+targets/
 apps/control-room/.next-audit/*
 
 # === Agent worktrees ===
@@ -157,7 +160,11 @@ pnpm-store/
 playwright-browsers/
 *.diff
 /patch.tmp
+antenna-implementation-target/
+storage/
+task-storage/
 .rotated-review/
 .target*
 .tmp*
 .codex*
+target-tracking-fix/

@@ -24,11 +24,13 @@ import {
 import { createServer, request } from "node:http";
 import { resolve, dirname, extname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveDevServerPublicOrigin } from "./scripts/dev-server-public-origin.mjs";
 
 import {
   ensureControlRoomDependencies,
   resolvePnpmInvocation,
 } from "./scripts/resolve-pnpm-invocation.mjs";
+import { createDevSourceMirror } from "./scripts/dev-source-mirror.mjs";
 
 const appDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(appDir, "../..");
@@ -45,7 +47,9 @@ const apiTarget =
     ? (args[apiTargetIdx + 1] ?? "http://localhost:8081")
     : "http://localhost:8081";
 const browserHost = process.env.FULLMAG_WEB_PUBLIC_HOST ?? "localhost";
-const browserOrigin = `http://${formatUrlHost(browserHost)}:${port}`;
+const browserOrigin = resolveDevServerPublicOrigin(
+  browserHost, port, process.env.FULLMAG_WEB_PUBLIC_PORT,
+);
 const staticRootIdx = args.indexOf("--static-root");
 const staticRoot =
   staticRootIdx >= 0
@@ -53,25 +57,53 @@ const staticRoot =
     : process.env.FULLMAG_STATIC_WEB_ROOT;
 const devDistDir = `.next-control-room-${port}`;
 
-function formatUrlHost(host) {
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-}
-
 if (staticRoot) {
   startStaticServer(staticRoot);
 } else {
-  startDevServer();
+  void startDevServer();
 }
 
-function startDevServer() {
+async function startDevServer() {
   process.stderr.write(`[control-room dev-server] starting on :${port}\n`);
   pruneIsolatedNextCaches();
   removeStaleNextDevLock(devDistDir);
+
+  let sourceMirror = null;
+  let sourceMirrorError = null;
+  let terminateChild = null;
+  const configuredSourceRoot = process.env.FULLMAG_DEV_SOURCE_ROOT?.trim();
+  if (configuredSourceRoot) {
+    try {
+      sourceMirror = createDevSourceMirror({
+        sourceRoot: configuredSourceRoot,
+        targetRoot: appDir,
+        onError: (error) => {
+          sourceMirrorError = error;
+          process.stderr.write(
+            `[control-room dev-server] source mirror failed: ${error.message}\n`,
+          );
+          terminateChild?.();
+        },
+      });
+      // The watcher is installed before this initial reconciliation.  Next
+      // is spawned only after the source and staged regular-file trees have
+      // converged, closing the initial-copy/event race.
+      await sourceMirror.start();
+    } catch (error) {
+      await sourceMirror?.close();
+      process.stderr.write(
+        `[control-room dev-server] source mirror setup failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      process.exit(1);
+      return;
+    }
+  }
 
   let pnpm;
   try {
     pnpm = resolvePnpmInvocation();
   } catch (error) {
+    await sourceMirror?.close();
     process.stderr.write(
       `[control-room dev-server] ${error instanceof Error ? error.message : String(error)}\n`,
     );
@@ -86,8 +118,18 @@ function startDevServer() {
       );
     }
   } catch (error) {
+    await sourceMirror?.close();
     process.stderr.write(
       `[control-room dev-server] frontend dependency setup failed: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exit(1);
+    return;
+  }
+
+  if (sourceMirrorError) {
+    await sourceMirror?.close();
+    process.stderr.write(
+      `[control-room dev-server] source mirror failed before Next startup: ${sourceMirrorError.message}\n`,
     );
     process.exit(1);
     return;
@@ -166,25 +208,36 @@ function startDevServer() {
       }
     }, 2000).unref();
   };
+  terminateChild = () => shutdown("SIGTERM");
+
+  if (sourceMirrorError) {
+    terminateChild();
+  }
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
   child.on("exit", (code, signal) => {
     childExited = true;
-    restoreGeneratedTypeConfig();
-    if (signal) {
-      process.exit(signalExitCodes[signal] ?? 1);
-      return;
-    }
-    process.exit(code ?? 0);
+    void (async () => {
+      await sourceMirror?.close();
+      restoreGeneratedTypeConfig();
+      if (signal) {
+        process.exit(signalExitCodes[signal] ?? 1);
+        return;
+      }
+      process.exit(code ?? 0);
+    })();
   });
   child.on("error", (err) => {
-    restoreGeneratedTypeConfig();
-    process.stderr.write(
-      `[control-room dev-server] failed to spawn pnpm via ${pnpm.source}: ${err.message}\n`,
-    );
-    process.exit(1);
+    void (async () => {
+      await sourceMirror?.close();
+      restoreGeneratedTypeConfig();
+      process.stderr.write(
+        `[control-room dev-server] failed to spawn pnpm via ${pnpm.source}: ${err.message}\n`,
+      );
+      process.exit(1);
+    })();
   });
 }
 

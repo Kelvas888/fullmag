@@ -1,0 +1,204 @@
+{
+  "schema_version": "2.0",
+  "approval": "proposed",
+  "object_edit_phases": [
+    "clean",
+    "editing-valid",
+    "editing-invalid",
+    "committing",
+    "conflict",
+    "reconciling",
+    "rejected",
+    "outcome-unknown",
+    "target-missing",
+    "suspended"
+  ],
+  "gesture_states": [
+    "idle",
+    "armed",
+    "dragging"
+  ],
+  "artifact_assessment": [
+    "current",
+    "stale",
+    "incompatible",
+    "unknown",
+    "loading",
+    "inconsistent"
+  ],
+  "artifact_presence": [
+    "not-built",
+    "present"
+  ],
+  "pointerup_scene_mutations": 0,
+  "object_edit_transitions": [
+    {
+      "state": "clean/editing-*",
+      "event": "RAW_CHANGE",
+      "guard": "Ten sam target/epoch",
+      "next": "editing-valid albo editing-invalid",
+      "effects": "Raw + editVersion; local preview z last-valid; bez HTTP"
+    },
+    {
+      "state": "editing-valid",
+      "event": "APPLY",
+      "guard": "Brak active write/gesture, parsed valid, capability, run idle",
+      "next": "committing",
+      "effects": "Capture intencji, local journal, jedno wysłanie"
+    },
+    {
+      "state": "clean",
+      "event": "APPLY",
+      "guard": "Patch jest no-op",
+      "next": "clean",
+      "effects": "Bez zapisu i historii"
+    },
+    {
+      "state": "editing-invalid",
+      "event": "APPLY",
+      "guard": "Zawsze",
+      "next": "editing-invalid",
+      "effects": "Focus pierwszego błędu; zero requestów"
+    },
+    {
+      "state": "editing-valid/clean",
+      "event": "BEGIN_GESTURE",
+      "guard": "Capability, brak write/unknown",
+      "next": "Ta sama phase + dragging",
+      "effects": "Snapshot startDraft i baseline/frame; pointer capture"
+    },
+    {
+      "state": "* + dragging",
+      "event": "MOVE",
+      "guard": "Id/epoch zgodne, ray rozwiązany",
+      "next": "editing-valid + dragging",
+      "effects": "Tylko local semantic patch; snap od startu"
+    },
+    {
+      "state": "* + dragging",
+      "event": "POINTER_UP",
+      "guard": "Id zgodne",
+      "next": "editing-valid albo clean + idle",
+      "effects": "Release capture; **zero commit**"
+    },
+    {
+      "state": "* + dragging",
+      "event": "ESC/CANCEL/UNMOUNT",
+      "guard": "GestureId zgodne",
+      "next": "Phase wynikająca ze startDraft + idle",
+      "effects": "Cofnij gest, zachowaj wcześniejsze raw; odblokuj orbit"
+    },
+    {
+      "state": "committing/outcome-unknown",
+      "event": "BEGIN_GESTURE/APPLY",
+      "guard": "Ta sama transakcja/scena",
+      "next": "Bez zmiany",
+      "effects": "Jawny disabled reason; brak nowego requestu"
+    },
+    {
+      "state": "committing",
+      "event": "RAW_CHANGE",
+      "guard": "Ta sama identity",
+      "next": "committing",
+      "effects": "Nowszy raw/patch/version, status queued edit"
+    },
+    {
+      "state": "committing",
+      "event": "ACK_COMMITTED",
+      "guard": "Pasujące operation/epoch/draft",
+      "next": "clean albo editing-*",
+      "effects": "Nowy baseline; zachowaj post-submit edits; dedup history"
+    },
+    {
+      "state": "committing",
+      "event": "KNOWN_REJECT",
+      "guard": "Odpowiedź walidacji/revision jest wiarygodna",
+      "next": "rejected albo conflict",
+      "effects": "Zachowaj draft; zwolnij wyłącznie write slot"
+    },
+    {
+      "state": "committing",
+      "event": "LOST_ACK/AMBIGUOUS_5XX",
+      "guard": "Wynik nieznany",
+      "next": "outcome-unknown",
+      "effects": "Zachowaj journal, blokada retry inną intencją"
+    },
+    {
+      "state": "outcome-unknown",
+      "event": "LOOKUP",
+      "guard": "Capability receipt i właściwy owner",
+      "next": "reconciling",
+      "effects": "GET jednej intencji; bez POST"
+    },
+    {
+      "state": "reconciling",
+      "event": "COMMITTED_RECEIPT",
+      "guard": "Digest/owner/intencja zgodne",
+      "next": "clean albo editing-*",
+      "effects": "Ten sam reducer ACK; nie dopisuj drugiego Undo"
+    },
+    {
+      "state": "reconciling",
+      "event": "REJECTED_RECEIPT",
+      "guard": "Wynik definitywny",
+      "next": "rejected/conflict",
+      "effects": "Można poprawić draft i utworzyć nową intencję"
+    },
+    {
+      "state": "reconciling",
+      "event": "IN_PROGRESS/INDETERMINATE/ERROR/EXPIRED",
+      "guard": "Brak wyniku definitywnego",
+      "next": "outcome-unknown",
+      "effects": "Nie traktuj timeout jako failure zapisu"
+    },
+    {
+      "state": "conflict",
+      "event": "REMOTE_SNAPSHOT",
+      "guard": "Baza i najnowszy owner zgodne",
+      "next": "conflict albo editing-*",
+      "effects": "Three-way merge; konflikty semantyczne wymagają wyboru"
+    },
+    {
+      "state": "conflict",
+      "event": "RESOLVE",
+      "guard": "Wszystkie konflikty rozstrzygnięte",
+      "next": "editing-*",
+      "effects": "Nowa baza, zachowany patch; brak automatycznego submit"
+    },
+    {
+      "state": "clean/editing-*/conflict/rejected",
+      "event": "REVERT",
+      "guard": "Brak unresolved write",
+      "next": "clean",
+      "effects": "Raw z najnowszego znanego baseline; clear problems/conflict"
+    },
+    {
+      "state": "każda",
+      "event": "TARGET_DELETED",
+      "guard": "Potwierdzone na aktualnej scenie",
+      "next": "target-missing",
+      "effects": "Zachowaj draft do eksportu; nie twórz obiektu ponownie"
+    },
+    {
+      "state": "target-missing",
+      "event": "EXPORT/DISCARD",
+      "guard": "Decyzja użytkownika",
+      "next": "suspended albo clean bez targetu",
+      "effects": "Bez mutacji; Create as new jest osobną intencją z nowym ID"
+    },
+    {
+      "state": "każda",
+      "event": "SESSION_SWITCH/PROJECT_CLOSE",
+      "guard": "Epoka zmieniona",
+      "next": "suspended",
+      "effects": "Cancel gesture, detach render subscriptions; journal in-flight zachowany"
+    },
+    {
+      "state": "suspended",
+      "event": "RESUME",
+      "guard": "Sprawdzony owner, nowa epoch, reconciliation",
+      "next": "clean/editing-*/conflict/outcome-unknown",
+      "effects": "Nie przenoś starego fence; wyznacz nowy"
+    }
+  ]
+}

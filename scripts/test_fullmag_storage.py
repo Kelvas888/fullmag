@@ -1,7 +1,10 @@
 """Behavioral regression checks for the project storage boundary (stdlib only)."""
 
 import json
+import errno
+import hashlib
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,7 +24,9 @@ class StorageTests(unittest.TestCase):
         self.addCleanup(environment.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.project = Path(self.temp.name) / "project"
+        # Windows runners may expose TEMP through an 8.3 short-name alias.
+        # Author fixture paths canonically, as required by the storage guard.
+        self.project = Path(self.temp.name).resolve() / "project"
         self.repo = self.project / "fullmag"
         self.repo.mkdir(parents=True)
         subprocess.run(["git", "init", "--quiet", str(self.repo)], check=True)
@@ -37,6 +42,32 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(layout, self.resolve())
         self.assertFalse((self.project / "storage").exists())
 
+    def test_inventory_ignores_non_registration_json_arrays(self):
+        layout = self.resolve()
+        index = Path(layout["storage_root"]) / "index"
+        index.mkdir(parents=True)
+        (index / "metrics-history.json").write_text("[]", encoding="utf-8")
+        result = storage.inventory(layout)
+        self.assertEqual(result["records"], [])
+        self.assertEqual(result["worktree_count"], 1)
+
+    def test_dotenv_storage_root_and_process_precedence(self):
+        custom = self.project / "configured-storage"
+        custom.mkdir()
+        (custom / ".fullmag-storage.json").write_text(json.dumps({
+            "schema": storage.SCHEMA, "project_root": str(self.project)}))
+        (self.repo / ".env").write_text(
+            f'FULLMAG_PROJECT_STORAGE_ROOT="{custom}"\nUNRELATED_SECRET=ignored\n')
+        self.assertEqual(Path(self.resolve()["storage_root"]), custom)
+        self.assertNotIn("UNRELATED_SECRET", storage.storage_dotenv(self.repo))
+        self.env["FULLMAG_PROJECT_STORAGE_ROOT"] = str(self.project / "storage")
+        self.assertEqual(Path(self.resolve()["storage_root"]), self.project / "storage")
+
+    def test_dotenv_invalid_path_is_not_silently_replaced(self):
+        (self.repo / ".env").write_text("FULLMAG_PROJECT_STORAGE_ROOT=relative/path\n")
+        with self.assertRaises(storage.StorageError):
+            self.resolve()
+
     def test_nested_worktree_uses_common_project_and_isolated_build(self):
         subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c",
                         "user.email=test@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "fixture"], check=True)
@@ -46,6 +77,21 @@ class StorageTests(unittest.TestCase):
         other = storage.resolve_layout(worktree, profile="test", environ={})
         self.assertEqual(main["storage_root"], other["storage_root"])
         self.assertNotEqual(main["build_root"], other["build_root"])
+
+    def test_worktree_reads_main_dotenv_without_local_copy(self):
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c",
+                        "user.email=test@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "fixture"], check=True)
+        worktree = self.project / "worktrees" / "task"
+        subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "--quiet", "--detach", str(worktree)], check=True)
+        custom = self.project / "host-storage"
+        custom.mkdir()
+        (custom / ".fullmag-storage.json").write_text(json.dumps({
+            "schema": storage.SCHEMA, "project_root": str(self.project)}))
+        (self.repo / ".env").write_text(f'FULLMAG_PROJECT_STORAGE_ROOT="{custom}"\n')
+        self.assertFalse((worktree / ".env").exists())
+        layout = storage.resolve_layout(worktree, profile="test", environ={})
+        self.assertEqual(Path(layout["storage_root"]), custom)
+        self.assertNotEqual(layout["build_root"], self.resolve()["build_root"])
 
     def test_override_outside_storage_is_rejected_before_creation(self):
         self.env["CARGO_TARGET_DIR"] = str(self.project / "random-target")
@@ -116,6 +162,89 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("busy", result.stderr.lower())
 
+    def test_bounded_lock_wait_acquires_after_contention_without_restarting_work(self):
+        layout = self.resolve()
+        storage.initialize(layout)
+        path = Path(layout["storage_root"]) / "locks/wait-fixture.lock"
+        if os.name == "nt":
+            import msvcrt as locking
+            method = "locking"
+        else:
+            import fcntl as locking
+            method = "flock"
+        body = []
+        with patch.object(locking, method, side_effect=[BlockingIOError(errno.EAGAIN, "busy"), None, None]) as calls, \
+                patch.object(storage.time, "monotonic", return_value=0), \
+                patch.object(storage.time, "sleep") as sleep:
+            with storage.file_lock(path, "fixture", wait_timeout_seconds=1):
+                body.append("one admitted operation")
+        self.assertEqual(body, ["one admitted operation"])
+        self.assertEqual(calls.call_count, 3)
+        sleep.assert_called_once_with(0.25)
+
+    def test_bounded_lock_wait_timeout_never_admits_work(self):
+        layout = self.resolve()
+        storage.initialize(layout)
+        path = Path(layout["storage_root"]) / "locks/wait-fixture.lock"
+        if os.name == "nt":
+            import msvcrt as locking
+            method = "locking"
+        else:
+            import fcntl as locking
+            method = "flock"
+        with patch.object(locking, method, side_effect=BlockingIOError(errno.EAGAIN, "busy")), \
+                patch.object(storage.time, "monotonic", side_effect=[0, 1]), \
+                patch.object(storage.time, "sleep") as sleep:
+            with self.assertRaisesRegex(storage.StorageError, "busy"):
+                with storage.file_lock(path, "fixture", wait_timeout_seconds=1):
+                    self.fail("A timed-out lock must not admit any work")
+        sleep.assert_not_called()
+
+    def test_lock_becoming_free_after_deadline_is_not_admitted(self):
+        layout = self.resolve()
+        storage.initialize(layout)
+        path = Path(layout["storage_root"]) / "locks/wait-fixture.lock"
+        if os.name == "nt":
+            import msvcrt as locking
+            method = "locking"
+        else:
+            import fcntl as locking
+            method = "flock"
+        with patch.object(locking, method, side_effect=[BlockingIOError(errno.EAGAIN, "busy"), None]) as calls, \
+                patch.object(storage.time, "monotonic", side_effect=[0, 0, 0, 1]), \
+                patch.object(storage.time, "sleep"):
+            with self.assertRaisesRegex(storage.StorageError, "wait expired"):
+                with storage.file_lock(path, "fixture", wait_timeout_seconds=1):
+                    self.fail("A late free lock must not admit work")
+        self.assertEqual(calls.call_count, 1)
+
+    def test_native_owner_stop_during_wait_never_admits_work(self):
+        layout = self.resolve()
+        storage.initialize(layout)
+        runtime = Path(layout["runtime_root"])
+        runtime.mkdir(parents=True, exist_ok=True)
+        active = dict(state="running", manager_pid=os.getpid(), launch_nonce="a" * 32,
+                      worktree_id=layout["worktree_id"], repo_root=layout["repo_root"])
+        storage.atomic_json(runtime / "native-workspace-status.json", active)
+        cancelled = storage._native_build_cancellation(layout, active)
+        path = Path(layout["storage_root"]) / "locks/wait-fixture.lock"
+        if os.name == "nt":
+            import msvcrt as locking
+            method = "locking"
+        else:
+            import fcntl as locking
+            method = "flock"
+        def stop_during_sleep(_seconds):
+            (runtime / ("native-watch-stop-" + "a" * 32 + ".json")).write_text("{}")
+        with patch.object(locking, method, side_effect=[BlockingIOError(errno.EAGAIN, "busy"), None]) as calls, \
+                patch.object(storage, "process_alive", return_value=True), \
+                patch.object(storage.time, "monotonic", return_value=0), \
+                patch.object(storage.time, "sleep", side_effect=stop_during_sleep):
+            with self.assertRaisesRegex(storage.StorageError, "cancelled"):
+                with storage.file_lock(path, "fixture", wait_timeout_seconds=1, cancelled=cancelled):
+                    self.fail("Stopped UI owner must not start another build")
+        self.assertEqual(calls.call_count, 1)
+
     def test_child_failure_is_recorded_and_releases_lock(self):
         subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c",
                         "user.email=test@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "fixture"], check=True)
@@ -127,6 +256,256 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(record["exit_code"], 7)
         with storage.build_lock(layout):
             pass
+
+    def test_windows_workspace_uses_runtime_lane_while_generic_run_keeps_heavy_guard(self):
+        layout = self.resolve(profile="windows-native-fdm-cpu")
+        storage.initialize(layout)
+        storage.prepare_links(layout, compat=True)
+        launcher = self.repo / "scripts" / "windows" / "run_fullmag.ps1"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("# workspace fixture\n", encoding="utf-8")
+        runner_marker = Path(layout["storage_root"]) / "index" / "local-runner-container.json"
+        runner_marker.write_text(json.dumps({"container_id": "fixture"}), encoding="utf-8")
+
+        with self.assertRaises(storage.StorageError):
+            storage.run(layout, [sys.executable, "-c", "raise SystemExit(99)"])
+
+        @contextmanager
+        def unlocked(*_args, **_kwargs):
+            yield
+
+        calls = []
+
+        def fake_git(_repo, *args):
+            if args == ("rev-parse", "HEAD"):
+                return "0" * 40
+            if args == ("status", "--porcelain", "--untracked-files=normal"):
+                return ""
+            raise AssertionError(args)
+
+        def fake_run(command, *_args, **_kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        def fake_runtime(runtime_layout, command, env, profile):
+            self.assertEqual(profile, "release")
+            self.assertEqual(runtime_layout["runtime_root"], layout["runtime_root"])
+            calls.append(command)
+            storage.atomic_json(Path(layout["runtime_root"]) / "native-workspace-status.json", {
+                "schema": storage.SCHEMA, "execution_mode": "windows-workspace",
+                "worktree_id": layout["worktree_id"], "repo_root": layout["repo_root"],
+                "state": "completed", "manager_pid": os.getpid(), "launcher_pid": 12,
+                "launcher_waited": True, "watcher_waited": True,
+                "exit_code": 0, "finished_at": storage.now(),
+            })
+            return 0
+
+        with patch.object(storage, "_is_native_windows", return_value=True), \
+             patch.object(storage, "file_lock", unlocked), \
+             patch.object(storage, "git", side_effect=fake_git), \
+             patch.object(storage.subprocess, "run", side_effect=fake_run), \
+             patch.object(storage, "_run_logged_command", side_effect=fake_run), \
+             patch("windows.runtime_lease.run_sealed_runtime", side_effect=fake_runtime):
+            result = storage.run_windows_workspace(layout, "static", 3197, build_mode="false")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0:6], [
+            "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass",
+        ])
+        self.assertEqual(calls[0][calls[0].index("-RunMode") + 1], "workspace")
+        self.assertEqual(calls[0][calls[0].index("-WebPort") + 1], "3197")
+        self.assertEqual(calls[0][calls[0].index("-BackendProfile") + 1], "release")
+        receipt = json.loads((Path(layout["runtime_root"]) / "native-workspace-status.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["execution_mode"], "windows-workspace")
+
+        calls.clear()
+        with patch.object(storage, "_is_native_windows", return_value=True), \
+             patch.object(storage, "file_lock", unlocked), \
+             patch.object(storage, "git", side_effect=fake_git), \
+             patch.object(storage.subprocess, "run", side_effect=fake_run), \
+             patch.object(storage, "_run_logged_command", side_effect=fake_run), \
+             patch("windows.runtime_lease.run_sealed_runtime", side_effect=fake_runtime):
+            result = storage.run_windows_workspace(layout, "static", 3197, build_mode="auto")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("-BuildOnly", calls[0])
+        self.assertEqual(calls[0][calls[0].index("-BuildMode") + 1], "auto")
+        self.assertEqual(calls[0][calls[0].index("-BackendProfile") + 1], "release")
+        self.assertNotIn("-BuildOnly", calls[1])
+        self.assertEqual(calls[1][calls[1].index("-BuildMode") + 1], "false")
+        self.assertEqual(calls[1][calls[1].index("-RunMode") + 1], "workspace")
+
+    def test_workspace_auto_profile_and_canonical_storage_are_separate(self):
+        self.assertEqual(storage.resolve_windows_workspace_backend_profile("dev", "auto"), "dev")
+        self.assertEqual(storage.resolve_windows_workspace_backend_profile("static", "auto"), "release")
+        self.assertEqual(storage.resolve_windows_workspace_backend_profile("dev", "release"), "release")
+        with self.assertRaises(storage.StorageError):
+            storage.resolve_windows_workspace_backend_profile("invalid", "auto")
+        with self.assertRaises(storage.StorageError):
+            storage.resolve_windows_workspace_backend_profile("dev", "custom")
+
+        release = self.resolve(profile="windows-native-fdm-cpu")
+        dev = self.resolve(profile="windows-native-fdm-cpu-dev")
+        self.assertNotEqual(release["build_root"], dev["build_root"])
+        self.assertNotEqual(release["env"]["CARGO_TARGET_DIR"], dev["env"]["CARGO_TARGET_DIR"])
+        self.assertTrue(release["build_root"].endswith("windows-native-fdm-cpu"))
+        self.assertTrue(dev["build_root"].endswith("windows-native-fdm-cpu-dev"))
+
+    def test_workspace_build_only_uses_closed_profile_lock_and_terminal_receipt(self):
+        layout = self.resolve(profile="windows-native-fdm-cpu-dev")
+        launcher = self.repo / "scripts" / "windows" / "run_fullmag.ps1"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("# workspace fixture\n", encoding="utf-8")
+
+        @contextmanager
+        def unlocked(*_args, **_kwargs):
+            yield
+
+        calls = []
+
+        def fake_git(_repo, *args):
+            if args == ("rev-parse", "HEAD"):
+                return "0" * 40
+            if args == ("status", "--porcelain", "--untracked-files=normal"):
+                return ""
+            raise AssertionError(args)
+
+        def fake_run(command, *_args, **_kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(storage, "_is_native_windows", return_value=True), \
+             patch.object(storage, "file_lock", unlocked), \
+             patch.object(storage, "git", side_effect=fake_git), \
+             patch.object(storage, "_run_logged_command", side_effect=fake_run), \
+             patch.object(storage.subprocess, "run", side_effect=fake_run):
+            result = storage.run_windows_workspace_build(
+                layout, "dev", 3197, "dev", build_mode="auto"
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("-BuildOnly", calls[0])
+        self.assertEqual(calls[0][calls[0].index("-BuildMode") + 1], "auto")
+        self.assertEqual(calls[0][calls[0].index("-BackendProfile") + 1], "dev")
+        self.assertNotIn("-RunMode", calls[0][calls[0].index("-BuildOnly") + 1:])
+        receipt = json.loads((Path(layout["build_root"]) / "build-status.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["execution_mode"], "windows-workspace-build")
+        self.assertEqual(receipt["profile"], "windows-native-fdm-cpu-dev")
+        self.assertEqual(receipt["state"], "completed")
+
+    def test_workspace_build_request_receipt_pins_its_terminal_manifest_and_cannot_replay(self):
+        layout = self.resolve(profile="windows-native-fdm-cpu-dev")
+        launcher = self.repo / "scripts" / "windows" / "run_fullmag.ps1"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("# workspace fixture\n", encoding="utf-8")
+        request_id = "32345678-1234-4234-8234-123456789abc"
+        manifest = Path(layout["build_root"]) / "windows-runtime" / "build-manifest.json"
+        manifest_raw = b'{"build":"request-a"}\n'
+        calls = []
+
+        @contextmanager
+        def unlocked(*_args, **_kwargs):
+            yield
+
+        def fake_git(_repo, *args):
+            if args == ("rev-parse", "HEAD"):
+                return "0" * 40
+            if args == ("status", "--porcelain", "--untracked-files=normal"):
+                return ""
+            raise AssertionError(args)
+
+        def fake_build(command, *_args, **_kwargs):
+            calls.append(command)
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_bytes(manifest_raw)
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(storage, "_is_native_windows", return_value=True), \
+             patch.object(storage, "file_lock", unlocked), \
+             patch.object(storage, "git", side_effect=fake_git), \
+             patch.object(storage, "_run_logged_command", side_effect=fake_build):
+            result = storage.run_windows_workspace_build(
+                layout, "dev", 3197, "dev", build_mode="true",
+                workspace_request_id=request_id,
+            )
+            receipt = storage.read_workspace_build_request_receipt(layout, request_id)
+            self.assertEqual(result, 0)
+            self.assertEqual(receipt["request_id"], request_id)
+            self.assertEqual(receipt["worktree_id"], layout["worktree_id"])
+            self.assertEqual(receipt["profile"], layout["profile"])
+            self.assertEqual(receipt["execution_mode"], "windows-workspace-build")
+            self.assertEqual(receipt["state"], "completed")
+            self.assertEqual(receipt["exit_code"], 0)
+            self.assertEqual(
+                receipt["build_manifest_sha256"],
+                hashlib.sha256(manifest_raw).hexdigest(),
+            )
+            self.assertTrue(receipt["started_at"])
+            self.assertTrue(receipt["finished_at"])
+            receipt_path = Path(layout["build_root"]) / "build-requests" / f"{request_id}.json"
+            original_receipt = receipt_path.read_bytes()
+            with self.assertRaisesRegex(storage.StorageError, "cannot be replayed"):
+                storage.run_windows_workspace_build(
+                    layout, "dev", 3197, "dev", build_mode="true",
+                    workspace_request_id=request_id,
+                )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(receipt_path.read_bytes(), original_receipt)
+
+    def test_workspace_request_id_is_canonical_and_only_admitted_for_build_route(self):
+        layout = self.resolve(profile="windows-native-fdm-cpu-dev")
+        with self.assertRaises(storage.StorageError):
+            storage._run_managed_command(
+                layout, ["arbitrary-command"], workspace_request_id="00000000-0000-0000-0000-000000000000"
+            )
+        with self.assertRaises(storage.StorageError):
+            storage._run_managed_command(
+                layout, ["arbitrary-command"], workspace_request_id="32345678-1234-4234-8234-123456789ABC"
+            )
+        self.assertFalse(Path(layout["storage_root"]).exists())
+
+    def test_native_stop_during_log_setup_prevents_process_launch(self):
+        log = self.project / "cancelled-compiler.log"
+        # Opening the log is the final setup operation before process launch.
+        with patch.object(storage.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(storage.StorageError, "cancelled before command launch"):
+                storage._run_logged_command(
+                    ["compiler"], str(self.repo), dict(os.environ), log,
+                    cancelled=lambda: log.exists(),
+                )
+        spawn.assert_not_called()
+        self.assertEqual(log.read_bytes(), b"")
+
+    def test_native_log_preserves_primary_stderr_diagnostic_and_exit(self):
+        log = self.project / "compiler.log"
+        result = storage._run_logged_command(
+            [sys.executable, "-B", "-c",
+             "import sys; print('build started', flush=True); print('error[E0505]: borrowed value', file=sys.stderr); sys.exit(101)"],
+            str(self.repo), dict(os.environ), log,
+        )
+        self.assertEqual(result.returncode, 101)
+        self.assertIn(b"build started", log.read_bytes())
+        self.assertIn(b"error[E0505]: borrowed value", log.read_bytes())
+
+    def test_workspace_build_admission_rejects_wrong_profile_and_generic_bypass_before_write(self):
+        release = self.resolve(profile="windows-native-fdm-cpu")
+        with patch.object(storage, "_is_native_windows", return_value=True):
+            with self.assertRaises(storage.StorageError):
+                storage.run_windows_workspace_build(release, "dev", 3197, "dev")
+            with self.assertRaises(storage.StorageError):
+                storage._run_managed_command(
+                    release,
+                    ["arbitrary-command"],
+                    native_user_build=True,
+                    workspace_backend_profile="release",
+                    execution_mode="windows-workspace-build",
+                )
+        self.assertFalse(Path(release["storage_root"]).exists())
 
     def test_initialize_rechecks_redirected_build_path(self):
         layout = self.resolve()
@@ -272,6 +651,38 @@ class StorageTests(unittest.TestCase):
                                 env={**os.environ, "FULLMAG_STORAGE_MANAGED_ENTRY": "1"})
         self.assertEqual(result.returncode, 2)
         self.assertIn("No inherited managed lock", result.stderr)
+
+    def test_uncertain_native_owner_blocks_before_storage_initialization(self):
+        layout = self.resolve(profile="windows-native-fdm-cpu-dev")
+        with patch.object(storage, "_is_native_windows", return_value=True), \
+             patch.object(storage, "initialize", side_effect=AssertionError("Must not write")), \
+             patch("windows.runtime_lease.active_runtime", side_effect=storage.StorageError("uncertain owner")):
+            with self.assertRaisesRegex(storage.StorageError, "uncertain owner"):
+                storage._run_managed_command(
+                    layout, ["fixed-launcher"], native_user_build=True,
+                    native_workspace_paths=True, workspace_backend_profile="dev",
+                    execution_mode="windows-workspace-build",
+                )
+
+    def test_independent_service_blocks_native_start_and_build_before_initialization(self):
+        layout = self.resolve(profile="windows-native-fdm-cpu-dev")
+        owner = Path(layout["runs_root"]) / "session-store" / "runtime-services" / "OWNER.json"
+        owner.parent.mkdir(parents=True)
+        owner.write_text('{"state":"ready"}', encoding="utf-8")
+        for mode in ("windows-workspace", "windows-workspace-build"):
+            with self.subTest(mode=mode), \
+                 patch.object(storage, "_is_native_windows", return_value=True), \
+                 patch.object(storage, "initialize", side_effect=AssertionError("Must not write")), \
+                 patch("windows.runtime_lease.active_runtime", return_value=None), \
+                 patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(storage.StorageError, "owner/launch state is present"):
+                    storage._run_managed_command(
+                        layout, ["fixed-launcher"],
+                        native_user_build=mode == "windows-workspace-build",
+                        native_workspace_paths=True, workspace_backend_profile="dev",
+                        execution_mode=mode,
+                    )
+        self.assertEqual(owner.read_text(encoding="utf-8"), '{"state":"ready"}')
 
     @unittest.skipIf(os.name == "nt", "Linux mount contract")
     def test_cifs_selects_managed_ext4_and_unmounted_view_fails(self):

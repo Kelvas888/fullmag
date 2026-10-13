@@ -43,6 +43,29 @@ kontrakt i wykrywalne braki, a nie pełną gwarancję wykonawczą.
 
 ## Granica projektu
 
+### Wyjątek: ulotne dane natywnej kompilacji Windows
+
+Na żądanie użytkownika z 05.10.2026 opcjonalny hostowy
+`FULLMAG_WINDOWS_VOLATILE_ROOT` może wskazywać lokalny RAM-disk poza trwałym
+storage. Dotyczy wyłącznie odtwarzalnej kopii wejść kompilatora i jego
+`TEMP`/`TMP`/`TMPDIR` w natywnym launcherze Windows. Właściciel projektu,
+worktree, profil i trwały build root są sprawdzane przed użyciem katalogu.
+Recepta zachowuje istniejące blokady i końcowy receipt. Trwałe snapshoty,
+cache Cargo, gotowe pakiety, manifesty, logi i sesje nadal podlegają
+kanonicznemu resolverowi. Brak dysku nie powoduje fallbacku nowego buildu.
+Szczegóły: [Windows-first development](windows-first-development.md#ulotne-dane-kompilacji-na-ram-disku).
+
+Fizyczną ścieżkę storage danego hosta deklaruje operator w `.env` głównego
+checkoutu przez `FULLMAG_PROJECT_STORAGE_ROOT`. `.env.example` dokumentuje klucz,
+ale nie narzuca lokalizacji Windows/Linux. Resolver czyta tylko zarządzane
+zmienne storage, bez wykonywania kodu i interpolacji; zmienne procesu mają
+pierwszeństwo (w szczególności dla ścieżek wewnątrz kontenera). Wszystkie
+worktree korzystają z `.env` głównego checkoutu. Nie kopiuj pliku z sekretami.
+Poniższy układ rodzeństwa jest wyłącznie fallbackiem zgodności przy braku
+konfiguracji; nowe buildy agenta wymagają jawnej deklaracji w `.env`.
+Niestandardowy root nadal wymaga zatwierdzonego markera projektu. Instrukcje
+i skille odsyłają do resolvera, nie ustalają fizycznych ścieżek hosta.
+
 Tożsamość projektu wyznacza się z Git, a nie z bieżącego katalogu procesu:
 
 1. rozwiąż bieżący checkout przez `git rev-parse --show-toplevel`;
@@ -144,6 +167,17 @@ rozwiązanym refie. Synchronizacja z remote jest osobnym, jawnie opisanym
 działaniem i zapisuje użyty ref bazowy w rejestrze.
 
 ## Profile buildów i ponowne użycie
+
+Natywny workspace Windows rozdziela `windows-native-fdm-cpu-dev`
+(Cargo `backend-dev`) i `windows-native-fdm-cpu` (Cargo `release`).
+Zamknięta trasa może uruchomić workspace z zapieczętowanej kopii EXE pod
+`runtimes/<worktree-id>/native-bundles/`. Do jej zweryfikowanej publikacji
+obowiązuje blokada worktree; potem runtime utrzymuje osobną blokadę
+`<worktree-id>.native-runtime.lock`, a kolejne buildy ponownie uzyskują zwykłą
+blokadę worktree. Status runtime to `native-workspace-status.json`; nie
+nadpisuje statusu równoległego buildu. Jest to kopia developerskich EXE,
+nie instalator ani gwarancja izolacji aktywnego solvera od zmian zależności
+Python/frontend. Watcher nie restartuje sesji.
 
 `profile-id` opisuje zgodny zestaw platformy/architektury, toolchainu, trybu
 debug/release, backendu, feature flags, ABI i zależności. Nie jest skrótem
@@ -257,6 +291,16 @@ wywołanie nie tworzy `C:\fullmag-build`, `C:\fullmag-cache` ani
 
 ## Linux
 
+Lokalną kolejkę Docker Desktop opisuje [instrukcja runnera](local-container-runner.md).
+Jej stały koordynator jest jedynym właścicielem SQLite; host przygotowuje kapsuły
+i komunikuje się przez API. Nie zakładamy zgodności blokad Win32 i Linux na bind
+NTFS. Poniższa historyczna trasa Linux nie narzuca ext4 nowemu profilowi Desktop.
+
+Rozszerzenie z 2026-09-11: [bramka właściwości storage](storage-capability-gate.md)
+pozwala badać osobną trasę Docker Desktop bez narzucania jej ext4. Nie zmienia
+automatycznie kwalifikacji ani guardów istniejących recept Linux opisanych
+poniżej. Wyniki sondy oraz build/runtime/physics pozostają osobnymi dowodami.
+
 Linuxowy profil hosta (domyślnie `linux-host`) obsługuje natywne narzędzia tam,
 gdzie dana recepta tego wymaga. Ciężkie buildy i runtime’y używają
 container-backed `just` oraz
@@ -281,6 +325,79 @@ CMake, CUDA, FEM ani wyników.
 
 ## Zakończenie, odzyskiwanie i sprzątanie
 
+### Cykl integracji zadania
+
+Domyślną decyzją użytkownika dla implementacji w worktree jest doprowadzenie
+zmian do `master` przez PR i usunięcie worktree zadania po udanej integracji.
+Ta autoryzacja obejmuje commit, push brancha zadania, utworzenie i scalenie PR
+oraz usunięcie dokładnie tego worktree po kontrolach poniżej. Audyt, plan i jawne
+ograniczenia użytkownika, np. „tylko lokalnie” lub „bez merge”, wyłączają
+odpowiednie kroki. Nie obejmuje to starych, obcych worktree, cache ani wyników.
+
+1. Ustal lokalny `master`, główny checkout i istniejący rejestr. Utwórz lub
+   wykorzystaj jedno `<project-root>/worktrees/<task-id>` z branchem
+   `codex/<task-id>`; zapisz ownera, cel i pełny bazowy commit. Domyślną bazą
+   jest `master`, chyba że zadanie wskazuje inną. Nie przejmuj aktywnego worktree.
+2. Buduj i testuj z worktree przez właściwe recepty `just`, korzystając z
+   resolverowego `storage/builds/<worktree-id>/<profile-id>`. Zachowaj dowody
+   testów i wymaganych bramek; wykonaj review zmian przed integracją.
+   Po każdym ukończonym, logicznie spójnym i adekwatnie zweryfikowanym etapie
+   wykonaj osobny commit na branchu zadania. Nie czekaj do końca całej pracy.
+   Commit zawiera powiązany kod, testy i dokumentację; nie rozdzielaj zależnych
+   zmian na commity łamiące build lub kontrakt. Przejrzyj staged diff i sprawdź
+   listę staged files w osobnym poleceniu przed każdym commitem. Zapisz pełny
+   hash oraz dowody w checkpointcie. Dokumentacja wymaga adekwatnej kontroli,
+   a nie sztucznego testu; niezmienionych zielonych kontroli nie ponawiaj.
+   Commity etapów są objęte autoryzacją zadania i nie oznaczają ukończenia
+   integracji ani kwalifikacji runtime. Nie uruchamiają oddzielnego merge.
+3. Sprawdź osobno listę staged files i commituj tylko zmiany zadania. Wypchnij
+   branch zadania do zweryfikowanego remote. Utwórz PR z bazą `master` albo
+   kontynuuj istniejący PR tego samego brancha. Zapisz URL i HEAD PR w rejestrze.
+4. Sprawdź wymagane CI, review i branch protection dla aktualnego HEAD PR.
+   Napraw błędy i konflikty na branchu zadania, ponów dotknięte kontrole.
+   Synchronizacja remote potrzebna do tego cyklu jest autoryzowana; zapisz
+   użyty ref. Nie omijaj ochrony ani wymaganej akceptacji. Jeśli wszystko
+   wymagane jest spełnione, scal PR metodą dozwoloną przez repozytorium.
+5. Potwierdź na remote stan PR `MERGED` oraz wynikowy commit. Zakończ polecenia
+   używające worktree i przejdź do głównego checkoutu. Sprawdź jego status;
+   wybierz `master`, pobierz aktualny ref i aktualizuj wyłącznie fast-forward.
+   Nie resetuj, nie stashuj ani nie commituj cudzych zmian. Jeśli aktualizacja
+   koliduje z nimi lub lokalny `master` jest rozbieżny, zapisz blokadę.
+   Zdalny merge musi mieć lokalny odpowiednik: potwierdź, że lokalny `HEAD`
+   głównego checkoutu wskazuje wynikowy commit `master`. Jeżeli główny checkout
+   nie może być użyty, ustaw pierwotny worktree na wynikowy ref tylko do
+   weryfikacji po sprawdzeniu jego procesów i mountów; cleanup wykonuje wtedy
+   inny zachowany checkout, a bez niego zapisz `blocked`. Po merge PR nie
+   wykonuj kolejnego merge brancha zadania.
+6. Zweryfikuj obecność wyniku PR na `master`, tożsamość źródeł i wymagane
+   kontrole integracyjne. Sprawdź brak nowych commitów na branchu zadania od
+   HEAD scalonego PR. Przy squash/rebase użyj też dowodu PR i porównania zmian;
+   sam brak ancestry nie świadczy o utracie kodu ani o bezpiecznym usunięciu.
+7. Przed cleanupem zapisz ścieżki buildów, logów i zachowanych wyników oraz
+   stan integracji. Sprawdź dokładną rozwiązaną ścieżkę worktree, status
+   obejmujący untracked files, unikalne zmiany, ownership, procesy, kontenery,
+   mounty i linki. Z dostępnego cleanup executora — głównego checkoutu albo
+   innego zachowanego checkoutu, którego nie usuwasz — wykonaj
+   `git worktree remove` dla pojedynczej zweryfikowanej ścieżki, bez `--force`.
+   Zweryfikuj brak wpisu
+   w `git worktree list` i brak katalogu. Następnie usuń lokalny branch zadania
+   dopiero po potwierdzeniu integracji: dla merge/fast-forward sprawdź ancestry,
+   a dla squash/rebase użyj stanu PR `MERGED` oraz porównania zmian. W obu
+   przypadkach potwierdź, że żaden inny worktree nie używa brancha, i sprawdź
+   jego usunięcie. Nie kasuj przy tym storage ani branchy innych zadań. Jeśli
+   Git odmawia, zachowaj dane i zapisz powód.
+8. Zaktualizuj rekord pierwotnego worktree w `storage/index` (nie rekord
+   głównego checkoutu): PR, merge commit, stan cleanupu, zachowane zasoby
+   i następny krok. Istniejący `worktree-finish` jedynie zapisuje stan;
+   nie tworzy PR, nie scala ani nie usuwa worktree. Zachowaj `worktree_id`
+   i ścieżkę rekordu przed usunięciem. Raport końcowy zawiera te dowody.
+
+Zadanie jest zakończone po integracji i cleanupie. Przy oczekiwaniu na CI,
+review, uprawnienia lub zwolnienie zasobów zachowaj worktree i wpis `review`
+albo `blocked`, z przyczyną i konkretnym następnym krokiem. Jawne polecenie
+zachowania worktree jest wyjątkiem i musi być zapisane. Nie przedstawiaj
+samej gotowości kodu ani PR jako ukończenia pełnego cyklu.
+
 Każde zakończenie worktree, profilu, builda i runu zapisuje stan końcowy,
 również po błędzie, anulowaniu lub przerwaniu. Stan musi wskazywać właściciela,
 źródła, ścieżki, procesy/kontenery, lease, ostatnią aktywność, powód
@@ -289,8 +406,9 @@ pozostawienia i następny krok. Używane rozróżnienia to co najmniej:
 `cancelled`/`abandoned` dla operacji przerwanych. Wygasły lease nie daje prawa
 do kasowania.
 
-Cleanup zaczyna się od read-only inventory i dry-runu. Usunięcie wymaga osobnej
-autoryzacji dla dokładnych celów oraz ponownego sprawdzenia dirty files,
+Cleanup zaczyna się od read-only inventory i dry-runu. Dla worktree bieżącego
+zadania autoryzację daje powyższy cykl; pozostałe usuwanie wymaga osobnej
+autoryzacji dla dokładnych celów. Zawsze wymaga ponownego sprawdzenia dirty files,
 unikalnych commitów i zmian, refów, właściciela, aktywnych procesów,
 kontenerów, mountów, junctionów/symlinków i containment. Wiek, nazwa katalogu
 ani status `prunable` nie są dowodem zbędności. Nie używaj szerokiego wildcardu

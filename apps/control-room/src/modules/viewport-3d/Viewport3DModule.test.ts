@@ -173,6 +173,24 @@ describe("FEM visualization ACK data identity", () => {
     );
     expect(callback).not.toContain("ackKind.dataIdentity");
   });
+
+  it("forwards the request scope epoch with viewport acknowledgements", () => {
+    const source = readFileSync(
+      "src/modules/viewport-3d/Viewport3DModule.tsx",
+      "utf8",
+    );
+    const callbackStart = source.indexOf(
+      "const onVisualizationFrameCommitted = useCallback",
+    );
+    const callback = source.slice(
+      callbackStart,
+      source.indexOf("useEffect(() => {", callbackStart),
+    );
+
+    expect(callback).toContain(
+      "requestScopeEpoch: sessionIdentity?.requestScopeEpoch ?? null",
+    );
+  });
 });
 
 function scalarColorbarPart(
@@ -2002,9 +2020,10 @@ describe("Viewport3DModule scene wiring", () => {
     expect(source).toContain("VIEWPORT_3D_CANVAS_GL_NO_ANTIALIAS");
     expect(source).toContain("VIEWPORT_3D_CANVAS_GL_ANTIALIAS");
     expect(source).toContain("VIEWPORT_3D_CANVAS_GL_CAPTURE");
+    expect(source).toContain("VIEWPORT_3D_CANVAS_GL_CAPTURE_NO_ANTIALIAS");
     expect(source).toContain("resolveStableViewport3DCanvasGlOptions");
-    expect(source).toContain(
-      "const canvasGlOptions = resolveStableViewport3DCanvasGlOptions(visualProfile);",
+    expect(source.replace(/\r\n/g, "\n")).toContain(
+      "const canvasGlOptions = resolveStableViewport3DCanvasGlOptions(\n    visualProfile,\n    effectAntialias,\n  );",
     );
     expect(source).toContain("const handleCanvasCreated = useCallback");
     expect(source).toContain("const handleCanvasContextMenu = useCallback");

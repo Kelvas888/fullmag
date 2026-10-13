@@ -47,6 +47,9 @@ fn relaxation_algorithms_available() -> Vec<String> {
     tag = "sessions"
 )]
 pub async fn get_status(State(state): State<Arc<AppState>>) -> Result<Json<LiveStatus>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    let _transition = state.current_live_session_transition.lock().await;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     let display_sel = state.current_display_selection.read().await.clone();
     let display_presentation = state.current_display_presentation.read().await.clone();
     let workspace_selection = state.current_workspace_selection.read().await.clone();
@@ -55,7 +58,12 @@ pub async fn get_status(State(state): State<Arc<AppState>>) -> Result<Json<LiveS
     let connectivity = refresh_current_live_connectivity(&state).await;
     let (commands_revision, command_completion_revision) = {
         let ledger = state.current_command_ledger.lock().await;
-        let revisions = command_ledger_revisions(&ledger);
+        let revisions = command_ledger_revisions(
+            &ledger,
+            state
+                .current_command_journal_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
         (
             revisions.commands_revision,
             revisions.command_completion_revision,
@@ -66,7 +74,7 @@ pub async fn get_status(State(state): State<Arc<AppState>>) -> Result<Json<LiveS
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
 
-    Ok(Json(build_live_status(
+    let response = build_live_status(
         state.current_workspace_root.as_path(),
         snapshot,
         &display_sel,
@@ -74,10 +82,13 @@ pub async fn get_status(State(state): State<Arc<AppState>>) -> Result<Json<LiveS
         &workspace_selection,
         &workspace_ribbon,
         &workspace_layout,
+        &request_context.request_scope_epoch,
         commands_revision,
         command_completion_revision,
         connectivity,
-    )))
+    );
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(Json(response))
 }
 
 /// Advances backend-owned connectivity from the real runner publication
@@ -183,6 +194,7 @@ pub(crate) fn build_live_status(
     workspace_selection: &CurrentWorkspaceSelection,
     workspace_ribbon: &CurrentWorkspaceRibbon,
     workspace_layout: &CurrentWorkspaceLayout,
+    request_scope_epoch: &str,
     commands_revision: u64,
     command_completion_revision: u64,
     connectivity: SessionConnectivity,
@@ -193,19 +205,18 @@ pub(crate) fn build_live_status(
         snapshot.runtime_status.can_accept_commands && !snapshot.runtime_status.is_busy,
         connectivity,
     );
-    let terminal_session_resource =
-        lifecycle.session_resource == crate::schemas::status::SessionResourceLifecycle::Tombstoned;
     let session = SessionSummary {
         session_id: snapshot.session.session_id.clone(),
-        session_epoch: session_epoch(
-            &snapshot.session.session_id,
-            snapshot.session.started_at_unix_ms,
-            snapshot.session.finished_at_unix_ms,
-            terminal_session_resource,
-        ),
+        session_epoch: current_live_session_epoch(snapshot),
+        request_scope_epoch: request_scope_epoch.to_string(),
         name: snapshot.session.problem_name.clone(),
         created_at: snapshot.session.started_at_unix_ms.to_string(),
         workspace_root: workspace_root.display().to_string(),
+        script: crate::script::session_script_summary(
+            workspace_root,
+            &snapshot.session.script_path,
+            false,
+        ),
     };
 
     let run = snapshot.run.as_ref().map(|r| {
@@ -389,7 +400,7 @@ pub(crate) fn build_live_status(
 
     LiveStatus {
         api_contract_version: "1.0.0".into(),
-        runtime_bundle_version: crate::build_info::backend_build_date().to_string(),
+        runtime_bundle_version: fullmag_build_info::version().to_string(),
         session,
         run,
         solver,
@@ -440,7 +451,30 @@ pub(crate) fn session_epoch(
     }
 }
 
-pub(crate) const ACTIVE_LANE_OPERATION_IDS: [&str; 33] = [
+/// Canonical browser-visible identity for a current session resource.
+///
+/// This is deliberately distinct from the internal monotonic
+/// `current_live_session_epoch` used by request-context fences. The browser
+/// receives this value in `LiveStatus.session.session_epoch` and echoes it in
+/// `x-fullmag-session-scope`.
+pub(crate) fn current_live_session_epoch(snapshot: &SessionStateResponse) -> String {
+    let solver_lifecycle = crate::session::effective_runtime_status_code(snapshot);
+    let lifecycle = lifecycle_contract(
+        &solver_lifecycle,
+        snapshot.runtime_status.can_accept_commands && !snapshot.runtime_status.is_busy,
+        SessionConnectivity::Connected,
+    );
+    let terminal_session_resource =
+        lifecycle.session_resource == SessionResourceLifecycle::Tombstoned;
+    session_epoch(
+        &snapshot.session.session_id,
+        snapshot.session.started_at_unix_ms,
+        snapshot.session.finished_at_unix_ms,
+        terminal_session_resource,
+    )
+}
+
+pub(crate) const ACTIVE_LANE_OPERATION_IDS: [&str; 34] = [
     "grid_build",
     "shared_mesh_build",
     "field_quantity",
@@ -460,6 +494,7 @@ pub(crate) const ACTIVE_LANE_OPERATION_IDS: [&str; 33] = [
     "interaction.sot",
     "interaction.stt",
     "interaction.interfacial_dmi",
+    "interaction.rotated_interfacial_dmi",
     "interaction.bulk_dmi",
     "interaction.uniaxial_anisotropy",
     "interaction.cubic_anisotropy",
@@ -695,13 +730,6 @@ fn active_lane_operations(
             requires.iter().copied(),
         )
     };
-    let deferred = |reason: &str, requires: &[&str]| {
-        operation(
-            ActiveLaneCapabilityState::Deferred,
-            reason,
-            requires.iter().copied(),
-        )
-    };
     let term_operation = |available: bool, term: &str| {
         if available {
             supported(
@@ -754,9 +782,9 @@ fn active_lane_operations(
         (
             "grid_build".into(),
             if is_fdm {
-                deferred(
-                    "FDM grid and membership masks are immutable execution-plan artifacts; standalone refresh is deferred until a safe replanning lifecycle exists.",
-                    &["discretization:fdm", "safe_replanning_lifecycle"],
+                supported(
+                    "FDM grid and membership masks are rebuilt by an atomic execution-plan replan.",
+                    &["discretization:fdm", "operation:fdm_grid_refresh"],
                 )
             } else {
                 unsupported(
@@ -832,7 +860,10 @@ fn active_lane_operations(
             "region_membership".into(),
             semantic_only(
                 "Region-membership semantics exist, but the planner profile does not publish current membership-resource readiness.",
-                &["domain_metadata:compatible", "region_membership_resource:compatible"],
+                &[
+                    "domain_metadata:compatible",
+                    "region_membership_resource:compatible",
+                ],
             ),
         ),
         (
@@ -891,7 +922,7 @@ fn active_lane_operations(
         (
             "interaction.dmi".into(),
             term_operation(
-                has_term(&["interfacial_dmi", "bulk_dmi"]),
+                has_term(&["interfacial_dmi", "rotated_interfacial_dmi", "bulk_dmi"]),
                 "interaction:dmi",
             ),
         ),
@@ -923,6 +954,13 @@ fn active_lane_operations(
             term_operation(
                 has_term(&["interfacial_dmi"]),
                 "interaction:interfacial_dmi",
+            ),
+        ),
+        (
+            "interaction.rotated_interfacial_dmi".into(),
+            term_operation(
+                has_term(&["rotated_interfacial_dmi"]),
+                "interaction:rotated_interfacial_dmi",
             ),
         ),
         (
@@ -959,14 +997,8 @@ fn active_lane_operations(
             "interaction.thermal".into(),
             term_operation(has_term(&["thermal"]), "interaction:thermal"),
         ),
-        (
-            "interaction.frozen_spins".into(),
-            frozen_spins_operation(),
-        ),
-        (
-            "constraint.frozen_spins".into(),
-            frozen_spins_operation(),
-        ),
+        ("interaction.frozen_spins".into(), frozen_spins_operation()),
+        ("constraint.frozen_spins".into(), frozen_spins_operation()),
         (
             "study.relaxation".into(),
             if time_domain_engine {
@@ -1003,7 +1035,10 @@ fn active_lane_operations(
                     &["planner:eigenmodes"],
                 )
             } else {
-                semantic_only("Eigenmode authoring exists, but the resolved planner lane does not advertise executable support.", &["planner:eigenmodes"])
+                semantic_only(
+                    "Eigenmode authoring exists, but the resolved planner lane does not advertise executable support.",
+                    &["planner:eigenmodes"],
+                )
             },
         ),
         (
@@ -1014,7 +1049,10 @@ fn active_lane_operations(
                     &["planner:frequency_response"],
                 )
             } else {
-                semantic_only("Frequency-response authoring exists, but the resolved planner lane does not advertise executable support.", &["planner:frequency_response"])
+                semantic_only(
+                    "Frequency-response authoring exists, but the resolved planner lane does not advertise executable support.",
+                    &["planner:frequency_response"],
+                )
             },
         ),
         (

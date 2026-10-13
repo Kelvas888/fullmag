@@ -1,0 +1,9 @@
+{
+  "schema_version": "2.0",
+  "protocol_ref": "fixtures/performance_scenarios.json",
+  "documentation": "docs/14_BASELINE_I_BUDZETY_WYDAJNOSCIOWE.md",
+  "owner": "PR01 / release maintainer",
+  "status": "pending_baseline",
+  "measurements": null,
+  "approved_budgets": null
+}

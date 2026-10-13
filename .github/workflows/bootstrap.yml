@@ -164,12 +164,112 @@ jobs:
             exit 1
           fi
 
+      - name: Run Inspector mutation and DMI authoring browser regressions
+        env:
+          NEXT_PUBLIC_AUDIT_BUILD: "1"
+          CONTROL_ROOM_URL: http://127.0.0.1:3100/workspace
+          CONTROL_ROOM_AUDIT_ARTIFACTS_DIR: ${{ runner.temp }}/viewport-3d-browser-audit
+          CONTROL_ROOM_INSPECTOR_REPORT_DIR: ${{ runner.temp }}/viewport-3d-browser-audit/inspector
+        run: |
+          mkdir -p "$CONTROL_ROOM_INSPECTOR_REPORT_DIR"
+          # Reuse the audit build from this exact CI source snapshot. Start
+          # Node directly so the cleanup trap owns the actual server process.
+          (
+            cd apps/control-room
+            exec node node_modules/next/dist/bin/next start --hostname 127.0.0.1 --port 3100
+          ) > "$CONTROL_ROOM_INSPECTOR_REPORT_DIR/server.log" 2>&1 &
+          inspector_server_pid=$!
+          trap 'kill "$inspector_server_pid" 2>/dev/null || true; wait "$inspector_server_pid" 2>/dev/null || true' EXIT
+          inspector_ready=0
+          for attempt in $(seq 1 60); do
+            if ! kill -0 "$inspector_server_pid" 2>/dev/null; then
+              cat "$CONTROL_ROOM_INSPECTOR_REPORT_DIR/server.log"
+              exit 1
+            fi
+            if curl --fail --silent --max-time 3 --output /dev/null "$CONTROL_ROOM_URL"; then
+              inspector_ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$inspector_ready" = 1
+          pnpm --dir apps/control-room run smoke:inspector
+          ./scripts/ci/run_frontend3d_required_gate.sh browser-fixture-source-verify-post-write
+
+      - name: Run start screen stylesheet browser check
+        # Static CSS plus inline markup: no server and no audit build are needed.
+        env:
+          CONTROL_ROOM_BROWSER_CHANNEL: chromium
+        run: pnpm --dir apps/control-room run check:start-screen-browser
+
       - name: Upload browser fixture smoke artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: viewport-3d-browser-audit
           path: ${{ runner.temp }}/viewport-3d-browser-audit
+          if-no-files-found: error
+
+  inspector-actions-browser-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.8.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Resolve Inspector fixture storage paths
+        id: inspector-storage
+        shell: bash
+        run: |
+          resolved_layout="$(python3 scripts/fullmag_storage.py resolve --repo-root "$GITHUB_WORKSPACE" --profile windows-control-room-browser-fixture)"
+          artifact_root="$(python3 -c 'import json,sys; from pathlib import Path; print(Path(json.load(sys.stdin)["build_storage_root"]) / "builds")' <<< "$resolved_layout")"
+          browser_root="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["env"]["PLAYWRIGHT_BROWSERS_PATH"])' <<< "$resolved_layout")"
+          for path in "$artifact_root" "$browser_root"; do
+            if [[ "$path" != /* || "$path" == *"/../"* || "$path" == */.. ]]; then
+              echo "Resolved Inspector storage path is not absolute and normalized: $path" >&2
+              exit 1
+            fi
+          done
+          echo "build_root=$artifact_root" >> "$GITHUB_OUTPUT"
+          echo "playwright_browsers_path=$browser_root" >> "$GITHUB_OUTPUT"
+
+      - name: Install Chromium for Inspector browser fixture
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ steps.inspector-storage.outputs.playwright_browsers_path }}
+        run: pnpm --dir apps/control-room exec playwright install --with-deps chromium
+
+      - name: Run production Inspector actions browser fixture
+        run: python3 scripts/verify_pinned_dataset_browser.py --repo-root "$GITHUB_WORKSPACE" --port 3257 --scenario inspector-actions
+
+      - name: Upload Inspector browser receipt and screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: inspector-actions-browser-fixture
+          path: |
+            ${{ steps.inspector-storage.outputs.build_root }}/**/inspector-actions-browser/*/receipt.json
+            ${{ steps.inspector-storage.outputs.build_root }}/**/inspector-actions-browser/*/next.log
+            ${{ steps.inspector-storage.outputs.build_root }}/**/inspector-actions-browser/*/browser.log
+            ${{ steps.inspector-storage.outputs.build_root }}/**/inspector-actions-browser/*/browser/**
           if-no-files-found: error
 
   fdm-relaxation-qualification:
@@ -222,7 +322,14 @@ jobs:
       - name: Install Python package
         run: |
           python -m pip install 'pytest>=9,<10'
-          python -m pip install -e 'packages/fullmag-py[meshing]'
+          python -m pip install -e 'packages/fullmag-py[meshing,figures]'
+
+      - name: Run Göbel 2019 bimeron reproducibility contracts
+        run: >-
+          python -m pytest -q
+          tests/standard_problems/bimeron/goebel_2019/test_verify.py
+          tests/standard_problems/bimeron/goebel_2019/test_contract.py
+          scripts/test_render_goebel_2019_bimeron_figure.py
 
       - name: Run Python API tests
         run: python -m unittest discover -s packages/fullmag-py/tests -p 'test_api.py' -v
@@ -238,3 +345,9 @@ jobs:
 
       - name: Repository consistency checks
         run: python scripts/check_repo_consistency.py
+
+      - name: Run rotated DMI scene authoring regressions
+        run: >-
+          python -m pytest -q
+          packages/fullmag-py/tests/test_scratch_authoring_ui_roundtrip.py
+          -k dmi
