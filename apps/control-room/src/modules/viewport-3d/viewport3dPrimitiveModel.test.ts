@@ -4,6 +4,9 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import type { MeshSharedDomainManifestResource } from "@/kernel/api/apiTypes";
+import {
+  resolveCommittedGeometryObjectDraft,
+} from "@/kernel/authoring/object-edit/objectEditDraftModel";
 import type { Selection } from "@/kernel/selection/selectionTypes";
 
 import {
@@ -11,6 +14,7 @@ import {
   buildViewport3DPrimitiveFrameKey,
   buildViewport3DPrimitiveRenderModel,
   resolvePrimitiveSelectionBounds,
+  withObjectPlacementDraftPreview,
 } from "./viewport3dPrimitiveModel";
 
 const viewport3dPrimitiveModelSource = readFileSync(
@@ -92,6 +96,58 @@ describe("viewport3dPrimitiveModel", () => {
     expect(buildViewport3DPrimitiveFrameKey(model)).toBe(
       "7|box:Box:{\"size\":[1,2,3]}:{\"translation\":[4,5,6]}|no-draft",
     );
+  });
+
+  it("moves the selected primitive preview from the shared placement draft", () => {
+    const scene = {
+      objects: [
+        {
+          geometry: {
+            geometry_kind: "Box",
+            geometry_params: { size: [1, 2, 3] },
+          },
+          id: "box",
+          name: "Box",
+          transform: { translation: [4, 5, 6] },
+        },
+      ],
+      revision: 7,
+    };
+    const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+    const canonicalDraft = resolveCommittedGeometryObjectDraft(
+      scene as never,
+      "box",
+    )!;
+    const preview = withObjectPlacementDraftPreview(
+      model,
+      { ...canonicalDraft, translation: ["7", "5", "6"] },
+      "box",
+    );
+
+    expect(preview?.objects[0]).toMatchObject({
+      bounds: { center: [7, 5, 6] },
+      translation: [7, 5, 6],
+    });
+    expect(preview?.objects[0]?.geometryKey).toContain("placement-draft:7,5,6");
+  });
+
+  it("calculates cylinder fallback bounds correctly from radius and height (F18)", () => {
+    const scene = {
+      objects: [
+        {
+          geometry: {
+            geometry_kind: "Cylinder",
+            geometry_params: { height: 1e-8, radius: 5e-8 },
+          },
+          id: "cyl",
+          name: "Cylinder",
+          transform: { translation: [0, 0, 0] },
+        },
+      ],
+      revision: 1,
+    };
+    const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+    expect(model.objects[0]?.bounds.size).toEqual([1e-7, 1e-7, 1e-8]);
   });
 
   it("builds primitive-only entries when the API uses scene_revision", () => {

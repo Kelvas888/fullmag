@@ -1,0 +1,339 @@
+[
+  {
+    "id": "Q01",
+    "documents": "D07",
+    "pull_requests": [
+      "PR01",
+      "PR12"
+    ],
+    "tests": [
+      "T70"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q02",
+    "documents": "D04",
+    "pull_requests": [
+      "PR07"
+    ],
+    "tests": [
+      "T02",
+      "T18",
+      "T25"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q03",
+    "documents": "D11",
+    "pull_requests": [
+      "PR05",
+      "PR07"
+    ],
+    "tests": [
+      "T51",
+      "T52"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q04",
+    "documents": "D13",
+    "pull_requests": [
+      "PR13",
+      "PR14"
+    ],
+    "tests": [
+      "T14",
+      "T63",
+      "T64"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q05",
+    "documents": "D04",
+    "pull_requests": [
+      "PR02",
+      "PR07"
+    ],
+    "tests": [
+      "T57",
+      "T67"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q06",
+    "documents": "D04/D11",
+    "pull_requests": [
+      "PR05",
+      "PR06",
+      "PR17"
+    ],
+    "tests": [
+      "T06",
+      "T32",
+      "T65"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q07",
+    "documents": "D04",
+    "pull_requests": [
+      "PR02",
+      "PR07"
+    ],
+    "tests": [
+      "T54",
+      "T55"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q08",
+    "documents": "D04",
+    "pull_requests": [
+      "PR07"
+    ],
+    "tests": [
+      "T03",
+      "T13"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q09",
+    "documents": "D11",
+    "pull_requests": [
+      "PR05",
+      "PR06"
+    ],
+    "tests": [
+      "T53",
+      "T65"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q10",
+    "documents": "D13",
+    "pull_requests": [
+      "PR13",
+      "PR15"
+    ],
+    "tests": [
+      "T14",
+      "T15",
+      "T62"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q11",
+    "documents": "D13",
+    "pull_requests": [
+      "PR13",
+      "PR14"
+    ],
+    "tests": [
+      "T61",
+      "T71"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q12",
+    "documents": "D06",
+    "pull_requests": [
+      "PR08",
+      "PR09",
+      "PR10"
+    ],
+    "tests": [
+      "T42",
+      "T68"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q13",
+    "documents": "D06",
+    "pull_requests": [
+      "PR09",
+      "PR10"
+    ],
+    "tests": [
+      "T43",
+      "T60"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q14",
+    "documents": "D06",
+    "pull_requests": [
+      "PR08",
+      "PR11"
+    ],
+    "tests": [
+      "T33",
+      "T58",
+      "T66"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q15",
+    "documents": "D12",
+    "pull_requests": [
+      "PR16",
+      "PR17",
+      "PR18"
+    ],
+    "tests": [
+      "T27",
+      "T32",
+      "T59",
+      "T72"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q16",
+    "documents": "D11",
+    "pull_requests": [
+      "PR05",
+      "PR07",
+      "PR09",
+      "PR13"
+    ],
+    "tests": [
+      "T63"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q17",
+    "documents": "D04",
+    "pull_requests": [
+      "PR02",
+      "PR07"
+    ],
+    "tests": [
+      "T18",
+      "T54"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q18",
+    "documents": "D04",
+    "pull_requests": [
+      "PR04",
+      "PR15",
+      "PR07"
+    ],
+    "tests": [
+      "T08",
+      "T09",
+      "T24",
+      "T56"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q19",
+    "documents": "D05",
+    "pull_requests": [
+      "PR07",
+      "PR12"
+    ],
+    "tests": [
+      "T67"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q20",
+    "documents": "D06",
+    "pull_requests": [
+      "PR19",
+      "PR20"
+    ],
+    "tests": [
+      "T45",
+      "T69"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q21",
+    "documents": "D08",
+    "pull_requests": [
+      "PR01",
+      "PR12"
+    ],
+    "tests": [
+      "T70"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q22",
+    "documents": "D14",
+    "pull_requests": [
+      "PR01",
+      "PR12"
+    ],
+    "tests": [
+      "T49"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q23",
+    "documents": "D07",
+    "pull_requests": [
+      "PR01",
+      "PR12"
+    ],
+    "tests": [
+      "T70"
+    ],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  },
+  {
+    "id": "Q24",
+    "documents": "D01/D10",
+    "pull_requests": [],
+    "tests": [],
+    "status": "addressed_in_plan_not_implemented",
+    "decision_approval": "see_D00"
+  }
+]

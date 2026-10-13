@@ -55,6 +55,13 @@ describe("resolveInspectorDescriptor", () => {
     });
   });
 
+  it("uses Geometry and Placement tabs for shared object authoring", () => {
+    expect(resolveInspectorDescriptor(selection("object.geometry")).tabs).toEqual([
+      { id: "geometry", label: "Geometry" },
+      { id: "placement", label: "Placement" },
+    ]);
+  });
+
   it("uses task-oriented mesh navigation", () => {
     const descriptor = resolveInspectorDescriptor(selection("object.mesh"));
 
@@ -114,7 +121,6 @@ describe("resolveInspectorDescriptor", () => {
 
   it.each([
     "object.material",
-    "object.geometry",
     "object.physics",
     "object.regions",
     "object.region.material",

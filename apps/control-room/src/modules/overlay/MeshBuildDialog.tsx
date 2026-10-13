@@ -208,8 +208,32 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
   const policyLoaded = objectId ? objectPolicy.status === "ready"
     : universePolicy.status === "ready" && sharedPolicy.status === "ready";
   const computedSnapshot = useMemo(() => {
-    if (!state.request?.requestId || !policyLoaded || sceneRevision == null || !runtimeStatus
-      || summary.status !== "ready" || latestBuild.status !== "ready" || manifest.status !== "ready") {
+    const isReadyOrNotBuilt = (resource: { status: string; error?: unknown }) => {
+      if (resource.status === "ready") return true;
+      if (resource.status === "error") {
+        const err = resource.error as { status?: number; code?: string; message?: string } | null;
+        if (
+          err?.status === 404 ||
+          err?.code === "NOT_FOUND" ||
+          err?.code === "NO_MESH_YET" ||
+          err?.message?.toLowerCase().includes("not found")
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    if (
+      !state.request?.requestId ||
+      !policyLoaded ||
+      sceneRevision == null ||
+      !runtimeStatus ||
+      !isReadyOrNotBuilt(summary) ||
+      !isReadyOrNotBuilt(latestBuild) ||
+      !isReadyOrNotBuilt(manifest) ||
+      !isReadyOrNotBuilt(sharedQuality)
+    ) {
       return null;
     }
     const previousSnapshot = asRecord(asRecord(latestBuild.data?.last_success)?.canonical_policy_snapshot);
@@ -224,9 +248,9 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
       policy: asRecord(previousPolicy),
       requestedPolicy: asRecord(structuredClone(requestedPolicy)),
       stats: {
-        build: asRecord(structuredClone(latestBuild.data)),
-        manifest: asRecord(structuredClone(manifest.data)),
-        quality: asRecord(structuredClone(sharedQuality.data)),
+        build: latestBuild.status === "ready" ? asRecord(structuredClone(latestBuild.data)) : null,
+        manifest: manifest.status === "ready" ? asRecord(structuredClone(manifest.data)) : null,
+        quality: sharedQuality.status === "ready" ? asRecord(structuredClone(sharedQuality.data)) : null,
       },
     };
   }, [
@@ -234,12 +258,10 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
     policyLoaded,
     sceneRevision,
     runtimeStatus,
-    summary.status,
-    latestBuild.status,
-    latestBuild.data,
-    manifest.status,
-    manifest.data,
-    sharedQuality.data,
+    summary,
+    latestBuild,
+    manifest,
+    sharedQuality,
     objectId,
     requestedPolicy,
     requestedPolicyKey,
