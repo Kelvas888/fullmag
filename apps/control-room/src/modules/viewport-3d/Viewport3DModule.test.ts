@@ -2061,6 +2061,7 @@ describe("Viewport3DModule scene wiring", () => {
     expect(source).toContain("cameraFieldUpdateHold.end(epoch);");
     expect(source).toContain("kernel.cameraRegistry.beginInteraction(epoch);");
     expect(source).toContain("kernel.cameraRegistry.endInteraction(epoch);");
+    expect(source).toContain("cameraFieldUpdateHold.begin(epoch);");
     expect(source).not.toContain("onPointerDownCapture={holdFieldUpdatesForPointerGesture}");
     expect(source).not.toContain("onPointerUpCapture={releaseFieldUpdatePointerHold}");
   });

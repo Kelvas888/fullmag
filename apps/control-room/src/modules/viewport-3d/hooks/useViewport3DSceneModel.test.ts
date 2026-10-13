@@ -778,7 +778,7 @@ describe("useViewport3DSceneModel", () => {
     ).toHaveLength(2);
   });
 
-  it("keeps FDM native-layer visibility on the local structured-grid target state", () => {
+  it("resolves FDM native layers from canonical state and pending local target edits", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
     const nativeLayerSettingsBlock = source.slice(
       source.indexOf("const fdmNativeLayerSettingsById = useMemo"),
@@ -788,7 +788,8 @@ describe("useViewport3DSceneModel", () => {
     expect(nativeLayerSettingsBlock).toContain(
       "resolveViewport3DFdmTargetVisualization({",
     );
-    expect(nativeLayerSettingsBlock).not.toContain(
+    expect(nativeLayerSettingsBlock).toContain("snapshot: objectVisualizationSnapshot");
+    expect(nativeLayerSettingsBlock).toContain(
       "visualizationState: renderingState",
     );
   });
