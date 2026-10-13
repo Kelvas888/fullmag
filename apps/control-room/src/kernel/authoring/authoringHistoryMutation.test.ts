@@ -372,4 +372,33 @@ describe("runAuthoringMutationWithHistory", () => {
       afterWorkspaceState: { selection: beforeSelection },
     }));
   });
+
+  it("triggers onHistoryDegraded when recording fails, preserving successful mutation ACK", async () => {
+    const before = scene(50);
+    const after = scene(51);
+    const degraded = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const record = vi.fn().mockImplementation(() => {
+      throw new Error("history store failure");
+    });
+    const context = {
+      api: { model: { scene: vi.fn(async () => before) } } as never,
+      authoringHistory: { record } as never,
+      sessionScopeKey: "session=test&epoch=1",
+      isCurrentSessionScope: () => true,
+    };
+
+    const result = await runAuthoringMutationWithHistory(
+      context,
+      "Mutate with failing history",
+      async () => ({ committed: true, scene_revision: 51 }),
+      () => after,
+      { onHistoryDegraded: degraded },
+    );
+
+    expect(result).toEqual({ committed: true, scene_revision: 51 });
+    expect(degraded).toHaveBeenCalledWith("history store failure");
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
 });

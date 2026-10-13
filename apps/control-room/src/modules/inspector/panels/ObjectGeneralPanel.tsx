@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 import {
   MODEL_GEOMETRY_DIAGNOSTICS_PATH,
@@ -7,7 +7,16 @@ import {
   MODEL_SCENE_PATH,
   VISUALIZATION_STATE_PATH,
 } from "@/kernel/api/apiPaths";
-import type { SceneResource } from "@/kernel/api/apiTypes";
+import type { JsonObject, SceneResource } from "@/kernel/api/apiTypes";
+import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
+import { patchObjectGeometryTransaction } from "@/kernel/authoring/geometryLifecycleCommands";
+import {
+  geometryDraftGeometryEquals,
+  geometryDraftTranslationEquals,
+  geometryObjectEditSessionTargetKey,
+  resolveCommittedGeometryObjectDraft,
+} from "@/kernel/authoring/object-edit/objectEditDraftModel";
+import { useObjectEditSelector } from "@/kernel/authoring/object-edit/useObjectEditSelector";
 import {
   deleteObjectWithHistory,
   patchObjectIdentityWithHistory,
@@ -40,13 +49,18 @@ import { FieldRow } from "../primitives/FieldRow";
 import { FormField } from "../primitives/FormField";
 import { InspectorGroup } from "../primitives/InspectorGroup";
 import {
+  buildGeometryDraftPatch,
+  buildTransformDraftPatch,
+  mergeGeometryDescriptor,
+} from "./geometryObjectPanelModel";
+import {
   resolveObjectGeneralPanelModel,
   resolveObjectMetricsPanelModel,
   summarizeGeometryValidationMessages,
 } from "./objectGeneralPanelModel";
 
 type Feedback = {
-  kind: "error" | "success";
+  kind: "error" | "success" | "warning";
   message: string;
 };
 
@@ -162,17 +176,47 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
     feedback: null,
     key: draftKey,
   });
+  const currentSessionScopeKey = kernel.commands.getSessionScopeKey() ?? null;
   const [pendingState, setPendingState] = useState<PendingOperationState>({
     draftKey,
     operationId: 0,
     pending: false,
-    sessionScopeKey: kernel.commands.getSessionScopeKey() ?? null,
+    sessionScopeKey: currentSessionScopeKey,
   });
   const pendingOperationId = useRef(0);
-  const currentSessionScopeKey = kernel.commands.getSessionScopeKey() ?? null;
-  const pending = pendingState.pending &&
-    pendingState.draftKey === draftKey &&
-    pendingState.sessionScopeKey === currentSessionScopeKey;
+  const editSnapshot = useObjectEditSelector(kernel.objectEditSession);
+  const targetKey = geometryObjectEditSessionTargetKey(currentSessionScopeKey, {
+    mode: "committed",
+    objectId: object.objectId,
+  });
+  const sessionMatchesTarget =
+    editSnapshot.identity?.targetKey === targetKey &&
+    editSnapshot.identity?.objectId === object.objectId;
+  const objectEditDraft = sessionMatchesTarget ? editSnapshot.draft : null;
+  const canonicalGeometryDraft = useMemo(
+    () =>
+      object.mode === "committed"
+        ? resolveCommittedGeometryObjectDraft(scene.data, object.objectId)
+        : null,
+    [object.mode, object.objectId, scene.data],
+  );
+  const geometryDraftChanged = Boolean(
+    objectEditDraft &&
+      canonicalGeometryDraft &&
+      !geometryDraftGeometryEquals(objectEditDraft, canonicalGeometryDraft),
+  );
+  const transformDraftChanged = Boolean(
+    objectEditDraft &&
+      canonicalGeometryDraft &&
+      !geometryDraftTranslationEquals(objectEditDraft, canonicalGeometryDraft),
+  );
+  const objectEditDraftDirty = geometryDraftChanged || transformDraftChanged;
+
+  const pending =
+    (pendingState.pending &&
+      pendingState.draftKey === draftKey &&
+      pendingState.sessionScopeKey === currentSessionScopeKey) ||
+    (sessionMatchesTarget && editSnapshot.applyOperationId !== null);
 
   const draftName = draftState.key === draftKey ? draftState.name : object.name;
   const draftNotes = draftState.key === draftKey ? draftState.notes : object.notes;
@@ -247,15 +291,24 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
     if (object.mode !== "committed") return false;
     const finishPending = beginPendingOperation();
     let isCurrentMutationContext: (() => boolean) | null = null;
+    let historyDegraded = false;
     try {
       const mutationContext = createAuthoringMutationContext();
       isCurrentMutationContext = mutationContext.isCurrentSessionScope;
-      const response = await patchObjectIdentityWithHistory(mutationContext, {
-        baseRevision: object.revision,
-        name: draftName,
-        notes: draftNotes,
-        objectId: object.objectId,
-      });
+      const response = await patchObjectIdentityWithHistory(
+        mutationContext,
+        {
+          baseRevision: object.revision,
+          name: draftName,
+          notes: draftNotes,
+          objectId: object.objectId,
+        },
+        {
+          onHistoryDegraded: () => {
+            historyDegraded = true;
+          },
+        },
+      );
       if (mutationContext.isCurrentSessionScope() === false) return false;
       const nextRevision =
         typeof response.revision === "number"
@@ -268,7 +321,12 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
         mutationContext.sessionScopeKey,
         api.resourceCacheScope,
       );
-      setFeedback({ kind: "success", message: "Object identity committed." });
+      setFeedback({
+        kind: historyDegraded ? "warning" : "success",
+        message: historyDegraded
+          ? "Object identity committed, but undo history was not recorded."
+          : "Object identity committed.",
+      });
       return true;
     } catch (error) {
       if (isCurrentMutationContext?.() === false) return false;
@@ -309,21 +367,116 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
     }
   }
 
+  async function applyObjectEditPatch(): Promise<boolean> {
+    if (!objectEditDraft || !canonicalGeometryDraft || object.mode !== "committed") return false;
+    const existingObject = scene.data?.objects?.find((candidate) => candidate.id === object.objectId);
+    if (!existingObject || !existingObject.geometry) {
+      setFeedback({ kind: "error", message: "Canonical object geometry is unavailable." });
+      return false;
+    }
+    const editedGeometry = buildGeometryDraftPatch(objectEditDraft);
+    if (geometryDraftChanged && (editedGeometry.error || !editedGeometry.geometry)) {
+      setFeedback({ kind: "error", message: editedGeometry.error ?? "Invalid geometry draft." });
+      return false;
+    }
+    const transformPatch = buildTransformDraftPatch(objectEditDraft, existingObject.transform);
+    if (transformPatch.error || !transformPatch.transform) {
+      setFeedback({ kind: "error", message: transformPatch.error ?? "Invalid transform draft." });
+      return false;
+    }
+    const geometryPayload = geometryDraftChanged
+      ? mergeGeometryDescriptor(existingObject.geometry as unknown as JsonObject, editedGeometry.geometry as JsonObject)
+      : (existingObject.geometry as unknown as JsonObject);
+
+    const finishPending = beginPendingOperation();
+    let isCurrentMutationContext: (() => boolean) | null = null;
+    let historyDegraded = false;
+    try {
+      const historyContext = createAuthoringMutationContext();
+      isCurrentMutationContext = historyContext.isCurrentSessionScope;
+      const requestOptions = historyContext.sessionScopeKey
+        ? { sessionScopeKey: historyContext.sessionScopeKey }
+        : undefined;
+      const response = await runAuthoringMutationWithHistory(
+        historyContext,
+        `Edit geometry and placement ${object.name}`,
+        () => patchObjectGeometryTransaction(api, object.objectId, {
+          base_revision: objectEditDraft.baseRevision ?? object.revision ?? 0,
+          geometry: geometryPayload,
+          transform: transformPatch.transform as JsonObject,
+        }, requestOptions),
+        undefined,
+        {
+          onHistoryDegraded: () => {
+            historyDegraded = true;
+          },
+        },
+      );
+      if (historyContext.isCurrentSessionScope() === false) return false;
+      const nextRevision =
+        typeof response.scene_revision === "number"
+          ? response.scene_revision
+          : (object.revision ?? 0) + 1;
+      invalidateAuthoringResources(
+        resources,
+        nextRevision,
+        response.committed_scene,
+        historyContext.sessionScopeKey,
+        api.resourceCacheScope,
+      );
+      kernel.objectEditSession.clear();
+      setFeedback({
+        kind: historyDegraded ? "warning" : "success",
+        message: historyDegraded
+          ? "Object placement committed, but undo history was not recorded."
+          : "Object placement committed.",
+      });
+      return true;
+    } catch (error) {
+      if (isCurrentMutationContext?.() === false) return false;
+      setFeedback({ kind: "error", message: errorMessage(error) });
+      return false;
+    } finally {
+      finishPending();
+    }
+  }
+
   function revertDraft(): void {
     setDraftState({ name: object.name, notes: object.notes, key: draftKey });
     setFeedback(null);
   }
 
+  function revertAllDrafts(): void {
+    revertDraft();
+    if (objectEditDraftDirty) {
+      kernel.objectEditSession.clear();
+    }
+  }
+
   const identityDraftDirty = object.mode === "committed" &&
     (draftName !== object.name || draftNotes !== object.notes);
+  const inspectorDirty = identityDraftDirty || objectEditDraftDirty;
+
+  async function applyRegisteredDrafts(): Promise<boolean> {
+    if (identityDraftDirty) {
+      const ok = await applyIdentityPatch();
+      if (!ok) return false;
+    }
+    if (objectEditDraftDirty) {
+      const ok = await applyObjectEditPatch();
+      if (!ok) return false;
+    }
+    return true;
+  }
+
   useRegisterInspectorEditSession(
     object.mode === "committed" ? "staged" : null,
     pending,
-    identityDraftDirty,
+    inspectorDirty,
     true,
     undefined,
-    applyIdentityPatch,
-    revertDraft,
+    applyRegisteredDrafts,
+    revertAllDrafts,
     { historyMode: "mutation-owned" },
   );
 
@@ -420,33 +573,66 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
       </InspectorGroup>
 
       <InspectorGroup title="Actions">
+        {objectEditDraftDirty ? (
+          <div style={{ marginBottom: "0.5rem" }}>
+            <FeedbackBanner
+              kind="warning"
+              message="Uncommitted 3D placement changes are pending for this object. Use Apply or Revert to commit or discard them."
+            />
+          </div>
+        ) : null}
         <div className="fm-inspector-toolbar">
           {object.mode === "committed" && (
             <>
               <Button
-                disabled={pending}
+                disabled={pending || !inspectorDirty}
                 size="sm"
                 type="button"
-                onClick={() => void applyIdentityPatch()}
+                onClick={() => void applyRegisteredDrafts()}
               >
-                Apply Identity
+                {identityDraftDirty && !objectEditDraftDirty ? "Apply Identity" : "Apply"}
               </Button>
               <Button
-                disabled={pending}
+                disabled={pending || !inspectorDirty}
                 size="sm"
                 type="button"
                 variant="ghost"
-                onClick={revertDraft}
+                onClick={revertAllDrafts}
               >
                 Revert
               </Button>
+              <Button
+                size="sm"
+                type="button"
+                variant="secondary"
+                onClick={() => {
+                  kernel.selection.set(
+                    {
+                      kind: "object.geometry",
+                      label: `${object.name} Geometry`,
+                      nodeId: `model:object:${object.objectId}:geometry`,
+                      objectId: object.objectId,
+                      ref: {
+                        kind: "object.geometry",
+                        nodeId: `model:object:${object.objectId}:geometry`,
+                        objectId: object.objectId,
+                        type: "scene-object",
+                        visualizationTargetId: `object:${object.objectId}`,
+                      },
+                    },
+                    "inspector",
+                  );
+                }}
+              >
+                Edit Geometry
+              </Button>
               <span className="fm-inspector-toolbar__spacer" />
               <Button
-                disabled={pending || identityDraftDirty}
+                disabled={pending || inspectorDirty}
                 size="sm"
                 type="button"
                 variant="danger"
-                title={identityDraftDirty ? "Apply or revert identity changes before deleting this object." : undefined}
+                title={inspectorDirty ? "Apply or revert changes before deleting this object." : undefined}
                 onClick={() => void deleteObject()}
               >
                 Delete

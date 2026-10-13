@@ -151,12 +151,15 @@ function createKernel(options: DevelopmentKernelFactoryOptions, developmentWorks
   const objectMoveTool = new ObjectMoveToolController();
   const chartViewportHandoff = new ChartViewportHandoffController();
   bus.on("session:status-changed", ({ status }) => {
-    if (status !== "connected") {
-      chartViewportHandoff.cancel("Session changed while loading a chart field.");
+    if (status === "idle") {
+      chartViewportHandoff.cancel("Session closed.");
       objectMoveTool.clear();
       authoringHistory.clear();
       objectEditSession.clear();
       pendingForms.clear();
+    } else if (status !== "connected") {
+      chartViewportHandoff.cancel("Session connection interrupted.");
+      objectMoveTool.clear();
     }
   });
   const cameraRegistry = new CameraRegistryController({
