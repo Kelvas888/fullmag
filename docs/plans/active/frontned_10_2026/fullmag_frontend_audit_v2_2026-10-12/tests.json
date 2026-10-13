@@ -156,8 +156,8 @@
     {
       "id": "T06",
       "release": "R1",
-      "scenario": "A→B→A podczas pending, późny ACK poprzedniej epoki oraz wyścig patch/delete targetu",
-      "oracle": "Późny ACK epoki 1 rozlicza wyłącznie tę samą intencję i nie publikuje sceny, selekcji, historii ani feedbacku do A/epoki 3. Przy delete-wins serwer odrzuca patch kodem TARGET_DELETED; draft pozostaje wyłącznie do eksportu, Apply jest wyłączone, selekcja nie rozwiązuje targetu, historia pozostaje pusta i obiekt nie jest odtwarzany. Przy commit-wins receipt jest rozliczony raz; późniejszy delete ustawia target-missing, bez odtworzenia draftu ani wykonywalnego Undo dla brakującego obiektu.",
+      "scenario": "Zmiana sesji A→B; ten sam objectId.",
+      "oracle": "Brak obcych invalidacji, historii i feedbacku.",
       "scope": [
         "BROWSER",
         "API"
@@ -165,8 +165,7 @@
       "pull_requests": [
         "PR02",
         "PR06",
-        "PR07",
-        "PR05"
+        "PR07"
       ],
       "fixture": "fixtures/authoring_sequences.json",
       "fixture_state": "specification_only_adapter_required",
@@ -519,9 +518,9 @@
     },
     {
       "id": "T18",
-      "release": "R0/R1",
-      "scenario": "Gesture B podczas nierozstrzygniętego A; osobne kryteria immediate R0 i staged R1",
-      "oracle": "R0: rozpoczęcie gestu B czeka na terminalny wynik A. R1: nowszy raw/patch B pozostaje w draftcie podczas pending A, a ACK A przesuwa baseline i zachowuje/rebase'uje B. Overlap mode nie jest w release.",
+      "release": "R1",
+      "scenario": "Podczas committing A użytkownik próbuje rozpocząć gesture B",
+      "oracle": "W R1 B jest zablokowany tylko dla tej transakcji; ACK A nie czyści innych rawText/draftów. Historyczny R01 zachowany; overlap mode nie jest w release.",
       "scope": [
         "BROWSER",
         "WEBGL"
@@ -546,24 +545,19 @@
         "browser trace/screenshot where applicable"
       ],
       "status": "planned_not_run",
-      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
-      "stage_acceptance": {
-        "R0": "Submit A pozostaje jedynym aktywnym zapisem; BeginGesture B jest zablokowane do ACK albo definitywnego odrzucenia A.",
-        "R1": "Nowsze raw/patch B może pozostać lokalnie queued podczas pending A; ACK A aktualizuje baseline, zachowuje/rebase'uje B i nie uruchamia drugiego Apply."
-      }
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
     },
     {
       "id": "T19",
-      "release": "R0/R1",
-      "scenario": "Click osi bez ruchu: no-op obecnej ścieżki R0 i czysty draft R1",
-      "oracle": "R0: brak zapisującego requestu i wpisu historii. R1: pointerup nie tworzy dirty draftu ani nie włącza Apply; brak requestu i wpisu historii.",
+      "release": "R1",
+      "scenario": "Click osi bez ruchu.",
+      "oracle": "Bez zapisującego requestu i wpisu historii.",
       "scope": [
         "BROWSER",
         "WEBGL"
       ],
       "pull_requests": [
-        "PR03",
-        "PR07"
+        "PR03"
       ],
       "fixture": "fixtures/authoring_sequences.json",
       "fixture_state": "specification_only_adapter_required",
@@ -580,17 +574,13 @@
         "browser trace/screenshot where applicable"
       ],
       "status": "planned_not_run",
-      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
-      "stage_acceptance": {
-        "R0": "Zero scene writes i zero wpisów historii po kliknięciu osi.",
-        "R1": "Draft pozostaje równy baseline, Apply pozostaje wyłączone, zero scene writes i zero wpisów historii."
-      }
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
     },
     {
       "id": "T20",
-      "release": "R0/R1/R2-T",
-      "scenario": "Escape / lost capture / pointercancel / unmount podczas Move gesture",
-      "oracle": "R0: commit nie jest wysyłany po cancel. R1: cancel porzuca wyłącznie preview bieżącego gestu i zachowuje wcześniejszy numeric draft; pointerup pozostaje lokalny. We wszystkich ścieżkach cleanup następuje raz, pointer capture jest zwolniony, a OrbitControls odblokowane.",
+      "release": "R1",
+      "scenario": "Escape / lost capture / pointercancel / unmount.",
+      "oracle": "Dokładnie jedno cleanup; OrbitControls odblokowane.",
       "scope": [
         "BROWSER",
         "WEBGL"
@@ -615,16 +605,11 @@
         "browser trace/screenshot where applicable"
       ],
       "status": "planned_not_run",
-      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
-      "stage_acceptance": {
-        "R0": "Anulowany gest nie wywołuje natychmiastowej mutacji ani wpisu historii; cleanup dokładnie raz.",
-        "R1": "Anulowany gest nie wysyła Apply, usuwa swój preview i zachowuje wcześniejsze edycje draftu; cleanup dokładnie raz.",
-        "R2-T": "Transform tool zachowuje ten sam cancel/teardown contract PR15."
-      }
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
     },
     {
       "id": "T21",
-      "release": "R0/R1/R2-T",
+      "release": "R1/R2-T",
       "scenario": "Kamera orthographic/perspective, oś prawie równoległa do ray.",
       "oracle": "Stabilny solver gestu; brak skoku do starego intersection.",
       "scope": [
@@ -633,8 +618,7 @@
       ],
       "pull_requests": [
         "PR03",
-        "PR15",
-        "PR07"
+        "PR15"
       ],
       "fixture": "fixtures/authoring_sequences.json",
       "fixture_state": "specification_only_adapter_required",
@@ -651,16 +635,11 @@
         "browser trace/screenshot where applicable"
       ],
       "status": "planned_not_run",
-      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
-      "stage_acceptance": {
-        "R0": "Obecny Move używa stabilnego solvera osi dla kamer orthographic/perspective bez skoku do starego intersection.",
-        "R1": "Ten sam solver zmienia tylko wspólny local draft; pointerup nie wysyła mutacji.",
-        "R2-T": "PR15 kwalifikuje solver uchwytów transformu dla zadeklarowanych widoków."
-      }
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
     },
     {
       "id": "T22",
-      "release": "R0/R1/R2-T",
+      "release": "R1",
       "scenario": "Przeciągnięcie poza obszar osi i viewport.",
       "oracle": "Kontynuacja lub jawne cancel według ustalonego kontraktu.",
       "scope": [
@@ -669,8 +648,7 @@
       ],
       "pull_requests": [
         "PR03",
-        "PR15",
-        "PR07"
+        "PR15"
       ],
       "fixture": "fixtures/authoring_sequences.json",
       "fixture_state": "specification_only_adapter_required",
@@ -687,12 +665,7 @@
         "browser trace/screenshot where applicable"
       ],
       "status": "planned_not_run",
-      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
-      "stage_acceptance": {
-        "R0": "Drag poza oś/viewport jest kontynuowany albo jawnie anulowany; normalne release wysyła najwyżej jeden commit.",
-        "R1": "Drag aktualizuje draft, pointerup nie wysyła mutacji; cancel nie wysyła Apply i zachowuje wcześniejszy draft.",
-        "R2-T": "PR15 zachowuje te same capture, cancel i teardown granice."
-      }
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
     },
     {
       "id": "T23",
@@ -762,6 +735,7 @@
         "API"
       ],
       "pull_requests": [
+        "PR03",
         "PR07",
         "PR12"
       ],
@@ -784,9 +758,9 @@
     },
     {
       "id": "T26",
-      "release": "R0/R1",
+      "release": "R1",
       "scenario": "History capture failure.",
-      "oracle": "Udany zapis pozostaje zapisany; nieudany capture historii jest jawnie degraded i nie tworzy fałszywego sukcesu ani Undo/Redo.",
+      "oracle": "Zapis zachowany, Undo degraded widoczne, brak fałszywego sukcesu historii.",
       "scope": [
         "BROWSER",
         "API"
@@ -794,8 +768,7 @@
       "pull_requests": [
         "PR03",
         "PR06",
-        "PR12",
-        "PR07"
+        "PR12"
       ],
       "fixture": "fixtures/authoring_sequences.json",
       "fixture_state": "specification_only_adapter_required",
@@ -812,11 +785,7 @@
         "browser trace/screenshot where applicable"
       ],
       "status": "planned_not_run",
-      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
-      "stage_acceptance": {
-        "R0": "Po immediate commit błąd capture jest widoczny jako degraded; zapis nie jest cofany ani przedstawiany jako Undo.",
-        "R1": "Po Apply błąd capture jest widoczny jako degraded; zapis pozostaje, bez fikcyjnego wpisu Undo/Redo."
-      }
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
     },
     {
       "id": "T27",
@@ -1728,17 +1697,18 @@
     {
       "id": "T56",
       "release": "R1",
-      "scenario": "Wpis numeryczny 1 pm przy bazie 100 nm i klasyfikacja no-op w SI",
-      "oracle": "NUM-01: Lchar=100 nm, a=0 m, b=1 pm i epsilon=8 ulp(Lchar) daje no-op=false; parser zachowuje rozróżnienie valid/incomplete/invalid oraz wartość po konwersji do SI. Ten test nie kwalifikuje snap ani screen-space threshold.",
+      "scenario": "Subnanometrowa zmiana i tolerancja no-op",
+      "oracle": "1 pm przy 100 nm nie jest no-op; epsilon SI zgodnie z D04; próg 3px nie usuwa wpisu liczbowego.",
       "scope": [
         "BROWSER",
         "API"
       ],
       "pull_requests": [
+        "PR03",
         "PR04",
-        "PR07"
+        "PR15"
       ],
-      "fixture": "fixtures/numeric_oracles.json",
+      "fixture": "fixtures/transform_oracles.json",
       "fixture_state": "specification_only_adapter_required",
       "recipes": [
         "Q-API",

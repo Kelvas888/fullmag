@@ -97,12 +97,10 @@ Analogiczny controller transakcji stosuje Object Mesh Policy i Airbox; zakres da
 | conflict | REMOTE_SNAPSHOT | Baza i najnowszy owner zgodne | conflict albo editing-* | Three-way merge; konflikty semantyczne wymagają wyboru |
 | conflict | RESOLVE | Wszystkie konflikty rozstrzygnięte | editing-* | Nowa baza, zachowany patch; brak automatycznego submit |
 | clean/editing-*/conflict/rejected | REVERT | Brak unresolved write | clean | Raw z najnowszego znanego baseline; clear problems/conflict |
-| każda | TARGET_DELETED | Potwierdzone na aktualnej scenie | target-missing | Draft wyłącznie do eksportu; Apply wyłączone, selekcja targetu nie rozwiązuje, bez upsert |
+| każda | TARGET_DELETED | Potwierdzone na aktualnej scenie | target-missing | Zachowaj draft do eksportu; nie twórz obiektu ponownie |
 | target-missing | EXPORT/DISCARD | Decyzja użytkownika | suspended albo clean bez targetu | Bez mutacji; Create as new jest osobną intencją z nowym ID |
 | każda | SESSION_SWITCH/PROJECT_CLOSE | Epoka zmieniona | suspended | Cancel gesture, detach render subscriptions; journal in-flight zachowany |
 | suspended | RESUME | Sprawdzony owner, nowa epoch, reconciliation | clean/editing-*/conflict/outcome-unknown | Nie przenoś starego fence; wyznacz nowy |
-
-Wyścig usunięcia z pending write ma dwa rozstrzygnięcia. Jeśli delete zatwierdzi się przed patch, odpowiedź `TARGET_DELETED` prowadzi do `target-missing`: draft pozostaje tylko do eksportu, Apply jest wyłączone, selekcja nie rozwiązuje obiektu, historia nie dostaje wpisu i klient nie wykonuje upsert. Jeśli patch zatwierdzi się pierwszy, jego receipt rozlicza tę intencję najwyżej raz; późniejszy delete z aktualnej sceny nadal przełącza target do `target-missing`, bez wskrzeszenia draftu ani wykonywalnego Undo dla nieobecnego obiektu.
 
 Komenda guard i dialog dirty stosują tę samą funkcję `canApply`; nie tylko valid/pending. `Apply and continue` jest niedostępne przy nierozstrzygniętym konflikcie nawet gdy wszystkie liczby są poprawne.
 

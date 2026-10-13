@@ -250,8 +250,7 @@
     "documents": "D04",
     "pull_requests": [
       "PR04",
-      "PR15",
-      "PR07"
+      "PR15"
     ],
     "tests": [
       "T08",

@@ -2,9 +2,9 @@
 
 ## Ocena
 
-**Kierunek refaktoryzacji pozostaje zrozumiały.** V2 odpowiada na Q01–Q24, oddziela stan kodu od propozycji, rozpisuje 20 PR-ów i 72 planowane scenariusze. W tym task worktree doprecyzowano rozjazdy przypisań i scenariusze graniczne wskazane w pierwszym przeglądzie; zmiany nie są implementacją produktu.
+**Kierunek refaktoryzacji jest teraz zrozumiały.** V2 zawiera odpowiedzi na wszystkie Q01–Q24, wyraźnie oddziela istniejący kod od propozycji, rozpisuje 20 PR-ów i 72 planowane scenariusze. Najważniejsza sprzeczność v1 została usunięta: w docelowym R1 pointerup kończy gest w draftcie, a wspólne Apply zapisuje geometrię i pełny transform jednego obiektu.
 
-Po tych korektach można przejść do realizacji R0/R1 zgodnie z D07. Pozostałe propozycje ADR nadal wymagają decyzji właściwych dla etapów, a kwalifikacja musi opierać się na osobnych dowodach.
+Potrafię na tej podstawie zaplanować wykonanie. Przed rozliczaniem poszczególnych PR-ów należy poprawić poniższe powiązania i doprecyzować scenariusze graniczne. Nie ma potrzeby ponownego otwierania wszystkich 24 pytań ani przepisywania całej dokumentacji.
 
 Proponowane ADR-y pozostają propozycjami. Przesłanie paczki jest kontynuacją przeglądu; nie traktuję go jako zatwierdzenia nowych zachowań produktu, wdrożenia ani operacji Git. Przed implementacją potrzebne będą decyzje właściwe dla uruchamianego etapu, aktualna mapa konsumentów i dowody zgodne z obowiązującymi regułami repozytorium.
 
@@ -12,7 +12,7 @@ Proponowane ADR-y pozostają propozycjami. Przesłanie paczki jest kontynuacją 
 
 | Obszar poprzednich uwag | Odpowiedź v2 | Ocena dokumentacji |
 |---|---|---|
-| Granica gest/Apply i zakres dostawy | Wewnętrzny R0 zachowuje obecny zapis; R1 wprowadza staged draft i jedno Apply; TRS/import/quality mają osobne R2 | Testy R0/R1 są jawnie rozdzielone w D07/D08 |
+| Granica gest/Apply i zakres dostawy | Wewnętrzny R0 zachowuje obecny zapis; R1 wprowadza staged draft i jedno Apply; TRS/import/quality mają osobne R2 | Jasne; skorygować testy R0 opisane niżej |
 | Atomowa edycja | Reuse istniejącego PatchObjectGeometry z geometrią i pełnym Transform3D; brak nowego ogólnego batcha | Poprawna korekta v1; CAS/trwałość wymagają kwalifikacji |
 | Własność draftu, ACK, rebase, zmiana widoków | Kernel objectEdits, Inspector jako adapter, identyfikatory epoki/intencji, zachowanie post-submit edits, trzystronne scalanie | Wystarczająco konkretne do implementacji po decyzji produktowej |
 | API i recovery | Osobne receipt dla ordinary mutations, brak ślepego ponawiania unknown, jawnie zdegradowana historia | Jasne; proponowanego API nie przedstawiono jako istniejącego |
@@ -21,9 +21,7 @@ Proponowane ADR-y pozostają propozycjami. Przesłanie paczki jest kontynuacją 
 | Import/reimport | Stage oddzielny od obiektu, limits/lease, logical asset refs, wersjonowanie źródeł i osierocone region bindings | Wyraźne granice i wymagane punkty integracji |
 | Wydajność i odbiór | Baseline przed budżetami, fixtures, SHA i środowisko, browser/WebGL/runtime/physics jako osobne dowody | Prawidłowo zachowano NOT VERIFIED dla niewykonanych bramek |
 
-## Ustalenia przeglądu v2 przed korektą
-
-Poniższe V2-01–V2-05 zachowują zapis pierwotnych obserwacji i próśb z pierwszego przeglądu. Stan ich realizacji w task worktree podsumowano w końcowej tabeli.
+## Pozostałe uwagi do poprawienia przez Chat Pro
 
 ### V2-01 — rozdzielić bramki R0 i R1 [P2]
 
@@ -71,28 +69,21 @@ Poniższe V2-01–V2-05 zachowują zapis pierwotnych obserwacji i próśb z pier
 
 ## Weryfikacja i ograniczenia
 
-- Pierwotna paczka i V1 pozostają zachowane; korekty v2 znajdują się w wyznaczonym task worktree. Niniejsza notatka pozostaje osobnym plikiem poza manifestem paczki.
-- Pierwotny wynik walidatora na Windows wskazywał problem separatorów. Po zastosowaniu ścieżek POSIX i jawnego UTF-8 uruchomiono kontrolę strukturalną oraz pełny walidator; oba aktualne wyniki są zapisane poniżej.
-- historyczne pliki verification/package_checks.json i verification/original_archive_check.json nie zostały nadpisane. Manifest odświeżono dla 76 plików paczki; walidator potwierdził inventory, SHA256, referencje i 122 lokalne linki.
-- Nie uruchomiono aplikacji Fullmag, testów produkcyjnych, WebGL, meshera, solvera ani kwalifikacji fizyki. Nie kompilowano testów jednostkowych. Wszystkie 72 testy produktu nadal mają status planned_not_run.
-- check_spec_oracles.py nie był ponownie uruchamiany w tym tasku. Historyczne wyniki oracle dokumentacji nie zamykają żadnego Txx wymagającego produkcji.
-- Dokumenty opisują snapshot 2a3c6becb9c7e111ae1497ec0cd9ac9576acba95; kontrola bieżącego kodu aplikacji ani dirty checkoutu nie była częścią tej korekty dokumentacji.
+- Paczkę bezpiecznie rozpakowano do nowego katalogu fullmag_frontend_audit_v2_2026-10-12. V1 i zawartość v2 pozostawiono bez zmian. Niniejszy raport jest oddzielnym plikiem.
+- Manifest: 76/76 wpisów zgodnych po normalizacji separatorów; bez różnic inventory i hashy. Powiązania PR↔test mają zgodne referencje w obu kierunkach. Ta kontrola sprawdza strukturę, nie poprawność znaczenia przypisań V2-01/V2-02.
+- Dostarczony check_package.py: FAIL na Windows wyłącznie dla inventory separators; pozostałe jego kontrole nie zgłosiły błędów. Dostarczony check_spec_oracles.py: PASS, exit 0, dziesięć kontroli niezależnej algebry i reguł dokumentacji.
+- Nie uruchomiono aplikacji Fullmag, testów produkcyjnych, WebGL, meshera ani kwalifikacji fizyki. Nie kompilowano unit tests. Wyniki oracle nie zamykają żadnego Txx wymagającego produkcji.
+- Dokumenty v2 opisują snapshot 2a3c6becb9c7e111ae1497ec0cd9ac9576acba95. To przegląd poprawionej specyfikacji i jej powiązań, nie pełny ponowny audyt aktualnego dirty checkoutu ani potwierdzenie wszystkich proponowanych ścieżek backendu.
 
-## Stan korekt w task worktree
+## Tekst do przekazania Chat Pro
 
-| Uwaga | Wprowadzona korekta | Kontrola |
-|---|---|---|
-| V2-01 | D07, D08, backlog.json, tests.json i findings.json oddzielają immediate Move R0 od staged R1. T18/T19/T20/T26 mają kryteria etapowe; T25 należy do PR07/PR12. | Referencje PR↔test sprawdzone przez check_package.py. |
-| V2-02 | D06 przypisuje canonical digest encoder do PR09 i rozdziela czysty resolver ArtifactAssessment od właściciela zasobów. D13/D07 przypisują mapowanie geometry→ProblemIR/DTO do PR13, a konsumentów lane do PR14. | Sekcje D06/D07/D13 zsynchronizowane. |
-| V2-03 | T56 jest testem parsera/no-op SI przypisanym do PR04/PR07 z fixtures/numeric_oracles.json; usunięto go z mapowania PR03 i PR15 oraz z testu snap. | Fixture i mapowania JSON/Markdown sprawdzone. |
-| V2-04 | T06 i authoring_sequences.json zawierają konkretne A→B→A z późnym ACK oraz osobne gałęzie delete-wins i commit-wins; D04 podaje stany target-missing, draftu, selekcji, historii i Apply. | JSON parsuje się; zachowano identyfikatory testów. |
-| V2-05 | verification/check_package.py normalizuje ścieżki przez as_posix() i jawnie odczytuje UTF-8; manifest odświeżony bez zmiany inventory. | Kontrola strukturalna PASS; pełny walidator PASS. |
-| ArtifactAssessment | shared/domain zawiera czysty resolver snapshotów; kernel/resources ładuje i subskrybuje zasoby; selector udostępnia stan konsumentom. | Granica opisana w D06 i PR08. |
+Paczka v2 rozwiązuje główne problemy wcześniejszego przeglądu; kierunek i zakres refaktoryzacji są jasne. Proszę o małą rewizję v2.1, bez przepisywania całego planu:
 
-## Bieżące dowody
+1. Rozdziel odbiór PR03/R0 immediate commit od staged R1: T25 i pozostałe wspólne testy muszą mieć jawne warianty etapowe.
+2. Napraw przypisania numerów PR: encoder/digesty w D06:58 oraz TRS→ProblemIR w D13:14, zgodnie z kartami D07 i backlog.json.
+3. Napraw fixture T56: przypadek 1 pm/no-op jest w numeric_oracles.json.
+4. Dopisz wykonywalne sekwencje odbioru A→B→A z nową epoką i usunięcia targetu podczas pending; deklaracja session_ABA już istnieje, potrzebuje zdarzeń i wyników.
+5. Napraw walidator manifestu na Windows przez as_posix(); obecne FAIL wynika z separatorów, a niezależna kontrola 76 hashy jest zgodna.
+6. Wyjaśnij relację czystego resolvera ArtifactAssessment w shared/domain do resource ownera/selectorów w kernel.
 
-- python verification/check_package.py --structural — PASS; 28 findings, 32 sources, 20 PR-ów, 72 testy, 24 pytania, 122 lokalne linki, 4 historyczne reprodukcje bez zmian.
-- python verification/check_package.py — PASS; 76 wpisów manifestu, wszystkie inventory/SHA256 i referencje poprawne.
-- package_checks.json i original_archive_check.json pozostały bez zmian jako zapis wcześniejszych wyników. PASS z tego tasku pochodzi z nowego uruchomienia walidatora, nie z podmiany historii.
-- Żadne testy produktu nie zostały uruchomione. Status wszystkich Txx pozostaje planned_not_run; WebGL, API runtime, mesher, solver i kwalifikacja fizyczna pozostają NOT VERIFIED.
-
+Zachowaj status proposed ADR, planned_not_run dla testów produkcyjnych oraz rozdzielenie oracle dokumentacji od runtime/browser/physics. Po poprawkach podaj krótką tabelę ID uwagi → zmienione pliki → kontrola; zaktualizuj manifest po ostatecznych edycjach. Nie przedstawiaj tej rewizji jako implementacji ani kwalifikacji Fullmaga.

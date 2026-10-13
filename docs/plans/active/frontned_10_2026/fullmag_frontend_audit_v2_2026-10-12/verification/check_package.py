@@ -5,10 +5,9 @@ import argparse, collections, hashlib, json, re, sys
 from urllib.parse import unquote, urlparse
 ROOT=Path(__file__).resolve().parents[1]
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
-def rel(p):return Path(p).relative_to(ROOT).as_posix()
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--structural',action='store_true',help='Skip manifest verification during packaging');args=ap.parse_args()
-    errors=[];checked={};load=lambda name:json.loads((ROOT/name).read_text(encoding='utf-8'))
+    errors=[];checked={};load=lambda name:json.loads((ROOT/name).read_text())
     f=load('findings.json');s=load('sources.json');b=load('backlog.json');t=load('tests.json')['tests'];q=load('review_traceability.json')
     for name,rows,count in [('findings',f,28),('sources',s,32),('pull_requests',b['pull_requests'],20),('tests',t,72),('questions',q,24)]:
         ids=[x['id'] for x in rows];checked[name]=len(rows)
@@ -47,13 +46,13 @@ def main():
     # Check actual Markdown link targets, ignoring source code and historical quoted text.
     local_links=0
     for p in [ROOT/'README.md',*(ROOT/'docs').glob('*.md'),ROOT/'verification/README.md']:
-        text=re.sub(r'```.*?```','',p.read_text(encoding='utf-8'),flags=re.S)
+        text=re.sub(r'```.*?```','',p.read_text(),flags=re.S)
         for url in re.findall(r'!?\[[^\]\n]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)',text):
             if url.startswith(('#','http:','https:','mailto:','data:')):continue
             target=(p.parent/unquote(url.split('#')[0])).resolve();local_links+=1
-            if not target.is_file():errors.append(f'Missing link in {rel(p)}: {url}')
+            if not target.is_file():errors.append(f'Missing link in {p.relative_to(ROOT)}: {url}')
     checked['local_markdown_links']=local_links
-    contract=load('state_contracts.json');diagram=(ROOT/'diagrams/02_edit_state_machine.dot').read_text(encoding='utf-8');d04=next((ROOT/'docs').glob('04_*.md')).read_text(encoding='utf-8')
+    contract=load('state_contracts.json');diagram=(ROOT/'diagrams/02_edit_state_machine.dot').read_text();d04=next((ROOT/'docs').glob('04_*.md')).read_text()
     for phase in contract['object_edit_phases']:
         if phase not in diagram or phase not in d04:errors.append('State missing: '+phase)
     checked['transition_rows']=len(contract['object_edit_transitions'])
@@ -61,11 +60,11 @@ def main():
     checked['ui_mockups']=len(list((ROOT/'mockups').glob('*.svg')))
     checked['system_diagrams']=len(list((ROOT/'diagrams').glob('*.dot')))
     for p in ROOT.rglob('*.json'):
-        try:json.loads(p.read_text(encoding='utf-8'))
-        except Exception as e:errors.append(rel(p)+': '+str(e))
+        try:json.loads(p.read_text())
+        except Exception as e:errors.append(str(p.relative_to(ROOT))+': '+str(e))
     if not args.structural:
         manifest=load('manifest.json');entries=manifest['files'];checked['manifest_entries']=len(entries)
-        actual={rel(p) for p in ROOT.rglob('*') if p.is_file() and p.name!='manifest.json' and '__pycache__' not in rel(p)}
+        actual={str(p.relative_to(ROOT)) for p in ROOT.rglob('*') if p.is_file() and p.name!='manifest.json' and '__pycache__' not in str(p)}
         expected={x['path'] for x in entries}
         if actual!=expected:errors.append('Manifest inventory mismatch: '+str(sorted(actual^expected)))
         for x in entries:
