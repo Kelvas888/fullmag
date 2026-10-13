@@ -3,6 +3,7 @@ import type {
   SceneResource,
 } from "@/kernel/api/apiTypes";
 import type { GeometryObjectDraft } from "@/kernel/authoring/object-edit/objectEditTypes";
+import { parseQuantityInput } from "@/kernel/authoring/object-edit/quantityInput";
 import {
   isVisualizationAirboxIdentity,
   type Selection,
@@ -548,10 +549,18 @@ export function withObjectPlacementDraftPreview(
 
   const object = model.objects.find((candidate) => candidate.objectId === draft.objectId);
   if (!object) return model;
-  const translation = draft.translation.map(Number);
+  const parsedTranslation = draft.translation.map((value) =>
+    parseQuantityInput(value, "length", "m"),
+  );
+  const translation = parsedTranslation
+    .map(({ parsedSI }) => parsedSI)
+    .filter(
+      (value): value is number =>
+        value !== null && Number.isFinite(value),
+    );
   if (
-    translation.length !== 3 ||
-    !translation.every(Number.isFinite)
+    parsedTranslation.some(({ parseStatus }) => parseStatus !== "valid") ||
+    translation.length !== 3
   ) {
     return model;
   }
