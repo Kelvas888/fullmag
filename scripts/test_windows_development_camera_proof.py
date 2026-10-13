@@ -30,6 +30,7 @@ class CameraProofChecks(unittest.TestCase):
     def test_invalid_or_missing_camera_never_counts_as_preserved(self):
         invalid = [None, {}, {**camera(), "extra": True}]
         for key, value in (("position", [float("nan"), 0, 0]), ("up", [0, 1]),
+                           ("position", [0, 0, 0]), ("up", [0, 0, 0]),
                            ("target", [False, 0, 0]), ("projection", "default"),
                            ("fov_degrees", float("inf")), ("fov_degrees", 180),
                            ("fov_degrees", 0.5), ("fov_degrees", 179.5),
