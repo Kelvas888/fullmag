@@ -33,8 +33,12 @@ export function resolveMeshBuildFreshness(
   if (assessment.presence === "not-built") {
     return { reason: assessment.reason, state: "not-built" };
   }
+  const state: MeshFreshnessState =
+    assessment.state === "incompatible"
+      ? "inconsistent"
+      : (assessment.state ?? "unknown");
   return {
     reason: assessment.reason,
-    state: assessment.state ?? "unknown",
+    state,
   };
 }
