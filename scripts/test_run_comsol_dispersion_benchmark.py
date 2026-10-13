@@ -523,7 +523,7 @@ class ComsolDispersionBenchmarkTests(unittest.TestCase):
             manifest = {
                 "schema_version": "frequency_domain_manifest.v1",
                 "validation": {
-                    "dispersion_frequency_source": "numeric_modal_solver",
+                    "dispersion_frequency_source": scientific_gate.NUMERIC_FREQUENCY_SOURCE,
                     "dispersion_reference_model": None,
                 },
             }
@@ -563,7 +563,11 @@ class ComsolDispersionBenchmarkTests(unittest.TestCase):
             coverage = result["artifact_generation_coverage"]
             self.assertEqual(result["artifact_generation"]["generation_id"], reader.generation.generation_id)
             self.assertEqual(result["checks"]["artifact_generation_current_fence"]["status"], "pass")
-            self.assertEqual(result["checks"]["artifact_binding"]["status"], "pass")
+            self.assertEqual(
+                result["checks"]["artifact_binding"]["status"],
+                "pass",
+                f"evidence binding failed: {result['reasons']!r}",
+            )
             self.assertEqual(result["qualification"], "NOT VERIFIED")
             self.assertTrue(coverage["case_local_evidence_loaded"])
             self.assertTrue(coverage["case_local_evidence_descriptor_bound"])
