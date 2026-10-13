@@ -854,6 +854,19 @@
         "source-g6-full-potential-replay",
         "source-g6-full-potential-binding"
       ]
+    },
+    {
+      "id": "eq-g5-hermitian-tangent-mass",
+      "symbols": [
+        "g5_mass_h",
+        "g5_mass_full",
+        "g5_mass_constraint",
+        "g5_mass_split",
+        "g5_mass_diagonal_index"
+      ],
+      "sources": [
+        "source-g5-hermitian-mass-projection"
+      ]
     }
   ],
   "symbols": [
@@ -1971,6 +1984,36 @@
       "id": "g6_imaginary_unit",
       "latex": "$\\mathrm{i}$",
       "meaning": "Jednostka urojona",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g5_mass_h",
+      "latex": "$H_M$",
+      "meaning": "Zredukowana geometryczna masa tangent Floqueta",
+      "si_unit": "$\\mathrm{m^3}$"
+    },
+    {
+      "id": "g5_mass_full",
+      "latex": "$M_T$",
+      "meaning": "Pełna rzeczywista symetryczna masa tangent P1",
+      "si_unit": "$\\mathrm{m^3}$"
+    },
+    {
+      "id": "g5_mass_constraint",
+      "latex": "$C$",
+      "meaning": "Zespolona macierz ograniczeń fazowych",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g5_mass_split",
+      "latex": "$\\mathcal{R}$",
+      "meaning": "Real-split operatora zespolonego",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g5_mass_diagonal_index",
+      "latex": "$a$",
+      "meaning": "Indeks diagonalnego stopnia swobody",
       "si_unit": "$1$"
     }
   ],
@@ -4282,6 +4325,12 @@
       "path": "scripts/validate_comsol_dispersion_scientific_gate.py",
       "symbol": "_c0_demag_disabled_contract",
       "responsibility": "Validated disabled dynamic demag before not_applicable"
+    },
+    {
+      "id": "source-g5-hermitian-mass-projection",
+      "path": "backends/fem/cpu/frequency_domain/operators/poisson_airbox_shared_domain.cpp",
+      "symbol": "project_positive_tangent_mass_with_complex_constraint",
+      "responsibility": "Structural Hermitian projection of validated real symmetric tangent mass"
     }
   ],
   "public_api": {

@@ -472,6 +472,167 @@ bool project_real_csr_with_complex_constraint(
     return true;
 }
 
+bool validate_symmetric_real_tangent_mass(
+    const CsrMatrixView &matrix,
+    std::string &error)
+{
+    // The caller supplies the internally assembled real symmetric mass form;
+    // require its exact CSR symmetry before constructing the Hermitian half.
+    if (matrix.row_count == 0u || matrix.row_count != matrix.column_count ||
+        matrix.row_count == std::numeric_limits<std::uint64_t>::max() ||
+        matrix.row_count > std::numeric_limits<std::uint32_t>::max() ||
+        matrix.row_offsets == nullptr ||
+        matrix.row_offsets_len != matrix.row_count + 1u ||
+        matrix.column_indices_len != matrix.values_len ||
+        matrix.values_len == 0u ||
+        matrix.values_len > std::numeric_limits<std::uint32_t>::max() ||
+        matrix.column_indices == nullptr || matrix.values == nullptr ||
+        matrix.row_offsets[0] != 0u ||
+        matrix.row_offsets[matrix.row_count] != matrix.values_len) {
+        error = "Floquet tangent mass input is not a valid square real CSR matrix";
+        return false;
+    }
+
+    for (std::uint64_t row = 0u; row < matrix.row_count; ++row) {
+        const std::uint32_t begin = matrix.row_offsets[row];
+        const std::uint32_t end = matrix.row_offsets[row + 1u];
+        if (begin > end || end > matrix.values_len) {
+            error = "Floquet tangent mass input has invalid CSR row offsets";
+            return false;
+        }
+        std::uint32_t previous_column = 0u;
+        bool first_entry = true;
+        for (std::uint32_t entry = begin; entry < end; ++entry) {
+            const std::uint32_t column = matrix.column_indices[entry];
+            if (column >= matrix.column_count || !std::isfinite(matrix.values[entry])) {
+                error = "Floquet tangent mass input contains an invalid or non-finite entry";
+                return false;
+            }
+            if (!first_entry && column <= previous_column) {
+                error = "Floquet tangent mass input CSR rows are not strictly ordered";
+                return false;
+            }
+            previous_column = column;
+            first_entry = false;
+        }
+    }
+
+    for (std::uint64_t row = 0u; row < matrix.row_count; ++row) {
+        for (std::uint32_t entry = matrix.row_offsets[row];
+             entry < matrix.row_offsets[row + 1u];
+             ++entry) {
+            const std::uint32_t column = matrix.column_indices[entry];
+            const std::uint32_t reverse_begin = matrix.row_offsets[column];
+            const std::uint32_t reverse_end = matrix.row_offsets[column + 1u];
+            const auto reverse = std::lower_bound(
+                matrix.column_indices + reverse_begin,
+                matrix.column_indices + reverse_end,
+                static_cast<std::uint32_t>(row));
+            if (reverse == matrix.column_indices + reverse_end ||
+                *reverse != row ||
+                matrix.values[static_cast<std::size_t>(
+                    reverse - matrix.column_indices)] != matrix.values[entry]) {
+                error = "Floquet tangent mass input is not exactly symmetric";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool project_positive_tangent_mass_with_complex_constraint(
+    const CsrMatrixView &full_mass,
+    const PoissonAirboxSharedDomainComplexCsrMatrix &constraint,
+    PoissonAirboxSharedDomainComplexCsrMatrix &out,
+    std::string &error)
+{
+    if (!validate_symmetric_real_tangent_mass(full_mass, error)) {
+        return false;
+    }
+    if (!complex_csr_is_valid(constraint) ||
+        constraint.column_count > std::numeric_limits<std::uint32_t>::max() ||
+        full_mass.row_count != constraint.row_count) {
+        error = "Floquet tangent mass phase-constraint shape is invalid";
+        return false;
+    }
+
+    PoissonAirboxSharedDomainComplexCsrMatrix full_complex{};
+    PoissonAirboxSharedDomainComplexCsrMatrix constrained{};
+    PoissonAirboxSharedDomainComplexCsrMatrix adjoint{};
+    if (!copy_real_csr_as_complex(full_mass, full_complex, error) ||
+        !complex_csr_multiply(full_complex, constraint, constrained, error) ||
+        !complex_csr_conjugate_transpose(constraint, adjoint, error)) {
+        return false;
+    }
+
+    try {
+        ComplexSparseAccumulator upper(adjoint.row_count, constrained.column_count);
+        for (std::uint64_t row = 0u; row < adjoint.row_count; ++row) {
+            for (std::uint32_t left_entry = adjoint.row_offsets[
+                     static_cast<std::size_t>(row)];
+                 left_entry < adjoint.row_offsets[static_cast<std::size_t>(row + 1u)];
+                 ++left_entry) {
+                const std::uint32_t middle = adjoint.column_indices[left_entry];
+                const Complex left_value = adjoint.values[left_entry];
+                for (std::uint32_t right_entry = constrained.row_offsets[
+                         static_cast<std::size_t>(middle)];
+                     right_entry < constrained.row_offsets[
+                         static_cast<std::size_t>(middle + 1u)];
+                     ++right_entry) {
+                    const std::uint32_t column = constrained.column_indices[right_entry];
+                    if (column < row) {
+                        continue;
+                    }
+                    upper.add(
+                        row,
+                        column,
+                        left_value * constrained.values[right_entry]);
+                }
+            }
+        }
+
+        ComplexSparseAccumulator hermitian(adjoint.row_count, constrained.column_count);
+        for (std::uint64_t row = 0u; row < adjoint.row_count; ++row) {
+            const auto diagonal = upper.rows[static_cast<std::size_t>(row)].find(
+                static_cast<std::uint32_t>(row));
+            if (diagonal == upper.rows[static_cast<std::size_t>(row)].end() ||
+                !std::isfinite(diagonal->second.real()) ||
+                !std::isfinite(diagonal->second.imag()) ||
+                !(diagonal->second.real() > 0.0)) {
+                error = "Floquet positive tangent mass projection has a non-positive diagonal";
+                return false;
+            }
+            const double diagonal_scale = std::max(
+                std::abs(diagonal->second.real()),
+                std::abs(diagonal->second.imag()));
+            if (std::abs(diagonal->second.imag()) >
+                64.0 * std::numeric_limits<double>::epsilon() * diagonal_scale) {
+                error = "Floquet positive tangent mass diagonal is not real to roundoff";
+                return false;
+            }
+            for (const auto &[column, accumulated] :
+                 upper.rows[static_cast<std::size_t>(row)]) {
+                Complex value = accumulated;
+                if (row == column) {
+                    // C^H M C has a real diagonal for real symmetric M.
+                    // Materialize that exact structure rather than retaining
+                    // cancellation noise from the complex multiply.
+                    value = Complex(value.real(), 0.0);
+                }
+                hermitian.add(row, column, value);
+                if (row != column) {
+                    hermitian.add(column, row, std::conj(value));
+                }
+            }
+        }
+        hermitian.finish(out);
+        return true;
+    } catch (const std::exception &exception) {
+        error = exception.what();
+        return false;
+    }
+}
+
 bool project_accumulator_with_complex_constraint(
     const SparseAccumulator &full_matrix,
     const PoissonAirboxSharedDomainComplexCsrMatrix &constraint,
@@ -3014,7 +3175,7 @@ FrequencyDomainStatus assemble_poisson_airbox_shared_domain(
             b_qq_full.finish(out_result->floquet_full_b_qq);
             positive_tangent_mass_full->finish(
                 out_result->floquet_full_positive_tangent_mass);
-            if (!project_real_csr_with_complex_constraint(
+            if (!project_positive_tangent_mass_with_complex_constraint(
                     out_result->floquet_full_positive_tangent_mass.view(),
                     phase_constraint,
                     out_result->floquet_positive_tangent_mass,

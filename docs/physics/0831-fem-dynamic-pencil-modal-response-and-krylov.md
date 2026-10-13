@@ -5753,3 +5753,49 @@ producenta. Jest to niezależna bramka konsumenta istniejącego eksportu.
 | `scripts/validate_comsol_dispersion_scientific_gate.py` | `_validate_exported_mode_potentials` | Pełna selekcja, topology/spectrum binding |
 | `scripts/validate_comsol_dispersion_scientific_gate.py` | `_c0_demag_disabled_contract` | Weryfikacja applicability C0 |
 | `scripts/test_comsol_modal_field_certificate.py` | `test_full_physical_potential_replays_phase_but_does_not_claim_gauge` | Niezależny phase fixture bez producer-gauge trust |
+
+
+(g5-hermitian-tangent-mass)=
+## G5 — zachowanie struktury masy Floqueta
+
+Dodatnia geometryczna masa tangent jest rzeczywistą symetryczną formą P1.
+Jej projekcja wymaga strukturalnie hermitianowskiego wyniku, a real-split musi
+pozostać rzeczywiście symetryczny:
+
+```{math}
+:label: eq-g5-hermitian-tangent-mass
+H_M=C^{\mathrm H}M_TC,\quad H_M=H_M^{\mathrm H},\quad
+\operatorname{Im}(H_M)_{aa}=0,\qquad
+\mathcal{R}(H_M)=\begin{pmatrix}\operatorname{Re}H_M&-\operatorname{Im}H_M \\
+\operatorname{Im}H_M&\operatorname{Re}H_M\end{pmatrix}
+=\mathcal{R}(H_M)^{\mathsf T}.
+```
+
+| Symbol | Znaczenie | SI |
+|---|---|---|
+| $H_M$ | Zredukowana geometryczna masa tangent Floqueta | $\mathrm{m^3}$ |
+| $M_T$ | Pełna rzeczywista symetryczna masa tangent P1 | $\mathrm{m^3}$ |
+| $C$ | Zespolona macierz ograniczeń fazowych | $1$ |
+| $\mathcal{R}$ | Real-split operatora zespolonego | $1$ |
+| $a$ | Indeks diagonalnego stopnia swobody | $1$ |
+
+FEM CPU sprawdza finite, canonical CSR i dokładną symetrię wewnętrznie
+złożonego $M_T$. Akumuluje jeden trójkąt $H_M$, drugi tworzy przez sprzężenie.
+Dodatnia diagonalna musi być rzeczywista do istniejącego ograniczenia64epsilon;
+wówczas zapisuje ją z dokładnie zerową częścią urojoną. To realizuje tożsamość
+formy, bez uśredniania dwóch niezależnie policzonych połówek ani naprawiania
+niesymetrycznego wejścia. Ogólne projekcje stiffness/gyrotropic nie zmieniają się.
+Walidatory sparse/dense nadal wymagają ich dotychczasowych warunków.
+
+FEM CPU: source implemented, hosted native pending. FEM GPU: korekta nie
+kwalifikuje device path. FDM CPU/GPU: not applicable — brak tej formy FEM.
+Python/ProblemIR i fizyczne parametry nie zmieniają się. Regresje sprawdzają
+niezależne $C^{\mathrm H}M_TC$, dodatnią formę kwadratową, exact conjugacy,
+real diagonal i real-split symmetry. Dwa mixed C ABI fixtures muszą następnie
+przejść bez modyfikowania swojej produkcyjnie złożonej masy; science NOT VERIFIED.
+
+| Źródło | Symbol | Zakres |
+|---|---|---|
+| `backends/fem/cpu/frequency_domain/operators/poisson_airbox_shared_domain.cpp` | `project_positive_tangent_mass_with_complex_constraint` | Structural Hermitian projection |
+| `backends/fem/cpu/frequency_domain/operators/poisson_airbox_shared_domain.cpp` | `validate_symmetric_real_tangent_mass` | Fail-closed internally assembled input |
+| `backends/fem/tests/frequency_domain/poisson_airbox_shared_domain_test.cpp` | `floquet_positive_tangent_mass_matches_independent_phase_reduction` | Independent integration/phase oracle |

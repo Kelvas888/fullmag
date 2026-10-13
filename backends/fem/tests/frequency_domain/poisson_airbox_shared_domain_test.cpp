@@ -1037,6 +1037,7 @@ void floquet_positive_tangent_mass_matches_independent_phase_reduction()
 
     double full_error = 0.0;
     double full_scale = 0.0;
+    bool full_mass_exactly_symmetric = true;
     for (std::uint64_t row = 0u; row < full_q_count; ++row) {
         for (std::uint64_t column = 0u; column < full_q_count; ++column) {
             const double expected = full_mass[static_cast<std::size_t>(
@@ -1045,10 +1046,18 @@ void floquet_positive_tangent_mass_matches_independent_phase_reduction()
                 assembled.floquet_full_positive_tangent_mass, row, column);
             full_error = std::max(full_error, std::abs(actual - expected));
             full_scale = std::max(full_scale, std::max(std::abs(actual), std::abs(expected)));
+            if (actual != matrix_value(
+                              assembled.floquet_full_positive_tangent_mass,
+                              column,
+                              row)) {
+                full_mass_exactly_symmetric = false;
+            }
         }
     }
     check(full_error <= 1.0e-12 * std::max(1.0, full_scale),
           "full tangent P1 CSR matches independent tet4/prism6 mass formulas");
+    check(full_mass_exactly_symmetric,
+          "full real tangent P1 mass is exactly symmetric before phase projection");
     check(std::abs(full_mass[0] - full_mass[static_cast<std::size_t>(
               (2u * 6u) * full_q_count + 2u * 6u)]) > 1.0e-6,
           "full P1 mass retains nonuniform nodal diagonal weights");
@@ -1121,6 +1130,8 @@ void floquet_positive_tangent_mass_matches_independent_phase_reduction()
     double reduced_error = 0.0;
     double reduced_scale = 0.0;
     double phase_effect = 0.0;
+    bool reduced_mass_exactly_hermitian = true;
+    bool reduced_mass_has_positive_real_diagonal = true;
     for (std::uint64_t row = 0u; row < reduced_q_count; ++row) {
         for (std::uint64_t column = 0u; column < reduced_q_count; ++column) {
             const std::size_t offset = static_cast<std::size_t>(row * reduced_q_count + column);
@@ -1134,16 +1145,66 @@ void floquet_positive_tangent_mass_matches_independent_phase_reduction()
                 phase_effect, std::abs(expected - no_phase_reduced[offset]));
             const std::complex<double> adjoint = std::conj(complex_matrix_value(
                 assembled.floquet_positive_tangent_mass, column, row));
-            check(std::abs(actual - adjoint) <= 1.0e-12 * std::max(1.0, reduced_scale),
-                  "phase-reduced tangent P1 mass is Hermitian");
+            if (actual != adjoint) {
+                reduced_mass_exactly_hermitian = false;
+            }
+            if (row == column &&
+                (!(actual.real() > 0.0) || actual.imag() != 0.0)) {
+                reduced_mass_has_positive_real_diagonal = false;
+            }
         }
     }
+    check(reduced_mass_exactly_hermitian,
+          "phase-reduced tangent P1 mass is exactly Hermitian");
+    check(reduced_mass_has_positive_real_diagonal,
+          "phase-reduced tangent P1 mass has a positive exactly-real diagonal");
     check(reduced_error <= 1.0e-12 * std::max(1.0, reduced_scale),
           "reduced tangent mass equals independent C^H M_full C");
     check(phase_effect > 1.0e-5,
           "Floquet phase changes the mass contribution of periodic physical copies");
     check(std::abs(expected_reduced[0] - master_only_reduced[0]) > 1.0e-5,
           "both master and periodic member contribute to the reduced physical mass");
+
+    const std::uint64_t real_split_dimension = 2u * reduced_q_count;
+    const auto real_split_mass_value = [&](std::uint64_t row, std::uint64_t column) {
+        if (row < reduced_q_count) {
+            if (column < reduced_q_count) {
+                return complex_matrix_value(
+                           assembled.floquet_positive_tangent_mass, row, column)
+                    .real();
+            }
+            return -complex_matrix_value(
+                        assembled.floquet_positive_tangent_mass,
+                        row,
+                        column - reduced_q_count)
+                        .imag();
+        }
+        if (column < reduced_q_count) {
+            return complex_matrix_value(
+                       assembled.floquet_positive_tangent_mass,
+                       row - reduced_q_count,
+                       column)
+                .imag();
+        }
+        return complex_matrix_value(
+                   assembled.floquet_positive_tangent_mass,
+                   row - reduced_q_count,
+                   column - reduced_q_count)
+            .real();
+    };
+    bool real_split_mass_exactly_symmetric = true;
+    for (std::uint64_t row = 0u; row < real_split_dimension; ++row) {
+        for (std::uint64_t column = row + 1u;
+             column < real_split_dimension;
+             ++column) {
+            if (real_split_mass_value(row, column) !=
+                real_split_mass_value(column, row)) {
+                real_split_mass_exactly_symmetric = false;
+            }
+        }
+    }
+    check(real_split_mass_exactly_symmetric,
+          "real-split tangent mass is exactly symmetric for the dense SLEPc contract");
 
     std::complex<double> quadratic{};
     for (std::uint64_t row = 0u; row < reduced_q_count; ++row) {
