@@ -246,7 +246,7 @@ export function canonicalDraftInSelectedUnits(
 
     if (canonicalInput.parseStatus === "valid" && canonicalSI !== null) {
       const converted = changeQuantityInputUnit(canonicalInput, unit);
-      formattedRaw = converted.ok
+      formattedRaw = unit === DEFAULT_LENGTH_UNIT ? canonicalRaw : converted.ok
         ? converted.input.rawText
         : `${String(canonicalSI)} m`;
       nextDraft = setRawQuantityField(nextDraft, field, formattedRaw);

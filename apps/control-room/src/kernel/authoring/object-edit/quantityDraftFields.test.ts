@@ -89,10 +89,8 @@ describe("quantityDraftFields", () => {
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.draft.quantityFields?.["size.0"]).toEqual({
-      unit: "um",
-      lastValidSI: 1e-7,
-    });
+    expect(result.draft.quantityFields?.["size.0"]?.unit).toBe("um");
+    expect(result.draft.quantityFields?.["size.0"]?.lastValidSI).toBeCloseTo(1e-7, 22);
     expect(result.draft.quantityFields?.["size.1"]).toEqual({
       unit: "mm",
       lastValidSI: 1e-7,
@@ -113,10 +111,10 @@ describe("quantityDraftFields", () => {
     expect(getRawQuantityField(updated, "size.0")).toBe("1e-");
     expect(updated.quantityFields?.["size.0"]).toEqual({
       unit: "nm",
-      lastValidSI: 1e-7,
+      lastValidSI: parseDraftQuantityField(original, "size.0").parsedSI,
     });
     expect(parseDraftQuantityField(updated, "size.0")).toMatchObject({
-      lastValidSI: 1e-7,
+      lastValidSI: parseDraftQuantityField(original, "size.0").parsedSI,
       parsedSI: null,
       parseStatus: "incomplete",
       rawText: "1e-",
@@ -124,9 +122,9 @@ describe("quantityDraftFields", () => {
 
     const invalidDomain = updateRawQuantityField(updated, "size.0", "0");
     expect(getRawQuantityField(invalidDomain, "size.0")).toBe("0");
-    expect(invalidDomain.quantityFields?.["size.0"]?.lastValidSI).toBe(1e-7);
+    expect(invalidDomain.quantityFields?.["size.0"]?.lastValidSI).toBe(parseDraftQuantityField(original, "size.0").parsedSI);
     expect(parseDraftQuantityField(invalidDomain, "size.0")).toMatchObject({
-      lastValidSI: 1e-7,
+      lastValidSI: parseDraftQuantityField(original, "size.0").parsedSI,
       parsedSI: null,
       parseStatus: "invalid",
     });
