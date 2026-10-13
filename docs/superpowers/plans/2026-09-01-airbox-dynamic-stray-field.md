@@ -1,10 +1,12 @@
 # Dynamiczne pole stray w Airboxie (`H_demag_dynamic`) — plan implementacji
 
-**Status:** gotowy do implementacji  
+**Status:** projekt kontraktu; nie jest jeszcze gotowy do implementacji
 **Data:** 2026-09-01  
 **Zakres produkcyjny v1:** FEM Poisson Airbox, CPU i GPU, dynamika w dziedzinie czasu, live preview, autosave, API i Control Room  
 **Zakres późniejszy:** FDM single-grid i multilayer przez oddzielny carrier obserwacyjny  
 **Powiązane komponenty:** canonical quantities, accepted-state observation, FEM demag, artifact pipeline, API v2, Control Room
+
+Przed implementacją wymagane są kanoniczna nota w `docs/physics/`, kompletna mapa źródeł oraz ponowna weryfikacja aktualnych właścicieli API, `ProblemIR` i runtime. Poniższy plan opisuje proponowany kontrakt; nie jest dowodem wdrożenia ani kwalifikacji CPU/GPU.
 
 ## 1. Decyzja
 
@@ -757,7 +759,9 @@ pub struct FieldAutosaveIR {
 
 Nie dodawać user-facing `reference` w v1. Semantyka `stage_start_accepted` jest częścią quantity i etapu, a nie właściwością pojedynczego writer policy.
 
-### 12.2. Przykład pełnego workflow
+### 12.2. Szkic przyszłego API — niewykonywalna propozycja
+
+Ten fragment pomija geometrię i materiały oraz zakłada proponowane, niewdrożone parametry `scope_kind`. Nie jest kompletnym skryptem ani przykładem działającym z bieżącym publicznym API.
 
 ```python
 import fullmag as fm
@@ -883,7 +887,7 @@ Dynamiczne pole Airboxa może być duże. Writer musi zachować istniejącą bou
 
 ### 14.1. Katalog
 
-`GET /api/quantities/catalog` powinien zwracać descriptor nowego quantity i lane-specific resolved capability.
+`GET /v2/sessions/current/data/quantities` powinien zwracać descriptor nowego quantity i lane-specific resolved capability.
 
 ### 14.2. Pobranie bieżącego pola
 
