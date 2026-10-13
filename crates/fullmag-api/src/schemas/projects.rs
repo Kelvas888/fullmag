@@ -63,6 +63,115 @@ pub(crate) struct ProjectRunSubmitRequest {
     pub asset_paths: BTreeMap<String, String>,
 }
 
+/// Immutable independent batch submission. The server deserializes
+/// `batch_request` into the versioned application contract before accepting it.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectBatchSubmitRequest {
+    /// Exact base64-encoded portable project archive accepted for this batch.
+    pub archive_base64: String,
+    /// Client intent key used to recover an ACK after a timeout.
+    pub idempotency_key: String,
+    /// Versioned `BatchExpansionRequest` object, including template and axes.
+    pub batch_request: BTreeMap<String, serde_json::Value>,
+    /// Versioned immutable StudyPlan used by the batch template.
+    pub study_plan: BTreeMap<String, serde_json::Value>,
+    /// Immutable StudyProblemCatalog pinned by the batch template.
+    pub study_problem_catalog: BTreeMap<String, serde_json::Value>,
+    /// Explicit immutable asset ID to path inside `project/assets/`.
+    pub asset_paths: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchSubmitResource {
+    pub disposition: ProjectRunSubmitDisposition,
+    pub batch_id: String,
+    /// Logical digest stored in the expansion manifest.
+    pub manifest_sha256: String,
+    pub case_count: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams, ToSchema)]
+pub(crate) struct ProjectBatchListQuery {
+    /// Page size, from 1 to 100; defaults to 50.
+    pub limit: Option<u32>,
+    /// Last BatchId returned on the previous page.
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchListResource {
+    pub project_id: String,
+    pub batches: Vec<ProjectBatchSummaryResource>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchSummaryResource {
+    pub batch_id: String,
+    pub accepted_at: String,
+    pub manifest_sha256: String,
+    pub case_count: u64,
+    pub max_parallel_cases: Option<u32>,
+    pub failure_policy: ProjectBatchFailurePolicy,
+    pub published_case_count: u64,
+    pub expansion_state: ProjectBatchExpansionState,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectBatchFailurePolicy {
+    ContinueIndependent,
+    StopAdmission,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectBatchExpansionState {
+    Pending,
+    Expanding,
+    Complete,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams, ToSchema)]
+pub(crate) struct ProjectBatchCasesQuery {
+    /// Page size, from 1 to 100; defaults to 50.
+    pub limit: Option<u32>,
+    /// Last CaseId returned on the previous page.
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchCasesResource {
+    pub batch_id: String,
+    /// Axis names and canonical units for the parameter tuples in this manifest.
+    pub axes: Vec<ProjectBatchAxisSummaryResource>,
+    pub cases: Vec<ProjectBatchCaseSummaryResource>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchAxisSummaryResource {
+    pub name: String,
+    pub canonical_unit: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectBatchCaseState {
+    PendingExpansion,
+    PendingMaterialization,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchCaseSummaryResource {
+    pub case_id: String,
+    pub planned_run_id: String,
+    pub parameter_tuple: BTreeMap<String, serde_json::Value>,
+    pub state: ProjectBatchCaseState,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct ProjectRunSubmitResource {
     pub disposition: ProjectRunSubmitDisposition,
@@ -148,6 +257,16 @@ pub(crate) struct ProjectRunTaskResource {
     pub artifact_ids: Vec<String>,
     pub resource_id: Option<String>,
     pub accepted_state_ref: Option<crate::schemas::common::AcceptedStateRefResource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_intent: Option<ProjectRunTaskCancellationSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectRunTaskCancellationSummary {
+    pub cancellation_id: String,
+    pub reason: String,
+    pub expected_catalog_revision: u64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
@@ -215,6 +334,7 @@ impl From<FmsTaskCatalogEntry> for ProjectRunTaskResource {
             artifact_ids: task.artifact_ids,
             resource_id: task.resource_id,
             accepted_state_ref: None,
+            cancellation_intent: None,
         }
     }
 }
@@ -231,12 +351,42 @@ pub(crate) struct ProjectRunMaterializationResource {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectRunTaskCancellationRequest {
-    /// Stable operator-visible reason persisted in the fenced Stop command.
+    /// Stable operator-visible reason persisted in the request or Stop command.
     pub reason: String,
+    /// Supply together with expected_catalog_revision for pre-claim cancellation.
+    #[serde(default)]
+    pub cancellation_id: Option<String>,
+    #[serde(default)]
+    pub expected_catalog_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub(crate) struct ProjectRunTaskCancellationResource {
+#[serde(untagged)]
+pub(crate) enum ProjectRunTaskCancellationResource {
+    Stop(ProjectRunTaskStopResource),
+    Requested(ProjectRunTaskCancellationIntentResource),
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectRunTaskCancellationIntentResource {
+    pub disposition: ProjectRunTaskCancellationDisposition,
+    pub run_id: String,
+    pub task_id: String,
+    pub cancellation_id: String,
+    pub cancellation_state: ProjectRunTaskCancellationState,
+    pub lifecycle: ProjectRunTaskLifecycle,
+    pub catalog_revision: u64,
+    pub expected_catalog_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectRunTaskCancellationState {
+    Requested,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectRunTaskStopResource {
     pub disposition: ProjectRunTaskCancellationDisposition,
     pub run_id: String,
     pub task_id: String,
@@ -378,4 +528,30 @@ pub(crate) struct ProjectFromScriptResource {
     #[serde(flatten)]
     pub project: ProjectDocumentResource,
     pub script_import: ProjectScriptImportResource,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectRunIntentRequest {
+    pub archive_base64: String,
+    /// Revision of the exact archived definition observed by the author.
+    pub expected_revision: u64,
+    /// Explicit RunIntentAuthoring: run_id, idempotency_key, parameters, seeds,
+    /// dependencies, scheduling_priority and requested_execution. No defaults
+    /// or identities are inferred from a live session.
+    pub run_authoring: BTreeMap<String, serde_json::Value>,
+    pub study_plan: BTreeMap<String, serde_json::Value>,
+    pub study_problem_catalog: BTreeMap<String, serde_json::Value>,
+    pub asset_paths: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectRunIntentResource {
+    pub project_id: String,
+    pub definition_revision: u64,
+    pub payload_fingerprint: String,
+    /// Canonical run_intent.v1 for the existing Submit operation. Submit must
+    /// receive the same archive, Study, catalog and asset bindings. It repeats
+    /// validation and checks published profiles before durable acceptance.
+    pub run_intent: BTreeMap<String, serde_json::Value>,
 }

@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
 
-import { act } from "react";
+import { act, type ComponentProps, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { KernelContext } from "@/kernel/KernelContext";
+import type { KernelApi } from "@/kernel/types";
 import type { CrossSectionDraft } from "@/kernel/workspace/crossSectionWorkspace";
 import {
   installSimulationPreparationTestDom,
@@ -12,7 +14,8 @@ import {
   TestNode,
 } from "@/kernel/layout/simulationPreparationTestDom.test-support";
 
-import { CrossSectionDraftEditor } from "./CrossSectionDraftEditor";
+import { InspectorEditSessionProvider } from "../InspectorEditSession";
+import { CrossSectionDraftEditor as UnwrappedCrossSectionDraftEditor } from "./CrossSectionDraftEditor";
 
 const sessionA = {
   sessionId: "A",
@@ -27,6 +30,7 @@ const mocks = vi.hoisted(() => ({
   domainMeta: vi.fn(),
   historyGeneration: 0,
   invalidate: vi.fn(),
+  kernel: null as unknown,
   queuePatch: vi.fn(),
   sessionIdentity: null as unknown,
   setActiveViewportMainModule: vi.fn(),
@@ -35,9 +39,16 @@ const mocks = vi.hoisted(() => ({
   setSelection: vi.fn(),
 }));
 
-vi.mock("@/kernel/KernelContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/kernel/KernelContext")>()),
-  useKernel: () => ({
+vi.mock("@/kernel/KernelContext", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@/kernel/KernelContext")>();
+  return {
+    ...original,
+    useKernel: () => mocks.kernel,
+  };
+});
+
+function createTestKernel(): KernelApi {
+  return {
     api: {
       data: { domain: { meta: mocks.domainMeta } },
       model: {
@@ -67,8 +78,26 @@ vi.mock("@/kernel/KernelContext", async (importOriginal) => ({
     visualizationSync: {
       queuePatch: mocks.queuePatch,
     },
-  }),
-}));
+  } as unknown as KernelApi;
+}
+
+function TestProviders({ children }: { children: ReactNode }) {
+  return (
+    <KernelContext.Provider value={mocks.kernel as KernelApi}>
+      <InspectorEditSessionProvider>{children}</InspectorEditSessionProvider>
+    </KernelContext.Provider>
+  );
+}
+
+function CrossSectionDraftEditor(
+  props: ComponentProps<typeof UnwrappedCrossSectionDraftEditor>,
+) {
+  return (
+    <TestProviders>
+      <UnwrappedCrossSectionDraftEditor {...props} />
+    </TestProviders>
+  );
+}
 
 vi.mock("@/kernel/resources/planarMonitorResources", () => ({
   usePlanarMonitorsResource: () => ({
@@ -108,6 +137,7 @@ const crossSectionDraftEditorSourceUrl = new URL(
 describe("CrossSectionDraftEditor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.kernel = createTestKernel();
     mocks.currentSessionScopeKey = sessionAScopeKey;
     mocks.sessionIdentity = sessionA;
     mocks.domainMeta.mockResolvedValue({

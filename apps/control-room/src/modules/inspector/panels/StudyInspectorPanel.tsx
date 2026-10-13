@@ -34,6 +34,7 @@ import { ControlRoomApiError } from "@/kernel/api/ControlRoomApi";
 import type {
   CheckpointEntry,
   FrequencyDomainManifestResource,
+  JsonObject,
   LiveStatusResource,
   MeshPeriodicPairsResource,
   MeshSharedDomainManifestResource,
@@ -81,6 +82,7 @@ import {
   useSessionStatusSelector,
 } from "@/kernel/resources/useSessionStatus";
 import type { ActiveLaneCapabilitySnapshot } from "@/kernel/resources/useActiveLaneCapabilities";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import { CommandDetailDialog } from "@/shared/runtime/CommandDetailDialog";
 import { Button } from "@/shared/ui/Button";
 import {
@@ -99,6 +101,7 @@ import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FormField } from "../primitives/FormField";
 import { InspectorGroup } from "../primitives/InspectorGroup";
 import { ProjectRunsSection } from "./ProjectRunsSection";
+import { ProjectBatchesSection } from "./ProjectBatchesSection";
 
 import {
   buildStudyGlobalMergePatch,
@@ -111,12 +114,14 @@ import {
 } from "./StudyGlobalAuthoringModel";
 import {
   buildStudyStagesMergePatch,
+  createStudyStageDraft,
   createDefaultStudyStageDraft,
   createStudyStageDrafts,
   validateStudyStageDraft,
   type StudyStageDraft,
   type StudyStageDraftKind,
 } from "./StudyStageAuthoringModel";
+import { readStudyStageSource } from "@/shared/domain/study/studyStageSource";
 import {
   resolveStudyInspectorModel,
   stageExecutionForCurrentScope,
@@ -332,6 +337,8 @@ function studyInspectorPanelReducer(
     case "duplicateStageDraft": {
       const source = state.stageDrafts[action.index];
       if (!source) return state;
+      // The immutable definition reference cannot be renamed into a second solve.
+      if (source.kind === "antenna_field_solve") return state;
       const draft = {
         ...source,
         stageId: `${source.stageId || source.kind}-copy`,
@@ -435,7 +442,7 @@ function clampIndex(index: number, drafts: readonly StudyStageDraft[]): number {
 function rawStudyStages(scene: unknown): unknown[] {
   const sceneRecord = asRecord(scene);
   const study = asRecord(sceneRecord?.study);
-  return Array.isArray(study?.stages) ? study.stages : [];
+  return readStudyStageSource(study).entries.map((entry) => entry.payload);
 }
 
 function magneticObjectCount(scene: unknown): number {
@@ -839,7 +846,19 @@ export function useStudyInspectorPanelController(
     if (!scene.data) return;
     if (!sceneHasAuthoringPayload(scene.data)) return;
     const rawStages = rawStudyStages(scene.data);
-    const stageDrafts = createStudyStageDrafts(rawStages);
+    const source = readStudyStageSource(asRecord(scene.data)?.study);
+    const stageDrafts = source.kind === "flat" ? createStudyStageDrafts(rawStages)
+      : source.entries.map((entry, index): StudyStageDraft => ({
+        ...createStudyStageDraft(entry.stageKind === "antenna_field_solve" ? entry.payload : {
+          kind: "unsupported",
+        }, index),
+        kind: entry.stageKind === "antenna_field_solve" ? "antenna_field_solve" : "unsupported",
+        rawStage: structuredClone(entry.payload) as JsonObject,
+        stageId: entry.queueId ?? `stage-${index + 1}`,
+        pipelineNodeId: entry.queueId ?? undefined,
+        pipelineEnabled: entry.enabled,
+        pipelineGroupIds: [...entry.groupIds],
+      }));
     dispatch({
       type: "resetStageDrafts",
       drafts: stageDrafts,
@@ -1068,7 +1087,7 @@ export function useStudyInspectorPanelController(
         mutationContext,
         "Edit study stages",
         () => kernel.api.model.commitTransaction(
-          buildStudyStagesMergePatch(state.stageDrafts, baseRevision),
+          buildStudyStagesMergePatch(state.stageDrafts, baseRevision, currentScene.scene),
           sessionScopeKey ? { sessionScopeKey } : undefined,
         ),
       );
@@ -1150,7 +1169,7 @@ export function useStudyInspectorPanelController(
       executionProfileBound: profileBound,
       magneticObjectCount: magneticObjectCount(currentScene.scene),
       magneticObjectIds: magneticObjectIds(currentScene.scene),
-      sessionDiscretization: runtimeStatus?.domain.discretization,
+      sessionDiscretization: resolveSessionDiscretization(runtimeStatus),
     }).filter(
       (issue) => issue.severity === "error",
     );
@@ -1176,7 +1195,7 @@ export function useStudyInspectorPanelController(
           buildStudyGlobalMergePatch(state.globalDraft, {
             baseRevision,
             executionProfileBound: profileBound,
-            sessionDiscretization: runtimeStatus?.domain.discretization,
+            sessionDiscretization: resolveSessionDiscretization(runtimeStatus),
           }),
           sessionScopeKey ? { sessionScopeKey } : undefined,
         ),
@@ -1194,7 +1213,7 @@ export function useStudyInspectorPanelController(
         requestedBackend: profileBound
           ? null
           : state.globalDraft.requestedBackend,
-        sessionDiscretization: runtimeStatus?.domain.discretization,
+        sessionDiscretization: resolveSessionDiscretization(runtimeStatus),
       });
       if (explicitFdm) {
         invalidateFdmGridResources(kernel.resources, revision);
@@ -1478,7 +1497,7 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
       hasStudyExecutionProfile(scene.data) || profileEditState.profileBound,
     magneticObjectCount: sceneMagneticObjectCount,
     magneticObjectIds: sceneMagneticObjectIds,
-    sessionDiscretization: runtimeStatus?.domain.discretization,
+    sessionDiscretization: resolveSessionDiscretization(runtimeStatus),
   });
   const workflowValidation = validateStudyWorkflow(state.stageDrafts);
   const stageValidation = state.stageDrafts.flatMap((draft, index) => [
@@ -1555,6 +1574,7 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
         />
 
         <ProjectRunsSection />
+        <ProjectBatchesSection />
 
         <StudySelectedStageSection
           model={model}
@@ -1581,7 +1601,7 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
           scene={scene.data}
           sceneRevision={sceneRevision}
           sceneStatus={scene.status}
-          sessionDiscretization={runtimeStatus?.domain.discretization}
+          sessionDiscretization={resolveSessionDiscretization(runtimeStatus)}
           snapshot={snapshot}
           onCommit={() => void commitGlobalDraft()}
           onUpdate={(patch) =>
@@ -1602,6 +1622,9 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
         />
 
         <StudyPipelineSection
+          readOnlyReason={readStudyStageSource(asRecord(scene.data)?.study).kind !== "flat"
+            ? readStudyStageSource(asRecord(scene.data)?.study).error ?? "Canonical pipeline inspection is read-only. Flat-stage editing cannot preserve its groups and references."
+            : null}
           activeStageIndex={activeStageIndex}
           activeLane={runtimeStatus?.capabilities.active_lane ?? null}
           algorithmsAvailable={runtimeStatus?.capabilities.algorithms_available}

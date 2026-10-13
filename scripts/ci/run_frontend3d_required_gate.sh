@@ -30,6 +30,7 @@ run_gate() {
       # Keep cross-layer rDMI regressions in the standard source/unit gate;
       # these do not claim managed FEM or CUDA physics qualification.
       cargo test -p fullmag-plan -p fullmag-engine -p fullmag-runner -p fullmag-api -p fullmag-authoring rotated --no-fail-fast
+      cargo test -p fullmag-authoring manual_universe --no-fail-fast
       cargo test -p fullmag-runner capabilities::tests --no-fail-fast
       # Debug-build router tests hold very large async futures on the stack;
       # the default 2 MiB test-thread stack overflows.
@@ -41,7 +42,8 @@ run_gate() {
       git diff --exit-code -- \
         apps/control-room/src/kernel/api/generated/openapi-v2.json \
         apps/control-room/src/kernel/api/generated/openapi-v2-types.ts \
-        apps/control-room/src/kernel/api/generated/openapi-v2-client.ts
+        apps/control-room/src/kernel/api/generated/openapi-v2-client.ts \
+        apps/control-room/src/kernel/api/generated/openapi-v2-paths.ts
       ;;
     architecture-api-hygiene)
       ./scripts/ci-resource-first-gates.sh --strict

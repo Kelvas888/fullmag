@@ -3,9 +3,10 @@ import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { SIMULATION_PREPARATION_PATH } from "../api/apiPaths";
+import { SESSIONS_PATH, SIMULATION_PREPARATION_PATH } from "../api/apiPaths";
 import type {
   LiveStatusResource,
+  SessionListResource,
   SimulationPreparationResource,
 } from "../api/apiTypes";
 import { ControlRoomApiError } from "../api/ControlRoomApi";
@@ -14,13 +15,17 @@ import type { KernelEventMap } from "../events/eventTypes";
 import { KernelContext } from "../KernelContext";
 import { DiagnosticRecorderController } from "../performance/diagnostic-recorder/DiagnosticRecorderController";
 import { updateRealtimeCommunicationPolicy } from "../realtime/communicationPolicy";
+import type { ResourceResult } from "./resourceTypes";
 import { ResourceInvalidationController } from "./ResourceInvalidationController";
-import { resetSharedResourceRuntimeStoreForTests, sharedResourceRuntimeStore } from "./ResourceRuntimeStore";
-import {
-  sessionRequestScopeKey,
-  sessionScopedResourceKey,
-} from "./sessionResourceIdentity";
+import { resetSharedResourceRuntimeStoreForTests } from "./ResourceRuntimeStore";
+import { sessionScopedResourceKey } from "./sessionResourceIdentity";
 import { useSimulationPreparation } from "./useSimulationPreparation";
+import { SESSION_STATUS_RESOURCE_KEY } from "./useSessionStatus";
+import {
+  preparationMinimumRevision,
+  preparationPublicationState,
+  preparationRetryKey,
+} from "./simulationPreparationPublication";
 
 interface Deferred<TData> {
   promise: Promise<TData>;
@@ -28,18 +33,7 @@ interface Deferred<TData> {
   resolve: (value: TData) => void;
 }
 
-const SESSION_IDENTITY = {
-  requestScopeEpoch: "api-instance:1",
-  sessionEpoch: "session-1@1700000000000",
-  sessionId: "session-1",
-} as const;
-const SCOPED_PREPARATION_RESOURCE_KEY = sessionScopedResourceKey(
-  SESSION_IDENTITY,
-  SIMULATION_PREPARATION_PATH,
-);
-const PREPARATION_SESSION_SCOPE_KEY = sessionRequestScopeKey(SESSION_IDENTITY)!;
-
-type PreparationResult = ReturnType<typeof useSimulationPreparation>;
+type PreparationResult = ResourceResult<SimulationPreparationResource>;
 
 afterEach(() => {
   updateRealtimeCommunicationPolicy({});
@@ -82,11 +76,9 @@ function preparationFixture(revision: number): SimulationPreparationResource {
   };
 }
 
-function statusFixture(simulationPreparationRevision = 0): LiveStatusResource {
+function statusFixture(): LiveStatusResource {
   return {
-    resources: {
-      simulation_preparation_revision: simulationPreparationRevision,
-    },
+    resources: { simulation_preparation_revision: 0 },
     session: {
       session_epoch: "session-1@1700000000000",
       session_id: "session-1",
@@ -97,10 +89,9 @@ function statusFixture(simulationPreparationRevision = 0): LiveStatusResource {
 }
 
 function makeKernel(
-  preparation: (
-    options?: { sessionScopeKey?: string; signal?: AbortSignal },
-  ) => Promise<SimulationPreparationResource>,
-  status: LiveStatusResource = statusFixture(),
+  preparation: (options?: { signal?: AbortSignal }) => Promise<SimulationPreparationResource>,
+  publishedPreparationRevision: number | (() => Promise<LiveStatusResource>) = 0,
+  currentSessionId: () => string = () => "session-1",
 ) {
   const bus = new EventBus<KernelEventMap>();
   const resources = new ResourceInvalidationController(bus);
@@ -108,7 +99,12 @@ function makeKernel(
     kernel: {
       api: {
         sessions: {
-          current: { status: async () => status },
+          current: { status: typeof publishedPreparationRevision === "function"
+            ? publishedPreparationRevision
+            : async () => ({
+                ...statusFixture(),
+                resources: { simulation_preparation_revision: publishedPreparationRevision },
+              }) },
           // Session identity is confirmed against the session collection.
           list: async () => ({
             schema_version: "2.0.0",
@@ -116,7 +112,7 @@ function makeKernel(
               {
                 current: true,
                 name: "session-1",
-                session_id: "session-1",
+                session_id: currentSessionId(),
                 status: "running",
               },
             ],
@@ -129,7 +125,7 @@ function makeKernel(
         config: { enabled: false },
       }),
       resources,
-    } as React.ComponentProps<typeof KernelContext.Provider>["value"],
+    } as NonNullable<React.ComponentProps<typeof KernelContext.Provider>["value"]>,
     bus,
     resources,
   };
@@ -171,291 +167,256 @@ async function waitFor(
 }
 
 describe("useSimulationPreparation", () => {
-  it("treats an unavailable preparation snapshot as absent without emitting a load failure", async () => {
-    const load = vi.fn(() =>
-      Promise.reject(
-        new ControlRoomApiError("simulation preparation unavailable", 404),
-      ),
-    );
-    const { bus, kernel, resources } = makeKernel(load, statusFixture(1));
+  it.each([
+    { publishedRevision: 0, requiredRevision: 7, status: 404, reports: true },
+    { publishedRevision: 7, requiredRevision: null, status: 404, reports: true },
+    { publishedRevision: 1, requiredRevision: null, status: 401, reports: true },
+    { publishedRevision: 1, requiredRevision: null, status: 500, reports: true },
+  ])("reports only unexpected initial failures: %j", async (testCase) => {
+    const failure = new ControlRoomApiError("preparation unavailable", testCase.status);
+    const load = vi.fn(() => Promise.reject(failure));
+    const { bus, kernel } = makeKernel(load, testCase.publishedRevision);
     const failures: KernelEventMap["resource:load-failed"][] = [];
-    const unsubscribeFailure = bus.on("resource:load-failed", (event) => {
-      failures.push(event);
-    });
+    const unsubscribe = bus.on("resource:load-failed", (event) => failures.push(event));
     const observations: PreparationResult[] = [];
     const dom = installTestDom();
     const root = createRoot(dom.document.createElement("div") as unknown as Element);
-    resources.invalidate(SCOPED_PREPARATION_RESOURCE_KEY, 1);
-
     try {
       await act(async () => {
         root.render(
           <KernelContext.Provider value={kernel}>
-            <Probe observations={observations} />
+            <Probe observations={observations} requiredRevision={testCase.requiredRevision} />
           </KernelContext.Provider>,
         );
       });
       await waitFor(
-        () => observations.some((observation) => observation.status === "ready"),
-        "missing preparation snapshot was not normalized as absent",
+        () => observations.some((observation) => observation.status === "error"),
+        "preparation failure did not remain visible",
       );
+      expect(observations.at(-1)).toMatchObject({ data: null, error: failure, status: "error" });
+      expect(failures.some((event) => event.resourceKey.endsWith(SIMULATION_PREPARATION_PATH)))
+        .toBe(testCase.reports);
+    } finally {
+      unsubscribe();
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
 
-      expect(load).toHaveBeenCalledTimes(1);
-      expect(load).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sessionScopeKey: PREPARATION_SESSION_SCOPE_KEY,
-        }),
-      );
-      expect(resultSnapshot(observations.at(-1)!)).toEqual({
-        data: null,
-        error: null,
-        revision: 1,
-        status: "ready",
+  it("waits for unknown publication and loads only a published preparation", () => {
+    expect(preparationPublicationState(undefined, null)).toBe("unknown");
+    expect(preparationPublicationState(undefined, 7)).toBe("unknown");
+    expect(preparationPublicationState(null, null)).toBe("absent");
+    expect(preparationPublicationState(0, null)).toBe("absent");
+    expect(preparationPublicationState(7, null)).toBe("published");
+    expect(preparationPublicationState(0, 7)).toBe("published");
+    expect(preparationMinimumRevision(8, null)).toBe(8);
+    expect(preparationMinimumRevision(8, 9)).toBe(9);
+    expect(preparationMinimumRevision(undefined, 9)).toBeNull();
+    expect(preparationRetryKey("session=A&epoch=1&request_scope_epoch=X|preparation", 7))
+      .not.toBe(preparationRetryKey("session=A&epoch=2&request_scope_epoch=X|preparation", 7));
+  });
+
+  it("keeps an unpublished scratch preparation idle without issuing a GET", async () => {
+    const load = vi.fn(() => Promise.reject(new ControlRoomApiError("not found", 404)));
+    const { bus, kernel } = makeKernel(load);
+    const failures: KernelEventMap["resource:load-failed"][] = [];
+    const unsubscribe = bus.on("resource:load-failed", (event) => failures.push(event));
+    const observations: PreparationResult[] = [];
+    const dom = installTestDom();
+    const root = createRoot(dom.document.createElement("div") as unknown as Element);
+    try {
+      await act(async () => {
+        root.render(<KernelContext.Provider value={kernel}>
+          <Probe observations={observations} />
+        </KernelContext.Provider>);
       });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      });
+      expect(load).not.toHaveBeenCalled();
+      expect(observations.at(-1)).toMatchObject({ data: null, error: null, status: "idle" });
+      await act(async () => observations.at(-1)!.refetch());
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      });
+      expect(load).not.toHaveBeenCalled();
       expect(failures).toEqual([]);
     } finally {
-      unsubscribeFailure();
+      unsubscribe();
       await act(async () => root.unmount());
       dom.restore();
     }
   });
 
-  it("keeps a missing preparation error when status advertises a required revision", async () => {
-    const load = vi.fn(() =>
-      Promise.reject(
-        new ControlRoomApiError("simulation preparation unavailable", 404),
-      ),
-    );
-    const { bus, kernel, resources } = makeKernel(load, statusFixture(8));
-    const failures: KernelEventMap["resource:load-failed"][] = [];
-    const unsubscribeFailure = bus.on("resource:load-failed", (event) => {
-      failures.push(event);
-    });
+  it("does not probe absence during a status refresh and starts after positive publication", async () => {
+    updateRealtimeCommunicationPolicy({ status_refresh_ms: 1 });
+    const refresh = deferred<LiveStatusResource>();
+    const statusLoad = vi.fn()
+      .mockResolvedValueOnce(statusFixture())
+      .mockImplementationOnce(() => refresh.promise)
+      .mockResolvedValue({
+        ...statusFixture(), resources: { simulation_preparation_revision: 7 },
+      });
+    const load = vi.fn(() => Promise.resolve(preparationFixture(7)));
+    const { kernel, resources } = makeKernel(load, statusLoad);
     const observations: PreparationResult[] = [];
     const dom = installTestDom();
     const root = createRoot(dom.document.createElement("div") as unknown as Element);
-    resources.invalidate(SCOPED_PREPARATION_RESOURCE_KEY, 8);
-
     try {
       await act(async () => {
-        root.render(
-          <KernelContext.Provider value={kernel}>
-            <Probe observations={observations} requiredRevision={8} />
-          </KernelContext.Provider>,
-        );
+        root.render(<KernelContext.Provider value={kernel}>
+          <Probe observations={observations} />
+        </KernelContext.Provider>);
       });
-      await waitFor(
-        () => observations.some((observation) => observation.status === "error"),
-        "missing required preparation revision was normalized away",
-      );
-
-      expect(resultSnapshot(observations.at(-1)!)).toMatchObject({
-        data: null,
-        error: expect.objectContaining({
-          message: "simulation preparation unavailable",
-        }),
-        revision: 8,
-        status: "error",
+      await waitFor(() => statusLoad.mock.calls.length === 1, "initial status did not load");
+      await act(async () => {
+        resources.invalidate(SESSION_STATUS_RESOURCE_KEY, "transport:1");
+        resources.invalidate(SIMULATION_PREPARATION_PATH, "transport:1");
       });
-      expect(load).toHaveBeenCalledTimes(1);
-      expect(load).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sessionScopeKey: PREPARATION_SESSION_SCOPE_KEY,
-        }),
-      );
-      expect(failures).toEqual([
-        expect.objectContaining({
-          resourceKey: SCOPED_PREPARATION_RESOURCE_KEY,
-          revision: 8,
-          status: 404,
-        }),
-      ]);
+      await waitFor(() => statusLoad.mock.calls.length === 2, "status refresh did not load");
+      await act(async () => observations.at(-1)!.refetch());
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      });
+      expect(load).not.toHaveBeenCalled();
+      await act(async () => {
+        refresh.resolve(statusFixture());
+        await refresh.promise;
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      });
+      expect(load).not.toHaveBeenCalled();
+      expect(observations.at(-1)).toMatchObject({ data: null, status: "idle" });
+      await act(async () => resources.invalidate(SESSION_STATUS_RESOURCE_KEY, "transport:2"));
+      await waitFor(() => load.mock.calls.length === 1, "published preparation did not load");
+      await waitFor(() => observations.at(-1)?.status === "ready", "published preparation was not ready");
+      expect(observations.at(-1)?.data?.revision).toBe(7);
     } finally {
-      unsubscribeFailure();
       await act(async () => root.unmount());
       dom.restore();
     }
   });
 
-  it.each(["optional", "required"] as const)(
-    "preserves required failure for a shared missing request started by the %s consumer",
-    async (firstConsumer) => {
-      const pending = deferred<SimulationPreparationResource>();
-      const load = vi.fn(() => pending.promise);
-      const ensureLoadSpy = vi.spyOn(sharedResourceRuntimeStore, "ensureLoad");
-      const { bus, kernel, resources } = makeKernel(load, statusFixture(8));
-      const failures: KernelEventMap["resource:load-failed"][] = [];
-      const unsubscribeFailure = bus.on("resource:load-failed", (event) => {
-        failures.push(event);
+  it("refreshes a new canonical minimum without explicit requiredRevision or preparation invalidation", async () => {
+    updateRealtimeCommunicationPolicy({ status_refresh_ms: 1 });
+    let revision = 7;
+    const statusLoad = vi.fn(async () => ({
+      ...statusFixture(),
+      resources: { ...statusFixture().resources, simulation_preparation_revision: revision },
+    }));
+    const load = vi.fn(async () => preparationFixture(revision));
+    const { kernel, resources } = makeKernel(load, statusLoad);
+    const observations: PreparationResult[] = [];
+    const dom = installTestDom();
+    const root = createRoot(dom.document.createElement("div") as unknown as Element);
+    try {
+      await act(async () => root.render(<KernelContext.Provider value={kernel}>
+        <Probe observations={observations} />
+      </KernelContext.Provider>));
+      await waitFor(() => observations.at(-1)?.data?.revision === 7, "initial publication did not load");
+      // A higher transport pointer must not stand in for a preparation revision.
+      await act(async () => resources.invalidate(SIMULATION_PREPARATION_PATH, 100));
+      await waitFor(() => load.mock.calls.length === 2, "transport refresh did not load");
+      await waitFor(() => observations.at(-1)?.status === "ready", "transport refresh did not settle");
+      revision = 8;
+      await act(async () => resources.invalidate(SESSION_STATUS_RESOURCE_KEY, "status:next"));
+      await waitFor(() => observations.at(-1)?.data?.revision === 8, "canonical minimum did not refresh");
+      expect(load).toHaveBeenCalledTimes(3);
+      await act(async () => observations.at(-1)!.refetch());
+      await waitFor(() => load.mock.calls.length === 4, "published manual refresh was blocked");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("retries the same revision separately for different confirmed sessions", async () => {
+    vi.useFakeTimers();
+    updateRealtimeCommunicationPolicy({ status_refresh_ms: 1, error_retry_ms: 10 });
+    let sessionId = "session-1";
+    const statusLoad = vi.fn(async (): Promise<LiveStatusResource> => ({
+      ...statusFixture(),
+      resources: { ...statusFixture().resources, simulation_preparation_revision: 7 },
+      session: {
+        ...statusFixture().session,
+        session_id: sessionId,
+        session_epoch: `${sessionId}@1700000000000`,
+      },
+    }));
+    const load = vi.fn()
+      .mockRejectedValueOnce(new ControlRoomApiError("upstream unavailable", 502))
+      .mockResolvedValueOnce(preparationFixture(7))
+      .mockRejectedValueOnce(new ControlRoomApiError("upstream unavailable", 502))
+      .mockResolvedValueOnce(preparationFixture(7));
+    const { kernel, resources } = makeKernel(load, statusLoad, () => sessionId);
+    const observations: PreparationResult[] = [];
+    const dom = installTestDom();
+    const root = createRoot(dom.document.createElement("div") as unknown as Element);
+    try {
+      await act(async () => root.render(<KernelContext.Provider value={kernel}>
+        <Probe observations={observations} />
+      </KernelContext.Provider>));
+      await waitForPhase(() => load.mock.calls.length === 1 && observations.at(-1)?.status === "error", "session A initial failure");
+      expect(load).toHaveBeenCalledTimes(1);
+      await act(async () => vi.advanceTimersByTimeAsync(11));
+      await waitForPhase(() => observations.at(-1)?.status === "ready", "session A retry completion");
+      expect(load).toHaveBeenCalledTimes(2);
+      const nextStatus = deferred<LiveStatusResource>();
+      const nextCollection = deferred<SessionListResource>();
+      statusLoad.mockImplementationOnce(() => nextStatus.promise);
+      const collectionLoad = vi.spyOn(kernel.api.sessions, "list")
+        .mockImplementationOnce(() => nextCollection.promise);
+      sessionId = "session-2";
+      await act(async () => {
+        resources.invalidate(SESSIONS_PATH, "session:next");
+        resources.invalidate(SESSION_STATUS_RESOURCE_KEY, "session:next");
       });
-      const optionalObservations: PreparationResult[] = [];
-      const requiredObservations: PreparationResult[] = [];
-      const dom = installTestDom();
-      const root = createRoot(
-        dom.document.createElement("div") as unknown as Element,
-      );
-      resources.invalidate(SCOPED_PREPARATION_RESOURCE_KEY, 8);
-
-      const optionalProbe = <Probe key="optional" observations={optionalObservations} />;
-      const requiredProbe = (
-        <Probe key="required" observations={requiredObservations} requiredRevision={8} />
-      );
-      const firstProbe =
-        firstConsumer === "optional" ? optionalProbe : requiredProbe;
-      const secondProbe =
-        firstConsumer === "optional" ? requiredProbe : optionalProbe;
-
-      try {
-        await act(async () => {
-          root.render(
-            <KernelContext.Provider value={kernel}>
-              <div>{firstProbe}{null}</div>
-            </KernelContext.Provider>,
-          );
+      await waitForPhase(() => collectionLoad.mock.calls.length === 1 && statusLoad.mock.calls.length === 2, "session B identity requests");
+      expect(load).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        nextStatus.resolve({
+          ...statusFixture(),
+          resources: { ...statusFixture().resources, simulation_preparation_revision: 7 },
+          session: { ...statusFixture().session, session_id: sessionId, session_epoch: `${sessionId}@1700000000000` },
         });
-        await waitFor(
-          () => load.mock.calls.length === 1,
-          "first consumer did not start the shared preparation request",
-        );
-
-        await act(async () => {
-          root.render(
-            <KernelContext.Provider value={kernel}>
-              <div>
-                {firstProbe}
-                {secondProbe}
-              </div>
-            </KernelContext.Provider>,
-          );
+        await nextStatus.promise;
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      // Status B cannot authorize preparation while the collection still names A.
+      expect(load).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        nextCollection.resolve({
+          schema_version: "2.0.0",
+          sessions: [{ current: true, name: sessionId, session_id: sessionId, status: "running" }],
         });
-        await waitFor(
-          () =>
-            optionalObservations.some(
-              (observation) => observation.status === "loading",
-            ) &&
-            requiredObservations.some(
-              (observation) => observation.status === "loading",
-            ),
-          "both consumers did not observe the pending shared request",
-        );
+        await nextCollection.promise;
+      });
+      await waitForPhase(() => load.mock.calls.length === 3 && observations.at(-1)?.status === "error", "confirmed session B initial failure");
+      expect(load).toHaveBeenCalledTimes(3);
+      await act(async () => vi.advanceTimersByTimeAsync(11));
+      await waitForPhase(() => observations.at(-1)?.status === "ready", "session B retry completion");
+      expect(load).toHaveBeenCalledTimes(4);
+      expect(load.mock.calls.map(([options]) => options.sessionScopeKey)).toEqual([
+        "session=session-1&epoch=session-1%401700000000000&request_scope_epoch=api-instance%3A1",
+        "session=session-1&epoch=session-1%401700000000000&request_scope_epoch=api-instance%3A1",
+        "session=session-2&epoch=session-2%401700000000000&request_scope_epoch=api-instance%3A1",
+        "session=session-2&epoch=session-2%401700000000000&request_scope_epoch=api-instance%3A1",
+      ]);
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
 
-        // Loading is a snapshot, not evidence that the second hook's
-        // scheduled ensureLoad has joined the existing in-flight request.
-        await waitFor(
-          () => ensureLoadSpy.mock.calls.filter(([request]) =>
-            request.resourceKey.endsWith(SIMULATION_PREPARATION_PATH),
-          ).length >= 2,
-          "both consumers did not join the shared preparation request",
-        );
-        expect(load).toHaveBeenCalledTimes(1);
-
-        await act(async () => {
-          pending.reject(
-            new ControlRoomApiError("simulation preparation unavailable", 404),
-          );
-          await pending.promise.catch(() => undefined);
-          await new Promise<void>((resolve) => setTimeout(resolve, 0));
-        });
-        await waitFor(
-          () =>
-            optionalObservations.some(
-              (observation) => observation.status === "ready",
-            ) &&
-            requiredObservations.some(
-              (observation) => observation.status === "error",
-            ),
-          "shared missing preparation did not produce consumer-specific states",
-        );
-
-        expect(load).toHaveBeenCalledTimes(1);
-        expect(load).toHaveBeenCalledWith(
-          expect.objectContaining({
-            sessionScopeKey: PREPARATION_SESSION_SCOPE_KEY,
-          }),
-        );
-        expect(resultSnapshot(optionalObservations.at(-1)!)).toMatchObject({
-          data: null,
-          error: null,
-          revision: 8,
-          status: "ready",
-        });
-        expect(resultSnapshot(requiredObservations.at(-1)!)).toMatchObject({
-          data: null,
-          error: expect.objectContaining({
-            message: "simulation preparation unavailable",
-          }),
-          revision: 8,
-          status: "error",
-        });
-        expect(failures).toEqual([
-          expect.objectContaining({
-            resourceKey: SCOPED_PREPARATION_RESOURCE_KEY,
-            revision: 8,
-            status: 404,
-          }),
-        ]);
-      } finally {
-        unsubscribeFailure();
-        await act(async () => root.unmount());
-        dom.restore();
+    async function waitForPhase(predicate: () => boolean, phase: string): Promise<void> {
+      for (let tick = 0; tick < 6; tick += 1) {
+        if (predicate()) return;
+        await act(async () => vi.advanceTimersByTimeAsync(1));
       }
-    },
-  );
-
-  it("keeps a session-scope 404 visible when no preparation revision is published", async () => {
-    const load = vi.fn(() =>
-      Promise.reject(
-        new ControlRoomApiError("no active local live workspace", 404),
-      ),
-    );
-    const { bus, kernel, resources } = makeKernel(load, statusFixture());
-    const failures: KernelEventMap["resource:load-failed"][] = [];
-    const unsubscribeFailure = bus.on("resource:load-failed", (event) => {
-      failures.push(event);
-    });
-    const observations: PreparationResult[] = [];
-    const dom = installTestDom();
-    const root = createRoot(dom.document.createElement("div") as unknown as Element);
-    resources.invalidate(SCOPED_PREPARATION_RESOURCE_KEY, 1);
-
-    try {
-      await act(async () => {
-        root.render(
-          <KernelContext.Provider value={kernel}>
-            <Probe observations={observations} requiredRevision={1} />
-          </KernelContext.Provider>,
-        );
-      });
-      await waitFor(
-        () => observations.some((observation) => observation.status === "error"),
-        "session-scope preparation failure was normalized away",
-      );
-
-      expect(resultSnapshot(observations.at(-1)!)).toMatchObject({
-        data: null,
-        error: expect.objectContaining({
-          message: "no active local live workspace",
-        }),
-        revision: 1,
-        status: "error",
-      });
-      expect(load).toHaveBeenCalledTimes(1);
-      expect(load).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sessionScopeKey: PREPARATION_SESSION_SCOPE_KEY,
-        }),
-      );
-      expect(failures).toEqual([
-        expect.objectContaining({
-          resourceKey: SCOPED_PREPARATION_RESOURCE_KEY,
-          revision: 1,
-          status: 404,
-        }),
-      ]);
-    } finally {
-      unsubscribeFailure();
-      await act(async () => root.unmount());
-      dom.restore();
+      expect(predicate(), `${phase}: ${JSON.stringify({
+        loadScopes: load.mock.calls.map(([options]) => options.sessionScopeKey),
+        observations: observations.slice(-6).map(resultSnapshot),
+        statusRequests: statusLoad.mock.calls.length,
+      })}`).toBe(true);
     }
   });
 
@@ -466,11 +427,11 @@ describe("useSimulationPreparation", () => {
       .fn()
       .mockRejectedValueOnce(new ControlRoomApiError("upstream unavailable", 502))
       .mockResolvedValueOnce(preparationFixture(8));
-    const { kernel, resources } = makeKernel(load, statusFixture(8));
+    const { kernel, resources } = makeKernel(load);
     const observations: PreparationResult[] = [];
     const dom = installTestDom();
     const root = createRoot(dom.document.createElement("div") as unknown as Element);
-    resources.invalidate(SCOPED_PREPARATION_RESOURCE_KEY, 8);
+    resources.invalidate(SIMULATION_PREPARATION_PATH, 8);
 
     try {
       await act(async () => {
@@ -531,7 +492,7 @@ describe("useSimulationPreparation", () => {
     const observations: PreparationResult[] = [];
     const dom = installTestDom();
     const root = createRoot(dom.document.createElement("div") as unknown as Element);
-    resources.invalidate(SCOPED_PREPARATION_RESOURCE_KEY, 1);
+    resources.invalidate(SIMULATION_PREPARATION_PATH, 1);
 
     await act(async () => {
       root.render(
@@ -571,45 +532,24 @@ describe("useSimulationPreparation", () => {
       .mockImplementationOnce(() => revision7.promise)
       .mockImplementationOnce(() => revision8.promise)
       .mockImplementation(() => revision9.promise);
-    const { bus, kernel, resources } = makeKernel(load, statusFixture(7));
+    const { bus, kernel, resources } = makeKernel(load);
     const observations: PreparationResult[] = [];
     const dom = installTestDom();
     const root = createRoot(dom.document.createElement("div") as unknown as Element);
-    resources.invalidate(SCOPED_PREPARATION_RESOURCE_KEY, 7);
+    resources.invalidate(SIMULATION_PREPARATION_PATH, 7);
 
     await act(async () => {
       root.render(
         <KernelContext.Provider value={kernel}>
-          <Probe
-            enabled={false}
-            observations={observations}
-            requiredRevision={7}
-          />
+        <Probe observations={observations} requiredRevision={7} />
         </KernelContext.Provider>,
       );
     });
 
-    await waitFor(
-      () =>
-        observations.some(
-          (observation) =>
-            observation.revision === 7 && observation.status === "idle",
-        ),
-      "session-scoped revision 7 did not become available while loading was paused",
-    );
-    expect(resultSnapshot(observations.at(-1)!)).toMatchObject({
+    expect(resultSnapshot(observations[0]!)).toMatchObject({
       data: null,
       revision: 7,
       status: "idle",
-    });
-    expect(load).not.toHaveBeenCalled();
-
-    await act(async () => {
-      root.render(
-        <KernelContext.Provider value={kernel}>
-          <Probe observations={observations} requiredRevision={7} />
-        </KernelContext.Provider>,
-      );
     });
     await waitFor(() => load.mock.calls.length === 1, "revision 7 did not load");
     expect(
@@ -628,7 +568,7 @@ describe("useSimulationPreparation", () => {
 
     now.mockReturnValue(2_000);
     await act(async () => {
-      resources.invalidate(SCOPED_PREPARATION_RESOURCE_KEY, 8);
+      resources.invalidate(SIMULATION_PREPARATION_PATH, 8);
     });
     const staleRevision8 = resultSnapshot(observations.at(-1)!);
     await waitFor(() => load.mock.calls.length === 2, "revision 8 did not load");
@@ -650,7 +590,7 @@ describe("useSimulationPreparation", () => {
       failures.push(event);
     });
     await act(async () => {
-      resources.invalidate(SCOPED_PREPARATION_RESOURCE_KEY, 9);
+      resources.invalidate(SIMULATION_PREPARATION_PATH, 9);
     });
     const staleRevision9 = resultSnapshot(observations.at(-1)!);
     await waitFor(() => load.mock.calls.length === 3, "revision 9 did not load");
@@ -728,14 +668,12 @@ describe("useSimulationPreparation", () => {
   it("uses the deterministic server snapshot and client revision before aborting", async () => {
     const pending = deferred<SimulationPreparationResource>();
     let signal: AbortSignal | undefined;
-    const load = vi.fn(
-      (options?: { sessionScopeKey?: string; signal?: AbortSignal }) => {
-        signal = options?.signal;
-        return pending.promise;
-      },
-    );
-    const { kernel, resources } = makeKernel(load, statusFixture(11));
-    resources.invalidate(SCOPED_PREPARATION_RESOURCE_KEY, 11);
+    const load = vi.fn((options?: { signal?: AbortSignal }) => {
+      signal = options?.signal;
+      return pending.promise;
+    });
+    const { kernel, resources } = makeKernel(load, 11);
+    resources.invalidate(SIMULATION_PREPARATION_PATH, 11);
     const serverObservations: PreparationResult[] = [];
     renderToStaticMarkup(
       <KernelContext.Provider value={kernel}>
@@ -750,11 +688,7 @@ describe("useSimulationPreparation", () => {
       await act(async () => {
         root.render(
           <KernelContext.Provider value={kernel}>
-            <Probe
-              enabled={false}
-              observations={clientObservations}
-              requiredRevision={11}
-            />
+          <Probe observations={clientObservations} requiredRevision={11} />
           </KernelContext.Provider>,
         );
       });
@@ -768,43 +702,16 @@ describe("useSimulationPreparation", () => {
       expect(resultSnapshot(clientObservations[0]!)).toEqual({
         data: null,
         error: null,
-        revision: null,
-        status: "idle",
-      });
-      await waitFor(
-        () =>
-          clientObservations.some(
-            (observation) =>
-              observation.revision === 11 && observation.status === "idle",
-          ),
-        "client did not adopt its scoped preparation revision",
-      );
-      expect(resultSnapshot(clientObservations.at(-1)!)).toMatchObject({
-        data: null,
         revision: 11,
         status: "idle",
       });
-      expect(load).not.toHaveBeenCalled();
-
-      await act(async () => {
-        root.render(
-          <KernelContext.Provider value={kernel}>
-            <Probe observations={clientObservations} requiredRevision={11} />
-          </KernelContext.Provider>,
-        );
-      });
       await waitFor(() => load.mock.calls.length === 1, "request did not start");
-      expect(load).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sessionScopeKey: PREPARATION_SESSION_SCOPE_KEY,
-        }),
-      );
       expect(signal?.aborted).toBe(false);
     } finally {
       await act(async () => root.unmount());
+      expect(signal?.aborted).toBe(true);
       dom.restore();
     }
-    expect(signal?.aborted).toBe(true);
   });
 });
 

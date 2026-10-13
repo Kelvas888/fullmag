@@ -108,6 +108,10 @@ import {
   type DecodedTopology,
 } from "../api/codecs";
 import { ControlRoomApiError } from "../api/ControlRoomApi";
+import {
+  resolveArtifactAssessment,
+  type ArtifactAssessment,
+} from "@/shared/domain/mesh/artifactAssessment";
 import { useKernel } from "../KernelContext";
 import type { ResourceInvalidationController } from "./ResourceInvalidationController";
 import {
@@ -704,6 +708,80 @@ function canPublishCommittedSceneAtRevision({
   return true;
 }
 
+let meshPolicyPublicationSequence = 0;
+
+export function resolveMeshPolicyResourceRevision(
+  resource:
+    | {
+        config?: unknown;
+        effective_config?: unknown;
+        revision?: ResourceRevision | null;
+      }
+    | null
+    | undefined,
+): ResourceRevision | null {
+  if (!resource) return null;
+  const baseRevision = resolveRevisionProperty(resource, "revision") ?? 0;
+  const configFingerprint =
+    resource.config === undefined || resource.config === null
+      ? "null"
+      : JSON.stringify(resource.config);
+  return `${baseRevision}:${configFingerprint}`;
+}
+
+export function publishCommittedMeshPolicyResource<
+  TPolicy extends {
+    config?: unknown;
+    effective_config?: unknown;
+    revision?: number;
+  },
+>(
+  resources: ResourceInvalidationController,
+  unscopedResourceKey: string,
+  policyResource: TPolicy,
+  sessionScopeKey?: string | null,
+  resourceCacheScope?: string | null,
+  runtimeStore: ResourceRuntimeStore<TPolicy> =
+    sharedResourceRuntimeStore as ResourceRuntimeStore<TPolicy>,
+): ResourceRevision {
+  const revisionToken: ResourceRevision =
+    resolveMeshPolicyResourceRevision(policyResource) ??
+    `policy:${policyResource.revision ?? 0}:${++meshPolicyPublicationSequence}`;
+  const publish = resourceCacheScope
+    ? runtimeStore.updateObservedData.bind(runtimeStore)
+    : runtimeStore.updateData.bind(runtimeStore);
+  publish(
+    resourceRuntimeKeyForClientScope(unscopedResourceKey, resourceCacheScope),
+    policyResource,
+    revisionToken,
+  );
+  if (sessionScopeKey) {
+    publish(
+      resourceRuntimeKeyForClientScope(
+        `${sessionScopeKey}|${unscopedResourceKey}`,
+        resourceCacheScope,
+      ),
+      policyResource,
+      revisionToken,
+    );
+    resources.invalidate(
+      `${sessionScopeKey}|${unscopedResourceKey}`,
+      revisionToken,
+    );
+  } else {
+    resources.invalidate(unscopedResourceKey, revisionToken);
+  }
+  const dependentRevision: ResourceRevision = `${revisionToken}:${++meshPolicyPublicationSequence}`;
+  resources.invalidate(MESH_SEMANTICS_RESOURCE_KEY, dependentRevision);
+  resources.invalidate(MESH_SUMMARY_RESOURCE_KEY, dependentRevision);
+  resources.invalidate(MESH_BUILD_CURRENT_RESOURCE_KEY, dependentRevision);
+  resources.invalidate(
+    MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY,
+    dependentRevision,
+  );
+  return dependentRevision;
+}
+
 export function useSceneResource(options: ResourceHookOptions = {}) {
   const { api } = useKernel();
   const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
@@ -1092,7 +1170,7 @@ export function useMeshSharedDomainPolicyResource(options: ResourceHookOptions =
   return useResource<MeshSharedDomainConfigResource>({
     enabled: options.enabled !== false && sessionIdentity !== null,
     load,
-    resolveRevision: resolveJsonResourceRevision,
+    resolveRevision: resolveMeshPolicyResourceRevision,
     resourceKey,
   });
 }
@@ -1984,7 +2062,7 @@ export function useObjectMeshPolicyResource(
   return useResource<MeshObjectConfigResource>({
     enabled,
     load,
-    resolveRevision: resolveJsonResourceRevision,
+    resolveRevision: resolveMeshPolicyResourceRevision,
     resourceKey,
   });
 }
@@ -2003,7 +2081,7 @@ export function useUniverseMeshPolicyResource(options: ResourceHookOptions = {})
   return useResource<MeshUniverseConfigResource>({
     enabled: options.enabled !== false && sessionIdentity !== null,
     load,
-    resolveRevision: resolveJsonResourceRevision,
+    resolveRevision: resolveMeshPolicyResourceRevision,
     resourceKey,
   });
 }
@@ -2094,4 +2172,36 @@ function resolveRevisionProperty(
   }
 
   return null;
+}
+
+/**
+ * Single shared artifact assessment selector across Control Room (PR08/PR10/D06).
+ */
+export function useMeshArtifactAssessment(
+  options: ResourceHookOptions = {},
+): ArtifactAssessment {
+  const scene = useSceneResource(options);
+  const manifest = useMeshSharedDomainManifestResource(options);
+  const activeBuild = useMeshBuildCurrent(options);
+  const latestBuild = useMeshBuildLatestSuccessful(options);
+  const summary = useMeshSummaryResource(options);
+
+  return useMemo(() => {
+    return resolveArtifactAssessment({
+      activeBuild: activeBuild.data?.active_build,
+      latestBuild: latestBuild.data?.last_success,
+      manifest: manifest.data as Record<string, unknown> | null | undefined,
+      resourceLoadState: manifest.status,
+      sceneRevision: scene.data?.revision ?? scene.data?.scene_revision,
+      statusMeshRevision: summary.data?.revision,
+    });
+  }, [
+    activeBuild.data?.active_build,
+    latestBuild.data?.last_success,
+    manifest.data,
+    manifest.status,
+    scene.data?.revision,
+    scene.data?.scene_revision,
+    summary.data?.revision,
+  ]);
 }

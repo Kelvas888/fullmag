@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from fullmag.model.study import _MAX_FEM_EIGEN_SOLVER_ITERATIONS
+from fullmag.model.compute_resources import ComputeResources
 from fullmag.model.output_storage import OutputStorage
 from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer, _parallel_execution_lane
 from fullmag.runtime.output_storage_lowering import (
@@ -13,6 +14,14 @@ from fullmag.runtime.output_storage_lowering import (
     configure_study_pipeline_autosaves,
 )
 from fullmag.model.current_transport import (
+    ExternalLeadCurrentSource,
+    ExternalLeadPreparation,
+    TerminalLeadExtension,
+    _CURRENT_SOURCE_MAX_ITEMS,
+    CurrentSourceInterfacePair,
+    CurrentSourceOuterTerminal,
+    CurrentSourceTerminalObservation,
+    CurrentSourceDrive,
     ConservativeCurrentBoundaryFace,
     ConservativeCurrentClosedGeometry,
     ConservativeCurrentExternalLead,
@@ -30,6 +39,7 @@ from fullmag.model.current_transport import (
     ChargeTransportMaterialAssignment,
     CurrentTransport,
     NormalCurrentElectrode,
+    EquipotentialCurrentTerminal,
     StructuredCurrentClosure,
     StructuredCurrentSourceCut,
     StructuredCutPlane,
@@ -99,6 +109,8 @@ _CURRENT_TRANSPORT_FIELDS = frozenset(
         "solver",
         "time_envelope",
         "conservative_current_view",
+        "conservative_current_source",
+        "external_lead_preparation",
         "structured_current_closure",
     }
 )
@@ -252,6 +264,18 @@ def _execution_profile_fields(
     if layers:
         result["execution_layers"] = [layer.to_ir() for layer in layers]
     return result
+
+
+def _compute_resources_fields(
+    source: Mapping[str, object],
+    context: str,
+) -> dict[str, object]:
+    if "compute_resources" not in source:
+        return {}
+    if not isinstance(source["compute_resources"], Mapping):
+        raise ValueError(f"{context}.compute_resources must be an object")
+    resources = ComputeResources.from_ir(source["compute_resources"])
+    return {"compute_resources": resources.to_ir()}
 
 
 def _reject_unknown_fields(
@@ -424,6 +448,9 @@ def _decode_current_transport(value: object) -> CurrentTransport:
         kind = boundary.get("kind")
         boundary_fields = (
             {
+                "equipotential_current_terminal": frozenset(
+                    {"id", "kind", "surfaces"}
+                ),
                 "voltage_electrode": frozenset(
                     {"id", "kind", "surfaces", "potential_V"}
                 ),
@@ -439,7 +466,9 @@ def _decode_current_transport(value: object) -> CurrentTransport:
             raise ValueError(f"unsupported charge boundary kind {kind!r}")
         _reject_unknown_fields(boundary, boundary_fields, boundary_context)
         boundary_id = _nonempty_string(boundary.get("id"), f"{boundary_context}.id")
-        if kind == "voltage_electrode":
+        if kind == "equipotential_current_terminal":
+            boundaries.append(EquipotentialCurrentTerminal(boundary_id, surfaces))
+        elif kind == "voltage_electrode":
             boundaries.append(
                 VoltageElectrode(
                     boundary_id,
@@ -553,12 +582,89 @@ def _decode_current_transport(value: object) -> CurrentTransport:
             if conservative_view_value is not None
             else None
         ),
+        conservative_current_source=(
+            _decode_conservative_current_source(entry["conservative_current_source"])
+            if entry.get("conservative_current_source") is not None
+            else None
+        ),
+        external_lead_preparation=(
+            _decode_external_lead_preparation(entry["external_lead_preparation"])
+            if entry.get("external_lead_preparation") is not None
+            else None
+        ),
         structured_current_closure=(
             _decode_structured_current_closure(structured_closure_value)
             if structured_closure_value is not None
             else None
         ),
     )
+
+
+def _decode_external_lead_preparation(value: object) -> ExternalLeadPreparation:
+    entry = dict(_mapping(value, "external_lead_preparation"))
+    if set(entry) != {"schema_version", "kind", "revision", "extensions", "drives"}:
+        raise ValueError("external_lead_preparation has unknown or missing fields")
+    if entry.pop("kind") != "isolated_branch_straight_stubs":
+        raise ValueError("unsupported external_lead_preparation kind")
+    extensions, drives = entry["extensions"], entry["drives"]
+    if not isinstance(extensions, list) or not isinstance(drives, list):
+        raise ValueError("external_lead_preparation extensions and drives must be lists")
+    if not 2 <= len(extensions) <= 128 or not drives or len(drives) * len(extensions) > _CURRENT_SOURCE_MAX_ITEMS:
+        raise ValueError("external_lead_preparation exceeds bounded input support before construction")
+    for values, key in ((extensions, "boundary_markers"), (drives, "outer_terminal_currents_a")):
+        count = 0
+        for raw in values:
+            item = _mapping(raw, "external_lead_preparation entry")
+            controls = item.get(key)
+            expected_type = list if key == "boundary_markers" else Mapping
+            if not isinstance(controls, expected_type):
+                raise ValueError(f"external_lead_preparation.{key} has an invalid shape")
+            count += len(controls)
+            if count > _CURRENT_SOURCE_MAX_ITEMS:
+                raise ValueError("external_lead_preparation exceeds bounded input support before construction")
+    groups = (
+        ("extensions", TerminalLeadExtension, {"id", "observation_id", "object_id", "boundary_markers",
+                                              "length_m", "outward_direction_xyz", "conductivity_spm", "layers"}),
+        ("drives", CurrentSourceDrive, {"id", "port_mode_ref", "outer_terminal_currents_a"}),
+    )
+    for name, cls, fields in groups:
+        values = []
+        for raw in entry[name]:
+            item = _mapping(raw, f"external_lead_preparation.{name}")
+            required = fields - {"layers"} if name == "extensions" else fields
+            if not required <= item.keys() or not item.keys() <= fields:
+                raise ValueError(f"external_lead_preparation.{name} has unknown or missing fields")
+            values.append(cls(**item))
+        entry[name] = values
+    return ExternalLeadPreparation(**entry)
+
+
+def _decode_conservative_current_source(value: object) -> ExternalLeadCurrentSource:
+    entry = dict(_mapping(value, "conservative_current_source"))
+    fields = {"schema_version", "kind", "revision", "device_stable_vertex_ids", "lead_mesh",
+              "lead_stable_vertex_ids", "lead_conductivity_spm_per_element", "interface_pairs",
+              "outer_terminals", "terminal_observations", "drives"}
+    if set(entry) != fields:
+        raise ValueError("conservative_current_source has unknown or missing fields")
+    if entry.pop("kind") != "external_lead_current":
+        raise ValueError("unsupported conservative_current_source kind")
+    groups = (
+        ("interface_pairs", CurrentSourceInterfacePair, {"id", "device_face_vertex_ids", "lead_face_vertex_ids", "vertex_pairs"}),
+        ("outer_terminals", CurrentSourceOuterTerminal, {"id", "boundary_face_vertex_ids"}),
+        ("terminal_observations", CurrentSourceTerminalObservation, {"id", "object_id", "interface_pair_ids"}),
+        ("drives", CurrentSourceDrive, {"id", "port_mode_ref", "outer_terminal_currents_a"}),
+    )
+    for name, cls, keys in groups:
+        if not isinstance(entry[name], list):
+            raise ValueError(f"conservative_current_source.{name} must be a list")
+        values = []
+        for raw in entry[name]:
+            item = _mapping(raw, f"conservative_current_source.{name}")
+            if set(item) != keys:
+                raise ValueError(f"conservative_current_source.{name} has unknown or missing fields")
+            values.append(cls(**item))
+        entry[name] = values
+    return ExternalLeadCurrentSource(**entry)
 
 
 def _decode_structured_current_closure(value: object) -> StructuredCurrentClosure:
@@ -1698,9 +1804,22 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
     }
     if "pbc" in builder:
         document["study"]["pbc"] = _scene_pbc_to_ir(builder["pbc"])
+    for collection in (
+        "antenna_port_modes",
+        "antenna_field_solve_stages",
+        "antenna_target_projections",
+        "solved_antenna_drives",
+        "antenna_spectrum_requests",
+    ):
+        if collection in builder:
+            value = builder[collection]
+            if not isinstance(value, list):
+                raise ValueError(f"{collection} must be a list when present")
+            document[collection] = copy.deepcopy(value)
     if "fdm" in builder:
         document["study"]["fdm"] = copy.deepcopy(builder.get("fdm"))
     document["study"].update(_execution_profile_fields(builder, "builder"))
+    document["study"].update(_compute_resources_fields(builder, "builder"))
     if "spin_torques" in builder:
         document["spin_torques"] = _canonical_spin_torques(
             builder["spin_torques"], scene_ids=True
@@ -1744,9 +1863,35 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
     }
     geometries: list[dict[str, Any]] = []
 
+    object_ids: set[str] = set()
+    geometry_names: set[str] = set()
+    magnetic_aliases = {
+        str(obj.get("name") or "").strip() or str(obj.get("id") or "")
+        for obj in scene.get("objects") or []
+        if obj.get("role", "magnet") == "magnet"
+    }
     for obj in scene.get("objects") or []:
-        role = str(obj.get("role") or "magnet")
+        role = str(obj.get("role", "magnet"))
+        if role not in {"magnet", "geometry", "conductor", "electrode", "antenna"}:
+            raise ValueError(f"unsupported scene presentation type '{role}'")
+        object_id = obj.get("id")
+        if not isinstance(object_id, str):
+            raise ValueError("immutable object ID must be a string")
+        if not object_id or object_id.strip() != object_id:
+            raise ValueError("immutable object ID must be nonempty without surrounding whitespace")
+        raw_name = obj.get("name", "")
+        if not isinstance(raw_name, str):
+            raise ValueError("geometry name must be a string")
+        name = raw_name.strip() or object_id
         is_auxiliary = role != "magnet"
+        if object_id in object_ids:
+            raise ValueError(f"duplicate immutable object ID '{object_id}'")
+        if name in geometry_names:
+            raise ValueError(f"ambiguous geometry name '{name}'")
+        if is_auxiliary and object_id in magnetic_aliases:
+            raise ValueError("auxiliary ID conflicts with a magnetic name alias")
+        object_ids.add(object_id)
+        geometry_names.add(name)
         material_ref = str(obj.get("material_ref") or "")
         if not is_auxiliary and (not material_ref or material_ref not in materials):
             raise ValueError(
@@ -1761,13 +1906,6 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
             )
         geometry = dict(obj.get("geometry") or {})
         geometry_params = dict(geometry.get("geometry_params") or {})
-        object_id = str(obj.get("id") or obj.get("name") or "")
-        name = str(obj.get("name") or obj.get("id") or "")
-        if is_auxiliary and object_id != name:
-            raise ValueError(
-                "scene_document_auxiliary_object_id_unsupported: "
-                f"object '{object_id}' has a name that cannot preserve its identity"
-            )
         transform = dict(obj.get("transform") or {})
         translation = _owner_frame_translation(transform, object_id)
         if any(abs(value) > 0 for value in translation):
@@ -1811,8 +1949,8 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         )
 
         entry: dict[str, Any] = {
-            "object_id": str(obj.get("id") or obj.get("name") or ""),
-            "name": str(obj.get("name") or obj.get("id") or ""),
+            "object_id": object_id,
+            "name": name,
             "role": role,
             "region_name": obj.get("region_name"),
             "geometry_kind": str(geometry.get("geometry_kind", "")),
@@ -1966,6 +2104,7 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         "cpu_threads": study.get("requested_cpu_threads"),
         "parallel_execution": parallel_execution_policy.to_ir(),
         **_execution_profile_fields(study, "SceneDocument.study"),
+        **_compute_resources_fields(study, "SceneDocument.study"),
         "fem_demag_solver_policy": study.get("fem_demag_solver_policy"),
         "exchange_enabled": bool(study.get("exchange_enabled", True)),
         "demag_enabled": bool(study.get("demag_enabled", True)),
@@ -2046,6 +2185,18 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         builder["oersted_terms"] = _canonical_oersted_fields(
             scene["oersted_terms"], scene_ids=False
         )
+    for collection in (
+        "antenna_port_modes",
+        "antenna_field_solve_stages",
+        "antenna_target_projections",
+        "solved_antenna_drives",
+        "antenna_spectrum_requests",
+    ):
+        if collection in scene:
+            value = scene[collection]
+            if not isinstance(value, list):
+                raise ValueError(f"{collection} must be a list when present")
+            builder[collection] = copy.deepcopy(value)
     return builder
 
 
@@ -2290,6 +2441,12 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
     _copy_present_collection(builder, overrides, "spin_torques")
     _copy_present_collection(builder, overrides, "spin_transports")
     _copy_present_collection(builder, overrides, "oersted_terms")
+    _copy_present_collection(builder, overrides, "field_drives")
+    _copy_present_collection(builder, overrides, "antenna_port_modes")
+    _copy_present_collection(builder, overrides, "antenna_field_solve_stages")
+    _copy_present_collection(builder, overrides, "antenna_target_projections")
+    _copy_present_collection(builder, overrides, "solved_antenna_drives")
+    _copy_present_collection(builder, overrides, "antenna_spectrum_requests")
     if "fdm" in builder:
         fdm = copy.deepcopy(builder.get("fdm"))
         if isinstance(fdm, dict):
@@ -2316,6 +2473,7 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
                     }
         overrides["fdm"] = fdm
     overrides.update(_execution_profile_fields(builder, "SceneDocument.study"))
+    overrides.update(_compute_resources_fields(builder, "SceneDocument.study"))
     return overrides
 
 

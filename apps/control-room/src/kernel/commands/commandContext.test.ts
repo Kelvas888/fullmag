@@ -11,8 +11,10 @@ describe("createCommandContext session ownership", () => {
       getScopeKey: () => scope,
       subscribe: () => () => {},
     });
-    const kernel = { commands } as never;
+    const objectEditSession = {};
+    const kernel = { commands, objectEditSession } as never;
     const context = createCommandContext("ribbon", kernel);
+    expect(context.objectEditSession).toBe(objectEditSession);
     expect(context.isCurrentSessionScope?.()).toBe(true);
     scope = "session=b&epoch=2";
     expect(context.sessionScopeKey).toBe("session=a&epoch=1");

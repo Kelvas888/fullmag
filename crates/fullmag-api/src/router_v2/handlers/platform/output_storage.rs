@@ -48,7 +48,7 @@ pub async fn put_output_storage_defaults(
     Ok((StatusCode::OK, Json(resource(saved))))
 }
 
-fn load_defaults() -> Result<OutputStorageDefaultsRequest, ApiError> {
+pub(crate) fn load_defaults() -> Result<OutputStorageDefaultsRequest, ApiError> {
     let (workspace, outcome) = Workspace::open_default().map_err(|error| {
         ApiError::internal(format!("failed to open workspace defaults: {error}"))
     })?;

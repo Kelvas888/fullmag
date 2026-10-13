@@ -455,7 +455,7 @@ part does not promote the others.
 | variable-width 3D microstrip/CPW layout | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Current constant-width antenna structs and box preview do not encode ordered width/gap stations or explicit return conductors. |
 | `StudyIR::AntennaFieldSolve(model="quasistatic_conduction_biot_savart_3d")` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Initial target is native FEM CPU/MFEM H1 conduction plus adaptive 3D Biot-Savart. Current `mqs_2p5d_az` is an infinite-strip approximation and does not satisfy this row. |
 | `SolvedAntennaDrive` consumption | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Each lane is promoted independently after artifact compatibility, stale rejection, waveform, `H_ant`, and LLG parity gates pass. |
-| source `W_H(k)` | `semantic_only` | `semantic_only` | `semantic_only` | `semantic_only` | `SpinWaveExcitationAnalysis(method="source_k_profile")` authoring exists, but the resource-backed vector spectrum is not executable. |
+| source `W_H(k)` | `semantic_only` | `semantic_only` | `reference_executable` | `semantic_only` | Referencyjny runner FEM CPU wykonuje `source_k_profile` na zweryfikowanym, niezmiennym `antenna_field_solution.v1` i publikuje `antenna_source_spectrum_artifact.v2` jako cienki manifest oraz cztery hashowane payloady `float64_le`. Nie jest to odpowiedź magnetyzacji. Producent GPU/FDM, świeżość zasobu w API i browser E2E pozostają niezakwalifikowane; `transverse` bez zweryfikowanego equilibrium oraz `mode_basis_ref` są fail-closed. |
 | local `W_H(u,k)` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Requires the new variable-width layout and windowed local-spectrum analysis contract. |
 | Gamma time-domain response from `RegionalFieldDrive` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Promotion requires equilibrium transfer, exact cadence, `H_drive` RHS/readback identity, RK-time convergence, linear-response, mesh, and lane-parity gates from physics note 0920. |
 | finite-k response `S_m(k,omega)` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | Requires localized regional drive, open propagation supercell, absorber proof, uniform physical probe operator, and an artifact-backed response. It must not be inferred from source spectrum or a nonuniform FEM node FFT. |
@@ -770,3 +770,23 @@ możliwościach docelowej architektury. Wymuszony backend/device nie ma silent
 fallbacku, a brak primary carriera jest typed unsupported. Task 0 jest
 wyłącznie kontraktem źródłowym/dokumentacyjnym i nie promuje żadnej z czterech
 capability.
+
+### FDM: admission anizotropii materiałowej bez globalnych energii
+
+Poprawka `crates/fullmag-plan/src/fdm.rs::has_referenced_material_anisotropy`
+uzupełnia warunek obecności fizyki w single-grid i multilayer FDM o istniejącą
+realizację skalarnej anizotropii materiałowej. Uwzględnia wyłącznie materiały
+przypisane do magnesów, skończone i niezerowe współczynniki oraz poprawne osie.
+Uniaxial wymaga jawnego Ku1; Ku2 bez Ku1 nie uzyskuje nowej wykonywalności.
+Brak osi zachowuje domyślne Z dla uniaxial i X/Y dla cubic. Nie zmienia to
+definicji energii, żądanego backendu/device, precision ani polityki fallbacku.
+Kontrakty fizyczne: `docs/physics/0402-uniaxial-anisotropy.md` oraz
+`docs/physics/0403-cubic-anisotropy.md`.
+
+Zakres dowodów tej poprawki opisuje
+`docs/plans/active/refactor_runtime/final/p8/53bf-fdm-material-anisotropy-admission.md`:
+managed build, dziesięć produkcyjnych przypadków plannera i single-grid CPU Grid
+PASS. Rust regression source nie były kompilowane. Multilayer/GPU runtime
+i końcowe Compute po restore pozostają NOT VERIFIED.
+Nie promuje to FDM CPU/GPU ani FEM CPU/GPU do `validated`; kwalifikacja
+naukowa i pozostałe bramki lane'ów zachowują dotychczasowy status.

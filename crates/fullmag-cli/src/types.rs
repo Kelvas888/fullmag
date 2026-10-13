@@ -211,6 +211,8 @@ pub(crate) struct EngineLogEntry {
     pub timestamp_unix_ms: u128,
     pub level: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -528,6 +530,8 @@ pub(crate) struct CurrentLiveStageExecutionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antenna_solve_stage_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -542,6 +546,9 @@ pub(crate) struct CurrentLiveStageExecutionRecord {
     pub started_at_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_step: Option<u64>,
+    /// Last solver step observed for this stage, in the run's step coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_step: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_time_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -284,6 +284,46 @@ export type FrequencyDomainFmrPeaksArtifactPayload =
 export type FrequencyDomainTextArtifactResource =
   components["schemas"]["FrequencyDomainTextArtifactResource"];
 export type ArtifactResource = components["schemas"]["ArtifactResource"];
+export type AntennaFieldSolutionResource =
+  components["schemas"]["AntennaFieldSolutionResource"];
+export type AntennaFieldPayloadKind =
+  | "conductor_positions"
+  | "sample_positions"
+  | "sample_topology"
+  | "electric_potential_per_ampere"
+  | "current_density_per_ampere"
+  | "magnetic_field_per_ampere";
+export type AntennaStageOutputCatalogResource =
+  components["schemas"]["AntennaStageOutputCatalogResource"];
+export type AntennaExternalLeadInspectionResource =
+  components["schemas"]["AntennaExternalLeadInspectionResource"];
+export type AntennaInspectionDisplayResource =
+  components["schemas"]["AntennaInspectionDisplayResource"];
+export type AntennaInspectionCurrentPayloadKind =
+  | "current_center_positions"
+  | "current_center_density"
+  | "current_trace_positions"
+  | "current_trace_density"
+  | "current_snapshot";
+export type AntennaInspectionPayloadKind =
+  | AntennaInspectionCurrentPayloadKind
+  | "bundle"
+  | "sample_positions"
+  | "magnetic_field"
+  | "device_vertex_ids"
+  | "device_potential"
+  | "device_positions"
+  | "device_topology";
+export type AntennaInspectionManifestPayloadKind = Exclude<
+  AntennaInspectionPayloadKind, "device_positions" | "device_topology" | AntennaInspectionCurrentPayloadKind
+>;
+export type AntennaSourceSpectrumResource =
+  components["schemas"]["AntennaSourceSpectrumResource"];
+export type AntennaSpectrumPayloadKind =
+  | "k_u_rad_per_m"
+  | "k_v_rad_per_m"
+  | "amplitudes_re_im"
+  | "power";
 export type FrequencyDomainKPathMetadataResource =
   components["schemas"]["FrequencyDomainKPathMetadataResource"];
 export type FrequencyDomainKPathSamplingResource =
@@ -871,6 +911,15 @@ export type ProjectRunMaterializationResource =
 export type ProjectRunResource = components["schemas"]["ProjectRunResource"];
 export type ProjectRunListQuery = components["schemas"]["ProjectRunListQuery"];
 export type ProjectRunListResource = components["schemas"]["ProjectRunListResource"];
+export type ProjectBatchSubmitRequest = components["schemas"]["ProjectBatchSubmitRequest"];
+export type ProjectBatchSubmitResource = components["schemas"]["ProjectBatchSubmitResource"];
+export type ProjectBatchListQuery = components["schemas"]["ProjectBatchListQuery"];
+export type ProjectBatchListResource = components["schemas"]["ProjectBatchListResource"];
+export type ProjectBatchSummaryResource = components["schemas"]["ProjectBatchSummaryResource"];
+export type ProjectBatchAxisSummaryResource = components["schemas"]["ProjectBatchAxisSummaryResource"];
+export type ProjectBatchCasesQuery = components["schemas"]["ProjectBatchCasesQuery"];
+export type ProjectBatchCasesResource = components["schemas"]["ProjectBatchCasesResource"];
+export type ProjectBatchCaseSummaryResource = components["schemas"]["ProjectBatchCaseSummaryResource"];
 export type ProjectRunTaskCancellationRequest =
   components["schemas"]["ProjectRunTaskCancellationRequest"];
 export type ProjectRunTaskCancellationResource =
@@ -1047,7 +1096,7 @@ export type BinaryResourceResult<TData, TMetadata = unknown> =
 
 export interface RequestOptions {
   /**
-   * Canonical session=<encoded-id>&epoch=<encoded-epoch> identity used for
+   * Canonical session, scientific epoch and request_scope_epoch identity used for
    * coalescing and the x-fullmag-session-scope HTTP precondition header.
    * It is never serialized into URLs.
    */

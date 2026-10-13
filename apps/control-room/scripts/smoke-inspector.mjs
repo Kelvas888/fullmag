@@ -1,5 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
+import { PerspectiveCamera, Vector3 } from "three";
 import { resolve } from "node:path";
+import { installInspectorCommitTrace } from "./lib/inspector-commit-trace.mjs";
 
 import {
   createInspectorRequestBudgetState,
@@ -233,8 +235,16 @@ if (!playwright?.chromium) {
 }
 
 await mkdir(outputDir, { recursive: true });
-const browser = await playwright.chromium.launch({ headless: true });
+const browser = await playwright.chromium.launch({
+  headless: true,
+  ...(process.env.CONTROL_ROOM_INSPECTOR_BROWSER_CHANNEL
+    ? { channel: process.env.CONTROL_ROOM_INSPECTOR_BROWSER_CHANNEL }
+    : {}),
+});
 const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
+if (process.env.CONTROL_ROOM_INSPECTOR_COMMIT_TRACE === "1") {
+  await installInspectorCommitTrace(page);
+}
 const consoleErrors = [];
 const consoleErrorEvents = [];
 const notFoundResponses = [];
@@ -394,6 +404,23 @@ try {
     );
   }
   const screenshotFiles = [];
+  const simulationMethod = page.getByLabel("Simulation method", { exact: true });
+  await simulationMethod.waitFor({ state: "visible", timeout: 30_000 });
+  await page.waitForFunction(() =>
+    document.querySelector('[aria-label="Simulation method"]')?.getAttribute("data-method") === "fem",
+  );
+  assert((await simulationMethod.innerText()).trim() === "FEM", "The bottom-right method indicator must identify the FEM session.");
+  const methodScreenshot = "simulation-method-status-bar.png";
+  await page.locator(".fm-status-bar").screenshot({ path: resolve(outputDir, methodScreenshot) });
+  screenshotFiles.push(methodScreenshot);
+  await writeFile(resolve(outputDir, "simulation-method-status-bar-proof.json"), JSON.stringify({
+    schema: "fullmag_simulation_method_browser_proof_v1",
+    method: await simulationMethod.getAttribute("data-method"),
+    visibleLabel: await simulationMethod.innerText(),
+    qualification: "production_status_bar_with_mock_api_legacy_fem_status",
+    real_backend_verified: false,
+  }, null, 2));
+  await qualifyFirstRunGuideRouting(page, inspector, screenshotFiles, fixture);
   await qualifyExplorerKeyboardNavigation(page);
   await qualifyInspectorRoutingMatrix(page, inspector, screenshotFiles, fixture);
   const resonanceLeafRoutingProof = await qualifyInspectorResonanceLeafRouting(
@@ -403,6 +430,12 @@ try {
   );
   screenshotFiles.push(...resonanceLeafRoutingProof.screenshots);
   await qualifyMagneticTextureMutationStability(page, inspector, fixture);
+  const objectMoveProof = await qualifyObjectMoveGestureAndSharedApply(
+    page,
+    inspector,
+    fixture,
+    screenshotFiles,
+  );
 
   await ensureModelNodeVisible(page, "model:object:film:visualization");
   const visualizationNode = page.locator(
@@ -511,7 +544,7 @@ try {
     name: "Toggle target visibility",
     exact: true,
   });
-  const resetButton = panel.getByRole("button", { name: "Reset", exact: true });
+  const resetButton = panel.getByRole("button", { name: "Reset display", exact: true });
   const initialVisible = (await visibleToggle.getAttribute("aria-pressed")) === "true";
   if (!initialVisible) {
     await visibleToggle.click();
@@ -913,12 +946,12 @@ try {
     const originalSizeFactor = await sizeFactor.inputValue();
     await sizeFactor.fill(originalSizeFactor === "1" ? "1.01" : "1");
     assert(
-      !(await inspector.getByRole("button", { name: "Apply", exact: true }).isDisabled()),
+      !(await inspector.locator(".fm-inspector__action-bar").getByRole("button", { name: "Apply", exact: true }).isDisabled()),
       "A valid object-mesh draft did not enable Apply.",
     );
     assert(
-      !(await inspector.getByRole("button", { name: "Reset", exact: true }).isDisabled()),
-      "A dirty object-mesh draft did not enable Reset.",
+      !(await inspector.getByRole("button", { name: "Revert", exact: true }).isDisabled()),
+      "A dirty object-mesh draft did not enable Revert.",
     );
 
     await geometryNode.click();
@@ -998,11 +1031,21 @@ try {
     assert(webgl && !webgl.lost && webgl.width > 0 && webgl.height > 0, "Viewport WebGL is not healthy.");
   }
 
+  objectMoveProof.objectAndAirboxStability =
+    "The existing Object and Airbox visualization mutation checks also passed in this smoke.";
+  objectMoveProof.reportFile = "object-move-gesture-proof.json";
+  await writeFile(
+    resolve(outputDir, objectMoveProof.reportFile),
+    JSON.stringify(objectMoveProof, null, 2) + "\n",
+    "utf8",
+  );
+
   console.log(
     JSON.stringify(
       {
         consoleErrors: consoleErrors.length,
         optionalResponseAbsenceProof,
+        objectMoveGesture: objectMoveProof,
         dirtySelectionGuard: "verified",
         inspectorPanelToggle: "verified; header icon and ribbon restore",
         previewRequests: previewRequests.length,
@@ -1146,6 +1189,522 @@ async function qualifyVisualizationMutationStability(page, inspector, fixture) {
   }
 }
 
+async function qualifyObjectMoveGestureAndSharedApply(page, inspector, fixture, screenshotFiles) {
+  const fixtureSnapshot = structuredClone({
+    manifest: fixture.manifest,
+    revision: fixture.revision,
+    scene: fixture.scene,
+    visualization: fixture.visualization,
+  });
+  const object = fixture.scene.objects.find((candidate) => candidate.id === "film");
+  assert(object, "The move fixture requires the canonical Film object.");
+  const originalTransform = structuredClone(object.transform);
+  const geometrySize = object.geometry?.geometry_params?.size;
+  assert(
+    Array.isArray(geometrySize) &&
+      geometrySize.length === 3 &&
+      geometrySize.every((value) => Number.isFinite(value) && value > 0),
+    "The move fixture requires a finite Box geometry size.",
+  );
+  const axisLength = Math.max(Math.max(...geometrySize) * 0.7, 1e-12);
+  const requestStart = fixture.requests.length;
+  fixture.requestCounts.clear();
+  fixture.geometryMutationBodies.length = 0;
+  fixture.geometryPatchPending = false;
+  fixture.geometryPatchDelayMs = 0;
+
+  await selectInspectorNode(page, inspector, "model:object:film", {
+    owner: "object-general",
+    label: "Film",
+  });
+  await page.getByRole("tab", { name: "Geometry", exact: true }).click();
+  await inspector.getByRole("button", { name: "Fit view", exact: true }).click();
+  await page.waitForFunction((maximumDistance) => {
+    const viewport = document.querySelector(".fm-viewport-3d");
+    const position = viewport?.getAttribute("data-camera-position")?.trim().split(/\s+/).map(Number);
+    const target = viewport?.getAttribute("data-camera-target")?.trim().split(/\s+/).map(Number);
+    if (position?.length !== 3 || target?.length !== 3) return false;
+    const distance = Math.hypot(...position.map((value, index) => value - target[index]));
+    return Number.isFinite(distance) && distance > 0 && distance < maximumDistance;
+  }, axisLength * 100, { timeout: 10_000 });
+  const moveAction = page.locator('button[data-action-id="builder-tool-move"]');
+  await moveAction.waitFor({ state: "visible", timeout: 60_000 });
+  await moveAction.click();
+  await page
+    .locator('button[data-action-id="builder-tool-move"][data-active="true"]')
+    .waitFor({ state: "visible", timeout: 10_000 });
+
+  const webglBefore = await assertHealthyViewportCanvas(page, "Object move before drag");
+  const initialDiagnostics = await readViewportProjectionDiagnostics(page);
+  const renderedObjectIds = initialDiagnostics.primitiveObjectIds
+    .split(/[\s,]+/)
+    .filter(Boolean);
+  assert(
+    renderedObjectIds.includes("film"),
+    "The live viewport diagnostics do not show the Film primitive.",
+  );
+
+  const panel = inspector.locator(".fm-inspector-panel").first();
+  await panel.waitFor({ state: "visible" });
+  const panelMarker = "object-move-shared-apply-stability";
+  await panel.evaluate((element, marker) => {
+    element.dataset.objectMoveStabilityMarker = marker;
+  }, panelMarker);
+  const panelBaseline = await panel.evaluate((element) => {
+    const scroller = element.closest(".fm-inspector");
+    return {
+      opacity: getComputedStyle(element).opacity,
+      opacityAnimations: element
+        .getAnimations({ subtree: true })
+        .filter((animation) => {
+          const frames = animation.effect?.getKeyframes?.() ?? [];
+          return frames.some((frame) => Object.hasOwn(frame, "opacity"));
+        }).length,
+      scrollTop: scroller?.scrollTop ?? 0,
+    };
+  });
+
+  const pointerStatsKey = "__FULLMAG_OBJECT_MOVE_R1_POINTER_STATS__";
+  const canvas = page.locator(".fm-viewport-3d canvas").first();
+  await canvas.evaluate((node, statsKey) => {
+    const stats = { nativePointerDowns: 0 };
+    // Observe before the production canvas capture handler stops Orbit input.
+    // Count only trusted native left-button events targeting this actual canvas.
+    document.addEventListener("pointerdown", (event) => {
+      if (event.target === node && event.isTrusted && event.button === 0) {
+        stats.nativePointerDowns += 1;
+      }
+    }, true);
+    Object.defineProperty(window, statsKey, {
+      configurable: true,
+      value: stats,
+    });
+  }, pointerStatsKey);
+
+  const startWorld = [...originalTransform.translation];
+  const endWorld = [...originalTransform.translation];
+  // The inner half overlaps the primitive, whose pointer handler stops propagation.
+  // Hit the exposed outer shaft with native input, then drag from the captured handle.
+  startWorld[0] += axisLength * 0.9;
+  // Use a longer native drag so the readiness header cannot reduce the
+  // projected movement below the unchanged production 3 px threshold.
+  endWorld[0] += axisLength * 1.5;
+  const startPoint = projectViewportWorldPoint(initialDiagnostics, startWorld);
+  const endPoint = projectViewportWorldPoint(initialDiagnostics, endWorld);
+  assertProjectedPointInCanvas(initialDiagnostics, startPoint, "X-axis drag start");
+  assertProjectedPointInCanvas(initialDiagnostics, endPoint, "X-axis drag end");
+  assert(
+    Math.hypot(endPoint.x - startPoint.x, endPoint.y - startPoint.y) > 3,
+    "The framed native move must exceed the production drag threshold in CSS pixels.",
+  );
+
+  const pointerUpRequestStart = fixture.requests.length;
+  await page.mouse.move(startPoint.x, startPoint.y);
+  await page.mouse.down();
+  await page.mouse.move(endPoint.x, endPoint.y, { steps: 8 });
+  await page.mouse.up();
+
+  const stagedBanner = inspector.getByText(
+    "Uncommitted object changes are pending. Use Apply or Revert to commit or discard them.",
+    { exact: true },
+  );
+  try {
+    await stagedBanner.waitFor({ state: "visible", timeout: 10_000 });
+  } catch (error) {
+    await page.screenshot({ path: resolve(outputDir, "object-move-staging-failure.png") });
+    await writeFile(resolve(outputDir, "object-move-staging-failure.json"), JSON.stringify({
+      apiBackend: "mocked v2 fixture",
+      initialDiagnostics, startWorld, endWorld, startPoint, endPoint,
+      afterDrag: await readViewportProjectionDiagnostics(page),
+      pointerStats: await readMovePointerStats(page, pointerStatsKey),
+      inspectorText: await inspector.innerText(),
+      modelWrites: sessionModelWriteRequests(fixture.requests.slice(pointerUpRequestStart)),
+    }, null, 2) + "\n");
+    throw error;
+  }
+  const applyButton = inspector.locator(".fm-inspector__action-bar").getByRole("button", { name: "Apply", exact: true });
+  assert(
+    await applyButton.isEnabled(),
+    "A real viewport drag did not stage an Inspector draft for the shared Apply action.",
+  );
+  const pointerStatsAfterDrag = await readMovePointerStats(page, pointerStatsKey);
+  assert(
+    pointerStatsAfterDrag.nativePointerDowns === 1,
+    "The initial move did not dispatch one native pointerdown to the production canvas.",
+  );
+
+  await waitForInspectorRequestQuiet(page, fixture);
+  const pointerUpModelWrites = sessionModelWriteRequests(
+    fixture.requests.slice(pointerUpRequestStart),
+  );
+  assert(
+    pointerUpModelWrites.length === 0 &&
+      fixture.geometryMutationBodies.length === 0 &&
+      fixture.revision === fixtureSnapshot.revision,
+    "Move pointerup wrote to the model before the shared Apply action.",
+  );
+  const stagedDiagnostics = await readViewportProjectionDiagnostics(page);
+  assertCameraPoseStable(initialDiagnostics, stagedDiagnostics, "after local pointerup");
+
+  const stagedScreenshot = "object-move-gesture-staged.png";
+  await page.screenshot({ path: resolve(outputDir, stagedScreenshot) });
+  screenshotFiles.push(stagedScreenshot);
+
+  fixture.geometryPatchDelayMs = 2_200;
+  const applyRequestStart = fixture.requests.length;
+  await applyButton.click();
+  await waitForFixtureCondition(
+    () => fixture.geometryPatchPending && fixture.geometryMutationBodies.length === 1,
+    "The shared Apply did not start one pending object-geometry transaction.",
+  );
+  assert(
+    await applyButton.isDisabled(),
+    "Apply should remain pending while the fixture delays its transaction acknowledgement.",
+  );
+
+  const submittedBody = structuredClone(fixture.geometryMutationBodies.at(-1));
+  const submittedTranslation = submittedBody?.transform?.translation;
+  assert(
+    Array.isArray(submittedTranslation) && submittedTranslation.length === 3,
+    "The pending geometry transaction has no complete translation.",
+  );
+  const pendingDiagnostics = await readViewportProjectionDiagnostics(page);
+  const pendingAxisCenterWorld = [
+    submittedTranslation[0] + axisLength * 0.9,
+    submittedTranslation[1],
+    submittedTranslation[2],
+  ];
+  const pendingAttemptEndWorld = [
+    pendingAxisCenterWorld[0] + axisLength * 0.2,
+    pendingAxisCenterWorld[1],
+    pendingAxisCenterWorld[2],
+  ];
+  const pendingStartPoint = projectViewportWorldPoint(
+    pendingDiagnostics,
+    pendingAxisCenterWorld,
+  );
+  const pendingEndPoint = projectViewportWorldPoint(
+    pendingDiagnostics,
+    pendingAttemptEndWorld,
+  );
+  assertProjectedPointInCanvas(pendingDiagnostics, pendingStartPoint, "pending X-axis drag start");
+  assertProjectedPointInCanvas(pendingDiagnostics, pendingEndPoint, "pending X-axis drag end");
+
+  const pendingCanvasBefore = "object-move-pending-apply-before-gesture.png";
+  const pendingCanvasDuring = "object-move-pending-apply-during-gesture.png";
+  await page.mouse.move(pendingEndPoint.x, pendingEndPoint.y);
+  await page.waitForTimeout(60);
+  const pendingCanvasBeforeBytes = await canvas.screenshot({
+    path: resolve(outputDir, pendingCanvasBefore),
+  });
+  screenshotFiles.push(pendingCanvasBefore);
+
+  await page.mouse.move(pendingStartPoint.x, pendingStartPoint.y);
+  await page.mouse.down();
+  await page.mouse.move(pendingEndPoint.x, pendingEndPoint.y, { steps: 5 });
+  await page.waitForTimeout(80);
+  const pendingCanvasDuringBytes = await canvas.screenshot({
+    path: resolve(outputDir, pendingCanvasDuring),
+  });
+  screenshotFiles.push(pendingCanvasDuring);
+  await page.mouse.up();
+
+  assert(
+    Buffer.compare(pendingCanvasBeforeBytes, pendingCanvasDuringBytes) === 0,
+    "A canvas drag during pending Apply changed the production viewport preview.",
+  );
+  const pointerStatsAfterPendingAttempt = await readMovePointerStats(page, pointerStatsKey);
+  assert(
+    pointerStatsAfterPendingAttempt.nativePointerDowns ===
+      pointerStatsAfterDrag.nativePointerDowns + 1,
+    "The pending-Apply attempt did not dispatch a real pointerdown to the production canvas.",
+  );
+  assert(
+    fixture.geometryMutationBodies.length === 1 &&
+      sessionModelWriteRequests(fixture.requests.slice(applyRequestStart)).length === 1,
+    "A gesture during pending Apply produced an additional model write.",
+  );
+
+  const pendingScreenshot = "object-move-pending-apply.png";
+  await page.screenshot({ path: resolve(outputDir, pendingScreenshot) });
+  screenshotFiles.push(pendingScreenshot);
+
+  await page.waitForFunction(
+    () => document.querySelector(".fm-inspector-panel")?.textContent?.includes("Object placement committed"),
+    undefined,
+    { timeout: 10_000 },
+  );
+  fixture.geometryPatchDelayMs = 0;
+
+  const geometryBodies = fixture.geometryMutationBodies;
+  const modelWritesAfterApply = sessionModelWriteRequests(
+    fixture.requests.slice(requestStart),
+  );
+  assert(
+    geometryBodies.length === 1 &&
+      modelWritesAfterApply.length === 1 &&
+      modelWritesAfterApply[0] === "POST /v2/sessions/current/model/transactions",
+    "Shared Apply must send exactly one model transaction: " +
+      JSON.stringify({ geometryBodies: geometryBodies.length, modelWritesAfterApply }),
+  );
+  const body = geometryBodies[0];
+  const currentObject = fixture.scene.objects.find((candidate) => candidate.id === "film");
+  assert(
+    body.kind === "patch_object_geometry" &&
+      body.object_id === "film" &&
+      body.base_revision === fixtureSnapshot.revision,
+    "Shared Apply did not submit patch_object_geometry for Film at the captured base revision.",
+  );
+  assert(
+    body.geometry?.geometry_kind === object.geometry.geometry_kind &&
+      JSON.stringify(body.geometry?.geometry_params) ===
+        JSON.stringify(object.geometry.geometry_params),
+    "A move gesture unexpectedly changed the object's canonical geometry.",
+  );
+  const transformArrays = {
+    pivot: body.transform?.pivot,
+    rotation_quat: body.transform?.rotation_quat,
+    scale: body.transform?.scale,
+    translation: body.transform?.translation,
+  };
+  const expectedTransformLengths = {
+    pivot: 3,
+    rotation_quat: 4,
+    scale: 3,
+    translation: 3,
+  };
+  for (const [field, length] of Object.entries(expectedTransformLengths)) {
+    const values = transformArrays[field];
+    assert(
+      Array.isArray(values) &&
+        values.length === length &&
+        values.every(Number.isFinite),
+      "Shared Apply omitted finite full-transform field " + field + ".",
+    );
+  }
+  assert(
+    Math.abs(body.transform.translation[0] - originalTransform.translation[0]) > 1e-12 &&
+      body.transform.translation[1] === originalTransform.translation[1] &&
+      body.transform.translation[2] === originalTransform.translation[2],
+    "The real X-axis drag did not update only the staged X translation.",
+  );
+  assert(
+    currentObject &&
+      JSON.stringify(currentObject.geometry) === JSON.stringify(body.geometry) &&
+      JSON.stringify(currentObject.transform) === JSON.stringify(body.transform) &&
+      fixture.scene.revision === fixtureSnapshot.revision + 1 &&
+      fixture.revision === fixtureSnapshot.revision + 1 &&
+      fixture.manifest.source_scene_revision === fixture.revision,
+    "The mock Apply acknowledgement did not echo one complete object update and revision.",
+  );
+  assert(
+    (await panel.getAttribute("data-object-move-stability-marker")) === panelMarker,
+    "The Object Inspector panel remounted during geometry Apply acknowledgement.",
+  );
+  const panelAfterApply = await panel.evaluate((element) => {
+    const scroller = element.closest(".fm-inspector");
+    return {
+      opacity: getComputedStyle(element).opacity,
+      opacityAnimations: element
+        .getAnimations({ subtree: true })
+        .filter((animation) => {
+          const frames = animation.effect?.getKeyframes?.() ?? [];
+          return frames.some((frame) => Object.hasOwn(frame, "opacity"));
+        }).length,
+      scrollTop: scroller?.scrollTop ?? 0,
+    };
+  });
+  assert(
+    panelAfterApply.opacity === panelBaseline.opacity &&
+      panelAfterApply.opacityAnimations === 0 &&
+      Math.abs(panelAfterApply.scrollTop - panelBaseline.scrollTop) <= 1,
+    "Object geometry acknowledgement changed Inspector opacity, animated opacity, or scroll position.",
+  );
+  assert(
+    await applyButton.isDisabled(),
+    "The acknowledged placement should leave the shared Apply action clean.",
+  );
+  const webglAfter = await assertHealthyViewportCanvas(page, "Object move after Apply");
+  const appliedScreenshot = "object-move-gesture-applied.png";
+  await page.screenshot({ path: resolve(outputDir, appliedScreenshot) });
+  screenshotFiles.push(appliedScreenshot);
+
+  const proof = {
+    apiBackend: "intercepted v2 fixture; mocked API only",
+    realBackendQualification: false,
+    path: "Playwright mouse input on the production .fm-viewport-3d canvas and MoveObjectGizmo",
+    viewportDiagnostics: {
+      cameraPosition: initialDiagnostics.cameraPosition,
+      cameraProjection: initialDiagnostics.cameraProjection,
+      cameraTarget: initialDiagnostics.cameraTarget,
+      cameraUp: initialDiagnostics.cameraUp,
+      canvasRectCssPixels: initialDiagnostics.canvasRect,
+      perspectiveFovDegrees: 42,
+      viewportBounds: initialDiagnostics.viewportBounds,
+      primitiveObjectIds: renderedObjectIds,
+      xAxisStartCssPixels: startPoint,
+      xAxisEndCssPixels: endPoint,
+    },
+    webgl: {
+      before: webglBefore,
+      after: webglAfter,
+    },
+    pointerUp: {
+      nativeCanvasPointerDowns: pointerStatsAfterDrag.nativePointerDowns,
+      modelWrites: pointerUpModelWrites,
+      stagedInspectorBanner: true,
+      sharedApplyEnabled: true,
+    },
+    pendingApplyGesture: {
+      nativeCanvasPointerDowns: pointerStatsAfterPendingAttempt.nativePointerDowns,
+      canvasPreviewUnchanged: true,
+      additionalModelWrites: 0,
+      pendingAxisStartCssPixels: pendingStartPoint,
+      pendingAxisEndCssPixels: pendingEndPoint,
+    },
+    sharedApply: {
+      transactionCount: geometryBodies.length,
+      transactionKind: body.kind,
+      objectId: body.object_id,
+      baseRevision: body.base_revision,
+      committedRevision: fixture.revision,
+      geometryKind: body.geometry.geometry_kind,
+      transformFields: Object.keys(transformArrays),
+      translation: body.transform.translation,
+      inspectorPanelStable: true,
+      objectAndAirboxStability: "covered by the existing Object and Airbox mutation regression in this smoke",
+    },
+    screenshots: [
+      stagedScreenshot,
+      pendingCanvasBefore,
+      pendingCanvasDuring,
+      pendingScreenshot,
+      appliedScreenshot,
+    ],
+    reportFile: "object-move-gesture-proof.json",
+  };
+
+  fixture.manifest = fixtureSnapshot.manifest;
+  fixture.revision = fixtureSnapshot.revision;
+  fixture.scene = fixtureSnapshot.scene;
+  fixture.visualization = fixtureSnapshot.visualization;
+  fixture.geometryPatchPending = false;
+  fixture.geometryPatchDelayMs = 0;
+  fixture.geometryMutationBodies.length = 0;
+  fixture.requestCounts.clear();
+  await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
+  await inspector.waitFor({ state: "visible", timeout: 30_000 });
+  return proof;
+}
+
+function sessionModelWriteRequests(entries) {
+  return entries.filter((entry) =>
+    /^(?:POST|PATCH|PUT|DELETE) \/v2\/sessions\/current\/model(?:\/|$)/.test(entry),
+  );
+}
+
+async function waitForFixtureCondition(predicate, message, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+  }
+  throw new Error(message);
+}
+
+async function readMovePointerStats(page, statsKey) {
+  return page.evaluate((key) => {
+    return { ...window[key] };
+  }, statsKey);
+}
+
+async function readViewportProjectionDiagnostics(page) {
+  const viewport = page.locator(".fm-viewport-3d");
+  await viewport.waitFor({ state: "visible", timeout: 60_000 });
+  const diagnostics = await viewport.evaluate((section) => {
+    const canvas = section.querySelector("canvas");
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      cameraPosition: section.getAttribute("data-camera-position"),
+      cameraProjection: section.getAttribute("data-camera-projection"),
+      cameraTarget: section.getAttribute("data-camera-target"),
+      cameraUp: section.getAttribute("data-camera-up"),
+      primitiveObjectIds: section.getAttribute("data-primitive-object-ids") ?? "",
+      viewportBounds: section.getAttribute("data-viewport-bounds") ?? "",
+      canvasRect: {
+        bottom: rect.bottom,
+        height: rect.height,
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        width: rect.width,
+      },
+    };
+  });
+  assert(diagnostics, "The production viewport did not expose its canvas and projection diagnostics.");
+  assert(
+    diagnostics.cameraProjection === "perspective",
+    "The deterministic Inspector fixture requires the production perspective camera.",
+  );
+  return {
+    ...diagnostics,
+    cameraPosition: parseViewportVector(diagnostics.cameraPosition, "camera position"),
+    cameraTarget: parseViewportVector(diagnostics.cameraTarget, "camera target"),
+    cameraUp: parseViewportVector(diagnostics.cameraUp, "camera up"),
+  };
+}
+
+function parseViewportVector(value, label) {
+  const vector = String(value ?? "")
+    .trim()
+    .split(/\s+/)
+    .map(Number);
+  assert(
+    vector.length === 3 && vector.every(Number.isFinite),
+    "Invalid " + label + " viewport diagnostic: " + String(value),
+  );
+  return vector;
+}
+
+function projectViewportWorldPoint(diagnostics, point) {
+  const rect = diagnostics.canvasRect;
+  const camera = new PerspectiveCamera(42, rect.width / rect.height, 0.1, 1000);
+  camera.position.fromArray(diagnostics.cameraPosition);
+  camera.up.fromArray(diagnostics.cameraUp);
+  camera.lookAt(new Vector3(...diagnostics.cameraTarget));
+  camera.updateProjectionMatrix();
+  camera.updateMatrixWorld(true);
+  const projected = new Vector3(...point).project(camera);
+  return {
+    x: rect.left + ((projected.x + 1) * rect.width) / 2,
+    y: rect.top + ((1 - projected.y) * rect.height) / 2,
+  };
+}
+
+function assertProjectedPointInCanvas(diagnostics, point, label) {
+  const rect = diagnostics.canvasRect;
+  assert(
+    point.x > rect.left + 1 &&
+      point.x < rect.right - 1 &&
+      point.y > rect.top + 1 &&
+      point.y < rect.bottom - 1,
+    label + " is outside the live viewport canvas: " + JSON.stringify({ point, rect }),
+  );
+}
+
+function assertCameraPoseStable(before, after, label) {
+  const fields = ["cameraPosition", "cameraTarget", "cameraUp"];
+  for (const field of fields) {
+    const first = before[field];
+    const second = after[field];
+    assert(
+      first.every((value, index) => Math.abs(value - second[index]) <= 1e-12),
+      "The production camera changed " + field + " " + label + ".",
+    );
+  }
+}
+
 async function qualifyMagneticTextureMutationStability(page, inspector, fixture) {
   const fixtureSnapshot = structuredClone({
     manifest: fixture.manifest,
@@ -1180,9 +1739,14 @@ async function qualifyMagneticTextureMutationStability(page, inspector, fixture)
     }
     return {
       opacity: getComputedStyle(element).opacity,
+      measuredAt: performance.now(),
       scrollTop: scroller?.scrollTop ?? 0,
     };
   }, identity);
+  await page.evaluate(() => {
+    const trace = window.__FULLMAG_INSPECTOR_COMMIT_TRACE__;
+    if (trace) { trace.commits = []; trace.dropped = 0; trace.errors = 0; }
+  });
   await page.waitForTimeout(1_100);
   const requestStart = fixture.requests.length;
   fixture.texturePatchDelayMs = 180;
@@ -1262,9 +1826,19 @@ async function qualifyMagneticTextureMutationStability(page, inspector, fixture)
       renderCount: performance
         .getEntriesByType("measure")
         .filter((entry) => entry.name.startsWith("fullmag.react.render.InspectorModule")).length,
+      renderMeasures: performance
+        .getEntriesByType("measure")
+        .filter((entry) => entry.name.startsWith("fullmag.react.render.InspectorModule"))
+        .slice(-32)
+        .map((entry) => ({ name: entry.name, startTime: entry.startTime, duration: entry.duration })),
+      measuredAt: performance.now(),
+      commitTrace: window.__FULLMAG_INSPECTOR_COMMIT_TRACE__ ?? null,
       scrollTop: scroller?.scrollTop ?? 0,
     };
   });
+  await writeFile(resolve(outputDir, "magnetic-texture-mutation-evidence.json"),
+    JSON.stringify({ baseline, duringMutation, evidence,
+      requests: fixture.requests.slice(requestStart, requestStart + 32) }, null, 2));
   assert(evidence.opacity === baseline.opacity && evidence.opacityAnimations === 0,
     "Magnetic Texture mutation changed Inspector opacity after ACK.");
   assert(Math.abs(evidence.scrollTop - baseline.scrollTop) <= 1,
@@ -1381,9 +1955,12 @@ async function qualifyPhysicsScopeExclusivity(page, inspector, fixture) {
     )
     .waitFor({ state: "visible", timeout: 5_000 });
   await page.waitForTimeout(200);
+  // A delayed viewport client ACK records display observation; it does not
+  // mutate authored physics. Keep every other mutation in this guard assertion.
   const guardRequests = fixture.requests
     .slice(requestStart)
-    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request));
+    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request) &&
+      request !== "POST /v2/sessions/current/visualization/client-acks");
   assert(
     guardRequests.length === 0,
     `Rotated DMI guard emitted a mutation: ${JSON.stringify(guardRequests)}.`,
@@ -1432,7 +2009,8 @@ async function qualifyPhysicsScopeExclusivity(page, inspector, fixture) {
   await page.waitForTimeout(200);
   const inverseRequests = fixture.requests
     .slice(inverseRequestStart)
-    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request));
+    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request) &&
+      request !== "POST /v2/sessions/current/visualization/client-acks");
   assert(
     inverseRequests.length === 0,
     `Object DMI inverse guard emitted a mutation: ${JSON.stringify(inverseRequests)}.`,
@@ -1453,7 +2031,7 @@ async function qualifyInspectorRoutingMatrix(page, inspector, screenshotFiles, f
     label: "Film",
   });
   await selectInspectorNode(page, inspector, "model:mesh:unassigned:orphan-part", {
-    owner: "mesh-part-visualization",
+    owner: "mesh-unassigned-part",
     label: "Orphan Mesh Part",
   });
 
@@ -2997,8 +3575,8 @@ async function selectInspectorNode(page, inspector, nodeId, { owner, label }) {
     `No placeholder Inspector may own ${label} selection: ${identityText}`,
   );
   assert(breadcrumbs.length > 0, `${label} selection has no breadcrumb identity.`);
-  const focus = inspector.getByRole("button", { name: "Focus", exact: true });
-  assert(await focus.isVisible(), `${label} selection has no visible primary Inspector action.`);
+  const fitView = inspector.getByRole("button", { name: "Fit view", exact: true });
+  assert(await fitView.isVisible(), `${label} selection has no visible Fit view action.`);
 }
 
 async function ensureModelNodeVisible(page, nodeId) {
@@ -3047,17 +3625,24 @@ async function expandInspectorNode(page, nodeId, fixtureState = fixture) {
     );
   }
   if ((await node.getAttribute("aria-expanded")) !== "false") return;
-  const branch = node.locator(".fm-explorer-tree-row__branch");
-  if (await branch.count()) {
-    await branch.click();
-  } else {
-    await node.dblclick();
+  // Expansion can change while model defaults/selection reveal settle. The
+  // keyboard contract expands a collapsed row without closing an open one.
+  await node.focus();
+  await node.press("ArrowRight");
+  try {
+    await page.waitForFunction(
+      (id) => document.querySelector(`[data-node-id="${id}"]`)?.getAttribute("aria-expanded") === "true",
+      nodeId,
+      { timeout: 60_000 },
+    );
+  } catch (error) {
+    const state = await node.evaluate((row) => ({
+      expanded: row.getAttribute("aria-expanded"),
+      focused: document.activeElement === row,
+      label: row.textContent?.trim(),
+    }));
+    throw new Error(`Explorer node ${nodeId} did not expand: ${JSON.stringify(state)}. ${error}`);
   }
-  await page.waitForFunction(
-    (id) => document.querySelector(`[data-node-id="${id}"]`)?.getAttribute("aria-expanded") === "true",
-    nodeId,
-    { timeout: 60_000 },
-  );
 }
 
 function recordInspectorSceneResponse(
@@ -3131,6 +3716,7 @@ async function assertHealthyViewportCanvas(page, label) {
     !state.isContextLost && state.drawingBufferWidth > 0 && state.drawingBufferHeight > 0,
     `${label}: viewport WebGL failed: ${JSON.stringify(state)}`,
   );
+  return state;
 }
 
 function createInspectorFixture() {
@@ -3261,6 +3847,9 @@ function createInspectorFixture() {
     scene,
     topology: inspectorTopologyBuffer(),
     texturePatchDelayMs: 0,
+    geometryPatchDelayMs: 0,
+    geometryPatchPending: false,
+    geometryMutationBodies: [],
     textureMutationBodies: [],
     physicsGuardEnabled: false,
     visualizationPatchDelayMs: 0,
@@ -3459,8 +4048,81 @@ async function installInspectorFixtureApi(page, fixture) {
     }
     if (path === "/v2/sessions/current/model/transactions" && request.method() === "POST") {
       const body = request.postDataJSON() ?? {};
+      if (body.kind === "patch_object_geometry") {
+        const objectMatches = fixture.scene.objects.filter(
+          (candidate) => candidate.id === body.object_id,
+        );
+        const transform = body.transform;
+        const geometry = body.geometry;
+        const validTransform = Boolean(
+          transform &&
+            Array.isArray(transform.pivot) &&
+            transform.pivot.length === 3 &&
+            transform.pivot.every(Number.isFinite) &&
+            Array.isArray(transform.rotation_quat) &&
+            transform.rotation_quat.length === 4 &&
+            transform.rotation_quat.every(Number.isFinite) &&
+            Array.isArray(transform.scale) &&
+            transform.scale.length === 3 &&
+            transform.scale.every(Number.isFinite) &&
+            Array.isArray(transform.translation) &&
+            transform.translation.length === 3 &&
+            transform.translation.every(Number.isFinite),
+        );
+        const validGeometry = Boolean(
+          geometry?.geometry_kind &&
+            geometry?.geometry_params &&
+            Array.isArray(geometry.geometry_params.size) &&
+            geometry.geometry_params.size.length === 3 &&
+            geometry.geometry_params.size.every(
+              (value) => Number.isFinite(value) && value > 0,
+            ),
+        );
+        if (
+          body.object_id !== "film" ||
+          objectMatches.length !== 1 ||
+          body.base_revision !== fixture.revision ||
+          !validTransform ||
+          !validGeometry ||
+          fixture.geometryMutationBodies.length > 0
+        ) {
+          fixture.unknownMutationPaths.push(
+            request.method() + " " + path + url.search + ":invalid-or-multiple-object-geometry-write",
+          );
+          return fulfillJson(
+            route,
+            { error: { code: "inspector_fixture_invalid_object_geometry_patch" } },
+            422,
+          );
+        }
+        fixture.geometryMutationBodies.push(structuredClone(body));
+        fixture.geometryPatchPending = true;
+        if (fixture.geometryPatchDelayMs > 0) {
+          await new Promise((resolveDelay) =>
+            setTimeout(resolveDelay, fixture.geometryPatchDelayMs),
+          );
+        }
+        const targetIndex = fixture.scene.objects.findIndex(
+          (candidate) => candidate.id === body.object_id,
+        );
+        fixture.scene.objects[targetIndex] = {
+          ...fixture.scene.objects[targetIndex],
+          geometry: structuredClone(geometry),
+          transform: structuredClone(transform),
+        };
+        fixture.revision += 1;
+        fixture.scene.revision = fixture.revision;
+        fixture.manifest.source_scene_revision = fixture.revision;
+        fixture.visualization.revision = fixture.revision;
+        fixture.geometryPatchPending = false;
+        return fulfillJson(route, {
+          committed_scene: fixture.scene,
+          scene_revision: fixture.revision,
+          transaction_kind: body.kind,
+        });
+      }
       if (body.kind !== "patch_magnetization" || body.object_id !== "film") {
-        fixture.unknownMutationPaths.push(`${request.method()} ${path}${url.search}`);
+        fixture.unknownMutationPaths.push(request.method() + " " + path + url.search);
         return fulfillJson(
           route,
           { error: { code: "inspector_fixture_unknown_transaction", kind: body.kind ?? null } },
@@ -3597,7 +4259,17 @@ async function installInspectorFixtureApi(page, fixture) {
         rotate: { available: true, reason: null },
         scale: { available: true, reason: null },
       },
-      checks: [],
+      checks: [
+        { id: "method", label: "Simulation method", state: "complete", target_resource: "model/study" },
+        { id: "domain", label: "Domain policy", state: "complete", target_resource: "meshing/policies/universe", reason: "Automatic domain follows authored geometry." },
+        { id: "geometry", label: "Geometry", state: "complete", target_resource: "model/scene" },
+        { id: "material", label: "Material", state: "blocked", target_resource: "model/objects/film", reason: "Assign a material to Film." },
+        { id: "texture", label: "Initial magnetization", state: "complete", target_resource: "model/objects/film" },
+        { id: "interactions", label: "Interactions", state: "complete", target_resource: "model/objects/film" },
+        { id: "discretization", label: "Discretization", state: "complete", target_resource: fixture.fdmBuildGridMode ? "model/study" : "meshing/builds/current" },
+        { id: "study", label: "Study", state: "blocked", target_resource: "model/study", reason: "Add a study stage." },
+        { id: "execution", label: "Execution request", state: "complete", target_resource: "model/study", reason: "Device support is checked during preparation for each run." },
+      ],
       ready_to_export: true,
       ready_to_run: false,
       scene_revision: fixture.revision,
@@ -4132,7 +4804,8 @@ function inspectorPhysicsGuardLane() {
       capability_profile_version: "inspector-smoke",
       effective_request: "session.runtime_resolution",
       engine_id: "fem_cpu_reference",
-      kind: "fixture",
+      // Simulate the planner-owned API resource; this is not a scientific solve.
+      kind: "planner",
     },
   };
 }
@@ -5201,4 +5874,31 @@ function inspectorFrequencyResponseSweep(
     schema_version: "frequency_domain_response_sweep_resource.v1",
     status: modal ? "missing" : "ready",
   };
+}
+
+
+async function qualifyFirstRunGuideRouting(page, inspector, screenshotFiles, fixture) {
+  const guide = page.getByTestId("scratch-authoring-guide");
+  await guide.waitFor({ state: "visible", timeout: 30_000 });
+  const material = guide.locator('[data-check-id="material"]');
+  await material.getByRole("button", { name: "Material", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector(".fm-inspector__title")?.textContent === "Material Assignment");
+  assert(await inspector.locator(".fm-inspector-panel").count(), "Guide material action must mount the existing Inspector.");
+  await guide.locator('[data-check-id="domain"]').getByRole("button", { name: "Configure domain", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector(".fm-inspector__title")?.textContent === "Universe");
+  assert(!(await inspector.innerText()).includes("Session discretization is unresolved"), "Known FEM must not require engine resolution to edit Universe.");
+  const webgl = await assertHealthyViewportCanvas(page, "First-run guide navigation");
+  const screenshot = "first-run-guide-domain.png";
+  await page.screenshot({ path: resolve(outputDir, screenshot) });
+  screenshotFiles.push(screenshot);
+  await writeFile(resolve(outputDir, "first-run-guide-proof.json"), JSON.stringify({
+    schema: "fullmag_first_run_guide_browser_proof_v1", scene_revision: fixture.revision,
+    guide_revision: await guide.getAttribute("data-readiness-revision"),
+    actions: ["material -> existing Film Material Assignment", "complete domain -> existing Universe"],
+    check_ids: await guide.locator("[data-check-id]").evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-check-id"))),
+    webgl, screenshot, qualification: "production_workspace_with_mock_api", real_backend_verified: false,
+  }, null, 2));
+  await guide.getByRole("button", { name: "Hide steps", exact: true }).click();
+  assert(!(await guide.getByRole("list", { name: "Model readiness checklist" }).count()), "Hide steps must release workspace space for expert navigation.");
+  await assertHealthyViewportCanvas(page, "Collapsed first-run guide");
 }

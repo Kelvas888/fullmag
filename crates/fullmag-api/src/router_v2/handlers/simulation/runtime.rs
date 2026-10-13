@@ -546,9 +546,11 @@ pub async fn get_stage_execution(
     };
 
     Ok(Json(StageExecutionResource {
-        session_id: snapshot.session.session_id.clone(),
-        session_epoch: crate::router_v2::handlers::sessions::status::snapshot_session_epoch(snapshot),
-        run_id: snapshot.run.as_ref().map(|run| run.run_id.clone()),
+        session_id: request_context.session_id.clone(),
+        session_epoch: crate::router_v2::handlers::sessions::current_live_session_epoch(snapshot),
+        request_scope_epoch: request_context.request_scope_epoch.clone(),
+        run_id: snapshot.run.as_ref().map(|run| run.run_id.clone())
+            .unwrap_or_else(|| snapshot.session.run_id.clone()),
         revision: snapshot.state_version,
         runtime_state: stage.runtime_state.as_str().to_string(),
         total_stages: stage.total_stages as u32,
@@ -580,6 +582,7 @@ pub async fn get_stage_execution(
                         .stage_id
                         .clone()
                         .unwrap_or_else(|| stage_id_for_index(index)),
+                    antenna_solve_stage_id: record.antenna_solve_stage_id.clone(),
                     index: index as u32,
                     label: Some(format!("Stage {}", index + 1)),
                     kind,
@@ -590,6 +593,7 @@ pub async fn get_stage_execution(
                     mesh_topology_fingerprint: record.mesh_topology_fingerprint.clone(),
                     mesh_revision: record.mesh_revision,
                     started_at_unix_ms: record.started_at_unix_ms,
+                    completed_step: record.completed_step,
                     completed_at_unix_ms: record.completed_at_unix_ms,
                     time_to_tolerance_seconds: time_to_tolerance_seconds(record),
                     reason: record.reason.clone().map(StageStopReason::from),
@@ -2471,6 +2475,9 @@ pub async fn get_command_detail(
         applied_step: stage_linkage
             .as_ref()
             .and_then(|linkage| linkage.applied_step),
+        completed_step: stage_linkage
+            .as_ref()
+            .and_then(|linkage| linkage.completed_step),
         applied_time_seconds: stage_linkage
             .as_ref()
             .and_then(|linkage| linkage.applied_time_seconds),
@@ -3859,6 +3866,7 @@ struct CommandStageLinkage {
     stage_index: Option<u32>,
     started_at_unix_ms: Option<u128>,
     applied_step: Option<u64>,
+    completed_step: Option<u64>,
     applied_time_seconds: Option<f64>,
     segment_id: Option<String>,
     completed_at_unix_ms: Option<u128>,
@@ -3905,6 +3913,7 @@ fn command_stage_linkage_from_record(
         stage_index: Some(index as u32),
         started_at_unix_ms: record.started_at_unix_ms.map(u128::from),
         applied_step: record.applied_step,
+        completed_step: record.completed_step,
         applied_time_seconds: record.applied_time_seconds,
         segment_id: record.segment_id.clone(),
         completed_at_unix_ms: record.completed_at_unix_ms.map(u128::from),

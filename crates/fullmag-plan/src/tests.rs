@@ -4878,7 +4878,8 @@ fn fem_static_time_domain_plans_exchange_only_periodic_mesh_pairs() {
         | fullmag_ir::StudyIR::Relaxation { sampling, .. }
         | fullmag_ir::StudyIR::Eigenmodes { sampling, .. }
         | fullmag_ir::StudyIR::FrequencyResponse { sampling, .. }
-        | fullmag_ir::StudyIR::Hysteresis { sampling, .. } => sampling,
+        | fullmag_ir::StudyIR::Hysteresis { sampling, .. }
+        | fullmag_ir::StudyIR::AntennaFieldSolve { sampling, .. } => sampling,
     };
     sampling.outputs.push(fullmag_ir::OutputIR::Field {
         name: "demag_phi".to_string(),
@@ -16216,7 +16217,8 @@ fn fdm_prescribed_zeeman_mask_antenna_plans_with_extra_geometry() {
         | StudyIR::Relaxation { sampling, .. }
         | StudyIR::Eigenmodes { sampling, .. }
         | StudyIR::FrequencyResponse { sampling, .. }
-        | StudyIR::Hysteresis { sampling, .. } => sampling.outputs.push(output),
+        | StudyIR::Hysteresis { sampling, .. }
+        | StudyIR::AntennaFieldSolve { sampling, .. } => sampling.outputs.push(output),
     }
 
     let plan = plan(&ir).expect("prescribed Zeeman antenna mask should plan");
@@ -16263,7 +16265,8 @@ fn fdm_regional_field_drive_is_carried_as_canonical_plan_input() {
         | StudyIR::Relaxation { sampling, .. }
         | StudyIR::Eigenmodes { sampling, .. }
         | StudyIR::FrequencyResponse { sampling, .. }
-        | StudyIR::Hysteresis { sampling, .. } => {
+        | StudyIR::Hysteresis { sampling, .. }
+        | StudyIR::AntennaFieldSolve { sampling, .. } => {
             sampling.outputs.push(OutputIR::Field {
                 name: "H_drive".into(),
                 every_seconds: 1e-12,

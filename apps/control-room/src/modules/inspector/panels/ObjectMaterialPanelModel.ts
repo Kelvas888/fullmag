@@ -293,17 +293,28 @@ export function buildMaterialAssignmentPatch(
 
 export function magneticParametersDraftFromResource(
   materialRef: string | null | undefined,
-  material: MaterialResource | null | undefined,
+  material: MaterialResource | NonNullable<SceneResource["materials"]>[number] | null | undefined,
 ): MagneticParametersDraft {
   return {
-    aex: formatOptionalNumber(material?.properties.Aex),
-    alpha: formatRequiredNumber(material?.properties.alpha, 0.01),
-    dind: formatOptionalNumber(material?.properties.Dind),
-    dbulk: formatOptionalNumber(material?.properties.Dbulk),
+    aex: formatOptionalNumber(material?.properties?.Aex),
+    alpha: formatRequiredNumber(material?.properties?.alpha, 0.01),
+    dind: formatOptionalNumber(material?.properties?.Dind),
+    dbulk: formatOptionalNumber(material?.properties?.Dbulk),
     materialName: material?.name ?? "",
     materialRef: normalizeMaterialRef(materialRef ?? "") ?? "",
-    ms: formatOptionalNumber(material?.properties.Ms),
+    ms: formatOptionalNumber(material?.properties?.Ms),
   };
+}
+
+export function assignedMaterialParametersDraft(
+  materialId: string,
+  scene: SceneResource,
+): MagneticParametersDraft {
+  const material = scene.materials?.find((entry) => entry.id === materialId);
+  if (!material) {
+    throw new Error(`Assigned material '${materialId}' is missing from the acknowledged scene.`);
+  }
+  return magneticParametersDraftFromResource(materialId, material);
 }
 
 export function materialParametersDraftKey(
@@ -314,11 +325,11 @@ export function materialParametersDraftKey(
     normalizeMaterialRef(materialRef ?? "") ?? "",
     material?.id ?? "missing",
     material?.name ?? "",
-    formatOptionalNumber(material?.properties.Ms),
-    formatOptionalNumber(material?.properties.Aex),
-    formatRequiredNumber(material?.properties.alpha, 0.01),
-    formatOptionalNumber(material?.properties.Dind),
-    formatOptionalNumber(material?.properties.Dbulk),
+    formatOptionalNumber(material?.properties?.Ms),
+    formatOptionalNumber(material?.properties?.Aex),
+    formatRequiredNumber(material?.properties?.alpha, 0.01),
+    formatOptionalNumber(material?.properties?.Dind),
+    formatOptionalNumber(material?.properties?.Dbulk),
   ].join(":");
 }
 
@@ -355,24 +366,25 @@ export function magneticParameterMaterialResourceFromSceneResource(
   const material = scene.materials?.find((candidate) => candidate.id === materialId);
   if (!material || !material.id || typeof material.name !== "string") return null;
   const properties = material.properties;
-  const aex = properties.Aex;
-  const dbulk = properties.Dbulk;
-  const dind = properties.Dind;
-  const ms = properties.Ms;
-  const alpha = properties.alpha;
+  const aex = properties?.Aex;
+  const dbulk = properties?.Dbulk;
+  const dind = properties?.Dind;
+  const ms = properties?.Ms;
+  const alpha = typeof properties?.alpha === "number" && Number.isFinite(properties.alpha)
+    ? properties.alpha
+    : 0.01;
   if (!isOptionalFiniteNumber(aex) || !isOptionalFiniteNumber(dbulk)
-    || !isOptionalFiniteNumber(dind) || !isOptionalFiniteNumber(ms)
-    || typeof alpha !== "number" || !Number.isFinite(alpha)) {
+    || !isOptionalFiniteNumber(dind) || !isOptionalFiniteNumber(ms)) {
     return null;
   }
   const resource: MaterialResource = {
     id: material.id,
     name: material.name,
     properties: {
-      Aex: aex,
-      Dbulk: dbulk,
-      Dind: dind,
-      Ms: ms,
+      Aex: aex ?? null,
+      Dbulk: dbulk ?? null,
+      Dind: dind ?? null,
+      Ms: ms ?? null,
       alpha,
     },
     scene_revision: scene.scene_revision ?? scene.revision ?? 0,
@@ -477,12 +489,12 @@ export function buildMaterialParametersPatch(
   };
 }
 
-function formatOptionalNumber(value: number | null | undefined): string {
+function formatOptionalNumber(value: unknown): string {
   return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
 }
 
 function formatRequiredNumber(
-  value: number | null | undefined,
+  value: unknown,
   fallback: number,
 ): string {
   return typeof value === "number" && Number.isFinite(value)

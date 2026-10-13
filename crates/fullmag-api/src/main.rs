@@ -1,7 +1,7 @@
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 #[cfg(not(feature = "swagger-ui"))]
 use axum::response::Html;
 use axum::response::{IntoResponse, Response};
@@ -36,6 +36,7 @@ use fullmag_runner::LivePreviewField;
 mod accepted_fem_state;
 #[path = "accepted_fem_study_worker.rs"]
 mod accepted_fem_study_worker;
+mod accepted_antenna_inspection_worker;
 mod accepted_study_worker;
 mod accepted_project_storage;
 mod analysis;
@@ -2525,11 +2526,11 @@ async fn main() {
         )
         .route(
             "/v1/internal/live/current/snapshot",
-            post(sync_current_live_snapshot),
+            post(sync_current_live_snapshot_with_owner),
         )
         .route(
             "/v2/sessions/current/internal/live/snapshot",
-            post(sync_current_live_snapshot),
+            post(sync_current_live_snapshot_with_owner),
         )
         .route(
             "/v2/sessions/current/internal/live/preparation-receipt",
@@ -2992,26 +2993,17 @@ async fn mark_commands_dispatched(
 async fn take_next_current_control_command_after(
     state: &Arc<AppState>,
     after_seq: u64,
+    grid_refresh_command_id: Option<&str>,
 ) -> Result<Option<SessionCommand>, ApiError> {
     let mut stale = Vec::new();
     let selected = {
         let mut queue = state.current_control_queue.lock().await;
-        let index = 0usize;
-        let mut selected = None;
-        while index < queue.len() {
-            let Some(command) = queue.get(index) else {
-                break;
-            };
-            if command.seq <= after_seq {
-                if let Some(removed) = queue.remove(index) {
-                    stale.push(removed);
-                }
-                continue;
-            }
-            selected = queue.remove(index);
-            break;
-        }
-        selected
+        take_next_control_command_from_queue(
+            &mut queue,
+            after_seq,
+            grid_refresh_command_id,
+            &mut stale,
+        )
     };
 
     let mut dispatched = stale.clone();
@@ -3034,10 +3026,215 @@ async fn take_next_current_control_command_after(
     Ok(selected)
 }
 
+fn take_next_control_command_from_queue(
+    queue: &mut VecDeque<SessionCommand>,
+    after_seq: u64,
+    grid_refresh_command_id: Option<&str>,
+    stale: &mut Vec<SessionCommand>,
+) -> Option<SessionCommand> {
+    if let Some(command_id) = grid_refresh_command_id {
+        let index = queue.iter().position(|command| {
+            command.seq > after_seq
+                && command.command_id == command_id
+                && command.kind == "fdm_grid_refresh"
+        })?;
+        return queue.remove(index);
+    }
+
+    let index = 0usize;
+    while index < queue.len() {
+        let Some(command) = queue.get(index) else {
+            break;
+        };
+        if command.seq <= after_seq {
+            if let Some(removed) = queue.remove(index) {
+                stale.push(removed);
+            }
+            continue;
+        }
+        return queue.remove(index);
+    }
+    None
+}
+
+#[cfg(test)]
+mod current_control_queue_selection_tests {
+    use super::take_next_control_command_from_queue;
+    use crate::types::SessionCommand;
+    use std::collections::VecDeque;
+
+    fn command(seq: u64, command_id: &str, kind: &str) -> SessionCommand {
+        serde_json::from_value(serde_json::json!({
+            "seq": seq,
+            "command_id": command_id,
+            "kind": kind,
+            "created_at_unix_ms": seq
+        }))
+        .expect("minimal session command should deserialize")
+    }
+
+    #[test]
+    fn pinned_grid_refresh_removes_only_the_exact_new_command() {
+        let mut queue = VecDeque::from([
+            command(1, "old-solve", "solve"),
+            command(2, "other-grid", "fdm_grid_refresh"),
+            command(3, "wanted-grid", "fdm_grid_refresh"),
+            command(4, "later-solve", "solve"),
+        ]);
+        let mut stale = Vec::new();
+
+        let selected = take_next_control_command_from_queue(
+            &mut queue,
+            1,
+            Some("wanted-grid"),
+            &mut stale,
+        )
+        .expect("exact pinned grid refresh should be selected");
+
+        assert_eq!(selected.command_id, "wanted-grid");
+        assert!(stale.is_empty(), "pinned selection must not drain stale commands");
+        assert_eq!(
+            queue
+                .iter()
+                .map(|command| command.command_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-solve", "other-grid", "later-solve"]
+        );
+    }
+
+    #[test]
+    fn pinned_grid_refresh_miss_preserves_every_queued_command() {
+        let mut queue = VecDeque::from([
+            command(0, "wanted-grid", "fdm_grid_refresh"),
+            command(1, "same-id-wrong-kind", "solve"),
+            command(2, "other-grid", "fdm_grid_refresh"),
+        ]);
+        let mut stale = Vec::new();
+
+        assert!(take_next_control_command_from_queue(
+            &mut queue,
+            0,
+            Some("wanted-grid"),
+            &mut stale,
+        )
+        .is_none());
+        assert!(stale.is_empty());
+        assert_eq!(queue.len(), 3);
+    }
+}
+
+#[cfg(test)]
 async fn sync_current_live_snapshot(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CurrentLiveSnapshotRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    sync_current_live_snapshot_impl(state, req, None).await
+}
+
+/// Private runner precondition; it is not a browser resource or a new route.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalSnapshotOwner {
+    session_id: String,
+    run_id: String,
+    #[serde(default)]
+    require_empty: bool,
+    session_epoch: Option<u64>,
+    request_scope_epoch: Option<String>,
+}
+
+async fn sync_current_live_snapshot_with_owner(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CurrentLiveSnapshotRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = headers
+        .get("x-fullmag-terminal-owner")
+        .map(|value| {
+            let text = value.to_str().map_err(|_| {
+                ApiError::bad_request("invalid terminal snapshot owner header")
+            })?;
+            serde_json::from_str::<TerminalSnapshotOwner>(text).map_err(|_| {
+                ApiError::bad_request("invalid terminal snapshot owner header")
+            })
+        })
+        .transpose()?;
+    sync_current_live_snapshot_impl(state, req, owner).await
+}
+
+fn validate_terminal_snapshot_owner(
+    state: &AppState,
+    snapshot: &SessionStateResponse,
+    req: &CurrentLiveSnapshotRequest,
+    owner: &TerminalSnapshotOwner,
+) -> Result<(), ApiError> {
+    // Called by the frame apply closure under current_live_session_transition.
+    // Checking GET status before/after POST cannot provide this guarantee.
+    let epoch = state.current_live_session_epoch.load(Ordering::Acquire);
+    let request_scope_epoch = format!("{}:{epoch}", state.request_scope_instance_id);
+    let payload_matches = req.session_id == owner.session_id
+        && req.session.as_ref().is_some_and(|session| {
+            session.session_id == owner.session_id && session.run_id == owner.run_id
+        })
+        && req.run.as_ref().is_some_and(|run| {
+            run.session_id == owner.session_id && run.run_id == owner.run_id
+        });
+    if owner.require_empty {
+        // Only the initial full frame may create an empty workspace. Inspect
+        // actual state, not the default clone synthesized for a first frame.
+        let current = state
+            .current_live_state
+            .try_read()
+            .map_err(|_| ApiError::conflict_with_code(
+                "terminal_snapshot_owner_busy", "terminal_snapshot_owner_busy"
+            ))?;
+        if current.is_none()
+            && !owner.session_id.is_empty()
+            && !owner.run_id.is_empty()
+            && payload_matches
+            && owner.session_epoch.is_none()
+            && owner.request_scope_epoch.is_none()
+        {
+            return Ok(());
+        }
+        return Err(ApiError::conflict_with_code(
+            "terminal_snapshot_owner_stale", "terminal_snapshot_owner_stale"
+        ));
+    }
+    if owner.session_id.is_empty()
+        || owner.run_id.is_empty()
+        || owner.session_epoch != Some(epoch)
+        || owner.request_scope_epoch.as_deref() != Some(request_scope_epoch.as_str())
+        || snapshot.session.session_id != owner.session_id
+        || snapshot.session.run_id != owner.run_id
+        || !snapshot.run.as_ref().is_some_and(|run| {
+            run.session_id == owner.session_id && run.run_id == owner.run_id
+        })
+        || req.session_id != owner.session_id
+        || req.session.as_ref().is_some_and(|session| {
+            session.session_id != owner.session_id || session.run_id != owner.run_id
+        })
+        || req.run.as_ref().is_some_and(|run| {
+            run.session_id != owner.session_id || run.run_id != owner.run_id
+        })
+    {
+        return Err(ApiError::conflict_with_code(
+            "terminal_snapshot_owner_stale", "terminal_snapshot_owner_stale"
+        ));
+    }
+    Ok(())
+}
+
+async fn sync_current_live_snapshot_impl(
+    state: Arc<AppState>,
+    req: CurrentLiveSnapshotRequest,
+    owner: Option<TerminalSnapshotOwner>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let kind = if is_authoring_grid_snapshot(&req) {
+        CurrentLiveSyncKind::AuthoringGridSnapshot
+    } else {
+        CurrentLiveSyncKind::Snapshot
+    };
     let has_live_state_update = req.live_state.is_some();
     let has_scalar_row_update = req.latest_scalar_row.is_some();
     let has_latest_fields_update = req.latest_fields.is_some();
@@ -3046,9 +3243,10 @@ async fn sync_current_live_snapshot(
     let clear_preview_cache = req.clear_preview_cache;
     let atomic_terminal_field_publish = req.replace_latest_fields;
     let session_id = req.session_id.clone();
+    let owner_state = state.clone();
     sync_current_live_frame_update(
         &state,
-        CurrentLiveSyncKind::Snapshot,
+        kind,
         &session_id,
         allow_previous_preview_fallback,
         has_live_state_update,
@@ -3057,9 +3255,104 @@ async fn sync_current_live_snapshot(
         preview_fields,
         clear_preview_cache,
         atomic_terminal_field_publish,
-        move |next| apply_current_live_snapshot(next, req),
+        move |next| {
+            if let Some(owner) = owner.as_ref() {
+                validate_terminal_snapshot_owner(&owner_state, next, &req, owner)?;
+            }
+            apply_current_live_snapshot(next, req)
+        },
     )
     .await
+}
+
+#[cfg(test)]
+mod terminal_snapshot_owner_tests {
+    use super::*;
+
+    fn fixture() -> (CurrentLiveSnapshotRequest, SessionStateResponse) {
+        let mut req: CurrentLiveSnapshotRequest = serde_json::from_value(json!({
+            "session_id": "terminal-session",
+            "run": {"session_id": "terminal-session", "run_id": "terminal-run",
+                "status": "completed", "total_steps": 0, "artifact_dir": "results"}
+        })).unwrap();
+        let mut snapshot = default_current_live_state(&req);
+        snapshot.run = req.run.clone();
+        req.session = Some(snapshot.session.clone());
+        (req, snapshot)
+    }
+
+    fn owner(state: &AppState) -> TerminalSnapshotOwner {
+        TerminalSnapshotOwner {
+            session_id: "terminal-session".into(),
+            run_id: "terminal-run".into(),
+            require_empty: false,
+            session_epoch: Some(0),
+            request_scope_epoch: Some(format!("{}:0", state.request_scope_instance_id)),
+        }
+    }
+
+    #[test]
+    fn current_owner_accepts_but_new_run_and_api_incarnation_reject() {
+        let state = crate::router_v2::tests::test_app_state();
+        let (req, mut snapshot) = fixture();
+        let mut expected = owner(&state);
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_ok());
+        snapshot.session.run_id = "new-run".into();
+        snapshot.run.as_mut().unwrap().run_id = "new-run".into();
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_err());
+        let (_, snapshot) = fixture();
+        expected.request_scope_epoch = Some("other-api:0".into());
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_err());
+        expected = owner(&state);
+        state.current_live_session_epoch.store(1, Ordering::Release);
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_err());
+    }
+
+    #[tokio::test]
+    async fn initial_admission_requires_empty_workspace_and_explicit_payload_owner() {
+        let state = crate::router_v2::tests::test_app_state();
+        let (mut req, snapshot) = fixture();
+        let expected = TerminalSnapshotOwner {
+            session_id: "terminal-session".into(), run_id: "terminal-run".into(),
+            require_empty: true, session_epoch: None, request_scope_epoch: None,
+        };
+        *state.current_live_state.write().await = None;
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_ok());
+        req.run.as_mut().unwrap().run_id = "wrong-run".into();
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_err());
+        let (req, snapshot) = fixture();
+        *state.current_live_state.write().await = Some(snapshot.clone());
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_err());
+    }
+
+    #[test]
+    fn malformed_private_owner_header_is_not_an_unconditional_publication() {
+        assert!(serde_json::from_str::<TerminalSnapshotOwner>(
+            r#"{"session_id":"s","run_id":"r","unexpected":true}"#
+        ).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_old_owner_preserves_new_owner_connectivity_and_snapshot() {
+        let state = crate::router_v2::tests::test_app_state();
+        let (req, mut snapshot) = fixture();
+        let expected = owner(&state);
+        snapshot.session.run_id = "new-run".into();
+        snapshot.run.as_mut().unwrap().run_id = "new-run".into();
+        let version = snapshot.state_version;
+        *state.current_live_state.write().await = Some(snapshot);
+        *state.current_live_connectivity.write().await =
+            crate::schemas::status::SessionConnectivity::Connected;
+        let error = sync_current_live_snapshot_impl(state.clone(), req, Some(expected))
+            .await.unwrap_err();
+        assert_eq!(error.code.as_deref(), Some("terminal_snapshot_owner_stale"));
+        assert!(matches!(*state.current_live_connectivity.read().await,
+            crate::schemas::status::SessionConnectivity::Connected));
+        let current = state.current_live_state.read().await;
+        let current = current.as_ref().unwrap();
+        assert_eq!(current.session.run_id, "new-run");
+        assert_eq!(current.state_version, version);
+    }
 }
 
 async fn sync_current_live_heartbeat(
@@ -3171,6 +3464,7 @@ async fn sync_current_live_field_frame(
 #[derive(Debug, Clone, Copy)]
 enum CurrentLiveSyncKind {
     Snapshot,
+    AuthoringGridSnapshot,
     Session,
     Runtime,
     Scalars,
@@ -3180,12 +3474,80 @@ enum CurrentLiveSyncKind {
 impl CurrentLiveSyncKind {
     fn label(self) -> &'static str {
         match self {
-            Self::Snapshot => "snapshot",
+            Self::Snapshot | Self::AuthoringGridSnapshot => "snapshot",
             Self::Session => "session",
             Self::Runtime => "runtime",
             Self::Scalars => "scalars",
             Self::Fields => "fields",
         }
+    }
+}
+
+// A one-shot Grid command publishes authoring mesh metadata and exits. It is
+// not a resident solver publisher and must not start its heartbeat watchdog.
+// Keep all runtime-bearing snapshots and all typed frames on the existing path.
+fn is_authoring_grid_snapshot(req: &CurrentLiveSnapshotRequest) -> bool {
+    req.mesh_workspace.is_some()
+        && req.session.is_none()
+        && req.session_status.is_none()
+        && req.metadata.is_none()
+        && req.stage_execution.is_none()
+        && req.simulation_preparation.is_none()
+        && req.run.is_none()
+        && req.live_state.is_none()
+        && req.frozen_spins_runtime_status.is_none()
+        && req.coupled_checkpoint.is_none()
+        && req.latest_scalar_row.is_none()
+        && req.latest_fields.is_none()
+        && !req.replace_latest_fields
+        && req.field_generation.is_none()
+        && req.preview_fields.is_none()
+        && !req.clear_preview_cache
+        && req.solver_profile.is_none()
+        && req.fem_mesh.is_none()
+}
+
+#[cfg(test)]
+mod authoring_grid_heartbeat_tests {
+    use super::*;
+
+    fn grid() -> CurrentLiveSnapshotRequest {
+        serde_json::from_value(json!({
+            "session_id": "scratch-grid",
+            "mesh_workspace": {"revision": 2},
+            "engine_log": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn grid_metadata_does_not_claim_resident_runner_liveness() {
+        let mut req = grid();
+        assert!(is_authoring_grid_snapshot(&req));
+        req.mesh_workspace = None;
+        assert!(!is_authoring_grid_snapshot(&req));
+    }
+
+    #[test]
+    fn stateful_or_field_mutating_snapshots_keep_heartbeat_semantics() {
+        let mut req = grid();
+        req.session_status = Some("running".into());
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.metadata = Some(json!({"publisher": "runtime"}));
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.coupled_checkpoint = Some(json!({}));
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.clear_preview_cache = true;
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.replace_latest_fields = true;
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.preview_fields = Some(Vec::new());
+        assert!(!is_authoring_grid_snapshot(&req));
     }
 }
 
@@ -3883,8 +4245,13 @@ where
     };
     let apply_start = std::time::Instant::now();
     if let Err(error) = apply(&mut next) {
-        *state.current_live_connectivity.write().await =
-            crate::schemas::status::SessionConnectivity::Degraded;
+        // Rejected stale ownership is an admission failure, not a failure of
+        // the current publisher. An old sender must not degrade a new owner.
+        if !matches!(error.code.as_deref(),
+            Some("terminal_snapshot_owner_stale" | "terminal_snapshot_owner_busy")) {
+            *state.current_live_connectivity.write().await =
+                crate::schemas::status::SessionConnectivity::Degraded;
+        }
         return Err(error);
     }
     let apply_ms = apply_start.elapsed().as_micros();
@@ -4028,7 +4395,9 @@ where
         }
         *current = Some(next);
     }
-    crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(state).await;
+    if !matches!(kind, CurrentLiveSyncKind::AuthoringGridSnapshot) {
+        crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(state).await;
+    }
 
     if let Some(sample) = scalar_sample {
         queue_current_live_realtime_scalar_sample(state.as_ref(), sample).await?;
@@ -4074,7 +4443,7 @@ async fn dequeue_current_live_command(
 ) -> Result<Response, ApiError> {
     let _permit = state.development_admission.admit().await?;
     let _transition = state.current_live_session_transition.lock().await;
-    let command = take_next_current_control_command_after(&state, 0).await?;
+    let command = take_next_current_control_command_after(&state, 0, None).await?;
     match command {
         Some(command) => Ok(Json(command).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
@@ -4094,10 +4463,14 @@ async fn wait_current_live_control(
     Query(query): Query<ControlWaitQuery>,
 ) -> Result<Response, ApiError> {
     let _ = current_live_session_id(&state).await?;
+    let after_seq = query.after_seq;
+    let requested_session_id = query.session_id.clone();
+    let grid_refresh_command_id = query.grid_refresh_command_id.clone();
     if let Some(command) = take_current_control_command_for_session(
         &state,
-        query.after_seq,
-        query.session_id.as_deref(),
+        after_seq,
+        requested_session_id.as_deref(),
+        grid_refresh_command_id.as_deref(),
     )
     .await?
     {
@@ -4107,7 +4480,7 @@ async fn wait_current_live_control(
     let timeout_ms = query.timeout_ms.clamp(100, 20_000);
     let mut rx = state.current_control_events.subscribe();
     let state_for_wait = Arc::clone(&state);
-    let requested_session_id = query.session_id.clone();
+    let grid_refresh_command_id_for_wait = grid_refresh_command_id.clone();
     let waited = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async move {
         loop {
             rx.changed()
@@ -4115,8 +4488,9 @@ async fn wait_current_live_control(
                 .map_err(|_| ApiError::internal("control command stream closed"))?;
             if let Some(command) = take_current_control_command_for_session(
                 &state_for_wait,
-                query.after_seq,
+                after_seq,
                 requested_session_id.as_deref(),
+                grid_refresh_command_id_for_wait.as_deref(),
             )
             .await?
             {
@@ -4137,6 +4511,7 @@ async fn take_current_control_command_for_session(
     state: &Arc<AppState>,
     after_seq: u64,
     requested_session_id: Option<&str>,
+    grid_refresh_command_id: Option<&str>,
 ) -> Result<Option<SessionCommand>, ApiError> {
     let _permit = state.development_admission.admit().await?;
     let _transition = state.current_live_session_transition.lock().await;
@@ -4146,7 +4521,7 @@ async fn take_current_control_command_for_session(
             return Ok(None);
         }
     }
-    take_next_current_control_command_after(state, after_seq).await
+    take_next_current_control_command_after(state, after_seq, grid_refresh_command_id).await
 }
 
 #[allow(dead_code)]

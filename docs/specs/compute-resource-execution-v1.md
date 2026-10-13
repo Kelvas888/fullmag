@@ -178,6 +178,20 @@ semantyki lease/protokołu. Nie dopisujemy pól po cichu do formatu v1.
 | `sample` | Source, collected_at, freshness, error/reason; brak danych nie jest zerem |
 | `enforcement` | Osobno `cpu_affinity`, CPU quota, memory cap, GPU visibility, storage quota: supported/advisory/unavailable |
 
+`inventory_revision` jest dodatnią, monotoniczną rewizją trwałego inventory.
+Zwiększa się wyłącznie, gdy zmieni się kanoniczny opis CPU topology/OS
+constraints, GPU UUID/partition lub ich trwałe powiązanie. Zmiany wolnej RAM,
+obciążenia, temperatury i innych próbek telemetrycznych nie zmieniają tej
+rewizji. `capabilities_revision` jest niezależne i zmienia się tylko po zmianie
+zgłoszonych capabilities runtime. Publikujący zachowuje ostatnią rewizję dla
+tej samej tożsamości node/boot; nie może jej wyliczać z chwilowego capacity.
+
+`sample.collected_at` jest czasem UTC pobrania próbki. Próbka jest `current`
+przez maksymalnie 30 sekund; po przekroczeniu limitu jest `stale`. Czas z
+przyszłości, błąd odczytu i brak pomiaru dają jawny `unavailable` z reason,
+nigdy świeżą próbkę ani wartość zero. Ten sam limit obowiązuje przy późniejszym
+admission; odczyt inventory nie tworzy ani nie rezerwuje allocation.
+
 Bieżące GPU oparte tylko na `index`/nazwie w telemetrii UI trzeba wzbogacić
 o UUID i wiązanie z inventory. Przekierowanie API na innego hosta/epoch
 unieważnia wszystkie cache zasobów i draft bindings do starej topologii.
@@ -241,16 +255,32 @@ poprawna i raportowana; nie uzasadnia cichego zmniejszenia przydziału requestu.
 ### 4.4 BatchSpecification
 
 - `batch_id`, snapshot/digest, study/catalog digest, versioned execution profiles.
-- Osie parametrów: nazwa, typ, jednostka kanoniczna, lista/przedział,
-  `cartesian` albo `zip`; porządek i reguły walidacji są częścią hasha.
-- `cases`: trwałe case IDs, canonical parameter tuples, seed derivation,
-  zależności i odpowiednie child run IDs. Duże zbiory mają stronicowany,
+- Osie parametrów: nazwa, typ, jawny typowany cel w konkretnym kroku Study,
+  jednostka kanoniczna, lista/przedział, `cartesian` albo `zip`; porządek,
+  wiązanie i reguły walidacji są częścią hasha. Wartość osi zmienia
+  case-local `ProblemIR` w `StudyProblemCatalog`; generyczne
+  `RunSpecification.parameters` nie jest wejściem solvera. Application wiąże
+  `external_field_b` z pojedynczym składnikiem Zeeman B w teslach oraz
+  `zhang_li_current_density` z nazwanym modułem Zhang–Li w A/m²; oba cele
+  wymagają jawnego, normalizowanego kierunku. Zhang–Li musi być wykonywalny,
+  a nazwane źródło transportu nie może być nadpisywane osią. Pozostałe cele
+  wymagają własnego typu i sprawdzenia przez planner przed udostępnieniem.
+- `cases`: trwałe case IDs, canonical parameter tuples, niezerowy seed
+  wyprowadzony deterministycznie z master seed i identyfikatora case,
+  zależności oraz odpowiednie child run IDs. Seed komponentu trafia do
+  stochastycznych pól wejściowego `ProblemIR`; generyczne
+  `RunSpecification.seeds` nie jest przekazywane jako zastępstwo bindingu.
+  Jeśli thermal noise wynika wyłącznie z legacy `ProblemIR.temperature` bez
+  jawnego `ThermalNoise`, materializacja odmawia zamiast zostawić system
+  entropy niezwiązane z zadanym seedem. Duże zbiory mają stronicowany,
   content-addressed manifest; UI nie przesyła milionowej tablicy w status.
 - `max_parallel_cases`: auto lub dodatni limit; to górna granica, nie gwarancja.
 - `resources_per_case`: domyślny profil/request; kroki nadal mają własne profile.
 - `execution_strategy`: independent / continuation / dependency-graph.
-- `failure_policy`: continue-independent / stop-admission; domyślnie brak
-  auto-retry. Liczbowy limit retry, jeśli włączony, jest immutable.
+- `failure_policy`: continue-independent / stop-admission; wartości wire to
+  `continue_independent` i `stop_admission`. Brak pola w starszym Submit oznacza
+  zgodne wstecz `continue_independent`; nie uruchamia to auto-retry. Liczbowy
+  limit retry, jeśli włączony, jest immutable.
 - `lane_policy`: homogeneous domyślnie; mixed CPU/GPU dopiero po jawnym wyborze
   `auto` i kwalifikowanym zbiorze równoważnych lane'ów. Forced GPU wyklucza CPU.
 - Polityka wyników: required ports, scalar summaries, field retention,
@@ -269,6 +299,11 @@ i zależności w istniejącym durable store. Przyjęcie batcha i zakres case IDs
 są trwałe i idempotentne; recovery kontynuuje ekspansję bez duplikowania runów.
 Przy bardzo dużej ekspansji ACK potwierdza batch i manifest, a nie gotowość
 wszystkich tasków. Postęp ekspansji jest osobnym zasobem.
+
+Postęp `stopped` oznacza, że opublikowany prefiks jest niepusty i niepełny, a
+`stop_admission` zatrzymało publikowanie po terminalnym niepowodzeniu,
+anulowaniu lub przerwaniu jednego z opublikowanych cases. Ten stan jest
+trwały i nie jest prezentowany jako pełna ekspansja.
 
 `max_parallel_cases` liczy cases rozpoczęte pierwszym admission (także
 preparation), aż do terminalnego zakończenia case. Nie liczy liczby tasków
@@ -507,8 +542,8 @@ wykonujący solver bez durable RunSpec.
 | `POST /v2/persistence/projects/{project_id}/execution-previews` | Plan legalności i szacowany placement bez lease/spawnu |
 | `POST /v2/persistence/projects/{project_id}/runs` — istnieje | Rozszerzony typowany request przyjęcia z profile/resource snapshot |
 | `GET /v2/persistence/projects/{project_id}/runs/{run_id}` — istnieje | Run/Tasks; rozszerzone references do allocation i executed receipt |
-| `POST/GET .../projects/{project_id}/batches` | Immutable przyjęcie i katalog kolekcji, idempotencja oraz pagination |
-| `GET .../batches/{batch_id}/cases` | Parametry, zależności, child runs, status i output refs |
+| `POST/GET .../projects/{project_id}/batches` — parent przyjęcia/listy istnieje | Immutable przyjęcie i stronicowana lista kolekcji; idempotentny parent nie oznacza opublikowanych child runów |
+| `GET .../batches/{batch_id}/cases` — manifest projection istnieje | Stronicowane parametry z nazwami osi i jednostkami kanonicznymi oraz planowane RunIds ze stanu `pending_expansion`; child-run status i output refs wymagają schedulera |
 | `POST .../batches/{batch_id}/commands` | Pause admission/resume/cancel/retry; ACK + command lifecycle |
 | `GET /v2/platform/compute/allocations/{allocation_id}` | Read-only szczegóły przydziału; bez tokenów operacyjnych |
 | `GET /v2/platform/compute/events/ws` | Proponowane platform-scoped invalidations; potrzebne bez aktywnej sesji |
@@ -529,6 +564,19 @@ Zmiana API oznacza: backend schemas/OpenAPI → generated v2 types/transport →
 facade → resource hooks → adapters → wspólne UI. Obecne session diagnostics
 pozostają adapterem zgodności do platform host telemetry, z jednym właścicielem
 próbkowania i terminem usunięcia podwójnej ścieżki po migracji konsumentów.
+
+Aktualny batch `POST` przyjmuje dokładne archiwum projektu, client
+`idempotency_key`, typowany `BatchExpansionRequest`, StudyPlan, immutable
+StudyProblemCatalog oraz jawne mapowanie assetów. Przed ACK sprawdza project
+snapshot, wejścia źródłowe i każdy case przez canonical planner, po czym
+utrwala batch intent i content-addressed expansion manifest. Odpowiedź zwraca
+BatchId, logiczny digest i liczbę cases. Nie potwierdza materializacji child
+runów, admission ani startu solvera. Batch `GET` zwraca stronicowane summary
+parentów wraz z total/published prefix oraz stanem ekspansji. Cases GET zwraca
+tuple parametrów i planowane RunIds z manifestu; opublikowany prefix jest
+`pending_materialization`, a pozostałe przypadki `pending_expansion`. Nie ma
+jeszcze task statusu ani output refs. Commands i worker ekspansji pozostają do
+wdrożenia.
 
 Mutacje Settings korzystają z typowanej walidacji i optimistic concurrency.
 Nie wysyłają dowolnego polecenia shell ani ścieżki do urządzenia. Lokalny
@@ -1105,6 +1153,424 @@ Nie jest to jeszcze konfiguracja działającej usługi ani dowód enforcement.
 Root/config/topology ownership, service scheduler/preparation wiring, owner lifecycle
 i runtime recovery są nadal otwartymi bramkami E2. Service cap pozostaje 1.
 
+
+### 13.15 Przypięta konfiguracja usługi i wynik oczekiwania admission
+
+RuntimeServiceConfig v1 zachowuje dotychczasowy format bez host_execution,
+limity 1/1 i reuse APPLICATION.json bez resamplingu. V2 wymaga jawnego bindingu:
+lokalnego root ledgeru, kompletnej polityki, limitów compute/preparation oraz
+map placement o dokładnie tych samych kluczach co skonfigurowane oferty.
+V1 z nowym bindingiem i v2 bez bindingu są błędami. Nie ma automatycznej
+migracji zapisu operatora. Limity mają dodatnie bounded wartości; pojedyncze
+oferty mieszczą się w host budget i per-device VRAM, a wspólny ledger sprawdza
+ich współbieżny bilans. Placement nie nadaje qualification ani OS enforcement.
+
+HostRuntimeAdmission otwiera exact istniejący ledger według przypiętej polityki;
+nie inicjuje pustego bilansu ani nie przechodzi na v1 po błędzie. Adapter dla
+schedulera porównuje digest kompletnej typed konfiguracji, store, pool, role
+i cap przekazane przez service ownera. Podmiana pliku podczas handoff nie
+autoryzuje innego placement. Oba CLI schedulery mają sparowane flagi bindingu
+i digestu oraz walidację pełnych opublikowanych poolów przed ready/admission.
+Zmiana oferty wymaga drain i nowej konfiguracji; nie podmienia aktywnego budżetu.
+
+Try host admission zwraca None dla typowanego contention nowego przydziału,
+przed publikacją host reservation i local claim. Task pozostaje queued, bez
+Prepare/Start. Read corruption, fencing, overflow i publication unknown są
+błędami; nie wolno zmienić ich w zwykły stan oczekiwania. Local preparation
+admission None po już opublikowanym tentative nadal wymaga reconciliation.
+
+Usługa jawnie odmawia startu v2 do czasu podłączenia host-aware schedulerów,
+supervisor release/recovery i lifecycle. Nie ignoruje nowych limitów,
+nie podnosi aktywnego cap i nie zmienia pracujących runów. Nowe źródłowe
+typy nie stanowią odbioru E2 ani dowodu równoległego wykonania.
+
+Scheduler przekazuje immutable host context do supervisorów. Przed spawn
+supervisor wymaga exact Committed reservation, razem z policy fence i całym
+przydziałem. GPU visibility pochodzi z explicit placement, a nie etykiety
+oferty. Legacy bez bindingu zachowuje dotychczasową trasę.
+
+Worker exit/retry recovery zwalnia host tylko przez durable exit receipt
+i exact Released local lease, również gdy terminalna porażka kończy się
+błędem supervisora. Active lease po niejednoznacznej reconciliation pozostawia
+quarantine. Cancel przed spawn nie ma exit receipt i nie zwalnia host capacity;
+trwała no-spawn reconciliation pozostaje otwartą bramką przed startem v2.
+
+Preparation finalize i host proof publication używają jednego host→store lock.
+Nie ma okna, w którym local readiness zmienia się przed host release. Recovery
+już Released local lease z exact launch/exit proofs omija wcześniejszy finalizer,
+ponieważ task może już być queued lub solver-owned po awarii publikacji hosta.
+Utrwalony proof jest weryfikowany przed ponownym udostępnieniem capacity.
+Service launcher ma forwarding config path/digest i role caps; startup guard
+pozostaje do zamknięcia pełnego recovery/lifecycle i runtime gates.
+
+Oba schedulery uzgadniają również host holds, dla których exact local lease
+jest już Released, a durable matching exit receipt pozostał po awarii host
+publication. Reconciliation jest scope'owana canonical store ID i owner
+attempt/epoch/resource/token/heartbeat. Receipt jest ponownie sprawdzany przez
+ledger pod host→store lock. Active/missing local lease, brak proof albo proof
+innej próby nie zwalniają capacity. History receipts są cache'owane per run
+na jeden pass; age/PID lub stan taska nie zastępują dowodu zakończenia.
+
+### 13.16 Import legacy CUDA ordinal i fizyczne przypięcie
+
+`runtime_selection.legacy_cuda_binding` (`legacy_cuda_binding.v1`) utrwala
+authored ordinal, odziedziczone `CUDA_VISIBLE_DEVICES` (null oznacza brak maski)
+i pełny UUID uzyskany w procesie importującym przez CUDA Driver API.
+Nieudana obserwacja zapisuje null UUID i konkretny `resolution_error`; nie
+zmienia forced GPU na CPU. CPU, Auto i GPU bez indeksu nie inicjują tej sondy.
+
+Host-aware dispatch wymaga poprawnego bindingu zgodnego z authored ordinal.
+UUID musi być obecnie widoczny i dopuszczony przez fizyczną politykę hosta.
+Scheduler dopasowuje UUID do configured placement przed zmianą lokalnego
+taska; inna oferta jest pomijana. Nowa kolejność enumeracji nie zmienia
+przypięcia. Stare indexed wejście bez bindingu wymaga jawnego wyboru GPU;
+nie jest interpretowane na nowo według numeracji innego hosta.
+
+Sonda używa `cuDeviceGetUuid_v2`, aby UUID instancji MIG nie zostało zastąpione
+UUID rodzica. Sam zapis bajtów CUDA nie dowodzi, że urządzenie jest pełną
+kartą: wymagane jest exact membership w polityce fizycznych UUID.
+Źródło ABI: [NVIDIA CUDA Driver API — Device Management](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__DEVICE.html).
+
+Przed spawn sprawdzane jest ponownie zgodne immutable wejście i Committed
+allocation. Child otrzymuje pojedynczy UUID w masce oraz lokalny indeks 0
+dla adapterów FDM i FEM; odziedziczony FEM index nie może zmienić przydziału.
+Importer mask jest provenance, nie globalną zmianą środowiska API. Ta ścieżka
+nie stanowi jeszcze NodeSnapshot/freshness, kwalifikacji MIG ani runtime
+odbioru E2/E3. Guard startu usługi v2 pozostaje do pozostałych bramek.
+
+### 13.17 Trwałe zezwolenie startu i dowód no-spawn
+
+Host admission zapisuje w solver lease opcjonalny `host_launch_binding.v1`:
+exact lokalny ledger root i przypiętą politykę. Binding jest częścią fence
+tożsamości dzierżawy; replay lub heartbeat nie może go usuwać ani podmieniać.
+Stare v1 JSON bez bindingu zachowuje format i trasę legacy. Brak nowego pola
+launch gate w istniejącym rekordzie hosta wymaga jawnej migracji: nie oznacza
+automatycznie Pending i nie autoryzuje nowego procesu.
+
+Nowa rezerwacja solvera ma gate Pending. Supervisor pod host→store lock
+sprawdza exact aktywny host-bound lease i Committed reservation, a następnie
+trwale zużywa zezwolenie (Consumed z unikalnym tokenem) **przed** próbą tworzenia
+procesu. Replay Consumed nie daje następnego spawn. Nieznany wynik publikacji
+lub awaria po zużyciu zezwolenia utrzymuje capacity do reconciliation.
+
+Worker odczytuje binding z durable lease, niezależnie od argv. Przed wykonaniem
+i rezerwacją katalogu próby sprawdza Committed allocation i matching token
+przekazany przez supervisora. GPU worker dodatkowo wymaga exact pojedynczego
+UUID w CUDA mask oraz lokalnego indeksu 0 w adapterach FDM i FEM. Pominięcie
+flagi procesu lub użycie legacy supervisora nie usuwa bindingu.
+
+Anulowanie przed pierwszym spawn zamyka wyłącznie Pending gate pod tym samym
+host→store lock. Consumed nie może zostać zamienione w Closed na podstawie
+braku PID, Started eventu lub heartbeat. Po trwałym Closed, terminalnym
+anulowaniu i exact local lease Released publikowany jest content-addressed
+proof WorkerNoSpawn, a dopiero potem host Released. Każdy odczyt Released
+waliduje ten proof, Closed gate, identity, budget i przypięty binding.
+Worker process-exit proof dla nowego host-bound lease wymaga Consumed gate;
+Closed nie może jednocześnie potwierdzać startu procesu i no-spawn. Te same
+warunki obowiązują przy release oraz późniejszym odczycie utrwalonego proof.
+
+Recovery przed wyborem kolejnej oferty uzgadnia również Closed gate z exact
+już Released local lease, gdy owner przerwał publikację proof/host Released.
+Active/missing lease nadal utrzymuje hold. Preparation ma odrębny process
+launch protocol; nie otrzymuje fikcyjnego solver launch tokenu. Nadal otwarte
+są partial admission bez local lease, awaria między Consumed i spawn oraz
+owner/policy lifecycle i pełne runtime gates. Startup v2 pozostaje guarded.
+
+### 13.18 Odtworzenie dokładnej intencji local admission
+
+SessionStore udostępnia odczyt i replay pojedynczego task admission przez
+run/task/attempt. Odczyt ma limit 1 MiB, walidację regular file/path oraz typed
+identity. Wyłącznie rzeczywisty NotFound oznacza brak zapisu; corruption lub
+inne błędy IO nie mogą być interpretowane jako brak przyjęcia zadania.
+Targeted replay korzysta z istniejącego apply protokołu pod store writer,
+bez uruchamiania innych intencji w tym runie.
+
+Host reconciliation pod host→store lock sprawdza Tentative/Pending solver
+reservation, canonical store ID, exact lease identity/budget i przypięty
+launch binding w zapisanej intencji. Dokańcza jej lokalną projekcję bez nowej
+próby/tokena. Promocja do Committed wymaga następnie exact aktywnej dzierżawy
+i zgodnego current Preparing/Stopping ready task. Superseded lub niedostępny
+claim zachowuje hold; nie zwalnia CPU/GPU na podstawie błędu replay.
+
+Oba schedulery wykonują ten pass przed wyborem ofert i przed recovery już
+Released leases. Brak intencji nie tworzy synthetic admission i nie jest
+automatycznym rollbackiem. Resume Prepare/Start po częściowym handoff, brak
+local admission record i awaria po Consumed nadal wymagają dalszego recovery.
+Sam Committed allocation nie dowodzi startu workera ani ukończenia E2/E3.
+
+### 13.19 Wznowienie przygotowanego handoff po restarcie schedulera
+
+Host-aware compute scheduler sprawdza istniejące Preparing/Ready claims na
+wolnym lokalnym slocie przed wyborem nowego unclaimed zadania. Zachowuje
+attempt/token/budget i nie nalicza nowego admission ani przesunięcia queue
+cursor za samo odzyskanie. Wymaga zgodnej immutable admission oraz current
+Committed/Pending allocation; Consumed/Closed nie autoryzują ponownego spawn.
+
+Jeżeli nie ma genesis, watermark ani historii journalu tej próby, odtwarza
+coordinator z exact admission. W pozostałych przypadkach odzyskuje istniejący
+coordinator i uzgadnia jego projekcję. Istniejące Prepare i Start envelopes
+pozostają niezmienne. Prepare zawiera authoritative ResolvedTaskInput; bez
+niego używany jest wyłącznie istniejący resolver automatycznie dostępnych
+inputs z immutable study, preparation receipt i catalogs, z claim validation.
+Nie zastępujemy utraconych explicit/manual overrides domyślnymi wartościami.
+
+Readonly Prepare może zostać ponownie zwalidowane i potwierdzone przy pending
+inbox. Prepared event używa stabilnego attempt-derived ID i kolejnego durable
+sequence. Brakujące Start jest publikowane tylko raz, a już pending Start jest
+przekazywane supervisorowi bez ponownego receive. Applied Start, divergent
+envelopes lub missing inbox po opublikowanym Start wymagają reconciliation.
+Helper nie wykonuje solvera. Drain i role cap nadal ograniczają handoff.
+
+Ta ścieżka nie obejmuje Stopping/Consumed recovery, brakującej admission,
+preparation no-spawn ani owner lifecycle i NodeSnapshot freshness. Kompilacja
+i runtime bramki są dokumentowane oddzielnie w checkpoincie; startup v2 guard
+pozostaje do pełnego odbioru E2/E3.
+
+
+### 13.20 Odzyskanie przerwanego anulowania przed spawn
+
+Jeżeli supervisor zapisał Closed i zakończone anulowanie, ale przerwał się przed
+zwolnieniem lokalnej lease, reconciler może dokończyć ten zapis. Operacja używa
+lock order host→store i wymaga exact Committed/Closed reservation, active
+host-bound lease oraz current Cancelled task z tym samym attempt/epoch/resource.
+Inne fazy i Consumed nie dopuszczają odzyskania bez dowodu zakończenia procesu.
+Po lokalnym release istniejąca ścieżka publikuje immutable WorkerNoSpawn proof
+i zwalnia host reservation. Awaria pomiędzy tymi zapisami jest replayowalna.
+
+Nie rozwiązuje to odzyskiwania Stopping przed publikacją Stopped ani Consumed
+przed potwierdzeniem uruchomienia. Startup guard v2 pozostaje.
+
+
+### 13.21 Stopping przed uruchomieniem procesu
+
+Host reconciler wybiera exact solver reservations Committed z Pending albo
+Closed oraz current Stopping task i active lease. Odtwarza coordinator journal
+i odrzuca sprzeczność z eventem Started. Dla Stopping zamyka niewykorzystaną
+bramkę pod host→store locks, następnie publikuje trwały Stopped z bounded,
+deterministycznym ID tej próby. Consumed nie może być zamknięte: race ze spawn
+pozostawia rezerwację do process reconciliation.
+
+Jeżeli Stopped jest już w journalu, lecz catalog nadal wskazuje Stopping,
+odzyskiwana jest tylko projekcja. Następnie exact Closed+Cancelled kończy local
+release, a istniejąca ścieżka publikuje WorkerNoSpawn proof i host release.
+Nie tworzymy Prepare/Start ani nowego attempt/token. Nie obejmuje to Consumed
+recovery, brakującej admission ani preparation no-spawn; startup guard pozostaje.
+
+Po niepewnym wyniku publikacji Stopped sam odczyt widocznego journalu nie
+dowodzi trwałości. Terminal replay odnajduje exact event entry (ID, sequence,
+task, attempt, epoch, token), porównuje typed envelope i ponawia commit tego
+samego wpisu. Dopiero potwierdzona publikacja pozwala naprawić catalog i
+zwolnić local lease. Błąd potwierdzenia zatrzymuje release.
+
+
+### 13.22 Rollback admission nieopublikowanego w store
+
+Sam brak admission nie zwalnia rezerwacji. Pod host→store writer locks
+rollback wymaga exact Tentative/Pending solver identity i przypiętej policy,
+braku admission tej próby, exact local lease oraz aktywnej lease zadania,
+braku journalu tej próby i current Ready/Queued, unclaimed task bez genesis
+i watermark. Next task epoch musi dokładnie odpowiadać reserved ownership epoch.
+Brak catalogu/zadania, inne epoki, corruption albo niepewne dane zatrzymują release.
+
+Ledger publikuje immutable AdmissionAbsent certificate z exact queued snapshot
+i request digest przed atomowym Closed+Released. Odczyt Released waliduje ten
+historyczny certyfikat, bez odpytywania później zmienionego store. Rezerwacja
+nie ustanowiła claimu, więc wyłącznie ten potwierdzony rodzaj release nie zużywa
+solver epoch. Nowa próba może użyć tej samej next epoch, ale nigdy starego
+attempt ani exact reservation identity. Stary publisher jest odrzucany jako
+Released. Pozostałe rodzaje release zachowują monotoniczne epoki.
+
+
+### 13.23 Preparation process binding i launch barrier
+
+Preparation lease ma optional host_launch_binding, zachowany przy heartbeat
+i uwzględniony w identity_matches. Host admission zapisuje exact ledger root
+i policy; scheduler zwraca tę samą bound lease. Host reservation ma osobną
+preparation_launch_gate, z Pending dla nowej rezerwacji; brak w starszym JSON
+nie jest domyślną zgodą i wymaga jawnej migracji. Solver gate pozostaje oddzielna.
+
+Po trwałym preparation process-launch record supervisor zużywa Pending→Consumed
+pod host→store locks, dla exact Committed allocation, Active bound lease i
+Accepted task oczekującego przygotowania. Token jest przekazywany do preparera,
+który odczytuje binding z durable lease i sprawdza Committed/Consumed przed pracą
+natywną. Bound lease bez przypiętego supervisora jest błędem. Nie ponawiamy spawn
+po Consumed ani po ambiguous launch. Legacy v1 bez bindingu zachowuje swoją trasę.
+
+Exit proof nowej preparation wymaga Consumed i zgodnego binding/policy/root;
+stare unbound proof pozostaje kompatybilne. Ta dostawa nie obejmuje jeszcze
+preparation no-spawn release, odzyskania Tentative po local lease ani positive
+reconciliation przerwania między Consumed i spawn. Są to dalsze bramki E2/E3.
+
+Non-consuming Pending preflight przed local launch publication odrzuca
+legacy/mismatched gate bez tworzenia one-shot śladu. Atomic consume po zapisie
+nadal ponownie waliduje wszystkie warunki. Awaria po local launch, przed consume
+pozostawia exact Pending i historyczny supervisor owner; odzyskanie wymaga
+jawnego owner takeover/adoption z zachowaniem oryginalnego launch record. Nie
+podmieniamy historycznego PID/tokena ani nie przedstawiamy go jako nowego ownera.
+
+
+### 13.24 Przejęcie preparation launch przed consume
+
+Exact Committed/Pending dowodzi, że host-bound supervisor nie uzyskał jeszcze
+zgody na spawn. Dopuszcza to użycie pojedynczego, niezmienionego local launch
+record po restarcie, bez wnioskowania o śmierci procesu z PID/age. Historyczny
+launch zachowuje swojego publishera. Atomic consume zapisuje dodatkowo
+`host_preparation_launch_owner.v1`: original launch ID/digest oraz PID i start
+token rzeczywistego supervisora, wyliczone dla aktualnego procesu. Brak użytecznego
+start token blokuje consume. Tylko lock winner dostaje permit.
+
+Pod host→store locks wymagamy exact Active bound lease, Committed/Pending,
+Accepted/awaiting-preparation task, dokładnie jednego zgodnego launch dla próby,
+braku exit evidence i preparation receipt. Exact launch replay confirmuje
+trwałość zapisu przed consume. Preparer weryfikuje digest/powiązanie original
+launch i consumed permit; heartbeat po spawn nie zmienia tej tożsamości.
+
+Exit proof zawiera ten sam actual launch owner i jest porównywany z host record.
+PID/start token exit receipt nadal opisuje child, a nie supervisora. Legacy
+unbound replay pozostaje ambiguous; Consumed bez owner metadata wymaga migracji.
+Consumed-before-spawn positive recovery i preparation no-spawn pozostają otwarte.
+
+
+### 13.25 Roll-forward preparation admission
+
+Awaria po local lease publication, przed host Committed, jest uzgadniana pod
+host→store locks. Wymagane są exact canonical store/reservation, Tentative/Pending
+preparation owner, Active lease z tym samym binding/policy/budget/identity oraz
+current Accepted/awaiting-preparation task bez preparation receipt. Trwałość
+lease jest potwierdzana przed atomowym Tentative→Committed. Operacja nie tworzy
+nowej próby, tokena ani launch. Brak/released lease pozostawia hold; mismatch
+lub corruption zatrzymuje recovery.
+
+Przed finalizacją exit live release ponownie porównuje jedyny launch z owner
+launch ID/canonical digest oraz ledger root lease. Immutable released proof
+pinuje owner, więc późniejsze odczyty historycznego release nie resamplują store.
+
+
+### 13.26 Nieopublikowane preparation admission
+
+Rollback przed local lease wymaga pod host→store locks exact Tentative/Pending
+preparation identity, braku lease pod exact token (także Released), aktywnej
+preparation/solver lease zadania, related launch/exit próby oraz preparation
+receipt. Pozytywnym certyfikatem jest istniejący Accepted task z readiness
+awaiting-preparation, bez claim/epoch/resource/genesis/watermark. Brak catalogu
+lub zadania nie jest certyfikatem; nieczytelne rekordy są błędami.
+
+Immutable PreparationAdmissionAbsent proof z request digest i captured accepted
+task jest confirmowany przed atomic Closed+Released. Historyczny proof nie
+odczytuje ponownie zmiennego store. Nie tworzymy lease ani nowej próby, a stara
+identity/attempt nie może być użyta ponownie. Preparation nie zużywa solver epoch.
+
+
+### 13.27 Anulowane preparation przed spawn
+
+No-spawn release wymaga exact Tentative/Committed Pending lub Closed preparation
+reservation, bound local lease i durable Cancelled task bez solver claim/epoch/
+resource/genesis/watermark. Raw solver-lease scan oraz active prep enumeration
+odrzucają sprzeczny drugi owner; existing prepared receipt lub related exit
+wyklucza tę ścieżkę. Consumed nie może zostać zamienione na no-spawn.
+
+Pod host→store locks confirmujemy catalog, trwale zamykamy gate, zwalniamy local
+lease i confirmujemy jej Released publication. Immutable PreparationNoSpawn
+proof z released lease i captured cancelled task poprzedza host Released.
+Awaria po Closed lub local release jest replayowalna; dowód historyczny nie
+resampluje późniejszego store. Hook uzgadnia już zapisane anulowanie; publiczna
+komenda anulowania pre-admission/preparation i jej UI wymagają osobnego odbioru E4.
+
+
+### 13.28 Żądanie anulowania zadania bez claimu
+
+Trwały `task_cancellation_intent.v1` jest osobnym, niezmiennym rekordem
+`runs/<run>/task_cancellation_intents/<task>.json`. Zawiera identyfikator
+żądania, oczekiwaną rewizję catalogu, dokładny snapshot Accepted/Queued task
+bez aktywnego claimu, przyczynę i kanoniczny digest bez czasu publikacji.
+Snapshot może zachować historyczną ownership epoch po retry. Rekord ma limit
+256 KiB; przyczyna jest niepusta i ograniczona do 4096 bajtów.
+
+Store serializuje żądanie swoim writerem: publikuje intent przed podbiciem
+rewizji catalogu, zachowując treść zadania. Exact retry sprawdza wcześniejszy
+rekord przed expected-revision CAS; naprawa brakującej rewizji wymaga dokładnego
+snapshotu. Inne żądanie dla tego samego zadania jest konfliktem. Nowy admission
+jest zablokowany, lecz exact wcześniej opublikowany admission może być naprawiony
+i następnie obsłużony przez istniejący protokół Stop.
+
+Supervisor pod host→store locks sprawdza intent przed konsumowaniem solver
+lub preparation launch permit. Samo żądanie nie zamyka gate, nie zwalnia
+capacity, nie zmienia Consumed i nie projektuje terminalnego Cancelled. Scheduler
+musi zastosować anulowanie zależnie od rzeczywistego stanu bramki i procesu;
+Consumed preparation zachowuje Accepted do prawidłowego uzgodnienia finalizacji.
+Publiczny wynik requested jest odrębny od potwierdzenia zakończenia i od
+WorkerCommand. Retencja FMS/live/archive zachowuje intent bez nowych CAS roots.
+
+Integracja scheduler/API/OpenAPI/UI oraz runtime/fault-injection odbiór tej
+ścieżki pozostają otwarte. Sam zapis rekordu nie oznacza gotowego anulowania.
+
+
+Scheduler obu faz enumeruje run-scoped intent records i stosuje je po
+reconciliation host reservations. NOWY host admission sprawdza intent przed
+publikacją rezerwacji. Terminalna projekcja wymaga braku aktywnego solver lease
+i nieuzgodnionego published admission; historycznych claimów nie odtwarza się
+zbiorczo na potrzeby anulowania. Exact prior owner najpierw kończy handoff
+Prepare/Start, potem zapisuje rzeczywisty Stop i wykonuje no-spawn recovery.
+Consumed preparation czeka na exit/finalization/release; nie zamieniamy
+niepewnego procesu na niewykorzystane pozwolenie. Oba supervisory, również
+legacy bez host ledger, odmawiają spawn przy existing intent.
+
+Live/archive traversal odrzuca intent z expected revision nowszą od catalogu;
+równa rewizja jest dopuszczona dla crash przed catalog bump. Wprowadzone
+podłączenia źródeł pozostają NOT VERIFIED do nowej bramki produkcyjnej oraz
+nie zastępują runtime/fault-injection i public API/UI odbioru.
+
+
+Publiczna cancellation surface zachowuje legacy request reason-only i Stop
+response z command_id. Nowa gałąź wymaga razem cancellation_id oraz dodatniej
+expected_catalog_revision; zwraca Requested z własnym cancellation_id i
+aktualnym lifecycle, bez fikcyjnego WorkerCommand. Task readmodel ma optional
+cancellation_intent summary walidowany pod kątem snapshot/revision/ownership.
+Zajęty writer daje retryable run_store_busy. Potwierdzone odrzucenie NEW request
+z nowszym catalogiem daje run_task_cancel_revision_conflict; UI może wtedy
+po odświeżeniu utworzyć nowe żądanie. Unknown publication lub transport failure
+zachowują pierwotny id/revision i nie oznaczają odrzucenia ani zakończenia.
+Ograniczony native component gate potwierdził żądania API i projekcję obu
+nieprzypisanych tasków przez standalone scheduler: rev5, Cancelled, bez claimów
+i host reservations. Scheduler zakończył się jawnym `stdin-v1` drain; konfiguracja
+v2 nadal nie startuje przez service ownera. [Raport](../plans/active/compute-execution-20261004/scheduler-cancellation-check-20261007.md)
+oddziela ten dowód od Submit, worker/release, service lifecycle i fizycznego
+enforcement. Browser/full Settings acceptance pozostaje otwarte.
+
+### 13.29 Inicjalizacja przypiętej konfiguracji hosta
+
+Wejście operatora `fullmag runtime initialize-host-application --config <absolute-path>
+--config-sha256 <digest>` przyjmuje zwalidowaną konfigurację v2 i SHA-256 jej
+kanonicznej, typowanej reprezentacji JSON, zgodnie z pinem schedulera.
+Digest nie jest hashem formatowania pliku. Niepoprawny pin lub niezgodność
+odrzuca operację przed otwarciem SessionStore. Store musi już istnieć.
+`store_root` odpowiada dokładnej kanonicznej ścieżce SessionStore, także
+kanonicznemu prefiksowi ścieżki Windows. Puste pola pomijane przez serde nie
+wchodzą do typowanego pinu, nawet gdy są obecne w wejściowym JSON.
+
+Inicjalizator utrwala `runtime-services/APPLICATION.json` przez istniejącą
+granicę konfiguracji aplikacji. Istniejąca konfiguracja musi być dokładnie
+równa kandydatowi; v1 ani zmieniona polityka nie są automatycznie migrowane.
+Ledger jest inicjalizowany dopiero po tej publikacji, bez trzymania store
+writera podczas przejęcia host writera. Błąd ledgera pozostawia przypiętą
+konfigurację do dokładnego ponowienia; częściowego stanu ledgera nie odbudowuje.
+
+Startup guard i launch guard wykluczają konkurencyjne uruchomienie podczas
+inicjalizacji. Obecność OWNER.lock, OWNER.json lub LAUNCH.json wymaga osobnej
+ścieżki uzgodnienia ownera; nie usuwamy tych rekordów ani nie oceniamy ich
+bezpieczeństwa na podstawie wieku lub PID. Inicjalizacja nie próbkuje ponownie
+zasobów, nie zmienia owner epoch, nie uruchamia procesów ani nie publikuje pul.
+
+Wynik `runtime_host_initialization.v1` wiąże configuration digest, store ID,
+target, host ID, policy revision, owner epoch i topology digest. Pole
+`execution_available: false` zachowuje rozdział inicjalizacji od dostępności
+wykonania. Guard startu runtime v2 pozostaje do czasu odbioru pełnego lifecycle,
+topologii, enforcement i recovery. Status implementacji i bramek dowodowych
+określa checkpoint; ten kontrakt sam nie dowodzi wykonania.
+
+Ograniczony odbiór operator initialization na przypiętym pakiecie opisuje
+[raport 26 kontroli natywnych](../plans/active/compute-execution-20261004/host-initialization-check-20261007.md).
+Nie odblokowuje on guardu v2 ani pozostałych bramek wykonania.
 
 ## Wspólna normalizacja authoring — ADR0057
 

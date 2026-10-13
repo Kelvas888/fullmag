@@ -410,11 +410,26 @@ function appMenuDialogReducer(
 export function AppMenuBar() {
   const sessions = useSessionCollection();
   const identity = useSessionResourceIdentity();
+  const [newProblem, setNewProblemOpen] = useNewProblemRequest();
+  const hasActiveSession = sessions.state === "ready" && Boolean(identity);
 
-  return sessions.state === "ready" && identity ? (
-    <SessionAppMenuBar />
-  ) : (
-    <NoSessionAppMenuBar state={sessions.state === "ready" ? "loading" : sessions.state} />
+  return (
+    <>
+      {hasActiveSession ? (
+        <SessionAppMenuBar />
+      ) : (
+        <NoSessionAppMenuBar
+          state={sessions.state === "ready" ? "loading" : sessions.state}
+        />
+      )}
+      <NewProblemDialog
+        hasActiveSession={hasActiveSession}
+        initialBackend={newProblem.backend}
+        key={newProblem.key}
+        open={newProblem.open}
+        onOpenChange={setNewProblemOpen}
+      />
+    </>
   );
 }
 
@@ -425,7 +440,6 @@ function NoSessionAppMenuBar({
 }) {
   const kernel = useKernel();
   const { theme, setTheme } = useTheme();
-  const [newProblem, setNewProblemOpen] = useNewProblemRequest();
   const homeOpen = useHomeViewOpen();
   const project = useProjectDocumentSnapshot();
   // Without a session the start screen is the page itself, unless a project is open.
@@ -514,13 +528,6 @@ function NoSessionAppMenuBar({
         <ProjectDocumentStatus />
         <ThemeSwitcher theme={theme} onThemeChange={setTheme} />
       </div>
-      <NewProblemDialog
-        hasActiveSession={false}
-        initialBackend={newProblem.backend}
-        key={newProblem.key}
-        open={state === "no-session" && newProblem.open}
-        onOpenChange={setNewProblemOpen}
-      />
     </header>
   );
 }
@@ -547,7 +554,6 @@ function SessionAppMenuBar() {
     appMenuDialogReducer,
     APP_MENU_DIALOG_INITIAL_STATE,
   );
-  const [newProblem, setNewProblemOpen] = useNewProblemRequest();
   const homeOpen = useHomeViewOpen();
   const setDataPreviewOpen = (open: boolean) =>
     dispatchDialogState({ open, type: "data-preview" });
@@ -742,14 +748,6 @@ function SessionAppMenuBar() {
       <CommunicationPolicyDialog
         onOpenChange={setCommunicationOpen}
         open={dialogState.communicationOpen}
-      />
-
-      <NewProblemDialog
-        hasActiveSession
-        initialBackend={newProblem.backend}
-        key={newProblem.key}
-        open={newProblem.open}
-        onOpenChange={setNewProblemOpen}
       />
 
       <div className="fm-header__separator" />

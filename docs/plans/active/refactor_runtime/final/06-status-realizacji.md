@@ -1,5 +1,132 @@
 # Status realizacji całego planu refaktoryzacji
 
+Checkpoint 13.10.2026 — [P8-53BM: zachowanie kamery](p8/53bm-camera-preservation.md):
+natywny pakiet API/CLI/desktop completed exit 0; regresja API 301 kontroli
+PASS, jawne set/absent/null skali i kanoniczny OpenAPI potwierdzone.
+Fixture ownerów 35/35, a po rozszerzeniu diagnostyki capture 36/36 PASS,
+scoped lint i review PASS. Commity `6b4fceba3379d5944c3f16f5329291ca9b6cafef`
+oraz `48d3893cca7d7f7fdd0b7408051d3955039318ac` są na remote master.
+Rzeczywisty browser utworzył 1 obiekt, 1 region i 1 materiał oraz potwierdził
+niezerowy canvas bez utraty kontekstu. Restart odmówił capture przed POST;
+próba została jawnie anulowana, 19/19 procesów terminalnych. Brak dowodu
+kamery po restarcie. Nowy build diagnostyki nie wystartował przez zajęty
+slot (120s, exit 2). **P8-53BM i P8-53 pozostają IN PROGRESS**; procentów
+całego planu nie zmieniono. [P8-55](p8/55-network-storage-assessment-20261013.md)
+uzupełnia ocenę Z: o niezależne bramki lokalnego writera i TEMP; nie ma
+kwalifikacji aktywnego storage SMB ani migracji.
+
+Kontynuacja P8-53: [53BH — szkic materiału po odświeżeniu](p8/53bh-inspector-first-edit-after-resource-refresh.md).
+Realny browser potwierdził odmowę restartu przy szkicu nazwy i jawny Apply
+(rewizja 1→2), następnie odtworzył błąd pierwszej edycji materiału:
+zmiana alpha wyczyściła nietknięte pola. Próba diagnostyczna została jawnie
+anulowana, wszystkie 19 procesów odebrane; nie jest to PASS restartu.
+Poprawka źródeł, 20 interpretowanych przypadków i production typecheck PASS;
+ponowny browser proof w toku. Procenty planu bez zmiany.
+
+Checkpoint 13.10.2026: **P8-53BE CLOSED — pierwsza bramka FDM CPU**.
+Build K completed exit 0, frozen-native API gate 296 kontroli PASS,
+OpenAPI/client generation i import checks PASS. Browser F→K
+`01ad57bafdca4a89881a4138c1fdbfcd`: completed exit 0, 9 kontroli;
+identyczna scena i dirty document po restore, normalne Grid, Compute
+Study 10 kroków / 1 ps, requested/resolved FDM CPU strict double,
+jawny Close i normalny solver wait exit 0 bez kill. Pozostałe bramki
+P8-53 oraz publiczny restart pozostają otwarte. Procentów całego planu
+nie przeliczono na podstawie tego pojedynczego dowodu. Poniższe wpisy
+są wcześniejszymi checkpointami. [Dowody](p8/53bg-acquisition-refusal-diagnostics.md).
+
+Checkpoint po próbie `523affb9b5dd4a13820b33e52171b550`: dziesięć
+produkcyjnych przypadków plannera oraz Grid 4×4×1 PASS, normalny child wait
+exit 0. Poprawka admission jest na lokalnym i remote master:
+`c5ea6a74119b69ce529cee6911815302db7f004c` ([P8-53BF](p8/53bf-fdm-material-anisotropy-admission.md)).
+Acquisition przed restore odmówiła; obserwowany scratch ma disconnected/
+forbidden mimo awaiting_command. Próba terminalna failed, exit 1,
+20/20 procesów i frontend odebrane. Restore/Compute i publiczny restart
+pozostają otwarte. Procenty całego planu bez zmian.
+
+Najnowszy przyrost 13.10.2026: poprawka admission lokalnej anizotropii
+w plannerze single-grid/multilayer FDM jest **WIP**. Scoped review po
+korektach współczynników/osi bez findings, parser/format check PASS.
+Rust regression source dodane, **NOT RUN**. Nowy managed build nie
+rozpoczął kompilacji: bounded wait na heavy slot wygasł po 120 s,
+session 51935 terminalna exit 1. Po zwolnieniu slotu nowy build
+`native-build-512469b6d89f42708b86926e2f540f2e.log` zakończył się
+completed, exit 0, manifest
+`fe245a03ab381c0d6a8eea5560a157fe4ca2e20fd2915b514487833e6eb9f730`.
+Managed handoff `80afe98f862447cca0045d1706fe05c1`: 158 testów PASS,
+completed, exit 0. Bramka produkcyjnego plannera i końcowe Grid/restore/Compute
+są w toku. Szczegóły w P8-53BE poniżej; procenty bez zmian.
+
+Checkpoint 13.10.2026: P8-53BE nadal **IN PROGRESS**. Rzeczywista próba
+`52a8ef28d5f44de689a58879ef962ee9` zakończyła się failed, exit 1;
+wykryto zbyt krótki timeout synchronizacji modelu (1 s). Przygotowana
+poprawka ogranicza helper API do 30 s, daje żądaniu sync 45 s i blokuje
+automatyczny replay/idle przy nieznanym wyniku. Managed build
+`native-build-61cc793f80324a4bb055e566ebc70758.log` zakończył się exit 0.
+Kolejna próba browserowa `25b8fb06696c4ebcb7d4a96cfb35629b` zakończyła
+się failed: synchronizacja ujawniła pominięcie jawnej anizotropii obiektu
+w bootstrapie eksportu Python. Poprawka jest na lokalnym i remote master
+(`27c43be1315bb70018a24b42aa15eec3cec6bc3e`); managed regresje
+`97f8c84e2ff9469a9636ca5156a4be77` zakończyły się exit 0, 156/156 PASS.
+Build pakietu `native-build-b5ff76c94cfe478d9252d8959b6c0e07.log`
+zakończył się completed, exit 0; manifest
+`9e8e0d5f95aa47dd0fdb35db28c7779e15be7ff70e3280b47adb467e7a4d7832`.
+Końcowe Grid/Compute po restore nie są jeszcze zaliczone. Procenty całego planu
+pozostają bez zmian. Próba `0aec17ea7b3c40b9900e92d70948ba85` zakończyła
+się failed, exit 1: eksport i materializacja przeszły, lecz planner FDM
+odrzucił model z samą anizotropią. Grid child odebrany normalnie, exit 1;
+wszystkie dziewięć procesów oraz frontend odebrane. Następny krok to
+rozstrzygnięcie warunku wymagającego globalnego energy term w plannerze.
+Procenty całego planu
+pozostają bez zmian. [Dowody i następna bramka](p8/53be-compute-after-workspace-restore.md).
+
+Aktualny przyrost P8-53BE: grid-only custody zaimplementowane i zbudowane
+w produkcyjnym native build F (exit 0); końcowy review bez findings.
+Managed handoff `34f25d27bbdd424283cdbfea0ef30a36`: 151/151 PASS,
+completed, exit 0. Managed API/archive
+`45e1ec45441a47eda950e2e0ea57f7b3`: 33 kontrole PASS, completed, exit 0;
+zachowano pakiet A do testu restartu. Dowody parsera i kompilacji nie
+zamykają wykonania Grid/Compute po restore. Nowy probe oraz rzeczywisty
+solver/browser pozostają IN PROGRESS; publiczny restart wyłączony,
+procenty P0–P8 bez zmian. [Szczegóły](p8/53be-compute-after-workspace-restore.md).
+
+Checkpoint P8-53BE, 07.10.2026: [Compute po restore](p8/53be-compute-after-workspace-restore.md)
+**IN PROGRESS**. Real browser `bb551f895a854177939cd55e9fc1f54f`
+odtworzył błąd zapisu Run: numeric until_seconds trafiał do tekstowego
+builder stage DTO. Próba terminalna failed, 8/8 własnych procesów odebrane;
+nie wykonano replacement ani Compute. Rozdzielono stage SceneDocument od
+buildera, zachowując legacy drafts/extra i fail-closed eksport. Read-only
+review bez findings, Rust regression source NOT RUN. Nowa regresja HTTP
+sprawdza rzeczywistą transakcję/odczyt sceny. Produkcyjny native build exit 0,
+manifest `7d87e9c8bdeaf1ad95c9aa8884db6758e4e657f4bb852e90c5995b54a44dd74e`.
+Finalna managed regresja `0bdb5b739e864f8786433c83aa17ef28`:
+32 kontrole PASS, completed, exit 0, wszystkie 6 procesów odebrane,
+sealed źródła i pakiet zweryfikowane ponownie na końcu.
+**CLOSED** dla numeric stage authoring; Compute po restore pozostaje otwarte.
+Wcześniejsza próba 32 kontroli failed przez wygenerowany Python bytecode;
+naprawiono zapis cache bez osłabienia inventory checks.
+Pierwszy build odmówił podczas snapshotu przy zmianie
+źródeł; kontrola integralności nie została wyłączona. Osobno otwarte są
+poprawne raportowanie acquisition refusal, jawne retry po potwierdzonej
+odmowie i terminalny solver po restore. Publiczny restart pozostaje wyłączony,
+workspace 3197 nie był restartowany, procentów P0–P8 nie zwiększono.
+
+Checkpoint P8-53BD, 07.10.2026: [zapis projektu bez fizyki](p8/53bd-incomplete-physics-project-persistence.md)
+**CLOSED** dla zapisu i odtworzenia projektu z materiałem i magnetyzacją,
+lecz bez oddziaływań/anizotropii. Runtime i zwykły renderer pozostają ścisłe.
+Review bez findings. Finalne managed regresje 140/140, bez skipów:
+`0f5be07d23d84aea8f5a4527c680508d`. Produkcyjny native build completed,
+exit 0, manifest `4546a80021efcc6c9b8a1b5e1a8725a3a9b538f2222832ef70bc0f277087ecee`.
+Managed API `261180dbb23242f4a906d267bafdc7a2`: 28 kontroli PASS,
+exit 0; zachowanie sceny, assetów, historii, noop/reopen i odtworzenia źródła.
+Deadline i log overflow nadal są odrzucane. Finalny real browser
+`782a66b4710b494d820f07ee2978b06d`: completed, exit 0, 7/7 PASS,
+13/13 procesów oraz frontend odebrane. Projekt revision 2, dirty=true
+oraz scena revision 6 zachowane dokładnie po B → C; API, sesja i scope świeże.
+Canvas visible, contextLost=false, drawing buffer 519 × 297; noEmit/lint PASS.
+Historyczne nieudane próby pozostają opisane w raporcie, nie są liczone jako PASS.
+Workspace 3197 nie był restartowany. Compute po restore, publiczny restart
+oraz pełny plan pozostają otwarte; procentów P0–P8 nie zwiększono.
+
 Checkpoint P8-53BC, 06.10.2026: [real active-run restart refusal](p8/53bc-real-active-run-restart-refusal.md)
 **CLOSED** dla odmowy podczas `running` i `paused` oraz wyścigu Start/freeze.
 Potwierdzają to trzy managed receipts z finalnego builda

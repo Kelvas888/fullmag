@@ -14,6 +14,7 @@ import warnings
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -23,8 +24,14 @@ from fullmag._progress import (
     indeterminate_progress_phase,
 )
 from fullmag._validation import ensure_unique_names, require_non_empty
+from fullmag.cuda_device_identity import legacy_cuda_binding
+from fullmag.model._incomplete import IncompletePhysicsError
 from fullmag.init.textures import PresetTexture
 from fullmag.model.antenna import (
+    AntennaFieldSolveStage,
+    AntennaSpectrumRequest,
+    AntennaTargetProjection,
+    AntennaPortMode,
     AntennaFieldSource,
     DriveActivation,
     FieldTarget,
@@ -32,6 +39,7 @@ from fullmag.model.antenna import (
     RegionalFieldDrive,
     SincFieldProfile,
     SpinWaveExcitationAnalysis,
+    SolvedAntennaDrive,
     UniformFieldProfile,
 )
 from fullmag.model.couplings import Coupling
@@ -74,7 +82,7 @@ from fullmag.model.structure import (
     ObjectRegion,
     Region,
 )
-from fullmag.model.study import Eigenmodes, FrequencyResponse, Relaxation, TimeEvolution
+from fullmag.model.study import AntennaFieldSolve, Eigenmodes, FrequencyResponse, Relaxation, TimeEvolution
 from fullmag.model.selection import SelectionDefinition
 
 IR_VERSION = "0.3.0"
@@ -413,6 +421,8 @@ def _fem_mesh_cache_dir() -> Path | None:
         return None
     if raw:
         path = Path(raw).expanduser()
+    elif (cache_root := os.environ.get("FULLMAG_CACHE_ROOT")) and cache_root.strip():
+        path = Path(cache_root).expanduser() / "fem_mesh_assets"
     else:
         path = Path.cwd() / ".fullmag" / "local" / "cache" / "fem_meshes"
     path.mkdir(parents=True, exist_ok=True)
@@ -694,6 +704,7 @@ def _fem_mesh_cache_key(
     mesh_workflow: dict[str, object] | None = None,
     per_object_recipes: Mapping[str, PerObjectMeshRecipe] | None = None,
     owner_geometry_names: Sequence[str] | None = None,
+    object_id: str | None = None,
 ) -> str:
     resolved_owner_geometry_names = sorted(
         owner_geometry_names
@@ -703,6 +714,7 @@ def _fem_mesh_cache_key(
     payload = {
         "version": _FEM_MESH_CACHE_VERSION,
         "geometry": _geometry_cache_fingerprint(geometry),
+        "object_id": object_id,
         "fem": hints.to_ir(),
         "study_universe": study_universe,
         "mesh_workflow": mesh_workflow,
@@ -859,12 +871,14 @@ def build_geometry_assets_for_request(
     mesh_workflow: dict[str, object] | None = None,
     per_object_recipes: Mapping[str, PerObjectMeshRecipe] | None = None,
     object_regions: Sequence[dict[str, object]] | None = None,
+    geometry_object_ids: Mapping[str, str] | None = None,
     asset_cache: dict[str, dict[str, Any] | None] | None = None,
     _copy_cached_assets: bool = True,
     _include_domain_mesh_ir: bool = True,
     _realized_domain_mesh_sink: list[
         tuple[object, list[dict[str, object]], object | None]
     ] | None = None,
+    _realized_object_mesh_sink: dict[str, object] | None = None,
 ) -> dict[str, Any] | None:
     if discretization is None:
         return None
@@ -882,9 +896,10 @@ def build_geometry_assets_for_request(
         mesh_workflow=mesh_workflow,
         per_object_recipes=per_object_recipes,
         object_regions=object_regions,
+        geometry_object_ids=geometry_object_ids,
         fdm_only=fdm_only,
     )
-    if asset_cache is not None and asset_cache_key in asset_cache:
+    if _realized_object_mesh_sink is None and asset_cache is not None and asset_cache_key in asset_cache:
         cached = asset_cache[asset_cache_key]
         return copy.deepcopy(cached) if _copy_cached_assets else cached
 
@@ -956,10 +971,21 @@ def build_geometry_assets_for_request(
                     )
 
     if discretization.fdm is not None:
-        from fullmag.model.geometry import Cylinder, ImportedGeometry
+        from fullmag.model.geometry import (
+            CPWAntennaLayout,
+            Cylinder,
+            ImportedGeometry,
+            MicrostripAntennaLayout,
+        )
         from fullmag.meshing import realize_fdm_grid_asset
 
         for geometry in geometries:
+            # A conductor-backed antenna is an authoring/field-solve object,
+            # never a magnetic FDM occupancy mask.  Keep it in the canonical
+            # geometry list for bounds and visualization, but do not hand it
+            # to the magnetic voxelizer when a study universe is present.
+            if isinstance(geometry, (MicrostripAntennaLayout, CPWAntennaLayout)):
+                continue
             should_realize = isinstance(geometry, (Cylinder, ImportedGeometry)) or study_universe is not None
             if should_realize:
                 asset = realize_fdm_grid_asset(
@@ -1009,6 +1035,11 @@ def build_geometry_assets_for_request(
                 if mesh_source is None and isinstance(geometry, ImportedGeometry):
                     mesh_source = geometry.source
                 if mesh_source is not None and mesh_source.lower().endswith(".json"):
+                    if _realized_object_mesh_sink is not None:
+                        raise ValueError(
+                            "antenna lead preparation requires actual MeshData vertex identity; "
+                            "a serialized MeshIR JSON cannot supply it"
+                        )
                     emit_progress(
                         f"Preparing FEM mesh asset for '{geometry.geometry_name}' from MeshIR JSON"
                     )
@@ -1037,6 +1068,7 @@ def build_geometry_assets_for_request(
                         mesh_workflow=mesh_workflow,
                         per_object_recipes=per_object_recipes,
                         owner_geometry_names=owner_geometry_names,
+                        object_id=(geometry_object_ids or {}).get(geometry.geometry_name),
                     )
                     cache_path = (
                         fem_mesh_cache_dir.joinpath(f"{mesh_cache_key}.npz")
@@ -1076,6 +1108,7 @@ def build_geometry_assets_for_request(
                             mesh_workflow=mesh_workflow,
                             per_object_recipes=dict(per_object_recipes or {}),
                             _owner_geometry_names=owner_geometry_names,
+                            object_id=(geometry_object_ids or {}).get(geometry.geometry_name),
                         )
                         mesh = _drop_degenerate_tetrahedra(
                             mesh,
@@ -1100,6 +1133,8 @@ def build_geometry_assets_for_request(
                         f"{mesh.n_boundary_faces} boundary faces"
                     )
                     mesh_ir = mesh.to_ir(geometry.geometry_name)
+                    if _realized_object_mesh_sink is not None:
+                        _realized_object_mesh_sink[geometry.geometry_name] = mesh
                     is_valid = validate_mesh_ir(mesh_ir)
                     if is_valid is False:
                         raise ValueError(
@@ -1493,6 +1528,7 @@ def _geometry_asset_cache_key(
     per_object_recipes: Mapping[str, PerObjectMeshRecipe] | None,
     object_regions: Sequence[dict[str, object]] | None,
     fdm_only: bool,
+    geometry_object_ids: Mapping[str, str] | None = None,
 ) -> str:
     """Build a cache identity for the products actually realized.
 
@@ -1507,6 +1543,7 @@ def _geometry_asset_cache_key(
         "study_universe": study_universe,
     }
     if not fdm_only:
+        payload["geometry_object_ids"] = dict(geometry_object_ids or {})
         payload["mesh_workflow"] = mesh_workflow
         payload["per_object_recipes"] = {
             str(name): recipe.to_ir()
@@ -1764,8 +1801,14 @@ class RuntimeSelection:
             raise ValueError(
                 "gpu_count > 1 requests multi-GPU execution, but multi-GPU execution is not implemented"
             )
-        if self.device_index is not None and self.device_index < 0:
-            raise ValueError("device_index must be >= 0")
+        if self.device_index is not None:
+            if isinstance(self.device_index, bool) or not isinstance(
+                self.device_index, Integral
+            ):
+                raise ValueError("device_index must be a nonnegative integer")
+            object.__setattr__(self, "device_index", int(self.device_index))
+            if self.device_index < 0:
+                raise ValueError("device_index must be >= 0")
         if self.cpu_threads is not None and self.cpu_threads <= 0:
             raise ValueError("cpu_threads must be >= 1")
         if self.cpu_threads is not None and self.cpu_threads > 1:
@@ -1955,6 +1998,8 @@ class RuntimeSelection:
         if self.fdm_precision_policy is not None:
             result["fdm_precision_policy"] = self.fdm_precision_policy.to_ir()
         result["parallel_execution"] = self.parallel_execution.to_ir()
+        if self.device_index is not None:
+            result["legacy_cuda_binding"] = legacy_cuda_binding(self.device_index)
         return result
 
 
@@ -2557,7 +2602,7 @@ class Problem:
     name: str
     magnets: Sequence[Ferromagnet]
     energy: Sequence[EnergyTerm]
-    study: TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | None = None
+    study: AntennaFieldSolve | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | None = None
     dynamics: LLG | None = None
     outputs: Sequence[LegacyOutputSpec] | None = None
     discretization: DiscretizationHints | None = None
@@ -2566,8 +2611,17 @@ class Problem:
     runtime_metadata: dict[str, object] = field(default_factory=dict)
     auxiliary_geometries: Sequence[object] = ()
     auxiliary_geometry_roles: Mapping[str, str] = field(default_factory=dict)
+    auxiliary_geometry_object_ids: Mapping[str, str] = field(default_factory=dict)
     current_modules: Sequence[CurrentModule] = ()
     field_drives: Sequence[RegionalFieldDrive] = ()
+    # Composition-first microwave antenna resources.  These are immutable
+    # authoring records; the solved field asset is produced by a dedicated
+    # stage and is never inferred from a field drive.
+    antenna_port_modes: Sequence[AntennaPortMode] = ()
+    antenna_field_solve_stages: Sequence[AntennaFieldSolveStage] = ()
+    antenna_target_projections: Sequence[AntennaTargetProjection] = ()
+    solved_antenna_drives: Sequence[SolvedAntennaDrive] = ()
+    antenna_spectrum_requests: Sequence[AntennaSpectrumRequest] = ()
     couplings: Sequence[Coupling] = ()
     monitors: Sequence[PlanarMonitor] = ()
     excitation_analysis: SpinWaveExcitationAnalysis | None = None
@@ -2636,12 +2690,24 @@ class Problem:
                 + ", ".join(unknown_roles)
             )
         object.__setattr__(self, "auxiliary_geometry_roles", roles)
-        if not self.magnets:
+        auxiliary_object_ids = {
+            require_non_empty(name, "auxiliary_geometry_object_ids.name"):
+            require_non_empty(object_id, "auxiliary_geometry_object_ids.object_id")
+            for name, object_id in self.auxiliary_geometry_object_ids.items()
+        }
+        unknown_ids = sorted(set(auxiliary_object_ids) - set(roles))
+        if unknown_ids:
+            raise ValueError(
+                "auxiliary_geometry_object_ids references unknown geometry object(s): "
+                + ", ".join(unknown_ids)
+            )
+        object.__setattr__(self, "auxiliary_geometry_object_ids", auxiliary_object_ids)
+        if not self.magnets and not isinstance(self.study, AntennaFieldSolve):
             raise ValueError("Problem requires at least one magnet")
-        if not self.energy and not any(
+        if not isinstance(self.study, AntennaFieldSolve) and not self.energy and not any(
             _material_has_anisotropy(magnet.material) for magnet in self.magnets
         ):
-            raise ValueError(
+            raise IncompletePhysicsError(
                 "Problem requires at least one interaction or material anisotropy"
             )
 
@@ -2718,6 +2784,15 @@ class Problem:
             magnet.object_id for magnet in self.magnets if magnet.object_id is not None
         ]
         ensure_unique_names(explicit_object_ids, "magnet object_ids")
+        ensure_unique_names(
+            [
+                *(magnet.object_id if magnet.object_id is not None else magnet.name
+                  for magnet in self.magnets),
+                *(self.auxiliary_geometry_object_ids.get(name, name)
+                  for name in self.auxiliary_geometry_roles),
+            ],
+            "object_ids",
+        )
         self._validate_magnetization_constraints()
         ensure_unique_names(
             (module.name for module in self.current_modules), "current module names"
@@ -2726,6 +2801,16 @@ class Problem:
         ensure_unique_names((drive.name for drive in self.field_drives), "field drive names")
         if any(not isinstance(drive, RegionalFieldDrive) for drive in self.field_drives):
             raise TypeError("Problem.field_drives must contain RegionalFieldDrive objects")
+        for name, values, expected in (
+            ("antenna_port_modes", self.antenna_port_modes, AntennaPortMode),
+            ("antenna_field_solve_stages", self.antenna_field_solve_stages, AntennaFieldSolveStage),
+            ("antenna_target_projections", self.antenna_target_projections, AntennaTargetProjection),
+            ("solved_antenna_drives", self.solved_antenna_drives, SolvedAntennaDrive),
+            ("antenna_spectrum_requests", self.antenna_spectrum_requests, AntennaSpectrumRequest),
+        ):
+            if any(not isinstance(value, expected) for value in values):
+                raise TypeError(f"Problem.{name} must contain {expected.__name__} objects")
+            ensure_unique_names((value.id for value in values), f"{name} ids")
         magnetic_object_ids = {magnet.name for magnet in self.magnets}
         region_ids = {
             (region.owner_object, region.region_id) for region in self._collect_object_regions()
@@ -2989,6 +3074,7 @@ class Problem:
                 mesh_workflow=mesh_workflow,
                 per_object_recipes=per_object_recipes,
                 object_regions=object_region_mesh_specs,
+                geometry_object_ids=self._geometry_object_ids(),
                 asset_cache=effective_asset_cache,
                 _copy_cached_assets=_copy_cached_geometry_assets,
             )
@@ -3007,14 +3093,13 @@ class Problem:
         physics_objects = [
             {
                 "schema_version": "physics_object.v1",
-                "object_id": name,
+                "object_id": self.auxiliary_geometry_object_ids.get(name, name),
                 "name": name,
                 "type": role,
                 "geometry_id": name,
                 "material_assignment_ids": [],
             }
             for name, role in self.auxiliary_geometry_roles.items()
-            if role != "antenna"
         ]
 
         result = {
@@ -3051,6 +3136,19 @@ class Problem:
             "couplings": [coupling.to_ir() for coupling in self.couplings],
             "planar_monitors": [monitor.to_ir() for monitor in self.monitors],
             "field_drives": [drive.to_ir() for drive in self.field_drives],
+            "antenna_port_modes": [mode.to_ir() for mode in self.antenna_port_modes],
+            "antenna_field_solve_stages": [
+                stage.to_ir() for stage in self.antenna_field_solve_stages
+            ],
+            "antenna_target_projections": [
+                projection.to_ir() for projection in self.antenna_target_projections
+            ],
+            "solved_antenna_drives": [
+                drive.to_ir() for drive in self.solved_antenna_drives
+            ],
+            "antenna_spectrum_requests": [
+                request.to_ir() for request in self.antenna_spectrum_requests
+            ],
             "magnets": magnets_ir,
             "selections": [selection.to_ir() for selection in self.selections],
             "magnetization_constraints": [
@@ -3095,6 +3193,14 @@ class Problem:
         }
         if physics_objects:
             result["physics_objects"] = physics_objects
+        if include_geometry_assets:
+            from fullmag.runtime.antenna_lead_materialization import materialize_antenna_lead_preparations
+
+            materialize_antenna_lead_preparations(
+                self, result, geometries=geometries, discretization=discretization,
+                mesh_workflow=mesh_workflow,
+                runtime_device_override=runtime_device_override,
+            )
         return result
 
     def to_model_definition(self, *, model_id: str | None = None) -> "ModelDefinition":
@@ -3205,7 +3311,7 @@ class Problem:
             hybrid=self.discretization.hybrid,
         )
 
-    def _normalize_study(self) -> TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse:
+    def _normalize_study(self) -> AntennaFieldSolve | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse:
         if self.study is not None and (self.dynamics is not None or self.outputs is not None):
             raise ValueError(
                 "Problem accepts either study=... or the legacy dynamics=... and outputs=... shape, not both"
@@ -3284,7 +3390,7 @@ class Problem:
         for geometry in self.auxiliary_geometries:
             geometry_name = geometry.geometry_name
             role = self.auxiliary_geometry_roles.get(geometry_name)
-            if role is None or role == "antenna" or geometry_name in seen:
+            if role is None or geometry_name in seen:
                 continue
             regions.append(Region(name=geometry_name, geometry=geometry))
             seen.add(geometry_name)
@@ -3329,13 +3435,24 @@ class Problem:
         for geometry in self.auxiliary_geometries:
             geometry_name = geometry.geometry_name
             role = self.auxiliary_geometry_roles.get(geometry_name)
-            if role not in {"conductor", "electrode", "geometry"}:
+            if role not in {"conductor", "electrode", "geometry", "antenna"}:
                 continue
             if geometry_name in seen and seen[geometry_name] != geometry_name:
                 raise ValueError(
                     f"region '{geometry_name}' is bound to conflicting geometries"
                 )
             seen[geometry_name] = geometry_name
+
+    def _geometry_object_ids(self) -> dict[str, str]:
+        return {
+            **self.auxiliary_geometry_object_ids,
+            **{
+                magnet.geometry.geometry_name: (
+                    magnet.name if magnet.object_id is None else magnet.object_id
+                )
+                for magnet in self.magnets
+            },
+        }
 
     def _build_geometry_assets(
         self,
@@ -3349,6 +3466,7 @@ class Problem:
             requested_backend=requested_backend,
             geometries=geometries,
             discretization=discretization,
+            geometry_object_ids=self._geometry_object_ids(),
             per_object_recipes={
                 magnet.geometry.geometry_name: magnet.mesh
                 for magnet in self.magnets

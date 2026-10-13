@@ -202,6 +202,7 @@ async fn coordinator_transition_survives_store_reopen_and_writer_conflict() {
             heartbeat_at: now,
             heartbeat_sequence: claim.lease.heartbeat_sequence,
             released_at: None,
+            host_launch_binding: None,
         })
         .unwrap();
     let mut coordinator =
@@ -1111,7 +1112,8 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
     assert!(state.current_live_state.read().await.is_none());
     let store =
-        fullmag_session::SessionStore::open(state.submit_store_root.as_ref().unwrap()).unwrap();
+        fullmag_session::SessionStore::open_existing(state.submit_store_root.as_ref().unwrap())
+            .unwrap();
     assert!(store
         .read_run_intent(accepted["run_id"].as_str().unwrap())
         .unwrap()
@@ -3766,6 +3768,210 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
 }
 
 #[tokio::test]
+async fn project_batch_submit_replays_and_lists_durable_parent() {
+    use fullmag_application::{
+        BatchAxis, BatchAxisJoin, BatchAxisTarget, BatchAxisValueKind, BatchAxisValues,
+        BatchExecutionStrategy, BatchExpansionRequest, FileProjectRepository, ProjectEnvelope,
+        ProjectId, ProjectSnapshot, RequestedExecution, RequestedResourceBudget, StudyId,
+        StudyReference, RunSpecification,
+    };
+    use fullmag_authoring::{
+        PrimitiveStageNode, StudyDiscretizationReference, StudyExecutionProfileReference,
+        StudyModelReference, StudyPipelineDocument, StudyPipelineNode, StudyPipelineNodeSource,
+        StudyPlan, StudyPlanMigrationDefaults, StudyPrimitiveStageKind, StudySolverConfigReference,
+        STUDY_PLAN_SCHEMA_VERSION,
+    };
+    use fullmag_ir::ProblemIR;
+    use fullmag_plan::{StudyProblemCatalog, StudyProblemCatalogEntry};
+    use serde_json::json;
+
+    let (app, state, _repo_root) = test_router_with_session_store_state().await;
+    *state.current_live_state.write().await = None;
+    let definition = ProjectEnvelope::blank(
+        ProjectId::parse("project-batch-http").unwrap(),
+        "Batch",
+    )
+    .unwrap();
+    let archive = FileProjectRepository::new()
+        .encode_archive(&definition)
+        .unwrap();
+    let study = StudyPlan::from_pipeline(
+        "study-batch-http",
+        1,
+        &StudyPipelineDocument {
+            version: "study_pipeline.v2".into(),
+            nodes: vec![StudyPipelineNode::Primitive(PrimitiveStageNode {
+                id: "step:run".into(),
+                label: "Run".into(),
+                enabled: true,
+                notes: None,
+                source: Some(StudyPipelineNodeSource::UiAuthored),
+                stage_kind: StudyPrimitiveStageKind::Run,
+                payload: [("until_seconds".into(), json!("1e-9"))]
+                    .into_iter()
+                    .collect(),
+            })],
+        },
+        &StudyPlanMigrationDefaults {
+            model: StudyModelReference {
+                model_id: "model:batch".into(),
+                version: "v1".into(),
+            },
+            solver_config: StudySolverConfigReference {
+                preset_id: "solver:default".into(),
+                version: "v1".into(),
+            },
+            discretization: StudyDiscretizationReference {
+                recipe_id: "mesh:default".into(),
+                version: "v1".into(),
+            },
+            execution_profile: StudyExecutionProfileReference {
+                profile_id: "exec:auto".into(),
+                version: "v1".into(),
+            },
+        },
+    )
+    .unwrap();
+    let catalog = StudyProblemCatalog::from_entries(
+        &study,
+        vec![StudyProblemCatalogEntry::from_step(
+            &study.steps[0],
+            ProblemIR::bootstrap_example(),
+        )],
+    )
+    .unwrap();
+    let catalog_value = serde_json::to_value(&catalog).unwrap();
+    let template = RunSpecification::new(
+        ProjectSnapshot::from_envelope(&definition).unwrap(),
+        StudyReference {
+            study_id: StudyId::parse(study.study_id.clone()).unwrap(),
+            plan_version: STUDY_PLAN_SCHEMA_VERSION.into(),
+            plan_sha256: study.canonical_sha256().unwrap(),
+        },
+        fullmag_session::canonical_json_sha256(&catalog_value),
+        json!({}),
+        RequestedExecution {
+            backend: "fdm".into(),
+            device: "cpu".into(),
+            precision: "double".into(),
+            mode: "strict".into(),
+            minimum_resources: Some(RequestedResourceBudget {
+                cpu_millis: 100,
+                memory_bytes: 1,
+                gpu_memory_bytes: 0,
+                storage_bytes: 1,
+            }),
+        },
+    );
+    let batch_request = BatchExpansionRequest {
+        batch_id: "batch-http".into(),
+        strategy: BatchExecutionStrategy::Independent,
+        failure_policy: fullmag_application::BatchFailurePolicy::ContinueIndependent,
+        template,
+        axes: vec![BatchAxis {
+            name: "field_z".into(),
+            target: BatchAxisTarget::ExternalFieldB {
+                step_id: "step:run".into(),
+                direction: [0.0, 0.0, 1.0],
+            },
+            value_kind: BatchAxisValueKind::Number,
+            canonical_unit: "T".into(),
+            values: BatchAxisValues::List {
+                values: vec![json!(-0.01), json!(0.02)],
+            },
+            join: BatchAxisJoin::Cartesian,
+        }],
+        master_seed: 42,
+        seed_name: "batch_seed".into(),
+        max_cases: 16,
+        max_parallel_cases: Some(2),
+    };
+    let body = json!({
+        "archive_base64": base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &archive,
+        ),
+        "idempotency_key": "submit-batch-http",
+        "batch_request": batch_request,
+        "study_plan": study,
+        "study_problem_catalog": catalog,
+        "asset_paths": {},
+    });
+    let submit = |body: String| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v2/persistence/projects/project-batch-http/batches")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let first = app
+        .clone()
+        .oneshot(submit(body.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let accepted = body_json(first).await;
+    assert_eq!(accepted["disposition"], "accepted");
+    assert_eq!(accepted["batch_id"], "batch-http");
+    assert_eq!(accepted["case_count"], 2);
+
+    let replay = app
+        .clone()
+        .oneshot(submit(body.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(body_json(replay).await["disposition"], "replayed");
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v2/persistence/projects/project-batch-http/batches?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = body_json(listed).await;
+    assert_eq!(listed["batches"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["batches"][0]["manifest_sha256"], accepted["manifest_sha256"]);
+    assert_eq!(listed["batches"][0]["published_case_count"], 0);
+    assert_eq!(listed["batches"][0]["expansion_state"], "pending");
+
+    let cases = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v2/persistence/projects/project-batch-http/batches/batch-http/cases?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cases.status(), StatusCode::OK);
+    let cases = body_json(cases).await;
+    assert_eq!(cases["axes"][0]["name"], "field_z");
+    assert_eq!(cases["axes"][0]["canonical_unit"], "T");
+    assert_eq!(cases["cases"].as_array().unwrap().len(), 2);
+    assert_eq!(cases["cases"][0]["state"], "pending_expansion");
+    assert!(cases["cases"][0]["planned_run_id"].as_str().is_some());
+
+    let mut changed = body;
+    changed["batch_request"]["axes"][0]["values"]["values"][0] = json!(-0.02);
+    let conflict = app
+        .oneshot(submit(changed.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert!(state.current_live_state.read().await.is_none());
+}
+
+#[tokio::test]
 async fn project_document_transport_creates_and_reopens_without_runtime_mutation() {
     let state = test_app_state();
     let app = build_v2_router().with_state(state.clone());
@@ -4177,16 +4383,25 @@ async fn from_script_embeds_script_provenance_and_survives_open_and_authoring() 
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "from-script response: {json:?}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "from-script response: {json:?}"
+    );
 
     let sha = format!("{:x}", Sha256::digest(FROM_SCRIPT_VALID.as_bytes()));
     assert_eq!(json["name"], "from script demo");
     assert_eq!(json["script_import"]["name"], "from script demo.py");
     assert_eq!(json["script_import"]["sha256"], sha);
     assert_eq!(json["script_import"]["origin"], "template:demo");
-    assert_eq!(json["script_import"]["script_path"], "project/source/script.py");
+    assert_eq!(
+        json["script_import"]["script_path"],
+        "project/source/script.py"
+    );
     assert_eq!(json["script_import"]["fidelity"]["scene_exported"], true);
-    let round_trip = json["script_import"]["fidelity"]["round_trip"].as_str().unwrap();
+    let round_trip = json["script_import"]["fidelity"]["round_trip"]
+        .as_str()
+        .unwrap();
     assert!(
         matches!(round_trip, "verified" | "failed" | "not_checked"),
         "round_trip: {round_trip}"
@@ -4260,7 +4475,10 @@ async fn from_script_embeds_script_provenance_and_survives_open_and_authoring() 
         "project/source/script.json",
         "project/provenance.json",
     ] {
-        assert_eq!(reopened_documents[path], documents[path], "{path} survives open");
+        assert_eq!(
+            reopened_documents[path], documents[path],
+            "{path} survives open"
+        );
     }
 
     // An authoring update replaces project/source.py, never the embedded script.
@@ -4333,7 +4551,10 @@ async fn from_script_reports_export_failure_as_422_and_keeps_nothing() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json:?}");
     assert_eq!(json["code"], "script_export_failed");
     assert!(
-        json["message"].as_str().unwrap().contains("boom-marker-4711"),
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("boom-marker-4711"),
         "the helper's error is returned: {json:?}"
     );
     let leftovers = fs::read_dir(root.join("workspace")).unwrap().count();
@@ -4429,15 +4650,17 @@ async fn from_script_survey_over_example_files() {
             let fidelity = &json["script_import"]["fidelity"];
             println!(
                 "SURVEY {name} | 201 | round_trip={} | {seconds:.1}s | notes={}",
-                fidelity["round_trip"],
-                fidelity["notes"]
+                fidelity["round_trip"], fidelity["notes"]
             );
         } else {
             println!(
                 "SURVEY {name} | {} | {} | {seconds:.1}s | {}",
                 status.as_u16(),
                 json["code"],
-                json["message"].as_str().unwrap_or_default().replace('\n', " ")
+                json["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .replace('\n', " ")
             );
         }
     }

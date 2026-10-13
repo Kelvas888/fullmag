@@ -345,11 +345,13 @@ fn publish_pools(
 
 fn spawn_scheduler(
     config: &ServiceConfig,
+    configuration_path: &Path,
     bin: &Path,
     logs: &Path,
     role: &'static str,
     owner: &str,
 ) -> Result<SchedulerChild> {
+    let max_concurrency = config.scheduler_concurrency(role)?;
     let (name, pool) = if role == "compute" {
         ("fullmag-api-accepted-scheduler", &config.compute_pool_id)
     } else {
@@ -373,15 +375,24 @@ fn spawn_scheduler(
             "stdin-v1",
             "--startup-gate",
             "stdin-v1",
-            "--max-concurrency",
-            "1",
             "--max-tasks",
             "0",
             "--max-idle-polls",
             "0",
         ])
+        .arg("--max-concurrency")
+        .arg(max_concurrency.to_string())
         .arg("--heartbeat-interval-milliseconds")
         .arg(config.heartbeat_interval_milliseconds.to_string());
+    if config.host_execution.is_some() {
+        command
+            .arg("--host-service-config")
+            .arg(configuration_path)
+            .arg("--host-config-sha256")
+            .arg(fullmag_session::canonical_json_sha256(
+                &serde_json::to_value(config)?,
+            ));
+    }
     if role == "compute" {
         command
             .args(["--discover-runs", "true", "--discover-resources", "true"])
@@ -642,6 +653,9 @@ fn run() -> Result<()> {
         bail!("service requires exactly one absolute config path");
     }
     let config = ServiceConfig::read(&path)?;
+    if config.host_execution.is_some() {
+        bail!("v2 host execution requires completed recovery, owner lifecycle, topology and enforcement gates; service startup remains unavailable");
+    }
     let startup_deadline = Instant::now() + Duration::from_secs(config.startup_timeout_seconds);
     let store = fullmag_runtime_control::retry_store_writer_busy(|| {
         SessionStore::open_existing(&config.store_root)
@@ -704,7 +718,7 @@ fn run() -> Result<()> {
             for role in ["compute", "preparation"] {
                 children
                     .0
-                    .push(spawn_scheduler(&config, &bin, &logs, role, &token)?);
+                    .push(spawn_scheduler(&config, &path, &bin, &logs, role, &token)?);
             }
             await_event(
                 &mut children,
@@ -1022,6 +1036,7 @@ mod tests {
             heartbeat_interval_milliseconds: 100,
             startup_timeout_seconds: 10,
             drain_timeout_seconds: 10,
+            host_execution: None,
         }
     }
     #[test]

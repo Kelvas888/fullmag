@@ -2333,6 +2333,56 @@ fn transport_common_grid(
     ))
 }
 
+/// Match the scalar local terms instantiated by the FDM runtime. Only a
+/// material used by a magnet can provide an interaction for this problem.
+fn has_referenced_material_anisotropy(problem: &ProblemIR) -> bool {
+    let nonzero_finite = |coefficients: &[Option<f64>]| {
+        coefficients.iter().flatten().all(|value| value.is_finite())
+            && coefficients.iter().flatten().any(|value| *value != 0.0)
+    };
+    let unit_axis = |axis: [f64; 3]| {
+        let squared_norm = axis.iter().map(|value| value * value).sum::<f64>();
+        if !squared_norm.is_finite() || squared_norm <= 0.0 {
+            return None;
+        }
+        normalize_axis(axis).ok()
+    };
+    problem.magnets.iter().any(|magnet| {
+        let Some(material) = problem
+            .materials
+            .iter()
+            .find(|item| item.name == magnet.material)
+        else {
+            return false;
+        };
+        let has_uniaxial = material.uniaxial_anisotropy.is_some()
+            && nonzero_finite(&[
+                material.uniaxial_anisotropy,
+                material.uniaxial_anisotropy_k2,
+            ])
+            && unit_axis(material.anisotropy_axis.unwrap_or([0.0, 0.0, 1.0])).is_some();
+        let has_cubic = nonzero_finite(&[
+            material.cubic_anisotropy_kc1,
+            material.cubic_anisotropy_kc2,
+            material.cubic_anisotropy_kc3,
+        ]) && match (
+            unit_axis(material.cubic_anisotropy_axis1.unwrap_or([1.0, 0.0, 0.0])),
+            unit_axis(material.cubic_anisotropy_axis2.unwrap_or([0.0, 1.0, 0.0])),
+        ) {
+            (Some(first), Some(second)) => {
+                let cross = [
+                    first[1] * second[2] - first[2] * second[1],
+                    first[2] * second[0] - first[0] * second[2],
+                    first[0] * second[1] - first[1] * second[0],
+                ];
+                cross.iter().map(|value| value * value).sum::<f64>() > 0.0
+            }
+            _ => false,
+        };
+        has_uniaxial || has_cubic
+    })
+}
+
 pub(crate) fn plan_fdm(
     problem: &ProblemIR,
     resolved_backend: BackendTarget,
@@ -2489,10 +2539,11 @@ pub(crate) fn plan_fdm(
         || enable_demag
         || external_field.is_some()
         || has_static_field_map
-        || has_rotated_interfacial_dmi)
+        || has_rotated_interfacial_dmi
+        || has_referenced_material_anisotropy(problem))
     {
         errors.push(
-        "the current executable FDM path requires at least one of Exchange, Demag, Zeeman, StaticFieldMap, or RotatedInterfacialDmi"
+        "the current executable FDM path requires Exchange, Demag, Zeeman, StaticFieldMap, RotatedInterfacialDmi, or nonzero anisotropy in a referenced material"
                 .to_string(),
         );
     }
@@ -3326,6 +3377,7 @@ pub(crate) fn plan_fdm(
         antenna_zeeman_masks,
         field_drives: active_field_drives,
         regional_field_drive_bases,
+        solved_antenna_drive_bases: Vec::new(),
         time_stage: crate::util::time_stage_context(problem),
         inter_region_exchange,
         gyromagnetic_ratio,
@@ -4294,10 +4346,11 @@ pub(crate) fn plan_fdm_multilayer(
     if !(enable_exchange
         || enable_demag
         || external_field.is_some()
-        || rotated_interfacial_dmi.is_some())
+        || rotated_interfacial_dmi.is_some()
+        || has_referenced_material_anisotropy(problem))
     {
         errors.push(
-            "the current executable multilayer FDM path requires at least one of Exchange, Demag, Zeeman, or RotatedInterfacialDmi"
+            "the current executable multilayer FDM path requires Exchange, Demag, Zeeman, RotatedInterfacialDmi, or nonzero anisotropy in a referenced material"
                 .to_string(),
         );
     }

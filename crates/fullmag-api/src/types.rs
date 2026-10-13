@@ -1273,6 +1273,8 @@ pub(crate) struct ControlWaitQuery {
     pub timeout_ms: u64,
     #[serde(rename = "sessionId")]
     pub session_id: Option<String>,
+    #[serde(rename = "gridRefreshCommandId", default)]
+    pub grid_refresh_command_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1491,6 +1493,8 @@ pub(crate) struct StageExecutionRecord {
     #[serde(default)]
     pub stage_id: Option<String>,
     #[serde(default)]
+    pub antenna_solve_stage_id: Option<String>,
+    #[serde(default)]
     pub kind: Option<String>,
     pub status: StageLifecycleState,
     #[serde(default)]
@@ -1505,6 +1509,8 @@ pub(crate) struct StageExecutionRecord {
     pub started_at_unix_ms: Option<u64>,
     #[serde(default)]
     pub applied_step: Option<u64>,
+    #[serde(default)]
+    pub completed_step: Option<u64>,
     #[serde(default)]
     pub applied_time_seconds: Option<f64>,
     #[serde(default)]
@@ -2165,6 +2171,11 @@ mod tests {
             spin_transports: Vec::new(),
             spin_torques: Vec::new(),
             oersted_terms: Vec::new(),
+            antenna_port_modes: Vec::new(),
+            antenna_field_solve_stages: Vec::new(),
+            antenna_target_projections: Vec::new(),
+            solved_antenna_drives: Vec::new(),
+            antenna_spectrum_requests: Vec::new(),
             excitation_analysis: None,
         }
     }
@@ -2279,6 +2290,20 @@ mod tests {
         assert!(value.get("builder_adapter").is_none());
         assert!(value.get("script_builder").is_none());
         assert!(value.get("model_builder_graph").is_none());
+    }
+
+    #[test]
+    fn control_wait_query_accepts_grid_refresh_command_pin() {
+        let query: ControlWaitQuery = serde_json::from_value(serde_json::json!({
+            "afterSeq": 4,
+            "timeoutMs": 1000,
+            "sessionId": "session-a",
+            "gridRefreshCommandId": "cmd-grid-a"
+        }))
+        .expect("control wait query should deserialize the internal grid refresh pin");
+
+        assert_eq!(query.after_seq, 4);
+        assert_eq!(query.grid_refresh_command_id.as_deref(), Some("cmd-grid-a"));
     }
 
     #[test]

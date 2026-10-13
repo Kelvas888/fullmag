@@ -502,6 +502,13 @@ fn effective_execution_request(
     plan: &fullmag_ir::ExecutionPlanIR,
 ) -> ExecutionRequestProvenance {
     let device = match &plan.backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
+            match inspection.requested_execution.device {
+                fullmag_ir::ExecutionDevice::Auto => "auto".to_string(),
+                fullmag_ir::ExecutionDevice::Cpu => "cpu".to_string(),
+                fullmag_ir::ExecutionDevice::Gpu => "gpu".to_string(),
+            }
+        }
         BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => {
             requested_registry_device_for_fdm(problem)
         }
@@ -904,6 +911,14 @@ fn mesh_runtime_metadata(plan: &fullmag_ir::ExecutionPlanIR) -> serde_json::Valu
                 |pair| pair.pair_id.as_str(),
             ),
             "mesh_build_report": fem.mesh_build_report,
+        }),
+        BackendPlanIR::AntennaExternalLeadInspection(inspection) => serde_json::json!({
+            "scope": "antenna_external_lead_inspection",
+            "mesh_name": inspection.input.combined_mesh.mesh_name,
+            "topology_fingerprint": inspection.input.combined_mesh.topology_fingerprint_v6(),
+            "node_count": inspection.input.combined_mesh.nodes.len(),
+            "element_count": inspection.input.combined_mesh.cell_count(),
+            "field_sampling_topology_digest": inspection.input.field_sampling.topology_digest,
         }),
         BackendPlanIR::FemFrequencyResponse(fem) => serde_json::json!({
             "mesh_name": fem.mesh.mesh_name,
@@ -4308,7 +4323,9 @@ fn periodic_mesh(plan: &fullmag_ir::ExecutionPlanIR) -> Option<&fullmag_ir::Mesh
         BackendPlanIR::Fem(fem) => Some(&fem.mesh),
         BackendPlanIR::FemEigen(fem) => Some(&fem.mesh),
         BackendPlanIR::FemFrequencyResponse(fem) => Some(&fem.mesh),
-        BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => None,
+        BackendPlanIR::Fdm(_)
+        | BackendPlanIR::FdmMultilayer(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_) => None,
     }
 }
 
@@ -4330,6 +4347,7 @@ fn periodic_material_fields(
         BackendPlanIR::Fdm(_)
         | BackendPlanIR::FdmMultilayer(_)
         | BackendPlanIR::FemEigen(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_)
         | BackendPlanIR::FemFrequencyResponse(_) => (None, None, None, None),
     }
 }
@@ -5660,6 +5678,15 @@ fn sanitize_layer_id(id: &str) -> String {
 
 pub(crate) fn field_layout(plan: &fullmag_ir::ExecutionPlanIR) -> serde_json::Value {
     match &plan.backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(inspection) => serde_json::json!({
+            "backend": "antenna_external_lead_inspection",
+            "stage_id": inspection.input.stage.id,
+            "port_mode_id": inspection.input.port.id,
+            "output_id": inspection.output_id,
+            "magnetization_state": "not_applicable",
+            "conductor_topology_fingerprint": inspection.input.combined_mesh.topology_fingerprint_v6(),
+            "sampling_topology_digest": inspection.input.field_sampling.topology_digest,
+        }),
         BackendPlanIR::Fdm(fdm) => {
             let total_cells = fdm.grid.cells[0] as usize
                 * fdm.grid.cells[1] as usize
@@ -7621,10 +7648,12 @@ mod tests {
                 enable_demag: false,
                 external_field: None,
                 antenna_zeeman_masks: Vec::new(),
+                solved_antenna_drive_bases: Vec::new(),
                 field_drives: Vec::new(),
                 field_drive_geometry_masks: Vec::new(),
                 time_stage: Default::default(),
                 current_modules: Vec::new(),
+                charge_transport_plans: Vec::new(),
                 spin_transport_plans: Vec::new(),
                 gyromagnetic_ratio: 2.211e5,
                 precision: ExecutionPrecision::Double,

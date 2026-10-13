@@ -87,17 +87,10 @@ pub struct CurrentRunResource {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StageExecutionResource {
-    /// Identity of the same locked snapshot that owns the stage records.
-    #[serde(default)]
-    #[schema(required = true)]
     pub session_id: String,
-    #[serde(default)]
-    #[schema(required = true)]
     pub session_epoch: String,
-    /// Explicit null means no run; omission is not accepted by the live UI.
-    #[serde(default)]
-    #[schema(required = true, nullable = true)]
-    pub run_id: Option<String>,
+    pub request_scope_epoch: String,
+    pub run_id: String,
     pub revision: u64,
     pub runtime_state: String,
     pub total_stages: u32,
@@ -173,6 +166,9 @@ impl From<&fullmag_runner::LiveParallelExecutionTelemetry> for ParallelExecution
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StageExecutionRecordResource {
     pub stage_id: String,
+    /// Exact authored antenna definition ID, not the study node or runtime ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub antenna_solve_stage_id: Option<String>,
     pub index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -194,6 +190,8 @@ pub struct StageExecutionRecordResource {
     pub mesh_revision: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_step: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -552,6 +550,8 @@ pub struct CommandDetailResource {
     pub started_at_unix_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_step: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_step: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_time_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

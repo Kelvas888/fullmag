@@ -6,6 +6,7 @@ import { Cpu, RefreshCw, Settings } from "lucide-react";
 import { Button } from "@/shared/ui/Button";
 import { cn } from "@/shared/utils/className";
 
+import { formatTelemetrySampleTime } from "../model/computeTelemetry";
 import type { ComputeEnvironment, ComputeProbeState, GpuInfo } from "../model/types";
 
 type EnvironmentTone = "busy" | "degraded" | "idle" | "observed";
@@ -104,6 +105,7 @@ export function ComputeEnvironmentWidget({
   onRefresh,
 }: ComputeEnvironmentWidgetProps) {
   const tone = resolveEnvironmentTone(compute, error);
+  const sampleTime = formatTelemetrySampleTime(compute?.sampledAt);
 
   return (
     <section
@@ -134,7 +136,13 @@ export function ComputeEnvironmentWidget({
 
       <div className="fm-start-env__body">
         <ProbeStatus compute={compute} error={error} refreshing={refreshing} stale={stale} />
+        {sampleTime ? (
+          <p className="fm-start-env__note">
+            Latest available telemetry sample: <time dateTime={sampleTime.dateTime}>{sampleTime.label}</time>
+          </p>
+        ) : null}
         {compute ? <ProbedEnvironment compute={compute} /> : null}
+        <RuntimeLaneSummary compute={compute} />
       </div>
 
       <Button
@@ -147,6 +155,61 @@ export function ComputeEnvironmentWidget({
         <Settings aria-hidden="true" size={14} />
         Configure compute
       </Button>
+    </section>
+  );
+}
+
+const RUNTIME_LANES = [
+  { backend: "FDM", device: "CPU" },
+  { backend: "FDM", device: "GPU" },
+  { backend: "FEM", device: "CPU" },
+  { backend: "FEM", device: "GPU" },
+] as const;
+
+function RuntimeLaneSummary({ compute }: { readonly compute: ComputeProbeState }) {
+  return (
+    <section aria-labelledby="fm-start-env-lanes-title" className="fm-start-env__runtime">
+      <h3 className="fm-start-env__runtime-title" id="fm-start-env-lanes-title">
+        Solver routes
+      </h3>
+      <ul aria-label="Solver route availability" className="fm-start-env__lanes">
+        {RUNTIME_LANES.map(({ backend, device }) => {
+          const lane = compute?.runtimeLanes?.find(
+            (candidate) => candidate.backend === backend && candidate.device === device,
+          );
+          const availability = lane?.availability ?? "unknown";
+          let label: string;
+          if (compute === undefined) {
+            label = "Loading";
+          } else if (availability === "available") {
+            label = "Available";
+          } else if (availability === "unavailable") {
+            label = "Unavailable";
+          } else {
+            label = "Not reported";
+          }
+
+          return (
+            <li
+              className="fm-start-env__lane"
+              data-availability={availability}
+              data-state={compute === undefined ? "loading" : undefined}
+              key={`${backend}-${device}`}
+            >
+              <span className="fm-start-env__lane-name">
+                {backend} · {device}
+              </span>
+              <span className="fm-start-env__lane-state">
+                <span aria-hidden="true" className="fm-start-env__lane-dot" />
+                {label}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+      <p className="fm-start-env__note">
+        Runtime support is separate from detected hardware. A concrete device is resolved when a run starts.
+      </p>
     </section>
   );
 }
@@ -166,7 +229,16 @@ function ProbeStatus({
     return (
       <div aria-live="polite" className="fm-start-env__state">
         <span aria-hidden="true" className="fm-start-env__dot" />
-        <span>{error ? "Compute probe failed" : "Reading host telemetry…"}</span>
+        <span>
+          {error ? "Compute probe failed" : "Not probed"}
+        </span>
+        {!error ? (
+          <p className="fm-start-env__note">
+            {refreshing
+              ? "Reading host telemetry…"
+              : "The desktop host supplies the compute probe. A concrete device is resolved when a run starts."}
+          </p>
+        ) : null}
         {error ? <p className="fm-start-env__note">Try refreshing the host readings.</p> : null}
       </div>
     );
@@ -245,11 +317,11 @@ function ProbedEnvironment({ compute }: { readonly compute: ComputeEnvironment }
         </p>
       ) : null}
       {compute.gpus.length > 0 ? (
-        <div aria-label="Detected GPUs" className="fm-start-env__gpu-list" role="list">
+        <ul aria-label="Detected GPUs" className="fm-start-env__gpu-list">
           {compute.gpus.map((gpu, index) => (
-            <GpuSummary gpu={gpu} key={`${gpu.index ?? "gpu"}-${index}`} position={index + 1} />
+            <GpuSummary gpu={gpu} key={gpu.index ?? gpu.name} position={index + 1} />
           ))}
-        </div>
+        </ul>
       ) : null}
 
       <div className="fm-start-env__cpu">
@@ -307,7 +379,7 @@ function GpuSummary({
   const memory = gpuMemory(gpu);
 
   return (
-    <article className="fm-start-env__gpu" role="listitem">
+    <li className="fm-start-env__gpu">
       <div className="fm-start-env__gpu-head">
         <span className="fm-start-env__name">
           GPU {gpu.index ?? position}: {gpu.name}
@@ -341,6 +413,6 @@ function GpuSummary({
       {gpu.busyWithRun ? (
         <p className="fm-start-env__note">Reported active run: {gpu.busyWithRun}.</p>
       ) : null}
-    </article>
+    </li>
   );
 }

@@ -59,6 +59,7 @@ import {
   useObjectVisualizationSelector,
 } from "@/kernel/visualization/useObjectVisualization";
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
+import { ScratchAuthoringGuide } from "@/kernel/authoring/ScratchAuthoringGuide";
 import { CommandDetailDialog } from "@/shared/runtime/CommandDetailDialog";
 import { Button } from "@/shared/ui/Button";
 import {
@@ -185,7 +186,7 @@ export default function RibbonModule({ kernel }: ModuleProps) {
   );
   const { setActiveTab } = useLayoutActions();
   const selection = useSelectionSelector((currentSelection) =>
-    activeTab === "view" || activeTab === "geometry"
+    activeTab === "view" || activeTab === "geometry" || activeTab === "mesh"
       ? currentSelection
       : EMPTY_SELECTION,
   );
@@ -196,9 +197,19 @@ export default function RibbonModule({ kernel }: ModuleProps) {
   const needsGeometryResources =
     activeTab === "geometry" || activeTab === "mesh";
   const needsRuntimeResources = ribbonTabNeedsRuntimeResources(activeTab);
+  const modelReadiness = useModelReadinessResource({ enabled: true });
+  const needsGuideMeshResources = Boolean(
+    modelReadiness.data?.checks.some(
+      (check) =>
+        check.id === "discretization" &&
+        check.state !== "complete" &&
+        check.target_resource === "meshing/builds/current",
+    ),
+  );
   const needsMeshResources =
     activeTab === "mesh" ||
     needsRuntimeResources ||
+    needsGuideMeshResources ||
     (activeTab === "view" && selection.ref?.type === "mesh-part");
   const needsVisualizationResources = activeTab === "view";
   const visualizationState = useVisualizationStateResource({
@@ -211,10 +222,10 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     enabled: needsVisualizationResources,
   });
   const geometryCapabilities = useGeometryCapabilitiesResource({
-    enabled: needsGeometryResources || needsRuntimeResources,
+    enabled: needsGeometryResources || needsRuntimeResources || needsGuideMeshResources,
   });
   const geometryValidation = useGeometryValidationResource({
-    enabled: needsGeometryResources || needsRuntimeResources,
+    enabled: needsGeometryResources || needsRuntimeResources || needsGuideMeshResources,
   });
   const needsSessionStatusResources = ribbonTabNeedsSessionStatusResources(
     activeTab,
@@ -255,6 +266,8 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     enabled:
       activeTab === "geometry" ||
       activeTab === "mesh" ||
+      activeTab === "physics" ||
+      needsGuideMeshResources ||
       (activeTab === "view" && selection.ref?.type === "mesh-part"),
   });
   const sceneObjectIds = useMemo(
@@ -275,9 +288,6 @@ export default function RibbonModule({ kernel }: ModuleProps) {
       needsRuntimeResources,
       sessionStatusData,
     ),
-  });
-  const modelReadiness = useModelReadinessResource({
-    enabled: needsRuntimeResources,
   });
   const solverStatus = useSolverStatusResource({
     enabled: needsRuntimeResources,
@@ -534,6 +544,11 @@ export default function RibbonModule({ kernel }: ModuleProps) {
         activeTabId={stripActiveTab}
         onAction={handleAction}
         onCommandDetail={setSelectedCommandId}
+      />
+      <ScratchAuthoringGuide
+        commandContext={commandContext}
+        kernel={kernel}
+        readiness={modelReadiness}
       />
       <CommandDetailDialog
         commandId={selectedCommandId}

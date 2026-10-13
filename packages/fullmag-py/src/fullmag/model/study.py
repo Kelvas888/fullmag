@@ -677,6 +677,21 @@ def _serialize_spin_wave_bc(value: SpinWaveBoundarySpec) -> str | dict[str, obje
 
 
 @dataclass(frozen=True, slots=True)
+class AntennaFieldSolve:
+    """Standalone charge/antenna stage family without magnetic dynamics."""
+
+    @property
+    def outputs(self) -> tuple[TimeOutputSpec, ...]:
+        return ()
+
+    def to_ir(self) -> dict[str, object]:
+        return {
+            "kind": "antenna_field_solve",
+            "sampling": {"outputs": []},
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class TimeEvolution:
     dynamics: LLG
     outputs: Sequence[TimeOutputSpec]

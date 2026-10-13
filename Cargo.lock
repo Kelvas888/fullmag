@@ -1145,6 +1145,7 @@ dependencies = [
  "chrono",
  "crc32fast",
  "fontdue",
+ "fullmag-antenna-artifacts",
  "fullmag-application",
  "fullmag-authoring",
  "fullmag-build-info",
@@ -1178,10 +1179,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fullmag-antenna-artifacts"
+version = "0.1.0"
+dependencies = [
+ "fullmag-ir",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "fullmag-application"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fullmag-antenna-artifacts",
  "fullmag-authoring",
  "fullmag-ir",
  "fullmag-plan",
@@ -1365,6 +1377,7 @@ dependencies = [
 name = "fullmag-runner"
 version = "0.1.0"
 dependencies = [
+ "fullmag-antenna-artifacts",
  "fullmag-build-info",
  "fullmag-engine",
  "fullmag-fdm-demag",

@@ -208,18 +208,23 @@ class LocalRunnerSourceTests(unittest.TestCase):
             repo, _ = _repository(root)
             stylesheet = repo / "apps" / "control-room" / "src" / "design" / "styles"
             stylesheet.mkdir(parents=True)
-            (stylesheet / "tokens.css").write_text(":root { --space: 1px; }\n", encoding="utf-8")
-            _git(repo, "add", "apps/control-room/src/design/styles/tokens.css")
+            allowed_paths = (
+                "apps/control-room/src/design/styles/tokens.css",
+                "apps/control-room/src/design/styles/start-screen.tokens.css",
+                "docs/design/start-screen/tokens/start-screen.tokens.css",
+            )
+            for relative in allowed_paths:
+                candidate = repo / relative
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_text(":root { --space: 1px; }\n", encoding="utf-8")
+            _git(repo, "add", *allowed_paths)
             _git(repo, "commit", "-qm", "design tokens")
             output = root / "capsule"
             output.mkdir()
 
             manifest = capture_source(repo, output, mode="commit", ref="HEAD")
 
-            self.assertIn(
-                "apps/control-room/src/design/styles/tokens.css",
-                {item["path"] for item in manifest["files"]},
-            )
+            self.assertTrue(set(allowed_paths).issubset({item["path"] for item in manifest["files"]}))
 
     def test_allows_exact_start_screen_token_paths_in_commit_and_snapshot(self) -> None:
         paths = (
@@ -451,6 +456,8 @@ class LocalRunnerSourceTests(unittest.TestCase):
             "apps/control-room/src/design/styles/start-screen.tokens-copy.css",
             "apps/control-room/src/design/styles/start-screen.tokens.css.bak",
             "docs/design/start-screen/tokens/start-screen.tokens.css.secret",
+            "apps/control-room/src/design/styles/api.tokens.css",
+            "config/start-screen.tokens.css",
         )
         with tempfile.TemporaryDirectory(prefix="fullmag-source-test-") as raw:
             root = Path(raw)

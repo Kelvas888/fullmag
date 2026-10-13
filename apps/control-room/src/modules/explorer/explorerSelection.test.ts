@@ -30,6 +30,7 @@ import { ResourceInvalidationController } from "@/kernel/resources/ResourceInval
 import { SelectionController } from "@/kernel/selection/SelectionController";
 import { selectionRefEquals } from "@/kernel/selection/selectionTypes";
 import { ObjectMoveToolController } from "@/kernel/authoring/ObjectMoveToolController";
+import { ObjectEditSessionController } from "@/kernel/authoring/object-edit/ObjectEditSessionController";
 import type { KernelApi } from "@/kernel/types";
 import { AnalysisFieldOverlayController } from "@/kernel/visualization/AnalysisFieldOverlayController";
 import { ModeCompositionController } from "@/kernel/visualization/ModeCompositionController";
@@ -90,6 +91,7 @@ function makeKernel(): KernelApi {
     }),
     layout: new LayoutController(bus),
     modules: new ModuleRegistry(),
+    objectEditSession: new ObjectEditSessionController(),
     objectMoveTool: new ObjectMoveToolController(),
     modeComposition: new ModeCompositionController({
       getActiveModeComposition: (options) =>
@@ -259,7 +261,7 @@ describe("selectExplorerNode", () => {
     selectExplorerNode(kernel, node, "explorer");
 
     expect(kernel.selection.get()).toMatchObject({
-      kind: "mesh-part",
+      kind: "mesh.unassigned.part",
       nodeId: node.id,
       ref: {
         carrierPartId: "part:orphan",
@@ -553,7 +555,7 @@ describe("selectExplorerNode", () => {
     });
   });
 
-  it("keeps the FEM unassigned parent on its exact legacy route", () => {
+  it("keeps the FEM unassigned parent on its semantic Inspector route with the legacy carrier ref", () => {
     const kernel = makeKernel();
     selectExplorerNode(kernel, {
       id: "model:mesh:unassigned",
@@ -561,6 +563,7 @@ describe("selectExplorerNode", () => {
       label: "Unassigned mesh parts",
       parentId: "model:mesh",
     }, "explorer");
+    expect(kernel.selection.get().kind).toBe("mesh.unassigned");
     expect(kernel.selection.get().ref).toMatchObject({
       type: "mesh-part",
       kind: "mesh-part",

@@ -4,28 +4,23 @@ import { useCallback, useEffect, useRef } from "react";
 
 import { SIMULATION_PREPARATION_PATH } from "../api/apiPaths";
 import type { SimulationPreparationResource } from "../api/apiTypes";
-import { ControlRoomApiError } from "../api/ControlRoomApi";
 import { useKernel } from "../KernelContext";
 import {
   errorRetryDelayMs,
   statusRefreshIntervalMs,
 } from "../realtime/communicationPolicy";
 
-import { useSessionScopedResourceKey } from "./useSessionScopedResourceKey";
-import { useSessionStatusSelector } from "./useSessionStatus";
-import { hasSimulationPreparation } from "./simulationResourceAvailability";
+import { useSimulationPreparationSessionScope } from "./useSessionStatus";
+import { sessionScopedResourceKey } from "./sessionResourceIdentity";
+import {
+  preparationMinimumRevision,
+  preparationPublicationState,
+  preparationRetryKey,
+} from "./simulationPreparationPublication";
 import { useResource } from "./useResource";
 
-function resolvePreparationRevision(data: SimulationPreparationResource | null) {
-  return data?.revision ?? null;
-}
-
-function isUnavailablePreparationError(error: unknown): boolean {
-  return (
-    error instanceof ControlRoomApiError &&
-    error.status === 404 &&
-    error.message.toLowerCase().includes("simulation preparation unavailable")
-  );
+function resolvePreparationRevision(data: SimulationPreparationResource) {
+  return data.revision;
 }
 
 export function useSimulationPreparation({
@@ -36,55 +31,59 @@ export function useSimulationPreparation({
   requiredRevision?: number | null;
 } = {}) {
   const { api, resources } = useKernel();
-  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
-    SIMULATION_PREPARATION_PATH,
-  );
-  const preparationAvailable = useSessionStatusSelector(
-    (status) => hasSimulationPreparation(status.data, requiredRevision),
-    { enabled: sessionIdentity !== null },
-  );
-  const effectiveEnabled = enabled && sessionIdentity !== null && preparationAvailable;
-  const missingPreparationIsOptional =
-    requiredRevision === null || requiredRevision <= 0;
+  const { sessionIdentity, preparationRevision } = useSimulationPreparationSessionScope();
+  const resourceKey = sessionIdentity
+    ? sessionScopedResourceKey(sessionIdentity, SIMULATION_PREPARATION_PATH)
+    : SIMULATION_PREPARATION_PATH;
+  const publication = preparationPublicationState(preparationRevision, requiredRevision);
+  const minimumRevision = preparationMinimumRevision(preparationRevision, requiredRevision);
+  const effectiveEnabled = enabled && sessionIdentity !== null && publication !== "absent";
   const load = useCallback(
     ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
       api.simulation.preparation({ sessionScopeKey, signal }),
     [api],
   );
-  const notifyOnError = useCallback(
-    (error: unknown) =>
-      !(
-        missingPreparationIsOptional &&
-        isUnavailablePreparationError(error)
-      ),
-    [missingPreparationIsOptional],
-  );
 
-  const preparation = useResource<SimulationPreparationResource | null>({
+  const preparation = useResource<SimulationPreparationResource>({
     enabled: effectiveEnabled,
+    pauseLoad: publication === "unknown",
     load,
     minRefetchIntervalMs: statusRefreshIntervalMs(),
-    notifyOnError,
     resolveRevision: resolvePreparationRevision,
     resourceKey,
   });
-  const retriedRequiredRevision = useRef<number | null>(null);
+  const retriedPublication = useRef<string | null>(null);
+  const refreshedPublication = useRef<string | null>(null);
+  const retryKey = preparationRetryKey(resourceKey, minimumRevision);
+  const requestRefetch = preparation.refetch;
+  const refetch = useCallback(() => {
+    if (!effectiveEnabled || publication !== "published") return;
+    requestRefetch();
+  }, [effectiveEnabled, publication, requestRefetch]);
 
   useEffect(() => {
-    if (!effectiveEnabled || requiredRevision === null || requiredRevision <= 0) return;
-    if ((preparation.data?.revision ?? 0) >= requiredRevision) return;
+    if (!effectiveEnabled || minimumRevision === null) return;
+    if ((preparation.data?.revision ?? 0) >= minimumRevision) return;
     const currentRevision = resources.getRevision(resourceKey);
     if (
-      currentRevision === requiredRevision ||
-      (typeof currentRevision === "number" && currentRevision > requiredRevision)
+      currentRevision === minimumRevision ||
+      (typeof currentRevision === "number" && currentRevision > minimumRevision)
     ) {
+      // A transport revision is not proof that the loaded preparation meets the minimum.
+      if (preparation.status === "ready" && refreshedPublication.current !== retryKey) {
+        refreshedPublication.current = retryKey;
+        refetch();
+      }
       return;
     }
-    resources.invalidate(resourceKey, requiredRevision);
+    resources.invalidate(resourceKey, minimumRevision);
   }, [
     effectiveEnabled,
     preparation.data?.revision,
-    requiredRevision,
+    preparation.status,
+    minimumRevision,
+    refetch,
+    retryKey,
     resourceKey,
     resources,
   ]);
@@ -93,36 +92,34 @@ export function useSimulationPreparation({
     const loadedRevision = preparation.data?.revision ?? 0;
     if (
       !effectiveEnabled ||
-      requiredRevision === null ||
-      requiredRevision <= 0 ||
-      loadedRevision >= requiredRevision ||
+      publication !== "published" ||
+      minimumRevision === null ||
+      retryKey === null ||
+      loadedRevision >= minimumRevision ||
       preparation.status !== "error" ||
       !isTransientPreparationLoadError(preparation.error) ||
-      retriedRequiredRevision.current === requiredRevision
+      retriedPublication.current === retryKey
     ) {
       return;
     }
 
-    retriedRequiredRevision.current = requiredRevision;
-    const timeoutId = setTimeout(preparation.refetch, errorRetryDelayMs());
+    const timeoutId = setTimeout(() => {
+      retriedPublication.current = retryKey;
+      refetch();
+    }, errorRetryDelayMs());
     return () => clearTimeout(timeoutId);
   }, [
     effectiveEnabled,
     preparation.data?.revision,
     preparation.error,
-    preparation.refetch,
     preparation.status,
-    requiredRevision,
+    publication,
+    minimumRevision,
+    refetch,
+    retryKey,
   ]);
 
-  if (
-    missingPreparationIsOptional &&
-    preparation.status === "error" &&
-    isUnavailablePreparationError(preparation.error)
-  ) {
-    return { ...preparation, data: null, error: null, status: "ready" as const };
-  }
-  return preparation;
+  return { ...preparation, refetch };
 }
 
 function isTransientPreparationLoadError(error: Error | null): boolean {

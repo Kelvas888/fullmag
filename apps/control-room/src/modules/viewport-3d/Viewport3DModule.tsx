@@ -1,4 +1,6 @@
 "use client";
+import { useAntennaFieldOverlay } from "./hooks/useAntennaFieldOverlay";
+import { antennaFieldDisplayLabel } from "@/kernel/visualization/antennaFieldIntent";
 
 import { useThree } from "@react-three/fiber";
 import {
@@ -57,6 +59,7 @@ import {
   type SemanticRenderTargetCatalog,
 } from "@/kernel/selection/semanticRenderTargetCatalog";
 import { WorkspaceRenderProfiler } from "@/kernel/performance/reactRenderProfiler";
+import { useObjectEditSelector } from "@/kernel/authoring/object-edit/useObjectEditSelector";
 import { recordVisualizationDebugResourceCounts } from "@/kernel/performance/visualizationDebugPerformanceProbe";
 import type { ModuleProps } from "@/kernel/types";
 import {
@@ -88,6 +91,7 @@ import {
 } from "@/shared/ui/Dialog";
 
 import { useViewport3DColors } from "./hooks/useViewport3DColors";
+import { withObjectPlacementDraftPreview } from "./viewport3dPrimitiveModel";
 import {
   useViewport3DSceneModel,
   type Viewport3DFieldDataIssue,
@@ -114,7 +118,7 @@ import {
 import { Viewport3DScene } from "./layers/Viewport3DScene";
 import {
   useViewport3DObjectMoveInteraction,
-  Viewport3DMoveConflictPanel,
+  Viewport3DMoveStatus,
 } from "./Viewport3DObjectMoveInteraction";
 import type { Viewport3DAirboxFrameState } from "./layers/Viewport3DScene";
 import { recordViewport3DCameraTrajectorySample } from "./layers/viewport3DCameraTrajectoryProbe";
@@ -1337,6 +1341,8 @@ interface Viewport3DFrameProps
     | "moveToolObjectId"
     | "onOrbitDebugAnglesChange"
     | "onMoveCommit"
+    | "onBeginGesture"
+    | "onMoveGestureActiveChange"
     | "onVisualizationFrameCommitted"
     | "orbitDebugAngles"
     | "orbitDebugCommitRevision"
@@ -1378,10 +1384,8 @@ interface Viewport3DFrameProps
   scalarColorPalette: string;
   savedViewportActive: boolean;
   sessionIdentity: SessionResourceIdentity | null;
+  sessionDiscretization: "fdm" | "fem" | null;
   selectedLabel: string;
-  sceneRefetch: () => void;
-  sceneRevision: number | null;
-  sceneStatus: string;
   slotId: ModuleProps["slotId"];
   status: string;
   topologyRevision: number | string | null;
@@ -1455,6 +1459,19 @@ export default function Viewport3DModule({
     selection,
     tracker,
   });
+  const objectEditSnapshot = useObjectEditSelector(kernel.objectEditSession);
+  const primitiveModelWithPlacementDraft = useMemo(
+    () => withObjectPlacementDraftPreview(
+      sceneModel.primitiveModel,
+      objectEditSnapshot.draft,
+      sceneModel.selectedObjectId,
+    ),
+    [
+      objectEditSnapshot.draft,
+      sceneModel.primitiveModel,
+      sceneModel.selectedObjectId,
+    ],
+  );
   const {
     beginInteraction: beginSavedCameraInteraction,
     endInteraction: endSavedCameraInteraction,
@@ -1725,10 +1742,12 @@ export default function Viewport3DModule({
         <WorkspaceRenderProfiler id="Viewport3DModule">
         <Viewport3DFrame
       {...sceneModel}
+      primitiveModel={primitiveModelWithPlacementDraft ?? null}
       clientReady={clientReady}
       colors={colors}
       cameraDialogOpen={commandState.widgets.cameraDialogOpen}
       cameraDialogState={commandState.camera}
+      dimensionFrameAnnotation={commandState.widgets.dimensionFrameAnnotation}
       dimensionFrameDensity={commandState.widgets.dimensionFrameDensity}
       dimensionFrameMode={commandState.widgets.dimensionFrameMode}
       effectAntialias={commandState.widgets.effectAntialias}
@@ -1962,10 +1981,8 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   quantityLabel,
   savedViewportActive,
   sessionIdentity,
+  sessionDiscretization,
   selectedLabel,
-  sceneRefetch,
-  sceneRevision,
-  sceneStatus,
   slotId,
   status,
   visualizationEffectiveRenderMode,
@@ -1974,6 +1991,17 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   ...sceneProps
 }: Viewport3DFrameProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const antennaFieldOverlay = useAntennaFieldOverlay();
+  const antennaFieldSourceLabel = antennaFieldOverlay
+    ? sceneProps.primitiveModel?.objects.find(
+        (object) => object.objectId === antennaFieldOverlay.intent.sourceObjectId,
+      )?.label ?? antennaFieldOverlay.intent.sourceObjectId
+    : null;
+  const createCanvasEvents = useCallback(
+    (store: Parameters<typeof createViewport3DEventManager>[0]) =>
+      createViewport3DEventManager(store, () => kernel.objectMoveTool.getSnapshot() !== null),
+    [kernel.objectMoveTool],
+  );
   const pendingCaptureRevisionRef = useRef<number | null>(null);
   const primitiveObjectIds =
     sceneProps.primitiveModel?.objects
@@ -2018,9 +2046,6 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   );
   const moveInteraction = useViewport3DObjectMoveInteraction({
     moveTargetEligible,
-    sceneRefetch,
-    sceneRevision,
-    sceneStatus,
     selectedObjectId: sceneProps.selectedObjectId,
     sessionId: sessionIdentity?.sessionId ?? null,
   });
@@ -2095,11 +2120,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     }),
     [initialCameraFit.far, initialCameraFit.near],
   );
-  const discretizationKind = sceneProps.fdmDomain
-    ? "FDM"
-    : sceneProps.femDomain.magneticParts.length > 0
-      ? "FEM"
-      : null;
+  const discretizationKind = sessionDiscretization?.toUpperCase() ?? null;
   const meshQualityLegend = resolveViewport3DMeshQualityLegend(
     sceneProps.meshQualityOverlayVisible,
     meshQualityMetric,
@@ -2614,6 +2635,10 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       data-inspect-enabled={sceneProps.inspectEnabled ? "true" : "false"}
       data-primitive-object-count={sceneProps.primitiveModel?.objects.length ?? 0}
       data-primitive-object-ids={primitiveObjectIds}
+      data-primitive-object-kinds={sceneProps.primitiveModel?.objects
+        .map((object) => `${object.objectId}:${object.kind}`).join(" ") ?? ""}
+      data-primitive-object-geometry-descriptors={sceneProps.primitiveModel?.objects
+        .map((object) => object.geometryKey.slice(0, 120)).join(" ") ?? ""}
       data-hysteresis-replay-snapshot-id={hysteresisReplayTarget?.snapshotId ?? ""}
       data-hysteresis-replay-stage-id={hysteresisReplayTarget?.stageId ?? ""}
       data-hysteresis-replay-field-direction={formatHysteresisReplayGlyphVector(
@@ -2627,6 +2652,8 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
         sceneProps.bounds ? JSON.stringify(sceneProps.bounds) : ""
       }
       data-visual-profile-id={sceneProps.visualProfileId}
+      data-antenna-field-quantity={antennaFieldOverlay?.intent.quantity}
+      data-antenna-field-sample-count={antennaFieldOverlay?.count}
       onPointerDown={() => kernel.layout.setFocusedSlot(slotId)}
     >
       <div aria-live="polite" className="fm-viewport-3d__hud">
@@ -2646,10 +2673,13 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             </Button>
           </fieldset>
         ) : null}
-        <span data-quantity-id={quantityId}>{quantityLabel}</span>
-        <span>{selectedLabel}</span>
+        <span data-quantity-id={quantityId}>{antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityLabel}</span>
+        <span>{antennaFieldSourceLabel ?? selectedLabel}</span>
         {hysteresisReplayLabel ? <span>{hysteresisReplayLabel}</span> : null}
-        <span>{domainSummary}</span>
+        <span>{antennaFieldOverlay ? `${antennaFieldOverlay.count} samples` : domainSummary}</span>
+        {antennaFieldOverlay?.intent.kind === "inspection" ? (
+          <span>inspection only · external electrode truncation · not qualified for LLG</span>
+        ) : null}
         {meshQualityLegend ? <span>{meshQualityLegend}</span> : null}
         {sceneProps.meshSizeHighlightModel ? (
           <span>
@@ -2664,6 +2694,11 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           </span>
         ) : null}
         <span>{status}</span>
+        {sceneProps.primitiveModel?.diagnostics?.map((issue) => (
+          <span key={issue.objectId} role="alert">
+            Geometry preview unavailable · {issue.objectId}: {issue.message}
+          </span>
+        ))}
         {sceneProps.regionOverlays.length > 0 ||
         sceneProps.meshRegionOverlays.length > 0 ? (
           <fieldset
@@ -2794,7 +2829,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           camera={canvasCamera}
           className="fm-viewport-3d__canvas"
           dpr={canvasDpr}
-          events={createViewport3DEventManager}
+          events={createCanvasEvents}
           frameloop={VIEWPORT_3D_FRAMELOOP}
           gl={canvasGlOptions}
           key={canvasContextKey}
@@ -2809,6 +2844,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           />
           <Viewport3DScene
             {...sceneProps}
+            antennaFieldOverlay={antennaFieldOverlay}
             adoptionRegistry={visualizationDebugAdoptionRegistry}
             colors={colors}
             savedViewportActive={savedViewportActive}
@@ -2823,6 +2859,8 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             onInspectClear={clearInspectHover}
             onInspectSample={updateInspectHover}
             onMoveCommit={moveInteraction.commitMove}
+            onBeginGesture={moveInteraction.onBeginGesture}
+            onMoveGestureActiveChange={moveInteraction.onGestureActiveChange}
             moveToolObjectId={moveInteraction.moveToolObjectId}
             moveDraftResetRevision={moveInteraction.moveDraftResetRevision}
             onVisualizationFrameCommitted={onVisualizationFrameCommitted}
@@ -2853,7 +2891,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           provenance={visibleInspectProvenance}
         />
       ) : null}
-      <Viewport3DMoveConflictPanel interaction={moveInteraction} />
+      <Viewport3DMoveStatus error={moveInteraction.moveError} />
       <Viewport3DFdmSelectionAnnouncement
         announcement={fdmSelectionAnnouncement}
       />
@@ -3505,10 +3543,11 @@ function Viewport3DOrbitDebugSlider({
   value: number;
 }) {
   return (
-    <label className="fm-viewport-3d__orbit-debug-field">
+    <div className="fm-viewport-3d__orbit-debug-field">
       <span>{label}</span>
       <output>{value.toFixed(3)}</output>
       <input
+        aria-label={label}
         max={max}
         min={min}
         step="0.001"
@@ -3521,6 +3560,6 @@ function Viewport3DOrbitDebugSlider({
         onPointerDown={onInteractionStart}
         onPointerUp={onInteractionEnd}
       />
-    </label>
+    </div>
   );
 }

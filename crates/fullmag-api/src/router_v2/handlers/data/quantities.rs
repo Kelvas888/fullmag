@@ -48,9 +48,20 @@ fn annotate_runtime_quantity_state(
     response: &mut QuantityCatalogResponse,
     snapshot: &SessionStateResponse,
 ) {
-    let Some(_capabilities) = snapshot.capabilities.as_ref() else {
+    let standalone_inspection = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("execution_plan"))
+        .and_then(|plan| plan.get("backend_plan"))
+        .and_then(|plan| plan.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("antenna_external_lead_inspection");
+    // An unresolved workspace remains unknown. A resolved nonmagnetic
+    // inspection, however, has no magnetic provider: use the canonical
+    // unavailable capability path even without a magnetic runtime profile.
+    if snapshot.capabilities.is_none() && !standalone_inspection {
         return;
-    };
+    }
 
     for entry in &mut response.quantities {
         let Some(spec) = quantity_spec(&entry.id) else {
@@ -302,6 +313,45 @@ mod tests {
         let demag = entry("H_demag");
         assert_eq!(demag.shape, "vector_field");
         assert_ne!(demag.location, "global");
+    }
+
+    #[test]
+    fn standalone_without_magnetic_capabilities_resolves_catalog_unavailable() {
+        let mut snapshot = snapshot_with_field_provider("m");
+        snapshot.capabilities = None;
+        snapshot.metadata = Some(serde_json::json!({
+            "execution_plan": { "backend_plan": { "kind": "antenna_external_lead_inspection" } }
+        }));
+        let mut response = QuantityCatalogResponse::build();
+        annotate_runtime_quantity_state(&mut response, &snapshot);
+
+        for entry in &response.quantities {
+            assert_eq!(entry.capability_state, "unsupported", "{}", entry.id);
+            assert_eq!(entry.solver_capability, "unsupported", "{}", entry.id);
+            assert_eq!(entry.materialization_state, "unsupported", "{}", entry.id);
+            assert!(!entry.requestable && !entry.materializable, "{}", entry.id);
+            assert!(!entry.renderable, "{}", entry.id);
+            let resolved = entry.resolved_capability.as_ref().expect("resolved absence");
+            assert_eq!(
+                resolved.provider,
+                crate::schemas::quantities::QuantityProviderCapability::Unavailable
+            );
+            assert_eq!(
+                resolved.request,
+                crate::schemas::quantities::QuantityRequestCapability::Unavailable
+            );
+            assert!(resolved.carriers.is_empty());
+        }
+    }
+
+    #[test]
+    fn unresolved_workspace_catalog_stays_unknown_without_capabilities() {
+        let mut snapshot = snapshot_with_field_provider("m");
+        snapshot.capabilities = None;
+        snapshot.metadata = None;
+        let mut response = QuantityCatalogResponse::build();
+        annotate_runtime_quantity_state(&mut response, &snapshot);
+        assert!(response.quantities.iter().all(|entry| entry.capability_state == "unknown"));
     }
 
     #[test]

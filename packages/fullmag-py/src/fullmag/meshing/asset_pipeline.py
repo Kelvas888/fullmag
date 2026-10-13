@@ -371,6 +371,16 @@ def _extract_frozen_magnetic_submesh(
 
     frozen_mesh = MeshData(
         nodes=np.asarray(shared_mesh.nodes[used_nodes], dtype=np.float64),
+        vertex_identity=(
+            {
+                **shared_mesh.vertex_identity,
+                "vertex_ids": [
+                    shared_mesh.vertex_identity["vertex_ids"][int(index)]
+                    for index in used_nodes
+                ],
+            }
+            if shared_mesh.vertex_identity is not None else None
+        ),
         cell_types=cell_types,
         cell_offsets=cell_offsets,
         cell_nodes=cell_nodes,
@@ -1018,6 +1028,7 @@ def _drop_degenerate_tetrahedra(
     boundary_faces, boundary_markers = _boundary_faces_for_kept_elements(mesh, keep)
     return MeshData.from_legacy_tet4(
         nodes=mesh.nodes,
+        vertex_identity=mesh.vertex_identity,
         elements=mesh.elements[keep],
         element_markers=mesh.element_markers[keep],
         boundary_faces=boundary_faces,
@@ -1286,6 +1297,7 @@ def realize_fem_mesh_asset(
     mesh_workflow: Mapping[str, object] | None = None,
     per_object_recipes: dict[str, PerObjectMeshRecipe] | None = None,
     _owner_geometry_names: Sequence[str] | None = None,
+    object_id: str | None = None,
 ) -> MeshData:
     """Resolve a FEM mesh asset from either a prebuilt mesh or geometry source.
 
@@ -1365,6 +1377,7 @@ def realize_fem_mesh_asset(
             hmax=target.hmax,
             order=target.order,
             options=mesh_options,
+            object_id=object_id,
         )
 
     if mesh.n_elements == 0:
@@ -3500,6 +3513,7 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
         else:
             classified_mesh = MeshData(
                 nodes=mesh.nodes,
+                vertex_identity=mesh.vertex_identity,
                 cell_types=mesh.cell_types,
                 cell_offsets=mesh.cell_offsets,
                 cell_nodes=mesh.cell_nodes,

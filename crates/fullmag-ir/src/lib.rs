@@ -2,6 +2,8 @@ use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod antenna;
+pub mod antenna_current_source;
 pub mod constraint;
 pub mod compute_resources;
 pub mod eigen_contract;
@@ -10,6 +12,7 @@ pub mod parallel_execution;
 pub mod execution_profile;
 
 pub mod execution_profile_materialization;
+pub mod field_drive_validation;
 pub mod frequency_response_contract;
 pub mod mechanics;
 pub mod mesh_assets;
@@ -19,6 +22,7 @@ pub mod mixed_certificate;
 pub mod native_indexed_geometry;
 pub mod model;
 pub mod output_storage;
+pub mod object_binding;
 pub mod physics_object;
 pub mod plan;
 pub mod planar_monitor;
@@ -27,6 +31,7 @@ pub mod quantities;
 pub mod selection;
 pub mod spectral_validation;
 pub mod spin_transport;
+pub mod antenna_lead_preparation;
 pub mod study;
 pub mod study_v04;
 mod v04_material_wire;
@@ -43,6 +48,8 @@ pub(crate) mod waveguide_mesh_world;
 pub(crate) mod waveguide_mesh_identity;
 mod floating_point_guard;
 mod validation;
+pub use antenna::*;
+pub use antenna_current_source::*;
 pub use constraint::*;
 pub use compute_resources::*;
 pub use eigen_contract::*;
@@ -54,6 +61,7 @@ pub use execution_profile_materialization::{
     materialize_execution_request, materialize_referenced_execution,
     validate_execution_materialization,
 };
+pub use field_drive_validation::*;
 pub use frequency_response_contract::*;
 pub use mechanics::*;
 pub use mesh_assets::*;
@@ -62,6 +70,7 @@ pub use mesh_policy::*;
 pub use mixed_certificate::*;
 pub use model::*;
 pub use output_storage::*;
+pub use object_binding::*;
 pub use physics_object::*;
 pub use plan::*;
 pub use planar_monitor::*;
@@ -72,6 +81,7 @@ pub use quantities::{
 pub use selection::*;
 pub use spectral_validation::BlochWavevectorIR;
 pub use spin_transport::*;
+pub use antenna_lead_preparation::*;
 pub use study::*;
 pub use study_v04::*;
 pub use waveguide_frame::{
@@ -426,6 +436,20 @@ pub struct ProblemIR {
     pub current_modules: Vec<CurrentModuleIR>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub field_drives: Vec<RegionalFieldDriveIR>,
+    /// Typed composition-first microwave antenna resources.  These fields
+    /// are additive to the 0.3 wire contract so existing scenes remain
+    /// readable while antenna authoring can already use the canonical
+    /// PhysicsObject/CurrentTransport lineage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_port_modes: Vec<AntennaPortModeIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_field_solve_stages: Vec<AntennaFieldSolveStageIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_target_projections: Vec<AntennaTargetProjectionRefIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub solved_antenna_drives: Vec<SolvedAntennaDriveIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_spectrum_requests: Vec<AntennaSpectrumRequestIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excitation_analysis: Option<ExcitationAnalysisIR>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -542,6 +566,16 @@ impl<'de> Deserialize<'de> for ProblemIR {
             #[serde(default)]
             field_drives: Vec<RegionalFieldDriveIR>,
             #[serde(default)]
+            antenna_port_modes: Vec<AntennaPortModeIR>,
+            #[serde(default)]
+            antenna_field_solve_stages: Vec<AntennaFieldSolveStageIR>,
+            #[serde(default)]
+            antenna_target_projections: Vec<AntennaTargetProjectionRefIR>,
+            #[serde(default)]
+            solved_antenna_drives: Vec<SolvedAntennaDriveIR>,
+            #[serde(default)]
+            antenna_spectrum_requests: Vec<AntennaSpectrumRequestIR>,
+            #[serde(default)]
             excitation_analysis: Option<ExcitationAnalysisIR>,
             #[serde(default)]
             spin_torque_modules: Vec<SpinTorqueModuleIR>,
@@ -606,6 +640,11 @@ impl<'de> Deserialize<'de> for ProblemIR {
             validation_profile: wire.validation_profile,
             current_modules: wire.current_modules,
             field_drives: wire.field_drives,
+            antenna_port_modes: wire.antenna_port_modes,
+            antenna_field_solve_stages: wire.antenna_field_solve_stages,
+            antenna_target_projections: wire.antenna_target_projections,
+            solved_antenna_drives: wire.solved_antenna_drives,
+            antenna_spectrum_requests: wire.antenna_spectrum_requests,
             excitation_analysis: wire.excitation_analysis,
             spin_torque_modules: wire.spin_torque_modules,
             spin_transport_modules: wire.spin_transport_modules,
@@ -758,6 +797,11 @@ impl ProblemIR {
             },
             current_modules: Vec::new(),
             field_drives: Vec::new(),
+            antenna_port_modes: Vec::new(),
+            antenna_field_solve_stages: Vec::new(),
+            antenna_target_projections: Vec::new(),
+            solved_antenna_drives: Vec::new(),
+            antenna_spectrum_requests: Vec::new(),
             excitation_analysis: None,
             spin_torque_modules: Vec::new(),
             spin_transport_modules: Vec::new(),
@@ -852,6 +896,7 @@ impl ProblemIR {
             }
         }
         validate_current_modules(self, &mut errors);
+        validate_antenna_composition_v03(self, &mut errors);
         validate_field_drives(self, &mut errors);
         validate_planar_monitors(self, &mut errors);
         validate_spin_wave_response_request(self, &mut errors);
@@ -865,13 +910,14 @@ impl ProblemIR {
         validate_spin_transport_modules(self, &mut errors);
         validate_magnetoelastic(self, &mut errors);
         validate_region_owned_semantics(self, &mut errors);
-        if self.regions.is_empty() {
+        let antenna_study = matches!(self.study, StudyIR::AntennaFieldSolve { .. });
+        if !antenna_study && self.regions.is_empty() {
             errors.push("at least one region is required".to_string());
         }
-        if self.materials.is_empty() {
+        if !antenna_study && self.materials.is_empty() {
             errors.push("at least one material is required".to_string());
         }
-        if self.magnets.is_empty() {
+        if !antenna_study && self.magnets.is_empty() {
             errors.push("at least one magnet is required".to_string());
         }
         let has_material_anisotropy = self.materials.iter().any(|material| {
@@ -886,7 +932,7 @@ impl ProblemIR {
                 || material.kc2_field.is_some()
                 || material.kc3_field.is_some()
         });
-        if self.energy_terms.is_empty() && !has_material_anisotropy {
+        if !antenna_study && self.energy_terms.is_empty() && !has_material_anisotropy {
             errors.push("at least one interaction or material anisotropy is required".to_string());
         }
         errors.extend(validate_study_contracts(
@@ -899,6 +945,9 @@ impl ProblemIR {
                 pbc: self.pbc.as_ref(),
             }),
         ));
+        if let Err(error) = self.study.validate_antenna_selection(&self.antenna_field_solve_stages) {
+            errors.push(error);
+        }
         for magnet in &self.magnets {
             if let Some(ref init_mag) = magnet.initial_magnetization {
                 match init_mag {
@@ -1154,6 +1203,50 @@ impl ProblemIR {
                         ));
                     }
                 }
+                GeometryEntryIR::MicrostripAntenna {
+                    name,
+                    length_m,
+                    thickness_m,
+                    conductivity_s_per_m,
+                    transform,
+                    stations,
+                    return_width_m,
+                    return_offset_m,
+                    conductors,
+                    terminal_faces,
+                } => antenna::validate_microstrip_geometry(
+                    name,
+                    *length_m,
+                    *thickness_m,
+                    *conductivity_s_per_m,
+                    transform,
+                    stations,
+                    *return_width_m,
+                    *return_offset_m,
+                    conductors,
+                    terminal_faces,
+                    &mut errors,
+                ),
+                GeometryEntryIR::CpwAntenna {
+                    name,
+                    length_m,
+                    thickness_m,
+                    conductivity_s_per_m,
+                    transform,
+                    stations,
+                    conductors,
+                    terminal_faces,
+                } => antenna::validate_cpw_geometry(
+                    name,
+                    *length_m,
+                    *thickness_m,
+                    *conductivity_s_per_m,
+                    transform,
+                    stations,
+                    conductors,
+                    terminal_faces,
+                    &mut errors,
+                ),
                 GeometryEntryIR::Difference { name, base, tool } => {
                     if name.trim().is_empty() {
                         errors.push("difference geometry name must not be empty".to_string());
@@ -3152,6 +3245,17 @@ if let Some(stage_autosave) = &study.sampling().stage_autosave {
     }
 }
 match &study {
+    StudyIR::AntennaFieldSolve { sampling, .. } => {
+        if !sampling.outputs.is_empty()
+            || sampling.table_autosave.is_some()
+            || sampling.stage_autosave.is_some()
+        {
+            errors.push(
+                "antenna_field_solve uses stage output requests, not magnetic time sampling"
+                    .to_string(),
+            );
+        }
+    }
     StudyIR::TimeEvolution { dynamics, .. } => {
         validate_study_dynamics(dynamics, &mut errors);
         for output in &study.sampling().outputs {

@@ -9,7 +9,7 @@ import {
 } from "./viewport3dEventManager";
 
 describe("pickViewport3DEventHandlers", () => {
-  it("removes release handlers but keeps click selection and wheel zoom", () => {
+  it("keeps gesture release, click selection and wheel zoom", () => {
     const handlers = {
       onClick: vi.fn(),
       onContextMenu: vi.fn(),
@@ -30,6 +30,7 @@ describe("pickViewport3DEventHandlers", () => {
       "onPointerDown",
       "onPointerLeave",
       "onPointerMove",
+      "onPointerUp",
       "onWheel",
     ]);
   });
@@ -115,7 +116,7 @@ describe("pickViewport3DEventHandlers", () => {
     expect(isViewport3DImmediatePointerDownRegion(event)).toBe(true);
   });
 
-  it("blocks native camera controls after dispatching ViewCube HUD pointer-down", () => {
+  it("preserves native camera controls when the HUD-region dispatch hits no widget", () => {
     const state = {
       internal: {
         initialClick: [0, 0],
@@ -142,8 +143,8 @@ describe("pickViewport3DEventHandlers", () => {
     } as unknown as MouseEvent);
 
     expect(pointerDownHandler).toHaveBeenCalledTimes(1);
-    expect(preventDefault).toHaveBeenCalledTimes(1);
-    expect(stopImmediatePropagation).toHaveBeenCalledTimes(1);
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(stopImmediatePropagation).not.toHaveBeenCalled();
   });
 
   it("does not replay selection raycasts for camera drags", () => {
@@ -169,6 +170,31 @@ describe("pickViewport3DEventHandlers", () => {
     expect(clickHandler).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])("does not restart a released HUD gesture on click (hit: %s)", (hit) => {
+    const state = { internal: { initialClick: [0, 0], initialHits: [] as unknown[] } };
+    const store = ({ getState: () => state } as unknown) as Parameters<typeof createViewport3DPointerDownHandler>[0];
+    const pointerDownDispatch = { immediate: false };
+    let dragging = false;
+    const pointerDownHandler = vi.fn(() => {
+      dragging = true;
+      state.internal.initialHits = hit ? [{}] : [];
+    });
+    const clickHandler = vi.fn();
+    const pointerDown = createViewport3DPointerDownHandler(store, pointerDownHandler, pointerDownDispatch);
+    const click = createViewport3DClickSelectionHandler({ store, pointerDownHandler, pointerDownDispatch, clickHandler });
+    const event = { currentTarget: { clientWidth: 800 }, offsetX: 720, offsetY: 80 } as unknown as MouseEvent;
+
+    pointerDown(event);
+    expect(state.internal.initialClick).toEqual([720, 80]);
+    dragging = false;
+    click(event);
+
+    expect(pointerDownHandler).toHaveBeenCalledTimes(1);
+    expect(dragging).toBe(false);
+    expect(pointerDownDispatch.immediate).toBe(false);
+    expect(clickHandler).toHaveBeenCalledTimes(hit ? 0 : 1);
+  });
+
   it("skips pointer-move raycasts while camera drag buttons are pressed", () => {
     const innerHandler = vi.fn();
     const handler = createViewport3DPointerMoveHandler(innerHandler);
@@ -178,6 +204,30 @@ describe("pickViewport3DEventHandlers", () => {
     handler?.({ buttons: 4 } as PointerEvent);
 
     expect(innerHandler).not.toHaveBeenCalled();
+  });
+
+  it("dispatches pressed moves only for the pointer captured by R3F", () => {
+    const innerHandler = vi.fn();
+    const handler = createViewport3DPointerMoveHandler(innerHandler, (id) => id === 7);
+    const capturedMove = { buttons: 1, pointerId: 7 } as PointerEvent;
+    handler?.({ buttons: 1, pointerId: 8 } as PointerEvent);
+    handler?.(capturedMove);
+    expect(innerHandler).toHaveBeenCalledExactlyOnceWith(capturedMove);
+  });
+
+  it("does not replay pointer-down after an immediate gizmo click", () => {
+    const pointerDownHandler = vi.fn();
+    const clickHandler = vi.fn();
+    const store = { getState: () => ({ internal: {
+      initialClick: [10, 20], initialHits: [],
+    } }) } as unknown as Parameters<typeof createViewport3DClickSelectionHandler>[0]["store"];
+    const handler = createViewport3DClickSelectionHandler({
+      store, pointerDownHandler, clickHandler,
+      pointerDownAlreadyHandled: () => true,
+    });
+    handler({ offsetX: 10, offsetY: 20 } as MouseEvent);
+    expect(pointerDownHandler).not.toHaveBeenCalled();
+    expect(clickHandler).not.toHaveBeenCalled();
   });
 
   it("keeps passive pointer-move handling for hover interactions", () => {

@@ -33,6 +33,7 @@ class ManagedHandoffCheckReceiptTests(unittest.TestCase):
 
             def child(command, **kwargs):
                 self.assertEqual(command[-2:], ["test_*development_*.py", "-v"])
+                self.assertEqual(kwargs["env"]["FULLMAG_TEST_TEMP_ROOT"], kwargs["env"]["TEMP"])
                 kwargs["stdout"].write(output)
                 return type("Result", (), {"returncode": child_code})()
 

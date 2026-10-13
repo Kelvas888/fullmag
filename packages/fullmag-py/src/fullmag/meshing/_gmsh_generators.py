@@ -12,6 +12,7 @@ from fullmag._progress import emit_progress
 from fullmag.model.geometry import (
     ArchWaveguide,
     Box,
+    CPWAntennaLayout,
     Cylinder,
     Difference,
     Ellipse,
@@ -19,6 +20,7 @@ from fullmag.model.geometry import (
     Geometry,
     ImportedGeometry,
     Intersection,
+    MicrostripAntennaLayout,
     Translate,
     Union,
 )
@@ -56,7 +58,12 @@ from ._gmsh_fields import _apply_mesh_options, _apply_post_mesh_options
 from ._gmsh_selectors import collect_orphan_entity_diagnostics
 from ._gmsh_airbox import _add_airbox_and_fragment, _add_airbox_geo
 from ._gmsh_swept import should_use_swept, generate_swept_mesh, classify_sweepability
-from ._gmsh_waveguides import add_arch_waveguide_to_occ
+from ._gmsh_waveguides import (
+    add_antenna_layout_parts_to_occ,
+    add_antenna_layout_terminal_physical_groups,
+    add_arch_waveguide_to_occ,
+    add_antenna_layout_to_occ,
+)
 from ._gmsh_occ import _configure_axis_periodic_surfaces, _scale_periodic_boundary_pairs
 
 _NO_OP_FIELD_SIZE = 1.0e22
@@ -294,6 +301,7 @@ def generate_mesh(
     airbox: AirboxOptions | None = None,
     options: MeshOptions | None = None,
     maximum_element_size: float | None = None,
+    object_id: str | None = None,
 ) -> MeshData:
     """Generate a tetrahedral mesh for the given geometry.
 
@@ -306,6 +314,8 @@ def generate_mesh(
         airbox: Structured airbox configuration. When given, takes precedence
                 over *air_padding*.
         options: Advanced Gmsh options (algorithms, quality, size fields).
+        object_id: Immutable owner for antenna terminal markers. Geometry-name
+                markers remain the compatibility default for unowned callers.
     """
     resolved_hmax = maximum_element_size if maximum_element_size is not None else hmax
     if resolved_hmax is None:
@@ -356,7 +366,21 @@ def generate_mesh(
             options=opts,
             geometry_name=geometry.geometry_name,
         )
-    if isinstance(geometry, (Cylinder, Difference, Union, Intersection, Translate, Ellipsoid, Ellipse, ArchWaveguide)):
+    if isinstance(
+        geometry,
+        (
+            Cylinder,
+            Difference,
+            Union,
+            Intersection,
+            Translate,
+            Ellipsoid,
+            Ellipse,
+            ArchWaveguide,
+            MicrostripAntennaLayout,
+            CPWAntennaLayout,
+        ),
+    ):
         # A chain of Translate wrapping an ImportedGeometry cannot go through
         # the OCC CSG pipeline (OCC cannot ingest STL/NPZ sources). Detect this
         # pattern, mesh the imported file directly, and apply the accumulated
@@ -378,7 +402,7 @@ def generate_mesh(
                     shift = np.array([ox, oy, oz], dtype=np.float64)
                     mesh = _dc_replace(mesh, nodes=mesh.nodes + shift)
                 return mesh
-        return _generate_csg_mesh(geometry, hmax=resolved_hmax, order=order, airbox=resolved_airbox, options=opts)
+        return _generate_csg_mesh(geometry, hmax=resolved_hmax, order=order, airbox=resolved_airbox, options=opts, object_id=object_id)
     if isinstance(geometry, ImportedGeometry):
         return generate_mesh_from_file(
             geometry.source,
@@ -456,6 +480,7 @@ def generate_box_mesh(
         )
         return MeshData.from_legacy_tet4(
             nodes=mesh.nodes / SCALE,
+            vertex_identity=mesh.vertex_identity,
             elements=mesh.elements,
             element_markers=mesh.element_markers,
             boundary_faces=mesh.boundary_faces,
@@ -530,6 +555,7 @@ def generate_cylinder_mesh(
         )
         return MeshData.from_legacy_tet4(
             nodes=mesh.nodes / SCALE,
+            vertex_identity=mesh.vertex_identity,
             elements=mesh.elements,
             element_markers=mesh.element_markers,
             boundary_faces=mesh.boundary_faces,
@@ -607,6 +633,7 @@ def generate_difference_mesh(
         # Scale nodes back to SI metres
         return MeshData.from_legacy_tet4(
             nodes=mesh.nodes / SCALE,
+            vertex_identity=mesh.vertex_identity,
             elements=mesh.elements,
             element_markers=mesh.element_markers,
             boundary_faces=mesh.boundary_faces,
@@ -629,6 +656,7 @@ def _generate_csg_mesh(
     order: int = 1,
     airbox: AirboxOptions | None = None,
     options: MeshOptions | None = None,
+    object_id: str | None = None,
 ) -> MeshData:
     """Mesh any geometry type via the generic OCC pipeline.
 
@@ -648,7 +676,20 @@ def _generate_csg_mesh(
     try:
         _configure_gmsh_threads(gmsh)
         gmsh.model.add("fullmag_csg")
-        mag_tags = _add_geometry_to_occ(gmsh, geometry, scale=SCALE)
+        antenna_part_tags = None
+        if isinstance(geometry, (MicrostripAntennaLayout, CPWAntennaLayout)):
+            antenna_part_tags = add_antenna_layout_parts_to_occ(
+                gmsh,
+                geometry,
+                scale=SCALE,
+            )
+            mag_tags = [
+                dimtag
+                for part_tags in antenna_part_tags.values()
+                for dimtag in part_tags
+            ]
+        else:
+            mag_tags = _add_geometry_to_occ(gmsh, geometry, scale=SCALE)
         gmsh.model.occ.synchronize()
         has_airbox = airbox_scaled is not None
         airbox_field_ids: list[int] = []
@@ -678,6 +719,14 @@ def _generate_csg_mesh(
                 geometry.geometry_name,
                 [int(tag) for dim, tag in mag_tags if int(dim) == 3],
             )
+            if antenna_part_tags is not None:
+                add_antenna_layout_terminal_physical_groups(
+                    gmsh,
+                    geometry,
+                    antenna_part_tags,
+                    scale=SCALE,
+                    object_id=object_id,
+                )
         periodic_pair_specs = _configure_axis_periodic_surfaces(
             gmsh,
             surface_tags=[
@@ -706,7 +755,7 @@ def _generate_csg_mesh(
         mesh = _extract_mesh_data(
             gmsh,
             quality=quality,
-            has_physical_groups=has_airbox,
+            has_physical_groups=has_airbox or antenna_part_tags is not None,
             per_domain_quality=_pdq,
             periodic_pair_specs=periodic_pair_specs,
         )
@@ -715,6 +764,7 @@ def _generate_csg_mesh(
         )
         return MeshData.from_legacy_tet4(
             nodes=mesh.nodes / SCALE,
+            vertex_identity=mesh.vertex_identity,
             elements=mesh.elements,
             element_markers=mesh.element_markers,
             boundary_faces=mesh.boundary_faces,
@@ -782,6 +832,8 @@ def _add_geometry_to_occ(
         return [(3, tag)]
     if isinstance(geometry, ArchWaveguide):
         return add_arch_waveguide_to_occ(gmsh, geometry, scale=scale)
+    if isinstance(geometry, (MicrostripAntennaLayout, CPWAntennaLayout)):
+        return add_antenna_layout_to_occ(gmsh, geometry, scale=scale)
     if isinstance(geometry, Difference):
         base_tags = _add_geometry_to_occ(gmsh, geometry.base, scale=scale)
         tool_tags = _add_geometry_to_occ(gmsh, geometry.tool, scale=scale)

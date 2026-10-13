@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::ffi::OsString;
 
 mod accepted_run_transport;
+mod antenna_workflow;
 mod args;
 mod command_bridge;
 mod communication_policy;
@@ -133,6 +134,18 @@ fn main() -> Result<()> {
         }
         Command::Runtime(RuntimeCommand::InitializeScopedAcceptedStore) => {
             control_room::initialize_scoped_accepted_store()?;
+        }
+        Command::Runtime(RuntimeCommand::InitializeHostApplication {
+            config,
+            config_sha256,
+        }) => {
+            println!(
+                "{}",
+                serde_json::to_string(&runtime_service_client::initialize_host_application(
+                    &config,
+                    &config_sha256,
+                )?)?
+            );
         }
         Command::Runtime(RuntimeCommand::VerifyDevelopmentHandoffCommit {
             store,
@@ -316,6 +329,14 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&direct_run_summary(&result, &output_dir))?
             );
+        }
+        Command::PrepareRunJson {
+            path,
+            project_id,
+            api_url,
+        } => {
+            let result = accepted_run_transport::prepare_run_json(&path, &project_id, &api_url)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::RunJson {
             path,
@@ -1569,10 +1590,12 @@ mod tests {
             enable_demag: true,
             external_field: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             field_drives: Vec::new(),
             field_drive_geometry_masks: Vec::new(),
             time_stage: Default::default(),
             current_modules: vec![],
+            charge_transport_plans: vec![],
             spin_transport_plans: vec![],
             gyromagnetic_ratio: 2.211e5,
             precision: ExecutionPrecision::Double,
@@ -1854,6 +1877,26 @@ mod tests {
                 submit_only: true,
             } if path == std::path::Path::new("accepted-run.json")
                 && api_url == "http://127.0.0.1:8000"
+        ));
+    }
+
+    #[test]
+    fn cli_prepares_run_identity_without_an_implicit_submit() {
+        let cli = Cli::try_parse_from([
+            "fullmag",
+            "prepare-run-json",
+            "authored-run.json",
+            "--project-id",
+            "project-submit",
+            "--api-url",
+            "http://127.0.0.1:8000",
+        ])
+        .expect("cli parse");
+        assert!(matches!(
+            cli.command,
+            Command::PrepareRunJson { path, project_id, api_url }
+                if path == std::path::Path::new("authored-run.json")
+                    && project_id == "project-submit" && api_url == "http://127.0.0.1:8000"
         ));
     }
 

@@ -18,6 +18,45 @@ use std::{
 
 const MAX_RESPONSE: usize = 256 * 1024;
 
+/// Pin an operator-selected application configuration and initialize its host
+/// ledger. This does not launch a service or qualify hardware enforcement.
+pub fn initialize_host_application(
+    configuration_path: &Path,
+    expected_configuration_sha256: &str,
+) -> Result<serde_json::Value> {
+    if expected_configuration_sha256.len() != 64
+        || !expected_configuration_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("host initialization requires a lowercase canonical configuration SHA-256");
+    }
+    let candidate = RuntimeServiceConfig::read(configuration_path)?;
+    let configuration_sha256 =
+        fullmag_session::canonical_json_sha256(&serde_json::to_value(&candidate)?);
+    if configuration_sha256 != expected_configuration_sha256 {
+        bail!("host initialization configuration digest differs from the operator pin");
+    }
+    let store = fullmag_session::SessionStore::open_existing(&candidate.store_root)?;
+    let config = RuntimeServiceConfig::initialize_host_application(&store, &candidate)?;
+    let host = config
+        .host_execution
+        .as_ref()
+        .context("initialized application configuration has no host binding")?;
+    Ok(serde_json::json!({
+        "schema_version": "runtime_host_initialization.v1",
+        "status": "configuration_and_ledger_ready",
+        "configuration_sha256": configuration_sha256,
+        "store_id": fullmag_session::host_resource_ledger::HostResourceLedger::store_id(store.root())?,
+        "target_id": config.target_id,
+        "host_id": host.policy.host_id,
+        "policy_revision": host.policy.revision,
+        "owner_epoch": host.policy.owner_epoch,
+        "topology_sha256": host.policy.topology_sha256,
+        "execution_available": false,
+    }))
+}
+
 fn read_api_document(port: u16) -> Result<(serde_json::Value, String)> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let address = SocketAddr::from(([127, 0, 0, 1], port));
@@ -831,6 +870,53 @@ fn require_attach_active(cancelled: &std::sync::atomic::AtomicBool) -> Result<()
 #[cfg(test)]
 mod tests {
     #[test]
+    fn host_initialization_rejects_invalid_pin_before_reading_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing-config.json");
+        for pin in [
+            String::new(),
+            "not-a-digest".into(),
+            "A".repeat(64),
+            "g".repeat(64),
+        ] {
+            let error = super::initialize_host_application(&path, &pin).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("lowercase canonical configuration SHA-256"));
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn host_initialization_rejects_stale_pin_before_opening_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_root = directory.path().join("missing-store");
+        let candidate = crate::local_resources::application_service_config(
+            &store_root,
+            crate::local_resources::LocalCpuCapacity {
+                cpu_millis: 8000,
+                memory_available_bytes: 1024 * 1024 * 1024,
+                storage_available_bytes: 4 * 1024 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let path = directory.path().join("config.json");
+        std::fs::write(&path, serde_json::to_vec(&candidate).unwrap()).unwrap();
+        let actual =
+            fullmag_session::canonical_json_sha256(&serde_json::to_value(candidate).unwrap());
+        let stale = if actual == "a".repeat(64) {
+            "b".repeat(64)
+        } else {
+            "a".repeat(64)
+        };
+        let error = super::initialize_host_application(&path, &stale).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("digest differs from the operator pin"));
+        assert!(!store_root.exists());
+    }
+
+    #[test]
     fn cancelled_attach_never_reaches_launch_or_creates_a_store() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let directory = tempfile::tempdir().unwrap();
@@ -1079,6 +1165,7 @@ mod tests {
             heartbeat_interval_milliseconds: 100,
             startup_timeout_seconds: 10,
             drain_timeout_seconds: 10,
+            host_execution: None,
         };
         config.validate().unwrap();
         config

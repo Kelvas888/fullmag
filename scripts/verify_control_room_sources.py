@@ -17,7 +17,7 @@ import fullmag_storage as storage
 
 PROFILE = "windows-control-room-source-check"
 GENERATED_OUTPUTS = ("openapi-v2-types.ts", "openapi-v2-client.ts", "openapi-v2-paths.ts")
-ROUTES = ("generate-client", "production-source", "api-hygiene", "lint", "openapi-import-check", "react-doctor", "development-restart-check", "resource-client-cache-check", "development-kernel-host-check", "development-transport-pause-check", "development-run-outcome-handoff-check", "development-run-outcome-handoff-lint", "development-restart-action-check", "development-restart-action-lint", "development-backend-build-action-check")
+ROUTES = ("generate-client", "production-source", "api-hygiene", "lint", "openapi-import-check", "react-doctor", "development-restart-check", "resource-client-cache-check", "development-kernel-host-check", "development-transport-pause-check", "development-run-outcome-handoff-check", "development-run-outcome-handoff-lint", "development-restart-action-check", "development-restart-action-lint", "development-backend-build-action-check", "material-assignment-draft-check")
 
 
 def timestamp():
@@ -163,6 +163,10 @@ def run(repo: Path, route: str, dependency_workspace: Path | None = None):
                 if route == "development-run-outcome-handoff-check":
                     receipt["unit_tests"] = "none_interpreted_js_driver_no_unit_build"
                     receipt["production_source_transform"] = "in_memory_parameter_property_support"
+            elif route == "material-assignment-draft-check":
+                commands = [[node, "scripts/check-material-assignment-draft.mjs"]]
+                receipt["interpreted_node_checks"] = True
+                receipt["unit_tests"] = "none_native_type_erasure_of_production_source_only"
             elif route == "api-hygiene":
                 commands = [[node, "scripts/check-api-hygiene.mjs"]]
             elif route == "lint":
@@ -207,10 +211,12 @@ def run(repo: Path, route: str, dependency_workspace: Path | None = None):
                     raise storage.StorageError("Repository-pinned React Doctor is unavailable")
                 env["NODE_DISABLE_COMPILE_CACHE"] = "1"
                 commands = [[node, str(doctor), ".", "--verbose", "--scope", "changed",
-                             "--base", "HEAD", "--no-score", "--no-supply-chain",
+                             "--base", "HEAD", "--include-untracked", "--no-cache", "--no-score", "--no-supply-chain",
                              "--no-dead-code", "--no-parallel", "--yes",
                              "--output-dir", str(run_root / "diagnostics")]]
                 receipt["scope"] = "changed_against_HEAD"
+                receipt["include_untracked"] = True
+                receipt["scan_cache"] = "disabled"
                 receipt["online_services"] = "disabled_score_and_supply_chain"
             else:
                 # This is source checking, not compilation of test targets. UI

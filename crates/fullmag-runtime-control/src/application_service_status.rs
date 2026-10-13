@@ -485,6 +485,7 @@ mod tests {
             heartbeat_interval_milliseconds: 1,
             startup_timeout_seconds: 1,
             drain_timeout_seconds: 1,
+            host_execution: None,
         };
         config.validate().unwrap();
         let config_path = root.join("runtime-services/APPLICATION.json");

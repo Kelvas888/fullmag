@@ -46,6 +46,7 @@ vi.mock("@/kernel/resources/geometryLifecycleResources", async (importOriginal) 
     useDomainMetaResource: () => result(null),
     useFdmRegionMembershipBinaryResource: () => result(null),
     useFdmRegionMembershipResource: () => result(null),
+    useMeshBuildHistoryResource: () => result(null),
     useMeshCapabilitiesResource: () => result({ mesh_capabilities: {} }),
     useObjectMeshPolicyResource: () => result(mocks.policy),
     useObjectMeshQualityResource: () => result(null),
@@ -81,7 +82,12 @@ function kernel(): KernelApi {
       execute: mocks.execute,
       getSessionScopeKey: () => mocks.scopeKey,
     },
-    resources: { invalidate: mocks.invalidate },
+    resources: {
+      get: () => null,
+      getRevision: () => 1,
+      invalidate: mocks.invalidate,
+      subscribe: () => () => {},
+    },
   } as unknown as KernelApi;
 }
 

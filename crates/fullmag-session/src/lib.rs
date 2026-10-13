@@ -20,6 +20,7 @@ mod archive_source;
 pub mod capture;
 pub mod cas;
 pub mod communication_policy;
+pub mod compute_node_snapshot;
 pub mod dataset_slice_adapter;
 mod durability;
 mod development_owner;
@@ -33,12 +34,14 @@ pub mod materialized_dataset;
 pub mod reachability;
 pub mod repository_path;
 pub mod runtime_service;
+pub mod runtime_service_host;
 pub mod runtime_service_startup;
 pub mod solution_set_catalog;
 pub mod solution_field_geometry;
 pub mod solution_scalar_source;
 pub mod solution_tensor_field;
 pub mod solution_tensor_source;
+pub mod task_cancellation;
 pub mod store;
 pub mod types;
 mod typed_documents;
@@ -68,5 +71,9 @@ pub use fms::{
     FmsStagedPreflight, PackOptions,
 };
 pub use store::{CheckpointStillReferenced, GcPlan, RunBacklogFull, SessionStore};
+pub use task_cancellation::{
+    FmsTaskCancellationIntent, TaskCancellationIntentCommitDisposition,
+    TaskCancellationIntentConflict, FMS_TASK_CANCELLATION_INTENT_SCHEMA,
+};
 pub use types::*;
 pub use writer::{StoreWriterBusy, WriteTransaction};
