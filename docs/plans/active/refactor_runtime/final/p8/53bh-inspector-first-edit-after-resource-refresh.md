@@ -90,3 +90,54 @@ Wymagane: interpretowana regresja empty→loaded→edit, zachowanie nietkniętyc
 pól, kolejnych edycji i dirty state; typecheck oraz adekwatne kontrole źródeł;
 następnie realny browser Apply→restart→restore. Pozostają też Save/Cancel,
 pozostałe typy paneli, powtórny restart, fault gates i warm-service ownership.
+
+## Pakiet natywny L — przygotowany do próby browser
+
+Zarządzany `just windows-workspace-build dev dev 3258 true` zakończył się
+kodem 0. Manifest SHA-256:
+`2831903ee7da60597d1d9781572af240f5db7373c32452580ed5b4b49c1519f6`.
+Commit pakietu `141f21a193bc920f7d5232b7e50d24550e31ba51`, stan dirty,
+tożsamość źródeł `abb2a46a6ad7f4d82cd6ffcb7ba1dffa6e726e33ea6e8108bf061d13a17900de`.
+Snapshot katalogu źródeł:
+`4c6d50d21b13e36484565caf15c0391186e917b504c9ba95c3ca9d73264092fa`.
+CLI SHA-256 `bac1493a494ce04a1f0ce0601c965085febc4fd7e4a359f3fd2959587486c852`,
+API `38b4f8832b1ac4f45ff3b6c4c89fd6e8579886d6408fa598a20b27ea5f87d1e6`.
+
+Uruchomiono osobną zarządzaną próbę browser z owner bundle F, receipt
+`development-backend-api-checks/checks/d2521f8a968d48b9baae60e92b3aa82b/receipt.json`.
+Próba jest w toku; przygotowanie obejmuje kontrolę typów produkcyjnego
+frontendu fixture. Nie kompiluje testów jednostkowych. Do chwili otrzymania
+terminalnego receipt nie zalicza bramki Apply→restart→restore.
+
+## Realny browser L — edycja i odtworzenie potwierdzone, pełny gate OPEN
+
+Próba `d2521f8a968d48b9baae60e92b3aa82b` wykazała:
+- normalne UI New FDM i Thin Film 20 × 20 × 5 nm;
+- otwarcie nieprzypisanego panelu przed transakcją odświeżającą materiał;
+- pierwsza edycja alpha 0.01→0.02 zachowała Name, Ms=800000 i Aex=1.3e-11;
+- niezastosowany szkic odmówił restartu bez zmiany API/session/generation;
+- Apply Parameters zakończył się ACK, rewizja 3, panel clean;
+- restart odtworzył scenę i dokładny niezapisany dokument, API zmieniło się
+  z `4f098324-a137-4679-8a39-9d4cb1aead40`
+  na `c581f020-a505-4e75-9fc2-6b1b5b7780ea`, generation=1;
+- ponownie otwarty panel zachował powyższe pola i alpha=0.02;
+- widoczny viewport: context_lost=false, drawing buffer 700×297;
+- Build Grid zakończył dziecko exit 0; Compute wykonał finite Run na FDM CPU.
+
+![Materiał odtworzony po restarcie](53bh-material-restored.jpg)
+
+Końcowa obserwacja execution odmówiła zamknięcia solvera: scena różniła się
+od obserwacji odtworzenia. Porównanie zapisanych scen wyizolowało wyłącznie
+usunięcie `objects[0].tags=["mesh:dirty"]`. Produkcyjny `session.rs` usuwa
+znacznik po pomyślnym przygotowaniu mesh; pozostałe dane są identyczne.
+To błąd reguły verifiera, nie utrata parametrów. Nie zaliczono pełnego gate.
+Normalne anulowanie fixture dało terminal failed/exit 1; wszystkie 26
+procesów mają waited=true. Nie przedstawiać tego jako normalnego terminalnego
+zamknięcia Compute ani PASS całej próby.
+
+Verifier zachowuje ścisłe porównanie sceny natychmiast po restore. Dopiero
+w gate wykonania i finish porównuje oczekiwaną scenę po usunięciu samego
+`mesh:dirty`, zachowując inne tagi i wszystkie dane authoringu. Nadal wymaga
+udanej terminalnej obserwacji Grid i osobnego Compute oraz dokładnego scope.
+Interpretowane regression checks: 27 PASS, bez kompilowania testów.
+Ponowna realna próba jest wymagana przed zamknięciem całego punktu.

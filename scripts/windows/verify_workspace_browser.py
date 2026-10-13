@@ -63,6 +63,20 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def scene_after_successful_grid(scene):
+    """Only clear the production mesh-dirty tag; retain all authored data."""
+    expected = copy.deepcopy(scene)
+    for obj in expected.get("objects", []):
+        tags = obj.get("tags")
+        if isinstance(tags, list) and "mesh:dirty" in tags:
+            remaining = [tag for tag in tags if tag != "mesh:dirty"]
+            if remaining:
+                obj["tags"] = remaining
+            else:
+                obj.pop("tags")
+    return expected
+
+
 def check_material_anisotropy_plans(binaries, fixture, env, receipt):
     """Exercise the production planner without compiling tests or starting a solver."""
     root = fixture / "material-anisotropy-plans"
@@ -708,7 +722,7 @@ class ProofBridge:
         queue_before = read_api(self.api_port, api_instance_id, "/v2/sessions/current/simulation/commands")
         scene = read_api(self.api_port, api_instance_id, "/v2/sessions/current/model/scene")
         scene_sha256 = hashlib.sha256(canonical(scene).encode()).hexdigest()
-        if (canonical(scene) != canonical(before.get("scene"))
+        if (canonical(scene) != canonical(scene_after_successful_grid(before.get("scene")))
                 or not same_execution_scope(scope_before, restore.get("scope"))):
             raise storage.StorageError("Restored scene or session scope changed after the restore observation")
 
@@ -942,7 +956,7 @@ class ProofBridge:
         scene = read_api(self.api_port, body["new_api_instance_id"], "/v2/sessions/current/model/scene")
         backend = read_api(self.api_port, body["new_api_instance_id"], "/v2/platform/development-backend")
         identity = backend.get("workspace_identity", {})
-        if (canonical(scene) != canonical(before["scene"])
+        if (canonical(scene) != canonical(scene_after_successful_grid(before["scene"]))
                 or identity.get("api_instance_id") != body["new_api_instance_id"]
                 or not isinstance(identity.get("session_id"), str)
                 or identity["session_id"] == before["identity"]["session_id"]
