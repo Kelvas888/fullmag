@@ -702,12 +702,12 @@
 
 .fm-inspector__options-button {
   flex: 0 0 auto;
-  opacity: 0.5;
-  transition: opacity var(--fm-transition-fast);
+  color: var(--fm-text-muted);
+  transition: color var(--fm-transition-fast);
 }
 
 .fm-inspector__identity:hover .fm-inspector__options-button {
-  opacity: 1;
+  color: var(--fm-text-primary);
 }
 
 /* Metadata Grid — hidden; info shown via metric strip instead */
@@ -817,7 +817,7 @@
 
 .fm-inspector__action-bar {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr 1.4fr;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
   gap: var(--fm-space-2);
   min-width: 0;
@@ -858,7 +858,6 @@
   }
 
   .fm-inspector__action-bar {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--fm-space-1);
     padding-inline: var(--fm-space-2);
   }
@@ -934,3 +933,17 @@
   color: var(--fm-text-muted);
   font-size: var(--fm-font-size-xs);
 }
+
+.fm-inspector__action-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--fm-space-2);
+}
+.fm-inspector__action-controls > button { flex: 1 1 auto; }
+.fm-inspector__action-reason, .fm-inspector__action-error {
+  margin: 0;
+  font-size: var(--fm-font-size-xs);
+  color: var(--fm-text-muted);
+  overflow-wrap: anywhere;
+}
+.fm-inspector__action-error { color: var(--fm-danger); }
