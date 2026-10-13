@@ -3431,6 +3431,27 @@
       "responsibility": "Publish the actual nearest-frequency Floquet result metadata: target kind and target frequency, selected-only spectrum completeness, window_complete=false, and status-derived solve_complete; leave the frequency-window producer contract separate."
     },
     {
+      "id": "source-native-cpu-required-phi-vector-transport",
+      "path": "backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp",
+      "symbol": "std::string populate_typed_modal_result",
+      "evidence_status": "source-visible; scoped native regression prepared; hosted execution pending",
+      "responsibility": "Require reconstructed phi for Floquet demag typed transport; matrix-only dense spectral input cannot waive required_phi_vector_missing or publish typed mode buffers."
+    },
+    {
+      "id": "source-native-cpu-mode-transport-failure-finalizer",
+      "path": "backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp",
+      "symbol": "void finalize_mode_transport_result",
+      "evidence_status": "source-visible; scoped native regression prepared; hosted execution pending",
+      "responsibility": "Convert typed transport failure to final solve_error, clear completion claims, and keep solver candidate metadata diagnostic rather than science acceptance."
+    },
+    {
+      "id": "test-native-cpu-matrix-only-required-phi-transport-fail-closed",
+      "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+      "symbol": "void modal_nonzero_k_floquet_dynamic_demag_matrix_admission_fails_closed_without_phi_transport",
+      "evidence_status": "source regression prepared; hosted native execution pending; not physics qualification",
+      "responsibility": "Exercise actual C ABI dense SLEPc admission and diagnostic candidate metadata, then require required_phi_vector_missing, empty typed buffers, and nearest selected-only/window-incomplete semantics."
+    },
+    {
       "id": "source-nearest-floquet-routing-regression",
       "path": "scripts/test_nearest_floquet_dynamic_demag_routing_source.py",
       "symbol": "test_native_solver_keeps_residual_and_selected_only_policies",

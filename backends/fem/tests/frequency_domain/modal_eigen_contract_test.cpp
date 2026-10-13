@@ -7857,7 +7857,7 @@ void modal_nonzero_k_floquet_bloch_payload_with_demag_is_unavailable()
     fullmag_fem_frequency_domain_result_destroy(&result);
 }
 
-void modal_nonzero_k_floquet_bloch_payload_with_dynamic_demag_k_is_admitted()
+void modal_nonzero_k_floquet_dynamic_demag_matrix_admission_fails_closed_without_phi_transport()
 {
     constexpr double stiffness_matrix_row_major[] = {1.0, 0.0, 0.0, 1.0};
     constexpr double gyrotropic_mass_row_major[] = {0.0, -1.0, 1.0, 0.0};
@@ -7901,19 +7901,48 @@ void modal_nonzero_k_floquet_bloch_payload_with_dynamic_demag_k_is_admitted()
 
     FullmagFemFrequencyDomainResult result = fullmag_fem_modal_eigen_solve(&request);
 #if FULLMAG_FEM_WITH_SLEPC
-    if (result.status != FULLMAG_FEM_FD_OK) {
-        print_bounded_cabi_modal_result("C ABI nonzero-k dynamic-demag payload", result);
+    if (result.status != FULLMAG_FEM_FD_SOLVE_ERROR) {
+        print_bounded_cabi_modal_result("C ABI matrix-only nonzero-k dynamic-demag payload", result);
     }
-    check(result.status == FULLMAG_FEM_FD_OK,
-          "a complete nonzero-k dynamic demag matrix must reach the production SLEPc path");
+    check(result.status == FULLMAG_FEM_FD_SOLVE_ERROR,
+          "matrix-only nonzero-k dynamic demag may reach SLEPc but cannot publish a mode without reconstructed phi");
+    check(contains(result.error_message, "required_phi_vector_missing"),
+          "matrix-only nonzero-k dynamic demag fails at required-potential typed transport");
+    check(contains(result.diagnostics_json,
+                   "\"mode_vector_transport_error\":\"required_phi_vector_missing\""),
+          "matrix-only dynamic demag diagnostics report the fail-closed transport reason");
+    check(contains(result.result_json,
+                   "\"mode_vector_transport_error\":\"required_phi_vector_missing\""),
+          "matrix-only dynamic demag result reports the fail-closed transport reason");
     check(contains(result.result_json, "\"accepted_mode_count\":1"),
-          "a complete nonzero-k dynamic demag matrix must produce one accepted mode");
+          "the dense solver candidate remains visible as diagnostic metadata");
+    check(contains(result.result_json, "\"mode_index\":0") &&
+              contains(result.result_json, "\"mode_vector_transport\":\"typed_abi_v18\"") &&
+              contains(result.result_json, "\"q_dof_count\":2") &&
+              contains(result.result_json, "\"phi_dof_count\":0"),
+          "diagnostic candidate metadata records q and the absent reconstructable phi without exporting vectors");
+    check(contains(result.diagnostics_json,
+                   "\"solver_adapter\":\"slepc_modal_eigen\"") &&
+              contains(result.diagnostics_json,
+                       "\"solver_model\":\"slepc_multi_shift_invert_production_cpu_dense\""),
+          "the window candidate is produced by the dense SLEPc modal adapter before transport fails");
     check(contains(result.resolved_engine_id, "floquet_airbox_cpu_schur_slepc"),
-          "a complete nonzero-k dynamic demag matrix must attest the distinct Floquet CPU engine");
+          "matrix-only typed publication failure retains the resolved engine identity");
+    check(contains(result.diagnostics_json, "\"complete\":false"),
+          "matrix-only transport failure clears the completed-solve diagnostic claim");
 #else
     check(result.status == FULLMAG_FEM_FD_UNAVAILABLE,
-          "a complete nonzero-k dynamic demag matrix still requires SLEPc");
+          "a numeric nonzero-k dynamic demag matrix still requires SLEPc");
 #endif
+    check(result.mode_count == 0 && result.mode_lambda_count == 0 &&
+              result.mode_q_complex_count == 0 && result.mode_phi_complex_count == 0 &&
+              result.mode_delta_m_xyz_complex_count == 0 && result.mode_residual_count == 0 &&
+              result.mode_cluster_id_count == 0 && result.q_dof_count == 0 &&
+              result.phi_dof_count == 0 && result.mode_lambda == nullptr &&
+              result.mode_q_complex == nullptr && result.mode_phi_complex == nullptr &&
+              result.mode_delta_m_xyz_complex == nullptr && result.mode_residuals == nullptr &&
+              result.mode_cluster_ids == nullptr,
+          "a matrix-only Floquet candidate without phi exports no typed modal buffers");
     check(!contains(result.diagnostics_json,
                     "\"production_cpu_rejection_reason\":\"production_cpu_modal_dynamic_demag_k_operator_missing\""),
           "a supplied dynamic demag matrix must not be reported as missing");
@@ -7924,13 +7953,33 @@ void modal_nonzero_k_floquet_bloch_payload_with_dynamic_demag_k_is_admitted()
           "dynamic demag diagnostics must preserve the payload extent");
     fullmag_fem_frequency_domain_result_destroy(&result);
 
-    // The same admitted Floquet operator must publish selected-only metadata
-    // when the native target is nearest-frequency.  This remains a prepared
-    // contract regression until the managed SLEPc build is available.
+    // The same matrix-only Floquet input must retain nearest-frequency
+    // selected-only metadata while failing closed at required-phi transport.
     request.target_kind = "nearest_frequency";
     request.target_frequency_hz = 0.2;
     FullmagFemFrequencyDomainResult nearest_result =
         fullmag_fem_modal_eigen_solve(&request);
+#if FULLMAG_FEM_WITH_SLEPC
+    if (nearest_result.status != FULLMAG_FEM_FD_SOLVE_ERROR) {
+        print_bounded_cabi_modal_result(
+            "C ABI matrix-only nearest nonzero-k dynamic-demag payload",
+            nearest_result);
+    }
+    check(nearest_result.status == FULLMAG_FEM_FD_SOLVE_ERROR,
+          "nearest matrix-only Floquet demag fails closed when required phi cannot be reconstructed");
+    check(contains(nearest_result.diagnostics_json,
+                   "\"mode_vector_transport_error\":\"required_phi_vector_missing\"") &&
+              contains(nearest_result.result_json,
+                       "\"mode_vector_transport_error\":\"required_phi_vector_missing\""),
+          "nearest diagnostics and result preserve the required-phi transport failure");
+    check(contains(nearest_result.result_json, "\"accepted_mode_count\":1") &&
+              contains(nearest_result.result_json, "\"mode_index\":0") &&
+              contains(nearest_result.result_json, "\"phi_dof_count\":0"),
+          "nearest solver candidate remains diagnostic metadata without a transported potential");
+#else
+    check(nearest_result.status == FULLMAG_FEM_FD_UNAVAILABLE,
+          "nearest matrix-only Floquet demag remains unavailable without SLEPc");
+#endif
     check(contains(nearest_result.diagnostics_json,
                    "\"target_kind\":\"nearest_frequency\""),
           "nearest Floquet diagnostics must publish the native target kind");
@@ -7943,12 +7992,8 @@ void modal_nonzero_k_floquet_bloch_payload_with_dynamic_demag_k_is_admitted()
     check(contains(nearest_result.diagnostics_json,
                    "\"window_complete\":false"),
           "nearest Floquet diagnostics must never publish a complete window");
-    const std::string expected_solve_complete =
-        nearest_result.status == FULLMAG_FEM_FD_OK ?
-            "\"solve_complete\":true" :
-            "\"solve_complete\":false";
-    check(contains(nearest_result.diagnostics_json, expected_solve_complete.c_str()),
-          "nearest Floquet diagnostics must distinguish solver completion from spectrum coverage");
+    check(contains(nearest_result.diagnostics_json, "\"solve_complete\":false"),
+          "nearest Floquet diagnostics must report incomplete execution after transport failure");
     check(contains(nearest_result.result_json,
                    "\"target_kind\":\"nearest_frequency\""),
           "nearest Floquet result must publish the native target kind");
@@ -7961,8 +8006,22 @@ void modal_nonzero_k_floquet_bloch_payload_with_dynamic_demag_k_is_admitted()
     check(contains(nearest_result.result_json,
                    "\"window_complete\":false"),
           "nearest Floquet result must never publish a complete window");
-    check(contains(nearest_result.result_json, expected_solve_complete.c_str()),
-          "nearest Floquet result must distinguish solver completion from spectrum coverage");
+    check(contains(nearest_result.result_json, "\"solve_complete\":false"),
+          "nearest Floquet result must report incomplete execution after transport failure");
+    check(nearest_result.mode_count == 0 && nearest_result.mode_lambda_count == 0 &&
+              nearest_result.mode_q_complex_count == 0 &&
+              nearest_result.mode_phi_complex_count == 0 &&
+              nearest_result.mode_delta_m_xyz_complex_count == 0 &&
+              nearest_result.mode_residual_count == 0 &&
+              nearest_result.mode_cluster_id_count == 0 &&
+              nearest_result.q_dof_count == 0 && nearest_result.phi_dof_count == 0 &&
+              nearest_result.mode_lambda == nullptr &&
+              nearest_result.mode_q_complex == nullptr &&
+              nearest_result.mode_phi_complex == nullptr &&
+              nearest_result.mode_delta_m_xyz_complex == nullptr &&
+              nearest_result.mode_residuals == nullptr &&
+              nearest_result.mode_cluster_ids == nullptr,
+          "nearest matrix-only Floquet candidate exports no typed modal buffers");
     fullmag_fem_frequency_domain_result_destroy(&nearest_result);
 }
 
@@ -11073,7 +11132,7 @@ int main(int argc, char **argv)
     modal_nonzero_k_floquet_bloch_payload_reaches_production_solver();
     modal_nonzero_k_floquet_bloch_payload_rejects_gated_operator_terms();
     modal_nonzero_k_floquet_bloch_payload_with_demag_is_unavailable();
-    modal_nonzero_k_floquet_bloch_payload_with_dynamic_demag_k_is_admitted();
+    modal_nonzero_k_floquet_dynamic_demag_matrix_admission_fails_closed_without_phi_transport();
     modal_nonzero_k_floquet_dynamic_demag_k_rejects_malformed_payload();
     modal_poisson_airbox_tail_payload_resolves_augmented_gauge_schur_solver();
     modal_poisson_airbox_tail_shift_invert_action_writes_artifact();

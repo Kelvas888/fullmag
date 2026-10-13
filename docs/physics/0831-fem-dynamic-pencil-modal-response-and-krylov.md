@@ -1642,6 +1642,31 @@ The frequency-window producer keeps its separate `window_completeness`
 contract and must not be marked selected-only by this route. Native compilation
 and runtime evidence for this producer remain pending.
 
+(native-cpu-matrix-only-phi-transport-boundary)=
+#### Dense Floquet matrix admission versus potential transport
+
+A caller-supplied dense `K/G/M/K_demag(k)` payload can exercise the bounded
+spectral assembly and reach the dense SLEPc adapter, but it carries neither a
+shared-domain mesh/provider nor a Poisson reconstruction path. It therefore
+cannot supply the required potential vector `phi` for Floquet demagnetization.
+If a solver candidate has no reconstructed `phi`,
+`populate_typed_modal_result` returns `required_phi_vector_missing` and
+`finalize_mode_transport_result` reports `solve_error`, clears completion
+claims, and adds `mode_vector_transport_error`. Typed mode buffers remain empty;
+the scalar candidate record is diagnostic metadata, not a transported physical
+mode or a science acceptance. Nearest-frequency output remains
+`selected_only` with `window_complete=false`, while `solve_complete` follows the
+final transport status. This boundary does not relax `phi_required` or turn a
+matrix payload into potential reconstruction.
+
+The scoped C ABI regression is
+`backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp` +
+`modal_nonzero_k_floquet_dynamic_demag_matrix_admission_fails_closed_without_phi_transport`.
+It checks the dense payload admission markers, the SLEPc diagnostic candidate,
+the required-potential transport error, and the absence of typed q/phi buffers
+for window and nearest requests. Hosted native execution remains pending; the
+regression is not physical qualification.
+
 
 ### Kanoniczne klasy redukcji periodycznej FEM CPU
 
@@ -2385,6 +2410,9 @@ Repository-owned related contracts:
 | backends/fem/cpu/frequency_domain/mode_deduplication.cpp | deduplicate_modes_by_frequency_and_overlap_with_mass_action | Strict comparison-only normalization using an explicit caller-owned geometric mass action; rejects a missing or invalid metric and retains original candidate data. |
 | backends/fem/cpu/frequency_domain/slepc_modal_eigen.cpp | solve_slepc_tiny_gyrotropic_modal_eigen | Generic dense and sparse requests apply the supplied geometric mass after residual screening, then refill with fixed resolved NCV/MPD and a cumulative outer-iteration budget. |
 | backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp | production_window_diagnostics_json | Serialize raw native adapter status and stop reason per subwindow, plus the explicit missing-certificate reason for strict sparse Floquet windows. |
+| backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp | std::string populate_typed_modal_result | Require reconstructed `phi` for Floquet demag typed transport and reject a candidate lacking it with `required_phi_vector_missing`. |
+| backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp | void finalize_mode_transport_result | Convert typed transport failure to final `solve_error`, clear completion claims, and retain the solver candidate as diagnostics only. |
+| backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp | void modal_nonzero_k_floquet_dynamic_demag_matrix_admission_fails_closed_without_phi_transport | Exercise C ABI dense SLEPc admission, diagnostic candidate metadata, required-phi transport failure, no typed vectors, and nearest selected-only semantics; hosted native execution pending. |
 | backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp | main | The --floquet-count-certificate entrypoint uses an expanded positive-mass fixture, proves at least four distinct modes exist before the public cap, and asserts its sole subwindow is status ok/converged before certified_count fails for the unavailable certificate. |
 | crates/fullmag-runner/src/fem/eigen_native_window.rs | execute_native_cpu_modal_window_from_bloch_floquet_complex_with_provenance | Return non-OK native solve status before parsing result_json modes; strict-count error modes remain C ABI diagnostics and are not runner artifacts. |
 | backends/fem/tests/frequency_domain/mode_deduplication_test.cpp | main | The test entrypoint calls `slepc_hard_solve_error_prevents_followup_queries_and_cleanup`, `slepc_vector_query_error_leaves_acquired_views_in_quarantine`, `slepc_destroy_sequence_stops_and_retains_remaining_handles_on_failure`, and `generic_candidate_span_gram_rejects_indefinite_dense_and_csr_mass`, alongside the finalizer fixture; injected callbacks verify the shared operation/destroy gates only, not PETSc runtime failures. The other cases cover phase-copy rank deficiency, mass-orthogonal modes, candidate-span PSD rejection, and missing/invalid mass. |

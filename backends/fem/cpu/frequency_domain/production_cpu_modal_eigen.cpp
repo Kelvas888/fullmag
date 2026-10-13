@@ -2046,11 +2046,20 @@ void finalize_mode_transport_result(
     mark_mode_transport_failure(result, modes.error);
     replace_json_status(result.diagnostics_json, "solve_error");
     replace_json_status(result.result_json, "solve_error");
-    const std::string complete_true = "\"complete\":true";
-    const std::size_t complete = result.diagnostics_json.find(complete_true);
-    if (complete != std::string::npos) {
-        result.diagnostics_json.replace(
-            complete, complete_true.size(), "\"complete\":false");
+    // These generated envelopes may already contain success-derived metadata.
+    // Missing typed q/phi makes the public solve incomplete even if EPS found a
+    // diagnostic candidate; do not retain stale nearest/window success flags.
+    std::string *envelopes[] = {&result.diagnostics_json, &result.result_json};
+    const char *completion_fields[] = {"complete", "solve_complete", "window_complete"};
+    for (std::string *json : envelopes) {
+        for (const char *field : completion_fields) {
+            const std::string success = std::string("\"") + field + "\":true";
+            const std::size_t position = json->find(success);
+            if (position != std::string::npos) {
+                json->replace(position, success.size(),
+                    std::string("\"") + field + "\":false");
+            }
+        }
     }
     append_mode_transport_error_fields(result, modes);
 }
