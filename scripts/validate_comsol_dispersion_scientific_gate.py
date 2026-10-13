@@ -4577,9 +4577,11 @@ _CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON = (
 )
 
 
-def _cross_run_field_not_verified(reason: str, *, inventory=None, policy=None) -> dict[str, Any]:
+def _cross_run_field_not_verified(
+    reason: str, *, inventory=None, policy=None, status="not_verified",
+) -> dict[str, Any]:
     return {
-        "status": "not_verified",
+        "status": status,
         "diagnostic_only": True,
         "qualification": "NOT VERIFIED",
         "physical_identity_status": "not_verified",
@@ -4668,6 +4670,247 @@ def _cross_run_bundle_artifact(descriptor: object, logical: str) -> tuple[str, s
     return relative, digest
 
 
+def _matched_frequency_multiset_comparison(
+    match: Mapping[str, Any],
+    left_context: Mapping[str, Any],
+    right_context: Mapping[str, Any],
+    sample_indices: set[int],
+    expected_modes_per_sample: int,
+) -> dict[str, Any]:
+    """Compare real-frequency multisets only after a complete field assignment."""
+    if match.get("status") != "pass":
+        reasons = match.get("reasons")
+        match_status = match.get("status")
+        if match_status not in {"fail", "not_verified"}:
+            match_status = "fail"
+        return {
+            "status": match_status,
+            "comparison_basis": "same_mesh_field_matched_frequency_multiset",
+            "comparison_count": 0,
+            "expected_comparison_count": len(sample_indices) * expected_modes_per_sample,
+            "relative_changes": {},
+            "comparisons": [],
+            "per_sample": [],
+            "reasons": list(reasons) if isinstance(reasons, list) else ["field assignment is not verified"],
+        }
+    left_modes = left_context.get("modes")
+    right_modes = right_context.get("modes")
+    if not isinstance(left_modes, Mapping) or not isinstance(right_modes, Mapping):
+        raise ValueError("field-matched frequency comparison has no loaded modes")
+    sample_reports = match.get("samples")
+    if not isinstance(sample_reports, list):
+        raise ValueError("field matcher returned no per-sample assignments")
+    sample_map: dict[int, Mapping[str, Any]] = {}
+    for entry in sample_reports:
+        if not isinstance(entry, Mapping) or type(entry.get("sample_index")) is not int:
+            raise ValueError("field matcher returned an invalid sample assignment")
+        sample = entry["sample_index"]
+        if sample in sample_map:
+            raise ValueError("field matcher returned a duplicate sample assignment")
+        sample_map[sample] = entry
+    if set(sample_map) != sample_indices:
+        raise ValueError("field matcher sample coverage differs from mode-count target samples")
+
+    comparisons: list[dict[str, Any]] = []
+    relative_changes: dict[str, float] = {}
+    per_sample: list[dict[str, Any]] = []
+    unmatched_right_clusters: list[dict[str, Any]] = []
+    total_left_modes = 0
+    total_right_candidates = 0
+    total_unmatched_right_modes = 0
+    for sample_index in sorted(sample_indices):
+        sample_match = sample_map[sample_index]
+        if sample_match.get("status") != "pass":
+            reasons = sample_match.get("reasons")
+            return {
+                "status": "not_verified",
+                "comparison_basis": "same_mesh_field_matched_frequency_multiset",
+                "comparison_count": len(relative_changes),
+                "expected_comparison_count": len(sample_indices) * expected_modes_per_sample,
+                "relative_changes": relative_changes,
+                "comparisons": comparisons,
+                "per_sample": per_sample,
+                "reasons": (
+                    list(reasons) if isinstance(reasons, list)
+                    else [f"sample {sample_index} field assignment is not verified"]
+                ),
+            }
+        inventory = sample_match.get("candidate_inventory")
+        clusters = sample_match.get("clusters")
+        assignment = sample_match.get("assignment")
+        if not all(isinstance(value, Mapping) for value in (inventory, clusters, assignment)):
+            raise ValueError(f"sample {sample_index} matcher result is missing assignment inventory")
+        if inventory.get("all_supplied_left_clusters_assigned") is not True:
+            raise ValueError(f"sample {sample_index} field assignment does not cover every target cluster")
+        left_cluster_rows, right_cluster_rows = clusters.get("left"), clusters.get("right")
+        assigned_pairs = assignment.get("assigned_pairs")
+        unmatched_indices = inventory.get("unmatched_right_cluster_indices")
+        if not all(isinstance(value, list) for value in (
+            left_cluster_rows, right_cluster_rows, assigned_pairs, unmatched_indices,
+        )):
+            raise ValueError(f"sample {sample_index} matcher result has malformed cluster assignments")
+        left_clusters: dict[int, Mapping[str, Any]] = {}
+        right_clusters: dict[int, Mapping[str, Any]] = {}
+        for rows, output, label in (
+            (left_cluster_rows, left_clusters, "left"),
+            (right_cluster_rows, right_clusters, "right"),
+        ):
+            for row in rows:
+                if not isinstance(row, Mapping) or type(row.get("cluster_index")) is not int:
+                    raise ValueError(f"sample {sample_index} has malformed {label} cluster inventory")
+                cluster_index = row["cluster_index"]
+                if cluster_index in output:
+                    raise ValueError(f"sample {sample_index} has duplicate {label} cluster index")
+                raw_ids, rank = row.get("raw_mode_indices"), row.get("rank")
+                if not isinstance(raw_ids, list) or not raw_ids or type(rank) is not int or rank != len(raw_ids):
+                    raise ValueError(f"sample {sample_index} has malformed {label} cluster rank")
+                output[cluster_index] = row
+
+        assigned_left: set[int] = set()
+        assigned_right: set[int] = set()
+        matched_left_ids: set[int] = set()
+        sample_rows: list[dict[str, Any]] = []
+        for pair in assigned_pairs:
+            if not isinstance(pair, Mapping):
+                raise ValueError(f"sample {sample_index} contains a malformed assigned cluster pair")
+            left_index, right_index = pair.get("left_cluster_index"), pair.get("right_cluster_index")
+            if (
+                type(left_index) is not int or type(right_index) is not int
+                or left_index not in left_clusters or right_index not in right_clusters
+            ):
+                raise ValueError(f"sample {sample_index} assignment references an unknown cluster")
+            if left_index in assigned_left or right_index in assigned_right:
+                raise ValueError(f"sample {sample_index} assignment reuses a cluster")
+            assigned_left.add(left_index)
+            assigned_right.add(right_index)
+            left_group = left_clusters[left_index]["raw_mode_indices"]
+            right_group = right_clusters[right_index]["raw_mode_indices"]
+            if pair.get("left_raw_mode_indices") != left_group or pair.get("right_raw_mode_indices") != right_group:
+                raise ValueError(f"sample {sample_index} assigned pair raw IDs differ from cluster inventory")
+            rank = len(left_group)
+            if len(right_group) != rank or pair.get("left_rank") != rank or pair.get("right_rank") != rank:
+                raise ValueError(f"sample {sample_index} assigned frequency clusters have incompatible ranks")
+            if any(type(raw) is not int for raw in left_group + right_group):
+                raise ValueError(f"sample {sample_index} assigned cluster contains an invalid raw mode label")
+            matched_left_ids.update(left_group)
+            left_frequencies = sorted(
+                float(left_modes[(sample_index, raw)]["frequency_real_hz"])
+                for raw in left_group
+                if (sample_index, raw) in left_modes
+                and _finite_positive(left_modes[(sample_index, raw)].get("frequency_real_hz"))
+            )
+            right_frequencies = sorted(
+                float(right_modes[(sample_index, raw)]["frequency_real_hz"])
+                for raw in right_group
+                if (sample_index, raw) in right_modes
+                and _finite_positive(right_modes[(sample_index, raw)].get("frequency_real_hz"))
+            )
+            if len(left_frequencies) != rank or len(right_frequencies) != rank:
+                raise ValueError(f"sample {sample_index} matched cluster has missing/non-finite real frequencies")
+            ordinal_errors: list[float] = []
+            for ordinal, (left_frequency, right_frequency) in enumerate(zip(left_frequencies, right_frequencies)):
+                error = _relative_error(right_frequency, left_frequency)
+                key = f"{sample_index}:cluster:{left_index}:frequency_ordinal:{ordinal}"
+                if key in relative_changes:
+                    raise ValueError("field-matched frequency comparison produced a duplicate key")
+                relative_changes[key] = error
+                ordinal_errors.append(error)
+            row = {
+                "sample_index": sample_index,
+                "left_cluster_index": left_index,
+                "right_cluster_index": right_index,
+                "rank": rank,
+                "baseline_raw_mode_indices": list(left_group),
+                "check_raw_mode_indices": list(right_group),
+                "baseline_frequency_multiset_hz": left_frequencies,
+                "check_frequency_multiset_hz": right_frequencies,
+                "frequency_ordinal_relative_changes": ordinal_errors,
+                "max_relative_change": max(ordinal_errors, default=math.inf),
+                "member_identity": "not_asserted; sorted frequency ordinals are multiset positions",
+            }
+            comparisons.append(row)
+            sample_rows.append(row)
+        if assigned_left != set(left_clusters) or len(assigned_pairs) != len(left_clusters):
+            raise ValueError(f"sample {sample_index} assignment does not cover all left target clusters")
+        if len(matched_left_ids) != expected_modes_per_sample or len(left_clusters) == 0:
+            raise ValueError(f"sample {sample_index} matched target mode coverage is not {expected_modes_per_sample}")
+        expected_left_ids = {
+            raw for sample, raw in left_modes
+            if sample == sample_index
+        }
+        if matched_left_ids != expected_left_ids:
+            raise ValueError(f"sample {sample_index} assigned pairs differ from the loaded left target inventory")
+        if sum(row["rank"] for row in sample_rows) != expected_modes_per_sample:
+            raise ValueError(f"sample {sample_index} comparison rank coverage is not {expected_modes_per_sample}")
+
+        if (
+            any(type(index) is not int or index not in right_clusters for index in unmatched_indices)
+            or len(set(unmatched_indices)) != len(unmatched_indices)
+            or set(unmatched_indices) != (set(right_clusters) - assigned_right)
+        ):
+            raise ValueError(f"sample {sample_index} unmatched right clusters do not cover candidate extras")
+        candidate_count = inventory.get("right_mode_count")
+        if type(candidate_count) is not int or candidate_count != sum(row["rank"] for row in right_clusters.values()):
+            raise ValueError(f"sample {sample_index} right candidate count differs from the cluster inventory")
+        sample_unmatched: list[dict[str, Any]] = []
+        for cluster_index in unmatched_indices:
+            cluster = right_clusters[cluster_index]
+            entry = {
+                "sample_index": sample_index,
+                "right_cluster_index": cluster_index,
+                "right_raw_mode_indices": list(cluster["raw_mode_indices"]),
+                "rank": cluster["rank"],
+            }
+            sample_unmatched.append(entry)
+            unmatched_right_clusters.append(entry)
+            total_unmatched_right_modes += int(cluster["rank"])
+        sample_error = max(
+            (row["max_relative_change"] for row in sample_rows),
+            default=math.inf,
+        )
+        per_sample.append({
+            "sample_index": sample_index,
+            "target_mode_count": expected_modes_per_sample,
+            "matched_target_mode_count": len(matched_left_ids),
+            "right_candidate_mode_count": candidate_count,
+            "unmatched_right_cluster_count": len(sample_unmatched),
+            "unmatched_right_mode_count": sum(int(row["rank"]) for row in sample_unmatched),
+            "comparison_count": sum(int(row["rank"]) for row in sample_rows),
+            "max_relative_change": sample_error,
+        })
+        total_left_modes += len(matched_left_ids)
+        total_right_candidates += candidate_count
+
+    expected_count = len(sample_indices) * expected_modes_per_sample
+    if len(relative_changes) != expected_count or total_left_modes != expected_count:
+        raise ValueError("field-matched frequency comparison does not cover the complete target inventory")
+    maximum = max(relative_changes.values(), default=math.inf)
+    reasons = []
+    if maximum > CONVERGENCE_RELATIVE_TOLERANCE:
+        reasons.append(
+            f"field-matched frequency multiset change {maximum:.6g} exceeds "
+            f"{CONVERGENCE_RELATIVE_TOLERANCE:.6g}"
+        )
+    return {
+        "status": "fail" if reasons else "pass",
+        "comparison_basis": "same_mesh_field_matched_frequency_multiset",
+        "comparison_count": len(relative_changes),
+        "expected_comparison_count": expected_count,
+        "target_mode_count": total_left_modes,
+        "right_candidate_mode_count": total_right_candidates,
+        "unmatched_right_cluster_count": len(unmatched_right_clusters),
+        "unmatched_right_mode_count": total_unmatched_right_modes,
+        "unmatched_right_clusters": unmatched_right_clusters,
+        "per_sample": per_sample,
+        "comparisons": comparisons,
+        "relative_changes": relative_changes,
+        "max_relative_change": maximum,
+        "tolerance": CONVERGENCE_RELATIVE_TOLERANCE,
+        "member_identity": "not_asserted; degenerate clusters compare sorted real-frequency multisets",
+        "reasons": reasons,
+    }
+
+
 def _cross_run_field_match_diagnostic(
     case_dir: Path,
     section: Mapping[str, Any],
@@ -4677,8 +4920,9 @@ def _cross_run_field_match_diagnostic(
     right_descriptor: object,
     comparisons: list[Any],
     case: str,
+    key: str,
 ) -> dict[str, Any]:
-    """Replay optional hash-bound same-mesh field matching without changing numeric rows."""
+    """Replay hash-bound same-mesh field matching and mode-count frequency multisets."""
     supplied = section.get("cross_run_fields")
     if supplied is None:
         return _cross_run_field_not_verified("convergence section has no explicit cross_run_fields evidence")
@@ -4686,21 +4930,26 @@ def _cross_run_field_match_diagnostic(
         "policy", "baseline_clusters", "check_clusters",
     }:
         return _cross_run_field_not_verified(
-            "cross_run_fields must contain only policy, baseline_clusters, and check_clusters"
+            "cross_run_fields must contain only policy, baseline_clusters, and check_clusters",
+            status="fail",
         )
 
     policy = supplied.get("policy")
     if not isinstance(policy, Mapping) or set(policy) != {
         "overlap_floor", "ambiguity_tolerance", "degeneration_relative_tolerance",
     }:
-        return _cross_run_field_not_verified("cross_run_fields.policy is missing explicit matcher thresholds")
+        return _cross_run_field_not_verified(
+            "cross_run_fields.policy is missing explicit matcher thresholds", status="fail",
+        )
     floor = policy.get("overlap_floor")
     ambiguity = policy.get("ambiguity_tolerance")
     degeneration = policy.get("degeneration_relative_tolerance")
     if not all(_finite(value) for value in (floor, ambiguity, degeneration)) \
             or float(floor) <= 0.0 or float(floor) > 1.0 \
             or float(ambiguity) < 0.0 or float(degeneration) < 0.0:
-        return _cross_run_field_not_verified("cross_run_fields.policy thresholds are outside the matcher's explicit domain")
+        return _cross_run_field_not_verified(
+            "cross_run_fields.policy thresholds are outside the matcher's explicit domain", status="fail",
+        )
     normalized_policy = {
         "overlap_floor": float(floor),
         "ambiguity_tolerance": float(ambiguity),
@@ -4799,12 +5048,12 @@ def _cross_run_field_match_diagnostic(
 
     if selection_errors:
         return _cross_run_field_not_verified(
-            "; ".join(selection_errors), inventory=inventory, policy=normalized_policy,
+            "; ".join(selection_errors), inventory=inventory, policy=normalized_policy, status="fail",
         )
     if not left_selections or not right_selections:
         return _cross_run_field_not_verified(
             "cross-run field selection produced an empty quality-admitted inventory",
-            inventory=inventory, policy=normalized_policy,
+            inventory=inventory, policy=normalized_policy, status="fail",
         )
 
     try:
@@ -4895,8 +5144,14 @@ def _cross_run_field_match_diagnostic(
             ambiguity_tolerance=normalized_policy["ambiguity_tolerance"],
             degeneration_relative_tolerance=normalized_policy["degeneration_relative_tolerance"],
         )
+        frequency_comparison = (
+            _matched_frequency_multiset_comparison(
+                match, left_fields, right_fields, sample_indices, expected_per_sample,
+            )
+            if key == "mode_count" else None
+        )
         return {
-            "status": match.get("status") if match.get("status") == "pass" else "not_verified",
+            "status": match.get("status") if match.get("status") in {"pass", "not_verified", "fail"} else "fail",
             "diagnostic_only": True,
             "qualification": "NOT VERIFIED",
             "physical_identity_status": "not_verified",
@@ -4907,6 +5162,7 @@ def _cross_run_field_match_diagnostic(
                 "check": {"path": check_spectrum_path, "sha256": check_spectrum_hash},
             },
             "field_match": match,
+            "frequency_comparison": frequency_comparison,
             "reasons": list(match.get("reasons", [])) if isinstance(match.get("reasons"), list) else [],
         }
     except (OSError, ValueError, TypeError, KeyError, IndexError, OverflowError, RuntimeError, AttributeError) as error:
@@ -4941,6 +5197,10 @@ def _validate_convergence_pair(
     primary_bundle: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     reason_count = len(reasons)
+    numeric_basis = (
+        "same_mesh_field_matched_frequency_multiset"
+        if key == "mode_count" else "legacy_run_local_branch_id"
+    )
     convergence = evidence.get("convergence") if isinstance(evidence, Mapping) else None
     section = convergence.get(key) if isinstance(convergence, Mapping) else None
     if key == "airbox" and case == "c0":
@@ -4955,6 +5215,7 @@ def _validate_convergence_pair(
         return _new_check(
             "missing",
             numeric_status="missing",
+            numeric_basis=numeric_basis,
             physical_identity_status="not_verified",
             physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
         )
@@ -4963,6 +5224,7 @@ def _validate_convergence_pair(
         return _new_check(
             "missing",
             numeric_status="missing",
+            numeric_basis=numeric_basis,
             physical_identity_status="not_verified",
             physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
         )
@@ -4974,6 +5236,7 @@ def _validate_convergence_pair(
         return _new_check(
             "missing",
             numeric_status="missing",
+            numeric_basis=numeric_basis,
             physical_identity_status="not_verified",
             physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
         )
@@ -4984,6 +5247,7 @@ def _validate_convergence_pair(
         return _new_check(
             "fail",
             numeric_status="fail",
+            numeric_basis=numeric_basis,
             physical_identity_status="not_verified",
             physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
         )
@@ -5031,6 +5295,7 @@ def _validate_convergence_pair(
         return _new_check(
             "fail",
             numeric_status="fail",
+            numeric_basis=numeric_basis,
             physical_identity_status="not_verified",
             physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
         )
@@ -5038,6 +5303,14 @@ def _validate_convergence_pair(
     observed_pairs: set[tuple[int, int]] = set()
     errors: list[float] = []
     changes: dict[str, float] = {}
+    legacy_rows: list[dict[str, Any]] = []
+    legacy_changes: dict[str, float] = {}
+    legacy_errors: list[float] = []
+    legacy_primary_changes: dict[str, float] = {}
+    legacy_primary_errors: list[float] = []
+    legacy_check_primary_changes: dict[str, float] = {}
+    legacy_check_primary_errors: list[float] = []
+    is_mode_count = key == "mode_count"
     for index, comparison in enumerate(comparisons):
         if not isinstance(comparison, Mapping):
             reasons.append(f"convergence.{key} comparison {index} is not an object")
@@ -5052,14 +5325,92 @@ def _validate_convergence_pair(
             reasons.append(f"convergence.{key} comparison {index} duplicates sample/band pair {pair}")
             continue
         observed_pairs.add(pair)
+
+        if is_mode_count:
+            baseline_reasons: list[str] = []
+            baseline_frequency, baseline_k = _bundle_observation(
+                left, sample, band, f"convergence.{key}.{left_name}", baseline_reasons,
+            )
+            if baseline_frequency is None or baseline_k is None:
+                reasons.extend(baseline_reasons)
+                continue
+
+            check_reasons: list[str] = []
+            check_frequency, check_k = _bundle_observation(
+                right, sample, band, f"convergence.{key}.{right_name}", check_reasons,
+            )
+            if check_k is None:
+                reasons.extend(reason for reason in check_reasons if "k_vector" in reason)
+
+            primary_frequency = None
+            primary_k = None
+            if primary_bundle is not None:
+                primary_reasons: list[str] = []
+                primary_frequency, primary_k = _bundle_observation(
+                    primary_bundle, sample, band, f"convergence.{key}.primary", primary_reasons,
+                )
+                if primary_k is None:
+                    reasons.extend(reason for reason in primary_reasons if "k_vector" in reason)
+                elif any(
+                    abs(a - b) > 1.0e-8 * max(1.0, abs(a), abs(b))
+                    for a, b in zip(primary_k, baseline_k)
+                ) or (check_k is not None and any(
+                    abs(a - b) > 1.0e-8 * max(1.0, abs(a), abs(b))
+                    for a, b in zip(primary_k, check_k)
+                )):
+                    reasons.append(
+                        f"convergence.{key} comparison {index} does not use the primary k vector"
+                    )
+            if check_k is not None and any(
+                abs(a - b) > 1.0e-8 * max(1.0, abs(a), abs(b))
+                for a, b in zip(baseline_k, check_k)
+            ):
+                reasons.append(f"convergence.{key} comparison {index} uses different k vectors")
+
+            legacy_error = None
+            if check_frequency is not None:
+                legacy_error = _relative_error(baseline_frequency, check_frequency)
+                if math.isfinite(legacy_error):
+                    legacy_errors.append(legacy_error)
+                    legacy_changes[f"{sample}:{band}"] = legacy_error
+            primary_error = (
+                _relative_error(baseline_frequency, primary_frequency)
+                if primary_frequency is not None else None
+            )
+            if primary_error is not None and math.isfinite(primary_error):
+                legacy_primary_errors.append(primary_error)
+                legacy_primary_changes[f"{sample}:{band}"] = primary_error
+            check_primary_error = (
+                _relative_error(check_frequency, primary_frequency)
+                if check_frequency is not None and primary_frequency is not None else None
+            )
+            if check_primary_error is not None and math.isfinite(check_primary_error):
+                legacy_check_primary_errors.append(check_primary_error)
+                legacy_check_primary_changes[f"{sample}:{band}"] = check_primary_error
+            legacy_rows.append({
+                "basis": "legacy_run_local_branch_id",
+                "sample_index": sample,
+                "run_local_branch_ids": {
+                    "baseline": band,
+                    "check": band,
+                    "primary": band if primary_bundle is not None else None,
+                },
+                "baseline_frequency_real_hz": baseline_frequency,
+                "check_frequency_real_hz": check_frequency,
+                "primary_frequency_real_hz": primary_frequency,
+                "baseline_to_check_relative_change": legacy_error,
+                "baseline_to_primary_relative_change": primary_error,
+                "check_to_primary_relative_change": check_primary_error,
+                "check_branch_observation_reasons": check_reasons,
+            })
+            continue
+
         coarse, coarse_k = _bundle_observation(left, sample, band, f"convergence.{key}.coarse", reasons)
         fine, fine_k = _bundle_observation(right, sample, band, f"convergence.{key}.fine", reasons)
         if coarse is None or fine is None or coarse_k is None or fine_k is None:
             continue
-        # A mesh or mode-count comparison must stay on the same finite-domain
-        # problem as primary.  An airbox comparison intentionally changes the
-        # Dirichlet boundary-value problem, so comparing it to primary would
-        # reject the physical boundary shift that the sweep is meant to measure.
+        # Mesh/airbox legacy convergence keeps its existing run-local branch-ID semantics.
+        # An airbox sweep intentionally changes the finite-boundary problem.
         if primary_bundle is not None and key != "airbox":
             primary, primary_k = _bundle_observation(
                 primary_bundle,
@@ -5093,21 +5444,12 @@ def _validate_convergence_pair(
         tolerance = AIRBOX_CONVERGENCE_RELATIVE_TOLERANCE if key == "airbox" else CONVERGENCE_RELATIVE_TOLERANCE
         if error > tolerance:
             reasons.append(f"convergence.{key} comparison {index} change {error:.6g} exceeds {tolerance:.6g}")
+
     missing = sorted(expected_pairs - observed_pairs)
     if missing:
         reasons.append(f"convergence.{key} is missing {len(missing)} required sample/band comparisons")
-    maximum = max(errors, default=math.inf)
-    numeric_status = (
-        "pass"
-        if len(reasons) == reason_count
-        and section.get("status") == "pass"
-        and not missing
-        and errors
-        and maximum <= (AIRBOX_CONVERGENCE_RELATIVE_TOLERANCE if key == "airbox" else CONVERGENCE_RELATIVE_TOLERANCE)
-        else "fail"
-    )
-    physical_identity_status = "not_verified"
-    status = numeric_status if numeric_status != "pass" else physical_identity_status
+    structural_reasons = list(reasons[reason_count:])
+
     cross_run_field_match = _cross_run_field_match_diagnostic(
         case_dir,
         section,
@@ -5117,19 +5459,93 @@ def _validate_convergence_pair(
         runs.get(right_name),
         comparisons,
         case,
+        key,
     )
+    frequency_comparison = cross_run_field_match.get("frequency_comparison")
+    if is_mode_count and isinstance(frequency_comparison, Mapping):
+        matched_reasons = frequency_comparison.get("reasons")
+        if isinstance(matched_reasons, list):
+            reasons.extend(str(reason) for reason in matched_reasons)
+
+    if is_mode_count:
+        matched_changes = (
+            dict(frequency_comparison.get("relative_changes", {}))
+            if isinstance(frequency_comparison, Mapping)
+            and isinstance(frequency_comparison.get("relative_changes"), Mapping)
+            else {}
+        )
+        matched_errors = list(matched_changes.values())
+        maximum = max(matched_errors, default=math.inf)
+        structural_failure = bool(structural_reasons) or bool(missing)
+        match_status = cross_run_field_match.get("status")
+        frequency_status = frequency_comparison.get("status") if isinstance(frequency_comparison, Mapping) else None
+        if structural_failure or match_status == "fail" or frequency_status == "fail":
+            numeric_status = "fail"
+        elif match_status == "pass" and frequency_status == "pass":
+            numeric_status = "pass"
+        else:
+            numeric_status = "not_verified"
+        reported_changes = matched_changes
+        reported_count = len(matched_changes)
+        numeric_reasons = structural_reasons + (
+            list(frequency_comparison.get("reasons", []))
+            if isinstance(frequency_comparison, Mapping)
+            else list(cross_run_field_match.get("reasons", []))
+        )
+        comparison_reference = "same_mesh_field_matched_frequency_multiset"
+        numeric_basis = "same_mesh_field_matched_frequency_multiset"
+    else:
+        maximum = max(errors, default=math.inf)
+        numeric_status = (
+            "pass"
+            if len(reasons) == reason_count
+            and section.get("status") == "pass"
+            and not missing
+            and errors
+            and maximum <= (AIRBOX_CONVERGENCE_RELATIVE_TOLERANCE if key == "airbox" else CONVERGENCE_RELATIVE_TOLERANCE)
+            else "fail"
+        )
+        reported_changes = changes
+        reported_count = len(comparisons)
+        numeric_reasons = []
+        comparison_reference = "adjacent_airbox_boundary_sweep" if key == "airbox" else "primary_same_physics"
+        numeric_basis = "legacy_run_local_branch_id"
+
+    physical_identity_status = "not_verified"
+    status = numeric_status if numeric_status != "pass" else physical_identity_status
     return _new_check(
         status,
         numeric_status=numeric_status,
+        numeric_basis=numeric_basis,
+        numeric_reasons=numeric_reasons,
         physical_identity_status=physical_identity_status,
         physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
         cross_run_field_match=cross_run_field_match,
-        relative_changes=changes,
-        comparison_count=len(comparisons),
+        frequency_comparison=frequency_comparison if is_mode_count else None,
+        relative_changes=reported_changes,
+        comparison_count=reported_count,
         expected_comparison_count=len(expected_pairs),
         max_relative_change=maximum if math.isfinite(maximum) else None,
         tolerance=(AIRBOX_CONVERGENCE_RELATIVE_TOLERANCE if key == "airbox" else CONVERGENCE_RELATIVE_TOLERANCE),
-        comparison_reference=("adjacent_airbox_boundary_sweep" if key == "airbox" else "primary_same_physics"),
+        comparison_reference=comparison_reference,
+        legacy_run_local_comparisons=legacy_rows if is_mode_count else None,
+        legacy_run_local_relative_changes=legacy_changes if is_mode_count else None,
+        legacy_run_local_max_relative_change=(
+            max(legacy_errors, default=None) if is_mode_count else None
+        ),
+        legacy_run_local_primary_relative_changes=(
+            legacy_primary_changes if is_mode_count else None
+        ),
+        legacy_run_local_primary_max_relative_change=(
+            max(legacy_primary_errors, default=None) if is_mode_count else None
+        ),
+        legacy_run_local_check_to_primary_relative_changes=(
+            legacy_check_primary_changes if is_mode_count else None
+        ),
+        legacy_run_local_check_to_primary_max_relative_change=(
+            max(legacy_check_primary_errors, default=None) if is_mode_count else None
+        ),
+        legacy_comparison_count=len(legacy_rows) if is_mode_count else None,
     )
 
 
@@ -5157,6 +5573,7 @@ def _validate_convergence(
         return _new_check(
             "fail",
             numeric_status="fail",
+            numeric_basis="legacy_run_local_branch_id",
             physical_identity_status="not_verified",
             physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
             required_level_count=3,
@@ -5197,6 +5614,7 @@ def _validate_convergence(
     return _new_check(
         status,
         numeric_status=numeric_status,
+        numeric_basis="legacy_run_local_branch_id",
         physical_identity_status=physical_identity_status,
         physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
         required_level_count=3,

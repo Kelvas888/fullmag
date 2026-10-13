@@ -4551,7 +4551,7 @@
     {
       "id": "source-g6-cross-run-gate-field-regression",
       "path": "scripts/test_validate_comsol_dispersion_scientific_gate.py",
-      "symbol": "test_convergence_field_match_uses_fields_across_swapped_raw_ids_and_rejects_orthogonal_loss",
+      "symbol": "test_convergence_field_match_uses_bound_fields_and_rejects_orthogonal_loss",
       "responsibility": "Use actual fields across raw IDs and reject lost field inventory"
     },
     {
@@ -4559,6 +4559,24 @@
       "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
       "symbol": "void textured_tet4_nodal_tangent_lift_reports_interior_normal_component",
       "responsibility": "Measure nodal tangency and interior P1 approximation without claiming weak JVP"
+    },
+    {
+      "id": "source-g6-field-matched-numeric",
+      "path": "scripts/validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "_matched_frequency_multiset_comparison",
+      "responsibility": "Use actual field assignments for same-mesh mode-count real-frequency multiset convergence"
+    },
+    {
+      "id": "source-g6-field-matched-false-pass",
+      "path": "scripts/test_validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "test_mode_count_swapped_fields_reject_a_run_local_branch_id_false_pass",
+      "responsibility": "Reject identical local slot frequencies when corresponding fields disagree"
+    },
+    {
+      "id": "source-g6-field-matched-degenerate",
+      "path": "scripts/test_validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "test_mode_count_rotated_degenerate_cluster_compares_frequency_multisets",
+      "responsibility": "Compare rotated degenerate cluster frequency multisets without member identity"
     }
   ],
   "public_api": {

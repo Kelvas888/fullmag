@@ -1280,7 +1280,9 @@ def _make_case(root: Path, case: str = "c1", *, primary_material=None, producer_
     return case_dir
 
 
-def _install_cross_run_field_inputs(case_dir: Path, *, check_source_raw=None, check_mesh_shift=False):
+def _install_cross_run_field_inputs(
+    case_dir: Path, *, check_source_raw=None, check_mesh_shift=False, check_rotated_samples=None,
+):
     """Create real loader-bound field bytes for synthetic convergence bundles."""
     from comsol_magnetic_support import magnetic_element_indices, tet4_cells
     from comsol_mesh_identity import mesh_topology_fingerprint_v3
@@ -1290,6 +1292,7 @@ def _install_cross_run_field_inputs(case_dir: Path, *, check_source_raw=None, ch
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     section = evidence["convergence"]["mode_count"]
     samples_expected = gate.EXPECTED_CONTROL_SAMPLES
+    check_rotated_samples = set(check_rotated_samples or ())
     bundle_roots = {
         "baseline": section["runs"]["baseline"]["root"],
         "check": section["runs"]["check"]["root"],
@@ -1354,7 +1357,11 @@ def _install_cross_run_field_inputs(case_dir: Path, *, check_source_raw=None, ch
                 if len(plane_levels) != 2:
                     raise AssertionError("synthetic field matcher fixture requires two z planes")
                 pattern = [0.0] * 6
-                if source_raw < 6:
+                if name == "check" and sample_index in check_rotated_samples and raw in (0, 1):
+                    pattern[0] = pattern[1] = 1.0 / math.sqrt(2.0)
+                    if raw == 1:
+                        pattern[1] = -pattern[1]
+                elif source_raw < 6:
                     pattern[source_raw] = 1.0
                 elif source_raw == 6:
                     pattern[0] = pattern[1] = 1.0 / math.sqrt(2.0)
@@ -1391,6 +1398,60 @@ def _install_cross_run_field_inputs(case_dir: Path, *, check_source_raw=None, ch
             for sample in samples_expected
         ],
     }
+    _write_json(evidence_path, evidence)
+
+
+def _bind_check_frequencies_to_baseline_raw_ids(case_dir: Path, *, rotate_degenerate_pair=False):
+    """Make run-local aliases agree while preserving or swapping field-bound frequencies."""
+    evidence_path = case_dir / gate.EVIDENCE_RELATIVE_PATH
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    section = evidence["convergence"]["mode_count"]
+    baseline_root = section["runs"]["baseline"]["root"]
+    check_root = section["runs"]["check"]["root"]
+    roots = {"baseline": baseline_root, "check": check_root}
+    spectra = {}
+    branches = {}
+    for name, root in roots.items():
+        spectra[name] = json.loads((case_dir / root / "eigen/spectrum.v2.json").read_text(encoding="utf-8"))
+        branches[name] = json.loads((case_dir / root / "eigen/branches.v2.json").read_text(encoding="utf-8"))
+    baseline_frequencies = {
+        (sample["sample_index"], mode["raw_mode_index"]): float(mode["frequency_real_hz"])
+        for sample in spectra["baseline"]["samples"] for mode in sample["modes"]
+    }
+    if rotate_degenerate_pair:
+        sample = next(item for item in spectra["baseline"]["samples"] if item["sample_index"] == 0)
+        modes = {mode["raw_mode_index"]: mode for mode in sample["modes"]}
+        base = float(modes[0]["frequency_real_hz"])
+        modes[0]["frequency_real_hz"] = base
+        modes[1]["frequency_real_hz"] = base * (1.0 + 5.0e-13)
+        baseline_frequencies[(0, 0)] = modes[0]["frequency_real_hz"]
+        baseline_frequencies[(0, 1)] = modes[1]["frequency_real_hz"]
+
+    for name, root in roots.items():
+        spectrum = spectra[name]
+        for sample in spectrum["samples"]:
+            sample_index = sample["sample_index"]
+            for mode in sample["modes"]:
+                raw = mode["raw_mode_index"]
+                frequency = baseline_frequencies.get((sample_index, raw), float(mode["frequency_real_hz"]))
+                if name == "check" and rotate_degenerate_pair and sample_index == 0 and raw in (0, 1):
+                    frequency = baseline_frequencies[(0, 1 - raw)]
+                mode["frequency_real_hz"] = frequency
+                _native_mode_diagnostics(mode)
+        spectrum_by_identity = {
+            (sample["sample_index"], mode["raw_mode_index"]): mode
+            for sample in spectrum["samples"] for mode in sample["modes"]
+        }
+        for branch in branches[name]["branches"]:
+            for point in branch["points"]:
+                mode = spectrum_by_identity.get((point["sample_index"], point["raw_mode_index"]))
+                if mode is None:
+                    continue
+                point["frequency_real_hz"] = mode["frequency_real_hz"]
+                point["frequency_imag_hz"] = mode["frequency_imag_hz"]
+        _write_json(case_dir / root / "eigen/spectrum.v2.json", spectrum)
+        _write_json(case_dir / root / "eigen/branches.v2.json", branches[name])
+        section["runs"][name] = _bundle_descriptor(case_dir, root)
     _write_json(evidence_path, evidence)
 
 
@@ -2085,8 +2146,10 @@ class ScientificGateTests(unittest.TestCase):
             self.assertIn("does not solve a dynamic scalar potential", potential_check["reason"])
             self.assertEqual(report["campaign_contract_status"], "pass")
             self.assertEqual(report["checks"]["mesh_convergence"]["numeric_status"], "pass")
+            self.assertEqual(report["checks"]["mesh_convergence"]["numeric_basis"], "legacy_run_local_branch_id")
             self.assertEqual(report["checks"]["mesh_convergence"]["physical_identity_status"], "not_verified")
-            self.assertEqual(report["checks"]["mode_count_convergence"]["numeric_status"], "pass")
+            self.assertEqual(report["checks"]["mode_count_convergence"]["numeric_status"], "not_verified")
+            self.assertEqual(report["checks"]["mode_count_convergence"]["numeric_basis"], "same_mesh_field_matched_frequency_multiset")
             self.assertEqual(report["checks"]["mode_count_convergence"]["physical_identity_status"], "not_verified")
             self.assertEqual(report["status"], "not_qualified")
 
@@ -2344,8 +2407,16 @@ class ScientificGateTests(unittest.TestCase):
                 self.assertEqual(baseline_point["frequency_real_hz"], check_point["frequency_real_hz"])
                 report = gate.validate_case(case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH)
                 check = report["checks"]["mode_count_convergence"]
-                self.assertEqual(check["numeric_status"], "pass", report["reasons"][:12])
-                self.assertTrue(all(value == 0.0 for value in check["relative_changes"].values()))
+                self.assertEqual(check["numeric_status"], "not_verified", report["reasons"][:12])
+                self.assertEqual(check["relative_changes"], {})
+                self.assertEqual(check["numeric_basis"], "same_mesh_field_matched_frequency_multiset")
+                self.assertTrue(all(value == 0.0 for value in check["legacy_run_local_relative_changes"].values()))
+                self.assertTrue(all(row["basis"] == "legacy_run_local_branch_id"
+                                    for row in check["legacy_run_local_comparisons"]))
+                self.assertTrue(all(row["run_local_branch_ids"]["primary"] is not None
+                                    for row in check["legacy_run_local_comparisons"]))
+                self.assertEqual(len(check["legacy_run_local_primary_relative_changes"]), 56)
+                self.assertEqual(len(check["legacy_run_local_check_to_primary_relative_changes"]), 56)
                 self.assertEqual(check["physical_identity_status"], "not_verified")
                 self.assertEqual(check["status"], "not_verified")
                 self.assertIn("run-local branch_id and frequency", check["physical_identity_reason"])
@@ -2369,6 +2440,12 @@ class ScientificGateTests(unittest.TestCase):
             self.assertTrue(diagnostic["diagnostic_only"])
             self.assertEqual(diagnostic["qualification"], "NOT VERIFIED")
             self.assertEqual(diagnostic["physical_identity_status"], "not_verified")
+            self.assertEqual(check["numeric_basis"], "same_mesh_field_matched_frequency_multiset")
+            self.assertEqual(check["comparison_count"], 56)
+            self.assertEqual(check["frequency_comparison"]["status"], "pass")
+            self.assertEqual(check["frequency_comparison"]["target_mode_count"], 56)
+            self.assertEqual(check["frequency_comparison"]["right_candidate_mode_count"], 56)
+            self.assertEqual(check["frequency_comparison"]["unmatched_right_mode_count"], 0)
             self.assertEqual(diagnostic["inventory"]["baseline_requested_mode_count"], 24)
             self.assertEqual(diagnostic["inventory"]["baseline_diagnostics_requested_mode_count"], 24)
             self.assertEqual(diagnostic["inventory"]["check_requested_mode_count"], 48)
@@ -2387,15 +2464,18 @@ class ScientificGateTests(unittest.TestCase):
             self.assertEqual(len(diagnostic["field_match"]["samples"]), 7)
             self.assertTrue(all(sample["status"] == "pass" for sample in diagnostic["field_match"]["samples"]))
 
-    def test_convergence_field_match_uses_fields_across_swapped_raw_ids_and_rejects_orthogonal_loss(self):
-        for check_source_raw, expected_status in (({0: 1, 1: 0}, "pass"), ({0: 1}, "not_verified")):
+    def test_convergence_field_match_uses_bound_fields_and_rejects_orthogonal_loss(self):
+        for check_source_raw, expected_status, expected_numeric_status in (
+            ({}, "pass", "pass"),
+            ({0: 1}, "not_verified", "not_verified"),
+        ):
             with self.subTest(check_source_raw=check_source_raw), tempfile.TemporaryDirectory() as directory:
                 case_dir = _make_case(Path(directory), "c1")
                 _install_cross_run_field_inputs(case_dir, check_source_raw=check_source_raw)
                 report = gate.validate_case(case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH)
                 check = report["checks"]["mode_count_convergence"]
                 diagnostic = check["cross_run_field_match"]
-                self.assertEqual(check["numeric_status"], "pass", report["reasons"][:12])
+                self.assertEqual(check["numeric_status"], expected_numeric_status, report["reasons"][:12])
                 self.assertEqual(check["physical_identity_status"], "not_verified")
                 self.assertEqual(diagnostic["status"], expected_status, diagnostic["reasons"])
                 if expected_status == "pass":
@@ -2405,10 +2485,89 @@ class ScientificGateTests(unittest.TestCase):
                         pair["left_raw_mode_indices"][0]: pair["right_raw_mode_indices"][0]
                         for pair in pairs
                     }
-                    self.assertEqual(raw_mapping[0], 1)
-                    self.assertEqual(raw_mapping[1], 0)
+                    expected_mapping = {raw: check_source_raw.get(raw, raw) for raw in (0, 1)}
+                    self.assertEqual(raw_mapping[0], expected_mapping[0])
+                    self.assertEqual(raw_mapping[1], expected_mapping[1])
                 else:
                     self.assertTrue(any("overlap_floor" in reason for reason in diagnostic["field_match"]["samples"][0]["reasons"]))
+
+    def test_mode_count_swapped_fields_reject_a_run_local_branch_id_false_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c1")
+            _bind_check_frequencies_to_baseline_raw_ids(case_dir)
+            evidence = json.loads((case_dir / gate.EVIDENCE_RELATIVE_PATH).read_text(encoding="utf-8"))
+            baseline_root = evidence["convergence"]["mode_count"]["runs"]["baseline"]["root"]
+            baseline_spectrum = json.loads(
+                (case_dir / baseline_root / "eigen/spectrum.v2.json").read_text(encoding="utf-8")
+            )
+            sample_zero = next(sample for sample in baseline_spectrum["samples"] if sample["sample_index"] == 0)
+            frequencies = {mode["raw_mode_index"]: mode["frequency_real_hz"] for mode in sample_zero["modes"]}
+            self.assertGreater(
+                gate._relative_error(frequencies[0], frequencies[1]),
+                gate.CONVERGENCE_RELATIVE_TOLERANCE,
+            )
+            _install_cross_run_field_inputs(case_dir, check_source_raw={0: 1, 1: 0})
+            report = gate.validate_case(case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH)
+
+            check = report["checks"]["mode_count_convergence"]
+            diagnostic = check["cross_run_field_match"]
+            self.assertEqual(check["numeric_status"], "fail", report["reasons"][:12])
+            self.assertEqual(check["numeric_basis"], "same_mesh_field_matched_frequency_multiset")
+            self.assertEqual(check["legacy_comparison_count"], 56)
+            self.assertTrue(all(value == 0.0 for value in check["legacy_run_local_relative_changes"].values()))
+            self.assertGreater(check["max_relative_change"], gate.CONVERGENCE_RELATIVE_TOLERANCE)
+            self.assertEqual(check["frequency_comparison"]["status"], "fail")
+            self.assertEqual(diagnostic["status"], "pass")
+            pairs = diagnostic["field_match"]["samples"][0]["assignment"]["assigned_pairs"]
+            mapping = {pair["left_raw_mode_indices"][0]: pair["right_raw_mode_indices"][0] for pair in pairs}
+            self.assertEqual(mapping[0], 1)
+            self.assertEqual(mapping[1], 0)
+            self.assertEqual(check["frequency_comparison"]["target_mode_count"], 56)
+            self.assertEqual(check["frequency_comparison"]["right_candidate_mode_count"], 56)
+
+    def test_mode_count_rotated_degenerate_cluster_compares_frequency_multisets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c1")
+            _bind_check_frequencies_to_baseline_raw_ids(case_dir, rotate_degenerate_pair=True)
+            _install_cross_run_field_inputs(case_dir, check_rotated_samples={0})
+            evidence_path = case_dir / gate.EVIDENCE_RELATIVE_PATH
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            cross_run_fields = evidence["convergence"]["mode_count"]["cross_run_fields"]
+            for label in ("baseline_clusters", "check_clusters"):
+                sample = next(row for row in cross_run_fields[label] if row["sample_index"] == 0)
+                sample["groups"] = [
+                    sample["groups"][0] + sample["groups"][1],
+                    *sample["groups"][2:],
+                ]
+            _write_json(evidence_path, evidence)
+
+            report = gate.validate_case(case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH)
+            check = report["checks"]["mode_count_convergence"]
+            self.assertEqual(check["numeric_status"], "pass", report["reasons"][:12])
+            degenerate = next(
+                row for row in check["frequency_comparison"]["comparisons"]
+                if row["sample_index"] == 0 and row["rank"] == 2
+            )
+            self.assertEqual(degenerate["baseline_frequency_multiset_hz"], degenerate["check_frequency_multiset_hz"])
+            self.assertEqual(len(degenerate["frequency_ordinal_relative_changes"]), 2)
+            self.assertIn("member_identity", degenerate)
+            self.assertIn("not_asserted", degenerate["member_identity"])
+
+    def test_mode_count_malformed_explicit_match_threshold_fails_numeric_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c1")
+            _install_cross_run_field_inputs(case_dir)
+            evidence_path = case_dir / gate.EVIDENCE_RELATIVE_PATH
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["convergence"]["mode_count"]["cross_run_fields"]["policy"]["overlap_floor"] = 1.01
+            _write_json(evidence_path, evidence)
+
+            report = gate.validate_case(case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH)
+            check = report["checks"]["mode_count_convergence"]
+            self.assertEqual(check["numeric_status"], "fail")
+            self.assertEqual(check["cross_run_field_match"]["status"], "fail")
+            self.assertTrue(any("outside the matcher's explicit domain" in reason
+                                for reason in check["numeric_reasons"]))
 
     def test_convergence_field_match_rejects_loader_metadata_hash_rebound(self):
         from comsol_tracking_fields import load_tracking_fields as actual_load_tracking_fields
@@ -2444,7 +2603,7 @@ class ScientificGateTests(unittest.TestCase):
             check = report["checks"]["mode_count_convergence"]
             diagnostic = check["cross_run_field_match"]
             self.assertEqual(calls, 2)
-            self.assertEqual(check["numeric_status"], "pass", report["reasons"][:12])
+            self.assertEqual(check["numeric_status"], "fail", report["reasons"][:12])
             self.assertEqual(diagnostic["status"], "fail")
             self.assertTrue(any("metadata hash differs from numeric bundle descriptor" in reason
                                 for reason in diagnostic["reasons"]))
@@ -2467,7 +2626,7 @@ class ScientificGateTests(unittest.TestCase):
                 if change == "mesh":
                     self.assertTrue(any("topology fingerprints differ" in reason for reason in diagnostic["reasons"]))
                 else:
-                    self.assertEqual(check["numeric_status"], "pass", report["reasons"][:12])
+                    self.assertEqual(check["numeric_status"], "fail", report["reasons"][:12])
                     self.assertTrue(any("phase certificate failed" in reason for reason in diagnostic["reasons"]))
 
     def test_signed_k_missing_evidence_is_a1_not_verified_and_c0_not_applicable(self):

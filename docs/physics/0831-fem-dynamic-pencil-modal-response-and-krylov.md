@@ -6027,7 +6027,7 @@ FDM CPU/GPU nie dotyczy. Publiczny Python DSL, ProblemIR i operator bez zmian.
 |---|---|---|
 | `scripts/validate_comsol_dispersion_scientific_gate.py` | `_cross_run_field_match_diagnostic` | Rzeczywiste pola, inventory i descriptor-bound metadane |
 | `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_convergence_field_match_rejects_loader_metadata_hash_rebound` | Odrzucenie podmiany metadata pomiędzy loaderami |
-| `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_convergence_field_match_uses_fields_across_swapped_raw_ids_and_rejects_orthogonal_loss` | Zamienione raw IDs i utrata tożsamości pola |
+| `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_convergence_field_match_uses_bound_fields_and_rejects_orthogonal_loss` | Zamienione raw IDs i utrata tożsamości pola |
 
 
 (g6-textured-nodal-p1-probe)=
@@ -6076,3 +6076,44 @@ Python DSL, ProblemIR, operatory i progi solvera pozostają bez zmian.
 | Źródło | Symbol | Zakres |
 |---|---|---|
 | `backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp` | `void textured_tet4_nodal_tangent_lift_reports_interior_normal_component` | Nodalna styczność i jawny interior probe, bez JVP qualification |
+
+
+(g6-field-matched-mode-count-numeric)=
+## G6 — zbieżność liczby modów według rzeczywistych pól
+
+Dla `mode_count` aktualne `numeric_status`, `relative_changes` i liczba
+porównań pochodzą wyłącznie z pełnego, jednoznacznego przypisania rzeczywistych
+pól na tej samej siatce. Singleton porównuje odpowiednie rzeczywiste
+częstotliwości w Hz. Zdegenerowany klaster porównuje uporządkowane multisety
+realnych częstotliwości z zachowaniem krotności; ordinal jest pozycją w
+multisecie, nie tożsamością pojedynczego wektora wewnątrz podprzestrzeni.
+Próg pozostaje istniejący `CONVERGENCE_RELATIVE_TOLERANCE=2e-4`.
+
+Wymagane jest dokładnie osiem target modes w siedmiu próbkach kontrolnych
+C1/A1, czyli 56 wartości. Niezaplanowane dodatkowe prawe klastry są raportowane
+osobno, poza błędem targetu. Dla C0 zakres pozostaje jednopunktowy.
+Requested count i actual published/quality-admitted count są odrębne.
+Bez dowodu pól lub przy niejednoznacznej tożsamości `numeric_status` pozostaje
+`not_verified`; uszkodzony dowód, niepoprawna jawna polityka lub przekroczenie
+progu daje `fail`. Żaden wynik z lokalnych branch ID nie zastępuje tego pomiaru.
+
+Dotychczasowe branch-ID rows i porównania do primary run są zachowane jako
+`legacy_run_local_*`, bez udziału w nowym mode-count numeric status. Mesh i
+airbox nadal mają `numeric_basis=legacy_run_local_branch_id` do czasu wdrożenia
+walidowanego transferu pomiędzy siatkami. C0 airbox pozostaje not_applicable.
+Nawet poprawne przypisanie i częstotliwości nie zamykają kompletności
+oczekiwanego widma, zgodności fizycznych konfiguracji ani kwalifikacji solvera:
+`physical_identity_status=not_verified`, cały benchmark NOT VERIFIED.
+
+Regresja swapped fields z rozłącznymi częstościami wykrywa false PASS:
+lokalne wiersze raw/branch są identyczne, lecz przypisanie pól ujawnia
+niezgodność ponad dotychczasowym progiem. Druga regresja obraca bazę
+zdegenerowanego klastra i porównuje multiset bez członkowskiej tożsamości.
+FEM CPU: source implemented, hosted checks pending. FEM GPU, scientific
+runtime i browser NOT VERIFIED; FDM CPU/GPU nie dotyczy. DSL/IR/operator bez zmian.
+
+| Źródło | Symbol | Zakres |
+|---|---|---|
+| `scripts/validate_comsol_dispersion_scientific_gate.py` | `_matched_frequency_multiset_comparison` | Pełne field assignment i częstości odpowiadających klastrów |
+| `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_mode_count_swapped_fields_reject_a_run_local_branch_id_false_pass` | Brak false PASS przez zgodność lokalnych slotów |
+| `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_mode_count_rotated_degenerate_cluster_compares_frequency_multisets` | Zdegenerowane podprzestrzenie i krotność częstości |
