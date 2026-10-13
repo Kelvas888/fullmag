@@ -106,10 +106,13 @@ export function antennaTerminalPreparationErrors(scene: SceneResource, objectId:
     const transport = scene.current_transports?.find((item) => item.name === port?.current_transport_id);
     if (!port || !transport || transport.model !== "ohmic_poisson" || transport.coupling !== "one_way" || transport.conservative_current_source || transport.structured_current_closure) throw new Error("An existing static one-way Ohmic port transport without expert source or closure is required.");
     if (transport.time_envelope) throw new Error("Remove the transport time envelope explicitly before authoring a static inspection source.");
-    if (transport.domain?.length !== 1 || transport.domain[0].object_id !== objectId || transport.domain[0].region_id) throw new Error("Preparation requires the complete original conductor object.");
+    const domain = transport.domain;
+    const domainOwner = Array.isArray(domain) && domain.length === 1 ? record(domain[0]) : null;
+    if (!domainOwner || domainOwner.object_id !== objectId || domainOwner.region_id) throw new Error("Preparation requires the complete original conductor object.");
     text(draft.revision, "Preparation revision");
     text(draft.driveId, "Drive ID");
-    if (transport.solver?.engine !== "cg" || transport.solver.operator_version !== "fem_charge_conforming_h1_p1.transparent.v1") throw new Error("Preparation requires the existing FEM H1 CG solver policy.");
+    const solver = record(transport.solver);
+    if (solver?.engine !== "cg" || solver.operator_version !== "fem_charge_conforming_h1_p1.transparent.v1") throw new Error("Preparation requires the existing FEM H1 CG solver policy.");
     if (port.branches.length !== conductors.length || port.branches.some((branch) => !conductors.includes(branch.id))) throw new Error("Port branch IDs must identify the actual authored conductor parts.");
     const expected = port.branches.flatMap((branch) => [branch.inlet_terminal_ref, branch.outlet_terminal_ref]);
     if (draft.rows.length !== expected.length || draft.rows.some((row) => !expected.includes(row.observationId)) || new Set(draft.rows.map((row) => row.observationId)).size !== expected.length) throw new Error("Each port observation must have exactly one explicit end cap.");
