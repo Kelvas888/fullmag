@@ -35,6 +35,7 @@ from fullmag.meshing.gmsh_bridge import MeshData
 from fullmag.model.discretization import PerObjectMeshRecipe
 from fullmag.model.problem import (
     _fem_mesh_cache_key,
+    _geometry_asset_cache_key,
     _fem_cache_write_lock,
     _quarantine_fem_mesh_cache_entry,
     _save_fem_mesh_cache_atomically,
@@ -67,14 +68,7 @@ class ProblemApiTests(unittest.TestCase):
             with self.subTest(field=field_name):
                 with self.assertRaisesRegex(TypeError, "not bool"):
                     fm.FEM(order=1, **kwargs)
-from fullmag.model.problem import (
-    _fem_mesh_cache_key,
-    _geometry_asset_cache_key,
-    build_geometry_assets_for_request,
-)
 
-
-class ProblemApiTests(unittest.TestCase):
     def test_fem_mesh_cache_key_changes_when_imported_source_content_changes_with_same_stat(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             source = Path(tmp_dir) / "shape.stl"
@@ -105,6 +99,7 @@ class ProblemApiTests(unittest.TestCase):
                 discretization=discretization,
                 study_universe=None,
                 mesh_workflow=None,
+                per_object_recipes=None,
                 object_regions=None,
                 fdm_only=False,
             )
@@ -122,6 +117,7 @@ class ProblemApiTests(unittest.TestCase):
                     discretization=discretization,
                     study_universe=None,
                     mesh_workflow=None,
+                    per_object_recipes=None,
                     object_regions=None,
                     fdm_only=False,
                 ),
@@ -805,6 +801,297 @@ class ProblemApiTests(unittest.TestCase):
         self.assertEqual(ir["materials"][0]["uniaxial_anisotropy"], 0.5e6)
         self.assertEqual(ir["materials"][0]["anisotropy_axis"], [0.0, 1.0, 0.0])
         self.assertEqual(ir["energy_terms"], [{"kind": "exchange"}])
+
+    def test_flat_problem_with_rotated_dmi_rewrites_to_study_surface(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            DEFAULT_UNTIL = 1e-12
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(name="Py", Ms=800e3, A=13e-12, alpha=0.02)
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="flat_rotated_dmi",
+                    magnets=[magnet],
+                    energy=[fm.Exchange(), fm.RotatedInterfacialDMI(D=3e-3)],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "flat_rotated_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            rendered = rewrite_loaded_problem_script(loaded)["rendered_source"]
+            rewritten_path = Path(tmp_dir) / "rewritten.py"
+            rewritten_path.write_text(rendered, encoding="utf-8")
+            reloaded = load_problem_from_script(rewritten_path, lightweight_assets=True)
+
+        self.assertIn('study = fm.study("flat_rotated_dmi")', rendered)
+        self.assertIn("study.terms.add(fm.RotatedInterfacialDMI(D=0.003))", rendered)
+        self.assertNotIn("fm.Problem(", rendered)
+        self.assertEqual(
+            reloaded.problem.to_ir(include_geometry_assets=False)["energy_terms"],
+            [
+                {"kind": "exchange"},
+                {"kind": "rotated_interfacial_dmi", "D": 3e-3},
+            ],
+        )
+
+    def test_rotated_dmi_override_validates_effective_mixed_terms(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(name="Py", Ms=800e3, A=13e-12, alpha=0.02)
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="flat_conventional_dmi",
+                    magnets=[magnet],
+                    energy=[fm.Exchange(), fm.InterfacialDMI(D=3e-3)],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "flat_conventional_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            with self.assertRaisesRegex(ValueError, "mixed conventional and rotated DMI"):
+                rewrite_loaded_problem_script(
+                    loaded,
+                    overrides={"rotated_interfacial_dmi": 3e-3},
+                )
+
+    def test_bulk_and_rotated_dmi_rewrite_fails_closed_without_dropping_bulk_term(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            DEFAULT_UNTIL = 1e-12
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(name="Py", Ms=800e3, A=13e-12, alpha=0.02)
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="flat_mixed_bulk_rotated_dmi",
+                    magnets=[magnet],
+                    energy=[
+                        fm.Exchange(),
+                        fm.BulkDMI(D=1e-3),
+                        fm.RotatedInterfacialDMI(D=3e-3),
+                    ],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "mixed_bulk_rotated_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            with self.assertRaisesRegex(ValueError, "mixed conventional and rotated DMI"):
+                rewrite_loaded_problem_script(loaded)
+
+    def test_material_bulk_dmi_rewrite_preserves_scalar_material_channel(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            DEFAULT_UNTIL = 1e-12
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(
+                    name="Py",
+                    Ms=800e3,
+                    A=13e-12,
+                    alpha=0.02,
+                    Dbulk=1e-3,
+                )
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="material_bulk_dmi",
+                    magnets=[magnet],
+                    energy=[fm.Exchange()],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "material_bulk_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            rendered = rewrite_loaded_problem_script(loaded)["rendered_source"]
+
+        self.assertIn("film.Dbulk = 0.001", rendered)
+
+    def test_material_spatial_dmi_rewrite_fails_closed(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(
+                    name="Py",
+                    Ms=800e3,
+                    A=13e-12,
+                    alpha=0.02,
+                    Dbulk_field=[1e-3, 1.1e-3],
+                )
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="material_spatial_dmi",
+                    magnets=[magnet],
+                    energy=[fm.Exchange()],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "material_spatial_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            with self.assertRaisesRegex(ValueError, "spatial material DMI fields"):
+                rewrite_loaded_problem_script(loaded)
+
+    def test_material_bulk_dmi_and_rotated_dmi_rewrite_fails_closed(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            DEFAULT_UNTIL = 1e-12
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(
+                    name="Py",
+                    Ms=800e3,
+                    A=13e-12,
+                    alpha=0.02,
+                    Dbulk=1e-3,
+                )
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="material_bulk_rotated_dmi",
+                    magnets=[magnet],
+                    energy=[fm.Exchange(), fm.RotatedInterfacialDMI(D=3e-3)],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "material_bulk_rotated_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            with self.assertRaisesRegex(ValueError, "mixed conventional and rotated DMI"):
+                rewrite_loaded_problem_script(loaded)
+
+    def test_rotated_interfacial_dmi_rewrite_preserves_float_round_trip(self) -> None:
+        d = 0.0012345678901234567
+        script = textwrap.dedent(
+            f"""
+            import fullmag as fm
+
+            DEFAULT_UNTIL = 1e-12
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(name="Py", Ms=800e3, A=13e-12, alpha=0.02)
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="flat_rotated_dmi_precision",
+                    magnets=[magnet],
+                    energy=[fm.Exchange(), fm.RotatedInterfacialDMI(D={d!r})],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "flat_rotated_dmi_precision.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            rendered = rewrite_loaded_problem_script(loaded)["rendered_source"]
+            rewritten_path = Path(tmp_dir) / "rewritten.py"
+            rewritten_path.write_text(rendered, encoding="utf-8")
+            reloaded = load_problem_from_script(rewritten_path, lightweight_assets=True)
+
+        self.assertIn(
+            f"study.terms.add(fm.RotatedInterfacialDMI(D={d!r}))",
+            rendered,
+        )
+        rewritten_terms = reloaded.problem.to_ir(include_geometry_assets=False)["energy_terms"]
+        rewritten_d = rewritten_terms[1]["D"]
+        self.assertEqual(rewritten_d.hex(), d.hex())
 
     def test_flat_api_object_region_lowers_to_ir(self) -> None:
         fm.reset()
@@ -2250,6 +2537,18 @@ class ProblemApiTests(unittest.TestCase):
             fm.BulkDMI(D=-2e-3).to_ir(),
             {"kind": "bulk_dmi", "D": -2e-3},
         )
+
+    def test_rotated_interfacial_dmi_serializes_exact_contract(self) -> None:
+        self.assertEqual(
+            fm.RotatedInterfacialDMI(D=-3.0e-3).to_ir(),
+            {"kind": "rotated_interfacial_dmi", "D": -3.0e-3},
+        )
+
+    def test_rotated_interfacial_dmi_rejects_non_finite_d(self) -> None:
+        for value in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "D must be finite"):
+                    fm.RotatedInterfacialDMI(D=value)
 
     def test_interfacial_dmi_rejects_invalid_interface_normal_shape(self) -> None:
         with self.assertRaises(ValueError):
@@ -9259,7 +9558,7 @@ class ProblemApiTests(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             captured["ir"] = ir
             captured["until_seconds"] = until_seconds
             captured["output_dir"] = output_dir
@@ -9329,7 +9628,7 @@ class ProblemApiTests(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             captured["until_seconds"] = until_seconds
             captured["entrypoint_kind"] = ir["problem_meta"]["entrypoint_kind"]
             return {
@@ -9372,7 +9671,7 @@ class ProblemApiTests(unittest.TestCase):
 
         calls: list[tuple[dict[str, object], float, str | None]] = []
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             calls.append((ir, until_seconds, output_dir))
             return {
                 "status": "completed",
@@ -9420,16 +9719,16 @@ class ProblemApiTests(unittest.TestCase):
         )
         self.assertEqual(
             calls[0][2],
-            str(output_dir / "stage_01_flat_relax"),
+            str(output_dir / "stage_01_flat_relax.zarr"),
         )
         self.assertEqual(
             calls[1][2],
-            str(output_dir / "stage_02_flat_run"),
+            str(output_dir / "stage_02_flat_run.zarr"),
         )
         self.assertEqual(manifest["kind"], "flat_sequence")
         self.assertEqual(len(manifest["stages"]), 2)
-        self.assertEqual(manifest["stages"][0]["output_dir"], str(output_dir / "stage_01_flat_relax"))
-        self.assertEqual(manifest["stages"][1]["output_dir"], str(output_dir / "stage_02_flat_run"))
+        self.assertEqual(manifest["stages"][0]["output_dir"], str(output_dir / "stage_01_flat_relax.zarr"))
+        self.assertEqual(manifest["stages"][1]["output_dir"], str(output_dir / "stage_02_flat_run.zarr"))
 
     def test_cli_json_mode_prints_machine_readable_summary(self) -> None:
         script = """
@@ -9503,7 +9802,7 @@ class ProblemApiTests(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             captured["until_seconds"] = until_seconds
             return {
                 "status": "completed",
@@ -9550,7 +9849,7 @@ class ProblemApiTests(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             captured["until_seconds"] = until_seconds
             return {
                 "status": "completed",
@@ -9600,7 +9899,7 @@ class ProblemApiTests(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             captured["until_seconds"] = until_seconds
             return {
                 "status": "completed",

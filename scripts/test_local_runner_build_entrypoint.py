@@ -1,0 +1,589 @@
+"""Unit tests for the trusted container Fullmag build entrypoint."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import stat
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from local_runner import build_entrypoint as entrypoint
+
+
+class BuildEntryPointTests(unittest.TestCase):
+    def test_specialized_profile_keeps_baseline_outputs_without_release_runtime(self) -> None:
+        output = self.root / "specialized-output"
+        output.mkdir()
+        for relative in entrypoint.BASE_REQUIRED_OUTPUTS:
+            path = output / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"artifact")
+        (output / "launcher-build-mode").write_text("fem-cpu", encoding="utf-8")
+        profile = entrypoint.Profile(name="fem-cpu-slepc-runtime-v2", lane="fem-cpu", environment={})
+        with patch.dict(entrypoint.EXPECTED_BUILD_MARKER, {profile.name: "fem-cpu"}):
+            entrypoint._validate_required_outputs(output, profile)
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="fullmag-build-entrypoint-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.source = self.root / "source"
+        self.workspace = self.root / "workspace"
+        self.build = self.root / "build"
+        self.artifacts = self.root / "artifacts"
+        for path in (self.source, self.workspace, self.build, self.artifacts):
+            path.mkdir()
+        (self.workspace / ".fullmag-build").mkdir()
+        (self.workspace / ".fullmag-cargo").mkdir()
+        (self.workspace / ".fullmag-rustup").mkdir()
+        self.job_id = "job-123"
+        self.profile = "fem-cpu-release"
+        self.image_digest = "sha256:" + "f" * 64
+        self.manifest, self.source_digest = self._make_capsule()
+
+    def _make_capsule(self) -> tuple[dict[str, object], str]:
+        tree = self.source / "tree"
+        tree.mkdir()
+        source_file = tree / "README.txt"
+        source_file.write_text("immutable source\n", encoding="utf-8")
+        source_file.chmod(0o755)
+        file_bytes = source_file.read_bytes()
+        manifest: dict[str, object] = {
+            "schema_version": entrypoint.CAPSULE_SCHEMA,
+            "source_mode": "commit",
+            "resolved_commit": "a" * 40,
+            "files": [
+                {
+                    "path": "README.txt",
+                    "type": "file",
+                    "mode": "100755",
+                    "size": len(file_bytes),
+                    "sha256": hashlib.sha256(file_bytes).hexdigest(),
+                }
+            ],
+            "deleted": [],
+            "included_untracked": [],
+            "excluded": [],
+        }
+        manifest["source_digest"] = hashlib.sha256(
+            entrypoint.canonical(manifest)
+        ).hexdigest()
+        (self.source / "manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        return manifest, str(manifest["source_digest"])
+
+    def _identity(self) -> dict[str, object]:
+        identity: dict[str, object] = {
+            "schema": entrypoint.IDENTITY_SCHEMA,
+            "head_commit_full": "a" * 40,
+            "head_tree_sha256": "1" * 64,
+            "git_status_porcelain_v1": [],
+            "dirty_path_content": [],
+            "dirty_content_sha256": "2" * 64,
+            "source_snapshot_dirty": False,
+        }
+        payload = dict(identity)
+        for derived in ("source_snapshot_dirty", "dirty_content_sha256"):
+            payload.pop(derived, None)
+        identity["source_snapshot_sha256"] = hashlib.sha256(
+            entrypoint.canonical(payload)
+        ).hexdigest()
+        return identity
+
+    def _write_context(self, *, include_identity: bool = True) -> Path:
+        context: dict[str, object] = {
+            "schema": entrypoint.CONTEXT_SCHEMA,
+            "job_id": self.job_id,
+            "source_digest": self.source_digest,
+            "profile": self.profile,
+            "image_digest": self.image_digest,
+        }
+        if include_identity:
+            context["native_source_identity"] = self._identity()
+        path = self.root / "context.json"
+        path.write_text(json.dumps(context), encoding="utf-8")
+        return path
+
+    def _argv(self, context: Path) -> list[str]:
+        return [
+            "--job-id",
+            self.job_id,
+            "--source-digest",
+            self.source_digest,
+            "--profile",
+            self.profile,
+            "--source",
+            str(self.source),
+            "--workspace",
+            str(self.workspace),
+            "--build",
+            str(self.build),
+            "--artifacts",
+            str(self.artifacts),
+            "--context",
+            str(context),
+            "--jobs",
+            "2",
+        ]
+
+    def _write_outputs(self, marker: str = "fem-cpu") -> Path:
+        output = self.workspace / ".fullmag" / "local"
+        (output / "bin").mkdir(parents=True)
+        (output / "lib").mkdir()
+        (output / "web").mkdir()
+        (output / "bin" / "fullmag-bin").write_bytes(b"cli")
+        (output / "bin" / "fullmag-api").write_bytes(b"api")
+        for name in (
+            "fullmag-api-accepted-worker",
+            "fullmag-api-accepted-supervisor",
+            "fullmag-api-accepted-scheduler",
+            "fullmag-runtime-service",
+            "fullmag-api-resource-pool",
+            "fullmag-api-accepted-fem-preparer",
+            "fullmag-api-accepted-fem-preparation-supervisor",
+            "fullmag-api-accepted-fem-preparation-scheduler",
+            "fullmag-api-preparation-resource-pool",
+            "fullmag-api-preparation-retry",
+        ):
+            (output / "bin" / name).write_bytes(b"accepted-runtime")
+        (output / "_fullmag_core.so").write_bytes(b"core")
+        (output / "launcher-build-mode").write_text(marker + "\n", encoding="utf-8")
+        (output / "web" / "index.html").write_text("<html />", encoding="utf-8")
+        return output
+
+    def test_incomplete_accepted_runtime_package_is_rejected(self) -> None:
+        output = self._write_outputs()
+        binaries = sorted(output.joinpath("bin").glob("fullmag-api-*")) + [output / "bin" / "fullmag-runtime-service"]
+        self.assertEqual(len(binaries), 10)
+        for binary in binaries:
+            with self.subTest(binary=binary.name):
+                original = binary.read_bytes()
+                binary.unlink()
+                try:
+                    with self.assertRaisesRegex(entrypoint.BuildEntryPointError, binary.name):
+                        entrypoint._validate_required_outputs(output, entrypoint.profile_for(self.profile))
+                finally:
+                    binary.write_bytes(original)
+
+    def test_empty_native_runtime_service_is_rejected(self) -> None:
+        output = self._write_outputs()
+        binary = output / "bin" / "fullmag-runtime-service"
+        binary.write_bytes(b"")
+        with self.assertRaisesRegex(entrypoint.BuildEntryPointError, binary.name):
+            entrypoint._validate_required_outputs(output, entrypoint.profile_for(self.profile))
+
+    def test_empty_accepted_runtime_binary_is_rejected(self) -> None:
+        output = self._write_outputs()
+        binary = output / "bin" / "fullmag-api-accepted-fem-preparer"
+        binary.write_bytes(b"")
+        with self.assertRaisesRegex(entrypoint.BuildEntryPointError, binary.name):
+            entrypoint._validate_required_outputs(output, entrypoint.profile_for(self.profile))
+
+    def test_profile_environment_cannot_silently_fallback(self) -> None:
+        identity = self._identity()
+        cpu = entrypoint.build_environment(
+            entrypoint.profile_for("fem-cpu-release"),
+            workspace=self.workspace,
+            build=self.build,
+            jobs=2,
+            native_identity=identity,
+        )
+        self.assertEqual(cpu["FULLMAG_FORCE_LOCAL_FEM_CPU"], "1")
+        self.assertEqual(cpu["FULLMAG_FORCE_LOCAL_FEM_GPU"], "0")
+        self.assertEqual(cpu["FULLMAG_BUILD_CPU_ONLY"], "0")
+        self.assertEqual(cpu["FULLMAG_FEM_WITH_SLEPC"], "OFF")
+        self.assertEqual(cpu["CARGO_BUILD_JOBS"], "2")
+        self.assertEqual(
+            cpu["FULLMAG_SOURCE_SNAPSHOT_SHA256"],
+            identity["source_snapshot_sha256"],
+        )
+        self.assertEqual(cpu["HOME"], "/workspace/.fullmag-build/home")
+        self.assertEqual(cpu["TMPDIR"], "/workspace/.fullmag-build/tmp")
+        self.assertTrue((self.build / "home").is_dir())
+        self.assertTrue((self.build / "tmp").is_dir())
+        gpu = entrypoint.profile_for("fem-gpu-release")
+        self.assertTrue(gpu.needs_cuda_toolchain)
+        self.assertEqual(gpu.environment["FULLMAG_FORCE_LOCAL_FEM_GPU"], "1")
+        fdm = entrypoint.profile_for("fdm-cpu-release")
+        self.assertEqual(fdm.environment["FULLMAG_BUILD_CPU_ONLY"], "1")
+
+    def test_preflight_requires_an_installed_nightly_toolchain(self) -> None:
+        with patch.object(
+            entrypoint.shutil,
+            "which",
+            side_effect=lambda name: f"/usr/bin/{name}",
+        ), patch.object(
+            entrypoint.subprocess,
+            "run",
+            return_value=entrypoint.subprocess.CompletedProcess(
+                ["rustup", "run", "nightly", "rustc", "--version"],
+                0, "rustc 1.99.0 (stable)\n", ""
+            ),
+        ):
+            with self.assertRaisesRegex(entrypoint.BuildEntryPointError, "nightly"):
+                entrypoint.preflight(entrypoint.profile_for("fdm-cpu-release"), release=False)
+        # A fresh host gets an operator-actionable remedy, but the trusted
+        # runner must not turn a build into an implicit network/bootstrap step.
+        with patch.object(
+            entrypoint.shutil,
+            "which",
+            side_effect=lambda name: f"/usr/bin/{name}",
+        ), patch.object(
+            entrypoint.subprocess,
+            "run",
+            return_value=entrypoint.subprocess.CompletedProcess(
+                ["rustup", "run", "nightly", "rustc", "--version"],
+                1, "toolchain nightly is not installed\n", ""
+            ),
+        ):
+            with self.assertRaisesRegex(
+                entrypoint.BuildEntryPointError,
+                r"rustup toolchain install nightly.*never downloads",
+            ):
+                entrypoint.preflight(entrypoint.profile_for("fdm-cpu-release"), release=False)
+
+    def test_preflight_probes_the_exact_installed_channel_without_install(self) -> None:
+        with patch.object(entrypoint.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"), patch.object(
+            entrypoint.subprocess, "run",
+            return_value=entrypoint.subprocess.CompletedProcess(
+                [], 0, "rustc 1.101.0-nightly (0abfedbc7 2026-10-02)\n", ""
+            ),
+        ) as run:
+            entrypoint.preflight(entrypoint.profile_for("fdm-cpu-release"), release=False)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0], [
+            "/usr/bin/rustup", "run", "nightly", "rustc", "--version",
+        ])
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+        self.assertEqual(run.call_args.kwargs["stdin"], entrypoint.subprocess.DEVNULL)
+
+    def test_receipt_observes_nightly_even_when_source_selects_stable(self) -> None:
+        # A source override must never be queried by the receipt probes.
+        (self.workspace / "rust-toolchain.toml").write_text(
+            '[toolchain]\nchannel = "stable"\n', encoding="utf-8"
+        )
+        tools = {name: f"/usr/bin/{name}" for name in ("rustup", "rustc", "cargo", "make")}
+        with patch.object(entrypoint, "_command_version", side_effect=lambda command: {
+            "command": command, "exit_code": 0, "output": "installed tool version",
+        }):
+            versions = entrypoint.toolchain_versions(tools)
+        for name in ("rustc", "cargo"):
+            self.assertEqual(versions[name]["command"], [
+                tools["rustup"], "run", "nightly", name, "--version",
+            ])
+
+    def test_failed_nightly_receipt_probe_is_not_accepted_as_build_evidence(self) -> None:
+        tools = {name: name for name in ("rustup", "rustc", "cargo", "make")}
+        for failed_tool in ("rustc", "cargo"):
+            with self.subTest(failed_tool=failed_tool):
+                def probe(command):
+                    failed = command[1:4] == ["run", "nightly", failed_tool]
+                    return {"command": command, "exit_code": 1 if failed else 0, "output": "probe"}
+                with patch.object(entrypoint, "_command_version", side_effect=probe):
+                    with self.assertRaisesRegex(entrypoint.BuildEntryPointError, failed_tool):
+                        entrypoint.toolchain_versions(tools)
+
+    def test_context_keeps_capsule_digest_separate_from_native_v2_identity(self) -> None:
+        context_path = self._write_context()
+        context = entrypoint.load_context(
+            context_path,
+            job_id=self.job_id,
+            source_digest=self.source_digest,
+            profile=self.profile,
+        )
+        self.assertEqual(
+            context["native_source_identity"]["source_snapshot_sha256"],
+            self._identity()["source_snapshot_sha256"],
+        )
+
+    def test_native_identity_accepts_sha256_git_commits(self) -> None:
+        identity = self._identity()
+        identity['head_commit_full'] = 'a' * 64
+        payload = dict(identity)
+        for key in ('source_snapshot_dirty', 'dirty_content_sha256', 'source_snapshot_sha256'):
+            payload.pop(key, None)
+        identity['source_snapshot_sha256'] = hashlib.sha256(entrypoint.canonical(payload)).hexdigest()
+        self.assertEqual(identity, entrypoint._validate_native_identity(identity))
+
+    def test_build_environment_excludes_ambient_credentials_and_command_overrides(self) -> None:
+        ambient = {'PATH': '/tools/bin', 'CMAKE_PREFIX_PATH': '/opt/deps',
+                   'GITHUB_TOKEN': 'private', 'HTTPS_PROXY': 'credential',
+                   'DOCKER_HOST': 'remote', 'MAKEFLAGS': '--eval=unexpected',
+                   'RUSTFLAGS': 'unexpected', 'BASH_ENV': '/injected'}
+        with patch.dict(entrypoint.os.environ, ambient, clear=True):
+            environment = entrypoint.build_environment(
+                entrypoint.profile_for(self.profile), workspace=self.workspace,
+                build=self.build, jobs=2, native_identity=self._identity())
+        self.assertEqual('/tools/bin', environment['PATH'])
+        self.assertEqual('/opt/deps', environment['CMAKE_PREFIX_PATH'])
+        for key in set(ambient) - {'PATH', 'CMAKE_PREFIX_PATH'}:
+            self.assertNotIn(key, environment)
+
+    def test_context_rejects_tampered_native_v2_self_hash(self) -> None:
+        context_path = self._write_context()
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+        context["native_source_identity"]["head_tree_sha256"] = "4" * 64
+        context_path.write_text(json.dumps(context), encoding="utf-8")
+        with self.assertRaisesRegex(entrypoint.BuildEntryPointError, "does not match"):
+            entrypoint.load_context(
+                context_path,
+                job_id=self.job_id,
+                source_digest=self.source_digest,
+                profile=self.profile,
+            )
+
+    def test_materialization_preserves_mode_and_does_not_create_git(self) -> None:
+        original = self.source / "tree" / "README.txt"
+        entrypoint.os.utime(original, (1000, 1000))
+        manifest = entrypoint.verify_source(self.source, self.source_digest)
+        entrypoint.materialize_capsule(manifest, self.source, self.workspace)
+        source_mode = stat.S_IMODE((self.source / "tree" / "README.txt").stat().st_mode)
+        target_mode = stat.S_IMODE((self.workspace / "README.txt").stat().st_mode)
+        if entrypoint.os.name != "nt":
+            self.assertEqual(target_mode, 0o755)
+        self.assertEqual((self.workspace / "README.txt").read_text(encoding="utf-8"), "immutable source\n")
+        self.assertFalse((self.workspace / ".git").exists())
+        self.assertGreater((self.workspace / "README.txt").stat().st_mtime, 1000)
+        self.assertEqual(original.stat().st_mtime, 1000)
+
+    def test_materialization_makes_private_dirs_writable_without_changing_capsule(self) -> None:
+        nested = self.source / "tree" / "readonly" / "nested"
+        nested.mkdir(parents=True)
+        nested_file = nested / "input.txt"
+        nested_file.write_text("nested immutable input\n", encoding="utf-8")
+        if entrypoint.os.name != "nt":
+            (self.source / "tree" / "readonly").chmod(0o555)
+            nested.chmod(0o555)
+        nested_bytes = nested_file.read_bytes()
+        files = list(self.manifest["files"])
+        files.append(
+            {
+                "path": "readonly/nested/input.txt",
+                "type": "file",
+                "mode": "100644",
+                "size": len(nested_bytes),
+                "sha256": hashlib.sha256(nested_bytes).hexdigest(),
+            }
+        )
+        manifest = {**self.manifest, "files": files}
+        source_modes = {
+            path: stat.S_IMODE(path.stat().st_mode)
+            for path in (self.source / "tree" / "readonly", nested, nested_file)
+        }
+        mount_modes = {
+            path: stat.S_IMODE(path.stat().st_mode)
+            for path in (
+                self.workspace / ".fullmag-build",
+                self.workspace / ".fullmag-cargo",
+                self.workspace / ".fullmag-rustup",
+            )
+        }
+        if entrypoint.os.name != "nt":
+            self.workspace.chmod(0o555)
+
+        entrypoint.materialize_capsule(manifest, self.source, self.workspace)
+
+        copied_root = self.workspace / "readonly"
+        copied_nested = copied_root / "nested"
+        if entrypoint.os.name != "nt":
+            self.assertTrue(stat.S_IMODE(copied_root.stat().st_mode) & stat.S_IWUSR)
+            self.assertTrue(stat.S_IMODE(copied_nested.stat().st_mode) & stat.S_IWUSR)
+            self.assertTrue(
+                stat.S_IMODE(self.workspace.stat().st_mode) & stat.S_IWUSR,
+                "private workspace root must be owner-writable",
+            )
+            for path, mode in source_modes.items():
+                self.assertEqual(mode, stat.S_IMODE(path.stat().st_mode))
+            for path, mode in mount_modes.items():
+                self.assertEqual(mode, stat.S_IMODE(path.stat().st_mode))
+        self.assertEqual(nested_bytes, (copied_nested / "input.txt").read_bytes())
+
+    def test_tail_text_reads_only_a_bounded_suffix(self) -> None:
+        log = self.root / "large.log"
+        log.write_text("a" * 10000 + "TAIL", encoding="utf-8")
+        suffix = entrypoint._tail_text(log)
+        self.assertEqual(len(suffix), 1024)
+        self.assertTrue(suffix.endswith("TAIL"))
+
+    def test_runtime_outputs_dereference_internal_library_links_only(self) -> None:
+        output = self._write_outputs()
+        library = output / "lib" / "libfullmag.so.1.0"
+        library.write_bytes(b"library")
+        try:
+            (output / "lib" / "libfullmag.so.1").symlink_to(library.name)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        destination_root = self.artifacts / "outputs" / ".fullmag" / "local"
+        entrypoint._copy_outputs(self.workspace, self.artifacts)
+        copied_link = destination_root / "lib" / "libfullmag.so.1"
+        self.assertTrue(copied_link.is_file())
+        self.assertFalse(copied_link.is_symlink())
+        self.assertEqual(copied_link.read_bytes(), b"library")
+        self.assertFalse((destination_root / "cache").exists())
+
+    def test_runtime_outputs_reject_symlink_into_venv(self) -> None:
+        output = self._write_outputs()
+        venv = output / ".venv"
+        venv.mkdir()
+        (venv / "secret").write_bytes(b"secret")
+        try:
+            (output / "lib" / "secret.so").symlink_to(Path("..") / ".venv" / "secret")
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        with self.assertRaisesRegex(entrypoint.BuildEntryPointError, "escapes output"):
+            entrypoint._copy_outputs(self.workspace, self.artifacts)
+
+    def test_workspace_allows_only_persistent_mountpoints(self) -> None:
+        (self.workspace / ".fullmag-cargo" / "registry-cache").write_text("cache")
+        entrypoint._workspace_is_empty(self.workspace)
+        (self.workspace / "unexpected.txt").write_text("not a mount")
+        with self.assertRaisesRegex(entrypoint.BuildEntryPointError, "workspace must be empty"):
+            entrypoint._workspace_is_empty(self.workspace)
+
+    def test_missing_native_identity_fails_and_publishes_receipt(self) -> None:
+        context = self._write_context(include_identity=False)
+        code = entrypoint.main(self._argv(context))
+        self.assertEqual(code, 2)
+        receipt = json.loads((self.artifacts / "build-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["state"], "failed")
+        self.assertEqual(receipt["qualification"], "NOT VERIFIED")
+        self.assertIn("native_source_identity", receipt["error"])
+
+    def test_success_runs_only_managed_fixed_stages_and_publishes_receipt(self) -> None:
+        context = self._write_context()
+        calls: list[tuple[str, list[str]]] = []
+
+        def fake_stage(name, command, *, workspace, artifacts, environment):
+            calls.append((name, command))
+            if name == "native-build":
+                self._write_outputs()
+            logs = artifacts / "logs"
+            logs.mkdir(exist_ok=True)
+            (logs / f"{name}.stdout.log").write_text("ok\n", encoding="utf-8")
+            (logs / f"{name}.stderr.log").write_text("", encoding="utf-8")
+            return {
+                "name": name,
+                "command": command,
+                "started_at": "now",
+                "finished_at": "now",
+                "duration_ms": 1,
+                "exit_code": 0,
+                "stdout_log": f"logs/{name}.stdout.log",
+                "stderr_log": f"logs/{name}.stderr.log",
+                "stdout_tail": "ok",
+                "stderr_tail": "",
+            }
+
+        with patch.object(
+            entrypoint,
+            "preflight",
+            return_value={"make": "/usr/bin/make", "pnpm": "/usr/bin/pnpm"},
+        ), patch.object(entrypoint, "toolchain_versions", return_value={"make": {}}), patch.object(
+            entrypoint, "run_stage", side_effect=fake_stage
+        ):
+            code = entrypoint.main(self._argv(context))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            calls,
+            [
+                ("native-build", ["/usr/bin/make", "install-cli-dev"]),
+                (
+                    "frontend-dependencies",
+                    ["/usr/bin/pnpm", "install", "--dir", "apps/control-room", "--frozen-lockfile"],
+                ),
+                ("frontend-build", ["/usr/bin/make", "web-build-static"]),
+            ],
+        )
+        receipt = json.loads((self.artifacts / "build-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["state"], "succeeded")
+        self.assertEqual(receipt["source_digest"], self.source_digest)
+        self.assertEqual(receipt["source_digest_kind"], "capsule")
+        self.assertEqual(
+            receipt["native_source_identity"]["source_snapshot_sha256"],
+            self._identity()["source_snapshot_sha256"],
+        )
+        self.assertEqual(receipt["qualification"], "NOT VERIFIED")
+        self.assertNotIn(".git", {path.name for path in self.workspace.iterdir()})
+
+    def test_successful_commands_without_required_outputs_fail_receipt(self) -> None:
+        context = self._write_context()
+
+        def fake_stage(name, command, *, workspace, artifacts, environment):
+            logs = artifacts / "logs"
+            logs.mkdir(exist_ok=True)
+            (logs / f"{name}.stdout.log").write_text("ok\n", encoding="utf-8")
+            (logs / f"{name}.stderr.log").write_text("", encoding="utf-8")
+            return {
+                "name": name,
+                "command": command,
+                "started_at": "now",
+                "finished_at": "now",
+                "duration_ms": 1,
+                "exit_code": 0,
+                "stdout_log": f"logs/{name}.stdout.log",
+                "stderr_log": f"logs/{name}.stderr.log",
+                "stdout_tail": "ok",
+                "stderr_tail": "",
+            }
+
+        with patch.object(
+            entrypoint,
+            "preflight",
+            return_value={"make": "/usr/bin/make", "pnpm": "/usr/bin/pnpm"},
+        ), patch.object(entrypoint, "toolchain_versions", return_value={}), patch.object(
+            entrypoint, "run_stage", side_effect=fake_stage
+        ):
+            code = entrypoint.main(self._argv(context))
+
+        self.assertEqual(code, 2)
+        receipt = json.loads((self.artifacts / "build-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["state"], "failed")
+        self.assertIn("required Fullmag output is missing", receipt["error"])
+
+    def test_failed_stage_keeps_failed_receipt_and_does_not_continue(self) -> None:
+        context = self._write_context()
+        calls: list[str] = []
+
+        def failing_stage(name, command, *, workspace, artifacts, environment):
+            calls.append(name)
+            logs = artifacts / "logs"
+            logs.mkdir(exist_ok=True)
+            (logs / f"{name}.stdout.log").write_text("failed\n", encoding="utf-8")
+            (logs / f"{name}.stderr.log").write_text("error\n", encoding="utf-8")
+            return {
+                "name": name,
+                "command": command,
+                "started_at": "now",
+                "finished_at": "now",
+                "duration_ms": 1,
+                "exit_code": 17,
+                "stdout_log": f"logs/{name}.stdout.log",
+                "stderr_log": f"logs/{name}.stderr.log",
+                "stdout_tail": "failed",
+                "stderr_tail": "error",
+            }
+
+        with patch.object(
+            entrypoint,
+            "preflight",
+            return_value={"make": "/usr/bin/make", "pnpm": "/usr/bin/pnpm"},
+        ), patch.object(entrypoint, "toolchain_versions", return_value={}), patch.object(
+            entrypoint, "run_stage", side_effect=failing_stage
+        ):
+            code = entrypoint.main(self._argv(context))
+
+        self.assertEqual(code, 2)
+        self.assertEqual(calls, ["native-build"])
+        receipt = json.loads((self.artifacts / "build-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["state"], "failed")
+        self.assertEqual(receipt["stages"][0]["exit_code"], 17)
+        self.assertIn("managed stage failed", receipt["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()

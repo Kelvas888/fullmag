@@ -12,21 +12,15 @@ import {
   Square,
   Upload,
 } from "lucide-react";
-import { useCallback, useEffect, useReducer, type ReactNode } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState, type ReactNode } from "react";
 
 import { createCommandContext } from "@/kernel/commands/commandContext";
+import { runFdmGridRefreshOperation } from "@/kernel/authoring/geometryLifecycleCommandContributions";
+import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
 import {
-  MESHING_BUILDS_CURRENT_PATH,
-  MESHING_BUILDS_PATH,
   MESHING_BUILDS_LATEST_SUCCESSFUL_PATH,
-  MESHING_SEMANTICS_PATH,
   MESHING_PERIODIC_PAIRS_PATH,
   MESHING_SHARED_DOMAIN_MANIFEST_PATH,
-  MESHING_SHARED_DOMAIN_QUALITY_DATA_PATH,
-  MESHING_SHARED_DOMAIN_QUALITY_GATES_PATH,
-  MESHING_SHARED_DOMAIN_QUALITY_PATH,
-  MESHING_SHARED_DOMAIN_REALIZED_SIZE_FIELDS_PATH,
-  MESHING_SHARED_DOMAIN_REPORT_PATH,
   MESHING_SUMMARY_PATH,
   MODEL_READINESS_PATH,
   MODEL_SCENE_PATH,
@@ -43,6 +37,7 @@ import type {
   LiveStatusResource,
   MeshPeriodicPairsResource,
   MeshSharedDomainManifestResource,
+  SceneResource,
   SessionImportInspectResponse,
   SolverStatusResource,
   StageExecutionResource,
@@ -69,6 +64,7 @@ import {
   useMeshPeriodicPairsResource,
 } from "@/kernel/resources/studyRuntimeResources";
 import {
+  invalidateFdmGridResources,
   useGeometryValidationResource,
   useMeshBuildCurrent,
   useMeshBuildLatestSuccessful,
@@ -77,8 +73,10 @@ import {
   useSceneResource,
 } from "@/kernel/resources/geometryLifecycleResources";
 import { useKernel } from "@/kernel/KernelContext";
+import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
 import {
   SESSION_STATUS_RESOURCE_KEY,
+  useSessionResourceIdentity,
   useSessionStatusSelector,
 } from "@/kernel/resources/useSessionStatus";
 import type { ActiveLaneCapabilitySnapshot } from "@/kernel/resources/useActiveLaneCapabilities";
@@ -99,6 +97,8 @@ import { FieldRow } from "../primitives/FieldRow";
 import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FormField } from "../primitives/FormField";
 import { InspectorGroup } from "../primitives/InspectorGroup";
+import { ProjectRunsSection } from "./ProjectRunsSection";
+import { ProjectBatchesSection } from "./ProjectBatchesSection";
 
 import {
   buildStudyGlobalMergePatch,
@@ -127,6 +127,16 @@ import {
   StudyPipelineSection,
   StudySolverPolicyFields,
 } from "./StudyPipelineSection";
+import {
+  StudyExecutionProfileSection,
+  type StudyExecutionProfileEditSession,
+} from "./StudyExecutionProfileSection";
+import {
+  buildStudyExecutionProfileAssignmentMergePatch,
+  hasChangeDeviceStudyStage,
+  hasStudyExecutionProfile,
+  type StudyExecutionProfileAssignment,
+} from "./StudyExecutionProfileModel";
 import type { K0ModalExecutionReadiness } from "./StudyStageAuthoringModel";
 import { validateStudyWorkflow } from "./stages/studyWorkflowState";
 import { StudyProgressBar } from "./StudyProgressBar";
@@ -450,27 +460,6 @@ function numericSceneRevision(value: number | string | null): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function invalidateFdmGridResources(
-  resources: { invalidate: (resourceKey: string, revision: number) => void },
-  revision: number,
-): void {
-  for (const resourceKey of [
-    MESHING_BUILDS_PATH,
-    MESHING_BUILDS_CURRENT_PATH,
-    MESHING_BUILDS_LATEST_SUCCESSFUL_PATH,
-    MESHING_SUMMARY_PATH,
-    MESHING_SEMANTICS_PATH,
-    MESHING_SHARED_DOMAIN_MANIFEST_PATH,
-    MESHING_SHARED_DOMAIN_REPORT_PATH,
-    MESHING_SHARED_DOMAIN_QUALITY_PATH,
-    MESHING_SHARED_DOMAIN_QUALITY_DATA_PATH,
-    MESHING_SHARED_DOMAIN_QUALITY_GATES_PATH,
-    MESHING_SHARED_DOMAIN_REALIZED_SIZE_FIELDS_PATH,
-  ]) {
-    resources.invalidate(resourceKey, revision);
-  }
-}
-
 function formatGridVector(values: readonly number[]): string {
   return values.map((value) => value.toExponential(3)).join(" × ");
 }
@@ -686,10 +675,20 @@ export function useStudyInspectorPanelController(
   selection: InspectorPanelProps["selection"],
 ) {
   const kernel = useKernel();
+  const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
   const [state, dispatch] = useReducer(
     studyInspectorPanelReducer,
     STUDY_INSPECTOR_INITIAL_STATE,
   );
+  const importInspectionGeneration = useRef(0);
+  const importScopeRef = useRef(sessionScopeKey);
+  useEffect(() => {
+    if (importScopeRef.current === sessionScopeKey) return;
+    importScopeRef.current = sessionScopeKey;
+    importInspectionGeneration.current += 1;
+    dispatch({ type: "prepareImportFile", fileName: null });
+    dispatch({ type: "setImportDialogOpen", open: false });
+  }, [sessionScopeKey]);
   const runtimeStatus = useSessionStatusSelector(
     selectStudyInspectorRuntimeStatus,
     { isEqual: studyInspectorRuntimeStatusEquals },
@@ -778,9 +777,36 @@ export function useStudyInspectorPanelController(
       stageExecution: stageExecution.data,
     });
   const sceneRevision = sceneRevisionValue(scene.data);
+  const authoringScopeKey = `${sessionScopeKey ?? "no-session"}:${kernel.api.resourceCacheScope}`;
+  const acknowledgedSceneRevisionRef = useRef<number | null>(null);
+  const authoritativeSceneRef = useRef<SceneResource | null>(scene.data);
+  const authoritativeScopeRef = useRef(authoringScopeKey);
+  const authoritativeSnapshotScopeRef = useRef<string | null>(
+    scene.status === "ready" ? authoringScopeKey : null,
+  );
+  useEffect(() => {
+    if (authoritativeScopeRef.current !== authoringScopeKey) {
+      authoritativeScopeRef.current = authoringScopeKey;
+      authoritativeSceneRef.current = null;
+      authoritativeSnapshotScopeRef.current = null;
+      acknowledgedSceneRevisionRef.current = null;
+      return;
+    }
+    if (scene.status !== "ready") return;
+    const observedRevision = numericSceneRevision(sceneRevision);
+    if (
+      scene.data &&
+      observedRevision !== null &&
+      (acknowledgedSceneRevisionRef.current === null ||
+        observedRevision >= acknowledgedSceneRevisionRef.current)
+    ) {
+      authoritativeSceneRef.current = scene.data;
+      authoritativeSnapshotScopeRef.current = authoringScopeKey;
+      acknowledgedSceneRevisionRef.current = observedRevision;
+    }
+  }, [authoringScopeKey, scene.data, scene.status, sceneRevision]);
   const sceneHasPayload = sceneHasAuthoringPayload(scene.data);
   const sceneMagneticObjectCount = magneticObjectCount(scene.data);
-  const sceneMagneticObjectIds = magneticObjectIds(scene.data);
   const sceneStageCount = rawStudyStages(scene.data).length;
   const studySignature = studyAuthoringSignature(scene.data);
   useEffect(() => {
@@ -839,12 +865,68 @@ export function useStudyInspectorPanelController(
       [PERSISTENCE_CHECKPOINTS_PATH]: checkpointCatalog.data,
       [SIMULATION_RUN_CURRENT_PATH]: currentRun.data,
     },
+    sessionScopeKey,
     sourceDetail: "study",
   });
+  const createAuthoringMutationContext = (
+    sceneSnapshot: SceneResource | null = scene.data,
+  ) => {
+    const historyGeneration = kernel.authoringHistory?.getGeneration?.();
+    return {
+      ...commandContext,
+      resourceData: {
+        ...commandContext.resourceData,
+        [MODEL_SCENE_PATH]: sceneSnapshot,
+      },
+      isCurrentSessionScope: () =>
+        commandContext.isCurrentSessionScope?.() !== false &&
+        (historyGeneration === undefined ||
+          kernel.authoringHistory?.getGeneration?.() === historyGeneration),
+    };
+  };
+  const readAuthoritativeScene = async (): Promise<{
+    revision: number;
+    scene: SceneResource;
+  } | null> => {
+    const observedRevision = numericSceneRevision(sceneRevision);
+    if (
+      authoritativeSnapshotScopeRef.current === authoringScopeKey &&
+      scene.data &&
+      observedRevision !== null &&
+      (acknowledgedSceneRevisionRef.current === null ||
+        observedRevision >= acknowledgedSceneRevisionRef.current)
+    ) {
+      authoritativeSceneRef.current = scene.data;
+      acknowledgedSceneRevisionRef.current = observedRevision;
+      return { revision: observedRevision, scene: scene.data };
+    }
+    try {
+      const canonical = await kernel.api.model.scene(
+        sessionScopeKey ? { sessionScopeKey } : undefined,
+      );
+      if (commandContext.isCurrentSessionScope?.() === false) return null;
+      const revision = numericSceneRevision(sceneRevisionValue(canonical));
+      if (
+        revision === null ||
+        (acknowledgedSceneRevisionRef.current !== null &&
+          revision < acknowledgedSceneRevisionRef.current)
+      ) {
+        return null;
+      }
+      authoritativeSceneRef.current = canonical;
+      authoritativeSnapshotScopeRef.current = authoringScopeKey;
+      acknowledgedSceneRevisionRef.current = revision;
+      return { revision, scene: canonical };
+    } catch {
+      return null;
+    }
+  };
   const runCommand = (commandId: string, input?: unknown) => {
     void kernel.commands.execute(commandId, commandContext, input);
   };
   const inspectImportFile = async (file: File | null) => {
+    const generation = ++importInspectionGeneration.current;
+    const scopeAtSelection = sessionScopeKey;
     dispatch({
       type: "prepareImportFile",
       fileName: file?.name ?? null,
@@ -853,15 +935,27 @@ export function useStudyInspectorPanelController(
 
     try {
       const fmsBase64 = await readFileAsBase64(file);
+      if (
+        generation !== importInspectionGeneration.current ||
+        scopeAtSelection !== importScopeRef.current
+      ) return;
       const inspection = await kernel.api.persistence.imports.inspect({
         fms_base64: fmsBase64,
       });
+      if (
+        generation !== importInspectionGeneration.current ||
+        scopeAtSelection !== importScopeRef.current
+      ) return;
       dispatch({
         type: "importInspectSuccess",
         fmsBase64,
         inspection: inspection.inspection,
       });
     } catch (error) {
+      if (
+        generation !== importInspectionGeneration.current ||
+        scopeAtSelection !== importScopeRef.current
+      ) return;
       dispatch({
         type: "importInspectFailure",
         message:
@@ -877,6 +971,33 @@ export function useStudyInspectorPanelController(
       : kernel.commands.get(commandId)?.disabledReason?.(commandContext) ??
         "Command is unavailable.";
   const commitStageDrafts = async () => {
+    const currentScene = await readAuthoritativeScene();
+    if (!currentScene) {
+      dispatch({
+        type: "setAuthoringFeedback",
+        scope: "stages",
+        feedback: {
+          kind: "error",
+          message: "Could not read the current scene revision. Refresh the scene before saving stages.",
+        },
+      });
+      return false;
+    }
+    if (
+      hasStudyExecutionProfile(currentScene.scene) &&
+      hasChangeDeviceStudyStage(currentScene.scene, state.stageDrafts)
+    ) {
+      dispatch({
+        type: "setAuthoringFeedback",
+        scope: "stages",
+        feedback: {
+          kind: "error",
+          message:
+            "A Change device stage cannot be saved while an execution profile is bound. Remove the stage or clear the profile first.",
+        },
+      });
+      return false;
+    }
     const localIssues = state.stageDrafts.flatMap((draft, index) =>
       validateStudyStageDraft(draft, {
         activeLane: runtimeStatus?.capabilities.active_lane ?? null,
@@ -912,29 +1033,22 @@ export function useStudyInspectorPanelController(
       return false;
     }
 
-    const baseRevision = numericSceneRevision(sceneRevision);
-    if (baseRevision === null) {
-      dispatch({
-        type: "setAuthoringFeedback",
-        scope: "stages",
-        feedback: {
-          kind: "error",
-          message:
-            "The canonical scene revision is unavailable. Refetch before applying study stages.",
-        },
-      });
-      return false;
-    }
+    const baseRevision = currentScene.revision;
 
+    const mutationContext = createAuthoringMutationContext(currentScene.scene);
     dispatch({ type: "setAuthoringBusy", busy: true });
     try {
-      const response = await kernel.api.model.commitTransaction(
-        buildStudyStagesMergePatch(
-          state.stageDrafts,
-          baseRevision,
+      const response = await runAuthoringMutationWithHistory(
+        mutationContext,
+        "Edit study stages",
+        () => kernel.api.model.commitTransaction(
+          buildStudyStagesMergePatch(state.stageDrafts, baseRevision),
+          sessionScopeKey ? { sessionScopeKey } : undefined,
         ),
       );
+      if (mutationContext.isCurrentSessionScope() === false) return false;
       const revision = response.scene_revision;
+      acknowledgedSceneRevisionRef.current = revision;
       kernel.resources.invalidate(MODEL_SCENE_PATH, revision);
       kernel.resources.invalidate(MODEL_READINESS_PATH, revision);
       kernel.resources.invalidate(MODEL_STUDY_PATH, revision);
@@ -952,6 +1066,7 @@ export function useStudyInspectorPanelController(
       dispatch({ type: "acceptStageDrafts" });
       return true;
     } catch (error) {
+      if (mutationContext.isCurrentSessionScope() === false) return false;
       if (
         error instanceof ControlRoomApiError &&
         (error.status === 409 ||
@@ -987,8 +1102,8 @@ export function useStudyInspectorPanelController(
     }
   };
   const commitGlobalDraft = async () => {
-    const baseRevision = numericSceneRevision(sceneRevision);
-    if (baseRevision === null) {
+    const currentScene = await readAuthoritativeScene();
+    if (currentScene === null) {
       dispatch({
         type: "setAuthoringFeedback",
         scope: "global",
@@ -1000,11 +1115,14 @@ export function useStudyInspectorPanelController(
       });
       return false;
     }
+    const baseRevision = currentScene.revision;
+    const profileBound = hasStudyExecutionProfile(currentScene.scene);
     const errors = validateStudyGlobalDraft(state.globalDraft, {
       activeLane: runtimeStatus?.capabilities.active_lane ?? null,
       algorithmsAvailable: runtimeStatus?.capabilities.algorithms_available,
-      magneticObjectCount: sceneMagneticObjectCount,
-      magneticObjectIds: sceneMagneticObjectIds,
+      executionProfileBound: profileBound,
+      magneticObjectCount: magneticObjectCount(currentScene.scene),
+      magneticObjectIds: magneticObjectIds(currentScene.scene),
       sessionDiscretization: runtimeStatus?.domain.discretization,
     }).filter(
       (issue) => issue.severity === "error",
@@ -1021,40 +1139,81 @@ export function useStudyInspectorPanelController(
       return false;
     }
 
+    const mutationContext = createAuthoringMutationContext(currentScene.scene);
     dispatch({ type: "setAuthoringBusy", busy: true });
     try {
-      const response = await kernel.api.model.commitTransaction(
-        buildStudyGlobalMergePatch(state.globalDraft, {
-          baseRevision,
-          sessionDiscretization: runtimeStatus?.domain.discretization,
-        }),
+      const response = await runAuthoringMutationWithHistory(
+        mutationContext,
+        "Edit global study settings",
+        () => kernel.api.model.commitTransaction(
+          buildStudyGlobalMergePatch(state.globalDraft, {
+            baseRevision,
+            executionProfileBound: profileBound,
+            sessionDiscretization: runtimeStatus?.domain.discretization,
+          }),
+          sessionScopeKey ? { sessionScopeKey } : undefined,
+        ),
       );
+      if (mutationContext.isCurrentSessionScope() === false) return false;
       const revision = response.scene_revision;
+      acknowledgedSceneRevisionRef.current = revision;
       kernel.resources.invalidate(MODEL_SCENE_PATH, revision);
       kernel.resources.invalidate(MODEL_READINESS_PATH, revision);
       kernel.resources.invalidate(MODEL_STUDY_PATH, revision);
       kernel.resources.invalidate(SESSION_STATUS_RESOURCE_KEY, revision);
       kernel.resources.invalidate(SIMULATION_STAGES_EXECUTION_PATH, revision);
       kernel.resources.invalidate(SIMULATION_COMMANDS_PATH, revision);
-      if (
-        isExplicitFdmStudy({
-          requestedBackend: state.globalDraft.requestedBackend,
-          sessionDiscretization: runtimeStatus?.domain.discretization,
-        })
-      ) {
+      const explicitFdm = isExplicitFdmStudy({
+        requestedBackend: profileBound
+          ? null
+          : state.globalDraft.requestedBackend,
+        sessionDiscretization: runtimeStatus?.domain.discretization,
+      });
+      if (explicitFdm) {
         invalidateFdmGridResources(kernel.resources, revision);
       }
+      let feedbackKind: "success" | "warning" | "error" = "success";
+      let feedbackMessage = "Committed global study settings.";
+      if (explicitFdm) {
+        try {
+          const result = await runFdmGridRefreshOperation(commandContext, {
+            kind: "fdm_grid_refresh",
+            reason: "study_global_commit",
+            precondition: { scene_revision: revision },
+          });
+          if (result.status === "completed") {
+            feedbackMessage = "Committed global study settings. FDM grid replan completed; magnetization was reinitialized from the model.";
+          } else if (result.status === "failed") {
+            feedbackKind = "error";
+            feedbackMessage =
+              result.message ??
+              "Global study settings were saved, but the FDM grid replan failed.";
+          } else {
+            feedbackKind = "warning";
+            feedbackMessage =
+              result.message ??
+              "Global study settings were saved. FDM grid replan remains active; see Mesh Jobs.";
+          }
+        } catch (error) {
+          feedbackKind = "warning";
+          feedbackMessage = `Global study settings were saved, but the FDM grid replan could not be submitted: ${
+            error instanceof Error ? error.message : "unknown command error"
+          }`;
+        }
+      }
+      if (mutationContext.isCurrentSessionScope() === false) return false;
       dispatch({
         type: "setAuthoringFeedback",
         scope: "global",
         feedback: {
-          kind: "success",
-          message: "Committed global study settings.",
+          kind: feedbackKind,
+          message: feedbackMessage,
         },
       });
       dispatch({ type: "acceptGlobalDraft" });
       return true;
     } catch (error) {
+      if (mutationContext.isCurrentSessionScope() === false) return false;
       if (
         error instanceof ControlRoomApiError &&
         (error.status === 409 ||
@@ -1090,6 +1249,107 @@ export function useStudyInspectorPanelController(
     }
   };
 
+  const commitExecutionProfile = async (
+    assignment: StudyExecutionProfileAssignment,
+    baseRevision: number,
+  ) => {
+    if (state.authoringBusy) {
+      return {
+        success: false,
+        message: "Another Study authoring transaction is still in progress.",
+      };
+    }
+    const currentScene = await readAuthoritativeScene();
+    if (!currentScene) {
+      return {
+        success: false,
+        message: "Could not read the current scene. The profile draft was preserved.",
+      };
+    }
+    if (currentScene.revision !== baseRevision) {
+      return {
+        stale: true,
+        success: false,
+        message:
+          "The scene revision changed while this draft was open. The draft was preserved; cancel to load the current scene.",
+      };
+    }
+    if (
+      assignment.execution_profile !== null &&
+      hasChangeDeviceStudyStage(currentScene.scene, [
+        ...rawStudyStages(currentScene.scene),
+        ...state.stageDrafts,
+      ])
+    ) {
+      return {
+        success: false,
+        message:
+          "A Change device stage cannot be combined with an execution profile. Remove the stage and save that change first, or clear the profile.",
+      };
+    }
+
+    const mutationContext = createAuthoringMutationContext(currentScene.scene);
+    dispatch({ type: "setAuthoringBusy", busy: true });
+    try {
+      const response = await runAuthoringMutationWithHistory(
+        mutationContext,
+        "Assign Study execution profile",
+        () => kernel.api.model.commitTransaction(
+          buildStudyExecutionProfileAssignmentMergePatch(
+            assignment,
+            baseRevision,
+          ),
+          sessionScopeKey ? { sessionScopeKey } : undefined,
+        ),
+      );
+      if (mutationContext.isCurrentSessionScope() === false) {
+        return {
+          success: false,
+          message: "The active session changed. The profile draft was preserved.",
+        };
+      }
+      const revision = response.scene_revision;
+      acknowledgedSceneRevisionRef.current = revision;
+      kernel.resources.invalidate(MODEL_SCENE_PATH, revision);
+      kernel.resources.invalidate(MODEL_READINESS_PATH, revision);
+      kernel.resources.invalidate(MODEL_STUDY_PATH, revision);
+      kernel.resources.invalidate(SESSION_STATUS_RESOURCE_KEY, revision);
+      kernel.resources.invalidate(SIMULATION_STAGES_EXECUTION_PATH, revision);
+      kernel.resources.invalidate(SIMULATION_COMMANDS_PATH, revision);
+      return { revision, success: true };
+    } catch (error) {
+      if (mutationContext.isCurrentSessionScope() === false) {
+        return {
+          success: false,
+          message: "The active session changed. The profile draft was preserved.",
+        };
+      }
+      if (
+        error instanceof ControlRoomApiError &&
+        (error.status === 409 ||
+          error.code === "revision_conflict" ||
+          error.code === "scene_revision_conflict")
+      ) {
+        scene.refetch();
+        return {
+          stale: true,
+          success: false,
+          message:
+            "Scene revision conflict. The canonical scene was refreshed; this profile draft was preserved for review and retry.",
+        };
+      }
+      return {
+        success: false,
+        message:
+          error instanceof Error
+            ? error.message
+            : "Failed to assign the Study execution profile. The draft was preserved.",
+      };
+    } finally {
+      dispatch({ type: "setAuthoringBusy", busy: false });
+    }
+  };
+
   return {
     activeStageIndex,
     checkpointCatalog,
@@ -1097,6 +1357,7 @@ export function useStudyInspectorPanelController(
     commandDetail,
     commandDisabledReason,
     commitGlobalDraft,
+    commitExecutionProfile,
     commitStageDrafts,
     currentRun,
     dispatch,
@@ -1113,6 +1374,7 @@ export function useStudyInspectorPanelController(
     sceneMagneticObjectCount,
     sceneRevision,
     sceneStageCount,
+    sessionScopeKey,
     selectedRestoreCheckpoint,
     snapshot,
     solverStatus,
@@ -1129,6 +1391,7 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
     commandDetail,
     commandDisabledReason,
     commitGlobalDraft,
+    commitExecutionProfile,
     commitStageDrafts,
     currentRun,
     dispatch,
@@ -1145,16 +1408,45 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
     sceneMagneticObjectCount,
     sceneRevision,
     sceneStageCount,
+    sessionScopeKey,
     selectedRestoreCheckpoint,
     snapshot,
     solverStatus,
     stageExecution,
     state,
   } = useStudyInspectorPanelController(selection);
+  const profileEditSessionRef = useRef<StudyExecutionProfileEditSession | null>(null);
+  const [profileEditState, setProfileEditState] = useState({
+    dirty: false,
+    profileBound: false,
+    valid: true,
+  });
+  const onProfileEditSessionChange = useCallback(
+    (session: StudyExecutionProfileEditSession | null) => {
+      profileEditSessionRef.current = session;
+      const next = session
+        ? {
+            dirty: session.dirty,
+            profileBound: session.profileBound,
+            valid: session.valid,
+          }
+        : { dirty: false, profileBound: false, valid: true };
+      setProfileEditState((current) =>
+        current.dirty === next.dirty &&
+        current.profileBound === next.profileBound &&
+        current.valid === next.valid
+          ? current
+          : next,
+      );
+    },
+    [],
+  );
   const sceneMagneticObjectIds = magneticObjectIds(scene.data);
   const globalValidation = validateStudyGlobalDraft(state.globalDraft, {
     activeLane: runtimeStatus?.capabilities.active_lane ?? null,
     algorithmsAvailable: runtimeStatus?.capabilities.algorithms_available,
+    executionProfileBound:
+      hasStudyExecutionProfile(scene.data) || profileEditState.profileBound,
     magneticObjectCount: sceneMagneticObjectCount,
     magneticObjectIds: sceneMagneticObjectIds,
     sessionDiscretization: runtimeStatus?.domain.discretization,
@@ -1179,24 +1471,35 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
   const stagesDirty =
     JSON.stringify(state.stageDrafts) !== JSON.stringify(state.baselineStageDrafts);
   const applyInspectorDraft = useCallback(async () => {
+    if (profileEditState.dirty) {
+      if (globalDirty || stagesDirty) return false;
+      return (await profileEditSessionRef.current?.apply()) === true;
+    }
     if (globalDirty && !(await commitGlobalDraft())) return false;
     if (stagesDirty && !(await commitStageDrafts())) return false;
     return true;
-  }, [commitGlobalDraft, commitStageDrafts, globalDirty, stagesDirty]);
+  }, [commitGlobalDraft, commitStageDrafts, globalDirty, profileEditState.dirty, stagesDirty]);
   const resetInspectorDraft = useCallback(() => {
     dispatch({ type: "revertGlobalDraft" });
     dispatch({ type: "revertStageDrafts" });
+    profileEditSessionRef.current?.reset();
   }, [dispatch]);
   useRegisterInspectorEditSession(
     "staged",
     state.authoringBusy,
-    globalDirty || stagesDirty,
+    globalDirty || stagesDirty || profileEditState.dirty,
     ![...globalValidation, ...stageValidation].some(
       (issue) => issue.severity === "error",
-    ),
+    ) && profileEditState.valid,
     state.authoringBusy ? "Study changes are being saved." : undefined,
     applyInspectorDraft,
     resetInspectorDraft,
+    {
+      applyBlockReason: profileEditState.dirty && (globalDirty || stagesDirty)
+        ? "Apply or cancel the execution profile first, then save the other Study edits."
+        : undefined,
+      historyMode: "mutation-owned",
+    },
   );
 
   return (
@@ -1221,6 +1524,9 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
           }
         />
 
+        <ProjectRunsSection />
+        <ProjectBatchesSection />
+
         <StudySelectedStageSection
           model={model}
           stageExecutionRevision={stageExecution.data?.revision ?? null}
@@ -1236,6 +1542,10 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
               : null
           }
           draft={state.globalDraft}
+          executionProfileBound={
+            hasStudyExecutionProfile(scene.data) || profileEditState.profileBound
+          }
+          executionProfileDraftDirty={profileEditState.dirty}
           model={model}
           magneticObjectCount={sceneMagneticObjectCount}
           magneticObjectIds={sceneMagneticObjectIds}
@@ -1250,6 +1560,18 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
           }
         />
 
+        <StudyExecutionProfileSection
+          authoringBusy={state.authoringBusy}
+          otherAuthoringDirty={globalDirty || stagesDirty}
+          scene={scene.data}
+          sceneRevision={sceneRevision}
+          sceneStatus={scene.status}
+          sessionScopeKey={sessionScopeKey}
+          stages={[...rawStudyStages(scene.data), ...state.stageDrafts]}
+          onApply={commitExecutionProfile}
+          onEditSessionChange={onProfileEditSessionChange}
+        />
+
         <StudyPipelineSection
           activeStageIndex={activeStageIndex}
           activeLane={runtimeStatus?.capabilities.active_lane ?? null}
@@ -1262,6 +1584,10 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
           }
           commandDisabledReason={commandDisabledReason}
           demagEnabled={state.globalDraft.demagEnabled}
+          executionProfileBound={
+            hasStudyExecutionProfile(scene.data) || profileEditState.profileBound
+          }
+          executionProfileDraftDirty={profileEditState.dirty}
           k0ModalReadinessFor={k0ModalReadinessFor}
           draft={state.stageDrafts[state.selectedDraftIndex] ?? null}
           draftIndex={state.selectedDraftIndex}
@@ -1728,6 +2054,8 @@ export function StudyBoundarySection({
   authoringBusy,
   authoringFeedback,
   draft,
+  executionProfileBound = false,
+  executionProfileDraftDirty = false,
   magneticObjectIds: _magneticObjectIds,
   model,
   magneticObjectCount,
@@ -1748,6 +2076,8 @@ export function StudyBoundarySection({
     message: string;
   } | null;
   draft: StudyGlobalDraft;
+  executionProfileBound?: boolean;
+  executionProfileDraftDirty?: boolean;
   magneticObjectIds?: readonly string[];
   model: StudyInspectorModel;
   magneticObjectCount?: number;
@@ -1760,15 +2090,18 @@ export function StudyBoundarySection({
   sceneStatus?: string;
   snapshot: StudyInspectorSnapshot;
 }) {
+  const laneRequestedBackend = executionProfileBound
+    ? null
+    : draft.requestedBackend;
   const explicitFdm = isExplicitFdmStudy({
-    requestedBackend: draft.requestedBackend,
+    requestedBackend: laneRequestedBackend,
     requestedDiscretization,
     sessionDiscretization,
   });
   const demagRealization = normalizeDemagRealizationForLane(
     draft.demagRealization,
     {
-      requestedBackend: draft.requestedBackend,
+      requestedBackend: laneRequestedBackend,
       requestedDiscretization,
       sessionDiscretization,
     },
@@ -1788,6 +2121,7 @@ export function StudyBoundarySection({
   const validation = validateStudyGlobalDraft(draft, {
     activeLane,
     algorithmsAvailable,
+    executionProfileBound,
     magneticObjectCount,
     magneticObjectIds: _magneticObjectIds,
     requestedDiscretization,
@@ -1800,12 +2134,13 @@ export function StudyBoundarySection({
     : null;
   const gridApplyDisabled =
     authoringBusy ||
+    executionProfileDraftDirty ||
     hasErrors ||
     (sceneStatus !== undefined && sceneStatus !== "ready");
   return (
     <InspectorGroup
       title="Global Study Settings"
-      badge={snapshot.requested.backend}
+      badge={executionProfileBound ? "Profile bound" : snapshot.requested.backend}
     >
       <FieldRow label="Current exchange" value={model.boundary.exchangeEnabled} />
       <FieldRow label="Current demag term" value={model.boundary.demagEnabled} />
@@ -1821,7 +2156,19 @@ export function StudyBoundarySection({
         }
       />
       <FieldRow label="Current CPU threads" value={model.requested.cpuThreads} />
+      {executionProfileBound ? (
+        <p role="status">
+          An immutable execution profile is bound. Legacy backend, device, precision, mode, and CPU thread fields are inactive; edit them in Study Execution Profile.
+        </p>
+      ) : null}
+      {executionProfileDraftDirty ? (
+        <FeedbackBanner
+          kind="warning"
+          message="Apply or cancel the Study execution profile draft before saving global Study settings."
+        />
+      ) : null}
       <FormField
+        disabled={executionProfileBound}
         label="Backend"
         type="select"
         value={draft.requestedBackend}
@@ -1835,6 +2182,7 @@ export function StudyBoundarySection({
         <option value="hybrid">Hybrid</option>
       </FormField>
       <FormField
+        disabled={executionProfileBound}
         label="Device"
         type="select"
         value={draft.requestedDevice}
@@ -1845,6 +2193,7 @@ export function StudyBoundarySection({
         <option value="gpu">GPU</option>
       </FormField>
       <FormField
+        disabled={executionProfileBound}
         label="Precision"
         type="select"
         value={draft.requestedPrecision}
@@ -1856,6 +2205,7 @@ export function StudyBoundarySection({
         <option value="single">Single</option>
       </FormField>
       <FormField
+        disabled={executionProfileBound}
         label="Mode"
         type="select"
         value={draft.requestedMode}
@@ -1866,6 +2216,7 @@ export function StudyBoundarySection({
         <option value="hybrid">Hybrid</option>
       </FormField>
       <FormField
+        disabled={executionProfileBound}
         label="CPU threads"
         hint="Blank keeps automatic runtime thread selection."
         value={draft.requestedCpuThreads}
@@ -1960,7 +2311,7 @@ export function StudyBoundarySection({
             )}
             <FieldRow
               label="Topology after Apply Grid"
-              value={sceneStatus === "ready" ? "stale until the next FDM realization" : "waiting for current scene"}
+              value={sceneStatus === "ready" ? "queued for the next FDM realization" : "waiting for current scene"}
             />
           </InspectorGroup>
           <FormField
@@ -2095,7 +2446,9 @@ export function StudyBoundarySection({
           disabled={gridApplyDisabled}
           size="sm"
           title={
-            hasErrors
+            executionProfileDraftDirty
+              ? "Apply or cancel the Study execution profile draft first."
+              : hasErrors
               ? "Fix global study validation errors before applying the grid."
               : explicitFdm
                 ? "Apply the FDM grid policy to the canonical scene"

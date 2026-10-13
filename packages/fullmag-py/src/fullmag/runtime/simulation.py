@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -28,6 +29,7 @@ class StepStats:
     mz: float = 0.0
     e_ani: float = 0.0
     e_dmi: float = 0.0
+    e_rotated_dmi: float = 0.0
     max_h_demag: float = 0.0
     max_torque_Apm: float = 0.0
     max_torque_T: float = 0.0
@@ -158,7 +160,16 @@ class Simulation:
             ],
         )
 
-    def run(self, *, until: float | None = None, output_dir: str | None = None) -> Result:
+    def run(
+        self,
+        *,
+        until: float | None = None,
+        output_dir: str | None = None,
+        temp_dir: str | None = None,
+        data_format: str | None = None,
+        cleanup: str | None = None,
+        existing_output: str | None = None,
+    ) -> Result:
         """Run the simulation through the reference engine.
 
         For Phase 1, the executable FDM subset supports Box + LLG with
@@ -167,7 +178,11 @@ class Simulation:
 
         Args:
             until: Simulation stop time in seconds. Required for execution.
-            output_dir: Directory for artifact output. Defaults to 'run_output'.
+            output_dir: Explicit result directory override; otherwise use study.storage or the script-derived default.
+            temp_dir: Optional parent for private run scratch, never removed itself.
+            data_format: Optional 'zarr' or 'hdf5' override.
+            cleanup: Optional private-scratch cleanup policy.
+            existing_output: Optional collision policy for a pre-existing result path.
         """
         if until is None:
             return Result(
@@ -179,9 +194,18 @@ class Simulation:
             )
 
         ir = self.to_ir()
+        _attach_direct_script_storage_source(ir)
 
         # Try the native runner
-        run_result = run_problem_json(ir, until, output_dir)
+        run_result = run_problem_json(
+            ir,
+            until,
+            output_dir,
+            temp_dir=temp_dir,
+            data_format=data_format,
+            temp_cleanup=cleanup,
+            existing_output=existing_output,
+        )
 
         if run_result is None:
             # Native core not available — fall back to planning-only
@@ -196,13 +220,40 @@ class Simulation:
                 ],
             )
 
+        resolved_storage = run_result.get("resolved_output_storage")
+        resolved_output_dir = (
+            resolved_storage.get("output_dir")
+            if isinstance(resolved_storage, Mapping)
+            else None
+        )
         return result_from_run_payload(
             run_result,
             backend=self.backend,
             mode=self.mode,
             precision=self.precision,
-            output_dir=output_dir or "run_output",
+            output_dir=resolved_output_dir or output_dir,
         )
+
+
+def _attach_direct_script_storage_source(ir: dict[str, object]) -> None:
+    problem_meta = ir.get("problem_meta")
+    if not isinstance(problem_meta, dict):
+        return
+    runtime_metadata = problem_meta.get("runtime_metadata")
+    if not isinstance(runtime_metadata, dict):
+        runtime_metadata = {}
+        problem_meta["runtime_metadata"] = runtime_metadata
+    if "output_storage_source_dir" in runtime_metadata:
+        return
+
+    main_module = sys.modules.get("__main__")
+    source_file = getattr(main_module, "__file__", None)
+    if isinstance(source_file, str) and source_file.strip():
+        source_path = Path(source_file).expanduser().resolve()
+        runtime_metadata["output_storage_source_dir"] = str(source_path.parent)
+        runtime_metadata["output_storage_source_stem"] = source_path.stem
+    else:
+        runtime_metadata["output_storage_source_dir"] = str(Path.cwd().resolve())
 
 
 def result_from_run_payload(
@@ -234,6 +285,7 @@ def result_from_run_payload(
                 mz=s.get("mz", 0.0),
                 e_ani=s.get("e_ani", 0.0),
                 e_dmi=s.get("e_dmi", 0.0),
+                e_rotated_dmi=s.get("e_rotated_dmi", 0.0),
                 max_h_demag=s.get("max_h_demag", 0.0),
                 max_torque_Apm=s.get("max_torque_Apm", 0.0),
                 max_torque_T=s.get("max_torque_T", 0.0),
@@ -298,6 +350,7 @@ _SCALAR_QUANTITY_ALIASES: Mapping[str, str] = {
     "e_ext": "e_ext",
     "e_ani": "e_ani",
     "e_dmi": "e_dmi",
+    "e_rotated_dmi": "e_rotated_dmi",
     "e_total": "e_total",
     "mx": "mx",
     "my": "my",
@@ -315,6 +368,9 @@ _SCALAR_QUANTITY_DESCRIPTORS: Mapping[str, ScalarQuantityDescriptor] = {
     "e_ext": ScalarQuantityDescriptor("e_ext", "External Energy", "J", "e_ext"),
     "e_ani": ScalarQuantityDescriptor("e_ani", "Anisotropy Energy", "J", "e_ani"),
     "e_dmi": ScalarQuantityDescriptor("e_dmi", "DMI Energy", "J", "e_dmi"),
+    "e_rotated_dmi": ScalarQuantityDescriptor(
+        "e_rotated_dmi", "Rotated DMI Energy", "J", "e_rotated_dmi"
+    ),
     "e_total": ScalarQuantityDescriptor("e_total", "Total Energy", "J", "e_total"),
     "mx": ScalarQuantityDescriptor("m", "m_x avg", "dimensionless", "mx", kind="derived"),
     "my": ScalarQuantityDescriptor("m", "m_y avg", "dimensionless", "my", kind="derived"),
@@ -332,6 +388,7 @@ _SCALAR_QUANTITY_ORDER: tuple[str, ...] = (
     "e_ext",
     "e_ani",
     "e_dmi",
+    "e_rotated_dmi",
     "e_total",
     "mx",
     "my",

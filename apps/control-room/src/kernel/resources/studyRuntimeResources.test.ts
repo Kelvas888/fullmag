@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync as readSourceFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
@@ -165,6 +165,11 @@ const FREQUENCY_DOMAIN_MANIFEST = {
 
 const studyRuntimeResourcesUrl = new URL("./studyRuntimeResources.ts", import.meta.url);
 
+// Source-contract assertions use "\n" fragments; normalize CRLF checkouts.
+function readFileSync(url: URL, encoding: "utf8"): string {
+  return readSourceFileSync(url, encoding).replace(/\r\n/g, "\n");
+}
+
 const baseResources: LiveStatusResource["resources"] = {
   artifact_revision: 0,
   artifacts_revision: 0,
@@ -246,6 +251,7 @@ function statusWith({
       name: "Test session",
       session_epoch:
         sessionEpoch ?? `${sessionId}@2026-05-29T00:00:00.000Z`,
+      request_scope_epoch: `test-api:${sessionId}`,
       session_id: sessionId,
       workspace_root: "/tmp/fullmag-test",
     },
@@ -591,6 +597,82 @@ describe("study runtime command resource bundles", () => {
     expect(hookSource).toContain("resourceKey");
   });
 
+  it("scopes simulation and checkpoint resources to the active session", () => {
+    const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
+    const simulationHooks = source.slice(
+      source.indexOf("export function useCommandQueueResource"),
+      source.indexOf("export function useArtifactsResource"),
+    );
+    const checkpointHooks = source.slice(
+      source.indexOf("export function useCheckpointCatalogResource"),
+      source.indexOf("export function useEngineLogResource"),
+    );
+
+    expect(source).toContain(
+      'import { useSessionScopedResourceKey } from "./useSessionScopedResourceKey"',
+    );
+    expect(simulationHooks).toContain(
+      "useSessionScopedResourceKey(\n    SIMULATION_COMMANDS_PATH",
+    );
+    expect(simulationHooks).toContain(
+      "enabled: Boolean(commandId) && sessionIdentity !== null",
+    );
+    expect(simulationHooks).toContain(
+      "enabled: enabled && Boolean(runId) && sessionIdentity !== null",
+    );
+    expect(checkpointHooks).toContain(
+      "useSessionScopedResourceKey(\n    PERSISTENCE_CHECKPOINTS_PATH",
+    );
+    expect(checkpointHooks).toContain(
+      "enabled: Boolean(checkpointId) && sessionIdentity !== null",
+    );
+  });
+
+  it("scopes field, scalar and table data resources to the active session", () => {
+    const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
+    const dataHooks = source.slice(
+      source.indexOf("export function useArtifactsResource"),
+      source.indexOf("export function useCheckpointCatalogResource"),
+    );
+
+    expect(dataHooks).toContain("useSessionScopedResourceKey");
+    expect(dataHooks).toContain("unscopedResourceKey");
+    expect(dataHooks).toContain("enabled: enabled && sessionIdentity !== null");
+    expect(dataHooks).toContain("#binary");
+    expect(dataHooks).toContain("DATA_FIELDS_PATH");
+    // Row hooks derive their unscoped key through the shared helper, which
+    // is the single place that expands DATA_TABLE_ROWS_PATH.
+    expect(dataHooks).toContain("tableRowsResourceKey(");
+    expect(source).toContain(
+      "DATA_TABLE_ROWS_PATH.replace(\"{table_id}\", tableId)",
+    );
+  });
+
+  it("uses one session-scoped wrapper for analysis and diagnostics families", () => {
+    const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
+    const analysisHooks = source.slice(
+      source.indexOf("export function useHysteresisPointsResource"),
+      source.indexOf("export function useFieldCatalogResource"),
+    );
+    const diagnosticsHooks = source.slice(
+      source.indexOf("export function useEngineLogResource"),
+      source.indexOf("export function useModelReadinessResource"),
+    );
+
+    expect(source).toContain("function useSessionScopedResource<TData>");
+    expect(source).toContain(
+      "enabled: enabled && sessionIdentity !== null",
+    );
+    expect(analysisHooks).toContain("useSessionScopedResource<");
+    expect(diagnosticsHooks).toContain("useSessionScopedResource<");
+    expect(diagnosticsHooks).toContain(
+      "resourceKey: DIAGNOSTICS_ENGINE_LOG_PATH",
+    );
+    expect(diagnosticsHooks).toContain(
+      "resourceKey: DIAGNOSTICS_SOLVER_PROFILE_PATH",
+    );
+  });
+
   it("exposes the magnetic response sweep artifact as an optional runtime resource", () => {
     const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
     const hookSource = source.slice(
@@ -604,6 +686,23 @@ describe("study runtime command resource bundles", () => {
     expect(hookSource).toContain(
       "resourceKey: ANALYSIS_FREQUENCY_RESPONSE_MAGNETIC_SWEEP_V1_PATH",
     );
+  });
+
+  it("keeps CPU and GPU telemetry global to the host", () => {
+    const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
+    const gpuHook = source.slice(
+      source.indexOf("export function useGpuTelemetryResource"),
+      source.indexOf("export function useCpuTelemetryResource"),
+    );
+    const cpuHook = source.slice(
+      source.indexOf("export function useCpuTelemetryResource"),
+      source.indexOf("export function useSolverProfileResource"),
+    );
+
+    expect(gpuHook).toContain("return useResource<GpuTelemetryResource>");
+    expect(cpuHook).toContain("return useResource<CpuTelemetryResource>");
+    expect(gpuHook).not.toContain("useSessionScopedResource");
+    expect(cpuHook).not.toContain("useSessionScopedResource");
   });
 
   it("exposes the frequency-domain family manifest as a revision-gated analysis resource", () => {
@@ -719,8 +818,9 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<MeshPeriodicPairsResource>",
     );
     expect(hookSource).toContain(
-      "resourceKey: MESHING_PERIODIC_PAIRS_PATH",
+      "useSessionScopedResourceKey(\n    MESHING_PERIODIC_PAIRS_PATH",
     );
+    expect(hookSource).toContain("resourceKey,");
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
     );
@@ -923,7 +1023,9 @@ describe("study runtime command resource bundles", () => {
     expect(hookSource).toContain(
       "ignoreMissingResource<HysteresisPointsResource>",
     );
-    expect(hookSource).toContain("useResource<HysteresisPointsResource | null>");
+    expect(hookSource).toContain(
+      "useSessionScopedResource<HysteresisPointsResource | null>",
+    );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
     );
@@ -941,7 +1043,9 @@ describe("study runtime command resource bundles", () => {
     expect(hookSource).toContain(
       "ignoreMissingResource<HysteresisMetricsResource>",
     );
-    expect(hookSource).toContain("useResource<HysteresisMetricsResource | null>");
+    expect(hookSource).toContain(
+      "useSessionScopedResource<HysteresisMetricsResource | null>",
+    );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
     );
@@ -960,7 +1064,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisSaturationResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisSaturationResource | null>",
+      "useSessionScopedResource<HysteresisSaturationResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
@@ -980,7 +1084,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisAdaptiveRefinementResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisAdaptiveRefinementResource | null>",
+      "useSessionScopedResource<HysteresisAdaptiveRefinementResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
@@ -1000,7 +1104,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisBranchesResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisBranchesResource | null>",
+      "useSessionScopedResource<HysteresisBranchesResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
@@ -1020,7 +1124,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisMinorLoopsResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisMinorLoopsResource | null>",
+      "useSessionScopedResource<HysteresisMinorLoopsResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
@@ -1040,7 +1144,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisReversalFieldsResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisReversalFieldsResource | null>",
+      "useSessionScopedResource<HysteresisReversalFieldsResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
@@ -1060,7 +1164,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisSettleTraceResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisSettleTraceResource | null>",
+      "useSessionScopedResource<HysteresisSettleTraceResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",

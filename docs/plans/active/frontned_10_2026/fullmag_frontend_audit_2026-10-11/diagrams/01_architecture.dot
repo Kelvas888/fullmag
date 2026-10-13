@@ -1,0 +1,26 @@
+digraph G {
+graph [bgcolor="#f7f9fc", fontname="DejaVu Sans", fontsize=20, fontcolor="#182e47", labelloc=t, labeljust=l, pad=0.4, nodesep=0.4, ranksep=0.7, splines=polyline, dpi=130];
+node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12, fillcolor="#e6edf5", color="#adc1d7", fontcolor="#142941", penwidth=1.2, margin="0.19,0.15"];
+edge [fontname="DejaVu Sans", fontsize=10, color="#6e89a7", fontcolor="#415c78", arrowsize=0.75, penwidth=1.2];
+rankdir=TB;
+label="D01 / TARGET AUTHORING ARCHITECTURE\nOne edit session, multiple views; committed model stays authoritative";
+subgraph cluster_ui {label="CLIENT / existing Control Room shell and kernel"; style="rounded,dashed"; color="#aec2d6"; fontcolor="#526b85";
+{rank=same; inspector [label="Inspector\nRaw fields + validation"]; gizmo [label="Gizmo / Type-in\nOne gestureId per intent"]; ribbon [label="Ribbon / Explorer\nShared command registry"];}
+draft [label="ObjectEditSession\nscope + target + draft + operation identity\nbaseline + local patch + phase",fillcolor="#cceae7",color="#5caaa1"];
+preview [label="Derived preview\nGeometry LOD + draft transform\nNever a backend model write"];
+command [label="Authoring command\nsession fence + expected revision\nintent ID + semantic history",fillcolor="#d4e5f7",color="#6f99c4"];
+inspector -> draft [dir=both,label="shared state"]; gizmo -> draft [dir=both];ribbon -> command;
+draft -> preview [label="local only"];draft -> command [label="Apply / gesture commit"];
+}
+server [label="CANONICAL BACKEND\nValidate + atomic commit + scene revision\nCommitted / conflict / rejection",fillcolor="#1d405f",fontcolor="white",color="#1d405f"];
+command -> server [label="one commit intent"];
+server -> draft [label="ACK: replace baseline only\nfor matching operation",color="#359583",constraint=false];
+scene [label="Committed scene resource\nGeometry + semantic assignments"];
+recipe [label="Mesh policy / recipe\nRequested and effective values"];
+job [label="Build pipeline\nTarget + provenance + intent ID"];
+artifact [label="Published mesh artifact\nmeshId + generation + source identity",fillcolor="#d5eada",color="#80ad8b"];
+view [label="Mesh / quality / selection\nSame artifact identity\nRender-only controls"];
+server -> scene;scene -> job;recipe -> job;job -> artifact;artifact -> view;
+scene -> preview [label="committed base",constraint=false];
+{rank=same;scene;recipe;}
+}

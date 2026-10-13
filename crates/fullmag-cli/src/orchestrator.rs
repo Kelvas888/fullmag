@@ -1,9 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use fullmag_ir::{
-    BackendPlanIR, BackendTarget, DiscretizationHintsIR, DynamicsIR, ExecutionPlanIR, FemHintsIR,
-    GeometryEntryIR, MagnetIR, MaterialIR, ObjectRegionIR, ProblemIR, RegionIR,
-    RelaxationAlgorithmIR, StudyIR,
+    AutosaveFormatIR, BackendPlanIR, BackendTarget, DiscretizationHintsIR, DynamicsIR,
+    ExecutionPlanIR, FdmHintsIR, FemHintsIR, GeometryEntryIR, MagnetIR, MaterialIR, ObjectRegionIR,
+    OutputDataFormatIR, OutputStorageIR, ProblemIR, RegionIR, RelaxationAlgorithmIR, StudyIR,
 };
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -27,6 +27,9 @@ use crate::simulation_preparation::{
 use crate::step_utils::*;
 use crate::types::*;
 
+mod manual_remesh;
+use manual_remesh::execute_manual_interactive_remesh;
+
 // ── helpers local to the orchestrator ────────────────────────────────────────
 
 const FEM_FREQUENCY_RESPONSE_PROGRESS_KEY: &str = "fem_frequency_response_progress";
@@ -41,12 +44,194 @@ const DEFERRED_DOMAIN_COMPLETION_DETAIL: &str =
 const DEFERRED_MESH_COMPLETION_DETAIL: &str =
     "Mesh completed during deferred materialization; timing unavailable";
 
+struct ScriptOutputStorageLease {
+    lease: Option<fullmag_runner::project_storage::ProjectStorageLease>,
+}
+
+impl ScriptOutputStorageLease {
+    fn new(lease: fullmag_runner::project_storage::ProjectStorageLease) -> Self {
+        Self { lease: Some(lease) }
+    }
+
+    fn resolved(&self) -> &fullmag_runner::project_storage::ResolvedOutputStorage {
+        self.lease
+            .as_ref()
+            .expect("script storage lease is active")
+            .resolved()
+    }
+
+    fn finish(&mut self, success: bool) -> Result<()> {
+        let Some(mut lease) = self.lease.take() else {
+            bail!("script storage lease is already finalized");
+        };
+        lease
+            .finish(success)
+            .map_err(|error| anyhow!("failed to finalize project output storage: {error}"))
+    }
+}
+
+fn collect_authored_output_storage(
+    config: &ScriptExecutionConfig,
+) -> Result<Option<OutputStorageIR>> {
+    let mut candidates = Vec::new();
+    for problem in std::iter::once(&config.ir).chain(config.stages.iter().map(|stage| &stage.ir)) {
+        if let Some(value) = problem.problem_meta.runtime_metadata.get("output_storage") {
+            candidates.push(
+                serde_json::from_value::<OutputStorageIR>(value.clone())
+                    .context("invalid output_storage metadata")?,
+            );
+        }
+    }
+    let Some(first) = candidates.first().cloned() else {
+        return Ok(None);
+    };
+    if candidates.iter().any(|candidate| candidate != &first) {
+        bail!("script stages declare conflicting output_storage policies");
+    }
+    Ok(Some(first))
+}
+
+fn explicit_stage_output_format(problem: &ProblemIR) -> Option<OutputDataFormatIR> {
+    match problem.study.sampling().stage_autosave.as_ref()?.format {
+        AutosaveFormatIR::Zarr => Some(OutputDataFormatIR::Zarr),
+        AutosaveFormatIR::Hdf5 => Some(OutputDataFormatIR::Hdf5),
+        AutosaveFormatIR::Txt => None,
+    }
+}
+
+fn prepare_script_output_storage(
+    config: &mut ScriptExecutionConfig,
+    args: &ScriptCli,
+    script_path: &Path,
+    run_id: &str,
+) -> Result<(ScriptOutputStorageLease, OutputStorageIR, serde_json::Value)> {
+    let authored = collect_authored_output_storage(config)?;
+    let mut settings = authored.clone().unwrap_or_default();
+    if authored.is_none() && args.data_format.is_none() {
+        let mut stage_formats = std::iter::once(&config.ir)
+            .chain(config.stages.iter().map(|stage| &stage.ir))
+            .filter_map(explicit_stage_output_format);
+        if let Some(format) = stage_formats.next() {
+            if stage_formats.any(|other| other != format) {
+                bail!("script stages declare conflicting primary autosave formats");
+            }
+            settings.data_format = format;
+        }
+    }
+
+    if let Some(output_dir) = args.output_dir.as_ref() {
+        let path = if output_dir.is_absolute() {
+            output_dir.clone()
+        } else {
+            std::env::current_dir()?.join(output_dir)
+        };
+        settings.output_dir = Some(path.to_string_lossy().into_owned());
+    }
+    if let Some(temp_dir) = args.temp_dir.as_ref() {
+        let path = if temp_dir.is_absolute() {
+            temp_dir.clone()
+        } else {
+            std::env::current_dir()?.join(temp_dir)
+        };
+        settings.temp_dir = Some(path.to_string_lossy().into_owned());
+    }
+    if let Some(data_format) = args.data_format {
+        settings.data_format = data_format.into();
+    }
+    if let Some(cleanup) = args.temp_cleanup {
+        settings.cleanup = cleanup.into();
+    }
+    if let Some(existing_output) = args.existing_output {
+        settings.existing_output = existing_output.into();
+    }
+    settings
+        .validate()
+        .map_err(|errors| anyhow!(errors.join("; ")))?;
+
+    let script_dir = script_path.parent().unwrap_or_else(|| Path::new("."));
+    let extension = match settings.data_format {
+        OutputDataFormatIR::Zarr => "zarr",
+        OutputDataFormatIR::Hdf5 => "results",
+    };
+    let default_output_dir = script_path.with_extension(extension);
+    let lease = fullmag_runner::project_storage::ProjectStorageLease::prepare(
+        &settings,
+        &default_output_dir,
+        script_dir,
+        run_id,
+    )
+    .map_err(|error| anyhow!("failed to prepare project output storage: {error}"))?;
+    let storage_lease = ScriptOutputStorageLease::new(lease);
+    let resolved = serde_json::to_value(storage_lease.resolved())?;
+    let settings_value = serde_json::to_value(&settings)?;
+    let source_dir = script_dir.canonicalize()?.to_string_lossy().into_owned();
+    let source_stem = script_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("fullmag_script")
+        .to_string();
+    let attach_storage_metadata = |problem: &mut ProblemIR| {
+        let metadata = &mut problem.problem_meta.runtime_metadata;
+        metadata.insert("output_storage".to_string(), settings_value.clone());
+        metadata.insert("resolved_output_storage".to_string(), resolved.clone());
+        metadata.insert(
+            "output_storage_source_dir".to_string(),
+            serde_json::Value::String(source_dir.clone()),
+        );
+        metadata.insert(
+            "output_storage_source_stem".to_string(),
+            serde_json::Value::String(source_stem.clone()),
+        );
+    };
+    attach_storage_metadata(&mut config.ir);
+    for stage in &mut config.stages {
+        attach_storage_metadata(&mut stage.ir);
+    }
+    Ok((storage_lease, settings, resolved))
+}
+
+fn prepare_grid_operation_storage(
+    workspace_dir: &Path,
+    command_id: &str,
+    script_path: &Path,
+) -> Result<(ScriptOutputStorageLease, OutputStorageIR, serde_json::Value)> {
+    let operation_id = format!("grid-{}", fullmag_session::hex_sha256(command_id.as_bytes()));
+    let operation_root = workspace_dir.join("grid-preparations").join(&operation_id);
+    let settings = OutputStorageIR {
+        output_dir: Some(operation_root.join("workspace").to_string_lossy().into_owned()),
+        temp_dir: Some(operation_root.join("temporary").to_string_lossy().into_owned()),
+        data_format: OutputDataFormatIR::Zarr,
+        cleanup: fullmag_ir::TempCleanupIR::Never,
+        existing_output: fullmag_ir::ExistingOutputIR::Error,
+    };
+    let source_dir = script_path.parent().context("grid source has no parent")?;
+    let lease = fullmag_runner::project_storage::ProjectStorageLease::prepare(
+        &settings, &operation_root.join("workspace"), source_dir, &operation_id,
+    ).map_err(|error| anyhow!("failed to prepare private grid operation storage: {error}"))?;
+    let lease = ScriptOutputStorageLease::new(lease);
+    let resolved = serde_json::to_value(lease.resolved())?;
+    Ok((lease, settings, resolved))
+}
+
 fn attached_session_id_or(generated: String) -> String {
     std::env::var("FULLMAG_ATTACHED_SESSION_ID")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or(generated)
+}
+
+fn attached_session_started_at_or(generated: u128) -> Result<u128> {
+    if std::env::var("FULLMAG_ATTACHED_SESSION_ID")
+        .ok().is_none_or(|value| value.trim().is_empty())
+    {
+        return Ok(generated);
+    }
+    let raw = std::env::var("FULLMAG_ATTACHED_SESSION_STARTED_AT_UNIX_MS")
+        .context("attached session requires its authoritative start timestamp")?;
+    let timestamp = raw.parse::<u128>().context("invalid attached session start timestamp")?;
+    anyhow::ensure!(timestamp > 0 && timestamp.to_string() == raw, "invalid attached session start timestamp");
+    Ok(timestamp)
 }
 
 fn control_room_bootstrap_disabled() -> bool {
@@ -56,9 +241,11 @@ fn control_room_bootstrap_disabled() -> bool {
 }
 
 fn attached_wait_for_solve_enabled() -> bool {
-    std::env::var("FULLMAG_ATTACHED_WAIT_FOR_SOLVE")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
+    // `--wait-for-solve` is the flag form of the same gate.
+    crate::script_launch::wait_for_solve_flag()
+        || std::env::var("FULLMAG_ATTACHED_WAIT_FOR_SOLVE")
+            .ok()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
 }
 
 fn frozen_spins_checkpoint_from_stage_artifacts(
@@ -694,7 +881,10 @@ fn deferred_mesh_failure_stage(
         .get("last_build_error")
         .and_then(serde_json::Value::as_str)
         .filter(|error| !error.trim().is_empty())?;
-    let payload = workspace.get("last_build_summary")?;
+    let payload = workspace
+        .get("last_build_attempt")
+        .filter(|value| value.is_object())
+        .or_else(|| workspace.get("last_build_summary"))?;
     match payload.get("phase").and_then(serde_json::Value::as_str) {
         Some("preparing_domain" | "meshing" | "postprocessing") => {}
         _ => return None,
@@ -2994,6 +3184,10 @@ struct SceneProblemPatch {
     object_regions: Vec<ObjectRegionIR>,
     #[serde(default)]
     universe: Option<serde_json::Value>,
+    #[serde(default)]
+    fdm: Option<serde_json::Value>,
+    #[serde(default)]
+    runtime_selection: Option<serde_json::Value>,
 }
 
 fn scene_problem_patch_from_mesh_options(
@@ -3014,12 +3208,19 @@ fn scene_problem_patch_from_mesh_options(
     Ok(Some(patch))
 }
 
-fn apply_scene_problem_patch(problem: &mut ProblemIR, patch: &SceneProblemPatch) {
+fn apply_scene_problem_patch(problem: &mut ProblemIR, patch: &SceneProblemPatch) -> Result<()> {
     problem.geometry.entries = patch.geometry_entries.clone();
     problem.regions = patch.regions.clone();
     problem.materials = patch.materials.clone();
     problem.magnets = patch.magnets.clone();
     problem.object_regions = patch.object_regions.clone();
+    apply_scene_discretization_patch(problem, patch)
+}
+
+fn apply_scene_discretization_patch(
+    problem: &mut ProblemIR,
+    patch: &SceneProblemPatch,
+) -> Result<()> {
     if let Some(universe) = patch.universe.as_ref() {
         problem
             .problem_meta
@@ -3027,6 +3228,58 @@ fn apply_scene_problem_patch(problem: &mut ProblemIR, patch: &SceneProblemPatch)
             .insert("study_universe".to_string(), universe.clone());
         problem.problem_meta.runtime_metadata.remove("domain_frame");
     }
+    if let Some(fdm) = patch.fdm.as_ref() {
+        let mut fdm = fdm.clone();
+        let fallback_cell = problem
+            .backend_policy
+            .discretization_hints
+            .as_ref()
+            .and_then(|hints| hints.fdm.as_ref())
+            .map(|hints| hints.cell);
+        if let Some(object) = fdm.as_object_mut() {
+            if let Some(per_object_grid) = object
+                .remove("per_object_grid")
+                .or_else(|| object.remove("per_magnet"))
+            {
+                object.insert("per_magnet".to_string(), per_object_grid);
+            }
+            if let Some(demag) = object
+                .get_mut("demag")
+                .and_then(|value| value.as_object_mut())
+            {
+                demag.remove("explain");
+                demag
+                    .entry("fft_backend".to_string())
+                    .or_insert_with(|| serde_json::json!("auto"));
+            }
+            if !object.contains_key("cell") {
+                if let Some(default_cell) = object.get("default_cell").cloned() {
+                    object.insert("cell".to_string(), default_cell);
+                } else if let Some(fallback_cell) = fallback_cell {
+                    object.insert("cell".to_string(), serde_json::json!(fallback_cell));
+                }
+            }
+        }
+        let fdm_hints: FdmHintsIR = serde_json::from_value(fdm)
+            .context("failed to apply FDM discretization patch to ProblemIR")?;
+        let hints = problem
+            .backend_policy
+            .discretization_hints
+            .get_or_insert_with(|| DiscretizationHintsIR {
+                fdm: None,
+                fem: None,
+                hybrid: None,
+            });
+        hints.fdm = Some(fdm_hints);
+        problem.backend_policy.requested_backend = BackendTarget::Fdm;
+    }
+    if let Some(runtime_selection) = patch.runtime_selection.as_ref() {
+        problem
+            .problem_meta
+            .runtime_metadata
+            .insert("runtime_selection".to_string(), runtime_selection.clone());
+    }
+    Ok(())
 }
 
 fn apply_remeshed_problem_snapshot_to_stages(
@@ -3041,7 +3294,7 @@ fn apply_remeshed_problem_snapshot_to_stages(
 ) -> Result<()> {
     for stage in stages {
         if let Some(patch) = scene_problem_patch {
-            apply_scene_problem_patch(&mut stage.ir, patch);
+            apply_scene_problem_patch(&mut stage.ir, patch)?;
         }
         apply_current_fem_overrides(
             &mut stage.ir,
@@ -3147,8 +3400,17 @@ fn prepare_remesh_stage_transaction(
     object_region_markers: &[fullmag_ir::FemDomainRegionMarkerIR],
     adaptive_runtime_state: Option<&serde_json::Value>,
     first_stage_plan: Option<ExecutionPlanIR>,
+    source_scene_revision: Option<u64>,
 ) -> Result<PreparedRemeshStageTransaction> {
     let mut candidate_stages = stages.to_vec();
+    if let Some(revision) = source_scene_revision {
+        for stage in &mut candidate_stages {
+            stage.ir.problem_meta.runtime_metadata.insert(
+                "mesh_source_scene_revision".to_string(),
+                serde_json::json!(revision),
+            );
+        }
+    }
     apply_remeshed_problem_snapshot_to_stages(
         &mut candidate_stages,
         scene_problem_patch,
@@ -3430,38 +3692,236 @@ fn current_mesh_workspace(
     quality_summary: Option<&crate::python_bridge::RemeshQualitySummary>,
     mesh_history: &[serde_json::Value],
 ) -> Option<serde_json::Value> {
-    let (mesh, mesh_source, fe_order, hmax) = match &plan.backend_plan {
-        BackendPlanIR::Fem(fem) => (
+    match &plan.backend_plan {
+        BackendPlanIR::Fem(fem) => Some(current_fem_mesh_workspace(
+            problem,
             &fem.mesh,
             fem.mesh_source.as_deref(),
             fem.fe_order,
             fem.hmax,
-        ),
-        BackendPlanIR::FemEigen(fem) => (
+            status,
+            problem.problem_meta.runtime_metadata.get("adaptive_mesh"),
+            problem
+                .problem_meta
+                .runtime_metadata
+                .get("adaptive_mesh_runtime_state"),
+            quality_summary,
+            None,
+            None,
+            mesh_history,
+        )),
+        BackendPlanIR::FemEigen(fem) => Some(current_fem_mesh_workspace(
+            problem,
             &fem.mesh,
             fem.mesh_source.as_deref(),
             fem.fe_order,
             fem.hmax,
-        ),
-        _ => return None,
-    };
-    Some(current_fem_mesh_workspace(
-        problem,
-        mesh,
-        mesh_source,
-        fe_order,
-        hmax,
+            status,
+            problem.problem_meta.runtime_metadata.get("adaptive_mesh"),
+            problem
+                .problem_meta
+                .runtime_metadata
+                .get("adaptive_mesh_runtime_state"),
+            quality_summary,
+            None,
+            None,
+            mesh_history,
+        )),
+        BackendPlanIR::Fdm(fdm) => Some(current_fdm_mesh_workspace(fdm, status, mesh_history)),
+        BackendPlanIR::FdmMultilayer(fdm) => Some(current_fdm_multilayer_mesh_workspace(
+            fdm,
+            status,
+            mesh_history,
+        )),
+        _ => None,
+    }
+}
+
+fn current_fdm_mesh_workspace(
+    plan: &fullmag_ir::FdmPlanIR,
+    status: &str,
+    mesh_history: &[serde_json::Value],
+) -> serde_json::Value {
+    let certificate = plan.grid_certificate.as_ref();
+    let counts = certificate
+        .map(|certificate| certificate.counts)
+        .unwrap_or(plan.grid.cells);
+    let cell_size = certificate
+        .map(|certificate| certificate.cell_m)
+        .unwrap_or(plan.cell_size);
+    let origin = certificate
+        .map(|certificate| certificate.origin_m)
+        .unwrap_or(plan.origin_m);
+    let active_cells = certificate
+        .map(|certificate| certificate.active_cells)
+        .unwrap_or_else(|| {
+            plan.active_mask
+                .as_ref()
+                .map(|mask| mask.iter().filter(|active| **active).count() as u64)
+                .unwrap_or_else(|| {
+                    plan.region_mask
+                        .iter()
+                        .filter(|marker| **marker != 0)
+                        .count() as u64
+                })
+        });
+    let fingerprint = certificate
+        .map(|certificate| certificate.grid_fingerprint.clone())
+        .unwrap_or_else(|| format!("fdm-grid-{}x{}x{}", counts[0], counts[1], counts[2]));
+    fdm_mesh_workspace_value(
+        "fdm",
+        counts,
+        cell_size,
+        origin,
+        active_cells,
+        certificate.map(|certificate| certificate.estimated_bytes),
+        fingerprint,
         status,
-        problem.problem_meta.runtime_metadata.get("adaptive_mesh"),
-        problem
-            .problem_meta
-            .runtime_metadata
-            .get("adaptive_mesh_runtime_state"),
-        quality_summary,
-        None,
-        None,
         mesh_history,
-    ))
+        true,
+    )
+}
+
+fn current_fdm_multilayer_mesh_workspace(
+    plan: &fullmag_ir::FdmMultilayerPlanIR,
+    status: &str,
+    mesh_history: &[serde_json::Value],
+) -> serde_json::Value {
+    let certificate = plan.grid_certificate.as_ref();
+    let counts = certificate
+        .map(|certificate| certificate.counts)
+        .unwrap_or(plan.common_cells);
+    let first_layer = plan.layers.first();
+    let cell_size = certificate
+        .map(|certificate| certificate.cell_m)
+        .or_else(|| first_layer.map(|layer| layer.convolution_cell_size))
+        .unwrap_or([0.0, 0.0, 0.0]);
+    let origin = certificate
+        .map(|certificate| certificate.origin_m)
+        .or_else(|| first_layer.map(|layer| layer.convolution_origin))
+        .unwrap_or([0.0, 0.0, 0.0]);
+    let active_cells = certificate
+        .map(|certificate| certificate.active_cells)
+        .unwrap_or_else(|| {
+            plan.layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .native_active_mask
+                        .as_ref()
+                        .map(|mask| mask.iter().filter(|active| **active).count() as u64)
+                        .unwrap_or_else(|| {
+                            layer
+                                .native_grid
+                                .iter()
+                                .try_fold(1u64, |product, count| product.checked_mul(*count as u64))
+                                .unwrap_or(0)
+                        })
+                })
+                .sum()
+        });
+    let fingerprint = certificate
+        .map(|certificate| certificate.grid_fingerprint.clone())
+        .unwrap_or_else(|| format!("fdm-multilayer-{}x{}x{}", counts[0], counts[1], counts[2]));
+    fdm_mesh_workspace_value(
+        "fdm_multilayer",
+        counts,
+        cell_size,
+        origin,
+        active_cells,
+        certificate.map(|certificate| certificate.estimated_bytes),
+        fingerprint,
+        status,
+        mesh_history,
+        false,
+    )
+}
+
+fn fdm_mesh_workspace_value(
+    backend: &str,
+    counts: [u32; 3],
+    cell_size: [f64; 3],
+    origin: [f64; 3],
+    active_cells: u64,
+    estimated_bytes: Option<u64>,
+    fingerprint: String,
+    status: &str,
+    mesh_history: &[serde_json::Value],
+    supports_boundary_correction: bool,
+) -> serde_json::Value {
+    let total_cells = counts
+        .iter()
+        .try_fold(1u64, |product, count| product.checked_mul(*count as u64))
+        .unwrap_or(0);
+    let mesh_generation_id = format!("{backend}:{fingerprint}");
+    let estimated_bytes = estimated_bytes.unwrap_or_else(|| {
+        total_cells
+            .saturating_mul(3)
+            .saturating_mul(std::mem::size_of::<f64>() as u64)
+    });
+    serde_json::json!({
+        "mesh_summary": {
+            "mesh_id": mesh_generation_id,
+            "mesh_name": format!("{backend}-structured-grid"),
+            "backend": backend,
+            "source_kind": "planner_resolved_structured_grid",
+            "generation_id": mesh_generation_id,
+            "grid": { "cells": counts },
+            "cells": counts,
+            "cell_size": cell_size,
+            "cell_size_m": cell_size,
+            "origin": origin,
+            "origin_m": origin,
+            "total_cells": total_cells,
+            "active_cells": active_cells,
+            "grid_fingerprint": fingerprint,
+            "node_count": total_cells,
+            "element_count": 0,
+            "boundary_face_count": 0,
+            "domain_mesh_mode": "structured_grid",
+        },
+        "mesh_quality_summary": null,
+        "mesh_statistics": {
+            "backend": backend,
+            "total_cells": total_cells,
+            "active_cells": active_cells,
+            "mask_coverage": if total_cells > 0 { active_cells as f64 / total_cells as f64 } else { 0.0 },
+        },
+        "mesh_cost_report": {
+            "total_cells": total_cells,
+            "active_cells": active_cells,
+            "estimated_bytes": estimated_bytes,
+            "estimated_memory_mb": estimated_bytes as f64 / 1.0e6,
+            "status": status,
+        },
+        "mesh_pipeline_status": [
+            {"id": "grid", "label": "Grid", "status": if total_cells > 0 { "done" } else { "warning" }, "detail": format!("{} × {} × {} cells", counts[0], counts[1], counts[2])},
+            {"id": "membership", "label": "Membership mask", "status": if active_cells > 0 { "done" } else { "warning" }, "detail": format!("{} active magnetic cells", active_cells)},
+            {"id": "runtime", "label": "Runtime replan", "status": if status == "ready" || status == "awaiting_command" || status == "waiting_for_compute" { "done" } else { "active" }, "detail": "Execution plan and runtime are derived from the same committed scene snapshot"},
+            {"id": "readiness", "label": "Solver readiness", "status": if total_cells > 0 { "done" } else { "warning" }, "detail": status},
+        ],
+        "mesh_capabilities": {
+            "has_volume_mesh": false,
+            "has_structured_grid": true,
+            "has_membership_mask": active_cells > 0,
+            "has_quality_arrays": false,
+            "supports_adaptive_remesh": false,
+            "supports_compare_snapshots": true,
+            "supports_grid_replan": true,
+            "supports_size_field_remesh": false,
+            "supports_edge_distance_fields": false,
+            "supports_boundary_layers": supports_boundary_correction,
+            "supports_mesh_convergence_workflow": false,
+            "supports_mesh_error_preview": false,
+            "supports_target_h_preview": false,
+        },
+        "mesh_adaptivity_state": {
+            "enabled": false,
+            "policy": "manual",
+            "convergence_status": "not_applicable",
+        },
+        "mesh_history": mesh_history,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -3836,27 +4296,30 @@ fn overlay_mesh_workspace(
                 value
             }),
     );
+    let effective_airbox_target = overlay
+        .effective_airbox_target
+        .clone()
+        .or_else(|| obj.get("effective_airbox_target").cloned())
+        .unwrap_or(serde_json::Value::Null);
     obj.insert(
         "effective_airbox_target".to_string(),
-        overlay
-            .effective_airbox_target
-            .clone()
-            .unwrap_or(serde_json::Value::Null),
+        effective_airbox_target,
     );
+    let effective_per_object_targets = overlay
+        .effective_per_object_targets
+        .clone()
+        .or_else(|| obj.get("effective_per_object_targets").cloned())
+        .unwrap_or(serde_json::Value::Null);
     obj.insert(
         "effective_per_object_targets".to_string(),
-        overlay
-            .effective_per_object_targets
-            .clone()
-            .unwrap_or(serde_json::Value::Null),
+        effective_per_object_targets,
     );
-    obj.insert(
-        "last_build_summary".to_string(),
-        overlay
-            .last_build_summary
-            .clone()
-            .unwrap_or(serde_json::Value::Null),
-    );
+    let last_build_summary = overlay
+        .last_build_summary
+        .clone()
+        .or_else(|| obj.get("last_build_summary").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    obj.insert("last_build_summary".to_string(), last_build_summary);
     obj.insert(
         "last_build_error".to_string(),
         overlay
@@ -3945,6 +4408,10 @@ fn scripted_stage_execution_state(
             mesh_topology_fingerprint: None,
             mesh_revision: None,
             started_at_unix_ms: None,
+            applied_step: None,
+            completed_step: None,
+            applied_time_seconds: None,
+            segment_id: None,
             completed_at_unix_ms: None,
             reason: None,
             converged: false,
@@ -4058,6 +4525,26 @@ fn attach_stage_fem_mesh_identity(
     ));
 }
 
+fn publish_scripted_stages_awaiting_command(execution: &mut CurrentLiveStageExecutionState) {
+    // Completed stages are history; the interactive owner still accepts commands.
+    *execution = stage_execution_from_records(&execution.stages, None, None, "awaiting_command");
+}
+
+fn attach_scripted_stage_solver_steps(
+    execution: &mut CurrentLiveStageExecutionState,
+    stage_index: usize,
+    boundary: Option<&CommandApplicationBoundary>,
+    completed_step: Option<u64>,
+) {
+    let Some(record) = execution.stages.get_mut(stage_index) else {
+        return;
+    };
+    record.applied_step = boundary.map(|boundary| boundary.applied_step);
+    record.applied_time_seconds = boundary.map(|boundary| boundary.applied_time_seconds);
+    record.segment_id = boundary.map(|boundary| boundary.segment_id.clone());
+    record.completed_step = completed_step;
+}
+
 fn preserve_terminal_stage_history(
     next: &mut CurrentLiveStageExecutionState,
     previous: Option<&CurrentLiveStageExecutionState>,
@@ -4137,6 +4624,10 @@ fn stage_record(index: usize, kind: Option<&str>) -> CurrentLiveStageExecutionRe
         mesh_topology_fingerprint: None,
         mesh_revision: None,
         started_at_unix_ms: None,
+        applied_step: None,
+        completed_step: None,
+        applied_time_seconds: None,
+        segment_id: None,
         completed_at_unix_ms: None,
         reason: None,
         converged: false,
@@ -4162,6 +4653,24 @@ fn stage_record(index: usize, kind: Option<&str>) -> CurrentLiveStageExecutionRe
         current_settle_step_index: None,
         current_settle_step_kind: None,
         current_settle_step_method: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CommandApplicationBoundary {
+    applied_step: u64,
+    applied_time_seconds: f64,
+    segment_id: String,
+}
+
+impl CommandApplicationBoundary {
+    fn new(run_id: &str, command_id: &str, applied_step: u64, applied_time_seconds: f64) -> Self {
+        let time_bits = applied_time_seconds.to_bits();
+        Self {
+            applied_step,
+            applied_time_seconds,
+            segment_id: format!("segment:{run_id}:{command_id}:{applied_step}:{time_bits:016x}"),
+        }
     }
 }
 
@@ -4201,6 +4710,7 @@ impl ActiveSequenceState {
         command_id: &str,
         started_at_unix_ms: u128,
         artifact_ref: Option<String>,
+        application_boundary: Option<&CommandApplicationBoundary>,
     ) {
         let current_index = self.current_stage_index();
         if current_index >= self.stages.len() {
@@ -4211,6 +4721,10 @@ impl ActiveSequenceState {
         record.status = "running".to_string();
         record.command_id = Some(command_id.to_string());
         record.started_at_unix_ms = Some(millis_to_u64(started_at_unix_ms));
+        record.applied_step = application_boundary.map(|boundary| boundary.applied_step);
+        record.applied_time_seconds =
+            application_boundary.map(|boundary| boundary.applied_time_seconds);
+        record.segment_id = application_boundary.map(|boundary| boundary.segment_id.clone());
         record.completed_at_unix_ms = None;
         record.progress_percent = Some(5.0);
         record.progress_label = Some("starting".to_string());
@@ -4316,6 +4830,10 @@ impl ActiveSequenceState {
                 mesh_topology_fingerprint: previous.mesh_topology_fingerprint,
                 mesh_revision: previous.mesh_revision,
                 started_at_unix_ms: previous.started_at_unix_ms,
+                applied_step: previous.applied_step,
+                completed_step: previous.completed_step,
+                applied_time_seconds: previous.applied_time_seconds,
+                segment_id: previous.segment_id,
                 completed_at_unix_ms: completed_at_unix_ms
                     .map(millis_to_u64)
                     .or(previous.completed_at_unix_ms),
@@ -4686,637 +5204,6 @@ fn renormalize_magnetization(values: &mut [[f64; 3]]) {
             *value = [1.0, 0.0, 0.0];
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_manual_interactive_remesh(
-    command: &SessionCommand,
-    stages: &mut [ResolvedScriptStage],
-    stage_execution_plans: &mut [ExecutionPlanIR],
-    workspace_status: &str,
-    live_workspace: &LocalLiveWorkspace,
-    current_mesh_quality: &mut Option<crate::python_bridge::RemeshQualitySummary>,
-    current_mesh_history: &mut Vec<serde_json::Value>,
-    current_fem_mesh_override: &mut Option<fullmag_ir::MeshIR>,
-    current_fem_hmax_override: &mut Option<f64>,
-    current_adaptive_runtime_state: &Option<serde_json::Value>,
-) -> Result<()> {
-    let mesh_target = command
-        .mesh_target
-        .as_ref()
-        .ok_or_else(|| anyhow!("remesh command is missing mesh_target"))?;
-    if matches!(mesh_target, MeshCommandTarget::AdaptiveFollowup) {
-        bail!(
-            "interactive remesh does not accept mesh_target=adaptive_followup, got {:?}",
-            mesh_target
-        );
-    }
-    let opts = command
-        .mesh_options
-        .clone()
-        .unwrap_or(serde_json::json!({}));
-    let scene_problem_patch = scene_problem_patch_from_mesh_options(&opts)?;
-    let base_problem = stages
-        .first()
-        .map(|stage| stage.ir.clone())
-        .ok_or_else(|| anyhow!("interactive remesh requires at least one materialized stage"))?;
-    let base_execution_plan = stage_execution_plans
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow!("interactive remesh requires at least one materialized plan"))?;
-    let mut remesh_problem_source = base_problem;
-    if let Some(patch) = scene_problem_patch.as_ref() {
-        apply_scene_problem_patch(&mut remesh_problem_source, patch);
-    }
-    if let Some(source_scene_revision) = mesh_source_scene_revision(&opts) {
-        remesh_problem_source.problem_meta.runtime_metadata.insert(
-            "mesh_source_scene_revision".to_string(),
-            serde_json::json!(source_scene_revision),
-        );
-    }
-    let mesh_reason = command
-        .mesh_reason
-        .as_deref()
-        .unwrap_or("manual_ui_rebuild");
-    let mesh_target_label = match mesh_target {
-        MeshCommandTarget::StudyDomain => "study_domain".to_string(),
-        MeshCommandTarget::AdaptiveFollowup => "adaptive_followup".to_string(),
-        MeshCommandTarget::Airbox => "airbox".to_string(),
-        MeshCommandTarget::ObjectMesh { object_id } => format!("object_mesh:{object_id}"),
-    };
-    eprintln!(
-        "[fullmag] remesh requested with target={} reason={} options: {}",
-        mesh_target_label, mesh_reason, opts
-    );
-    live_workspace.push_log(
-        "info",
-        format!(
-            "Remesh requested — target={} · reason={} · options: {}",
-            mesh_target_label, mesh_reason, opts
-        ),
-    );
-    if mesh_reason == "airbox_parameter_changed" {
-        eprintln!(
-            "[fullmag] remesh note — airbox change requires full shared-domain remesh (ferromagnet geometry included)"
-        );
-        live_workspace.push_log(
-            "info",
-            "Airbox change requires full shared-domain remesh; ferromagnet mesh will also be regenerated",
-        );
-    }
-
-    let adaptive_mesh_runtime = remesh_problem_source
-        .problem_meta
-        .runtime_metadata
-        .get("adaptive_mesh")
-        .cloned();
-    let fem_plan = match &base_execution_plan.backend_plan {
-        BackendPlanIR::Fem(plan) => Some(plan),
-        _ => None,
-    };
-    let previous_periodic_mesh = remesh_problem_source
-        .geometry_assets
-        .as_ref()
-        .and_then(|assets| assets.fem_domain_mesh_asset.as_ref())
-        .and_then(|asset| asset.mesh.clone());
-
-    if let Some(plan) = fem_plan {
-        let shared_domain_remesh = matches!(
-            plan.domain_mesh_mode,
-            fullmag_ir::FemDomainMeshModeIR::SharedDomainMeshWithAir
-        );
-        let declared_universe = fem_declared_universe(&remesh_problem_source);
-        let geometry_entry = remesh_problem_source.geometry.entries.first().cloned();
-        let hmax = opts
-            .get("hmax")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(plan.hmax);
-        if shared_domain_remesh && mesh_reason == "airbox_parameter_changed" {
-            let airbox_hmax = declared_universe
-                .as_ref()
-                .and_then(|value| value.airbox_hmax);
-            match airbox_hmax {
-                Some(airbox_hmax) if airbox_hmax > 0.0 => {
-                    eprintln!(
-                        "[fullmag] shared-domain remesh scope — updating airbox grading only (airbox_hmax={:.3e} m, magnetic body hmax remains {:.3e} m)",
-                        airbox_hmax, hmax
-                    );
-                    live_workspace.push_log(
-                        "info",
-                        format!(
-                            "Shared-domain remesh scope — airbox grading update only (airbox_hmax={:.3e}, body_hmax={:.3e})",
-                            airbox_hmax, hmax
-                        ),
-                    );
-                }
-                _ => {
-                    eprintln!(
-                        "[fullmag] shared-domain remesh scope — rebuilding study mesh after airbox parameter change (magnetic body hmax remains {:.3e} m)",
-                        hmax
-                    );
-                    live_workspace.push_log(
-                        "info",
-                        format!(
-                            "Shared-domain remesh scope — airbox parameter change detected; body_hmax remains {:.3e}",
-                            hmax
-                        ),
-                    );
-                }
-            }
-        } else if shared_domain_remesh && mesh_reason.starts_with("object_mesh_override_changed") {
-            let object_id = mesh_reason
-                .strip_prefix("object_mesh_override_changed:")
-                .unwrap_or("selected_object");
-            let custom_override_count = opts
-                .get("per_geometry")
-                .and_then(|value| value.as_array())
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter(|entry| {
-                            entry
-                                .get("mode")
-                                .and_then(|value| value.as_str())
-                                .map(|mode| mode == "custom")
-                                .unwrap_or(false)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            eprintln!(
-                "[fullmag] shared-domain remesh scope — applying local object sizing for {} (custom object overrides={}, default body hmax={:.3e} m)",
-                object_id, custom_override_count, hmax
-            );
-            live_workspace.push_log(
-                "info",
-                format!(
-                    "Shared-domain remesh scope — local object sizing for {} (custom overrides={}, default body hmax={:.3e})",
-                    object_id,
-                    custom_override_count,
-                    hmax
-                ),
-            );
-        }
-        eprintln!(
-            "[fullmag] meshing in progress — hmax={:.3e} m, order=P{} ...",
-            hmax, plan.fe_order
-        );
-        live_workspace.push_log(
-            "info",
-            format!(
-                "Meshing in progress — hmax={:.3e}, order=P{}",
-                hmax, plan.fe_order
-            ),
-        );
-        let build_overlay = Arc::new(Mutex::new(CurrentMeshBuildOverlay {
-            active_build: Some(mesh_build_intent_json(mesh_target, mesh_reason, &opts)),
-            effective_airbox_target: None,
-            effective_per_object_targets: None,
-            last_build_summary: None,
-            last_build_error: None,
-            active_phase: Some("queued".to_string()),
-            progress_percent: None,
-            progress_label: None,
-            attempt_index: None,
-            algorithm_3d: None,
-            attempt_status: None,
-            attempt_failure_reason: None,
-            next_algorithm_3d: None,
-            progress_kind: None,
-            last_recoverable_attempt: None,
-            phase_started_at: Instant::now(),
-            phase_durations_ms: Vec::new(),
-            failed: false,
-        }));
-        live_workspace.update(|state| {
-            let mut workspace = state
-                .mesh_workspace
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({}));
-            let overlay = build_overlay
-                .lock()
-                .expect("mesh build overlay mutex poisoned")
-                .clone();
-            overlay_mesh_workspace(&mut workspace, &overlay);
-            state.mesh_workspace = Some(workspace);
-        });
-        let mesh_start = std::time::Instant::now();
-        let remesh_progress_stage = Arc::new(Mutex::new(None::<RemeshTerminalProgress>));
-        let remesh_progress_callback = Some({
-            let live_workspace = live_workspace.clone();
-            let remesh_progress_stage = Arc::clone(&remesh_progress_stage);
-            let build_overlay = Arc::clone(&build_overlay);
-            Arc::new(move |event: PythonProgressEvent| {
-                let terminal_update = match &event {
-                    PythonProgressEvent::Message(message) => {
-                        if message.trim_start().starts_with("json:") {
-                            None
-                        } else {
-                            match map_remesh_progress_message(message) {
-                                Some(stage) => {
-                                    let mut guard = remesh_progress_stage
-                                        .lock()
-                                        .expect("remesh progress mutex poisoned");
-                                    if guard.as_ref() == Some(&stage)
-                                        && !gmsh_indeterminate_heartbeat(message)
-                                    {
-                                        None
-                                    } else {
-                                        *guard = Some(stage);
-                                        if let Ok(mut overlay) = build_overlay.lock() {
-                                            update_mesh_overlay_from_terminal_progress(
-                                                &mut overlay,
-                                                stage,
-                                            );
-                                            let overlay_snapshot = overlay.clone();
-                                            live_workspace.update(|state| {
-                                                let mut workspace = state
-                                                    .mesh_workspace
-                                                    .clone()
-                                                    .unwrap_or_else(|| serde_json::json!({}));
-                                                overlay_mesh_workspace(
-                                                    &mut workspace,
-                                                    &overlay_snapshot,
-                                                );
-                                                state.mesh_workspace = Some(workspace);
-                                            });
-                                        }
-                                        Some(match stage.percent {
-                                            Some(percent) => format!(
-                                                "[fullmag] remesh {percent:02}% - {}",
-                                                stage.label
-                                            ),
-                                            None => format!(
-                                                "[fullmag] remesh active (indeterminate) - {}",
-                                                stage.label
-                                            ),
-                                        })
-                                    }
-                                }
-                                None => Some(format!("[fullmag] remesh info - {}", message)),
-                            }
-                        }
-                    }
-                    PythonProgressEvent::FemSurfacePreview { .. } => None,
-                    PythonProgressEvent::Structured { kind, payload } => {
-                        if let Ok(mut overlay) = build_overlay.lock() {
-                            if update_mesh_attempt_overlay_from_payload(&mut overlay, kind, payload)
-                            {
-                                let overlay_snapshot = overlay.clone();
-                                live_workspace.update(|state| {
-                                    let mut workspace = state
-                                        .mesh_workspace
-                                        .clone()
-                                        .unwrap_or_else(|| serde_json::json!({}));
-                                    overlay_mesh_workspace(&mut workspace, &overlay_snapshot);
-                                    state.mesh_workspace = Some(workspace);
-                                });
-                            }
-                        }
-                        payload
-                            .get("message")
-                            .and_then(|value| value.as_str())
-                            .map(|message| format!("[fullmag] remesh info - {}", message))
-                    }
-                };
-                apply_python_progress_event(&live_workspace, event);
-                if let Some(line) = terminal_update {
-                    eprintln!("{}", line);
-                }
-            }) as PythonProgressCallback
-        });
-
-        let remesh_attempt = if shared_domain_remesh {
-            let declared_universe = declared_universe.ok_or_else(|| {
-                anyhow!(
-                    "shared-domain remesh requires a declared universe in domain_frame or study_universe metadata"
-                )
-            })?;
-            let declared_universe_value = serde_json::to_value(&declared_universe)
-                .context("failed to serialize declared universe for shared-domain remesh")?;
-            let object_region_mesh_specs =
-                shared_domain_object_region_mesh_specs(&remesh_problem_source)?;
-            invoke_shared_domain_remesh_full(
-                &remesh_problem_source.geometry.entries,
-                &object_region_mesh_specs,
-                &declared_universe_value,
-                hmax,
-                plan.fe_order,
-                &opts,
-                remesh_progress_callback,
-            )
-        } else {
-            let geom = geometry_entry
-                .as_ref()
-                .ok_or_else(|| anyhow!("no geometry entry available"))?;
-            invoke_remesh_full(geom, hmax, plan.fe_order, &opts, remesh_progress_callback)
-        };
-
-        match remesh_attempt {
-            Ok(remesh_result) => {
-                let elapsed = mesh_start.elapsed();
-                let new_mesh = remesh_result.clone().into_mesh_ir();
-                if let Some(previous_mesh) = previous_periodic_mesh.as_ref() {
-                    validate_periodic_remesh_candidate(previous_mesh, &new_mesh)?;
-                }
-                let node_count = new_mesh.nodes.len();
-                let elem_count = new_mesh.cell_count();
-                let face_count = new_mesh.facet_count();
-                let remeshed_mesh_source = if shared_domain_remesh {
-                    None
-                } else {
-                    plan.mesh_source.clone()
-                };
-                let (live_mesh_payload, remeshed_magnetization, remeshed_plan) = {
-                    let mut remeshed_problem = remesh_problem_source.clone();
-                    apply_current_fem_overrides(
-                        &mut remeshed_problem,
-                        Some(&new_mesh),
-                        Some(hmax),
-                        current_adaptive_runtime_state.as_ref(),
-                    );
-                    if shared_domain_remesh {
-                        let region_markers = if remesh_result.region_markers.is_empty() {
-                            default_domain_region_markers(&remeshed_problem.geometry.entries)
-                        } else {
-                            remesh_result.region_markers.clone()
-                        };
-                        let object_region_markers = resolved_shared_domain_object_region_markers(
-                            &remeshed_problem,
-                            &remesh_result.object_region_markers,
-                        )?;
-                        let domain_asset = remeshed_problem
-                            .geometry_assets
-                            .as_mut()
-                            .and_then(|assets| assets.fem_domain_mesh_asset.as_mut())
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "shared-domain remesh produced a domain mesh but no fem_domain_mesh_asset is attached"
-                                )
-                            })?;
-                        domain_asset.region_markers = region_markers;
-                        domain_asset.object_region_markers = object_region_markers;
-                    }
-                    let remeshed_plan = fullmag_plan::plan(&remeshed_problem)
-                        .map_err(|error| anyhow!(error.to_string()))?;
-                    let magnetization =
-                        current_stage_magnetization_vectors(None, &remeshed_plan.backend_plan);
-                    let mesh_payload =
-                        fem_mesh_payload_from_backend_plan(&remeshed_plan.backend_plan)
-                            .ok_or_else(|| {
-                                anyhow!("updated backend plan did not produce a FEM mesh payload")
-                            })?;
-                    (mesh_payload, magnetization, remeshed_plan)
-                };
-                let prepared_remesh = prepare_remesh_stage_transaction(
-                    stages,
-                    stage_execution_plans,
-                    scene_problem_patch.as_ref(),
-                    &new_mesh,
-                    hmax,
-                    shared_domain_remesh,
-                    &remesh_result.region_markers,
-                    &remesh_result.object_region_markers,
-                    current_adaptive_runtime_state.as_ref(),
-                    Some(remeshed_plan.clone()),
-                )?;
-                live_workspace.push_log(
-                    "success",
-                    format!(
-                        "Remesh complete — {} nodes, {} elements, {} boundary faces ({:.1}s)",
-                        node_count,
-                        elem_count,
-                        face_count,
-                        elapsed.as_secs_f64()
-                    ),
-                );
-                eprintln!(
-                    "[fullmag] ✓ remesh complete — {} nodes, {} elements ({:.1}s)",
-                    node_count,
-                    elem_count,
-                    elapsed.as_secs_f64()
-                );
-                if node_count > 50_000 {
-                    live_workspace.push_log(
-                        "warn",
-                        format!(
-                            "⛔ Mesh has {} nodes — CPU dense solver will likely OOM. Increase hmax.",
-                            node_count
-                        ),
-                    );
-                } else if node_count > 10_000 {
-                    live_workspace.push_log(
-                        "warn",
-                        format!(
-                            "⚠ Mesh has {} nodes — may be slow with CPU dense solver.",
-                            node_count
-                        ),
-                    );
-                }
-                live_workspace.push_log(
-                    "info",
-                    format!(
-                        "Magnetization texture re-sampled on the new mesh — {} vectors",
-                        remeshed_magnetization.len()
-                    ),
-                );
-                *current_mesh_quality = remesh_result.quality.clone();
-                *current_fem_mesh_override = Some(new_mesh.clone());
-                *current_fem_hmax_override = Some(hmax);
-                stages.clone_from_slice(&prepared_remesh.stages);
-                stage_execution_plans.clone_from_slice(&prepared_remesh.stage_execution_plans);
-                current_mesh_history.push(serde_json::json!({
-                    "mesh_name": new_mesh.mesh_name,
-                    "generation_mode": remesh_result.generation_mode,
-                    "node_count": node_count,
-                    "element_count": elem_count,
-                    "boundary_face_count": face_count,
-                    "quality": remesh_result.quality.as_ref().map(|quality| serde_json::json!({
-                        "sicn_p5": quality.sicn_p5,
-                        "gamma_min": quality.gamma_min,
-                        "avg_quality": quality.avg_quality,
-                    })),
-                    "mesh_target": mesh_target_label.clone(),
-                    "mesh_reason": mesh_reason,
-                    "mesh_provenance": remesh_result.mesh_provenance.clone(),
-                    "mesh_statistics": remesh_result.mesh_statistics.clone(),
-                    "size_field_stats": remesh_result.size_field_stats.clone(),
-                    "quality_data_artifact": remesh_result.quality_data_artifact.clone(),
-                }));
-                live_workspace.update(|state| {
-                    state.live_state.latest_step.fem_mesh_generation_id =
-                        live_mesh_payload.generation_id.clone();
-                    state.fem_mesh = Some(live_mesh_payload);
-                    state.live_state.latest_step.magnetization =
-                        Some(flatten_magnetization(&remeshed_magnetization));
-                    let mut workspace = current_fem_mesh_workspace(
-                        &remesh_problem_source,
-                        &new_mesh,
-                        remeshed_mesh_source.as_deref(),
-                        plan.fe_order,
-                        hmax,
-                        workspace_status,
-                        adaptive_mesh_runtime.as_ref(),
-                        current_adaptive_runtime_state.as_ref(),
-                        current_mesh_quality.as_ref(),
-                        remesh_result.quality_data_artifact.as_ref(),
-                        remesh_result.mesh_statistics.as_ref(),
-                        current_mesh_history,
-                    );
-                    let provenance = remesh_result
-                        .mesh_provenance
-                        .as_ref()
-                        .and_then(|value| value.as_object());
-                    let summary = serde_json::json!({
-                        "kind": "mesh_build_summary",
-                        "mesh_target": mesh_target_label.clone(),
-                        "mesh_reason": mesh_reason,
-                        "geometry_realization": mesh_geometry_realization_json(&opts),
-                        "source_scene_revision": opts
-                            .get("geometry_realization")
-                            .and_then(|value| value.get("source_scene_revision"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "realization_revision": opts
-                            .get("geometry_realization")
-                            .and_then(|value| value.get("realization_revision"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "shared_domain_build_mode": provenance
-                            .and_then(|value| value.get("shared_domain_build_mode"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "effective_airbox_target": provenance
-                            .and_then(|value| value.get("effective_airbox_target"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "effective_per_object_targets": provenance
-                            .and_then(|value| value.get("effective_per_object_targets"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "used_size_field_kinds": provenance
-                            .and_then(|value| value.get("used_size_field_kinds"))
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!([])),
-                        "fallbacks_triggered": provenance
-                            .and_then(|value| value.get("fallbacks_triggered"))
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!([])),
-                        "operation_statuses": provenance
-                            .and_then(|value| value.get("operation_statuses"))
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!([])),
-                        "thin_film_diagnostics": provenance
-                            .and_then(|value| value.get("thin_film_diagnostics"))
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!([])),
-                        "shared_domain_build_report": provenance
-                            .and_then(|value| value.get("shared_domain_build_report"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "mesh_statistics": remesh_result
-                            .mesh_statistics
-                            .clone()
-                            .unwrap_or(serde_json::Value::Null),
-                        "n_nodes": node_count,
-                        "n_elements": elem_count,
-                        "n_boundary_faces": face_count,
-                    });
-                    if let Ok(mut overlay) = build_overlay.lock() {
-                        overlay.active_build = None;
-                        overlay.effective_airbox_target = provenance
-                            .and_then(|value| value.get("effective_airbox_target"))
-                            .cloned();
-                        overlay.effective_per_object_targets = provenance
-                            .and_then(|value| value.get("effective_per_object_targets"))
-                            .cloned();
-                        overlay.last_build_summary = Some(summary);
-                        overlay.last_build_error = None;
-                        transition_mesh_build_phase(&mut overlay, "ready");
-                        overlay.progress_percent = Some(100);
-                        overlay.progress_label = Some("mesh ready".to_string());
-                        overlay.failed = false;
-                        let overlay_snapshot = overlay.clone();
-                        overlay_mesh_workspace(&mut workspace, &overlay_snapshot);
-                    }
-                    state.mesh_workspace = Some(workspace);
-                });
-            }
-            Err(error) => {
-                let elapsed = mesh_start.elapsed();
-                eprintln!(
-                    "[fullmag] ✗ remesh FAILED after {:.1}s: {}",
-                    elapsed.as_secs_f64(),
-                    error
-                );
-                live_workspace.push_log("error", format!("Remesh failed: {}", error));
-                if let Ok(mut overlay) = build_overlay.lock() {
-                    overlay.active_build = None;
-                    overlay.last_build_summary = Some(serde_json::json!({
-                        "kind": "mesh_build_failed",
-                        "phase": overlay.active_phase.clone(),
-                        "attempt_index": overlay.attempt_index,
-                        "algorithm_3d": overlay.algorithm_3d.clone(),
-                        "attempt_status": overlay.attempt_status.clone(),
-                        "attempt_failure_reason": overlay.attempt_failure_reason.clone(),
-                        "next_algorithm_3d": overlay.next_algorithm_3d.clone(),
-                        "last_recoverable_attempt": overlay.last_recoverable_attempt.clone(),
-                        "error": error.to_string(),
-                        "duration_ms": saturating_duration_millis_u64(elapsed),
-                    }));
-                    overlay.last_build_error = Some(error.to_string());
-                    overlay.active_phase = Some(
-                        overlay
-                            .active_phase
-                            .clone()
-                            .unwrap_or_else(|| "meshing".to_string()),
-                    );
-                    overlay.failed = true;
-                    let overlay_snapshot = overlay.clone();
-                    live_workspace.update(|state| {
-                        let mut workspace = state
-                            .mesh_workspace
-                            .clone()
-                            .unwrap_or_else(|| serde_json::json!({}));
-                        overlay_mesh_workspace(&mut workspace, &overlay_snapshot);
-                        state.mesh_workspace = Some(workspace);
-                    });
-                }
-            }
-        }
-    } else {
-        eprintln!("[fullmag] structured-grid mesh is already materialized for the active FDM plan");
-        let source_scene_revision = mesh_source_scene_revision(&opts);
-        let mesh_summary = serde_json::json!({
-            "kind": "mesh_build_summary",
-            "mesh_target": mesh_target_label,
-            "mesh_reason": mesh_reason,
-            "geometry_realization": mesh_geometry_realization_json(&opts),
-            "source_scene_revision": source_scene_revision,
-            "realization_revision": opts
-                .get("geometry_realization")
-                .and_then(|value| value.get("realization_revision"))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        });
-        live_workspace.update(|state| {
-            let mut workspace = state
-                .mesh_workspace
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({}));
-            workspace["active_build"] = serde_json::Value::Null;
-            workspace["last_build_error"] = serde_json::Value::Null;
-            workspace["last_build_summary"] = mesh_summary.clone();
-            workspace["mesh_pipeline_status"] = serde_json::Value::String("ready".to_string());
-            state.mesh_workspace = Some(workspace);
-        });
-        live_workspace.push_log(
-            "success",
-            "Remesh complete — FDM structured grid is current; no FEM remesh is required",
-        );
-    }
-
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5893,6 +5780,8 @@ pub(crate) fn build_session_manifest(
     finished_at_unix_ms: u128,
     plan_summary: serde_json::Value,
 ) -> SessionManifest {
+    // A managed run's receipt reports the latest requested/resolved selection.
+    crate::script_launch::note_runtime(runtime);
     SessionManifest {
         session_id: session_id.to_string(),
         run_id: run_id.to_string(),
@@ -5953,6 +5842,7 @@ pub(crate) fn run_manifest_from_steps(
         final_e_ext: steps.last().map(|step| step.e_ext),
         final_e_ani: steps.last().map(|step| step.e_ani),
         final_e_dmi: steps.last().map(|step| step.e_dmi),
+        final_e_rotated_dmi: steps.last().map(|step| step.e_rotated_dmi),
         final_e_total: steps.last().map(|step| step.e_total),
         artifact_dir: artifact_dir.display().to_string(),
     }
@@ -6045,6 +5935,7 @@ fn capture_pause_checkpoint(
             zeeman: step.map(|value| value.e_ext).unwrap_or(0.0),
             anisotropy: step.map(|value| value.e_ani).unwrap_or(0.0),
             dmi: step.map(|value| value.e_dmi).unwrap_or(0.0),
+            rotated_dmi: step.map(|value| value.e_rotated_dmi).unwrap_or(0.0),
             total: step.map(|value| value.e_total).unwrap_or(0.0),
         },
         magnetization: magnetization.to_vec(),
@@ -6132,6 +6023,9 @@ fn print_script_summary(summary: &ScriptRunSummary) {
     }
     if let Some(final_e_dmi) = summary.final_e_dmi {
         println!("- final_E_dmi: {:.6e} J", final_e_dmi);
+    }
+    if let Some(final_e_rotated_dmi) = summary.final_e_rotated_dmi {
+        println!("- final_E_rotated_dmi: {:.6e} J", final_e_rotated_dmi);
     }
     if let Some(final_e_total) = summary.final_e_total {
         println!("- final_E_total: {:.6e} J", final_e_total);
@@ -6236,6 +6130,7 @@ fn refresh_problem_energy_state(
         state.live_state.latest_step.e_ext = step_stats.e_ext;
         state.live_state.latest_step.e_ani = step_stats.e_ani;
         state.live_state.latest_step.e_dmi = step_stats.e_dmi;
+        state.live_state.latest_step.e_rotated_dmi = step_stats.e_rotated_dmi;
         state.live_state.latest_step.e_total = step_stats.e_total;
         state.live_state.latest_step.max_dm_dt = step_stats.max_dm_dt;
         state.live_state.latest_step.max_h_eff = step_stats.max_h_eff;
@@ -6305,7 +6200,7 @@ fn classify_wait_for_solve_command(kind: &str) -> WaitForSolveCommandAction {
         "compute_energies" => WaitForSolveCommandAction::RefreshEnergies,
         "set_solver_profile" => WaitForSolveCommandAction::ConfigureProfiler,
         "solve" | "compute" | "run" | "relax" => WaitForSolveCommandAction::StartSolver,
-        "remesh" => WaitForSolveCommandAction::Remesh,
+        "remesh" | "fdm_grid_refresh" => WaitForSolveCommandAction::Remesh,
         "stop" => WaitForSolveCommandAction::Stop,
         _ => WaitForSolveCommandAction::Ignore,
     }
@@ -6947,11 +6842,23 @@ fn resolve_rayon_cpu_threads(
 }
 
 pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
-    let args = ScriptCli::parse_from(raw_args);
+    let mut args = ScriptCli::parse_from(raw_args);
+    let ui_plan = crate::script_launch::ui_plan(&args);
+    if ui_plan == crate::script_launch::UiPlan::None {
+        // `--ui none` is the headless web side.
+        args.headless = true;
+    }
+    if let Some(port) = args.api_port {
+        // `--api-port` replaces the FULLMAG_API_PORT convention for this run.
+        std::env::set_var("FULLMAG_API_PORT", port.to_string());
+    }
     if args.headless {
         init_headless_api_port()?;
     } else {
         init_api_port()?;
+    }
+    if crate::script_launch::is_managed_run() && api_port() != 0 {
+        crate::script_launch::note_api_port(api_port());
     }
 
     // Eagerly configure the global Rayon pool used by Rust-side control-plane
@@ -7006,12 +6913,16 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     }
     crate::live_workspace::init_feature_flags(feature_flags);
 
-    let started_at_unix_ms = unix_time_millis()?;
+    let started_at_unix_ms = attached_session_started_at_or(unix_time_millis()?)?;
     let script_path = args
         .script
         .canonicalize()
         .with_context(|| format!("failed to resolve script path {}", args.script.display()))?;
-    check_script_syntax_via_python(&script_path)?;
+    if let Err(error) = check_script_syntax_via_python(&script_path) {
+        crate::script_launch::mark_failure(crate::script_launch::ExitKind::Syntax);
+        return Err(error);
+    }
+    crate::script_launch::note_stage(crate::script_launch::Stage::Materializing);
     eprintln!("fullmag syntax check passed");
     eprintln!("- script: {}", script_path.display());
     let requested_backend_name = args
@@ -7033,6 +6944,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         std::process::id()
     ));
     let run_id = format!("run-{}", session_id);
+    crate::script_launch::note_ids(&session_id, &run_id);
     let default_session_root = runtime_state_root(&repo_root())
         .join("local-live")
         .join("history");
@@ -7041,23 +6953,21 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     } else {
         args.session_root.as_path()
     };
-    let output_paths = resolve_script_output_paths(
-        &script_path,
-        args.output_dir.as_deref(),
-        session_root,
-        &session_id,
-    );
-    let workspace_dir = output_paths.workspace_dir.clone();
-    let artifact_dir = output_paths.artifact_dir.clone();
-
-    if output_paths.is_sibling_zarr_bundle {
-        replace_and_initialize_script_result_bundle(&output_paths, &script_path, &session_id)?;
-        eprintln!("- result_bundle: {}", workspace_dir.display());
-    } else {
-        fs::create_dir_all(&workspace_dir).with_context(|| {
-            format!("failed to create workspace dir {}", workspace_dir.display())
-        })?;
-    }
+    // Keep preparation state in its session directory until authored storage has
+    // been captured and the shared lease reserves the actual result directory.
+    let mut output_paths = ScriptOutputPaths {
+        workspace_dir: session_root.join(&session_id),
+        artifact_dir: session_root.join(&session_id).join("artifacts"),
+        is_sibling_zarr_bundle: false,
+    };
+    let mut workspace_dir = output_paths.workspace_dir.clone();
+    let mut artifact_dir = output_paths.artifact_dir.clone();
+    fs::create_dir_all(&artifact_dir).with_context(|| {
+        format!(
+            "failed to create session artifact directory {}",
+            artifact_dir.display()
+        )
+    })?;
     // When 3D preview is disabled, set field_every_n to infinity to skip expensive computations.
     // Keep FEM cadence aligned with interactive control-room expectations:
     // too-large step intervals make 3D magnetization look "stuck" even while
@@ -7074,7 +6984,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     let preview_every_n_override = preview_every_n_override_raw
         .as_ref()
         .map(|_| field_every_n as u32);
-    let current_live_publisher = CurrentLivePublisher::spawn(&session_id);
+    let grid_refresh_command_id = std::env::var("FULLMAG_ATTACHED_GRID_REFRESH_COMMAND_ID").ok();
+    let current_live_publisher = if grid_refresh_command_id.is_some() {
+        CurrentLivePublisher::unpublished_grid_refresh()
+    } else {
+        CurrentLivePublisher::spawn(&session_id)
+    };
     let bootstrapping_runtime = requested_runtime_selection(
         &requested_backend_name,
         false,
@@ -7131,8 +7046,11 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         },
         current_live_publisher.clone(),
     );
-    let display_selection_handle =
-        CurrentLiveDisplaySelectionHandle::spawn_for_session(Some(session_id.clone()));
+    let display_selection_handle = if let Some(command_id) = grid_refresh_command_id.as_ref() {
+        CurrentLiveDisplaySelectionHandle::spawn_for_grid_refresh(session_id.clone(), command_id.clone())
+    } else {
+        CurrentLiveDisplaySelectionHandle::spawn_for_session(Some(session_id.clone()))
+    };
     live_workspace.push_log(
         "system",
         format!(
@@ -7188,6 +7106,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         let phase1_backend = args.backend;
         let phase1_mode = args.mode;
         let phase1_precision = args.precision;
+        let phase1_execution_layers = crate::python_bridge::script_cli_execution_layers(&args)?;
         let phase1_runtime_device = crate::python_bridge::managed_execution_device(
             phase1_backend,
             std::env::var("FULLMAG_FEM_EXECUTION").ok().as_deref(),
@@ -7241,8 +7160,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     let stdout = String::from_utf8(output.stdout)
                         .context("phase-1 output not valid UTF-8")?;
                     let json_str = crate::python_bridge::extract_json_from_stdout(&stdout)?;
-                    serde_json::from_str(json_str)
-                        .context("failed to deserialize phase-1 script execution config")
+                    let mut config = serde_json::from_str(json_str)
+                        .context("failed to deserialize phase-1 script execution config")?;
+                    crate::python_bridge::bind_script_execution_profiles(
+                        &mut config,
+                        &phase1_execution_layers,
+                        phase1_runtime_device,
+                    )?;
+                    Ok(config)
                 })
                 .context("failed to spawn phase-1 materialization thread"),
         )?)
@@ -7255,16 +7180,22 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             &live_workspace,
             "control_room_bootstrap_failed",
             "Control Room bootstrap failed",
-            spawn_control_room(&session_id, args.dev, args.web_port, &live_workspace).with_context(
-                || {
-                    format!(
-                        "failed to bootstrap control room for workspace {}",
-                        session_id
-                    )
-                },
-            ),
+            spawn_control_room(
+                &session_id,
+                args.dev,
+                args.web_port,
+                &live_workspace,
+                ui_plan,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to bootstrap control room for workspace {}",
+                    session_id
+                )
+            }),
         )?;
         eprintln!("fullmag control room bootstrap verified");
+        crate::script_launch::note_ui_ready();
         live_workspace.push_log("system", "Control room bootstrap verified");
         _control_room_guard = ControlRoomGuard::active(web_port, child, frontend_child);
         let failed_workspace = live_workspace.clone();
@@ -7280,9 +7211,28 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     // The bridge ignores this script-backed session and only attaches a fresh
     // runtime after the browser explicitly replaces it with a runnable scene.
     let _scratch_runtime = if !args.headless {
-        std::env::current_exe().ok().map(|executable| {
-            crate::scratch_runtime::spawn(api_port(), executable, Some(session_id.clone()))
-        })
+        std::env::current_exe()
+            .ok()
+            .map(|executable| {
+                fullmag_runtime_control::application_attach::prepare_for_authoring(
+                    &crate::control_room::repo_root(),
+                    &crate::control_room::runtime_state_root(&crate::control_room::repo_root()),
+                    api_port(),
+                )
+                .map(|binding| {
+                    crate::scratch_runtime::spawn(
+                        api_port(),
+                        executable,
+                        Some(session_id.clone()),
+                        binding.api_instance_id().to_owned(),
+                    )
+                })
+                .map_err(|error| {
+                    eprintln!("[fullmag] scratch observer identity unavailable: {error:#}")
+                })
+                .ok()
+            })
+            .flatten()
     } else {
         None
     };
@@ -7420,7 +7370,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         )
     };
     let script_export = authoritative_preflight_error.map_or_else(export_full_script, Err);
-    let script_config = match script_export {
+    let mut script_config = match script_export {
         Ok(config) => config,
         Err(error) => {
             let error =
@@ -7480,6 +7430,54 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             return Err(error);
         }
     };
+    // Grid authoring must not reserve the user's next scientific output path
+    // or modify its existing-output policy in the canonical script/IR.
+    let (mut storage_lease, storage_settings, resolved_storage) =
+        if let Some(command_id) = grid_refresh_command_id.as_deref() {
+            prepare_grid_operation_storage(&workspace_dir, command_id, &script_path)?
+        } else {
+            prepare_script_output_storage(&mut script_config, &args, &script_path, &run_id)?
+        };
+    workspace_dir = storage_lease.resolved().output_dir.clone();
+    crate::script_launch::note_results_dir(&workspace_dir);
+    crate::script_launch::note_source_hash(script_config.ir.problem_meta.source_hash.as_deref());
+    artifact_dir = workspace_dir.join("artifacts");
+    output_paths = ScriptOutputPaths {
+        workspace_dir: workspace_dir.clone(),
+        artifact_dir: artifact_dir.clone(),
+        is_sibling_zarr_bundle: storage_settings.data_format == OutputDataFormatIR::Zarr,
+    };
+    fs::create_dir_all(&artifact_dir).with_context(|| {
+        format!(
+            "failed to create project artifact directory {}",
+            artifact_dir.display()
+        )
+    })?;
+    fs::create_dir_all(workspace_dir.join("stages")).with_context(|| {
+        format!(
+            "failed to create project stage directory {}",
+            workspace_dir.join("stages").display()
+        )
+    })?;
+    if output_paths.is_sibling_zarr_bundle {
+        initialize_zarr_group(
+            &artifact_dir,
+            serde_json::json!({"fullmag_role": "final_stage_artifacts"}),
+        )?;
+        initialize_zarr_group(
+            &workspace_dir.join("stages"),
+            serde_json::json!({"fullmag_role": "stage_artifacts"}),
+        )?;
+        eprintln!("- result_bundle: {}", workspace_dir.display());
+    }
+    live_workspace.update(|state| {
+        state.session.artifact_dir = artifact_dir.display().to_string();
+        state.run.artifact_dir = artifact_dir.display().to_string();
+        state.metadata = Some(serde_json::json!({
+            "output_storage": storage_settings,
+            "resolved_output_storage": resolved_storage,
+        }));
+    });
     let mut stages = run_active_preparation_operation(
         &live_workspace,
         "script_materialization_failed",
@@ -7660,7 +7658,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         script_requested_interactive,
         args.headless,
     );
-    let final_session_runtime = stages
+    let mut final_session_runtime = stages
         .last()
         .map(|stage| {
             session_runtime_selection_for_problem(
@@ -8166,6 +8164,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             .unwrap_or(false);
     let _is_fem_backend = matches!(&initial_execution_plan.backend_plan, BackendPlanIR::Fem(_));
     let wait_for_solve_supported = wait_for_solve_supported(&initial_execution_plan.backend_plan);
+    if let Some(command_id) = grid_refresh_command_id.as_deref() {
+        anyhow::ensure!(
+            !command_id.is_empty()
+                && wait_for_solve_should_block(wait_for_solve_requested, wait_for_solve_supported, args.headless)
+                && matches!(&initial_execution_plan.backend_plan, BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_)),
+            "grid-only attached runtime requires an interactive FDM wait-for-solve command pin"
+        );
+    }
 
     if wait_for_solve_should_block(
         wait_for_solve_requested,
@@ -8175,6 +8181,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         let wait_message = wait_for_solve_prompt(&initial_execution_plan.backend_plan);
         eprintln!("[fullmag] {}", wait_message.to_lowercase());
         live_workspace.push_log("system", wait_message);
+        crate::script_launch::note_stage(crate::script_launch::Stage::WaitingForSolve);
         // Switch to slow publish mode — solver loop will produce its own cadenced updates.
         live_workspace.set_publish_fast_mode(false);
         live_workspace.update(|state| {
@@ -8398,6 +8405,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                     &remesh_result.object_region_markers,
                                     current_adaptive_runtime_state.as_ref(),
                                     Some(remeshed_plan.clone()),
+                                    None,
                                 )?;
 
                                 if new_ram <= ram_budget {
@@ -8489,6 +8497,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         }
 
         loop {
+            if display_selection_handle.grid_refresh_command_refused() {
+                bail!("grid-only control receiver refused an unpinned command");
+            }
             if display_selection_handle.owner_session_lost() {
                 live_workspace.push_log(
                     "warning",
@@ -8646,6 +8657,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     continue;
                 }
                 WaitForSolveCommandAction::StartSolver => {
+                    anyhow::ensure!(grid_refresh_command_id.is_none(), "grid-only runtime cannot execute a solver command");
                     if matches!(cmd.kind.as_str(), "relax" | "run" | "solve") {
                         let frozen_binding_summary = cmd
                             .frozen_spins_runtime_plan_binding
@@ -8679,7 +8691,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                     continue;
                                 }
                             };
-                        let Some(mut command_stage) = (match build_interactive_command_stage(
+                        let Some(mut command_stage) = (match crate::step_utils::build_initial_interactive_command_stage(
+                            &stages[0],
                             &command_base_ir,
                             &cmd,
                         ) {
@@ -8747,6 +8760,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                 Ok(None) => "no certificate".to_string(),
                                 Err(error) => format!("invalid certificate: {error}"),
                             };
+                        if cmd.kind == "solve" {
+                            command_stage.entrypoint_kind = stages[0].entrypoint_kind.clone();
+                            command_stage.ir.problem_meta.entrypoint_kind =
+                                stages[0].ir.problem_meta.entrypoint_kind.clone();
+                            command_stage.incoming_transition =
+                                stages[0].incoming_transition.clone();
+                        }
                         stages[0] = command_stage;
                         stage_execution_plans[0] = command_plan.clone();
                         initial_execution_plan = command_plan;
@@ -8793,7 +8813,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     break;
                 }
                 WaitForSolveCommandAction::Remesh => {
-                    execute_manual_interactive_remesh(
+                    if let Some(expected_id) = grid_refresh_command_id.as_deref() {
+                        anyhow::ensure!(
+                            cmd.kind == "fdm_grid_refresh" && cmd.command_id == expected_id,
+                            "grid-only runtime received a different command"
+                        );
+                    }
+                    let remesh_summary = execute_manual_interactive_remesh(
                         &cmd,
                         &mut stages,
                         &mut stage_execution_plans,
@@ -8804,19 +8830,27 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         &mut current_fem_mesh_override,
                         &mut current_fem_hmax_override,
                         &current_adaptive_runtime_state,
-                    )?;
-                    if continuation_magnetization.take().is_some() {
-                        live_workspace.push_log(
-                            "info",
-                            "Remesh changed the solver mesh; previous continuation magnetization was cleared",
-                        );
+                        &mut continuation_magnetization,
+                        &mut continuation_source,
+                        &mut continuation_completion,
+                        None,
+                        args.backend.map(BackendTarget::from),
+                    );
+                    let remesh_succeeded = remesh_summary.is_some();
+                    if let Some(summary) = remesh_summary {
+                        current_plan_summary = summary;
+                        continuation_relax_handoff = None;
                     }
-                    continuation_source = None;
-                    continuation_completion = None;
-                    continuation_relax_handoff = None;
+                    if grid_refresh_command_id.is_some() {
+                        let payload = live_workspace.grid_refresh_snapshot()?;
+                        sync_current_live_snapshot(&session_id, &payload)?;
+                        storage_lease.finish(remesh_succeeded)?;
+                        return Ok(());
+                    }
                 }
                 WaitForSolveCommandAction::Stop => {
                     eprintln!("[fullmag] aborted by user during wait_for_solve");
+                    crate::script_launch::mark_failure(crate::script_launch::ExitKind::Stopped);
                     live_workspace.push_log("system", "Aborted by user");
                     live_workspace.update(|state| {
                         state.session.status = "stopped".to_string();
@@ -8847,6 +8881,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         );
     }
 
+    crate::script_launch::note_stage(crate::script_launch::Stage::Running);
     for (stage_index, (mut stage, materialized_execution_plan)) in stages
         .into_iter()
         .zip(stage_execution_plans.into_iter())
@@ -9024,6 +9059,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 stage.entrypoint_kind
             ),
         );
+        let stage_application_boundary = start_solver_command_id.as_deref().map(|command_id| {
+            CommandApplicationBoundary::new(
+                &run_id,
+                command_id,
+                stage_initial_update.stats.step,
+                stage_initial_update.stats.time,
+            )
+        });
         live_workspace.update(|state| {
             let stage_runtime = session_runtime_selection_for_problem(
                 &stage.ir,
@@ -9073,6 +9116,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 Some(current_stage_artifact_dir.display().to_string()),
                 None,
                 stage.incoming_transition.as_ref(),
+            );
+            attach_scripted_stage_solver_steps(
+                &mut next_stage_execution,
+                stage_index,
+                stage_application_boundary.as_ref(),
+                None,
             );
             preserve_terminal_stage_history(
                 &mut next_stage_execution,
@@ -9208,6 +9257,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     stage_index,
                     stage_fem_mesh_asset.as_ref(),
                 );
+                if interactive_requested && is_session_final_stage {
+                    publish_scripted_stages_awaiting_command(&mut next_stage_execution);
+                }
                 state.stage_execution = Some(next_stage_execution);
             });
 
@@ -9650,6 +9702,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         }
 
         let offset_steps = offset_step_stats(&stage_result.steps, step_offset, time_offset);
+        let completed_step = offset_steps.last().map(|last| last.step);
         if let Some(last) = offset_steps.last() {
             step_offset = last.step;
             time_offset = last.time;
@@ -9659,6 +9712,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         let next_continuation_completion = stage_result.completion.clone();
         let next_continuation_certified_fields =
             if matches!(&stage.ir.study, fullmag_ir::StudyIR::Relaxation { .. })
+                && matches!(&execution_plan.backend_plan, BackendPlanIR::Fem(_))
                 && stage_result.completion.as_ref().is_some_and(|completion| {
                     completion.status == "completed" && completion.converged
                 })
@@ -9680,6 +9734,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             };
         let next_continuation_recomputed_certificate =
             if matches!(&stage.ir.study, fullmag_ir::StudyIR::Relaxation { .. })
+                && matches!(&execution_plan.backend_plan, BackendPlanIR::Fem(_))
                 && stage_result.completion.as_ref().is_some_and(|completion| {
                     completion.status == "completed" && completion.converged
                 })
@@ -9863,12 +9918,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         {
             let final_step = stage_result.steps.last();
             eprintln!(
-                "[fullmag] stage {}/{} ({}) {} — steps={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
+                "[fullmag] stage {}/{} ({}) {} — samples={}  final_step={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
                 stage_index + 1,
                 stage_count,
                 stage.entrypoint_kind,
                 stage_status,
                 stage_result.steps.len(),
+                final_step.map(|s| s.step).unwrap_or(0),
                 final_step.map(|s| s.time).unwrap_or(0.0),
                 final_step.map(|s| s.max_torque_T).unwrap_or(0.0),
                 format_stop_reason(stage_result.completion.as_ref()),
@@ -9899,6 +9955,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 stage_result.completion.as_ref(),
                 stage.incoming_transition.as_ref(),
             );
+            attach_scripted_stage_solver_steps(
+                &mut next_stage_execution,
+                stage_index,
+                stage_application_boundary.as_ref(),
+                completed_step,
+            );
             preserve_terminal_stage_history(
                 &mut next_stage_execution,
                 previous_stage_execution.as_ref(),
@@ -9908,6 +9970,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 stage_index,
                 stage_fem_mesh_asset.as_ref(),
             );
+            if interactive_requested && is_session_final_stage && !stage_failed {
+                publish_scripted_stages_awaiting_command(&mut next_stage_execution);
+            }
             state.stage_execution = Some(next_stage_execution);
             if stage_failed {
                 state.session.status = "failed".to_string();
@@ -9940,15 +10005,15 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         );
 
         // Build session context for interactive command loop
-        let ctx = crate::runtime_supervisor::InteractiveSessionContext {
+        let mut ctx = crate::runtime_supervisor::InteractiveSessionContext {
             session_id: session_id.clone(),
             run_id: run_id.clone(),
             interactive_requested,
             script_path: script_path.clone(),
             final_problem_name: final_problem_name.clone(),
-            requested_backend: final_requested_backend,
-            execution_mode: final_execution_mode,
-            precision: final_precision,
+            runtime_selection: crate::runtime_supervisor::runtime_selection_from_manifest(
+                &live_workspace.snapshot().session,
+            ),
             artifact_dir: artifact_dir.clone(),
             workspace_dir: workspace_dir.clone(),
             started_at_unix_ms,
@@ -9957,6 +10022,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
 
         if paused_stage.is_none() {
             live_workspace.update(|state| {
+                if let Some(execution) = state.stage_execution.as_mut() {
+                    publish_scripted_stages_awaiting_command(execution);
+                }
                 state.session = ctx.build_session(
                     "awaiting_command",
                     &plan_summary_json(&current_plan_summary),
@@ -10385,7 +10453,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     .enter_awaiting_command(continuation_magnetization.clone(), &live_workspace);
             }
 
-            if command.kind == "remesh" {
+            if matches!(command.kind.as_str(), "remesh" | "fdm_grid_refresh") {
                 let mut remesh_problem = interactive_template_ir.clone();
                 apply_current_fem_overrides(
                     &mut remesh_problem,
@@ -10398,9 +10466,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     0.0,
                     "interactive_remesh",
                 )];
-                let mut remesh_stage_plans = vec![fullmag_plan::plan(&remesh_stages[0].ir)
-                    .map_err(|error| anyhow!(error.to_string()))?];
-                execute_manual_interactive_remesh(
+                let mut remesh_stage_plans = Vec::new();
+                if let Some(summary) = execute_manual_interactive_remesh(
                     &command,
                     &mut remesh_stages,
                     &mut remesh_stage_plans,
@@ -10411,25 +10478,17 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     &mut current_fem_mesh_override,
                     &mut current_fem_hmax_override,
                     &current_adaptive_runtime_state,
-                )?;
-                if continuation_magnetization.take().is_some() {
-                    live_workspace.push_log(
-                        "info",
-                        "Remesh changed the solver mesh; previous continuation magnetization was cleared",
-                    );
+                    &mut continuation_magnetization,
+                    &mut continuation_source,
+                    &mut continuation_completion,
+                    Some(&mut interactive_runtime_host),
+                    args.backend.map(BackendTarget::from),
+                ) {
+                    interactive_template_ir = remesh_stages.remove(0).ir;
+                    current_plan_summary = summary;
+                    drop(continuation_relax_handoff.take());
+                    interactive_runtime_host.enter_awaiting_command(None, &live_workspace);
                 }
-                continuation_source = None;
-                continuation_completion = None;
-                drop(continuation_relax_handoff.take());
-                if let Some(remesh_stage) = remesh_stages.into_iter().next() {
-                    interactive_template_ir = remesh_stage.ir;
-                    current_plan_summary = interactive_template_ir
-                        .plan_for(args.backend.map(BackendTarget::from))
-                        .map_err(join_errors)?;
-                    interactive_runtime_host.replace_base_problem(interactive_template_ir.clone());
-                }
-                interactive_runtime_host
-                    .enter_awaiting_command(continuation_magnetization.clone(), &live_workspace);
                 continue;
             }
 
@@ -10658,6 +10717,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 .map_err(join_errors)?;
             let execution_plan =
                 fullmag_plan::plan(&stage.ir).map_err(|error| anyhow!(error.to_string()))?;
+            ctx.runtime_selection = session_runtime_selection_for_problem(
+                &stage.ir,
+                Some(&execution_plan),
+                field_every_n,
+                backend_target_name(stage.ir.backend_policy.requested_backend),
+                execution_mode_name(stage.ir.validation_profile.execution_mode),
+                execution_precision_name(stage.ir.backend_policy.execution_precision),
+            );
             emit_initial_state_warnings(Some(&live_workspace), &stage.ir, &execution_plan)?;
             let use_live_callback = matches!(
                 &execution_plan.backend_plan,
@@ -10704,6 +10771,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     .get("sampling_resolution"),
             )?;
             let running_at_unix_ms = unix_time_millis()?;
+            let application_boundary = CommandApplicationBoundary::new(
+                &run_id,
+                &command.command_id,
+                step_offset,
+                time_offset,
+            );
             let stage_fem_mesh_asset = fullmag_runner::StageFemMeshAsset::build_from_backend_plan(
                 &execution_plan.backend_plan,
             );
@@ -10723,6 +10796,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     &command.command_id,
                     running_at_unix_ms,
                     Some(current_stage_artifact_dir.display().to_string()),
+                    Some(&application_boundary),
                 );
                 sequence.mark_current_fem_mesh_identity(stage_fem_mesh_asset.as_ref());
             }
@@ -11483,6 +11557,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             }
 
             let offset_steps = offset_step_stats(&stage_result.steps, step_offset, time_offset);
+            let completed_step = offset_steps.last().map(|last| last.step);
             if let Some(last) = offset_steps.last() {
                 step_offset = last.step;
                 time_offset = last.time;
@@ -11510,9 +11585,10 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 {
                     let final_step = stage_result.steps.last();
                     eprintln!(
-                        "[fullmag] {} — steps={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
+                        "[fullmag] {} — samples={}  final_step={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
                         stage_message,
                         stage_result.steps.len(),
+                        final_step.map(|s| s.step).unwrap_or(0),
                         final_step.map(|s| s.time).unwrap_or(0.0),
                         final_step.map(|s| s.max_torque_T).unwrap_or(0.0),
                         format_stop_reason(stage_result.completion.as_ref()),
@@ -11523,6 +11599,10 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
 
             // ── Sequence continuation: if there are more stages, advance ──
             if let Some(sequence) = active_sequence.as_mut() {
+                let current_stage_index = sequence.current_stage_index();
+                if let Some(record) = sequence.stages.get_mut(current_stage_index) {
+                    record.completed_step = completed_step;
+                }
                 sequence.mark_current(
                     "completed",
                     stage_result.completion.as_ref(),
@@ -11588,6 +11668,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 .enter_awaiting_command(continuation_magnetization.clone(), &live_workspace);
             paused_stage = None;
         }
+        final_session_runtime = ctx.runtime_selection.clone();
         interactive_runtime_host.mark_closed(&live_workspace);
         if display_selection_handle.owner_session_lost() {
             return Ok(());
@@ -11651,6 +11732,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         final_e_ext: aggregated_steps.last().map(|step| step.e_ext),
         final_e_ani: aggregated_steps.last().map(|step| step.e_ani),
         final_e_dmi: aggregated_steps.last().map(|step| step.e_dmi),
+        final_e_rotated_dmi: aggregated_steps.last().map(|step| step.e_rotated_dmi),
         final_e_total: aggregated_steps.last().map(|step| step.e_total),
         wall_time_ns: aggregated_steps.last().map(|step| step.wall_time_ns),
         backend_create_wall_time_ns: aggregated_steps
@@ -11727,6 +11809,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     };
 
     live_workspace.update(|state| {
+        if let Some(execution) = state.stage_execution.as_mut() {
+            *execution = stage_execution_from_records(
+                &execution.stages,
+                None,
+                None,
+                &summary.status,
+            );
+        }
         state.session = build_session_manifest(
             &session_id,
             &run_id,
@@ -11765,6 +11855,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             e_ext: step.e_ext,
             e_ani: step.e_ani,
             e_dmi: step.e_dmi,
+            e_rotated_dmi: step.e_rotated_dmi,
             e_total: step.e_total,
             max_dm_dt: step.max_dm_dt,
             max_h_eff: step.max_h_eff,
@@ -11793,6 +11884,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     } else {
         print_script_summary(&summary);
     }
+    storage_lease.finish(true)?;
 
     Ok(())
 }
@@ -11915,11 +12007,14 @@ mod tests {
         adaptive_remesh_backend_legality_reason, adaptive_remesh_legality_reason,
         apply_current_fem_overrides, apply_initial_magnetization_state_override,
         apply_live_step_update_to_workspace_state, apply_remeshed_problem_snapshot_to_stages,
-        apply_stage_heartbeat_progress, apply_terminal_live_step_update_to_workspace_state,
+        apply_scene_discretization_patch, apply_stage_heartbeat_progress,
+        apply_terminal_live_step_update_to_workspace_state,
         attach_initial_magnetization_state_override_metadata, attach_region_realization_revisions,
-        attach_stage_fem_mesh_identity, classify_wait_for_solve_command,
-        continuation_source_from_backend_plan, cumulative_rhs_evals, default_domain_region_markers,
-        deferred_mesh_failure_stage, discard_active_paused_stage_execution,
+        attach_stage_fem_mesh_identity, attach_scripted_stage_solver_steps,
+        classify_wait_for_solve_command,
+        continuation_source_from_backend_plan, cumulative_rhs_evals, current_fdm_mesh_workspace,
+        default_domain_region_markers, deferred_mesh_failure_stage,
+        discard_active_paused_stage_execution,
         ensure_frequency_response_relaxed_continuation_is_qualified, execute_synthetic_stage,
         fail_owned_preparation_stage, fem_gpu_memory_preflight_message,
         fem_interactive_dense_ram_estimate, fem_live_mesh_payload_and_initial_magnetization,
@@ -11931,6 +12026,7 @@ mod tests {
         mesh_source_scene_revision, offset_step_update, own_preparation_boundary_failure,
         plan_materialized_stage_snapshot, prepare_remesh_stage_transaction,
         preserve_terminal_stage_history, project_script_export_failure,
+        publish_scripted_stages_awaiting_command,
         replace_continuation_after_synthetic_stage, requested_execution_device_for_overrides,
         resolve_adaptive_convergence_metric, resolve_preview_field_every_n,
         resolve_rayon_cpu_threads, resolved_shared_domain_object_region_markers,
@@ -11942,10 +12038,11 @@ mod tests {
         step_update_has_frequency_response_progress, user_cancelled_stage_completion,
         validate_periodic_remesh_candidate, wait_for_failed_preparation_close,
         wait_for_solve_prompt, wait_for_solve_should_block, wait_for_solve_supported,
-        write_sampling_resolution_stage_record, ActiveSequenceState, ContinuationStageSource,
-        LiveProgressCadence, LoadedInitialMagnetizationState, RuntimeCommandPrecondition,
-        SceneProblemPatch, StageProgressHeartbeat, WaitForSolveCommandAction,
-        FEM_FREQUENCY_RESPONSE_PROGRESS_KEY, LIVE_PROGRESS_PUBLISH_INTERVAL,
+        write_sampling_resolution_stage_record, ActiveSequenceState, CommandApplicationBoundary,
+        ContinuationStageSource, LiveProgressCadence, LoadedInitialMagnetizationState,
+        RuntimeCommandPrecondition, SceneProblemPatch, StageProgressHeartbeat,
+        WaitForSolveCommandAction, FEM_FREQUENCY_RESPONSE_PROGRESS_KEY,
+        LIVE_PROGRESS_PUBLISH_INTERVAL,
     };
     use crate::live_workspace::{CurrentLivePublisher, LocalLiveWorkspace};
     use crate::simulation_preparation::{
@@ -12035,6 +12132,34 @@ mod tests {
             !production.contains("_ => ContinuationSource::Fdm"),
             "wildcard source classification aliases FEM eigen/frequency and unsupported backends to FDM"
         );
+    }
+
+    #[test]
+    fn fem_equilibrium_certificates_are_only_required_for_native_fem_relaxation() {
+        let source = include_str!("orchestrator.rs");
+        let production = source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("production source");
+        let certified_block = production
+            .split("let next_continuation_certified_fields =")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("let next_continuation_recomputed_certificate =")
+                    .next()
+            })
+            .expect("certified FEM equilibrium field handoff block");
+        let recomputed_block = production
+            .split("let next_continuation_recomputed_certificate =")
+            .nth(1)
+            .and_then(|tail| tail.split("let next_continuation_stage_source =").next())
+            .expect("recomputed FEM linearization certificate handoff block");
+        for block in [certified_block, recomputed_block] {
+            assert!(
+                block.contains("execution_plan.backend_plan")
+                    && block.contains("BackendPlanIR::Fem(_)")
+            );
+        }
     }
 
     #[test]
@@ -12398,12 +12523,41 @@ mod tests {
             &[],
             None,
             None,
+            Some(42),
         )
         .expect_err("a shared-domain candidate without a domain asset must fail before commit");
 
         assert!(error
             .to_string()
             .contains("shared-domain remesh produced no fem_domain_mesh_asset"));
+        assert_eq!(stages[0].ir, stages_before[0].ir);
+        assert_eq!(plans, plans_before);
+
+        let initial_plan =
+            fullmag_plan::plan(&stages[0].ir).expect("bootstrap problem should plan");
+        let prepared = prepare_remesh_stage_transaction(
+            &stages,
+            &[initial_plan],
+            None,
+            &candidate,
+            1.0,
+            false,
+            &[],
+            &[],
+            None,
+            None,
+            Some(42),
+        )
+        .expect("valid candidate should prepare without publishing");
+        assert_eq!(
+            prepared.stages[0].ir.problem_meta.runtime_metadata["mesh_source_scene_revision"],
+            serde_json::json!(42),
+        );
+        assert_eq!(
+            prepared.stage_execution_plans[0],
+            fullmag_plan::plan(&prepared.stages[0].ir)
+                .expect("candidate plan must reflect the updated stage snapshot"),
+        );
         assert_eq!(stages[0].ir, stages_before[0].ir);
         assert_eq!(plans, plans_before);
     }
@@ -12557,6 +12711,7 @@ mod tests {
                 final_e_ext: None,
                 final_e_ani: None,
                 final_e_dmi: None,
+                final_e_rotated_dmi: None,
                 final_e_total: None,
                 artifact_dir: "/tmp/artifacts".to_string(),
             },
@@ -13191,6 +13346,10 @@ mod tests {
             let workspace = serde_json::json!({
                 "last_build_error": "raw mesher failure",
                 "last_build_summary": {
+                    "build_id": "mesh:last-good",
+                    "status": "completed"
+                },
+                "last_build_attempt": {
                     "phase": phase,
                     "message": "Shared-domain mesh build failed"
                 }
@@ -13199,6 +13358,19 @@ mod tests {
             assert_eq!(
                 deferred_mesh_failure_stage(Some(&workspace)),
                 Some(stage_id)
+            );
+
+            let legacy_workspace = serde_json::json!({
+                "last_build_error": "raw mesher failure",
+                "last_build_summary": {
+                    "phase": phase,
+                    "message": "Shared-domain mesh build failed"
+                }
+            });
+            assert_eq!(
+                deferred_mesh_failure_stage(Some(&legacy_workspace)),
+                Some(stage_id),
+                "legacy failure summaries remain readable"
             );
         }
     }
@@ -14038,17 +14210,17 @@ mod tests {
             "interactive remesh must mutate both stage IR snapshots and materialized execution plans"
         );
         assert!(
-            source.contains("interactive_template_ir = remesh_stage.ir;")
+            source.contains("interactive_template_ir = remesh_stages.remove(0).ir;")
                 && source.contains(
-                    "interactive_runtime_host.replace_base_problem(interactive_template_ir.clone())"
+                    "Some(&mut interactive_runtime_host)"
                 ),
             "post-script interactive remesh must update the base problem used by later run/relax commands"
         );
+        let remesh_source = include_str!("orchestrator/manual_remesh.rs");
         assert!(
-            source
-                .matches("previous continuation magnetization was cleared")
-                .count()
-                >= 2,
+            remesh_source.contains("*continuation = None;")
+                && remesh_source.contains("*continuation_source = None;")
+                && remesh_source.contains("*continuation_completion = None;"),
             "interactive remesh must not let old-mesh continuation magnetization override the refreshed solver mesh"
         );
         assert!(
@@ -14184,6 +14356,75 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn mesh_build_overlay_keeps_last_successful_artifact_during_new_attempt() {
+        let last_success = serde_json::json!({
+            "build_id": "mesh:previous-success",
+            "status": "completed",
+            "source_scene_revision": 12
+        });
+        let airbox_target = serde_json::json!({ "hmax": "5e-9" });
+        let per_object_targets = serde_json::json!({
+            "film": { "hmax": "2e-9" }
+        });
+        let mut workspace = serde_json::json!({
+            "last_build_summary": last_success,
+            "effective_airbox_target": airbox_target,
+            "effective_per_object_targets": per_object_targets,
+            "last_build_error": "an earlier build failed"
+        });
+        let mut overlay = super::CurrentMeshBuildOverlay {
+            active_build: Some(serde_json::json!({ "build_id": "mesh:next-attempt" })),
+            effective_airbox_target: None,
+            effective_per_object_targets: None,
+            last_build_summary: None,
+            last_build_error: None,
+            active_phase: Some("meshing".to_string()),
+            progress_percent: None,
+            progress_label: None,
+            attempt_index: None,
+            algorithm_3d: None,
+            attempt_status: None,
+            attempt_failure_reason: None,
+            next_algorithm_3d: None,
+            progress_kind: None,
+            last_recoverable_attempt: None,
+            phase_started_at: Instant::now(),
+            phase_durations_ms: Vec::new(),
+            failed: false,
+        };
+
+        super::overlay_mesh_workspace(&mut workspace, &overlay);
+
+        assert_eq!(
+            workspace["last_build_summary"]["build_id"],
+            "mesh:previous-success"
+        );
+        assert_eq!(workspace["effective_airbox_target"], airbox_target);
+        assert_eq!(
+            workspace["effective_per_object_targets"],
+            per_object_targets
+        );
+        assert!(workspace["last_build_error"].is_null());
+        assert_eq!(workspace["active_build"]["build_id"], "mesh:next-attempt");
+
+        overlay.active_build = None;
+        overlay.effective_airbox_target = Some(serde_json::Value::Null);
+        overlay.effective_per_object_targets = Some(serde_json::Value::Null);
+        overlay.last_build_summary = Some(serde_json::json!({
+            "build_id": "mesh:next-success",
+            "status": "completed"
+        }));
+        super::overlay_mesh_workspace(&mut workspace, &overlay);
+
+        assert_eq!(
+            workspace["last_build_summary"]["build_id"],
+            "mesh:next-success"
+        );
+        assert!(workspace["effective_airbox_target"].is_null());
+        assert!(workspace["effective_per_object_targets"].is_null());
     }
 
     #[test]
@@ -14913,6 +15154,96 @@ mod tests {
         })
     }
 
+    #[test]
+    fn fdm_grid_refresh_workspace_exposes_new_generation_and_mask_contract() {
+        let BackendPlanIR::Fdm(mut plan) = tiny_fdm_plan() else {
+            panic!("test fixture must be an FDM plan");
+        };
+        plan.region_mask = vec![1];
+        let workspace = current_fdm_mesh_workspace(&plan, "awaiting_command", &[]);
+
+        assert_eq!(
+            workspace["mesh_summary"]["cells"],
+            serde_json::json!([1, 1, 1])
+        );
+        assert_eq!(
+            workspace["mesh_summary"]["cell_size_m"],
+            serde_json::json!([5e-9, 5e-9, 5e-9])
+        );
+        assert_eq!(
+            workspace["mesh_summary"]["generation_id"],
+            "fdm:fdm-grid-1x1x1"
+        );
+        assert_eq!(workspace["mesh_summary"]["active_cells"], 1);
+        assert_eq!(workspace["mesh_capabilities"]["has_structured_grid"], true);
+        assert_eq!(workspace["mesh_capabilities"]["has_membership_mask"], true);
+        assert_eq!(workspace["mesh_capabilities"]["supports_grid_replan"], true);
+    }
+
+    #[test]
+    fn fdm_grid_refresh_patch_normalizes_policy_and_runtime_selection() {
+        let mut problem = ProblemIR::bootstrap_example();
+        let geometry_before = problem.geometry.clone();
+        let materials_before = problem.materials.clone();
+        let magnets_before = problem.magnets.clone();
+        let regions_before = problem.regions.clone();
+        let object_regions_before = problem.object_regions.clone();
+        let patch = SceneProblemPatch {
+            geometry_entries: Vec::new(),
+            magnets: Vec::new(),
+            materials: Vec::new(),
+            regions: Vec::new(),
+            object_regions: Vec::new(),
+            universe: None,
+            fdm: Some(serde_json::json!({
+                "default_cell": [1e-9, 2e-9, 3e-9],
+                "per_object_grid": {
+                    "magnet": {"cell": [4e-9, 5e-9, 6e-9]}
+                },
+                "demag": {"strategy": "auto", "mode": "auto", "explain": true}
+            })),
+            runtime_selection: Some(serde_json::json!({
+                "backend": "fdm",
+                "device": "gpu",
+                "precision": "double"
+            })),
+        };
+
+        apply_scene_discretization_patch(&mut problem, &patch)
+            .expect("FDM discretization patch should be valid");
+
+        assert_eq!(problem.backend_policy.requested_backend, BackendTarget::Fdm);
+        assert_eq!(problem.geometry, geometry_before);
+        assert_eq!(problem.materials, materials_before);
+        assert_eq!(problem.magnets, magnets_before);
+        assert_eq!(problem.regions, regions_before);
+        assert_eq!(problem.object_regions, object_regions_before);
+        let hints = problem
+            .backend_policy
+            .discretization_hints
+            .as_ref()
+            .and_then(|hints| hints.fdm.as_ref())
+            .expect("FDM hints should be materialized");
+        assert_eq!(hints.cell, [1e-9, 2e-9, 3e-9]);
+        assert_eq!(hints.default_cell, Some([1e-9, 2e-9, 3e-9]));
+        assert_eq!(
+            hints
+                .per_magnet
+                .as_ref()
+                .and_then(|entries| entries.get("magnet"))
+                .map(|entry| entry.cell),
+            Some([4e-9, 5e-9, 6e-9])
+        );
+        assert_eq!(
+            hints.demag.as_ref().map(|demag| demag.fft_backend.as_str()),
+            Some("auto")
+        );
+        assert_eq!(
+            problem.problem_meta.runtime_metadata["runtime_selection"]["device"],
+            "gpu"
+        );
+    }
+
     fn tiny_fem_plan() -> BackendPlanIR {
         BackendPlanIR::Fem(FemPlanIR {
             mesh_name: "tiny".to_string(),
@@ -14992,6 +15323,7 @@ mod tests {
             demag_realization: None,
             air_box_config: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             dmi_interface_normal: None,
             dind_field: None,
@@ -15133,6 +15465,7 @@ mod tests {
             demag_realization: None,
             air_box_config: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             dmi_interface_normal: None,
             dind_field: None,
@@ -15427,13 +15760,35 @@ mod tests {
     }
 
     #[test]
+    fn active_sequence_records_the_exact_application_boundary_and_segment() {
+        let mut sequence = ActiveSequenceState::single_current();
+        let boundary = CommandApplicationBoundary::new("run-7", "cmd-hot-apply", 42, 2.5e-12);
+
+        sequence.mark_current_started("cmd-hot-apply", 1_700_000_000_000, None, Some(&boundary));
+        sequence.mark_current("completed", None, Some(1_700_000_001_000), None);
+
+        let stage = sequence
+            .completed_stage_execution("awaiting_command")
+            .stages
+            .into_iter()
+            .next()
+            .expect("stage record should be present");
+        assert_eq!(stage.applied_step, Some(42));
+        assert_eq!(stage.applied_time_seconds, Some(2.5e-12));
+        assert_eq!(
+            stage.segment_id.as_deref(),
+            Some("segment:run-7:cmd-hot-apply:42:3d85fd7fe1796495")
+        );
+    }
+
+    #[test]
     fn active_sequence_tracks_pause_checkpoint_and_resume_ref() {
         let mut sequence = ActiveSequenceState::new(vec![SequenceStage::Run {
             until_seconds: 1e-9,
             max_steps: Some(100),
         }]);
 
-        sequence.mark_current_started("cmd-stage-0", 1_700_000_000_000, None);
+        sequence.mark_current_started("cmd-stage-0", 1_700_000_000_000, None, None);
         sequence.mark_current(
             "paused",
             None,
@@ -15445,7 +15800,7 @@ mod tests {
             Some("runs/run-1/checkpoints/cp-000042/common_state.json".to_string()),
         );
         sequence.mark_current_resume_from_checkpoint("cp-000042");
-        sequence.mark_current_started("cmd-stage-0", 1_700_000_001_000, None);
+        sequence.mark_current_started("cmd-stage-0", 1_700_000_001_000, None, None);
 
         let stage = sequence
             .stage_execution(Some("run"), "running")
@@ -15514,7 +15869,7 @@ mod tests {
         }]);
 
         sequence.mark_current_materialized_kind("flat_hysteresis");
-        sequence.mark_current_started("cmd-stage-0", 1_700_000_000_000, None);
+        sequence.mark_current_started("cmd-stage-0", 1_700_000_000_000, None, None);
         sequence.mark_current("completed", None, Some(1_700_000_001_000), None);
 
         let execution = sequence.completed_stage_execution("awaiting_command");
@@ -15544,6 +15899,42 @@ mod tests {
         );
         assert_eq!(execution.stages[0].kind.as_deref(), Some("flat_hysteresis"));
         assert_eq!(execution.stages[0].status, "completed");
+    }
+
+    #[test]
+    fn completed_scripted_stages_keep_interactive_owner_awaiting_commands() {
+        let mut execution = scripted_stage_execution_state(
+            1,
+            0,
+            "flat_run",
+            "completed",
+            Some("cmd-solve"),
+            Some(1_700_000_000_000),
+            Some(1_700_000_001_000),
+            Some("artifacts/stage-000".to_string()),
+            Some(fullmag_ir::StageStopReason::MaxPhysicalTime),
+            None,
+        );
+        let boundary = CommandApplicationBoundary::new("run-1", "cmd-solve", 0, 0.0);
+        attach_scripted_stage_solver_steps(&mut execution, 0, Some(&boundary), Some(10));
+        assert_eq!(execution.stages[0].applied_step, Some(0));
+        assert_eq!(execution.stages[0].completed_step, Some(10));
+        assert_eq!(execution.stages[0].segment_id, Some(boundary.segment_id));
+        let terminal_history = serde_json::to_value(&execution.stages).unwrap();
+
+        publish_scripted_stages_awaiting_command(&mut execution);
+
+        assert_eq!(execution.runtime_state, "awaiting_command");
+        assert_eq!(execution.active_stage_index, None);
+        assert_eq!(execution.active_stage_kind, None);
+        assert_eq!(execution.completed_stage_indexes, vec![0]);
+        assert_eq!(execution.stage_statuses, vec!["completed"]);
+        assert_eq!(serde_json::to_value(&execution.stages).unwrap(), terminal_history);
+
+        // A later explicit close must publish terminal ownership, not idle ownership.
+        execution = super::stage_execution_from_records(&execution.stages, None, None, "completed");
+        assert_eq!(execution.runtime_state, "completed");
+        assert_eq!(serde_json::to_value(&execution.stages).unwrap(), terminal_history);
     }
 
     #[test]
@@ -15619,7 +16010,7 @@ mod tests {
         let sequence = active_sequence
             .as_mut()
             .expect("active sequence should be present");
-        sequence.mark_current_started("cmd-solve", 1_700_000_000_000, None);
+        sequence.mark_current_started("cmd-solve", 1_700_000_000_000, None, None);
         sequence.mark_current("paused", None, None, None);
 
         let execution =
@@ -15741,7 +16132,7 @@ mod tests {
             .find("problem_with_frozen_spins_runtime_plan_binding(")
             .expect("initial solver command must consume the Frozen Spins binding");
         let stage_index = branch
-            .find("build_interactive_command_stage(")
+            .find("build_initial_interactive_command_stage(")
             .expect("initial solver command must build a stage");
 
         assert!(
@@ -16230,11 +16621,13 @@ mod tests {
         state.live_state.latest_step.preview_field = Some(test_preview_field("h_eff", 1, 2.0));
         let mut update = test_step_update(9);
         update.stats.e_total = 42.0;
+        update.stats.e_rotated_dmi = 17.0;
         let progress = crate::stage_heartbeat::StageHeartbeatProgress::new(&update);
 
         progress.apply_to_live_step(&mut state.live_state.latest_step);
 
         assert_eq!(state.live_state.latest_step.step, 9);
+        assert_eq!(state.live_state.latest_step.e_rotated_dmi, 17.0);
         assert_eq!(state.live_state.latest_step.e_total, 42.0);
         assert_eq!(state.live_state.latest_step.grid, [17, 19, 23]);
         assert_eq!(
@@ -16294,7 +16687,7 @@ mod tests {
         assert_eq!(scripted.stages[0].mesh_revision, None);
 
         let mut interactive = ActiveSequenceState::single_current();
-        interactive.mark_current_started("cmd-interactive", 1_700_000_000_000, None);
+        interactive.mark_current_started("cmd-interactive", 1_700_000_000_000, None, None);
         interactive.mark_current_fem_mesh_identity(Some(&asset));
         let interactive_execution = interactive.stage_execution(Some("relax"), "running");
         assert_eq!(
@@ -16407,6 +16800,10 @@ mod tests {
             mode: None,
             precision: None,
             output_dir: None,
+            temp_dir: None,
+            data_format: None,
+            temp_cleanup: None,
+            existing_output: None,
             initial_magnetization_state: Some(state_path.clone()),
             initial_magnetization_state_format: Some("json".to_string()),
             initial_magnetization_state_dataset: None,
@@ -16416,6 +16813,13 @@ mod tests {
             dev: false,
             json: true,
             web_port: None,
+            ui: None,
+            api_port: None,
+            wait_for_solve: false,
+            expect_script_sha256: None,
+            receipt: None,
+            launched_by: None,
+            python: None,
         };
 
         let loaded =
@@ -16580,6 +16984,8 @@ mod tests {
                 "kind": "box",
                 "extent": [4.0, 2.0, 2.0]
             })),
+            fdm: None,
+            runtime_selection: None,
         };
         let new_mesh = MeshIR {
             mesh_name: "study_domain_after_ui_patch".to_string(),
@@ -16812,7 +17218,7 @@ mod tests {
     #[test]
     fn active_sequence_preserves_completed_relaxation_metric_and_identity() {
         let mut state = ActiveSequenceState::single_current();
-        state.mark_current_started("cmd-relax", 1_700_000_000_000, None);
+        state.mark_current_started("cmd-relax", 1_700_000_000_000, None, None);
         let completion = fullmag_ir::StageCompletionIR {
             status: "completed".into(),
             converged: true,

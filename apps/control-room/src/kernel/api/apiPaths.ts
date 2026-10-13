@@ -23,6 +23,55 @@ export const PLATFORM_HEALTH_PATH = openApiV2Path(
   "/v2/platform/health",
 );
 
+export const PLATFORM_DEVELOPMENT_BACKEND_PATH = openApiV2Path(
+  "/v2/platform/development-backend",
+);
+
+export const PLATFORM_DEVELOPMENT_BACKEND_BUILD_REQUESTS_PATH =
+  openApiV2Path("/v2/platform/development-backend/build-requests");
+
+export const PLATFORM_DEVELOPMENT_BACKEND_BUILD_REQUEST_PATH =
+  openApiV2Path("/v2/platform/development-backend/build-requests/{request_id}");
+
+export function developmentBackendBuildRequestPathParams(requestId: string) {
+  return { path: { request_id: requestId } };
+}
+
+export const PLATFORM_RUNTIME_SERVICE_PATH = openApiV2Path(
+  "/v2/platform/runtime-service",
+);
+
+export const PLATFORM_DEVELOPMENT_RESTART_REQUESTS_PATH = openApiV2Path(
+  "/v2/platform/development-restart-requests",
+);
+
+export const PLATFORM_DEVELOPMENT_RESTART_REQUEST_PATH = openApiV2Path(
+  "/v2/platform/development-restart-requests/{request_id}",
+);
+
+export function developmentRestartRequestPathParams(requestId: string) {
+  return { path: { request_id: requestId } };
+}
+
+export function isDevelopmentRestartRequestStatusPath(path: string): boolean {
+  const pathParameter = "{request_id}";
+  const parameterOffset = PLATFORM_DEVELOPMENT_RESTART_REQUEST_PATH.indexOf(
+    pathParameter,
+  );
+  if (parameterOffset < 0 || path.includes("?")) return false;
+
+  const prefix = PLATFORM_DEVELOPMENT_RESTART_REQUEST_PATH.slice(
+    0,
+    parameterOffset,
+  );
+  const requestId = path.slice(prefix.length);
+  return (
+    path.startsWith(prefix) &&
+    requestId.length > 0 &&
+    !requestId.includes("/")
+  );
+}
+
 export const PLATFORM_OPENAPI_PATH = openApiV2Path(
   "/v2/platform/openapi.json",
 );
@@ -57,6 +106,54 @@ export const ANALYSIS_SPIN_WAVE_GAMMA_V1_PATH = openApiV2Path(
 
 export const ANALYSIS_DYNAMIC_STRUCTURE_FACTOR_V1_PATH = openApiV2Path(
   "/v2/sessions/current/analysis/spin-wave/dynamic-structure-factor.v1",
+);
+
+export const ANALYSIS_RESULT_DATASETS_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets",
+);
+
+export const ANALYSIS_RESULT_DATASET_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}",
+);
+
+export const ANALYSIS_RESULT_AXIS_VALUES_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}/axes/{axis_id}/values",
+);
+
+export const ANALYSIS_RESULT_SAMPLES_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}/samples",
+);
+
+export const ANALYSIS_RESULT_ITEMS_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}/items",
+);
+
+export const ANALYSIS_RESULT_ITEM_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}/items/{item_id}",
+);
+
+export const ANALYSIS_RESULT_BRANCHES_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}/branches",
+);
+
+export const ANALYSIS_RESULT_BRANCH_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}/branches/{branch_id}",
+);
+
+export const ANALYSIS_RESULT_BRANCH_POINTS_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}/branches/{branch_id}/points",
+);
+
+export const ANALYSIS_RESULT_RELATIONS_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}/relations",
+);
+
+export const ANALYSIS_RESULT_RELATION_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}/relations/{relation_id}",
+);
+
+export const ANALYSIS_RESULT_PROJECTION_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/results/runs/{run_id}/datasets/{dataset_id}/projections/{projection_id}",
 );
 
 export const ANALYSIS_OBJECT_TOPOLOGICAL_CHARGE_PATH = openApiV2Path(
@@ -440,6 +537,18 @@ export const DATA_FIELD_SLICE_ARROWS_PATH = openApiV2Path(
 
 export const DATA_FIELD_VECTOR_PATH = openApiV2Path(
   "/v2/sessions/current/data/fields/{quantity_id}/samples/vector",
+);
+
+export const DATA_OBSERVATION_FRAMES_PATH = openApiV2Path(
+  "/v2/sessions/current/data/observation-frames",
+);
+
+export const DATA_OBSERVATION_FRAME_PATH = openApiV2Path(
+  "/v2/sessions/current/data/observation-frames/{frame_id}",
+);
+
+export const DATA_OBSERVATION_FRAME_MAGNETIZATION_PATH = openApiV2Path(
+  "/v2/sessions/current/data/observation-frames/{frame_id}/magnetization",
 );
 
 export const DIAGNOSTICS_ENGINE_LOG_PATH = openApiV2Path(
@@ -834,6 +943,10 @@ export const SIMULATION_PREPARATION_PATH = openApiV2Path(
   "/v2/sessions/current/simulation/preparation",
 );
 
+export const SIMULATION_PREPARATION_MATERIALIZATION_PATH = openApiV2Path(
+  "/v2/sessions/current/simulation/preparation/materialization",
+);
+
 export const SIMULATION_COMMANDS_PATH = openApiV2Path(
   "/v2/sessions/current/simulation/commands",
 );
@@ -935,13 +1048,125 @@ export const PERSISTENCE_IMPORTS_PATH = openApiV2Path(
 );
 
 export const PERSISTENCE_IMPORT_INSPECTIONS_PATH = openApiV2Path(
-  "/v2/sessions/current/persistence/imports/inspections",
+  "/v2/persistence/imports/inspections",
 );
 
 export const PERSISTENCE_ASSET_IMPORT_PATH = openApiV2Path(
   "/v2/sessions/current/persistence/assets/import",
 );
 
+export const PERSISTENCE_PROJECTS_PATH = openApiV2Path(
+  "/v2/persistence/projects",
+);
+
+export const PERSISTENCE_PROJECT_OPEN_PATH = openApiV2Path(
+  "/v2/persistence/projects/open",
+);
+export const PERSISTENCE_PROJECT_AUTHORING_PATH = openApiV2Path(
+  "/v2/persistence/projects/authoring",
+);
+export const PERSISTENCE_PROJECT_FROM_SCRIPT_PATH = openApiV2Path(
+  "/v2/persistence/projects/from-script",
+);
+
+export const PROJECT_RUN_SUBMIT_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs",
+);
+
+export const PROJECT_BATCHES_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/batches",
+);
+
+export const PROJECT_BATCH_CASES_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/batches/{batch_id}/cases",
+);
+
+export const PROJECT_RUN_MATERIALIZATION_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/materialization",
+);
+
+export const PROJECT_RUN_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}",
+);
+
+export const PROJECT_SOLUTION_SET_DISCOVERY_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/solution-sets",
+);
+
+export const PROJECT_SOLUTION_SET_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/solution-sets/{solution_set_id}/revisions/{revision}",
+);
+
+export const PROJECT_SOLUTION_SET_MEMBERS_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/solution-sets/{solution_set_id}/revisions/{revision}/members",
+);
+
+export const PROJECT_SOLUTION_SET_ARTIFACTS_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/solution-sets/{solution_set_id}/revisions/{revision}/members/{member_id}/artifacts",
+);
+
+export const PROJECT_MATERIALIZED_DATASET_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/solution-sets/{solution_set_id}/revisions/{revision}/members/{member_id}/artifacts/{artifact_id}/materialized-dataset",
+);
+
+export const PROJECT_SOLUTION_SCALAR_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/solution-sets/{solution_set_id}/revisions/{revision}/members/{member_id}/artifacts/{artifact_id}/scalar",
+);
+
+export const PROJECT_MATERIALIZED_DATASET_SLICE_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/solution-sets/{solution_set_id}/revisions/{revision}/members/{member_id}/artifacts/{artifact_id}/materialized-dataset/slice",
+);
+
+export const PROJECT_SAVED_FIELD_GEOMETRY_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/solution-sets/{solution_set_id}/revisions/{revision}/members/{member_id}/artifacts/{artifact_id}/saved-field-geometry",
+);
+export const PROJECT_SAVED_FIELD_TOPOLOGY_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/solution-sets/{solution_set_id}/revisions/{revision}/members/{member_id}/artifacts/{artifact_id}/saved-field-geometry/topology",
+);
+export const PROJECT_SAVED_FIELD_SUPPORT_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/solution-sets/{solution_set_id}/revisions/{revision}/members/{member_id}/artifacts/{artifact_id}/saved-field-geometry/support",
+);
+
+export const PROJECT_RUN_TASK_CANCELLATION_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/tasks/{task_id}/cancellation",
+);
+
 export const PERSISTENCE_RECOVERY_PATH = openApiV2Path(
   "/v2/sessions/current/persistence/recovery",
 );
+
+export const PLATFORM_OUTPUT_STORAGE_PATH = openApiV2Path("/v2/platform/output-storage");
+
+// Workspace database routes (start screen).
+
+export const WORKSPACE_ITEMS_PATH = openApiV2Path("/v2/workspace/items");
+export const WORKSPACE_ITEM_PATH = openApiV2Path("/v2/workspace/items/{id}");
+export const WORKSPACE_ITEM_THUMBNAIL_PATH = openApiV2Path(
+  "/v2/workspace/items/{id}/thumbnail",
+);
+export const WORKSPACE_ITEM_ARCHIVE_PATH = openApiV2Path(
+  "/v2/workspace/items/{id}/archive",
+);
+export const WORKSPACE_ITEM_PIN_PATH = openApiV2Path("/v2/workspace/items/{id}/pin");
+export const WORKSPACE_ITEM_FORGET_PATH = openApiV2Path("/v2/workspace/items/{id}/forget");
+export const WORKSPACE_ITEM_HISTORY_PATH = openApiV2Path(
+  "/v2/workspace/items/{id}/history",
+);
+export const WORKSPACE_ITEM_FRAMES_PATH = openApiV2Path(
+  "/v2/workspace/items/{id}/frames",
+);
+export const WORKSPACE_SETTING_PATH = openApiV2Path("/v2/workspace/settings/{key}");
+export const WORKSPACE_ROOTS_PATH = openApiV2Path("/v2/workspace/roots");
+export const WORKSPACE_SCAN_PATH = openApiV2Path("/v2/workspace/scan");
+
+/** Absolute URL that downloads a result folder as a zip (a navigation, not a fetch). */
+export function workspaceItemArchiveUrl(baseUrl: string, id: string): string {
+  return `${baseUrl}${WORKSPACE_ITEM_ARCHIVE_PATH.replace("{id}", encodeURIComponent(id))}`;
+}
+
+/** Absolute URL of an item's thumbnail, for an <img>; the id is path-encoded. */
+export function workspaceItemThumbnailUrl(baseUrl: string, id: string): string {
+  return `${baseUrl}${WORKSPACE_ITEM_THUMBNAIL_PATH.replace("{id}", encodeURIComponent(id))}`;
+}
+export const PLATFORM_COMPUTE_PROFILES_PATH = openApiV2Path("/v2/platform/compute/profiles");
+export const PLATFORM_COMPUTE_PREVIEW_PATH = openApiV2Path("/v2/platform/compute/preview");

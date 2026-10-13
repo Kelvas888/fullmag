@@ -1,11 +1,15 @@
-import { useMemo, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { MODEL_READINESS_PATH, MODEL_SCENE_PATH } from "@/kernel/api/apiPaths";
 import type { JsonObject, RegionalFieldDriveResource } from "@/kernel/api/apiTypes";
+import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
 import { useKernel } from "@/kernel/KernelContext";
+import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
+import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { useSceneResource } from "@/kernel/resources/geometryLifecycleResources";
 import { Button } from "@/shared/ui/Button";
 
+import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import type { InspectorPanelProps } from "../inspectorTypes";
 import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FieldRow } from "../primitives/FieldRow";
@@ -47,14 +51,27 @@ function invalidateSceneResource(
 }
 
 export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
-  const { api, resources } = useKernel();
+  const { api, authoringHistory, commands, resources } = useKernel();
+  const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
   const scene = useSceneResource();
   const model = resolveAntennaObjectPanelModel(selection, scene.data);
   const baseDraft = useMemo(
     () => resolveAntennaObjectDraft(selection, scene.data),
     [scene.data, selection],
   );
-  const draftKey = `${model.objectId}:${scene.data?.revision ?? "none"}`;
+  const resourceRevision = scene.data?.revision ?? -1;
+  const [acknowledgedBase, setAcknowledgedBase] = useState<{
+    draft: AntennaObjectDraft;
+    objectId: string;
+    revision: number;
+  } | null>(null);
+  const hasPendingAcknowledgedBase =
+    acknowledgedBase?.objectId === model.objectId &&
+    resourceRevision < acknowledgedBase.revision;
+  const baselineDraft = hasPendingAcknowledgedBase
+    ? acknowledgedBase.draft
+    : baseDraft;
+  const draftKey = `${model.objectId}:${hasPendingAcknowledgedBase ? acknowledgedBase.revision : (scene.data?.revision ?? "none")}`;
   const [draftState, setDraftState] = useState<DraftState>({
     draft: baseDraft,
     key: draftKey,
@@ -64,45 +81,144 @@ export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
     key: draftKey,
   });
   const [pending, setPending] = useState(false);
-  const draft = draftState.key === draftKey ? draftState.draft : baseDraft;
+  const applyInFlight = useRef(false);
+  const draft = draftState.key === draftKey ? draftState.draft : baselineDraft;
+  const draftRef = useRef(draft);
+  useLayoutEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(baselineDraft);
+  const validation = model.mode === "canonical"
+    ? buildAntennaCanonicalFieldDrive(selection, scene.data, draft)
+    : model.mode === "legacy"
+      ? buildAntennaLegacyMigrationPatch(selection, scene.data, draft)
+      : null;
+  const valid = Boolean(validation && !validation.error);
   const feedback =
     feedbackState.key === draftKey ? feedbackState.feedback : null;
 
+  const acknowledgeAntennaDraft = useRegisterInspectorEditSession(
+    model.mode === "missing" ? null : "staged",
+    pending,
+    dirty,
+    valid,
+    undefined,
+    commitDraft,
+    resetDraft,
+    { historyMode: "mutation-owned" },
+  );
+
   function updateDraft(patch: Partial<AntennaObjectDraft>): void {
-    setDraftState((current) => ({
-      draft: { ...(current.key === draftKey ? current.draft : baseDraft), ...patch },
-      key: draftKey,
-    }));
+    const next = { ...draftRef.current, ...patch };
+    draftRef.current = next;
+    setDraftState({ draft: next, key: draftKey });
   }
 
   function setFeedback(feedbackValue: Feedback | null): void {
     setFeedbackState({ feedback: feedbackValue, key: draftKey });
   }
 
-  async function commitDraft(): Promise<void> {
+  function resetDraft(): void {
+    draftRef.current = baselineDraft;
+    setDraftState({ draft: baselineDraft, key: draftKey });
+    setFeedback(null);
+  }
+
+  async function commitDraft(): Promise<boolean> {
+    if (applyInFlight.current) return false;
+    if (!validation || validation.error) {
+      setFeedback({
+        kind: "error",
+        message: validation?.error ?? "A committed antenna drive is not available.",
+      });
+      return false;
+    }
+    if (!sessionScopeKey) {
+      setFeedback({ kind: "error", message: "Session identity is not ready. Try again after it loads." });
+      return false;
+    }
+    const submittedDraft = draft;
+    applyInFlight.current = true;
     setPending(true);
     try {
-      const response = model.mode === "canonical" ? await saveCanonicalDrive() : await migrateLegacyDrive();
+      const historyGeneration = authoringHistory?.getGeneration?.();
+      const historyContext = {
+        api,
+        authoringHistory,
+        sessionScopeKey,
+        isCurrentSessionScope: () =>
+          commands.getSessionScopeKey() === sessionScopeKey &&
+          (historyGeneration === undefined ||
+            authoringHistory?.getGeneration?.() === historyGeneration),
+      };
+      const response = await runAuthoringMutationWithHistory(
+        historyContext,
+        model.mode === "canonical"
+          ? `Update antenna drive ${model.objectId}`
+          : `Migrate antenna drive ${model.objectId}`,
+        async ({ baseRevision }) =>
+          model.mode === "canonical"
+            ? saveCanonicalDrive(baseRevision, submittedDraft)
+            : migrateLegacyDrive(baseRevision, submittedDraft),
+      );
+      if (historyContext.isCurrentSessionScope() === false) return false;
       invalidateSceneResource(resources, response.scene_revision);
+      const acknowledgedDraft = { ...submittedDraft };
+      setAcknowledgedBase({
+        draft: acknowledgedDraft,
+        objectId: model.objectId,
+        revision: response.scene_revision,
+      });
+      const latestDraft = draftRef.current;
+      const rebasedDraft = latestDraft === submittedDraft
+        ? acknowledgedDraft
+        : latestDraft;
+      const acknowledgedDraftKey = `${model.objectId}:${response.scene_revision}`;
+      draftRef.current = rebasedDraft;
+      setDraftState({ draft: rebasedDraft, key: acknowledgedDraftKey });
+      if (latestDraft === submittedDraft && !acknowledgeAntennaDraft()) return false;
       setFeedback({ kind: "success", message: model.mode === "legacy" ? "Legacy source migrated to a regional field drive." : "Antenna field drive committed." });
+      return true;
     } catch (error) {
       setFeedback({ kind: "error", message: errorMessage(error) });
+      return false;
     } finally {
+      applyInFlight.current = false;
       setPending(false);
     }
   }
 
-  async function saveCanonicalDrive() {
-    const patch = buildAntennaCanonicalFieldDrive(selection, scene.data, draft);
+  async function saveCanonicalDrive(
+    capturedRevision?: number | null,
+    submittedDraft: AntennaObjectDraft = draft,
+  ) {
+    const patch = buildAntennaCanonicalFieldDrive(selection, scene.data, submittedDraft);
     if (patch.error || !patch.drive) throw new Error(patch.error ?? "Invalid antenna drive draft.");
     const drive = patch.drive as unknown as RegionalFieldDriveResource;
-    return api.model.replaceFieldDrive(drive.id, { base_revision: scene.data?.revision ?? null, drive });
+    return api.model.replaceFieldDrive(
+      drive.id,
+      {
+        base_revision: capturedRevision ?? scene.data?.revision ?? null,
+        drive,
+      },
+      sessionScopeKey ? { sessionScopeKey } : undefined,
+    );
   }
 
-  async function migrateLegacyDrive() {
-    const patch = buildAntennaLegacyMigrationPatch(selection, scene.data, draft);
+  async function migrateLegacyDrive(
+    capturedRevision?: number | null,
+    submittedDraft: AntennaObjectDraft = draft,
+  ) {
+    const patch = buildAntennaLegacyMigrationPatch(selection, scene.data, submittedDraft);
     if (patch.error || !patch.drives || !patch.modules) throw new Error(patch.error ?? "Invalid legacy antenna migration.");
-    return api.model.commitTransaction({ kind: "merge_patch", merge_patch: { field_drives: { drives: patch.drives as JsonObject[] }, current_modules: { modules: patch.modules as JsonObject[] } } });
+    return api.model.commitTransaction({
+      base_revision: capturedRevision ?? scene.data?.revision ?? null,
+      kind: "merge_patch",
+      merge_patch: {
+        field_drives: { drives: patch.drives as JsonObject[] },
+        current_modules: { modules: patch.modules as JsonObject[] },
+      },
+    }, sessionScopeKey ? { sessionScopeKey } : undefined);
   }
 
   return (

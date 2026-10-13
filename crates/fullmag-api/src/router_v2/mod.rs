@@ -25,6 +25,48 @@ use crate::types::{AppState, EigenModeQuery};
 pub fn build_v2_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v2/platform/health", get(handlers::platform::get_health))
+        .route(
+            "/v2/platform/compute/preview",
+            post(handlers::platform::compute_preview::post_compute_preview)
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
+            "/v2/platform/compute/profiles",
+            get(handlers::platform::compute_profiles::get_compute_profiles)
+                .post(handlers::platform::compute_profiles::post_compute_profile)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/v2/platform/output-storage",
+            get(handlers::platform::output_storage::get_output_storage_defaults)
+                .put(handlers::platform::output_storage::put_output_storage_defaults),
+        )
+        .route(
+            "/v2/platform/runtime-service",
+            get(handlers::platform::runtime_service::get_runtime_service),
+        )
+        .route(
+            "/v2/platform/development-backend",
+            get(handlers::platform::development_backend::get_development_backend),
+        )
+        .route(
+            "/v2/platform/development-backend/build-requests",
+            post(handlers::platform::development_backend_build_request::post_development_backend_build_request)
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/v2/platform/development-backend/build-requests/:request_id",
+            get(handlers::platform::development_backend_build_request::get_development_backend_build_request),
+        )
+        .route(
+            "/v2/platform/development-restart-requests",
+            post(handlers::platform::development_restart_request::post_development_restart_request)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route(
+            "/v2/platform/development-restart-requests/:request_id",
+            get(handlers::platform::development_restart_request::get_development_restart_request),
+        )
         .route("/v2", get(get_v2_index))
         .route("/v2/", get(get_v2_index))
         .route("/v2/platform/openapi.json", get(get_openapi_json))
@@ -463,6 +505,10 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
             get(handlers::simulation::get_simulation_preparation),
         )
         .route(
+            "/v2/sessions/current/simulation/preparation/materialization",
+            post(handlers::simulation::materialize_live_preparation),
+        )
+        .route(
             "/v2/sessions/current/simulation/runs/:run_id",
             get(handlers::simulation::get_run_by_id),
         )
@@ -522,6 +568,18 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
         .route(
             "/v2/sessions/current/data/quantities",
             get(handlers::data::get_quantities_catalog),
+        )
+        .route(
+            "/v2/sessions/current/data/observation-frames",
+            get(handlers::data::list_observation_frames),
+        )
+        .route(
+            "/v2/sessions/current/data/observation-frames/:frame_id",
+            get(handlers::data::get_observation_frame),
+        )
+        .route(
+            "/v2/sessions/current/data/observation-frames/:frame_id/magnetization",
+            get(handlers::data::get_observation_frame_magnetization),
         )
         .route(
             "/v2/sessions/current/data/fields",
@@ -774,6 +832,51 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
                 .put(handlers::workspace::replace_workspace_active_node),
         )
         .route(
+            "/v2/workspace/items",
+            get(handlers::workspace_items::list_items).post(handlers::workspace_items::post_item),
+        )
+        .route(
+            "/v2/workspace/items/:id",
+            get(handlers::workspace_items::get_item),
+        )
+        .route(
+            "/v2/workspace/items/:id/thumbnail",
+            get(handlers::workspace_items::get_item_thumbnail),
+        )
+        .route(
+            "/v2/workspace/items/:id/archive",
+            get(handlers::workspace_items::get_item_archive),
+        )
+        .route(
+            "/v2/workspace/items/:id/pin",
+            post(handlers::workspace_items::pin_item),
+        )
+        .route(
+            "/v2/workspace/items/:id/forget",
+            post(handlers::workspace_items::forget_item),
+        )
+        .route(
+            "/v2/workspace/items/:id/history",
+            get(handlers::workspace_items::get_item_history),
+        )
+        .route(
+            "/v2/workspace/items/:id/frames",
+            get(handlers::workspace_items::get_item_frames),
+        )
+        .route(
+            "/v2/workspace/settings/:key",
+            get(handlers::workspace_items::get_setting)
+                .put(handlers::workspace_items::put_setting),
+        )
+        .route(
+            "/v2/workspace/roots",
+            get(handlers::workspace_items::get_roots).put(handlers::workspace_items::put_roots),
+        )
+        .route(
+            "/v2/workspace/scan",
+            post(handlers::workspace_items::post_scan),
+        )
+        .route(
             "/v2/sessions/current/analysis/eigenmodes/spectrum",
             get(handlers::analysis::get_spectrum),
         )
@@ -898,6 +1001,54 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
             get(handlers::analysis::get_frequency_domain_response_field_meta),
         )
         .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets",
+            get(handlers::analysis::get_analysis_result_dataset_catalog),
+        )
+        .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets/:dataset_id/axes/:axis_id/values",
+            get(handlers::analysis::get_analysis_result_axis_values),
+        )
+        .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets/:dataset_id/samples",
+            get(handlers::analysis::get_analysis_result_samples),
+        )
+        .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets/:dataset_id/items/:item_id",
+            get(handlers::analysis::get_analysis_result_item),
+        )
+        .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets/:dataset_id/items",
+            get(handlers::analysis::get_analysis_result_items),
+        )
+        .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets/:dataset_id/branches",
+            get(handlers::analysis::get_analysis_result_branches),
+        )
+        .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets/:dataset_id/branches/:branch_id",
+            get(handlers::analysis::get_analysis_result_branch),
+        )
+        .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets/:dataset_id/branches/:branch_id/points",
+            get(handlers::analysis::get_analysis_result_branch_points),
+        )
+        .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets/:dataset_id/relations",
+            get(handlers::analysis::get_analysis_result_relations),
+        )
+        .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets/:dataset_id/relations/:relation_id",
+            get(handlers::analysis::get_analysis_result_relation),
+        )
+        .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets/:dataset_id/projections/:projection_id",
+            get(handlers::analysis::get_analysis_result_projection),
+        )
+        .route(
+            "/v2/sessions/current/analysis/results/runs/:run_id/datasets/:dataset_id",
+            get(handlers::analysis::get_analysis_result_dataset_manifest),
+        )
+        .route(
             "/v2/sessions/current/analysis/hysteresis/:stage_id/points",
             get(handlers::analysis::get_points),
         )
@@ -952,7 +1103,8 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
         )
         .route(
             "/v2/sessions/current/persistence/checkpoints/:checkpoint_id",
-            get(handlers::persistence::get_checkpoint),
+            get(handlers::persistence::get_checkpoint)
+                .delete(handlers::persistence::delete_checkpoint),
         )
         .route(
             "/v2/sessions/current/persistence/checkpoints/:checkpoint_id/restore",
@@ -975,8 +1127,8 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
             post(handlers::persistence::import_field_state),
         )
         .route(
-            "/v2/sessions/current/persistence/imports/inspections",
-            post(handlers::persistence::inspect_session),
+            "/v2/persistence/imports/inspections",
+            post(handlers::persistence::inspect_project_archive),
         )
         .route(
             "/v2/sessions/current/persistence/imports",
@@ -985,6 +1137,88 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
         .route(
             "/v2/sessions/current/persistence/assets/import",
             post(handlers::persistence::import_asset),
+        )
+        .route(
+            "/v2/persistence/projects",
+            post(handlers::persistence::projects::create),
+        )
+        .route(
+            "/v2/persistence/projects/open",
+            post(handlers::persistence::projects::open),
+        )
+        .route(
+            "/v2/persistence/projects/authoring",
+            post(handlers::persistence::projects::authoring_update),
+        )
+        .route(
+            "/v2/persistence/projects/from-script",
+            post(handlers::persistence::script_project::from_script),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs",
+            get(handlers::persistence::projects::list_runs)
+                .post(handlers::persistence::projects::submit_run),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/batches",
+            get(handlers::persistence::projects::list_batches)
+                .post(handlers::persistence::projects::submit_batch),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/batches/:batch_id/cases",
+            get(handlers::persistence::projects::list_batch_cases),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id",
+            get(handlers::persistence::projects::get_run),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets/:solution_set_id/revisions/:revision",
+            get(handlers::persistence::solutions::get_solution_revision),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets",
+            get(handlers::persistence::solutions::get_solution_set_discovery),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets/:solution_set_id/revisions/:revision/members",
+            get(handlers::persistence::solutions::get_solution_members),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets/:solution_set_id/revisions/:revision/members/:member_id/artifacts",
+            get(handlers::persistence::solutions::get_solution_artifacts),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets/:solution_set_id/revisions/:revision/members/:member_id/artifacts/:artifact_id/scalar",
+            get(handlers::persistence::solutions::get_solution_scalar),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets/:solution_set_id/revisions/:revision/members/:member_id/artifacts/:artifact_id/materialized-dataset",
+            get(handlers::persistence::solutions::get_materialized_dataset),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets/:solution_set_id/revisions/:revision/members/:member_id/artifacts/:artifact_id/materialized-dataset/slice",
+            get(handlers::persistence::solutions::get_materialized_dataset_slice),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets/:solution_set_id/revisions/:revision/members/:member_id/artifacts/:artifact_id/saved-field-geometry",
+            get(handlers::persistence::solutions::get_saved_field_geometry),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets/:solution_set_id/revisions/:revision/members/:member_id/artifacts/:artifact_id/saved-field-geometry/topology",
+            get(handlers::persistence::solutions::get_saved_field_geometry_topology),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets/:solution_set_id/revisions/:revision/members/:member_id/artifacts/:artifact_id/saved-field-geometry/support",
+            get(handlers::persistence::solutions::get_saved_field_geometry_support),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/materialization",
+            post(handlers::persistence::projects::materialize_run),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/tasks/:task_id/cancellation",
+            post(handlers::persistence::projects::cancel_run_task),
         )
         .route(
             "/v2/sessions/current/persistence/recovery",
@@ -1007,6 +1241,9 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
         ))
         .layer(axum::middleware::from_fn(
             middleware::version::contract_version_middleware,
+        ))
+        .layer(axum::middleware::from_fn(
+            middleware::session_scope::session_scope_middleware,
         ))
 }
 
@@ -1033,8 +1270,43 @@ async fn get_v2_index() -> Json<Value> {
     }))
 }
 
-async fn get_openapi_json() -> Json<Value> {
-    Json(crate::openapi_v2::openapi_json())
+async fn get_openapi_json(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let mut document = crate::openapi_v2::openapi_json();
+    document["x-fullmag-runtime-store-binding"] = json!({
+        "schema_version":"runtime_store_binding.v1",
+        "kind":"accepted_runs",
+        "binding":state.submit_store_root.as_deref().and_then(
+            fullmag_runtime_control::accepted_store::store_binding),
+    });
+    Json(document)
+}
+
+#[cfg(test)]
+mod runtime_binding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn platform_document_binds_actual_accepted_store_without_initializing_it() {
+        let directory =
+            std::env::temp_dir().join(format!("runtime-binding-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let root = directory.join("accepted-store");
+        let mut state = crate::router_v2::tests::test_app_state();
+        Arc::get_mut(&mut state).unwrap().submit_store_root = Some(root.clone());
+        let Json(document) = get_openapi_json(State(state)).await;
+        let binding = &document["x-fullmag-runtime-store-binding"];
+        assert_eq!(binding["schema_version"], "runtime_store_binding.v1");
+        assert_eq!(
+            binding["binding"].as_str(),
+            fullmag_runtime_control::accepted_store::store_binding(&root).as_deref()
+        );
+        assert!(!root.exists());
+        assert!(!binding.to_string().contains(root.to_str().unwrap()));
+        let Json(document) =
+            get_openapi_json(State(crate::router_v2::tests::test_app_state())).await;
+        assert!(document["x-fullmag-runtime-store-binding"]["binding"].is_null());
+        std::fs::remove_dir(directory).unwrap();
+    }
 }
 
 async fn list_sessions(
@@ -1059,16 +1331,25 @@ async fn list_sessions(
 }
 
 async fn get_current_session(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    let _transition = state.current_live_session_transition.lock().await;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    let script = crate::script::session_script_summary(
+        state.current_workspace_root.as_path(),
+        &snapshot.session.script_path,
+        true,
+    );
     Ok(Json(json!({
         "schema_version": "2.0.0",
         "session_id": snapshot.session.session_id,
         "name": snapshot.session.problem_name,
         "status": snapshot.session.status,
         "script_path": snapshot.session.script_path,
+        "script": script,
         "current": true,
     })))
 }

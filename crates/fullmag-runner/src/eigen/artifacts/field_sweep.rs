@@ -1,5 +1,5 @@
 use super::common::*;
-use crate::eigen::types::PathSolveResult;
+use crate::eigen::types::{PathSolveResult, SingleKModeResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -27,11 +27,15 @@ pub struct FrequencyDomainFieldSweepModeArtifact {
     pub branch_id: Option<usize>,
     pub frequency_hz: f64,
     pub angular_frequency_rad_per_s: f64,
-    pub mode_artifact_path: String,
-    pub mode_field_id: String,
-    pub mode_field_resource_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_artifact_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_field_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_field_resource_key: Option<String>,
     pub residual_relative_l2: Option<f64>,
     pub source_revision: String,
+    pub field_status: String,
     pub status: ServerArtifactStatus,
 }
 
@@ -58,6 +62,7 @@ pub struct FrequencyDomainFieldSweepArtifact {
     pub artifact_id: String,
     pub source: ServerArtifactSource,
     pub source_revision: String,
+    pub session_id: String,
     pub run_id: String,
     pub stage_id: String,
     pub scope_id: String,
@@ -92,13 +97,27 @@ fn field_sweep_axis() -> FieldSweepAxisArtifact {
     }
 }
 
+fn mode_field_payload_is_valid(mode: &SingleKModeResult) -> bool {
+    let (Some(real), Some(imag)) = (mode.lifted_real.as_ref(), mode.lifted_imag.as_ref()) else {
+        return false;
+    };
+    !real.is_empty()
+        && real.len() == imag.len()
+        && real
+            .iter()
+            .chain(imag.iter())
+            .all(|vector| vector.iter().all(|value| value.is_finite()))
+}
+
 /// Build the physical bias-field scan artifact from per-sample solver
 /// provenance.  Kittel validation metadata is deliberately not consulted as
 /// an input source; when native diagnostics do not declare a field, no scan is
 /// emitted instead of inventing one from an oracle configuration.
 pub fn build_frequency_domain_field_sweep_artifact(
     result: &PathSolveResult,
+    identity: &FrequencyDomainArtifactIdentity,
 ) -> std::io::Result<Option<FrequencyDomainFieldSweepArtifact>> {
+    identity.validate()?;
     if result.samples.is_empty() {
         return Ok(None);
     }
@@ -132,28 +151,38 @@ pub fn build_frequency_domain_field_sweep_artifact(
         let modes = sample
             .modes
             .iter()
-            .map(|mode| FrequencyDomainFieldSweepModeArtifact {
-                sample_id: sample_id.clone(),
-                mode_id: format!(
-                    "sample-{:04}/mode-{:04}",
-                    sample.sample.sample_index, mode.raw_mode_index
-                ),
-                raw_mode_index: mode.raw_mode_index,
-                branch_id: mode.branch_id,
-                frequency_hz: mode.frequency_real_hz,
-                angular_frequency_rad_per_s: mode.angular_frequency_rad_per_s,
-                mode_artifact_path: format!(
-                    "eigen/modes/sample_{:04}/mode_{:04}.json",
-                    sample.sample.sample_index, mode.raw_mode_index
-                ),
-                mode_field_id: eigen_mode_field_id(sample.sample.sample_index, mode.raw_mode_index),
-                mode_field_resource_key: eigen_mode_field_resource_key(&eigen_mode_field_id(
-                    sample.sample.sample_index,
-                    mode.raw_mode_index,
-                )),
-                residual_relative_l2: mode.residual_norm,
-                source_revision: result_source_revision(result),
-                status,
+            .map(|mode| {
+                let field_payload_valid = mode_field_payload_is_valid(mode);
+                let mode_field_id =
+                    eigen_mode_field_id(sample.sample.sample_index, mode.raw_mode_index);
+                FrequencyDomainFieldSweepModeArtifact {
+                    sample_id: sample_id.clone(),
+                    mode_id: format!(
+                        "sample-{:04}/mode-{:04}",
+                        sample.sample.sample_index, mode.raw_mode_index
+                    ),
+                    raw_mode_index: mode.raw_mode_index,
+                    branch_id: mode.branch_id,
+                    frequency_hz: mode.frequency_real_hz,
+                    angular_frequency_rad_per_s: mode.angular_frequency_rad_per_s,
+                    mode_artifact_path: field_payload_valid.then(|| {
+                        format!(
+                            "eigen/modes/sample_{:04}/mode_{:04}.json",
+                            sample.sample.sample_index, mode.raw_mode_index
+                        )
+                    }),
+                    mode_field_id: field_payload_valid.then_some(mode_field_id.clone()),
+                    // Transport is projected by the API from the owning dataset.
+                    mode_field_resource_key: None,
+                    residual_relative_l2: mode.residual_norm,
+                    source_revision: result_source_revision(result),
+                    field_status: if field_payload_valid {
+                        "ready".to_string()
+                    } else {
+                        "spectrum-only".to_string()
+                    },
+                    status,
+                }
             })
             .collect::<Vec<_>>();
         let stop_reason = diagnostic_string_any(diagnostics, &["stop_reason", "failure_reason"]);
@@ -186,6 +215,8 @@ pub fn build_frequency_domain_field_sweep_artifact(
     let topology_consistent = samples.windows(2).all(|window| {
         window[0].topology.mesh_id == window[1].topology.mesh_id
             && window[0].topology.topology_revision == window[1].topology.topology_revision
+            && window[0].topology.topology_fingerprint == window[1].topology.topology_fingerprint
+            && window[0].topology.mesh_generation_id == window[1].topology.mesh_generation_id
     });
     if !topology_consistent && status == ServerArtifactStatus::Complete {
         status = ServerArtifactStatus::Partial;
@@ -222,7 +253,7 @@ pub fn build_frequency_domain_field_sweep_artifact(
     } else {
         status
     };
-    let (requested_execution, resolved_execution, runtime_id) =
+    let (requested_execution, resolved_execution, _runtime_id) =
         server_execution_from_modal_result(result);
     let source_revision = result_source_revision(result);
     let mut artifact = FrequencyDomainFieldSweepArtifact {
@@ -234,10 +265,11 @@ pub fn build_frequency_domain_field_sweep_artifact(
             revision: source_revision.clone(),
         },
         source_revision: source_revision.clone(),
-        run_id: "run:current".to_string(),
-        stage_id: "stage:eigenmodes".to_string(),
+        session_id: identity.session_id.clone(),
+        run_id: identity.run_id.clone(),
+        stage_id: identity.stage_id.clone(),
         scope_id: "scope:bias-field".to_string(),
-        runtime_id,
+        runtime_id: identity.runtime_id.clone(),
         revision: String::new(),
         content_sha256: String::new(),
         status,
@@ -277,8 +309,9 @@ pub fn build_frequency_domain_field_sweep_artifact(
 pub fn write_frequency_domain_field_sweep_artifact(
     base_dir: &Path,
     result: &PathSolveResult,
+    identity: &FrequencyDomainArtifactIdentity,
 ) -> std::io::Result<bool> {
-    let Some(mut artifact) = build_frequency_domain_field_sweep_artifact(result)? else {
+    let Some(mut artifact) = build_frequency_domain_field_sweep_artifact(result, identity)? else {
         return Ok(false);
     };
     let spectrum_path = base_dir.join("eigen").join("spectrum.v2.json");

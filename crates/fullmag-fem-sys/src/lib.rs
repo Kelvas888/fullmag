@@ -5,6 +5,8 @@
 
 #![allow(non_camel_case_types)]
 
+pub mod node_map;
+
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
@@ -32,6 +34,8 @@ pub const FULLMAG_FEM_SOT_FORMULA_PRESCRIBED_V1: u32 = 1;
 pub const FULLMAG_FEM_SOT_ENVELOPE_ABI_VERSION: u32 = 1;
 pub const FULLMAG_FEM_FROZEN_SPINS_ABI_VERSION: u32 = 1;
 pub const FULLMAG_FEM_GPU_EXECUTION_RECEIPT_ABI_V1: u32 = 1;
+pub const FULLMAG_FEM_DEMAG_FEM_BEM_PROVENANCE_V1_ABI_VERSION: u32 = 1;
+pub const FULLMAG_FEM_GPU_PERFORMANCE_SNAPSHOT_V1_ABI_VERSION: u32 = 1;
 pub const FULLMAG_FEM_GPU_OPERATOR_EXCHANGE: u64 = 1 << 0;
 pub const FULLMAG_FEM_GPU_OPERATOR_DEMAG_RHS: u64 = 1 << 1;
 pub const FULLMAG_FEM_GPU_OPERATOR_DEMAG_SOLVE: u64 = 1 << 2;
@@ -408,6 +412,12 @@ pub struct fullmag_fem_stage_transport_callback_v1 {
 pub const FULLMAG_FEM_MESH_DESC_ABI_VERSION: u32 = 2;
 pub const FULLMAG_FEM_MESH_DESC_ABI_LAYOUT_FINGERPRINT: &str =
     "fullmag:fem-mesh-desc:abi:v2:lp64:size232:typed-csr-global-ordinals";
+pub const FULLMAG_FEM_MESH_SPACE_PREPARATION_ABI_VERSION: u32 = 1;
+pub const FULLMAG_FEM_MESH_SPACE_PREPARATION_PRODUCER_ID: &str = "fullmag.mfem.mesh_space";
+pub const FULLMAG_FEM_MESH_SPACE_PREPARATION_SCHEMA_VERSION: &str = "mfem_mesh_space_evidence.v1";
+pub const FULLMAG_FEM_MESH_SPACE_PREPARATION_PRODUCER_VERSION: &str = "1";
+pub const FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY: usize = 65;
+pub const FULLMAG_FEM_FE_FAMILY_H1: u32 = 1;
 pub const FULLMAG_FEM_MESH_ABI_LAYOUT_VERSION: u32 = 1;
 pub const FULLMAG_FEM_MESH_ABI_FIELD_COUNT: usize = 30;
 pub const FULLMAG_FEM_MESH_ABI_FINGERPRINT_CAPACITY: usize = 96;
@@ -456,6 +466,40 @@ pub struct fullmag_fem_mesh_desc {
     /// flat `[marker_a, marker_b] × count`.  Null/0 when not applicable.
     pub periodic_boundary_pair_markers: *const u32,
     pub periodic_boundary_pair_markers_len: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct fullmag_fem_mesh_space_preparation_request_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub mesh: *const fullmag_fem_mesh_desc,
+    pub fe_order: u32,
+    pub reserved_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct fullmag_fem_mesh_space_preparation_evidence_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub mesh_dimension: u32,
+    pub fe_family: u32,
+    pub fe_order: u32,
+    pub mesh_matches_canonical_input: u32,
+    pub node_count: u64,
+    pub cell_count: u64,
+    pub boundary_element_count: u64,
+    pub local_dof_count: u64,
+    pub true_dof_count: u64,
+    pub quality_sample_count: u64,
+    pub invalid_cell_count: u64,
+    pub min_jacobian_determinant: f64,
+    pub max_jacobian_determinant: f64,
+    pub topology_fingerprint: [c_char; FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY],
+    pub marker_map_fingerprint: [c_char; FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY],
+    pub quality_fingerprint: [c_char; FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY],
+    pub space_fingerprint: [c_char; FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY],
 }
 
 #[repr(C)]
@@ -515,6 +559,43 @@ const _: () = {
     assert!(std::mem::offset_of!(fullmag_fem_mesh_desc, periodic_node_pairs_len) == 208);
     assert!(std::mem::offset_of!(fullmag_fem_mesh_desc, periodic_boundary_pair_markers) == 216);
     assert!(std::mem::offset_of!(fullmag_fem_mesh_desc, periodic_boundary_pair_markers_len) == 224);
+    assert!(std::mem::size_of::<fullmag_fem_mesh_space_preparation_request_v1>() == 24);
+    assert!(std::mem::align_of::<fullmag_fem_mesh_space_preparation_request_v1>() == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_mesh_space_preparation_request_v1, mesh) == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_mesh_space_preparation_request_v1, fe_order) == 16);
+    assert!(std::mem::size_of::<fullmag_fem_mesh_space_preparation_evidence_v1>() == 360);
+    assert!(std::mem::align_of::<fullmag_fem_mesh_space_preparation_evidence_v1>() == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_mesh_space_preparation_evidence_v1, node_count) == 24);
+    assert!(
+        std::mem::offset_of!(
+            fullmag_fem_mesh_space_preparation_evidence_v1,
+            min_jacobian_determinant
+        ) == 80
+    );
+    assert!(
+        std::mem::offset_of!(
+            fullmag_fem_mesh_space_preparation_evidence_v1,
+            topology_fingerprint
+        ) == 96
+    );
+    assert!(
+        std::mem::offset_of!(
+            fullmag_fem_mesh_space_preparation_evidence_v1,
+            marker_map_fingerprint
+        ) == 161
+    );
+    assert!(
+        std::mem::offset_of!(
+            fullmag_fem_mesh_space_preparation_evidence_v1,
+            quality_fingerprint
+        ) == 226
+    );
+    assert!(
+        std::mem::offset_of!(
+            fullmag_fem_mesh_space_preparation_evidence_v1,
+            space_fingerprint
+        ) == 291
+    );
     assert!(std::mem::size_of::<fullmag_fem_mesh_abi_layout>() == 360);
     assert!(std::mem::align_of::<fullmag_fem_mesh_abi_layout>() == 8);
     assert!(std::mem::offset_of!(fullmag_fem_mesh_abi_layout, abi_version) == 0);
@@ -775,6 +856,18 @@ pub struct fullmag_fem_plan_desc {
     pub frozen_mask_len: u64,
     pub frozen_reference_xyz: *const f64,
     pub frozen_reference_len: u64,
+}
+
+pub const FULLMAG_FEM_PLAN_DESC_V2_ABI_VERSION: u32 = 2;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_plan_desc_v2 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub base: fullmag_fem_plan_desc,
+    pub has_rotated_interfacial_dmi: i32,
+    pub rotated_interfacial_dmi_constant: f64,
 }
 
 #[repr(C)]
@@ -1630,6 +1723,30 @@ pub struct fullmag_fem_frequency_domain_dmi_element {
     pub d: f64,
     pub normal: [f64; 3],
 }
+
+pub const FULLMAG_FEM_FREQUENCY_DOMAIN_ARTIFACT_IDENTITY_V1: u32 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FullmagFemFrequencyDomainArtifactIdentityV1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub session_id: *const c_char,
+    pub run_id: *const c_char,
+    pub stage_id: *const c_char,
+    pub runtime_id: *const c_char,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<FullmagFemFrequencyDomainArtifactIdentityV1>() == 40);
+    assert!(std::mem::align_of::<FullmagFemFrequencyDomainArtifactIdentityV1>() == 8);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, abi_version) == 0);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, struct_size) == 4);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, session_id) == 8);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, run_id) == 16);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, stage_id) == 24);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, runtime_id) == 32);
+};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -2517,6 +2634,7 @@ pub enum fullmag_fem_gpu_demag_mode {
     FULLMAG_FEM_GPU_DEMAG_UNSPECIFIED = 0,
     FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_POISSON = 1,
     FULLMAG_FEM_GPU_DEMAG_HYBRID_CPU_POISSON = 2,
+    FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_FEM_BEM = 3,
 }
 
 #[repr(C)]
@@ -2589,6 +2707,105 @@ pub struct fullmag_fem_gpu_execution_receipt_v1 {
     pub hot_loop_compute_host_sync_count: u64,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_demag_fem_bem_provenance_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub available: u32,
+    pub reserved: u32,
+    pub operator_mode: [c_char; 64],
+    pub operator_fingerprint: [c_char; 256],
+    pub boundary_node_count: u64,
+    pub boundary_triangle_count: u64,
+    pub near_block_count: u64,
+    pub far_block_count: u64,
+    pub near_entry_count: u64,
+    pub far_row_count: u64,
+    pub max_rank: u32,
+    pub reserved2: u32,
+    pub relative_error_estimate: f64,
+    pub resident_bytes: u64,
+    pub device_bytes: u64,
+    pub operator_build_count: u64,
+    pub operator_upload_count: u64,
+    pub apply_count: u64,
+}
+
+impl Default for fullmag_fem_demag_fem_bem_provenance_v1 {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct fullmag_fem_gpu_performance_snapshot_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub available: u32,
+    pub execution_class: u32,
+    pub precision: u32,
+    pub integrator: u32,
+    pub device_ordinal: i32,
+    pub completed_step: u64,
+    pub completed_execution_id: u64,
+    pub completed_operator_id: u64,
+    pub completed_attempt_count: u64,
+    pub rejected_attempt_count: u64,
+    pub failed_attempt_count: u64,
+    pub physical_rhs_evaluations: u64,
+    pub physical_exchange_applies: u64,
+    pub physical_exchange_launches: u64,
+    pub physical_exchange_nnz_visited: u64,
+    pub physical_demag_solves: u64,
+    pub physical_demag_iterations: u64,
+    pub physical_demag_rhs_norm_evaluations: u64,
+    pub physical_demag_stage_energy_evaluations: u64,
+    pub physical_normalization_launches: u64,
+    pub physical_normalization_readbacks: u64,
+    pub physical_adaptive_readbacks: u64,
+    pub physical_control_fences: u64,
+    pub physical_endpoint_cache_hits: u64,
+    pub physical_endpoint_cache_misses: u64,
+    pub physical_endpoint_cache_invalidations: u64,
+    pub physical_device_to_device_bytes: u64,
+    pub physical_control_d2h_bytes: u64,
+    pub physical_bulk_d2h_bytes: u64,
+    pub physical_demag_rhs_norm_sum: f64,
+    pub physical_demag_stage_energy_sum_joules: f64,
+    pub accepted_rhs_evaluations: u64,
+    pub accepted_exchange_applies: u64,
+    pub accepted_exchange_launches: u64,
+    pub accepted_exchange_nnz_visited: u64,
+    pub accepted_demag_solves: u64,
+    pub accepted_demag_iterations: u64,
+    pub accepted_demag_rhs_norm_evaluations: u64,
+    pub accepted_demag_stage_energy_evaluations: u64,
+    pub accepted_normalization_launches: u64,
+    pub accepted_normalization_readbacks: u64,
+    pub accepted_adaptive_readbacks: u64,
+    pub accepted_control_fences: u64,
+    pub accepted_endpoint_cache_hits: u64,
+    pub accepted_endpoint_cache_misses: u64,
+    pub accepted_endpoint_cache_invalidations: u64,
+    pub accepted_device_to_device_bytes: u64,
+    pub accepted_control_d2h_bytes: u64,
+    pub accepted_bulk_d2h_bytes: u64,
+    pub accepted_demag_rhs_norm_sum: f64,
+    pub accepted_demag_stage_energy_sum_joules: f64,
+    pub physical_exchange_elapsed_ns: u64,
+    pub physical_demag_assemble_elapsed_ns: u64,
+    pub physical_demag_recover_elapsed_ns: u64,
+    pub physical_demag_energy_elapsed_ns: u64,
+    pub physical_rhs_elapsed_ns: u64,
+    pub accepted_exchange_elapsed_ns: u64,
+    pub accepted_demag_assemble_elapsed_ns: u64,
+    pub accepted_demag_recover_elapsed_ns: u64,
+    pub accepted_demag_energy_elapsed_ns: u64,
+    pub accepted_rhs_elapsed_ns: u64,
+}
+
 include!(concat!(
     env!("OUT_DIR"),
     "/gpu_execution_receipt_abi_assertions.rs"
@@ -2631,6 +2848,12 @@ extern "C" {
         out_layout: *mut fullmag_fem_regional_field_drive_abi_layout,
     ) -> i32;
     pub fn fullmag_fem_get_mesh_abi_layout(out_layout: *mut fullmag_fem_mesh_abi_layout) -> i32;
+    pub fn fullmag_fem_prepare_mesh_space_v1(
+        request: *const fullmag_fem_mesh_space_preparation_request_v1,
+        out_evidence: *mut fullmag_fem_mesh_space_preparation_evidence_v1,
+        error_message: *mut c_char,
+        error_message_capacity: u64,
+    ) -> i32;
     pub fn fullmag_fem_solve_steady_transport_v1(
         request: *const fullmag_fem_steady_transport_request_v1,
         result: *mut fullmag_fem_steady_transport_result_v1,
@@ -2712,6 +2935,17 @@ extern "C" {
             fullmag_fem_frequency_domain_apply_with_potential_callback,
         out_result: *mut fullmag_fem_frequency_domain_solve_result,
     ) -> i32;
+    pub fn fullmag_fem_frequency_domain_solve_driven_response_with_identity_v1(
+        request: *const fullmag_fem_frequency_domain_driven_response_request,
+        identity: *const FullmagFemFrequencyDomainArtifactIdentityV1,
+        mfem_apply_demag_tangent_with_potential: fullmag_fem_frequency_domain_apply_with_potential_callback,
+        out_result: *mut fullmag_fem_frequency_domain_solve_result,
+    ) -> i32;
+
+    pub fn fullmag_fem_frequency_domain_validate_artifact_identity_v1(
+        identity: *const FullmagFemFrequencyDomainArtifactIdentityV1,
+    ) -> i32;
+
     pub fn fullmag_fem_frequency_domain_solve_driven_response_v10(
         request: *const fullmag_fem_frequency_domain_driven_response_request,
         mfem_apply_demag_tangent_with_potential:
@@ -2744,6 +2978,10 @@ extern "C" {
     ) -> *mut fullmag_fem_backend;
     pub fn fullmag_fem_backend_create_v2(
         plan: *const fullmag_fem_plan_desc,
+        adaptive_config: *const fullmag_fem_adaptive_config_v2,
+    ) -> *mut fullmag_fem_backend;
+    pub fn fullmag_fem_backend_create_v3(
+        plan: *const fullmag_fem_plan_desc_v2,
         adaptive_config: *const fullmag_fem_adaptive_config_v2,
     ) -> *mut fullmag_fem_backend;
     pub fn fullmag_fem_backend_begin_stage(
@@ -2948,6 +3186,14 @@ extern "C" {
         handle: *mut fullmag_fem_backend,
         out_receipt: *mut fullmag_fem_gpu_execution_receipt_v1,
     ) -> i32;
+    pub fn fullmag_fem_backend_demag_fem_bem_provenance_v1(
+        handle: *mut fullmag_fem_backend,
+        out_provenance: *mut fullmag_fem_demag_fem_bem_provenance_v1,
+    ) -> i32;
+    pub fn fullmag_fem_backend_gpu_performance_snapshot_v1(
+        handle: *mut fullmag_fem_backend,
+        out_snapshot: *mut fullmag_fem_gpu_performance_snapshot_v1,
+    ) -> i32;
 
     pub fn fullmag_fem_backend_last_error(handle: *mut fullmag_fem_backend) -> *const c_char;
 
@@ -2998,6 +3244,42 @@ extern "C" {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "build-native")]
+    #[test]
+    fn artifact_identity_v1_native_boundary_rejects_aliases_and_bad_layout() {
+        use std::ffi::CString;
+        let owner = CString::new("owner:exact").unwrap();
+        let mut identity = super::FullmagFemFrequencyDomainArtifactIdentityV1 {
+            abi_version: super::FULLMAG_FEM_FREQUENCY_DOMAIN_ARTIFACT_IDENTITY_V1,
+            struct_size: std::mem::size_of::<super::FullmagFemFrequencyDomainArtifactIdentityV1>() as u32,
+            session_id: owner.as_ptr(),
+            run_id: owner.as_ptr(),
+            stage_id: owner.as_ptr(),
+            runtime_id: owner.as_ptr(),
+        };
+        let validate = |value: &super::FullmagFemFrequencyDomainArtifactIdentityV1| unsafe {
+            super::fullmag_fem_frequency_domain_validate_artifact_identity_v1(value)
+        };
+        assert_eq!(validate(&identity), super::FULLMAG_FEM_OK);
+        for invalid in ["", "current", "Run:CURRENT", "scope:Current", "runtime:not_provided", "\u{a0}CURRENT\u{a0}", "run:\u{85}"] {
+            let candidate = CString::new(invalid).unwrap();
+            identity.run_id = candidate.as_ptr();
+            assert_eq!(validate(&identity), super::FULLMAG_FEM_ERR_INVALID, "{invalid:?}");
+        }
+        let malformed_utf8 = CString::new(vec![0xc0, 0xaf]).unwrap();
+        identity.run_id = malformed_utf8.as_ptr();
+        assert_eq!(validate(&identity), super::FULLMAG_FEM_ERR_INVALID);
+        identity.run_id = owner.as_ptr();
+        identity.abi_version = 99;
+        assert_eq!(validate(&identity), super::FULLMAG_FEM_ERR_INVALID);
+        identity.abi_version = super::FULLMAG_FEM_FREQUENCY_DOMAIN_ARTIFACT_IDENTITY_V1;
+        identity.struct_size = 0;
+        assert_eq!(validate(&identity), super::FULLMAG_FEM_ERR_INVALID);
+        assert_eq!(unsafe {
+            super::fullmag_fem_frequency_domain_validate_artifact_identity_v1(std::ptr::null())
+        }, super::FULLMAG_FEM_ERR_INVALID);
+    }
+
     use super::*;
 
     #[test]
@@ -3396,6 +3678,13 @@ mod tests {
         assert!(
             std::mem::offset_of!(fullmag_fem_plan_desc, frozen_reference_len)
                 > std::mem::offset_of!(fullmag_fem_plan_desc, frozen_reference_xyz)
+        );
+        assert_eq!(std::mem::size_of::<fullmag_fem_plan_desc>(), 1616);
+        assert_eq!(FULLMAG_FEM_PLAN_DESC_V2_ABI_VERSION, 2);
+        assert_eq!(std::mem::offset_of!(fullmag_fem_plan_desc_v2, base), 8);
+        assert!(
+            std::mem::offset_of!(fullmag_fem_plan_desc_v2, has_rotated_interfacial_dmi)
+                >= 8 + std::mem::size_of::<fullmag_fem_plan_desc>()
         );
     }
 
@@ -6018,5 +6307,77 @@ mod tests {
             *mut fullmag_fem_backend,
             *mut fullmag_fem_gpu_execution_receipt_v1,
         ) -> i32 = fullmag_fem_backend_gpu_execution_receipt_v1;
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn demag_fem_bem_provenance_v1_has_stable_layout_and_symbol() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(FULLMAG_FEM_DEMAG_FEM_BEM_PROVENANCE_V1_ABI_VERSION, 1);
+        assert_eq!(size_of::<fullmag_fem_demag_fem_bem_provenance_v1>(), 440);
+        assert_eq!(align_of::<fullmag_fem_demag_fem_bem_provenance_v1>(), 8);
+        assert_eq!(offset_of!(fullmag_fem_demag_fem_bem_provenance_v1, abi_version), 0);
+        assert_eq!(offset_of!(fullmag_fem_demag_fem_bem_provenance_v1, struct_size), 4);
+        assert_eq!(offset_of!(fullmag_fem_demag_fem_bem_provenance_v1, available), 8);
+        assert_eq!(offset_of!(fullmag_fem_demag_fem_bem_provenance_v1, operator_mode), 16);
+        assert_eq!(offset_of!(fullmag_fem_demag_fem_bem_provenance_v1, operator_fingerprint), 80);
+        assert_eq!(offset_of!(fullmag_fem_demag_fem_bem_provenance_v1, boundary_node_count), 336);
+        assert_eq!(offset_of!(fullmag_fem_demag_fem_bem_provenance_v1, max_rank), 384);
+        assert_eq!(offset_of!(fullmag_fem_demag_fem_bem_provenance_v1, relative_error_estimate), 392);
+        assert_eq!(offset_of!(fullmag_fem_demag_fem_bem_provenance_v1, apply_count), 432);
+        let _: unsafe extern "C" fn(
+            *mut fullmag_fem_backend,
+            *mut fullmag_fem_demag_fem_bem_provenance_v1,
+        ) -> i32 = fullmag_fem_backend_demag_fem_bem_provenance_v1;
+    }
+
+    #[test]
+    fn gpu_performance_snapshot_v1_has_stable_append_only_layout_and_symbol() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(align_of::<fullmag_fem_gpu_performance_snapshot_v1>(), 8);
+        assert_eq!(
+            offset_of!(fullmag_fem_gpu_performance_snapshot_v1, abi_version),
+            0
+        );
+        assert_eq!(
+            offset_of!(fullmag_fem_gpu_performance_snapshot_v1, struct_size),
+            4
+        );
+        assert_eq!(
+            offset_of!(fullmag_fem_gpu_performance_snapshot_v1, available),
+            8
+        );
+        assert_eq!(
+            offset_of!(fullmag_fem_gpu_performance_snapshot_v1, completed_step),
+            32
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fem_gpu_performance_snapshot_v1,
+                physical_rhs_evaluations
+            ),
+            80
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fem_gpu_performance_snapshot_v1,
+                accepted_rhs_evaluations
+            ),
+            240
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fem_gpu_performance_snapshot_v1,
+                physical_exchange_elapsed_ns
+            ),
+            400
+        );
+        assert_eq!(size_of::<fullmag_fem_gpu_performance_snapshot_v1>(), 480);
+        let _symbol: unsafe extern "C" fn(
+            *mut fullmag_fem_backend,
+            *mut fullmag_fem_gpu_performance_snapshot_v1,
+        ) -> i32 = fullmag_fem_backend_gpu_performance_snapshot_v1;
     }
 }

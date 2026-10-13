@@ -12,8 +12,9 @@ vi.mock("../InspectorTabState", () => ({
   useInspectorActiveTab: () => "policy",
 }));
 
-vi.mock("@/kernel/KernelContext", () => ({
-  useKernel: () => ({
+vi.mock("@/kernel/KernelContext", async () => {
+  const { createContext } = await import("react");
+  const kernel = {
     api: {
       meshing: {
         replaceObjectPolicy: vi.fn(),
@@ -29,8 +30,12 @@ vi.mock("@/kernel/KernelContext", () => ({
     resources: {
       invalidate: vi.fn(),
     },
-  }),
-}));
+  };
+  return {
+    KernelContext: createContext<unknown>(kernel),
+    useKernel: () => kernel,
+  };
+});
 
 vi.mock("@/kernel/resources/studyRuntimeResources", () => ({
   shouldLoadRuntimeMeshBuild: () => true,
@@ -59,6 +64,11 @@ const sessionStatusMock = {
 
 vi.mock("@/kernel/resources/useSessionStatus", () => ({
   SESSION_STATUS_RESOURCE_KEY: "session:status",
+  useSessionResourceIdentity: () => ({
+    requestScopeEpoch: "scope-test",
+    sessionEpoch: "epoch-test",
+    sessionId: "session-test",
+  }),
   useSessionStatus: () => sessionStatusMock,
   useSessionStatusSelector: (selector: (status: typeof sessionStatusMock) => unknown) =>
     selector(sessionStatusMock),
@@ -230,6 +240,13 @@ vi.mock("@/kernel/resources/geometryLifecycleResources", () => ({
     error: null,
     refetch: vi.fn(),
     revision: 4,
+    status: "ready",
+  }),
+  useMeshBuildHistoryResource: () => ({
+    data: null,
+    error: null,
+    refetch: vi.fn(),
+    revision: null,
     status: "ready",
   }),
   useMeshSharedDomainManifestResource: () => ({
@@ -775,7 +792,7 @@ describe("scoped mesh quality panels", () => {
     expect(html).not.toContain("ż".repeat(513));
   });
 
-  it("keeps FDM Airbox parameters geometry-only and requires a rerun or re-plan", () => {
+  it("keeps FDM Airbox parameters geometry-only and exposes the atomic grid replan", () => {
     const html = renderToStaticMarkup(
       <AirboxMeshParametersPanel
         lane="fdm"
@@ -786,7 +803,9 @@ describe("scoped mesh quality panels", () => {
     expect(html).toContain("Canonical Airbox Geometry");
     expect(html).toContain("Padding X");
     expect(html).toContain("Center X");
-    expect(html).toContain("FDM policy changes apply to the next run");
+    expect(html).toContain(
+      "Apply Airbox Policy saves the canonical policy and queues an atomic FDM grid replan.",
+    );
     expect(html).not.toContain("Maximum element growth rate");
     expect(html).not.toContain("Curvature factor");
     expect(html).not.toContain("Element grading");

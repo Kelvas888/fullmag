@@ -1,0 +1,373 @@
+[
+  {
+    "id": "S01",
+    "path": "apps/control-room/src/modules/inspector/panels/GeometryObjectPanel.tsx",
+    "scope": "65–1080; także wcześniejszy odczyt początku",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/GeometryObjectPanel.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S02",
+    "path": "apps/control-room/src/modules/inspector/panels/geometryObjectPanelModel.ts",
+    "scope": "1–660",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/geometryObjectPanelModel.ts",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S03",
+    "path": "apps/control-room/src/modules/inspector/InspectorEditSession.tsx",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/InspectorEditSession.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S04",
+    "path": "apps/control-room/src/modules/inspector/InspectorModule.tsx",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/InspectorModule.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S05",
+    "path": "apps/control-room/src/modules/inspector/panels/DedicatedExplorerInspectorPanels.tsx",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/DedicatedExplorerInspectorPanels.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S06",
+    "path": "apps/control-room/src/kernel/authoring/geometryLifecycleCommands.ts",
+    "scope": "1–380",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/kernel/authoring/geometryLifecycleCommands.ts",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S07",
+    "path": "apps/control-room/src/kernel/authoring/objectTranslationMutation.ts",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/kernel/authoring/objectTranslationMutation.ts",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S08",
+    "path": "apps/control-room/src/kernel/authoring/objectMoveConflictWorkflow.ts",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/kernel/authoring/objectMoveConflictWorkflow.ts",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S09",
+    "path": "apps/control-room/src/modules/viewport-3d/Viewport3DObjectMoveInteraction.tsx",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/viewport-3d/Viewport3DObjectMoveInteraction.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S10",
+    "path": "apps/control-room/src/modules/viewport-3d/MoveObjectGizmo.tsx",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/viewport-3d/MoveObjectGizmo.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S11",
+    "path": "apps/control-room/src/modules/viewport-3d/MoveObjectGizmo.test.tsx",
+    "scope": "1–330 / cały zwrócony plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/viewport-3d/MoveObjectGizmo.test.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S12",
+    "path": "apps/control-room/src/modules/start/model/importFormats.ts",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/start/model/importFormats.ts",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S13",
+    "path": "crates/fullmag-api/src/assets.rs",
+    "scope": "1–250",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/crates/fullmag-api/src/assets.rs",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S14",
+    "path": "apps/control-room/src/modules/ribbon/ribbonCommands.ts",
+    "scope": "1–360",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/ribbon/ribbonCommands.ts",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S15",
+    "path": "apps/control-room/src/modules/ribbon/ribbonContributions.tsx",
+    "scope": "1–230, 285–426 oraz fragment definicji Mesh",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/ribbon/ribbonContributions.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S16",
+    "path": "apps/control-room/src/modules/inspector/panels/MeshDetailsPanel.tsx",
+    "scope": "1–350",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/MeshDetailsPanel.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S17",
+    "path": "apps/control-room/src/modules/inspector/panels/mesh-details/useMeshDetailsModel.ts",
+    "scope": "1–320, 350–koniec",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/mesh-details/useMeshDetailsModel.ts",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S18",
+    "path": "apps/control-room/src/modules/inspector/panels/ObjectMeshPolicyPanel.tsx",
+    "scope": "1–350, 1000–koniec",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/ObjectMeshPolicyPanel.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S19",
+    "path": "apps/control-room/src/modules/overlay/MeshBuildDialog.tsx",
+    "scope": "1–360",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/overlay/MeshBuildDialog.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S20",
+    "path": "apps/control-room/src/kernel/authoring/geometryLifecycleCommandContributions.ts",
+    "scope": "1–250, 500–860",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/kernel/authoring/geometryLifecycleCommandContributions.ts",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S21",
+    "path": "apps/control-room/src/kernel/authoring/authoringHistoryMutation.ts",
+    "scope": "1–340 / cały zwrócony plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/kernel/authoring/authoringHistoryMutation.ts",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S22",
+    "path": "apps/control-room/src/modules/viewport-3d/viewport3dPrimitiveModel.ts",
+    "scope": "1–340, 435–koniec",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/viewport-3d/viewport3dPrimitiveModel.ts",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S23",
+    "path": "apps/control-room/src/modules/inspector/panels/fdm-grid/FdmGridInspectorPanel.tsx",
+    "scope": "1–340",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/fdm-grid/FdmGridInspectorPanel.tsx",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S24",
+    "path": "apps/control-room/package.json",
+    "scope": "1–120",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/package.json",
+    "verification": "inherited_v1_targeted_read",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95"
+  },
+  {
+    "id": "S25",
+    "path": "crates/fullmag-api/src/schemas/authoring.rs",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/crates/fullmag-api/src/schemas/authoring.rs",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+    "ranges": [
+      [
+        1440,
+        1645
+      ]
+    ],
+    "scope": "1440–1645",
+    "symbols": [
+      "AuthoringTransactionRequest::PatchObjectGeometry",
+      "AuthoringTransactionResponse"
+    ],
+    "git_blob_sha": "d04dcbd98bc87fc48af85348e060ea243322f9cc",
+    "verification": "v2_connector_targeted_read",
+    "limitation": "Odczyt wskazanych zakresów; brak kwalifikacji runtime. Dla S31 żądany zakres kończył się po EOF; S32 ograniczony do widocznej części."
+  },
+  {
+    "id": "S26",
+    "path": "crates/fullmag-api/src/router_v2/handlers/model/authoring.rs",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/crates/fullmag-api/src/router_v2/handlers/model/authoring.rs",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+    "ranges": [
+      [
+        3260,
+        3505
+      ],
+      [
+        4100,
+        4330
+      ],
+      [
+        2800,
+        2880
+      ]
+    ],
+    "scope": "3260–3505; 4100–4330; 2800–2880",
+    "symbols": [
+      "commit_authoring_transaction",
+      "apply_object_geometry_patch",
+      "patch_authoring_object_geometry",
+      "apply_create_object_transaction"
+    ],
+    "git_blob_sha": "5f9e4ddd81338caa1ff20c13a83a07bf8e04982f",
+    "verification": "v2_connector_targeted_read",
+    "limitation": "Odczyt wskazanych zakresów; brak kwalifikacji runtime. Dla S31 żądany zakres kończył się po EOF; S32 ograniczony do widocznej części."
+  },
+  {
+    "id": "S27",
+    "path": "crates/fullmag-authoring/src/scene.rs",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/crates/fullmag-authoring/src/scene.rs",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+    "ranges": [
+      [
+        130,
+        215
+      ]
+    ],
+    "scope": "130–215",
+    "symbols": [
+      "Transform3D",
+      "impl Default for Transform3D"
+    ],
+    "git_blob_sha": "d57b91ad0d5db7ed8989e4a31a9bc9b5588e5fa2",
+    "verification": "v2_connector_targeted_read",
+    "limitation": "Odczyt wskazanych zakresów; brak kwalifikacji runtime. Dla S31 żądany zakres kończył się po EOF; S32 ograniczony do widocznej części."
+  },
+  {
+    "id": "S28",
+    "path": "crates/fullmag-authoring/src/adapters.rs",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/crates/fullmag-authoring/src/adapters.rs",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+    "ranges": [
+      [
+        80,
+        245
+      ]
+    ],
+    "scope": "80–245",
+    "symbols": [
+      "scene_document_to_script_builder",
+      "owner_transform_rotation_scale_unsupported"
+    ],
+    "git_blob_sha": "515ab5d8b1a8a252e706a50ad9103e91ac449c6f",
+    "verification": "v2_connector_targeted_read",
+    "limitation": "Odczyt wskazanych zakresów; brak kwalifikacji runtime. Dla S31 żądany zakres kończył się po EOF; S32 ograniczony do widocznej części."
+  },
+  {
+    "id": "S29",
+    "path": "packages/fullmag-py/src/fullmag/runtime/scene_document.py",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/packages/fullmag-py/src/fullmag/runtime/scene_document.py",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+    "ranges": [
+      [
+        1920,
+        2025
+      ]
+    ],
+    "scope": "1920–2025",
+    "symbols": [
+      "_owner_frame_translation",
+      "builder_overrides_from_scene_document"
+    ],
+    "git_blob_sha": "9ac49c5f39686132076d797b677d271000d32181",
+    "verification": "v2_connector_targeted_read",
+    "limitation": "Odczyt wskazanych zakresów; brak kwalifikacji runtime. Dla S31 żądany zakres kończył się po EOF; S32 ograniczony do widocznej części."
+  },
+  {
+    "id": "S30",
+    "path": "crates/fullmag-authoring/src/geometry.rs",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/crates/fullmag-authoring/src/geometry.rs",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+    "ranges": [
+      [
+        320,
+        520
+      ],
+      [
+        900,
+        1020
+      ]
+    ],
+    "scope": "320–520; 900–1020",
+    "symbols": [
+      "realize_geometry_scene",
+      "geometry_capabilities",
+      "derive_object_bounds",
+      "derive_geometry_bounds"
+    ],
+    "git_blob_sha": "728fbe032ff0009a9333c07a3b3062c8c32802a9",
+    "verification": "v2_connector_targeted_read",
+    "limitation": "Odczyt wskazanych zakresów; brak kwalifikacji runtime. Dla S31 żądany zakres kończył się po EOF; S32 ograniczony do widocznej części."
+  },
+  {
+    "id": "S31",
+    "path": ".agents/instructions/frontend.md",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/.agents/instructions/frontend.md",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+    "ranges": [
+      [
+        1,
+        260
+      ]
+    ],
+    "scope": "1–260",
+    "symbols": [
+      "9.1 Control-room API invariant",
+      "9.2 Frontend architecture invariant",
+      "9.4 Zero-tolerance quality gate",
+      "Reguły z korekt projektu"
+    ],
+    "git_blob_sha": "392039b2692c0cb5dec95085fdd3af1d5eddd27d",
+    "verification": "v2_connector_targeted_read",
+    "limitation": "Odczyt wskazanych zakresów; brak kwalifikacji runtime. Dla S31 żądany zakres kończył się po EOF; S32 ograniczony do widocznej części."
+  },
+  {
+    "id": "S32",
+    "path": "AGENTS.md",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/AGENTS.md",
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+    "ranges": [
+      [
+        1,
+        100
+      ]
+    ],
+    "scope": "1–100",
+    "symbols": [
+      "Obowiązkowy cykl pracy w worktree",
+      "Kontrakt Fullmag",
+      "Build i dowody"
+    ],
+    "git_blob_sha": "945a1e883ff54ae3b8830d662c1a57ef4f6d161b",
+    "verification": "v2_connector_targeted_read",
+    "limitation": "Odczyt wskazanych zakresów; brak kwalifikacji runtime. Dla S31 żądany zakres kończył się po EOF; S32 ograniczony do widocznej części."
+  }
+]

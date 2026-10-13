@@ -9,6 +9,7 @@ import {
   visualizationTargetIdForSceneObject,
 } from "@/kernel/selection/selectionTypes";
 import type { KernelApi, ModuleId } from "@/kernel/types";
+import type { AnalysisFieldOverlaySource } from "@/kernel/visualization/AnalysisFieldOverlayController";
 import type { PostprocessingDefinitionKind } from "@/shared/domain/analysis/postprocessingTypes";
 import { targetForFdmNativeLayer } from "@/kernel/visualization/ObjectVisualizationController";
 import { selectCrossSectionPlot } from "@/kernel/workspace/crossSectionWorkspace";
@@ -119,7 +120,7 @@ function extensionIdFromNode(node: ExplorerNode): string | undefined {
 
 function modeVisualizationSourceFromNode(
   node: ExplorerNode,
-): "eigen-mode" | "frequency-response" | null {
+): AnalysisFieldOverlaySource | null {
   if (node.analysisFieldSource) return node.analysisFieldSource;
   if (node.fieldId?.startsWith("analysis:eigen:")) return "eigen-mode";
   if (node.fieldId?.startsWith("analysis:frequency-response:")) {
@@ -148,6 +149,23 @@ function postprocessingRootKind(
 }
 
 export function selectionRefFromNode(node: ExplorerNode): SelectionRef | null {
+  if (node.kind === "results.observation_frame" && node.observationFrame) {
+    const frame = node.observationFrame;
+    return {
+      acceptedRevision: frame.accepted_state_ref.generation.accepted_revision,
+      acceptedStep: frame.accepted_state_ref.id.accepted_step,
+      adapterId: frame.adapter_id,
+      frameId: frame.frame_id,
+      kind: "results.observation_frame",
+      nodeId: node.id,
+      runId: frame.run_id,
+      runtimeEpoch: frame.accepted_state_ref.generation.runtime_epoch,
+      stageId: frame.stage_id,
+      stateDigest: frame.accepted_state_ref.id.state_digest,
+      type: "observation-frame",
+    };
+  }
+
   if (
     node.kind === "object.frozen-spins" &&
     node.constraintId
@@ -815,7 +833,9 @@ export function selectExplorerNode(
         ref?.type === "cross-section-draft" ||
         ref?.type === "cross-section-plot" ||
         ref?.type === "planar-monitor-draft" ||
-        ref?.type === "mesh-part" ||
+        (ref?.type === "mesh-part" &&
+          node.kind !== "mesh.unassigned" &&
+          node.kind !== "mesh.unassigned.part") ||
         ref?.type === "current-transport" ||
         ref?.type === "spin-transport" ||
         ref?.type === "spin-interface" ||

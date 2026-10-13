@@ -12,6 +12,73 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) const REFERENCE_MODAL_GAMMA0_RAD_S_PER_A_M: f64 = 2.211e5;
 
+/// Immutable identity of the run that owns a frequency-domain artifact.
+///
+/// Writers require this context instead of persisting aliases such as
+/// `current` or `run:current`. Transport routes are resolved later by the API;
+/// the stored artifact keeps only the exact owning identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrequencyDomainArtifactIdentity {
+    pub session_id: String,
+    pub run_id: String,
+    pub stage_id: String,
+    pub runtime_id: String,
+}
+
+impl FrequencyDomainArtifactIdentity {
+    pub fn try_new(
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        stage_id: impl Into<String>,
+        runtime_id: impl Into<String>,
+    ) -> std::io::Result<Self> {
+        let identity = Self {
+            session_id: session_id.into(),
+            run_id: run_id.into(),
+            stage_id: stage_id.into(),
+            runtime_id: runtime_id.into(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub fn validate(&self) -> std::io::Result<()> {
+        for (label, value) in [
+            ("session_id", self.session_id.as_str()),
+            ("run_id", self.run_id.as_str()),
+            ("stage_id", self.stage_id.as_str()),
+            ("runtime_id", self.runtime_id.as_str()),
+        ] {
+            let normalized = value.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("frequency-domain artifact {label} must not be empty"),
+                ));
+            }
+            if normalized == "current"
+                || normalized == "run:current"
+                || normalized.ends_with(":current")
+                || normalized == "runtime:not_provided"
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "frequency-domain artifact {label} must be an exact identity, got `{value}`"
+                    ),
+                ));
+            }
+            if value.chars().any(char::is_control) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("frequency-domain artifact {label} contains a control character"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn reference_modal_gamma_rad_s_t() -> f64 {
     REFERENCE_MODAL_GAMMA0_RAD_S_PER_A_M / crate::MU0
 }
@@ -69,9 +136,10 @@ pub(super) struct FrequencyDomainArtifactManifest<'a> {
     pub(super) analysis_family: &'static str,
     pub(super) study_product: &'static str,
     pub(super) revision: String,
-    pub(super) session_id: &'static str,
-    pub(super) run_id: &'static str,
-    pub(super) stage_id: &'static str,
+    pub(super) session_id: &'a str,
+    pub(super) run_id: &'a str,
+    pub(super) stage_id: &'a str,
+    pub(super) runtime_id: &'a str,
     pub(super) stage_kind: &'static str,
     pub(super) created_at: String,
     pub(super) requested_execution: FrequencyDomainRequestedExecution<'a>,
@@ -221,7 +289,7 @@ pub(super) struct FrequencyDomainArtifactIndex {
     pub(super) frequency_point_paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct FrequencyDomainResourceIndex {
     pub(super) spectrum_resource_key: Option<&'static str>,
     pub(super) branches_resource_key: Option<&'static str>,
@@ -329,6 +397,10 @@ pub struct ServerArtifactUnits {
 pub struct ServerArtifactTopology {
     pub mesh_id: String,
     pub topology_revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_generation_id: Option<String>,
     pub indexing: String,
     pub sample_axis: String,
     pub mode_axis: String,
@@ -337,12 +409,6 @@ pub struct ServerArtifactTopology {
 
 pub(super) fn eigen_mode_field_id(sample_index: usize, raw_mode_index: usize) -> String {
     format!("analysis:eigen:sample-{sample_index:04}:mode-{raw_mode_index:04}")
-}
-
-pub(super) fn eigen_mode_field_resource_key(mode_field_id: &str) -> String {
-    format!(
-        "/v2/sessions/current/data/fields/{mode_field_id}/samples/vector?view=phase_rotated_real&phase_rad=0"
-    )
 }
 
 pub(super) fn result_mode(
@@ -893,6 +959,8 @@ pub(super) fn empty_server_topology() -> ServerArtifactTopology {
     ServerArtifactTopology {
         mesh_id: "topology:not_provided".to_string(),
         topology_revision: "topology:not_provided".to_string(),
+        topology_fingerprint: None,
+        mesh_generation_id: None,
         indexing: "sample_index_then_raw_mode_index".to_string(),
         sample_axis: "sample_id".to_string(),
         mode_axis: "mode_id".to_string(),
@@ -906,6 +974,19 @@ pub(super) fn diagnostic_string_any(
 ) -> Option<String> {
     keys.iter()
         .find_map(|key| diagnostic_string(diagnostics, key))
+}
+
+pub(super) fn diagnostic_string_or_integer_any(
+    diagnostics: Option<&serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = diagnostics?.get(key)?;
+        value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| value.as_u64().map(|number| number.to_string()))
+    })
 }
 
 pub(super) fn is_canonical_sha256(value: &str) -> bool {
@@ -1069,7 +1150,7 @@ pub(super) fn topology_from_diagnostics(
     if let Some(value) = diagnostics {
         topology.mesh_id = diagnostic_string_any(Some(value), &["mesh_id", "topology_id"])
             .unwrap_or(topology.mesh_id);
-        topology.topology_revision = diagnostic_string_any(
+        topology.topology_revision = diagnostic_string_or_integer_any(
             Some(value),
             &[
                 "topology_revision",
@@ -1078,6 +1159,23 @@ pub(super) fn topology_from_diagnostics(
             ],
         )
         .unwrap_or(topology.topology_revision);
+        topology.topology_fingerprint = diagnostic_string_any(
+            Some(value),
+            &[
+                "topology_fingerprint",
+                "source_topology_fingerprint",
+                "source_mesh_topology_sha256",
+            ],
+        )
+        .filter(|fingerprint| is_canonical_sha256(fingerprint));
+        topology.mesh_generation_id = diagnostic_string_any(
+            Some(value),
+            &[
+                "mesh_generation_id",
+                "mesh_generation_identity",
+                "domain_generation_id",
+            ],
+        );
         topology.node_count = value
             .get("node_count")
             .and_then(serde_json::Value::as_u64)

@@ -105,7 +105,12 @@ describe("VisualizationDebugPanel mounted interaction", () => {
 
     expect(container.textContent).toContain("Evidence export");
     expect(container.textContent).toContain("Snapshot is stale");
-    expect(container.textContent).toContain("Evidence is internally consistent.");
+    expect(container.textContent).toContain("Health is unknown because evidence is incomplete.");
+    expect(container.textContent).not.toContain("Evidence is internally consistent.");
+    const health = findElements(container, (element) =>
+      element.getAttribute("class")?.includes("fm-visualization-debug-health") ?? false,
+    )[0];
+    expect(health?.getAttribute("data-disposition")).toBe("unknown");
     expect(container.textContent).toContain("Requested componentfull");
     expect(container.textContent).toContain("Decoded component— (not encoded)");
 
@@ -452,6 +457,7 @@ function makeKernel(): KernelApi {
         scene: () => new Promise(() => undefined),
       },
       sessions: {
+        list: async () => ({ schema_version: "2.0.0", sessions: [] }),
         current: {
           status: async () => ({
             capabilities: { explicit_topology: false },
@@ -492,6 +498,7 @@ function makeKernel(): KernelApi {
       applyOptimisticState: (value: unknown) => value,
       getSnapshot: () => visualizationSyncSnapshot,
       observeRemoteState: vi.fn(),
+      setSessionScopeKey: vi.fn(),
       subscribe: () => () => undefined,
     },
     visualizationDebug: new VisualizationDebugController(),
@@ -695,7 +702,7 @@ async function settleMountedPanel(container: TestElement): Promise<void> {
       await Promise.resolve();
     });
   }
-  throw new Error("VisualizationDebugPanel did not reach the ready state.");
+  throw new Error("VisualizationDebugPanel did not settle its evidence state.");
 }
 
 function findButton(container: TestElement, name: string): TestElement {

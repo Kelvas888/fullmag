@@ -9,7 +9,7 @@ import {
 } from "./viewport3dEventManager";
 
 describe("pickViewport3DEventHandlers", () => {
-  it("removes release handlers but keeps click selection and wheel zoom", () => {
+  it("keeps gesture release, click selection and wheel zoom", () => {
     const handlers = {
       onClick: vi.fn(),
       onContextMenu: vi.fn(),
@@ -30,6 +30,7 @@ describe("pickViewport3DEventHandlers", () => {
       "onPointerDown",
       "onPointerLeave",
       "onPointerMove",
+      "onPointerUp",
       "onWheel",
     ]);
   });
@@ -178,6 +179,30 @@ describe("pickViewport3DEventHandlers", () => {
     handler?.({ buttons: 4 } as PointerEvent);
 
     expect(innerHandler).not.toHaveBeenCalled();
+  });
+
+  it("dispatches pressed moves only for the pointer captured by R3F", () => {
+    const innerHandler = vi.fn();
+    const handler = createViewport3DPointerMoveHandler(innerHandler, (id) => id === 7);
+    const capturedMove = { buttons: 1, pointerId: 7 } as PointerEvent;
+    handler?.({ buttons: 1, pointerId: 8 } as PointerEvent);
+    handler?.(capturedMove);
+    expect(innerHandler).toHaveBeenCalledExactlyOnceWith(capturedMove);
+  });
+
+  it("does not replay pointer-down after an immediate gizmo click", () => {
+    const pointerDownHandler = vi.fn();
+    const clickHandler = vi.fn();
+    const store = { getState: () => ({ internal: {
+      initialClick: [10, 20], initialHits: [],
+    } }) } as unknown as Parameters<typeof createViewport3DClickSelectionHandler>[0]["store"];
+    const handler = createViewport3DClickSelectionHandler({
+      store, pointerDownHandler, clickHandler,
+      pointerDownAlreadyHandled: () => true,
+    });
+    handler({ offsetX: 10, offsetY: 20 } as MouseEvent);
+    expect(pointerDownHandler).not.toHaveBeenCalled();
+    expect(clickHandler).not.toHaveBeenCalled();
   });
 
   it("keeps passive pointer-move handling for hover interactions", () => {

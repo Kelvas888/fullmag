@@ -1,4 +1,11 @@
-import type { ChartRenderModel } from "./chartRenderer";
+import type { MutableRefObject } from "react";
+
+import type {
+  ChartRenderModel,
+  ChartRendererOwner,
+  ChartRenderResultCoordinate,
+  ChartRenderResultSelectionRef,
+} from "./chartRenderer";
 import type { ChartScientificTrust } from "./chartScientificTrust";
 import {
   chartValueExtrema,
@@ -7,6 +14,52 @@ import {
 } from "./chartScalePolicy";
 
 export type ChartExportFormat = "csv" | "tsv";
+export type ChartExportRequestFormat = ChartExportFormat | "png";
+
+/** A command identity that remains unique when two consecutive commands share a format. */
+export interface ChartExportRequest {
+  format: ChartExportRequestFormat;
+  requestId: string;
+}
+
+export function exportChartData(model: ChartRenderModel, format: ChartExportFormat): boolean {
+  try {
+    const dataDownloaded = downloadChartBlob({
+      content: serializeChartData(model, format),
+      filename: safeChartExportFilename(model, format),
+      mimeType: format === "csv" ? "text/csv;charset=utf-8" : "text/tab-separated-values;charset=utf-8",
+    });
+    if (!dataDownloaded) return false;
+    return downloadChartBlob({
+      content: JSON.stringify(chartExportProvenance(model), null, 2),
+      filename: safeChartExportFilename(model, ".provenance.json"),
+      mimeType: "application/json",
+    });
+  } catch {
+    return false;
+  }
+}
+
+export function exportChartPng(
+  model: ChartRenderModel,
+  rendererRef: MutableRefObject<ChartRendererOwner | null>,
+): boolean {
+  try {
+    const dataUrl = rendererRef.current?.exportPng();
+    if (!dataUrl) return false;
+    const anchor = document.createElement("a");
+    anchor.download = safeChartExportFilename(model, "png");
+    anchor.href = dataUrl;
+    anchor.click();
+    return downloadChartBlob({
+      content: JSON.stringify(chartExportProvenance(model), null, 2),
+      filename: safeChartExportFilename(model, ".provenance.json"),
+      mimeType: "application/json",
+    });
+  } catch {
+    return false;
+  }
+}
 
 export interface ChartExportProvenance {
   artifactPath: string | null;
@@ -15,17 +68,23 @@ export interface ChartExportProvenance {
   contentDigest: string | null;
   dataRevision: string | number | null;
   decimation: string;
+  datasetId?: string | null;
+  datasetRevision?: string | null;
   descriptorId: string;
   device: string | null;
   displayUnits: Record<string, string>;
   exportedAt: string;
+  fixedCoordinates?: readonly ChartRenderResultCoordinate[];
   precision: string | null;
+  projectionId?: string | null;
+  projectionRevision?: string | null;
   provenance: string | null;
   qualification: string;
   query: string;
   resourceKey: string;
   runId: string | null;
   schemaVersion: 1;
+  selectionRefs?: readonly ChartRenderResultSelectionRef[];
   sourceSchemaVersion: string | null;
   sessionId: string | null;
   status: ChartRenderModel["status"];
@@ -37,6 +96,29 @@ export function chartExportProvenance(
   model: ChartRenderModel,
   exportedAt = new Date().toISOString(),
 ): ChartExportProvenance {
+  const resultContext = model.provenance?.datasetId != null ||
+    model.provenance?.projectionId != null
+    ? {
+        ...(model.provenance?.datasetId != null
+          ? { datasetId: model.provenance.datasetId }
+          : {}),
+        ...(model.provenance?.datasetRevision != null
+          ? { datasetRevision: model.provenance.datasetRevision }
+          : {}),
+        ...(model.provenance?.fixedCoordinates
+          ? { fixedCoordinates: model.provenance.fixedCoordinates }
+          : {}),
+        ...(model.provenance?.projectionId != null
+          ? { projectionId: model.provenance.projectionId }
+          : {}),
+        ...(model.provenance?.projectionRevision != null
+          ? { projectionRevision: model.provenance.projectionRevision }
+          : {}),
+        ...(model.provenance?.selectionRefs
+          ? { selectionRefs: model.provenance.selectionRefs }
+          : {}),
+      }
+    : {};
   return {
     artifactPath: model.provenance?.artifactPath ?? null,
     dataRevision: model.provenance?.dataRevision ?? null,
@@ -51,6 +133,7 @@ export function chartExportProvenance(
     device: model.provenance?.device ?? null,
     displayUnits: resolvedDisplayUnits(model),
     exportedAt,
+    ...resultContext,
     precision: model.provenance?.precision ?? null,
     provenance: model.provenance?.provenance ?? null,
     qualification: model.provenance?.qualification ?? "unknown",
@@ -95,6 +178,8 @@ export function serializeChartData(
 ): string {
   const delimiter = format === "csv" ? "," : "\t";
   const rows: string[][] = [];
+  const hasResultContext = model.provenance?.datasetId != null ||
+    model.provenance?.projectionId != null;
 
   // Warning header for stale/degraded data — alerts user in the file itself
   if (model.status === "stale" || model.status === "degraded") {
@@ -112,6 +197,18 @@ export function serializeChartData(
     "y_unit",
     "data_revision",
     "decimation",
+    ...(hasResultContext
+      ? [
+          "dataset_id",
+          "dataset_revision",
+          "projection_id",
+          "projection_revision",
+          "sample_id",
+          "item_id",
+          "branch_id",
+          "coordinate_tokens",
+        ]
+      : []),
   ]);
 
   const rev = String(model.provenance?.dataRevision ?? "");
@@ -128,6 +225,21 @@ export function serializeChartData(
         quoteStringCell(series.unit, delimiter),
         quoteStringCell(rev, delimiter),
         quoteStringCell(decimation, delimiter),
+        ...(hasResultContext
+          ? [
+              quoteStringCell(model.provenance?.datasetId ?? "", delimiter),
+              quoteStringCell(model.provenance?.datasetRevision ?? "", delimiter),
+              quoteStringCell(model.provenance?.projectionId ?? "", delimiter),
+              quoteStringCell(model.provenance?.projectionRevision ?? "", delimiter),
+              quoteStringCell(point.sampleId ?? "", delimiter),
+              quoteStringCell(point.itemId ?? "", delimiter),
+              quoteStringCell(point.branchId ?? "", delimiter),
+              quoteStringCell(
+                fixedCoordinateTokens(model.provenance?.fixedCoordinates),
+                delimiter,
+              ),
+            ]
+          : []),
       ]);
     }
   }
@@ -135,6 +247,14 @@ export function serializeChartData(
   return rows
     .map((row) => row.join(delimiter))
     .join("\n");
+}
+
+function fixedCoordinateTokens(
+  coordinates: readonly ChartRenderResultCoordinate[] | undefined,
+): string {
+  return (coordinates ?? [])
+    .map((coordinate) => `${coordinate.axisId}=${coordinate.token}`)
+    .join("|");
 }
 
 export function safeChartExportFilename(
@@ -158,14 +278,23 @@ export function downloadChartBlob({
   content: BlobPart;
   filename: string;
   mimeType: string;
-}): void {
-  const url = URL.createObjectURL(new Blob([content], { type: mimeType }));
-  const anchor = document.createElement("a");
-  anchor.download = filename;
-  anchor.href = url;
-  anchor.click();
-  // Revoke after current event loop to ensure download started
-  queueMicrotask(() => URL.revokeObjectURL(url));
+}): boolean {
+  let url: string | null = null;
+  try {
+    url = URL.createObjectURL(new Blob([content], { type: mimeType }));
+    const anchor = document.createElement("a");
+    anchor.download = filename;
+    anchor.href = url;
+    anchor.click();
+    // Revoke after current event loop to ensure download started.
+    queueMicrotask(() => {
+      if (url) URL.revokeObjectURL(url);
+    });
+    return true;
+  } catch {
+    if (url) URL.revokeObjectURL(url);
+    return false;
+  }
 }
 
 function roundTripNumber(value: number): string {

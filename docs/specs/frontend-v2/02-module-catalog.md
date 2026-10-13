@@ -24,8 +24,17 @@ As of 2026-08-03, `apps/control-room` registers these manifests through `src/mod
 | `transport-footer` | `src/modules/footer` | `panel-bottom` | implemented footer owner; mounts Quick Chart content only in its active tab |
 | `command-palette` | `src/modules/overlay` | `overlay` | implemented as the current overlay module |
 | `status-bar` | `src/modules/status-bar` | `status-bar` | implemented |
+| `start-screen` | `src/modules/start` | `start-screen` | implemented launcher shell; mounted by `WorkspaceShellClient` without a session or during an explicit Start visit over an existing workspace. Design: `docs/design/start-screen/` |
 
 The modules listed in later sections remain the target catalog. A target module that is not in this snapshot is deferred, not silently dropped. Cutover acceptance still depends on the required workflows in `21-cutover-acceptance.md`, not on this snapshot alone.
+
+Globalny przycisk **Start** otwiera ekran startowy przez idempotentną komendę
+`workspace.home`. Zakładka narzędzi symulacji na wstążce nosi nazwę **Workspace**,
+a pierwsza sekcja ekranu startowego — **Overview**. Podczas wizyty na ekranie
+startowym przycisk **Back to simulation** (lub **Back to project**) wykonuje
+`workspace.return-to-workspace`. Zmienia wyłącznie widok: zachowuje sesję,
+kamerę, szkice i historię edycji. Nagłówek pozostaje widoczny, a ekran startowy
+wypełnia pozostałą wysokość bez przesuwania zamontowanego viewportu.
 
 ## 1. Core Shell Modules
 
@@ -47,7 +56,7 @@ Core shell modules must not contain physics-specific UI. They render commands, s
 |---|---|---|---|
 | `explorer` | `panel-left` | Unified tree for model, resources, results, jobs, diagnostics entry points. | `ModelTree.tsx`, `features/model-builder`, `features/workspace-graph` |
 | `results-navigator` | `panel-left` | Artifact and result dataset browsing. | `features/analyze`, `features/workspace-graph` |
-| `project-start` | `viewport-main` or `overlay` | Open/recent/example/session start flow. | `components/start-hub` |
+| `project-start` | `viewport-main` or `overlay` | Open/recent/example/session start flow. Superseded by the implemented `start-screen` module, which owns its own body-row slot. | `components/start-hub` |
 
 The explorer is the default left-panel module. Results navigator is a tab in the same panel, not a separate application shell.
 
@@ -74,7 +83,7 @@ Authoring modules never mutate local-only physics state. They submit semantic tr
 | `viewport-3d` | `viewport-main` | 3D scene, mesh, field, glyph, overlay, selection visualization. | Mesh/topology/field binary resources. |
 | `cross-section-image` | `viewport-main` during migration; export/fallback after cutover | Server-rendered mesh cross-section preview and PNG export. | Meshing cross-section image resource plus FMCS/FMQS statistics resources. |
 | `field-map` | `viewport-main` | Interactive heatmaps, contours, probes, vectors, mesh overlays, plane/slab/depth reductions, and surface projections for every compatible published spatial quantity. | Canonical planar-monitor metadata plus bounded scalar, vector, occupancy, mesh-overlay, probe, and PNG resources. |
-| `live-charts` | `viewport-main` | **Live Charts** follows active-run scalar histories with local series visibility and explicit Follow/Pause controls. | Revisioned table resources through the shared chart data-plan; retained-data background refresh; no polling. |
+| `live-charts` | `viewport-main` | **Live Charts** follows active-run scalar histories with searchable signal readings, local visibility, direct axis/window selection and explicit Follow/Pause controls. Only selected unit groups occupy plot space; a responsive signal panel preserves access to hidden signals. | Revisioned table resources through the shared chart data-plan; retained-data background refresh; no polling. |
 | `analysis-plots` | `viewport-main` | **Analysis** postprocesses an **explicit selected dataset**, run, stage, or artifact in an active-only center surface. | Revisioned table and analysis resources; no active-tail adoption and no server payload in workspace stores. |
 | `transport-footer` Quick Chart content | `panel-bottom` | **Quick Chart** displays one pinned table descriptor while its footer tab is active and coexists with 3D. | Shared chart contracts and table resources only; never imports either center-module store. |
 | `viewport-2d` | disabled after replacement | Legacy live WebGL slices, projections, probes, line profiles, and mesh cross-sections. | Removed from default registration once `cross-section-image` is active. |

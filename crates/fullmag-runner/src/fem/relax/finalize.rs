@@ -30,6 +30,7 @@ const LINEARIZATION_PHI_ABSOLUTE_TOLERANCE_A: f64 = 1.0e-12;
 struct NativeEquilibriumEvaluation {
     magnetization: Vec<[f64; 3]>,
     fields: CertifiedFemEquilibriumFields,
+    representation: fullmag_quantities::FemRepresentationReceipt,
 }
 
 #[cfg(test)]
@@ -177,6 +178,7 @@ fn copy_native_equilibrium_evaluation(
             )?,
             backend.copy_demag_phi(node_count)?,
         )?,
+        representation: backend.representation_receipt()?,
     })
 }
 
@@ -216,7 +218,6 @@ fn max_scalar_amplitude(values: &[f64]) -> f64 {
 
 fn certify_native_linearization_recompute(
     plan: &FemPlanIR,
-    fem_mesh_generation_id: &Option<String>,
     accepted: &NativeEquilibriumEvaluation,
     recomputed: &NativeEquilibriumEvaluation,
 ) -> Result<RecomputedFemLinearizationCertificateV1, RunError> {
@@ -301,18 +302,8 @@ fn certify_native_linearization_recompute(
         });
     }
 
-    let mesh_topology_sha256 = fem_mesh_generation_id
-        .as_deref()
-        .filter(|digest| {
-            digest.strip_prefix("sha256:").is_some_and(|hex| {
-                hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-        })
-        .ok_or_else(|| RunError {
-            message: "native_linearization_recompute_missing_stage_mesh_topology_sha256"
-                .to_string(),
-        })?
-        .to_string();
+    let mesh = crate::types::FemMeshPayload::from(plan);
+    let mesh_topology_sha256 = crate::types::fem_mesh_topology_fingerprint(&mesh);
     let identity =
         crate::fem::equilibrium_identity::EquilibriumIdentitySignaturesV1::from_relax_plan(plan)?;
     let mut certificate = RecomputedFemLinearizationCertificateV1 {
@@ -379,6 +370,11 @@ pub(crate) fn finalize_native_fem_relaxation(
     // ExecutedRun; no later provenance mutation is permitted.
     let mut final_provenance = artifacts.provenance_snapshot();
     final_provenance.fem_poisson_demag = fem_poisson_demag_provenance(plan, Some(&final_stats));
+    if plan.demag_realization == Some(fullmag_ir::ResolvedFemDemagIR::FredkinKoehler) {
+        final_provenance.fem_bem_demag = backend
+            .demag_fem_bem_provenance()?
+            .map(|value| value.into_provenance());
+    }
     let gpu_state_info = backend.gpu_state_info()?;
     let gpu_rk_plan_info = backend.gpu_rk_plan_info()?;
     apply_native_fem_runtime_contract(
@@ -617,10 +613,42 @@ pub(crate) fn finalize_native_fem_relaxation(
     let recomputed_native_equilibrium = copy_native_equilibrium_evaluation(backend, node_count)?;
     let recomputed_linearization_certificate = certify_native_linearization_recompute(
         plan,
-        fem_mesh_generation_id,
         &accepted_native_equilibrium,
         &recomputed_native_equilibrium,
     )?;
+    let final_node_map = backend.local_node_index_map()?;
+    final_node_map
+        .validate_representation(&recomputed_native_equilibrium.representation)
+        .map_err(|message| RunError { message })?;
+    let native_indexed_geometry = backend
+        .indexed_geometry_sha256(plan.mesh.nodes.len() as u64, plan.mesh.cells.len() as u64)?;
+    let expected_indexed_geometry =
+        fullmag_ir::native_indexed_geometry::fem_native_indexed_geometry_sha256(
+            &plan.mesh.nodes,
+            &plan.mesh.cells,
+        )
+        .map_err(|message| RunError { message })?;
+    if native_indexed_geometry != expected_indexed_geometry {
+        return Err(RunError {
+            message: "live native FEM indexed geometry differs from the accepted MeshIR projection"
+                .into(),
+        });
+    }
+    let mut final_snapshot_receipt =
+        fullmag_quantities::fem_state_snapshot_receipt::FemLocalNodeSnapshotReceipt::capture(
+            final_stats.step,
+            final_stats.time,
+            final_stats.dt,
+            &recomputed_native_equilibrium.magnetization,
+            recomputed_native_equilibrium.representation,
+        )
+        .map_err(|message| RunError { message })?;
+    final_snapshot_receipt.native_node_map_sha256 = Some(
+        final_node_map
+            .content_sha256()
+            .map_err(|message| RunError { message })?,
+    );
+    final_snapshot_receipt.native_indexed_geometry_sha256 = Some(native_indexed_geometry);
     let final_magnetization = recomputed_native_equilibrium.magnetization;
     let certified_fem_equilibrium_fields = recomputed_native_equilibrium.fields;
     finalization_field_copy_wall_time_ns =
@@ -630,6 +658,26 @@ pub(crate) fn finalize_native_fem_relaxation(
     let mut diagnostic_steps = artifacts.take_solver_steps();
     let (mut field_snapshots, field_snapshot_count, provenance) = artifacts.finish();
     let mut auxiliary_artifacts = Vec::new();
+    let node_map_bytes = serde_json::to_vec(&final_node_map).map_err(|error| RunError {
+        message: format!("failed to encode final FEM local-node map: {error}"),
+    })?;
+    if node_map_bytes.len() > fullmag_quantities::fem_local_node_map::MAX_FEM_LOCAL_NODE_MAP_BYTES {
+        return Err(RunError {
+            message: "final FEM local-node map exceeds serialized byte budget".into(),
+        });
+    }
+    auxiliary_artifacts.push(AuxiliaryArtifact {
+        relative_path: fullmag_quantities::fem_local_node_map::FEM_FINAL_NODE_MAP_ARTIFACT.into(),
+        bytes: node_map_bytes,
+    });
+    auxiliary_artifacts.push(AuxiliaryArtifact {
+        relative_path:
+            fullmag_quantities::fem_state_snapshot_receipt::FEM_FINAL_SNAPSHOT_RECEIPT_ARTIFACT
+                .into(),
+        bytes: serde_json::to_vec(&final_snapshot_receipt).map_err(|error| RunError {
+            message: format!("failed to encode final FEM state representation: {error}"),
+        })?,
+    });
     auxiliary_artifacts.push(AuxiliaryArtifact {
         relative_path: "equilibrium/certified_fem_equilibrium_fields.v1.json".into(),
         bytes: serde_json::to_vec_pretty(&certified_fem_equilibrium_fields).map_err(|error| {

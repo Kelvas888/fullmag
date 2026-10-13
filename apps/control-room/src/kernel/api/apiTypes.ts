@@ -1,4 +1,4 @@
-import type { components } from "./generated/openapi-v2-types";
+import type { components, paths } from "./generated/openapi-v2-types";
 
 export type ResourceRevision = string | number;
 type JsonPrimitive = boolean | null | number | string;
@@ -212,6 +212,21 @@ export type GeometryRealizationResource =
 export type GeometryValidationResource =
   components["schemas"]["GeometryValidationResource"];
 export type HealthResource = components["schemas"]["HealthResponse"];
+export type DevelopmentBackendResource =
+  components["schemas"]["DevelopmentBackendResource"];
+export type DevelopmentBackendBuildRequest =
+  components["schemas"]["DevelopmentBackendBuildRequest"] & {
+    schema: "fullmag.development-backend-build-request.v1";
+  };
+export type DevelopmentBackendBuildRequestResource =
+  components["schemas"]["DevelopmentBackendBuildRequestResource"] & {
+    ready_build_id: string | null;
+    ready_source_sha256: string | null;
+  };
+export type DevelopmentRestartRequest =
+  components["schemas"]["DevelopmentRestartRequest"];
+export type DevelopmentRestartResource =
+  components["schemas"]["DevelopmentRestartResource"];
 export type ImportSessionAssetRequest =
   components["schemas"]["ImportSessionAssetRequest"];
 export type SessionAssetImportResponse =
@@ -245,6 +260,8 @@ export type FrequencyDomainSpectrumArtifactPayload =
   components["schemas"]["FrequencyDomainSpectrumArtifactPayload"];
 export type FrequencyDomainBranchesArtifactPayload =
   components["schemas"]["FrequencyDomainBranchesArtifactPayload"];
+export type FrequencyDomainFieldSweepArtifactPayload =
+  components["schemas"]["FrequencyDomainFieldSweepArtifactPayload"];
 export type FrequencyDomainResponseSweepArtifactPayload =
   components["schemas"]["FrequencyDomainResponseSweepArtifactPayload"];
 export type FrequencyDomainFmrPeaksArtifactPayload =
@@ -368,6 +385,92 @@ export type SpinWaveGammaResource =
   components["schemas"]["SpinWaveGammaResource"];
 export type DynamicStructureFactorResource =
   components["schemas"]["DynamicStructureFactorResource"];
+export type AnalysisResultProductKind =
+  components["schemas"]["AnalysisResultProductKind"];
+export type AnalysisResultItemKind =
+  components["schemas"]["AnalysisResultItemKind"];
+export type AnalysisResultAxisProjection =
+  components["schemas"]["AnalysisResultAxisProjection"];
+export type AnalysisResultAxisValueResource =
+  components["schemas"]["AnalysisResultAxisValueResource"];
+export type AnalysisResultAxisResource =
+  components["schemas"]["AnalysisResultAxisResource"];
+export type AnalysisResultCoordinateResource =
+  components["schemas"]["AnalysisResultCoordinateResource"];
+export type AnalysisResultMeshRef =
+  components["schemas"]["AnalysisResultMeshRef"];
+export type AnalysisResultStatusFacets =
+  components["schemas"]["AnalysisResultStatusFacets"];
+export type AnalysisResultDatasetCapabilities =
+  components["schemas"]["AnalysisResultDatasetCapabilities"];
+export type AnalysisResultProjectionDescriptor =
+  components["schemas"]["AnalysisResultProjectionDescriptor"];
+export type AnalysisResultDefaultCursor =
+  components["schemas"]["AnalysisResultDefaultCursor"];
+export type AnalysisResultDatasetSummaryResource =
+  components["schemas"]["AnalysisResultDatasetSummaryResource"];
+export type AnalysisResultDatasetCatalogResource =
+  components["schemas"]["AnalysisResultDatasetCatalogResource"];
+export type AnalysisResultDatasetManifestResource =
+  components["schemas"]["AnalysisResultDatasetManifestResource"];
+export type AnalysisResultSampleIndexEntry =
+  components["schemas"]["AnalysisResultSampleIndexEntry"];
+export type AnalysisResultFieldRef =
+  components["schemas"]["AnalysisResultFieldRef"];
+export type AnalysisResultQualitySummary =
+  components["schemas"]["AnalysisResultQualitySummary"];
+export type AnalysisResultItemRelation =
+  components["schemas"]["AnalysisResultItemRelation"];
+export type AnalysisResultSpectralItemSummary =
+  components["schemas"]["AnalysisResultSpectralItemSummary"];
+export type AnalysisResultSamplePageResource =
+  components["schemas"]["AnalysisResultSamplePageResource"];
+export type AnalysisResultItemPageResource =
+  components["schemas"]["AnalysisResultItemPageResource"];
+export type AnalysisResultBranchPointResource =
+  components["schemas"]["AnalysisResultBranchPointResource"];
+export type AnalysisResultBranchSummaryResource =
+  components["schemas"]["AnalysisResultBranchSummaryResource"];
+export type AnalysisResultBranchPageResource =
+  components["schemas"]["AnalysisResultBranchPageResource"];
+export type AnalysisResultBranchResource =
+  components["schemas"]["AnalysisResultBranchResource"];
+export type AnalysisResultBranchPointPageResource =
+  components["schemas"]["AnalysisResultBranchPointPageResource"];
+export type AnalysisResultRelationResource =
+  components["schemas"]["AnalysisResultRelationResource"];
+export type AnalysisResultRelationPageResource =
+  components["schemas"]["AnalysisResultRelationPageResource"];
+export type AnalysisResultProjectionSelectionEntry =
+  components["schemas"]["AnalysisResultProjectionSelectionEntry"];
+export type AnalysisResultProjectionPoint =
+  components["schemas"]["AnalysisResultProjectionPoint"];
+export type AnalysisResultProjectionSeries =
+  components["schemas"]["AnalysisResultProjectionSeries"];
+export type AnalysisResultProjectionResource =
+  components["schemas"]["AnalysisResultProjectionResource"];
+export type AnalysisResultAxisValuesResource =
+  components["schemas"]["AnalysisResultAxisValuesResource"];
+export interface AnalysisResultPageQuery {
+  cursor?: string;
+  limit?: number;
+  stage_id?: string;
+  product_kind?: AnalysisResultProductKind;
+  search?: string;
+  from_si?: number;
+  to_si?: number;
+  sample_id?: string;
+  item_kind?: AnalysisResultItemKind;
+  branch_id?: string;
+  status?: string;
+  has_field?: boolean;
+  has_fields?: boolean;
+  frequency_min_hz?: number;
+  frequency_max_hz?: number;
+  residual_max?: number;
+  sort?: string;
+  [coordinate: `coordinate.${string}`]: string | undefined;
+}
 export type FieldDriveListResource =
   components["schemas"]["FieldDriveListResource"];
 export type PhysicsGraphResource =
@@ -402,6 +505,10 @@ export type SolverEnergyHistoryResource =
   components["schemas"]["SolverEnergyHistoryResource"];
 export type SimulationPreparationResource =
   components["schemas"]["SimulationPreparationResource"];
+export type LivePreparationMaterializationRequest =
+  components["schemas"]["LivePreparationMaterializationRequest"];
+export type LivePreparationMaterializationResource =
+  components["schemas"]["LivePreparationMaterializationResource"];
 export type SolverStatusResource = components["schemas"]["SolverStatusResource"];
 export type StageExecutionResource =
   components["schemas"]["StageExecutionResource"];
@@ -448,7 +555,8 @@ export type StudyRuntimePatchRequest =
 export type StudyRuntimeResource =
   components["schemas"]["StudyRuntimeResource"];
 export type AuthoringTransactionRequest =
-  | { kind: "replace_scene"; scene: JsonObject }
+  | { base_revision: number; kind: "assign_study_execution"; execution_profile: ExecutionProfile; execution_layers: ExecutionRequestLayer[] }
+  | { base_revision?: number | null; kind: "replace_scene"; scene: JsonObject }
   | (BaseAuthoringTransaction & {
       kind: "merge_patch";
       merge_patch: JsonObject;
@@ -723,6 +831,77 @@ export type SessionImportInspectRequest =
   components["schemas"]["SessionImportInspectRequest"];
 export type SessionImportInspectResponse =
   components["schemas"]["SessionImportInspectResponse"];
+export type ProjectCreateRequest =
+  components["schemas"]["ProjectCreateRequest"];
+export type ProjectArchiveRequest =
+  components["schemas"]["ProjectArchiveRequest"];
+export type ProjectAuthoringUpdateRequest =
+  components["schemas"]["ProjectAuthoringUpdateRequest"];
+export type ProjectDocumentResource =
+  components["schemas"]["ProjectDocumentResource"];
+export type ProjectFromScriptRequest =
+  components["schemas"]["ProjectFromScriptRequest"];
+export type ProjectFromScriptResource =
+  components["schemas"]["ProjectFromScriptResource"];
+export type ProjectScriptImportResource =
+  components["schemas"]["ProjectScriptImportResource"];
+export type ScriptFidelityResource =
+  components["schemas"]["ScriptFidelityResource"];
+export type ProjectRunSubmitRequest =
+  components["schemas"]["ProjectRunSubmitRequest"];
+export type ProjectRunSubmitResource =
+  components["schemas"]["ProjectRunSubmitResource"];
+export type ProjectRunMaterializationResource =
+  components["schemas"]["ProjectRunMaterializationResource"];
+export type ProjectRunResource = components["schemas"]["ProjectRunResource"];
+export type ProjectRunListQuery = components["schemas"]["ProjectRunListQuery"];
+export type ProjectRunListResource = components["schemas"]["ProjectRunListResource"];
+export type ProjectBatchSubmitRequest = components["schemas"]["ProjectBatchSubmitRequest"];
+export type ProjectBatchSubmitResource = components["schemas"]["ProjectBatchSubmitResource"];
+export type ProjectBatchListQuery = components["schemas"]["ProjectBatchListQuery"];
+export type ProjectBatchListResource = components["schemas"]["ProjectBatchListResource"];
+export type ProjectBatchSummaryResource = components["schemas"]["ProjectBatchSummaryResource"];
+export type ProjectBatchAxisSummaryResource = components["schemas"]["ProjectBatchAxisSummaryResource"];
+export type ProjectBatchCasesQuery = components["schemas"]["ProjectBatchCasesQuery"];
+export type ProjectBatchCasesResource = components["schemas"]["ProjectBatchCasesResource"];
+export type ProjectBatchCaseSummaryResource = components["schemas"]["ProjectBatchCaseSummaryResource"];
+export type ProjectRunTaskCancellationRequest =
+  components["schemas"]["ProjectRunTaskCancellationRequest"];
+export type ProjectRunTaskCancellationResource =
+  components["schemas"]["ProjectRunTaskCancellationResource"];
+export type SolutionSetDiscoveryPageResource =
+  components["schemas"]["SolutionSetDiscoveryPageResource"];
+export type SolutionSetDiscoveryPageQuery =
+  components["schemas"]["SolutionSetDiscoveryPageQuery"];
+export type SolutionSetResource =
+  components["schemas"]["SolutionSetResource"];
+export type SolutionSetMemberResource =
+  components["schemas"]["SolutionSetMemberResource"];
+export type SolutionSetArtifactResource =
+  components["schemas"]["SolutionSetArtifactResource"];
+export type SolutionSetMemberPageResource =
+  components["schemas"]["SolutionSetMemberPageResource"];
+export type SolutionSetArtifactPageResource =
+  components["schemas"]["SolutionSetArtifactPageResource"];
+export type SolutionSetMemberPageQuery =
+  components["schemas"]["SolutionSetMemberPageQuery"];
+export type SolutionSetArtifactPageQuery =
+  components["schemas"]["SolutionSetArtifactPageQuery"];
+export type SolutionScalarResource =
+  components["schemas"]["SolutionScalarResource"];
+export type SolutionSetRevision = Extract<SolutionSetResource["revision"], string>;
+export type MaterializedDatasetResource =
+  components["schemas"]["MaterializedDatasetResource"];
+export type MaterializedDatasetSliceEnvelopeResource =
+  components["schemas"]["MaterializedDatasetSliceEnvelopeResource"];
+export type SavedFieldGeometryResource =
+  components["schemas"]["SavedFieldGeometryResource"];
+export type ObservationFrameListQuery =
+  components["schemas"]["ObservationFrameListQuery"];
+export type ObservationFrameListResource =
+  components["schemas"]["ObservationFrameListResource"];
+export type ObservationFrameResource =
+  components["schemas"]["ObservationFrameResource"];
 type GeneratedStructuredCommandRequest =
   components["schemas"]["StructuredCommandRequest"];
 type RuntimeCommandIntent = components["schemas"]["RuntimeCommandIntent"];
@@ -732,13 +911,22 @@ type MeshBuildCommandRequest = RuntimeCommandIntent & {
   mesh_reason?: string | null;
   mesh_target?: components["schemas"]["MeshCommandTarget"] | null;
 };
+type FdmGridRefreshCommandRequest = RuntimeCommandIntent & {
+  kind: "fdm_grid_refresh";
+  mesh_options?: JsonObject | null;
+};
 export type StructuredCommandRequest =
-  | Exclude<GeneratedStructuredCommandRequest, { kind: "mesh_build" }>
-  | MeshBuildCommandRequest;
+  | Exclude<
+      GeneratedStructuredCommandRequest,
+      { kind: "mesh_build" } | { kind: "fdm_grid_refresh" }
+    >
+  | MeshBuildCommandRequest
+  | FdmGridRefreshCommandRequest;
 export type UniversePatchRequest = components["schemas"]["UniversePatchRequest"];
 export type UniverseResource = components["schemas"]["UniverseResource"];
 export type VisualizationStatePatch =
   components["schemas"]["VisualizationStatePatch"];
+export type DisplaySelection = components["schemas"]["DisplaySelection"];
 export type VisualizationStateResource =
   components["schemas"]["VisualizationStateResource"];
 export type ModeCompositionDatasetPatch =
@@ -798,6 +986,7 @@ export interface FieldVectorResponseMetadata {
   domainGenerationId: string | null;
   encoding: string | null;
   fieldIndexing: string | null;
+  fieldGenerationId?: string | null;
   fieldRevision: string | null;
   identityIssues: FieldVectorIdentityIssue[];
   meshTopologyHash: string | null;
@@ -807,7 +996,13 @@ export interface FieldVectorResponseMetadata {
   quantityId: string | null;
   scopeId: string | null;
   scopeKind: string | null;
+  sourceId?: string | null;
+  sourceKind?: string | null;
+  sourceRevision?: string | null;
   snapshotId: string | null;
+  stageId?: string | null;
+  phaseRad?: number | null;
+  view?: string | null;
   valueCount: number | null;
 }
 
@@ -844,10 +1039,18 @@ export type BinaryResourceResult<TData, TMetadata = unknown> =
     };
 
 export interface RequestOptions {
+  /**
+   * Canonical session=<encoded-id>&epoch=<encoded-epoch> identity used for
+   * coalescing and the x-fullmag-session-scope HTTP precondition header.
+   * It is never serialized into URLs.
+   */
+  sessionScopeKey?: string;
   signal?: AbortSignal;
 }
 
 export interface BinaryRequestOptions extends RequestOptions {
+  /** Optional hard body cap enforced while reading, before binary decoding. */
+  maxResponseBytes?: number;
   etag?: string | null;
   range?: string | null;
 }
@@ -855,5 +1058,40 @@ export interface BinaryRequestOptions extends RequestOptions {
 export function isOptionalObjectInteractionKind(
   kind: ObjectInteractionKind,
 ): boolean {
-  return kind === "interfacial_dmi" || kind === "uniaxial_anisotropy";
+  return (
+    kind === "interfacial_dmi" || kind === "uniaxial_anisotropy"
+  );
+}
+
+export type OutputStorageDefaultsResource = components["schemas"]["OutputStorageDefaultsResource"];
+export type ExecutionProfileCatalogResource = components["schemas"]["ExecutionProfileCatalogResource"];
+export type ComputePreviewRequest = components["schemas"]["ComputePreviewRequest"];
+export type ExecutionRequestLayer = components["schemas"]["ExecutionLayerSchema"];
+export type ComputePreviewResource = components["schemas"]["ComputePreviewResource"];
+export type ExecutionProfileVersionResource = components["schemas"]["ExecutionProfileVersionResource"];
+export type ExecutionProfile = ExecutionProfileVersionResource["profile"];
+export type PublishExecutionProfileRequest = components["schemas"]["PublishExecutionProfileRequest"];
+export type PublishExecutionProfileResource = components["schemas"]["PublishExecutionProfileResource"];
+export type ExecutionProfileCatalogQuery = NonNullable<paths["/v2/platform/compute/profiles"]["get"]["parameters"]["query"]>;
+export type OutputStorageDefaultsRequest = components["schemas"]["OutputStorageDefaultsRequest"];
+export type OutputStorageSettings = components["schemas"]["OutputStorageSettingsSchema"];
+
+/**
+ * Request shapes of the workspace database routes. The answers are returned
+ * as `unknown` and validated by the start screen's parsers
+ * (modules/start/model/workspaceApiTypes.ts) until generated types replace both.
+ */
+export interface WorkspaceItemsQuery {
+  readonly kind?: "all" | "project" | "script" | "result";
+  readonly sort?: "last_used" | "name" | "modified" | "use_count";
+  readonly search?: string;
+  readonly limit?: number;
+  readonly includeMissing?: boolean;
+}
+
+export interface WorkspaceRootWire {
+  readonly path: string;
+  readonly kinds: readonly string[];
+  readonly recursive: boolean;
+  readonly enabled: boolean;
 }

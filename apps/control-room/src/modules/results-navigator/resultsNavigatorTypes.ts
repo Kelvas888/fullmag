@@ -1,5 +1,6 @@
 import type {
   FrequencyDomainBranchesArtifactPayload,
+  FrequencyDomainFieldSweepArtifactPayload,
   FrequencyDomainFmrPeaksArtifactPayload,
   FrequencyDomainJsonArtifactPayload,
   FrequencyDomainJsonArtifactResource,
@@ -10,6 +11,7 @@ import type {
   FrequencyDomainTextArtifactResource,
 } from "@/kernel/api/apiTypes";
 import type { ResourceResult } from "@/kernel/resources/resourceTypes";
+import { fieldVectorResourceKey } from "@/kernel/api/fieldQueryIdentity";
 import type { components } from "@/kernel/api/generated/openapi-v2-types";
 
 import type { ResultsSelectionRef } from "./resultsNavigatorSelection";
@@ -109,6 +111,126 @@ export interface NavigatorSpectrumPayload {
   samples: readonly NavigatorSampleDescriptor[];
 }
 
+export interface NavigatorFieldSweepDisplayConversion {
+  name: string;
+  scale: number;
+  unit: string;
+}
+
+export interface NavigatorFieldSweepAxis {
+  coordinate: string;
+  displayConversions: readonly NavigatorFieldSweepDisplayConversion[];
+  kind: string;
+  unit: string;
+}
+
+export interface NavigatorFieldSweepSource {
+  artifact: string;
+  kind: string;
+  revision: string;
+}
+
+export interface NavigatorFieldSweepUnits {
+  angularFrequency: string;
+  biasField: string;
+  biasFieldDisplay: string;
+  covariance: string | null;
+  frequency: string;
+  linewidth: string | null;
+  qFactor: string | null;
+  responseAmplitude: string | null;
+}
+
+export interface NavigatorFieldSweepTopology {
+  indexing: string;
+  meshId: string;
+  modeAxis: string;
+  nodeCount: number | null;
+  sampleAxis: string;
+  topologyRevision: string;
+}
+
+export interface NavigatorFieldSweepExecution {
+  backend: string;
+  device: string;
+  engine: string;
+  executionMode: string;
+  fallbackReason: string | null;
+  fallbackUsed: boolean | null;
+  implementationId: string | null;
+  precision: string;
+  status: string;
+}
+
+export interface NavigatorFieldSweepReference {
+  artifact: string;
+  relation: string;
+  revision: string;
+}
+
+export type NavigatorFieldSweepJoinState =
+  | "compatible"
+  | "not_checked"
+  | "stale"
+  | "unavailable";
+
+export interface NavigatorFieldSweepModeDescriptor extends NavigatorModeDescriptor {
+  angularFrequencyRadPerS: number | null;
+  fieldAvailability: "available" | "unavailable";
+  fieldStatus: string | null;
+  modeArtifactPath: string | null;
+  modeFieldId: string | null;
+  modeFieldResourceKey: string | null;
+  modeSourceRevision: string | null;
+  sampleId: string;
+  status: string;
+}
+
+export interface NavigatorFieldSweepSampleDescriptor extends NavigatorSampleDescriptor {
+  biasFieldAPerM: readonly [number, number, number] | null;
+  biasFieldMu0T: readonly [number, number, number] | null;
+  branchIds: readonly string[];
+  fieldAvailableCount: number;
+  fieldModeCount: number;
+  modes: readonly NavigatorFieldSweepModeDescriptor[];
+  scanAxis: NavigatorFieldSweepAxis | null;
+  sourceRevision: string | null;
+  status: string;
+  stopReason: string | null;
+  topology: NavigatorFieldSweepTopology | null;
+}
+
+export interface NavigatorFieldSweepPayload {
+  artifactId: string | null;
+  axis: NavigatorFieldSweepAxis | null;
+  complete: boolean | null;
+  completedSampleCount: number | null;
+  contentSha256: string | null;
+  crossArtifactRefs: readonly NavigatorFieldSweepReference[];
+  datasetRevision: string | null;
+  interrupted: boolean | null;
+  joins: {
+    branches: NavigatorFieldSweepJoinState;
+    spectrum: NavigatorFieldSweepJoinState;
+  };
+  requestedExecution: NavigatorFieldSweepExecution | null;
+  requestedSampleCount: number | null;
+  resolvedExecution: NavigatorFieldSweepExecution | null;
+  runId: string | null;
+  samples: readonly NavigatorFieldSweepSampleDescriptor[];
+  scopeId: string | null;
+  source: NavigatorFieldSweepSource | null;
+  sourceBranchesRevision: string | null;
+  sourceRevision: string | null;
+  sourceSpectrumRevision: string | null;
+  stageId: string | null;
+  status: string | null;
+  stopReason: string | null;
+  topology: NavigatorFieldSweepTopology | null;
+  units: NavigatorFieldSweepUnits | null;
+  runtimeId: string | null;
+}
+
 export interface NavigatorBranchDescriptor {
   branchId: string;
   modeCount?: number | null;
@@ -169,6 +291,7 @@ export interface FrequencyDomainNavigatorResources {
 
 export interface FrequencyDomainNavigatorInput {
   branches?: NavigatorBranchesPayload | null;
+  fieldSweep?: NavigatorFieldSweepPayload | null;
   fmr?: {
     fieldFrequencyMap?: NavigatorArtifactDescriptor | null;
     kittelFit?: NavigatorArtifactDescriptor | null;
@@ -462,6 +585,510 @@ function isResonanceFitsPayload(
 ): payload is components["schemas"]["FrequencyDomainResonanceFitsArtifactPayload"] {
   const schemaVersion = payloadSchemaVersion(payload);
   return Boolean(schemaVersion?.includes("resonance_fits")) && Array.isArray(payload["fits"]);
+}
+
+function isFieldSweepPayload(
+  payload: FrequencyDomainJsonArtifactPayload,
+): payload is FrequencyDomainFieldSweepArtifactPayload {
+  const schemaVersion = payloadSchemaVersion(payload);
+  return Boolean(schemaVersion?.includes("field_sweep")) && Array.isArray(payload["samples"]);
+}
+
+function hasCompleteFieldSweepContract(
+  payload: FrequencyDomainFieldSweepArtifactPayload,
+): boolean {
+  return Boolean(
+    fieldSweepSourceFromPayload(payload.source)
+      && nonEmptyString(payload.source_revision)
+      && nonEmptyString(payload.revision)
+      && finiteNumber(payload.requested_sample_count) != null
+      && finiteNumber(payload.completed_sample_count) != null
+      && fieldSweepAxisFromPayload(payload.scan_axis)
+      && fieldSweepUnitsFromPayload(payload.units)
+      && fieldSweepTopologyFromPayload(payload.topology)
+      && fieldSweepExecutionFromPayload(payload.requested_execution)
+      && fieldSweepExecutionFromPayload(payload.resolved_execution)
+      && Array.isArray(payload.samples)
+      && Array.isArray(payload.cross_artifact_refs),
+  );
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function finiteTuple(value: unknown): readonly [number, number, number] | null {
+  if (!Array.isArray(value) || value.length !== 3) return null;
+  const tuple = value.map(finiteNumber);
+  return tuple.every((item): item is number => item != null)
+    ? [tuple[0], tuple[1], tuple[2]]
+    : null;
+}
+
+function duplicateStableIds(values: readonly unknown[]): ReadonlySet<string> {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    const id = nonEmptyString(value);
+    if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  return new Set(
+    [...counts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([id]) => id),
+  );
+}
+
+function fieldSweepAxisFromPayload(
+  axis: FrequencyDomainFieldSweepArtifactPayload["scan_axis"],
+): NavigatorFieldSweepAxis | null {
+  if (!axis) return null;
+  const kind = nonEmptyString(axis.kind);
+  const coordinate = nonEmptyString(axis.coordinate);
+  const unit = nonEmptyString(axis.unit);
+  if (!kind || !coordinate || !unit) return null;
+  return {
+    coordinate,
+    displayConversions: (axis.display_conversions ?? [])
+      .map((conversion) => {
+        const name = nonEmptyString(conversion.name);
+        const conversionUnit = nonEmptyString(conversion.unit);
+        const scale = finiteNumber(conversion.scale);
+        return name && conversionUnit && scale != null
+          ? { name, scale, unit: conversionUnit }
+          : null;
+      })
+      .filter((conversion): conversion is NavigatorFieldSweepDisplayConversion => conversion != null),
+    kind,
+    unit,
+  };
+}
+
+function fieldSweepSourceFromPayload(
+  source: FrequencyDomainFieldSweepArtifactPayload["source"],
+): NavigatorFieldSweepSource | null {
+  if (!source) return null;
+  const artifact = nonEmptyString(source.artifact);
+  const kind = nonEmptyString(source.kind);
+  const revision = nonEmptyString(source.revision);
+  return artifact && kind && revision ? { artifact, kind, revision } : null;
+}
+
+function fieldSweepUnitsFromPayload(
+  units: FrequencyDomainFieldSweepArtifactPayload["units"],
+): NavigatorFieldSweepUnits | null {
+  if (!units) return null;
+  const frequency = nonEmptyString(units.frequency);
+  const angularFrequency = nonEmptyString(units.angular_frequency);
+  const biasField = nonEmptyString(units.bias_field);
+  const biasFieldDisplay = nonEmptyString(units.bias_field_display);
+  if (!frequency || !angularFrequency || !biasField || !biasFieldDisplay) return null;
+  return {
+    angularFrequency,
+    biasField,
+    biasFieldDisplay,
+    covariance: nonEmptyString(units.covariance),
+    frequency,
+    linewidth: nonEmptyString(units.linewidth),
+    qFactor: nonEmptyString(units.q_factor),
+    responseAmplitude: nonEmptyString(units.response_amplitude),
+  };
+}
+
+function fieldSweepTopologyFromPayload(
+  topology: FrequencyDomainFieldSweepArtifactPayload["topology"],
+): NavigatorFieldSweepTopology | null {
+  if (!topology) return null;
+  const meshId = nonEmptyString(topology.mesh_id);
+  const topologyRevision = nonEmptyString(topology.topology_revision);
+  const indexing = nonEmptyString(topology.indexing);
+  const sampleAxis = nonEmptyString(topology.sample_axis);
+  const modeAxis = nonEmptyString(topology.mode_axis);
+  if (!meshId || !topologyRevision || !indexing || !sampleAxis || !modeAxis) return null;
+  return {
+    indexing,
+    meshId,
+    modeAxis,
+    nodeCount: finiteNumber(topology.node_count),
+    sampleAxis,
+    topologyRevision,
+  };
+}
+
+function fieldSweepExecutionFromPayload(
+  execution: FrequencyDomainFieldSweepArtifactPayload["requested_execution"],
+): NavigatorFieldSweepExecution | null {
+  if (!execution) return null;
+  const backend = nonEmptyString(execution.backend);
+  const device = nonEmptyString(execution.device);
+  const engine = nonEmptyString(execution.engine);
+  const executionMode = nonEmptyString(execution.execution_mode);
+  const precision = nonEmptyString(execution.precision);
+  const status = nonEmptyString(execution.status);
+  if (!backend || !device || !engine || !executionMode || !precision || !status) return null;
+  return {
+    backend,
+    device,
+    engine,
+    executionMode,
+    fallbackReason: nonEmptyString(execution.fallback_reason),
+    fallbackUsed: execution.fallback_used ?? null,
+    implementationId: nonEmptyString(execution.implementation_id),
+    precision,
+    status,
+  };
+}
+
+function fieldSweepModeFromPayload(
+  mode: NonNullable<
+    NonNullable<FrequencyDomainFieldSweepArtifactPayload["samples"]>[number]["modes"]
+  >[number],
+  sampleId: string,
+  stableSampleId: string | null,
+  sourceRevision: string | null,
+  position: number,
+  duplicateModeIds: ReadonlySet<string>,
+): NavigatorFieldSweepModeDescriptor {
+  const rawModeIndex = Math.max(0, Math.trunc(finiteNumber(mode.raw_mode_index) ?? position));
+  const modeId = nonEmptyString(mode.mode_id);
+  const modeFieldId = nonEmptyString(mode.mode_field_id);
+  const modeArtifactPath = nonEmptyString(mode.mode_artifact_path);
+  // Derive transport in the view model without mutating the hashed artifact.
+  const modeFieldResourceKey = nonEmptyString(mode.mode_field_resource_key)
+    ?? (modeFieldId && modeArtifactPath
+      ? fieldVectorResourceKey(modeFieldId, { view: "phase_rotated_real", phase_rad: 0 })
+      : null);
+  const modeSourceRevision = nonEmptyString(mode.source_revision);
+  const fieldStatus = normalizedStatusToken(mode.field_status);
+  const sourceRevisionMatches = sourceRevision == null || modeSourceRevision === sourceRevision;
+  const hasStableModeIdentity = Boolean(
+    stableSampleId
+      && nonEmptyString(mode.sample_id) === stableSampleId
+      && modeId
+      && !duplicateModeIds.has(modeId),
+  );
+  const hasFieldIdentity = Boolean(
+    hasStableModeIdentity
+      && sourceRevisionMatches
+      && (fieldStatus === "" || fieldStatus === "ready")
+      && modeFieldId
+      && modeFieldResourceKey,
+  );
+  return {
+    angularFrequencyRadPerS: finiteNumber(mode.angular_frequency_rad_per_s),
+    branchId: mode.branch_id == null ? null : String(mode.branch_id),
+    displayModeIndex: rawModeIndex,
+    fieldAvailability: hasFieldIdentity ? "available" : "unavailable",
+    fieldStatus: nonEmptyString(mode.field_status),
+    frequencyHz: finiteNumber(mode.frequency_hz),
+    modeArtifactPath,
+    modeFieldId: hasFieldIdentity ? modeFieldId : null,
+    modeFieldResourceKey: hasFieldIdentity ? modeFieldResourceKey : null,
+    modeId: hasStableModeIdentity ? modeId : null,
+    modeSourceRevision,
+    rawModeIndex,
+    residualNorm: finiteNumber(mode.residual_relative_l2),
+    sampleId,
+    status: nonEmptyString(mode.status) ?? "unknown",
+  };
+}
+
+function formatFieldSweepNumber(value: number): string {
+  return value.toFixed(1);
+}
+
+export function formatFieldSweepSampleLabel(
+  sample: Pick<
+    NavigatorFieldSweepSampleDescriptor,
+    "biasFieldAPerM" | "biasFieldMu0T" | "scanAxis" | "sampleId"
+  >,
+): string {
+  const conversion = sample.scanAxis?.displayConversions.find(
+    (item) => item.name === "mu0_H" || item.name === "μ₀H",
+  );
+  const displayField = sample.biasFieldMu0T
+    ?? (sample.biasFieldAPerM && conversion
+      ? [
+          sample.biasFieldAPerM[0] * conversion.scale,
+          sample.biasFieldAPerM[1] * conversion.scale,
+          sample.biasFieldAPerM[2] * conversion.scale,
+        ] as const
+      : null);
+  if (!displayField) return `Sample ${sample.sampleId}`;
+
+  const componentIndex = displayField.reduce(
+    (best, value, index, values) =>
+      Math.abs(value) > Math.abs(values[best] ?? 0) ? index : best,
+    0,
+  );
+  const component = ["x", "y", "z"][componentIndex] ?? "x";
+  return `μ₀ H${component} = ${formatFieldSweepNumber(displayField[componentIndex] * 1000)} mT`;
+}
+
+function fieldSweepSampleFromPayload(
+  sample: NonNullable<FrequencyDomainFieldSweepArtifactPayload["samples"]>[number],
+  position: number,
+  axis: NavigatorFieldSweepAxis | null,
+  topology: NavigatorFieldSweepTopology | null,
+  sourceRevision: string | null,
+  duplicateSampleIds: ReadonlySet<string>,
+): NavigatorFieldSweepSampleDescriptor {
+  const publishedSampleId = nonEmptyString(sample.sample_id);
+  const stableSampleId = publishedSampleId && !duplicateSampleIds.has(publishedSampleId)
+    ? publishedSampleId
+    : null;
+  const sampleId = stableSampleId ?? `sample-${position}`;
+  const duplicateModeIds = duplicateStableIds(
+    (sample.modes ?? []).map((mode) => mode.mode_id),
+  );
+  const modes = (sample.modes ?? []).map((mode, modePosition) =>
+    fieldSweepModeFromPayload(
+      mode,
+      sampleId,
+      stableSampleId,
+      sourceRevision,
+      modePosition,
+      duplicateModeIds,
+    ),
+  );
+  const sampleAxis = fieldSweepAxisFromPayload(sample.scan_axis) ?? axis;
+  const sampleTopology = fieldSweepTopologyFromPayload(sample.topology) ?? topology;
+  const biasFieldAPerM = finiteTuple(sample.bias_field_a_per_m);
+  const biasFieldMu0T = finiteTuple(sample.bias_field_mu0_t);
+  const branchIds = [...new Set((sample.branch_ids ?? []).map((branchId) => String(branchId)))];
+  return {
+    biasFieldAPerM,
+    biasFieldMu0T,
+    branchIds,
+    fieldAvailableCount: modes.filter((mode) => mode.fieldAvailability === "available").length,
+    fieldModeCount: modes.length,
+    label: formatFieldSweepSampleLabel({
+      biasFieldAPerM,
+      biasFieldMu0T,
+      sampleId,
+      scanAxis: sampleAxis,
+    }),
+    modes,
+    sampleId,
+    sampleIndex: Math.max(0, Math.trunc(finiteNumber(sample.sample_index) ?? position)),
+    scanAxis: sampleAxis,
+    sourceRevision,
+    stableIdentityAvailable: stableSampleId != null,
+    status: nonEmptyString(sample.status) ?? "unknown",
+    stopReason: nonEmptyString(sample.stop_reason),
+    topology: sampleTopology,
+  };
+}
+
+function fieldSweepSamplesMatchSpectrum(
+  samples: readonly NavigatorFieldSweepSampleDescriptor[],
+  spectrum: NavigatorSpectrumPayload,
+): boolean {
+  if (
+    spectrum.samples.some(
+      (sample) =>
+        sample.stableIdentityAvailable === false || !nonEmptyString(sample.sampleId),
+    )
+    || duplicateStableIds(spectrum.samples.map((sample) => sample.sampleId)).size > 0
+  ) {
+    return false;
+  }
+  const bySampleId = new Map(spectrum.samples.map((sample) => [sample.sampleId, sample]));
+  return samples.every((sample) => {
+    if (
+      sample.stableIdentityAvailable === false
+      || sample.modes.some(
+        (mode) => mode.modeId == null || mode.modeSourceRevision !== sample.sourceRevision,
+      )
+    ) {
+      return false;
+    }
+    const companion = bySampleId.get(sample.sampleId);
+    if (!companion) return false;
+    const companionModeIds = companion.modes
+      .map((mode) => mode.modeId)
+      .filter((modeId): modeId is string => modeId != null);
+    return Boolean(
+      duplicateStableIds(companionModeIds).size === 0
+        && sample.modes.every((mode) => companionModeIds.includes(mode.modeId!)),
+    );
+  });
+}
+
+function fieldSweepSamplesMatchBranches(
+  samples: readonly NavigatorFieldSweepSampleDescriptor[],
+  branches: NavigatorBranchesPayload,
+): boolean {
+  if (
+    branches.branches.some(
+      (branch) =>
+        branch.stableIdentityAvailable === false || !nonEmptyString(branch.branchId),
+    )
+    || duplicateStableIds(branches.branches.map((branch) => branch.branchId)).size > 0
+  ) {
+    return false;
+  }
+  const branchIds = new Set(branches.branches.map((branch) => branch.branchId));
+  return samples.every((sample) =>
+    [...sample.branchIds, ...sample.modes.flatMap((mode) => mode.branchId ? [mode.branchId] : [])]
+      .every((branchId) => branchIds.has(branchId)),
+  );
+}
+
+function fieldSweepJoinState(
+  sourceRevision: string | null,
+  companionRevision: string | null | undefined,
+  companionAvailable: boolean,
+  matches: boolean,
+): NavigatorFieldSweepJoinState {
+  if (!companionAvailable) return "unavailable";
+  if (!sourceRevision || !companionRevision) return "stale";
+  return sourceRevision === companionRevision && matches ? "compatible" : "stale";
+}
+
+function singleCrossArtifactRevision(
+  references: readonly NavigatorFieldSweepReference[],
+  relation: string,
+  malformedRelations: ReadonlySet<string> = new Set(),
+): string | null {
+  if (malformedRelations.has(relation)) return null;
+  const revisions = references
+    .filter((reference) => reference.relation === relation)
+    .map((reference) => reference.revision);
+  return revisions.length === 1 ? revisions[0]! : null;
+}
+
+export interface NavigatorFieldSweepCompanions {
+  branches?: NavigatorBranchesPayload | null;
+  branchesRevision?: string | null;
+  spectrum?: NavigatorSpectrumPayload | null;
+  spectrumRevision?: string | null;
+}
+
+export function navigatorFieldSweepFromResource(
+  resource: FrequencyDomainJsonArtifactResource | null | undefined,
+  companions: NavigatorFieldSweepCompanions = {},
+): NavigatorFieldSweepPayload | null {
+  const payload = resource?.payload;
+  if (!payload || !isFieldSweepPayload(payload)) return null;
+
+  const hasTypedContract = hasCompleteFieldSweepContract(payload);
+  const axis = fieldSweepAxisFromPayload(payload.scan_axis);
+  const sourceRevision = nonEmptyString(payload.source_revision);
+  const payloadSamples = payload.samples ?? [];
+  const duplicateSampleIds = duplicateStableIds(
+    payloadSamples.map((sample) => sample.sample_id),
+  );
+  const samples = payloadSamples.map((sample, position) =>
+    fieldSweepSampleFromPayload(
+      sample,
+      position,
+      axis,
+      fieldSweepTopologyFromPayload(payload.topology),
+      sourceRevision,
+      duplicateSampleIds,
+    ),
+  );
+  const malformedCrossArtifactRelations = new Set<string>();
+  const crossArtifactRefs = (payload.cross_artifact_refs ?? [])
+    .map((reference) => {
+      const artifact = nonEmptyString(reference.artifact);
+      const relation = nonEmptyString(reference.relation);
+      const revision = nonEmptyString(reference.revision);
+      if (
+        relation
+        && (relation === "source_spectrum" || relation === "source_branches")
+        && (!artifact || !revision)
+      ) {
+        malformedCrossArtifactRelations.add(relation);
+      }
+      return artifact && relation && revision ? { artifact, relation, revision } : null;
+    })
+    .filter((reference): reference is NavigatorFieldSweepReference => reference != null);
+  const source = fieldSweepSourceFromPayload(payload.source);
+  const sourceSpectrumRevision = singleCrossArtifactRevision(
+    crossArtifactRefs,
+    "source_spectrum",
+    malformedCrossArtifactRelations,
+  );
+  const sourceBranchesRevision = singleCrossArtifactRevision(
+    crossArtifactRefs,
+    "source_branches",
+    malformedCrossArtifactRelations,
+  );
+  const sourceRevisionIsConsistent = Boolean(
+    source
+      && sourceRevision
+      && source.revision === sourceRevision,
+  );
+  const spectrumJoinRevision = sourceRevisionIsConsistent
+    && sourceSpectrumRevision === sourceRevision
+    ? sourceSpectrumRevision
+    : null;
+  const branchesJoinRevision = sourceRevisionIsConsistent
+    ? sourceBranchesRevision
+    : null;
+  const stableIdentitiesAreValid = samples.every(
+    (sample) =>
+      sample.stableIdentityAvailable !== false
+      && sample.sourceRevision != null
+      && sample.modes.every(
+        (mode) => mode.modeId != null && mode.modeSourceRevision === sample.sourceRevision,
+      ),
+  );
+  const datasetRevision =
+    nonEmptyString(payload.revision) ?? artifactResourceRevision(resource);
+
+  return {
+    artifactId: nonEmptyString(payload.artifact_id),
+    axis,
+    complete: hasTypedContract ? payload.complete ?? null : false,
+    completedSampleCount: finiteNumber(payload.completed_sample_count),
+    contentSha256: nonEmptyString(payload.content_sha256),
+    crossArtifactRefs,
+    datasetRevision,
+    interrupted: payload.interrupted ?? null,
+    joins: {
+      branches: fieldSweepJoinState(
+        branchesJoinRevision,
+        companions.branchesRevision,
+        companions.branches != null,
+        companions.branches == null
+          ? false
+          : fieldSweepSamplesMatchBranches(samples, companions.branches),
+      ),
+      spectrum: fieldSweepJoinState(
+        spectrumJoinRevision,
+        companions.spectrumRevision,
+        companions.spectrum != null,
+        companions.spectrum == null
+          ? false
+          : fieldSweepSamplesMatchSpectrum(samples, companions.spectrum),
+      ),
+    },
+    requestedExecution: fieldSweepExecutionFromPayload(payload.requested_execution),
+    requestedSampleCount: finiteNumber(payload.requested_sample_count),
+    resolvedExecution: fieldSweepExecutionFromPayload(payload.resolved_execution),
+    runId: nonEmptyString(payload.run_id),
+    samples,
+    scopeId: nonEmptyString(payload.scope_id),
+    source,
+    sourceBranchesRevision,
+    sourceRevision,
+    sourceSpectrumRevision,
+    stageId: nonEmptyString(payload.stage_id),
+    status: hasTypedContract
+      && payload.complete === true
+      && sourceRevisionIsConsistent
+      && stableIdentitiesAreValid
+      ? nonEmptyString(payload.status)
+      : hasTypedContract
+        ? "partial"
+        : "incomplete",
+    stopReason: nonEmptyString(payload.stop_reason),
+    topology: fieldSweepTopologyFromPayload(payload.topology),
+    units: fieldSweepUnitsFromPayload(payload.units),
+    runtimeId: nonEmptyString(payload.runtime_id),
+  };
 }
 
 /**

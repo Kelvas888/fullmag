@@ -322,6 +322,7 @@ fn relax_source_plan_from_eigen(plan: &FemEigenPlanIR) -> fullmag_ir::FemPlanIR 
         demag_realization: plan.demag_realization.clone(),
         air_box_config: plan.air_box_config.clone(),
         interfacial_dmi: plan.interfacial_dmi,
+        rotated_interfacial_dmi: None,
         dmi_interface_normal: plan.dmi_interface_normal,
         bulk_dmi: plan.bulk_dmi,
         dind_field: None,
@@ -494,6 +495,40 @@ fn accepted_relax_stage_handoff_v3_round_trips_and_rejects_unknown_fields() {
     let error = serde_json::from_value::<AcceptedFemRelaxStageHandoffV3Record>(extended)
         .expect_err("v3 must reject unknown fields");
     assert!(error.to_string().contains("unknown field"));
+}
+
+#[test]
+fn accepted_relax_stage_handoff_accepts_prism_source_and_checks_m0() {
+    let mut plan = minimal_native_modal_plan();
+    plan.mesh.nodes = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0],
+    ];
+    plan.mesh.cells = fullmag_ir::FemConnectivityIR {
+        types: vec![fullmag_ir::FemCellTypeIR::Prism6],
+        offsets: vec![0, 6],
+        nodes: vec![0, 1, 2, 3, 4, 5],
+        global_ordinals: vec![0],
+        mesh_parts: Vec::new(),
+    };
+    plan.equilibrium_magnetization = vec![[1.0, 0.0, 0.0]; 6];
+    fullmag_ir::validate_mesh_for_execution(&plan.mesh)
+        .expect("prism fixture must satisfy execution mesh validation");
+    relax_handoff_from_completion(&plan, &accepted_relax_completion())
+        .expect("native prism relaxation must publish its accepted handoff");
+
+    plan.equilibrium_magnetization[5] = [0.5, 0.0, 0.0];
+    let error = relax_handoff_from_completion(&plan, &accepted_relax_completion())
+        .expect_err("prism magnetic nodes must retain unit-norm validation");
+    assert!(
+        error.message.contains("m0_norm_mismatch"),
+        "{}",
+        error.message
+    );
 }
 
 #[test]
@@ -4522,6 +4557,57 @@ fn native_field_sweep_binds_published_sources_and_has_own_content_digest() {
             {"relation": "source_branches", "artifact": "eigen/branches.v2.json", "revision": branches_revision},
         ])
     );
+}
+
+#[test]
+fn native_field_sweep_preserves_spectrum_only_modes_without_field_refs() {
+    let spectrum = serde_json::json!({
+        "samples": [{
+            "sample_index": 7,
+            "external_field_a_per_m": [40_000.0, 0.0, 0.0],
+            "mesh_id": "mesh:periodic-airbox",
+            "topology_revision": "sha256:mesh-revision",
+            "modes": [{
+                "raw_mode_index": 2,
+                "frequency_hz": 6.1e9,
+                "angular_frequency_rad_per_s": std::f64::consts::TAU * 6.1e9,
+                "residual_relative_l2": 1.0e-10,
+                "equilibrium_artifact_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "linearization_state_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "operator_input_signature_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }]
+        }]
+    });
+    let branches = serde_json::json!({"branches": []});
+    let diagnostics = serde_json::json!({
+        "requested_execution": {"backend": "fem", "device": "cpu"},
+        "resolved_execution": {"backend": "fem", "device": "cpu"}
+    });
+    let artifacts = vec![
+        json_artifact("eigen/spectrum.v2.json", &spectrum)
+            .expect("spectrum fixture should serialize"),
+        json_artifact("eigen/branches.v2.json", &branches)
+            .expect("branches fixture should serialize"),
+    ];
+
+    let artifact = build_native_field_sweep_artifact(
+        &spectrum,
+        &branches,
+        &diagnostics,
+        &artifacts,
+        1,
+        RunStatus::Completed,
+        None,
+    )
+    .expect("spectrum-only native field sweep should be serializable");
+    let mode = &artifact["samples"][0]["modes"][0];
+
+    assert_eq!(mode["mode_id"], "sample-0007/mode-0002");
+    assert_eq!(mode["field_status"], "spectrum-only");
+    assert!(mode.get("mode_artifact_path").is_none());
+    assert!(mode.get("mode_field_id").is_none());
+    assert!(mode.get("mode_field_resource_key").is_none());
+    assert!(mode["branch_id"].is_null());
 }
 
 fn scope_observables(node_count: usize, max_torque_apm: f64) -> EffectiveFieldObservables {

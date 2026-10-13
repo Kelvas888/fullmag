@@ -4,6 +4,10 @@ import type { FrequencyDomainFieldResource } from "../api/apiTypes";
 import { useKernel } from "../KernelContext";
 import type { ResourceResult, ResourceStatus } from "./resourceTypes";
 import {
+  isAnalysisResultFieldOverlayIntent,
+  validateAnalysisResultFieldResponseMetadata,
+} from "../visualization/AnalysisResultFieldOverlayIntent";
+import {
   type ModeFieldOverlayIntent,
   type ModeFieldOverlayTopologyIdentity,
   type ResolvedModeFieldOverlayMetadata,
@@ -13,6 +17,8 @@ import {
   ModeFieldOverlayIntentController,
   type ModeFieldOverlayIntentSnapshot,
 } from "../visualization/ModeFieldOverlayIntentController";
+import { sessionResourceIdentityKey } from "./sessionResourceIdentity";
+import { useSessionResourceIdentity } from "./useSessionStatus";
 
 import { useFrequencyDomainEigenModeFieldMetaResource } from "./studyRuntimeResources";
 
@@ -106,10 +112,11 @@ export function useModeFieldOverlayResource(
   intent: ModeFieldOverlayIntent | null | undefined,
   { enabled = true }: { enabled?: boolean } = {},
 ): ModeFieldOverlayResource {
+  const sessionIdentity = useSessionResourceIdentity();
   const metadataResource = useFrequencyDomainEigenModeFieldMetaResource(
     intent?.sampleIndex,
     intent?.modeIndex,
-    { enabled: enabled && Boolean(intent) },
+    { enabled: enabled && Boolean(intent) && sessionIdentity !== null },
   );
   return useMemo(
     () => resolveModeFieldOverlayResource(intent, metadataResource),
@@ -136,6 +143,10 @@ export function useModeFieldOverlayIntentResource({
   topology: ModeFieldOverlayTopologyIdentity | null;
 }): ModeFieldOverlayIntentSnapshot {
   const { api } = useKernel();
+  const sessionIdentity = useSessionResourceIdentity();
+  const sessionScope = sessionIdentity
+    ? sessionResourceIdentityKey(sessionIdentity)
+    : null;
   const [controller] = useState(() => new ModeFieldOverlayIntentController());
   const subscribe = useCallback(
     (listener: () => void) => controller.subscribe(listener),
@@ -145,7 +156,7 @@ export function useModeFieldOverlayIntentResource({
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
   useEffect(() => {
-    if (!enabled || !intent || !topology) {
+    if (!enabled || !intent || !topology || !sessionScope) {
       controller.clear();
       return;
     }
@@ -154,10 +165,26 @@ export function useModeFieldOverlayIntentResource({
       intent,
       {
         loadMetadata: async (activeIntent, signal) => {
+          if (isAnalysisResultFieldOverlayIntent(activeIntent)) {
+            const metadata = resolveModeFieldOverlayMetadata(
+              activeIntent,
+              activeIntent.fieldRef,
+              activeIntent.fieldRevision,
+            );
+            if (!metadata) {
+              throw new Error(
+                "Analysis result field reference failed validation.",
+              );
+            }
+            return {
+              data: activeIntent.fieldRef,
+              revision: activeIntent.fieldRevision,
+            };
+          }
           const data = await api.analysis.frequencyDomain.eigenModeFieldMeta(
             activeIntent.sampleIndex,
             activeIntent.modeIndex,
-            { signal },
+            { sessionScopeKey: sessionScope, signal },
           );
           return {
             data,
@@ -168,11 +195,22 @@ export function useModeFieldOverlayIntentResource({
           const response = await api.data.fields.vector(
             metadata.fieldId,
             metadata.binaryQuery,
-            { signal },
+            { sessionScopeKey: sessionScope, signal },
           );
           if (response.status !== "ready") {
             throw new Error(
               `Mode field binary resource returned ${response.status}.`,
+            );
+          }
+          if (
+            isAnalysisResultFieldOverlayIntent(metadata.intent) &&
+            !validateAnalysisResultFieldResponseMetadata(
+              metadata.intent,
+              response.responseMetadata,
+            )
+          ) {
+            throw new Error(
+              "Analysis result field binary revision failed validation.",
             );
           }
           return response.data;
@@ -182,7 +220,7 @@ export function useModeFieldOverlayIntentResource({
     );
 
     return () => controller.clear();
-  }, [api, controller, enabled, intent, topology]);
+  }, [api, controller, enabled, intent, sessionScope, topology]);
 
   return snapshot;
 }

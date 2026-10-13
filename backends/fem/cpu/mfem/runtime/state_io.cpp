@@ -33,8 +33,10 @@ namespace {
 bool strict_gpu_demag_upload_path(const Context &ctx)
 {
     return ctx.gpu_state.device.lifecycle.allocated &&
-        ctx.poisson_demag.gpu_demag_mode ==
-            FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_POISSON;
+        (ctx.poisson_demag.gpu_demag_mode ==
+             FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_POISSON ||
+         ctx.poisson_demag.gpu_demag_mode ==
+             FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_FEM_BEM);
 }
 #endif
 
@@ -137,14 +139,43 @@ int copy_demag_phi_observable_f64(
         error = "demag scalar potential requested but demag is disabled";
         return FULLMAG_FEM_ERR_INVALID;
     }
-    auto *potential = static_cast<mfem::GridFunction *>(ctx.poisson_demag.gf_potential);
-    if (potential == nullptr) {
-        error = "demag scalar potential has not been initialized";
-        return FULLMAG_FEM_ERR_INVALID;
-    }
     const uint64_t expected_len = static_cast<uint64_t>(ctx.mesh.n_nodes);
     if (out_len != expected_len) {
         error = "demag scalar-potential output length mismatch";
+        return FULLMAG_FEM_ERR_INVALID;
+    }
+    if (ctx.demag.realization == FULLMAG_FEM_DEMAG_FREDKIN_KOEHLER) {
+        const auto *workspace = ctx.demag_fem_bem.workspace;
+        if (workspace == nullptr || workspace->potential_fes == nullptr ||
+            workspace->total_potential == nullptr) {
+            error = "Fredkin-Koehler demag scalar potential has not been initialized";
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        if (workspace->total_potential->Size() != workspace->potential_fes->GetTrueVSize()) {
+            error = "Fredkin-Koehler demag scalar-potential true-DOF size mismatch";
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+
+        // FEM/BEM stores the solved potential in true-DOF ordering.  Export
+        // the corresponding mesh-node values through the observable ABI.
+        mfem::GridFunction potential(workspace->potential_fes.get());
+        potential.SetFromTrueDofs(*workspace->total_potential);
+        mfem::Vector nodal_values;
+        potential.GetNodalValues(nodal_values);
+        if (nodal_values.Size() != static_cast<int>(expected_len)) {
+            error = "Fredkin-Koehler demag scalar-potential nodal projection size mismatch";
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        std::memcpy(
+            out,
+            nodal_values.Read(),
+            static_cast<size_t>(sizeof(double) * out_len));
+        record_device_to_host(ctx.transfer_audit.audit, sizeof(double) * out_len);
+        return FULLMAG_FEM_OK;
+    }
+    auto *potential = static_cast<mfem::GridFunction *>(ctx.poisson_demag.gf_potential);
+    if (potential == nullptr) {
+        error = "demag scalar potential has not been initialized";
         return FULLMAG_FEM_ERR_INVALID;
     }
     if (potential->Size() == static_cast<int>(expected_len)) {
@@ -527,6 +558,7 @@ int context_upload_magnetization_f64(
     if (!ctx.mfem_context.ready) {
         if (ctx.exchange.enabled || ctx.demag.enabled || ctx.anisotropy.uniaxial_enabled ||
             ctx.anisotropy.cubic_enabled || ctx.dmi.interfacial_enabled ||
+            ctx.dmi.rotated_interfacial_enabled ||
             ctx.dmi.bulk_enabled || ctx.oersted.has_cylinder || ctx.oersted.has_explicit_field ||
             ctx.magnetoelastic.enabled || ctx.stt.zhang_li_enabled ||
             ctx.stt.slonczewski_enabled || ctx.thermal_brown.temperature > 0.0) {

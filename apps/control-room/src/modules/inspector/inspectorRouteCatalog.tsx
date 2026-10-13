@@ -11,6 +11,10 @@ import { FdmMultilayerAirboxTargetPanel } from "./panels/airbox/FdmMultilayerAir
 import { AirboxVisualizationDebugInspectorPanel } from "./panels/airbox/AirboxVisualizationDebugInspectorPanel";
 import { AntennaObjectPanel } from "./panels/AntennaObjectPanel";
 import { QuickChartInspectorPanel } from "./panels/QuickChartInspectorPanel";
+import {
+  ObservationFrameInspectorPanel,
+  ObservationFramesOverviewPanel,
+} from "./panels/ObservationFrameInspectorPanel";
 import { BoundaryFacesOverviewPanel } from "./panels/boundary-faces/BoundaryFacesOverviewPanel";
 import { CouplingInspectorPanel } from "./panels/CouplingInspectorPanel";
 import {
@@ -51,6 +55,8 @@ import { EigenModeInspectorPanel } from "./panels/frequency-domain/EigenModeInsp
 import { FmrModalSpectrumInspectorPanel } from "./panels/frequency-domain/FmrModalSpectrumInspectorPanel";
 import { FmrResponseSweepInspectorPanel } from "./panels/frequency-domain/FmrResponseSweepInspectorPanel";
 import { FieldQuantityInspectorPanel } from "./panels/FieldQuantityInspectorPanel";
+import { AnalysisResultInspectorPanel } from "./panels/analysis-results/AnalysisResultInspectorPanel";
+import { MaterializedDatasetInspectorPanel } from "./panels/MaterializedDatasetInspectorPanel";
 import { FrozenSpinsInspectorPanel } from "./panels/constraint/FrozenSpinsInspectorPanel";
 import { MeshPartVisualizationPanel } from "./panels/MeshPartVisualizationPanel";
 import { ModeVisualizationOverviewPanel } from "./panels/mode-visualization/ModeVisualizationOverviewPanel";
@@ -93,6 +99,7 @@ import {
   DispersionResponseFieldAtKResultInspector,
   DynamicsResultInspector,
   HysteresisResultInspector,
+  LegacyTimeDomainResultInspector,
   ResonanceDrivenPeaksResultInspector,
   ResonanceDrivenSpectrumResultInspector,
   ResonanceDrivenStageResultInspector,
@@ -336,6 +343,8 @@ export const FREQUENCY_DOMAIN_INSPECTOR_SELECTION_KINDS = [
   "results.frequency_domain.comparison",
   "results.frequency_domain.exports",
   "results.dynamics.root",
+  "results.time_domain.spectral_feature",
+  "results.time_domain.dsf_point",
   "results.resonance.root",
   "results.resonance.modal.stage",
   "results.resonance.driven.stage",
@@ -465,6 +474,8 @@ const FREQUENCY_DOMAIN_NAMED_PANELS: Partial<
   "results.frequency_response.diagnostics":
     FrequencyResponseDiagnosticsInspectorPanel,
   "results.dynamics.root": DynamicsResultInspector,
+  "results.time_domain.spectral_feature": LegacyTimeDomainResultInspector,
+  "results.time_domain.dsf_point": LegacyTimeDomainResultInspector,
   "results.resonance.root": ResonanceOverviewResultInspector,
   "results.resonance.modal.stage": ResonanceModalStageResultInspector,
   "results.resonance.driven.stage": ResonanceDrivenStageResultInspector,
@@ -658,6 +669,18 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
     title: "Quick Chart",
     selectionKinds: ["results.quick_chart"],
     component: QuickChartInspectorPanel,
+  },
+  {
+    id: "observation-frames-overview",
+    title: "State Snapshots",
+    selectionKinds: ["results.observation_frames.root"],
+    component: ObservationFramesOverviewPanel,
+  },
+  {
+    id: "observation-frame",
+    title: "Observation Frame",
+    selectionKinds: ["results.observation_frame"],
+    component: ObservationFrameInspectorPanel,
   },
   {
     id: "session-root",
@@ -1410,6 +1433,18 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
     component: StudyStageSaveStateInspectorPanel,
   },
   ...frequencyDomainPanels,
+  {
+    id: "analysis-result",
+    title: "Analysis result",
+    selectionKinds: ["analysis.result"],
+    component: AnalysisResultInspectorPanel,
+  },
+  {
+    id: "materialized-dataset",
+    title: "Materialized Dataset",
+    selectionKinds: ["results.materialized_dataset"],
+    component: MaterializedDatasetInspectorPanel,
+  },
   {
     id: "field-quantity",
     title: "Field Quantity",
