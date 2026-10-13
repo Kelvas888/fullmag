@@ -7639,6 +7639,8 @@ void modal_nonzero_k_floquet_bloch_payload_reaches_production_solver()
 {
     constexpr double stiffness_matrix_row_major[] = {1.0, 0.0, 0.0, 1.0};
     constexpr double gyrotropic_mass_row_major[] = {0.0, -1.0, 1.0, 0.0};
+    // This meshless ABI-routing fixture supplies its positive metric explicitly.
+    constexpr double tangent_mass_matrix_row_major[] = {1.0, 0.0, 0.0, 1.0};
 
     fullmag_fem_frequency_domain_floquet_periodic_pair pair{};
     pair.pair_id = "x_periodic_pair_0";
@@ -7658,6 +7660,7 @@ void modal_nonzero_k_floquet_bloch_payload_reaches_production_solver()
     request.mfem_tangent_dof_count = 2;
     request.mfem_stiffness_matrix_row_major = stiffness_matrix_row_major;
     request.mfem_gyrotropic_matrix_row_major = gyrotropic_mass_row_major;
+    request.mfem_mass_matrix_row_major = tangent_mass_matrix_row_major;
     request.operator_request.operator_diagnostics_json =
         "{\"operator_family\":\"mfem_linearized_llg\","
         "\"payload_kind\":\"bloch_floquet_tangent_operator\"}";
@@ -7682,6 +7685,9 @@ void modal_nonzero_k_floquet_bloch_payload_reaches_production_solver()
           "nonzero-k Floquet Bloch payload diagnostics report production lane");
     check(contains(result.result_json, "\"accepted_mode_count\":1"),
           "nonzero-k Floquet Bloch payload solves one accepted mode");
+    check(contains(result.diagnostics_json,
+                   "\"deduplication_mass_matrix\":\"provided_dense_row_major\""),
+          "nonzero-k Floquet Bloch payload consumes the explicit caller-provided mass metric");
 #else
     check(result.status == FULLMAG_FEM_FD_UNAVAILABLE,
           "nonzero-k Floquet Bloch payload remains unavailable without SLEPc");

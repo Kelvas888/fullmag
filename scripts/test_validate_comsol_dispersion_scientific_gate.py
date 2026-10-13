@@ -1423,7 +1423,9 @@ def _bind_check_frequencies_to_baseline_raw_ids(case_dir: Path, *, rotate_degene
         modes = {mode["raw_mode_index"]: mode for mode in sample["modes"]}
         base = float(modes[0]["frequency_real_hz"])
         modes[0]["frequency_real_hz"] = base
-        modes[1]["frequency_real_hz"] = base * (1.0 + 5.0e-13)
+        # Exact degeneracy permits a rotated basis without changing the
+        # fundamental branch selected at the seed on the rest of the path.
+        modes[1]["frequency_real_hz"] = base
         baseline_frequencies[(0, 0)] = modes[0]["frequency_real_hz"]
         baseline_frequencies[(0, 1)] = modes[1]["frequency_real_hz"]
 
