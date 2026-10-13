@@ -1633,9 +1633,12 @@ async function qualifyPhysicsScopeExclusivity(page, inspector, fixture) {
     )
     .waitFor({ state: "visible", timeout: 5_000 });
   await page.waitForTimeout(200);
+  // A delayed viewport client ACK records display observation; it does not
+  // mutate authored physics. Keep every other mutation in this guard assertion.
   const guardRequests = fixture.requests
     .slice(requestStart)
-    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request));
+    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request) &&
+      request !== "POST /v2/sessions/current/visualization/client-acks");
   assert(
     guardRequests.length === 0,
     `Rotated DMI guard emitted a mutation: ${JSON.stringify(guardRequests)}.`,
@@ -1683,7 +1686,8 @@ async function qualifyPhysicsScopeExclusivity(page, inspector, fixture) {
   await page.waitForTimeout(200);
   const inverseRequests = fixture.requests
     .slice(inverseRequestStart)
-    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request));
+    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request) &&
+      request !== "POST /v2/sessions/current/visualization/client-acks");
   assert(
     inverseRequests.length === 0,
     `Object DMI inverse guard emitted a mutation: ${JSON.stringify(inverseRequests)}.`,
