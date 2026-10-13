@@ -965,8 +965,10 @@ async function qualifyObjectMoveGestureAndSharedApply(page, inspector, fixture, 
 
   const startWorld = [...originalTransform.translation];
   const endWorld = [...originalTransform.translation];
-  startWorld[0] += axisLength * 0.5;
-  endWorld[0] += axisLength * 0.75;
+  // The inner half overlaps the primitive, whose pointer handler stops propagation.
+  // Hit the exposed outer shaft with native input, then drag from the captured handle.
+  startWorld[0] += axisLength * 0.9;
+  endWorld[0] += axisLength * 1.15;
   const startPoint = projectViewportWorldPoint(initialDiagnostics, startWorld);
   const endPoint = projectViewportWorldPoint(initialDiagnostics, endWorld);
   assertProjectedPointInCanvas(initialDiagnostics, startPoint, "X-axis drag start");
@@ -982,7 +984,20 @@ async function qualifyObjectMoveGestureAndSharedApply(page, inspector, fixture, 
     "Uncommitted object changes are pending. Use Apply or Revert to commit or discard them.",
     { exact: true },
   );
-  await stagedBanner.waitFor({ state: "visible", timeout: 10_000 });
+  try {
+    await stagedBanner.waitFor({ state: "visible", timeout: 10_000 });
+  } catch (error) {
+    await page.screenshot({ path: resolve(outputDir, "object-move-staging-failure.png") });
+    await writeFile(resolve(outputDir, "object-move-staging-failure.json"), JSON.stringify({
+      apiBackend: "mocked v2 fixture",
+      initialDiagnostics, startWorld, endWorld, startPoint, endPoint,
+      afterDrag: await readViewportProjectionDiagnostics(page),
+      pointerStats: await readMovePointerStats(page, pointerStatsKey),
+      inspectorText: await inspector.innerText(),
+      modelWrites: sessionModelWriteRequests(fixture.requests.slice(pointerUpRequestStart)),
+    }, null, 2) + "\n");
+    throw error;
+  }
   const applyButton = inspector.getByRole("button", { name: "Apply", exact: true });
   assert(
     await applyButton.isEnabled(),
@@ -1031,7 +1046,7 @@ async function qualifyObjectMoveGestureAndSharedApply(page, inspector, fixture, 
   );
   const pendingDiagnostics = await readViewportProjectionDiagnostics(page);
   const pendingAxisCenterWorld = [
-    submittedTranslation[0] + axisLength * 0.5,
+    submittedTranslation[0] + axisLength * 0.9,
     submittedTranslation[1],
     submittedTranslation[2],
   ];

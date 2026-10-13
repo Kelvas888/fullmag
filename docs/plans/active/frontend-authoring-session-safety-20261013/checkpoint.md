@@ -137,3 +137,11 @@ Bieżący etap nie zamyka całego R0/R1; audyt pozostaje w dokumentacji PR150.
 - control-room-contracts job115279518462 FAIL na typecheck: brak findInput w Geometry DOM oraz closure narrowing pendingApply do never w viewport regresji. Poprawiono helper i odczyt faktycznego applyOperationId ze snapshotu; wymagane ponowne CI.
 - React Doctor run38392514685 SUCCESS advisory: score90, 0 errors, 5 warnings. Wszystkie pięć async-await-in-loop dotyczą smoke-inspector: sekwencyjne resize/theme screenshot (311/331), polling Reset (555), mutacje stabilności panelu (822), polling quiet request (2774). Klasyfikacja false-positive dla proponowanej równoległości, wysoka pewność: każdy krok zależy od stanu poprzedniego kroku tej samej strony, polling wymaga kolejnej obserwacji po czasie. Nie zmieniono ani nie wyciszono reguły; nie deklarować 0 warnings.
 - browser jobs i pozostałe CI w trakcie; managedFEM queued, NOT VERIFIED. PR154 draft; pełny R0/R1 pozostaje otwarty.
+
+
+## Browser e357 — staging failure diagnoza i korekta
+
+- browser-fixture-smoke job115279518775 FAIL na banner staging; bazowy WebGL fixture oraz negative control PASS. Nie ma dowodu R1 gesture PASS.
+- Artefakt11811061377 viewport-3d-browser-audit pobrany do storage/evidence/frontend-authoring-session-safety-20261013/ci-e357; związany z e357 exactHEAD. Inspector actions fixture job115279518285 SUCCESS nie zastępuje gestu ani rzeczywistego API.
+- Hipoteza źródłowa: punkt0.5*140nm leżał wewnątrz box +/-100nm; PrimitiveObjectLayer pointer handler stopsPropagation. Punkt0.9*140nm na odsłoniętej osi, nadal native mouse z pointer capture; asercje zachowane. Review bez nowych findings. Na timeout dodano screenshot/JSON, ponownie rzucany błąd. Skuteczność korekty browser NOT VERIFIED.
+- PR04 parser sześć plików gotowe do source review; unitpicker i stan jednostki kontrolki nadal otwarte.
