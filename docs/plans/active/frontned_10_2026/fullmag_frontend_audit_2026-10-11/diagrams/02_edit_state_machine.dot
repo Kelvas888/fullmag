@@ -1,0 +1,25 @@
+digraph G {
+graph [bgcolor="#f7f9fc", fontname="DejaVu Sans", fontsize=20, fontcolor="#182e47", labelloc=t, labeljust=l, pad=0.4, nodesep=0.4, ranksep=0.7, splines=polyline, dpi=130];
+node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12, fillcolor="#e6edf5", color="#adc1d7", fontcolor="#142941", penwidth=1.2, margin="0.19,0.15"];
+edge [fontname="DejaVu Sans", fontsize=10, color="#6e89a7", fontcolor="#415c78", arrowsize=0.75, penwidth=1.2];
+rankdir=LR;
+label="D02 / OBJECT EDIT SESSION\nEvery completion is fenced by session, draft and operation identity";
+clean [label="CLEAN\nbaseline = committed",fillcolor="#d5eada",color="#80ad8b"];
+edit [label="EDITING VALID\nlocal patch + preview",fillcolor="#cceae7",color="#5caaa1"];
+invalid [label="EDITING INVALID\nraw input preserved\ncommit blocked",fillcolor="#f7e9cc",color="#d3b465"];
+commit [label="COMMITTING\none operationId\nbase revision pinned",fillcolor="#d4e5f7",color="#6f99c4"];
+conflict [label="CONFLICT\nkeep local intent\nfetch latest baseline",fillcolor="#f7e9cc",color="#d3b465"];
+rebase [label="THREE-WAY REBASE\nbase / local / remote\nresolve overlapping changes"];
+failed [label="FAILED / KNOWN\nshow reason\nkeep editable values",fillcolor="#f5dddd",color="#c38c8c"];
+unknown [label="OUTCOME UNKNOWN\nlookup by intent ID\nnever blind resubmit",fillcolor="#f7e9cc",color="#d3b465"];
+clean -> edit [label="edit / begin gesture"];edit -> invalid [label="incomplete or invalid input"];
+invalid -> edit [label="input valid"];edit -> commit [label="Apply"];edit -> clean [label="Revert / cancel"];
+commit -> clean [label="matching ACK\nnew baseline + history",color="#359583"];
+commit -> conflict [label="409"];conflict -> rebase [label="latest snapshot"];rebase -> edit [label="review preserved intent"];
+conflict -> clean [label="discard to latest",constraint=false];
+commit -> failed [label="known rejection"];failed -> edit [label="correct input"];
+commit -> unknown [label="lost ACK / disconnect"];
+unknown -> clean [label="commit confirmed",color="#359583",constraint=false];unknown -> failed [label="rejection confirmed"];
+note [label="Late ACK from another operation\nis never allowed to clear a newer draft.",shape=note,fillcolor="#edf1f7",color="#b6c5d6"];
+commit -> note [style=dashed,arrowhead=none];
+}
