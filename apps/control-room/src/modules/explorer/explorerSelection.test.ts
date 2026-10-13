@@ -260,7 +260,7 @@ describe("selectExplorerNode", () => {
     selectExplorerNode(kernel, node, "explorer");
 
     expect(kernel.selection.get()).toMatchObject({
-      kind: "mesh-part",
+      kind: "mesh.unassigned.part",
       nodeId: node.id,
       ref: {
         carrierPartId: "part:orphan",
@@ -554,7 +554,7 @@ describe("selectExplorerNode", () => {
     });
   });
 
-  it("keeps the FEM unassigned parent on its exact legacy route", () => {
+  it("keeps the FEM unassigned parent on its semantic Inspector route with the legacy carrier ref", () => {
     const kernel = makeKernel();
     selectExplorerNode(kernel, {
       id: "model:mesh:unassigned",
@@ -562,6 +562,7 @@ describe("selectExplorerNode", () => {
       label: "Unassigned mesh parts",
       parentId: "model:mesh",
     }, "explorer");
+    expect(kernel.selection.get().kind).toBe("mesh.unassigned");
     expect(kernel.selection.get().ref).toMatchObject({
       type: "mesh-part",
       kind: "mesh-part",

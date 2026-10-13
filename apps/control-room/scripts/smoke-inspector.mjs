@@ -249,7 +249,7 @@ try {
     name: "Toggle target visibility",
     exact: true,
   });
-  const resetButton = panel.getByRole("button", { name: "Reset", exact: true });
+  const resetButton = panel.getByRole("button", { name: "Reset display", exact: true });
   const initialVisible = (await visibleToggle.getAttribute("aria-pressed")) === "true";
   if (!initialVisible) {
     await visibleToggle.click();
@@ -654,8 +654,8 @@ try {
       "A valid object-mesh draft did not enable Apply.",
     );
     assert(
-      !(await inspector.getByRole("button", { name: "Reset", exact: true }).isDisabled()),
-      "A dirty object-mesh draft did not enable Reset.",
+      !(await inspector.getByRole("button", { name: "Revert", exact: true }).isDisabled()),
+      "A dirty object-mesh draft did not enable Revert.",
     );
 
     await geometryNode.click();
@@ -1154,7 +1154,7 @@ async function qualifyInspectorRoutingMatrix(page, inspector, screenshotFiles, f
     label: "Film",
   });
   await selectInspectorNode(page, inspector, "model:mesh:unassigned:orphan-part", {
-    owner: "mesh-part-visualization",
+    owner: "mesh-unassigned-part",
     label: "Orphan Mesh Part",
   });
 
@@ -1418,8 +1418,8 @@ async function selectInspectorNode(page, inspector, nodeId, { owner, label }) {
     `No placeholder Inspector may own ${label} selection: ${identityText}`,
   );
   assert(breadcrumbs.length > 0, `${label} selection has no breadcrumb identity.`);
-  const focus = inspector.getByRole("button", { name: "Focus", exact: true });
-  assert(await focus.isVisible(), `${label} selection has no visible primary Inspector action.`);
+  const fitView = inspector.getByRole("button", { name: "Fit view", exact: true });
+  assert(await fitView.isVisible(), `${label} selection has no visible Fit view action.`);
 }
 
 async function ensureModelNodeVisible(page, nodeId) {

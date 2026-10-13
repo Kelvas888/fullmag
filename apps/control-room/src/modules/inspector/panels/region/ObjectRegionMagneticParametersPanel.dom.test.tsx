@@ -91,6 +91,23 @@ describe("ObjectRegionMagneticParametersPanel session fence", () => {
     });
   });
 
+  it("keeps clean Apply Fields disabled without submitting a write", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(<ObjectRegionMagneticParametersPanel {...panelProps()} />));
+      expect(findButton(container, "Apply Fields").disabled).toBe(true);
+      await act(async () => findButton(container, "Apply Fields").click());
+      expect(mocks.readScene).not.toHaveBeenCalled();
+      expect(mocks.patchMaterialFields).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
   it("sends the material-field write with the scoped canonical revision", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
@@ -98,12 +115,19 @@ describe("ObjectRegionMagneticParametersPanel session fence", () => {
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(<ObjectRegionMagneticParametersPanel {...panelProps()} />));
+      await act(async () => findButton(container, "Add Field").click());
+      expect(findButton(container, "Apply Fields").disabled).toBe(false);
       await act(async () => findButton(container, "Apply Fields").click());
 
       expect(mocks.readScene).toHaveBeenCalledWith({ sessionScopeKey: sessionAScopeKey });
       expect(mocks.patchMaterialFields).toHaveBeenCalledWith(
         "object-a",
-        [],
+        [expect.objectContaining({
+          owner_object: "object-a",
+          region_id: "region-a",
+          parameter: "ms",
+          value: expect.objectContaining({ kind: "linear", base: 800e3 }),
+        })],
         { baseRevision: 10, sessionScopeKey: sessionAScopeKey },
       );
       expect(mocks.recordHistory).toHaveBeenCalledOnce();
@@ -134,6 +158,8 @@ describe("ObjectRegionMagneticParametersPanel session fence", () => {
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(<ObjectRegionMagneticParametersPanel {...panelProps()} />));
+      await act(async () => findButton(container, "Add Field").click());
+      expect(findButton(container, "Apply Fields").disabled).toBe(false);
       await act(async () => {
         findButton(container, "Apply Fields").click();
         await Promise.resolve();
@@ -142,7 +168,12 @@ describe("ObjectRegionMagneticParametersPanel session fence", () => {
 
       expect(mocks.patchMaterialFields).toHaveBeenCalledWith(
         "object-a",
-        [],
+        [expect.objectContaining({
+          owner_object: "object-a",
+          region_id: "region-a",
+          parameter: "ms",
+          value: expect.objectContaining({ kind: "linear", base: 800e3 }),
+        })],
         expect.objectContaining({ sessionScopeKey: sessionAScopeKey }),
       );
       mocks.currentSessionScopeKey = "session=B&epoch=2&request_scope_epoch=2";
@@ -173,6 +204,8 @@ describe("ObjectRegionMagneticParametersPanel session fence", () => {
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(<ObjectRegionMagneticParametersPanel {...panelProps()} />));
+      await act(async () => findButton(container, "Add Field").click());
+      expect(findButton(container, "Apply Fields").disabled).toBe(false);
       await act(async () => findButton(container, "Apply Fields").click());
 
       expect(mocks.readScene).not.toHaveBeenCalled();
