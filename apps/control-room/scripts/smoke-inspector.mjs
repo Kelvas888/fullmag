@@ -2014,8 +2014,8 @@ async function expandInspectorNode(page, nodeId) {
   }
   if ((await node.getAttribute("aria-expanded")) !== "false") return;
   const branch = node.locator(".fm-explorer-tree-row__branch");
-  if (await branch.count()) {
-    await branch.click();
+  if (await branch.locator("svg").count()) {
+    await branch.locator("svg").click();
   } else {
     await node.dblclick();
   }
@@ -3413,4 +3413,7 @@ async function qualifyFirstRunGuideRouting(page, inspector, screenshotFiles, fix
     check_ids: await guide.locator("[data-check-id]").evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-check-id"))),
     webgl, screenshot, qualification: "production_workspace_with_mock_api", real_backend_verified: false,
   }, null, 2));
+  await guide.getByRole("button", { name: "Hide steps", exact: true }).click();
+  assert(!(await guide.getByRole("list", { name: "Model readiness checklist" }).count()), "Hide steps must release workspace space for expert navigation.");
+  await assertHealthyViewportCanvas(page, "Collapsed first-run guide");
 }
