@@ -38,7 +38,7 @@ interface FixtureControl {
 declare global { interface Window { __antennaDriveEditorFixture?: FixtureControl; } }
 
 function makeScene(name: string): SceneResource {
-  const drive = { id: driveId, peak_current_a: 1, waveform: { kind: "constant" }, activation: { kind: "all_time_evolution" }, bandwidth_declaration: null };
+  const drive: NonNullable<SceneResource["solved_antenna_drives"]>[number] = { id: driveId, name: "Fixture drive", port_mode_id: "fixture-port", projection_ref: "fixture-projection", time_origin: "stage_local", peak_current_a: 1, waveform: { kind: "constant" }, activation: { kind: "all_time_evolution" }, bandwidth_declaration: null };
   return { revision: 1, scene_revision: 1, scene: { id: `session-${name}`, name, authoring_schema: "fixture", source_of_truth: "fixture" },
     objects: [], solved_antenna_drives: [drive, { ...drive, id: "drive-b" }] } as SceneResource;
 }
