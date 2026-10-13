@@ -429,6 +429,79 @@ fn requested_control_action(
     *pending_action
 }
 
+// Only the manifest beside this exact API bundle can select a managed worker.
+// An explicit managed declaration must fail closed; legacy sibling lookup is
+// retained only for bundles that do not declare this managed runtime.
+fn resolve_managed_worker_sibling(current: &Path) -> Result<Option<PathBuf>, String> {
+    let bin = current.parent().ok_or("API executable has no parent")?;
+    if bin.file_name().and_then(|name| name.to_str()) != Some("bin") {
+        return Ok(None);
+    }
+    let root = bin.parent().ok_or("managed bin directory has no parent")?;
+    let manifest_path = root.join("manifest.json");
+    if !manifest_path.try_exists().map_err(|error| format!("inspect managed manifest: {error}"))? {
+        return Ok(None);
+    }
+    let manifest_path = manifest_path.canonicalize()
+        .map_err(|error| format!("canonicalize managed manifest: {error}"))?;
+    if manifest_path.parent() != Some(root) {
+        return Err("managed manifest escapes the API bundle".to_string());
+    }
+    let file = fs::File::open(&manifest_path)
+        .map_err(|error| format!("open managed manifest: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)
+        .map_err(|error| format!("read managed manifest: {error}"))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("managed manifest exceeds the bounded byte limit".to_string());
+    }
+    let manifest: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("decode managed manifest: {error}"))?;
+    if manifest.get("runtime").and_then(Value::as_str) != Some("fem-gpu-host") {
+        return Ok(None);
+    }
+    if manifest.get("schema").and_then(Value::as_u64) != Some(3) {
+        return Err("unsupported managed worker manifest schema".to_string());
+    }
+    let binaries = manifest.get("binaries").ok_or("managed manifest has no binaries")?;
+    let resolve = |name: &str| -> Result<PathBuf, String> {
+        let relative = binaries.get(name).and_then(Value::as_str)
+            .ok_or_else(|| format!("managed manifest has no {name} binary"))?;
+        let path = Path::new(relative);
+        let components: Vec<_> = path.components().collect();
+        if components.len() != 2 ||
+            components[0] != std::path::Component::Normal(std::ffi::OsStr::new("bin")) ||
+            !matches!(components[1], std::path::Component::Normal(_)) {
+            return Err(format!("managed {name} binary must be directly inside bin"));
+        }
+        let canonical = root.join(path).canonicalize()
+            .map_err(|error| format!("resolve managed {name} binary: {error}"))?;
+        if canonical.parent() != Some(bin) || !canonical.is_file() {
+            return Err(format!("managed {name} binary escapes bin or is not a file"));
+        }
+        if fs::metadata(&canonical).map_err(|error| error.to_string())?.len() == 0 {
+            return Err(format!("managed {name} binary is empty"));
+        }
+        let key = format!("{name}_sha256");
+        let expected = manifest.get("integrity").and_then(|value| value.get(&key))
+            .and_then(Value::as_str).ok_or_else(|| format!("managed manifest has no {name} digest"))?;
+        let observed = executable_sha256(&canonical).map_err(|error| error.message)?;
+        if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) ||
+            observed.strip_prefix("sha256:") != Some(expected) {
+            return Err(format!("managed {name} binary digest mismatch"));
+        }
+        Ok(canonical)
+    };
+    if resolve("api")? != current {
+        return Err("managed manifest does not identify this API executable".to_string());
+    }
+    let worker = resolve("worker")?;
+    if worker == current {
+        return Err("managed worker cannot be the API executable".to_string());
+    }
+    Ok(Some(worker))
+}
+
 fn resolve_worker_executable() -> Result<PathBuf, String> {
     let current = std::env::current_exe()
         .map_err(|error| format!("resolve current Fullmag executable: {error}"))?
@@ -442,8 +515,11 @@ fn resolve_worker_executable() -> Result<PathBuf, String> {
     let suffix = if cfg!(windows) { ".exe" } else { "" };
     let mut candidates = Vec::new();
     match current_name.as_str() {
-        "fullmag-bin" | "fullmag" => candidates.push(current.clone()),
+        "fullmag-bin" | "fullmag" | "fullmag-fem-gpu-bin" => candidates.push(current.clone()),
         "fullmag-api" => {
+            if let Some(worker) = resolve_managed_worker_sibling(&current)? {
+                return Ok(worker);
+            }
             // The API and CLI are shipped as one bundle.  The API process is
             // the normal GUI parent, while the hidden worker command belongs
             // to the CLI binary.  Resolve only its sibling from the same
@@ -1974,6 +2050,50 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn managed_worker_fixture() -> (StopHarvestTempDir, PathBuf, serde_json::Value) {
+        let root = StopHarvestTempDir::new();
+        let bin = root.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let api = bin.join("fullmag-api");
+        let worker = bin.join("fullmag-fem-gpu-bin");
+        std::fs::write(&api, b"api fixture").unwrap();
+        std::fs::write(&worker, b"worker fixture").unwrap();
+        let manifest = serde_json::json!({
+            "schema": 3, "runtime": "fem-gpu-host",
+            "binaries": {"api": "bin/fullmag-api", "worker": "bin/fullmag-fem-gpu-bin"},
+            "integrity": {
+                "api_sha256": super::executable_sha256(&api).unwrap().trim_start_matches("sha256:"),
+                "worker_sha256": super::executable_sha256(&worker).unwrap().trim_start_matches("sha256:")
+            }
+        });
+        (root, api.canonicalize().unwrap(), manifest)
+    }
+
+    #[test]
+    fn managed_bundle_worker_resolution_without_legacy_cli() {
+        let (root, api, manifest) = managed_worker_fixture();
+        std::fs::write(root.0.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let worker = super::resolve_managed_worker_sibling(&api).unwrap().unwrap();
+        assert_eq!(worker, root.0.join("bin/fullmag-fem-gpu-bin").canonicalize().unwrap());
+        assert!(!root.0.join("bin/fullmag-bin").exists());
+    }
+
+    #[test]
+    fn managed_bundle_worker_resolution_rejects_missing_escape_and_bad_digest() {
+        for mode in ["missing", "escape", "digest", "wrong_api"] {
+            let (root, api, mut manifest) = managed_worker_fixture();
+            match mode {
+                "missing" => { std::fs::remove_file(root.0.join("bin/fullmag-fem-gpu-bin")).unwrap(); },
+                "escape" => { manifest["binaries"]["worker"] = serde_json::json!("bin/../fullmag-fem-gpu-bin"); },
+                "digest" => { manifest["integrity"]["worker_sha256"] = serde_json::json!("0".repeat(64)); },
+                "wrong_api" => { manifest["binaries"]["api"] = serde_json::json!("bin/fullmag-fem-gpu-bin"); },
+                _ => unreachable!(),
+            }
+            std::fs::write(root.0.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert!(super::resolve_managed_worker_sibling(&api).is_err(), "{mode}");
+        }
+    }
 
     fn adaptive_policy() -> ParallelExecutionPolicyIR {
         ParallelExecutionPolicyIR {
