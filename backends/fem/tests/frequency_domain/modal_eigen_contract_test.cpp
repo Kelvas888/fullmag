@@ -7860,6 +7860,7 @@ void modal_nonzero_k_floquet_bloch_payload_with_dynamic_demag_k_is_admitted()
 {
     constexpr double stiffness_matrix_row_major[] = {1.0, 0.0, 0.0, 1.0};
     constexpr double gyrotropic_mass_row_major[] = {0.0, -1.0, 1.0, 0.0};
+    constexpr double tangent_mass_matrix_row_major[] = {1.0, 0.0, 0.0, 1.0};
     constexpr double dynamic_demag_k_row_major[] = {0.25, 0.0, 0.0, 0.25};
 
     fullmag_fem_frequency_domain_floquet_periodic_pair pair{};
@@ -7880,6 +7881,7 @@ void modal_nonzero_k_floquet_bloch_payload_with_dynamic_demag_k_is_admitted()
     request.mfem_tangent_dof_count = 2;
     request.mfem_stiffness_matrix_row_major = stiffness_matrix_row_major;
     request.mfem_gyrotropic_matrix_row_major = gyrotropic_mass_row_major;
+    request.mfem_mass_matrix_row_major = tangent_mass_matrix_row_major;
     request.operator_request.include_demag = 1;
     request.operator_request.demag_realization = "floquet_airbox";
     request.operator_request.operator_diagnostics_json =
@@ -7898,6 +7900,9 @@ void modal_nonzero_k_floquet_bloch_payload_with_dynamic_demag_k_is_admitted()
 
     FullmagFemFrequencyDomainResult result = fullmag_fem_modal_eigen_solve(&request);
 #if FULLMAG_FEM_WITH_SLEPC
+    if (result.status != FULLMAG_FEM_FD_OK) {
+        print_bounded_cabi_modal_result("C ABI nonzero-k dynamic-demag payload", result);
+    }
     check(result.status == FULLMAG_FEM_FD_OK,
           "a complete nonzero-k dynamic demag matrix must reach the production SLEPc path");
     check(contains(result.result_json, "\"accepted_mode_count\":1"),
