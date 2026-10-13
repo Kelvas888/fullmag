@@ -580,3 +580,27 @@ finished ani browser PASS, nie dotyczy publicznego UI i nie zabija sesji 3197.
 odmowa anulowania po finish i odmowa finish po anulowaniu. Diff check PASS.
 Rzeczywista próba anulowania z procesami pozostaje NOT VERIFIED;
 bramka restore→Compute nadal OPEN.
+
+## F completed i nowa próba D→F
+
+Sesja 97293 zakończyła się exit 0; build-status `completed`, zakończenie
+`2026-10-13T11:22:38.801210+00:00`. Manifest F SHA256
+`a3aaab8a14c82ceaf31cf9dd3f9faaf1475953cdf64a811c4efc793bdfd61e2f`
+zweryfikowany bezpośrednio z pliku; backend source SHA256
+`499ebdccf714fba3ff94fc2923b10bb3a8f0f9394e07a59f7f2ddcc04be9a1cd`.
+CLI/API build 3m47s, desktop 1m12s. Jest to dowód produkcyjnej kompilacji,
+nie wykonania Compute ani zamknięcia publicznego restartu.
+
+Interpretowana regresja HTTP anulowania wykazała Windows connection reset
+przy odmowie origin bez odbioru bounded request body. Handler odbiera teraz
+body w istniejącym limicie przed oceną origin; odmowa nadal poprzedza parsing
+i każdą mutację. 23/23 kontroli PASS, exit 0, w tym rzeczywisty lokalny
+HTTP: obcy origin 409 bez cancel, właściwy origin 200 z cancel bez finish.
+Nie zastępuje to terminalnego custody realnego native ownera.
+
+Uruchomiono managed browser proof D→F: sesja 89785, receipt
+`864d2e68606c4b1caa259f93e8556e22`, stan running. Stary owner D
+`da3fb23a4fdf49b380ffcdeebfd7049e`. User workspace 3197 nietknięty.
+Współdzielony checkout przeszedł na HEAD
+`a227bea56dc94109edb6b72826d55e65e8e19e6d`; nie przypisywać temu HEAD
+frozen builda F, którego recorded head pozostaje 9112d38880f4.
