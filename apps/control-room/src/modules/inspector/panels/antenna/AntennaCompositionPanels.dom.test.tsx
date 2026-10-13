@@ -347,7 +347,7 @@ describe("AntennaCompositionPanel runtime results", () => {
           expect.objectContaining({ id: "drive-1", peak_current_a: 3 }),
           expect.objectContaining({ id: "drive-2", peak_current_a: 2 }),
         ] }),
-        8, undefined, false,
+        8, undefined, true,
         "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7", undefined,
       );
       expect(mocks.invalidate).toHaveBeenCalled();
