@@ -11,7 +11,7 @@ import {
   recordAuthoringMutationHistory,
   runAuthoringMutationWithHistory,
 } from "@/kernel/authoring/authoringHistoryMutation";
-import type { SceneResource } from "@/kernel/api/apiTypes";
+import type { MaterialResource, SceneResource } from "@/kernel/api/apiTypes";
 import { useKernel } from "@/kernel/KernelContext";
 import {
   publishCommittedSceneResource,
@@ -565,29 +565,30 @@ function useObjectMaterialPanelState(selection: InspectorPanelProps["selection"]
     pendingScope: PanelScope,
   ): boolean {
     if (!isCurrentScope() || pendingScope.token !== scope.token) return false;
-    const committedSnapshot = acknowledgedScenes
-      .map((acknowledgedScene) => {
-        const material = magneticParameterMaterialResourceFromSceneResource(materialId, acknowledgedScene);
-        return {
-          object: resolveGeometryObjectDraft(selection, acknowledgedScene),
-          material,
-          draft: material ? magneticParametersDraftFromResource(materialId, material) : null,
-          sceneRevision: sceneResourceRevision(acknowledgedScene),
-        };
-      })
-      .find(({ object: acknowledgedObject, draft }) =>
-        draft !== null &&
+    let acknowledgedMaterial: MaterialResource | null = null;
+    for (const acknowledgedScene of acknowledgedScenes) {
+      const candidate = magneticParameterMaterialResourceFromSceneResource(materialId, acknowledgedScene);
+      if (candidate) {
+        acknowledgedMaterial = candidate;
+        break;
+      }
+    }
+    if (!acknowledgedMaterial) return false;
+
+    const assignedObjectSnapshot = acknowledgedScenes
+      .map((acknowledgedScene) => ({
+        object: resolveGeometryObjectDraft(selection, acknowledgedScene),
+        sceneRevision: sceneResourceRevision(acknowledgedScene),
+      }))
+      .find(({ object: acknowledgedObject }) =>
         acknowledgedObject.mode === "committed" &&
         acknowledgedObject.objectId === object.objectId &&
         normalizeMaterialRef(acknowledgedObject.material) === materialId,
       );
-    if (!committedSnapshot?.draft || !committedSnapshot.material) return false;
-    const {
-      draft: committedBaseDraft,
-      object: acknowledgedObject,
-      material: acknowledgedMaterial,
-      sceneRevision: acknowledgedSceneRevision,
-    } = committedSnapshot;
+    if (!assignedObjectSnapshot) return false;
+
+    const committedBaseDraft = magneticParametersDraftFromResource(materialId, acknowledgedMaterial);
+    const { object: acknowledgedObject, sceneRevision: acknowledgedSceneRevision } = assignedObjectSnapshot;
     const committedBaseKey = `${[
       acknowledgedObject.mode,
       acknowledgedObject.objectId,

@@ -242,6 +242,13 @@ vi.mock("@/kernel/resources/geometryLifecycleResources", () => ({
     revision: 4,
     status: "ready",
   }),
+  useMeshBuildHistoryResource: () => ({
+    data: null,
+    error: null,
+    refetch: vi.fn(),
+    revision: null,
+    status: "ready",
+  }),
   useMeshSharedDomainManifestResource: () => ({
     data: {
       domain_mesh_mode: "shared_domain_mesh_with_air",

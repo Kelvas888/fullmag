@@ -2,6 +2,7 @@ export type MeshFreshnessState =
   | "building"
   | "current"
   | "failed"
+  | "inconsistent"
   | "not-built"
   | "stale"
   | "unknown";
@@ -93,6 +94,12 @@ export function resolveMeshBuildFreshness(
   }
 
   if (manifestSourceSceneRevision !== null && sceneRevision !== null) {
+    if (Number(manifestSourceSceneRevision) > Number(sceneRevision)) {
+      return {
+        reason: "mesh manifest source scene revision is ahead of the current scene",
+        state: "inconsistent",
+      };
+    }
     return {
       reason: "mesh manifest source scene revision is older than the current scene",
       state: "stale",

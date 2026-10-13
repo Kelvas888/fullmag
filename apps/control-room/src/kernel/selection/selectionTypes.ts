@@ -427,9 +427,12 @@ export type SelectionRef =
       visualizationTargetId: string;
     }
   | {
+      artifactId?: string | null;
       centroid: [number, number, number] | null;
       elementIndex: number;
+      generationId?: string | null;
       kind: "mesh.quality.element";
+      meshRevision?: number | null;
       metric?: MeshQualitySelectionMetric;
       nodeId: string;
       type: "mesh-quality-element";
@@ -1129,6 +1132,9 @@ export function selectionRefEquals(
         left.elementIndex === right.elementIndex &&
         nullableStringEquals(left.metric, right.metric) &&
         centroidEquals(left.centroid, right.centroid) &&
+        nullableStringEquals(left.artifactId, right.artifactId) &&
+        nullableStringEquals(left.generationId, right.generationId) &&
+        left.meshRevision === right.meshRevision &&
         left.visualizationTargetId === right.visualizationTargetId
       );
     case "mesh-quality-metric":

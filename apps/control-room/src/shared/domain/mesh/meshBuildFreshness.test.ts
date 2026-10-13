@@ -41,6 +41,14 @@ describe("mesh build freshness", () => {
 
     expect(
       resolveMeshBuildFreshness({
+        manifest: { source_scene_revision: 11 },
+        sceneRevision: 10,
+        statusMeshRevision: 4,
+      }).state,
+    ).toBe("inconsistent");
+
+    expect(
+      resolveMeshBuildFreshness({
         latestBuild: { source_scene_revision: 10, status: "failed" },
         manifest: { source_scene_revision: 9 },
         sceneRevision: 10,

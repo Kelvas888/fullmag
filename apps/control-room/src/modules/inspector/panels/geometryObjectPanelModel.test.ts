@@ -7,6 +7,8 @@ import {
   buildGeometryDraftPatch,
   buildTransformDraftPatch,
   createDraftObjectId,
+  geometryDraftGeometryEquals,
+  geometryDraftTranslationEquals,
   resolveGeometryObjectDraft,
   resolveGeometryObjectPanelModel,
   resolvePrimitiveDraft,
@@ -55,6 +57,34 @@ describe("resolveGeometryObjectPanelModel", () => {
     expect(rebaseGeometryObjectDraft(dirty, 13)).toEqual({
       ...dirty,
       baseRevision: 13,
+    });
+  });
+
+  it("performs 3-way rebase preserving local dirty fields while taking concurrent target edits", () => {
+    const baseline = resolveGeometryObjectDraft(
+      { ...baseSelection, kind: "builder.primitive", nodeId: "geometry:draft:box", objectId: null, ref: null },
+      { objects: [], revision: 12 },
+    );
+    // User edited size locally
+    const dirty = {
+      ...baseline,
+      size: ["2e-7", "2e-7", "2e-8"] as [string, string, string],
+    };
+    // Concurrent change on server updated translation and baseRevision
+    const target = {
+      ...baseline,
+      baseRevision: 13,
+      translation: ["5e-8", "0", "0"] as [string, string, string],
+    };
+
+    const rebased = rebaseGeometryObjectDraft(dirty, target, baseline);
+    expect(rebased).toEqual({
+      ...baseline,
+      baseRevision: 13,
+      // Local edit preserved
+      size: ["2e-7", "2e-7", "2e-8"],
+      // Server concurrent edit preserved
+      translation: ["5e-8", "0", "0"],
     });
   });
   it("reads committed object data from SceneDocument", () => {
@@ -242,12 +272,55 @@ describe("resolveGeometryObjectPanelModel", () => {
     expect(buildTransformDraftPatch(draft)).toEqual({
       error: null,
       transform: {
+        pivot: [0, 0, 0],
+        rotation_quat: [0, 0, 0, 1],
+        scale: [1, 1, 1],
         translation: [0, 0, 0],
       },
     });
     expect(createDraftObjectId({ ...draft, name: "Free Layer" }, 12345)).toBe(
       "free-layer-9ix",
     );
+  });
+
+  it("preserves the complete existing Transform3D and detects subnanometre edits", () => {
+    const scene = {
+      objects: [{
+        geometry: {
+          geometry_kind: "Box",
+          geometry_params: { size: [1e-7, 1e-7, 1e-8] },
+        },
+        id: "box",
+        transform: {
+          pivot: [2e-8, 3e-8, 4e-8],
+          rotation_quat: [0, 0, 0.3826834323650898, 0.9238795325112867],
+          scale: [1, 2, 3],
+          translation: [0, 0, 0],
+        },
+      }],
+      revision: 8,
+    };
+    const draft = resolveGeometryObjectDraft(baseSelection, scene);
+    expect(buildTransformDraftPatch(
+      { ...draft, translation: ["1e-7", "0", "0"] },
+      scene.objects[0].transform,
+    )).toEqual({
+      error: null,
+      transform: {
+        pivot: [2e-8, 3e-8, 4e-8],
+        rotation_quat: [0, 0, 0.3826834323650898, 0.9238795325112867],
+        scale: [1, 2, 3],
+        translation: [1e-7, 0, 0],
+      },
+    });
+
+    const onePicometre = {
+      ...draft,
+      size: ["1.00001e-7", "1e-7", "1e-8"] as [string, string, string],
+      translation: ["1e-12", "0", "0"] as [string, string, string],
+    };
+    expect(geometryDraftGeometryEquals(onePicometre, draft)).toBe(false);
+    expect(geometryDraftTranslationEquals(onePicometre, draft)).toBe(false);
   });
 
   it("validates local geometry and translation while excluding unsupported rigid transforms", () => {

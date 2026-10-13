@@ -42,6 +42,7 @@ import {
   normalizeMeshBuildHistory,
   type MeshBuildHistoryEntry,
 } from "@/shared/domain/mesh/meshBuildHistory";
+import { resolveMeshBuildFreshness } from "@/shared/domain/mesh/meshBuildFreshness";
 import {
   type MeshPolicyDiffRow,
   diffMeshPolicies,
@@ -485,15 +486,15 @@ export function useMeshDetailsModel(
     recordField(lastBuildGeometryRealization, "source_scene_revision"),
     recordField(activeBuildRecord, "source_scene_revision"),
   );
-  const meshIsStale =
-    sceneRevision !== null &&
-    meshSourceSceneRevision !== null &&
-    meshSourceSceneRevision < sceneRevision;
-  const meshFreshness = meshIsStale
-    ? "stale"
-    : sceneRevision !== null && meshSourceSceneRevision !== null
-      ? "current"
-      : "unknown";
+  const freshnessResult = resolveMeshBuildFreshness({
+    activeBuild: activeBuildRecord,
+    latestBuild: asRecord(lastBuildSummary),
+    manifest: manifest.data as Record<string, unknown> | null | undefined,
+    sceneRevision,
+    statusMeshRevision: summary.data?.revision,
+  });
+  const meshFreshness = freshnessResult.state;
+  const meshIsStale = meshFreshness === "stale" || meshFreshness === "inconsistent";
   const targetCount = Object.keys(
     asRecord(activeBuild.data?.effective_per_object_targets) ?? {},
   ).length;
@@ -534,9 +535,12 @@ export function useMeshDetailsModel(
           nodeId,
           objectId: null,
           ref: {
+            artifactId: manifest.data?.mesh_id ?? null,
             centroid: element.centroid,
             elementIndex: element.elementIndex,
+            generationId: manifest.data?.generation_id ?? null,
             kind: "mesh.quality.element",
+            meshRevision: numericRevision(summary.data?.revision),
             metric: "gamma",
             nodeId,
             type: "mesh-quality-element",
@@ -547,7 +551,7 @@ export function useMeshDetailsModel(
       );
       kernel.layout.setActiveTab("mesh");
     },
-    [kernel],
+    [kernel, manifest.data?.generation_id, manifest.data?.mesh_id, summary.data?.revision],
   );
   const selectQualityMetric = useCallback(
     (metric: MeshQualityMetric["id"]) => {

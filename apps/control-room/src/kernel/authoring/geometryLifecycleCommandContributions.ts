@@ -534,6 +534,7 @@ function invalidateObjectMeshResources(
   objectId: string,
   revision: string | number,
 ): void {
+  context.resources?.invalidate(MESHING_BUILDS_PATH, revision);
   context.resources?.invalidate(MESHING_BUILDS_CURRENT_PATH, revision);
   context.resources?.invalidate(MODEL_READINESS_PATH, revision);
   context.resources?.invalidate(MESHING_SUMMARY_PATH, revision);
@@ -587,11 +588,12 @@ function currentMeshRevision(context: CommandContext): number | null {
 }
 
 function authoritativeMeshCommandRevision(detail: CommandDetailResource): number {
-  return detail.resource_invalidations!.find((entry) => {
+  const matching = detail.resource_invalidations?.find((entry) => {
     const key = entry.resource_key;
     return key === "meshing/shared-domain/manifest" || key === "data/domain/topology" ||
       (key.startsWith("meshing/objects/") && key.endsWith("/topology"));
-  })!.revision;
+  });
+  return matching?.revision ?? 0;
 }
 
 function invalidateMeshBuildStatus(context: CommandContext, revision: string | number): void {
@@ -669,6 +671,8 @@ function meshCommandKindMatches(actual: string, expected: ObservableMeshCommandK
   return actual === expected || (expected === "mesh_build" && actual === "remesh");
 }
 
+const MAX_RECONCILE_MESH_COMMANDS = 8;
+
 async function reconcileMeshSubmission(
   api: MeshCommandApi,
   operation: MeshBuildOperation,
@@ -678,7 +682,8 @@ async function reconcileMeshSubmission(
   const candidates = queue.commands.filter((entry) =>
     meshCommandKindMatches(entry.kind, operation.commandKind),
   )
-    .sort((left, right) => right.seq - left.seq).slice(0, 8);
+    .sort((left, right) => right.seq - left.seq)
+    .slice(0, MAX_RECONCILE_MESH_COMMANDS);
   for (const entry of candidates) {
     const detail = requestOptions
       ? await api.detail(entry.command_id, requestOptions)

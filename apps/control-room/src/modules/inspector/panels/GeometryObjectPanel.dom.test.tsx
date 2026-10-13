@@ -35,10 +35,15 @@ const mocks = vi.hoisted(() => ({
   selectionState: null as unknown,
   select: vi.fn(),
   publishCommittedScene: vi.fn(),
+  objectEditSession: null as { clear: () => void } | null,
 }));
 
 vi.mock("@/kernel/KernelContext", async () => {
   const React = await import("react");
+  const { ObjectEditSessionController } = await import(
+    "@/kernel/authoring/object-edit/ObjectEditSessionController"
+  );
+  mocks.objectEditSession ??= new ObjectEditSessionController();
   return {
     KernelContext: React.createContext(null),
     useKernel: () => ({
@@ -48,6 +53,7 @@ vi.mock("@/kernel/KernelContext", async () => {
         record: mocks.recordHistory,
       },
       commands: { getSessionScopeKey: () => mocks.sessionScopeKey },
+      objectEditSession: mocks.objectEditSession,
       resources: { invalidate: mocks.invalidate },
       selection: {
         get: () => mocks.selectionState,
@@ -83,6 +89,7 @@ describe("GeometryObjectPanel primitive transaction", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.commitTransaction.mockReset();
+    mocks.objectEditSession?.clear();
     mocks.sceneResource.data = { objects: [], revision: 12 };
     mocks.sceneResource.error = null;
     mocks.sceneResource.revision = 12;
@@ -354,12 +361,33 @@ describe("GeometryObjectPanel primitive transaction", () => {
         geometry: { geometry_kind: "Box", geometry_params: { size: [1e-7, 1e-7, 1e-8] } },
         id: "box-1",
         name: "Box 1",
-        transform: { rotation: [0, 0, 0], scale: [1, 1, 1], translation: [0, 0, 0] },
+        transform: {
+          pivot: [0, 0, 0],
+          rotation_quat: [0, 0, 0, 1],
+          scale: [1, 1, 1],
+          translation: [0, 0, 0],
+        },
       }],
       revision: 12,
     };
     mocks.commitTransaction.mockResolvedValueOnce({
-      committed_scene: { objects: [{ id: "box-1" }], revision: 13 },
+      committed_scene: {
+        objects: [{
+          geometry: {
+            geometry_kind: "Box",
+            geometry_params: { size: [2e-7, 1e-7, 1e-8] },
+          },
+          id: "box-1",
+          name: "Box 1",
+          transform: {
+            pivot: [0, 0, 0],
+            rotation_quat: [0, 0, 0, 1],
+            scale: [1, 1, 1],
+            translation: [1e-7, 0, 0],
+          },
+        }],
+        revision: 13,
+      },
       scene_revision: 13,
     });
     const committedSelection: Selection = {
@@ -409,13 +437,18 @@ describe("GeometryObjectPanel primitive transaction", () => {
     }
   });
 
-  it("locks global Apply when committed geometry and translation need separate commits", async () => {
+  it("applies geometry and placement in one full-transform transaction", async () => {
     mocks.sceneResource.data = {
       objects: [{
         geometry: { geometry_kind: "Box", geometry_params: { size: [1e-7, 1e-7, 1e-8] } },
         id: "box-1",
         name: "Box 1",
-        transform: { rotation: [0, 0, 0], scale: [1, 1, 1], translation: [0, 0, 0] },
+        transform: {
+          pivot: [0, 0, 0],
+          rotation_quat: [0, 0, 0, 1],
+          scale: [1, 1, 1],
+          translation: [0, 0, 0],
+        },
       }],
       revision: 12,
     };
@@ -447,15 +480,46 @@ describe("GeometryObjectPanel primitive transaction", () => {
       await act(async () => changeInput(container, "Size X", "2e-7"));
       await act(async () => changeInput(container, "Translation X", "1e-7"));
 
-      expect(findButton(container, "Global Apply").disabled).toBe(true);
-      expect(container.textContent).toContain("Apply geometry and transform separately");
-      expect(mocks.commitTransaction).not.toHaveBeenCalled();
-      expect(findButton(container, "Global Reset").disabled).toBe(false);
-      await act(async () => findButton(container, "Global Reset").click());
-      expect(findElements(container, (element) =>
-        element.tagName === "INPUT" && element.getAttribute("aria-label") === "Size X")[0]?.value).toBe("1e-7");
-      expect(findElements(container, (element) =>
-        element.tagName === "INPUT" && element.getAttribute("aria-label") === "Translation X")[0]?.value).toBe("0");
+      expect(findButton(container, "Global Apply").disabled).toBe(false);
+      mocks.commitTransaction.mockResolvedValueOnce({
+        committed_scene: {
+          objects: [{
+            geometry: {
+              geometry_kind: "Box",
+              geometry_params: { size: [2e-7, 1e-7, 1e-8] },
+            },
+            id: "box-1",
+            name: "Box 1",
+            transform: {
+              pivot: [0, 0, 0],
+              rotation_quat: [0, 0, 0, 1],
+              scale: [1, 1, 1],
+              translation: [1e-7, 0, 0],
+            },
+          }],
+          revision: 13,
+        },
+        scene_revision: 13,
+      });
+
+      await act(async () => findButton(container, "Global Apply").click());
+
+      expect(mocks.commitTransaction).toHaveBeenCalledOnce();
+      expect(mocks.commitTransaction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          base_revision: 12,
+          geometry: { geometry_kind: "Box", geometry_params: { size: [2e-7, 1e-7, 1e-8] } },
+          kind: "patch_object_geometry",
+          transform: {
+            pivot: [0, 0, 0],
+            rotation_quat: [0, 0, 0, 1],
+            scale: [1, 1, 1],
+            translation: [1e-7, 0, 0],
+          },
+        }),
+        { sessionScopeKey: "session=A&epoch=1" },
+      );
+      expect(mocks.recordHistory).toHaveBeenCalledOnce();
     } finally {
       await act(async () => root.unmount());
       dom.restore();

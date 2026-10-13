@@ -1,0 +1,872 @@
+{
+  "schema_version": "2.0",
+  "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+  "approval": "proposed_not_approved",
+  "releases": {
+    "R0": "internal_hotfix_not_public_release",
+    "R1": "first_usable_consistency_release",
+    "R2-T": "qualified_transforms",
+    "R2-I": "qualified_import",
+    "R2-Q": "mesh_inspection_extensions",
+    "R3": "deferred_requires_new_contract"
+  },
+  "features": [
+    {
+      "feature": "Spójny Apply geometry+translation",
+      "release": "R1",
+      "dependencies": "PR02/05/06/07",
+      "acceptance": "T01/T02/T51/T52"
+    },
+    {
+      "feature": "Powtarzalne Create, Revert, konflikty, późny ACK",
+      "release": "R1",
+      "dependencies": "PR02/04/06/07",
+      "acceptance": "T01/T03–T07/T53–T55"
+    },
+    {
+      "feature": "Move myszą, single object — immediate commit safety",
+      "release": "R0",
+      "dependencies": "PR03",
+      "acceptance": "T18 (R0)/T19 (R0)/T20 (R0)/T21/T22/T26 (R0)"
+    },
+    {
+      "feature": "Move numeryczny i myszą, single object — staged draft + Apply",
+      "release": "R1",
+      "dependencies": "PR04/07",
+      "acceptance": "T18 (R1)/T19 (R1)/T20 (R1)/T21/T22/T25/T26 (R1)/T56"
+    },
+    {
+      "feature": "First-build, wspólna aktualność, Build Selected scope",
+      "release": "R1",
+      "dependencies": "PR08–PR12",
+      "acceptance": "T33–T44/T58/T60"
+    },
+    {
+      "feature": "Portable recovery receipts zwykłych mutacji",
+      "release": "R1",
+      "dependencies": "PR05/06",
+      "acceptance": "T53/T65; brak pełnej trwałej historii Undo"
+    },
+    {
+      "feature": "Numeric Rotate/Scale, canonical pivot, World/Local",
+      "release": "R2-T",
+      "dependencies": "PR13–PR15",
+      "acceptance": "T13–T17/T23/T64"
+    },
+    {
+      "feature": "Snap translation/rotation/scale",
+      "release": "R2-T",
+      "dependencies": "PR15",
+      "acceptance": "T24; OFF domyślnie"
+    },
+    {
+      "feature": "Anchor center/bottom/custom i ustawienie Position",
+      "release": "R2-T",
+      "dependencies": "PR13/15",
+      "acceptance": "T14/T15; zero pierwotnych pól transformu nie dodawane ponownie"
+    },
+    {
+      "feature": "STL staged import, source units, construction-only",
+      "release": "R2-I",
+      "dependencies": "PR16–PR18",
+      "acceptance": "T27–T31/T72"
+    },
+    {
+      "feature": "STL occupancy/volume i reimport",
+      "release": "R2-I",
+      "dependencies": "PR17/18 + kwalifikacja właściwej lane",
+      "acceptance": "T29/T32/T59/T64"
+    },
+    {
+      "feature": "Custom clipping plane + per-element quality",
+      "release": "R2-Q",
+      "dependencies": "PR19",
+      "acceptance": "T43–T45/T69"
+    },
+    {
+      "feature": "Quality refinement przez receptę",
+      "release": "R2-Q",
+      "dependencies": "PR20",
+      "acceptance": "T35/T43/T69"
+    },
+    {
+      "feature": "Wieloselekcja do inspekcji",
+      "release": "R3",
+      "dependencies": "osobny selection contract",
+      "acceptance": "Nie aktywować multi-write przez tablicę ID"
+    },
+    {
+      "feature": "Wieloobiektowe Move/Rotate/Scale, duplicate/array",
+      "release": "R3",
+      "dependencies": "osobna atomowość i historia zbioru",
+      "acceptance": "Nowy backend kontrakt i test all-or-nothing"
+    },
+    {
+      "feature": "Align do obiektu/ściany",
+      "release": "R3",
+      "dependencies": "stabilne face/anchor selection, multiobject policy",
+      "acceptance": "Brak udawania poprzez bbox innych obiektów"
+    },
+    {
+      "feature": "Dowolne authored workplanes i workplane snapping",
+      "release": "R3",
+      "dependencies": "frame assets + lifetime/export",
+      "acceptance": "R1 ma tylko istniejące widoki XY/XZ/YZ, nie nowe parametric planes"
+    },
+    {
+      "feature": "Parametryczne expressions i dependency graph",
+      "release": "R3",
+      "dependencies": "parser typowany + jednostki + cykle + Python roundtrip",
+      "acceptance": "R1/R2 akceptuje liczby z jednostkami, nie równania"
+    },
+    {
+      "feature": "Ogólne CSG/history of features",
+      "release": "R3",
+      "dependencies": "topology naming + geometry kernel contracts",
+      "acceptance": "Zachować już istniejący ograniczony Difference; nie rozszerzać przez sam UI"
+    },
+    {
+      "feature": "Hierarchia parent/child, shear, mirror",
+      "release": "R3",
+      "dependencies": "affine/frame/physics ADR",
+      "acceptance": "T16/T17 w R1/R2 odmowa"
+    },
+    {
+      "feature": "Porównanie zbieżności meshu i projektowanie transferu stanu",
+      "release": "R3",
+      "dependencies": "obserwable + serie runów + nota naukowa",
+      "acceptance": "Nie nazywać histogramu elementów testem zbieżności"
+    }
+  ],
+  "pull_requests": [
+    {
+      "id": "PR01",
+      "release": "R0",
+      "legacy_packages": "A0",
+      "title": "Dowody wejściowe i baseline",
+      "owner_role": "frontend QA / release",
+      "sources": [
+        "S01",
+        "S09",
+        "S17",
+        "S31",
+        "S32"
+      ],
+      "depends_on": [],
+      "tests": [
+        "T01",
+        "T02",
+        "T18",
+        "T33",
+        "T49",
+        "T55"
+      ],
+      "files": [
+        "verification recipes w zatwierdzonym storage; bez modyfikacji runtime"
+      ],
+      "entry_contract": "Zamrożony commit, środowisko i oryginalne reprodukcje; reguły worktree i zakaz kompilacji testów odczytane.",
+      "acceptance": "Reproduce / not-reproduced / blocked per test; baseline numbers pozostają null do pomiaru. Właściciel zatwierdza profile.",
+      "rollback": "Nie dotyka aplikacji; usunąć wyłącznie output zadania według governance.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR02",
+      "release": "R0",
+      "legacy_packages": "A1",
+      "title": "Reducer baseline, identity i ACK",
+      "owner_role": "frontend authoring",
+      "sources": [
+        "S01",
+        "S02",
+        "S03",
+        "S04"
+      ],
+      "depends_on": [
+        "PR01"
+      ],
+      "tests": [
+        "T01",
+        "T03",
+        "T04",
+        "T05",
+        "T06",
+        "T07",
+        "T54",
+        "T55"
+      ],
+      "files": [
+        "kernel/authoring/object-edit/objectEditReducer.ts [nowy]",
+        "modules/inspector/panels/GeometryObjectPanel.tsx"
+      ],
+      "entry_contract": "Semantyczne grupy i scoped identity z D04. Nowy reducer od początku publiczny przez kernel, bez prywatnego store Inspectora.",
+      "acceptance": "Dwie edycje, conflict/Revert, ACK A→B, późniejszy rawText; stabilny panel. Ten sam reducer zostanie użyty w PR07.",
+      "rollback": "Adapter starego panelu pozostaje właścicielem integracji; revert kodu bez zmiany modelu.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR03",
+      "release": "R0",
+      "legacy_packages": "A2",
+      "title": "Zabezpieczenie obecnego Move",
+      "owner_role": "frontend viewport",
+      "sources": [
+        "S07",
+        "S08",
+        "S09",
+        "S10",
+        "S21"
+      ],
+      "depends_on": [
+        "PR01"
+      ],
+      "tests": [
+        "T18",
+        "T19",
+        "T20",
+        "T21",
+        "T22",
+        "T26"
+      ],
+      "files": [
+        "modules/viewport-3d/MoveObjectGizmo.tsx",
+        "modules/viewport-3d/Viewport3DObjectMoveInteraction.tsx",
+        "kernel/authoring/objectMoveConflictWorkflow.ts"
+      ],
+      "entry_contract": "R0 jest wewnętrznym hotfiksem. Zachowuje istniejące zakończenie gestu, lecz fence/serializacja i error handling są obowiązkowe.",
+      "acceptance": "Nie rozpoczyna gestu B przed ACK A; zero commit dla no-op, brak unhandled rejection, historia degraded jawna. Brak kwalifikacji staged R1 tym hotfiksem.",
+      "rollback": "Nowe narzędzie można wyłączyć, pozostawiając naprawiony numeric Inspector; PR07 usuwa immediate compatibility path.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR04",
+      "release": "R0",
+      "legacy_packages": "A3",
+      "title": "Parser i uczciwe stany walidacji/preview",
+      "owner_role": "frontend authoring",
+      "sources": [
+        "S01",
+        "S02",
+        "S22"
+      ],
+      "depends_on": [
+        "PR01"
+      ],
+      "tests": [
+        "T08",
+        "T09",
+        "T10",
+        "T11",
+        "T12",
+        "T56"
+      ],
+      "files": [
+        "kernel/authoring/object-edit/quantityInput.ts [nowy]",
+        "modules/inspector/panels/geometryObjectPanelModel.ts",
+        "modules/viewport-3d/viewport3dPrimitiveModel.ts"
+      ],
+      "entry_contract": "Gramatyka i no-op D04; znane kształty są rozróżniane od fallbacku.",
+      "acceptance": "Empty nie staje się 0, unsupported nie udaje Box, cylinder h≠2r ma właściwe bounds. Nieznana walidacja nie jest pass.",
+      "rollback": "Parser adapter ma jednego ownera; nie utrzymywać dwóch parserów po migracji paneli.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR05",
+      "release": "R1",
+      "legacy_packages": "B1-backend",
+      "title": "Warunek atomowego zapisu i durable intent receipt",
+      "owner_role": "API / persistence",
+      "sources": [
+        "S25",
+        "S26",
+        "S32"
+      ],
+      "depends_on": [
+        "PR01"
+      ],
+      "tests": [
+        "T51",
+        "T52",
+        "T53",
+        "T61",
+        "T63",
+        "T65",
+        "T06"
+      ],
+      "files": [
+        "crates/fullmag-api/src/schemas/authoring.rs",
+        "crates/fullmag-api/src/router_v2/handlers/model/authoring.rs",
+        "istniejący właściciel commit_current_live_scene_document_with_context [pełny trace wymagany]",
+        "router_v2/model intent lookup [nowy]"
+      ],
+      "entry_contract": "ADR02 i ADR04 zaakceptowane. Reuse patch_object_geometry; review końcowego committera, walidatora i storage przed zmianą.",
+      "acceptance": "Jeden przegrany writer dostaje conflict; effect+receipt po crash są rozstrzygalne; run admission sprawdzony przy commit. Brak nowego generic batch.",
+      "rollback": "Receipts nie usuwać przy rollback. Stary klient może pracować tylko według wersjonowanej compatibility; nie downgrade’ować zapisanych semantyk.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR06",
+      "release": "R1",
+      "legacy_packages": "B1-client",
+      "title": "Journal klienta i transport reconciliation",
+      "owner_role": "frontend API / persistence",
+      "sources": [
+        "S03",
+        "S07",
+        "S21",
+        "S25"
+      ],
+      "depends_on": [
+        "PR02",
+        "PR05"
+      ],
+      "tests": [
+        "T05",
+        "T06",
+        "T26",
+        "T53",
+        "T54",
+        "T57",
+        "T65"
+      ],
+      "files": [
+        "kernel/authoring/object-edit/authoringIntentJournal.ts [nowy]",
+        "kernel/api typed facade i generated types",
+        "kernel/authoring/authoringHistoryMutation.ts"
+      ],
+      "entry_contract": "Capability receipt od backendu; journal przed wysłaniem, digest payloadu i owning document.",
+      "acceptance": "Reload unknown→lookup; najwyżej jeden wpis Undo per intent; failure journal/history widoczny. Post-submit fields zachowane.",
+      "rollback": "Po wyłączeniu UI można odczytać i uzgodnić stare intencje; zakaz automatycznej zmiany ID i replay bez capability.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR07",
+      "release": "R1",
+      "legacy_packages": "B1/F1",
+      "title": "Wspólny staged authoring i wszystkie wejścia Apply",
+      "owner_role": "frontend kernel / inspector / viewport",
+      "sources": [
+        "S01",
+        "S03",
+        "S04",
+        "S09",
+        "S10",
+        "S11",
+        "S20"
+      ],
+      "depends_on": [
+        "PR02",
+        "PR03",
+        "PR04",
+        "PR06"
+      ],
+      "tests": [
+        "T02",
+        "T03",
+        "T04",
+        "T05",
+        "T06",
+        "T18",
+        "T19",
+        "T20",
+        "T21",
+        "T22",
+        "T25",
+        "T26",
+        "T34",
+        "T50",
+        "T54",
+        "T55",
+        "T56",
+        "T57",
+        "T67"
+      ],
+      "files": [
+        "kernel/authoring/object-edit/ObjectEditSessionController.ts [nowy]",
+        "kernel/types.ts + KernelProvider.tsx",
+        "modules/inspector/InspectorEditSession.tsx adapter",
+        "GeometryObjectPanel.tsx + ObjectPlacementPanel.tsx [nowy]",
+        "ribbon / command registry / viewport adapters"
+      ],
+      "entry_contract": "ADR01 zaakceptowany. Jeden shell/viewport. Jeden draft/kernel-instance; istniejąca stopka jest adapterem.",
+      "acceptance": "Pointerup 0 HTTP; jeden Apply zapisuje wymiary+pełny transform. Geometry→Placement nie gubi draftu; inne scope respektują guard. Wszystkie przyciski/skrót/paleta używają tego samego intent.",
+      "rollback": "Flaga owner=frontend authoring. Brak dual-write; wyłączenie myszy zostawia numeric staged UI. Immediate shim z PR03 usunąć przed R1.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR08",
+      "release": "R1",
+      "legacy_packages": "E1-pre",
+      "title": "Pierwszy build i konserwatywny resolver",
+      "owner_role": "frontend mesh / API",
+      "sources": [
+        "S06",
+        "S17",
+        "S18",
+        "S19",
+        "S20"
+      ],
+      "depends_on": [
+        "PR01"
+      ],
+      "tests": [
+        "T33",
+        "T35",
+        "T37",
+        "T40",
+        "T41",
+        "T42",
+        "T43",
+        "T44",
+        "T60",
+        "T68"
+      ],
+      "files": [
+        "shared/domain/mesh/artifactAssessment.ts [nowy]",
+        "kernel/resources geometryLifecycleResources",
+        "useMeshDetailsModel.ts",
+        "MeshBuildDialog.tsx",
+        "Run readiness adapter"
+      ],
+      "entry_contract": "D06 legacy-revision resolver; explicit not-built z API, nie globalne 404→empty. To niezależna ścieżka od PR07.",
+      "acceptance": "First-build legal; przyszła rewizja inconsistent; każdy konsument ten sam resolver; stary ElementRef blokowany.",
+      "rollback": "Adapter owner=mesh domain. Do czasu PR09/10 działa konserwatywnie; nigdy optymistyczny fake-current.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR09",
+      "release": "R1",
+      "legacy_packages": "E1-server",
+      "title": "Digest, generacje i marker aktywacji",
+      "owner_role": "meshing / API / persistence",
+      "sources": [
+        "S17",
+        "S20",
+        "S31"
+      ],
+      "depends_on": [
+        "PR08"
+      ],
+      "tests": [
+        "T37",
+        "T40",
+        "T42",
+        "T44",
+        "T60",
+        "T68",
+        "T69"
+      ],
+      "files": [
+        "backend mesh artifact publisher [wybrać po trace]",
+        "meshing active-generation schema/route [nowe]",
+        "wersjonowany canonical digest encoder [nowy/adaptacja]"
+      ],
+      "entry_contract": "ADR05 zaakceptowany. Pełny trace publishera jest zadaniem wejściowym; nie deklarujemy tu konkretnego nieodczytanego symbolu.",
+      "acceptance": "Golden canonical bytes; obowiązkowe topology/membership w jednej generacji; crash przed markerem nie aktywuje; optional quality nie blokuje poprawnej topologii.",
+      "rollback": "Immutable blobs i receipts zachować. Wycofanie producenta nie może aktywować incomplete generacji; reader starej schemy read-only/refuse.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR10",
+      "release": "R1",
+      "legacy_packages": "E1-consumers",
+      "title": "Jedna identity w selection, viewport, quality i Run",
+      "owner_role": "frontend mesh / runtime",
+      "sources": [
+        "S17",
+        "S19",
+        "S22"
+      ],
+      "depends_on": [
+        "PR08",
+        "PR09"
+      ],
+      "tests": [
+        "T41",
+        "T42",
+        "T43",
+        "T44",
+        "T46",
+        "T47",
+        "T48",
+        "T60",
+        "T68"
+      ],
+      "files": [
+        "kernel/resources artifact activation owner",
+        "kernel/selection ElementRef adapter",
+        "viewport topology/delivery adapter",
+        "mesh Inspector + Run readiness"
+      ],
+      "entry_contract": "Marker/provenance vNext; wszystkie selection consumers zinwentaryzowane w PR.",
+      "acceptance": "Żaden ordinal nie przechodzi do nowej generacji; scene rename nie remeshuje przy matching digest. Legacy resolver usuwany dopiero po kwalifikacji kompatybilnych producers.",
+      "rollback": "Adapter zachowany tylko dla jawnej starszej wersji z datą/removal criteria; nie fallback po błędzie nowej odpowiedzi.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR11",
+      "release": "R1",
+      "legacy_packages": "E2",
+      "title": "Build saga, selected scope i kompletne recovery",
+      "owner_role": "frontend mesh / mesher API",
+      "sources": [
+        "S06",
+        "S18",
+        "S19",
+        "S20"
+      ],
+      "depends_on": [
+        "PR05",
+        "PR08"
+      ],
+      "tests": [
+        "T34",
+        "T35",
+        "T36",
+        "T37",
+        "T38",
+        "T39",
+        "T40",
+        "T41",
+        "T58",
+        "T66"
+      ],
+      "files": [
+        "ObjectMeshPolicyPanel.tsx",
+        "airbox/AirboxMeshParametersPanel.tsx",
+        "kernel/authoring/geometryLifecycleCommandContributions.ts",
+        "meshBuildConfirmation.ts + MeshBuildDialog.tsx",
+        "commands intent lookup / paging [backend kontrakt]"
+      ],
+      "entry_contract": "ADR06 zaakceptowany; istniejące confirmation/observation i duplicate guards zachowane.",
+      "acceptance": "Policy-saved/build-rejected widoczne; nowa scena wymaga nowej confirmation; właściwy job znaleziony mimo >8 wpisów; BuildSelected opisuje rzeczywisty shared-domain scope.",
+      "rollback": "Nie usuwać observation active jobów. Rollback nie wykonuje kolejnego builda ani cofania poprawnie zapisanej polityki.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR12",
+      "release": "R1",
+      "legacy_packages": "E3/F1",
+      "title": "Historia, dedykowane widoki i release qualification",
+      "owner_role": "frontend inspector / QA",
+      "sources": [
+        "S03",
+        "S04",
+        "S17",
+        "S18",
+        "S21",
+        "S31"
+      ],
+      "depends_on": [
+        "PR07",
+        "PR10",
+        "PR11"
+      ],
+      "tests": [
+        "T25",
+        "T26",
+        "T33",
+        "T34",
+        "T39",
+        "T50",
+        "T55",
+        "T67",
+        "T70"
+      ],
+      "files": [
+        "inspectorRouteCatalog / selection routes",
+        "object.mesh history view",
+        "existing workspace toolbar/footer",
+        "release evidence manifest"
+      ],
+      "entry_contract": "D05 node mapping; JSON tylko Diagnostics. Brak rozszerzania całego Control Room.",
+      "acceptance": "R1 acceptance set zielony albo release blocked; brak cichego history failure, wszystkie cztery deklarowane lane sprawdzone osobno.",
+      "rollback": "R1 switch off preview tool pozostawia spójny numeric Apply; nie wraca do dwóch różnych commit paths.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR13",
+      "release": "R2-T",
+      "legacy_packages": "C1-contract",
+      "title": "TRS/pivot semantyka, migracja i nota naukowa",
+      "owner_role": "geometry + Python/IR + physics",
+      "sources": [
+        "S27",
+        "S28",
+        "S29",
+        "S30"
+      ],
+      "depends_on": [
+        "PR05",
+        "PR07"
+      ],
+      "tests": [
+        "T13",
+        "T14",
+        "T15",
+        "T16",
+        "T17",
+        "T61",
+        "T62",
+        "T63",
+        "T64"
+      ],
+      "files": [
+        "crates/fullmag-authoring scene/geometry/adapters/validation",
+        "packages/fullmag-py runtime/scene_document.py",
+        "ProblemIR/export/evaluator [trace matrix D13]",
+        "docs/physics transform-frame note + schema migration"
+      ],
+      "entry_contract": "ADR03/04 akceptacja; fixture points i legacy nonzero pivot. Nie dodawać drugiego Transform3D.",
+      "acceptance": "Roundtrip bez utraty pivot/frame; do czasu końca lane qualification capability unsupported/planned. Hierarchia i mirror odrzucone.",
+      "rollback": "Zapis pivot-v1 blokuje stary write-client; odczyt wcześniejszego evaluated artifact zachowany. Nie cofać modelu zmieniając macierz.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR14",
+      "release": "R2-T",
+      "legacy_packages": "C1-lowering",
+      "title": "Lowering TRS i kwalifikacja czterech realizacji",
+      "owner_role": "FDM/FEM backend + physics",
+      "sources": [
+        "S28",
+        "S29",
+        "S30",
+        "S32"
+      ],
+      "depends_on": [
+        "PR13",
+        "PR10"
+      ],
+      "tests": [
+        "T14",
+        "T15",
+        "T47",
+        "T62",
+        "T64",
+        "T71"
+      ],
+      "files": [
+        "Python→IR canonical geometry owner",
+        "FDM membership/evaluator CPU + GPU",
+        "FEM geometry realization + backend consumers",
+        "backend lane capability qualification records"
+      ],
+      "entry_contract": "Każda z 4 lanes ma osobny owner i dowody. Nie utożsamiać CPU meshera z CPU solver lane.",
+      "acceptance": "Points/AABB, region ownership, occupancy/mesh i nauka per lane; explicit GPU nigdy fallbackCPU.",
+      "rollback": "Unqualified lane nie włącza Rotate/Scale; backend reason pozostaje prawdziwy.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR15",
+      "release": "R2-T",
+      "legacy_packages": "C2",
+      "title": "Gizmo TRS, pivot, World/Local i snap",
+      "owner_role": "frontend viewport",
+      "sources": [
+        "S09",
+        "S10",
+        "S11",
+        "S31"
+      ],
+      "depends_on": [
+        "PR14",
+        "PR07"
+      ],
+      "tests": [
+        "T13",
+        "T14",
+        "T15",
+        "T17",
+        "T20",
+        "T21",
+        "T22",
+        "T23",
+        "T24",
+        "T50",
+        "T55"
+      ],
+      "files": [
+        "viewport-3d transform tool adapter [nowy]",
+        "ObjectPlacementPanel.tsx",
+        "kernel/authoring/object-edit transform intents"
+      ],
+      "entry_contract": "Qualified capability danej lane; math D13; brak prywatnych HTTP/historii w gizmo.",
+      "acceptance": "Ray/ortho/perspective, screen-size handles, staged preview równoważny wpisowi liczbowemu. Brak autocommit po pointerup.",
+      "rollback": "Flaga owner=viewport authoring; możliwość wyłączyć drag i używać tych samych numeric fields; journal/draft nieusuwany.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR16",
+      "release": "R2-I",
+      "legacy_packages": "D1-control",
+      "title": "Staging/import checks i bounded data plane",
+      "owner_role": "assets / API",
+      "sources": [
+        "S12",
+        "S13",
+        "S31"
+      ],
+      "depends_on": [
+        "PR05"
+      ],
+      "tests": [
+        "T27",
+        "T28",
+        "T29",
+        "T30",
+        "T31",
+        "T63",
+        "T72"
+      ],
+      "files": [
+        "assets owner + model/import-stages routes [nowe]",
+        "OpenAPI/facade/hooks",
+        "binary preview owner"
+      ],
+      "entry_contract": "ADR07, limit/lease profile z D12; przegląd istniejącego assets.rs poza summary.",
+      "acceptance": "ASCII/binary, malformed, topology checks, cancel/reload; zero object po Cancel. Finite check nie udaje volume certification.",
+      "rollback": "Usunięcie stage tylko bez refs; nie kasować referenced original asset; capability off nie gubi danych.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR17",
+      "release": "R2-I",
+      "legacy_packages": "D1/D2-project",
+      "title": "Attach/reimport i przenośny projekt",
+      "owner_role": "assets + persistence + Python/IR",
+      "sources": [
+        "S25",
+        "S26",
+        "S27",
+        "S29"
+      ],
+      "depends_on": [
+        "PR16",
+        "PR10"
+      ],
+      "tests": [
+        "T27",
+        "T29",
+        "T30",
+        "T31",
+        "T32",
+        "T59",
+        "T63",
+        "T64",
+        "T72"
+      ],
+      "files": [
+        "typed attach/reimport transaction [nowa]",
+        "SceneGeometry asset-version reference",
+        "Python/IR asset resolver",
+        "istniejący .fms writer/reader [trace przed zmianą]",
+        "region rebind reports"
+      ],
+      "entry_contract": "Asset refs są logiczne, nie host path; version/ranges i orphan map. Reimport jednego obiektu, nie multiobjectbatch.",
+      "acceptance": "Offline export/import zachowuje source hash; objectID stałe w reimport, nowy w duplicate; konflikty nie nadpisują źródła.",
+      "rollback": "Nowe schema read-only w starszym kliencie; immutable source versions i region diff zachować.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR18",
+      "release": "R2-I",
+      "legacy_packages": "D1/F1",
+      "title": "Import inspector i pełny workflow",
+      "owner_role": "frontend assets / QA",
+      "sources": [
+        "S12",
+        "S31"
+      ],
+      "depends_on": [
+        "PR07",
+        "PR17"
+      ],
+      "tests": [
+        "T27",
+        "T28",
+        "T29",
+        "T30",
+        "T31",
+        "T32",
+        "T50",
+        "T55",
+        "T59",
+        "T72"
+      ],
+      "files": [
+        "modules/start import entry adapter",
+        "modules/inspector ImportSourcePanel [nowy]",
+        "kernel import service public API",
+        "viewport binary surface preview adapter"
+      ],
+      "entry_contract": "Jedno wejście importer wizard ze Start i Geometry; żadnego bezpośredniego fetch w panelu.",
+      "acceptance": "Tryb construction-only jawny; dopiero qualified checks pozwalają FEM/FDM; stage nie jest scene object.",
+      "rollback": "Importer disabled z zachowaniem już zatwierdzonych assetów i tylko własnych stage cleanup.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR19",
+      "release": "R2-Q",
+      "legacy_packages": "F1-quality",
+      "title": "Przekrój i metryki zgodnej generacji",
+      "owner_role": "viewport mesh / geometry QA",
+      "sources": [
+        "S17",
+        "S31"
+      ],
+      "depends_on": [
+        "PR10"
+      ],
+      "tests": [
+        "T43",
+        "T44",
+        "T45",
+        "T46",
+        "T49",
+        "T69"
+      ],
+      "files": [
+        "existing cross-section adapter + binary geometry owner",
+        "mesh quality metric/legend model",
+        "viewport element highlight"
+      ],
+      "entry_contract": "Zdefiniowane metric/family/version i płaszczyzna; przycinanie wszystkich rodzin deklarowanych w capability.",
+      "acceptance": "Tetra plane oracle i mixed-family fixtures; brak zgodnej metryki = unavailable, nie failed mesh. Rzeczywisty WebGL proof.",
+      "rollback": "Read-only slice fallback jasno nazwany, nie dowód runtime mesh i nie nowy Build.",
+      "status": "proposed_not_started"
+    },
+    {
+      "id": "PR20",
+      "release": "R2-Q",
+      "legacy_packages": "F1-refine",
+      "title": "Refinement jako zmiana recepty",
+      "owner_role": "meshing / frontend mesh",
+      "sources": [
+        "S17",
+        "S18",
+        "S20"
+      ],
+      "depends_on": [
+        "PR19",
+        "PR11"
+      ],
+      "tests": [
+        "T35",
+        "T36",
+        "T43",
+        "T44",
+        "T60",
+        "T69"
+      ],
+      "files": [
+        "meshQualityRefinement recipe producer",
+        "shared-domain policy draft service",
+        "build confirmation adapter"
+      ],
+      "entry_contract": "Backend capability scope i metric definition; tylko recipe mutation z ElementRef freshness gate.",
+      "acceptance": "Nowa recepta → Apply → Build; nie podmieniać lokalnej topologii. Stary wynik retained.",
+      "rollback": "Wyłączyć akcję refine, zachować receptę i wygenerowane artefakty; bez automatic rollback jobów.",
+      "status": "proposed_not_started"
+    }
+  ]
+}
