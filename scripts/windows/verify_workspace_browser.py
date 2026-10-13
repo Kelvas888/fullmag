@@ -10,6 +10,8 @@ import ctypes
 from ctypes import wintypes
 import copy
 import json
+import math
+import sys
 import os
 from pathlib import Path
 import queue
@@ -61,6 +63,66 @@ def utc_ms():
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def camera_for_proof(value):
+    """Require the exact camera contract; never normalize a lost view to defaults."""
+    fields = {"projection", "position", "target", "up", "fov_degrees", "orthographic_scale"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise storage.StorageError("Camera proof has an incomplete or foreign camera")
+
+    def finite_number(number):
+        return type(number) in (int, float) and math.isfinite(number)
+
+    if value["projection"] not in ("perspective", "orthographic"):
+        raise storage.StorageError("Camera proof has an invalid projection")
+    for field in ("position", "target", "up"):
+        vector = value[field]
+        if not isinstance(vector, list) or len(vector) != 3 or not all(map(finite_number, vector)):
+            raise storage.StorageError("Camera proof has an invalid vector")
+    if (value["position"] == value["target"]
+            or sum(component * component for component in value["up"]) <= sys.float_info.epsilon):
+        raise storage.StorageError("Camera proof has a degenerate view basis")
+    fov, scale = value["fov_degrees"], value["orthographic_scale"]
+    if (not finite_number(fov) or not 1 <= fov <= 179
+            or (scale is not None and (not finite_number(scale) or scale <= 0))):
+        raise storage.StorageError("Camera proof has an invalid projection parameter")
+    return copy.deepcopy(value)
+
+
+def validate_camera_preservation(before, after):
+    expected, observed = camera_for_proof(before), camera_for_proof(after)
+    changed = sorted(key for key in expected if expected[key] != observed[key])
+    if changed:
+        raise storage.StorageError("Native restart changed the captured camera: " + ", ".join(changed))
+    return {"preserved": True, "before": expected, "after": observed}
+
+
+def scene_after_successful_grid(scene):
+    """Only clear the production mesh-dirty tag; retain all authored data."""
+    expected = copy.deepcopy(scene)
+    for obj in expected.get("objects", []):
+        tags = obj.get("tags")
+        if isinstance(tags, list) and "mesh:dirty" in tags:
+            remaining = [tag for tag in tags if tag != "mesh:dirty"]
+            if remaining:
+                obj["tags"] = remaining
+            else:
+                obj.pop("tags")
+    return expected
+
+
+def validate_after_grid_document(before, expected):
+    """Pin predicted hashes before restart; never relax archive or metadata."""
+    if not isinstance(before, dict) or not isinstance(expected, dict):
+        raise storage.StorageError("After-grid document proof is missing")
+    hashes = ("scene_resource_sha256", "scene_document_sha256")
+    if any(not isinstance(expected.get(key), str) or not SHA256_RE.fullmatch(expected[key])
+           or not isinstance(before.get(key), str) or not SHA256_RE.fullmatch(before[key])
+           for key in hashes):
+        raise storage.StorageError("After-grid document hashes are invalid")
+    if canonical({**expected, **{key: before[key] for key in hashes}}) != canonical(before):
+        raise storage.StorageError("After-grid document changed archive or metadata")
 
 
 def check_material_anisotropy_plans(binaries, fixture, env, receipt):
@@ -243,6 +305,7 @@ def read_execution_scope(api_port, api_instance_id):
             or not session["session_epoch"][len(session_id) + 1:]
             or session.get("request_scope_epoch") != f"{api_instance_id}:{identity['session_epoch']}"):
         raise storage.StorageError("Execution status is not bound to the observed API/session transition")
+    parse_session_resource_epoch(session_id, session["session_epoch"])
     return {
         "api_instance_id": api_instance_id,
         "session_id": session_id,
@@ -469,9 +532,15 @@ def completed_command_detail(frame, command_id, command_kind):
         "stage_id": frame.get("stage_id"),
         "stage_index": frame.get("stage_index"),
         "applied_step": frame.get("applied_step"),
+        "completed_step": frame.get("completed_step"),
         "requested_execution": frame.get("requested_execution"),
         "resolved_execution": frame.get("resolved_execution"),
     }
+
+
+def has_positive_solver_execution(evidence):
+    applied, completed = evidence.get("applied_step"), evidence.get("completed_step")
+    return type(applied) is int and applied >= 0 and type(completed) is int and completed > applied
 
 
 def completed_scratch_entry(entry, api_instance_id, scope):
@@ -494,6 +563,40 @@ def completed_scratch_entry(entry, api_instance_id, scope):
 def same_execution_scope(left, right):
     return isinstance(left, dict) and isinstance(right, dict) and all(
         left.get(key) == right.get(key) for key in EXECUTION_SCOPE_KEYS)
+
+
+def parse_session_resource_epoch(session_id, value):
+    prefix = session_id + "@"
+    if not isinstance(value, str) or not value.startswith(prefix):
+        raise storage.StorageError("Session resource epoch has a different session identity")
+    parts = value[len(prefix):].split(":tombstone:")
+    if len(parts) not in (1, 2) or any(
+            len(part) > 39 or not part.isascii() or not part.isdecimal() or not 0 < int(part) < 2**128
+            or str(int(part)) != part for part in parts):
+        raise storage.StorageError("Session resource epoch is not canonical")
+    started = int(parts[0])
+    finished = int(parts[1]) if len(parts) == 2 else None
+    if finished is not None and finished < started:
+        raise storage.StorageError("Session tombstone precedes its start")
+    return started, finished
+
+
+def validate_terminal_execution_scope(scope, restored, lifecycle, earliest_finish, observed_at):
+    for key in EXECUTION_SCOPE_KEYS:
+        if key != "session_resource_epoch" and scope.get(key) != restored.get(key):
+            raise storage.StorageError("Terminal execution changed its API/session owner")
+    started, previous_finish = parse_session_resource_epoch(
+        restored["session_id"], restored["session_resource_epoch"])
+    next_started, finished = parse_session_resource_epoch(
+        scope["session_id"], scope["session_resource_epoch"])
+    if (previous_finish is not None or next_started != started or finished is None
+            or type(earliest_finish) is not int or type(observed_at) is not int
+            or not earliest_finish <= finished <= observed_at
+            or not isinstance(lifecycle, dict) or lifecycle.get("solver") != "completed"
+            or lifecycle.get("session_resource") != "tombstoned"
+            or lifecycle.get("commandability") != "read_only"):
+        raise storage.StorageError("Execution has no exact completed session tombstone")
+    return finished
 
 
 def owned_scratch_entry_in_scope(entry, api_instance_id, scope):
@@ -667,7 +770,7 @@ class ProofBridge:
         queue_before = read_api(self.api_port, api_instance_id, "/v2/sessions/current/simulation/commands")
         scene = read_api(self.api_port, api_instance_id, "/v2/sessions/current/model/scene")
         scene_sha256 = hashlib.sha256(canonical(scene).encode()).hexdigest()
-        if (canonical(scene) != canonical(before.get("scene"))
+        if (canonical(scene) != canonical(scene_after_successful_grid(before.get("scene")))
                 or not same_execution_scope(scope_before, restore.get("scope"))):
             raise storage.StorageError("Restored scene or session scope changed after the restore observation")
 
@@ -711,7 +814,7 @@ class ProofBridge:
         if (not isinstance(compute_evidence["run_id"], str) or not compute_evidence["run_id"].strip()
                 or not ((isinstance(compute_evidence["stage_id"], str) and compute_evidence["stage_id"].strip())
                         or (type(compute_evidence["stage_index"]) is int and compute_evidence["stage_index"] >= 0))
-                or type(compute_evidence["applied_step"]) is not int or compute_evidence["applied_step"] <= 0
+                or not has_positive_solver_execution(compute_evidence)
                 or not isinstance(compute_evidence["requested_execution"], dict)
                 or not isinstance(compute_evidence["resolved_execution"], dict)):
             raise storage.StorageError("Completed Compute command lacks positive stage-step and execution provenance")
@@ -735,6 +838,8 @@ class ProofBridge:
                                         for item in stages["stages"]):
             raise storage.StorageError("Close requires all authored stages to be completed")
         stage = matching_stages[0]
+        if stage.get("completed_step") != compute_evidence["completed_step"]:
+            raise storage.StorageError("Compute stage and command differ on the completed solver step")
         stage_index = stage.get("index")
         completed_indexes = stages["completed_stage_indexes"]
         if (not isinstance(stage.get("stage_id"), str) or not stage["stage_id"].strip()
@@ -768,8 +873,36 @@ class ProofBridge:
         scope_after = read_execution_scope(self.api_port, api_instance_id)
         if canonical(scope_after) != canonical(scope_before):
             raise storage.StorageError("API/session observation scope changed while reading execution receipts")
-        if not same_execution_scope(scope_after, restore.get("scope")):
-            raise storage.StorageError("Stable API/session execution scope changed after restore")
+        close_evidence = None
+        terminal_timestamp = None
+        if require_terminal:
+            if not isinstance(queue_before, dict) or not isinstance(queue_before.get("commands"), list):
+                raise storage.StorageError("Terminal execution has no command ledger")
+            closes = [item for item in queue_before.get("commands", [])
+                      if isinstance(item, dict) and item.get("kind") == "close"
+                      and type(item.get("created_at_unix_ms")) is int
+                      and item["created_at_unix_ms"] >= compute_evidence["completed_at_unix_ms"]]
+            if len(closes) != 1:
+                raise storage.StorageError("Terminal Compute has no unique explicit Close command")
+            close_id = closes[0].get("command_id")
+            if not isinstance(close_id, str) or not close_id.strip():
+                raise storage.StorageError("Terminal Close has no command identity")
+            close_detail = read_api(self.api_port, api_instance_id,
+                                   "/v2/sessions/current/simulation/commands/" + quote(close_id, safe=""))
+            close_evidence = completed_command_detail(close_detail, close_id, "close")
+            status = read_api(self.api_port, api_instance_id, "/v2/sessions/current/status")
+            if (status.get("session", {}).get("session_epoch") != scope_after["session_resource_epoch"]
+                    or canonical(read_execution_scope(self.api_port, api_instance_id)) != canonical(scope_after)
+                    or stages.get("runtime_state") != "completed"
+                    or any(not isinstance(item, dict) or item.get("status") != "completed"
+                           for item in stages["stages"])):
+                raise storage.StorageError("Terminal lifecycle changed while reading Close receipts")
+            terminal_timestamp = validate_terminal_execution_scope(
+                scope_after, restore["scope"], status.get("lifecycle"),
+                max(stage["completed_at_unix_ms"], close_evidence["created_at_unix_ms"]), utc_ms())
+        elif (not same_execution_scope(scope_after, restore.get("scope"))
+              or scope_after["session_resource_epoch"] != restore["scope"]["session_resource_epoch"]):
+            raise storage.StorageError("Stable API/session execution scope changed before Close")
         close_precondition = None
         if not require_terminal:
             queue_after = read_api(self.api_port, api_instance_id, "/v2/sessions/current/simulation/commands")
@@ -800,6 +933,8 @@ class ProofBridge:
             },
             "observation_scope": scope_after,
             "close_precondition": close_precondition,
+            "close": close_evidence,
+            "session_finished_at_unix_ms": terminal_timestamp,
             "grid": {**grid_evidence, "child_pid": grid_entry["record"]["pid"],
                      "child_exit_code": grid_entry["record"]["exit_code"],
                      "kill_requested": grid_entry["record"]["kill_requested"]},
@@ -816,13 +951,14 @@ class ProofBridge:
 
     def capture_before(self, body):
         proof = self.eligibility()
-        if (set(body) != {"schema", "nonce", "api_instance_id", "project_document_before"}
+        if (set(body) != {"schema", "nonce", "api_instance_id", "project_document_before", "project_document_after_grid"}
                 or body["schema"] != "fullmag.development-browser-before.v1"
                 or body["nonce"] != self.expected["nonce"]
                 or body["api_instance_id"] != proof["api_instance_id"]
                 or not isinstance(body["project_document_before"], dict)
                 or not body["project_document_before"]):
             raise storage.StorageError("Browser before-capture has a different scope or empty draft")
+        validate_after_grid_document(body["project_document_before"], body["project_document_after_grid"])
         scene = read_api(self.api_port, proof["api_instance_id"], "/v2/sessions/current/model/scene")
         objects = scene.get("objects")
         if not isinstance(objects, list) or not objects:
@@ -834,6 +970,9 @@ class ProofBridge:
                 or type(identity.get("session_epoch")) is not int):
             raise storage.StorageError("Nonempty browser scene has no exact workspace identity")
         session_scope = read_session_scope(self.api_port, proof["api_instance_id"], identity)
+        camera = camera_for_proof(read_api(
+            self.api_port, proof["api_instance_id"], "/v2/sessions/current/visualization/state"
+        ).get("camera"))
         admission = read_admission_observation(self.api_port, proof["api_instance_id"])
         if (admission["scope"]["session_id"] != identity["session_id"]
                 or admission["scope"]["session_resource_epoch"] != session_scope["session_resource_epoch"]
@@ -845,7 +984,7 @@ class ProofBridge:
             if self.before is not None:
                 raise storage.StorageError("Browser before-capture is immutable")
             self.before = {**body, "scene": scene, "identity": identity, "session_scope": session_scope,
-                           "admission_observation": admission}
+                           "admission_observation": admission, "camera": camera}
             self.receipt["workspace_browser_before"] = copy.deepcopy(self.before)
             if self.receipt_path is not None:
                 storage.atomic_json(self.receipt_path, self.receipt)
@@ -863,13 +1002,16 @@ class ProofBridge:
                 or body.get("new_api_instance_id") != restored.get("new_api_instance_id")
                 or body["new_api_instance_id"] == before["api_instance_id"]
                 or canonical(body["project_document_before"]) != canonical(before["project_document_before"])
-                or canonical(body["project_document_after"]) != canonical(before["project_document_before"])):
+                or canonical(body["project_document_after"]) != canonical(before["project_document_after_grid"])):
             raise storage.StorageError("Browser hydration does not preserve the captured draft and new pin")
+        camera_evidence = validate_camera_preservation(before["camera"], read_api(
+            self.api_port, body["new_api_instance_id"], "/v2/sessions/current/visualization/state"
+        ).get("camera"))
         execution = self.execution()
         scene = read_api(self.api_port, body["new_api_instance_id"], "/v2/sessions/current/model/scene")
         backend = read_api(self.api_port, body["new_api_instance_id"], "/v2/platform/development-backend")
         identity = backend.get("workspace_identity", {})
-        if (canonical(scene) != canonical(before["scene"])
+        if (canonical(scene) != canonical(scene_after_successful_grid(before["scene"]))
                 or identity.get("api_instance_id") != body["new_api_instance_id"]
                 or not isinstance(identity.get("session_id"), str)
                 or identity["session_id"] == before["identity"]["session_id"]
@@ -886,6 +1028,7 @@ class ProofBridge:
                 raise storage.StorageError("Browser proof cancellation has already been submitted")
             if self.browser is not None:
                 raise storage.StorageError("Browser finish has already been submitted")
+            self.receipt["workspace_browser_camera"] = camera_evidence
             self.browser = {**body, "scene_sha256": hashlib.sha256(canonical(scene).encode()).hexdigest(),
                             "identity": identity, "session_scope": session_scope}
             self.process.stdin.write((canonical(command) + "\n").encode())

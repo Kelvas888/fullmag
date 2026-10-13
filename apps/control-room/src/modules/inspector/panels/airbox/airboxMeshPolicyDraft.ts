@@ -100,6 +100,19 @@ export function draftFromUniverseMeshPolicyResource(
   };
 }
 
+export function draftFromEffectiveUniverseMeshPolicyResource(
+  resource: MeshUniverseConfigResource,
+): AirboxMeshPolicyDraft {
+  const sourceConfig = resource.config ?? resource.effective_config ?? {};
+  return {
+    ...draftFromUniverseMeshPolicyResource({
+      ...resource,
+      config: sourceConfig,
+    }),
+    authoredConfigPresent: true,
+  };
+}
+
 export function draftKeyForUniverseMeshPolicyResource(
   resource: MeshUniverseConfigResource,
 ): string {

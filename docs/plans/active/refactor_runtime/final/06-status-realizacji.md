@@ -1,5 +1,39 @@
 # Status realizacji całego planu refaktoryzacji
 
+Checkpoint 13.10.2026 — [P8-53BM: zachowanie kamery](p8/53bm-camera-preservation.md):
+natywny pakiet API/CLI/desktop completed exit 0; regresja API 301 kontroli
+PASS, jawne set/absent/null skali i kanoniczny OpenAPI potwierdzone.
+Fixture ownerów 35/35, a po rozszerzeniu diagnostyki capture 36/36 PASS,
+scoped lint i review PASS. Commity `6b4fceba3379d5944c3f16f5329291ca9b6cafef`
+oraz `48d3893cca7d7f7fdd0b7408051d3955039318ac` są na remote master.
+Rzeczywisty browser utworzył 1 obiekt, 1 region i 1 materiał oraz potwierdził
+niezerowy canvas bez utraty kontekstu. Restart odmówił capture przed POST;
+próba została jawnie anulowana, 19/19 procesów terminalnych. Brak dowodu
+kamery po restarcie. Nowy build diagnostyki nie wystartował przez zajęty
+slot (120s, exit 2). **P8-53BM i P8-53 pozostają IN PROGRESS**; procentów
+całego planu nie zmieniono. [P8-55](p8/55-network-storage-assessment-20261013.md)
+uzupełnia ocenę Z: o niezależne bramki lokalnego writera i TEMP; nie ma
+kwalifikacji aktywnego storage SMB ani migracji.
+
+Kontynuacja P8-53: [53BH — szkic materiału po odświeżeniu](p8/53bh-inspector-first-edit-after-resource-refresh.md).
+Realny browser potwierdził odmowę restartu przy szkicu nazwy i jawny Apply
+(rewizja 1→2), następnie odtworzył błąd pierwszej edycji materiału:
+zmiana alpha wyczyściła nietknięte pola. Próba diagnostyczna została jawnie
+anulowana, wszystkie 19 procesów odebrane; nie jest to PASS restartu.
+Poprawka źródeł, 20 interpretowanych przypadków i production typecheck PASS;
+ponowny browser proof w toku. Procenty planu bez zmiany.
+
+Checkpoint 13.10.2026: **P8-53BE CLOSED — pierwsza bramka FDM CPU**.
+Build K completed exit 0, frozen-native API gate 296 kontroli PASS,
+OpenAPI/client generation i import checks PASS. Browser F→K
+`01ad57bafdca4a89881a4138c1fdbfcd`: completed exit 0, 9 kontroli;
+identyczna scena i dirty document po restore, normalne Grid, Compute
+Study 10 kroków / 1 ps, requested/resolved FDM CPU strict double,
+jawny Close i normalny solver wait exit 0 bez kill. Pozostałe bramki
+P8-53 oraz publiczny restart pozostają otwarte. Procentów całego planu
+nie przeliczono na podstawie tego pojedynczego dowodu. Poniższe wpisy
+są wcześniejszymi checkpointami. [Dowody](p8/53bg-acquisition-refusal-diagnostics.md).
+
 Checkpoint po próbie `523affb9b5dd4a13820b33e52171b550`: dziesięć
 produkcyjnych przypadków plannera oraz Grid 4×4×1 PASS, normalny child wait
 exit 0. Poprawka admission jest na lokalnym i remote master:

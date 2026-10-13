@@ -460,6 +460,13 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
                     or identity["source_snapshot_sha256"] != receipt["build_snapshot_sha256"]
                     or "/v2/platform/development-backend" not in spec["paths"]):
                 raise storage.StorageError("Canonical native OpenAPI identity does not match the verified build")
+            camera_patch_schema = spec["components"]["schemas"]["VisualizationCameraPatch"]
+            scale_schema = camera_patch_schema["properties"]["orthographic_scale"]
+            if (set(scale_schema.get("type", [])) != {"number", "null"}
+                    or scale_schema.get("format") != "double"
+                    or "orthographic_scale" in camera_patch_schema.get("required", [])):
+                raise storage.StorageError("Camera scale PATCH lost its optional nullable number contract")
+            receipt["checks"].append("camera-scale-openapi-optional-nullable-double")
             storage.atomic_json(run_root / "openapi-v2.json", spec)
             receipt["openapi_sha256"] = hashlib.sha256((run_root / "openapi-v2.json").read_bytes()).hexdigest()
             receipt["checks"].append("canonical-codegen-identity")
@@ -2592,6 +2599,39 @@ def exercise(api: Path, repo: Path, run_root: Path, receipt: dict, *, project_do
         assert code == 200 and edited["revision"] == 18, edited
         assert edited["scene"]["name"] == "Edited restored model", edited
         checks.append("prelisten-restored-authoring-is-editable")
+
+        # Real owned API regression: JSON null must clear a previously set scale.
+        camera_path = "/v2/sessions/current/visualization/state"
+        code, _, initial_view = get(camera_path)
+        assert code == 200, initial_view
+        original_camera = dict(initial_view["camera"])
+        previous_revision = initial_view["revision"]
+        for label, camera_patch, expected_scale in (
+            ("set", {"orthographic_scale": 2.0}, 2.0),
+            ("absent", {}, 2.0),
+            ("clear", {"orthographic_scale": None}, None),
+        ):
+            code, _, view = get(camera_path, method="PATCH", payload={"camera": camera_patch})
+            assert code == 200, view
+            assert view["revision"] > previous_revision, view
+            expected_camera = {**original_camera, "orthographic_scale": expected_scale}
+            assert view["camera"] == expected_camera, view
+            code, _, readback = get(camera_path)
+            assert code == 200 and readback["camera"] == expected_camera, readback
+            assert readback["revision"] == view["revision"], readback
+            previous_revision = view["revision"]
+            checks.append("camera-scale-patch-" + label + "-revision-and-readback")
+        for invalid_scale in (0.0, -1.0):
+            try:
+                get(camera_path, method="PATCH", payload={"camera": {"orthographic_scale": invalid_scale}})
+            except urllib.error.HTTPError as error:
+                assert error.code == 400, error.code
+            else:
+                raise AssertionError("Invalid camera scale was accepted")
+            code, _, readback = get(camera_path)
+            assert code == 200 and readback["camera"] == expected_camera, readback
+            assert readback["revision"] == previous_revision, readback
+        checks.append("camera-scale-invalid-patch-preserves-state-and-revision")
 
     with_api("restored", restore_config, restored, restore_input=json.dumps(restore_envelope).encode())
     for label, config, envelope in (

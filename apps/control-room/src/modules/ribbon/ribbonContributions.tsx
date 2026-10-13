@@ -534,7 +534,7 @@ const meshTab: RibbonTabContent = {
       actions: [
         { id: "grid.build-fdm", icon: icon(Grid3X3), label: "Build Grid", accent: true, iconColor: C.green, tooltip: "Rebuild the structured FDM grid from the committed scene" },
         { id: "mesh.build-selected", icon: icon(RefreshCw),  label: "Build",      accent: true, splitButton: true, iconColor: C.green, menu: [...statusMenu("mesh-build-status", "Mesh state", "Not built", "warning"), separator("mesh-build-sep"), ...menu("mesh-build", "Build scope", ["Selected object", "All objects", "Universe mesh", "Shared solver mesh"])] },
-        { id: "mesh.build-shared-domain", icon: icon(Zap),   label: "Build All",  splitButton: true, iconColor: C.yellow, menu: menu("mesh-build-all", "Build all", ["FDM mesh", "FEM shared domain", "Quality report"]) },
+        { id: "mesh.build-shared-domain", icon: icon(Zap),   label: "Build All",  splitButton: true, iconColor: C.yellow, menu: menu("mesh-build-all", "Build all", ["FEM shared domain", "Quality report"]) },
         { id: "mesh-stats",     icon: icon(BarChart3),  label: "Statistics",               iconColor: C.peach },
       ],
     },
@@ -1344,6 +1344,26 @@ function buildMeshTabContent(
                     id: "mesh.open-builds:item",
                     label: "Open build pipeline",
                     commandId: "mesh.open-builds",
+                  },
+                ] satisfies RibbonMenuNode[],
+              };
+            }
+            if (action.id === "mesh.build-shared-domain") {
+              return {
+                ...action,
+                commandId: "mesh.build-shared-domain",
+                menu: [
+                  {
+                    type: "item",
+                    id: "mesh.build-shared-domain:item",
+                    label: "Build shared domain mesh",
+                    commandId: "mesh.build-shared-domain",
+                  },
+                  {
+                    type: "item",
+                    id: "mesh.open-quality:report",
+                    label: "Quality report",
+                    commandId: "mesh.open-quality",
                   },
                 ] satisfies RibbonMenuNode[],
               };

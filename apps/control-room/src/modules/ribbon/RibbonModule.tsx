@@ -171,7 +171,7 @@ export default function RibbonModule({ kernel }: ModuleProps) {
   const activeTab = useLayoutSelector((layout) => layout.activeModuleTab);
   const { setActiveTab } = useLayoutActions();
   const selection = useSelectionSelector((currentSelection) =>
-    activeTab === "view" || activeTab === "geometry"
+    activeTab === "view" || activeTab === "geometry" || activeTab === "mesh"
       ? currentSelection
       : EMPTY_SELECTION,
   );

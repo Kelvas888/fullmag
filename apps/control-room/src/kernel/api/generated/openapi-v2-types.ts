@@ -5492,6 +5492,8 @@ export interface components {
             client_intent_id?: string | null;
             command_id: string;
             completed_at_unix_ms?: number | null;
+            /** Format: int64 */
+            completed_step?: number | null;
             completion_status?: string | null;
             created_at_unix_ms: number;
             diagnostics?: components["schemas"]["CommandDiagnosticReferenceResource"][];
@@ -14106,6 +14108,8 @@ export interface components {
             command_id?: string | null;
             /** Format: int64 */
             completed_at_unix_ms?: number | null;
+            /** Format: int64 */
+            completed_step?: number | null;
             converged: boolean;
             /** Format: double */
             current_field_mT?: number | null;

@@ -2,9 +2,11 @@
 
 Stan 13.10.2026: **OPEN**. P8-53BE oraz publiczny restart nie są zamknięte.
 
-Aktualny checkpoint: produkcyjny build C zakończony PASS (manifest
-`7e9039806e8ce9046cd26c816bcb9d0727e93ea515d59482dad0eb21f82130d7`),
-archiwizacja C zakończona PASS (33 kontrole). Restore/Compute NOT VERIFIED.
+Aktualny checkpoint: F→H potwierdziło restore i wykonanie Compute, ale
+normalne zamknięcie child odmówiło z powodu brakujących danych wykonania
+i błędnego tombstone. Poprawki producenta oraz typed readback są w źródłach;
+ich nowa próba browser/runtime pozostaje NOT VERIFIED. Wyniki buildów
+i kontroli zapisano w końcowych wpisach.
 Sekcje poniżej stanowią chronologiczny dziennik; wcześniejsze określenia
 „żywa” lub „NOT VERIFIED” opisują stan w chwili danego wpisu. Aktualne
 rozstrzygnięcia i pełne hashe są w końcowych wpisach.
@@ -792,3 +794,203 @@ receipt. Child Compute zakończył się dopiero przez cancel (exit 1, kill=true)
 więc normalnego zakończenia procesu nie zaliczono. Sesja 17081 terminalna;
 nie ponawiać jej poll ani nie uruchamiać ponownie tylko z powodu timeoutu.
 [Zrzut odmowy](p8-53bg-restored-compute-lifecycle.png). P8-53BE nadal OPEN.
+
+### Kontynuacja 13.10.2026 — korekta lifecycle i dowodu kroków
+
+Poprzedni spójny przyrost zapisano i wypchnięto jako
+`3857b9f02123e97448a2b32e6dd8982f78935593`.
+Diagnoza odpowiedzi z receipt `11caba0f12ac4e7c8ba39ca7ee4ae342`
+wykazała trzy odrębne przyczyny:
+
+- Po końcu scripted stages interaktywny owner nadal obsługiwał komendy,
+  lecz `stage_execution.runtime_state=completed` powodował tombstone w API.
+  Producent publikuje teraz `awaiting_command`, zachowując terminalną historię.
+- `InteractiveSessionContext::build_session` odtwarzał syntetyczne `auto`
+  zamiast zachować pełny wybór requested/resolved. Kontekst otrzymuje wybór
+  z rzeczywistego manifestu i odświeża go dla planu zaakceptowanego etapu.
+- `applied_step` jest granicą zastosowania komendy, więc `0` dla pierwszego
+  Compute jest poprawne. Dodatnie wykonanie potwierdza nowe opcjonalne
+  `completed_step`, pochodzące z ostatniego offsetowanego `StepStats` tego
+  etapu. API przenosi tę wartość ze stage do command detail; verifier wymaga
+  `completed_step > applied_step` oraz zgodności command/stage. Nie wylicza
+  jej z czasu ani licznika całego runu. Starszy payload bez wartości nie
+  uzyskuje pozytywnego dowodu wykonania.
+
+Podsumowanie CLI rozróżnia teraz `samples` (liczbę zachowanych obserwacji)
+od `final_step` (numeru kroku solvera). Samo `steps.len()` nie było liczbą
+wykonanych kroków; stąd wcześniejsze 2 próbki przy końcowym kroku 10.
+Nie stanowi to kwalifikacji fizyki ani wyjaśnienia zerowej energii fixture.
+
+Kontrole: 24 interpretowane testy `test_windows_workspace_browser.py` PASS;
+parser rustfmt dla zmienionych źródeł CLI/API PASS; scoped diff check PASS.
+Dodane regresje Rust pozostają NOT COMPILED / NOT RUN zgodnie z zakazem.
+Generacja OpenAPI i browser/runtime nowego pakietu pozostają NOT VERIFIED.
+
+Po potwierdzeniu terminalnego buildu użytkownika na 3197 (log
+`native-build-6117ac90faf443829f0da4ef6ab9d720.log`, exit 0) oraz zwolnienia
+blokady rozpoczęto własny BuildOnly przez zarządzaną receptę
+`just windows-workspace-build dev dev 3258 true`.
+Sesja `41594`, log `native-build-7fda98bd72c24e87a654b799caa019fb.log`,
+snapshot `088e7bddf459b8e06e8dfa12d913125d754ff13f641b0280171b1dd159fbcdfb`.
+Nie zamknięto workspace użytkownika na 3197. Build jest w toku;
+wynik i manifest muszą zostać odczytane przed zaliczeniem. P8-53BE OPEN.
+
+Build sesji `41594` zakończył się exit 1 / Cargo 101: E0063, brak
+`published_run` w konstruktorze `ProjectBatchCaseSummaryResource` w
+utrwalonym snapshotcie. Błąd pochodził z równoległego przyrostu batch API;
+bieżący producent miał już właściwe powiązanie z trwałym child intent.
+Nie zastąpiono go `None` ani nie cofnięto cudzych zmian. Log i snapshot
+nieudanej próby zachowano.
+
+Source review ujawnił ponadto wcześniejsze cofnięcie końcowego manifestu
+do `final_session_runtime` sprzed interaktywnych poleceń. Po wyjściu pętli
+wartość do finalnego summary/manifest otrzymuje teraz aktualny wybór z
+kontekstu. Regresja replan/terminal wymaga runtime; sama kontrola źródeł
+nie zamyka tej bramki.
+
+Nowy zarządzany build: sesja `38707`, log
+`native-build-de5a2e2337354041bb00fe3a1e11d3b8.log`, ten sam profil i port
+3258, bez uruchomienia UI. Stan running potwierdzono procesem ownera
+127668 i uchwytem sesji. Nie uruchomiono równoległego ciężkiego buildu.
+
+### Build J i finalizacja ownera
+
+Sesja `38707` terminalna exit 0. Receipt build-status: completed,
+finished `2026-10-13T13:11:43.245309+00:00`, qualification=not_assessed.
+Manifest `8202e5b621f02e4fbc4eb3df324dc5f38725fb4771e38b04c04bc9d2ffa450eb`;
+source identity v2 `18ff1167ab5d91f524b2317c19af18f0c5c236dfc3ffc7953100e7e0b3b1b3df`;
+backend source `6742acf16e6c582dd1b5c812c01c32bd2b7ddf10a7291be35c2718fcacff4162`;
+snapshot katalogowy `4f1cd80998bdccd634741601139fd0872837959fe1b953e6efbd42428e518a00`.
+Kompilacja CLI/API 3m13s, desktop 52.07s. Sześć zmienionych źródeł
+CLI/API było byte-equal względem tej utrwalonej kopii przy kontroli.
+
+J nie obejmuje późniejszej finalizacji ownera: po jawnym Close top-level
+stage execution musi stać się completed, zachowując records. Bez tej
+zmiany API nadal preferowałoby awaiting_command nad końcowym manifestem.
+Ponadto ostatni udany scripted stage publikuje awaiting_command atomowo
+z terminalną historią, aby nie tworzyć przejściowego tombstone podczas
+oczekiwania na uruchomienie pętli interaktywnej. Failed pozostaje failed.
+Source review potwierdził zachowanie najnowszego runtime selection w
+końcowym summary/manifest i historii w finalnej projekcji.
+
+Verifier rozdziela teraz aktywny zakres przed Close od terminalnego zakresu
+po Close. Wcześniejszy `same_execution_scope` porównywał tylko cztery pola
+ownera, pomijając resource epoch. Teraz przed Close także resource epoch
+musi być dokładnie zgodny z restore. Po normalnym wait wymagane są:
+unikalna ukończona komenda Close po Compute, completed run i wszystkie
+stages, lifecycle completed/tombstoned/read_only oraz pełny kanoniczny
+`session_id@start:tombstone:finish` z niezmienionym startem i ownerem.
+Timestamp finish pochodzi z resource epoch, musi następować po stage/Close
+i nie wyprzedzać obserwacji. Nie zmienia to tożsamości sesji ani scope
+scratch child; zmiana podczas odczytu pozostaje odmową.
+
+26 interpretowanych testów PASS (obejmują dodatni krok wykonania, zmianę
+ownera/startu, malformed/unbounded epoch, błędny lifecycle i kolejność).
+Rust regression source pozostaje NOT COMPILED / NOT RUN. OpenAPI i nowy
+browser/runtime nadal NOT VERIFIED.
+
+Build K tej finalizacji: sesja `38801`, log
+`native-build-6573f6be07c949b5b9f3d2be5835b938.log`, ten sam profil i port
+3258, BuildOnly. Nie restartuje UI użytkownika na 3197. Pozostawić uchwyt
+do odczytu wyniku; nie uruchamiać drugiej kompilacji z powodu ciszy logu.
+
+### Kontynuacja buildu K — 13.10.2026
+
+Odczyt tego samego uchwytu `38801` potwierdził utrwalony snapshot
+`049570944965b74366d3cabf32a38e3f3f07c3da0fad928f007fe56cba7a34b8`.
+Sześć zmienionych plików produkcyjnych CLI/API jest byte-equal względem
+tej kopii: orchestrator, runtime_supervisor, CLI types, API types,
+schemas/runtime i handlers/simulation/runtime. Kompilacja CLI/API zakończyła
+się w 1m08s, desktop w 54.32s. Nie jest to jeszcze terminalny sukces
+całego wrappera: publikacja pakietu pozostaje w toku, potwierdzona żywym
+procesem ownera 132564 i aktywnym uchwytem. Nie używać poprzedniego
+manifestu J do kwalifikacji K.
+
+Ponowny lekki regression check verifiera: 26 testów PASS, exit 0,
+bez kompilowania testów jednostkowych Rust. Kolejny krok po terminalnym
+wyniku K: frozen-native API gate/export OpenAPI, generacja klienta i
+prywatny browser proof na 3258. Workspace użytkownika 3197 zachowany.
+
+Build K terminalny: exit 0, receipt completed, finished
+`2026-10-13T13:26:43.588096+00:00`, qualification=not_assessed.
+Manifest `cb683c2e8e879785f01f4547fa25e2fbcf2d5369f42ab297512c8e72dff22959`;
+frozen git commit `e1865ce66c0291be2bfc03a77253b77972b62d4f`;
+source identity `e05f2c21ffd61bd16f89070fb45e1f782f868d6b6eb8fc46fb93fefba1471b1b`;
+backend source `f9652bafd01af1eb975a062e4d21b51f19560edd91383644c49d3532712b4b33`;
+CLI `e0d84ee99956bf153e121af20d55c724e7309acad3f67ea4618d17925ab192c0`;
+API `800e4ff9fbe4b33d07c27ac8725f1544506144fb60e935a14e45850ca8ab9d19`;
+desktop `8bcbdc78827b230c2296b65ab3a36468b60f21514ea15df8c0d9618c10cd5e44`.
+Zapis ownera zachował wcześniejszy HEAD 3857b9f, dlatego tożsamość
+kompilowanych źródeł określa frozen manifest i snapshot, nie samo pole
+head w build-status. Uruchomiono frozen-native API gate dla powyższego
+digestu manifestu. P8-53BE nadal OPEN do runtime/browser proof.
+
+Frozen-native gate K: aktywny uchwyt `10906`, proces verifiera 123644,
+run `f488e3f929c341bba45d015d553c8607` pod profilem
+`development-backend-api-checks/checks`. Zapis początkowy przypina
+manifest K, commit e1865ce i source identity e05f2c21. Logi obejmują
+odtworzenie sceny i próby cold start usługi. Terminalny receipt oraz
+końcowy canonical-codegen export wymagają jeszcze odczytu. Nie
+importować pośredniego openapi-v2.json przed terminalnym sukcesem.
+Kontynuować ten sam uchwyt; żywy proces potwierdzony, nie restartować
+próby z powodu ciszy wyjścia.
+
+Frozen-native gate K zakończony exit 0: 296 kontroli, wszystkie wymagane
+procesy mają terminalne dowody. Canonical OpenAPI export exit 0,
+SHA256 `1d510192cd47981630566273e27fb1b7ff1a0010080428ec2b4882d66b0c534a`.
+Import kontraktu zweryfikował receipt i frozen commit/snapshot K.
+Zarządzana generacja klienta PASS: run `d4c3350522b045a6be0d8030bc6bffd0`.
+OpenAPI import check PASS: 17 interpretowanych testów, run
+`7beb68621a0c44fdb967b5f6c50b6cd5`. Generowany kontrakt i typy zawierają
+opcjonalne completed_step w CommandDetailResource i StageExecutionRecordResource.
+Wygenerowany diff obejmuje także równoległe zmiany compute/batch API;
+nie traktować całego diffu jako własnego zakresu przy stagingu.
+
+Nowa prywatna próba browser F→K: uchwyt `7740`, run
+`01ad57bafdca4a89881a4138c1fdbfcd`, owner bundle
+`12984ba740244e5e86d8878814069155`, port 3258. Wymaga normalnego Compute
+i Close po odtworzeniu. P8-53BE nadal OPEN; publiczny restart nie awansuje
+na podstawie API gate.
+
+### Terminalny browser proof F→K — PASS
+
+Run `01ad57bafdca4a89881a4138c1fdbfcd` completed, exit 0, 9 kontroli,
+finished `2026-10-13T15:47:28.718992+02:00`. Typowanie i lint frozen
+frontendu exit 0. Wszystkie 27 procesów receipt mają waited=true;
+negatywne przypadki materiałów celowo kończą się exit 1. Nowe API
+zostało zamknięte przez cleanup fixture (exit 1), co nie jest wynikiem
+solvera. Solver Compute child 135404 zakończył się normalnie exit 0,
+kill_requested=false; oba Grid children również normalnie exit 0.
+
+Projekt `project-40935611141445eba39a5cc4659ee34d`, revision 2, dirty=true,
+przed/po archive hash
+`d9a2b22c35c8b840f526393cbfee167c797e66b6d9d6147319213a61f3a4a3ae`;
+scene/document hash
+`c787060cc2cc27ce03831e709dd62d55dea669a5954c668ca7c92afc6884fac8`.
+Odtworzono obiekt, region i materiał. Nowe API
+`3aae986d-77d6-48e2-9b3f-049b784f2d94`, session
+`session-18de1ab5d3b4c1580002137c`, scope `api_instance_id:1`.
+Canvas visible=true, context_lost=false, drawing buffer 700×297.
+
+Compute `fm-0d53f5d5-7fe0-4fbc-a681-7033c94746d2` solve completed,
+stage-000 completed, applied_step=0, completed_step=10, Run 1 ps.
+Requested/resolved fdm/cpu/double/strict, cpu-reference / fdm_cpu_reference.
+Close `fm-2af58f17-1ac9-41ed-a610-593deed18088` completed; terminalny run
+completed i stabilny epoch
+`session-18de1ab5d3b4c1580002137c@1791899069983:tombstone:1791899165910`.
+Start sesji oraz owner scope zachowane; finish pochodzi z manifestu,
+nie z zegara verifiera. P8-53BE CLOSED w zakresie pierwszej bramki FDM CPU.
+Pozostałe wymagania P8-53/P0–P8 i kwalifikacja naukowa nie są zaliczone.
+
+Aktualna kontrola produkcyjnych typów po pełnej generacji współdzielonego
+OpenAPI: FAILED, run `6b766df60ea6479eb7024d4e4c8fdfb0`, TS2345 w
+ProjectBatchesSection.tsx:121. caseStateLabel nie obsługuje nowego
+stanu materialized z równoległego batch API. Frozen frontend browser
+typecheck/lint pozostają PASS; nie przedstawiać bieżącego checkoutu
+jako całkowicie zielonego. W stagingu kontraktu tej poprawki wyłącznie
+dwa completed_step schema hunks, bez zmian compute/batch innych agentów.
+
+Po rzeczywistej równoległej poprawce caseStateLabel przez właściciela
+batch UI ponowiono production-source: PASS, exit 0, run
+`6e2734f7b88f4120b547547622744e00`. Poprawka batch UI nie jest częścią
+tego przyrostu; wcześniejszy FAILED zachowany jako dowód diagnozy.
