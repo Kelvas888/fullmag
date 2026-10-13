@@ -998,7 +998,9 @@ async function qualifyObjectMoveGestureAndSharedApply(page, inspector, fixture, 
   // The inner half overlaps the primitive, whose pointer handler stops propagation.
   // Hit the exposed outer shaft with native input, then drag from the captured handle.
   startWorld[0] += axisLength * 0.9;
-  endWorld[0] += axisLength * 1.15;
+  // Use a longer native drag so the readiness header cannot reduce the
+  // projected movement below the unchanged production 3 px threshold.
+  endWorld[0] += axisLength * 1.5;
   const startPoint = projectViewportWorldPoint(initialDiagnostics, startWorld);
   const endPoint = projectViewportWorldPoint(initialDiagnostics, endWorld);
   assertProjectedPointInCanvas(initialDiagnostics, startPoint, "X-axis drag start");

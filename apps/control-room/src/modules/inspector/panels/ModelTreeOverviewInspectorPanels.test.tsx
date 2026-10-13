@@ -76,7 +76,7 @@ describe("UniverseRootInspectorPanel", () => {
 
     const html = renderToStaticMarkup(<UniverseRootInspectorPanel selection={selection} />);
 
-    expect(html).toContain("FDM policy editor");
+    expect(html).toContain("fdm policy editor");
     expect(html).toContain("Open FDM grid settings");
     expect(html).not.toContain("FEM Airbox setup");
     expect(testState.panelLanes).toEqual([{ lane: "fdm", runtimeLane: null }]);

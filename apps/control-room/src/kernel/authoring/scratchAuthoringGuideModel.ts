@@ -71,6 +71,8 @@ function objectIdFromTargetResource(
   if (!match) return null;
   try {
     const objectId = decodeURIComponent(match[1]);
+    // This existing route is the general interactions destination, not an object ID.
+    if (objectId === "interactions") return null;
     return objectId.length > 0 ? objectId : null;
   } catch {
     return null;

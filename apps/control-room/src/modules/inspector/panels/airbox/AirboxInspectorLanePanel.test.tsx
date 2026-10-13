@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const testState = vi.hoisted(() => ({
   calls: [] as boolean[],
@@ -102,7 +102,7 @@ const parameterPanelLanes = vi.hoisted(() => ({ values: [] as Array<{ lane: stri
 vi.mock("./AirboxMeshParametersPanel", () => ({
   AirboxMeshParametersPanel: ({ lane = "fem", runtimeLane = null }: { lane?: string; runtimeLane?: string | null }) => {
     parameterPanelLanes.values.push({ lane, runtimeLane });
-    return <div>{lane === "fdm" ? "FDM Airbox parameters" : "FEM Airbox child"}</div>;
+    return <div>{lane} policy editor</div>;
   },
 }));
 vi.mock("./AirboxMeshQualityGatesPanel", () => ({ AirboxMeshQualityGatesPanel: () => <div>FEM Airbox child</div> }));
@@ -153,6 +153,14 @@ const staleAirboxSelection = {
 } satisfies Selection;
 
 describe("AirboxInspectorLanePanel", () => {
+  beforeEach(() => {
+    testState.calls.length = 0;
+    parameterPanelLanes.values.length = 0;
+    testState.discretization = "fdm";
+    testState.authoringMethod = null;
+    testState.resolvedDiscretization = null;
+  });
+
   it.each([
     AirboxOverviewLanePanel,
     AirboxMeshParametersLanePanel,
@@ -219,7 +227,7 @@ describe("AirboxInspectorLanePanel", () => {
     expect(testState.calls).toEqual([false, false]);
     expect(html).not.toContain("Airbox · FDM structured universe");
     expect(html).not.toContain("FEM Airbox child");
-    expect(html).toContain("The model method is unavailable.");
+    expect(html).toContain("The accepted model method has not been published.");
     expect(html).not.toContain("runtime lane conflict");
   });
 
@@ -276,7 +284,7 @@ describe("AirboxInspectorLanePanel", () => {
     );
 
     expect(parameterPanelLanes.values).toEqual([{ lane: "fdm", runtimeLane: "fdm" }]);
-    expect(html).toContain("FDM Airbox parameters");
+    expect(html).toContain("fdm policy editor");
     expect(html).not.toContain("Airbox · FDM structured universe");
   });
 

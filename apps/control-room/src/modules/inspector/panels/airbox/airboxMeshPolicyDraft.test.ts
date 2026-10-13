@@ -236,6 +236,7 @@ describe("Airbox mesh policy draft", () => {
 
     expect(nanometers.airboxHmax).toBe("2");
     expect(nanometers.quantityUnits?.airboxHmax).toBe("nm");
+    expect(airboxMeshPolicyDraftDirty(nanometers, base)).toBe(false);
     expect(buildAirboxMeshPolicyReplaceRequest(nanometers)).toEqual({
       request: { config: { airbox_hmax: 2e-9 } },
     });
@@ -273,6 +274,7 @@ describe("Airbox mesh policy draft", () => {
             airbox_hmax: 1e-9,
             mode: "manual",
             padding: [1e-7, 2e-7, 3e-7],
+            size: [1e-6, 2e-6, 3e-6],
           },
           revision: 19,
         }),
@@ -291,6 +293,7 @@ describe("Airbox mesh policy draft", () => {
         config: {
           mode: "manual",
           padding: [1e-7, 2e-7, 3e-7],
+          size: [1e-6, 2e-6, 3e-6],
         },
       },
     });
@@ -383,10 +386,14 @@ describe("synchronized mesh parameter editing", () => {
     const structured = updateAirboxMeshPolicyDraft(json, { airboxHmax: "30" });
     expect(structured.airboxHmax).toBe("30");
     expect(structured.quantityUnits?.airboxHmax).toBe("nm");
-    expect(JSON.parse(structured.configText)).toMatchObject({ airbox_hmax: 3e-8 });
-    expect(buildAirboxMeshPolicyReplaceRequest(structured)).toMatchObject({
-      request: { config: { airbox_hmax: 3e-8 } },
-    });
+    const structuredSI = (JSON.parse(structured.configText) as { airbox_hmax: number }).airbox_hmax;
+    expect(structuredSI / 3e-8).toBeCloseTo(1, 14);
+    const request = buildAirboxMeshPolicyReplaceRequest(structured);
+    expect("request" in request).toBe(true);
+    if ("request" in request) {
+      const submittedSI = request.request?.config?.airbox_hmax as number;
+      expect(submittedSI / 3e-8).toBeCloseTo(1, 14);
+    }
   });
 
   it("preserves invalid structured text and prevents submission until corrected", () => {

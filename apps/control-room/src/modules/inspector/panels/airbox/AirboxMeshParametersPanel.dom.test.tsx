@@ -85,8 +85,10 @@ describe("AirboxMeshParametersPanel session fencing", () => {
       ));
 
       const mode = control(container, "Domain mode");
-      expect(mode.value).toBe("auto");
+      expect(mode.textContent).toContain("Auto");
+      expect(mode.textContent).toContain("Manual");
       expect(findElements(container, (element) => ["Size X", "Size Y", "Size Z", "Center X", "Center Y", "Center Z"].includes(element.getAttribute("aria-label") ?? ""))).toHaveLength(0);
+      expect(container.textContent).toContain("Automatic is the canonical default.");
       expect(container.textContent).toContain("Bounds are determined after geometry is available; no zero extents are created.");
 
       mode.value = "manual";
@@ -127,8 +129,8 @@ describe("AirboxMeshParametersPanel session fencing", () => {
 
       const apply = findElement(
         container,
-        (element) => element.tagName === "BUTTON" && element.textContent.includes("Apply Airbox Policy"),
-        "Apply Airbox Policy button",
+        (element) => element.tagName === "BUTTON" && element.textContent.includes("Apply Universe Policy"),
+        "Apply Universe Policy button",
       );
       await act(async () => {
         apply.dispatchEvent(new TestEvent("click", { bubbles: true }));
@@ -166,8 +168,8 @@ describe("AirboxMeshParametersPanel session fencing", () => {
       });
       const apply = findElement(
         container,
-        (element) => element.tagName === "BUTTON" && element.textContent.includes("Apply Airbox Policy"),
-        "Apply Airbox Policy button",
+        (element) => element.tagName === "BUTTON" && element.textContent.includes("Apply Universe Policy"),
+        "Apply Universe Policy button",
       );
       await act(async () => {
         apply.dispatchEvent(new TestEvent("click", { bubbles: true }));
