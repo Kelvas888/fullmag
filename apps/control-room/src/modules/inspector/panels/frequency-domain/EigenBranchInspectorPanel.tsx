@@ -222,6 +222,71 @@ export function buildEigenBranchModePlotHandoff(
   };
 }
 
+function buildEigenBranchModeOpenSelectionRef(
+  branchId: string,
+  point: EigenBranchPoint,
+  resourceStatus: string,
+  artifact: FrequencyDomainJsonArtifactResource | null | undefined,
+  manifestStatus: string,
+  manifestOwner: EigenBranchResultManifestOwner | null,
+): Extract<SelectionRef, { type: "frequency-domain" }> | null {
+  const sessionId = artifact?.session_id;
+  const artifactSetId = artifact?.artifact_set_id;
+  const runId = artifact?.run_id;
+  const stageId = artifact?.stage_id;
+  const artifactRevision = artifact?.revision;
+  const artifactPath = artifact?.artifact_path;
+  const manifestContext = manifestOwner?.resultContext;
+  const equilibriumId = manifestContext?.equilibriumId;
+  const kContextKind = manifestContext?.classification?.kContext.kind;
+  if (
+    !isNonEmptyString(branchId) ||
+    !hasReadyOrRetainedSnapshot(resourceStatus) ||
+    artifact?.status !== "ready" ||
+    !hasReadyOrRetainedSnapshot(manifestStatus) ||
+    !isNonEmptyString(sessionId) ||
+    !isNonEmptyString(artifactSetId) ||
+    !isNonEmptyString(runId) ||
+    !isNonEmptyString(stageId) ||
+    !isNonEmptyString(artifactRevision) ||
+    !isNonEmptyString(artifactPath) ||
+    !manifestOwner ||
+    !manifestContext ||
+    manifestOwner.sessionId !== sessionId ||
+    manifestOwner.artifactSetId !== artifactSetId ||
+    manifestOwner.runId !== runId ||
+    manifestOwner.stageId !== stageId ||
+    manifestContext.runId !== runId ||
+    manifestContext.stageId !== stageId ||
+    manifestContext.studyProduct !== "modal_eigen" ||
+    !isNonEmptyString(equilibriumId) ||
+    !kContextKind ||
+    !isNonNegativeInteger(point.sampleIndex) ||
+    !isNonNegativeInteger(point.rawModeIndex) ||
+    !Number.isFinite(point.frequencyRealHz)
+  ) {
+    return null;
+  }
+
+  const selectionRef = buildEigenBranchPointModeSelectionRef(
+    branchId,
+    point,
+    {
+      analysisRunId: runId,
+      analysisStageId: stageId,
+      artifactPath,
+      artifactRevision,
+      equilibriumId,
+      kContextKind,
+      normalization: manifestContext.normalization,
+      representation: EIGEN_MODE_FIELD_REPRESENTATION,
+      resourceRef: point.modeFieldResourceKey ?? undefined,
+      studyProduct: manifestContext.studyProduct,
+    },
+  );
+  return selectionRef.type === "frequency-domain" ? selectionRef : null;
+}
+
 export function buildEigenBranchPointViewModel(
   branchId: string,
   point: EigenBranchPoint,
@@ -366,11 +431,10 @@ function BranchSampleTable({
       left.sampleIndex - right.sampleIndex ||
       left.rawModeIndex - right.rawModeIndex,
   );
-  const openMode = (point: EigenBranchPoint): void => {
-    const modeRef = buildEigenBranchPointModeSelectionRef(
-      branch.branchId,
-      point,
-    );
+  const openMode = (
+    point: EigenBranchPoint,
+    modeRef: Extract<SelectionRef, { type: "frequency-domain" }>,
+  ): void => {
     kernel.selection.set(
       {
         kind: modeRef.kind,
@@ -441,6 +505,16 @@ function BranchSampleTable({
               manifestStatus,
               manifestOwner,
             );
+            const openModeRef =
+              handoff?.selectionRef ??
+              buildEigenBranchModeOpenSelectionRef(
+                branch.branchId,
+                point,
+                resourceStatus,
+                artifact,
+                manifestStatus,
+                manifestOwner,
+              );
             const rowKey = `${point.sampleIndex}:${point.rawModeIndex}`;
             return (
               <tr
@@ -458,11 +532,18 @@ function BranchSampleTable({
                   <Button
                     aria-label={`Open sample ${point.sampleIndex} mode ${point.rawModeIndex}`}
                     className="fm-inspector-action-button"
+                    disabled={!openModeRef}
                     size="sm"
-                    title={`Open sample ${point.sampleIndex} mode ${point.rawModeIndex}`}
+                    title={
+                      openModeRef
+                        ? `Open sample ${point.sampleIndex} mode ${point.rawModeIndex}`
+                        : "Current eigen-mode result owner identity is unavailable"
+                    }
                     type="button"
                     variant="secondary"
-                    onClick={() => openMode(point)}
+                    onClick={() => {
+                      if (openModeRef) openMode(point, openModeRef);
+                    }}
                   >
                     <Eye aria-hidden="true" size={13} />
                     <span>Open mode</span>

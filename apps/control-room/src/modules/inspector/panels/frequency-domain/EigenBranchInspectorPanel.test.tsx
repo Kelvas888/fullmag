@@ -1,13 +1,54 @@
-import { describe, expect, it } from "vitest";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ANALYSIS_FREQUENCY_DOMAIN_EIGEN_BRANCHES_V2_PATH,
   ANALYSIS_FREQUENCY_DOMAIN_MANIFEST_V1_PATH,
 } from "@/kernel/api/apiPaths";
 import type { FrequencyDomainJsonArtifactResource } from "@/kernel/api/apiTypes";
+import {
+  installSimulationPreparationTestDom,
+  TestElement,
+  TestNode,
+} from "@/kernel/layout/simulationPreparationTestDom.test-support";
 import type { EigenBranchPoint } from "@/shared/domain/analysis/frequencyDomainChartModels";
 
+const panelMocks = vi.hoisted(() => ({
+  branchArtifact: null as unknown,
+  branchStatus: "ready" as string,
+  executeCommand: vi.fn(),
+  manifest: null as unknown,
+  manifestStatus: "ready" as string,
+  setSelection: vi.fn(),
+}));
+
+vi.mock("@/kernel/KernelContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/kernel/KernelContext")>()),
+  useKernel: () => ({
+    commands: { execute: panelMocks.executeCommand },
+    selection: { set: panelMocks.setSelection },
+  }),
+}));
+
+vi.mock("@/kernel/resources/studyRuntimeResources", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/kernel/resources/studyRuntimeResources")>()),
+  useFrequencyDomainManifestResource: () => ({
+    data: panelMocks.manifest as never,
+    status: panelMocks.manifestStatus as never,
+  }),
+  useFrequencyDomainEigenBranchesResource: () => ({
+    data: panelMocks.branchArtifact as never,
+    status: panelMocks.branchStatus as never,
+  }),
+  useFrequencyDomainEigenDispersionResource: () => ({
+    data: null,
+    status: "idle",
+  }),
+}));
+
 import {
+  EigenBranchInspectorPanel,
   buildEigenBranchResultManifestOwner,
   buildEigenBranchModePlotHandoff,
   buildEigenBranchPointViewModel,
@@ -354,3 +395,221 @@ describe("EigenBranchInspectorPanel point model", () => {
     ).toBeNull();
   });
 });
+
+afterEach(() => {
+  panelMocks.branchArtifact = null;
+  panelMocks.branchStatus = "ready";
+  panelMocks.manifest = null;
+  panelMocks.manifestStatus = "ready";
+  panelMocks.executeCommand.mockClear();
+  panelMocks.setSelection.mockClear();
+});
+
+describe("EigenBranchInspectorPanel open mode owner binding", () => {
+  it("opens a row with the exact ready artifact owner", async () => {
+    configurePanelResources();
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () =>
+        root.render(
+          <EigenBranchInspectorPanel selection={branchInspectorSelection()} />,
+        ),
+      );
+
+      await act(async () =>
+        findButton(container, "Open sample 1 mode 1").click(),
+      );
+
+      expect(panelMocks.setSelection).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "results.eigen.mode",
+          nodeId: expect.any(String),
+          ref: expect.objectContaining({
+            analysisRunId: "run-7",
+            analysisStageId: "eigen-stage-7",
+            artifactPath: "eigen/branches.v2.json",
+            artifactRevision: "sha256:branches-revision-7",
+            branchId: "acoustic",
+            equilibriumId: "equilibrium-7",
+            fieldId: "analysis:eigen:sample-0001:mode-0001",
+            modeIndex: 1,
+            sampleIndex: 1,
+            studyProduct: "modal_eigen",
+            type: "frequency-domain",
+          }),
+        }),
+        "inspector",
+      );
+      expect(panelMocks.executeCommand).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("keeps metadata selection available when the mode field is absent", async () => {
+    configurePanelResources({ modeFieldAvailable: false });
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () =>
+        root.render(
+          <EigenBranchInspectorPanel selection={branchInspectorSelection()} />,
+        ),
+      );
+
+      const openButton = findButton(container, "Open sample 1 mode 1");
+      expect(openButton.disabled).toBe(false);
+      await act(async () => openButton.click());
+
+      expect(panelMocks.setSelection).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ref: expect.objectContaining({
+            analysisRunId: "run-7",
+            analysisStageId: "eigen-stage-7",
+            artifactPath: "eigen/branches.v2.json",
+            artifactRevision: "sha256:branches-revision-7",
+            modeIndex: 1,
+            sampleIndex: 1,
+            type: "frequency-domain",
+          }),
+        }),
+        "inspector",
+      );
+      const selection = panelMocks.setSelection.mock.calls[0]?.[0];
+      expect(selection?.ref).not.toHaveProperty("fieldId");
+      expect(selection?.ref).not.toHaveProperty("resourceRef");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it.each([
+    ["resource is still loading", { branchStatus: "loading" }, {}],
+    ["artifact belongs to another run", {}, { runId: "other-run" }],
+  ] as const)(
+    "does not open a row when its owner is not ready or mismatched: %s",
+    async (_label, resourceOptions, artifactOptions) => {
+      configurePanelResources({ ...resourceOptions, ...artifactOptions });
+      const dom = installSimulationPreparationTestDom();
+      const container = dom.document.createElement("div");
+      const root = createRoot(container as unknown as Element);
+      try {
+        await act(async () =>
+          root.render(
+            <EigenBranchInspectorPanel selection={branchInspectorSelection()} />,
+          ),
+        );
+
+        const openButton = findButton(container, "Open sample 1 mode 1");
+        expect(openButton.disabled).toBe(true);
+        await act(async () => openButton.click());
+        expect(panelMocks.setSelection).not.toHaveBeenCalled();
+      } finally {
+        await act(async () => root.unmount());
+        dom.restore();
+      }
+    },
+  );
+});
+
+function configurePanelResources(options: {
+  branchStatus?: string;
+  modeFieldAvailable?: boolean;
+  runId?: string;
+} = {}): void {
+  panelMocks.manifest = modalManifestResource();
+  panelMocks.manifestStatus = "ready";
+  panelMocks.branchStatus = options.branchStatus ?? "ready";
+  panelMocks.branchArtifact = {
+    artifact_path: "eigen/branches.v2.json",
+    artifact_set_id: "sha256:artifact-set-7",
+    content_digest: "sha256:branches-bytes-7",
+    mesh_generation_id: "mesh-7",
+    payload: {
+      branches: [
+        {
+          branch_id: "acoustic",
+          points: [
+            {
+              frequency_imag_hz: -14e6,
+              frequency_real_hz: 13.1e9,
+              mode_field_available: options.modeFieldAvailable ?? true,
+              ...(options.modeFieldAvailable === false
+                ? {}
+                : {
+                    mode_field_id: "analysis:eigen:sample-0001:mode-0001",
+                    mode_field_resource_key:
+                      "data/fields/analysis%3Aeigen%3Asample-0001%3Amode-0001?view=phase_rotated_real&phase_rad=0",
+                  }),
+              mode_id: "mode-0001",
+              overlap_prev: 0.97,
+              path_s_rad_per_m: 1.25e7,
+              raw_mode_index: 1,
+              residual_norm: 2e-8,
+              sample_id: "sample-0001",
+              sample_index: 1,
+              tracking_confidence: 0.98,
+              wavevector_kf: [1.25e7, 0, 0],
+            },
+          ],
+        },
+      ],
+    },
+    resource_key: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_BRANCHES_V2_PATH,
+    revision: "sha256:branches-revision-7",
+    run_id: options.runId ?? "run-7",
+    schema_version: "frequency_domain_eigen_branches.v2",
+    session_id: "session-7",
+    stage_id: "eigen-stage-7",
+    status: "ready",
+  } as unknown as FrequencyDomainJsonArtifactResource;
+}
+
+function branchInspectorSelection(): Parameters<
+  typeof EigenBranchInspectorPanel
+>[0]["selection"] {
+  const nodeId = "results:eigen:branch:acoustic";
+  return {
+    kind: "results.eigen.branch",
+    label: "Acoustic branch",
+    moduleSource: "frequency-domain",
+    nodeId,
+    objectId: null,
+    ref: {
+      branchId: "acoustic",
+      kind: "results.eigen.branch",
+      nodeId,
+      type: "frequency-domain",
+    },
+  } as Parameters<typeof EigenBranchInspectorPanel>[0]["selection"];
+}
+
+function findButton(root: TestNode, text: string): TestElement {
+  const button = findElements(
+    root,
+    (element) =>
+      element.tagName === "BUTTON" &&
+      (element.getAttribute("aria-label") === text ||
+        element.textContent.includes(text)),
+  )[0];
+  if (!button) throw new Error(`Missing button ${text}`);
+  return button;
+}
+
+function findElements(
+  root: TestNode,
+  predicate: (element: TestElement) => boolean,
+): TestElement[] {
+  const found: TestElement[] = [];
+  const visit = (node: TestNode) => {
+    if (node instanceof TestElement && predicate(node)) found.push(node);
+    node.childNodes.forEach(visit);
+  };
+  visit(root);
+  return found;
+}
