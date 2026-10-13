@@ -732,6 +732,203 @@ def _verify_compile_gates(
     return results
 
 
+def _parse_ctest_failure_log(test_log: str, *, tests: list[dict[str, Any]]) -> dict[str, Any]:
+    expected_names = [test["name"] for test in tests]
+    summary_pattern = re.compile(
+        r"(?m)^[ \t]*(\d+)%[ \t]+tests passed,[ \t]+(\d+)[ \t]+tests failed out of[ \t]+(\d+)[ \t]*$"
+    )
+    summaries = list(summary_pattern.finditer(test_log))
+    result_rows: list[dict[str, Any]] = []
+    result_pattern_by_name = {
+        name: re.compile(
+            rf"(?m)^[ \t]*(\d+)/(\d+)[ \t]+Test[ \t]+#(\d+):[ \t]+{re.escape(name)}"
+            rf"[ \t]+.*?(?:\*{{3}})?(Passed|Failed|Not Run|Skipped|Timeout|Exception)\b"
+        )
+        for name in expected_names
+    }
+    for name, pattern in result_pattern_by_name.items():
+        for match in pattern.finditer(test_log):
+            result_rows.append(
+                {
+                    "ordinal": int(match.group(1)),
+                    "reported_total": int(match.group(2)),
+                    "ctest_id": int(match.group(3)),
+                    "name": name,
+                    "status": match.group(4).lower().replace(" ", "_"),
+                }
+            )
+    result_rows.sort(key=lambda row: (row["ordinal"], row["name"]))
+
+    starts = [
+        name
+        for name in expected_names
+        if re.search(
+            rf"(?m)^[ \t]*Start[ \t]+\d+:[ \t]+{re.escape(name)}[ \t]*$",
+            test_log,
+        )
+    ]
+    summary = None
+    if summaries:
+        match = summaries[-1]
+        summary = {
+            "reported_pass_percent": int(match.group(1)),
+            "reported_failed_count": int(match.group(2)),
+            "reported_total_count": int(match.group(3)),
+        }
+
+    counts = {
+        "completed_test_count": len(result_rows),
+        "passed_count": sum(row["status"] == "passed" for row in result_rows),
+        "failed_count": sum(row["status"] == "failed" for row in result_rows),
+        "not_run_count": sum(row["status"] == "not_run" for row in result_rows),
+        "skipped_count": sum(row["status"] == "skipped" for row in result_rows),
+        "timeout_count": sum(row["status"] == "timeout" for row in result_rows),
+        "exception_count": sum(row["status"] == "exception" for row in result_rows),
+    }
+    ctest_activity_observed = bool(
+        summaries
+        or result_rows
+        or starts
+        or re.search(r"(?m)^[ \t]*Test project[ \t]+", test_log)
+    )
+    observation_status = "unavailable"
+    observation_error = None
+    if ctest_activity_observed:
+        observation_status = "partial"
+    if summaries:
+        observed_names = [row["name"] for row in result_rows]
+        observed_ordinals = [row["ordinal"] for row in result_rows]
+        observed_ctest_ids = [row["ctest_id"] for row in result_rows]
+        reported_failed_from_rows = (
+            counts["failed_count"]
+            + counts["not_run_count"]
+            + counts["timeout_count"]
+            + counts["exception_count"]
+        )
+        rows_match_summary = all(
+            row["reported_total"] == summary["reported_total_count"] for row in result_rows
+        )
+        if len(summaries) > 1:
+            observation_status = "inconsistent"
+            observation_error = "Multiple CTest terminal summaries were found in one log"
+        elif summary["reported_total_count"] != len(expected_names):
+            observation_status = "inconsistent"
+            observation_error = "CTest terminal summary count differs from the selected contract profile"
+        elif len(set(observed_ordinals)) != len(observed_ordinals):
+            observation_status = "inconsistent"
+            observation_error = "CTest per-test terminal rows contain duplicate ordinals"
+        elif len(set(observed_ctest_ids)) != len(observed_ctest_ids):
+            observation_status = "inconsistent"
+            observation_error = "CTest per-test terminal rows contain duplicate test IDs"
+        elif len(set(observed_names)) != len(observed_names):
+            observation_status = "inconsistent"
+            observation_error = "CTest per-test terminal rows are duplicated"
+        elif len(observed_names) != len(expected_names) or set(observed_names) != set(expected_names):
+            observation_status = "partial"
+        elif set(observed_ordinals) != set(range(1, summary["reported_total_count"] + 1)):
+            observation_status = "inconsistent"
+            observation_error = "CTest per-test terminal rows do not cover each ordinal exactly once"
+        elif not rows_match_summary:
+            observation_status = "inconsistent"
+            observation_error = "CTest per-test terminal rows disagree with the summary total"
+        elif reported_failed_from_rows != summary["reported_failed_count"]:
+            observation_status = "inconsistent"
+            observation_error = "CTest per-test outcomes disagree with the terminal failure count"
+        else:
+            observation_status = "terminal_observation_complete"
+
+    return {
+        "status": observation_status,
+        "activity_observed": ctest_activity_observed,
+        "start_markers_observed": starts,
+        "terminal_summary": summary,
+        "test_results": result_rows if ctest_activity_observed else None,
+        "observed_counts": counts if ctest_activity_observed else None,
+        "observation_error": observation_error,
+        "qualification_claimed": False,
+    }
+
+
+def _record_failure_observation(
+    receipt: dict[str, Any],
+    *,
+    profile: dict[str, Any],
+    compile_commands: Path,
+    ctest_log: Path,
+    execution_status: str,
+) -> None:
+    observation_errors = receipt.setdefault("observation_errors", [])
+    observation: dict[str, Any] = {
+        "primary_error": receipt.get("error"),
+        "qualification_claimed": False,
+        "execution": {
+            "status": execution_status,
+            "scope": "CMake configure/build plus the selected CTest command in one Docker process",
+            "qualification_claimed": False,
+        },
+        "compile_commands": {
+            "status": "unavailable",
+            "path": compile_commands.name,
+            "reason": "compile_commands.json is absent after the failure",
+            "compile_gates": None,
+            "all_required_gates_passed": None,
+            "scope": "Command-line definitions only; this does not prove compilation completed",
+        },
+        "ctest": {
+            "status": "unavailable",
+            "path": ctest_log.name,
+            "reason": "CTest log is absent after the failure",
+            "activity_observed": False,
+            "start_markers_observed": [],
+            "terminal_summary": None,
+            "test_results": None,
+            "observed_counts": None,
+            "qualification_claimed": False,
+        },
+    }
+    receipt["failure_observation"] = observation
+
+    try:
+        if compile_commands.is_file():
+            gates = _verify_compile_gates(compile_commands, tests=profile["tests"])
+            observation["compile_commands"].update(
+                status="observed",
+                reason=None,
+                compile_gates=gates,
+                all_required_gates_passed=all(gates.values()),
+            )
+    except Exception as error:
+        observation["compile_commands"]["status"] = "observation_error"
+        observation["compile_commands"]["reason"] = "compile command gates could not be observed"
+        observation_errors.append(
+            f"compile_commands: {type(error).__name__}: {error}"
+        )
+
+    try:
+        if ctest_log.is_file():
+            test_log = ctest_log.read_text(encoding="utf-8", errors="replace")
+            parsed = _parse_ctest_failure_log(test_log, tests=profile["tests"])
+            if not parsed["activity_observed"]:
+                parsed["reason"] = "No CTest start, terminal test row, or summary was observed"
+            elif parsed["status"] == "partial":
+                parsed["reason"] = (
+                    "CTest terminal summary exists, but named terminal test outcomes are incomplete"
+                    if parsed["terminal_summary"] is not None
+                    else "CTest activity exists, but no terminal summary was observed"
+                )
+            elif parsed["status"] == "inconsistent":
+                parsed["reason"] = parsed["observation_error"]
+            else:
+                parsed["reason"] = None
+            observation["ctest"].update(parsed)
+            if parsed["observation_error"]:
+                observation_errors.append(f"ctest_log: {parsed['observation_error']}")
+    except Exception as error:
+        observation["ctest"]["status"] = "observation_error"
+        observation["ctest"]["reason"] = "CTest log could not be read or parsed"
+        observation_errors.append(f"ctest_log: {type(error).__name__}: {error}")
+
+
 def _disk_observation(
     *,
     stage: str,
@@ -821,11 +1018,16 @@ def _execute_contract(args: Any) -> int:
             "compile_gates_observed": {},
         },
         "disk_observations": [],
+        "observation_errors": [],
+        "failure_observation": None,
     }
     _write_json(receipt_path, receipt)
 
     status = "failed"
     failure: str | None = None
+    native_execution_status = "not_started"
+    native_build_dir = build_dir / "native"
+    ctest_log_path = run_dir / "native-build-and-ctest.log"
     try:
         env = os.environ.copy()
         global _ORCHESTRATION_DEADLINE
@@ -1142,7 +1344,6 @@ def _execute_contract(args: Any) -> int:
         storage_relative_temp = temp_dir.relative_to(storage_root).as_posix()
         container_build_dir = f"/fullmag-storage/{storage_relative_build}/native"
         container_temp_dir = f"/fullmag-storage/{storage_relative_temp}"
-        native_build_dir = build_dir / "native"
         slepc_enabled = "ON" if profile["uses_slepc"] else "OFF"
         cmake_flags = [
             "-DCMAKE_BUILD_TYPE=Release",
@@ -1229,13 +1430,26 @@ def _execute_contract(args: Any) -> int:
         for name, value in container_environment:
             docker_run_command.extend(["--env", f"{name}={value}"])
         docker_run_command.extend([image_tag, "bash", "-lc", inner_script])
-        _run_logged(
-            docker_run_command,
-            cwd=REPO_ROOT,
-            env=env,
-            log_path=run_dir / "native-build-and-ctest.log",
-            timeout_seconds=timeouts["native_build_test_seconds"],
-        )
+        native_execution_status = "running"
+        try:
+            _run_logged(
+                docker_run_command,
+                cwd=REPO_ROOT,
+                env=env,
+                log_path=ctest_log_path,
+                timeout_seconds=timeouts["native_build_test_seconds"],
+            )
+        except CommandTimeout:
+            native_execution_status = "timed_out_or_not_started"
+            raise
+        except ContractRunError:
+            native_execution_status = "returned_nonzero"
+            raise
+        except Exception:
+            native_execution_status = "execution_error"
+            raise
+        else:
+            native_execution_status = "returned_zero"
         receipt["disk_observations"].append(
             _disk_observation(stage="after_native_build_and_ctest", storage_root=storage_root, env=env)
         )
@@ -1255,9 +1469,7 @@ def _execute_contract(args: Any) -> int:
         )
         if not all(compile_gates.values()):
             raise ContractRunError("Contract test source lacks required CPU MFEM/SLEPc compile definitions")
-        test_log = (run_dir / "native-build-and-ctest.log").read_text(
-            encoding="utf-8", errors="replace"
-        )
+        test_log = ctest_log_path.read_text(encoding="utf-8", errors="replace")
         missing_markers = [
             test["marker"]
             for test in profile["tests"]
@@ -1313,6 +1525,45 @@ def _execute_contract(args: Any) -> int:
                 "command": error.command,
                 "timeout_seconds": error.timeout_seconds,
                 "log_path": str(error.log_path) if error.log_path else None,
+            }
+        try:
+            _record_failure_observation(
+                receipt,
+                profile=profile,
+                compile_commands=native_build_dir / "compile_commands.json",
+                ctest_log=ctest_log_path,
+                execution_status=native_execution_status,
+            )
+        except Exception as observation_error:
+            receipt.setdefault("observation_errors", []).append(
+                f"failure_observation: {type(observation_error).__name__}: {observation_error}"
+            )
+            receipt["failure_observation"] = {
+                "primary_error": failure,
+                "qualification_claimed": False,
+                "execution": {
+                    "status": native_execution_status,
+                    "qualification_claimed": False,
+                },
+                "compile_commands": {
+                    "status": "observation_error",
+                    "path": (native_build_dir / "compile_commands.json").name,
+                    "reason": "failure observation could not inspect the compile database",
+                    "compile_gates": None,
+                    "all_required_gates_passed": None,
+                },
+                "ctest": {
+                    "status": "observation_error",
+                    "path": ctest_log_path.name,
+                    "reason": "failure observation could not inspect the CTest log",
+                    "activity_observed": None,
+                    "start_markers_observed": None,
+                    "terminal_summary": None,
+                    "test_results": None,
+                    "observed_counts": None,
+                    "qualification_claimed": False,
+                },
+                "qualification_claimed": False,
             }
         print(f"[{profile['slug']}] {failure}", file=sys.stderr, flush=True)
     finally:

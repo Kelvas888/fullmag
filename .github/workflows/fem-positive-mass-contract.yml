@@ -56,6 +56,9 @@ jobs:
       - name: Verify C04 snapshot parser contracts before dependency build
         run: python3 -m unittest discover -s scripts/ci -p "test_parse_floquet_factor_matrix_snapshots.py" -v
 
+      - name: Verify native failure receipt observations before dependency build
+        run: python3 -B -m unittest discover -s scripts/ci -p "test_fem_contract_failure_receipt.py" -v
+
       - name: Build pinned CPU MFEM image and run the selected source contract
         id: contract
         run: python3 scripts/ci/run_fem_positive_mass_contract.py --contract-profile "${{ inputs.contract_profile || 'positive-mass' }}"
