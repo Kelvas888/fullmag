@@ -73,3 +73,20 @@ Bieżący etap nie zamyka całego R0/R1; audyt pozostaje w dokumentacji PR150.
   zwalniania przed staging i pointerup bez HTTP. Lokalnie nie uruchomiono.
 - Scope review viewportu: jedna P1 poprawiona; wykonanie i browser/WebGL
   NOT VERIFIED. Następny dowód musi użyć produkcyjnego canvas/ścieżki Apply.
+
+## Checkpoint — recovery komend mesh
+
+- Gesty zapisane w f0ec935e94e01c191cfaa23b8d27efcbadecd28a.
+- Oddzielny fragment PR11 usuwa limit ośmiu kandydatów w
+  reconcileMeshSubmission. Zachowuje filtrowanie rodzaju komendy, kolejność
+  od najnowszych i zgodność command_id + client_intent_id oraz scope.
+- Regresje FDM/FEM umieszczają właściwą zaakceptowaną intencję za dwunastoma
+  nowszymi kandydatami. Sprawdzają brak drugiego submit, pominięcie obcego
+  rodzaju komendy i scope wszystkich detail reads.
+- Przypadek 50 niepasujących komend sprawdza wszystkie 50 i nadal pozostawia
+  pending; późniejszy offline pozostaje disconnected, bez duplicate POST.
+- Diff/API/architecture source checks PASS. Pierwsze wywołanie architecture
+  z rootu miało błędny cwd; poprawne wywołanie z apps/control-room przeszło.
+- Wykonanie regresji i rzeczywisty API recovery NOT VERIFIED. Usunięcie limitu
+  nie dowodzi lookup poza listą serwera ani reload portability; te kontrakty
+  pozostają do osobnego audytu backendu/receipts.

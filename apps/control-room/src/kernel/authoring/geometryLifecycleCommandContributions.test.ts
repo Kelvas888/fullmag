@@ -1495,7 +1495,53 @@ describe("geometry lifecycle command contributions", () => {
     expect(submit).toHaveBeenCalledOnce();
   });
 
-  it("bounds lost-ACK reconciliation and reports pending when the queue is unreachable", async () => {
+  it.each(["fem", "fdm"])("recovers the %s intent behind more than eight newer candidates without resubmission", async (lane) => {
+    const registry = registryWithLifecycleCommands();
+    let intentId: string | undefined;
+    const commandKind = lane === "fem" ? "mesh_build" : "fdm_grid_refresh";
+    const submit = vi.fn(async (request) => {
+      intentId = request.client_intent_id;
+      throw new Error("ACK lost after server acceptance");
+    });
+    const list = vi.fn().mockResolvedValueOnce({ commands: [] }).mockResolvedValue({
+      commands: [
+        { command_id: "accepted-old", kind: lane === "fem" ? "remesh" : commandKind, seq: 1 },
+        ...Array.from({ length: 12 }, (_, index) => ({ command_id: `newer-${index}`, kind: commandKind, seq: index + 2 })),
+        { command_id: "unrelated", kind: "run", seq: 100 },
+      ],
+    });
+    const detail = vi.fn(async (id: string, options?: { sessionScopeKey: string }) => {
+      void options;
+      return {
+        command_id: id,
+        client_intent_id: id === "accepted-old" ? intentId : "different-intent",
+        status: "completed",
+        seq: id === "accepted-old" ? 1 : 20,
+        resource_invalidations: [{ resource_key: "data/domain/topology", revision: 10 }],
+      };
+    });
+    const scope = `session=${lane}&epoch=1`;
+    const context: CommandContext = {
+      api: { commands: { submit, detail, list } } as never,
+      resourceData: sessionStatus(lane),
+      sessionScopeKey: scope,
+      isCurrentSessionScope: () => true,
+      source: "test",
+    };
+    const initial = lane === "fem"
+      ? await registry.execute("mesh.build-shared-domain", context)
+      : await runFdmGridRefreshOperation(context, { kind: "fdm_grid_refresh" });
+    expect(initial).toMatchObject({ status: "pending", observation: "publication-unconfirmed" });
+    expect(await resumeMeshBuildObservation(context)).toEqual({ commandId: "accepted-old", status: "completed" });
+    expect(submit).toHaveBeenCalledOnce();
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(detail).toHaveBeenCalledWith("accepted-old", { sessionScopeKey: scope });
+    expect(detail.mock.calls[0]).toEqual(["newer-11", { sessionScopeKey: scope }]);
+    expect(detail.mock.calls.some(([id]) => id === "unrelated")).toBe(false);
+    expect(detail.mock.calls.every(([, options]) => options?.sessionScopeKey === scope)).toBe(true);
+  });
+
+  it("examines all lost-ACK candidates and reports pending when the queue is unreachable", async () => {
     const registry = registryWithLifecycleCommands();
     const bus = new EventBus<KernelEventMap>();
     const observed = vi.fn();
@@ -1508,7 +1554,7 @@ describe("geometry lifecycle command contributions", () => {
     const context = { api: { commands: { submit, detail, list } } as never, bus,
       resourceData: sessionStatus("fem"), source: "test" as const };
     expect(await registry.execute("mesh.build-shared-domain", context)).toMatchObject({ status: "pending" });
-    expect(detail).toHaveBeenCalledTimes(8);
+    expect(detail).toHaveBeenCalledTimes(50);
     expect(await resumeMeshBuildObservation(context)).toMatchObject({
       status: "pending", observation: "disconnected",
     });
