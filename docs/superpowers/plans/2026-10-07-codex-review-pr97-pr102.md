@@ -2,11 +2,11 @@
 
 ## Zakres i stan
 
-Aktualizacja 11.10.2026: rejestr obejmuje 312 komentarzy liniowych Codex oraz 5 uwag w treści review w PR #97 (317 obserwacji). Świeży odczyt timeline GitHub wykrył 14 nowych komentarzy liniowych oraz body review ID5482578850; informacyjne podsumowania i powiadomienia o limitach nie są uwagami do kodu. PR #102 nie zawiera sugestii do kodu od Codex; komentarze o limitach i podsumowania nie są żądaniami implementacji.
+Aktualizacja 13.10.2026: świeży paginowany odczyt GitHub obejmuje 398 komentarzy liniowych Codex oraz 49 review PR #97. Rejestr wiąże wszystkie 398 komentarzy z canonical rozstrzygnięciem i osobno śledzi uwagi z treści review. Informacyjne podsumowania i powiadomienia o limitach nie są uwagami do kodu. Statusy wcześniejszych pozycji wymagające nowego dowodu są pozostawione otwarte, a nie automatycznie uznane za naprawione.
 
 PR #102 zamknięto 2026-10-07, zachowując remote branch `codex/launcher-instance-isolation-20261002` przy `954ba797307c4cc773772d380123893210cfa447`. PR #97 pozostaje otwarty do ukończenia rozpatrzenia i uzasadnionych poprawek. Merge ani usuwanie branchy nie są częścią polecenia zamknięcia PR-ów. Wcześniejszy WIP meshing zachowany osobno.
 
-Stan rejestru: `already_fixed`:31, `duplicate`:97, `implemented`:145, `implemented_pending_browser`:3, `implemented_pending_ci`:11, `not_actionable`:3, `pending`:11, `unsupported_recommendation`:3, `valid_unfixed`:13. Łącznie317 wpisów. Nowy odczyt obejmuje20 dalszych uwag (19 inline i1 body); pięć to powtórzenia, jedna sprzeczna z jawną zgodą użytkownika na GHA, jedna ma przygotowaną korektę, trzynaście wymagają weryfikacji. Zasadnych nienaprawionych i brakujących bramek nie uznaje się za zakończone.
+Stan canonical rejestru bieżącego snapshotu: `already_fixed`:31, `duplicate`:99, `duplicate_open`:5, `implemented`:169, `implemented_pending_browser`:15, `implemented_pending_ci`:9, `implemented_pending_ci_browser`:3, `implemented_pending_external_equivalence`:1, `implemented_pending_gpu_runtime`:1, `not_actionable`:3, `open_pending_source_review`:26, `pending`:28, `source_guarded_ci_verified`:1, `unsupported_recommendation`:3, `valid_unfixed`:12. Razem398 inline i8 action-bearing body review. Trzy historyczne wpisy inline spoza świeżego snapshotu zachowano oddzielnie (4060016735,4206086548,4206086557); nie wlicza się ich do398. Statusy opisują zakres dowodów, nie procent kwalifikacji solvera.
 
 Legenda: `pending` — nierozpatrzona; `valid_unfixed` — zasadna, nie naprawiona; `already_fixed` — poprawka potwierdzona aktualnym kodem; `duplicate` — powtórzenie; `unsupported_recommendation` — konkretna rekomendacja nie odpowiada kontraktowi; `implemented` — poprawka z potwierdzoną regresją CI; `implemented_pending_ci` — poprawka przygotowana, regresja oczekuje CI; `implemented_pending_browser` — pokrywające CI przeszło, nadal wymaga celowanego dowodu z przeglądarki; `not_actionable` — uwaga zastąpiona późniejszą jawną decyzją użytkownika.
 
@@ -3724,3 +3724,34 @@ Implementacja dodaje publiczny owner PREONLY/PCSHELL zachowujący STSINVERT i we
 Profil CI obejmuje 14 dotychczasowych przypadków i 3 nowe regresje: mixed recovery, wyczerpany budżet oraz dokładną granicę progu/zero RHS. Stan: SOURCE IMPLEMENTED, NATIVE VERIFICATION PENDING. Nie kwalifikuje managed sweep, COMSOL A1, browser ani GPU.
 
 G0: GHA38372200187 PASS, sześć regresji receiptów nieudanego wykonania; nie zmienia głównego błędu ani statusu kwalifikacji. C03 zachowuje fail-closed publication bez immutable history.
+
+
+## Pełna aktualizacja timeline — 13.10.2026
+
+GitHub: 398 komentarzy liniowych Codex, 49 review. Sześć nowych uwag inline oraz trzy nieuwzględnione uwagi w review body wymagają rozpatrzenia. Liczniki na początku dokumentu odnoszą się do canonical wpisów bieżącego snapshotu. Każdy nowy wpis pozostaje otwarty do źródeł i adekwatnego dowodu.
+
+| ID / PR | Plik | Rozstrzygnięcie | Uzasadnienie |
+|---|---|---|---|
+| [4252023512](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4252023512) / #97 | `crates/fullmag-runner/src/fem/eigen_k_pool.rs` | implemented_pending_ci | Source review PASS, commit3d8ed0d3594f54747abdb710113905d733015cde: terminal callback ukończonej puli nie zmienia wyniku; aktywne Stop/Pause zachowane. Dokładna regresja wybrana w GHA38379689033; wynik oczekiwany. |
+| [4252023519](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4252023519) / #97 | `crates/fullmag-plan/src/fem.rs` | implemented_pending_ci | Source review PASS, commit3d8ed0d3594f54747abdb710113905d733015cde: wszystkie selected pair IDs wymagają nodepair i finite translation; missing/NaN/Infinity/empty regressions. Dokładne filtry GHA38379689033; wynik oczekiwany. |
+| [4252023526](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4252023526) / #97 | `scripts/local_runner/container_main.py` | implemented | Commitff66d8d4c9a712f444f7928839b16fd1ae94dd85: GET plans wyłącznie list/read-only, POST preview zachowany; persisted metadata bez rawparts/reconcile, max100 summary. GHA38379405011 SUCCESS Windows+Ubuntu, routing/coordinator/restart regressions PASS. |
+| [4252023530](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4252023530) / #97 | `scripts/local_runner/container_main.py` | pending | Ogranicz lub stronicuj odpowiedź dużego planu retencji; source review/implementation w toku, bez nowego runtime dowodu. |
+| [4252023536](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4252023536) / #97 | `crates/fullmag-api/src/router_v2/handlers/data/fields.rs` | implemented_pending_browser | Commit74b32044f294f5b01cf66002d4f30cbdf36e3be2: coherent FMVP3/3 i5/5, rzeczywisteencoding cache/retainedfield/bufferkey; niezależny source review PASS. GHA38378840997 SUCCESS UI regressions/typecheck/architecture. Browser/WebGL nadal NOT VERIFIED. |
+| [4252023546](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4252023546) / #97 | `crates/fullmag-runner/src/eigen/k_process_pool.rs` | implemented_pending_ci | Commit4b1825543601872db3aae0249976ffe997353763: worker z manifestu tego samego managed bundle schema3, relative contained bin, exact API/worker SHA256, malformed managed declaration failclosed. GHA38379689033 z k_process_pool regressions oczekiwany. |
+| [5483870930](https://github.com/MateuszZelent/fullmag/pull/97#pullrequestreview-5483870930) / #97 | `crates/fullmag-api/src/router_v2/handlers/analysis/results.rs (body review)` | pending | Etap z właściciela artefaktu; sprawdzić aktualny kod i regresję, bez automatycznego uznania powtórzenia. |
+| [5489859861](https://github.com/MateuszZelent/fullmag/pull/97#pullrequestreview-5489859861) / #97 | `crates/fullmag-api/src/router_v2/handlers/analysis/results.rs (body review)` | implemented_pending_ci | Commit587c19aacc1372c7d1e3bd838bafcd5e3d5c6810: legalne v1 jako fallback gdy v2 absent, exact source_artifact provenance, malformed preferred v2 failclosed. Rozszerzony actual-router integration; GHA38381330970 oczekiwany. |
+| [5495613047](https://github.com/MateuszZelent/fullmag/pull/97#pullrequestreview-5495613047) / #97 | `apps/control-room/src/modules/inspector/panels/frequency-domain/EigenBranchInspectorPanel.tsx (body review)` | implemented_pending_browser | Commit3ce2429c08b3b27184c22435f3e5935234aa7755: Open używa ready handoff.selectionRef; metadata bez pola zachowują dokładny run/stage/revision. Real DOM-click regressions ready/missingfield/loading/mismatch. GHA38380681893 SUCCESS UI/typecheck/architecture; browser NOT VERIFIED. |
+
+### Checkpoint 13.10 — nowe poprawki i granice dowodów
+
+- Remote source: `4b1825543601872db3aae0249976ffe997353763`. Lokalny HEAD/index/stash pozostawione bez zmian; publikacja exact-parent GitData bez force.
+- UI/FMVPv5: GHA38378840997 SUCCESS dla74b32044; brak nowego dowodu browser/WebGL.
+- Retencja read-only GET: GHA38379405011 SUCCESS dlaff66d8d4 naWindows iUbuntu, w tym nowe routing/coordinator regressions.
+- Rust managed-worker/Floquet/completedpool: GHA38379689033 oczekiwany; wcześniejszy38379278436 nie wybierał nowych dwóch payload tests i finalcallback test, więc sam nie zamyka tych pozycji.
+- G5 source6c64b2fb: GHA38374719458 kompilacja sukces,14/17 CTest PASS; trzy FAIL. Owned same-attempt candidate recovery w toku; bez zmiany tolerancji, shiftu ani iteration budget. Native/scientific qualification nadal NOT VERIFIED.
+
+### Checkpoint — Open mode i legacy response Results
+
+- Open mode3ce2429c: GHA38380681893 SUCCESS; nowe rzeczywiste DOM-click regressions i pełny typecheck. Browser/WebGL NOT VERIFIED.
+- Legacy response Results587c19aa: fallback v1, preferred-v2 provenance i failclosed korupcja; GHA38381330970 uruchomiony.
+- Nadal otwarte: stage owner5483870930, paging retencji4252023530, G5 native14/17 i pozostałe canonical pending źródłowe/runtime/scientific. Nie zamykać PR97 na podstawie tych częściowych poprawek.
