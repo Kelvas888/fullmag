@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -21,10 +21,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::artifacts::{
-    require_current_live_artifact_dir, sanitize_artifact_relative_path,
-    try_resolve_artifact_path,
-};
+use crate::artifacts::{sanitize_artifact_relative_path, try_resolve_artifact_path};
 use crate::error::ApiError;
 use crate::router_v2::handlers::analysis::frequency_domain::{
     decode_frequency_domain_artifact_payload, FrequencyDomainFieldSweepArtifactPayload,
@@ -39,7 +36,7 @@ use crate::router_v2::handlers::analysis::spin_wave_response::{
     SpinWavePeakResource, MAX_DYNAMIC_STRUCTURE_FACTOR_CELLS,
 };
 use crate::schemas::hysteresis::HysteresisPointSchema;
-use crate::types::{AppState, StageLifecycleState};
+use crate::types::{AppState, StageExecutionRecord, StageLifecycleState};
 
 pub const ANALYSIS_RESULT_INDEX_SCHEMA_VERSION: &str = "fullmag.analysis.result_dataset_index.v1";
 const DEFAULT_PAGE_LIMIT: usize = 100;
@@ -1151,22 +1148,30 @@ pub async fn get_analysis_result_projection(
 
 async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollection, ApiError> {
     let request_context = crate::capture_current_live_request_context(state).await?;
-    let artifact_dir = require_current_live_artifact_dir(state).await?;
-    let (run_id, default_stage_id, request_stage_id) = current_result_identity(state).await?;
+    let owner_snapshot = capture_result_owner_snapshot(state).await?;
+    let artifact_dir = owner_snapshot.artifact_dir;
+    let run_id = owner_snapshot.run_id;
     let generation =
         fullmag_runner::artifact_generation::capture(&artifact_dir).map_err(|error| {
             ApiError::internal(format!(
                 "invalid frequency-domain artifact generation: {error}"
             ))
         })?;
-    validate_generation_producer(
-        generation.as_ref(),
-        Some(run_id.as_str()),
-        request_stage_id.as_deref(),
-    )?;
+    validate_generation_producer(generation.as_ref(), Some(run_id.as_str()), None)?;
+    let stage_for = |artifact_path: &str, digest: &str, byte_length: u64| {
+        result_artifact_stage_id_with_identity(
+            &artifact_dir,
+            artifact_path,
+            &run_id,
+            &owner_snapshot.stage_records,
+            generation.as_ref(),
+            digest,
+            byte_length,
+        )
+    };
     let mut datasets = Vec::new();
 
-    if let Some((value, digest)) = read_result_artifact_snapshot_in_generation(
+    if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_in_generation(
         &artifact_dir,
         "eigen/field_sweep.v1.json",
         generation.as_ref(),
@@ -1180,14 +1185,15 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
                     ));
                 }
             };
+        let stage_id = stage_for("eigen/field_sweep.v1.json", &digest, byte_length)?;
         datasets.push(build_field_sweep_index(
             payload,
             digest,
             &run_id,
-            default_stage_id.as_str(),
+            stage_id.as_str(),
         )?);
     }
-    if let Some((value, digest)) = read_result_artifact_snapshot_in_generation(
+    if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_in_generation(
         &artifact_dir,
         "eigen/spectrum.v3.json",
         generation.as_ref(),
@@ -1208,14 +1214,15 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
                 generation.as_ref(),
             )?,
         )?;
+        let stage_id = stage_for("eigen/spectrum.v3.json", &digest, byte_length)?;
         datasets.push(build_spectrum_v3_index(
             payload,
             digest,
             &run_id,
-            default_stage_id.as_str(),
+            stage_id.as_str(),
             scope_metadata,
         )?);
-    } else if let Some((value, digest)) = read_result_artifact_snapshot_in_generation(
+    } else if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_in_generation(
         &artifact_dir,
         "eigen/spectrum.v2.json",
         generation.as_ref(),
@@ -1236,30 +1243,31 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
                 generation.as_ref(),
             )?,
         )?;
+        let stage_id = stage_for("eigen/spectrum.v2.json", &digest, byte_length)?;
         datasets.push(build_spectrum_v2_index(
             payload,
             digest,
             &run_id,
-            default_stage_id.as_str(),
+            stage_id.as_str(),
             scope_metadata,
         )?);
     }
 
     // Prefer v2, but preserve the legal v1 publisher when v2 is absent.
     // A present malformed v2 remains an error, never a reason to use stale v1.
-    let response_snapshot = match read_result_artifact_snapshot_in_generation(
+    let response_snapshot = match read_result_artifact_snapshot_with_identity_in_generation(
         &artifact_dir,
         "response/magnetic_response_sweep.v2.json",
         generation.as_ref(),
     )? {
-        Some((value, digest)) => Some(("response/magnetic_response_sweep.v2.json", value, digest)),
-        None => read_result_artifact_snapshot_in_generation(
+        Some((value, digest, byte_length)) => Some(("response/magnetic_response_sweep.v2.json", value, digest, byte_length)),
+        None => read_result_artifact_snapshot_with_identity_in_generation(
             &artifact_dir,
             "response/magnetic_response_sweep.v1.json",
             generation.as_ref(),
-        )?.map(|(value, digest)| ("response/magnetic_response_sweep.v1.json", value, digest)),
+        )?.map(|(value, digest, byte_length)| ("response/magnetic_response_sweep.v1.json", value, digest, byte_length)),
     };
-    if let Some((source_artifact, value, digest)) = response_snapshot {
+    if let Some((source_artifact, value, digest, byte_length)) = response_snapshot {
         let payload = match decode_frequency_domain_artifact_payload(
             source_artifact,
             value,
@@ -1271,39 +1279,46 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
                 ));
             }
         };
+        let stage_id = stage_for(source_artifact, &digest, byte_length)?;
         datasets.push(build_response_index(
             payload,
             digest,
             &run_id,
-            default_stage_id.as_str(),
+            stage_id.as_str(),
             source_artifact,
         )?);
     }
 
-    if let Some((value, digest)) =
-        read_result_artifact_snapshot(&artifact_dir, "analysis/spin_wave_response.gamma.v1.json")?
+    if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_and_generation_fallback(
+        &artifact_dir,
+        "analysis/spin_wave_response.gamma.v1.json",
+        generation.as_ref(),
+    )?
     {
         let payload = serde_json::from_value::<SpinWaveGammaResource>(value)
             .map_err(|error| ApiError::internal(format!("invalid gamma artifact: {error}")))?;
+        let stage_id = stage_for("analysis/spin_wave_response.gamma.v1.json", &digest, byte_length)?;
         datasets.push(build_gamma_index(
             payload,
             digest,
             &run_id,
-            default_stage_id.as_str(),
+            stage_id.as_str(),
         )?);
     }
 
-    if let Some((value, digest)) = read_result_artifact_snapshot(
+    if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_and_generation_fallback(
         &artifact_dir,
         "analysis/dynamic_structure_factor.1d.v1.json",
+        generation.as_ref(),
     )? {
         let payload = serde_json::from_value::<DynamicStructureFactorResource>(value)
             .map_err(|error| ApiError::internal(format!("invalid DSF artifact: {error}")))?;
+        let stage_id = stage_for("analysis/dynamic_structure_factor.1d.v1.json", &digest, byte_length)?;
         datasets.push(build_dsf_index(
             payload,
             digest,
             &run_id,
-            default_stage_id.as_str(),
+            stage_id.as_str(),
         )?);
     }
 
@@ -1372,9 +1387,15 @@ fn spectrum_output_scope_metadata_from_snapshot(
     })
 }
 
-async fn current_result_identity(
+struct ResultOwnerSnapshot {
+    run_id: String,
+    artifact_dir: PathBuf,
+    stage_records: Vec<StageExecutionRecord>,
+}
+
+async fn capture_result_owner_snapshot(
     state: &Arc<AppState>,
-) -> Result<(String, String, Option<String>), ApiError> {
+) -> Result<ResultOwnerSnapshot, ApiError> {
     let current = state.current_live_state.read().await;
     let snapshot = current.as_ref().ok_or_else(|| {
         ApiError::not_found("RESULT_RUN_NOT_FOUND: no active local live workspace")
@@ -1384,16 +1405,248 @@ async fn current_result_identity(
         .as_ref()
         .map(|run| run.run_id.clone())
         .unwrap_or_else(|| snapshot.session.run_id.clone());
-    let request_stage_id = snapshot.stage_execution.as_ref().and_then(|execution| {
-        execution
-            .active_stage_index
-            .and_then(|index| execution.stages.get(index))
-            .and_then(|stage| stage.stage_id.clone())
+    let artifact_dir = crate::session::current_artifact_dir(snapshot).ok_or_else(|| {
+        ApiError::not_found("no artifact directory for the active workspace")
+    })?;
+    let stage_records = snapshot
+        .stage_execution
+        .as_ref()
+        .map(|execution| execution.stages.clone())
+        .unwrap_or_default();
+    Ok(ResultOwnerSnapshot {
+        run_id,
+        artifact_dir,
+        stage_records,
+    })
+}
+
+#[cfg(test)]
+fn result_artifact_stage_id(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    captured_run_id: &str,
+    stage_records: &[StageExecutionRecord],
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<String, ApiError> {
+    let generation_for_artifact = generation.filter(|generation| {
+        generation
+            .commit
+            .content
+            .members
+            .contains_key(artifact_path)
     });
-    let default_stage_id = request_stage_id
-        .clone()
-        .unwrap_or_else(|| "stage:analysis".to_string());
-    Ok((run_id, default_stage_id, request_stage_id))
+    let (bytes, digest) = read_result_artifact_bytes_snapshot_in_generation(
+        artifact_dir,
+        artifact_path,
+        generation_for_artifact,
+        MAX_RESULT_ARTIFACT_BYTES,
+    )?
+    .ok_or_else(result_owner_mismatch)?;
+    result_artifact_stage_id_with_identity(
+        artifact_dir,
+        artifact_path,
+        captured_run_id,
+        stage_records,
+        generation,
+        &digest,
+        bytes.len() as u64,
+    )
+}
+
+fn result_artifact_stage_id_with_identity(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    captured_run_id: &str,
+    stage_records: &[StageExecutionRecord],
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+    source_digest: &str,
+    source_byte_length: u64,
+) -> Result<String, ApiError> {
+    // A publication's producer owns only an exact member. Legacy artifacts
+    // need one unambiguous stage reference; active stage and payload fields do
+    // not supply ownership. The exact source snapshot identity also prevents a
+    // same-named artifact from an older sibling stage from claiming ownership.
+    let artifact_relative = sanitize_artifact_relative_path(artifact_path)?;
+    let canonical_root = artifact_dir
+        .canonicalize()
+        .map_err(|_| result_owner_mismatch())?;
+    let canonical_artifact = canonical_root
+        .join(&artifact_relative)
+        .canonicalize()
+        .map_err(|_| result_owner_mismatch())?;
+    if !canonical_artifact.starts_with(&canonical_root) || !canonical_artifact.is_file() {
+        return Err(result_owner_mismatch());
+    }
+
+    let producer = generation
+        .filter(|generation| {
+            generation
+                .commit
+                .content
+                .members
+                .contains_key(artifact_path)
+        })
+        .and_then(|generation| generation.commit.content.producer.as_ref());
+    if producer.is_some_and(|producer| {
+        producer.run_id.as_str() != captured_run_id || producer.stage_id.trim().is_empty()
+    }) {
+        return Err(result_owner_mismatch());
+    }
+
+    let mut reference_owners = Vec::new();
+    for stage in stage_records {
+        let mut stage_matches = false;
+        for reference in &stage.artifact_refs {
+            if result_stage_ref_covers_artifact(
+                &canonical_root,
+                &artifact_relative,
+                &canonical_artifact,
+                reference,
+                source_digest,
+                source_byte_length,
+            ) {
+                stage_matches = true;
+                break;
+            }
+        }
+        if stage_matches {
+            let Some(stage_id) = stage
+                .stage_id
+                .as_deref()
+                .filter(|stage_id| !stage_id.trim().is_empty())
+            else {
+                return Err(result_owner_mismatch());
+            };
+            reference_owners.push(stage_id);
+        }
+    }
+    if reference_owners.len() > 1 {
+        return Err(result_owner_mismatch());
+    }
+    let reference_owner = reference_owners.first().copied();
+
+    if let Some(producer) = producer {
+        if reference_owner.is_some_and(|stage_id| stage_id != producer.stage_id.as_str()) {
+            return Err(result_owner_mismatch());
+        }
+        return Ok(producer.stage_id.clone());
+    }
+
+    Ok(reference_owner
+        .unwrap_or("stage:analysis")
+        .to_string())
+}
+
+fn result_stage_ref_covers_artifact(
+    canonical_root: &Path,
+    artifact_relative: &Path,
+    canonical_artifact: &Path,
+    raw_reference: &str,
+    source_digest: &str,
+    source_byte_length: u64,
+) -> bool {
+    let raw_path = Path::new(raw_reference);
+    let is_absolute = raw_path.is_absolute();
+    let candidate = if is_absolute {
+        let Ok(candidate) = raw_path.canonicalize() else {
+            return false;
+        };
+        candidate
+    } else {
+        let Ok(relative) = sanitize_artifact_relative_path(raw_reference) else {
+            return false;
+        };
+        let Ok(candidate) = canonical_root.join(relative).canonicalize() else {
+            return false;
+        };
+        candidate
+    };
+
+    let canonical_parent = canonical_root.parent().unwrap_or(canonical_root);
+    let allowed = if is_absolute {
+        candidate.starts_with(canonical_root)
+            || (candidate != canonical_parent && candidate.starts_with(canonical_parent))
+    } else {
+        candidate.starts_with(canonical_root)
+    };
+    if !allowed {
+        return false;
+    }
+
+    if candidate.is_file() {
+        if candidate == canonical_artifact {
+            return true;
+        }
+        return is_absolute
+            && result_stage_ref_is_legal_sibling(canonical_root, &candidate)
+            && candidate
+                .strip_prefix(canonical_parent)
+                .is_ok_and(|relative| relative.ends_with(artifact_relative))
+            && result_stage_ref_matches_snapshot(
+                &candidate,
+                source_digest,
+                source_byte_length,
+            );
+    }
+
+    if !candidate.is_dir() {
+        return false;
+    }
+    if canonical_artifact.starts_with(&candidate) {
+        return true;
+    }
+    let Ok(expected_artifact) = candidate.join(artifact_relative).canonicalize() else {
+        return false;
+    };
+    if !expected_artifact.starts_with(&candidate) || !expected_artifact.is_file() {
+        return false;
+    }
+    expected_artifact == canonical_artifact
+        || (result_stage_ref_is_legal_sibling(canonical_root, &candidate)
+            && result_stage_ref_matches_snapshot(
+                &expected_artifact,
+                source_digest,
+                source_byte_length,
+            ))
+}
+
+fn result_stage_ref_is_legal_sibling(canonical_root: &Path, candidate: &Path) -> bool {
+    let canonical_parent = canonical_root.parent().unwrap_or(canonical_root);
+    candidate != canonical_parent
+        && !candidate.starts_with(canonical_root)
+        && candidate.starts_with(canonical_parent)
+}
+
+fn result_stage_ref_matches_snapshot(
+    candidate: &Path,
+    source_digest: &str,
+    source_byte_length: u64,
+) -> bool {
+    if source_byte_length > MAX_RESULT_ARTIFACT_BYTES {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(candidate) else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != source_byte_length {
+        return false;
+    }
+    let Ok(bytes) = read_result_artifact_bytes(
+        file,
+        candidate.to_string_lossy().as_ref(),
+        MAX_RESULT_ARTIFACT_BYTES,
+    ) else {
+        return false;
+    };
+    bytes.len() as u64 == source_byte_length
+        && format!("sha256:{:x}", Sha256::digest(&bytes)) == source_digest
+}
+
+fn result_owner_mismatch() -> ApiError {
+    ApiError::conflict("frequency_domain_artifact_generation_owner_mismatch")
 }
 
 fn ensure_run(collection: &ResultIndexCollection, requested_run_id: &str) -> Result<(), ApiError> {
@@ -1425,12 +1678,10 @@ fn build_field_sweep_index(
     payload: FrequencyDomainFieldSweepArtifactPayload,
     source_digest: String,
     run_id: &str,
-    fallback_stage_id: &str,
+    stage_id: &str,
 ) -> Result<ResultDatasetIndex, ApiError> {
-    let stage_id = payload
-        .stage_id
-        .clone()
-        .unwrap_or_else(|| fallback_stage_id.to_string());
+    // The caller resolves stage ownership from the captured artifact owner;
+    // the payload's legacy stage_id is descriptive data, not authority.
     let dataset_id = format!("result:{run_id}:{stage_id}:modal-eigen-field-sweep");
     let source_revision = payload
         .source_revision
@@ -1633,7 +1884,7 @@ fn build_field_sweep_index(
         dataset_id,
         dataset_revision,
         run_id,
-        &stage_id,
+        stage_id,
         AnalysisResultProductKind::ModalEigen,
         "Modal eigen field sweep",
         Some("Validated adapter over eigen/field_sweep.v1 and its source artifacts"),
@@ -3824,6 +4075,34 @@ pub(super) fn read_result_artifact_snapshot(
     decode_result_artifact_snapshot(file, artifact_path, MAX_RESULT_ARTIFACT_BYTES).map(Some)
 }
 
+fn read_result_artifact_snapshot_with_identity_and_generation_fallback(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<Option<(Value, String, u64)>, ApiError> {
+    if generation.is_some_and(|generation| {
+        generation
+            .commit
+            .content
+            .members
+            .contains_key(artifact_path)
+    }) {
+        read_result_artifact_snapshot_with_identity_in_generation(
+            artifact_dir,
+            artifact_path,
+            generation,
+        )
+    } else {
+        // Gamma and DSF are legal mixed legacy products; a different committed
+        // generation member must not lend them its producer identity.
+        read_result_artifact_snapshot_with_identity_in_generation(
+            artifact_dir,
+            artifact_path,
+            None,
+        )
+    }
+}
+
 /// Read an artifact from the captured publication when one is available.
 /// A missing member is not read from the mutable directory as a fallback.
 pub(crate) fn read_result_artifact_snapshot_in_generation(
@@ -3831,6 +4110,19 @@ pub(crate) fn read_result_artifact_snapshot_in_generation(
     artifact_path: &str,
     generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Option<(Value, String)>, ApiError> {
+    Ok(read_result_artifact_snapshot_with_identity_in_generation(
+        artifact_dir,
+        artifact_path,
+        generation,
+    )?
+    .map(|(value, digest, _)| (value, digest)))
+}
+
+fn read_result_artifact_snapshot_with_identity_in_generation(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<Option<(Value, String, u64)>, ApiError> {
     let Some((bytes, digest)) = read_result_artifact_bytes_snapshot_in_generation(
         artifact_dir,
         artifact_path,
@@ -3841,7 +4133,7 @@ pub(crate) fn read_result_artifact_snapshot_in_generation(
         return Ok(None);
     };
     let value = parse_result_artifact_bytes(&bytes, artifact_path)?;
-    Ok(Some((value, digest)))
+    Ok(Some((value, digest, bytes.len() as u64)))
 }
 
 /// Return the exact bounded bytes and digest read from either a committed
@@ -4051,6 +4343,54 @@ pub(super) fn validate_generation_producer(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn write_result_generation_for_test(
+    root: &Path,
+    artifact_path: &str,
+    bytes: &[u8],
+    producer: Option<fullmag_runner::artifact_generation::PublicationOwner>,
+) {
+    use fullmag_runner::artifact_generation::{
+        GenerationBody, GenerationCommit, GenerationMember, COMMIT_PATH,
+    };
+
+    let relative = sanitize_artifact_relative_path(artifact_path)
+        .expect("test artifact path should be safe and relative");
+    let member_path = root.join(relative);
+    std::fs::create_dir_all(member_path.parent().expect("member has a parent"))
+        .expect("member directory should be created");
+    std::fs::create_dir_all(root.join("frequency_domain"))
+        .expect("generation directory should be created");
+    std::fs::write(member_path, bytes).expect("generation member should be written");
+
+    let content = GenerationBody {
+        schema_version: "frequency_domain_artifact_generation.v1".to_string(),
+        producer,
+        members: BTreeMap::from([(
+            artifact_path.to_string(),
+            GenerationMember {
+                byte_length: bytes.len() as u64,
+                sha256: format!("sha256:{:x}", Sha256::digest(bytes)),
+            },
+        )]),
+    };
+    let generation_id = format!(
+        "sha256:{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&content).expect("generation content should serialize")
+        )
+    );
+    let commit = GenerationCommit {
+        generation_id,
+        content,
+    };
+    std::fs::write(
+        root.join(COMMIT_PATH),
+        serde_json::to_vec_pretty(&commit).expect("generation commit should serialize"),
+    )
+    .expect("generation commit should be written");
 }
 
 fn read_result_artifact_bytes(
@@ -6407,6 +6747,221 @@ mod generation_snapshot_tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(value["schema_version"], "eigen_spectrum.v3");
+    }
+
+    fn result_stage_record(stage_id: &str, artifact_refs: Vec<String>) -> crate::types::StageExecutionRecord {
+        serde_json::from_value(serde_json::json!({
+            "stage_id": stage_id,
+            "kind": "flat_eigenmodes",
+            "status": "completed",
+            "artifact_refs": artifact_refs,
+        }))
+        .expect("stage owner fixture should deserialize")
+    }
+
+    #[test]
+    fn result_owner_uses_producer_only_for_exact_generation_members() {
+        let temporary = TempGenerationRoot::new();
+        let root = temporary.0.join("artifacts");
+        let member = br#"{"schema_version":"eigen_spectrum.v2","samples":[]}"#;
+        let generation = publish_one_member(
+            &root,
+            "eigen/spectrum.v2.json",
+            member,
+            Some(PublicationOwner {
+                run_id: "run:current".into(),
+                stage_id: "eigen-stage".into(),
+                stage_kind: "flat_eigenmodes".into(),
+            }),
+        );
+        std::fs::create_dir_all(root.join("analysis")).unwrap();
+        for artifact_path in [
+            "analysis/spin_wave_response.gamma.v1.json",
+            "analysis/dynamic_structure_factor.1d.v1.json",
+        ] {
+            std::fs::write(root.join(artifact_path), b"{}").unwrap();
+        }
+        let stages = vec![result_stage_record("eigen-stage", Vec::new())];
+
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                "eigen/spectrum.v2.json",
+                "run:current",
+                &stages,
+                Some(&generation),
+            )
+            .expect("generation member should use its producer"),
+            "eigen-stage"
+        );
+        for artifact_path in [
+            "analysis/spin_wave_response.gamma.v1.json",
+            "analysis/dynamic_structure_factor.1d.v1.json",
+        ] {
+            assert_eq!(
+                result_artifact_stage_id(
+                    &root,
+                    artifact_path,
+                    "run:current",
+                    &stages,
+                    Some(&generation),
+                )
+                .expect("nonmember legacy product should remain unbound"),
+                "stage:analysis"
+            );
+        }
+        assert_eq!(
+            result_artifact_stage_id(&root, "eigen/spectrum.v2.json", "run:current", &[], None)
+                .expect("legacy artifact without an owner should remain unbound"),
+            "stage:analysis"
+        );
+    }
+
+    #[test]
+    fn result_owner_resolves_exact_file_and_safe_directory_references() {
+        let temporary = TempGenerationRoot::new();
+        let root = temporary.0.join("artifacts");
+        let artifact_path = "eigen/spectrum.v2.json";
+        let artifact_file = root.join(artifact_path);
+        std::fs::create_dir_all(artifact_file.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_file, b"{}").unwrap();
+
+        let file_owner = result_stage_record(
+            "file-stage",
+            vec![artifact_file.to_string_lossy().into_owned()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(&root, artifact_path, "run:current", &[file_owner], None)
+                .expect("exact file ref should resolve its owner"),
+            "file-stage"
+        );
+
+        let relative_file_owner = result_stage_record("relative-file-stage", vec![artifact_path.into()]);
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[relative_file_owner],
+                None,
+            )
+            .expect("root-relative file ref should resolve its owner"),
+            "relative-file-stage"
+        );
+
+        let directory_owner = result_stage_record(
+            "directory-stage",
+            vec![root.to_string_lossy().into_owned()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[directory_owner],
+                None,
+            )
+            .expect("artifact root directory should cover the exact file"),
+            "directory-stage"
+        );
+
+        let stale_sibling_stage = temporary.0.join("stages/stage_00_eigen");
+        let stale_sibling_artifact = stale_sibling_stage.join(artifact_path);
+        std::fs::create_dir_all(stale_sibling_artifact.parent().unwrap()).unwrap();
+        std::fs::write(&stale_sibling_artifact, b"older stage contents").unwrap();
+        let stale_sibling_owner = result_stage_record(
+            "stale-sibling-stage",
+            vec![stale_sibling_stage.to_string_lossy().into_owned()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[stale_sibling_owner],
+                None,
+            )
+            .expect("different bytes in a same-named sibling must not claim ownership"),
+            "stage:analysis"
+        );
+
+        let matching_sibling_stage = temporary.0.join("stages/stage_01_eigen");
+        let matching_sibling_artifact = matching_sibling_stage.join(artifact_path);
+        std::fs::create_dir_all(matching_sibling_artifact.parent().unwrap()).unwrap();
+        std::fs::write(&matching_sibling_artifact, b"{}").unwrap();
+        let matching_sibling_owner = result_stage_record(
+            "matching-sibling-stage",
+            vec![matching_sibling_stage.to_string_lossy().into_owned()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[matching_sibling_owner.clone()],
+                None,
+            )
+            .expect("identical bounded content in a legal sibling should resolve ownership"),
+            "matching-sibling-stage"
+        );
+
+        let second_matching_sibling_stage = temporary.0.join("stages/stage_02_eigen");
+        let second_matching_sibling_artifact = second_matching_sibling_stage.join(artifact_path);
+        std::fs::create_dir_all(second_matching_sibling_artifact.parent().unwrap()).unwrap();
+        std::fs::write(&second_matching_sibling_artifact, b"{}").unwrap();
+        let second_matching_sibling_owner = result_stage_record(
+            "second-matching-sibling-stage",
+            vec![second_matching_sibling_stage.to_string_lossy().into_owned()],
+        );
+        assert!(result_artifact_stage_id(
+            &root,
+            artifact_path,
+            "run:current",
+            &[matching_sibling_owner, second_matching_sibling_owner],
+            None,
+        )
+        .is_err(), "two identical sibling owners remain ambiguous");
+    }
+
+    #[test]
+    fn result_owner_rejects_stage_reference_conflict_and_ambiguity() {
+        let temporary = TempGenerationRoot::new();
+        let root = temporary.0.join("artifacts");
+        let artifact_path = "eigen/spectrum.v2.json";
+        let member = br#"{"schema_version":"eigen_spectrum.v2","samples":[]}"#;
+        let generation = publish_one_member(
+            &root,
+            artifact_path,
+            member,
+            Some(PublicationOwner {
+                run_id: "run:current".into(),
+                stage_id: "eigen-stage".into(),
+                stage_kind: "flat_eigenmodes".into(),
+            }),
+        );
+        let file_ref = root.join(artifact_path).to_string_lossy().into_owned();
+        let conflict = vec![result_stage_record("relax-stage", vec![file_ref.clone()])];
+        assert!(result_artifact_stage_id(
+            &root,
+            artifact_path,
+            "run:current",
+            &conflict,
+            Some(&generation),
+        )
+        .is_err());
+
+        let ambiguous = vec![
+            result_stage_record("eigen-stage", vec![file_ref.clone()]),
+            result_stage_record("relax-stage", vec![file_ref]),
+        ];
+        assert!(result_artifact_stage_id(
+            &root,
+            artifact_path,
+            "run:current",
+            &ambiguous,
+            Some(&generation),
+        )
+        .is_err());
     }
 
     #[test]

@@ -14606,6 +14606,223 @@ async fn response_magnetic_sweep_v1_endpoint_returns_artifact_json() {
 }
 
 #[tokio::test]
+async fn result_catalog_uses_committed_eigen_owner_after_active_stage_advances() {
+    let (app, state, artifact_dir) = test_router_with_session_state_and_artifact_dir().await;
+    set_running_stage_execution(&state, 11).await;
+    {
+        let mut guard = state.current_live_state.write().await;
+        let execution = guard
+            .as_mut()
+            .and_then(|snapshot| snapshot.stage_execution.as_mut())
+            .expect("stage execution should exist");
+        execution.stages[0].stage_id = Some("eigen-stage".into());
+        execution.stages[0].kind = Some("flat_eigenmodes".into());
+        execution.stages[0].artifact_refs.clear();
+        execution.stages[1].stage_id = Some("later-relax-stage".into());
+        execution.stages[1].kind = Some("relax".into());
+        execution.stages[1].artifact_refs.clear();
+    }
+
+    let artifact_path = "eigen/spectrum.v2.json";
+    let artifact_bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": "eigen_spectrum.v2",
+        "samples": []
+    }))
+    .expect("spectrum fixture should serialize");
+    fs::create_dir_all(artifact_dir.join("eigen")).expect("eigen directory should exist");
+    fs::write(artifact_dir.join(artifact_path), &artifact_bytes)
+        .expect("spectrum fixture should be written");
+    let analysis_dir = artifact_dir.join("analysis");
+    fs::create_dir_all(&analysis_dir).expect("analysis directory should exist");
+    fs::write(
+        analysis_dir.join("spin_wave_response.gamma.v1.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version":"spin_wave_response.gamma.v1","time_unit":"s","frequency_unit":"Hz","trace_unit":"1","source_unit":"A/m","susceptibility_unit":"m/A",
+            "weighting":"fixture","detrend":"none","window":"none","normalization":"fixture",
+            "reference_m0":1.0,"reference_m0_secondary":0.0,"response_component":"my","transverse_components":["my","mz"],
+            "time_s":[],"response_trace":[],"secondary_response_trace":[],"source_trace":[],"frequency_hz":[],
+            "response_psd":[],"primary_response_psd":[],"secondary_response_psd":[],"source_psd":[],
+            "response_spectrum_real":[],"response_spectrum_imag":[],"secondary_response_spectrum_real":[],"secondary_response_spectrum_imag":[],
+            "source_spectrum_real":[],"source_spectrum_imag":[],"window_values":[],"window_power_sum":0.0,"nyquist_hz":0.0,
+            "susceptibility_abs":[],"peaks":[]
+        }))
+        .expect("gamma fixture should serialize"),
+    )
+    .expect("gamma fixture should be written");
+    fs::write(
+        analysis_dir.join("dynamic_structure_factor.1d.v1.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version":"dynamic_structure_factor.1d.v1","artifact_ref":"analysis/dynamic_structure_factor.1d.v1.json","bounded":false,
+            "original_frequency_count":0,"original_wavevector_count":0,"wavevector_unit":"rad/m","frequency_unit":"Hz",
+            "x_m":[],"time_s":[],"k_rad_per_m":[],"frequency_hz":[],"power":[],"spectrum_real":[],"spectrum_imag":[],
+            "source_power":[],"source_spectrum_real":[],"source_spectrum_imag":[],"source_observable":"H_drive_y","source_unit":"A/m",
+            "component":"my","propagation_axis":"x","phase_convention":"fixture","normalization":"fixture",
+            "spatial_window":[],"temporal_window":[],"spatial_window_power_sum":0.0,"temporal_window_power_sum":0.0,
+            "mesh_probe_signature":"fixture","invalid_probe_mask":[],"excluded_absorber_ranges_m":[],"frequency_count":0,"wavevector_count":0
+        }))
+        .expect("DSF fixture should serialize"),
+    )
+    .expect("DSF fixture should be written");
+    super::handlers::analysis::results::write_result_generation_for_test(
+        &artifact_dir,
+        artifact_path,
+        &artifact_bytes,
+        Some(fullmag_runner::artifact_generation::PublicationOwner {
+            run_id: "test-run".into(),
+            stage_id: "eigen-stage".into(),
+            stage_kind: "flat_eigenmodes".into(),
+        }),
+    );
+
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/analysis/results/runs/run:current/datasets")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), StatusCode::OK);
+    let catalog = body_json(catalog_response).await;
+    let catalog_items = catalog["items"]
+        .as_array()
+        .expect("result catalog should contain items");
+    let eigen = catalog_items
+        .iter()
+        .find(|item| item["dataset_id"] == "result:test-run:eigen-stage:modal-eigen-spectrum")
+        .expect("eigen dataset id should be present");
+    let dataset_id = eigen["dataset_id"]
+        .as_str()
+        .expect("eigen dataset id should be present");
+    assert_eq!(dataset_id, "result:test-run:eigen-stage:modal-eigen-spectrum");
+    let gamma = catalog_items
+        .iter()
+        .find(|item| item["dataset_id"] == "result:test-run:stage:analysis:time-domain-spectrum")
+        .expect("legacy gamma should not inherit the eigen producer");
+    let dsf = catalog_items
+        .iter()
+        .find(|item| item["dataset_id"] == "result:test-run:stage:analysis:dynamic-structure-factor")
+        .expect("legacy DSF should not inherit the eigen producer");
+    assert_eq!(gamma["stage_id"], "stage:analysis");
+    assert_eq!(dsf["stage_id"], "stage:analysis");
+    let manifest_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v2/sessions/current/analysis/results/runs/run:current/datasets/{dataset_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(manifest_response.status(), StatusCode::OK);
+    let manifest = body_json(manifest_response).await;
+    assert_eq!(manifest["stage_id"], "eigen-stage");
+
+    fs::remove_file(artifact_dir.join(fullmag_runner::artifact_generation::COMMIT_PATH))
+        .expect("legacy fixture should remove the generation receipt");
+    let legacy_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/analysis/results/runs/run:current/datasets")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy_response.status(), StatusCode::OK);
+    let legacy_catalog = body_json(legacy_response).await;
+    assert_eq!(
+        legacy_catalog["items"][0]["dataset_id"],
+        "result:test-run:stage:analysis:modal-eigen-spectrum"
+    );
+    let _ = fs::remove_dir_all(&artifact_dir);
+}
+
+#[tokio::test]
+async fn result_catalog_rejects_generation_run_and_stage_reference_mismatches() {
+    let (app, state, artifact_dir) = test_router_with_session_state_and_artifact_dir().await;
+    set_running_stage_execution(&state, 12).await;
+    {
+        let mut guard = state.current_live_state.write().await;
+        let execution = guard
+            .as_mut()
+            .and_then(|snapshot| snapshot.stage_execution.as_mut())
+            .expect("stage execution should exist");
+        execution.stages[0].stage_id = Some("eigen-stage".into());
+        execution.stages[0].kind = Some("flat_eigenmodes".into());
+        execution.stages[1].stage_id = Some("later-relax-stage".into());
+        execution.stages[1].kind = Some("relax".into());
+        execution.stages[0].artifact_refs.clear();
+        execution.stages[1].artifact_refs.clear();
+    }
+    let artifact_path = "eigen/spectrum.v2.json";
+    let artifact_bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": "eigen_spectrum.v2",
+        "samples": []
+    }))
+    .expect("spectrum fixture should serialize");
+    fs::create_dir_all(artifact_dir.join("eigen")).expect("eigen directory should exist");
+    let artifact_file = artifact_dir.join(artifact_path);
+    fs::write(&artifact_file, &artifact_bytes).expect("spectrum fixture should be written");
+    let make_owner = |run_id: &str, stage_id: &str| {
+        Some(fullmag_runner::artifact_generation::PublicationOwner {
+            run_id: run_id.into(),
+            stage_id: stage_id.into(),
+            stage_kind: "flat_eigenmodes".into(),
+        })
+    };
+    let catalog_request = || {
+        Request::builder()
+            .uri("/v2/sessions/current/analysis/results/runs/run:current/datasets")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    super::handlers::analysis::results::write_result_generation_for_test(
+        &artifact_dir,
+        artifact_path,
+        &artifact_bytes,
+        make_owner("other-run", "eigen-stage"),
+    );
+    let wrong_run = app.clone().oneshot(catalog_request()).await.unwrap();
+    assert_eq!(wrong_run.status(), StatusCode::CONFLICT);
+
+    {
+        let mut guard = state.current_live_state.write().await;
+        let execution = guard
+            .as_mut()
+            .and_then(|snapshot| snapshot.stage_execution.as_mut())
+            .expect("stage execution should exist");
+        execution.stages[1].artifact_refs = vec![artifact_file.to_string_lossy().into_owned()];
+    }
+    super::handlers::analysis::results::write_result_generation_for_test(
+        &artifact_dir,
+        artifact_path,
+        &artifact_bytes,
+        make_owner("test-run", "eigen-stage"),
+    );
+    let conflicting_ref = app.clone().oneshot(catalog_request()).await.unwrap();
+    assert_eq!(conflicting_ref.status(), StatusCode::CONFLICT);
+
+    {
+        let mut guard = state.current_live_state.write().await;
+        let execution = guard
+            .as_mut()
+            .and_then(|snapshot| snapshot.stage_execution.as_mut())
+            .expect("stage execution should exist");
+        execution.stages[0].artifact_refs = vec![artifact_file.to_string_lossy().into_owned()];
+    }
+    let multiple_refs = app.oneshot(catalog_request()).await.unwrap();
+    assert_eq!(multiple_refs.status(), StatusCode::CONFLICT);
+    let _ = fs::remove_dir_all(&artifact_dir);
+}
+
+#[tokio::test]
 async fn response_magnetic_sweep_v1_missing_artifact_returns_404() {
     let (app, artifact_dir) = test_router_with_session_and_artifact_dir().await;
     fs::create_dir_all(artifact_dir.join("response"))

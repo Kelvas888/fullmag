@@ -187,6 +187,16 @@ jobs:
       - name: Run response sweep legacy Results catalog contracts
         run: cargo test -p fullmag-api response_magnetic_sweep_v1_endpoint_returns_artifact_json
 
+      - name: Run Results artifact stage ownership contracts
+        env:
+          RUST_MIN_STACK: 8388608
+        run: |
+          cargo test -p fullmag-api --bin fullmag-api result_catalog_uses_committed_eigen_owner_after_active_stage_advances
+          cargo test -p fullmag-api --bin fullmag-api result_catalog_rejects_generation_run_and_stage_reference_mismatches
+          cargo test -p fullmag-api --bin fullmag-api result_owner_uses_producer_only_for_exact_generation_members
+          cargo test -p fullmag-api --bin fullmag-api result_owner_resolves_exact_file_and_safe_directory_references
+          cargo test -p fullmag-api --bin fullmag-api result_owner_rejects_stage_reference_conflict_and_ambiguity
+
       - name: Run modal solver policy planning contracts
         run: |
           cargo test -p fullmag-plan fem_eigen_modal_solver_policy --lib
