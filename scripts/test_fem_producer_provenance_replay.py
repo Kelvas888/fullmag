@@ -767,7 +767,8 @@ class ProducerProvenanceReplayTests(unittest.TestCase):
             self.assertEqual(report.status, SOURCE_REPLAY_QUALIFIED)
             self.assertTrue(reads)
             self.assertTrue(all(count == 1 for count in reads.values()))
-            self.assertIn("eigen/metadata/sample_0000/producer_provenance.v1.json", reads)
+            self.assertIn(paths.provenance_path.relative_to(root).as_posix(), reads)
+            self.assertEqual(set(reads), set(captured))
         finally:
             temp.cleanup()
 
