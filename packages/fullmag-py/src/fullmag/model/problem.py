@@ -14,6 +14,7 @@ import warnings
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -23,6 +24,8 @@ from fullmag._progress import (
     indeterminate_progress_phase,
 )
 from fullmag._validation import ensure_unique_names, require_non_empty
+from fullmag.cuda_device_identity import legacy_cuda_binding
+from fullmag.model._incomplete import IncompletePhysicsError
 from fullmag.init.textures import PresetTexture
 from fullmag.model.antenna import (
     AntennaFieldSource,
@@ -40,7 +43,7 @@ from fullmag.model.current_transport import CurrentTransport
 from fullmag.model.discretization import DiscretizationHints, FEM, PerObjectMeshRecipe
 from fullmag.model.dynamics import LLG
 from fullmag.model.domain_frame import build_domain_frame, geometry_bounds
-from fullmag.model.energy import BulkDMI, CubicAnisotropy, Demag, Exchange, InterfacialDMI, Magnetoelastic, OerstedField, OerstedCylinder, PiecewiseLinear, StaticFieldMap, ThermalNoise, UniaxialAnisotropy, Zeeman
+from fullmag.model.energy import BulkDMI, CubicAnisotropy, Demag, Exchange, InterfacialDMI, Magnetoelastic, OerstedField, OerstedCylinder, PiecewiseLinear, RotatedInterfacialDMI, StaticFieldMap, ThermalNoise, UniaxialAnisotropy, Zeeman
 from fullmag.model.spin_torque import (
     LegacySpinTorque,
     PrescribedSpinOrbitTorque,
@@ -56,6 +59,7 @@ from fullmag.model.mechanics import (
     MechanicalLoad,
 )
 from fullmag.model.physics_scope import build_physics_graph
+from fullmag.model.parameters import ParameterLibrary
 from fullmag.model.outputs import (
     SaveDispersion,
     SaveField,
@@ -1584,8 +1588,14 @@ class RuntimeSelection:
             raise ValueError(
                 "gpu_count > 1 requests multi-GPU execution, but multi-GPU execution is not implemented"
             )
-        if self.device_index is not None and self.device_index < 0:
-            raise ValueError("device_index must be >= 0")
+        if self.device_index is not None:
+            if isinstance(self.device_index, bool) or not isinstance(
+                self.device_index, Integral
+            ):
+                raise ValueError("device_index must be a nonnegative integer")
+            object.__setattr__(self, "device_index", int(self.device_index))
+            if self.device_index < 0:
+                raise ValueError("device_index must be >= 0")
         if self.cpu_threads is not None and self.cpu_threads <= 0:
             raise ValueError("cpu_threads must be >= 1")
         if self.cpu_threads is not None and self.cpu_threads > 1:
@@ -1749,13 +1759,15 @@ class RuntimeSelection:
         }
         if self.fdm_precision_policy is not None:
             result["fdm_precision_policy"] = self.fdm_precision_policy.to_ir()
+        if self.device_index is not None:
+            result["legacy_cuda_binding"] = legacy_cuda_binding(self.device_index)
         return result
 
 
 backend = RuntimeSelection()
 
 
-EnergyTerm = Exchange | Demag | InterfacialDMI | BulkDMI | Zeeman | StaticFieldMap | Magnetoelastic | UniaxialAnisotropy | OerstedCylinder | OerstedField | CubicAnisotropy | ThermalNoise
+EnergyTerm = Exchange | Demag | InterfacialDMI | RotatedInterfacialDMI | BulkDMI | Zeeman | StaticFieldMap | Magnetoelastic | UniaxialAnisotropy | OerstedCylinder | OerstedField | CubicAnisotropy | ThermalNoise
 CurrentModule = AntennaFieldSource | CurrentTransport
 LegacyOutputSpec = SaveField | SaveScalar | Snapshot
 OutputSpec = LegacyOutputSpec | SaveSpectrum | SaveMode | SaveDispersion
@@ -2268,9 +2280,25 @@ def _validate_authored_mixed_p1_scope(
         if hasattr(term, "to_ir")
     ]
     device = runtime_selection.get("device")
-    dmi_kinds = {"interfacial_dmi", "bulk_dmi"}
-    has_dmi = any(payload.get("kind") in dmi_kinds for payload in energy_payloads) or any(
-        payload.get(key) is not None
+    dmi_kinds = {"interfacial_dmi", "bulk_dmi", "rotated_interfacial_dmi"}
+
+    def has_nonzero_value(value: object) -> bool:
+        if value is None or isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            # NaN is non-zero here so malformed authored input remains visible
+            # to the normal finite-value validators instead of being silently
+            # treated as an inactive interaction.
+            return value != 0.0
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return any(has_nonzero_value(item) for item in value)
+        return False
+
+    has_dmi = any(
+        payload.get("kind") in dmi_kinds and has_nonzero_value(payload.get("D"))
+        for payload in energy_payloads
+    ) or any(
+        has_nonzero_value(payload.get(key))
         for payload in material_payloads
         for key in ("interfacial_dmi", "bulk_dmi", "dind_field", "dbulk_field")
     )
@@ -2296,7 +2324,14 @@ def _validate_authored_mixed_p1_scope(
         failed.append("demag_term_count_not_one")
     if any(
         payload.get("kind")
-        not in {"exchange", "demag", "zeeman", "interfacial_dmi", "bulk_dmi"}
+        not in {
+            "exchange",
+            "demag",
+            "zeeman",
+            "interfacial_dmi",
+            "bulk_dmi",
+            "rotated_interfacial_dmi",
+        }
         for payload in energy_payloads
     ):
         failed.append("unsupported_energy_term")
@@ -2364,12 +2399,25 @@ class Problem:
     mechanical_loads: Sequence[MechanicalLoad] = ()
     selections: Sequence[SelectionDefinition] = ()
     magnetization_constraints: Sequence[FrozenSpins] = ()
+    # Optional versioned authoring parameter library.  It is lowered as
+    # authoring metadata only; solver code continues to consume resolved SI
+    # values through the existing material/physics contracts.
+    parameters: ParameterLibrary | None = None
 
     # Periodic boundary conditions (per-axis, for FDM)
     pbc: FdmPbc | tuple[bool, bool, bool] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", require_non_empty(self.name, "name"))
+        if self.parameters is not None:
+            if not isinstance(self.parameters, ParameterLibrary):
+                raise TypeError("Problem.parameters must be a ParameterLibrary or None")
+            # Construction is the authoring → Problem boundary.  Resolve now
+            # so unknown references, cycles and display-dimension conflicts
+            # fail before any runtime or meshing path can consume this object.
+            parameter_snapshot = ParameterLibrary.from_ir(self.parameters.to_ir())
+            parameter_snapshot.resolve_all()
+            object.__setattr__(self, "parameters", parameter_snapshot)
         roles = {
             require_non_empty(str(name), "auxiliary_geometry_roles.name"): require_non_empty(
                 str(role), "auxiliary_geometry_roles.role"
@@ -2399,7 +2447,7 @@ class Problem:
         if not self.energy and not any(
             _material_has_anisotropy(magnet.material) for magnet in self.magnets
         ):
-            raise ValueError(
+            raise IncompletePhysicsError(
                 "Problem requires at least one interaction or material anisotropy"
             )
 
@@ -2789,6 +2837,11 @@ class Problem:
                 "seeds": [],
             },
             "geometry": {"entries": [geometry.to_ir() for geometry in geometries]},
+            **(
+                {"parameters": self.parameters.to_ir()}
+                if self.parameters is not None
+                else {}
+            ),
             "geometry_assets": geometry_assets,
             "regions": [region.to_ir() for region in regions],
             "object_regions": [
@@ -2847,6 +2900,18 @@ class Problem:
         if physics_objects:
             result["physics_objects"] = physics_objects
         return result
+
+    def to_model_definition(self, *, model_id: str | None = None) -> "ModelDefinition":
+        """Return the read-only authoring projection for this problem.
+
+        The projection is an authoring/document boundary only.  It does not
+        materialize meshes, select a runtime, or create a second mutable
+        problem state.
+        """
+
+        from fullmag.model.authoring import ModelDefinition
+
+        return ModelDefinition.from_problem(self, model_id=model_id)
 
     def _collect_magnetization_constraints(self) -> tuple[FrozenSpins, ...]:
         collected: list[FrozenSpins] = list(self.magnetization_constraints)

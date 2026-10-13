@@ -14,6 +14,10 @@ fn main() {
 
     println!("cargo:rerun-if-changed=../../native/include/fullmag_fdm.h");
     println!("cargo:rerun-if-changed=../../native/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=../../native/cmake/ImportFullmagFdm.cmake");
+    println!("cargo:rerun-if-changed=../../native/cmake/RequireFemGpu.cmake");
+    println!("cargo:rerun-if-changed=../../native/cmake/FindFullmagMfem.cmake");
+    println!("cargo:rerun-if-changed=../../native/cmake/FindFullmagWindowsModal.cmake");
     println!("cargo:rerun-if-changed=../../backends/fdm/CMakeLists.txt");
     println!("cargo:rerun-if-changed=../../backends/fdm/api");
     println!("cargo:rerun-if-changed=../../backends/fdm/core");
@@ -258,6 +262,7 @@ fn generate_plan_desc_layout_assertions() {
     let mut grid_fields = 0usize;
     let mut material_fields = 0usize;
     let mut time_fields = 0usize;
+    let mut extension_fields = 0usize;
     for line in source.lines().map(str::trim) {
         if line.is_empty() || line.starts_with("/*") {
             continue;
@@ -324,6 +329,13 @@ fn generate_plan_desc_layout_assertions() {
                     ),
                 )
             }
+            "FULLMAG_FDM_PLAN_V2_EXTENSION_FIELD" => {
+                extension_fields += 1;
+                (
+                    field.to_string(),
+                    format!("std::mem::offset_of!(fullmag_fdm_plan_desc_v2, {field})"),
+                )
+            }
             other => panic!("unknown layout manifest macro: {other}"),
         };
         assertions.push_str(&format!(
@@ -342,6 +354,7 @@ fn generate_plan_desc_layout_assertions() {
     assert_eq!(grid_fields, 6, "grid descriptor field count drift");
     assert_eq!(material_fields, 4, "material descriptor field count drift");
     assert_eq!(time_fields, 13, "time policy descriptor field count drift");
+    assert_eq!(extension_fields, 2, "v2 extension field count drift");
 
     let generated = format!("{{\n{assertions}}}\n");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());

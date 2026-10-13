@@ -1,14 +1,84 @@
 use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const COMMAND_SETTLE_GRACE: Duration = Duration::from_secs(2);
+const API_INSTANCE_HEADER: &str = "x-fullmag-api-instance";
+
+#[derive(Clone, PartialEq, Eq)]
+struct GridSessionScope {
+    api_instance_id: String,
+    session_id: String,
+    session_epoch: String,
+    request_scope_epoch: String,
+}
+
+impl GridSessionScope {
+    fn started_at_unix_ms(&self) -> anyhow::Result<u128> {
+        let prefix = format!("{}@", self.session_id);
+        let timestamp = self.session_epoch.strip_prefix(&prefix)
+            .ok_or_else(|| anyhow::anyhow!("attached session epoch does not match its session ID"))?;
+        let value = timestamp.parse::<u128>()?;
+        anyhow::ensure!(value > 0 && value.to_string() == timestamp, "invalid attached session timestamp");
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod session_scope_tests {
+    use super::GridSessionScope;
+
+    #[test]
+    fn attached_timestamp_requires_exact_session_and_canonical_positive_time() {
+        let mut scope = GridSessionScope {
+            api_instance_id: "api".into(), session_id: "session-a".into(),
+            session_epoch: "session-a@1700000000000".into(), request_scope_epoch: "api:1".into(),
+        };
+        assert_eq!(scope.started_at_unix_ms().unwrap(), 1_700_000_000_000);
+        for invalid in ["session-b@1700000000000", "session-a@0", "session-a@01",
+                        "session-a@+1", "session-a@invalid"] {
+            scope.session_epoch = invalid.into();
+            assert!(scope.started_at_unix_ms().is_err(), "{invalid}");
+        }
+    }
+}
+
+struct GridCommandCustody {
+    command_id: String,
+    scope: GridSessionScope,
+}
+
+struct ScratchChildProof {
+    pid: u32,
+    command_id: String,
+    command_kind: String,
+    scope: GridSessionScope,
+}
+
+fn emit_scratch_child_proof(proof: &ScratchChildProof, state: &str, exit_code: Option<i32>, killed: bool) {
+    let Ok(nonce) = std::env::var("FULLMAG_SCRATCH_PROOF_NONCE") else { return; };
+    if !canonical_non_nil_uuid(&nonce) { return; }
+    let value = serde_json::json!({
+        "schema": "fullmag.development-browser-scratch-child.v1", "nonce": nonce,
+        "state": state, "pid": proof.pid, "command_id": proof.command_id,
+        "command_kind": proof.command_kind, "api_instance_id": proof.scope.api_instance_id,
+        "session_id": proof.scope.session_id, "session_epoch": proof.scope.session_epoch,
+        "request_scope_epoch": proof.scope.request_scope_epoch,
+        "waited": state == "waited", "exit_code": exit_code, "kill_requested": killed,
+    });
+    use std::io::Write;
+    let mut output = std::io::stdout().lock();
+    let _ = writeln!(output, "{value}");
+    let _ = output.flush();
+}
 
 enum CurrentSession {
     NoActive,
@@ -24,27 +94,88 @@ pub(crate) fn spawn(
     api_port: u16,
     executable: PathBuf,
     ignored_session: Option<String>,
+    expected_api_instance_id: String,
 ) -> ScratchRuntimeHandle {
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stop);
-    let handle = thread::Builder::new()
-        .name("fullmag-scratch-runtime-supervisor".to_string())
-        .spawn(move || run(worker_stop, api_port, executable, ignored_session))
-        .expect("scratch runtime supervisor thread should spawn");
-    ScratchRuntimeHandle {
-        stop,
-        worker: Some(handle),
-    }
+    let control = PauseControl::new();
+    let worker = if canonical_non_nil_uuid(&expected_api_instance_id) {
+        Some(
+            spawn_supervised_thread(
+                Arc::clone(&control),
+                "fullmag-scratch-runtime-supervisor",
+                move |worker_control| {
+                    run(
+                        worker_control,
+                        api_port,
+                        executable,
+                        ignored_session,
+                        expected_api_instance_id,
+                    )
+                },
+            )
+            .expect("scratch runtime supervisor thread should spawn"),
+        )
+    } else {
+        eprintln!("[fullmag] scratch runtime supervisor disabled: invalid API instance pin");
+        control.publish_stopped();
+        None
+    };
+    ScratchRuntimeHandle { control, worker }
 }
 
 pub(crate) struct ScratchRuntimeHandle {
-    stop: Arc<AtomicBool>,
+    control: Arc<PauseControl>,
     worker: Option<JoinHandle<()>>,
+}
+
+impl ScratchRuntimeHandle {
+    pub(crate) fn pause_if_idle(
+        &self,
+        timeout: Duration,
+    ) -> anyhow::Result<ScratchRuntimePauseGuard> {
+        self.control.begin_pause(timeout)?.wait_for_ack()
+    }
+
+    pub(crate) fn shutdown_paused(
+        &mut self,
+        mut guard: ScratchRuntimePauseGuard,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Arc::ptr_eq(&self.control, &guard.control),
+            "pause guard belongs to a different scratch runtime"
+        );
+        anyhow::ensure!(
+            self.worker
+                .as_ref()
+                .is_some_and(|worker| worker.thread().id() != thread::current().id()),
+            "scratch runtime worker is unavailable or cannot join itself"
+        );
+
+        {
+            let mut state = self.control.lock_state();
+            anyhow::ensure!(
+                matches!(state.pause, PausePhase::Paused { token } if token == guard.token),
+                "pause guard no longer owns the scratch runtime pause"
+            );
+            state.stopping = true;
+            state.pause = PausePhase::None;
+            guard.armed = false;
+            self.control.changed.notify_all();
+        }
+
+        let worker = self
+            .worker
+            .take()
+            .expect("worker presence was checked before shutdown");
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("scratch runtime supervisor panicked during shutdown"))?;
+        Ok(())
+    }
 }
 
 impl Drop for ScratchRuntimeHandle {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.control.request_stop();
         let Some(worker) = self.worker.take() else {
             return;
         };
@@ -54,11 +185,317 @@ impl Drop for ScratchRuntimeHandle {
     }
 }
 
-fn run(stop: Arc<AtomicBool>, api_port: u16, executable: PathBuf, ignored_session: Option<String>) {
-    let client = match Client::builder().timeout(Duration::from_secs(1)).build() {
+#[derive(Clone, Copy)]
+enum PauseRefusal {
+    Busy,
+    TimedOut,
+}
+
+#[derive(Clone, Copy)]
+enum PausePhase {
+    None,
+    Requested { token: u64, deadline: Instant },
+    Paused { token: u64 },
+    Refused { token: u64, reason: PauseRefusal },
+}
+
+struct PauseState {
+    next_token: u64,
+    pause: PausePhase,
+    stopping: bool,
+    stopped: bool,
+}
+
+struct PauseControl {
+    state: Mutex<PauseState>,
+    changed: Condvar,
+}
+
+impl PauseControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(PauseState {
+                next_token: 1,
+                pause: PausePhase::None,
+                stopping: false,
+                stopped: false,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, PauseState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin_pause(self: &Arc<Self>, timeout: Duration) -> anyhow::Result<PauseRequestTicket> {
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(timeout)
+            .ok_or_else(|| anyhow::anyhow!("scratch runtime pause timeout is too large"))?;
+        let token = {
+            let mut state = self.lock_state();
+            anyhow::ensure!(
+                !state.stopping && !state.stopped,
+                "scratch runtime supervisor is stopped"
+            );
+            anyhow::ensure!(
+                matches!(state.pause, PausePhase::None),
+                "scratch runtime already has a pause request or guard"
+            );
+            let token = state.next_token;
+            state.next_token = state
+                .next_token
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("scratch runtime pause token space exhausted"))?;
+            state.pause = PausePhase::Requested { token, deadline };
+            token
+        };
+        self.changed.notify_all();
+        Ok(PauseRequestTicket {
+            control: Arc::clone(self),
+            token,
+            deadline,
+            armed: true,
+        })
+    }
+
+    fn wait_before_iteration(&self, idle: bool) -> bool {
+        let mut state = self.lock_state();
+        loop {
+            if state.stopping || state.stopped {
+                return false;
+            }
+            match state.pause {
+                PausePhase::Requested { token, deadline } => {
+                    let reason = if Instant::now() >= deadline {
+                        Some(PauseRefusal::TimedOut)
+                    } else if !idle {
+                        Some(PauseRefusal::Busy)
+                    } else {
+                        state.pause = PausePhase::Paused { token };
+                        self.changed.notify_all();
+                        continue;
+                    };
+                    state.pause = PausePhase::Refused {
+                        token,
+                        reason: reason.expect("non-idle or expired request has a refusal reason"),
+                    };
+                    self.changed.notify_all();
+                    return true;
+                }
+                PausePhase::Paused { token } => {
+                    state = self
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if matches!(state.pause, PausePhase::Paused { token: active } if active == token)
+                    {
+                        continue;
+                    }
+                }
+                PausePhase::None | PausePhase::Refused { .. } => return true,
+            }
+        }
+    }
+
+    fn wait_poll_interval(&self, interval: Duration) {
+        let deadline = Instant::now().checked_add(interval);
+        let Some(deadline) = deadline else {
+            return;
+        };
+        let mut state = self.lock_state();
+        while !state.stopping && !state.stopped && matches!(state.pause, PausePhase::None) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            let (next_state, result) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next_state;
+            if result.timed_out() {
+                return;
+            }
+        }
+    }
+
+    fn request_stop(&self) {
+        let mut state = self.lock_state();
+        state.stopping = true;
+        state.pause = PausePhase::None;
+        self.changed.notify_all();
+    }
+
+    fn is_stopping(&self) -> bool {
+        let state = self.lock_state();
+        state.stopping || state.stopped
+    }
+
+    fn publish_stopped(&self) {
+        let mut state = self.lock_state();
+        state.stopping = true;
+        state.stopped = true;
+        if !matches!(state.pause, PausePhase::Paused { .. }) {
+            state.pause = PausePhase::None;
+        }
+        self.changed.notify_all();
+    }
+
+    fn cancel_pause(&self, token: u64) {
+        let mut state = self.lock_state();
+        let owns_phase = matches!(
+            state.pause,
+            PausePhase::Requested { token: active, .. }
+                | PausePhase::Paused { token: active }
+                | PausePhase::Refused { token: active, .. }
+                if active == token
+        );
+        if owns_phase {
+            state.pause = PausePhase::None;
+            self.changed.notify_all();
+        }
+    }
+}
+
+struct PauseRequestTicket {
+    control: Arc<PauseControl>,
+    token: u64,
+    deadline: Instant,
+    armed: bool,
+}
+
+impl PauseRequestTicket {
+    fn wait_for_ack(mut self) -> anyhow::Result<ScratchRuntimePauseGuard> {
+        loop {
+            let mut state = self.control.lock_state();
+            if state.stopping || state.stopped {
+                anyhow::bail!("scratch runtime supervisor stopped before acknowledging pause");
+            }
+            if matches!(state.pause, PausePhase::Paused { token } if token == self.token) {
+                self.armed = false;
+                return Ok(ScratchRuntimePauseGuard {
+                    control: Arc::clone(&self.control),
+                    token: self.token,
+                    armed: true,
+                });
+            }
+            match state.pause {
+                PausePhase::Refused { token, reason } if token == self.token => {
+                    state.pause = PausePhase::None;
+                    self.control.changed.notify_all();
+                    self.armed = false;
+                    match reason {
+                        PauseRefusal::Busy => anyhow::bail!(
+                            "scratch runtime has active or pending work and cannot pause"
+                        ),
+                        PauseRefusal::TimedOut => {
+                            anyhow::bail!("scratch runtime pause request timed out")
+                        }
+                    }
+                }
+                PausePhase::Requested { token, .. } if token == self.token => {
+                    let remaining = self.deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        state.pause = PausePhase::None;
+                        self.control.changed.notify_all();
+                        self.armed = false;
+                        anyhow::bail!("scratch runtime pause request timed out");
+                    }
+                    let (state, _) = self
+                        .control
+                        .changed
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    drop(state);
+                }
+                PausePhase::None
+                | PausePhase::Requested { .. }
+                | PausePhase::Paused { .. }
+                | PausePhase::Refused { .. } => {
+                    anyhow::bail!("scratch runtime pause request was revoked or replaced")
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PauseRequestTicket {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control.cancel_pause(self.token);
+        }
+    }
+}
+
+pub(crate) struct ScratchRuntimePauseGuard {
+    control: Arc<PauseControl>,
+    token: u64,
+    armed: bool,
+}
+
+impl Drop for ScratchRuntimePauseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control.cancel_pause(self.token);
+            self.armed = false;
+        }
+    }
+}
+
+fn spawn_supervised_thread<F>(
+    control: Arc<PauseControl>,
+    thread_name: &str,
+    worker: F,
+) -> std::io::Result<JoinHandle<()>>
+where
+    F: FnOnce(Arc<PauseControl>) + Send + 'static,
+{
+    let thread_control = Arc::clone(&control);
+    thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            let terminal_control = Arc::clone(&thread_control);
+            let _ = catch_unwind(AssertUnwindSafe(|| worker(thread_control)));
+            terminal_control.publish_stopped();
+        })
+}
+
+fn canonical_non_nil_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == value)
+}
+
+fn pinned_client(expected_api_instance_id: &str) -> anyhow::Result<Client> {
+    anyhow::ensure!(
+        canonical_non_nil_uuid(expected_api_instance_id),
+        "invalid API instance pin"
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static(API_INSTANCE_HEADER),
+        HeaderValue::from_bytes(expected_api_instance_id.as_bytes())?,
+    );
+    Ok(Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(1))
+        .build()?)
+}
+
+fn run(
+    control: Arc<PauseControl>,
+    api_port: u16,
+    executable: PathBuf,
+    ignored_session: Option<String>,
+    expected_api_instance_id: String,
+) {
+    let client = match pinned_client(&expected_api_instance_id) {
         Ok(client) => client,
         Err(error) => {
-            eprintln!("[fullmag] scratch runtime supervisor disabled: {error}");
+            eprintln!("[fullmag] scratch runtime supervisor disabled: {error:#}");
             return;
         }
     };
@@ -70,11 +507,32 @@ fn run(stop: Arc<AtomicBool>, api_port: u16, executable: PathBuf, ignored_sessio
     let mut settling_command: Option<(String, bool, Instant)> = None;
     let mut pending_failure: Option<(String, String)> = None;
     let mut child: Option<Child> = None;
+    let mut grid_command: Option<GridCommandCustody> = None;
+    let mut child_proof: Option<ScratchChildProof> = None;
+    // A lost synchronization response cannot prove that its writer stopped.
+    // Retain ownership until explicit workspace recovery, without replaying it.
+    let mut synchronization_unknown = false;
 
-    while !stop.load(Ordering::Acquire) {
+    loop {
+        let idle = child.is_none()
+            && handled_command_id.is_none()
+            && settling_command.is_none()
+            && pending_failure.is_none()
+            && !synchronization_unknown;
+        if !control.wait_before_iteration(idle) {
+            break;
+        }
+        if synchronization_unknown {
+            control.wait_poll_interval(POLL_INTERVAL);
+            continue;
+        }
+
         if let Some(active_child) = child.as_mut() {
             match active_child.try_wait() {
                 Ok(Some(status)) => {
+                    if let Some(proof) = child_proof.take() {
+                        emit_scratch_child_proof(&proof, "waited", status.code(), false);
+                    }
                     eprintln!("[fullmag] scratch attached runtime exited with status {status}");
                     child = None;
                     if let Some(command_id) = handled_command_id.take() {
@@ -88,19 +546,47 @@ fn run(stop: Arc<AtomicBool>, api_port: u16, executable: PathBuf, ignored_sessio
                 Ok(None) => {}
                 Err(error) => {
                     eprintln!("[fullmag] scratch attached runtime status check failed: {error}");
-                    child = None;
-                    if let Some(command_id) = handled_command_id.take() {
-                        settling_command =
-                            Some((command_id, false, Instant::now() + COMMAND_SETTLE_GRACE));
-                    }
+                    // A failed observation is not an exit or a released handle.
+                    control.wait_poll_interval(POLL_INTERVAL);
+                    continue;
                 }
+            }
+        }
+
+        if let Some(grid) = grid_command.as_ref() {
+            // Grid-only custody is independent of later scene edits. The child
+            // never accepts a solver command and must finish with its own wait.
+            if child.is_some() {
+                control.wait_poll_interval(POLL_INTERVAL);
+                continue;
+            }
+            if grid_command_is_terminal(&client, &api_base, grid) == Some(true) {
+                grid_command = None;
+                settling_command = None;
+                handled_command_id = None;
+                attached_session = None;
+                attached_backend = None;
+                attached_scene_revision = None;
+            } else {
+                if settling_command.as_ref().is_some_and(|(_, _, deadline)| Instant::now() >= *deadline)
+                    && current_grid_scope(&client, &api_base, &expected_api_instance_id).as_ref() == Some(&grid.scope)
+                {
+                    let _ = report_command_failure(
+                        &client, &api_base, &grid.command_id,
+                        "grid-only attached runtime exited before an exact terminal receipt",
+                    );
+                }
+                // Missing/foreign receipts remain unknown; do not acknowledge
+                // observer pause or attach another runtime on that evidence.
+                control.wait_poll_interval(POLL_INTERVAL);
+                continue;
             }
         }
 
         let session = current_session(&client, &api_base);
         match session {
             CurrentSession::NoActive => {
-                terminate_child(&mut child);
+                terminate_child(&mut child, &mut child_proof);
                 attached_session = None;
                 attached_backend = None;
                 attached_scene_revision = None;
@@ -114,7 +600,7 @@ fn run(stop: Arc<AtomicBool>, api_port: u16, executable: PathBuf, ignored_sessio
                 backend: _,
                 scene_revision: _,
             } if ignored_session.as_deref() == Some(session_id.as_str()) => {
-                terminate_child(&mut child);
+                terminate_child(&mut child, &mut child_proof);
                 attached_session = None;
                 attached_backend = None;
                 attached_scene_revision = None;
@@ -138,7 +624,7 @@ fn run(stop: Arc<AtomicBool>, api_port: u16, executable: PathBuf, ignored_sessio
                     .zip(scene_revision)
                     .is_some_and(|(active, current)| active != current);
                 if session_changed || backend_changed || scene_changed {
-                    terminate_child(&mut child);
+                    terminate_child(&mut child, &mut child_proof);
                     if session_changed {
                         handled_command_id = None;
                         settling_command = None;
@@ -168,7 +654,7 @@ fn run(stop: Arc<AtomicBool>, api_port: u16, executable: PathBuf, ignored_sessio
                     let terminal = command_is_terminal(&client, &api_base, &command_id);
                     if terminal != Some(true) && Instant::now() < deadline {
                         settling_command = Some((command_id, exited_cleanly, deadline));
-                        thread::sleep(POLL_INTERVAL);
+                        control.wait_poll_interval(POLL_INTERVAL);
                         continue;
                     }
                     if terminal != Some(true) {
@@ -187,13 +673,28 @@ fn run(stop: Arc<AtomicBool>, api_port: u16, executable: PathBuf, ignored_sessio
                     if report_command_failure(&client, &api_base, command_id, error) {
                         pending_failure = None;
                     } else {
-                        thread::sleep(POLL_INTERVAL);
+                        control.wait_poll_interval(POLL_INTERVAL);
                         continue;
                     }
                 }
 
                 if child.is_none() && matches!(backend.as_str(), "fdm" | "fem") {
-                    if let Some(command_id) = pending_compute_command(&client, &api_base) {
+                    if let Some((command_id, grid_refresh_only, command_kind)) = pending_compute_command(&client, &api_base) {
+                        let proof_scope = current_grid_scope(&client, &api_base, &expected_api_instance_id)
+                            .filter(|scope| scope.session_id == session_id);
+                        let Some(attached_scope) = proof_scope.as_ref() else {
+                            control.wait_poll_interval(POLL_INTERVAL);
+                            continue;
+                        };
+                        let grid_scope = if grid_refresh_only {
+                            let Some(scope) = proof_scope.clone() else {
+                                control.wait_poll_interval(POLL_INTERVAL);
+                                continue;
+                            };
+                            Some(scope)
+                        } else {
+                            None
+                        };
                         if current_session_matches(
                             &client,
                             &api_base,
@@ -209,27 +710,44 @@ fn run(stop: Arc<AtomicBool>, api_port: u16, executable: PathBuf, ignored_sessio
                                         &session_id,
                                         &backend,
                                         scene_revision,
-                                    ) {
+                                    ) && current_grid_scope(&client, &api_base, &expected_api_instance_id).as_ref() == Some(attached_scope) {
                                         match spawn_attached_runtime(
                                             &executable,
                                             api_port,
                                             &session_id,
                                             &backend,
                                             &script_path,
+                                            grid_refresh_only.then_some(command_id.as_str()),
+                                            attached_scope,
                                         ) {
                                             Ok(next_child) => {
+                                                child_proof = proof_scope.map(|scope| ScratchChildProof {
+                                                    pid: next_child.id(), command_id: command_id.clone(),
+                                                    command_kind, scope,
+                                                });
+                                                if let Some(proof) = child_proof.as_ref() {
+                                                    emit_scratch_child_proof(proof, "started", None, false);
+                                                }
                                                 eprintln!(
                                                     "[fullmag] attached scratch runtime started for {backend} session {session_id} command {command_id}"
                                                 );
                                                 attached_session = Some(session_id);
                                                 attached_backend = Some(backend);
                                                 attached_scene_revision = scene_revision;
+                                                grid_command = grid_scope.map(|scope| GridCommandCustody {
+                                                    command_id: command_id.clone(), scope,
+                                                });
                                                 handled_command_id = Some(command_id);
                                                 child = Some(next_child);
                                             }
-                                            Err(error) => eprintln!(
-                                                "[fullmag] failed to start attached scratch runtime: {error}"
-                                            ),
+                                            Err(error) => {
+                                                eprintln!("[fullmag] failed to start attached scratch runtime: {error}");
+                                                if grid_refresh_only
+                                                    && current_grid_scope(&client, &api_base, &expected_api_instance_id) == grid_scope
+                                                {
+                                                    let _ = report_command_failure(&client, &api_base, &command_id, "grid-only runtime could not be started");
+                                                }
+                                            }
                                         }
                                     } else {
                                         eprintln!(
@@ -238,9 +756,19 @@ fn run(stop: Arc<AtomicBool>, api_port: u16, executable: PathBuf, ignored_sessio
                                     }
                                 }
                                 Err(error) => {
+                                    if error.is_unknown() {
+                                        synchronization_unknown = true;
+                                        eprintln!("[fullmag] model synchronization outcome is unknown; automatic replay and runtime attachment are fenced until workspace recovery: {error}");
+                                        continue;
+                                    }
                                     eprintln!(
                                         "[fullmag] scratch scene is not runnable yet; waiting for authoring ACK: {error}"
                                     );
+                                    if grid_refresh_only
+                                        && current_grid_scope(&client, &api_base, &expected_api_instance_id) == grid_scope
+                                    {
+                                        let _ = report_command_failure(&client, &api_base, &command_id, &format!("grid model synchronization failed: {error}"));
+                                    }
                                 }
                             }
                         }
@@ -249,10 +777,10 @@ fn run(stop: Arc<AtomicBool>, api_port: u16, executable: PathBuf, ignored_sessio
             }
         }
 
-        thread::sleep(POLL_INTERVAL);
+        control.wait_poll_interval(POLL_INTERVAL);
     }
 
-    terminate_child(&mut child);
+    terminate_child(&mut child, &mut child_proof);
 }
 
 fn current_session(client: &Client, api_base: &str) -> CurrentSession {
@@ -381,7 +909,53 @@ fn normalize_backend(value: &str) -> Option<String> {
     }
 }
 
-fn pending_compute_command(client: &Client, api_base: &str) -> Option<String> {
+fn current_grid_scope(client: &Client, api_base: &str, expected_api_instance_id: &str) -> Option<GridSessionScope> {
+    let response = client.get(format!("{api_base}/v2/sessions/current/status"))
+        .send().ok()?.error_for_status().ok()?;
+    if response.headers().get(API_INSTANCE_HEADER)?.to_str().ok()? != expected_api_instance_id {
+        return None;
+    }
+    let body = response.json::<Value>().ok()?;
+    let session = body.get("session")?;
+    let text = |name| session.get(name)?.as_str().filter(|value| !value.is_empty()).map(str::to_owned);
+    Some(GridSessionScope {
+        api_instance_id: expected_api_instance_id.to_string(),
+        session_id: text("session_id")?,
+        session_epoch: text("session_epoch")?,
+        request_scope_epoch: text("request_scope_epoch")?,
+    })
+}
+
+fn grid_terminal_receipt(body: &Value, command_id: &str) -> bool {
+    let status = body.get("status").and_then(Value::as_str);
+    let completion = body.get("completion_status").and_then(Value::as_str);
+    let created = body.get("created_at_unix_ms").and_then(Value::as_u64);
+    let completed = body.get("completed_at_unix_ms").and_then(Value::as_u64);
+    body.get("command_id").and_then(Value::as_str) == Some(command_id)
+        && body.get("kind").and_then(Value::as_str) == Some("fdm_grid_refresh")
+        && matches!(status, Some("completed" | "failed" | "rejected"))
+        && status == completion
+        && created.zip(completed).is_some_and(|(created, completed)| completed > 0 && completed >= created)
+}
+
+fn grid_command_is_terminal(client: &Client, api_base: &str, grid: &GridCommandCustody) -> Option<bool> {
+    if current_grid_scope(client, api_base, &grid.scope.api_instance_id).as_ref() != Some(&grid.scope) {
+        return None;
+    }
+    let response = client.get(format!(
+        "{api_base}/v2/sessions/current/simulation/commands/{}", grid.command_id
+    )).send().ok()?.error_for_status().ok()?;
+    if response.headers().get(API_INSTANCE_HEADER)?.to_str().ok()? != grid.scope.api_instance_id {
+        return None;
+    }
+    let body = response.json::<Value>().ok()?;
+    if current_grid_scope(client, api_base, &grid.scope.api_instance_id).as_ref() != Some(&grid.scope) {
+        return None;
+    }
+    Some(grid_terminal_receipt(&body, &grid.command_id))
+}
+
+fn pending_compute_command(client: &Client, api_base: &str) -> Option<(String, bool, String)> {
     let Ok(response) = client
         .get(format!(
             "{api_base}/v2/sessions/current/simulation/commands"
@@ -405,12 +979,12 @@ fn pending_compute_command(client: &Client, api_base: &str) -> Option<String> {
                 if matches!(
                     status,
                     Some("queued" | "pending" | "accepted" | "dispatched")
-                ) && matches!(kind, Some("remesh" | "relax" | "run" | "solve"))
+                ) && matches!(kind, Some("fdm_grid_refresh" | "remesh" | "relax" | "run" | "solve"))
                 {
                     command
                         .get("command_id")
                         .and_then(Value::as_str)
-                        .map(str::to_string)
+                        .map(|id| (id.to_string(), kind == Some("fdm_grid_refresh"), kind.unwrap_or_default().to_string()))
                 } else {
                     None
                 }
@@ -418,18 +992,51 @@ fn pending_compute_command(client: &Client, api_base: &str) -> Option<String> {
         })
 }
 
-fn render_current_scene(client: &Client, api_base: &str) -> anyhow::Result<PathBuf> {
+#[derive(Debug)]
+enum SceneSynchronizationError {
+    Rejected(reqwest::StatusCode),
+    Unknown(anyhow::Error),
+}
+
+impl SceneSynchronizationError {
+    fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown(_))
+    }
+}
+
+impl std::fmt::Display for SceneSynchronizationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(status) => write!(formatter, "model sync returned HTTP {status}"),
+            Self::Unknown(error) => write!(formatter, "{error:#}"),
+        }
+    }
+}
+
+fn render_current_scene(client: &Client, api_base: &str) -> Result<PathBuf, SceneSynchronizationError> {
     let response = client
         .post(format!("{api_base}/v2/sessions/current/model/syncs"))
+        // The server bounds and waits for its Python helper at 30 seconds.
+        // Keep fast metadata polling unchanged while allowing the write to finish.
+        .timeout(Duration::from_secs(45))
         .json(&serde_json::json!({}))
-        .send()?
-        .error_for_status()?;
-    let body = response.json::<Value>()?;
+        .send()
+        .map_err(|error| SceneSynchronizationError::Unknown(error.into()))?;
+    if !response.status().is_success() {
+        if response.status().is_server_error() {
+            return Err(SceneSynchronizationError::Unknown(anyhow::anyhow!(
+                "model sync returned HTTP {}; helper shutdown is not confirmed", response.status()
+            )));
+        }
+        return Err(SceneSynchronizationError::Rejected(response.status()));
+    }
+    let body = response.json::<Value>()
+        .map_err(|error| SceneSynchronizationError::Unknown(error.into()))?;
     let path = body
         .get("script_path")
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("model sync did not return script_path"))?;
+        .ok_or_else(|| SceneSynchronizationError::Unknown(anyhow::anyhow!("model sync did not return script_path")))?;
     Ok(PathBuf::from(path))
 }
 
@@ -439,7 +1046,11 @@ fn spawn_attached_runtime(
     session_id: &str,
     backend: &str,
     script_path: &PathBuf,
+    grid_refresh_command_id: Option<&str>,
+    session_scope: &GridSessionScope,
 ) -> anyhow::Result<Child> {
+    anyhow::ensure!(session_scope.session_id == session_id, "attached runtime session scope mismatch");
+    let started_at_unix_ms = session_scope.started_at_unix_ms()?;
     let mut command = Command::new(executable);
     command
         .arg(script_path)
@@ -452,18 +1063,293 @@ fn spawn_attached_runtime(
         .arg("double")
         .env("FULLMAG_API_PORT", api_port.to_string())
         .env("FULLMAG_ATTACHED_SESSION_ID", session_id)
+        .env("FULLMAG_ATTACHED_SESSION_STARTED_AT_UNIX_MS", started_at_unix_ms.to_string())
         .env("FULLMAG_ATTACHED_WAIT_FOR_SOLVE", "1")
         .env("FULLMAG_SKIP_CONTROL_ROOM", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    command.env_remove("FULLMAG_ATTACHED_GRID_REFRESH_COMMAND_ID");
+    if let Some(command_id) = grid_refresh_command_id {
+        command.env("FULLMAG_ATTACHED_GRID_REFRESH_COMMAND_ID", command_id);
+    }
     Ok(command.spawn()?)
 }
 
-fn terminate_child(child: &mut Option<Child>) {
+fn terminate_child(child: &mut Option<Child>, proof: &mut Option<ScratchChildProof>) {
     let Some(mut child_process) = child.take() else {
         return;
     };
     let _ = child_process.kill();
-    let _ = child_process.wait();
+    if let Ok(status) = child_process.wait() {
+        if let Some(proof) = proof.take() {
+            emit_scratch_child_proof(&proof, "waited", status.code(), true);
+        }
+    }
+}
+
+#[cfg(test)]
+mod grid_receipt_tests {
+    use super::grid_terminal_receipt;
+
+    #[test]
+    fn grid_receipt_requires_exact_command_and_matching_terminal_completion() {
+        let good = serde_json::json!({
+            "command_id": "grid-command", "kind": "fdm_grid_refresh",
+            "status": "completed", "completion_status": "completed",
+            "created_at_unix_ms": 10, "completed_at_unix_ms": 11
+        });
+        assert!(grid_terminal_receipt(&good, "grid-command"));
+        assert!(!grid_terminal_receipt(&good, "different-command"));
+        for (field, value) in [
+            ("kind", serde_json::json!("solve")),
+            ("status", serde_json::json!("running")),
+            ("completion_status", serde_json::json!("failed")),
+            ("completed_at_unix_ms", serde_json::json!(0)),
+            ("completed_at_unix_ms", serde_json::json!(9)),
+            ("completed_at_unix_ms", serde_json::Value::Null),
+        ] {
+            let mut invalid = good.clone();
+            invalid[field] = value;
+            assert!(!grid_terminal_receipt(&invalid, "grid-command"));
+        }
+        assert!(!grid_terminal_receipt(&serde_json::Value::Null, "grid-command"));
+    }
+}
+
+fn spawn_pause_diagnostic_handle<F>(
+    control: Arc<PauseControl>,
+    worker: F,
+) -> anyhow::Result<ScratchRuntimeHandle>
+where
+    F: FnOnce(Arc<PauseControl>) + Send + 'static,
+{
+    let worker = spawn_supervised_thread(
+        Arc::clone(&control),
+        "fullmag-scratch-pause-diagnostic",
+        worker,
+    )?;
+    Ok(ScratchRuntimeHandle {
+        control,
+        worker: Some(worker),
+    })
+}
+
+fn wait_for_diagnostic_count(counter: &AtomicUsize, minimum: usize) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while counter.load(Ordering::Acquire) < minimum {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "scratch pause diagnostic worker did not make progress"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+fn wait_for_diagnostic_pause(control: &PauseControl, token: u64) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let state = control.lock_state();
+        if matches!(state.pause, PausePhase::Paused { token: active } if active == token) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !state.stopping && !state.stopped,
+            "diagnostic worker stopped before acknowledging pause"
+        );
+        drop(state);
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "diagnostic worker did not acknowledge pause"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn wait_for_diagnostic_release(
+    control: &PauseControl,
+    receiver: std::sync::mpsc::Receiver<()>,
+) -> bool {
+    loop {
+        if control.is_stopping() {
+            return false;
+        }
+        match receiver.recv_timeout(Duration::from_millis(5)) {
+            Ok(()) => return true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
+pub(crate) fn verify_idle_pause_control() -> anyhow::Result<Value> {
+    use std::sync::mpsc::sync_channel;
+
+    // Hold the diagnostic worker before its polling boundary so the busy
+    // refusal is deterministic and exercises the same control state as run().
+    let busy_control = PauseControl::new();
+    let (busy_ready_tx, busy_ready_rx) = sync_channel(1);
+    let (busy_release_tx, busy_release_rx) = sync_channel(1);
+    let (busy_boundary_tx, busy_boundary_rx) = sync_channel(1);
+    let busy_progress = Arc::new(AtomicUsize::new(0));
+    let busy_worker_progress = Arc::clone(&busy_progress);
+    let busy_handle = spawn_pause_diagnostic_handle(Arc::clone(&busy_control), move |control| {
+        let _ = busy_ready_tx.send(());
+        if wait_for_diagnostic_release(&control, busy_release_rx) {
+            let continued = control.wait_before_iteration(false);
+            let _ = busy_boundary_tx.send(continued);
+            while continued && control.wait_before_iteration(true) {
+                busy_worker_progress.fetch_add(1, Ordering::Release);
+                thread::yield_now();
+            }
+        }
+    })?;
+    busy_ready_rx.recv_timeout(Duration::from_secs(1))?;
+    let busy_request = busy_control.begin_pause(Duration::from_secs(1))?;
+    busy_release_tx.send(())?;
+    let busy_error = busy_request
+        .wait_for_ack()
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("busy scratch runtime unexpectedly paused"))?;
+    anyhow::ensure!(
+        busy_error.to_string().contains("active or pending work"),
+        "busy scratch runtime was refused for an unexpected reason: {busy_error:#}"
+    );
+    anyhow::ensure!(
+        busy_boundary_rx.recv_timeout(Duration::from_secs(1))?,
+        "busy diagnostic worker did not continue after refusing pause"
+    );
+    wait_for_diagnostic_count(&busy_progress, 1)?;
+    drop(busy_handle);
+
+    // Expire a request while the worker is held away from its boundary, then
+    // prove that processing that boundary later cannot acknowledge the old ID.
+    let timeout_control = PauseControl::new();
+    let (timeout_ready_tx, timeout_ready_rx) = sync_channel(1);
+    let (timeout_release_tx, timeout_release_rx) = sync_channel(1);
+    let (timeout_boundary_tx, timeout_boundary_rx) = sync_channel(1);
+    let timeout_handle =
+        spawn_pause_diagnostic_handle(Arc::clone(&timeout_control), move |control| {
+            let _ = timeout_ready_tx.send(());
+            if wait_for_diagnostic_release(&control, timeout_release_rx) {
+                let continued = control.wait_before_iteration(true);
+                let _ = timeout_boundary_tx.send(continued);
+            }
+        })?;
+    timeout_ready_rx.recv_timeout(Duration::from_secs(1))?;
+    let late_request = timeout_control.begin_pause(Duration::from_millis(10))?;
+    let timeout_error = late_request
+        .wait_for_ack()
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("held scratch runtime unexpectedly acknowledged pause"))?;
+    anyhow::ensure!(
+        timeout_error.to_string().contains("timed out"),
+        "held scratch runtime failed for an unexpected reason: {timeout_error:#}"
+    );
+    timeout_release_tx.send(())?;
+    anyhow::ensure!(
+        timeout_boundary_rx.recv_timeout(Duration::from_secs(1))?,
+        "late diagnostic boundary did not continue"
+    );
+    anyhow::ensure!(
+        matches!(timeout_control.lock_state().pause, PausePhase::None),
+        "timed-out request remained active after the late boundary"
+    );
+    drop(timeout_handle);
+
+    // Simulate a terminal notification racing with a waiter after the worker
+    // has acknowledged and retained the pause token. The waiter must reject it.
+    let terminal_control = PauseControl::new();
+    let (terminal_ready_tx, terminal_ready_rx) = sync_channel(1);
+    let terminal_handle =
+        spawn_pause_diagnostic_handle(Arc::clone(&terminal_control), move |control| {
+            let _ = terminal_ready_tx.send(());
+            while control.wait_before_iteration(true) {
+                thread::yield_now();
+            }
+        })?;
+    terminal_ready_rx.recv_timeout(Duration::from_secs(1))?;
+    let terminal_request = terminal_control.begin_pause(Duration::from_secs(1))?;
+    wait_for_diagnostic_pause(&terminal_control, terminal_request.token)?;
+    terminal_control.publish_stopped();
+    anyhow::ensure!(
+        matches!(
+            terminal_control.lock_state().pause,
+            PausePhase::Paused { token } if token == terminal_request.token
+        ),
+        "terminal diagnostic did not retain the acknowledged pause token"
+    );
+    let terminal_error = terminal_request
+        .wait_for_ack()
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("stopped scratch worker returned a pause guard"))?;
+    anyhow::ensure!(
+        terminal_error
+            .to_string()
+            .contains("stopped before acknowledging pause"),
+        "terminal scratch worker failed for an unexpected reason: {terminal_error:#}"
+    );
+    drop(terminal_handle);
+
+    // A returned guard holds a real worker at its polling boundary. Dropping it
+    // releases that worker; consuming it with shutdown joins the same worker.
+    let resume_control = PauseControl::new();
+    let resume_progress = Arc::new(AtomicUsize::new(0));
+    let resume_worker_progress = Arc::clone(&resume_progress);
+    let resume_handle =
+        spawn_pause_diagnostic_handle(Arc::clone(&resume_control), move |control| {
+            while control.wait_before_iteration(true) {
+                resume_worker_progress.fetch_add(1, Ordering::Release);
+                thread::yield_now();
+            }
+        })?;
+    wait_for_diagnostic_count(&resume_progress, 2)?;
+    let resume_guard = resume_handle.pause_if_idle(Duration::from_secs(1))?;
+    let paused_count = resume_progress.load(Ordering::Acquire);
+    thread::sleep(Duration::from_millis(10));
+    anyhow::ensure!(
+        resume_progress.load(Ordering::Acquire) == paused_count,
+        "guarded diagnostic worker progressed while paused"
+    );
+    drop(resume_guard);
+    wait_for_diagnostic_count(&resume_progress, paused_count.saturating_add(1))?;
+    drop(resume_handle);
+
+    let shutdown_control = PauseControl::new();
+    let shutdown_progress = Arc::new(AtomicUsize::new(0));
+    let shutdown_worker_progress = Arc::clone(&shutdown_progress);
+    let mut shutdown_handle =
+        spawn_pause_diagnostic_handle(Arc::clone(&shutdown_control), move |control| {
+            while control.wait_before_iteration(true) {
+                shutdown_worker_progress.fetch_add(1, Ordering::Release);
+                thread::yield_now();
+            }
+        })?;
+    wait_for_diagnostic_count(&shutdown_progress, 2)?;
+    let shutdown_guard = shutdown_handle.pause_if_idle(Duration::from_secs(1))?;
+    let shutdown_count = shutdown_progress.load(Ordering::Acquire);
+    shutdown_handle.shutdown_paused(shutdown_guard)?;
+    anyhow::ensure!(
+        shutdown_control.lock_state().stopped,
+        "paused diagnostic worker did not publish its stopped state"
+    );
+    thread::sleep(Duration::from_millis(10));
+    anyhow::ensure!(
+        shutdown_progress.load(Ordering::Acquire) == shutdown_count,
+        "shutdown diagnostic worker progressed after join"
+    );
+
+    Ok(serde_json::json!({
+        "schema": "fullmag.scratch_runtime.pause_control_diagnostic.v1",
+        "status": "passed",
+        "scope": "pause protocol with native threads; no API or solver execution",
+        "checks": {
+            "busy_refusal_preserves_progress": true,
+            "timeout_revokes_late_request": true,
+            "stopped_worker_does_not_ack_paused_request": true,
+            "guard_drop_resumes_worker": true,
+            "paused_shutdown_joins_worker": true
+        }
+    }))
 }

@@ -5,14 +5,16 @@ use crate::{
     SceneOerstedTimeDependence, ScenePrescribedSotDrive, SceneReactionLength, SceneRegionRef,
     SceneSpinBoundary, SceneSpinInterface, SceneSpinTorque, SceneSpinTransport,
     SceneSpinTransportMode, SceneStructuredCurrentClosure, SceneStructuredCurrentDrive,
-    SceneSurfaceRef, SceneTimeEnvelope, SceneTransportCoupling, SlonczewskiFormulaVersion,
-    StudyPipelineDocument, StudyPipelineNode,
+    SceneSurfaceRef, SceneTimeEnvelope, SceneTransportCoupling,
+    ScriptBuilderMagneticInteractionKind, SlonczewskiFormulaVersion, StudyPipelineDocument,
+    StudyPipelineNode,
 };
 use fullmag_ir::{
     CouplingEndpointIR, CouplingIR, CouplingKindIR, CouplingParametersIR, DriveActivationIR,
-    ExchangeCouplingModeIR, FieldSpatialProfileIR, FieldTargetIR, MaterialParameterAssignmentIR,
-    MaterialParameterFieldIR, MaterialParameterNameIR, MaterialTransitionSpecIR, MeshIR,
-    MonitorTargetIR, ObjectRegionIR, RegionFrameIR, RegionMeshPolicyIR, RegionShapeIR,
+    ExchangeCouplingModeIR, ExecutionOriginKindIR, FieldSpatialProfileIR, FieldTargetIR,
+    MaterialParameterAssignmentIR, MaterialParameterFieldIR, MaterialParameterNameIR,
+    MaterialTransitionSpecIR, MeshIR, MonitorTargetIR, ObjectRegionIR, RegionFrameIR,
+    RegionMeshPolicyIR, RegionShapeIR,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,6 +40,108 @@ impl Display for SceneDocumentValidationError {
 }
 
 impl std::error::Error for SceneDocumentValidationError {}
+
+fn validate_execution_profile_intent(
+    study: &crate::SceneStudyState,
+) -> Result<(), SceneDocumentValidationError> {
+    if study.execution_profile.is_none() && !study.execution_layers.is_empty() {
+        return Err(SceneDocumentValidationError::new(
+            "study.execution_layers require study.execution_profile",
+        ));
+    }
+
+    if let Some(profile) = study.execution_profile.as_ref() {
+        profile.validate().map_err(|error| {
+            SceneDocumentValidationError::new(format!(
+                "study.execution_profile is invalid: {error}"
+            ))
+        })?;
+    }
+
+    for (index, layer) in study.execution_layers.iter().enumerate() {
+        layer.origin.validate().map_err(|error| {
+            SceneDocumentValidationError::new(format!(
+                "study.execution_layers[{index}].origin is invalid: {error}"
+            ))
+        })?;
+        if matches!(
+            layer.origin.kind,
+            ExecutionOriginKindIR::ProductDefault | ExecutionOriginKindIR::Profile
+        ) {
+            return Err(SceneDocumentValidationError::new(format!(
+                "study.execution_layers[{index}].origin.kind must identify an authored request layer"
+            )));
+        }
+    }
+
+    if study.execution_profile.is_some() {
+        validate_profile_change_device_stages(study)?;
+    }
+
+    Ok(())
+}
+
+fn validate_profile_change_device_stages(
+    study: &crate::SceneStudyState,
+) -> Result<(), SceneDocumentValidationError> {
+    for (index, stage) in study.stages.iter().enumerate() {
+        if stage.kind.trim().eq_ignore_ascii_case("change_device")
+            || stage
+                .entrypoint_kind
+                .trim()
+                .eq_ignore_ascii_case("flat_change_device")
+        {
+            return Err(execution_profile_change_device_stage_error(&format!(
+                "study.stages[{index}]"
+            )));
+        }
+    }
+
+    if let Some(pipeline) = study.study_pipeline.as_ref() {
+        validate_profile_change_device_pipeline_nodes(
+            &pipeline.nodes,
+            "study.study_pipeline.nodes",
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_profile_change_device_pipeline_nodes(
+    nodes: &[StudyPipelineNode],
+    path: &str,
+) -> Result<(), SceneDocumentValidationError> {
+    for (index, node) in nodes.iter().enumerate() {
+        let node_path = format!("{path}[{index}]");
+        match node {
+            StudyPipelineNode::Primitive(node)
+                if node.stage_kind == crate::StudyPrimitiveStageKind::ChangeDevice
+                    || node
+                        .payload
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("change_device")) =>
+            {
+                return Err(execution_profile_change_device_stage_error(&node_path));
+            }
+            // MacroStageNode is a leaf with a macro kind/config, not nested child nodes.
+            StudyPipelineNode::Primitive(_) | StudyPipelineNode::Macro(_) => {}
+            StudyPipelineNode::Group(group) => {
+                validate_profile_change_device_pipeline_nodes(
+                    &group.children,
+                    &format!("{node_path}.children"),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execution_profile_change_device_stage_error(path: &str) -> SceneDocumentValidationError {
+    SceneDocumentValidationError::new(format!(
+        "execution_profile_change_device_stage_conflict: {path} cannot change the device while study.execution_profile is bound; declare per-step execution through canonical StudyPlan layers/references instead of change_device stages"
+    ))
+}
 
 pub fn validate_scene_document(scene: &SceneDocument) -> Result<(), SceneDocumentValidationError> {
     validate_scene_document_with_mode(scene, true)
@@ -67,6 +171,8 @@ fn validate_scene_document_with_mode(
     if scene.version == "scene.v1" {
         validate_scene_v1_has_no_region_owned_payloads(scene)?;
     }
+    validate_execution_profile_intent(&scene.study)?;
+    validate_dmi_scope_exclusivity(scene)?;
     if !matches!(
         scene.study.requested_mode.as_str(),
         "" | "strict" | "extended" | "hybrid"
@@ -90,7 +196,8 @@ fn validate_scene_document_with_mode(
         ));
     }
     for (index, stage) in scene.study.stages.iter().enumerate() {
-        validate_stage_solver_state(stage, index)?;
+        let builder_stage = stage.to_script_builder();
+        validate_stage_solver_state(&builder_stage, index)?;
     }
 
     let mut object_ids = BTreeSet::new();
@@ -200,6 +307,85 @@ fn validate_scene_document_with_mode(
     validate_scene_magnetization_constraints(scene, &object_ids)?;
 
     Ok(())
+}
+
+fn validate_dmi_scope_exclusivity(
+    scene: &SceneDocument,
+) -> Result<(), SceneDocumentValidationError> {
+    // SceneDocument currently has no periodicity field, so its magnetic
+    // boundary is conservatively treated as open.  The FDM planner remains
+    // the source of truth for the fully-periodic exception once PBC is in IR.
+    if scene
+        .study
+        .rotated_interfacial_dmi
+        .is_some_and(|d| d != 0.0)
+        && !scene.study.exchange_enabled
+    {
+        return Err(SceneDocumentValidationError::new(
+            "RotatedInterfacialDmi with open magnetic boundaries requires Exchange for the coupled natural boundary condition",
+        ));
+    }
+    let mut conflicts = BTreeSet::new();
+    for object in &scene.objects {
+        let mut interfacial_present = false;
+        let mut interfacial_enabled = false;
+        let mut bulk_present = false;
+        let mut bulk_enabled = false;
+        for interaction in &object.physics_stack {
+            match interaction.kind {
+                ScriptBuilderMagneticInteractionKind::RotatedInterfacialDmi => {
+                    return Err(SceneDocumentValidationError::new(
+                        "rotated_interfacial_dmi is study-scoped and cannot appear in object physics_stack",
+                    ));
+                }
+                ScriptBuilderMagneticInteractionKind::InterfacialDmi => {
+                    interfacial_present = true;
+                    interfacial_enabled = interaction.enabled;
+                }
+                ScriptBuilderMagneticInteractionKind::BulkDmi => {
+                    bulk_present = true;
+                    bulk_enabled = interaction.enabled;
+                }
+                _ => {}
+            }
+        }
+
+        if object.role != "magnet" {
+            continue;
+        }
+        let material = scene
+            .materials
+            .iter()
+            .find(|material| material.id == object.material_ref);
+        if !interfacial_present {
+            interfacial_enabled = material
+                .and_then(|material| material.properties.dind)
+                .is_some_and(|value| value != 0.0);
+        }
+        if !bulk_present {
+            bulk_enabled = material
+                .and_then(|material| material.properties.dbulk)
+                .is_some_and(|value| value != 0.0);
+        }
+        if scene.study.rotated_interfacial_dmi.is_none() {
+            continue;
+        }
+        if interfacial_enabled {
+            conflicts.insert("interfacial_dmi");
+        }
+        if bulk_enabled {
+            conflicts.insert("bulk_dmi");
+        }
+    }
+
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    Err(SceneDocumentValidationError::new(format!(
+        "rotated_interfacial_dmi is study-scoped and cannot coexist with active object-scoped {}",
+        conflicts.into_iter().collect::<Vec<_>>().join(", ")
+    )))
 }
 
 fn validate_scene_magnetization_constraints(
@@ -760,12 +946,12 @@ fn validate_adaptive_state(
         "max_error" => {
             return Err(SceneDocumentValidationError::new(format!(
                 "{context} max_error mode requires atol>0 and rtol=0"
-            )))
+            )));
         }
         other => {
             return Err(SceneDocumentValidationError::new(format!(
                 "{context} has unsupported tolerance_mode '{other}'"
-            )))
+            )));
         }
     }
     validate_present_positive(
@@ -993,7 +1179,7 @@ fn validate_spin_authoring(
             SceneSpinTransport::Unsupported(_) => {
                 return Err(SceneDocumentValidationError::new(format!(
                     "spin_transports[{index}] uses an unsupported read-only variant"
-                )))
+                )));
             }
         };
         if module.id.trim().is_empty() || !spin_transport_ids.insert(module.id.clone()) {
@@ -1236,7 +1422,7 @@ fn validate_spin_authoring(
             SceneOerstedField::Unsupported(_) => {
                 return Err(SceneDocumentValidationError::new(format!(
                     "oersted_fields[{index}] uses an unsupported read-only variant"
-                )))
+                )));
             }
         };
         match field {
@@ -2067,8 +2253,8 @@ fn validate_scene_conservative_current_view(
                     pair_faces.push(ids);
                     if !source_cut_faces.contains(&ids) {
                         return Err(SceneDocumentValidationError::new(format!(
-                        "{pair_path}.{field} must reference a boundary face with role source_cut"
-                    )));
+                            "{pair_path}.{field} must reference a boundary face with role source_cut"
+                        )));
                     }
                 }
                 if pair_faces[0] == pair_faces[1] {
@@ -2390,7 +2576,7 @@ fn validate_spin_torque(
         SceneSpinTorque::Unsupported(_) => {
             return Err(SceneDocumentValidationError::new(format!(
                 "spin_torques[{index}] uses an unsupported read-only variant"
-            )))
+            )));
         }
     };
     match torque {
@@ -2538,7 +2724,9 @@ fn validate_spin_torque(
                 }
                 SlonczewskiFormulaVersion::LegacyFullmagV0 => {
                     if target.is_some() || stack_normal.is_some() || realization.is_some() {
-                        return Err(SceneDocumentValidationError::new(format!("spin_torques[{index}] legacy Slonczewski must not define canonical geometry")));
+                        return Err(SceneDocumentValidationError::new(format!(
+                            "spin_torques[{index}] legacy Slonczewski must not define canonical geometry"
+                        )));
                     }
                     if !matches!(fixed_layer_position.as_deref(), Some("top" | "bottom")) {
                         return Err(SceneDocumentValidationError::new(format!(
@@ -2748,7 +2936,7 @@ fn validate_prescribed_drive(
         _ => {
             return Err(SceneDocumentValidationError::new(format!(
                 "spin_torques[{index}].drive is incompatible with formula_version"
-            )))
+            )));
         }
     }
     Ok(())
@@ -3381,6 +3569,152 @@ mod tests {
             }]
         }))
         .expect("test scene should deserialize")
+    }
+
+    #[test]
+    fn rotated_interfacial_dmi_rejects_active_object_scoped_dmi() {
+        for kind in [
+            crate::ScriptBuilderMagneticInteractionKind::InterfacialDmi,
+            crate::ScriptBuilderMagneticInteractionKind::BulkDmi,
+        ] {
+            let mut scene = region_owned_scene();
+            scene.study.rotated_interfacial_dmi = Some(-3.0e-3);
+            scene.study.exchange_enabled = true;
+            scene.objects[0]
+                .physics_stack
+                .push(crate::ScriptBuilderMagneticInteractionEntry {
+                    kind,
+                    enabled: true,
+                    params: None,
+                });
+
+            let error = validate_scene_document(&scene)
+                .expect_err("active object-scoped DMI must conflict with study rDMI");
+            assert!(
+                error.message.contains("study-scoped") && error.message.contains("cannot coexist"),
+                "{}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn rotated_interfacial_dmi_rejects_material_derived_object_dmi() {
+        for (kind, dind, dbulk) in [
+            (
+                crate::ScriptBuilderMagneticInteractionKind::InterfacialDmi,
+                Some(3.0e-3),
+                None,
+            ),
+            (
+                crate::ScriptBuilderMagneticInteractionKind::BulkDmi,
+                None,
+                Some(3.0e-3),
+            ),
+        ] {
+            let mut scene = region_owned_scene();
+            scene.materials[0].properties.dind = dind;
+            scene.materials[0].properties.dbulk = dbulk;
+            scene.study.rotated_interfacial_dmi = Some(-3.0e-3);
+            scene.study.exchange_enabled = true;
+
+            let error = validate_scene_document(&scene)
+                .expect_err("material-derived object DMI must conflict with study rDMI");
+            assert!(
+                error.message.contains("study-scoped") && error.message.contains("cannot coexist"),
+                "{}",
+                error.message
+            );
+
+            scene.objects[0]
+                .physics_stack
+                .push(crate::ScriptBuilderMagneticInteractionEntry {
+                    kind,
+                    enabled: false,
+                    params: None,
+                });
+            validate_scene_document(&scene)
+                .expect("explicitly disabled object DMI must suppress material injection");
+        }
+    }
+
+    #[test]
+    fn object_scoped_rotated_interfacial_dmi_is_rejected_without_study_term() {
+        for enabled in [false, true] {
+            let mut scene = region_owned_scene();
+            scene.objects[0]
+                .physics_stack
+                .push(crate::ScriptBuilderMagneticInteractionEntry {
+                    kind: crate::ScriptBuilderMagneticInteractionKind::RotatedInterfacialDmi,
+                    enabled,
+                    params: None,
+                });
+
+            let error = validate_scene_document(&scene)
+                .expect_err("object-scoped rotated DMI must be rejected unconditionally");
+            assert!(
+                error
+                    .message
+                    .contains("cannot appear in object physics_stack")
+            );
+        }
+    }
+
+    #[test]
+    fn rotated_interfacial_dmi_conflict_can_be_recovered_by_disabling_or_removing_object_dmi() {
+        for kind in [
+            crate::ScriptBuilderMagneticInteractionKind::InterfacialDmi,
+            crate::ScriptBuilderMagneticInteractionKind::BulkDmi,
+        ] {
+            let mut scene = region_owned_scene();
+            scene.study.rotated_interfacial_dmi = Some(-3.0e-3);
+            scene.study.exchange_enabled = true;
+            scene.objects[0]
+                .physics_stack
+                .push(crate::ScriptBuilderMagneticInteractionEntry {
+                    kind,
+                    enabled: true,
+                    params: None,
+                });
+
+            scene.objects[0].physics_stack[0].enabled = false;
+            validate_scene_document(&scene)
+                .expect("disabling object-scoped DMI must allow study rDMI");
+
+            scene.objects[0].physics_stack.clear();
+            validate_scene_document(&scene)
+                .expect("removing object-scoped DMI must allow study rDMI");
+        }
+    }
+
+    #[test]
+    fn nonzero_rotated_interfacial_dmi_requires_study_exchange_even_with_object_exchange() {
+        let mut scene = region_owned_scene();
+        scene.study.rotated_interfacial_dmi = Some(-3.0e-3);
+        scene.study.exchange_enabled = false;
+        scene.objects[0]
+            .physics_stack
+            .push(crate::ScriptBuilderMagneticInteractionEntry {
+                kind: crate::ScriptBuilderMagneticInteractionKind::Exchange,
+                enabled: true,
+                params: None,
+            });
+
+        let error = validate_scene_document_for_authoring(&scene)
+            .expect_err("object-scoped Exchange must not satisfy the global boundary coupling");
+        assert_eq!(
+            error.message,
+            "RotatedInterfacialDmi with open magnetic boundaries requires Exchange for the coupled natural boundary condition"
+        );
+
+        scene.study.exchange_enabled = true;
+        validate_scene_document_for_authoring(&scene)
+            .expect("global Exchange must make nonzero open-boundary rDMI authorable");
+
+        scene.study.exchange_enabled = false;
+        scene.study.rotated_interfacial_dmi = Some(0.0);
+        validate_scene_document_for_authoring(&scene)
+            .expect("zero rotated DMI is a no-op and must not require Exchange");
     }
 
     fn valid_closed_current_view_value() -> Value {

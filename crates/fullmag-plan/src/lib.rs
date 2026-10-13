@@ -12,8 +12,10 @@ use fullmag_ir::{BackendTarget, ExecutionMode, ExecutionPlanIR, ProblemIR, Study
 use fullmag_ir::*;
 
 mod antenna_zeeman;
+mod compute_resources;
 mod current_transport;
 mod error;
+mod execution_profile_guard;
 mod fdm;
 mod fem;
 mod geometry;
@@ -24,6 +26,7 @@ mod material_transition;
 mod mesh;
 mod oersted;
 mod physics_graph;
+pub mod preparation;
 pub mod quantities;
 mod region_conflict;
 mod region_textures;
@@ -32,6 +35,8 @@ mod sampling;
 mod selection;
 mod spin_torque;
 mod spin_transport;
+pub mod study_catalog;
+pub mod study_lowering;
 mod surface_selectors;
 mod util;
 mod validate;
@@ -60,6 +65,16 @@ pub use physics_graph::{
     physics_graph_runtime_provenance, physics_graph_sha256, resolve_physics_graph,
     resolve_physics_modules, ResolvedPhysicsModule,
 };
+pub use preparation::{
+    assess_selective_reuse, NativeFemMeshSpaceEvidence, PreparationCertificate,
+    PreparationJacobianQualityCertificate, PreparationMarkerCertificate,
+    PreparationMaterialization, PreparationPlan, PreparationPlanError, PreparationPlanSource,
+    PreparationProducer, PreparationProducerKind, PreparationQualityCertificate,
+    PreparationReuseDecision, PreparationReuseDisposition, PreparationReuseReason,
+    PreparationSpaceCertificate, PreparationStateTransfer, PREPARATION_CERTIFICATE_SCHEMA,
+    PREPARATION_PLAN_ACCEPTED_RUN_SCHEMA, PREPARATION_PLAN_SCHEMA,
+    PREPARATION_STATE_TRANSFER_SCHEMA,
+};
 pub use quantities::{
     default_capability_matrix, validate_quantity_requests, BackendFamily, CapabilityMatrix,
     QuantityCapability,
@@ -77,6 +92,16 @@ pub use selection::{
     compile_fdm_frozen_spins, compile_fem_frozen_spins, FdmFrozenSpinsDomain, FemIncidentElement,
     FemTrueDofDomain, FrozenSpinsCompileRequest, FrozenSpinsStateSnapshot,
     ResolvedFrozenSpinsReference, SelectionDofMembership,
+};
+pub use study_catalog::{
+    capture_study_input_references, lower_study_plan_with_catalog, CapturedStudyInputIdentity,
+    CapturedStudyInputReferences, StudyCatalogError, StudyProblemCatalog, StudyProblemCatalogEntry,
+    CAPTURED_STUDY_INPUT_IDENTITY_SCHEMA_V1, STUDY_PROBLEM_CATALOG_SCHEMA,
+    STUDY_PROBLEM_CATALOG_SCHEMA_V1, STUDY_PROBLEM_CATALOG_SCHEMA_V3,
+};
+pub use study_lowering::{
+    lower_study_plan, StudyExecutionPlan, StudyLoweringError, StudyStepExecutionPlan,
+    StudyStepLoweringStatus, STUDY_EXECUTION_PLAN_SCHEMA, STUDY_EXECUTION_PLAN_SCHEMA_V1,
 };
 pub use surface_selectors::{resolve_fem_surface_selector, ResolvedFemSurfaceSelector};
 pub use util::generate_random_unit_vectors;
@@ -101,6 +126,9 @@ fn routes_to_fdm_multilayer(problem: &ProblemIR) -> bool {
 /// - executable multilayer FDM for stacked multi-body cases,
 /// - executable FEM / FEM eigen with precomputed mesh assets.
 pub fn plan(problem: &ProblemIR) -> Result<ExecutionPlanIR, PlanError> {
+    execution_profile_guard::validate_bound_intent(problem).map_err(|reason| PlanError {
+        reasons: vec![reason],
+    })?;
     if sampling::has_unresolved_auto_sampling(problem) {
         let context = if util::active_stage_id(problem).is_none() {
             "runtime_metadata.active_stage_id and an enabled active sinc drive"
@@ -122,6 +150,15 @@ pub fn plan(problem: &ProblemIR) -> Result<ExecutionPlanIR, PlanError> {
         return Err(PlanError {
             reasons: graph_errors,
         });
+    }
+
+    if let Some(resources) =
+        fullmag_ir::ComputeResourcesIR::from_problem(problem).map_err(|reason| PlanError {
+            reasons: vec![reason],
+        })?
+    {
+        compute_resources::validate_current_runtime_support(&resources)
+            .map_err(|reasons| PlanError { reasons })?;
     }
 
     let mut errors = Vec::new();

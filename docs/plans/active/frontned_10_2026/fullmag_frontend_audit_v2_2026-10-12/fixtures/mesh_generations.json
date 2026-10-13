@@ -1,0 +1,79 @@
+{
+  "id": "MESH-01",
+  "kind": "planned_fixture_contract",
+  "owner": {
+    "project_id": "project-fixture",
+    "document_id": "doc-fixture",
+    "source_session_id": "session-fixture"
+  },
+  "cases": [
+    {
+      "id": "empty",
+      "presence": "not-built",
+      "assessment": null
+    },
+    {
+      "id": "matching",
+      "presence": "present",
+      "same_generation": true,
+      "same_input_digest": true,
+      "expected": "current"
+    },
+    {
+      "id": "source_old",
+      "presence": "present",
+      "source_scene_revision": 10,
+      "scene_revision": 11,
+      "legacy": true,
+      "expected": "stale"
+    },
+    {
+      "id": "future",
+      "presence": "present",
+      "source_scene_revision": 12,
+      "scene_revision": 11,
+      "expected": "inconsistent"
+    },
+    {
+      "id": "unknown_owner",
+      "presence": "present",
+      "missing_identity": true,
+      "expected": "unknown"
+    },
+    {
+      "id": "wrong_doc",
+      "presence": "present",
+      "different_document": true,
+      "expected": "incompatible"
+    },
+    {
+      "id": "mixed",
+      "presence": "present",
+      "manifest_generation": "g2",
+      "topology_generation": "g1",
+      "expected": "inconsistent"
+    },
+    {
+      "id": "optional_quality_absent",
+      "presence": "present",
+      "mandatory_complete": true,
+      "quality": null,
+      "expected": "current"
+    },
+    {
+      "id": "rename_only",
+      "presence": "present",
+      "source_scene_revision": 10,
+      "scene_revision": 11,
+      "same_input_digest": true,
+      "server_activation_valid": true,
+      "expected": "current"
+    },
+    {
+      "id": "stale_element",
+      "element_generation": "g1",
+      "active_generation": "g2",
+      "expected": "reject highlight/refinement; no ordinal rebinding"
+    }
+  ]
+}

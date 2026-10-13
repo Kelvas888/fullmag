@@ -1,9 +1,11 @@
-import { act } from "react";
+import { act, type ReactNode } from "react";
 import { createRoot, hydrateRoot } from "react-dom/client";
 import { renderToString, renderToStaticMarkup } from "react-dom/server";
 import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { KernelContext } from "@/kernel/KernelContext";
+import type { KernelApi } from "@/kernel/types";
 import {
   installSimulationPreparationTestDom,
   TestElement,
@@ -16,23 +18,51 @@ import {
   resetCrossSectionWorkspaceForTests,
 } from "@/kernel/workspace/crossSectionWorkspace";
 
-import { PlanarMonitorDraftInspectorPanel } from "./PlanarMonitorDraftInspectorPanel";
+import { InspectorEditSessionProvider } from "../InspectorEditSession";
+import { PlanarMonitorDraftInspectorPanel as UnwrappedPlanarMonitorDraftInspectorPanel } from "./PlanarMonitorDraftInspectorPanel";
 
 const mocks = vi.hoisted(() => ({
+  authoringHistory: undefined as { record: ReturnType<typeof vi.fn>; getGeneration?: () => number } | undefined,
   create: vi.fn(),
+  currentSessionScopeKey: "session=A&epoch=1&request_scope_epoch=1" as string | null,
+  historyGeneration: 0,
   invalidate: vi.fn(),
+  kernel: null as unknown,
+  scene: vi.fn(),
   setActiveViewportMainModule: vi.fn(),
   setFocusedSlot: vi.fn(),
   setPanelVisible: vi.fn(),
   setSelection: vi.fn(),
   queuePatch: vi.fn(),
   refetch: vi.fn(),
+  sessionIdentity: null as unknown,
   collection: { monitors: [] as unknown[], scene_revision: 7 },
 }));
 
-vi.mock("@/kernel/KernelContext", () => ({
-  useKernel: () => ({
-    api: { model: { planarMonitors: { create: mocks.create } } },
+const sessionA = {
+  sessionId: "A",
+  sessionEpoch: "1",
+  requestScopeEpoch: "1",
+} as const;
+const sessionAScopeKey = "session=A&epoch=1&request_scope_epoch=1";
+
+vi.mock("@/kernel/KernelContext", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@/kernel/KernelContext")>();
+  return {
+    ...original,
+    useKernel: () => mocks.kernel,
+  };
+});
+
+function createTestKernel(): KernelApi {
+  return {
+    api: { model: { planarMonitors: { create: mocks.create }, scene: mocks.scene } },
+    get authoringHistory() {
+      return mocks.authoringHistory
+        ? { ...mocks.authoringHistory, getGeneration: () => mocks.historyGeneration }
+        : undefined;
+    },
+    commands: { getSessionScopeKey: () => mocks.currentSessionScopeKey },
     layout: {
       setActiveViewportMainModule: mocks.setActiveViewportMainModule,
       setFocusedSlot: mocks.setFocusedSlot,
@@ -41,7 +71,27 @@ vi.mock("@/kernel/KernelContext", () => ({
     resources: { invalidate: mocks.invalidate },
     selection: { set: mocks.setSelection },
     visualizationSync: { queuePatch: mocks.queuePatch },
-  }),
+  } as unknown as KernelApi;
+}
+
+function TestProviders({ children }: { children: ReactNode }) {
+  return (
+    <KernelContext.Provider value={mocks.kernel as KernelApi}>
+      <InspectorEditSessionProvider>{children}</InspectorEditSessionProvider>
+    </KernelContext.Provider>
+  );
+}
+
+function PlanarMonitorDraftInspectorPanel() {
+  return (
+    <TestProviders>
+      <UnwrappedPlanarMonitorDraftInspectorPanel />
+    </TestProviders>
+  );
+}
+
+vi.mock("@/kernel/resources/useSessionStatus", () => ({
+  useSessionResourceIdentity: () => mocks.sessionIdentity,
 }));
 
 vi.mock("@/kernel/resources/planarMonitorResources", () => ({
@@ -67,6 +117,12 @@ describe("PlanarMonitorDraftInspectorPanel", () => {
     vi.clearAllMocks();
     mocks.collection.monitors = [];
     mocks.collection.scene_revision = 7;
+    mocks.authoringHistory = undefined;
+    mocks.currentSessionScopeKey = sessionAScopeKey;
+    mocks.historyGeneration = 0;
+    mocks.kernel = createTestKernel();
+    mocks.sessionIdentity = sessionA;
+    mocks.scene.mockReset();
     mocks.create.mockResolvedValue({
       monitor: beginPlanarMonitorDraft().monitor,
       scene_revision: 8,
@@ -114,10 +170,13 @@ describe("PlanarMonitorDraftInspectorPanel", () => {
       await act(async () => change(findControl(container, "Target kind"), "magnetic_domain"));
       await act(async () => findButton(container, "Apply monitor").click());
 
-      expect(mocks.create).toHaveBeenCalledWith({
-        expected_scene_revision: 7,
-        monitor: uiRoundtripFixture().create,
-      });
+      expect(mocks.create).toHaveBeenCalledWith(
+        {
+          expected_scene_revision: 7,
+          monitor: uiRoundtripFixture().create,
+        },
+        { sessionScopeKey: sessionAScopeKey },
+      );
       expect(crossSectionWorkspaceStore.getSnapshot().planarMonitorDraft).toBeNull();
       expect(mocks.invalidate).toHaveBeenCalledWith(expect.any(String), 8);
       expect(mocks.queuePatch).toHaveBeenCalledWith({
@@ -125,6 +184,97 @@ describe("PlanarMonitorDraftInspectorPanel", () => {
           source: { kind: "monitor", monitor_id: "planar_monitor_1" },
         },
       });
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("records a created monitor against the captured canonical scene revision", async () => {
+    const record = vi.fn();
+    mocks.authoringHistory = { record };
+    const before = { objects: [], revision: 7 };
+    const after = { objects: [{ id: "planar_monitor_1" }], revision: 8 };
+    mocks.scene.mockResolvedValueOnce(before).mockResolvedValueOnce(after);
+    beginPlanarMonitorDraft();
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(<PlanarMonitorDraftInspectorPanel />));
+      await act(async () => findButton(container, "Apply monitor").click());
+
+      expect(mocks.create).toHaveBeenCalledWith(expect.objectContaining({
+        expected_scene_revision: 7,
+      }), { sessionScopeKey: sessionAScopeKey });
+      expect(record).toHaveBeenCalledWith(expect.objectContaining({
+        before,
+        after,
+        committedRevision: 8,
+        label: "Create planar monitor",
+      }));
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("does not publish workspace effects when the session changes before create ACK", async () => {
+    const draft = beginPlanarMonitorDraft();
+    let finishCreate: ((value: unknown) => void) | null = null;
+    const createResult = new Promise((resolve) => {
+      finishCreate = resolve;
+    });
+    mocks.create.mockReturnValue(createResult);
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(<PlanarMonitorDraftInspectorPanel />));
+      await act(async () => {
+        findButton(container, "Apply monitor").click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(mocks.create).toHaveBeenCalledWith(
+        expect.objectContaining({ expected_scene_revision: 7 }),
+        { sessionScopeKey: sessionAScopeKey },
+      );
+      mocks.currentSessionScopeKey = "session=B&epoch=2&request_scope_epoch=2";
+      mocks.historyGeneration += 1;
+      await act(async () => {
+        finishCreate?.({
+          monitor: draft.monitor,
+          scene_revision: 8,
+        });
+        await createResult;
+      });
+
+      expect(crossSectionWorkspaceStore.getSnapshot().planarMonitorDraft).toEqual(draft);
+      expect(mocks.invalidate).not.toHaveBeenCalled();
+      expect(mocks.queuePatch).not.toHaveBeenCalled();
+      expect(mocks.setSelection).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("fails closed when the active session identity is unavailable", async () => {
+    beginPlanarMonitorDraft();
+    mocks.currentSessionScopeKey = null;
+    mocks.sessionIdentity = null;
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(<PlanarMonitorDraftInspectorPanel />));
+      await act(async () => findButton(container, "Apply monitor").click());
+
+      expect(mocks.scene).not.toHaveBeenCalled();
+      expect(mocks.create).not.toHaveBeenCalled();
+      expect(container.textContent).toContain("Session identity is not ready");
     } finally {
       await act(async () => root.unmount());
       dom.restore();
@@ -140,10 +290,13 @@ describe("PlanarMonitorDraftInspectorPanel", () => {
     try {
       await act(async () => root.render(<PlanarMonitorDraftInspectorPanel />));
       await act(async () => findButton(container, "Apply monitor").click());
-      expect(mocks.create).toHaveBeenCalledWith({
-        expected_scene_revision: 7,
-        monitor: { ...draft.monitor, id: "midplane_3", name: "Midplane 3" },
-      });
+      expect(mocks.create).toHaveBeenCalledWith(
+        {
+          expected_scene_revision: 7,
+          monitor: { ...draft.monitor, id: "midplane_3", name: "Midplane 3" },
+        },
+        { sessionScopeKey: sessionAScopeKey },
+      );
     } finally {
       await act(async () => root.unmount());
       dom.restore();

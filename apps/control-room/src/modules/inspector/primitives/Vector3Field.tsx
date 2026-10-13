@@ -1,4 +1,4 @@
-import { useId } from "react";
+import { useId, type ReactNode } from "react";
 
 interface Vector3FieldProps {
   errors?: readonly (string | undefined)[];
@@ -6,6 +6,7 @@ interface Vector3FieldProps {
   values: readonly [string, string, string];
   onChange: (index: 0 | 1 | 2, value: string) => void;
   unit?: string;
+  unitControls?: readonly [ReactNode, ReactNode, ReactNode];
   disabled?: boolean;
 }
 
@@ -19,6 +20,7 @@ export function Vector3Field({
   values,
   onChange,
   unit,
+  unitControls,
   disabled,
 }: Vector3FieldProps) {
   const fieldId = useId();
@@ -56,6 +58,7 @@ export function Vector3Field({
                   onChange={(event) => onChange(index as 0 | 1 | 2, event.target.value)}
                   onInput={(event) => onChange(index as 0 | 1 | 2, event.currentTarget.value)}
                 />
+                {unitControls?.[index]}
                 {errors?.[index] ? (
                   <span
                     className="fm-inspector-form-field__hint fm-inspector-form-field__hint--error"
@@ -68,7 +71,7 @@ export function Vector3Field({
             );
           })}
         </div>
-        {unit && <span className="fm-inspector-form-field__unit">{unit}</span>}
+        {unit && !unitControls && <span className="fm-inspector-form-field__unit">{unit}</span>}
       </div>
     </div>
   );

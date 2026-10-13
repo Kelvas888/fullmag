@@ -8,6 +8,27 @@ import type {
 } from "@/kernel/api/apiTypes";
 import type { Selection } from "@/kernel/selection/selectionTypes";
 
+export interface RegionAuxiliaryDraftApplySnapshot {
+  dirty: boolean;
+  apply: (() => Promise<boolean>) | null;
+}
+
+export function captureRegionAuxiliaryDraftApply(
+  session: { dirty: boolean; apply: () => Promise<boolean> } | null,
+): RegionAuxiliaryDraftApplySnapshot {
+  return session?.dirty
+    ? { dirty: true, apply: session.apply }
+    : { dirty: false, apply: null };
+}
+
+export function resetRegionAggregateDraft(
+  auxiliarySession: { reset: () => void } | null,
+  resetRegionDraft: () => void,
+): void {
+  auxiliarySession?.reset();
+  resetRegionDraft();
+}
+
 export type RegionEditShapeKind = "box" | "cylinder" | "sphere";
 export type RegionEditRealizationPolicy = "inherit" | "conformal" | "project";
 

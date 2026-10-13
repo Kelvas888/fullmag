@@ -2,6 +2,7 @@
 
 import type { ThreeEvent } from "@react-three/fiber";
 import { useEffect, useMemo, useState } from "react";
+import { Plane, Vector3, type Ray } from "three";
 
 import type {
   Viewport3DPrimitiveRenderModel,
@@ -9,10 +10,16 @@ import type {
 } from "./viewport3dPrimitiveModel";
 import type { Viewport3DColors } from "./viewport3dTypes";
 import { useViewport3DColors } from "./hooks/useViewport3DColors";
-export { PROBLEM_IR_03_RIGID_TRANSFORM_REASON } from "@/kernel/authoring/objectTranslationMutation";
+import {
+  isMoveCommitPending,
+  tryAcquireMoveCommit,
+  type MoveAxis,
+  type MoveCommitHandler,
+  type MoveCommitLockToken,
+  type Translation3,
+} from "./moveCommitLock";
 
-export type MoveAxis = "x" | "y" | "z";
-export type Translation3 = [number, number, number];
+export type { MoveAxis, MoveCommitHandler, MoveCommitLockToken, Translation3 };
 
 const FALLBACK_MOVE_GIZMO_COLORS: Viewport3DColors = {
   accent: 0x89b4fa,
@@ -33,11 +40,8 @@ export interface MoveDraft {
 interface MoveGestureControllerOptions {
   baseRevision: number;
   objectId: string;
-  onCommit: (
-    objectId: string,
-    translation: Translation3,
-    baseRevision: number,
-  ) => Promise<boolean | void> | boolean | void;
+  onCommit: MoveCommitHandler;
+  onBeginGesture?: () => boolean;
   onDraftChange: (draft: MoveDraft | null) => void;
   onGestureActiveChange?: (active: boolean) => void;
   origin: Translation3;
@@ -47,6 +51,7 @@ export function createMoveGestureController({
   baseRevision,
   objectId,
   onCommit,
+  onBeginGesture,
   onDraftChange,
   onGestureActiveChange,
   origin,
@@ -54,6 +59,7 @@ export function createMoveGestureController({
   let active:
     | {
         axis: MoveAxis;
+        dragPlane: Plane | null;
         pointerId: number;
         releasePointerCapture: (pointerId: number) => void;
         start: Translation3;
@@ -71,13 +77,35 @@ export function createMoveGestureController({
       point: Translation3,
       setPointerCapture: (pointerId: number) => void,
       releasePointerCapture: (pointerId: number) => void,
+      ray?: Ray,
     ): void {
-      if (active) cancelActive(false);
-      active = { axis, pointerId, releasePointerCapture, start: [...point] };
+      if (active || isMoveCommitPending(onCommit)) return;
+      if (onBeginGesture && !onBeginGesture()) return;
+      try {
+        setPointerCapture(pointerId);
+      } catch {
+        try {
+          releasePointerCapture(pointerId);
+        } catch {
+          // R3F may have registered capture before native capture failed.
+        }
+        if (onBeginGesture) onGestureActiveChange?.(false);
+        return;
+      }
+      active = {
+        axis, pointerId, releasePointerCapture, start: [...point],
+        dragPlane: ray
+          ? new Plane().setFromNormalAndCoplanarPoint(ray.direction, new Vector3(...point))
+          : null,
+      };
       translation = [...origin];
-      setPointerCapture(pointerId);
       onGestureActiveChange?.(true);
       publish();
+    },
+    cancelPointer(pointerId: number): boolean {
+      if (!active || active.pointerId !== pointerId) return false;
+      cancelActive(true);
+      return true;
     },
     cancel(): boolean {
       if (!active) return false;
@@ -87,11 +115,28 @@ export function createMoveGestureController({
     async end(pointerId: number): Promise<void> {
       if (!active || active.pointerId !== pointerId) return;
       releaseActiveCapture();
-      const committed = await onCommit(objectId, [...translation], baseRevision);
-      if (committed !== false) onDraftChange(null);
+      if (translation.every((coordinate, index) => coordinate === origin[index])) {
+        onDraftChange(null);
+        return;
+      }
+      const releaseCommit = tryAcquireMoveCommit(onCommit);
+      if (!releaseCommit) return;
+      try {
+        const committed = await onCommit(objectId, [...translation], baseRevision, {
+          lockHeldByGesture: true,
+        });
+        if (committed !== false) onDraftChange(null);
+      } finally {
+        releaseCommit();
+      }
     },
-    move(pointerId: number, point: Translation3): void {
+    move(pointerId: number, point: Translation3, ray?: Ray): void {
       if (!active || active.pointerId !== pointerId) return;
+      if (ray && active.dragPlane) {
+        const intersection = ray.intersectPlane(active.dragPlane, new Vector3());
+        if (!intersection) return;
+        point = [intersection.x, intersection.y, intersection.z];
+      }
       const axisIndex = active.axis === "x" ? 0 : active.axis === "y" ? 1 : 2;
       translation = [...origin];
       translation[axisIndex] += point[axisIndex] - active.start[axisIndex];
@@ -122,12 +167,14 @@ export function MoveObjectGizmo({
   baseRevision,
   object,
   onCommit,
+  onBeginGesture,
   onDraftChange,
   onGestureActiveChange,
 }: {
   baseRevision: number;
   object: Viewport3DPrimitiveObject;
   onCommit: MoveGestureControllerOptions["onCommit"];
+  onBeginGesture?: () => boolean;
   onDraftChange?: (draft: MoveDraft | null) => void;
   onGestureActiveChange?: (active: boolean) => void;
 }) {
@@ -142,6 +189,7 @@ export function MoveObjectGizmo({
         baseRevision,
         objectId: object.objectId,
         origin: [originX, originY, originZ],
+        onBeginGesture,
         onCommit,
         onDraftChange: (next) => {
           setDraft(next);
@@ -153,6 +201,7 @@ export function MoveObjectGizmo({
       baseRevision,
       object.objectId,
       onCommit,
+      onBeginGesture,
       onDraftChange,
       onGestureActiveChange,
       originX,
@@ -211,10 +260,17 @@ export function installMoveGestureTerminalListeners(
       keyboardEvent.preventDefault();
     }
   };
+  const onPointerTerminated = (event: Event) => {
+    controller.cancelPointer((event as PointerEvent).pointerId);
+  };
   target.addEventListener("keydown", onKeyDown);
+  target.addEventListener("pointercancel", onPointerTerminated, true);
+  target.addEventListener("lostpointercapture", onPointerTerminated, true);
   return () => {
     controller.cancel();
     target.removeEventListener("keydown", onKeyDown);
+    target.removeEventListener("pointercancel", onPointerTerminated, true);
+    target.removeEventListener("lostpointercapture", onPointerTerminated, true);
   };
 }
 
@@ -232,7 +288,7 @@ export function moveAxisPointerHandlers(
     onPointerMove: (event: ThreeEvent<PointerEvent>) =>
       moveAxisDrag(controller, event),
     onPointerUp: (event: ThreeEvent<PointerEvent>) =>
-      void endAxisDrag(controller, event),
+      void endAxisDrag(controller, event).catch(() => undefined),
   };
 }
 
@@ -240,6 +296,7 @@ export function Viewport3DMoveToolLayer({
   moveDraftResetRevision,
   moveToolObjectId,
   onCommit,
+  onBeginGesture,
   onGestureActiveChange,
   primitiveModel,
   selectedObjectId,
@@ -247,6 +304,7 @@ export function Viewport3DMoveToolLayer({
   moveDraftResetRevision: number;
   moveToolObjectId: string | null;
   onCommit: MoveGestureControllerOptions["onCommit"];
+  onBeginGesture?: () => boolean;
   onGestureActiveChange?: (active: boolean) => void;
   primitiveModel: Viewport3DPrimitiveRenderModel | null;
   selectedObjectId: string | null;
@@ -267,6 +325,7 @@ export function Viewport3DMoveToolLayer({
           baseRevision={primitiveModel.sceneRevision as number}
           object={object}
           onCommit={onCommit}
+          onBeginGesture={onBeginGesture}
           onGestureActiveChange={onGestureActiveChange}
         />
       </group>
@@ -302,6 +361,7 @@ function beginAxisDrag(
   controller.begin(axis, event.pointerId, eventPoint(event), (pointerId) =>
     target.setPointerCapture(pointerId),
     (pointerId) => target.releasePointerCapture(pointerId),
+    event.ray,
   );
 }
 
@@ -310,7 +370,7 @@ function moveAxisDrag(
   event: ThreeEvent<PointerEvent>,
 ): void {
   event.stopPropagation();
-  controller.move(event.pointerId, eventPoint(event));
+  controller.move(event.pointerId, eventPoint(event), event.ray);
 }
 
 async function endAxisDrag(

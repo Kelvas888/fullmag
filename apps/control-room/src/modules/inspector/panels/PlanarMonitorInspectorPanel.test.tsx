@@ -11,6 +11,10 @@ import {
   TestNode,
 } from "@/kernel/layout/simulationPreparationTestDom.test-support";
 import { planarMonitorFramePreviewStore } from "@/kernel/workspace/planarMonitorFramePreview";
+import {
+  InspectorEditSessionProvider,
+  useInspectorEditSession,
+} from "../InspectorEditSession";
 
 import { PlanarMonitorInspectorPanel } from "./PlanarMonitorInspectorPanel";
 
@@ -18,10 +22,22 @@ const mocks = vi.hoisted(() => ({
   collection: { monitors: [] as unknown[], scene_revision: 7 },
   duplicate: vi.fn(),
   execute: vi.fn(),
+  currentSessionScopeKey: "session=A&epoch=1&request_scope_epoch=1" as string | null,
+  historyGeneration: 0,
   invalidate: vi.fn(),
   patch: vi.fn(),
   refetch: vi.fn(),
+  resourceMonitor: null as unknown,
+  resourceSceneRevision: 7,
+  sessionIdentity: null as unknown,
 }));
+
+const sessionA = {
+  sessionId: "A",
+  sessionEpoch: "1",
+  requestScopeEpoch: "1",
+} as const;
+const sessionAScopeKey = "session=A&epoch=1&request_scope_epoch=1";
 
 const monitorFixture = {
   frame: {
@@ -39,22 +55,32 @@ const monitorFixture = {
   target: { kind: "magnetic_domain" },
 } as const;
 
-vi.mock("@/kernel/KernelContext", () => ({
-  useKernel: () => ({
+vi.mock("@/kernel/KernelContext", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/kernel/KernelContext")>();
+  return {
+    ...actual,
+    useKernel: () => ({
     api: { model: { planarMonitors: { duplicate: mocks.duplicate, patch: mocks.patch } } },
-    commands: { execute: mocks.execute },
+    authoringHistory: undefined,
+    commands: {
+      execute: mocks.execute,
+      getSessionScopeKey: () => mocks.currentSessionScopeKey,
+    },
     resources: { invalidate: mocks.invalidate },
   }),
+  };
+});
+
+vi.mock("@/kernel/resources/useSessionStatus", () => ({
+  useSessionResourceIdentity: () => mocks.sessionIdentity,
 }));
 
 vi.mock("@/kernel/resources/planarMonitorResources", () => ({
   usePlanarMonitorsResource: () => ({ data: mocks.collection }),
   usePlanarMonitorResource: () => ({
     data: {
-      monitor: {
-        ...monitorFixture,
-      },
-      scene_revision: 7,
+      monitor: mocks.resourceMonitor ?? { ...monitorFixture },
+      scene_revision: mocks.resourceSceneRevision,
     },
     refetch: mocks.refetch,
   }),
@@ -83,6 +109,11 @@ describe("PlanarMonitorInspectorPanel", () => {
     vi.clearAllMocks();
     planarMonitorFramePreviewStore.clearDraft();
     mocks.collection.monitors = [monitorFixture];
+    mocks.resourceMonitor = { ...monitorFixture };
+    mocks.resourceSceneRevision = 7;
+    mocks.currentSessionScopeKey = sessionAScopeKey;
+    mocks.historyGeneration = 0;
+    mocks.sessionIdentity = sessionA;
     mocks.patch.mockResolvedValue({
       monitor: { ...monitorFixture, name: "Edited" },
       scene_revision: 8,
@@ -170,7 +201,7 @@ describe("PlanarMonitorInspectorPanel", () => {
       expect(mocks.patch).toHaveBeenCalledWith("plane-1", {
         expected_scene_revision: 7,
         monitor: uiRoundtripFixture().patch,
-      });
+      }, { baseRevision: 7, sessionScopeKey: sessionAScopeKey });
     } finally {
       await act(async () => root.unmount());
       dom.restore();
@@ -225,6 +256,189 @@ describe("PlanarMonitorInspectorPanel", () => {
       dom.restore();
     }
   });
+
+  it("does not publish an edit ACK after the active session changes", async () => {
+    let finishPatch: ((value: unknown) => void) | null = null;
+    const patchResult = new Promise((resolve) => {
+      finishPatch = resolve;
+    });
+    mocks.patch.mockReturnValue(patchResult);
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(<PlanarMonitorInspectorPanel selection={selection()} />));
+      await act(async () => change(findControl(container, "Target kind"), "domain"));
+      await act(async () => {
+        findButton(container, "Apply").click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(mocks.patch).toHaveBeenCalledWith(
+        "plane-1",
+        expect.objectContaining({ expected_scene_revision: 7 }),
+        { baseRevision: 7, sessionScopeKey: sessionAScopeKey },
+      );
+      mocks.currentSessionScopeKey = "session=B&epoch=2&request_scope_epoch=2";
+      mocks.historyGeneration += 1;
+      await act(async () => {
+        finishPatch?.({
+          monitor: { ...monitorFixture, name: "Edited" },
+          scene_revision: 8,
+        });
+        await patchResult;
+      });
+
+      expect(controlValue(findControl(container, "Target kind"))).toBe("domain");
+      expect(mocks.invalidate).not.toHaveBeenCalled();
+      expect(mocks.refetch).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("keeps one staged owner across revision-only refetch and acknowledges only the submitted draft", async () => {
+    let finishPatch: ((value: unknown) => void) | null = null;
+    const patchResult = new Promise((resolve) => {
+      finishPatch = resolve;
+    });
+    mocks.patch.mockReturnValueOnce(patchResult);
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <InspectorEditSessionProvider>
+          <>
+            <PlanarMonitorInspectorPanel selection={selection()} />
+            <InspectorEditSessionProbe />
+          </>
+        </InspectorEditSessionProvider>,
+      ));
+      expect(findSessionProbe(container).textContent).toBe("staged:false");
+
+      await act(async () => change(findControl(container, "Target kind"), "domain"));
+      expect(findSessionProbe(container).textContent).toBe("staged:true");
+
+      mocks.resourceMonitor = { ...monitorFixture };
+      mocks.resourceSceneRevision = 8;
+      await act(async () => root.render(
+        <InspectorEditSessionProvider>
+          <>
+            <PlanarMonitorInspectorPanel selection={selection()} />
+            <InspectorEditSessionProbe />
+          </>
+        </InspectorEditSessionProvider>,
+      ));
+      expect(controlValue(findControl(container, "Target kind"))).toBe("domain");
+      expect(findSessionProbe(container).textContent).toBe("staged:true");
+      expect(findSessionProbe(container).getAttribute("data-valid")).toBe("true");
+
+      await act(async () => {
+        findButton(container, "Apply").click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(mocks.patch).toHaveBeenCalledWith(
+        "plane-1",
+        expect.objectContaining({ expected_scene_revision: 8 }),
+        { baseRevision: 8, sessionScopeKey: sessionAScopeKey },
+      );
+
+      await act(async () => change(findControl(container, "Name"), "Later edit"));
+      expect(controlValue(findControl(container, "Name"))).toBe("Later edit");
+      expect(planarMonitorFramePreviewStore.getDraftSnapshot()?.monitor.name).toBe("Later edit");
+      await act(async () => {
+        finishPatch?.({ monitor: uiRoundtripFixture().patch, scene_revision: 9 });
+        await patchResult;
+      });
+      expect(controlValue(findControl(container, "Name"))).toBe("Later edit");
+      expect(findSessionProbe(container).textContent).toBe("staged:true");
+
+      await act(async () => findButton(container, "Discard").click());
+      expect(findSessionProbe(container).textContent).toBe("staged:false");
+      expect(controlValue(findControl(container, "Target kind"))).toBe("domain");
+      mocks.patch.mockResolvedValueOnce({ monitor: { ...monitorFixture }, scene_revision: 10 });
+      await act(async () => change(findControl(container, "Target kind"), "magnetic_domain"));
+      expect(findSessionProbe(container).textContent).toBe("staged:true");
+      await act(async () => findButton(container, "Apply").click());
+      expect(mocks.patch).toHaveBeenLastCalledWith(
+        "plane-1",
+        expect.objectContaining({ expected_scene_revision: 9 }),
+        { baseRevision: 9, sessionScopeKey: sessionAScopeKey },
+      );
+      expect(mocks.patch).toHaveBeenCalledTimes(2);
+      expect(findSessionProbe(container).textContent).toBe("staged:false");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("blocks local and global Apply after an external definition change until Revert", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <InspectorEditSessionProvider>
+          <>
+            <PlanarMonitorInspectorPanel selection={selection()} />
+            <InspectorEditSessionProbe />
+          </>
+        </InspectorEditSessionProvider>,
+      ));
+      await act(async () => change(findControl(container, "Target kind"), "domain"));
+
+      mocks.resourceMonitor = { ...monitorFixture, name: "External refresh" };
+      mocks.resourceSceneRevision = 8;
+      await act(async () => root.render(
+        <InspectorEditSessionProvider>
+          <>
+            <PlanarMonitorInspectorPanel selection={selection()} />
+            <InspectorEditSessionProbe />
+          </>
+        </InspectorEditSessionProvider>,
+      ));
+
+      expect(controlValue(findControl(container, "Name"))).toBe("Mid-plane");
+      expect(controlValue(findControl(container, "Target kind"))).toBe("domain");
+      expect(findButton(container, "Apply").disabled).toBe(true);
+      expect(findSessionProbe(container).getAttribute("data-valid")).toBe("false");
+      expect(findSessionProbe(container).getAttribute("data-apply-block-reason")).toContain("Revert");
+      expect(mocks.patch).not.toHaveBeenCalled();
+
+      await act(async () => findButton(container, "Discard").click());
+      expect(controlValue(findControl(container, "Name"))).toBe("External refresh");
+      expect(findButton(container, "Apply").disabled).toBe(true);
+      expect(findSessionProbe(container).getAttribute("data-valid")).toBe("true");
+      expect(mocks.patch).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("fails closed when no session identity is available", async () => {
+    mocks.currentSessionScopeKey = null;
+    mocks.sessionIdentity = null;
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(<PlanarMonitorInspectorPanel selection={selection()} />));
+      await act(async () => change(findControl(container, "Target kind"), "domain"));
+      await act(async () => findButton(container, "Apply").click());
+
+      expect(mocks.patch).not.toHaveBeenCalled();
+      expect(container.textContent).toContain("Session identity is not ready");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
 });
 
 function selection(): Parameters<typeof PlanarMonitorInspectorPanel>[0]["selection"] {
@@ -255,6 +469,14 @@ function controlValue(control: TestElement): string {
 }
 
 function change(element: TestElement, value: string): void {
+  if (element.tagName === "INPUT") {
+    // Bypass React's value tracker, as a browser keystroke does.
+    const nativeValueSetter = Object.getOwnPropertyDescriptor(TestElement.prototype, "value")?.set;
+    if (!nativeValueSetter) throw new Error("Missing native test input value setter");
+    nativeValueSetter.call(element, value);
+    element.dispatchEvent(new TestEvent("input", { bubbles: true }));
+    return;
+  }
   element.value = value;
   element.dispatchEvent(new TestEvent("change", { bubbles: true }));
 }
@@ -264,6 +486,28 @@ function findButton(root: TestNode, text: string): TestElement {
     element.tagName === "BUTTON" && element.textContent === text)[0];
   if (!button) throw new Error(`Missing button ${text}`);
   return button;
+}
+
+function InspectorEditSessionProbe() {
+  const session = useInspectorEditSession();
+  return (
+    <output
+      data-testid="inspector-edit-session"
+      data-valid={session?.valid ? "true" : "false"}
+      data-apply-block-reason={session?.applyBlockReason ?? ""}
+    >
+      {session ? `${session.mode}:${session.dirty}` : "none"}
+    </output>
+  );
+}
+
+function findSessionProbe(root: TestNode): TestElement {
+  const probe = findElements(
+    root,
+    (element) => element.getAttribute("data-testid") === "inspector-edit-session",
+  )[0];
+  if (!probe) throw new Error("Missing Inspector edit-session probe.");
+  return probe;
 }
 
 function findElements(root: TestNode, predicate: (element: TestElement) => boolean): TestElement[] {

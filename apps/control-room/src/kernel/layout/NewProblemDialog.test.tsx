@@ -7,7 +7,9 @@ import {
   MODEL_SCENE_PATH,
   SESSIONS_PATH,
   SESSION_CURRENT_PATH,
+  PLATFORM_OUTPUT_STORAGE_PATH,
 } from "../api/apiPaths";
+import { PendingFormRegistry } from "../authoring/PendingFormRegistry";
 import { EventBus } from "../events/EventBus";
 import type { KernelEventMap } from "../events/eventTypes";
 import { KernelContext } from "../KernelContext";
@@ -35,6 +37,23 @@ vi.mock("@/shared/ui/Dialog", () => ({
   DialogTitle: (props: ComponentProps<"h2">) => <h2 {...props} />,
 }));
 
+vi.mock("../resources/useOutputStorageDefaults", () => ({
+  useOutputStorageDefaults: () => ({
+    data: { output_parent: "C:/simulations", temp_parent: "C:/simulations/.fullmag-tmp",
+      data_format: "zarr", cleanup: "on_success", existing_output: "timestamp",
+      supported_formats: ["zarr"], hdf5_unavailable_reason: "HDF5 unavailable in this runtime" },
+    status: "ready", error: null, refetch: vi.fn(), revision: null,
+  }),
+}));
+
+vi.mock("@/shared/ui/Select", () => ({
+  Select: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectTrigger: (props: ComponentProps<"button">) => <button type="button" {...props} />,
+  SelectValue: () => null,
+  SelectContent: () => null,
+  SelectItem: ({ children }: { children: ReactNode }) => <span>{children}</span>,
+}));
+
 afterEach(() => vi.restoreAllMocks());
 
 describe("NewProblemDialog", () => {
@@ -44,12 +63,16 @@ describe("NewProblemDialog", () => {
     const { body, invalidations, onOpenChange, dispose } = await mountDialog({ create });
 
     try {
-      await act(async () => findButton(body, "Create").click());
+      await act(async () => submitDialog(body));
 
       expect(create).toHaveBeenCalledWith({
         backend: "fdm",
         device: "cpu",
-        name: "Untitled problem",
+        name: expect.stringMatching(/^Simulation /),
+        output_storage: expect.objectContaining({
+          output_dir: expect.stringMatching(/^C:\/simulations\/simulation_.*\/results\.zarr$/),
+          temp_dir: "C:/simulations/.fullmag-tmp", data_format: "zarr", cleanup: "on_success", existing_output: "timestamp",
+        }),
         precision: "double",
         replace_current: false,
       });
@@ -61,14 +84,15 @@ describe("NewProblemDialog", () => {
       });
 
       expect(invalidations.invalidate.mock.calls).toEqual([
-        [SESSIONS_PATH, 7],
-        [SESSION_STATUS_RESOURCE_KEY, 7],
-        [MODEL_SCENE_PATH, 7],
-        [MODEL_READINESS_PATH, 7],
+        [SESSIONS_PATH, "session:scratch-session"],
+        [SESSION_STATUS_RESOURCE_KEY, "session:scratch-session"],
+        [MODEL_SCENE_PATH, "session:scratch-session"],
+        [MODEL_READINESS_PATH, "session:scratch-session"],
+        [PLATFORM_OUTPUT_STORAGE_PATH, "saved:scratch-session"],
       ]);
       expect(invalidations.invalidatePrefix).toHaveBeenCalledWith(
         SESSION_CURRENT_PATH,
-        7,
+        "session:scratch-session",
       );
       expect(onOpenChange).toHaveBeenCalledWith(false);
     } finally {
@@ -82,13 +106,17 @@ describe("NewProblemDialog", () => {
 
     try {
       await act(async () => findRadio(body, "FEM").click());
-      await act(async () => findButton(body, "Create").click());
+      await act(async () => submitDialog(body));
       await settle();
 
       expect(create).toHaveBeenCalledWith({
         backend: "fem",
         device: "cpu",
-        name: "Untitled problem",
+        name: expect.stringMatching(/^Simulation /),
+        output_storage: expect.objectContaining({
+          output_dir: expect.stringMatching(/^C:\/simulations\/simulation_.*\/results\.zarr$/),
+          temp_dir: "C:/simulations/.fullmag-tmp", data_format: "zarr", cleanup: "on_success", existing_output: "timestamp",
+        }),
         precision: "double",
         replace_current: false,
       });
@@ -105,12 +133,12 @@ describe("NewProblemDialog", () => {
 
     try {
       await act(async () => findRadio(body, "FEM").click());
-      await act(async () => findButton(body, "Create").click());
+      await act(async () => submitDialog(body));
       await settle();
 
       expect(body.textContent).toContain("FEM CPU is unavailable in this runtime");
       expect(findRadio(body, "FEM").getAttribute("aria-checked")).toBe("true");
-      expect(findButton(body, "Create").disabled).toBe(false);
+      expect(findButton(body, "Create simulation").disabled).toBe(false);
       expect(onOpenChange).not.toHaveBeenCalledWith(false);
     } finally {
       await dispose();
@@ -122,7 +150,7 @@ describe("NewProblemDialog", () => {
     const { body, dispose } = await mountDialog({ create, hasActiveSession: true });
 
     try {
-      const createButton = findButton(body, "Create");
+      const createButton = findButton(body, "Create simulation");
       const checkbox = findElements(
         body,
         (element) => element.tagName === "INPUT",
@@ -136,11 +164,48 @@ describe("NewProblemDialog", () => {
       });
       expect(createButton.disabled).toBe(false);
 
-      await act(async () => createButton.click());
+      await act(async () => submitDialog(body));
       await settle();
       expect(create).toHaveBeenCalledWith(expect.objectContaining({
         replace_current: true,
       }));
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("invalidates a replacement by session identity when its state version resets", async () => {
+    const create = vi.fn(async () => createResponse(0, "session-fem-replacement"));
+    const { body, invalidations, dispose } = await mountDialog({
+      create,
+      hasActiveSession: true,
+    });
+
+    try {
+      const checkbox = findElements(
+        body,
+        (element) => element.tagName === "INPUT",
+      ).at(-1)!;
+      Object.assign(checkbox!, { checked: true });
+      await act(async () => {
+        checkbox!.dispatchEvent(new TestEvent("click", { bubbles: true }));
+      });
+
+      await act(async () => submitDialog(body));
+      await settle();
+
+      expect(invalidations.invalidate).toHaveBeenCalledWith(
+        SESSIONS_PATH,
+        "session:session-fem-replacement",
+      );
+      expect(invalidations.invalidate).toHaveBeenCalledWith(
+        SESSION_STATUS_RESOURCE_KEY,
+        "session:session-fem-replacement",
+      );
+      expect(invalidations.invalidatePrefix).toHaveBeenCalledWith(
+        SESSION_CURRENT_PATH,
+        "session:session-fem-replacement",
+      );
     } finally {
       await dispose();
     }
@@ -178,7 +243,10 @@ interface CreateResponse {
   };
 }
 
-function createResponse(revision: number): CreateResponse {
+function createResponse(
+  revision: number,
+  sessionId = "scratch-session",
+): CreateResponse {
   const execution = { backend: "fdm", device: "cpu", precision: "double" } as const;
   return {
     revisions: { scene_revision: revision, state_version: revision },
@@ -189,7 +257,7 @@ function createResponse(revision: number): CreateResponse {
       schema_version: "0.3",
       version: null,
     },
-    session_id: "scratch-session",
+    session_id: sessionId,
     status: {
       effective_execution: execution,
       fallback: null,
@@ -215,8 +283,10 @@ async function mountDialog({
     invalidatePrefix: vi.fn(),
   };
   const kernel = {
-    api: { sessions: { create } },
+    api: { sessions: { create }, platform: { saveOutputStorageDefaults: vi.fn(async () => ({})) } },
     bus,
+    // Creation goes through the pending-form guard, which needs the real registry.
+    pendingForms: new PendingFormRegistry(),
     resources: invalidations,
   } as unknown as KernelApi;
   const onOpenChange = vi.fn();
@@ -273,4 +343,9 @@ function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((accept) => { resolve = accept; });
   return { promise, resolve };
+}
+
+function submitDialog(body: TestElement): void {
+  const form = findElement(body, (element) => element.tagName === "FORM", "simulation form");
+  form.dispatchEvent(new TestEvent("submit", { bubbles: true }));
 }

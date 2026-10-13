@@ -1592,6 +1592,7 @@ fn materializer_status<'a>(
         .latest_step
         .field_materialization_states
         .iter()
+        .rev()
         .find(|status| status.quantity == quantity_id)
 }
 
@@ -1886,10 +1887,18 @@ fn invalid_current_field_source_is_present(
 pub async fn get_field_catalog(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<FieldCatalog>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(
+        snapshot,
+        &request_context,
+        state
+            .current_live_session_epoch
+            .load(std::sync::atomic::Ordering::Acquire),
+    )?;
 
     let gen_id = domain_generation_id(snapshot);
 
@@ -2216,10 +2225,18 @@ pub async fn get_field_availability(
     AxumPath(quantity_id): AxumPath<String>,
     Query(query): Query<TargetFieldAvailabilityQuery>,
 ) -> Result<Json<FieldAvailabilityResource>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(
+        snapshot,
+        &request_context,
+        state
+            .current_live_session_epoch
+            .load(std::sync::atomic::Ordering::Acquire),
+    )?;
     Ok(Json(resolve_target_field_availability(
         snapshot,
         &quantity_id,
@@ -2665,6 +2682,7 @@ pub async fn get_field_meta(
     AxumPath(quantity_id): AxumPath<String>,
     Query(query): Query<FieldMetaQuery>,
 ) -> Result<Json<FieldMeta>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let quantity_id = canonical_quantity_id(&quantity_id);
     let quantity_id = quantity_id.as_ref();
     let workspace_selection = if query.scope_kind.as_deref() == Some("selection") {
@@ -2676,6 +2694,13 @@ pub async fn get_field_meta(
     let snapshot = guard
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(
+        snapshot,
+        &request_context,
+        state
+            .current_live_session_epoch
+            .load(std::sync::atomic::Ordering::Acquire),
+    )?;
 
     let spec = quantity_spec(quantity_id);
     let requested_capability_scope = query
@@ -2789,6 +2814,13 @@ pub async fn get_field_meta(
         }
         validate_hysteresis_snapshot_stage_scope(&state, query.stage_id.as_deref(), snapshot_id)
             .await?;
+        crate::ensure_current_live_request_context(
+            snapshot,
+            &request_context,
+            state
+                .current_live_session_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        )?;
         let (values, grid) = persisted_hysteresis_magnetization_values(snapshot, snapshot_id)?;
         let revision = field_quantity_revision(snapshot, quantity_id);
         let resolved = resolve_spatial_field_from_values(
@@ -3593,7 +3625,7 @@ fn resolve_fdm_field_scope_from_carrier(
         _ => {
             return Err(ApiError::bad_request(format!(
                 "unsupported FDM field scope_kind '{scope_kind}'"
-            )))
+            )));
         }
     };
     if scope_kind == "airbox" && geometry_scope == "surface" {
@@ -3701,7 +3733,7 @@ fn resolve_fdm_field_scope(
         _ => {
             return Err(ApiError::bad_request(format!(
                 "unsupported FDM field scope_kind '{scope_kind}'"
-            )))
+            )));
         }
     };
     if scope_kind == "airbox" && geometry_scope == "surface" {
@@ -3827,13 +3859,13 @@ fn resolve_multilayer_native_layer_scope_from_carrier(
         [] => {
             return Err(ApiError::not_found(format!(
                 "multilayer FDM {scope_kind} not found: {scope_id}"
-            )))
+            )));
         }
         [pair] => *pair,
         _ => {
             return Err(ApiError::conflict(format!(
                 "multilayer FDM {scope_kind} is ambiguous: {scope_id}"
-            )))
+            )));
         }
     };
     let canonical_scope_id = plan_layer
@@ -4514,6 +4546,25 @@ pub async fn get_field_vector(
     AxumPath(quantity_id): AxumPath<String>,
     Query(query): Query<FieldVectorQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_vector_unfenced(
+        State(state.clone()),
+        headers,
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_vector_unfenced(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldVectorQuery>,
+) -> Result<axum::response::Response, ApiError> {
     let quantity_id = canonical_quantity_id(&quantity_id);
     let quantity_id = quantity_id.as_ref();
     resolve_field_geometry_scope(&query)?;
@@ -4605,8 +4656,8 @@ pub async fn get_field_vector(
         } else if let Some(snapshot_id) = requested_snapshot_id {
             if quantity_id != "m" {
                 return Err(ApiError::bad_request(format!(
-                "persisted hysteresis snapshot '{snapshot_id}' is only available for magnetization"
-            )));
+                    "persisted hysteresis snapshot '{snapshot_id}' is only available for magnetization"
+                )));
             }
             validate_hysteresis_snapshot_stage_scope(
                 &state,
@@ -7124,6 +7175,25 @@ pub async fn get_field_projection_meta(
     AxumPath(quantity_id): AxumPath<String>,
     Query(query): Query<FieldProjectionQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_projection_meta_unfenced(
+        State(state.clone()),
+        headers,
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_projection_meta_unfenced(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldProjectionQuery>,
+) -> Result<axum::response::Response, ApiError> {
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
@@ -7270,6 +7340,25 @@ pub async fn get_field_projection_scalar(
     AxumPath(quantity_id): AxumPath<String>,
     Query(query): Query<FieldProjectionQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_projection_scalar_unfenced(
+        State(state.clone()),
+        headers,
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_projection_scalar_unfenced(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldProjectionQuery>,
+) -> Result<axum::response::Response, ApiError> {
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
@@ -7376,6 +7465,23 @@ pub async fn get_field_projection_profile(
     AxumPath(quantity_id): AxumPath<String>,
     Query(query): Query<FieldProjectionProfileQuery>,
 ) -> Result<Json<FieldProjectionProfile>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_projection_profile_unfenced(
+        State(state.clone()),
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_projection_profile_unfenced(
+    State(state): State<Arc<AppState>>,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldProjectionProfileQuery>,
+) -> Result<Json<FieldProjectionProfile>, ApiError> {
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
@@ -7447,6 +7553,25 @@ pub async fn get_field_projection_profile(
     tag = "data"
 )]
 pub async fn get_field_projection_empty_mask(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldProjectionQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_projection_empty_mask_unfenced(
+        State(state.clone()),
+        headers,
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_projection_empty_mask_unfenced(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     AxumPath(quantity_id): AxumPath<String>,
@@ -7555,6 +7680,25 @@ pub async fn get_field_slice_matrix_json(
     AxumPath(quantity_id): AxumPath<String>,
     Query(query): Query<FieldSliceMatrixQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_slice_matrix_json_unfenced(
+        State(state.clone()),
+        headers,
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_slice_matrix_json_unfenced(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldSliceMatrixQuery>,
+) -> Result<axum::response::Response, ApiError> {
     let (etag, matrix) = build_slice_matrix(&state, &quantity_id, &query).await?;
     Ok(
         crate::router_v2::handlers::shared::conditional_json_response(
@@ -7581,6 +7725,25 @@ pub async fn get_field_slice_matrix_json(
     tag = "data"
 )]
 pub async fn get_field_projection_matrix_json(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldProjectionMatrixQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_projection_matrix_json_unfenced(
+        State(state.clone()),
+        headers,
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_projection_matrix_json_unfenced(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     AxumPath(quantity_id): AxumPath<String>,
@@ -7613,6 +7776,25 @@ pub async fn get_field_projection_matrix_json(
     tag = "data"
 )]
 pub async fn get_field_slice_render_png(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldRenderPngQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_slice_render_png_unfenced(
+        State(state.clone()),
+        headers,
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_slice_render_png_unfenced(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     AxumPath(quantity_id): AxumPath<String>,
@@ -7681,6 +7863,25 @@ pub async fn get_field_slice_render_png(
     tag = "data"
 )]
 pub async fn get_field_projection_render_png(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldRenderPngQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_projection_render_png_unfenced(
+        State(state.clone()),
+        headers,
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_projection_render_png_unfenced(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     AxumPath(quantity_id): AxumPath<String>,
@@ -7831,6 +8032,25 @@ fn insert_matrix_headers(
     tag = "data"
 )]
 pub async fn get_field_slice_meta(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldSliceQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_slice_meta_unfenced(
+        State(state.clone()),
+        headers,
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_slice_meta_unfenced(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     AxumPath(quantity_id): AxumPath<String>,
@@ -8037,6 +8257,25 @@ pub async fn get_field_slice_scalar(
     AxumPath(quantity_id): AxumPath<String>,
     Query(query): Query<FieldSliceQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_slice_scalar_unfenced(
+        State(state.clone()),
+        headers,
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_slice_scalar_unfenced(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldSliceQuery>,
+) -> Result<axum::response::Response, ApiError> {
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
@@ -8165,6 +8404,25 @@ pub async fn get_field_slice_scalar(
     tag = "data"
 )]
 pub async fn get_field_slice_arrows(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(quantity_id): AxumPath<String>,
+    Query(query): Query<FieldSliceQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    let response = get_field_slice_arrows_unfenced(
+        State(state.clone()),
+        headers,
+        AxumPath(quantity_id),
+        Query(query),
+    )
+    .await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(response)
+}
+
+async fn get_field_slice_arrows_unfenced(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     AxumPath(quantity_id): AxumPath<String>,
@@ -8302,10 +8560,10 @@ mod tests {
     use super::{
         analysis_complex_vector_view_values, analysis_frequency_response_view_values,
         apply_field_scope, decode_complex_f64_pairs_little_endian,
-        insert_field_vector_binary_headers, is_fem_runtime, parse_analysis_eigen_mode_field_id,
-        parse_analysis_frequency_response_field_id, parse_component, preview_cache_is_fresher,
-        project_values, push_field_descriptor, resolve_field_scope,
-        resolve_target_field_availability, resolve_transport_spatial_field,
+        insert_field_vector_binary_headers, is_fem_runtime, materializer_status,
+        parse_analysis_eigen_mode_field_id, parse_analysis_frequency_response_field_id,
+        parse_component, preview_cache_is_fresher, project_values, push_field_descriptor,
+        resolve_field_scope, resolve_target_field_availability, resolve_transport_spatial_field,
         serialize_analysis_field_vector_binary, FieldFreshness, FieldMaterializationState,
         FieldVectorQuery, ResolvedFieldScopeDomain, TargetFieldAvailabilityQuery,
     };
@@ -8625,6 +8883,57 @@ mod tests {
             Some("field_materialization_pending")
         );
         assert_eq!(availability.carrier_id, None);
+    }
+
+    #[test]
+    fn field_meta_uses_latest_materialization_status_after_pending() {
+        let request: CurrentLiveSnapshotRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "field-meta-latest-materialization-status"
+        }))
+        .expect("minimal live snapshot request should deserialize");
+        let mut snapshot = default_current_live_state(&request);
+        snapshot.live_state = Some(
+            serde_json::from_value(serde_json::json!({
+                "status": "running",
+                "updated_at_unix_ms": 1,
+                "latest_step": {
+                    "step": 1,
+                    "time": 0.0,
+                    "dt": 0.0,
+                    "e_ex": 0.0,
+                    "e_demag": 0.0,
+                    "e_ext": 0.0,
+                    "e_total": 0.0,
+                    "max_dm_dt": 0.0,
+                    "max_h_eff": 0.0,
+                    "wall_time_ns": 0,
+                    "grid": [1, 1, 1],
+                    "field_materialization_states": [
+                        {
+                            "quantity": "H_demag",
+                            "source_step": 1,
+                            "request_revision": 4,
+                            "state": "pending",
+                            "error": null
+                        },
+                        {
+                            "quantity": "H_demag",
+                            "source_step": 1,
+                            "request_revision": 4,
+                            "state": "complete",
+                            "error": null
+                        }
+                    ],
+                    "finished": false
+                }
+            }))
+            .expect("materialization status history should deserialize"),
+        );
+
+        assert_eq!(
+            materializer_status(&snapshot, "H_demag").map(|status| status.state),
+            Some(fullmag_runner::LiveFieldMaterializationState::Complete)
+        );
     }
 
     #[test]
