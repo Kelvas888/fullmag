@@ -80,7 +80,7 @@ def camera_for_proof(value):
         if not isinstance(vector, list) or len(vector) != 3 or not all(map(finite_number, vector)):
             raise storage.StorageError("Camera proof has an invalid vector")
     fov, scale = value["fov_degrees"], value["orthographic_scale"]
-    if (not finite_number(fov) or not 0 < fov < 180
+    if (not finite_number(fov) or not 1 <= fov <= 179
             or (scale is not None and (not finite_number(scale) or scale <= 0))):
         raise storage.StorageError("Camera proof has an invalid projection parameter")
     return copy.deepcopy(value)

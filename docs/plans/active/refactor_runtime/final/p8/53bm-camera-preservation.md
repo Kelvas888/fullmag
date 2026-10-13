@@ -49,6 +49,11 @@ Receipt `57d5fc8a660e4eaf8c2c1b71ecd30201`; tożsamość źródeł przed/po:
 Nie kompilowano testów jednostkowych. Te testy dowodzą kontroli dowodu,
 a nie naprawienia produkcyjnego odtworzenia kamery.
 
+Ponowna seria po dopasowaniu FOV do backendowego zakresu `[1,179]`:
+165 testów, 0 skipów, exit 0, receipt `ba44d7f6f0b74f0daf205dfefa272c3e`.
+Źródła przed/po: `03458c10c461ad9f80e2b4e785a0f4c28620b140cac0d595644b2a29b21e70f2`.
+Regresja odrzuca także 0,5 oraz 179,5 stopnia.
+
 ## Odbiór poprawki
 
 Owner musi przenosić ścisły snapshot kamery, wykrywać jego zmianę podczas

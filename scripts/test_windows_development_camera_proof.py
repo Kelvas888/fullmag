@@ -32,6 +32,7 @@ class CameraProofChecks(unittest.TestCase):
         for key, value in (("position", [float("nan"), 0, 0]), ("up", [0, 1]),
                            ("target", [False, 0, 0]), ("projection", "default"),
                            ("fov_degrees", float("inf")), ("fov_degrees", 180),
+                           ("fov_degrees", 0.5), ("fov_degrees", 179.5),
                            ("orthographic_scale", -1)):
             invalid.append({**camera(), key: value})
         for value in invalid:
