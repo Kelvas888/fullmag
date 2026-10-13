@@ -1,6 +1,6 @@
 # Plan naprawy wiązania generacji artefaktów
 
-Uwagi4225198873/4246863076. Source checkpoint02f6f86caaebe4946ef19b8595eddac4adc579d4. Stan: analiza źródłowa zakończona; wdrożenie i runtime NOT VERIFIED. Plan nie zastępuje wykonania pozostałych uwag PR97.
+Uwagi4225198873/4246863076. Historyczny source checkpoint02f6f86caaebe4946ef19b8595eddac4adc579d4. Aktualny checkpoint6536e34a0036c5605ebc6e26e01f0c00ec6577b1: migracja konsumentów i UI zweryfikowana kontraktowo; API handoff w CI, immutable writer jeszcze nieaktywny. Managed runtime, browser i kwalifikacja naukowa NOT VERIFIED. Plan nie zastępuje wykonania pozostałych uwag PR97.
 
 ## Potwierdzony problem
 
@@ -91,3 +91,21 @@ pierwszy cached live/fresh action probe z tą samą parą, bez nowych solves
 lub zmian tolerance. Nie jest to jeszcze naprawa solvera ani kwalifikacja.
 Receipt SHA256: 4ce12388b137aa664d2a518ab30b5ff6c1abce979f93e08b7259e7282012e4fc.
 Log SHA256: 88fd278a3107a7fe031d6f6c2c4cb5eb6c7869f9da3fa4d31ab102af7a6c62cc.
+
+## Aktualny etap G3 — captured generation, 13.10.2026
+
+ADR0058 i implementacja wspólnego readera rozdzielają mutable v1 i immutable v2. Wcześniejsze wpisy o braku immutable history opisują etap C03; nie określają nowej ścieżki v2. Reader/terminal inspector oraz Python consumers obsługują v2, ale aktywacja produkcyjnego writera pozostaje osobną bramką.
+
+- Consumers na exact1c5a22454464fcf7b0e280272ac6ca2bd24a71f5: [CI38458450446](https://github.com/MateuszZelent/fullmag/actions/runs/38458450446) SUCCESS, Python subsets144/162,248/4,214/70,155/327 (tests/subtests), reader/attestation Ubuntu i Windows PASS. Shared Rust reader zachowuje facade runnera; Cargo.lock zmieniono wyłącznie w remote tree o bezpośrednią zależność inspectora.
+- Result-field handoff na exact6536e34a0036c5605ebc6e26e01f0c00ec6577b1: captured ID dopisywany do publicznego linku pola bez mutacji hash-verified payloadu. UI zachowuje go w typed binary query/cache i sprawdza response generation; poprawny phase_rotated_real link pobiera full complex dane overlay. [UI38462801139](https://github.com/MateuszZelent/fullmag/actions/runs/38462801139) SUCCESS48files/1025tests, typecheck i architecture PASS; Doctor85/100,9warnings nadal do oceny. [API38462801191](https://github.com/MateuszZelent/fullmag/actions/runs/38462801191) w chwili wpisu in_progress; generated contract i postprocessing joby SUCCESS, physical-field job w toku.
+
+Pozostała kolejność:
+
+1. Potwierdzić named public catalog -> items -> binary regression w hosted API CI: exact values/current header, root aliases ignorowane, stary link409 po publikacji nowej generacji.
+2. Zakończyć review kompletnego immutable writer closure: metadata/material/node geometry/periodic pairs/modes oraz references, owner, staging/lease, zachowanie previous commit przy błędzie i legacy pozostałych realizacji. WIP artifacts.rs nie jest jeszcze opublikowany; sama gotowość readerów nie dowodzi producenta.
+3. Opublikować zweryfikowaną aktywację i przejść pełne producer tests w GitHub Actions, w tym interruption/duplicate/missing member/reference/owner i compatibility. Bez lokalnego buildu lub wykonania projektu.
+4. Oddzielnie potwierdzić managed publish/capture i browser handoff zgodnie z obowiązującymi uprawnieniami. Nie zastępować ich testem źródłowym.
+5. Zachować oddzielne G0/G6/G7/G8 oraz kwalifikację DE/BV/A1; native19/21FAIL i niezgodność reprezentacji production-RHS/modal weak oracle nie są zamknięte przez G3. A1 threshold0.005 i native admission bez zmian.
+### Wynik API handoff i kolejna falsyfikowalna diagnoza
+
+API38462801191 FAILURE: catalog route zwrócił500 zamiast200, zanim nowa regression dotarła do binary GET. Unit query-binding i pozostałe32dataset/11snapshot tests PASS. Generated contract i postprocessing joby SUCCESS. Przyczyna500 nie jest znana z obecnego logu; zgodna identity i wymagane pola fixture nie dowodzą poprawności całej ścieżki. Test-only checkpoint dopisuje bounded response body do niezmienionej asercji200 i nadal parsuje jednorazowo odczytane bajty. Nie wyłączono testu ani nie aktywowano writera. Następny hosted run ma ujawnić konkretną przyczynę, po czym należy ją naprawić i przejść pełną bramkę API.

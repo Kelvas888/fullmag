@@ -7173,13 +7173,17 @@ mod generation_snapshot_tests {
             )
             .await
             .unwrap();
-        assert_eq!(catalog_response.status(), StatusCode::OK);
-        let catalog: Value = serde_json::from_slice(
-            &to_bytes(catalog_response.into_body(), 1024 * 1024)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let catalog_status = catalog_response.status();
+        let catalog_body = to_bytes(catalog_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog_status,
+            StatusCode::OK,
+            "catalog response body: {}",
+            String::from_utf8_lossy(&catalog_body)
+        );
+        let catalog: Value = serde_json::from_slice(&catalog_body).unwrap();
         let dataset_id = catalog["items"]
             .as_array()
             .unwrap()
