@@ -249,7 +249,7 @@ try {
     name: "Toggle target visibility",
     exact: true,
   });
-  const resetButton = panel.getByRole("button", { name: "Reset", exact: true });
+  const resetButton = panel.getByRole("button", { name: "Reset display", exact: true });
   const initialVisible = (await visibleToggle.getAttribute("aria-pressed")) === "true";
   if (!initialVisible) {
     await visibleToggle.click();
@@ -654,8 +654,8 @@ try {
       "A valid object-mesh draft did not enable Apply.",
     );
     assert(
-      !(await inspector.getByRole("button", { name: "Reset", exact: true }).isDisabled()),
-      "A dirty object-mesh draft did not enable Reset.",
+      !(await inspector.getByRole("button", { name: "Revert", exact: true }).isDisabled()),
+      "A dirty object-mesh draft did not enable Revert.",
     );
 
     await geometryNode.click();
