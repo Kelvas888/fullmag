@@ -28,6 +28,7 @@ import { planarMonitorFramePreviewStore } from "@/kernel/workspace/planarMonitor
 import { Button } from "@/shared/ui/Button";
 
 import type { InspectorPanelProps } from "../inspectorTypes";
+import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import { FieldRow } from "../primitives/FieldRow";
 import { InspectorGroup } from "../primitives/InspectorGroup";
 import { VisualizationContextSwitch } from "../visualization/VisualizationContextSwitch";
@@ -58,7 +59,7 @@ export function PlanarMonitorInspectorPanel({ selection }: InspectorPanelProps) 
 
   return (
     <CommittedPlanarMonitorEditor
-      key={`${monitor.id}:${sceneRevision}`}
+      key={monitor.id}
       monitor={monitor}
       sceneRevision={sceneRevision}
       selection={selection}
@@ -84,7 +85,20 @@ function CommittedPlanarMonitorEditor({
   const kernel = useKernel();
   const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
   const visualizationState = useVisualizationStateResource();
+  const [acknowledgedBaseline, setAcknowledgedBaseline] = useState<{
+    monitor: PlanarMonitor;
+    revision: number;
+  }>({ monitor, revision: sceneRevision });
+  const [baselineState, setBaselineState] = useState({ monitor, revision: sceneRevision });
+  const baselineRef = useRef(baselineState);
+  const baseline = acknowledgedBaseline.revision > sceneRevision
+    ? acknowledgedBaseline
+    : baselineState.revision > sceneRevision
+      ? baselineState
+      : { monitor, revision: sceneRevision };
   const [draft, setDraft] = useState<PlanarMonitorDraft>(() => planarMonitorDraftFromMonitor(monitor));
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
   const [feedback, setFeedback] = useState<string | null>(null);
   const [conflict, setConflict] = useState(false);
   const [pendingOperation, setPendingOperation] = useState<{
@@ -92,15 +106,43 @@ function CommittedPlanarMonitorEditor({
     sessionScopeKey: string;
   } | null>(null);
   const nextPendingOperationId = useRef(0);
+  const applyInFlight = useRef(false);
   const [commandPending, setCommandPending] = useState(false);
   const pending =
     commandPending || pendingOperation?.sessionScopeKey === sessionScopeKey;
+  const draftApplying = pendingOperation?.sessionScopeKey === sessionScopeKey;
   const errors = [
     ...planarMonitorValidationErrors(draft.monitor),
     ...(draft.monitor.id === monitor.id ? [] : ["Committed monitor ID must match the resource path ID."]),
     ...planarMonitorDefinitionAvailabilityErrors(draft.monitor, definitionAvailability),
   ];
-  const dirty = JSON.stringify(draft.monitor) !== JSON.stringify(monitor);
+  const dirty = JSON.stringify(draft.monitor) !== JSON.stringify(baseline.monitor);
+  const updateDraft = (next: PlanarMonitorDraft) => {
+    draftRef.current = next;
+    setDraft(next);
+  };
+  useEffect(() => {
+    if (sceneRevision < acknowledgedBaseline.revision) return;
+    const incoming = { monitor, revision: sceneRevision };
+    const previous = baselineRef.current;
+    if (
+      incoming.revision === previous.revision &&
+      JSON.stringify(incoming.monitor) === JSON.stringify(previous.monitor)
+    ) {
+      return;
+    }
+    const wasClean = JSON.stringify(draftRef.current.monitor) === JSON.stringify(previous.monitor);
+    baselineRef.current = incoming;
+    setBaselineState(incoming);
+    if (wasClean) {
+      const nextDraft = planarMonitorDraftFromMonitor(
+        monitor,
+        draftRef.current.ui.displayLengthUnit,
+      );
+      draftRef.current = nextDraft;
+      setDraft(nextDraft);
+    }
+  }, [acknowledgedBaseline.revision, monitor, sceneRevision]);
   useEffect(() => {
     planarMonitorFramePreviewStore.setDraft(dirty ? draft : null);
     return () => planarMonitorFramePreviewStore.clearDraft();
@@ -117,12 +159,25 @@ function CommittedPlanarMonitorEditor({
       { monitorId: monitor.id, ...input },
     );
 
-  const apply = async () => {
-    if (!dirty || errors.length > 0) return;
+  const resetDraft = () => {
+    const reset = planarMonitorDraftFromMonitor(
+      baseline.monitor,
+      draft.ui.displayLengthUnit,
+    );
+    draftRef.current = reset;
+    setDraft(reset);
+    setFeedback(null);
+    setConflict(false);
+  };
+
+  const apply = async (): Promise<boolean> => {
+    if (applyInFlight.current || !dirty || errors.length > 0) return false;
+    const submittedDraft = draft;
+    const submittedMonitor = structuredClone(draft.monitor);
     const operationSessionScopeKey = sessionScopeKey;
     if (!operationSessionScopeKey) {
       setFeedback("Session identity is not ready. Try again after it loads.");
-      return;
+      return false;
     }
     const historyGeneration = kernel.authoringHistory?.getGeneration?.();
     const historyContext = createCommandContext("inspector", kernel, {
@@ -137,6 +192,7 @@ function CommittedPlanarMonitorEditor({
       sourceDetail: "planar-monitor-inspector",
     });
     const operationId = ++nextPendingOperationId.current;
+    applyInFlight.current = true;
     setPendingOperation({ id: operationId, sessionScopeKey: operationSessionScopeKey });
     setFeedback(null);
     setConflict(false);
@@ -145,7 +201,7 @@ function CommittedPlanarMonitorEditor({
         historyContext,
         "Update planar monitor",
         async ({ baseRevision }) => {
-          const commitRevision = baseRevision ?? sceneRevision;
+          const commitRevision = baseRevision ?? baseline.revision;
           if (typeof commitRevision !== "number" || !Number.isFinite(commitRevision)) {
             throw new Error(
               "The canonical scene revision is unavailable. Refetch the scene before applying.",
@@ -160,18 +216,38 @@ function CommittedPlanarMonitorEditor({
               "The session-scoped scene revision is unavailable. Refetch the scene before applying.",
             );
           }
-          return kernel.api.model.planarMonitors.patch(monitor.id, {
-            expected_scene_revision: writeOptions.baseRevision,
-            monitor: structuredClone(draft.monitor),
-          }, writeOptions);
+          return kernel.api.model.planarMonitors.patch(
+            monitor.id,
+            {
+              expected_scene_revision: writeOptions.baseRevision,
+              monitor: submittedMonitor,
+            },
+            writeOptions,
+          );
         },
       );
-      if (historyContext.isCurrentSessionScope?.() === false) return;
-      setDraft(planarMonitorDraftFromMonitor(response.monitor, draft.ui.displayLengthUnit));
+      if (historyContext.isCurrentSessionScope?.() === false) return false;
+      const nextBaseline = {
+        monitor: response.monitor,
+        revision: response.scene_revision,
+      };
+      baselineRef.current = nextBaseline;
+      setBaselineState(nextBaseline);
+      setAcknowledgedBaseline(nextBaseline);
+      if (draftRef.current === submittedDraft) {
+        if (!acknowledgeCommittedDraft()) return false;
+        const acknowledgedDraft = planarMonitorDraftFromMonitor(
+          response.monitor,
+          submittedDraft.ui.displayLengthUnit,
+        );
+        draftRef.current = acknowledgedDraft;
+        setDraft(acknowledgedDraft);
+      }
       kernel.resources.invalidate(MODEL_PLANAR_MONITORS_PATH, response.scene_revision);
       refetch();
+      return true;
     } catch (error) {
-      if (historyContext.isCurrentSessionScope?.() === false) return;
+      if (historyContext.isCurrentSessionScope?.() === false) return false;
       const revisionConflict = isPlanarMonitorRevisionConflict(error);
       setConflict(revisionConflict);
       setFeedback(
@@ -181,7 +257,9 @@ function CommittedPlanarMonitorEditor({
             ? error.message
             : "Planar monitor update failed.",
       );
+      return false;
     } finally {
+      applyInFlight.current = false;
       setPendingOperation((current) =>
         current?.id === operationId ? null : current,
       );
@@ -203,12 +281,28 @@ function CommittedPlanarMonitorEditor({
     }
   };
 
+  const acknowledgeCommittedDraft = useRegisterInspectorEditSession(
+    "staged",
+    draftApplying,
+    dirty,
+    errors.length === 0,
+    undefined,
+    apply,
+    resetDraft,
+    {
+      applyBlockReason: sessionScopeKey
+        ? undefined
+        : "Session identity is not ready.",
+      historyMode: "mutation-owned",
+    },
+  );
+
   return (
     <div className="fm-inspector-panel">
       <InspectorGroup title="View">
         <VisualizationContextSwitch />
       </InspectorGroup>
-      <PlanarMonitorDefinitionEditor availability={definitionAvailability} draft={draft} mode="committed" onChange={setDraft} />
+      <PlanarMonitorDefinitionEditor availability={definitionAvailability} draft={draft} mode="committed" onChange={updateDraft} />
       <InspectorGroup title="Provenance">
         <FieldRow label="Scene revision" value={sceneRevision} />
         <FieldRow label="Source" value="SceneDocument / ProblemIR" />
@@ -219,11 +313,7 @@ function CommittedPlanarMonitorEditor({
           size="sm"
           type="button"
           variant="ghost"
-          onClick={() => {
-            setDraft(planarMonitorDraftFromMonitor(monitor, draft.ui.displayLengthUnit));
-            setFeedback(null);
-            setConflict(false);
-          }}
+          onClick={resetDraft}
         >
           Discard
         </Button>

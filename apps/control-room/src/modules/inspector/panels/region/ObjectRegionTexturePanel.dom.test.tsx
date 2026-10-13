@@ -74,12 +74,14 @@ vi.mock("@/kernel/resources/useActiveLaneCapabilities", () => ({
 }));
 
 vi.mock("../ObjectMagneticTexturePanelModel", () => ({
-  buildMagnetizationTransactionRequest: () => ({
+  buildMagnetizationTransactionRequest: (_model: unknown, draft: { magnetizationRef: string }) => ({
     base_revision: 8,
     kind: "patch_magnetization",
+    textureRef: draft.magnetizationRef,
   }),
   buildObjectMagneticTextureAssetDraft: () => ({ id: "texture-a" }),
-  objectMagneticTextureDraftDirty: () => true,
+  objectMagneticTextureDraftDirty: (draft: unknown, baseline: unknown) =>
+    JSON.stringify(draft) !== JSON.stringify(baseline),
   objectMagneticTextureDraftFromModel: () => ({
     magnetizationRef: "",
     presetKind: "uniform",
@@ -91,19 +93,6 @@ vi.mock("../ObjectMagneticTexturePanelModel", () => ({
     objectId: "object-a",
     regionId: "region-a",
   }),
-}));
-
-vi.mock("../inspectorDraftState", () => ({
-  initialInspectorDraftState: ({ baseDraft, baseKey, identityKey }: {
-    baseDraft: unknown;
-    baseKey: string;
-    identityKey: string;
-  }) => ({ baseDraft, baseKey, dirty: false, draft: baseDraft, identityKey }),
-  resolveInspectorDraftState: ({ baseDraft, state }: {
-    baseDraft: unknown;
-    state: { draft: unknown };
-  }) => ({ dirty: true, draft: state.draft ?? baseDraft }),
-  updateInspectorDraftState: vi.fn(),
 }));
 
 vi.mock("./shared", () => ({ ObjectRegionMetadataSection: () => null }));
@@ -126,7 +115,24 @@ vi.mock("../ObjectMagneticTexturePanel", () => ({
       {feedback ? <div>{feedback.message}</div> : null}
     </div>
   ),
-  MagneticTextureAssignmentSection: () => null,
+  MagneticTextureAssignmentSection: ({ updateDraft }: {
+    updateDraft: (patch: { magnetizationRef: string }) => void;
+  }) => (
+    <div>
+      <button
+        onClick={() => updateDraft({ magnetizationRef: "texture-at-apply-click" })}
+        type="button"
+      >
+        Set click-time texture
+      </button>
+      <button
+        onClick={() => updateDraft({ magnetizationRef: "texture-edited-while-waiting" })}
+        type="button"
+      >
+        Edit texture after Apply starts
+      </button>
+    </div>
+  ),
   MagneticTexturePresetParametersSection: () => null,
   MagneticTextureRawAssetSection: () => null,
 }));
@@ -164,7 +170,7 @@ describe("ObjectRegionTexturePanel session fence", () => {
 
       expect(mocks.readScene).toHaveBeenCalledWith({ sessionScopeKey: sessionAScopeKey });
       expect(mocks.commitTransaction).toHaveBeenCalledWith(
-        { base_revision: 10, kind: "patch_magnetization" },
+        { base_revision: 10, kind: "patch_magnetization", textureRef: "" },
         { baseRevision: 10, sessionScopeKey: sessionAScopeKey },
       );
       expect(mocks.recordHistory).toHaveBeenCalledOnce();
@@ -174,6 +180,57 @@ describe("ObjectRegionTexturePanel session fence", () => {
         { sessionScopeKey: sessionAScopeKey },
       );
       expect(container.textContent).toContain("Magnetic texture saved.");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("applies the reported click-time texture draft and keeps edits made while the parent waits", async () => {
+    let reportedSession: {
+      dirty: boolean;
+      apply: () => Promise<boolean>;
+    } | null = null;
+    const reportAuxiliaryDraftSession: NonNullable<
+      RegionSubPanelProps["reportAuxiliaryDraftSession"]
+    > = (_ownerKey, session) => {
+      if (session) reportedSession = session;
+    };
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <ObjectRegionTexturePanel
+          {...panelProps({
+            auxiliaryDraftOwnerKey: "object.region.texture:identity-a",
+            reportAuxiliaryDraftSession,
+          })}
+        />,
+      ));
+      await act(async () => findButton(container, "Set click-time texture").click());
+      const clickTimeSession = reportedSession;
+      expect(clickTimeSession?.dirty).toBe(true);
+
+      await act(async () =>
+        findButton(container, "Edit texture after Apply starts").click(),
+      );
+      expect(reportedSession).not.toBe(clickTimeSession);
+
+      await act(async () => {
+        expect(await clickTimeSession?.apply()).toBe(true);
+      });
+
+      expect(mocks.commitTransaction).toHaveBeenCalledWith(
+        {
+          base_revision: 10,
+          kind: "patch_magnetization",
+          textureRef: "texture-at-apply-click",
+        },
+        { baseRevision: 10, sessionScopeKey: sessionAScopeKey },
+      );
+      expect(reportedSession?.dirty).toBe(true);
     } finally {
       await act(async () => root.unmount());
       dom.restore();
@@ -243,10 +300,11 @@ describe("ObjectRegionTexturePanel session fence", () => {
   });
 });
 
-function panelProps(): RegionSubPanelProps {
+function panelProps(overrides: Partial<RegionSubPanelProps> = {}): RegionSubPanelProps {
   return {
     model: { objectId: "object-a", regionId: "region-a" },
     meshLane: "fdm" as const,
+    ...overrides,
   } as unknown as RegionSubPanelProps;
 }
 

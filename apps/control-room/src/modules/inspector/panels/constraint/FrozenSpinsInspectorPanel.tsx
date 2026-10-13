@@ -29,6 +29,7 @@ import {
 import { useSessionScopedResourceKey } from "@/kernel/resources/useSessionScopedResourceKey";
 import { Button } from "@/shared/ui/Button";
 
+import { useRegisterInspectorEditSession } from "../../InspectorEditSession";
 import type { InspectorPanelProps } from "../../inspectorTypes";
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
 import { FieldRow } from "../../primitives/FieldRow";
@@ -118,7 +119,14 @@ export function FrozenSpinsEditor({
 }) {
   const kernel = useKernel();
   const [draft, setDraft] = useState(() => normalizeDefinition(initialDefinition));
+  const [baseline, setBaseline] = useState(() => normalizeDefinition(initialDefinition));
+  const baselineRef = useRef({
+    definition: normalizeDefinition(initialDefinition),
+    revision: initialRevision,
+  });
+  const acknowledgedRevisionRef = useRef(initialRevision);
   const draftRef = useRef(draft);
+  const applyInFlight = useRef(false);
   const mountedRef = useRef(true);
   const [revision, setRevision] = useState(initialRevision);
   const [pendingField, setPendingField] = useState<PendingField>(null);
@@ -139,15 +147,50 @@ export function FrozenSpinsEditor({
     draftRef.current = draft;
   }, [draft]);
   useEffect(() => {
+    const incomingDefinition = normalizeDefinition(initialDefinition);
+    if (initialRevision < acknowledgedRevisionRef.current) return;
+    const previousBaseline = baselineRef.current;
+    if (
+      initialRevision === previousBaseline.revision &&
+      JSON.stringify(incomingDefinition) === JSON.stringify(previousBaseline.definition)
+    ) {
+      return;
+    }
+    const wasClean =
+      JSON.stringify(draftRef.current) === JSON.stringify(previousBaseline.definition);
+    baselineRef.current = { definition: incomingDefinition, revision: initialRevision };
+    acknowledgedRevisionRef.current = initialRevision;
+    setBaseline(incomingDefinition);
+    setRevision(initialRevision);
+    if (wasClean) {
+      draftRef.current = incomingDefinition;
+      setDraft(incomingDefinition);
+      setPreview(null);
+      setPreviewSelectorJson(null);
+    }
+  }, [initialDefinition, initialRevision]);
+  useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
     };
   }, []);
 
-  async function applyDraft(): Promise<void> {
+  async function applyDraft(): Promise<boolean> {
+    if (applyInFlight.current || !dirty) return false;
     const submittedDraft = draft;
+    const operationSessionScopeKey = sessionScopeKey ?? null;
+    if (!operationSessionScopeKey) {
+      setFeedback({ kind: "error", message: "Session identity is not ready. Try again after it loads." });
+      return false;
+    }
+    const historyGeneration = kernel.authoringHistory?.getGeneration?.();
+    const isCurrentSession = () =>
+      kernel.commands.getSessionScopeKey() === operationSessionScopeKey &&
+      (historyGeneration === undefined ||
+        kernel.authoringHistory?.getGeneration?.() === historyGeneration);
     const requestOptions = scopedFrozenSpinsRequestOptions(sessionScopeKey);
+    applyInFlight.current = true;
     setPendingField("apply");
     setFeedback(null);
     try {
@@ -156,6 +199,7 @@ export function FrozenSpinsEditor({
           api: kernel.api,
           authoringHistory: kernel.authoringHistory,
           sessionScopeKey,
+          isCurrentSessionScope: isCurrentSession,
         },
         "Update Frozen Spins definition",
         async ({ baseRevision }) =>
@@ -173,9 +217,14 @@ export function FrozenSpinsEditor({
                 expected_revision: baseRevision ?? revision,
           }),
       );
-      if (!mountedRef.current) return;
+      if (!mountedRef.current) return false;
+      if (!isCurrentSession()) return false;
+      const acknowledged = normalizeDefinition(response.definition);
+      baselineRef.current = { definition: acknowledged, revision: response.revision };
+      acknowledgedRevisionRef.current = response.revision;
+      setBaseline(acknowledged);
       if (draftRef.current === submittedDraft) {
-        const acknowledged = normalizeDefinition(response.definition);
+        if (!acknowledgeAppliedDraft()) return false;
         draftRef.current = acknowledged;
         setDraft(acknowledged);
       }
@@ -191,15 +240,20 @@ export function FrozenSpinsEditor({
           ? frozenSpinsRuntimeApplicationMessage(response.runtime_application)
           : "Frozen Spins definition updated.",
       });
+      return true;
     } catch (error) {
-      if (!mountedRef.current) return;
+      if (!mountedRef.current) return false;
+      if (!isCurrentSession()) return false;
       setFeedback({ kind: "error", message: errorMessage(error) });
+      return false;
     } finally {
+      applyInFlight.current = false;
       if (mountedRef.current) setPendingField(null);
     }
   }
 
   async function createPreview(): Promise<void> {
+    if (applyInFlight.current) return;
     if (!objectId) {
       setFeedback({
         kind: "warning",
@@ -267,6 +321,7 @@ export function FrozenSpinsEditor({
   }
 
   async function activatePreview(): Promise<void> {
+    if (applyInFlight.current) return;
     if (!preview?.current) {
       setFeedback({
         kind: "warning",
@@ -275,7 +330,18 @@ export function FrozenSpinsEditor({
       return;
     }
     const submittedDraft = draft;
+    const operationSessionScopeKey = sessionScopeKey ?? null;
+    if (!operationSessionScopeKey) {
+      setFeedback({ kind: "error", message: "Session identity is not ready. Try again after it loads." });
+      return;
+    }
+    const historyGeneration = kernel.authoringHistory?.getGeneration?.();
+    const isCurrentSession = () =>
+      kernel.commands.getSessionScopeKey() === operationSessionScopeKey &&
+      (historyGeneration === undefined ||
+        kernel.authoringHistory?.getGeneration?.() === historyGeneration);
     const requestOptions = scopedFrozenSpinsRequestOptions(sessionScopeKey);
+    applyInFlight.current = true;
     setPendingField("activate");
     setFeedback(null);
     try {
@@ -284,6 +350,7 @@ export function FrozenSpinsEditor({
           api: kernel.api,
           authoringHistory: kernel.authoringHistory,
           sessionScopeKey,
+          isCurrentSessionScope: isCurrentSession,
         },
         "Commit Frozen Spins preview",
         async ({ baseRevision }) =>
@@ -307,8 +374,13 @@ export function FrozenSpinsEditor({
               ),
       );
       if (!mountedRef.current) return;
+      if (!isCurrentSession()) return;
+      const acknowledged = normalizeDefinition(response.definition);
+      baselineRef.current = { definition: acknowledged, revision: response.revision };
+      acknowledgedRevisionRef.current = response.revision;
+      setBaseline(acknowledged);
       if (draftRef.current === submittedDraft) {
-        const acknowledged = normalizeDefinition(response.definition);
+        if (!acknowledgeAppliedDraft()) return;
         draftRef.current = acknowledged;
         setDraft(acknowledged);
       }
@@ -325,13 +397,17 @@ export function FrozenSpinsEditor({
       });
     } catch (error) {
       if (!mountedRef.current) return;
+      if (!isCurrentSession()) return;
       setFeedback({ kind: "error", message: errorMessage(error) });
     } finally {
+      applyInFlight.current = false;
       if (mountedRef.current) setPendingField(null);
     }
   }
 
   async function deleteDefinition(): Promise<void> {
+    if (applyInFlight.current) return;
+    applyInFlight.current = true;
     const requestOptions = scopedFrozenSpinsRequestOptions(sessionScopeKey);
     setPendingField("delete");
     setFeedback(null);
@@ -369,6 +445,8 @@ export function FrozenSpinsEditor({
       if (!mountedRef.current) return;
       setFeedback({ kind: "error", message: errorMessage(error) });
       setPendingField(null);
+    } finally {
+      applyInFlight.current = false;
     }
   }
 
@@ -398,6 +476,15 @@ export function FrozenSpinsEditor({
     }
   }
 
+  const dirty = JSON.stringify(draft) !== JSON.stringify(baseline);
+  const resetDraft = () => {
+    if (applyInFlight.current) return;
+    draftRef.current = baseline;
+    setDraft(baseline);
+    setPreview(null);
+    setPreviewSelectorJson(null);
+    setFeedback(null);
+  };
   const activation = draft.activation ?? { kind: "all_stages" };
   const reference = draft.reference ?? { kind: "capture_current_at_activation" };
   const membership = draft.membership ?? { kind: "static" };
@@ -413,6 +500,19 @@ export function FrozenSpinsEditor({
     activationReceipt,
     solverStatus.data?.frozen_spins ?? null,
     draft.id,
+  );
+  const acknowledgeAppliedDraft = useRegisterInspectorEditSession(
+    "staged",
+    pendingField === "apply" || pendingField === "activate",
+    dirty,
+    true,
+    undefined,
+    applyDraft,
+    resetDraft,
+    {
+      applyBlockReason: sessionScopeKey ? undefined : "Session identity is not ready.",
+      historyMode: "mutation-owned",
+    },
   );
 
   return (

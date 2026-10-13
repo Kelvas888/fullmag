@@ -10,6 +10,7 @@ import { usePlanarMonitorsResource } from "@/kernel/resources/planarMonitorResou
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
 import {
+  crossSectionWorkspaceStore,
   discardPlanarMonitorDraft,
   isPlanarMonitorRevisionConflict,
   planarMonitorCreateRequestFromDraft,
@@ -20,6 +21,7 @@ import {
 import { useCrossSectionWorkspaceSelector } from "@/kernel/workspace/useCrossSectionWorkspace";
 import { Button } from "@/shared/ui/Button";
 
+import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import { MeshResourceEmpty } from "./MeshResourceView";
 import {
   PlanarMonitorDefinitionEditor,
@@ -43,6 +45,7 @@ export function PlanarMonitorDraftInspectorPanel() {
     sessionScopeKey: string;
   } | null>(null);
   const nextPendingOperationId = useRef(0);
+  const applyInFlight = useRef(false);
   const pending = pendingOperation?.sessionScopeKey === sessionScopeKey;
 
   function createHistoryMutationContext() {
@@ -59,25 +62,28 @@ export function PlanarMonitorDraftInspectorPanel() {
     };
   }
 
-  if (!draft) {
-    return <MeshResourceEmpty label="No editable planar monitor draft." />;
-  }
-  const validationErrors = [
-    ...planarMonitorValidationErrors(draft.monitor),
-    ...planarMonitorDefinitionAvailabilityErrors(draft.monitor, definitionAvailability),
-  ];
+  const validationErrors = draft
+    ? [
+        ...planarMonitorValidationErrors(draft.monitor),
+        ...planarMonitorDefinitionAvailabilityErrors(draft.monitor, definitionAvailability),
+      ]
+    : [];
 
-  const commitDraft = async () => {
+  const commitDraft = async (): Promise<boolean> => {
+    if (applyInFlight.current) return false;
+    if (!draft) return false;
     if (!visualizationState.data?.planar) {
       setFeedback("Planar visualization state is unavailable.");
-      return;
+      return false;
     }
     const historyContext = createHistoryMutationContext();
     if (!historyContext.sessionScopeKey) {
       setFeedback("Session identity is not ready. Try again after it loads.");
-      return;
+      return false;
     }
     const operationId = ++nextPendingOperationId.current;
+    const submittedDraft = draft;
+    applyInFlight.current = true;
     setPendingOperation({
       id: operationId,
       sessionScopeKey: historyContext.sessionScopeKey,
@@ -112,8 +118,18 @@ export function PlanarMonitorDraftInspectorPanel() {
           );
         },
       );
-      if (historyContext.isCurrentSessionScope() === false) return;
+      if (historyContext.isCurrentSessionScope() === false) return false;
       const monitor = created.monitor;
+      const currentDraft = crossSectionWorkspaceStore.getSnapshot().planarMonitorDraft;
+      if (currentDraft !== submittedDraft) {
+        kernel.resources.invalidate(
+          MODEL_PLANAR_MONITORS_PATH,
+          created.scene_revision,
+        );
+        setFeedback("The monitor was created; newer monitor edits remain in the draft.");
+        return true;
+      }
+      if (!acknowledgeCommittedDraft()) return false;
       discardPlanarMonitorDraft();
       kernel.visualizationSync.queuePatch({
         planar: { source: { kind: "monitor", monitor_id: monitor.id } },
@@ -142,8 +158,9 @@ export function PlanarMonitorDraftInspectorPanel() {
       kernel.layout.setActiveViewportMainModule("field-map");
       kernel.layout.setFocusedSlot("viewport-main");
       kernel.layout.setPanelVisible("right", true);
+      return true;
     } catch (error) {
-      if (historyContext.isCurrentSessionScope() === false) return;
+      if (historyContext.isCurrentSessionScope() === false) return false;
       const revisionConflict = isPlanarMonitorRevisionConflict(error);
       setConflict(revisionConflict);
       setFeedback(
@@ -153,12 +170,43 @@ export function PlanarMonitorDraftInspectorPanel() {
             ? error.message
             : "Planar monitor commit failed. Reload the scene and retry.",
       );
+      return false;
     } finally {
+      applyInFlight.current = false;
       setPendingOperation((current) =>
         current?.id === operationId ? null : current,
       );
     }
   };
+
+  const resetDraft = () => {
+    discardPlanarMonitorDraft();
+    setFeedback(null);
+    setConflict(false);
+  };
+  const resourcesReady = Boolean(monitors.data && visualizationState.data?.planar);
+  const acknowledgeCommittedDraft = useRegisterInspectorEditSession(
+    draft ? "staged" : null,
+    pending,
+    draft !== null,
+    !draft || (resourcesReady && validationErrors.length === 0),
+    undefined,
+    commitDraft,
+    resetDraft,
+    {
+      applyBlockReason:
+        draft && !sessionScopeKey
+          ? "Session identity is not ready."
+          : draft && !resourcesReady
+            ? "Monitor resources are still loading."
+            : undefined,
+      historyMode: "mutation-owned",
+    },
+  );
+
+  if (!draft) {
+    return <MeshResourceEmpty label="No editable planar monitor draft." />;
+  }
 
   return (
     <div className="fm-cross-section-inspector">
@@ -174,7 +222,7 @@ export function PlanarMonitorDraftInspectorPanel() {
           size="sm"
           type="button"
           variant="ghost"
-          onClick={discardPlanarMonitorDraft}
+          onClick={resetDraft}
         >
           Discard
         </Button>

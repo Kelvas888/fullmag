@@ -36,6 +36,7 @@ import {
 } from "./inspectorDraftState";
 import {
   buildObjectRegionPatch,
+  captureRegionAuxiliaryDraftApply,
   clampObjectRegionDraftShapeToOwnerBounds,
   defaultMaterialOverrideDraft,
   formatRegionPhysicalScalar,
@@ -44,6 +45,7 @@ import {
   objectRegionDraftIdentityKey,
   objectRegionDraftKey,
   parseRegionPhysicalScalar,
+  resetRegionAggregateDraft,
   resolveRegionCouplingDependencies,
   resolveObjectRegionPanelModel,
   validateObjectRegionDraft,
@@ -64,7 +66,10 @@ import { ObjectRegionNestedRegionsPanel as ObjectRegionNestedRegionsPanelImpl } 
 import { ObjectRegionOverviewPanel as ObjectRegionOverviewPanelImpl } from "./region/ObjectRegionOverviewPanel";
 import { ObjectRegionTexturePanel as ObjectRegionTexturePanelImpl } from "./region/ObjectRegionTexturePanel";
 import { ObjectRegionVisualizationPanel as ObjectRegionVisualizationPanelImpl } from "./region/ObjectRegionVisualizationPanel";
-import type { RegionSubPanelProps } from "./region/shared";
+import type {
+  RegionAuxiliaryDraftSession,
+  RegionSubPanelProps,
+} from "./region/shared";
 import { resolveMeshInspectorLane } from "./fdmMeshInspectorModel";
 
 type Feedback =
@@ -210,6 +215,8 @@ function useObjectRegionsPanelView({ selection }: InspectorPanelProps) {
   const nextOperationId = useRef(0);
   const pending = pendingOperation?.sessionScopeKey === sessionScopeKey &&
     pendingOperation.identityKey === draftIdentityKey;
+  const [draftApplyPending, setDraftApplyPending] = useState(false);
+  const regionDraftApplyInFlight = useRef(false);
   const [buildPendingOperation, setBuildPendingOperation] = useState<{
     id: number;
     identityKey: string;
@@ -230,6 +237,39 @@ function useObjectRegionsPanelView({ selection }: InspectorPanelProps) {
     isDirty: objectRegionDraftDirty,
     state: draftState,
   });
+  const auxiliaryDraftOwnerKey = `${selection.kind}:${draftIdentityKey}`;
+  const [auxiliaryDraftState, setAuxiliaryDraftState] = useState<{
+    ownerKey: string;
+    session: RegionAuxiliaryDraftSession;
+  } | null>(null);
+  const auxiliaryDraftSession = auxiliaryDraftState?.ownerKey === auxiliaryDraftOwnerKey
+    ? auxiliaryDraftState.session
+    : null;
+  const auxiliaryDraftSessionRef = useRef(auxiliaryDraftSession);
+  auxiliaryDraftSessionRef.current = auxiliaryDraftSession;
+  const auxiliaryDraftOwnerKeyRef = useRef(auxiliaryDraftOwnerKey);
+  auxiliaryDraftOwnerKeyRef.current = auxiliaryDraftOwnerKey;
+  const reportAuxiliaryDraftSession = useCallback(
+    (ownerKey: string, session: RegionAuxiliaryDraftSession | null) => {
+      setAuxiliaryDraftState((current) => {
+        if (session === null) {
+          return current?.ownerKey === ownerKey ? null : current;
+        }
+        if (
+          current?.ownerKey === ownerKey &&
+          current.session.applying === session.applying &&
+          current.session.dirty === session.dirty &&
+          current.session.valid === session.valid &&
+          current.session.apply === session.apply &&
+          current.session.reset === session.reset
+        ) {
+          return current;
+        }
+        return { ownerKey, session };
+      });
+    },
+    [],
+  );
 
   const membership = useMeshRegionMembershipResource(model.objectId, model.regionId, {
     enabled:
@@ -407,6 +447,7 @@ function useObjectRegionsPanelView({ selection }: InspectorPanelProps) {
   }
 
   async function applyRegion(): Promise<boolean> {
+    if (regionDraftApplyInFlight.current) return false;
     if (!canWriteRegion) {
       setFeedback({ kind: "error", message: "Select an authored object region." });
       return false;
@@ -427,6 +468,8 @@ function useObjectRegionsPanelView({ selection }: InspectorPanelProps) {
     }
     const operationId = beginRegionOperation();
     if (operationId === null) return false;
+    regionDraftApplyInFlight.current = true;
+    setDraftApplyPending(true);
     try {
       const response = await runAuthoringMutationWithHistory(
         operationContext,
@@ -473,6 +516,8 @@ function useObjectRegionsPanelView({ selection }: InspectorPanelProps) {
       setFeedback({ kind: "error", message: errorMessage(error) });
       return false;
     } finally {
+      regionDraftApplyInFlight.current = false;
+      setDraftApplyPending(false);
       finishRegionOperation(operationId);
     }
   }
@@ -706,17 +751,39 @@ function useObjectRegionsPanelView({ selection }: InspectorPanelProps) {
   }
 
   const revert = () => {
-    setDraftState(initialInspectorDraftState({ baseDraft, baseKey: draftKey, identityKey: draftIdentityKey }));
+    resetRegionAggregateDraft(auxiliaryDraftSessionRef.current, () => {
+      setDraftState(initialInspectorDraftState({ baseDraft, baseKey: draftKey, identityKey: draftIdentityKey }));
+    });
     setFeedback(null);
   };
   const validationErrors = validateObjectRegionDraft(draft, { meshPolicyLane: meshLane });
+  const regionDraftDirty = objectRegionDraftDirty(draft, baseDraft);
+  async function applyInspectorDraft(): Promise<boolean> {
+    const expectedOwnerKey = auxiliaryDraftOwnerKey;
+    const auxiliaryApplyAtStart = captureRegionAuxiliaryDraftApply(
+      auxiliaryDraftSessionRef.current,
+    );
+    let applied = false;
+    if (regionDraftDirty) {
+      if (!(await applyRegion())) return false;
+      applied = true;
+    }
+    if (auxiliaryDraftOwnerKeyRef.current !== expectedOwnerKey) return false;
+    if (auxiliaryApplyAtStart.dirty && auxiliaryApplyAtStart.apply) {
+      if (!(await auxiliaryApplyAtStart.apply())) return false;
+      applied = true;
+    }
+    return applied;
+  }
   useRegisterInspectorEditSession(
-    canWriteRegion ? "staged" : null,
-    pending,
-    objectRegionDraftDirty(draft, baseDraft),
-    sessionAvailable && canWriteRegion && validationErrors.length === 0,
+    canWriteRegion || auxiliaryDraftSession ? "staged" : null,
+    pending || draftApplyPending || (auxiliaryDraftSession?.applying ?? false),
+    regionDraftDirty || (auxiliaryDraftSession?.dirty ?? false),
+    sessionAvailable &&
+      (!canWriteRegion || validationErrors.length === 0) &&
+      (auxiliaryDraftSession?.valid ?? true),
     undefined,
-    applyRegion,
+    applyInspectorDraft,
     revert,
     { historyMode: "mutation-owned" },
   );
@@ -725,6 +792,7 @@ function useObjectRegionsPanelView({ selection }: InspectorPanelProps) {
     model,
     draft,
     pending,
+    draftApplyPending,
     sessionAvailable,
     buildPending,
     membership: membership.data ?? null,
@@ -748,6 +816,8 @@ function useObjectRegionsPanelView({ selection }: InspectorPanelProps) {
     feedback,
     materialFields: materialFields.data ?? null,
     couplingDependencies,
+    auxiliaryDraftOwnerKey,
+    reportAuxiliaryDraftSession,
   };
 
   switch (selection.kind) {

@@ -18,6 +18,7 @@ import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus"
 import { Button } from "@/shared/ui/Button";
 
 import type { InspectorPanelProps } from "../inspectorTypes";
+import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FieldRow } from "../primitives/FieldRow";
 import { InspectorGroup } from "../primitives/InspectorGroup";
@@ -52,6 +53,22 @@ export function CouplingInspectorPanel({ selection }: InspectorPanelProps) {
   const model = useMemo(
     () => resolveCouplingInspectorModel(selection, couplings.data ?? null),
     [couplings.data, selection],
+  );
+  const lockReason = model.mode === "found"
+    ? undefined
+    : model.mode === "missing"
+      ? "The selected coupling is not present in the current model resource."
+      : "Select an authored coupling to use its immediate actions.";
+
+  useRegisterInspectorEditSession(
+    "immediate",
+    pending,
+    false,
+    true,
+    lockReason,
+    () => true,
+    () => undefined,
+    { historyMode: "mutation-owned" },
   );
 
   async function commitCouplingAction(

@@ -121,8 +121,11 @@ const mocks = vi.hoisted(() => ({
   },
 }));
 
-vi.mock("@/kernel/KernelContext", () => ({
-  useKernel: () => ({
+vi.mock("@/kernel/KernelContext", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/kernel/KernelContext")>();
+  return {
+    ...actual,
+    useKernel: () => ({
     api: {
       model: {
         frozenSpins: {
@@ -149,7 +152,8 @@ vi.mock("@/kernel/KernelContext", () => ({
       patchDefaults: mocks.patchVisualizationDefaults,
     },
   }),
-}));
+  };
+});
 
 vi.mock("@/kernel/resources/studyRuntimeResources", () => ({
   useFieldMetaResource: () => ({
@@ -329,6 +333,7 @@ describe("FrozenSpinsInspectorPanel", () => {
           revision={7}
         />,
       ));
+      expect(findButton(container, "Preview mask").disabled).toBe(false);
       await act(async () => findButton(container, "Preview mask").click());
       await act(async () => findButton(container, "Commit preview").click());
       await act(async () =>
