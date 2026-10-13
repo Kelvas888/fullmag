@@ -1,5 +1,12 @@
 # P8-53 — bezpieczne zastosowanie nowego backendu w workspace
 
+[P8-53BL](53bl-inspector-owner-inventory.md), 13.10.2026:
+inwentaryzacja 23 zarejestrowanych ownerów Inspectora zakończona w źródłach.
+Nie wykazano brakującej ochrony standardowych staged formularzy.
+Stany natychmiastowe rozszerzeń i przekrojów oraz lokalne kontrolki zapytania
+Topological Charge wymagają odrębnego dowodu capture/restore.
+Pełna macierz browser i P8-53 pozostają otwarte.
+
 [P8-53BK](53bk-repeated-handoff-owner-chain.md), 13.10.2026:
 interpretowany łańcuch terminalnie odtworzonych kapsuł z nowym ownerem
 **PASS**, 162 kontrole bez pominięć, receipt `d061e0844b104248bf03fedb12ce3f34`.
