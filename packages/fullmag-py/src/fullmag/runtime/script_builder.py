@@ -22,6 +22,7 @@ from fullmag.init.textures import PresetTexture
 from fullmag.init.state_io import infer_magnetization_state_format
 from fullmag.model.antenna import (
     ANTENNA_PORT_MODE_SCHEMA_VERSION,
+    AntennaSourceCutRt0,
     AntennaFieldSource,
     CPWAntenna,
     DriveActivation,
@@ -1100,6 +1101,9 @@ def _render_scene_document_bootstrap(
                     f"name={_python_literal(name)}, type={_python_literal(role)}, "
                     f"object_id={_python_literal(object_id)})"
                 )
+            mesh = raw_object.get("mesh")
+            if isinstance(mesh, Mapping):
+                lines.extend(_render_object_id_mesh_workflow(object_id, dict(mesh), source_root=Path.cwd()))
             continue
         name = str(raw_object.get("name") or raw_object.get("id") or f"object_{index}")
         object_id = str(raw_object.get("object_id") or raw_object.get("id") or name)
@@ -1164,8 +1168,8 @@ def _render_scene_document_bootstrap(
                     f"{handle}.mesh(cell_size={_python_literal(tuple(raw_grid['cell']))})"
                 )
 
-    if not handles:
-        raise ValueError("SceneDocument export requires at least one magnetic object.")
+    # Non-magnetic objects remain valid for explicit field-only stages.
+    # Run/Relax validation continues to require magnetic objects on import.
 
     if builder.get("exchange_enabled") is False:
         lines.append("study.disable_exchange()")
@@ -1213,13 +1217,20 @@ def _render_scene_document_bootstrap(
             raise ValueError("antenna_port_modes must contain objects")
         kwargs = dict(mode)
         schema = kwargs.pop("schema_version", None)
-        if schema != ANTENNA_PORT_MODE_SCHEMA_VERSION:
+        if schema not in {ANTENNA_PORT_MODE_SCHEMA_VERSION, "antenna_port_mode.v3"}:
             raise ValueError("unsupported antenna port mode schema_version")
+        normalization = kwargs.pop("normalization", None)
+        normalization_expr = ""
+        if schema == "antenna_port_mode.v3":
+            kwargs["schema_version"] = schema
+            normalization_expr = f", normalization={_render_source_cut_normalization(normalization)}"
+        elif normalization is not None:
+            raise ValueError("antenna port mode v2 cannot use source-cut normalization")
         branches = kwargs.pop("branches", None)
         if not isinstance(branches, list):
             raise ValueError("antenna port mode branches must be a list")
         expression = "[" + ", ".join(f"fm.AntennaPortBranch(**{_py_literal(branch)})" for branch in branches) + "]"
-        lines.append(f"study.add_antenna_port_mode(port_mode=fm.AntennaPortMode(**{_py_literal(kwargs)}, branches={expression}))")
+        lines.append(f"study.add_antenna_port_mode(port_mode=fm.AntennaPortMode(**{_py_literal(kwargs)}, branches={expression}{normalization_expr}))")
 
     authored_stages = []
     raw_stages = builder.get("stages") or []
@@ -4850,7 +4861,8 @@ def _render_conservative_current_view_payload(payload: object) -> str:
                 f"{_py_repr(str(cut.get('id') or ''))}, "
                 f"{_py_tuple3(_optional_vec3(cut.get('translation_m')) or (0.0, 0.0, 0.0))}, "
                 f"{_py_number(_number_or_none(cut.get('potential_drop_v')) or 0.0)}, "
-                f"[{', '.join(pair_exprs)}])"
+                f"[{', '.join(pair_exprs)}], "
+                f"closure_operator_version={_py_repr(str(closure.get('operator_version') or 'fem_closed_current_geometry.v1'))})"
             )
         closure_expr = (
             "fm.ConservativeCurrentClosedGeometry("
@@ -4999,7 +5011,8 @@ def _render_current_transport_payload(payload: object, *, surface: str) -> str:
                 "plane=fm.StructuredCutPlane("
                 f"axis={_py_repr(str(plane.get('axis') or ''))}, "
                 f"offset_m={_py_number(_number_or_none(plane.get('offset_m')) or 0.0)}, "
-                f"normal={_py_repr(str(plane.get('normal') or ''))}), "
+                f"normal={_py_repr(str(plane.get('normal') or ''))}, "
+                f"coordinate_frame={_py_repr(str(plane.get('coordinate_frame') or 'world'))}), "
                 "drive=fm.ImpressedPotentialJump("
                 f"drive_id={_py_repr(str(drive.get('drive_id') or ''))}, "
                 "potential_jump_V="
@@ -5008,7 +5021,8 @@ def _render_current_transport_payload(payload: object, *, surface: str) -> str:
         kwargs.append(
             "structured_current_closure=fm.StructuredCurrentClosure("
             f"closure_id={_py_repr(str(structured_closure.get('closure_id') or ''))}, "
-            f"source_cuts=[{', '.join(cut_exprs)}])"
+            f"source_cuts=[{', '.join(cut_exprs)}], "
+            f"schema_version={_py_repr(str(structured_closure.get('schema_version') or 'structured_current_closure.v1'))})"
         )
     return f"{_surface_call(surface, 'current_transport')}({', '.join(kwargs)})"
 
@@ -5079,6 +5093,14 @@ def _render_field_target_expr(target: FieldTarget) -> str:
     )
 
 
+def _render_source_cut_normalization(value: object) -> str:
+    if not isinstance(value, Mapping) or set(value) != {"kind", "source_cut_ref", "orientation"} or value["kind"] != "source_cut_rt0":
+        raise ValueError("unsupported antenna source-cut normalization payload")
+    normalization = AntennaSourceCutRt0(value["source_cut_ref"], value["orientation"])
+    return (f"fm.AntennaSourceCutRt0(source_cut_ref={_py_repr(normalization.source_cut_ref)}, "
+            f"orientation={_py_repr(normalization.orientation)})")
+
+
 def _render_antenna_port_modes(problem: Problem, *, surface: str) -> list[str]:
     if not problem.antenna_port_modes:
         return []
@@ -5094,13 +5116,16 @@ def _render_antenna_port_modes(problem: Problem, *, surface: str) -> list[str]:
             f"signed_weight={_py_number(branch.signed_weight)})"
             for branch in mode.branches
         )
+        normalization_expr = (f", schema_version={_py_repr(mode.schema_version)}, "
+                              f"normalization={_render_source_cut_normalization(mode.normalization.to_ir())}"
+                              if mode.normalization is not None else "")
         lines.append(
             "study.add_antenna_port_mode(port_mode=fm.AntennaPortMode("
             f"id={_py_repr(mode.id)}, "
             f"source_object_id={_py_repr(mode.source_object_id)}, "
             f"current_transport_id={_py_repr(mode.current_transport_id)}, "
             f"branches=({branches},), "
-            f"normalization_current_a={_py_number(mode.normalization_current_a)}))"
+            f"normalization_current_a={_py_number(mode.normalization_current_a)}{normalization_expr}))"
         )
     return lines
 
@@ -6970,6 +6995,9 @@ def _study_geometry_mesh_configs(
     return [
         (magnet.name, _normalize_mapping(_export_geometry_mesh_entry(magnet.name, problem)))
         for magnet in problem.magnets
+    ] + [
+        (geometry.geometry_name, _normalize_mapping(_export_geometry_mesh_entry(geometry.geometry_name, problem)))
+        for geometry in problem.auxiliary_geometries
     ]
 
 
@@ -6979,6 +7007,19 @@ def _mesh_entry_requests_build(mesh_config: Mapping[str, object]) -> bool:
 
 def _mesh_entry_requires_explicit_render(mesh_config: Mapping[str, object]) -> bool:
     return _mesh_mode(mesh_config.get("mode")) == "custom" or _mesh_entry_requests_build(mesh_config)
+
+
+def _render_object_id_mesh_workflow(
+    object_id: str, mesh_config: dict[str, object], *, source_root: Path,
+) -> list[str]:
+    target = f"study.objects.mesh.by_id({_py_repr(object_id)})"
+    call = _render_geometry_mesh_call(target, mesh_config, source_root=source_root)
+    lines = [call] if call is not None else []
+    lines.extend(_render_mesh_size_fields(target, mesh_config))
+    lines.extend(_render_mesh_operations(target, mesh_config))
+    if _mesh_entry_requests_build(mesh_config):
+        lines.append(f"{target}.mesh.build()")
+    return [line.replace(f"{target}.mesh", target) for line in lines]
 
 
 def _render_study_mesh_workflow(
@@ -7002,7 +7043,15 @@ def _render_study_mesh_workflow(
         if not _mesh_entry_requires_explicit_render(mesh_config):
             continue
         target_var = magnet_vars.get(magnet_name)
-        if target_var is None:
+        if magnet_name in problem.auxiliary_geometry_object_ids or target_var is None:
+            object_id = problem.auxiliary_geometry_object_ids.get(magnet_name, magnet_name)
+            geometries_override = overrides.get("geometries")
+            if isinstance(geometries_override, list):
+                for geometry in geometries_override:
+                    if isinstance(geometry, Mapping) and geometry.get("name") == magnet_name:
+                        object_id = str(geometry.get("object_id") or magnet_name)
+                        break
+            lines.extend(_render_object_id_mesh_workflow(object_id, mesh_config, source_root=source_root))
             continue
         mesh_call = _render_geometry_mesh_call(
             target_var,
@@ -8817,6 +8866,12 @@ def _render_antenna_layout_expr(
         if isinstance(entry, Mapping)
     }
     if constructor == "fm.MicrostripAntennaLayout":
+        loop = params.get("loop")
+        if isinstance(loop, Mapping) and loop.get("enabled") is True:
+            kwargs.append("closed_loop=True")
+            for key, value in loop.items():
+                if key != "enabled":
+                    kwargs.append(f"{key}={_py_repr(value)}")
         kwargs.extend([
             f"return_width_m={number('return_width_m', 'return_width')}",
             f"return_offset_m={number('return_offset_m', 'return_gap_m')}",
