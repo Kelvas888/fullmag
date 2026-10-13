@@ -133,7 +133,6 @@ function meshDetailsInspectorSections(selectionKind: string | null): string[] {
     default:
       return [
         "overview",
-        "shared-policy",
         "identity",
         "counts",
         "pipeline",
@@ -180,13 +179,18 @@ export function MeshDetailsPanel({ selection }: InspectorPanelProps) {
   }
   const sections = meshDetailsInspectorSections(selection.kind);
   const showSection = (section: string) => sections.includes(section);
+  const showGuide =
+    selection.kind === "mesh.root" ||
+    selection.kind === "mesh.shared-domain" ||
+    selection.kind === "mesh.builds" ||
+    selection.kind === "mesh.quality";
 
   return (
     <div
       key={selection.kind ?? "default"}
       className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group"
     >
-      <FemMeshReadinessGuideCard />
+      {showGuide ? <FemMeshReadinessGuideCard /> : null}
       {showSection("overview") ? (
         <MeshOverviewSection
           activeBuildRevision={model.activeBuildRevision}

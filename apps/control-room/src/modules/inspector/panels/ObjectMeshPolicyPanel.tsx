@@ -1269,7 +1269,10 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
         if (!applied) return;
       }
       if (!isCurrentOperation()) return;
-      const result = await commands.execute(commandId, operationContext);
+      const result =
+        commandId === "mesh.build-shared-domain"
+          ? await commands.execute("mesh.build-shared-domain", operationContext)
+          : await commands.execute("mesh.build-selected", operationContext);
       if (!isCurrentOperation()) return;
       const labelPrefix = commandId === "mesh.build-shared-domain" ? "Shared-domain" : "Object";
       setFeedback({
@@ -1353,7 +1356,11 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
       <Tabs value={activeTab} className="fm-inspector-tabs">
 
         <TabsContent value="policy" className="fm-tabs-content">
-          <FemMeshReadinessGuideCard selectedObjectId={objectId} />
+          <FemMeshReadinessGuideCard
+            compact
+            selectedObjectId={objectId}
+            selectedObjectPolicy={resource}
+          />
           <ObjectMeshOverrideSection draft={draft} updateDraft={updateDraft} />
           <ObjectMeshTransactionsSection
             buildLabel={isDirty ? "Apply & Build Object Mesh" : "Build Object Mesh"}

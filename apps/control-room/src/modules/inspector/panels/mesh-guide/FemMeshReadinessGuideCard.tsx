@@ -28,6 +28,9 @@ import { useFemMeshReadinessGuide } from "./useFemMeshReadinessGuide";
 export interface FemMeshReadinessGuideCardProps {
   compact?: boolean;
   selectedObjectId?: string | null;
+  selectedObjectPolicy?: unknown;
+  sharedDomainPolicy?: unknown;
+  universePolicy?: unknown;
 }
 
 function stepBadgeVariant(
@@ -88,12 +91,18 @@ export function FemMeshReadinessGuideCard(
 function FemMeshReadinessGuideCardInner({
   compact = false,
   selectedObjectId = null,
+  selectedObjectPolicy,
+  sharedDomainPolicy,
+  universePolicy,
 }: FemMeshReadinessGuideCardProps) {
   const kernel = useKernel();
   const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
   const guide = useFemMeshReadinessGuide({
     enabled: true,
     selectedObjectId,
+    selectedObjectPolicy,
+    sharedDomainPolicy,
+    universePolicy,
   });
   const [expanded, setExpanded] = useState(!compact);
   const [runningCommand, setRunningCommand] = useState(false);

@@ -66,7 +66,6 @@ import {
   reconcileObjectEditAck,
   reconcileObjectIdentityAck,
 } from "./objectEditAckReconciliation";
-import { FemMeshReadinessGuideCard } from "./mesh-guide/FemMeshReadinessGuideCard";
 
 type Feedback = {
   kind: "error" | "success" | "warning";
@@ -849,9 +848,6 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
 
   return (
     <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group">
-      {object.mode === "committed" ? (
-        <FemMeshReadinessGuideCard compact selectedObjectId={object.objectId} />
-      ) : null}
       <InspectorGroup title="Ferromagnet Object" collapsible defaultOpen>
         {object.mode === "committed" ? (
           <>

@@ -8,8 +8,9 @@ import { useKernel } from "@/kernel/KernelContext";
 import {
   MESH_BUILD_CURRENT_RESOURCE_KEY,
   MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY,
+  MESH_SEMANTICS_RESOURCE_KEY,
   MESH_SHARED_DOMAIN_POLICY_RESOURCE_KEY,
-  useMeshSharedDomainPolicyResource,
+  useMeshSemanticsResource,
 } from "@/kernel/resources/geometryLifecycleResources";
 import { publishCommittedMeshPolicyResource } from "@/kernel/resources/meshPolicyResourceCache";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
@@ -168,16 +169,21 @@ export function SharedDomainMeshPolicySection() {
   const kernel = useKernel();
   const { api, commands, resources } = kernel;
   const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
-  const policyResource = useMeshSharedDomainPolicyResource();
-  const resource = useMemo<SharedDomainResourceLike>(
-    () =>
-      (policyResource.data as SharedDomainResourceLike | null) ?? {
-        config: null,
-        effective_config: null,
-        revision: 0,
-      },
-    [policyResource.data],
-  );
+  const semanticsResource = useMeshSemanticsResource();
+  const resource = useMemo<SharedDomainResourceLike>(() => {
+    const data = semanticsResource.data as Record<string, unknown> | null;
+    const sharedConfig =
+      data?.shared_domain_config &&
+      typeof data.shared_domain_config === "object" &&
+      !Array.isArray(data.shared_domain_config)
+        ? (data.shared_domain_config as Record<string, unknown>)
+        : null;
+    return {
+      config: sharedConfig,
+      effective_config: sharedConfig,
+      revision: typeof data?.revision === "number" ? data.revision : 0,
+    };
+  }, [semanticsResource.data]);
 
   const baseDraft = useMemo(
     () => draftFromSharedDomainResource(resource),
@@ -303,6 +309,7 @@ export function SharedDomainMeshPolicySection() {
         MESH_SHARED_DOMAIN_POLICY_RESOURCE_KEY,
         next.revision,
       );
+      resources.invalidate(MESH_SEMANTICS_RESOURCE_KEY, next.revision);
       resources.invalidate(MESH_BUILD_CURRENT_RESOURCE_KEY, next.revision);
       resources.invalidate(
         MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY,

@@ -39,31 +39,12 @@ function useOptionalResource<T>(
   return { data: null, status: "idle" };
 }
 
-function useOptionalScopedResource<T>(
-  hookName: keyof typeof geometryLifecycleResources,
-  id: string | null | undefined,
-  options: { enabled: boolean },
-): { data: T | null; status: string } {
-  let hook: unknown;
-  try {
-    hook = geometryLifecycleResources[hookName];
-  } catch {
-    hook = undefined;
-  }
-  if (typeof hook === "function") {
-    return (
-      hook as (
-        targetId: string | null | undefined,
-        hookOptions?: { enabled?: boolean },
-      ) => { data: T | null; status: string }
-    )(id, options);
-  }
-  return { data: null, status: "idle" };
-}
-
 export function useFemMeshReadinessGuide(options?: {
   enabled?: boolean;
   selectedObjectId?: string | null;
+  selectedObjectPolicy?: unknown;
+  sharedDomainPolicy?: unknown;
+  universePolicy?: unknown;
 }): FemMeshReadinessGuideModel | null {
   const discretization = useSessionStatusSelector(
     (status) => status.data?.domain?.discretization ?? null,
@@ -82,12 +63,8 @@ export function useFemMeshReadinessGuide(options?: {
     { enabled: femEnabled },
   );
   const universePolicy = useOptionalResource("useUniverseMeshPolicyResource", {
-    enabled: femEnabled,
+    enabled: femEnabled && options?.universePolicy === undefined,
   });
-  const sharedDomainPolicy = useOptionalResource(
-    "useMeshSharedDomainPolicyResource",
-    { enabled: femEnabled },
-  );
   const meshSemantics = useOptionalResource("useMeshSemanticsResource", {
     enabled: femEnabled,
   });
@@ -101,19 +78,38 @@ export function useFemMeshReadinessGuide(options?: {
     enabled: femEnabled,
   });
   const qualityGates = useOptionalResource(
-    "useMeshSharedDomainQualityResource",
+    "useMeshSharedDomainQualityGatesResource",
     {
       enabled: femEnabled,
     },
   );
-  const selectedObjectPolicy = useOptionalScopedResource(
-    "useObjectMeshPolicyResource",
-    options?.selectedObjectId,
-    { enabled: femEnabled && Boolean(options?.selectedObjectId) },
-  );
 
   return useMemo(() => {
     if (!femEnabled) return null;
+
+    const semanticsRecord =
+      meshSemantics.data &&
+      typeof meshSemantics.data === "object" &&
+      !Array.isArray(meshSemantics.data)
+        ? (meshSemantics.data as Record<string, unknown>)
+        : null;
+    const resolvedSharedDomainPolicy =
+      options?.sharedDomainPolicy ??
+      (semanticsRecord?.shared_domain_config !== undefined
+        ? {
+            config: semanticsRecord.shared_domain_config,
+            revision: semanticsRecord.revision ?? 0,
+          }
+        : null);
+    const resolvedUniversePolicy =
+      options?.universePolicy ??
+      universePolicy.data ??
+      (semanticsRecord?.universe_config !== undefined
+        ? {
+            config: semanticsRecord.universe_config,
+            revision: semanticsRecord.revision ?? 0,
+          }
+        : null);
 
     return evaluateFemMeshReadinessGuide({
       activeBuild: activeBuild.data,
@@ -124,9 +120,9 @@ export function useFemMeshReadinessGuide(options?: {
       qualityGates: qualityGates.data,
       scene: scene.data,
       selectedObjectId: options?.selectedObjectId ?? null,
-      selectedObjectPolicy: selectedObjectPolicy.data,
-      sharedDomainPolicy: sharedDomainPolicy.data,
-      universePolicy: universePolicy.data,
+      selectedObjectPolicy: options?.selectedObjectPolicy ?? null,
+      sharedDomainPolicy: resolvedSharedDomainPolicy,
+      universePolicy: resolvedUniversePolicy,
     });
   }, [
     activeBuild.data,
@@ -136,10 +132,11 @@ export function useFemMeshReadinessGuide(options?: {
     meshSemantics.data,
     meshSummary.data,
     options?.selectedObjectId,
+    options?.selectedObjectPolicy,
+    options?.sharedDomainPolicy,
+    options?.universePolicy,
     qualityGates.data,
     scene.data,
-    selectedObjectPolicy.data,
-    sharedDomainPolicy.data,
     universePolicy.data,
   ]);
 }
