@@ -210,7 +210,7 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
   });
   const [feedbackState, setFeedbackState] = useState<FeedbackState>({
     feedback: null,
-    key: draftKey,
+    key: "",
   });
   const currentSessionScopeKey = kernel.commands.getSessionScopeKey() ?? null;
   const [pendingState, setPendingState] = useState<PendingOperationState>({
@@ -230,6 +230,10 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
     editSnapshot.identity?.objectId === object.objectId;
   const editIdentity = sessionMatchesTarget ? editSnapshot.identity : null;
   const objectEditDraft = sessionMatchesTarget ? editSnapshot.draft : null;
+  const feedbackKey = JSON.stringify([
+    currentSessionScopeKey, object.mode, object.objectId,
+    editIdentity?.epoch, editIdentity?.draftId,
+  ]);
   const sceneWritePending = kernel.objectEditSession.hasPendingWrite(currentSessionScopeKey);
   const placementGestureActive = kernel.objectEditSession.hasActiveGesture(currentSessionScopeKey);
   const ownObjectApplyPending = Boolean(
@@ -306,7 +310,7 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
   const draftNotes = objectEditDraft?.notes ?? fallbackDraft.notes;
   const draftMaterial = objectEditDraft?.material ?? fallbackDraft.material;
   const draftRegion = objectEditDraft?.region ?? fallbackDraft.region;
-  const feedback = feedbackState.key === draftKey ? feedbackState.feedback : null;
+  const feedback = feedbackState.key === feedbackKey ? feedbackState.feedback : null;
 
   const validationMessages = summarizeGeometryValidationMessages(
     validation.data,
@@ -422,7 +426,7 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
   function setFeedback(feedbackValue: Feedback | null): void {
     setFeedbackState({
       feedback: feedbackValue,
-      key: draftKey,
+      key: feedbackKey,
     });
   }
 

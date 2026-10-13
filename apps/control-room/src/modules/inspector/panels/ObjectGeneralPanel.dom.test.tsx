@@ -242,6 +242,81 @@ describe("ObjectGeneralPanel staged identity edits", () => {
     }
   });
 
+  it("keeps identity success feedback across an ACK revision and scopes it to session and object", async () => {
+    const beforeObject = {
+      geometry: { geometry_kind: "Box", geometry_params: { size: [1e-7, 1e-7, 1e-8] } },
+      id: "object-a",
+      material_ref: null,
+      name: "Magnet",
+      notes: "Original notes",
+      region_name: null,
+      transform: {
+        pivot: [0, 0, 0],
+        rotation_quat: [0, 0, 0, 1],
+        scale: [1, 1, 1],
+        translation: [0, 0, 0],
+      },
+    };
+    const beforeScene = {
+      objects: [beforeObject],
+      revision: 7,
+      scene_revision: 7,
+    };
+    const acknowledgedScene = {
+      objects: [
+        { ...beforeObject, name: "Updated magnet" },
+        { ...beforeObject, id: "object-b", name: "Other magnet" },
+      ],
+      revision: 8,
+      scene_revision: 8,
+    };
+    mocks.sceneData = beforeScene;
+    mocks.readScene.mockReset();
+    mocks.readScene.mockResolvedValue(beforeScene);
+    mocks.patchObject.mockResolvedValue(acknowledgedScene);
+
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    const renderPanel = (activeSelection: Selection) => (
+      <InspectorEditSessionProvider>
+        <ObjectGeneralPanel selection={activeSelection} />
+      </InspectorEditSessionProvider>
+    );
+    try {
+      await act(async () => root.render(renderPanel(selection)));
+      await act(async () => changeInput(container, "Name", "Updated magnet"));
+      await act(async () => findButton(container, "Apply").click());
+
+      expect(mocks.patchObject).toHaveBeenCalledWith(
+        "object-a",
+        { base_revision: 7, name: "Updated magnet", notes: "Original notes" },
+        { sessionScopeKey: "session=A&epoch=1" },
+      );
+      expect(container.textContent).toContain("Object identity committed.");
+
+      // Model the resource rerender caused by publishing the revision-8 ACK.
+      mocks.sceneData = acknowledgedScene;
+      await act(async () => root.render(renderPanel(selection)));
+      expect(container.textContent).toContain("Object identity committed.");
+
+      mocks.getSessionScopeKey.mockReturnValue("session=B&epoch=2");
+      await act(async () => root.render(renderPanel(selection)));
+      expect(container.textContent).not.toContain("Object identity committed.");
+
+      mocks.getSessionScopeKey.mockReturnValue("session=A&epoch=1");
+      await act(async () => root.render(renderPanel(selection)));
+      expect(container.textContent).not.toContain("Object identity committed.");
+
+      await act(async () => root.render(renderPanel(objectSelection("object-b", "Other magnet"))));
+      expect(container.textContent).not.toContain("Object identity committed.");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
   it("shows and applies retained post-create material and region drafts through the identity patch", async () => {
     const createdScene = {
       objects: [{
