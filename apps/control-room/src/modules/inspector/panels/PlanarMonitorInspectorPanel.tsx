@@ -117,12 +117,17 @@ function CommittedPlanarMonitorEditor({
     ...planarMonitorDefinitionAvailabilityErrors(draft.monitor, definitionAvailability),
   ];
   const dirty = JSON.stringify(draft.monitor) !== JSON.stringify(baseline.monitor);
+  const incomingDefinitionConflict =
+    sceneRevision > acknowledgedBaseline.revision &&
+    JSON.stringify(monitor) !== JSON.stringify(baselineRef.current.monitor) &&
+    JSON.stringify(draft.monitor) !== JSON.stringify(baselineRef.current.monitor);
+  const hasConflict = conflict || incomingDefinitionConflict;
   const updateDraft = (next: PlanarMonitorDraft) => {
     draftRef.current = next;
     setDraft(next);
   };
   useEffect(() => {
-    if (sceneRevision < acknowledgedBaseline.revision) return;
+    if (sceneRevision <= acknowledgedBaseline.revision) return;
     const incoming = { monitor, revision: sceneRevision };
     const previous = baselineRef.current;
     if (
@@ -131,6 +136,8 @@ function CommittedPlanarMonitorEditor({
     ) {
       return;
     }
+    const definitionChanged =
+      JSON.stringify(incoming.monitor) !== JSON.stringify(previous.monitor);
     const wasClean = JSON.stringify(draftRef.current.monitor) === JSON.stringify(previous.monitor);
     baselineRef.current = incoming;
     setBaselineState(incoming);
@@ -141,6 +148,11 @@ function CommittedPlanarMonitorEditor({
       );
       draftRef.current = nextDraft;
       setDraft(nextDraft);
+    } else if (definitionChanged) {
+      setConflict(true);
+      setFeedback(
+        "The monitor definition changed externally while this draft was open. Revert to the current monitor before applying.",
+      );
     }
   }, [acknowledgedBaseline.revision, monitor, sceneRevision]);
   useEffect(() => {
@@ -171,7 +183,7 @@ function CommittedPlanarMonitorEditor({
   };
 
   const apply = async (): Promise<boolean> => {
-    if (applyInFlight.current || !dirty || errors.length > 0) return false;
+    if (applyInFlight.current || hasConflict || !dirty || errors.length > 0) return false;
     const submittedDraft = draft;
     const submittedMonitor = structuredClone(draft.monitor);
     const operationSessionScopeKey = sessionScopeKey;
@@ -285,14 +297,16 @@ function CommittedPlanarMonitorEditor({
     "staged",
     draftApplying,
     dirty,
-    errors.length === 0,
+    errors.length === 0 && !hasConflict,
     undefined,
     apply,
     resetDraft,
     {
-      applyBlockReason: sessionScopeKey
-        ? undefined
-        : "Session identity is not ready.",
+      applyBlockReason: hasConflict
+        ? "The monitor definition changed externally. Revert this draft before applying."
+        : sessionScopeKey
+          ? undefined
+          : "Session identity is not ready.",
       historyMode: "mutation-owned",
     },
   );
@@ -318,7 +332,7 @@ function CommittedPlanarMonitorEditor({
           Discard
         </Button>
         <Button
-          disabled={pending || !dirty || errors.length > 0}
+          disabled={pending || hasConflict || !dirty || errors.length > 0}
           size="sm"
           type="button"
           variant="primary"
@@ -333,7 +347,7 @@ function CommittedPlanarMonitorEditor({
         </div>
       ) : null}
       {feedback ? <p role="alert">{feedback}</p> : null}
-      {conflict ? (
+      {hasConflict ? (
         <Button size="sm" type="button" variant="secondary" onClick={refetch}>
           Reload current monitor
         </Button>

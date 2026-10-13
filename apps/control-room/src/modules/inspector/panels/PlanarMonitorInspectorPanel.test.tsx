@@ -299,7 +299,7 @@ describe("PlanarMonitorInspectorPanel", () => {
     }
   });
 
-  it("keeps one staged owner across refetch and acknowledges only the submitted draft", async () => {
+  it("keeps one staged owner across revision-only refetch and acknowledges only the submitted draft", async () => {
     let finishPatch: ((value: unknown) => void) | null = null;
     const patchResult = new Promise((resolve) => {
       finishPatch = resolve;
@@ -322,7 +322,7 @@ describe("PlanarMonitorInspectorPanel", () => {
       await act(async () => change(findControl(container, "Target kind"), "domain"));
       expect(findSessionProbe(container).textContent).toBe("staged:true");
 
-      mocks.resourceMonitor = { ...monitorFixture, name: "External refresh" };
+      mocks.resourceMonitor = { ...monitorFixture };
       mocks.resourceSceneRevision = 8;
       await act(async () => root.render(
         <InspectorEditSessionProvider>
@@ -334,6 +334,7 @@ describe("PlanarMonitorInspectorPanel", () => {
       ));
       expect(controlValue(findControl(container, "Target kind"))).toBe("domain");
       expect(findSessionProbe(container).textContent).toBe("staged:true");
+      expect(findSessionProbe(container).getAttribute("data-valid")).toBe("true");
 
       await act(async () => {
         findButton(container, "Apply").click();
@@ -359,6 +360,50 @@ describe("PlanarMonitorInspectorPanel", () => {
       await act(async () => change(findControl(container, "Target kind"), "domain"));
       await act(async () => findButton(container, "Apply").click());
       expect(findSessionProbe(container).textContent).toBe("staged:false");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("blocks local and global Apply after an external definition change until Revert", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <InspectorEditSessionProvider>
+          <>
+            <PlanarMonitorInspectorPanel selection={selection()} />
+            <InspectorEditSessionProbe />
+          </>
+        </InspectorEditSessionProvider>,
+      ));
+      await act(async () => change(findControl(container, "Target kind"), "domain"));
+
+      mocks.resourceMonitor = { ...monitorFixture, name: "External refresh" };
+      mocks.resourceSceneRevision = 8;
+      await act(async () => root.render(
+        <InspectorEditSessionProvider>
+          <>
+            <PlanarMonitorInspectorPanel selection={selection()} />
+            <InspectorEditSessionProbe />
+          </>
+        </InspectorEditSessionProvider>,
+      ));
+
+      expect(controlValue(findControl(container, "Name"))).toBe("Mid-plane");
+      expect(controlValue(findControl(container, "Target kind"))).toBe("domain");
+      expect(findButton(container, "Apply").disabled).toBe(true);
+      expect(findSessionProbe(container).getAttribute("data-valid")).toBe("false");
+      expect(findSessionProbe(container).getAttribute("data-apply-block-reason")).toContain("Revert");
+      expect(mocks.patch).not.toHaveBeenCalled();
+
+      await act(async () => findButton(container, "Discard").click());
+      expect(controlValue(findControl(container, "Name"))).toBe("External refresh");
+      expect(findButton(container, "Apply").disabled).toBe(true);
+      expect(findSessionProbe(container).getAttribute("data-valid")).toBe("true");
+      expect(mocks.patch).not.toHaveBeenCalled();
     } finally {
       await act(async () => root.unmount());
       dom.restore();
@@ -427,7 +472,11 @@ function findButton(root: TestNode, text: string): TestElement {
 function InspectorEditSessionProbe() {
   const session = useInspectorEditSession();
   return (
-    <output data-testid="inspector-edit-session">
+    <output
+      data-testid="inspector-edit-session"
+      data-valid={session?.valid ? "true" : "false"}
+      data-apply-block-reason={session?.applyBlockReason ?? ""}
+    >
       {session ? `${session.mode}:${session.dirty}` : "none"}
     </output>
   );
