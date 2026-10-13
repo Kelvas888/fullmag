@@ -192,6 +192,13 @@ inline PetscErrorCode calculate_floquet_relative_residual(
 struct FloquetShiftedKspTrueConvergenceContext {
     void *default_context = nullptr;
     Vec candidate_solution = nullptr;
+    Vec owned_true_probe_solution = nullptr;
+    bool owned_true_probe_solution_available = false;
+    std::uint64_t current_inner_attempt_id = 0;
+    std::uint64_t owned_true_probe_attempt_id = 0;
+    std::uint64_t owned_true_probe_callback_ordinal = 0;
+    PetscInt owned_true_probe_iteration = -1;
+    int owned_true_probe_build_reason = 0;
     Vec true_residual = nullptr;
     PetscReal rtol = 0.0;
     PetscReal atol = 0.0;
@@ -326,6 +333,17 @@ inline PetscErrorCode clear_floquet_shifted_ksp_true_convergence_context(
         }
         context->candidate_solution = nullptr;
     }
+    if (context->owned_true_probe_solution != nullptr) {
+        Vec owned = context->owned_true_probe_solution;
+        const PetscErrorCode error = VecDestroy(&owned);
+        if (error != PETSC_SUCCESS || owned != nullptr) {
+            context->cleanup_failed = true;
+            context->cleanup_error = error != PETSC_SUCCESS ? error : PETSC_ERR_LIB;
+            return context->cleanup_error;
+        }
+        context->owned_true_probe_solution = nullptr;
+        context->owned_true_probe_solution_available = false;
+    }
     if (context->default_context != nullptr) {
         const PetscErrorCode error =
             destroy_floquet_ksp_default_convergence_context(
@@ -394,6 +412,11 @@ inline PetscErrorCode create_floquet_shifted_ksp_true_convergence_context(
             operator_matrix,
             &context->candidate_solution,
             &context->true_residual);
+    }
+    if (error == 0) {
+        error = VecDuplicate(
+            context->candidate_solution,
+            &context->owned_true_probe_solution);
     }
     if (error == 0) {
         error = KSPGetTolerances(
@@ -530,6 +553,11 @@ inline PetscErrorCode floquet_shifted_true_convergence_test(
 
     ++context->true_probe_attempt_count;
     context->last_true_probe_available = false;
+    context->owned_true_probe_solution_available = false;
+    context->owned_true_probe_attempt_id = context->current_inner_attempt_id;
+    context->owned_true_probe_callback_ordinal = context->callback_count;
+    context->owned_true_probe_iteration = iteration;
+    context->owned_true_probe_build_reason = 0;
     context->last_true_build_reason_available = false;
     context->last_true_build_reason = 0;
     context->last_true_tolerance_ratio_available = false;
@@ -607,6 +635,12 @@ inline PetscErrorCode floquet_shifted_true_convergence_test(
     if (build_reason < 0) {
         *reason = build_reason;
         return 0;
+    }
+    error = VecCopy(
+        context->candidate_solution,
+        context->owned_true_probe_solution);
+    if (error != PETSC_SUCCESS) {
+        return record_probe_failure(error);
     }
 
     // Cache diagnostics from the solution vector already built for this true
@@ -707,6 +741,15 @@ inline PetscErrorCode floquet_shifted_true_convergence_test(
             context->last_true_tolerance_ratio = ratio;
         }
     }
+    // The copied storage is made eligible only after the full true-residual
+    // probe completes. The callback scratch vector is reused by later
+    // iterations and cannot serve as a recovery candidate.
+    context->owned_true_probe_attempt_id = context->current_inner_attempt_id;
+    context->owned_true_probe_callback_ordinal =
+        context->last_true_probe_callback_ordinal;
+    context->owned_true_probe_iteration = iteration;
+    context->owned_true_probe_build_reason = static_cast<int>(build_reason);
+    context->owned_true_probe_solution_available = true;
     return 0;
 }
 

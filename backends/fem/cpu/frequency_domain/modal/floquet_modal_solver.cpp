@@ -8706,6 +8706,11 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
         target.last_cycle_count = static_cast<std::int64_t>(source->last_cycle_count);
         target.max_cumulative_iterations_per_solve =
             static_cast<std::int64_t>(source->max_cumulative_iterations_per_solve);
+        target.last_candidate_iteration =
+            static_cast<std::int64_t>(source->last_candidate_iteration);
+        target.last_terminal_iteration =
+            static_cast<std::int64_t>(source->last_terminal_iteration);
+        target.last_candidate_source = source->last_candidate_source;
         target.last_certified = source->last_certified;
         target.last_recovered = source->last_recovered;
         target.last_inner_reason_available = source->last_inner_reason_available;

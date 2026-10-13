@@ -4299,8 +4299,16 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
                            "\"transport_ksp_type\":\"preonly\",\"transport_pc_type\":\"shell\"") &&
                   contains(value.diagnostics_json,
                            "\"inner_ksp_type\":\"gmres\",\"inner_pc_type\":\"lu\"") &&
+                  (contains(value.diagnostics_json,
+                            "\"certificate_source\":\"owner_recomputed_true_residual\"") ||
+                   contains(value.diagnostics_json,
+                            "\"certificate_source\":\"owner_recomputed_owned_true_probe_cache\"")) &&
                   contains(value.diagnostics_json,
-                           "\"certificate_source\":\"owner_recomputed_true_residual\"") &&
+                           "\"candidate_iteration\":") &&
+                  contains(value.diagnostics_json,
+                           "\"terminal_iteration\":") &&
+                  contains(value.diagnostics_json,
+                           "\"candidate_source\":\"") &&
                   contains(value.diagnostics_json,
                            "\"iteration_budget_semantics\":\"cumulative_per_original_rhs\""),
               "mixed 4-by-4 recovery distinguishes ST transport, inner engine and physical certificate");
@@ -10007,6 +10015,181 @@ void modal_certified_recovery_exhausted_budget_contract()
               snapshot->final_residual_available &&
               snapshot->final_residual > snapshot->threshold,
           "budget exhaustion cannot grant a certificate, retry, or increase the original iteration budget");
+
+    AlgebraicCertifiedRecoveryFixture candidate_fixture{};
+    initialize_algebraic_certified_recovery_fixture(candidate_fixture, 8);
+    auto *candidate_owner = candidate_fixture.owner;
+    auto *candidate_true_context = candidate_fixture.true_context.get();
+    const auto *candidate_snapshot =
+        fd::detail::floquet_shifted_ksp_certified_recovery_snapshot(candidate_owner);
+    const PetscInt indices[] = {0, 1, 2, 3};
+    const PetscScalar approximate_values[] = {
+        static_cast<PetscScalar>(0.5),
+        static_cast<PetscScalar>(0.25),
+        static_cast<PetscScalar>(1.0 / 6.0),
+        static_cast<PetscScalar>(0.125),
+    };
+    check(candidate_true_context != nullptr &&
+              candidate_true_context->owned_true_probe_solution != nullptr &&
+              VecSet(candidate_fixture.rhs, static_cast<PetscScalar>(1)) == PETSC_SUCCESS &&
+              VecSet(candidate_fixture.solution, static_cast<PetscScalar>(0)) == PETSC_SUCCESS &&
+              VecSetValues(candidate_true_context->owned_true_probe_solution,
+                           4, indices, approximate_values, INSERT_VALUES) == PETSC_SUCCESS &&
+              VecAssemblyBegin(candidate_true_context->owned_true_probe_solution) == PETSC_SUCCESS &&
+              VecAssemblyEnd(candidate_true_context->owned_true_probe_solution) == PETSC_SUCCESS,
+          "prepare a terminal zero vector and an independently owned earlier Krylov candidate");
+    PetscReal candidate_rhs_norm = 0.0;
+    PetscReal committed_residual = PETSC_INFINITY;
+    bool committed_residual_finite = false;
+    check(VecNorm(candidate_fixture.rhs, NORM_2, &candidate_rhs_norm) == PETSC_SUCCESS &&
+              fd::detail::floquet_recompute_certified_recovery_residual(
+                  candidate_owner,
+                  candidate_fixture.rhs,
+                  candidate_fixture.solution,
+                  &committed_residual,
+                  &committed_residual_finite) == PETSC_SUCCESS &&
+              committed_residual_finite && committed_residual == candidate_rhs_norm,
+          "owner recomputation identifies the unchanged committed vector as no progress");
+    PetscReal cached_solution_norm =
+        std::numeric_limits<PetscReal>::quiet_NaN();
+    check(VecNorm(candidate_true_context->owned_true_probe_solution,
+                  NORM_2, &cached_solution_norm) == PETSC_SUCCESS,
+          "measure the owned cache vector for controlled probe metadata");
+    candidate_true_context->current_inner_attempt_id = 9;
+    candidate_owner->snapshot.inner_attempt_count = 9;
+    candidate_owner->snapshot.last_inner_reason_available = true;
+    candidate_owner->snapshot.last_inner_reason = KSP_DIVERGED_BREAKDOWN;
+    candidate_true_context->owned_true_probe_solution_available = true;
+    candidate_true_context->owned_true_probe_attempt_id = 9;
+    candidate_true_context->owned_true_probe_callback_ordinal = 26;
+    candidate_true_context->owned_true_probe_iteration = 4;
+    candidate_true_context->owned_true_probe_build_reason =
+        KSP_CONVERGED_ITERATING;
+    candidate_true_context->callback_count = 26;
+    candidate_true_context->last_true_probe_available = true;
+    candidate_true_context->last_true_probe_callback_ordinal = 26;
+    candidate_true_context->last_true_probe_iteration = 4;
+    candidate_true_context->last_true_build_reason_available = true;
+    candidate_true_context->last_true_build_reason = KSP_CONVERGED_ITERATING;
+    candidate_true_context->last_true_probe_default_reason_available = true;
+    candidate_true_context->last_true_probe_default_reason = KSP_CONVERGED_RTOL;
+    candidate_true_context->last_true_probe_reason_after_gate_available = true;
+    candidate_true_context->last_true_probe_reason_after_gate =
+        KSP_CONVERGED_ITERATING;
+    candidate_true_context->last_true_solution_norm_available = true;
+    candidate_true_context->last_true_solution_norm = cached_solution_norm;
+    candidate_true_context->last_true_residual_norm = 1.0;
+    candidate_true_context->last_true_residual_threshold = 2.0e-12;
+    bool cached_candidate_selected = false;
+    PetscReal cached_candidate_residual =
+        std::numeric_limits<PetscReal>::quiet_NaN();
+    check(fd::detail::floquet_select_owned_true_probe_candidate(
+              candidate_owner,
+              candidate_fixture.rhs,
+              candidate_fixture.solution,
+              20,
+              KSP_DIVERGED_BREAKDOWN,
+              5,
+              5,
+              candidate_rhs_norm,
+              2.0e-12,
+              PETSC_INFINITY,
+              committed_residual,
+              &cached_candidate_selected,
+              &cached_candidate_residual) == PETSC_SUCCESS &&
+              cached_candidate_selected && cached_candidate_residual < committed_residual &&
+              cached_candidate_residual > 2.0e-12 &&
+              candidate_snapshot != nullptr && !candidate_snapshot->last_certified &&
+              candidate_snapshot->last_candidate_iteration == 4 &&
+              candidate_snapshot->last_terminal_iteration == 5 &&
+              std::strcmp(candidate_snapshot->last_candidate_source,
+                          "owned_true_probe_cache") == 0,
+          "a same-attempt iteration-4 cache replaces the invalid terminal-iteration-5 vector only after owner residual recomputation");
+    PetscBool cached_vector_selected = PETSC_FALSE;
+    check(VecEqual(candidate_fixture.solution,
+                   candidate_true_context->owned_true_probe_solution,
+                   &cached_vector_selected) == PETSC_SUCCESS &&
+              cached_vector_selected == PETSC_TRUE &&
+              !fd::detail::floquet_mark_owner_candidate_certified(
+                  candidate_owner,
+                  KSP_DIVERGED_BREAKDOWN,
+                  false,
+                  0.0,
+                  2.0e-12,
+                  true) &&
+              !candidate_snapshot->last_certified,
+          "cached scalar metadata cannot certify before a separate owner recomputation");
+
+    candidate_true_context->current_inner_attempt_id = 10;
+    candidate_owner->snapshot.inner_attempt_count = 10;
+    candidate_owner->snapshot.last_candidate_iteration = -1;
+    candidate_owner->snapshot.last_terminal_iteration = -1;
+    candidate_owner->snapshot.last_candidate_source = "none";
+    check(VecSet(candidate_fixture.solution, static_cast<PetscScalar>(0)) == PETSC_SUCCESS &&
+              fd::detail::floquet_recompute_certified_recovery_residual(
+                  candidate_owner,
+                  candidate_fixture.rhs,
+                  candidate_fixture.solution,
+                  &committed_residual,
+                  &committed_residual_finite) == PETSC_SUCCESS &&
+              committed_residual_finite &&
+              fd::detail::floquet_select_owned_true_probe_candidate(
+                  candidate_owner,
+                  candidate_fixture.rhs,
+                  candidate_fixture.solution,
+                  20,
+                  KSP_DIVERGED_BREAKDOWN,
+                  5,
+                  5,
+                  candidate_rhs_norm,
+                  2.0e-12,
+                  PETSC_INFINITY,
+                  committed_residual,
+                  &cached_candidate_selected,
+                  &cached_candidate_residual) == PETSC_SUCCESS &&
+              !cached_candidate_selected &&
+              candidate_snapshot->last_candidate_iteration == -1 &&
+              candidate_snapshot->last_terminal_iteration == -1 &&
+              std::strcmp(candidate_snapshot->last_candidate_source, "none") == 0,
+          "a valid-looking candidate from the previous inner attempt is rejected");
+
+    const PetscScalar exact_values[] = {
+        static_cast<PetscScalar>(1.0),
+        static_cast<PetscScalar>(0.5),
+        static_cast<PetscScalar>(1.0 / 3.0),
+        static_cast<PetscScalar>(0.25),
+    };
+    check(VecSetValues(candidate_fixture.solution, 4, indices, exact_values,
+                       INSERT_VALUES) == PETSC_SUCCESS &&
+              VecAssemblyBegin(candidate_fixture.solution) == PETSC_SUCCESS &&
+              VecAssemblyEnd(candidate_fixture.solution) == PETSC_SUCCESS &&
+              !fd::detail::floquet_mark_owner_candidate_certified(
+                  candidate_owner,
+                  KSP_CONVERGED_RTOL,
+                  false,
+                  0.0,
+                  2.0e-12,
+                  false) &&
+              !candidate_snapshot->last_certified,
+          "a threshold-looking cached scalar still cannot certify the committed vector");
+    PetscReal recomputed_exact_residual = PETSC_INFINITY;
+    bool exact_residual_finite = false;
+    check(fd::detail::floquet_recompute_certified_recovery_residual(
+              candidate_owner,
+              candidate_fixture.rhs,
+              candidate_fixture.solution,
+              &recomputed_exact_residual,
+              &exact_residual_finite) == PETSC_SUCCESS &&
+              exact_residual_finite && recomputed_exact_residual <= 2.0e-12 &&
+              fd::detail::floquet_mark_owner_candidate_certified(
+                  candidate_owner,
+                  KSP_CONVERGED_RTOL,
+                  exact_residual_finite,
+                  recomputed_exact_residual,
+                  2.0e-12,
+                  false) &&
+              candidate_snapshot->last_certified,
+          "the owner grants a certificate only from the independently recomputed candidate residual");
     std::printf("PASS: algebraic_certified_recovery_budget scope=isolated_numerical_failure cleanup_certification=not_claimed\n");
     std::fflush(stdout);
     std::_Exit(0);

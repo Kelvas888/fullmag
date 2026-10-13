@@ -811,6 +811,9 @@ struct FloquetShiftedKspCertifiedRecoveryProvenance {
     std::int64_t last_cumulative_iterations = 0;
     std::int64_t last_cycle_count = 0;
     std::int64_t max_cumulative_iterations_per_solve = 0;
+    std::int64_t last_candidate_iteration = -1;
+    std::int64_t last_terminal_iteration = -1;
+    const char *last_candidate_source = "none";
     bool last_certified = false;
     bool last_recovered = false;
     bool last_inner_reason_available = false;

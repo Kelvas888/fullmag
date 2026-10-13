@@ -900,6 +900,9 @@ std::string floquet_certified_recovery_json(
         ",\"last_cumulative_iterations\":" + std::to_string(value.last_cumulative_iterations) +
         ",\"last_cycle_count\":" + std::to_string(value.last_cycle_count) +
         ",\"max_cumulative_iterations_per_solve\":" + std::to_string(value.max_cumulative_iterations_per_solve) +
+        ",\"candidate_iteration\":" + std::to_string(value.last_candidate_iteration) +
+        ",\"terminal_iteration\":" + std::to_string(value.last_terminal_iteration) +
+        ",\"candidate_source\":\"" + value.last_candidate_source + "\"" +
         ",\"last_certified\":" + boolean(value.last_certified) +
         ",\"last_recovered\":" + boolean(value.last_recovered) +
         ",\"last_inner_reason\":" + (value.last_inner_reason_available

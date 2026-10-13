@@ -39,6 +39,9 @@ struct FloquetShiftedKspCertifiedRecoverySnapshot {
     PetscInt last_cycle_count = 0;
     PetscInt last_cumulative_iterations = 0;
     PetscInt max_cumulative_iterations_per_solve = 0;
+    PetscInt last_candidate_iteration = -1;
+    PetscInt last_terminal_iteration = -1;
+    const char *last_candidate_source = "none";
 
     bool last_certified = false;
     bool last_recovered = false;
@@ -335,7 +338,7 @@ inline PetscErrorCode restore_floquet_certified_recovery_settings(
 inline bool floquet_cached_true_gate_rejected_current_candidate(
     const FloquetShiftedKspCertifiedRecoveryContext *context,
     std::uint64_t callback_count_before_cycle,
-    PetscInt cycle_iterations) noexcept
+    PetscInt terminal_iteration) noexcept
 {
     if (context == nullptr || context->true_convergence_context == nullptr) {
         return false;
@@ -343,17 +346,33 @@ inline bool floquet_cached_true_gate_rejected_current_candidate(
     const auto *true_context = context->true_convergence_context;
     return !true_context->cleanup_failed &&
         !true_context->candidate_operator_diagnostic_cleanup_failed &&
+        true_context->owned_true_probe_solution_available &&
+        true_context->owned_true_probe_solution != nullptr &&
+        true_context->owned_true_probe_attempt_id ==
+            true_context->current_inner_attempt_id &&
+        true_context->current_inner_attempt_id ==
+            context->snapshot.inner_attempt_count &&
+        true_context->owned_true_probe_callback_ordinal >
+            callback_count_before_cycle &&
+        true_context->owned_true_probe_callback_ordinal ==
+            true_context->callback_count &&
         true_context->last_true_probe_available &&
         true_context->last_true_probe_default_reason_available &&
         true_context->last_true_probe_default_reason > 0 &&
         true_context->last_true_probe_reason_after_gate_available &&
         true_context->last_true_probe_reason_after_gate ==
             KSP_CONVERGED_ITERATING &&
-        true_context->last_true_probe_callback_ordinal >
-            callback_count_before_cycle &&
         true_context->last_true_probe_callback_ordinal ==
-            true_context->callback_count &&
-        true_context->last_true_probe_iteration == cycle_iterations &&
+            true_context->owned_true_probe_callback_ordinal &&
+        true_context->last_true_probe_iteration ==
+            true_context->owned_true_probe_iteration &&
+        true_context->owned_true_probe_iteration > 0 &&
+        true_context->owned_true_probe_iteration <= terminal_iteration &&
+        true_context->last_true_build_reason_available &&
+        true_context->last_true_build_reason >= 0 &&
+        true_context->last_true_build_reason ==
+            true_context->owned_true_probe_build_reason &&
+        true_context->owned_true_probe_build_reason >= 0 &&
         true_context->last_true_solution_norm_available &&
         std::isfinite(static_cast<double>(
             true_context->last_true_solution_norm)) &&
@@ -361,8 +380,165 @@ inline bool floquet_cached_true_gate_rejected_current_candidate(
         std::isfinite(static_cast<double>(true_context->last_true_residual_norm)) &&
         std::isfinite(static_cast<double>(
             true_context->last_true_residual_threshold)) &&
+        true_context->last_true_residual_norm >= 0.0 &&
+        true_context->last_true_residual_threshold >= 0.0 &&
         true_context->last_true_residual_norm >
             true_context->last_true_residual_threshold;
+}
+
+inline PetscErrorCode floquet_recompute_certified_recovery_residual(
+    FloquetShiftedKspCertifiedRecoveryContext *context,
+    Vec rhs,
+    Vec candidate,
+    PetscReal *residual_norm,
+    bool *finite)
+{
+    if (context == nullptr || rhs == nullptr || candidate == nullptr ||
+        residual_norm == nullptr || finite == nullptr) {
+        return PETSC_ERR_ARG_NULL;
+    }
+    if (context->operator_matrix == nullptr || context->true_residual == nullptr) {
+        return PETSC_ERR_ARG_WRONGSTATE;
+    }
+    *residual_norm = std::numeric_limits<PetscReal>::quiet_NaN();
+    *finite = false;
+    PetscReal candidate_norm = std::numeric_limits<PetscReal>::quiet_NaN();
+    PetscErrorCode error = VecNorm(candidate, NORM_2, &candidate_norm);
+    if (error != PETSC_SUCCESS) {
+        return error;
+    }
+    if (!std::isfinite(static_cast<double>(candidate_norm)) || candidate_norm < 0.0) {
+        return PETSC_SUCCESS;
+    }
+    error = MatMult(context->operator_matrix, candidate, context->true_residual);
+    if (error != PETSC_SUCCESS) {
+        return error;
+    }
+    error = VecAYPX(
+        context->true_residual,
+        static_cast<PetscScalar>(-1.0),
+        rhs);
+    if (error != PETSC_SUCCESS) {
+        return error;
+    }
+    error = VecNorm(context->true_residual, NORM_2, residual_norm);
+    if (error != PETSC_SUCCESS) {
+        return error;
+    }
+    *finite = std::isfinite(static_cast<double>(*residual_norm)) &&
+        *residual_norm >= 0.0;
+    return PETSC_SUCCESS;
+}
+
+inline PetscErrorCode floquet_select_owned_true_probe_candidate(
+    FloquetShiftedKspCertifiedRecoveryContext *context,
+    Vec rhs,
+    Vec solution,
+    std::uint64_t callback_count_before_cycle,
+    KSPConvergedReason terminal_reason,
+    PetscInt terminal_iteration,
+    PetscInt cumulative_iterations,
+    PetscReal rhs_norm,
+    PetscReal threshold,
+    PetscReal previous_residual,
+    PetscReal committed_residual,
+    bool *selected,
+    PetscReal *selected_residual)
+{
+    if (selected == nullptr || selected_residual == nullptr) {
+        return PETSC_ERR_ARG_NULL;
+    }
+    *selected = false;
+    *selected_residual = std::numeric_limits<PetscReal>::quiet_NaN();
+    if (context == nullptr || rhs == nullptr || solution == nullptr) {
+        return PETSC_ERR_ARG_NULL;
+    }
+    if (context->solution_backup == nullptr) {
+        return PETSC_ERR_ARG_WRONGSTATE;
+    }
+    if (terminal_reason != KSP_DIVERGED_BREAKDOWN ||
+        !context->snapshot.last_inner_reason_available ||
+        context->snapshot.last_inner_reason != static_cast<int>(terminal_reason) ||
+        !floquet_cached_true_gate_rejected_current_candidate(
+            context,
+            callback_count_before_cycle,
+            terminal_iteration) ||
+        !std::isfinite(static_cast<double>(rhs_norm)) || rhs_norm <= 0.0 ||
+        !std::isfinite(static_cast<double>(threshold)) || threshold < 0.0 ||
+        std::isnan(static_cast<double>(previous_residual)) ||
+        previous_residual < 0.0 ||
+        !std::isfinite(static_cast<double>(committed_residual)) ||
+        committed_residual <= threshold || cumulative_iterations < 0 ||
+        cumulative_iterations > context->snapshot.original_max_iterations) {
+        return PETSC_SUCCESS;
+    }
+
+    bool candidate_finite = false;
+    PetscReal candidate_residual = std::numeric_limits<PetscReal>::quiet_NaN();
+    PetscErrorCode error = floquet_recompute_certified_recovery_residual(
+        context,
+        rhs,
+        context->true_convergence_context->owned_true_probe_solution,
+        &candidate_residual,
+        &candidate_finite);
+    if (error != PETSC_SUCCESS || !candidate_finite) {
+        return error;
+    }
+    // A cached candidate is usable only when the owner independently measures
+    // strict progress against both the terminal vector and the previous
+    // accepted iterate. A still-unconverged candidate also needs budget left.
+    if (!(candidate_residual < committed_residual &&
+          candidate_residual < rhs_norm &&
+          candidate_residual < previous_residual)) {
+        return PETSC_SUCCESS;
+    }
+    const PetscInt remaining_iterations =
+        context->snapshot.original_max_iterations - cumulative_iterations;
+    if (candidate_residual > threshold && remaining_iterations <= 0) {
+        return PETSC_SUCCESS;
+    }
+
+    error = VecCopy(
+        context->true_convergence_context->owned_true_probe_solution,
+        solution);
+    if (error != PETSC_SUCCESS) {
+        return error;
+    }
+    error = VecCopy(
+        context->true_convergence_context->owned_true_probe_solution,
+        context->solution_backup);
+    if (error != PETSC_SUCCESS) {
+        return error;
+    }
+    context->snapshot.last_candidate_iteration =
+        context->true_convergence_context->owned_true_probe_iteration;
+    context->snapshot.last_terminal_iteration = terminal_iteration;
+    context->snapshot.last_candidate_source = "owned_true_probe_cache";
+    *selected_residual = candidate_residual;
+    *selected = true;
+    return PETSC_SUCCESS;
+}
+
+inline bool floquet_mark_owner_candidate_certified(
+    FloquetShiftedKspCertifiedRecoveryContext *context,
+    KSPConvergedReason terminal_reason,
+    bool owner_recomputed_residual_available,
+    PetscReal residual_norm,
+    PetscReal threshold,
+    bool owned_true_probe_candidate) noexcept
+{
+    if (context == nullptr || !owner_recomputed_residual_available ||
+        (terminal_reason <= 0 && terminal_reason != KSP_DIVERGED_BREAKDOWN) ||
+        !std::isfinite(static_cast<double>(residual_norm)) || residual_norm < 0.0 ||
+        !std::isfinite(static_cast<double>(threshold)) || threshold < 0.0 ||
+        residual_norm > threshold) {
+        return false;
+    }
+    context->snapshot.last_certified = true;
+    context->snapshot.certificate_source = owned_true_probe_candidate
+        ? "owner_recomputed_owned_true_probe_cache"
+        : "owner_recomputed_true_residual";
+    return true;
 }
 
 inline PetscErrorCode fail_floquet_certified_recovery_without_unsafe_graph(
@@ -430,6 +606,9 @@ inline PetscErrorCode floquet_shifted_certified_recovery_shell_apply(
     context->snapshot.certificate_source = "none";
     context->snapshot.last_cycle_count = 0;
     context->snapshot.last_cumulative_iterations = 0;
+    context->snapshot.last_candidate_iteration = -1;
+    context->snapshot.last_terminal_iteration = -1;
+    context->snapshot.last_candidate_source = "none";
 
     PetscReal rhs_norm = std::numeric_limits<PetscReal>::quiet_NaN();
     error = VecNorm(rhs, NORM_2, &rhs_norm);
@@ -568,6 +747,8 @@ inline PetscErrorCode floquet_shifted_certified_recovery_shell_apply(
         const std::uint64_t callback_count_before_cycle =
             context->true_convergence_context->callback_count;
         ++context->snapshot.inner_attempt_count;
+        context->true_convergence_context->current_inner_attempt_id =
+            context->snapshot.inner_attempt_count;
         ++context->snapshot.cycle_count_total;
         ++context->snapshot.last_cycle_count;
         error = KSPSolve(context->inner_ksp, rhs, solution);
@@ -626,12 +807,12 @@ inline PetscErrorCode floquet_shifted_certified_recovery_shell_apply(
         context->snapshot.last_inner_reason_available = true;
         context->snapshot.last_inner_reason = static_cast<int>(reason);
         if (cycle_iterations < 0 ||
-            cycle_iterations > remaining_iterations ||
             cumulative_iterations >
                 std::numeric_limits<PetscInt>::max() - cycle_iterations) {
             numerical_failure = PETSC_ERR_ARG_OUTOFRANGE;
             break;
         }
+        context->snapshot.last_terminal_iteration = cycle_iterations;
         cumulative_iterations += cycle_iterations;
         context->snapshot.last_cumulative_iterations = cumulative_iterations;
         if (std::numeric_limits<std::uint64_t>::max() -
@@ -652,60 +833,65 @@ inline PetscErrorCode floquet_shifted_certified_recovery_shell_apply(
                 static_cast<int>(reason);
             context->snapshot.last_failed_inner_iterations = cycle_iterations;
         }
-
-        PetscReal solution_norm = std::numeric_limits<PetscReal>::quiet_NaN();
-        error = VecNorm(solution, NORM_2, &solution_norm);
-        if (error != PETSC_SUCCESS) {
-            mark_floquet_certified_recovery_unsafe(context, error);
-            context->applying = false;
-            ++context->snapshot.failed_count;
-            return error;
-        }
-        if (!std::isfinite(static_cast<double>(solution_norm)) ||
-            solution_norm < 0.0) {
-            numerical_failure = PETSC_ERR_FP;
+        if (cycle_iterations > remaining_iterations) {
+            numerical_failure = PETSC_ERR_ARG_OUTOFRANGE;
             break;
         }
 
-        error = VecCopy(solution, context->solution_backup);
-        if (error != PETSC_SUCCESS) {
-            mark_floquet_certified_recovery_unsafe(context, error);
-            context->applying = false;
-            ++context->snapshot.failed_count;
-            return error;
-        }
-        error = MatMult(
-            context->operator_matrix,
-            context->solution_backup,
-            context->true_residual);
-        if (error != PETSC_SUCCESS) {
-            mark_floquet_certified_recovery_unsafe(context, error);
-            context->applying = false;
-            ++context->snapshot.failed_count;
-            return error;
-        }
-        error = VecAYPX(
-            context->true_residual,
-            static_cast<PetscScalar>(-1.0),
-            rhs);
-        if (error != PETSC_SUCCESS) {
-            mark_floquet_certified_recovery_unsafe(context, error);
-            context->applying = false;
-            ++context->snapshot.failed_count;
-            return error;
-        }
+        bool committed_candidate_finite = false;
         PetscReal residual_norm = std::numeric_limits<PetscReal>::quiet_NaN();
-        error = VecNorm(context->true_residual, NORM_2, &residual_norm);
+        error = floquet_recompute_certified_recovery_residual(
+            context,
+            rhs,
+            solution,
+            &residual_norm,
+            &committed_candidate_finite);
         if (error != PETSC_SUCCESS) {
             mark_floquet_certified_recovery_unsafe(context, error);
             context->applying = false;
             ++context->snapshot.failed_count;
             return error;
         }
-        if (!std::isfinite(static_cast<double>(residual_norm)) ||
-            residual_norm < 0.0) {
+        if (!committed_candidate_finite) {
             numerical_failure = PETSC_ERR_FP;
             break;
+        }
+        bool cached_candidate_selected = false;
+        PetscReal cached_candidate_residual =
+            std::numeric_limits<PetscReal>::quiet_NaN();
+        error = floquet_select_owned_true_probe_candidate(
+            context,
+            rhs,
+            solution,
+            callback_count_before_cycle,
+            reason,
+            cycle_iterations,
+            cumulative_iterations,
+            rhs_norm,
+            threshold,
+            previous_residual,
+            residual_norm,
+            &cached_candidate_selected,
+            &cached_candidate_residual);
+        if (error != PETSC_SUCCESS) {
+            mark_floquet_certified_recovery_unsafe(context, error);
+            context->applying = false;
+            ++context->snapshot.failed_count;
+            return error;
+        }
+        if (cached_candidate_selected) {
+            residual_norm = cached_candidate_residual;
+        } else {
+            context->snapshot.last_candidate_iteration = cycle_iterations;
+            context->snapshot.last_candidate_source =
+                "committed_inner_solution";
+            error = VecCopy(solution, context->solution_backup);
+            if (error != PETSC_SUCCESS) {
+                mark_floquet_certified_recovery_unsafe(context, error);
+                context->applying = false;
+                ++context->snapshot.failed_count;
+                return error;
+            }
         }
         context->snapshot.final_residual_available = true;
         context->snapshot.final_residual = residual_norm;
@@ -723,13 +909,16 @@ inline PetscErrorCode floquet_shifted_certified_recovery_shell_apply(
             }
         }
 
+        if (floquet_mark_owner_candidate_certified(
+                context,
+                reason,
+                true,
+                residual_norm,
+                threshold,
+                cached_candidate_selected)) {
+            break;
+        }
         if (residual_norm <= threshold) {
-            if (reason > 0 || reason == KSP_DIVERGED_BREAKDOWN) {
-                context->snapshot.last_certified = true;
-                context->snapshot.certificate_source =
-                    "owner_recomputed_true_residual";
-                break;
-            }
             numerical_failure = PETSC_ERR_NOT_CONVERGED;
             break;
         }
@@ -743,7 +932,8 @@ inline PetscErrorCode floquet_shifted_certified_recovery_shell_apply(
         }
         const PetscInt next_remaining =
             context->snapshot.original_max_iterations - cumulative_iterations;
-        if (next_remaining <= 0 || residual_norm >= previous_residual) {
+        if (next_remaining <= 0 || residual_norm >= previous_residual ||
+            residual_norm >= rhs_norm) {
             numerical_failure = PETSC_ERR_NOT_CONVERGED;
             break;
         }
