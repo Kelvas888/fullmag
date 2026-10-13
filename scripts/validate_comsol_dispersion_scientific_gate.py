@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import math
 import sys
@@ -105,10 +106,11 @@ _REQUIRED_ARTIFACTS = (
 _PRIMARY_GENERATION_JSON_ARTIFACTS = frozenset(
     relative for relative in _REQUIRED_ARTIFACTS if relative.suffix == ".json"
 )
-_PRIMARY_GENERATION_MEMBERS = tuple(sorted(
-    tuple(relative.as_posix() for relative in _PRIMARY_GENERATION_JSON_ARTIFACTS)
-    + (EVIDENCE_RELATIVE_PATH.as_posix(),)
-))
+_PRIMARY_GENERATION_ARTIFACTS = frozenset(_REQUIRED_ARTIFACTS)
+# Bounded input-memory budget for the primary 61-sample dispersion table.
+# It leaves substantial room for the current wider native mode diagnostics;
+# this is a resource limit, not a scientific acceptance threshold.
+MAX_PRIMARY_DISPERSION_CSV_BYTES = 16 * 1024 * 1024
 
 
 class ScientificGateError(RuntimeError):
@@ -1724,6 +1726,33 @@ def _new_check(status: str, **values: Any) -> dict[str, Any]:
     return {"status": status, **values}
 
 
+def _read_captured_member_bytes(
+    bundle_reader: ArtifactBundleReader,
+    logical: str,
+    *,
+    json_limit: bool = False,
+    maximum_bytes: int | None = None,
+) -> bytes:
+    """Read one logical member through the shared captured-byte cache."""
+    if json_limit:
+        maximum_bytes = (
+            artifact_generation.DEFAULT_MAX_JSON_BYTES
+            if maximum_bytes is None
+            else min(maximum_bytes, artifact_generation.DEFAULT_MAX_JSON_BYTES)
+        )
+    capture = bundle_reader.generation
+    if capture is not None:
+        member = capture.members.get(logical)
+        if member is not None:
+            declared_length = member.byte_length
+            maximum_bytes = (
+                declared_length
+                if maximum_bytes is None
+                else min(maximum_bytes, declared_length)
+            )
+    return bundle_reader.read_bytes(logical, maximum_bytes=maximum_bytes)
+
+
 def _artifact_map(
     case_dir: Path,
     *,
@@ -1733,15 +1762,21 @@ def _artifact_map(
     artifacts: dict[Path, dict[str, Any]] = {}
     reasons: list[str] = []
     for relative in _REQUIRED_ARTIFACTS:
-        if relative in _PRIMARY_GENERATION_JSON_ARTIFACTS:
+        if relative in _PRIMARY_GENERATION_ARTIFACTS:
             if generation_capture_error is not None:
                 continue
             if bundle_reader is not None:
                 logical = relative.as_posix()
                 try:
-                    payload = bundle_reader.read_bytes(
+                    payload = _read_captured_member_bytes(
+                        bundle_reader,
                         logical,
-                        maximum_bytes=artifact_generation.DEFAULT_MAX_JSON_BYTES,
+                        json_limit=relative in _PRIMARY_GENERATION_JSON_ARTIFACTS,
+                        maximum_bytes=(
+                            MAX_PRIMARY_DISPERSION_CSV_BYTES
+                            if relative == Path("eigen/dispersion.csv")
+                            else None
+                        ),
                     )
                     record = bundle_reader.record_for(logical)
                 except (OSError, ValueError) as error:
@@ -1922,6 +1957,8 @@ def _validate_primary_equilibrium(
     branches: Sequence[Mapping[str, Any]],
     diagnostics: Mapping[str, Any],
     reasons: list[str],
+    *,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, Any]:
     """Bind each selected primary mode to its accepted, content-bound state."""
 
@@ -1986,15 +2023,20 @@ def _validate_primary_equilibrium(
     if not isinstance(manifest_artifacts, dict):
         local_reasons.append("manifest.artifacts is missing")
         manifest_artifacts = {}
+    sidecar_root = (
+        bundle_reader.generation.member_root
+        if bundle_reader is not None and bundle_reader.generation is not None
+        else case_dir
+    )
     try:
         identity_paths = _declared_r4_sidecar_paths(
-            case_dir,
+            sidecar_root,
             manifest_artifacts,
             "linearization_identity_v2_paths",
             "linearization_identity.v2.json",
         )
         identity_preimage_paths = _declared_r4_sidecar_paths(
-            case_dir,
+            sidecar_root,
             manifest_artifacts,
             "linearization_identity_preimage_v1_paths",
             "linearization_identity_preimage.v1.json",
@@ -2082,17 +2124,30 @@ def _validate_primary_equilibrium(
             relative_mode_path = (
                 f"eigen/modes/sample_{sample_index:04d}/mode_{raw_mode_index:04d}.json"
             )
-            mode_path = _safe_relative_path(
-                case_dir,
-                relative_mode_path,
-                f"primary mode metadata sample {sample_index} raw mode {raw_mode_index}",
-                local_reasons,
+            mode_path = (
+                bundle_reader.logical_path(relative_mode_path)
+                if bundle_reader is not None
+                else _safe_relative_path(
+                    case_dir,
+                    relative_mode_path,
+                    f"primary mode metadata sample {sample_index} raw mode {raw_mode_index}",
+                    local_reasons,
+                )
             )
             if mode_path is None:
                 continue
             try:
-                mode = json.loads(mode_path.read_bytes())
-            except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as error:
+                mode_bytes = (
+                    _read_captured_member_bytes(
+                        bundle_reader,
+                        relative_mode_path,
+                        json_limit=True,
+                    )
+                    if bundle_reader is not None
+                    else mode_path.read_bytes()
+                )
+                mode = json.loads(mode_bytes)
+            except (OSError, UnicodeError, ValueError, TypeError) as error:
                 local_reasons.append(
                     f"primary mode metadata sample {sample_index} raw mode {raw_mode_index} is invalid: {error}"
                 )
@@ -2142,21 +2197,34 @@ def _validate_primary_equilibrium(
                 metadata,
                 first_mode,
                 sample_index,
+                bundle_reader=bundle_reader,
             )
             state_hashes = state_binding.get("file_hashes")
             if not isinstance(state_hashes, list) or len(state_hashes) != 2:
                 raise ValueError("equilibrium reader did not return both content hashes")
             state_objects: list[Mapping[str, Any]] = []
             for position, relative in enumerate(state_paths):
-                state_path = _safe_relative_path(
-                    case_dir,
-                    relative,
-                    f"primary equilibrium state sample {sample_index}",
-                    local_reasons,
+                state_path = (
+                    bundle_reader.logical_path(relative)
+                    if bundle_reader is not None
+                    else _safe_relative_path(
+                        case_dir,
+                        relative,
+                        f"primary equilibrium state sample {sample_index}",
+                        local_reasons,
+                    )
                 )
                 if state_path is None:
                     raise ValueError("equilibrium state path is missing or unsafe")
-                state_bytes = state_path.read_bytes()
+                state_bytes = (
+                    _read_captured_member_bytes(
+                        bundle_reader,
+                        relative,
+                        json_limit=True,
+                    )
+                    if bundle_reader is not None
+                    else state_path.read_bytes()
+                )
                 actual_hash = "sha256:" + hashlib.sha256(state_bytes).hexdigest()
                 if (
                     not isinstance(state_hashes[position], Mapping)
@@ -2184,8 +2252,24 @@ def _validate_primary_equilibrium(
         identity_relative, identity_path = identity_record
         preimage_relative, preimage_path = preimage_record
         try:
-            identity_bytes = identity_path.read_bytes()
-            preimage_bytes = preimage_path.read_bytes()
+            identity_bytes = (
+                _read_captured_member_bytes(
+                    bundle_reader,
+                    identity_relative,
+                    json_limit=True,
+                )
+                if bundle_reader is not None
+                else identity_path.read_bytes()
+            )
+            preimage_bytes = (
+                _read_captured_member_bytes(
+                    bundle_reader,
+                    preimage_relative,
+                    json_limit=True,
+                )
+                if bundle_reader is not None
+                else preimage_path.read_bytes()
+            )
             identity_digest = replay_identity_preimage(identity_bytes, preimage_bytes)
             identity = strict_identity_json(identity_bytes, "primary linearization identity")
             replay_equilibrium_identity_preimages(identity_bytes)
@@ -3230,6 +3314,20 @@ def _validate_branches(
     )
 
 
+def _open_primary_dispersion_csv(
+    path: Path,
+    bundle_reader: ArtifactBundleReader | None,
+):
+    if bundle_reader is None:
+        return path.open("r", encoding="utf-8-sig", newline="")
+    payload = _read_captured_member_bytes(
+        bundle_reader,
+        "eigen/dispersion.csv",
+        maximum_bytes=MAX_PRIMARY_DISPERSION_CSV_BYTES,
+    )
+    return io.TextIOWrapper(io.BytesIO(payload), encoding="utf-8-sig", newline="")
+
+
 def _validate_dispersion_csv(
     path: Path,
     case: str,
@@ -3238,6 +3336,8 @@ def _validate_dispersion_csv(
     mode_map: Mapping[tuple[int, int], float],
     selected_branches: Sequence[Mapping[str, Any]],
     reasons: list[str],
+    *,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, Any]:
     """Cross-check native dispersion rows against the modal spectrum."""
 
@@ -3260,7 +3360,7 @@ def _validate_dispersion_csv(
                 branch_by_mode[key] = int(branch_id)
     observed_pairs: set[tuple[int, int]] = set()
     try:
-        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        with _open_primary_dispersion_csv(path, bundle_reader) as stream:
             reader = csv.DictReader(stream)
             fieldnames = set(reader.fieldnames or ())
             required = {
@@ -3345,7 +3445,7 @@ def _validate_dispersion_csv(
                         reasons.append(f"dispersion.csv row {row_number} branch_id does not bind tracked raw mode {raw_mode_index} to branch {expected_branch}")
                     else:
                         observed_pairs.add(key)
-    except (OSError, UnicodeError) as error:
+    except (OSError, UnicodeError, ValueError) as error:
         reasons.append(f"cannot read dispersion.csv: {error}")
     if sample_indices != expected_indices:
         reasons.append(f"dispersion.csv sample indices are {sorted(sample_indices)}, expected {sorted(expected_indices)}")
@@ -3372,6 +3472,8 @@ def _validate_primary_analytic_columns(
     expected_path: Mapping[int, tuple[float, float, float]],
     parameters: Mapping[str, Any],
     reasons: list[str],
+    *,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, Any]:
     """Recompute every exported analytic CSV value from the native k row.
 
@@ -3392,7 +3494,7 @@ def _validate_primary_analytic_columns(
         "validation_geometry",
     }
     rows = 0
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+    with _open_primary_dispersion_csv(path, bundle_reader) as stream:
         reader = csv.DictReader(stream)
         fieldnames = set(reader.fieldnames or ())
         missing = sorted(required - fieldnames)
@@ -6044,6 +6146,7 @@ def validate_case(
             mode_map,
             selected_branches,
             reasons,
+            bundle_reader=bundle_reader,
         )
     evidence: dict[str, Any] | None = None
     if bundle_reader is not None:
@@ -6055,6 +6158,7 @@ def validate_case(
             expected_path,
             parameters,
             reasons,
+            bundle_reader=bundle_reader,
         )
     source_check = _new_check("missing")
     if manifest and diagnostics:
@@ -6089,16 +6193,28 @@ def validate_case(
             "not_verified", qualification="NOT VERIFIED", phase_status="not_verified",
             gauge_status="not_verified", reasons=[capture_reason],
         )
-    primary_equilibrium_check = _validate_primary_equilibrium(
-        case_dir,
-        case,
-        manifest,
-        metadata,
-        sample_map,
-        selected_branches,
-        diagnostics,
-        reasons,
-    )
+    if bundle_reader is not None:
+        primary_equilibrium_check = _validate_primary_equilibrium(
+            case_dir,
+            case,
+            manifest,
+            metadata,
+            sample_map,
+            selected_branches,
+            diagnostics,
+            reasons,
+            bundle_reader=bundle_reader,
+        )
+    else:
+        capture_reason = f"primary artifact generation is unavailable: {generation_capture_error}"
+        primary_equilibrium_check = _new_check(
+            "not_verified",
+            qualification="NOT VERIFIED",
+            sample_count=0,
+            selected_mode_count=0,
+            validated_mode_count=0,
+            reasons=[capture_reason],
+        )
     evidence_check = _validate_evidence_binding(case_dir, evidence, artifacts, case, reasons)
     kittel_check = _validate_kittel(case, selected_branches, parameters or {}, reasons) if parameters else _new_check("missing")
     ks_check = _validate_ks(case_dir, case, evidence, parameters or {}, reasons, primary_metadata=metadata or None) if parameters else _new_check("missing")
@@ -6131,9 +6247,9 @@ def validate_case(
     )
     campaign_contract_status = "pass" if not reasons else "fail"
     generation_coverage_reason = (
-        "primary artifact-generation coverage is PARTIAL: primary equilibrium, dispersion CSV, "
-        "auxiliary comparison artifacts, and referenced external scientific evidence are outside "
-        "this captured JSON generation"
+        "primary artifact-generation coverage is PARTIAL: primary CSV and selected equilibrium/state "
+        "inputs are read through the shared reader when capture succeeds, while auxiliary comparison "
+        "artifacts and referenced external scientific evidence remain outside this generation"
     )
     reasons.append(generation_coverage_reason)
     # Signed-k proof is also a scientific gate, separate from the primary campaign contract.
@@ -6244,12 +6360,17 @@ def validate_case(
         "bound_primary_native_json_members": sorted(
             path.as_posix() for path in artifacts if path in _PRIMARY_GENERATION_JSON_ARTIFACTS
         ),
+        "primary_dispersion_csv_member": "eigen/dispersion.csv",
+        "primary_dispersion_csv_member_bound": Path("eigen/dispersion.csv") in artifacts,
+        "primary_equilibrium_inputs_routed_through_shared_reader": bundle_reader is not None,
+        "primary_equilibrium_reader_scope": (
+            "selected_mode_metadata_state_pairs_identity_preimages"
+        ),
+        "primary_equilibrium_member_inventory_complete": False,
         "case_local_evidence_descriptor": EVIDENCE_RELATIVE_PATH.as_posix(),
         "case_local_evidence_descriptor_bound": evidence is not None,
         "referenced_external_evidence_files_in_generation": False,
         "excluded_inputs": [
-            "eigen/dispersion.csv",
-            "primary_equilibrium_artifacts",
             "auxiliary_convergence_and_control_runs",
             "external_scientific_evidence_referenced_by_case_descriptor",
         ],

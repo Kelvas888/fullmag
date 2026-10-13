@@ -6,6 +6,7 @@ from pathlib import Path
 from collections.abc import Mapping
 
 import verify_fem_frequency_domain_eigen_artifacts as verifier
+import frequency_domain_generation as artifact_generation
 from comsol_linearization_binding import validate_linearization_binding
 from comsol_mesh_identity import mesh_topology_fingerprint_v2, mesh_topology_fingerprint_v3
 from comsol_magnetic_support import magnetic_element_indices, tet4_cells
@@ -135,23 +136,44 @@ def sample_state_paths(manifest, sample_index):
     return tuple(selected)
 
 
-def read_sample_equilibrium(root, manifest, metadata, mode, sample_index, *, mesh_signature=None):
+def read_sample_equilibrium(
+    root,
+    manifest,
+    metadata,
+    mode,
+    sample_index,
+    *,
+    mesh_signature=None,
+    bundle_reader=None,
+):
     """Bind the actual state to a mode; acceptance and field checks are mandatory.
 
     The mesh signature is recomputed from canonical metadata. An optional
     expected signature is an additional check, never a replacement.
     """
     root = Path(root)
+    if bundle_reader is not None and bundle_reader.root != root.absolute():
+        raise ValueError("artifact reader belongs to another case root")
     paths = sample_state_paths(manifest, sample_index)
     objects, hashes = [], []
     for relative in paths:
         path = root / relative
-        for candidate in (path, *path.parents):
-            if candidate.is_symlink() or (hasattr(candidate, "is_junction") and candidate.is_junction()):
-                raise ValueError("state artifact path contains a link")
-            if candidate == root:
-                break
-        data = path.read_bytes()
+        if bundle_reader is None:
+            for candidate in (path, *path.parents):
+                if candidate.is_symlink() or (hasattr(candidate, "is_junction") and candidate.is_junction()):
+                    raise ValueError("state artifact path contains a link")
+                if candidate == root:
+                    break
+            data = path.read_bytes()
+        else:
+            # The shared reader enforces immutable-generation membership and
+            # supplies the exact bytes all downstream validators must parse.
+            # Bound JSON before allocation for legacy and generation-backed
+            # captures alike; standalone callers retain their legacy path.
+            data = bundle_reader.read_bytes(
+                relative,
+                maximum_bytes=artifact_generation.DEFAULT_MAX_JSON_BYTES,
+            )
         objects.append(json.loads(data))
         hashes.append({"path": relative, "sha256": "sha256:" + hashlib.sha256(data).hexdigest()})
     equilibrium, state = objects

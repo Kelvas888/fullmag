@@ -104,21 +104,59 @@ def _install_test_generation(root: Path, payloads: dict[str, bytes], *, schema: 
     return generation_id, marker
 
 
-def _primary_generation_payloads(case_dir: Path, *, include_c0_field: bool = False) -> dict[str, bytes]:
-    logical_paths = [
+def _primary_generation_payloads(
+    case_dir: Path,
+    *,
+    include_c0_field: bool = False,
+    include_primary_equilibrium: bool = True,
+) -> dict[str, bytes]:
+    logical_paths = {
         "metadata.json",
         "eigen/spectrum.v2.json",
         "eigen/branches.v2.json",
+        "eigen/dispersion.csv",
         "frequency_domain/manifest.v1.json",
         "eigen/diagnostics/solver.v1.json",
         gate.EVIDENCE_RELATIVE_PATH.as_posix(),
-    ]
-    if include_c0_field:
-        logical_paths.extend((
-            "eigen/modes/sample_0000/mode_0000.json",
-            "eigen/mode_fields/sample_0000/mode_0000/vector.bin",
-        ))
-    return {relative: (case_dir / relative).read_bytes() for relative in logical_paths}
+    }
+    if include_primary_equilibrium:
+        branches = json.loads((case_dir / "eigen/branches.v2.json").read_bytes())
+        selected_pairs = set()
+        for branch in branches.get("branches", []):
+            for point in branch.get("points", []):
+                sample_index = point.get("sample_index")
+                raw_mode_index = point.get("raw_mode_index")
+                if type(sample_index) is int and type(raw_mode_index) is int:
+                    selected_pairs.add((sample_index, raw_mode_index))
+        for sample_index, raw_mode_index in selected_pairs:
+            logical_paths.add(
+                f"eigen/modes/sample_{sample_index:04d}/mode_{raw_mode_index:04d}.json"
+            )
+            if include_c0_field:
+                logical_paths.add(
+                    f"eigen/mode_fields/sample_{sample_index:04d}/mode_{raw_mode_index:04d}/vector.bin"
+                )
+
+        manifest = json.loads((case_dir / "frequency_domain/manifest.v1.json").read_bytes())
+        manifest_artifacts = manifest.get("artifacts", {})
+        for key in (
+            "equilibrium_artifact_v8_path",
+            "equilibrium_artifact_v8_paths",
+            "linearization_state_v7_path",
+            "linearization_state_v7_paths",
+            "equilibrium_artifact_v7_path",
+            "equilibrium_artifact_v7_paths",
+            "linearization_state_v6_path",
+            "linearization_state_v6_paths",
+            "linearization_identity_v2_paths",
+            "linearization_identity_preimage_v1_paths",
+        ):
+            value = manifest_artifacts.get(key)
+            if isinstance(value, str):
+                logical_paths.add(value)
+            elif isinstance(value, list):
+                logical_paths.update(item for item in value if isinstance(item, str))
+    return {relative: (case_dir / relative).read_bytes() for relative in sorted(logical_paths)}
 
 
 def _refresh_primary_artifact_binding(case_dir: Path, relative_path: str, binding_key: str) -> None:
@@ -3830,6 +3868,103 @@ class ScientificGateTests(unittest.TestCase):
         self.assertNotIn(Path("metadata.json"), artifacts)
         self.assertTrue(any("symlink or junction" in reason for reason in reasons))
 
+    def test_primary_csv_budget_rejects_sparse_legacy_member_before_hashing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_relative = Path("eigen/dispersion.csv")
+            for relative in gate._REQUIRED_ARTIFACTS:
+                if relative != csv_relative:
+                    _write_json(root / relative, {})
+            csv_path = root / csv_relative
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            budget = 32
+            with csv_path.open("wb") as stream:
+                stream.seek(budget)
+                stream.write(b"x")
+            self.assertEqual(csv_path.stat().st_size, budget + 1)
+
+            reader = gate.ArtifactBundleReader(root)
+            with mock.patch.object(gate, "MAX_PRIMARY_DISPERSION_CSV_BYTES", budget):
+                artifacts, reasons = gate._artifact_map(root, bundle_reader=reader)
+
+        self.assertNotIn(csv_relative, artifacts)
+        self.assertNotIn(csv_relative.as_posix(), reader._records)
+        self.assertTrue(any("reader byte budget" in reason for reason in reasons), reasons)
+
+    def test_equilibrium_generation_state_json_is_bounded_before_parsing(self):
+        import comsol_equilibrium_artifacts
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).absolute()
+
+            class OversizeReader:
+                def __init__(self):
+                    self.root = root
+                    self.reads = []
+
+                def read_bytes(self, relative, *, maximum_bytes=None):
+                    self.reads.append((relative, maximum_bytes))
+                    raise ValueError("artifact member exceeds reader byte budget")
+
+            reader = OversizeReader()
+            manifest = {
+                "artifacts": {
+                    "equilibrium_artifact_v7_paths": [
+                        "eigen/metadata/sample_0000/equilibrium_artifact.v7.json"
+                    ],
+                    "linearization_state_v6_paths": [
+                        "eigen/metadata/sample_0000/linearization_state.v6.json"
+                    ],
+                }
+            }
+            with self.assertRaisesRegex(ValueError, "reader byte budget"):
+                comsol_equilibrium_artifacts.read_sample_equilibrium(
+                    root,
+                    manifest,
+                    {},
+                    {},
+                    0,
+                    bundle_reader=reader,
+                )
+
+        self.assertEqual(
+            reader.reads,
+            [
+                (
+                    "eigen/metadata/sample_0000/equilibrium_artifact.v7.json",
+                    generation.DEFAULT_MAX_JSON_BYTES,
+                )
+            ],
+        )
+
+    def test_primary_equilibrium_state_reread_keeps_json_budget(self):
+        class OversizeReader:
+            generation = None
+
+            def __init__(self):
+                self.reads = []
+
+            def read_bytes(self, relative, *, maximum_bytes=None):
+                self.reads.append((relative, maximum_bytes))
+                raise ValueError("artifact member exceeds reader byte budget")
+
+        reader = OversizeReader()
+        with self.assertRaisesRegex(ValueError, "reader byte budget"):
+            gate._read_captured_member_bytes(
+                reader,
+                "eigen/metadata/sample_0000/equilibrium_artifact.v7.json",
+                json_limit=True,
+            )
+        self.assertEqual(
+            reader.reads,
+            [
+                (
+                    "eigen/metadata/sample_0000/equilibrium_artifact.v7.json",
+                    generation.DEFAULT_MAX_JSON_BYTES,
+                )
+            ],
+        )
+
     def test_validate_case_uses_one_v2_reader_and_cached_primary_json_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             case_dir = _make_case(Path(directory), "c0")
@@ -3837,9 +3972,10 @@ class ScientificGateTests(unittest.TestCase):
             generation_id, _marker = _install_test_generation(
                 case_dir, payloads, schema=generation.SCHEMA_V2,
             )
-            (case_dir / "eigen/spectrum.v2.json").write_text(
-                '{"schema_version":"stale-root-payload"}', encoding="utf-8",
-            )
+            for relative in payloads:
+                path = case_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"stale root artifact")
             original_reader = gate.ArtifactBundleReader
             readers = []
 
@@ -3867,13 +4003,64 @@ class ScientificGateTests(unittest.TestCase):
         self.assertEqual(readers[0].generation.generation_id, generation_id)
         self.assertEqual(report["artifact_bindings"]["eigen/spectrum.v2.json"]["sha256"],
                          hashlib.sha256(payloads["eigen/spectrum.v2.json"]).hexdigest())
+        self.assertEqual(report["artifact_bindings"]["eigen/dispersion.csv"]["sha256"],
+                         hashlib.sha256(payloads["eigen/dispersion.csv"]).hexdigest())
         self.assertEqual(report["checks"]["spectrum_samples"]["sample_count"], 1)
+        self.assertEqual(report["checks"]["dispersion_csv"]["status"], "pass")
+        self.assertEqual(report["checks"]["primary_equilibrium"]["status"], "pass")
         for relative in payloads:
             self.assertEqual(member_reads.get(relative), 1, relative)
         self.assertEqual(report["artifact_generation"]["generation_binding_status"], "immutable_verified")
         self.assertEqual(report["artifact_generation_coverage"]["coverage"], "partial")
         self.assertFalse(report["artifact_generation_coverage"]["whole_gate_immutable_snapshot_verified"])
+        self.assertFalse(report["artifact_generation_coverage"]["referenced_external_evidence_files_in_generation"])
+        self.assertIn(
+            "external_scientific_evidence_referenced_by_case_descriptor",
+            report["artifact_generation_coverage"]["excluded_inputs"],
+        )
         self.assertEqual(report["status"], "not_qualified")
+
+    def test_corrupt_v2_primary_csv_or_equilibrium_member_never_falls_back_to_root(self):
+        for corrupt_kind in ("csv", "equilibrium"):
+            with self.subTest(member=corrupt_kind), tempfile.TemporaryDirectory() as directory:
+                case_dir = _make_case(Path(directory), "c0")
+                payloads = _primary_generation_payloads(case_dir, include_c0_field=True)
+                generation_id, _marker = _install_test_generation(
+                    case_dir, payloads, schema=generation.SCHEMA_V2,
+                )
+                relative = "eigen/dispersion.csv" if corrupt_kind == "csv" else next(
+                    path for path in payloads
+                    if path.endswith(("equilibrium_artifact.v7.json", "equilibrium_artifact.v8.json"))
+                )
+                member = (
+                    case_dir
+                    / generation.GENERATION_DIRECTORY
+                    / generation_id[7:]
+                    / relative
+                )
+                member.write_bytes(payloads[relative] + b" ")
+                report = gate.validate_case(
+                    case_dir, "c0", parameters_path=PARAMETERS, kpath_path=KPATH,
+                )
+
+            self.assertIn(relative, payloads)
+            if corrupt_kind == "csv":
+                self.assertNotIn(relative, report["artifact_bindings"])
+                self.assertEqual(report["checks"]["dispersion_csv"]["status"], "missing")
+                self.assertTrue(
+                    any("could not be read from the captured generation" in reason for reason in report["reasons"]),
+                    report["reasons"],
+                )
+            else:
+                self.assertEqual(report["checks"]["primary_equilibrium"]["status"], "fail")
+                self.assertTrue(
+                    any("accepted state failed validation" in reason for reason in report["reasons"]),
+                    report["reasons"],
+                )
+                self.assertTrue(
+                    any("generation member" in reason for reason in report["reasons"]),
+                    report["reasons"],
+                )
 
     def test_validate_case_reports_v1_as_mutable_and_keeps_coverage_partial(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3934,7 +4121,10 @@ class ScientificGateTests(unittest.TestCase):
     def test_gate_uses_nested_replay_without_fence_and_fences_once_at_end(self):
         with tempfile.TemporaryDirectory() as directory:
             case_dir = _make_case(Path(directory), "c1")
-            payloads = _primary_generation_payloads(case_dir)
+            payloads = _primary_generation_payloads(
+                case_dir,
+                include_primary_equilibrium=False,
+            )
             _install_test_generation(case_dir, payloads, schema=generation.SCHEMA_V2)
             original_reader = gate.ArtifactBundleReader
             readers = []
