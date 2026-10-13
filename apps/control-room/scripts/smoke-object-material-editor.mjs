@@ -120,8 +120,8 @@ try {
     assert.equal(await ms().inputValue(), editBack ? '800000' : '810000', 'Later same-field edit survives assignment ACK, including edit-back');
     assert.deepEqual(await stable(), before);
     const after = await read();
-    assert.equal(after.scene.objects.find(object => object.id === 'object-a').material_ref, 'mat:new');
-    assert.equal(after.scene.materials.find(material => material.id === 'mat:new').properties.Ms, 900000, 'Backend base differs from retained draft');
+    assert.equal(after.scene.objects.find(object => object.id === 'object-a')?.material_ref, 'mat:new');
+    assert.equal(after.scene.materials.find(material => material.id === 'mat:new')?.properties?.Ms, 900000, 'Backend base differs from retained draft');
     assert.equal(writes(after).length, 2); assert.equal(writes(after)[0].body.base_revision, 1); assert.equal(writes(after)[1].body.base_revision, 2);
     const monitored = await page.evaluate(() => window.__materialMonitor.finish());
     assert.deepEqual(monitored.attributeChanges, []); assert.deepEqual(monitored.failures, []); assert(monitored.frames > 0 && monitored.frames < 900);
@@ -152,7 +152,7 @@ try {
     const after = await read();
     assert.equal(after.canUndo, false); assert.equal(after.invalidations, before.invalidations, 'Old ACK must not invalidate current resources');
     assert.equal(writes(after).length, 1, 'Old create ACK must not continue assignment');
-    assert.equal(after.scene.objects.find(object => object.id === 'object-a').material_ref, 'mat:base');
+    assert.equal(after.scene.objects.find(object => object.id === 'object-a')?.material_ref, 'mat:base');
     assert.equal(await page.getByText('Material created and assigned.', { exact: true }).count(), 0);
     assert.deepEqual(after.unexpected, []); assert(after.calls.length < 60); assert(after.renders < 160);
     checks.push({ case: `${change}-fence`, writes: writes(after), requests: after.calls.length, renders: after.renders });
