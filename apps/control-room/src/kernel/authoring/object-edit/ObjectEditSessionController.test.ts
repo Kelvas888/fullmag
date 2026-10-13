@@ -33,6 +33,18 @@ describe("ObjectEditSessionController", () => {
     });
   });
 
+  it("can reconcile unsent fields even without edits during the submitted operation", () => {
+    const controller = new ObjectEditSessionController<{ name: string; position: number }>();
+    const identity = controller.activate({ objectId: "a", sessionScopeKey: "s", targetKey: "a" }, { name: "Unsent name", position: 1 });
+    const operation = controller.beginApply(identity)!;
+    let reconciliations = 0;
+    expect(controller.acknowledge(operation, { name: "Server name", position: 2 }, (current, _submitted, canonical) => {
+      reconciliations += 1;
+      return { dirty: true, draft: { ...canonical, name: current.name } };
+    }, { reconcileUnchangedDraft: true })).toBe(true);
+    expect(reconciliations).toBe(1);
+    expect(controller.getSnapshot()).toMatchObject({ applyOperationId: null, dirty: true, draft: { name: "Unsent name", position: 2 } });
+  });
   it("keeps edits made after Apply while adopting the acknowledged baseline", () => {
     const controller = new ObjectEditSessionController<{ value: number }>();
     const identity = controller.activate({

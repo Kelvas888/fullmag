@@ -122,3 +122,11 @@ Bieżący etap nie zamyka całego R0/R1; audyt pozostaje w dokumentacji PR150.
 - Regresje źródłowe obejmują transfer create, geometry failure/retry, metadata-only oraz edycję podczas drugiego ACK. Review Geometry/helper: brak nowych actionable findings.
 - Architecture hygiene: PASS; API hygiene: PASS; `git diff --check`: PASS; `node --check apps/control-room/scripts/smoke-inspector.mjs`: PASS. Nie kompilowano ani nie wykonywano testów jednostkowych/DOM. Browser/WebGL, rzeczywiste API i generacja: NOT VERIFIED.
 - General i rozszerzenie browser smoke są osobnymi fragmentami, nadal wymagają końcowego review i integracji. Pełny R0/R1 nie jest zakończony.
+
+## Checkpoint — General/CAS i browser source review
+
+- General używa wspólnego kernel draft dla name/notes/material/region; identity ACK fence przed publikacją. Geometry ACK jawnie uzgadnia także niesubmitowane metadata, nawet bez nowszej edycji podczas tego requestu.
+- Oba P1 review poprawione: combined identity A -> późniejszy raw B -> geometry ACK A zachowuje B dirty; jawna rewizja draftu jest CAS i nie jest zastępowana świeższym history read.
+- Review General/controller i native mouse browser smoke: brak bieżących actionable findings. W smoke dopasowano staged banner do aktualnego pełnego tekstu produkcyjnego.
+- Architecture/API hygiene: PASS; parser smoke i diff-check: PASS. Testy DOM/unit oraz browser/WebGL/API execution: NOT VERIFIED. Fixture używa mock API.
+- Kolejny niezależny PR04: parser długości i jawne stany, payload/preview/equality wspólną ścieżką. Zmiany parsera nie należą do commita General.

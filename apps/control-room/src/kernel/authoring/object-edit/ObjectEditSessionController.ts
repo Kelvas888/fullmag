@@ -187,6 +187,7 @@ export class ObjectEditSessionController<TDraft> {
       submittedDraft: TDraft,
       canonicalDraft: TDraft,
     ) => { dirty: boolean; draft: TDraft },
+    options: { reconcileUnchangedDraft?: boolean } = {},
   ): boolean {
     const opKey = this.pendingOperationKey(operation.identity);
     const pending = this.pendingOperations.get(opKey);
@@ -210,7 +211,7 @@ export class ObjectEditSessionController<TDraft> {
       return false;
     }
     const reconciled =
-      this.snapshot.editVersion === operation.submittedVersion
+      this.snapshot.editVersion === operation.submittedVersion && !options.reconcileUnchangedDraft
         ? { dirty: false, draft: canonicalDraft }
         : reconcile(
             this.snapshot.draft as TDraft,
