@@ -252,6 +252,17 @@ impl serde::Serialize for RunMetadata<'_> {
     }
 }
 
+fn serialize_run_metadata(metadata: &RunMetadata<'_>) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    serde_json::to_writer_pretty(&mut bytes, metadata).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("serializing run metadata: {error}"),
+        )
+    })?;
+    Ok(bytes)
+}
+
 fn fdm_multilayer_transfer_realization(
     plan: &fullmag_ir::ExecutionPlanIR,
     execution_provenance: &crate::types::ExecutionProvenance,
@@ -2069,13 +2080,9 @@ pub(crate) fn write_artifacts(
         sampling_resolution,
     };
     let metadata_path = output_dir.join("metadata.json");
+    let metadata_bytes = serialize_run_metadata(&metadata)?;
     let mut metadata_file = BufWriter::new(fs::File::create(&metadata_path)?);
-    serde_json::to_writer_pretty(&mut metadata_file, &metadata).map_err(|error| {
-        Error::new(
-            ErrorKind::InvalidData,
-            format!("serializing run metadata: {error}"),
-        )
-    })?;
+    metadata_file.write_all(&metadata_bytes)?;
     metadata_file.flush()?;
 
     if let Some(spin_torque) = spin_torque_provenance {
@@ -2495,25 +2502,52 @@ fn write_solver_diagnostics_artifacts(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct PreparedMaterialFieldArtifacts {
+    metadata_assets: Vec<serde_json::Value>,
+    files: Vec<crate::types::AuxiliaryArtifact>,
+}
+
+fn build_material_field_artifacts(
+    plan: &fullmag_ir::ExecutionPlanIR,
+) -> std::io::Result<PreparedMaterialFieldArtifacts> {
+    match &plan.backend_plan {
+        BackendPlanIR::Fem(fem) => build_fem_material_field_artifacts(plan, fem),
+        BackendPlanIR::FdmMultilayer(multilayer) => {
+            build_fdm_multilayer_material_field_artifacts(multilayer)
+        }
+        _ => Ok(PreparedMaterialFieldArtifacts::default()),
+    }
+}
+
 fn write_material_field_artifacts(
     output_dir: &Path,
     plan: &fullmag_ir::ExecutionPlanIR,
 ) -> std::io::Result<Vec<serde_json::Value>> {
-    match &plan.backend_plan {
-        BackendPlanIR::Fem(fem) => write_fem_material_field_artifacts(output_dir, plan, fem),
-        BackendPlanIR::FdmMultilayer(multilayer) => {
-            write_fdm_multilayer_material_field_artifacts(output_dir, multilayer)
-        }
-        _ => Ok(Vec::new()),
-    }
+    let prepared = build_material_field_artifacts(plan)?;
+    write_artifact_bytes(output_dir, &prepared.files)?;
+    Ok(prepared.metadata_assets)
 }
 
-fn write_fem_material_field_artifacts(
+fn write_artifact_bytes(
     output_dir: &Path,
+    files: &[crate::types::AuxiliaryArtifact],
+) -> std::io::Result<()> {
+    for artifact in files {
+        let full_path = output_dir.join(&artifact.relative_path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(full_path, &artifact.bytes)?;
+    }
+    Ok(())
+}
+
+fn build_fem_material_field_artifacts(
     plan: &fullmag_ir::ExecutionPlanIR,
     fem: &fullmag_ir::FemPlanIR,
-) -> std::io::Result<Vec<serde_json::Value>> {
-    let mut metadata_assets = Vec::new();
+) -> std::io::Result<PreparedMaterialFieldArtifacts> {
+    let mut prepared = PreparedMaterialFieldArtifacts::default();
     for field_plan in &plan.common.material_field_plans {
         let Some((values, location)) = fem_material_field_values(fem, field_plan) else {
             continue;
@@ -2554,11 +2588,7 @@ fn write_fem_material_field_artifacts(
             },
         };
 
-        let full_path = output_dir.join(&artifact_path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&full_path, serde_json::to_string_pretty(&asset).unwrap())?;
+        let bytes = serde_json::to_string_pretty(&asset).unwrap().into_bytes();
 
         let mut metadata_asset = serde_json::to_value(asset).map_err(|error| {
             Error::new(
@@ -2570,19 +2600,22 @@ fn write_fem_material_field_artifacts(
             .as_object_mut()
             .expect("MaterialFieldAssetIR serializes as an object")
             .insert("values".to_string(), serde_json::json!([]));
-        metadata_assets.push(metadata_asset);
+        prepared.metadata_assets.push(metadata_asset);
+        prepared.files.push(crate::types::AuxiliaryArtifact {
+            relative_path: artifact_path,
+            bytes,
+        });
     }
 
-    Ok(metadata_assets)
+    Ok(prepared)
 }
 
-fn write_fdm_multilayer_material_field_artifacts(
-    output_dir: &Path,
+fn build_fdm_multilayer_material_field_artifacts(
     multilayer: &fullmag_ir::FdmMultilayerPlanIR,
-) -> std::io::Result<Vec<serde_json::Value>> {
+) -> std::io::Result<PreparedMaterialFieldArtifacts> {
     let build_identity = build_identity_json();
     let mut prepared_files = Vec::<(String, serde_json::Value)>::new();
-    let mut metadata_assets = Vec::new();
+    let mut prepared = PreparedMaterialFieldArtifacts::default();
     let mut manifest_layers = Vec::with_capacity(multilayer.layers.len());
     let mut value_offset = 0usize;
 
@@ -2635,7 +2668,7 @@ fn write_fdm_multilayer_material_field_artifacts(
                 "values": values,
             });
             prepared_files.push((relative_path.clone(), payload));
-            metadata_assets.push(serde_json::json!({
+            prepared.metadata_assets.push(serde_json::json!({
                 "schema_version": "fdm_multilayer_material_field.v1",
                 "backend": "fdm_multilayer",
                 "build_identity": build_identity,
@@ -2692,7 +2725,7 @@ fn write_fdm_multilayer_material_field_artifacts(
     }
 
     if prepared_files.is_empty() {
-        return Ok(Vec::new());
+        return Ok(prepared);
     }
 
     let manifest_path = "material-fields/fdm-multilayer/manifest.json";
@@ -2707,14 +2740,13 @@ fn write_fdm_multilayer_material_field_artifacts(
     prepared_files.push((manifest_path.to_string(), manifest));
 
     for (relative_path, payload) in prepared_files {
-        let full_path = output_dir.join(relative_path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(full_path, serde_json::to_vec_pretty(&payload).unwrap())?;
+        prepared.files.push(crate::types::AuxiliaryArtifact {
+            relative_path,
+            bytes: serde_json::to_vec_pretty(&payload).unwrap(),
+        });
     }
 
-    Ok(metadata_assets)
+    Ok(prepared)
 }
 
 fn fdm_multilayer_layer_artifact_descriptor(
@@ -3124,13 +3156,12 @@ fn hash_json_value(value: &serde_json::Value) -> std::io::Result<String> {
     Ok(format!("sha256:{:x}", Sha256::digest(payload)))
 }
 
-fn write_fem_supercell_node_geometry_artifact(
-    output_dir: &Path,
+fn build_fem_supercell_node_geometry_artifact(
     problem: &fullmag_ir::ProblemIR,
     plan: &fullmag_ir::ExecutionPlanIR,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<crate::types::AuxiliaryArtifact>> {
     let BackendPlanIR::Fem(fem) = &plan.backend_plan else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(runtime_metadata) = problem
         .problem_meta
@@ -3138,10 +3169,10 @@ fn write_fem_supercell_node_geometry_artifact(
         .get("periodic_antidot_relaxation")
         .and_then(|value| value.as_object())
     else {
-        return Ok(());
+        return Ok(None);
     };
     if !runtime_metadata.contains_key("supercell_repeat") {
-        return Ok(());
+        return Ok(None);
     }
 
     let magnetic_node_mask = crate::preview::mesh_quantity_active_mask("m", &fem.mesh)
@@ -3164,12 +3195,21 @@ fn write_fem_supercell_node_geometry_artifact(
         },
         "source": "ExecutionPlanIR.FemPlanIR.mesh.nodes",
     });
-    let mesh_dir = output_dir.join("mesh");
-    fs::create_dir_all(&mesh_dir)?;
-    fs::write(
-        mesh_dir.join("node_geometry.v1.json"),
-        serde_json::to_vec_pretty(&artifact).unwrap(),
-    )?;
+    let bytes = serde_json::to_vec_pretty(&artifact).unwrap();
+    Ok(Some(crate::types::AuxiliaryArtifact {
+        relative_path: "mesh/node_geometry.v1.json".to_string(),
+        bytes,
+    }))
+}
+
+fn write_fem_supercell_node_geometry_artifact(
+    output_dir: &Path,
+    problem: &fullmag_ir::ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+) -> std::io::Result<()> {
+    if let Some(artifact) = build_fem_supercell_node_geometry_artifact(problem, plan)? {
+        write_artifact_bytes(output_dir, &[artifact])?;
+    }
     Ok(())
 }
 
@@ -3326,16 +3366,15 @@ fn problem_source_scene_revision(problem: &fullmag_ir::ProblemIR) -> Option<u64>
         })
 }
 
-fn write_periodic_pairs_artifact(
-    output_dir: &Path,
+fn build_periodic_pairs_artifact(
     plan: &fullmag_ir::ExecutionPlanIR,
     source_scene_revision: Option<u64>,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<crate::types::AuxiliaryArtifact>> {
     let Some(mesh) = periodic_mesh(plan) else {
-        return Ok(());
+        return Ok(None);
     };
     if mesh.periodic_boundary_pairs.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let mesh_topology_fingerprint = mesh.topology_fingerprint_v6();
@@ -3489,15 +3528,20 @@ fn write_periodic_pairs_artifact(
         "max_translation_residual_m": max_translation_residual_m,
         "pairs": pairs,
     });
-    let artifact_path = output_dir.join("mesh").join("periodic_pairs.v1.json");
-    if let Some(parent) = artifact_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        artifact_path,
-        serde_json::to_string_pretty(&payload).unwrap(),
-    )?;
+    Ok(Some(crate::types::AuxiliaryArtifact {
+        relative_path: "mesh/periodic_pairs.v1.json".to_string(),
+        bytes: serde_json::to_string_pretty(&payload).unwrap().into_bytes(),
+    }))
+}
 
+fn write_periodic_pairs_artifact(
+    output_dir: &Path,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    source_scene_revision: Option<u64>,
+) -> std::io::Result<()> {
+    if let Some(artifact) = build_periodic_pairs_artifact(plan, source_scene_revision)? {
+        write_artifact_bytes(output_dir, &[artifact])?;
+    }
     Ok(())
 }
 
@@ -6575,9 +6619,34 @@ mod tests {
             unique_suffix
         ));
 
+        let prepared = build_material_field_artifacts(&plan)
+            .expect("multilayer material bundle should build without filesystem output");
+        let prepared_paths = prepared
+            .files
+            .iter()
+            .map(|artifact| artifact.relative_path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(!output_dir.exists(), "pure preparation must not write files");
+        assert_eq!(prepared.metadata_assets.len(), 6);
+        for asset in &prepared.metadata_assets {
+            let referenced_path = asset["artifact_path"]
+                .as_str()
+                .expect("metadata field asset should reference a member");
+            assert!(prepared_paths.contains(referenced_path));
+        }
+
         let assets = write_material_field_artifacts(&output_dir, &plan)
             .expect("multilayer material artifacts should be written");
 
+        assert_eq!(assets, prepared.metadata_assets);
+        for artifact in &prepared.files {
+            assert_eq!(
+                fs::read(output_dir.join(&artifact.relative_path))
+                    .expect("legacy wrapper member should exist"),
+                artifact.bytes,
+                "legacy wrapper must write the exact bytes returned by the pure builder"
+            );
+        }
         assert_eq!(assets.len(), 6);
         assert!(assets
             .iter()
@@ -6606,6 +6675,19 @@ mod tests {
                 .expect("multilayer material manifest should exist"),
         )
         .expect("multilayer material manifest should parse");
+        let manifest_artifact = prepared
+            .files
+            .iter()
+            .find(|artifact| {
+                artifact.relative_path == "material-fields/fdm-multilayer/manifest.json"
+            })
+            .expect("pure builder should include the referenced manifest");
+        assert_eq!(
+            fs::read(output_dir.join(&manifest_artifact.relative_path))
+                .expect("legacy wrapper manifest should exist"),
+            manifest_artifact.bytes,
+            "legacy wrapper must write the exact manifest bytes returned by the pure builder"
+        );
         assert_eq!(
             manifest["schema_version"],
             "fdm_multilayer_material_fields.v1"
@@ -6614,6 +6696,28 @@ mod tests {
         assert_eq!(manifest["layers"].as_array().map(Vec::len), Some(2));
         assert_eq!(manifest["build_identity"], build_identity_json());
         assert!(manifest.get("common_grid").is_none());
+        for layer in manifest["layers"]
+            .as_array()
+            .expect("manifest layer descriptors")
+        {
+            let material_fields = layer["material_fields"]
+                .as_object()
+                .expect("layer material-field descriptors");
+            for descriptor in material_fields.values() {
+                if let Some(relative_path) = descriptor["artifact_path"].as_str() {
+                    assert!(
+                        prepared_paths.contains(relative_path),
+                        "manifest material descriptor must resolve to a prepared member"
+                    );
+                }
+            }
+            if let Some(relative_path) = layer["native_region_mask"]["artifact_path"].as_str() {
+                assert!(
+                    prepared_paths.contains(relative_path),
+                    "manifest membership descriptor must resolve to a prepared member"
+                );
+            }
+        }
 
         let bottom_ms: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(
@@ -8625,6 +8729,10 @@ mod tests {
             panic!("test plan should be FEM");
         };
         fem.material.ms_field = Some(vec![700e3, 710e3, 720e3, 730e3]);
+        let prepared = build_material_field_artifacts(&plan)
+            .expect("FEM material fields should build without filesystem output");
+        assert_eq!(prepared.metadata_assets.len(), 1);
+        assert_eq!(prepared.files.len(), 1);
 
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -8635,6 +8743,7 @@ mod tests {
             std::process::id(),
             unique_suffix
         ));
+        assert!(!output_dir.exists(), "pure preparation must not write files");
         let executed = ExecutedRun {
             result: RunResult {
                 status: RunStatus::Completed,
@@ -8663,6 +8772,7 @@ mod tests {
         let assets = metadata["material_field_assets"]
             .as_array()
             .expect("metadata should carry material_field_assets");
+        assert_eq!(assets, &prepared.metadata_assets);
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0]["asset_id"], "free_ms_node");
         assert_eq!(
@@ -8670,6 +8780,16 @@ mod tests {
             "material-fields/free_ms_node.json"
         );
         assert_eq!(assets[0]["values"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            assets[0]["artifact_path"],
+            prepared.files[0].relative_path
+        );
+        assert_eq!(
+            fs::read(output_dir.join(&prepared.files[0].relative_path))
+                .expect("FEM material-field artifact should exist"),
+            prepared.files[0].bytes,
+            "legacy writer must preserve exact bytes returned by the pure FEM builder"
+        );
 
         let artifact: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(output_dir.join("material-fields/free_ms_node.json"))
@@ -10284,9 +10404,20 @@ mod tests {
             std::process::id(),
             unique_suffix
         ));
+        let prepared = build_periodic_pairs_artifact(&plan, Some(46))
+            .expect("periodic pairs artifact should build without filesystem output")
+            .expect("periodic mesh should produce a periodic pairs artifact");
+        assert!(!output_dir.exists(), "pure preparation must not write files");
+        assert_eq!(prepared.relative_path, "mesh/periodic_pairs.v1.json");
 
         write_periodic_pairs_artifact(&output_dir, &plan, Some(46))
             .expect("periodic pairs artifact should be written");
+        assert_eq!(
+            fs::read(output_dir.join(&prepared.relative_path))
+                .expect("periodic pairs artifact should exist"),
+            prepared.bytes,
+            "legacy wrapper must write the exact bytes returned by the pure builder"
+        );
 
         let artifact: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(output_dir.join("mesh/periodic_pairs.v1.json"))
@@ -11198,6 +11329,10 @@ mod tests {
             }),
         );
         let plan = test_fem_execution_plan();
+        let prepared = build_fem_supercell_node_geometry_artifact(&problem, &plan)
+            .expect("node geometry should build without filesystem output")
+            .expect("supercell metadata should produce node geometry");
+        assert_eq!(prepared.relative_path, "mesh/node_geometry.v1.json");
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock drift")
@@ -11207,6 +11342,7 @@ mod tests {
             std::process::id(),
             unique_suffix
         ));
+        assert!(!output_dir.exists(), "pure preparation must not write files");
         let executed = ExecutedRun {
             result: RunResult {
                 status: RunStatus::Completed,
@@ -11227,6 +11363,12 @@ mod tests {
 
         write_artifacts(&output_dir, &problem, &plan, &executed, None)
             .expect("supercell node geometry artifact should write");
+        assert_eq!(
+            fs::read(output_dir.join(&prepared.relative_path))
+                .expect("node geometry artifact should exist"),
+            prepared.bytes,
+            "write_artifacts must preserve exact bytes returned by the pure node-geometry builder"
+        );
 
         let artifact: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(output_dir.join("mesh/node_geometry.v1.json"))
@@ -11266,6 +11408,9 @@ mod tests {
             }),
         );
         let plan = test_fem_execution_plan();
+        assert!(build_fem_supercell_node_geometry_artifact(&problem, &plan)
+            .expect("primitive cell should validate without filesystem output")
+            .is_none());
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock drift")
