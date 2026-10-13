@@ -23,9 +23,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
 from comsol_magnetic_support import magnetic_element_indices, tet4_cells
+from comsol_modal_field_certificate import ArtifactBundleReader
 from comsol_n0_field_certificate import measure_n0_field
 from comsol_signed_k_replay import replay_signed_k_spectra
 from comsol_tracking_replay import replay_tracking_fields
+import frequency_domain_generation as artifact_generation
 from verify_fem_frequency_domain_eigen_artifacts import (
     p00_demag_factor,
     require_kalinikos_slab_n0_material_and_bias,
@@ -100,6 +102,13 @@ _REQUIRED_ARTIFACTS = (
     Path("frequency_domain/manifest.v1.json"),
     Path("eigen/diagnostics/solver.v1.json"),
 )
+_PRIMARY_GENERATION_JSON_ARTIFACTS = frozenset(
+    relative for relative in _REQUIRED_ARTIFACTS if relative.suffix == ".json"
+)
+_PRIMARY_GENERATION_MEMBERS = tuple(sorted(
+    tuple(relative.as_posix() for relative in _PRIMARY_GENERATION_JSON_ARTIFACTS)
+    + (EVIDENCE_RELATIVE_PATH.as_posix(),)
+))
 
 
 class ScientificGateError(RuntimeError):
@@ -1715,10 +1724,43 @@ def _new_check(status: str, **values: Any) -> dict[str, Any]:
     return {"status": status, **values}
 
 
-def _artifact_map(case_dir: Path) -> tuple[dict[Path, dict[str, Any]], list[str]]:
+def _artifact_map(
+    case_dir: Path,
+    *,
+    bundle_reader: ArtifactBundleReader | None = None,
+    generation_capture_error: BaseException | None = None,
+) -> tuple[dict[Path, dict[str, Any]], list[str]]:
     artifacts: dict[Path, dict[str, Any]] = {}
     reasons: list[str] = []
     for relative in _REQUIRED_ARTIFACTS:
+        if relative in _PRIMARY_GENERATION_JSON_ARTIFACTS:
+            if generation_capture_error is not None:
+                continue
+            if bundle_reader is not None:
+                logical = relative.as_posix()
+                try:
+                    payload = bundle_reader.read_bytes(
+                        logical,
+                        maximum_bytes=artifact_generation.DEFAULT_MAX_JSON_BYTES,
+                    )
+                    record = bundle_reader.record_for(logical)
+                except (OSError, ValueError) as error:
+                    reasons.append(
+                        f"required artifact could not be read from the captured generation: "
+                        f"{logical}: {error}"
+                    )
+                    continue
+                if not payload:
+                    reasons.append(f"required artifact is empty: {logical}")
+                    continue
+                digest = record.get("sha256")
+                if isinstance(digest, str) and digest.startswith("sha256:"):
+                    digest = digest[7:]
+                if not isinstance(digest, str):
+                    reasons.append(f"required artifact has no captured SHA256: {logical}")
+                    continue
+                artifacts[relative] = {"sha256": digest, "size": len(payload)}
+                continue
         path = _safe_relative_path(case_dir, relative.as_posix(), f"required artifact {relative.as_posix()}", reasons)
         if path is None:
             continue
@@ -1729,7 +1771,27 @@ def _artifact_map(case_dir: Path) -> tuple[dict[Path, dict[str, Any]], list[str]
     return artifacts, reasons
 
 
-def _tracking_input_hashes(case_dir, artifacts, mode_ids):
+def _read_captured_json(
+    bundle_reader: ArtifactBundleReader,
+    relative: Path,
+    reasons: list[str],
+) -> dict[str, Any] | None:
+    logical = relative.as_posix()
+    try:
+        value = bundle_reader.read_json(
+            logical,
+            maximum_bytes=artifact_generation.DEFAULT_MAX_JSON_BYTES,
+        )
+    except (OSError, ValueError) as error:
+        reasons.append(f"cannot read captured primary JSON {logical}: {error}")
+        return None
+    if not isinstance(value, dict):
+        reasons.append(f"captured primary JSON root must be an object: {logical}")
+        return None
+    return value
+
+
+def _tracking_input_hashes(case_dir, artifacts, mode_ids, *, bundle_reader=None):
     """Capture every candidate before long-running scientific checks.
 
     None is an unavailable snapshot, never permission to accept later bytes.
@@ -1741,10 +1803,21 @@ def _tracking_input_hashes(case_dir, artifacts, mode_ids):
     for sample, raw in sorted(mode_ids):
         for relative in (f"eigen/modes/sample_{sample:04d}/mode_{raw:04d}.json",
                          f"eigen/mode_fields/sample_{sample:04d}/mode_{raw:04d}/vector.bin"):
-            path = _safe_relative_path(case_dir, relative, "tracking snapshot", [])
             try:
-                hashes[relative] = "sha256:" + _sha256(path) if path is not None else None
-            except OSError:
+                if bundle_reader is not None:
+                    bundle_reader.read_bytes(
+                        relative,
+                        maximum_bytes=(
+                            artifact_generation.DEFAULT_MAX_JSON_BYTES
+                            if relative.endswith(".json") else None
+                        ),
+                    )
+                    digest = bundle_reader.record_for(relative)["sha256"]
+                    hashes[relative] = digest if digest.startswith("sha256:") else "sha256:" + digest
+                else:
+                    path = _safe_relative_path(case_dir, relative, "tracking snapshot", [])
+                    hashes[relative] = "sha256:" + _sha256(path) if path is not None else None
+            except (OSError, ValueError):
                 hashes[relative] = None
     return hashes
 
@@ -2335,6 +2408,8 @@ def _validate_exported_mode_fields(
     branches: Sequence[Mapping[str, Any]],
     sample_map: Mapping[int, Mapping[str, Any]],
     reasons: list[str],
+    *,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, Any]:
     """Inspect every branch-selected magnetic field, independently of solver claims."""
     from comsol_modal_field_certificate import validate_modal_field_certificate
@@ -2443,6 +2518,8 @@ def _validate_exported_mode_fields(
 
     certificate = validate_modal_field_certificate(
         case_dir, mode_selections=sorted(selected_pairs), phase_tolerance=MAX_PHASE_RESIDUAL,
+        bundle_reader=bundle_reader,
+        final_fence=bundle_reader is None,
     )
     certificate["expected_mode_count"] = expected_count
     certificate_modes = certificate.get("modes")
@@ -2503,10 +2580,16 @@ def _validate_exported_mode_fields(
     from comsol_mesh_identity import mesh_topology_fingerprint_v3
     mesh_signature = None
     try:
-        metadata_path = _safe_relative_path(case_dir, "metadata.json", "modal field mesh metadata", reasons)
-        if metadata_path is None:
-            raise ValueError("unsafe or missing mesh metadata")
-        metadata_bytes = metadata_path.read_bytes()
+        if bundle_reader is not None:
+            metadata_bytes = bundle_reader.read_bytes(
+                "metadata.json",
+                maximum_bytes=artifact_generation.DEFAULT_MAX_JSON_BYTES,
+            )
+        else:
+            metadata_path = _safe_relative_path(case_dir, "metadata.json", "modal field mesh metadata", reasons)
+            if metadata_path is None:
+                raise ValueError("unsafe or missing mesh metadata")
+            metadata_bytes = metadata_path.read_bytes()
         certified_hashes = {item["path"]: item["sha256"] for item in certificate.get("file_hashes", [])}
         if "sha256:" + hashlib.sha256(metadata_bytes).hexdigest() != certified_hashes.get("metadata.json"):
             raise ValueError("metadata changed after field certification")
@@ -2593,6 +2676,7 @@ def _validate_exported_mode_potentials(
     metadata: Mapping[str, Any] | None = None,
     manifest: Mapping[str, Any] | None = None,
     evidence: Mapping[str, Any] | None = None,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, Any]:
     """Replay full physical phi for the exact branch-selected modes.
 
@@ -2679,6 +2763,8 @@ def _validate_exported_mode_potentials(
         case_dir,
         mode_selections=sorted(selected_pairs),
         phase_tolerance=MAX_PHASE_RESIDUAL,
+        bundle_reader=bundle_reader,
+        final_fence=bundle_reader is None,
     )
     if case == "c0":
         certificate["applicability_status"] = "not_verified"
@@ -2728,12 +2814,18 @@ def _validate_exported_mode_potentials(
     try:
         from comsol_mesh_identity import mesh_topology_fingerprint_v3
 
-        metadata_path = _safe_relative_path(
-            case_dir, "metadata.json", "full-potential mesh metadata", mesh_identity_reasons
-        )
-        if metadata_path is None:
-            raise ValueError("unsafe or missing mesh metadata")
-        metadata_bytes = metadata_path.read_bytes()
+        if bundle_reader is not None:
+            metadata_bytes = bundle_reader.read_bytes(
+                "metadata.json",
+                maximum_bytes=artifact_generation.DEFAULT_MAX_JSON_BYTES,
+            )
+        else:
+            metadata_path = _safe_relative_path(
+                case_dir, "metadata.json", "full-potential mesh metadata", mesh_identity_reasons
+            )
+            if metadata_path is None:
+                raise ValueError("unsafe or missing mesh metadata")
+            metadata_bytes = metadata_path.read_bytes()
         certified_hashes = {
             item.get("path"): item.get("sha256")
             for item in certificate.get("file_hashes", [])
@@ -5876,7 +5968,18 @@ def validate_case(
     if case not in EXPECTED_CASES:
         raise ScientificGateError(f"unsupported benchmark case: {case}")
     reasons: list[str] = []
-    artifacts, artifact_reasons = _artifact_map(case_dir)
+    bundle_reader: ArtifactBundleReader | None = None
+    generation_capture_error: OSError | ValueError | None = None
+    try:
+        bundle_reader = ArtifactBundleReader(case_dir)
+    except (OSError, ValueError) as error:
+        generation_capture_error = error
+        reasons.append(f"primary artifact generation capture failed: {error}")
+    artifacts, artifact_reasons = _artifact_map(
+        case_dir,
+        bundle_reader=bundle_reader,
+        generation_capture_error=generation_capture_error,
+    )
     reasons.extend(artifact_reasons)
     parameters, parameter_reasons = _load_parameters(parameters_path)
     reasons.extend(parameter_reasons)
@@ -5892,31 +5995,19 @@ def validate_case(
     manifest: dict[str, Any] = {}
     metadata: dict[str, Any] = {}
     diagnostics: dict[str, Any] = {}
-    if Path("metadata.json") in artifacts:
-        metadata, error = _load_json(case_dir / "metadata.json")
-        if error:
-            reasons.append(error)
-            metadata = {}
-    if Path("eigen/spectrum.v2.json") in artifacts:
-        spectrum, error = _load_json(case_dir / "eigen/spectrum.v2.json")
-        if error:
-            reasons.append(error)
-            spectrum = {}
-    if Path("eigen/branches.v2.json") in artifacts:
-        branches, error = _load_json(case_dir / "eigen/branches.v2.json")
-        if error:
-            reasons.append(error)
-            branches = {}
-    if Path("frequency_domain/manifest.v1.json") in artifacts:
-        manifest, error = _load_json(case_dir / "frequency_domain/manifest.v1.json")
-        if error:
-            reasons.append(error)
-            manifest = {}
-    if Path("eigen/diagnostics/solver.v1.json") in artifacts:
-        diagnostics, error = _load_json(case_dir / "eigen/diagnostics/solver.v1.json")
-        if error:
-            reasons.append(error)
-            diagnostics = {}
+    if bundle_reader is not None:
+        if Path("metadata.json") in artifacts:
+            metadata = _read_captured_json(bundle_reader, Path("metadata.json"), reasons) or {}
+        if Path("eigen/spectrum.v2.json") in artifacts:
+            spectrum = _read_captured_json(bundle_reader, Path("eigen/spectrum.v2.json"), reasons) or {}
+        if Path("eigen/branches.v2.json") in artifacts:
+            branches = _read_captured_json(bundle_reader, Path("eigen/branches.v2.json"), reasons) or {}
+        if Path("frequency_domain/manifest.v1.json") in artifacts:
+            manifest = _read_captured_json(bundle_reader, Path("frequency_domain/manifest.v1.json"), reasons) or {}
+        if Path("eigen/diagnostics/solver.v1.json") in artifacts:
+            diagnostics = _read_captured_json(
+                bundle_reader, Path("eigen/diagnostics/solver.v1.json"), reasons,
+            ) or {}
     _validate_payload_schemas(
         {"spectrum": spectrum, "branches": branches, "manifest": manifest}, "primary", reasons,
     )
@@ -5932,7 +6023,10 @@ def validate_case(
     quality_mode_map: dict[tuple[int, int], float] = {}
     if spectrum:
         sample_map, mode_map, quality_mode_map = _validate_spectrum(spectrum, case, expected_path, reasons)
-    tracking_input_hashes = _tracking_input_hashes(case_dir, artifacts, mode_map) if case in PATH_CASES else {}
+    tracking_input_hashes = (
+        _tracking_input_hashes(case_dir, artifacts, mode_map, bundle_reader=bundle_reader)
+        if case in PATH_CASES and bundle_reader is not None else {}
+    )
     selected_branches: list[dict[str, Any]] = []
     branch_check = _new_check("missing")
     if branches:
@@ -5952,12 +6046,8 @@ def validate_case(
             reasons,
         )
     evidence: dict[str, Any] | None = None
-    evidence_path = case_dir / EVIDENCE_RELATIVE_PATH
-    if evidence_path.is_file():
-        evidence, error = _load_json(evidence_path)
-        if error:
-            reasons.append(error)
-            evidence = None
+    if bundle_reader is not None:
+        evidence = _read_captured_json(bundle_reader, EVIDENCE_RELATIVE_PATH, reasons)
     analytic_columns_check = _new_check("not_applicable")
     if case == "c1" and Path("eigen/dispersion.csv") in artifacts and parameters:
         analytic_columns_check = _validate_primary_analytic_columns(
@@ -5978,16 +6068,27 @@ def validate_case(
             reasons,
             require_uniform_slab=case == "c1",
         )
-    field_check = _validate_exported_mode_fields(case_dir, case, selected_branches, sample_map, reasons)
-    potential_phase_check = _validate_exported_mode_potentials(
-        case_dir,
-        case,
-        selected_branches,
-        sample_map,
-        metadata=metadata,
-        manifest=manifest,
-        evidence=evidence,
-    )
+    if bundle_reader is not None:
+        field_check = _validate_exported_mode_fields(
+            case_dir, case, selected_branches, sample_map, reasons, bundle_reader=bundle_reader,
+        )
+        potential_phase_check = _validate_exported_mode_potentials(
+            case_dir,
+            case,
+            selected_branches,
+            sample_map,
+            metadata=metadata,
+            manifest=manifest,
+            evidence=evidence,
+            bundle_reader=bundle_reader,
+        )
+    else:
+        capture_reason = f"primary artifact generation is unavailable: {generation_capture_error}"
+        field_check = _new_check("not_verified", qualification="NOT VERIFIED", reasons=[capture_reason])
+        potential_phase_check = _new_check(
+            "not_verified", qualification="NOT VERIFIED", phase_status="not_verified",
+            gauge_status="not_verified", reasons=[capture_reason],
+        )
     primary_equilibrium_check = _validate_primary_equilibrium(
         case_dir,
         case,
@@ -6029,6 +6130,12 @@ def validate_case(
         mode_count=len(mode_map),
     )
     campaign_contract_status = "pass" if not reasons else "fail"
+    generation_coverage_reason = (
+        "primary artifact-generation coverage is PARTIAL: primary equilibrium, dispersion CSV, "
+        "auxiliary comparison artifacts, and referenced external scientific evidence are outside "
+        "this captured JSON generation"
+    )
+    reasons.append(generation_coverage_reason)
     # Signed-k proof is also a scientific gate, separate from the primary campaign contract.
     signed_k_check = _validate_signed_k_replay(
         case_dir,
@@ -6055,9 +6162,19 @@ def validate_case(
     tracking_replay = _new_check("not_applicable")
     assignment_replay = _new_check("not_applicable")
     if case in PATH_CASES:
-        tracking_replay = replay_tracking_fields(case_dir,
-            selected_branch_ids=[branch["branch_id"] for branch in selected_branches],
-            expected_hashes=tracking_input_hashes)
+        if bundle_reader is not None:
+            tracking_replay = replay_tracking_fields(
+                case_dir,
+                selected_branch_ids=[branch["branch_id"] for branch in selected_branches],
+                expected_hashes=tracking_input_hashes,
+                bundle_reader=bundle_reader,
+                final_fence=False,
+            )
+        else:
+            tracking_replay = _new_check(
+                "fail", qualification="NOT VERIFIED",
+                reasons=[f"primary artifact generation is unavailable: {generation_capture_error}"],
+            )
         if tracking_replay["status"] != "pass":
             reasons.append(
                 "scientific tracking qualification requires executed hash-bound field-metric replay; "
@@ -6084,7 +6201,66 @@ def validate_case(
                                       qualification="NOT VERIFIED", verified_step_count=len(steps) if isinstance(steps, list) else 0)
         if not assignment_pass:
             reasons.append("scientific tracking assignment/cluster-selection replay remains NOT VERIFIED")
+    generation_fence_error: str | None = None
+    if bundle_reader is not None:
+        try:
+            bundle_reader.ensure_current()
+        except (OSError, ValueError) as error:
+            generation_fence_error = str(error)
+            reasons.append(f"primary artifact generation final fence failed: {error}")
+            campaign_contract_status = "fail"
+        generation_descriptor = bundle_reader.generation_descriptor()
+        generation_fence_check = _new_check(
+            "fail" if generation_fence_error else "pass",
+            final_fence="failed" if generation_fence_error else "current",
+            reasons=[generation_fence_error] if generation_fence_error else [],
+        )
+    else:
+        generation_descriptor = {
+            "generation_binding_status": "not_verified",
+            "generation_id": None,
+            "schema_version": None,
+            "immutable": False,
+            "marker_path": None,
+            "marker_sha256": None,
+            "producer": None,
+            "current_fence_status": "capture_failed",
+        }
+        generation_fence_check = _new_check(
+            "fail",
+            final_fence="not_run",
+            reasons=[f"primary artifact generation capture failed: {generation_capture_error}"],
+        )
+    for nested_check in (field_check, potential_phase_check, tracking_replay):
+        if isinstance(nested_check, dict) and "artifact_generation" in nested_check:
+            nested_check["artifact_generation"] = generation_descriptor
+    generation_coverage = {
+        "status": "not_verified",
+        "coverage": "partial",
+        "whole_gate_immutable_snapshot_verified": False,
+        "required_primary_native_json_members": sorted(
+            path.as_posix() for path in _PRIMARY_GENERATION_JSON_ARTIFACTS
+        ),
+        "bound_primary_native_json_members": sorted(
+            path.as_posix() for path in artifacts if path in _PRIMARY_GENERATION_JSON_ARTIFACTS
+        ),
+        "case_local_evidence_descriptor": EVIDENCE_RELATIVE_PATH.as_posix(),
+        "case_local_evidence_descriptor_bound": evidence is not None,
+        "referenced_external_evidence_files_in_generation": False,
+        "excluded_inputs": [
+            "eigen/dispersion.csv",
+            "primary_equilibrium_artifacts",
+            "auxiliary_convergence_and_control_runs",
+            "external_scientific_evidence_referenced_by_case_descriptor",
+        ],
+        "reasons": [generation_coverage_reason],
+    }
     checks = {
+        "artifact_generation_current_fence": generation_fence_check,
+        "artifact_generation_coverage": {
+            **generation_coverage,
+            "qualification": "NOT VERIFIED",
+        },
         "canonical_kpath": canonical_path_check,
         "artifact_binding": evidence_check,
         "numeric_source": source_check,
@@ -6122,6 +6298,8 @@ def validate_case(
         "scientific_qualification": "qualified" if status == "qualified" else "not_verified",
         "reasons": reasons,
         "checks": checks,
+        "artifact_generation": generation_descriptor,
+        "artifact_generation_coverage": generation_coverage,
         "artifact_bindings": {path.as_posix(): record for path, record in artifacts.items()},
         "evidence_path": EVIDENCE_RELATIVE_PATH.as_posix(),
         "parameters_path": str(parameters_path),

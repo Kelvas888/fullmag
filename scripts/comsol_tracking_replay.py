@@ -368,6 +368,7 @@ def replay_tracking_fields(
     selected_branch_ids=None,
     expected_hashes=None,
     bundle_reader=None,
+    final_fence: bool = True,
 ):
     """Replay all candidates; selected IDs identify the comparison, not a filter."""
     root = Path(case_dir).absolute()
@@ -454,12 +455,13 @@ def replay_tracking_fields(
             artifact_generation=reader.generation_descriptor(),
             candidate_field_coverage={"status": "pass", "exported_candidate_count": len(selections),
                                       "solver_spectral_completeness": "NOT VERIFIED"})
-        try:
-            reader.ensure_current()
-        except (OSError, ValueError):
-            final_fence_failed = True
-            raise
-        report["artifact_generation"] = reader.generation_descriptor()
+        if final_fence:
+            try:
+                reader.ensure_current()
+            except (OSError, ValueError):
+                final_fence_failed = True
+                raise
+            report["artifact_generation"] = reader.generation_descriptor()
     except (OSError, ValueError, TypeError, KeyError, IndexError, OverflowError, AttributeError) as error:
         report["reasons"] = [str(error)]
         # Missing fields fail closed without pretending the replay executed.

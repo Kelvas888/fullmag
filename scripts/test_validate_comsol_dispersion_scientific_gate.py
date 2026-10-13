@@ -21,6 +21,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import validate_comsol_dispersion_scientific_gate as gate
+import frequency_domain_generation as generation
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +65,60 @@ def _tracking_fixture_payload(branches):
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2), encoding="utf-8")
+
+
+def _install_test_generation(root: Path, payloads: dict[str, bytes], *, schema: str) -> tuple[str, bytes]:
+    members = {
+        name: {
+            "byte_length": len(payload),
+            "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+        }
+        for name, payload in sorted(payloads.items())
+    }
+    body = {
+        "schema_version": schema,
+        "producer": None,
+        "members": members,
+    }
+    canonical = json.dumps(
+        body, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    generation_id = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    marker = json.dumps(
+        {"generation_id": generation_id, "content": body},
+        ensure_ascii=False, indent=2, allow_nan=False,
+    ).encode("utf-8")
+    if schema == generation.SCHEMA_V2:
+        member_root = root / generation.GENERATION_DIRECTORY / generation_id[7:]
+        marker_relative = generation.IMMUTABLE_COMMIT_PATH
+    else:
+        member_root = root
+        marker_relative = generation.COMMIT_PATH
+    for relative, payload in payloads.items():
+        path = member_root.joinpath(*relative.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    marker_path = root.joinpath(*marker_relative.split("/"))
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker)
+    return generation_id, marker
+
+
+def _primary_generation_payloads(case_dir: Path, *, include_c0_field: bool = False) -> dict[str, bytes]:
+    logical_paths = [
+        "metadata.json",
+        "eigen/spectrum.v2.json",
+        "eigen/branches.v2.json",
+        "frequency_domain/manifest.v1.json",
+        "eigen/diagnostics/solver.v1.json",
+        gate.EVIDENCE_RELATIVE_PATH.as_posix(),
+    ]
+    if include_c0_field:
+        logical_paths.extend((
+            "eigen/modes/sample_0000/mode_0000.json",
+            "eigen/mode_fields/sample_0000/mode_0000/vector.bin",
+        ))
+    return {relative: (case_dir / relative).read_bytes() for relative in logical_paths}
 
 
 def _refresh_primary_artifact_binding(case_dir: Path, relative_path: str, binding_key: str) -> None:
@@ -3774,6 +3829,160 @@ class ScientificGateTests(unittest.TestCase):
                     artifacts, reasons = gate._artifact_map(root)
         self.assertNotIn(Path("metadata.json"), artifacts)
         self.assertTrue(any("symlink or junction" in reason for reason in reasons))
+
+    def test_validate_case_uses_one_v2_reader_and_cached_primary_json_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c0")
+            payloads = _primary_generation_payloads(case_dir, include_c0_field=True)
+            generation_id, _marker = _install_test_generation(
+                case_dir, payloads, schema=generation.SCHEMA_V2,
+            )
+            (case_dir / "eigen/spectrum.v2.json").write_text(
+                '{"schema_version":"stale-root-payload"}', encoding="utf-8",
+            )
+            original_reader = gate.ArtifactBundleReader
+            readers = []
+
+            def make_reader(root):
+                reader = original_reader(root)
+                readers.append(reader)
+                return reader
+
+            member_reads = {}
+            original_read_member = generation.GenerationCapture.read_member
+
+            def count_member_read(capture, relative, *args, **kwargs):
+                member_reads[relative] = member_reads.get(relative, 0) + 1
+                return original_read_member(capture, relative, *args, **kwargs)
+
+            with (
+                mock.patch.object(gate, "ArtifactBundleReader", side_effect=make_reader),
+                mock.patch.object(generation.GenerationCapture, "read_member", new=count_member_read),
+            ):
+                report = gate.validate_case(
+                    case_dir, "c0", parameters_path=PARAMETERS, kpath_path=KPATH,
+                )
+
+        self.assertEqual(len(readers), 1)
+        self.assertEqual(readers[0].generation.generation_id, generation_id)
+        self.assertEqual(report["artifact_bindings"]["eigen/spectrum.v2.json"]["sha256"],
+                         hashlib.sha256(payloads["eigen/spectrum.v2.json"]).hexdigest())
+        self.assertEqual(report["checks"]["spectrum_samples"]["sample_count"], 1)
+        for relative in payloads:
+            self.assertEqual(member_reads.get(relative), 1, relative)
+        self.assertEqual(report["artifact_generation"]["generation_binding_status"], "immutable_verified")
+        self.assertEqual(report["artifact_generation_coverage"]["coverage"], "partial")
+        self.assertFalse(report["artifact_generation_coverage"]["whole_gate_immutable_snapshot_verified"])
+        self.assertEqual(report["status"], "not_qualified")
+
+    def test_validate_case_reports_v1_as_mutable_and_keeps_coverage_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c0")
+            _install_test_generation(
+                case_dir,
+                _primary_generation_payloads(case_dir),
+                schema=generation.SCHEMA_V1,
+            )
+            report = gate.validate_case(
+                case_dir, "c0", parameters_path=PARAMETERS, kpath_path=KPATH,
+            )
+        self.assertEqual(report["artifact_generation"]["generation_binding_status"], "byte_verified_mutable")
+        self.assertFalse(report["artifact_generation"]["immutable"])
+        self.assertEqual(report["artifact_generation_coverage"]["status"], "not_verified")
+        self.assertEqual(report["artifact_generation_coverage"]["coverage"], "partial")
+        self.assertEqual(report["status"], "not_qualified")
+
+    def test_corrupt_v2_marker_never_falls_back_to_root_primary_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c0")
+            _install_test_generation(
+                case_dir,
+                _primary_generation_payloads(case_dir, include_c0_field=True),
+                schema=generation.SCHEMA_V2,
+            )
+            marker_path = case_dir / generation.IMMUTABLE_COMMIT_PATH
+            marker_path.write_bytes(b"{corrupt v2 marker")
+            primary_paths = {
+                (case_dir / relative).resolve()
+                for relative in (
+                    "metadata.json",
+                    "eigen/spectrum.v2.json",
+                    "eigen/branches.v2.json",
+                    "frequency_domain/manifest.v1.json",
+                    "eigen/diagnostics/solver.v1.json",
+                    gate.EVIDENCE_RELATIVE_PATH.as_posix(),
+                )
+            }
+            loaded_paths = []
+            original_load_json = gate._load_json
+
+            def track_json_load(path):
+                loaded_paths.append(Path(path).resolve())
+                return original_load_json(path)
+
+            with mock.patch.object(gate, "_load_json", side_effect=track_json_load):
+                report = gate.validate_case(
+                    case_dir, "c0", parameters_path=PARAMETERS, kpath_path=KPATH,
+                )
+
+        self.assertTrue(primary_paths.isdisjoint(loaded_paths))
+        self.assertNotIn("eigen/spectrum.v2.json", report["artifact_bindings"])
+        self.assertEqual(report["artifact_generation"]["current_fence_status"], "capture_failed")
+        self.assertTrue(any("generation capture failed" in reason for reason in report["reasons"]))
+        self.assertEqual(report["status"], "not_qualified")
+
+    def test_gate_uses_nested_replay_without_fence_and_fences_once_at_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c1")
+            payloads = _primary_generation_payloads(case_dir)
+            _install_test_generation(case_dir, payloads, schema=generation.SCHEMA_V2)
+            original_reader = gate.ArtifactBundleReader
+            readers = []
+
+            class CountingReader(original_reader):
+                def __init__(self, root):
+                    self.final_fence_calls = 0
+                    super().__init__(root)
+                    readers.append(self)
+
+                def ensure_current(self):
+                    self.final_fence_calls += 1
+                    return super().ensure_current()
+
+            replay_calls = []
+
+            def replay_without_work(*args, **kwargs):
+                replay_calls.append((args, kwargs))
+                return {"status": "fail", "qualification": "NOT VERIFIED", "reasons": ["test replay boundary"]}
+
+            def change_current_generation(*_args, **_kwargs):
+                _install_test_generation(
+                    case_dir,
+                    {"eigen/spectrum.v2.json": b'{"replacement":true}'},
+                    schema=generation.SCHEMA_V2,
+                )
+                return {"status": "not_verified", "reasons": ["test replacement"]}
+
+            with (
+                mock.patch.object(gate, "ArtifactBundleReader", CountingReader),
+                mock.patch.object(gate, "_validate_spectrum", return_value=({}, {}, {})),
+                mock.patch.object(gate, "replay_tracking_fields", side_effect=replay_without_work),
+                mock.patch.object(gate, "_validate_primary_equilibrium", side_effect=change_current_generation),
+            ):
+                report = gate.validate_case(
+                    case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH,
+                )
+
+        self.assertEqual(len(readers), 1)
+        self.assertEqual(len(replay_calls), 1)
+        self.assertIs(replay_calls[0][1]["bundle_reader"], readers[0])
+        self.assertFalse(replay_calls[0][1]["final_fence"])
+        self.assertEqual(readers[0].final_fence_calls, 1)
+        self.assertEqual(report["checks"]["artifact_generation_current_fence"]["status"], "fail")
+        self.assertEqual(report["artifact_generation"]["generation_binding_status"], "stale")
+        self.assertEqual(report["artifact_generation_coverage"]["coverage"], "partial")
+        self.assertEqual(report["campaign_contract_status"], "fail")
+        self.assertEqual(report["status"], "not_qualified")
 
     def test_tracking_snapshot_covers_sparse_unselected_candidates_and_missing_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
