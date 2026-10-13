@@ -52,6 +52,36 @@ def _validate_start_freeze_race_scope(enabled: bool, conflicting_scope: bool) ->
         raise storage.StorageError("Start/freeze race is a separate owned native verification scope")
 
 
+def _publish_owned_store_fixture_json(store: Path, path: Path, document: dict) -> None:
+    """Publish this verifier's fixture under the existing native writer lock."""
+    store = storage.validate_path(store, store, "owned fixture store")
+    path = storage.validate_path(path, store, "owned fixture document")
+    lock_path = storage.validate_path(store / "WRITER.lock", store, "native fixture writer lock")
+    # Never create or replace the native descriptor or its owner metadata.
+    with lock_path.open("r+b", buffering=0) as descriptor:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                descriptor.seek(0)
+                msvcrt.locking(descriptor.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as error:
+                if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise storage.StorageError("Owned fixture writer lock remained busy") from error
+                time.sleep(0.01)
+        try:
+            descriptor.seek(0)
+            if descriptor.read(256) != b"fullmag.writer.lock.v1\n":
+                raise storage.StorageError("Owned fixture has an unsupported native writer descriptor")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            storage.atomic_json(path, document)
+        finally:
+            descriptor.seek(0)
+            msvcrt.locking(descriptor.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def _can_reuse_active_binaries(source_bin: Path, stable_bin: Path, expected: dict) -> bool:
     from windows.runtime_bundle import BINARY_NAMES, _check_path_chain, _require_directory, _require_regular_file
 
@@ -1503,8 +1533,7 @@ def exercise_service(repo: Path, run_root: Path, manifest: dict, receipt: dict, 
                     preparation_attempt_id="fixture-preparation")),
             ):
                 lease_path = store / "runs/idle-fence-lease" / family / "outside-pool/fixture-lease.json"
-                lease_path.parent.mkdir(parents=True)
-                storage.atomic_json(lease_path, document)
+                _publish_owned_store_fixture_json(store, lease_path, document)
                 denied = control("drain_idle_confirmed", owner["owner_token"], uuid.uuid4().hex)
                 assert denied == {"status": "rejected", "reason": "idle_not_proven"}, denied
                 assert control("status", owner["owner_token"], uuid.uuid4().hex)["owner"]["state"] == "ready"
@@ -1512,7 +1541,7 @@ def exercise_service(repo: Path, run_root: Path, manifest: dict, receipt: dict, 
                 receipt["checks"].append(family + "-outside-pool-refuses-idle-drain")
                 # Keep the document to prove that terminal lease history does
                 # not prevent the eventual idle drain. No process owns it.
-                storage.atomic_json(lease_path, {**document, "state": "released",
+                _publish_owned_store_fixture_json(store, lease_path, {**document, "state": "released",
                     "released_at": "2026-10-03T00:01:00Z"})
             fence_path = store / "development/ADMISSION-FENCE.json"
             fence_path.parent.mkdir(exist_ok=True)

@@ -582,3 +582,130 @@ pozostają obecne, cudze pliki pozostają poza stagingiem tego zadania.
 Po potwierdzeniu zakończenia obcego buildu FEM zlecono nowy
 `just windows-workspace-build dev dev 3258 true`. Wynik tego buildu i
 rzeczywisty restart z kamerą wymagają odrębnego terminalnego dowodu.
+
+### Kontynuacja 14.10.2026 — utrwalony snapshot i integracja
+
+Checkpoint powyżej zapisano w commicie
+`e1ff1a7af12b7077bc6f5f6043fc061ceab4ce35`. Bezpośredni push do master
+odmówił fast-forward przez równoległe aktualizacje remote. Commit jest
+na `codex/camera-handoff-checkpoint-20261014`, PR
+[160](https://github.com/MateuszZelent/fullmag/pull/160): tylko trzy pliki
+dokumentacji, bez konfliktów, lecz CI nie pozwala uznać integracji za gotową.
+Główny dirty checkout pozostaje na master; nie scalano do niego szerokiej
+aktualizacji ani nie zmieniano cudzych plików.
+
+Build `native-build-9a26cabc0ca14011ac32330ca4c90ab7.log` utrwalił snapshot
+`acfc1505daeb0eb07850aea7179aeee0c452f95f277d307bf7e1236ab43d5630`.
+Fingerprint backendu `ae78a1a5fe3109786cfb6933dc4c6c7fc5be2230b5cdf69e9b8f5c262c2506d2`,
+inventory `02f10c90e35bcc5fd417176c66127542c9f10bdc4ece39042e96b14fcd65096f`.
+Bezpośredni odczyt obu plików ze snapshotu potwierdza warunek `compute !== null`
+oraz końcową gałąź `undefined`, z zachowaną etykietą Single process.
+Wersja pakietu `0.1.0-dev.20261013.ge1ff1a7af12b.dirty.s6137d856bd99+9782`.
+pnpm odtworzył 771 pakietów z cache, bez pobrań, w 3m 59,5s;
+to koszt przygotowania zależności, nie czas kompilacji Cargo.
+W chwili tego checkpointu build ma `running`; nie jest to PASS pakietu.
+
+Logi CI PR160 wskazują odrębne problemy w testowanym drzewie merge:
+
+- [generated-api-determinism](https://github.com/MateuszZelent/fullmag/actions/runs/38477816344/job/115572761459)
+  oraz [rust-contracts](https://github.com/MateuszZelent/fullmag/actions/runs/38477816344/job/115572760912):
+  `E0063`, `crates/fullmag-authoring/src/scene.rs:75`. `SceneDocument::default()`
+  nie inicjalizuje `antenna_port_modes`, `antenna_field_solve_stages`,
+  `antenna_target_projections`, `solved_antenna_drives`, `antenna_spectrum_requests`.
+  Odczyt źródła base `911902d6d545d1471c77290eedef1a1b6937fb62` potwierdza
+  deklaracje pięciu wektorów i brak ich inicjalizacji w Default.
+- [control-room-contracts](https://github.com/MateuszZelent/fullmag/actions/runs/38477816344/job/115572761308):
+  `ERR_PACKAGE_PATH_NOT_EXPORTED` dla `typescript/bin/tsc`,
+  `apps/control-room/scripts/typecheck-control-room.mjs:21`. Odczyt tego samego
+  base potwierdza odwołanie do nieeksportowanej ścieżki. Nie jest to wynik
+  sprawdzenia typów ani dowód naprawienia go przez lokalny f49.
+
+Nie uruchamiano ponownie CI ani kompilacji testów jednostkowych. Diagnozy
+nie oznaczają poprawienia źródeł remote; PR i rzeczywisty restart pozostają otwarte.
+
+Niezależny read-only audyt czterech dalszych jobów tego samego workflow
+potwierdził następujące granice:
+
+- `python-contracts` (job `115572761655`): dwie odrębne niespójności
+  oczekiwań `scripts/test_bootstrap_workflow_contract.py:246,299` względem
+  YAML. Test zakłada bezpośrednią kolejność kroku quantity po poprzedniku,
+  pomijając dodany krok session reachability, oraz równość liczby wystąpień
+  checkout@v7 z krokami nazwanymi Checkout (`6 != 5`). Nie naprawiono testu.
+- `checkpoint-windows-contracts` (job `115572761660`) oraz
+  `fdm-relaxation-qualification` (job `115572761217`): wspólny E0063
+  zatrzymuje kompilację. Walidator Python relaksacji ma 16 PASS, lecz test
+  Rust nie wystartował. Nie wnioskować z tego o błędzie fizyki relaksacji.
+- `browser-fixture-smoke` (job `115572761782`): build TypeScript kończy się
+  przed próbą aplikacji. Pierwsze błędy dotyczą `BufferSource` w
+  `fdmRegionMembershipCodec.ts:482` i `BlobPart` w
+  `ProjectDocumentController.ts:938`. Dalej są niespójne fixture'y scope
+  oraz brak symboli AST (`createSourceFile`, `Node`, `SyntaxKind`) w użytej
+  wersji TypeScript. Base ma 7.0.2, a HEAD dokumentacyjnego PR ma 5.8.3;
+  lokalny typecheck f49 nie kwalifikuje tego nowego toolchainu.
+
+To diagnoza logów i źródeł, bez ponowienia jobów i bez zmian zależności.
+Nie zmienia wyniku ani zakresu natywnego pakietu z snapshotu acfc.
+
+### Pakiet 94fc, desynchronizacja typów i blokada writera fixture
+
+Build acfc zakończył się `completed`, exit 0. Manifest
+`94fc81b9c323e28f93fa8549bea299ad5c380075a07714d1e71cb0fecd09d45f`,
+API `deac8a4a07a5ec128d4cd53d775ce9a4a750b34f6d1c958a1e865d3e1724a7b3`,
+CLI `8799d7b22531eef75d342dff57d8b8da628977266a59a39d6c290749c5207a83`,
+desktop `09f17b743276933323bc9bc15613d484747085717d3ce43fa8cd79773cc8c0ce`.
+Source snapshot `6137d856bd9995b4b75cf6a41d4ead7bade7b090198ba26110df6a97897a627b`.
+Fazy Cargo: API/CLI 4m 28s, desktop 1m 30s; to nie cały koszt przygotowania.
+
+Próba browser `57e2b855f74948a9bf510fb5f3ca326b`: failed przed UI,
+18/18 procesów odebranych. Nowa diagnoza:
+`computeNodeInventory.ts(382,40) TS2339`, brak `node_policy` w wygenerowanym
+typie odpowiedzi. Poprzednie dwie poprawki były obecne w snapshocie.
+Wynik nie obejmuje capture ani restartu.
+
+Pełna bramka API `9467e0693243475491737c29e57b778e` wykonała 290 kontroli,
+po czym zakończyła się failed przez WinError 10054. Wszystkie 97 procesów
+ma waited=true. Przyczyna źródłowa w `preparation.stderr.log`:
+`preparation resource lease file name must end in .json`.
+Fixture publikował lease przez Python `atomic_json` bez natywnej blokady;
+scheduler mógł zobaczyć tymczasowy `.<name>.<uuid>.tmp`. Nie jest to dowód
+naprawienia lub awarii fizyki ani PASS całej bramki.
+
+Poprawiono tylko publikację własnych fixture w weryfikatorze: istniejący
+`WRITER.lock`, `r+b`, bounded retry, 1 bajt od offsetu 0; odczyt dokładnego
+deskryptora `fullmag.writer.lock.v1\n`. `mkdir` i zapisy active/released są
+pod blokadą, release następuje przed zapytaniem `drain_idle_confirmed`.
+Nie tworzono ani nie naprawiano deskryptora i nie zmieniono walidatora Rust.
+Review potwierdził, że legacy scheduler i idle fence skanują lease'y pod
+`write_transaction()`; nie znalazł P0/P1/P2 w poprawce i jej regresjach.
+
+`just verify-windows-development-handoff`: PASS, exit 0, 186 kontroli,
+receipt `900fb3ed7e7e4659b95a51210d70c635`. Fingerprint before/after
+`78d8bb0cf05b61ea73302cc76a3af343e431bbc62d4595c3a89304542da3a8dc`.
+Pięć nowych kontroli używa rzeczywistych Windows locks i sprawdza blokadę
+podczas publikacji, oczekiwanie na konkurenta, cleanup po błędzie,
+odmowę brakującego/niepoprawnego deskryptora i ścieżki spoza własnego store.
+Nie kompilowano testów natywnych. Pełna bramka API po poprawce zakończyła
+się PASS: receipt `ee9dc8ae88c840b09716322aba936a9c`, exit 0,
+301 kontroli i 98/98 procesów z waited=true (0 nieodebranych).
+Wynik dotyczy zamrożonego pakietu 94fc i poprawionego weryfikatora;
+nie zastępuje dowodu odtworzenia kamery w rzeczywistej przeglądarce.
+
+Odrębna bramka `verify-windows-project-document-frozen` na 94fc: PASS,
+33 kontrole, 6/6 procesów odebranych, receipt
+`26329c681a074c8294d2a1685d1d90ce`. Kanoniczny eksport OpenAPI exit 0,
+SHA256 `75f4aba5570a6edc7955cd651d839d77b381721f2d17c7d71240d22289770687`.
+Zakres runtime-free archive i eksportu nie zastępuje pełnego service gate.
+
+Importowano kontrakt przez `generate-openapi-v2.mjs --input --native-receipt`,
+z jawnym e1ff i snapshotem 6137, bez Cargo fallbacku. Poprzednie cztery
+artefakty zachowano w `contracts-before-sync` pod receipt 26329.
+Nie zmieniono zestawu endpointów; różnice schematów dotyczą
+ComputeNodeResource/ComputeNodePolicyResource. `just generate-control-room-client`
+PASS (`adbccec0f42745918811aa2094077c20`). `node_policy` jest teraz
+optional/nullable w wygenerowanym typie. Artefakty pozostają częścią
+cudzej niezacommitowanej implementacji; nie stage'owano całych tych plików.
+
+Production typecheck PASS, exit 0, `13d3c33c7a3643ec8f9b3719e05a04c8`,
+before/after `7160cc932c63c402d90b5472cc6dd80562501fed7c27e7145c209544946f49cf`.
+Nie zmienia to wyniku próby 57e2 ani nie kwalifikuje TypeScript 7 z remote.
+Nowy snapshot frontendu i rzeczywiste odtworzenie kamery nadal są wymagane.

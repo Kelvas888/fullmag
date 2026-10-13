@@ -57,6 +57,8 @@ SOURCE_PATHS = (
     "scripts/test_windows_development_handoff.py",
     "scripts/test_verify_development_handoff.py",
     "scripts/verify_development_handoff.py",
+    "scripts/verify_development_backend_api.py",
+    "scripts/test_windows_development_fixture_publication.py",
     "scripts/fullmag_storage.py",
     "scripts/windows/runtime_bundle.py",
     "scripts/windows/compiler_inputs.py",
