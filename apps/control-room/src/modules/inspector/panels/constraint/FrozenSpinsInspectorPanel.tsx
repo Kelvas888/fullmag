@@ -681,7 +681,7 @@ export function FrozenSpinsEditor({
             {pendingField === "preview" ? "Computing preview…" : "Preview mask"}
           </Button>
           <Button
-            disabled={toolbarPending}
+            disabled={toolbarPending || !dirty}
             size="sm"
             type="button"
             onClick={() => void applyDraft()}
@@ -1001,6 +1001,7 @@ function TextInput({
       <input
         aria-label={label}
         className="fm-inspector-input"
+        type="text"
         value={value}
         onChange={(event) => onChange(event.target.value)}
       />

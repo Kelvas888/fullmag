@@ -206,3 +206,32 @@ do c496af jest pusty, a PR150 nie zmienia backendu. Obecny log nie zawiera
 response body błędu500, więc dokładna przyczyna nadal NOT VERIFIED.
 Nie zmieniono backendu ani asercji Rust; kolejny automatyczny przebieg CI
 zweryfikuje poprawione testy frontendu i dostarczy nowej obserwacji tej bramki.
+
+## CI 3139a2b8e i pozostałe regresje
+
+Commit3139a2b8ed6c018f7a5a498d6c023191e8eca168 wysłano do PR150.
+Run38383772022: oba browser smoke PASS; generated-api, Python, FDM
+i API hygiene PASS. control-room-contracts: 7588 PASS, 8 FAIL, 13 skipped
+(2 failed files), typecheck/lint PASS. Rust job115250378604 nadal live
+podczas diagnozy.
+
+Receipt najnowszego Inspector fixture: merge-ref
+a8d74f5e4cfd7177dc60fceb6c709a1770d55f50, rodzice
+becaf9e8f183b80413f02d181d5a56763e925c57 i3139a2b8e. Wszystkie11
+SHA256/size zgodne; źródła przed/po mają identyczny digest
+0c91e9b71927cd78f055ec0a67bc2145b949e49e3d9e5212d1f9d27dc2184f8d.
+Server terminal=true. 7 scenariuszy PASS; callback fixture, bez backend API E2E.
+
+Pozostały test monitora potwierdził zachowanie Later edit po ACK, lecz jego
+drugi mock zwracał rewizję8 po potwierdzonej9. Sekwencję poprawiono: ACK9
+odzwierciedla wysłaną definicję domain, Revert ją przywraca, nowa edycja
+magnetic_domain zapisuje z base9 i otrzymuje ACK10. Zachowano asercje
+nowego szkicu, dwóch zapisów i czystej sesji po drugim ACK.
+
+Frozen Spins: wcześniejsza diagnoza samych mocków była niepełna. Lokalny
+Apply był wizualnie aktywny mimo clean draft; teraz uwzględnia !dirty.
+Name input ma jawny type=text, dzięki czemu fixture DOM/React rozpoznaje
+zdarzenie input. Asercja disabled przed edycją i enabled po edycji dowodzi
+aktualizacji stanu zamiast samej wartości DOM. Kontrole session/history
+i nowszej edycji pozostają zachowane. git diff --check PASS; lokalnych
+testów/kompilacji nie uruchomiono. Nowy przebieg CI wymagany przed integracją.

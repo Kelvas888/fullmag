@@ -351,7 +351,7 @@ describe("PlanarMonitorInspectorPanel", () => {
       expect(controlValue(findControl(container, "Name"))).toBe("Later edit");
       expect(planarMonitorFramePreviewStore.getDraftSnapshot()?.monitor.name).toBe("Later edit");
       await act(async () => {
-        finishPatch?.({ monitor: { ...monitorFixture }, scene_revision: 9 });
+        finishPatch?.({ monitor: uiRoundtripFixture().patch, scene_revision: 9 });
         await patchResult;
       });
       expect(controlValue(findControl(container, "Name"))).toBe("Later edit");
@@ -359,8 +359,17 @@ describe("PlanarMonitorInspectorPanel", () => {
 
       await act(async () => findButton(container, "Discard").click());
       expect(findSessionProbe(container).textContent).toBe("staged:false");
-      await act(async () => change(findControl(container, "Target kind"), "domain"));
+      expect(controlValue(findControl(container, "Target kind"))).toBe("domain");
+      mocks.patch.mockResolvedValueOnce({ monitor: { ...monitorFixture }, scene_revision: 10 });
+      await act(async () => change(findControl(container, "Target kind"), "magnetic_domain"));
+      expect(findSessionProbe(container).textContent).toBe("staged:true");
       await act(async () => findButton(container, "Apply").click());
+      expect(mocks.patch).toHaveBeenLastCalledWith(
+        "plane-1",
+        expect.objectContaining({ expected_scene_revision: 9 }),
+        { baseRevision: 9, sessionScopeKey: sessionAScopeKey },
+      );
+      expect(mocks.patch).toHaveBeenCalledTimes(2);
       expect(findSessionProbe(container).textContent).toBe("staged:false");
     } finally {
       await act(async () => root.unmount());
