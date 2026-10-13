@@ -172,3 +172,10 @@ Bieżący etap nie zamyka całego R0/R1; audyt pozostaje w dokumentacji PR150.
 - Architecture/API hygiene uruchomione z apps/control-room PASS, diff-check PASS. Unit/DOM/typecheck/browser/WebGL po zmianie NOT VERIFIED; lokalnie nie kompilowano testów. Pierwsze wywołanie architecture z root miało błędny cwd, nie dowodziło awarii aplikacji.
 - Rust: session_checkpoint_create_captures_live_magnetization zwraca500 session store writer is busy (969 PASS/1 FAIL/3 ignored); diagnoza osobna. Python: test_multi_object_sizing_cylinder_and_waveguide odrzuca component_aware zamiast conformal_occ po trzech odrzuceniach degenerate tetra volume; nie osłabiono asercji ani progu jakości.
 - Niezacommitowany PR04 unit kernel/UI zachowany, nie włączany do commita dispatchu. Pełny R0/R1 (units consumers, durable receipts, generation/publication i kwalifikacja) pozostaje aktywny; merge wymaga zielonych kontroli i review.
+
+## PR04 — kernel metadata jednostek, etap pomocniczy
+
+- objectEditTypes definiuje opcjonalne quantityFields per scalar/axis: wybrana jednostka długości i lastValidSI; raw nadal źródłem tekstu, status/parsedSI są pochodne. Brak metadata oznacza m.
+- quantityDraftFields udostępnia immutable raw update, domain-aware parse, unit change zachowujące SI i canonicalDraftInSelectedUnits dla ACK. Overflow formatowania zachowuje jawne SI z sufiksem m. Invalid/incomplete nie zmienia lastValidSI i blokuje tylko unit selector danego pola.
+- Regresje źródłowe: roundtrip nm/um/m, pole/osiowa izolacja, invalid/incomplete/domain guard, overflow ACK i niemutowalność. Niezależny review helpera bez actionable findings; root sprawdził API i kod. Diff-check PASS. Testy/typecheck/browser NOT VERIFIED, nie uruchamiano kompilacji.
+- Ten etap nie kończy PR04. Konsumenci payload/preview/equality/rebase w realizacji; root integruje ACK/refresh/reset, gest i kontrolki. Nie pushujemy pomocniczego commita przed otrzymaniem bieżącego CI be015852 dla dispatchu, aby zachować dowód tego źródła.
