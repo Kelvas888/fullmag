@@ -1,6 +1,7 @@
 name: FEM native failure receipt observation contracts
 
 on:
+  workflow_call:
   workflow_dispatch:
 
 permissions:
