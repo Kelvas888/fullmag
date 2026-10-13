@@ -10,6 +10,7 @@ import ctypes
 from ctypes import wintypes
 import copy
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -61,6 +62,36 @@ def utc_ms():
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def camera_for_proof(value):
+    """Require the exact camera contract; never normalize a lost view to defaults."""
+    fields = {"projection", "position", "target", "up", "fov_degrees", "orthographic_scale"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise storage.StorageError("Camera proof has an incomplete or foreign camera")
+
+    def finite_number(number):
+        return type(number) in (int, float) and math.isfinite(number)
+
+    if value["projection"] not in ("perspective", "orthographic"):
+        raise storage.StorageError("Camera proof has an invalid projection")
+    for field in ("position", "target", "up"):
+        vector = value[field]
+        if not isinstance(vector, list) or len(vector) != 3 or not all(map(finite_number, vector)):
+            raise storage.StorageError("Camera proof has an invalid vector")
+    fov, scale = value["fov_degrees"], value["orthographic_scale"]
+    if (not finite_number(fov) or not 0 < fov < 180
+            or (scale is not None and (not finite_number(scale) or scale <= 0))):
+        raise storage.StorageError("Camera proof has an invalid projection parameter")
+    return copy.deepcopy(value)
+
+
+def validate_camera_preservation(before, after):
+    expected, observed = camera_for_proof(before), camera_for_proof(after)
+    changed = sorted(key for key in expected if expected[key] != observed[key])
+    if changed:
+        raise storage.StorageError("Native restart changed the captured camera: " + ", ".join(changed))
+    return {"preserved": True, "before": expected, "after": observed}
 
 
 def scene_after_successful_grid(scene):
@@ -935,6 +966,9 @@ class ProofBridge:
                 or type(identity.get("session_epoch")) is not int):
             raise storage.StorageError("Nonempty browser scene has no exact workspace identity")
         session_scope = read_session_scope(self.api_port, proof["api_instance_id"], identity)
+        camera = camera_for_proof(read_api(
+            self.api_port, proof["api_instance_id"], "/v2/sessions/current/visualization/state"
+        ).get("camera"))
         admission = read_admission_observation(self.api_port, proof["api_instance_id"])
         if (admission["scope"]["session_id"] != identity["session_id"]
                 or admission["scope"]["session_resource_epoch"] != session_scope["session_resource_epoch"]
@@ -946,7 +980,7 @@ class ProofBridge:
             if self.before is not None:
                 raise storage.StorageError("Browser before-capture is immutable")
             self.before = {**body, "scene": scene, "identity": identity, "session_scope": session_scope,
-                           "admission_observation": admission}
+                           "admission_observation": admission, "camera": camera}
             self.receipt["workspace_browser_before"] = copy.deepcopy(self.before)
             if self.receipt_path is not None:
                 storage.atomic_json(self.receipt_path, self.receipt)
@@ -966,6 +1000,9 @@ class ProofBridge:
                 or canonical(body["project_document_before"]) != canonical(before["project_document_before"])
                 or canonical(body["project_document_after"]) != canonical(before["project_document_after_grid"])):
             raise storage.StorageError("Browser hydration does not preserve the captured draft and new pin")
+        camera_evidence = validate_camera_preservation(before["camera"], read_api(
+            self.api_port, body["new_api_instance_id"], "/v2/sessions/current/visualization/state"
+        ).get("camera"))
         execution = self.execution()
         scene = read_api(self.api_port, body["new_api_instance_id"], "/v2/sessions/current/model/scene")
         backend = read_api(self.api_port, body["new_api_instance_id"], "/v2/platform/development-backend")
@@ -987,6 +1024,7 @@ class ProofBridge:
                 raise storage.StorageError("Browser proof cancellation has already been submitted")
             if self.browser is not None:
                 raise storage.StorageError("Browser finish has already been submitted")
+            self.receipt["workspace_browser_camera"] = camera_evidence
             self.browser = {**body, "scene_sha256": hashlib.sha256(canonical(scene).encode()).hexdigest(),
                             "identity": identity, "session_scope": session_scope}
             self.process.stdin.write((canonical(command) + "\n").encode())

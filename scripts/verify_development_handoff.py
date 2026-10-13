@@ -70,6 +70,7 @@ SOURCE_PATHS = (
     "scripts/windows/verify_workspace_browser.py",
     "scripts/test_windows_development_scratch_process_frames.py",
     "scripts/test_windows_development_admission_observation.py",
+    "scripts/test_windows_development_camera_proof.py",
     "scripts/just_storage_shell.sh",
     "justfile",
 )

@@ -40,6 +40,10 @@ class AdmissionObservationChecks(unittest.TestCase):
                         return {"workspace_identity": identity}
                     if path.endswith("/status"):
                         return status
+                    if path.endswith("/visualization/state"):
+                        return {"camera": {"projection": "orthographic", "position": [2, 1, 2],
+                            "target": [0, 0, 0], "up": [0, 0, 1], "fov_degrees": 45,
+                            "orthographic_scale": None}}
                     if path.endswith("/meshing/semantics"):
                         return {"mesh_build_diagnostics": {"last_build_error": None}}
                     self.fail("Unexpected API read: " + path)
