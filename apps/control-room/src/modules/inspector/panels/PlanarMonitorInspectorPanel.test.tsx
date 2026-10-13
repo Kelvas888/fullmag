@@ -348,6 +348,8 @@ describe("PlanarMonitorInspectorPanel", () => {
       );
 
       await act(async () => change(findControl(container, "Name"), "Later edit"));
+      expect(controlValue(findControl(container, "Name"))).toBe("Later edit");
+      expect(planarMonitorFramePreviewStore.getDraftSnapshot()?.monitor.name).toBe("Later edit");
       await act(async () => {
         finishPatch?.({ monitor: { ...monitorFixture }, scene_revision: 9 });
         await patchResult;
@@ -458,6 +460,14 @@ function controlValue(control: TestElement): string {
 }
 
 function change(element: TestElement, value: string): void {
+  if (element.tagName === "INPUT") {
+    // Bypass React's value tracker, as a browser keystroke does.
+    const nativeValueSetter = Object.getOwnPropertyDescriptor(TestElement.prototype, "value")?.set;
+    if (!nativeValueSetter) throw new Error("Missing native test input value setter");
+    nativeValueSetter.call(element, value);
+    element.dispatchEvent(new TestEvent("input", { bubbles: true }));
+    return;
+  }
   element.value = value;
   element.dispatchEvent(new TestEvent("change", { bubbles: true }));
 }

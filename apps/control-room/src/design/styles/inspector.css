@@ -827,16 +827,6 @@
   background: var(--fm-bg-chrome);
 }
 
-.fm-inspector__action-tooltip-target {
-  display: flex;
-  width: 100%;
-}
-
-.fm-inspector__action-tooltip-target > .fm-inspector__action-btn,
-.fm-inspector__action-tooltip-target > button {
-  width: 100%;
-}
-
 .fm-inspector__action-btn--apply.fm-button--primary {
   background: var(--fm-accent) !important;
   border-color: var(--fm-accent) !important;

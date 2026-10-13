@@ -170,3 +170,25 @@ synchronizują refs po każdym commitcie, więc usunięto pozornie stabilne
 deps arrays, zachowując semantykę i threshold max-warnings=0.
 React Doctor CI: 22 warnings, score84, bez nowych error findings; wynik
 advisory nie jest deklaracją zero warnings. Nie tłumiono reguł ani diagnostyk.
+
+## Diagnoza końcowego CI c496af
+
+Run 38381937823 zakończony: oba browser smoke PASS, Python, FDM,
+generated-api i API hygiene PASS. control-room-contracts: typecheck i lint
+PASS, testy FAIL (29); rust-contracts: 967 PASS, 1 FAIL, 3 ignored w grupie
+API — capture resolved_device zwrócił 500 zamiast 200. Diagnoza Rust trwa;
+nie uznano tego za flake ani nie osłabiono bramki.
+
+Poprawki konfiguracji testów CrossSection i PlanarMonitorDraft zachowują
+oryginalne eksporty KernelContext oraz montują rzeczywiste providery kernela
+i sesji Inspectora. Test późniejszej edycji PlanarMonitor używa natywnego
+settera i zdarzenia input dla pola tekstowego zamiast zdarzenia select;
+dodatkowa asercja potwierdza draft przed ACK. Zachowano wymaganie, że ACK
+nie kasuje późniejszej edycji.
+
+Usunięto nieużywane selektory dawnego tooltip wrappera stopki. Kontrakt CSS
+sprawdza obecny wrapping kontrolek i osobny wiersz feedbacku, zgodny z
+wcześniej zweryfikowanym wąskim fixture. git diff --check PASS; lokalnych
+testów/kompilacji nie uruchamiano. Wykonanie poprawionych testów pozostaje
+NOT VERIFIED do następnego CI. Pozostałe błędy Frozen Spins/regionów diagnozuje
+oddzielny worker; zakres R0/R1 nadal nieukończony.
