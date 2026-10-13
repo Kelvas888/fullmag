@@ -6132,8 +6132,15 @@ Residual odczytany z EPS/KSP nie zastępuje tych niezależnych residualów.
 Certyfikowane recovery testujemy na payload-only sparse Floquet owner lane,
 z rzeczywistym PREONLY/PCSHELL transportem, inner GMRES/LU, ponownym pomiarem
 true residual względem oryginalnego przesuniętego operatora i RHS oraz pełnym
-budżetem. Wymóg co najmniej jednego odzyskanego solve odnosi się wyłącznie do
-tego lane; nie sumujemy niecertyfikowanych dense solve jako dowodu recovery.
+budżetem. Naturalny solve może poprawnie zakończyć się bez breakdown; jego
+licznik recovery jest wtedy telemetryką, a nie warunkiem fizycznej poprawności.
+Osobny deterministyczny fixture algebraiczny wywołuje ten sam sparse recovery
+owner: testowy callback najpierw deleguje do produkcyjnego pomiaru, następnie
+jednokrotnie wymusza BREAKDOWN po zmierzonym strict progress. Rzeczywisty
+KSPSolve musi odzyskać rozwiązanie w oryginalnym budżecie i przejść niezależne
+b-Ax. Wymóg odzyskanego solve pozostaje obowiązkowy w tym fixture; nie
+sumujemy niecertyfikowanych dense solve jako dowodu recovery. Kontrolowany
+trigger nie jest dowodem naturalnego wystąpienia happy breakdown w FEM.
 
 Test mixed nie może żądać ani syntetyzować sparse recovery JSON dla dense LU.
 Sprawdza natomiast prawdziwy adapter, jego preonly/lu provenance i brak
@@ -6151,3 +6158,4 @@ kwalifikacji dynamic demag, DE/BV lub A1.
 |---|---|---|
 | `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md` | `DOC-ANCHOR:g5-sparse-recovery-dense-bridge-boundary` | Zatwierdzony kontrakt; runtime do oddzielnej weryfikacji |
 | `backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp` | `void modal_shared_domain_floquet_mixed_dense_real_split_contract` | Oddzielny sparse recovery i caller-dense descriptor validation |
+| `backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp` | `void modal_certified_recovery_controlled_breakdown_contract` | Deterministyczny rzeczywisty sparse-owner recovery i niezależny residual |

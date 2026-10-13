@@ -4590,6 +4590,12 @@
       "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
       "symbol": "void modal_shared_domain_floquet_mixed_dense_real_split_contract",
       "responsibility": "Sparse owner recovery certificate and count; separate caller-authoritative dense full descriptor residuals without fake certificate"
+    },
+    {
+      "id": "source-g5-controlled-sparse-recovery-test",
+      "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+      "symbol": "void modal_certified_recovery_controlled_breakdown_contract",
+      "responsibility": "Test-only measured breakdown, actual sparse-owner recovery in the original iteration budget, and independent final b-Ax; not evidence of incidental FEM breakdown"
     }
   ],
   "public_api": {

@@ -4859,8 +4859,9 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
           "invalid legacy dense dimensions do not publish solve progress");
     fullmag_fem_frequency_domain_result_destroy(&legacy_dimension_result);
     if (require_certified_recovery) {
-        check(sparse_recovered_solve_count > 0.0,
-              "the payload-only sparse Floquet result actually recovers at least one rejected happy breakdown");
+        std::printf(
+            "INFO: payload-only sparse natural recovered_solve_count=%.0f; incidental_recovery_not_required\n",
+            sparse_recovered_solve_count);
     }
 #else
     std::printf("SKIP: modal_shared_domain_floquet_mixed_dense_real_split_requires_mfem_slepc\n");
@@ -10282,6 +10283,78 @@ void modal_poisson_iteration_policy_preserves_lane_defaults()
 }
 
 #if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
+struct ControlledRecoveryBreakdownTrigger {
+    fd::detail::FloquetShiftedKspTrueConvergenceContext *true_context = nullptr;
+    bool injected = false;
+    bool candidate_provenance_valid = false;
+    std::uint64_t attempt_id = 0;
+    std::uint64_t callback_ordinal = 0;
+    PetscInt iteration = -1;
+    PetscReal rhs_norm = std::numeric_limits<PetscReal>::quiet_NaN();
+    PetscReal residual_norm = std::numeric_limits<PetscReal>::quiet_NaN();
+    PetscReal threshold = std::numeric_limits<PetscReal>::quiet_NaN();
+};
+
+thread_local ControlledRecoveryBreakdownTrigger *g_controlled_recovery_breakdown = nullptr;
+
+PetscErrorCode controlled_recovery_breakdown_convergence_test(
+    KSP ksp,
+    PetscInt iteration,
+    PetscReal recursive_residual_norm,
+    KSPConvergedReason *reason,
+    void *raw_context)
+{
+    const PetscErrorCode error = fd::detail::floquet_shifted_true_convergence_test(
+        ksp, iteration, recursive_residual_norm, reason, raw_context);
+    if (error != PETSC_SUCCESS) {
+        return error;
+    }
+    auto *trigger = g_controlled_recovery_breakdown;
+    auto *context =
+        static_cast<fd::detail::FloquetShiftedKspTrueConvergenceContext *>(raw_context);
+    if (trigger == nullptr || context == nullptr ||
+        trigger->true_context != context || trigger->injected || reason == nullptr) {
+        return PETSC_SUCCESS;
+    }
+
+    const bool current_measured_progress =
+        iteration > 0 && *reason == KSP_CONVERGED_ITERATING &&
+        context->last_true_probe_available &&
+        context->last_true_probe_reason_after_gate_available &&
+        context->last_true_probe_reason_after_gate == KSP_CONVERGED_ITERATING &&
+        context->last_true_probe_iteration == iteration &&
+        context->owned_true_probe_solution_available &&
+        context->owned_true_probe_attempt_id == context->current_inner_attempt_id &&
+        context->owned_true_probe_callback_ordinal == context->callback_count &&
+        context->last_true_probe_callback_ordinal == context->callback_count &&
+        context->last_true_solution_norm_available &&
+        std::isfinite(static_cast<double>(context->last_true_rhs_norm)) &&
+        std::isfinite(static_cast<double>(context->last_true_residual_norm)) &&
+        std::isfinite(static_cast<double>(context->last_true_residual_threshold)) &&
+        context->last_true_residual_norm >
+            context->last_true_residual_threshold &&
+        context->last_true_residual_norm < context->last_true_rhs_norm;
+    if (!current_measured_progress) {
+        return PETSC_SUCCESS;
+    }
+
+    trigger->attempt_id = context->owned_true_probe_attempt_id;
+    trigger->callback_ordinal = context->owned_true_probe_callback_ordinal;
+    trigger->iteration = context->owned_true_probe_iteration;
+    trigger->rhs_norm = context->last_true_rhs_norm;
+    trigger->residual_norm = context->last_true_residual_norm;
+    trigger->threshold = context->last_true_residual_threshold;
+    trigger->candidate_provenance_valid =
+        trigger->attempt_id == context->current_inner_attempt_id &&
+        trigger->callback_ordinal == context->callback_count &&
+        trigger->iteration == iteration &&
+        trigger->residual_norm > trigger->threshold &&
+        trigger->residual_norm < trigger->rhs_norm;
+    trigger->injected = true;
+    *reason = KSP_DIVERGED_BREAKDOWN;
+    return PETSC_SUCCESS;
+}
+
 struct AlgebraicCertifiedRecoveryFixture {
     Mat operator_matrix = nullptr;
     Mat preconditioner_matrix = nullptr;
@@ -10336,7 +10409,9 @@ void initialize_algebraic_certified_recovery_fixture(
           "create the real production true-convergence callback context");
     fixture.true_context.reset(raw_context);
     check(KSPSetConvergenceTest(
-              fixture.inner, fd::detail::floquet_shifted_true_convergence_test,
+              fixture.inner, (g_controlled_recovery_breakdown == nullptr
+                   ? fd::detail::floquet_shifted_true_convergence_test
+                   : controlled_recovery_breakdown_convergence_test),
               raw_context, fd::detail::destroy_floquet_shifted_ksp_true_convergence_context) == PETSC_SUCCESS,
           "install the production true-residual gate on the inner engine");
     PC outer_pc = nullptr;
@@ -10611,6 +10686,114 @@ void modal_certified_recovery_exact_threshold_contract()
           "release the safe isolated exact-threshold fixture");
     std::printf("PASS: algebraic_certified_recovery_exact_threshold\n");
 }
+
+void modal_certified_recovery_controlled_breakdown_contract()
+{
+    std::lock_guard<std::mutex> lock(fullmag::fem::runtime::petsc_slepc_process_mutex());
+    PetscBool was_initialized = PETSC_FALSE;
+    check(PetscInitialized(&was_initialized) == PETSC_SUCCESS,
+          "inspect PETSc lifecycle before the controlled-recovery fixture");
+    const bool initialized_here = was_initialized == PETSC_FALSE;
+    if (initialized_here) {
+        check(PetscInitializeNoArguments() == PETSC_SUCCESS,
+              "initialize PETSc for the deterministic recovery case");
+    }
+
+    ControlledRecoveryBreakdownTrigger trigger{};
+    g_controlled_recovery_breakdown = &trigger;
+    AlgebraicCertifiedRecoveryFixture fixture{};
+    initialize_algebraic_certified_recovery_fixture(fixture, 8);
+    trigger.true_context = fixture.true_context.get();
+
+    check(KSPSolve(fixture.outer, fixture.rhs, fixture.solution) == PETSC_SUCCESS,
+          "the recovery owner resumes after one measured test-triggered breakdown");
+    g_controlled_recovery_breakdown = nullptr;
+
+    const auto *snapshot =
+        fd::detail::floquet_shifted_ksp_certified_recovery_snapshot(fixture.owner);
+    Vec independent_residual = nullptr;
+    PetscReal rhs_norm = std::numeric_limits<PetscReal>::quiet_NaN();
+    PetscReal residual_norm = std::numeric_limits<PetscReal>::quiet_NaN();
+    check(VecDuplicate(fixture.rhs, &independent_residual) == PETSC_SUCCESS &&
+              VecNorm(fixture.rhs, NORM_2, &rhs_norm) == PETSC_SUCCESS &&
+              MatMult(fixture.operator_matrix, fixture.solution,
+                      independent_residual) == PETSC_SUCCESS &&
+              VecAYPX(independent_residual, static_cast<PetscScalar>(-1.0),
+                      fixture.rhs) == PETSC_SUCCESS &&
+              VecNorm(independent_residual, NORM_2, &residual_norm) == PETSC_SUCCESS,
+          "independently recompute b-Ax from the returned algebraic solution");
+    const PetscReal unchanged_threshold = 1.0e-12 * rhs_norm;
+    const bool recognized_certificate =
+        snapshot != nullptr &&
+        (std::strcmp(snapshot->certificate_source,
+                     "owner_recomputed_true_residual") == 0 ||
+         std::strcmp(snapshot->certificate_source,
+                     "owner_recomputed_owned_true_probe_cache") == 0);
+    const bool recognized_candidate_source =
+        snapshot != nullptr &&
+        (std::strcmp(snapshot->last_candidate_source,
+                     "owned_true_probe_cache") == 0 ||
+         std::strcmp(snapshot->last_candidate_source,
+                     "committed_inner_solution") == 0);
+    check(trigger.injected && trigger.candidate_provenance_valid &&
+              trigger.attempt_id == 1u && trigger.callback_ordinal > 0u &&
+              trigger.iteration > 0 &&
+              std::isfinite(static_cast<double>(trigger.rhs_norm)) &&
+              std::isfinite(static_cast<double>(trigger.residual_norm)) &&
+              std::isfinite(static_cast<double>(trigger.threshold)) &&
+              trigger.residual_norm > trigger.threshold &&
+              trigger.residual_norm < trigger.rhs_norm,
+          "one-shot wrapper injects BREAKDOWN only after a measured current-attempt strict-progress candidate");
+    check(snapshot != nullptr && snapshot->last_certified &&
+              snapshot->last_recovered &&
+              snapshot->recovered_solve_count == 1u &&
+              snapshot->recovery_attempt_count > 0u &&
+              snapshot->last_cycle_count >= 2 &&
+              snapshot->last_failed_inner_reason_available &&
+              snapshot->last_failed_inner_reason == KSP_DIVERGED_BREAKDOWN &&
+              snapshot->last_failed_inner_iterations == trigger.iteration &&
+              snapshot->original_max_iterations == 8 &&
+              snapshot->last_cumulative_iterations > 0 &&
+              snapshot->last_cumulative_iterations <= snapshot->original_max_iterations &&
+              snapshot->max_cumulative_iterations_per_solve <=
+                  snapshot->original_max_iterations &&
+              recognized_certificate && recognized_candidate_source &&
+              snapshot->last_candidate_iteration > 0 &&
+              snapshot->last_terminal_iteration >=
+                  snapshot->last_candidate_iteration,
+          "the real recovery owner records the failed attempt, retries within the original budget, and publishes candidate provenance plus a certificate");
+    check(std::isfinite(static_cast<double>(rhs_norm)) &&
+              std::isfinite(static_cast<double>(residual_norm)) &&
+              residual_norm <= unchanged_threshold &&
+              snapshot != nullptr && snapshot->final_residual_available &&
+              std::abs(snapshot->final_residual - residual_norm) <=
+                  std::numeric_limits<PetscReal>::epsilon() *
+                      std::max<PetscReal>(1.0, residual_norm) * 8.0,
+          "independent final b-Ax residual satisfies the unchanged 1e-12 relative threshold and matches the owner report");
+
+    check(VecDestroy(&independent_residual) == PETSC_SUCCESS &&
+              KSPDestroy(&fixture.outer) == PETSC_SUCCESS &&
+              KSPDestroy(&fixture.inner) == PETSC_SUCCESS,
+          "destroy the recovery owner and callback without transferring context ownership");
+    fixture.true_context.reset();
+    check(VecDestroy(&fixture.rhs) == PETSC_SUCCESS &&
+              VecDestroy(&fixture.solution) == PETSC_SUCCESS &&
+              MatDestroy(&fixture.operator_matrix) == PETSC_SUCCESS &&
+              MatDestroy(&fixture.preconditioner_matrix) == PETSC_SUCCESS,
+          "release the independently owned algebraic fixture resources");
+    if (initialized_here) {
+        check(fullmag::fem::runtime::petsc_slepc_global_finalization_allowed_locked() &&
+                  PetscFinalize() == PETSC_SUCCESS,
+              "finalize PETSc only when this test initialized it and the runtime permits finalization");
+    }
+    std::printf(
+        "PASS: algebraic_certified_recovery_controlled_breakdown attempt=%llu iteration=%d residual=%.17g threshold=%.17g\n",
+        static_cast<unsigned long long>(trigger.attempt_id),
+        static_cast<int>(trigger.iteration),
+        static_cast<double>(trigger.residual_norm),
+        static_cast<double>(trigger.threshold));
+}
+
 #endif
 
 } // namespace
@@ -10621,6 +10804,7 @@ int main(int argc, char **argv)
         std::strcmp(argv[1], "--floquet-certified-recovery-mixed") == 0) {
 #if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
         modal_shared_domain_floquet_mixed_dense_real_split_contract(true);
+        modal_certified_recovery_controlled_breakdown_contract();
         std::printf("PASS: native_floquet_mixed_4x4_certified_recovery\n");
         return 0;
 #else
