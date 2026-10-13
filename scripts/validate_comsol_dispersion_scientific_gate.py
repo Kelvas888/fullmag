@@ -5240,6 +5240,13 @@ def validate_case(
         )
         for key in ("mesh", "airbox", "mode_count")
     }
+    finite_check = _new_check(
+        "pass" if not any("non-finite" in reason for reason in reasons) else "fail",
+        sample_count=len(sample_map),
+        mode_count=len(mode_map),
+    )
+    campaign_contract_status = "pass" if not reasons else "fail"
+    # Signed-k proof is also a scientific gate, separate from the primary campaign contract.
     signed_k_check = _validate_signed_k_replay(
         case_dir,
         case,
@@ -5255,12 +5262,6 @@ def validate_case(
         quality_mode_map,
         reasons,
     )
-    finite_check = _new_check(
-        "pass" if not any("non-finite" in reason for reason in reasons) else "fail",
-        sample_count=len(sample_map),
-        mode_count=len(mode_map),
-    )
-    campaign_contract_status = "pass" if not reasons else "fail"
     # External COMSOL proof is a scientific gate after the source/campaign contract.
     comsol_reference_check = (
         _validate_a1_comsol_reference(case_dir, evidence, parameters or {}, sample_map, reasons)
