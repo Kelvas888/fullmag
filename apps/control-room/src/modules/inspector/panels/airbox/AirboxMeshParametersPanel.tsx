@@ -16,6 +16,7 @@ import {
   MESH_UNIVERSE_POLICY_RESOURCE_KEY,
   useUniverseMeshPolicyResource,
 } from "@/kernel/resources/geometryLifecycleResources";
+import { publishCommittedMeshPolicyResource } from "@/kernel/resources/meshPolicyResourceCache";
 import { Button } from "@/shared/ui/Button";
 
 import {
@@ -33,6 +34,7 @@ import {
   updateInspectorDraftState,
   type InspectorDraftState,
 } from "../inspectorDraftState";
+import { FemMeshReadinessGuideCard } from "../mesh-guide/FemMeshReadinessGuideCard";
 import {
   AIRBOX_GRADING_MODES,
   airboxMeshPolicyDraftDirty,
@@ -40,6 +42,7 @@ import {
   updateAirboxMeshPolicyDraft,
   buildAirboxMeshPolicyReplaceRequest,
   defaultUniverseMeshPolicyResource,
+  draftFromEffectiveUniverseMeshPolicyResource,
   draftFromUniverseMeshPolicyResource,
   draftIdentityKeyForUniverseMeshPolicyResource,
   draftKeyForUniverseMeshPolicyResource,
@@ -275,6 +278,12 @@ export function AirboxMeshParametersPanel({
         return true;
       }
       const next = submission.resource;
+      publishCommittedMeshPolicyResource?.(
+        resources,
+        MESH_UNIVERSE_POLICY_RESOURCE_KEY,
+        operationSessionScopeKey,
+        next,
+      );
       resources.invalidate(MESH_UNIVERSE_POLICY_RESOURCE_KEY, next.revision);
       resources.invalidate(MESH_BUILD_CURRENT_RESOURCE_KEY, next.revision);
       resources.invalidate(MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY, next.revision);
@@ -404,6 +413,20 @@ export function AirboxMeshParametersPanel({
     setFeedback(null);
   };
 
+  const loadEffectiveDefaults = () => {
+    const seeded = draftFromEffectiveUniverseMeshPolicyResource(resource);
+    setDraftState({
+      baseKey,
+      dirty: true,
+      draft: seeded,
+      identityKey,
+    });
+    setFeedback({
+      kind: "success",
+      message: "Backend-effective Airbox defaults loaded into the draft. Click Apply Airbox Policy to commit.",
+    });
+  };
+
   const validation = buildAirboxMeshPolicyReplaceRequest(draft, { lane });
   const validationError = "error" in validation ? validation.error : null;
   const jsonError = airboxMeshPolicyJsonError(draft.configText);
@@ -420,11 +443,18 @@ export function AirboxMeshParametersPanel({
 
   return (
     <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group" data-mesh-policy-draft="airbox">
+      {!isFdm ? <FemMeshReadinessGuideCard compact universePolicy={resource} /> : null}
       <InspectorGroup title="Transactions">
         {isFdm ? (
           <FeedbackBanner
             kind="warning"
             message="Apply Airbox Policy saves the canonical policy and queues an atomic FDM grid replan."
+          />
+        ) : null}
+        {!draft.authoredConfigPresent && resource.effective_config ? (
+          <FeedbackBanner
+            kind="warning"
+            message="Using inherited backend Airbox defaults (no explicit authored policy saved yet). Load Effective Defaults or enter values below to author a canonical Airbox policy."
           />
         ) : null}
         {dirty ? (
@@ -444,6 +474,11 @@ export function AirboxMeshParametersPanel({
           {!isFdm ? (
             <Button disabled={!sessionScopeKey || pending || buildPending || validationError !== null} size="sm" type="button" variant="secondary" onClick={() => void build()}>
               {buildPending ? "Waiting for mesh build…" : dirty ? "Apply & Build Shared-Domain Mesh" : "Build Shared-Domain Mesh"}
+            </Button>
+          ) : null}
+          {!draft.authoredConfigPresent && resource.effective_config ? (
+            <Button disabled={pending} size="sm" type="button" variant="secondary" onClick={loadEffectiveDefaults}>
+              Load Effective Defaults
             </Button>
           ) : null}
           <Button disabled={pending} size="sm" type="button" variant="ghost" onClick={revert}>
