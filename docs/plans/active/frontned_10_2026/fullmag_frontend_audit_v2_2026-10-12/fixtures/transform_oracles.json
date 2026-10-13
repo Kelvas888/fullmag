@@ -1,0 +1,153 @@
+{
+  "id": "TRS-01",
+  "kind": "specification_oracle",
+  "units": "m",
+  "translation": [
+    1e-07,
+    2e-07,
+    3e-07
+  ],
+  "pivot": [
+    1e-08,
+    2e-08,
+    3e-08
+  ],
+  "scale": [
+    2,
+    3,
+    1
+  ],
+  "quaternion_xyzw": [
+    0,
+    0,
+    0.7071067811865476,
+    0.7071067811865476
+  ],
+  "local_bounds": {
+    "min": [
+      -1e-08,
+      -2e-08,
+      -5e-09
+    ],
+    "max": [
+      1e-08,
+      2e-08,
+      5e-09
+    ]
+  },
+  "expected_linear": [
+    [
+      0,
+      -3,
+      0
+    ],
+    [
+      2,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      1
+    ]
+  ],
+  "expected_offset": [
+    1.7e-07,
+    2e-07,
+    3e-07
+  ],
+  "expected_matrix_si": [
+    [
+      0,
+      -3,
+      0,
+      1.7e-07
+    ],
+    [
+      2,
+      0,
+      0,
+      2e-07
+    ],
+    [
+      0,
+      0,
+      1,
+      3e-07
+    ],
+    [
+      0,
+      0,
+      0,
+      1
+    ]
+  ],
+  "expected_world_bounds": {
+    "min": [
+      1.1e-07,
+      1.8e-07,
+      2.95e-07
+    ],
+    "max": [
+      2.3e-07,
+      2.2e-07,
+      3.05e-07
+    ]
+  },
+  "control_points": [
+    {
+      "local": [
+        0,
+        0,
+        0
+      ],
+      "world": [
+        1.7e-07,
+        2e-07,
+        3e-07
+      ]
+    },
+    {
+      "local": [
+        1e-08,
+        2e-08,
+        3e-08
+      ],
+      "world": [
+        1.1e-07,
+        2.2e-07,
+        3.3e-07
+      ]
+    },
+    {
+      "local": [
+        0,
+        0,
+        -5e-09
+      ],
+      "world": [
+        1.7e-07,
+        2e-07,
+        2.95e-07
+      ]
+    }
+  ],
+  "pivot_only": {
+    "new_pivot": [
+      0,
+      0,
+      0
+    ],
+    "expected_new_translation": [
+      1.7e-07,
+      2e-07,
+      3e-07
+    ]
+  },
+  "tolerance": {
+    "point_abs_m": 1e-20,
+    "matrix_linear_abs": 1e-14,
+    "basis": "Numerical algebra tolerance for this binary64 fixture, not a solver/physics tolerance"
+  }
+}

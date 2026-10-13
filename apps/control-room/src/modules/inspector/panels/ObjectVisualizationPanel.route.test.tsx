@@ -18,8 +18,10 @@ function resourceCall(name: string, enabled: boolean): void {
   testState.resourceCalls.push({ enabled, name });
 }
 
-vi.mock("@/kernel/KernelContext", () => ({
+vi.mock("@/kernel/KernelContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/kernel/KernelContext")>()),
   useKernel: () => ({
+    api: {},
     resources: {
       getRevision: () => null,
       subscribe: () => () => undefined,
@@ -46,6 +48,7 @@ vi.mock("@/kernel/KernelContext", () => ({
 
 vi.mock("@/kernel/resources/useSessionStatus", () => ({
   SESSION_STATUS_RESOURCE_KEY: "session:status",
+  useSessionResourceIdentity: () => null,
   useSessionStatusSelector: (selector: (status: unknown) => unknown) =>
     selector({
       data: {
@@ -197,9 +200,9 @@ vi.mock("@/kernel/resources/geometryLifecycleResources", () => ({
     resourceCall("shared-domain-manifest", enabled);
     return { data: null, error: null, revision: null, status: "idle" };
   },
-  useSceneResource: ({ enabled }: { enabled: boolean }) => {
+  useSceneResource: ({ enabled = true }: { enabled?: boolean } = {}) => {
     resourceCall("scene", enabled);
-    return { data: null, error: null, revision: null, status: "idle" };
+    return { data: { objects: [{ id: "film" }] }, error: null, revision: 1, status: "ready" };
   },
 }));
 
@@ -536,7 +539,7 @@ describe("ObjectVisualizationPanel lane routing", () => {
           "Object-scoped FEM viewport snapshots, field carriers, and exact transport metadata",
         owner: "object.visualization.debug",
         selection: objectDebugSelection,
-        target: "Magnetic object target (object:film)",
+        target: "Object target (object:film)",
         title: "Object Visualization Debug",
       },
       {
@@ -692,11 +695,14 @@ describe("ObjectVisualizationPanel lane routing", () => {
     const html = renderToStaticMarkup(<ObjectVisualizationPanel selection={selection} />);
 
     expect(html).not.toContain("Structured grid cells");
+    // Owner identity must still resolve independently of the numerical lane.
+    expect(testState.resourceCalls.find((call) => call.name === "scene")).toMatchObject({
+      enabled: true,
+    });
     for (const name of [
       "domain-meta",
       "fdm-membership",
       "visualization-state",
-      "scene",
       "shared-domain-manifest",
     ]) {
       expect(testState.resourceCalls.find((call) => call.name === name)).toMatchObject({

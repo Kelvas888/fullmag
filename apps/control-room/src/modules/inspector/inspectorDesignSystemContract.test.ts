@@ -34,13 +34,16 @@ describe("Inspector design-system reference contract", () => {
     expect(segmented).not.toContain("border-r");
   });
 
-  it("stacks the Inspector action bar into two columns in narrow containers", () => {
+  it("wraps owned action controls and keeps feedback below them in narrow Inspectors", () => {
     const inspector = read("src/design/styles/inspector.css");
+    const footer = read("src/modules/inspector/InspectorFooter.tsx");
 
-    expect(inspector).toContain("@container (max-width: 560px)");
-    expect(inspector).toMatch(
-      /@container \(max-width: 560px\)[\s\S]*?\.fm-inspector__action-bar\s*\{[\s\S]*?grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/,
-    );
+    expect(inspector).toMatch(/\.fm-inspector__action-bar\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\)/);
+    expect(inspector).toMatch(/\.fm-inspector__action-controls\s*\{[^}]*display: flex;[^}]*flex-wrap: wrap;/);
+    expect(inspector).toMatch(/\.fm-inspector__action-controls > button\s*\{[^}]*flex: 1 1 auto;/);
+    expect(inspector).toMatch(/@container \(max-width: 560px\)[\s\S]*?\.fm-inspector__action-bar\s*\{[^}]*padding-inline: var\(--fm-space-2\)/);
+    expect(footer).toContain('className="fm-inspector__action-controls"');
+    expect(footer).toContain('className="fm-inspector__action-reason"');
   });
 
   it("contains wide scientific content inside the Inspector shell", () => {
@@ -287,6 +290,18 @@ describe("Inspector design-system reference contract", () => {
         /import\s+\{\s*InspectorSection\s*\}/,
       );
     }
+  });
+
+  it("builds the mode visualization Inspector from the object visualization Inspector", () => {
+    // ADR 0054 / spec 32 §12: one Inspector style for the whole tree; a mode is a
+    // quantity on the magnetic object, not a second visualization panel.
+    const overview = read("src/modules/inspector/panels/mode-visualization/ModeVisualizationOverviewPanel.tsx");
+    const modeSections = read("src/modules/inspector/panels/ModeVisualizationInspectorPanel.tsx");
+
+    expect(overview).toContain("<VisualizationTargetInspectorPanel");
+    expect(modeSections).not.toMatch(/<FrequencyDomainModeDisplayControls/);
+    expect(modeSections).toContain('variant="nav"');
+    expect(modeSections).not.toMatch(/<select/);
   });
 
   it.each([

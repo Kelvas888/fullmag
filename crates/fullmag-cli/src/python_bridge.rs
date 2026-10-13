@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -958,66 +958,20 @@ pub(crate) fn run_python_helper_with_progress(
     progress_callback: Option<PythonProgressCallback>,
 ) -> Result<std::process::Output> {
     let root = repo_root();
-    let local_python = if cfg!(windows) {
-        root.join(".fullmag")
-            .join("local")
-            .join("python")
-            .join("Scripts")
-            .join("python.exe")
-    } else {
-        root.join(".fullmag")
-            .join("local")
-            .join("python")
-            .join("bin")
-            .join("python")
-    };
-    let repo_python = if cfg!(windows) {
-        root.join(".venv").join("Scripts").join("python.exe")
-    } else {
-        root.join(".venv").join("bin").join("python")
-    };
-    let packaged_python_candidates = if cfg!(windows) {
-        vec![
-            root.join("python").join("python.exe"),
-            root.join("python").join("Scripts").join("python.exe"),
-            root.join(".fullmag")
-                .join("local")
-                .join("python")
-                .join("python.exe"),
-            root.join(".fullmag")
-                .join("local")
-                .join("python")
-                .join("Scripts")
-                .join("python.exe"),
-            root.join(".fullmag")
-                .join("local")
-                .join("python")
-                .join("bin")
-                .join("python.exe"),
-        ]
-    } else {
-        Vec::new()
-    };
-    let mut candidates = Vec::new();
+    let interpreter = fullmag_runtime_control::python_runtime::resolve_interpreter(&root)
+        .map_err(|error| anyhow!("{error}"))?;
+    run_python_helper_with_interpreter(&root, &interpreter, args, progress_callback)
+}
 
-    if let Ok(preferred) = std::env::var("FULLMAG_PYTHON") {
-        candidates.push(preferred);
-    } else {
-        for candidate in std::iter::once(local_python)
-            .chain(std::iter::once(repo_python))
-            .chain(packaged_python_candidates)
-        {
-            if candidate.is_file() {
-                candidates.push(candidate.display().to_string());
-            }
-        }
-    }
-
-    for fallback in ["python3", "python"] {
-        if !candidates.iter().any(|candidate| candidate == fallback) {
-            candidates.push(fallback.to_string());
-        }
-    }
+/// Run a helper child with an already resolved interpreter. The single place
+/// that spawns Python for the CLI; it never falls back to another interpreter.
+pub(crate) fn run_python_helper_with_interpreter(
+    root: &Path,
+    interpreter: &fullmag_runtime_control::python_runtime::ResolvedInterpreter,
+    args: &[String],
+    progress_callback: Option<PythonProgressCallback>,
+) -> Result<std::process::Output> {
+    let uses_bundle = interpreter.isolated;
 
     let pythonpath = root.join("packages").join("fullmag-py").join("src");
     let packaged_site_packages = root.join("python").join("site-packages");
@@ -1028,9 +982,10 @@ pub(crate) fn run_python_helper_with_progress(
         .join("fem_mesh_assets");
     let inherited_pythonpath = std::env::var("PYTHONPATH").ok();
 
-    let mut last_error = None;
-    for candidate in candidates {
-        let mut command = ProcessCommand::new(&candidate);
+    {
+        let mut command = interpreter
+            .command(root)
+            .context("bundled Python runtime is incomplete or invalid")?;
         command.args(args);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -1054,71 +1009,65 @@ pub(crate) fn run_python_helper_with_progress(
                 python_paths.push(existing.clone());
             }
         }
-        if !python_paths.is_empty() {
+        if !uses_bundle && !python_paths.is_empty() {
             command.env(
                 "PYTHONPATH",
                 python_paths.join(if cfg!(windows) { ";" } else { ":" }),
             );
         }
 
-        match command.spawn() {
-            Ok(mut child) => {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| anyhow!("python helper stdout was not piped"))?;
-                let stderr = child
-                    .stderr
-                    .take()
-                    .ok_or_else(|| anyhow!("python helper stderr was not piped"))?;
-                let stdout_thread = std::thread::spawn(move || -> Result<Vec<u8>> {
-                    let mut stdout = stdout;
-                    let mut bytes = Vec::new();
-                    stdout.read_to_end(&mut bytes)?;
-                    Ok(bytes)
-                });
-                let stderr_progress = progress_callback.clone();
-                let stderr_thread = std::thread::spawn(move || -> Result<Vec<u8>> {
-                    let mut reader = BufReader::new(stderr);
-                    let mut collected = Vec::new();
-                    loop {
-                        let mut line = String::new();
-                        let read = reader.read_line(&mut line)?;
-                        if read == 0 {
-                            break;
-                        }
-                        collected.extend_from_slice(line.as_bytes());
-                        if let Some(callback) = stderr_progress.as_ref() {
-                            if let Some(message) =
-                                line.trim_end().strip_prefix(PYTHON_PROGRESS_PREFIX)
-                            {
-                                callback(parse_python_progress_event(message));
-                            }
-                        }
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to spawn python helper ({})",
+                interpreter.path.display()
+            )
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("python helper stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("python helper stderr was not piped"))?;
+        let stdout_thread = std::thread::spawn(move || -> Result<Vec<u8>> {
+            let mut stdout = stdout;
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        let stderr_progress = progress_callback.clone();
+        let stderr_thread = std::thread::spawn(move || -> Result<Vec<u8>> {
+            let mut reader = BufReader::new(stderr);
+            let mut collected = Vec::new();
+            loop {
+                let mut line = String::new();
+                let read = reader.read_line(&mut line)?;
+                if read == 0 {
+                    break;
+                }
+                collected.extend_from_slice(line.as_bytes());
+                if let Some(callback) = stderr_progress.as_ref() {
+                    if let Some(message) = line.trim_end().strip_prefix(PYTHON_PROGRESS_PREFIX) {
+                        callback(parse_python_progress_event(message));
                     }
-                    Ok(collected)
-                });
-                let status = child.wait()?;
-                let stdout = stdout_thread
-                    .join()
-                    .map_err(|_| anyhow!("python helper stdout reader panicked"))??;
-                let stderr = stderr_thread
-                    .join()
-                    .map_err(|_| anyhow!("python helper stderr reader panicked"))??;
-                return Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
+                }
             }
-            Err(error) => last_error = Some(format!("{}: {}", candidate, error)),
-        }
+            Ok(collected)
+        });
+        let status = child.wait()?;
+        let stdout = stdout_thread
+            .join()
+            .map_err(|_| anyhow!("python helper stdout reader panicked"))??;
+        let stderr = stderr_thread
+            .join()
+            .map_err(|_| anyhow!("python helper stderr reader panicked"))??;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
     }
-
-    Err(anyhow!(
-        "failed to spawn python helper ({})",
-        last_error.unwrap_or_else(|| "unknown error".to_string())
-    ))
 }
 
 pub(crate) fn check_script_syntax_via_python(script_path: &Path) -> Result<()> {
@@ -1202,11 +1151,12 @@ pub(crate) fn export_script_execution_config_via_python_with_options(
                 .to_string(),
         );
     }
-    if let Some(device) = managed_execution_device(
+    let managed_device = managed_execution_device(
         args.backend,
         std::env::var("FULLMAG_FEM_EXECUTION").ok().as_deref(),
         std::env::var("FULLMAG_FDM_EXECUTION").ok().as_deref(),
-    ) {
+    );
+    if let Some(device) = managed_device {
         helper_args.push("--runtime-device".to_string());
         helper_args.push(device.to_string());
     }
@@ -1224,8 +1174,85 @@ pub(crate) fn export_script_execution_config_via_python_with_options(
     let stdout = String::from_utf8(output.stdout)
         .context("python helper did not return valid UTF-8 JSON")?;
     let json_str = extract_json_from_stdout(&stdout)?;
-    serde_json::from_str(json_str)
-        .context("failed to deserialize script execution config from python helper")
+    let mut config = serde_json::from_str(json_str)
+        .context("failed to deserialize script execution config from python helper")?;
+    bind_script_execution_profiles(
+        &mut config,
+        &script_cli_execution_layers(args)?,
+        managed_device,
+    )?;
+    Ok(config)
+}
+
+pub(crate) fn script_cli_execution_layers(
+    args: &ScriptCli,
+) -> Result<Vec<fullmag_ir::ExecutionRequestLayerIR>> {
+    use clap::ValueEnum;
+    let mut values = serde_json::Map::new();
+    if let Some(value) = args.backend {
+        values.insert(
+            "backend".into(),
+            Value::String(value.to_possible_value().unwrap().get_name().into()),
+        );
+    }
+    if let Some(value) = args.mode {
+        values.insert(
+            "mode".into(),
+            Value::String(value.to_possible_value().unwrap().get_name().into()),
+        );
+    }
+    if let Some(value) = args.precision {
+        values.insert(
+            "precision".into(),
+            Value::String(value.to_possible_value().unwrap().get_name().into()),
+        );
+    }
+    if values.is_empty() {
+        return Ok(vec![]);
+    }
+    Ok(vec![fullmag_ir::ExecutionRequestLayerIR {
+        origin: fullmag_ir::ExecutionFieldOriginIR {
+            kind: fullmag_ir::ExecutionOriginKindIR::Cli,
+            location: "cli.backend/mode/precision".into(),
+        },
+        request: serde_json::from_value(Value::Object(values))?,
+    }])
+}
+
+pub(crate) fn bind_script_execution_profiles(
+    config: &mut ScriptExecutionConfig,
+    layers: &[fullmag_ir::ExecutionRequestLayerIR],
+    managed_device: Option<&str>,
+) -> Result<()> {
+    for problem in
+        std::iter::once(&mut config.ir).chain(config.stages.iter_mut().map(|stage| &mut stage.ir))
+    {
+        let metadata = &problem.problem_meta.runtime_metadata;
+        let has_profile = metadata.contains_key("execution_profile")
+            || metadata.contains_key("execution_materialization");
+        let bound = fullmag_application::bind_declared_execution(
+            problem,
+            if has_profile { layers.to_vec() } else { vec![] },
+        )
+        .map_err(anyhow::Error::msg)?;
+        if has_profile {
+            if let Some(device) = managed_device {
+                let snapshot: fullmag_ir::MaterializedExecutionRequestIR = serde_json::from_value(
+                    bound.problem_meta.runtime_metadata["execution_materialization"].clone(),
+                )?;
+                let forced = match snapshot.requested.device {
+                    fullmag_ir::ExecutionDevice::Auto => None,
+                    fullmag_ir::ExecutionDevice::Cpu => Some("cpu"),
+                    fullmag_ir::ExecutionDevice::Gpu => Some("gpu"),
+                };
+                if forced.is_some_and(|requested| requested != device) {
+                    bail!("execution_intent_conflict: bound profile device {:?} conflicts with managed execution lane {device}", snapshot.requested.device);
+                }
+            }
+        }
+        *problem = bound;
+    }
+    Ok(())
 }
 
 pub(crate) fn managed_fem_execution_device(value: Option<&str>) -> Option<&'static str> {

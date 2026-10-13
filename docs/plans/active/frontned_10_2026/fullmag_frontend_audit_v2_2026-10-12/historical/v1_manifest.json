@@ -1,0 +1,259 @@
+{
+  "project": "Fullmag",
+  "repository": "MateuszZelent/fullmag",
+  "branch": "master",
+  "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+  "commit_time_utc": "2026-10-07T18:34:20Z",
+  "audit_date": "2026-10-11",
+  "final_master_recheck": "same_commit_confirmed",
+  "scope": "static targeted source audit + isolated JS reproductions",
+  "excluded": [
+    "legacy_web",
+    "full runtime / E2E execution",
+    "actual WebGL and mesher validation",
+    "CPU/GPU performance measurements"
+  ],
+  "counts": {
+    "source_files_or_fragments": 24,
+    "findings": 28,
+    "P1": 7,
+    "P2": 21,
+    "evidence_C": 5,
+    "evidence_L": 7,
+    "evidence_R": 10,
+    "evidence_G": 6,
+    "executed_isolated_reproductions": 7,
+    "proposed_acceptance_tests": 50,
+    "thematic_markdown_documents": 10,
+    "ui_mockups": 7,
+    "system_diagrams": 4
+  },
+  "visuals": "Original proposed wireframes. Illustrative data and schematic geometry. Not application screenshots.",
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 5183,
+      "sha256": "f6f7b09cf908eaa960cd694846d09a4a6d5c9001f8691b5d34d29dec13180f5e"
+    },
+    {
+      "path": "diagrams/01_architecture.dot",
+      "bytes": 2401,
+      "sha256": "2e07802484f78db6a16233d10b2ad98c53b99a957a6eba667a2894c3dfb75c0d"
+    },
+    {
+      "path": "diagrams/01_architecture.png",
+      "bytes": 290976,
+      "sha256": "d347eee17994acd5a250166333b21643937446724de2a4fa00e94090882a8a9d"
+    },
+    {
+      "path": "diagrams/01_architecture.svg",
+      "bytes": 16627,
+      "sha256": "d5bb02833ee76a7d2fc470c6cc63e8b6aec87f8dbc6b4d289ceb4cc5b97daf44"
+    },
+    {
+      "path": "diagrams/02_edit_state_machine.dot",
+      "bytes": 2304,
+      "sha256": "e3ea233e50810e32658a3e467032f53beb4b78029ad239f2e8010059176bacb3"
+    },
+    {
+      "path": "diagrams/02_edit_state_machine.png",
+      "bytes": 325815,
+      "sha256": "fe04caaf428a2fdb2a82c96b809cce4a0da2ef1e8b692dce0a2bb0ddc76603e1"
+    },
+    {
+      "path": "diagrams/02_edit_state_machine.svg",
+      "bytes": 16126,
+      "sha256": "cc3ba341578ac67aec693b7f9d1037a7aeab580769ae3bab179e357478a48d98"
+    },
+    {
+      "path": "diagrams/03_mesh_lifecycle.dot",
+      "bytes": 2290,
+      "sha256": "25a716b06ad3df07b038a941f6cb6ca6146482f58b1bc155978f55aa09bbe95d"
+    },
+    {
+      "path": "diagrams/03_mesh_lifecycle.png",
+      "bytes": 277886,
+      "sha256": "aacabe29efd695e78e6b91c4e773492c31aec933bd98d7c759a41bb588683a0e"
+    },
+    {
+      "path": "diagrams/03_mesh_lifecycle.svg",
+      "bytes": 15594,
+      "sha256": "dcf70acd49f3a757b8bb40322975bb0b60bb01608ab79fc1e6a4190207e06199"
+    },
+    {
+      "path": "diagrams/04_import_pipeline.dot",
+      "bytes": 2189,
+      "sha256": "ca83e9faed09ab0d49afd59fe01e5aa4da13db01b83dd8ee75cc4ac8a74d4a5a"
+    },
+    {
+      "path": "diagrams/04_import_pipeline.png",
+      "bytes": 246075,
+      "sha256": "d8ce0c452dedc0db96d43c04d837bc1575f554d7dcc63dc546b138b43d4958b0"
+    },
+    {
+      "path": "diagrams/04_import_pipeline.svg",
+      "bytes": 13858,
+      "sha256": "e076ed150d0b6ed40a38e293519793785de8474d13df5a2ced07fa38b711851f"
+    },
+    {
+      "path": "docs/01_ZRODLA_I_METODYKA.md",
+      "bytes": 11641,
+      "sha256": "8173396b18727ad33d1193e717659691e63a66ede4e78ef584c2027c8aa010a5"
+    },
+    {
+      "path": "docs/02_REJESTR_USTALEN.md",
+      "bytes": 46497,
+      "sha256": "6edfbecc0a6181406d4e30e5a1d6bea4b103b9962c38daf80c6c8825fbe905bb"
+    },
+    {
+      "path": "docs/03_STAN_OBECNY_I_WORKFLOW.md",
+      "bytes": 14419,
+      "sha256": "2dda454755ee816931ca253a3d30ed9f71c457f194162738db1f7f198718503d"
+    },
+    {
+      "path": "docs/04_ARCHITEKTURA_DOCELOWA_I_TRANSFORMACJE.md",
+      "bytes": 10956,
+      "sha256": "f86aaec6cf9badc5728c137b8e12c541bec328cb556468fd0a2cd3b7d44e77bf"
+    },
+    {
+      "path": "docs/05_SPECYFIKACJA_UI_I_INSPEKTOROW.md",
+      "bytes": 13880,
+      "sha256": "83cdca33ddb1975a090c582fcb244614c6a2925216b63bb280f474657ed04478"
+    },
+    {
+      "path": "docs/06_MESH_WORKFLOW_I_JAKOSC.md",
+      "bytes": 13054,
+      "sha256": "05c624a44463ac1a4ea0c97fc5e03d00873f344ac1f8a2f779c2d284c2465eac"
+    },
+    {
+      "path": "docs/07_PLAN_WDROZENIA.md",
+      "bytes": 10667,
+      "sha256": "0eae57b3bb4883d60f413f53ef71305ca4548a98f8c57e06c5a4e106141ca0cf"
+    },
+    {
+      "path": "docs/08_TESTY_I_REPRODUKCJE.md",
+      "bytes": 10613,
+      "sha256": "2702683bfdd42fc8a2d53be1db5682d39152574a59007994af1ed12c16c5fa23"
+    },
+    {
+      "path": "docs/09_BENCHMARKI_I_DECYZJE_PROJEKTOWE.md",
+      "bytes": 4594,
+      "sha256": "288359eb01bae71fa132b485670cce66585185f8981babbd4a8bc5e4550a8778"
+    },
+    {
+      "path": "docs/10_MAKIETY_I_SCHEMATY.md",
+      "bytes": 5827,
+      "sha256": "4cafee572e6d37cabfadba5c4abe08eb7498fbfc1aac9ea1df166c9dfcc2603f"
+    },
+    {
+      "path": "findings.json",
+      "bytes": 31755,
+      "sha256": "de7951e8b20abc21c97acc8ab67d244adc15e58feb7203eb070fd4a3314e2c34"
+    },
+    {
+      "path": "index.html",
+      "bytes": 3883875,
+      "sha256": "408b49ca4be6bd9afe7f2670a15df2aa7f302427070da01084b2779c7f4b3946"
+    },
+    {
+      "path": "mockups/01_geometry.png",
+      "bytes": 249265,
+      "sha256": "8a96bf4603871d35015a536267b19652e06214abb9149dfdab9046cf0df2b1e5"
+    },
+    {
+      "path": "mockups/01_geometry.svg",
+      "bytes": 28412,
+      "sha256": "412bd82bec299c414c2cd42a430f95ca2b7f1ffbc39bfe515326309f03626c32"
+    },
+    {
+      "path": "mockups/02_transform.png",
+      "bytes": 272312,
+      "sha256": "8b71d96c798e403431fc8b53bc1c807af40f36e4cafce0ca14b2a97c9af5d2c4"
+    },
+    {
+      "path": "mockups/02_transform.svg",
+      "bytes": 30399,
+      "sha256": "90953ca4dedf4293d29c70aa93a6efbc2b05fe915aa9800f1fbb0220678e9456"
+    },
+    {
+      "path": "mockups/03_import.png",
+      "bytes": 251061,
+      "sha256": "fc6a013747499a87d71820ef7ef295734922d8ba4fbc04eaacee55f3f870e714"
+    },
+    {
+      "path": "mockups/03_import.svg",
+      "bytes": 33515,
+      "sha256": "d6d5647ce6336ed0f070d2eb3f89390a04ad21001f1a79ab824c657517fc8323"
+    },
+    {
+      "path": "mockups/04_mesh_policy.png",
+      "bytes": 278771,
+      "sha256": "be08834d4b995c69ac88216b9c3a576561a0685dc472ce250057dea6faf8eb3d"
+    },
+    {
+      "path": "mockups/04_mesh_policy.svg",
+      "bytes": 56022,
+      "sha256": "c2ff27bab228f447d5b6c4cad8db2b2a137e86b23578b4bbe5b3b1e5c91a7735"
+    },
+    {
+      "path": "mockups/05_rebuild.png",
+      "bytes": 197409,
+      "sha256": "cfeb3fed85c10b5d8a3b37b0dc073a374715591b3388b58f8e83964f300efcc7"
+    },
+    {
+      "path": "mockups/05_rebuild.svg",
+      "bytes": 56163,
+      "sha256": "9cdd4d19cc09ddf9eadde7348688b170b3d92a5bd5225e74becf14bbb94bcc1b"
+    },
+    {
+      "path": "mockups/06_quality.png",
+      "bytes": 259849,
+      "sha256": "eda33ce3e3484453d527cc270c8fbbdd3eabd609083447f6f488c1bc284b9424"
+    },
+    {
+      "path": "mockups/06_quality.svg",
+      "bytes": 65869,
+      "sha256": "8c709c59e53e0869f84eb27396708f5d26ba8d1062ec4c326487e3bf14bd2fc3"
+    },
+    {
+      "path": "mockups/07_fdm.png",
+      "bytes": 128965,
+      "sha256": "4fc767bdcb0a9d7b99c62c200d752728c51b84be4a6a8e6f798cfb84e54d4ad4"
+    },
+    {
+      "path": "mockups/07_fdm.svg",
+      "bytes": 55654,
+      "sha256": "7bec6b44d5ca69c94a6c50591be6d1c6b03d93700f719308b2c2fc5f21d0caba"
+    },
+    {
+      "path": "mockups/contact_sheet.png",
+      "bytes": 934381,
+      "sha256": "e1da0c3b9c04bd6c543124deb2af2e9a95a4e141af4eec0d231b379e8858bf3b"
+    },
+    {
+      "path": "reproductions/README.md",
+      "bytes": 2034,
+      "sha256": "c4120d0372d9363cfa236b63159bf12eaf9900e0288a73bc6e707c1a1ba4c803"
+    },
+    {
+      "path": "reproductions/reproduce.mjs",
+      "bytes": 6411,
+      "sha256": "239bae092ec5335a496c7c617bf8dd361867706ca51c4a80827c1f8529ca1f09"
+    },
+    {
+      "path": "reproductions/results.json",
+      "bytes": 2961,
+      "sha256": "1cdbe98df30f84eaa959d96cbd30215fcb558c336d6c59fe517c47fd17acfc51"
+    },
+    {
+      "path": "reproductions/run.log",
+      "bytes": 528,
+      "sha256": "31a9b88d21ef27a7eadc22e57316d3a8f5c5a658c312380827bdfa3f7b3f820e"
+    },
+    {
+      "path": "sources.json",
+      "bytes": 7342,
+      "sha256": "2784681471464d3d22bf307a4f960ccd9332b62ac9eb147000238c7b18751067"
+    }
+  ]
+}

@@ -89,6 +89,21 @@ Odpowiedzialności wyglądają tak:
 | Sys bindings | `crates/fullmag-fdm-sys/*`, `crates/fullmag-fem-sys/*` | bez zmiany | bindy do C ABI kompilowanych backendów |
 | Rust reference | `crates/fullmag-engine/*` i wybrane moduły runnera | bez zmiany | walidacja, debug, jawne ścieżki referencyjne |
 
+W aktualnej realizacji Rust FDM CPU/reference moduł
+`crates/fullmag-engine/src/fdm/cpu/fields/demag.rs` jest właścicielem
+obliczania pola demagnetyzacji: wariantów allocating, workspace, add-into
+AoS i add-into SoA przez `FdmFftBackend`. Rozróżnienie maskowanego pola
+solvera i niemaskowanego pola obserwacyjnego pozostaje w tym module.
+FFT/workspace zachowuje dotychczasowego właściciela; energie i obserwable
+pozostają konsumentami tej realizacji. Ta ekstrakcja nie zmienia dispatchu
+`CpuReference` i nie kwalifikuje natywnego backendu CPU/GPU.
+
+`fields/direct_torques.rs` skupia realizacje Zhang–Li, Slonczewski i SOT,
+ich warianty allocating/add-into AoS/SoA oraz dispatcher momentów.
+`fields.rs` zachowuje orkiestrację RHS i reeksport dwóch helperów konfiguracji
+używanych przez FEM reference. Współdzielenie lokalnej algebry nie oznacza
+wspólnego stanu runtime ani zmiany właściciela produkcyjnego FEM.
+
 Profesjonalne kryteria organizacji:
 
 1. Top-level albo pseudo-top-level root backendów ma oznaczać kompilowany kod
@@ -214,6 +229,11 @@ Reguły dla tego drzewa:
   materiałów, field buffers, własność stanu i natywne kontrakty backend-neutral,
   żyją w `backends/fem/core` albo `backends/fem/include`.
 - Realizacja FEM CPU MFEM żyje pod `backends/fem/cpu/mfem`.
+- Zimny eksport actual MFEM node/cell projection należy do
+  `backends/fem/cpu/mfem/runtime/indexed_geometry.*`. Fasada C ABI waliduje
+  caller buffers i przekazuje błędy; runner haszuje bounded chunki,
+  porównuje accepted MeshIR i publikuje mały receipt. Nie przenosi to
+  własności numeryki do Rust ani nie kwalifikuje CPU/GPU przez sam digest.
 - Workflow steady charge/spin transportu FEM CPU należy do
   `backends/fem/cpu/mfem/transport`. Runner może walidować deskryptor,
   wywołać wersjonowane ABI oraz opublikować quantity/provenance, ale nie może
@@ -418,6 +438,25 @@ ADR 0023 zamraża `BiasFieldSweep` jako physical input, Kittel/FMR jako
 postsolve analysis oraz Results jako widok nad artefaktami `modal_eigen` i
 `driven_response`, nigdy jako trzeci solver.
 
+### Granica reprezentacji dyspersji nonzero-k (ADR-0031)
+
+Dyspersja FEM ma dwie odrębne reprezentacje opisane w
+`docs/adr/0031-fem-nonzero-k-dispersion-representations.md` oraz w notach
+`docs/physics/0828-fem-frequency-domain-floquet-demag.md` i
+`docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md`:
+
+- pełna komórka Blocha 3D stosuje zwykłe gradienty do pełnych zespolonych pól,
+  a fazę przenosi przez zespolone ograniczenia `C(k)` na parach magnetycznych
+  i w airboxie; dynamiczny demag należy do tego samego operatora;
+- falowód 2.5D o przekroju niezmiennym wzdłuż osi stosuje operator obwiedni
+  `D(k)=grad_perp-i*k*z_hat`, bez podłużnych par fazowych `C(k)`.
+
+Nie wolno stosować jednocześnie ograniczeń fazowych i przesuniętego gradientu,
+ani kierować żądania nonzero-k do operatora K0. Obie reprezentacje współdzielą
+modalny pencil, proweniencję i artefakty, ale mają osobne warunki topologii,
+normalizacji, zbieżności i granicy `k -> 0`. Stan źródłowy obu ścieżek pozostaje
+`source_visible / unvalidated`; niniejsze odwołanie nie podnosi capability matrix.
+
 Runner przekazuje deskryptor okna i pojedynczy wybrany engine, odbiera wyniki,
 mapuje progress oraz publikuje artefakty i proweniencję. Nie może wybierać
 innego solvera, implementować assembly MFEM ani posiadać PETSc/SLEPc/hypre
@@ -562,6 +601,24 @@ routing i numerykę, a runner nadal wykonuje część method rejection/resolutio
 docelowej architektury. Ich naprawa jest późniejszym behavior-preserving
 refaktorem i implementacją, nie częścią tego dokumentacyjnego patcha.
 
+### Adaptacyjne próbkowanie dyspersji FEM CPU
+
+Polityka wykonania i granice dopuszczania procesów są opisane w
+[ADR 0034](../adr/0034-adaptive-dispersion-process-pool.md).
+`crates/fullmag-runner/src/eigen/k_process_pool.rs` jest właścicielem puli
+izolowanych procesów oraz cancellation, a `adaptive_resources*.rs` pomiarów
+alokacji CPU/RAM. `fem/eigen_k_worker.rs` wiąże żądanie i artefakty z planem,
+przyjętą równowagą i indeksem próbki. Numeryka nadal należy do natywnego FEM;
+pula nie współdzieli MFEM/PETSc pomiędzy wątkami ani nie zmienia operatorów.
+
+Brak polityki zachowuje wykonanie szeregowe. Tryb adaptacyjny dotyczy
+niezależnych k w FEM CPU; GPU oraz continuation pola wymagają odrębnej
+kwalifikacji. Cel procentowego obciążenia CPU jest miękką regułą dopuszczania,
+a limity OS/cgroup/HPC są nadrzędne. Stan wdrożenia i osobne bramki runtime,
+GUI oraz parytetu naukowego podaje
+[plan wykonania](../superpowers/plans/2026-10-02-adaptive-dispersion-execution.md).
+Sam obecny kod nie dowodzi zaliczenia tych bramek.
+
 ## 7.3 Workflow pola anteny mikrofalowej
 
 Kanoniczny kontrakt fizyczny dla anten microstrip/CPW z profilem zmiennym
@@ -581,6 +638,138 @@ backends/fem/cpu/mfem/workflows/antenna_field_solve
 ```
 
 Reguły własności:
+
+Stan źródłowy 2026-10-03: powyższy właściciel ma teraz
+`charge_trace_workspace.cpp::solve_charge_trace_workspace`, napięciowy
+etap H1/P1 na straight tet4 z affine trace, gauge i niezależnym residualem
+każdego komponentu oraz owned V i reakcjami oryginalnego K.
+`PeriodicChargePotentialSolver::Solve` deleguje do tego etapu.
+Nie oznacza to ukończenia workflow: odpowiedź na zadane podpisane prądy
+portowe, ograniczenia sum terminalnych w RT0 i wspólny zaakceptowany
+snapshot V/J/H nadal wymagają wdrożenia i kwalifikacji runtime.
+Stan źródeł i builda nie jest dowodem walidacji fizycznej.
+Późniejszy etap źródłowy `charge_current_response.cpp::solve_charge_current_response`
+korzysta z owned `ChargeTraceWorkspace`: K powstaje raz dla jednostkowych
+i końcowego solve, a odpowiedź dotyczy prądów sprzężonych z voltage controls.
+To nie jest jeszcze publiczny adapter physical terminal/closure ani
+terminal-current certificate. Źródłowy gate odrzuca authored common-mode
+przed solve; numeryczny rząd, signed currents i RT0 wymagają dowodów.
+Kolejny źródłowy `charge_control_nullspace_rank.cpp::validate_charge_control_rank`
+dodaje dokładną wykonalność i niezależność wszystkich controls modulo stałe
+pierwotnych objętości K, przed identyfikacją trace i przed unit CG.
+Odmowy bounded arytmetyki są odrębne od zależności; numerical response
+conditioning i runtime nadal nie są kwalifikowane.
+Następny source-only `charge_terminal_current_constraints.cpp::solve_charge_terminal_current_constraints`
+wiąże terminale z rzeczywistymi stable-ID boundary faces i P1 DOF,
+sprawdza face closure, referencje i bilans per electrical component oraz
+podpisane prądy wszystkich terminali, także reference/requested-zero.
+`solve_charge_current_response_prepared` korzysta z tego samego frozen K;
+ordered topology i solver policy nie mogą się zmienić. Zero-jump
+interfaces są jawne; nonzero cut actuators i trace-aliased electrodes
+wymagają oddzielnej realizacji. Ten adapter nie jest jeszcze publiczną
+ścieżką closure/RT0, nowym ABI ani kompletnym accepted-source V/J/H.
+Kwalifikacja numeryczna i runtime pozostają otwarte.
+Kolejny source-only operator transportu `project_terminal_constrained_rt0`
+przyjmuje zmierzone H1 outward currents jako aggregate terminal rows;
+rozszerza istniejący exact rank i weighted RT0 KKT. Wszystkie elementy,
+ściany oraz terminale są mierzone po solve, także omitted rows.
+Legacy `Build` nadal używa pustej listy tych rows. Owned numeric
+projection nie jest `ConservativeCurrentView` ani accepted V/J/H:
+sam operator nie ma typed wspólnego mesh/material/V provenance,
+publicznego ABI i kwalifikacji. Nie używać go do promowania capability.
+Kolejny numeric source step dodaje optional explicit metal-metal pair
+rows do tego samego rank/KKT. Face/vertex maps są authored stable IDs,
+geometry exact-coincident z przeciwnymi outward normals, a terminal
+overlap i reused faces są odrzucane. Każdy interface flux jest mierzony
+po solve. To nie jest source cut ani accepted external-lead closure;
+same numeric pairs nie potwierdzają pochodzenia H1/raw J.
+Następny source-only workflow
+`accepted_terminal_charge_source.cpp::solve_accepted_terminal_charge_source`
+łączy terminal H1 z RT0 na jednej owned mesh i frozen elementwise scalar
+conductivity. Odtwarza rzeczywiste P1 i mierzy requested→RT0 każdego
+terminala. Typed interfaces mają wspólny geometric/topological preflight
+przed H1: owner wyprowadza wyłącznie actual P1 zero-jumps z zamrożonych
+stable vertex maps i przekazuje te same face pairs do RT0. Nie ma
+caller DOF trace passthrough, inferred contacts ani dopisywania leadów
+po solve. Shared mesh preflight sprawdza
+bezwymiarowy shape przed clone/H1, bez metr-scale minimum ani zmiany
+legacy `Build`. Otwarte terminal V/σ/J nie jest domkniętym źródłem
+Oersteda; typed closure finalization, source cuts, digest/ABI, publiczny producent i native
+numerical/runtime qualification pozostają wymaganiami T05/T06.
+
+Kolejny prywatny source-only przyrost wiąże ten owned payload przez
+`accepted_terminal_charge_source.ordered.v1` SHA-256. Rzeczywisty
+ordered mesh/stable IDs/σ/V/reakcje/RT0 face-DOF-sign map, terminale,
+interfaces, rank i scalar solver policy trafiają do finite typed
+stream po acceptance gates. Preimage ma limit 128 MiB, nie gwarancję
+peak RAM. Digest nie jest permutation-invariant geometry identity,
+caller field digest ani closure certificate; sam nie promuje ABI,
+publicznego producenta lub kwalifikacji.
+
+Append-only ABI `fullmag_fem_solve_accepted_terminal_charge_v1` i prywatny
+Rust adapter są kolejnym source-only prerequisite. Publikują/odbierają
+wyłącznie dokładny canonical owned record objęty SHA; consumer dekoduje
+ten sam stream i porównuje maps/material/controls/policy z request.
+Bounded typed CSR/exterior preflight poprzedza import MFEM; skrócony
+result prefix nie otrzymuje pełnych zapisów, odmowy nie publikują
+acceptance metadata. C/Rust layout jest zamrożony niezależnie od testów.
+Nie ma połączenia z publicznym producerem ani nowego domknięcia/H.
+Retained caller buffer może kosztować 128 MiB per record, nie jest to
+peak-RAM qualification. Source regressions pozostają niekompilowane;
+build, numerical/runtime i public artifact evidence są osobne.
+
+Kolejny source-only owner `accepted_external_lead_source.cpp` finalizuje
+ten sam immutable charge/RT0 payload dla jawnie partycjonowanej domeny
+device+lead z outer current electrodes. Transport zatrzymuje rzeczywiste
+terminal face groups i explicit pairs oraz udostępnia niezależny fizyczny
+pomiar niezmienionego RT0. Workflow sprawdza exhaustive exterior roles,
+actual komponenty, signed H1/RT0 device-port observations i wszystkie
+outer terminal currents; nie wykonuje drugiego H1 ani projekcji RT0.
+Całkowanie `EvaluateField` jest wyłącznie wkładem skończonej domeny:
+fixed scope `external_electrode_truncation`, własne source/field digests,
+pusta legacy view identity. Nie ma zależności transport→workflow ani
+promocji do pełnego zamkniętego obwodu, public producer lub bazy LLG.
+Private bounds order/depth/pair count i field-record preflight ograniczają
+wejścia; obecny kernel floor 1 A/m jest jawny w polityce, nie deklaracją
+standardowej tolerancji względnej małego pola. Source cuts, sterowanie
+device branch currents, dowód braku nakładania objętości, truncation/error
+qualification, ABI/public integration i runtime pozostają otwarte.
+
+Source-only ABI `fullmag_fem_solve_accepted_external_lead_field_v1` dodaje
+jeden native workflow charge→finalizer→field i canonical bounded bundle
+trzech exact retained records. J jest jawnie reprezentowane przez momenty
+RT0, nie przez nodalny raw J z niezależnego solve. Workflow sam ustala
+accepted charge owner i SHA pin; wspólny importer C nie definiuje nowej
+numeryki. Nowy request/result/fingerprint nie zmienia starszych layoutów.
+Hash całego pakietu i cross-digests wiążą V/material/RT0, finalizację
+i ordered H/targets/options. Łączny preimage ma limit 128 MiB, a failed
+ABI nie publikuje acceptance metadata. To granica wewnętrzna; publiczny
+producer nadal musi otrzymać jawne actuator→observation maps i usunąć
+dwa legacy charge workflow. Build, runtime i physics qualification
+pozostają osobnymi wymaganiami, bez promocji truncated scope do pełnej
+closure lub bazy LLG.
+
+Finalizer source record v2 dodaje rzeczywisty signed Piola RT0
+DOF→canonical-flux weight. Właściwy numeric owner liczy go z owned
+`CalcVShape`/orientation, także przy zero current; Rust nie zgaduje
+normalizacji bazy i nie zastępuje signed binding porównaniem modułów.
+Face ledger musi wiązać element/terminal/interface/insulation aggregates,
+a sumowanie uwzględniać silne cancellation bez osłabiania SI gates.
+To korekta jawnego private record contract, nie nowy charge solve ani
+zmiana starego charge ABI.
+
+Source-only inspection boundary `antenna_external_lead_solution.v1` ma osobnego
+właściciela w `crates/fullmag-runner/src/antenna_external_lead_solution.rs`.
+Nie zastępuje `antenna_field_solution.v1`: przechowuje jeden exact raw
+V/RT0/H bundle oraz zgodne binary pochodne, bez per-ampere rescale. Pure owned
+codecs pozostają w istniejących plikach `native_fem/accepted_*`, ale nie zależą
+od flag uruchamiających build natywnego solvera. Request binding i packed ABI
+pozostają FEM-gated. Adapter zachowuje actual input i jawne native-v1 jump
+defaults, natomiast builder wymaga odrębnej requested execution i odrzuca
+wymuszone GPU. Bezsolverowy inspection load nie jest realizacją solve w FDM
+lub FEM GPU. Atomic publisher/cache mają oddzielny namespace; legacy LLG i
+spectrum boundaries zwracają `source_not_qualified` przed projekcją. Public
+stage/API, managed runtime i kwalifikacja naukowa nie wynikają z tej granicy.
 
 1. Numeryka przewodnictwa, normalizacji prądu, kwadratury Biota-Savarta i
    projekcji targetu żyje w `backends/fem`, nie w Rust runnerze.
@@ -641,16 +830,44 @@ własnością wykonania i muszą przejść bez reinterpretacji przez IR, API i U
 
 ## 8. Architektura FDM
 
-FDM ma dwie różne role, które muszą pozostać jawne:
+FDM ma dwa poziomy własności, które muszą pozostać jawne:
 
-- natywny kompilowany backend FDM pod `backends/fdm`,
-- wsparcie Rust CPU/reference używane do walidacji, uruchomień bez GPU i
-  parity checks.
+- strategiczny kompilowany backend FDM pod `backends/fdm`, który jest miejscem
+  produkcyjnego CUDA oraz przyszłych natywnych realizacji CPU;
+- bieżąca Rustowa ścieżka `FdmEngine::CpuReference`, używana jako CPU
+  execution route i trusted reference oracle.
 
-Natywny backend FDM jest produkcyjną ścieżką kompilowaną. Kod Rust CPU reference
-nie może być przedstawiany jako zamiennik natywnego FDM. Jeśli funkcja jest
-potrzebna w obu miejscach, najpierw definiujemy wspólny kontrakt, a potem
-realizujemy go osobno w backendzie natywnym i lane referencyjnym.
+W repozytorium nie ma jeszcze osobnego, wystawionego przez `FdmEngine`,
+kompilowanego native CPU solvera pełnego FDM LLG. Zgodnie z ADR 0032 nie wolno
+wyprowadzać jego istnienia z samego katalogu `backends/fdm` ani zastępować
+`CpuReference` przez zmianę nazwy wrappera. Bieżące mapowanie zachowuje:
+
+| Requested / resolved lane | Engine | Właściciel bieżącej realizacji |
+|---|---|---|
+| FDM CPU / `auto -> cpu` | `CpuReference` | Rust reference/current CPU route |
+| FDM GPU | `CudaFdm` | `backends/fdm` native CUDA |
+
+`CpuReference` może być używany do wykonania CPU i walidacji, ale jego
+provenance musi pozostać jawne. Przyszły native CPU wymaga osobnego engine,
+ABI, capability, requested/resolved/executed provenance, parity i
+workload-scoped qualification. Nie jest skutkiem tego planu.
+
+Jeśli funkcja jest potrzebna w obu miejscach, najpierw definiujemy wspólny
+kontrakt, a potem realizujemy go osobno w backendzie natywnym i lane
+referencyjnym. Forced GPU nadal kończy się błędem, gdy CUDA nie jest dostępne;
+nie może po cichu użyć `CpuReference`.
+
+### 8.1. Bieżące rozstrzygnięcie FDM CPU (ADR 0032)
+
+`crates/fullmag-runner/src/solver_runtime/engine.rs::FdmEngine` oraz
+`crates/fullmag-runner/src/solvers/fdm/execute.rs::execute_fdm` są źródłem
+bieżącego dispatchu, dopóki nie zostanie przyjęta późniejsza decyzja. Runner
+publikuje requested, resolved i executed engine oraz fallback reason; `auto`
+nie znika z provenance, a jawne `gpu` nie może rozwiązać się do CPU.
+
+Status capability i status physics validation są niezależne. Wpis o
+`CpuReference` albo `CudaFdm` nie jest dowodem native CPU ownership, parity ani
+production qualification.
 
 Dopracowania natywnego FDM CUDA są dozwolone, ale powinny być wąskie:
 
@@ -771,6 +988,21 @@ Własność implementacji:
 - właściciele GPU demag żyją pod `backends/fem/gpu/cuda/demag_poisson`
   albo pod przyszłym jawnym natywnym właścicielem GPU BEM/FMM,
 - ścisłe requesty GPU nie mogą po cichu spadać do CPU Poisson.
+
+Bieżący Fredkin-Koehler/FEM-BEM ma rozpoznawalny wariant w `ProblemIR`,
+plannerze i native provenance, a istniejący opis capability `Demag` obejmuje
+body-only FK CPU source path. Publiczna capability projection runnera jest
+jednak Poisson-focused (`crates/fullmag-runner/src/capabilities.rs`), więc
+uzgodnienie planner/runtime/resource reporting pozostaje **NOT VERIFIED** w
+P0. Brak FK w tej projekcji nie jest dowodem braku legalnej realizacji i nie
+upoważnia do wyłączenia istniejącej ścieżki planner/native; do czasu
+reconciliacji zachowuje się bieżące zachowanie i raportuje rozbieżność.
+
+CPU i GPU muszą mieć osobne dowody źródłowe oraz osobne receipts: CPU
+`hierarchical_h2`, GPU `device_hypre_fem_bem` (jeżeli dany branch je wybierze).
+Żaden z tych sygnałów nie jest sam w sobie parity, physics validation ani
+production qualification. Generic BEM/FMM pozostają `unsupported`/deferred
+zgodnie z plannerem.
 
 ## 10. Polityka Refaktoru Runnera
 
@@ -967,3 +1199,20 @@ wolno tworzyć nowych ownerów fizyki w `Context`, `mfem_bridge.cpp`,
 runnerowym `dispatch.rs` ani ogólnym `execute.rs`. Source presence,
 executability, validation i production qualification pozostają czterema
 oddzielnymi osiami dowodu.
+
+
+### CPU Floquet — właściciel certyfikowanego shifted solve (G5)
+
+Odzyskanie po odrzuconym happy breakdown jest częścią natywnego workflow
+FEM CPU w `backends/fem/cpu/frequency_domain/modal`, a nie runnera lub UI.
+Kontrakt zapisano w `0831-fem-dynamic-pencil-modal-response-and-krylov.md`.
+Transport STSINVERT/PREONLY/PCSHELL i wewnętrzny GMRES/PCLU mają osobne
+provenance. Inner solver może być przybliżony lub zakończyć cykl BREAKDOWN;
+cały owner zwraca sukces tylko po niezależnym true-residual check i zachowaniu
+łącznego requested iteration budget. Nie ma cichego wyboru innego backendu,
+poluzowania tolerancji ani pominięcia dynamic demag.
+
+Implementacja i hosted dowody tego recovery są w toku; capability pozostaje
+source_visible / unvalidated. Solver-ownership nie zmienia publicznego
+Python/ProblemIR ani fizycznych definicji residualów. Pierwotne full/mixed,
+fault/quarantine i backing-byte guards pozostają obowiązkową bramką.

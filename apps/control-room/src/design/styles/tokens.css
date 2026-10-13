@@ -44,6 +44,7 @@
   --fm-chart-height-md: 260px;
   --fm-chart-height-lg: 360px;
   --fm-chart-height-analysis: 360px;
+  --fm-chart-cell-separator-width: 1px;
   --fm-ribbon-chevron-size: 19px;
   --fm-ribbon-tab-indicator-bottom: 25px;
   --fm-thread-progress-width: 54px;
@@ -62,6 +63,7 @@
   --fm-bp-inspector: 390px; /* inspector @container narrow breakpoint */
 
   /* Dialog / panel spatial constraints */
+  --fm-dialog-new-problem-width: 860px;
   --fm-dialog-mesh-build-width: 680px;
   --fm-dialog-mesh-build-width-compact: 480px;
   --fm-dialog-mesh-build-section-max-height: 168px;

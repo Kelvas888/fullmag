@@ -182,7 +182,8 @@ async fn get_object_topological_charge_legacy(
     let requested_method = query.method;
     let requested_snapshot = query.snapshot_id.as_deref().unwrap_or("latest");
     let field_summary = resolved_field_summary;
-    let mesh = snapshot.fem_mesh.as_ref();
+    // A retained FEM artifact must not change the topology of current FDM field data.
+    let mesh = snapshot.fem_mesh.as_ref().filter(|_| !is_fdm_snapshot(&snapshot));
     let field_revision = field_summary
         .as_ref()
         .map(|_| field_quantity_revision(&snapshot, &query.quantity_id).max(1));
@@ -329,6 +330,7 @@ pub async fn get_object_topological_charge(
     query
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let snapshot = state
         .current_live_state
         .read()
@@ -388,18 +390,19 @@ pub async fn get_object_topological_charge(
         ),
         "berg_luescher_oriented_triangles_v2",
     );
-    if let Some(cached) = state
+    let cached = state
         .quantity_data_plane
         .topological_charge_cache
         .lock()
         .await
-        .get(&cache_key)
-    {
+        .get(&cache_key);
+    if let Some(cached) = cached {
         if let Ok(resource) = serde_json::from_value::<TopologicalChargeResourceV2>(cached) {
+            crate::validate_current_live_request_context(&state, &request_context).await?;
             return Ok(Json(resource));
         }
     }
-    let fdm_qualification = (snapshot.fem_mesh.is_none()
+    let fdm_qualification = (is_fdm_snapshot(&snapshot)
         && query.support
             == crate::schemas::analysis_extensions::TopologicalChargeSupportMode::Midplane)
         .then(|| {
@@ -680,6 +683,7 @@ pub async fn get_object_topological_charge(
             .await
             .insert(cache_key, value);
     }
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(Json(resource))
 }
 

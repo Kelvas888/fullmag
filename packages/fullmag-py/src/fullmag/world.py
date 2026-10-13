@@ -32,11 +32,14 @@ Multi-magnet example::
 from __future__ import annotations
 
 import copy
+import asyncio
 import math
+import threading
 import warnings
 from dataclasses import dataclass, field, replace
+from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Sequence, cast
+from typing import Any, Callable, Generic, Literal, Mapping, Sequence, TypeVar, cast
 
 from fullmag._progress import emit_progress
 from fullmag._validation import (
@@ -47,13 +50,21 @@ from fullmag._validation import (
     require_positive,
 )
 from fullmag.model.antenna import (
+    AntennaFieldSolutionRef,
+    AntennaFieldSolveStage,
     AntennaFieldSource,
     Antenna,
+    AntennaStageOutputRef,
+    AntennaTargetProjection,
+    AntennaPortMode,
+    AntennaSpectrumRequest,
     RegionalFieldDrive,
     RfDrive,
+    SolvedAntennaDrive,
     SpinWaveExcitationAnalysis,
 )
 from fullmag.model.absorbing_boundary import AbsorbingBoundaryLayer
+from fullmag.model.antenna_inventory import AntennaAuthoringInventory
 from fullmag.model.couplings import CouplingEndpoint, CouplingRegistry
 from fullmag.model.constraints import FrozenSpins, merge_constraint_stage_ids
 from fullmag.model.current_transport import (
@@ -62,6 +73,8 @@ from fullmag.model.current_transport import (
     ChargeSolverPolicy,
     ChargeTransportMaterialAssignment,
     ConservativeCurrentView,
+    ExternalLeadCurrentSource,
+    ExternalLeadPreparation,
     NormalCurrentElectrode,
     StructuredCurrentClosure,
     CurrentTransport,
@@ -103,11 +116,14 @@ from fullmag.model.dynamics import (
     FieldRefreshPolicy,
     LLG,
 )
-from fullmag.model.outputs import SaveField, SaveScalar, SaveSpectrum, SaveMode, SaveDispersion, SaveResponse, Snapshot, parse_snapshot_quantity
+from fullmag.model.outputs import SaveEigenDiagnostics, SaveField, SaveScalar, SaveSpectrum, SaveMode, SaveDispersion, SaveResponse, Snapshot, parse_snapshot_quantity
 from fullmag.model.planar_monitor import (
     PlanarMonitor,
     StudyMonitorRegistry,
 )
+from fullmag.model.output_storage import OutputStorage
+from fullmag.model.compute_resources import ComputeResources
+from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer, _parallel_execution_lane
 from fullmag.model.study import (
     DEFAULT_RELAXATION_TORQUE_TOLERANCE_T,
     AdaptiveRefinement,
@@ -120,6 +136,7 @@ from fullmag.model.study import (
     MeasurementAxis,
     MinorLoop,
     PiecewiseFieldSchedule,
+    FemEigenSolverPolicy,
     FrequencyResponseSolverPolicy,
     GammaResponseAnalysis,
     RelaxStop,
@@ -130,6 +147,7 @@ from fullmag.model.study import (
     StageAutosave,
     TableAutosave,
     TimeEvolution,
+    AntennaFieldSolve,
     DEFAULT_RELAXATION_MAX_STEPS,
     DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM,
 )
@@ -149,9 +167,15 @@ from fullmag.model.problem import (
     ExecutionMode,
     ExecutionPrecision,
     FdmPbc,
+    ParallelExecutionPolicy,
     Problem,
     resolve_geometry_sources,
     RuntimeSelection,
+)
+from fullmag.model.parameters import (
+    ParameterDefinition,
+    ParameterExpression,
+    ParameterLibrary,
 )
 from fullmag.model.discretization import (
     FDM,
@@ -311,12 +335,15 @@ class RegionRegistry:
         self._owner = owner
 
     def __iter__(self):
+        self._owner._assert_active_context()
         return iter(self._owner._object_regions)
 
     def __len__(self) -> int:
+        self._owner._assert_active_context()
         return len(self._owner._object_regions)
 
     def __contains__(self, key: object) -> bool:
+        self._owner._assert_active_context()
         try:
             self[key]  # type: ignore[index]
             return True
@@ -324,6 +351,7 @@ class RegionRegistry:
             return False
 
     def __getitem__(self, key: int | str) -> ObjectRegion:
+        self._owner._assert_active_context()
         if isinstance(key, int):
             return self._owner._object_regions[key]
         if not isinstance(key, str):
@@ -334,15 +362,19 @@ class RegionRegistry:
         raise KeyError(key)
 
     def keys(self) -> tuple[str, ...]:
+        self._owner._assert_active_context()
         return tuple(region.name for region in self._owner._object_regions)
 
     def values(self) -> tuple[ObjectRegion, ...]:
+        self._owner._assert_active_context()
         return tuple(self._owner._object_regions)
 
     def items(self) -> tuple[tuple[str, ObjectRegion], ...]:
+        self._owner._assert_active_context()
         return tuple((region.name, region) for region in self._owner._object_regions)
 
     def allocate_region_id(self, name: str) -> str:
+        self._owner._assert_active_context()
         require_non_empty(name, "name")
         candidate = f"{self._owner._name}:r{self._owner._next_region_id_index}"
         while (
@@ -356,6 +388,7 @@ class RegionRegistry:
         return candidate
 
     def reserve_region_id(self, region_id: str) -> str:
+        self._owner._assert_active_context()
         region_id = require_non_empty(region_id, "region_id")
         if (
             region_id in self._owner._allocated_region_ids
@@ -440,6 +473,7 @@ class AlphaControl:
 
     @property
     def value(self) -> float:
+        self._owner._assert_active_context()
         return self._owner._alpha_value
 
     def absorbing_boundary(
@@ -453,6 +487,7 @@ class AlphaControl:
         profile: str | None = None,
         frame: str | None = None,
     ) -> AbsorbingBoundaryLayer:
+        self._owner._assert_active_context()
         if parameters is not None:
             if any(
                 value is not None
@@ -488,21 +523,26 @@ class AlphaControl:
         return layer
 
     def __float__(self) -> float:
+        self._owner._assert_active_context()
         return self.value
 
     def __repr__(self) -> str:
+        self._owner._assert_active_context()
         return repr(self.value)
 
     def __str__(self) -> str:
+        self._owner._assert_active_context()
         return str(self.value)
 
     def __eq__(self, other: object) -> bool:
+        self._owner._assert_active_context()
         try:
             return self.value == float(other)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return False
 
     def __format__(self, spec: str) -> str:
+        self._owner._assert_active_context()
         return format(self.value, spec)
 
 
@@ -525,6 +565,7 @@ class MagnetHandle:
         *,
         object_id: str | None = None,
     ) -> None:
+        object.__setattr__(self, "_owner_state", _state.current())
         self._shape = shape
         self._name = name
         self._object_id = (
@@ -555,15 +596,31 @@ class MagnetHandle:
         self._material_parameter_assignments: list[MaterialParameterAssignment] = []
         self.regions = RegionRegistry(self)
 
+    def __setattr__(self, name: str, value: object) -> None:
+        """Fence public mutations to the context that created this handle."""
+        if not name.startswith("_"):
+            owner_state = self.__dict__.get("_owner_state")
+            if owner_state is not None:
+                self._assert_active_context()
+        object.__setattr__(self, name, value)
+
+    def _assert_active_context(self) -> None:
+        if _state.current() is not self._owner_state:
+            raise RuntimeError(
+                f"magnet handle '{self._name}' belongs to a different authoring context"
+            )
+
     def __repr__(self) -> str:
         return f"MagnetHandle({self._name!r}, Ms={self.Ms}, Aex={self.Aex}, m={self._m_value!r})"
 
     @property
     def object_id(self) -> str | None:
+        self._assert_active_context()
         return self._object_id
 
     @property
     def m(self) -> "MagnetizationHandle":
+        self._assert_active_context()
         return self._m_proxy
 
     @m.setter
@@ -572,6 +629,7 @@ class MagnetHandle:
 
     @property
     def alpha(self) -> AlphaControl:
+        self._assert_active_context()
         return self._alpha_control
 
     @alpha.setter
@@ -583,6 +641,7 @@ class MagnetHandle:
 
     @property
     def dind(self) -> float | None:
+        self._assert_active_context()
         return self.Dind
 
     @dind.setter
@@ -591,6 +650,7 @@ class MagnetHandle:
 
     @property
     def dbulk(self) -> float | None:
+        self._assert_active_context()
         return self.Dbulk
 
     @dbulk.setter
@@ -599,6 +659,7 @@ class MagnetHandle:
 
     def _resolved_geometry(self) -> object:
         """Return geometry with a stable per-magnet geometry asset name."""
+        self._assert_active_context()
         geom = self._shape
         if hasattr(geom, "name"):
             import copy
@@ -609,6 +670,7 @@ class MagnetHandle:
 
     def _to_ferromagnet(self) -> Ferromagnet:
         """Convert to class-based Ferromagnet."""
+        self._assert_active_context()
         if self.Ms is None:
             raise ValueError(f"Magnet '{self._name}': Ms not set")
         if self.Aex is None:
@@ -664,6 +726,7 @@ class MagnetHandle:
         priority: int = 0,
         realization_policy: str = "inherit",
     ) -> ObjectRegion:
+        self._assert_active_context()
         if name in self.regions:
             raise ValueError(f"Magnet '{self._name}' already has a region named {name!r}")
         resolved_region_id = (
@@ -681,11 +744,13 @@ class MagnetHandle:
             priority=priority,
             realization_policy=realization_policy,
         )
+        region._context_guard = self._assert_active_context
         region._delete_callback = lambda region_id=region.region_id: self.remove_region(region_id)
         self._object_regions.append(region)
         return region
 
     def remove_region(self, region: ObjectRegion | str | int) -> ObjectRegion:
+        self._assert_active_context()
         index, resolved = self._resolve_region_index(region)
         removed = self._object_regions.pop(index)
         removed._delete_callback = None
@@ -698,6 +763,7 @@ class MagnetHandle:
         return removed
 
     def rename_region(self, region: ObjectRegion | str | int, name: str) -> ObjectRegion:
+        self._assert_active_context()
         _, resolved = self._resolve_region_index(region)
         new_name = require_non_empty(name, "name")
         if new_name != resolved.name and new_name in self.regions:
@@ -708,6 +774,7 @@ class MagnetHandle:
         return resolved
 
     def reorder_region(self, region: ObjectRegion | str | int, index: int) -> ObjectRegion:
+        self._assert_active_context()
         current_index, resolved = self._resolve_region_index(region)
         count = len(self._object_regions)
         target = int(index)
@@ -720,6 +787,7 @@ class MagnetHandle:
         return resolved
 
     def _resolve_region_index(self, region: ObjectRegion | str | int) -> tuple[int, ObjectRegion]:
+        self._assert_active_context()
         if isinstance(region, ObjectRegion):
             for index, candidate in enumerate(self._object_regions):
                 if candidate is region:
@@ -746,6 +814,7 @@ class MagnetHandle:
         priority: int = 0,
         conflict_policy: str = "error",
     ) -> "MagnetHandle":
+        self._assert_active_context()
         field = value if isinstance(value, MaterialParameterField) else MaterialParameterField.constant(value, unit=unit)
         if isinstance(region, ObjectRegion):
             region_id = region.region_id
@@ -771,6 +840,7 @@ class MagnetHandle:
         return self
 
     def surface(self, selector: str) -> CouplingEndpoint:
+        self._assert_active_context()
         return CouplingEndpoint.surface(self._name, selector)
 
     def visualization(
@@ -834,6 +904,7 @@ class MagnetHandle:
         field_component:
             Field component to display: ``"x"``, ``"y"``, ``"z"``, ``"magnitude"``.
         """
+        self._assert_active_context()
         _VALID_SURFACE_COLOR_SOURCE = {
             "solid", "orientation", "component_x", "component_y",
             "component_z", "magnitude", "colormap",
@@ -915,6 +986,7 @@ class MagnetHandle:
         sample: int = -1,
         mode: str = "auto",
     ):
+        self._assert_active_context()
         from fullmag.init import load_field_state
 
         quantity_id = _normalize_quantity_name(getattr(quantity, "name", quantity or "m"))
@@ -941,6 +1013,7 @@ class MagnetHandle:
         dataset: str | None = None,
         units: str | None = None,
     ) -> Path:
+        self._assert_active_context()
         from fullmag.init import FieldState, SampledMagnetization, save_field_state
 
         quantity_id = _normalize_quantity_name(getattr(quantity, "name", quantity or "m"))
@@ -978,21 +1051,26 @@ class MagnetizationHandle:
 
     @property
     def value(self) -> Any:
+        self._owner._assert_active_context()
         return self._owner._m_value
 
     @property
     def table_expression(self) -> str:
         """Stable object-scoped table expression used by ``study.tableadd``."""
+        self._owner._assert_active_context()
         return f"{self._owner._name}.m"
 
     def get(self) -> Any:
+        self._owner._assert_active_context()
         return self._owner._m_value
 
     def set(self, value: Any) -> Any:
+        self._owner._assert_active_context()
         self._owner._m_value = value
         return value
 
     def clear(self) -> None:
+        self._owner._assert_active_context()
         self._owner._m_value = None
 
     def loadfile(
@@ -1003,6 +1081,7 @@ class MagnetizationHandle:
         dataset: str | None = None,
         sample: int = -1,
     ):
+        self._owner._assert_active_context()
         from fullmag.init import load_magnetization
 
         state = load_magnetization(path, format=format, dataset=dataset, sample=sample)
@@ -1016,6 +1095,7 @@ class MagnetizationHandle:
         format: str = "auto",
         dataset: str = "values",
     ) -> Path:
+        self._owner._assert_active_context()
         from fullmag.init import SampledMagnetization, save_magnetization
 
         value = self._owner._m_value
@@ -1029,9 +1109,11 @@ class MagnetizationHandle:
         return save_magnetization(path, value, format=format, dataset=dataset)
 
     def __bool__(self) -> bool:
+        self._owner._assert_active_context()
         return self._owner._m_value is not None
 
     def __repr__(self) -> str:
+        self._owner._assert_active_context()
         return repr(self._owner._m_value)
 
 
@@ -1669,6 +1751,7 @@ class GeometryMeshHandle:
         exact_layer_count : bool, optional
             Require the requested through-thickness element count exactly.
         """
+        self._owner._assert_active_context()
         if source is not None:
             raise ValueError(
                 "per-object mesh source is unavailable; use FEM(mesh=...) for "
@@ -1891,6 +1974,7 @@ class GeometryMeshHandle:
             flower.mesh.algorithm(dim3=10)  # HXT for 3D
             flower.mesh.algorithm(dim2=6, dim3=1)  # Frontal-Delaunay 2D, Delaunay 3D
         """
+        self._owner._assert_active_context()
         if dim2 is not None:
             self._owner._mesh_spec.algorithm_2d = dim2
         if dim3 is not None:
@@ -1913,17 +1997,20 @@ class GeometryMeshHandle:
                 ZMin=-5e-9, ZMax=5e-9,
             )
         """
+        self._owner._assert_active_context()
         self._owner._mesh_spec.size_fields.append({"kind": kind, "params": dict(params)})
         return self
 
     def build(self) -> "GeometryMeshHandle":
+        self._owner._assert_active_context()
         self._owner._mesh_spec.build_requested = True
-        if _capture_enabled:
+        if _capture_binding.current().enabled:
             return self
         _build_explicit_mesh_assets(_include_mesh_ir=False)
         return self
 
     def optimize(self, method: str | None = None, iterations: int = 1) -> "GeometryMeshHandle":
+        self._owner._assert_active_context()
         self._owner._mesh_spec.operations.append(
             _MeshOperationSpec(
                 kind="optimize",
@@ -1933,12 +2020,14 @@ class GeometryMeshHandle:
         return self
 
     def refine(self, steps: int = 1) -> "GeometryMeshHandle":
+        self._owner._assert_active_context()
         self._owner._mesh_spec.operations.append(
             _MeshOperationSpec(kind="refine", params={"steps": steps})
         )
         return self
 
     def smooth(self, iterations: int = 1) -> "GeometryMeshHandle":
+        self._owner._assert_active_context()
         self._owner._mesh_spec.operations.append(
             _MeshOperationSpec(kind="smooth", params={"iterations": iterations})
         )
@@ -1977,6 +2066,7 @@ class GeometryMeshHandle:
         exact_layers : bool, optional
             Require the realized mesh to preserve exactly ``elements`` layers.
         """
+        self._owner._assert_active_context()
         layer_count = _element_layer_count(
             elements,
             context=f"{self._owner._name}.mesh.swept.elements",
@@ -2090,6 +2180,7 @@ class GeometryMeshHandle:
         preset. ``topology="prismatic"`` requests strict P1 prism layers with
         a pyramid-to-tetrahedra shared-domain transition.
         """
+        self._owner._assert_active_context()
         layer_count = _element_layer_count(
             layers,
             context=f"{self._owner._name}.mesh.thin_film.layers",
@@ -2302,6 +2393,7 @@ class GeometryMeshHandle:
         Returns the ``MeshQualityReport`` from the most recent ``build()`` call,
         or ``None`` if quality extraction was not requested.
         """
+        self._owner._assert_active_context()
         return self._owner._last_mesh_quality
 
 
@@ -2382,7 +2474,7 @@ class StudyUniverseConfig:
 
 
 # ---------------------------------------------------------------------------
-# World state singleton
+# Context-bound world state
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -2397,6 +2489,7 @@ class _WorldState:
     _precision: str | None = None
     _execution_mode: str | None = None
     _cpu_threads: int | None = None
+    _parallel_execution: ParallelExecutionPolicy | None = None
     _boundary_correction: str | None = None  # "none" | "volume" | "full"
 
     # Grid
@@ -2415,15 +2508,18 @@ class _WorldState:
     _domain_object_region_markers: list[dict[str, object]] | None = None
     _frozen_magnetic_submesh_source: dict[str, object] | None = None
     _extra_runtime_metadata: dict[str, object] = field(default_factory=dict)
+    _legacy_execution_selection_calls: set[str] = field(default_factory=set)
     _exchange_enabled: bool = True
     _demag_enabled: bool = True
     _demag_realization: str | None = None
     _thermal_noise: ThermalNoise | None = None
+    _parameters: ParameterLibrary = field(default_factory=ParameterLibrary)
 
     # Magnets (ordered)
     _magnets: list[MagnetHandle] = field(default_factory=list)
     _auxiliary_geometries: list[object] = field(default_factory=list)
     _auxiliary_geometry_roles: dict[str, str] = field(default_factory=dict)
+    _auxiliary_geometry_object_ids: dict[str, str] = field(default_factory=dict)
     _couplings: CouplingRegistry = field(default_factory=CouplingRegistry)
     _loaded_field_states: dict[tuple[str, str, str], object] = field(default_factory=dict)
 
@@ -2450,6 +2546,14 @@ class _WorldState:
     _outputs_explicit: bool = False
     _table_autosave: TableAutosave | None = None
     _current_modules: list[AntennaFieldSource | CurrentTransport] = field(default_factory=list)
+    _antenna_port_modes: list[AntennaPortMode] = field(default_factory=list)
+    _antenna_field_solve_stages: list[AntennaFieldSolveStage] = field(default_factory=list)
+    _antenna_target_projections: list[AntennaTargetProjection] = field(default_factory=list)
+    _solved_antenna_drives: list[SolvedAntennaDrive] = field(default_factory=list)
+    _antenna_spectrum_requests: list[AntennaSpectrumRequest] = field(default_factory=list)
+    _antenna_authoring_inventory: AntennaAuthoringInventory = field(
+        default_factory=AntennaAuthoringInventory
+    )
     _field_drives: list[RegionalFieldDrive] = field(default_factory=list)
     _planar_monitors: list[PlanarMonitor] = field(default_factory=list)
     _spin_torques: list[SpinTorqueModule] = field(default_factory=list)
@@ -2485,10 +2589,6 @@ class _WorldState:
     _magnetization_constraints: list[FrozenSpins] = field(default_factory=list)
 
 
-# Module-level singleton
-_state = _WorldState()
-_capture_enabled = False
-_capture_skip_geometry_assets = False
 _RELAXATION_DEFAULT_TORQUE_TOLERANCE_APM = DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM
 _RELAXATION_DEFAULT_TORQUE_TOLERANCE_T = DEFAULT_RELAXATION_TORQUE_TOLERANCE_T
 _RELAX_UNSET = object()
@@ -2504,6 +2604,163 @@ class CapturedStage:
     output_every_seconds: float | None = None
     table_autosave: TableAutosave | None = None
     autosave: StageAutosave | None = None
+
+
+@dataclass
+class _CaptureState:
+    enabled: bool = False
+    skip_geometry_assets: bool = False
+    stages: list[CapturedStage] = field(default_factory=list)
+
+
+_ContextValue = TypeVar("_ContextValue")
+
+
+def _execution_owner() -> tuple[int, int | None]:
+    """Return the thread/task owner of the active authoring context.
+
+    ``ContextVar`` values are inherited by newly-created asyncio tasks.  A
+    mutable ``_WorldState`` must not follow that inheritance by reference:
+    otherwise two request tasks can append objects to the same flat script.
+    The owner stamp lets the binding fork a fresh state at the first access in
+    the child task while preserving normal single-task flat-script behavior.
+    """
+
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return (threading.get_ident(), id(task) if task is not None else None)
+
+
+@dataclass
+class _ContextSlot(Generic[_ContextValue]):
+    value: _ContextValue
+    owner: tuple[int, int | None]
+
+
+class _ContextBinding(Generic[_ContextValue]):
+    """ContextVar binding that forks inherited mutable values by owner."""
+
+    def __init__(self, name: str, factory: Callable[[], _ContextValue]) -> None:
+        self._factory = factory
+        self._var: ContextVar[_ContextSlot[_ContextValue] | None] = ContextVar(
+            name,
+            default=None,
+        )
+
+    def current(self) -> _ContextValue:
+        slot = self._var.get()
+        owner = _execution_owner()
+        if slot is None or slot.owner != owner:
+            slot = _ContextSlot(self._factory(), owner)
+            self._var.set(slot)
+        return slot.value
+
+    def replace(self, value: _ContextValue) -> None:
+        self._var.set(_ContextSlot(value, _execution_owner()))
+
+    def bind(self, value: _ContextValue) -> Token[_ContextSlot[_ContextValue] | None]:
+        return self._var.set(_ContextSlot(value, _execution_owner()))
+
+    def reset(self, token: Token[_ContextSlot[_ContextValue] | None]) -> None:
+        self._var.reset(token)
+
+
+class _WorldStateBinding:
+    """Attribute-compatible proxy preserving the legacy ``world._state`` name."""
+
+    def __init__(self) -> None:
+        self._binding = _ContextBinding("fullmag_world_state", _WorldState)
+
+    def current(self) -> _WorldState:
+        return self._binding.current()
+
+    def replace(self, state: _WorldState | None = None) -> None:
+        self._binding.replace(state if state is not None else _WorldState())
+
+    def bind(self, state: _WorldState) -> Token[_ContextSlot[_WorldState] | None]:
+        return self._binding.bind(state)
+
+    def reset(self, token: Token[_ContextSlot[_WorldState] | None]) -> None:
+        self._binding.reset(token)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.current(), name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_binding":
+            object.__setattr__(self, name, value)
+            return
+        setattr(self.current(), name, value)
+
+    def __repr__(self) -> str:
+        return repr(self.current())
+
+
+_state = _WorldStateBinding()
+_capture_binding = _ContextBinding("fullmag_capture_state", _CaptureState)
+
+
+class ExecutionContext:
+    """Isolated authoring context for the compatible flat Python DSL.
+
+    A context owns a fresh mutable world and capture state.  Entering a nested
+    context binds it for the current thread/task; leaving it restores the
+    previous binding even when the body raises.  The legacy module-level DSL
+    continues to use the current context when no explicit block is needed.
+    """
+
+    def __init__(self) -> None:
+        self._state = _WorldState()
+        self._state_token: Token[_ContextSlot[_WorldState] | None] | None = None
+        self._capture_token: Token[_ContextSlot[_CaptureState] | None] | None = None
+
+    @property
+    def state(self) -> _WorldState:
+        """Return this context's owned mutable state for diagnostics."""
+
+        return self._state
+
+    def _assert_active(self) -> None:
+        if _state.current() is not self._state:
+            raise RuntimeError(
+                "ExecutionContext materialization requires its active authoring context"
+            )
+
+    def materialize_problem(self, **kwargs: Any) -> Problem:
+        """Build an immutable :class:`Problem` from this context's definition.
+
+        Authoring calls only accumulate definition state.  This explicit
+        boundary performs the existing lowering/validation step and remains
+        bound to the context that owns the authored handles; it does not run a
+        solver or invoke the mesh asset builder.
+        """
+
+        self._assert_active()
+        return _build_problem(**kwargs)
+
+    def __enter__(self) -> "ExecutionContext":
+        if self._state_token is not None:
+            raise RuntimeError("ExecutionContext cannot be entered twice concurrently")
+        self._state_token = _state.bind(self._state)
+        self._capture_token = _capture_binding.bind(_CaptureState())
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        if self._capture_token is None or self._state_token is None:
+            raise RuntimeError("ExecutionContext exit without a matching enter")
+        _capture_binding.reset(self._capture_token)
+        _state.reset(self._state_token)
+        self._capture_token = None
+        self._state_token = None
+        return False
+
+
+def execution_context() -> ExecutionContext:
+    """Create an isolated context for concurrent or nested authoring."""
+
+    return ExecutionContext()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2552,6 +2809,7 @@ class EigenmodesStageSpec:
     bias_field_sweep: BiasFieldSweep | None = None
     bc: str | dict[str, object] = "free"
     magnetostatic_bc: str = "open"
+    solver_policy: FemEigenSolverPolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2578,8 +2836,6 @@ class SaveStateStageSpec:
     format: str | None = None
     dataset: str | None = None
 
-
-_captured_stages: list[CapturedStage] = []
 
 _MU_0 = 4.0e-7 * math.pi
 _MU_B = 9.274_010_078_3e-24
@@ -2983,7 +3239,15 @@ def eigenmodes_stage(
     bias_field_sweep: BiasFieldSweep | None = None,
     bc: str | dict[str, object] = "free",
     magnetostatic_bc: str = "open",
+    solver_rtol: float | None = None,
+    solver_max_outer_iterations: int | None = None,
+    solver_max_linear_iterations: int | None = None,
 ) -> EigenmodesStageSpec:
+    solver_policy = _fem_eigen_solver_policy(
+        solver_rtol=solver_rtol,
+        solver_max_outer_iterations=solver_max_outer_iterations,
+        solver_max_linear_iterations=solver_max_linear_iterations,
+    )
     return EigenmodesStageSpec(
         count=count,
         target=target,
@@ -3001,6 +3265,7 @@ def eigenmodes_stage(
         bias_field_sweep=bias_field_sweep,
         bc=bc,
         magnetostatic_bc=magnetostatic_bc,
+        solver_policy=solver_policy,
     )
 
 
@@ -3084,6 +3349,25 @@ def _frequency_response_solver_policy(
     )
 
 
+def _fem_eigen_solver_policy(
+    *,
+    solver_rtol: float | None,
+    solver_max_outer_iterations: int | None,
+    solver_max_linear_iterations: int | None,
+) -> FemEigenSolverPolicy | None:
+    if (
+        solver_rtol is None
+        and solver_max_outer_iterations is None
+        and solver_max_linear_iterations is None
+    ):
+        return None
+    return FemEigenSolverPolicy(
+        residual_tolerance=solver_rtol,
+        max_outer_iterations=solver_max_outer_iterations,
+        max_linear_iterations=solver_max_linear_iterations,
+    )
+
+
 def save_state_stage(
     *,
     artifact_name: str = "state_snapshot",
@@ -3159,7 +3443,7 @@ def _capture_stage(stage_spec: object) -> CapturedStage:
             default_until_seconds=None,
         )
     if isinstance(stage_spec, RunStageSpec):
-        problem = _build_problem()
+        problem = _build_problem(study_kind="time_evolution")
         if not isinstance(problem.study, TimeEvolution):
             raise TypeError("run stage requires a time-evolution study")
         return CapturedStage(
@@ -3187,6 +3471,7 @@ def _capture_stage(stage_spec: object) -> CapturedStage:
                 eigen_bias_field_sweep=stage_spec.bias_field_sweep,
                 eigen_spin_wave_bc=stage_spec.bc,
                 eigen_magnetostatic_bc=stage_spec.magnetostatic_bc,
+                eigen_solver_policy=stage_spec.solver_policy,
             ),
             entrypoint_kind="flat_eigenmodes",
             default_until_seconds=None,
@@ -3594,39 +3879,43 @@ def _normalize_domain_region_markers(
 
 def reset() -> None:
     """Reset world state to defaults (useful between scripts)."""
-    global _state
-    _state = _WorldState()
+    _state.replace()
 
 
 def begin_script_capture(source_root: str | Path | None = None) -> None:
     """Enable loader capture mode for flat scripts."""
-    global _capture_enabled, _captured_stages, _capture_skip_geometry_assets
     reset()
     _state._script_source_root = Path(source_root).resolve() if source_root is not None else None
-    _capture_enabled = True
-    _capture_skip_geometry_assets = False
-    _captured_stages = []
+    capture = _capture_binding.current()
+    capture.enabled = True
+    capture.skip_geometry_assets = False
+    capture.stages.clear()
 
 
 def set_script_capture_lightweight_assets(enabled: bool) -> None:
-    global _capture_skip_geometry_assets
-    _capture_skip_geometry_assets = bool(enabled)
+    _capture_binding.current().skip_geometry_assets = bool(enabled)
 
 
 def finish_script_capture() -> list[CapturedStage]:
     """Return captured flat-script execution data and clear capture mode."""
-    global _capture_enabled, _captured_stages, _capture_skip_geometry_assets
-    captured = list(_captured_stages)
-    _capture_enabled = False
-    _capture_skip_geometry_assets = False
-    _captured_stages = []
+    captured = list(_capture_binding.current().stages)
+    _capture_binding.replace(_CaptureState())
     reset()
     return captured
 
 
+def capture_executed_stages() -> list[CapturedStage]:
+    """Read executed stages without ending capture or resetting authoring state."""
+    return list(_capture_binding.current().stages)
+
+
 def capture_workspace_problem() -> Problem | None:
     """Materialize the current flat-script world without requiring run()/relax()."""
-    if not _capture_enabled or not _state._magnets:
+    has_antenna_stage = bool(
+        _state._declared_stages
+        and _state._declared_stages[-1].entrypoint_kind == "flat_antenna_field_solve"
+    )
+    if not _capture_binding.current().enabled or (not _state._magnets and not has_antenna_stage):
         return None
     previous_interactive = _state._interactive
     _state._interactive = True
@@ -3637,9 +3926,14 @@ def capture_workspace_problem() -> Problem | None:
 
 
 def capture_declared_stages() -> list[CapturedStage]:
-    if not _capture_enabled:
+    if not _capture_binding.current().enabled:
         return []
     return list(_state._declared_stages)
+
+
+def capture_antenna_authoring_inventory() -> AntennaAuthoringInventory:
+    """Capture immutable declarations without adding them to solver snapshots."""
+    return _state._antenna_authoring_inventory
 
 
 class RelaxStageBuilder:
@@ -4042,6 +4336,57 @@ class StudyStagesBuilder:
             _state._wait_for_solve = True
         return self
 
+    def add_antenna_field_solve(
+        self,
+        *,
+        id: str,
+        definition: AntennaFieldSolveStage,
+    ) -> AntennaStageOutputRef:
+        """Declare a static antenna-field precompute and return its symbolic output."""
+        stage_id = require_non_empty(id, "id")
+        if not isinstance(definition, AntennaFieldSolveStage):
+            raise TypeError("definition must be an AntennaFieldSolveStage")
+        if any(
+            stage.stage_id == stage_id
+            for stage in _state._declared_stages
+            if stage.stage_id is not None
+        ):
+            raise ValueError(f"duplicate stage_id {stage_id!r}")
+        if any(stage.id == stage_id for stage in _state._antenna_field_solve_stages):
+            raise ValueError(f"duplicate antenna field solve id {stage_id!r}")
+        normalized_definition = replace(definition, id=stage_id)
+        declared_definition = next((
+            item for item in _state._antenna_authoring_inventory.antenna_field_solve_stages
+            if item.id == stage_id
+        ), None)
+        if declared_definition is not None and declared_definition != normalized_definition:
+            raise ValueError(f"conflicting antenna field solve declaration {stage_id!r}")
+        basis_outputs = [
+            output
+            for output in normalized_definition.outputs
+            if output.quantity == "H_ant_basis"
+        ]
+        if len(basis_outputs) != 1:
+            raise ValueError(
+                "antenna field solve requires exactly one H_ant_basis output"
+            )
+        problem_before_action = _build_problem(study_kind="antenna_field_solve")
+        _state._antenna_field_solve_stages.append(normalized_definition)
+        _state._declared_stages.append(
+            CapturedStage(
+                problem=problem_before_action,
+                entrypoint_kind="flat_antenna_field_solve",
+                action={
+                    "kind": "antenna_field_solve",
+                    "definition": normalized_definition.to_ir(),
+                },
+                stage_id=stage_id,
+            )
+        )
+        if _state._interactive:
+            _state._wait_for_solve = True
+        return AntennaStageOutputRef(stage_id=stage_id, output_id=basis_outputs[0].id)
+
     def remove_field_drive(
         self,
         drive_id: str,
@@ -4288,6 +4633,7 @@ class StudyStagesBuilder:
     def add_eigenmodes(
         self,
         *,
+        stage_id: str | None = None,
         count: int = 10,
         target: str = "lowest",
         target_frequency: float | None = None,
@@ -4304,6 +4650,9 @@ class StudyStagesBuilder:
         bias_field_sweep: BiasFieldSweep | None = None,
         bc: str | dict[str, object] = "free",
         magnetostatic_bc: str = "open",
+        solver_rtol: float | None = None,
+        solver_max_outer_iterations: int | None = None,
+        solver_max_linear_iterations: int | None = None,
     ) -> "StudyStagesBuilder":
         return self.add_stage(
             eigenmodes_stage(
@@ -4323,7 +4672,12 @@ class StudyStagesBuilder:
                 bias_field_sweep=bias_field_sweep,
                 bc=bc,
                 magnetostatic_bc=magnetostatic_bc,
-            )
+                solver_rtol=solver_rtol,
+                solver_max_outer_iterations=solver_max_outer_iterations,
+                solver_max_linear_iterations=solver_max_linear_iterations,
+            ),
+            stage_id=stage_id,
+            id_kind="eigenmodes",
         )
 
     def add_frequency_response(
@@ -4546,6 +4900,11 @@ class StudyStagesBuilder:
         return self
 
     def change_device(self, device: str) -> "StudyStagesBuilder":
+        if "execution_profile" in _state._extra_runtime_metadata:
+            raise ValueError(
+                "execution_profile_change_device_stage_conflict: use per-step profile "
+                "references in StudyPlan instead of change_device stages"
+            )
         normalized = _normalize_stage_device(device)
         _state._declared_stages.append(
             CapturedStage(
@@ -5318,6 +5677,103 @@ class StudyEnergyTermRegistry:
         return tuple(_state._explicit_energy_terms)
 
 
+def _validate_compute_resources_runtime_intent(
+    compute_resources: object,
+    *,
+    device: str,
+    cpu_threads: int | None,
+    gpu_count: int,
+    device_index: int | None,
+) -> None:
+    """Reject contradictory typed resource and legacy runtime requests."""
+    if not isinstance(compute_resources, dict):
+        return
+
+    cpu = compute_resources.get("cpu")
+    if cpu_threads is not None and isinstance(cpu, dict):
+        if cpu.get("threads") != cpu_threads:
+            raise ValueError(
+                "execution_intent_conflict: runtime_selection.cpu_threads differs "
+                "from compute_resources.cpu.threads"
+            )
+
+    gpu = compute_resources.get("gpu")
+    if not isinstance(gpu, dict):
+        return
+    if device == "cpu":
+        raise ValueError(
+            "execution_intent_conflict: GPU resources contradict runtime_selection.device=cpu"
+        )
+    if gpu_count > 0 and gpu.get("devices_per_task") != gpu_count:
+        raise ValueError(
+            "execution_intent_conflict: runtime_selection.gpu_count differs from "
+            "compute_resources.gpu.devices_per_task"
+        )
+    device_uuids = gpu.get("device_uuids")
+    if (
+        isinstance(device_uuids, (list, tuple))
+        and device_uuids
+        and device_index is not None
+    ):
+        raise ValueError(
+            "execution_intent_conflict: GPU UUID selector and legacy ordinal require "
+            "explicit inventory resolution"
+        )
+
+
+def _validate_current_compute_resources_runtime_intent() -> None:
+    _validate_compute_resources_runtime_intent(
+        _state._extra_runtime_metadata.get("compute_resources"),
+        device=_state._device,
+        cpu_threads=_state._cpu_threads,
+        gpu_count=_state._gpu_count,
+        device_index=_state._device_index,
+    )
+
+
+def _check_legacy_execution_selection_call(selection: str) -> None:
+    if "execution_profile" in _state._extra_runtime_metadata:
+        raise ValueError(
+            "execution_profile_selection_conflict: legacy "
+            f"{selection} selection cannot be combined with study.execution_profile(); "
+            "put the requested value in an ExecutionRequestLayer"
+        )
+
+
+def _record_legacy_execution_selection(selection: str) -> None:
+    _state._legacy_execution_selection_calls.add(selection)
+
+
+def _check_execution_profile_declaration_order() -> None:
+    if _state._legacy_execution_selection_calls:
+        selections = ", ".join(sorted(_state._legacy_execution_selection_calls))
+        raise ValueError(
+            "execution_profile_selection_conflict: declare the profile before legacy "
+            f"execution selections ({selections}); use ExecutionRequestLayer values instead"
+        )
+    declared_stages = _state._declared_stages
+    captured_stages = _capture_binding.current().stages
+    if declared_stages or captured_stages:
+        if any(
+            isinstance(stage.action, Mapping)
+            and stage.action.get("kind") == "change_device"
+            for stage in (*declared_stages, *captured_stages)
+        ):
+            raise ValueError(
+                "execution_profile_change_device_stage_conflict: declare the profile "
+                "before stages; use per-step profile references in StudyPlan"
+            )
+        raise ValueError(
+            "execution_profile_order_conflict: declare the profile before solver or "
+            "pipeline stages; use per-step profile references in StudyPlan"
+        )
+    if _state._last_result is not None:
+        raise ValueError(
+            "execution_profile_order_conflict: declare the profile before direct "
+            "solver execution"
+        )
+
+
 class StudyBuilder:
     """Study-root facade over the current script-local world state."""
 
@@ -5339,6 +5795,209 @@ class StudyBuilder:
     def name(self, problem_name: str) -> "StudyBuilder":
         name(problem_name)
         return self
+
+    def add_antenna_port_mode(self, *, port_mode: AntennaPortMode) -> AntennaPortMode:
+        """Register one authored, signed antenna current-port mode."""
+        if not isinstance(port_mode, AntennaPortMode):
+            raise TypeError("port_mode must be an AntennaPortMode")
+        if any(mode.id == port_mode.id for mode in _state._antenna_port_modes):
+            raise ValueError(f"duplicate antenna port mode id {port_mode.id!r}")
+        _state._antenna_port_modes.append(port_mode)
+        return port_mode
+
+    def _declare_antenna(self, collection: str, value: object) -> None:
+        candidate = _state._antenna_authoring_inventory.declare(collection, value)
+        active = AntennaAuthoringInventory(**{
+            name: tuple(getattr(_state, f"_{name}"))
+            for name in candidate.__dataclass_fields__
+        })
+        candidate.merge_with(active)
+        _state._antenna_authoring_inventory = candidate
+
+    def declare_antenna_field_solve(
+        self, *, definition: AntennaFieldSolveStage
+    ) -> AntennaFieldSolveStage:
+        """Keep a static solve definition without scheduling its execution."""
+        self._declare_antenna("antenna_field_solve_stages", definition)
+        return definition
+
+    def declare_antenna_target_projection(
+        self, *, projection: AntennaTargetProjection
+    ) -> AntennaTargetProjection:
+        """Keep a target projection independently of a field drive."""
+        self._declare_antenna("antenna_target_projections", projection)
+        return projection
+
+    def declare_solved_antenna_drive(
+        self, *, drive: SolvedAntennaDrive
+    ) -> SolvedAntennaDrive:
+        """Keep a drive declaration without activating its field."""
+        self._declare_antenna("solved_antenna_drives", drive)
+        return drive
+
+    def declare_antenna_spectrum_request(
+        self, *, request: AntennaSpectrumRequest
+    ) -> AntennaSpectrumRequest:
+        """Keep a source-spectrum request without scheduling analysis."""
+        self._declare_antenna("antenna_spectrum_requests", request)
+        return request
+
+    def add_solved_antenna_drive(
+        self,
+        *,
+        drive: SolvedAntennaDrive,
+        projection: AntennaTargetProjection,
+    ) -> SolvedAntennaDrive:
+        """Register a solved antenna drive and its target projection."""
+        if not isinstance(drive, SolvedAntennaDrive):
+            raise TypeError("drive must be a SolvedAntennaDrive")
+        if not isinstance(projection, AntennaTargetProjection):
+            raise TypeError("projection must be an AntennaTargetProjection")
+        if drive.projection_ref != projection.id:
+            raise ValueError(
+                "drive.projection_ref must match the supplied projection.id"
+            )
+        for collection, value in (
+            ("solved_antenna_drives", drive), ("antenna_target_projections", projection)
+        ):
+            declared = next((item for item in getattr(_state._antenna_authoring_inventory, collection)
+                             if item.id == value.id), None)
+            if declared is not None and declared != value:
+                raise ValueError(f"conflicting {collection} declaration {value.id!r}")
+        if isinstance(projection.solution, (AntennaStageOutputRef, AntennaFieldSolutionRef)):
+            solve = next(
+                (
+                    stage
+                    for stage in _state._antenna_field_solve_stages
+                    if stage.id == projection.solution.stage_id
+                ),
+                None,
+            )
+            if solve is None:
+                raise ValueError(
+                    f"projection.solution references unknown antenna field solve "
+                    f"{projection.solution.stage_id!r}"
+                )
+            if not any(
+                output.id == projection.solution.output_id
+                and output.quantity == "H_ant_basis"
+                for output in solve.outputs
+            ):
+                raise ValueError(
+                    f"projection.solution must reference an H_ant_basis output "
+                    f"{projection.solution.output_id!r} on solve "
+                    f"{projection.solution.stage_id!r}"
+                )
+            if drive.port_mode_id not in solve.port_mode_ids:
+                raise ValueError(
+                    f"drive.port_mode_id {drive.port_mode_id!r} is not in antenna "
+                    f"field solve {solve.id!r}"
+                )
+        else:
+            raise TypeError(
+                "projection.solution must be an AntennaStageOutputRef or "
+                "AntennaFieldSolutionRef"
+            )
+        existing_projection = next(
+            (item for item in _state._antenna_target_projections if item.id == projection.id),
+            None,
+        )
+        if existing_projection is not None and existing_projection != projection:
+            raise ValueError(f"conflicting antenna projection id {projection.id!r}")
+        if any(item.id == drive.id for item in _state._solved_antenna_drives):
+            raise ValueError(f"duplicate solved antenna drive id {drive.id!r}")
+        if any(
+            stage.stage_id == drive.id
+            for stage in _state._declared_stages
+            if stage.stage_id is not None
+        ):
+            raise ValueError(f"duplicate stage_id {drive.id!r}")
+        problem_before_action = _build_problem()
+        if existing_projection is None:
+            _state._antenna_target_projections.append(projection)
+        _state._solved_antenna_drives.append(drive)
+        _state._declared_stages.append(
+            CapturedStage(
+                problem=problem_before_action,
+                entrypoint_kind="flat_add_solved_antenna_drive",
+                action={
+                    "kind": "add_solved_antenna_drive",
+                    "projection": projection.to_ir(),
+                    "drive": drive.to_ir(),
+                },
+                stage_id=drive.id,
+            )
+        )
+        return drive
+
+    def add_antenna_spectrum_request(
+        self,
+        *,
+        request: AntennaSpectrumRequest,
+    ) -> AntennaSpectrumRequest:
+        """Register a source-field spectrum for a declared antenna solve output."""
+        if not isinstance(request, AntennaSpectrumRequest):
+            raise TypeError("request must be an AntennaSpectrumRequest")
+        declared = next((item for item in _state._antenna_authoring_inventory.antenna_spectrum_requests
+                         if item.id == request.id), None)
+        if declared is not None and declared != request:
+            raise ValueError(f"conflicting antenna spectrum declaration {request.id!r}")
+        if any(item.id == request.id for item in _state._antenna_spectrum_requests):
+            raise ValueError(f"duplicate antenna spectrum request id {request.id!r}")
+        if any(item.output_id == request.output_id for item in _state._antenna_spectrum_requests):
+            raise ValueError(f"duplicate antenna spectrum output_id {request.output_id!r}")
+        solve = next(
+            (
+                stage
+                for stage in _state._antenna_field_solve_stages
+                if stage.id == request.solution_ref.stage_id
+            ),
+            None,
+        )
+        if solve is None or not any(
+            output.id == request.solution_ref.output_id
+            and output.quantity == "H_ant_basis"
+            for output in solve.outputs
+        ):
+            raise ValueError("antenna spectrum request must reference an H_ant_basis solve output")
+        if request.port_mode_id is not None and request.port_mode_id not in solve.port_mode_ids:
+            raise ValueError("antenna spectrum request port_mode_id is not in its solve stage")
+        if any(
+            stage.stage_id == request.id
+            for stage in _state._declared_stages
+            if stage.stage_id is not None
+        ):
+            raise ValueError(f"duplicate stage_id {request.id!r}")
+        problem_before_action = _build_problem()
+        _state._antenna_spectrum_requests.append(request)
+        _state._declared_stages.append(
+            CapturedStage(
+                problem=problem_before_action,
+                entrypoint_kind="flat_antenna_source_spectrum",
+                action={"kind": "antenna_source_spectrum", "request": request.to_ir()},
+                stage_id=request.id,
+            )
+        )
+        return request
+
+    def parameter(
+        self,
+        parameter_name: str,
+        value: object,
+        *,
+        unit: str = "1",
+        display_unit: str | None = None,
+        description: str | None = None,
+    ) -> ParameterDefinition:
+        """Declare one versioned authoring parameter in this study."""
+
+        return parameter(
+            parameter_name,
+            value,
+            unit=unit,
+            display_unit=display_unit,
+            description=description,
+        )
 
     def load(
         self,
@@ -5366,8 +6025,50 @@ class StudyBuilder:
         engine(backend)
         return self
 
+    def execution_profile(
+        self,
+        profile: ExecutionProfile,
+        *,
+        layers: Sequence[ExecutionRequestLayer] = (),
+    ) -> "StudyBuilder":
+        """Attach an immutable profile and explicit layers for shared materialization."""
+        if not isinstance(profile, ExecutionProfile):
+            raise TypeError("execution_profile() requires an ExecutionProfile value")
+        _check_execution_profile_declaration_order()
+        if isinstance(layers, (str, bytes)) or not isinstance(layers, Sequence):
+            raise TypeError("execution_profile() layers must be a sequence of ExecutionRequestLayer")
+        layer_values = list(layers)
+        if any(not isinstance(layer, ExecutionRequestLayer) for layer in layer_values):
+            raise TypeError("execution_profile() layers must contain ExecutionRequestLayer values")
+        profile_ir = profile.to_ir()
+        layers_ir = [layer.to_ir() for layer in layer_values]
+        _state._extra_runtime_metadata["execution_profile"] = profile_ir
+        if layers_ir:
+            _state._extra_runtime_metadata["execution_layers"] = layers_ir
+        else:
+            _state._extra_runtime_metadata.pop("execution_layers", None)
+        return self
+
     def device(self, spec: str, *, precision: str | None = None) -> "StudyBuilder":
-        device(spec, precision=precision)
+        previous = (
+            _state._device,
+            _state._gpu_count,
+            _state._device_index,
+            _state._precision,
+        )
+        previous_selection_calls = set(_state._legacy_execution_selection_calls)
+        try:
+            device(spec, precision=precision)
+            _validate_current_compute_resources_runtime_intent()
+        except Exception:
+            (
+                _state._device,
+                _state._gpu_count,
+                _state._device_index,
+                _state._precision,
+            ) = previous
+            _state._legacy_execution_selection_calls = previous_selection_calls
+            raise
         return self
 
     def mode(self, execution_mode: str) -> "StudyBuilder":
@@ -5375,7 +6076,71 @@ class StudyBuilder:
         return self
 
     def threads(self, cpu_threads: int) -> "StudyBuilder":
-        threads(cpu_threads)
+        previous = _state._cpu_threads
+        previous_selection_calls = set(_state._legacy_execution_selection_calls)
+        try:
+            threads(cpu_threads)
+            _validate_current_compute_resources_runtime_intent()
+        except Exception:
+            _state._cpu_threads = previous
+            _state._legacy_execution_selection_calls = previous_selection_calls
+            raise
+        return self
+
+    def resources(self, value: ComputeResources) -> "StudyBuilder":
+        """Set the typed compute-resource request preserved in ProblemIR."""
+        if not isinstance(value, ComputeResources):
+            raise TypeError("resources() requires a ComputeResources value")
+        _check_legacy_execution_selection_call("resources")
+        request = value.to_ir()
+        _validate_compute_resources_runtime_intent(
+            request,
+            device=_state._device,
+            cpu_threads=_state._cpu_threads,
+            gpu_count=_state._gpu_count,
+            device_index=_state._device_index,
+        )
+        _state._extra_runtime_metadata["compute_resources"] = request
+        _record_legacy_execution_selection("resources")
+        return self
+
+    def parallel_execution(
+        self,
+        policy: ParallelExecutionPolicy | Mapping[str, object] | None = None,
+        **kwargs: object,
+    ) -> "StudyBuilder":
+        parallel_execution(policy, **kwargs)
+        return self
+
+    def storage(
+        self,
+        output_storage: OutputStorage | None = None,
+        *,
+        output_dir: str | None = None,
+        temp_dir: str | None = None,
+        data_format: str | None = None,
+        cleanup: str | None = None,
+        existing_output: str | None = None,
+    ) -> "StudyBuilder":
+        """Set this study's result directory, data format, and scratch policy."""
+        if output_storage is not None and any(
+            value is not None
+            for value in (output_dir, temp_dir, data_format, cleanup, existing_output)
+        ):
+            raise ValueError("pass either OutputStorage or storage fields, not both")
+        if output_storage is None:
+            output_storage = OutputStorage(
+                output_dir=output_dir,
+                temp_dir=temp_dir,
+                data_format=data_format if data_format is not None else "zarr",
+                cleanup=cleanup if cleanup is not None else "on_success",
+                existing_output=(
+                    existing_output if existing_output is not None else "timestamp"
+                ),
+            )
+        elif not isinstance(output_storage, OutputStorage):
+            raise TypeError("output_storage must be an OutputStorage value")
+        _state._extra_runtime_metadata["output_storage"] = output_storage.to_ir()
         return self
 
     def fem_demag_solver(
@@ -5632,14 +6397,19 @@ class StudyBuilder:
         name: str = "object",
         *,
         type: str = "geometry",
+        object_id: str | None = None,
     ) -> object:
-        return geometry_object(shape, name=name, type=type)
+        return geometry_object(shape, name=name, type=type, object_id=object_id)
 
-    def conductor(self, shape: object, name: str = "conductor") -> object:
-        return geometry_object(shape, name=name, type="conductor")
+    def conductor(
+        self, shape: object, name: str = "conductor", *, object_id: str | None = None
+    ) -> object:
+        return geometry_object(shape, name=name, type="conductor", object_id=object_id)
 
-    def antenna_object(self, shape: object, name: str = "antenna") -> object:
-        return antenna_object(shape, name=name)
+    def antenna_object(
+        self, shape: object, name: str = "antenna", *, object_id: str | None = None
+    ) -> object:
+        return antenna_object(shape, name=name, object_id=object_id)
 
     def solver(
         self,
@@ -5691,8 +6461,40 @@ class StudyBuilder:
         *,
         every: SamplingPeriod | None = None,
         indices: Sequence[int] | None = None,
+        branches: Sequence[int] | None = None,
+        all_modes: bool = False,
+        sample_indices: Sequence[int] | None = None,
+        sample_labels: Sequence[str] | None = None,
+        field: str = "mode",
+        name: str = "dispersion",
+        include_branch_table: bool = True,
+        spectrum_quantity: str = "eigenfrequency",
+        spectrum_scope: str = "per_sample",
+        include_tracking: bool = True,
+        include_residuals: bool = True,
+        include_overlaps: bool = True,
+        include_tangent_leakage: bool = True,
+        include_orthogonality: bool = True,
     ) -> "StudyBuilder":
-        save(quantity, every=every, indices=indices)
+        save(
+            quantity,
+            every=every,
+            indices=indices,
+            branches=branches,
+            all_modes=all_modes,
+            sample_indices=sample_indices,
+            sample_labels=sample_labels,
+            field=field,
+            name=name,
+            include_branch_table=include_branch_table,
+            spectrum_quantity=spectrum_quantity,
+            spectrum_scope=spectrum_scope,
+            include_tracking=include_tracking,
+            include_residuals=include_residuals,
+            include_overlaps=include_overlaps,
+            include_tangent_leakage=include_tangent_leakage,
+            include_orthogonality=include_orthogonality,
+        )
         return self
 
     def save_response(self, observable: str = "susceptibility_tensor") -> "StudyBuilder":
@@ -5715,10 +6517,18 @@ class StudyBuilder:
 
     def tableautosave(
         self,
-        every: SamplingPeriod,
+        every: SamplingPeriod | None = None,
         quantities: Sequence[str] | None = None,
+        *,
+        every_steps: int | None = None,
+        table_id: str = "default",
     ) -> "StudyBuilder":
-        tableautosave(every, quantities=quantities)
+        tableautosave(
+            every,
+            quantities=quantities,
+            every_steps=every_steps,
+            table_id=table_id,
+        )
         return self
 
     def tableadd(self, expression: object) -> "StudyBuilder":
@@ -5773,6 +6583,8 @@ class StudyBuilder:
         time_envelope: TimeEnvelope | None = None,
         conservative_current_view: ConservativeCurrentView | None = None,
         structured_current_closure: StructuredCurrentClosure | None = None,
+        conservative_current_source: ExternalLeadCurrentSource | None = None,
+        external_lead_preparation: ExternalLeadPreparation | None = None,
     ) -> CurrentTransport:
         return current_transport(
             name=name,
@@ -5789,6 +6601,8 @@ class StudyBuilder:
             time_envelope=time_envelope,
             conservative_current_view=conservative_current_view,
             structured_current_closure=structured_current_closure,
+            conservative_current_source=conservative_current_source,
+            external_lead_preparation=external_lead_preparation,
         )
 
     def spin_torque(self, module: SpinTorqueModule) -> SpinTorqueModule:
@@ -6056,8 +6870,8 @@ def frequency_response(
         frequency_solver_policy=solver_policy,
     )
 
-    if _capture_enabled:
-        _captured_stages.append(
+    if _capture_binding.current().enabled:
+        _capture_binding.current().stages.append(
             CapturedStage(
                 problem=problem,
                 entrypoint_kind="flat_frequency_response",
@@ -6066,6 +6880,7 @@ def frequency_response(
         )
         return problem
 
+    _guard_profile_direct_execution()
     result = Simulation(problem).run()
     _record_result(result)
     return result
@@ -6076,6 +6891,36 @@ def study(problem_name: str | None = None) -> StudyBuilder:
     if problem_name is not None:
         require_non_empty(problem_name, "problem_name")
     return StudyBuilder(problem_name)
+
+
+def parameter(
+    parameter_name: str,
+    value: object,
+    *,
+    unit: str = "1",
+    display_unit: str | None = None,
+    description: str | None = None,
+) -> ParameterDefinition:
+    """Declare a versioned SI-normalized authoring parameter.
+
+    A numeric ``value`` is converted to a constant expression using ``unit``.
+    Callers can pass :class:`ParameterExpression` for references or arithmetic.
+    The definition is stored in the current context and lowered into
+    ``ProblemIR`` when a problem is materialized.
+    """
+
+    if isinstance(value, ParameterExpression):
+        if unit != "1":
+            raise ValueError("unit is only accepted for numeric parameter values")
+        expression = value
+    else:
+        expression = ParameterExpression.constant(value, unit=unit)
+    return _state._parameters.define(
+        parameter_name,
+        expression,
+        display_unit=display_unit,
+        description=description,
+    )
 
 
 def demag(
@@ -6135,7 +6980,9 @@ def thermal_noise(temperature: float, *, seed: int | None = None) -> ThermalNois
 
 def engine(backend: str) -> None:
     """Set computation backend: ``"fdm"``, ``"fem"``, or ``"auto"``."""
+    _check_legacy_execution_selection_call("backend")
     _state._backend = backend.lower()
+    _record_legacy_execution_selection("backend")
 
 
 def device(spec: str, *, precision: str | None = None) -> None:
@@ -6147,6 +6994,7 @@ def device(spec: str, *, precision: str | None = None) -> None:
         fm.device("cuda:0")
         fm.device("cuda:0", precision="single")
     """
+    _check_legacy_execution_selection_call("device")
     spec = spec.lower()
     if spec == "cpu":
         _state._device = "cpu"
@@ -6165,22 +7013,49 @@ def device(spec: str, *, precision: str | None = None) -> None:
         _state._device = spec
     if precision is not None:
         _state._precision = precision.lower()
+    _record_legacy_execution_selection("device")
+    if precision is not None:
+        _record_legacy_execution_selection("precision")
 
 
 def mode(execution_mode: str) -> None:
     """Set execution policy: ``"strict"``, ``"extended"``, or ``"hybrid"``."""
+    _check_legacy_execution_selection_call("mode")
     normalized = str(execution_mode).strip().lower()
     if normalized not in {"strict", "extended", "hybrid"}:
         raise ValueError("execution_mode must be 'strict', 'extended', or 'hybrid'")
     _state._execution_mode = normalized
+    _record_legacy_execution_selection("mode")
 
 
 def threads(cpu_threads: int) -> None:
     """Set requested CPU thread count for the next run."""
+    _check_legacy_execution_selection_call("threads")
     resolved = int(cpu_threads)
     if resolved < 1:
         raise ValueError("threads() requires cpu_threads >= 1")
     _state._cpu_threads = resolved
+    _record_legacy_execution_selection("threads")
+
+
+def parallel_execution(
+    policy: ParallelExecutionPolicy | Mapping[str, object] | None = None,
+    **kwargs: object,
+) -> ParallelExecutionPolicy:
+    """Set the policy for admitting independent work items.
+
+    ``policy`` may be a :class:`ParallelExecutionPolicy` or an IR-shaped
+    mapping.  Keyword arguments are a convenience for generated scripts.
+    The policy controls admission targets; it does not replace the native
+    runtime's process/thread limits.
+    """
+    if policy is not None and kwargs:
+        raise TypeError("parallel_execution accepts either policy or keyword fields")
+    candidate: ParallelExecutionPolicy | Mapping[str, object]
+    candidate = kwargs if policy is None else policy
+    resolved = ParallelExecutionPolicy.from_ir(candidate)
+    _state._parallel_execution = resolved
+    return resolved
 
 
 def fem_demag_solver(
@@ -6554,7 +7429,7 @@ def fem_order(order: int) -> None:
 def build_mesh() -> None:
     """Materialize the shared FEM mesh asset for the current flat-script model."""
     _state._default_mesh_spec.build_requested = True
-    if _capture_enabled:
+    if _capture_binding.current().enabled:
         return
     _build_explicit_mesh_assets(_include_mesh_ir=False)
 
@@ -6760,6 +7635,11 @@ def adaptive_mesh(
 def runtime_metadata(key: str, value: object) -> None:
     """Attach script-owned runtime metadata to the exported problem."""
     normalized_key = require_non_empty(str(key), "runtime_metadata key")
+    if normalized_key in {"execution_profile", "execution_layers"}:
+        raise ValueError(
+            "execution profile metadata must be authored with "
+            "study.execution_profile()"
+        )
     _state._extra_runtime_metadata[normalized_key] = copy.deepcopy(value)
 
 
@@ -7546,6 +8426,15 @@ def _build_explicit_mesh_assets(
     assets = build_geometry_assets_for_request(
         requested_backend=BackendTarget.FEM,
         geometries=resolved_geometries,
+        geometry_object_ids={
+            **_state._auxiliary_geometry_object_ids,
+            **{
+                handle._resolved_geometry().geometry_name: (
+                    handle._name if handle.object_id is None else handle.object_id
+                )
+                for handle in _state._magnets
+            },
+        },
         discretization=DiscretizationHints(**discretization_kwargs),
         study_universe=(
             _state._study_universe.to_ir()
@@ -7720,6 +8609,12 @@ def geometry(
     Multiple calls register multiple magnets.
     """
     handle = MagnetHandle(shape, name, object_id=object_id)
+    resolved_id = handle.object_id if handle.object_id is not None else handle._name
+    if resolved_id in _state._auxiliary_geometry_object_ids.values() or any(
+        resolved_id == (magnet.object_id if magnet.object_id is not None else magnet._name)
+        for magnet in _state._magnets
+    ):
+        raise ValueError(f"duplicate object_id {resolved_id!r}")
     _state._magnets.append(handle)
     return handle
 
@@ -7729,6 +8624,7 @@ def geometry_object(
     name: str = "object",
     *,
     type: str = "geometry",
+    object_id: str | None = None,
 ) -> object:
     """Register a non-magnetic geometry with an explicit physical object type.
 
@@ -7752,8 +8648,17 @@ def geometry_object(
         raise TypeError("geometry_object() requires a geometry with a geometry_name")
     if geometry_name in _state._auxiliary_geometry_roles:
         raise ValueError(f"duplicate geometry object name {geometry_name!r}")
+    resolved_id = (
+        require_non_empty(object_id, "object_id") if object_id is not None else geometry_name
+    )
+    if resolved_id in _state._auxiliary_geometry_object_ids.values() or any(
+        resolved_id == (magnet.object_id if magnet.object_id is not None else magnet._name)
+        for magnet in _state._magnets
+    ):
+        raise ValueError(f"duplicate object_id {resolved_id!r}")
     _state._auxiliary_geometries.append(resolved)
     _state._auxiliary_geometry_roles[geometry_name] = normalized_type
+    _state._auxiliary_geometry_object_ids[geometry_name] = resolved_id
     if normalized_type == "antenna":
         _state._register_geometry_visualization_hint(
             geometry_name,
@@ -7767,9 +8672,11 @@ def geometry_object(
     return resolved
 
 
-def antenna_object(shape: object, name: str = "antenna") -> object:
+def antenna_object(
+    shape: object, name: str = "antenna", *, object_id: str | None = None
+) -> object:
     """Register a non-magnetic geometry object for prescribed antenna masks."""
-    return geometry_object(shape, name=name, type="antenna")
+    return geometry_object(shape, name=name, type="antenna", object_id=object_id)
 
 
 # ---------------------------------------------------------------------------
@@ -8068,6 +8975,8 @@ def current_transport(
     time_envelope: TimeEnvelope | None = None,
     conservative_current_view: ConservativeCurrentView | None = None,
     structured_current_closure: StructuredCurrentClosure | None = None,
+    conservative_current_source: ExternalLeadCurrentSource | None = None,
+    external_lead_preparation: ExternalLeadPreparation | None = None,
 ) -> CurrentTransport:
     module = CurrentTransport(
         name=name,
@@ -8084,6 +8993,8 @@ def current_transport(
         time_envelope=time_envelope,
         conservative_current_view=conservative_current_view,
         structured_current_closure=structured_current_closure,
+        conservative_current_source=conservative_current_source,
+        external_lead_preparation=external_lead_preparation,
     )
     _state._current_modules.append(module)
     return module
@@ -8165,7 +9076,7 @@ _SCALAR_QUANTITIES = {
     "max_dm_dt",
     "max_h_demag",
 }
-_EIGEN_QUANTITIES = {"spectrum", "mode", "dispersion"}
+_EIGEN_QUANTITIES = {"spectrum", "mode", "dispersion", "diagnostics"}
 
 
 def save(
@@ -8173,6 +9084,20 @@ def save(
     *,
     every: SamplingPeriod | None = None,
     indices: Sequence[int] | None = None,
+    branches: Sequence[int] | None = None,
+    all_modes: bool = False,
+    sample_indices: Sequence[int] | None = None,
+    sample_labels: Sequence[str] | None = None,
+    field: str = "mode",
+    name: str = "dispersion",
+    include_branch_table: bool = True,
+    spectrum_quantity: str = "eigenfrequency",
+    spectrum_scope: str = "per_sample",
+    include_tracking: bool = True,
+    include_residuals: bool = True,
+    include_overlaps: bool = True,
+    include_tangent_leakage: bool = True,
+    include_orthogonality: bool = True,
 ) -> None:
     """Register an output quantity to save periodically.
 
@@ -8181,23 +9106,67 @@ def save(
     quantity : str
         Field name (``"m"``, ``"H_demag"``, ``"H_eff"``),
         scalar name (``"E_ex"``, ``"E_total"``, ``"max_h_eff"``),
-        or eigen quantity (``"spectrum"``, ``"mode"``, ``"dispersion"``).
+        or eigen quantity (``"spectrum"``, ``"mode"``, ``"dispersion"``,
+        ``"diagnostics"``).
     every : float or "auto", optional
         Save interval in seconds, or automatic sampling derived from an active
         sinc drive. Required for field/scalar outputs, ignored for eigen outputs.
-    indices : sequence of int, optional
-        Mode indices for ``"mode"`` output.
+    indices, branches : sequence of int, optional
+        Raw mode indices or tracked branch indices for ``"mode"`` output.
+    all_modes : bool, optional
+        Save every returned solver mode at selected samples. Cannot be
+        combined with indices or branches; does not request extra eigenpairs.
+    sample_indices, sample_labels : sequence, optional
+        Optional sample selectors for ``"mode"`` output.
     """
+    if type(all_modes) is not bool:
+        raise ValueError("all_modes must be a boolean")
+    if all_modes and quantity != "mode":
+        raise ValueError("all_modes applies only to mode output")
+    if quantity == "spectrum":
+        output = SaveSpectrum(quantity=spectrum_quantity, scope=spectrum_scope)
+        _state._outputs_explicit = True
+        _state._outputs.append(output)
+        return
+    if quantity == "diagnostics":
+        output = SaveEigenDiagnostics(
+            include_tracking=include_tracking,
+            include_residuals=include_residuals,
+            include_overlaps=include_overlaps,
+            include_tangent_leakage=include_tangent_leakage,
+            include_orthogonality=include_orthogonality,
+        )
+        _state._outputs_explicit = True
+        _state._outputs.append(output)
+        return
     _state._outputs_explicit = True
     if quantity in _EIGEN_QUANTITIES:
-        if quantity == "spectrum":
-            _state._outputs.append(SaveSpectrum())
-        elif quantity == "mode":
-            if indices is None:
-                raise ValueError("save('mode', indices=[...]) requires mode indices")
-            _state._outputs.append(SaveMode(indices=tuple(indices)))
+        if quantity == "mode":
+            _state._outputs.append(
+                SaveMode(
+                    field=field,
+                    indices=(
+                        tuple(indices) if indices is not None else ()
+                    ),
+                    branches=(
+                        tuple(branches) if branches is not None else ()
+                    ),
+                    all_modes=all_modes,
+                    sample_indices=(
+                        tuple(sample_indices) if sample_indices is not None else ()
+                    ),
+                    sample_labels=(
+                        tuple(sample_labels) if sample_labels is not None else ()
+                    ),
+                )
+            )
         elif quantity == "dispersion":
-            _state._outputs.append(SaveDispersion())
+            _state._outputs.append(
+                SaveDispersion(
+                    name=name,
+                    include_branch_table=include_branch_table,
+                )
+            )
         return
     if every is None:
         raise ValueError("save() requires every= for field/scalar outputs")
@@ -8292,6 +9261,7 @@ def tableautosave(
     quantities: Sequence[str] | None = None,
     *,
     every_steps: int | None = None,
+    table_id: str = "default",
 ) -> None:
     """Configure a mumax-style scalar table autosave cadence.
 
@@ -8303,6 +9273,7 @@ def tableautosave(
         t_sampl=every,
         every_steps=every_steps,
         quantities=quantities,
+        table_id=table_id,
     )
 
 
@@ -8489,7 +9460,7 @@ def _build_relax_llg_dynamics(
 
 def _build_problem(
     *,
-    study_kind: str = "time_evolution",
+    study_kind: str | None = None,
     relax_algorithm: str = "llg_overdamped",
     relax_torque_tolerance: float = DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM,
     relax_torque_tolerance_unit: str = "T",
@@ -8516,6 +9487,7 @@ def _build_problem(
     eigen_bias_field_sweep: BiasFieldSweep | None = None,
     eigen_spin_wave_bc: str | dict[str, object] = "free",
     eigen_magnetostatic_bc: str = "open",
+    eigen_solver_policy: FemEigenSolverPolicy | None = None,
     frequency_frequencies_hz: Sequence[float] = (1.0e9,),
     frequency_excitation_field_au_per_m: tuple[float, float, float] = (0.0, 0.0, 1.0),
     frequency_excitation_phase_rad: float = 0.0,
@@ -8535,8 +9507,17 @@ def _build_problem(
     """Construct a Problem from the current world state."""
     s = _state
 
+    if study_kind is None:
+        study_kind = (
+            "antenna_field_solve"
+            if s._declared_stages and s._declared_stages[-1].entrypoint_kind == "flat_antenna_field_solve"
+            else "time_evolution"
+        )
+
+    _validate_current_compute_resources_runtime_intent()
+
     # ── Validate ──
-    if not s._magnets:
+    if not s._magnets and study_kind != "antenna_field_solve":
         raise ValueError("No magnets defined — call fm.geometry(...) first")
 
     # Convert handles to Ferromagnet objects
@@ -8545,9 +9526,9 @@ def _build_problem(
     # Energy terms default to Exchange + Demag, but UI/Python authoring may
     # explicitly remove either contribution from H_eff.
     energy: list = []
-    if s._exchange_enabled:
+    if s._magnets and s._exchange_enabled:
         energy.append(Exchange())
-    if s._demag_enabled:
+    if s._magnets and s._demag_enabled:
         energy.append(Demag(realization=s._demag_realization))
     # Check if any magnet has DMI
     for h in s._magnets:
@@ -8591,7 +9572,7 @@ def _build_problem(
         llg_kwargs["field_refresh"] = FieldRefreshPolicy(
             demag_interval_s=s._demag_interval_s
         )
-    dynamics = LLG(**llg_kwargs)
+    dynamics = None if study_kind == "antenna_field_solve" else LLG(**llg_kwargs)
 
     # Discretization
     disc_kwargs: dict[str, Any] = {}
@@ -8658,6 +9639,14 @@ def _build_problem(
         rt = rt.mode(s._execution_mode)
     if s._cpu_threads is not None:
         rt = rt.threads(s._cpu_threads)
+    if s._parallel_execution is not None:
+        if s._parallel_execution.mode == "adaptive" and "execution_profile" in s._extra_runtime_metadata:
+            backend, device = _parallel_execution_lane(s._extra_runtime_metadata, rt.backend_target, rt.device_target)
+            s._parallel_execution.validate_for_runtime(backend, device)
+            # Capture the declared concrete lane without changing live state or
+            # minting a materialization; Rust still replays all profile/layers.
+            rt = rt.engine(backend).cpu()
+        rt = rt.with_parallel_execution(s._parallel_execution)
 
     runtime_metadata: dict[str, Any] = {"interactive_session_requested": s._interactive}
     runtime_metadata["script_api_surface"] = s._api_surface
@@ -8681,7 +9670,7 @@ def _build_problem(
     runtime_metadata.update(copy.deepcopy(s._extra_runtime_metadata))
 
     # Partition outputs by study family.
-    _EIGEN_OUTPUT_TYPES = (SaveSpectrum, SaveMode, SaveDispersion)
+    _EIGEN_OUTPUT_TYPES = (SaveSpectrum, SaveMode, SaveDispersion, SaveEigenDiagnostics)
     _RESPONSE_OUTPUT_TYPES = (SaveResponse,)
     eigen_outputs = [o for o in outputs if isinstance(o, _EIGEN_OUTPUT_TYPES)]
     response_outputs = [o for o in outputs if isinstance(o, _RESPONSE_OUTPUT_TYPES)]
@@ -8737,6 +9726,7 @@ def _build_problem(
             k_sampling=eigen_k_sampling,
             k_vector=eigen_k_vector,
             bias_field_sweep=eigen_bias_field_sweep,
+            solver_policy=eigen_solver_policy,
             dynamics=dynamics,
         )
     elif study_kind == "frequency_response":
@@ -8760,6 +9750,8 @@ def _build_problem(
             k_vector=frequency_k_vector,
             dynamics=dynamics,
         )
+    elif study_kind == "antenna_field_solve":
+        study = AntennaFieldSolve()
     elif study_kind == "hysteresis":
         study = hysteresis_spec
     else:
@@ -8779,7 +9771,13 @@ def _build_problem(
         runtime_metadata=runtime_metadata,
         auxiliary_geometries=tuple(s._auxiliary_geometries),
         auxiliary_geometry_roles=dict(s._auxiliary_geometry_roles),
+        auxiliary_geometry_object_ids=dict(s._auxiliary_geometry_object_ids),
         current_modules=tuple(s._current_modules),
+        antenna_port_modes=tuple(s._antenna_port_modes),
+        antenna_field_solve_stages=tuple(s._antenna_field_solve_stages),
+        antenna_target_projections=tuple(s._antenna_target_projections),
+        solved_antenna_drives=tuple(s._solved_antenna_drives),
+        antenna_spectrum_requests=tuple(s._antenna_spectrum_requests),
         field_drives=tuple(s._field_drives),
         monitors=tuple(s._planar_monitors),
         spin_torques=tuple(s._spin_torques),
@@ -8791,6 +9789,7 @@ def _build_problem(
         geometry_asset_cache=s._geometry_asset_cache,
         magnetization_constraints=tuple(s._magnetization_constraints),
         pbc=s._pbc,
+        parameters=s._parameters if s._parameters.names else None,
     )
 
 
@@ -8798,14 +9797,26 @@ def _build_problem(
 # Run / Relax
 # ---------------------------------------------------------------------------
 
+def _guard_profile_direct_execution() -> None:
+    if (
+        "execution_profile" in _state._extra_runtime_metadata
+        and not _capture_binding.current().enabled
+    ):
+        raise RuntimeError(
+            "execution_profile_requires_shared_materialization: eager Python solver "
+            "execution cannot resolve a profile; submit the authored IR through the "
+            "shared application materializer"
+        )
+
+
 def run(until: float) -> Any:
     """Build the problem and run until the given simulation time."""
     if until <= 0.0:
         raise ValueError("run(until) requires a positive stop time")
     from fullmag.runtime import Simulation
-    problem = _build_problem()
-    if _capture_enabled:
-        _captured_stages.append(
+    problem = _build_problem(study_kind="time_evolution")
+    if _capture_binding.current().enabled:
+        _capture_binding.current().stages.append(
             CapturedStage(
                 problem=problem,
                 entrypoint_kind="flat_run",
@@ -8813,6 +9824,7 @@ def run(until: float) -> Any:
             )
         )
         return problem
+    _guard_profile_direct_execution()
     result = Simulation(problem).run(until=until)
     _record_result(result)
     return result
@@ -8843,6 +9855,7 @@ def run_while(
     * At least one guard (`max_time` or `max_steps`) is required.
     * `max_steps` guards the accumulated solver steps across all chunks.
     """
+    _guard_profile_direct_execution()
     relax_kwargs: dict[str, object] = {}
     relax_fn = globals()["relax"]
     if kwargs:
@@ -8901,7 +9914,7 @@ def run_while(
                 call_kwargs[key] = relax_kwargs[key]
         return call_kwargs
 
-    if _capture_enabled:
+    if _capture_binding.current().enabled:
         if cfg.relax:
             initial_dt = _safe_step_value(_state._last_step, "dt", 1e-13)
             dt_ref = initial_dt if initial_dt > 0.0 else 1e-13
@@ -9112,8 +10125,8 @@ def relax(
         ]
         problem = dataclasses.replace(problem, magnets=new_magnets)
 
-    if _capture_enabled:
-        _captured_stages.append(
+    if _capture_binding.current().enabled:
+        _capture_binding.current().stages.append(
             CapturedStage(
                 problem=problem,
                 entrypoint_kind="flat_relax",
@@ -9122,6 +10135,7 @@ def relax(
         )
         return problem
 
+    _guard_profile_direct_execution()
     if isinstance(problem.study, Relaxation):
         until_seconds = _relaxation_default_until_seconds(problem.study)
     else:
@@ -9259,8 +10273,8 @@ def eigenmodes(
         eigen_magnetostatic_bc=magnetostatic_bc,
     )
 
-    if _capture_enabled:
-        _captured_stages.append(
+    if _capture_binding.current().enabled:
+        _capture_binding.current().stages.append(
             CapturedStage(
                 problem=problem,
                 entrypoint_kind="flat_eigenmodes",
@@ -9269,6 +10283,7 @@ def eigenmodes(
         )
         return problem
 
+    _guard_profile_direct_execution()
     result = Simulation(problem).run()
     _record_result(result)
     return result

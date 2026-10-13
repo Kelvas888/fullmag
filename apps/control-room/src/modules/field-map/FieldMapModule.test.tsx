@@ -12,11 +12,16 @@ const mocks = vi.hoisted(() => ({
   meta: vi.fn(),
   metaData: new Map<boolean, unknown>(),
   scalarData: { data: new ArrayBuffer(8), etag: "scalar-authoritative" },
-  projectionStatus: vi.fn(() => "resolved"),
+  projectionStatus: vi.fn((meta: { fold_count: number; non_injective: boolean; overlap_count: number }) =>
+    meta.non_injective || meta.fold_count > 0 || meta.overlap_count > 0 ? "ambiguous" : "resolved"),
+  metaAvailable: true,
   probeData: null as null | { occupancy: string; scalar: number | null; u_m: number; v_m: number },
   queuePatch: vi.fn(),
   renderModel: vi.fn(),
   renderReady: false,
+  scalarPending: false,
+  metaPending: false,
+  sourceDefinitionHash: null as string | null,
   selection: null as unknown as Selection,
   surface: vi.fn(),
   visualization: {
@@ -27,7 +32,8 @@ const mocks = vi.hoisted(() => ({
   },
 }));
 
-vi.mock("@/kernel/KernelContext", () => ({
+vi.mock("@/kernel/KernelContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/kernel/KernelContext")>()),
   useKernel: () => ({
     layout: { get: () => ({ activeViewportMainModuleId: "field-map" }) },
     visualizationSync: { queuePatch: mocks.queuePatch },
@@ -88,7 +94,7 @@ vi.mock("@/kernel/resources/planarFieldResources", () => ({
     mocks.meta(...args);
     const requestedSource = args[1] as { kind?: string } | undefined;
     const isDefault = requestedSource?.kind === "default";
-    const resource = mocks.renderReady
+    const resource = mocks.renderReady && mocks.metaAvailable && !mocks.metaPending
       ? {
           data: {
             canonical_unit: "A/m",
@@ -114,14 +120,14 @@ vi.mock("@/kernel/resources/planarFieldResources", () => ({
             operator: { kind: "plane_sample" },
             source: isDefault
               ? {
-                  default_slice_hash: "default-slice-hash",
+                  default_slice_hash: mocks.sourceDefinitionHash ?? "default-slice-hash",
                   default_slice_revision: "3",
                   domain_generation_id: "domain-generation-1",
                   kind: "default",
                 }
               : {
                   kind: "monitor",
-                  monitor_hash: "monitor-hash",
+                  monitor_hash: mocks.sourceDefinitionHash ?? "monitor-hash",
                   monitor_id: "plane-1",
                   monitor_revision: "2",
                 },
@@ -133,10 +139,13 @@ vi.mock("@/kernel/resources/planarFieldResources", () => ({
           error: null,
           status: "ready",
         }
-      : { data: null, error: null, status: "idle" };
+      : { data: null, error: null, status: mocks.renderReady ? "loading" : "idle" };
     // Resource hooks retain the same data object until its revision changes.
     if (resource.data) {
-      if (!mocks.metaData.has(isDefault)) mocks.metaData.set(isDefault, resource.data);
+      const cached = mocks.metaData.get(isDefault) as { source?: unknown } | undefined;
+      if (!cached || JSON.stringify(cached.source) !== JSON.stringify(resource.data.source)) {
+        mocks.metaData.set(isDefault, resource.data);
+      }
       return { ...resource, data: mocks.metaData.get(isDefault) };
     }
     return resource;
@@ -144,7 +153,7 @@ vi.mock("@/kernel/resources/planarFieldResources", () => ({
   usePlanarMaskResource: () => ({ data: null, error: null, status: "idle" }),
   usePlanarMeshOverlayResource: () => ({ data: null, error: null, status: "idle" }),
   usePlanarProbeResource: () => ({ data: mocks.probeData, error: null, status: mocks.probeData ? "ready" : "idle" }),
-  usePlanarScalarResource: () => mocks.renderReady
+  usePlanarScalarResource: () => mocks.renderReady && !mocks.scalarPending
     ? { data: mocks.scalarData, error: null, status: "ready" }
     : { data: null, error: null, status: "idle" },
   usePlanarVectorResource: () => ({ data: null, error: null, status: "idle" }),
@@ -167,6 +176,13 @@ vi.mock("@/kernel/resources/useSessionStatus", () => ({
   useSessionStatusSelector: () => null,
 }));
 
+vi.mock("@/kernel/resources/useSessionScopedResourceKey", () => ({
+  useSessionScopedResourceKey: () => ({
+    resourceKey: "session=A&epoch=1&request_scope_epoch=api:1|planar-render-frame",
+    sessionIdentity: { sessionId: "A", sessionEpoch: "1", requestScopeEpoch: "api:1" },
+  }),
+}));
+
 vi.mock("@/kernel/selection/useSelection", () => ({
   useSelectionSelector: (selector: (selection: Selection) => unknown) =>
     selector(mocks.selection),
@@ -180,11 +196,16 @@ describe("FieldMapModule planar state ownership", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.metaData.clear();
+    mocks.renderModel.mockReset();
     mocks.visualization.data = null;
     mocks.visualization.error = null;
     mocks.visualization.status = "loading";
     mocks.visualization.optimisticData = null;
     mocks.renderReady = false;
+    mocks.metaAvailable = true;
+    mocks.scalarPending = false;
+    mocks.metaPending = false;
+    mocks.sourceDefinitionHash = null;
     mocks.probeData = null;
     mocks.selection = emptySelection();
   });
@@ -299,6 +320,42 @@ describe("FieldMapModule planar state ownership", () => {
     }
   });
 
+  it("retains the planar surface while metadata refresh has no data", async () => {
+    mocks.visualization.data = {
+      planar: {
+        colormap: "viridis",
+        component: "magnitude",
+        display_unit: "A/m",
+        interaction: { pan_u_m: 0, pan_v_m: 0, zoom: 1 },
+        layers: { mesh: false, vectors: false },
+        quantity_id: "m",
+        quality: "interactive",
+        range: { mode: "auto" },
+        resolution: { height: 128, width: 256 },
+        source: { kind: "default" },
+        default_slice: { operator: { kind: "plane_sample" }, plane: "xy", position_fraction: 0.5 },
+        vector_style: { color_mode: "orientation", length_mode: "uniform", scale: 1 },
+        view_scope: { kind: "monitor_target" },
+      },
+    };
+    mocks.visualization.status = "ready";
+    mocks.renderReady = true;
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(<FieldMapModule />));
+      expect(container.querySelector(".fm-field-map__canvas-stack")).toBeDefined();
+      mocks.metaAvailable = false;
+      await act(async () => root.render(<FieldMapModule />));
+      expect(container.querySelector(".fm-field-map__canvas-stack")).toBeDefined();
+      expect(container.textContent).not.toContain("Ambiguous surface");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
   it("publishes source and runtime provenance for a default sample in the DOM", () => {
     mocks.visualization.data = {
       planar: {
@@ -341,6 +398,60 @@ describe("FieldMapModule planar state ownership", () => {
     expect(mocks.renderModel).toHaveBeenCalledWith(expect.objectContaining({
       frame: expect.objectContaining({ origin: [11, 22, 32] }),
     }));
+  });
+
+  it.each([
+    ["plane", { default_slice: { plane: "xz", position_fraction: 0.5, operator: { kind: "plane_sample" } } }, null],
+    ["position", { default_slice: { plane: "xy", position_fraction: 0.75, operator: { kind: "plane_sample" } } }, null],
+    ["operator", { default_slice: { plane: "xy", position_fraction: 0.5, operator: { kind: "slab_average", thickness_m: 1e-9 } } }, null],
+    ["vector budget", { resolution: { width: 256, height: 128, vector_budget: 1024 } }, null],
+    ["default source definition", {}, "changed-default-hash"],
+    ["monitor source definition", {}, "changed-monitor-hash"],
+  ])("discards a retained frame when %s changes during scalar refresh", async (_label, patch, sourceHash) => {
+    const planar = {
+      component: "magnitude",
+      quantity_id: "m",
+      source: _label === "monitor source definition" ? { kind: "monitor", monitor_id: "plane-1" } : { kind: "default" },
+      default_slice: { plane: "xy", position_fraction: 0.5, operator: { kind: "plane_sample" } },
+      resolution: { width: 256, height: 128, vector_budget: 512 },
+      interaction: { pan_u_m: 0, pan_v_m: 0, zoom: 1 },
+      layers: { raster: true, vectors: false },
+      vector_style: { color_mode: "orientation", length_mode: "uniform", scale: 1 },
+      view_scope: { kind: "monitor_target" },
+    };
+    mocks.visualization.data = { planar };
+    mocks.visualization.status = "ready";
+    mocks.renderReady = true;
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    const render = async () => {
+      await act(async () => {
+        root.render(<FieldMapModule />);
+        await Promise.resolve();
+      });
+    };
+    try {
+      await render();
+      expect(mocks.surface).toHaveBeenCalled();
+      mocks.surface.mockClear();
+      mocks.scalarPending = true;
+      await render();
+      expect(mocks.surface).toHaveBeenCalled();
+      mocks.surface.mockClear();
+      mocks.metaPending = true;
+      await render();
+      expect(mocks.surface).toHaveBeenCalled();
+      mocks.surface.mockClear();
+      mocks.metaPending = false;
+      mocks.visualization.data = { planar: { ...planar, ...patch } };
+      mocks.sourceDefinitionHash = sourceHash as string | null;
+      await render();
+      expect(mocks.surface).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
   });
 
   it("does not duplicate Inspector-owned planar selection controls", () => {
@@ -399,7 +510,7 @@ describe("FieldMapModule planar state ownership", () => {
     };
     mocks.visualization.status = "ready";
     mocks.renderReady = true;
-    mocks.renderModel.mockImplementationOnce((input: unknown) => ({
+    mocks.renderModel.mockImplementation((input: unknown) => ({
       diagnostics: [],
       bounds: [0, 1, 0, 1],
       frame: {

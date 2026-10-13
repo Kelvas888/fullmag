@@ -1,11 +1,11 @@
 use crate::{
-    validate_scene_document, MagnetizationAsset, SceneCurrentModulesState, SceneDocument,
-    SceneDocumentValidationError, SceneEditorState, SceneFdmDiscretizationState, SceneGeometry,
-    SceneMaterialAsset, SceneMeshInterface, SceneMetadata, SceneObject, SceneOutputsState,
-    SceneStudyState, ScriptBuilderFdmState, ScriptBuilderGeometryEntry,
-    ScriptBuilderMagneticInteractionEntry, ScriptBuilderMagneticInteractionKind,
-    ScriptBuilderMagnetizationState, ScriptBuilderMeshInterfaceState,
-    ScriptBuilderPerGeometryMeshState, ScriptBuilderState, StudyPipelineNode, Transform3D,
+    MagnetizationAsset, SceneCurrentModulesState, SceneDocument, SceneDocumentValidationError,
+    SceneEditorState, SceneFdmDiscretizationState, SceneGeometry, SceneMaterialAsset,
+    SceneMeshInterface, SceneMetadata, SceneObject, SceneOutputsState, SceneStudyState,
+    ScriptBuilderFdmState, ScriptBuilderGeometryEntry, ScriptBuilderMagneticInteractionEntry,
+    ScriptBuilderMagneticInteractionKind, ScriptBuilderMagnetizationState,
+    ScriptBuilderMeshInterfaceState, ScriptBuilderPerGeometryMeshState, ScriptBuilderState,
+    StudyPipelineNode, Transform3D, validate_scene_document,
 };
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -84,19 +84,29 @@ pub fn scene_document_from_script_builder(builder: &ScriptBuilderState) -> Scene
         spin_transports: builder.spin_transports.clone(),
         spin_torques,
         oersted_fields,
+        antenna_port_modes: builder.antenna_port_modes.clone(),
+        antenna_field_solve_stages: builder.antenna_field_solve_stages.clone(),
+        antenna_target_projections: builder.antenna_target_projections.clone(),
+        solved_antenna_drives: builder.solved_antenna_drives.clone(),
+        antenna_spectrum_requests: builder.antenna_spectrum_requests.clone(),
         study: SceneStudyState {
             backend: builder.backend.clone(),
             requested_backend: builder
-                .backend
+                .requested_backend
                 .clone()
+                .or_else(|| builder.backend.clone())
                 .unwrap_or_else(|| "auto".to_string()),
-            requested_device: "auto".to_string(),
-            requested_precision: "double".to_string(),
+            requested_device: builder.requested_device.clone()
+                .unwrap_or_else(|| "auto".to_string()),
+            requested_precision: builder.requested_precision.clone()
+                .unwrap_or_else(|| "double".to_string()),
             requested_mode: builder
                 .requested_mode
                 .clone()
                 .unwrap_or_else(|| "strict".to_string()),
             requested_cpu_threads: builder.cpu_threads,
+            parallel_execution: builder.parallel_execution.clone().unwrap_or_default(),
+            pbc: Some(builder.pbc.clone()),
             fem_demag_solver_policy: builder.fem_demag_solver_policy.clone(),
             exchange_enabled: builder.exchange_enabled,
             demag_enabled: builder.demag_enabled,
@@ -113,12 +123,21 @@ pub fn scene_document_from_script_builder(builder: &ScriptBuilderState) -> Scene
                 .iter()
                 .map(scene_mesh_interface_from_builder)
                 .collect(),
-            stages: builder.stages.clone(),
+            stages: builder
+                .stages
+                .iter()
+                .map(crate::SceneStudyStageState::from_script_builder)
+                .collect(),
             study_pipeline: builder.study_pipeline.clone(),
+            table_autosave: builder.table_autosave.clone(),
+            output_storage: builder.output_storage.clone(),
+            execution_profile: builder.execution_profile.clone(),
+            execution_layers: builder.execution_layers.clone(),
             initial_state: builder.initial_state.clone(),
         },
         outputs: SceneOutputsState::default(),
         editor: SceneEditorState::default(),
+        analysis: Default::default(),
     }
 }
 
@@ -128,6 +147,11 @@ pub fn scene_document_to_script_builder(
     let mut normalized_scene = scene.clone();
     normalize_scene_document_study_pipeline_labels(&mut normalized_scene);
     migrate_legacy_fdm_demag_realization(&mut normalized_scene);
+    if let Some(storage) = normalized_scene.study.output_storage.as_ref() {
+        storage
+            .validate()
+            .map_err(|errors| SceneDocumentValidationError::new(errors.join("; ")))?;
+    }
     validate_scene_document(&normalized_scene)?;
     let materials = scene
         .materials
@@ -216,8 +240,13 @@ pub fn scene_document_to_script_builder(
     Ok(ScriptBuilderState {
         revision: scene.revision,
         backend: normalized_scene.study.backend.clone(),
+        requested_backend: Some(normalized_scene.study.requested_backend.clone()),
+        requested_device: Some(normalized_scene.study.requested_device.clone()),
+        requested_precision: Some(normalized_scene.study.requested_precision.clone()),
         requested_mode: Some(normalized_scene.study.requested_mode.clone()),
         cpu_threads: normalized_scene.study.requested_cpu_threads,
+        parallel_execution: Some(normalized_scene.study.parallel_execution.clone()),
+        pbc: normalized_scene.study.pbc.clone().flatten(),
         fem_demag_solver_policy: normalized_scene.study.fem_demag_solver_policy.clone(),
         exchange_enabled: normalized_scene.study.exchange_enabled,
         demag_enabled: normalized_scene.study.demag_enabled,
@@ -236,8 +265,17 @@ pub fn scene_document_to_script_builder(
             .clone()
             .or_else(|| normalized_scene.universe.clone()),
         domain_frame: None,
-        stages: normalized_scene.study.stages.clone(),
+        stages: normalized_scene
+            .study
+            .stages
+            .iter()
+            .map(crate::SceneStudyStageState::to_script_builder)
+            .collect(),
         study_pipeline: normalized_scene.study.study_pipeline.clone(),
+        table_autosave: normalized_scene.study.table_autosave.clone(),
+        output_storage: normalized_scene.study.output_storage.clone(),
+        execution_profile: normalized_scene.study.execution_profile.clone(),
+        execution_layers: normalized_scene.study.execution_layers.clone(),
         initial_state: normalized_scene.study.initial_state.clone(),
         geometries,
         mesh_interfaces: normalized_scene
@@ -253,6 +291,11 @@ pub fn scene_document_to_script_builder(
         spin_transports: normalized_scene.spin_transports.clone(),
         spin_torques: normalized_scene.spin_torques.clone(),
         oersted_terms: normalized_scene.oersted_fields.clone(),
+        antenna_port_modes: normalized_scene.antenna_port_modes.clone(),
+        antenna_field_solve_stages: normalized_scene.antenna_field_solve_stages.clone(),
+        antenna_target_projections: normalized_scene.antenna_target_projections.clone(),
+        solved_antenna_drives: normalized_scene.solved_antenna_drives.clone(),
+        antenna_spectrum_requests: normalized_scene.antenna_spectrum_requests.clone(),
         excitation_analysis: normalized_scene.current_modules.excitation_analysis.clone(),
     })
 }
@@ -295,24 +338,147 @@ fn migrate_legacy_fdm_demag_realization(scene: &mut SceneDocument) {
     });
 }
 
+fn validate_stage_builder_numeric_values(
+    scene: &SceneDocument,
+) -> Result<(), SceneDocumentValidationError> {
+    for (index, stage) in scene.study.stages.iter().enumerate() {
+        for (field, value) in [
+            ("fixed_timestep", &stage.fixed_timestep),
+            ("until_seconds", &stage.until_seconds),
+            ("torque_tolerance", &stage.torque_tolerance),
+            ("energy_tolerance", &stage.energy_tolerance),
+            ("eigen_target_frequency", &stage.eigen_target_frequency),
+        ] {
+            if !scene_stage_f64_is_exportable(value) {
+                return Err(SceneDocumentValidationError::new(format!(
+                    "study.stages[{index}].{field} must be a finite number"
+                )));
+            }
+        }
+
+        for (field, value) in [
+            ("max_steps", &stage.max_steps),
+            ("eigen_count", &stage.eigen_count),
+        ] {
+            if !scene_stage_u64_is_exportable(value) {
+                return Err(SceneDocumentValidationError::new(format!(
+                    "study.stages[{index}].{field} must be an unsigned integer"
+                )));
+            }
+        }
+
+        if !stage.eigen_k_vector.is_valid_or_empty() {
+            return Err(SceneDocumentValidationError::new(format!(
+                "study.stages[{index}].eigen_k_vector must be a numeric vector with three finite components"
+            )));
+        }
+
+        if let Some(adaptive) = stage.adaptive_timestep.as_ref() {
+            for (field, value) in [
+                ("atol", &adaptive.atol),
+                ("rtol", &adaptive.rtol),
+                ("dt_initial", &adaptive.dt_initial),
+                ("dt_min", &adaptive.dt_min),
+                ("dt_max", &adaptive.dt_max),
+                ("safety", &adaptive.safety),
+                ("growth_limit", &adaptive.growth_limit),
+                ("shrink_limit", &adaptive.shrink_limit),
+                ("max_spin_rotation", &adaptive.max_spin_rotation),
+                ("norm_tolerance", &adaptive.norm_tolerance),
+            ] {
+                if !scene_stage_f64_is_exportable(value) {
+                    return Err(SceneDocumentValidationError::new(format!(
+                        "study.stages[{index}].adaptive_timestep.{field} must be a finite number"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scene_stage_f64_is_exportable(value: &crate::SceneStageF64) -> bool {
+    match value {
+        crate::SceneStageF64::Number(value) => value.is_finite(),
+        crate::SceneStageF64::LegacyText(text) if text.trim().is_empty() => true,
+        crate::SceneStageF64::LegacyText(text) => text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .is_some_and(|value| value.is_finite()),
+    }
+}
+
+fn scene_stage_u64_is_exportable(value: &crate::SceneStageU64) -> bool {
+    match value {
+        crate::SceneStageU64::Number(_) => true,
+        crate::SceneStageU64::LegacyText(text) if text.trim().is_empty() => true,
+        crate::SceneStageU64::LegacyText(text) => text.trim().parse::<u64>().is_ok(),
+    }
+}
+
 pub fn scene_document_to_script_builder_overrides(
     scene: &SceneDocument,
 ) -> Result<Value, SceneDocumentValidationError> {
+    validate_stage_builder_numeric_values(scene)?;
     let builder = scene_document_to_script_builder(scene)?;
-    Ok(serde_json::json!({
+    // The solver projection is magnetic-only; script export owns the complete
+    // authored inventory, including conductors without magnetic assignments.
+    let mut geometries = builder
+        .geometries
+        .iter()
+        .zip(crate::scene_solve_objects(scene))
+        .map(|(geometry, object)| {
+            let mut value = geometry_override_value(geometry);
+            value["object_id"] = Value::String(object.id.clone());
+            value["role"] = Value::String(object.role.clone());
+            value
+        })
+        .collect::<Vec<_>>();
+    for object in scene.objects.iter().filter(|object| object.role != "magnet") {
+        if !is_identity_quaternion(object.transform.rotation_quat)
+            || !is_identity_scale(object.transform.scale)
+        {
+            return Err(SceneDocumentValidationError::new(format!(
+                "owner_transform_rotation_scale_unsupported: object '{}' uses rotation or scale that is not represented by the canonical owner-frame lowering",
+                object.id
+            )));
+        }
+        let mut geometry_params = object.geometry.geometry_params.clone();
+        strip_translation_fields(&mut geometry_params);
+        if !is_zero_vec3(object.transform.translation) {
+            insert_translation(&mut geometry_params, object.transform.translation);
+        }
+        geometries.push(serde_json::json!({
+            "name": builder_geometry_name_for_object(object),
+            "object_id": object.id,
+            "role": object.role,
+            "geometry_kind": object.geometry.geometry_kind,
+            "geometry_params": geometry_params,
+            "bounds_min": object.geometry.bounds_min,
+            "bounds_max": object.geometry.bounds_max,
+            "mesh": object.object_mesh.as_ref().or(object.mesh_override.as_ref())
+                .map(geometry_mesh_override_value),
+        }));
+    }
+    let mut overrides = serde_json::json!({
         "runtime_selection": {
             "backend": scene.study.requested_backend,
             "device": scene.study.requested_device,
             "precision": scene.study.requested_precision,
             "mode": scene.study.requested_mode,
             "cpu_threads": scene.study.requested_cpu_threads,
+            "parallel_execution": scene.study.parallel_execution,
             "fem_demag_solver_policy": scene.study.fem_demag_solver_policy,
             "explicit_selection": scene.study.requested_backend != "auto"
                 || scene.study.requested_device != "auto"
                 || scene.study.requested_precision != "double"
                 || scene.study.requested_mode != "strict"
-                || scene.study.requested_cpu_threads.is_some(),
+                || scene.study.requested_cpu_threads.is_some()
+                || scene.study.parallel_execution
+                    != fullmag_ir::ParallelExecutionPolicyIR::default(),
         },
+        "pbc": builder.pbc,
         "exchange_enabled": builder.exchange_enabled,
         "demag_enabled": builder.demag_enabled,
         "demag_realization": builder.demag_realization,
@@ -395,25 +561,58 @@ pub fn scene_document_to_script_builder_overrides(
             "airbox_growth_rate": universe.airbox_growth_rate,
             "airbox_grading": universe.airbox_grading,
         })).unwrap_or(Value::Null),
-        "stages": builder.stages.iter().map(|stage| serde_json::json!({
-            "kind": stage.kind,
-            "entrypoint_kind": stage.entrypoint_kind,
-            "integrator": string_or_null(&stage.integrator),
-            "fixed_timestep": parse_optional_text_f64(&stage.fixed_timestep),
-            "adaptive_timestep": stage.adaptive_timestep.as_ref().map(adaptive_timestep_override_value).unwrap_or(Value::Null),
-            "until_seconds": parse_optional_text_f64(&stage.until_seconds),
-            "relax_algorithm": string_or_null(&stage.relax_algorithm),
-            "torque_tolerance": parse_optional_text_f64(&stage.torque_tolerance),
-            "energy_tolerance": parse_optional_text_f64(&stage.energy_tolerance),
-            "max_steps": parse_optional_text_u64(&stage.max_steps),
-            "eigen_count": parse_optional_text_u64(&stage.eigen_count),
-            "eigen_target": string_or_null(&stage.eigen_target),
-            "eigen_include_demag": stage.eigen_include_demag,
-            "eigen_equilibrium_source": string_or_null(&stage.eigen_equilibrium_source),
-            "eigen_normalization": string_or_null(&stage.eigen_normalization),
-        })).collect::<Vec<_>>(),
+        "stages": builder.stages.iter().map(|stage| {
+            let mut stage_override = serde_json::json!({
+                "kind": stage.kind,
+                "entrypoint_kind": stage.entrypoint_kind,
+                "integrator": string_or_null(&stage.integrator),
+                "fixed_timestep": parse_optional_text_f64(&stage.fixed_timestep),
+                "adaptive_timestep": stage.adaptive_timestep.as_ref().map(adaptive_timestep_override_value).unwrap_or(Value::Null),
+                "until_seconds": parse_optional_text_f64(&stage.until_seconds),
+                "relax_algorithm": string_or_null(&stage.relax_algorithm),
+                "torque_tolerance": parse_optional_text_f64(&stage.torque_tolerance),
+                "energy_tolerance": parse_optional_text_f64(&stage.energy_tolerance),
+                "max_steps": parse_optional_text_u64(&stage.max_steps),
+                "eigen_count": parse_optional_text_u64(&stage.eigen_count),
+                "eigen_target_frequency": parse_optional_text_f64(&stage.eigen_target_frequency),
+                "eigen_k_vector": parse_optional_text_vec3(&stage.eigen_k_vector),
+                "eigen_target": string_or_null(&stage.eigen_target),
+                "eigen_include_demag": stage.eigen_include_demag,
+                "eigen_equilibrium_source": if stage.eigen_equilibrium_source.is_empty() {
+                    stage.extra.get("equilibrium_source").cloned().unwrap_or(Value::Null)
+                } else {
+                    string_or_null(&stage.eigen_equilibrium_source)
+                },
+                "eigen_equilibrium_artifact": stage.extra.get("eigen_equilibrium_artifact")
+                    .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                    .or_else(|| stage.extra.get("equilibrium_artifact")),
+                "frequency_equilibrium_source": stage.extra.get("frequency_equilibrium_source")
+                    .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                    .or_else(|| stage.extra.get("equilibrium_source")),
+                "frequency_equilibrium_artifact": stage.extra.get("frequency_equilibrium_artifact")
+                    .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                    .or_else(|| stage.extra.get("equilibrium_artifact")),
+                "eigen_normalization": string_or_null(&stage.eigen_normalization),
+            });
+            let stage_fields = stage_override
+                .as_object_mut()
+                .expect("script builder stage overrides are an object");
+            for key in [
+                "eigen_solver_rtol",
+                "eigen_solver_max_outer_iterations",
+                "eigen_solver_max_linear_iterations",
+            ] {
+                if let Some(value) = stage.extra.get(key) {
+                    stage_fields.insert(key.to_string(), value.clone());
+                }
+            }
+            stage_override
+        }).collect::<Vec<_>>(),
         "study_pipeline": builder.study_pipeline.as_ref().map(|document| {
             serde_json::to_value(document).unwrap_or(Value::Null)
+        }).unwrap_or(Value::Null),
+        "table_autosave": builder.table_autosave.as_ref().map(|table| {
+            serde_json::to_value(table).unwrap_or(Value::Null)
         }).unwrap_or(Value::Null),
         "initial_state": builder.initial_state.as_ref().map(|initial_state| serde_json::json!({
             "magnet_name": initial_state.magnet_name,
@@ -422,11 +621,7 @@ pub fn scene_document_to_script_builder_overrides(
             "dataset": initial_state.dataset,
             "sample_index": initial_state.sample_index,
         })).unwrap_or(Value::Null),
-        "geometries": builder
-            .geometries
-            .iter()
-            .map(geometry_override_value)
-            .collect::<Vec<_>>(),
+        "geometries": geometries,
         "couplings": scene
             .couplings
             .iter()
@@ -461,6 +656,21 @@ pub fn scene_document_to_script_builder_overrides(
         "oersted_terms": builder.oersted_terms.iter()
             .map(oersted_override_value)
             .collect::<Vec<_>>(),
+        "antenna_port_modes": builder.antenna_port_modes.iter()
+            .map(|mode| serde_json::to_value(mode).unwrap_or(Value::Null))
+            .collect::<Vec<_>>(),
+        "antenna_field_solve_stages": builder.antenna_field_solve_stages.iter()
+            .map(|stage| serde_json::to_value(stage).unwrap_or(Value::Null))
+            .collect::<Vec<_>>(),
+        "antenna_target_projections": builder.antenna_target_projections.iter()
+            .map(|projection| serde_json::to_value(projection).unwrap_or(Value::Null))
+            .collect::<Vec<_>>(),
+        "solved_antenna_drives": builder.solved_antenna_drives.iter()
+            .map(|drive| serde_json::to_value(drive).unwrap_or(Value::Null))
+            .collect::<Vec<_>>(),
+        "antenna_spectrum_requests": builder.antenna_spectrum_requests.iter()
+            .map(|request| serde_json::to_value(request).unwrap_or(Value::Null))
+            .collect::<Vec<_>>(),
         "excitation_analysis": builder.excitation_analysis.as_ref().map(|analysis| serde_json::json!({
             "source": analysis.source,
             "method": analysis.method,
@@ -468,7 +678,22 @@ pub fn scene_document_to_script_builder_overrides(
             "k_max_rad_per_m": analysis.k_max_rad_per_m,
             "samples": analysis.samples,
         })).unwrap_or(Value::Null),
-    }))
+    });
+    if scene.study.pbc.is_none() {
+        overrides
+            .as_object_mut()
+            .expect("script builder overrides are an object")
+            .remove("pbc");
+    }
+    if let Some(profile) = builder.execution_profile.as_ref() {
+        overrides["execution_profile"] =
+            serde_json::to_value(profile).expect("execution profile is serializable");
+    }
+    if !builder.execution_layers.is_empty() {
+        overrides["execution_layers"] = serde_json::to_value(&builder.execution_layers)
+            .expect("execution layers are serializable");
+    }
+    Ok(overrides)
 }
 
 fn spin_torque_override_value(torque: &crate::SceneSpinTorque) -> Value {
@@ -1325,11 +1550,11 @@ fn upsert_interaction(
     }
 }
 
-fn builder_geometry_name_for_object(object: &SceneObject) -> String {
+pub(crate) fn builder_geometry_name_for_object(object: &SceneObject) -> String {
     if object.name.trim().is_empty() {
         object.id.clone()
     } else {
-        object.name.clone()
+        object.name.trim().to_string()
     }
 }
 
@@ -1698,6 +1923,31 @@ fn parse_optional_text_u64(raw: &str) -> Value {
         .parse::<u64>()
         .ok()
         .map_or(Value::Null, Value::from)
+}
+
+fn parse_optional_text_vec3(raw: &str) -> Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Value::Null;
+    }
+    let components = trimmed
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(trimmed)
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if components.len() != 3 {
+        return Value::Null;
+    }
+    let Some(values) = components
+        .iter()
+        .map(|value| value.parse::<f64>().ok().filter(|value| value.is_finite()))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Value::Null;
+    };
+    serde_json::json!(values)
 }
 
 impl From<crate::SceneRegionFrame> for fullmag_ir::RegionFrameIR {
@@ -2116,6 +2366,21 @@ mod tests {
             entry
         );
     }
+
+    #[test]
+    fn scene_document_mesh_quality_defaults_match_python_mesh_options() {
+        let scene: SceneDocument = serde_json::from_value(serde_json::json!({
+            "version": "scene.v2"
+        }))
+        .expect("minimal scene should receive typed defaults");
+        let builder_mesh = ScriptBuilderMeshState::default();
+
+        assert!(scene.study.mesh_defaults.compute_quality);
+        assert!(scene.study.mesh_defaults.per_element_quality);
+        assert!(builder_mesh.compute_quality);
+        assert!(builder_mesh.per_element_quality);
+    }
+
     use crate::{
         MacroStageNode, PrimitiveStageNode, ScriptBuilderAdaptiveTimestepState,
         ScriptBuilderCurrentModuleState, ScriptBuilderDriveState, ScriptBuilderInitialState,
@@ -2171,12 +2436,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adaptive_scene_builder_roundtrip_preserves_requested_runtime() {
+        let mut scene = scene_document_from_script_builder(&sample_builder());
+        scene.study.backend = None;
+        scene.study.requested_backend = "fem".into();
+        scene.study.requested_device = "cpu".into();
+        scene.study.requested_precision = "single".into();
+        scene.study.parallel_execution.mode = fullmag_ir::ParallelExecutionModeIR::Adaptive;
+        let builder = scene_document_to_script_builder(&scene).expect("valid adaptive scene");
+        let restored = scene_document_from_script_builder(&builder);
+        assert_eq!(restored.study.backend, None);
+        assert_eq!(restored.study.requested_backend, scene.study.requested_backend);
+        assert_eq!(restored.study.requested_device, scene.study.requested_device);
+        assert_eq!(restored.study.requested_precision, scene.study.requested_precision);
+        assert_eq!(restored.study.parallel_execution, scene.study.parallel_execution);
+        crate::validate_scene_document_for_authoring(&restored)
+            .expect("round-trip must preserve the legal lane");
+    }
+
+    #[test]
+    fn legacy_builder_keeps_runtime_defaults_without_policy_inference() {
+        let scene = scene_document_from_script_builder(&sample_builder());
+        assert_eq!(scene.study.requested_backend, "fem");
+        assert_eq!(scene.study.requested_device, "auto");
+        assert_eq!(scene.study.requested_precision, "double");
+    }
+
+    #[test]
+    fn scene_pbc_roundtrip_preserves_axes_demag_images_and_null_override() {
+        let mut builder = sample_builder();
+        builder.pbc = Some(fullmag_ir::FdmPeriodicityIR {
+            axes: [fullmag_ir::AxisBoundary::Periodic, fullmag_ir::AxisBoundary::Open,
+                   fullmag_ir::AxisBoundary::Periodic],
+            demag: fullmag_ir::FdmDemagPeriodicityIR::TruncatedImages,
+            image_counts: Some([4, 0, 7]),
+        });
+        let scene = scene_document_from_script_builder(&builder);
+        assert_eq!(scene.study.pbc, Some(builder.pbc.clone()));
+        let restored = scene_document_to_script_builder(&scene).expect("valid PBC scene");
+        assert_eq!(restored.pbc, builder.pbc);
+        let overrides = scene_document_to_script_builder_overrides(&scene).unwrap();
+        assert_eq!(overrides["pbc"], serde_json::to_value(&builder.pbc).unwrap());
+        let encoded = serde_json::to_value(&scene).unwrap();
+        let decoded: SceneDocument = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.study.pbc, Some(builder.pbc.clone()));
+
+        let mut cleared = decoded;
+        cleared.study.pbc = Some(None);
+        assert!(scene_document_to_script_builder(&cleared).unwrap().pbc.is_none());
+        assert!(scene_document_to_script_builder_overrides(&cleared).unwrap()["pbc"].is_null());
+        let mut legacy = serde_json::to_value(&cleared).unwrap();
+        // Keep an explicit reset through serde; absence is not a clear override.
+        assert_eq!(legacy["study"].get("pbc"), Some(&serde_json::Value::Null));
+        legacy["study"].as_object_mut().unwrap().remove("pbc");
+        let legacy: SceneDocument = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.study.pbc.is_none());
+        let legacy_overrides = scene_document_to_script_builder_overrides(&legacy).unwrap();
+        assert!(legacy_overrides.get("pbc").is_none());
+        assert!(serde_json::to_value(&legacy).unwrap()["study"].get("pbc").is_none());
+
+        let explicit_clear: SceneDocument =
+            serde_json::from_value(serde_json::to_value(&cleared).unwrap()).unwrap();
+        assert_eq!(explicit_clear.study.pbc, Some(None));
+        assert_eq!(
+            scene_document_to_script_builder_overrides(&explicit_clear).unwrap().get("pbc"),
+            Some(&serde_json::Value::Null),
+        );
+    }
+
+    #[test]
+    fn scene_pbc_rejects_inconsistent_demag_policy() {
+        let mut scene = scene_document_from_script_builder(&sample_builder());
+        scene.study.pbc = Some(Some(fullmag_ir::FdmPeriodicityIR {
+            axes: [fullmag_ir::AxisBoundary::Periodic, fullmag_ir::AxisBoundary::Open,
+                   fullmag_ir::AxisBoundary::Open],
+            demag: fullmag_ir::FdmDemagPeriodicityIR::PeriodicAirboxK0,
+            image_counts: None,
+        }));
+        assert!(scene_document_to_script_builder(&scene).is_err());
+        let pbc = scene.study.pbc.as_mut().unwrap().as_mut().unwrap();
+        pbc.demag = fullmag_ir::FdmDemagPeriodicityIR::Open;
+        pbc.image_counts = Some([1, 0, 0]);
+        assert!(scene_document_to_script_builder(&scene).is_err());
+    }
+
     fn sample_builder() -> ScriptBuilderState {
         ScriptBuilderState {
             revision: 7,
             backend: Some("fem".to_string()),
+            requested_backend: None,
+            requested_device: None,
+            requested_precision: None,
             requested_mode: Some("strict".to_string()),
             cpu_threads: Some(8),
+            parallel_execution: None,
+            pbc: None,
             fem_demag_solver_policy: Some(fullmag_ir::FemLinearSolverPolicy::default()),
             exchange_enabled: true,
             demag_enabled: true,
@@ -2299,6 +2654,10 @@ mod tests {
                     }),
                 ],
             }),
+            table_autosave: None,
+            output_storage: None,
+            execution_profile: None,
+            execution_layers: Vec::new(),
             initial_state: Some(ScriptBuilderInitialState {
                 magnet_name: Some("flower".to_string()),
                 source_path: "/tmp/m0.ovf".to_string(),
@@ -2533,6 +2892,11 @@ mod tests {
             spin_transports: Vec::new(),
             spin_torques: Vec::new(),
             oersted_terms: Vec::new(),
+            antenna_port_modes: Vec::new(),
+            antenna_field_solve_stages: Vec::new(),
+            antenna_target_projections: Vec::new(),
+            solved_antenna_drives: Vec::new(),
+            antenna_spectrum_requests: Vec::new(),
             excitation_analysis: Some(crate::ScriptBuilderExcitationAnalysisState {
                 source: "cpw_1".to_string(),
                 method: "dispersion".to_string(),
@@ -2544,8 +2908,615 @@ mod tests {
     }
 
     #[test]
-    fn scene_document_round_trips_script_builder_state() {
+    fn scene_stage_numeric_scalars_round_trip_through_builder_text() {
+        let mut scene_value =
+            serde_json::to_value(scene_document_from_script_builder(&sample_builder()))
+                .expect("sample scene should serialize");
+        let stage = &mut scene_value["study"]["stages"][0];
+        stage["until_seconds"] = serde_json::json!(2e-12);
+        stage["fixed_timestep"] = serde_json::json!(1e-13);
+        stage["torque_tolerance"] = serde_json::json!(1e-5);
+        stage["energy_tolerance"] = serde_json::json!(1e-9);
+        stage["max_steps"] = serde_json::json!(25);
+        stage["eigen_count"] = serde_json::json!(12);
+        stage["eigen_target_frequency"] = serde_json::json!(4e9);
+        stage["eigen_k_vector"] = serde_json::json!([1.0, 0.0, 0.0]);
+        stage["future_stage_field"] = serde_json::json!({ "retained": true });
+
+        let scene: SceneDocument =
+            serde_json::from_value(scene_value).expect("numeric scene stage should deserialize");
+        let canonical = serde_json::to_value(&scene).expect("canonical scene should serialize");
+        assert_eq!(canonical["study"]["stages"][0]["until_seconds"], 2e-12);
+        assert_eq!(canonical["study"]["stages"][0]["fixed_timestep"], 1e-13);
+        assert_eq!(canonical["study"]["stages"][0]["torque_tolerance"], 1e-5);
+        assert_eq!(canonical["study"]["stages"][0]["energy_tolerance"], 1e-9);
+        assert_eq!(canonical["study"]["stages"][0]["max_steps"], 25);
+        assert_eq!(canonical["study"]["stages"][0]["eigen_count"], 12);
+        assert_eq!(
+            canonical["study"]["stages"][0]["eigen_target_frequency"],
+            4e9
+        );
+        assert_eq!(
+            canonical["study"]["stages"][0]["eigen_k_vector"],
+            serde_json::json!([1.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            canonical["study"]["stages"][0]["future_stage_field"]["retained"],
+            true
+        );
+
+        let builder = scene_document_to_script_builder(&scene)
+            .expect("numeric stage should adapt to the text-oriented builder");
+        let builder_stage = &builder.stages[0];
+        assert_eq!(builder_stage.until_seconds.parse::<f64>().unwrap(), 2e-12);
+        assert_eq!(builder_stage.fixed_timestep.parse::<f64>().unwrap(), 1e-13);
+        assert_eq!(builder_stage.torque_tolerance.parse::<f64>().unwrap(), 1e-5);
+        assert_eq!(builder_stage.energy_tolerance.parse::<f64>().unwrap(), 1e-9);
+        assert_eq!(builder_stage.max_steps.parse::<u64>().unwrap(), 25);
+        assert_eq!(builder_stage.eigen_count.parse::<u64>().unwrap(), 12);
+        assert_eq!(
+            builder_stage.eigen_target_frequency.parse::<f64>().unwrap(),
+            4e9
+        );
+        assert_eq!(builder_stage.eigen_k_vector, "1,0,0");
+        assert_eq!(
+            builder_stage.extra["future_stage_field"]["retained"],
+            true
+        );
+        let overrides = scene_document_to_script_builder_overrides(&scene)
+            .expect("numeric stage scalars should remain numeric in overrides");
+        assert_eq!(overrides["stages"][0]["until_seconds"], 2e-12);
+        assert_eq!(overrides["stages"][0]["fixed_timestep"], 1e-13);
+        assert_eq!(overrides["stages"][0]["torque_tolerance"], 1e-5);
+        assert_eq!(overrides["stages"][0]["energy_tolerance"], 1e-9);
+        assert_eq!(overrides["stages"][0]["max_steps"], 25);
+        assert_eq!(overrides["stages"][0]["eigen_count"], 12);
+        assert_eq!(overrides["stages"][0]["eigen_target_frequency"], 4e9);
+        assert_eq!(
+            overrides["stages"][0]["eigen_k_vector"],
+            serde_json::json!([1.0, 0.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn scene_stage_adaptive_numeric_values_round_trip_through_builder_text() {
+        let mut scene_value =
+            serde_json::to_value(scene_document_from_script_builder(&sample_builder()))
+                .expect("sample scene should serialize");
+        let stage = &mut scene_value["study"]["stages"][0];
+        stage["kind"] = serde_json::json!("relax");
+        stage["entrypoint_kind"] = serde_json::json!("flat_relax");
+        stage["algorithm"] = serde_json::json!("llg_overdamped");
+        stage["fixed_timestep"] = serde_json::json!("");
+        stage["adaptive_timestep"] = serde_json::json!({
+            "tolerance_mode": "advanced",
+            "atol": 1e-8,
+            "rtol": 1e-5,
+            "dt_initial": 1e-13,
+            "dt_min": 1e-16,
+            "dt_max": 1e-12,
+            "safety": 0.9,
+            "growth_limit": 2.0,
+            "shrink_limit": 0.2
+        });
+
+        let scene: SceneDocument =
+            serde_json::from_value(scene_value).expect("numeric adaptive stage should deserialize");
+        let canonical = serde_json::to_value(&scene).expect("scene should serialize");
+        assert_eq!(
+            canonical["study"]["stages"][0]["adaptive_timestep"]["atol"],
+            1e-8
+        );
+        assert_eq!(
+            canonical["study"]["stages"][0]["adaptive_timestep"]["dt_max"],
+            1e-12
+        );
+
+        let builder = scene_document_to_script_builder(&scene)
+            .expect("adaptive scene should adapt to the text-oriented builder");
+        let adaptive = builder.stages[0]
+            .adaptive_timestep
+            .as_ref()
+            .expect("builder should retain adaptive policy");
+        assert_eq!(adaptive.atol.parse::<f64>().unwrap(), 1e-8);
+        assert_eq!(adaptive.rtol.parse::<f64>().unwrap(), 1e-5);
+        assert_eq!(adaptive.dt_initial.parse::<f64>().unwrap(), 1e-13);
+        assert_eq!(adaptive.dt_min.parse::<f64>().unwrap(), 1e-16);
+        assert_eq!(adaptive.dt_max.parse::<f64>().unwrap(), 1e-12);
+        assert_eq!(adaptive.safety.parse::<f64>().unwrap(), 0.9);
+        assert_eq!(adaptive.growth_limit.parse::<f64>().unwrap(), 2.0);
+        assert_eq!(adaptive.shrink_limit.parse::<f64>().unwrap(), 0.2);
+
+        let overrides = scene_document_to_script_builder_overrides(&scene)
+            .expect("adaptive numeric values should remain numeric in overrides");
+        assert_eq!(
+            overrides["stages"][0]["adaptive_timestep"]["atol"],
+            1e-8
+        );
+        assert_eq!(
+            overrides["stages"][0]["adaptive_timestep"]["dt_max"],
+            1e-12
+        );
+    }
+
+    #[test]
+    fn scene_stage_reader_normalizes_valid_legacy_numbers_and_preserves_invalid_drafts() {
+        let mut scene_value =
+            serde_json::to_value(scene_document_from_script_builder(&sample_builder()))
+                .expect("sample scene should serialize");
+        let stage = &mut scene_value["study"]["stages"][0];
+        stage["until_seconds"] = serde_json::json!("2e-12");
+        stage["fixed_timestep"] = serde_json::json!("1e-13");
+        stage["torque_tolerance"] = serde_json::json!("1e-5");
+        stage["energy_tolerance"] = serde_json::json!("1e-9");
+        stage["max_steps"] = serde_json::json!("25");
+        stage["eigen_count"] = serde_json::json!("12");
+        stage["eigen_target_frequency"] = serde_json::json!("4e9");
+        stage["eigen_k_vector"] = serde_json::json!("1, 2, 3");
+        stage["adaptive_timestep"] = serde_json::json!({
+            "tolerance_mode": "advanced",
+            "atol": "1e-8",
+            "rtol": "1e-5",
+            "dt_initial": "1e-13",
+            "dt_min": "1e-16",
+            "dt_max": "1e-12",
+            "safety": "0.9",
+            "growth_limit": "2.0",
+            "shrink_limit": "0.2"
+        });
+        let legacy_scene: SceneDocument =
+            serde_json::from_value(scene_value.clone()).expect("legacy numeric text is readable");
+        let canonical = serde_json::to_value(&legacy_scene).expect("scene should serialize");
+        assert_eq!(canonical["study"]["stages"][0]["until_seconds"], 2e-12);
+        assert_eq!(canonical["study"]["stages"][0]["fixed_timestep"], 1e-13);
+        assert_eq!(canonical["study"]["stages"][0]["torque_tolerance"], 1e-5);
+        assert_eq!(canonical["study"]["stages"][0]["energy_tolerance"], 1e-9);
+        assert_eq!(canonical["study"]["stages"][0]["max_steps"], 25);
+        assert_eq!(canonical["study"]["stages"][0]["eigen_count"], 12);
+        assert_eq!(
+            canonical["study"]["stages"][0]["eigen_target_frequency"],
+            4e9
+        );
+        assert_eq!(
+            canonical["study"]["stages"][0]["eigen_k_vector"],
+            serde_json::json!([1.0, 2.0, 3.0])
+        );
+        assert_eq!(
+            canonical["study"]["stages"][0]["adaptive_timestep"]["atol"],
+            1e-8
+        );
+
+        let stage = &mut scene_value["study"]["stages"][0];
+        stage["until_seconds"] = serde_json::json!("unfinished duration");
+        stage["fixed_timestep"] = serde_json::json!("");
+        stage["torque_tolerance"] = serde_json::json!("unfinished torque");
+        stage["max_steps"] = serde_json::json!("unfinished count");
+        stage["eigen_k_vector"] = serde_json::json!("unfinished vector");
+        stage["future_stage_field"] = serde_json::json!({ "retained": true });
+        let draft_scene: SceneDocument =
+            serde_json::from_value(scene_value).expect("legacy text draft should be retained");
+        let preserved = serde_json::to_value(&draft_scene).expect("draft should serialize");
+        assert_eq!(
+            preserved["study"]["stages"][0]["until_seconds"],
+            "unfinished duration"
+        );
+        assert!(preserved["study"]["stages"][0]
+            .get("fixed_timestep")
+            .is_none());
+        assert_eq!(
+            preserved["study"]["stages"][0]["torque_tolerance"],
+            "unfinished torque"
+        );
+        assert_eq!(
+            preserved["study"]["stages"][0]["max_steps"],
+            "unfinished count"
+        );
+        assert_eq!(
+            preserved["study"]["stages"][0]["eigen_k_vector"],
+            "unfinished vector"
+        );
+        assert_eq!(
+            preserved["study"]["stages"][0]["future_stage_field"]["retained"],
+            true
+        );
+
+        let builder = scene_document_to_script_builder(&draft_scene)
+            .expect("invalid non-solver draft text should remain in builder state");
+        assert_eq!(builder.stages[0].until_seconds, "unfinished duration");
+        assert_eq!(builder.stages[0].fixed_timestep, "");
+        assert_eq!(builder.stages[0].torque_tolerance, "unfinished torque");
+        assert_eq!(builder.stages[0].max_steps, "unfinished count");
+        assert_eq!(builder.stages[0].eigen_k_vector, "unfinished vector");
+        let adaptive = builder.stages[0]
+            .adaptive_timestep
+            .as_ref()
+            .expect("legacy adaptive values should reach the builder reader");
+        assert_eq!(adaptive.atol.parse::<f64>().unwrap(), 1e-8);
+        assert_eq!(adaptive.dt_max.parse::<f64>().unwrap(), 1e-12);
+        assert_eq!(
+            builder.stages[0].extra["future_stage_field"]["retained"],
+            true
+        );
+        let error = scene_document_to_script_builder_overrides(&draft_scene)
+            .expect_err("script export must not turn invalid drafts into null values");
+        assert!(error.message.contains("until_seconds"), "{}", error.message);
+    }
+
+    #[test]
+    fn scene_stage_numeric_reader_rejects_non_scalar_and_non_u64_json_values() {
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!({ "value": 1 }),
+            serde_json::json!([1]),
+        ] {
+            for field in [
+                "until_seconds",
+                "fixed_timestep",
+                "torque_tolerance",
+                "energy_tolerance",
+                "max_steps",
+                "eigen_count",
+                "eigen_target_frequency",
+                "eigen_k_vector",
+            ] {
+                let mut scene_value = serde_json::json!({
+                    "version": "scene.v2",
+                    "study": { "stages": [{
+                        "kind": "run",
+                        "entrypoint_kind": "flat_run"
+                    }]}
+                });
+                scene_value["study"]["stages"][0][field] = invalid.clone();
+                assert!(
+                    serde_json::from_value::<SceneDocument>(scene_value).is_err(),
+                    "{field} must reject {invalid}"
+                );
+            }
+        }
+
+        for invalid in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut scene_value = serde_json::json!({
+                "version": "scene.v2",
+                "study": { "stages": [{
+                    "kind": "relax",
+                    "entrypoint_kind": "flat_relax",
+                    "max_steps": 1
+                }]}
+            });
+            scene_value["study"]["stages"][0]["max_steps"] = invalid.clone();
+            assert!(
+                serde_json::from_value::<SceneDocument>(scene_value).is_err(),
+                "max_steps must reject {invalid}"
+            );
+        }
+
+        let mut scene_value = serde_json::json!({
+            "version": "scene.v2",
+            "study": { "stages": [{
+                "kind": "relax",
+                "entrypoint_kind": "flat_relax",
+                "adaptive_timestep": { "tolerance_mode": "advanced" }
+            }]}
+        });
+        scene_value["study"]["stages"][0]["adaptive_timestep"]["atol"] =
+            serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<SceneDocument>(scene_value).is_err(),
+            "adaptive scalar fields must reject nonnumeric JSON values"
+        );
+    }
+
+    fn sample_execution_profile() -> fullmag_ir::ExecutionProfileIR {
+        fullmag_ir::ExecutionProfileIR {
+            schema_version: fullmag_ir::EXECUTION_PROFILE_SCHEMA.to_string(),
+            profile_id: "exec:authoring-roundtrip".to_string(),
+            version: "2".to_string(),
+            description: "Authored execution profile".to_string(),
+            defaults: fullmag_ir::ExecutionRequestPatchIR {
+                backend: fullmag_ir::FieldPatch::Value(fullmag_ir::BackendTarget::Fem),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn sample_execution_layer() -> fullmag_ir::ExecutionRequestLayerIR {
+        fullmag_ir::ExecutionRequestLayerIR {
+            origin: fullmag_ir::ExecutionFieldOriginIR {
+                kind: fullmag_ir::ExecutionOriginKindIR::Script,
+                location: "study.script".to_string(),
+            },
+            request: fullmag_ir::ExecutionRequestPatchIR {
+                device: fullmag_ir::FieldPatch::Value(fullmag_ir::ExecutionDevice::Cpu),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn execution_profile_and_layers_round_trip_through_scene_overrides_and_model() {
+        let mut builder = sample_builder();
+        let profile = sample_execution_profile();
+        let layers = vec![sample_execution_layer()];
+        builder.execution_profile = Some(profile.clone());
+        builder.execution_layers = layers.clone();
+
+        let scene = scene_document_from_script_builder(&builder);
+        assert_eq!(scene.study.execution_profile, Some(profile.clone()));
+        assert_eq!(scene.study.execution_layers, layers);
+
+        let round_trip = scene_document_to_script_builder(&scene).expect("scene should validate");
+        assert_eq!(round_trip.execution_profile, Some(profile.clone()));
+        assert_eq!(round_trip.execution_layers, layers);
+
+        let overrides = scene_document_to_script_builder_overrides(&scene)
+            .expect("scene overrides should serialize");
+        assert_eq!(
+            overrides["execution_profile"],
+            serde_json::to_value(&profile).unwrap()
+        );
+        assert_eq!(
+            overrides["execution_layers"],
+            serde_json::to_value(&layers).unwrap()
+        );
+
+        let model = crate::scene_document_model_definition(&scene).expect("model projection");
+        let discretization = model.discretization.expect("discretization projection");
+        assert_eq!(
+            discretization["execution_profile"],
+            serde_json::to_value(&profile).unwrap()
+        );
+        assert_eq!(
+            discretization["execution_layers"],
+            serde_json::to_value(&layers).unwrap()
+        );
+    }
+
+    #[test]
+    fn absent_execution_profile_keeps_legacy_serialization_omitted() {
         let builder = sample_builder();
+        let scene = scene_document_from_script_builder(&builder);
+
+        let builder_json = serde_json::to_value(&builder).unwrap();
+        let scene_json = serde_json::to_value(&scene).unwrap();
+        let overrides = scene_document_to_script_builder_overrides(&scene)
+            .expect("legacy scene overrides should serialize");
+        let model = crate::scene_document_model_definition(&scene).expect("model projection");
+        let discretization = model.discretization.expect("discretization projection");
+
+        assert!(builder_json.get("execution_profile").is_none());
+        assert!(builder_json.get("execution_layers").is_none());
+        assert!(scene_json["study"].get("execution_profile").is_none());
+        assert!(scene_json["study"].get("execution_layers").is_none());
+        assert!(overrides.get("execution_profile").is_none());
+        assert!(overrides.get("execution_layers").is_none());
+        assert!(discretization.get("execution_profile").is_none());
+        assert!(discretization.get("execution_layers").is_none());
+    }
+
+    #[test]
+    fn malformed_execution_profile_intent_is_rejected() {
+        let mut scene = scene_document_from_script_builder(&sample_builder());
+        scene.study.execution_layers = vec![sample_execution_layer()];
+        let error = scene_document_to_script_builder(&scene).expect_err("layers need a profile");
+        assert!(error.message.contains("execution_layers require"));
+
+        scene.study.execution_profile = Some(sample_execution_profile());
+        scene
+            .study
+            .execution_profile
+            .as_mut()
+            .unwrap()
+            .schema_version = "execution_profile.v0".into();
+        let error = scene_document_to_script_builder(&scene).expect_err("schema must be supported");
+        assert!(
+            error
+                .message
+                .contains("unsupported execution profile schema")
+        );
+
+        scene.study.execution_profile = Some(sample_execution_profile());
+        scene
+            .study
+            .execution_profile
+            .as_mut()
+            .unwrap()
+            .profile_id
+            .clear();
+        let error = scene_document_to_script_builder(&scene).expect_err("profile id must validate");
+        assert!(error.message.contains("execution profile profile_id"));
+
+        scene.study.execution_profile = Some(sample_execution_profile());
+        scene.study.execution_layers[0].origin.kind =
+            fullmag_ir::ExecutionOriginKindIR::ProductDefault;
+        let error =
+            scene_document_to_script_builder(&scene).expect_err("layer origin must be authored");
+        assert!(
+            error
+                .message
+                .contains("must identify an authored request layer")
+        );
+
+        scene.study.execution_layers[0].origin.kind = fullmag_ir::ExecutionOriginKindIR::Script;
+        scene.study.execution_layers[0].origin.location.clear();
+        let error = scene_document_to_script_builder(&scene).expect_err("origin must validate");
+        assert!(
+            error
+                .message
+                .contains("execution_layers[0].origin is invalid")
+        );
+
+        let mut scene_json =
+            serde_json::to_value(scene_document_from_script_builder(&sample_builder())).unwrap();
+        scene_json["study"]["execution_profile"] =
+            serde_json::to_value(sample_execution_profile()).unwrap();
+        scene_json["study"]["execution_layers"] = serde_json::json!([{
+            "origin": {"kind": "script", "location": "study.script"},
+            "request": {},
+            "unknown": true
+        }]);
+        assert!(serde_json::from_value::<SceneDocument>(scene_json).is_err());
+    }
+
+    #[test]
+    fn execution_profile_rejects_legacy_change_device_stages() {
+        let mut builder = sample_builder();
+        builder.stages.push(
+            serde_json::from_value(serde_json::json!({
+                "kind": "change_device",
+                "entrypoint_kind": "flat_change_device"
+            }))
+            .expect("legacy change_device stage should deserialize"),
+        );
+        builder.study_pipeline = Some(StudyPipelineDocument {
+            version: "study_pipeline.v1".to_string(),
+            nodes: vec![StudyPipelineNode::Group(crate::StageGroupNode {
+                id: "group_1".to_string(),
+                label: "Legacy device action".to_string(),
+                enabled: true,
+                notes: None,
+                source: Some(StudyPipelineNodeSource::ScriptImported),
+                collapsed: false,
+                children: vec![
+                    StudyPipelineNode::Primitive(PrimitiveStageNode {
+                        id: "stage_change_device".to_string(),
+                        label: "Change device".to_string(),
+                        enabled: true,
+                        notes: None,
+                        source: Some(StudyPipelineNodeSource::ScriptImported),
+                        stage_kind: StudyPrimitiveStageKind::ChangeDevice,
+                        payload: BTreeMap::from([(
+                            "kind".to_string(),
+                            serde_json::json!("change_device"),
+                        )]),
+                    }),
+                    StudyPipelineNode::Macro(MacroStageNode {
+                        id: "macro_relax_run".to_string(),
+                        label: "Relax then run".to_string(),
+                        enabled: true,
+                        notes: None,
+                        source: Some(StudyPipelineNodeSource::ScriptImported),
+                        macro_kind: StudyMacroStageKind::RelaxRun,
+                        config: BTreeMap::new(),
+                    }),
+                ],
+            })],
+        });
+
+        let mut scene = scene_document_from_script_builder(&builder);
+        scene_document_to_script_builder(&scene)
+            .expect("legacy change_device stages remain valid without a profile");
+
+        scene.study.execution_profile = Some(sample_execution_profile());
+        let error = scene_document_to_script_builder(&scene)
+            .expect_err("flat change_device stages conflict with a profile");
+        assert!(
+            error
+                .message
+                .starts_with("execution_profile_change_device_stage_conflict")
+        );
+        assert!(
+            error
+                .message
+                .contains("canonical StudyPlan layers/references")
+        );
+
+        scene.study.stages.clear();
+        let error = scene_document_to_script_builder(&scene)
+            .expect_err("nested pipeline change_device stages conflict with a profile");
+        assert!(
+            error
+                .message
+                .contains("study.study_pipeline.nodes[0].children[0]")
+        );
+    }
+
+    #[test]
+    fn scene_document_round_trips_script_builder_state() {
+        let mut builder = sample_builder();
+        builder.antenna_port_modes = vec![serde_json::from_value(serde_json::json!({
+            "schema_version": "antenna_port_mode.v2",
+            "id": "port_1",
+            "source_object_id": "antenna_1",
+            "current_transport_id": "transport_1",
+            "branches": [{
+                "id": "signal",
+                "inlet_terminal_ref": "signal_in",
+                "outlet_terminal_ref": "signal_out",
+                "signed_weight": 1.0
+            }, {
+                "id": "return",
+                "inlet_terminal_ref": "return_in",
+                "outlet_terminal_ref": "return_out",
+                "signed_weight": -1.0
+            }]
+        }))
+        .expect("port fixture")];
+        builder.antenna_field_solve_stages = vec![serde_json::from_value(serde_json::json!({
+            "id": "solve_1",
+            "source_object_id": "antenna_1",
+            "current_transport_id": "transport_1",
+            "port_mode_ids": ["port_1"],
+            "conservative_current_view_ref": "transport_1:rt0",
+            "model": "quasistatic_conduction_biot_savart3d",
+            "oersted_realization": "direct_tetra_quadrature",
+            "conductor_mesh_policy": "authored_shared_domain",
+            "field_sampling_domain": {"kind": "global"},
+            "target_refs": [{"kind": "global"}],
+            "solver_policy": "production_default",
+            "outputs": [{"id": "basis", "quantity": "H_ant_basis"}]
+        }))
+        .expect("field solve fixture")];
+        builder.antenna_target_projections = vec![serde_json::from_value(serde_json::json!({
+            "id": "projection_1",
+            "solution": {
+                "stage_id": "solve_1",
+                "output_id": "basis",
+                "asset_id": "asset_1",
+                "content_digest": "sha256:asset"
+            },
+            "target": {"kind": "global"},
+            "output_id": "projected"
+        }))
+        .expect("projection fixture")];
+        builder.solved_antenna_drives = vec![serde_json::from_value(serde_json::json!({
+            "id": "drive_1",
+            "name": "Drive 1",
+            "projection_ref": "projection_1",
+            "port_mode_id": "port_1",
+            "peak_current_a": 0.01,
+            "waveform": {"kind": "constant"},
+            "time_origin": "stage_local",
+            "activation": {"kind": "all_time_evolution"}
+        }))
+        .expect("drive fixture")];
+        builder.antenna_spectrum_requests = vec![serde_json::from_value(serde_json::json!({
+            "id": "spectrum_1",
+            "solution_ref": {
+                "stage_id": "solve_1",
+                "output_id": "basis",
+                "asset_id": "asset_1",
+                "content_digest": "sha256:asset"
+            },
+            "target": {"kind": "global"},
+            "transform": "spatial_fft",
+            "sampling_plane": {
+                "origin_m": [0.0, 0.0, 0.0],
+                "axis_u": [1.0, 0.0, 0.0],
+                "axis_v": [0.0, 1.0, 0.0],
+                "extent_u_m": 1.0,
+                "extent_v_m": 1.0,
+                "sample_count_u": 2,
+                "sample_count_v": 2,
+                "interpolation": "fem_element",
+                "outside_policy": "error"
+            },
+            "window": "rectangular",
+            "normalization": "integral_si",
+            "component": "x",
+            "output_id": "spectrum_out"
+        }))
+        .expect("spectrum fixture")];
         let scene = scene_document_from_script_builder(&builder);
         let round_trip = scene_document_to_script_builder(&scene).expect("scene should validate");
 
@@ -2557,10 +3528,41 @@ mod tests {
         assert_eq!(round_trip.mesh, builder.mesh);
         assert_eq!(round_trip.universe, builder.universe);
         assert_eq!(round_trip.study_pipeline, builder.study_pipeline);
+        assert_eq!(round_trip.table_autosave, builder.table_autosave);
         assert_eq!(round_trip.mesh_interfaces, builder.mesh_interfaces);
         assert_eq!(round_trip.initial_state, builder.initial_state);
         assert_eq!(round_trip.current_modules, builder.current_modules);
         assert_eq!(round_trip.excitation_analysis, builder.excitation_analysis);
+        assert_eq!(round_trip.antenna_port_modes, builder.antenna_port_modes);
+        assert_eq!(
+            round_trip.antenna_field_solve_stages,
+            builder.antenna_field_solve_stages
+        );
+        assert_eq!(
+            round_trip.antenna_target_projections,
+            builder.antenna_target_projections
+        );
+        assert_eq!(round_trip.solved_antenna_drives, builder.solved_antenna_drives);
+        assert_eq!(
+            round_trip.antenna_spectrum_requests,
+            builder.antenna_spectrum_requests
+        );
+        let overrides = scene_document_to_script_builder_overrides(&scene)
+            .expect("antenna collections should survive rewrite overrides");
+        assert_eq!(overrides["antenna_port_modes"][0]["id"], "port_1");
+        assert_eq!(
+            overrides["antenna_field_solve_stages"][0]["id"],
+            "solve_1"
+        );
+        assert_eq!(
+            overrides["antenna_target_projections"][0]["id"],
+            "projection_1"
+        );
+        assert_eq!(overrides["solved_antenna_drives"][0]["id"], "drive_1");
+        assert_eq!(
+            overrides["antenna_spectrum_requests"][0]["id"],
+            "spectrum_1"
+        );
         assert_eq!(
             round_trip.geometries[0].physics_stack,
             builder.geometries[0].physics_stack
@@ -2611,6 +3613,32 @@ mod tests {
                 .map(|document| document.version.as_str()),
             Some("study_pipeline.v1")
         );
+    }
+
+    #[test]
+    fn scene_document_preserves_table_autosave_through_builder_and_overrides() {
+        let expected: fullmag_ir::TableAutosaveIR = serde_json::from_value(serde_json::json!({
+            "kind": "table_autosave",
+            "table_id": "scene-table",
+            "every_steps": 3,
+            "quantities": ["step", "mx"],
+            "expressions": ["custom_quantity"]
+        }))
+        .expect("valid table autosave");
+        let mut scene = scene_document_from_script_builder(&sample_builder());
+        scene.study.table_autosave = Some(expected.clone());
+
+        let builder = scene_document_to_script_builder(&scene).expect("scene should validate");
+        let overrides = scene_document_to_script_builder_overrides(&scene)
+            .expect("scene overrides should serialize");
+        let round_trip = scene_document_from_script_builder(&builder);
+
+        assert_eq!(builder.table_autosave, Some(expected.clone()));
+        assert_eq!(
+            overrides["table_autosave"],
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(round_trip.study.table_autosave, Some(expected));
     }
 
     #[test]
@@ -2684,10 +3712,12 @@ mod tests {
                 });
             let recovered = scene_document_to_script_builder(&scene)
                 .expect("explicitly disabled object DMI must suppress material injection");
-            assert!(recovered.geometries[0]
-                .physics_stack
-                .iter()
-                .any(|interaction| interaction.kind == kind && !interaction.enabled));
+            assert!(
+                recovered.geometries[0]
+                    .physics_stack
+                    .iter()
+                    .any(|interaction| interaction.kind == kind && !interaction.enabled)
+            );
         }
     }
 
@@ -2708,16 +3738,18 @@ mod tests {
 
             let round_trip = scene_document_to_script_builder(&scene)
                 .expect("zero material DMI defaults must allow study rDMI");
-            assert!(round_trip.geometries[0]
-                .physics_stack
-                .iter()
-                .all(|interaction| {
-                    !matches!(
-                        interaction.kind,
-                        ScriptBuilderMagneticInteractionKind::InterfacialDmi
-                            | ScriptBuilderMagneticInteractionKind::BulkDmi
-                    )
-                }));
+            assert!(
+                round_trip.geometries[0]
+                    .physics_stack
+                    .iter()
+                    .all(|interaction| {
+                        !matches!(
+                            interaction.kind,
+                            ScriptBuilderMagneticInteractionKind::InterfacialDmi
+                                | ScriptBuilderMagneticInteractionKind::BulkDmi
+                        )
+                    })
+            );
         }
     }
 
@@ -2774,9 +3806,11 @@ mod tests {
 
         let error = scene_document_to_script_builder(&scene)
             .expect_err("object-scoped rotated DMI must be rejected unconditionally");
-        assert!(error
-            .message
-            .contains("cannot appear in object physics_stack"));
+        assert!(
+            error
+                .message
+                .contains("cannot appear in object physics_stack")
+        );
     }
 
     #[test]
@@ -2809,6 +3843,45 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(projected_names, vec![hidden_magnet_name.as_str()]);
+        let exported = projection.rewrite_overrides["geometries"].as_array().unwrap();
+        assert_eq!(exported.len(), 2);
+        assert_eq!(exported[0]["object_id"], scene.objects[0].id);
+        assert_eq!(exported[1]["object_id"], "carrier");
+        assert_eq!(exported[1]["role"], "carrier");
+        assert!(exported[1].get("material").is_none());
+        assert!(exported[1].get("magnetization").is_none());
+        assert!(exported[1].get("physics_stack").is_none());
+    }
+
+    #[test]
+    fn antenna_export_preserves_owner_identity_and_translation_without_magnetism() {
+        let mut scene = scene_document_from_script_builder(&sample_builder());
+        let mut antenna = scene.objects[0].clone();
+        antenna.id = "immutable-conductor-owner".to_string();
+        antenna.name = "Renamed antenna".to_string();
+        antenna.role = "antenna".to_string();
+        antenna.material_ref.clear();
+        antenna.magnetization_ref = None;
+        antenna.physics_stack.clear();
+        antenna.regions.clear();
+        antenna.allocated_region_ids.clear();
+        antenna.material_parameter_fields.clear();
+        antenna.absorbing_boundary = None;
+        antenna.transform.translation = [0.0, 0.0, 50e-9];
+        scene.objects.insert(0, antenna);
+
+        let overrides = scene_document_to_script_builder_overrides(&scene).expect("export");
+        let exported = &overrides["geometries"][1];
+        assert_eq!(exported["object_id"], "immutable-conductor-owner");
+        assert_eq!(exported["name"], "Renamed antenna");
+        assert_eq!(exported["role"], "antenna");
+        assert_eq!(exported["geometry_params"]["translation"], serde_json::json!([0.0, 0.0, 50e-9]));
+        assert!(exported.get("material").is_none());
+        assert!(exported.get("magnetization").is_none());
+
+        scene.objects[0].transform.scale = [2.0, 1.0, 1.0];
+        let error = scene_document_to_script_builder_overrides(&scene).expect_err("unsupported scale");
+        assert!(error.message.contains("owner_transform_rotation_scale_unsupported"));
     }
 
     #[test]
@@ -3083,6 +4156,123 @@ mod tests {
     }
 
     #[test]
+    fn scene_override_preserves_modal_equilibrium_artifact_paths() {
+        for (kind, prefix) in [("eigenmodes", "eigen"), ("frequency_response", "frequency")] {
+            for artifact_key in [
+                format!("{prefix}_equilibrium_artifact"),
+                "equilibrium_artifact".into(),
+            ] {
+                let mut encoded = serde_json::to_value(sample_builder()).unwrap();
+                encoded["stages"][0]["kind"] = serde_json::json!(kind);
+                encoded["stages"][0][format!("{prefix}_equilibrium_source")] =
+                    serde_json::json!("artifact");
+                encoded["stages"][0][&artifact_key] = serde_json::json!("storage/preserved.json");
+                let builder: ScriptBuilderState = serde_json::from_value(encoded).unwrap();
+                let scene = scene_document_from_script_builder(&builder);
+                let overrides = scene_document_to_script_builder_overrides(&scene).unwrap();
+                assert_eq!(
+                    overrides["stages"][0][format!("{prefix}_equilibrium_artifact")],
+                    serde_json::json!("storage/preserved.json")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scene_override_preserves_generic_equilibrium_with_empty_prefixed_aliases() {
+        for (kind, prefix) in [("eigenmodes", "eigen"), ("frequency_response", "frequency")] {
+            let mut encoded = serde_json::to_value(sample_builder()).unwrap();
+            encoded["stages"][0]["kind"] = serde_json::json!(kind);
+            encoded["stages"][0][format!("{prefix}_equilibrium_source")] = serde_json::json!("");
+            encoded["stages"][0][format!("{prefix}_equilibrium_artifact")] = Value::Null;
+            encoded["stages"][0]["equilibrium_source"] = serde_json::json!("artifact");
+            encoded["stages"][0]["equilibrium_artifact"] =
+                serde_json::json!("storage/preserved.json");
+            let builder: ScriptBuilderState = serde_json::from_value(encoded).unwrap();
+            let scene = scene_document_from_script_builder(&builder);
+            let overrides = scene_document_to_script_builder_overrides(&scene).unwrap();
+            assert_eq!(
+                overrides["stages"][0][format!("{prefix}_equilibrium_source")],
+                "artifact"
+            );
+            assert_eq!(
+                overrides["stages"][0][format!("{prefix}_equilibrium_artifact")],
+                "storage/preserved.json"
+            );
+        }
+    }
+
+    #[test]
+    fn scene_override_preserves_explicit_eigen_solver_policy() {
+        let mut encoded = serde_json::to_value(sample_builder()).unwrap();
+        encoded["stages"][0]["kind"] = serde_json::json!("eigenmodes");
+        encoded["stages"][0]["eigen_solver_rtol"] = serde_json::json!(2.5e-8);
+        encoded["stages"][0]["eigen_solver_max_outer_iterations"] = serde_json::json!(145);
+        encoded["stages"][0]["eigen_solver_max_linear_iterations"] = serde_json::json!(245);
+        let builder: ScriptBuilderState = serde_json::from_value(encoded).unwrap();
+        let scene = scene_document_from_script_builder(&builder);
+        let overrides = scene_document_to_script_builder_overrides(&scene).unwrap();
+
+        assert_eq!(
+            overrides["stages"][0]["eigen_solver_rtol"],
+            serde_json::json!(2.5e-8)
+        );
+        assert_eq!(
+            overrides["stages"][0]["eigen_solver_max_outer_iterations"],
+            serde_json::json!(145)
+        );
+        assert_eq!(
+            overrides["stages"][0]["eigen_solver_max_linear_iterations"],
+            serde_json::json!(245)
+        );
+    }
+
+    #[test]
+    fn scene_override_omits_unset_eigen_solver_policy_for_legacy_stage() {
+        let mut encoded = serde_json::to_value(sample_builder()).unwrap();
+        encoded["stages"][0]["kind"] = serde_json::json!("eigenmodes");
+        let builder: ScriptBuilderState = serde_json::from_value(encoded).unwrap();
+        let scene = scene_document_from_script_builder(&builder);
+        let overrides = scene_document_to_script_builder_overrides(&scene).unwrap();
+        let stage_overrides = overrides["stages"][0]
+            .as_object()
+            .expect("stage override should be an object");
+
+        for key in [
+            "eigen_solver_rtol",
+            "eigen_solver_max_outer_iterations",
+            "eigen_solver_max_linear_iterations",
+        ] {
+            assert!(
+                !stage_overrides.contains_key(key),
+                "legacy stage must not emit absent solver key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn scene_override_preserves_explicit_eigen_solver_policy_clears_and_mixed_values() {
+        let mut encoded = serde_json::to_value(sample_builder()).unwrap();
+        encoded["stages"][0]["kind"] = serde_json::json!("eigenmodes");
+        encoded["stages"][0]["eigen_solver_rtol"] = Value::Null;
+        encoded["stages"][0]["eigen_solver_max_outer_iterations"] = serde_json::json!("");
+        encoded["stages"][0]["eigen_solver_max_linear_iterations"] = serde_json::json!(57);
+        let builder: ScriptBuilderState = serde_json::from_value(encoded).unwrap();
+        let scene = scene_document_from_script_builder(&builder);
+        let overrides = scene_document_to_script_builder_overrides(&scene).unwrap();
+
+        assert_eq!(overrides["stages"][0]["eigen_solver_rtol"], Value::Null);
+        assert_eq!(
+            overrides["stages"][0]["eigen_solver_max_outer_iterations"],
+            serde_json::json!("")
+        );
+        assert_eq!(
+            overrides["stages"][0]["eigen_solver_max_linear_iterations"],
+            serde_json::json!(57)
+        );
+    }
+
+    #[test]
     fn scene_projection_exports_edited_stage_adaptive_policy() {
         let builder = sample_builder();
         let mut encoded = serde_json::to_value(builder).unwrap();
@@ -3124,9 +4314,11 @@ mod tests {
         scene.objects[0].magnetization_ref = None;
         let error = scene_document_to_script_builder(&scene)
             .expect_err("missing magnetization ref must fail");
-        assert!(error
-            .message
-            .contains("must reference a magnetization asset"));
+        assert!(
+            error
+                .message
+                .contains("must reference a magnetization asset")
+        );
     }
 
     #[test]
@@ -3137,9 +4329,11 @@ mod tests {
         scene.objects[0].transform.scale = [2.0, 1.0, 1.0];
         let error = scene_document_to_script_builder(&scene)
             .expect_err("owner rotation/scale must not be silently dropped");
-        assert!(error
-            .message
-            .contains("owner_transform_rotation_scale_unsupported"));
+        assert!(
+            error
+                .message
+                .contains("owner_transform_rotation_scale_unsupported")
+        );
     }
 
     #[test]
@@ -3167,9 +4361,11 @@ mod tests {
         scene.magnetization_assets[0].kind = "procedural".to_string();
         let error = scene_document_to_script_builder(&scene)
             .expect_err("unsupported magnetization kind must fail");
-        assert!(error
-            .message
-            .contains("unsupported magnetization asset kind"));
+        assert!(
+            error
+                .message
+                .contains("unsupported magnetization asset kind")
+        );
     }
 
     #[test]

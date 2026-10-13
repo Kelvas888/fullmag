@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { installSimulationPreparationTestDom } from "@/kernel/layout/simulationPreparationTestDom.test-support";
 
 import { DEFAULT_CAMERA_REGISTRY_STATE } from "@/kernel/visualization/CameraRegistryController";
-import { DATA_FIELD_VECTOR_PATH } from "@/kernel/api/apiPaths";
+import { DATA_FIELD_VECTOR_PATH, DATA_OBSERVATION_FRAME_MAGNETIZATION_PATH } from "@/kernel/api/apiPaths";
 import {
   DEFAULT_OBJECT_VISUALIZATION,
   ObjectVisualizationController,
@@ -33,6 +33,7 @@ import {
   resolveViewport3DActiveQuantityId,
   resolveViewport3DAnalysisComplexFieldQuery,
   resolveViewport3DAnalysisComplexProjectionEnabled,
+  resolveViewport3DModeFieldOverlaySourceIdentity,
   resolveViewport3DDisplayedLiveValue,
   resolvePrimaryFieldDisplayedEnvelope,
   type Viewport3DPrimaryFieldRetainedState,
@@ -43,6 +44,7 @@ import {
   resolveViewport3DPrimaryFieldVectorEnabled,
   resolveViewport3DPrimaryFieldQuery,
   resolveViewport3DDomainRenderLane,
+  hasActiveViewport3DTargetQuantityDemand,
   resolveViewport3DFdmFieldIdentityCompatible,
   resolveViewport3DFieldRenderModelBuildOptions,
   resolveViewport3DSelectedSnapshotId,
@@ -123,9 +125,14 @@ function readFileSync(
 const sceneModelSourceUrl = new URL("./useViewport3DSceneModel.ts", import.meta.url);
 const planarPreviewSourceUrl = new URL("../../../kernel/workspace/planarMonitorFramePreview.ts", import.meta.url);
 const TEST_SESSION_IDENTITY = {
+  requestScopeEpoch: "test-api:1",
   sessionEpoch: "test-session@1000",
   sessionId: "test-session",
 } as const;
+
+function currentFieldVectorResourcePath(query: string): string {
+  return `${DATA_FIELD_VECTOR_PATH.replace("{quantity_id}", "m")}?${query}`;
+}
 
 describe("viewport vector scale", () => {
   it("derives glyphs from effective sample spacing", () => {
@@ -497,7 +504,7 @@ describe("FDM Airbox mesh demand", () => {
     );
 
     expect(settingsBlock).toContain(
-      "visualizationState: fdmLaneActive ? null : renderingState",
+      "visualizationState: femLaneActive ? renderingState : null",
     );
   });
 
@@ -744,17 +751,31 @@ function fieldVectorFixture(
 }
 
 describe("useViewport3DSceneModel", () => {
+  it("surfaces target-vector status only for current resolved-lane demand", () => {
+    expect(hasActiveViewport3DTargetQuantityDemand("fdm", 1)).toBe(true);
+    expect(hasActiveViewport3DTargetQuantityDemand("fem", 1)).toBe(true);
+    expect(hasActiveViewport3DTargetQuantityDemand(null, 1)).toBe(false);
+    expect(hasActiveViewport3DTargetQuantityDemand("fdm", 0)).toBe(false);
+  });
+
   it("propagates FEM Airbox per-carrier field states into scene and debug models", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
     expect(source).toContain(
       "airboxFieldVectorPartStates: airboxFieldVectors.partStates,",
     );
+    // Live scene model carries the states directly; the debug source and the
+    // memoized scene model drop them while a pinned saved selection is active.
     expect(
       source.match(
         /airboxFieldVectorPartStates: airboxFieldVectors\.partStates,/g,
       ),
-    ).toHaveLength(3);
+    ).toHaveLength(1);
+    expect(
+      source.match(
+        /airboxFieldVectorPartStates: savedSelectionActive\s*\? EMPTY_VIEWPORT_FDM_PART_STATES\s*: airboxFieldVectors\.partStates,/g,
+      ),
+    ).toHaveLength(2);
   });
 
   it("resolves FDM native layers from canonical state and pending local target edits", () => {
@@ -776,7 +797,7 @@ describe("useViewport3DSceneModel", () => {
   it("uses canonical local Airbox settings for both FDM Airbox carriers", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
     expect(source).toContain(
-      "target: AIRBOX_VISUALIZATION_TARGET,\n        visualizationState: fdmLaneActive ? null : renderingState,",
+      "target: AIRBOX_VISUALIZATION_TARGET,\n        visualizationState: femLaneActive ? renderingState : null,",
     );
     const fdmSingleGridAirboxBlock = source.slice(
       source.indexOf("const fdmSingleGridAirboxSettings ="),
@@ -797,7 +818,7 @@ describe("useViewport3DSceneModel", () => {
     expect(airboxSettingsBlock).toContain("resolveTargetVisualization({");
     expect(airboxSettingsBlock).toContain("target: AIRBOX_VISUALIZATION_TARGET");
     expect(airboxSettingsBlock).toContain(
-      "visualizationState: fdmLaneActive ? null : renderingState",
+      "visualizationState: femLaneActive ? renderingState : null",
     );
     expect(airboxSettingsBlock).not.toContain("resolveViewport3DFdmTargetVisualization({");
 
@@ -828,7 +849,7 @@ describe("useViewport3DSceneModel", () => {
   it("reports FDM field mismatches only while the FDM lane is active", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
     const expression = source.match(
-      /fieldVector\.error\?\.message \?\?\s*([\s\S]*?)\s*\?\?\s*magneticPartFieldVectors/,
+      /fieldVector\.error\?\.message \?\?\s*([\s\S]*?)\s*\?\?\s*\(femLaneActive \? magneticPartFieldVectors/,
     )?.[1];
     expect(expression).toBeDefined();
     const resolveWarning = new Function(
@@ -869,7 +890,7 @@ describe("useViewport3DSceneModel", () => {
 
     for (const topologyFreshness of ["current", "stale", "unknown"] as const) {
       const lane = resolveViewport3DDomainRenderLane({
-        fdmActive: true,
+        discretization: "fdm",
         femDomain,
         topologyFreshness,
       });
@@ -891,7 +912,7 @@ describe("useViewport3DSceneModel", () => {
     } as never;
 
     const lane = resolveViewport3DDomainRenderLane({
-      fdmActive: false,
+      discretization: "fem",
       femDomain,
       topologyFreshness: "current",
     });
@@ -901,16 +922,45 @@ describe("useViewport3DSceneModel", () => {
     expect(lane.topologyRenderable).toBe(true);
   });
 
+  it("keeps unresolved session mode from opening a stale FEM renderer", () => {
+    const femDomain = {
+      airboxParts: [{ id: "airbox" }],
+      magneticParts: [{ id: "film" }],
+      magneticSurfacePartsByPartId: new Map(),
+      objectPartIds: new Map([["film", ["film"]]]),
+      partsById: new Map([["film", { id: "film" }]]),
+    } as never;
+
+    const lane = resolveViewport3DDomainRenderLane({
+      discretization: null,
+      femDomain,
+      topologyFreshness: "current",
+    });
+
+    expect(lane.femDomain.magneticParts).toEqual([]);
+    expect(lane.topologyCurrent).toBe(false);
+    expect(lane.topologyRenderable).toBe(false);
+  });
+
   it("does not surface FEM topology freshness labels in the FDM lane", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
     expect(source).toContain(
-      'const fdmLaneActive = domainMeta.data?.discretization === "fdm";',
+      'const fdmLaneActive = sessionDiscretization === "fdm";',
     );
     expect(source).toContain(
-      "const topologyFreshnessStatus = fdmLaneActive\n    ? null\n    : resolveViewport3DTopologyFreshnessLabel(topologyFreshness);",
+      "const topologyFreshnessStatus = femLaneActive\n    ? resolveViewport3DTopologyFreshnessLabel(topologyFreshness)\n    : null;",
     );
-    expect(source).toContain("topologyFreshnessStatus ??\n    topology.status");
+    expect(source).toContain(
+      "(femLaneActive ? topologyFreshnessStatus ?? topology.status : null)",
+    );
+    expect(source).toContain("(femLaneActive ? topology.error?.message : null)");
+    expect(source).toContain(
+      "(fdmLaneActive ? fdmBuildState?.error?.message : null)",
+    );
+    expect(source).toContain(
+      "[femLaneActive, objectVisualizationSnapshot, renderingState]",
+    );
   });
 
   it("uses full metadata component for scalar spatial quantities", () => {
@@ -1002,7 +1052,12 @@ describe("useViewport3DSceneModel", () => {
       "topologyRenderModel: fieldCompatibleTopologyRenderModel",
     );
     expect(source).toContain("topology: fieldCompatibleTopologyRenderModel");
-    expect(source).toContain("topologyModel: topologyRenderModelForGeometry");
+    // The geometry-only topology model stays the live path; pinned saved
+    // selections substitute their own saved-viewport topology model.
+    expect(source).toContain(
+      "const effectiveViewportTopologyModel = savedSelectionActive\n    ? savedViewportSceneModel?.topologyModel ?? null\n    : topologyRenderModelForGeometry;",
+    );
+    expect(source).toContain("topologyModel: effectiveViewportTopologyModel");
     expect(source).toContain(
       "Boolean(fdmDomain || fieldCompatibleTopologyRenderModel) &&",
     );
@@ -1016,7 +1071,7 @@ describe("useViewport3DSceneModel", () => {
       "const tet4FmmqQualitySupported = topologySupportsTet4FmmqQuality(topology.data);",
     );
     expect(source).toContain(
-      "useViewport3DMeshQualityData(\n    Boolean(\n      fieldCompatibleTopologyRenderModel &&\n        meshQualityOverlayVisible &&\n        tet4FmmqQualitySupported,\n    ),\n  )",
+      "useViewport3DMeshQualityData(\n    Boolean(\n      liveViewportResourcesEnabled &&\n        fieldCompatibleTopologyRenderModel &&\n        meshQualityOverlayVisible &&\n        tet4FmmqQualitySupported,\n    ),\n  )",
     );
   });
 
@@ -1510,7 +1565,7 @@ describe("useViewport3DSceneModel", () => {
       },
       etag: '"m-frame-a"',
       resourceKey:
-        "/v2/sessions/current/data/fields/m?scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1",
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
       responseMetadata: {
         component: "full",
         domainGenerationId: "gen-1",
@@ -1537,7 +1592,7 @@ describe("useViewport3DSceneModel", () => {
       ...frameA,
       etag: '"m-frame-b"',
       resourceKey:
-        "/v2/sessions/current/data/fields/m?scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-wrong",
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-wrong"),
       responseMetadata: {
         ...frameA.responseMetadata!,
         fieldRevision: "rev-B",
@@ -1637,6 +1692,51 @@ describe("useViewport3DSceneModel", () => {
     });
   });
 
+  it("does not retain a live field after switching to an observation frame source", () => {
+    const envelope: Viewport3DFieldVectorEnvelope = {
+      data: {
+        dtype: "float64",
+        grid: [1, 1, 1],
+        nComp: 3,
+        pointCount: 1,
+        quantityId: "m",
+        valueCount: 3,
+        values: new Float64Array([1, 0, 0]),
+      },
+      etag: '"live-1"',
+      resourceKey: DATA_FIELD_VECTOR_PATH.replace("{quantity_id}", "m"),
+      responseMetadata: null,
+    };
+    const request = {
+      quantityId: "m",
+      query: { component: "full", scope_kind: "full" },
+    };
+    const live = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: envelope,
+      preparedRevision: "live-1",
+      request,
+      retained: null,
+      sourceResourceKey: envelope.resourceKey,
+      status: "ready",
+    });
+
+    const historical = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: null,
+      preparedRevision: null,
+      request,
+      retained: live.nextRetained,
+      sourceResourceKey:
+        DATA_OBSERVATION_FRAME_MAGNETIZATION_PATH.replace("{frame_id}", "frame-7"),
+      status: "loading",
+    });
+
+    expect(historical).toEqual({
+      displayedEnvelope: null,
+      displayedRevision: null,
+      nextRetained: null,
+    });
+  });
+
   it("reaches a retention fixed point in one step (regression: render loop)", () => {
     const tracker = new Viewport3DResourceTracker();
     const frameA: Viewport3DFieldVectorEnvelope = {
@@ -1657,7 +1757,7 @@ describe("useViewport3DSceneModel", () => {
       },
       etag: '"m-frame-a"',
       resourceKey:
-        "/v2/sessions/current/data/fields/m?scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1",
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
       responseMetadata: {
         component: "full",
         domainGenerationId: "gen-1",
@@ -1684,7 +1784,7 @@ describe("useViewport3DSceneModel", () => {
       ...frameA,
       etag: '"m-frame-b"',
       resourceKey:
-        "/v2/sessions/current/data/fields/m?scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-wrong",
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-wrong"),
       responseMetadata: {
         ...frameA.responseMetadata!,
         fieldRevision: "rev-B",
@@ -1919,7 +2019,7 @@ describe("useViewport3DSceneModel", () => {
       },
       etag: '"m-frame-a"',
       resourceKey:
-        "/v2/sessions/current/data/fields/m?scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1",
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
       responseMetadata: {
         component: "full",
         domainGenerationId: "gen-1",
@@ -1946,7 +2046,7 @@ describe("useViewport3DSceneModel", () => {
       ...frameA,
       etag: '"m-frame-b"',
       resourceKey:
-        "/v2/sessions/current/data/fields/m?scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-wrong",
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-wrong"),
       responseMetadata: {
         ...frameA.responseMetadata!,
         fieldRevision: "rev-B",
@@ -2290,7 +2390,7 @@ describe("useViewport3DSceneModel", () => {
     expect(source).toContain(
       "resolveViewport3DTargetQuantityFieldVectorForTarget({",
     );
-    expect(source).toContain("fieldVector: fdmFieldVector,");
+    expect(source).toContain("fieldVector: savedSelectionActive ? null : fdmFieldVector,");
   });
 
   it("builds synthetic +Z airbox vector fields without backend data", () => {
@@ -2425,7 +2525,8 @@ describe("useViewport3DSceneModel", () => {
 
     expect(source).toContain("useRenderableAnalysisFieldOverlay");
     expect(source).toContain("startAnalysisFieldOverlayPhaseAnimation");
-    expect(source).toContain("const primaryFieldQuantityId = analysisOverlay?.fieldId ?? quantityId;");
+    expect(source).toContain("const primaryFieldQuantityId = analysisOverlay?.fieldId ??");
+    expect(source).toContain('(pinnedObservationActive ? "m" : quantityId);');
     expect(source).toContain("const analysisPrimaryFieldDemandPlan = useMemo(() => {");
     expect(source).toContain("query: analysisOverlay.query,");
     expect(source).toContain("consumers: [\"primary-field-vector\"],");
@@ -2434,6 +2535,49 @@ describe("useViewport3DSceneModel", () => {
     expect(source).toContain("resolveViewport3DAnalysisComplexFieldQuery");
     expect(source).toContain("asDecodedComplexFieldVector");
     expect(source).toContain("Boolean(analysisOverlay) ||");
+  });
+
+  it("binds modal surface provenance to the active owner and validated binary revision", () => {
+    const metadata = {
+      binaryQuery: {
+        component: "full" as const,
+        scope_kind: "full" as const,
+        view: "complex" as const,
+      },
+      fieldId: "eigen-field-a",
+      intent: {
+        analysisRunId: "run a",
+        analysisStageId: "stage/1",
+        artifactRevision: "artifact-4",
+        modeId: "mode:2",
+        sampleId: "sample/3",
+      },
+      resourceRevision: "field-r9",
+    };
+    const canonicalResourceKey = resolveViewport3DFieldVectorResourceKey(
+      metadata.fieldId,
+      metadata.binaryQuery,
+    );
+    expect(
+      resolveViewport3DModeFieldOverlaySourceIdentity({ metadata }),
+    ).toEqual({
+      fieldBufferId:
+        "analysis-mode-field:run%20a:stage%2F1:artifact-4:sample%2F3:mode%3A2:eigen-field-a:field-r9",
+      resourceKey: canonicalResourceKey,
+    });
+    expect(
+      resolveViewport3DModeFieldOverlaySourceIdentity({ metadata: null }),
+    ).toBeNull();
+
+    const source = readFileSync(sceneModelSourceUrl, "utf8");
+    expect(source).toContain("analysisFieldIntentActive: Boolean(analysisFieldIntent)");
+    expect(source).toContain("analysisOverlaySourceIdentity,");
+    expect(source).toContain("metadata.binaryQuery,");
+    const chunkedColorBlock = source.slice(
+      source.indexOf("const chunkedScalarColors = useViewport3DChunkedScalarColors({"),
+      source.indexOf("const fieldRenderModelBuildOptions = useMemo(", source.indexOf("const chunkedScalarColors = useViewport3DChunkedScalarColors({")),
+    );
+    expect(chunkedColorBlock).toContain("!analysisFieldIntent");
   });
 
   it("requests analysis complex field data without making phase part of the resource key", () => {
@@ -2475,7 +2619,9 @@ describe("useViewport3DSceneModel", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
     expect(source).toContain("useModelRegionsResource({");
-    expect(source).toContain("enabled: Boolean(scene.data)");
+    expect(source).toContain(
+      "enabled: liveViewportResourcesEnabled && Boolean(scene.data)",
+    );
   });
 
   it("does not use domain selections to filter object region overlays", () => {
@@ -5201,7 +5347,9 @@ describe("useViewport3DSceneModel", () => {
     expect(source).toContain("const visualizationState = useVisualizationStateResource();");
     expect(source).toContain("const cameraRegistryCamera = useCameraRegistryCamera();");
     expect(source).toContain("const cameraView = resolveViewport3DSceneCameraView({");
-    expect(source).toContain("const cameraResource = cameraView.cameraResource;");
+    expect(source).toContain("const cameraResource = savedSelectionActive");
+    expect(source).toContain("? savedViewportCamera.cameraResource");
+    expect(source).toContain(": cameraView.cameraResource;");
     expect(source).not.toContain("useViewport3DVisualizationState");
   });
 
@@ -5325,7 +5473,10 @@ describe("useViewport3DSceneModel", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
     expect(source).toContain(
-      "domainMeta.data?.discretization === \"fem\"",
+      "const sessionDiscretization = useSessionStatusSelector((status) =>\n    resolveSessionDiscretization(status.data),\n  );",
+    );
+    expect(source).not.toContain(
+      'domainMeta.data?.discretization === "fem"',
     );
     expect(source).toContain(
       "const availableQuantityIdsForPlanning = fdmLaneActive",
@@ -5345,7 +5496,9 @@ describe("useViewport3DSceneModel", () => {
 
     expect(source).toContain("activeCrossSectionFramePreview");
     expect(source).toContain("crossSectionFramePreviewToClip");
-    expect(source).toContain("enabled: Boolean(renderingState?.clip?.enabled && topologyCurrent)");
+    expect(source).toContain(
+      "liveViewportResourcesEnabled &&\n      Boolean(renderingState?.clip?.enabled && topologyCurrent)",
+    );
     expect(source).toContain("crossSectionFrameClip");
     expect(source).toContain("clipFrameRotationDegrees: 0");
   });
@@ -5452,7 +5605,9 @@ describe("useViewport3DSceneModel", () => {
       "fdmRegionMembership.error || fdmRegionMembershipBinary.error",
     );
     expect(source).toContain("fdmBuildFieldRevision");
-    expect(source).toContain("fdmInstanceModel: fdmInstanceModel");
+    expect(source).toContain(
+      "fdmInstanceModel: savedSelectionActive ? null : fdmInstanceModel",
+    );
     expect(source).toContain("fdmVectorSegments");
     expect(source).not.toContain("const fdmInstanceModel = useMemo<");
     expect(source).not.toContain("buildFdmCuboidInstanceModel(");
@@ -5578,8 +5733,9 @@ describe("useViewport3DSceneModel", () => {
     );
     expect(adoptionSource).toContain("?.fieldBuffer ?? fdmAirboxFieldBuffer");
     expect(identitySource).toContain(
-      "fullFieldBufferIdentity: adoptedFdmFieldBuffer",
+      "fullFieldBufferIdentity: !savedSelectionActive && adoptedFdmFieldBuffer",
     );
+    expect(identitySource).toContain("bufferId: adoptedFdmFieldBuffer.bufferId");
     expect(identitySource).not.toContain(
       "fullFieldBufferIdentity: fdmAirboxFieldBuffer",
     );

@@ -60,12 +60,45 @@ use crate::types::{
     LiveStepConsumer, RunError, RunResult, RunStatus, StateObservables, StepAction, StepStats,
     StepUpdate,
 };
+#[cfg(test)]
+use crate::FDM_CPU_ACCEPTED_STATE_SNAPSHOT_SCHEMA;
+use crate::{FdmCpuAcceptedStateSnapshotV1, FDM_CPU_ACCEPTED_STATE_SNAPSHOT_FILE};
 
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 const MAX_COUPLED_ADAPTIVE_REJECTIONS: u64 = 50;
 const FDM_ABM3_RUNNER_CHECKPOINT_SCHEMA: &str = "fullmag.fdm.cpu.abm3-checkpoint.v1";
+fn fdm_cpu_accepted_state_snapshot(
+    plan: &FdmPlanIR,
+    accepted_step: u64,
+    time_seconds: f64,
+    dt_seconds: Option<f64>,
+    transactional_state_digest: &str,
+    magnetization: &[[f64; 3]],
+) -> Result<Option<FdmCpuAcceptedStateSnapshotV1>, RunError> {
+    // The transactional CPU digest covers magnetization, integrator memory,
+    // and the accepted thermal RNG interval. Coupled transport and Frozen
+    // Spins own additional primary carriers, so this lane must stay unavailable
+    // until those carriers are supplied explicitly.
+    if !plan.spin_transport_plans.is_empty() || plan.frozen_spins.is_some() {
+        return Ok(None);
+    }
+    let clock = crate::ObservationClock {
+        accepted_step,
+        time_seconds,
+        dt_seconds,
+    };
+    FdmCpuAcceptedStateSnapshotV1::from_transactional_state(
+        clock,
+        transactional_state_digest,
+        magnetization,
+    )
+    .map(Some)
+    .map_err(|error| RunError {
+        message: format!("materializing FDM CPU accepted state snapshot: {error}"),
+    })
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -437,11 +470,20 @@ pub(crate) fn resolved_antenna_zeeman_field_for_count(
     sample_count: usize,
     time_seconds: f64,
 ) -> Vec<Vector3> {
-    crate::antenna_fields::combined_antenna_zeeman_mask_field_at_time(
+    let mut field = crate::antenna_fields::combined_antenna_zeeman_mask_field_at_time(
         &plan.antenna_zeeman_masks,
         sample_count,
         time_seconds,
-    )
+    );
+    for term in resolved_solved_antenna_drives(plan, plan.time_stage.start_time_s) {
+        let multiplier = term.multiplier_at(time_seconds);
+        for (target, basis) in field.iter_mut().zip(&term.basis_field) {
+            target[0] += basis[0] * multiplier;
+            target[1] += basis[1] * multiplier;
+            target[2] += basis[2] * multiplier;
+        }
+    }
+    field
 }
 
 pub(crate) fn resolved_oersted_visual_field_for_count(
@@ -484,16 +526,61 @@ pub(crate) fn resolved_regional_field_drives(
     plan: &FdmPlanIR,
     stage_start_time_s: f64,
 ) -> Vec<RegionalFieldDriveTerm> {
-    plan.regional_field_drive_bases
+    let mut drives: Vec<_> = plan
+        .regional_field_drive_bases
         .iter()
         .map(|resolved| RegionalFieldDriveTerm {
             basis_field: resolved.field_xyz.clone(),
             waveform: resolved.drive.waveform.clone(),
             time_offset_s: match resolved.drive.time_origin {
-                fullmag_ir::FieldTimeOriginIR::StageLocal => stage_start_time_s,
+                fullmag_ir::FieldTimeOriginIR::StageLocal => plan
+                    .time_stage
+                    .waveform_origin_time_s
+                    .unwrap_or(stage_start_time_s),
                 fullmag_ir::FieldTimeOriginIR::Absolute => 0.0,
             },
             enabled: resolved.drive.enabled,
+        })
+        .collect();
+    drives.extend(resolved_solved_antenna_drives(plan, stage_start_time_s));
+    drives
+}
+
+fn resolved_solved_antenna_drives(
+    plan: &FdmPlanIR,
+    stage_start_time_s: f64,
+) -> Vec<RegionalFieldDriveTerm> {
+    use fullmag_ir::FieldTimeOriginIR;
+
+    plan.solved_antenna_drive_bases
+        .iter()
+        .filter(|basis| {
+            basis.drive.activation.is_active_for(
+                plan.time_stage.study_kind,
+                plan.time_stage.active_stage_id.as_deref(),
+            )
+        })
+        .map(|basis| RegionalFieldDriveTerm {
+            basis_field: basis
+                .field_xyz_apm_per_a
+                .iter()
+                .map(|value| {
+                    [
+                        value[0] * basis.drive.peak_current_a,
+                        value[1] * basis.drive.peak_current_a,
+                        value[2] * basis.drive.peak_current_a,
+                    ]
+                })
+                .collect(),
+            waveform: basis.drive.waveform.clone(),
+            time_offset_s: match basis.drive.time_origin {
+                FieldTimeOriginIR::StageLocal => plan
+                    .time_stage
+                    .waveform_origin_time_s
+                    .unwrap_or(stage_start_time_s),
+                FieldTimeOriginIR::Absolute => 0.0,
+            },
+            enabled: true,
         })
         .collect()
 }
@@ -753,6 +840,10 @@ fn engine_projection_policy(policy: FdmProjectionPolicyIR) -> ProjectionPolicy {
 
 fn build_reference_problem(plan: &FdmPlanIR) -> Result<ExchangeLlgProblem, RunError> {
     validate_single_grid_budget(plan)?;
+    crate::antenna_fields::validate_fdm_antenna_sample_counts(
+        plan,
+        plan.initial_magnetization.len(),
+    )?;
     let grid = GridShape::new(
         plan.grid.cells[0] as usize,
         plan.grid.cells[1] as usize,
@@ -1433,9 +1524,11 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
 
     let mut scalar_schedules = collect_scalar_schedules(outputs)?;
     let mut field_schedules = collect_field_schedules(outputs)?;
-    let time_events = crate::time_events::build_resolved_stage_event_schedule(
+    let time_events = crate::time_events::build_resolved_stage_event_schedule_with_origin(
         &plan.field_drives,
+        &plan.solved_antenna_drive_bases,
         plan.time_stage.start_time_s,
+        plan.time_stage.waveform_origin_time_s(),
         stage_end_time_s,
         outputs,
         crate::schedules::OUTPUT_TIME_TOLERANCE,
@@ -2404,6 +2497,14 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
         .map_err(|error| RunError {
             message: format!("CPU FDM transaction checkpoint digest: {error}"),
         })?;
+    let accepted_state_snapshot = fdm_cpu_accepted_state_snapshot(
+        plan,
+        step_count,
+        state.time_seconds,
+        (!is_direct_minimization && last_solver_dt > 0.0).then_some(last_solver_dt),
+        &checkpoint_digest,
+        state.magnetization(),
+    )?;
     let mut final_provenance = artifacts.provenance_snapshot();
     if let Some(fft_execution) = final_provenance.fdm_fft_execution.as_mut() {
         let telemetry = fft_workspace.telemetry();
@@ -2542,6 +2643,14 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
             relative_path: "solver/fdm_cpu_abm3_checkpoint.v1.json".to_string(),
             bytes: serde_json::to_vec_pretty(&checkpoint).map_err(|error| RunError {
                 message: format!("serializing final FDM CPU ABM3 checkpoint artifact: {error}"),
+            })?,
+        });
+    }
+    if let Some(snapshot) = accepted_state_snapshot {
+        auxiliary_artifacts.push(crate::types::AuxiliaryArtifact {
+            relative_path: FDM_CPU_ACCEPTED_STATE_SNAPSHOT_FILE.to_string(),
+            bytes: serde_json::to_vec_pretty(&snapshot).map_err(|error| RunError {
+                message: format!("serializing FDM CPU accepted state snapshot: {error}"),
             })?,
         });
     }
@@ -3757,7 +3866,8 @@ mod tests {
         FieldSpatialProfileIR, FieldTargetIR, FieldTimeOriginIR, GridDimensions, IntegratorChoice,
         RegionalFieldDriveIR, RelaxStopIR, RelaxationAlgorithmIR, RelaxationControlIR,
         ResolvedFrozenSpinsPlanIR, ResolvedRegionalFieldDriveBasisIR,
-        SelectionAuthoredFingerprintIR, SelectionCertificateIR, StageStopReason, TimeDependenceIR,
+        ResolvedSolvedAntennaDriveBasisIR, SelectionAuthoredFingerprintIR, SelectionCertificateIR,
+        SolvedAntennaDriveIR, StageStopReason, StudyKindIR, TimeDependenceIR,
         RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION, SELECTION_CERTIFICATE_SCHEMA_VERSION,
     };
     use sha2::{Digest, Sha256};
@@ -3851,6 +3961,119 @@ mod tests {
             bulk_dmi: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn fdm_cpu_accepted_state_snapshot_is_content_bound_and_strictly_scoped() {
+        let plan = make_test_plan();
+        let first = fdm_cpu_accepted_state_snapshot(
+            &plan,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            &format!("sha256:{}", "a".repeat(64)),
+            &plan.initial_magnetization,
+        )
+        .expect("accepted state snapshot")
+        .expect("supported simple FDM CPU lane");
+        let changed = fdm_cpu_accepted_state_snapshot(
+            &plan,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            &format!("sha256:{}", "b".repeat(64)),
+            &plan.initial_magnetization,
+        )
+        .expect("changed accepted state snapshot")
+        .expect("supported simple FDM CPU lane");
+
+        assert_eq!(first.schema_version, FDM_CPU_ACCEPTED_STATE_SNAPSHOT_SCHEMA);
+        first.validate().expect("valid strict lane snapshot");
+        assert_eq!(first.clock.accepted_step, 5);
+        assert_eq!(
+            first.primary_carrier_ids,
+            ["fdm.cpu.transactional-state-digest.v1"]
+        );
+        assert_eq!(first.clock_digest, changed.clock_digest);
+        assert_ne!(first.state_digest, changed.state_digest);
+
+        let invalid = fdm_cpu_accepted_state_snapshot(
+            &plan,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            "not-a-digest",
+            &plan.initial_magnetization,
+        )
+        .expect_err("noncanonical carrier digest must fail closed");
+        assert!(invalid.message.contains("transactional_state_digest"));
+
+        let mut frozen = plan;
+        frozen.frozen_spins = Some(resolved_frozen_spins_test_plan(vec![false; 16]));
+        assert!(fdm_cpu_accepted_state_snapshot(
+            &frozen,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            &format!("sha256:{}", "a".repeat(64)),
+            &frozen.initial_magnetization,
+        )
+        .expect("unsupported lane remains unavailable")
+        .is_none());
+    }
+
+    #[test]
+    fn simple_fdm_cpu_lane_emits_accepted_state_snapshot_from_final_transactional_state() {
+        let plan = make_test_plan();
+        let executed = execute_reference_fdm(&plan, 2.0e-14, &[], None, None)
+            .expect("simple FDM CPU execution");
+        let artifact = executed
+            .auxiliary_artifacts
+            .iter()
+            .find(|artifact| artifact.relative_path == FDM_CPU_ACCEPTED_STATE_SNAPSHOT_FILE)
+            .expect("accepted state snapshot artifact");
+        let snapshot: FdmCpuAcceptedStateSnapshotV1 =
+            serde_json::from_slice(&artifact.bytes).expect("strict accepted state snapshot");
+        let transaction = executed
+            .provenance
+            .fdm_cpu_step_transaction_telemetry
+            .as_ref()
+            .expect("FDM CPU transaction telemetry");
+        let recomputed = crate::accepted_state_digests(
+            snapshot.clock,
+            &[crate::AcceptedPrimaryCarrier {
+                carrier_id: "fdm.cpu.transactional-state-digest.v1",
+                canonical_bytes: transaction.checkpoint_digest.as_bytes(),
+            }],
+        )
+        .expect("recompute accepted state digest from the lane carrier");
+
+        assert_eq!(
+            snapshot.clock.accepted_step,
+            transaction.accepted_step_count
+        );
+        assert_eq!(snapshot.clock_digest, recomputed.clock_digest);
+        assert_eq!(snapshot.state_digest, recomputed.state_digest);
+        assert_eq!(snapshot.clock.time_seconds, 2.0e-14);
+        assert_eq!(snapshot.clock.dt_seconds, Some(1.0e-14));
+    }
+
+    #[test]
+    fn reference_problem_rejects_short_antenna_mask_before_execution() {
+        let mut plan = make_test_plan();
+        plan.antenna_zeeman_masks = vec![fullmag_ir::ResolvedAntennaZeemanMaskIR {
+            source: "antenna_1".into(),
+            object: "magnet".into(),
+            amplitude_b_t: 0.0,
+            direction: [1.0, 0.0, 0.0],
+            spatial_profile: None,
+            waveform: None,
+            field_xyz: vec![[0.0; 3]],
+        }];
+        let error = build_reference_problem(&plan)
+            .err()
+            .expect("short antenna mask must be rejected");
+        assert!(error.message.contains("antenna Zeeman mask 'antenna_1'"));
     }
 
     #[test]
@@ -4348,6 +4571,7 @@ mod tests {
             source_hash: None,
             execution_mode: fullmag_ir::ExecutionMode::Strict,
             layout: serde_json::json!({"kind": "fdm", "cell_count": 16}),
+            magnetization_field_semantics: Ok(None),
             execution_resolution: None,
         };
         let mut pipeline =
@@ -4540,6 +4764,85 @@ mod tests {
     }
 
     #[test]
+    fn solved_antenna_basis_uses_peak_current_stage_clock_and_exact_term_time() {
+        let mut plan = make_test_plan();
+        plan.time_stage.active_stage_id = Some("ringdown".into());
+        plan.time_stage.start_time_s = 10.0;
+        let projection_signature = format!(
+            "verified:target_topology:{}",
+            crate::antenna_field_solution::fdm_target_topology_digest(&plan).unwrap()
+        );
+        plan.solved_antenna_drive_bases = vec![ResolvedSolvedAntennaDriveBasisIR {
+            drive: SolvedAntennaDriveIR {
+                id: "antenna-drive".into(),
+                name: "Antenna drive".into(),
+                projection_ref: "projection".into(),
+                port_mode_id: "common".into(),
+                peak_current_a: 0.25,
+                waveform: TimeDependenceIR::Sinusoidal {
+                    frequency_hz: 0.25,
+                    phase_rad: 0.0,
+                    offset: 0.0,
+                },
+                bandwidth_declaration: None,
+                time_origin: FieldTimeOriginIR::StageLocal,
+                activation: DriveActivationIR::StageIds {
+                    stage_ids: vec!["ringdown".into()],
+                },
+            },
+            solution_id: "solution".into(),
+            source_object_id: "antenna".into(),
+            field_xyz_apm_per_a: vec![[4.0, 8.0, 12.0]; 16],
+            projection_signature,
+        }];
+
+        let terms = resolved_regional_field_drives(&plan, plan.time_stage.start_time_s);
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].basis_field[0], [1.0, 2.0, 3.0]);
+        assert!((terms[0].multiplier_at(11.0) - 1.0).abs() < 1.0e-12);
+        let visual = resolved_antenna_zeeman_field_for_count(&plan, 16, 11.0);
+        assert!(visual.iter().all(|value| {
+            (value[0] - 1.0).abs() < 1.0e-12
+                && (value[1] - 2.0).abs() < 1.0e-12
+                && (value[2] - 3.0).abs() < 1.0e-12
+        }));
+        plan.solved_antenna_drive_bases[0].field_xyz_apm_per_a.pop();
+        let error = build_reference_problem(&plan)
+            .err()
+            .expect("short solved antenna basis must be rejected before FDM execution");
+        assert!(error.message.contains("expected 16 FDM cells"));
+    }
+
+    #[test]
+    fn solved_antenna_all_time_evolution_is_inactive_during_relaxation() {
+        let mut plan = make_test_plan();
+        plan.time_stage.study_kind = StudyKindIR::Relaxation;
+        plan.time_stage.active_stage_id = Some("relax".into());
+        plan.solved_antenna_drive_bases = vec![ResolvedSolvedAntennaDriveBasisIR {
+            drive: SolvedAntennaDriveIR {
+                id: "relaxation-drive".into(),
+                name: "Relaxation drive".into(),
+                projection_ref: "projection".into(),
+                port_mode_id: "common".into(),
+                peak_current_a: 1.0,
+                waveform: TimeDependenceIR::Constant,
+                bandwidth_declaration: None,
+                time_origin: FieldTimeOriginIR::StageLocal,
+                activation: DriveActivationIR::AllTimeEvolution {},
+            },
+            solution_id: "solution".into(),
+            source_object_id: "antenna".into(),
+            field_xyz_apm_per_a: vec![[4.0, 8.0, 12.0]; 16],
+            projection_signature: "verified".into(),
+        }];
+
+        assert!(resolved_regional_field_drives(&plan, 0.0).is_empty());
+        assert!(resolved_antenna_zeeman_field_for_count(&plan, 16, 0.0)
+            .iter()
+            .all(|value| *value == [0.0, 0.0, 0.0]));
+    }
+
+    #[test]
     fn regional_drive_stage_local_restart_and_absolute_clock_are_distinct() {
         let mut plan = make_test_plan();
         plan.time_stage.start_time_s = 10.0;
@@ -4571,6 +4874,12 @@ mod tests {
         let local = resolved_regional_field_drives(&plan, plan.time_stage.start_time_s);
         assert_eq!(local[0].multiplier_at(11.5), 1.0);
         assert_eq!(local[0].multiplier_at(10.5), 0.0);
+
+        plan.time_stage.start_time_s = 10.5;
+        plan.time_stage.waveform_origin_time_s = Some(10.0);
+        let resumed = resolved_regional_field_drives(&plan, plan.time_stage.start_time_s);
+        assert_eq!(resumed[0].multiplier_at(11.25), 1.0);
+        assert_eq!(resumed[0].multiplier_at(12.25), 0.0);
 
         plan.regional_field_drive_bases = vec![make_basis(
             FieldTimeOriginIR::Absolute,

@@ -298,21 +298,16 @@ describe("CameraControls", () => {
     expect(changeBlock).not.toContain("invalidate();");
   });
 
-  it("disables native orbit handling before ViewCube HUD pointer-down bubbles", () => {
+  it("leaves native orbit ownership to actual HUD hit handlers", () => {
     const source = readFileSync(
       new URL("./CameraControls.tsx", import.meta.url),
       "utf8",
     );
 
-    expect(source).toContain("isViewport3DImmediatePointerDownRegion");
-    expect(source).toContain("handlePointerDownCapture");
-    expect(source).toContain('addEventListener("pointerdown", handlePointerDownCapture');
-    expect(source).toContain("capture: true");
-    expect(source).toContain("holdViewport3DCameraControls(controls)");
-    expect(source).toContain('addEventListener("pointerup", handlePointerEnd');
-    expect(source).toContain('addEventListener("pointercancel", handlePointerEnd');
-    expect(source).toContain("if (event.pointerId === hudPointerId) restoreControls();");
-    expect(source).toContain("if (event.button !== 0 || !event.isPrimary) return;");
+    expect(source).not.toContain("isViewport3DImmediatePointerDownRegion");
+    expect(source).not.toContain("handlePointerDownCapture");
+    expect(source).not.toContain("previousHudControlsEnabledRef");
+    expect(source).not.toContain("controls.enabled = false");
   });
 
   it("does not regress Canvas DPR during orbit interactions", () => {

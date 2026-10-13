@@ -1,3 +1,4 @@
+import { API_INSTANCE_HEADER, isApiInstanceId, resolveApiInstancePin } from "./apiInstancePin";
 import {
   ANALYSIS_FREQUENCY_DOMAIN_MANIFEST_V1_PATH,
   ANALYSIS_FREQUENCY_DOMAIN_EIGEN_BRANCHES_V2_PATH,
@@ -53,6 +54,14 @@ import {
   DATA_QUANTITIES_PATH,
   DATA_ARTIFACT_PATH,
   DATA_ARTIFACTS_PATH,
+  DATA_ANTENNA_FIELD_SOLUTION_PATH,
+  DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH,
+  DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH,
+  DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH,
+  DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH,
+  DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH,
+  DATA_ANTENNA_SOURCE_SPECTRUM_PATH,
+  DATA_ANTENNA_SOURCE_SPECTRUM_PAYLOAD_PATH,
   DATA_DOMAIN_META_PATH,
   DATA_DOMAIN_FDM_MULTILAYER_LAYOUT_PATH,
   DATA_DOMAIN_FDM_MULTILAYER_LAYER_ACTIVE_MASK_PATH,
@@ -78,6 +87,9 @@ import {
   DATA_PLANAR_DEFAULT_FIELD_SCALAR_PATH,
   DATA_PLANAR_DEFAULT_FIELD_VECTORS_PATH,
   DATA_FIELD_VECTOR_PATH,
+  DATA_OBSERVATION_FRAME_MAGNETIZATION_PATH,
+  DATA_OBSERVATION_FRAME_PATH,
+  DATA_OBSERVATION_FRAMES_PATH,
   DATA_MESH_REGION_MEMBERSHIP_PATH,
   DATA_MESH_REGION_MEMBERSHIPS_PATH,
   EXPECTED_API_CONTRACT_VERSION,
@@ -154,6 +166,9 @@ import {
   MODEL_OBJECT_REGIONS_PATH,
   MODEL_OBJECTS_PATH,
   MODEL_PHYSICS_GRAPH_PATH,
+  ANALYSIS_POSTPROCESSING_DEFINITION_PATH,
+  ANALYSIS_ANALYTIC_REFERENCE_MODELS_PATH,
+  ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH,
   MODEL_PLANAR_MONITOR_DUPLICATE_PATH,
   MODEL_PLANAR_MONITOR_PATH,
   MODEL_PLANAR_MONITORS_PATH,
@@ -181,8 +196,50 @@ import {
   PERSISTENCE_FIELD_STATE_IMPORTS_PATH,
   PERSISTENCE_IMPORT_INSPECTIONS_PATH,
   PERSISTENCE_IMPORTS_PATH,
+  PERSISTENCE_PROJECT_OPEN_PATH,
+  PERSISTENCE_PROJECT_AUTHORING_PATH,
+  PERSISTENCE_PROJECT_FROM_SCRIPT_PATH,
+  PERSISTENCE_PROJECTS_PATH,
+  PROJECT_MATERIALIZED_DATASET_PATH,
+  PROJECT_MATERIALIZED_DATASET_SLICE_PATH,
+  PROJECT_SOLUTION_SCALAR_PATH,
+  PROJECT_SAVED_FIELD_GEOMETRY_PATH,
+  PROJECT_SAVED_FIELD_TOPOLOGY_PATH,
+  PROJECT_SAVED_FIELD_SUPPORT_PATH,
+  PROJECT_SOLUTION_SET_ARTIFACTS_PATH,
+  PROJECT_SOLUTION_SET_MEMBERS_PATH,
+  PROJECT_SOLUTION_SET_PATH,
+  PROJECT_SOLUTION_SET_DISCOVERY_PATH,
+  PROJECT_RUN_SUBMIT_PATH,
+  PROJECT_RUN_MATERIALIZATION_PATH,
+  PROJECT_RUN_PATH,
+  PROJECT_RUN_TASK_CANCELLATION_PATH,
+  PROJECT_BATCHES_PATH,
+  PROJECT_BATCH_CASES_PATH,
   PLATFORM_CAPABILITIES_PATH,
+  PLATFORM_OUTPUT_STORAGE_PATH,
+  PLATFORM_COMPUTE_PROFILES_PATH,
+  PLATFORM_COMPUTE_PREVIEW_PATH,
   PLATFORM_HEALTH_PATH,
+  PLATFORM_DEVELOPMENT_BACKEND_PATH,
+  WORKSPACE_ITEMS_PATH,
+  WORKSPACE_ITEM_FORGET_PATH,
+  WORKSPACE_ITEM_FRAMES_PATH,
+  WORKSPACE_ITEM_HISTORY_PATH,
+  WORKSPACE_ITEM_PATH,
+  WORKSPACE_ITEM_PIN_PATH,
+  WORKSPACE_ROOTS_PATH,
+  WORKSPACE_SETTING_PATH,
+  WORKSPACE_SCAN_PATH,
+  workspaceItemArchiveUrl,
+  workspaceItemThumbnailUrl,
+  PLATFORM_DEVELOPMENT_BACKEND_BUILD_REQUESTS_PATH,
+  PLATFORM_DEVELOPMENT_BACKEND_BUILD_REQUEST_PATH,
+  developmentBackendBuildRequestPathParams,
+  PLATFORM_DEVELOPMENT_RESTART_REQUESTS_PATH,
+  PLATFORM_DEVELOPMENT_RESTART_REQUEST_PATH,
+  developmentRestartRequestPathParams,
+  isDevelopmentRestartRequestStatusPath,
   SESSIONS_PATH,
   SESSION_EVENTS_COMMUNICATION_POLICY_PATH,
   SESSION_STATUS_PATH,
@@ -190,6 +247,7 @@ import {
   SIMULATION_COMMAND_FAILURE_PATH,
   SIMULATION_COMMANDS_PATH,
   SIMULATION_OBJECT_METRICS_PATH,
+  SIMULATION_PREPARATION_MATERIALIZATION_PATH,
   SIMULATION_PREPARATION_PATH,
   SIMULATION_RUN_CURRENT_PATH,
   SIMULATION_RUN_PATH,
@@ -205,18 +263,26 @@ import {
   SIMULATION_STAGE_HYSTERESIS_SETTLE_PIPELINE_PATH,
   SIMULATION_STAGES_EXECUTION_PATH,
   VISUALIZATION_CLIENT_ACKS_PATH,
+  VISUALIZATION_DISPLAY_PATH,
   VISUALIZATION_MODE_COMPOSITION_ACTIVE_PATH,
   VISUALIZATION_STATE_PATH,
 } from "./apiPaths";
 import {
   canonicalFieldVectorQuery,
   canonicalFieldVectorQueryParams,
+  isCanonicalU64Decimal,
 } from "./fieldQueryIdentity";
 import {
   fieldDisplayScale,
   resolveCanonicalQuantityId,
   storedFieldQuantityId,
 } from "./quantityIds";
+import type { OutputStorageDefaultsResource, OutputStorageDefaultsRequest } from "./apiTypes";
+import type {
+  ExecutionProfileCatalogQuery, ExecutionProfileCatalogResource,
+  ComputePreviewRequest, ComputePreviewResource,
+  PublishExecutionProfileRequest, PublishExecutionProfileResource,
+} from "./apiTypes";
 import type {
   BinaryRequestOptions,
   BinaryResourceResult,
@@ -283,6 +349,12 @@ import type {
   PlanarFieldProbeResource,
   PlanarFieldQuery,
   PlanarFieldSource,
+  AnalyticReferenceModelCollectionResource,
+  PostprocessingDefinitionCollectionResource,
+  PostprocessingDefinitionCreateRequest,
+  PostprocessingDefinitionDeleteRequest,
+  PostprocessingDefinitionPatchRequest,
+  PostprocessingDefinitionResource,
   PlanarMonitorCollectionResource,
   PlanarMonitorCreateRequest,
   PlanarMonitorDeleteRequest,
@@ -296,6 +368,11 @@ import type {
   GeometryValidationResource,
   GpuTelemetryResource,
   HealthResource,
+  DevelopmentBackendResource,
+  WorkspaceItemsQuery,
+  WorkspaceRootWire,
+  DevelopmentBackendBuildRequest,
+  DevelopmentBackendBuildRequestResource,
   ImportSessionAssetRequest,
   JsonObject,
   LiveStatusResource,
@@ -309,6 +386,14 @@ import type {
   FrequencyDomainJsonArtifactResource,
   FrequencyDomainTextArtifactResource,
   ArtifactResource,
+  AntennaFieldSolutionResource,
+  AntennaFieldPayloadKind,
+  AntennaExternalLeadInspectionResource,
+  AntennaInspectionDisplayResource,
+  AntennaInspectionPayloadKind,
+  AntennaStageOutputCatalogResource,
+  AntennaSpectrumPayloadKind,
+  AntennaSourceSpectrumResource,
   FrequencyDomainFieldResource,
   FrequencyDomainSweepProgressResource,
   HysteresisAdaptiveRefinementResource,
@@ -434,6 +519,42 @@ import type {
   SessionImportCommitResponse,
   SessionImportInspectRequest,
   SessionImportInspectResponse,
+  ProjectArchiveRequest,
+  ProjectAuthoringUpdateRequest,
+  ProjectFromScriptRequest,
+  ProjectFromScriptResource,
+  ProjectCreateRequest,
+  ProjectDocumentResource,
+  ProjectRunSubmitRequest,
+  ProjectRunSubmitResource,
+  ProjectRunMaterializationResource,
+  ProjectRunResource,
+  ProjectRunListQuery,
+  ProjectRunListResource,
+  ProjectRunTaskCancellationRequest,
+  ProjectRunTaskCancellationResource,
+  ProjectBatchSubmitRequest,
+  ProjectBatchSubmitResource,
+  ProjectBatchListQuery,
+  ProjectBatchListResource,
+  ProjectBatchCasesQuery,
+  ProjectBatchCasesResource,
+  SolutionSetArtifactPageQuery,
+  SolutionSetArtifactPageResource,
+  SolutionScalarResource,
+  SolutionSetMemberPageQuery,
+  SolutionSetMemberPageResource,
+  SolutionSetResource,
+  SolutionSetDiscoveryPageQuery,
+  SolutionSetDiscoveryPageResource,
+  MaterializedDatasetResource,
+  SavedFieldGeometryResource,
+  SolutionSetRevision,
+  ObservationFrameListQuery,
+  ObservationFrameListResource,
+  ObservationFrameResource,
+  LivePreparationMaterializationRequest,
+  LivePreparationMaterializationResource,
   SolverEnergyCurrentResource,
   SolverEnergyHistoryResource,
   SolverProfileResource,
@@ -441,6 +562,8 @@ import type {
   SolverStatusResource,
   StageExecutionResource,
   StructuredCommandRequest,
+  DevelopmentRestartRequest,
+  DevelopmentRestartResource,
   StudyRuntimePatchRequest,
   StudyRuntimeResource,
   UniversePatchRequest,
@@ -448,6 +571,7 @@ import type {
   VisualizationClientAckEntry,
   VisualizationClientAckRequest,
   VisualizationClientAckResource,
+  DisplaySelection,
   VisualizationStatePatch,
   VisualizationStateResource,
 } from "./apiTypes";
@@ -468,8 +592,10 @@ export function parseFieldVectorResponseMetadata(
   return {
     component: headers.get("x-fullmag-component"),
     domainGenerationId: headers.get("x-fullmag-domain-generation-id"),
+    artifactGenerationId: headers.get("x-fullmag-artifact-generation-id"),
     encoding: headers.get("x-fullmag-encoding"),
     fieldIndexing: headers.get("x-fullmag-field-indexing"),
+    fieldGenerationId: headers.get("x-fullmag-field-generation-id"),
     fieldRevision: headers.get("x-fullmag-field-revision"),
     identityIssues: [],
     meshTopologyHash: headers.get("x-fullmag-mesh-topology-hash"),
@@ -479,6 +605,9 @@ export function parseFieldVectorResponseMetadata(
     quantityId: headers.get("x-fullmag-quantity-id"),
     scopeId: headers.get("x-fullmag-scope-id"),
     scopeKind: headers.get("x-fullmag-scope-kind"),
+    sourceId: headers.get("x-fullmag-source-id"),
+    sourceKind: headers.get("x-fullmag-source-kind"),
+    sourceRevision: headers.get("x-fullmag-source-revision"),
     snapshotId: headers.get("x-fullmag-snapshot-id"),
     valueCount: optionalIntegerHeader(headers, "x-fullmag-value-count"),
   };
@@ -502,7 +631,11 @@ export function collectFieldVectorIdentityIssues(
   compare("pointCount", metadata.pointCount, payload.pointCount);
   compare("valueCount", metadata.valueCount, payload.valueCount);
   compare("nComp", metadata.nComp, payload.nComp);
-  if (payload.formatVersion === 3) {
+  if (
+    payload.formatVersion === 3 ||
+    payload.formatVersion === 4 ||
+    payload.formatVersion === 5
+  ) {
     compare("scopeKind", metadata.scopeKind, payload.scopeKind ?? null);
     compare("scopeId", metadata.scopeId, payload.scopeId ?? null);
     const payloadMeshTopologyHash = payload.meshTopologyHash ?? null;
@@ -527,6 +660,20 @@ export function collectFieldVectorIdentityIssues(
       "domainGenerationId",
       metadata.domainGenerationId,
       payload.domainGenerationId ?? null,
+    );
+  }
+  if (payload.formatVersion === 4 || payload.formatVersion === 5) {
+    compare("sourceKind", metadata.sourceKind ?? null, payload.sourceKind ?? null);
+    compare("sourceId", metadata.sourceId ?? null, payload.sourceId ?? null);
+    compare(
+      "sourceRevision",
+      metadata.sourceRevision ?? null,
+      payload.sourceRevision ?? null,
+    );
+    compare(
+      "fieldGenerationId",
+      metadata.fieldGenerationId ?? null,
+      payload.fieldGenerationId ?? null,
     );
   }
   return issues;
@@ -607,6 +754,14 @@ import { decodeCrossSection } from "./codecs/crossSectionCodec";
 import { decodeCrossSectionQuality } from "./codecs/crossSectionQualityCodec";
 import { decodeFieldVector } from "./codecs/fieldVectorCodec";
 import { decodeMeshQualityData } from "./codecs/meshQualityDataCodec";
+import { decodeSavedSupport, savedSupportByteLimit } from "./codecs/savedSupportCodec";
+import { savedTopologyByteLimit, validateSavedGeometry, verifySavedTopologyBody } from "./savedGeometryIdentity";
+import { boundedBinaryResponse } from "./boundedBinaryResponse";
+import {
+  decodeMaterializedDatasetSlice,
+  materializedDatasetSliceByteLimit,
+  type MaterializedDatasetSliceRange,
+} from "./codecs/materializedDatasetSliceCodec";
 import { decodePeriodicPairs } from "./codecs/periodicPairsCodec";
 import { decodeTableRows } from "./codecs/tableRowsCodec";
 import {
@@ -690,11 +845,198 @@ export interface HysteresisExecutionTreeQuery {
 }
 
 const CHUNKED_TOPOLOGY_THRESHOLD_BYTES = 16 * 1024 * 1024;
+
+function savedGeometryPath(dataset: MaterializedDatasetResource) {
+  return {
+    project_id: assertSolutionSetProjectId(dataset.project_id),
+    run_id: assertSolutionSetRunId(dataset.run_id),
+    solution_set_id: assertSolutionSetLogicalId(dataset.solution_set_id),
+    revision: assertSolutionSetRevision(dataset.containing_solution_revision),
+    member_id: assertMaterializedDatasetPathId("member id", dataset.member_id),
+    artifact_id: assertMaterializedDatasetPathId("artifact id", dataset.artifact_id),
+  };
+}
+
+function savedGeometryBinaryQuery(geometry: SavedFieldGeometryResource, limit: number) {
+  return {
+    expected_dataset_manifest_object_ref: geometry.dataset_manifest.object_ref,
+    expected_geometry_manifest_object_ref: geometry.geometry_manifest.object_ref,
+    expected_geometry_object_ref: geometry.geometry_payload.object_ref,
+    max_response_bytes: String(limit),
+  };
+}
 const TOPOLOGY_RANGE_CHUNK_BYTES = 8 * 1024 * 1024;
 export const MAX_TOPOLOGY_BYTES = 512 * 1024 * 1024;
+export const MAX_ANTENNA_INSPECTION_BYTES = 128 * 1024 * 1024;
 const FIELD_MATERIALIZATION_TIMEOUT_MS = 5_000;
 const FIELD_MATERIALIZATION_RETRY_MS = 250;
 const FIELD_MATERIALIZATION_REQUEST_KEY = "current-field-cache";
+const DEVELOPMENT_RESTART_STATUS_POLICY_HEADER =
+  "x-fullmag-internal-api-instance-policy";
+const DEVELOPMENT_RESTART_STATUS_POLICY = "token-bound-status";
+const DEVELOPMENT_RESTART_ACKNOWLEDGEMENT_TOKEN_PATTERN = /^[a-f0-9]{32}$/;
+
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
+const PROJECT_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+const PROJECT_ID_MAX_BYTES = 200;
+const RUN_ID_MAX_BYTES = 256;
+const SOLUTION_SET_ID_MAX_BYTES = 1024;
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function assertNonEmptyId(label: string, value: string): string {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    CONTROL_CHARACTERS.test(value)
+  ) {
+    throw new Error(`Invalid ${label}.`);
+  }
+  return value;
+}
+
+function developmentRestartAuthorization(token: string): string {
+  if (!DEVELOPMENT_RESTART_ACKNOWLEDGEMENT_TOKEN_PATTERN.test(token)) {
+    throw new ControlRoomApiError(
+      "Invalid development restart acknowledgement token",
+      0,
+      null,
+      "DEVELOPMENT_RESTART_TOKEN_INVALID",
+    );
+  }
+  return `Bearer ${token}`;
+}
+
+function isTokenBoundDevelopmentRestartStatusRequest(
+  method: string,
+  url: string,
+  headers: Headers,
+): boolean {
+  const authorization = headers.get("authorization");
+  return (
+    method === "GET" &&
+    isDevelopmentRestartRequestStatusPath(pathFromUrl(url)) &&
+    isDevelopmentRestartAuthorization(authorization)
+  );
+}
+
+function isDevelopmentRestartAuthorization(
+  authorization: string | null,
+): boolean {
+  return authorization !== null && /^Bearer [a-f0-9]{32}$/.test(authorization);
+}
+
+export function assertSolutionSetProjectId(value: string): string {
+  assertNonEmptyId("project id", value);
+  if (
+    utf8ByteLength(value) > PROJECT_ID_MAX_BYTES ||
+    value !== value.trim() ||
+    value === "." ||
+    value === ".." ||
+    value.endsWith(".") ||
+    !PROJECT_ID_PATTERN.test(value)
+  ) {
+    throw new Error("Invalid project id.");
+  }
+  const stem = (value.split(".")[0] ?? "").toUpperCase();
+  if (
+    new Set(["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]).has(stem) ||
+    ((stem.startsWith("COM") || stem.startsWith("LPT")) &&
+      stem.length === 4 &&
+      /^[1-9]$/.test(stem.slice(3)))
+  ) {
+    throw new Error("Invalid project id.");
+  }
+  return value;
+}
+
+export function assertSolutionSetRunId(value: string): string {
+  assertNonEmptyId("run id", value);
+  if (
+    utf8ByteLength(value) > RUN_ID_MAX_BYTES ||
+    /[\\/]/.test(value)
+  ) {
+    throw new Error("Invalid run id.");
+  }
+  return value;
+}
+
+export function assertSolutionSetLogicalId(value: string): string {
+  assertNonEmptyId("solution set id", value);
+  if (utf8ByteLength(value) > SOLUTION_SET_ID_MAX_BYTES) {
+    throw new Error("Invalid solution set id.");
+  }
+  return value;
+}
+
+export function assertSolutionSetMemberId(
+  label: string,
+  value: string,
+): string {
+  return assertNonEmptyId(label, value);
+}
+
+export function assertSolutionSetRevision(
+  revision: SolutionSetRevision,
+): SolutionSetRevision {
+  if (revision === "0" || !isCanonicalU64Decimal(revision)) {
+    throw new Error("SolutionSet revision must be a positive canonical u64 string.");
+  }
+  return revision;
+}
+
+export function assertMaterializedDatasetPathId(label: string, value: string): string {
+  assertSolutionSetMemberId(label, value);
+  if (utf8ByteLength(value) > 1024) {
+    throw new Error(`Invalid ${label}.`);
+  }
+  return value;
+}
+
+function normalizeSolutionSetPageQuery<
+  T extends {
+    after_artifact_id?: string | null;
+    after_member_id?: string | null;
+    limit?: number | null;
+  },
+>(
+  query: T,
+): T {
+  const limit = query.limit ?? 50;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    throw new Error("SolutionSet page limit must be an integer between 1 and 100.");
+  }
+  if (query.after_member_id != null) {
+    assertSolutionSetMemberId("member cursor", query.after_member_id);
+  }
+  if (query.after_artifact_id != null) {
+    assertSolutionSetMemberId("artifact cursor", query.after_artifact_id);
+  }
+  return {
+    ...query,
+    after_artifact_id: query.after_artifact_id ?? undefined,
+    after_member_id: query.after_member_id ?? undefined,
+    limit,
+  };
+}
+
+function workspaceQueryParams(query: WorkspaceItemsQuery): Record<string, unknown> {
+  const wire: Record<string, unknown> = {};
+  if (query.kind) wire.kind = query.kind;
+  if (query.sort) wire.sort = query.sort;
+  if (query.search) wire.search = query.search;
+  if (query.limit !== undefined) wire.limit = query.limit;
+  if (query.includeMissing !== undefined) wire.include_missing = query.includeMissing;
+  return wire;
+}
+
+function sessionScopeHeaders(options: RequestOptions): Record<string, string> {
+  return options.sessionScopeKey
+    ? { "x-fullmag-session-scope": options.sessionScopeKey }
+    : {};
+}
 
 function baseRevisionPayload(options?: AuthoringWriteOptions): { base_revision?: number } {
   return options?.baseRevision === undefined
@@ -736,6 +1078,7 @@ function delay(ms: number, signal?: AbortSignal | null): Promise<void> {
 }
 
 interface ControlRoomApiOptions {
+  expectedApiInstance?: string | null;
   baseUrl?: string;
   binaryDecodeScheduler?: BinaryDecodeScheduler;
   diagnostics?: RequestDiagnosticsController;
@@ -743,6 +1086,13 @@ interface ControlRoomApiOptions {
   maxGetRetries?: number;
   retryDelayMs?: number;
   requestIdFactory?: () => string;
+}
+
+interface DevelopmentTransportAdmission {
+  readonly apiInstancePolicy: "pinned" | "token-bound-restart-status";
+  readonly isRestartStatusRead: boolean;
+  readonly pauseAllowed: boolean;
+  release(): void;
 }
 
 export class ControlRoomApiError extends Error {
@@ -758,6 +1108,11 @@ export class ControlRoomApiError extends Error {
 }
 
 export class ControlRoomApi {
+  /** Unique cache namespace for this API client instance. */
+  readonly resourceCacheScope = createRequestId();
+
+  private readonly expectedApiInstance: string | null;
+  private apiInstanceMismatch = false;
   private readonly baseUrl: string;
   private readonly binaryDecodeScheduler: BinaryDecodeScheduler;
   private readonly requestDiagnostics: RequestDiagnosticsController | null;
@@ -766,8 +1121,12 @@ export class ControlRoomApi {
   private readonly retryDelayMs: number;
   private readonly requestIdFactory: () => string;
   private readonly transport: OpenApiV2Transport;
+  private developmentHandoffTransportPauseCount = 0;
+  private developmentHandoffTransportRetired = false;
+  private ordinaryFacadeOperationsInFlight = 0;
+  private ordinaryTransportOperationsInFlight = 0;
   private readonly fieldMaterializationRequests = new Map<string, Promise<void>>();
-  private meshFreshnessRequest: Promise<boolean> | null = null;
+  private readonly meshFreshnessRequests = new Map<string, Promise<boolean>>();
 
   readonly sessions = {
     list: (options?: RequestOptions) =>
@@ -784,7 +1143,127 @@ export class ControlRoomApi {
     },
   };
 
+  /**
+   * The workspace database (projects, scripts, result folders) as the start
+   * screen reads it. Answers are `unknown` on purpose: the caller validates
+   * them (modules/start/model/workspaceApiTypes.ts) until generated types exist.
+   */
+  readonly workspace = {
+    items: (query: WorkspaceItemsQuery = {}, options?: RequestOptions) =>
+      this.requestJson<unknown>(WORKSPACE_ITEMS_PATH, options, {
+        query: workspaceQueryParams(query),
+      }),
+    item: (id: string, options?: RequestOptions) =>
+      this.requestJson<unknown>(WORKSPACE_ITEM_PATH, options, { path: { id } }),
+    history: (id: string, limit?: number, options?: RequestOptions) =>
+      this.requestJson<unknown>(WORKSPACE_ITEM_HISTORY_PATH, options, {
+        path: { id },
+        query: limit === undefined ? {} : { limit },
+      }),
+    /** One page of the saved-frame index (`frames.json`) of a result folder. */
+    frames: (id: string, from: number, limit: number, options?: RequestOptions) =>
+      this.requestJson<unknown>(WORKSPACE_ITEM_FRAMES_PATH, options, {
+        path: { id },
+        query: { from, limit },
+      }),
+    /** An allow-listed per-user setting (`telemetry.enabled`, `update.available`). */
+    setting: (key: string, options?: RequestOptions) =>
+      this.requestJson<unknown>(WORKSPACE_SETTING_PATH, options, { path: { key } }),
+    saveSetting: (key: string, value: boolean, options?: RequestOptions) =>
+      this.putJson<unknown, { value: boolean }>(
+        WORKSPACE_SETTING_PATH,
+        { value },
+        options,
+        { path: { key } },
+      ),
+    thumbnailUrl: (id: string) => workspaceItemThumbnailUrl(this.baseUrl, id),
+    archiveUrl: (id: string) => workspaceItemArchiveUrl(this.baseUrl, id),
+    setPinned: (id: string, pinned: boolean, options?: RequestOptions) =>
+      this.postJson<unknown, { pinned: boolean }>(
+        WORKSPACE_ITEM_PIN_PATH,
+        { pinned },
+        options,
+        { path: { id } },
+      ),
+    forget: (id: string, options?: RequestOptions) =>
+      this.postJson<unknown, Record<string, never>>(WORKSPACE_ITEM_FORGET_PATH, {}, options, {
+        path: { id },
+      }),
+    roots: (options?: RequestOptions) =>
+      this.requestJson<unknown>(WORKSPACE_ROOTS_PATH, options),
+    saveRoots: (roots: readonly WorkspaceRootWire[], options?: RequestOptions) =>
+      this.putJson<unknown, { roots: readonly WorkspaceRootWire[] }>(
+        WORKSPACE_ROOTS_PATH,
+        { roots },
+        options,
+      ),
+    scan: (roots?: readonly string[], options?: RequestOptions) =>
+      this.postJson<unknown, { roots?: readonly string[] }>(
+        WORKSPACE_SCAN_PATH,
+        roots ? { roots } : {},
+        options,
+      ),
+    addItem: (path: string, kind?: "project" | "script" | "result", options?: RequestOptions) =>
+      this.postJson<unknown, { path: string; kind?: string }>(
+        WORKSPACE_ITEMS_PATH,
+        kind ? { path, kind } : { path },
+        options,
+      ),
+  };
+
   readonly platform = {
+    computeExecutionPreview: (input: ComputePreviewRequest, options?: RequestOptions) =>
+      this.postJson<ComputePreviewResource, ComputePreviewRequest>(PLATFORM_COMPUTE_PREVIEW_PATH, input, options),
+    computeProfiles: (query: ExecutionProfileCatalogQuery = {}, options?: RequestOptions) =>
+      this.requestJson<ExecutionProfileCatalogResource>(PLATFORM_COMPUTE_PROFILES_PATH, options, { query }),
+    publishComputeProfile: (input: PublishExecutionProfileRequest, options?: RequestOptions) =>
+      this.postJson<PublishExecutionProfileResource, PublishExecutionProfileRequest>(PLATFORM_COMPUTE_PROFILES_PATH, input, options),
+    outputStorageDefaults: (options?: RequestOptions) =>
+      this.requestJson<OutputStorageDefaultsResource>(PLATFORM_OUTPUT_STORAGE_PATH, options),
+    saveOutputStorageDefaults: (input: OutputStorageDefaultsRequest, options?: RequestOptions) =>
+      this.putJson<OutputStorageDefaultsResource, OutputStorageDefaultsRequest>(PLATFORM_OUTPUT_STORAGE_PATH, input, options),
+    developmentBackend: (options?: RequestOptions) =>
+      this.requestJson<DevelopmentBackendResource>(PLATFORM_DEVELOPMENT_BACKEND_PATH, options),
+    submitDevelopmentBackendBuildRequest: (
+      request: DevelopmentBackendBuildRequest,
+      acknowledgementToken: string,
+      options?: RequestOptions,
+    ) =>
+      this.submitDevelopmentBackendBuildRequest(
+        request,
+        acknowledgementToken,
+        options,
+      ),
+    developmentBackendBuildRequest: (
+      requestId: string,
+      acknowledgementToken: string,
+      options?: RequestOptions,
+    ) =>
+      this.developmentBackendBuildRequest(
+        requestId,
+        acknowledgementToken,
+        options,
+      ),
+    submitDevelopmentRestartRequest: (
+      request: DevelopmentRestartRequest,
+      acknowledgementToken: string,
+      options?: RequestOptions,
+    ) =>
+      this.submitDevelopmentRestartRequest(
+        request,
+        acknowledgementToken,
+        options,
+      ),
+    developmentRestartRequest: (
+      requestId: string,
+      acknowledgementToken: string,
+      options?: RequestOptions,
+    ) =>
+      this.developmentRestartRequest(
+        requestId,
+        acknowledgementToken,
+        options,
+      ),
     capabilities: (options?: RequestOptions) =>
       this.requestJson<PlatformCapabilitiesResource>(
         PLATFORM_CAPABILITIES_PATH,
@@ -842,6 +1321,58 @@ export class ControlRoomApi {
   };
 
   readonly analysis = {
+    /** Analytic reference models with their declared assumptions (spec 32 §9). */
+    references: {
+      analyticModels: (options?: RequestOptions) =>
+        this.requestJson<AnalyticReferenceModelCollectionResource>(
+          ANALYSIS_ANALYTIC_REFERENCE_MODELS_PATH,
+          options,
+        ),
+    },
+    /** User-created Results nodes saved with the project (ADR 0054, spec 32 §8). */
+    postprocessing: {
+      definitions: {
+        list: (options?: RequestOptions) =>
+          this.requestJson<PostprocessingDefinitionCollectionResource>(
+            ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH,
+            options,
+          ),
+        get: (definitionId: string, options?: RequestOptions) =>
+          this.requestJson<PostprocessingDefinitionResource>(
+            ANALYSIS_POSTPROCESSING_DEFINITION_PATH,
+            options,
+            { path: { definition_id: definitionId } },
+          ),
+        create: (request: PostprocessingDefinitionCreateRequest, options?: RequestOptions) =>
+          this.postJson<PostprocessingDefinitionResource, PostprocessingDefinitionCreateRequest>(
+            ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH,
+            request,
+            options,
+          ),
+        patch: (
+          definitionId: string,
+          request: PostprocessingDefinitionPatchRequest,
+          options?: RequestOptions,
+        ) =>
+          this.patchJson<PostprocessingDefinitionResource, PostprocessingDefinitionPatchRequest>(
+            ANALYSIS_POSTPROCESSING_DEFINITION_PATH,
+            request,
+            options,
+            { path: { definition_id: definitionId } },
+          ),
+        remove: (
+          definitionId: string,
+          request: PostprocessingDefinitionDeleteRequest,
+          options?: RequestOptions,
+        ) =>
+          this.deleteJsonWithBody<
+            PostprocessingDefinitionCollectionResource,
+            PostprocessingDefinitionDeleteRequest
+          >(ANALYSIS_POSTPROCESSING_DEFINITION_PATH, request, options, {
+            path: { definition_id: definitionId },
+          }),
+      },
+    },
     spinWave: {
       gamma: (options?: RequestOptions) =>
         this.requestJson<SpinWaveGammaResource>(
@@ -1281,6 +1812,82 @@ export class ControlRoomApi {
   };
 
   readonly data = {
+    antenna: {
+      fieldSolution: (solutionId: string, options?: RequestOptions) =>
+        this.requestJson<AntennaFieldSolutionResource>(
+          DATA_ANTENNA_FIELD_SOLUTION_PATH,
+          options,
+          { path: { solution_id: solutionId } },
+        ),
+      fieldSolutionPayload: (
+        solutionId: string,
+        payloadKind: AntennaFieldPayloadKind,
+        portModeId?: string,
+        options?: BinaryRequestOptions,
+      ) =>
+        this.requestBinaryBytes(
+          DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH,
+          options,
+          { solution_id: solutionId, payload_kind: payloadKind },
+          portModeId ? { port_mode_id: portModeId } : undefined,
+        ),
+      stageOutputCatalog: (stageId: string, options?: RequestOptions) =>
+        this.requestJson<AntennaStageOutputCatalogResource>(
+          DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH,
+          options,
+          { path: { stage_id: stageId } },
+        ),
+      externalLeadInspection: (stageId: string, options?: RequestOptions) =>
+        this.requestJson<AntennaExternalLeadInspectionResource>(
+          DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH,
+          options,
+          { path: { stage_id: stageId } },
+        ),
+      externalLeadInspectionDisplay: (
+        stageId: string,
+        contentDigest: string,
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<AntennaInspectionDisplayResource>(
+          DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH,
+          options,
+          { path: { stage_id: stageId }, query: { content_digest: contentDigest } },
+        ),
+      externalLeadInspectionPayload: (
+        stageId: string,
+        payloadKind: AntennaInspectionPayloadKind,
+        contentDigest: string,
+        options?: BinaryRequestOptions,
+      ) =>
+        this.requestBinaryBytes(
+          DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH,
+          {
+            ...options,
+            maxResponseBytes: Math.min(
+              options?.maxResponseBytes ?? MAX_ANTENNA_INSPECTION_BYTES,
+              MAX_ANTENNA_INSPECTION_BYTES,
+            ),
+          },
+          { stage_id: stageId, payload_kind: payloadKind },
+          { content_digest: contentDigest },
+        ),
+      sourceSpectrum: (outputId: string, options?: RequestOptions) =>
+        this.requestJson<AntennaSourceSpectrumResource>(
+          DATA_ANTENNA_SOURCE_SPECTRUM_PATH,
+          options,
+          { path: { output_id: outputId } },
+        ),
+      sourceSpectrumPayload: (
+        outputId: string,
+        payloadKind: AntennaSpectrumPayloadKind,
+        options?: BinaryRequestOptions,
+      ) =>
+        this.requestBinaryBytes(
+          DATA_ANTENNA_SOURCE_SPECTRUM_PAYLOAD_PATH,
+          options,
+          { output_id: outputId, payload_kind: payloadKind },
+        ),
+    },
     artifacts: {
       list: (options?: RequestOptions) =>
         this.requestJson<ArtifactResource[]>(DATA_ARTIFACTS_PATH, options),
@@ -1332,6 +1939,30 @@ export class ControlRoomApi {
         this.requestBinaryBytes(DATA_DOMAIN_TOPOLOGY_PATH, options),
       topologyChunked: (options?: BinaryRequestOptions) =>
         this.requestTopologyChunked(DATA_DOMAIN_TOPOLOGY_PATH, options),
+    },
+    observationFrames: {
+      list: (
+        query: ObservationFrameListQuery = {},
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<ObservationFrameListResource>(
+          DATA_OBSERVATION_FRAMES_PATH,
+          options,
+          { query },
+        ),
+      get: (frameId: string, options?: RequestOptions) =>
+        this.requestJson<ObservationFrameResource>(
+          DATA_OBSERVATION_FRAME_PATH,
+          options,
+          { path: { frame_id: frameId } },
+        ),
+      magnetization: (frameId: string, options?: BinaryRequestOptions) =>
+        this.requestFieldVector(
+          DATA_OBSERVATION_FRAME_MAGNETIZATION_PATH,
+          { frame_id: frameId },
+          {},
+          options,
+        ),
     },
     fields: {
       catalog: (options?: RequestOptions) =>
@@ -2438,11 +3069,11 @@ export class ControlRoomApi {
     patchRegion: (
       regionId: string,
       patch: RegionPatchRequest,
-      options?: RequestOptions,
+      options?: AuthoringWriteOptions,
     ) =>
       this.patchJson<SceneResource, RegionPatchRequest>(
         MODEL_REGION_PATH,
-        patch,
+        { ...baseRevisionPayload(options), ...patch },
         options,
         { path: { region_id: regionId } },
       ),
@@ -2503,6 +3134,11 @@ export class ControlRoomApi {
           request,
           options,
         ),
+      /** 204 on success; 404 for an unknown id; 409 while still referenced. */
+      delete: (checkpointId: string, options?: RequestOptions) =>
+        this.deleteJson<void>(PERSISTENCE_CHECKPOINT_PATH, options, {
+          path: { checkpoint_id: checkpointId },
+        }),
       detail: (checkpointId: string, options?: RequestOptions) =>
         this.requestJson<CheckpointEntry>(
           PERSISTENCE_CHECKPOINT_PATH,
@@ -2579,6 +3215,366 @@ export class ControlRoomApi {
           SessionImportInspectRequest
         >(PERSISTENCE_IMPORT_INSPECTIONS_PATH, request, options),
     },
+    projects: {
+      listRuns: (
+        projectId: string,
+        query: ProjectRunListQuery = {},
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<ProjectRunListResource>(
+          PROJECT_RUN_SUBMIT_PATH,
+          options,
+          { path: { project_id: projectId }, query },
+        ),
+      listBatches: (
+        projectId: string,
+        query: ProjectBatchListQuery = {},
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<ProjectBatchListResource>(
+          PROJECT_BATCHES_PATH,
+          options,
+          { path: { project_id: projectId }, query },
+        ),
+      listBatchCases: (
+        projectId: string,
+        batchId: string,
+        query: ProjectBatchCasesQuery = {},
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<ProjectBatchCasesResource>(
+          PROJECT_BATCH_CASES_PATH,
+          options,
+          { path: { project_id: projectId, batch_id: batchId }, query },
+        ),
+      getRun: (projectId: string, runId: string, options?: RequestOptions) =>
+        this.requestJson<ProjectRunResource>(
+          PROJECT_RUN_PATH,
+          options,
+          { path: { project_id: projectId, run_id: runId } },
+        ),
+      solutionSets: (
+        projectId: string,
+        runId: string,
+        query: SolutionSetDiscoveryPageQuery = {},
+        options?: RequestOptions,
+      ) => {
+        const limit = query.limit ?? 25;
+        if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+          throw new Error("Solution discovery limit must be between 1 and 50.");
+        }
+        const cursor = query.cursor ?? undefined;
+        if (cursor !== undefined &&
+          (cursor.length > 4096 || !/^[A-Za-z0-9_-]+$/.test(cursor))) {
+          throw new Error("Invalid solution discovery cursor.");
+        }
+        return this.requestJson<SolutionSetDiscoveryPageResource>(
+          PROJECT_SOLUTION_SET_DISCOVERY_PATH,
+          options,
+          {
+            path: {
+              project_id: assertSolutionSetProjectId(projectId),
+              run_id: assertSolutionSetRunId(runId),
+            },
+            query: { cursor, limit },
+          },
+        );
+      },
+      solutionSet: (
+        projectId: string,
+        runId: string,
+        solutionSetId: string,
+        revision: SolutionSetRevision,
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<SolutionSetResource>(
+          PROJECT_SOLUTION_SET_PATH,
+          options,
+          {
+            path: {
+              project_id: assertSolutionSetProjectId(projectId),
+              revision: assertSolutionSetRevision(revision),
+              run_id: assertSolutionSetRunId(runId),
+              solution_set_id: assertSolutionSetLogicalId(solutionSetId),
+            },
+          },
+        ),
+      solutionSetMembers: (
+        projectId: string,
+        runId: string,
+        solutionSetId: string,
+        revision: SolutionSetRevision,
+        query: SolutionSetMemberPageQuery = {},
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<SolutionSetMemberPageResource>(
+          PROJECT_SOLUTION_SET_MEMBERS_PATH,
+          options,
+          {
+            path: {
+              project_id: assertSolutionSetProjectId(projectId),
+              revision: assertSolutionSetRevision(revision),
+              run_id: assertSolutionSetRunId(runId),
+              solution_set_id: assertSolutionSetLogicalId(solutionSetId),
+            },
+            query: normalizeSolutionSetPageQuery(query),
+          },
+        ),
+      solutionSetArtifacts: (
+        projectId: string,
+        runId: string,
+        solutionSetId: string,
+        revision: SolutionSetRevision,
+        memberId: string,
+        query: SolutionSetArtifactPageQuery = {},
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<SolutionSetArtifactPageResource>(
+          PROJECT_SOLUTION_SET_ARTIFACTS_PATH,
+          options,
+          {
+            path: {
+              member_id: assertSolutionSetMemberId("member id", memberId),
+              project_id: assertSolutionSetProjectId(projectId),
+              revision: assertSolutionSetRevision(revision),
+              run_id: assertSolutionSetRunId(runId),
+              solution_set_id: assertSolutionSetLogicalId(solutionSetId),
+            },
+            query: normalizeSolutionSetPageQuery(query),
+          },
+        ),
+      materializedDataset: (
+        projectId: string,
+        runId: string,
+        solutionSetId: string,
+        revision: SolutionSetRevision,
+        memberId: string,
+        artifactId: string,
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<MaterializedDatasetResource>(
+          PROJECT_MATERIALIZED_DATASET_PATH,
+          options,
+          {
+            path: {
+              project_id: assertSolutionSetProjectId(projectId),
+              run_id: assertSolutionSetRunId(runId),
+              solution_set_id: assertSolutionSetLogicalId(solutionSetId),
+              revision: assertSolutionSetRevision(revision),
+              member_id: assertMaterializedDatasetPathId("member id", memberId),
+              artifact_id: assertMaterializedDatasetPathId("artifact id", artifactId),
+            },
+          },
+        ),
+      solutionScalar: (
+        projectId: string,
+        runId: string,
+        solutionSetId: string,
+        revision: SolutionSetRevision,
+        memberId: string,
+        artifactId: string,
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<SolutionScalarResource>(
+          PROJECT_SOLUTION_SCALAR_PATH,
+          options,
+          {
+            path: {
+              project_id: assertSolutionSetProjectId(projectId),
+              run_id: assertSolutionSetRunId(runId),
+              solution_set_id: assertSolutionSetLogicalId(solutionSetId),
+              revision: assertSolutionSetRevision(revision),
+              member_id: assertMaterializedDatasetPathId("member id", memberId),
+              artifact_id: assertMaterializedDatasetPathId("artifact id", artifactId),
+            },
+          },
+        ),
+      materializedDatasetSlice: async (
+        dataset: MaterializedDatasetResource,
+        range: MaterializedDatasetSliceRange,
+        options?: RequestOptions,
+      ) => {
+        const result = await this.requestBinaryBytes(
+          PROJECT_MATERIALIZED_DATASET_SLICE_PATH,
+          { signal: options?.signal, maxResponseBytes: materializedDatasetSliceByteLimit(range) },
+          {
+            project_id: assertSolutionSetProjectId(dataset.project_id),
+            run_id: assertSolutionSetRunId(dataset.run_id),
+            solution_set_id: assertSolutionSetLogicalId(dataset.solution_set_id),
+            revision: assertSolutionSetRevision(dataset.containing_solution_revision),
+            member_id: assertMaterializedDatasetPathId("member id", dataset.member_id),
+            artifact_id: assertMaterializedDatasetPathId("artifact id", dataset.artifact_id),
+          },
+          {
+            schema_version: "1.0.0",
+            dataset_id: dataset.dataset.dataset_id,
+            dataset_revision: assertSolutionSetRevision(dataset.dataset.revision),
+            sample_id: dataset.sample_id,
+            item_id: dataset.item_id,
+            field_id: dataset.field_id,
+            expected_manifest_object_ref: dataset.manifest_object_ref,
+            element_offset: range.elementOffset,
+            element_count: range.elementCount,
+            max_response_bytes: range.maxResponseBytes,
+          },
+        );
+        if (result.status !== "ready") {
+          throw new ControlRoomApiError("Expected a complete pinned dataset slice response", 0);
+        }
+        return decodeMaterializedDatasetSlice(result.data, dataset, range, options?.signal);
+      },
+      savedFieldGeometry: async (dataset: MaterializedDatasetResource, options?: RequestOptions) => {
+        const geometry = await this.requestJson<SavedFieldGeometryResource>(
+          PROJECT_SAVED_FIELD_GEOMETRY_PATH, options, { path: savedGeometryPath(dataset) },
+        );
+        return validateSavedGeometry(geometry, dataset);
+      },
+      savedFieldTopology: async (
+        dataset: MaterializedDatasetResource,
+        geometry: SavedFieldGeometryResource,
+        options?: RequestOptions,
+      ) => {
+        validateSavedGeometry(geometry, dataset);
+        if (geometry.topology_binary_byte_length == null || geometry.topology_binary_sha256 == null) {
+          return null;
+        }
+        const limit = savedTopologyByteLimit(geometry);
+        const result = await this.requestBinaryBytes(
+          PROJECT_SAVED_FIELD_TOPOLOGY_PATH,
+          { signal: options?.signal, maxResponseBytes: limit },
+          savedGeometryPath(dataset), savedGeometryBinaryQuery(geometry, limit),
+        );
+        if (result.status === "not-applicable") return null;
+        if (result.status !== "ready") throw new ControlRoomApiError("Expected a complete pinned topology body", 0);
+        await verifySavedTopologyBody(result.data, geometry, options?.signal);
+        this.requireApiInstanceCurrent();
+        const topology = await this.binaryDecodeScheduler({
+          buffer: result.data,
+          decodeInline: decodeTopology,
+          kind: "topology",
+          path: PROJECT_SAVED_FIELD_TOPOLOGY_PATH,
+          signal: options?.signal,
+        });
+        this.requireApiInstanceCurrent();
+        if (topology.formatVersion !== 2 || String(topology.nodeCount) !== geometry.node_count ||
+            String(topology.cellCount) !== geometry.cell_count || String(topology.facetCount) !== geometry.facet_count) {
+          throw new ControlRoomApiError("Pinned topology extents differ from saved geometry", 0);
+        }
+        return topology;
+      },
+      savedFieldSupport: async (
+        dataset: MaterializedDatasetResource,
+        geometry: SavedFieldGeometryResource,
+        options?: RequestOptions,
+      ) => {
+        validateSavedGeometry(geometry, dataset);
+        if (geometry.support_binary_byte_length == null || geometry.support_binary_sha256 == null) {
+          return null;
+        }
+        const identity = { nodeCount: geometry.node_count, byteLength: geometry.support_binary_byte_length, sha256: geometry.support_binary_sha256 };
+        const limit = savedSupportByteLimit(identity);
+        const result = await this.requestBinaryBytes(
+          PROJECT_SAVED_FIELD_SUPPORT_PATH,
+          { signal: options?.signal, maxResponseBytes: limit },
+          savedGeometryPath(dataset), savedGeometryBinaryQuery(geometry, limit),
+        );
+        if (result.status === "not-applicable") return null;
+        if (result.status !== "ready") throw new ControlRoomApiError("Expected a complete pinned support body", 0);
+        const support = await decodeSavedSupport(result.data, identity, options?.signal);
+        this.requireApiInstanceCurrent();
+        let active = 0;
+        for (const byte of support.bits) {
+          let remaining = byte;
+          while (remaining !== 0) { remaining &= remaining - 1; active += 1; }
+        }
+        if (String(active) !== geometry.active_node_count) throw new ControlRoomApiError("Pinned support active count mismatch", 0);
+        return support;
+      },
+      create: (request: ProjectCreateRequest, options?: RequestOptions) =>
+        this.postJson<ProjectDocumentResource, ProjectCreateRequest>(
+          PERSISTENCE_PROJECTS_PATH,
+          request,
+          options,
+        ),
+      open: (request: ProjectArchiveRequest, options?: RequestOptions) =>
+        this.postJson<ProjectDocumentResource, ProjectArchiveRequest>(
+          PERSISTENCE_PROJECT_OPEN_PATH,
+          request,
+          options,
+        ),
+      /**
+       * Executes the supplied script in the Python helper (the request must
+       * carry `consent.executed_by_user: true`) and returns a project with the
+       * script embedded plus a fidelity verdict.
+       */
+      fromScript: (request: ProjectFromScriptRequest, options?: RequestOptions) =>
+        this.postJson<ProjectFromScriptResource, ProjectFromScriptRequest>(
+          PERSISTENCE_PROJECT_FROM_SCRIPT_PATH,
+          request,
+          options,
+        ),
+      authoringUpdate: (request: ProjectAuthoringUpdateRequest, options?: RequestOptions) =>
+        this.postJson<ProjectDocumentResource, ProjectAuthoringUpdateRequest>(
+          PERSISTENCE_PROJECT_AUTHORING_PATH,
+          request,
+          options,
+        ),
+      submitBatch: (
+        projectId: string,
+        request: ProjectBatchSubmitRequest,
+        options?: RequestOptions,
+      ) =>
+        this.postJson<ProjectBatchSubmitResource, ProjectBatchSubmitRequest>(
+          PROJECT_BATCHES_PATH,
+          request,
+          options,
+          { path: { project_id: projectId } },
+        ),
+      submitRun: (
+        projectId: string,
+        request: ProjectRunSubmitRequest,
+        options?: RequestOptions,
+      ) =>
+        this.postJson<ProjectRunSubmitResource, ProjectRunSubmitRequest>(
+          PROJECT_RUN_SUBMIT_PATH,
+          request,
+          options,
+          { path: { project_id: projectId } },
+        ),
+      materializeRun: (
+        projectId: string,
+        runId: string,
+        options?: RequestOptions,
+      ) =>
+        this.postJson<ProjectRunMaterializationResource, undefined>(
+          PROJECT_RUN_MATERIALIZATION_PATH,
+          undefined,
+          options,
+          { path: { project_id: projectId, run_id: runId } },
+        ),
+      cancelRunTask: (
+        projectId: string,
+        runId: string,
+        taskId: string,
+        request: ProjectRunTaskCancellationRequest,
+        options?: RequestOptions,
+      ) =>
+        this.postJson<
+          ProjectRunTaskCancellationResource,
+          ProjectRunTaskCancellationRequest
+        >(
+          PROJECT_RUN_TASK_CANCELLATION_PATH,
+          request,
+          options,
+          {
+            path: {
+              project_id: projectId,
+              run_id: runId,
+              task_id: taskId,
+            },
+          },
+        ),
+    },
   };
 
   readonly simulation = {
@@ -2590,6 +3586,18 @@ export class ControlRoomApi {
     preparation: (options?: RequestOptions) =>
       this.requestJson<SimulationPreparationResource>(
         SIMULATION_PREPARATION_PATH,
+        options,
+      ),
+    materializePreparation: (
+      request: LivePreparationMaterializationRequest,
+      options?: RequestOptions,
+    ) =>
+      this.postJson<
+        LivePreparationMaterializationResource,
+        LivePreparationMaterializationRequest
+      >(
+        SIMULATION_PREPARATION_MATERIALIZATION_PATH,
+        request,
         options,
       ),
     objects: {
@@ -2684,6 +3692,14 @@ export class ControlRoomApi {
   };
 
   readonly visualization = {
+    display: (options?: RequestOptions) =>
+      this.requestJson<DisplaySelection>(VISUALIZATION_DISPLAY_PATH, options),
+    replaceDisplay: (display: DisplaySelection, options?: RequestOptions) =>
+      this.putJson<DisplaySelection, DisplaySelection>(
+        VISUALIZATION_DISPLAY_PATH,
+        display,
+        options,
+      ),
     ack: (ack: VisualizationClientAckRequest, options?: RequestOptions) =>
       this.postJson<VisualizationClientAckEntry, VisualizationClientAckRequest>(
         VISUALIZATION_CLIENT_ACKS_PATH,
@@ -2727,10 +3743,20 @@ export class ControlRoomApi {
         VISUALIZATION_STATE_PATH,
         options,
       ),
+    replaceState: (
+      replacement: VisualizationStateResource,
+      options?: RequestOptions,
+    ) =>
+      this.putJson<VisualizationStateResource, VisualizationStateResource>(
+        VISUALIZATION_STATE_PATH,
+        replacement,
+        options,
+      ),
   };
 
   constructor({
     baseUrl,
+    expectedApiInstance = resolveApiInstancePin(),
     binaryDecodeScheduler = createBinaryDecodeScheduler(),
     diagnostics,
     fetchImpl,
@@ -2739,6 +3765,10 @@ export class ControlRoomApi {
     requestIdFactory = createRequestId,
   }: ControlRoomApiOptions = {}) {
     this.baseUrl = resolveBaseUrl(baseUrl);
+    if (expectedApiInstance !== null && !isApiInstanceId(expectedApiInstance)) {
+      throw new ControlRoomApiError("Invalid API instance pin", 0, null, "API_INSTANCE_MISMATCH");
+    }
+    this.expectedApiInstance = expectedApiInstance;
     this.binaryDecodeScheduler = binaryDecodeScheduler;
     this.requestDiagnostics = diagnostics ?? null;
     this.fetchImpl = fetchImpl ?? resolveDefaultFetch();
@@ -2747,12 +3777,463 @@ export class ControlRoomApi {
     this.requestIdFactory = requestIdFactory;
     this.transport = createOpenApiV2Transport({
       baseUrl: this.baseUrl,
-      fetch: (input) => this.executeOpenApiFetch(input, undefined),
+      fetch: (input: Request, init?: RequestInit) =>
+        this.executeOpenApiFetch(input, init),
     });
+    this.wrapOpenApiTransportOperations();
+    this.wrapPublicApiOperations();
+  }
+
+  beginDevelopmentHandoffTransportPause(): () => void {
+    if (this.developmentHandoffTransportRetired) {
+      throw new ControlRoomApiError(
+        "Development handoff transport has been retired",
+        0,
+        null,
+        "DEVELOPMENT_TRANSPORT_RETIRED",
+      );
+    }
+    if (
+      this.ordinaryFacadeOperationsInFlight > 0 ||
+      this.ordinaryTransportOperationsInFlight > 0
+    ) {
+      throw new ControlRoomApiError(
+        "Cannot pause development handoff transport while an ordinary request is in flight",
+        0,
+        null,
+        "DEVELOPMENT_TRANSPORT_BUSY",
+      );
+    }
+
+    this.developmentHandoffTransportPauseCount += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.developmentHandoffTransportPauseCount = Math.max(
+        0,
+        this.developmentHandoffTransportPauseCount - 1,
+      );
+    };
+  }
+
+  retireDevelopmentHandoffTransport(): void {
+    this.developmentHandoffTransportRetired = true;
   }
 
   getBaseUrl(): string {
     return this.baseUrl;
+  }
+
+  getExpectedApiInstance(): string | null {
+    return this.expectedApiInstance;
+  }
+
+  private wrapOpenApiTransportOperations(): void {
+    const transport = this.transport as unknown as Record<string, unknown>;
+    for (const method of [
+      "GET",
+      "POST",
+      "PATCH",
+      "PUT",
+      "DELETE",
+      "OPTIONS",
+      "HEAD",
+      "TRACE",
+    ]) {
+      const member = transport[method];
+      if (typeof member !== "function") continue;
+      const original = member as (...args: unknown[]) => unknown;
+      transport[method] = this.wrapTrackedOperation(
+        original,
+        this.transport,
+        (args) =>
+          !this.isHandoffProtocolTransportOperation(method, args) ||
+          this.developmentHandoffTransportPauseCount === 0,
+      );
+    }
+  }
+
+  private isHandoffProtocolTransportOperation(
+    method: string,
+    args: readonly unknown[],
+  ): boolean {
+    const [rawPath, rawOptions] = args;
+    if (
+      typeof rawPath !== "string" ||
+      !isPlainRecord(rawOptions) ||
+      rawOptions.fetch !== undefined
+    ) {
+      return false;
+    }
+
+    let url: URL;
+    let headers: Headers;
+    try {
+      url = new URL(rawPath, this.baseUrl);
+      headers = new Headers(rawOptions.headers as HeadersInit | undefined);
+    } catch {
+      return false;
+    }
+    if (!this.isSameApiOrigin(url.toString()) || url.search !== "") {
+      return false;
+    }
+
+    if (
+      method === "GET" &&
+      rawPath === PLATFORM_DEVELOPMENT_BACKEND_PATH
+    ) {
+      return true;
+    }
+
+    if (
+      method === "POST" &&
+      rawPath === PLATFORM_DEVELOPMENT_RESTART_REQUESTS_PATH &&
+      isDevelopmentRestartAuthorization(headers.get("authorization"))
+    ) {
+      return true;
+    }
+
+    const params = rawOptions.params;
+    const pathParams = isPlainRecord(params) ? params.path : undefined;
+    const requestId = isPlainRecord(pathParams)
+      ? pathParams.request_id
+      : undefined;
+    if (
+      method !== "GET" ||
+      rawPath !== PLATFORM_DEVELOPMENT_RESTART_REQUEST_PATH ||
+      typeof requestId !== "string" ||
+      requestId.length === 0 ||
+      headers.get(DEVELOPMENT_RESTART_STATUS_POLICY_HEADER) !==
+        DEVELOPMENT_RESTART_STATUS_POLICY
+    ) {
+      return false;
+    }
+
+    const resolvedStatusPath = PLATFORM_DEVELOPMENT_RESTART_REQUEST_PATH.replace(
+      "{request_id}",
+      encodeURIComponent(requestId),
+    );
+    return isTokenBoundDevelopmentRestartStatusRequest(
+      method,
+      new URL(resolvedStatusPath, this.baseUrl).toString(),
+      headers,
+    );
+  }
+
+  private wrapPublicApiOperations(): void {
+    // Keep each facade promise in flight through JSON parsing and binary decoding,
+    // after the transport-level Response has already returned.
+    const groups: Array<[string, Record<string, unknown>]> = [
+      ["sessions", this.sessions],
+      ["platform", this.platform],
+      ["workspace", this.workspace],
+      ["events", this.events],
+      ["commands", this.commands],
+      ["analysis", this.analysis],
+      ["data", this.data],
+      ["diagnostics", this.diagnostics],
+      ["meshing", this.meshing],
+      ["model", this.model],
+      ["persistence", this.persistence],
+      ["simulation", this.simulation],
+      ["visualization", this.visualization],
+    ];
+    for (const [name, group] of groups) {
+      this.wrapPublicApiOperationTree(group, name, new WeakSet());
+    }
+  }
+
+  private wrapPublicApiOperationTree(
+    value: Record<string, unknown>,
+    parentPath: string,
+    visited: WeakSet<object>,
+  ): void {
+    if (visited.has(value)) return;
+    visited.add(value);
+
+    for (const [key, member] of Object.entries(value)) {
+      const operationPath = `${parentPath}.${key}`;
+      if (typeof member === "function") {
+        const original = member as (...args: unknown[]) => unknown;
+        value[key] = this.wrapTrackedOperation(original, value, () => {
+          const isHandoffProtocolOperation =
+            operationPath === "platform.developmentBackend" ||
+            operationPath === "platform.submitDevelopmentRestartRequest" ||
+            operationPath === "platform.developmentRestartRequest";
+          return (
+            !isHandoffProtocolOperation ||
+            this.developmentHandoffTransportPauseCount === 0
+          );
+        });
+      } else if (isPlainRecord(member)) {
+        this.wrapPublicApiOperationTree(member, operationPath, visited);
+      }
+    }
+  }
+
+  private wrapTrackedOperation(
+    original: (...args: unknown[]) => unknown,
+    thisArg: unknown,
+    shouldTrack: (args: readonly unknown[]) => boolean,
+  ): (...args: unknown[]) => unknown {
+    return (...args: unknown[]) => {
+      const release = shouldTrack(args)
+        ? this.beginOrdinaryFacadeOperation()
+        : () => undefined;
+      let result: unknown;
+      try {
+        result = original.apply(thisArg, args);
+      } catch (error) {
+        release();
+        throw error;
+      }
+
+      let thenable = false;
+      if (
+        (typeof result === "object" && result !== null) ||
+        typeof result === "function"
+      ) {
+        try {
+          thenable = typeof (result as { then?: unknown }).then === "function";
+        } catch (error) {
+          release();
+          throw error;
+        }
+      }
+      if (thenable) return Promise.resolve(result).finally(release);
+
+      release();
+      return result;
+    };
+  }
+
+  private beginOrdinaryFacadeOperation(): () => void {
+    this.ordinaryFacadeOperationsInFlight += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.ordinaryFacadeOperationsInFlight = Math.max(
+        0,
+        this.ordinaryFacadeOperationsInFlight - 1,
+      );
+    };
+  }
+
+  private admitTransportOperation(
+    input: RequestInfo | URL,
+    init: RequestInit | undefined,
+  ): DevelopmentTransportAdmission {
+    const identity = fetchRequestIdentity(input, init);
+    const policy = identity.headers.get(
+      DEVELOPMENT_RESTART_STATUS_POLICY_HEADER,
+    );
+    let apiInstancePolicy: DevelopmentTransportAdmission["apiInstancePolicy"] =
+      "pinned";
+    if (policy !== null) {
+      if (
+        policy !== DEVELOPMENT_RESTART_STATUS_POLICY ||
+        !this.isSameApiOrigin(identity.url) ||
+        !isTokenBoundDevelopmentRestartStatusRequest(
+          identity.method,
+          identity.url,
+          identity.headers,
+        )
+      ) {
+        throw new ControlRoomApiError(
+          "Invalid token-bound development restart status request",
+          0,
+          null,
+          "DEVELOPMENT_RESTART_STATUS_POLICY_INVALID",
+        );
+      }
+      apiInstancePolicy = "token-bound-restart-status";
+    }
+
+    const path = pathFromUrl(identity.url);
+    const isRestartStatusRead =
+      apiInstancePolicy === "token-bound-restart-status" &&
+      this.isSameApiOrigin(identity.url) &&
+      isTokenBoundDevelopmentRestartStatusRequest(
+        identity.method,
+        identity.url,
+        identity.headers,
+      );
+    const isDevelopmentBackendRead =
+      this.isSameApiOrigin(identity.url) &&
+      identity.method === "GET" && path === PLATFORM_DEVELOPMENT_BACKEND_PATH;
+    const isRestartSubmission =
+      this.isSameApiOrigin(identity.url) &&
+      identity.method === "POST" &&
+      path === PLATFORM_DEVELOPMENT_RESTART_REQUESTS_PATH &&
+      isDevelopmentRestartAuthorization(
+        identity.headers.get("authorization"),
+      );
+    const pauseAllowed =
+      isRestartStatusRead || isDevelopmentBackendRead || isRestartSubmission;
+
+    this.assertTransportAdmission({
+      isRestartStatusRead,
+      pauseAllowed,
+    });
+
+    const trackOperation = !pauseAllowed;
+    if (trackOperation) this.ordinaryTransportOperationsInFlight += 1;
+    let released = false;
+    return {
+      apiInstancePolicy,
+      isRestartStatusRead,
+      pauseAllowed,
+      release: () => {
+        if (released) return;
+        released = true;
+        if (trackOperation) {
+          this.ordinaryTransportOperationsInFlight = Math.max(
+            0,
+            this.ordinaryTransportOperationsInFlight - 1,
+          );
+        }
+      },
+    };
+  }
+
+  private isSameApiOrigin(url: string): boolean {
+    try {
+      return new URL(url, this.baseUrl).origin === new URL(this.baseUrl).origin;
+    } catch {
+      return false;
+    }
+  }
+
+  private assertTransportAdmission(
+    admission: Pick<
+      DevelopmentTransportAdmission,
+      "isRestartStatusRead" | "pauseAllowed"
+    >,
+  ): void {
+    if (
+      this.developmentHandoffTransportRetired &&
+      !admission.isRestartStatusRead
+    ) {
+      throw new ControlRoomApiError(
+        "Development handoff transport has been retired",
+        0,
+        null,
+        "DEVELOPMENT_TRANSPORT_RETIRED",
+      );
+    }
+    if (
+      this.developmentHandoffTransportPauseCount > 0 &&
+      !admission.pauseAllowed
+    ) {
+      throw new ControlRoomApiError(
+        "Development handoff transport is paused",
+        0,
+        null,
+        "DEVELOPMENT_TRANSPORT_PAUSED",
+      );
+    }
+  }
+
+  private requireApiInstanceCurrent(): void {
+    if (this.apiInstanceMismatch) {
+      throw new ControlRoomApiError("API instance changed; reopen Fullmag", 409, null, "API_INSTANCE_MISMATCH");
+    }
+  }
+
+  private async submitDevelopmentRestartRequest(
+    request: DevelopmentRestartRequest,
+    acknowledgementToken: string,
+    options: RequestOptions = {},
+  ): Promise<DevelopmentRestartResource> {
+    const result = await this.transport.POST(
+      PLATFORM_DEVELOPMENT_RESTART_REQUESTS_PATH as never,
+      {
+        body: request,
+        cache: "no-store",
+        headers: {
+          Authorization: developmentRestartAuthorization(acknowledgementToken),
+        },
+        signal: options.signal,
+      } as never,
+    );
+    this.requireApiInstanceCurrent();
+    return readOpenApiResult<DevelopmentRestartResource>(result);
+  }
+
+  private async submitDevelopmentBackendBuildRequest(
+    request: DevelopmentBackendBuildRequest,
+    acknowledgementToken: string,
+    options: RequestOptions = {},
+  ): Promise<DevelopmentBackendBuildRequestResource> {
+    const result = await this.transport.POST(
+      PLATFORM_DEVELOPMENT_BACKEND_BUILD_REQUESTS_PATH as never,
+      {
+        body: request,
+        cache: "no-store",
+        headers: {
+          Authorization: developmentRestartAuthorization(acknowledgementToken),
+        },
+        signal: options.signal,
+      } as never,
+    );
+    this.requireApiInstanceCurrent();
+    return readOpenApiResult<DevelopmentBackendBuildRequestResource>(result);
+  }
+
+  private async developmentBackendBuildRequest(
+    requestId: string,
+    acknowledgementToken: string,
+    options: RequestOptions = {},
+  ): Promise<DevelopmentBackendBuildRequestResource> {
+    assertNonEmptyId("development backend build request id", requestId);
+    if (typeof window === "undefined" || !window.location.origin) {
+      throw new ControlRoomApiError(
+        "Development backend build status requires a browser UI origin",
+        0,
+        null,
+        "DEVELOPMENT_BACKEND_BUILD_ORIGIN_UNAVAILABLE",
+      );
+    }
+    const result = await this.transport.GET(
+      PLATFORM_DEVELOPMENT_BACKEND_BUILD_REQUEST_PATH as never,
+      {
+        cache: "no-store",
+        headers: {
+          Authorization: developmentRestartAuthorization(acknowledgementToken),
+          "x-fullmag-ui-origin": window.location.origin,
+        },
+        params: developmentBackendBuildRequestPathParams(requestId),
+        signal: options.signal,
+      } as never,
+    );
+    this.requireApiInstanceCurrent();
+    return readOpenApiResult<DevelopmentBackendBuildRequestResource>(result);
+  }
+
+  private async developmentRestartRequest(
+    requestId: string,
+    acknowledgementToken: string,
+    options: RequestOptions = {},
+  ): Promise<DevelopmentRestartResource> {
+    assertNonEmptyId("development restart request id", requestId);
+    const result = await this.transport.GET(
+      PLATFORM_DEVELOPMENT_RESTART_REQUEST_PATH as never,
+      {
+        cache: "no-store",
+        headers: {
+          Authorization: developmentRestartAuthorization(acknowledgementToken),
+          [DEVELOPMENT_RESTART_STATUS_POLICY_HEADER]:
+            DEVELOPMENT_RESTART_STATUS_POLICY,
+        },
+        params: developmentRestartRequestPathParams(requestId),
+        signal: options.signal,
+      } as never,
+    );
+    // This bearer-only status read is the single authorized way to inspect a
+    // restart after the old API pin has stopped matching the replacement.
+    return readOpenApiResult<DevelopmentRestartResource>(result);
   }
 
   private async requestJson<T>(
@@ -2762,9 +4243,11 @@ export class ControlRoomApi {
   ): Promise<T> {
     const result = await this.transport.GET(path as never, {
       cache: "no-store",
+      headers: sessionScopeHeaders(options),
       params,
       signal: options.signal,
     } as never);
+    this.requireApiInstanceCurrent();
     return readOpenApiResult<T>(result);
   }
 
@@ -2775,9 +4258,11 @@ export class ControlRoomApi {
   ): Promise<T | null> {
     const result = await this.transport.GET(path as never, {
       cache: "no-store",
+      headers: sessionScopeHeaders(options),
       params,
       signal: options.signal,
     } as never);
+    this.requireApiInstanceCurrent();
 
     if (result.response?.status === 204 || result.response?.status === 304) {
       return null;
@@ -2793,9 +4278,11 @@ export class ControlRoomApi {
   ): Promise<PendingJsonResourceResult<T>> {
     const result = await this.transport.GET(path as never, {
       cache: "no-store",
+      headers: sessionScopeHeaders(options),
       params,
       signal: options.signal,
     } as never);
+    this.requireApiInstanceCurrent();
 
     if (result.response?.status === 204) {
       return { data: null, status: "pending" };
@@ -2833,9 +4320,11 @@ export class ControlRoomApi {
     const result = await this.transport.POST(path as never, {
       body,
       cache: "no-store",
+      headers: sessionScopeHeaders(options),
       params,
       signal: options.signal,
     } as never);
+    this.requireApiInstanceCurrent();
     return readOpenApiResult<TResponse>(result);
   }
 
@@ -2848,9 +4337,11 @@ export class ControlRoomApi {
     const result = await this.transport.PATCH(path as never, {
       body,
       cache: "no-store",
+      headers: sessionScopeHeaders(options),
       params,
       signal: options.signal,
     } as never);
+    this.requireApiInstanceCurrent();
     return readOpenApiResult<TResponse>(result);
   }
 
@@ -2863,9 +4354,11 @@ export class ControlRoomApi {
     const result = await this.transport.PATCH(path as never, {
       body,
       cache: "no-store",
+      headers: sessionScopeHeaders(options),
       params,
       signal: options.signal,
     } as never);
+    this.requireApiInstanceCurrent();
     return {
       data: readOpenApiResult<TResponse>(result),
       requestId: result.response.headers.get("x-request-id"),
@@ -2881,9 +4374,11 @@ export class ControlRoomApi {
     const result = await this.transport.PUT(path as never, {
       body,
       cache: "no-store",
+      headers: sessionScopeHeaders(options),
       params,
       signal: options.signal,
     } as never);
+    this.requireApiInstanceCurrent();
     return readOpenApiResult<TResponse>(result);
   }
 
@@ -2894,9 +4389,11 @@ export class ControlRoomApi {
   ): Promise<TResponse> {
     const result = await this.transport.DELETE(path as never, {
       cache: "no-store",
+      headers: sessionScopeHeaders(options),
       params,
       signal: options.signal,
     } as never);
+    this.requireApiInstanceCurrent();
     return readOpenApiResult<TResponse>(result);
   }
 
@@ -2909,9 +4406,11 @@ export class ControlRoomApi {
     const result = await this.transport.DELETE(path as never, {
       body,
       cache: "no-store",
+      headers: sessionScopeHeaders(options),
       params,
       signal: options.signal,
     } as never);
+    this.requireApiInstanceCurrent();
     return readOpenApiResult<TResponse>(result);
   }
 
@@ -2995,6 +4494,7 @@ export class ControlRoomApi {
       options,
       pathParams,
     );
+    this.requireApiInstanceCurrent();
     return {
       byteLength: expectedByteLength,
       data,
@@ -3237,6 +4737,19 @@ export class ControlRoomApi {
       query,
       (response, data) => {
         const metadata = parseFieldVectorResponseMetadata(response.headers);
+        const expectedArtifactGenerationId = query[
+          "expected_artifact_generation_id"
+        ];
+        if (
+          typeof expectedArtifactGenerationId === "string" &&
+          expectedArtifactGenerationId.trim().length > 0 &&
+          metadata.artifactGenerationId !== expectedArtifactGenerationId
+        ) {
+          throw new ControlRoomApiError(
+            "Field vector artifact generation did not match the requested generation.",
+            409,
+          );
+        }
         return {
           ...metadata,
           identityIssues: collectFieldVectorIdentityIssues(data, metadata),
@@ -3319,7 +4832,7 @@ export class ControlRoomApi {
       return;
     }
     throwIfAborted(options.signal);
-    const key = FIELD_MATERIALIZATION_REQUEST_KEY;
+    const key = options.sessionScopeKey ?? FIELD_MATERIALIZATION_REQUEST_KEY;
     const existing = this.fieldMaterializationRequests.get(key);
     if (existing) {
       return existing;
@@ -3346,8 +4859,10 @@ export class ControlRoomApi {
 
   private async meshIsStale(options: RequestOptions = {}): Promise<boolean> {
     throwIfAborted(options.signal);
-    if (this.meshFreshnessRequest) {
-      const stale = await this.meshFreshnessRequest;
+    const key = options.sessionScopeKey ?? FIELD_MATERIALIZATION_REQUEST_KEY;
+    const existing = this.meshFreshnessRequests.get(key);
+    if (existing) {
+      const stale = await existing;
       throwIfAborted(options.signal);
       return stale;
     }
@@ -3355,7 +4870,9 @@ export class ControlRoomApi {
     const request = (async () => {
       try {
         // Do not bind the shared request to one component's abort signal.
-        return (await this.model.geometry.validation()).dirty;
+        return (await this.model.geometry.validation({
+          sessionScopeKey: options.sessionScopeKey,
+        })).dirty;
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") {
           throw error;
@@ -3364,10 +4881,12 @@ export class ControlRoomApi {
         return true;
       }
     })();
-    this.meshFreshnessRequest = request;
+    this.meshFreshnessRequests.set(key, request);
     void request
       .finally(() => {
-        if (this.meshFreshnessRequest === request) this.meshFreshnessRequest = null;
+        if (this.meshFreshnessRequests.get(key) === request) {
+          this.meshFreshnessRequests.delete(key);
+        }
       })
       .catch(() => undefined);
     const stale = await request;
@@ -3445,7 +4964,7 @@ export class ControlRoomApi {
     return measureControlRoomApiPerformance(
       measureBase,
       async () => {
-        const headers: Record<string, string> = {};
+        const headers: Record<string, string> = sessionScopeHeaders(options);
         if (options.etag) {
           headers["if-none-match"] = options.etag;
         }
@@ -3477,7 +4996,7 @@ export class ControlRoomApi {
                   );
                   const resp = await this.executeBinaryOpenApiFetch(input, init);
                   requestState.lastResponse = resp;
-                  return resp;
+                  return boundedBinaryResponse(resp, options.maxResponseBytes);
                 },
                 headers,
                 params: { path: pathParams, query },
@@ -3486,6 +5005,7 @@ export class ControlRoomApi {
               } as never) as unknown as BinaryOpenApiTransportResult,
           );
         } catch (error) {
+          this.requireApiInstanceCurrent();
           const lastResponse = requestState.lastResponse;
           if (lastResponse && !lastResponse.ok) {
             throw new ControlRoomApiError(
@@ -3495,6 +5015,7 @@ export class ControlRoomApi {
           }
           throw error;
         }
+        this.requireApiInstanceCurrent();
         if (!result) {
           throw new ControlRoomApiError("Binary resource request did not return a response", 0);
         }
@@ -3549,8 +5070,10 @@ export class ControlRoomApi {
                     decodeInline: decode,
                     kind: decoderKind,
                     path: requestState.lastRequestPath,
+                    signal: options.signal,
                   }),
           );
+          this.requireApiInstanceCurrent();
         } catch (error) {
           this.requestDiagnostics?.record({
             byteLength,
@@ -3609,32 +5132,70 @@ export class ControlRoomApi {
     input: RequestInfo | URL,
     init: RequestInit | undefined,
   ): Promise<Response> {
-    const request = await normalizeFetchInput(input, init);
-    return this.executeFetchRequest(
-      request.url,
-      request.method,
-      request.init,
-      new Set([204, 304]),
-      true,
-    );
+    const admission = this.admitTransportOperation(input, init);
+    try {
+      const request = await normalizeFetchInput(input, init);
+      return await this.executeFetchRequest(
+        request.url,
+        request.method,
+        request.init,
+        new Set([204, 304]),
+        true,
+        admission.apiInstancePolicy,
+        admission,
+      );
+    } finally {
+      admission.release();
+    }
   }
 
   private async executeOpenApiFetch(
     input: RequestInfo | URL,
     init: RequestInit | undefined,
   ): Promise<Response> {
-    const request = await normalizeFetchInput(input, init);
-    return this.executeFetchRequest(request.url, request.method, request.init);
+    const admission = this.admitTransportOperation(input, init);
+    try {
+      const request = await normalizeFetchInput(input, init);
+      const headers = new Headers(request.init.headers);
+      if (
+        admission.apiInstancePolicy === "token-bound-restart-status"
+      ) {
+        headers.delete(DEVELOPMENT_RESTART_STATUS_POLICY_HEADER);
+        request.init.headers = headers;
+      }
+      return await this.executeFetchRequest(
+        request.url,
+        request.method,
+        request.init,
+        new Set(),
+        false,
+        admission.apiInstancePolicy,
+        admission,
+      );
+    } finally {
+      admission.release();
+    }
   }
 
   private async executeFetchRequest(
     url: string,
     method: string,
     init: RequestInit,
-    acceptedStatuses = new Set<number>(),
-    allowMissingContractVersion = false,
+    acceptedStatuses: Set<number>,
+    allowMissingContractVersion: boolean,
+    apiInstancePolicy: "pinned" | "token-bound-restart-status",
+    admission: DevelopmentTransportAdmission,
   ): Promise<Response> {
+    const enforceApiInstancePin = apiInstancePolicy === "pinned";
+    if (enforceApiInstancePin && this.apiInstanceMismatch) {
+      throw new ControlRoomApiError("API instance changed; reopen Fullmag", 409, null, "API_INSTANCE_MISMATCH");
+    }
     const headers = new Headers(init.headers);
+    if (enforceApiInstancePin && this.expectedApiInstance) {
+      headers.set(API_INSTANCE_HEADER, this.expectedApiInstance);
+    } else if (!enforceApiInstancePin) {
+      headers.delete(API_INSTANCE_HEADER);
+    }
     const requestId = this.requestIdFactory();
     headers.set("x-request-id", requestId);
 
@@ -3645,6 +5206,10 @@ export class ControlRoomApi {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
+        this.assertTransportAdmission(admission);
+        if (enforceApiInstancePin && this.apiInstanceMismatch) {
+          throw new ControlRoomApiError("API instance changed; reopen Fullmag", 409, null, "API_INSTANCE_MISMATCH");
+        }
         this.requestDiagnostics?.record({
           byteLength: byteLengthFromBody(init.body),
           channel: "http",
@@ -3669,6 +5234,11 @@ export class ControlRoomApi {
           method,
         });
 
+        if (enforceApiInstancePin && (this.apiInstanceMismatch || (this.expectedApiInstance && response.headers.get(API_INSTANCE_HEADER) !== this.expectedApiInstance))) {
+          this.apiInstanceMismatch = true;
+          throw new ControlRoomApiError("API instance changed; reopen Fullmag", 409, response.headers.get("x-request-id"), "API_INSTANCE_MISMATCH");
+        }
+
         const contractVersionError = resolveContractVersionError(response, {
           allowMissing: allowMissingContractVersion,
         });
@@ -3681,6 +5251,7 @@ export class ControlRoomApi {
           path,
           response,
         });
+        if (enforceApiInstancePin) this.requireApiInstanceCurrent();
         this.requestDiagnostics?.record({
           byteLength: byteLengthFromHeaders(response.headers),
           channel: "http",
@@ -3859,6 +5430,30 @@ async function normalizeFetchInput(
     method: init?.method ?? "GET",
     url: String(input),
   };
+}
+
+function fetchRequestIdentity(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+): { headers: Headers; method: string; url: string } {
+  if (typeof Request !== "undefined" && input instanceof Request) {
+    return {
+      headers: new Headers(init?.headers ?? input.headers),
+      method: init?.method ?? input.method,
+      url: input.url,
+    };
+  }
+  return {
+    headers: new Headers(init?.headers),
+    method: init?.method ?? "GET",
+    url: String(input),
+  };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function pathFromUrl(url: string): string {

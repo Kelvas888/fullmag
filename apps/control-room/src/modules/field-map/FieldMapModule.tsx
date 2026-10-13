@@ -15,7 +15,9 @@ import {
   usePlanarVectorResource,
 } from "@/kernel/resources/planarFieldResources";
 import { useDomainMetaResource } from "@/kernel/resources/geometryLifecycleResources";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
+import { useSessionScopedResourceKey } from "@/kernel/resources/useSessionScopedResourceKey";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
 import { resolveVisualizationTargetFromSelection } from "@/kernel/visualization/ObjectVisualizationController";
 import {
@@ -49,9 +51,11 @@ import {
   type PlanarRenderEvidence,
 } from "./model/fieldMapEvidence";
 import { PlanarSurface } from "./renderer/PlanarSurface";
+import { useRetainedPlanarFrame } from "./hooks/useRetainedPlanarFrame";
 
 function useFieldMapModuleController() {
   const { layout, visualizationSync } = useKernel();
+  const { resourceKey: sessionFrameKey, sessionIdentity } = useSessionScopedResourceKey("planar-render-frame");
   const [pinned, setPinned] = useState<readonly [number, number] | null>(null);
   const [renderEvidence, setRenderEvidence] =
     useState<PlanarRenderEvidence | null>(null);
@@ -82,7 +86,7 @@ function useFieldMapModuleController() {
   }, [canonicalSourceKind, canonicalSourceMonitorId]);
   const domain = useDomainMetaResource({ enabled: active });
   const runtime = useSessionStatusSelector(
-    (status) => status.data?.domain.discretization ?? null,
+    (status) => resolveSessionDiscretization(status.data),
     { enabled: active },
   );
   const selectedFieldContext = useSelectionSelector((selection) => {
@@ -310,6 +314,10 @@ function useFieldMapModuleController() {
   const planarViewIdentityKey = useMemo(
     () =>
       JSON.stringify({
+        sessionFrameKey,
+        domainGenerationId: domain.data?.generation_id ?? null,
+        defaultSlice: canonicalPlanar?.default_slice ?? null,
+        vectorBudget: canonicalPlanar?.resolution.vector_budget ?? 0,
         component: canonicalPlanar?.component ?? null,
         quality: canonicalPlanar?.quality ?? null,
         quantityId: canonicalPlanar?.quantity_id ?? null,
@@ -324,6 +332,8 @@ function useFieldMapModuleController() {
         viewScope: canonicalPlanar?.view_scope ?? null,
       }),
     [
+      sessionFrameKey,
+      domain.data?.generation_id,
       canonicalPlanar,
       canonicalSourceKind,
       canonicalSourceMonitorId,
@@ -331,35 +341,11 @@ function useFieldMapModuleController() {
       selectedFieldContext.stageId,
     ],
   );
-  const [retainedPlanarFrame, setRetainedPlanarFrame] = useState<{
-    identityKey: string;
-    model: NonNullable<typeof freshRenderModel>;
-  } | null>(null);
-  // Retention affects rendered output, so keep it in React state rather than
-  // reading a mutable ref during render. The identity/model guards converge
-  // after one retry and discard frames when the semantic view changes.
-  if (freshRenderModel) {
-    if (
-      retainedPlanarFrame?.identityKey !== planarViewIdentityKey ||
-      retainedPlanarFrame.model !== freshRenderModel
-    ) {
-      setRetainedPlanarFrame({
-        identityKey: planarViewIdentityKey,
-        model: freshRenderModel,
-      });
-    }
-  } else if (
-    retainedPlanarFrame &&
-    retainedPlanarFrame.identityKey !== planarViewIdentityKey
-  ) {
-    setRetainedPlanarFrame(null);
-  }
-  const renderModel =
-    freshRenderModel ??
-    (retainedPlanarFrame &&
-    retainedPlanarFrame.identityKey === planarViewIdentityKey
-      ? retainedPlanarFrame.model
-      : null);
+  const renderModel = useRetainedPlanarFrame(
+    sessionIdentity === null ? null : planarViewIdentityKey,
+    freshRenderModel,
+    meta.data?.source ? JSON.stringify(meta.data.source) : null,
+  );
   const pinnedAxisState = useMemo(() => {
     if (!renderModel || !probe.data) return null;
     const axisFrame = {
@@ -539,6 +525,9 @@ export default function FieldMapModule() {
   if (!renderModel) {
     return <FieldMapStatus message="Loading planar field…" planarStatus="loading" />;
   }
+  const ambiguousSurfaceMeta = meta.data && surfaceProjectionStatus(meta.data) === "ambiguous"
+    ? meta.data
+    : null;
 
   return (
     <section className="fm-field-map">
@@ -586,10 +575,10 @@ export default function FieldMapModule() {
         <strong>{plan.quantityId}</strong>
         <span>{presentationPlanar.component}</span>
         <span>{renderModel.display.legendUnit}</span>
-        {meta.data && surfaceProjectionStatus(meta.data) === "ambiguous" ? (
+        {ambiguousSurfaceMeta ? (
           <span className="fm-field-map__diagnostic" role="status">
-            Ambiguous surface: {meta.data.overlap_count} overlaps,{" "}
-            {meta.data.fold_count} folds
+            Ambiguous surface: {ambiguousSurfaceMeta.overlap_count} overlaps,{" "}
+            {ambiguousSurfaceMeta.fold_count} folds
           </span>
         ) : null}
       </header>

@@ -74,4 +74,23 @@ describe("ObjectMagneticTexturePanel", () => {
     expect(source).not.toContain("patchRegion(");
     expect(source).not.toContain("patchObject(model.objectId");
   });
+
+  it("records immediate texture writes through the shared authoring history boundary", () => {
+    const objectPanel = readFileSync(
+      new URL("./ObjectMagneticTexturePanel.tsx", import.meta.url),
+      "utf8",
+    );
+    const regionPanel = readFileSync(
+      new URL("./region/ObjectRegionTexturePanel.tsx", import.meta.url),
+      "utf8",
+    );
+
+    for (const source of [objectPanel, regionPanel]) {
+      expect(source).toContain("runAuthoringMutationWithHistory(");
+      expect(source).toContain("authoringHistory");
+    }
+    expect(objectPanel).toContain("base_revision: baseRevision ?? request.base_revision");
+    expect(regionPanel).toContain("const commitRevision = baseRevision ?? request.base_revision;");
+    expect(regionPanel).toContain("base_revision: commitRevision");
+  });
 });

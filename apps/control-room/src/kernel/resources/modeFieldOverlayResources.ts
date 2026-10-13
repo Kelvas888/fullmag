@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import type { FrequencyDomainFieldResource } from "../api/apiTypes";
 import { useKernel } from "../KernelContext";
@@ -11,12 +11,15 @@ import {
   type ModeFieldOverlayIntent,
   type ModeFieldOverlayTopologyIdentity,
   type ResolvedModeFieldOverlayMetadata,
+  modeFieldOverlayArtifactGenerationMatches,
   resolveModeFieldOverlayMetadata,
 } from "../visualization/ModeFieldOverlayIntent";
 import {
   ModeFieldOverlayIntentController,
   type ModeFieldOverlayIntentSnapshot,
 } from "../visualization/ModeFieldOverlayIntentController";
+import { sessionRequestScopeKey } from "./sessionResourceIdentity";
+import { useSessionResourceIdentity } from "./useSessionStatus";
 
 import { useFrequencyDomainEigenModeFieldMetaResource } from "./studyRuntimeResources";
 
@@ -32,6 +35,30 @@ const MODE_FIELD_METADATA_INVALID = new Error(
   "Mode-field metadata is incomplete, stale, or not a global complex XYZ field.",
 );
 
+function modeFieldArtifactGenerationError(
+  metadata: FrequencyDomainFieldResource,
+): Error | null {
+  const generationId =
+    typeof metadata.generation_id === "string" &&
+    metadata.generation_id.trim().length > 0
+      ? metadata.generation_id
+      : null;
+  const status = metadata.generation_status ?? "legacy_unverified";
+  if (status === "member_verified_unbound") {
+    return new Error(
+      "Mode-field artifact is member_verified_unbound and cannot be joined to the viewport.",
+    );
+  }
+  if (
+    (status === "member_verified_owner_bound" && generationId === null) ||
+    (status === "legacy_unverified" && generationId !== null) ||
+    (status !== "member_verified_owner_bound" && status !== "legacy_unverified")
+  ) {
+    return new Error("Mode-field artifact generation identity is incomplete or inconsistent.");
+  }
+  return null;
+}
+
 export function resolveModeFieldOverlayMetadataRevision(
   intent: ModeFieldOverlayIntent,
   metadata: FrequencyDomainFieldResource,
@@ -39,6 +66,8 @@ export function resolveModeFieldOverlayMetadataRevision(
   return JSON.stringify({
     artifactRevision: intent.artifactRevision,
     artifactPath: metadata.artifact_path,
+    artifactGenerationId: metadata.generation_id ?? null,
+    artifactGenerationStatus: metadata.generation_status ?? null,
     contentDigest: metadata.content_digest ?? null,
     metadataRevision: metadata.revision ?? null,
     metadataStatus: metadata.status,
@@ -77,6 +106,17 @@ export function resolveModeFieldOverlayResource(
     };
   }
 
+  const generationError = modeFieldArtifactGenerationError(resource.data);
+  if (generationError) {
+    return {
+      binaryResourceKey: null,
+      error: generationError,
+      metadata: null,
+      metadataStatus: resource.status,
+      status: "error",
+    };
+  }
+
   const metadata = resolveModeFieldOverlayMetadata(
     intent,
     resource.data,
@@ -110,10 +150,11 @@ export function useModeFieldOverlayResource(
   intent: ModeFieldOverlayIntent | null | undefined,
   { enabled = true }: { enabled?: boolean } = {},
 ): ModeFieldOverlayResource {
+  const sessionIdentity = useSessionResourceIdentity();
   const metadataResource = useFrequencyDomainEigenModeFieldMetaResource(
     intent?.sampleIndex,
     intent?.modeIndex,
-    { enabled: enabled && Boolean(intent) },
+    { enabled: enabled && Boolean(intent) && sessionIdentity !== null },
   );
   return useMemo(
     () => resolveModeFieldOverlayResource(intent, metadataResource),
@@ -139,7 +180,9 @@ export function useModeFieldOverlayIntentResource({
   intent: ModeFieldOverlayIntent | null | undefined;
   topology: ModeFieldOverlayTopologyIdentity | null;
 }): ModeFieldOverlayIntentSnapshot {
-  const { api } = useKernel();
+  const { api, diagnosticRecorder } = useKernel();
+  const sessionIdentity = useSessionResourceIdentity();
+  const sessionScope = sessionRequestScopeKey(sessionIdentity);
   const [controller] = useState(() => new ModeFieldOverlayIntentController());
   const subscribe = useCallback(
     (listener: () => void) => controller.subscribe(listener),
@@ -147,9 +190,81 @@ export function useModeFieldOverlayIntentResource({
   );
   const getSnapshot = useCallback(() => controller.getSnapshot(), [controller]);
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const hasIntent = Boolean(intent);
+  const hasSession = Boolean(sessionScope);
+  const hasTopology = topology !== null;
+  const topologyIdentityComplete = Boolean(
+    topology?.domainGenerationId &&
+      topology.meshTopologyHash &&
+      topology.meshTopologyRevision !== null &&
+      Number.isInteger(topology.pointCount) &&
+      topology.pointCount > 0,
+  );
+  const controllerHasError = snapshot.error !== null;
+  const controllerErrorName = snapshot.error?.name
+    ? snapshot.error.name.slice(0, 80)
+    : null;
+  const controllerErrorMessage = snapshot.error?.message?.slice(0, 160) ?? null;
+  const lastDiagnosticRef = useRef<{
+    controllerHasError: boolean;
+    controllerErrorName: string | null;
+    controllerErrorMessage: string | null;
+    controllerStatus: ModeFieldOverlayIntentSnapshot["status"];
+    enabled: boolean;
+    hasIntent: boolean;
+    hasSession: boolean;
+    hasTopology: boolean;
+    topologyIdentityComplete: boolean;
+  } | null>(null);
 
   useEffect(() => {
-    if (!enabled || !intent || !topology) {
+    const next = {
+      controllerHasError,
+      controllerErrorName,
+      controllerErrorMessage,
+      controllerStatus: snapshot.status,
+      enabled,
+      hasIntent,
+      hasSession,
+      hasTopology,
+      topologyIdentityComplete,
+    };
+    const previous = lastDiagnosticRef.current;
+    if (
+      previous &&
+      previous.controllerErrorName === next.controllerErrorName &&
+      previous.controllerErrorMessage === next.controllerErrorMessage &&
+      previous.controllerHasError === next.controllerHasError &&
+      previous.controllerStatus === next.controllerStatus &&
+      previous.enabled === next.enabled &&
+      previous.hasIntent === next.hasIntent &&
+      previous.hasSession === next.hasSession &&
+      previous.hasTopology === next.hasTopology &&
+      previous.topologyIdentityComplete === next.topologyIdentityComplete
+    ) {
+      return;
+    }
+    lastDiagnosticRef.current = next;
+    diagnosticRecorder.mark(
+      "viewport-3d.mode-field-overlay.resource-state",
+      next,
+      "viewport-3d",
+    );
+  }, [
+    controllerErrorName,
+    controllerErrorMessage,
+    controllerHasError,
+    diagnosticRecorder,
+    enabled,
+    hasIntent,
+    hasSession,
+    hasTopology,
+    snapshot.status,
+    topologyIdentityComplete,
+  ]);
+
+  useEffect(() => {
+    if (!enabled || !intent || !topology || !sessionScope) {
       controller.clear();
       return;
     }
@@ -177,7 +292,7 @@ export function useModeFieldOverlayIntentResource({
           const data = await api.analysis.frequencyDomain.eigenModeFieldMeta(
             activeIntent.sampleIndex,
             activeIntent.modeIndex,
-            { signal },
+            { sessionScopeKey: sessionScope, signal },
           );
           return {
             data,
@@ -188,7 +303,7 @@ export function useModeFieldOverlayIntentResource({
           const response = await api.data.fields.vector(
             metadata.fieldId,
             metadata.binaryQuery,
-            { signal },
+            { sessionScopeKey: sessionScope, signal },
           );
           if (response.status !== "ready") {
             throw new Error(
@@ -206,6 +321,16 @@ export function useModeFieldOverlayIntentResource({
               "Analysis result field binary revision failed validation.",
             );
           }
+          if (
+            !modeFieldOverlayArtifactGenerationMatches(
+              metadata,
+              response.responseMetadata.artifactGenerationId,
+            )
+          ) {
+            throw new Error(
+              "Mode-field artifact generation header is missing or does not match its committed member.",
+            );
+          }
           return response.data;
         },
       },
@@ -213,7 +338,7 @@ export function useModeFieldOverlayIntentResource({
     );
 
     return () => controller.clear();
-  }, [api, controller, enabled, intent, topology]);
+  }, [api, controller, enabled, intent, sessionScope, topology]);
 
   return snapshot;
 }

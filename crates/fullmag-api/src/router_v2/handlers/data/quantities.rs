@@ -4,6 +4,7 @@ use axum::{extract::State, Json};
 use std::sync::Arc;
 
 use crate::schemas::quantities::QuantityCatalogResponse;
+use crate::session::relevant_field_materialization_status;
 use crate::types::{AppState, SessionStateResponse};
 use fullmag_quantities::{quantity_spec, QuantitySpec};
 use fullmag_runner::{
@@ -25,22 +26,42 @@ use super::resolved_spatial_field::{
 )]
 pub async fn get_quantities_catalog(
     State(state): State<Arc<AppState>>,
-) -> Json<QuantityCatalogResponse> {
+) -> Result<Json<QuantityCatalogResponse>, crate::error::ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let mut response = QuantityCatalogResponse::build();
     let guard = state.current_live_state.read().await;
-    if let Some(snapshot) = guard.as_ref() {
-        annotate_runtime_quantity_state(&mut response, snapshot);
-    }
-    Json(response)
+    let snapshot = guard
+        .as_ref()
+        .ok_or_else(|| crate::error::ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(
+        snapshot,
+        &request_context,
+        state
+            .current_live_session_epoch
+            .load(std::sync::atomic::Ordering::Acquire),
+    )?;
+    annotate_runtime_quantity_state(&mut response, snapshot);
+    Ok(Json(response))
 }
 
 fn annotate_runtime_quantity_state(
     response: &mut QuantityCatalogResponse,
     snapshot: &SessionStateResponse,
 ) {
-    let Some(_capabilities) = snapshot.capabilities.as_ref() else {
+    let standalone_inspection = snapshot
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("execution_plan"))
+        .and_then(|plan| plan.get("backend_plan"))
+        .and_then(|plan| plan.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("antenna_external_lead_inspection");
+    // An unresolved workspace remains unknown. A resolved nonmagnetic
+    // inspection, however, has no magnetic provider: use the canonical
+    // unavailable capability path even without a magnetic runtime profile.
+    if snapshot.capabilities.is_none() && !standalone_inspection {
         return;
-    };
+    }
 
     for entry in &mut response.quantities {
         let Some(spec) = quantity_spec(&entry.id) else {
@@ -56,28 +77,15 @@ fn annotate_runtime_quantity_state(
         let supported =
             preliminary.provider == fullmag_runner::QuantityProviderCapability::Available;
 
-        let status = snapshot.live_state.as_ref().and_then(|state| {
-            state
-                .latest_step
-                .field_materialization_states
-                .iter()
-                .find(|status| status.quantity == entry.id)
-        });
-        let source_is_present = snapshot.latest_fields.get(&entry.id).is_some()
-            || snapshot.preview_cache.get(&entry.id).is_some()
-            || (entry.id == "m"
-                && snapshot
-                    .live_state
-                    .as_ref()
-                    .and_then(|state| state.latest_step.magnetization.as_ref())
-                    .is_some());
-        let resolved_field = source_is_present
-            .then(|| resolve_current_spatial_field(snapshot, &entry.id, usize::from(spec.n_comp)))
-            .transpose()
-            .ok()
-            .flatten()
-            .flatten()
-            .filter(|field| !field.values.is_empty());
+        let status = relevant_field_materialization_status(snapshot, &entry.id);
+        let resolved_field = resolve_current_spatial_field(
+            snapshot,
+            &entry.id,
+            usize::from(spec.n_comp),
+        )
+        .ok()
+        .flatten()
+        .filter(|field| !field.values.is_empty());
         let has_payload = resolved_field.is_some();
         let unavailable_payload_state = || {
             if supported {
@@ -308,6 +316,45 @@ mod tests {
     }
 
     #[test]
+    fn standalone_without_magnetic_capabilities_resolves_catalog_unavailable() {
+        let mut snapshot = snapshot_with_field_provider("m");
+        snapshot.capabilities = None;
+        snapshot.metadata = Some(serde_json::json!({
+            "execution_plan": { "backend_plan": { "kind": "antenna_external_lead_inspection" } }
+        }));
+        let mut response = QuantityCatalogResponse::build();
+        annotate_runtime_quantity_state(&mut response, &snapshot);
+
+        for entry in &response.quantities {
+            assert_eq!(entry.capability_state, "unsupported", "{}", entry.id);
+            assert_eq!(entry.solver_capability, "unsupported", "{}", entry.id);
+            assert_eq!(entry.materialization_state, "unsupported", "{}", entry.id);
+            assert!(!entry.requestable && !entry.materializable, "{}", entry.id);
+            assert!(!entry.renderable, "{}", entry.id);
+            let resolved = entry.resolved_capability.as_ref().expect("resolved absence");
+            assert_eq!(
+                resolved.provider,
+                crate::schemas::quantities::QuantityProviderCapability::Unavailable
+            );
+            assert_eq!(
+                resolved.request,
+                crate::schemas::quantities::QuantityRequestCapability::Unavailable
+            );
+            assert!(resolved.carriers.is_empty());
+        }
+    }
+
+    #[test]
+    fn unresolved_workspace_catalog_stays_unknown_without_capabilities() {
+        let mut snapshot = snapshot_with_field_provider("m");
+        snapshot.capabilities = None;
+        snapshot.metadata = None;
+        let mut response = QuantityCatalogResponse::build();
+        annotate_runtime_quantity_state(&mut response, &snapshot);
+        assert!(response.quantities.iter().all(|entry| entry.capability_state == "unknown"));
+    }
+
+    #[test]
     fn legal_unmaterialized_quantity_catalog_entry_has_no_carrier() {
         let snapshot = snapshot_with_field_provider("H_demag");
         let mut response = QuantityCatalogResponse::build();
@@ -325,13 +372,14 @@ mod tests {
             .expect("resolved capability");
         assert_eq!(demag.materialization_state, "unmaterialized");
         assert!(resolved.carriers.is_empty());
-        assert!(response.quantities.iter().all(|entry| entry
-            .resolved_capability
-            .as_ref()
-            .is_none_or(|resolved| resolved
-                .carriers
-                .iter()
-                .all(|carrier| !carrier.carrier_id.starts_with("declared:")))));
+        assert!(response.quantities.iter().all(|entry| {
+            entry.resolved_capability.as_ref().is_none_or(|resolved| {
+                resolved
+                    .carriers
+                    .iter()
+                    .all(|carrier| !carrier.carrier_id.starts_with("declared:"))
+            })
+        }));
     }
 
     #[test]

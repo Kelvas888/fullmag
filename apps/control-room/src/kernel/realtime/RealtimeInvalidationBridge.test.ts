@@ -24,7 +24,14 @@ import {
 import { frequencyDomainModeFieldMetaResourceKey } from "../resources/frequencyDomainResourceKeys";
 import {
   ANALYSIS_OBJECT_TOPOLOGICAL_CHARGE_PATH,
+  DATA_ANTENNA_FIELD_SOLUTION_PATH,
+  DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH,
+  DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH,
+  DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH,
+  DATA_ANTENNA_SOURCE_SPECTRUM_PATH,
+  DATA_ARTIFACTS_PATH,
   DATA_DOMAIN_TOPOLOGY_PATH,
+  SESSIONS_PATH,
   DATA_FIELD_AVAILABILITY_PATH,
   DATA_FDM_REGION_MEMBERSHIP_BINARY_PATH,
   DATA_FDM_REGION_MEMBERSHIPS_PATH,
@@ -69,6 +76,7 @@ import {
   MODEL_REGION_DIAGNOSTICS_PATH,
   MODEL_REGIONS_PATH,
   MODEL_SCENE_PATH,
+  SESSION_CURRENT_PATH,
   SIMULATION_COMMANDS_PATH,
   SIMULATION_OBJECT_METRICS_PATH,
   SIMULATION_PREPARATION_PATH,
@@ -82,6 +90,7 @@ import {
   SIMULATION_STAGE_HYSTERESIS_SATURATION_PATH,
   SIMULATION_STAGE_HYSTERESIS_SETTLE_PIPELINE_PATH,
   SIMULATION_STAGES_EXECUTION_PATH,
+  SESSION_STATUS_PATH,
   VISUALIZATION_CLIENT_ACKS_PATH,
   VISUALIZATION_STATE_PATH,
 } from "../api/apiPaths";
@@ -96,6 +105,53 @@ function dependentRevision(resourceKey: string, revision: string | number): stri
 }
 
 describe("RealtimeInvalidationBridge", () => {
+  it("forces HTTP session resources to refetch after a socket reconnect", () => {
+    const bus = new EventBus<KernelEventMap>();
+    const resources = new ResourceInvalidationController(bus);
+    const bridge = new RealtimeInvalidationBridge(resources);
+
+    bridge.handleReconnect();
+
+    expect(resources.getRevision("session:status")).toEqual(
+      expect.stringMatching(/^realtime:reconnect:/),
+    );
+    expect(resources.getRevision(SESSION_STATUS_PATH)).toEqual(
+      expect.stringMatching(/^realtime:reconnect:/),
+    );
+  });
+
+  it("reconciles active-run resources through the session prefix after reconnect", () => {
+    const bus = new EventBus<KernelEventMap>();
+    const resources = new ResourceInvalidationController(bus);
+    const bridge = new RealtimeInvalidationBridge(resources);
+    const activeRunResources = [
+      SIMULATION_RUN_CURRENT_PATH,
+      SIMULATION_STAGES_EXECUTION_PATH,
+      SIMULATION_SOLVER_STATUS_PATH,
+      SIMULATION_COMMANDS_PATH,
+    ];
+    const listeners = activeRunResources.map(() => vi.fn());
+
+    activeRunResources.forEach((resourceKey, index) => {
+      resources.subscribe(resourceKey, listeners[index]!);
+    });
+
+    bridge.handleReconnect();
+
+    const revisions = activeRunResources.map((resourceKey) =>
+      resources.getRevision(resourceKey),
+    );
+    expect(revisions).toHaveLength(activeRunResources.length);
+    expect(revisions.every((revision) =>
+      typeof revision === "string" && revision.startsWith("realtime:reconnect:"),
+    )).toBe(true);
+    listeners.forEach((listener) => {
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener.mock.calls[0]?.[0]).toEqual(revisions[0]);
+    });
+    expect(resources.getRevision(SESSION_CURRENT_PATH)).toBeNull();
+  });
+
   it("invalidates CPU and GPU diagnostic resources exactly", () => {
     const bus = new EventBus<KernelEventMap>();
     const resources = new ResourceInvalidationController(bus);
@@ -251,6 +307,78 @@ describe("RealtimeInvalidationBridge", () => {
     expect(resources.getRevision(ANALYSIS_FREQUENCY_DOMAIN_FMR_PEAKS_PATH)).toBe(
       digest,
     );
+  });
+
+  it("invalidates only antenna result resources when the artifact catalog changes", () => {
+    const bus = new EventBus<KernelEventMap>();
+    const resources = new ResourceInvalidationController(bus);
+    const bridge = new RealtimeInvalidationBridge(resources);
+    const fieldSolutionKey = DATA_ANTENNA_FIELD_SOLUTION_PATH.replace(
+      "{solution_id}",
+      "solution-1",
+    );
+    const sourceSpectrumKey = DATA_ANTENNA_SOURCE_SPECTRUM_PATH.replace(
+      "{output_id}",
+      "spectrum-1",
+    );
+    const stageOutputCatalogKey = DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH.replace(
+      "{stage_id}",
+      "solve-1",
+    );
+    const inspectionKey = "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7|" +
+      DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH.replace("{stage_id}", "solve-1");
+    const inspectionPayloadKey = inspectionKey + "/payloads/magnetic_field?content_digest=sha256%3Aselected#4:record@bytes=0-23";
+    resources.subscribe(fieldSolutionKey, () => {});
+    resources.subscribe(stageOutputCatalogKey, () => {});
+    resources.subscribe(sourceSpectrumKey, () => {});
+    resources.subscribe(inspectionKey, () => {});
+    resources.subscribe(inspectionPayloadKey, () => {});
+    resources.subscribe(DATA_ARTIFACTS_PATH, () => {});
+    resources.subscribe(DATA_DOMAIN_TOPOLOGY_PATH, () => {});
+
+    expect(
+      bridge.handleEvent({
+        payload: {
+          changes: [
+            {
+              recommended_fetch: DATA_ARTIFACTS_PATH,
+              resource: "artifacts",
+              revision: 17,
+            },
+          ],
+        },
+        type: "resource.batch_changed",
+      }),
+    ).toBe(true);
+
+    expect(resources.getRevision(fieldSolutionKey)).toBe(17);
+    expect(resources.getRevision(stageOutputCatalogKey)).toBe(17);
+    expect(resources.getRevision(sourceSpectrumKey)).toBe(17);
+    expect(resources.getRevision(inspectionKey)).toBe(17);
+    expect(resources.getRevision(inspectionPayloadKey)).toBe(17);
+    expect(resources.getRevision(DATA_ARTIFACTS_PATH)).toBe(17);
+    expect(resources.getRevision(DATA_DOMAIN_TOPOLOGY_PATH)).toBeNull();
+  });
+
+  it("invalidates scoped antenna catalogs and inspection payloads when stage execution changes", () => {
+    const bus = new EventBus<KernelEventMap>();
+    const resources = new ResourceInvalidationController(bus);
+    const bridge = new RealtimeInvalidationBridge(resources);
+    const scope = "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7|";
+    const keys = [
+      DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH.replace("{stage_id}", "solve-1"),
+      DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH.replace("{stage_id}", "solve-1"),
+      DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH.replace("{stage_id}", "solve-1")
+        .replace("{payload_kind}", "magnetic_field") + "?content_digest=sha256%3Aselected#4:record",
+    ].map((key) => scope + key);
+    keys.forEach((key) => resources.subscribe(key, () => {}));
+    resources.subscribe(DATA_DOMAIN_TOPOLOGY_PATH, () => {});
+    bridge.handleEvent({
+      payload: { changes: [{ recommended_fetch: SIMULATION_STAGES_EXECUTION_PATH, resource: "stages", revision: 44 }] },
+      type: "resource.batch_changed",
+    });
+    keys.forEach((key) => expect(resources.getRevision(key)).toBe(dependentRevision(SIMULATION_STAGES_EXECUTION_PATH, 44)));
+    expect(resources.getRevision(DATA_DOMAIN_TOPOLOGY_PATH)).toBeNull();
   });
 
   it.each([
@@ -607,6 +735,7 @@ describe("RealtimeInvalidationBridge", () => {
     ).toBe(true);
 
     expect(resources.getRevision("session:status")).toBe("session:session-new:2");
+    expect(resources.getRevision(SESSIONS_PATH)).toBe("session:session-new:2");
     expect(resources.getRevision(SIMULATION_COMMANDS_PATH)).toBe(
       "session:session-new:2",
     );

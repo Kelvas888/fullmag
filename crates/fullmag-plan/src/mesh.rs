@@ -153,6 +153,52 @@ pub(crate) fn build_mesh_parts_from_segments(
         .collect()
 }
 
+/// Build volume ownership for a conductor-only FEM mesh.  Keeping this
+/// separate from `build_mesh_parts_from_segments` prevents an electrical
+/// domain from being mislabeled as magnetic merely because both use a volume
+/// mesh and the same surface-selector machinery.
+pub(crate) fn build_conductor_mesh_parts_from_segments(
+    mesh: &MeshIR,
+    object_segments: &[FemObjectSegmentIR],
+) -> Vec<FemMeshPartIR> {
+    object_segments
+        .iter()
+        .map(|segment| {
+            let bounds = compute_segment_bounds(mesh, segment);
+            let part_identity = segment
+                .geometry_id
+                .as_deref()
+                .unwrap_or(segment.object_id.as_str());
+            FemMeshPartIR {
+                id: format!("conductor:{part_identity}"),
+                label: part_identity.to_string(),
+                role: FemMeshPartRole::Conductor,
+                object_id: Some(segment.object_id.clone()),
+                geometry_id: segment.geometry_id.clone(),
+                material_id: None,
+                element_selector: FemMeshPartSelector::ElementRange {
+                    start: segment.element_start,
+                    count: segment.element_count,
+                },
+                boundary_face_selector: FemMeshPartSelector::BoundaryFaceRange {
+                    start: segment.boundary_face_start,
+                    count: segment.boundary_face_count,
+                },
+                node_selector: FemMeshPartSelector::NodeRange {
+                    start: segment.node_start,
+                    count: segment.node_count,
+                },
+                boundary_face_indices: Vec::new(),
+                node_indices: Vec::new(),
+                facet_global_ordinals: Vec::new(),
+                bounds_min: bounds.map(|(min, _)| min),
+                bounds_max: bounds.map(|(_, max)| max),
+                parent_id: None,
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn compute_segment_bounds(
     mesh: &MeshIR,
     segment: &FemObjectSegmentIR,
@@ -1909,9 +1955,9 @@ pub(crate) fn build_air_box_config(
     {
         if marker != certified_marker {
             return Err(format!(
-                    "air_box_policy.boundary_marker={} does not match certified Gamma_out marker {} in mesh '{}'",
-                    marker, certified_marker, mesh.mesh_name
-                ));
+                "air_box_policy.boundary_marker={} does not match certified Gamma_out marker {} in mesh '{}'",
+                marker, certified_marker, mesh.mesh_name
+            ));
         }
         (marker, "user_policy")
     } else {
@@ -2014,11 +2060,7 @@ pub(crate) fn load_mesh_from_source(source: &str) -> Result<MeshIR, String> {
             let mesh: MeshIR = serde_json::from_str(&payload)
                 .map_err(|err| format!("failed to parse FEM mesh_source '{}': {}", source, err))?;
             validate_mesh_for_execution(&mesh).map_err(|errors| {
-                format!(
-                    "mesh_source '{}' is invalid: {}",
-                    source,
-                    errors.join("; ")
-                )
+                format!("mesh_source '{}' is invalid: {}", source, errors.join("; "))
             })?;
             Ok(mesh)
         }
@@ -2057,8 +2099,7 @@ fn merged_fem_element_markers(mesh: &MeshIR) -> Result<Vec<u32>, String> {
 
     Err(format!(
         "mesh '{}' does not mark magnetic elements with marker=1 and uses multiple element markers {:?}; current multi-body FEM merge baseline cannot infer magnetic ownership safely",
-        mesh.mesh_name,
-        distinct
+        mesh.mesh_name, distinct
     ))
 }
 

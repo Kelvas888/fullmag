@@ -119,6 +119,11 @@ pub(crate) fn create_empty_scene_document(
     if name.is_empty() {
         return Err(ApiError::bad_request("session name must not be empty"));
     }
+    let output_storage = request
+        .output_storage
+        .as_ref()
+        .map(|settings| settings.validated_ir().map_err(ApiError::bad_request))
+        .transpose()?;
     Ok(SceneDocument {
         version: "scene.v2".to_string(),
         revision: 0,
@@ -142,15 +147,22 @@ pub(crate) fn create_empty_scene_document(
         spin_transports: Vec::new(),
         spin_torques: Vec::new(),
         oersted_fields: Vec::new(),
+        antenna_port_modes: Vec::new(),
+        antenna_field_solve_stages: Vec::new(),
+        antenna_target_projections: Vec::new(),
+        solved_antenna_drives: Vec::new(),
+        antenna_spectrum_requests: Vec::new(),
         study: SceneStudyState {
             requested_backend: request.backend.clone(),
             requested_device: request.device.clone(),
             requested_precision: request.precision.clone(),
             requested_mode: "strict".to_string(),
+            output_storage,
             ..Default::default()
         },
         outputs: Default::default(),
         editor: Default::default(),
+        analysis: Default::default(),
     })
 }
 
@@ -181,7 +193,10 @@ fn scratch_snapshot(
         resolved_device: Some(execution.device.clone()),
         resolved_precision: Some(execution.precision.clone()),
         resolved_mode: Some("strict".to_string()),
-        resolved_runtime_family: Some(format!("{}_cpu_reference", execution.backend)),
+        // Scratch authoring publishes a lane capability preview; no executable
+        // runtime has been resolved or launched yet. Keep runtime provenance
+        // empty until the first real resolution instead of inventing a family.
+        resolved_runtime_family: None,
         resolved_engine_id: None,
         resolved_worker: None,
         resolved_cpu_threads: None,
@@ -240,6 +255,7 @@ mod tests {
             device: "cpu".to_string(),
             precision: "double".to_string(),
             replace_current: false,
+            output_storage: None,
         };
 
         let scene = create_empty_scene_document(&request).expect("request must create a scene");
@@ -260,6 +276,7 @@ mod tests {
             device: "cpu".to_string(),
             precision: "double".to_string(),
             replace_current: false,
+            output_storage: None,
         };
         let execution = validated_execution(&request).expect("scratch execution must validate");
         let scene = create_empty_scene_document(&request).expect("scene must be created");
@@ -268,6 +285,9 @@ mod tests {
             .capabilities
             .expect("scratch sessions need a lane capability snapshot before authoring");
 
+        assert_eq!(snapshot.session.resolved_backend.as_deref(), Some("fdm"));
+        assert!(snapshot.session.resolved_runtime_family.is_none());
+        assert!(snapshot.session.resolved_engine_id.is_none());
         assert_eq!(capabilities.engine_id.as_str(), "fdm_cpu_reference");
         assert!(capabilities
             .supported_terms
@@ -283,6 +303,7 @@ mod tests {
             device: "cpu".to_string(),
             precision: "double".to_string(),
             replace_current: false,
+            output_storage: None,
         };
         let execution = validated_execution(&request).expect("scratch execution must validate");
         let scene = create_empty_scene_document(&request).expect("scene must be created");
@@ -291,6 +312,9 @@ mod tests {
             .capabilities
             .expect("FEM scratch sessions need a lane capability snapshot before authoring");
 
+        assert_eq!(snapshot.session.resolved_backend.as_deref(), Some("fem"));
+        assert!(snapshot.session.resolved_runtime_family.is_none());
+        assert!(snapshot.session.resolved_engine_id.is_none());
         assert_eq!(capabilities.engine_id.as_str(), "fem_cpu_native");
         assert!(capabilities
             .supported_terms

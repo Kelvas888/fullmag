@@ -1,16 +1,24 @@
 import type { ModuleManifest } from "@/kernel/types";
 import type { CommandContext } from "@/kernel/commands/commandTypes";
 import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import { DEFAULT_CAMERA_REGISTRY_STATE } from "@/kernel/visualization/CameraRegistryController";
 
 import { viewport3dStore } from "./viewport3dStore";
 import type {
+  Viewport3DDimensionFrameAnnotation,
   Viewport3DDimensionFrameDensity,
   Viewport3DDimensionFrameMode,
   Viewport3DFdmTopographyComponent,
   Viewport3DScaleUnitMode,
 } from "./viewport3dStore";
 import type { Viewport3DVisualProfileId } from "./viewport3dVisualProfile";
+
+function isSavedMaterializedDatasetSelection(context: CommandContext): boolean {
+  const selection = context.selection?.get();
+  return selection?.kind === "results.materialized_dataset" &&
+    selection.ref?.type === "materialized-dataset";
+}
 
 const VISUAL_PROFILE_COMMANDS: Array<{
   id: string;
@@ -62,6 +70,27 @@ const DIMENSION_FRAME_MODE_COMMANDS: Array<{
     id: "viewport-3d.dimension-frame-cage",
     mode: "cage",
     title: "Show 3D Dimension Cage",
+  },
+];
+const DIMENSION_FRAME_ANNOTATION_COMMANDS: Array<{
+  annotation: Viewport3DDimensionFrameAnnotation;
+  id: string;
+  title: string;
+}> = [
+  {
+    annotation: "ticks",
+    id: "viewport-3d.dimension-annotation-ticks",
+    title: "Annotate 3D Frame With Tick Scales",
+  },
+  {
+    annotation: "extents",
+    id: "viewport-3d.dimension-annotation-extents",
+    title: "Annotate 3D Frame With Overall Extents",
+  },
+  {
+    annotation: "both",
+    id: "viewport-3d.dimension-annotation-both",
+    title: "Annotate 3D Frame With Ticks And Extents",
   },
 ];
 const DIMENSION_FRAME_DENSITY_COMMANDS: Array<{
@@ -144,17 +173,18 @@ const FDM_TOPOGRAPHY_COMPONENT_COMMANDS: Array<{
 ];
 
 function fdmTopographyDisabledReason(context: CommandContext): string | null {
-  const status = context.resourceData?.[SESSION_STATUS_RESOURCE_KEY];
-  if (!status || typeof status !== "object" || Array.isArray(status)) {
+  const resource = context.resourceData?.[SESSION_STATUS_RESOURCE_KEY];
+  if (!resource || typeof resource !== "object" || Array.isArray(resource)) {
     return "Session domain capabilities are unavailable.";
   }
-  const record = status as Record<string, unknown>;
-  const domain = record.domain;
+  const resourceRecord = resource as Record<string, unknown>;
+  const record = resourceRecord.data && typeof resourceRecord.data === "object"
+    ? resourceRecord.data as Record<string, unknown>
+    : resourceRecord;
   const capabilities = record.capabilities;
-  const discretization =
-    domain && typeof domain === "object" && !Array.isArray(domain)
-      ? (domain as Record<string, unknown>).discretization
-      : null;
+  const discretization = resolveSessionDiscretization(
+    record as Parameters<typeof resolveSessionDiscretization>[0],
+  );
   const structuredGrid =
     capabilities && typeof capabilities === "object" && !Array.isArray(capabilities)
       ? (capabilities as Record<string, unknown>).structured_grid
@@ -214,7 +244,9 @@ export const viewport3dManifest: ModuleManifest = {
         scope: "viewport",
         run: (context) => {
           viewport3dStore.resetCamera();
-          context.cameraRegistry?.patchCamera(DEFAULT_CAMERA_REGISTRY_STATE);
+          if (!isSavedMaterializedDatasetSelection(context)) {
+            context.cameraRegistry?.patchCamera(DEFAULT_CAMERA_REGISTRY_STATE);
+          }
           return { status: "completed" };
         },
       },
@@ -296,7 +328,9 @@ export const viewport3dManifest: ModuleManifest = {
           // Update the local store immediately so the viewport responds without
           // waiting for the backend round-trip.
           viewport3dStore.setCameraProjection(nextProjection);
-          context.cameraRegistry?.patchCamera({ projection: nextProjection });
+          if (!isSavedMaterializedDatasetSelection(context)) {
+            context.cameraRegistry?.patchCamera({ projection: nextProjection });
+          }
           return { status: "completed" };
         },
       },
@@ -376,6 +410,20 @@ export const viewport3dManifest: ModuleManifest = {
           command.mode,
         run: () => {
           viewport3dStore.setDimensionFrameMode(command.mode);
+          return { status: "completed" as const };
+        },
+      })),
+      ...DIMENSION_FRAME_ANNOTATION_COMMANDS.map((command) => ({
+        id: command.id,
+        title: command.title,
+        group: "viewport-3d",
+        category: "Viewport",
+        scope: "viewport" as const,
+        isActive: () =>
+          viewport3dStore.getSnapshot().widgets.dimensionFrameAnnotation ===
+          command.annotation,
+        run: () => {
+          viewport3dStore.setDimensionFrameAnnotation(command.annotation);
           return { status: "completed" as const };
         },
       })),

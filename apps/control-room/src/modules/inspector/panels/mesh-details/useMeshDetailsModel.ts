@@ -2,11 +2,12 @@
 
 import { restoreMeshHistoryToDraft } from "@/kernel/authoring/meshBuildHistoryRestore";
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 
 import type { JsonObject, LiveStatusResource, MeshSharedDomainManifestResource } from "@/kernel/api/apiTypes";
 import { createCommandContext } from "@/kernel/commands/commandContext";
 import {
+  MESH_CAPABILITIES_RESOURCE_KEY,
   useMeshBuildCurrent,
   useMeshBuildHistoryResource,
   useMeshBuildLatestSuccessful,
@@ -27,8 +28,16 @@ import {
   shouldLoadRuntimeMeshManifest,
   shouldLoadRuntimeMeshSummary,
 } from "@/kernel/resources/studyRuntimeResources";
+import {
+  projectFlatActiveLaneDiscretization,
+  resolveSessionDiscretization,
+} from "@/kernel/resources/sessionDiscretization";
 import { useKernel } from "@/kernel/KernelContext";
-import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
+import type { SessionDiscretizationCapabilitiesProjection } from "@/kernel/resources/sessionDiscretization";
+import {
+  SESSION_STATUS_RESOURCE_KEY,
+  useSessionStatusSelector,
+} from "@/kernel/resources/useSessionStatus";
 import type { ResourceStatus } from "@/kernel/resources/resourceTypes";
 import {
   normalizeMeshPipelineStatus,
@@ -38,6 +47,7 @@ import {
   normalizeMeshBuildHistory,
   type MeshBuildHistoryEntry,
 } from "@/shared/domain/mesh/meshBuildHistory";
+import { resolveMeshBuildFreshness } from "@/shared/domain/mesh/meshBuildFreshness";
 import {
   type MeshPolicyDiffRow,
   diffMeshPolicies,
@@ -88,7 +98,8 @@ export function shouldLoadMeshDetailsFemResources(
 }
 
 type MeshDetailsRuntimeStatus = {
-  capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology">;
+  capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology"> &
+    SessionDiscretizationCapabilitiesProjection;
   domain: Pick<LiveStatusResource["domain"], "discretization">;
   resources: Pick<
     LiveStatusResource["resources"],
@@ -102,6 +113,7 @@ export interface MeshDetailsModel {
   buildHistoryEntries: ReturnType<typeof normalizeMeshBuildHistory>;
   buildMode: unknown;
   buildStatus: string;
+  sharedDomainBuildDisabledReason: string | null;
   capabilitiesData: unknown;
   editorCapabilities: MeshEditorCapabilityModel;
   capabilitiesStatus: string;
@@ -127,6 +139,7 @@ export interface MeshDetailsModel {
   policyDiffRows: MeshPolicyDiffRow[];
   qualityRefinementState: ReturnType<typeof resolveMeshQualityRefinementState>;
   qualityStatistics: ReturnType<typeof normalizeMeshQualityStatistics>;
+  retainedArtifact: RetainedMeshArtifactPresentation | null;
   sceneRevision: number | null;
   semanticLayers: string;
   semanticsData: unknown;
@@ -150,13 +163,33 @@ export interface MeshDetailsModel {
   onSelectWorstElement: (element: MeshWorstElement) => void;
 }
 
+export interface RetainedMeshArtifactPresentation {
+  buildId: string | null;
+  generationId: string | null;
+  meshId: string | null;
+  meshName: string | null;
+  meshRevision: number | null;
+  sourceSceneRevision: number | null;
+  state: "identity-unavailable" | "retained";
+}
+
 function selectMeshDetailsRuntimeStatus(status: {
   data: LiveStatusResource | null;
 }): MeshDetailsRuntimeStatus | null {
   if (!status.data) return null;
+  const sourceCapabilities = status.data.capabilities;
+  const flatLane = projectFlatActiveLaneDiscretization(sourceCapabilities);
+  const hasActiveLane = Object.prototype.hasOwnProperty.call(
+    sourceCapabilities ?? {},
+    "active_lane",
+  );
   return {
     capabilities: {
-      explicit_topology: status.data.capabilities.explicit_topology,
+      explicit_topology: status.data.capabilities?.explicit_topology ?? false,
+      ...(hasActiveLane
+        ? { active_lane: sourceCapabilities?.active_lane ?? null }
+        : {}),
+      ...(flatLane ? { active_lane_discretization: flatLane.value } : {}),
     },
     domain: {
       discretization: status.data.domain.discretization,
@@ -175,6 +208,22 @@ function meshDetailsRuntimeStatusEquals(
   if (previous === next) return true;
   if (!previous || !next) return previous === next;
   return (
+    Object.prototype.hasOwnProperty.call(
+      previous.capabilities,
+      "active_lane",
+    ) === Object.prototype.hasOwnProperty.call(next.capabilities, "active_lane") &&
+    previous.capabilities.active_lane?.resolved?.discretization ===
+      next.capabilities.active_lane?.resolved?.discretization &&
+    Object.prototype.hasOwnProperty.call(
+      previous.capabilities,
+      "active_lane_discretization",
+    ) ===
+      Object.prototype.hasOwnProperty.call(
+        next.capabilities,
+        "active_lane_discretization",
+      ) &&
+    previous.capabilities.active_lane_discretization ===
+      next.capabilities.active_lane_discretization &&
     previous.capabilities.explicit_topology ===
       next.capabilities.explicit_topology &&
     previous.domain.discretization === next.domain.discretization &&
@@ -224,6 +273,55 @@ function firstNumericRevision(...values: unknown[]): number | null {
     if (revision !== null) return revision;
   }
   return null;
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+export function resolveRetainedMeshArtifact({
+  lastBuildError,
+  latestSuccess,
+  manifest,
+  meshRevision,
+}: {
+  lastBuildError: unknown;
+  latestSuccess: unknown;
+  manifest: unknown;
+  meshRevision: unknown;
+}): RetainedMeshArtifactPresentation | null {
+  if (!nonEmptyString(lastBuildError)) return null;
+
+  const success = asRecord(latestSuccess);
+  if (!success) return null;
+
+  const published = asRecord(manifest);
+  const presentation: RetainedMeshArtifactPresentation = {
+    buildId: nonEmptyString(success.build_id),
+    generationId: nonEmptyString(published?.generation_id),
+    meshId: nonEmptyString(published?.mesh_id),
+    meshName:
+      nonEmptyString(published?.mesh_name) ?? nonEmptyString(success.mesh_name),
+    meshRevision: numericRevision(meshRevision),
+    sourceSceneRevision: firstNumericRevision(
+      published?.source_scene_revision,
+      success.source_scene_revision,
+    ),
+    state: "identity-unavailable",
+  };
+  const hasPublishedIdentity =
+    presentation.meshRevision !== null &&
+    Boolean(
+      presentation.meshId ??
+        presentation.generationId ??
+        presentation.meshName,
+    );
+  return {
+    ...presentation,
+    state: hasPublishedIdentity ? "retained" : "identity-unavailable",
+  };
 }
 
 function jsonObject(value: unknown): JsonObject | null {
@@ -325,7 +423,7 @@ export function useMeshDetailsModel(
     selectMeshDetailsRuntimeStatus,
     { isEqual: meshDetailsRuntimeStatusEquals },
   );
-  const lane = resolveMeshDetailsLane(runtimeStatus?.domain.discretization);
+  const lane = resolveMeshDetailsLane(resolveSessionDiscretization(runtimeStatus));
   const femLane = lane === "fem";
   const loadMeshSummary = shouldLoadMeshDetailsFemResources(
     lane,
@@ -420,25 +518,45 @@ export function useMeshDetailsModel(
     recordField(lastBuildGeometryRealization, "source_scene_revision"),
     recordField(activeBuildRecord, "source_scene_revision"),
   );
-  const meshIsStale =
-    sceneRevision !== null &&
-    meshSourceSceneRevision !== null &&
-    meshSourceSceneRevision < sceneRevision;
-  const meshFreshness = meshIsStale
-    ? "stale"
-    : sceneRevision !== null && meshSourceSceneRevision !== null
-      ? "current"
-      : "unknown";
+  const freshnessResult = resolveMeshBuildFreshness({
+    activeBuild: activeBuildRecord,
+    latestBuild: asRecord(lastBuildSummary),
+    manifest: manifest.data as Record<string, unknown> | null | undefined,
+    sceneRevision,
+    statusMeshRevision: summary.data?.revision,
+  });
+  const meshFreshness = freshnessResult.state;
+  const meshIsStale = meshFreshness === "stale";
   const targetCount = Object.keys(
     asRecord(activeBuild.data?.effective_per_object_targets) ?? {},
   ).length;
   const buildContext = useMemo(
     () =>
       createCommandContext("inspector", kernel, {
+        resourceData: {
+          [SESSION_STATUS_RESOURCE_KEY]: runtimeStatus,
+          [MESH_CAPABILITIES_RESOURCE_KEY]: capabilities.data,
+        },
         sourceDetail: "mesh-details",
       }),
-    [kernel],
+    [capabilities.data, kernel, runtimeStatus],
   );
+  const lastBuildError =
+    activeBuild.data?.last_build_error ?? latestBuild.data?.last_build_error;
+  const retainedArtifact = resolveRetainedMeshArtifact({
+    lastBuildError,
+    latestSuccess: latestBuild.data?.last_success,
+    manifest: manifest.data,
+    meshRevision: summary.data?.revision,
+  });
+  const sharedDomainBuildDisabledReason = useMemo(() => {
+    const commandId = "mesh.build-shared-domain";
+    if (kernel.commands.isEnabled(commandId, buildContext)) return null;
+    return (
+      kernel.commands.get(commandId)?.disabledReason?.(buildContext) ??
+      "Command is unavailable."
+    );
+  }, [buildContext, kernel.commands]);
   const selectWorstElement = useCallback(
     (element: MeshWorstElement) => {
       const nodeId = `model:mesh:quality:element:${element.elementIndex}`;
@@ -449,9 +567,12 @@ export function useMeshDetailsModel(
           nodeId,
           objectId: null,
           ref: {
+            artifactId: manifest.data?.mesh_id ?? null,
             centroid: element.centroid,
             elementIndex: element.elementIndex,
+            generationId: manifest.data?.generation_id ?? null,
             kind: "mesh.quality.element",
+            meshRevision: numericRevision(summary.data?.revision),
             metric: "gamma",
             nodeId,
             type: "mesh-quality-element",
@@ -462,7 +583,7 @@ export function useMeshDetailsModel(
       );
       kernel.layout.setActiveTab("mesh");
     },
-    [kernel],
+    [kernel, manifest.data?.generation_id, manifest.data?.mesh_id, summary.data?.revision],
   );
   const selectQualityMetric = useCallback(
     (metric: MeshQualityMetric["id"]) => {
@@ -519,12 +640,26 @@ export function useMeshDetailsModel(
     [kernel],
   );
 
+  useEffect(() => {
+    const currentGenerationId = manifest.data?.generation_id;
+    const currentSelection = kernel.selection.get();
+    if (
+      currentSelection.ref?.type === "mesh-quality-element" &&
+      currentSelection.ref.generationId &&
+      currentGenerationId &&
+      currentSelection.ref.generationId !== currentGenerationId
+    ) {
+      kernel.selection.clear("mesh");
+    }
+  }, [kernel.selection, manifest.data?.generation_id]);
+
   return {
     activeBuildRevision: activeBuild.data?.revision,
     activeBuildStatus: activeBuild.status,
     buildHistoryEntries,
     buildMode: activeBuild.data?.shared_domain_build_report?.build_mode,
     buildStatus,
+    sharedDomainBuildDisabledReason,
     capabilitiesData: capabilities.data,
     editorCapabilities: resolveMeshEditorCapabilities(capabilities.data),
     capabilitiesStatus: capabilities.status,
@@ -534,8 +669,7 @@ export function useMeshDetailsModel(
     lane,
     meshBuildReport: semantics.data?.solver_mesh?.build_report,
     latestSuccessAvailable: Boolean(latestBuild.data?.last_success),
-    lastBuildError:
-      activeBuild.data?.last_build_error ?? latestBuild.data?.last_build_error,
+    lastBuildError,
     manifest: manifest.data,
     manifestStatus: manifest.status,
     meshFreshness,
@@ -566,6 +700,7 @@ export function useMeshDetailsModel(
     }),
     qualityRefinementState,
     qualityStatistics,
+    retainedArtifact,
     sceneRevision,
     semanticLayers: semantics.data?.render_only_controls_do_not_change_solver_domain
       ? "universe / object / shared-domain"

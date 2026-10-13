@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 
 import { SESSION_EVENTS_WS_PATH, VISUALIZATION_STATE_PATH } from "./api/apiPaths";
 import { planarMonitorFramePreviewStore } from "./workspace/planarMonitorFramePreview";
@@ -13,7 +13,7 @@ import {
   createBinaryDecodeScheduler,
   type BinaryDecodeDiagnosticEvent,
 } from "./api/binaryDecodeScheduler";
-import { ControlRoomApi } from "./api/ControlRoomApi";
+import { ControlRoomApi, ControlRoomApiError } from "./api/ControlRoomApi";
 import {
   resolveControlRoomApiBase,
   resolveControlRoomWebSocketUrl,
@@ -25,6 +25,7 @@ import { MAGNETIZATION_TEXTURE_COMMANDS } from "./authoring/magnetization-textur
 import { REGION_COMMANDS } from "./authoring/regionCommandContributions";
 import { createCommandContext } from "./commands/commandContext";
 import { CommandRegistry } from "./commands/CommandRegistry";
+import { createCommandSessionScopeSource } from "./commands/commandSessionScopeSource";
 import {
   dispatchShortcutCommand,
 } from "./commands/commandShortcuts";
@@ -55,6 +56,7 @@ import { RealtimeInvalidationBridge } from "./realtime/RealtimeInvalidationBridg
 import { useSimulationStartupOverlayVisibility } from "./layout/SimulationStartupOverlay";
 import { ResourceInvalidationController } from "./resources/ResourceInvalidationController";
 import { sharedResourceRuntimeStore } from "./resources/ResourceRuntimeStore";
+import { resourceRuntimeKeyForClientScope } from "./resources/resourceClientScope";
 import {
   acquireViewport3DWorkerRuntime,
   getViewport3DWorkerRuntimeSnapshot,
@@ -64,6 +66,10 @@ import {
   createViewport3DInactiveResourcePauseController,
 } from "./resources/inactiveViewportResourcePolicy";
 import { useRuntimeCommandControlResourceData } from "./resources/studyRuntimeResources";
+import { confirmedSessionResourceIdentity, sessionRequestScopeKey, sessionScopedResourceKey, type SessionResourceIdentity } from "./resources/sessionResourceIdentity";
+import { useSessionResourceIdentity } from "./resources/useSessionStatus";
+import { useSessionCollection } from "./resources/useSessionCollection";
+import { isProjectWorkspaceCommand } from "./commands/projectWorkspaceCommandPolicy";
 import { STUDY_RUNTIME_COMMANDS } from "./runtime/studyRuntimeCommandContributions";
 import { SelectionController } from "./selection/SelectionController";
 import type { KernelApi } from "./types";
@@ -72,6 +78,7 @@ import { CameraRegistryController } from "./visualization/CameraRegistryControll
 import { AnalysisFieldOverlayController } from "./visualization/AnalysisFieldOverlayController";
 import { ModeCompositionController } from "./visualization/ModeCompositionController";
 import { ANALYSIS_FIELD_OVERLAY_COMMANDS } from "./visualization/analysisFieldOverlayCommandContributions";
+import { POSTPROCESSING_DEFINITION_COMMANDS } from "./analysis-modules/postprocessingCommandContributions";
 import {
   ObjectVisualizationController,
   type VisualizationTargetPatch,
@@ -81,7 +88,15 @@ import { VisualizationDebugController } from "./visualization/VisualizationDebug
 import { VisualizationRegistrySyncController } from "./visualization/VisualizationRegistrySyncController";
 import { VISUALIZATION_TARGET_COMMANDS } from "./visualization/visualizationCommandContributions";
 import { ObjectMoveToolController } from "./authoring/ObjectMoveToolController";
+import { AuthoringHistoryController } from "./authoring/AuthoringHistoryController";
+import { ObjectEditSessionController } from "./authoring/object-edit/ObjectEditSessionController";
+import type { GeometryObjectDraft } from "./authoring/object-edit/objectEditTypes";
+import { PendingFormRegistry } from "./authoring/PendingFormRegistry";
+import { ProjectDocumentController } from "./persistence/ProjectDocumentController";
+import { RunOutcomeConnector } from "./persistence/RunOutcomeConnector";
 import { resolveControlRoomModules } from "@/modules";
+import { DevelopmentKernelHost, type DevelopmentKernelFactoryOptions } from "./development/DevelopmentKernelHost";
+import { developmentReplacementUrl } from "./api/apiInstancePin";
 
 installPerformanceMeasureGuard();
 
@@ -89,7 +104,7 @@ interface KernelProviderProps {
   children: ReactNode;
 }
 
-function createKernel(): KernelApi {
+function createKernel(options: DevelopmentKernelFactoryOptions, developmentWorkspace: DevelopmentKernelHost): KernelApi {
   const bus = new EventBus<KernelEventMap>();
   const diagnostics = new RequestDiagnosticsController();
   const browserConfig =
@@ -109,29 +124,51 @@ function createKernel(): KernelApi {
     },
   });
   const api = new ControlRoomApi({
-    baseUrl: resolveControlRoomApiBase(),
+    baseUrl: options.baseUrl ?? resolveControlRoomApiBase(),
+    expectedApiInstance: options.expectedApiInstance,
     binaryDecodeScheduler,
     diagnostics,
   });
+  const projectDocument = new ProjectDocumentController(api);
   const commands = new CommandRegistry();
+  commands.attachSessionScopeSource(
+    createCommandSessionScopeSource(
+      sharedResourceRuntimeStore,
+      api.resourceCacheScope,
+    ),
+  );
   commands.attach(bus);
   commands.attachDiagnostics(commandDiagnostics);
 
   const modules = new ModuleRegistry();
   const resources = new ResourceInvalidationController(bus);
+  const authoringHistory = new AuthoringHistoryController(api, resources);
+  const objectEditSession = new ObjectEditSessionController<GeometryObjectDraft>();
+  const pendingForms = new PendingFormRegistry();
+  authoringHistory.subscribe(() => commands.refresh());
+  pendingForms.subscribe(() => commands.refresh());
+  objectEditSession.subscribe(() => commands.refresh());
   const selection = new SelectionController(bus);
   const layout = new LayoutController(bus);
   const objectMoveTool = new ObjectMoveToolController();
   const chartViewportHandoff = new ChartViewportHandoffController();
   bus.on("session:status-changed", ({ status }) => {
-    if (status !== "connected") {
-      chartViewportHandoff.cancel("Session changed while loading a chart field.");
+    if (status === "idle") {
+      chartViewportHandoff.cancel("Session closed.");
+      objectMoveTool.clear();
+      authoringHistory.clear();
+      objectEditSession.clear();
+      pendingForms.clear();
+    } else if (status !== "connected") {
+      chartViewportHandoff.cancel("Session connection interrupted.");
       objectMoveTool.clear();
     }
   });
   const cameraRegistry = new CameraRegistryController({
     api: api.visualization,
+    getSessionScopeKey: () => commands.getSessionScopeKey() ?? null,
   });
+  cameraRegistry.setSessionScopeKey(null);
   const analysisFieldOverlay = new AnalysisFieldOverlayController();
   const modeComposition = new ModeCompositionController({
     getActiveModeComposition: (options) =>
@@ -143,6 +180,7 @@ function createKernel(): KernelApi {
   const visualizationDebug = new VisualizationDebugController();
   const visualizationSync = new VisualizationRegistrySyncController({
     api: api.visualization,
+    resourceCacheScope: api.resourceCacheScope,
     resources,
     onAcknowledgedTargetPatches: (state, _targetIds, transactionIds) =>
       visualization.acknowledgePendingTargetPatches(state, transactionIds),
@@ -178,6 +216,9 @@ function createKernel(): KernelApi {
   for (const cmd of ANALYSIS_FIELD_OVERLAY_COMMANDS) {
     commands.register(cmd);
   }
+  for (const cmd of POSTPROCESSING_DEFINITION_COMMANDS) {
+    commands.register(cmd);
+  }
 
   // Register modules and auto-register their contributed commands.
   for (const manifest of resolveControlRoomModules()) {
@@ -190,8 +231,11 @@ function createKernel(): KernelApi {
   }
 
   return {
+    developmentWorkspace,
     api,
     analysisFieldOverlay,
+    authoringHistory,
+    objectEditSession,
     bus,
     chartViewportHandoff,
     cameraRegistry,
@@ -203,6 +247,8 @@ function createKernel(): KernelApi {
     modeComposition,
     modules,
     objectMoveTool,
+    pendingForms,
+    projectDocument,
     realtime,
     realtimeConnection,
     resources,
@@ -280,9 +326,12 @@ function DiagnosticRecorderConnector({ kernel }: { kernel: KernelApi }) {
   return null;
 }
 
-function RealtimeConnector({ kernel }: { kernel: KernelApi }) {
+function RealtimeConnector({ kernel, sessionIdentity, paused }: { kernel: KernelApi; sessionIdentity: SessionResourceIdentity; paused: boolean }) {
+  const sessionScopeKey = sessionRequestScopeKey(sessionIdentity);
+  const expectedRequestScopeEpoch = sessionIdentity?.requestScopeEpoch ?? null;
+  const expectedSessionId = sessionIdentity?.sessionId ?? null;
   useEffect(() => {
-    if (controlRoomRealtimeDisabledFromBrowser()) {
+    if (paused || !expectedSessionId || !expectedRequestScopeEpoch || controlRoomRealtimeDisabledFromBrowser()) {
       return;
     }
 
@@ -300,9 +349,29 @@ function RealtimeConnector({ kernel }: { kernel: KernelApi }) {
     }
 
     const client = new RealtimeClient({
+      beforeConnect: kernel.api.getExpectedApiInstance() ? async () => {
+        try {
+          await kernel.api.platform.health({ signal: AbortSignal.timeout(3000) });
+          return true;
+        } catch (error) {
+          if (error instanceof ControlRoomApiError && error.code === "API_INSTANCE_MISMATCH") return false;
+          throw error;
+        }
+      } : undefined,
       bridge: kernel.realtime,
       diagnostics: kernel.diagnostics,
+      expectedRequestScopeEpoch,
+      expectedSessionId,
+      expectedApiInstance: kernel.api.getExpectedApiInstance(),
+      onReconnected: () => {
+        kernel.realtime.handleReconnect();
+      },
+      onScopeMismatch: () => {
+        kernel.realtime.handleReconnect();
+      },
       onStatusChange: (status) => {
+        const host = kernel.developmentWorkspace?.getSnapshot();
+        if (host && (host.paused || host.kernel !== kernel)) return;
         kernel.realtimeConnection.update(status);
         kernel.bus.emit("session:status-changed", { status });
       },
@@ -310,7 +379,7 @@ function RealtimeConnector({ kernel }: { kernel: KernelApi }) {
     });
     client.connect();
     return () => client.close();
-  }, [kernel]);
+  }, [kernel, sessionScopeKey, expectedRequestScopeEpoch, expectedSessionId, paused]);
 
   return null;
 }
@@ -322,8 +391,10 @@ function controlRoomRealtimeDisabledFromBrowser(): boolean {
   return auditWindow.__FULLMAG_CONFIG__?.disableRealtime === true;
 }
 
-function CommandShortcutConnector({ kernel }: { kernel: KernelApi }) {
+function CommandShortcutConnector({ kernel, paused }: { kernel: KernelApi; paused: boolean }) {
   const startupVisible = useSimulationStartupOverlayVisibility();
+  const sessionIdentity = useSessionResourceIdentity();
+  const sessionScopeKey = sessionRequestScopeKey(sessionIdentity);
   const runtimeResourceData = useRuntimeCommandControlResourceData({
     enabled: !startupVisible,
   });
@@ -334,13 +405,15 @@ function CommandShortcutConnector({ kernel }: { kernel: KernelApi }) {
   }, [runtimeResourceData]);
 
   useEffect(() => {
-    if (startupVisible) {
+    if (startupVisible || paused) {
       return;
     }
 
     function handleKeyDown(event: KeyboardEvent): void {
+      if (kernel.developmentWorkspace?.getSnapshot().paused) return;
       const context = createCommandContext("shortcut", kernel, {
         resourceData: runtimeResourceDataRef.current,
+        sessionScopeKey,
         sourceDetail: "global",
       });
       dispatchShortcutCommand(kernel.commands, event, context);
@@ -348,35 +421,118 @@ function CommandShortcutConnector({ kernel }: { kernel: KernelApi }) {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [kernel, startupVisible]);
+  }, [kernel, sessionScopeKey, startupVisible, paused]);
 
   return null;
 }
 
-function VisualizationRegistrySyncConnector({ kernel }: { kernel: KernelApi }) {
+function ProjectWorkspaceShortcutConnector({
+  kernel,
+  canCreateSession,
+  paused,
+}: {
+  kernel: KernelApi;
+  canCreateSession: boolean;
+  paused: boolean;
+}) {
   useEffect(() => {
-    kernel.visualizationSync.start();
+    if (paused) return;
+    const commands = {
+      all: () => kernel.commands.all().filter((command) =>
+        isProjectWorkspaceCommand(command.id) &&
+        (canCreateSession || command.id !== "workspace.new-problem")),
+      isEnabled: (id: string, context: Parameters<typeof kernel.commands.isEnabled>[1]) => kernel.commands.isEnabled(id, context),
+      execute: (id: string, context: Parameters<typeof kernel.commands.execute>[1]) => kernel.commands.execute(id, context),
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (kernel.developmentWorkspace?.getSnapshot().paused) return;
+      dispatchShortcutCommand(commands, event, createCommandContext("shortcut", kernel, {
+        sessionScopeKey: null,
+        sourceDetail: "project-workspace",
+      }));
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [kernel, canCreateSession, paused]);
+  return null;
+}
+
+function SessionRuntimeConnectors({ kernel, paused }: { kernel: KernelApi; paused: boolean }) {
+  const sessions = useSessionCollection();
+  if (sessions.state !== "ready") {
+    return <ProjectWorkspaceShortcutConnector kernel={kernel} paused={paused} canCreateSession={sessions.state === "no-session"} />;
+  }
+  return <AvailableSessionRuntimeConnectors kernel={kernel} paused={paused} collection={sessions.resource.data} />;
+}
+
+function AvailableSessionRuntimeConnectors({ kernel, collection, paused }: {
+  kernel: KernelApi;
+  paused: boolean;
+  collection: ReturnType<typeof useSessionCollection>["resource"]["data"];
+}) {
+  const identity = useSessionResourceIdentity();
+  const confirmedIdentity = confirmedSessionResourceIdentity(identity, collection);
+  const scopeKey = sessionRequestScopeKey(confirmedIdentity);
+  useLayoutEffect(() => {
+    const clearRuntimeSelection = () => {
+      if (kernel.selection.get().ref?.type !== "materialized-dataset") kernel.selection.clearForSessionTransition("workspace");
+    };
+    clearRuntimeSelection();
+    return clearRuntimeSelection;
+  }, [kernel, scopeKey]);
+  if (!confirmedIdentity) return null;
+  return (
+    <>
+      <RealtimeConnector kernel={kernel} paused={paused} sessionIdentity={confirmedIdentity} />
+      <CommandShortcutConnector kernel={kernel} paused={paused} />
+      <VisualizationRegistrySyncConnector kernel={kernel} paused={paused} />
+      <CameraRegistrySyncConnector kernel={kernel} paused={paused} sessionScopeKey={scopeKey!} />
+      <RunOutcomeConnector kernel={kernel} sessionIdentity={confirmedIdentity} paused={paused} />
+    </>
+  );
+}
+
+function VisualizationRegistrySyncConnector({ kernel, paused }: { kernel: KernelApi; paused: boolean }) {
+  useEffect(() => {
+    if (!paused) kernel.visualizationSync.start();
     return () => kernel.visualizationSync.stop();
-  }, [kernel]);
+  }, [kernel, paused]);
 
   return null;
 }
 
-function CameraRegistrySyncConnector({ kernel }: { kernel: KernelApi }) {
+function CameraRegistrySyncConnector({ kernel, sessionScopeKey, paused }: { kernel: KernelApi; sessionScopeKey: string; paused: boolean }) {
   useEffect(() => {
-    kernel.cameraRegistry.start();
+    kernel.cameraRegistry.setSessionScopeKey(sessionScopeKey);
+    return () => { kernel.cameraRegistry.stop(); kernel.cameraRegistry.setSessionScopeKey(null); };
+  }, [kernel, sessionScopeKey]);
+  useEffect(() => {
+    if (!paused) kernel.cameraRegistry.start();
     return () => kernel.cameraRegistry.stop();
-  }, [kernel]);
+  }, [kernel, sessionScopeKey, paused]);
 
   return null;
 }
 
 function BrowserAuditConnector({ kernel }: { kernel: KernelApi }) {
+  const sessionIdentity = useSessionResourceIdentity();
+  const sessionIdentityRef = useRef(sessionIdentity);
+  useEffect(() => {
+    sessionIdentityRef.current = sessionIdentity;
+  }, [sessionIdentity]);
   useEffect(() => {
     // The browser driver is compiled only into the explicitly named audit
     // artifact. Ordinary production bundles never install this mutable hook.
     const auditBuild = process.env.NEXT_PUBLIC_AUDIT_BUILD === "1";
     if (process.env.NODE_ENV === "production" && !auditBuild) return;
+    // Audit drivers address resources by their canonical path; the store keys
+    // them by the confirmed session scope.
+    const auditScopedResourceKey = (resourceKey: string) => {
+      const identity = sessionIdentityRef.current;
+      return identity && !resourceKey.includes("|")
+        ? sessionScopedResourceKey(identity, resourceKey)
+        : resourceKey;
+    };
     const auditWindow = window as Window & {
       __FULLMAG_CONFIG__?: {
         allowMissingSessionSmoke?: boolean;
@@ -541,20 +697,37 @@ function BrowserAuditConnector({ kernel }: { kernel: KernelApi }) {
       readActiveViewportModule: () =>
         kernel.layout.get().activeViewportMainModuleId,
       publishVisualizationState: (state: VisualizationStateResource) => {
+        // Runtime resources are keyed by the confirmed session scope; an
+        // unscoped publication would never reach the mounted viewport.
+        const identity = sessionIdentityRef.current;
+        if (!identity) {
+          throw new Error("Browser audit publication requires a confirmed session identity.");
+        }
         sharedResourceRuntimeStore.updateData(
-          VISUALIZATION_STATE_PATH,
+          resourceRuntimeKeyForClientScope(
+            sessionScopedResourceKey(identity, VISUALIZATION_STATE_PATH),
+            kernel.api.resourceCacheScope,
+          ),
           state,
           state.revision,
         );
       },
-      readViewportAuditRuntime: () => ({
-        listenerCounts: sharedResourceRuntimeStore.listenerCounts(),
-        resources: sharedResourceRuntimeStore.stats(),
-        visualizationRevision: sharedResourceRuntimeStore.getSnapshot(
-          VISUALIZATION_STATE_PATH,
-        ).revision,
-        workers: getViewport3DWorkerRuntimeSnapshot(),
-      }),
+      readViewportAuditRuntime: () => {
+        const identity = sessionIdentityRef.current;
+        return {
+          listenerCounts: sharedResourceRuntimeStore.listenerCounts(),
+          resources: sharedResourceRuntimeStore.stats(),
+          visualizationRevision: identity
+            ? sharedResourceRuntimeStore.getSnapshot(
+                resourceRuntimeKeyForClientScope(
+                  sessionScopedResourceKey(identity, VISUALIZATION_STATE_PATH),
+                  kernel.api.resourceCacheScope,
+                ),
+              ).revision
+            : null,
+          workers: getViewport3DWorkerRuntimeSnapshot(),
+        };
+      },
       setPlanarMonitorFrameVisible: (visible: boolean) => {
         planarMonitorFramePreviewStore.setVisible(visible);
       },
@@ -572,7 +745,12 @@ function BrowserAuditConnector({ kernel }: { kernel: KernelApi }) {
         });
       },
       readViewportAuditResource: (resourceKey: string) => {
-        const snapshot = sharedResourceRuntimeStore.getSnapshot(resourceKey);
+        const snapshot = sharedResourceRuntimeStore.getSnapshot(
+          resourceRuntimeKeyForClientScope(
+            auditScopedResourceKey(resourceKey),
+            kernel.api.resourceCacheScope,
+          ),
+        );
         return {
           data: snapshot.data,
           error: snapshot.error?.message ?? null,
@@ -581,11 +759,17 @@ function BrowserAuditConnector({ kernel }: { kernel: KernelApi }) {
         };
       },
       invalidateResource: (resourceKey: string, revision: ResourceRevision) => {
-        kernel.resources.invalidate(resourceKey, revision);
+        kernel.resources.invalidate(auditScopedResourceKey(resourceKey), revision);
       },
       injectViewportAuditListenerLeak: () => {
         // Deliberately retained only when an audit asks for a negative control.
-        sharedResourceRuntimeStore.subscribe(VISUALIZATION_STATE_PATH, () => {});
+        sharedResourceRuntimeStore.subscribe(
+          resourceRuntimeKeyForClientScope(
+            VISUALIZATION_STATE_PATH,
+            kernel.api.resourceCacheScope,
+          ),
+          () => {},
+        );
       },
       injectViewportAuditWorkerLeak: () => {
         // Deliberately retained only when an audit asks for a negative control.
@@ -643,14 +827,18 @@ function Viewport3DResourceLifecycleConnector({
 }
 
 export function KernelProvider({ children }: KernelProviderProps) {
-  const kernel = useMemo(() => createKernel(), []);
+  const [host] = useState(() => new DevelopmentKernelHost(createKernel));
+  const { kernel, generation, paused } = useSyncExternalStore(host.subscribe, host.getSnapshot, host.getSnapshot);
+  useEffect(() => {
+    host.confirmMounted(kernel, (previous, replacement) => {
+      const url = developmentReplacementUrl(window.location.href, previous.api.getExpectedApiInstance(), replacement.api.getExpectedApiInstance());
+      window.history.replaceState(window.history.state, "", url);
+    });
+  }, [host, kernel]);
 
   return (
-    <KernelContext.Provider value={kernel}>
-      <RealtimeConnector kernel={kernel} />
-      <CommandShortcutConnector kernel={kernel} />
-      <VisualizationRegistrySyncConnector kernel={kernel} />
-      <CameraRegistrySyncConnector kernel={kernel} />
+    <KernelContext.Provider key={generation} value={kernel}>
+      <SessionRuntimeConnectors kernel={kernel} paused={paused} />
       <BrowserAuditConnector kernel={kernel} />
       <DiagnosticRecorderConnector kernel={kernel} />
       <PerformanceDiagnosticsConnector kernel={kernel} />

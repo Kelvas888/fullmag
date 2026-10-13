@@ -16,13 +16,28 @@ import {
   MESHING_SEMANTICS_PATH,
   MESHING_SUMMARY_PATH,
   MODEL_GEOMETRY_CAPABILITIES_PATH,
+  MODEL_GEOMETRY_DIAGNOSTICS_PATH,
+  MODEL_GEOMETRY_REALIZATION_CURRENT_PATH,
   MODEL_GEOMETRY_VALIDATION_PATH,
   MODEL_READINESS_PATH,
+  MODEL_REALIZED_REGIONS_PATH,
+  MODEL_REGION_DIAGNOSTICS_PATH,
   MODEL_SCENE_PATH,
+  MODEL_UNIVERSE_PATH,
+  SIMULATION_COMMANDS_PATH,
+  SIMULATION_PREPARATION_PATH,
 } from "../api/apiPaths";
-import type { JsonObject, JsonValue, MeshCapabilitiesResource } from "../api/apiTypes";
+import type {
+  AuthoringTransactionRequest,
+  JsonObject,
+  JsonValue,
+  LiveStatusResource,
+  MeshCapabilitiesResource,
+  RequestOptions,
+} from "../api/apiTypes";
 import type { CommandDetailResource, StructuredCommandRequest } from "../api/apiTypes";
 import type { CommandContext, CommandContribution, CommandResult } from "../commands/commandTypes";
+import { assertCurrentSessionScope, obsoleteSessionResult } from "../commands/commandSessionScope";
 import type { Selection } from "../selection/selectionTypes";
 import {
   meshEditorCapabilityBlocks,
@@ -39,8 +54,38 @@ import {
   deleteObjectTransaction,
 } from "./geometryLifecycleCommands";
 import { invalidateAuthoringMutationDependents } from "./authoringMutationInvalidation";
+import {
+  captureAuthoringHistoryWorkspaceState,
+  prepareAuthoringMutation,
+  recordAuthoringMutationHistory,
+} from "./authoringHistoryMutation";
 import { awaitMeshBuildConfirmation, type MeshBuildConfirmCommandId } from "./meshBuildConfirmation";
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
+import {
+  resolveActiveLaneOperation,
+} from "../resources/useActiveLaneCapabilities";
+import { resolveSessionAuthoringDiscretization } from "../resources/sessionDiscretization";
+
+function deleteObjectBlockedReason(context: CommandContext, ignoreReservation = false): string | null {
+  const controller = context.objectEditSession;
+  const scope = context.sessionScopeKey ?? null;
+  if (controller) {
+    if (!scope) return "Wait for the current project session before deleting.";
+    if (!ignoreReservation && controller.hasPendingWrite(scope)) {
+      return "Wait for the pending scene change before deleting.";
+    }
+    if (controller.hasActiveGesture(scope)) return "Finish the active move before deleting.";
+    const draft = controller.getSnapshot();
+    if (draft.identity?.sessionScopeKey === scope && draft.dirty) {
+      return "Apply or revert geometry changes before deleting.";
+    }
+  }
+  const forms = context.pendingForms?.getTransitionSnapshot();
+  if (forms && (forms.applyingOwnerCount > 0 || forms.dirtyOwnerCount > 0 || forms.guarded || forms.preparing)) {
+    return "Apply or revert Inspector changes before deleting.";
+  }
+  return null;
+}
 
 type JsonRecord = Record<string, unknown>;
 
@@ -58,11 +103,148 @@ function resourceData(context: CommandContext, resourceKey: string): unknown {
   return context.resourceData?.[resourceKey] ?? null;
 }
 
+function sessionRequestOptions(
+  context: CommandContext,
+): RequestOptions | undefined {
+  return context.sessionScopeKey
+    ? { sessionScopeKey: context.sessionScopeKey }
+    : undefined;
+}
+
 function sceneBaseRevision(context: CommandContext): number | null {
-  const revision = asRecord(resourceData(context, MODEL_SCENE_PATH))?.revision;
-  return typeof revision === "number" && Number.isFinite(revision)
+  const scene = asRecord(resourceData(context, MODEL_SCENE_PATH));
+  const revision = scene?.revision ?? scene?.scene_revision;
+  return typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0
     ? revision
     : null;
+}
+
+function sceneDocumentRevision(scene: unknown): number | null {
+  const revision = asRecord(scene)?.revision;
+  return typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0
+    ? revision
+    : null;
+}
+
+function geometryRealizationDisabledReason(
+  context: CommandContext,
+): string | null {
+  if (!context.api) return "Control-room API is unavailable.";
+  return sceneBaseRevision(context) === null
+    ? "The canonical scene revision is unavailable. Refetch the scene before building geometry."
+    : null;
+}
+
+function geometryValidationDisabledReason(
+  context: CommandContext,
+): string | null {
+  if (!context.api) return "Control-room API is unavailable.";
+  return sceneBaseRevision(context) === null
+    ? "The canonical scene revision is unavailable. Refetch the scene before validating geometry."
+    : null;
+}
+
+function invalidateGeometryRealizationResources(
+  context: CommandContext,
+  revision: number,
+): void {
+  for (const resourceKey of [
+    MODEL_GEOMETRY_REALIZATION_CURRENT_PATH,
+    MODEL_REALIZED_REGIONS_PATH,
+    MODEL_REGION_DIAGNOSTICS_PATH,
+    MODEL_UNIVERSE_PATH,
+    MODEL_READINESS_PATH,
+  ]) {
+    context.resources?.invalidate(resourceKey, revision);
+  }
+}
+
+async function runGeometryRealization(
+  context: CommandContext,
+): Promise<CommandResult> {
+  const obsolete = obsoleteSessionResult(context);
+  if (obsolete) return obsolete;
+  const disabledReason = geometryRealizationDisabledReason(context);
+  if (disabledReason) return { message: disabledReason, status: "failed" };
+
+  const sceneRevision = sceneBaseRevision(context);
+  if (sceneRevision === null || !context.api) {
+    return {
+      message:
+        disabledReason ??
+        "The canonical scene revision is unavailable. Refetch the scene before building geometry.",
+      status: "failed",
+    };
+  }
+
+  const requestOptions = sessionRequestOptions(context);
+  const realization = requestOptions
+    ? await context.api.model.geometry.realize({}, requestOptions)
+    : await context.api.model.geometry.realize({});
+  const obsoleteAfterRealization = obsoleteSessionResult(context);
+  if (obsoleteAfterRealization) return obsoleteAfterRealization;
+  if (realization.source_scene_revision !== sceneRevision) {
+    return {
+      message: `Geometry realization is stale: source scene revision ${realization.source_scene_revision} does not match current scene revision ${sceneRevision}. Refetch the scene before using it.`,
+      status: "failed",
+    };
+  }
+  if (
+    typeof realization.realization_revision !== "number" ||
+    !Number.isFinite(realization.realization_revision)
+  ) {
+    return {
+      message: "Geometry realization did not publish a finite realization revision.",
+      status: "failed",
+    };
+  }
+
+  invalidateGeometryRealizationResources(
+    context,
+    realization.realization_revision,
+  );
+  return { message: "Geometry realization completed.", status: "completed" };
+}
+
+async function runGeometryValidation(
+  context: CommandContext,
+): Promise<CommandResult> {
+  const obsolete = obsoleteSessionResult(context);
+  if (obsolete) return obsolete;
+  const disabledReason = geometryValidationDisabledReason(context);
+  if (disabledReason) return { message: disabledReason, status: "failed" };
+
+  const sceneRevision = sceneBaseRevision(context);
+  if (sceneRevision === null || !context.api) {
+    return {
+      message:
+        disabledReason ??
+        "The canonical scene revision is unavailable. Refetch the scene before validating geometry.",
+      status: "failed",
+    };
+  }
+
+  const requestOptions = sessionRequestOptions(context);
+  const validation = requestOptions
+    ? await context.api.model.geometry.validation(requestOptions)
+    : await context.api.model.geometry.validation();
+  const obsoleteAfterValidation = obsoleteSessionResult(context);
+  if (obsoleteAfterValidation) return obsoleteAfterValidation;
+  if (validation.scene_revision !== sceneRevision) {
+    return {
+      message: `Geometry validation is stale: source scene revision ${validation.scene_revision} does not match current scene revision ${sceneRevision}. Refetch the scene before using it.`,
+      status: "failed",
+    };
+  }
+
+  for (const resourceKey of [
+    MODEL_GEOMETRY_VALIDATION_PATH,
+    MODEL_GEOMETRY_DIAGNOSTICS_PATH,
+    MODEL_READINESS_PATH,
+  ]) {
+    context.resources?.invalidate(resourceKey, validation.scene_revision);
+  }
+  return { message: "Geometry validation completed.", status: "completed" };
 }
 
 export type MeshCommandLane = "fdm" | "fem" | "unknown";
@@ -71,7 +253,7 @@ export const FDM_MESH_COMMAND_NOT_APPLICABLE_REASON =
   "FEM mesh commands are not applicable to an FDM structured-grid session.";
 
 export const UNKNOWN_MESH_COMMAND_LANE_REASON =
-  "Session discretization is unresolved; FEM mesh commands remain unavailable until an explicit FEM lane is published.";
+  "Choose FEM or FDM in Study settings. If a method is already selected, review session diagnostics before building a mesh.";
 
 /**
  * Resolve the current command lane from the session-status resource only.
@@ -89,14 +271,36 @@ export function resolveMeshCommandLane(
 
 function meshCommandLane(context: CommandContext): MeshCommandLane {
   const status = asRecord(resourceData(context, SESSION_STATUS_RESOURCE_KEY));
-  return resolveMeshCommandLane(asRecord(status?.domain)?.discretization);
+  const payload = asRecord(status?.data ?? status);
+  return resolveMeshCommandLane(resolveSessionAuthoringDiscretization(payload));
 }
 
 function femMeshCommandDisabledReason(context: CommandContext): string | null {
   const lane = meshCommandLane(context);
   if (lane === "fdm") return FDM_MESH_COMMAND_NOT_APPLICABLE_REASON;
   if (lane === "unknown") return UNKNOWN_MESH_COMMAND_LANE_REASON;
-  return null;
+  const status = resourceData(context, SESSION_STATUS_RESOURCE_KEY) as LiveStatusResource | null;
+  const operation = resolveActiveLaneOperation(status?.capabilities?.active_lane ?? null, "shared_mesh_build");
+  return operation.enabled ? null : operation.reason;
+}
+
+export const FEM_GRID_COMMAND_NOT_APPLICABLE_REASON =
+  "Build Grid is only applicable to an FDM structured-grid session.";
+
+export const UNKNOWN_GRID_COMMAND_LANE_REASON =
+  "Choose FDM in Study settings to build a structured grid. If FDM is already selected, review session diagnostics.";
+
+function fdmGridBuildDisabledReason(context: CommandContext): string | null {
+  if (!context.api) return "Control-room API is unavailable.";
+  const lane = meshCommandLane(context);
+  if (lane === "fem") return FEM_GRID_COMMAND_NOT_APPLICABLE_REASON;
+  if (lane === "unknown") return UNKNOWN_GRID_COMMAND_LANE_REASON;
+  const status = resourceData(context, SESSION_STATUS_RESOURCE_KEY) as LiveStatusResource | null;
+  const operation = resolveActiveLaneOperation(status?.capabilities?.active_lane ?? null, "grid_build");
+  if (!operation.enabled) return operation.reason;
+  return sceneBaseRevision(context) === null
+    ? "The canonical scene revision is unavailable. Refetch the scene before building the grid."
+    : null;
 }
 
 function selectedObjectId(context: Pick<CommandContext, "selection">): string | null {
@@ -223,7 +427,7 @@ function isObjectMeshBuildRunning(
   context: CommandContext,
   objectId: string,
 ): boolean {
-  if (context.api && meshBuildOperations.has(context.api.commands)) return false;
+  if (context.api && currentMeshOperation(context)) return false;
   const activeBuild = resourceData(context, MESHING_BUILDS_CURRENT_PATH);
   const runningStatuses = new Set(["building", "pending", "queued", "running"]);
 
@@ -257,7 +461,7 @@ function isObjectMeshBuildRunning(
 }
 
 function isSharedDomainMeshBuildRunning(context: CommandContext): boolean {
-  if (context.api && meshBuildOperations.has(context.api.commands)) return false;
+  if (context.api && currentMeshOperation(context)) return false;
   const activeBuild = resourceData(context, MESHING_BUILDS_CURRENT_PATH);
   const runningStatuses = new Set(["building", "pending", "queued", "running"]);
 
@@ -353,12 +557,14 @@ function invalidateObjectMeshResources(
   objectId: string,
   revision: string | number,
 ): void {
+  context.resources?.invalidate(MESHING_BUILDS_PATH, revision);
   context.resources?.invalidate(MESHING_BUILDS_CURRENT_PATH, revision);
   context.resources?.invalidate(MODEL_READINESS_PATH, revision);
   context.resources?.invalidate(MESHING_SUMMARY_PATH, revision);
   context.resources?.invalidate(MESHING_SEMANTICS_PATH, revision);
   context.resources?.invalidate(MESHING_BUILDS_LATEST_SUCCESSFUL_PATH, revision);
   context.resources?.invalidate(MESHING_SHARED_DOMAIN_MANIFEST_PATH, revision);
+  context.resources?.invalidate(SIMULATION_PREPARATION_PATH, `mesh:${revision}`);
   context.resources?.invalidate(
     objectResourceKey(MESHING_OBJECT_TOPOLOGY_PATH, objectId),
     revision,
@@ -384,6 +590,7 @@ function invalidateSharedDomainMeshResources(
   context.resources?.invalidate(MESHING_BUILDS_CURRENT_PATH, revision);
   context.resources?.invalidate(MESHING_BUILDS_LATEST_SUCCESSFUL_PATH, revision);
   context.resources?.invalidate(MESHING_SHARED_DOMAIN_MANIFEST_PATH, revision);
+  context.resources?.invalidate(SIMULATION_PREPARATION_PATH, `mesh:${revision}`);
   context.resources?.invalidate(MESHING_SHARED_DOMAIN_REPORT_PATH, revision);
   context.resources?.invalidate(MESHING_SHARED_DOMAIN_QUALITY_PATH, revision);
   context.resources?.invalidate(MESHING_SHARED_DOMAIN_QUALITY_DATA_PATH, revision);
@@ -404,11 +611,12 @@ function currentMeshRevision(context: CommandContext): number | null {
 }
 
 function authoritativeMeshCommandRevision(detail: CommandDetailResource): number {
-  return detail.resource_invalidations!.find((entry) => {
+  const matching = detail.resource_invalidations?.find((entry) => {
     const key = entry.resource_key;
     return key === "meshing/shared-domain/manifest" || key === "data/domain/topology" ||
       (key.startsWith("meshing/objects/") && key.endsWith("/topology"));
-  })!.revision;
+  });
+  return matching?.revision ?? 0;
 }
 
 function invalidateMeshBuildStatus(context: CommandContext, revision: string | number): void {
@@ -417,12 +625,12 @@ function invalidateMeshBuildStatus(context: CommandContext, revision: string | n
   context.resources?.invalidate(MODEL_READINESS_PATH, revision);
 }
 
-function focusMeshJobs(context: CommandContext): void {
+function focusOperations(context: CommandContext): void {
   context.layout?.setPanelVisible("bottom", true);
   context.layout?.setFocusedSlot("panel-bottom");
   context.bus?.emit("footer:tab-requested", {
     reason: "mesh-build",
-    tab: "mesh",
+    tab: "operations",
   });
 }
 
@@ -437,7 +645,7 @@ function emitMeshBuildSubmitted(
   },
 ): void {
   context.bus?.emit("mesh:build-submitted", payload);
-  focusMeshJobs(context);
+  focusOperations(context);
 }
 
 type MeshBuildRequest = Extract<StructuredCommandRequest, { kind: "mesh_build" }>;
@@ -455,11 +663,32 @@ interface MeshBuildOperation {
   promise?: Promise<CommandResult>;
   reason: string;
   requestId?: string;
+  scopeKey: string | null;
   submitted: boolean;
 }
 
-// Per-client submission locks retain only identities and live promises, never resource snapshots.
-const meshBuildOperations = new WeakMap<MeshCommandApi, MeshBuildOperation>();
+// Retain accepted intents by session so a switched session cannot inherit their lock or observer.
+const meshBuildOperations = new WeakMap<MeshCommandApi, Map<string | null, MeshBuildOperation>>();
+
+function currentMeshOperation(context: CommandContext): MeshBuildOperation | undefined {
+  return context.api && meshBuildOperations.get(context.api.commands)?.get(context.sessionScopeKey ?? null);
+}
+
+function retainMeshOperation(api: MeshCommandApi, operation: MeshBuildOperation): void {
+  let byScope = meshBuildOperations.get(api);
+  if (!byScope) {
+    byScope = new Map();
+    meshBuildOperations.set(api, byScope);
+  }
+  byScope.set(operation.scopeKey, operation);
+}
+
+function releaseMeshOperation(api: MeshCommandApi, operation: MeshBuildOperation): void {
+  const byScope = meshBuildOperations.get(api);
+  if (byScope?.get(operation.scopeKey) !== operation) return;
+  byScope.delete(operation.scopeKey);
+  if (byScope.size === 0) meshBuildOperations.delete(api);
+}
 
 function meshCommandKindMatches(actual: string, expected: ObservableMeshCommandKind): boolean {
   return actual === expected || (expected === "mesh_build" && actual === "remesh");
@@ -469,13 +698,16 @@ async function reconcileMeshSubmission(
   api: MeshCommandApi,
   operation: MeshBuildOperation,
 ): Promise<string | undefined> {
-  const queue = await api.list();
+  const requestOptions = operation.scopeKey ? { sessionScopeKey: operation.scopeKey } : undefined;
+  const queue = requestOptions ? await api.list(requestOptions) : await api.list();
   const candidates = queue.commands.filter((entry) =>
     meshCommandKindMatches(entry.kind, operation.commandKind),
   )
-    .sort((left, right) => right.seq - left.seq).slice(0, 8);
+    .sort((left, right) => right.seq - left.seq);
   for (const entry of candidates) {
-    const detail = await api.detail(entry.command_id);
+    const detail = requestOptions
+      ? await api.detail(entry.command_id, requestOptions)
+      : await api.detail(entry.command_id);
     if (detail.command_id === entry.command_id && detail.client_intent_id === operation.requestId) {
       return detail.command_id;
     }
@@ -488,10 +720,14 @@ async function observeMeshBuildOperation(
   operation: MeshBuildOperation,
 ): Promise<CommandResult> {
   const api = context.api!.commands;
+  const obsolete = obsoleteSessionResult(context);
+  if (obsolete) return obsolete;
   if (!operation.commandId) {
     try {
       operation.commandId = await reconcileMeshSubmission(api, operation);
     } catch {
+      const obsolete = obsoleteSessionResult(context);
+      if (obsolete) return obsolete;
       const result: CommandResult = {
         message: "Mesh submission acknowledgement was lost. Reconnect to check the existing intent; no duplicate build was submitted.",
         observation: "disconnected", status: "pending",
@@ -499,6 +735,8 @@ async function observeMeshBuildOperation(
       context.bus?.emit("mesh:build-observed", { ...result, requestId: operation.requestId });
       return result;
     }
+    const obsolete = obsoleteSessionResult(context);
+    if (obsolete) return obsolete;
     if (!operation.commandId) {
       const result: CommandResult = {
         message: "Mesh submission is unconfirmed. Check the command history before retrying; no duplicate build was submitted.",
@@ -520,7 +758,12 @@ async function observeMeshBuildOperation(
     });
     operation.announced = true;
   }
-  const terminal = await awaitMeshCommandTerminal(api, commandId, { baseMeshRevision: operation.baseMeshRevision });
+  const terminal = await awaitMeshCommandTerminal(api, commandId, {
+    baseMeshRevision: operation.baseMeshRevision,
+    requestOptions: operation.scopeKey ? { sessionScopeKey: operation.scopeKey } : undefined,
+  });
+  const obsoleteAfterPoll = obsoleteSessionResult(context);
+  if (obsoleteAfterPoll) return obsoleteAfterPoll;
   let meshRevision: number | undefined;
   if (terminal.status === "completed") {
     meshRevision = authoritativeMeshCommandRevision(terminal.detail);
@@ -536,6 +779,7 @@ async function observeMeshBuildOperation(
     status: terminal.status,
   };
   context.bus?.emit("mesh:build-observed", { ...result, meshRevision, requestId: operation.requestId });
+
   return result;
 }
 
@@ -547,9 +791,11 @@ function trackMeshBuildOperation(
   const api = context.api!.commands;
   operation.promise = work().catch((error: unknown): CommandResult => {
     if (!operation.submitted) {
-      meshBuildOperations.delete(api);
+      releaseMeshOperation(api, operation);
       throw error;
     }
+    const obsolete = obsoleteSessionResult(context);
+    if (obsolete) return obsolete;
     const result: CommandResult = {
       commandId: operation.commandId,
       message: error instanceof Error ? error.message : "Mesh observation was interrupted.",
@@ -558,8 +804,9 @@ function trackMeshBuildOperation(
     context.bus?.emit("mesh:build-observed", { ...result, requestId: operation.requestId });
     return result;
   }).then((result) => {
-    operation.observationPaused = result.status === "pending";
-    if (result.status !== "pending") meshBuildOperations.delete(api);
+    const obsolete = obsoleteSessionResult(context);
+    operation.observationPaused = result.status === "pending" || (operation.submitted && Boolean(obsolete));
+    if (result.status !== "pending" && (!obsolete || !operation.submitted)) releaseMeshOperation(api, operation);
     return result;
   }).finally(() => { operation.promise = undefined; });
   return operation.promise;
@@ -567,7 +814,7 @@ function trackMeshBuildOperation(
 
 /** Resume only the retained command identity or client intent; never confirm or submit another build. */
 export function resumeMeshBuildObservation(context: CommandContext): Promise<CommandResult> {
-  const operation = context.api ? meshBuildOperations.get(context.api.commands) : undefined;
+  const operation = currentMeshOperation(context);
   if (!operation) return Promise.resolve({ message: "No mesh command observation is available to resume.", status: "cancelled" });
   return operation.promise ?? trackMeshBuildOperation(context, operation, () => observeMeshBuildOperation(context, operation));
 }
@@ -588,6 +835,8 @@ export async function restoreMeshBuildObservation(
 ): Promise<CommandResult> {
   const api = context.api?.commands;
   if (!api) return { message: "Control-room API is unavailable.", status: "cancelled" };
+  const obsolete = obsoleteSessionResult(context);
+  if (obsolete) return obsolete;
   const resumeExisting = (operation: MeshBuildOperation): Promise<CommandResult> => {
     if (operation.commandId !== commandId) return Promise.resolve({
       message: "Another mesh command observation is active. Resolve it before opening this command.",
@@ -596,15 +845,20 @@ export async function restoreMeshBuildObservation(
     requestMeshObservation(context, operation);
     return resumeMeshBuildObservation(context);
   };
-  const existing = meshBuildOperations.get(api);
+  const existing = currentMeshOperation(context);
   if (existing) return resumeExisting(existing);
   let detail: CommandDetailResource;
   try {
-    detail = await api.detail(commandId);
+    const requestOptions = sessionRequestOptions(context);
+    detail = requestOptions ? await api.detail(commandId, requestOptions) : await api.detail(commandId);
   } catch {
+    const obsolete = obsoleteSessionResult(context);
+    if (obsolete) return obsolete;
     return { commandId, message: "Mesh command details are unavailable. Reconnect and observe this command again.",
       observation: "disconnected", status: "pending" };
   }
+  const obsoleteAfterDetail = obsoleteSessionResult(context);
+  if (obsoleteAfterDetail) return obsoleteAfterDetail;
   const commandKind = detail.kind === "fdm_grid_refresh" ? "fdm_grid_refresh" : "mesh_build";
   const validTarget = commandKind === "fdm_grid_refresh" || Boolean(detail.mesh_target);
   if (
@@ -614,7 +868,7 @@ export async function restoreMeshBuildObservation(
   ) {
     return { commandId, message: "The requested resource does not identify a mesh build with a target.", status: "failed" };
   }
-  const concurrent = meshBuildOperations.get(api);
+  const concurrent = currentMeshOperation(context);
   if (concurrent) return resumeExisting(concurrent);
   const operation: MeshBuildOperation = {
     announced: true,
@@ -626,9 +880,10 @@ export async function restoreMeshBuildObservation(
     observationPaused: true,
     reason: detail.mesh_reason ?? detail.reason ?? "mesh-observation",
     requestId: detail.client_intent_id ?? "mesh-observe:" + commandId,
+    scopeKey: context.sessionScopeKey ?? null,
     submitted: true,
   };
-  meshBuildOperations.set(api, operation);
+  retainMeshOperation(api, operation);
   requestMeshObservation(context, operation);
   return resumeMeshBuildObservation(context);
 }
@@ -654,7 +909,7 @@ function runMeshBuildOperation(
   const status = asRecord(resourceData(context, SESSION_STATUS_RESOURCE_KEY));
   const sceneRevision = asRecord(status?.resources)?.scene_revision ?? sceneBaseRevision(context);
   const key = JSON.stringify({ scene_revision: sceneRevision, mesh_options: request.mesh_options ?? null, mesh_target: request.mesh_target });
-  const previous = meshBuildOperations.get(api);
+  const previous = currentMeshOperation(context);
   if (previous) {
     if (previous.key === key && !previous.observationPaused && previous.promise) return previous.promise;
     return Promise.resolve({
@@ -667,23 +922,39 @@ function runMeshBuildOperation(
     announced: false, baseMeshRevision: currentMeshRevision(context), key,
     commandKind: "mesh_build",
     objectId: request.mesh_target?.kind === "object_mesh" ? request.mesh_target.object_id : undefined,
-    observationPaused: false, reason: request.mesh_reason ?? "mesh-build", submitted: false,
+    observationPaused: false, reason: request.mesh_reason ?? "mesh-build",
+    scopeKey: context.sessionScopeKey ?? null, submitted: false,
   };
-  meshBuildOperations.set(api, operation);
+  retainMeshOperation(api, operation);
   return trackMeshBuildOperation(context, operation, async () => {
     const confirmation = await awaitMeshBuildConfirmation(context, registryCommandId, {
       ...asRecord(context.input), ...request,
     });
     operation.requestId = confirmation.requestId;
+    const obsoleteAfterConfirmation = obsoleteSessionResult(context);
+    if (obsoleteAfterConfirmation) return obsoleteAfterConfirmation;
     if (!confirmation.confirmed) return { status: "cancelled" };
     operation.baseMeshRevision = confirmation.precondition?.mesh_revision ?? operation.baseMeshRevision;
     operation.submitted = true;
     try {
-      const response = await api.submit({
+      const meshRequest = {
         ...request,
         client_intent_id: operation.requestId,
         ...(confirmation.precondition ? { precondition: confirmation.precondition } : {}),
-      });
+      };
+      const requestOptions = sessionRequestOptions(context);
+      const response = requestOptions
+        ? await api.submit(meshRequest, requestOptions)
+        : await api.submit(meshRequest);
+      const obsoleteAfterSubmission = obsoleteSessionResult(context);
+      if (obsoleteAfterSubmission) {
+        operation.commandId = response.accepted ? response.command_id : undefined;
+        return obsoleteAfterSubmission;
+      }
+      context.resources?.invalidate(
+        SIMULATION_COMMANDS_PATH,
+        response.command_id,
+      );
       if (!response.accepted) {
         const result: CommandResult = {
           commandId: response.command_id,
@@ -694,6 +965,8 @@ function runMeshBuildOperation(
       }
       operation.commandId = response.command_id;
     } catch (error) {
+      const obsoleteAfterSubmission = obsoleteSessionResult(context);
+      if (obsoleteAfterSubmission) return obsoleteAfterSubmission;
       const rejection = meshSubmissionRejection(context, operation, error);
       if (rejection) return rejection;
       // A lost POST response cannot prove rejection. Reconcile by intent before any further action.
@@ -721,7 +994,7 @@ export function runFdmGridRefreshOperation(
     precondition: request.precondition ?? null,
     reason: request.reason ?? null,
   });
-  const previous = meshBuildOperations.get(api);
+  const previous = currentMeshOperation(context);
   if (previous) {
     if (previous.key === key && !previous.observationPaused && previous.promise) {
       return previous.promise;
@@ -743,12 +1016,31 @@ export function runFdmGridRefreshOperation(
     observationPaused: false,
     reason: request.reason ?? "fdm-grid-refresh",
     requestId,
+    scopeKey: context.sessionScopeKey ?? null,
     submitted: true,
   };
-  meshBuildOperations.set(api, operation);
+  retainMeshOperation(api, operation);
   return trackMeshBuildOperation(context, operation, async () => {
+    const obsoleteBeforeSubmission = obsoleteSessionResult(context);
+    if (obsoleteBeforeSubmission) {
+      operation.submitted = false;
+      return obsoleteBeforeSubmission;
+    }
     try {
-      const response = await api.submit({ ...request, client_intent_id: requestId });
+      const gridRequest = { ...request, client_intent_id: requestId };
+      const requestOptions = sessionRequestOptions(context);
+      const response = requestOptions
+        ? await api.submit(gridRequest, requestOptions)
+        : await api.submit(gridRequest);
+      const obsoleteAfterSubmission = obsoleteSessionResult(context);
+      if (obsoleteAfterSubmission) {
+        operation.commandId = response.accepted ? response.command_id : undefined;
+        return obsoleteAfterSubmission;
+      }
+      context.resources?.invalidate(
+        SIMULATION_COMMANDS_PATH,
+        response.command_id,
+      );
       if (!response.accepted) {
         const result: CommandResult = {
           commandId: response.command_id,
@@ -760,6 +1052,8 @@ export function runFdmGridRefreshOperation(
       }
       operation.commandId = response.command_id;
     } catch (error) {
+      const obsoleteAfterSubmission = obsoleteSessionResult(context);
+      if (obsoleteAfterSubmission) return obsoleteAfterSubmission;
       const rejection = meshSubmissionRejection(context, operation, error);
       if (rejection) return rejection;
       // Reconcile a possibly accepted command by client intent before allowing a retry.
@@ -840,13 +1134,6 @@ function sceneObjects(scene: unknown): JsonObject[] {
     : [];
 }
 
-function sceneFieldDrives(scene: unknown): JsonObject[] {
-  const drives = asRecord(asRecord(scene)?.field_drives)?.drives;
-  return Array.isArray(drives)
-    ? drives.filter((drive): drive is JsonObject => Boolean(drive && typeof drive === "object" && !Array.isArray(drive)))
-    : [];
-}
-
 function defaultPrimitiveGeometry(
   primitiveKind: "box" | "cylinder" | "sphere",
 ): JsonObject {
@@ -878,8 +1165,32 @@ function draftObjectId(primitiveKind: string): string {
 function defaultMicrostripAntennaObject(objectId: string): JsonObject {
   return {
     geometry: {
-      geometry_kind: "Box",
-      geometry_params: { size: [50e-9, 1e-6, 10e-9] },
+      geometry_kind: "MicrostripAntennaLayout",
+      geometry_params: {
+        length_m: 1e-6,
+        thickness_m: 10e-9,
+        conductivity_s_per_m: 5.8e7,
+        stations: [
+          { s: 0, signal_width_m: 50e-9 },
+          { s: 1, signal_width_m: 50e-9 },
+        ],
+        transform: {
+          rotation_matrix: [[0, -1, 0], [1, 0, 0], [0, 0, 1]],
+          translation_m: [0, -0.5e-6, 0],
+        },
+        return_width_m: 500e-9,
+        return_offset_m: 30e-9,
+        conductors: [
+          { id: "signal", kind: "signal" },
+          { id: "return", kind: "return" },
+        ],
+        terminal_faces: {
+          signal: { inlet: "local_u_min", outlet: "local_u_max" },
+          return: { inlet: "local_u_min", outlet: "local_u_max" },
+        },
+      },
+      bounds_min: [-250e-9, -0.5e-6, -45e-9],
+      bounds_max: [250e-9, 0.5e-6, 5e-9],
     },
     id: objectId,
     locked: false,
@@ -898,19 +1209,125 @@ function defaultMicrostripAntennaObject(objectId: string): JsonObject {
   };
 }
 
-function defaultMicrostripFieldDrive(objectId: string): JsonObject {
+function sceneArray(scene: unknown, key: string): JsonValue[] {
+  const record = asRecord(scene);
+  if (!Array.isArray(record?.[key])) return [];
+  return record[key].flatMap((item) => {
+    const converted = jsonValue(item);
+    return converted === undefined ? [] : [converted];
+  });
+}
+
+function defaultCpwAntennaObject(objectId: string): JsonObject {
   return {
-    activation: { kind: "all_time_evolution" },
-    amplitude_B_T: 0.001,
-    direction: [0, 1, 0],
-    enabled: true,
-    id: `${objectId}:H_ant`,
-    kind: "regional",
-    name: "Microstrip antenna field",
-    spatial_profile: { kind: "geometry_mask", object_id: objectId, envelope: { kind: "uniform" } },
-    target: { kind: "global" },
-    time_origin: "stage_local",
-    waveform: { amplitude: 1, cutoff_hz: 20e9, kind: "sinc_pulse", t0: 5e-11 },
+    ...defaultMicrostripAntennaObject(objectId),
+    name: "CPW antenna",
+    geometry: {
+      geometry_kind: "CPWAntennaLayout",
+      geometry_params: {
+        length_m: 1e-6,
+        thickness_m: 10e-9,
+        conductivity_s_per_m: 5.8e7,
+        stations: [0, 1].map((s) => ({
+          s, signal_width_m: 50e-9,
+          left_gap_m: 50e-9, right_gap_m: 50e-9,
+          left_ground_width_m: 200e-9, right_ground_width_m: 200e-9,
+        })),
+        transform: {
+          rotation_matrix: [[0, -1, 0], [1, 0, 0], [0, 0, 1]],
+          translation_m: [0, -0.5e-6, 0],
+        },
+        conductors: [
+          { id: "signal", kind: "signal" },
+          { id: "ground_left", kind: "ground_left" },
+          { id: "ground_right", kind: "ground_right" },
+        ],
+        terminal_faces: {
+          signal: { inlet: "local_u_min", outlet: "local_u_max" },
+          ground_left: { inlet: "local_u_min", outlet: "local_u_max" },
+          ground_right: { inlet: "local_u_min", outlet: "local_u_max" },
+        },
+      },
+      bounds_min: [-275e-9, -0.5e-6, -5e-9],
+      bounds_max: [275e-9, 0.5e-6, 5e-9],
+    },
+  };
+}
+
+function defaultMicrostripCurrentTransport(
+  objectId: string,
+  conductorIds = ["signal", "return"],
+): JsonObject {
+  const currentId = `${objectId}:current`;
+  return {
+    boundaries: [
+      ...conductorIds.flatMap((id) => [
+        {
+          id: `${id}_in`,
+          kind: "equipotential_current_terminal",
+          surfaces: [{ object_id: objectId, orientation: [0, -1, 0], surface_id: `antenna_terminal:${id}:local_u_min` }],
+        },
+        {
+          id: `${id}_out`,
+          kind: "equipotential_current_terminal",
+          surfaces: [{ object_id: objectId, orientation: [0, 1, 0], surface_id: `antenna_terminal:${id}:local_u_max` }],
+        },
+      ]),
+      {
+        id: "insulating_outer",
+        kind: "insulating",
+        surfaces: [{ object_id: objectId, orientation: [0, 0, 1], surface_id: "antenna_nonterminal" }],
+      },
+    ],
+    coupling: "one_way",
+    domain: [{ object_id: objectId }],
+    gauge: "terminal_reference",
+    kind: "current_transport",
+    materials: [{ material: { sigma_Spm: 5.8e7 }, region: { object_id: objectId } }],
+    model: "ohmic_poisson",
+    name: currentId,
+    solver: {
+      engine: "cg",
+      linear: { absolute_tolerance: 0, max_iterations: 500, relative_tolerance: 1e-10 },
+      operator_version: "fem_charge_conforming_h1_p1.transparent.v1",
+      physical_residual_version: "charge_balance_integrated_l2.v1",
+    },
+  };
+}
+
+function defaultMicrostripPortMode(
+  objectId: string,
+  conductorIds = ["signal", "return"],
+): JsonObject {
+  return {
+    schema_version: "antenna_port_mode.v2",
+    branches: conductorIds.map((id, index) => ({
+      id,
+      inlet_terminal_ref: `${id}_in`,
+      outlet_terminal_ref: `${id}_out`,
+      signed_weight: index === 0 ? 1 : -1 / (conductorIds.length - 1),
+    })),
+    current_transport_id: `${objectId}:current`,
+    id: `${objectId}:port:common`,
+    normalization_current_a: 1,
+    source_object_id: objectId,
+  };
+}
+
+function defaultMicrostripFieldSolveStage(objectId: string): JsonObject {
+  return {
+    conductor_mesh_policy: "shared_domain_conforming",
+    conservative_current_view_ref: `${objectId}:current:rt0`,
+    current_transport_id: `${objectId}:current`,
+    field_sampling_domain: { kind: "global" },
+    id: `${objectId}:solve-field`,
+    model: "quasistatic_conduction_biot_savart3d",
+    oersted_realization: "direct_tetra_quadrature",
+    outputs: [{ id: `${objectId}:field-solution`, quantity: "H_ant_basis" }],
+    port_mode_ids: [`${objectId}:port:common`],
+    solver_policy: "fem_cpu_double_reference",
+    source_object_id: objectId,
+    target_refs: [{ kind: "global" }],
   };
 }
 
@@ -1025,40 +1442,135 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
   primitiveDraftCommand("geometry.add-cylinder", "Add Cylinder", "cylinder"),
   primitiveDraftCommand("geometry.add-sphere", "Add Sphere", "sphere"),
   {
-    id: "geometry.add-microstrip-antenna",
-    title: "Add Microstrip Antenna",
+    id: "builder-build-geometry",
+    title: "Build Geometry",
+    category: "Geometry",
+    group: "geometry",
+    scope: "workspace",
+    isEnabled: (context) => geometryRealizationDisabledReason(context) === null,
+    disabledReason: geometryRealizationDisabledReason,
+    run: runGeometryRealization,
+  },
+  {
+    id: "builder-validate",
+    title: "Validate Geometry",
+    category: "Geometry",
+    group: "geometry",
+    scope: "workspace",
+    isEnabled: (context) => geometryValidationDisabledReason(context) === null,
+    disabledReason: geometryValidationDisabledReason,
+    run: runGeometryValidation,
+  },
+  {
+    id: "grid.build-fdm",
+    title: "Build Grid",
+    category: "Mesh",
+    group: "mesh",
+    scope: "workspace",
+    isEnabled: (context) => fdmGridBuildDisabledReason(context) === null,
+    disabledReason: fdmGridBuildDisabledReason,
+    run: async (context) => {
+      const disabledReason = fdmGridBuildDisabledReason(context);
+      if (disabledReason) {
+        return { message: disabledReason, status: "failed" };
+      }
+      const sceneRevision = sceneBaseRevision(context);
+      if (sceneRevision === null) {
+        return {
+          message:
+            "The canonical scene revision is unavailable. Refetch the scene before building the grid.",
+          status: "failed",
+        };
+      }
+      const confirmation = await awaitMeshBuildConfirmation(context, "grid.build-fdm", {
+        ...asRecord(context.input),
+        kind: "fdm_grid_refresh",
+        reason: "explicit_build_grid",
+        scene_revision: sceneRevision,
+      });
+      if (!confirmation.confirmed) {
+        return { status: "cancelled" };
+      }
+      return runFdmGridRefreshOperation(context, {
+        kind: "fdm_grid_refresh",
+        precondition: confirmation.precondition ?? { scene_revision: sceneRevision },
+        reason: "explicit_build_grid",
+      });
+    },
+  },
+  ...(["microstrip", "cpw"] as const).map((layout): CommandContribution => ({
+    id: `geometry.add-${layout}-antenna`,
+    title: layout === "cpw" ? "Add CPW Antenna" : "Add Microstrip Antenna",
     category: "Geometry",
     group: "geometry",
     scope: "workspace",
     isEnabled: isApiAvailable,
     disabledReason: disabledWithoutApi,
     run: async (context) => {
+      const obsolete = obsoleteSessionResult(context);
+      if (obsolete) return obsolete;
       if (!context.api) {
         return { message: "Control-room API is unavailable.", status: "failed" };
       }
 
-      const scene = await context.api.model.scene();
+      const preparation = await prepareAuthoringMutation(context);
+      const scene = preparation.before ?? await context.api.model.scene(sessionRequestOptions(context));
+      assertCurrentSessionScope(context);
+      const baseRevision = sceneDocumentRevision(scene);
+      if (baseRevision === null) {
+        return {
+          message: "The canonical scene revision is unavailable. Refetch the scene before adding an antenna.",
+          status: "failed",
+        };
+      }
+      preparation.before ??= scene;
+      preparation.baseRevision = baseRevision;
       const objectId = draftObjectId("antenna");
-      const response = await context.api.model.commitTransaction({
+      const conductorIds = layout === "cpw"
+        ? ["signal", "ground_left", "ground_right"]
+        : ["signal", "return"];
+      const label = layout === "cpw" ? "CPW antenna" : "Microstrip antenna";
+      const request: AuthoringTransactionRequest = {
+        base_revision: baseRevision,
         kind: "merge_patch",
         merge_patch: {
-          field_drives: {
-            drives: [
-              ...sceneFieldDrives(scene),
-              defaultMicrostripFieldDrive(objectId),
-            ],
-          },
+          antenna_field_solve_stages: [
+            ...sceneArray(scene, "antenna_field_solve_stages"),
+            defaultMicrostripFieldSolveStage(objectId),
+          ],
+          antenna_port_modes: [
+            ...sceneArray(scene, "antenna_port_modes"),
+            defaultMicrostripPortMode(objectId, conductorIds),
+          ],
+          current_transports: [
+            ...sceneArray(scene, "current_transports"),
+            defaultMicrostripCurrentTransport(objectId, conductorIds),
+          ],
           objects: [
             ...sceneObjects(scene),
-            defaultMicrostripAntennaObject(objectId),
+            layout === "cpw" ? defaultCpwAntennaObject(objectId) : defaultMicrostripAntennaObject(objectId),
           ],
         },
-      });
+      };
+      const requestOptions = sessionRequestOptions(context);
+      const response = requestOptions
+        ? await context.api.model.commitTransaction(request, requestOptions)
+        : await context.api.model.commitTransaction(request);
+      const obsoleteAfterWrite = obsoleteSessionResult(context);
+      if (obsoleteAfterWrite) return obsoleteAfterWrite;
+      selectCommittedObject(context, objectId, label);
+      await recordAuthoringMutationHistory(
+        context,
+        `Add ${layout} antenna`,
+        preparation,
+        response.committed_scene,
+        captureAuthoringHistoryWorkspaceState(context),
+      );
+      assertCurrentSessionScope(context);
       invalidateSceneAuthoringResources(context, response.scene_revision);
-      selectCommittedObject(context, objectId, "Microstrip antenna");
-      return { message: "Microstrip antenna added.", status: "completed" };
+      return { message: `${label} draft added; field solve requires a mesh-exact ConservativeCurrentView.`, status: "completed" };
     },
-  },
+  })),
   {
     id: "geometry.commit-object-draft",
     title: "Commit Object Draft",
@@ -1074,14 +1586,22 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
         ? "Open a primitive draft before committing."
         : "The canonical scene revision is unavailable. Refetch the scene before committing.",
     run: async (context) => {
+      const obsolete = obsoleteSessionResult(context);
+      if (obsolete) return obsolete;
       const selection = context.selection?.get();
       const primitiveKind = primitiveKindFromDraftSelection(selection);
       const objectId = draftObjectId(primitiveKind);
       const name = selection?.label ?? `New ${primitiveKind}`;
-      const baseRevision = sceneBaseRevision(context);
       if (!context.api) {
         return { message: "Control-room API is unavailable.", status: "failed" };
       }
+      const preparation = await prepareAuthoringMutation(context);
+      assertCurrentSessionScope(context);
+      const before = preparation.before;
+      const baseRevision =
+        typeof before?.revision === "number" && Number.isFinite(before.revision)
+          ? before.revision
+          : sceneBaseRevision(context);
       if (baseRevision === null) {
         return {
           message: "The canonical scene revision is unavailable. Refetch the scene before committing.",
@@ -1099,9 +1619,19 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
           scale: [1, 1, 1],
           translation: [0, 0, 0],
         },
-      });
-      invalidateSceneAuthoringResources(context, response.scene_revision);
+      }, sessionRequestOptions(context));
+      const obsoleteAfterWrite = obsoleteSessionResult(context);
+      if (obsoleteAfterWrite) return obsoleteAfterWrite;
       selectCommittedObject(context, objectId, name);
+      await recordAuthoringMutationHistory(
+        context,
+        `Create ${name}`,
+        preparation,
+        response.committed_scene,
+        captureAuthoringHistoryWorkspaceState(context),
+      );
+      assertCurrentSessionScope(context);
+      invalidateSceneAuthoringResources(context, response.scene_revision);
       return { status: "completed" };
     },
   },
@@ -1111,9 +1641,11 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
     category: "Geometry",
     group: "geometry",
     scope: "selection",
-    isEnabled: (context) => Boolean(selectedObjectId(context)),
-    disabledReason: selectedObjectDisabledReason,
+    isEnabled: (context) => Boolean(selectedObjectId(context)) && !deleteObjectBlockedReason(context),
+    disabledReason: (context) => selectedObjectDisabledReason(context) ?? deleteObjectBlockedReason(context),
     run: async (context) => {
+      const obsolete = obsoleteSessionResult(context);
+      if (obsolete) return obsolete;
       const objectId = selectedObjectId(context);
       if (!objectId) {
         return { message: "No scene object selected.", status: "failed" };
@@ -1122,12 +1654,46 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
         return { message: "Control-room API is unavailable.", status: "failed" };
       }
 
-      const response = await deleteObjectTransaction(context.api, objectId);
-      invalidateSceneAuthoringResources(context, response.scene_revision);
-      if (context.selection?.get().objectId === objectId) {
-        context.selection.clear("geometry-authoring");
+      const blocked = deleteObjectBlockedReason(context);
+      if (blocked) return { message: blocked, status: "failed" };
+      const controller = context.objectEditSession;
+      const lease = controller?.beginSceneMutation(context.sessionScopeKey ?? null, objectId) ?? null;
+      if (controller && lease === null) {
+        return { message: "Wait for the pending scene change before deleting.", status: "failed" };
       }
-      return { status: "completed" };
+      try {
+        const preparation = await prepareAuthoringMutation(context);
+        assertCurrentSessionScope(context);
+        const blockedBeforeWrite = deleteObjectBlockedReason(context, true);
+        if (blockedBeforeWrite) return { message: blockedBeforeWrite, status: "failed" };
+        const response = await deleteObjectTransaction(
+          context.api,
+          objectId,
+          {},
+          sessionRequestOptions(context),
+        );
+        const obsoleteAfterWrite = obsoleteSessionResult(context);
+        if (obsoleteAfterWrite) return obsoleteAfterWrite;
+        let selectionClearedByMutation = false;
+        if (context.selection?.get().objectId === objectId) {
+          context.selection.clear("geometry-authoring");
+          selectionClearedByMutation = true;
+        }
+        await recordAuthoringMutationHistory(
+          context,
+          `Delete ${objectId}`,
+          preparation,
+          response.committed_scene,
+          selectionClearedByMutation
+            ? captureAuthoringHistoryWorkspaceState(context)
+            : preparation.beforeWorkspaceState ?? null,
+        );
+        assertCurrentSessionScope(context);
+        invalidateSceneAuthoringResources(context, response.scene_revision);
+        return { status: "completed" };
+      } finally {
+        if (lease !== null) controller?.endSceneMutation(lease);
+      }
     },
   },
   {

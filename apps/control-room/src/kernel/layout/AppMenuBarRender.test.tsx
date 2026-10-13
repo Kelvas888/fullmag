@@ -28,6 +28,18 @@ describe("AppMenuBar", () => {
     expect(source).not.toContain("const sessionStatus = useSessionStatus();");
   });
 
+  it("keeps the new-simulation dialog mounted across session-header transitions", () => {
+    const source = readFileSync(appMenuBarSourceUrl, "utf8");
+    const appMenuBar = source.slice(
+      source.indexOf("export function AppMenuBar()"),
+      source.indexOf("function NoSessionAppMenuBar"),
+    );
+
+    expect(appMenuBar).toContain("useNewProblemRequest()");
+    expect(appMenuBar).toContain("<NewProblemDialog");
+    expect(source.match(/<NewProblemDialog/g)).toHaveLength(1);
+  });
+
   it("renders header controls through shared shadcn-style button primitives", () => {
     const html = renderToStaticMarkup(
       <ThemeProvider>
@@ -40,7 +52,9 @@ describe("AppMenuBar", () => {
     expect(html).toContain("fm-button");
     expect(html).toContain("fm-header__nav-item");
     expect(html).toContain("fm-header__action-btn");
-    expect(html).toContain("fm-header__app-trigger");
+    // Home leads the main menu; the brand no longer opens a menu of its own.
+    expect(html).toContain('aria-current="page"');
+    expect(html).not.toContain("fm-header__app-trigger");
     expect(html).toContain("Command search");
     expect(html).toContain("Runtime controls");
     expect(html).toContain('aria-label="Switch to light theme"');

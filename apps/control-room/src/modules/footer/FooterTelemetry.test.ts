@@ -120,6 +120,7 @@ const status: LiveStatusResource = {
     created_at: "0",
     name: "test",
     session_epoch: "session-1@0",
+    request_scope_epoch: "test-api:0",
     session_id: "session-1",
     workspace_root: "/tmp/fullmag",
   },
@@ -415,8 +416,12 @@ describe("FooterTelemetry", () => {
       active_stage_index: 0,
       active_stage_kind: "flat_frequency_response",
       completed_stage_indexes: [],
+      request_scope_epoch: status.session.request_scope_epoch,
       revision: 7,
+      run_id: status.run!.run_id,
       runtime_state: "running",
+      session_epoch: status.session.session_epoch,
+      session_id: status.session.session_id,
       stage_statuses: ["running"],
       stages: [
         {
@@ -516,8 +521,12 @@ describe("FooterTelemetry", () => {
       active_stage_index: 0,
       active_stage_kind: "flat_frequency_response",
       completed_stage_indexes: [],
+      request_scope_epoch: status.session.request_scope_epoch,
       revision: 9,
+      run_id: status.run!.run_id,
       runtime_state: "running",
+      session_epoch: status.session.session_epoch,
+      session_id: status.session.session_id,
       stage_statuses: ["running"],
       stages: [
         {
@@ -604,8 +613,12 @@ describe("FooterTelemetry", () => {
       active_stage_index: 0,
       active_stage_kind: "flat_frequency_response",
       completed_stage_indexes: [],
+      request_scope_epoch: status.session.request_scope_epoch,
       revision: 7,
+      run_id: status.run!.run_id,
       runtime_state: "running",
+      session_epoch: status.session.session_epoch,
+      session_id: status.session.session_id,
       stage_statuses: ["running"],
       stages: [
         {
@@ -680,8 +693,12 @@ describe("FooterTelemetry", () => {
       active_stage_index: 0,
       active_stage_kind: "flat_frequency_response",
       completed_stage_indexes: [],
+      request_scope_epoch: status.session.request_scope_epoch,
       revision: 12,
+      run_id: status.run!.run_id,
       runtime_state: "running",
+      session_epoch: status.session.session_epoch,
+      session_id: status.session.session_id,
       stage_statuses: ["running"],
       stages: [
         {
@@ -774,8 +791,12 @@ describe("FooterTelemetry", () => {
       active_stage_index: 0,
       active_stage_kind: "flat_eigenmodes",
       completed_stage_indexes: [],
+      request_scope_epoch: status.session.request_scope_epoch,
       revision: 11,
+      run_id: status.run!.run_id,
       runtime_state: "running",
+      session_epoch: status.session.session_epoch,
+      session_id: status.session.session_id,
       stage_statuses: ["running"],
       stages: [
         {

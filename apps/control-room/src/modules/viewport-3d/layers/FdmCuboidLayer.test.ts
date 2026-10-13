@@ -544,7 +544,7 @@ describe("FdmCuboidLayer model", () => {
     recordFdmCuboidSurfaceAdoption({
       fieldBufferId: "field-global",
       registry,
-      sessionIdentity: { sessionEpoch: "test-session@1000", sessionId: "test-session" },
+      sessionIdentity: { sessionEpoch: "test-session@1000", sessionId: "test-session", requestScopeEpoch: "test-api:1" },
       scalarBuffer: {
         buildKey: "scalar-global",
         colors: new Float32Array(12),
@@ -569,7 +569,7 @@ describe("FdmCuboidLayer model", () => {
       carrierId: "region:left:core",
       fieldBufferId: "field-global",
       registry,
-      sessionIdentity: { sessionEpoch: "test-session@1000", sessionId: "test-session" },
+      sessionIdentity: { sessionEpoch: "test-session@1000", sessionId: "test-session", requestScopeEpoch: "test-api:1" },
       scalarBuffer: {
         buildKey: "scalar-left-core",
         colors: new Float32Array(6),
@@ -965,7 +965,9 @@ describe("FdmCuboidLayer model", () => {
     expect(sceneModelSource).toContain(
       "modelFieldVector: fdmInstanceModelFieldVector",
     );
-    expect(sceneModelSource).toContain("fdmInstanceModel: fdmInstanceModel");
+    expect(sceneModelSource).toContain(
+      "fdmInstanceModel: savedSelectionActive ? null : fdmInstanceModel",
+    );
     expect(sceneModelSource).toContain("fdmVectorSegments");
     expect(sceneModelSource).toContain("fdmBuildState?.error?.message");
     expect(sceneModelSource).not.toContain("buildFdmCuboidInstanceModel(");

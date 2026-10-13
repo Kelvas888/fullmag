@@ -173,6 +173,24 @@ describe("FEM visualization ACK data identity", () => {
     );
     expect(callback).not.toContain("ackKind.dataIdentity");
   });
+
+  it("forwards the request scope epoch with viewport acknowledgements", () => {
+    const source = readFileSync(
+      "src/modules/viewport-3d/Viewport3DModule.tsx",
+      "utf8",
+    );
+    const callbackStart = source.indexOf(
+      "const onVisualizationFrameCommitted = useCallback",
+    );
+    const callback = source.slice(
+      callbackStart,
+      source.indexOf("useEffect(() => {", callbackStart),
+    );
+
+    expect(callback).toContain(
+      "requestScopeEpoch: sessionIdentity?.requestScopeEpoch ?? null",
+    );
+  });
 });
 
 function scalarColorbarPart(
@@ -2036,9 +2054,14 @@ describe("Viewport3DModule scene wiring", () => {
     );
 
     expect(source).toContain("const beginCameraInteraction = useCallback");
-    expect(source).toContain("createViewport3DInteractionFieldHold()");
+    expect(source).toContain(
+      "const cameraFieldUpdateHold = useMemo(() => createViewport3DInteractionFieldHold(), []);",
+    );
     expect(source).toContain("cameraFieldUpdateHold.begin(epoch);");
     expect(source).toContain("cameraFieldUpdateHold.end(epoch);");
+    expect(source).toContain("kernel.cameraRegistry.beginInteraction(epoch);");
+    expect(source).toContain("kernel.cameraRegistry.endInteraction(epoch);");
+    expect(source).toContain("cameraFieldUpdateHold.begin(epoch);");
     expect(source).not.toContain("onPointerDownCapture={holdFieldUpdatesForPointerGesture}");
     expect(source).not.toContain("onPointerUpCapture={releaseFieldUpdatePointerHold}");
   });
