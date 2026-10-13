@@ -3242,6 +3242,16 @@ async fn sync_current_live_snapshot_impl(
     let preview_fields = req.preview_fields.clone();
     let clear_preview_cache = req.clear_preview_cache;
     let atomic_terminal_field_publish = req.replace_latest_fields;
+    // Preserve only a genuinely finished terminal replacement payload so the
+    // completed run remains inspectable. Initial replacement frames can still
+    // carry bootstrap fields and must use the large-grid filter.
+    let terminal_replacement = req.replace_latest_fields
+        && req
+            .live_state
+            .as_ref()
+            .is_some_and(|state| state.latest_step.finished);
+    let drop_live_magnetization =
+        state.feature_flags.disable_live_magnetization && !terminal_replacement;
     let session_id = req.session_id.clone();
     let owner_state = state.clone();
     sync_current_live_frame_update(
@@ -3259,7 +3269,7 @@ async fn sync_current_live_snapshot_impl(
             if let Some(owner) = owner.as_ref() {
                 validate_terminal_snapshot_owner(&owner_state, next, &req, owner)?;
             }
-            apply_current_live_snapshot(next, req)
+            apply_current_live_snapshot_with_options(next, req, drop_live_magnetization)
         },
     )
     .await
@@ -3400,6 +3410,7 @@ async fn sync_current_live_runtime_frame(
     Json(frame): Json<CurrentLiveRuntimeFrameRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = frame.session_id.clone();
+    let drop_live_magnetization = state.feature_flags.disable_live_magnetization;
     sync_current_live_frame_update(
         &state,
         CurrentLiveSyncKind::Runtime,
@@ -3411,7 +3422,9 @@ async fn sync_current_live_runtime_frame(
         None,
         false,
         false,
-        move |next| apply_current_live_runtime_frame(next, frame),
+        move |next| {
+            apply_current_live_runtime_frame_with_options(next, frame, drop_live_magnetization)
+        },
     )
     .await
 }
