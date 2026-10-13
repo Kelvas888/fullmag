@@ -71,6 +71,13 @@ interface ResolvedMetadata {
   readonly metadataRevision: string;
 }
 
+type ModeCompositionFieldBinaryEncoding = "FMVP;version=3" | "FMVP;version=5";
+
+interface ResolvedFieldRevision {
+  readonly binaryEncoding: ModeCompositionFieldBinaryEncoding;
+  readonly fieldRevision: string;
+}
+
 interface CachedField {
   readonly field: DecodedComplexFieldVector;
   readonly identity: ModeFieldComplexBinaryIdentity;
@@ -97,7 +104,7 @@ export class ModeCompositionFieldLayerController {
     maxBytes: MAX_CACHE_BYTES,
   });
   private readonly listeners = new Set<Listener>();
-  private readonly fieldRevisions = new Map<string, string>();
+  private readonly fieldRevisions = new Map<string, ResolvedFieldRevision>();
   private readonly metadataCache = new Map<string, ResolvedMetadata>();
   private readonly metadataInflight = new Map<string, Promise<ResolvedMetadata>>();
   private requestToken = 0;
@@ -243,7 +250,7 @@ export class ModeCompositionFieldLayerController {
       for (const { layer, topology } of active) {
         const metadata = resolvedMetadata.get(layer.target_id);
         const retained = this.retained.get(layer.target_id);
-        const expectedFieldRevision = metadata
+        const expectedFieldIdentity = metadata
           ? this.fieldRevisions.get(fieldRevisionKey(layer, topology, metadata)) ?? null
           : null;
         if (
@@ -254,7 +261,7 @@ export class ModeCompositionFieldLayerController {
             layer,
             topology,
             metadata,
-            expectedFieldRevision,
+            expectedFieldIdentity,
           )
         ) {
           this.retained.delete(layer.target_id);
@@ -298,9 +305,15 @@ export class ModeCompositionFieldLayerController {
       const metadata = preloadedMetadata ?? await this.resolveMetadata(layer, loaders, signal);
       if (!this.isCurrent(requestToken)) return;
       const revisionKey = fieldRevisionKey(layer, topology, metadata);
-      const fieldRevision = this.fieldRevisions.get(revisionKey) ?? null;
-      const identity = fieldRevision
-        ? createFieldIdentity(layer, topology, fieldRevision, metadata.artifactGenerationId)
+      const resolvedFieldRevision = this.fieldRevisions.get(revisionKey) ?? null;
+      const identity = resolvedFieldRevision
+        ? createFieldIdentity(
+            layer,
+            topology,
+            resolvedFieldRevision.fieldRevision,
+            metadata.artifactGenerationId,
+            resolvedFieldRevision.binaryEncoding,
+          )
         : null;
       const cached = identity
         ? this.fieldCache.get(modeFieldComplexBinaryResourceKey(identity))
@@ -396,7 +409,7 @@ export class ModeCompositionFieldLayerController {
       metadata.artifactGenerationId,
       null,
     );
-    const fieldRevision = validateBinary(
+    const resolvedFieldRevision = validateBinary(
       layer,
       expectedIdentity,
       topology,
@@ -406,10 +419,11 @@ export class ModeCompositionFieldLayerController {
     const identity = expectedIdentity ?? createFieldIdentity(
       layer,
       topology,
-      fieldRevision,
+      resolvedFieldRevision.fieldRevision,
       metadata.artifactGenerationId,
+      resolvedFieldRevision.binaryEncoding,
     );
-    this.fieldRevisions.set(revisionKey, fieldRevision);
+    this.fieldRevisions.set(revisionKey, resolvedFieldRevision);
     const key = modeFieldComplexBinaryResourceKey(identity);
     const entry = {
       byteLength: result.byteLength,
@@ -557,11 +571,12 @@ function createFieldIdentity(
   topology: ModeCompositionFieldLayerTopologyIdentity,
   fieldRevision: string,
   artifactGenerationId: string,
+  binaryEncoding: ModeCompositionFieldBinaryEncoding,
 ): ModeFieldComplexBinaryIdentity {
   return {
     artifactGenerationId,
     artifactRevision: layer.mode.artifact_revision,
-    binaryEncoding: "FMVP;version=3",
+    binaryEncoding,
     fieldId: layer.field_id,
     fieldRevision,
     generationId: topology.domainGenerationId!,
@@ -581,7 +596,7 @@ function validateBinary(
   topology: ModeCompositionFieldLayerTopologyIdentity,
   result: ModeCompositionFieldBinaryLoadResult,
   expectedArtifactGenerationId: string,
-): string {
+): ResolvedFieldRevision {
   const field = result.data;
   const complex = asDecodedComplexFieldVector(field);
   const nodeIndices = field.nodeIndices;
@@ -600,12 +615,22 @@ function validateBinary(
       "Object-scoped complex mode field does not match the current topology identity.",
     );
   }
+  const binaryEncoding = supportedModeCompositionFieldEncoding(
+    result.encoding,
+    field.formatVersion,
+  );
+  if (!binaryEncoding) {
+    throw new ModeCompositionFieldIdentityError(
+      "Object-scoped complex mode field requires a matching FMVP v3 or v5 header and decoded format version.",
+    );
+  }
   if (
-    result.encoding !== "FMVP;version=3" ||
     !fieldRevision ||
-    (expectedIdentity !== null && result.fieldRevision !== expectedIdentity.fieldRevision) ||
+    (expectedIdentity !== null && (
+      result.fieldRevision !== expectedIdentity.fieldRevision ||
+      binaryEncoding !== expectedIdentity.binaryEncoding
+    )) ||
     !complex ||
-    field.formatVersion !== 3 ||
     field.nComp !== 6 ||
     complex.componentCount !== 3 ||
     field.quantityId !== layer.field_id ||
@@ -625,7 +650,16 @@ function validateBinary(
       "Object-scoped complex mode field failed identity, topology, scope, or coverage validation.",
     );
   }
-  return fieldRevision;
+  return { binaryEncoding, fieldRevision };
+}
+
+function supportedModeCompositionFieldEncoding(
+  encoding: string | null,
+  formatVersion: number | undefined,
+): ModeCompositionFieldBinaryEncoding | null {
+  if (encoding === "FMVP;version=3" && formatVersion === 3) return encoding;
+  if (encoding === "FMVP;version=5" && formatVersion === 5) return encoding;
+  return null;
 }
 
 function metadataKey(layer: ModeCompositionLayer): string {
@@ -678,12 +712,13 @@ function sameRetainedIdentity(
   layer: ModeCompositionLayer,
   topology: ModeCompositionFieldLayerTopologyIdentity,
   metadata: ResolvedMetadata,
-  expectedFieldRevision: string | null,
+  expectedFieldIdentity: ResolvedFieldRevision | null,
 ): boolean {
   const identity = retained.identity;
   return Boolean(
-    expectedFieldRevision &&
-    identity.fieldRevision === expectedFieldRevision &&
+    expectedFieldIdentity &&
+    identity.fieldRevision === expectedFieldIdentity.fieldRevision &&
+    identity.binaryEncoding === expectedFieldIdentity.binaryEncoding &&
     identity.artifactGenerationId === metadata.artifactGenerationId &&
     retained.metadataRevision === metadata.metadataRevision &&
     identity.runId === layer.mode.run_id &&

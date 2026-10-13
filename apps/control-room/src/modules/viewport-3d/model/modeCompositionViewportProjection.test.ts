@@ -11,12 +11,12 @@ import {
   resolveModeCompositionMeshPartRenderPlan,
 } from "./modeCompositionViewportProjection";
 
-function field(): DecodedComplexFieldVector {
+function field(formatVersion: 2 | 3 | 4 | 5 = 3): DecodedComplexFieldVector {
   return {
     componentCount: 3,
     domainGenerationId: "generation-7",
     dtype: "complex128",
-    formatVersion: 3,
+    formatVersion,
     grid: [2, 1, 1],
     indexing: "explicit_node_indices",
     meshTopologyHash: "topology-a",
@@ -82,11 +82,12 @@ function layer(
 function identity(
   artifactGenerationId: string,
   fieldRevision: string,
+  binaryEncoding: "FMVP;version=3" | "FMVP;version=5" = "FMVP;version=3",
 ): ModeFieldComplexBinaryIdentity {
   return {
     artifactGenerationId,
     artifactRevision: "artifact-3",
-    binaryEncoding: "FMVP;version=3",
+    binaryEncoding,
     fieldId: "analysis:eigen:sample-a:mode-a",
     fieldRevision,
     generationId: "generation-7",
@@ -132,6 +133,37 @@ describe("modeCompositionViewportProjection", () => {
       complexRepresentation: "real",
       range: { min: -8, max: 8 },
     });
+  });
+
+  it.each([3, 5] as const)(
+    "projects FMVP v%s fields with the same complex values, phase, and coverage",
+    (formatVersion) => {
+      const buffer = buildModeCompositionScalarColorBuffer({
+        field: field(formatVersion),
+        layer: layer({ phase_rad: 1.25, representation: "phase_rotated_real" }),
+        requiredSurfaceNodeIndices: new Uint32Array([1, 3]),
+        topologyNodeCount: 5,
+      });
+
+      expect(buffer).not.toBeNull();
+      expect(buffer?.complexRealValues).toEqual(
+        new Float32Array([0, 0, 0, 1, 2, 3, 0, 0, 0, 4, 5, 6, 0, 0, 0]),
+      );
+      expect(buffer?.complexImagValues).toEqual(
+        new Float32Array([0, 0, 0, 10, 20, 30, 0, 0, 0, 40, 50, 60, 0, 0, 0]),
+      );
+      expect(buffer?.complexPhaseRad).toBe(1.25);
+      expect(buffer?.complexRepresentation).toBe("phase_rotated_real");
+    },
+  );
+
+  it.each([2, 4] as const)("rejects FMVP v%s fields from mode composition projection", (formatVersion) => {
+    expect(buildModeCompositionScalarColorBuffer({
+      field: field(formatVersion),
+      layer: layer(),
+      requiredSurfaceNodeIndices: new Uint32Array([1, 3]),
+      topologyNodeCount: 5,
+    })).toBeNull();
   });
 
   it("changes phase, representation and component without rebuilding raw attributes", () => {
@@ -191,6 +223,27 @@ describe("modeCompositionViewportProjection", () => {
     expect(updatedField?.buildKey).not.toBe(publicationA?.buildKey);
     expect(publicationB?.sourceFieldBufferId).not.toBe(publicationA?.sourceFieldBufferId);
     expect(updatedField?.targetRevision).not.toBe(publicationA?.targetRevision);
+  });
+
+  it("keeps projected buffer identities distinct across actual FMVP encodings", () => {
+    const common = {
+      layer: layer(),
+      requiredSurfaceNodeIndices: new Uint32Array([1, 3]),
+      topologyNodeCount: 5,
+    };
+    const version3 = buildModeCompositionScalarColorBuffer({
+      ...common,
+      field: field(3),
+      identity: identity("publication-a", "field-a", "FMVP;version=3"),
+    });
+    const version5 = buildModeCompositionScalarColorBuffer({
+      ...common,
+      field: field(5),
+      identity: identity("publication-a", "field-a", "FMVP;version=5"),
+    });
+
+    expect(version5?.buildKey).not.toBe(version3?.buildKey);
+    expect(version5?.sourceFieldBufferId).not.toBe(version3?.sourceFieldBufferId);
   });
 
   it("projects scoped values onto expanded surface-face vertices", () => {

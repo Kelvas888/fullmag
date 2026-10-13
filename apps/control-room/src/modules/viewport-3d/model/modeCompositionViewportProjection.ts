@@ -333,7 +333,7 @@ function modeFieldMatchesLayer(
       Number.isFinite(layer.phase_rad) &&
       Number.isFinite(layer.animation.phase_offset_rad) &&
       field.componentCount === 3 &&
-      field.formatVersion === 3 &&
+      (field.formatVersion === 3 || field.formatVersion === 5) &&
       field.indexing === "explicit_node_indices" &&
       field.scopeKind === "object" &&
       scopeId === layer.object_id.replace(/^object:/, "") &&
@@ -554,6 +554,7 @@ function rawModeBufferKey(
     layer.mode.artifact_revision,
     identity?.artifactGenerationId ?? "unverified",
     identity?.fieldRevision ?? "unverified",
+    identity?.binaryEncoding ?? "unverified",
     layer.mode.sample_id,
     layer.mode.mode_id,
     layer.field_id,
