@@ -130,12 +130,13 @@ describe("viewport object move staged draft", () => {
         sessionScopeKey: SESSION_A_SCOPE_KEY,
         targetKey: geometryObjectEditSessionTargetKey(SESSION_A_SCOPE_KEY, baseDraft),
       }, baseDraft);
-      let pendingApply: ReturnType<typeof fixture.objectEditSession.beginApply> = null;
+
       act(() => {
-        pendingApply = fixture.objectEditSession.beginApply(identity);
+        fixture.objectEditSession.beginApply(identity);
       });
-      expect(pendingApply).not.toBeNull();
+
       const pendingSnapshot = fixture.objectEditSession.getSnapshot();
+      expect(pendingSnapshot.applyOperationId).not.toBeNull();
       const beginGesture = vi.spyOn(fixture.objectEditSession, "beginGesture");
       const axis = moveAxis(mounted.container, "x", "magnet-a");
       const { capture, release } = installPointerCapture(axis);
@@ -152,7 +153,7 @@ describe("viewport object move staged draft", () => {
       expect(release).not.toHaveBeenCalled();
       expect(fixture.objectEditSession.hasActiveGesture(SESSION_A_SCOPE_KEY)).toBe(false);
       expect(fixture.objectEditSession.getSnapshot()).toMatchObject({
-        applyOperationId: pendingApply?.id,
+        applyOperationId: pendingSnapshot.applyOperationId,
         draft: pendingSnapshot.draft,
         editVersion: pendingSnapshot.editVersion,
       });

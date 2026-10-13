@@ -130,3 +130,10 @@ Bieżący etap nie zamyka całego R0/R1; audyt pozostaje w dokumentacji PR150.
 - Review General/controller i native mouse browser smoke: brak bieżących actionable findings. W smoke dopasowano staged banner do aktualnego pełnego tekstu produkcyjnego.
 - Architecture/API hygiene: PASS; parser smoke i diff-check: PASS. Testy DOM/unit oraz browser/WebGL/API execution: NOT VERIFIED. Fixture używa mock API.
 - Kolejny niezależny PR04: parser długości i jawne stany, payload/preview/equality wspólną ścieżką. Zmiany parsera nie należą do commita General.
+
+
+## CI PR154 — pierwszy exact-head przebieg e3571622
+
+- control-room-contracts job115279518462 FAIL na typecheck: brak findInput w Geometry DOM oraz closure narrowing pendingApply do never w viewport regresji. Poprawiono helper i odczyt faktycznego applyOperationId ze snapshotu; wymagane ponowne CI.
+- React Doctor run38392514685 SUCCESS advisory: score90, 0 errors, 5 warnings. Wszystkie pięć async-await-in-loop dotyczą smoke-inspector: sekwencyjne resize/theme screenshot (311/331), polling Reset (555), mutacje stabilności panelu (822), polling quiet request (2774). Klasyfikacja false-positive dla proponowanej równoległości, wysoka pewność: każdy krok zależy od stanu poprzedniego kroku tej samej strony, polling wymaga kolejnej obserwacji po czasie. Nie zmieniono ani nie wyciszono reguły; nie deklarować 0 warnings.
+- browser jobs i pozostałe CI w trakcie; managedFEM queued, NOT VERIFIED. PR154 draft; pełny R0/R1 pozostaje otwarty.

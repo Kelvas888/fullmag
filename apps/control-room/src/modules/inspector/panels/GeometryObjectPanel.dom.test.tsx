@@ -904,6 +904,12 @@ function InspectorSessionProbe() {
   );
 }
 
+function findInput(root: TestNode, label: string): TestElement {
+  const input = findElements(root, (element) =>
+    element.tagName === "INPUT" && element.getAttribute("aria-label") === label)[0];
+  if (!input) throw new Error(`Missing input ${label}`);
+  return input;
+}
 function changeInput(root: TestNode, label: string, value: string): void {
   const input = findElements(root, (element) =>
     element.tagName === "INPUT" && element.getAttribute("aria-label") === label)[0];
