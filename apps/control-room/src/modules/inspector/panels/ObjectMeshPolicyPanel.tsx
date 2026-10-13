@@ -23,6 +23,7 @@ import {
   useObjectMeshSizeFieldResource,
   useObjectTopologyResource,
 } from "@/kernel/resources/geometryLifecycleResources";
+import { publishCommittedMeshPolicyResource } from "@/kernel/resources/meshPolicyResourceCache";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import {
   sessionRequestScopeKey,
@@ -57,6 +58,7 @@ import type { MeshSizeDistributionHoverBin } from "./MeshQualityChart";
 import { MeshQualityStatisticsView } from "./MeshQualityStatisticsView";
 import { emitMeshSizeHistogramHover } from "./meshSizeHistogramHover";
 import { MeshBuildHistorySection } from "./mesh-details/MeshBuildHistorySection";
+import { FemMeshReadinessGuideCard } from "./mesh-guide/FemMeshReadinessGuideCard";
 import {
   initialInspectorDraftState,
   resolveInspectorDraftState,
@@ -364,13 +366,34 @@ function ObjectMeshOverrideSection({
   updateDraft: UpdateObjectMeshPolicyDraft;
 }) {
   return (
-    <InspectorGroup title="Override">
-      <FormField
-        checked={draft.present}
-        label="Use object policy"
-        type="checkbox"
-        onChange={(event) => updateDraft({ present: event.target.checked })}
-      />
+    <InspectorGroup
+      badge={draft.present ? "custom override" : "inherited"}
+      title="Override"
+    >
+      {!draft.present ? (
+        <FeedbackBanner
+          kind="warning"
+          message="This object currently inherits global shared-domain mesh sizing. Enable Object Override to customize per-object element sizes, sweep layers, or local refinement."
+        />
+      ) : null}
+      <div className="flex items-center justify-between gap-2">
+        <FormField
+          checked={draft.present}
+          label="Use object policy"
+          type="checkbox"
+          onChange={(event) => updateDraft({ present: event.target.checked })}
+        />
+        {!draft.present ? (
+          <Button
+            size="sm"
+            type="button"
+            variant="secondary"
+            onClick={() => updateDraft({ present: true })}
+          >
+            Enable Object Override
+          </Button>
+        ) : null}
+      </div>
     </InspectorGroup>
   );
 }
@@ -804,6 +827,7 @@ export function ObjectMeshTransactionsSection({
   sessionAvailable = true,
   onApply,
   onBuild,
+  onBuildSharedDomain,
   buildLabel,
   onRevert,
   pending,
@@ -819,6 +843,7 @@ export function ObjectMeshTransactionsSection({
   sessionAvailable?: boolean;
   onApply: () => void;
   onBuild: () => void;
+  onBuildSharedDomain?: () => void;
   onRevert: () => void;
   pending: boolean;
 }) {
@@ -837,6 +862,11 @@ export function ObjectMeshTransactionsSection({
         <Button disabled={!sessionAvailable || pending || buildPending || !objectId || Boolean(validationError)} size="sm" type="button" variant="secondary" onClick={onBuild}>
           {buildPending ? "Waiting for mesh build…" : buildLabel}
         </Button>
+        {onBuildSharedDomain ? (
+          <Button disabled={!sessionAvailable || pending || buildPending || Boolean(validationError)} size="sm" type="button" variant="secondary" onClick={onBuildSharedDomain}>
+            Build Shared-Domain Mesh
+          </Button>
+        ) : null}
         <Button disabled={pending} size="sm" type="button" variant="ghost" onClick={onRevert}>
           Revert
         </Button>
@@ -1129,6 +1159,12 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
       );
       if (!isCurrentOperation()) return { ok: false };
       const revision = next.revision;
+      publishCommittedMeshPolicyResource?.(
+        resources,
+        resolveObjectMeshPolicyResourceKey(objectId),
+        operationSessionScopeKey,
+        next,
+      );
       resources.invalidate(resolveObjectMeshPolicyResourceKey(objectId), revision);
       resources.invalidate(resolveObjectMeshReportResourceKey(objectId), revision);
       resources.invalidate(resolveObjectMeshQualityResourceKey(objectId), revision);
@@ -1163,7 +1199,9 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
     topologyCapabilities,
   ]);
 
-  async function buildMesh(): Promise<void> {
+  async function buildMesh(
+    commandId: "mesh.build-selected" | "mesh.build-shared-domain" = "mesh.build-selected",
+  ): Promise<void> {
     const operationSessionScopeKey = sessionScopeKey;
     const operationContext = commandContext;
     const isCurrentOperation = () => Boolean(
@@ -1231,13 +1269,17 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
         if (!applied) return;
       }
       if (!isCurrentOperation()) return;
-      const result = await commands.execute("mesh.build-selected", operationContext);
+      const result =
+        commandId === "mesh.build-shared-domain"
+          ? await commands.execute("mesh.build-shared-domain", operationContext)
+          : await commands.execute("mesh.build-selected", operationContext);
       if (!isCurrentOperation()) return;
+      const labelPrefix = commandId === "mesh.build-shared-domain" ? "Shared-domain" : "Object";
       setFeedback({
         kind: result.status === "completed" ? "success" : result.status === "failed" ? "error" : "warning",
         message: result.message ?? (result.status === "completed"
-          ? "Object mesh build completed."
-          : result.status === "failed" ? "Object mesh build failed."
+          ? `${labelPrefix} mesh build completed.`
+          : result.status === "failed" ? `${labelPrefix} mesh build failed.`
           : result.status === "pending" ? "Build remains active; see Mesh Jobs."
           : "Mesh build was not submitted."),
       });
@@ -1314,15 +1356,21 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
       <Tabs value={activeTab} className="fm-inspector-tabs">
 
         <TabsContent value="policy" className="fm-tabs-content">
+          <FemMeshReadinessGuideCard
+            compact
+            selectedObjectId={objectId}
+            selectedObjectPolicy={resource}
+          />
           <ObjectMeshOverrideSection draft={draft} updateDraft={updateDraft} />
           <ObjectMeshTransactionsSection
-            buildLabel={isDirty ? "Apply & Build Mesh" : "Build Mesh"}
+            buildLabel={isDirty ? "Apply & Build Object Mesh" : "Build Object Mesh"}
             feedback={feedback}
             isDirty={isDirty}
             objectId={objectId}
             sessionAvailable={sessionScopeKey !== null}
             onApply={() => void (inspectorEditSession?.apply() ?? applyPolicy())}
-            onBuild={() => void buildMesh()}
+            onBuild={() => void buildMesh("mesh.build-selected")}
+            onBuildSharedDomain={() => void buildMesh("mesh.build-shared-domain")}
             onRevert={() => {
               setDraftState(
                 initialInspectorDraftState({

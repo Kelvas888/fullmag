@@ -6,6 +6,7 @@ import {
   updateAirboxMeshPolicyDraft,
   airboxMeshPolicyDraftDirty,
   defaultUniverseMeshPolicyResource,
+  draftFromEffectiveUniverseMeshPolicyResource,
   draftFromUniverseMeshPolicyResource,
   draftIdentityKeyForUniverseMeshPolicyResource,
   draftKeyForUniverseMeshPolicyResource,
@@ -93,6 +94,18 @@ describe("Airbox mesh policy draft", () => {
       paddingX: "",
       paddingY: "",
       paddingZ: "",
+    });
+
+    expect(
+      draftFromEffectiveUniverseMeshPolicyResource(resource),
+    ).toMatchObject({
+      airboxGrading: "geometric",
+      airboxGrowthRate: "1.3",
+      airboxMode: "auto",
+      authoredConfigPresent: true,
+      paddingX: "0",
+      paddingY: "0",
+      paddingZ: "0",
     });
   });
 
