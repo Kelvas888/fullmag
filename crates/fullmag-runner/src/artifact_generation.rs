@@ -669,6 +669,31 @@ mod tests {
         publish(root, None, ["eigen/spectrum.json".into(), "eigen/dispersion.csv".into()]).unwrap();
     }
     #[test]
+    fn rust_python_utf8_generation_body_golden_digest_agrees() {
+        let body = GenerationBody {
+            schema_version: IMMUTABLE_SCHEMA.into(),
+            producer: Some(PublicationOwner {
+                run_id: "run-\u{00e9}".into(),
+                stage_id: "stage:\u{03b1}".into(),
+                stage_kind: "frequency_response".into(),
+            }),
+            members: BTreeMap::from([(
+                "response/\u{03bc}.json".into(),
+                GenerationMember {
+                    byte_length: 2,
+                    sha256: "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(),
+                },
+            )]),
+        };
+        // The same UTF-8 body and golden digest are consumed by the Python
+        // generation reader regression; this checks the actual Rust serializer.
+        assert_eq!(
+            generation_id(&body).unwrap(),
+            "sha256:cc306e3a05680ba1855960fb03b9104397067da5bf29eb2794f62201e297a2e6",
+        );
+    }
+
+    #[test]
     fn immutable_v2_keeps_history_bytes_and_enforces_current_capture_fence() {
         let tmp = Temp::new();
         let first = publish_immutable(

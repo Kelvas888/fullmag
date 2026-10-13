@@ -64,3 +64,17 @@ v1/v2 priority, malformed-v2/no-fallback oraz A/B joins. Obecne DTO nie zmieniaj
 się w etapie addytywnym; przed przełączeniem routingu konieczny jest dowód, że
 logical path nie otwiera root legacy membera zamiast captured immutable membera.
 Runtime, browser i scientific qualification pozostają osobnymi bramkami.
+
+
+### Etap G3 — wspólny czytnik Python
+
+`scripts/frequency_domain_generation.py` dodaje stdlib capture/read/verify dla
+v1/v2 z tym samym body SHA i canonical marker. Nie wyprowadza ownera ani nie
+skanuje members. `read_member` oddaje dokładne hash-verified bytes; verify jest
+streaming, a bounded JSON odrzuca duplicate keys. Błędny obecny v2 nie daje
+fallbacku. Poprzedni capture jest fenced po zmianie current selector.
+Golden UTF-8 jest niezależnie sprawdzany przez rzeczywisty serializer Rust i
+czytnik Python w hosted CI. Testy Linux/Windows nie dowodzą ochrony przed
+złośliwą równoległą podmianą całego drzewa ani power-loss durability.
+Sam moduł nie przełącza producenta ani istniejących konsumentów: ich migracja
+oraz jeden wspólny publication lease pozostają obowiązkowym kolejnym etapem.
