@@ -13,6 +13,7 @@ const GENERATION_DIRECTORY: &str = "frequency_domain/generations";
 const SCHEMA: &str = "frequency_domain_artifact_generation.v1";
 const IMMUTABLE_SCHEMA: &str = "frequency_domain_artifact_generation.v2";
 const MAX_COMMIT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PUBLICATION_LEASE_TOKEN_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -315,24 +316,78 @@ fn generation_id(body: &GenerationBody) -> io::Result<String> {
 /// Exclusive final publication. A crash leaves a lease for explicit recovery;
 /// readers still reject mismatching bytes instead of accepting partial output.
 pub(crate) struct PublicationLease {
+    root: PathBuf,
     path: PathBuf,
     token: String,
 }
 impl PublicationLease {
     pub(crate) fn acquire(root: &Path) -> io::Result<Self> {
-        fs::create_dir_all(root)?;
-        let path = root.join(".frequency-domain-publication.lease");
+        if !validate_publication_root(root)? {
+            fs::create_dir_all(root)?;
+        }
+        if !validate_publication_root(root)? {
+            return Err(invalid("publication root is missing after lease setup"));
+        }
+        let canonical_root = fs::canonicalize(root)?;
+        let path = canonical_root.join(".frequency-domain-publication.lease");
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                return Err(invalid("publication lease path is redirected"));
+            }
+        }
         let token = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
         let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
         file.write_all(token.as_bytes())?;
         file.sync_all()?;
-        Ok(Self { path, token })
+        Ok(Self { root: canonical_root, path, token })
+    }
+
+    fn validate_for(&self, root: &Path) -> io::Result<PathBuf> {
+        if !validate_publication_root(root)? {
+            return Err(invalid("publication root for lease is missing"));
+        }
+        let canonical_root = fs::canonicalize(root)?;
+        if canonical_root != self.root {
+            return Err(invalid("publication lease belongs to a different canonical root"));
+        }
+        let expected_path = canonical_root.join(".frequency-domain-publication.lease");
+        if self.path != expected_path {
+            return Err(invalid("publication lease token path does not match its root"));
+        }
+        if !self.token_file_matches()? {
+            return Err(invalid("publication lease token is missing or was replaced"));
+        }
+        Ok(canonical_root)
+    }
+
+    fn token_file_matches(&self) -> io::Result<bool> {
+        let metadata = fs::symlink_metadata(&self.path)?;
+        let token_length = u64::try_from(self.token.len())
+            .map_err(|_| invalid("publication lease token length exceeds u64"))?;
+        if metadata.file_type().is_symlink()
+            || is_reparse_point(&metadata)
+            || !metadata.is_file()
+            || self.token.len() > MAX_PUBLICATION_LEASE_TOKEN_BYTES
+            || metadata.len() != token_length
+        {
+            return Ok(false);
+        }
+        let read_limit_bytes = token_length
+            .checked_add(1)
+            .ok_or_else(|| invalid("publication lease token length overflow"))?;
+        let read_limit_capacity = usize::try_from(read_limit_bytes)
+            .map_err(|_| invalid("publication lease token read bound exceeds usize"))?;
+        let mut bytes = Vec::with_capacity(read_limit_capacity);
+        fs::File::open(&self.path)?.take(read_limit_bytes).read_to_end(&mut bytes)?;
+        Ok(bytes.len() == self.token.len() && bytes.as_slice() == self.token.as_bytes())
     }
 }
 impl Drop for PublicationLease {
     fn drop(&mut self) {
         // Do not remove a replaced lease belonging to a different publisher.
-        if fs::read(&self.path).ok().as_deref() == Some(self.token.as_bytes()) {
+        let root_is_still_canonical = matches!(validate_publication_root(&self.root), Ok(true))
+            && fs::canonicalize(&self.root).ok().as_deref() == Some(self.root.as_path());
+        if root_is_still_canonical && self.token_file_matches().unwrap_or(false) {
             let _ = fs::remove_file(&self.path);
         }
     }
@@ -390,6 +445,30 @@ pub fn publish_immutable(
     member_bytes: impl IntoIterator<Item = (String, Vec<u8>)>,
 ) -> io::Result<GenerationCommit> {
     validate_publication_root(root)?;
+    let (payloads, commit) = prepare_immutable_publication(producer, member_bytes)?;
+
+    validate_publication_root(root)?;
+    let lease = PublicationLease::acquire(root)?;
+    publish_immutable_prepared(root, payloads, commit, &lease)
+}
+
+/// Publish with a lease already acquired by the caller for this canonical root.
+/// The helper validates the lease before every mutating publication phase.
+pub(crate) fn publish_immutable_with_lease(
+    root: &Path,
+    producer: Option<PublicationOwner>,
+    member_bytes: impl IntoIterator<Item = (String, Vec<u8>)>,
+    lease: &PublicationLease,
+) -> io::Result<GenerationCommit> {
+    lease.validate_for(root)?;
+    let (payloads, commit) = prepare_immutable_publication(producer, member_bytes)?;
+    publish_immutable_prepared(root, payloads, commit, lease)
+}
+
+fn prepare_immutable_publication(
+    producer: Option<PublicationOwner>,
+    member_bytes: impl IntoIterator<Item = (String, Vec<u8>)>,
+) -> io::Result<(BTreeMap<String, Vec<u8>>, GenerationCommit)> {
     if producer.as_ref().is_some_and(|owner| {
         [&owner.run_id, &owner.stage_id, &owner.stage_kind].iter().any(|value| value.trim().is_empty())
     }) {
@@ -428,10 +507,16 @@ pub fn publish_immutable(
         return Err(invalid("invalid or oversized immutable generation commit"));
     }
 
-    validate_publication_root(root)?;
-    let _lease = PublicationLease::acquire(root)?;
-    validate_publication_root(root)?;
-    let root = fs::canonicalize(root)?;
+    Ok((payloads, commit))
+}
+
+fn publish_immutable_prepared(
+    root: &Path,
+    payloads: BTreeMap<String, Vec<u8>>,
+    commit: GenerationCommit,
+    lease: &PublicationLease,
+) -> io::Result<GenerationCommit> {
+    let root = lease.validate_for(root)?;
     if marker_path_if_present(&root, IMMUTABLE_COMMIT_PATH)?.is_some() {
         capture_from_marker(
             &root,
@@ -440,6 +525,7 @@ pub fn publish_immutable(
             GenerationLayout::ImmutableV2,
         )?;
     }
+    lease.validate_for(&root)?;
     let generations_directory = ensure_directory_chain(&root, GENERATION_DIRECTORY)?;
 
     let generation_name = commit.generation_id.strip_prefix("sha256:")
@@ -456,6 +542,7 @@ pub fn publish_immutable(
             verify_members_at_directory(&existing, &commit.content.members)?;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            lease.validate_for(&root)?;
             let staging = generations_directory.join(format!(
                 ".stage-{}-{}",
                 std::process::id(),
@@ -463,10 +550,12 @@ pub fn publish_immutable(
             ));
             create_private_staging(&staging)?;
             for (relative, bytes) in &payloads {
+                lease.validate_for(&root)?;
                 write_member_bytes(&staging, relative, bytes)?;
             }
             verify_members_at_directory(&staging, &commit.content.members)?;
 
+            lease.validate_for(&root)?;
             fullmag_session::publish_directory(&staging, &destination).map_err(|error| {
                 match error.downcast::<fullmag_session::PublicationUncertain>() {
                     Ok(uncertain) => io::Error::new(io::ErrorKind::Other, uncertain),
@@ -490,6 +579,7 @@ pub fn publish_immutable(
         return Err(invalid("injected failure after immutable directory publication"));
     }
 
+    lease.validate_for(&root)?;
     crate::autosave_zarr::write_json_atomic(&root.join(IMMUTABLE_COMMIT_PATH), &commit)
         .map_err(invalid)?;
     Ok(commit)
@@ -915,6 +1005,122 @@ mod tests {
         drop(second);
         assert_eq!(fs::read(tmp.0.join(".frequency-domain-publication.lease")).unwrap(), b"replacement-owner");
     }
+
+    #[test]
+    fn immutable_v2_publishes_under_the_callers_existing_lease() {
+        let tmp = Temp::new();
+        let lease = PublicationLease::acquire(&tmp.0).unwrap();
+        let commit = publish_immutable_with_lease(
+            &tmp.0,
+            None,
+            vec![("eigen/result.json".into(), b"owned-lease".to_vec())],
+            &lease,
+        ).unwrap();
+
+        let capture = capture(&tmp.0).unwrap().unwrap();
+        assert_eq!(capture.commit.generation_id, commit.generation_id);
+        assert_eq!(
+            capture.read_member(&tmp.0, "eigen/result.json").unwrap(),
+            b"owned-lease",
+        );
+        assert_eq!(fs::read(&lease.path).unwrap(), lease.token.as_bytes());
+        assert!(PublicationLease::acquire(&tmp.0).is_err());
+    }
+
+    fn assert_invalid_lease_preserves_publication(root: &Path, lease: &PublicationLease) {
+        let marker_path = root.join(IMMUTABLE_COMMIT_PATH);
+        let marker_before = fs::read(&marker_path).unwrap();
+        let sentinel = root.join("lease-sentinel.txt");
+        fs::write(&sentinel, b"preserve-me").unwrap();
+        let generations = fs::read_dir(root.join(GENERATION_DIRECTORY)).unwrap().count();
+
+        assert!(publish_immutable_with_lease(
+            root,
+            None,
+            vec![("eigen/unpublished.json".into(), b"must-not-publish".to_vec())],
+            lease,
+        ).is_err());
+
+        assert_eq!(fs::read(&marker_path).unwrap(), marker_before);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve-me");
+        assert_eq!(fs::read_dir(root.join(GENERATION_DIRECTORY)).unwrap().count(), generations);
+    }
+
+    #[test]
+    fn immutable_v2_rejects_foreign_replaced_and_missing_leases_without_mutation() {
+        let target = Temp::new();
+        publish_immutable(
+            &target.0,
+            None,
+            vec![("eigen/current.json".into(), b"current".to_vec())],
+        ).unwrap();
+
+        let foreign_root = Temp::new();
+        let foreign_lease = PublicationLease::acquire(&foreign_root.0).unwrap();
+        assert_invalid_lease_preserves_publication(&target.0, &foreign_lease);
+
+        let replaced = PublicationLease::acquire(&target.0).unwrap();
+        fs::write(&replaced.path, b"replacement-owner").unwrap();
+        assert_invalid_lease_preserves_publication(&target.0, &replaced);
+        drop(replaced);
+        fs::remove_file(target.0.join(".frequency-domain-publication.lease")).unwrap();
+
+        let missing = PublicationLease::acquire(&target.0).unwrap();
+        fs::remove_file(&missing.path).unwrap();
+        assert_invalid_lease_preserves_publication(&target.0, &missing);
+
+        let oversized = PublicationLease::acquire(&target.0).unwrap();
+        let oversized_bytes = vec![b'x'; 1024 * 1024];
+        fs::write(&oversized.path, &oversized_bytes).unwrap();
+        assert_invalid_lease_preserves_publication(&target.0, &oversized);
+        assert_eq!(fs::read(&oversized.path).unwrap(), oversized_bytes);
+    }
+
+    #[test]
+    fn public_immutable_publisher_refuses_an_active_lease_without_mutation() {
+        let tmp = Temp::new();
+        publish_immutable(
+            &tmp.0,
+            None,
+            vec![("eigen/current.json".into(), b"current".to_vec())],
+        ).unwrap();
+        let marker_path = tmp.0.join(IMMUTABLE_COMMIT_PATH);
+        let marker_before = fs::read(&marker_path).unwrap();
+        let sentinel = tmp.0.join("lease-sentinel.txt");
+        fs::write(&sentinel, b"preserve-me").unwrap();
+        let generations = fs::read_dir(tmp.0.join(GENERATION_DIRECTORY)).unwrap().count();
+        let _active_lease = PublicationLease::acquire(&tmp.0).unwrap();
+
+        assert!(publish_immutable(
+            &tmp.0,
+            None,
+            vec![("eigen/unpublished.json".into(), b"must-not-publish".to_vec())],
+        ).is_err());
+
+        assert_eq!(fs::read(marker_path).unwrap(), marker_before);
+        assert_eq!(fs::read(sentinel).unwrap(), b"preserve-me");
+        assert_eq!(fs::read_dir(tmp.0.join(GENERATION_DIRECTORY)).unwrap().count(), generations);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_v2_rejects_a_symlink_lease_without_mutation() {
+        let tmp = Temp::new();
+        publish_immutable(
+            &tmp.0,
+            None,
+            vec![("eigen/current.json".into(), b"current".to_vec())],
+        ).unwrap();
+        let lease = PublicationLease::acquire(&tmp.0).unwrap();
+        let external_token = tmp.0.join("external-lease-token");
+        fs::write(&external_token, lease.token.as_bytes()).unwrap();
+        fs::remove_file(&lease.path).unwrap();
+        std::os::unix::fs::symlink(&external_token, &lease.path).unwrap();
+
+        assert_invalid_lease_preserves_publication(&tmp.0, &lease);
+        assert_eq!(fs::read(external_token).unwrap(), lease.token.as_bytes());
+    }
+
     #[test]
     fn legacy_and_unbound_publications_do_not_invent_owners() {
         let tmp = Temp::new(); assert!(capture(&tmp.0).unwrap().is_none()); fixture(&tmp.0);
