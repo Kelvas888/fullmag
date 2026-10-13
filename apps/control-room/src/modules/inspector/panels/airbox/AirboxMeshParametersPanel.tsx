@@ -186,7 +186,7 @@ const NUMBER_FIELDS: readonly {
 ];
 
 const VECTOR_FIELDS: readonly {
-  key: AirboxMeshPolicyTextKey;
+  key: AirboxLengthPolicyField;
   label: string;
 }[] = [
   { key: "paddingX", label: "Padding X" },
