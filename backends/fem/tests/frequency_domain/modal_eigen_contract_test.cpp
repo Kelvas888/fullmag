@@ -8518,6 +8518,8 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
         "{\"operator_family\":\"mfem_linearized_llg\","
         "\"payload_kind\":\"certified_shared_domain\"}";
 
+    const FullmagFemModalEigenRequest compact_observer_request = request;
+
     if (pattern_mismatch_fixture_only) {
         const ScopedFloquetDiagnosticEnvironment diagnostic_environment{};
         SavedEnvironmentValue fault_environment{
@@ -9607,99 +9609,177 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
             hard_ksp_nearest_result =
                 fullmag_fem_modal_eigen_solve(&hard_ksp_nearest_request);
         }
-        const bool candidate_diagnostic_serialized =
-            contains(hard_ksp_nearest_result.diagnostics_json,
-                     "\"candidate_operator_diagnostic\":{\"schema_version\":\"floquet_candidate_operator_diagnostic.v1\"") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
-                     "\"live_pc_observation\":{\"schema_version\":\"floquet_live_pc_observation.v1\"") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
-                     "\"requested\":true");
-        if (!candidate_diagnostic_serialized) {
-            std::fprintf(
-                stderr,
-                "INFO: hard-KSP candidate diagnostic missing; full diagnostics=%s\n"
-                "INFO: hard-KSP result JSON=%s\n",
-                hard_ksp_nearest_result.diagnostics_json != nullptr
-                    ? hard_ksp_nearest_result.diagnostics_json
-                    : "",
-                hard_ksp_nearest_result.result_json != nullptr
-                    ? hard_ksp_nearest_result.result_json
-                    : "");
-        }
         check(hard_ksp_nearest_result.status == FULLMAG_FEM_FD_SOLVE_ERROR &&
                   contains(hard_ksp_nearest_result.diagnostics_json,
-                           "\"unsupported_reason\":\"floquet_slepc_solve_failed\"") &&
+                           "\"stop_reason\":\"floquet_slepc_solve_failed\"") &&
                   contains(hard_ksp_nearest_result.diagnostics_json,
-                           "\"shifted_ksp_failure_probe\":{\"schema_version\":\"shifted_ksp_failure_probe.v1\""),
-              "nearest hard KSP failure serializes its failure-only scalar probe");
-        check(candidate_diagnostic_serialized,
-              "nearest hard KSP failure serializes its bounded opt-in candidate diagnostics without clipping the native result evidence");
+                           "\"shifted_ksp_failure_probe\":{\"schema_version\":\"shifted_ksp_failure_probe.v1\"") &&
+                  contains(hard_ksp_nearest_result.diagnostics_json,
+                           "\"callback_count\":") &&
+                  contains(hard_ksp_nearest_result.diagnostics_json,
+                           "\"true_probe_attempt_count\":0"),
+              "nearest hard KSP failure preserves its stop reason and failure-only scalar callback probe");
+        check(extract_json_number(
+                  hard_ksp_nearest_result.diagnostics_json,
+                  "\"callback_count\":",
+                  "hard_ksp_failure_probe_callback_count") >= 1.0,
+              "hard failure retains the actual registered callback count");
+        const bool candidate_waits_for_true_probe =
+            contains(hard_ksp_nearest_result.diagnostics_json,
+                     "\"candidate_operator_diagnostic\":{\"schema_version\":\"floquet_candidate_operator_diagnostic.v1\",\"requested\":true") &&
+            contains(hard_ksp_nearest_result.diagnostics_json,
+                     "\"reason\":\"awaiting_true_probe_candidate\"") &&
+            contains(hard_ksp_nearest_result.diagnostics_json,
+                     "\"sample_available\":false") &&
+            contains(hard_ksp_nearest_result.diagnostics_json,
+                     "\"live_pc_observation\":null");
+        check(candidate_waits_for_true_probe,
+              "hard failure keeps candidate measurements explicitly unavailable until a positive true-probe candidate exists");
+        check(contains(hard_ksp_nearest_result.diagnostics_json,
+                       "\"raw_spectrum\":{\"count_available\":") &&
+                  contains(hard_ksp_nearest_result.diagnostics_json,
+                           "\"rotated_eps_real_rad_s\":"),
+              "hard-KSP provenance carries the bounded unfiltered dense EPS raw spectrum when the existing dense oracle is requested");
+        check(extract_json_number(
+                  hard_ksp_nearest_result.diagnostics_json,
+                  "\"eps_attempt_number\":",
+                  "nearest_shifted_ksp_failure_probe") >= 1.0 &&
+                  extract_json_number(
+                      hard_ksp_nearest_result.diagnostics_json,
+                      "\"eps_nev_argument\":",
+                      "nearest_shifted_ksp_failure_probe") >= 1.0 &&
+                  extract_json_number(
+                      hard_ksp_nearest_result.diagnostics_json,
+                      "\"eps_ncv_argument\":",
+                      "nearest_shifted_ksp_failure_probe") >= 1.0,
+              "nearest failure JSON retains the actual attempt and EPS dimension arguments");
+        check(contains(hard_ksp_nearest_result.diagnostics_json,
+                       "\"scope\":\"internal_shifted_linear_system_not_original_descriptor\"") &&
+                  contains(hard_ksp_nearest_result.diagnostics_json,
+                           "\"true_probe_measurement_failure_count\":") &&
+                  contains(hard_ksp_nearest_result.diagnostics_json,
+                           "\"callback_ordinal\":"),
+              "nearest failure JSON scopes the callback norms and exposes probe availability counts");
+        if (contains(hard_ksp_nearest_result.diagnostics_json,
+                     "\"last_true_probe\":{\"available\":false")) {
+            check(contains(hard_ksp_nearest_result.diagnostics_json,
+                           "\"rhs_l2_norm\":null") &&
+                      contains(hard_ksp_nearest_result.diagnostics_json,
+                               "\"true_residual_l2_norm\":null") &&
+                      contains(hard_ksp_nearest_result.diagnostics_json,
+                               "\"threshold_l2_norm\":null"),
+                  "unavailable callback measurement values serialize as null rather than zero");
+        }
+        fullmag_fem_frequency_domain_result_destroy(&hard_ksp_nearest_result);
+        std::printf("PASS: modal_eigen_hard_ksp_nearest_diagnostics_probe\n");
+        return;
+    }
+    if (hard_ksp_probe_case == FloquetHardKspProbeCase::fresh_setup_fault) {
+        const ScopedFloquetDiagnosticEnvironment diagnostic_environment{};
+        SavedEnvironmentValue fault_environment{
+            "FULLMAG_FLOQUET_LIVE_PC_DIAGNOSTIC_FAULT"};
+        check(diagnostic_environment.ready &&
+                  set_floquet_diagnostic_environment(fault_environment.name, "") == 0,
+              "enable the private observer and clear its fault for a successful control");
+        FullmagFemModalEigenRequest fixture_request = compact_observer_request;
+        fixture_request.max_linear_iterations = 1;
+        FullmagFemFrequencyDomainResult control_result =
+            fullmag_fem_modal_eigen_solve(&fixture_request);
+        const std::string control_observation = json_object_after_key(
+            control_result.diagnostics_json, "\"candidate_operator_observation\":");
+        const std::string control_live_pc = json_object_after_key(
+            control_observation.c_str(), "\"live_pc_observation\":");
+        check(control_result.status == FULLMAG_FEM_FD_OK &&
+                  json_member_has_literal(control_observation.c_str(), "\"requested\":", "true") &&
+                  json_member_has_literal(control_observation.c_str(), "\"sample_available\":", "true") &&
+                  json_member_has_literal(control_live_pc.c_str(), "\"status\":", "\"measured\"") &&
+                  json_member_has_literal(control_live_pc.c_str(), "\"available\":", "true") &&
+                  !contains(control_result.diagnostics_json, "\"shifted_ksp_failure_probe\":"),
+              "positive control reaches a measured candidate before fresh-solve fault injection");
+        const auto solver_agrees_with_control = [&](const FullmagFemFrequencyDomainResult &candidate) {
+            if (candidate.status != FULLMAG_FEM_FD_OK || candidate.mode_count != 1u ||
+                control_result.mode_count != 1u || candidate.mode_lambda == nullptr ||
+                control_result.mode_lambda == nullptr || candidate.mode_residuals == nullptr ||
+                !std::isfinite(candidate.mode_residuals[0]) || candidate.mode_residuals[0] < 0.0 ||
+                candidate.mode_residuals[0] > fixture_request.residual_tolerance) {
+                return false;
+            }
+            const double scale = std::hypot(control_result.mode_lambda[0].real,
+                                             control_result.mode_lambda[0].imag);
+            const double defect = std::hypot(
+                candidate.mode_lambda[0].real - control_result.mode_lambda[0].real,
+                candidate.mode_lambda[0].imag - control_result.mode_lambda[0].imag);
+            return std::isfinite(scale) && scale > 0.0 && std::isfinite(defect) &&
+                defect / scale <= fixture_request.residual_tolerance;
+        };
+        check(solver_agrees_with_control(control_result),
+              "successful control result satisfies its own residual and spectral comparison");
         const bool shifted_lu_diagnostic_serialized =
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"shifted_lu_policy_comparison\":{\"schema_version\":\"floquet_shifted_lu_policy_comparison.v1\"") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"mat_shift_nonzero\":{\"factorization_shift_policy\":\"MAT_SHIFT_NONZERO\"") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"mat_shift_none\":{\"factorization_shift_policy\":\"MAT_SHIFT_NONE\"");
         check(shifted_lu_diagnostic_serialized,
-              "nearest hard KSP failure serializes separate exact-shift LU policy measurements");
+              "successful fresh-solve control serializes separate exact-shift LU policy measurements");
         const bool borrowed_pmat_copy_full_observation =
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"borrowed_pmat_copy\":{\"schema_version\":\"floquet_borrowed_pmat_copy.v1\",\"requested\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"matrix_copy_method\":\"MatDuplicate(MAT_COPY_VALUES)\"") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"full_explicit_entry_comparison_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"matrix_dimensions_match_available\":true,\"matrix_dimensions_match\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"nnz_match_available\":true,\"nnz_match\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"structural_pattern_match_available\":true,\"structural_pattern_match\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"values_equal_available\":true,\"values_equal\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"relative_frobenius_defect_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"actual_live_solver_package_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"fresh_requested_solver_package_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"fresh_shift_type_configured\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"fresh_shift_amount_configured_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"live_shift_query_status_available\":true,\"live_shift_query_status\":\"measured\"") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"actual_factorization_shift_type_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"actual_factorization_shift_amount_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"actual_factorization_shift_type_query_error_code_available\":true,\"actual_factorization_shift_type_query_error_code\":0") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"actual_factorization_shift_amount_query_error_code_available\":true,\"actual_factorization_shift_amount_query_error_code\":0") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"actual_factorization_perturbation_measured\":false") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"fresh_ksp_setup_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"fresh_solve_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"same_private_rhs_source\":\"live_pc_rhs_snapshot\"") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"same_private_rhs_l2_norm_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"fresh_pmat_residual_l2_norm_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"fresh_shifted_operator_residual_l2_norm_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"live_vs_fresh_solution_relative_defect_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"cleanup_attempted\":true,\"cleanup_succeeded_available\":true,\"cleanup_succeeded\":true");
         check(borrowed_pmat_copy_full_observation,
-              "opt-in hard-KSP diagnostics capture a complete explicit Pmat copy comparison and fresh-LU evidence on the same RHS");
+              "opt-in successful-control diagnostics capture a complete explicit Pmat copy comparison and fresh-LU evidence on the same RHS");
         const char *borrowed_pmat_full_json = std::strstr(
-            hard_ksp_nearest_result.diagnostics_json,
+            control_result.diagnostics_json,
             "\"borrowed_pmat_copy\":{");
         check(borrowed_pmat_full_json != nullptr,
               "private borrowed-Pmat count assertion is scoped to its serialized object");
@@ -9748,41 +9828,41 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
                   borrowed_pmat_copy_nnz == borrowed_pmat_reference_nnz,
               "full explicit Pmat comparison reports matching known nonzero stored-entry counts at least covering the structural diagonal");
         const bool both_shifted_lu_setups_and_solves_available =
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"mat_shift_nonzero\":{\"factorization_shift_policy\":\"MAT_SHIFT_NONZERO\",\"factorization_shift_amount_is_honored_by_policy\":true,\"actual_factorization_perturbation_measured\":false,\"factorization_setup_available\":true,\"factorization_setup_error_code\":0,\"solve_available\":true") &&
-            contains(hard_ksp_nearest_result.diagnostics_json,
+            contains(control_result.diagnostics_json,
                      "\"mat_shift_none\":{\"factorization_shift_policy\":\"MAT_SHIFT_NONE\",\"factorization_shift_amount_is_honored_by_policy\":false,\"actual_factorization_perturbation_measured\":false,\"factorization_setup_available\":true,\"factorization_setup_error_code\":0,\"solve_available\":true");
         check(both_shifted_lu_setups_and_solves_available,
-              "the real hard-KSP callback retains successful independent setup and solve evidence for both LU policies");
-        check(contains(hard_ksp_nearest_result.diagnostics_json,
+              "the real successful control callback retains successful independent setup and solve evidence for both LU policies");
+        check(contains(control_result.diagnostics_json,
                        "\"shifted_operator_action_source\":\"isolated_copy_of_production_matshell_components\"") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"pc_type_available\":true,\"pc_type_overflow\":false,\"pc_type\":\"lu\"") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"pmat_type_available\":true") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"pc_side_available\":true") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"pc_pmat_matches_expected_available\":true,\"pc_pmat_matches_expected\":true") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"candidate_unchanged_after_repeat_apply\":true") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"production_phi_rhs_unchanged_after_observation_available\":true,\"production_phi_rhs_unchanged_after_observation\":true") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"production_phi_solution_unchanged_after_observation_available\":true,\"production_phi_solution_unchanged_after_observation\":true") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"ksp_diagonal_scaling_available\":true") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"mat_shift_nonzero_solution_defect_available\":true") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"mat_shift_none_solution_defect_available\":true"),
-              "the hard-KSP JSON consumer retains live PC identity, candidate stability, and both isolated-LU differences");
+              "the successful observer JSON consumer retains live PC identity, candidate stability, and both isolated-LU differences");
         const double live_rhs_norm = extract_json_number(
-            hard_ksp_nearest_result.diagnostics_json,
+            control_result.diagnostics_json,
             "\"rhs_l2_norm\":",
             "live_pc_rhs_norm");
         const double borrowed_pmat_copy_rhs_norm = extract_json_number(
-            hard_ksp_nearest_result.diagnostics_json,
+            control_result.diagnostics_json,
             "\"same_private_rhs_l2_norm\":",
             "borrowed_pmat_copy_same_private_rhs");
         check(std::isfinite(borrowed_pmat_copy_rhs_norm) &&
@@ -9791,19 +9871,19 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
                           std::max(1.0, std::abs(live_rhs_norm)),
               "fresh Pmat LU uses the same private RHS snapshot and norm as the live PC observation");
         const double live_pmat_residual = extract_json_number(
-            hard_ksp_nearest_result.diagnostics_json,
+            control_result.diagnostics_json,
             "\"pmat_residual_l2_norm\":",
             "live_pc_pmat_residual");
         const double live_pmat_relative_residual = extract_json_number(
-            hard_ksp_nearest_result.diagnostics_json,
+            control_result.diagnostics_json,
             "\"pmat_relative_residual\":",
             "live_pc_pmat_relative_residual");
         const double live_shifted_residual = extract_json_number(
-            hard_ksp_nearest_result.diagnostics_json,
+            control_result.diagnostics_json,
             "\"shifted_operator_residual_l2_norm\":",
             "live_pc_shifted_residual");
         const double live_shifted_relative_residual = extract_json_number(
-            hard_ksp_nearest_result.diagnostics_json,
+            control_result.diagnostics_json,
             "\"shifted_operator_relative_residual\":",
             "live_pc_shifted_relative_residual");
         const double live_rhs_denominator = std::max(
@@ -9821,79 +9901,46 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
                       16.0 * std::numeric_limits<double>::epsilon() *
                           std::max(1.0, std::abs(live_shifted_relative_residual)),
               "serialized live-Pmat and normalized shifted-operator residual ratios use the same actual KSP RHS norm");
-        check(contains(hard_ksp_nearest_result.diagnostics_json,
+        check(contains(control_result.diagnostics_json,
                        "\"rhs_source\":\"live_shifted_ksp_get_rhs\"") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"operator_normalization_relation\":\"normalized_live_ksp_A_shift = operator_normalization_scale * raw_pencil_A_shift\"") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"solution_calibration\":\"P_normalized = preconditioner_normalization_scale * normalized_live_ksp_A_shift; x_A = preconditioner_normalization_scale * y_P\"") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"actual_factorization_perturbation_measured\":false") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
+                  contains(control_result.diagnostics_json,
                            "\"operator_residual_to_unchanged_ksp_threshold_ratio\":"),
               "LU JSON binds the live RHS and calibrated operator residual without claiming a measured factor perturbation");
-        check(contains(hard_ksp_nearest_result.diagnostics_json,
-                       "\"raw_spectrum\":{\"count_available\":") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
-                           "\"rotated_eps_real_rad_s\":"),
-              "hard-KSP provenance carries the bounded unfiltered dense EPS raw spectrum when the existing dense oracle is requested");
-        check(extract_json_number(
-                  hard_ksp_nearest_result.diagnostics_json,
-                  "\"eps_attempt_number\":",
-                  "nearest_shifted_ksp_failure_probe") >= 1.0 &&
-                  extract_json_number(
-                      hard_ksp_nearest_result.diagnostics_json,
-                      "\"eps_nev_argument\":",
-                      "nearest_shifted_ksp_failure_probe") >= 1.0 &&
-                  extract_json_number(
-                      hard_ksp_nearest_result.diagnostics_json,
-                      "\"eps_ncv_argument\":",
-                      "nearest_shifted_ksp_failure_probe") >= 1.0,
-              "nearest failure JSON retains the actual attempt and EPS dimension arguments");
-        check(contains(hard_ksp_nearest_result.diagnostics_json,
-                       "\"scope\":\"internal_shifted_linear_system_not_original_descriptor\"") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
-                           "\"true_probe_measurement_failure_count\":") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
-                           "\"callback_ordinal\":"),
-              "nearest failure JSON scopes the callback norms and exposes probe availability counts");
-        if (contains(hard_ksp_nearest_result.diagnostics_json,
-                     "\"last_true_probe\":{\"available\":false")) {
-            check(contains(hard_ksp_nearest_result.diagnostics_json,
-                           "\"rhs_l2_norm\":null") &&
-                      contains(hard_ksp_nearest_result.diagnostics_json,
-                               "\"true_residual_l2_norm\":null") &&
-                      contains(hard_ksp_nearest_result.diagnostics_json,
-                               "\"threshold_l2_norm\":null"),
-                  "unavailable callback measurement values serialize as null rather than zero");
-        }
-        fullmag_fem_frequency_domain_result_destroy(&hard_ksp_nearest_result);
-        std::printf("PASS: modal_eigen_hard_ksp_nearest_diagnostics_probe\n");
-        return;
-    }
-    if (hard_ksp_probe_case == FloquetHardKspProbeCase::fresh_setup_fault) {
+        const bool fault_ready = set_floquet_diagnostic_environment(
+            fault_environment.name, "fresh_solve") == 0;
+        check(fault_ready,
+              "inject fresh-solve observer fault only after the successful control measurements");
         FullmagFemFrequencyDomainResult fresh_solve_fault_result{};
-        {
-            const ScopedFloquetDiagnosticEnvironment diagnostic_environment{};
-            const bool fault_ready = diagnostic_environment.ready &&
-                set_floquet_diagnostic_environment(
-                    "FULLMAG_FLOQUET_LIVE_PC_DIAGNOSTIC_FAULT", "fresh_solve") == 0;
-            check(fault_ready,
-                  "enable the private fresh-LU fault after its owned matrix/KSP setup");
-            if (fault_ready) {
-                fresh_solve_fault_result =
-                    fullmag_fem_modal_eigen_solve(&hard_ksp_nearest_request);
-            }
+        if (fault_ready) {
+            fresh_solve_fault_result =
+                fullmag_fem_modal_eigen_solve(&fixture_request);
         }
-        check(fresh_solve_fault_result.status == FULLMAG_FEM_FD_SOLVE_ERROR &&
+        fault_environment.restore();
+        check(solver_agrees_with_control(fresh_solve_fault_result) &&
                   contains(fresh_solve_fault_result.diagnostics_json,
                            "\"fresh_solve_fault_injected\":true") &&
+                  contains(fresh_solve_fault_result.diagnostics_json,
+                           "\"fresh_ksp_setup_available\":true") &&
+                  contains(fresh_solve_fault_result.diagnostics_json,
+                           "\"fresh_solve_attempted\":true") &&
                   contains(fresh_solve_fault_result.diagnostics_json,
                            "\"fresh_solve_error_code_available\":true") &&
                   contains(fresh_solve_fault_result.diagnostics_json,
                            "\"fresh_solve_available\":false") &&
                   contains(fresh_solve_fault_result.diagnostics_json,
                            "\"fresh_pmat_residual_l2_norm_available\":false,\"fresh_pmat_residual_l2_norm\":null") &&
+                  contains(fresh_solve_fault_result.diagnostics_json,
+                           "\"fresh_pmat_relative_residual_available\":false,\"fresh_pmat_relative_residual\":null") &&
+                  contains(fresh_solve_fault_result.diagnostics_json,
+                           "\"fresh_shifted_operator_residual_l2_norm_available\":false,\"fresh_shifted_operator_residual_l2_norm\":null") &&
+                  contains(fresh_solve_fault_result.diagnostics_json,
+                           "\"fresh_shifted_operator_relative_residual_available\":false,\"fresh_shifted_operator_relative_residual\":null") &&
                   contains(fresh_solve_fault_result.diagnostics_json,
                            "\"cleanup_attempted\":true,\"cleanup_succeeded_available\":true,\"cleanup_succeeded\":true") &&
                   contains(fresh_solve_fault_result.diagnostics_json,
@@ -9902,12 +9949,12 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
                            "\"production_phi_rhs_unchanged_after_observation_available\":true,\"production_phi_rhs_unchanged_after_observation\":true") &&
                   contains(fresh_solve_fault_result.diagnostics_json,
                            "\"production_phi_solution_unchanged_after_observation_available\":true,\"production_phi_solution_unchanged_after_observation\":true"),
-              "fresh-LU measurement failure stays unavailable, cleans its owned graph, and preserves live/production workspaces");
+              "reached fresh-solve fault leaves observer measurements unavailable, cleans up, preserves workspaces, and keeps solver output equal to control");
         fullmag_fem_frequency_domain_result_destroy(&fresh_solve_fault_result);
+        fullmag_fem_frequency_domain_result_destroy(&control_result);
         std::printf("PASS: modal_eigen_hard_ksp_fresh_setup_fault_probe\n");
         return;
     }
-
     if (hard_ksp_probe_case == FloquetHardKspProbeCase::window) {
         constexpr double hard_ksp_two_pi = 2.0 * 3.14159265358979323846;
         // Keep a positive symmetric test window; the Ms scale may exceed H0.

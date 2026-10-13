@@ -79,3 +79,9 @@ Implementacja dodaje publiczny owner PREONLY/PCSHELL zachowujący STSINVERT i we
 Profil CI obejmuje 14 dotychczasowych przypadków i 3 nowe regresje: mixed recovery, wyczerpany budżet oraz dokładną granicę progu/zero RHS. Stan: SOURCE IMPLEMENTED, NATIVE VERIFICATION PENDING. Nie kwalifikuje managed sweep, COMSOL A1, browser ani GPU.
 
 G0: GHA38372200187 PASS, sześć regresji receiptów nieudanego wykonania; nie zmienia głównego błędu ani statusu kwalifikacji. C03 zachowuje fail-closed publication bez immutable history.
+
+### Native19/21 — poprawka fixture bez utraty coverage
+
+Poprawiono wyłącznie modal_eigen_contract_test.cpp. Hard nearest oczekuje serialized stop_reason, dodatnich callbacków, zerowych true-probe attempts oraz requested/no-sample/awaiting state i nullowych niedostępnych pomiarów. Zachowuje scalar failure probe, raw spectrum, actual EPS argumenty i scope. Pełne dotychczasowe checks Pmat, obu LU policy setup/solve, wspólnego RHS, residual ratios, normalizacji, stabilności i workspace przeniesiono do dodatniego control przed fresh_solve fault; nie zniknęły z wykonywalnego coverage.
+
+Fresh-solve fault używa zachowanego początkowego compact_observer_request, tak jak istniejący pozytywny pattern fixture, i wymaga osiągniętego injection, unavailable/null measurement, cleanup/unchanged state oraz solvera zgodnego z control. Root review wykryło i wyeliminowało odziedziczenie późniejszego request.residual_tolerance=0.0, bez nowej stałej tolerancji. Selektory/profil21/CMake niezmienione, production solver/admission bez zmian. Source hashD8FA8981CB7556CBC513C2B63F0DDFCE6E5F08CAF2F8DE196C15AE9EC5CEC052. Source diff review i check bez kompilacji; nowa native bramka pending hosted execution.
