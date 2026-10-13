@@ -4,7 +4,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { createCommandContext } from "@/kernel/commands/commandContext";
 import { runFdmGridRefreshOperation } from "@/kernel/authoring/geometryLifecycleCommandContributions";
+import { parseQuantityInput } from "@/kernel/authoring/object-edit/quantityInput";
 import { useKernel } from "@/kernel/KernelContext";
+import { visualizationTargetIdForSceneObject } from "@/kernel/selection/selectionTypes";
 import {
   sessionRequestScopeKey,
 } from "@/kernel/resources/sessionResourceIdentity";
@@ -14,6 +16,8 @@ import {
   MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY,
   SCENE_RESOURCE_KEY,
   MESH_UNIVERSE_POLICY_RESOURCE_KEY,
+  useGeometryDiagnosticsResource,
+  useSceneResource,
   useUniverseMeshPolicyResource,
 } from "@/kernel/resources/geometryLifecycleResources";
 import { Button } from "@/shared/ui/Button";
@@ -27,6 +31,7 @@ import { FeedbackBanner } from "../../primitives/FeedbackBanner";
 import { AirboxFieldRow as FieldRow, boundedDisplayText } from "./airboxDisplay";
 import { FormField } from "../../primitives/FormField";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
+import { QuantityUnitSelect } from "../../primitives/QuantityUnitSelect";
 import {
   initialInspectorDraftState,
   resolveInspectorDraftState,
@@ -35,6 +40,7 @@ import {
 } from "../inspectorDraftState";
 import {
   AIRBOX_GRADING_MODES,
+  updateAirboxLengthUnit,
   airboxMeshPolicyDraftDirty,
   airboxMeshPolicyJsonError,
   updateAirboxMeshPolicyDraft,
@@ -44,9 +50,15 @@ import {
   draftIdentityKeyForUniverseMeshPolicyResource,
   draftKeyForUniverseMeshPolicyResource,
   type AirboxMeshPolicyDraft,
+  type AirboxLengthPolicyField,
+  type AirboxLengthUnit,
   type AirboxMeshPolicyLane,
 } from "./airboxMeshPolicyDraft";
-import type { MeshUniverseConfigReplaceRequest, MeshUniverseConfigResource } from "@/kernel/api/apiTypes";
+import type {
+  GeometryDiagnosticsResource,
+  MeshUniverseConfigReplaceRequest,
+  MeshUniverseConfigResource,
+} from "@/kernel/api/apiTypes";
 
 type Feedback = { kind: "error" | "success" | "warning"; message: string } | null;
 
@@ -70,9 +82,95 @@ export async function submitAirboxPolicyDraft(
     : undefined;
   return { kind: "submitted", resource: await replace(result.request, requestOptions) } as const;
 }
+
+function GeometryBoundsDiagnosticNotice({
+  diagnostics,
+  error,
+  onAdjustBounds,
+  onOpenDiagnostics,
+  onSelectObject,
+  sceneRevision,
+  status,
+}: {
+  diagnostics: GeometryDiagnosticsResource | null;
+  error?: unknown;
+  onAdjustBounds: () => void;
+  onOpenDiagnostics: () => void;
+  onSelectObject: (objectId: string) => void;
+  sceneRevision: number | null;
+  status: string;
+}) {
+  const outside = diagnostics?.diagnostics.filter(
+    (diagnostic) => diagnostic.code === "GEOMETRY_OBJECT_OUTSIDE_UNIVERSE",
+  ) ?? [];
+  const stale = Boolean(
+    diagnostics &&
+      sceneRevision !== null &&
+      diagnostics.scene_revision !== sceneRevision,
+  );
+  if (error || status === "error") {
+    return (
+      <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group" role="status">
+        <p>Backend geometry diagnostics could not be loaded.</p>
+        <p>{boundedDisplayText(error instanceof Error ? error.message : String(error ?? "No error details published."))}</p>
+        <Button size="sm" type="button" variant="secondary" onClick={onOpenDiagnostics}>Open diagnostics</Button>
+      </div>
+    );
+  }
+  if (!diagnostics) {
+    return (
+      <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group" role="status">
+        <p>{status === "loading" ? "Checking backend geometry diagnostics for manual bounds." : "Geometry diagnostics are not available for this session."}</p>
+        <Button size="sm" type="button" variant="secondary" onClick={onOpenDiagnostics}>Open diagnostics</Button>
+      </div>
+    );
+  }
+  if (stale) {
+    return (
+      <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group" role="status">
+        <p>Backend geometry diagnostics are for scene revision {diagnostics.scene_revision}; current scene revision is {sceneRevision}.</p>
+        <Button size="sm" type="button" variant="secondary" onClick={onOpenDiagnostics}>Open current diagnostics</Button>
+      </div>
+    );
+  }
+  if (outside.length === 0) {
+    return (
+      <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group" role="status">
+        <p>The backend has not published GEOMETRY_OBJECT_OUTSIDE_UNIVERSE for scene revision {diagnostics.scene_revision}.</p>
+        <Button size="sm" type="button" variant="secondary" onClick={onOpenDiagnostics}>Open diagnostics</Button>
+      </div>
+    );
+  }
+  return (
+    <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group" role="status">
+      {outside.map((diagnostic) => (
+        <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group" key={diagnostic.id}>
+          <p>{diagnostic.message}</p>
+          <FieldRow label="Backend diagnostic" value={diagnostic.code} />
+          <FieldRow label="Severity" value={diagnostic.severity} />
+          <FieldRow label="Backend blocks" value={diagnostic.blocks?.join(", ") ?? "not published"} />
+          {diagnostic.geometry_path ? <FieldRow label="Geometry path" value={diagnostic.geometry_path} /> : null}
+          {diagnostic.object_id ? (
+            <Button size="sm" type="button" variant="secondary" onClick={() => onSelectObject(diagnostic.object_id!)}>
+              Select object to adjust placement
+            </Button>
+          ) : null}
+        </div>
+      ))}
+      <div className="fm-inspector-toolbar">
+        <Button size="sm" type="button" variant="primary" onClick={onAdjustBounds}>Adjust manual bounds</Button>
+        <Button size="sm" type="button" variant="secondary" onClick={onOpenDiagnostics}>Open diagnostics</Button>
+      </div>
+    </div>
+  );
+}
 type AirboxMeshPolicyTextKey = Exclude<
   keyof AirboxMeshPolicyDraft,
-  "airboxGradingAuthored" | "authoredConfigPresent" | "syncedConfigText" | "configSynchronized"
+  | "airboxGradingAuthored"
+  | "authoredConfigPresent"
+  | "syncedConfigText"
+  | "configSynchronized"
+  | "quantityUnits"
 >;
 
 const NUMBER_FIELDS: readonly {
@@ -124,9 +222,11 @@ export type AirboxMeshParametersLane = "fem" | "fdm";
 
 export function AirboxMeshParametersPanel({
   lane = "fem",
+  runtimeLane = null,
   selection,
 }: InspectorPanelProps & {
   lane?: AirboxMeshParametersLane;
+  runtimeLane?: AirboxMeshParametersLane | null;
 }) {
   void selection;
   const isFdm = lane === "fdm";
@@ -196,6 +296,11 @@ export function AirboxMeshParametersPanel({
     [kernel, sessionScopeKey],
   );
   const inspectorEditSession = useInspectorEditSession();
+  const effectiveMode = draft.airboxMode.trim() || "auto";
+  const invalidMode = effectiveMode !== "auto" && effectiveMode !== "manual";
+  const manualPolicy = effectiveMode === "manual";
+  const geometryDiagnostics = useGeometryDiagnosticsResource({ enabled: manualPolicy });
+  const scene = useSceneResource({ enabled: manualPolicy });
 
   const updateDraft = (patch: Partial<AirboxMeshPolicyDraft>) =>
     setDraftState(
@@ -208,6 +313,38 @@ export function AirboxMeshParametersPanel({
         patch: updateAirboxMeshPolicyDraft(draft, patch, { lane }),
       }),
     );
+
+  const updateLengthUnit = (
+    field: AirboxLengthPolicyField,
+    unit: AirboxLengthUnit,
+  ) => {
+    const nextDraft = updateAirboxLengthUnit(draft, field, unit, { lane });
+    setDraftState(
+      updateInspectorDraftState({
+        baseDraft,
+        baseKey,
+        currentDraft: draft,
+        identityKey,
+        isDirty: airboxMeshPolicyDraftDirty,
+        patch: nextDraft,
+      }),
+    );
+  };
+
+  const lengthUnitControl = (
+    field: AirboxLengthPolicyField,
+    label: string,
+  ) => (
+    <QuantityUnitSelect
+      input={parseQuantityInput(
+        draft[field],
+        "length",
+        draft.quantityUnits?.[field] ?? "m",
+      )}
+      label={label}
+      onChange={(unit) => updateLengthUnit(field, unit as AirboxLengthUnit)}
+    />
+  );
 
   useEffect(() => {
     const offRestore = kernel.bus.on("mesh:build-history-restore-requested", (event) => {
@@ -279,7 +416,7 @@ export function AirboxMeshParametersPanel({
       resources.invalidate(MESH_BUILD_CURRENT_RESOURCE_KEY, next.revision);
       resources.invalidate(MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY, next.revision);
       let fdmReplanMessage: Feedback | null = null;
-      if (isFdm) {
+      if (isFdm && runtimeLane === "fdm") {
         try {
           const committedScene = await api.model.scene({
             sessionScopeKey: operationSessionScopeKey,
@@ -325,7 +462,9 @@ export function AirboxMeshParametersPanel({
           kind: fdmReplanMessage?.kind ?? "success",
           message:
             fdmReplanMessage?.message ??
-            "Canonical Airbox policy saved. The realized shared-domain mesh is stale until rebuilt.",
+            (isFdm
+              ? "Canonical Universe policy saved. FDM grid realization remains pending until the runtime lane resolves."
+              : "Canonical Airbox policy saved. The realized shared-domain mesh is stale until rebuilt."),
         });
       }
       return true;
@@ -424,7 +563,9 @@ export function AirboxMeshParametersPanel({
         {isFdm ? (
           <FeedbackBanner
             kind="warning"
-            message="Apply Airbox Policy saves the canonical policy and queues an atomic FDM grid replan."
+            message={runtimeLane === "fdm"
+              ? "Apply Universe Policy saves the canonical policy and queues an FDM grid replan."
+              : "Apply Universe Policy saves canonical authoring. FDM grid actions wait for runtime lane resolution."}
           />
         ) : null}
         {dirty ? (
@@ -432,16 +573,18 @@ export function AirboxMeshParametersPanel({
             kind="warning"
             message={
               isFdm
-                ? "Unapplied changes. Apply Airbox Policy to save and queue the FDM grid replan."
+                ? runtimeLane === "fdm"
+                  ? "Unapplied changes. Apply Universe Policy to save and queue the FDM grid replan."
+                  : "Unapplied changes. Apply Universe Policy to save the canonical policy."
                 : "Unapplied changes. Apply Airbox Policy or Apply & Build before trusting the current Airbox mesh."
             }
           />
         ) : null}
         <div className="fm-inspector-toolbar">
           <Button disabled={!sessionScopeKey || pending || validationError !== null} size="sm" type="button" variant="primary" onClick={() => void (inspectorEditSession?.apply() ?? applyPolicy())}>
-            Apply Airbox Policy
+            Apply Universe Policy
           </Button>
-          {!isFdm ? (
+          {!isFdm && runtimeLane === "fem" ? (
             <Button disabled={!sessionScopeKey || pending || buildPending || validationError !== null} size="sm" type="button" variant="secondary" onClick={() => void build()}>
               {buildPending ? "Waiting for mesh build…" : dirty ? "Apply & Build Shared-Domain Mesh" : "Build Shared-Domain Mesh"}
             </Button>
@@ -452,6 +595,17 @@ export function AirboxMeshParametersPanel({
         </div>
         {validationError ? <FeedbackBanner kind="error" message={validationError} /> : null}
         {feedback ? <FeedbackBanner kind={feedback.kind} message={feedback.message} /> : null}
+        {!isFdm && runtimeLane !== "fem" ? (
+          <>
+            <FeedbackBanner
+              kind="warning"
+              message="The FEM policy can be saved now. Shared-domain mesh actions require a resolved runtime lane."
+            />
+            <Button size="sm" type="button" variant="secondary" onClick={() => kernel.layout.openBottomPanel("diagnostics")}>
+              Open diagnostics
+            </Button>
+          </>
+        ) : null}
       </InspectorGroup>
       <fieldset disabled={jsonError !== null} className="fm-mesh-policy-fields contents">
         <InspectorGroup title="Canonical Authored Parameters" badge="Python round-trip">
@@ -466,6 +620,9 @@ export function AirboxMeshParametersPanel({
                   inputMode="decimal"
                   error={fieldError(label)}
                   unit={unit}
+                  unitControl={key === "airboxHmax" || key === "airboxHmin"
+                    ? lengthUnitControl(key, label)
+                    : undefined}
                   value={draft[key]}
                   onChange={(event) => updateDraft({ [key]: event.target.value })}
                 />
@@ -493,29 +650,79 @@ export function AirboxMeshParametersPanel({
             />
           )}
         </InspectorGroup>
-        <InspectorGroup title="Canonical Airbox Geometry" badge="Python round-trip">
+        <InspectorGroup title="Canonical Universe Geometry" badge="Python round-trip">
           <FormField
             label="Domain mode"
             type="select"
-            value={draft.airboxMode}
+            error={fieldError("Domain mode")}
+            value={effectiveMode}
             onChange={(event) => updateDraft({ airboxMode: event.target.value })}
           >
-            <option value="">Inherited</option>
+            {invalidMode ? <option disabled value={effectiveMode}>Invalid authored mode: {effectiveMode}</option> : null}
             <option value="auto">Auto</option>
             <option value="manual">Manual</option>
           </FormField>
-          {VECTOR_FIELDS.map(({ key, label }) => (
+          {effectiveMode === "auto" ? (
+            <FeedbackBanner
+              kind="warning"
+              message={draft.airboxMode.trim()
+                ? "Automatic bounds are derived from accepted geometry. No manual extents are authored here."
+                : "Automatic is the canonical default. Bounds are determined after geometry is available; no zero extents are created."}
+            />
+          ) : null}
+          {VECTOR_FIELDS.filter(({ key }) => key.startsWith("padding") || manualPolicy).map(({ key, label }) => (
             <FormField
               key={key}
               label={label}
               type="text"
               inputMode="decimal"
               error={fieldError(label)}
-              unit="m"
+              unitControl={lengthUnitControl(key, label)}
               value={draft[key]}
               onChange={(event) => updateDraft({ [key]: event.target.value })}
             />
           ))}
+          {manualPolicy ? (
+            <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group" id="fm-airbox-manual-bounds" tabIndex={-1}>
+              <FeedbackBanner
+                kind="warning"
+                message="Manual mode requires three positive size components. Center may be omitted (canonical origin); if entered, provide all three components. Values are stored in SI."
+              />
+              <InspectorGroup title="Backend geometry diagnostics" badge={geometryDiagnostics.status}>
+            <p>
+              Diagnostics describe the committed backend policy and scene. Apply edited bounds before relying on a refreshed result.
+            </p>
+                <GeometryBoundsDiagnosticNotice
+                  diagnostics={geometryDiagnostics.data ?? null}
+                  error={geometryDiagnostics.error}
+                  sceneRevision={scene.data?.scene_revision ?? scene.data?.revision ?? null}
+                  status={geometryDiagnostics.status}
+                  onAdjustBounds={() => {
+                    const target = document.getElementById("fm-airbox-manual-bounds");
+                    target?.scrollIntoView?.({ block: "center", behavior: "smooth" });
+                    target?.focus();
+                  }}
+                  onOpenDiagnostics={() => kernel.layout.openBottomPanel("diagnostics")}
+                  onSelectObject={(objectId) => {
+                    const nodeId = `model:object:${objectId}`;
+                    kernel.selection.set({
+                      kind: "object.root",
+                      label: objectId,
+                      nodeId,
+                      objectId,
+                      ref: {
+                        kind: "object.root",
+                        nodeId,
+                        objectId,
+                        type: "scene-object",
+                        visualizationTargetId: visualizationTargetIdForSceneObject(objectId, null),
+                      },
+                    }, "inspector");
+                  }}
+                />
+              </InspectorGroup>
+            </div>
+          ) : null}
         </InspectorGroup>
       </fieldset>
       <InspectorGroup title="Backend-effective Values" badge="read-only">

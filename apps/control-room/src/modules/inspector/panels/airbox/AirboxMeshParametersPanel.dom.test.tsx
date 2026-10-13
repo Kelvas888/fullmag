@@ -8,6 +8,7 @@ import {
   findElement,
   installSimulationPreparationTestDom,
   TestEvent,
+  findElements,
 } from "@/kernel/layout/simulationPreparationTestDom.test-support";
 
 const mocks = vi.hoisted(() => ({
@@ -34,6 +35,8 @@ vi.mock("@/kernel/resources/geometryLifecycleResources", () => ({
   MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY: "meshing:build-latest-successful",
   MESH_UNIVERSE_POLICY_RESOURCE_KEY: "meshing:universe-policy",
   SCENE_RESOURCE_KEY: "model:scene",
+  useGeometryDiagnosticsResource: () => ({ data: null, error: null, status: "idle" }),
+  useSceneResource: () => ({ data: null, error: null, status: "idle" }),
   useUniverseMeshPolicyResource: () => ({
     data: { config: null, effective_config: { mode: "auto" }, revision: 1 },
     status: "ready",
@@ -67,6 +70,37 @@ describe("AirboxMeshParametersPanel session fencing", () => {
     vi.clearAllMocks();
     mocks.identity = { sessionEpoch: "4", sessionId: "A", requestScopeEpoch: "4" };
     mocks.scopeKey = "session=A&epoch=4&request_scope_epoch=4";
+  });
+
+  it("keeps empty automatic bounds unset and exposes manual fields only after choosing Manual", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+
+    try {
+      await act(async () => root.render(
+        <KernelContext.Provider value={kernel()}>
+          <AirboxMeshParametersPanel selection={null as never} />
+        </KernelContext.Provider>,
+      ));
+
+      const mode = control(container, "Domain mode");
+      expect(mode.value).toBe("auto");
+      expect(findElements(container, (element) => ["Size X", "Size Y", "Size Z", "Center X", "Center Y", "Center Z"].includes(element.getAttribute("aria-label") ?? ""))).toHaveLength(0);
+      expect(container.textContent).toContain("Bounds are determined after geometry is available; no zero extents are created.");
+
+      mode.value = "manual";
+      await act(async () => mode.dispatchEvent(new TestEvent("change", { bubbles: true })));
+
+      expect(control(container, "Size X").value).toBe("");
+      expect(control(container, "Size Y").value).toBe("");
+      expect(control(container, "Size Z").value).toBe("");
+      expect(control(container, "Center X").value).toBe("");
+      expect(container.textContent).toContain("Center may be omitted (canonical origin)");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
   });
 
   it("sends the scoped policy write and invalidates resources after its acknowledgement", async () => {

@@ -155,6 +155,7 @@ try {
     qualification: "production_status_bar_with_mock_api_legacy_fem_status",
     real_backend_verified: false,
   }, null, 2));
+  await qualifyFirstRunGuideRouting(page, inspector, screenshotFiles, fixture);
   await qualifyExplorerKeyboardNavigation(page);
   await qualifyInspectorRoutingMatrix(page, inspector, screenshotFiles, fixture);
   await qualifyMagneticTextureMutationStability(page, inspector, fixture);
@@ -2552,7 +2553,17 @@ async function installInspectorFixtureApi(page, fixture) {
         rotate: { available: true, reason: null },
         scale: { available: true, reason: null },
       },
-      checks: [],
+      checks: [
+        { id: "method", label: "Simulation method", state: "complete", target_resource: "model/study" },
+        { id: "domain", label: "Domain policy", state: "complete", target_resource: "meshing/policies/universe", reason: "Automatic domain follows authored geometry." },
+        { id: "geometry", label: "Geometry", state: "complete", target_resource: "model/scene" },
+        { id: "material", label: "Material", state: "blocked", target_resource: "model/objects/film", reason: "Assign a material to Film." },
+        { id: "texture", label: "Initial magnetization", state: "complete", target_resource: "model/objects/film" },
+        { id: "interactions", label: "Interactions", state: "complete", target_resource: "model/objects/film" },
+        { id: "discretization", label: "Discretization", state: "complete", target_resource: fixture.fdmBuildGridMode ? "model/study" : "meshing/builds/current" },
+        { id: "study", label: "Study", state: "blocked", target_resource: "model/study", reason: "Add a study stage." },
+        { id: "execution", label: "Execution request", state: "complete", target_resource: "model/study", reason: "Device support is checked during preparation for each run." },
+      ],
       ready_to_export: true,
       ready_to_run: false,
       scene_revision: fixture.revision,
@@ -3378,4 +3389,28 @@ function inspectorFrequencyResponseSweep() {
     schema_version: "frequency_domain_response_sweep.v2",
     status: "ready",
   };
+}
+
+
+async function qualifyFirstRunGuideRouting(page, inspector, screenshotFiles, fixture) {
+  const guide = page.getByTestId("scratch-authoring-guide");
+  await guide.waitFor({ state: "visible", timeout: 30_000 });
+  const material = guide.locator('[data-check-id="material"]');
+  await material.getByRole("button", { name: "Material", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector(".fm-inspector__title")?.textContent === "Material Assignment");
+  assert(await inspector.locator(".fm-inspector-panel").count(), "Guide material action must mount the existing Inspector.");
+  await guide.locator('[data-check-id="domain"]').getByRole("button", { name: "Configure domain", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector(".fm-inspector__title")?.textContent === "Universe");
+  assert(!(await inspector.innerText()).includes("Session discretization is unresolved"), "Known FEM must not require engine resolution to edit Universe.");
+  const webgl = await assertHealthyViewportCanvas(page, "First-run guide navigation");
+  const screenshot = "first-run-guide-domain.png";
+  await page.screenshot({ path: resolve(outputDir, screenshot) });
+  screenshotFiles.push(screenshot);
+  await writeFile(resolve(outputDir, "first-run-guide-proof.json"), JSON.stringify({
+    schema: "fullmag_first_run_guide_browser_proof_v1", scene_revision: fixture.revision,
+    guide_revision: await guide.getAttribute("data-readiness-revision"),
+    actions: ["material -> existing Film Material Assignment", "complete domain -> existing Universe"],
+    check_ids: await guide.locator("[data-check-id]").evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-check-id"))),
+    webgl, screenshot, qualification: "production_workspace_with_mock_api", real_backend_verified: false,
+  }, null, 2));
 }

@@ -10,6 +10,7 @@ import {
   draftIdentityKeyForUniverseMeshPolicyResource,
   draftKeyForUniverseMeshPolicyResource,
   formatUniverseMeshPolicyConfig,
+  updateAirboxLengthUnit,
 } from "./airboxMeshPolicyDraft";
 
 describe("Airbox mesh policy draft", () => {
@@ -195,6 +196,51 @@ describe("Airbox mesh policy draft", () => {
     });
   });
 
+  it("keeps an empty automatic domain policy free of zero-filled bounds", () => {
+    const draft = {
+      ...draftFromUniverseMeshPolicyResource({ config: null, revision: 1 }),
+      airboxMode: "auto",
+    };
+
+    expect(buildAirboxMeshPolicyReplaceRequest(draft)).toEqual({
+      request: { config: { mode: "auto" } },
+    });
+  });
+
+  it("requires explicit positive manual size but preserves the canonical omitted-center behavior", () => {
+    const empty = draftFromUniverseMeshPolicyResource({ config: null, revision: 2 });
+    const manual = {
+      ...empty,
+      airboxMode: "manual",
+      airboxSizeX: "2e-9",
+      airboxSizeY: "3e-9",
+      airboxSizeZ: "4e-9",
+    };
+
+    expect(buildAirboxMeshPolicyReplaceRequest(manual)).toEqual({
+      request: {
+        config: { mode: "manual", size: [2e-9, 3e-9, 4e-9] },
+      },
+    });
+    expect(buildAirboxMeshPolicyReplaceRequest({ ...manual, airboxSizeZ: "" })).toEqual({
+      error: "Manual size requires all three explicit components.",
+    });
+  });
+
+  it("stores unit-edited lengths in SI while retaining the readable display unit", () => {
+    const base = draftFromUniverseMeshPolicyResource({
+      config: { airbox_hmax: 2e-9 },
+      revision: 3,
+    });
+    const nanometers = updateAirboxLengthUnit(base, "airboxHmax", "nm");
+
+    expect(nanometers.airboxHmax).toBe("2");
+    expect(nanometers.quantityUnits?.airboxHmax).toBe("nm");
+    expect(buildAirboxMeshPolicyReplaceRequest(nanometers)).toEqual({
+      request: { config: { airbox_hmax: 2e-9 } },
+    });
+  });
+
   it("builds the shared geometry PUT payload used by FDM Airbox", () => {
     const draft = draftFromUniverseMeshPolicyResource({
       config: {
@@ -314,6 +360,33 @@ describe("synchronized mesh parameter editing", () => {
     const fixed = updateAirboxMeshPolicyDraft(invalid, { configText: '{"airbox_hmax":4e-8}' });
     expect(fixed.airboxHmax).toBe("4e-8");
     expect(buildAirboxMeshPolicyReplaceRequest(fixed)).toMatchObject({ request: { config: { airbox_hmax: 4e-8 } } });
+  });
+
+  it("keeps JSON SI values in the selected display unit through later structured edits", () => {
+    const initial = draftFromUniverseMeshPolicyResource({
+      config: { airbox_hmax: 1e-8 },
+      revision: 1,
+    });
+    const nanometers = updateAirboxLengthUnit(initial, "airboxHmax", "nm");
+
+    expect(nanometers.airboxHmax).toBe("10");
+    const json = updateAirboxMeshPolicyDraft(nanometers, {
+      configText: '{"airbox_hmax":2e-8}',
+    });
+    expect(json.airboxHmax).toBe("20");
+    expect(json.quantityUnits?.airboxHmax).toBe("nm");
+    expect(airboxMeshPolicyDraftDirty(json, initial)).toBe(true);
+    expect(buildAirboxMeshPolicyReplaceRequest(json)).toMatchObject({
+      request: { config: { airbox_hmax: 2e-8 } },
+    });
+
+    const structured = updateAirboxMeshPolicyDraft(json, { airboxHmax: "30" });
+    expect(structured.airboxHmax).toBe("30");
+    expect(structured.quantityUnits?.airboxHmax).toBe("nm");
+    expect(JSON.parse(structured.configText)).toMatchObject({ airbox_hmax: 3e-8 });
+    expect(buildAirboxMeshPolicyReplaceRequest(structured)).toMatchObject({
+      request: { config: { airbox_hmax: 3e-8 } },
+    });
   });
 
   it("preserves invalid structured text and prevents submission until corrected", () => {

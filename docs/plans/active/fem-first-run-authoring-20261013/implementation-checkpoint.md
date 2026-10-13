@@ -26,3 +26,17 @@ Read-only `local_runner_cli.py container-status`: exit 1, `Container profile all
 ## Pozostałe kroki
 
 Dokończenie i review UI, nowy CI, browser proof, próba realnego authoring z zarządzanego Windows workspace oraz osobna ocena managed FEM, integracja PR, fast-forward chronionego mastera i cleanup dokładnego worktree. Całe R0/R1 D07 i kwalifikacja wydania nie są zamknięte.
+
+## Etap P0 zapisany i CI
+
+Commit `3d8a1b1ac2290ebe9f39ee8cd05521e0be5971e0`: authored method, readiness, manual admission i ADR 0053. GitHub Actions run `38424872870`, attempt 2: wszystkie osiem bramek SUCCESS, w tym Rust i browser. Cztery nowe API regresje były zielone już w attempt 1; niezmieniony `session_recovery_is_scoped_to_current_session` zwrócił 500 zamiast 200. Powtórzono wyłącznie tę bramkę bez osłabienia asercji. Nie ustalono przyczyny pierwotnego 500. React Doctor run `38424872996`: SUCCESS; wynik advisory nie dowodzi braku całego istniejącego długu.
+
+Nowe UI obejmuje przewodnik, wspólny trwały host NewProblemDialog, potwierdzenie session collection przed nawigacją, Universe i SI. Review wykrył rozjazd SI JSON i wybranej jednostki nm; poprawka i regresja są częścią następnego etapu. Browser fixture prowadzi do Material Assignment i Universe oraz zapisuje WebGL proof. CI rozszerzono o wykonanie `fullmag-authoring manual_universe`, ponieważ wcześniejszy filtr rotated nie wykonywał tych nowych testów.
+
+### Runner i retencja przed buildem
+
+Rozwiązano blokadę klienta: konfiguracja hosta zawiera zatwierdzony profil runtime-v2, którego stary klient zadania nie rozpoznaje. Zweryfikowany istniejący klient `fem-script-launch-20261013` (HEAD `e0d64ca97af68e7c125fa79aaf5c3014b63a0c8d`, pliki klienta czyste) z jawnym `--worktree` tego zadania zwrócił health.ok=true, worker_alive=true, accepting_jobs=true, pustą kolejkę i brak aktywnych jobów. Konfiguracji ani źródeł obcego zadania nie zmieniono.
+
+Na odczycie preflight dostępne 23 258 718 208 bajtów. Nie ma zakończonych danych nowego etapu wykazanych jako zbędne; cache przyrostowy, runtime użytkownika, logi i evidence pozostają zachowane. Zarządzany fem-cpu-release buduje target native `fullmag_fem`, nie targety testowe, i produkcyjny CLI/API oraz static web; lokalny zakaz kompilowania testów pozostaje w mocy. Build i realny happy path nadal NOT VERIFIED do terminalnego receiptu i obserwacji.
+
+Finalny source review UI: brak kolejnych konkretnych P1/P2; poprawiono JSON SI → aktualna jednostka kontrolki i dodano nm round-trip regression. Odczyt runnera `/storage` zwrócił magic `1021997` (9p), poza allowlistą session persistence w managed-browser launcherze. Dlatego realna trwała sesja FEM na tej bind-mounted trasie pozostaje blokowana; nie obniżono allowlisty. Listing własnych jobów zwrócił HTTP 500; przed zleceniem builda należy ponownie sprawdzić zdrowie koordynatora.

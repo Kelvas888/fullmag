@@ -1,7 +1,9 @@
 import type { LiveStatusResource } from "@/kernel/api/apiTypes";
 import {
+  describeSessionAuthoringDiscretization,
   projectFlatActiveLaneDiscretization,
   resolveSessionDiscretization,
+  type SessionAuthoringMethodDescription,
   type SessionDiscretizationCapabilitiesProjection,
 } from "@/kernel/resources/sessionDiscretization";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
@@ -9,6 +11,7 @@ import type { Selection } from "@/kernel/selection/selectionTypes";
 import { isExplicitFdmStudy } from "../StudyGlobalAuthoringModel";
 
 export type AirboxInspectorRuntimeStatus = {
+  authoring: SessionAuthoringMethodDescription;
   capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology"> &
     SessionDiscretizationCapabilitiesProjection;
   domain: Pick<LiveStatusResource["domain"], "discretization">;
@@ -29,6 +32,7 @@ export function selectAirboxInspectorRuntimeStatus(status: {
     "active_lane",
   );
   return {
+    authoring: describeSessionAuthoringDiscretization(status.data),
     capabilities: {
       explicit_topology: status.data.capabilities?.explicit_topology ?? false,
       ...(hasActiveLane
@@ -52,13 +56,27 @@ export function airboxInspectorRuntimeStatusEquals(
 ): boolean {
   if (previous === next) return true;
   if (!previous || !next) return previous === next;
+  const previousLane = previous.capabilities.active_lane;
+  const nextLane = next.capabilities.active_lane;
+  const previousHasAuthored = Boolean(
+    previousLane && Object.prototype.hasOwnProperty.call(previousLane, "authored"),
+  );
+  const nextHasAuthored = Boolean(
+    nextLane && Object.prototype.hasOwnProperty.call(nextLane, "authored"),
+  );
   return (
+    previous.authoring.method === next.authoring.method &&
+    previous.authoring.state === next.authoring.state &&
+    previous.authoring.reason === next.authoring.reason &&
     Object.prototype.hasOwnProperty.call(
       previous.capabilities,
       "active_lane",
     ) === Object.prototype.hasOwnProperty.call(next.capabilities, "active_lane") &&
     previous.capabilities.active_lane?.resolved?.discretization ===
       next.capabilities.active_lane?.resolved?.discretization &&
+    previousHasAuthored === nextHasAuthored &&
+    previousLane?.authored?.backend === nextLane?.authored?.backend &&
+    previousLane?.authored?.discretization === nextLane?.authored?.discretization &&
     Object.prototype.hasOwnProperty.call(
       previous.capabilities,
       "active_lane_discretization",
@@ -117,6 +135,24 @@ export function resolveAirboxInspectorLane(
     return "conflict";
   }
   return runtimeLane;
+}
+
+export function resolveAirboxInspectorAuthoringLane(
+  selection: Selection,
+  status: AirboxInspectorRuntimeStatus | null | undefined,
+): "conflict" | "fdm" | "fem" | "unresolved" {
+  const authoredLane = status?.authoring.method ?? null;
+  if (authoredLane === null) return "unresolved";
+
+  const selectionLane =
+    selection.ref?.type === "airbox" &&
+    (selection.kind === "airbox.multilayer.target" ||
+      selection.kind === "mesh.grid.universe-outside-support")
+      ? "fdm"
+      : null;
+  return selectionLane && selectionLane !== authoredLane
+    ? "conflict"
+    : authoredLane;
 }
 
 export function useAirboxInspectorRuntimeStatus() {
