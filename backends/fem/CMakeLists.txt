@@ -1204,6 +1204,20 @@ if(FULLMAG_USE_MFEM_STACK AND FULLMAG_FEM_WITH_SLEPC)
         COMMAND fem_modal_eigen_contract --floquet-borrowed-pmat-row-primary-cleanup-fault-quarantine-probe)
     set_tests_properties(modal_eigen_borrowed_pmat_row_primary_cleanup_fault_quarantine
         PROPERTIES TIMEOUT 120)
+    # Genuine production backing-byte measurement runs in its own fault process.
+    add_custom_target(modal_eigen_row_restore_production_phi_backing_bytes
+        DEPENDS fem_modal_eigen_contract)
+    add_test(NAME modal_eigen_row_restore_production_phi_backing_bytes
+        COMMAND fem_modal_eigen_contract --floquet-row-restore-production-phi-backing-bytes-probe)
+    set_tests_properties(modal_eigen_row_restore_production_phi_backing_bytes
+        PROPERTIES TIMEOUT 120)
+    # Genuine production backing-byte measurement runs in its own fault process.
+    add_custom_target(modal_eigen_row_primary_cleanup_production_phi_backing_bytes
+        DEPENDS fem_modal_eigen_contract)
+    add_test(NAME modal_eigen_row_primary_cleanup_production_phi_backing_bytes
+        COMMAND fem_modal_eigen_contract --floquet-row-primary-cleanup-production-phi-backing-bytes-probe)
+    set_tests_properties(modal_eigen_row_primary_cleanup_production_phi_backing_bytes
+        PROPERTIES TIMEOUT 120)
     add_custom_target(modal_eigen_borrowed_pmat_pattern_mismatch_fixture
         DEPENDS fem_modal_eigen_contract)
     add_test(NAME modal_eigen_borrowed_pmat_pattern_mismatch_fixture

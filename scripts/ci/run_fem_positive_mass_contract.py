@@ -178,6 +178,26 @@ CONTRACT_PROFILES: dict[str, dict[str, Any]] = {
                 ],
             },
             {
+                "name": "modal_eigen_row_restore_production_phi_backing_bytes",
+                "source_suffix": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+                "marker": "PASS: modal_eigen_row_restore_production_phi_backing_bytes_probe",
+                "compile_definitions": [
+                    "-DFULLMAG_HAS_MFEM_STACK=1",
+                    "-DFULLMAG_FEM_WITH_SLEPC=1",
+                    "-DFULLMAG_HAS_CUDA_RUNTIME=0",
+                ],
+            },
+            {
+                "name": "modal_eigen_row_primary_cleanup_production_phi_backing_bytes",
+                "source_suffix": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+                "marker": "PASS: modal_eigen_row_primary_cleanup_production_phi_backing_bytes_probe",
+                "compile_definitions": [
+                    "-DFULLMAG_HAS_MFEM_STACK=1",
+                    "-DFULLMAG_FEM_WITH_SLEPC=1",
+                    "-DFULLMAG_HAS_CUDA_RUNTIME=0",
+                ],
+            },
+            {
                 "name": "modal_eigen_borrowed_pmat_pattern_mismatch_fixture",
                 "source_suffix": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
                 "marker": "PASS: modal_eigen_borrowed_pmat_pattern_mismatch_fixture_probe",

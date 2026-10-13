@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <type_traits>
 #include <vector>
 
 #ifndef FULLMAG_FEM_WITH_SLEPC
@@ -30,6 +31,7 @@
 
 namespace fullmag::fem::frequency_domain {
 namespace {
+thread_local FloquetPhiBackingStorageTestHarness *active_phi_backing_storage_test_harness = nullptr;
 
 #if FULLMAG_FEM_WITH_SLEPC
 // Public PETSc v3.24.6 getters only; no row/array leases or factor setup.
@@ -1263,6 +1265,7 @@ PetscErrorCode stop_native_floquet_eps(
 }
 
 struct NativeFloquetMatShellContext {
+    std::shared_ptr<FloquetPhiBackingStorageTestBuffers> phi_test_storage;
     Mat a_qq = nullptr;
     Mat rotated_a_qq = nullptr;
     Mat a_qphi = nullptr;
@@ -1281,6 +1284,76 @@ struct NativeFloquetMatShellContext {
     char error_message[256]{};
 };
 
+bool create_floquet_phi_vectors(NativeFloquetMatShellContext *context) noexcept
+{
+    auto *harness = active_phi_backing_storage_test_harness;
+    if (harness == nullptr) {
+        // Preserve the existing production ownership path exactly.
+        return VecCreateSeq(PETSC_COMM_SELF, context->phi_split_count, &context->phi_rhs) == 0 &&
+            VecCreateSeq(PETSC_COMM_SELF, context->phi_split_count, &context->phi_solution) == 0;
+    }
+    harness->factory_bound = false;
+    harness->before_snapshot_available = false;
+    harness->reason = "production_phi_host_factory_failed";
+    if (!std::is_same<PetscScalar, double>::value || context->phi_split_count <= 0 ||
+        context->phi_split_count > 512) {
+        harness->reason = "production_phi_host_factory_requires_bounded_real_double";
+        return false;
+    }
+    try {
+        auto storage = std::make_shared<FloquetPhiBackingStorageTestBuffers>();
+        storage->rhs.resize(static_cast<std::size_t>(context->phi_split_count), 0.0);
+        storage->solution.resize(static_cast<std::size_t>(context->phi_split_count), 0.0);
+        // Bind owner BEFORE creating Vec so partial setup/retained graph always
+        // owns the backing allocation. The fixture also receives shared ownership.
+        context->phi_test_storage = storage;
+        harness->storage = storage;
+        harness->scalar_bytes = sizeof(PetscScalar);
+        if (VecCreateSeqWithArray(PETSC_COMM_SELF, 1, context->phi_split_count,
+                reinterpret_cast<const PetscScalar *>(storage->rhs.data()), &context->phi_rhs) != 0 ||
+            VecCreateSeqWithArray(PETSC_COMM_SELF, 1, context->phi_split_count,
+                reinterpret_cast<const PetscScalar *>(storage->solution.data()), &context->phi_solution) != 0) {
+            return false;
+        }
+        harness->factory_bound = true;
+        harness->reason = "production_phi_external_host_buffers_bound";
+        return true;
+    } catch (...) {
+        harness->reason = "production_phi_host_factory_allocation_failed";
+        return false;
+    }
+}
+
+void snapshot_floquet_phi_backing_bytes_before_observation(
+    const NativeFloquetMatShellContext *context) noexcept
+{
+    auto *harness = active_phi_backing_storage_test_harness;
+    if (harness == nullptr) {
+        return;
+    }
+    harness->before_snapshot_available = false;
+    if (context == nullptr || !harness->factory_bound || !harness->storage ||
+        context->phi_test_storage != harness->storage ||
+        harness->scalar_bytes != sizeof(double) ||
+        harness->storage->rhs.size() != static_cast<std::size_t>(context->phi_split_count) ||
+        harness->storage->solution.size() != harness->storage->rhs.size()) {
+        harness->reason = "production_phi_before_snapshot_binding_unavailable";
+        return;
+    }
+    try {
+        const std::size_t bytes = harness->storage->rhs.size() * sizeof(double);
+        harness->rhs_before.resize(bytes);
+        harness->solution_before.resize(bytes);
+        // Read the externally owned production backing arrays directly: no Vec
+        // getter/array lease and no pointer retained from a PETSc read operation.
+        std::memcpy(harness->rhs_before.data(), harness->storage->rhs.data(), bytes);
+        std::memcpy(harness->solution_before.data(), harness->storage->solution.data(), bytes);
+        harness->before_snapshot_available = true;
+        harness->reason = "production_phi_whole_backing_bytes_snapshotted";
+    } catch (...) {
+        harness->reason = "production_phi_before_snapshot_allocation_failed";
+    }
+}
 LivePcluShiftConfiguration query_live_pclu_shift_configuration(
     PC live_pc) noexcept;
 
@@ -3036,6 +3109,7 @@ PetscErrorCode capture_candidate_live_pc_observation(
     if (workspace == nullptr) {
         return PETSC_SUCCESS;
     }
+    snapshot_floquet_phi_backing_bytes_before_observation(workspace->production_context);
     auto &observation = workspace->summary.live_pc_observation;
     observation = {};
     observation.requested = true;
@@ -6711,6 +6785,14 @@ bool run_floquet_dense_original_oracle(
 
 } // namespace
 
+FloquetPhiBackingStorageTestHarness *set_floquet_phi_backing_storage_test_harness(
+    FloquetPhiBackingStorageTestHarness *harness) noexcept
+{
+    auto *previous = active_phi_backing_storage_test_harness;
+    active_phi_backing_storage_test_harness = harness;
+    return previous;
+}
+
 namespace detail {
 
 FloquetModalCandidateFinalization finalize_certified_floquet_candidates(
@@ -7483,8 +7565,7 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
             requested_linear_iterations) != 0 ||
         KSPSetErrorIfNotConverged(context.p_ksp, PETSC_TRUE) != 0 ||
         KSPSetUp(context.p_ksp) != 0 ||
-        VecCreateSeq(PETSC_COMM_SELF, context.phi_split_count, &context.phi_rhs) != 0 ||
-        VecCreateSeq(PETSC_COMM_SELF, context.phi_split_count, &context.phi_solution) != 0 ||
+        !create_floquet_phi_vectors(&context) ||
         VecCreateSeq(PETSC_COMM_SELF, context.q_split_count, &context.feedback) != 0 ||
         VecCreateSeq(PETSC_COMM_SELF, context.q_split_count, &context.q_physical_real) != 0 ||
         VecCreateSeq(PETSC_COMM_SELF, context.q_split_count, &context.q_physical_imag) != 0) {

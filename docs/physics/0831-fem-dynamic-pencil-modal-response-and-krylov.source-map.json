@@ -4127,6 +4127,37 @@
       "path": ".github/workflows/fem-positive-mass-contract.yml",
       "symbol": "fem-positive-mass-contract",
       "responsibility": "Always produce/upload diagnostic report after selected native attempt; original test failure remains a failure"
+    },
+    {
+      "id": "source-c05-phi-backing-harness-contract",
+      "path": "docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md",
+      "symbol": "DOC-ANCHOR:c05-production-phi-backing-byte-harness",
+      "responsibility": "Private backing-byte measurement scope and retained ownership; hosted proof pending, not whole Vec-state invariance",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "source-c05-phi-backing-harness-private-api",
+      "path": "backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.hpp",
+      "symbol": "set_floquet_phi_backing_storage_test_harness",
+      "responsibility": "Explicit synchronous private thread-local fixture hook with shared backing owner; no C ABI or IR change"
+    },
+    {
+      "id": "source-c05-phi-backing-harness-factory",
+      "path": "backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp",
+      "symbol": "create_floquet_phi_vectors",
+      "responsibility": "Default VecCreateSeq unchanged; bounded real-double opt-in binds both production Vec to externally owned host buffers"
+    },
+    {
+      "id": "source-c05-phi-backing-before-snapshot",
+      "path": "backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp",
+      "symbol": "void snapshot_floquet_phi_backing_bytes_before_observation",
+      "responsibility": "Copy full production backing bytes just before observation without PETSc array leases"
+    },
+    {
+      "id": "source-c05-phi-backing-fault-fixtures",
+      "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+      "symbol": "void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnostics",
+      "responsibility": "Separate row-restore/primary-cleanup backing-byte selectors require actual before/after evidence and mutation controls; unchanged safety selectors remain separate"
     }
   ],
   "public_api": {

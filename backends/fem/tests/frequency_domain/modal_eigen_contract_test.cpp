@@ -2,6 +2,7 @@
 #include "cpu/frequency_domain/contour_interval_solver.hpp"
 #include "cpu/frequency_domain/poisson_airbox_modal_eigen.hpp"
 #include "cpu/frequency_domain/floquet_airbox_operator.hpp"
+#include "cpu/frequency_domain/modal/floquet_modal_solver.hpp"
 #include "cpu/frequency_domain/modal_shared_domain_provider_status.hpp"
 #include "cpu/frequency_domain/operators/poisson_airbox_shared_domain.hpp"
 #include "frequency_domain/linearized_dynamic_pencil.hpp"
@@ -7893,7 +7894,8 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
     bool fault_quarantine_only = false,
     bool borrowed_pmat_row_restore_fault_only = false,
     bool borrowed_pmat_primary_cleanup_fault_only = false,
-    bool pattern_mismatch_fixture_only = false)
+    bool pattern_mismatch_fixture_only = false,
+    bool post_fault_backing_bytes_only = false)
 {
 #if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
     FloquetContourSharedDomainFixture fixture{};
@@ -8161,8 +8163,15 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
               "enable the private borrowed-Pmat row-restore fault in its fresh process");
         FullmagFemModalEigenRequest fault_request = request;
         fault_request.max_linear_iterations = 1;
+        fullmag::fem::frequency_domain::FloquetPhiBackingStorageTestHarness backing_harness;
+        auto *previous_backing_harness = post_fault_backing_bytes_only
+            ? fullmag::fem::frequency_domain::set_floquet_phi_backing_storage_test_harness(&backing_harness)
+            : nullptr;
         FullmagFemFrequencyDomainResult fault_result =
             fullmag_fem_modal_eigen_solve(&fault_request);
+        if (post_fault_backing_bytes_only) {
+            fullmag::fem::frequency_domain::set_floquet_phi_backing_storage_test_harness(previous_backing_harness);
+        }
         fault_environment.restore();
 
         const char *borrowed_observation = fault_result.diagnostics_json != nullptr
@@ -8308,10 +8317,49 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
               "borrowed-Pmat row failure preserves restore order, distinct primary/cleanup errors, and solve/quarantine evidence");
         check(process_unsafe_before_destroy && process_unsafe_after_destroy,
               "row-restore failure quarantines the PETSc/SLEPc graph across result destruction");
-        std::printf("PASS: %s\n",
-            borrowed_pmat_primary_cleanup_fault_only
-                ? "modal_eigen_borrowed_pmat_row_primary_cleanup_fault_quarantine_probe"
-                : "modal_eigen_borrowed_pmat_row_restore_fault_quarantine_probe");
+        if (post_fault_backing_bytes_only) {
+            // The graph is quarantined. Only externally owned ordinary host
+            // bytes are inspected here; no Vec getter/destroy or PETSc call.
+            const auto bytes_match = [](const std::vector<unsigned char> &before,
+                                        const std::vector<double> &after) {
+                return !before.empty() && before.size() == after.size() * sizeof(double) &&
+                    std::memcmp(before.data(), after.data(), before.size()) == 0;
+            };
+            const bool backing_available = backing_harness.factory_bound &&
+                backing_harness.before_snapshot_available && backing_harness.storage &&
+                backing_harness.scalar_bytes == sizeof(double);
+            const bool rhs_same = backing_available &&
+                bytes_match(backing_harness.rhs_before, backing_harness.storage->rhs);
+            const bool solution_same = backing_available &&
+                bytes_match(backing_harness.solution_before, backing_harness.storage->solution);
+            if (!backing_available || !rhs_same || !solution_same) {
+                std::fprintf(stderr,
+                    "FAIL-DIAGNOSTICS: production_phi_backing_bytes available=%d rhs_same=%d solution_same=%d reason=%s\n",
+                    backing_available ? 1 : 0, rhs_same ? 1 : 0, solution_same ? 1 : 0,
+                    backing_harness.reason);
+            }
+            check(backing_available && rhs_same && solution_same,
+                  "forced restore fault preserves measured whole bytes of bound production phi backing buffers");
+            check(!bytes_match({}, backing_harness.storage->rhs),
+                  "unavailable backing snapshot cannot satisfy byte invariance");
+            auto corrupted_rhs_snapshot = backing_harness.rhs_before;
+            corrupted_rhs_snapshot[0] ^= 1u;
+            auto corrupted_solution_snapshot = backing_harness.solution_before;
+            corrupted_solution_snapshot[0] ^= 1u;
+            check(!bytes_match(corrupted_rhs_snapshot, backing_harness.storage->rhs) &&
+                      !bytes_match(corrupted_solution_snapshot, backing_harness.storage->solution),
+                  "independent byte mutation controls reject changes in either full buffer");
+            std::printf("PASS: %s rhs_bytes=%zu solution_bytes=%zu scope=production_backing_bytes_only\n",
+                borrowed_pmat_primary_cleanup_fault_only
+                    ? "modal_eigen_row_primary_cleanup_production_phi_backing_bytes_probe"
+                    : "modal_eigen_row_restore_production_phi_backing_bytes_probe",
+                backing_harness.rhs_before.size(), backing_harness.solution_before.size());
+        } else {
+            std::printf("PASS: %s\n",
+                borrowed_pmat_primary_cleanup_fault_only
+                    ? "modal_eigen_borrowed_pmat_row_primary_cleanup_fault_quarantine_probe"
+                    : "modal_eigen_borrowed_pmat_row_restore_fault_quarantine_probe");
+        }
         return;
     }
     if (fault_quarantine_only) {
@@ -8324,8 +8372,15 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
         check(fault_ready,
               "enable the private live-PC apply fault hook in its fresh process");
         FullmagFemModalEigenRequest fault_request = request;
+        fullmag::fem::frequency_domain::FloquetPhiBackingStorageTestHarness backing_harness;
+        auto *previous_backing_harness = post_fault_backing_bytes_only
+            ? fullmag::fem::frequency_domain::set_floquet_phi_backing_storage_test_harness(&backing_harness)
+            : nullptr;
         FullmagFemFrequencyDomainResult fault_result =
             fullmag_fem_modal_eigen_solve(&fault_request);
+        if (post_fault_backing_bytes_only) {
+            fullmag::fem::frequency_domain::set_floquet_phi_backing_storage_test_harness(previous_backing_harness);
+        }
         fault_environment.restore();
         const std::array<std::pair<bool, const char *>, 12> fault_contract_checks{{
             {
@@ -9896,6 +9951,20 @@ int main(int argc, char **argv)
             std::fprintf(
                 stderr,
                 "FAIL: --floquet-borrowed-pmat-pattern-mismatch-fixture-probe requires MFEM and SLEPc\n");
+            return 3;
+#endif
+        }
+        if (argc == 2 &&
+            (std::strcmp(argv[1], "--floquet-row-restore-production-phi-backing-bytes-probe") == 0 ||
+             std::strcmp(argv[1], "--floquet-row-primary-cleanup-production-phi-backing-bytes-probe") == 0)) {
+#if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
+            const bool primary_cleanup = std::strcmp(
+                argv[1], "--floquet-row-primary-cleanup-production-phi-backing-bytes-probe") == 0;
+            modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnostics(
+                false, false, !primary_cleanup, primary_cleanup, false, true);
+            return 0;
+#else
+            std::fprintf(stderr, "FAIL: production phi backing-byte probes require MFEM and SLEPc\n");
             return 3;
 #endif
         }

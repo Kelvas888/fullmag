@@ -5467,3 +5467,42 @@ dowodem niezmienności produkcyjnych Vec. Snapshoty C04 tej bramki nie zamykają
 | `.github/workflows/fem-positive-mass-contract.yml` | `fem-positive-mass-contract` | Krok Record C04 matrix measurements even after failed CTest: raport `always()`, bez zmiany natywnego wyniku |
 
 | `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md` | `DOC-ANCHOR:c04-factor-matrix-phase-snapshots` | Kontrakt C04, pairing i kwalifikacja pozostają NOT VERIFIED |
+
+(c05-production-phi-backing-byte-harness)=
+<!-- DOC-ANCHOR:c05-production-phi-backing-byte-harness -->
+
+### C05 — rzeczywisty pomiar bytes produkcyjnego phi backing storage
+
+Przed zmianą fabryki ustanawiamy prywatny, synchroniczny, thread-local test
+hook FEM CPU. Nie zmienia C ABI, Python, ProblemIR, operatora lub tolerancji.
+Domyślna fabryka zachowuje `VecCreateSeq`. Tylko jawna fixture harnessu
+ustanawia dwa stabilne bufory hostowe double przez publiczne
+`VecCreateSeqWithArray`; inne scalar types są błędem fixture, nie pomiarem.
+Udane utworzenie obu produkcyjnych Vec z tymi adresami jest bindingiem fabryki,
+nie kopią osobnych diagnostycznych Vec. Właściciel buforów jest współdzielony
+z rzeczywistym kontekstem graphu; nie wolno zwolnić pamięci retained Vec po
+fault ani przy result destruction. Graph i bufory pozostają do OS teardown.
+
+Tuż przed live-PC obserwacją hook kopiuje pełne bytes obu produkcyjnych
+backing buffers do niezależnych snapshotów, bez PETSc read lease. Po powrocie
+forced restore fault fixture porównuje własne host buffers przez `memcmp`,
+bez getterów, destroy lub innych wywołań PETSc na quarantined graphie.
+Brak udanego bindingu, before snapshotu, pełnej długości lub dostępnej pamięci
+jest FAIL nowej fixture. Oba warianty row-restore/primary-cleanup fault wymagają
+rzeczywistego pomiaru. Dotychczasowe safety fixtures są odrębne i zachowują
+restore ordering, distinct errors oraz quarantine guards.
+
+Dowód jest ograniczony do niezmienności **bytes produkcyjnego backing
+storage** w tej opt-in fixture. Nie dowodzi niezmienności całego stanu Vec,
+ani domyślnego ownership path. Nie wolno przypisywać available/true polom
+starego VecEqual obserwatora po fault; pozostają unavailable/null. Hosted
+wykonanie nowej fixture i jej kontrast mutation-control są NOT VERIFIED
+przed otrzymaniem rzeczywistych wyników.
+
+| Ścieżka | Symbol | Zakres dowodu C05 |
+|---|---|---|
+| `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md` | `DOC-ANCHOR:c05-production-phi-backing-byte-harness` | Kontrakt zapisany przed zmianą fabryki |
+| `backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.hpp` | `set_floquet_phi_backing_storage_test_harness` | Prywatny opt-in fixture; brak zmiany publicznego ABI |
+| `backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp` | `create_floquet_phi_vectors` | Binding produkcyjnych Vec oraz współdzielony lifetime |
+| `backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp` | `void snapshot_floquet_phi_backing_bytes_before_observation` | Whole-byte before snapshot bez lease |
+| `backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp` | `void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnostics` | Osobne `--floquet-row-restore-production-phi-backing-bytes-probe` i `--floquet-row-primary-cleanup-production-phi-backing-bytes-probe`; hosted wykonanie pending |

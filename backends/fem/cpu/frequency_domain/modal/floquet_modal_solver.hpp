@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace fullmag::fem::frequency_domain {
@@ -114,6 +115,25 @@ struct FloquetSharedDomainSparseModalSolveContext {
 // periodic, CPU contract and then executes the selected spectrum.  Keeping
 // the admission here prevents a nonzero-k request from accidentally entering
 // the k=0 Poisson branch or a GPU fallback.
+// Private synchronous CPU fixture hook; no public C ABI or ProblemIR surface.
+// Retained graph ownership keeps these buffers alive after quarantine.
+struct FloquetPhiBackingStorageTestBuffers {
+    std::vector<double> rhs;
+    std::vector<double> solution;
+};
+
+struct FloquetPhiBackingStorageTestHarness {
+    std::shared_ptr<FloquetPhiBackingStorageTestBuffers> storage;
+    std::vector<unsigned char> rhs_before;
+    std::vector<unsigned char> solution_before;
+    std::size_t scalar_bytes = 0;
+    bool factory_bound = false;
+    bool before_snapshot_available = false;
+    const char *reason = "production_phi_factory_not_bound";
+};
+
+FloquetPhiBackingStorageTestHarness *set_floquet_phi_backing_storage_test_harness(
+    FloquetPhiBackingStorageTestHarness *harness) noexcept;
 struct FloquetModalSolverAdmission {
     bool accepted = false;
     bool nonzero_k = false;
