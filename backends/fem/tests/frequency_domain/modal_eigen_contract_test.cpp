@@ -4248,13 +4248,15 @@ void modal_floquet_shared_domain_original_descriptor_certification_is_fail_close
     check(contains(result.result_json, "\"floquet_geometric_bc_certified\":false"),
           "shared-domain Floquet window must preserve the geometric-BC certificate distinction");
     if (!contains(result.result_json,
-                  "\"potential_representation\":\"doubled_real_split_complex_coefficients\"")) {
+                  "\"potential_representation\":\"complex_coefficients\"")) {
         print_bounded_cabi_modal_result(
             "C ABI shared-domain Floquet potential representation",
             result);
     }
     check(contains(result.result_json,
-                   "\"potential_representation\":\"doubled_real_split_complex_coefficients\""),
+                   "\"floquet_mode_vector_physical_complex\":true") &&
+              contains(result.result_json,
+                   "\"potential_representation\":\"complex_coefficients\""),
           "shared-domain Floquet window must publish the reconstructed potential representation");
     check(contains(result.result_json, "\"magnetic_relative_residual\":"),
           "shared-domain Floquet window must publish the original magnetic residual");
@@ -4278,9 +4280,9 @@ void modal_floquet_shared_domain_original_descriptor_certification_is_fail_close
     check(contains(result.result_json,
                    "\"mode_vector_transport\":\"typed_abi_v18\"") &&
               contains(result.result_json,
-                       "\"q_layout\":\"doubled_real_split\"") &&
+                       "\"q_layout\":\"interleaved_node_component\"") &&
               contains(result.result_json,
-                       "\"phi_layout\":\"doubled_real_split_complex_coefficients\"") &&
+                       "\"phi_layout\":\"complex_coefficients\"") &&
               !contains(result.result_json, "\"mode_vector_real\":[") &&
               !contains(result.result_json, "\"mode_q_real\":[") &&
               !contains(result.result_json, "\"mode_q_imag\":[") &&
