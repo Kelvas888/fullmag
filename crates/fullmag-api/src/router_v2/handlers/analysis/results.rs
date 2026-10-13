@@ -68,6 +68,13 @@ pub enum AnalysisResultItemKind {
     DsfPoint,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisResultSpectrumOutputScope {
+    PerSample,
+    Global,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AnalysisResultSourceArtifactRef {
     pub artifact: String,
@@ -206,6 +213,10 @@ pub struct AnalysisResultDatasetManifestResource {
     pub product_kind: AnalysisResultProductKind,
     pub title: String,
     pub description: Option<String>,
+    /// Requested output scopes declared by the producer manifest. This does not
+    /// describe which requested outputs completed or were resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spectrum_output_scopes: Option<Vec<AnalysisResultSpectrumOutputScope>>,
     pub status: AnalysisResultStatusFacets,
     pub source_artifacts: Vec<AnalysisResultSourceArtifactRef>,
     pub axes: Vec<AnalysisResultAxisResource>,
@@ -450,6 +461,12 @@ struct ResultDatasetIndex {
     items: Vec<AnalysisResultSpectralItemSummary>,
     axis_values: BTreeMap<String, Vec<AnalysisResultAxisValueResource>>,
     projections: BTreeMap<String, AnalysisResultProjectionResource>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SpectrumOutputScopeMetadata {
+    requested_scopes: Option<Vec<AnalysisResultSpectrumOutputScope>>,
+    source_manifest_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1169,11 +1186,15 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
                     ));
                 }
             };
+        let scope_metadata = spectrum_output_scope_metadata_from_snapshot(
+            read_result_artifact_snapshot(&artifact_dir, "frequency_domain/manifest.v1.json")?,
+        )?;
         datasets.push(build_spectrum_v3_index(
             payload,
             digest,
             &run_id,
             default_stage_id.as_str(),
+            scope_metadata,
         )?);
     } else if let Some((value, digest)) =
         read_result_artifact_snapshot(&artifact_dir, "eigen/spectrum.v2.json")?
@@ -1187,11 +1208,15 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
                     ));
                 }
             };
+        let scope_metadata = spectrum_output_scope_metadata_from_snapshot(
+            read_result_artifact_snapshot(&artifact_dir, "frequency_domain/manifest.v1.json")?,
+        )?;
         datasets.push(build_spectrum_v2_index(
             payload,
             digest,
             &run_id,
             default_stage_id.as_str(),
+            scope_metadata,
         )?);
     }
 
@@ -1270,6 +1295,42 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
 
     crate::validate_current_live_request_context(state, &request_context).await?;
     Ok(ResultIndexCollection { run_id, datasets })
+}
+
+fn spectrum_output_scope_metadata_from_snapshot(
+    snapshot: Option<(Value, String)>,
+) -> Result<SpectrumOutputScopeMetadata, ApiError> {
+    let Some((manifest_value, manifest_digest)) = snapshot else {
+        return Ok(SpectrumOutputScopeMetadata::default());
+    };
+    let manifest = match decode_frequency_domain_artifact_payload(
+        "frequency_domain/manifest.v1.json",
+        manifest_value,
+    )? {
+        FrequencyDomainJsonArtifactPayload::Manifest(manifest) => manifest,
+        _ => {
+            return Err(ApiError::internal(
+                "frequency-domain manifest artifact decoded to an unexpected payload",
+            ));
+        }
+    };
+    let requested_scopes = manifest
+        .extra
+        .0
+        .get("spectrum_output_scopes")
+        .map(|value| {
+            serde_json::from_value::<Vec<AnalysisResultSpectrumOutputScope>>(value.clone())
+                .map_err(|_| {
+                    ApiError::internal(
+                        "frequency-domain manifest spectrum_output_scopes must be an array containing only 'per_sample' or 'global'",
+                    )
+                })
+        })
+        .transpose()?;
+    Ok(SpectrumOutputScopeMetadata {
+        requested_scopes,
+        source_manifest_digest: Some(manifest_digest),
+    })
 }
 
 async fn current_result_identity(state: &Arc<AppState>) -> Result<(String, String), ApiError> {
@@ -1670,6 +1731,7 @@ fn build_spectrum_v3_index(
     source_digest: String,
     run_id: &str,
     stage_id: &str,
+    scope_metadata: SpectrumOutputScopeMetadata,
 ) -> Result<ResultDatasetIndex, ApiError> {
     let dataset_id = format!("result:{run_id}:{stage_id}:modal-eigen-spectrum");
     let source_revision = source_digest.clone();
@@ -1756,16 +1818,20 @@ fn build_spectrum_v3_index(
         None,
         None,
     );
-    let dataset_revision = derived_dataset_revision(
-        &dataset_id,
-        &source_revision,
-        &axes,
-        &vec![AnalysisResultSourceArtifactRef {
-            artifact: "eigen/spectrum.v3.json".to_string(),
-            revision: source_digest.clone(),
-            relation: "adapter_source".to_string(),
-        }],
-    );
+    let mut source_artifacts = vec![AnalysisResultSourceArtifactRef {
+        artifact: "eigen/spectrum.v3.json".to_string(),
+        revision: source_digest.clone(),
+        relation: "adapter_source".to_string(),
+    }];
+    if let Some(manifest_digest) = scope_metadata.source_manifest_digest.as_ref() {
+        source_artifacts.push(AnalysisResultSourceArtifactRef {
+            artifact: "frequency_domain/manifest.v1.json".to_string(),
+            revision: manifest_digest.clone(),
+            relation: "requested_output_scopes".to_string(),
+        });
+    }
+    let dataset_revision =
+        derived_dataset_revision(&dataset_id, &source_revision, &axes, &source_artifacts);
     let projections = build_modal_projections(
         run_id,
         &dataset_id,
@@ -1785,12 +1851,7 @@ fn build_spectrum_v3_index(
         &items,
         &status,
     );
-    let source_artifacts = vec![AnalysisResultSourceArtifactRef {
-        artifact: "eigen/spectrum.v3.json".to_string(),
-        revision: source_digest,
-        relation: "adapter_source".to_string(),
-    }];
-    let manifest = build_manifest(
+    let mut manifest = build_manifest(
         dataset_id,
         dataset_revision,
         run_id,
@@ -1808,6 +1869,7 @@ fn build_spectrum_v3_index(
         "shared_across_dataset",
         "Hz",
     );
+    manifest.spectrum_output_scopes = scope_metadata.requested_scopes;
     Ok(ResultDatasetIndex {
         manifest,
         samples,
@@ -1822,6 +1884,7 @@ fn build_spectrum_v2_index(
     source_digest: String,
     run_id: &str,
     stage_id: &str,
+    scope_metadata: SpectrumOutputScopeMetadata,
 ) -> Result<ResultDatasetIndex, ApiError> {
     let dataset_id = format!("result:{run_id}:{stage_id}:modal-eigen-spectrum");
     let source_revision = source_digest.clone();
@@ -1873,15 +1936,22 @@ fn build_spectrum_v2_index(
         Some("legacy_spectrum_v2"),
         None,
     );
-    let source_artifacts = vec![AnalysisResultSourceArtifactRef {
+    let mut source_artifacts = vec![AnalysisResultSourceArtifactRef {
         artifact: "eigen/spectrum.v2.json".to_string(),
         revision: source_digest,
         relation: "adapter_source".to_string(),
     }];
+    if let Some(manifest_digest) = scope_metadata.source_manifest_digest.as_ref() {
+        source_artifacts.push(AnalysisResultSourceArtifactRef {
+            artifact: "frequency_domain/manifest.v1.json".to_string(),
+            revision: manifest_digest.clone(),
+            relation: "requested_output_scopes".to_string(),
+        });
+    }
     let dataset_revision =
         derived_dataset_revision(&dataset_id, &source_revision, &[], &source_artifacts);
     let projections = BTreeMap::new();
-    let manifest = build_manifest(
+    let mut manifest = build_manifest(
         dataset_id,
         dataset_revision,
         run_id,
@@ -1899,6 +1969,7 @@ fn build_spectrum_v2_index(
         "shared_across_dataset",
         "Hz",
     );
+    manifest.spectrum_output_scopes = scope_metadata.requested_scopes;
     Ok(ResultDatasetIndex {
         manifest,
         samples,
@@ -3274,6 +3345,7 @@ fn build_manifest(
         product_kind,
         title: title.to_string(),
         description: description.map(str::to_string),
+        spectrum_output_scopes: None,
         status,
         source_artifacts,
         axes,
@@ -4439,6 +4511,57 @@ mod tests {
     use super::*;
     use crate::router_v2::handlers::analysis::frequency_domain::FrequencyDomainArtifactExtras;
 
+    fn v3_spectrum_with_signed_wavevector_samples() -> FrequencyDomainSpectrumV3ArtifactPayload {
+        let participation = serde_json::json!({
+            "schema_version": "modal_component_participation.v1",
+            "definition_id": "volume_weighted_complex_l2_fraction.v1",
+            "status": "unavailable",
+            "quantity_id": "m",
+            "quantity_symbol": "m",
+            "unit": "1",
+            "component_basis": "global_xyz",
+            "integration_method": "not_available",
+            "qualification": "unvalidated",
+            "provenance": {"solver_device": "cpu", "observable_lane": "reference"},
+            "objects": [],
+            "unavailable": {"reason_code": "not_computed", "detail": "fixture"}
+        });
+        let mode = |mode_id: &str, raw_mode_index: u64, branch_id: u64, frequency_hz: f64| {
+            serde_json::json!({
+                "mode_id": mode_id,
+                "raw_mode_index": raw_mode_index,
+                "branch_id": branch_id,
+                "frequency_hz": frequency_hz,
+                "residual_relative_l2": null,
+                "component_participation": participation.clone()
+            })
+        };
+        let sample = |sample_id: &str, sample_index: u64, kx: f64, modes: Vec<Value>| {
+            serde_json::json!({
+                "sample_id": sample_id,
+                "sample_index": sample_index,
+                "k_vector": [kx, 0.0, 0.0],
+                "modes": modes
+            })
+        };
+        serde_json::from_value(serde_json::json!({
+            "schema_version": "eigen_spectrum.v3",
+            "samples": [
+                sample("sample:k-negative", 0, -1.0, vec![
+                    mode("mode:k-negative:0", 0, 10, 1.0e9)
+                ]),
+                sample("sample:k-zero", 1, 0.0, vec![
+                    mode("mode:k-zero:degenerate-a", 0, 20, 2.0e9),
+                    mode("mode:k-zero:degenerate-b", 1, 21, 2.0e9)
+                ]),
+                sample("sample:k-positive", 2, 1.0, vec![
+                    mode("mode:k-positive:0", 0, 30, 3.0e9)
+                ])
+            ]
+        }))
+        .expect("V3 spectrum fixture")
+    }
+
     #[test]
     fn artifact_snapshot_binds_raw_bytes_including_insignificant_whitespace() {
         let first = br#"{"generation":1}"#;
@@ -4824,6 +4947,217 @@ mod tests {
     }
 
     #[test]
+    fn spectrum_scope_metadata_keeps_legacy_unknown_empty_and_invalid_distinct() {
+        let absent = spectrum_output_scope_metadata_from_snapshot(None).unwrap();
+        assert_eq!(absent.requested_scopes, None);
+        assert_eq!(absent.source_manifest_digest, None);
+
+        let legacy = spectrum_output_scope_metadata_from_snapshot(Some((
+            serde_json::json!({"schema_version": "frequency_domain_manifest.v1"}),
+            "sha256:legacy-manifest".to_string(),
+        )))
+        .unwrap();
+        assert_eq!(legacy.requested_scopes, None);
+        assert_eq!(legacy.source_manifest_digest.as_deref(), Some("sha256:legacy-manifest"));
+        let legacy_index = build_spectrum_v3_index(
+            v3_spectrum_with_signed_wavevector_samples(),
+            "sha256:spectrum".to_string(),
+            "run",
+            "stage",
+            legacy,
+        )
+        .unwrap();
+        let legacy_manifest = serde_json::to_value(&legacy_index.manifest).unwrap();
+        assert!(legacy_manifest.get("spectrum_output_scopes").is_none());
+        assert_eq!(
+            legacy_index.manifest.source_artifacts[1].revision,
+            "sha256:legacy-manifest"
+        );
+
+        let empty = spectrum_output_scope_metadata_from_snapshot(Some((
+            serde_json::json!({
+                "schema_version": "frequency_domain_manifest.v1",
+                "spectrum_output_scopes": []
+            }),
+            "sha256:empty-scopes".to_string(),
+        )))
+        .unwrap();
+        assert_eq!(empty.requested_scopes, Some(Vec::new()));
+        let empty_index = build_spectrum_v3_index(
+            v3_spectrum_with_signed_wavevector_samples(),
+            "sha256:spectrum".to_string(),
+            "run",
+            "stage",
+            empty,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&empty_index.manifest).unwrap()["spectrum_output_scopes"],
+            serde_json::json!([])
+        );
+
+        for invalid_scope in [
+            serde_json::json!("per_sample"),
+            serde_json::json!(["per_sample", "unsupported"]),
+            serde_json::json!(null),
+            serde_json::json!(false),
+        ] {
+            let error = spectrum_output_scope_metadata_from_snapshot(Some((
+                serde_json::json!({
+                    "schema_version": "frequency_domain_manifest.v1",
+                    "spectrum_output_scopes": invalid_scope
+                }),
+                "sha256:invalid-scopes".to_string(),
+            )))
+            .expect_err("malformed or unsupported scope declarations must fail closed");
+            assert!(error.message.contains("spectrum_output_scopes"));
+        }
+    }
+
+    #[test]
+    fn spectrum_v3_scope_manifest_preserves_signed_k_samples_and_degenerate_modes() {
+        let scope_metadata = spectrum_output_scope_metadata_from_snapshot(Some((
+            serde_json::json!({
+                "schema_version": "frequency_domain_manifest.v1",
+                "spectrum_output_scopes": ["per_sample", "global"]
+            }),
+            "sha256:scope-manifest".to_string(),
+        )))
+        .unwrap();
+        let index = build_spectrum_v3_index(
+            v3_spectrum_with_signed_wavevector_samples(),
+            "sha256:spectrum".to_string(),
+            "run:scope",
+            "stage:scope",
+            scope_metadata,
+        )
+        .unwrap();
+
+        assert_eq!(
+            index.manifest.spectrum_output_scopes,
+            Some(vec![
+                AnalysisResultSpectrumOutputScope::PerSample,
+                AnalysisResultSpectrumOutputScope::Global,
+            ])
+        );
+        assert_eq!(
+            index
+                .samples
+                .iter()
+                .map(|sample| sample.sample_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sample:k-negative", "sample:k-zero", "sample:k-positive"]
+        );
+        assert_eq!(
+            index.samples[0].items_resource,
+            items_path(
+                "run:scope",
+                &index.manifest.dataset_id,
+                "sample:k-negative"
+            )
+        );
+        assert_eq!(
+            index.samples[1].items_resource,
+            items_path("run:scope", &index.manifest.dataset_id, "sample:k-zero")
+        );
+        assert_eq!(
+            index.samples[2].items_resource,
+            items_path(
+                "run:scope",
+                &index.manifest.dataset_id,
+                "sample:k-positive"
+            )
+        );
+        assert_eq!(
+            index.manifest.item_index_resource,
+            items_path("run:scope", &index.manifest.dataset_id, "")
+        );
+        assert_eq!(
+            index.samples[0].coordinates[0].vector3_si,
+            Some([-1.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            index.samples[1].coordinates[0].vector3_si,
+            Some([0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            index.samples[2].coordinates[0].vector3_si,
+            Some([1.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            index
+                .items
+                .iter()
+                .map(|item| item.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "mode:k-negative:0",
+                "mode:k-zero:degenerate-a",
+                "mode:k-zero:degenerate-b",
+                "mode:k-positive:0",
+            ]
+        );
+        let degenerate_modes = index
+            .items
+            .iter()
+            .filter(|item| item.sample_id == "sample:k-zero")
+            .collect::<Vec<_>>();
+        assert_eq!(degenerate_modes.len(), 2);
+        assert_eq!(degenerate_modes[0].frequency_hz, degenerate_modes[1].frequency_hz);
+        assert_ne!(degenerate_modes[0].item_id, degenerate_modes[1].item_id);
+        assert_eq!(degenerate_modes[0].branch_id.as_deref(), Some("20"));
+        assert_eq!(degenerate_modes[1].branch_id.as_deref(), Some("21"));
+        assert_eq!(index.manifest.source_artifacts.len(), 2);
+        assert_eq!(
+            index.manifest.source_artifacts[1].artifact,
+            "frequency_domain/manifest.v1.json"
+        );
+        assert_eq!(
+            index.manifest.source_artifacts[1].revision,
+            "sha256:scope-manifest"
+        );
+    }
+
+    #[test]
+    fn spectrum_v3_manifest_digest_changes_dataset_revision() {
+        let payload = v3_spectrum_with_signed_wavevector_samples();
+        let scope_metadata = |manifest_digest: &str| SpectrumOutputScopeMetadata {
+            requested_scopes: Some(vec![AnalysisResultSpectrumOutputScope::PerSample]),
+            source_manifest_digest: Some(manifest_digest.to_string()),
+        };
+        let first = build_spectrum_v3_index(
+            payload.clone(),
+            "sha256:spectrum".to_string(),
+            "run:scope",
+            "stage:scope",
+            scope_metadata("sha256:manifest-one"),
+        )
+        .unwrap();
+        let second = build_spectrum_v3_index(
+            payload,
+            "sha256:spectrum".to_string(),
+            "run:scope",
+            "stage:scope",
+            scope_metadata("sha256:manifest-two"),
+        )
+        .unwrap();
+
+        assert_ne!(
+            first.manifest.dataset_revision,
+            second.manifest.dataset_revision
+        );
+        assert_eq!(first.samples[0].source_revision, "sha256:spectrum");
+        assert_eq!(
+            first.manifest.source_artifacts[1].revision,
+            "sha256:manifest-one"
+        );
+        assert_eq!(
+            second.manifest.source_artifacts[1].revision,
+            "sha256:manifest-two"
+        );
+    }
+
+    #[test]
     fn spectrum_v3_items_project_durable_field_identity_without_mutating_payload() {
         let mode: FrequencyDomainSpectrumV3ModePayload = serde_json::from_value(serde_json::json!({
             "mode_id": "sample-0000/mode-0000",
@@ -4889,6 +5223,7 @@ mod tests {
                 product_kind: AnalysisResultProductKind::ModalEigen,
                 title: "Modal".to_string(),
                 description: None,
+                spectrum_output_scopes: None,
                 status: status.clone(),
                 source_artifacts: Vec::new(),
                 axes: Vec::new(),
