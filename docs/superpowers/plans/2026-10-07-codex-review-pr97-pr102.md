@@ -6,7 +6,7 @@ Aktualizacja 13.10.2026: świeży paginowany odczyt GitHub obejmuje 398 komentar
 
 PR #102 zamknięto 2026-10-07, zachowując remote branch `codex/launcher-instance-isolation-20261002` przy `954ba797307c4cc773772d380123893210cfa447`. PR #97 pozostaje otwarty do ukończenia rozpatrzenia i uzasadnionych poprawek. Merge ani usuwanie branchy nie są częścią polecenia zamknięcia PR-ów. Wcześniejszy WIP meshing zachowany osobno.
 
-Stan canonical rejestru bieżącego snapshotu: `already_fixed`:31, `duplicate`:99, `duplicate_open`:5, `implemented`:169, `implemented_pending_browser`:15, `implemented_pending_ci`:9, `implemented_pending_ci_browser`:3, `implemented_pending_external_equivalence`:1, `implemented_pending_gpu_runtime`:1, `not_actionable`:3, `open_pending_source_review`:26, `pending`:28, `source_guarded_ci_verified`:1, `unsupported_recommendation`:3, `valid_unfixed`:12. Razem398 inline i8 action-bearing body review. Trzy historyczne wpisy inline spoza świeżego snapshotu zachowano oddzielnie (4060016735,4206086548,4206086557); nie wlicza się ich do398. Statusy opisują zakres dowodów, nie procent kwalifikacji solvera.
+Stan canonical rejestru bieżącego snapshotu: `already_fixed`:31, `duplicate`:97, `duplicate_open`:5, `implemented`:172, `implemented_pending_browser`:16, `implemented_pending_ci`:7, `implemented_pending_ci_browser`:3, `implemented_pending_external_equivalence`:1, `implemented_pending_gpu_runtime`:1, `not_actionable`:3, `open_pending_source_review`:25, `pending`:25, `source_guarded_ci_verified`:1, `unsupported_recommendation`:3, `valid_unfixed`:8. Razem398 inline i8 action-bearing body review. Trzy historyczne wpisy inline spoza świeżego snapshotu zachowano oddzielnie (4060016735,4206086548,4206086557); nie wlicza się ich do398. Statusy opisują zakres dowodów, nie procent kwalifikacji solvera.
 
 Legenda: `pending` — nierozpatrzona; `valid_unfixed` — zasadna, nie naprawiona; `already_fixed` — poprawka potwierdzona aktualnym kodem; `duplicate` — powtórzenie; `unsupported_recommendation` — konkretna rekomendacja nie odpowiada kontraktowi; `implemented` — poprawka z potwierdzoną regresją CI; `implemented_pending_ci` — poprawka przygotowana, regresja oczekuje CI; `implemented_pending_browser` — pokrywające CI przeszło, nadal wymaga celowanego dowodu z przeglądarki; `not_actionable` — uwaga zastąpiona późniejszą jawną decyzją użytkownika.
 
@@ -3755,3 +3755,63 @@ GitHub: 398 komentarzy liniowych Codex, 49 review. Sześć nowych uwag inline or
 - Open mode3ce2429c: GHA38380681893 SUCCESS; nowe rzeczywiste DOM-click regressions i pełny typecheck. Browser/WebGL NOT VERIFIED.
 - Legacy response Results587c19aa: fallback v1, preferred-v2 provenance i failclosed korupcja; GHA38381330970 uruchomiony.
 - Nadal otwarte: stage owner5483870930, paging retencji4252023530, G5 native14/17 i pozostałe canonical pending źródłowe/runtime/scientific. Nie zamykać PR97 na podstawie tych częściowych poprawek.
+
+### Checkpoint — G5 owned candidate i korekta bieżących statusów
+
+Remote `e1589b98cd162cbe4610f825a0ce472ee93774af`, bez zmiany frozen lokalnego HEAD/index/stash. Pełny sześcioplikowy diff G5 przeszedł source review: cache kandydata tej samej próby, niezależne b-Ax, strict progress, pełne rozliczenie terminalnych iteracji. Bez zmiany rtol/atol/shift/PC side. Native GHA38383290699 trwa; poprzedni exact receipt6c64 pozostaje14/17 PASS, trzy FAIL. Nie zamyka G5 ani scientific qualification.
+
+Poniższe wiersze aktualizują wcześniejsze historyczne klasyfikacje. Ostatni wpis danego ID jest bieżący.
+
+| Uwaga | Zakres | Status | Dowód i ograniczenie |
+|---|---|---|---|
+| [4060116242](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4060116242) / #97 | `Python/OutputIR/publisher/API/UI spectrum_scope` | implemented_pending_browser | OutputIR i V04 zachowują typowane Option<EigenSpectrumScopeIR>; API per_sample/global, eksport pełnej kolekcji i markery różnych k sprawdzone. C01: producer9e123c7103855805aee0c1e9a64f895139743edc, API4fa31 z GHA38354208125 SUCCESS, UIe6cd+29634/GHA38359456109 SUCCESS. C03 późniejsze791testów GHA38366123014 SUCCESS. Rzeczywisty browser/script reimport na solver artifacts pozostaje NOT VERIFIED. |
+| [4225198873](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4225198873) / #97 | `publisher/API/UI generation fencing` | implemented_pending_browser | Final-byte commit/member digest/length, producer owner binding i JSON/CSV/metadata/binary fences wdrożone; API38364933538 i UI38366123014 SUCCESS. Mieszana lub zmieniona generacja daje stale/conflict. Browser na actual solver artifacts NOT VERIFIED; immutable history nie jest wdrożone i pozostaje odrębnym otwartym wymaganiem G3, zgodnie z ADR0058. |
+
+Uwagi4069106604 dotyczą osobnej ścieżki native eigen progress, nie serialnego process pool; nie zamknięto ich przez same C02 pool tests. Przenośna publikacja logów, paged retention i Results stage owner są w implementacji. PR97 pozostaje otwarty.
+
+### Checkpoint — dalsze korekty i rzeczywisty stan CI
+
+Remote kodu `3f626856230768653d9e956fd88cf2391d0c353b`. Source review oraz parse-only Rust/AST potwierdzają zakres źródeł; nie wykonano lokalnych testów ani buildów. Publikacja przez GitData exact-parent, force:false. HEAD `1827c3436f80ff17396c285d13c0e269eecf4b25` i SHA256 indeksu `D867F6996C4A8952B025F0B8644FE5E9806628C3A59706F2D87193AC81641144` są zachowane. Współdzielony refs/stash ma teraz `3ea5620015594a502ad90e2aaf1055921be10350` (autostash); poprzedni `a4a7d2f87508b47da6133049df6a2b91a4bfa463` pozostaje w reflogu. Nie wykonano operacji na stash i nie przypisano tej zmiany do niniejszego zadania.
+
+- G5 `e1589b98cd162cbe4610f825a0ce472ee93774af`: GHA38383290699 FAILURE,14/17 CTest PASS. Full fixture przyjmuje mod i certyfikat descriptoru, zatrzymuje się na reprezentacji potencjału; dwa mixed cases nadal nie mają statusu OK. `053113962c9f8fbe462eb16fa5c99e43ec7ef09f` dodaje bounded C ABI diagnostics przed istniejącymi asercjami; [GHA38386937372](https://github.com/MateuszZelent/fullmag/actions/runs/38386937372) pending. Bez zmiany tolerancji, budżetów i parametrów fizycznych.
+- Portable logs `65954212b3483a6cebf264d3074b8ca50d6f1c62`: publiczny raport zawiera względne member paths, rzeczywiste stdout/stderr/handshake bytes, SHA256 i długość. Oversized/duplicate/path collision failclosed; missing jest jawnie dozwolony tylko po interruption. Prywatny journal nie jest zamieniony w publiczny bundle.
+- Paged retention `b1c6685d2de9fe53c709d38cf0af79c751a5b061`: bounded HTTP details, hash-bound collection revision, strict cursor/query, explicit partial/blocked ranges i pełny compacted count. UI fences obejmują page/manual refresh/reconnect/apply/destroy. Pierwsze CI38388239666 FAIL na mocku bez DOM style; `3f626856230768653d9e956fd88cf2391d0c353b` dodaje tylko style do mocka, zachowuje asercje. [GHA38389234232](https://github.com/MateuszZelent/fullmag/actions/runs/38389234232) pending.
+- Results owner `07773bdc92e34c92ea21c6abd44d3511f5aa5f18`: capture run/root/stage records once; exact generation producer owns only members. Unique stage refs must agree, ambiguity/conflict daje409. Sibling refs wymagają także exact snapshot SHA256 i długości; gamma/DSF legacy bez ownera pozostają stage:analysis. Payload stage i aktywny indeks nie nadają tożsamości. Hysteresis zachowuje istniejący odrębny stage-specific discovery.
+- Terminal progress `94873a7c105dfb0f65dae6724d278a58a652fae2`: callback completed jest notification-only, Stop/Pause nie odrzuca ukończonego rezultatu; aktywne przerwanie nadal wymaga typed partial correction. Nie zamknięto całej4069106604.
+- [Rust GHA38389038221](https://github.com/MateuszZelent/fullmag/actions/runs/38389038221) obejmuje powyższe logs/owner/progress oraz CLI fixture `b7affaa4711f331d42373a183b08233220ac888c`. Poprzednie38379689033/38381330970 były FAILURE przez brak metody get na tuple-wrapper w CLI; targeted wcześniejsze kroki pozostały PASS. Nie oznaczać całego poprzedniego joba jako SUCCESS.
+
+Poniższa tabela zastępuje wcześniejsze wiersze tych ID; pozostałe wymagania runtime/browser/scientific pozostają otwarte.
+
+| ID / PR | Plik | Rozstrzygnięcie | Uzasadnienie |
+|---|---|---|---|
+| [4252023512](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4252023512) / #97 | `fem/eigen_k_pool.rs` | implemented | Named terminal pool callback regression PASS w kroku modal policy38379689033; cały job FAIL później w CLI. Dotyczy completed pool, nie aktywnego native progress. |
+| [4252023519](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4252023519) / #97 | `fullmag-plan/src/fem.rs` | implemented | Selected Floquet payload regression step38379689033 PASS; missing/NaN/Infinity/empty pair admission failclosed. Nie jest dowodem native solve. |
+| [4252023546](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4252023546) / #97 | `eigen/k_process_pool.rs` | implemented | Managed worker manifest/binary identity regressions w adaptive pool step38379689033 PASS, cały job FAIL później w CLI. Wykonanie rzeczywistego managed bundle pozostaje odrębną bramką. |
+| [4252023530](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4252023530) / #97 | `local_runner/container_api.py + runner-console` | implemented_pending_ci | Paged details b1c6685 + mock3f62685; bounded/strict/revision/partial/UI fences, hosted38389234232 oczekiwany. |
+| [4204074481](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4204074481) / #97 | `runner-console source/generated StorageView` | implemented_pending_ci | Canonical/generated sync b1c6685; preedit canonical był byte-equal już zdalnemu generated, a po poprawce obie wersje pozostają byte-equal. Hosted console test oczekiwany. |
+| [4241893348](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4241893348) / #97 | `fem/eigen_path.rs worker log artifacts` | implemented_pending_ci | Przenośne member paths i content identity6595421, trzy named actual-bundle regressions wybrane w38389038221. |
+| [4251262132](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4251262132) / #97 | `fem/eigen_path.rs worker log artifacts` | implemented_pending_ci | Ten sam portable bundle6595421, w tym interruption missing, oversized/duplicate/collision failclosed; pending hosted gate. |
+| [5483870930](https://github.com/MateuszZelent/fullmag/pull/97#pullrequestreview-5483870930) / #97 | `analysis/results.rs body review` | implemented_pending_ci | Exact per-artifact owner07773bdc; pięć explicit HTTP/resolver selectors38389038221, źródłowe review i parse-only PASS. |
+| [5489859861](https://github.com/MateuszZelent/fullmag/pull/97#pullrequestreview-5489859861) / #97 | `analysis/results.rs body review` | implemented | response_magnetic_sweep_v1_endpoint_returns_artifact_json z rozszerzonym rzeczywistym Results route PASS38381330970; malformed preferred-v2 nie przechodzi fallbackiem. Cały job później FAIL w CLI. |
+
+Mixed typed mesh: legacy MeshTopology przed native single-k, equilibrium i consistent P1 tracking metric nadal ograniczają modal sweep do Tet4/Tri3. Prism6/Quad4 w native MFEM builderze nie zamyka tej bramki; potrzebne typed adapter/equilibrium/FE metric i rzeczywisty mixed-cell receipt. Fixture mixed Floquet oznacza operator caller/provider, nie mixed cells. G0–G8, immutable history, external COMSOL equivalence, browser i integracja PR97 pozostają nieukończone.
+
+
+### Retencja — hosted gate PASS
+
+[GHA38389234232](https://github.com/MateuszZelent/fullmag/actions/runs/38389234232), exact3f626856230768653d9e956fd88cf2391d0c353b, SUCCESS na Windows i Ubuntu. Przeszły Node console/source mirror, HTTP routing/coordinator, near-budget blocked response, collection revision, stale UI oraz istniejące execution/runtime/source retention guards. Jest to dowód kontraktów hosted, bez faktycznego usuwania storage użytkownika ani browser Fullmag solver receipt.
+
+| ID / PR | Plik | Rozstrzygnięcie | Uzasadnienie |
+|---|---|---|---|
+| [4252023530](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4252023530) / #97 | `local_runner/container_api.py + runner-console` | implemented | b1c6685 + mock3f62685, hosted38389234232 SUCCESS Windows+Ubuntu: bounded HTTP paging/revision/partial/UI stale responses i packaged source. |
+| [4204074481](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4204074481) / #97 | `runner-console source/generated StorageView` | implemented | Canonical/generated byte-equal, hosted38389234232 source mirror i console regressions PASS; brak zmiany semantyki mutacji lub automatycznego retry. |
+
+
+### G5 — potwierdzona przyczyna trzech awarii native
+
+[GHA38386937372](https://github.com/MateuszZelent/fullmag/actions/runs/38386937372), exact053113962c9f8fbe462eb16fa5c99e43ec7ef09f: FAILURE, 14/17 CTest PASS. Bounded diagnostics rozróżniły przyczyny:
+
+- Full modal zwrócił zaakceptowany mod 0.5174055238347522 Hz, residual 2.9224477919344582e-11, q/phi po dwa fizyczne zespolone DOF oraz pełny certyfikat descriptoru. Fixture oczekiwał starego doubled-real-split. Commit375212591720e4988539f92c20eafb5ef11bd0ad wymaga teraz flagi physical_complex, q interleaved_node_component oraz phi complex_coefficients. Kontrole residualu, buforów, niekompletności widma i progów pozostają bez zmian; ponowienie native CI będzie potrzebne.
+- Dwa mixed caller/provider cases zwracają status2 / invalid_tangent_mass_metric przed solve. Nie są teraz dowodem braku zbieżności GMRES. Trwa diagnoza przekazania i walidacji dodatniej macierzy masy. Nie zmieniono progów ani warunku dodatniości.
+
+Retencja38389234232 SUCCESS Windows+Ubuntu. Rust38389038221 pozostaje in_progress; wykonane kroki do bias-field sample identity przeszły, bez deklarowania całego joba jako SUCCESS. Aktywny Stop/Pause i niezależny replay pełnego potencjału są nadal w pracy. Powyższy miniaturowy mod jest dowodem kontraktu native, nie benchmarkiem DE/BV ani kwalifikacją COMSOL A1.
