@@ -26,6 +26,8 @@ export interface DecodedFieldVector {
   meshTopologyHash?: string | null;
   meshTopologyRevision?: string | null;
   nComp: number;
+  /** Explicit presentation projection; raw transport does not assign one. */
+  projectionToken?: string;
   nodeIndices?: readonly number[] | Uint32Array | null;
   pointCount: number;
   quantityId: string;
