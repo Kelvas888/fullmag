@@ -146,3 +146,47 @@ Końcowa kontrola produkcyjnych typów po guardzie świeżości rejestru:
 `e5ec865c017d4184a73eabeb2ee3a7f1`, FAILED wyłącznie na
 computeNodeInventory.ts:260. Własne pliki poprawki nie zgłosiły diagnoz.
 Nie promować tego checkpointu do pełnej kwalifikacji frontendu ani wydania.
+
+## Natywny pakiet po poprawce — 13.10.2026
+
+Zarządzany `just windows-workspace-build dev dev 3258 true` zakończył się
+kodem 0; wrapper zapisał `state=completed` o
+`2026-10-13T19:03:41.476902+00:00`. API/CLI i launcher desktopowy skompilowano
+w profilu `backend-dev`; integralność utrwalonej kopii źródeł przeszła kontrolę.
+Build nie kompilował testów jednostkowych i nie restartował workspace na 3197.
+
+- Commit: `1c0c35dcf8a4d7dcb0cbde10f3c723c83b729a22`; snapshot obejmuje
+  także zastane zmiany równoległej pracy, zatem `source_dirty=true`.
+- Snapshot źródeł:
+  `8d236794af8bfcd0b9a78f4fe64767990fb0cffde33410ee63b3cf1b94bdc038`.
+- Kapsuła:
+  `ff37087d52de092122c8621425b9e5c3f57469841e4017252e4fee344fc50310`.
+- SHA-256 manifestu pakietu:
+  `e14f2a96f55b69177b979543095dc7d1006ca28a6493f0b1b48d8f72daee14b7`.
+- SHA-256 API:
+  `053b19f3e144befeff29f8afeb7cad435757a3c43c0c08daf3883b4b32049c65`.
+- Manifest zamrożonych źródeł frontendu:
+  `cef3504337a530d4f0b117762bb6718df1fbf1d6565d83e5f68af46c490038d1`.
+
+Dowody znajdują się pod rozwiązaną ścieżką
+`storage/builds/fullmag-0950f4dca4ffe38f/windows-native-fdm-cpu-dev/`:
+`build-status.json`, `windows-runtime/build-manifest.json` oraz
+`logs/native-build-1c9664e56d224fd3a67e8158d6a65db7.log`.
+Sukces kompilacji nie zamyka bramki kamery, solvera ani wydania.
+
+Wykonano odrębną natywną próbę przeglądarkową na 3258:
+receipt `fa2d27b2689b434785b39a3c28374623`, source binding
+`verified_frozen_native_package`. Próba zakończyła się FAILED, exit 1,
+przed udostępnieniem strony: zamrożony frontend zawierał błąd
+`computeNodeInventory.ts:260`, TS18047 (`snapshot` possibly null).
+Wszystkie 18 procesów ma terminalne `waited=true`; nie wykonano restartu
+ani porównania kamery. Workspace 3197 pozostał nietknięty.
+
+W bieżącym checkoutcie dodano jedną linię `!snapshot ||` do istniejącej
+walidacji parsera compute inventory. Pozostała równoległa implementacja
+tego nieśledzonego pliku została zachowana i nie jest przejmowana do
+commita kamery. Zarządzana kontrola całych produkcyjnych typów po tej
+poprawce przeszła: `4d5cb65a806c4521b49ef378bd4803d8`, exit 0, PASS.
+Nie poprawiano zamrożonej kapsuły ani nie pomijano jej kontroli.
+Próba restartu wymaga nowego pakietu zawierającego poprawiony frontend;
+wynik natywnego restartu z zachowaniem kamery nadal NOT VERIFIED.
