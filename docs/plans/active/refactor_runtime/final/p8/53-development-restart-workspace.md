@@ -1,5 +1,11 @@
 # P8-53 — bezpieczne zastosowanie nowego backendu w workspace
 
+[P8-53BK](53bk-repeated-handoff-owner-chain.md), 13.10.2026:
+interpretowany łańcuch terminalnie odtworzonych kapsuł z nowym ownerem
+**PASS**, 162 kontrole bez pominięć, receipt `d061e0844b104248bf03fedb12ce3f34`.
+Nie zastępuje dwóch restartów A→B→C w jednej sesji przeglądarki;
+ta bramka oraz pozostałe wymagania P8-53 pozostają otwarte.
+
 [P8-53BJ](53bj-pending-inspector-save-cancel.md), 13.10.2026:
 Save/Cancel przy szkicu panelu materiału **CLOSED w opisanym zakresie**.
 Save pobrał zatwierdzone alpha=0.01, zachowując szkic alpha=0.03; Cancel
