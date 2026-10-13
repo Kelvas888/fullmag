@@ -6,6 +6,7 @@ use std::time::Duration;
 use fullmag_ir::{BackendPlanIR, ExecutionPlanIR, FemDomainMeshModeIR};
 use serde_json::{json, Value};
 
+use crate::antenna_workflow::{materialize_antenna_consumer_plan, plan_antenna_observation};
 use crate::control_room::*;
 use crate::live_workspace::*;
 
@@ -17,6 +18,12 @@ struct CurrentLiveControlState {
     queue: VecDeque<SessionCommand>,
 }
 
+fn latch_running_interrupt_request(signal: &AtomicBool, requests_interrupt: bool) {
+    if requests_interrupt {
+        signal.store(true, Ordering::Release);
+    }
+}
+
 pub(super) struct CurrentLiveDisplaySelectionHandle {
     shared: Arc<(Mutex<CurrentLiveControlState>, Condvar)>,
     stop: Arc<AtomicBool>,
@@ -25,6 +32,8 @@ pub(super) struct CurrentLiveDisplaySelectionHandle {
     running_interrupt: Arc<Mutex<Option<InteractiveStageInterrupt>>>,
     running_interrupt_requested: Arc<AtomicBool>,
     owner_session_id: Option<String>,
+    grid_refresh_command_id: Option<String>,
+    grid_refresh_command_refused: Arc<AtomicBool>,
     worker_owner: bool,
 }
 
@@ -38,6 +47,8 @@ impl Clone for CurrentLiveDisplaySelectionHandle {
             running_interrupt: Arc::clone(&self.running_interrupt),
             running_interrupt_requested: Arc::clone(&self.running_interrupt_requested),
             owner_session_id: self.owner_session_id.clone(),
+            grid_refresh_command_id: self.grid_refresh_command_id.clone(),
+            grid_refresh_command_refused: Arc::clone(&self.grid_refresh_command_refused),
             worker_owner: false,
         }
     }
@@ -54,6 +65,17 @@ pub(super) enum InteractiveStageInterrupt {
 
 impl CurrentLiveDisplaySelectionHandle {
     pub(super) fn spawn_for_session(session_id: Option<String>) -> Self {
+        Self::spawn_for_session_scoped(session_id, None)
+    }
+
+    pub(super) fn spawn_for_grid_refresh(session_id: String, command_id: String) -> Self {
+        Self::spawn_for_session_scoped(Some(session_id), Some(command_id))
+    }
+
+    fn spawn_for_session_scoped(
+        session_id: Option<String>,
+        grid_refresh_command_id: Option<String>,
+    ) -> Self {
         let initial_display_selection = current_live_display_selection().unwrap_or_default();
         let handle = Self {
             shared: Arc::new((
@@ -69,6 +91,8 @@ impl CurrentLiveDisplaySelectionHandle {
             running_interrupt: Arc::new(Mutex::new(None)),
             running_interrupt_requested: Arc::new(AtomicBool::new(false)),
             owner_session_id: session_id,
+            grid_refresh_command_id,
+            grid_refresh_command_refused: Arc::new(AtomicBool::new(false)),
             worker_owner: true,
         };
         let worker = handle.clone();
@@ -97,8 +121,21 @@ impl CurrentLiveDisplaySelectionHandle {
                     after_seq,
                     1_000,
                     worker.owner_session_id.as_deref(),
+                    worker.grid_refresh_command_id.as_deref(),
                 ) {
                     Ok(Some(command)) => {
+                        if let Some(expected_command_id) =
+                            worker.grid_refresh_command_id.as_deref()
+                        {
+                            if !is_expected_grid_refresh_command(&command, expected_command_id) {
+                                worker
+                                    .grid_refresh_command_refused
+                                    .store(true, Ordering::Release);
+                                worker.stop.store(true, Ordering::Release);
+                                break;
+                            }
+                            worker.stop.store(true, Ordering::Release);
+                        }
                         after_seq = after_seq.max(command.seq);
                         eprintln!(
                             "[fullmag-host] RX <- api command {} seq={} id={}",
@@ -109,14 +146,18 @@ impl CurrentLiveDisplaySelectionHandle {
                         if let Some(ref typed_cmd) = typed {
                             let requests_interrupt =
                                 crate::command_bridge::is_interrupt_command(typed_cmd);
-                            worker
-                                .running_interrupt_requested
-                                .store(requests_interrupt, Ordering::Relaxed);
+                            latch_running_interrupt_request(
+                                &worker.running_interrupt_requested,
+                                requests_interrupt,
+                            );
                         }
                         let (lock, cvar) = &*worker.shared;
                         let mut state = lock.lock().unwrap_or_else(|poison| poison.into_inner());
                         state.queue.push_back(command);
                         cvar.notify_all();
+                        if worker.grid_refresh_command_id.is_some() {
+                            break;
+                        }
                     }
                     Ok(None) => sync_display_selection_from_status(&worker.shared),
                     Err(_) => std::thread::sleep(Duration::from_millis(100)),
@@ -134,6 +175,10 @@ impl CurrentLiveDisplaySelectionHandle {
 
     pub(super) fn owner_session_lost(&self) -> bool {
         self.owner_lost.load(Ordering::Acquire)
+    }
+
+    pub(super) fn grid_refresh_command_refused(&self) -> bool {
+        self.grid_refresh_command_refused.load(Ordering::Acquire)
     }
 
     pub(super) fn display_selection_snapshot(&self) -> CurrentDisplaySelection {
@@ -556,7 +601,10 @@ impl InteractiveRuntimeHost {
         };
 
         let continuation_slice = continuation_magnetization.as_deref();
-        self.ensure_base_runtime_ready(continuation_slice, live_workspace);
+        if let Err(error) = self.ensure_base_runtime_ready(continuation_slice, live_workspace) {
+            eprintln!("interactive preview runtime warning: {error}");
+            live_workspace.push_log("warn", format!("Idle live preview runtime unavailable: {error}"));
+        }
 
         if self.runtime.is_none()
             && self.dynamic_idle_preview_supported
@@ -626,14 +674,17 @@ impl InteractiveRuntimeHost {
     pub(super) fn prepare_base_problem(
         base_problem: ProblemIR,
         plan: &ExecutionPlanIR,
+        live_workspace: &LocalLiveWorkspace,
     ) -> Result<PreparedInteractiveBase> {
+        let mut plan = plan.clone();
+        materialize_antenna_consumer_plan(&base_problem, &mut plan, live_workspace)?;
         let backend_plan = &plan.backend_plan;
         let resolver = fullmag_runner::ObservationProviderResolver::from_backend_plan(backend_plan);
         let runtime_capable = resolver.retains_idle_runtime();
         let runtime = if runtime_capable {
             Some(fullmag_runner::create_planned_interactive_runtime(
                 &base_problem,
-                plan,
+                &plan,
                 None,
             )?)
         } else {
@@ -709,7 +760,7 @@ impl InteractiveRuntimeHost {
         let display_selection = self.control.display_selection_snapshot();
         let preview_request = display_selection.preview_request();
         let materialization_request = full_field_materialization_request(preview_request.clone());
-        self.ensure_base_runtime_ready(continuation_magnetization, live_workspace);
+        self.ensure_base_runtime_ready(continuation_magnetization, live_workspace)?;
 
         if let Some(runtime) = self.runtime.as_mut() {
             refresh_interactive_preview_runtime_display(
@@ -731,6 +782,7 @@ impl InteractiveRuntimeHost {
                 &self.base_problem,
                 continuation_magnetization,
                 &preview_request,
+                live_workspace,
             )?;
         live_workspace.replace_auxiliary_artifacts(&auxiliary_artifacts)?;
         live_workspace.update(|state| {
@@ -746,14 +798,15 @@ impl InteractiveRuntimeHost {
         continuation_magnetization: Option<&[[f64; 3]]>,
         live_workspace: &LocalLiveWorkspace,
     ) -> Result<()> {
-        self.ensure_base_runtime_ready(continuation_magnetization, live_workspace);
+        self.ensure_base_runtime_ready(continuation_magnetization, live_workspace)?;
 
-        if let Some(runtime) = self.runtime.as_mut() {
-            let step_stats = runtime.snapshot_step_stats()?;
-            live_workspace.update(|state| {
-                apply_step_stats_to_idle_live_state(state, &step_stats);
-            });
-        }
+        let runtime = self.runtime.as_mut().ok_or_else(|| {
+            anyhow!("Energy snapshots are unavailable for the current interactive backend")
+        })?;
+        let step_stats = runtime.snapshot_step_stats()?;
+        live_workspace.update(|state| {
+            apply_step_stats_to_idle_live_state(state, &step_stats);
+        });
 
         Ok(())
     }
@@ -823,6 +876,9 @@ impl InteractiveRuntimeHost {
         magnetization: Vec<[f64; 3]>,
         live_workspace: &LocalLiveWorkspace,
     ) -> Result<()> {
+        validate_imported_magnetization(&self.base_problem, &magnetization)?;
+        self.ensure_base_runtime_ready(Some(&magnetization), live_workspace)?;
+
         let generation = if let Ok(mut preview_state) = self.preview_source.lock() {
             preview_state.status = InteractivePreviewStatus::AwaitingCommand;
             preview_state.continuation_magnetization = Some(magnetization.clone());
@@ -831,13 +887,6 @@ impl InteractiveRuntimeHost {
         } else {
             0
         };
-
-        self.ensure_base_runtime_ready(Some(&magnetization), live_workspace);
-        if let Some(runtime) = self.runtime.as_mut() {
-            runtime
-                .upload_magnetization(&magnetization)
-                .map_err(|error| anyhow!(error.to_string()))?;
-        }
 
         live_workspace.update(|state| {
             state.live_state.updated_at_unix_ms = unix_time_millis().unwrap_or(0);
@@ -875,43 +924,31 @@ impl InteractiveRuntimeHost {
         &mut self,
         continuation_magnetization: Option<&[[f64; 3]]>,
         live_workspace: &LocalLiveWorkspace,
-    ) {
+    ) -> Result<()> {
         if !self.runtime_capable {
-            return;
+            return Ok(());
         }
 
         if self.runtime.is_none() {
-            match create_interactive_preview_runtime_from_problem(
+            let runtime = create_interactive_preview_runtime_from_problem(
                 &self.base_problem,
                 continuation_magnetization,
-            ) {
-                Ok(runtime) => {
-                    self.runtime = Some(runtime);
-                    self.publish_runtime_engine_metadata(live_workspace);
-                }
-                Err(error) => {
-                    eprintln!("interactive preview runtime warning: {}", error);
-                    live_workspace.push_log(
-                        "warn",
-                        format!("Idle live preview runtime unavailable: {}", error),
-                    );
-                    return;
-                }
-            }
+                live_workspace,
+            )
+            .context("Idle live preview runtime unavailable")?;
+            self.runtime = Some(runtime);
+            self.publish_runtime_engine_metadata(live_workspace);
         } else if let (Some(runtime), Some(magnetization)) =
             (self.runtime.as_mut(), continuation_magnetization)
         {
             if let Err(error) = runtime.upload_magnetization(magnetization) {
-                eprintln!("interactive preview runtime warning: {}", error);
-                live_workspace.push_log(
-                    "warn",
-                    format!("Idle live preview runtime resync failed: {}", error),
-                );
                 self.runtime = None;
+                return Err(anyhow!("Idle live preview runtime resync failed: {error}"));
             } else {
                 self.publish_runtime_engine_metadata(live_workspace);
             }
         }
+        Ok(())
     }
 
     fn publish_runtime_engine_metadata(&self, live_workspace: &LocalLiveWorkspace) {
@@ -989,8 +1026,10 @@ impl InteractiveRuntimeHost {
         }
         let quantities = fullmag_runner::quantities::field_materialization_quantity_ids();
         let materialization_request = full_field_materialization_request(request.clone());
-        let batch = fullmag_runner::snapshot_problem_vector_field_batch(
+        let plan = plan_antenna_observation(&problem, live_workspace)?;
+        let batch = fullmag_runner::snapshot_planned_problem_vector_field_batch(
             &problem,
+            &plan,
             &quantities,
             &materialization_request,
         )?;
@@ -1049,7 +1088,8 @@ fn refresh_interactive_preview_snapshot(
     if let Some(previous_final_magnetization) = continuation_magnetization {
         apply_continuation_initial_state(&mut problem, previous_final_magnetization)?;
     }
-    let preview_field = fullmag_runner::snapshot_problem_preview(&problem, request)?;
+    let plan = plan_antenna_observation(&problem, live_workspace)?;
+    let preview_field = fullmag_runner::snapshot_planned_problem_preview(&problem, &plan, request)?;
     live_workspace.update(|state| {
         state.live_state.updated_at_unix_ms = unix_time_millis().unwrap_or(0);
         state.live_state.latest_step.preview_field = Some(preview_field.clone());
@@ -1084,8 +1124,10 @@ fn create_interactive_preview_runtime(
 fn create_interactive_preview_runtime_from_problem(
     base_problem: &ProblemIR,
     continuation_magnetization: Option<&[[f64; 3]]>,
+    live_workspace: &LocalLiveWorkspace,
 ) -> Result<fullmag_runner::InteractiveRuntime> {
-    fullmag_runner::create_interactive_runtime(base_problem, continuation_magnetization)
+    let plan = plan_antenna_observation(base_problem, live_workspace)?;
+    fullmag_runner::create_planned_interactive_runtime(base_problem, &plan, continuation_magnetization)
         .map_err(|error| anyhow!(error.to_string()))
 }
 
@@ -1174,7 +1216,9 @@ fn idle_observation_quantities(display_selection: &CurrentDisplaySelection) -> V
     // Older control-plane payloads have no demand list. Keep their selected
     // spatial quantity working without eagerly materializing the whole catalog.
     if demand.observation_quantities.is_empty() {
-        demand.observation_quantities.push(display_selection.selection.quantity.clone());
+        demand
+            .observation_quantities
+            .push(display_selection.selection.quantity.clone());
     }
     demand.canonicalize_observation_quantities();
     demand.observation_quantities
@@ -1184,10 +1228,15 @@ fn apply_step_stats_to_idle_live_state(
     state: &mut LocalLiveWorkspaceState,
     step_stats: &fullmag_runner::StepStats,
 ) {
+    if step_stats.validate_record_kind().is_err() || step_stats.kind.is_solver_progress() {
+        return;
+    }
     if step_stats.step < state.live_state.latest_step.step {
         return;
     }
     state.live_state.updated_at_unix_ms = unix_time_millis().unwrap_or(0);
+    state.live_state.latest_step.kind = step_stats.kind.clone();
+    state.live_state.latest_step.solver_progress = step_stats.solver_progress.clone();
     state.live_state.latest_step.step = step_stats.step;
     state.live_state.latest_step.time = step_stats.time;
     state.live_state.latest_step.dt = step_stats.dt;
@@ -1211,7 +1260,9 @@ fn apply_step_stats_to_idle_live_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_step_stats_to_idle_live_state, scalar_row_from_stats, CurrentLiveControlState,
+        apply_step_stats_to_idle_live_state, latch_running_interrupt_request,
+        current_live_control_wait_query_parameters, is_expected_grid_refresh_command,
+        scalar_row_from_stats, CurrentLiveControlState,
         CurrentLiveDisplaySelectionHandle, InteractivePreviewStatus, InteractiveRuntimeHost,
     };
     use crate::live_workspace::{
@@ -1231,8 +1282,11 @@ mod tests {
     fn idle_observation_demand_is_canonical_and_not_eager() {
         let mut display = fullmag_runner::DisplaySelectionState::default();
         display.observation_quantities = vec![
-            "h_demag".into(), "H_demag".into(), "eden_total".into(),
-            "E_total".into(), "unknown".into(),
+            "h_demag".into(),
+            "H_demag".into(),
+            "eden_total".into(),
+            "E_total".into(),
+            "unknown".into(),
         ];
         assert_eq!(
             super::idle_observation_quantities(&display),
@@ -1374,8 +1428,52 @@ mod tests {
             running_interrupt: Arc::new(Mutex::new(None)),
             running_interrupt_requested: Arc::new(AtomicBool::new(false)),
             owner_session_id: None,
+            grid_refresh_command_id: None,
+            grid_refresh_command_refused: Arc::new(AtomicBool::new(false)),
             worker_owner: true,
         }
+    }
+
+    #[test]
+    fn unrelated_command_cannot_clear_pending_stage_interrupt() {
+        let signal = AtomicBool::new(false);
+        latch_running_interrupt_request(&signal, true);
+        latch_running_interrupt_request(&signal, false);
+        assert!(signal.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pinned_control_wait_sends_only_the_requested_grid_refresh_pin() {
+        let query = current_live_control_wait_query_parameters(
+            7,
+            1_000,
+            Some("session-a"),
+            Some("cmd-grid-a"),
+        );
+
+        assert!(query.contains(&("afterSeq", "7".to_string())));
+        assert!(query.contains(&("sessionId", "session-a".to_string())));
+        assert!(query.contains(&("gridRefreshCommandId", "cmd-grid-a".to_string())));
+        assert!(!current_live_control_wait_query_parameters(0, 1_000, None, None)
+            .iter()
+            .any(|(key, _)| *key == "gridRefreshCommandId"));
+    }
+
+    #[test]
+    fn pinned_control_worker_accepts_only_exact_grid_refresh_identity() {
+        let exact = queued_command(2, "fdm_grid_refresh");
+        assert!(is_expected_grid_refresh_command(
+            &exact,
+            "cmd-2-fdm_grid_refresh"
+        ));
+        assert!(!is_expected_grid_refresh_command(
+            &queued_command(3, "fdm_grid_refresh"),
+            "cmd-2-fdm_grid_refresh"
+        ));
+        assert!(!is_expected_grid_refresh_command(
+            &queued_command(2, "solve"),
+            "cmd-2-solve"
+        ));
     }
 
     fn retained_preview_field(quantity: &str) -> fullmag_runner::LivePreviewField {
@@ -1488,6 +1586,8 @@ mod tests {
             running_interrupt: Arc::new(Mutex::new(None)),
             running_interrupt_requested: Arc::new(AtomicBool::new(false)),
             owner_session_id: None,
+            grid_refresh_command_id: None,
+            grid_refresh_command_refused: Arc::new(AtomicBool::new(false)),
             worker_owner: true,
         };
 
@@ -1570,6 +1670,8 @@ mod tests {
             running_interrupt: Arc::new(Mutex::new(None)),
             running_interrupt_requested: Arc::new(AtomicBool::new(false)),
             owner_session_id: None,
+            grid_refresh_command_id: None,
+            grid_refresh_command_refused: Arc::new(AtomicBool::new(false)),
             worker_owner: true,
         };
 
@@ -1675,7 +1777,7 @@ mod tests {
         assert!(function_body.contains("snapshot_interactive_preview_payload"));
         assert!(function_body.contains("replace_auxiliary_artifacts"));
         assert!(function_body.contains("full_field_materialization_request"));
-        assert!(source.contains("snapshot_problem_vector_field_batch"));
+        assert!(source.contains("snapshot_planned_problem_vector_field_batch"));
     }
 
     #[test]
@@ -1698,6 +1800,7 @@ fn refresh_interactive_preview_fields(
     base_problem: &ProblemIR,
     continuation_magnetization: Option<&[[f64; 3]]>,
     request: &fullmag_runner::LivePreviewRequest,
+    live_workspace: &LocalLiveWorkspace,
 ) -> Result<Vec<fullmag_runner::LivePreviewField>> {
     let mut problem = base_problem.clone();
     if let Some(previous_final_magnetization) = continuation_magnetization {
@@ -1705,8 +1808,10 @@ fn refresh_interactive_preview_fields(
     }
     let quantities = fullmag_runner::quantities::field_materialization_quantity_ids();
 
-    Ok(fullmag_runner::snapshot_problem_vector_fields(
+    let plan = plan_antenna_observation(&problem, live_workspace)?;
+    Ok(fullmag_runner::snapshot_planned_problem_vector_fields(
         &problem,
+        &plan,
         &quantities,
         request,
     )?)
@@ -1716,6 +1821,7 @@ fn snapshot_interactive_preview_payload(
     base_problem: &ProblemIR,
     continuation_magnetization: Option<&[[f64; 3]]>,
     request: &fullmag_runner::LivePreviewRequest,
+    live_workspace: &LocalLiveWorkspace,
 ) -> Result<(
     fullmag_runner::LivePreviewField,
     Vec<fullmag_runner::LivePreviewField>,
@@ -1726,10 +1832,12 @@ fn snapshot_interactive_preview_payload(
         apply_continuation_initial_state(&mut problem, previous_final_magnetization)?;
     }
     let quantities = fullmag_runner::quantities::field_materialization_quantity_ids();
-    let preview_field = fullmag_runner::snapshot_problem_preview(&problem, request)?;
+    let plan = plan_antenna_observation(&problem, live_workspace)?;
+    let preview_field = fullmag_runner::snapshot_planned_problem_preview(&problem, &plan, request)?;
     let materialization_request = full_field_materialization_request(request.clone());
-    let batch = fullmag_runner::snapshot_problem_vector_field_batch(
+    let batch = fullmag_runner::snapshot_planned_problem_vector_field_batch(
         &problem,
+        &plan,
         &quantities,
         &materialization_request,
     )?;
@@ -1761,6 +1869,7 @@ fn spawn_interactive_preview_cache_refresh(
             &base_problem,
             continuation_magnetization.as_deref(),
             &request,
+            &live_workspace,
         ) else {
             return;
         };
@@ -1792,16 +1901,17 @@ fn wait_for_current_live_control(
     after_seq: u64,
     timeout_ms: u64,
     session_id: Option<&str>,
+    grid_refresh_command_id: Option<&str>,
 ) -> Result<Option<SessionCommand>> {
-    let mut request = current_live_api_client()
+    let query = current_live_control_wait_query_parameters(
+        after_seq,
+        timeout_ms,
+        session_id,
+        grid_refresh_command_id,
+    );
+    let request = current_live_api_client()
         .get(internal_live_api_url("control/wait"))
-        .query(&[
-            ("afterSeq", after_seq.to_string()),
-            ("timeoutMs", timeout_ms.to_string()),
-        ]);
-    if let Some(session_id) = session_id {
-        request = request.query(&[("sessionId", session_id.to_string())]);
-    }
+        .query(&query);
     let response = match request.send() {
         Ok(response) => response,
         Err(_) => return Ok(None),
@@ -1819,6 +1929,29 @@ fn wait_for_current_live_control(
             status
         ),
     }
+}
+
+fn is_expected_grid_refresh_command(command: &SessionCommand, command_id: &str) -> bool {
+    command.command_id == command_id && command.kind == "fdm_grid_refresh"
+}
+
+fn current_live_control_wait_query_parameters(
+    after_seq: u64,
+    timeout_ms: u64,
+    session_id: Option<&str>,
+    grid_refresh_command_id: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut query = vec![
+        ("afterSeq", after_seq.to_string()),
+        ("timeoutMs", timeout_ms.to_string()),
+    ];
+    if let Some(session_id) = session_id {
+        query.push(("sessionId", session_id.to_string()));
+    }
+    if let Some(command_id) = grid_refresh_command_id {
+        query.push(("gridRefreshCommandId", command_id.to_string()));
+    }
+    query
 }
 
 fn current_live_session_matches(owner_session_id: &str) -> Option<bool> {

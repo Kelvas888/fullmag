@@ -1,5 +1,4 @@
-import { act } from "react";
-import { createRoot } from "react-dom/client";
+import { act, type ComponentProps } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -14,7 +13,7 @@ import {
 } from "@/kernel/layout/simulationPreparationTestDom.test-support";
 
 import {
-  FrozenSpinsEditor,
+  FrozenSpinsEditor as ScopedFrozenSpinsEditor,
   FrozenSpinsInspectorPanel,
   FrozenSpinsPreviewDetails,
   frozenSpinsPreviewTopologyFingerprint,
@@ -98,6 +97,7 @@ const solverRuntime = {
 
 const mocks = vi.hoisted(() => ({
   activatePreview: vi.fn(),
+  authoringHistory: undefined as { record: ReturnType<typeof vi.fn> } | undefined,
   clear: vi.fn(),
   createPreview: vi.fn(),
   delete: vi.fn(),
@@ -108,6 +108,10 @@ const mocks = vi.hoisted(() => ({
   queueVisualizationPatch: vi.fn(),
   refetchFieldMeta: vi.fn(),
   refetchSolverStatus: vi.fn(),
+  requestScopeEpoch: "request-a",
+  sessionEpoch: "epoch-a",
+  sessionId: "session-a",
+  scene: vi.fn(),
   setActiveViewportMainModule: vi.fn(),
   setFocusedSlot: vi.fn(),
   solverStatusData: null as unknown,
@@ -117,8 +121,11 @@ const mocks = vi.hoisted(() => ({
   },
 }));
 
-vi.mock("@/kernel/KernelContext", () => ({
-  useKernel: () => ({
+vi.mock("@/kernel/KernelContext", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/kernel/KernelContext")>();
+  return {
+    ...actual,
+    useKernel: () => ({
     api: {
       model: {
         frozenSpins: {
@@ -127,8 +134,11 @@ vi.mock("@/kernel/KernelContext", () => ({
           delete: mocks.delete,
           patch: mocks.patch,
         },
+        scene: mocks.scene,
       },
     },
+    authoringHistory: mocks.authoringHistory,
+    commands: { getSessionScopeKey: () => `session=${mocks.sessionId}&epoch=${mocks.sessionEpoch}&request_scope_epoch=${mocks.requestScopeEpoch}` },
     resources: { invalidate: mocks.invalidate },
     selection: { clear: mocks.clear },
     layout: {
@@ -143,7 +153,8 @@ vi.mock("@/kernel/KernelContext", () => ({
       patchDefaults: mocks.patchVisualizationDefaults,
     },
   }),
-}));
+  };
+});
 
 vi.mock("@/kernel/resources/studyRuntimeResources", () => ({
   useFieldMetaResource: () => ({
@@ -167,9 +178,35 @@ vi.mock("@/kernel/resources/frozenSpinsResources", () => ({
   useFrozenSpinsDefinitionResource: () => mocks.definitionResource,
 }));
 
+vi.mock("@/kernel/resources/useSessionScopedResourceKey", () => ({
+  useSessionScopedResourceKey: (unscopedResourceKey: string) => ({
+    resourceKey:
+      `session=${mocks.sessionId}&epoch=${mocks.sessionEpoch}&request_scope_epoch=${mocks.requestScopeEpoch}|${unscopedResourceKey}`,
+    sessionIdentity: {
+      requestScopeEpoch: mocks.requestScopeEpoch,
+      sessionEpoch: mocks.sessionEpoch,
+      sessionId: mocks.sessionId,
+    },
+  }),
+}));
+
+function FrozenSpinsEditor(props: ComponentProps<typeof ScopedFrozenSpinsEditor>) {
+  return (
+    <ScopedFrozenSpinsEditor
+      sessionScopeKey={`session=${mocks.sessionId}&epoch=${mocks.sessionEpoch}&request_scope_epoch=${mocks.requestScopeEpoch}`}
+      {...props}
+    />
+  );
+}
+
 describe("FrozenSpinsInspectorPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.authoringHistory = undefined;
+    mocks.scene.mockReset();
+    mocks.requestScopeEpoch = "request-a";
+    mocks.sessionEpoch = "epoch-a";
+    mocks.sessionId = "session-a";
     mocks.activatePreview.mockResolvedValue(activationReceipt);
     mocks.flushVisualization.mockResolvedValue(undefined);
     mocks.solverStatusData = null;
@@ -298,6 +335,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     mocks.solverStatusData = { frozen_spins: solverRuntime };
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -308,6 +346,7 @@ describe("FrozenSpinsInspectorPanel", () => {
           revision={7}
         />,
       ));
+      expect(findButton(container, "Preview mask").disabled).toBe(false);
       await act(async () => findButton(container, "Preview mask").click());
       await act(async () => findButton(container, "Commit preview").click());
       await act(async () =>
@@ -334,6 +373,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("requests a revision-bound preview and publishes only its preview identity", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () =>
@@ -369,12 +409,163 @@ describe("FrozenSpinsInspectorPanel", () => {
         },
         stage_id: null,
         target_object_id: "film",
-      });
+      }, { sessionScopeKey: "session=session-a&epoch=epoch-a&request_scope_epoch=request-a" });
       expect(mocks.invalidate).toHaveBeenCalledWith(
         "model:frozen-spins:active-preview",
         "preview-1",
       );
       expect(container.textContent).toContain("25.00%");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("forwards the active session scope to every Frozen Spins write", async () => {
+    const sessionScopeKey = "session=session-a&epoch=epoch-a&request_scope_epoch=request-a";
+    mocks.delete.mockResolvedValueOnce({ revision: 9 });
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <FrozenSpinsEditor
+          definition={definitionFixture()}
+          objectId="film"
+          regionId={null}
+          revision={7}
+          sessionScopeKey={sessionScopeKey}
+        />,
+      ));
+      await editDefinitionName(container);
+      await act(async () => findButton(container, "Apply").click());
+      expect(mocks.patch).toHaveBeenCalledWith(
+        "pin-edge",
+        expect.objectContaining({ definition: expect.objectContaining({ name: "Edited pinned edge" }) }),
+        { sessionScopeKey: "session=session-a&epoch=epoch-a&request_scope_epoch=request-a" },
+      );
+      await act(async () => findButton(container, "Preview mask").click());
+      await act(async () => findButton(container, "Commit preview").click());
+      await act(async () => findButton(container, "Delete").click());
+
+      expect(mocks.patch).toHaveBeenCalledWith(
+        "pin-edge",
+        expect.objectContaining({ expected_revision: 7, definition: expect.objectContaining({ name: "Edited pinned edge" }) }),
+        { sessionScopeKey },
+      );
+      expect(mocks.createPreview).toHaveBeenCalledWith(
+        expect.objectContaining({ expected_revision: 8 }),
+        { sessionScopeKey },
+      );
+      expect(mocks.activatePreview).toHaveBeenCalledWith(
+        "preview-1",
+        expect.objectContaining({ expected_revision: 8 }),
+        { sessionScopeKey },
+      );
+      expect(mocks.delete).toHaveBeenCalledWith(
+        "pin-edge",
+        expect.objectContaining({ expected_revision: 8 }),
+        { sessionScopeKey },
+      );
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("keeps a clean Apply disabled without submitting a write", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <FrozenSpinsEditor definition={definitionFixture()} objectId="film" regionId={null} revision={7} />,
+      ));
+      expect(findButton(container, "Apply").disabled).toBe(true);
+      await act(async () => findButton(container, "Apply").click());
+      expect(mocks.patch).not.toHaveBeenCalled();
+      expect(mocks.scene).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("ignores a late write ACK after the editor is unmounted", async () => {
+    let resolvePatch!: (value: unknown) => void;
+    mocks.patch.mockReturnValueOnce(new Promise((resolve) => { resolvePatch = resolve; }));
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <FrozenSpinsEditor
+          definition={definitionFixture()}
+          objectId="film"
+          regionId={null}
+          revision={7}
+        />,
+      ));
+      await editDefinitionName(container);
+      await act(async () => findButton(container, "Apply").click());
+      expect(mocks.patch).toHaveBeenCalledWith(
+        "pin-edge",
+        expect.objectContaining({ definition: expect.objectContaining({ name: "Edited pinned edge" }) }),
+        { sessionScopeKey: "session=session-a&epoch=epoch-a&request_scope_epoch=request-a" },
+      );
+      await act(async () => root.unmount());
+      await act(async () => resolvePatch({
+        definition: definitionFixture(),
+        revision: 8,
+      }));
+
+      expect(mocks.invalidate).not.toHaveBeenCalled();
+      expect(mocks.clear).not.toHaveBeenCalled();
+    } finally {
+      dom.restore();
+    }
+  });
+
+  it("records an authored Apply after the Frozen Spins ACK advances the scene", async () => {
+    const record = vi.fn();
+    mocks.authoringHistory = { record };
+    const before = { objects: [], revision: 7 };
+    const after = { objects: [], revision: 8 };
+    mocks.scene.mockResolvedValueOnce(before).mockResolvedValueOnce(after);
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <FrozenSpinsEditor
+          definition={definitionFixture()}
+          objectId="film"
+          regionId={null}
+          revision={7}
+        />,
+      ));
+      await editDefinitionName(container);
+      await act(async () => findButton(container, "Apply").click());
+      expect(mocks.patch).toHaveBeenCalledWith(
+        "pin-edge",
+        expect.objectContaining({ definition: expect.objectContaining({ name: "Edited pinned edge" }) }),
+        { sessionScopeKey: "session=session-a&epoch=epoch-a&request_scope_epoch=request-a" },
+      );
+
+      expect(mocks.patch).toHaveBeenCalledWith("pin-edge", expect.objectContaining({
+        definition: expect.objectContaining({ name: "Edited pinned edge" }),
+        expected_revision: 7,
+      }), { sessionScopeKey: "session=session-a&epoch=epoch-a&request_scope_epoch=request-a" });
+      expect(record).toHaveBeenCalledWith(expect.objectContaining({
+        before,
+        after,
+        committedRevision: 8,
+        label: "Update Frozen Spins definition",
+      }));
     } finally {
       await act(async () => root.unmount());
       dom.restore();
@@ -387,6 +578,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     );
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -411,6 +603,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("reports an authored edit as a pending runtime revision instead of an in-place solver mutation", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -421,7 +614,13 @@ describe("FrozenSpinsInspectorPanel", () => {
           revision={7}
         />,
       ));
+      await editDefinitionName(container);
       await act(async () => findButton(container, "Apply").click());
+      expect(mocks.patch).toHaveBeenCalledWith(
+        "pin-edge",
+        expect.objectContaining({ definition: expect.objectContaining({ name: "Edited pinned edge" }) }),
+        { sessionScopeKey: "session=session-a&epoch=epoch-a&request_scope_epoch=request-a" },
+      );
 
       expect(container.textContent).toContain("current solver is unchanged");
       expect(container.textContent).toContain("pending_runtime_plan");
@@ -448,6 +647,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     });
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -458,7 +658,13 @@ describe("FrozenSpinsInspectorPanel", () => {
           revision={7}
         />,
       ));
+      await editDefinitionName(container);
       await act(async () => findButton(container, "Apply").click());
+      expect(mocks.patch).toHaveBeenCalledWith(
+        "pin-edge",
+        expect.objectContaining({ definition: expect.objectContaining({ name: "Edited pinned edge" }) }),
+        { sessionScopeKey: "session=session-a&epoch=epoch-a&request_scope_epoch=request-a" },
+      );
 
       expect(container.textContent).toContain("next accepted solver step");
       expect(container.textContent).toContain("accepted_step");
@@ -474,6 +680,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("atomically commits the exact speculative preview candidate and awaits solver binding", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -495,7 +702,7 @@ describe("FrozenSpinsInspectorPanel", () => {
           selector: { kind: "in_object", object_id: "film" },
         }),
         expected_revision: 7,
-      });
+      }, { sessionScopeKey: "session=session-a&epoch=epoch-a&request_scope_epoch=request-a" });
       expect(mocks.invalidate).toHaveBeenCalledWith(
         "model:frozen-spins:active-preview",
         "",
@@ -518,6 +725,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     );
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -543,6 +751,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("disables activation after the selector diverges from the previewed selector", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -579,6 +788,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     );
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -648,6 +858,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     mocks.createPreview.mockResolvedValueOnce({ ...preview, current: false });
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -673,6 +884,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("retains the same inspector root while a revision invalidation refetches", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     const selection = {
       kind: "object.frozen-spins",
@@ -703,6 +915,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("does not retain another constraint definition after the target changes", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     const selection = {
       kind: "object.frozen-spins",
@@ -748,11 +961,68 @@ describe("FrozenSpinsInspectorPanel", () => {
     }
   });
 
+  it("does not retain the same constraint draft after the session changes", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    const selection = {
+      kind: "object.frozen-spins",
+      label: "Frozen Spins",
+      moduleSource: "explorer",
+      nodeId: "model:object:film:frozen-spins:pin-edge",
+      objectId: "film",
+      ref: {
+        constraintId: "pin-edge",
+        kind: "object.frozen-spins",
+        nodeId: "model:object:film:frozen-spins:pin-edge",
+        objectId: "film",
+        type: "frozen-spins",
+      },
+    } as const;
+    try {
+      mocks.definitionResource = {
+        data: {
+          definition: { ...definitionFixture(), name: "Session A" },
+          revision: 7,
+        },
+        error: null,
+      };
+      await act(async () => root.render(<FrozenSpinsInspectorPanel selection={selection} />));
+      expect(findByAttribute(container, "aria-label", "Name").value).toBe("Session A");
+
+      mocks.sessionId = "session-b";
+      mocks.definitionResource = { data: null, error: null };
+      await act(async () => root.render(<FrozenSpinsInspectorPanel selection={selection} />));
+      expect(container.textContent).toContain("Loading Frozen Spins definition");
+      expect(
+        findElements(
+          container,
+          (element) => element.getAttribute("data-frozen-spins-inspector-id") !== null,
+        ),
+      ).toHaveLength(0);
+
+      mocks.definitionResource = {
+        data: {
+          definition: { ...definitionFixture(), name: "Session B" },
+          revision: 9,
+        },
+        error: null,
+      };
+      await act(async () => root.render(<FrozenSpinsInspectorPanel selection={selection} />));
+      expect(findByAttribute(container, "aria-label", "Name").value).toBe("Session B");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
   it("preserves a field edit made while an apply transaction is awaiting ACK", async () => {
     let resolvePatch!: (value: unknown) => void;
     mocks.patch.mockReturnValueOnce(new Promise((resolve) => { resolvePatch = resolve; }));
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -763,7 +1033,13 @@ describe("FrozenSpinsInspectorPanel", () => {
           revision={7}
         />,
       ));
+      await editDefinitionName(container);
       await act(async () => findButton(container, "Apply").click());
+      expect(mocks.patch).toHaveBeenCalledWith(
+        "pin-edge",
+        expect.objectContaining({ definition: expect.objectContaining({ name: "Edited pinned edge" }) }),
+        { sessionScopeKey: "session=session-a&epoch=epoch-a&request_scope_epoch=request-a" },
+      );
       const operator = findElements(container, (element) => element.tagName === "SELECT")[0]!;
       await act(async () => {
         operator.value = "all_magnetic";
@@ -835,4 +1111,16 @@ function definitionFixture() {
     schema_version: "fullmag.frozen-spins.v1",
     selector: { kind: "in_object" as const, object_id: "film" },
   };
+}
+
+async function editDefinitionName(container: TestNode): Promise<void> {
+  await act(async () => {
+    const input = findByAttribute(container, "aria-label", "Name");
+    const nativeValueSetter = Object.getOwnPropertyDescriptor(TestElement.prototype, "value")?.set;
+    if (!nativeValueSetter) throw new Error("Missing native test input value setter");
+    nativeValueSetter.call(input, "Edited pinned edge");
+    input.dispatchEvent(new TestEvent("input", { bubbles: true }));
+  });
+  expect(findByAttribute(container, "aria-label", "Name").value).toBe("Edited pinned edge");
+  expect(findButton(container, "Apply").disabled).toBe(false);
 }

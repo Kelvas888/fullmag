@@ -5,42 +5,46 @@
 //! only bounded identity, coordinates, summaries, and resource links.
 
 use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    io::Read,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
-use axum::{extract::{Path as AxumPath, Query, State}, Json};
+use axum::{
+    extract::{Path as AxumPath, Query, State},
+    Json,
+};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::artifacts::{
-    read_json_artifact_value, require_current_live_artifact_dir, try_resolve_artifact_path,
-};
+use crate::artifacts::{sanitize_artifact_relative_path, try_resolve_artifact_path};
 use crate::error::ApiError;
 use crate::router_v2::handlers::analysis::frequency_domain::{
-    decode_frequency_domain_artifact_payload, FrequencyDomainJsonArtifactPayload,
-    FrequencyDomainFieldSweepArtifactPayload, FrequencyDomainFieldSweepModePayload,
-    FrequencyDomainFieldSweepTopologyPayload,
-    FrequencyDomainResponsePointPayload,
+    decode_frequency_domain_artifact_payload, FrequencyDomainFieldSweepArtifactPayload,
+    FrequencyDomainFieldSweepModePayload, FrequencyDomainFieldSweepTopologyPayload,
+    FrequencyDomainJsonArtifactPayload, FrequencyDomainResponsePointPayload,
     FrequencyDomainResponseSweepArtifactPayload, FrequencyDomainSpectrumArtifactPayload,
     FrequencyDomainSpectrumModePayload, FrequencyDomainSpectrumV3ArtifactPayload,
     FrequencyDomainSpectrumV3ModePayload,
 };
 use crate::router_v2::handlers::analysis::spin_wave_response::{
-    dynamic_structure_factor_axis_indices, DynamicStructureFactorResource,
-    SpinWaveGammaResource, SpinWavePeakResource, MAX_DYNAMIC_STRUCTURE_FACTOR_CELLS,
+    dynamic_structure_factor_axis_indices, DynamicStructureFactorResource, SpinWaveGammaResource,
+    SpinWavePeakResource, MAX_DYNAMIC_STRUCTURE_FACTOR_CELLS,
 };
-use crate::types::AppState;
+use crate::schemas::hysteresis::HysteresisPointSchema;
+use crate::types::{AppState, StageExecutionRecord, StageLifecycleState};
 
-pub const ANALYSIS_RESULT_INDEX_SCHEMA_VERSION: &str =
-    "fullmag.analysis.result_dataset_index.v1";
+pub const ANALYSIS_RESULT_INDEX_SCHEMA_VERSION: &str = "fullmag.analysis.result_dataset_index.v1";
 const DEFAULT_PAGE_LIMIT: usize = 100;
 const MAX_PAGE_LIMIT: usize = 500;
 const MAX_INLINE_AXIS_VALUES: usize = 256;
+// Transitional JSON/CSV adapters have a raw-byte budget. Large datasets belong on
+// the bounded binary data plane; this is not a bound on serde's parsed heap.
+pub(super) const MAX_RESULT_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +53,7 @@ pub enum AnalysisResultProductKind {
     DrivenResponse,
     TimeDomainSpectrum,
     DynamicStructureFactor,
+    HysteresisLoop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -58,6 +63,13 @@ pub enum AnalysisResultItemKind {
     DrivenFrequencyPoint,
     SpectralFeature,
     DsfPoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisResultSpectrumOutputScope {
+    PerSample,
+    Global,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -198,6 +210,10 @@ pub struct AnalysisResultDatasetManifestResource {
     pub product_kind: AnalysisResultProductKind,
     pub title: String,
     pub description: Option<String>,
+    /// Requested output scopes declared by the producer manifest. This does not
+    /// describe which requested outputs completed or were resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spectrum_output_scopes: Option<Vec<AnalysisResultSpectrumOutputScope>>,
     pub status: AnalysisResultStatusFacets,
     pub source_artifacts: Vec<AnalysisResultSourceArtifactRef>,
     pub axes: Vec<AnalysisResultAxisResource>,
@@ -444,6 +460,12 @@ struct ResultDatasetIndex {
     projections: BTreeMap<String, AnalysisResultProjectionResource>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SpectrumOutputScopeMetadata {
+    requested_scopes: Option<Vec<AnalysisResultSpectrumOutputScope>>,
+    source_manifest_digest: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ResultIndexCollection {
     run_id: String,
@@ -549,15 +571,39 @@ pub async fn get_analysis_result_dataset_catalog(
         .collect::<Vec<_>>();
     sort_dataset_summaries(&mut all_items, parsed.sort.as_deref())?;
     let revision = digest_json(&all_items);
-    let start = cursor_start(all_items.iter().map(|item| item.dataset_id.as_str()), &revision, &parsed, "catalog")?;
-    let items = all_items.iter().skip(start).take(parsed.limit).cloned().collect::<Vec<_>>();
-    let next_cursor = (start + items.len() < all_items.len())
-        .then(|| encode_cursor(&revision, &parsed, &items.last().map(|item| item.dataset_id.clone()).unwrap_or_default(), "catalog"));
+    let start = cursor_start(
+        all_items.iter().map(|item| item.dataset_id.as_str()),
+        &revision,
+        &parsed,
+        "catalog",
+    )?;
+    let items = all_items
+        .iter()
+        .skip(start)
+        .take(parsed.limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_cursor = (start + items.len() < all_items.len()).then(|| {
+        encode_cursor(
+            &revision,
+            &parsed,
+            &items
+                .last()
+                .map(|item| item.dataset_id.clone())
+                .unwrap_or_default(),
+            "catalog",
+        )
+    });
     Ok(Json(AnalysisResultDatasetCatalogResource {
         schema_version: ANALYSIS_RESULT_INDEX_SCHEMA_VERSION.to_string(),
         run_id: collection.run_id,
         revision,
-        status: if items.is_empty() { "unsupported" } else { "ready" }.to_string(),
+        status: if items.is_empty() {
+            "unsupported"
+        } else {
+            "ready"
+        }
+        .to_string(),
         items,
         next_cursor,
         total_count: all_items.len() as u64,
@@ -587,7 +633,11 @@ pub async fn get_analysis_result_dataset_manifest(
         .into_iter()
         .find(|dataset| dataset.manifest.dataset_id == dataset_id)
         .map(|dataset| Json(dataset.manifest))
-        .ok_or_else(|| ApiError::not_found(format!("RESULT_DATASET_NOT_FOUND: dataset '{dataset_id}' was not found")))
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "RESULT_DATASET_NOT_FOUND: dataset '{dataset_id}' was not found"
+            ))
+        })
 }
 
 #[utoipa::path(
@@ -606,7 +656,9 @@ pub async fn get_analysis_result_axis_values(
     ensure_run(&collection, &run_id)?;
     let dataset = find_dataset(&collection, &dataset_id)?;
     let values = dataset.axis_values.get(&axis_id).ok_or_else(|| {
-        ApiError::unprocessable(format!("RESULT_INVALID_AXIS_FILTER: unknown axis '{axis_id}'"))
+        ApiError::unprocessable(format!(
+            "RESULT_INVALID_AXIS_FILTER: unknown axis '{axis_id}'"
+        ))
     })?;
     let parsed = parse_page_query(&query)?;
     validate_axis_range_filter(dataset, &axis_id, &parsed)?;
@@ -615,10 +667,28 @@ pub async fn get_analysis_result_axis_values(
         .filter(|value| axis_value_matches(value, &parsed))
         .cloned()
         .collect::<Vec<_>>();
-    let start = cursor_start(filtered_values.iter().map(|value| value.token.as_str()), &dataset.manifest.dataset_revision, &parsed, "axis")?;
-    let page = filtered_values.iter().skip(start).take(parsed.limit).cloned().collect::<Vec<_>>();
+    let start = cursor_start(
+        filtered_values.iter().map(|value| value.token.as_str()),
+        &dataset.manifest.dataset_revision,
+        &parsed,
+        "axis",
+    )?;
+    let page = filtered_values
+        .iter()
+        .skip(start)
+        .take(parsed.limit)
+        .cloned()
+        .collect::<Vec<_>>();
     let next_cursor = (start + page.len() < filtered_values.len()).then(|| {
-        encode_cursor(&dataset.manifest.dataset_revision, &parsed, &page.last().map(|value| value.token.clone()).unwrap_or_default(), "axis")
+        encode_cursor(
+            &dataset.manifest.dataset_revision,
+            &parsed,
+            &page
+                .last()
+                .map(|value| value.token.clone())
+                .unwrap_or_default(),
+            "axis",
+        )
     });
     Ok(Json(AnalysisResultAxisValuesResource {
         schema_version: ANALYSIS_RESULT_INDEX_SCHEMA_VERSION.to_string(),
@@ -673,10 +743,28 @@ pub async fn get_analysis_result_samples(
         .collect::<Vec<_>>();
     let mut samples = samples;
     sort_samples(&mut samples, parsed.sort.as_deref())?;
-    let start = cursor_start(samples.iter().map(|sample| sample.sample_id.as_str()), &dataset.manifest.dataset_revision, &parsed, "samples")?;
-    let page = samples.iter().skip(start).take(parsed.limit).cloned().collect::<Vec<_>>();
+    let start = cursor_start(
+        samples.iter().map(|sample| sample.sample_id.as_str()),
+        &dataset.manifest.dataset_revision,
+        &parsed,
+        "samples",
+    )?;
+    let page = samples
+        .iter()
+        .skip(start)
+        .take(parsed.limit)
+        .cloned()
+        .collect::<Vec<_>>();
     let next_cursor = (start + page.len() < samples.len()).then(|| {
-        encode_cursor(&dataset.manifest.dataset_revision, &parsed, &page.last().map(|sample| sample.sample_id.clone()).unwrap_or_default(), "samples")
+        encode_cursor(
+            &dataset.manifest.dataset_revision,
+            &parsed,
+            &page
+                .last()
+                .map(|sample| sample.sample_id.clone())
+                .unwrap_or_default(),
+            "samples",
+        )
     });
     Ok(Json(AnalysisResultSamplePageResource {
         schema_version: ANALYSIS_RESULT_INDEX_SCHEMA_VERSION.to_string(),
@@ -716,10 +804,28 @@ pub async fn get_analysis_result_items(
         .collect::<Vec<_>>();
     let mut items = items;
     sort_items(&mut items, parsed.sort.as_deref())?;
-    let start = cursor_start(items.iter().map(|item| item.item_id.as_str()), &dataset.manifest.dataset_revision, &parsed, "items")?;
-    let page = items.iter().skip(start).take(parsed.limit).cloned().collect::<Vec<_>>();
+    let start = cursor_start(
+        items.iter().map(|item| item.item_id.as_str()),
+        &dataset.manifest.dataset_revision,
+        &parsed,
+        "items",
+    )?;
+    let page = items
+        .iter()
+        .skip(start)
+        .take(parsed.limit)
+        .cloned()
+        .collect::<Vec<_>>();
     let next_cursor = (start + page.len() < items.len()).then(|| {
-        encode_cursor(&dataset.manifest.dataset_revision, &parsed, &page.last().map(|item| item.item_id.clone()).unwrap_or_default(), "items")
+        encode_cursor(
+            &dataset.manifest.dataset_revision,
+            &parsed,
+            &page
+                .last()
+                .map(|item| item.item_id.clone())
+                .unwrap_or_default(),
+            "items",
+        )
     });
     Ok(Json(AnalysisResultItemPageResource {
         schema_version: ANALYSIS_RESULT_INDEX_SCHEMA_VERSION.to_string(),
@@ -754,7 +860,11 @@ pub async fn get_analysis_result_item(
         .find(|item| item.item_id == item_id)
         .cloned()
         .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("RESULT_ITEM_NOT_FOUND: item '{item_id}' was not found")))
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "RESULT_ITEM_NOT_FOUND: item '{item_id}' was not found"
+            ))
+        })
 }
 
 #[utoipa::path(
@@ -824,9 +934,8 @@ pub async fn get_analysis_result_branches(
         limit: parsed.limit,
         total_count,
         items,
-        unsupported_reason: (total_count == 0).then_some(
-            "branch tracking is not published for this result dataset".to_string(),
-        ),
+        unsupported_reason: (total_count == 0)
+            .then_some("branch tracking is not published for this result dataset".to_string()),
     }))
 }
 
@@ -884,13 +993,11 @@ pub async fn get_analysis_result_branch_points(
     ensure_run(&collection, &run_id)?;
     let dataset = find_dataset(&collection, &dataset_id)?;
     let parsed = parse_page_query(&query)?;
-    let points = branch_points(dataset)
-        .remove(&branch_id)
-        .ok_or_else(|| {
-            ApiError::not_found(format!(
-                "RESULT_BRANCH_NOT_FOUND: branch '{branch_id}' was not found"
-            ))
-        })?;
+    let points = branch_points(dataset).remove(&branch_id).ok_or_else(|| {
+        ApiError::not_found(format!(
+            "RESULT_BRANCH_NOT_FOUND: branch '{branch_id}' was not found"
+        ))
+    })?;
     let start_resource = format!("branch_points:{branch_id}");
     let start = cursor_start(
         points.iter().map(|point| point.item_id.as_str()),
@@ -948,7 +1055,9 @@ pub async fn get_analysis_result_relations(
     let parsed = parse_page_query(&query)?;
     let relations = relation_resources(dataset);
     let start = cursor_start(
-        relations.iter().map(|relation| relation.relation_id.as_str()),
+        relations
+            .iter()
+            .map(|relation| relation.relation_id.as_str()),
         &dataset.manifest.dataset_revision,
         &parsed,
         "relations",
@@ -980,9 +1089,9 @@ pub async fn get_analysis_result_relations(
         limit: parsed.limit,
         total_count: relations.len() as u64,
         items,
-        unsupported_reason: relations.is_empty().then_some(
-            "no versioned result relations are published for this dataset".to_string(),
-        ),
+        unsupported_reason: relations
+            .is_empty()
+            .then_some("no versioned result relations are published for this dataset".to_string()),
     }))
 }
 
@@ -1030,121 +1139,538 @@ pub async fn get_analysis_result_projection(
         .get(&projection_id)
         .cloned()
         .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("RESULT_PROJECTION_NOT_FOUND: projection '{projection_id}' was not found")))
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "RESULT_PROJECTION_NOT_FOUND: projection '{projection_id}' was not found"
+            ))
+        })
 }
 
 async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollection, ApiError> {
-    let artifact_dir = require_current_live_artifact_dir(state).await?;
-    let (run_id, default_stage_id) = current_result_identity(state).await?;
+    let request_context = crate::capture_current_live_request_context(state).await?;
+    let owner_snapshot = capture_result_owner_snapshot(state).await?;
+    let artifact_dir = owner_snapshot.artifact_dir;
+    let run_id = owner_snapshot.run_id;
+    let generation =
+        fullmag_runner::artifact_generation::capture(&artifact_dir).map_err(|error| {
+            ApiError::internal(format!(
+                "invalid frequency-domain artifact generation: {error}"
+            ))
+        })?;
+    validate_generation_producer(generation.as_ref(), Some(run_id.as_str()), None)?;
+    let generation_id = generation
+        .as_ref()
+        .map(|generation| generation.commit.generation_id.as_str());
+    let stage_for = |artifact_path: &str, digest: &str, byte_length: u64| {
+        result_artifact_stage_id_with_identity(
+            &artifact_dir,
+            artifact_path,
+            &run_id,
+            &owner_snapshot.stage_records,
+            generation.as_ref(),
+            digest,
+            byte_length,
+        )
+    };
     let mut datasets = Vec::new();
 
-    if try_resolve_artifact_path(&artifact_dir, "eigen/field_sweep.v1.json")?.is_some() {
-        let digest = artifact_digest(&artifact_dir, "eigen/field_sweep.v1.json")?;
-        let payload = match decode_frequency_domain_artifact_payload(
-            "eigen/field_sweep.v1.json",
-            read_json_artifact_value(&artifact_dir, "eigen/field_sweep.v1.json")?,
-        )? {
-            FrequencyDomainJsonArtifactPayload::FieldSweep(payload) => payload,
-            _ => return Err(ApiError::internal("eigen/field_sweep.v1 artifact decoded to an unexpected payload")),
-        };
+    if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_in_generation(
+        &artifact_dir,
+        "eigen/field_sweep.v1.json",
+        generation.as_ref(),
+    )? {
+        let payload =
+            match decode_frequency_domain_artifact_payload("eigen/field_sweep.v1.json", value)? {
+                FrequencyDomainJsonArtifactPayload::FieldSweep(payload) => payload,
+                _ => {
+                    return Err(ApiError::internal(
+                        "eigen/field_sweep.v1 artifact decoded to an unexpected payload",
+                    ));
+                }
+            };
+        let stage_id = stage_for("eigen/field_sweep.v1.json", &digest, byte_length)?;
         datasets.push(build_field_sweep_index(
             payload,
             digest,
             &run_id,
-            default_stage_id.as_str(),
+            stage_id.as_str(),
+            generation_id,
         )?);
     }
-    if try_resolve_artifact_path(&artifact_dir, "eigen/spectrum.v3.json")?.is_some() {
-        let digest = artifact_digest(&artifact_dir, "eigen/spectrum.v3.json")?;
-        let payload = match decode_frequency_domain_artifact_payload(
-            "eigen/spectrum.v3.json",
-            read_json_artifact_value(&artifact_dir, "eigen/spectrum.v3.json")?,
-        )? {
-            FrequencyDomainJsonArtifactPayload::SpectrumV3(payload) => payload,
-            _ => return Err(ApiError::internal("eigen/spectrum.v3 artifact decoded to an unexpected payload")),
-        };
-        datasets.push(build_spectrum_v3_index(
+    if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_in_generation(
+        &artifact_dir,
+        "eigen/spectrum.v3.json",
+        generation.as_ref(),
+    )? {
+        let payload =
+            match decode_frequency_domain_artifact_payload("eigen/spectrum.v3.json", value)? {
+                FrequencyDomainJsonArtifactPayload::SpectrumV3(payload) => payload,
+                _ => {
+                    return Err(ApiError::internal(
+                        "eigen/spectrum.v3 artifact decoded to an unexpected payload",
+                    ));
+                }
+            };
+        let scope_metadata = spectrum_output_scope_metadata_from_snapshot(
+            read_result_artifact_snapshot_in_generation(
+                &artifact_dir,
+                "frequency_domain/manifest.v1.json",
+                generation.as_ref(),
+            )?,
+        )?;
+        let stage_id = stage_for("eigen/spectrum.v3.json", &digest, byte_length)?;
+        datasets.push(build_spectrum_v3_index_with_generation(
             payload,
             digest,
             &run_id,
-            default_stage_id.as_str(),
+            stage_id.as_str(),
+            scope_metadata,
+            generation_id,
         )?);
-    } else if try_resolve_artifact_path(&artifact_dir, "eigen/spectrum.v2.json")?.is_some() {
-        let digest = artifact_digest(&artifact_dir, "eigen/spectrum.v2.json")?;
-        let payload = match decode_frequency_domain_artifact_payload(
-            "eigen/spectrum.v2.json",
-            read_json_artifact_value(&artifact_dir, "eigen/spectrum.v2.json")?,
-        )? {
-            FrequencyDomainJsonArtifactPayload::Spectrum(payload) => payload,
-            _ => return Err(ApiError::internal("eigen/spectrum.v2 artifact decoded to an unexpected payload")),
-        };
+    } else if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_in_generation(
+        &artifact_dir,
+        "eigen/spectrum.v2.json",
+        generation.as_ref(),
+    )? {
+        let payload =
+            match decode_frequency_domain_artifact_payload("eigen/spectrum.v2.json", value)? {
+                FrequencyDomainJsonArtifactPayload::Spectrum(payload) => payload,
+                _ => {
+                    return Err(ApiError::internal(
+                        "eigen/spectrum.v2 artifact decoded to an unexpected payload",
+                    ));
+                }
+            };
+        let scope_metadata = spectrum_output_scope_metadata_from_snapshot(
+            read_result_artifact_snapshot_in_generation(
+                &artifact_dir,
+                "frequency_domain/manifest.v1.json",
+                generation.as_ref(),
+            )?,
+        )?;
+        let stage_id = stage_for("eigen/spectrum.v2.json", &digest, byte_length)?;
         datasets.push(build_spectrum_v2_index(
             payload,
             digest,
             &run_id,
-            default_stage_id.as_str(),
+            stage_id.as_str(),
+            scope_metadata,
         )?);
     }
 
-    if try_resolve_artifact_path(&artifact_dir, "response/magnetic_response_sweep.v2.json")?.is_some() {
-        let digest = artifact_digest(&artifact_dir, "response/magnetic_response_sweep.v2.json")?;
+    // Prefer v2, but preserve the legal v1 publisher when v2 is absent.
+    // A present malformed v2 remains an error, never a reason to use stale v1.
+    let response_snapshot = match read_result_artifact_snapshot_with_identity_in_generation(
+        &artifact_dir,
+        "response/magnetic_response_sweep.v2.json",
+        generation.as_ref(),
+    )? {
+        Some((value, digest, byte_length)) => Some(("response/magnetic_response_sweep.v2.json", value, digest, byte_length)),
+        None => read_result_artifact_snapshot_with_identity_in_generation(
+            &artifact_dir,
+            "response/magnetic_response_sweep.v1.json",
+            generation.as_ref(),
+        )?.map(|(value, digest, byte_length)| ("response/magnetic_response_sweep.v1.json", value, digest, byte_length)),
+    };
+    if let Some((source_artifact, value, digest, byte_length)) = response_snapshot {
         let payload = match decode_frequency_domain_artifact_payload(
-            "response/magnetic_response_sweep.v2.json",
-            read_json_artifact_value(&artifact_dir, "response/magnetic_response_sweep.v2.json")?,
+            source_artifact,
+            value,
         )? {
             FrequencyDomainJsonArtifactPayload::ResponseSweep(payload) => payload,
-            _ => return Err(ApiError::internal("response sweep artifact decoded to an unexpected payload")),
+            _ => {
+                return Err(ApiError::internal(
+                    "response sweep artifact decoded to an unexpected payload",
+                ));
+            }
         };
+        let stage_id = stage_for(source_artifact, &digest, byte_length)?;
         datasets.push(build_response_index(
             payload,
             digest,
             &run_id,
-            default_stage_id.as_str(),
+            stage_id.as_str(),
+            source_artifact,
         )?);
     }
 
-    if try_resolve_artifact_path(&artifact_dir, "analysis/spin_wave_response.gamma.v1.json")?.is_some() {
-        let digest = artifact_digest(&artifact_dir, "analysis/spin_wave_response.gamma.v1.json")?;
-        let payload = serde_json::from_value::<SpinWaveGammaResource>(
-            read_json_artifact_value(&artifact_dir, "analysis/spin_wave_response.gamma.v1.json")?,
-        )
-        .map_err(|error| ApiError::internal(format!("invalid gamma artifact: {error}")))?;
-        datasets.push(build_gamma_index(payload, digest, &run_id, default_stage_id.as_str())?);
+    if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_and_generation_fallback(
+        &artifact_dir,
+        "analysis/spin_wave_response.gamma.v1.json",
+        generation.as_ref(),
+    )?
+    {
+        let payload = serde_json::from_value::<SpinWaveGammaResource>(value)
+            .map_err(|error| ApiError::internal(format!("invalid gamma artifact: {error}")))?;
+        let stage_id = stage_for("analysis/spin_wave_response.gamma.v1.json", &digest, byte_length)?;
+        datasets.push(build_gamma_index(
+            payload,
+            digest,
+            &run_id,
+            stage_id.as_str(),
+        )?);
     }
 
-    if try_resolve_artifact_path(&artifact_dir, "analysis/dynamic_structure_factor.1d.v1.json")?.is_some() {
-        let digest = artifact_digest(&artifact_dir, "analysis/dynamic_structure_factor.1d.v1.json")?;
-        let payload = serde_json::from_value::<DynamicStructureFactorResource>(
-            read_json_artifact_value(&artifact_dir, "analysis/dynamic_structure_factor.1d.v1.json")?,
-        )
-        .map_err(|error| ApiError::internal(format!("invalid DSF artifact: {error}")))?;
-        datasets.push(build_dsf_index(payload, digest, &run_id, default_stage_id.as_str())?);
+    if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_and_generation_fallback(
+        &artifact_dir,
+        "analysis/dynamic_structure_factor.1d.v1.json",
+        generation.as_ref(),
+    )? {
+        let payload = serde_json::from_value::<DynamicStructureFactorResource>(value)
+            .map_err(|error| ApiError::internal(format!("invalid DSF artifact: {error}")))?;
+        let stage_id = stage_for("analysis/dynamic_structure_factor.1d.v1.json", &digest, byte_length)?;
+        datasets.push(build_dsf_index(
+            payload,
+            digest,
+            &run_id,
+            stage_id.as_str(),
+        )?);
     }
 
+    for artifact in super::hysteresis::hysteresis_stage_point_artifacts(state).await? {
+        let source_artifact =
+            resolved_hysteresis_source_artifact_ref(&artifact_dir, &artifact.path)?;
+        let file = std::fs::File::open(&artifact.path).map_err(|error| {
+            ApiError::internal(format!(
+                "failed to open hysteresis points of stage '{}': {error}",
+                artifact.stage_id
+            ))
+        })?;
+        let (value, digest) =
+            decode_result_artifact_snapshot(file, &source_artifact, MAX_RESULT_ARTIFACT_BYTES)?;
+        let points = serde_json::from_value::<Vec<HysteresisPointSchema>>(value).map_err(
+            |error| ApiError::internal(format!("invalid hysteresis points artifact: {error}")),
+        )?;
+        datasets.push(build_hysteresis_index(
+            &points,
+            digest,
+            &source_artifact,
+            &run_id,
+            &artifact.stage_id,
+            artifact.lifecycle,
+        ));
+    }
+
+    crate::validate_current_live_request_context(state, &request_context).await?;
+    ensure_generation_capture_current(&artifact_dir, generation.as_ref())?;
     Ok(ResultIndexCollection { run_id, datasets })
 }
 
-async fn current_result_identity(state: &Arc<AppState>) -> Result<(String, String), ApiError> {
+fn spectrum_output_scope_metadata_from_snapshot(
+    snapshot: Option<(Value, String)>,
+) -> Result<SpectrumOutputScopeMetadata, ApiError> {
+    let Some((manifest_value, manifest_digest)) = snapshot else {
+        return Ok(SpectrumOutputScopeMetadata::default());
+    };
+    let manifest = match decode_frequency_domain_artifact_payload(
+        "frequency_domain/manifest.v1.json",
+        manifest_value,
+    )? {
+        FrequencyDomainJsonArtifactPayload::Manifest(manifest) => manifest,
+        _ => {
+            return Err(ApiError::internal(
+                "frequency-domain manifest artifact decoded to an unexpected payload",
+            ));
+        }
+    };
+    let requested_scopes = manifest
+        .extra
+        .0
+        .get("spectrum_output_scopes")
+        .map(|value| {
+            serde_json::from_value::<Vec<AnalysisResultSpectrumOutputScope>>(value.clone())
+                .map_err(|_| {
+                    ApiError::internal(
+                        "frequency-domain manifest spectrum_output_scopes must be an array containing only 'per_sample' or 'global'",
+                    )
+                })
+        })
+        .transpose()?;
+    Ok(SpectrumOutputScopeMetadata {
+        requested_scopes,
+        source_manifest_digest: Some(manifest_digest),
+    })
+}
+
+struct ResultOwnerSnapshot {
+    run_id: String,
+    artifact_dir: PathBuf,
+    stage_records: Vec<StageExecutionRecord>,
+}
+
+async fn capture_result_owner_snapshot(
+    state: &Arc<AppState>,
+) -> Result<ResultOwnerSnapshot, ApiError> {
     let current = state.current_live_state.read().await;
-    let snapshot = current
-        .as_ref()
-        .ok_or_else(|| ApiError::not_found("RESULT_RUN_NOT_FOUND: no active local live workspace"))?;
+    let snapshot = current.as_ref().ok_or_else(|| {
+        ApiError::not_found("RESULT_RUN_NOT_FOUND: no active local live workspace")
+    })?;
     let run_id = snapshot
         .run
         .as_ref()
         .map(|run| run.run_id.clone())
         .unwrap_or_else(|| snapshot.session.run_id.clone());
-    let stage_id = snapshot
+    let artifact_dir = crate::session::current_artifact_dir(snapshot).ok_or_else(|| {
+        ApiError::not_found("no artifact directory for the active workspace")
+    })?;
+    let stage_records = snapshot
         .stage_execution
         .as_ref()
-        .and_then(|execution| {
-            execution
-                .active_stage_index
-                .and_then(|index| execution.stages.get(index))
-                .and_then(|stage| stage.stage_id.clone())
+        .map(|execution| execution.stages.clone())
+        .unwrap_or_default();
+    Ok(ResultOwnerSnapshot {
+        run_id,
+        artifact_dir,
+        stage_records,
+    })
+}
+
+#[cfg(test)]
+fn result_artifact_stage_id(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    captured_run_id: &str,
+    stage_records: &[StageExecutionRecord],
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<String, ApiError> {
+    let generation_for_artifact = generation.filter(|generation| {
+        generation
+            .commit
+            .content
+            .members
+            .contains_key(artifact_path)
+    });
+    let (bytes, digest) = read_result_artifact_bytes_snapshot_in_generation(
+        artifact_dir,
+        artifact_path,
+        generation_for_artifact,
+        MAX_RESULT_ARTIFACT_BYTES,
+    )?
+    .ok_or_else(result_owner_mismatch)?;
+    result_artifact_stage_id_with_identity(
+        artifact_dir,
+        artifact_path,
+        captured_run_id,
+        stage_records,
+        generation,
+        &digest,
+        bytes.len() as u64,
+    )
+}
+
+fn result_artifact_stage_id_with_identity(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    captured_run_id: &str,
+    stage_records: &[StageExecutionRecord],
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+    source_digest: &str,
+    source_byte_length: u64,
+) -> Result<String, ApiError> {
+    // A publication's producer owns only an exact member. Legacy artifacts
+    // need one unambiguous stage reference; active stage and payload fields do
+    // not supply ownership. The exact source snapshot identity also prevents a
+    // same-named artifact from an older sibling stage from claiming ownership.
+    let artifact_relative = sanitize_artifact_relative_path(artifact_path)?;
+    if let Some(generation) = generation.filter(|generation| generation.is_immutable()) {
+        let Some(member) = generation.commit.content.members.get(artifact_path) else {
+            ensure_generation_capture_current(artifact_dir, Some(generation))?;
+            return Ok("stage:analysis".to_string());
+        };
+        if member.sha256 != source_digest || member.byte_length != source_byte_length {
+            return Err(result_owner_mismatch());
+        }
+        validate_generation_producer(Some(generation), Some(captured_run_id), None)?;
+        let stage_id = generation
+            .commit
+            .content
+            .producer
+            .as_ref()
+            .map(|producer| producer.stage_id.clone())
+            .unwrap_or_else(|| "stage:analysis".to_string());
+        ensure_generation_capture_current(artifact_dir, Some(generation))?;
+        return Ok(stage_id);
+    }
+    let canonical_root = artifact_dir
+        .canonicalize()
+        .map_err(|_| result_owner_mismatch())?;
+    let canonical_artifact = canonical_root
+        .join(&artifact_relative)
+        .canonicalize()
+        .map_err(|_| result_owner_mismatch())?;
+    if !canonical_artifact.starts_with(&canonical_root) || !canonical_artifact.is_file() {
+        return Err(result_owner_mismatch());
+    }
+
+    let producer = generation
+        .filter(|generation| {
+            generation
+                .commit
+                .content
+                .members
+                .contains_key(artifact_path)
         })
-        .unwrap_or_else(|| "stage:analysis".to_string());
-    Ok((run_id, stage_id))
+        .and_then(|generation| generation.commit.content.producer.as_ref());
+    if producer.is_some_and(|producer| {
+        producer.run_id.as_str() != captured_run_id || producer.stage_id.trim().is_empty()
+    }) {
+        return Err(result_owner_mismatch());
+    }
+
+    let mut reference_owners = Vec::new();
+    for stage in stage_records {
+        let mut stage_matches = false;
+        for reference in &stage.artifact_refs {
+            if result_stage_ref_covers_artifact(
+                &canonical_root,
+                &artifact_relative,
+                &canonical_artifact,
+                reference,
+                source_digest,
+                source_byte_length,
+            ) {
+                stage_matches = true;
+                break;
+            }
+        }
+        if stage_matches {
+            let Some(stage_id) = stage
+                .stage_id
+                .as_deref()
+                .filter(|stage_id| !stage_id.trim().is_empty())
+            else {
+                return Err(result_owner_mismatch());
+            };
+            reference_owners.push(stage_id);
+        }
+    }
+    if reference_owners.len() > 1 {
+        return Err(result_owner_mismatch());
+    }
+    let reference_owner = reference_owners.first().copied();
+
+    if let Some(producer) = producer {
+        if reference_owner.is_some_and(|stage_id| stage_id != producer.stage_id.as_str()) {
+            return Err(result_owner_mismatch());
+        }
+        return Ok(producer.stage_id.clone());
+    }
+
+    Ok(reference_owner
+        .unwrap_or("stage:analysis")
+        .to_string())
+}
+
+fn result_stage_ref_covers_artifact(
+    canonical_root: &Path,
+    artifact_relative: &Path,
+    canonical_artifact: &Path,
+    raw_reference: &str,
+    source_digest: &str,
+    source_byte_length: u64,
+) -> bool {
+    let raw_path = Path::new(raw_reference);
+    let is_absolute = raw_path.is_absolute();
+    let candidate = if is_absolute {
+        let Ok(candidate) = raw_path.canonicalize() else {
+            return false;
+        };
+        candidate
+    } else {
+        let Ok(relative) = sanitize_artifact_relative_path(raw_reference) else {
+            return false;
+        };
+        let Ok(candidate) = canonical_root.join(relative).canonicalize() else {
+            return false;
+        };
+        candidate
+    };
+
+    let canonical_parent = canonical_root.parent().unwrap_or(canonical_root);
+    let allowed = if is_absolute {
+        candidate.starts_with(canonical_root)
+            || (candidate != canonical_parent && candidate.starts_with(canonical_parent))
+    } else {
+        candidate.starts_with(canonical_root)
+    };
+    if !allowed {
+        return false;
+    }
+
+    if candidate.is_file() {
+        if candidate == canonical_artifact {
+            return true;
+        }
+        return is_absolute
+            && result_stage_ref_is_legal_sibling(canonical_root, &candidate)
+            && candidate
+                .strip_prefix(canonical_parent)
+                .is_ok_and(|relative| relative.ends_with(artifact_relative))
+            && result_stage_ref_matches_snapshot(
+                &candidate,
+                source_digest,
+                source_byte_length,
+            );
+    }
+
+    if !candidate.is_dir() {
+        return false;
+    }
+    if canonical_artifact.starts_with(&candidate) {
+        return true;
+    }
+    let Ok(expected_artifact) = candidate.join(artifact_relative).canonicalize() else {
+        return false;
+    };
+    if !expected_artifact.starts_with(&candidate) || !expected_artifact.is_file() {
+        return false;
+    }
+    expected_artifact == canonical_artifact
+        || (result_stage_ref_is_legal_sibling(canonical_root, &candidate)
+            && result_stage_ref_matches_snapshot(
+                &expected_artifact,
+                source_digest,
+                source_byte_length,
+            ))
+}
+
+fn result_stage_ref_is_legal_sibling(canonical_root: &Path, candidate: &Path) -> bool {
+    let canonical_parent = canonical_root.parent().unwrap_or(canonical_root);
+    candidate != canonical_parent
+        && !candidate.starts_with(canonical_root)
+        && candidate.starts_with(canonical_parent)
+}
+
+fn result_stage_ref_matches_snapshot(
+    candidate: &Path,
+    source_digest: &str,
+    source_byte_length: u64,
+) -> bool {
+    if source_byte_length > MAX_RESULT_ARTIFACT_BYTES {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(candidate) else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != source_byte_length {
+        return false;
+    }
+    let Ok(bytes) = read_result_artifact_bytes(
+        file,
+        candidate.to_string_lossy().as_ref(),
+        MAX_RESULT_ARTIFACT_BYTES,
+    ) else {
+        return false;
+    };
+    bytes.len() as u64 == source_byte_length
+        && format!("sha256:{:x}", Sha256::digest(&bytes)) == source_digest
+}
+
+fn result_owner_mismatch() -> ApiError {
+    ApiError::conflict("frequency_domain_artifact_generation_owner_mismatch")
 }
 
 fn ensure_run(collection: &ResultIndexCollection, requested_run_id: &str) -> Result<(), ApiError> {
@@ -1157,21 +1683,30 @@ fn ensure_run(collection: &ResultIndexCollection, requested_run_id: &str) -> Res
     }
 }
 
-fn find_dataset<'a>(collection: &'a ResultIndexCollection, dataset_id: &str) -> Result<&'a ResultDatasetIndex, ApiError> {
+fn find_dataset<'a>(
+    collection: &'a ResultIndexCollection,
+    dataset_id: &str,
+) -> Result<&'a ResultDatasetIndex, ApiError> {
     collection
         .datasets
         .iter()
         .find(|dataset| dataset.manifest.dataset_id == dataset_id)
-        .ok_or_else(|| ApiError::not_found(format!("RESULT_DATASET_NOT_FOUND: dataset '{dataset_id}' was not found")))
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "RESULT_DATASET_NOT_FOUND: dataset '{dataset_id}' was not found"
+            ))
+        })
 }
 
 fn build_field_sweep_index(
     payload: FrequencyDomainFieldSweepArtifactPayload,
     source_digest: String,
     run_id: &str,
-    fallback_stage_id: &str,
+    stage_id: &str,
+    generation_id: Option<&str>,
 ) -> Result<ResultDatasetIndex, ApiError> {
-    let stage_id = payload.stage_id.clone().unwrap_or_else(|| fallback_stage_id.to_string());
+    // The caller resolves stage ownership from the captured artifact owner;
+    // the payload's legacy stage_id is descriptive data, not authority.
     let dataset_id = format!("result:{run_id}:{stage_id}:modal-eigen-field-sweep");
     let source_revision = payload
         .source_revision
@@ -1183,39 +1718,47 @@ fn build_field_sweep_index(
         payload.complete,
         payload.interrupted.unwrap_or(false),
     );
-    let axis = payload.scan_axis.clone().map(|axis| axis_resource(
-        "bias-field",
-        "outer_sweep",
-        "vector3",
-        axis.coordinate,
-        axis.unit,
-        axis.display_conversions
-            .iter()
-            .map(|conversion| conversion.unit.clone())
-            .collect(),
-        axis.display_conversions
-            .iter()
-            .map(|conversion| AnalysisResultAxisProjection {
-                projection_id: conversion.name.clone(),
-                label: conversion.name.clone(),
-                unit: conversion.unit.clone(),
-                operation: "scale_vector_component_or_magnitude".to_string(),
-            })
-            .collect(),
-    )).unwrap_or_else(|| axis_resource(
-        "bias-field",
-        "outer_sweep",
-        "vector3",
-        "bias_field_a_per_m".to_string(),
-        "A/m".to_string(),
-        vec!["T".to_string()],
-        vec![AnalysisResultAxisProjection {
-            projection_id: "mu0_H".to_string(),
-            label: "mu0 H".to_string(),
-            unit: "T".to_string(),
-            operation: "scale_vector_component_or_magnitude".to_string(),
-        }],
-    ));
+    let axis = payload
+        .scan_axis
+        .clone()
+        .map(|axis| {
+            axis_resource(
+                "bias-field",
+                "outer_sweep",
+                "vector3",
+                axis.coordinate,
+                axis.unit,
+                axis.display_conversions
+                    .iter()
+                    .map(|conversion| conversion.unit.clone())
+                    .collect(),
+                axis.display_conversions
+                    .iter()
+                    .map(|conversion| AnalysisResultAxisProjection {
+                        projection_id: conversion.name.clone(),
+                        label: conversion.name.clone(),
+                        unit: conversion.unit.clone(),
+                        operation: "scale_vector_component_or_magnitude".to_string(),
+                    })
+                    .collect(),
+            )
+        })
+        .unwrap_or_else(|| {
+            axis_resource(
+                "bias-field",
+                "outer_sweep",
+                "vector3",
+                "bias_field_a_per_m".to_string(),
+                "A/m".to_string(),
+                vec!["T".to_string()],
+                vec![AnalysisResultAxisProjection {
+                    projection_id: "mu0_H".to_string(),
+                    label: "mu0 H".to_string(),
+                    unit: "T".to_string(),
+                    operation: "scale_vector_component_or_magnitude".to_string(),
+                }],
+            )
+        });
     let raw_samples = payload.samples.unwrap_or_default();
     let mut samples = Vec::with_capacity(raw_samples.len());
     let mut items = Vec::new();
@@ -1267,18 +1810,22 @@ fn build_field_sweep_index(
                 invalid = true;
                 continue;
             }
-            let item = field_sweep_item(
+            let item = field_sweep_item_with_generation(
                 run_id,
                 &dataset_id,
                 &sample_id,
                 &source_revision,
                 mode,
                 mesh_ref.clone(),
+                generation_id,
             );
             sample_item_count += 1;
             items.push(item);
         }
-        let branch_count = sample.branch_ids.as_ref().map(|branches| branches.len() as u64);
+        let branch_count = sample
+            .branch_ids
+            .as_ref()
+            .map(|branches| branches.len() as u64);
         samples.push(AnalysisResultSampleIndexEntry {
             sample_id: sample_id.clone(),
             sample_index: sample.sample_index,
@@ -1287,15 +1834,19 @@ fn build_field_sweep_index(
             item_count: sample_item_count,
             branch_count,
             source_revision: sample_revision,
-            equilibrium_ref: sample.equilibrium_artifact_sha256.map(|revision| AnalysisResultSourceArtifactRef {
-                artifact: "eigen/equilibrium".to_string(),
-                revision,
-                relation: "sample_equilibrium".to_string(),
+            equilibrium_ref: sample.equilibrium_artifact_sha256.map(|revision| {
+                AnalysisResultSourceArtifactRef {
+                    artifact: "eigen/equilibrium".to_string(),
+                    revision,
+                    relation: "sample_equilibrium".to_string(),
+                }
             }),
-            linearization_ref: sample.linearization_state_sha256.map(|revision| AnalysisResultSourceArtifactRef {
-                artifact: "eigen/linearization".to_string(),
-                revision,
-                relation: "sample_linearization".to_string(),
+            linearization_ref: sample.linearization_state_sha256.map(|revision| {
+                AnalysisResultSourceArtifactRef {
+                    artifact: "eigen/linearization".to_string(),
+                    revision,
+                    relation: "sample_linearization".to_string(),
+                }
             }),
             mesh_ref,
             items_resource: items_path(run_id, &dataset_id, &sample_id),
@@ -1322,7 +1873,14 @@ fn build_field_sweep_index(
         });
     }
     let status = if invalid {
-        status_facets("partial", "published", "partial", "unvalidated", Some("invalid_sample_or_mode_identity"), None)
+        status_facets(
+            "partial",
+            "published",
+            "partial",
+            "unvalidated",
+            Some("invalid_sample_or_mode_identity"),
+            None,
+        )
     } else {
         status_facets(
             &root_status,
@@ -1339,12 +1897,20 @@ fn build_field_sweep_index(
         std::slice::from_ref(&axis),
         &source_artifacts,
     );
-    let projections = build_modal_projections(run_id, &dataset_id, &dataset_revision, &axis, &samples, &items, &status);
+    let projections = build_modal_projections(
+        run_id,
+        &dataset_id,
+        &dataset_revision,
+        &axis,
+        &samples,
+        &items,
+        &status,
+    );
     let manifest = build_manifest(
         dataset_id,
         dataset_revision,
         run_id,
-        &stage_id,
+        stage_id,
         AnalysisResultProductKind::ModalEigen,
         "Modal eigen field sweep",
         Some("Validated adapter over eigen/field_sweep.v1 and its source artifacts"),
@@ -1371,6 +1937,85 @@ fn build_field_sweep_index(
     })
 }
 
+fn modal_field_vector_resource_key(field_id: Option<&str>) -> Option<String> {
+    let field_id = field_id.filter(|id| !id.trim().is_empty())?;
+    Some(format!(
+        "/v2/sessions/current/data/fields/{}/samples/vector?phase_rad=0&view=phase_rotated_real",
+        encode_path_segment(field_id),
+    ))
+}
+
+fn bind_field_resource_key_to_generation(
+    resource_key: &str,
+    generation_id: Option<&str>,
+) -> String {
+    let Some(generation_id) = generation_id else {
+        // Preserve legacy resource keys when there is no captured generation.
+        return resource_key.to_string();
+    };
+
+    let (resource, fragment) = resource_key
+        .split_once('#')
+        .map_or((resource_key, ""), |(resource, _fragment)| {
+            (resource, &resource_key[resource.len()..])
+        });
+    let (path, query) = resource
+        .split_once('?')
+        .map_or((resource, None), |(path, query)| (path, Some(query)));
+    let query_parts = query
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter(|part| !is_artifact_generation_query_parameter(part))
+        .collect::<Vec<_>>();
+    let mut query = query_parts.join("&");
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str("expected_artifact_generation_id=");
+    query.push_str(generation_id);
+    format!("{path}?{query}{fragment}")
+}
+
+fn is_artifact_generation_query_parameter(part: &str) -> bool {
+    let name = part.split_once('=').map_or(part, |(name, _)| name);
+    let bytes = name.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let Some(high) = hex_digit(bytes[index + 1]) else {
+                    return false;
+                };
+                let Some(low) = hex_digit(bytes[index + 2]) else {
+                    return false;
+                };
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            b'%' => return false,
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    decoded == b"expected_artifact_generation_id"
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn field_sweep_item(
     run_id: &str,
     dataset_id: &str,
@@ -1379,9 +2024,42 @@ fn field_sweep_item(
     mode: FrequencyDomainFieldSweepModePayload,
     mesh_ref: Option<AnalysisResultMeshRef>,
 ) -> AnalysisResultSpectralItemSummary {
-    let field_ready = mode.field_status.as_deref() == Some("ready")
-        && mode.mode_field_id.is_some()
-        && mode.mode_field_resource_key.is_some()
+    field_sweep_item_with_generation(
+        run_id,
+        dataset_id,
+        sample_id,
+        dataset_source_revision,
+        mode,
+        mesh_ref,
+        None,
+    )
+}
+
+fn field_sweep_item_with_generation(
+    run_id: &str,
+    dataset_id: &str,
+    sample_id: &str,
+    dataset_source_revision: &str,
+    mode: FrequencyDomainFieldSweepModePayload,
+    mesh_ref: Option<AnalysisResultMeshRef>,
+    generation_id: Option<&str>,
+) -> AnalysisResultSpectralItemSummary {
+    // Derive transport only in the result projection, preserving the hashed source payload.
+    let field_resource_key = mode.mode_field_resource_key.as_ref()
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| bind_field_resource_key_to_generation(key, generation_id))
+        .or_else(|| {
+            mode.mode_artifact_path.as_deref().filter(|path| !path.trim().is_empty())?;
+            modal_field_vector_resource_key(mode.mode_field_id.as_deref())
+                .map(|key| bind_field_resource_key_to_generation(&key, generation_id))
+        });
+    let field_ready = mode.mode_field_available != Some(false)
+        && mode.field_status.as_deref() == Some("ready")
+        && mode
+            .mode_field_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+        && field_resource_key.is_some()
         && mesh_ref.is_some();
     let field_reason = if field_ready {
         None
@@ -1407,7 +2085,11 @@ fn field_sweep_item(
         status: status_facets(
             item_status,
             "published",
-            if field_ready { "ready" } else { "spectrum_only" },
+            if field_ready {
+                "ready"
+            } else {
+                "spectrum_only"
+            },
             "unvalidated",
             field_reason,
             None,
@@ -1420,7 +2102,7 @@ fn field_sweep_item(
         field_ref: field_ready.then(|| AnalysisResultFieldRef {
             field_id: mode.mode_field_id.unwrap_or_default(),
             field_revision: mode.source_revision.clone(),
-            resource_key: mode.mode_field_resource_key.unwrap_or_default(),
+            resource_key: field_resource_key.unwrap_or_default(),
             status: "ready".to_string(),
             quantity_id: Some("m".to_string()),
             representation: Some("complex-vector-xyz".to_string()),
@@ -1460,6 +2142,25 @@ fn build_spectrum_v3_index(
     source_digest: String,
     run_id: &str,
     stage_id: &str,
+    scope_metadata: SpectrumOutputScopeMetadata,
+) -> Result<ResultDatasetIndex, ApiError> {
+    build_spectrum_v3_index_with_generation(
+        payload,
+        source_digest,
+        run_id,
+        stage_id,
+        scope_metadata,
+        None,
+    )
+}
+
+fn build_spectrum_v3_index_with_generation(
+    payload: FrequencyDomainSpectrumV3ArtifactPayload,
+    source_digest: String,
+    run_id: &str,
+    stage_id: &str,
+    scope_metadata: SpectrumOutputScopeMetadata,
+    generation_id: Option<&str>,
 ) -> Result<ResultDatasetIndex, ApiError> {
     let dataset_id = format!("result:{run_id}:{stage_id}:modal-eigen-spectrum");
     let source_revision = source_digest.clone();
@@ -1485,14 +2186,25 @@ fn build_spectrum_v3_index(
         let sample_id = sample.sample_id.clone();
         let mesh_ref = None;
         for mode in sample.modes {
-            items.push(spectrum_v3_item(run_id, &dataset_id, &sample_id, &source_revision, mode, mesh_ref.clone()));
+            items.push(spectrum_v3_item_with_generation(
+                run_id,
+                &dataset_id,
+                &sample_id,
+                &source_revision,
+                mode,
+                mesh_ref.clone(),
+                generation_id,
+            ));
         }
         samples.push(AnalysisResultSampleIndexEntry {
             sample_id: sample_id.clone(),
             sample_index: Some(sample.sample_index),
             coordinates,
             status: status_facets("ready", "published", "ready", "unvalidated", None, None),
-            item_count: items.iter().filter(|item| item.sample_id == sample_id).count() as u64,
+            item_count: items
+                .iter()
+                .filter(|item| item.sample_id == sample_id)
+                .count() as u64,
             branch_count: None,
             source_revision: source_revision.clone(),
             equilibrium_ref: None,
@@ -1504,38 +2216,72 @@ fn build_spectrum_v3_index(
     let axes = if k_values.is_empty() {
         Vec::new()
     } else {
-        let axis = finalize_axis(axis_resource(
-            "wavevector",
-            "wavevector",
-            "vector3",
-            "wavevector_kf".to_string(),
-            "rad/m".to_string(),
-            vec!["rad/m".to_string()],
-            Vec::new(),
-        ), k_values.clone(), samples.len());
+        let axis = finalize_axis(
+            axis_resource(
+                "wavevector",
+                "wavevector",
+                "vector3",
+                "wavevector_kf".to_string(),
+                "rad/m".to_string(),
+                vec!["rad/m".to_string()],
+                Vec::new(),
+            ),
+            k_values.clone(),
+            samples.len(),
+        );
         axis_values.insert("wavevector".to_string(), k_values);
         vec![axis]
     };
     let status = status_facets(
-        if payload.solve_succeeded == Some(false) { "partial" } else { "ready" },
+        if payload.solve_succeeded == Some(false) {
+            "partial"
+        } else {
+            "ready"
+        },
         "published",
-        if payload.solve_succeeded == Some(false) { "partial" } else { "ready" },
+        if payload.solve_succeeded == Some(false) {
+            "partial"
+        } else {
+            "ready"
+        },
         "unvalidated",
         None,
         None,
     );
-    let dataset_revision = derived_dataset_revision(&dataset_id, &source_revision, &axes, &vec![AnalysisResultSourceArtifactRef {
+    let mut source_artifacts = vec![AnalysisResultSourceArtifactRef {
         artifact: "eigen/spectrum.v3.json".to_string(),
         revision: source_digest.clone(),
         relation: "adapter_source".to_string(),
-    }]);
-    let projections = build_modal_projections(run_id, &dataset_id, &dataset_revision, &axes.first().cloned().unwrap_or_else(|| axis_resource("frequency", "spectral", "scalar", "frequency_hz".to_string(), "Hz".to_string(), vec!["Hz".to_string()], Vec::new())), &samples, &items, &status);
-    let source_artifacts = vec![AnalysisResultSourceArtifactRef {
-        artifact: "eigen/spectrum.v3.json".to_string(),
-        revision: source_digest,
-        relation: "adapter_source".to_string(),
     }];
-    let manifest = build_manifest(
+    if let Some(manifest_digest) = scope_metadata.source_manifest_digest.as_ref() {
+        source_artifacts.push(AnalysisResultSourceArtifactRef {
+            artifact: "frequency_domain/manifest.v1.json".to_string(),
+            revision: manifest_digest.clone(),
+            relation: "requested_output_scopes".to_string(),
+        });
+    }
+    let dataset_revision =
+        derived_dataset_revision(&dataset_id, &source_revision, &axes, &source_artifacts);
+    let projections = build_modal_projections(
+        run_id,
+        &dataset_id,
+        &dataset_revision,
+        &axes.first().cloned().unwrap_or_else(|| {
+            axis_resource(
+                "frequency",
+                "spectral",
+                "scalar",
+                "frequency_hz".to_string(),
+                "Hz".to_string(),
+                vec!["Hz".to_string()],
+                Vec::new(),
+            )
+        }),
+        &samples,
+        &items,
+        &status,
+    );
+    let mut manifest = build_manifest(
         dataset_id,
         dataset_revision,
         run_id,
@@ -1553,7 +2299,14 @@ fn build_spectrum_v3_index(
         "shared_across_dataset",
         "Hz",
     );
-    Ok(ResultDatasetIndex { manifest, samples, items, axis_values, projections })
+    manifest.spectrum_output_scopes = scope_metadata.requested_scopes;
+    Ok(ResultDatasetIndex {
+        manifest,
+        samples,
+        items,
+        axis_values,
+        projections,
+    })
 }
 
 fn build_spectrum_v2_index(
@@ -1561,22 +2314,42 @@ fn build_spectrum_v2_index(
     source_digest: String,
     run_id: &str,
     stage_id: &str,
+    scope_metadata: SpectrumOutputScopeMetadata,
 ) -> Result<ResultDatasetIndex, ApiError> {
     let dataset_id = format!("result:{run_id}:{stage_id}:modal-eigen-spectrum");
     let source_revision = source_digest.clone();
     let mut samples = Vec::new();
     let mut items = Vec::new();
     for sample in payload.samples {
-        let sample_id = sample.sample_id.clone().unwrap_or_else(|| format!("legacy-sample-{:04}", sample.sample_index.unwrap_or(0)));
+        let sample_id = sample
+            .sample_id
+            .clone()
+            .unwrap_or_else(|| format!("legacy-sample-{:04}", sample.sample_index.unwrap_or(0)));
         for mode in sample.modes.unwrap_or_default() {
-            items.push(spectrum_v2_item(run_id, &dataset_id, &sample_id, &source_revision, mode));
+            items.push(spectrum_v2_item(
+                run_id,
+                &dataset_id,
+                &sample_id,
+                &source_revision,
+                mode,
+            ));
         }
         samples.push(AnalysisResultSampleIndexEntry {
             sample_id: sample_id.clone(),
             sample_index: sample.sample_index,
             coordinates: Vec::new(),
-            status: status_facets("partial", "published", "partial", "legacy", Some("legacy_spectrum_v2_without_typed_coordinates"), None),
-            item_count: items.iter().filter(|item| item.sample_id == sample_id).count() as u64,
+            status: status_facets(
+                "partial",
+                "published",
+                "partial",
+                "legacy",
+                Some("legacy_spectrum_v2_without_typed_coordinates"),
+                None,
+            ),
+            item_count: items
+                .iter()
+                .filter(|item| item.sample_id == sample_id)
+                .count() as u64,
             branch_count: None,
             source_revision: source_revision.clone(),
             equilibrium_ref: None,
@@ -1585,15 +2358,30 @@ fn build_spectrum_v2_index(
             items_resource: items_path(run_id, &dataset_id, &sample_id),
         });
     }
-    let status = status_facets("partial", "published", "partial", "legacy", Some("legacy_spectrum_v2"), None);
-    let source_artifacts = vec![AnalysisResultSourceArtifactRef {
+    let status = status_facets(
+        "partial",
+        "published",
+        "partial",
+        "legacy",
+        Some("legacy_spectrum_v2"),
+        None,
+    );
+    let mut source_artifacts = vec![AnalysisResultSourceArtifactRef {
         artifact: "eigen/spectrum.v2.json".to_string(),
         revision: source_digest,
         relation: "adapter_source".to_string(),
     }];
-    let dataset_revision = derived_dataset_revision(&dataset_id, &source_revision, &[], &source_artifacts);
+    if let Some(manifest_digest) = scope_metadata.source_manifest_digest.as_ref() {
+        source_artifacts.push(AnalysisResultSourceArtifactRef {
+            artifact: "frequency_domain/manifest.v1.json".to_string(),
+            revision: manifest_digest.clone(),
+            relation: "requested_output_scopes".to_string(),
+        });
+    }
+    let dataset_revision =
+        derived_dataset_revision(&dataset_id, &source_revision, &[], &source_artifacts);
     let projections = BTreeMap::new();
-    let manifest = build_manifest(
+    let mut manifest = build_manifest(
         dataset_id,
         dataset_revision,
         run_id,
@@ -1611,7 +2399,14 @@ fn build_spectrum_v2_index(
         "shared_across_dataset",
         "Hz",
     );
-    Ok(ResultDatasetIndex { manifest, samples, items, axis_values: BTreeMap::new(), projections })
+    manifest.spectrum_output_scopes = scope_metadata.requested_scopes;
+    Ok(ResultDatasetIndex {
+        manifest,
+        samples,
+        items,
+        axis_values: BTreeMap::new(),
+        projections,
+    })
 }
 
 fn build_response_index(
@@ -1619,19 +2414,33 @@ fn build_response_index(
     source_digest: String,
     run_id: &str,
     stage_id: &str,
+    source_artifact: &str,
 ) -> Result<ResultDatasetIndex, ApiError> {
     let dataset_id = format!("result:{run_id}:{stage_id}:driven-response");
     let source_revision = source_digest.clone();
     let mut items = Vec::new();
     let sample_id = "response-sample-0000".to_string();
     for point in payload.points.unwrap_or_default() {
-        items.push(response_item(run_id, &dataset_id, &sample_id, &source_revision, point));
+        items.push(response_item(
+            run_id,
+            &dataset_id,
+            &sample_id,
+            &source_revision,
+            point,
+        ));
     }
     let sample = AnalysisResultSampleIndexEntry {
         sample_id: sample_id.clone(),
         sample_index: Some(0),
         coordinates: Vec::new(),
-        status: status_facets("partial", "published", "partial", "legacy", Some("outer_sweep_coordinates_not_typed"), None),
+        status: status_facets(
+            "partial",
+            "published",
+            "partial",
+            "legacy",
+            Some("outer_sweep_coordinates_not_typed"),
+            None,
+        ),
         item_count: items.len() as u64,
         branch_count: None,
         source_revision: source_revision.clone(),
@@ -1649,29 +2458,44 @@ fn build_response_index(
         vec!["GHz".to_string()],
         Vec::new(),
     );
-    let values = items.iter().filter_map(|item| item.frequency_hz.map(|frequency| AnalysisResultAxisValueResource {
-        token: item.item_id.clone(),
-        scalar_si: Some(frequency),
-        vector3_si: None,
-        category: None,
-        entity_ref: None,
-        label: Some(format_frequency(frequency)),
-        status: item.status.completeness.clone(),
-    })).collect::<Vec<_>>();
+    let values = items
+        .iter()
+        .filter_map(|item| {
+            item.frequency_hz
+                .map(|frequency| AnalysisResultAxisValueResource {
+                    token: item.item_id.clone(),
+                    scalar_si: Some(frequency),
+                    vector3_si: None,
+                    category: None,
+                    entity_ref: None,
+                    label: Some(format_frequency(frequency)),
+                    status: item.status.completeness.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
     let axes = vec![finalize_axis(axis, values.clone(), 1)];
     let status = declared_status(
         payload.status.as_deref(),
         payload.complete,
         payload.interrupted.unwrap_or(false),
     );
-    let status = status_facets(&status, "published", &status, "legacy", Some("response_outer_sweep_not_typed"), None);
+    let status = status_facets(
+        &status,
+        "published",
+        &status,
+        "legacy",
+        Some("response_outer_sweep_not_typed"),
+        None,
+    );
     let source_artifacts = vec![AnalysisResultSourceArtifactRef {
-        artifact: "response/magnetic_response_sweep.v2.json".to_string(),
+        artifact: source_artifact.to_string(),
         revision: source_digest,
         relation: "adapter_source".to_string(),
     }];
-    let dataset_revision = derived_dataset_revision(&dataset_id, &source_revision, &axes, &source_artifacts);
-    let projections = build_response_projection(run_id, &dataset_id, &dataset_revision, &items, &status);
+    let dataset_revision =
+        derived_dataset_revision(&dataset_id, &source_revision, &axes, &source_artifacts);
+    let projections =
+        build_response_projection(run_id, &dataset_id, &dataset_revision, &items, &status);
     let manifest = build_manifest(
         dataset_id,
         dataset_revision,
@@ -1679,7 +2503,9 @@ fn build_response_index(
         stage_id,
         AnalysisResultProductKind::DrivenResponse,
         "Driven response frequency sweep",
-        Some("Typed frequency-point adapter; outer coordinates remain unavailable until response metadata is published"),
+        Some(
+            "Typed frequency-point adapter; outer coordinates remain unavailable until response metadata is published",
+        ),
         status,
         source_artifacts,
         axes,
@@ -1690,7 +2516,197 @@ fn build_response_index(
         "shared_across_dataset",
         "Hz",
     );
-    Ok(ResultDatasetIndex { manifest, samples: vec![sample], items, axis_values: BTreeMap::from([(String::from("drive-frequency"), values)]), projections })
+    Ok(ResultDatasetIndex {
+        manifest,
+        samples: vec![sample],
+        items,
+        axis_values: BTreeMap::from([(String::from("drive-frequency"), values)]),
+        projections,
+    })
+}
+
+fn resolved_hysteresis_source_artifact_ref(
+    artifact_dir: &Path,
+    resolved_path: &Path,
+) -> Result<String, ApiError> {
+    // The stage resolver accepts absolute stage refs under this same parent run root.
+    let run_root = artifact_dir.parent().unwrap_or(artifact_dir);
+    let relative_path = resolved_path.strip_prefix(run_root).map_err(|_| {
+        ApiError::internal("resolved hysteresis artifact path is outside the active run root")
+    })?;
+    let relative_path = relative_path
+        .to_str()
+        .ok_or_else(|| ApiError::internal("resolved hysteresis artifact path is not valid UTF-8"))?
+        .replace('\\', "/");
+    let sanitized_path = sanitize_artifact_relative_path(&relative_path)?;
+    let sanitized_path = sanitized_path.to_str().ok_or_else(|| {
+        ApiError::internal("sanitized hysteresis artifact path is not valid UTF-8")
+    })?;
+    Ok(sanitized_path.replace('\\', "/"))
+}
+
+/// Hysteresis loops publish their applied-field sweep as an outer axis. The
+/// magnetization points stay on the dedicated hysteresis resources, so the
+/// dataset carries no spectral items.
+fn build_hysteresis_index(
+    points: &[HysteresisPointSchema],
+    source_digest: String,
+    source_artifact: &str,
+    run_id: &str,
+    stage_id: &str,
+    stage_lifecycle: Option<StageLifecycleState>,
+) -> ResultDatasetIndex {
+    const MU0: f64 = 4.0e-7 * std::f64::consts::PI;
+    let dataset_id = format!("result:{run_id}:{stage_id}:hysteresis-loop");
+    let sample_id = "hysteresis-sample-0000".to_string();
+    let values = points
+        .iter()
+        .map(|point| {
+            let field_si = point.field_value_m_t * 1.0e-3 / MU0;
+            AnalysisResultAxisValueResource {
+                token: format!("point-{:05}", point.point_id),
+                scalar_si: Some(field_si),
+                vector3_si: point.field_vector_a_per_m,
+                category: point.branch_id.clone(),
+                entity_ref: None,
+                label: Some(format!("{:.3} mT", point.field_value_m_t)),
+                status: point.status.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut axis = axis_resource(
+        "applied-field",
+        "outer_sweep",
+        "scalar",
+        "applied_field_a_per_m".to_string(),
+        "A/m".to_string(),
+        vec!["mT".to_string()],
+        Vec::new(),
+    );
+    axis.label = "Applied field".to_string();
+    let axes = vec![finalize_axis(axis, values.clone(), 0)];
+    let status = hysteresis_dataset_status(points, stage_lifecycle);
+    let sample = AnalysisResultSampleIndexEntry {
+        sample_id: sample_id.clone(),
+        sample_index: Some(0),
+        coordinates: Vec::new(),
+        status: status.clone(),
+        item_count: 0,
+        branch_count: None,
+        source_revision: source_digest.clone(),
+        equilibrium_ref: None,
+        linearization_ref: None,
+        mesh_ref: None,
+        items_resource: items_path(run_id, &dataset_id, &sample_id),
+    };
+    let source_artifacts = vec![AnalysisResultSourceArtifactRef {
+        artifact: source_artifact.to_string(),
+        revision: source_digest.clone(),
+        relation: "adapter_source".to_string(),
+    }];
+    let dataset_revision = derived_hysteresis_dataset_revision(
+        &dataset_id,
+        &source_digest,
+        &axes,
+        &source_artifacts,
+        stage_lifecycle,
+    );
+    let projections = BTreeMap::new();
+    let mut manifest = build_manifest(
+        dataset_id,
+        dataset_revision,
+        run_id,
+        stage_id,
+        AnalysisResultProductKind::HysteresisLoop,
+        "Hysteresis loop",
+        Some("Quasi-static applied-field sweep; M(H) points are served by the hysteresis resources"),
+        status,
+        source_artifacts,
+        axes,
+        Vec::new(),
+        &projections,
+        &[sample.clone()],
+        &[],
+        "shared_across_dataset",
+        "A/m",
+    );
+    manifest.capabilities.item_paging = false;
+    ResultDatasetIndex {
+        manifest,
+        samples: vec![sample],
+        items: Vec::new(),
+        axis_values: BTreeMap::from([(String::from("applied-field"), values)]),
+        projections,
+    }
+}
+
+fn hysteresis_dataset_status(
+    points: &[HysteresisPointSchema],
+    stage_lifecycle: Option<StageLifecycleState>,
+) -> AnalysisResultStatusFacets {
+    let complete = stage_lifecycle == Some(StageLifecycleState::Completed)
+        && has_complete_hysteresis_data(points);
+    let reason_code = if complete {
+        None
+    } else {
+        Some(match stage_lifecycle {
+            Some(StageLifecycleState::Completed) => "hysteresis_artifact_incomplete",
+            Some(StageLifecycleState::Failed) => "hysteresis_stage_failed",
+            Some(StageLifecycleState::Cancelled) => "hysteresis_stage_cancelled",
+            Some(StageLifecycleState::Stopped) => "hysteresis_stage_stopped",
+            Some(
+                StageLifecycleState::Pending
+                | StageLifecycleState::Running
+                | StageLifecycleState::Paused,
+            ) => {
+                "hysteresis_stage_nonterminal"
+            }
+            Some(StageLifecycleState::Skipped) => "hysteresis_stage_skipped",
+            Some(StageLifecycleState::Unknown) | None => "hysteresis_stage_lifecycle_unknown",
+        })
+    };
+    status_facets(
+        "ready",
+        stage_lifecycle
+            .map(StageLifecycleState::as_str)
+            .unwrap_or("unknown"),
+        if complete { "complete" } else { "partial" },
+        "legacy",
+        reason_code,
+        None,
+    )
+}
+
+fn has_complete_hysteresis_data(points: &[HysteresisPointSchema]) -> bool {
+    if points.is_empty() {
+        return false;
+    }
+
+    let mut point_ids = BTreeSet::new();
+    points.iter().all(|point| {
+        let point_status_is_complete = is_completed_hysteresis_point_status(&point.status)
+            && point
+                .run_status
+                .as_deref()
+                .map(is_completed_hysteresis_point_status)
+                .unwrap_or(true);
+        point_ids.insert(point.point_id)
+            && point_status_is_complete
+            && point.field_value_m_t.is_finite()
+            && point.m_parallel.is_finite()
+            && point.m_oop.is_finite()
+            && point.m_ip.is_finite()
+            && point.m_avg.iter().all(|value| value.is_finite())
+            && point
+                .field_vector_a_per_m
+                .as_ref()
+                .map(|vector| vector.iter().all(|value| value.is_finite()))
+                .unwrap_or(true)
+    })
+}
+
+fn is_completed_hysteresis_point_status(status: &str) -> bool {
+    status.eq_ignore_ascii_case("complete") || status.eq_ignore_ascii_case("completed")
 }
 
 fn build_gamma_index(
@@ -1703,26 +2719,52 @@ fn build_gamma_index(
     let sample_id = "gamma-spectrum-sample-0000".to_string();
     let provenance = legacy_gamma_provenance(&payload);
     let peaks = &payload.peaks;
-    let items = peaks.iter().map(|peak| AnalysisResultSpectralItemSummary {
-        item_id: format!("legacy:gamma:peak:{}", peak.index),
-        item_kind: AnalysisResultItemKind::SpectralFeature,
-        sample_id: sample_id.clone(),
-        display_index: Some(peak.index as u64),
-        frequency_hz: Some(peak.frequency_hz),
-        wavevector_kf: None,
-        branch_id: None,
-        status: status_facets("partial", "published", "partial", "legacy", Some("legacy_gamma_feature"), None),
-        quality: AnalysisResultQualitySummary { residual_relative_l2: None, tracking_score: None, qualification: "legacy".to_string() },
-        field_ref: None,
-        detail_resource: item_path(run_id, &dataset_id, &sample_id, &format!("legacy:gamma:peak:{}", peak.index)),
-        source_revision: source_digest.clone(),
-        relations: Vec::new(),
-    }).collect::<Vec<_>>();
+    let items = peaks
+        .iter()
+        .map(|peak| AnalysisResultSpectralItemSummary {
+            item_id: format!("legacy:gamma:peak:{}", peak.index),
+            item_kind: AnalysisResultItemKind::SpectralFeature,
+            sample_id: sample_id.clone(),
+            display_index: Some(peak.index as u64),
+            frequency_hz: Some(peak.frequency_hz),
+            wavevector_kf: None,
+            branch_id: None,
+            status: status_facets(
+                "partial",
+                "published",
+                "partial",
+                "legacy",
+                Some("legacy_gamma_feature"),
+                None,
+            ),
+            quality: AnalysisResultQualitySummary {
+                residual_relative_l2: None,
+                tracking_score: None,
+                qualification: "legacy".to_string(),
+            },
+            field_ref: None,
+            detail_resource: item_path(
+                run_id,
+                &dataset_id,
+                &sample_id,
+                &format!("legacy:gamma:peak:{}", peak.index),
+            ),
+            source_revision: source_digest.clone(),
+            relations: Vec::new(),
+        })
+        .collect::<Vec<_>>();
     let sample = AnalysisResultSampleIndexEntry {
         sample_id: sample_id.clone(),
         sample_index: Some(0),
         coordinates: Vec::new(),
-        status: status_facets("partial", "published", "partial", "legacy", Some("legacy_gamma_schema"), None),
+        status: status_facets(
+            "partial",
+            "published",
+            "partial",
+            "legacy",
+            Some("legacy_gamma_schema"),
+            None,
+        ),
         item_count: items.len() as u64,
         branch_count: None,
         source_revision: source_digest.clone(),
@@ -1731,22 +2773,74 @@ fn build_gamma_index(
         mesh_ref: None,
         items_resource: items_path(run_id, &dataset_id, &sample_id),
     };
-    let axis = axis_resource("frequency", "spectral", "scalar", "frequency_hz".to_string(), "Hz".to_string(), vec!["GHz".to_string()], Vec::new());
-    let values = items.iter().filter_map(|item| item.frequency_hz.map(|frequency| AnalysisResultAxisValueResource { token: item.item_id.clone(), scalar_si: Some(frequency), vector3_si: None, category: None, entity_ref: None, label: Some(format_frequency(frequency)), status: "partial".to_string() })).collect::<Vec<_>>();
-    let axes = vec![finalize_axis(axis, values.clone(), 1)];
-    let status = status_facets("partial", "published", "partial", "legacy", Some("legacy_gamma_adapter"), None);
-    let source_artifacts = vec![AnalysisResultSourceArtifactRef { artifact: "analysis/spin_wave_response.gamma.v1.json".to_string(), revision: source_digest.clone(), relation: "adapter_source".to_string() }];
-    let dataset_revision = derived_dataset_revision(&dataset_id, &source_digest, &axes, &source_artifacts);
-    let projections = build_gamma_projection(
-        run_id,
-        &dataset_id,
-        &dataset_revision,
-        &payload,
-        &status,
+    let axis = axis_resource(
+        "frequency",
+        "spectral",
+        "scalar",
+        "frequency_hz".to_string(),
+        "Hz".to_string(),
+        vec!["GHz".to_string()],
+        Vec::new(),
     );
-    let mut manifest = build_manifest(dataset_id, dataset_revision, run_id, stage_id, AnalysisResultProductKind::TimeDomainSpectrum, "LLG Gamma spectrum", Some("Bounded legacy adapter; peaks are spectral features, never eigenmodes"), status, source_artifacts, axes, vec![AnalysisResultItemKind::SpectralFeature], &projections, &[sample.clone()], &items, "shared_across_dataset", "Hz");
+    let values = items
+        .iter()
+        .filter_map(|item| {
+            item.frequency_hz
+                .map(|frequency| AnalysisResultAxisValueResource {
+                    token: item.item_id.clone(),
+                    scalar_si: Some(frequency),
+                    vector3_si: None,
+                    category: None,
+                    entity_ref: None,
+                    label: Some(format_frequency(frequency)),
+                    status: "partial".to_string(),
+                })
+        })
+        .collect::<Vec<_>>();
+    let axes = vec![finalize_axis(axis, values.clone(), 1)];
+    let status = status_facets(
+        "partial",
+        "published",
+        "partial",
+        "legacy",
+        Some("legacy_gamma_adapter"),
+        None,
+    );
+    let source_artifacts = vec![AnalysisResultSourceArtifactRef {
+        artifact: "analysis/spin_wave_response.gamma.v1.json".to_string(),
+        revision: source_digest.clone(),
+        relation: "adapter_source".to_string(),
+    }];
+    let dataset_revision =
+        derived_dataset_revision(&dataset_id, &source_digest, &axes, &source_artifacts);
+    let projections =
+        build_gamma_projection(run_id, &dataset_id, &dataset_revision, &payload, &status);
+    let mut manifest = build_manifest(
+        dataset_id,
+        dataset_revision,
+        run_id,
+        stage_id,
+        AnalysisResultProductKind::TimeDomainSpectrum,
+        "LLG Gamma spectrum",
+        Some("Bounded legacy adapter; peaks are spectral features, never eigenmodes"),
+        status,
+        source_artifacts,
+        axes,
+        vec![AnalysisResultItemKind::SpectralFeature],
+        &projections,
+        &[sample.clone()],
+        &items,
+        "shared_across_dataset",
+        "Hz",
+    );
     manifest.provenance.extend(provenance);
-    Ok(ResultDatasetIndex { manifest, samples: vec![sample], items, axis_values: BTreeMap::from([(String::from("frequency"), values)]), projections })
+    Ok(ResultDatasetIndex {
+        manifest,
+        samples: vec![sample],
+        items,
+        axis_values: BTreeMap::from([(String::from("frequency"), values)]),
+        projections,
+    })
 }
 
 fn build_gamma_projection(
@@ -1787,7 +2881,9 @@ fn build_gamma_projection(
         .enumerate()
         .filter_map(|(index, (frequency, susceptibility))| {
             (frequency.is_finite()
-                && susceptibility.as_ref().is_some_and(|value| value.is_finite()))
+                && susceptibility
+                    .as_ref()
+                    .is_some_and(|value| value.is_finite()))
             .then(|| {
                 let value = *susceptibility
                     .as_ref()
@@ -1988,14 +3084,35 @@ fn build_dsf_index(
                 sample_id: sample_id.clone(),
                 display_index: Some(ordinal),
                 frequency_hz: payload.frequency_hz.get(frequency_index).copied(),
-                wavevector_kf: payload.k_rad_per_m.get(wavevector_index).map(|value| [*value, 0.0, 0.0]),
+                wavevector_kf: payload
+                    .k_rad_per_m
+                    .get(wavevector_index)
+                    .map(|value| [*value, 0.0, 0.0]),
                 branch_id: None,
                 status: if invalid_probe {
-                    status_facets("unsupported", "published", "unsupported", "legacy", Some("invalid_spatial_probe"), None)
+                    status_facets(
+                        "unsupported",
+                        "published",
+                        "unsupported",
+                        "legacy",
+                        Some("invalid_spatial_probe"),
+                        None,
+                    )
                 } else {
-                    status_facets("partial", "published", "partial", "legacy", Some("legacy_dsf_adapter"), None)
+                    status_facets(
+                        "partial",
+                        "published",
+                        "partial",
+                        "legacy",
+                        Some("legacy_dsf_adapter"),
+                        None,
+                    )
                 },
-                quality: AnalysisResultQualitySummary { residual_relative_l2: None, tracking_score: None, qualification: "legacy".to_string() },
+                quality: AnalysisResultQualitySummary {
+                    residual_relative_l2: None,
+                    tracking_score: None,
+                    qualification: "legacy".to_string(),
+                },
                 field_ref: None,
                 detail_resource: item_path(run_id, &dataset_id, &sample_id, &item_id),
                 source_revision: source_digest.clone(),
@@ -2004,9 +3121,23 @@ fn build_dsf_index(
         }
     }
     let sample = AnalysisResultSampleIndexEntry {
-        sample_id: sample_id.clone(), sample_index: Some(0), coordinates: Vec::new(),
-        status: status_facets("partial", "published", "partial", "legacy", Some("legacy_dsf_schema"), None),
-        item_count: items.len() as u64, branch_count: None, source_revision: source_digest.clone(), equilibrium_ref: None, linearization_ref: None, mesh_ref: None,
+        sample_id: sample_id.clone(),
+        sample_index: Some(0),
+        coordinates: Vec::new(),
+        status: status_facets(
+            "partial",
+            "published",
+            "partial",
+            "legacy",
+            Some("legacy_dsf_schema"),
+            None,
+        ),
+        item_count: items.len() as u64,
+        branch_count: None,
+        source_revision: source_digest.clone(),
+        equilibrium_ref: None,
+        linearization_ref: None,
+        mesh_ref: None,
         items_resource: items_path(run_id, &dataset_id, &sample_id),
     };
     let frequency_values = payload
@@ -2014,36 +3145,110 @@ fn build_dsf_index(
         .iter()
         .enumerate()
         .filter(|(index, _)| frequency_indices.contains(index))
-        .map(|(index, value)| AnalysisResultAxisValueResource { token: format!("frequency:{index}"), scalar_si: Some(*value), vector3_si: None, category: None, entity_ref: None, label: Some(format_frequency(*value)), status: "partial".to_string() })
+        .map(|(index, value)| AnalysisResultAxisValueResource {
+            token: format!("frequency:{index}"),
+            scalar_si: Some(*value),
+            vector3_si: None,
+            category: None,
+            entity_ref: None,
+            label: Some(format_frequency(*value)),
+            status: "partial".to_string(),
+        })
         .collect::<Vec<_>>();
     let wavevector_values = payload
         .k_rad_per_m
         .iter()
         .enumerate()
         .filter(|(index, _)| wavevector_indices.contains(index))
-        .map(|(index, value)| AnalysisResultAxisValueResource { token: format!("wavevector:{index}"), scalar_si: Some(*value), vector3_si: None, category: None, entity_ref: None, label: Some(format!("k[{index}]")), status: "partial".to_string() })
+        .map(|(index, value)| AnalysisResultAxisValueResource {
+            token: format!("wavevector:{index}"),
+            scalar_si: Some(*value),
+            vector3_si: None,
+            category: None,
+            entity_ref: None,
+            label: Some(format!("k[{index}]")),
+            status: "partial".to_string(),
+        })
         .collect::<Vec<_>>();
     let axes = vec![
-        finalize_axis(axis_resource("frequency", "spectral", "scalar", "frequency_hz".to_string(), payload.frequency_unit.clone(), vec!["GHz".to_string()], Vec::new()), frequency_values.clone(), 1),
-        finalize_axis(axis_resource("wavevector", "wavevector", "scalar", "k_rad_per_m".to_string(), payload.wavevector_unit.clone(), vec!["rad/um".to_string()], Vec::new()), wavevector_values.clone(), 1),
+        finalize_axis(
+            axis_resource(
+                "frequency",
+                "spectral",
+                "scalar",
+                "frequency_hz".to_string(),
+                payload.frequency_unit.clone(),
+                vec!["GHz".to_string()],
+                Vec::new(),
+            ),
+            frequency_values.clone(),
+            1,
+        ),
+        finalize_axis(
+            axis_resource(
+                "wavevector",
+                "wavevector",
+                "scalar",
+                "k_rad_per_m".to_string(),
+                payload.wavevector_unit.clone(),
+                vec!["rad/um".to_string()],
+                Vec::new(),
+            ),
+            wavevector_values.clone(),
+            1,
+        ),
     ];
-    let status = status_facets("partial", "published", "partial", "legacy", Some("legacy_dsf_adapter"), None);
-    let source_artifacts = vec![AnalysisResultSourceArtifactRef { artifact: "analysis/dynamic_structure_factor.1d.v1.json".to_string(), revision: source_digest.clone(), relation: "adapter_source".to_string() }];
-    let dataset_revision = derived_dataset_revision(&dataset_id, &source_digest, &axes, &source_artifacts);
-    let projections = build_dsf_projection(
-        run_id,
-        &dataset_id,
-        &dataset_revision,
-        &payload,
-        &status,
+    let status = status_facets(
+        "partial",
+        "published",
+        "partial",
+        "legacy",
+        Some("legacy_dsf_adapter"),
+        None,
     );
-    let mut manifest = build_manifest(dataset_id, dataset_revision, run_id, stage_id, AnalysisResultProductKind::DynamicStructureFactor, "Dynamic structure factor", Some("Bounded legacy adapter; dense tiles remain in the native data plane"), status, source_artifacts, axes, vec![AnalysisResultItemKind::DsfPoint], &projections, &[sample.clone()], &items, "shared_across_dataset", &payload.frequency_unit);
+    let source_artifacts = vec![AnalysisResultSourceArtifactRef {
+        artifact: "analysis/dynamic_structure_factor.1d.v1.json".to_string(),
+        revision: source_digest.clone(),
+        relation: "adapter_source".to_string(),
+    }];
+    let dataset_revision =
+        derived_dataset_revision(&dataset_id, &source_digest, &axes, &source_artifacts);
+    let projections =
+        build_dsf_projection(run_id, &dataset_id, &dataset_revision, &payload, &status);
+    let mut manifest = build_manifest(
+        dataset_id,
+        dataset_revision,
+        run_id,
+        stage_id,
+        AnalysisResultProductKind::DynamicStructureFactor,
+        "Dynamic structure factor",
+        Some("Bounded legacy adapter; dense tiles remain in the native data plane"),
+        status,
+        source_artifacts,
+        axes,
+        vec![AnalysisResultItemKind::DsfPoint],
+        &projections,
+        &[sample.clone()],
+        &items,
+        "shared_across_dataset",
+        &payload.frequency_unit,
+    );
     manifest.provenance.extend(provenance);
-    Ok(ResultDatasetIndex { manifest, samples: vec![sample], items, axis_values: BTreeMap::from([(String::from("frequency"), frequency_values), (String::from("wavevector"), wavevector_values)]), projections })
+    Ok(ResultDatasetIndex {
+        manifest,
+        samples: vec![sample],
+        items,
+        axis_values: BTreeMap::from([
+            (String::from("frequency"), frequency_values),
+            (String::from("wavevector"), wavevector_values),
+        ]),
+        projections,
+    })
 }
 
 fn legacy_gamma_provenance(payload: &SpinWaveGammaResource) -> BTreeMap<String, String> {
-    let (sampling_clock, uniformity_proof) = time_sampling_metadata(&payload.time_s, &payload.time_unit);
+    let (sampling_clock, uniformity_proof) =
+        time_sampling_metadata(&payload.time_s, &payload.time_unit);
     let response_components = payload
         .transverse_components
         .iter()
@@ -2066,7 +3271,10 @@ fn legacy_gamma_provenance(payload: &SpinWaveGammaResource) -> BTreeMap<String, 
         ("nyquist_hz".to_string(), payload.nyquist_hz.to_string()),
         (
             "response_components".to_string(),
-            format!("{response_components} (primary: {})", payload.response_component),
+            format!(
+                "{response_components} (primary: {})",
+                payload.response_component
+            ),
         ),
         (
             "source_drive".to_string(),
@@ -2077,7 +3285,11 @@ fn legacy_gamma_provenance(payload: &SpinWaveGammaResource) -> BTreeMap<String, 
 
 fn legacy_dsf_provenance(payload: &DynamicStructureFactorResource) -> BTreeMap<String, String> {
     let (sampling_clock, uniformity_proof) = time_sampling_metadata(&payload.time_s, "s");
-    let invalid_probe_count = payload.invalid_probe_mask.iter().filter(|invalid| **invalid).count();
+    let invalid_probe_count = payload
+        .invalid_probe_mask
+        .iter()
+        .filter(|invalid| **invalid)
+        .count();
     BTreeMap::from([
         ("legacy_schema".to_string(), payload.schema_version.clone()),
         ("sampling_clock".to_string(), sampling_clock),
@@ -2088,12 +3300,18 @@ fn legacy_dsf_provenance(payload: &DynamicStructureFactorResource) -> BTreeMap<S
         ),
         ("normalization".to_string(), payload.normalization.clone()),
         ("spatial_axis".to_string(), payload.propagation_axis.clone()),
-        ("source_observable".to_string(), payload.source_observable.clone()),
+        (
+            "source_observable".to_string(),
+            payload.source_observable.clone(),
+        ),
         (
             "source_drive".to_string(),
             format!("{} [{}]", payload.source_observable, payload.source_unit),
         ),
-        ("phase_convention".to_string(), payload.phase_convention.clone()),
+        (
+            "phase_convention".to_string(),
+            payload.phase_convention.clone(),
+        ),
         (
             "mesh_probe_signature".to_string(),
             payload.mesh_probe_signature.clone(),
@@ -2125,9 +3343,9 @@ fn time_sampling_metadata(time_s: &[f64], unit: &str) -> (String, String) {
     let uniform = dt.is_finite()
         && dt > 0.0
         && time_s.iter().all(|value| value.is_finite())
-        && time_s.windows(2).all(|pair| {
-            ((pair[1] - pair[0]) - dt).abs() <= tolerance
-        });
+        && time_s
+            .windows(2)
+            .all(|pair| ((pair[1] - pair[0]) - dt).abs() <= tolerance);
     (
         format!("N={sample_count}; dt={dt:.6e} {unit}"),
         if uniform {
@@ -2153,34 +3371,43 @@ fn build_dsf_projection(
     let points = frequency_indices
         .iter()
         .flat_map(|frequency_index| {
-            wavevector_indices.iter().filter_map(move |wavevector_index| {
-                let ordinal = (*frequency_index * payload.wavevector_count + *wavevector_index) as u64;
-                let is_invalid_probe = payload
-                    .invalid_probe_mask
-                    .get(*wavevector_index)
-                    .copied()
-                    .unwrap_or(true);
-                let flat_index = (*frequency_index)
-                    .checked_mul(payload.wavevector_count)?
-                    .checked_add(*wavevector_index)?;
-                let x = payload.k_rad_per_m.get(*wavevector_index).copied();
-                let y = payload.frequency_hz.get(*frequency_index).copied();
-                let value = payload.power.get(flat_index).copied();
-                Some(AnalysisResultProjectionPoint {
-                    ordinal,
-                    x: (!is_invalid_probe).then_some(x?).filter(|value| value.is_finite()),
-                    y: (!is_invalid_probe).then_some(y?).filter(|value| value.is_finite()),
-                    value: (!is_invalid_probe).then_some(value?).filter(|value| value.is_finite()),
-                    sample_id: Some(String::from("dsf-sample-0000")),
-                    item_id: Some(format!("legacy:dsf:{frequency_index}:{wavevector_index}")),
-                    branch_id: None,
-                    status: if is_invalid_probe {
-                        String::from("unsupported")
-                    } else {
-                        status.completeness.clone()
-                    },
+            wavevector_indices
+                .iter()
+                .filter_map(move |wavevector_index| {
+                    let ordinal =
+                        (*frequency_index * payload.wavevector_count + *wavevector_index) as u64;
+                    let is_invalid_probe = payload
+                        .invalid_probe_mask
+                        .get(*wavevector_index)
+                        .copied()
+                        .unwrap_or(true);
+                    let flat_index = (*frequency_index)
+                        .checked_mul(payload.wavevector_count)?
+                        .checked_add(*wavevector_index)?;
+                    let x = payload.k_rad_per_m.get(*wavevector_index).copied();
+                    let y = payload.frequency_hz.get(*frequency_index).copied();
+                    let value = payload.power.get(flat_index).copied();
+                    Some(AnalysisResultProjectionPoint {
+                        ordinal,
+                        x: (!is_invalid_probe)
+                            .then_some(x?)
+                            .filter(|value| value.is_finite()),
+                        y: (!is_invalid_probe)
+                            .then_some(y?)
+                            .filter(|value| value.is_finite()),
+                        value: (!is_invalid_probe)
+                            .then_some(value?)
+                            .filter(|value| value.is_finite()),
+                        sample_id: Some(String::from("dsf-sample-0000")),
+                        item_id: Some(format!("legacy:dsf:{frequency_index}:{wavevector_index}")),
+                        branch_id: None,
+                        status: if is_invalid_probe {
+                            String::from("unsupported")
+                        } else {
+                            status.completeness.clone()
+                        },
+                    })
                 })
-            })
         })
         .collect::<Vec<_>>();
     let selection_index = points
@@ -2190,7 +3417,10 @@ fn build_dsf_projection(
             ordinal: point.ordinal,
             sample_id: point.sample_id.clone(),
             item_id: point.item_id.clone(),
-            item_kind: point.item_id.as_ref().map(|_| AnalysisResultItemKind::DsfPoint),
+            item_kind: point
+                .item_id
+                .as_ref()
+                .map(|_| AnalysisResultItemKind::DsfPoint),
             branch_id: None,
         })
         .collect::<Vec<_>>();
@@ -2227,28 +3457,165 @@ fn build_dsf_projection(
     BTreeMap::from([(projection_id, projection)])
 }
 
-fn spectrum_v3_item(run_id: &str, dataset_id: &str, sample_id: &str, source_revision: &str, mode: FrequencyDomainSpectrumV3ModePayload, mesh_ref: Option<AnalysisResultMeshRef>) -> AnalysisResultSpectralItemSummary {
-    let field_ready = mode.mode_field_id.is_some() && mode.mode_field_resource_key.is_some();
+fn spectrum_v3_item(
+    run_id: &str,
+    dataset_id: &str,
+    sample_id: &str,
+    source_revision: &str,
+    mode: FrequencyDomainSpectrumV3ModePayload,
+    mesh_ref: Option<AnalysisResultMeshRef>,
+) -> AnalysisResultSpectralItemSummary {
+    spectrum_v3_item_with_generation(
+        run_id,
+        dataset_id,
+        sample_id,
+        source_revision,
+        mode,
+        mesh_ref,
+        None,
+    )
+}
+
+fn spectrum_v3_item_with_generation(
+    run_id: &str,
+    dataset_id: &str,
+    sample_id: &str,
+    source_revision: &str,
+    mode: FrequencyDomainSpectrumV3ModePayload,
+    mesh_ref: Option<AnalysisResultMeshRef>,
+    generation_id: Option<&str>,
+) -> AnalysisResultSpectralItemSummary {
+    let field_resource_key = mode.mode_field_resource_key.as_ref()
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| bind_field_resource_key_to_generation(key, generation_id))
+        .or_else(|| {
+            modal_field_vector_resource_key(mode.mode_field_id.as_deref())
+                .map(|key| bind_field_resource_key_to_generation(&key, generation_id))
+        });
+    let field_ready = mode.mode_field_available != Some(false)
+        && mode.mode_field_id.as_deref().is_some_and(|id| !id.trim().is_empty())
+        && field_resource_key.is_some();
     let item_id = mode.mode_id.clone();
     AnalysisResultSpectralItemSummary {
-        item_id: item_id.clone(), item_kind: AnalysisResultItemKind::EigenMode, sample_id: sample_id.to_string(), display_index: Some(mode.raw_mode_index), frequency_hz: Some(mode.frequency_hz), wavevector_kf: None, branch_id: mode.branch_id.map(|branch| branch.to_string()),
-        status: status_facets("ready", "published", if field_ready { "ready" } else { "spectrum_only" }, "unvalidated", (!field_ready).then_some("field_payload_not_published"), None),
-        quality: AnalysisResultQualitySummary { residual_relative_l2: Some(mode.residual_relative_l2), tracking_score: None, qualification: "unvalidated".to_string() },
-        field_ref: field_ready.then(|| AnalysisResultFieldRef { field_id: mode.mode_field_id.unwrap_or_default(), field_revision: source_revision.to_string(), resource_key: mode.mode_field_resource_key.unwrap_or_default(), status: "ready".to_string(), quantity_id: Some("m".to_string()), representation: Some("complex-vector-xyz".to_string()), mesh_ref }),
-        detail_resource: item_path(run_id, dataset_id, sample_id, &item_id), source_revision: source_revision.to_string(), relations: Vec::new(),
+        item_id: item_id.clone(),
+        item_kind: AnalysisResultItemKind::EigenMode,
+        sample_id: sample_id.to_string(),
+        display_index: Some(mode.raw_mode_index),
+        frequency_hz: Some(mode.frequency_hz),
+        wavevector_kf: None,
+        branch_id: mode.branch_id.map(|branch| branch.to_string()),
+        status: status_facets(
+            "ready",
+            "published",
+            if field_ready {
+                "ready"
+            } else {
+                "spectrum_only"
+            },
+            "unvalidated",
+            (!field_ready).then_some("field_payload_not_published"),
+            None,
+        ),
+        quality: AnalysisResultQualitySummary {
+            residual_relative_l2: mode.residual_relative_l2,
+            tracking_score: None,
+            qualification: "unvalidated".to_string(),
+        },
+        field_ref: field_ready.then(|| AnalysisResultFieldRef {
+            field_id: mode.mode_field_id.unwrap_or_default(),
+            field_revision: source_revision.to_string(),
+            resource_key: field_resource_key.unwrap_or_default(),
+            status: "ready".to_string(),
+            quantity_id: Some("m".to_string()),
+            representation: Some("complex-vector-xyz".to_string()),
+            mesh_ref,
+        }),
+        detail_resource: item_path(run_id, dataset_id, sample_id, &item_id),
+        source_revision: source_revision.to_string(),
+        relations: Vec::new(),
     }
 }
 
-fn spectrum_v2_item(run_id: &str, dataset_id: &str, sample_id: &str, source_revision: &str, mode: FrequencyDomainSpectrumModePayload) -> AnalysisResultSpectralItemSummary {
-    let item_id = mode.mode_id.clone().unwrap_or_else(|| format!("legacy:{sample_id}:mode:{}", mode.raw_mode_index.unwrap_or(0)));
+fn spectrum_v2_item(
+    run_id: &str,
+    dataset_id: &str,
+    sample_id: &str,
+    source_revision: &str,
+    mode: FrequencyDomainSpectrumModePayload,
+) -> AnalysisResultSpectralItemSummary {
+    let item_id = mode.mode_id.clone().unwrap_or_else(|| {
+        format!(
+            "legacy:{sample_id}:mode:{}",
+            mode.raw_mode_index.unwrap_or(0)
+        )
+    });
     AnalysisResultSpectralItemSummary {
-        item_id: item_id.clone(), item_kind: AnalysisResultItemKind::EigenMode, sample_id: sample_id.to_string(), display_index: mode.raw_mode_index, frequency_hz: mode.frequency_hz.or(mode.frequency_real_hz), wavevector_kf: None, branch_id: mode.branch_id.map(|branch| branch.to_string()), status: status_facets("partial", "published", "spectrum_only", "legacy", Some("legacy_spectrum_v2"), None), quality: AnalysisResultQualitySummary { residual_relative_l2: None, tracking_score: None, qualification: "legacy".to_string() }, field_ref: None, detail_resource: item_path(run_id, dataset_id, sample_id, &item_id), source_revision: source_revision.to_string(), relations: Vec::new(),
+        item_id: item_id.clone(),
+        item_kind: AnalysisResultItemKind::EigenMode,
+        sample_id: sample_id.to_string(),
+        display_index: mode.raw_mode_index,
+        frequency_hz: mode.frequency_hz.or(mode.frequency_real_hz),
+        wavevector_kf: None,
+        branch_id: mode.branch_id.map(|branch| branch.to_string()),
+        status: status_facets(
+            "partial",
+            "published",
+            "spectrum_only",
+            "legacy",
+            Some("legacy_spectrum_v2"),
+            None,
+        ),
+        quality: AnalysisResultQualitySummary {
+            residual_relative_l2: None,
+            tracking_score: None,
+            qualification: "legacy".to_string(),
+        },
+        field_ref: None,
+        detail_resource: item_path(run_id, dataset_id, sample_id, &item_id),
+        source_revision: source_revision.to_string(),
+        relations: Vec::new(),
     }
 }
 
-fn response_item(run_id: &str, dataset_id: &str, sample_id: &str, source_revision: &str, point: FrequencyDomainResponsePointPayload) -> AnalysisResultSpectralItemSummary {
-    let item_id = point.point_id.clone().unwrap_or_else(|| format!("legacy:response:point:{}", point.frequency_index.unwrap_or(0)));
-    AnalysisResultSpectralItemSummary { item_id: item_id.clone(), item_kind: AnalysisResultItemKind::DrivenFrequencyPoint, sample_id: sample_id.to_string(), display_index: point.frequency_index, frequency_hz: point.frequency_hz, wavevector_kf: None, branch_id: None, status: status_facets("partial", "published", "partial", "legacy", Some("response_point_field_contract_not_published"), None), quality: AnalysisResultQualitySummary { residual_relative_l2: None, tracking_score: None, qualification: "legacy".to_string() }, field_ref: None, detail_resource: item_path(run_id, dataset_id, sample_id, &item_id), source_revision: source_revision.to_string(), relations: Vec::new() }
+fn response_item(
+    run_id: &str,
+    dataset_id: &str,
+    sample_id: &str,
+    source_revision: &str,
+    point: FrequencyDomainResponsePointPayload,
+) -> AnalysisResultSpectralItemSummary {
+    let item_id = point.point_id.clone().unwrap_or_else(|| {
+        format!(
+            "legacy:response:point:{}",
+            point.frequency_index.unwrap_or(0)
+        )
+    });
+    AnalysisResultSpectralItemSummary {
+        item_id: item_id.clone(),
+        item_kind: AnalysisResultItemKind::DrivenFrequencyPoint,
+        sample_id: sample_id.to_string(),
+        display_index: point.frequency_index,
+        frequency_hz: point.frequency_hz,
+        wavevector_kf: None,
+        branch_id: None,
+        status: status_facets(
+            "partial",
+            "published",
+            "partial",
+            "legacy",
+            Some("response_point_field_contract_not_published"),
+            None,
+        ),
+        quality: AnalysisResultQualitySummary {
+            residual_relative_l2: None,
+            tracking_score: None,
+            qualification: "legacy".to_string(),
+        },
+        field_ref: None,
+        detail_resource: item_path(run_id, dataset_id, sample_id, &item_id),
+        source_revision: source_revision.to_string(),
+        relations: Vec::new(),
+    }
 }
 
 fn branch_points(
@@ -2305,12 +3672,9 @@ fn branch_summaries(
     branch_points(dataset)
         .into_iter()
         .map(|(branch_id, points)| {
-            let complete = points.iter().all(|point| {
-                matches!(
-                    point.status.completeness.as_str(),
-                    "ready" | "complete"
-                )
-            });
+            let complete = points
+                .iter()
+                .all(|point| matches!(point.status.completeness.as_str(), "ready" | "complete"));
             let first_source_revision = points[0].source_revision.as_str();
             let source_revision = if points
                 .iter()
@@ -2340,19 +3704,13 @@ fn branch_summaries(
         .collect()
 }
 
-fn relation_resources(
-    dataset: &ResultDatasetIndex,
-) -> Vec<AnalysisResultRelationResource> {
+fn relation_resources(dataset: &ResultDatasetIndex) -> Vec<AnalysisResultRelationResource> {
     dataset
         .items
         .iter()
         .flat_map(|item| {
             item.relations.iter().map(|relation| {
-                let relation_id = format!(
-                    "relation:{}:{}",
-                    item.item_id,
-                    digest_json(relation)
-                );
+                let relation_id = format!("relation:{}:{}", item.item_id, digest_json(relation));
                 AnalysisResultRelationResource {
                     relation_id,
                     source_item_id: item.item_id.clone(),
@@ -2364,12 +3722,34 @@ fn relation_resources(
         .collect()
 }
 
-fn spectrum_sample_coordinates(sample_id: &str, extra: &crate::router_v2::handlers::analysis::frequency_domain::FrequencyDomainArtifactExtras) -> Vec<AnalysisResultCoordinateResource> {
-    let vector = extra.0.get("k_vector").and_then(|value| value.as_array()).and_then(|values| {
-        let values = values.iter().map(Value::as_f64).collect::<Option<Vec<_>>>()?;
-        (values.len() == 3).then(|| [values[0], values[1], values[2]])
-    });
-    vector.map(|vector| vec![AnalysisResultCoordinateResource { axis_id: "wavevector".to_string(), token: sample_id.to_string(), scalar_si: None, vector3_si: Some(vector), category: None, entity_ref: None, label: Some(sample_id.to_string()) }]).unwrap_or_default()
+fn spectrum_sample_coordinates(
+    sample_id: &str,
+    extra: &crate::router_v2::handlers::analysis::frequency_domain::FrequencyDomainArtifactExtras,
+) -> Vec<AnalysisResultCoordinateResource> {
+    let vector = extra
+        .0
+        .get("k_vector")
+        .and_then(|value| value.as_array())
+        .and_then(|values| {
+            let values = values
+                .iter()
+                .map(Value::as_f64)
+                .collect::<Option<Vec<_>>>()?;
+            (values.len() == 3).then(|| [values[0], values[1], values[2]])
+        });
+    vector
+        .map(|vector| {
+            vec![AnalysisResultCoordinateResource {
+                axis_id: "wavevector".to_string(),
+                token: sample_id.to_string(),
+                scalar_si: None,
+                vector3_si: Some(vector),
+                category: None,
+                entity_ref: None,
+                label: Some(sample_id.to_string()),
+            }]
+        })
+        .unwrap_or_default()
 }
 
 fn build_manifest(
@@ -2397,17 +3777,62 @@ fn build_manifest(
             axis
         })
         .collect::<Vec<_>>();
-    let projection_descriptors = projections.values().map(|projection| AnalysisResultProjectionDescriptor { projection_id: projection.projection_id.clone(), kind: "line".to_string(), title: projection_descriptor_title(&projection.projection_id), resource_key: projection_path(run_id, &dataset_id, &projection.projection_id), x_axis_id: projection.axis_mapping.get("x").cloned(), y_axis_id: projection.axis_mapping.get("y").cloned(), selectable: !projection.selection_index.is_empty() }).collect::<Vec<_>>();
+    let projection_descriptors = projections
+        .values()
+        .map(|projection| AnalysisResultProjectionDescriptor {
+            projection_id: projection.projection_id.clone(),
+            kind: "line".to_string(),
+            title: projection_descriptor_title(&projection.projection_id),
+            resource_key: projection_path(run_id, &dataset_id, &projection.projection_id),
+            x_axis_id: projection.axis_mapping.get("x").cloned(),
+            y_axis_id: projection.axis_mapping.get("y").cloned(),
+            selectable: !projection.selection_index.is_empty(),
+        })
+        .collect::<Vec<_>>();
     let fields = items.iter().any(|item| item.field_ref.is_some());
     let branch_tracking = items.iter().any(|item| item.branch_id.is_some());
     AnalysisResultDatasetManifestResource {
         schema_version: ANALYSIS_RESULT_INDEX_SCHEMA_VERSION.to_string(),
-        dataset_id: dataset_id.clone(), dataset_revision, run_id: run_id.to_string(), stage_id: stage_id.to_string(), product_kind, title: title.to_string(), description: description.map(str::to_string), status, source_artifacts, axes, item_kinds,
+        dataset_id: dataset_id.clone(),
+        dataset_revision,
+        run_id: run_id.to_string(),
+        stage_id: stage_id.to_string(),
+        product_kind,
+        title: title.to_string(),
+        description: description.map(str::to_string),
+        spectrum_output_scopes: None,
+        status,
+        source_artifacts,
+        axes,
+        item_kinds,
         projections: projection_descriptors,
-        capabilities: AnalysisResultDatasetCapabilities { sample_paging: true, item_paging: true, server_filtering: true, server_sorting: true, branch_tracking, fields, result_meshes: false, comparison: false, export: true, live_partial_results: true },
-        default_cursor: AnalysisResultDefaultCursor { sample_id: samples.first().map(|sample| sample.sample_id.clone()), item_id: items.first().map(|item| item.item_id.clone()) },
-        topology_policy: topology_policy.to_string(), units_policy: units_policy.to_string(), provenance: BTreeMap::from([(String::from("adapter"), String::from(ANALYSIS_RESULT_INDEX_SCHEMA_VERSION)), (String::from("qualification"), String::from("unvalidated"))]),
-        sample_index_resource: samples_path(run_id, &dataset_id), item_index_resource: items_path(run_id, &dataset_id, "",),
+        capabilities: AnalysisResultDatasetCapabilities {
+            sample_paging: true,
+            item_paging: true,
+            server_filtering: true,
+            server_sorting: true,
+            branch_tracking,
+            fields,
+            result_meshes: false,
+            comparison: false,
+            export: true,
+            live_partial_results: true,
+        },
+        default_cursor: AnalysisResultDefaultCursor {
+            sample_id: samples.first().map(|sample| sample.sample_id.clone()),
+            item_id: items.first().map(|item| item.item_id.clone()),
+        },
+        topology_policy: topology_policy.to_string(),
+        units_policy: units_policy.to_string(),
+        provenance: BTreeMap::from([
+            (
+                String::from("adapter"),
+                String::from(ANALYSIS_RESULT_INDEX_SCHEMA_VERSION),
+            ),
+            (String::from("qualification"), String::from("unvalidated")),
+        ]),
+        sample_index_resource: samples_path(run_id, &dataset_id),
+        item_index_resource: items_path(run_id, &dataset_id, ""),
     }
 }
 
@@ -2445,20 +3870,26 @@ fn build_modal_projections(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut by_branch: BTreeMap<
-        String,
-        Vec<(Option<u64>, AnalysisResultProjectionPoint)>,
-    > = BTreeMap::new();
+    let mut by_branch: BTreeMap<String, Vec<(Option<u64>, AnalysisResultProjectionPoint)>> =
+        BTreeMap::new();
     let spectrum_projection = axis.axis_id == "frequency";
     for (ordinal, item) in items.iter().enumerate() {
-        let Some(frequency) = item.frequency_hz else { continue };
-        let branch = item.branch_id.clone().unwrap_or_else(|| format!("item:{}", item.item_id));
+        let Some(frequency) = item.frequency_hz else {
+            continue;
+        };
+        let branch = item
+            .branch_id
+            .clone()
+            .unwrap_or_else(|| format!("item:{}", item.item_id));
         let (sample_index, sample_coordinate) = sample_metadata
             .get(item.sample_id.as_str())
             .copied()
             .unwrap_or((None, None));
         let (x, y) = if spectrum_projection {
-            (Some(frequency), item.display_index.map(|index| index as f64))
+            (
+                Some(frequency),
+                item.display_index.map(|index| index as f64),
+            )
         } else {
             (sample_coordinate, Some(frequency))
         };
@@ -2468,7 +3899,19 @@ fn build_modal_projections(
         if x.is_none() || y.is_none() {
             continue;
         }
-        by_branch.entry(branch).or_default().push((sample_index, AnalysisResultProjectionPoint { ordinal: ordinal as u64, x, y, value: Some(frequency), sample_id: Some(item.sample_id.clone()), item_id: Some(item.item_id.clone()), branch_id: item.branch_id.clone(), status: item.status.completeness.clone() }));
+        by_branch.entry(branch).or_default().push((
+            sample_index,
+            AnalysisResultProjectionPoint {
+                ordinal: ordinal as u64,
+                x,
+                y,
+                value: Some(frequency),
+                sample_id: Some(item.sample_id.clone()),
+                item_id: Some(item.item_id.clone()),
+                branch_id: item.branch_id.clone(),
+                status: item.status.completeness.clone(),
+            },
+        ));
     }
     let mut next_gap_ordinal = u64::MAX;
     let series = by_branch
@@ -2483,9 +3926,7 @@ fn build_modal_projections(
             let mut previous_sample_index: Option<u64> = None;
             let mut points = Vec::with_capacity(indexed_points.len());
             for (sample_index, point) in indexed_points {
-                if let (Some(previous), Some(current)) =
-                    (previous_sample_index, sample_index)
-                {
+                if let (Some(previous), Some(current)) = (previous_sample_index, sample_index) {
                     if current > previous.saturating_add(1) {
                         points.push(AnalysisResultProjectionPoint {
                             ordinal: next_gap_ordinal,
@@ -2518,17 +3959,26 @@ fn build_modal_projections(
         .iter()
         .flat_map(|series| {
             series.points.iter().filter_map(|point| {
-                point.item_id.as_ref().map(|item_id| AnalysisResultProjectionSelectionEntry {
-                    ordinal: point.ordinal,
-                    sample_id: point.sample_id.clone(),
-                    item_id: Some(item_id.clone()),
-                    item_kind: item_kinds_by_id.get(item_id.as_str()).cloned(),
-                    branch_id: point.branch_id.clone(),
-                })
+                point
+                    .item_id
+                    .as_ref()
+                    .map(|item_id| AnalysisResultProjectionSelectionEntry {
+                        ordinal: point.ordinal,
+                        sample_id: point.sample_id.clone(),
+                        item_id: Some(item_id.clone()),
+                        item_kind: item_kinds_by_id.get(item_id.as_str()).cloned(),
+                        branch_id: point.branch_id.clone(),
+                    })
             })
         })
         .collect::<Vec<_>>();
-    let projection_id = if spectrum_projection { "spectrum" } else if axis.axis_id == "drive-frequency" { "response-sweep" } else { "field-frequency-map" };
+    let projection_id = if spectrum_projection {
+        "spectrum"
+    } else if axis.axis_id == "drive-frequency" {
+        "response-sweep"
+    } else {
+        "field-frequency-map"
+    };
     let projection_revision = digest_json(&(series.clone(), &selection_index));
     let unsupported_reason = selection_index
         .is_empty()
@@ -2539,23 +3989,65 @@ fn build_modal_projections(
         });
     let (axis_labels, axis_mapping, axis_units) = if spectrum_projection {
         (
-            BTreeMap::from([(String::from("x"), String::from("Frequency")), (String::from("y"), String::from("Mode index"))]),
-            BTreeMap::from([(String::from("x"), String::from("frequency_hz")), (String::from("y"), String::from("display_index"))]),
-            BTreeMap::from([(String::from("x"), axis.unit_si.clone().unwrap_or_else(|| String::from("Hz"))), (String::from("y"), String::from("index"))]),
+            BTreeMap::from([
+                (String::from("x"), String::from("Frequency")),
+                (String::from("y"), String::from("Mode index")),
+            ]),
+            BTreeMap::from([
+                (String::from("x"), String::from("frequency_hz")),
+                (String::from("y"), String::from("display_index")),
+            ]),
+            BTreeMap::from([
+                (
+                    String::from("x"),
+                    axis.unit_si.clone().unwrap_or_else(|| String::from("Hz")),
+                ),
+                (String::from("y"), String::from("index")),
+            ]),
         )
     } else {
         (
-            BTreeMap::from([(String::from("x"), axis.label.clone()), (String::from("y"), String::from("Frequency"))]),
-            BTreeMap::from([(String::from("x"), axis.axis_id.clone()), (String::from("y"), String::from("frequency_hz"))]),
-            BTreeMap::from([(String::from("x"), axis.unit_si.clone().unwrap_or_else(|| String::from("unknown"))), (String::from("y"), String::from("Hz"))]),
+            BTreeMap::from([
+                (String::from("x"), axis.label.clone()),
+                (String::from("y"), String::from("Frequency")),
+            ]),
+            BTreeMap::from([
+                (String::from("x"), axis.axis_id.clone()),
+                (String::from("y"), String::from("frequency_hz")),
+            ]),
+            BTreeMap::from([
+                (
+                    String::from("x"),
+                    axis.unit_si
+                        .clone()
+                        .unwrap_or_else(|| String::from("unknown")),
+                ),
+                (String::from("y"), String::from("Hz")),
+            ]),
         )
     };
-    BTreeMap::from([(projection_id.to_string(), AnalysisResultProjectionResource { schema_version: ANALYSIS_RESULT_INDEX_SCHEMA_VERSION.to_string(), run_id: run_id.to_string(), dataset_id: dataset_id.to_string(), dataset_revision: dataset_revision.to_string(), projection_id: projection_id.to_string(), projection_revision, axis_labels, axis_mapping, axis_units, fixed_coordinates: Vec::new(), series, selection_index, status: status.clone(), unsupported_reason })])
+    BTreeMap::from([(
+        projection_id.to_string(),
+        AnalysisResultProjectionResource {
+            schema_version: ANALYSIS_RESULT_INDEX_SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            dataset_id: dataset_id.to_string(),
+            dataset_revision: dataset_revision.to_string(),
+            projection_id: projection_id.to_string(),
+            projection_revision,
+            axis_labels,
+            axis_mapping,
+            axis_units,
+            fixed_coordinates: Vec::new(),
+            series,
+            selection_index,
+            status: status.clone(),
+            unsupported_reason,
+        },
+    )])
 }
 
-fn projection_scalar_for_coordinate(
-    coordinate: &AnalysisResultCoordinateResource,
-) -> Option<f64> {
+fn projection_scalar_for_coordinate(coordinate: &AnalysisResultCoordinateResource) -> Option<f64> {
     if let Some(scalar) = coordinate.scalar_si {
         return scalar.is_finite().then_some(scalar);
     }
@@ -2563,7 +4055,10 @@ fn projection_scalar_for_coordinate(
     if vector.iter().any(|value| !value.is_finite()) {
         return None;
     }
-    let non_zero = vector.iter().filter(|value| value.abs() > f64::EPSILON).count();
+    let non_zero = vector
+        .iter()
+        .filter(|value| value.abs() > f64::EPSILON)
+        .count();
     (non_zero <= 1).then(|| vector.iter().map(|value| value * value).sum::<f64>().sqrt())
 }
 
@@ -2632,39 +4127,534 @@ fn build_response_projection(
     BTreeMap::from([(projection_id.to_string(), projection)])
 }
 
-fn axis_resource(axis_id: &str, role: &str, value_kind: &str, semantic_id: String, unit_si: String, preferred_display_units: Vec<String>, projections: Vec<AnalysisResultAxisProjection>) -> AnalysisResultAxisResource {
-    AnalysisResultAxisResource { axis_id: axis_id.to_string(), role: role.to_string(), value_kind: value_kind.to_string(), semantic_id, label: axis_id.to_string(), symbol: None, unit_si: Some(unit_si), preferred_display_units, ordering: "source_order".to_string(), cardinality: 0, values_resource_key: None, inline_values: None, projections }
+fn axis_resource(
+    axis_id: &str,
+    role: &str,
+    value_kind: &str,
+    semantic_id: String,
+    unit_si: String,
+    preferred_display_units: Vec<String>,
+    projections: Vec<AnalysisResultAxisProjection>,
+) -> AnalysisResultAxisResource {
+    AnalysisResultAxisResource {
+        axis_id: axis_id.to_string(),
+        role: role.to_string(),
+        value_kind: value_kind.to_string(),
+        semantic_id,
+        label: axis_id.to_string(),
+        symbol: None,
+        unit_si: Some(unit_si),
+        preferred_display_units,
+        ordering: "source_order".to_string(),
+        cardinality: 0,
+        values_resource_key: None,
+        inline_values: None,
+        projections,
+    }
 }
 
-fn finalize_axis(mut axis: AnalysisResultAxisResource, values: Vec<AnalysisResultAxisValueResource>, sample_count: usize) -> AnalysisResultAxisResource {
+fn finalize_axis(
+    mut axis: AnalysisResultAxisResource,
+    values: Vec<AnalysisResultAxisValueResource>,
+    sample_count: usize,
+) -> AnalysisResultAxisResource {
     axis.cardinality = values.len().max(sample_count) as u64;
     axis.inline_values = (values.len() <= MAX_INLINE_AXIS_VALUES).then_some(values);
     axis.values_resource_key = Some(format!("axis:{}/values", axis.axis_id));
     axis
 }
 
-fn status_facets(resource: &str, execution: &str, completeness: &str, qualification: &str, reason_code: Option<&str>, detail: Option<&str>) -> AnalysisResultStatusFacets {
-    AnalysisResultStatusFacets { resource: resource.to_string(), execution: execution.to_string(), completeness: completeness.to_string(), qualification: qualification.to_string(), reason_code: reason_code.map(str::to_string), detail: detail.map(str::to_string) }
+fn status_facets(
+    resource: &str,
+    execution: &str,
+    completeness: &str,
+    qualification: &str,
+    reason_code: Option<&str>,
+    detail: Option<&str>,
+) -> AnalysisResultStatusFacets {
+    AnalysisResultStatusFacets {
+        resource: resource.to_string(),
+        execution: execution.to_string(),
+        completeness: completeness.to_string(),
+        qualification: qualification.to_string(),
+        reason_code: reason_code.map(str::to_string),
+        detail: detail.map(str::to_string),
+    }
 }
 
 fn declared_status(status: Option<&str>, complete: Option<bool>, interrupted: bool) -> String {
-    if interrupted || status.is_some_and(|status| status.eq_ignore_ascii_case("interrupted")) { return "interrupted".to_string(); }
-    if status.is_some_and(|status| status.eq_ignore_ascii_case("corrupt")) { return "corrupt".to_string(); }
-    if complete == Some(true) || status.is_some_and(|status| status.eq_ignore_ascii_case("complete")) { "ready".to_string() } else { "partial".to_string() }
+    if interrupted || status.is_some_and(|status| status.eq_ignore_ascii_case("interrupted")) {
+        return "interrupted".to_string();
+    }
+    if status.is_some_and(|status| status.eq_ignore_ascii_case("corrupt")) {
+        return "corrupt".to_string();
+    }
+    if complete == Some(true)
+        || status.is_some_and(|status| status.eq_ignore_ascii_case("complete"))
+    {
+        "ready".to_string()
+    } else {
+        "partial".to_string()
+    }
 }
 
 fn dataset_summary(dataset: &ResultDatasetIndex) -> AnalysisResultDatasetSummaryResource {
-    AnalysisResultDatasetSummaryResource { dataset_id: dataset.manifest.dataset_id.clone(), dataset_revision: dataset.manifest.dataset_revision.clone(), run_id: dataset.manifest.run_id.clone(), stage_id: dataset.manifest.stage_id.clone(), product_kind: dataset.manifest.product_kind.clone(), title: dataset.manifest.title.clone(), status: dataset.manifest.status.clone(), sample_count: dataset.samples.len() as u64, item_count: dataset.items.len() as u64, manifest_resource_key: dataset.manifest.sample_index_resource.replace("/samples", "") }
+    AnalysisResultDatasetSummaryResource {
+        dataset_id: dataset.manifest.dataset_id.clone(),
+        dataset_revision: dataset.manifest.dataset_revision.clone(),
+        run_id: dataset.manifest.run_id.clone(),
+        stage_id: dataset.manifest.stage_id.clone(),
+        product_kind: dataset.manifest.product_kind.clone(),
+        title: dataset.manifest.title.clone(),
+        status: dataset.manifest.status.clone(),
+        sample_count: dataset.samples.len() as u64,
+        item_count: dataset.items.len() as u64,
+        manifest_resource_key: dataset
+            .manifest
+            .sample_index_resource
+            .replace("/samples", ""),
+    }
 }
 
-fn artifact_digest(artifact_dir: &Path, artifact_path: &str) -> Result<String, ApiError> {
-    let path = try_resolve_artifact_path(artifact_dir, artifact_path)?.ok_or_else(|| ApiError::not_found(format!("result artifact '{artifact_path}' was not found")))?;
-    let bytes = std::fs::read(path).map_err(|error| ApiError::internal(format!("failed to read result artifact: {error}")))?;
-    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+/// Read once, then derive both the decoded value and revision from those bytes.
+/// A pathname replaced between hash and decode must never pair two generations.
+pub(super) fn read_result_artifact_snapshot(
+    artifact_dir: &Path,
+    artifact_path: &str,
+) -> Result<Option<(Value, String)>, ApiError> {
+    let Some(path) = try_resolve_artifact_path(artifact_dir, artifact_path)? else {
+        return Ok(None);
+    };
+    let file = std::fs::File::open(path).map_err(|error| {
+        ApiError::internal(format!(
+            "failed to open result artifact '{artifact_path}': {error}"
+        ))
+    })?;
+    if !file.metadata()?.is_file() {
+        return Err(ApiError::internal(format!(
+            "RESULT_ARTIFACT_NOT_REGULAR: '{artifact_path}' must be a regular file"
+        )));
+    }
+    decode_result_artifact_snapshot(file, artifact_path, MAX_RESULT_ARTIFACT_BYTES).map(Some)
 }
 
-fn derived_dataset_revision(dataset_id: &str, source_revision: &str, axes: &[AnalysisResultAxisResource], sources: &[AnalysisResultSourceArtifactRef]) -> String {
-    digest_json(&(ANALYSIS_RESULT_INDEX_SCHEMA_VERSION, dataset_id, source_revision, axes, sources))
+fn read_result_artifact_snapshot_with_identity_and_generation_fallback(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<Option<(Value, String, u64)>, ApiError> {
+    if generation.is_some_and(|generation| {
+        generation
+            .commit
+            .content
+            .members
+            .contains_key(artifact_path)
+    }) {
+        read_result_artifact_snapshot_with_identity_in_generation(
+            artifact_dir,
+            artifact_path,
+            generation,
+        )
+    } else {
+        // Gamma and DSF are legal mixed legacy products; a different committed
+        // generation member must not lend them its producer identity.
+        read_result_artifact_snapshot_with_identity_in_generation(
+            artifact_dir,
+            artifact_path,
+            None,
+        )
+    }
+}
+
+/// Read an artifact from the captured publication when one is available.
+/// A missing member is not read from the mutable directory as a fallback.
+pub(crate) fn read_result_artifact_snapshot_in_generation(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<Option<(Value, String)>, ApiError> {
+    Ok(read_result_artifact_snapshot_with_identity_in_generation(
+        artifact_dir,
+        artifact_path,
+        generation,
+    )?
+    .map(|(value, digest, _)| (value, digest)))
+}
+
+fn read_result_artifact_snapshot_with_identity_in_generation(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<Option<(Value, String, u64)>, ApiError> {
+    let Some((bytes, digest)) = read_result_artifact_bytes_snapshot_in_generation(
+        artifact_dir,
+        artifact_path,
+        generation,
+        MAX_RESULT_ARTIFACT_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let value = parse_result_artifact_bytes(&bytes, artifact_path)?;
+    Ok(Some((value, digest, bytes.len() as u64)))
+}
+
+/// Return the exact bounded bytes and digest read from either a committed
+/// generation member or the explicitly unverified legacy directory path.
+pub(super) fn read_result_artifact_bytes_snapshot_in_generation(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+    byte_limit: u64,
+) -> Result<Option<(Vec<u8>, String)>, ApiError> {
+    let bytes = if let Some(generation) = generation {
+        if !generation
+            .commit
+            .content
+            .members
+            .contains_key(artifact_path)
+        {
+            return Ok(None);
+        }
+        generation
+            .read_member_bounded(artifact_dir, artifact_path, byte_limit)
+            .map_err(|error| {
+                if generation.ensure_current(artifact_dir).is_err() {
+                    ApiError::conflict("frequency_domain_artifact_generation_stale")
+                } else {
+                    ApiError::internal(format!(
+                        "failed to read committed result artifact '{artifact_path}': {error}"
+                    ))
+                }
+            })?
+    } else {
+        let Some(path) = try_resolve_artifact_path(artifact_dir, artifact_path)? else {
+            return Ok(None);
+        };
+        let file = std::fs::File::open(path).map_err(|error| {
+            ApiError::internal(format!(
+                "failed to open result artifact '{artifact_path}': {error}"
+            ))
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(ApiError::internal(format!(
+                "RESULT_ARTIFACT_NOT_REGULAR: '{artifact_path}' must be a regular file"
+            )));
+        }
+        read_result_artifact_bytes(file, artifact_path, byte_limit)?
+    };
+    let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+    Ok(Some((bytes, digest)))
+}
+
+/// Read the exact field payload bytes bounded by the captured member length.
+/// `try_reserve` reports address-space/allocation failure without an arbitrary
+/// scientific-size cutoff; this adapter has no independent field-size ceiling.
+/// The returned bytes are the ones whose digest and generation fence were checked.
+pub(crate) fn read_frequency_domain_field_payload_in_generation(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<Option<(Vec<u8>, Option<fullmag_runner::artifact_generation::GenerationMember>)>, ApiError>
+{
+    if let Some(generation) = generation {
+        let Some(expected) = generation.commit.content.members.get(artifact_path).cloned() else {
+            ensure_generation_capture_current(artifact_dir, Some(generation))?;
+            return Ok(None);
+        };
+        let bytes = generation.read_member(artifact_dir, artifact_path).map_err(|error| {
+            if generation.ensure_current(artifact_dir).is_err() {
+                ApiError::conflict("frequency_domain_artifact_generation_stale")
+            } else {
+                match error.kind() {
+                    std::io::ErrorKind::NotFound => ApiError::conflict(
+                        "frequency_domain_artifact_generation_member_missing",
+                    ),
+                    std::io::ErrorKind::InvalidData => ApiError::conflict(format!(
+                        "frequency_domain_artifact_generation_member_mismatch: {artifact_path}: {error}"
+                    )),
+                    _ => ApiError::internal(format!(
+                        "failed to read committed frequency-domain field payload '{artifact_path}': {error}"
+                    )),
+                }
+            }
+        })?;
+        return Ok(Some((bytes, Some(expected))));
+    }
+
+    let Some(path) = try_resolve_artifact_path(artifact_dir, artifact_path)? else {
+        ensure_generation_capture_current(artifact_dir, None)?;
+        return Ok(None);
+    };
+    let file = std::fs::File::open(path).map_err(|error| {
+        ApiError::internal(format!(
+            "failed to open frequency-domain field payload '{artifact_path}': {error}"
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        ApiError::internal(format!(
+            "failed to inspect frequency-domain field payload '{artifact_path}': {error}"
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(ApiError::internal(format!(
+            "frequency-domain field payload '{artifact_path}' is not a regular file"
+        )));
+    }
+    let byte_length = metadata.len();
+    let read_limit = byte_length.checked_add(1).ok_or_else(|| {
+        ApiError::internal(format!(
+            "frequency-domain field payload '{artifact_path}' length cannot be bounded"
+        ))
+    })?;
+    let reserve = usize::try_from(read_limit).map_err(|_| {
+        ApiError::internal(format!(
+            "frequency-domain field payload '{artifact_path}' exceeds addressable memory"
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(reserve).map_err(|error| {
+        ApiError::internal(format!(
+            "cannot allocate bounded frequency-domain field payload '{artifact_path}': {error}"
+        ))
+    })?;
+    let mut reader = file.take(read_limit);
+    let mut measured_length = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = reader.read(&mut buffer).map_err(|error| {
+            ApiError::internal(format!(
+                "failed to read frequency-domain field payload '{artifact_path}': {error}"
+            ))
+        })?;
+        if count == 0 {
+            break;
+        }
+        measured_length = measured_length.checked_add(count as u64).ok_or_else(|| {
+            ApiError::internal(format!(
+                "frequency-domain field payload '{artifact_path}' length overflow"
+            ))
+        })?;
+        if measured_length > byte_length {
+            return Err(ApiError::internal(format!(
+                "frequency-domain field payload '{artifact_path}' grew while being read"
+            )));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    if measured_length != byte_length {
+        return Err(ApiError::internal(format!(
+            "frequency-domain field payload '{artifact_path}' changed while being read"
+        )));
+    }
+    ensure_generation_capture_current(artifact_dir, None)?;
+    Ok(Some((bytes, None)))
+}
+
+/// Fence both committed publications and the absence captured for legacy reads.
+pub(crate) fn ensure_generation_capture_current(
+    root: &Path,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<(), ApiError> {
+    if let Some(generation) = generation {
+        generation.ensure_current(root)
+            .map_err(|_| ApiError::conflict("frequency_domain_artifact_generation_stale"))
+    } else {
+        match fullmag_runner::artifact_generation::capture(root) {
+            Ok(None) => Ok(()),
+            _ => Err(ApiError::conflict("frequency_domain_artifact_generation_stale")),
+        }
+    }
+}
+
+pub(super) fn validate_generation_producer(
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+    request_run_id: Option<&str>,
+    request_stage_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(producer) =
+        generation.and_then(|generation| generation.commit.content.producer.as_ref())
+    else {
+        return Ok(());
+    };
+    if request_run_id.is_some_and(|run_id| run_id != producer.run_id.as_str())
+        || request_stage_id.is_some_and(|stage_id| stage_id != producer.stage_id.as_str())
+    {
+        return Err(ApiError::conflict(
+            "frequency_domain_artifact_generation_owner_mismatch",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn write_result_generation_for_test(
+    root: &Path,
+    artifact_path: &str,
+    bytes: &[u8],
+    producer: Option<fullmag_runner::artifact_generation::PublicationOwner>,
+) {
+    use fullmag_runner::artifact_generation::{
+        GenerationBody, GenerationCommit, GenerationMember, COMMIT_PATH,
+    };
+
+    let relative = sanitize_artifact_relative_path(artifact_path)
+        .expect("test artifact path should be safe and relative");
+    let member_path = root.join(relative);
+    std::fs::create_dir_all(member_path.parent().expect("member has a parent"))
+        .expect("member directory should be created");
+    std::fs::create_dir_all(root.join("frequency_domain"))
+        .expect("generation directory should be created");
+    std::fs::write(member_path, bytes).expect("generation member should be written");
+
+    let content = GenerationBody {
+        schema_version: "frequency_domain_artifact_generation.v1".to_string(),
+        producer,
+        members: BTreeMap::from([(
+            artifact_path.to_string(),
+            GenerationMember {
+                byte_length: bytes.len() as u64,
+                sha256: format!("sha256:{:x}", Sha256::digest(bytes)),
+            },
+        )]),
+    };
+    let generation_id = format!(
+        "sha256:{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&content).expect("generation content should serialize")
+        )
+    );
+    let commit = GenerationCommit {
+        generation_id,
+        content,
+    };
+    std::fs::write(
+        root.join(COMMIT_PATH),
+        serde_json::to_vec_pretty(&commit).expect("generation commit should serialize"),
+    )
+    .expect("generation commit should be written");
+}
+
+#[cfg(test)]
+pub(crate) fn write_immutable_result_generation_for_test(
+    root: &Path,
+    member_bytes: impl IntoIterator<Item = (String, Vec<u8>)>,
+    producer: Option<fullmag_runner::artifact_generation::PublicationOwner>,
+) -> fullmag_runner::artifact_generation::GenerationCapture {
+    use fullmag_runner::artifact_generation::{
+        GenerationBody, GenerationCommit, GenerationMember, IMMUTABLE_COMMIT_PATH,
+    };
+
+    let mut payloads = BTreeMap::new();
+    let mut members = BTreeMap::new();
+    for (relative, bytes) in member_bytes {
+        sanitize_artifact_relative_path(&relative)
+            .expect("immutable test member path should be safe");
+        let member = GenerationMember {
+            byte_length: bytes.len() as u64,
+            sha256: format!("sha256:{:x}", Sha256::digest(&bytes)),
+        };
+        assert!(members.insert(relative.clone(), member).is_none());
+        payloads.insert(relative, bytes);
+    }
+
+    let content = GenerationBody {
+        schema_version: "frequency_domain_artifact_generation.v2".to_string(),
+        producer,
+        members,
+    };
+    let generation_id = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&content).unwrap()));
+    let commit = GenerationCommit {
+        generation_id: generation_id.clone(),
+        content,
+    };
+    let generation_name = generation_id.strip_prefix("sha256:").unwrap();
+    let generation_root = root
+        .join("frequency_domain/generations")
+        .join(generation_name);
+    for (relative, bytes) in payloads {
+        let path = generation_root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    std::fs::create_dir_all(root.join("frequency_domain")).unwrap();
+    std::fs::write(
+        root.join(IMMUTABLE_COMMIT_PATH),
+        serde_json::to_vec_pretty(&commit).unwrap(),
+    )
+    .unwrap();
+    fullmag_runner::artifact_generation::capture(root)
+        .unwrap()
+        .expect("immutable fixture should publish a capture")
+}
+
+fn read_result_artifact_bytes(
+    reader: impl Read,
+    artifact_path: &str,
+    byte_limit: u64,
+) -> Result<Vec<u8>, ApiError> {
+    // The extra byte detects growth beyond the budget without trusting metadata.
+    let mut bytes = Vec::new();
+    reader
+        .take(byte_limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "failed to read result artifact '{artifact_path}': {error}"
+            ))
+        })?;
+    if bytes.len() as u64 > byte_limit {
+        return Err(ApiError::internal(format!(
+            "RESULT_ARTIFACT_BYTE_LIMIT: '{artifact_path}' exceeds the {byte_limit}-byte adapter budget"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn decode_result_artifact_snapshot(
+    reader: impl Read,
+    artifact_path: &str,
+    byte_limit: u64,
+) -> Result<(Value, String), ApiError> {
+    let bytes = read_result_artifact_bytes(reader, artifact_path, byte_limit)?;
+    let value = parse_result_artifact_bytes(&bytes, artifact_path)?;
+    let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+    Ok((value, digest))
+}
+
+fn parse_result_artifact_bytes(bytes: &[u8], artifact_path: &str) -> Result<Value, ApiError> {
+    let value = serde_json::from_slice(bytes).map_err(|error| {
+        ApiError::internal(format!(
+            "failed to parse result artifact '{artifact_path}': {error}"
+        ))
+    })?;
+    Ok(value)
+}
+
+fn derived_dataset_revision(
+    dataset_id: &str,
+    source_revision: &str,
+    axes: &[AnalysisResultAxisResource],
+    sources: &[AnalysisResultSourceArtifactRef],
+) -> String {
+    digest_json(&(
+        ANALYSIS_RESULT_INDEX_SCHEMA_VERSION,
+        dataset_id,
+        source_revision,
+        axes,
+        sources,
+    ))
+}
+
+fn derived_hysteresis_dataset_revision(
+    dataset_id: &str,
+    source_revision: &str,
+    axes: &[AnalysisResultAxisResource],
+    sources: &[AnalysisResultSourceArtifactRef],
+    stage_lifecycle: Option<StageLifecycleState>,
+) -> String {
+    let data_revision = derived_dataset_revision(dataset_id, source_revision, axes, sources);
+    digest_json(&(data_revision, stage_lifecycle.map(StageLifecycleState::as_str)))
 }
 
 fn digest_json<T: Serialize>(value: &T) -> String {
@@ -2745,11 +4735,21 @@ fn branch_points_path(run_id: &str, dataset_id: &str, branch_id: &str) -> String
     )
 }
 
-fn format_frequency(value: f64) -> String { if value.abs() >= 1.0e9 { format!("{:.6} GHz", value / 1.0e9) } else { format!("{value:.6} Hz") } }
+fn format_frequency(value: f64) -> String {
+    if value.abs() >= 1.0e9 {
+        format!("{:.6} GHz", value / 1.0e9)
+    } else {
+        format!("{value:.6} Hz")
+    }
+}
 fn bias_field_label(field: Option<[f64; 3]>) -> String {
-    let Some(field) = field else { return "bias field unavailable".to_string() };
+    let Some(field) = field else {
+        return "bias field unavailable".to_string();
+    };
     let magnitude = field.iter().map(|value| value * value).sum::<f64>().sqrt();
-    if !magnitude.is_finite() { return "bias field unavailable".to_string(); }
+    if !magnitude.is_finite() {
+        return "bias field unavailable".to_string();
+    }
     if magnitude.abs() >= 1.0e-3 {
         format!("μ₀H = {:.3} mT", magnitude * 1.0e3)
     } else {
@@ -2787,26 +4787,65 @@ fn parse_page_query(query: &HashMap<String, String>) -> Result<ParsedPageQuery, 
     }
     let limit = match query.get("limit") {
         None => DEFAULT_PAGE_LIMIT,
-        Some(value) => value.parse::<usize>().map_err(|_| ApiError::unprocessable("RESULT_INVALID_PAGE_LIMIT: limit must be an integer"))?,
+        Some(value) => value.parse::<usize>().map_err(|_| {
+            ApiError::unprocessable("RESULT_INVALID_PAGE_LIMIT: limit must be an integer")
+        })?,
     };
-    if limit == 0 || limit > MAX_PAGE_LIMIT { return Err(ApiError::unprocessable(format!("RESULT_INVALID_PAGE_LIMIT: limit must be between 1 and {MAX_PAGE_LIMIT}"))); }
-    let parse_finite = |key: &str| -> Result<Option<f64>, ApiError> { query.get(key).map(|value| value.parse::<f64>().ok().filter(|number| number.is_finite()).ok_or_else(|| ApiError::unprocessable(format!("RESULT_INVALID_RANGE: {key} must be finite")))).transpose() };
+    if limit == 0 || limit > MAX_PAGE_LIMIT {
+        return Err(ApiError::unprocessable(format!(
+            "RESULT_INVALID_PAGE_LIMIT: limit must be between 1 and {MAX_PAGE_LIMIT}"
+        )));
+    }
+    let parse_finite = |key: &str| -> Result<Option<f64>, ApiError> {
+        query
+            .get(key)
+            .map(|value| {
+                value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|number| number.is_finite())
+                    .ok_or_else(|| {
+                        ApiError::unprocessable(format!(
+                            "RESULT_INVALID_RANGE: {key} must be finite"
+                        ))
+                    })
+            })
+            .transpose()
+    };
     let frequency_min_hz = parse_finite("frequency_min_hz")?;
     let frequency_max_hz = parse_finite("frequency_max_hz")?;
-    if let (Some(min), Some(max)) = (frequency_min_hz, frequency_max_hz) { if min > max { return Err(ApiError::unprocessable("RESULT_INVALID_RANGE: frequency_min_hz must not exceed frequency_max_hz")); } }
+    if let (Some(min), Some(max)) = (frequency_min_hz, frequency_max_hz) {
+        if min > max {
+            return Err(ApiError::unprocessable(
+                "RESULT_INVALID_RANGE: frequency_min_hz must not exceed frequency_max_hz",
+            ));
+        }
+    }
     let residual_max = parse_finite("residual_max")?;
-    if residual_max.is_some_and(|value| value < 0.0) { return Err(ApiError::unprocessable("RESULT_INVALID_RANGE: residual_max must not be negative")); }
+    if residual_max.is_some_and(|value| value < 0.0) {
+        return Err(ApiError::unprocessable(
+            "RESULT_INVALID_RANGE: residual_max must not be negative",
+        ));
+    }
     let has_field = parse_bool_filter(query, "has_field")?;
     let has_fields = parse_bool_filter(query, "has_fields")?;
     if let (Some(has_field), Some(has_fields)) = (has_field, has_fields) {
         if has_field != has_fields {
-            return Err(ApiError::unprocessable("RESULT_INVALID_FILTER: has_field and has_fields must agree"));
+            return Err(ApiError::unprocessable(
+                "RESULT_INVALID_FILTER: has_field and has_fields must agree",
+            ));
         }
     }
     let has_field = has_field.or(has_fields);
     let from_si = parse_finite("from_si")?;
     let to_si = parse_finite("to_si")?;
-    if let (Some(min), Some(max)) = (from_si, to_si) { if min > max { return Err(ApiError::unprocessable("RESULT_INVALID_RANGE: from_si must not exceed to_si")); } }
+    if let (Some(min), Some(max)) = (from_si, to_si) {
+        if min > max {
+            return Err(ApiError::unprocessable(
+                "RESULT_INVALID_RANGE: from_si must not exceed to_si",
+            ));
+        }
+    }
     if query
         .get("search")
         .is_some_and(|value| value.chars().count() > 128)
@@ -2816,10 +4855,17 @@ fn parse_page_query(query: &HashMap<String, String>) -> Result<ParsedPageQuery, 
         ));
     }
     let mut raw = BTreeMap::new();
-    for (key, value) in query { if key != "cursor" { raw.insert(key.clone(), value.clone()); } }
+    for (key, value) in query {
+        if key != "cursor" {
+            raw.insert(key.clone(), value.clone());
+        }
+    }
     let coordinate_tokens = query
         .iter()
-        .filter_map(|(key, value)| key.strip_prefix("coordinate.").map(|axis| (axis.to_string(), value.clone())))
+        .filter_map(|(key, value)| {
+            key.strip_prefix("coordinate.")
+                .map(|axis| (axis.to_string(), value.clone()))
+        })
         .collect::<BTreeMap<_, _>>();
     if coordinate_tokens.len() > 16 {
         return Err(ApiError::unprocessable(
@@ -2831,14 +4877,44 @@ fn parse_page_query(query: &HashMap<String, String>) -> Result<ParsedPageQuery, 
     validate_enum_filter(
         query.get("product_kind").map(String::as_str),
         "product_kind",
-        &["modal_eigen", "driven_response", "time_domain_spectrum", "dynamic_structure_factor"],
+        &[
+            "modal_eigen",
+            "driven_response",
+            "time_domain_spectrum",
+            "dynamic_structure_factor",
+            "hysteresis_loop",
+        ],
     )?;
     validate_enum_filter(
         query.get("item_kind").map(String::as_str),
         "item_kind",
-        &["eigen_mode", "driven_frequency_point", "spectral_feature", "dsf_point"],
+        &[
+            "eigen_mode",
+            "driven_frequency_point",
+            "spectral_feature",
+            "dsf_point",
+        ],
     )?;
-    Ok(ParsedPageQuery { cursor: query.get("cursor").cloned(), limit, stage_id: query.get("stage_id").cloned(), product_kind: query.get("product_kind").cloned(), search: query.get("search").cloned(), from_si, to_si, sample_id: query.get("sample_id").cloned(), item_kind: query.get("item_kind").cloned(), branch_id: query.get("branch_id").cloned(), status: query.get("status").cloned(), has_field, frequency_min_hz, frequency_max_hz, residual_max, sort, coordinate_tokens, raw })
+    Ok(ParsedPageQuery {
+        cursor: query.get("cursor").cloned(),
+        limit,
+        stage_id: query.get("stage_id").cloned(),
+        product_kind: query.get("product_kind").cloned(),
+        search: query.get("search").cloned(),
+        from_si,
+        to_si,
+        sample_id: query.get("sample_id").cloned(),
+        item_kind: query.get("item_kind").cloned(),
+        branch_id: query.get("branch_id").cloned(),
+        status: query.get("status").cloned(),
+        has_field,
+        frequency_min_hz,
+        frequency_max_hz,
+        residual_max,
+        sort,
+        coordinate_tokens,
+        raw,
+    })
 }
 
 fn validate_enum_filter(
@@ -2856,17 +4932,17 @@ fn validate_enum_filter(
     Ok(())
 }
 
-fn parse_bool_filter(
-    query: &HashMap<String, String>,
-    key: &str,
-) -> Result<Option<bool>, ApiError> {
-    query.get(key).map(|value| match value.as_str() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(ApiError::unprocessable(format!(
-            "RESULT_INVALID_FILTER: {key} must be true or false"
-        ))),
-    }).transpose()
+fn parse_bool_filter(query: &HashMap<String, String>, key: &str) -> Result<Option<bool>, ApiError> {
+    query
+        .get(key)
+        .map(|value| match value.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(ApiError::unprocessable(format!(
+                "RESULT_INVALID_FILTER: {key} must be true or false"
+            ))),
+        })
+        .transpose()
 }
 
 fn validate_sort(sort: Option<&str>) -> Result<(), ApiError> {
@@ -2902,11 +4978,17 @@ fn sort_dataset_summaries(
 ) -> Result<(), ApiError> {
     match sort {
         None => {}
-        Some("dataset_id_asc") => datasets.sort_by(|left, right| left.dataset_id.cmp(&right.dataset_id)),
-        Some("dataset_id_desc") => datasets.sort_by(|left, right| right.dataset_id.cmp(&left.dataset_id)),
-        Some(sort) => return Err(ApiError::unprocessable(format!(
-            "RESULT_INVALID_SORT: sort '{sort}' is not valid for dataset catalog"
-        ))),
+        Some("dataset_id_asc") => {
+            datasets.sort_by(|left, right| left.dataset_id.cmp(&right.dataset_id))
+        }
+        Some("dataset_id_desc") => {
+            datasets.sort_by(|left, right| right.dataset_id.cmp(&left.dataset_id))
+        }
+        Some(sort) => {
+            return Err(ApiError::unprocessable(format!(
+                "RESULT_INVALID_SORT: sort '{sort}' is not valid for dataset catalog"
+            )));
+        }
     }
     Ok(())
 }
@@ -2917,8 +4999,12 @@ fn sort_samples(
 ) -> Result<(), ApiError> {
     match sort {
         None => {}
-        Some("sample_id_asc") => samples.sort_by(|left, right| left.sample_id.cmp(&right.sample_id)),
-        Some("sample_id_desc") => samples.sort_by(|left, right| right.sample_id.cmp(&left.sample_id)),
+        Some("sample_id_asc") => {
+            samples.sort_by(|left, right| left.sample_id.cmp(&right.sample_id))
+        }
+        Some("sample_id_desc") => {
+            samples.sort_by(|left, right| right.sample_id.cmp(&left.sample_id))
+        }
         Some("sample_index_asc") => samples.sort_by(|left, right| {
             left.sample_index
                 .unwrap_or(u64::MAX)
@@ -2932,9 +5018,11 @@ fn sort_samples(
                 .cmp(&left.sample_index.unwrap_or(u64::MIN))
                 .then_with(|| left.sample_id.cmp(&right.sample_id))
         }),
-        Some(sort) => return Err(ApiError::unprocessable(format!(
-            "RESULT_INVALID_SORT: sort '{sort}' is not valid for samples"
-        ))),
+        Some(sort) => {
+            return Err(ApiError::unprocessable(format!(
+                "RESULT_INVALID_SORT: sort '{sort}' is not valid for samples"
+            )));
+        }
     }
     Ok(())
 }
@@ -2973,14 +5061,18 @@ fn sort_items(
                 .cmp(&left.display_index.unwrap_or(u64::MIN))
                 .then_with(|| left.item_id.cmp(&right.item_id))
         }),
-        Some(sort) => return Err(ApiError::unprocessable(format!(
-            "RESULT_INVALID_SORT: sort '{sort}' is not valid for items"
-        ))),
+        Some(sort) => {
+            return Err(ApiError::unprocessable(format!(
+                "RESULT_INVALID_SORT: sort '{sort}' is not valid for items"
+            )));
+        }
     }
     Ok(())
 }
 
-fn query_digest(query: &ParsedPageQuery, resource: &str) -> String { digest_json(&(resource, &query.raw)) }
+fn query_digest(query: &ParsedPageQuery, resource: &str) -> String {
+    digest_json(&(resource, &query.raw))
+}
 
 fn encode_cursor(
     dataset_revision: &str,
@@ -2988,29 +5080,78 @@ fn encode_cursor(
     last_stable_id: &str,
     resource: &str,
 ) -> String {
-    let cursor = ResultPageCursor { schema: 1, dataset_revision: dataset_revision.to_string(), query_digest: query_digest(query, resource), last_stable_id: last_stable_id.to_string() };
+    let cursor = ResultPageCursor {
+        schema: 1,
+        dataset_revision: dataset_revision.to_string(),
+        query_digest: query_digest(query, resource),
+        last_stable_id: last_stable_id.to_string(),
+    };
     let bytes = serde_json::to_vec(&cursor).expect("cursor serializes");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn decode_cursor(cursor: &str) -> Result<ResultPageCursor, ApiError> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cursor).map_err(|_| ApiError::bad_request("RESULT_INVALID_CURSOR: cursor is not valid base64url"))?;
-    serde_json::from_slice(&bytes).map_err(|_| ApiError::bad_request("RESULT_INVALID_CURSOR: cursor payload is invalid"))
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| {
+            ApiError::bad_request("RESULT_INVALID_CURSOR: cursor is not valid base64url")
+        })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| ApiError::bad_request("RESULT_INVALID_CURSOR: cursor payload is invalid"))
 }
 
-fn cursor_start<'a, I>(ids: I, dataset_revision: &str, query: &ParsedPageQuery, resource: &str) -> Result<usize, ApiError>
-where I: Iterator<Item = &'a str> {
-    let Some(cursor) = query.cursor.as_deref() else { return Ok(0) };
+fn cursor_start<'a, I>(
+    ids: I,
+    dataset_revision: &str,
+    query: &ParsedPageQuery,
+    resource: &str,
+) -> Result<usize, ApiError>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let Some(cursor) = query.cursor.as_deref() else {
+        return Ok(0);
+    };
     let cursor = decode_cursor(cursor)?;
-    if cursor.schema != 1 || cursor.dataset_revision != dataset_revision || cursor.query_digest != query_digest(query, resource) { return Err(ApiError::conflict_with_code("RESULT_PAGE_CURSOR_STALE", "result page cursor is stale for the current dataset revision, query, or resource")); }
+    if cursor.schema != 1
+        || cursor.dataset_revision != dataset_revision
+        || cursor.query_digest != query_digest(query, resource)
+    {
+        return Err(ApiError::conflict_with_code(
+            "RESULT_PAGE_CURSOR_STALE",
+            "result page cursor is stale for the current dataset revision, query, or resource",
+        ));
+    }
     let ids = ids.collect::<Vec<_>>();
-    ids.iter().position(|id| *id == cursor.last_stable_id).map(|index| index + 1).ok_or_else(|| ApiError::conflict_with_code("RESULT_PAGE_CURSOR_STALE", format!("cursor stable id '{}' is no longer present", cursor.last_stable_id)))
+    ids.iter()
+        .position(|id| *id == cursor.last_stable_id)
+        .map(|index| index + 1)
+        .ok_or_else(|| {
+            ApiError::conflict_with_code(
+                "RESULT_PAGE_CURSOR_STALE",
+                format!(
+                    "cursor stable id '{}' is no longer present",
+                    cursor.last_stable_id
+                ),
+            )
+        })
 }
 
-fn validate_coordinate_filters(dataset: &ResultDatasetIndex, query: &ParsedPageQuery) -> Result<(), ApiError> {
+fn validate_coordinate_filters(
+    dataset: &ResultDatasetIndex,
+    query: &ParsedPageQuery,
+) -> Result<(), ApiError> {
     for (axis_id, token) in &query.coordinate_tokens {
-        let values = dataset.axis_values.get(axis_id).ok_or_else(|| ApiError::unprocessable(format!("RESULT_INVALID_AXIS_FILTER: unknown axis '{axis_id}'")))?;
-        if !values.iter().any(|value| value.token == *token) { return Err(ApiError::unprocessable(format!("RESULT_UNKNOWN_AXIS_VALUE_TOKEN: unknown value token '{token}' for axis '{axis_id}'"))); }
+        let values = dataset.axis_values.get(axis_id).ok_or_else(|| {
+            ApiError::unprocessable(format!(
+                "RESULT_INVALID_AXIS_FILTER: unknown axis '{axis_id}'"
+            ))
+        })?;
+        if !values.iter().any(|value| value.token == *token) {
+            return Err(ApiError::unprocessable(format!(
+                "RESULT_UNKNOWN_AXIS_VALUE_TOKEN: unknown value token '{token}' for axis '{axis_id}'"
+            )));
+        }
     }
     Ok(())
 }
@@ -3053,49 +5194,329 @@ fn axis_value_matches(value: &AnalysisResultAxisValueResource, query: &ParsedPag
                 .is_some_and(|entity| entity.to_lowercase().contains(&search))
     });
     let range_matches = value.scalar_si.is_none_or(|scalar| {
-        query.from_si.is_none_or(|from| scalar >= from)
-            && query.to_si.is_none_or(|to| scalar <= to)
+        query.from_si.is_none_or(|from| scalar >= from) && query.to_si.is_none_or(|to| scalar <= to)
     });
-    let status_matches = query.status.as_deref().is_none_or(|status| status == value.status);
+    let status_matches = query
+        .status
+        .as_deref()
+        .is_none_or(|status| status == value.status);
     search_matches && range_matches && status_matches
 }
 
 fn sample_matches(sample: &AnalysisResultSampleIndexEntry, query: &ParsedPageQuery) -> bool {
-    if query.sample_id.as_deref().is_some_and(|sample_id| sample_id != sample.sample_id) { return false; }
-    if query.status.as_deref().is_some_and(|status| status != sample.status.completeness && status != sample.status.resource) { return false; }
+    if query
+        .sample_id
+        .as_deref()
+        .is_some_and(|sample_id| sample_id != sample.sample_id)
+    {
+        return false;
+    }
+    if query.status.as_deref().is_some_and(|status| {
+        status != sample.status.completeness && status != sample.status.resource
+    }) {
+        return false;
+    }
     if query.search.as_deref().is_some_and(|search| {
         let search = search.to_lowercase();
         !sample.sample_id.to_lowercase().contains(&search)
             && !sample.coordinates.iter().any(|coordinate| {
                 coordinate.token.to_lowercase().contains(&search)
-                    || coordinate.label.as_deref().is_some_and(|label| label.to_lowercase().contains(&search))
+                    || coordinate
+                        .label
+                        .as_deref()
+                        .is_some_and(|label| label.to_lowercase().contains(&search))
             })
-    }) { return false; }
-    query.coordinate_tokens.iter().all(|(axis_id, token)| sample.coordinates.iter().any(|coordinate| &coordinate.axis_id == axis_id && &coordinate.token == token))
+    }) {
+        return false;
+    }
+    query.coordinate_tokens.iter().all(|(axis_id, token)| {
+        sample
+            .coordinates
+            .iter()
+            .any(|coordinate| &coordinate.axis_id == axis_id && &coordinate.token == token)
+    })
 }
 
-fn item_matches(item: &AnalysisResultSpectralItemSummary, query: &ParsedPageQuery, dataset: &ResultDatasetIndex) -> bool {
-    if query.sample_id.as_deref().is_some_and(|sample_id| sample_id != item.sample_id) { return false; }
-    if query.item_kind.as_deref().is_some_and(|kind| serde_json::to_value(&item.item_kind).ok().and_then(|value| value.as_str().map(str::to_string)).as_deref() != Some(kind)) { return false; }
-    if query.branch_id.as_deref().is_some_and(|branch| item.branch_id.as_deref() != Some(branch)) { return false; }
-    if query.status.as_deref().is_some_and(|status| status != item.status.completeness && status != item.status.resource) { return false; }
-    if query.has_field.is_some_and(|has_field| item.field_ref.is_some() != has_field) { return false; }
-    if query.frequency_min_hz.is_some_and(|min| item.frequency_hz.is_none_or(|frequency| frequency < min)) { return false; }
-    if query.frequency_max_hz.is_some_and(|max| item.frequency_hz.is_none_or(|frequency| frequency > max)) { return false; }
-    if query.residual_max.is_some_and(|max| item.quality.residual_relative_l2.is_none_or(|residual| residual > max)) { return false; }
+fn item_matches(
+    item: &AnalysisResultSpectralItemSummary,
+    query: &ParsedPageQuery,
+    dataset: &ResultDatasetIndex,
+) -> bool {
+    if query
+        .sample_id
+        .as_deref()
+        .is_some_and(|sample_id| sample_id != item.sample_id)
+    {
+        return false;
+    }
+    if query.item_kind.as_deref().is_some_and(|kind| {
+        serde_json::to_value(&item.item_kind)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .as_deref()
+            != Some(kind)
+    }) {
+        return false;
+    }
+    if query
+        .branch_id
+        .as_deref()
+        .is_some_and(|branch| item.branch_id.as_deref() != Some(branch))
+    {
+        return false;
+    }
+    if query
+        .status
+        .as_deref()
+        .is_some_and(|status| status != item.status.completeness && status != item.status.resource)
+    {
+        return false;
+    }
+    if query
+        .has_field
+        .is_some_and(|has_field| item.field_ref.is_some() != has_field)
+    {
+        return false;
+    }
+    if query
+        .frequency_min_hz
+        .is_some_and(|min| item.frequency_hz.is_none_or(|frequency| frequency < min))
+    {
+        return false;
+    }
+    if query
+        .frequency_max_hz
+        .is_some_and(|max| item.frequency_hz.is_none_or(|frequency| frequency > max))
+    {
+        return false;
+    }
+    if query.residual_max.is_some_and(|max| {
+        item.quality
+            .residual_relative_l2
+            .is_none_or(|residual| residual > max)
+    }) {
+        return false;
+    }
     if query.search.as_deref().is_some_and(|search| {
         let search = search.to_lowercase();
         !item.item_id.to_lowercase().contains(&search)
-            && !item.branch_id.as_deref().is_some_and(|branch| branch.to_lowercase().contains(&search))
+            && !item
+                .branch_id
+                .as_deref()
+                .is_some_and(|branch| branch.to_lowercase().contains(&search))
             && !item.detail_resource.to_lowercase().contains(&search)
-    }) { return false; }
-    if !query.coordinate_tokens.is_empty() { dataset.samples.iter().find(|sample| sample.sample_id == item.sample_id).is_some_and(|sample| query.coordinate_tokens.iter().all(|(axis_id, token)| sample.coordinates.iter().any(|coordinate| &coordinate.axis_id == axis_id && &coordinate.token == token))) } else { true }
+    }) {
+        return false;
+    }
+    if !query.coordinate_tokens.is_empty() {
+        dataset
+            .samples
+            .iter()
+            .find(|sample| sample.sample_id == item.sample_id)
+            .is_some_and(|sample| {
+                query.coordinate_tokens.iter().all(|(axis_id, token)| {
+                    sample.coordinates.iter().any(|coordinate| {
+                        &coordinate.axis_id == axis_id && &coordinate.token == token
+                    })
+                })
+            })
+    } else {
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::router_v2::handlers::analysis::frequency_domain::FrequencyDomainArtifactExtras;
+
+    #[test]
+    fn generation_binding_replaces_every_payload_generation_query_without_changing_legacy_keys() {
+        let payload_key = "/v2/data/fields/m/samples/vector?view=complex&expected_artifact_generation_id=old&%65xpected_artifact_generation_id=older#mode";
+        let bound = bind_field_resource_key_to_generation(payload_key, Some("sha256:current"));
+
+        assert_eq!(
+            bound,
+            "/v2/data/fields/m/samples/vector?view=complex&expected_artifact_generation_id=sha256:current#mode"
+        );
+        assert_eq!(
+            bound.matches("expected_artifact_generation_id=").count(),
+            1
+        );
+        assert_eq!(
+            bind_field_resource_key_to_generation(payload_key, None),
+            payload_key
+        );
+    }
+
+    fn v3_spectrum_with_signed_wavevector_samples() -> FrequencyDomainSpectrumV3ArtifactPayload {
+        let participation = serde_json::json!({
+            "schema_version": "modal_component_participation.v1",
+            "definition_id": "volume_weighted_complex_l2_fraction.v1",
+            "status": "unavailable",
+            "quantity_id": "m",
+            "quantity_symbol": "m",
+            "unit": "1",
+            "component_basis": "global_xyz",
+            "integration_method": "not_available",
+            "qualification": "unvalidated",
+            "provenance": {"solver_device": "cpu", "observable_lane": "reference"},
+            "objects": [],
+            "unavailable": {"reason_code": "not_computed", "detail": "fixture"}
+        });
+        let mode = |mode_id: &str, raw_mode_index: u64, branch_id: u64, frequency_hz: f64| {
+            serde_json::json!({
+                "mode_id": mode_id,
+                "raw_mode_index": raw_mode_index,
+                "branch_id": branch_id,
+                "frequency_hz": frequency_hz,
+                "residual_relative_l2": null,
+                "component_participation": participation.clone()
+            })
+        };
+        let sample = |sample_id: &str, sample_index: u64, kx: f64, modes: Vec<Value>| {
+            serde_json::json!({
+                "sample_id": sample_id,
+                "sample_index": sample_index,
+                "k_vector": [kx, 0.0, 0.0],
+                "modes": modes
+            })
+        };
+        serde_json::from_value(serde_json::json!({
+            "schema_version": "eigen_spectrum.v3",
+            "samples": [
+                sample("sample:k-negative", 0, -1.0, vec![
+                    mode("mode:k-negative:0", 0, 10, 1.0e9)
+                ]),
+                sample("sample:k-zero", 1, 0.0, vec![
+                    mode("mode:k-zero:degenerate-a", 0, 20, 2.0e9),
+                    mode("mode:k-zero:degenerate-b", 1, 21, 2.0e9)
+                ]),
+                sample("sample:k-positive", 2, 1.0, vec![
+                    mode("mode:k-positive:0", 0, 30, 3.0e9)
+                ])
+            ]
+        }))
+        .expect("V3 spectrum fixture")
+    }
+
+    #[test]
+    fn artifact_snapshot_binds_raw_bytes_including_insignificant_whitespace() {
+        let first = br#"{"generation":1}"#;
+        let second = br#"{ "generation": 1 }"#;
+        let (value, revision) =
+            decode_result_artifact_snapshot(&first[..], "fixture.json", 100).unwrap();
+        let (other_value, other_revision) =
+            decode_result_artifact_snapshot(&second[..], "fixture.json", 100).unwrap();
+        assert_eq!(value, other_value);
+        assert_eq!(revision, format!("sha256:{:x}", Sha256::digest(first)));
+        assert_ne!(revision, other_revision);
+    }
+
+    #[test]
+    fn artifact_snapshot_reads_no_more_than_budget_plus_one_byte() {
+        let bytes = br#"{"generation":1}"#;
+        assert!(
+            decode_result_artifact_snapshot(&bytes[..], "fixture.json", bytes.len() as u64).is_ok()
+        );
+        let mut reader = std::io::Cursor::new(&bytes[..]);
+        let error = decode_result_artifact_snapshot(&mut reader, "fixture.json", 4).unwrap_err();
+        assert!(error.message.starts_with("RESULT_ARTIFACT_BYTE_LIMIT:"));
+        assert_eq!(reader.position(), 5);
+    }
+
+    #[test]
+    fn artifact_snapshot_rejects_truncated_json_and_read_errors() {
+        assert!(
+            decode_result_artifact_snapshot(&br#"{"generation":"#[..], "fixture.json", 100)
+                .is_err()
+        );
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected reader failure",
+                ))
+            }
+        }
+        let error = decode_result_artifact_snapshot(FailedRead, "fixture.json", 100).unwrap_err();
+        assert!(error.message.contains("injected reader failure"));
+    }
+
+    #[test]
+    fn artifact_snapshot_does_not_reopen_a_replaced_generation_after_read() {
+        struct TestFile(std::path::PathBuf);
+        impl Drop for TestFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        struct ReplaceOnEof {
+            file: std::fs::File,
+            path: std::path::PathBuf,
+            replaced: bool,
+        }
+        impl Read for ReplaceOnEof {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.file.read(buffer)?;
+                if count == 0 && !self.replaced {
+                    std::fs::write(&self.path, br#"{"generation":2}"#)?;
+                    self.replaced = true;
+                }
+                Ok(count)
+            }
+        }
+        let owned = TestFile(
+            std::env::temp_dir().join(format!("result-snapshot-{}.json", uuid::Uuid::new_v4())),
+        );
+        let original = br#"{"generation":1}"#;
+        std::fs::write(&owned.0, original).unwrap();
+        let reader = ReplaceOnEof {
+            file: std::fs::File::open(&owned.0).unwrap(),
+            path: owned.0.clone(),
+            replaced: false,
+        };
+        let (value, digest) = decode_result_artifact_snapshot(reader, "fixture.json", 100).unwrap();
+        assert_eq!(value["generation"], 1);
+        assert_eq!(digest, format!("sha256:{:x}", Sha256::digest(original)));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&owned.0).unwrap()).unwrap()
+                ["generation"],
+            2
+        );
+    }
+
+    #[test]
+    fn dataset_and_projection_revisions_bind_the_snapshot_digest() {
+        let payload = gamma_projection_fixture();
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let mut changed_bytes = bytes.clone();
+        changed_bytes.push(b' ');
+        let (_, digest) =
+            decode_result_artifact_snapshot(&bytes[..], "gamma.json", MAX_RESULT_ARTIFACT_BYTES)
+                .unwrap();
+        let (_, changed_digest) = decode_result_artifact_snapshot(
+            &changed_bytes[..],
+            "gamma.json",
+            MAX_RESULT_ARTIFACT_BYTES,
+        )
+        .unwrap();
+        let first =
+            build_gamma_index(payload.clone(), digest.clone(), "run:test", "stage:test").unwrap();
+        let second =
+            build_gamma_index(payload, changed_digest.clone(), "run:test", "stage:test").unwrap();
+        assert_eq!(first.manifest.source_artifacts[0].revision, digest);
+        assert_eq!(second.manifest.source_artifacts[0].revision, changed_digest);
+        assert_ne!(
+            first.manifest.dataset_revision,
+            second.manifest.dataset_revision
+        );
+        for projection in first.projections.values() {
+            assert_eq!(projection.dataset_revision, first.manifest.dataset_revision);
+        }
+        assert!(!first.projections.is_empty());
+    }
 
     #[test]
     fn page_limit_is_bounded_and_finite_ranges_are_validated() {
@@ -3113,25 +5534,44 @@ mod tests {
 
     #[test]
     fn cursor_binds_revision_and_query_without_exposing_offset() {
-        let query = parse_page_query(&HashMap::from([(String::from("limit"), String::from("2"))])).unwrap();
+        let query =
+            parse_page_query(&HashMap::from([(String::from("limit"), String::from("2"))])).unwrap();
         let encoded = encode_cursor("sha256:revision", &query, "sample-0001", "samples");
         assert!(!encoded.contains("sample-0001"));
         let next_query = parse_page_query(&HashMap::from([
             (String::from("cursor"), encoded.clone()),
             (String::from("limit"), String::from("2")),
-        ])).unwrap();
-        assert_eq!(cursor_start(["sample-0000", "sample-0001", "sample-0002"].into_iter(), "sha256:revision", &next_query, "samples").unwrap(), 2);
+        ]))
+        .unwrap();
+        assert_eq!(
+            cursor_start(
+                ["sample-0000", "sample-0001", "sample-0002"].into_iter(),
+                "sha256:revision",
+                &next_query,
+                "samples"
+            )
+            .unwrap(),
+            2
+        );
         let stale = parse_page_query(&HashMap::from([
             (String::from("cursor"), encoded.clone()),
             (String::from("limit"), String::from("3")),
-        ])).unwrap();
-        let error = cursor_start(["sample-0000", "sample-0001"].into_iter(), "sha256:revision", &stale, "samples").expect_err("changed query must stale");
+        ]))
+        .unwrap();
+        let error = cursor_start(
+            ["sample-0000", "sample-0001"].into_iter(),
+            "sha256:revision",
+            &stale,
+            "samples",
+        )
+        .expect_err("changed query must stale");
         assert_eq!(error.code.as_deref(), Some("RESULT_PAGE_CURSOR_STALE"));
 
         let cross_resource_query = parse_page_query(&HashMap::from([
             (String::from("cursor"), encoded),
             (String::from("limit"), String::from("2")),
-        ])).unwrap();
+        ]))
+        .unwrap();
         let error = cursor_start(
             ["sample-0000", "sample-0001"].into_iter(),
             "sha256:revision",
@@ -3172,6 +5612,25 @@ mod tests {
     }
 
     #[test]
+    fn published_hysteresis_product_kind_is_a_valid_catalog_filter() {
+        let query = HashMap::from([(
+            String::from("product_kind"),
+            String::from("hysteresis_loop"),
+        )]);
+        let parsed = parse_page_query(&query)
+            .expect("the published hysteresis product must be queryable");
+        assert_eq!(parsed.product_kind.as_deref(), Some("hysteresis_loop"));
+
+        let invalid = HashMap::from([(
+            String::from("product_kind"),
+            String::from("hysteresis_looop"),
+        )]);
+        let error = parse_page_query(&invalid)
+            .expect_err("unpublished product kinds must still be rejected");
+        assert!(error.message.starts_with("RESULT_INVALID_FILTER"));
+    }
+
+    #[test]
     fn field_sweep_items_keep_their_owner_identity_and_encode_resource_paths() {
         let mesh_ref = Some(AnalysisResultMeshRef {
             mesh_id: "mesh/test".to_string(),
@@ -3181,6 +5640,86 @@ mod tests {
                     .to_string(),
             ),
         });
+        let durable_mode = FrequencyDomainFieldSweepModePayload {
+            mode_artifact_path: Some("eigen/modes/sample_0000/mode_0003.json".to_string()),
+            mode_field_id: Some(" field/1:α ".to_string()),
+            mode_field_resource_key: None,
+            ..FrequencyDomainFieldSweepModePayload {
+                sample_id: "sample/1".to_string(),
+                mode_id: "mode/1".to_string(),
+                raw_mode_index: 3,
+                branch_id: Some(7),
+                frequency_hz: 2.5e9,
+                angular_frequency_rad_per_s: 2.5e9,
+                mode_artifact_path: None,
+                mode_field_id: Some("field-1".to_string()),
+                mode_field_resource_key: Some("data/fields/field-1".to_string()),
+                residual_relative_l2: Some(1.0e-8),
+                source_revision: "revision-1".to_string(),
+                field_status: Some("ready".to_string()),
+                status: "ready".to_string(),
+                mode_field_available: Some(true),
+                extra: FrequencyDomainArtifactExtras(BTreeMap::new()),
+            }
+        };
+        let durable_payload = serde_json::to_value(&durable_mode).unwrap();
+        assert_eq!(durable_payload["mode_field_available"], true);
+        let mut invalid_availability = durable_payload.clone();
+        invalid_availability["mode_field_available"] = serde_json::json!("false");
+        assert!(
+            serde_json::from_value::<FrequencyDomainFieldSweepModePayload>(invalid_availability)
+                .is_err()
+        );
+        let durable_item = field_sweep_item(
+            "run/1",
+            "dataset/1",
+            "sample/1",
+            "revision-1",
+            durable_mode.clone(),
+            mesh_ref.clone(),
+        );
+        assert_eq!(durable_item.status.completeness, "ready");
+        assert_eq!(durable_item.field_ref.as_ref().unwrap().field_id, " field/1:α ");
+        assert_eq!(
+            durable_item.field_ref.as_ref().unwrap().resource_key,
+            "/v2/sessions/current/data/fields/%20field%2F1%3A%CE%B1%20/samples/vector?phase_rad=0&view=phase_rotated_real",
+        );
+        let mut provided_mode = durable_mode.clone();
+        provided_mode.mode_field_resource_key = Some(
+            "/v2/data/fields/m/samples/vector?view=complex&expected_artifact_generation_id=old"
+                .to_string(),
+        );
+        let generation_bound_item = field_sweep_item_with_generation(
+            "run/1",
+            "dataset/1",
+            "sample/1",
+            "revision-1",
+            provided_mode,
+            mesh_ref.clone(),
+            Some("sha256:captured"),
+        );
+        assert_eq!(
+            generation_bound_item.field_ref.as_ref().unwrap().resource_key,
+            "/v2/data/fields/m/samples/vector?view=complex&expected_artifact_generation_id=sha256:captured"
+        );
+        assert_eq!(
+            serde_json::to_value(&durable_mode).unwrap(),
+            durable_payload
+        );
+
+        let mut unavailable_mode = durable_mode.clone();
+        unavailable_mode.mode_field_available = Some(false);
+        let unavailable_item = field_sweep_item(
+            "run/1",
+            "dataset/1",
+            "sample/1",
+            "revision-1",
+            unavailable_mode,
+            mesh_ref.clone(),
+        );
+        assert!(unavailable_item.field_ref.is_none());
+        assert_eq!(unavailable_item.status.completeness, "spectrum_only");
+
         let item = field_sweep_item(
             "run/1",
             "dataset/1",
@@ -3200,6 +5739,7 @@ mod tests {
                 source_revision: "revision-1".to_string(),
                 field_status: Some("ready".to_string()),
                 status: "ready".to_string(),
+                mode_field_available: None,
                 extra: FrequencyDomainArtifactExtras(BTreeMap::new()),
             },
             mesh_ref,
@@ -3238,6 +5778,7 @@ mod tests {
                 source_revision: "revision-1".to_string(),
                 field_status: Some("ready".to_string()),
                 status: "ready".to_string(),
+                mode_field_available: None,
                 extra: FrequencyDomainArtifactExtras(BTreeMap::new()),
             },
             None,
@@ -3262,6 +5803,286 @@ mod tests {
     }
 
     #[test]
+    fn spectrum_scope_metadata_keeps_legacy_unknown_empty_and_invalid_distinct() {
+        let absent = spectrum_output_scope_metadata_from_snapshot(None).unwrap();
+        assert_eq!(absent.requested_scopes, None);
+        assert_eq!(absent.source_manifest_digest, None);
+
+        let legacy = spectrum_output_scope_metadata_from_snapshot(Some((
+            serde_json::json!({"schema_version": "frequency_domain_manifest.v1"}),
+            "sha256:legacy-manifest".to_string(),
+        )))
+        .unwrap();
+        assert_eq!(legacy.requested_scopes, None);
+        assert_eq!(legacy.source_manifest_digest.as_deref(), Some("sha256:legacy-manifest"));
+        let legacy_index = build_spectrum_v3_index(
+            v3_spectrum_with_signed_wavevector_samples(),
+            "sha256:spectrum".to_string(),
+            "run",
+            "stage",
+            legacy,
+        )
+        .unwrap();
+        let legacy_manifest = serde_json::to_value(&legacy_index.manifest).unwrap();
+        assert!(legacy_manifest.get("spectrum_output_scopes").is_none());
+        assert_eq!(
+            legacy_index.manifest.source_artifacts[1].revision,
+            "sha256:legacy-manifest"
+        );
+
+        let empty = spectrum_output_scope_metadata_from_snapshot(Some((
+            serde_json::json!({
+                "schema_version": "frequency_domain_manifest.v1",
+                "spectrum_output_scopes": []
+            }),
+            "sha256:empty-scopes".to_string(),
+        )))
+        .unwrap();
+        assert_eq!(empty.requested_scopes, Some(Vec::new()));
+        let empty_index = build_spectrum_v3_index(
+            v3_spectrum_with_signed_wavevector_samples(),
+            "sha256:spectrum".to_string(),
+            "run",
+            "stage",
+            empty,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&empty_index.manifest).unwrap()["spectrum_output_scopes"],
+            serde_json::json!([])
+        );
+
+        for invalid_scope in [
+            serde_json::json!("per_sample"),
+            serde_json::json!(["per_sample", "unsupported"]),
+            serde_json::json!(null),
+            serde_json::json!(false),
+        ] {
+            let error = spectrum_output_scope_metadata_from_snapshot(Some((
+                serde_json::json!({
+                    "schema_version": "frequency_domain_manifest.v1",
+                    "spectrum_output_scopes": invalid_scope
+                }),
+                "sha256:invalid-scopes".to_string(),
+            )))
+            .expect_err("malformed or unsupported scope declarations must fail closed");
+            assert!(error.message.contains("spectrum_output_scopes"));
+        }
+    }
+
+    #[test]
+    fn spectrum_v3_scope_manifest_preserves_signed_k_samples_and_degenerate_modes() {
+        let scope_metadata = spectrum_output_scope_metadata_from_snapshot(Some((
+            serde_json::json!({
+                "schema_version": "frequency_domain_manifest.v1",
+                "spectrum_output_scopes": ["per_sample", "global"]
+            }),
+            "sha256:scope-manifest".to_string(),
+        )))
+        .unwrap();
+        let index = build_spectrum_v3_index(
+            v3_spectrum_with_signed_wavevector_samples(),
+            "sha256:spectrum".to_string(),
+            "run:scope",
+            "stage:scope",
+            scope_metadata,
+        )
+        .unwrap();
+
+        assert_eq!(
+            index.manifest.spectrum_output_scopes,
+            Some(vec![
+                AnalysisResultSpectrumOutputScope::PerSample,
+                AnalysisResultSpectrumOutputScope::Global,
+            ])
+        );
+        assert_eq!(
+            index
+                .samples
+                .iter()
+                .map(|sample| sample.sample_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sample:k-negative", "sample:k-zero", "sample:k-positive"]
+        );
+        assert_eq!(
+            index.samples[0].items_resource,
+            items_path(
+                "run:scope",
+                &index.manifest.dataset_id,
+                "sample:k-negative"
+            )
+        );
+        assert_eq!(
+            index.samples[1].items_resource,
+            items_path("run:scope", &index.manifest.dataset_id, "sample:k-zero")
+        );
+        assert_eq!(
+            index.samples[2].items_resource,
+            items_path(
+                "run:scope",
+                &index.manifest.dataset_id,
+                "sample:k-positive"
+            )
+        );
+        assert_eq!(
+            index.manifest.item_index_resource,
+            items_path("run:scope", &index.manifest.dataset_id, "")
+        );
+        assert_eq!(
+            index.samples[0].coordinates[0].vector3_si,
+            Some([-1.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            index.samples[1].coordinates[0].vector3_si,
+            Some([0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            index.samples[2].coordinates[0].vector3_si,
+            Some([1.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            index
+                .items
+                .iter()
+                .map(|item| item.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "mode:k-negative:0",
+                "mode:k-zero:degenerate-a",
+                "mode:k-zero:degenerate-b",
+                "mode:k-positive:0",
+            ]
+        );
+        let degenerate_modes = index
+            .items
+            .iter()
+            .filter(|item| item.sample_id == "sample:k-zero")
+            .collect::<Vec<_>>();
+        assert_eq!(degenerate_modes.len(), 2);
+        assert_eq!(degenerate_modes[0].frequency_hz, degenerate_modes[1].frequency_hz);
+        assert_ne!(degenerate_modes[0].item_id, degenerate_modes[1].item_id);
+        assert_eq!(degenerate_modes[0].branch_id.as_deref(), Some("20"));
+        assert_eq!(degenerate_modes[1].branch_id.as_deref(), Some("21"));
+        assert_eq!(index.manifest.source_artifacts.len(), 2);
+        assert_eq!(
+            index.manifest.source_artifacts[1].artifact,
+            "frequency_domain/manifest.v1.json"
+        );
+        assert_eq!(
+            index.manifest.source_artifacts[1].revision,
+            "sha256:scope-manifest"
+        );
+    }
+
+    #[test]
+    fn spectrum_v3_manifest_digest_changes_dataset_revision() {
+        let payload = v3_spectrum_with_signed_wavevector_samples();
+        let scope_metadata = |manifest_digest: &str| SpectrumOutputScopeMetadata {
+            requested_scopes: Some(vec![AnalysisResultSpectrumOutputScope::PerSample]),
+            source_manifest_digest: Some(manifest_digest.to_string()),
+        };
+        let first = build_spectrum_v3_index(
+            payload.clone(),
+            "sha256:spectrum".to_string(),
+            "run:scope",
+            "stage:scope",
+            scope_metadata("sha256:manifest-one"),
+        )
+        .unwrap();
+        let second = build_spectrum_v3_index(
+            payload,
+            "sha256:spectrum".to_string(),
+            "run:scope",
+            "stage:scope",
+            scope_metadata("sha256:manifest-two"),
+        )
+        .unwrap();
+
+        assert_ne!(
+            first.manifest.dataset_revision,
+            second.manifest.dataset_revision
+        );
+        assert_eq!(first.samples[0].source_revision, "sha256:spectrum");
+        assert_eq!(
+            first.manifest.source_artifacts[1].revision,
+            "sha256:manifest-one"
+        );
+        assert_eq!(
+            second.manifest.source_artifacts[1].revision,
+            "sha256:manifest-two"
+        );
+    }
+
+    #[test]
+    fn spectrum_v3_items_project_durable_field_identity_without_mutating_payload() {
+        let mode: FrequencyDomainSpectrumV3ModePayload = serde_json::from_value(serde_json::json!({
+            "mode_id": "sample-0000/mode-0000",
+            "raw_mode_index": 0,
+            "frequency_hz": 1.0e9,
+            "mode_field_id": "analysis:eigen:field/α",
+            "residual_relative_l2": 1.0e-8,
+            "component_participation": {
+                "schema_version": "modal_component_participation.v1",
+                "definition_id": "volume_weighted_complex_l2_fraction.v1",
+                "status": "unavailable", "quantity_id": "m", "quantity_symbol": "m",
+                "unit": "1", "component_basis": "global_xyz",
+                "integration_method": "not_available", "qualification": "unvalidated",
+                "provenance": {"solver_device": "cpu", "observable_lane": "reference"},
+                "objects": [],
+                "unavailable": {"reason_code": "not_computed", "detail": "fixture"}
+            }
+        })).unwrap();
+        let mut mode = mode;
+        mode.mode_field_available = Some(true);
+        let before = serde_json::to_value(&mode).unwrap();
+        assert_eq!(before["mode_field_available"], true);
+        let mut invalid_availability = before.clone();
+        invalid_availability["mode_field_available"] = serde_json::json!("false");
+        assert!(
+            serde_json::from_value::<FrequencyDomainSpectrumV3ModePayload>(invalid_availability)
+                .is_err()
+        );
+        let item = spectrum_v3_item("run", "dataset", "sample", "revision", mode.clone(), None);
+        assert_eq!(item.field_ref.as_ref().unwrap().field_id, "analysis:eigen:field/α");
+        assert_eq!(item.field_ref.as_ref().unwrap().resource_key,
+            "/v2/sessions/current/data/fields/analysis%3Aeigen%3Afield%2F%CE%B1/samples/vector?phase_rad=0&view=phase_rotated_real");
+        let generation_bound_fallback = spectrum_v3_item_with_generation(
+            "run",
+            "dataset",
+            "sample",
+            "revision",
+            mode.clone(),
+            None,
+            Some("sha256:captured"),
+        );
+        let fallback_key = &generation_bound_fallback
+            .field_ref
+            .as_ref()
+            .expect("fallback field reference should remain available")
+            .resource_key;
+        assert!(fallback_key.ends_with("expected_artifact_generation_id=sha256:captured"));
+        assert_eq!(fallback_key.matches("expected_artifact_generation_id=").count(), 1);
+        assert_eq!(serde_json::to_value(&mode).unwrap(), before);
+        let mut legacy_mode = mode.clone();
+        legacy_mode.mode_field_available = None;
+        let legacy_item =
+            spectrum_v3_item("run", "dataset", "sample", "revision", legacy_mode, None);
+        assert!(legacy_item.field_ref.is_some());
+        let mut unavailable_mode = mode.clone();
+        unavailable_mode.mode_field_available = Some(false);
+        let unavailable_item = spectrum_v3_item(
+            "run",
+            "dataset",
+            "sample",
+            "revision",
+            unavailable_mode,
+            None,
+        );
+        assert!(unavailable_item.field_ref.is_none());
+        assert_eq!(unavailable_item.status.completeness, "spectrum_only");
+    }
+
+    #[test]
     fn branch_resources_are_derived_from_stable_item_ids() {
         let status = status_facets("ready", "published", "ready", "unvalidated", None, None);
         let dataset = ResultDatasetIndex {
@@ -3274,6 +6095,7 @@ mod tests {
                 product_kind: AnalysisResultProductKind::ModalEigen,
                 title: "Modal".to_string(),
                 description: None,
+                spectrum_output_scopes: None,
                 status: status.clone(),
                 source_artifacts: Vec::new(),
                 axes: Vec::new(),
@@ -3349,6 +6171,286 @@ mod tests {
     }
 
     #[test]
+    fn hysteresis_loop_dataset_publishes_the_applied_field_sweep() {
+        let points: Vec<HysteresisPointSchema> = serde_json::from_value(serde_json::json!([
+            {"point_id": 0, "field_value_mT": 100.0, "m_parallel": 1.0, "m_oop": 0.0,
+             "m_ip": 1.0, "m_avg": [1.0, 0.0, 0.0], "status": "complete", "branch_id": "descending"},
+            {"point_id": 1, "field_value_mT": -100.0, "m_parallel": -1.0, "m_oop": 0.0,
+             "m_ip": -1.0, "m_avg": [-1.0, 0.0, 0.0], "status": "complete", "branch_id": "descending"}
+        ]))
+        .expect("hysteresis fixture");
+        let index = build_hysteresis_index(
+            &points,
+            "sha256:abc".to_string(),
+            "hysteresis_points.json",
+            "run:1",
+            "stage-002",
+            Some(StageLifecycleState::Completed),
+        );
+        let manifest = &index.manifest;
+        assert_eq!(manifest.dataset_id, "result:run:1:stage-002:hysteresis-loop");
+        assert_eq!(manifest.stage_id, "stage-002");
+        assert_eq!(manifest.status.execution, "completed");
+        assert_eq!(manifest.status.completeness, "complete");
+        assert_eq!(
+            serde_json::to_value(&manifest.product_kind).unwrap(),
+            serde_json::json!("hysteresis_loop")
+        );
+        assert_eq!(manifest.axes.len(), 1);
+        let axis = &manifest.axes[0];
+        assert_eq!((axis.axis_id.as_str(), axis.role.as_str()), ("applied-field", "outer_sweep"));
+        assert_eq!(axis.cardinality, 2);
+        let first = &index.axis_values["applied-field"][0];
+        let expected = 0.1 / (4.0e-7 * std::f64::consts::PI);
+        assert!((first.scalar_si.unwrap() - expected).abs() < 1e-6 * expected);
+        assert!(index.items.is_empty());
+        assert!(!manifest.capabilities.item_paging);
+        assert!(manifest.capabilities.live_partial_results);
+    }
+
+    #[test]
+    fn resolved_hysteresis_source_ref_rejects_paths_outside_run_root() {
+        let run_root = std::path::Path::new("run");
+        let artifact_dir = run_root.join("artifacts");
+        let resolved_path = std::path::Path::new("other-run")
+            .join("stages")
+            .join("stage-000")
+            .join("hysteresis_points.json");
+
+        let error = resolved_hysteresis_source_artifact_ref(&artifact_dir, &resolved_path)
+            .expect_err("a path outside the run root must be rejected");
+        assert_eq!(
+            error.message,
+            "resolved hysteresis artifact path is outside the active run root"
+        );
+    }
+
+    #[test]
+    fn resolved_hysteresis_source_ref_rejects_parent_components() {
+        let run_root = std::path::Path::new("run");
+        let artifact_dir = run_root.join("artifacts");
+        let resolved_path = run_root
+            .join("..")
+            .join("outside")
+            .join("hysteresis_points.json");
+
+        let error = resolved_hysteresis_source_artifact_ref(&artifact_dir, &resolved_path)
+            .expect_err("parent path components must be rejected");
+        assert_eq!(
+            error.message,
+            "artifact path must not contain '..' or root prefixes"
+        );
+    }
+
+    #[test]
+    fn resolved_hysteresis_source_ref_rejects_empty_paths() {
+        let run_root = std::path::Path::new("run");
+        let artifact_dir = run_root.join("artifacts");
+
+        let error = resolved_hysteresis_source_artifact_ref(&artifact_dir, run_root)
+            .expect_err("an empty run-relative path must be rejected");
+        assert_eq!(error.message, "artifact path must not be empty");
+    }
+
+    #[test]
+    fn resolved_hysteresis_source_ref_keeps_flat_artifact_run_relative() {
+        let run_root = std::path::Path::new("run");
+        let artifact_dir = run_root.join("artifacts");
+        let resolved_path = artifact_dir.join("hysteresis_points.json");
+
+        let source_artifact =
+            resolved_hysteresis_source_artifact_ref(&artifact_dir, &resolved_path)
+                .expect("flat artifact ref");
+
+        assert_eq!(source_artifact, "artifacts/hysteresis_points.json");
+    }
+
+    #[test]
+    fn multi_stage_hysteresis_manifests_preserve_resolved_source_paths_and_revisions() {
+        let points: Vec<HysteresisPointSchema> = serde_json::from_value(serde_json::json!([
+            {"point_id": 0, "field_value_mT": 100.0, "m_parallel": 1.0, "m_oop": 0.0,
+             "m_ip": 1.0, "m_avg": [1.0, 0.0, 0.0], "status": "complete"}
+        ]))
+        .expect("hysteresis fixture");
+        let source_bytes = serde_json::to_vec(&points).expect("hysteresis points should serialize");
+        let (_, source_digest) = decode_result_artifact_snapshot(
+            &source_bytes[..],
+            "hysteresis_points.json",
+            MAX_RESULT_ARTIFACT_BYTES,
+        )
+        .expect("hysteresis source digest");
+
+        let run_root = std::path::Path::new("run");
+        let artifact_dir = run_root.join("artifacts");
+        let source_paths = [
+            ("stage-000", "stages/stage-000/hysteresis_points.json"),
+            ("stage-001", "stages/stage-001/hysteresis_points.json"),
+        ];
+        let indices = source_paths.map(|(stage_id, relative_path)| {
+            let resolved_path = run_root.join(relative_path);
+            let source_artifact =
+                resolved_hysteresis_source_artifact_ref(&artifact_dir, &resolved_path)
+                    .expect("resolved stage artifact path");
+            assert_eq!(source_artifact.as_str(), relative_path);
+            build_hysteresis_index(
+                &points,
+                source_digest.clone(),
+                &source_artifact,
+                "run:multi",
+                stage_id,
+                Some(StageLifecycleState::Completed),
+            )
+        });
+
+        for ((_, relative_path), index) in source_paths.iter().zip(&indices) {
+            assert_eq!(
+                index.manifest.source_artifacts[0].artifact.as_str(),
+                *relative_path
+            );
+            assert_eq!(
+                index.manifest.source_artifacts[0].revision.as_str(),
+                source_digest.as_str()
+            );
+            assert_eq!(
+                index.samples[0].source_revision.as_str(),
+                source_digest.as_str()
+            );
+        }
+        assert_ne!(
+            indices[0].manifest.dataset_revision,
+            indices[1].manifest.dataset_revision
+        );
+
+        let moved_path = run_root.join("stages/stage-000/alternate/hysteresis_points.json");
+        let moved_source = resolved_hysteresis_source_artifact_ref(&artifact_dir, &moved_path)
+            .expect("resolved alternate stage artifact path");
+        let moved_index = build_hysteresis_index(
+            &points,
+            source_digest,
+            &moved_source,
+            "run:multi",
+            "stage-000",
+            Some(StageLifecycleState::Completed),
+        );
+        assert_ne!(
+            indices[0].manifest.dataset_revision,
+            moved_index.manifest.dataset_revision,
+            "the resolved source path participates in dataset identity"
+        );
+    }
+
+    #[test]
+    fn running_hysteresis_publishes_accepted_axis_values_as_partial_and_revises_on_completion() {
+        let points: Vec<HysteresisPointSchema> = serde_json::from_value(serde_json::json!([
+            {"point_id": 0, "field_value_mT": 100.0, "m_parallel": 1.0, "m_oop": 0.0,
+             "m_ip": 1.0, "m_avg": [1.0, 0.0, 0.0], "status": "Completed", "branch_id": "descending"}
+        ]))
+        .expect("hysteresis fixture");
+        let running = build_hysteresis_index(
+            &points,
+            "sha256:abc".to_string(),
+            "hysteresis_points.json",
+            "run:1",
+            "stage-002",
+            Some(StageLifecycleState::Running),
+        );
+        assert_eq!(running.manifest.status.execution, "running");
+        assert_eq!(running.manifest.status.completeness, "partial");
+        assert!(running.manifest.capabilities.live_partial_results);
+        assert_eq!(running.axis_values["applied-field"].len(), 1);
+        assert_eq!(running.manifest.axes[0].cardinality, 1);
+
+        let completed = build_hysteresis_index(
+            &points,
+            "sha256:abc".to_string(),
+            "hysteresis_points.json",
+            "run:1",
+            "stage-002",
+            Some(StageLifecycleState::Completed),
+        );
+        assert_eq!(completed.manifest.status.execution, "completed");
+        assert_eq!(completed.manifest.status.completeness, "complete");
+        assert_ne!(
+            running.manifest.dataset_revision,
+            completed.manifest.dataset_revision,
+            "stage lifecycle must invalidate result resource identity when point bytes stay unchanged"
+        );
+    }
+
+    #[test]
+    fn hysteresis_dataset_lifecycle_failures_and_unknown_state_remain_partial() {
+        let points: Vec<HysteresisPointSchema> = serde_json::from_value(serde_json::json!([
+            {"point_id": 0, "field_value_mT": 100.0, "m_parallel": 1.0, "m_oop": 0.0,
+             "m_ip": 1.0, "m_avg": [1.0, 0.0, 0.0], "status": "Completed"}
+        ]))
+        .expect("hysteresis fixture");
+
+        for lifecycle in [
+            StageLifecycleState::Failed,
+            StageLifecycleState::Cancelled,
+            StageLifecycleState::Stopped,
+            StageLifecycleState::Pending,
+            StageLifecycleState::Paused,
+            StageLifecycleState::Skipped,
+            StageLifecycleState::Unknown,
+        ] {
+            let index = build_hysteresis_index(
+                &points,
+                "sha256:abc".to_string(),
+                "hysteresis_points.json",
+                "run:1",
+                "stage-002",
+                Some(lifecycle),
+            );
+            assert_eq!(index.manifest.status.execution, lifecycle.as_str());
+            assert_eq!(index.manifest.status.completeness, "partial");
+        }
+
+        let missing_lifecycle = build_hysteresis_index(
+            &points,
+            "sha256:abc".to_string(),
+            "hysteresis_points.json",
+            "run:1",
+            "stage-002",
+            None,
+        );
+        assert_eq!(missing_lifecycle.manifest.status.execution, "unknown");
+        assert_eq!(missing_lifecycle.manifest.status.completeness, "partial");
+    }
+
+    #[test]
+    fn empty_or_point_failed_hysteresis_artifact_is_not_complete() {
+        let empty = build_hysteresis_index(
+            &[],
+            "sha256:empty".to_string(),
+            "hysteresis_points.json",
+            "run:1",
+            "stage-002",
+            Some(StageLifecycleState::Completed),
+        );
+        assert_eq!(empty.manifest.status.execution, "completed");
+        assert_eq!(empty.manifest.status.completeness, "partial");
+        assert_eq!(empty.manifest.axes[0].cardinality, 0);
+        assert!(empty.axis_values["applied-field"].is_empty());
+
+        let failed_point: Vec<HysteresisPointSchema> = serde_json::from_value(serde_json::json!([
+            {"point_id": 0, "field_value_mT": 100.0, "m_parallel": 1.0, "m_oop": 0.0,
+             "m_ip": 1.0, "m_avg": [1.0, 0.0, 0.0], "status": "complete", "run_status": "Failed"}
+        ]))
+        .expect("hysteresis fixture");
+        let incomplete = build_hysteresis_index(
+            &failed_point,
+            "sha256:failed-point".to_string(),
+            "hysteresis_points.json",
+            "run:1",
+            "stage-002",
+            Some(StageLifecycleState::Completed),
+        );
+        assert_eq!(incomplete.manifest.status.execution, "completed");
+        assert_eq!(incomplete.manifest.status.completeness, "partial");
+    }
+
+    #[test]
     fn single_sample_modal_spectrum_has_a_selectable_projection() {
         let axis = finalize_axis(
             axis_resource(
@@ -3405,11 +6507,18 @@ mod tests {
             &status,
         );
         let projection = projection.get("spectrum").expect("spectrum projection");
-        assert_eq!(projection.axis_mapping.get("x").map(String::as_str), Some("frequency_hz"));
-        assert_eq!(projection.axis_units.get("y").map(String::as_str), Some("index"));
+        assert_eq!(
+            projection.axis_mapping.get("x").map(String::as_str),
+            Some("frequency_hz")
+        );
+        assert_eq!(
+            projection.axis_units.get("y").map(String::as_str),
+            Some("index")
+        );
         assert_eq!(projection.selection_index.len(), 1);
         assert_eq!(
-            serde_json::to_value(&projection.selection_index[0]).expect("selection entry JSON")["item_kind"],
+            serde_json::to_value(&projection.selection_index[0]).expect("selection entry JSON")
+                ["item_kind"],
             serde_json::Value::String("eigen_mode".to_string()),
         );
         assert_eq!(projection.series[0].points[0].x, Some(2.5e9));
@@ -3549,25 +6658,34 @@ mod tests {
         assert_eq!(response.axis_units["y"], "1²");
         assert_eq!(response.selection_index[0].item_id, None);
         assert_eq!(
-            serde_json::to_value(&response.selection_index[0]).expect("selection entry JSON")["item_kind"],
+            serde_json::to_value(&response.selection_index[0]).expect("selection entry JSON")
+                ["item_kind"],
             serde_json::Value::Null,
         );
         assert_eq!(response.series[0].points.len(), 3);
 
         let features = &index.projections["spectral-features"];
         assert_eq!(features.axis_units["y"], "1²");
-        assert_eq!(features.selection_index[0].item_id.as_deref(), Some("legacy:gamma:peak:2"));
         assert_eq!(
-            serde_json::to_value(&features.selection_index[0]).expect("selection entry JSON")["item_kind"],
+            features.selection_index[0].item_id.as_deref(),
+            Some("legacy:gamma:peak:2")
+        );
+        assert_eq!(
+            serde_json::to_value(&features.selection_index[0]).expect("selection entry JSON")
+                ["item_kind"],
             serde_json::Value::String("spectral_feature".to_string()),
         );
-        assert!(index.items.iter().any(|item| item.item_id == "legacy:gamma:peak:2"));
+        assert!(index
+            .items
+            .iter()
+            .any(|item| item.item_id == "legacy:gamma:peak:2"));
 
         let susceptibility = &index.projections["susceptibility"];
         assert_eq!(susceptibility.axis_units["y"], "m/A");
         assert_eq!(susceptibility.selection_index[0].item_id, None);
         assert_eq!(
-            serde_json::to_value(&susceptibility.selection_index[0]).expect("selection entry JSON")["item_kind"],
+            serde_json::to_value(&susceptibility.selection_index[0]).expect("selection entry JSON")
+                ["item_kind"],
             serde_json::Value::Null,
         );
     }
@@ -3628,7 +6746,11 @@ mod tests {
             window_power_sum: 3.0,
             nyquist_hz: 3.0e9,
             susceptibility_abs: vec![Some(0.1), Some(0.2), Some(0.3)],
-            peaks: vec![SpinWavePeakResource { index: 2, frequency_hz: 3.0e9, power: 3.0 }],
+            peaks: vec![SpinWavePeakResource {
+                index: 2,
+                frequency_hz: 3.0e9,
+                power: 3.0,
+            }],
         }
     }
 
@@ -3684,15 +6806,958 @@ mod tests {
         assert_eq!(index.items[0].status.completeness, "partial");
         assert_eq!(index.items[1].item_id, "legacy:dsf:0:1");
         assert_eq!(index.items[1].status.completeness, "unsupported");
-        assert_eq!(index.items[1].status.reason_code.as_deref(), Some("invalid_spatial_probe"));
+        assert_eq!(
+            index.items[1].status.reason_code.as_deref(),
+            Some("invalid_spatial_probe")
+        );
         assert_eq!(index.projections["dsf-map"].selection_index.len(), 2);
         assert_eq!(
             serde_json::to_value(&index.projections["dsf-map"].selection_index[0])
                 .expect("selection entry JSON")["item_kind"],
             serde_json::Value::String("dsf_point".to_string()),
         );
-        assert_eq!(index.manifest.provenance["sampling_clock"], "N=3; dt=1.000000e-12 s");
-        assert_eq!(index.manifest.provenance["uniformity_proof"], "certified by bounded legacy adapter");
+        assert_eq!(
+            index.manifest.provenance["sampling_clock"],
+            "N=3; dt=1.000000e-12 s"
+        );
+        assert_eq!(
+            index.manifest.provenance["uniformity_proof"],
+            "certified by bounded legacy adapter"
+        );
         assert_eq!(index.manifest.provenance["source_drive"], "H_drive_y [A/m]");
+    }
+}
+
+#[cfg(test)]
+mod generation_snapshot_tests {
+    use super::*;
+    use fullmag_runner::artifact_generation::{
+        GenerationBody, GenerationCommit, GenerationMember, PublicationOwner, COMMIT_PATH,
+    };
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    struct TempGenerationRoot(PathBuf);
+
+    impl TempGenerationRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "result-generation-snapshot-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for TempGenerationRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn publish_one_member(
+        root: &Path,
+        path: &str,
+        bytes: &[u8],
+        producer: Option<PublicationOwner>,
+    ) -> fullmag_runner::artifact_generation::GenerationCapture {
+        let member_path = root.join(path);
+        std::fs::create_dir_all(member_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("frequency_domain")).unwrap();
+        std::fs::write(&member_path, bytes).unwrap();
+        let members = BTreeMap::from([(
+            path.to_string(),
+            GenerationMember {
+                byte_length: bytes.len() as u64,
+                sha256: format!("sha256:{:x}", Sha256::digest(bytes)),
+            },
+        )]);
+        let content = GenerationBody {
+            schema_version: "frequency_domain_artifact_generation.v1".to_string(),
+            producer,
+            members,
+        };
+        let generation_id = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&content).unwrap())
+        );
+        let commit = GenerationCommit {
+            generation_id,
+            content,
+        };
+        std::fs::write(
+            root.join(COMMIT_PATH),
+            serde_json::to_vec_pretty(&commit).unwrap(),
+        )
+        .unwrap();
+        fullmag_runner::artifact_generation::capture(root)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn legacy_capture_fence_rejects_a_new_publication() {
+        let root = TempGenerationRoot::new();
+        assert!(ensure_generation_capture_current(&root.0, None).is_ok());
+        let generation = publish_one_member(&root.0, "eigen/spectrum.v3.json", b"{}", None);
+        assert!(ensure_generation_capture_current(&root.0, None).is_err());
+        assert!(ensure_generation_capture_current(&root.0, Some(&generation)).is_ok());
+        publish_one_member(&root.0, "eigen/spectrum.v3.json", b"{ }", None);
+        assert!(ensure_generation_capture_current(&root.0, Some(&generation)).is_err());
+    }
+
+    #[test]
+    fn committed_snapshot_reads_only_bounded_digest_verified_members() {
+        let root = TempGenerationRoot::new();
+        let member = br#"{"schema_version":"eigen_spectrum.v3","generation":1}"#;
+        let generation = publish_one_member(
+            &root.0,
+            "eigen/spectrum.v3.json",
+            member,
+            Some(PublicationOwner {
+                run_id: "run:one".to_string(),
+                stage_id: "stage:one".to_string(),
+                stage_kind: "eigen".to_string(),
+            }),
+        );
+        std::fs::write(
+            root.0.join("eigen/spectrum.v2.json"),
+            br#"{"schema_version":"eigen_spectrum.v2"}"#,
+        )
+        .unwrap();
+
+        let (value, digest) = read_result_artifact_snapshot_in_generation(
+            &root.0,
+            "eigen/spectrum.v3.json",
+            Some(&generation),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(value["schema_version"], "eigen_spectrum.v3");
+        assert_eq!(value["generation"], 1);
+        assert_eq!(digest, format!("sha256:{:x}", Sha256::digest(member)));
+        assert!(read_result_artifact_snapshot_in_generation(
+            &root.0,
+            "eigen/spectrum.v2.json",
+            Some(&generation),
+        )
+        .unwrap()
+        .is_none());
+        assert!(read_result_artifact_bytes_snapshot_in_generation(
+            &root.0,
+            "eigen/spectrum.v3.json",
+            Some(&generation),
+            1,
+        )
+        .is_err());
+
+        let changed_member = br#"{"schema_version":"eigen_spectrum.v3","generation":2}"#;
+        assert_eq!(member.len(), changed_member.len());
+        std::fs::write(root.0.join("eigen/spectrum.v3.json"), changed_member).unwrap();
+        assert!(read_result_artifact_snapshot_in_generation(
+            &root.0,
+            "eigen/spectrum.v3.json",
+            Some(&generation),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_absence_stays_unbound_and_generation_owner_is_only_compared_when_present() {
+        let root = TempGenerationRoot::new();
+        let member = br#"{"schema_version":"eigen_spectrum.v3","samples":[]}"#;
+        let generation = publish_one_member(
+            &root.0,
+            "eigen/spectrum.v3.json",
+            member,
+            Some(PublicationOwner {
+                run_id: "run:one".to_string(),
+                stage_id: "stage:one".to_string(),
+                stage_kind: "eigen".to_string(),
+            }),
+        );
+        assert!(validate_generation_producer(
+            Some(&generation),
+            Some("run:one"),
+            Some("stage:one"),
+        )
+        .is_ok());
+        assert!(validate_generation_producer(Some(&generation), Some("run:other"), None).is_err());
+
+        std::fs::remove_file(root.0.join(COMMIT_PATH)).unwrap();
+        let legacy_generation = fullmag_runner::artifact_generation::capture(&root.0).unwrap();
+        assert!(legacy_generation.is_none());
+        assert!(validate_generation_producer(None, Some("run:other"), Some("stage:other")).is_ok());
+        let (value, _) =
+            read_result_artifact_snapshot_in_generation(&root.0, "eigen/spectrum.v3.json", None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(value["schema_version"], "eigen_spectrum.v3");
+    }
+
+    fn result_stage_record(stage_id: &str, artifact_refs: Vec<String>) -> crate::types::StageExecutionRecord {
+        serde_json::from_value(serde_json::json!({
+            "stage_id": stage_id,
+            "kind": "flat_eigenmodes",
+            "status": "completed",
+            "artifact_refs": artifact_refs,
+        }))
+        .expect("stage owner fixture should deserialize")
+    }
+
+    fn modal_field_generation_members(
+        topology_fingerprint: &str,
+        vector_offset: f64,
+    ) -> Vec<(String, Vec<u8>)> {
+        let spectrum = serde_json::json!({
+            "schema_version": "eigen_spectrum.v3",
+            "samples": [{
+                "sample_id": "sample-0000",
+                "sample_index": 0,
+                "modes": [{
+                    "mode_id": "sample-0000/mode-0000",
+                    "raw_mode_index": 0,
+                    "frequency_hz": 1.0e9,
+                    "mode_field_id": "analysis:eigen:sample-0000:mode-0000",
+                    "mode_field_resource_key": "/v2/sessions/current/data/fields/analysis%3Aeigen%3Asample-0000%3Amode-0000/samples/vector?view=phase_rotated_real&phase_rad=0&expected_artifact_generation_id=old&%65xpected_artifact_generation_id=older",
+                    "mode_field_available": true,
+                    "residual_relative_l2": 1.0e-8,
+                    "component_participation": {
+                        "schema_version": "modal_component_participation.v1",
+                        "definition_id": "volume_weighted_complex_l2_fraction.v1",
+                        "status": "unavailable",
+                        "quantity_id": "m",
+                        "quantity_symbol": "m",
+                        "unit": "1",
+                        "component_basis": "global_cartesian_xyz",
+                        "integration_method": "not_available",
+                        "qualification": "unvalidated",
+                        "provenance": {"solver_device": "cpu", "observable_lane": "reference"},
+                        "objects": [],
+                        "unavailable": {"reason_code": "component_participation_unavailable", "detail": "fixture"}
+                    }
+                }]
+            }]
+        });
+        let mode_metadata = serde_json::json!({
+            "schema_version": "eigen_mode.v2",
+            "sample_index": 0,
+            "raw_mode_index": 0,
+            "source_mesh_identity": {
+                "mesh_generation_id": "42",
+                "mesh_revision": 9,
+                "topology_fingerprint": topology_fingerprint,
+                "indexing": "full_domain_node_order",
+                "node_count": 4
+            },
+            "value_kind": "complex_spatial_vector",
+            "component_basis": "global_xyz",
+            "component_count": 3,
+            "components": ["x", "y", "z"],
+            "compatibility_binary_payload_path": "eigen/mode_fields/sample_0000/mode_0000/vector.bin",
+            "payload_encoding": "f64_interleaved_real_imag_xyz",
+            "binary_layout": "complex_f64_pairs_little_endian",
+            "complex_pair_count": 12,
+            "payload_value_count": 24,
+            "available_views": ["complex", "real", "imag", "abs", "amplitude", "phase", "phase_rotated_real"],
+            "default_view": "phase_rotated_real",
+            "default_phase_rad": 0.0
+        });
+        let vector = (0..24)
+            .flat_map(|index| (vector_offset + f64::from(index)).to_le_bytes())
+            .collect::<Vec<_>>();
+        vec![
+            (
+                "eigen/spectrum.v3.json".to_string(),
+                serde_json::to_vec(&spectrum).unwrap(),
+            ),
+            (
+                "eigen/modes/sample_0000/mode_0000.json".to_string(),
+                serde_json::to_vec(&mode_metadata).unwrap(),
+            ),
+            (
+                "eigen/mode_fields/sample_0000/mode_0000/vector.bin".to_string(),
+                vector,
+            ),
+        ]
+    }
+
+    fn assert_valid_modal_field_generation_fixture(members: &[(String, Vec<u8>)]) {
+        let spectrum_bytes = members
+            .iter()
+            .find(|(path, _)| path == "eigen/spectrum.v3.json")
+            .map(|(_, bytes)| bytes.as_slice())
+            .expect("generation fixture should contain the V3 spectrum");
+        let spectrum: Value = serde_json::from_slice(spectrum_bytes)
+            .expect("generation fixture spectrum should be valid JSON");
+        decode_frequency_domain_artifact_payload("eigen/spectrum.v3.json", spectrum)
+            .expect("generation fixture should satisfy the production V3 spectrum validator");
+    }
+
+    #[tokio::test]
+    async fn spectrum_v3_projection_field_link_is_bound_to_the_captured_binary_generation() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let temporary = TempGenerationRoot::new();
+        let artifact_root = temporary.0.clone();
+        let state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        let mesh = fullmag_runner::FemMeshPayload {
+            mesh_name: "generation-bound-mode".to_string(),
+            mesh_id: "generation-bound-mode:1".to_string(),
+            nodes: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            cells: fullmag_ir::FemConnectivityIR::from_tet4(vec![[0, 1, 2, 3]]),
+            element_markers: vec![7],
+            facets: fullmag_ir::FemFacetConnectivityIR::from_tri3(vec![[0, 1, 2]]),
+            boundary_markers: vec![3],
+            periodic_boundary_pairs: Vec::new(),
+            periodic_node_pairs: Vec::new(),
+            object_segments: vec![fullmag_runner::FemMeshObjectSegment {
+                object_id: "body".to_string(),
+                geometry_id: Some("body".to_string()),
+                node_start: 0,
+                node_count: 4,
+                element_start: 0,
+                element_count: 1,
+                boundary_face_start: 0,
+                boundary_face_count: 1,
+            }],
+            mesh_parts: Vec::new(),
+            domain_mesh_mode: Some("shared_domain".to_string()),
+            domain_frame: None,
+            generation_id: Some("42".to_string()),
+            per_domain_quality: Default::default(),
+            build_report: None,
+        };
+        let topology_fingerprint = fullmag_runner::fem_mesh_topology_fingerprint(&mesh);
+        {
+            let mut current = state.current_live_state.write().await;
+            let snapshot = current
+                .as_mut()
+                .expect("test live session should have a snapshot");
+            snapshot.session.artifact_dir = artifact_root.display().to_string();
+            snapshot.mesh_revision = 9;
+            snapshot.fem_mesh = Some(mesh);
+        }
+
+        let producer = Some(PublicationOwner {
+            run_id: "test-run".to_string(),
+            stage_id: "eigen-stage".to_string(),
+            stage_kind: "flat_eigenmodes".to_string(),
+        });
+        let first_members = modal_field_generation_members(&topology_fingerprint, 1.0);
+        assert_valid_modal_field_generation_fixture(&first_members);
+        let first_generation = write_immutable_result_generation_for_test(
+            &artifact_root,
+            first_members,
+            producer.clone(),
+        );
+        for (path, bytes) in [
+            ("eigen/spectrum.v3.json", b"stale root spectrum alias".as_slice()),
+            (
+                "eigen/modes/sample_0000/mode_0000.json",
+                b"stale root mode metadata".as_slice(),
+            ),
+            (
+                "eigen/mode_fields/sample_0000/mode_0000/vector.bin",
+                b"stale root vector payload".as_slice(),
+            ),
+        ] {
+            let path = artifact_root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        let app = crate::router_v2::build_v2_router().with_state(state.clone());
+        let catalog_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/sessions/current/analysis/results/runs/test-run/datasets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let catalog_status = catalog_response.status();
+        let catalog_body = to_bytes(catalog_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog_status,
+            StatusCode::OK,
+            "catalog response body: {}",
+            String::from_utf8_lossy(&catalog_body)
+        );
+        let catalog: Value = serde_json::from_slice(&catalog_body).unwrap();
+        let dataset_id = catalog["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dataset| {
+                dataset["dataset_id"]
+                    .as_str()
+                    .is_some_and(|id| id.ends_with(":modal-eigen-spectrum"))
+            })
+            .and_then(|dataset| dataset["dataset_id"].as_str())
+            .expect("public catalog should include the V3 modal spectrum")
+            .to_string();
+        let items_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/sessions/current/analysis/results/runs/test-run/datasets/{dataset_id}/items"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(items_response.status(), StatusCode::OK);
+        let items: Value = serde_json::from_slice(
+            &to_bytes(items_response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let field_key = items["items"][0]["field_ref"]["resource_key"]
+            .as_str()
+            .expect("public V3 item should retain its canonical field resource key")
+            .to_string();
+        assert_eq!(
+            field_key.matches("expected_artifact_generation_id=").count(),
+            1
+        );
+        assert!(field_key.ends_with(&format!(
+            "expected_artifact_generation_id={}",
+            first_generation.commit.generation_id
+        )));
+
+        let first_field_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(field_key.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_field_response.status(), StatusCode::OK);
+        assert_eq!(
+            first_field_response
+                .headers()
+                .get("x-fullmag-artifact-generation-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(first_generation.commit.generation_id.as_str())
+        );
+        let first_field_bytes = to_bytes(first_field_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&first_field_bytes[..4], b"FMVP");
+        assert_eq!(first_field_bytes[4], 5);
+        let metadata_length =
+            u32::from_le_bytes(first_field_bytes[8..12].try_into().unwrap()) as usize;
+        let value_offset = 48 + metadata_length;
+        let first_generation_values = first_field_bytes[value_offset..]
+            .chunks_exact(8)
+            .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_generation_values,
+            vec![1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0, 21.0, 23.0]
+        );
+
+        let second_members = modal_field_generation_members(&topology_fingerprint, 100.0);
+        assert_valid_modal_field_generation_fixture(&second_members);
+        let second_generation = write_immutable_result_generation_for_test(
+            &artifact_root,
+            second_members,
+            producer,
+        );
+        assert_ne!(
+            first_generation.commit.generation_id,
+            second_generation.commit.generation_id
+        );
+        let stale_field_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(field_key.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_field_response.status(), StatusCode::CONFLICT);
+        let stale_error: Value = serde_json::from_slice(
+            &to_bytes(stale_field_response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(stale_error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("stale_artifact_generation_id")));
+    }
+
+    #[test]
+    fn result_owner_uses_producer_only_for_exact_generation_members() {
+        let temporary = TempGenerationRoot::new();
+        let root = temporary.0.join("artifacts");
+        let member = br#"{"schema_version":"eigen_spectrum.v2","samples":[]}"#;
+        let generation = publish_one_member(
+            &root,
+            "eigen/spectrum.v2.json",
+            member,
+            Some(PublicationOwner {
+                run_id: "run:current".into(),
+                stage_id: "eigen-stage".into(),
+                stage_kind: "flat_eigenmodes".into(),
+            }),
+        );
+        std::fs::create_dir_all(root.join("analysis")).unwrap();
+        for artifact_path in [
+            "analysis/spin_wave_response.gamma.v1.json",
+            "analysis/dynamic_structure_factor.1d.v1.json",
+        ] {
+            std::fs::write(root.join(artifact_path), b"{}").unwrap();
+        }
+        let stages = vec![result_stage_record("eigen-stage", Vec::new())];
+
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                "eigen/spectrum.v2.json",
+                "run:current",
+                &stages,
+                Some(&generation),
+            )
+            .expect("generation member should use its producer"),
+            "eigen-stage"
+        );
+        for artifact_path in [
+            "analysis/spin_wave_response.gamma.v1.json",
+            "analysis/dynamic_structure_factor.1d.v1.json",
+        ] {
+            assert_eq!(
+                result_artifact_stage_id(
+                    &root,
+                    artifact_path,
+                    "run:current",
+                    &stages,
+                    Some(&generation),
+                )
+                .expect("nonmember legacy product should remain unbound"),
+                "stage:analysis"
+            );
+        }
+        assert_eq!(
+            result_artifact_stage_id(&root, "eigen/spectrum.v2.json", "run:current", &[], None)
+                .expect("legacy artifact without an owner should remain unbound"),
+            "stage:analysis"
+        );
+    }
+
+    #[test]
+    fn immutable_result_owner_uses_only_the_exact_commit_producer() {
+        let temporary = TempGenerationRoot::new();
+        let root = temporary.0.join("artifacts");
+        let artifact_path = "eigen/spectrum.v2.json";
+        let member = br#"{"schema_version":"eigen_spectrum.v2","samples":[]}"#;
+        let generation = write_immutable_result_generation_for_test(
+            &root,
+            [(artifact_path.to_string(), member.to_vec())],
+            Some(PublicationOwner {
+                run_id: "run:current".into(),
+                stage_id: "immutable-eigen-stage".into(),
+                stage_kind: "flat_eigenmodes".into(),
+            }),
+        );
+        assert!(generation.is_immutable());
+        assert!(!root.join(artifact_path).exists());
+
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[],
+                Some(&generation),
+            )
+            .expect("immutable member should bind to the commit producer without a root alias"),
+            "immutable-eigen-stage"
+        );
+        assert!(result_artifact_stage_id(
+            &root,
+            artifact_path,
+            "run:other",
+            &[],
+            Some(&generation),
+        )
+        .is_err());
+        assert!(result_artifact_stage_id_with_identity(
+            &root,
+            artifact_path,
+            "run:current",
+            &[],
+            Some(&generation),
+            "sha256:wrong-content",
+            member.len() as u64,
+        )
+        .is_err());
+
+        let root_alias = root.join(artifact_path);
+        std::fs::create_dir_all(root_alias.parent().unwrap()).unwrap();
+        std::fs::write(&root_alias, b"stale mutable alias").unwrap();
+        let stale_root_reference = result_stage_record(
+            "stale-root-stage",
+            vec![artifact_path.to_string()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[stale_root_reference],
+                Some(&generation),
+            )
+            .expect("mutable aliases and stage refs must not override a v2 producer"),
+            "immutable-eigen-stage"
+        );
+
+        let unbound_path = "eigen/unbound.json";
+        let unbound = write_immutable_result_generation_for_test(
+            &root,
+            [(unbound_path.to_string(), b"{}".to_vec())],
+            None,
+        );
+        let unbound_alias = root.join(unbound_path);
+        std::fs::create_dir_all(unbound_alias.parent().unwrap()).unwrap();
+        std::fs::write(&unbound_alias, b"stale root alias").unwrap();
+        let stale_unbound_reference = result_stage_record(
+            "must-not-bind",
+            vec![unbound_path.to_string()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                unbound_path,
+                "run:current",
+                &[stale_unbound_reference],
+                Some(&unbound),
+            )
+            .expect("missing v2 producer remains explicitly unbound"),
+            "stage:analysis"
+        );
+    }
+
+    #[test]
+    fn result_owner_resolves_exact_file_and_safe_directory_references() {
+        let temporary = TempGenerationRoot::new();
+        let root = temporary.0.join("artifacts");
+        let artifact_path = "eigen/spectrum.v2.json";
+        let artifact_file = root.join(artifact_path);
+        std::fs::create_dir_all(artifact_file.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_file, b"{}").unwrap();
+
+        let file_owner = result_stage_record(
+            "file-stage",
+            vec![artifact_file.to_string_lossy().into_owned()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(&root, artifact_path, "run:current", &[file_owner], None)
+                .expect("exact file ref should resolve its owner"),
+            "file-stage"
+        );
+
+        let relative_file_owner = result_stage_record("relative-file-stage", vec![artifact_path.into()]);
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[relative_file_owner],
+                None,
+            )
+            .expect("root-relative file ref should resolve its owner"),
+            "relative-file-stage"
+        );
+
+        let directory_owner = result_stage_record(
+            "directory-stage",
+            vec![root.to_string_lossy().into_owned()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[directory_owner],
+                None,
+            )
+            .expect("artifact root directory should cover the exact file"),
+            "directory-stage"
+        );
+
+        let stale_sibling_stage = temporary.0.join("stages/stage_00_eigen");
+        let stale_sibling_artifact = stale_sibling_stage.join(artifact_path);
+        std::fs::create_dir_all(stale_sibling_artifact.parent().unwrap()).unwrap();
+        std::fs::write(&stale_sibling_artifact, b"older stage contents").unwrap();
+        let stale_sibling_owner = result_stage_record(
+            "stale-sibling-stage",
+            vec![stale_sibling_stage.to_string_lossy().into_owned()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[stale_sibling_owner],
+                None,
+            )
+            .expect("different bytes in a same-named sibling must not claim ownership"),
+            "stage:analysis"
+        );
+
+        let matching_sibling_stage = temporary.0.join("stages/stage_01_eigen");
+        let matching_sibling_artifact = matching_sibling_stage.join(artifact_path);
+        std::fs::create_dir_all(matching_sibling_artifact.parent().unwrap()).unwrap();
+        std::fs::write(&matching_sibling_artifact, b"{}").unwrap();
+        let matching_sibling_owner = result_stage_record(
+            "matching-sibling-stage",
+            vec![matching_sibling_stage.to_string_lossy().into_owned()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[matching_sibling_owner.clone()],
+                None,
+            )
+            .expect("identical bounded content in a legal sibling should resolve ownership"),
+            "matching-sibling-stage"
+        );
+
+        let second_matching_sibling_stage = temporary.0.join("stages/stage_02_eigen");
+        let second_matching_sibling_artifact = second_matching_sibling_stage.join(artifact_path);
+        std::fs::create_dir_all(second_matching_sibling_artifact.parent().unwrap()).unwrap();
+        std::fs::write(&second_matching_sibling_artifact, b"{}").unwrap();
+        let second_matching_sibling_owner = result_stage_record(
+            "second-matching-sibling-stage",
+            vec![second_matching_sibling_stage.to_string_lossy().into_owned()],
+        );
+        assert!(result_artifact_stage_id(
+            &root,
+            artifact_path,
+            "run:current",
+            &[matching_sibling_owner, second_matching_sibling_owner],
+            None,
+        )
+        .is_err(), "two identical sibling owners remain ambiguous");
+    }
+
+    #[test]
+    fn result_owner_rejects_stage_reference_conflict_and_ambiguity() {
+        let temporary = TempGenerationRoot::new();
+        let root = temporary.0.join("artifacts");
+        let artifact_path = "eigen/spectrum.v2.json";
+        let member = br#"{"schema_version":"eigen_spectrum.v2","samples":[]}"#;
+        let generation = publish_one_member(
+            &root,
+            artifact_path,
+            member,
+            Some(PublicationOwner {
+                run_id: "run:current".into(),
+                stage_id: "eigen-stage".into(),
+                stage_kind: "flat_eigenmodes".into(),
+            }),
+        );
+        let file_ref = root.join(artifact_path).to_string_lossy().into_owned();
+        let conflict = vec![result_stage_record("relax-stage", vec![file_ref.clone()])];
+        assert!(result_artifact_stage_id(
+            &root,
+            artifact_path,
+            "run:current",
+            &conflict,
+            Some(&generation),
+        )
+        .is_err());
+
+        let ambiguous = vec![
+            result_stage_record("eigen-stage", vec![file_ref.clone()]),
+            result_stage_record("relax-stage", vec![file_ref]),
+        ];
+        assert!(result_artifact_stage_id(
+            &root,
+            artifact_path,
+            "run:current",
+            &ambiguous,
+            Some(&generation),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn committed_csv_snapshot_returns_the_exact_bounded_member_bytes() {
+        let root = TempGenerationRoot::new();
+        let csv = b"sample_index,kx_rad_per_m,ky_rad_per_m,kz_rad_per_m\n0,1,0,0\n";
+        let generation = publish_one_member(&root.0, "eigen/dispersion.csv", csv, None);
+
+        let (bytes, digest) = read_result_artifact_bytes_snapshot_in_generation(
+            &root.0,
+            "eigen/dispersion.csv",
+            Some(&generation),
+            csv.len() as u64,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes.as_slice(), csv.as_slice());
+        assert_eq!(digest, format!("sha256:{:x}", Sha256::digest(csv)));
+        assert!(read_result_artifact_bytes_snapshot_in_generation(
+            &root.0,
+            "eigen/dispersion.csv",
+            Some(&generation),
+            csv.len() as u64 - 1,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn committed_field_reader_returns_only_digest_verified_generation_bytes() {
+        let root = TempGenerationRoot::new();
+        let payload = b"field-vector-generation-one";
+        let generation = publish_one_member(&root.0, "eigen/field.bin", payload, None);
+
+        let (served, member) = read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            "eigen/field.bin",
+            Some(&generation),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(served.as_slice(), payload.as_slice());
+        let member = member.expect("committed reader must return the member identity");
+        assert_eq!(member.byte_length, payload.len() as u64);
+        assert_eq!(member.sha256, format!("sha256:{:x}", Sha256::digest(payload)));
+
+        std::fs::write(root.0.join("eigen/field.bin"), b"field-vector-generation-two").unwrap();
+        assert!(read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            "eigen/field.bin",
+            Some(&generation),
+        )
+        .is_err());
+
+        std::fs::remove_file(root.0.join(COMMIT_PATH)).unwrap();
+        let (legacy, member) = read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            "eigen/field.bin",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(legacy.as_slice(), b"field-vector-generation-two");
+        assert!(member.is_none(), "legacy reads stay explicitly unbound");
+    }
+
+    #[test]
+    fn immutable_field_reader_uses_generation_prefix_and_rejects_corruption() {
+        let root = TempGenerationRoot::new();
+        let artifact_path = "eigen/modes/sample_0000/mode_0000/vector.bin";
+        let payload = b"immutable complex field bytes";
+        let generation = write_immutable_result_generation_for_test(
+            &root.0,
+            [(artifact_path.to_string(), payload.to_vec())],
+            None,
+        );
+        assert!(generation.is_immutable());
+        assert!(!root.0.join(artifact_path).exists());
+        assert!(read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            "eigen/modes/sample_0000/mode_0001/vector.bin",
+            Some(&generation),
+        )
+        .unwrap()
+        .is_none());
+
+        let (served, member) = read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            artifact_path,
+            Some(&generation),
+        )
+        .unwrap()
+        .expect("immutable generation member should be served without a logical root file");
+        assert_eq!(served.as_slice(), payload.as_slice());
+        assert_eq!(
+            member.expect("immutable reader returns committed member identity").sha256,
+            format!("sha256:{:x}", Sha256::digest(payload))
+        );
+
+        let root_alias = root.0.join(artifact_path);
+        std::fs::create_dir_all(root_alias.parent().unwrap()).unwrap();
+        std::fs::write(&root_alias, b"stale root bytes").unwrap();
+        let (served, _) = read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            artifact_path,
+            Some(&generation),
+        )
+        .unwrap()
+        .expect("stale root alias must not shadow the immutable member");
+        assert_eq!(served.as_slice(), payload.as_slice());
+
+        let generation_name = generation
+            .commit
+            .generation_id
+            .strip_prefix("sha256:")
+            .unwrap();
+        let immutable_member = root
+            .0
+            .join("frequency_domain/generations")
+            .join(generation_name)
+            .join(artifact_path);
+        let mut corrupted = payload.to_vec();
+        corrupted[0] ^= 1;
+        std::fs::write(immutable_member, corrupted).unwrap();
+        let error = read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            artifact_path,
+            Some(&generation),
+        )
+        .expect_err("corrupt immutable member must not fall back to the stale root alias");
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert!(error.message.contains("frequency_domain_artifact_generation_member_mismatch"));
+    }
+
+    #[test]
+    fn legacy_field_reader_rejects_a_receipt_published_after_absence_capture() {
+        let root = TempGenerationRoot::new();
+        let field_path = "eigen/field.bin";
+        let earlier_bytes = b"legacy field";
+        std::fs::create_dir_all(root.0.join("eigen")).unwrap();
+        std::fs::write(root.0.join(field_path), earlier_bytes).unwrap();
+        assert!(fullmag_runner::artifact_generation::capture(&root.0)
+            .unwrap()
+            .is_none());
+
+        // The caller passes None because it captured an earlier absence. A
+        // publication arriving before the read returns must invalidate it.
+        let published_bytes = b"published field";
+        publish_one_member(&root.0, field_path, published_bytes, None);
+        assert!(read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            field_path,
+            None,
+        )
+        .is_err());
     }
 }

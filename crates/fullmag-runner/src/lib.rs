@@ -14,9 +14,69 @@
 /// Vacuum permeability μ₀ in T·m/A.
 pub const MU0: f64 = 4.0 * std::f64::consts::PI * 1e-7;
 
+pub mod adaptive_resources;
+pub mod artifact_generation;
+mod antenna_external_lead_solution;
+pub use antenna_external_lead_solution::{
+    decode_antenna_inspection_package, encode_antenna_inspection_package,
+    load_antenna_inspection_package_for_execution_plan,
+    ANTENNA_INSPECTION_PACKAGE_MAX_BYTES,
+    execute_antenna_external_lead_inspection,
+    load_antenna_external_lead_solution, load_antenna_external_lead_solution_manifest,
+    load_published_antenna_external_lead_solution,
+    load_published_antenna_external_lead_solution_manifest,
+    publish_antenna_external_lead_solution_atomically, publish_antenna_inspection_package_atomically,
+    AntennaExternalLeadCurrentDisplayReceipt,
+    AntennaExternalLeadExecutionReceipt,
+    AntennaExternalLeadPayloadRef, AntennaExternalLeadSamplingCarrier,
+    AntennaExternalLeadSolutionArtifact, AntennaExternalLeadSolutionManifest,
+    AntennaExternalLeadSolutionRef, LoadedAntennaExternalLeadSolution,
+    AntennaInspectionCurrentDisplayCell, AntennaInspectionDeviceCurrentDisplay,
+    PublishedAntennaExternalLeadSolution, ANTENNA_EXTERNAL_LEAD_SOLUTION_SCHEMA,
+    ANTENNA_EXTERNAL_LEAD_CURRENT_DISPLAY_SOLUTION_SCHEMA,
+};
+mod antenna_field_solution;
+mod antenna_spectrum;
+mod antenna_stage;
+pub use antenna_field_solution::{
+    load_antenna_field_solution_samples, load_antenna_field_solution_samples_for_spectrum,
+    load_solved_antenna_drive_basis_projected,
+    materialize_fdm_solved_antenna_drives, materialize_fdm_solved_antenna_drives_v03,
+    materialize_fem_solved_antenna_drives, materialize_fem_solved_antenna_drives_v03,
+    verify_antenna_field_solution_asset, verify_antenna_field_solution_signatures,
+    verify_antenna_field_solution_referenced_data, AntennaQuadratureEvidenceRef,
+    AntennaDependencySignatures, AntennaFieldSolutionAsset, AntennaFieldSolutionSamples,
+    AntennaFieldSolutionSignatures,
+};
+pub use antenna_spectrum::{
+    antenna_source_spectrum_auxiliary_artifact, antenna_source_spectrum_auxiliary_artifacts,
+    parse_antenna_source_spectrum_manifest_json,
+    verify_antenna_source_spectrum_auxiliary_artifacts,
+    validate_antenna_source_spectrum_manifest_semantics,
+    reusable_antenna_source_spectrum_output,
+    compute_antenna_source_spectrum_artifact,
+    compute_antenna_source_spectrum_artifact_interruptible,
+    compute_nonuniform_k_antenna_source_spectrum,
+    compute_structured_antenna_source_spectrum, sample_antenna_field_on_plane,
+    AntennaSourceSpectrum2D, AntennaSourceSpectrumArtifact, AntennaSourceSpectrumManifest,
+    AntennaSourceSpectrumSummary, AntennaSpectrumPayloadRef, AntennaSpectrumPayloads,
+    AntennaSpectrumSampleGrid, AntennaSpectrumSamplingMetadata,
+};
+pub use antenna_stage::{
+    load_published_antenna_field_solution_for_port,
+    antenna_field_solution_signatures, inspect_cached_antenna_field_solution,
+    load_cached_antenna_field_solution, load_expected_antenna_field_solution,
+    load_published_antenna_field_solution,
+    publish_antenna_field_solution_atomically, publish_antenna_field_solution_atomically_interruptible,
+    AntennaFieldSolutionCacheState, AntennaFieldStageState, AntennaFieldStageStatus,
+    AntennaFieldStageTransition, PublishedAntennaFieldSolution,
+    ExpectedAntennaSolution,
+};
 mod antenna_fields;
 pub mod artifact_pipeline;
+mod artifact_json;
 mod artifacts;
+pub use artifacts::fem_p1_magnetization_field_semantics;
 #[cfg(feature = "stage-autosave-hdf5")]
 pub mod autosave_hdf5;
 pub mod autosave_storage;
@@ -26,6 +86,7 @@ pub mod capabilities;
 pub mod constraints;
 mod derived_fields;
 mod dispatch;
+pub use dispatch::{stage_step_time_frame, StageStepTimeFrame};
 pub mod eigen;
 mod fdm;
 #[allow(dead_code)]
@@ -34,18 +95,31 @@ pub(crate) mod fem;
 mod fem_baseline;
 mod fem_eigen;
 mod frequency_response;
+pub mod frames_index;
 pub mod hysteresis;
 pub mod interactive;
 mod interactive_runtime;
 mod native_fem;
+#[cfg(feature = "fem-native")]
+pub use native_fem::prepare_fem_mesh_space;
 mod observation;
+mod observation_runtime;
 mod physics_graph_execution;
 mod preview;
 pub mod quantities;
+pub mod project_storage;
 mod solvers;
 pub use observation::{
-    observation_provider_policy, ObservationLane, ObservationProviderPolicy,
-    ObservationProviderResolver,
+    accepted_state_digests, observation_provider_policy, AcceptedPrimaryCarrier,
+    AcceptedStateDigests, AcceptedStateGeneration, AcceptedStateId, AcceptedStateIdentityError,
+    AcceptedStateRef, FdmCpuAcceptedStateSnapshotV1, FdmGpuAcceptedStateSnapshotV1,
+    ObservationClock, ObservationLane, ObservationProviderPolicy, ObservationProviderResolver,
+    FDM_CPU_ACCEPTED_STATE_SNAPSHOT_FILE, FDM_CPU_ACCEPTED_STATE_SNAPSHOT_SCHEMA,
+    FDM_GPU_ACCEPTED_STATE_SNAPSHOT_FILE, FDM_GPU_ACCEPTED_STATE_SNAPSHOT_SCHEMA,
+};
+pub use observation_runtime::{
+    ObservationFrame, ObservationPrimaryCarrier, ObservationQuantityBatch, ObservationRuntime,
+    ObservationRuntimeError,
 };
 mod regional_field_drive_artifacts;
 mod relaxation;
@@ -437,6 +511,7 @@ pub fn frozen_spins_runtime_status_for_backend_plan(
         ),
         BackendPlanIR::FdmMultilayer(_)
         | BackendPlanIR::FemEigen(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_)
         | BackendPlanIR::FemFrequencyResponse(_) => return Ok(None),
     };
     let Some(frozen_plan) = frozen_plan else {
@@ -467,7 +542,11 @@ pub use capabilities::{
 };
 pub use fem_eigen::{
     fem_relax_equilibrium_identity_signatures, validate_recomputed_fem_linearization_certificate,
-    AcceptedFemRelaxStageHandoff,
+    AcceptedFemRelaxExactArtifacts, AcceptedFemRelaxStageHandoff,
+    FemRelaxationProducerBuildIdentity, FemRelaxationProducerPayloadRef,
+    FemRelaxationProducerPayloads, FemRelaxationProducerPlanSnapshot,
+    FemRelaxationProducerProvenance, FEM_RELAXATION_PRODUCER_PLAN_NAMESPACE_V1,
+    FEM_RELAXATION_PRODUCER_PROVENANCE_RELATIVE_PATH, FEM_RELAXATION_PRODUCER_PROVENANCE_V1,
 };
 pub use interactive::backend::BackendGeometry;
 pub use interactive::checkpoints::RunOutcome;
@@ -513,12 +592,14 @@ pub use types::{
     FdmGpuTransferCounts, FemCrossoverDecision, FemEigenRunResult, FemMeshObjectSegment,
     FemMeshPartPayload, FemMeshPayload, InitialTimestepReason, LegacyDtPolicy,
     LiveFieldMaterializationState, LiveFieldMaterializationStatus, LivePreviewField,
-    LivePreviewRequest, LiveVectorFieldSnapshot, LlgTimestepCapabilityId,
+    LiveParallelExecutionTelemetry, LivePreviewRequest, LiveVectorFieldSnapshot,
+    LlgTimestepCapabilityId,
     LlgTimestepQualificationId, RecomputedFemLinearizationCertificateV1, RequestedTimestepPolicy,
     ResolvedFallback, ResolvedTimestepPolicy, RunError, RunResult, RunStatus, RuntimeEngineInfo,
     SolverAttemptRecord, StageFemMeshAsset, StageFemMeshIdentity, StepAction, StepStats,
     StepUpdate, TimestepBackend, TimestepDevice, TimestepExecutionIdentity,
     TimestepPolicyProvenance, TimestepValidationState,
+    TransportExecutionProvenance,
 };
 
 use crate::capabilities::{
@@ -1461,6 +1542,7 @@ pub fn is_native_fem_gpu_available() -> bool {
 
 #[derive(Debug, Clone)]
 pub struct NativeFemGpuStatus {
+    pub cpu_available: bool,
     pub available: bool,
     pub visible_cuda_device_count: i32,
     pub requested_gpu_index: i32,
@@ -1473,6 +1555,7 @@ pub struct NativeFemGpuStatus {
 pub fn native_fem_gpu_status() -> NativeFemGpuStatus {
     let availability = native_fem::native_availability();
     NativeFemGpuStatus {
+        cpu_available: availability.native_fem_cpu_available,
         available: availability.native_fem_gpu_available,
         visible_cuda_device_count: availability.visible_cuda_device_count,
         requested_gpu_index: availability.requested_gpu_index,
@@ -1740,7 +1823,9 @@ fn require_supported_fem_topology(
             "fem_frequency_response",
             None,
         ),
-        BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => return Ok(()),
+        BackendPlanIR::Fdm(_)
+        | BackendPlanIR::FdmMultilayer(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_) => return Ok(()),
     };
     let mut cell_families = mesh.cells.types.clone();
     cell_families.sort_unstable();
@@ -2422,6 +2507,41 @@ fn validate_sampling_resolution_provenance(
     Ok(())
 }
 
+/// Bind a newly executed standalone FEM producer before dispatch. Imported
+/// equilibrium records retain their own identity; this only names the execution
+/// owned by this entry point. Complete orchestrator bindings are preserved.
+fn bind_fem_execution_stage_identity<'a>(
+    problem: &'a ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+) -> Result<std::borrow::Cow<'a, ProblemIR>, RunError> {
+    let stage_kind = match &plan.backend_plan {
+        BackendPlanIR::Fem(fem) if fem.relaxation.is_some() => "relaxation",
+        BackendPlanIR::FemEigen(_) => "eigenmodes",
+        _ => return Ok(std::borrow::Cow::Borrowed(problem)),
+    };
+    let keys = ["producer_run_id", "producer_stage_id", "producer_stage_kind"];
+    let metadata = &problem.problem_meta.runtime_metadata;
+    let declared = keys.iter().filter(|key| metadata.contains_key(**key)).count();
+    if declared != 0 {
+        if declared != keys.len()
+            || fem::eigen_equilibrium_contract::FemRelaxationProducerStageIdentity::from_problem(problem)
+                .is_none()
+        {
+            return Err(RunError {
+                message: "fem_producer_stage_identity_incomplete_or_invalid".to_string(),
+            });
+        }
+        return Ok(std::borrow::Cow::Borrowed(problem));
+    }
+    let mut bound = problem.clone();
+    let metadata = &mut bound.problem_meta.runtime_metadata;
+    let run_id = format!("run-{}", uuid::Uuid::new_v4());
+    metadata.insert("producer_run_id".to_string(), serde_json::json!(run_id));
+    metadata.insert("producer_stage_id".to_string(), serde_json::json!("stage-001"));
+    metadata.insert("producer_stage_kind".to_string(), serde_json::json!(stage_kind));
+    Ok(std::borrow::Cow::Owned(bound))
+}
+
 /// Plan and run a problem, writing artifacts to `output_dir`.
 ///
 /// This is the top-level entry point: ProblemIR → plan → execute → artifacts.
@@ -2432,6 +2552,272 @@ pub fn run_problem(
 ) -> Result<RunResult, RunError> {
     let plan = fullmag_plan::plan(problem)?;
     run_planned_problem(problem, &plan, until_seconds, output_dir)
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedParallelExecution {
+    policy: fullmag_ir::ParallelExecutionPolicyIR,
+    resolved_mode: &'static str,
+    resolved_reason: &'static str,
+}
+
+/// Resolve the requested process policy once at every top-level execution
+/// boundary.  Adaptive admission is a FEM eigen-k capability; accepting it
+/// for FDM, time integration, FEM frequency response, or an unrelated FEM
+/// stage would silently execute serial work while claiming the request.
+/// FEM relaxation remains legal as a prerequisite stage and resolves to one
+/// serial work item.  FEM eigen Single likewise remains serial, while Path
+/// is the independent-k process-pool realization.
+fn validate_parallel_execution_workflow(
+    problem: &ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+) -> Result<ValidatedParallelExecution, RunError> {
+    let policy = fullmag_ir::ParallelExecutionPolicyIR::from_runtime_metadata(
+        &problem.problem_meta.runtime_metadata,
+    )
+    .map_err(|message| RunError { message })?;
+    policy.validate().map_err(|message| RunError { message })?;
+
+    if policy.mode == fullmag_ir::ParallelExecutionModeIR::Adaptive {
+        if problem.backend_policy.requested_backend != fullmag_ir::BackendTarget::Fem {
+            return Err(RunError {
+                message: format!(
+                    "parallel_execution adaptive requires requested_backend='fem'; got {:?}; fallback=none",
+                    problem.backend_policy.requested_backend
+                ),
+            });
+        }
+        let requested_device = crate::solver_runtime::selection::runtime_selection(problem)
+            .and_then(|selection| selection.get("device"))
+            .and_then(Value::as_str);
+        if requested_device != Some("cpu") {
+            return Err(RunError {
+                message: format!(
+                    "parallel_execution adaptive requires runtime_selection.device='cpu' for the FEM CPU lane; got {}; fallback=none",
+                    requested_device.unwrap_or("<missing>")
+                ),
+            });
+        }
+    }
+
+    let (resolved_mode, resolved_reason) = match policy.mode {
+        fullmag_ir::ParallelExecutionModeIR::Serial => ("serial", "requested_serial"),
+        fullmag_ir::ParallelExecutionModeIR::Adaptive => match &plan.backend_plan {
+            BackendPlanIR::Fem(fem) if fem.relaxation.is_some() => {
+                ("serial", "fem_relax_prerequisite")
+            }
+            BackendPlanIR::FemEigen(fem) => {
+                if !fem.bias_field_samples.is_empty() {
+                    return Err(RunError {
+                        message: "parallel_execution adaptive is unsupported for FEM bias-field continuation; use serial continuation or a k-path without bias_field_samples".into(),
+                    });
+                }
+                match fem.k_sampling.as_ref() {
+                    Some(fullmag_ir::KSamplingIR::Path { .. }) => {
+                        ("adaptive", "independent_k_path")
+                    }
+                    Some(fullmag_ir::KSamplingIR::Single { .. }) | None => {
+                        ("serial", "single_work_item")
+                    }
+                }
+            }
+            BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => {
+                return Err(RunError {
+                    message: "parallel_execution adaptive is unsupported for FDM and time-integration workflows; use serial execution".into(),
+                });
+            }
+            BackendPlanIR::Fem(_) => {
+                return Err(RunError {
+                    message: "parallel_execution adaptive is unsupported for FEM stages without a Relax prerequisite or Eigen k-path".into(),
+                });
+            }
+            BackendPlanIR::FemFrequencyResponse(_) => {
+                return Err(RunError {
+                    message: "parallel_execution adaptive is unsupported for FEM frequency-response workflows; use serial execution".into(),
+                });
+            }
+        },
+    };
+
+    Ok(ValidatedParallelExecution {
+        policy,
+        resolved_mode,
+        resolved_reason,
+    })
+}
+
+fn append_parallel_execution_provenance(
+    executed: &mut types::ExecutedRun,
+    resolution: &ValidatedParallelExecution,
+) -> Result<(), RunError> {
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": "parallel_execution.runtime.v1",
+        "requested_policy": &resolution.policy,
+        "resolved_mode": resolution.resolved_mode,
+        "resolved_reason": resolution.resolved_reason,
+    }))
+    .map_err(|error| RunError {
+        message: format!("serialize parallel execution provenance: {error}"),
+    })?;
+    executed.auxiliary_artifacts.push(AuxiliaryArtifact {
+        relative_path: "execution/parallel_execution.v1.json".to_string(),
+        bytes,
+    });
+    Ok(())
+}
+
+/// Return the runner's canonical layout identity for supported study state
+/// inputs. The exact artifact layout is the contract; the worker must never
+/// infer compatibility from vector length alone.
+pub fn study_magnetization_layout_for_plan(
+    plan: &fullmag_ir::ExecutionPlanIR,
+) -> Result<serde_json::Value, RunError> {
+    let layout = artifacts::field_layout(plan);
+    let backend = layout
+        .get("backend")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if layout.get("layout_error").is_some()
+        || !matches!(backend, "fdm" | "fdm_multilayer" | "fem")
+        || matches!(&plan.backend_plan, fullmag_ir::BackendPlanIR::Fem(fem) if fem.fe_order != 1)
+    {
+        return Err(RunError {
+            message: format!(
+                "study magnetization input is unsupported for runner layout `{backend}`"
+            ),
+        });
+    }
+    Ok(layout)
+}
+
+/// Apply an immutable, decoded study magnetization to a copy of the accepted
+/// execution plan. Only exact same-space FDM, FDM multilayer, and FEM H1 P1
+/// layouts are supported; this performs no interpolation or backend change.
+pub fn materialize_study_magnetization_input(
+    plan: &fullmag_ir::ExecutionPlanIR,
+    source_layout: &serde_json::Value,
+    values: &[[f64; 3]],
+) -> Result<fullmag_ir::ExecutionPlanIR, RunError> {
+    let expected_layout = study_magnetization_layout_for_plan(plan)?;
+    if &expected_layout != source_layout {
+        return Err(RunError {
+            message: "study magnetization input space does not exactly match the accepted execution plan; cross-space transfer is unsupported".into(),
+        });
+    }
+    if values.is_empty() || values.iter().flatten().any(|value| !value.is_finite()) {
+        return Err(RunError {
+            message: "study magnetization input must contain finite three-component samples"
+                .into(),
+        });
+    }
+
+    let expected_samples = study_plan_state_sample_count(plan, &expected_layout)?;
+    if values.len() != expected_samples {
+        return Err(RunError {
+            message: format!(
+                "study magnetization input has {} samples but the accepted execution plan requires {expected_samples}",
+                values.len()
+            ),
+        });
+    }
+
+    let mut materialized = plan.clone();
+    match &mut materialized.backend_plan {
+        fullmag_ir::BackendPlanIR::Fdm(fdm) => {
+            fdm.initial_magnetization.copy_from_slice(values);
+        }
+        fullmag_ir::BackendPlanIR::FdmMultilayer(multilayer) => {
+            let mut offset = 0usize;
+            for layer in &mut multilayer.layers {
+                let end = offset + layer.initial_magnetization.len();
+                layer
+                    .initial_magnetization
+                    .copy_from_slice(&values[offset..end]);
+                offset = end;
+            }
+        }
+        fullmag_ir::BackendPlanIR::Fem(fem) => {
+            fem.initial_magnetization.copy_from_slice(values);
+        }
+        _ => unreachable!("accepted layout was validated above"),
+    }
+    Ok(materialized)
+}
+
+fn study_plan_state_sample_count(
+    plan: &fullmag_ir::ExecutionPlanIR,
+    layout: &serde_json::Value,
+) -> Result<usize, RunError> {
+    let invalid_layout = || RunError {
+        message: "study magnetization layout sample identity differs from the accepted execution plan".into(),
+    };
+    match (&plan.backend_plan, layout["backend"].as_str()) {
+        (fullmag_ir::BackendPlanIR::Fdm(fdm), Some("fdm")) => {
+            let sample_count = layout["total_cell_count"]
+                .as_u64()
+                .and_then(|count| usize::try_from(count).ok())
+                .ok_or_else(invalid_layout)?;
+            if sample_count != fdm.initial_magnetization.len() {
+                return Err(invalid_layout());
+            }
+            Ok(sample_count)
+        }
+        (fullmag_ir::BackendPlanIR::FdmMultilayer(multilayer), Some("fdm_multilayer")) => {
+            let layout_layers = layout["layers"].as_array().ok_or_else(invalid_layout)?;
+            if layout_layers.len() != multilayer.layers.len() {
+                return Err(invalid_layout());
+            }
+            let mut expected_offset = 0usize;
+            for (layer, descriptor) in multilayer.layers.iter().zip(layout_layers) {
+                let offset = descriptor["value_offset"]
+                    .as_u64()
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .ok_or_else(invalid_layout)?;
+                let count = descriptor["value_count"]
+                    .as_u64()
+                    .and_then(|count| usize::try_from(count).ok())
+                    .ok_or_else(invalid_layout)?;
+                if offset != expected_offset || count != layer.initial_magnetization.len() {
+                    return Err(invalid_layout());
+                }
+                expected_offset = expected_offset
+                    .checked_add(count)
+                    .ok_or_else(invalid_layout)?;
+            }
+            Ok(expected_offset)
+        }
+        (fullmag_ir::BackendPlanIR::Fem(fem), Some("fem")) if fem.fe_order == 1 => {
+            let sample_count = layout["n_nodes"]
+                .as_u64()
+                .and_then(|count| usize::try_from(count).ok())
+                .ok_or_else(invalid_layout)?;
+            if sample_count != fem.mesh.nodes.len()
+                || sample_count != fem.initial_magnetization.len()
+            {
+                return Err(invalid_layout());
+            }
+            Ok(sample_count)
+        }
+        _ => Err(invalid_layout()),
+    }
+}
+
+fn require_frequency_response_artifact_identity(
+    plan: &fullmag_ir::ExecutionPlanIR,
+    identity: Option<&eigen::FrequencyDomainArtifactIdentity>,
+) -> Result<(), RunError> {
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+    identity.validate().map_err(|error| RunError {
+        message: format!("invalid frequency-domain artifact identity: {error}"),
+    })?;
+    let BackendPlanIR::FemFrequencyResponse(response) = &plan.backend_plan else {
+        return Err(RunError {
+            message: "exact FMR artifact identity requires a FEM frequency-response plan".into(),
+        });
+    };
+    frequency_response::validate_frequency_response_artifact_identity(response, Some(identity))
 }
 
 /// Run a problem with an already materialized execution plan.
@@ -2446,8 +2832,58 @@ pub fn run_planned_problem(
     until_seconds: f64,
     output_dir: &Path,
 ) -> Result<RunResult, RunError> {
+    run_planned_problem_with_artifact_context(problem, plan, until_seconds, output_dir, None)
+}
+
+/// Execute an FMR plan with exact artifact ownership.
+/// Native execution requires the FEM feature; dense execution must be explicit.
+/// Identity is runner-owned and does not change the canonical ProblemIR.
+pub fn run_planned_problem_with_artifact_identity(
+    problem: &ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    until_seconds: f64,
+    output_dir: &Path,
+    artifact_identity: &eigen::FrequencyDomainArtifactIdentity,
+) -> Result<RunResult, RunError> {
+    run_planned_problem_with_artifact_context(
+        problem,
+        plan,
+        until_seconds,
+        output_dir,
+        Some(artifact_identity),
+    )
+}
+
+fn antenna_plan_requires_dedicated_inspection() -> RunError {
+    RunError {
+        message: "antenna_field_solve requires the dedicated antenna inspection workflow; no magnetic Run, Relax, or preview state exists".into(),
+    }
+}
+
+fn require_magnetic_execution_plan(plan: &fullmag_ir::ExecutionPlanIR) -> Result<(), RunError> {
+    if matches!(
+        plan.backend_plan,
+        BackendPlanIR::AntennaExternalLeadInspection(_)
+    ) {
+        return Err(antenna_plan_requires_dedicated_inspection());
+    }
+    Ok(())
+}
+
+fn run_planned_problem_with_artifact_context(
+    problem: &ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    until_seconds: f64,
+    output_dir: &Path,
+    artifact_identity: Option<&eigen::FrequencyDomainArtifactIdentity>,
+) -> Result<RunResult, RunError> {
+    require_magnetic_execution_plan(plan)?;
+    require_frequency_response_artifact_identity(plan, artifact_identity)?;
+    let execution_problem = bind_fem_execution_stage_identity(problem, plan)?;
+    let problem = execution_problem.as_ref();
     require_resolved_runtime_sampling(problem, plan)?;
     require_physics_graph_runtime_provenance(problem, plan)?;
+    let parallel_execution = validate_parallel_execution_workflow(problem, plan)?;
     if let fullmag_ir::StudyIR::Hysteresis { .. } = &problem.study {
         return hysteresis::run_planned_hysteresis(problem, plan, until_seconds, output_dir, None);
     }
@@ -2533,15 +2969,30 @@ pub fn run_planned_problem(
         }
         BackendPlanIR::FemEigen(fem) => {
             let execution = dispatch::resolve_planned_fem_eigen_execution(problem, plan, fem)?;
-            dispatch::execute_fem_eigen(execution, fem, &plan.output_plan.outputs)
+            let producer_identity =
+                fem::eigen_equilibrium_contract::FemRelaxationProducerStageIdentity::from_problem(
+                    problem,
+                );
+            dispatch::execute_fem_eigen_with_producer_identity_and_parallel_policy(
+                execution,
+                fem,
+                &plan.output_plan.outputs,
+                producer_identity.as_ref(),
+                &parallel_execution.policy,
+                Some(output_dir),
+            )
+        }
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            Err(antenna_plan_requires_dedicated_inspection())
         }
         BackendPlanIR::FemFrequencyResponse(response) => {
             let stage_context =
                 types::FemStageExecutionContext::from_backend_plan(&plan.backend_plan)
                     .expect("FEM stage context");
-            frequency_response::execute_fem_frequency_response_validation_with_context(
+            frequency_response::execute_fem_frequency_response_validation_with_artifact_context(
                 response,
                 &stage_context,
+                artifact_identity,
                 output_dir,
                 None,
                 None,
@@ -2572,6 +3023,7 @@ pub fn run_planned_problem(
         .extend(spin_wave_sampling::requested_finite_k_artifacts(
             problem, plan, output_dir,
         )?);
+    append_parallel_execution_provenance(&mut executed, &parallel_execution)?;
 
     if let Err(e) = artifacts::write_artifacts(
         output_dir,
@@ -2603,6 +3055,7 @@ pub fn run_planned_problem_with_hysteresis_stage_id(
     require_resolved_runtime_sampling(problem, plan)?;
     require_physics_graph_runtime_provenance(problem, plan)?;
     if let fullmag_ir::StudyIR::Hysteresis { .. } = &problem.study {
+        validate_parallel_execution_workflow(problem, plan)?;
         return hysteresis::run_planned_hysteresis(
             problem,
             plan,
@@ -2622,11 +3075,29 @@ pub fn fem_observables_for_magnetization(
     fem_baseline::fem_observables_for_magnetization(plan, magnetization)
 }
 
+fn insert_parallel_u64_scalars(
+    scalars: &mut std::collections::HashMap<String, f64>,
+    key: &str,
+    value: u64,
+) {
+    scalars.insert(
+        format!("{key}_lo"),
+        f64::from((value & u64::from(u32::MAX)) as u32),
+    );
+    scalars.insert(format!("{key}_hi"), f64::from((value >> 32) as u32));
+}
+
 fn fem_eigen_progress_update(
     progress: fem_eigen::FemEigenProgress,
     fem_mesh_generation_id: Option<String>,
 ) -> StepUpdate {
     let mut progress_scalars = std::collections::HashMap::new();
+    // Preserve categorical solver/phase identity in the existing scalar envelope.
+    // These flags carry identity only; they are not measured physical fields.
+    if !progress.solver_kind.is_empty() {
+        progress_scalars.insert(format!("solver_kind:{}", progress.solver_kind), 1.0);
+    }
+    progress_scalars.insert(format!("phase_kind:{}", progress.phase), 1.0);
     progress_scalars.insert("phase_code".to_string(), f64::from(progress.phase_index));
     progress_scalars.insert("phase_count".to_string(), f64::from(progress.phase_count));
     progress_scalars.insert("percent".to_string(), progress.percent);
@@ -2650,6 +3121,28 @@ fn fem_eigen_progress_update(
     if let Some(residual) = progress.residual {
         progress_scalars.insert("residual".to_string(), residual);
     }
+    if let Some(linear_solve) = progress.linear_solve.as_ref() {
+        progress_scalars.insert(
+            "linear_iteration".to_string(),
+            linear_solve.linear_iteration as f64,
+        );
+        if let Some(residual_norm) = linear_solve
+            .linear_residual_norm
+            .filter(|value| value.is_finite() && *value >= 0.0)
+        {
+            progress_scalars.insert("linear_residual_norm".to_string(), residual_norm);
+        }
+        if matches!(linear_solve.linear_solver_role, "poisson" | "shift_invert") {
+            progress_scalars.insert(
+                format!("linear_solver_role:{}", linear_solve.linear_solver_role),
+                1.0,
+            );
+        }
+        if let Some(ksp_type @ ("gmres" | "fgmres" | "preonly")) = linear_solve.linear_ksp_type {
+            progress_scalars.insert(format!("linear_ksp_type:{ksp_type}"), 1.0);
+        }
+        progress_scalars.insert("residual_source:ksp_norm".to_string(), 1.0);
+    }
     if let Some(current_subwindow) = progress.current_subwindow {
         progress_scalars.insert(
             "current_subwindow".to_string(),
@@ -2667,6 +3160,82 @@ fn fem_eigen_progress_update(
     }
     if let Some(window_elapsed_seconds) = progress.window_elapsed_seconds {
         progress_scalars.insert("window_elapsed_seconds".to_string(), window_elapsed_seconds);
+    }
+    if let Some(parallel) = progress.parallel_execution.as_ref() {
+        progress_scalars.insert("parallel_telemetry_available".to_string(), 1.0);
+        progress_scalars.insert(
+            "parallel_active_workers".to_string(),
+            f64::from(parallel.active_workers),
+        );
+        progress_scalars.insert(
+            "parallel_admission_desired_workers".to_string(),
+            f64::from(parallel.admission_desired_workers),
+        );
+        progress_scalars.insert(
+            "parallel_admission_pending_samples".to_string(),
+            f64::from(parallel.admission_pending_samples),
+        );
+        progress_scalars.insert(
+            "parallel_cpu_target_percent".to_string(),
+            parallel.cpu_target_percent,
+        );
+        progress_scalars.insert(
+            "parallel_memory_target_percent".to_string(),
+            parallel.memory_target_percent,
+        );
+        insert_parallel_u64_scalars(
+            &mut progress_scalars,
+            "parallel_memory_reserve_bytes",
+            parallel.memory_reserve_bytes,
+        );
+        insert_parallel_u64_scalars(
+            &mut progress_scalars,
+            "parallel_sampled_at_unix_ms",
+            parallel.sampled_at_unix_ms,
+        );
+        progress_scalars.insert(
+            "parallel_telemetry_terminal".to_string(),
+            parallel.terminal as u8 as f64,
+        );
+        for (key, value) in [
+            ("parallel_admission_worker_limit", parallel.admission_worker_limit),
+            ("parallel_resolved_workers", parallel.resolved_workers),
+        ] {
+            if let Some(value) = value {
+                progress_scalars.insert(key.to_string(), f64::from(value));
+            }
+        }
+        for (key, value) in [
+            ("parallel_cpu_busy_percent", parallel.cpu_busy_percent),
+            ("parallel_allocated_cpu_cores", parallel.allocated_cpu_cores),
+            ("parallel_cpu_available_cores", parallel.cpu_available_cores),
+            ("parallel_worker_peak_cpu_cores", parallel.worker_peak_cpu_cores),
+        ] {
+            if let Some(value) = value.filter(|value| value.is_finite()) {
+                progress_scalars.insert(key.to_string(), value);
+            }
+        }
+        for (key, value) in [
+            ("parallel_memory_limit_bytes", parallel.memory_limit_bytes),
+            ("parallel_memory_available_bytes", parallel.memory_available_bytes),
+            ("parallel_worker_peak_rss_bytes", parallel.worker_peak_rss_bytes),
+        ] {
+            if let Some(value) = value {
+                insert_parallel_u64_scalars(&mut progress_scalars, key, value);
+            }
+        }
+        if !parallel.cpu_target_kind.is_empty() {
+            progress_scalars.insert(
+                format!("parallel_cpu_target_kind:{}", parallel.cpu_target_kind),
+                1.0,
+            );
+        }
+        if !parallel.admission_reason.is_empty() {
+            progress_scalars.insert(
+                format!("parallel_admission_reason:{}", parallel.admission_reason),
+                1.0,
+            );
+        }
     }
     progress_scalars.insert(
         "window_phase_base".to_string(),
@@ -2709,9 +3278,6 @@ fn fem_eigen_progress_update(
         (progress.warning == Some("dense_o_n3_eigensolve_without_iteration_progress")) as u8 as f64,
     );
 
-    let mut per_object_scalars = std::collections::HashMap::new();
-    per_object_scalars.insert("fem_eigen_progress".to_string(), progress_scalars);
-
     StepUpdate {
         coupled_checkpoint: None,
         stats: StepStats {
@@ -2719,8 +3285,10 @@ fn fem_eigen_progress_update(
                 .iteration
                 .map(u64::from)
                 .unwrap_or(u64::from(progress.phase_index)),
-            max_h_eff: progress.residual.unwrap_or(0.0),
-            per_object_scalars,
+            kind: fullmag_quantities::StepDataKind::SolverProgress,
+            solver_progress: Some(fullmag_quantities::SolverProgress::FemEigen {
+                metrics: progress_scalars,
+            }),
             ..StepStats::default()
         },
         grid: [0, 0, 0],
@@ -2813,10 +3381,66 @@ pub fn run_planned_problem_with_callback_and_fem_mesh_identity_and_relax_handoff
     output_dir: &Path,
     field_every_n: u64,
     relax_handoff: Option<&AcceptedFemRelaxStageHandoff>,
-    mut on_step: impl FnMut(StepUpdate) -> StepAction + Send,
+    on_step: impl FnMut(StepUpdate) -> StepAction + Send,
 ) -> Result<RunResult, RunError> {
+    run_planned_problem_with_callback_artifact_context(
+        problem,
+        plan,
+        fem_mesh_identity,
+        until_seconds,
+        output_dir,
+        field_every_n,
+        relax_handoff,
+        on_step,
+        None,
+    )
+}
+
+/// Execute an FMR plan with exact artifact ownership.
+/// Native execution requires the FEM feature; dense execution must be explicit.
+/// Identity is runner-owned and does not change the canonical ProblemIR.
+pub fn run_planned_problem_with_callback_and_artifact_identity(
+    problem: &ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    fem_mesh_identity: Option<&StageFemMeshIdentity>,
+    until_seconds: f64,
+    output_dir: &Path,
+    field_every_n: u64,
+    relax_handoff: Option<&AcceptedFemRelaxStageHandoff>,
+    on_step: impl FnMut(StepUpdate) -> StepAction + Send,
+    artifact_identity: &eigen::FrequencyDomainArtifactIdentity,
+) -> Result<RunResult, RunError> {
+    run_planned_problem_with_callback_artifact_context(
+        problem,
+        plan,
+        fem_mesh_identity,
+        until_seconds,
+        output_dir,
+        field_every_n,
+        relax_handoff,
+        on_step,
+        Some(artifact_identity),
+    )
+}
+
+fn run_planned_problem_with_callback_artifact_context(
+    problem: &ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    fem_mesh_identity: Option<&StageFemMeshIdentity>,
+    until_seconds: f64,
+    output_dir: &Path,
+    field_every_n: u64,
+    relax_handoff: Option<&AcceptedFemRelaxStageHandoff>,
+    mut on_step: impl FnMut(StepUpdate) -> StepAction + Send,
+    artifact_identity: Option<&eigen::FrequencyDomainArtifactIdentity>,
+) -> Result<RunResult, RunError> {
+    require_magnetic_execution_plan(plan)?;
+    require_frequency_response_artifact_identity(plan, artifact_identity)?;
+    let execution_problem = bind_fem_execution_stage_identity(problem, plan)?;
+    let problem = execution_problem.as_ref();
     require_resolved_runtime_sampling(problem, plan)?;
     require_physics_graph_runtime_provenance(problem, plan)?;
+    let parallel_execution = validate_parallel_execution_workflow(problem, plan)?;
     if let fullmag_ir::StudyIR::Hysteresis { .. } = &problem.study {
         return hysteresis::run_planned_hysteresis_with_callback(
             problem,
@@ -2831,7 +3455,12 @@ pub fn run_planned_problem_with_callback_and_fem_mesh_identity_and_relax_handoff
     }
     let fem_stage_context = fem_mesh_identity
         .cloned()
-        .map(types::FemStageExecutionContext::from_mesh_identity);
+        .map(types::FemStageExecutionContext::from_mesh_identity)
+        .or_else(|| {
+            artifact_identity.and_then(|_| {
+                types::FemStageExecutionContext::from_backend_plan(&plan.backend_plan)
+            })
+        });
     let mut artifact_pipeline = artifact_pipeline::ArtifactPipeline::start_for_problem_and_plan(
         problem,
         plan,
@@ -2934,6 +3563,10 @@ pub fn run_planned_problem_with_callback_and_fem_mesh_identity_and_relax_handoff
         }
         BackendPlanIR::FemEigen(fem) => {
             let execution = dispatch::resolve_planned_fem_eigen_execution(problem, plan, fem)?;
+            let producer_identity =
+                fem::eigen_equilibrium_contract::FemRelaxationProducerStageIdentity::from_problem(
+                    problem,
+                );
             let mut progress_callback = |progress| {
                 on_step(fem_eigen_progress_update(
                     progress,
@@ -2943,25 +3576,35 @@ pub fn run_planned_problem_with_callback_and_fem_mesh_identity_and_relax_handoff
                 ))
             };
             match relax_handoff {
-                Some(handoff) => dispatch::execute_fem_eigen_with_progress_and_stage_handoff(
+                Some(handoff) => dispatch::execute_fem_eigen_with_progress_and_stage_handoff_and_producer_identity_and_parallel_policy(
                     execution,
                     fem,
                     &runtime_outputs,
                     &mut progress_callback,
                     handoff,
+                    producer_identity.as_ref(),
+                    &parallel_execution.policy,
+                    Some(output_dir),
                 ),
-                None => dispatch::execute_fem_eigen_with_progress(
+                None => dispatch::execute_fem_eigen_with_progress_and_producer_identity_and_parallel_policy(
                     execution,
                     fem,
                     &runtime_outputs,
                     &mut progress_callback,
+                    producer_identity.as_ref(),
+                    &parallel_execution.policy,
+                    Some(output_dir),
                 ),
             }
         }
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            Err(antenna_plan_requires_dedicated_inspection())
+        }
         BackendPlanIR::FemFrequencyResponse(response) => {
-            frequency_response::execute_fem_frequency_response_validation_with_context(
+            frequency_response::execute_fem_frequency_response_validation_with_artifact_context(
                 response,
                 fem_stage_context.as_ref().expect("FEM stage context"),
+                artifact_identity,
                 output_dir,
                 None,
                 Some(&mut on_step as &mut dyn FnMut(StepUpdate) -> StepAction),
@@ -2992,6 +3635,7 @@ pub fn run_planned_problem_with_callback_and_fem_mesh_identity_and_relax_handoff
         .extend(spin_wave_sampling::requested_finite_k_artifacts(
             problem, plan, output_dir,
         )?);
+    append_parallel_execution_provenance(&mut executed, &parallel_execution)?;
 
     if let Err(e) = artifacts::write_artifacts(
         output_dir,
@@ -3041,6 +3685,7 @@ pub fn run_planned_problem_with_callback_and_fem_mesh_identity_and_relax_handoff
         ],
         BackendPlanIR::Fem(_)
         | BackendPlanIR::FemEigen(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_)
         | BackendPlanIR::FemFrequencyResponse(_) => [0, 0, 0],
     };
     on_step(StepUpdate {
@@ -3275,9 +3920,77 @@ pub fn run_planned_problem_with_live_preview_interruptible_with_initial_snapshot
     display_selection: &(dyn Fn() -> DisplaySelectionState + Send + Sync),
     interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
     initial_snapshot: bool,
-    mut on_step: impl FnMut(StepUpdate) -> StepAction + Send,
+    on_step: impl FnMut(StepUpdate) -> StepAction + Send,
 ) -> Result<RunResult, RunError> {
+    run_planned_problem_with_live_preview_artifact_context(
+        problem,
+        plan,
+        fem_mesh_identity,
+        until_seconds,
+        output_dir,
+        autosave_root,
+        field_every_n,
+        display_selection,
+        interrupt_requested,
+        initial_snapshot,
+        on_step,
+        None,
+    )
+}
+
+/// Execute an FMR plan with exact artifact ownership.
+/// Native execution requires the FEM feature; dense execution must be explicit.
+/// Identity is runner-owned and does not change the canonical ProblemIR.
+pub fn run_planned_problem_with_live_preview_and_artifact_identity(
+    problem: &ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    fem_mesh_identity: Option<&StageFemMeshIdentity>,
+    until_seconds: f64,
+    output_dir: &Path,
+    autosave_root: &Path,
+    field_every_n: u64,
+    display_selection: &(dyn Fn() -> DisplaySelectionState + Send + Sync),
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+    initial_snapshot: bool,
+    on_step: impl FnMut(StepUpdate) -> StepAction + Send,
+    artifact_identity: &eigen::FrequencyDomainArtifactIdentity,
+) -> Result<RunResult, RunError> {
+    run_planned_problem_with_live_preview_artifact_context(
+        problem,
+        plan,
+        fem_mesh_identity,
+        until_seconds,
+        output_dir,
+        autosave_root,
+        field_every_n,
+        display_selection,
+        interrupt_requested,
+        initial_snapshot,
+        on_step,
+        Some(artifact_identity),
+    )
+}
+
+fn run_planned_problem_with_live_preview_artifact_context(
+    problem: &ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    fem_mesh_identity: Option<&StageFemMeshIdentity>,
+    until_seconds: f64,
+    output_dir: &Path,
+    autosave_root: &Path,
+    field_every_n: u64,
+    display_selection: &(dyn Fn() -> DisplaySelectionState + Send + Sync),
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+    initial_snapshot: bool,
+    mut on_step: impl FnMut(StepUpdate) -> StepAction + Send,
+    artifact_identity: Option<&eigen::FrequencyDomainArtifactIdentity>,
+) -> Result<RunResult, RunError> {
+    require_magnetic_execution_plan(plan)?;
+    require_frequency_response_artifact_identity(plan, artifact_identity)?;
+    let execution_problem = bind_fem_execution_stage_identity(problem, plan)?;
+    let problem = execution_problem.as_ref();
     require_resolved_runtime_sampling(problem, plan)?;
+    let parallel_execution = validate_parallel_execution_workflow(problem, plan)?;
     if let fullmag_ir::StudyIR::Hysteresis { .. } = &problem.study {
         return hysteresis::run_planned_hysteresis_with_live_preview(
             problem,
@@ -3295,7 +4008,12 @@ pub fn run_planned_problem_with_live_preview_interruptible_with_initial_snapshot
     }
     let fem_stage_context = fem_mesh_identity
         .cloned()
-        .map(types::FemStageExecutionContext::from_mesh_identity);
+        .map(types::FemStageExecutionContext::from_mesh_identity)
+        .or_else(|| {
+            artifact_identity.and_then(|_| {
+                types::FemStageExecutionContext::from_backend_plan(&plan.backend_plan)
+            })
+        });
     let mut artifact_pipeline =
         artifact_pipeline::ArtifactPipeline::start_for_problem_and_plan_with_autosave_root(
             problem,
@@ -3413,6 +4131,10 @@ pub fn run_planned_problem_with_live_preview_interruptible_with_initial_snapshot
         }
         BackendPlanIR::FemEigen(fem) => {
             let execution = dispatch::resolve_planned_fem_eigen_execution(problem, plan, fem)?;
+            let producer_identity =
+                fem::eigen_equilibrium_contract::FemRelaxationProducerStageIdentity::from_problem(
+                    problem,
+                );
             let mut progress_callback = |progress| {
                 on_step(fem_eigen_progress_update(
                     progress,
@@ -3421,17 +4143,24 @@ pub fn run_planned_problem_with_live_preview_interruptible_with_initial_snapshot
                         .and_then(|context| context.generation_id()),
                 ))
             };
-            dispatch::execute_fem_eigen_with_progress(
+            dispatch::execute_fem_eigen_with_progress_and_producer_identity_and_parallel_policy(
                 execution,
                 fem,
                 &runtime_outputs,
                 &mut progress_callback,
+                producer_identity.as_ref(),
+                &parallel_execution.policy,
+                Some(output_dir),
             )
         }
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            Err(antenna_plan_requires_dedicated_inspection())
+        }
         BackendPlanIR::FemFrequencyResponse(response) => {
-            frequency_response::execute_fem_frequency_response_validation_with_context(
+            frequency_response::execute_fem_frequency_response_validation_with_artifact_context(
                 response,
                 fem_stage_context.as_ref().expect("FEM stage context"),
+                artifact_identity,
                 output_dir,
                 interrupt_requested,
                 Some(&mut on_step as &mut dyn FnMut(StepUpdate) -> StepAction),
@@ -3462,6 +4191,7 @@ pub fn run_planned_problem_with_live_preview_interruptible_with_initial_snapshot
         .extend(spin_wave_sampling::requested_finite_k_artifacts(
             problem, plan, output_dir,
         )?);
+    append_parallel_execution_provenance(&mut executed, &parallel_execution)?;
 
     if let Err(e) = artifacts::write_artifacts(
         output_dir,
@@ -3498,6 +4228,7 @@ pub fn run_planned_problem_with_live_preview_interruptible_with_initial_snapshot
         ],
         BackendPlanIR::Fem(_)
         | BackendPlanIR::FemEigen(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_)
         | BackendPlanIR::FemFrequencyResponse(_) => [0, 0, 0],
     };
     let final_m = match &plan.backend_plan {
@@ -3511,6 +4242,7 @@ pub fn run_planned_problem_with_live_preview_interruptible_with_initial_snapshot
         ),
         BackendPlanIR::Fem(_)
         | BackendPlanIR::FemEigen(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_)
         | BackendPlanIR::FemFrequencyResponse(_) => None,
     };
     let cached_preview_fields = if matches!(plan.backend_plan, BackendPlanIR::Fdm(_))
@@ -3797,6 +4529,8 @@ pub fn run_problem_with_interactive_fem_runtime_live_preview_interruptible(
     mut on_step: impl FnMut(StepUpdate) -> StepAction + Send,
 ) -> Result<RunResult, RunError> {
     let plan = fullmag_plan::plan(problem)?;
+    let execution_problem = bind_fem_execution_stage_identity(problem, &plan)?;
+    let problem = execution_problem.as_ref();
     require_physics_graph_runtime_provenance(problem, &plan)?;
     let BackendPlanIR::Fem(fem) = &plan.backend_plan else {
         return Err(RunError {
@@ -4112,6 +4846,16 @@ pub fn snapshot_problem_preview(
     request: &LivePreviewRequest,
 ) -> Result<LivePreviewField, RunError> {
     let plan = fullmag_plan::plan(problem)?;
+    snapshot_planned_problem_preview(problem, &plan, request)
+}
+
+/// Observe an already materialized plan without discarding its field bases.
+pub fn snapshot_planned_problem_preview(
+    problem: &ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    request: &LivePreviewRequest,
+) -> Result<LivePreviewField, RunError> {
+    require_physics_graph_runtime_provenance(problem, plan)?;
     match &plan.backend_plan {
         BackendPlanIR::Fdm(fdm) => {
             let engine = dispatch::resolve_fdm_engine_for_plan_with_trail(problem, fdm)?.engine;
@@ -4142,6 +4886,9 @@ pub fn snapshot_problem_preview(
                 "interactive preview snapshot is not supported for FEM frequency-response plans"
                     .to_string(),
         }),
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            Err(antenna_plan_requires_dedicated_inspection())
+        }
     }
 }
 
@@ -4151,6 +4898,17 @@ pub fn snapshot_problem_vector_fields(
     request: &LivePreviewRequest,
 ) -> Result<Vec<LivePreviewField>, RunError> {
     let plan = fullmag_plan::plan(problem)?;
+    snapshot_planned_problem_vector_fields(problem, &plan, quantities, request)
+}
+
+/// Materialize vector observations from the exact prepared consumer plan.
+pub fn snapshot_planned_problem_vector_fields(
+    problem: &ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    quantities: &[&str],
+    request: &LivePreviewRequest,
+) -> Result<Vec<LivePreviewField>, RunError> {
+    require_physics_graph_runtime_provenance(problem, plan)?;
     match &plan.backend_plan {
         BackendPlanIR::Fdm(fdm) => {
             let engine = dispatch::resolve_fdm_engine_for_plan_with_trail(problem, fdm)?.engine;
@@ -4181,6 +4939,9 @@ pub fn snapshot_problem_vector_fields(
                 "interactive vector-field snapshots are not supported for FEM frequency-response plans"
                     .to_string(),
         }),
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            Err(antenna_plan_requires_dedicated_inspection())
+        }
     }
 }
 
@@ -4188,6 +4949,231 @@ pub fn snapshot_problem_vector_fields(
 pub struct ProblemVectorFieldBatch {
     pub fields: Vec<LivePreviewField>,
     pub auxiliary_artifacts: Vec<AuxiliaryArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AntennaFieldSolveQuantity {
+    pub quantity_id: String,
+    pub unit: String,
+    pub component_count: u8,
+    pub component_order: String,
+    pub location: String,
+    pub scope: String,
+    pub revision: u64,
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AntennaFieldSolveResult {
+    pub schema_version: String,
+    pub stage_id: String,
+    pub port_mode_id: String,
+    pub solution_id: String,
+    pub field_solution: AntennaFieldSolutionSamples,
+    pub quantities: Vec<AntennaFieldSolveQuantity>,
+    pub auxiliary_artifacts: Vec<AuxiliaryArtifact>,
+    pub transport_provenance: Vec<TransportExecutionProvenance>,
+}
+
+/// Execute only the static charge -> RT0 -> Oersted antenna pipeline.
+/// No magnetization state, LLG integrator, relaxation loop, or time step is
+/// created by this entry point.
+#[cfg(feature = "fem-gpu")]
+pub fn execute_antenna_field_solve_plan(
+    plan: &fullmag_ir::AntennaFieldSolvePlanIR,
+) -> Result<AntennaFieldSolveResult, RunError> {
+    execute_antenna_field_solve_plan_with_interrupt(plan, None, None)
+}
+
+/// Execute the static antenna solve while observing an optional interrupt
+/// signal between charge, RT0/Oersted, and artifact-materialization blocks.
+/// The native solve itself remains non-preemptive; cancellation is reported
+/// before a ready result can be returned to the publisher.
+#[cfg(feature = "fem-gpu")]
+pub fn execute_antenna_field_solve_plan_interruptible(
+    plan: &fullmag_ir::AntennaFieldSolvePlanIR,
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<AntennaFieldSolveResult, RunError> {
+    execute_antenna_field_solve_plan_with_interrupt(plan, interrupt_requested, None)
+}
+
+#[cfg(feature = "fem-gpu")]
+pub fn execute_antenna_field_solve_plan_with_progress_interruptible(
+    plan: &fullmag_ir::AntennaFieldSolvePlanIR,
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+    progress: &mut dyn FnMut(AntennaFieldStageStatus, Option<String>) -> Result<(), RunError>,
+) -> Result<AntennaFieldSolveResult, RunError> {
+    execute_antenna_field_solve_plan_with_interrupt(plan, interrupt_requested, Some(progress))
+}
+
+#[cfg(feature = "fem-gpu")]
+fn execute_antenna_field_solve_plan_with_interrupt(
+    plan: &fullmag_ir::AntennaFieldSolvePlanIR,
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+    progress: Option<
+        &mut dyn FnMut(AntennaFieldStageStatus, Option<String>) -> Result<(), RunError>,
+    >,
+) -> Result<AntennaFieldSolveResult, RunError> {
+    if plan.schema_version != fullmag_ir::ANTENNA_FIELD_SOLVE_PLAN_SCHEMA_VERSION {
+        return Err(RunError {
+            message: format!(
+                "unsupported antenna field-solve plan schema '{}'",
+                plan.schema_version
+            ),
+        });
+    }
+    if plan.conductor.charge_transport_plans.len() != 1 {
+        return Err(RunError {
+            message:
+                "antenna_field_solve_plan.v1 requires exactly one charge-only CurrentTransport"
+                    .into(),
+        });
+    }
+    let request = plan.conductor.charge_transport_plans[0]
+        .antenna_field_solution_request
+        .as_ref()
+        .ok_or_else(|| RunError {
+            message: "antenna field-solve plan has no bound field-solution request".into(),
+        })?;
+    if request.stage_id != plan.stage_id
+        || request.port_mode_id != plan.port_mode_id
+        || request.solution_id != plan.solution_id
+        || request.source_object_id != plan.source_object_id
+    {
+        return Err(RunError {
+            message: "antenna field-solve plan identity disagrees with its bound charge request"
+                .into(),
+        });
+    }
+
+    let bundle = crate::native_fem::execute_native_fem_antenna_field_solve_plan_interruptible(
+        plan,
+        interrupt_requested,
+        progress,
+    )?
+    .ok_or_else(|| RunError {
+        message: "antenna field-solve plan produced no charge/Oersted result".into(),
+    })?;
+    if interrupt_requested.is_some_and(|signal| {
+        signal.load(std::sync::atomic::Ordering::Acquire)
+    }) {
+        return Err(RunError {
+            message: "antenna field solve cancelled before result materialization: interrupt_requested"
+                .into(),
+        });
+    }
+    let manifest_path = format!(
+        "antenna/field_solutions/{}/manifest.v1.json",
+        plan.solution_id
+    );
+    let manifest = bundle
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.relative_path == manifest_path)
+        .ok_or_else(|| RunError {
+            message: format!("antenna field-solve result is missing manifest '{manifest_path}'"),
+        })?;
+    let manifest_value: serde_json::Value =
+        serde_json::from_slice(&manifest.bytes).map_err(|error| RunError {
+            message: format!("parse antenna field-solve result manifest: {error}"),
+        })?;
+    let content_digest = manifest_value
+        .get("content_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| RunError {
+            message: "antenna field-solve result manifest has no content_digest".into(),
+        })?;
+    let field_solution = load_antenna_field_solution_samples(
+        &manifest.bytes,
+        &bundle.artifacts,
+        &plan.port_mode_id,
+        &plan.solution_id,
+        &plan.source_object_id,
+        content_digest,
+    )?;
+    let mut quantities = bundle
+        .field_snapshots
+        .iter()
+        .map(|snapshot| AntennaFieldSolveQuantity {
+            quantity_id: snapshot.name.clone(),
+            unit: fullmag_quantities::quantity_spec(&snapshot.name)
+                .map(|spec| spec.unit)
+                .unwrap_or("1")
+                .into(),
+            component_count: snapshot.component_count,
+            component_order: snapshot.component_order.clone(),
+            location: snapshot.location.clone(),
+            scope: snapshot.scope.clone(),
+            revision: snapshot.revision,
+            values: snapshot.values.clone(),
+        })
+        .collect::<Vec<_>>();
+    let sampling_scope = match &plan.field_sampling.domain {
+        fullmag_ir::FieldTargetIR::Global {} => "global".to_string(),
+        fullmag_ir::FieldTargetIR::Object { object_id } => format!("object:{object_id}"),
+        fullmag_ir::FieldTargetIR::Region {
+            object_id,
+            region_id,
+        } => format!("region:{object_id}:{region_id}"),
+    };
+    quantities.push(AntennaFieldSolveQuantity {
+        quantity_id: "H_ant_basis".into(),
+        unit: "A/m/A".into(),
+        component_count: 3,
+        component_order: "xyz".into(),
+        location: plan.field_sampling.location.clone(),
+        scope: sampling_scope,
+        revision: quantities.len() as u64 + 1,
+        values: field_solution
+            .magnetic_field_xyz_apm_per_a
+            .iter()
+            .flat_map(|value| value.iter().copied())
+            .collect(),
+    });
+
+    Ok(AntennaFieldSolveResult {
+        schema_version: "antenna_field_solve_result.v1".into(),
+        stage_id: plan.stage_id.clone(),
+        port_mode_id: plan.port_mode_id.clone(),
+        solution_id: plan.solution_id.clone(),
+        field_solution,
+        quantities,
+        auxiliary_artifacts: bundle.artifacts,
+        transport_provenance: bundle.provenance,
+    })
+}
+
+#[cfg(not(feature = "fem-gpu"))]
+pub fn execute_antenna_field_solve_plan(
+    _plan: &fullmag_ir::AntennaFieldSolvePlanIR,
+) -> Result<AntennaFieldSolveResult, RunError> {
+    Err(RunError {
+        message: "antenna field precomputation requires a runner built with the managed native FEM feature"
+            .into(),
+    })
+}
+
+#[cfg(not(feature = "fem-gpu"))]
+pub fn execute_antenna_field_solve_plan_interruptible(
+    _plan: &fullmag_ir::AntennaFieldSolvePlanIR,
+    _interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<AntennaFieldSolveResult, RunError> {
+    Err(RunError {
+        message: "antenna field precomputation requires a runner built with the managed native FEM feature"
+            .into(),
+    })
+}
+
+#[cfg(not(feature = "fem-gpu"))]
+pub fn execute_antenna_field_solve_plan_with_progress_interruptible(
+    _plan: &fullmag_ir::AntennaFieldSolvePlanIR,
+    _interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+    _progress: &mut dyn FnMut(AntennaFieldStageStatus, Option<String>) -> Result<(), RunError>,
+) -> Result<AntennaFieldSolveResult, RunError> {
+    Err(RunError {
+        message: "antenna field precomputation requires a runner built with the managed native FEM feature"
+            .into(),
+    })
 }
 
 /// Materialize vector fields together with separately scoped carriers such as
@@ -4198,37 +5184,17 @@ pub fn snapshot_problem_vector_field_batch(
     request: &LivePreviewRequest,
 ) -> Result<ProblemVectorFieldBatch, RunError> {
     let plan = fullmag_plan::plan(problem)?;
-    let fields = match &plan.backend_plan {
-        BackendPlanIR::Fdm(fdm) => {
-            let engine = dispatch::resolve_fdm_engine_for_plan_with_trail(problem, fdm)?.engine;
-            dispatch::snapshot_fdm_vector_fields(engine, fdm, quantities, request)
-        }
-        BackendPlanIR::FdmMultilayer(fdm) => {
-            let engine = dispatch::resolve_fdm_engine(problem)?;
-            if engine != dispatch::FdmEngine::CpuReference {
-                return Err(RunError {
-                    message: format!(
-                        "FDM multilayer interactive vector snapshots require CPU reference; resolved {:?} is not supported",
-                        engine
-                    ),
-                });
-            }
-            multilayer_reference::snapshot_vector_fields(fdm, quantities, request)
-        }
-        BackendPlanIR::Fem(fem) => {
-            let engine = dispatch::resolve_fem_engine(problem)?;
-            dispatch::snapshot_fem_vector_fields(engine, fem, quantities, request)
-        }
-        BackendPlanIR::FemEigen(_) => Err(RunError {
-            message: "interactive vector-field snapshots are not supported for FEM eigenmode plans"
-                .to_string(),
-        }),
-        BackendPlanIR::FemFrequencyResponse(_) => Err(RunError {
-            message:
-                "interactive vector-field snapshots are not supported for FEM frequency-response plans"
-                    .to_string(),
-        }),
-    }?;
+    snapshot_planned_problem_vector_field_batch(problem, &plan, quantities, request)
+}
+
+/// Preserve both prepared field bases and backend-owned observation artifacts.
+pub fn snapshot_planned_problem_vector_field_batch(
+    problem: &ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    quantities: &[&str],
+    request: &LivePreviewRequest,
+) -> Result<ProblemVectorFieldBatch, RunError> {
+    let fields = snapshot_planned_problem_vector_fields(problem, plan, quantities, request)?;
     let auxiliary_artifacts = match &plan.backend_plan {
         BackendPlanIR::FdmMultilayer(fdm)
             if quantities.iter().any(|quantity| {
@@ -4270,6 +5236,15 @@ pub fn resolve_planned_runtime_engine(
 ) -> Result<RuntimeEngineInfo, RunError> {
     require_supported_fem_topology(problem, plan)?;
     match &plan.backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
+            solver_runtime::registry::resolve_antenna_inspection_runtime(inspection, None)?;
+            Ok(RuntimeEngineInfo {
+                backend_family: "fem".into(),
+                engine_id: "fem_cpu_native".into(),
+                engine_label: "CPU FEM antenna inspection (MFEM)".into(),
+                accelerator: "cpu".into(),
+            })
+        }
         BackendPlanIR::Fdm(fdm) => {
             let engine = dispatch::resolve_fdm_engine_for_plan_with_trail(problem, fdm)?.engine;
             let (engine_id, engine_label, accelerator) = match engine {
@@ -4461,6 +5436,30 @@ pub fn resolve_planned_runtime_capabilities(
 ) -> Result<BackendCapabilities, RunError> {
     require_supported_fem_topology(problem, plan)?;
     match &plan.backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
+            solver_runtime::registry::resolve_antenna_inspection_runtime(inspection, None)?;
+            // V/J/H are published by the owned inspection resource, not by the
+            // generic magnetic preview or accepted-step observation providers.
+            Ok(BackendCapabilities {
+                engine_id: capabilities::RuntimeEngineId::FemCpuNative,
+                capability_profile_version: "antenna_external_lead_inspection.v1".into(),
+                supported_terms: Vec::new(),
+                term_scopes: Default::default(),
+                feature_capabilities: Default::default(),
+                supported_demag_realizations: Vec::new(),
+                preview_quantities: Vec::new(),
+                snapshot_quantities: Vec::new(),
+                scalar_outputs: Vec::new(),
+                resolved_quantity_registry: None,
+                approximate_operators: Vec::new(),
+                supports_frequency_response: false,
+                supports_coupled_magnetoelastic_quasistatic: false,
+                supports_coupled_magnetoelastic_elastodynamic: false,
+                supports_frequency_domain_elastodynamics: false,
+                supports_coupled_eigenmodes: false,
+                supports_lossy_fallback_override: false,
+            })
+        }
         BackendPlanIR::Fdm(fdm) => {
             let engine = dispatch::resolve_fdm_engine_for_plan_with_trail(problem, fdm)?.engine;
             let mut capabilities = capabilities_for_fdm_engine_with_precision(
@@ -4627,6 +5626,13 @@ pub(crate) fn resolve_planned_session_runtime_with_registry_and_preview(
     let resolved_cpu_threads = configured_cpu_threads(problem);
     let requested_cpu_threads = requested_cpu_threads(problem).map(|threads| threads as usize);
     let effective_requested_device = match &plan.backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
+            match inspection.requested_execution.device {
+                fullmag_ir::ExecutionDevice::Auto => "auto".into(),
+                fullmag_ir::ExecutionDevice::Cpu => "cpu".into(),
+                fullmag_ir::ExecutionDevice::Gpu => "gpu".into(),
+            }
+        }
         BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => {
             dispatch::requested_registry_device_for_fdm(problem)
         }
@@ -4730,7 +5736,11 @@ pub(crate) fn resolve_planned_session_runtime_with_registry_and_preview(
                 fem_crossover_decision: None,
             })
         }
-        (BackendPlanIR::Fem(_), dispatch::DispatchEngine::Fem(engine)) => {
+        (BackendPlanIR::Fem(_), dispatch::DispatchEngine::Fem(engine))
+        | (
+            BackendPlanIR::AntennaExternalLeadInspection(_),
+            dispatch::DispatchEngine::Fem(engine),
+        ) => {
             let (default_family, engine_id, default_worker) = fem_session_runtime_defaults(engine);
             Ok(ResolvedSessionRuntime {
                 requested_device: effective_requested_device,
@@ -4834,6 +5844,9 @@ pub(crate) fn resolve_planned_session_runtime_with_registry_and_preview(
 }
 
 pub(crate) fn requested_cpu_threads(problem: &ProblemIR) -> Option<u32> {
+    if let Ok(Some(resources)) = fullmag_ir::ComputeResourcesIR::from_problem(problem) {
+        return resources.cpu.threads.count();
+    }
     problem
         .problem_meta
         .runtime_metadata
@@ -4845,6 +5858,12 @@ pub(crate) fn requested_cpu_threads(problem: &ProblemIR) -> Option<u32> {
 }
 
 pub(crate) fn configured_cpu_threads(problem: &ProblemIR) -> usize {
+    if let Ok(Some(resources)) = fullmag_ir::ComputeResourcesIR::from_problem(problem) {
+        return resources.cpu.threads.count().map_or_else(
+            || resolve_auto_cpu_threads(default_cpu_threads(), None),
+            |threads| threads as usize,
+        );
+    }
     // 1. Explicit per-problem setting from runtime_metadata
     if let Some(threads) = requested_cpu_threads(problem).map(|threads| threads as usize) {
         return threads;
@@ -5143,9 +6162,105 @@ pub fn run_reference_fem_eigen(
     })
 }
 
+/// Hidden process-worker entry point used by the adaptive independent-k pool.
+/// The CLI wrapper keeps the request/response protocol file based so startup
+/// diagnostics cannot be mistaken for solver output.
+pub fn run_eigen_k_worker_request_file(
+    request_path: &std::path::Path,
+) -> Result<(), RunError> {
+    fem::eigen_k_worker::run_request_file(request_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eigen_progress_keeps_residual_separate_from_physical_field() {
+        let update = fem_eigen_progress_update(
+            fem_eigen::FemEigenProgress {
+                phase: "solving_native_frequency_window_base",
+                solver_kind: "slepc_multi_shift_invert_production_cpu_dense",
+                residual: Some(2.5e-7),
+                ..Default::default()
+            },
+            None,
+        );
+        let progress = match update
+            .stats
+            .solver_progress
+            .as_ref()
+            .expect("typed progress channel")
+        {
+            fullmag_quantities::SolverProgress::FemEigen { metrics } => metrics,
+        };
+        assert_eq!(update.stats.kind, fullmag_quantities::StepDataKind::SolverProgress);
+        assert!(update.stats.per_object_scalars.is_empty());
+        assert_eq!(progress["residual"], 2.5e-7);
+        assert_eq!(
+            progress["solver_kind:slepc_multi_shift_invert_production_cpu_dense"],
+            1.0
+        );
+        assert_eq!(
+            progress["phase_kind:solving_native_frequency_window_base"],
+            1.0
+        );
+        assert_eq!(update.stats.max_h_eff, 0.0);
+        assert!(!update.scalar_row_due);
+
+        let v2 = update.to_v2();
+        assert!(v2.validate().is_ok());
+        assert_eq!(v2.diagnostics.kind, fullmag_quantities::StepDataKind::SolverProgress);
+        assert_eq!(v2.scalars.kind, fullmag_quantities::StepDataKind::SolverProgress);
+        assert!(v2.diagnostics.solver_progress.is_some());
+        assert!(v2.scalars.per_object_scalars.is_empty());
+        assert_eq!(v2.scalars.scalar_value("max_h_eff"), None);
+    }
+
+    #[test]
+    fn eigen_progress_keeps_ksp_norm_diagnostic_and_separate_from_eps_and_subwindow() {
+        let update = fem_eigen_progress_update(
+            fem_eigen::FemEigenProgress {
+                phase: "solving_native_frequency_window_base",
+                iteration: Some(17),
+                max_iterations: Some(300),
+                current_subwindow: Some(23),
+                total_subwindows: Some(50),
+                linear_solve: Some(crate::fem::eigen_progress::FemEigenLinearProgress {
+                    linear_iteration: 12,
+                    linear_residual_norm: Some(4.5e-8),
+                    linear_solver_role: "poisson",
+                    linear_ksp_type: Some("gmres"),
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+        let progress = match update
+            .stats
+            .solver_progress
+            .as_ref()
+            .expect("typed progress channel")
+        {
+            fullmag_quantities::SolverProgress::FemEigen { metrics } => metrics,
+        };
+        assert_eq!(update.stats.kind, fullmag_quantities::StepDataKind::SolverProgress);
+        assert!(update.stats.per_object_scalars.is_empty());
+
+        assert_eq!(progress["iteration"], 17.0);
+        assert_eq!(progress["max_iterations"], 300.0);
+        assert_eq!(progress["current_subwindow"], 23.0);
+        assert_eq!(progress["total_subwindows"], 50.0);
+        assert_eq!(progress["linear_iteration"], 12.0);
+        assert_eq!(progress["linear_residual_norm"], 4.5e-8);
+        assert_eq!(progress["linear_solver_role:poisson"], 1.0);
+        assert_eq!(progress["linear_ksp_type:gmres"], 1.0);
+        assert_eq!(progress["residual_source:ksp_norm"], 1.0);
+        assert!(!progress.contains_key("residual"));
+        assert_eq!(update.stats.max_h_eff, 0.0);
+        assert!(!update.scalar_row_due);
+    }
+
     use fullmag_ir::{
         CurrentModuleIR, CurrentTransportModelIR, ExchangeBoundaryCondition, ExecutionPrecision,
         FdmMaterialIR, GridDimensions, IntegratorChoice, MeshIR,
@@ -5160,6 +6275,61 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn antenna_inspection_cannot_enter_magnetic_run_before_artifact_writes() {
+        let source = include_str!("lib.rs");
+        for function in [
+            "fn run_planned_problem_with_artifact_context(",
+            "fn run_planned_problem_with_callback_artifact_context(",
+            "fn run_planned_problem_with_live_preview_artifact_context(",
+        ] {
+            let body = source.split(function).nth(1).expect("runner entrypoint");
+            let before_pipeline = body
+                .split("let mut artifact_pipeline")
+                .next()
+                .expect("entrypoint body");
+            assert!(
+                before_pipeline.contains("require_magnetic_execution_plan(plan)?;"),
+                "{function} must refuse antenna plans before creating artifacts"
+            );
+        }
+        let guard = source
+            .split("fn require_magnetic_execution_plan(")
+            .nth(1)
+            .expect("magnetic plan guard")
+            .split("fn run_planned_problem_with_artifact_context(")
+            .next()
+            .unwrap();
+        assert!(guard.contains("BackendPlanIR::AntennaExternalLeadInspection(_)"));
+        assert!(guard.contains("return Err(antenna_plan_requires_dedicated_inspection());"));
+    }
+
+    #[test]
+    fn antenna_inspection_does_not_advertise_generic_magnetic_quantity_providers() {
+        let source = include_str!("lib.rs");
+        let capabilities = source
+            .split("pub fn resolve_planned_runtime_capabilities(")
+            .nth(1)
+            .expect("capability resolver")
+            .split("BackendPlanIR::Fdm(fdm)")
+            .next()
+            .unwrap();
+        assert!(capabilities.contains("BackendPlanIR::AntennaExternalLeadInspection(inspection)"));
+        for field in [
+            "supported_terms: Vec::new()",
+            "supported_demag_realizations: Vec::new()",
+            "preview_quantities: Vec::new()",
+            "snapshot_quantities: Vec::new()",
+            "scalar_outputs: Vec::new()",
+            "resolved_quantity_registry: None",
+        ] {
+            assert!(
+                capabilities.contains(field),
+                "missing nonmagnetic contract: {field}"
+            );
+        }
+    }
 
     #[test]
     fn managed_fdm_gpu_override_is_the_effective_request_without_erasing_authored_cpu_intent() {
@@ -5492,8 +6662,8 @@ mod tests {
                 .expect("lib.rs should contain production code")
                 .matches("require_resolved_runtime_sampling(problem, plan)?;")
                 .count(),
-            7,
-            "all seven public planned runner entry points must fail closed before dispatch"
+            8,
+            "all eight public planned runner entry points must fail closed before dispatch"
         );
         let interactive_source = fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -5772,6 +6942,50 @@ mod tests {
         certified_mixed_cpu_relaxation_guard_fixture_for_layers(1)
     }
 
+    #[test]
+    fn standalone_fem_producer_identity_is_allocated_before_execution_and_preserves_caller() {
+        let (problem, plan) = certified_mixed_cpu_relaxation_guard_fixture();
+        let first = bind_fem_execution_stage_identity(&problem, &plan).expect("first execution");
+        let second = bind_fem_execution_stage_identity(&problem, &plan).expect("second execution");
+        let first_id = fem::eigen_equilibrium_contract::FemRelaxationProducerStageIdentity::from_problem(first.as_ref())
+            .expect("bound producer identity");
+        let second_id = fem::eigen_equilibrium_contract::FemRelaxationProducerStageIdentity::from_problem(second.as_ref())
+            .expect("second producer identity");
+        assert_ne!(first_id.run_id, second_id.run_id);
+        assert_eq!(first_id.stage_id, "stage-001");
+        assert_eq!(first_id.stage_kind, "relaxation");
+        assert!(!problem.problem_meta.runtime_metadata.contains_key("producer_run_id"));
+        let preserved = bind_fem_execution_stage_identity(first.as_ref(), &plan).expect("explicit identity");
+        assert!(matches!(preserved, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(
+            fem::eigen_equilibrium_contract::FemRelaxationProducerStageIdentity::from_problem(preserved.as_ref()),
+            Some(first_id),
+        );
+    }
+
+    #[test]
+    fn standalone_fem_producer_identity_rejects_partial_or_invalid_caller_metadata() {
+        let (problem, plan) = certified_mixed_cpu_relaxation_guard_fixture();
+        for invalid in [
+            json!({"producer_run_id": "source-run"}),
+            json!({"producer_run_id": "source-run", "producer_stage_id": "stage-001", "producer_stage_kind": null}),
+            json!({"producer_run_id": " ", "producer_stage_id": "stage-001", "producer_stage_kind": "relaxation"}),
+        ] {
+            let mut candidate = problem.clone();
+            for (key, value) in invalid.as_object().expect("metadata object") {
+                candidate.problem_meta.runtime_metadata.insert(key.clone(), value.clone());
+            }
+            let error = bind_fem_execution_stage_identity(&candidate, &plan).expect_err("invalid producer metadata");
+            assert_eq!(error.message, "fem_producer_stage_identity_incomplete_or_invalid");
+        }
+        let fdm_problem = ProblemIR::bootstrap_example();
+        let fdm_plan = fullmag_plan::plan(&fdm_problem).expect("FDM plan");
+        assert!(matches!(
+            bind_fem_execution_stage_identity(&fdm_problem, &fdm_plan).expect("unrelated lane"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
     fn topology_guard_error(
         problem: &fullmag_ir::ProblemIR,
         plan: &fullmag_ir::ExecutionPlanIR,
@@ -5991,7 +7205,7 @@ mod tests {
     fn fem_topology_guard_fully_bound_mixed_frequency_plan_reaches_scope_rejection() {
         let (problem, plan) = certified_mixed_topology_guard_fixture();
 
-        let expected = "fem_mixed_p1_runtime_scope_rejected: study=fem_frequency_response; requested_device=cpu; precision=Double; required=explicit_cpu_or_gpu+strict+double+P1+exchange+poisson_robin_or_dirichlet+PG_BB_or_NCG_or_LLG_overdamped; failed_predicates=[fem_relaxation_plan_missing,demag_count_not_one,study_not_relaxation]; fallback=none";
+        let expected = "fem_mixed_p1_runtime_scope_rejected: study=fem_frequency_response; requested_device=cpu; precision=Double; required=explicit_cpu_or_gpu+strict+double+P1+exchange+poisson_robin_or_dirichlet+relaxation_PG_BB_NCG_LLG_overdamped_or_time_evolution_heun_rk4_rk23_rk45+regional_field_drive_supported_by_time_evolution; failed_predicates=[fem_relaxation_plan_missing,demag_count_not_one,study_not_relaxation_or_time_evolution]; fallback=none";
         let actual = topology_guard_error(&problem, &plan);
         assert_eq!(actual, expected);
         for false_plan_predicate in [
@@ -6185,7 +7399,7 @@ mod tests {
     }
 
     #[test]
-    fn fem_topology_guard_accepts_only_bound_cpu_double_relaxation_scope() {
+    fn fem_topology_guard_bound_strict_double_scope_rejects_unbound_or_unsupported_scope() {
         let (problem, plan) = certified_mixed_cpu_relaxation_guard_fixture();
         require_supported_fem_topology(&problem, &plan)
             .expect("bound CPU-double mixed P1 relaxation must cross the runner guard");
@@ -6214,16 +7428,16 @@ mod tests {
             .expect("bound v3 CPU-double mixed P1 relaxation must cross the runner guard");
 
         for case in [
-            "gpu",
+            "device_provenance_mismatch",
             "single",
             "extended",
-            "time_evolution",
+            "unsupported_time_integrator",
             "unsupported_status",
         ] {
             let mut rejected_problem = problem.clone();
             let mut rejected_plan = plan.clone();
             match case {
-                "gpu" => {
+                "device_provenance_mismatch" => {
                     rejected_problem.problem_meta.runtime_metadata.insert(
                         "runtime_selection".to_string(),
                         json!({"device": "gpu", "precision": "double"}),
@@ -6237,8 +7451,14 @@ mod tests {
                     rejected_problem.validation_profile.execution_mode =
                         fullmag_ir::ExecutionMode::Extended;
                 }
-                "time_evolution" => {
-                    rejected_problem.study = fullmag_ir::ProblemIR::bootstrap_example().study;
+                "unsupported_time_integrator" => {
+                    let bootstrap = fullmag_ir::ProblemIR::bootstrap_example();
+                    rejected_problem.study = bootstrap.study;
+                    let BackendPlanIR::Fem(fem) = &mut rejected_plan.backend_plan else {
+                        unreachable!()
+                    };
+                    fem.relaxation = None;
+                    fem.integrator = Some(IntegratorChoice::Abm3);
                 }
                 "unsupported_status" => {
                     let BackendPlanIR::Fem(fem) = &mut rejected_plan.backend_plan else {
@@ -6255,6 +7475,21 @@ mod tests {
             }
             let error = require_supported_fem_topology(&rejected_problem, &rejected_plan)
                 .expect_err("runner must fail closed outside the qualified mixed P1 tuple");
+            if case == "device_provenance_mismatch" {
+                assert_eq!(
+                    error.message,
+                    "fem_mixed_p1_runtime_provenance_stale: authored/managed device metadata does not match plan-bound effective device; fallback=none"
+                );
+            }
+            if case == "unsupported_time_integrator" {
+                assert!(
+                    error
+                        .message
+                        .contains("study_time_evolution_integrator_unsupported"),
+                    "case={case}: {}",
+                    error.message
+                );
+            }
             assert!(
                 error
                     .message
@@ -6678,7 +7913,9 @@ mod tests {
                 body.contains("hysteresis::run_planned_hysteresis")
                     || body.contains(
                         "run_planned_problem_with_callback_and_fem_mesh_identity_and_relax_handoff(",
-                    ),
+                    )
+                    || body.contains("run_planned_problem_with_artifact_context(")
+                    || body.contains("run_planned_problem_with_live_preview_artifact_context("),
                 "{entrypoint} bypasses the shared hysteresis owner"
             );
         }
@@ -6796,9 +8033,14 @@ mod tests {
         };
 
         let pgbb = row("Relaxation(projected_gradient_bb)");
-        assert!(pgbb.contains("fem_cpu_native"), "{pgbb}");
-        assert!(pgbb.contains("fem_native_gpu"), "{pgbb}");
-        assert!(pgbb.contains("native FEM CPU/MFEM/CUDA"), "{pgbb}");
+        assert!(pgbb.contains("FEM CPU/GPU development executable"), "{pgbb}");
+        assert!(pgbb.contains("**planned**"), "{pgbb}");
+        assert!(pgbb.contains("**unvalidated**"), "{pgbb}");
+        assert!(
+            pgbb.contains("No exact source-bound managed receipt exists"),
+            "{pgbb}"
+        );
+        assert!(pgbb.contains("not production-qualified"), "{pgbb}");
         assert!(pgbb.contains("mu0 Ms V"), "{pgbb}");
         assert!(pgbb.contains("m/A"), "{pgbb}");
         assert!(pgbb.contains("owns no RK"), "{pgbb}");
@@ -6814,9 +8056,14 @@ mod tests {
         );
 
         let ncg = row("Relaxation(nonlinear_cg)");
-        assert!(ncg.contains("fem_cpu_native"), "{ncg}");
-        assert!(ncg.contains("fem_native_gpu"), "{ncg}");
-        assert!(ncg.contains("native FEM CPU/MFEM/CUDA"), "{ncg}");
+        assert!(ncg.contains("FEM CPU/GPU development executable"), "{ncg}");
+        assert!(ncg.contains("**planned**"), "{ncg}");
+        assert!(ncg.contains("**unvalidated**"), "{ncg}");
+        assert!(
+            ncg.contains("No exact source-bound managed receipt exists"),
+            "{ncg}"
+        );
+        assert!(ncg.contains("not production-qualified"), "{ncg}");
         assert!(ncg.contains("same physical energy metric"), "{ncg}");
         assert!(ncg.contains("m/A"), "{ncg}");
         assert!(ncg.contains("owns no RK"), "{ncg}");
@@ -6832,11 +8079,12 @@ mod tests {
         );
 
         let tpi = row("Relaxation(tangent_plane_implicit)");
-        assert!(tpi.contains("CPU/MFEM development-only"), "{tpi}");
         assert!(
-            tpi.contains("**under-development** (native FEM CPU/MFEM only)"),
+            tpi.contains("CPU/MFEM development-only in extended mode; forced GPU unsupported"),
             "{tpi}"
         );
+        assert!(tpi.contains("**planned**"), "{tpi}");
+        assert!(tpi.contains("**unvalidated**"), "{tpi}");
         assert!(tpi.contains("Strict mode rejects TPI"), "{tpi}");
         assert!(tpi.contains("Forced GPU rejects"), "{tpi}");
         assert!(tpi.contains("no hidden GPU-to-CPU fallback"), "{tpi}");
@@ -8186,6 +9434,26 @@ mod tests {
         assert_eq!(configured_cpu_threads(&problem), 7);
     }
 
+    #[test]
+    fn typed_cpu_request_reaches_runner_and_preserves_auto() {
+        let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        problem.problem_meta.runtime_metadata.insert(
+            "compute_resources".into(),
+            json!({"schema_version":"compute_resources.v1", "cpu":{"threads":3}}),
+        );
+        assert_eq!(requested_cpu_threads(&problem), Some(3));
+        assert_eq!(configured_cpu_threads(&problem), 3);
+        problem.problem_meta.runtime_metadata.insert(
+            "compute_resources".into(),
+            json!({"schema_version":"compute_resources.v1", "cpu":{"threads":"auto"}}),
+        );
+        assert_eq!(requested_cpu_threads(&problem), None);
+        assert_eq!(
+            configured_cpu_threads(&problem),
+            resolve_auto_cpu_threads(default_cpu_threads(), None)
+        );
+    }
+
     fn fem_session_runtime_problem() -> fullmag_ir::ProblemIR {
         let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
         problem.backend_policy.requested_backend = fullmag_ir::BackendTarget::Fem;
@@ -8792,6 +10060,8 @@ mod tests {
             std::env::remove_var("FULLMAG_FDM_EXECUTION");
         }
         let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        // Positive fallback coverage requires an authored mode that permits fallback.
+        problem.validation_profile.execution_mode = fullmag_ir::ExecutionMode::Extended;
         problem
             .problem_meta
             .runtime_metadata
@@ -8831,6 +10101,8 @@ mod tests {
             std::env::remove_var("FULLMAG_FDM_EXECUTION");
         }
         let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        // Positive fallback coverage requires an authored mode that permits fallback.
+        problem.validation_profile.execution_mode = fullmag_ir::ExecutionMode::Extended;
         problem
             .problem_meta
             .runtime_metadata
@@ -9469,7 +10741,12 @@ mod tests {
 
     #[test]
     fn run_problem_writes_prescribed_current_transport_artifact() {
+        let _guard = ENV_LOCK.lock().expect("lock FDM execution environment");
         let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        // This fixture verifies current artifacts, not device availability fallback.
+        problem.problem_meta.runtime_metadata.insert(
+            "runtime_selection".to_string(), json!({"device": "cpu"}),
+        );
         problem
             .current_modules
             .push(CurrentModuleIR::CurrentTransport {

@@ -2,10 +2,19 @@
 
 mod api_sidecar;
 mod commands;
+mod compute_probe;
+mod provenance;
+mod recent_index;
+mod script_run;
+mod script_run_core;
+mod script_run_process;
+mod script_save;
+mod workspace_commands;
 
 use api_sidecar::ApiSidecar;
 use commands::AppConfig;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use workspace_commands::WorkspaceHost;
 
 fn main() {
     let launch_intent =
@@ -19,6 +28,14 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .setup(move |app| {
+            let workspace = WorkspaceHost::default();
+            app.manage(workspace.clone());
+            app.manage(script_run::ScriptRunHost::default());
+            // Runs an earlier session left without a database event are recorded now.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || script_run::reconcile_at_startup(&handle, &workspace));
+            }
             let (url, sidecar) = if let Some(ref url) = external_url {
                 let api_base = std::env::var("FULLMAG_API_BASE")
                     .unwrap_or_else(|_| "http://localhost:8083".into());
@@ -32,12 +49,13 @@ fn main() {
                 let sidecar =
                     ApiSidecar::start().map_err(|e| Box::<dyn std::error::Error>::from(e))?;
                 let base = sidecar.base_url();
+                let ui_url = sidecar.ui_url();
                 app.manage(AppConfig {
                     api_base: base.clone(),
-                    ui_url: base.clone(),
+                    ui_url: ui_url.clone(),
                     launch_intent: launch_intent.clone(),
                 });
-                (base, Some(sidecar))
+                (ui_url, Some(sidecar))
             };
 
             let parsed_url: url::Url = url.parse().map_err(|error| {
@@ -54,7 +72,8 @@ fn main() {
                 .center()
                 .build()?;
 
-            if let Some(sidecar) = sidecar {
+            if let Some(mut sidecar) = sidecar {
+                sidecar.start_runtime_attach();
                 app.manage(sidecar);
             }
 
@@ -64,10 +83,39 @@ fn main() {
             commands::open_file_dialog,
             commands::open_project_dialog,
             commands::open_project_archive_dialog,
+            commands::pick_output_directory,
             commands::open_project_path,
+            commands::open_project_archive_path,
+            commands::app_build_info,
+            commands::author_identity,
+            commands::compute_probe,
+            commands::project_provenance_read,
+            commands::project_record_outcome,
+            commands::recent_index_read,
+            commands::recent_index_rebuild,
+            commands::recent_index_pin,
+            commands::recent_index_forget,
             commands::save_project_archive,
             commands::reveal_in_file_manager,
             commands::get_app_config,
+            workspace_commands::workspace_list,
+            workspace_commands::workspace_pin,
+            workspace_commands::workspace_forget,
+            workspace_commands::workspace_history,
+            workspace_commands::workspace_open_script_dialog,
+            workspace_commands::workspace_open_script,
+            workspace_commands::workspace_reveal,
+            workspace_commands::workspace_read_script_text,
+            script_run::script_pick,
+            script_run::script_open_recent,
+            script_run::script_preflight,
+            script_run::script_run,
+            script_run::script_run_status,
+            script_run::script_run_stop,
+            script_run::script_trust_forget,
+            script_run::python_interpreter_status,
+            script_run::python_interpreter_set,
+            script_save::script_save_new,
         ])
         .run(tauri::generate_context!())
         .expect("error while running fullmag-ui");

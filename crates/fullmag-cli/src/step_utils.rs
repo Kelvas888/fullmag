@@ -2,8 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use fullmag_ir::{BackendPlanIR, OutputIR, ProblemIR, RegionalFieldDriveIR, TableAutosaveIR};
+use fullmag_ir::{BackendPlanIR, ProblemIR};
+#[cfg(test)]
+use fullmag_ir::{
+    OutputDataFormatIR, OutputIR, OutputStorageIR, RegionalFieldDriveIR, TableAutosaveIR,
+};
+#[cfg(test)]
 use serde_json::Value;
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 use fullmag_engine::fem::MeshTopology;
@@ -11,11 +17,24 @@ use fullmag_engine::fem_solution_transfer::{
     normalize_unit_vectors, transfer_fem_field_to_grid, GridTransferResult,
 };
 
+#[cfg(test)]
+use fullmag_application::script_stage_materialization::{
+    materialize_pipeline_eigenmodes, materialize_pipeline_relax,
+    propagate_disabled_transport_pipeline, requested_device, set_runtime_selection_device,
+};
+use fullmag_application::script_stage_materialization::{
+    materialize_script_stages_with_output_policy, required_study_dynamics,
+    resolve_relaxation_until_seconds,
+};
+
 use crate::formatting::unix_time_millis;
 use crate::live_workspace::LocalLiveWorkspace;
 use crate::types::{
-    LiveStateManifest, LiveStepView, ResolvedScriptStage, ResolvedScriptStageAction, RunManifest,
-    ScriptExecutionConfig, ScriptExecutionStageAction, StageTransitionKind,
+    LiveStateManifest, LiveStepView, ResolvedScriptStage, RunManifest, ScriptExecutionConfig,
+};
+#[cfg(test)]
+use crate::types::{
+    ResolvedScriptStageAction, ScriptExecutionStageAction, StageTransitionKind,
     StageTransitionMetadata, StageTransitionReason, StateTransferOperatorKind,
     StudyPipelineDocument, StudyPipelineNode,
 };
@@ -156,7 +175,10 @@ pub(crate) fn offset_step_update(
         status.source_step = status.source_step.saturating_add(step_offset);
     }
     for field in update.preview_field.iter_mut().chain(
-        update.cached_preview_fields.iter_mut().flat_map(|fields| fields.iter_mut()),
+        update
+            .cached_preview_fields
+            .iter_mut()
+            .flat_map(|fields| fields.iter_mut()),
     ) {
         // Explicit capture coordinates are stage-local, just like StepStats.
         // Legacy unstamped fields inherit the adjusted stats at ingestion.
@@ -378,6 +400,8 @@ pub(crate) fn live_state_manifest_from_update(
         runtime_status: Some(fullmag_runner::RuntimeStatus::from_status_code(status_str)),
         updated_at_unix_ms: unix_time_millis().unwrap_or(0),
         latest_step: LiveStepView {
+            kind: update.stats.kind.clone(),
+            solver_progress: update.stats.solver_progress.clone(),
             step: update.stats.step,
             time: update.stats.time,
             dt: update.stats.dt,
@@ -413,6 +437,7 @@ pub(crate) fn running_run_manifest_from_update(
     artifact_dir: &Path,
     update: &fullmag_runner::StepUpdate,
 ) -> RunManifest {
+    let physical = update.stats.is_physical_observation();
     RunManifest {
         run_id: run_id.to_string(),
         session_id: session_id.to_string(),
@@ -421,15 +446,21 @@ pub(crate) fn running_run_manifest_from_update(
         } else {
             "running".to_string()
         },
-        total_steps: update.stats.step as usize,
-        final_time: Some(update.stats.time),
-        final_e_ex: Some(update.stats.e_ex),
-        final_e_demag: Some(update.stats.e_demag),
-        final_e_ext: Some(update.stats.e_ext),
-        final_e_ani: Some(update.stats.e_ani),
-        final_e_dmi: Some(update.stats.e_dmi),
-        final_e_rotated_dmi: Some(update.stats.e_rotated_dmi),
-        final_e_total: Some(update.stats.e_total),
+        // Modal iteration/phase counters belong to progress diagnostics, not
+        // the number of accepted physical time-integration steps.
+        total_steps: if physical {
+            update.stats.step as usize
+        } else {
+            0
+        },
+        final_time: physical.then_some(update.stats.time),
+        final_e_ex: physical.then_some(update.stats.e_ex),
+        final_e_demag: physical.then_some(update.stats.e_demag),
+        final_e_ext: physical.then_some(update.stats.e_ext),
+        final_e_ani: physical.then_some(update.stats.e_ani),
+        final_e_dmi: physical.then_some(update.stats.e_dmi),
+        final_e_rotated_dmi: physical.then_some(update.stats.e_rotated_dmi),
+        final_e_total: physical.then_some(update.stats.e_total),
         artifact_dir: artifact_dir.display().to_string(),
     }
 }
@@ -454,6 +485,9 @@ pub(crate) fn initial_step_update(
     };
 
     match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            antenna_inspection_step_update(stats, false)
+        }
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: None,
             stats,
@@ -550,6 +584,29 @@ pub(crate) fn initial_step_update(
     }
 }
 
+fn antenna_inspection_step_update(
+    stats: fullmag_runner::StepStats,
+    finished: bool,
+) -> fullmag_runner::StepUpdate {
+    fullmag_runner::StepUpdate {
+        coupled_checkpoint: None,
+        stats,
+        grid: [0, 0, 0],
+        fem_mesh_generation_id: None,
+        magnetization: None,
+        preview_field: None,
+        cached_preview_fields: None,
+        hysteresis_field_m_t: None,
+        hysteresis_point_index: None,
+        hysteresis_settle_step_index: None,
+        hysteresis_settle_step_kind: None,
+        hysteresis_settle_step_method: None,
+        scalar_row_due: false,
+        terminal_field_snapshot: false,
+        finished,
+    }
+}
+
 fn initial_frequency_response_progress_scalars(
     fem: &fullmag_ir::FemFrequencyResponsePlanIR,
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, f64>> {
@@ -614,6 +671,9 @@ pub(crate) fn final_stage_step_update(
         .expect("single step should offset");
 
     Some(match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            antenna_inspection_step_update(stats, finished)
+        }
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: checkpoint,
             stats,
@@ -714,6 +774,9 @@ pub(crate) fn snapshot_step_update_from_stats(
     finished: bool,
 ) -> fullmag_runner::StepUpdate {
     match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            antenna_inspection_step_update(stats, finished)
+        }
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: None,
             stats,
@@ -806,1065 +869,26 @@ pub(crate) fn snapshot_step_update_from_stats(
     }
 }
 
-pub(crate) fn resolve_script_until_seconds(
-    ir: &ProblemIR,
-    default_until_seconds: Option<f64>,
-) -> Result<f64> {
-    if let Some(until_seconds) = default_until_seconds {
-        return Ok(until_seconds);
-    }
-
-    match &ir.study {
-        fullmag_ir::StudyIR::Relaxation { dynamics, stop, .. } => {
-            Ok(resolve_relaxation_until_seconds(dynamics, stop))
-        }
-        fullmag_ir::StudyIR::TimeEvolution { .. } => bail!(
-            "no stop time provided. Define DEFAULT_UNTIL in the script for time-evolution runs"
-        ),
-        fullmag_ir::StudyIR::Eigenmodes { .. } => Ok(0.0),
-        fullmag_ir::StudyIR::FrequencyResponse { .. } => Ok(0.0),
-        fullmag_ir::StudyIR::Hysteresis { .. } => Ok(0.0),
-    }
-}
-
-fn resolve_relaxation_until_seconds(
-    dynamics: &Option<fullmag_ir::DynamicsIR>,
-    stop: &fullmag_ir::RelaxStopIR,
-) -> f64 {
-    if let Some(until_seconds) = stop.max_relaxation_time_s {
-        return until_seconds;
-    }
-    let _ = dynamics;
-    f64::INFINITY
-}
-
-#[cfg(test)]
-mod canonical_relaxation_time_tests {
-    use super::*;
-
-    #[test]
-    fn max_steps_does_not_synthesize_a_time_budget() {
-        let dynamics = Some(fullmag_ir::DynamicsIR::Llg {
-            gyromagnetic_ratio: 2.211e5,
-            integrator: "heun".to_string(),
-            fixed_timestep: Some(1.0e-13),
-            adaptive_timestep: None,
-            field_refresh: None,
-            mechanics: None,
-        });
-        let stop = fullmag_ir::RelaxStopIR {
-            torque_tolerance_apm: Some(1.0e-4),
-            energy_tolerance_j: None,
-            max_steps: Some(10),
-            max_relaxation_time_s: None,
-        };
-
-        assert_eq!(
-            resolve_relaxation_until_seconds(&dynamics, &stop),
-            f64::INFINITY
-        );
-    }
-}
-
 pub(crate) fn materialize_script_stages(
-    config: ScriptExecutionConfig,
+    mut config: ScriptExecutionConfig,
 ) -> Result<Vec<ResolvedScriptStage>> {
-    let ScriptExecutionConfig {
-        mut ir,
-        shared_geometry_assets,
-        default_until_seconds,
-        study_pipeline,
-        stages,
-    } = config;
-
-    if ir.geometry_assets.is_none() {
-        ir.geometry_assets = shared_geometry_assets.clone();
-    }
-
-    if stages.is_empty() {
-        if let Some(document) = study_pipeline {
-            let materialized = annotate_stage_transitions(materialize_study_pipeline(
-                &document,
-                &ir,
-                default_until_seconds,
-            )?);
-            if !materialized.is_empty() {
-                return Ok(materialized);
-            }
-        }
-        let entrypoint_kind = ir.problem_meta.entrypoint_kind.clone();
-        let entrypoint_kind = if entrypoint_kind.is_empty() {
-            "direct_script".to_string()
-        } else {
-            entrypoint_kind
-        };
-        let until_seconds = if entrypoint_kind == "flat_workspace" {
-            0.0
-        } else {
-            resolve_script_until_seconds(&ir, default_until_seconds)?
-        };
-        let mut stage = ResolvedScriptStage::solver(ir, until_seconds, entrypoint_kind);
-        resolve_stage_auto_sampling(&mut stage)?;
-        return Ok(vec![stage]);
-    }
-
-    let mut materialized = Vec::with_capacity(stages.len());
-    let mut device_override: Option<String> = None;
-    for mut stage in stages {
-        if stage.ir.geometry_assets.is_none() {
-            stage.ir.geometry_assets = shared_geometry_assets.clone();
-        }
-        if let Some(device) = device_override.as_deref() {
-            set_runtime_selection_device(&mut stage.ir, device);
-        }
-        normalize_stage_sampling(&mut stage.ir);
-        if let Some(action) = stage.action {
-            if let ScriptExecutionStageAction::ChangeDevice { device } = &action {
-                set_runtime_selection_device(&mut stage.ir, device);
-                device_override = Some(device.clone());
-            }
-            materialized.push(resolve_explicit_stage_action(
-                stage.ir,
-                stage.entrypoint_kind,
-                action,
-            )?);
-        } else {
-            let until_seconds =
-                resolve_script_until_seconds(&stage.ir, stage.default_until_seconds)?;
-            let mut resolved =
-                ResolvedScriptStage::solver(stage.ir, until_seconds, stage.entrypoint_kind);
-            resolve_stage_auto_sampling(&mut resolved)?;
-            materialized.push(resolved);
-        }
-    }
-    Ok(annotate_stage_transitions(materialized))
+    crate::python_bridge::bind_script_execution_profiles(&mut config, &[], None)?;
+    materialize_script_stages_with_output_policy(
+        config,
+        fullmag_runner::project_storage::configure_project_autosave,
+    )
 }
 
-fn resolve_stage_auto_sampling(stage: &mut ResolvedScriptStage) -> Result<()> {
-    if stage.action.is_none() && matches!(stage.ir.study, fullmag_ir::StudyIR::TimeEvolution { .. })
-    {
-        fullmag_plan::resolve_auto_sampling_for_stage(&mut stage.ir)
-            .map_err(|error| anyhow::anyhow!(error.to_string().trim().to_owned()))?;
-    }
-    Ok(())
-}
-
-fn annotate_stage_transitions(mut stages: Vec<ResolvedScriptStage>) -> Vec<ResolvedScriptStage> {
-    let transitions = (0..stages.len())
-        .map(|index| {
-            if index == 0 {
-                None
-            } else {
-                Some(classify_stage_transition(
-                    &stages[index - 1],
-                    &stages[index],
-                ))
-            }
-        })
-        .collect::<Vec<_>>();
-    for (stage, transition) in stages.iter_mut().zip(transitions.into_iter()) {
-        stage.incoming_transition = transition;
-    }
-    stages
-}
-
-fn classify_stage_transition(
-    previous: &ResolvedScriptStage,
-    current: &ResolvedScriptStage,
-) -> StageTransitionMetadata {
-    if let Some(action) = current.action.as_ref() {
-        return classify_action_stage_transition(action);
-    }
-    if requested_device(&previous.ir) != requested_device(&current.ir) {
-        return StageTransitionMetadata::boundary(
-            StageTransitionKind::BackendTransfer,
-            StageTransitionReason::DeviceChange,
-            Some(StateTransferOperatorKind::IdentityCopy),
-        );
-    }
-    if previous.ir.backend_policy.requested_backend != current.ir.backend_policy.requested_backend {
-        return StageTransitionMetadata::boundary(
-            StageTransitionKind::BackendTransfer,
-            StageTransitionReason::BackendChange,
-            None,
-        );
-    }
-    if same_runtime_state_topology(&previous.ir, &current.ir) {
-        return StageTransitionMetadata::continue_in_place();
-    }
-    StageTransitionMetadata::unsupported(StageTransitionReason::IncompatibleImplicitState)
-}
-
-fn classify_action_stage_transition(action: &ResolvedScriptStageAction) -> StageTransitionMetadata {
-    match action {
-        ResolvedScriptStageAction::SaveState { .. } => StageTransitionMetadata::boundary(
-            StageTransitionKind::SaveCheckpoint,
-            StageTransitionReason::UserExport,
-            None,
-        ),
-        ResolvedScriptStageAction::LoadState { .. } => StageTransitionMetadata::boundary(
-            StageTransitionKind::LoadState,
-            StageTransitionReason::CheckpointLoad,
-            Some(StateTransferOperatorKind::CheckpointLoad),
-        ),
-        ResolvedScriptStageAction::Export { .. } => StageTransitionMetadata::boundary(
-            StageTransitionKind::ExportOnly,
-            StageTransitionReason::UserExport,
-            None,
-        ),
-        ResolvedScriptStageAction::ChangeDevice { .. } => StageTransitionMetadata::boundary(
-            StageTransitionKind::BackendTransfer,
-            StageTransitionReason::DeviceChange,
-            Some(StateTransferOperatorKind::IdentityCopy),
-        ),
-        ResolvedScriptStageAction::AddFieldDrive { .. }
-        | ResolvedScriptStageAction::RemoveFieldDrive { .. }
-        | ResolvedScriptStageAction::TableAutosave { .. }
-        | ResolvedScriptStageAction::Autosave { .. }
-        | ResolvedScriptStageAction::FftResponse { .. }
-        | ResolvedScriptStageAction::SetTransportCurrent { .. }
-        | ResolvedScriptStageAction::SetSpinTorqueEnabled { .. } => {
-            StageTransitionMetadata::continue_in_place()
-        }
-    }
-}
-
-fn same_runtime_state_topology(previous: &ProblemIR, current: &ProblemIR) -> bool {
-    previous.backend_policy.requested_backend == current.backend_policy.requested_backend
-        && previous.backend_policy.execution_precision == current.backend_policy.execution_precision
-        && previous.backend_policy.discretization_hints
-            == current.backend_policy.discretization_hints
-        && previous.geometry == current.geometry
-        && previous.geometry_assets == current.geometry_assets
-        && previous.regions == current.regions
-        && same_material_topology(&previous.materials, &current.materials)
-        && same_magnet_topology(&previous.magnets, &current.magnets)
-        && previous.current_modules == current.current_modules
-        && previous.spin_torque_modules == current.spin_torque_modules
-        && previous.elastic_materials == current.elastic_materials
-        && previous.elastic_bodies == current.elastic_bodies
-        && previous.magnetostriction_laws == current.magnetostriction_laws
-        && previous.mechanical_bcs == current.mechanical_bcs
-        && previous.mechanical_loads == current.mechanical_loads
-        && previous.air_box_policy == current.air_box_policy
-        && previous.pbc == current.pbc
-        && previous.mesh_semantics == current.mesh_semantics
-}
-
-fn requested_device(ir: &ProblemIR) -> String {
-    ir.problem_meta
-        .runtime_metadata
-        .get("runtime_selection")
-        .and_then(Value::as_object)
-        .and_then(|selection| selection.get("device"))
-        .and_then(Value::as_str)
-        .unwrap_or("auto")
-        .to_string()
-}
-
-fn same_material_topology(
-    previous: &[fullmag_ir::MaterialIR],
-    current: &[fullmag_ir::MaterialIR],
-) -> bool {
-    previous.len() == current.len()
-        && previous
-            .iter()
-            .zip(current.iter())
-            .all(|(p, c)| p.name == c.name)
-}
-
-fn same_magnet_topology(
-    previous: &[fullmag_ir::MagnetIR],
-    current: &[fullmag_ir::MagnetIR],
-) -> bool {
-    previous.len() == current.len()
-        && previous
-            .iter()
-            .zip(current.iter())
-            .all(|(previous, current)| {
-                previous.name == current.name
-                    && previous.region == current.region
-                    && previous.material == current.material
+pub(crate) fn requires_antenna_lead_materialization(config: &ScriptExecutionConfig) -> bool {
+    std::iter::once(&config.ir)
+        .chain(config.stages.iter().map(|stage| &stage.ir))
+        .any(|ir| {
+            ir.current_modules.iter().any(|module| {
+                matches!(module, fullmag_ir::CurrentModuleIR::CurrentTransport {
+                    definition: Some(definition), ..
+                } if definition.external_lead_preparation.is_some())
             })
-}
-
-fn resolve_explicit_stage_action(
-    mut ir: ProblemIR,
-    entrypoint_kind: String,
-    action: ScriptExecutionStageAction,
-) -> Result<ResolvedScriptStage> {
-    let (entrypoint_fallback, resolved_action) = match action {
-        ScriptExecutionStageAction::SaveState {
-            artifact_name,
-            format,
-            dataset,
-        } => (
-            "study_pipeline_save_state",
-            ResolvedScriptStageAction::SaveState {
-                artifact_name,
-                format,
-                dataset,
-            },
-        ),
-        ScriptExecutionStageAction::LoadState {
-            artifact_name,
-            state_path,
-            format,
-            dataset,
-            sample_index,
-        } => (
-            "study_pipeline_load_state",
-            ResolvedScriptStageAction::LoadState {
-                artifact_name,
-                state_path,
-                format,
-                dataset,
-                sample_index,
-            },
-        ),
-        ScriptExecutionStageAction::Export {
-            artifact_name,
-            quantity,
-            format,
-            dataset,
-        } => (
-            "study_pipeline_export",
-            ResolvedScriptStageAction::Export {
-                artifact_name,
-                quantity,
-                format,
-                dataset,
-            },
-        ),
-        ScriptExecutionStageAction::ChangeDevice { device } => (
-            "study_pipeline_change_device",
-            ResolvedScriptStageAction::ChangeDevice { device },
-        ),
-        ScriptExecutionStageAction::AddFieldDrive { drive } => {
-            ensure_field_drive_can_be_added(&ir, &drive)?;
-            ir.field_drives.push(drive.clone());
-            (
-                "study_pipeline_add_field_drive",
-                ResolvedScriptStageAction::AddFieldDrive { drive },
-            )
-        }
-        ScriptExecutionStageAction::RemoveFieldDrive { drive_id } => {
-            remove_field_drive(&mut ir, &drive_id)?;
-            (
-                "study_pipeline_remove_field_drive",
-                ResolvedScriptStageAction::RemoveFieldDrive { drive_id },
-            )
-        }
-        ScriptExecutionStageAction::TableAutosave {
-            enabled,
-            table_autosave,
-        } => {
-            if enabled && table_autosave.is_none() {
-                bail!("enabled table_autosave action requires table_autosave payload");
-            }
-            ir.study.sampling_mut().table_autosave = if enabled {
-                table_autosave.clone()
-            } else {
-                None
-            };
-            (
-                "study_pipeline_table_autosave",
-                ResolvedScriptStageAction::TableAutosave {
-                    enabled,
-                    table_autosave,
-                },
-            )
-        }
-        ScriptExecutionStageAction::Autosave {
-            enabled,
-            quantity,
-            output,
-        } => {
-            if enabled {
-                let configured = output
-                    .as_ref()
-                    .context("enabled autosave action requires output payload")?;
-                let name = time_output_name(configured)
-                    .context("autosave action supports field, scalar, or snapshot outputs")?;
-                let outputs = &mut ir.study.sampling_mut().outputs;
-                outputs.retain(|candidate| time_output_name(candidate) != Some(name));
-                outputs.push(configured.clone());
-            } else if let Some(quantity) = quantity.as_deref() {
-                ir.study
-                    .sampling_mut()
-                    .outputs
-                    .retain(|candidate| time_output_name(candidate) != Some(quantity));
-            } else {
-                ir.study.sampling_mut().outputs.clear();
-            }
-            (
-                "study_pipeline_autosave",
-                ResolvedScriptStageAction::Autosave {
-                    enabled,
-                    quantity,
-                    output,
-                },
-            )
-        }
-        ScriptExecutionStageAction::FftResponse { enabled, request } => {
-            if enabled {
-                let request = request
-                    .as_ref()
-                    .filter(|value| value.is_object())
-                    .context("enabled fft_response action requires object request")?;
-                ir.problem_meta
-                    .runtime_metadata
-                    .insert("spin_wave_response".to_string(), request.clone());
-            } else {
-                ir.problem_meta
-                    .runtime_metadata
-                    .remove("spin_wave_response");
-            }
-            (
-                "study_pipeline_fft_response",
-                ResolvedScriptStageAction::FftResponse { enabled, request },
-            )
-        }
-        ScriptExecutionStageAction::SetTransportCurrent {
-            module_id,
-            terminal_outward_current_density_apm2,
-        } => {
-            let payload = BTreeMap::from([
-                ("module_id".to_string(), Value::String(module_id.clone())),
-                (
-                    "terminal_outward_current_density_Apm2".to_string(),
-                    serde_json::to_value(&terminal_outward_current_density_apm2)
-                        .context("failed to encode set_transport_current payload")?,
-                ),
-            ]);
-            apply_pipeline_set_transport_current(&mut ir, &payload)?;
-            (
-                "study_pipeline_set_transport_current",
-                ResolvedScriptStageAction::SetTransportCurrent {
-                    module_id,
-                    terminal_outward_current_density_apm2,
-                },
-            )
-        }
-        ScriptExecutionStageAction::SetSpinTorqueEnabled { module_id, enabled } => {
-            let payload = BTreeMap::from([
-                ("module_id".to_string(), Value::String(module_id.clone())),
-                ("enabled".to_string(), Value::Bool(enabled)),
-            ]);
-            apply_pipeline_set_spin_torque_enabled(&mut ir, &payload)?;
-            (
-                "study_pipeline_set_spin_torque_enabled",
-                ResolvedScriptStageAction::SetSpinTorqueEnabled { module_id, enabled },
-            )
-        }
-    };
-    let entrypoint = if entrypoint_kind.trim().is_empty() {
-        entrypoint_fallback.to_string()
-    } else {
-        entrypoint_kind
-    };
-    Ok(ResolvedScriptStage::synthetic(
-        ir,
-        entrypoint,
-        resolved_action,
-    ))
-}
-
-fn materialize_study_pipeline(
-    document: &StudyPipelineDocument,
-    base_ir: &ProblemIR,
-    default_until_seconds: Option<f64>,
-) -> Result<Vec<ResolvedScriptStage>> {
-    if document.version != "study_pipeline.v1" {
-        bail!(
-            "unsupported study pipeline version '{}' while materializing script stages",
-            document.version
-        );
-    }
-    let mut stages = Vec::new();
-    let mut current_ir = base_ir.clone();
-    current_ir.problem_meta.runtime_metadata.insert(
-        "study_pipeline".to_string(),
-        serde_json::to_value(document).context("failed to preserve study pipeline provenance")?,
-    );
-    walk_study_pipeline_nodes(
-        &document.nodes,
-        &mut current_ir,
-        default_until_seconds,
-        &mut stages,
-    )?;
-    Ok(stages)
-}
-
-fn walk_study_pipeline_nodes(
-    nodes: &[StudyPipelineNode],
-    current_ir: &mut ProblemIR,
-    default_until_seconds: Option<f64>,
-    out: &mut Vec<ResolvedScriptStage>,
-) -> Result<()> {
-    for node in nodes {
-        match node {
-            StudyPipelineNode::Primitive {
-                id,
-                enabled,
-                stage_kind,
-                payload,
-                label,
-                ..
-            } => {
-                if !enabled {
-                    continue;
-                }
-                if let Some(mut stage) = materialize_pipeline_primitive(
-                    current_ir,
-                    stage_kind,
-                    payload,
-                    default_until_seconds,
-                )
-                .with_context(|| format!("failed to materialize study pipeline node '{label}'"))?
-                {
-                    stage
-                        .ir
-                        .problem_meta
-                        .runtime_metadata
-                        .insert("active_stage_id".to_string(), Value::String(id.clone()));
-                    resolve_stage_auto_sampling(&mut stage)?;
-                    out.push(stage);
-                }
-            }
-            StudyPipelineNode::Macro {
-                id,
-                enabled,
-                macro_kind,
-                label,
-                config,
-                ..
-            } => {
-                if !enabled {
-                    continue;
-                }
-                let mut stages = materialize_pipeline_macro(
-                    current_ir,
-                    macro_kind,
-                    config,
-                    default_until_seconds,
-                )
-                .with_context(|| format!("failed to materialize study pipeline node '{label}'"))?;
-                for stage in &mut stages {
-                    stage
-                        .ir
-                        .problem_meta
-                        .runtime_metadata
-                        .insert("active_stage_id".to_string(), Value::String(id.clone()));
-                    resolve_stage_auto_sampling(stage)?;
-                }
-                out.extend(stages);
-            }
-            StudyPipelineNode::Group {
-                enabled, children, ..
-            } => {
-                if !enabled {
-                    continue;
-                }
-                walk_study_pipeline_nodes(children, current_ir, default_until_seconds, out)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn materialize_pipeline_primitive(
-    current_ir: &mut ProblemIR,
-    stage_kind: &str,
-    payload: &BTreeMap<String, Value>,
-    default_until_seconds: Option<f64>,
-) -> Result<Option<ResolvedScriptStage>> {
-    let normalized_kind = stage_kind.trim().to_ascii_lowercase();
-    match normalized_kind.as_str() {
-        "run" => {
-            validate_pipeline_run_primitive_payload(payload)?;
-            materialize_pipeline_run(current_ir, payload, default_until_seconds).map(Some)
-        }
-        "relax" => materialize_pipeline_relax(current_ir, payload).map(Some),
-        "eigenmodes" => materialize_pipeline_eigenmodes(current_ir, payload).map(Some),
-        "frequency_response" => {
-            materialize_pipeline_frequency_response(current_ir, payload).map(Some)
-        }
-        "set_field" => {
-            apply_pipeline_set_field(current_ir, payload)?;
-            Ok(None)
-        }
-        "set_current" => {
-            apply_pipeline_set_current(current_ir, payload)?;
-            Ok(None)
-        }
-        "set_transport_current" => {
-            apply_pipeline_set_transport_current(current_ir, payload)?;
-            Ok(None)
-        }
-        "set_spin_torque_enabled" => {
-            apply_pipeline_set_spin_torque_enabled(current_ir, payload)?;
-            Ok(None)
-        }
-        "save_state" => materialize_pipeline_save_state(current_ir, payload).map(Some),
-        "load_state" => materialize_pipeline_load_state(current_ir, payload).map(Some),
-        "export" => materialize_pipeline_export(current_ir, payload).map(Some),
-        "change_device" => materialize_pipeline_change_device(current_ir, payload).map(Some),
-        "add_field_drive" => materialize_pipeline_add_field_drive(current_ir, payload).map(Some),
-        "remove_field_drive" => {
-            materialize_pipeline_remove_field_drive(current_ir, payload).map(Some)
-        }
-        "table_autosave" => materialize_pipeline_table_autosave(current_ir, payload).map(Some),
-        "autosave" => materialize_pipeline_autosave(current_ir, payload).map(Some),
-        "fft_response" => materialize_pipeline_fft_response(current_ir, payload).map(Some),
-        other => bail!(
-            "study pipeline primitive stage '{}' is not yet executable by the runtime; materialize it into explicit stages first",
-            other
-        ),
-    }
-}
-
-fn materialize_pipeline_add_field_drive(
-    current_ir: &mut ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let drive_value = payload
-        .get("drive")
-        .cloned()
-        .context("study pipeline add_field_drive requires payload.drive")?;
-    let drive: RegionalFieldDriveIR = serde_json::from_value(drive_value)
-        .context("study pipeline add_field_drive payload.drive is invalid")?;
-    ensure_field_drive_can_be_added(current_ir, &drive)?;
-    current_ir.field_drives.push(drive.clone());
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_add_field_drive".to_string());
-    current_ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    Ok(ResolvedScriptStage::synthetic(
-        current_ir.clone(),
-        entrypoint_kind,
-        ResolvedScriptStageAction::AddFieldDrive { drive },
-    ))
-}
-
-fn materialize_pipeline_remove_field_drive(
-    current_ir: &mut ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let drive_id = payload
-        .get("drive_id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .context("study pipeline remove_field_drive requires string payload.drive_id")?;
-    remove_field_drive(current_ir, &drive_id)?;
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_remove_field_drive".to_string());
-    current_ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    Ok(ResolvedScriptStage::synthetic(
-        current_ir.clone(),
-        entrypoint_kind,
-        ResolvedScriptStageAction::RemoveFieldDrive { drive_id },
-    ))
-}
-
-fn materialize_pipeline_table_autosave(
-    current_ir: &mut ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let enabled = payload
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let table_autosave = if enabled {
-        let value = payload
-            .get("table_autosave")
-            .cloned()
-            .context("enabled table_autosave stage requires payload.table_autosave")?;
-        let table: TableAutosaveIR = serde_json::from_value(value)
-            .context("table_autosave stage payload.table_autosave is invalid")?;
-        let explicit_is_valid = table
-            .sample_period_s
-            .is_some_and(|period| period.is_finite() && period > 0.0);
-        if !explicit_is_valid && !table.requests_auto_sinc_cutoff() {
-            bail!("table_autosave requires a positive finite sample_period_s or the auto_sinc_cutoff policy");
-        }
-        if table.quantities.is_empty() {
-            bail!("table_autosave quantities must not be empty");
-        }
-        Some(table)
-    } else {
-        None
-    };
-    current_ir.study.sampling_mut().table_autosave = table_autosave.clone();
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_table_autosave".to_string());
-    current_ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    Ok(ResolvedScriptStage::synthetic(
-        current_ir.clone(),
-        entrypoint_kind,
-        ResolvedScriptStageAction::TableAutosave {
-            enabled,
-            table_autosave,
-        },
-    ))
-}
-
-fn materialize_pipeline_autosave(
-    current_ir: &mut ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let enabled = payload
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let quantity = payload_string(payload, "quantity");
-    let output = if enabled {
-        let value = payload
-            .get("output")
-            .cloned()
-            .context("enabled autosave stage requires payload.output")?;
-        let output: OutputIR =
-            serde_json::from_value(value).context("autosave stage payload.output is invalid")?;
-        let name = time_output_name(&output)
-            .context("autosave stage supports field, scalar, or snapshot outputs")?;
-        if quantity.as_deref().is_some_and(|quantity| quantity != name) {
-            bail!("autosave quantity must match payload.output name");
-        }
-        let outputs = &mut current_ir.study.sampling_mut().outputs;
-        outputs.retain(|candidate| time_output_name(candidate) != Some(name));
-        outputs.push(output.clone());
-        Some(output)
-    } else {
-        let outputs = &mut current_ir.study.sampling_mut().outputs;
-        if let Some(quantity) = quantity.as_deref() {
-            outputs.retain(|candidate| time_output_name(candidate) != Some(quantity));
-        } else {
-            outputs.clear();
-        }
-        None
-    };
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_autosave".to_string());
-    current_ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    Ok(ResolvedScriptStage::synthetic(
-        current_ir.clone(),
-        entrypoint_kind,
-        ResolvedScriptStageAction::Autosave {
-            enabled,
-            quantity,
-            output,
-        },
-    ))
-}
-
-fn materialize_pipeline_fft_response(
-    current_ir: &mut ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let enabled = payload
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let request = if enabled {
-        let request = payload
-            .get("request")
-            .cloned()
-            .context("enabled fft_response stage requires payload.request")?;
-        if !request.is_object() {
-            bail!("fft_response payload.request must be an object");
-        }
-        current_ir
-            .problem_meta
-            .runtime_metadata
-            .insert("spin_wave_response".to_string(), request.clone());
-        Some(request)
-    } else {
-        current_ir
-            .problem_meta
-            .runtime_metadata
-            .remove("spin_wave_response");
-        None
-    };
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_fft_response".to_string());
-    current_ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    Ok(ResolvedScriptStage::synthetic(
-        current_ir.clone(),
-        entrypoint_kind,
-        ResolvedScriptStageAction::FftResponse { enabled, request },
-    ))
-}
-
-fn time_output_name(output: &OutputIR) -> Option<&str> {
-    match output {
-        OutputIR::Field { name, .. }
-        | OutputIR::FieldAuto { name, .. }
-        | OutputIR::FieldResolvedAuto { name, .. }
-        | OutputIR::Scalar { name, .. }
-        | OutputIR::ScalarAuto { name, .. }
-        | OutputIR::ScalarResolvedAuto { name, .. } => Some(name),
-        OutputIR::Snapshot { field, .. } => Some(field),
-        _ => None,
-    }
-}
-
-fn ensure_field_drive_can_be_added(ir: &ProblemIR, drive: &RegionalFieldDriveIR) -> Result<()> {
-    if ir
-        .field_drives
-        .iter()
-        .any(|existing| existing.id == drive.id)
-    {
-        bail!(
-            "study pipeline field drive id '{}' already exists",
-            drive.id
-        );
-    }
-    if ir
-        .field_drives
-        .iter()
-        .any(|existing| existing.name == drive.name)
-    {
-        bail!(
-            "study pipeline field drive name '{}' already exists",
-            drive.name
-        );
-    }
-    Ok(())
-}
-
-fn remove_field_drive(ir: &mut ProblemIR, drive_id: &str) -> Result<()> {
-    if drive_id.trim().is_empty() {
-        bail!("study pipeline remove_field_drive drive_id must be non-empty");
-    }
-    let Some(index) = ir
-        .field_drives
-        .iter()
-        .position(|drive| drive.id == drive_id)
-    else {
-        bail!(
-            "study pipeline field drive id '{}' does not exist",
-            drive_id
-        );
-    };
-    ir.field_drives.remove(index);
-    Ok(())
-}
-
-fn materialize_pipeline_macro(
-    current_ir: &mut ProblemIR,
-    macro_kind: &str,
-    config: &BTreeMap<String, Value>,
-    default_until_seconds: Option<f64>,
-) -> Result<Vec<ResolvedScriptStage>> {
-    let normalized_kind = macro_kind.trim().to_ascii_lowercase();
-    match normalized_kind.as_str() {
-        "relax_run" => {
-            let mut stages = Vec::with_capacity(2);
-            let mut relax_payload = config.clone();
-            relax_payload.insert(
-                "entrypoint_kind".to_string(),
-                Value::String("study_pipeline_relax_run_relax".to_string()),
-            );
-            stages.push(materialize_pipeline_relax(current_ir, &relax_payload)?);
-
-            let mut run_payload = config.clone();
-            run_payload.insert(
-                "entrypoint_kind".to_string(),
-                Value::String("study_pipeline_relax_run_run".to_string()),
-            );
-            if let Some(until_seconds) =
-                payload_f64(config, "run_until_seconds")?.or(default_until_seconds)
-            {
-                run_payload.insert(
-                    "until_seconds".to_string(),
-                    Value::String(until_seconds.to_string()),
-                );
-            }
-            stages.push(materialize_pipeline_run(
-                current_ir,
-                &run_payload,
-                default_until_seconds,
-            )?);
-            Ok(stages)
-        }
-        "relax_eigenmodes" => {
-            let mut stages = Vec::with_capacity(2);
-            let mut relax_payload = config.clone();
-            relax_payload.insert(
-                "entrypoint_kind".to_string(),
-                Value::String("study_pipeline_relax_eigenmodes_relax".to_string()),
-            );
-            stages.push(materialize_pipeline_relax(current_ir, &relax_payload)?);
-
-            let mut eigen_payload = config.clone();
-            eigen_payload.insert(
-                "entrypoint_kind".to_string(),
-                Value::String("study_pipeline_relax_eigenmodes_eigenmodes".to_string()),
-            );
-            stages.push(materialize_pipeline_eigenmodes(current_ir, &eigen_payload)?);
-            Ok(stages)
-        }
-        "field_sweep_relax" | "field_sweep_relax_snapshot" => materialize_pipeline_field_sweep(
-            current_ir,
-            config,
-            default_until_seconds,
-            normalized_kind.as_str(),
-        ),
-        "hysteresis_loop" => {
-            materialize_pipeline_hysteresis_branch(current_ir, config, default_until_seconds)
-        }
-        "parameter_sweep" => {
-            materialize_pipeline_parameter_sweep(current_ir, config, default_until_seconds)
-        }
-        other => bail!(
-            "study pipeline macro '{}' is not yet executable by the runtime fallback; materialize it into explicit stages first",
-            other
-        ),
-    }
-}
-
-fn time_domain_sampling_from(base: &fullmag_ir::SamplingIR) -> fullmag_ir::SamplingIR {
-    let outputs: Vec<fullmag_ir::OutputIR> = base
-        .outputs
-        .iter()
-        .filter(|output| {
-            matches!(
-                output,
-                fullmag_ir::OutputIR::Field { .. }
-                    | fullmag_ir::OutputIR::FieldAuto { .. }
-                    | fullmag_ir::OutputIR::FieldResolvedAuto { .. }
-                    | fullmag_ir::OutputIR::Scalar { .. }
-                    | fullmag_ir::OutputIR::ScalarAuto { .. }
-                    | fullmag_ir::OutputIR::ScalarResolvedAuto { .. }
-                    | fullmag_ir::OutputIR::Snapshot { .. }
-            )
         })
-        .cloned()
-        .collect();
-    fullmag_ir::SamplingIR {
-        table_autosave: base.table_autosave.clone(),
-        stage_autosave: base.stage_autosave.clone(),
-        outputs,
-    }
-}
-
-fn eigen_sampling_from(base: &fullmag_ir::SamplingIR, mode_count: u32) -> fullmag_ir::SamplingIR {
-    let mut outputs: Vec<fullmag_ir::OutputIR> = base
-        .outputs
-        .iter()
-        .filter(|output| {
-            matches!(
-                output,
-                fullmag_ir::OutputIR::EigenSpectrum { .. }
-                    | fullmag_ir::OutputIR::EigenMode { .. }
-                    | fullmag_ir::OutputIR::DispersionCurve { .. }
-            )
-        })
-        .cloned()
-        .collect();
-    for output in &mut outputs {
-        if let fullmag_ir::OutputIR::EigenMode { indices, .. } = output {
-            indices.retain(|index| *index < mode_count);
-        }
-    }
-    outputs.retain(|output| {
-        !matches!(
-            output,
-            fullmag_ir::OutputIR::EigenMode { indices, .. } if indices.is_empty()
-        )
-    });
-    if !outputs.iter().any(|output| {
-        matches!(
-            output,
-            fullmag_ir::OutputIR::EigenSpectrum { .. } | fullmag_ir::OutputIR::EigenMode { .. }
-        )
-    }) {
-        outputs.push(fullmag_ir::OutputIR::EigenSpectrum {
-            quantity: "spectrum".to_string(),
-        });
-    }
-    fullmag_ir::SamplingIR {
-        table_autosave: base.table_autosave.clone(),
-        stage_autosave: None,
-        outputs,
-    }
-}
-
-fn frequency_response_sampling_from(base: &fullmag_ir::SamplingIR) -> fullmag_ir::SamplingIR {
-    fullmag_ir::SamplingIR {
-        table_autosave: base.table_autosave.clone(),
-        stage_autosave: None,
-        outputs: base
-            .outputs
-            .iter()
-            .filter(|output| {
-                matches!(
-                    output,
-                    fullmag_ir::OutputIR::FrequencyResponseOutput { .. }
-                        | fullmag_ir::OutputIR::EigenSpectrum { .. }
-                        | fullmag_ir::OutputIR::EigenMode { .. }
-                        | fullmag_ir::OutputIR::DispersionCurve { .. }
-                )
-            })
-            .cloned()
-            .collect(),
-    }
-}
-
-fn normalize_stage_sampling(ir: &mut ProblemIR) {
-    match &mut ir.study {
-        fullmag_ir::StudyIR::TimeEvolution { sampling, .. }
-        | fullmag_ir::StudyIR::Relaxation { sampling, .. }
-        | fullmag_ir::StudyIR::Hysteresis { sampling, .. } => {
-            *sampling = time_domain_sampling_from(sampling);
-        }
-        fullmag_ir::StudyIR::Eigenmodes {
-            sampling, count, ..
-        } => {
-            *sampling = eigen_sampling_from(sampling, *count);
-        }
-        fullmag_ir::StudyIR::FrequencyResponse { sampling, .. } => {
-            *sampling = frequency_response_sampling_from(sampling);
-        }
-    }
-}
-
-fn required_study_dynamics(
-    study: &fullmag_ir::StudyIR,
-    context: &str,
-) -> Result<fullmag_ir::DynamicsIR> {
-    study
-        .optional_dynamics()
-        .cloned()
-        .with_context(|| format!("{context} requires explicit LLG dynamics"))
-}
-
-fn payload_field_is_set(payload: &BTreeMap<String, Value>, field: &str) -> bool {
-    payload.get(field).is_some_and(|value| match value {
-        Value::Null => false,
-        Value::String(value) => !value.trim().is_empty(),
-        _ => true,
-    })
-}
-
-fn reject_direct_minimizer_llg_payload(
-    algorithm: fullmag_ir::RelaxationAlgorithmIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<()> {
-    if algorithm == fullmag_ir::RelaxationAlgorithmIR::LlgOverdamped {
-        return Ok(());
-    }
-    let rejected = ["integrator", "fixed_timestep", "max_error", "relax_alpha"]
-        .into_iter()
-        .filter(|field| payload_field_is_set(payload, field))
-        .collect::<Vec<_>>();
-    if !rejected.is_empty() {
-        bail!(
-            "relaxation algorithm '{}' is a direct minimizer and rejects LLG-only controls: {}",
-            algorithm.as_str(),
-            rejected.join(", ")
-        );
-    }
-    Ok(())
 }
 
 fn reject_direct_minimizer_llg_command(
@@ -1900,2029 +924,37 @@ fn reject_direct_minimizer_llg_command(
     Ok(())
 }
 
-fn materialize_pipeline_run(
-    base_ir: &ProblemIR,
-    payload: &BTreeMap<String, Value>,
-    default_until_seconds: Option<f64>,
-) -> Result<ResolvedScriptStage> {
-    let mut ir = base_ir.clone();
-    let dynamics = required_study_dynamics(&ir.study, "run pipeline stage")?;
-    let sampling = time_domain_sampling_from(ir.study.sampling());
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_run".to_string());
-    ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    ir.study = fullmag_ir::StudyIR::TimeEvolution { dynamics, sampling };
-    attach_stage_autosave_from_payload(&mut ir, payload, "run")?;
-    let until_seconds = resolve_script_until_seconds(
-        &ir,
-        payload_f64(payload, "until_seconds")?.or(default_until_seconds),
-    )?;
-    if until_seconds <= 0.0 {
-        bail!("run study pipeline stage requires a positive until_seconds value");
-    }
-    Ok(ResolvedScriptStage::solver(
-        ir,
-        until_seconds,
-        entrypoint_kind,
-    ))
-}
-
-fn validate_pipeline_run_primitive_payload(payload: &BTreeMap<String, Value>) -> Result<()> {
-    let unsupported = payload
-        .keys()
-        .filter(|key| {
-            !matches!(
-                key.as_str(),
-                "entrypoint_kind"
-                    | "kind"
-                    | "stage_id"
-                    | "until_seconds"
-                    | "output_every_seconds"
-                    | "autosave"
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !unsupported.is_empty() {
-        bail!(
-            "run pipeline stage accepts only until_seconds; configure solver, table_autosave, autosave, and fft_response independently (unsupported: {})",
-            unsupported.join(", ")
-        );
-    }
-    Ok(())
-}
-
-fn materialize_pipeline_relax(
-    base_ir: &ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let mut ir = base_ir.clone();
-    let mut sampling = time_domain_sampling_from(ir.study.sampling());
-    if let Some(value) = payload.get("table_autosave") {
-        let table: TableAutosaveIR = serde_json::from_value(value.clone())
-            .context("relax stage table_autosave is invalid")?;
-        if table.accepted_step_cadence().is_none() {
-            bail!("relax stage table_autosave must use a positive every_steps cadence");
-        }
-        if table.quantities.is_empty() {
-            bail!("relax stage table_autosave quantities must not be empty");
-        }
-        sampling.table_autosave = Some(table);
-    }
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_relax".to_string());
-    ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    let algorithm = payload_relaxation_algorithm(payload)?
-        .unwrap_or(fullmag_ir::RelaxationAlgorithmIR::LlgOverdamped);
-    reject_direct_minimizer_llg_payload(algorithm, payload)?;
-    let dynamics = if algorithm == fullmag_ir::RelaxationAlgorithmIR::LlgOverdamped {
-        let mut dynamics = required_study_dynamics(&ir.study, "LLG relaxation pipeline stage")?;
-        apply_dynamics_overrides(&mut dynamics, payload)?;
-        Some(dynamics)
-    } else {
-        None
-    };
-    ir.study = fullmag_ir::StudyIR::Relaxation {
-        algorithm,
-        dynamics,
-        stop: payload_relax_stop(payload, true)?,
-        sampling,
-    };
-    attach_stage_autosave_from_payload(&mut ir, payload, "relax")?;
-    let until_seconds = resolve_script_until_seconds(&ir, None)?;
-    Ok(ResolvedScriptStage::solver(
-        ir,
-        until_seconds,
-        entrypoint_kind,
-    ))
-}
-
-fn attach_stage_autosave_from_payload(
-    ir: &mut ProblemIR,
-    payload: &BTreeMap<String, Value>,
-    stage_kind: &str,
+/// Validate a state import privately, without publishing or creating a runtime.
+pub(crate) fn validate_imported_magnetization(
+    base_problem: &ProblemIR,
+    magnetization: &[[f64; 3]],
 ) -> Result<()> {
-    let Some(value) = payload.get("autosave") else {
-        ir.study.sampling_mut().stage_autosave = None;
-        return Ok(());
-    };
-    let policy: fullmag_ir::StageAutosaveIR = serde_json::from_value(value.clone())
-        .with_context(|| format!("{stage_kind} stage autosave payload is invalid"))?;
-    policy.validate_for_study(&ir.study).map_err(|errors| {
-        anyhow::anyhow!(
-            "{stage_kind} stage autosave validation failed: {}",
-            errors.join("; ")
-        )
-    })?;
-    ir.study.sampling_mut().stage_autosave = Some(policy);
-    Ok(())
-}
-
-fn materialize_pipeline_eigenmodes(
-    base_ir: &ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let mut ir = base_ir.clone();
-    let mut dynamics = required_study_dynamics(&ir.study, "eigenmodes pipeline stage")?;
-    apply_dynamics_overrides(&mut dynamics, payload)?;
-    let sampling = ir.study.sampling().clone();
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_eigenmodes".to_string());
-    let current_eigen = match &base_ir.study {
-        fullmag_ir::StudyIR::Eigenmodes {
-            operator,
-            count,
-            target,
-            equilibrium,
-            k_sampling,
-            normalization,
-            damping_policy,
-            spin_wave_bc,
-            ..
-        } => Some((
-            operator.clone(),
-            *count,
-            target.clone(),
-            equilibrium.clone(),
-            k_sampling.clone(),
-            *normalization,
-            *damping_policy,
-            spin_wave_bc.clone(),
-        )),
-        _ => None,
-    };
-    let default_count = current_eigen
-        .as_ref()
-        .map(|current| current.1)
-        .unwrap_or(10);
-    let default_target = current_eigen
-        .as_ref()
-        .map(|current| current.2.clone())
-        .unwrap_or(fullmag_ir::EigenTargetIR::Lowest);
-    let default_equilibrium = current_eigen
-        .as_ref()
-        .map(|current| current.3.clone())
-        .unwrap_or(fullmag_ir::EquilibriumSourceIR::RelaxedInitialState);
-    let default_normalization = current_eigen
-        .as_ref()
-        .map(|current| current.5)
-        .unwrap_or(fullmag_ir::EigenNormalizationIR::UnitL2);
-    let default_damping_policy = current_eigen
-        .as_ref()
-        .map(|current| current.6)
-        .unwrap_or(fullmag_ir::EigenDampingPolicyIR::Ignore);
-    let default_spin_wave_bc = current_eigen
-        .as_ref()
-        .map(|current| current.7.clone())
-        .unwrap_or_default();
-    let bias_field_sweep = match &base_ir.study {
-        fullmag_ir::StudyIR::Eigenmodes {
-            bias_field_sweep, ..
-        } => bias_field_sweep.clone(),
-        _ => None,
-    };
-    let default_magnetostatic_bc = match &base_ir.study {
-        fullmag_ir::StudyIR::Eigenmodes {
-            magnetostatic_bc, ..
-        } => *magnetostatic_bc,
-        _ => fullmag_ir::MagnetostaticBoundaryConditionIR::default(),
-    };
-    let count = payload_u32(payload, "eigen_count")?.unwrap_or(default_count);
-    let include_demag = payload_bool(payload, "eigen_include_demag")?.unwrap_or_else(|| {
-        current_eigen
-            .as_ref()
-            .map(|current| current.0.include_demag)
-            .unwrap_or(true)
-    });
-
-    ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    ir.study = fullmag_ir::StudyIR::Eigenmodes {
-        dynamics,
-        operator: fullmag_ir::EigenOperatorConfigIR {
-            kind: fullmag_ir::EigenOperatorIR::LinearizedLlg,
-            include_demag,
-        },
-        count,
-        target: payload_eigen_target(payload, default_target)?,
-        equilibrium: payload_equilibrium_source(payload, default_equilibrium)?,
-        k_sampling: payload_k_sampling(
-            payload,
-            current_eigen.as_ref().and_then(|current| current.4.clone()),
-        )?,
-        bias_field_sweep,
-        normalization: payload_eigen_normalization(payload)?.unwrap_or(default_normalization),
-        damping_policy: payload_eigen_damping_policy(payload)?.unwrap_or(default_damping_policy),
-        spin_wave_bc: payload_spin_wave_bc(payload)?.unwrap_or(default_spin_wave_bc),
-        magnetostatic_bc: default_magnetostatic_bc,
-        sampling: eigen_sampling_from(&sampling, count),
-        mode_tracking: None,
-    };
-
-    Ok(ResolvedScriptStage::solver(ir, 0.0, entrypoint_kind))
-}
-
-fn materialize_pipeline_frequency_response(
-    base_ir: &ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let mut ir = base_ir.clone();
-    let mut dynamics = required_study_dynamics(&ir.study, "frequency-response pipeline stage")?;
-    apply_dynamics_overrides(&mut dynamics, payload)?;
-    let sampling = ir.study.sampling().clone();
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_frequency_response".to_string());
-    let current_frequency = match &base_ir.study {
-        fullmag_ir::StudyIR::FrequencyResponse {
-            operator,
-            equilibrium,
-            k_sampling,
-            normalization,
-            damping_policy,
-            spin_wave_bc,
-            excitation,
-            frequencies_hz,
-            ..
-        } => Some((
-            operator.clone(),
-            equilibrium.clone(),
-            k_sampling.clone(),
-            *normalization,
-            *damping_policy,
-            spin_wave_bc.clone(),
-            excitation.clone(),
-            frequencies_hz.clone(),
-        )),
-        _ => None,
-    };
-    let include_demag = payload_bool(payload, "frequency_include_demag")?.unwrap_or_else(|| {
-        current_frequency
-            .as_ref()
-            .map(|current| current.0.include_demag)
-            .unwrap_or(true)
-    });
-    let default_equilibrium = current_frequency
-        .as_ref()
-        .map(|current| current.1.clone())
-        .unwrap_or(fullmag_ir::EquilibriumSourceIR::Provided);
-    let default_k_sampling = current_frequency
-        .as_ref()
-        .and_then(|current| current.2.clone());
-    let default_normalization = current_frequency
-        .as_ref()
-        .map(|current| current.3)
-        .unwrap_or(fullmag_ir::FrequencyResponseNormalizationIR::UnitL2);
-    let default_damping_policy = current_frequency
-        .as_ref()
-        .map(|current| current.4)
-        .unwrap_or(fullmag_ir::EigenDampingPolicyIR::Ignore);
-    let default_spin_wave_bc = current_frequency
-        .as_ref()
-        .map(|current| current.5.clone())
-        .unwrap_or_default();
-    let default_magnetostatic_bc = match &base_ir.study {
-        fullmag_ir::StudyIR::FrequencyResponse {
-            magnetostatic_bc, ..
-        } => *magnetostatic_bc,
-        _ => fullmag_ir::MagnetostaticBoundaryConditionIR::default(),
-    };
-    let default_excitation = current_frequency
-        .as_ref()
-        .map(|current| current.6.field_au_per_m)
-        .unwrap_or([0.0, 0.0, 1.0]);
-    let default_excitation_phase_rad = current_frequency
-        .as_ref()
-        .map(|current| current.6.phase_rad)
-        .unwrap_or(0.0);
-    let default_frequencies = current_frequency
-        .as_ref()
-        .map(|current| current.7.values_hz.clone())
-        .unwrap_or_else(|| vec![1.0e9]);
-    let default_solver_policy = match &base_ir.study {
-        fullmag_ir::StudyIR::FrequencyResponse { solver_policy, .. } => solver_policy.clone(),
-        _ => None,
-    };
-
-    let frequencies_hz =
-        payload_f64_array(payload, "frequency_values_hz")?.unwrap_or(default_frequencies);
-    if frequencies_hz.is_empty()
-        || frequencies_hz
+    let mut candidate = base_problem.clone();
+    apply_continuation_initial_state(&mut candidate, magnetization)?;
+    let plan = fullmag_plan::plan(&candidate)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let expected_vectors = match &plan.backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            bail!("antenna inspection does not accept a magnetization import")
+        }
+        BackendPlanIR::Fdm(fdm) => fdm.initial_magnetization.len(),
+        BackendPlanIR::FdmMultilayer(fdm) => fdm
+            .layers
             .iter()
-            .any(|value| !value.is_finite() || *value <= 0.0)
-    {
-        bail!("study pipeline frequency_response stage requires positive frequency_values_hz");
-    }
-    let excitation_phase_rad = payload_f64(payload, "frequency_excitation_phase_rad")?
-        .unwrap_or(default_excitation_phase_rad);
-    if !excitation_phase_rad.is_finite() {
-        bail!("study pipeline frequency_response stage requires finite frequency_excitation_phase_rad");
-    }
-
-    let frequency_payload = frequency_payload_as_eigen_payload(payload);
-    ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    ir.study = fullmag_ir::StudyIR::FrequencyResponse {
-        dynamics,
-        operator: fullmag_ir::EigenOperatorConfigIR {
-            kind: fullmag_ir::EigenOperatorIR::LinearizedLlg,
-            include_demag,
-        },
-        equilibrium: payload_equilibrium_source(&frequency_payload, default_equilibrium)?,
-        k_sampling: payload_k_sampling(&frequency_payload, default_k_sampling)?,
-        normalization: payload_frequency_normalization(payload)?.unwrap_or(default_normalization),
-        damping_policy: payload_eigen_damping_policy(&frequency_payload)?
-            .unwrap_or(default_damping_policy),
-        spin_wave_bc: payload_spin_wave_bc(&frequency_payload)?.unwrap_or(default_spin_wave_bc),
-        magnetostatic_bc: payload_frequency_magnetostatic_bc(payload)?
-            .unwrap_or(default_magnetostatic_bc),
-        excitation: fullmag_ir::FrequencyExcitationIR {
-            field_au_per_m: payload_vec3(
-                payload,
-                "frequency_excitation_field_au_per_m",
-                default_excitation,
-            )?,
-            phase_rad: excitation_phase_rad,
-        },
-        frequencies_hz: fullmag_ir::FrequencySweepIR {
-            values_hz: frequencies_hz,
-        },
-        solver_policy: payload_frequency_solver_policy(payload, default_solver_policy)?,
-        sampling: fullmag_ir::SamplingIR {
-            table_autosave: sampling.table_autosave,
-            stage_autosave: None,
-            outputs: vec![fullmag_ir::OutputIR::FrequencyResponseOutput {
-                observable: payload_frequency_observable(payload)?,
-            }],
-        },
+            .map(|layer| layer.initial_magnetization.len())
+            .sum(),
+        BackendPlanIR::Fem(fem) => fem.mesh.nodes.len(),
+        BackendPlanIR::FemEigen(fem) => fem.mesh.nodes.len(),
+        BackendPlanIR::FemFrequencyResponse(fem) => fem.mesh.nodes.len(),
     };
-
-    Ok(ResolvedScriptStage::solver(ir, 0.0, entrypoint_kind))
-}
-
-fn frequency_payload_as_eigen_payload(
-    payload: &BTreeMap<String, Value>,
-) -> BTreeMap<String, Value> {
-    let mut mapped = payload.clone();
-    for (frequency_key, eigen_key) in [
-        ("frequency_equilibrium_source", "eigen_equilibrium_source"),
-        (
-            "frequency_equilibrium_artifact",
-            "eigen_equilibrium_artifact",
-        ),
-        ("frequency_damping_policy", "eigen_damping_policy"),
-        ("frequency_k_vector", "eigen_k_vector"),
-        ("frequency_spin_wave_bc", "eigen_spin_wave_bc"),
-        ("frequency_spin_wave_bc_config", "eigen_spin_wave_bc_config"),
-    ] {
-        if let Some(value) = payload.get(frequency_key) {
-            mapped.insert(eigen_key.to_string(), value.clone());
-        }
-    }
-    mapped
-}
-
-fn materialize_pipeline_save_state(
-    base_ir: &ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let mut ir = base_ir.clone();
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_save_state".to_string());
-    let artifact_name =
-        payload_string(payload, "artifact_name").unwrap_or_else(|| "state_snapshot".to_string());
-    ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    Ok(ResolvedScriptStage::synthetic(
-        ir,
-        entrypoint_kind,
-        ResolvedScriptStageAction::SaveState {
-            artifact_name,
-            format: payload_string(payload, "format"),
-            dataset: payload_string(payload, "dataset"),
-        },
-    ))
-}
-
-fn materialize_pipeline_load_state(
-    base_ir: &ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let mut ir = base_ir.clone();
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_load_state".to_string());
-    ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    Ok(ResolvedScriptStage::synthetic(
-        ir,
-        entrypoint_kind,
-        ResolvedScriptStageAction::LoadState {
-            artifact_name: payload_string(payload, "artifact_name"),
-            state_path: payload_string(payload, "state_path"),
-            format: payload_string(payload, "format"),
-            dataset: payload_string(payload, "dataset"),
-            sample_index: payload_i64(payload, "sample_index")?,
-        },
-    ))
-}
-
-fn materialize_pipeline_export(
-    base_ir: &ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let mut ir = base_ir.clone();
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_export".to_string());
-    ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    Ok(ResolvedScriptStage::synthetic(
-        ir,
-        entrypoint_kind,
-        ResolvedScriptStageAction::Export {
-            artifact_name: payload_string(payload, "artifact_name"),
-            quantity: payload_string(payload, "quantity")
-                .unwrap_or_else(|| "magnetization".to_string()),
-            format: payload_string(payload, "format").unwrap_or_else(|| "json".to_string()),
-            dataset: payload_string(payload, "dataset"),
-        },
-    ))
-}
-
-fn materialize_pipeline_change_device(
-    current_ir: &mut ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<ResolvedScriptStage> {
-    let device = normalize_pipeline_device(
-        payload_string(payload, "device")
-            .unwrap_or_else(|| "auto".to_string())
-            .as_str(),
-    )?;
-    set_runtime_selection_device(current_ir, &device);
-    let entrypoint_kind = payload_string(payload, "entrypoint_kind")
-        .unwrap_or_else(|| "study_pipeline_change_device".to_string());
-    current_ir.problem_meta.entrypoint_kind = entrypoint_kind.clone();
-    Ok(ResolvedScriptStage::synthetic(
-        current_ir.clone(),
-        entrypoint_kind,
-        ResolvedScriptStageAction::ChangeDevice { device },
-    ))
-}
-
-fn materialize_pipeline_field_sweep(
-    current_ir: &mut ProblemIR,
-    config: &BTreeMap<String, Value>,
-    default_until_seconds: Option<f64>,
-    macro_kind: &str,
-) -> Result<Vec<ResolvedScriptStage>> {
-    let start_mt = payload_f64(config, "start_mT")?.unwrap_or(-100.0);
-    let stop_mt = payload_f64(config, "stop_mT")?.unwrap_or(100.0);
-    let steps = payload_u64(config, "steps")?.unwrap_or(if macro_kind == "hysteresis_loop" {
-        21
-    } else {
-        11
-    });
-    let relax_each = payload_bool(config, "relax_each")?.unwrap_or(true);
-    let save_point_state = payload_bool(config, "save_point_state")?
-        .unwrap_or(macro_kind == "field_sweep_relax_snapshot");
-    let save_format = payload_string(config, "save_format");
-    let save_dataset = payload_string(config, "save_dataset");
-    let axis = payload_axis(config, "axis", [0.0, 0.0, 1.0])?;
-    let settle_until_seconds = payload_f64(config, "settle_until_seconds")?
-        .or(default_until_seconds)
-        .unwrap_or(1e-12);
-
-    if steps == 0 {
-        bail!("study pipeline {macro_kind} requires steps >= 1");
-    }
-    if settle_until_seconds <= 0.0 {
-        bail!("study pipeline {macro_kind} requires a positive settle_until_seconds");
-    }
-
-    let sweep_values_mt = linear_sweep_values(start_mt, stop_mt, steps)?;
-    let stage_multiplier = 1 + usize::from(relax_each) + usize::from(save_point_state);
-    let mut stages = Vec::with_capacity(sweep_values_mt.len() * stage_multiplier);
-
-    for (point_index, amplitude_mt) in sweep_values_mt.iter().enumerate() {
-        let field_t = scaled_axis(axis, *amplitude_mt * 1e-3);
-        apply_pipeline_external_field(current_ir, field_t);
-
-        let mut point_ir = current_ir.clone();
-        apply_pipeline_external_field(&mut point_ir, field_t);
-
-        let mut run_payload = config.clone();
-        run_payload.insert(
-            "entrypoint_kind".to_string(),
-            Value::String(format!(
-                "study_pipeline_{}_point_{:03}_run",
-                macro_kind,
-                point_index + 1
-            )),
-        );
-        run_payload.insert(
-            "until_seconds".to_string(),
-            Value::String(settle_until_seconds.to_string()),
-        );
-        stages.push(materialize_pipeline_run(
-            &point_ir,
-            &run_payload,
-            Some(settle_until_seconds),
-        )?);
-
-        if relax_each {
-            let mut relax_payload = config.clone();
-            relax_payload.insert(
-                "entrypoint_kind".to_string(),
-                Value::String(format!(
-                    "study_pipeline_{}_point_{:03}_relax",
-                    macro_kind,
-                    point_index + 1
-                )),
-            );
-            stages.push(materialize_pipeline_relax(&point_ir, &relax_payload)?);
-        }
-
-        if save_point_state {
-            let mut save_payload = BTreeMap::<String, Value>::new();
-            save_payload.insert(
-                "entrypoint_kind".to_string(),
-                Value::String(format!(
-                    "study_pipeline_{}_point_{:03}_save_state",
-                    macro_kind,
-                    point_index + 1
-                )),
-            );
-            save_payload.insert(
-                "artifact_name".to_string(),
-                Value::String(format!("{}_point_{:03}", macro_kind, point_index + 1)),
-            );
-            if let Some(format) = save_format.as_ref() {
-                save_payload.insert("format".to_string(), Value::String(format.clone()));
-            }
-            if let Some(dataset) = save_dataset.as_ref() {
-                save_payload.insert("dataset".to_string(), Value::String(dataset.clone()));
-            }
-            stages.push(materialize_pipeline_save_state(&point_ir, &save_payload)?);
-        }
-    }
-
-    Ok(stages)
-}
-
-fn hysteresis_settle_stop(
-    config: &BTreeMap<String, Value>,
-    default_until_seconds: Option<f64>,
-) -> Result<fullmag_ir::RelaxStopIR> {
-    let mut settle_payload = match config.get("settle") {
-        Some(Value::Object(map)) => map
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>(),
-        Some(Value::Null) | None => BTreeMap::new(),
-        Some(_) => {
-            bail!("study pipeline hysteresis_loop expects config.settle to be an object")
-        }
-    };
-
-    for key in [
-        "torque_tolerance_apm",
-        "torque_tolerance",
-        "energy_tolerance_j",
-        "energy_tolerance",
-        "max_steps",
-        "max_relaxation_time_s",
-        "max_pseudotime_s",
-        "max_physical_time_s",
-    ] {
-        if !settle_payload.contains_key(key) {
-            if let Some(value) = config.get(key) {
-                settle_payload.insert(key.to_string(), value.clone());
-            }
-        }
-    }
-    if !settle_payload.contains_key("max_physical_time_s") {
-        if let Some(settle_until_seconds) =
-            payload_f64(config, "settle_until_seconds")?.or(default_until_seconds)
-        {
-            settle_payload.insert(
-                "max_physical_time_s".to_string(),
-                Value::String(settle_until_seconds.to_string()),
-            );
-        }
-    }
-
-    payload_relax_stop(&settle_payload, true)
-}
-
-fn inject_relax_stop_payload(
-    payload: &mut BTreeMap<String, Value>,
-    stop: &fullmag_ir::RelaxStopIR,
-) {
-    if let Some(value) = stop.torque_tolerance_apm {
-        payload.insert(
-            "torque_tolerance_apm".to_string(),
-            Value::String(value.to_string()),
-        );
-    }
-    if let Some(value) = stop.energy_tolerance_j {
-        payload.insert(
-            "energy_tolerance_j".to_string(),
-            Value::String(value.to_string()),
-        );
-    }
-    if let Some(value) = stop.max_steps {
-        payload.insert("max_steps".to_string(), Value::String(value.to_string()));
-    }
-    if let Some(value) = stop.max_relaxation_time_s {
-        payload.insert(
-            "max_relaxation_time_s".to_string(),
-            Value::String(value.to_string()),
-        );
-    }
-}
-
-fn materialize_pipeline_hysteresis_branch(
-    current_ir: &mut ProblemIR,
-    config: &BTreeMap<String, Value>,
-    default_until_seconds: Option<f64>,
-) -> Result<Vec<ResolvedScriptStage>> {
-    let quantity = payload_string(config, "quantity").unwrap_or_else(|| "b_ext".to_string());
-    if quantity != "b_ext" && quantity != "external_field" {
+    if magnetization.len() != expected_vectors {
         bail!(
-            "study pipeline hysteresis_loop currently supports only quantity='b_ext', got '{}'",
-            quantity
+            "imported magnetization has {} vectors, but the resolved global flat carrier requires {} (length mismatch)",
+            magnetization.len(),
+            expected_vectors
         );
-    }
-
-    let axis = if config.contains_key("direction") {
-        payload_axis(config, "direction", [0.0, 0.0, 1.0])?
-    } else {
-        payload_axis(config, "axis", [0.0, 0.0, 1.0])?
-    };
-    let save_point_state = payload_bool(config, "save_state")?
-        .or(payload_bool(config, "save_point_state")?)
-        .unwrap_or(false);
-    let save_format = payload_string(config, "save_format");
-    let save_dataset = payload_string(config, "save_dataset");
-    let settle_stop = hysteresis_settle_stop(config, default_until_seconds)?;
-
-    let sweep_values_t =
-        if let Some(explicit_values_t) = payload_f64_array(config, "field_values_t")? {
-            if explicit_values_t.is_empty() {
-                bail!("study pipeline hysteresis_loop requires field_values_t to be non-empty");
-            }
-            explicit_values_t
-        } else {
-            let start_mt = payload_f64(config, "start_mT")?.unwrap_or(-100.0);
-            let stop_mt = payload_f64(config, "stop_mT")?.unwrap_or(100.0);
-            let steps = payload_u64(config, "steps")?.unwrap_or(21);
-            if steps == 0 {
-                bail!("study pipeline hysteresis_loop requires steps >= 1");
-            }
-            linear_sweep_values(start_mt, stop_mt, steps)?
-                .into_iter()
-                .map(|value_mt| value_mt * 1e-3)
-                .collect::<Vec<_>>()
-        };
-
-    let mut stages = Vec::with_capacity(sweep_values_t.len() * (1 + usize::from(save_point_state)));
-    for (point_index, amplitude_t) in sweep_values_t.iter().enumerate() {
-        let field_t = scaled_axis(axis, *amplitude_t);
-        apply_pipeline_external_field(current_ir, field_t);
-
-        let mut point_ir = current_ir.clone();
-        apply_pipeline_external_field(&mut point_ir, field_t);
-
-        let mut relax_payload = config.clone();
-        relax_payload.insert(
-            "entrypoint_kind".to_string(),
-            Value::String(format!(
-                "study_pipeline_hysteresis_branch_point_{:03}_relax",
-                point_index + 1
-            )),
-        );
-        inject_relax_stop_payload(&mut relax_payload, &settle_stop);
-        stages.push(materialize_pipeline_relax(&point_ir, &relax_payload)?);
-
-        if save_point_state {
-            let mut save_payload = BTreeMap::<String, Value>::new();
-            save_payload.insert(
-                "entrypoint_kind".to_string(),
-                Value::String(format!(
-                    "study_pipeline_hysteresis_branch_point_{:03}_save_state",
-                    point_index + 1
-                )),
-            );
-            save_payload.insert(
-                "artifact_name".to_string(),
-                Value::String(format!("hysteresis_branch_point_{:03}", point_index + 1)),
-            );
-            if let Some(format) = save_format.as_ref() {
-                save_payload.insert("format".to_string(), Value::String(format.clone()));
-            }
-            if let Some(dataset) = save_dataset.as_ref() {
-                save_payload.insert("dataset".to_string(), Value::String(dataset.clone()));
-            }
-            stages.push(materialize_pipeline_save_state(&point_ir, &save_payload)?);
-        }
-    }
-
-    Ok(stages)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ParameterSweepSolvePattern {
-    run_each: bool,
-    relax_each: bool,
-}
-
-fn parameter_sweep_solve_pattern(
-    config: &BTreeMap<String, Value>,
-) -> Result<ParameterSweepSolvePattern> {
-    let solve_kind = payload_string(config, "solve_kind")
-        .unwrap_or_else(|| "run_relax".to_string())
-        .trim()
-        .to_ascii_lowercase();
-    let pattern = match solve_kind.as_str() {
-        "run" => ParameterSweepSolvePattern {
-            run_each: true,
-            relax_each: false,
-        },
-        "relax" => ParameterSweepSolvePattern {
-            run_each: false,
-            relax_each: true,
-        },
-        "run_relax" | "relax_run" => ParameterSweepSolvePattern {
-            run_each: true,
-            relax_each: true,
-        },
-        other => {
-            bail!(
-                "parameter_sweep solve_kind '{}' is not supported; use run, relax, or run_relax",
-                other
-            )
-        }
-    };
-    Ok(pattern)
-}
-
-fn materialize_pipeline_parameter_sweep(
-    current_ir: &mut ProblemIR,
-    config: &BTreeMap<String, Value>,
-    default_until_seconds: Option<f64>,
-) -> Result<Vec<ResolvedScriptStage>> {
-    let parameter = payload_string(config, "parameter")
-        .or_else(|| payload_string(config, "quantity"))
-        .unwrap_or_else(|| "b_ext".to_string())
-        .trim()
-        .to_ascii_lowercase();
-    let axis = payload_axis(config, "axis", [0.0, 0.0, 1.0])?;
-    let steps = payload_u64(config, "steps")?.unwrap_or(11);
-    if steps == 0 {
-        bail!("parameter_sweep requires steps >= 1");
-    }
-
-    let is_field_parameter = matches!(
-        parameter.as_str(),
-        "b_ext" | "external_field" | "zeeman_b" | "field" | "field_mt"
-    );
-    let is_current_parameter = matches!(
-        parameter.as_str(),
-        "current_density" | "j" | "j_ext" | "current"
-    );
-    if !is_field_parameter && !is_current_parameter {
-        bail!(
-            "parameter_sweep parameter '{}' is not supported yet; supported parameters: b_ext, current_density",
-            parameter
-        );
-    }
-
-    let start_raw = payload_f64(config, "start_value")?
-        .or(payload_f64(config, "start")?)
-        .or(payload_f64(config, "start_mT")?)
-        .unwrap_or(if is_field_parameter { -100.0 } else { 0.0 });
-    let stop_raw = payload_f64(config, "stop_value")?
-        .or(payload_f64(config, "stop")?)
-        .or(payload_f64(config, "stop_mT")?)
-        .unwrap_or(if is_field_parameter { 100.0 } else { 1e10 });
-    let values_raw = linear_sweep_values(start_raw, stop_raw, steps)?;
-    let values_si = if is_field_parameter {
-        values_raw
-            .iter()
-            .map(|value| value * 1e-3)
-            .collect::<Vec<_>>()
-    } else {
-        values_raw
-    };
-    let solve_pattern = parameter_sweep_solve_pattern(config)?;
-    let save_point_state = payload_bool(config, "save_point_state")?.unwrap_or(false);
-    let save_format = payload_string(config, "save_format");
-    let save_dataset = payload_string(config, "save_dataset");
-
-    let run_until_seconds = payload_f64(config, "run_until_seconds")?
-        .or(payload_f64(config, "settle_until_seconds")?)
-        .or(default_until_seconds)
-        .unwrap_or(1e-12);
-    if solve_pattern.run_each && run_until_seconds <= 0.0 {
-        bail!("parameter_sweep requires positive run_until_seconds when solve_kind includes run");
-    }
-
-    let stage_multiplier = usize::from(solve_pattern.run_each)
-        + usize::from(solve_pattern.relax_each)
-        + usize::from(save_point_state);
-    let mut stages = Vec::with_capacity(values_si.len() * stage_multiplier.max(1));
-    for (point_index, value_si) in values_si.iter().enumerate() {
-        if is_field_parameter {
-            apply_pipeline_external_field(current_ir, scaled_axis(axis, *value_si));
-        } else {
-            current_ir.current_density = Some(scaled_axis(axis, *value_si));
-        }
-
-        let mut point_ir = current_ir.clone();
-        if is_field_parameter {
-            apply_pipeline_external_field(&mut point_ir, scaled_axis(axis, *value_si));
-        } else {
-            point_ir.current_density = Some(scaled_axis(axis, *value_si));
-        }
-
-        if solve_pattern.run_each {
-            let mut run_payload = config.clone();
-            run_payload.insert(
-                "entrypoint_kind".to_string(),
-                Value::String(format!(
-                    "study_pipeline_parameter_sweep_point_{:03}_run",
-                    point_index + 1
-                )),
-            );
-            run_payload.insert(
-                "until_seconds".to_string(),
-                Value::String(run_until_seconds.to_string()),
-            );
-            stages.push(materialize_pipeline_run(
-                &point_ir,
-                &run_payload,
-                Some(run_until_seconds),
-            )?);
-        }
-
-        if solve_pattern.relax_each {
-            let mut relax_payload = config.clone();
-            relax_payload.insert(
-                "entrypoint_kind".to_string(),
-                Value::String(format!(
-                    "study_pipeline_parameter_sweep_point_{:03}_relax",
-                    point_index + 1
-                )),
-            );
-            stages.push(materialize_pipeline_relax(&point_ir, &relax_payload)?);
-        }
-
-        if save_point_state {
-            let mut save_payload = BTreeMap::<String, Value>::new();
-            save_payload.insert(
-                "entrypoint_kind".to_string(),
-                Value::String(format!(
-                    "study_pipeline_parameter_sweep_point_{:03}_save_state",
-                    point_index + 1
-                )),
-            );
-            save_payload.insert(
-                "artifact_name".to_string(),
-                Value::String(format!("parameter_sweep_point_{:03}", point_index + 1)),
-            );
-            if let Some(format) = save_format.as_ref() {
-                save_payload.insert("format".to_string(), Value::String(format.clone()));
-            }
-            if let Some(dataset) = save_dataset.as_ref() {
-                save_payload.insert("dataset".to_string(), Value::String(dataset.clone()));
-            }
-            stages.push(materialize_pipeline_save_state(&point_ir, &save_payload)?);
-        }
-    }
-    Ok(stages)
-}
-
-fn apply_dynamics_overrides(
-    dynamics: &mut fullmag_ir::DynamicsIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<()> {
-    match dynamics {
-        fullmag_ir::DynamicsIR::Llg {
-            integrator,
-            fixed_timestep,
-            ..
-        } => {
-            let integrator_override = payload_string(payload, "integrator");
-            if let Some(value) = integrator_override.as_ref() {
-                *integrator = value.clone();
-            }
-            if payload.contains_key("fixed_timestep") {
-                *fixed_timestep = payload_f64(payload, "fixed_timestep")?;
-            } else if matches!(integrator_override.as_deref(), Some("rk45" | "rk23")) {
-                *fixed_timestep = None;
-            }
-        }
     }
     Ok(())
-}
-
-fn payload_string(payload: &BTreeMap<String, Value>, key: &str) -> Option<String> {
-    match payload.get(key) {
-        Some(Value::String(value)) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-        Some(Value::Number(value)) => Some(value.to_string()),
-        Some(Value::Bool(value)) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-fn normalize_pipeline_device(device: &str) -> Result<String> {
-    let normalized = device.trim().to_ascii_lowercase();
-    if matches!(normalized.as_str(), "auto" | "cpu" | "gpu" | "cuda") {
-        return Ok(normalized);
-    }
-    if let Some(index) = normalized.strip_prefix("cuda:") {
-        if !index.is_empty() && index.chars().all(|ch| ch.is_ascii_digit()) {
-            return Ok(normalized);
-        }
-    }
-    bail!("change_device requires device 'auto', 'cpu', 'gpu', 'cuda', or 'cuda:<index>'");
-}
-
-fn set_runtime_selection_device(ir: &mut ProblemIR, device: &str) {
-    let mut runtime_selection = ir
-        .problem_meta
-        .runtime_metadata
-        .get("runtime_selection")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-
-    let (device_label, device_index) = if let Some(index) = device.strip_prefix("cuda:") {
-        (
-            "cuda".to_string(),
-            index.parse::<i64>().ok().map(Value::from),
-        )
-    } else {
-        (device.to_string(), None)
-    };
-
-    runtime_selection.insert("device".to_string(), Value::String(device_label.clone()));
-    runtime_selection.insert("explicit_selection".to_string(), Value::Bool(true));
-
-    if device_label == "cpu" || device_label == "auto" {
-        runtime_selection.insert("gpu_count".to_string(), Value::from(0));
-        runtime_selection.remove("device_index");
-    } else {
-        runtime_selection.insert("gpu_count".to_string(), Value::from(1));
-        if let Some(index) = device_index {
-            runtime_selection.insert("device_index".to_string(), index);
-        } else {
-            runtime_selection.remove("device_index");
-        }
-    }
-
-    ir.problem_meta.runtime_metadata.insert(
-        "runtime_selection".to_string(),
-        Value::Object(runtime_selection),
-    );
-}
-
-fn payload_f64(payload: &BTreeMap<String, Value>, key: &str) -> Result<Option<f64>> {
-    let Some(raw_value) = payload.get(key) else {
-        return Ok(None);
-    };
-    match raw_value {
-        Value::Null => Ok(None),
-        Value::String(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            trimmed
-                .parse::<f64>()
-                .with_context(|| format!("invalid floating-point value for payload field '{key}'"))
-                .map(Some)
-        }
-        Value::Number(value) => value
-            .as_f64()
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("invalid numeric value for payload field '{key}'")),
-        _ => bail!("payload field '{key}' must be a number or numeric string"),
-    }
-}
-
-fn payload_u64(payload: &BTreeMap<String, Value>, key: &str) -> Result<Option<u64>> {
-    let Some(raw_value) = payload.get(key) else {
-        return Ok(None);
-    };
-    match raw_value {
-        Value::Null => Ok(None),
-        Value::String(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            trimmed
-                .parse::<u64>()
-                .with_context(|| format!("invalid integer value for payload field '{key}'"))
-                .map(Some)
-        }
-        Value::Number(value) => value
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("invalid integer value for payload field '{key}'")),
-        _ => bail!("payload field '{key}' must be an integer or integer string"),
-    }
-}
-
-fn payload_u32(payload: &BTreeMap<String, Value>, key: &str) -> Result<Option<u32>> {
-    payload_u64(payload, key)?.map_or(Ok(None), |value| {
-        u32::try_from(value)
-            .with_context(|| format!("payload field '{key}' does not fit into u32"))
-            .map(Some)
-    })
-}
-
-fn payload_i64(payload: &BTreeMap<String, Value>, key: &str) -> Result<Option<i64>> {
-    let Some(raw_value) = payload.get(key) else {
-        return Ok(None);
-    };
-    match raw_value {
-        Value::Null => Ok(None),
-        Value::String(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            trimmed
-                .parse::<i64>()
-                .with_context(|| format!("invalid integer value for payload field '{key}'"))
-                .map(Some)
-        }
-        Value::Number(value) => value
-            .as_i64()
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("invalid integer value for payload field '{key}'")),
-        _ => bail!("payload field '{key}' must be an integer or integer string"),
-    }
-}
-
-fn payload_bool(payload: &BTreeMap<String, Value>, key: &str) -> Result<Option<bool>> {
-    let Some(raw_value) = payload.get(key) else {
-        return Ok(None);
-    };
-    match raw_value {
-        Value::Null => Ok(None),
-        Value::Bool(value) => Ok(Some(*value)),
-        Value::String(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            match trimmed {
-                "true" => Ok(Some(true)),
-                "false" => Ok(Some(false)),
-                _ => bail!("payload field '{key}' must be a boolean or 'true'/'false' string"),
-            }
-        }
-        _ => bail!("payload field '{key}' must be a boolean"),
-    }
-}
-
-fn payload_f64_array(payload: &BTreeMap<String, Value>, key: &str) -> Result<Option<Vec<f64>>> {
-    let Some(raw_value) = payload.get(key) else {
-        return Ok(None);
-    };
-    match raw_value {
-        Value::Null => Ok(None),
-        Value::Array(values) => {
-            let mut parsed = Vec::with_capacity(values.len());
-            for (index, value) in values.iter().enumerate() {
-                let component = match value {
-                    Value::Number(number) => number.as_f64().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "invalid numeric component at payload field '{key}[{index}]'"
-                        )
-                    })?,
-                    Value::String(text) => text.trim().parse::<f64>().with_context(|| {
-                        format!(
-                            "invalid floating-point component at payload field '{key}[{index}]'"
-                        )
-                    })?,
-                    _ => {
-                        bail!(
-                            "payload field '{key}' must contain numeric values (array index {index})"
-                        )
-                    }
-                };
-                parsed.push(component);
-            }
-            Ok(Some(parsed))
-        }
-        Value::String(text) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            trimmed
-                .split(',')
-                .map(|component| {
-                    component.trim().parse::<f64>().with_context(|| {
-                        format!(
-                            "invalid floating-point component in comma-separated payload field '{key}'"
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(Some)
-        }
-        _ => bail!("payload field '{key}' must be an array or comma-separated string"),
-    }
-}
-
-fn payload_vec3(
-    payload: &BTreeMap<String, Value>,
-    key: &str,
-    default: [f64; 3],
-) -> Result<[f64; 3]> {
-    let Some(values) = payload_f64_array(payload, key)? else {
-        return Ok(default);
-    };
-    if values.len() != 3 {
-        bail!("payload field '{key}' must contain exactly 3 vector components");
-    }
-    if values.iter().any(|value| !value.is_finite()) {
-        bail!("payload field '{key}' must contain finite vector components");
-    }
-    Ok([values[0], values[1], values[2]])
-}
-
-fn payload_relaxation_algorithm(
-    payload: &BTreeMap<String, Value>,
-) -> Result<Option<fullmag_ir::RelaxationAlgorithmIR>> {
-    match payload_string(payload, "relax_algorithm") {
-        Some(value) => serde_json::from_value(Value::String(value))
-            .context("invalid relax_algorithm in study pipeline payload")
-            .map(Some),
-        None => Ok(None),
-    }
-}
-
-fn payload_relax_stop(
-    payload: &BTreeMap<String, Value>,
-    apply_legacy_defaults: bool,
-) -> Result<fullmag_ir::RelaxStopIR> {
-    let torque_tolerance_apm =
-        payload_f64(payload, "torque_tolerance_apm")?.or(payload_f64(payload, "torque_tolerance")?);
-    let energy_tolerance_j =
-        payload_f64(payload, "energy_tolerance_j")?.or(payload_f64(payload, "energy_tolerance")?);
-    let max_steps = payload_u64(payload, "max_steps")?;
-    let max_relaxation_time_s = payload_f64(payload, "max_relaxation_time_s")?;
-    let max_pseudotime_s = payload_f64(payload, "max_pseudotime_s")?;
-    let max_physical_time_s = payload_f64(payload, "max_physical_time_s")?;
-    if max_relaxation_time_s.is_some()
-        && (max_pseudotime_s.is_some() || max_physical_time_s.is_some())
-    {
-        bail!("max_relaxation_time_s conflicts with legacy max_pseudotime_s/max_physical_time_s");
-    }
-    if max_pseudotime_s.is_some()
-        && max_physical_time_s.is_some()
-        && max_pseudotime_s != max_physical_time_s
-    {
-        bail!("legacy max_pseudotime_s and max_physical_time_s conflict");
-    }
-
-    let any_explicit = torque_tolerance_apm.is_some()
-        || energy_tolerance_j.is_some()
-        || max_steps.is_some()
-        || max_relaxation_time_s.is_some()
-        || max_pseudotime_s.is_some()
-        || max_physical_time_s.is_some();
-
-    Ok(fullmag_ir::RelaxStopIR {
-        torque_tolerance_apm: if apply_legacy_defaults && !any_explicit {
-            Some(1e-4)
-        } else {
-            torque_tolerance_apm
-        },
-        energy_tolerance_j,
-        max_steps: if apply_legacy_defaults && !any_explicit {
-            Some(50_000)
-        } else {
-            max_steps
-        },
-        max_relaxation_time_s: max_relaxation_time_s
-            .or(max_physical_time_s)
-            .or(max_pseudotime_s),
-    })
-}
-
-fn payload_eigen_target(
-    payload: &BTreeMap<String, Value>,
-    default_target: fullmag_ir::EigenTargetIR,
-) -> Result<fullmag_ir::EigenTargetIR> {
-    let target_kind =
-        payload_string(payload, "eigen_target").unwrap_or_else(|| match default_target {
-            fullmag_ir::EigenTargetIR::Lowest => "lowest".to_string(),
-            fullmag_ir::EigenTargetIR::Nearest { .. } => "nearest".to_string(),
-            fullmag_ir::EigenTargetIR::FrequencyWindow { .. } => "frequency_window".to_string(),
-        });
-    match target_kind.as_str() {
-        "lowest" => Ok(fullmag_ir::EigenTargetIR::Lowest),
-        "nearest" => {
-            let default_frequency = match default_target {
-                fullmag_ir::EigenTargetIR::Nearest { frequency_hz } => Some(frequency_hz),
-                fullmag_ir::EigenTargetIR::Lowest
-                | fullmag_ir::EigenTargetIR::FrequencyWindow { .. } => None,
-            };
-            let frequency_hz = payload_f64(payload, "eigen_target_frequency")?
-                .or(default_frequency)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "study pipeline eigenmodes stage with eigen_target='nearest' requires eigen_target_frequency"
-                    )
-                })?;
-            Ok(fullmag_ir::EigenTargetIR::Nearest { frequency_hz })
-        }
-        "frequency_window" => {
-            let (default_min, default_max) = match default_target {
-                fullmag_ir::EigenTargetIR::FrequencyWindow {
-                    frequency_min_hz,
-                    frequency_max_hz,
-                } => (Some(frequency_min_hz), Some(frequency_max_hz)),
-                _ => (None, None),
-            };
-            let frequency_min_hz = payload_f64(payload, "eigen_frequency_min")?
-                .or(payload_f64(payload, "frequency_min")?)
-                .or(default_min)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "study pipeline eigenmodes stage with eigen_target='frequency_window' requires eigen_frequency_min"
-                    )
-                })?;
-            let frequency_max_hz = payload_f64(payload, "eigen_frequency_max")?
-                .or(payload_f64(payload, "frequency_max")?)
-                .or(default_max)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "study pipeline eigenmodes stage with eigen_target='frequency_window' requires eigen_frequency_max"
-                    )
-                })?;
-            Ok(fullmag_ir::EigenTargetIR::FrequencyWindow {
-                frequency_min_hz,
-                frequency_max_hz,
-            })
-        }
-        other => bail!("unsupported eigen_target value '{other}'"),
-    }
-}
-
-fn payload_equilibrium_source(
-    payload: &BTreeMap<String, Value>,
-    default_equilibrium: fullmag_ir::EquilibriumSourceIR,
-) -> Result<fullmag_ir::EquilibriumSourceIR> {
-    let default_label = match &default_equilibrium {
-        fullmag_ir::EquilibriumSourceIR::Provided => "provided",
-        fullmag_ir::EquilibriumSourceIR::RelaxedInitialState => "relax",
-        fullmag_ir::EquilibriumSourceIR::Artifact { .. } => "artifact",
-    };
-    let source = payload_string(payload, "eigen_equilibrium_source")
-        .unwrap_or_else(|| default_label.to_string());
-    match source.as_str() {
-        "provided" => Ok(fullmag_ir::EquilibriumSourceIR::Provided),
-        "relax" => Ok(fullmag_ir::EquilibriumSourceIR::RelaxedInitialState),
-        "artifact" => {
-            let path = payload_string(payload, "eigen_equilibrium_artifact").or_else(|| {
-                match default_equilibrium {
-                    fullmag_ir::EquilibriumSourceIR::Artifact { path } => Some(path),
-                    _ => None,
-                }
-            });
-            let path = path.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "study pipeline eigenmodes stage with equilibrium_source='artifact' requires eigen_equilibrium_artifact"
-                )
-            })?;
-            Ok(fullmag_ir::EquilibriumSourceIR::Artifact { path })
-        }
-        other => bail!("unsupported eigen_equilibrium_source value '{other}'"),
-    }
-}
-
-fn payload_eigen_normalization(
-    payload: &BTreeMap<String, Value>,
-) -> Result<Option<fullmag_ir::EigenNormalizationIR>> {
-    match payload_string(payload, "eigen_normalization") {
-        Some(value) => serde_json::from_value(Value::String(value))
-            .context("invalid eigen_normalization in study pipeline payload")
-            .map(Some),
-        None => Ok(None),
-    }
-}
-
-fn payload_eigen_damping_policy(
-    payload: &BTreeMap<String, Value>,
-) -> Result<Option<fullmag_ir::EigenDampingPolicyIR>> {
-    match payload_string(payload, "eigen_damping_policy") {
-        Some(value) => serde_json::from_value(Value::String(value))
-            .context("invalid eigen_damping_policy in study pipeline payload")
-            .map(Some),
-        None => Ok(None),
-    }
-}
-
-fn payload_frequency_normalization(
-    payload: &BTreeMap<String, Value>,
-) -> Result<Option<fullmag_ir::FrequencyResponseNormalizationIR>> {
-    match payload_string(payload, "frequency_normalization") {
-        Some(value) => serde_json::from_value(Value::String(value))
-            .context("invalid frequency_normalization in study pipeline payload")
-            .map(Some),
-        None => Ok(None),
-    }
-}
-
-fn payload_frequency_observable(
-    payload: &BTreeMap<String, Value>,
-) -> Result<fullmag_ir::FrequencyResponseOutputIR> {
-    let value = payload_string(payload, "frequency_observable")
-        .unwrap_or_else(|| "susceptibility_tensor".to_string());
-    serde_json::from_value(Value::String(value))
-        .context("invalid frequency_observable in study pipeline payload")
-}
-
-fn payload_k_sampling(
-    payload: &BTreeMap<String, Value>,
-    default_sampling: Option<fullmag_ir::KSamplingIR>,
-) -> Result<Option<fullmag_ir::KSamplingIR>> {
-    let parsed = match payload.get("eigen_k_vector") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                let values: Vec<f64> = trimmed
-                    .split(',')
-                    .map(|component| {
-                        component.trim().parse::<f64>().with_context(|| {
-                            "invalid eigen_k_vector component in study pipeline payload"
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                if values.len() != 3 {
-                    bail!("eigen_k_vector must contain exactly 3 comma-separated values");
-                }
-                Some([values[0], values[1], values[2]])
-            }
-        }
-        Some(Value::Array(values)) => {
-            if values.len() != 3 {
-                bail!("eigen_k_vector array must contain exactly 3 entries");
-            }
-            Some([
-                values[0]
-                    .as_f64()
-                    .ok_or_else(|| anyhow::anyhow!("invalid eigen_k_vector[0] value"))?,
-                values[1]
-                    .as_f64()
-                    .ok_or_else(|| anyhow::anyhow!("invalid eigen_k_vector[1] value"))?,
-                values[2]
-                    .as_f64()
-                    .ok_or_else(|| anyhow::anyhow!("invalid eigen_k_vector[2] value"))?,
-            ])
-        }
-        _ => bail!("eigen_k_vector must be a comma-separated string or 3-element array"),
-    };
-    Ok(match parsed {
-        Some(k_vector) => Some(fullmag_ir::KSamplingIR::Single { k_vector }),
-        None => default_sampling,
-    })
-}
-
-fn payload_spin_wave_bc(
-    payload: &BTreeMap<String, Value>,
-) -> Result<Option<fullmag_ir::SpinWaveBoundaryConditionIR>> {
-    if let Some(config) = payload.get("eigen_spin_wave_bc_config") {
-        if matches!(config, Value::Null) {
-            return Ok(None);
-        }
-        return serde_json::from_value(config.clone())
-            .context("invalid eigen_spin_wave_bc_config in study pipeline payload")
-            .map(Some);
-    }
-    match payload_string(payload, "eigen_spin_wave_bc") {
-        Some(value) => serde_json::from_value(Value::String(value))
-            .context("invalid eigen_spin_wave_bc in study pipeline payload")
-            .map(Some),
-        None => Ok(None),
-    }
-}
-
-fn payload_frequency_magnetostatic_bc(
-    payload: &BTreeMap<String, Value>,
-) -> Result<Option<fullmag_ir::MagnetostaticBoundaryConditionIR>> {
-    match payload_string(payload, "frequency_magnetostatic_bc") {
-        Some(value) => serde_json::from_value(Value::String(value))
-            .context("invalid frequency_magnetostatic_bc in study pipeline payload")
-            .map(Some),
-        None => Ok(None),
-    }
-}
-
-fn payload_frequency_solver_policy(
-    payload: &BTreeMap<String, Value>,
-    default: Option<fullmag_ir::FrequencyResponseSolverPolicyIR>,
-) -> Result<Option<fullmag_ir::FrequencyResponseSolverPolicyIR>> {
-    let method = match payload_string(payload, "frequency_solver_method") {
-        Some(value) => Some(
-            serde_json::from_value(Value::String(value))
-                .context("invalid frequency_solver_method in study pipeline payload")?,
-        ),
-        None => None,
-    };
-    let preconditioner = match payload_string(payload, "frequency_solver_preconditioner") {
-        Some(value) => Some(
-            serde_json::from_value(Value::String(value))
-                .context("invalid frequency_solver_preconditioner in study pipeline payload")?,
-        ),
-        None => None,
-    };
-    let rtol = payload_f64(payload, "frequency_solver_rtol")?;
-    let max_iterations = payload_u64(payload, "frequency_solver_max_iterations")?;
-    let restart_iterations = payload_u64(payload, "frequency_solver_restart_iterations")?;
-    if method.is_none()
-        && preconditioner.is_none()
-        && rtol.is_none()
-        && max_iterations.is_none()
-        && restart_iterations.is_none()
-    {
-        return Ok(default);
-    }
-    if let Some(rtol) = rtol {
-        if !rtol.is_finite() || rtol <= 0.0 {
-            bail!("frequency_solver_rtol must be finite and positive");
-        }
-    }
-    if matches!(max_iterations, Some(0)) {
-        bail!("frequency_solver_max_iterations must be positive");
-    }
-    if matches!(restart_iterations, Some(0)) {
-        bail!("frequency_solver_restart_iterations must be positive");
-    }
-    if let (Some(restart), Some(max)) = (restart_iterations, max_iterations) {
-        if restart > max {
-            bail!("frequency_solver_restart_iterations must be <= frequency_solver_max_iterations");
-        }
-    }
-    Ok(Some(fullmag_ir::FrequencyResponseSolverPolicyIR {
-        method,
-        preconditioner,
-        rtol,
-        max_iterations,
-        restart_iterations,
-    }))
-}
-
-fn apply_pipeline_set_field(
-    problem: &mut ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<()> {
-    let axis = payload_axis(payload, "axis", [0.0, 0.0, 1.0])?;
-    let field_mt = payload_f64(payload, "field_mT")?.unwrap_or(50.0);
-    apply_pipeline_external_field(problem, scaled_axis(axis, field_mt * 1e-3));
-    Ok(())
-}
-
-fn apply_pipeline_set_current(
-    problem: &mut ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<()> {
-    let axis = payload_axis(payload, "direction", [1.0, 0.0, 0.0])?;
-    let current_density = payload_f64(payload, "current_density")?.unwrap_or(1e10);
-    problem.current_density = Some(scaled_axis(axis, current_density));
-    Ok(())
-}
-
-fn apply_pipeline_set_transport_current(
-    problem: &mut ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<()> {
-    let module_id = payload_string(payload, "module_id")
-        .filter(|value| !value.trim().is_empty())
-        .context("study pipeline set_transport_current requires payload.module_id")?;
-    let raw_values = payload
-        .get("terminal_outward_current_density_Apm2")
-        .and_then(Value::as_object)
-        .context(
-            "study pipeline set_transport_current requires payload.terminal_outward_current_density_Apm2 object",
-        )?;
-    if raw_values.is_empty() {
-        bail!("study pipeline set_transport_current terminal map must not be empty");
-    }
-    let mut values = BTreeMap::new();
-    for (boundary_id, raw_value) in raw_values {
-        if boundary_id.trim().is_empty() {
-            bail!("study pipeline set_transport_current boundary ids must be non-empty");
-        }
-        let value = match raw_value {
-            Value::Number(number) => number.as_f64(),
-            Value::String(text) => text.trim().parse::<f64>().ok(),
-            _ => None,
-        }
-        .with_context(|| {
-            format!(
-                "study pipeline set_transport_current boundary '{}' must carry a finite A/m^2 value",
-                boundary_id
-            )
-        })?;
-        if !value.is_finite() {
-            bail!(
-                "study pipeline set_transport_current boundary '{}' must carry a finite A/m^2 value",
-                boundary_id
-            );
-        }
-        values.insert(boundary_id.as_str(), value);
-    }
-
-    let matching: Vec<_> = problem
-        .current_modules
-        .iter()
-        .enumerate()
-        .filter_map(|(index, module)| match module {
-            fullmag_ir::CurrentModuleIR::CurrentTransport { name, .. } if name == &module_id => {
-                Some(index)
-            }
-            _ => None,
-        })
-        .collect();
-    let [module_index] = matching.as_slice() else {
-        bail!(
-            "study pipeline set_transport_current module_id '{}' must identify exactly one CurrentTransport",
-            module_id
-        );
-    };
-    let fullmag_ir::CurrentModuleIR::CurrentTransport { definition, .. } =
-        &mut problem.current_modules[*module_index]
-    else {
-        unreachable!("matching index must identify CurrentTransport");
-    };
-    let definition = definition
-        .as_mut()
-        .context("study pipeline set_transport_current requires a complete transport definition")?;
-    let electrode_ids: std::collections::BTreeSet<_> = definition
-        .boundaries
-        .iter()
-        .filter_map(|boundary| match boundary {
-            fullmag_ir::ChargeBoundaryIR::NormalCurrentElectrode { id, .. } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let supplied_ids: std::collections::BTreeSet<_> = values.keys().copied().collect();
-    if supplied_ids != electrode_ids {
-        let missing: Vec<_> = electrode_ids.difference(&supplied_ids).copied().collect();
-        let unexpected: Vec<_> = supplied_ids.difference(&electrode_ids).copied().collect();
-        bail!(
-            "study pipeline set_transport_current must cover exactly the normal-current electrodes; missing={:?}, unexpected={:?}",
-            missing,
-            unexpected
-        );
-    }
-    for boundary in &mut definition.boundaries {
-        if let fullmag_ir::ChargeBoundaryIR::NormalCurrentElectrode {
-            id,
-            outward_current_density_apm2,
-            ..
-        } = boundary
-        {
-            *outward_current_density_apm2 = values[id.as_str()];
-        }
-    }
-    Ok(())
-}
-
-fn apply_pipeline_set_spin_torque_enabled(
-    problem: &mut ProblemIR,
-    payload: &BTreeMap<String, Value>,
-) -> Result<()> {
-    let module_id = payload_string(payload, "module_id")
-        .filter(|value| !value.trim().is_empty())
-        .context("study pipeline set_spin_torque_enabled requires payload.module_id")?;
-    let enabled = payload
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .context("study pipeline set_spin_torque_enabled requires boolean payload.enabled")?;
-
-    let typed_matches = problem
-        .spin_torque_modules
-        .iter()
-        .filter(|module| match module {
-            fullmag_ir::SpinTorqueModuleIR::Slonczewski { id, .. }
-            | fullmag_ir::SpinTorqueModuleIR::ZhangLi { id, .. } => {
-                id.as_deref() == Some(module_id.as_str())
-            }
-            fullmag_ir::SpinTorqueModuleIR::DriftDiffusionSpinTorque { id, .. }
-            | fullmag_ir::SpinTorqueModuleIR::PrescribedSot { id, .. } => id == &module_id,
-            fullmag_ir::SpinTorqueModuleIR::InterfaceCpp { .. }
-            | fullmag_ir::SpinTorqueModuleIR::DriftDiffusion { .. }
-            | fullmag_ir::SpinTorqueModuleIR::SpinOrbitTorque { .. } => false,
-        })
-        .count();
-    if typed_matches != 1 {
-        bail!(
-            "study pipeline set_spin_torque_enabled module_id '{}' must identify exactly one typed spin torque module",
-            module_id
-        );
-    }
-
-    let graph = problem
-        .physics_graph
-        .as_mut()
-        .and_then(Value::as_object_mut)
-        .context("study pipeline set_spin_torque_enabled requires physics_graph.v1")?;
-    if graph.get("schema_version").and_then(Value::as_str) != Some("physics_graph.v1") {
-        bail!("study pipeline set_spin_torque_enabled requires physics_graph.v1");
-    }
-    let modules = graph
-        .get_mut("modules")
-        .and_then(Value::as_array_mut)
-        .context("physics_graph.v1 modules must be an array")?;
-    let matching_graph_indices: Vec<_> = modules
-        .iter()
-        .enumerate()
-        .filter_map(|(index, module)| {
-            (module.get("id").and_then(Value::as_str) == Some(module_id.as_str())
-                && module.get("kind").and_then(Value::as_str) == Some("spin_torque"))
-            .then_some(index)
-        })
-        .collect();
-    let [module_index] = matching_graph_indices.as_slice() else {
-        bail!(
-            "study pipeline set_spin_torque_enabled module_id '{}' must identify exactly one physics_graph spin_torque module",
-            module_id
-        );
-    };
-    let activation = if enabled { "active" } else { "inactive" };
-    modules[*module_index]
-        .as_object_mut()
-        .expect("matching graph module must be an object")
-        .insert(
-            "activation".to_string(),
-            Value::String(activation.to_string()),
-        );
-
-    let edges = graph
-        .get_mut("edges")
-        .and_then(Value::as_array_mut)
-        .context("physics_graph.v1 edges must be an array")?;
-    for edge in edges {
-        if edge.get("target_id").and_then(Value::as_str) == Some(module_id.as_str()) {
-            edge.as_object_mut()
-                .expect("physics graph edge must be an object")
-                .insert("status".to_string(), Value::String(activation.to_string()));
-        }
-    }
-    propagate_disabled_transport_pipeline(graph, &module_id)?;
-    Ok(())
-}
-
-fn graph_module_is_active(module: &Value) -> bool {
-    matches!(
-        module.get("activation").and_then(Value::as_str),
-        Some("active" | "configured")
-    )
-}
-
-fn set_graph_module_activation(module: &mut Value, active: bool) {
-    module
-        .as_object_mut()
-        .expect("physics graph module must be an object")
-        .insert(
-            "activation".to_string(),
-            Value::String(if active { "active" } else { "inactive" }.to_string()),
-        );
-}
-
-/// Propagate a stage-local torque action through its solved transport pipeline.
-///
-/// The typed torque node is the user-facing switch, but an inactive transport
-/// consumer must not leave its upstream charge/spin solver executable during a
-/// preparation stage.  Conversely, enabling the torque reactivates the same
-/// source and transport nodes before the following run.  The graph remains
-/// present for provenance in both cases.
-fn propagate_disabled_transport_pipeline(
-    graph: &mut serde_json::Map<String, Value>,
-    changed_torque_id: &str,
-) -> Result<()> {
-    let modules = graph
-        .get("modules")
-        .and_then(Value::as_array)
-        .context("physics_graph.v1 modules must be an array")?;
-    let snapshot = modules
-        .iter()
-        .map(|module| {
-            (
-                module
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                module
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                module
-                    .get("depends_on")
-                    .and_then(Value::as_array)
-                    .map(|dependencies| {
-                        dependencies
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
-                graph_module_is_active(module),
-            )
-        })
-        .collect::<Vec<_>>();
-    let changed = snapshot
-        .iter()
-        .find(|(id, kind, _, _)| id == changed_torque_id && kind == "spin_torque");
-    let Some((_, _, changed_dependencies, _)) = changed else {
-        return Ok(());
-    };
-    let affected_transport_ids = changed_dependencies
-        .iter()
-        .filter(|dependency| {
-            snapshot
-                .iter()
-                .any(|(id, kind, _, _)| id == *dependency && kind == "spin_transport")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if affected_transport_ids.is_empty() {
-        return Ok(());
-    }
-
-    let mut desired_transport = BTreeMap::new();
-    let mut affected_sources = BTreeMap::<String, Vec<String>>::new();
-    for transport_id in &affected_transport_ids {
-        let consumers = snapshot
-            .iter()
-            .filter(|(_, kind, dependencies, _)| {
-                kind == "spin_torque" && dependencies.iter().any(|id| id == transport_id)
-            })
-            .collect::<Vec<_>>();
-        if consumers.is_empty() {
-            continue;
-        }
-        desired_transport.insert(
-            transport_id.clone(),
-            consumers.iter().any(|(_, _, _, active)| *active),
-        );
-        if let Some((_, _, dependencies, _)) = snapshot
-            .iter()
-            .find(|(id, kind, _, _)| id == transport_id && kind == "spin_transport")
-        {
-            for source_id in dependencies {
-                if snapshot
-                    .iter()
-                    .any(|(id, kind, _, _)| id == source_id && kind == "current_transport")
-                {
-                    affected_sources
-                        .entry(source_id.clone())
-                        .or_default()
-                        .push(transport_id.clone());
-                }
-            }
-        }
-    }
-
-    let mut desired_source = BTreeMap::new();
-    for (source_id, transports) in &affected_sources {
-        let active_dependent = snapshot.iter().any(|(id, kind, dependencies, active)| {
-            id != source_id
-                && dependencies
-                    .iter()
-                    .any(|dependency| dependency == source_id)
-                && if kind == "spin_transport" {
-                    transports
-                        .iter()
-                        .find_map(|transport_id| {
-                            (id == transport_id).then(|| desired_transport[transport_id])
-                        })
-                        .unwrap_or(*active)
-                } else {
-                    *active
-                }
-        });
-        desired_source.insert(source_id.clone(), active_dependent);
-    }
-
-    let modules = graph
-        .get_mut("modules")
-        .and_then(Value::as_array_mut)
-        .context("physics_graph.v1 modules must be an array")?;
-    for module in modules.iter_mut() {
-        let id = module.get("id").and_then(Value::as_str).unwrap_or_default();
-        let kind = module
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if let Some(active) = desired_source.get(id) {
-            set_graph_module_activation(module, *active);
-            continue;
-        }
-        if kind == "spin_transport" {
-            if let Some(active) = desired_transport.get(id) {
-                let source_active = module
-                    .get("depends_on")
-                    .and_then(Value::as_array)
-                    .and_then(|dependencies| dependencies.first())
-                    .and_then(Value::as_str)
-                    .and_then(|source_id| desired_source.get(source_id))
-                    .copied()
-                    .unwrap_or(true);
-                set_graph_module_activation(module, *active && source_active);
-            }
-        }
-    }
-
-    let module_status = modules
-        .iter()
-        .filter_map(|module| {
-            Some((
-                module.get("id")?.as_str()?.to_string(),
-                graph_module_is_active(module),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    for module in modules.iter_mut() {
-        let kind = module
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !matches!(kind, "spin_interface" | "spin_torque" | "oersted_field") {
-            continue;
-        }
-        let dependencies = module
-            .get("depends_on")
-            .and_then(Value::as_array)
-            .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-            .unwrap_or_default();
-        if dependencies
-            .iter()
-            .any(|dependency| module_status.get(*dependency) == Some(&false))
-        {
-            set_graph_module_activation(module, false);
-        } else if matches!(kind, "spin_interface" | "oersted_field") {
-            set_graph_module_activation(module, true);
-        }
-    }
-
-    let module_status = modules
-        .iter()
-        .filter_map(|module| {
-            Some((
-                module.get("id")?.as_str()?.to_string(),
-                module
-                    .get("activation")
-                    .and_then(Value::as_str)
-                    .unwrap_or("inactive")
-                    .to_string(),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let edges = graph
-        .get_mut("edges")
-        .and_then(Value::as_array_mut)
-        .context("physics_graph.v1 edges must be an array")?;
-    for edge in edges {
-        let Some(target_id) = edge.get("target_id").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(status) = module_status.get(target_id) else {
-            continue;
-        };
-        edge.as_object_mut()
-            .expect("physics graph edge must be an object")
-            .insert("status".to_string(), Value::String(status.clone()));
-    }
-    Ok(())
-}
-
-fn apply_pipeline_external_field(problem: &mut ProblemIR, field_t: [f64; 3]) {
-    for term in &mut problem.energy_terms {
-        if let fullmag_ir::EnergyTermIR::Zeeman { b } = term {
-            *b = field_t;
-            return;
-        }
-    }
-    problem
-        .energy_terms
-        .push(fullmag_ir::EnergyTermIR::Zeeman { b: field_t });
-}
-
-fn payload_axis(
-    payload: &BTreeMap<String, Value>,
-    key: &str,
-    default_axis: [f64; 3],
-) -> Result<[f64; 3]> {
-    let Some(raw_value) = payload.get(key) else {
-        return Ok(default_axis);
-    };
-    match raw_value {
-        Value::Null => Ok(default_axis),
-        Value::String(value) => {
-            if value.trim().is_empty() {
-                Ok(default_axis)
-            } else {
-                parse_axis_spec(value, key)
-            }
-        }
-        Value::Array(values) => {
-            if values.len() != 3 {
-                bail!("payload field '{key}' must contain exactly 3 axis components");
-            }
-            let axis = [
-                values[0].as_f64().ok_or_else(|| {
-                    anyhow::anyhow!("invalid axis component for payload field '{key}'")
-                })?,
-                values[1].as_f64().ok_or_else(|| {
-                    anyhow::anyhow!("invalid axis component for payload field '{key}'")
-                })?,
-                values[2].as_f64().ok_or_else(|| {
-                    anyhow::anyhow!("invalid axis component for payload field '{key}'")
-                })?,
-            ];
-            normalize_axis(axis, key)
-        }
-        _ => bail!("payload field '{key}' must be an axis string or 3-element array"),
-    }
-}
-
-fn parse_axis_spec(raw: &str, key: &str) -> Result<[f64; 3]> {
-    let trimmed = raw.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let axis = match lower.as_str() {
-        "x" | "+x" => Some([1.0, 0.0, 0.0]),
-        "-x" => Some([-1.0, 0.0, 0.0]),
-        "y" | "+y" => Some([0.0, 1.0, 0.0]),
-        "-y" => Some([0.0, -1.0, 0.0]),
-        "z" | "+z" => Some([0.0, 0.0, 1.0]),
-        "-z" => Some([0.0, 0.0, -1.0]),
-        _ => None,
-    };
-    if let Some(axis) = axis {
-        return Ok(axis);
-    }
-    let values: Vec<f64> = trimmed
-        .split(',')
-        .map(|component| {
-            component
-                .trim()
-                .parse::<f64>()
-                .with_context(|| format!("invalid axis component in payload field '{key}'"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if values.len() != 3 {
-        bail!("payload field '{key}' must be a named axis or 3 comma-separated values");
-    }
-    normalize_axis([values[0], values[1], values[2]], key)
-}
-
-fn normalize_axis(axis: [f64; 3], key: &str) -> Result<[f64; 3]> {
-    let norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
-    if norm <= f64::EPSILON {
-        bail!("payload field '{key}' must not be the zero vector");
-    }
-    Ok([axis[0] / norm, axis[1] / norm, axis[2] / norm])
-}
-
-fn scaled_axis(axis: [f64; 3], magnitude: f64) -> [f64; 3] {
-    [
-        axis[0] * magnitude,
-        axis[1] * magnitude,
-        axis[2] * magnitude,
-    ]
-}
-
-fn linear_sweep_values(start: f64, stop: f64, steps: u64) -> Result<Vec<f64>> {
-    if steps == 0 {
-        bail!("linear sweep requires at least one point");
-    }
-    if steps == 1 {
-        return Ok(vec![start]);
-    }
-    let denominator = (steps - 1) as f64;
-    Ok((0..steps)
-        .map(|index| {
-            let t = index as f64 / denominator;
-            start + (stop - start) * t
-        })
-        .collect())
 }
 
 pub(crate) fn apply_continuation_initial_state(
@@ -4005,13 +1037,18 @@ pub(crate) fn apply_continuation_initial_state(
         return Ok(());
     }
 
+    let has_shared_domain = problem
+        .geometry_assets
+        .as_ref()
+        .and_then(|assets| assets.fem_domain_mesh_asset.as_ref())
+        .is_some();
     let shared_domain_node_count = problem
         .geometry_assets
         .as_ref()
         .and_then(|assets| assets.fem_domain_mesh_asset.as_ref())
         .and_then(|asset| asset.mesh.as_ref())
         .map(|mesh| mesh.nodes.len());
-    let planned_fem_node_count = if shared_domain_node_count.is_some() {
+    let planned_fem_node_count = if has_shared_domain {
         match planned_fem_mesh_node_count(problem) {
             Ok(node_count) => node_count,
             Err(_error) if shared_domain_node_count == Some(final_magnetization.len()) => None,
@@ -4069,7 +1106,9 @@ fn planned_fem_mesh_node_count(problem: &ProblemIR) -> Result<Option<usize>> {
         BackendPlanIR::Fem(fem) => Some(fem.mesh.nodes.len()),
         BackendPlanIR::FemEigen(fem) => Some(fem.mesh.nodes.len()),
         BackendPlanIR::FemFrequencyResponse(fem) => Some(fem.mesh.nodes.len()),
-        BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => None,
+        BackendPlanIR::AntennaExternalLeadInspection(_)
+        | BackendPlanIR::Fdm(_)
+        | BackendPlanIR::FdmMultilayer(_) => None,
     })
 }
 
@@ -4129,6 +1168,9 @@ pub(crate) fn continuation_source_from_backend_plan(
     backend_plan: &BackendPlanIR,
 ) -> ContinuationSource {
     match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => ContinuationSource::Unsupported(
+            "antenna inspection does not define a magnetic continuation carrier".to_string(),
+        ),
         BackendPlanIR::Fdm(plan) => match fdm_continuation_identity(plan) {
             Ok(identity) => ContinuationSource::Fdm(identity),
             Err(error) => ContinuationSource::Unsupported(error.to_string()),
@@ -4302,6 +1344,9 @@ pub(crate) fn resample_continuation_if_cross_backend(
             // Multi-layer FDM continuation from FEM is not yet supported.
             bail!("FEM → FDM-multilayer cross-backend continuation is not yet supported");
         }
+        (_, BackendPlanIR::AntennaExternalLeadInspection(_)) => {
+            bail!("antenna inspection does not accept cross-backend magnetization transfer")
+        }
         (ContinuationSource::Unsupported(_), _) => unreachable!(),
     }
 }
@@ -4471,7 +1516,8 @@ pub(crate) fn estimate_fem_dense_ram(node_count: usize) -> u64 {
 
 pub(crate) fn read_ir(path: &Path) -> Result<ProblemIR> {
     let content = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&content)?)
+    let problem = serde_json::from_str(&content)?;
+    fullmag_application::bind_declared_execution(&problem, vec![]).map_err(anyhow::Error::msg)
 }
 
 pub(crate) fn validate_ir(ir: &ProblemIR) -> Result<()> {
@@ -4600,6 +1646,23 @@ fn resolve_interactive_llg_policy(
     Ok(())
 }
 
+pub(crate) fn build_initial_interactive_command_stage(
+    authored_stage: &ResolvedScriptStage,
+    bound_problem: &ProblemIR,
+    command: &crate::types::SessionCommand,
+) -> Result<Option<ResolvedScriptStage>> {
+    let mut effective_command = command.clone();
+    // Compute solves the already materialized study; TimeEvolution IR keeps
+    // its duration in ResolvedScriptStage rather than in StudyIR.
+    if command.kind == "solve"
+        && command.until_seconds.is_none()
+        && matches!(&bound_problem.study, fullmag_ir::StudyIR::TimeEvolution { .. })
+    {
+        effective_command.until_seconds = Some(authored_stage.until_seconds);
+    }
+    build_interactive_command_stage(bound_problem, &effective_command)
+}
+
 pub(crate) fn build_interactive_command_stage(
     base_problem: &ProblemIR,
     command: &crate::types::SessionCommand,
@@ -4611,7 +1674,8 @@ pub(crate) fn build_interactive_command_stage(
             solve_command.kind = match &base_problem.study {
                 fullmag_ir::StudyIR::Relaxation { .. } => "relax".to_string(),
                 fullmag_ir::StudyIR::TimeEvolution { .. } => "run".to_string(),
-                fullmag_ir::StudyIR::Eigenmodes { .. }
+                fullmag_ir::StudyIR::AntennaFieldSolve { .. }
+                | fullmag_ir::StudyIR::Eigenmodes { .. }
                 | fullmag_ir::StudyIR::FrequencyResponse { .. }
                 | fullmag_ir::StudyIR::Hysteresis { .. } => {
                     anyhow::bail!("interactive 'solve' is not supported for this study kind")
@@ -4693,7 +1757,9 @@ pub(crate) fn build_interactive_command_stage(
             // Default relax_alpha = 1.0 for optimal overdamped convergence
             // (user can still override to any value via command.relax_alpha)
             if algorithm == fullmag_ir::RelaxationAlgorithmIR::LlgOverdamped {
-                let effective_alpha = command.relax_alpha.or_else(|| (!preserve_authored).then_some(1.0));
+                let effective_alpha = command
+                    .relax_alpha
+                    .or_else(|| (!preserve_authored).then_some(1.0));
                 if let Some(effective_alpha) = effective_alpha {
                     for mat in &mut ir.materials {
                         mat.damping = effective_alpha;
@@ -4866,15 +1932,11 @@ pub(crate) fn bind_frozen_spins_replan_to_paused_command(
 pub(crate) fn build_resumable_interactive_command(
     command: &crate::types::SessionCommand,
     stage_result: &fullmag_runner::RunResult,
+    elapsed_seconds: f64,
 ) -> Option<crate::types::SessionCommand> {
     match command.kind.as_str() {
         "run" => {
             let requested_until_seconds = command.until_seconds?;
-            let elapsed_seconds = stage_result
-                .steps
-                .last()
-                .map(|step| step.time)
-                .unwrap_or(0.0);
             let remaining_until_seconds = (requested_until_seconds - elapsed_seconds).max(0.0);
             if remaining_until_seconds <= 0.0 {
                 return None;
@@ -5091,6 +2153,94 @@ mod tests {
             "until_seconds": 1e-12
         }))
         .expect("minimal solver command")
+    }
+
+    #[test]
+    fn antenna_field_solve_pipeline_uses_the_dedicated_planner_lane() {
+        let mut problem = sample_problem_ir();
+        problem.backend_policy.requested_backend = fullmag_ir::BackendTarget::Fdm;
+        let payload = BTreeMap::from([
+            ("stage_id".to_string(), json!("solve_antenna")),
+            ("port_mode_ids".to_string(), json!(["drive"])),
+        ]);
+        let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
+            ir: problem,
+            shared_geometry_assets: None,
+            default_until_seconds: None,
+            study_pipeline: Some(StudyPipelineDocument {
+                version: "study_pipeline.v1".to_string(),
+                nodes: vec![StudyPipelineNode::Primitive {
+                    id: "solve_antenna".to_string(),
+                    label: "Antenna field solve".to_string(),
+                    enabled: true,
+                    notes: None,
+                    source: None,
+                    stage_kind: "antenna_field_solve".to_string(),
+                    payload,
+                }],
+            }),
+            stages: vec![],
+        };
+        let error = materialize_script_stages(config)
+            .expect_err("FDM antenna precomputation must fail closed");
+        let message = format!("{error:#}");
+        assert!(message
+            .contains("antenna field precomputation requires requested_backend='fem'"));
+        assert!(!message.contains("not yet executable by the runtime"));
+    }
+
+    #[test]
+    fn antenna_lead_preflight_deferral_checks_root_and_future_stage_intent() {
+        let mut config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(), ir: sample_problem_ir(),
+            shared_geometry_assets: None, default_until_seconds: None,
+            study_pipeline: None, stages: vec![],
+        };
+        assert!(!requires_antenna_lead_materialization(&config));
+        let module = serde_json::from_value(json!({
+            "kind":"current_transport", "name":"charge", "model":"ohmic_poisson", "coupling":"one_way",
+            "domain":[{"object_id":"device"}], "materials":[{"region":{"object_id":"device"},"material":{"sigma_Spm":4e7}}],
+            "boundaries":[], "gauge":"terminal_reference", "solver":{"engine":"cg", "linear":{"relative_tolerance":1e-10,"absolute_tolerance":0.,"max_iterations":100},
+            "operator_version":"fem_charge_conforming_h1_p1.transparent.v1","physical_residual_version":"charge_balance_integrated_l2.v1"},
+            "external_lead_preparation":{"schema_version":"antenna_external_lead_preparation.v1","kind":"isolated_branch_straight_stubs","revision":"r1",
+            "extensions":[{"id":"minus","observation_id":"observe-minus","object_id":"device","boundary_markers":[11],"length_m":1e-6,"outward_direction_xyz":[-1.,0.,0.],"conductivity_spm":4e7},
+            {"id":"plus","observation_id":"observe-plus","object_id":"device","boundary_markers":[12],"length_m":1e-6,"outward_direction_xyz":[1.,0.,0.],"conductivity_spm":4e7}],
+            "drives":[{"id":"drive","port_mode_ref":"port","outer_terminal_currents_a":{"minus":-0.002,"plus":0.002}}]}
+        })).expect("authored lead module");
+        config.ir.current_modules.push(module);
+        assert!(requires_antenna_lead_materialization(&config));
+        let stage_ir = config.ir.clone();
+        config.ir.current_modules.clear();
+        config.stages.push(fullmag_application::script_stage_contract::ScriptExecutionStage {
+            ir: stage_ir, default_until_seconds: None, entrypoint_kind: "flat_workspace".into(), action: None,
+        });
+        assert!(requires_antenna_lead_materialization(&config));
+        config.stages[0].ir.current_modules.clear();
+        assert!(!requires_antenna_lead_materialization(&config));
+    }
+
+    #[test]
+    fn initial_solve_uses_authored_run_duration_and_preserves_explicit_override() {
+        let problem = sample_problem_ir();
+        let authored = ResolvedScriptStage::solver(problem.clone(), 7e-12, "flat_run");
+        let mut command = solver_command("solve");
+        command.until_seconds = None;
+        let stage = build_initial_interactive_command_stage(&authored, &problem, &command)
+            .expect("authored solve should build")
+            .expect("solve should produce a stage");
+        assert_eq!(stage.until_seconds, 7e-12);
+        assert_eq!(command.until_seconds, None);
+
+        command.until_seconds = Some(2e-12);
+        let overridden = build_initial_interactive_command_stage(&authored, &problem, &command)
+            .expect("explicit solve duration should build")
+            .expect("solve should produce a stage");
+        assert_eq!(overridden.until_seconds, 2e-12);
+
+        command.kind = "run".to_string();
+        command.until_seconds = None;
+        assert!(build_initial_interactive_command_stage(&authored, &problem, &command).is_err());
     }
 
     fn frozen_spins_binding_command(source_scene_revision: u64) -> crate::types::SessionCommand {
@@ -5573,6 +2723,95 @@ mod tests {
     }
 
     #[test]
+    fn imported_magnetization_validation_rejects_wrong_size_without_mutating_problem() {
+        let problem = fullmag_ir::ProblemIR::bootstrap_example();
+        let before = serde_json::to_value(&problem).expect("problem should serialize");
+        let plan = fullmag_plan::plan(&problem).expect("bootstrap plan should resolve");
+        let BackendPlanIR::Fdm(fdm) = plan.backend_plan else {
+            panic!("bootstrap import fixture requires FDM");
+        };
+        let expected = fdm.initial_magnetization.len();
+        assert!(expected > 1);
+        for count in [0, expected - 1, expected + 1] {
+            let error = validate_imported_magnetization(&problem, &vec![[1.0, 0.0, 0.0]; count])
+                .expect_err("mismatched carrier size must be rejected");
+            assert!(error.to_string().contains("length mismatch"));
+            assert_eq!(serde_json::to_value(&problem).unwrap(), before);
+        }
+        validate_imported_magnetization(&problem, &vec![[0.0, 1.0, 0.0]; expected])
+            .expect("matching sampled state should be accepted privately");
+        assert_eq!(serde_json::to_value(&problem).unwrap(), before);
+    }
+
+    #[test]
+    fn imported_fem_state_requires_global_nodes_not_local_initializer() {
+        let mut mesh: fullmag_ir::MeshIR = serde_json::from_str(include_str!(
+            "../tests/fixtures/import_shared_domain.mesh.json"
+        ))
+        .expect("shared-domain fixture should parse");
+        mesh.element_markers[1] = 0;
+        let problem = fem_target_problem_ir(mesh);
+        let before = serde_json::to_value(&problem).unwrap();
+        let mut local = problem.clone();
+        apply_continuation_initial_state(&mut local, &vec![[1.0, 0.0, 0.0]; 4]).unwrap();
+        fullmag_plan::plan(&local).expect("local magnetic initializer is legal for authoring");
+        let error = validate_imported_magnetization(&problem, &vec![[1.0, 0.0, 0.0]; 4])
+            .expect_err("local initializer is not a global runtime carrier");
+        assert!(error.to_string().contains("global flat carrier"));
+        validate_imported_magnetization(&problem, &vec![[0.0, 1.0, 0.0]; 5])
+            .expect("global carrier should be accepted");
+        assert_eq!(serde_json::to_value(&problem).unwrap(), before);
+    }
+
+    #[test]
+    fn imported_fem_state_supports_multi_magnet_source_only_mesh() {
+        let mesh = serde_json::from_str(include_str!(
+            "../tests/fixtures/import_shared_domain.mesh.json"
+        ))
+        .expect("shared-domain fixture should parse");
+        let mut problem = fem_target_problem_ir(mesh);
+        problem.geometry.entries.push(fullmag_ir::GeometryEntryIR::Box {
+            name: "ring".to_string(),
+            size: [1.0, 1.0, 1.0],
+        });
+        problem.regions.push(fullmag_ir::RegionIR {
+            name: "ring".to_string(),
+            geometry: "ring".to_string(),
+        });
+        let mut ring = problem.magnets[0].clone();
+        ring.object_id = Some("ring".to_string());
+        ring.name = "ring".to_string();
+        ring.region = "ring".to_string();
+        problem.magnets.push(ring);
+        let asset = problem.geometry_assets.as_mut().unwrap()
+            .fem_domain_mesh_asset.as_mut().unwrap();
+        asset.region_markers.push(fullmag_ir::FemDomainRegionMarkerIR {
+            geometry_name: "ring".to_string(),
+            marker: 2,
+        });
+        asset.mesh = None;
+        asset.mesh_source = Some(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/import_shared_domain.mesh.json")
+                .display().to_string(),
+        );
+        let before = serde_json::to_value(&problem).unwrap();
+        let plan = fullmag_plan::plan(&problem).expect("source-only shared domain should resolve");
+        let BackendPlanIR::Fem(fem) = plan.backend_plan else {
+            panic!("source-only import fixture requires FEM");
+        };
+        let expected = fem.mesh.nodes.len();
+        assert_eq!(expected, 8, "shared magnetic interface nodes are packed per object");
+        validate_imported_magnetization(&problem, &vec![[0.0, 1.0, 0.0]; expected])
+            .expect("source-only multi-magnet global carrier should be accepted");
+        for count in [5, expected - 1] {
+            validate_imported_magnetization(&problem, &vec![[0.0, 1.0, 0.0]; count])
+                .expect_err("source mesh node count is not the resolved runtime carrier length");
+        }
+        assert_eq!(serde_json::to_value(&problem).unwrap(), before);
+    }
+
+    #[test]
     fn continuation_initial_state_supports_multi_magnet_shared_domain() {
         let mut problem = sample_problem_ir();
         problem.backend_policy.requested_backend = fullmag_ir::BackendTarget::Fem;
@@ -5993,8 +3232,91 @@ mod tests {
     }
 
     #[test]
+    fn materialize_script_stages_does_not_synthesize_solver_for_empty_pipeline() {
+        let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
+            ir: sample_problem_ir(),
+            shared_geometry_assets: None,
+            default_until_seconds: Some(5e-12),
+            study_pipeline: Some(StudyPipelineDocument {
+                version: "study_pipeline.v1".to_string(),
+                nodes: vec![],
+            }),
+            stages: vec![],
+        };
+        assert!(materialize_script_stages(config).expect("empty pipeline").is_empty());
+    }
+
+    #[test]
+    fn materialize_script_stages_does_not_synthesize_solver_for_disabled_pipeline() {
+        let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
+            ir: sample_problem_ir(),
+            shared_geometry_assets: None,
+            default_until_seconds: Some(5e-12),
+            study_pipeline: Some(StudyPipelineDocument {
+                version: "study_pipeline.v1".to_string(),
+                nodes: vec![StudyPipelineNode::Primitive {
+                    id: "disabled_run".to_string(),
+                    label: "Disabled run".to_string(),
+                    enabled: false,
+                    notes: None,
+                    source: Some("script_imported".to_string()),
+                    stage_kind: "run".to_string(),
+                    payload: serde_json::from_value(json!({"until_seconds": "5e-12"}))
+                        .expect("payload"),
+                }],
+            }),
+            stages: vec![],
+        };
+        assert!(materialize_script_stages(config).expect("disabled pipeline").is_empty());
+    }
+
+    #[test]
+    fn materialize_script_stages_skips_enabled_children_of_disabled_group() {
+        let document = serde_json::from_value(json!({
+            "version": "study_pipeline.v1",
+            "nodes": [{
+                "node_kind": "group", "id": "disabled_group", "label": "Disabled",
+                "enabled": false,
+                "children": [{
+                    "node_kind": "primitive", "id": "child_run", "label": "Run",
+                    "enabled": true, "stage_kind": "run",
+                    "payload": {"until_seconds": "5e-12"}
+                }]
+            }]
+        })).expect("group document");
+        let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
+            ir: sample_problem_ir(),
+            shared_geometry_assets: None,
+            default_until_seconds: Some(5e-12),
+            study_pipeline: Some(document),
+            stages: vec![],
+        };
+        assert!(materialize_script_stages(config).expect("disabled group").is_empty());
+    }
+
+    #[test]
+    fn materialize_script_stages_retains_legacy_solver_without_pipeline() {
+        let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
+            ir: sample_problem_ir(),
+            shared_geometry_assets: None,
+            default_until_seconds: Some(5e-12),
+            study_pipeline: None,
+            stages: vec![],
+        };
+        let stages = materialize_script_stages(config).expect("legacy solver");
+        assert_eq!(stages.len(), 1);
+        assert!(stages[0].action.is_none());
+        assert!((stages[0].until_seconds - 5e-12).abs() < 1e-24);
+    }
+
+    #[test]
     fn materialize_script_stages_uses_study_pipeline_when_explicit_stages_are_absent() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(5e-12),
@@ -6064,6 +3386,7 @@ mod tests {
     #[test]
     fn stage_local_table_autosave_is_owned_by_relaxation_only() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(5e-12),
@@ -6130,6 +3453,7 @@ mod tests {
     fn stage_local_autosave_materializes_without_leaking_to_following_stage() {
         let config = ScriptExecutionConfig {
             ir: sample_problem_ir(),
+            antenna_inventory: Default::default(),
             shared_geometry_assets: None,
             default_until_seconds: Some(5e-12),
             study_pipeline: Some(StudyPipelineDocument {
@@ -6237,6 +3561,7 @@ mod tests {
         ] {
             let config = ScriptExecutionConfig {
                 ir: sample_problem_ir(),
+                antenna_inventory: Default::default(),
                 shared_geometry_assets: None,
                 default_until_seconds: Some(5e-12),
                 study_pipeline: Some(StudyPipelineDocument {
@@ -6257,6 +3582,7 @@ mod tests {
     fn materialized_compatible_solver_stages_are_marked_continue_in_place() {
         let config = ScriptExecutionConfig {
             ir: sample_problem_ir(),
+            antenna_inventory: Default::default(),
             shared_geometry_assets: None,
             default_until_seconds: Some(5e-12),
             study_pipeline: Some(StudyPipelineDocument {
@@ -6428,6 +3754,7 @@ mod tests {
         };
 
         let stages = materialize_script_stages(ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: base.clone(),
             shared_geometry_assets: None,
             default_until_seconds: Some(1e-12),
@@ -6545,6 +3872,7 @@ mod tests {
         };
 
         let stages = materialize_script_stages(ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: base,
             shared_geometry_assets: None,
             default_until_seconds: Some(1e-12),
@@ -6593,6 +3921,7 @@ mod tests {
     #[test]
     fn materialized_hysteresis_points_continue_same_branch_state() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(5e-12),
@@ -6642,6 +3971,7 @@ mod tests {
     #[test]
     fn materialize_pipeline_relax_without_time_budget_is_unbounded() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir_with_adaptive_relax_dt(3e-16),
             shared_geometry_assets: None,
             default_until_seconds: None,
@@ -6783,6 +4113,7 @@ mod tests {
     #[test]
     fn materialize_pipeline_relax_without_time_budget_ignores_dt_seed_fallback() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir_with_adaptive_relax_dt_limits(3e-16, 3e-16),
             shared_geometry_assets: None,
             default_until_seconds: None,
@@ -6915,8 +4246,12 @@ mod tests {
         ] {
             let mut base = sample_problem_ir_with_adaptive_relax_dt(4e-16);
             if let fullmag_ir::StudyIR::Relaxation {
-                algorithm: authored, dynamics, stop, ..
-            } = &mut base.study {
+                algorithm: authored,
+                dynamics,
+                stop,
+                ..
+            } = &mut base.study
+            {
                 *authored = algorithm;
                 if algorithm != fullmag_ir::RelaxationAlgorithmIR::LlgOverdamped {
                     *dynamics = None;
@@ -6935,15 +4270,26 @@ mod tests {
             let stage = build_interactive_command_stage(&base, &command)
                 .expect("solve must retain the authored algorithm")
                 .unwrap();
-            assert_eq!(serde_json::to_value(&stage.ir.study).unwrap(), expected_study);
-            assert_eq!(serde_json::to_value(&stage.ir.materials).unwrap(), expected_materials);
+            assert_eq!(
+                serde_json::to_value(&stage.ir.study).unwrap(),
+                expected_study
+            );
+            assert_eq!(
+                serde_json::to_value(&stage.ir.materials).unwrap(),
+                expected_materials
+            );
 
             command.max_steps = Some(4321);
-            let overridden = build_interactive_command_stage(&base, &command).unwrap().unwrap();
+            let overridden = build_interactive_command_stage(&base, &command)
+                .unwrap()
+                .unwrap();
             if let fullmag_ir::StudyIR::Relaxation { stop, .. } = &mut base.study {
                 stop.max_steps = Some(4321);
             }
-            assert_eq!(serde_json::to_value(&overridden.ir.study).unwrap(), serde_json::to_value(&base.study).unwrap());
+            assert_eq!(
+                serde_json::to_value(&overridden.ir.study).unwrap(),
+                serde_json::to_value(&base.study).unwrap()
+            );
         }
     }
 
@@ -7056,6 +4402,7 @@ mod tests {
             action: None,
         };
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(5e-12),
@@ -7100,6 +4447,7 @@ mod tests {
             .expect("stage autosave"),
         );
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(5e-12),
@@ -7137,6 +4485,7 @@ mod tests {
             }),
         };
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(5e-12),
@@ -7198,6 +4547,7 @@ mod tests {
         }]))
         .expect("transport fixture should deserialize");
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: ir.clone(),
             shared_geometry_assets: None,
             default_until_seconds: Some(3e-12),
@@ -7315,6 +4665,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_supports_contextual_set_field_and_set_current_nodes() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(3e-12),
@@ -7419,6 +4770,7 @@ mod tests {
         }]))
         .expect("transport fixture should deserialize");
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir,
             shared_geometry_assets: None,
             default_until_seconds: Some(3e-12),
@@ -7517,6 +4869,7 @@ mod tests {
             }]
         }));
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir,
             shared_geometry_assets: None,
             default_until_seconds: Some(3e-12),
@@ -7562,6 +4915,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_adds_field_drive_only_after_explicit_action() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(2e-9),
@@ -7675,6 +5029,7 @@ mod tests {
             })
         };
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(1.0e-12),
@@ -7761,6 +5116,7 @@ mod tests {
     fn materialize_script_stages_rejects_unknown_or_repeated_field_drive_removal() {
         for drive_id in ["missing", ""] {
             let config = ScriptExecutionConfig {
+                antenna_inventory: Default::default(),
                 ir: sample_problem_ir(),
                 shared_geometry_assets: None,
                 default_until_seconds: Some(1.0e-12),
@@ -7788,6 +5144,7 @@ mod tests {
 
         let drive = sample_regional_field_drive("pulse");
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(1.0e-12),
@@ -7825,6 +5182,7 @@ mod tests {
         let mut ir = sample_problem_ir();
         ir.field_drives.push(sample_regional_field_drive("pulse"));
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: ir.clone(),
             shared_geometry_assets: None,
             default_until_seconds: Some(1.0e-12),
@@ -7852,6 +5210,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_applies_visible_autosave_and_fft_actions_in_order() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(2e-9),
@@ -8016,6 +5375,7 @@ mod tests {
             })
         };
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(2e-9),
@@ -8092,6 +5452,7 @@ mod tests {
     #[test]
     fn materialize_pipeline_auto_sampling_fails_after_sinc_drive_removal() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(1.0e-9),
@@ -8174,6 +5535,7 @@ mod tests {
             .expect("drive"),
         );
         let stages = materialize_script_stages(ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: ir.clone(),
             shared_geometry_assets: None,
             default_until_seconds: Some(1e-9),
@@ -8203,6 +5565,7 @@ mod tests {
             },
         }];
         let error = materialize_script_stages(ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir,
             shared_geometry_assets: None,
             default_until_seconds: Some(1e-9),
@@ -8216,6 +5579,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_rejects_hidden_configuration_inside_plain_run() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(2e-9),
@@ -8244,6 +5608,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_supports_synthetic_state_actions() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(3e-12),
@@ -8322,6 +5687,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_supports_change_device_action() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(3e-12),
@@ -8399,6 +5765,7 @@ mod tests {
         base.backend_policy.requested_backend = fullmag_ir::BackendTarget::Fem;
         set_runtime_selection_device(&mut base, "gpu");
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: base,
             shared_geometry_assets: None,
             default_until_seconds: Some(3e-12),
@@ -8476,6 +5843,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_supports_relax_run_macro() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(5e-12),
@@ -8520,6 +5888,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_supports_field_sweep_relax_macro() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(2e-12),
@@ -8566,6 +5935,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_supports_hysteresis_loop_macro() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(1e-12),
@@ -8624,6 +5994,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_supports_field_sweep_relax_snapshot_macro() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(1e-12),
@@ -8665,6 +6036,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_supports_hysteresis_loop_save_point_state() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(1e-12),
@@ -8714,6 +6086,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_supports_parameter_sweep_b_ext() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(1e-12),
@@ -8759,6 +6132,7 @@ mod tests {
     #[test]
     fn materialize_script_stages_supports_parameter_sweep_current_density_with_snapshots() {
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: sample_problem_ir(),
             shared_geometry_assets: None,
             default_until_seconds: Some(1e-12),
@@ -9086,10 +6460,14 @@ mod tests {
         sampling.outputs = vec![
             fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "spectrum".to_string(),
+                scope: None,
             },
             fullmag_ir::OutputIR::EigenMode {
                 field: "mode".to_string(),
+                all_modes: false,
                 indices: vec![0, 1],
+                branches: vec![],
+                sample_selector: None,
             },
         ];
         target_ir.study = fullmag_ir::StudyIR::Eigenmodes {
@@ -9269,6 +6647,7 @@ mod tests {
         let mut sampling = eigen_ir.study.sampling().clone();
         sampling.outputs = vec![fullmag_ir::OutputIR::EigenSpectrum {
             quantity: "spectrum".to_string(),
+            scope: None,
         }];
         eigen_ir.study = fullmag_ir::StudyIR::Eigenmodes {
             dynamics,
@@ -9334,14 +6713,19 @@ mod tests {
                 },
                 fullmag_ir::OutputIR::EigenSpectrum {
                     quantity: "spectrum".to_string(),
+                    scope: None,
                 },
                 fullmag_ir::OutputIR::EigenMode {
                     field: "mode".to_string(),
+                    all_modes: false,
                     indices: vec![0, 1, 7],
+                    branches: vec![],
+                    sample_selector: None,
                 },
             ];
         }
         let config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir,
             shared_geometry_assets: None,
             default_until_seconds: Some(3e-12),
@@ -9434,10 +6818,14 @@ mod tests {
         sampling.outputs = vec![
             fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "spectrum".to_string(),
+                scope: None,
             },
             fullmag_ir::OutputIR::EigenMode {
                 field: "mode".to_string(),
+                all_modes: false,
                 indices: vec![0, 1, 7],
+                branches: vec![],
+                sample_selector: None,
             },
         ];
         base.study = fullmag_ir::StudyIR::TimeEvolution {
@@ -9476,6 +6864,7 @@ mod tests {
             mode_tracking: None,
         };
         let stages = materialize_script_stages(ScriptExecutionConfig {
+            antenna_inventory: Default::default(),
             ir: base,
             shared_geometry_assets: None,
             default_until_seconds: Some(3e-12),

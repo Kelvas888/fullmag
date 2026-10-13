@@ -40,7 +40,10 @@ import {
   useCommandDetailResource,
   useRuntimeCommandControlResourceData,
 } from "@/kernel/resources/studyRuntimeResources";
-import { VISUALIZATION_STATE_PATH } from "@/kernel/api/apiPaths";
+import {
+  MODEL_SCENE_PATH,
+  VISUALIZATION_STATE_PATH,
+} from "@/kernel/api/apiPaths";
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
 import type { KernelApi, ModuleId } from "@/kernel/types";
 import { CommandDetailDialog } from "@/shared/runtime/CommandDetailDialog";
@@ -393,7 +396,7 @@ const ExplorerTreeRow = memo(function ExplorerTreeRow({
           ? (event) => {
               if (event.button !== 0) return;
               if (
-                event.target instanceof HTMLElement &&
+                event.target instanceof Element &&
                 event.target.closest(".fm-explorer-tree-row__branch")
               ) {
                 return;
@@ -417,16 +420,20 @@ const ExplorerTreeRow = memo(function ExplorerTreeRow({
             />
           ))
         : null}
-      <span className="fm-explorer-tree-row__branch" aria-hidden="true">
+      <span
+        className="fm-explorer-tree-row__branch"
+        aria-hidden="true"
+        onClick={
+          hasChildren
+            ? (event) => {
+                event.stopPropagation();
+                handleToggle();
+              }
+            : undefined
+        }
+      >
         {hasChildren ? (
-          <ChevronRight
-            size={13}
-            data-expanded={expanded}
-            onClick={(event) => {
-              event.stopPropagation();
-              handleToggle();
-            }}
-          />
+          <ChevronRight size={13} data-expanded={expanded} />
         ) : null}
       </span>
       <span
@@ -512,6 +519,7 @@ interface ExplorerTreeViewProps {
   kernel: KernelApi;
   moduleId: ModuleId;
   nodes: readonly ExplorerNode[];
+  sceneResourceData: unknown;
   tabId: ExplorerTabId;
 }
 
@@ -522,6 +530,7 @@ export function ExplorerTreeView({
   kernel,
   moduleId,
   nodes,
+  sceneResourceData,
   tabId,
 }: ExplorerTreeViewProps) {
   const treeRef = useRef<HTMLDivElement | null>(null);
@@ -534,9 +543,10 @@ export function ExplorerTreeView({
   const commandResourceData = useMemo(
     () => ({
       ...runtimeResourceData,
+      [MODEL_SCENE_PATH]: sceneResourceData,
       [VISUALIZATION_STATE_PATH]: visualizationState.data,
     }),
-    [runtimeResourceData, visualizationState.data],
+    [runtimeResourceData, sceneResourceData, visualizationState.data],
   );
   const rows = useMemo(
     () => flattenVisibleExplorerRows(nodes, expandedIds),

@@ -776,8 +776,10 @@ function checkFieldCatalogResourceSeparation() {
   ]);
   requireTokens(studyRuntimeResources, "field catalog resource hook", [
     "export function useFieldCatalogResource",
-    "api.data.fields.catalog({ signal })",
-    "resourceKey: DATA_FIELDS_PATH",
+    "api.data.fields.catalog({ sessionScopeKey, signal })",
+    "useSessionScopedResourceKey(",
+    "DATA_FIELDS_PATH",
+    "enabled: enabled && sessionIdentity !== null",
   ]);
   requireTokens(objectVisualizationSources, "ObjectVisualizationPanel field catalog separation", [
     "useFieldCatalogResource",
@@ -1152,14 +1154,17 @@ function checkObjectGeneralPanelVisualizationSelector() {
     "geometryObjectVisualizationColorsEquals",
     "createCommandContext",
     "kernel.commands.execute",
-    'visualization.target.set-shader-mono-color',
+    'visualization.target.set-primitive-mono-color',
     'visualization.target.set-wireframe-color',
     "useVisualizationStateResource",
     "shaderMonoColor",
+    "primitiveMonoColor",
+    "surfaceColorSource",
     "wireframeColor",
   ]);
   forbidTokens(source, "ObjectGeneralPanel visualization selector", [
     "useObjectVisualizationRegistry()",
+    'visualization.target.set-shader-mono-color',
   ]);
 }
 
@@ -1176,7 +1181,7 @@ function checkCommandShortcutConnector() {
     "const runtimeResourceDataRef = useRef(runtimeResourceData)",
     "runtimeResourceDataRef.current = runtimeResourceData",
     "resourceData: runtimeResourceDataRef.current",
-    "}, [kernel, startupVisible]);",
+    "}, [kernel, sessionScopeKey, startupVisible, paused]);",
   ]);
   forbidTokens(block, "CommandShortcutConnector", [
     "useSessionStatus()",
@@ -1801,7 +1806,6 @@ function checkAnalysisPlotsStableResourceInputs() {
     "AnalysisPlotsView",
     "{...controller}",
     "onDatasetRefChange={controller.setSelectedDatasetRef}",
-    "onSurfaceChange={controller.setActiveSurface}",
   ]);
   requireTokens(controllerSource, "analysis plots stable resource inputs", [
     "useAnalysisDatasetData",

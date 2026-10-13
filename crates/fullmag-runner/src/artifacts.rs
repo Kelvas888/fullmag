@@ -2,10 +2,11 @@
 
 use crate::artifact_pipeline::ArtifactPipelineSummary;
 use crate::dispatch::{
-    effective_fem_device_request, requested_registry_device_for_fdm, runtime_device,
-    runtime_precision,
+    effective_fem_device_request, normalized_runtime_element_markers,
+    requested_registry_device_for_fdm, runtime_device, runtime_precision,
 };
 use fullmag_ir::BackendPlanIR;
+use fullmag_quantities::fem_state_field::FemP1MagnetizationFieldSemantics;
 use sha2::{Digest, Sha256};
 
 use crate::types::{
@@ -251,6 +252,17 @@ impl serde::Serialize for RunMetadata<'_> {
     }
 }
 
+fn serialize_run_metadata(metadata: &RunMetadata<'_>) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    serde_json::to_writer_pretty(&mut bytes, metadata).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("serializing run metadata: {error}"),
+        )
+    })?;
+    Ok(bytes)
+}
+
 fn fdm_multilayer_transfer_realization(
     plan: &fullmag_ir::ExecutionPlanIR,
     execution_provenance: &crate::types::ExecutionProvenance,
@@ -320,6 +332,109 @@ pub(crate) fn build_identity_json() -> serde_json::Value {
     })
 }
 
+/// Materialize the typed producer sidecar from the exact payload bytes that
+/// are about to be written.  The runner does not invent a run identity: the
+/// execution owner must provide `producer_run_id` and `producer_stage_id` in
+/// the problem runtime metadata. Public standalone entry points allocate this
+/// binding before dispatch; orchestrated calls retain their supplied identity.
+/// Direct artifact writers without it receive no verified replay sidecar.
+fn fem_relaxation_producer_provenance_artifact(
+    problem: &fullmag_ir::ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    executed: &ExecutedRun,
+) -> std::io::Result<Option<crate::types::AuxiliaryArtifact>> {
+    let fullmag_ir::BackendPlanIR::Fem(source_plan) = &plan.backend_plan else {
+        return Ok(None);
+    };
+    if source_plan.relaxation.is_none()
+        || !matches!(executed.result.status, crate::types::RunStatus::Completed)
+    {
+        return Ok(None);
+    }
+    let runtime_metadata = &problem.problem_meta.runtime_metadata;
+    let Some(source_run_id) = runtime_metadata
+        .get("producer_run_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(source_stage_id) = runtime_metadata
+        .get("producer_stage_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(source_stage_kind) = runtime_metadata
+        .get("producer_stage_kind")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let accepted_path = crate::types::CertifiedFemEquilibriumFields::accepted_artifact_path_for_material(
+        &source_plan.material,
+    );
+    let (certified_path, recomputed_path) =
+        crate::types::CertifiedFemEquilibriumFields::artifact_paths_for_material(
+            &source_plan.material,
+        );
+    let exact_bytes = |path: &str, label: &str| -> std::io::Result<&[u8]> {
+        let mut matches = executed
+            .auxiliary_artifacts
+            .iter()
+            .filter(|artifact| artifact.relative_path == path);
+        let Some(artifact) = matches.next() else {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "FEM relaxation producer sidecar missing exact {label} payload {path}"
+                ),
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("FEM relaxation producer sidecar has duplicate {label} payload {path}"),
+            ));
+        }
+        Ok(artifact.bytes.as_slice())
+    };
+    let accepted_bytes = exact_bytes(accepted_path, "accepted fields")?;
+    let certified_bytes = exact_bytes(certified_path, "certified fields")?;
+    let recomputed_bytes = exact_bytes(recomputed_path, "recomputed certificate")?;
+    let provenance = crate::fem::eigen_equilibrium_contract::
+        fem_relaxation_producer_provenance_from_exact_artifacts(
+            source_run_id,
+            source_stage_id,
+            source_stage_kind,
+            source_plan,
+            &executed.result.final_magnetization,
+            build_identity_json(),
+            accepted_path,
+            accepted_bytes,
+            certified_path,
+            certified_bytes,
+            recomputed_path,
+            recomputed_bytes,
+        )
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error.message))?;
+    let bytes = serde_json::to_vec_pretty(&provenance).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("serializing FEM relaxation producer provenance: {error}"),
+        )
+    })?;
+    Ok(Some(crate::types::AuxiliaryArtifact {
+        relative_path: crate::fem::eigen_equilibrium_contract::
+            FEM_RELAXATION_PRODUCER_PROVENANCE_RELATIVE_PATH
+            .to_string(),
+        bytes,
+    }))
+}
+
 fn runtime_threading_summary(problem: &fullmag_ir::ProblemIR) -> serde_json::Value {
     let resolved_cpu_threads = u32::try_from(crate::configured_cpu_threads(problem)).ok();
     serde_json::json!({
@@ -387,6 +502,13 @@ fn effective_execution_request(
     plan: &fullmag_ir::ExecutionPlanIR,
 ) -> ExecutionRequestProvenance {
     let device = match &plan.backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
+            match inspection.requested_execution.device {
+                fullmag_ir::ExecutionDevice::Auto => "auto".to_string(),
+                fullmag_ir::ExecutionDevice::Cpu => "cpu".to_string(),
+                fullmag_ir::ExecutionDevice::Gpu => "gpu".to_string(),
+            }
+        }
         BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => {
             requested_registry_device_for_fdm(problem)
         }
@@ -412,10 +534,24 @@ fn effective_execution_request(
     }
 }
 
+fn canonical_engine_identity(engine: &str) -> &str {
+    match engine {
+        "cpu_reference" | "fdm_cpu_reference" => {
+            crate::solver_runtime::engine::fdm_engine_id(
+                crate::solver_runtime::engine::FdmEngine::CpuReference,
+            )
+        }
+        "cuda_fdm" | "fdm_cuda" => crate::solver_runtime::engine::fdm_engine_id(
+            crate::solver_runtime::engine::FdmEngine::CudaFdm,
+        ),
+        other => other,
+    }
+}
+
 fn actual_engine_backend_and_device(engine: &str) -> std::io::Result<(&'static str, &'static str)> {
-    let resolved = match engine {
-        "cpu_reference" | "cpu_reference_multilayer" => ("fdm", "cpu"),
-        "cuda_fdm"
+    let resolved = match canonical_engine_identity(engine) {
+        "fdm_cpu_reference" | "cpu_reference_multilayer" => ("fdm", "cpu"),
+        "fdm_cuda"
         | "cuda_fdm_charge_only"
         | "cuda_assisted_multilayer"
         | "cuda_native_multilayer_convolution"
@@ -599,13 +735,17 @@ fn final_execution_resolution_provenance(
         ));
     }
     if let Some(entry) = fallback {
-        if entry.original_engine == entry.fallback_engine {
+        if canonical_engine_identity(&entry.original_engine)
+            == canonical_engine_identity(&entry.fallback_engine)
+        {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 "resolved fallback original_engine and fallback_engine must differ",
             ));
         }
-        if entry.fallback_engine != provenance.execution_engine {
+        if canonical_engine_identity(&entry.fallback_engine)
+            != canonical_engine_identity(&provenance.execution_engine)
+        {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 format!(
@@ -771,6 +911,14 @@ fn mesh_runtime_metadata(plan: &fullmag_ir::ExecutionPlanIR) -> serde_json::Valu
                 |pair| pair.pair_id.as_str(),
             ),
             "mesh_build_report": fem.mesh_build_report,
+        }),
+        BackendPlanIR::AntennaExternalLeadInspection(inspection) => serde_json::json!({
+            "scope": "antenna_external_lead_inspection",
+            "mesh_name": inspection.input.combined_mesh.mesh_name,
+            "topology_fingerprint": inspection.input.combined_mesh.topology_fingerprint_v6(),
+            "node_count": inspection.input.combined_mesh.nodes.len(),
+            "element_count": inspection.input.combined_mesh.cell_count(),
+            "field_sampling_topology_digest": inspection.input.field_sampling.topology_digest,
         }),
         BackendPlanIR::FemFrequencyResponse(fem) => serde_json::json!({
             "mesh_name": fem.mesh.mesh_name,
@@ -1021,26 +1169,25 @@ fn demag_runtime_metadata(
             let max_iterations =
                 resolved_policy.map_or(policy.max_iterations, |entry| entry.max_iterations);
             let amg_profile = demag_amg_profile_metadata(&preconditioner, last);
-            let (runtime_solver, runtime_preconditioner) =
-                if matches!(
-                    provenance.fem_demag_operator_mode.as_deref(),
-                    Some("device_hypre_poisson") | Some("device_hypre_fem_bem")
-                ) {
-                    let solver = match linear_solver.as_str() {
-                        "CG" => Some("HyprePCG"),
-                        "GMRES" => Some("HypreGMRES"),
-                        _ => None,
-                    };
-                    let preconditioner = match preconditioner.as_str() {
-                        "AMG" => Some("HypreBoomerAMG"),
-                        "JACOBI" => Some("HypreDiagScale"),
-                        "NONE" => Some("HypreIdentity"),
-                        _ => None,
-                    };
-                    (solver, preconditioner)
-                } else {
-                    (None, None)
+            let (runtime_solver, runtime_preconditioner) = if matches!(
+                provenance.fem_demag_operator_mode.as_deref(),
+                Some("device_hypre_poisson") | Some("device_hypre_fem_bem")
+            ) {
+                let solver = match linear_solver.as_str() {
+                    "CG" => Some("HyprePCG"),
+                    "GMRES" => Some("HypreGMRES"),
+                    _ => None,
                 };
+                let preconditioner = match preconditioner.as_str() {
+                    "AMG" => Some("HypreBoomerAMG"),
+                    "JACOBI" => Some("HypreDiagScale"),
+                    "NONE" => Some("HypreIdentity"),
+                    _ => None,
+                };
+                (solver, preconditioner)
+            } else {
+                (None, None)
+            };
 
             serde_json::json!({
                 "model": resolved_demag.model_name(),
@@ -1645,6 +1792,7 @@ pub(crate) struct FieldArtifactContext {
     pub source_hash: Option<String>,
     pub execution_mode: fullmag_ir::ExecutionMode,
     pub layout: serde_json::Value,
+    pub magnetization_field_semantics: Result<Option<FemP1MagnetizationFieldSemantics>, String>,
     pub execution_resolution: Option<FinalExecutionResolutionProvenance>,
 }
 
@@ -1652,14 +1800,55 @@ pub(crate) fn build_field_context(
     problem: &fullmag_ir::ProblemIR,
     plan: &fullmag_ir::ExecutionPlanIR,
 ) -> FieldArtifactContext {
+    let magnetization_field_semantics = fem_p1_magnetization_field_semantics(plan);
     FieldArtifactContext {
         problem_name: problem.problem_meta.name.clone(),
         ir_version: problem.ir_version.clone(),
         source_hash: problem.problem_meta.source_hash.clone(),
         execution_mode: plan.common.execution_mode,
         layout: field_layout(plan),
+        magnetization_field_semantics,
         execution_resolution: None,
     }
+}
+
+/// Build the typed producer envelope for the serial FEM H1/P1 magnetization
+/// field.  The envelope is intentionally limited to the ordinary FEM plan:
+/// eigen, frequency-response, FDM, and higher-order FEM plans remain
+/// unqualified until their own field producers provide an equivalent
+/// contract.
+pub fn fem_p1_magnetization_field_semantics(
+    plan: &fullmag_ir::ExecutionPlanIR,
+) -> Result<Option<FemP1MagnetizationFieldSemantics>, String> {
+    let BackendPlanIR::Fem(fem) = &plan.backend_plan else {
+        return Ok(None);
+    };
+    if fem.fe_order != 1 {
+        return Ok(None);
+    }
+
+    // The preview adapter has compatibility handling for incomplete markers;
+    // a quantitative producer must supply the same validated runtime mesh.
+    fullmag_ir::validate_mesh_for_execution(&fem.mesh)
+        .map_err(|errors| errors.join("; "))?;
+    let normalized_markers = normalized_runtime_element_markers(fem)
+        .map_err(|error| error.message)?;
+    let active_node_mask = crate::preview::mesh_quantity_active_mask_with_element_markers(
+        "m",
+        &fem.mesh,
+        &normalized_markers,
+    )
+    .ok_or_else(|| "FEM magnetization active support is unavailable".to_string())?;
+    // Preserve the accepted source mesh identity; runtime marker normalization
+    // only supplies the support mask used by this artifact.
+    let topology_fingerprint = fem.mesh.topology_fingerprint_v6();
+    FemP1MagnetizationFieldSemantics::new(
+        &topology_fingerprint,
+        fem.mesh.nodes.len(),
+        active_node_mask,
+    )
+    .map(Some)
+    .map_err(|error| error.to_string())
 }
 
 fn collect_streamed_provenance_files(
@@ -1790,6 +1979,320 @@ fn finalize_provenance_files(
     Ok(())
 }
 
+fn frequency_publication_owner(
+    problem: &fullmag_ir::ProblemIR,
+) -> std::io::Result<Option<crate::artifact_generation::PublicationOwner>> {
+    let metadata = &problem.problem_meta.runtime_metadata;
+    let owner_value = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    };
+    match (
+        owner_value("producer_run_id"),
+        owner_value("producer_stage_id"),
+        owner_value("producer_stage_kind"),
+    ) {
+        (Some(run_id), Some(stage_id), Some(stage_kind)) => {
+            Ok(Some(crate::artifact_generation::PublicationOwner {
+                run_id: run_id.into(),
+                stage_id: stage_id.into(),
+                stage_kind: stage_kind.into(),
+            }))
+        }
+        (None, None, None)
+            if [
+                "producer_run_id",
+                "producer_stage_id",
+                "producer_stage_kind",
+            ]
+            .iter()
+            .all(|key| !metadata.contains_key(*key)) =>
+        {
+            Ok(None)
+        }
+        _ => Err(Error::new(
+            ErrorKind::InvalidData,
+            "incomplete frequency-domain publication owner",
+        )),
+    }
+}
+
+fn validate_immutable_generation_references(
+    member_bytes: &[(String, Vec<u8>)],
+) -> std::io::Result<()> {
+    let member_paths = member_bytes
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect::<BTreeSet<_>>();
+    let member_payload = |relative: &str| {
+        member_bytes
+            .iter()
+            .find(|(path, _)| path == relative)
+            .map(|(_, bytes)| bytes.as_slice())
+    };
+    let require_member = |relative: &str, context: &str| -> std::io::Result<()> {
+        if relative.trim().is_empty() || !member_paths.contains(relative) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("{context} references missing immutable generation member '{relative}'"),
+            ));
+        }
+        Ok(())
+    };
+    let require_safe_store_path = |relative: &str, context: &str| -> std::io::Result<()> {
+        if relative.trim().is_empty()
+            || relative.starts_with('/')
+            || relative.contains('\\')
+            || relative
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("{context} is not a canonical relative store path: '{relative}'"),
+            ));
+        }
+        Ok(())
+    };
+
+    let metadata_bytes = member_payload("metadata.json").ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "immutable FEM eigen publication is missing metadata.json",
+        )
+    })?;
+    let metadata: serde_json::Value = serde_json::from_slice(metadata_bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("immutable FEM eigen metadata is invalid JSON: {error}"),
+        )
+    })?;
+    let assets = metadata
+        .get("material_field_assets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "immutable FEM eigen metadata is missing material_field_assets",
+            )
+        })?;
+    for (index, asset) in assets.iter().enumerate() {
+        let asset = asset.as_object().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("metadata.material_field_assets[{index}] must be an object"),
+            )
+        })?;
+        match asset.get("artifact_path") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(relative)) => {
+                require_member(relative, &format!("metadata.material_field_assets[{index}]"))?;
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "metadata.material_field_assets[{index}].artifact_path must be a path or null"
+                    ),
+                ));
+            }
+        }
+    }
+
+    if let Some(manifest_bytes) = member_payload("frequency_domain/manifest.v1.json") {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(manifest_bytes).map_err(|error| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("immutable frequency-domain manifest is invalid JSON: {error}"),
+                )
+            })?;
+        let artifacts = manifest
+            .get("artifacts")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "immutable frequency-domain manifest is missing artifacts object",
+                )
+            })?;
+        let zarr_store_path = match artifacts.get("mode_field_zarr_store_path") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(relative)) => {
+                require_safe_store_path(relative, "manifest.artifacts.mode_field_zarr_store_path")?;
+                Some(relative.as_str())
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "manifest.artifacts.mode_field_zarr_store_path must be a directory path or null",
+                ));
+            }
+        };
+        for (name, value) in artifacts {
+            if name == "mode_field_zarr_store_path" {
+                // This field identifies a Zarr directory, not a single member.
+                // Its concrete closure is checked below against the supplied bytes.
+                continue;
+            }
+            if name.ends_with("_path") {
+                match value {
+                    serde_json::Value::Null => {}
+                    serde_json::Value::String(relative) => {
+                        require_member(relative, &format!("manifest.artifacts.{name}"))?;
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("manifest.artifacts.{name} must be a path or null"),
+                        ));
+                    }
+                }
+            } else if name.ends_with("_paths") {
+                match value {
+                    serde_json::Value::Null => {}
+                    serde_json::Value::Array(paths) => {
+                        for (index, path) in paths.iter().enumerate() {
+                            let relative = path.as_str().ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::InvalidData,
+                                    format!("manifest.artifacts.{name}[{index}] must be a path"),
+                                )
+                            })?;
+                            require_member(
+                                relative,
+                                &format!("manifest.artifacts.{name}[{index}]"),
+                            )?;
+                        }
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("manifest.artifacts.{name} must be a path list or null"),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(store_path) = zarr_store_path {
+            for suffix in [".zgroup", ".zattrs"] {
+                let relative = format!("{store_path}/{suffix}");
+                require_member(
+                    &relative,
+                    "manifest.artifacts.mode_field_zarr_store_path",
+                )?;
+            }
+            let mode_metadata_paths = artifacts
+                .get("mode_metadata_paths")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        "Zarr mode-field store requires manifest.artifacts.mode_metadata_paths",
+                    )
+                })?;
+            let store_prefix = format!("{store_path}/");
+            for (index, mode_path) in mode_metadata_paths.iter().enumerate() {
+                let mode_path = mode_path.as_str().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("manifest.artifacts.mode_metadata_paths[{index}] must be a path"),
+                    )
+                })?;
+                let mode_bytes = member_payload(mode_path).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("mode metadata member '{mode_path}' disappeared from generation"),
+                    )
+                })?;
+                let mode: serde_json::Value = serde_json::from_slice(mode_bytes).map_err(|error| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("immutable mode metadata '{mode_path}' is invalid JSON: {error}"),
+                    )
+                })?;
+                if mode.get("storage_format").and_then(serde_json::Value::as_str) != Some("zarr")
+                    || mode.get("zarr_store_path").and_then(serde_json::Value::as_str)
+                        != Some(store_path)
+                {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("mode metadata '{mode_path}' does not bind to the manifest Zarr store"),
+                    ));
+                }
+                let array_path = mode
+                    .get("zarr_array_path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidData,
+                            format!("mode metadata '{mode_path}' is missing zarr_array_path"),
+                        )
+                    })?;
+                let array_relative = array_path.strip_prefix(&store_prefix).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("mode metadata '{mode_path}' array path is outside its Zarr store"),
+                    )
+                })?;
+                let array_components = array_relative.split('/').collect::<Vec<_>>();
+                if array_components.is_empty()
+                    || array_components
+                        .iter()
+                        .any(|component| component.is_empty() || matches!(*component, "." | "..") || component.contains('\\'))
+                {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("mode metadata '{mode_path}' has a non-canonical Zarr array path"),
+                    ));
+                }
+                let mut group_path = store_path.to_string();
+                for component in array_components.iter().take(array_components.len() - 1) {
+                    group_path.push('/');
+                    group_path.push_str(component);
+                    require_member(
+                        &format!("{group_path}/.zgroup"),
+                        &format!("mode metadata '{mode_path}' Zarr group"),
+                    )?;
+                }
+                for suffix in [".zarray", ".zattrs"] {
+                    let relative = format!("{array_path}/{suffix}");
+                    require_member(&relative, &format!("mode metadata '{mode_path}'"))?;
+                }
+                let chunk_path = mode
+                    .get("zarr_chunk_path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidData,
+                            format!("mode metadata '{mode_path}' is missing zarr_chunk_path"),
+                        )
+                    })?;
+                if !chunk_path.starts_with(&format!("{array_path}/")) {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("mode metadata '{mode_path}' chunk path is outside its Zarr array"),
+                    ));
+                }
+                require_member(chunk_path, &format!("mode metadata '{mode_path}'"))?;
+                let compatibility_path = mode
+                    .get("compatibility_binary_payload_path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidData,
+                            format!("mode metadata '{mode_path}' is missing compatibility_binary_payload_path"),
+                        )
+                    })?;
+                require_member(compatibility_path, &format!("mode metadata '{mode_path}'"))?;
+            }
+        }
+    }
+    Ok(())
+}
 pub(crate) fn write_artifacts(
     output_dir: &Path,
     problem: &fullmag_ir::ProblemIR,
@@ -1797,6 +2300,33 @@ pub(crate) fn write_artifacts(
     executed: &ExecutedRun,
     streamed: Option<&ArtifactPipelineSummary>,
 ) -> std::io::Result<()> {
+    // Serialize final writes before any member is changed. No stale lease is
+    // automatically removed: recovery requires checking its active owner.
+    let has_frequency_generation_artifacts = executed.auxiliary_artifacts.iter().any(|artifact| {
+        artifact.relative_path.starts_with("eigen/") || artifact.relative_path.starts_with("response/")
+    });
+    let immutable_fem_eigen_publication = matches!(
+        &plan.backend_plan,
+        BackendPlanIR::FemEigen(_)
+    ) && executed
+        .auxiliary_artifacts
+        .iter()
+        .any(|artifact| artifact.relative_path.starts_with("eigen/"));
+    let immutable_producer = if immutable_fem_eigen_publication {
+        frequency_publication_owner(problem)?
+    } else {
+        None
+    };
+    let frequency_publication_lease = if has_frequency_generation_artifacts {
+        if !immutable_fem_eigen_publication {
+            // Other artifact producers remain on the mutable v1 path. Do not
+            // let them shadow a v2 selector.
+            crate::artifact_generation::ensure_legacy_publication_allowed(output_dir)?;
+        }
+        Some(crate::artifact_generation::PublicationLease::acquire(output_dir)?)
+    } else {
+        None
+    };
     let diagnostic_steps = solver_diagnostic_steps(executed);
     let accepted_steps = diagnostic_steps
         .as_deref()
@@ -1827,7 +2357,15 @@ pub(crate) fn write_artifacts(
         .unwrap_or(serde_json::Value::Null);
     let mesh_metadata = mesh_runtime_metadata(plan);
     let region_realization_revisions = region_realization_revisions_metadata(problem);
-    let material_field_assets = write_material_field_artifacts(output_dir, plan)?;
+    let prepared_immutable_material_artifacts = if immutable_fem_eigen_publication {
+        Some(build_material_field_artifacts(plan)?)
+    } else {
+        None
+    };
+    let material_field_assets = match prepared_immutable_material_artifacts.as_ref() {
+        Some(prepared) => prepared.metadata_assets.clone(),
+        None => write_material_field_artifacts(output_dir, plan)?,
+    };
     validate_execution_provenance_for_artifacts(plan, &execution_provenance)?;
     let execution_resolution =
         final_execution_resolution_provenance(problem, plan, &execution_provenance)?;
@@ -1894,14 +2432,12 @@ pub(crate) fn write_artifacts(
         sampling_resolution,
     };
     let metadata_path = output_dir.join("metadata.json");
-    let mut metadata_file = BufWriter::new(fs::File::create(&metadata_path)?);
-    serde_json::to_writer_pretty(&mut metadata_file, &metadata).map_err(|error| {
-        Error::new(
-            ErrorKind::InvalidData,
-            format!("serializing run metadata: {error}"),
-        )
-    })?;
-    metadata_file.flush()?;
+    let metadata_bytes = serialize_run_metadata(&metadata)?;
+    if !immutable_fem_eigen_publication {
+        let mut metadata_file = BufWriter::new(fs::File::create(&metadata_path)?);
+        metadata_file.write_all(&metadata_bytes)?;
+        metadata_file.flush()?;
+    }
 
     if let Some(spin_torque) = spin_torque_provenance {
         let path = output_dir.join("physics/spin_torque_provenance.v1.json");
@@ -1933,7 +2469,7 @@ pub(crate) fn write_artifacts(
         &executed.initial_magnetization,
     )?;
 
-    let final_stats = accepted_steps.last().cloned().unwrap_or(StepStats {
+    let mut final_stats = accepted_steps.last().cloned().unwrap_or(StepStats {
         step: 0,
         time: 0.0,
         dt: 0.0,
@@ -1948,7 +2484,13 @@ pub(crate) fn write_artifacts(
         wall_time_ns: 0,
         ..StepStats::default()
     });
-    write_field_file(
+    let final_snapshot_receipt = final_native_snapshot_receipt(
+        &field_context,
+        executed,
+        &mut final_stats,
+    )?;
+    let final_node_map = final_native_node_map(executed, final_snapshot_receipt.as_ref())?;
+    write_field_file_with_native_snapshot(
         &output_dir.join("m_final.json"),
         &field_context,
         &execution_provenance,
@@ -1957,10 +2499,13 @@ pub(crate) fn write_artifacts(
         final_stats.time,
         final_stats.dt,
         &executed.result.final_magnetization,
+        final_snapshot_receipt.as_ref(),
+        final_node_map.as_ref(),
     )?;
 
     if streamed.is_none() {
         let fields_dir = output_dir.join("fields");
+        let mut frames_index = crate::frames_index::FramesIndexWriter::new(output_dir, None);
         for snapshot in &executed.field_snapshots {
             write_field_snapshot_artifact(
                 &fields_dir,
@@ -1968,10 +2513,40 @@ pub(crate) fn write_artifacts(
                 &execution_provenance,
                 snapshot,
             )?;
+            let relative =
+                crate::frames_index::snapshot_relative_path(&snapshot.name, snapshot.step, true);
+            let single_file = output_dir.join(&relative);
+            let bytes = fs::metadata(&single_file).ok().map(|meta| meta.len());
+            let path = if single_file.is_file() {
+                relative
+            } else {
+                // Multilayer snapshots are one file per layer under the observable folder.
+                format!("fields/{}", snapshot.name)
+            };
+            frames_index
+                .record(&snapshot.name, snapshot.step, snapshot.time, path, bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
         }
+        frames_index
+            .finish()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
     }
 
     let mut auxiliary_artifacts = executed.auxiliary_artifacts.clone();
+    if let Some(producer_provenance) =
+        fem_relaxation_producer_provenance_artifact(problem, plan, executed)?
+    {
+        if auxiliary_artifacts
+            .iter()
+            .any(|artifact| artifact.relative_path == producer_provenance.relative_path)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "duplicate FEM relaxation producer provenance sidecar",
+            ));
+        }
+        auxiliary_artifacts.push(producer_provenance);
+    }
     if matches!(
         &plan.backend_plan,
         fullmag_ir::BackendPlanIR::FdmMultilayer(_)
@@ -2005,18 +2580,36 @@ pub(crate) fn write_artifacts(
     if let Some(artifact) = physics_graph_artifact {
         auxiliary_artifacts.push(artifact);
     }
-    for artifact in &auxiliary_artifacts {
-        let artifact_path = output_dir.join(&artifact.relative_path);
-        if let Some(parent) = artifact_path.parent() {
-            fs::create_dir_all(parent)?;
+    if !immutable_fem_eigen_publication {
+        for artifact in &auxiliary_artifacts {
+            let artifact_path = output_dir.join(&artifact.relative_path);
+            if let Some(parent) = artifact_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(artifact_path, &artifact.bytes)?;
         }
-        fs::write(artifact_path, &artifact.bytes)?;
     }
 
-    if should_write_plan_periodic_pairs_artifact(plan, executed) {
-        write_periodic_pairs_artifact(output_dir, plan, problem_source_scene_revision(problem))?;
-    }
-    write_fem_supercell_node_geometry_artifact(output_dir, problem, plan)?;
+    let periodic_pairs_artifact = if should_write_plan_periodic_pairs_artifact(plan, executed) {
+        if immutable_fem_eigen_publication {
+            build_periodic_pairs_artifact(plan, problem_source_scene_revision(problem))?
+        } else {
+            write_periodic_pairs_artifact(
+                output_dir,
+                plan,
+                problem_source_scene_revision(problem),
+            )?;
+            None
+        }
+    } else {
+        None
+    };
+    let node_geometry_artifact = if immutable_fem_eigen_publication {
+        build_fem_supercell_node_geometry_artifact(problem, plan)?
+    } else {
+        write_fem_supercell_node_geometry_artifact(output_dir, problem, plan)?;
+        None
+    };
     write_static_pbc_demag_seam_diagnostics_artifact(
         output_dir,
         problem,
@@ -2032,6 +2625,66 @@ pub(crate) fn write_artifacts(
         &field_context,
         &execution_provenance,
     )?;
+
+    if immutable_fem_eigen_publication {
+        let lease = frequency_publication_lease.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "immutable FEM eigen publication is missing its writer lease",
+            )
+        })?;
+        let mut member_bytes = auxiliary_artifacts
+            .into_iter()
+            .map(|artifact| (artifact.relative_path, artifact.bytes))
+            .collect::<Vec<_>>();
+        member_bytes.push(("metadata.json".to_string(), metadata_bytes));
+        if let Some(prepared) = prepared_immutable_material_artifacts {
+            member_bytes.extend(
+                prepared
+                    .files
+                    .into_iter()
+                    .map(|artifact| (artifact.relative_path, artifact.bytes)),
+            );
+        }
+        if let Some(artifact) = periodic_pairs_artifact {
+            member_bytes.push((artifact.relative_path, artifact.bytes));
+        }
+        if let Some(artifact) = node_geometry_artifact {
+            member_bytes.push((artifact.relative_path, artifact.bytes));
+        }
+        validate_immutable_generation_references(&member_bytes)?;
+        crate::artifact_generation::publish_immutable_with_lease(
+            output_dir,
+            immutable_producer,
+            member_bytes,
+            lease,
+        )?;
+    } else if auxiliary_artifacts.iter().any(|artifact| {
+        artifact.relative_path.starts_with("eigen/")
+            || artifact.relative_path.starts_with("response/")
+    }) {
+        let members = auxiliary_artifacts
+            .iter()
+            .map(|artifact| artifact.relative_path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut members = members;
+        members.insert("metadata.json".to_string());
+        if should_write_plan_periodic_pairs_artifact(plan, executed) {
+            members.insert("mesh/periodic_pairs.v1.json".to_string());
+        }
+        if matches!(&plan.backend_plan, BackendPlanIR::Fem(_))
+            && problem.problem_meta.runtime_metadata.get("periodic_antidot_relaxation")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|value| value.contains_key("supercell_repeat"))
+        {
+            members.insert("mesh/node_geometry.v1.json".to_string());
+        }
+        crate::artifact_generation::publish(
+            output_dir,
+            frequency_publication_owner(problem)?,
+            members,
+        )?;
+    }
 
     Ok(())
 }
@@ -2242,27 +2895,88 @@ fn write_solver_diagnostics_artifacts(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct PreparedMaterialFieldArtifacts {
+    metadata_assets: Vec<serde_json::Value>,
+    files: Vec<crate::types::AuxiliaryArtifact>,
+}
+
+fn build_material_field_artifacts(
+    plan: &fullmag_ir::ExecutionPlanIR,
+) -> std::io::Result<PreparedMaterialFieldArtifacts> {
+    match &plan.backend_plan {
+        BackendPlanIR::Fem(fem) => build_fem_material_field_artifacts(plan, fem),
+        BackendPlanIR::FemEigen(fem) => build_fem_eigen_material_field_artifacts(plan, fem),
+        BackendPlanIR::FdmMultilayer(multilayer) => {
+            build_fdm_multilayer_material_field_artifacts(multilayer)
+        }
+        _ => Ok(PreparedMaterialFieldArtifacts::default()),
+    }
+}
+
 fn write_material_field_artifacts(
     output_dir: &Path,
     plan: &fullmag_ir::ExecutionPlanIR,
 ) -> std::io::Result<Vec<serde_json::Value>> {
-    match &plan.backend_plan {
-        BackendPlanIR::Fem(fem) => write_fem_material_field_artifacts(output_dir, plan, fem),
-        BackendPlanIR::FdmMultilayer(multilayer) => {
-            write_fdm_multilayer_material_field_artifacts(output_dir, multilayer)
-        }
-        _ => Ok(Vec::new()),
+    if let BackendPlanIR::FdmMultilayer(multilayer) = &plan.backend_plan {
+        return write_fdm_multilayer_material_field_artifacts(output_dir, multilayer);
     }
+
+    let prepared = build_material_field_artifacts(plan)?;
+    write_artifact_bytes(output_dir, &prepared.files)?;
+    Ok(prepared.metadata_assets)
 }
 
-fn write_fem_material_field_artifacts(
+fn write_artifact_bytes(
     output_dir: &Path,
+    files: &[crate::types::AuxiliaryArtifact],
+) -> std::io::Result<()> {
+    for artifact in files {
+        let full_path = output_dir.join(&artifact.relative_path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(full_path, &artifact.bytes)?;
+    }
+    Ok(())
+}
+
+fn build_fem_material_field_artifacts(
     plan: &fullmag_ir::ExecutionPlanIR,
     fem: &fullmag_ir::FemPlanIR,
-) -> std::io::Result<Vec<serde_json::Value>> {
-    let mut metadata_assets = Vec::new();
+) -> std::io::Result<PreparedMaterialFieldArtifacts> {
+    build_fem_material_field_artifacts_with_values(
+        plan,
+        &fem.mesh_name,
+        &fem.mesh,
+        |field_plan| fem_material_field_values(fem, field_plan),
+    )
+}
+
+fn build_fem_eigen_material_field_artifacts(
+    plan: &fullmag_ir::ExecutionPlanIR,
+    fem: &fullmag_ir::FemEigenPlanIR,
+) -> std::io::Result<PreparedMaterialFieldArtifacts> {
+    build_fem_material_field_artifacts_with_values(
+        plan,
+        &fem.mesh_name,
+        &fem.mesh,
+        |field_plan| fem_eigen_material_field_values(fem, field_plan),
+    )
+}
+
+fn build_fem_material_field_artifacts_with_values<'values>(
+    plan: &fullmag_ir::ExecutionPlanIR,
+    mesh_name: &str,
+    mesh: &fullmag_ir::MeshIR,
+    mut values_for: impl FnMut(
+        &fullmag_ir::MaterialFieldPlan,
+    ) -> Option<(&'values [f64], fullmag_ir::MaterialFieldLocationIR)>,
+) -> std::io::Result<PreparedMaterialFieldArtifacts> {
+    let mut prepared = PreparedMaterialFieldArtifacts::default();
+    let mesh_generation_id = solver_mesh_signature(mesh);
     for field_plan in &plan.common.material_field_plans {
-        let Some((values, location)) = fem_material_field_values(fem, field_plan) else {
+        let Some((values, location)) = values_for(field_plan) else {
             continue;
         };
         if values.is_empty() {
@@ -2282,8 +2996,8 @@ fn write_fem_material_field_artifacts(
             parameter: field_plan.parameter,
             owner_object_id: field_plan.object_id.clone(),
             source_region_id: None,
-            mesh_id: fem.mesh_name.clone(),
-            mesh_generation_id: solver_mesh_signature(&fem.mesh),
+            mesh_id: mesh_name.to_string(),
+            mesh_generation_id: mesh_generation_id.clone(),
             location,
             component_count: 1,
             unit: material_field_unit(field_plan.parameter).to_string(),
@@ -2301,11 +3015,7 @@ fn write_fem_material_field_artifacts(
             },
         };
 
-        let full_path = output_dir.join(&artifact_path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&full_path, serde_json::to_string_pretty(&asset).unwrap())?;
+        let bytes = serde_json::to_string_pretty(&asset).unwrap().into_bytes();
 
         let mut metadata_asset = serde_json::to_value(asset).map_err(|error| {
             Error::new(
@@ -2317,19 +3027,22 @@ fn write_fem_material_field_artifacts(
             .as_object_mut()
             .expect("MaterialFieldAssetIR serializes as an object")
             .insert("values".to_string(), serde_json::json!([]));
-        metadata_assets.push(metadata_asset);
+        prepared.metadata_assets.push(metadata_asset);
+        prepared.files.push(crate::types::AuxiliaryArtifact {
+            relative_path: artifact_path,
+            bytes,
+        });
     }
 
-    Ok(metadata_assets)
+    Ok(prepared)
 }
 
-fn write_fdm_multilayer_material_field_artifacts(
-    output_dir: &Path,
+fn build_fdm_multilayer_material_field_artifacts(
     multilayer: &fullmag_ir::FdmMultilayerPlanIR,
-) -> std::io::Result<Vec<serde_json::Value>> {
+) -> std::io::Result<PreparedMaterialFieldArtifacts> {
     let build_identity = build_identity_json();
     let mut prepared_files = Vec::<(String, serde_json::Value)>::new();
-    let mut metadata_assets = Vec::new();
+    let mut prepared = PreparedMaterialFieldArtifacts::default();
     let mut manifest_layers = Vec::with_capacity(multilayer.layers.len());
     let mut value_offset = 0usize;
 
@@ -2382,7 +3095,7 @@ fn write_fdm_multilayer_material_field_artifacts(
                 "values": values,
             });
             prepared_files.push((relative_path.clone(), payload));
-            metadata_assets.push(serde_json::json!({
+            prepared.metadata_assets.push(serde_json::json!({
                 "schema_version": "fdm_multilayer_material_field.v1",
                 "backend": "fdm_multilayer",
                 "build_identity": build_identity,
@@ -2439,7 +3152,7 @@ fn write_fdm_multilayer_material_field_artifacts(
     }
 
     if prepared_files.is_empty() {
-        return Ok(Vec::new());
+        return Ok(prepared);
     }
 
     let manifest_path = "material-fields/fdm-multilayer/manifest.json";
@@ -2454,14 +3167,22 @@ fn write_fdm_multilayer_material_field_artifacts(
     prepared_files.push((manifest_path.to_string(), manifest));
 
     for (relative_path, payload) in prepared_files {
-        let full_path = output_dir.join(relative_path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(full_path, serde_json::to_vec_pretty(&payload).unwrap())?;
+        prepared.files.push(crate::types::AuxiliaryArtifact {
+            relative_path,
+            bytes: serde_json::to_vec_pretty(&payload).unwrap(),
+        });
     }
 
-    Ok(metadata_assets)
+    Ok(prepared)
+}
+
+fn write_fdm_multilayer_material_field_artifacts(
+    output_dir: &Path,
+    multilayer: &fullmag_ir::FdmMultilayerPlanIR,
+) -> std::io::Result<Vec<serde_json::Value>> {
+    let prepared = build_fdm_multilayer_material_field_artifacts(multilayer)?;
+    write_artifact_bytes(output_dir, &prepared.files)?;
+    Ok(prepared.metadata_assets)
 }
 
 fn fdm_multilayer_layer_artifact_descriptor(
@@ -2871,13 +3592,12 @@ fn hash_json_value(value: &serde_json::Value) -> std::io::Result<String> {
     Ok(format!("sha256:{:x}", Sha256::digest(payload)))
 }
 
-fn write_fem_supercell_node_geometry_artifact(
-    output_dir: &Path,
+fn build_fem_supercell_node_geometry_artifact(
     problem: &fullmag_ir::ProblemIR,
     plan: &fullmag_ir::ExecutionPlanIR,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<crate::types::AuxiliaryArtifact>> {
     let BackendPlanIR::Fem(fem) = &plan.backend_plan else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(runtime_metadata) = problem
         .problem_meta
@@ -2885,10 +3605,10 @@ fn write_fem_supercell_node_geometry_artifact(
         .get("periodic_antidot_relaxation")
         .and_then(|value| value.as_object())
     else {
-        return Ok(());
+        return Ok(None);
     };
     if !runtime_metadata.contains_key("supercell_repeat") {
-        return Ok(());
+        return Ok(None);
     }
 
     let magnetic_node_mask = crate::preview::mesh_quantity_active_mask("m", &fem.mesh)
@@ -2911,12 +3631,21 @@ fn write_fem_supercell_node_geometry_artifact(
         },
         "source": "ExecutionPlanIR.FemPlanIR.mesh.nodes",
     });
-    let mesh_dir = output_dir.join("mesh");
-    fs::create_dir_all(&mesh_dir)?;
-    fs::write(
-        mesh_dir.join("node_geometry.v1.json"),
-        serde_json::to_vec_pretty(&artifact).unwrap(),
-    )?;
+    let bytes = serde_json::to_vec_pretty(&artifact).unwrap();
+    Ok(Some(crate::types::AuxiliaryArtifact {
+        relative_path: "mesh/node_geometry.v1.json".to_string(),
+        bytes,
+    }))
+}
+
+fn write_fem_supercell_node_geometry_artifact(
+    output_dir: &Path,
+    problem: &fullmag_ir::ProblemIR,
+    plan: &fullmag_ir::ExecutionPlanIR,
+) -> std::io::Result<()> {
+    if let Some(artifact) = build_fem_supercell_node_geometry_artifact(problem, plan)? {
+        write_artifact_bytes(output_dir, &[artifact])?;
+    }
     Ok(())
 }
 
@@ -2947,6 +3676,21 @@ fn fem_material_field_values<'a>(
             .a_element_field
             .as_deref()
             .map(|values| (values, Element)),
+        _ => None,
+    }
+}
+
+fn fem_eigen_material_field_values<'a>(
+    fem: &'a fullmag_ir::FemEigenPlanIR,
+    field_plan: &fullmag_ir::MaterialFieldPlan,
+) -> Option<(&'a [f64], fullmag_ir::MaterialFieldLocationIR)> {
+    use fullmag_ir::MaterialFieldLocationIR::Node;
+    use fullmag_ir::MaterialParameterNameIR::{Aex, Alpha, Ms};
+
+    match (field_plan.parameter, field_plan.realization_location) {
+        (Ms, Node) => fem.material.ms_field.as_deref().map(|values| (values, Node)),
+        (Aex, Node) => fem.material.a_field.as_deref().map(|values| (values, Node)),
+        (Alpha, Node) => fem.material.alpha_field.as_deref().map(|values| (values, Node)),
         _ => None,
     }
 }
@@ -3073,16 +3817,15 @@ fn problem_source_scene_revision(problem: &fullmag_ir::ProblemIR) -> Option<u64>
         })
 }
 
-fn write_periodic_pairs_artifact(
-    output_dir: &Path,
+fn build_periodic_pairs_artifact(
     plan: &fullmag_ir::ExecutionPlanIR,
     source_scene_revision: Option<u64>,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<crate::types::AuxiliaryArtifact>> {
     let Some(mesh) = periodic_mesh(plan) else {
-        return Ok(());
+        return Ok(None);
     };
     if mesh.periodic_boundary_pairs.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let mesh_topology_fingerprint = mesh.topology_fingerprint_v6();
@@ -3236,15 +3979,20 @@ fn write_periodic_pairs_artifact(
         "max_translation_residual_m": max_translation_residual_m,
         "pairs": pairs,
     });
-    let artifact_path = output_dir.join("mesh").join("periodic_pairs.v1.json");
-    if let Some(parent) = artifact_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        artifact_path,
-        serde_json::to_string_pretty(&payload).unwrap(),
-    )?;
+    Ok(Some(crate::types::AuxiliaryArtifact {
+        relative_path: "mesh/periodic_pairs.v1.json".to_string(),
+        bytes: serde_json::to_string_pretty(&payload).unwrap().into_bytes(),
+    }))
+}
 
+fn write_periodic_pairs_artifact(
+    output_dir: &Path,
+    plan: &fullmag_ir::ExecutionPlanIR,
+    source_scene_revision: Option<u64>,
+) -> std::io::Result<()> {
+    if let Some(artifact) = build_periodic_pairs_artifact(plan, source_scene_revision)? {
+        write_artifact_bytes(output_dir, &[artifact])?;
+    }
     Ok(())
 }
 
@@ -3575,7 +4323,9 @@ fn periodic_mesh(plan: &fullmag_ir::ExecutionPlanIR) -> Option<&fullmag_ir::Mesh
         BackendPlanIR::Fem(fem) => Some(&fem.mesh),
         BackendPlanIR::FemEigen(fem) => Some(&fem.mesh),
         BackendPlanIR::FemFrequencyResponse(fem) => Some(&fem.mesh),
-        BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => None,
+        BackendPlanIR::Fdm(_)
+        | BackendPlanIR::FdmMultilayer(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_) => None,
     }
 }
 
@@ -3597,6 +4347,7 @@ fn periodic_material_fields(
         BackendPlanIR::Fdm(_)
         | BackendPlanIR::FdmMultilayer(_)
         | BackendPlanIR::FemEigen(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_)
         | BackendPlanIR::FemFrequencyResponse(_) => (None, None, None, None),
     }
 }
@@ -4339,6 +5090,86 @@ fn write_sampling_resolution_artifact(
     )
 }
 
+fn final_native_snapshot_receipt(
+    context: &FieldArtifactContext,
+    executed: &ExecutedRun,
+    stats: &mut StepStats,
+) -> std::io::Result<
+    Option<fullmag_quantities::fem_state_snapshot_receipt::FemLocalNodeSnapshotReceipt>,
+> {
+    use fullmag_quantities::fem_state_snapshot_receipt::{
+        parse_fem_snapshot_receipt, FEM_FINAL_SNAPSHOT_RECEIPT_ARTIFACT,
+    };
+    let mut artifacts = executed
+        .auxiliary_artifacts
+        .iter()
+        .filter(|artifact| artifact.relative_path == FEM_FINAL_SNAPSHOT_RECEIPT_ARTIFACT);
+    let Some(artifact) = artifacts.next() else {
+        return Ok(None);
+    };
+    if artifacts.next().is_some()
+        || context
+            .layout
+            .get("backend")
+            .and_then(serde_json::Value::as_str)
+            != Some("fem")
+        || !matches!(
+            executed.provenance.execution_engine.as_str(),
+            "fem_cpu_native" | "fem_native_gpu"
+        )
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "ambiguous or nonnative final FEM snapshot receipt",
+        ));
+    }
+    let receipt = parse_fem_snapshot_receipt(&artifact.bytes)
+        .map_err(|message| Error::new(ErrorKind::InvalidData, message))?;
+    receipt
+        .validate_snapshot(
+            receipt.snapshot_step,
+            receipt.snapshot_time_s,
+            receipt.snapshot_solver_dt_s,
+            &executed.result.final_magnetization,
+        )
+        .map_err(|message| Error::new(ErrorKind::InvalidData, message))?;
+    // A sampled diagnostic trace can omit the final endpoint. The receipt
+    // captured with final m is the authority for this artifact's timestamp.
+    stats.step = receipt.snapshot_step;
+    stats.time = receipt.snapshot_time_s;
+    stats.dt = receipt.snapshot_solver_dt_s;
+    Ok(Some(receipt))
+}
+fn final_native_node_map(
+    executed: &ExecutedRun,
+    receipt: Option<&fullmag_quantities::fem_state_snapshot_receipt::FemLocalNodeSnapshotReceipt>,
+) -> std::io::Result<Option<fullmag_quantities::fem_local_node_map::FemLocalNodeIndexMap>> {
+    use fullmag_quantities::fem_local_node_map::{
+        parse_fem_local_node_map, FEM_FINAL_NODE_MAP_ARTIFACT,
+    };
+    let mut artifacts = executed
+        .auxiliary_artifacts
+        .iter()
+        .filter(|artifact| artifact.relative_path == FEM_FINAL_NODE_MAP_ARTIFACT);
+    let map = artifacts
+        .next()
+        .map(|artifact| parse_fem_local_node_map(&artifact.bytes))
+        .transpose()
+        .map_err(|message| Error::new(ErrorKind::InvalidData, message))?;
+    if artifacts.next().is_some() || (map.is_some() && receipt.is_none()) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "ambiguous or unbound final FEM node map",
+        ));
+    }
+    if let Some(receipt) = receipt {
+        receipt
+            .validate_node_map(map.as_ref())
+            .map_err(|message| Error::new(ErrorKind::InvalidData, message))?;
+    }
+    Ok(map)
+}
+
 pub(crate) fn write_field_file(
     path: &Path,
     context: &FieldArtifactContext,
@@ -4349,17 +5180,187 @@ pub(crate) fn write_field_file(
     solver_dt: f64,
     values: &[[f64; 3]],
 ) -> std::io::Result<()> {
-    let field_json = serde_json::json!({
+    write_field_file_with_native_snapshot(path, context, provenance, observable, step, time, solver_dt, values, None, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_field_file_with_native_snapshot(
+    path: &Path,
+    context: &FieldArtifactContext,
+    provenance: &crate::types::ExecutionProvenance,
+    observable: &str,
+    step: u64,
+    time: f64,
+    solver_dt: f64,
+    values: &[[f64; 3]],
+    snapshot_receipt: Option<
+        &fullmag_quantities::fem_state_snapshot_receipt::FemLocalNodeSnapshotReceipt,
+    >,
+    node_map: Option<&fullmag_quantities::fem_local_node_map::FemLocalNodeIndexMap>,
+) -> std::io::Result<()> {
+    let mut layout = context.layout.clone();
+    if observable == "m" {
+        let semantics = context
+            .magnetization_field_semantics
+            .as_ref()
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("FEM magnetization field semantics unavailable: {error}"),
+                )
+            })?;
+        if let Some(semantics) = semantics {
+            if values.len() != semantics.active_node_mask.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "FEM H1/P1 magnetization payload length {} does not match the declared node count {}",
+                        values.len(),
+                        semantics.active_node_mask.len()
+                    ),
+                ));
+            }
+            if values
+                .iter()
+                .flat_map(|value| value.iter())
+                .any(|component| !component.is_finite())
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "FEM H1/P1 magnetization payload contains a non-finite value",
+                ));
+            }
+            let layout_object = layout.as_object_mut().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "magnetization field layout is not a JSON object",
+                )
+            })?;
+            let field_semantics = serde_json::to_value(semantics)
+                .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+            layout_object.insert("field_semantics".to_string(), field_semantics);
+        }
+    }
+    let mut field_json = serde_json::json!({
         "observable": observable,
         "unit": field_unit(observable),
         "step": step,
         "time": time,
         "solver_dt": solver_dt,
-        "layout": context.layout,
+        "layout": layout,
         "provenance": artifact_provenance_json(context, provenance),
         "values": values,
     });
+    if let Some(receipt) = snapshot_receipt {
+        if observable != "m"
+            || context
+                .layout
+                .get("backend")
+                .and_then(serde_json::Value::as_str)
+                != Some("fem")
+            || !matches!(
+                provenance.execution_engine.as_str(),
+                "fem_cpu_native" | "fem_native_gpu"
+            )
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "native state receipt requires native FEM m output",
+            ));
+        }
+        receipt
+            .validate_snapshot(step, time, solver_dt, values)
+            .map_err(|message| Error::new(ErrorKind::InvalidData, message))?;
+        receipt
+            .validate_node_map(node_map)
+            .map_err(|message| Error::new(ErrorKind::InvalidData, message))?;
+        field_json
+            .as_object_mut()
+            .expect("field artifact is an object")
+            .insert(
+                "native_state_snapshot".into(),
+                serde_json::to_value(receipt)?,
+            );
+    }
+    if let Some(map) = node_map {
+        if snapshot_receipt.is_none() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "native node map requires snapshot receipt",
+            ));
+        }
+        field_json
+            .as_object_mut()
+            .expect("field artifact is an object")
+            .insert("native_node_map".into(), serde_json::to_value(map)?);
+    }
+    if observable == "m" {
+        let layout = field_json.get("layout").ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "magnetization field layout is missing",
+            )
+        })?;
+        let backend = layout
+            .get("backend")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "magnetization field layout has no backend identity",
+                )
+            })?;
+        let layout_bytes = serde_json::to_vec(layout)
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+        let layout_sha256 = format!("{:x}", Sha256::digest(layout_bytes));
+        field_json
+            .as_object_mut()
+            .expect("field artifact JSON is an object")
+            .insert(
+                "state_identity".into(),
+                serde_json::json!({
+                    "schema_version": "magnetization_state.v1",
+                    "backend": backend,
+                    "layout_sha256": layout_sha256,
+                    "sample_count": values.len(),
+                }),
+            );
+    }
+    if node_map.is_some() {
+        validate_mapped_state_byte_budget(
+            &field_json,
+            fullmag_quantities::fem_local_node_map::MAX_FEM_MAPPED_STATE_JSON_BYTES,
+        )?;
+    }
     fs::write(path, serde_json::to_string_pretty(&field_json).unwrap())
+}
+
+fn validate_mapped_state_byte_budget(
+    value: &serde_json::Value,
+    max_bytes: usize,
+) -> std::io::Result<()> {
+    struct Budget {
+        used: usize,
+        max_bytes: usize,
+    }
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.max_bytes.saturating_sub(self.used) {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "mapped native FEM state exceeds the shared source JSON budget",
+                ));
+            }
+            self.used += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer_pretty(Budget { used: 0, max_bytes }, value)
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))
 }
 
 #[derive(Debug, Clone)]
@@ -4677,6 +5678,15 @@ fn sanitize_layer_id(id: &str) -> String {
 
 pub(crate) fn field_layout(plan: &fullmag_ir::ExecutionPlanIR) -> serde_json::Value {
     match &plan.backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(inspection) => serde_json::json!({
+            "backend": "antenna_external_lead_inspection",
+            "stage_id": inspection.input.stage.id,
+            "port_mode_id": inspection.input.port.id,
+            "output_id": inspection.output_id,
+            "magnetization_state": "not_applicable",
+            "conductor_topology_fingerprint": inspection.input.combined_mesh.topology_fingerprint_v6(),
+            "sampling_topology_digest": inspection.input.field_sampling.topology_digest,
+        }),
         BackendPlanIR::Fdm(fdm) => {
             let total_cells = fdm.grid.cells[0] as usize
                 * fdm.grid.cells[1] as usize
@@ -4692,6 +5702,10 @@ pub(crate) fn field_layout(plan: &fullmag_ir::ExecutionPlanIR) -> serde_json::Va
                 "origin_m": fdm.origin_m,
                 "grid_cells": fdm.grid.cells,
                 "cell_size": fdm.cell_size,
+                "grid_fingerprint": fdm
+                    .grid_certificate
+                    .as_ref()
+                    .map(|certificate| certificate.grid_fingerprint.clone()),
                 "total_cell_count": total_cells,
                 "active_mask_present": fdm.active_mask.is_some(),
                 "active_mask": fdm.active_mask.as_ref().map(|mask| mask.as_slice()),
@@ -4748,6 +5762,7 @@ pub(crate) fn field_layout(plan: &fullmag_ir::ExecutionPlanIR) -> serde_json::Va
             "mesh_source": fem.mesh_source,
             "fe_order": fem.fe_order,
             "hmax": fem.hmax,
+            "topology_fingerprint": fem.mesh.topology_fingerprint_v6(),
             "n_nodes": fem.mesh.nodes.len(),
             "n_elements": fem.mesh.cell_count(),
         }),
@@ -4757,6 +5772,7 @@ pub(crate) fn field_layout(plan: &fullmag_ir::ExecutionPlanIR) -> serde_json::Va
             "mesh_source": fem.mesh_source,
             "fe_order": fem.fe_order,
             "hmax": fem.hmax,
+            "topology_fingerprint": fem.mesh.topology_fingerprint_v6(),
             "n_nodes": fem.mesh.nodes.len(),
             "n_elements": fem.mesh.cell_count(),
             "mode_count": fem.count,
@@ -4774,6 +5790,7 @@ pub(crate) fn field_layout(plan: &fullmag_ir::ExecutionPlanIR) -> serde_json::Va
             "mesh_source": fem.mesh_source,
             "fe_order": fem.fe_order,
             "hmax": fem.hmax,
+            "topology_fingerprint": fem.mesh.topology_fingerprint_v6(),
             "n_nodes": fem.mesh.nodes.len(),
             "n_elements": fem.mesh.cell_count(),
             "frequency_count": fem.frequencies_hz.values_hz.len(),
@@ -4961,6 +5978,31 @@ mod tests {
     #[test]
     fn exact_backend_observation_executes_only_one_of_two_same_kind_modules() {
         let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        fn torque_module(id: &str, current_density: [f64; 3]) -> fullmag_ir::SpinTorqueModuleIR {
+            fullmag_ir::SpinTorqueModuleIR::ZhangLi {
+                schema_version: Some("zhang_li_torque.v1".to_string()),
+                id: Some(id.to_string()),
+                target: Some(fullmag_ir::RegionRefIR {
+                    object_id: "strip".to_string(),
+                    region_id: None,
+                }),
+                formula_version: "zhang_li.mumax3.v1".to_string(),
+                operator_version: Some("zl_mumax3_central_v1".to_string()),
+                current_density: Some(current_density),
+                current_source: None,
+                degree: 1.0,
+                beta: 0.05,
+                lande_g: Some(2.0),
+            }
+        }
+        problem.spin_torque_modules = vec![
+            torque_module("torque:first", [1.0e12, 0.0, 0.0]),
+            torque_module("torque:second", [0.0, 1.0e12, 0.0]),
+        ];
+        let first_family_payload = serde_json::to_value(&problem.spin_torque_modules[0])
+            .expect("serialize first canonical typed torque record");
+        let second_family_payload = serde_json::to_value(&problem.spin_torque_modules[1])
+            .expect("serialize second canonical typed torque record");
         problem.physics_graph = Some(serde_json::json!({
             "schema_version": "physics_graph.v1",
             "scene_revision": 1,
@@ -4968,31 +6010,41 @@ mod tests {
                 {
                     "id": "torque:first",
                     "kind": "spin_torque",
-                    "applies_to": [{"kind": "global"}],
-                    "solve_domain": [],
+                    "applies_to": [{"kind": "object", "object_id": "strip"}],
+                    "solve_domain": [{"object_id": "strip"}],
                     "depends_on": [],
                     "activation": "active",
                     "authored_state": "authored",
                     "capability": "reference_executable",
-                    "source_path": "/spin_torques/0",
-                    "family_payload": {"kind": "zhang_li"}
+                    "source_path": "/spin_torque_modules/0",
+                    "family_payload": first_family_payload
                 },
                 {
                     "id": "torque:second",
                     "kind": "spin_torque",
-                    "applies_to": [{"kind": "global"}],
-                    "solve_domain": [],
+                    "applies_to": [{"kind": "object", "object_id": "strip"}],
+                    "solve_domain": [{"object_id": "strip"}],
                     "depends_on": [],
                     "activation": "active",
                     "authored_state": "authored",
                     "capability": "reference_executable",
-                    "source_path": "/spin_torques/1",
-                    "family_payload": {"kind": "zhang_li"}
+                    "source_path": "/spin_torque_modules/1",
+                    "family_payload": second_family_payload
                 }
             ],
             "edges": []
         }));
-        let plan = test_execution_plan(None);
+        let mut plan = test_execution_plan(None);
+        let BackendPlanIR::Fdm(fdm_plan) = &mut plan.backend_plan else {
+            panic!("expected FDM plan");
+        };
+        // Give the object-scoped modules an identity in this fixture mask.
+        let grid_certificate = fdm_plan
+            .grid_certificate
+            .take()
+            .expect("artifact fixture grid certificate should exist");
+        fdm_plan.grid_certificate =
+            Some(grid_certificate.with_object_ids(vec!["strip".to_string()]));
         let executed = ExecutedRun {
             result: RunResult {
                 status: RunStatus::Completed,
@@ -5046,6 +6098,8 @@ mod tests {
             beta: 0.05,
             lande_g: Some(2.0),
         }];
+        let family_payload = serde_json::to_value(&problem.spin_torque_modules[0])
+            .expect("serialize canonical typed torque payload");
         problem.physics_graph = Some(serde_json::json!({
             "schema_version": "physics_graph.v1",
             "scene_revision": 1,
@@ -5059,7 +6113,7 @@ mod tests {
                 "authored_state": "authored",
                 "capability": "reference_executable",
                 "source_path": "/spin_torque_modules/0",
-                "family_payload": {"kind": "zhang_li"}
+                "family_payload": family_payload
             }],
             "edges": []
         }));
@@ -5315,6 +6369,7 @@ mod tests {
             source_hash: Some("source-bound".into()),
             execution_mode: ExecutionMode::Hybrid,
             layout: serde_json::json!({"backend": "fem"}),
+            magnetization_field_semantics: Ok(None),
             execution_resolution: None,
         };
         let mut provenance = ExecutionProvenance::default();
@@ -5388,6 +6443,7 @@ mod tests {
             source_hash: None,
             execution_mode: ExecutionMode::Strict,
             layout: serde_json::json!({"backend": "fdm", "grid_cells": [2, 1, 1]}),
+            magnetization_field_semantics: Ok(None),
             execution_resolution: None,
         };
         let snapshot = FieldSnapshot::new(
@@ -6026,9 +7082,34 @@ mod tests {
             unique_suffix
         ));
 
+        let prepared = build_material_field_artifacts(&plan)
+            .expect("multilayer material bundle should build without filesystem output");
+        let prepared_paths = prepared
+            .files
+            .iter()
+            .map(|artifact| artifact.relative_path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(!output_dir.exists(), "pure preparation must not write files");
+        assert_eq!(prepared.metadata_assets.len(), 6);
+        for asset in &prepared.metadata_assets {
+            let referenced_path = asset["artifact_path"]
+                .as_str()
+                .expect("metadata field asset should reference a member");
+            assert!(prepared_paths.contains(referenced_path));
+        }
+
         let assets = write_material_field_artifacts(&output_dir, &plan)
             .expect("multilayer material artifacts should be written");
 
+        assert_eq!(assets, prepared.metadata_assets);
+        for artifact in &prepared.files {
+            assert_eq!(
+                fs::read(output_dir.join(&artifact.relative_path))
+                    .expect("legacy wrapper member should exist"),
+                artifact.bytes,
+                "legacy wrapper must write the exact bytes returned by the pure builder"
+            );
+        }
         assert_eq!(assets.len(), 6);
         assert!(assets
             .iter()
@@ -6057,6 +7138,19 @@ mod tests {
                 .expect("multilayer material manifest should exist"),
         )
         .expect("multilayer material manifest should parse");
+        let manifest_artifact = prepared
+            .files
+            .iter()
+            .find(|artifact| {
+                artifact.relative_path == "material-fields/fdm-multilayer/manifest.json"
+            })
+            .expect("pure builder should include the referenced manifest");
+        assert_eq!(
+            fs::read(output_dir.join(&manifest_artifact.relative_path))
+                .expect("legacy wrapper manifest should exist"),
+            manifest_artifact.bytes,
+            "legacy wrapper must write the exact manifest bytes returned by the pure builder"
+        );
         assert_eq!(
             manifest["schema_version"],
             "fdm_multilayer_material_fields.v1"
@@ -6065,6 +7159,28 @@ mod tests {
         assert_eq!(manifest["layers"].as_array().map(Vec::len), Some(2));
         assert_eq!(manifest["build_identity"], build_identity_json());
         assert!(manifest.get("common_grid").is_none());
+        for layer in manifest["layers"]
+            .as_array()
+            .expect("manifest layer descriptors")
+        {
+            let material_fields = layer["material_fields"]
+                .as_object()
+                .expect("layer material-field descriptors");
+            for descriptor in material_fields.values() {
+                if let Some(relative_path) = descriptor["artifact_path"].as_str() {
+                    assert!(
+                        prepared_paths.contains(relative_path),
+                        "manifest material descriptor must resolve to a prepared member"
+                    );
+                }
+            }
+            if let Some(relative_path) = layer["native_region_mask"]["artifact_path"].as_str() {
+                assert!(
+                    prepared_paths.contains(relative_path),
+                    "manifest membership descriptor must resolve to a prepared member"
+                );
+            }
+        }
 
         let bottom_ms: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(
@@ -6532,10 +7648,12 @@ mod tests {
                 enable_demag: false,
                 external_field: None,
                 antenna_zeeman_masks: Vec::new(),
+                solved_antenna_drive_bases: Vec::new(),
                 field_drives: Vec::new(),
                 field_drive_geometry_masks: Vec::new(),
                 time_stage: Default::default(),
                 current_modules: Vec::new(),
+                charge_transport_plans: Vec::new(),
                 spin_transport_plans: Vec::new(),
                 gyromagnetic_ratio: 2.211e5,
                 precision: ExecutionPrecision::Double,
@@ -6617,6 +7735,620 @@ mod tests {
         }
     }
 
+    fn test_fem_eigen_execution_plan() -> ExecutionPlanIR {
+        ExecutionPlanIR {
+            common: CommonPlanMeta {
+                ir_version: "v0".to_string(),
+                requested_backend: fullmag_ir::BackendTarget::Fem,
+                resolved_backend: fullmag_ir::BackendTarget::Fem,
+                execution_mode: ExecutionMode::Strict,
+                material_field_plans: vec![MaterialFieldPlan {
+                    object_id: "free".to_string(),
+                    parameter: MaterialParameterNameIR::Ms,
+                    source_kind: MaterialFieldSourceKind::Override,
+                    realization_location: MaterialFieldLocationIR::Node,
+                    requires_sampling: false,
+                    requires_mesh_revision: false,
+                    warnings: Vec::new(),
+                    realization_method: Some("immutable_generation_fixture".to_string()),
+                    statistics: None,
+                }],
+            },
+            backend_plan: BackendPlanIR::FemEigen(fullmag_ir::FemEigenPlanIR {
+                mesh_name: "unit_tet".to_string(),
+                mesh_source: Some("meshes/unit_tet.msh".to_string()),
+                mesh: MeshIR {
+                    mesh_name: "unit_tet".to_string(),
+                    nodes: vec![
+                        [0.0, 0.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    cells: fullmag_ir::FemConnectivityIR::from_tet4(vec![[0, 1, 2, 3]]),
+                    element_markers: vec![1],
+                    facets: fullmag_ir::FemFacetConnectivityIR::from_tri3(vec![[0, 1, 2]]),
+                    boundary_markers: vec![1],
+                    periodic_boundary_pairs: Vec::new(),
+                    periodic_node_pairs: Vec::new(),
+                    per_domain_quality: HashMap::new(),
+                },
+                object_segments: vec![FemObjectSegmentIR {
+                    object_id: "free".to_string(),
+                    geometry_id: Some("pillar".to_string()),
+                    node_start: 0,
+                    node_count: 4,
+                    element_start: 0,
+                    element_count: 1,
+                    boundary_face_start: 0,
+                    boundary_face_count: 1,
+                }],
+                mesh_parts: Vec::new(),
+                mesh_build_report: None,
+                domain_mesh_mode: FemDomainMeshModeIR::MergedMagneticMesh,
+                domain_frame: None,
+                fe_order: 1,
+                hmax: 0.4,
+                equilibrium_magnetization: vec![[1.0, 0.0, 0.0]; 4],
+                material: MaterialIR {
+                    name: "Py".to_string(),
+                    saturation_magnetisation: 800e3,
+                    exchange_stiffness: 13e-12,
+                    damping: 0.02,
+                    uniaxial_anisotropy: None,
+                    anisotropy_axis: None,
+                    uniaxial_anisotropy_k2: None,
+                    cubic_anisotropy_kc1: None,
+                    cubic_anisotropy_kc2: None,
+                    cubic_anisotropy_kc3: None,
+                    cubic_anisotropy_axis1: None,
+                    cubic_anisotropy_axis2: None,
+                    ms_field: Some(vec![800e3; 4]),
+                    a_field: None,
+                    alpha_field: None,
+                    ku_field: None,
+                    ku2_field: None,
+                    kc1_field: None,
+                    kc2_field: None,
+                    kc3_field: None,
+                    interfacial_dmi: None,
+                    bulk_dmi: None,
+                    dind_field: None,
+                    dbulk_field: None,
+                },
+                operator: fullmag_ir::EigenOperatorConfigIR {
+                    kind: fullmag_ir::EigenOperatorIR::LinearizedLlg,
+                    include_demag: false,
+                },
+                count: 2,
+                target: fullmag_ir::EigenTargetIR::FrequencyWindow {
+                    frequency_min_hz: 1.0e8,
+                    frequency_max_hz: 5.0e9,
+                },
+                equilibrium: fullmag_ir::EquilibriumSourceIR::RelaxedInitialState,
+                k_sampling: Some(fullmag_ir::KSamplingIR::Single {
+                    k_vector: [0.0, 0.0, 0.0],
+                }),
+                bias_field_samples: Vec::new(),
+                normalization: fullmag_ir::EigenNormalizationIR::UnitL2,
+                damping_policy: fullmag_ir::EigenDampingPolicyIR::Include,
+                enable_exchange: true,
+                enable_demag: false,
+                interfacial_dmi: None,
+                dmi_interface_normal: None,
+                bulk_dmi: None,
+                external_field: None,
+                gyromagnetic_ratio: 2.211e5,
+                precision: ExecutionPrecision::Double,
+                exchange_bc: ExchangeBoundaryCondition::Neumann,
+                spin_wave_bc: fullmag_ir::SpinWaveBoundaryConditionIR::default(),
+                demag_realization: None,
+                air_box_config: None,
+                mode_tracking: None,
+                dispersion_validation: None,
+                k0_kittel_validation: None,
+                solver_policy: None,
+            }),
+            output_plan: OutputPlanIR {
+                outputs: Vec::new(),
+            },
+            provenance: ProvenancePlanIR {
+                notes: Vec::new(),
+                integrator_resolution: None,
+                fem_eigen_execution_resolution: None,
+                physics_graph: None,
+            },
+        }
+    }
+
+    fn test_fem_eigen_generation_artifacts(spectrum: &[u8]) -> Vec<crate::types::AuxiliaryArtifact> {
+        let store = "eigen/mode_fields.zarr";
+        let array = "eigen/mode_fields.zarr/sample_0000/mode_0000/vector_xyz_complex";
+        let chunk = format!("{array}/0.0.0");
+        let compatibility = "eigen/mode_fields/sample_0000/mode_0000/vector.bin";
+        let mode_metadata_path = "eigen/modes/sample_0000/mode_0000.json";
+        let manifest = serde_json::json!({
+            "schema_version": "frequency_domain_manifest.v1",
+            "artifacts": {
+                "solver_diagnostics_path": "eigen/diagnostics/solver.v1.json",
+                "spectrum_v2_path": "eigen/spectrum.v2.json",
+                "mode_field_zarr_store_path": store,
+                "mode_metadata_paths": [mode_metadata_path],
+            }
+        });
+        let mode_metadata = serde_json::json!({
+            "storage_format": "zarr",
+            "zarr_store_path": store,
+            "zarr_array_path": array,
+            "zarr_chunk_path": chunk,
+            "compatibility_binary_payload_path": compatibility,
+        });
+        vec![
+            crate::types::AuxiliaryArtifact {
+                relative_path: "eigen/spectrum.json".to_string(),
+                bytes: spectrum.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: "eigen/spectrum.v2.json".to_string(),
+                bytes: spectrum.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: "eigen/diagnostics/solver.v1.json".to_string(),
+                bytes: br#"{"status":"ready"}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: mode_metadata_path.to_string(),
+                bytes: serde_json::to_vec(&mode_metadata).unwrap(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{store}/.zgroup"),
+                bytes: br#"{"zarr_format":2}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{store}/.zattrs"),
+                bytes: br#"{}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{store}/sample_0000/.zgroup"),
+                bytes: br#"{"zarr_format":2}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{store}/sample_0000/mode_0000/.zgroup"),
+                bytes: br#"{"zarr_format":2}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{array}/.zarray"),
+                bytes: br#"{"zarr_format":2}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{array}/.zattrs"),
+                bytes: br#"{}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: chunk,
+                bytes: b"mode data chunk".to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: compatibility.to_string(),
+                bytes: b"compatibility mode payload".to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: "frequency_domain/manifest.v1.json".to_string(),
+                bytes: serde_json::to_vec_pretty(&manifest).unwrap(),
+            },
+        ]
+    }
+    fn assert_immutable_fem_eigen_references_resolve(
+        output_dir: &Path,
+        capture: &crate::artifact_generation::GenerationCapture,
+    ) {
+        assert!(capture.is_immutable());
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &capture.read_member(output_dir, "metadata.json").unwrap(),
+        )
+        .unwrap();
+        let material_assets = metadata["material_field_assets"]
+            .as_array()
+            .expect("metadata carries material field references");
+        assert_eq!(material_assets.len(), 1);
+        for asset in material_assets {
+            let relative = asset["artifact_path"]
+                .as_str()
+                .expect("material asset has a path");
+            assert!(capture.commit.content.members.contains_key(relative));
+            let _: serde_json::Value =
+                serde_json::from_slice(&capture.read_member(output_dir, relative).unwrap())
+                    .expect("material field member resolves and parses");
+        }
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &capture
+                .read_member(output_dir, "frequency_domain/manifest.v1.json")
+                .unwrap(),
+        )
+        .unwrap();
+        let artifacts = manifest["artifacts"]
+            .as_object()
+            .expect("manifest artifacts are an object");
+        for (name, value) in artifacts {
+            if name == "mode_field_zarr_store_path" {
+                if let Some(store) = value.as_str() {
+                    for suffix in [".zgroup", ".zattrs"] {
+                        capture
+                            .read_member(output_dir, &format!("{store}/{suffix}"))
+                            .expect("Zarr directory resolves to its root metadata members");
+                    }
+                }
+            } else if name.ends_with("_path") {
+                if let Some(relative) = value.as_str() {
+                    assert!(capture.commit.content.members.contains_key(relative));
+                    capture.read_member(output_dir, relative).unwrap();
+                }
+            } else if name.ends_with("_paths") {
+                if let Some(paths) = value.as_array() {
+                    for relative in paths.iter().filter_map(serde_json::Value::as_str) {
+                        assert!(capture.commit.content.members.contains_key(relative));
+                        capture.read_member(output_dir, relative).unwrap();
+                        if name == "mode_metadata_paths" {
+                            let mode: serde_json::Value = serde_json::from_slice(
+                                &capture.read_member(output_dir, relative).unwrap(),
+                            )
+                            .unwrap();
+                            if let Some(array_path) = mode
+                                .get("zarr_array_path")
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                let store = mode["zarr_store_path"].as_str().unwrap();
+                                let relative = array_path
+                                    .strip_prefix(&format!("{store}/"))
+                                    .expect("mode array path is inside its store");
+                                let components = relative.split('/').collect::<Vec<_>>();
+                                let mut group = store.to_string();
+                                for component in components.iter().take(components.len() - 1) {
+                                    group.push('/');
+                                    group.push_str(component);
+                                    capture
+                                        .read_member(output_dir, &format!("{group}/.zgroup"))
+                                        .expect("Zarr parent group resolves");
+                                }
+                                for suffix in [".zarray", ".zattrs"] {
+                                    capture
+                                        .read_member(output_dir, &format!("{array_path}/{suffix}"))
+                                        .expect("mode array descriptors resolve");
+                                }
+                            }
+                            for field in ["zarr_chunk_path", "compatibility_binary_payload_path"] {
+                                if let Some(path) = mode.get(field).and_then(serde_json::Value::as_str) {
+                                    capture
+                                        .read_member(output_dir, path)
+                                        .expect("mode payload references resolve");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn fem_eigen_writer_publishes_two_immutable_generations_and_preserves_legacy_root() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let output_dir = std::env::temp_dir().join(format!(
+            "fullmag-fem-eigen-v2-writer-{}-{suffix}",
+            std::process::id()
+        ));
+        let sentinels = [
+            ("metadata.json", b"legacy metadata sentinel".as_slice()),
+            (
+                "material-fields/free_ms_node.json",
+                b"legacy material sentinel".as_slice(),
+            ),
+            ("eigen/spectrum.json", b"legacy eigen sentinel".as_slice()),
+            (
+                "frequency_domain/manifest.v1.json",
+                b"legacy frequency manifest sentinel".as_slice(),
+            ),
+        ];
+        for (relative, _) in sentinels {
+            let path = output_dir.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        for (relative, bytes) in sentinels {
+            fs::write(output_dir.join(relative), bytes).unwrap();
+        }
+
+        let mut problem = fem_execution_problem("cpu", ExecutionMode::Strict);
+        for (key, value) in [
+            ("producer_run_id", "writer-run"),
+            ("producer_stage_id", "eigen-stage"),
+            ("producer_stage_kind", "eigenmodes"),
+        ] {
+            problem
+                .problem_meta
+                .runtime_metadata
+                .insert(key.to_string(), serde_json::json!(value));
+        }
+        let expected_owner = crate::artifact_generation::PublicationOwner {
+            run_id: "writer-run".to_string(),
+            stage_id: "eigen-stage".to_string(),
+            stage_kind: "eigenmodes".to_string(),
+        };
+        let plan = test_fem_eigen_execution_plan();
+        let provenance = ExecutionProvenance {
+            execution_engine: "fem_eigen_cpu_baseline".to_string(),
+            precision: "double".to_string(),
+            ..ExecutionProvenance::default()
+        };
+        let summary = ArtifactPipelineSummary::default();
+        let mut first_run = final_execution_test_run(provenance.clone());
+        first_run.auxiliary_artifacts = test_fem_eigen_generation_artifacts(b"spectrum generation one");
+        write_artifacts(&output_dir, &problem, &plan, &first_run, Some(&summary))
+            .expect("first FEM eigen v2 publication should accept a streamed summary");
+
+        let first_capture = crate::artifact_generation::capture(&output_dir)
+            .unwrap()
+            .expect("first immutable generation should be current");
+        assert_immutable_fem_eigen_references_resolve(&output_dir, &first_capture);
+        assert_eq!(first_capture.commit.content.producer.as_ref(), Some(&expected_owner));
+        let first_generation_id = first_capture.commit.generation_id.clone();
+        let first_member_bytes = first_capture
+            .commit
+            .content
+            .members
+            .keys()
+            .map(|relative| {
+                (
+                    relative.clone(),
+                    first_capture.read_member(&output_dir, relative).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (relative, bytes) in &sentinels {
+            assert_eq!(fs::read(output_dir.join(relative)).unwrap(), bytes.to_vec());
+        }
+
+        let mut second_run = final_execution_test_run(provenance.clone());
+        second_run.auxiliary_artifacts =
+            test_fem_eigen_generation_artifacts(b"spectrum generation two");
+        write_artifacts(&output_dir, &problem, &plan, &second_run, Some(&summary))
+            .expect("second FEM eigen v2 publication should advance the current pointer");
+
+        let second_capture = crate::artifact_generation::capture(&output_dir)
+            .unwrap()
+            .expect("second immutable generation should be current");
+        assert_ne!(second_capture.commit.generation_id, first_generation_id);
+        assert_immutable_fem_eigen_references_resolve(&output_dir, &second_capture);
+        assert_eq!(second_capture.commit.content.producer.as_ref(), Some(&expected_owner));
+        assert_eq!(
+            second_capture.read_member(&output_dir, "eigen/spectrum.json").unwrap(),
+            b"spectrum generation two".to_vec()
+        );
+
+        let first_generation_name = first_generation_id
+            .strip_prefix("sha256:")
+            .expect("generation ID has canonical digest prefix");
+        let first_generation_dir = output_dir
+            .join("frequency_domain/generations")
+            .join(first_generation_name);
+        for (relative, bytes) in &first_member_bytes {
+            assert_eq!(
+                fs::read(first_generation_dir.join(relative)).unwrap(),
+                *bytes,
+                "old immutable member {relative} must remain byte-identical",
+            );
+        }
+
+        for (relative, bytes) in sentinels {
+            assert_eq!(fs::read(output_dir.join(relative)).unwrap(), bytes);
+        }
+
+        let pointer_path = output_dir.join(crate::artifact_generation::IMMUTABLE_COMMIT_PATH);
+        let pointer_before_failure = fs::read(&pointer_path).unwrap();
+
+        let mut invalid_owner_problem = problem.clone();
+        invalid_owner_problem
+            .problem_meta
+            .runtime_metadata
+            .remove("producer_stage_id");
+        let mut invalid_owner_run = final_execution_test_run(provenance.clone());
+        invalid_owner_run.auxiliary_artifacts =
+            test_fem_eigen_generation_artifacts(b"spectrum with invalid owner");
+        let owner_error = write_artifacts(
+            &output_dir,
+            &invalid_owner_problem,
+            &plan,
+            &invalid_owner_run,
+            Some(&summary),
+        )
+        .expect_err("partial producer ownership must fail before publication");
+        assert!(owner_error
+            .to_string()
+            .contains("incomplete frequency-domain publication owner"));
+        assert_eq!(fs::read(&pointer_path).unwrap(), pointer_before_failure);
+        assert_eq!(
+            crate::artifact_generation::capture(&output_dir)
+                .unwrap()
+                .unwrap()
+                .commit,
+            second_capture.commit
+        );
+        for (relative, bytes) in &sentinels {
+            assert_eq!(fs::read(output_dir.join(relative)).unwrap(), bytes.to_vec());
+        }
+
+        let mut failed_run = final_execution_test_run(provenance.clone());
+        failed_run.auxiliary_artifacts =
+            test_fem_eigen_generation_artifacts(b"spectrum rejected generation");
+        failed_run
+            .auxiliary_artifacts
+            .push(crate::types::AuxiliaryArtifact {
+                relative_path: "../outside.json".to_string(),
+                bytes: b"must never be written".to_vec(),
+            });
+        let error = write_artifacts(&output_dir, &problem, &plan, &failed_run, Some(&summary))
+            .expect_err("invalid member closure must fail before changing the current pointer");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(error.to_string().contains("generation member path"));
+        assert_eq!(fs::read(&pointer_path).unwrap(), pointer_before_failure);
+        assert_eq!(
+            crate::artifact_generation::capture(&output_dir)
+                .unwrap()
+                .unwrap()
+                .commit,
+            second_capture.commit
+        );
+        for (relative, bytes) in sentinels {
+            assert_eq!(fs::read(output_dir.join(relative)).unwrap(), bytes);
+        }
+        assert!(!output_dir
+            .join(".frequency-domain-publication.lease")
+            .exists());
+
+        let mut missing_reference_run = final_execution_test_run(provenance);
+        missing_reference_run.auxiliary_artifacts =
+            test_fem_eigen_generation_artifacts(b"spectrum with missing reference");
+        let manifest_artifact = missing_reference_run
+            .auxiliary_artifacts
+            .iter_mut()
+            .find(|artifact| artifact.relative_path == "frequency_domain/manifest.v1.json")
+            .expect("fixture has a frequency-domain manifest");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_artifact.bytes).unwrap();
+        manifest["artifacts"]["solver_diagnostics_path"] =
+            serde_json::json!("eigen/diagnostics/missing.v1.json");
+        manifest_artifact.bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        let missing_reference_error = write_artifacts(
+            &output_dir,
+            &problem,
+            &plan,
+            &missing_reference_run,
+            Some(&summary),
+        )
+        .expect_err("a missing manifest member must fail before advancing the generation");
+        assert_eq!(missing_reference_error.kind(), ErrorKind::InvalidData);
+        assert!(missing_reference_error
+            .to_string()
+            .contains("manifest.artifacts.solver_diagnostics_path references missing immutable generation member 'eigen/diagnostics/missing.v1.json'"));
+        assert_eq!(fs::read(&pointer_path).unwrap(), pointer_before_failure);
+        assert_eq!(
+            crate::artifact_generation::capture(&output_dir)
+                .unwrap()
+                .unwrap()
+                .commit,
+            second_capture.commit
+        );
+        for (relative, bytes) in sentinels {
+            assert_eq!(fs::read(output_dir.join(relative)).unwrap(), bytes);
+        }
+
+        fs::remove_dir_all(output_dir).expect("temporary FEM eigen output should be removed");
+    }
+
+    #[test]
+    fn final_native_snapshot_uses_captured_endpoint_and_rejects_corrupt_or_duplicate_proof() {
+        use fullmag_quantities::fem_state_snapshot_receipt::{
+            FemLocalNodeSnapshotReceipt, FEM_FINAL_SNAPSHOT_RECEIPT_ARTIFACT,
+        };
+        use fullmag_quantities::{
+            FemMaterialFieldLocation, FemRepresentationReceipt, FemStateRepresentation,
+        };
+        let plan = test_fem_execution_plan();
+        let context = FieldArtifactContext {
+            problem_name: "native-final-state".into(),
+            ir_version: "v0".into(),
+            source_hash: None,
+            execution_mode: ExecutionMode::Strict,
+            layout: field_layout(&plan),
+            magnetization_field_semantics: Ok(None),
+            execution_resolution: None,
+        };
+        let mut executed = final_execution_test_run(ExecutionProvenance {
+            execution_engine: "fem_cpu_native".into(),
+            ..ExecutionProvenance::default()
+        });
+        let receipt = FemLocalNodeSnapshotReceipt::capture(
+            9,
+            0.9,
+            0.1,
+            &executed.result.final_magnetization,
+            FemRepresentationReceipt {
+                schema_version: 1,
+                state_space: FemStateRepresentation::LocalNodeAos,
+                ms_location: FemMaterialFieldLocation::Scalar,
+                a_location: FemMaterialFieldLocation::Scalar,
+                local_node_count: 4,
+                true_node_count: 2,
+                periodic_map_revision: 13,
+                representation_copy_count: 0,
+                gather_scatter_bytes: 0,
+                invalid_space_assertion_count: 0,
+                hot_loop_representation_copy_count: 0,
+                hot_loop_gather_scatter_bytes: 0,
+            },
+        )
+        .unwrap();
+        executed
+            .auxiliary_artifacts
+            .push(crate::types::AuxiliaryArtifact {
+                relative_path: FEM_FINAL_SNAPSHOT_RECEIPT_ARTIFACT.into(),
+                bytes: serde_json::to_vec(&receipt).unwrap(),
+            });
+        let mut stats = executed.result.steps[0].clone();
+        let captured = final_native_snapshot_receipt(&context, &executed, &mut stats).unwrap();
+        assert_eq!((stats.step, stats.time, stats.dt), (9, 0.9, 0.1));
+        assert!(context.layout.get("native_state_snapshot").is_none());
+        assert_eq!(captured.unwrap(), receipt);
+        {
+            use fullmag_quantities::fem_local_node_map::{FemLocalNodeIndexMap, FEM_LOCAL_NODE_MAP_SCHEMA, FEM_FINAL_NODE_MAP_ARTIFACT};
+            let map = FemLocalNodeIndexMap { schema_version: FEM_LOCAL_NODE_MAP_SCHEMA.into(), local_node_count: 4,
+                mfem_local_dof_count: 4, mfem_true_dof_count: 4, core_periodic_class_count: 2,
+                core_periodic_map_revision: 13, canonical_node_to_mfem_local_dof: vec![0,1,2,3],
+                local_node_to_core_class: vec![0,1,0,1], core_class_representatives: vec![0,1] };
+            let mut bound_receipt = receipt.clone();
+            bound_receipt.native_node_map_sha256 = Some(map.content_sha256().unwrap());
+            assert!(final_native_node_map(&executed, Some(&bound_receipt)).is_err());
+            let mut mapped = executed.clone();
+            mapped.auxiliary_artifacts.push(crate::types::AuxiliaryArtifact {
+                relative_path: FEM_FINAL_NODE_MAP_ARTIFACT.into(), bytes: serde_json::to_vec(&map).unwrap(),
+            });
+            assert_eq!(final_native_node_map(&mapped, Some(&bound_receipt)).unwrap(), Some(map));
+            assert!(final_native_node_map(&mapped, None).is_err());
+            assert!(final_native_node_map(&mapped, Some(&receipt)).is_err());
+            mapped.auxiliary_artifacts.push(mapped.auxiliary_artifacts.last().unwrap().clone());
+            assert!(final_native_node_map(&mapped, Some(&bound_receipt)).is_err());
+        }
+        let mut invalid = executed.clone();
+        invalid.result.final_magnetization[0][0] = 0.5;
+        assert!(final_native_snapshot_receipt(&context, &invalid, &mut stats).is_err());
+        invalid = executed.clone();
+        invalid.provenance.execution_engine = "fem_cpu_baseline_internal".into();
+        assert!(final_native_snapshot_receipt(&context, &invalid, &mut stats).is_err());
+        invalid = executed.clone();
+        invalid
+            .auxiliary_artifacts
+            .push(invalid.auxiliary_artifacts[0].clone());
+        assert!(final_native_snapshot_receipt(&context, &invalid, &mut stats).is_err());
+        invalid = executed.clone();
+        invalid.auxiliary_artifacts.clear();
+        let legacy = final_native_snapshot_receipt(&context, &invalid, &mut stats).unwrap();
+        assert!(legacy.is_none());
+    }
+
+    #[test]
+    fn mapped_source_budget_covers_values_map_and_metadata_together() {
+        let value = serde_json::json!({ "values": [[1.0, 0.0, 0.0]],
+            "native_node_map": { "canonical_node_to_mfem_local_dof": [0] },
+            "state_identity": { "backend": "fem" } });
+        let length = serde_json::to_vec_pretty(&value).unwrap().len();
+        validate_mapped_state_byte_budget(&value, length).unwrap();
+        assert!(validate_mapped_state_byte_budget(&value, length - 1).is_err());
+        assert!(serde_json::to_vec_pretty(&value["values"]).unwrap().len() < length - 1);
+        assert!(serde_json::to_vec_pretty(&value["native_node_map"]).unwrap().len() < length - 1);
+    }
+
     fn write_final_execution_test_metadata(
         label: &str,
         problem: &fullmag_ir::ProblemIR,
@@ -6652,10 +8384,65 @@ mod tests {
     }
 
     #[test]
+    fn write_artifacts_refuses_eigen_auxiliary_when_immutable_generation_marker_exists() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let output_dir = std::env::temp_dir().join(format!(
+            "fullmag-v1-writer-v2-marker-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(output_dir.join("frequency_domain"))
+            .expect("frequency-domain marker directory should be created");
+        fs::create_dir_all(output_dir.join("eigen"))
+            .expect("legacy eigen directory should be created");
+
+        let marker_path = output_dir.join(crate::artifact_generation::IMMUTABLE_COMMIT_PATH);
+        let marker_sentinel = b"malformed but present immutable generation marker";
+        let metadata_path = output_dir.join("metadata.json");
+        let metadata_sentinel = b"legacy metadata must remain byte-identical";
+        let member_path = output_dir.join("eigen/spectrum.json");
+        let member_sentinel = b"legacy eigen member must remain byte-identical";
+        fs::write(&marker_path, marker_sentinel).expect("v2 marker should be seeded");
+        fs::write(&metadata_path, metadata_sentinel).expect("legacy metadata should be seeded");
+        fs::write(&member_path, member_sentinel).expect("legacy eigen member should be seeded");
+
+        let problem = fullmag_ir::ProblemIR::bootstrap_example();
+        let plan = test_fem_execution_plan();
+        let mut executed = final_execution_test_run(ExecutionProvenance::default());
+        executed
+            .auxiliary_artifacts
+            .push(crate::types::AuxiliaryArtifact {
+                relative_path: "eigen/spectrum.json".to_string(),
+                bytes: b"replacement spectrum from the v1 writer".to_vec(),
+            });
+
+        let error = write_artifacts(&output_dir, &problem, &plan, &executed, None)
+            .expect_err("legacy writer must refuse an existing immutable v2 marker");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("v1 publisher cannot shadow the current immutable v2 generation"));
+        assert_eq!(fs::read(&marker_path).unwrap(), marker_sentinel.to_vec());
+        assert_eq!(fs::read(&metadata_path).unwrap(), metadata_sentinel.to_vec());
+        assert_eq!(fs::read(&member_path).unwrap(), member_sentinel.to_vec());
+        assert!(!output_dir
+            .join(".frequency-domain-publication.lease")
+            .exists());
+
+        fs::remove_dir_all(output_dir).expect("temporary writer fixture should be removed");
+    }
+
+    #[test]
     fn metadata_persists_authoritative_stage_completion() {
         let problem = fem_execution_problem("cpu", ExecutionMode::Strict);
         let plan = test_fem_execution_plan();
-        let mut executed = final_execution_test_run(ExecutionProvenance::default());
+        let mut executed = final_execution_test_run(ExecutionProvenance {
+            execution_engine: "fem_cpu_native".to_string(),
+            precision: "double".to_string(),
+            ..ExecutionProvenance::default()
+        });
         executed.result.completion = Some(fullmag_ir::StageCompletionIR {
             status: "completed".to_string(),
             converged: true,
@@ -6755,6 +8542,20 @@ mod tests {
     fn fem_execution_problem(device: &str, mode: ExecutionMode) -> fullmag_ir::ProblemIR {
         let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
         problem.backend_policy.requested_backend = fullmag_ir::BackendTarget::Fem;
+        problem.validation_profile.execution_mode = mode;
+        problem.problem_meta.runtime_metadata.insert(
+            "runtime_selection".to_string(),
+            serde_json::json!({
+                "device": device,
+                "precision": "double",
+            }),
+        );
+        problem
+    }
+
+    fn fdm_execution_problem(device: &str, mode: ExecutionMode) -> fullmag_ir::ProblemIR {
+        let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        problem.backend_policy.requested_backend = fullmag_ir::BackendTarget::Fdm;
         problem.validation_profile.execution_mode = mode;
         problem.problem_meta.runtime_metadata.insert(
             "runtime_selection".to_string(),
@@ -6925,6 +8726,150 @@ mod tests {
         assert_eq!(resolution["resolution_mode"], "fallback");
         assert_eq!(resolution["fallback_occurred"], true);
         assert_eq!(resolution["fallback_reason"], "native_fem_gpu_unavailable");
+    }
+
+    #[test]
+    fn final_metadata_accepts_canonical_fdm_cpu_fallback_with_legacy_cpu_execution_id() {
+        let problem = fdm_execution_problem("auto", ExecutionMode::Extended);
+        let mut plan = test_execution_plan(None);
+        plan.common.execution_mode = ExecutionMode::Extended;
+        let metadata = write_final_execution_test_metadata_without_fem_policy(
+            "fdm-cpu-alias-fallback",
+            &problem,
+            &plan,
+            ExecutionProvenance {
+                execution_engine: "cpu_reference".to_string(),
+                precision: "double".to_string(),
+                resolved_fallback: Some(ResolvedFallback {
+                    occurred: true,
+                    original_engine: "cuda_fdm".to_string(),
+                    fallback_engine: "fdm_cpu_reference".to_string(),
+                    reason: "cuda_fdm_unavailable".to_string(),
+                    message: "CUDA unavailable; selected CPU reference".to_string(),
+                }),
+                ..ExecutionProvenance::default()
+            },
+        )
+        .expect("canonical CPU fallback and legacy CPU execution IDs should agree");
+
+        let provenance = &metadata["execution_provenance"];
+        assert_eq!(provenance["execution_engine"], "cpu_reference");
+        assert_eq!(
+            provenance["resolved_fallback"]["original_engine"],
+            "cuda_fdm"
+        );
+        assert_eq!(
+            provenance["resolved_fallback"]["fallback_engine"],
+            "fdm_cpu_reference"
+        );
+        let resolution = &provenance["execution_resolution"];
+        assert_eq!(resolution["resolved_execution"]["backend"], "fdm");
+        assert_eq!(resolution["resolved_execution"]["device"], "cpu");
+        assert_eq!(resolution["fallback_occurred"], true);
+    }
+
+    #[test]
+    fn final_metadata_rejects_cpu_fallback_when_actual_engine_is_cuda_alias() {
+        let problem = fdm_execution_problem("auto", ExecutionMode::Extended);
+        let mut plan = test_execution_plan(None);
+        plan.common.execution_mode = ExecutionMode::Extended;
+        let error = write_final_execution_test_metadata_without_fem_policy(
+            "fdm-cpu-fallback-actual-cuda",
+            &problem,
+            &plan,
+            ExecutionProvenance {
+                execution_engine: "fdm_cuda".to_string(),
+                precision: "double".to_string(),
+                resolved_fallback: Some(ResolvedFallback {
+                    occurred: true,
+                    original_engine: "cuda_fdm".to_string(),
+                    fallback_engine: "cpu_reference".to_string(),
+                    reason: "test_cpu_fallback".to_string(),
+                    message: "CPU fallback was declared".to_string(),
+                }),
+                ..ExecutionProvenance::default()
+            },
+        )
+        .expect_err("CPU fallback metadata must reject an actual CUDA engine");
+        assert!(error
+            .to_string()
+            .contains("resolved fallback engine mismatch"));
+    }
+
+    #[test]
+    fn final_metadata_rejects_fallback_aliases_with_same_canonical_identity() {
+        let problem = fdm_execution_problem("auto", ExecutionMode::Extended);
+        let mut plan = test_execution_plan(None);
+        plan.common.execution_mode = ExecutionMode::Extended;
+        let error = write_final_execution_test_metadata_without_fem_policy(
+            "fdm-same-canonical-fallback",
+            &problem,
+            &plan,
+            ExecutionProvenance {
+                execution_engine: "cpu_reference".to_string(),
+                precision: "double".to_string(),
+                resolved_fallback: Some(ResolvedFallback {
+                    occurred: true,
+                    original_engine: "cpu_reference".to_string(),
+                    fallback_engine: "fdm_cpu_reference".to_string(),
+                    reason: "invalid_same_engine_fallback".to_string(),
+                    message: "the aliases name one engine".to_string(),
+                }),
+                ..ExecutionProvenance::default()
+            },
+        )
+        .expect_err("different FDM engine aliases must not hide a same-engine fallback");
+        assert!(error
+            .to_string()
+            .contains("resolved fallback original_engine and fallback_engine must differ"));
+    }
+
+    #[test]
+    fn final_metadata_rejects_unknown_execution_engine_id() {
+        let problem = fdm_execution_problem("auto", ExecutionMode::Extended);
+        let mut plan = test_execution_plan(None);
+        plan.common.execution_mode = ExecutionMode::Extended;
+        let error = write_final_execution_test_metadata_without_fem_policy(
+            "fdm-unknown-engine",
+            &problem,
+            &plan,
+            ExecutionProvenance {
+                execution_engine: "fdm_future_guess".to_string(),
+                precision: "double".to_string(),
+                ..ExecutionProvenance::default()
+            },
+        )
+        .expect_err("unknown engine identifiers must fail closed");
+        assert!(error
+            .to_string()
+            .contains("unknown execution_engine 'fdm_future_guess'"));
+    }
+
+    #[test]
+    fn final_metadata_keeps_strict_fallback_rejection_for_fdm_aliases() {
+        let problem = fdm_execution_problem("auto", ExecutionMode::Strict);
+        let plan = test_execution_plan(None);
+        let error = write_final_execution_test_metadata_without_fem_policy(
+            "fdm-strict-fallback-rejected",
+            &problem,
+            &plan,
+            ExecutionProvenance {
+                execution_engine: "cpu_reference".to_string(),
+                precision: "double".to_string(),
+                resolved_fallback: Some(ResolvedFallback {
+                    occurred: true,
+                    original_engine: "cuda_fdm".to_string(),
+                    fallback_engine: "fdm_cpu_reference".to_string(),
+                    reason: "cuda_fdm_unavailable".to_string(),
+                    message: "CUDA unavailable; selected CPU reference".to_string(),
+                }),
+                ..ExecutionProvenance::default()
+            },
+        )
+        .expect_err("Strict execution must continue to reject every fallback");
+        assert!(error
+            .to_string()
+            .contains("strict execution metadata cannot contain a resolved fallback"));
     }
 
     #[test]
@@ -7761,6 +9706,10 @@ mod tests {
             panic!("test plan should be FEM");
         };
         fem.material.ms_field = Some(vec![700e3, 710e3, 720e3, 730e3]);
+        let prepared = build_material_field_artifacts(&plan)
+            .expect("FEM material fields should build without filesystem output");
+        assert_eq!(prepared.metadata_assets.len(), 1);
+        assert_eq!(prepared.files.len(), 1);
 
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -7771,6 +9720,7 @@ mod tests {
             std::process::id(),
             unique_suffix
         ));
+        assert!(!output_dir.exists(), "pure preparation must not write files");
         let executed = ExecutedRun {
             result: RunResult {
                 status: RunStatus::Completed,
@@ -7799,6 +9749,7 @@ mod tests {
         let assets = metadata["material_field_assets"]
             .as_array()
             .expect("metadata should carry material_field_assets");
+        assert_eq!(assets, &prepared.metadata_assets);
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0]["asset_id"], "free_ms_node");
         assert_eq!(
@@ -7806,6 +9757,16 @@ mod tests {
             "material-fields/free_ms_node.json"
         );
         assert_eq!(assets[0]["values"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            assets[0]["artifact_path"],
+            prepared.files[0].relative_path
+        );
+        assert_eq!(
+            fs::read(output_dir.join(&prepared.files[0].relative_path))
+                .expect("FEM material-field artifact should exist"),
+            prepared.files[0].bytes,
+            "legacy writer must preserve exact bytes returned by the pure FEM builder"
+        );
 
         let artifact: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(output_dir.join("material-fields/free_ms_node.json"))
@@ -8862,6 +10823,269 @@ mod tests {
         assert_eq!(layout["active_cell_count"], 8);
         assert_eq!(layout["inactive_cell_count"], 0);
         assert_eq!(layout["active_fraction"], serde_json::json!(1.0));
+        assert!(layout["grid_fingerprint"].as_str().is_some());
+    }
+
+    #[test]
+    fn final_magnetization_artifact_binds_layout_and_sample_identity() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "fullmag-state-identity-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create state identity fixture");
+
+        let plan = test_execution_plan(None);
+        let context = FieldArtifactContext {
+            problem_name: "state-identity".into(),
+            ir_version: "v0".into(),
+            source_hash: Some("source-bound".into()),
+            execution_mode: ExecutionMode::Strict,
+            layout: field_layout(&plan),
+            magnetization_field_semantics: Ok(None),
+            execution_resolution: None,
+        };
+        let path = root.join("m_final.json");
+        write_field_file(
+            &path,
+            &context,
+            &ExecutionProvenance::default(),
+            "m",
+            8,
+            8.0e-12,
+            1.0e-12,
+            &[[1.0, 0.0, 0.0]; 8],
+        )
+        .expect("write final magnetization field");
+        let field: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read field artifact"))
+                .expect("parse field artifact JSON");
+        let layout_bytes = serde_json::to_vec(&context.layout).expect("serialize layout");
+        assert_eq!(
+            field["state_identity"]["schema_version"],
+            "magnetization_state.v1"
+        );
+        assert_eq!(field["state_identity"]["backend"], "fdm");
+        assert_eq!(
+            field["state_identity"]["layout_sha256"],
+            format!("{:x}", Sha256::digest(layout_bytes))
+        );
+        assert_eq!(field["state_identity"]["sample_count"], 8);
+
+        fs::remove_dir_all(root).expect("remove state identity fixture");
+    }
+
+    #[test]
+    fn fem_p1_magnetization_artifact_emits_typed_semantics_only_for_m() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "fullmag-fem-p1-field-semantics-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create FEM field semantics fixture");
+
+        let plan = test_fem_execution_plan();
+        let context = build_field_context(
+            &fullmag_ir::ProblemIR::bootstrap_example(),
+            &plan,
+        );
+        assert!(context.magnetization_field_semantics.is_ok());
+        assert!(context
+            .magnetization_field_semantics
+            .as_ref()
+            .expect("FEM magnetization semantics result")
+            .is_some());
+
+        let magnetization_path = root.join("m_final.json");
+        write_field_file(
+            &magnetization_path,
+            &context,
+            &ExecutionProvenance::default(),
+            "m",
+            4,
+            4.0e-12,
+            1.0e-12,
+            &[[1.0, 0.0, 0.0]; 4],
+        )
+        .expect("write FEM magnetization field");
+        let magnetization: serde_json::Value = serde_json::from_slice(
+            &fs::read(&magnetization_path).expect("read FEM magnetization field"),
+        )
+        .expect("parse FEM magnetization field");
+        assert_eq!(
+            magnetization["layout"]["field_semantics"]["format"],
+            fullmag_quantities::fem_state_field::FEM_P1_MAGNETIZATION_FIELD_SEMANTICS_FORMAT
+        );
+        assert_eq!(
+            magnetization["state_identity"]["schema_version"],
+            "magnetization_state.v1"
+        );
+        let layout_bytes = serde_json::to_vec(&magnetization["layout"])
+            .expect("serialize FEM magnetization layout");
+        assert_eq!(
+            magnetization["state_identity"]["layout_sha256"],
+            format!("{:x}", Sha256::digest(layout_bytes))
+        );
+
+        let field_path = root.join("H_eff_final.json");
+        write_field_file(
+            &field_path,
+            &context,
+            &ExecutionProvenance::default(),
+            "H_eff",
+            4,
+            4.0e-12,
+            1.0e-12,
+            &[[0.0, 0.0, 0.0]; 4],
+        )
+        .expect("write FEM effective field");
+        let field: serde_json::Value =
+            serde_json::from_slice(&fs::read(&field_path).expect("read FEM effective field"))
+                .expect("parse FEM effective field");
+        assert!(field["layout"].get("field_semantics").is_none());
+        assert!(field.get("state_identity").is_none());
+
+        fs::remove_dir_all(root).expect("remove FEM field semantics fixture");
+    }
+
+    #[test]
+    fn fem_magnetization_writer_rejects_semantics_error_but_other_fields_continue() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "fullmag-fem-p1-field-semantics-error-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create FEM field semantics error fixture");
+
+        let context = FieldArtifactContext {
+            problem_name: "fem-p1-semantics-error".into(),
+            ir_version: "v0".into(),
+            source_hash: None,
+            execution_mode: ExecutionMode::Strict,
+            layout: serde_json::json!({"backend": "fem"}),
+            magnetization_field_semantics: Err("invalid FEM mesh".into()),
+            execution_resolution: None,
+        };
+        let error = write_field_file(
+            &root.join("m_final.json"),
+            &context,
+            &ExecutionProvenance::default(),
+            "m",
+            1,
+            0.0,
+            1.0e-12,
+            &[[1.0, 0.0, 0.0]],
+        )
+        .expect_err("m must reject an unavailable semantics result");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("FEM magnetization field semantics unavailable"));
+
+        let other_path = root.join("H_eff_final.json");
+        write_field_file(
+            &other_path,
+            &context,
+            &ExecutionProvenance::default(),
+            "H_eff",
+            1,
+            0.0,
+            1.0e-12,
+            &[[0.0, 0.0, 0.0]],
+        )
+        .expect("other observables must not consume m semantics errors");
+        let other: serde_json::Value = serde_json::from_slice(
+            &fs::read(&other_path).expect("read effective field after semantics error"),
+        )
+        .expect("parse effective field after semantics error");
+        assert!(other["layout"].get("field_semantics").is_none());
+
+        fs::remove_dir_all(root).expect("remove FEM field semantics error fixture");
+    }
+
+    #[test]
+    fn fem_p1_magnetization_factory_rejects_invalid_execution_mesh() {
+        let mut plan = test_fem_execution_plan();
+        {
+            let BackendPlanIR::Fem(fem) = &mut plan.backend_plan else {
+                panic!("test plan must be FEM");
+            };
+            fem.mesh.nodes[3] = [0.0, 0.0, 0.0];
+        }
+
+        let error = fem_p1_magnetization_field_semantics(&plan)
+            .expect_err("invalid FEM geometry must not receive field semantics");
+        assert!(error.contains("degenerate tetra volume"), "{error}");
+    }
+
+    #[test]
+    fn fem_p1_magnetization_factory_uses_runtime_marker_normalization_for_support() {
+        let mut plan = test_fem_execution_plan();
+        let expected_mask = {
+            let BackendPlanIR::Fem(fem) = &mut plan.backend_plan else {
+                panic!("test plan must be FEM");
+            };
+            fem.mesh.nodes.push([2.0, 0.0, 0.0]);
+            fem.mesh.set_tet4_cells(vec![[0, 1, 2, 3], [1, 2, 3, 4]]);
+            fem.mesh.element_markers = vec![1, 0];
+            fem.object_segments.clear();
+            fem.region_materials = vec![fullmag_ir::FemRegionMaterialIR {
+                object_id: "free".to_string(),
+                material: fem.material.clone(),
+                element_marker: 1,
+            }];
+
+            let normalized_markers = normalized_runtime_element_markers(fem)
+                .expect("region-material markers should normalize");
+            crate::preview::mesh_quantity_active_mask_with_element_markers(
+                "m",
+                &fem.mesh,
+                &normalized_markers,
+            )
+            .expect("magnetization support mask")
+        };
+        let semantics = fem_p1_magnetization_field_semantics(&plan)
+            .expect("valid region-material mesh should produce semantics")
+            .expect("FEM H1/P1 semantics should be present");
+        assert_eq!(semantics.active_node_mask, expected_mask);
+        assert_eq!(semantics.active_node_mask, vec![true, true, true, true, false]);
+
+        let mut all_zero_plan = test_fem_execution_plan();
+        {
+            let BackendPlanIR::Fem(all_zero_fem) = &mut all_zero_plan.backend_plan else {
+                panic!("test plan must be FEM");
+            };
+            all_zero_fem.mesh.element_markers = vec![0];
+        }
+        let all_zero_semantics = fem_p1_magnetization_field_semantics(&all_zero_plan)
+            .expect("all-zero marker fallback should be accepted by runtime normalization")
+            .expect("all-zero mesh should keep a quantitative FEM field");
+        assert_eq!(all_zero_semantics.active_node_mask, vec![true; 4]);
+
+        let mut ambiguous_plan = test_fem_execution_plan();
+        {
+            let BackendPlanIR::Fem(ambiguous_fem) = &mut ambiguous_plan.backend_plan else {
+                panic!("test plan must be FEM");
+            };
+            ambiguous_fem.mesh.nodes.push([2.0, 0.0, 0.0]);
+            ambiguous_fem
+                .mesh
+                .set_tet4_cells(vec![[0, 1, 2, 3], [1, 2, 3, 4]]);
+            ambiguous_fem.mesh.element_markers = vec![1, 2];
+            ambiguous_fem.object_segments.clear();
+        }
+        let error = fem_p1_magnetization_field_semantics(&ambiguous_plan)
+            .expect_err("ambiguous positive markers must not receive semantics");
+        assert!(error.contains("ambiguous FEM magnetic region contract"), "{error}");
     }
 
     #[test]
@@ -9157,9 +11381,20 @@ mod tests {
             std::process::id(),
             unique_suffix
         ));
+        let prepared = build_periodic_pairs_artifact(&plan, Some(46))
+            .expect("periodic pairs artifact should build without filesystem output")
+            .expect("periodic mesh should produce a periodic pairs artifact");
+        assert!(!output_dir.exists(), "pure preparation must not write files");
+        assert_eq!(prepared.relative_path, "mesh/periodic_pairs.v1.json");
 
         write_periodic_pairs_artifact(&output_dir, &plan, Some(46))
             .expect("periodic pairs artifact should be written");
+        assert_eq!(
+            fs::read(output_dir.join(&prepared.relative_path))
+                .expect("periodic pairs artifact should exist"),
+            prepared.bytes,
+            "legacy wrapper must write the exact bytes returned by the pure builder"
+        );
 
         let artifact: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(output_dir.join("mesh/periodic_pairs.v1.json"))
@@ -10071,6 +12306,10 @@ mod tests {
             }),
         );
         let plan = test_fem_execution_plan();
+        let prepared = build_fem_supercell_node_geometry_artifact(&problem, &plan)
+            .expect("node geometry should build without filesystem output")
+            .expect("supercell metadata should produce node geometry");
+        assert_eq!(prepared.relative_path, "mesh/node_geometry.v1.json");
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock drift")
@@ -10080,6 +12319,7 @@ mod tests {
             std::process::id(),
             unique_suffix
         ));
+        assert!(!output_dir.exists(), "pure preparation must not write files");
         let executed = ExecutedRun {
             result: RunResult {
                 status: RunStatus::Completed,
@@ -10100,6 +12340,12 @@ mod tests {
 
         write_artifacts(&output_dir, &problem, &plan, &executed, None)
             .expect("supercell node geometry artifact should write");
+        assert_eq!(
+            fs::read(output_dir.join(&prepared.relative_path))
+                .expect("node geometry artifact should exist"),
+            prepared.bytes,
+            "write_artifacts must preserve exact bytes returned by the pure node-geometry builder"
+        );
 
         let artifact: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(output_dir.join("mesh/node_geometry.v1.json"))
@@ -10139,6 +12385,9 @@ mod tests {
             }),
         );
         let plan = test_fem_execution_plan();
+        assert!(build_fem_supercell_node_geometry_artifact(&problem, &plan)
+            .expect("primitive cell should validate without filesystem output")
+            .is_none());
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock drift")

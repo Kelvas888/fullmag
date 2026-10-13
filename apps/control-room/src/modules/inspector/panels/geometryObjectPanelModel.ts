@@ -4,7 +4,27 @@ import type {
 } from "@/kernel/api/apiTypes";
 import type { Selection } from "@/kernel/selection/selectionTypes";
 import type { PrimitiveDraft } from "@/kernel/authoring/geometryLifecycleCommands";
+import type {
+  GeometryObjectDraft,
+  QuantityDraftField,
+} from "@/kernel/authoring/object-edit/objectEditTypes";
+export type { GeometryObjectDraft } from "@/kernel/authoring/object-edit/objectEditTypes";
+import {
+  geometryDraftQuantityEquals,
+  resolveCommittedGeometryObjectDraft,
+} from "@/kernel/authoring/object-edit/objectEditDraftModel";
+import {
+  canonicalDraftInSelectedUnits,
+  getRawQuantityField,
+  parseDraftQuantityField,
+  setRawQuantityField,
+} from "@/kernel/authoring/object-edit/quantityDraftFields";
+export {
+  geometryDraftGeometryEquals,
+  geometryDraftTranslationEquals,
+} from "@/kernel/authoring/object-edit/objectEditDraftModel";
 import { ControlRoomApiError } from "@/kernel/api/ControlRoomApi";
+import { parseQuantityInput } from "@/kernel/authoring/object-edit/quantityInput";
 
 export interface GeometryObjectPanelModel {
   dimensions: string;
@@ -20,26 +40,6 @@ export interface GeometryObjectPanelModel {
   source: string;
 }
 
-export interface GeometryObjectDraft {
-  archHeight: string;
-  baseRevision: number | null;
-  geometryKind: string;
-  height: string;
-  length: string;
-  material: string;
-  mode: "committed" | "draft-new" | "missing";
-  name: string;
-  notes: string;
-  objectId: string;
-  radius: string;
-  region: string;
-  rotation: [string, string, string];
-  scale: [string, string, string];
-  size: [string, string, string];
-  translation: [string, string, string];
-  width: string;
-  z0: string;
-}
 
 export interface GeometryDraftGeometryResult {
   error: string | null;
@@ -59,11 +59,135 @@ export function isPrimitiveDraftRevisionConflict(error: unknown): boolean {
     (error.code === "revision_conflict" || error.code === "scene_revision_conflict");
 }
 
+function rebaseVector3(
+  draftVec: readonly [string, string, string] | readonly string[],
+  targetVec: readonly [string, string, string] | readonly string[],
+  baseVec: readonly [string, string, string] | readonly string[],
+): [string, string, string] {
+  const result: [string, string, string] = [
+    targetVec[0] ?? "0",
+    targetVec[1] ?? "0",
+    targetVec[2] ?? "0",
+  ];
+  for (let i = 0; i < 3; i++) {
+    const d = draftVec[i] ?? "";
+    const b = baseVec[i] ?? "";
+    const t = targetVec[i] ?? "";
+    const draftChanged = d !== b;
+    const targetChanged = t !== b;
+    if (draftChanged && !targetChanged) {
+      result[i] = d;
+    } else if (!draftChanged && targetChanged) {
+      result[i] = t;
+    } else if (draftChanged && targetChanged) {
+      result[i] = d;
+    } else {
+      result[i] = t;
+    }
+  }
+  return result;
+}
+
+function quantityFieldUnchangedForRebase(
+  draft: GeometryObjectDraft,
+  baseline: GeometryObjectDraft,
+  field: QuantityDraftField,
+): boolean {
+  if (geometryDraftQuantityEquals(draft, baseline, field)) return true;
+  const draftValue = parseDraftQuantityField(draft, field);
+  const baselineValue = parseDraftQuantityField(baseline, field);
+  return draftValue.parseStatus !== "valid" &&
+    baselineValue.parseStatus !== "valid" &&
+    getRawQuantityField(draft, field) === getRawQuantityField(baseline, field) &&
+    draftValue.unit === baselineValue.unit &&
+    draftValue.lastValidSI === baselineValue.lastValidSI;
+}
+
 export function rebaseGeometryObjectDraft(
   draft: GeometryObjectDraft,
-  baseRevision: number | null,
+  target: GeometryObjectDraft | number | null,
+  baseline?: GeometryObjectDraft | null,
 ): GeometryObjectDraft {
-  return { ...draft, baseRevision };
+  if (typeof target === "number" || target === null) {
+    return { ...draft, baseRevision: target };
+  }
+  if (!baseline) {
+    return { ...draft, baseRevision: target.baseRevision };
+  }
+  let merged: GeometryObjectDraft = canonicalDraftInSelectedUnits(target, draft);
+  const vectorFields = new Set([
+    "rotation",
+    "scale",
+    "bounds_min",
+    "bounds_max",
+  ]);
+  const quantityRawFields = new Set<keyof GeometryObjectDraft>([
+    "size",
+    "translation",
+    "radius",
+    "height",
+    "length",
+    "width",
+    "archHeight",
+    "z0",
+    "quantityFields",
+  ]);
+  const quantityKeys: readonly QuantityDraftField[] = [
+    "size.0",
+    "size.1",
+    "size.2",
+    "translation.0",
+    "translation.1",
+    "translation.2",
+    "radius",
+    "height",
+    "length",
+    "width",
+    "archHeight",
+    "z0",
+  ];
+  for (const field of quantityKeys) {
+    if (quantityFieldUnchangedForRebase(draft, baseline, field)) continue;
+    merged = setRawQuantityField(merged, field, getRawQuantityField(draft, field));
+    const nextQuantityFields = { ...merged.quantityFields };
+    const localMetadata = draft.quantityFields?.[field];
+    if (localMetadata) nextQuantityFields[field] = localMetadata;
+    else delete nextQuantityFields[field];
+    const nextMerged: GeometryObjectDraft = {
+      ...merged,
+      quantityFields: nextQuantityFields,
+    };
+    if (Object.keys(nextQuantityFields).length === 0) {
+      delete nextMerged.quantityFields;
+    }
+    merged = nextMerged;
+  }
+  const fields = Object.keys(draft) as (keyof GeometryObjectDraft)[];
+  for (const field of fields) {
+    if (field === "baseRevision" || quantityRawFields.has(field)) continue;
+    const draftVal = draft[field];
+    const baseVal = baseline[field];
+    const targetVal = target[field];
+    if (
+      vectorFields.has(field) &&
+      Array.isArray(draftVal) &&
+      Array.isArray(targetVal) &&
+      Array.isArray(baseVal)
+    ) {
+      const mergedVec = rebaseVector3(
+        draftVal as readonly string[],
+        targetVal as readonly string[],
+        baseVal as readonly string[],
+      );
+      Object.assign(merged, { [field]: mergedVec });
+      continue;
+    }
+    const isDirty = Array.isArray(draftVal)
+      ? JSON.stringify(draftVal) !== JSON.stringify(baseVal)
+      : draftVal !== baseVal;
+    Object.assign(merged, { [field]: isDirty ? draftVal : targetVal });
+  }
+  return merged;
 }
 
 function asRecord(value: unknown): JsonRecord | null {
@@ -85,32 +209,6 @@ function asNumberArray(value: unknown): number[] | null {
     value.every((entry) => typeof entry === "number" && Number.isFinite(entry))
     ? value
     : null;
-}
-
-function formatScientificInput(value: number): string {
-  if (value === 0) return "0";
-  const abs = Math.abs(value);
-  if (abs < 1e-4 || abs >= 1e6) {
-    return value.toExponential().replace(/\.0+e/, "e").replace(/(\.\d*?[1-9])0+e/, "$1e");
-  }
-  return String(value);
-}
-
-function formatNumberInput(value: unknown, fallback: number): string {
-  const numberValue = asNumber(value);
-  return formatScientificInput(numberValue ?? fallback);
-}
-
-function formatVectorInput(
-  value: unknown,
-  fallback: readonly [number, number, number],
-): [string, string, string] {
-  const values = asNumberArray(value);
-  return [
-    formatScientificInput(values?.[0] ?? fallback[0]),
-    formatScientificInput(values?.[1] ?? fallback[1]),
-    formatScientificInput(values?.[2] ?? fallback[2]),
-  ];
 }
 
 function lengthScale(values: readonly number[]): { scale: number; unit: string } {
@@ -225,10 +323,6 @@ function defaultDraftForPrimitive(
   };
 }
 
-function stringOrFallback(value: unknown, fallback: string): string {
-  return asString(value) ?? fallback;
-}
-
 export function resolveGeometryObjectDraft(
   selection: Selection,
   scene: SceneResource | null,
@@ -248,70 +342,88 @@ export function resolveGeometryObjectDraft(
     };
   }
 
-  const geometry = asRecord(object.geometry);
-  const params = asRecord(geometry?.geometry_params);
-  const transform = asRecord(object.transform);
-  const geometryKind =
-    asString(geometry?.geometry_kind) ??
-    asString(geometry?.kind) ??
-    "Box";
-
-  return {
-    archHeight: formatNumberInput(params?.arch_height, 5e-8),
-    baseRevision: revision,
-    geometryKind,
-    height: formatNumberInput(params?.height, 1e-8),
-    length: formatNumberInput(params?.length, 1e-6),
-    material: stringOrFallback(object.material_ref, "unassigned"),
-    mode: "committed",
-    name: stringOrFallback(object.name, objectId),
-    notes: asString(object.notes) ?? "",
+  return resolveCommittedGeometryObjectDraft(scene, objectId) ?? {
+    ...defaultDraftForPrimitive(selection, revision),
+    mode: "missing",
+    notes: "",
     objectId,
-    radius: formatNumberInput(params?.radius, 5e-8),
-    region: stringOrFallback(object.region_name, "unassigned"),
-    rotation: formatVectorInput(transform?.rotation, [0, 0, 0]),
-    scale: formatVectorInput(transform?.scale, [1, 1, 1]),
-    size: formatVectorInput(params?.size ?? params?.dimensions, [1e-7, 1e-7, 1e-8]),
-    translation: formatVectorInput(transform?.translation, [0, 0, 0]),
-    width: formatNumberInput(params?.width, 1e-6),
-    z0: formatNumberInput(params?.z0, 0),
   };
 }
 
-function parseFiniteNumber(value: string, label: string): { error: string | null; value: number } {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return { error: `${label} must be a finite SI value.`, value: 0 };
-  }
-  return { error: null, value: parsed };
-}
+type DraftQuantityParseResult =
+  | { error: null; previewValue: number; value: number }
+  | { error: string; previewValue: number | null; value: null };
 
-function parsePositiveNumber(value: string, label: string): { error: string | null; value: number } {
-  const parsed = parseFiniteNumber(value, label);
-  if (parsed.error) return parsed;
-  if (parsed.value <= 0) {
-    return { error: `${label} must be greater than 0.`, value: parsed.value };
+const POSITIVE_QUANTITY_FIELDS = new Set<QuantityDraftField>([
+  "size.0",
+  "size.1",
+  "size.2",
+  "radius",
+  "height",
+  "length",
+  "width",
+  "archHeight",
+]);
+
+function parseQuantityField(
+  draft: GeometryObjectDraft,
+  field: QuantityDraftField,
+  label: string,
+): DraftQuantityParseResult {
+  const parsed = parseDraftQuantityField(draft, field);
+  if (parsed.parseStatus === "valid" && parsed.parsedSI !== null) {
+    return {
+      error: null,
+      previewValue: parsed.parsedSI,
+      value: parsed.parsedSI,
+    };
   }
-  return parsed;
+
+  let error: string;
+  if (parsed.parseStatus === "empty") {
+    error = `${label} is required.`;
+  } else if (parsed.parseStatus === "incomplete") {
+    error = `${label} is incomplete.`;
+  } else {
+    const rawParsed = parseQuantityInput(
+      getRawQuantityField(draft, field),
+      "length",
+      draft.quantityFields?.[field]?.unit ?? "m",
+    );
+    error = POSITIVE_QUANTITY_FIELDS.has(field) &&
+      rawParsed.parseStatus === "valid" &&
+      rawParsed.parsedSI !== null &&
+      rawParsed.parsedSI <= 0
+      ? `${label} must be greater than 0.`
+      : `${label} must be a finite SI value.`;
+  }
+  return {
+    error,
+    previewValue: parsed.lastValidSI,
+    value: null,
+  };
 }
 
 function parseVector(
-  values: readonly [string, string, string],
+  draft: GeometryObjectDraft,
+  field: "size" | "translation",
   label: string,
-  positive: boolean,
-): { error: string | null; value: [number, number, number] } {
-  const result: number[] = [];
-  for (let index = 0; index < values.length; index += 1) {
-    const componentLabel = `${label} ${index + 1}`;
-    const parsed = positive
-      ? parsePositiveNumber(values[index], componentLabel)
-      : parseFiniteNumber(values[index], componentLabel);
-    if (parsed.error) {
-      return { error: parsed.error, value: [0, 0, 0] };
-    }
-    result.push(parsed.value);
-  }
-  return { error: null, value: result as [number, number, number] };
+): { error: string | null; value: [number, number, number] | null } {
+  const fields: readonly QuantityDraftField[] = field === "size"
+    ? ["size.0", "size.1", "size.2"]
+    : ["translation.0", "translation.1", "translation.2"];
+  const parsed = fields.map((quantityField, index) =>
+    parseQuantityField(draft, quantityField, `${label} ${index + 1}`),
+  );
+  const failed = parsed.find((component) => component.error !== null);
+  if (failed) return { error: failed.error, value: null };
+  const values = parsed.flatMap((component) =>
+    component.value === null ? [] : [component.value],
+  );
+  return {
+    error: null,
+    value: values as [number, number, number],
+  };
 }
 
 function primitiveDraftKind(kind: string): PrimitiveDraft["kind"] {
@@ -321,53 +433,47 @@ function primitiveDraftKind(kind: string): PrimitiveDraft["kind"] {
   return "Box";
 }
 
-function parseDraftComponent(
-  value: string,
-  label: string,
-  positive: boolean,
-): { error: string | null; value: number | null } {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return { error: `${label} must be a finite SI value.`, value: null };
-  }
-  if (positive && parsed <= 0) {
-    return { error: `${label} must be greater than 0.`, value: null };
-  }
-  return { error: null, value: parsed };
-}
-
 export function resolvePrimitiveDraft(draft: GeometryObjectDraft): PrimitiveDraft {
   const kind = primitiveDraftKind(draft.geometryKind);
   const errors: Record<string, string> = {};
-  const translationValues = draft.translation.map((value, index) => {
-    const parsed = parseDraftComponent(value, `Translation ${"XYZ"[index]}`, false);
-    if (parsed.error) errors[`translation.${index}`] = parsed.error;
-    return parsed.value;
+  const translationFields: readonly QuantityDraftField[] = [
+    "translation.0",
+    "translation.1",
+    "translation.2",
+  ];
+  const translationParsed = translationFields.map((field, index) =>
+    parseQuantityField(draft, field, `Translation ${"XYZ"[index]}`),
+  );
+  translationParsed.forEach((parsed, index) => {
+    if (parsed.error) errors[translationFields[index]] = parsed.error;
   });
-  let dimensionInputs: readonly string[];
+  let dimensionFields: readonly QuantityDraftField[];
   let dimensionLabels: readonly string[];
   if (kind === "Box") {
-    dimensionInputs = draft.size;
+    dimensionFields = ["size.0", "size.1", "size.2"];
     dimensionLabels = ["Box size X", "Box size Y", "Box size Z"];
   } else if (kind === "Cylinder") {
-    dimensionInputs = [draft.radius, draft.height, draft.radius];
+    dimensionFields = ["radius", "height", "radius"];
     dimensionLabels = ["Cylinder radius", "Cylinder height", "Cylinder radius"];
   } else {
-    dimensionInputs = [draft.radius, draft.radius, draft.radius];
+    dimensionFields = ["radius", "radius", "radius"];
     dimensionLabels = ["Sphere radius", "Sphere radius", "Sphere radius"];
   }
-  const parsedDimensions = dimensionInputs.map((value, index) => {
-    const parsed = parseDraftComponent(value, dimensionLabels[index], true);
-    if (parsed.error && !(kind !== "Box" && index > 0 && value === dimensionInputs[0])) {
-      errors[kind === "Box" ? `size.${index}` : index === 1 ? "height" : "radius"] = parsed.error;
-    }
-    return parsed.value;
+  const parsedDimensions = dimensionFields.map((field, index) =>
+    parseQuantityField(draft, field, dimensionLabels[index]),
+  );
+  parsedDimensions.forEach((parsed, index) => {
+    if (parsed.error) errors[dimensionFields[index]] = parsed.error;
   });
-  const dimensions = parsedDimensions.every((value): value is number => value !== null)
+  const dimensionValues = parsedDimensions.map((parsed) => parsed.previewValue);
+  const dimensions = dimensionValues.every((value): value is number => value !== null)
     ? kind === "Box"
-      ? parsedDimensions
-      : parsedDimensions.map((value, index) => index === 1 && kind === "Cylinder" ? value : value * 2)
+      ? dimensionValues
+      : dimensionValues.map((value, index) =>
+          index === 1 && kind === "Cylinder" ? value : value * 2,
+        )
     : null;
+  const translationValues = translationParsed.map((parsed) => parsed.previewValue);
   const translation = translationValues.every((value): value is number => value !== null)
     ? translationValues
     : null;
@@ -405,8 +511,10 @@ export function buildGeometryDraftPatch(
   }
 
   if (geometryKind === "Box") {
-    const size = parseVector(draft.size, "Box size", true);
-    if (size.error) return { error: size.error, geometry: null };
+    const size = parseVector(draft, "size", "Box size");
+    if (size.error || size.value === null) {
+      return { error: size.error ?? "Box size is invalid.", geometry: null };
+    }
     return {
       error: null,
       geometry: {
@@ -417,18 +525,19 @@ export function buildGeometryDraftPatch(
   }
 
   if (geometryKind === "ArchWaveguide") {
-    const length = parsePositiveNumber(draft.length, "Arch waveguide length");
+    const length = parseQuantityField(draft, "length", "Arch waveguide length");
     if (length.error) return { error: length.error, geometry: null };
-    const width = parsePositiveNumber(draft.width, "Arch waveguide width");
+    const width = parseQuantityField(draft, "width", "Arch waveguide width");
     if (width.error) return { error: width.error, geometry: null };
-    const height = parsePositiveNumber(draft.height, "Arch waveguide height");
+    const height = parseQuantityField(draft, "height", "Arch waveguide height");
     if (height.error) return { error: height.error, geometry: null };
-    const archHeight = parsePositiveNumber(
-      draft.archHeight,
+    const archHeight = parseQuantityField(
+      draft,
+      "archHeight",
       "Arch waveguide arch height",
     );
     if (archHeight.error) return { error: archHeight.error, geometry: null };
-    const z0 = parseFiniteNumber(draft.z0, "Arch waveguide z0");
+    const z0 = parseQuantityField(draft, "z0", "Arch waveguide z0");
     if (z0.error) return { error: z0.error, geometry: null };
     return {
       error: null,
@@ -446,9 +555,9 @@ export function buildGeometryDraftPatch(
   }
 
   if (geometryKind === "Cylinder") {
-    const radius = parsePositiveNumber(draft.radius, "Cylinder radius");
+    const radius = parseQuantityField(draft, "radius", "Cylinder radius");
     if (radius.error) return { error: radius.error, geometry: null };
-    const height = parsePositiveNumber(draft.height, "Cylinder height");
+    const height = parseQuantityField(draft, "height", "Cylinder height");
     if (height.error) return { error: height.error, geometry: null };
     return {
       error: null,
@@ -459,7 +568,7 @@ export function buildGeometryDraftPatch(
     };
   }
 
-  const radius = parsePositiveNumber(draft.radius, "Sphere radius");
+  const radius = parseQuantityField(draft, "radius", "Sphere radius");
   if (radius.error) return { error: radius.error, geometry: null };
   return {
     error: null,
@@ -470,15 +579,61 @@ export function buildGeometryDraftPatch(
   };
 }
 
+function persistedTransformVector(
+  transform: JsonRecord | null,
+  field: string,
+  length: number,
+  fallback: readonly number[],
+): { error: string | null; value: number[] } {
+  const value = transform?.[field];
+  if (value === undefined || value === null) {
+    return { error: null, value: [...fallback] };
+  }
+  if (
+    !Array.isArray(value) ||
+    value.length !== length ||
+    !value.every((component) => typeof component === "number" && Number.isFinite(component))
+  ) {
+    return {
+      error: "The existing transform " + field + " must contain " + length + " finite values.",
+      value: [],
+    };
+  }
+  return { error: null, value: [...value] as number[] };
+}
+
 export function buildTransformDraftPatch(
   draft: GeometryObjectDraft,
+  existingTransform?: unknown,
 ): GeometryDraftTransformResult {
-  const translation = parseVector(draft.translation, "Translation", false);
-  if (translation.error) return { error: translation.error, transform: null };
+  const translation = parseVector(draft, "translation", "Translation");
+  if (translation.error || translation.value === null) {
+    return {
+      error: translation.error ?? "Translation is invalid.",
+      transform: null,
+    };
+  }
+  const transform =
+    existingTransform === undefined || existingTransform === null
+      ? null
+      : asRecord(existingTransform);
+  if (existingTransform !== undefined && existingTransform !== null && !transform) {
+    return { error: "The existing object transform is not a valid record.", transform: null };
+  }
+  const rotation = persistedTransformVector(transform, "rotation_quat", 4, [0, 0, 0, 1]);
+  const scale = persistedTransformVector(transform, "scale", 3, [1, 1, 1]);
+  const pivot = persistedTransformVector(transform, "pivot", 3, [0, 0, 0]);
+  const invalid = [rotation, scale, pivot].find((component) => component.error);
+  if (invalid?.error) return { error: invalid.error, transform: null };
 
   return {
     error: null,
-    transform: { translation: translation.value },
+    transform: {
+      pivot: pivot.value,
+      rotation_quat: rotation.value,
+      scale: scale.value,
+      translation: translation.value,
+    },
   };
 }
 
@@ -594,5 +749,23 @@ export function resolveGeometryObjectPanelModel(
       asString(geometry?.kind) ??
       "object",
     source: "SceneDocument",
+  };
+}
+
+export function mergeGeometryDescriptor(
+  existing: JsonObject,
+  edited: JsonObject,
+): JsonObject {
+  const existingParams = existing.geometry_params;
+  const editedParams = edited.geometry_params;
+  const mergedParams =
+    existingParams && typeof existingParams === "object" && !Array.isArray(existingParams) &&
+    editedParams && typeof editedParams === "object" && !Array.isArray(editedParams)
+      ? { ...existingParams, ...editedParams }
+      : editedParams;
+  return {
+    ...existing,
+    ...edited,
+    ...(mergedParams ? { geometry_params: mergedParams as JsonObject } : {}),
   };
 }

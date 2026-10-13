@@ -9,6 +9,10 @@
 
 #include "fullmag_fem.h"
 
+#ifndef FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256
+#define FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256 ""
+#endif
+
 #include "backend_handle.hpp"
 #include "context.hpp"
 #include "cpu/mfem/interactions/demag.hpp"
@@ -23,11 +27,14 @@
 #include "cpu/mfem/runtime/interrupt.hpp"
 #include "cpu/mfem/runtime/mfem_host_access.hpp"
 #include "cpu/mfem/runtime/mfem_device.hpp"
+#include "cpu/mfem/runtime/mfem_mesh_builder.hpp"
+#include "cpu/mfem/runtime/indexed_geometry.hpp"
 #include "cpu/mfem/runtime/runtime_build_info.hpp"
 #include "cpu/mfem/runtime/snapshot.hpp"
 #include "cpu/mfem/runtime/stage_completion.hpp"
 #include "cpu/mfem/runtime/state_io.hpp"
 #include "frequency_domain/driven_response_solver.hpp"
+#include "frequency_domain/artifact_identity.hpp"
 #include "frequency_domain/frequency_domain_contract.hpp"
 #include "frequency_domain/linearization_state.hpp"
 #include "frequency_domain/modal_gpu_krylov.hpp"
@@ -56,12 +63,18 @@
 #include <cuda_runtime.h>
 #endif
 
+#if FULLMAG_HAS_MFEM_STACK
+#include <mfem.hpp>
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <complex>
 #include <cstddef>
 #include <cstdio>
+#include <cstdint>
+#include <exception>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -83,6 +96,207 @@ struct DrivenResponseCAbiDemagTangentContext {
 
 constexpr const char *kUnavailableMessage =
     "fullmag_fem native backend was built without the MFEM stack; rebuild with FULLMAG_USE_MFEM_STACK=ON and an installed MFEM toolchain";
+
+#if FULLMAG_HAS_MFEM_STACK
+
+constexpr std::uint64_t kMaxLocalNodeMapNodes = 4ull * 1024ull * 1024ull;
+constexpr std::uint64_t kMaxLiveGeometryChunk = 4096ull;
+constexpr std::uint64_t kLiveCellRecordWidth = 9ull;
+
+struct LocalNodeMapSnapshot {
+    std::uint64_t local_node_count = 0;
+    std::uint64_t mfem_local_dof_count = 0;
+    std::uint64_t mfem_true_dof_count = 0;
+    std::uint64_t core_periodic_class_count = 0;
+    std::uint64_t core_periodic_map_revision = 0;
+    std::vector<std::uint32_t> local_to_mfem_dof;
+    std::vector<std::uint32_t> local_to_core_class;
+    std::vector<std::uint32_t> class_representatives;
+};
+
+static_assert(sizeof(fullmag_fem_local_node_map_v1) == 56u,
+    "local-node map ABI layout changed");
+static_assert(alignof(fullmag_fem_local_node_map_v1) == 8u,
+    "local-node map ABI alignment changed");
+static_assert(offsetof(fullmag_fem_local_node_map_v1, local_node_count) == 16u,
+    "local-node map ABI count offset changed");
+static_assert(offsetof(fullmag_fem_local_node_map_v1, core_periodic_map_revision) == 48u,
+    "local-node map ABI revision offset changed");
+
+bool collect_local_node_map(
+    const fullmag::fem::Context &ctx,
+    LocalNodeMapSnapshot &snapshot,
+    std::string &error)
+{
+    snapshot = {};
+    error.clear();
+
+    const std::uint64_t local_node_count = static_cast<std::uint64_t>(ctx.mesh.n_nodes);
+    if (local_node_count == 0u ||
+        local_node_count > kMaxLocalNodeMapNodes ||
+        local_node_count > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
+        local_node_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        error = "native local-node map requires a positive bounded MFEM-addressable node extent";
+        return false;
+    }
+    if (ctx.base_plan.fe_order != 1u) {
+        error = "native local-node map requires scalar H1 P1 magnetization space";
+        return false;
+    }
+    if (!ctx.mfem_context.ready || ctx.mfem_context.fes == nullptr) {
+        error = "native local-node map requires a ready MFEM finite element space";
+        return false;
+    }
+
+    mfem::FiniteElementSpace *fes = ctx.mfem_context.fes;
+    if (ctx.mfem_context.mesh == nullptr || fes->GetMesh() != ctx.mfem_context.mesh) {
+        error = "native local-node map MFEM space is not bound to the live context mesh";
+        return false;
+    }
+    if (!fullmag::fem::verify_mfem_local_node_ordering(ctx.mesh, *fes, error)) {
+        return false;
+    }
+
+    const int mfem_local_dof_count = fes->GetNDofs();
+    const int mfem_true_dof_count = fes->GetTrueVSize();
+    if (mfem_local_dof_count <= 0 || mfem_true_dof_count <= 0 ||
+        mfem_true_dof_count > mfem_local_dof_count ||
+        static_cast<std::uint64_t>(mfem_local_dof_count) != local_node_count) {
+        error = "native local-node map has invalid MFEM local/true DOF extents";
+        return false;
+    }
+
+    fullmag::fem::PeriodicNodeMapView periodic_map;
+    if (!fullmag::fem::bind_periodic_node_map(ctx, periodic_map, error)) {
+        return false;
+    }
+    const std::uint64_t core_periodic_class_count =
+        static_cast<std::uint64_t>(periodic_map.true_node_count);
+    if (periodic_map.local_node_count != static_cast<std::size_t>(local_node_count) ||
+        core_periodic_class_count == 0u ||
+        core_periodic_class_count > local_node_count ||
+        core_periodic_class_count >
+            static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) ||
+        (!periodic_map.reduced() &&
+            (periodic_map.revision != 0u || core_periodic_class_count != local_node_count)) ||
+        (periodic_map.reduced() &&
+            (periodic_map.local_to_true == nullptr ||
+             periodic_map.true_representatives == nullptr ||
+             periodic_map.revision == 0u))) {
+        error = "native local-node map has invalid core periodic map extents or revision";
+        return false;
+    }
+
+    snapshot.local_node_count = local_node_count;
+    snapshot.mfem_local_dof_count = static_cast<std::uint64_t>(mfem_local_dof_count);
+    snapshot.mfem_true_dof_count = static_cast<std::uint64_t>(mfem_true_dof_count);
+    snapshot.core_periodic_class_count = core_periodic_class_count;
+    snapshot.core_periodic_map_revision = periodic_map.revision;
+    snapshot.local_to_mfem_dof.resize(static_cast<std::size_t>(local_node_count));
+    snapshot.local_to_core_class.resize(static_cast<std::size_t>(local_node_count));
+    snapshot.class_representatives.resize(static_cast<std::size_t>(core_periodic_class_count));
+
+    std::vector<std::uint8_t> seen_mfem_dofs(static_cast<std::size_t>(mfem_local_dof_count), 0u);
+    mfem::Array<int> vertex_dofs;
+    for (std::uint64_t node = 0u; node < local_node_count; ++node) {
+        fes->GetVertexDofs(static_cast<int>(node), vertex_dofs);
+        if (vertex_dofs.Size() != 1) {
+            error = "native local-node map requires one MFEM scalar DOF per canonical vertex";
+            return false;
+        }
+        const int dof = vertex_dofs[0];
+        if (dof < 0 || dof >= mfem_local_dof_count ||
+            dof != static_cast<int>(node) || seen_mfem_dofs[static_cast<std::size_t>(dof)] != 0u) {
+            error = "native local-node map MFEM vertex DOF ordering is not canonical identity";
+            return false;
+        }
+        seen_mfem_dofs[static_cast<std::size_t>(dof)] = 1u;
+        snapshot.local_to_mfem_dof[static_cast<std::size_t>(node)] =
+            static_cast<std::uint32_t>(dof);
+    }
+
+    if (periodic_map.reduced()) {
+        std::copy_n(
+            periodic_map.local_to_true,
+            static_cast<std::size_t>(local_node_count),
+            snapshot.local_to_core_class.begin());
+        std::copy_n(
+            periodic_map.true_representatives,
+            static_cast<std::size_t>(core_periodic_class_count),
+            snapshot.class_representatives.begin());
+    } else {
+        for (std::uint32_t node = 0u; node < ctx.mesh.n_nodes; ++node) {
+            snapshot.local_to_core_class[static_cast<std::size_t>(node)] = node;
+            snapshot.class_representatives[static_cast<std::size_t>(node)] = node;
+        }
+    }
+
+    std::vector<std::uint8_t> seen_core_classes(
+        static_cast<std::size_t>(core_periodic_class_count), 0u);
+    for (std::uint32_t core_class : snapshot.local_to_core_class) {
+        if (static_cast<std::uint64_t>(core_class) >= core_periodic_class_count) {
+            error = "native local-node map contains an out-of-range core periodic class";
+            return false;
+        }
+        seen_core_classes[static_cast<std::size_t>(core_class)] = 1u;
+    }
+    for (std::size_t core_class = 0u;
+         core_class < static_cast<std::size_t>(core_periodic_class_count);
+         ++core_class) {
+        const std::uint32_t representative = snapshot.class_representatives[core_class];
+        if (static_cast<std::uint64_t>(representative) >= local_node_count ||
+            snapshot.local_to_core_class[static_cast<std::size_t>(representative)] !=
+                static_cast<std::uint32_t>(core_class) ||
+            seen_core_classes[core_class] == 0u) {
+            error = "native local-node map core periodic representative is inconsistent";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool map_output_buffers_overlap(
+    const std::uint32_t *first,
+    std::uint64_t first_len,
+    const std::uint32_t *second,
+    std::uint64_t second_len)
+{
+    const std::uintptr_t first_address = reinterpret_cast<std::uintptr_t>(first);
+    const std::uintptr_t second_address = reinterpret_cast<std::uintptr_t>(second);
+    const std::uintptr_t first_bytes =
+        static_cast<std::uintptr_t>(first_len * sizeof(std::uint32_t));
+    const std::uintptr_t second_bytes =
+        static_cast<std::uintptr_t>(second_len * sizeof(std::uint32_t));
+    if (first_address <= second_address) {
+        return second_address - first_address < first_bytes;
+    }
+    return first_address - second_address < second_bytes;
+}
+
+fullmag_fem_local_node_map_v1 local_node_map_metadata(const LocalNodeMapSnapshot &snapshot)
+{
+    fullmag_fem_local_node_map_v1 metadata{};
+    metadata.abi_version = FULLMAG_FEM_LOCAL_NODE_MAP_V1_ABI_VERSION;
+    metadata.struct_size = sizeof(metadata);
+    metadata.state_space = FULLMAG_FEM_REPRESENTATION_SPACE_LOCAL_NODE_AOS;
+    metadata.reserved0 = 0u;
+    metadata.local_node_count = snapshot.local_node_count;
+    metadata.mfem_local_dof_count = snapshot.mfem_local_dof_count;
+    metadata.mfem_true_dof_count = snapshot.mfem_true_dof_count;
+    metadata.core_periodic_class_count = snapshot.core_periodic_class_count;
+    metadata.core_periodic_map_revision = snapshot.core_periodic_map_revision;
+    return metadata;
+}
+
+template <typename T>
+bool valid_geometry_output_span(const T *pointer, std::uint64_t length)
+{
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    return pointer != nullptr && address % alignof(T) == 0u &&
+        length <= (std::numeric_limits<std::uintptr_t>::max() - address) / sizeof(T);
+}
+
+#endif
 
 uint32_t gpu_execution_class_to_abi(fullmag::fem::FemGpuExecutionClass execution_class) {
     switch (execution_class) {
@@ -378,6 +592,7 @@ const fullmag::fem::FemGpuComponentField *gpu_snapshot_source_field(
     case FULLMAG_FEM_OBSERVABLE_H_EX:
         return &context.gpu_state.device.fields.h_ex;
     case FULLMAG_FEM_OBSERVABLE_H_DEMAG:
+#if FULLMAG_HAS_MFEM_STACK
         if (context.demag.enabled &&
             (context.poisson_demag.gpu_demag_mode ==
                  FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_POISSON ||
@@ -385,6 +600,7 @@ const fullmag::fem::FemGpuComponentField *gpu_snapshot_source_field(
                  FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_FEM_BEM)) {
             return &context.gpu_state.device.demag_poisson.poisson_gradient;
         }
+#endif
         return nullptr;
     case FULLMAG_FEM_OBSERVABLE_H_EXT:
         return &context.gpu_state.device.fields.h_ext;
@@ -403,13 +619,17 @@ const fullmag::fem::FemGpuComponentField *gpu_snapshot_source_field(
     case FULLMAG_FEM_OBSERVABLE_H_MEL:
         return &context.gpu_state.device.fields.h_mel;
     case FULLMAG_FEM_OBSERVABLE_H_EFF:
-        if (!context.demag.enabled ||
-            (context.poisson_demag.gpu_demag_mode ==
-                 FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_POISSON ||
-             context.poisson_demag.gpu_demag_mode ==
-                 FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_FEM_BEM)) {
+        if (!context.demag.enabled) {
             return &context.gpu_state.device.fields.h_eff;
         }
+#if FULLMAG_HAS_MFEM_STACK
+        if (context.poisson_demag.gpu_demag_mode ==
+                FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_POISSON ||
+            context.poisson_demag.gpu_demag_mode ==
+                FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_FEM_BEM) {
+            return &context.gpu_state.device.fields.h_eff;
+        }
+#endif
         return nullptr;
     case FULLMAG_FEM_OBSERVABLE_DEMAG_PHI:
         return nullptr;
@@ -1609,6 +1829,7 @@ int fullmag_fem_get_frequency_domain_dependency_info(
         out_info->diagnostics_json,
         sizeof(out_info->diagnostics_json),
         "{\"schema_version\":\"fullmag_fem_frequency_domain_dependency_info.v1\","
+        "\"native_source_snapshot_sha256\":\"%s\","
         "\"petsc_available\":%s,"
         "\"slepc_available\":%s,"
         "\"modal_eigen_native_cpu_slepc_available\":%s,"
@@ -1621,6 +1842,7 @@ int fullmag_fem_get_frequency_domain_dependency_info(
         "\"petsc_library_path\":\"%s\","
         "\"slepc_library_path\":\"%s\","
         "\"reason\":\"%s\"}",
+        FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256,
         petsc_available ? "true" : "false",
         slepc_available ? "true" : "false",
         modal_eigen_native_cpu_slepc_available ? "true" : "false",
@@ -2204,6 +2426,18 @@ int fullmag_fem_get_mesh_abi_layout(fullmag_fem_mesh_abi_layout *out_layout)
     return FULLMAG_FEM_OK;
 }
 
+int fullmag_fem_frequency_domain_validate_artifact_identity_v1(
+    const FullmagFemFrequencyDomainArtifactIdentityV1 *identity)
+{
+    char error_message[128]{};
+    if (!fullmag::fem::frequency_domain::validate_artifact_identity_v1(identity, error_message)) {
+        fullmag_fem_set_global_error(error_message);
+        return FULLMAG_FEM_ERR_INVALID;
+    }
+    fullmag_fem_clear_global_error();
+    return FULLMAG_FEM_OK;
+}
+
 int fullmag_fem_frequency_domain_initial_sweep_progress(
     uint64_t total_frequency_points,
     fullmag_fem_frequency_domain_sweep_progress *out_progress
@@ -2302,7 +2536,8 @@ int fullmag_fem_frequency_domain_completed_sweep_progress(
 static int fullmag_fem_frequency_domain_solve_driven_response_from_c_abi(
     const fullmag_fem_frequency_domain_driven_response_request *request,
     fullmag_fem_frequency_domain_apply_with_potential_callback mfem_apply_demag_tangent_with_potential,
-    fullmag_fem_frequency_domain_solve_result *out_result
+    fullmag_fem_frequency_domain_solve_result *out_result,
+    const FullmagFemFrequencyDomainArtifactIdentityV1 *artifact_identity = nullptr
 ) {
     if (request == nullptr || out_result == nullptr) {
         fullmag_fem_set_global_error(
@@ -2374,6 +2609,7 @@ static int fullmag_fem_frequency_domain_solve_driven_response_from_c_abi(
         return FULLMAG_FEM_OK;
     }
     fd::DrivenFrequencyResponseSolveRequest native_request{};
+    native_request.artifact_identity = artifact_identity;
     std::vector<fd::TangentFrameNode> frequency_domain_tangent_nodes;
     std::vector<fd::TangentOperatorEdgeBlock> frequency_domain_exchange_edges;
     std::vector<fd::MfemDmiElementTangentData> frequency_domain_dmi_elements;
@@ -2391,6 +2627,10 @@ static int fullmag_fem_frequency_domain_solve_driven_response_from_c_abi(
     native_request.struct_size = request->struct_size == 0
         ? 0
         : sizeof(fd::DrivenFrequencyResponseSolveRequest);
+    if (artifact_identity != nullptr) {
+        native_request.abi_version = fd::kDrivenFrequencyResponseSolveRequestAbiVersion;
+        native_request.struct_size = sizeof(fd::DrivenFrequencyResponseSolveRequest);
+    }
     native_request.solver_options.relative_tolerance =
         request->solver_relative_tolerance;
     native_request.solver_options.absolute_tolerance =
@@ -2816,6 +3056,19 @@ static int fullmag_fem_frequency_domain_solve_driven_response_from_c_abi(
     fd::release_driven_frequency_response_result(&native_result);
     fullmag_fem_clear_global_error();
     return FULLMAG_FEM_OK;
+}
+
+int fullmag_fem_frequency_domain_solve_driven_response_with_identity_v1(
+    const fullmag_fem_frequency_domain_driven_response_request *request,
+    const FullmagFemFrequencyDomainArtifactIdentityV1 *identity,
+    fullmag_fem_frequency_domain_apply_with_potential_callback mfem_apply_demag_tangent_with_potential,
+    fullmag_fem_frequency_domain_solve_result *out_result)
+{
+    if (fullmag_fem_frequency_domain_validate_artifact_identity_v1(identity) != FULLMAG_FEM_OK) {
+        return FULLMAG_FEM_ERR_INVALID;
+    }
+    return fullmag_fem_frequency_domain_solve_driven_response_from_c_abi(
+        request, mfem_apply_demag_tangent_with_potential, out_result, identity);
 }
 
 int fullmag_fem_frequency_domain_solve_driven_response(
@@ -4189,8 +4442,99 @@ static FullmagFemFrequencyDomainResult fullmag_fem_modal_eigen_solve_impl(
             "k0_poisson_airbox_gpu_attestation_abi_required");
     }
 
+    constexpr std::size_t kModalTinyMassMatrixPointerEnd =
+        offsetof(FullmagFemModalEigenRequest, tiny_validation_mass_matrix_row_major) +
+        sizeof(request->tiny_validation_mass_matrix_row_major);
+    const bool tiny_mass_matrix_pointer_layout_valid =
+        known_modal_abi &&
+        request->abi_version >= FULLMAG_FEM_FREQUENCY_DOMAIN_V15_ABI_VERSION &&
+        request->struct_size >= kModalTinyMassMatrixPointerEnd;
+    const bool tiny_mass_matrix_boundary_layout_valid =
+        tiny_mass_matrix_pointer_layout_valid &&
+        native_request.tiny_validation_enabled != 0 &&
+        native_request.tiny_validation_tangent_dof_count == 2 &&
+        (native_request.tiny_validation_stiffness_matrix_row_major != nullptr ||
+         native_request.tiny_validation_stiffness_diagonal != nullptr) &&
+        request->tiny_validation_mass_matrix_row_major != nullptr &&
+        native_request.tiny_validation_mass_matrix_row_major != nullptr;
+    const bool tiny_mass_matrix_pointer_matches_native =
+        tiny_mass_matrix_boundary_layout_valid &&
+        request->tiny_validation_mass_matrix_row_major ==
+            native_request.tiny_validation_mass_matrix_row_major;
+
     fd::FrequencyDomainContractResult native_result =
         fd::solve_modal_eigen_contract(native_request);
+    if (tiny_mass_matrix_boundary_layout_valid &&
+        native_result.status == fd::FrequencyDomainStatus::solve_error &&
+        native_result.error_message ==
+            "modal tiny validation gyrotropic mass matrix is singular") {
+        double public_tiny_mass_matrix_snapshot[4]{};
+        double native_tiny_mass_matrix_snapshot[4]{};
+        if (tiny_mass_matrix_pointer_matches_native) {
+            for (std::size_t index = 0; index < 4; ++index) {
+                public_tiny_mass_matrix_snapshot[index] =
+                    request->tiny_validation_mass_matrix_row_major[index];
+                native_tiny_mass_matrix_snapshot[index] =
+                    native_request.tiny_validation_mass_matrix_row_major[index];
+            }
+        }
+        const auto json_number = [](double value) {
+            if (!std::isfinite(value)) {
+                return std::string("null");
+            }
+            char buffer[64]{};
+            const int written = std::snprintf(buffer, sizeof(buffer), "%.17g", value);
+            if (written <= 0 || static_cast<std::size_t>(written) >= sizeof(buffer)) {
+                return std::string("null");
+            }
+            return std::string(buffer);
+        };
+        std::string boundary_field =
+            "\"tiny_validation_cabi_boundary\":{"
+            "\"public_abi_version\":" +
+            std::to_string(request->abi_version) +
+            ",\"public_struct_size\":" + std::to_string(request->struct_size) +
+            ",\"public_request_sizeof\":" +
+            std::to_string(sizeof(FullmagFemModalEigenRequest)) +
+            ",\"public_mass_pointer_offset\":" +
+            std::to_string(offsetof(
+                FullmagFemModalEigenRequest,
+                tiny_validation_mass_matrix_row_major)) +
+            ",\"public_mass_pointer_size\":" +
+            std::to_string(sizeof(request->tiny_validation_mass_matrix_row_major)) +
+            ",\"public_mass_pointer_matches_native\":" +
+            std::string(tiny_mass_matrix_pointer_matches_native ? "true" : "false") +
+            ",\"native_abi_version\":" +
+            std::to_string(native_request.abi_version) +
+            ",\"native_struct_size\":" + std::to_string(native_request.struct_size) +
+            ",\"native_request_sizeof\":" +
+            std::to_string(sizeof(fd::ModalEigenRequest));
+        boundary_field += ",\"public_mass_matrix_row_major\":";
+        if (tiny_mass_matrix_pointer_matches_native) {
+            boundary_field += "[" +
+                json_number(public_tiny_mass_matrix_snapshot[0]) + "," +
+                json_number(public_tiny_mass_matrix_snapshot[1]) + "," +
+                json_number(public_tiny_mass_matrix_snapshot[2]) + "," +
+                json_number(public_tiny_mass_matrix_snapshot[3]) +
+                "],\"native_mass_matrix_row_major\":[";
+            boundary_field +=
+                json_number(native_tiny_mass_matrix_snapshot[0]) + "," +
+                json_number(native_tiny_mass_matrix_snapshot[1]) + "," +
+                json_number(native_tiny_mass_matrix_snapshot[2]) + "," +
+                json_number(native_tiny_mass_matrix_snapshot[3]) + "]}";
+        } else {
+            boundary_field += "null,\"native_mass_matrix_row_major\":null}";
+        }
+        std::string &diagnostics = native_result.diagnostics_json;
+        if (!diagnostics.empty() && diagnostics.back() == '}') {
+            diagnostics.pop_back();
+            if (diagnostics.size() > 1) {
+                diagnostics.push_back(',');
+            }
+            diagnostics += boundary_field;
+            diagnostics.push_back('}');
+        }
+    }
     if (accepted_certificate_binding_status !=
         FULLMAG_FEM_MODAL_CERTIFICATE_BINDING_UNSPECIFIED) {
         native_result.certificate_binding.status = accepted_certificate_binding_status;
@@ -4605,23 +4949,27 @@ int fullmag_fem_get_regional_field_drive_abi_layout(
     return FULLMAG_FEM_OK;
 }
 
-int fullmag_fem_backend_begin_stage(
+int fullmag_fem_backend_begin_stage_v2(
     fullmag_fem_backend *handle,
-    double stage_start_time_s)
+    double segment_start_time_s,
+    double waveform_origin_time_s)
 {
-    if (handle == nullptr || !std::isfinite(stage_start_time_s)) {
-        fullmag_fem_set_handle_error(handle, "begin_stage requires a non-null handle and finite stage start time");
+    if (handle == nullptr || !std::isfinite(segment_start_time_s) ||
+        segment_start_time_s < 0.0 || !std::isfinite(waveform_origin_time_s) ||
+        waveform_origin_time_s < 0.0 ||
+        waveform_origin_time_s > segment_start_time_s) {
+        fullmag_fem_set_handle_error(handle, "begin_stage_v2 requires finite non-negative times with waveform origin no later than segment start");
         return FULLMAG_FEM_ERR_INVALID;
     }
     auto &ctx = handle->context;
     const double tolerance = 64.0 * std::numeric_limits<double>::epsilon() *
-        std::max({1.0, std::abs(ctx.state.current_time), std::abs(stage_start_time_s)});
-    if (std::abs(ctx.state.current_time - stage_start_time_s) > tolerance) {
+        std::max({1.0, std::abs(ctx.state.current_time), std::abs(segment_start_time_s)});
+    if (std::abs(ctx.state.current_time - segment_start_time_s) > tolerance) {
         fullmag_fem_set_handle_error(handle,
             "begin_stage start time must equal the backend's current absolute time");
         return FULLMAG_FEM_ERR_INVALID;
     }
-    ctx.zeeman.stage_start_time_s = stage_start_time_s;
+    ctx.zeeman.stage_start_time_s = waveform_origin_time_s;
     ctx.zeeman.regional_drive_revision += 1;
     ctx.stepper.workspace.fsal_valid = false;
     ctx.gpu_state.device.rk.fsal_valid = false;
@@ -4630,12 +4978,22 @@ int fullmag_fem_backend_begin_stage(
     ctx.gpu_state.device.rk.endpoint_operator_signature = 0;
     ctx.adaptive_dt.prev_error_norm = 1.0;
     ctx.adaptive_dt.has_prev_error_norm = false;
+#if FULLMAG_HAS_MFEM_STACK
     ctx.poisson_demag.fresh_initial_guess_required =
         ctx.demag.enabled && ctx.gpu_state.device.lifecycle.allocated;
+#endif
     std::fill(ctx.zeeman.h_drive_xyz.begin(), ctx.zeeman.h_drive_xyz.end(), 0.0);
     std::fill(ctx.effective_field.h_xyz.begin(), ctx.effective_field.h_xyz.end(), 0.0);
     handle->last_error.clear();
     return FULLMAG_FEM_OK;
+}
+
+int fullmag_fem_backend_begin_stage(
+    fullmag_fem_backend *handle,
+    double stage_start_time_s)
+{
+    return fullmag_fem_backend_begin_stage_v2(
+        handle, stage_start_time_s, stage_start_time_s);
 }
 
 int fullmag_fem_backend_set_gpu_execution_request_v1(
@@ -5186,6 +5544,7 @@ int fullmag_fem_backend_apply_demag_tangent_with_potential_f64(
         return FULLMAG_FEM_ERR_INVALID;
     }
 
+#if FULLMAG_HAS_MFEM_STACK
     if (handle->context.gpu_state.device.lifecycle.allocated &&
         handle->context.poisson_demag.gpu_demag_mode ==
             FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_POISSON) {
@@ -5203,6 +5562,8 @@ int fullmag_fem_backend_apply_demag_tangent_with_potential_f64(
         }
         return FULLMAG_FEM_OK;
     }
+
+#endif
 
     const int tangent_status = fullmag_fem_backend_apply_demag_tangent_f64(
         handle,
@@ -5357,6 +5718,309 @@ int fullmag_fem_backend_snapshot_representation_receipt_v1(
     handle->last_error.clear();
     fullmag_fem_clear_global_error();
     return FULLMAG_FEM_OK;
+}
+
+int fullmag_fem_backend_snapshot_local_node_map_v1(
+    fullmag_fem_backend *handle,
+    fullmag_fem_local_node_map_v1 *out_map)
+{
+    if (out_map == nullptr) {
+        fullmag_fem_set_handle_error(
+            handle,
+            "fullmag_fem_backend_snapshot_local_node_map_v1 received null out_map");
+        return FULLMAG_FEM_ERR_INVALID;
+    }
+    if (handle == nullptr) {
+        fullmag_fem_set_global_error(
+            "fullmag_fem_backend_snapshot_local_node_map_v1 received null handle");
+        return FULLMAG_FEM_ERR_INVALID;
+    }
+    if (out_map->abi_version != FULLMAG_FEM_LOCAL_NODE_MAP_V1_ABI_VERSION ||
+        out_map->struct_size != sizeof(fullmag_fem_local_node_map_v1)) {
+        fullmag_fem_set_handle_error(
+            handle,
+            "fullmag_fem_backend_snapshot_local_node_map_v1 received unsupported abi_version or struct_size");
+        return FULLMAG_FEM_ERR_INVALID;
+    }
+
+#if FULLMAG_HAS_MFEM_STACK
+    try {
+        LocalNodeMapSnapshot snapshot;
+        std::string error;
+        if (!collect_local_node_map(handle->context, snapshot, error)) {
+            fullmag_fem_set_handle_error(
+                handle,
+                "local-node map rejected invalid MFEM/core map: " + error);
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        const fullmag_fem_local_node_map_v1 metadata = local_node_map_metadata(snapshot);
+        *out_map = metadata;
+        handle->last_error.clear();
+        fullmag_fem_clear_global_error();
+        return FULLMAG_FEM_OK;
+    } catch (const std::exception &ex) {
+        fullmag_fem_set_handle_error(
+            handle,
+            std::string("fullmag_fem_backend_snapshot_local_node_map_v1 failed: ") + ex.what());
+        return FULLMAG_FEM_ERR_INTERNAL;
+    } catch (...) {
+        fullmag_fem_set_handle_error(
+            handle,
+            "fullmag_fem_backend_snapshot_local_node_map_v1 failed with an unknown exception");
+        return FULLMAG_FEM_ERR_INTERNAL;
+    }
+#else
+    fullmag_fem_set_handle_error(handle, kUnavailableMessage);
+    return FULLMAG_FEM_ERR_UNAVAILABLE;
+#endif
+}
+
+int fullmag_fem_backend_copy_local_node_map_v1(
+    fullmag_fem_backend *handle,
+    uint64_t expected_revision,
+    uint32_t *local_to_mfem_dof,
+    uint64_t local_to_mfem_dof_len,
+    uint32_t *local_to_core_class,
+    uint64_t local_to_core_class_len,
+    uint32_t *class_representatives,
+    uint64_t class_representatives_len)
+{
+    if (handle == nullptr) {
+        fullmag_fem_set_global_error(
+            "fullmag_fem_backend_copy_local_node_map_v1 received null handle");
+        return FULLMAG_FEM_ERR_INVALID;
+    }
+
+#if FULLMAG_HAS_MFEM_STACK
+    try {
+        if (local_to_mfem_dof == nullptr || local_to_core_class == nullptr ||
+            class_representatives == nullptr || local_to_mfem_dof_len == 0u ||
+            local_to_core_class_len == 0u || class_representatives_len == 0u ||
+            local_to_mfem_dof_len > kMaxLocalNodeMapNodes ||
+            local_to_core_class_len > kMaxLocalNodeMapNodes ||
+            class_representatives_len > kMaxLocalNodeMapNodes) {
+            fullmag_fem_set_handle_error(
+                handle,
+                "fullmag_fem_backend_copy_local_node_map_v1 received invalid output buffers");
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        if (map_output_buffers_overlap(
+                local_to_mfem_dof,
+                local_to_mfem_dof_len,
+                local_to_core_class,
+                local_to_core_class_len) ||
+            map_output_buffers_overlap(
+                local_to_mfem_dof,
+                local_to_mfem_dof_len,
+                class_representatives,
+                class_representatives_len) ||
+            map_output_buffers_overlap(
+                local_to_core_class,
+                local_to_core_class_len,
+                class_representatives,
+                class_representatives_len)) {
+            fullmag_fem_set_handle_error(
+                handle,
+                "fullmag_fem_backend_copy_local_node_map_v1 output buffers overlap");
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        LocalNodeMapSnapshot snapshot;
+        std::string error;
+        if (!collect_local_node_map(handle->context, snapshot, error)) {
+            fullmag_fem_set_handle_error(
+                handle,
+                "local-node map rejected invalid MFEM/core map: " + error);
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        if (expected_revision != snapshot.core_periodic_map_revision) {
+            fullmag_fem_set_handle_error(
+                handle,
+                "fullmag_fem_backend_copy_local_node_map_v1 received a stale core periodic map revision");
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        if (local_to_mfem_dof_len != snapshot.local_node_count ||
+            local_to_core_class_len != snapshot.local_node_count ||
+            class_representatives_len != snapshot.core_periodic_class_count) {
+            fullmag_fem_set_handle_error(
+                handle,
+                "fullmag_fem_backend_copy_local_node_map_v1 buffer lengths do not match the live map");
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        std::copy(
+            snapshot.local_to_mfem_dof.begin(),
+            snapshot.local_to_mfem_dof.end(),
+            local_to_mfem_dof);
+        std::copy(
+            snapshot.local_to_core_class.begin(),
+            snapshot.local_to_core_class.end(),
+            local_to_core_class);
+        std::copy(
+            snapshot.class_representatives.begin(),
+            snapshot.class_representatives.end(),
+            class_representatives);
+        handle->last_error.clear();
+        fullmag_fem_clear_global_error();
+        return FULLMAG_FEM_OK;
+    } catch (const std::exception &ex) {
+        fullmag_fem_set_handle_error(
+            handle,
+            std::string("fullmag_fem_backend_copy_local_node_map_v1 failed: ") + ex.what());
+        return FULLMAG_FEM_ERR_INTERNAL;
+    } catch (...) {
+        fullmag_fem_set_handle_error(
+            handle,
+            "fullmag_fem_backend_copy_local_node_map_v1 failed with an unknown exception");
+        return FULLMAG_FEM_ERR_INTERNAL;
+    }
+#else
+    (void)expected_revision;
+    (void)local_to_mfem_dof;
+    (void)local_to_mfem_dof_len;
+    (void)local_to_core_class;
+    (void)local_to_core_class_len;
+    (void)class_representatives;
+    (void)class_representatives_len;
+    fullmag_fem_set_handle_error(handle, kUnavailableMessage);
+    return FULLMAG_FEM_ERR_UNAVAILABLE;
+#endif
+}
+
+int fullmag_fem_backend_copy_local_node_geometry_v1(
+    fullmag_fem_backend *handle,
+    uint64_t expected_total_nodes,
+    uint64_t expected_total_cells,
+    uint64_t first_node,
+    uint64_t node_count,
+    double *out_nodes_xyz,
+    uint64_t out_nodes_xyz_len)
+{
+    if (handle == nullptr) {
+        fullmag_fem_set_global_error(
+            "fullmag_fem_backend_copy_local_node_geometry_v1 received null handle");
+        return FULLMAG_FEM_ERR_INVALID;
+    }
+
+#if FULLMAG_HAS_MFEM_STACK
+    try {
+        if (node_count == 0u || node_count > kMaxLiveGeometryChunk ||
+            node_count > std::numeric_limits<uint64_t>::max() / 3u ||
+            out_nodes_xyz == nullptr ||
+            !valid_geometry_output_span(out_nodes_xyz, out_nodes_xyz_len) ||
+            out_nodes_xyz_len != node_count * 3u) {
+            fullmag_fem_set_handle_error(
+                handle,
+                "fullmag_fem_backend_copy_local_node_geometry_v1 received invalid output range or buffer");
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        std::vector<double> chunk;
+        std::string error;
+        if (!fullmag::fem::collect_live_node_geometry_chunk(
+                handle->context,
+                expected_total_nodes,
+                expected_total_cells,
+                first_node,
+                node_count,
+                chunk,
+                error)) {
+            fullmag_fem_set_handle_error(
+                handle,
+                "live MFEM node geometry rejected: " + error);
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        std::copy(chunk.begin(), chunk.end(), out_nodes_xyz);
+        handle->last_error.clear();
+        fullmag_fem_clear_global_error();
+        return FULLMAG_FEM_OK;
+    } catch (const std::exception &ex) {
+        fullmag_fem_set_handle_error(
+            handle,
+            std::string("fullmag_fem_backend_copy_local_node_geometry_v1 failed: ") + ex.what());
+        return FULLMAG_FEM_ERR_INTERNAL;
+    } catch (...) {
+        fullmag_fem_set_handle_error(
+            handle,
+            "fullmag_fem_backend_copy_local_node_geometry_v1 failed with an unknown exception");
+        return FULLMAG_FEM_ERR_INTERNAL;
+    }
+#else
+    (void)expected_total_nodes;
+    (void)expected_total_cells;
+    (void)first_node;
+    (void)node_count;
+    (void)out_nodes_xyz;
+    (void)out_nodes_xyz_len;
+    fullmag_fem_set_handle_error(handle, kUnavailableMessage);
+    return FULLMAG_FEM_ERR_UNAVAILABLE;
+#endif
+}
+
+int fullmag_fem_backend_copy_local_cell_geometry_v1(
+    fullmag_fem_backend *handle,
+    uint64_t expected_total_nodes,
+    uint64_t expected_total_cells,
+    uint64_t first_cell,
+    uint64_t cell_count,
+    uint32_t *out_cells,
+    uint64_t out_cells_len)
+{
+    if (handle == nullptr) {
+        fullmag_fem_set_global_error(
+            "fullmag_fem_backend_copy_local_cell_geometry_v1 received null handle");
+        return FULLMAG_FEM_ERR_INVALID;
+    }
+
+#if FULLMAG_HAS_MFEM_STACK
+    try {
+        if (cell_count == 0u || cell_count > kMaxLiveGeometryChunk ||
+            cell_count > std::numeric_limits<uint64_t>::max() / kLiveCellRecordWidth ||
+            out_cells == nullptr ||
+            !valid_geometry_output_span(out_cells, out_cells_len) ||
+            out_cells_len != cell_count * kLiveCellRecordWidth) {
+            fullmag_fem_set_handle_error(
+                handle,
+                "fullmag_fem_backend_copy_local_cell_geometry_v1 received invalid output range or buffer");
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        std::vector<uint32_t> chunk;
+        std::string error;
+        if (!fullmag::fem::collect_live_cell_geometry_chunk(
+                handle->context,
+                expected_total_nodes,
+                expected_total_cells,
+                first_cell,
+                cell_count,
+                chunk,
+                error)) {
+            fullmag_fem_set_handle_error(
+                handle,
+                "live MFEM cell geometry rejected: " + error);
+            return FULLMAG_FEM_ERR_INVALID;
+        }
+        std::copy(chunk.begin(), chunk.end(), out_cells);
+        handle->last_error.clear();
+        fullmag_fem_clear_global_error();
+        return FULLMAG_FEM_OK;
+    } catch (const std::exception &ex) {
+        fullmag_fem_set_handle_error(
+            handle,
+            std::string("fullmag_fem_backend_copy_local_cell_geometry_v1 failed: ") + ex.what());
+        return FULLMAG_FEM_ERR_INTERNAL;
+    } catch (...) {
+        fullmag_fem_set_handle_error(
+            handle,
+            "fullmag_fem_backend_copy_local_cell_geometry_v1 failed with an unknown exception");
+        return FULLMAG_FEM_ERR_INTERNAL;
+    }
+#else
+    (void)expected_total_nodes;
+    (void)expected_total_cells;
+    (void)first_cell;
+    (void)cell_count;
+    (void)out_cells;
+    (void)out_cells_len;
+    fullmag_fem_set_handle_error(handle, kUnavailableMessage);
+    return FULLMAG_FEM_ERR_UNAVAILABLE;
+#endif
 }
 
 int fullmag_fem_backend_solver_attempt_count_v1(

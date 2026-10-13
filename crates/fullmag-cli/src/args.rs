@@ -1,11 +1,14 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use fullmag_ir::{BackendTarget, ExecutionMode, ExecutionPrecision};
+use fullmag_ir::{
+    BackendTarget, ExecutionMode, ExecutionPrecision, ExistingOutputIR, OutputDataFormatIR,
+    TempCleanupIR,
+};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "fullmag")]
+#[command(name = "fullmag", version = fullmag_build_info::version())]
 #[command(
     about = "Rust-hosted Fullmag CLI for Python-authored ProblemIR validation, planning, and execution"
 )]
@@ -31,8 +34,16 @@ pub(crate) struct ScriptCli {
     pub mode: Option<ModeArg>,
     #[arg(long, value_enum)]
     pub precision: Option<PrecisionArg>,
-    #[arg(long)]
+    #[arg(long, help = "Explicit result directory override; default is a script sibling .zarr bundle.")]
     pub output_dir: Option<PathBuf>,
+    #[arg(long, help = "Parent directory for private run scratch.")]
+    pub temp_dir: Option<PathBuf>,
+    #[arg(long, value_enum, help = "Override the authored result format.")]
+    pub data_format: Option<OutputDataFormatArg>,
+    #[arg(long, value_enum, help = "Override private-scratch cleanup policy.")]
+    pub temp_cleanup: Option<TempCleanupArg>,
+    #[arg(long, value_enum, help = "Behavior when the requested result directory exists.")]
+    pub existing_output: Option<ExistingOutputArg>,
     #[arg(long)]
     pub initial_magnetization_state: Option<PathBuf>,
     #[arg(long)]
@@ -54,6 +65,65 @@ pub(crate) struct ScriptCli {
         help = "Port for the dev control room frontend (auto-selects 3000-3010 if omitted)"
     )]
     pub web_port: Option<u16>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Where the Control Room opens: browser (default), desktop (Fullmag window) or none (same as --headless)."
+    )]
+    pub ui: Option<UiModeArg>,
+    #[arg(
+        long,
+        help = "Explicit API port for this run; it must be free or already serve a compatible API."
+    )]
+    pub api_port: Option<u16>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Materialize the script, then wait for COMPUTE in the Control Room."
+    )]
+    pub wait_for_solve: bool,
+    #[arg(
+        long,
+        value_name = "SHA256",
+        help = "Abort with exit code 11, before executing anything, when the script bytes differ."
+    )]
+    pub expect_script_sha256: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write a fullmag.script_run_receipt.v1 JSON document here on every exit path."
+    )]
+    pub receipt: Option<PathBuf>,
+    #[arg(long, value_enum, hide = true)]
+    pub launched_by: Option<LaunchedByArg>,
+    #[arg(
+        long,
+        value_name = "ABS_PATH",
+        help = "Explicit Python interpreter; ignored with a note when a packaged bundle owns Python."
+    )]
+    pub python: Option<PathBuf>,
+}
+
+impl ScriptCli {
+    /// True when any option that makes this a host-managed run is present.
+    /// Only managed runs use the documented exit codes and write receipts.
+    pub(crate) fn is_managed(&self) -> bool {
+        self.receipt.is_some() || self.expect_script_sha256.is_some() || self.launched_by.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum UiModeArg {
+    Browser,
+    Desktop,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum LaunchedByArg {
+    Desktop,
+    Cli,
+    Python,
 }
 
 #[derive(Subcommand)]
@@ -80,7 +150,42 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = false)]
         execution_plan: bool,
     },
+    /// Prepare submission JSON without accepting a run or starting a solver.
+    PrepareRunJson {
+        /// JSON containing the exact archive, expected_revision, explicit
+        /// run_authoring, compiled Study/catalog and asset_paths.
+        path: PathBuf,
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        api_url: String,
+    },
+    /// Submit and materialize an immutable accepted-run request through the public API v2.
     RunJson {
+        /// JSON containing archive_base64, RunIntent, StudyPlan, and StudyProblemCatalog.
+        path: PathBuf,
+        /// Fullmag API origin, for example http://127.0.0.1:8000.
+        #[arg(long)]
+        api_url: String,
+        /// Accept the immutable intent without materializing its task catalog.
+        #[arg(long, default_value_t = false)]
+        submit_only: bool,
+    },
+    /// Deprecated compatibility alias for `run-json`.
+    #[command(hide = true)]
+    SubmitRunJson {
+        /// JSON containing archive_base64, RunIntent, StudyPlan, and StudyProblemCatalog.
+        path: PathBuf,
+        /// Fullmag API origin, for example http://127.0.0.1:8000.
+        #[arg(long)]
+        api_url: String,
+        /// Accept the immutable intent without materializing its task catalog.
+        #[arg(long, default_value_t = false)]
+        submit_only: bool,
+    },
+    /// Execute a canonical ProblemIR directly for internal qualification tooling.
+    #[command(hide = true)]
+    RunProblemJsonDirect {
         path: PathBuf,
         #[arg(long)]
         until: f64,
@@ -105,12 +210,38 @@ pub(crate) enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         raw_args: Vec<OsString>,
     },
+    /// Internal allowlisted FEM eigen k worker.  This command is launched
+    /// only by the runner's process pool and exchanges data through files.
+    #[command(name = "__eigen-k-worker", hide = true)]
+    EigenKWorker {
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Session persistence commands (save, open, inspect, recover, gc)
     #[command(subcommand)]
     Session(SessionSubcommand),
     /// Project definition commands.  These never restore or start a runtime.
     #[command(subcommand)]
     Project(ProjectSubcommand),
+    /// Static operations on a Python script. These never execute the script.
+    #[command(subcommand)]
+    Script(ScriptSubcommand),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ScriptSubcommand {
+    /// Print static facts about a script (hash, syntax, imports, environment reads).
+    Inspect {
+        /// Path to the Python script; it is read and parsed, never executed.
+        path: PathBuf,
+        /// Print the `fullmag.script_inspect.v1` JSON document.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Absolute path of the Python interpreter to use. Ignored, with a
+        /// note in the output, when a packaged bundle owns Python.
+        #[arg(long)]
+        python: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -194,7 +325,7 @@ pub(crate) struct UiCli {
     pub mode: Option<ModeArg>,
     #[arg(long, value_enum)]
     pub precision: Option<PrecisionArg>,
-    /// Use web dev server instead of static assets
+    /// Use the frontend dev server with hot updates instead of static assets
     #[arg(long, default_value_t = false)]
     pub dev: bool,
     #[arg(
@@ -206,6 +337,74 @@ pub(crate) struct UiCli {
 
 #[derive(Subcommand)]
 pub(crate) enum RuntimeCommand {
+    /// Internal native-thread proof of the observer pause protocol.
+    #[command(hide = true)]
+    VerifyDevelopmentObserverPause,
+    /// Internal managed end-to-end proof of the native restart consumer.
+    #[command(hide = true)]
+    VerifyDevelopmentRestartConsumer,
+    /// Internal managed diagnostic for the native CLI owner protocol.
+    #[command(hide = true)]
+    VerifyDevelopmentApiOwner,
+    /// Internal managed probe of the native replacement completion client.
+    #[command(hide = true)]
+    VerifyDevelopmentCompletionOwner,
+    /// Initialize only a new explicitly scoped accepted store.
+    #[command(hide = true)]
+    InitializeScopedAcceptedStore,
+    /// Initialize a pinned host policy for a never-started application store.
+    #[command(hide = true)]
+    InitializeHostApplication {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        config_sha256: String,
+    },
+    /// Internal managed proof of one-shot durable handoff acceptance.
+    #[command(hide = true)]
+    VerifyDevelopmentHandoffCommit {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        corrupt_store: PathBuf,
+    },
+    /// Internal managed proof of an existing cold accepted-store reservation.
+    #[command(hide = true)]
+    VerifyDevelopmentColdIdle {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Internal managed proof of the production client's idle service drain.
+    #[command(hide = true)]
+    VerifyDevelopmentServiceDrain {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Internal operator-level start/attach for an explicitly selected store.
+    #[command(hide = true)]
+    ServiceEnsure {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Observe an already running native service without starting or stopping it.
+    ServiceStatus {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..=30))]
+        timeout_seconds: u64,
+    },
+    /// Internal cold integrity gate for an explicitly pinned saved FEM tensor.
+    #[command(hide = true)]
+    VerifySavedFemSnapshot {
+        #[arg(long)]
+        store: std::path::PathBuf,
+        #[arg(long)]
+        source: std::path::PathBuf,
+        #[arg(long)]
+        source_artifact_id: String,
+    },
     /// Diagnose installed runtime packs and host capabilities
     Doctor,
     /// Print native FEM CPU/GPU availability from the linked runtime
@@ -237,6 +436,54 @@ pub(crate) enum ModeArg {
 pub(crate) enum PrecisionArg {
     Single,
     Double,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum OutputDataFormatArg {
+    Zarr,
+    #[value(alias = "h5")]
+    Hdf5,
+}
+
+impl From<OutputDataFormatArg> for OutputDataFormatIR {
+    fn from(value: OutputDataFormatArg) -> Self {
+        match value {
+            OutputDataFormatArg::Zarr => Self::Zarr,
+            OutputDataFormatArg::Hdf5 => Self::Hdf5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum TempCleanupArg {
+    OnSuccess,
+    Always,
+    Never,
+}
+
+impl From<TempCleanupArg> for TempCleanupIR {
+    fn from(value: TempCleanupArg) -> Self {
+        match value {
+            TempCleanupArg::OnSuccess => Self::OnSuccess,
+            TempCleanupArg::Always => Self::Always,
+            TempCleanupArg::Never => Self::Never,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ExistingOutputArg {
+    Timestamp,
+    Error,
+}
+
+impl From<ExistingOutputArg> for ExistingOutputIR {
+    fn from(value: ExistingOutputArg) -> Self {
+        match value {
+            ExistingOutputArg::Timestamp => Self::Timestamp,
+            ExistingOutputArg::Error => Self::Error,
+        }
+    }
 }
 
 impl From<BackendArg> for BackendTarget {

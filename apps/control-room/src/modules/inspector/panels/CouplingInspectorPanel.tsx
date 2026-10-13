@@ -13,9 +13,12 @@ import {
   publishCommittedSceneResource,
   useModelCouplingsResource,
 } from "@/kernel/resources/geometryLifecycleResources";
+import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
+import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { Button } from "@/shared/ui/Button";
 
 import type { InspectorPanelProps } from "../inspectorTypes";
+import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FieldRow } from "../primitives/FieldRow";
 import { InspectorGroup } from "../primitives/InspectorGroup";
@@ -40,6 +43,7 @@ function errorMessage(error: unknown): string {
 
 export function CouplingInspectorPanel({ selection }: InspectorPanelProps) {
   const { api, authoringHistory, resources } = useKernel();
+  const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
   const couplings = useModelCouplingsResource();
   const [pending, setPending] = useState(false);
   const [feedback, setFeedback] = useState<{
@@ -50,6 +54,22 @@ export function CouplingInspectorPanel({ selection }: InspectorPanelProps) {
     () => resolveCouplingInspectorModel(selection, couplings.data ?? null),
     [couplings.data, selection],
   );
+  const lockReason = model.mode === "found"
+    ? undefined
+    : model.mode === "missing"
+      ? "The selected coupling is not present in the current model resource."
+      : "Select an authored coupling to use its immediate actions.";
+
+  useRegisterInspectorEditSession(
+    "immediate",
+    pending,
+    false,
+    true,
+    lockReason,
+    () => true,
+    () => undefined,
+    { historyMode: "mutation-owned" },
+  );
 
   async function commitCouplingAction(
     action: "delete" | "toggle-enabled",
@@ -59,16 +79,22 @@ export function CouplingInspectorPanel({ selection }: InspectorPanelProps) {
       return;
     }
 
+    const operationSessionScopeKey = sessionScopeKey;
     setPending(true);
     try {
       const response = await runAuthoringMutationWithHistory(
-        { api, authoringHistory },
+        {
+          api,
+          authoringHistory,
+          sessionScopeKey: operationSessionScopeKey,
+        },
         action === "delete"
           ? `Delete coupling ${model.couplingId}`
           : `Toggle coupling ${model.couplingId}`,
         async ({ baseRevision }) => {
           const options = authoringWriteOptions(
             baseRevision ?? couplings.data?.scene_revision,
+            operationSessionScopeKey,
           );
           if (action === "delete") {
             return options
@@ -90,6 +116,10 @@ export function CouplingInspectorPanel({ selection }: InspectorPanelProps) {
         resources,
         response.committed_scene,
         response.scene_revision,
+        undefined,
+        true,
+        operationSessionScopeKey,
+        api.resourceCacheScope,
       );
       resources.invalidate(
         MODEL_COUPLINGS_RESOURCE_KEY,

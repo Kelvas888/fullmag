@@ -14,6 +14,8 @@ import type { EventBus } from "../events/EventBus";
 import type { KernelEventMap } from "../events/eventTypes";
 import type { ObjectMoveToolController } from "../authoring/ObjectMoveToolController";
 import type { AuthoringHistoryController } from "../authoring/AuthoringHistoryController";
+import type { ObjectEditSessionController } from "../authoring/object-edit/ObjectEditSessionController";
+import type { GeometryObjectDraft } from "../authoring/object-edit/objectEditTypes";
 import type { PendingFormRegistry } from "../authoring/PendingFormRegistry";
 import type { ProjectDocumentController } from "../persistence/ProjectDocumentController";
 
@@ -36,6 +38,7 @@ export interface CommandContext {
   analysisFieldOverlay?: AnalysisFieldOverlayController;
   authoringHistory?: AuthoringHistoryController;
   pendingForms?: PendingFormRegistry;
+  objectEditSession?: ObjectEditSessionController<GeometryObjectDraft>;
   bus?: EventBus<KernelEventMap>;
   chartViewportHandoff?: ChartViewportHandoffController;
   cameraRegistry?: CameraRegistryController;
@@ -45,6 +48,10 @@ export interface CommandContext {
   projectDocument?: ProjectDocumentController;
   resourceData?: Readonly<Record<string, unknown>>;
   resources?: ResourceInvalidationController;
+  /** Session identity used to partition current-session API request coalescing. */
+  sessionScopeKey?: string | null;
+  /** Recheck after await before applying a session-owned UI effect. */
+  isCurrentSessionScope?: () => boolean;
   selection?: SelectionController;
   sourceDetail?: string;
   visualization?: ObjectVisualizationController;

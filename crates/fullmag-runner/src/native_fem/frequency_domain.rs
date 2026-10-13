@@ -86,6 +86,7 @@ pub(crate) type NativeFrequencyDomainApplyWithPotentialCallback =
 #[derive(Clone)]
 #[allow(dead_code)]
 pub(crate) struct NativeDrivenFrequencyResponseRequest<'a> {
+    pub artifact_identity: Option<&'a crate::eigen::FrequencyDomainArtifactIdentity>,
     pub node_count: u64,
     pub tangent_dof_count: u64,
     pub alpha: f64,
@@ -272,6 +273,7 @@ pub(crate) struct NativeModalEigenRequest<'a> {
     pub mfem_sparse_operator_problem: Option<NativeModalEigenSparseOperatorProblem<'a>>,
     pub poisson_airbox_block_problem: Option<NativeModalEigenPoissonAirboxBlockProblem<'a>>,
     pub shared_domain_problem: Option<NativeModalEigenSharedDomainProblem<'a>>,
+    pub shared_domain_floquet_periodic_pairs: &'a [NativeModalEigenFloquetPeriodicPair<'a>],
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +309,9 @@ pub(crate) struct NativeModalEigenSharedDomainProblem<'a> {
     pub term_presence_mask: u32,
     pub exchange_term_digest: Option<String>,
     pub field_term_digest: Option<String>,
+    pub anisotropy_term_digest: Option<String>,
+    pub uniaxial_axis_xyz: Vec<f64>,
+    pub uniaxial_anisotropy_field_a_per_m: Vec<f64>,
     pub demag_term_digest: Option<String>,
     pub operator_input_digest: String,
     pub demag_provider_signature: Option<String>,
@@ -503,6 +508,7 @@ impl<'a> NativeModalEigenSharedDomainProblem<'a> {
     fn ffi_envelope_contract(&self) -> Result<NativeModalSharedDomainFfiEnvelopeContract, String> {
         const TERM_EXCHANGE: u32 = 1 << 0;
         const TERM_FIELD: u32 = 1 << 1;
+        const TERM_ANISOTROPY: u32 = 1 << 2;
         const TERM_DEMAG: u32 = 1 << 4;
         let node_count = self.mesh.nodes.len();
         let digest_valid = |value: &str| {
@@ -641,11 +647,29 @@ impl<'a> NativeModalEigenSharedDomainProblem<'a> {
         };
         if !term_digest_matches(TERM_EXCHANGE, self.exchange_term_digest.as_ref())
             || !term_digest_matches(TERM_FIELD, self.field_term_digest.as_ref())
+            || !term_digest_matches(TERM_ANISOTROPY, self.anisotropy_term_digest.as_ref())
             || !term_digest_matches(TERM_DEMAG, self.demag_term_digest.as_ref())
         {
             return Err(
                 "native FEM modal_eigen descriptor term mask and digests disagree".to_string(),
             );
+        }
+        if self.term_presence_mask & TERM_ANISOTROPY != 0 {
+            if self.uniaxial_axis_xyz.len() != 3 * node_count
+                || self.uniaxial_anisotropy_field_a_per_m.len() != 1
+                || !finite(&self.uniaxial_axis_xyz)
+                || !finite(&self.uniaxial_anisotropy_field_a_per_m)
+                || self.uniaxial_axis_xyz.chunks_exact(3).any(|axis| {
+                    let norm = axis[0].hypot(axis[1]).hypot(axis[2]);
+                    !norm.is_finite() || norm <= 0.0
+                })
+            {
+                return Err("native FEM modal_eigen uniaxial descriptor views are invalid".to_string());
+            }
+        } else if !self.uniaxial_axis_xyz.is_empty()
+            || !self.uniaxial_anisotropy_field_a_per_m.is_empty()
+        {
+            return Err("native FEM modal_eigen descriptor carries unadvertised anisotropy views".to_string());
         }
         if self.term_presence_mask & TERM_EXCHANGE != 0
             && !self
@@ -845,6 +869,11 @@ pub(crate) struct NativeModalEigenMfemOperatorProblem<'a> {
     pub stiffness_matrix_row_major: Option<&'a [f64]>,
     pub gyrotropic_matrix_row_major: Option<&'a [f64]>,
     pub mass_matrix_row_major: Option<&'a [f64]>,
+    /// Optional k-dependent dynamic-demagnetization contribution in the same
+    /// real-split tangent layout and units as `stiffness_matrix_row_major`.
+    /// The native boundary validates its shape and finite values; absence is
+    /// preserved so callers cannot silently fall back to a k=0 demag term.
+    pub dynamic_demag_k_tangent_matrix_row_major: Option<&'a [f64]>,
     pub linearized_pencil_dependency_digest: Option<&'a str>,
     pub linearized_pencil_gamma0_m_per_a_s: f64,
     pub phase_convention: FrequencyDomainPhaseConvention,
@@ -977,19 +1006,44 @@ pub(crate) fn solve_native_driven_frequency_response(
     solve_native_driven_frequency_response_impl(request)
 }
 
+/// Absolute threshold, in rad/m, below which a k-vector component is
+/// treated as exactly zero for Gamma-point classification.
+///
+/// This must match the looser threshold already used by the rest of the
+/// runner's Floquet/k-path guards (`eigen_path_guards.rs`, `1.0e-12`)
+/// rather than `f64::EPSILON` (~2.22e-16), so a k-path sample is classified
+/// as Gamma consistently across the codebase instead of only here being far
+/// stricter and treating tiny (but numerically-zero-in-practice) residual
+/// k-components as nonzero.
+const GAMMA_POINT_K_COMPONENT_ABS_TOLERANCE_RAD_PER_M: f64 = 1.0e-12;
+
 #[allow(dead_code)]
 pub(crate) fn solve_native_modal_eigen(
     request: NativeModalEigenRequest<'_>,
 ) -> Result<NativeFrequencyDomainContractResult, String> {
+    let nonzero_k_floquet_shared_domain_provider = matches!(
+        request.execution_target,
+        NativeModalExecutionTarget::ProductionCpu
+    ) && request.include_demag
+        && request.spin_wave_bc_kind == "floquet"
+        && request.k_vector_rad_m.is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.abs() > GAMMA_POINT_K_COMPONENT_ABS_TOLERANCE_RAD_PER_M)
+        })
+        && request.shared_domain_problem.is_some()
+        && request.mfem_operator_problem.is_some();
     let production_shared_domain_required = matches!(
         request.execution_target,
         NativeModalExecutionTarget::ProductionCpu | NativeModalExecutionTarget::ProductionGpu
     ) && request.include_demag
         && request.spin_wave_bc_kind == "periodic"
-        && request
-            .k_vector_rad_m
-            .is_none_or(|values| values.iter().all(|value| value.abs() <= f64::EPSILON));
-    validate_native_modal_request_payload_ownership(
+        && request.k_vector_rad_m.is_none_or(|values| {
+            values
+                .iter()
+                .all(|value| value.abs() <= GAMMA_POINT_K_COMPONENT_ABS_TOLERANCE_RAD_PER_M)
+        });
+    validate_native_modal_request_payload_ownership_with_provider(
         request.execution_target,
         production_shared_domain_required,
         request.shared_domain_problem.is_some(),
@@ -997,6 +1051,7 @@ pub(crate) fn solve_native_modal_eigen(
         request.mfem_sparse_operator_problem.is_some(),
         request.poisson_airbox_block_problem.is_some(),
         request.tiny_validation_problem.is_some(),
+        nonzero_k_floquet_shared_domain_provider,
     )?;
     #[cfg(any(feature = "fem-gpu", feature = "fem-native"))]
     super::configure_managed_openmpi_environment();
@@ -1018,6 +1073,28 @@ fn validate_native_modal_request_payload_ownership(
     has_poisson_airbox_block_problem: bool,
     has_tiny_validation_problem: bool,
 ) -> Result<(), String> {
+    validate_native_modal_request_payload_ownership_with_provider(
+        execution_target,
+        production_shared_domain_required,
+        has_shared_domain_problem,
+        has_mfem_operator_problem,
+        has_mfem_sparse_operator_problem,
+        has_poisson_airbox_block_problem,
+        has_tiny_validation_problem,
+        false,
+    )
+}
+
+fn validate_native_modal_request_payload_ownership_with_provider(
+    execution_target: NativeModalExecutionTarget,
+    production_shared_domain_required: bool,
+    has_shared_domain_problem: bool,
+    has_mfem_operator_problem: bool,
+    has_mfem_sparse_operator_problem: bool,
+    has_poisson_airbox_block_problem: bool,
+    has_tiny_validation_problem: bool,
+    allow_shared_domain_with_mfem_operator: bool,
+) -> Result<(), String> {
     let production = matches!(
         execution_target,
         NativeModalExecutionTarget::ProductionCpu | NativeModalExecutionTarget::ProductionGpu
@@ -1029,6 +1106,7 @@ fn validate_native_modal_request_payload_ownership(
     }
     if production
         && has_shared_domain_problem
+        && !allow_shared_domain_with_mfem_operator
         && (has_mfem_operator_problem
             || has_mfem_sparse_operator_problem
             || has_poisson_airbox_block_problem
@@ -1056,6 +1134,15 @@ pub(crate) fn validate_planned_modal_execution_attestation(
         fullmag_ir::FemEigenEngineIR::K0PoissonAirboxCpuSchurSlepc => {
             (1, &["k0_poisson_airbox_cpu_schur_slepc"])
         }
+        fullmag_ir::FemEigenEngineIR::FloquetAirboxCpuSchurSlepc => (
+            1,
+            &[
+                "floquet_airbox_cpu_schur_slepc",
+                // Gamma samples in a Floquet path are normalized to the
+                // already-qualified periodic K0 solver.
+                "k0_poisson_airbox_cpu_schur_slepc",
+            ],
+        ),
         fullmag_ir::FemEigenEngineIR::GpuModalDeviceKrylov => (
             2,
             &[
@@ -1130,6 +1217,31 @@ fn positive_env_u64(primary: &str, alias: &str) -> u64 {
 fn solve_native_driven_frequency_response_impl(
     request: NativeDrivenFrequencyResponseRequest<'_>,
 ) -> Result<NativeDrivenFrequencyResponseResult, String> {
+    let identity_strings = request
+        .artifact_identity
+        .map(|identity| {
+            identity.validate().map_err(|error| error.to_string())?;
+            let value = |text: &str| CString::new(text).map_err(|error| error.to_string());
+            Ok::<_, String>([
+                value(&identity.session_id)?,
+                value(&identity.run_id)?,
+                value(&identity.stage_id)?,
+                value(&identity.runtime_id)?,
+            ])
+        })
+        .transpose()?;
+    let ffi_identity =
+        identity_strings
+            .as_ref()
+            .map(|values| ffi::FullmagFemFrequencyDomainArtifactIdentityV1 {
+                abi_version: ffi::FULLMAG_FEM_FREQUENCY_DOMAIN_ARTIFACT_IDENTITY_V1,
+                struct_size: std::mem::size_of::<ffi::FullmagFemFrequencyDomainArtifactIdentityV1>()
+                    as u32,
+                session_id: values[0].as_ptr(),
+                run_id: values[1].as_ptr(),
+                stage_id: values[2].as_ptr(),
+                runtime_id: values[3].as_ptr(),
+            });
     let output_directory = CString::new(request.output_directory.to_string_lossy().as_bytes())
         .map_err(|_| "native FEM frequency response output path contains NUL".to_string())?;
     let operator_diagnostics_json = request
@@ -1533,7 +1645,14 @@ fn solve_native_driven_frequency_response_impl(
         mfem_operator.and_then(|problem| problem.apply_demag_tangent_with_potential);
     let mut ffi_result = NativeDrivenFrequencyResponseFfiResult::default();
     let rc = unsafe {
-        if mfem_apply_demag_tangent_with_potential.is_some() {
+        if let Some(identity) = ffi_identity.as_ref() {
+            ffi::fullmag_fem_frequency_domain_solve_driven_response_with_identity_v1(
+                &ffi_request,
+                identity,
+                mfem_apply_demag_tangent_with_potential,
+                &mut ffi_result.inner,
+            )
+        } else if mfem_apply_demag_tangent_with_potential.is_some() {
             ffi::fullmag_fem_frequency_domain_solve_driven_response_v10(
                 &ffi_request,
                 mfem_apply_demag_tangent_with_potential,
@@ -1945,6 +2064,11 @@ fn solve_native_modal_eigen_impl(
         .map(CString::new)
         .transpose()
         .map_err(|_| "native FEM modal_eigen field term digest contains NUL".to_string())?;
+    let shared_anisotropy_term_digest = shared_domain
+        .and_then(|problem| problem.anisotropy_term_digest.as_deref())
+        .map(CString::new)
+        .transpose()
+        .map_err(|_| "native FEM modal_eigen anisotropy term digest contains NUL".to_string())?;
     let shared_demag_term_digest = shared_domain
         .and_then(|problem| problem.demag_term_digest.as_deref())
         .map(CString::new)
@@ -1989,7 +2113,7 @@ fn solve_native_modal_eigen_impl(
                         .as_ptr(),
                     exchange_term_digest: optional_str_ptr(shared_exchange_term_digest.as_ref()),
                     field_term_digest: optional_str_ptr(shared_field_term_digest.as_ref()),
-                    anisotropy_term_digest: std::ptr::null(),
+                    anisotropy_term_digest: optional_str_ptr(shared_anisotropy_term_digest.as_ref()),
                     dmi_term_digest: std::ptr::null(),
                     demag_term_digest: optional_str_ptr(shared_demag_term_digest.as_ref()),
                     operator_input_digest: shared_operator_input_digest
@@ -2011,10 +2135,18 @@ fn solve_native_modal_eigen_impl(
                     external_field_h_ext0_xyz_count: envelope.external_field_count,
                     alpha_per_node: problem.alpha_per_node.as_ptr(),
                     alpha_per_node_count: envelope.alpha_count,
-                    uniaxial_axis_xyz: std::ptr::null(),
-                    uniaxial_axis_xyz_count: 0,
-                    uniaxial_anisotropy_field_a_per_m: std::ptr::null(),
-                    uniaxial_anisotropy_field_count: 0,
+                    uniaxial_axis_xyz: if problem.uniaxial_axis_xyz.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        problem.uniaxial_axis_xyz.as_ptr()
+                    },
+                    uniaxial_axis_xyz_count: problem.uniaxial_axis_xyz.len() as u64,
+                    uniaxial_anisotropy_field_a_per_m: if problem.uniaxial_anisotropy_field_a_per_m.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        problem.uniaxial_anisotropy_field_a_per_m.as_ptr()
+                    },
+                    uniaxial_anisotropy_field_count: problem.uniaxial_anisotropy_field_a_per_m.len() as u64,
                     saturation_magnetisation_a_per_m: if problem
                         .saturation_magnetisation_a_per_m
                         .is_empty()
@@ -2178,52 +2310,41 @@ fn solve_native_modal_eigen_impl(
     });
     let has_floquet_k_vector =
         request.spin_wave_bc_kind == "floquet" && floquet_k_vector_rad_per_m.is_some();
-    let floquet_pair_ids = mfem_operator
-        .map(|problem| {
-            problem
-                .floquet_periodic_pairs
-                .iter()
-                .map(|pair| {
-                    pair.pair_id
-                        .map(|pair_id| {
-                            CString::new(pair_id.as_bytes()).map_err(|_| {
-                                "native FEM modal_eigen Floquet pair id contains NUL".to_string()
-                            })
-                        })
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let floquet_periodic_pairs = mfem_operator
-        .map(|problem| {
-            problem
-                .floquet_periodic_pairs
-                .iter()
-                .zip(floquet_pair_ids.iter())
-                .map(
-                    |(pair, pair_id)| ffi::fullmag_fem_frequency_domain_floquet_periodic_pair {
-                        pair_id: pair_id
-                            .as_ref()
-                            .map_or(std::ptr::null(), |value| value.as_ptr()),
-                        node_a: pair.node_a,
-                        node_b: pair.node_b,
-                        has_translation: pair.translation_m.is_some() as i32,
-                        translation_m: pair.translation_m.unwrap_or([0.0; 3]),
-                        has_phase: pair.phase_rad.is_some() as i32,
-                        phase_rad: pair.phase_rad.unwrap_or(0.0),
-                    },
-                )
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if let Some(problem) = mfem_operator {
-        validate_floquet_pair_phase_metadata(
-            floquet_k_vector_rad_per_m,
-            problem.floquet_periodic_pairs,
-        )?;
+    let pairs = mfem_operator
+        .map(|problem| problem.floquet_periodic_pairs)
+        .unwrap_or(request.shared_domain_floquet_periodic_pairs);
+    if mfem_operator.is_some() && !request.shared_domain_floquet_periodic_pairs.is_empty() {
+        return Err(
+            "native modal Floquet pairs have competing matrix and shared-domain owners".to_string(),
+        );
     }
+    validate_floquet_pair_phase_metadata(floquet_k_vector_rad_per_m, pairs)?;
+    let floquet_pair_ids = pairs
+        .iter()
+        .map(|pair| {
+            pair.pair_id
+                .map(|id| {
+                    CString::new(id.as_bytes())
+                        .map_err(|_| "native modal Floquet pair id contains NUL".to_string())
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let floquet_periodic_pairs = pairs
+        .iter()
+        .zip(&floquet_pair_ids)
+        .map(
+            |(pair, id)| ffi::fullmag_fem_frequency_domain_floquet_periodic_pair {
+                pair_id: id.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                node_a: pair.node_a,
+                node_b: pair.node_b,
+                has_translation: pair.translation_m.is_some() as i32,
+                translation_m: pair.translation_m.unwrap_or([0.0; 3]),
+                has_phase: pair.phase_rad.is_some() as i32,
+                phase_rad: pair.phase_rad.unwrap_or(0.0),
+            },
+        )
+        .collect::<Vec<_>>();
 
     let ffi_request = ffi::FullmagFemModalEigenRequest {
         abi_version: ffi::FULLMAG_FEM_FREQUENCY_DOMAIN_ABI_VERSION,
@@ -2416,8 +2537,12 @@ fn solve_native_modal_eigen_impl(
             .as_ref()
             .map(|value| value.as_ptr())
             .unwrap_or(std::ptr::null()),
-        dynamic_demag_k_tangent_matrix_row_major: std::ptr::null(),
-        dynamic_demag_k_tangent_matrix_value_count: 0,
+        dynamic_demag_k_tangent_matrix_row_major: mfem_operator
+            .and_then(|problem| problem.dynamic_demag_k_tangent_matrix_row_major)
+            .map_or(std::ptr::null(), slice_ptr_or_null),
+        dynamic_demag_k_tangent_matrix_value_count: mfem_operator
+            .and_then(|problem| problem.dynamic_demag_k_tangent_matrix_row_major)
+            .map_or(0, |values| values.len() as u64),
         struct_size: std::mem::size_of::<ffi::FullmagFemModalEigenRequest>() as u64,
         execution_target: match request.execution_target {
             NativeModalExecutionTarget::Auto => {
@@ -3536,7 +3661,12 @@ impl Default for NativeFrequencyDomainContractFfiResult {
 #[cfg(any(feature = "fem-gpu", feature = "fem-native"))]
 impl NativeFrequencyDomainContractFfiResult {
     fn to_owned_result(&self) -> NativeFrequencyDomainContractResult {
-        let modal_eigen = if self.inner.mode_count == 0 {
+        // An empty spectrum is still a modal solve. Keep its native execution
+        // attestation so the caller can report the actual solver outcome.
+        let modal_eigen = if self.inner.mode_count == 0
+            && self.inner.resolved_execution_target
+                == ffi::fullmag_fem_modal_execution_target::FULLMAG_FEM_MODAL_EXECUTION_AUTO
+        {
             None
         } else {
             Some(NativeModalEigenTypedResult {
@@ -4006,6 +4136,23 @@ mod tests {
 
     #[test]
     #[cfg(any(feature = "fem-gpu", feature = "fem-native"))]
+    fn empty_modal_spectrum_preserves_native_execution_attestation() {
+        let mut result = NativeFrequencyDomainContractFfiResult::default();
+        assert!(result.to_owned_result().modal_eigen.is_none());
+
+        result.inner.status = ffi::FullmagFemFrequencyDomainStatus::FULLMAG_FEM_FD_OK;
+        result.inner.resolved_execution_target =
+            ffi::fullmag_fem_modal_execution_target::FULLMAG_FEM_MODAL_EXECUTION_PRODUCTION_CPU;
+        let owned = result.to_owned_result();
+        let modal = owned
+            .modal_eigen
+            .expect("an empty modal solve retains its attestation");
+        assert!(modal.mode_lambda.is_empty());
+        assert_eq!(modal.resolved_execution_target, 1);
+    }
+
+    #[test]
+    #[cfg(any(feature = "fem-gpu", feature = "fem-native"))]
     fn measured_gpu_attestation_requires_complete_identity_and_state_prefix() {
         let mut attestation: ffi::FullmagFemModalGpuAttestationV1 = unsafe { std::mem::zeroed() };
         attestation.abi_version = ffi::FULLMAG_FEM_MODAL_GPU_ATTESTATION_V1_ABI_VERSION;
@@ -4362,6 +4509,9 @@ mod tests {
             term_presence_mask: (1 << 0) | (1 << 1) | (1 << 4),
             exchange_term_digest: Some(digest.to_string()),
             field_term_digest: Some(digest.to_string()),
+            anisotropy_term_digest: None,
+            uniaxial_axis_xyz: Vec::new(),
+            uniaxial_anisotropy_field_a_per_m: Vec::new(),
             demag_term_digest: Some(digest.to_string()),
             operator_input_digest: digest.to_string(),
             demag_provider_signature: Some(digest.to_string()),
@@ -4469,6 +4619,20 @@ mod tests {
         )
         .expect_err("shared-domain production must reject the runner MFEM pencil");
         assert!(error.contains("must not transport a runner-assembled operator"));
+
+        validate_native_modal_request_payload_ownership_with_provider(
+            NativeModalExecutionTarget::ProductionCpu,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            true,
+        )
+        .expect(
+            "the explicit nonzero-k shared-domain provider may combine an accepted payload with the phase-aware runner pencil",
+        );
     }
 
     #[test]
@@ -4556,6 +4720,33 @@ mod tests {
             "fem_eigen_native_gpu",
         )
         .expect_err("broad legacy engine id must not attest the exact GPU lane");
+        assert!(error.contains("native_modal_engine_mismatch"));
+    }
+
+    #[test]
+    fn planned_floquet_dynamic_demag_attestation_accepts_cpu_engine_and_gamma_alias() {
+        for engine_id in [
+            "floquet_airbox_cpu_schur_slepc",
+            "k0_poisson_airbox_cpu_schur_slepc",
+        ] {
+            validate_planned_modal_execution_attestation(
+                fullmag_ir::FemEigenEngineIR::FloquetAirboxCpuSchurSlepc,
+                NativeModalExecutionTarget::ProductionCpu,
+                Some(1),
+                0,
+                engine_id,
+            )
+            .expect("Floquet dynamic-demag CPU engine and its Gamma K0 alias are accepted");
+        }
+
+        let error = validate_planned_modal_execution_attestation(
+            fullmag_ir::FemEigenEngineIR::FloquetAirboxCpuSchurSlepc,
+            NativeModalExecutionTarget::ProductionCpu,
+            Some(1),
+            0,
+            "fem_eigen_cpu_baseline",
+        )
+        .expect_err("broad CPU baseline engine must not attest the exact Floquet lane");
         assert!(error.contains("native_modal_engine_mismatch"));
     }
 
@@ -4875,6 +5066,7 @@ mod tests {
             let frequencies_hz = [1.0e9];
             let err =
                 solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+                    artifact_identity: None,
                     node_count: 2,
                     tangent_dof_count: 4,
                     alpha: 0.01,
@@ -4942,6 +5134,7 @@ mod tests {
                 mfem_sparse_operator_problem: None,
                 poisson_airbox_block_problem: None,
                 shared_domain_problem: None,
+                shared_domain_floquet_periodic_pairs: &[],
             })
             .expect_err("native modal contract should require fem-native feature");
             assert!(err.contains("fem-native"));
@@ -4983,6 +5176,7 @@ mod tests {
                 mfem_sparse_operator_problem: None,
                 poisson_airbox_block_problem: None,
                 shared_domain_problem: None,
+                shared_domain_floquet_periodic_pairs: &[],
             })
             .expect("native modal contract should return a structured unavailable result");
             assert_eq!(result.status, NativeFrequencyDomainStatus::Unavailable);
@@ -5054,6 +5248,7 @@ mod tests {
             mfem_sparse_operator_problem: None,
         poisson_airbox_block_problem: None,
         shared_domain_problem: None,
+                shared_domain_floquet_periodic_pairs: &[],
         })
         .expect("native modal contract should return a structured unavailable result");
 
@@ -5125,6 +5320,7 @@ mod tests {
             mfem_sparse_operator_problem: None,
             poisson_airbox_block_problem: None,
             shared_domain_problem: None,
+            shared_domain_floquet_periodic_pairs: &[],
         })
         .expect("native modal validation solve should return a structured result");
 
@@ -5188,6 +5384,7 @@ mod tests {
             mfem_sparse_operator_problem: None,
             poisson_airbox_block_problem: None,
             shared_domain_problem: None,
+            shared_domain_floquet_periodic_pairs: &[],
         })
         .expect("native modal validation cancel should return a structured result");
 
@@ -5247,6 +5444,7 @@ mod tests {
             mfem_sparse_operator_problem: None,
             poisson_airbox_block_problem: None,
             shared_domain_problem: None,
+            shared_domain_floquet_periodic_pairs: &[],
         })
         .expect("native modal frequency-window validation solve should return a result");
 
@@ -5361,6 +5559,7 @@ mod tests {
                 stiffness_matrix_row_major: Some(&stiffness_matrix_row_major),
                 gyrotropic_matrix_row_major: Some(&gyrotropic_mass_row_major),
                 mass_matrix_row_major: Some(&mass_matrix_row_major),
+                dynamic_demag_k_tangent_matrix_row_major: None,
                 linearized_pencil_dependency_digest: Some("modal-payload-dependency-v1"),
                 linearized_pencil_gamma0_m_per_a_s: 1.0,
                 phase_convention: FrequencyDomainPhaseConvention::ExpIOmegaT,
@@ -5369,6 +5568,7 @@ mod tests {
             mfem_sparse_operator_problem: None,
         poisson_airbox_block_problem: None,
         shared_domain_problem: None,
+                shared_domain_floquet_periodic_pairs: &[],
         })
         .expect("native modal production payload should return a structured result");
 
@@ -5496,6 +5696,7 @@ mod tests {
                 stiffness_matrix_row_major: Some(&stiffness_matrix_row_major),
                 gyrotropic_matrix_row_major: Some(&gyrotropic_mass_row_major),
                 mass_matrix_row_major: Some(&mass_matrix_row_major),
+                dynamic_demag_k_tangent_matrix_row_major: None,
                 linearized_pencil_dependency_digest: None,
                 linearized_pencil_gamma0_m_per_a_s: 0.0,
                 phase_convention: FrequencyDomainPhaseConvention::ExpIOmegaT,
@@ -5504,6 +5705,7 @@ mod tests {
             mfem_sparse_operator_problem: None,
         poisson_airbox_block_problem: None,
         shared_domain_problem: None,
+                shared_domain_floquet_periodic_pairs: &[],
         })
         .expect("native modal shift-invert payload should return a structured result");
 
@@ -5578,6 +5780,7 @@ mod tests {
                 stiffness_matrix_row_major: Some(&stiffness_matrix_row_major),
                 gyrotropic_matrix_row_major: Some(&gyrotropic_mass_row_major),
                 mass_matrix_row_major: None,
+                dynamic_demag_k_tangent_matrix_row_major: None,
                 linearized_pencil_dependency_digest: None,
                 linearized_pencil_gamma0_m_per_a_s: 0.0,
                 phase_convention: FrequencyDomainPhaseConvention::ExpIOmegaT,
@@ -5586,6 +5789,7 @@ mod tests {
             mfem_sparse_operator_problem: None,
             poisson_airbox_block_problem: None,
             shared_domain_problem: None,
+            shared_domain_floquet_periodic_pairs: &[],
         })
         .expect("native modal Floquet payload should return a structured result");
 
@@ -5675,6 +5879,7 @@ mod tests {
         }];
 
         let err = solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+            artifact_identity: None,
             node_count: 2,
             tangent_dof_count: 4,
             alpha: 0.01,
@@ -5745,6 +5950,7 @@ mod tests {
         }];
 
         let result = solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+            artifact_identity: None,
             node_count: 2,
             tangent_dof_count: 4,
             alpha: 0.01,
@@ -5842,7 +6048,14 @@ mod tests {
             unique_suffix
         ));
 
+        let identity = crate::eigen::FrequencyDomainArtifactIdentity {
+            session_id: "session:native-fmr".into(),
+            run_id: "run:native-fmr-\"\\-α".into(),
+            stage_id: "stage:native-fmr".into(),
+            runtime_id: "runtime:native-fmr".into(),
+        };
         let result = solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+            artifact_identity: Some(&identity),
             node_count: 2,
             tangent_dof_count: 4,
             alpha: 0.01,
@@ -5895,6 +6108,16 @@ mod tests {
         .expect("native frequency response boundary should return a structured result");
 
         assert_eq!(result.status, NativeFrequencyDomainStatus::ValidationError);
+        let owned_manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&result.artifact_manifest_path).unwrap())
+                .unwrap();
+        assert_eq!(owned_manifest["session_id"], identity.session_id);
+        assert_eq!(owned_manifest["run_id"], identity.run_id);
+        assert_eq!(owned_manifest["stage_id"], identity.stage_id);
+        assert_eq!(owned_manifest["runtime_id"], identity.runtime_id);
+        assert!(!owned_manifest["resources"]
+            .to_string()
+            .contains("/v2/sessions/current/"));
         assert_eq!(result.total_frequency_count, 2);
         assert_eq!(result.completed_frequency_count, 0);
         assert_eq!(result.written_frequency_point_artifacts, 0);
@@ -5955,6 +6178,7 @@ mod tests {
         ));
 
         let result = solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+            artifact_identity: None,
             node_count: 2,
             tangent_dof_count: 4,
             alpha: 0.01,
@@ -6059,6 +6283,7 @@ mod tests {
         ));
 
         let result = solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+            artifact_identity: None,
             node_count: 1,
             tangent_dof_count: 2,
             alpha: 0.01,
@@ -6120,6 +6345,7 @@ mod tests {
         let drive_real = [1.0, 0.0];
 
         let result = solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+            artifact_identity: None,
             node_count: 1,
             tangent_dof_count: 2,
             alpha: 0.01,
@@ -6181,6 +6407,7 @@ mod tests {
         let drive_real = [1.0, 2.0];
 
         let result = solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+            artifact_identity: None,
             node_count: 1,
             tangent_dof_count: 2,
             alpha: 0.01,
@@ -6230,6 +6457,7 @@ mod tests {
 
         let gpu_result =
             solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+                artifact_identity: None,
                 node_count: 1,
                 tangent_dof_count: 2,
                 alpha: 0.01,
@@ -6405,7 +6633,14 @@ mod tests {
             unique_suffix
         ));
 
+        let identity = crate::eigen::FrequencyDomainArtifactIdentity {
+            session_id: "session:native-fmr".into(),
+            run_id: "run:native-fmr-\"\\-α".into(),
+            stage_id: "stage:native-fmr".into(),
+            runtime_id: "runtime:native-fmr".into(),
+        };
         let result = solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+            artifact_identity: Some(&identity),
             node_count: 1,
             tangent_dof_count: 2,
             alpha: 0.01,
@@ -6464,6 +6699,16 @@ mod tests {
             result.error_message,
             result.diagnostics_json
         );
+        let owned_manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&result.artifact_manifest_path).unwrap())
+                .unwrap();
+        assert_eq!(owned_manifest["session_id"], identity.session_id);
+        assert_eq!(owned_manifest["run_id"], identity.run_id);
+        assert_eq!(owned_manifest["stage_id"], identity.stage_id);
+        assert_eq!(owned_manifest["runtime_id"], identity.runtime_id);
+        assert!(!owned_manifest["resources"]
+            .to_string()
+            .contains("/v2/sessions/current/"));
         assert_eq!(result.total_frequency_count, 1);
         assert_eq!(result.completed_frequency_count, 1);
         assert_eq!(result.written_frequency_point_artifacts, 1);
@@ -6505,6 +6750,7 @@ mod tests {
         let demag_tangent_matrix = [0.5, 0.0, 0.0, 0.25];
 
         let result = solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+            artifact_identity: None,
             node_count: 1,
             tangent_dof_count: 2,
             alpha: 0.01,
@@ -6605,6 +6851,7 @@ mod tests {
         }];
 
         let result = solve_native_driven_frequency_response(NativeDrivenFrequencyResponseRequest {
+            artifact_identity: None,
             node_count: 4,
             tangent_dof_count: 8,
             alpha: 0.01,

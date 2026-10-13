@@ -8,6 +8,15 @@ const kernelProviderSource = readFileSync(
 ).replace(/\r\n/g, "\n");
 
 describe("KernelProvider performance contracts", () => {
+  it("preserves the kernel host across Fast Refresh through lazy state ownership", () => {
+    expect(kernelProviderSource).toContain(
+      "const [host] = useState(() => new DevelopmentKernelHost(createKernel));",
+    );
+    expect(kernelProviderSource).not.toContain(
+      "useMemo(() => new DevelopmentKernelHost(createKernel)",
+    );
+  });
+
   it("keeps the global shortcut listener stable across runtime resource updates", () => {
     expect(kernelProviderSource).toContain(
       "runtimeResourceDataRef.current = runtimeResourceData",
@@ -16,7 +25,7 @@ describe("KernelProvider performance contracts", () => {
       "resourceData: runtimeResourceDataRef.current",
     );
     expect(kernelProviderSource).toContain(
-      "}, [kernel, startupVisible]);",
+      "}, [kernel, sessionScopeKey, startupVisible, paused]);",
     );
     expect(kernelProviderSource).not.toContain(
       "}, [kernel, runtimeResourceData, startupVisible]);",
@@ -37,11 +46,26 @@ describe("KernelProvider performance contracts", () => {
       "function RealtimeConnector({ kernel }: { kernel: KernelApi }) {\n  const startupVisible",
     );
     expect(kernelProviderSource).not.toContain("if (startupVisible) {\n      return;\n    }\n\n    if (typeof WebSocket");
-    expect(kernelProviderSource).not.toContain("useSessionStatus");
+    expect(kernelProviderSource).not.toContain("useSessionStatus(");
     expect(kernelProviderSource).not.toContain(
       "resolveSimulationStartupOverlayState",
     );
     expect(kernelProviderSource).not.toContain("startupState.isVisible");
+  });
+
+  it("rebinds realtime when the request scope incarnation changes", () => {
+    expect(kernelProviderSource).toContain(
+      "const sessionScopeKey = sessionRequestScopeKey(sessionIdentity);",
+    );
+    expect(kernelProviderSource).toContain(
+      "const expectedRequestScopeEpoch = sessionIdentity?.requestScopeEpoch ?? null;",
+    );
+    expect(kernelProviderSource).toContain(
+      "const expectedSessionId = sessionIdentity?.sessionId ?? null;",
+    );
+    expect(kernelProviderSource).toContain(
+      "}, [kernel, sessionScopeKey, expectedRequestScopeEpoch, expectedSessionId, paused]);",
+    );
   });
 
   it("exports fullmag performance measures into diagnostics", () => {
@@ -124,7 +148,7 @@ describe("KernelProvider performance contracts", () => {
       "controlRoomRealtimeDisabledFromBrowser()",
     );
     expect(kernelProviderSource).toContain(
-      "if (controlRoomRealtimeDisabledFromBrowser())",
+      "!expectedSessionId || !expectedRequestScopeEpoch || controlRoomRealtimeDisabledFromBrowser()",
     );
   });
 

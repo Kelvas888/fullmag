@@ -5,6 +5,8 @@
 
 #![allow(non_camel_case_types)]
 
+pub mod node_map;
+
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
@@ -13,14 +15,18 @@ pub const FULLMAG_FEM_ERR_INVALID: i32 = -1;
 pub const FULLMAG_FEM_ERR_UNAVAILABLE: i32 = -2;
 pub const FULLMAG_FEM_ERR_INTERNAL: i32 = -3;
 pub const FULLMAG_FEM_ERR_INTERRUPTED: i32 = -4;
-pub const FULLMAG_FEM_REGIONAL_FIELD_DRIVE_ABI_VERSION: u32 = 2;
+pub const FULLMAG_FEM_REGIONAL_FIELD_DRIVE_ABI_VERSION: u32 = 3;
 pub const FULLMAG_FEM_STAGE_OERSTED_CALLBACK_ABI_VERSION: u32 = 1;
 pub const FULLMAG_FEM_STAGE_TRANSPORT_CALLBACK_ABI_VERSION: u32 = 1;
 pub const FULLMAG_FEM_STAGE_TRANSPORT_CALLBACK_ERROR_CAPACITY: usize = 256;
 pub const FULLMAG_FEM_STEADY_TRANSPORT_ABI_VERSION: u32 = 1;
 pub const FULLMAG_FEM_STEADY_TRANSPORT_M2_ABI_VERSION: u32 = 1;
+pub const FULLMAG_FEM_CHARGE_TRANSPORT_ABI_VERSION: u32 = 1;
 pub const FULLMAG_FEM_STEADY_TRANSPORT_RT0_ABI_VERSION: u32 = 1;
+pub const FULLMAG_FEM_STEADY_TRANSPORT_RT0_CHARGE_SNAPSHOT_ABI_VERSION: u32 = 1;
 pub const FULLMAG_FEM_STEADY_TRANSPORT_RT0_OERSTED_ABI_VERSION: u32 = 1;
+pub const FULLMAG_FEM_DIRECT_OERSTED_SNAPSHOT_ABI_VERSION: u32 = 1;
+pub const FULLMAG_FEM_DIRECT_OERSTED_SNAPSHOT_MAX_TARGETS: u64 = 1_000_000;
 pub const FULLMAG_FEM_STEADY_TRANSPORT_RT0_OERSTED_VECTOR_POTENTIAL_ABI_VERSION: u32 = 1;
 pub const FULLMAG_FEM_STEADY_TRANSPORT_RT0_CLOSURE_CLOSED_GEOMETRY: u32 = 1;
 pub const FULLMAG_FEM_STEADY_TRANSPORT_RT0_CLOSURE_EXTERNAL_LEAD: u32 = 2;
@@ -254,6 +260,8 @@ pub struct fullmag_fem_spatial_profile_desc {
     pub gaussian_sigma_y_m: f64,
     pub gaussian_wavelength_m: f64,
     pub gaussian_carrier_phase_rad: f64,
+    pub preprojected_h_xyz_a_per_m: *const f64,
+    pub preprojected_h_value_count: u64,
 }
 
 #[repr(C)]
@@ -410,6 +418,12 @@ pub struct fullmag_fem_stage_transport_callback_v1 {
 pub const FULLMAG_FEM_MESH_DESC_ABI_VERSION: u32 = 2;
 pub const FULLMAG_FEM_MESH_DESC_ABI_LAYOUT_FINGERPRINT: &str =
     "fullmag:fem-mesh-desc:abi:v2:lp64:size232:typed-csr-global-ordinals";
+pub const FULLMAG_FEM_MESH_SPACE_PREPARATION_ABI_VERSION: u32 = 1;
+pub const FULLMAG_FEM_MESH_SPACE_PREPARATION_PRODUCER_ID: &str = "fullmag.mfem.mesh_space";
+pub const FULLMAG_FEM_MESH_SPACE_PREPARATION_SCHEMA_VERSION: &str = "mfem_mesh_space_evidence.v1";
+pub const FULLMAG_FEM_MESH_SPACE_PREPARATION_PRODUCER_VERSION: &str = "1";
+pub const FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY: usize = 65;
+pub const FULLMAG_FEM_FE_FAMILY_H1: u32 = 1;
 pub const FULLMAG_FEM_MESH_ABI_LAYOUT_VERSION: u32 = 1;
 pub const FULLMAG_FEM_MESH_ABI_FIELD_COUNT: usize = 30;
 pub const FULLMAG_FEM_MESH_ABI_FINGERPRINT_CAPACITY: usize = 96;
@@ -458,6 +472,40 @@ pub struct fullmag_fem_mesh_desc {
     /// flat `[marker_a, marker_b] × count`.  Null/0 when not applicable.
     pub periodic_boundary_pair_markers: *const u32,
     pub periodic_boundary_pair_markers_len: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct fullmag_fem_mesh_space_preparation_request_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub mesh: *const fullmag_fem_mesh_desc,
+    pub fe_order: u32,
+    pub reserved_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct fullmag_fem_mesh_space_preparation_evidence_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub mesh_dimension: u32,
+    pub fe_family: u32,
+    pub fe_order: u32,
+    pub mesh_matches_canonical_input: u32,
+    pub node_count: u64,
+    pub cell_count: u64,
+    pub boundary_element_count: u64,
+    pub local_dof_count: u64,
+    pub true_dof_count: u64,
+    pub quality_sample_count: u64,
+    pub invalid_cell_count: u64,
+    pub min_jacobian_determinant: f64,
+    pub max_jacobian_determinant: f64,
+    pub topology_fingerprint: [c_char; FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY],
+    pub marker_map_fingerprint: [c_char; FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY],
+    pub quality_fingerprint: [c_char; FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY],
+    pub space_fingerprint: [c_char; FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY],
 }
 
 #[repr(C)]
@@ -517,6 +565,43 @@ const _: () = {
     assert!(std::mem::offset_of!(fullmag_fem_mesh_desc, periodic_node_pairs_len) == 208);
     assert!(std::mem::offset_of!(fullmag_fem_mesh_desc, periodic_boundary_pair_markers) == 216);
     assert!(std::mem::offset_of!(fullmag_fem_mesh_desc, periodic_boundary_pair_markers_len) == 224);
+    assert!(std::mem::size_of::<fullmag_fem_mesh_space_preparation_request_v1>() == 24);
+    assert!(std::mem::align_of::<fullmag_fem_mesh_space_preparation_request_v1>() == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_mesh_space_preparation_request_v1, mesh) == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_mesh_space_preparation_request_v1, fe_order) == 16);
+    assert!(std::mem::size_of::<fullmag_fem_mesh_space_preparation_evidence_v1>() == 360);
+    assert!(std::mem::align_of::<fullmag_fem_mesh_space_preparation_evidence_v1>() == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_mesh_space_preparation_evidence_v1, node_count) == 24);
+    assert!(
+        std::mem::offset_of!(
+            fullmag_fem_mesh_space_preparation_evidence_v1,
+            min_jacobian_determinant
+        ) == 80
+    );
+    assert!(
+        std::mem::offset_of!(
+            fullmag_fem_mesh_space_preparation_evidence_v1,
+            topology_fingerprint
+        ) == 96
+    );
+    assert!(
+        std::mem::offset_of!(
+            fullmag_fem_mesh_space_preparation_evidence_v1,
+            marker_map_fingerprint
+        ) == 161
+    );
+    assert!(
+        std::mem::offset_of!(
+            fullmag_fem_mesh_space_preparation_evidence_v1,
+            quality_fingerprint
+        ) == 226
+    );
+    assert!(
+        std::mem::offset_of!(
+            fullmag_fem_mesh_space_preparation_evidence_v1,
+            space_fingerprint
+        ) == 291
+    );
     assert!(std::mem::size_of::<fullmag_fem_mesh_abi_layout>() == 360);
     assert!(std::mem::align_of::<fullmag_fem_mesh_abi_layout>() == 8);
     assert!(std::mem::offset_of!(fullmag_fem_mesh_abi_layout, abi_version) == 0);
@@ -1019,6 +1104,26 @@ pub struct fullmag_fem_steady_transport_rt0_result_v1 {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub electric_potential_v: *mut f64,
+    pub electric_potential_v_capacity: u64,
+    pub electric_potential_v_len: u64,
+    pub stable_vertex_ids: *mut u64,
+    pub stable_vertex_ids_capacity: u64,
+    pub stable_vertex_ids_len: u64,
+    pub vertex_xyz_m: *mut f64,
+    pub vertex_xyz_m_capacity: u64,
+    pub vertex_xyz_m_len: u64,
+    pub stable_vertex_id_version: [c_char; 96],
+    pub source_view_identity_digest: [c_char; 65],
+    pub error_message: [c_char; 256],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct fullmag_fem_steady_transport_rt0_oersted_request_v1 {
     pub abi_version: u32,
     pub reserved_flags: u32,
@@ -1051,6 +1156,52 @@ pub struct fullmag_fem_steady_transport_rt0_oersted_result_v1 {
     pub source_view_identity_digest: [c_char; 65],
     pub error_message: [c_char; 256],
     pub diagnostics_json: [c_char; 1024],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_direct_oersted_target_record_v1 {
+    pub target_xyz_m: [f64; 3],
+    pub h_xyz_apm: [f64; 3],
+    pub estimated_error_apm: f64,
+    pub tolerance_apm: f64,
+    pub roundoff_indicator_apm: f64,
+    pub final_leaf_count: u64,
+    pub kernel_evaluations: u64,
+    pub ledger_leaf_visits: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_direct_oersted_snapshot_result_v1 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub target_records: *mut fullmag_fem_direct_oersted_target_record_v1,
+    pub target_records_capacity: u64,
+    pub target_records_len: u64,
+    pub source_target_pairs: u64,
+    pub refined_pairs: u64,
+    pub unconverged_pair_count: u64,
+    pub maximum_pair_error_apm: f64,
+    pub kernel_evaluations: u64,
+    pub ledger_leaf_visits: u64,
+    pub base_quadrature_order: i32,
+    pub maximum_subdivision_depth: i32,
+    pub absolute_tolerance_apm: f64,
+    pub relative_tolerance: f64,
+    pub relative_scale_floor_apm: f64,
+    pub maximum_source_target_pairs: u64,
+    pub maximum_final_leaves_per_target: u64,
+    pub maximum_kernel_evaluations: u64,
+    pub maximum_ledger_leaf_visits: u64,
+    pub schema_version: [c_char; 96],
+    pub operator_version: [c_char; 96],
+    pub quadrature_scope: [c_char; 32],
+    pub estimated_error_policy: [c_char; 96],
+    pub roundoff_indicator_policy: [c_char; 96],
+    pub source_view_identity_digest: [c_char; 65],
+    pub error_message: [c_char; 256],
 }
 
 #[repr(C)]
@@ -1137,6 +1288,295 @@ pub struct fullmag_fem_steady_transport_result_v1 {
     pub error_message: [c_char; 256],
     pub diagnostics_json: [c_char; 1024],
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_charge_transport_request_v1 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub execution_lane: fullmag_fem_steady_transport_execution_lane,
+    pub charge_gauge: fullmag_fem_steady_transport_charge_gauge,
+    pub constitutive_version: *const c_char,
+    pub operator_version: *const c_char,
+    pub physical_residual_version: *const c_char,
+    pub mesh: fullmag_fem_mesh_desc,
+    pub charge_conductivity_spm_per_element: *const f64,
+    pub charge_conductivity_spm_per_element_len: u64,
+    pub relative_tolerance: f64,
+    pub absolute_tolerance: f64,
+    pub maximum_iterations: u32,
+    pub dirichlet_boundary_attributes: *const u32,
+    pub dirichlet_boundary_values_v: *const f64,
+    pub dirichlet_boundary_count: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_charge_transport_result_v1 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub electric_potential_v: *mut f64,
+    pub electric_potential_v_capacity: u64,
+    pub electric_potential_v_len: u64,
+    pub charge_current_density_xyz_apm2: *mut f64,
+    pub charge_current_density_xyz_apm2_capacity: u64,
+    pub charge_current_density_xyz_apm2_len: u64,
+    pub charge_converged: i32,
+    pub charge_iterations: u32,
+    pub charge_relative_residual: f64,
+    pub net_boundary_current_a: f64,
+    pub current_density_volume_average_apm2: [f64; 3],
+    pub error_message: [c_char; 256],
+    pub diagnostics_json: [c_char; 1024],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_charge_transport_result_v2 {
+    pub base: fullmag_fem_charge_transport_result_v1,
+    pub dirichlet_boundary_currents_a: *mut f64,
+    pub dirichlet_boundary_currents_a_capacity: u64,
+    pub dirichlet_boundary_currents_a_len: u64,
+}
+
+pub const FULLMAG_FEM_CHARGE_TERMINAL_CURRENT_ABI_VERSION: u32 = 3;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_charge_transport_request_v3 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub base: fullmag_fem_charge_transport_request_v1,
+    pub terminal_attribute_offsets: *const u64,
+    pub terminal_attribute_offsets_len: u64,
+    pub terminal_boundary_attributes: *const u32,
+    pub terminal_boundary_attributes_len: u64,
+    pub requested_outward_currents_a: *const f64,
+    pub terminal_count: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_charge_transport_result_v3 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub base: fullmag_fem_charge_transport_result_v1,
+    pub terminal_voltages_v: *mut f64,
+    pub terminal_voltages_v_capacity: u64,
+    pub terminal_voltages_v_len: u64,
+    pub measured_outward_currents_a: *mut f64,
+    pub measured_outward_currents_a_capacity: u64,
+    pub measured_outward_currents_a_len: u64,
+    pub gauge_terminal_indices: *mut u32,
+    pub gauge_terminal_indices_capacity: u64,
+    pub gauge_terminal_indices_len: u64,
+}
+
+pub const FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_ABI_VERSION: u32 = 1;
+pub const FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY: usize = 96;
+pub const FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_BOUNDARY_INSULATING: u32 = 1;
+pub const FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_BOUNDARY_OUTER_ELECTRODE: u32 = 2;
+pub const FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_BOUNDARY_DEVICE_INTERFACE: u32 = 3;
+pub const FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_MAX_PAYLOAD_BYTES: usize = 128 << 20;
+pub const FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_LAYOUT_FINGERPRINT: &str =
+    "fullmag:fem-accepted-external-lead:abi:v1:canonical-owned-bundle";
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_accepted_external_lead_boundary_v1 {
+    pub vertex_ids: [u64; 3],
+    pub role: u32,
+    pub reserved: u32,
+    pub circuit_id: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_accepted_external_lead_branch_v1 {
+    pub id: *const c_char,
+    pub interface_pair_ids: *const *const c_char,
+    pub interface_pair_count: u64,
+    pub requested_device_outward_current_a: f64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_accepted_external_lead_request_v1 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub charge: fullmag_fem_accepted_terminal_charge_request_v1,
+    pub closure_revision: *const c_char,
+    pub device_vertex_ids: *const u64,
+    pub device_vertex_count: u64,
+    pub lead_vertex_ids: *const u64,
+    pub lead_vertex_count: u64,
+    pub boundary_faces: *const fullmag_fem_accepted_external_lead_boundary_v1,
+    pub boundary_face_count: u64,
+    pub branches: *const fullmag_fem_accepted_external_lead_branch_v1,
+    pub branch_count: u64,
+    pub target_xyz_m: *const f64,
+    pub target_count: u64,
+    pub base_quadrature_order: i32,
+    pub maximum_subdivision_depth: i32,
+    pub absolute_tolerance_apm: f64,
+    pub relative_tolerance: f64,
+    pub maximum_source_target_pairs: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_accepted_external_lead_result_v1 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub canonical_payload: *mut u8,
+    pub canonical_payload_capacity: u64,
+    pub canonical_payload_len: u64,
+    pub digest_schema: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub operator_version: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub layout_fingerprint: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub content_sha256: [c_char; 65],
+    pub error_message: [c_char; 256],
+}
+
+pub const FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_ABI_VERSION: u32 = 2;
+pub const FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_LAYOUT_FINGERPRINT: &str =
+    "fullmag:fem-accepted-external-lead:abi:v2:owned-current-display";
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_accepted_external_lead_result_v2 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub canonical_payload: *mut u8,
+    pub canonical_payload_capacity: u64,
+    pub canonical_payload_len: u64,
+    pub digest_schema: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub operator_version: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub layout_fingerprint: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub content_sha256: [c_char; 65],
+    pub error_message: [c_char; 256],
+    pub current_display_payload: *mut u8,
+    pub current_display_payload_capacity: u64,
+    pub current_display_payload_len: u64,
+    pub current_display_digest_schema: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub current_display_operator_version: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub current_display_content_sha256: [c_char; 65],
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<fullmag_fem_accepted_external_lead_boundary_v1>() == 40);
+    assert!(std::mem::size_of::<fullmag_fem_accepted_external_lead_branch_v1>() == 32);
+    assert!(std::mem::size_of::<fullmag_fem_accepted_external_lead_request_v1>() == 496);
+    assert!(std::mem::align_of::<fullmag_fem_accepted_external_lead_request_v1>() == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_request_v1, charge) == 16);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_request_v1, closure_revision) == 376);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_request_v1, target_xyz_m) == 448);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_request_v1, maximum_source_target_pairs) == 488);
+    assert!(std::mem::size_of::<fullmag_fem_accepted_external_lead_result_v1>() == 656);
+    assert!(std::mem::align_of::<fullmag_fem_accepted_external_lead_result_v1>() == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v1, canonical_payload) == 16);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v1, content_sha256) == 328);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v1, error_message) == 393);
+    assert!(std::mem::size_of::<fullmag_fem_accepted_external_lead_result_v2>() == 944);
+    assert!(std::mem::align_of::<fullmag_fem_accepted_external_lead_result_v2>() == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, canonical_payload) == 16);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, content_sha256) == 328);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, error_message) == 393);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_payload) == 656);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_payload_capacity) == 664);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_payload_len) == 672);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_digest_schema) == 680);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_operator_version) == 776);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_content_sha256) == 872);
+};
+
+pub const FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_ABI_VERSION: u32 = 1;
+pub const FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_TEXT_CAPACITY: usize = 96;
+pub const FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_MAX_PAYLOAD_BYTES: usize = 128 << 20;
+pub const FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_LAYOUT_FINGERPRINT: &str =
+    "fullmag:fem-accepted-terminal-charge:abi:v1:canonical-owned-record";
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_accepted_terminal_charge_terminal_v1 {
+    pub id: *const c_char,
+    pub boundary_face_vertex_ids: *const u64,
+    pub face_count: u64,
+    pub requested_outward_current_a: f64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_accepted_terminal_charge_interface_v1 {
+    pub id: *const c_char,
+    pub first_face_vertex_ids: [u64; 3],
+    pub second_face_vertex_ids: [u64; 3],
+    pub vertex_pairs: [[u64; 2]; 3],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_accepted_terminal_charge_request_v1 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub execution_lane: fullmag_fem_steady_transport_execution_lane,
+    pub reserved_execution: u32,
+    pub mesh: fullmag_fem_mesh_desc,
+    pub stable_vertex_identities: fullmag_fem_steady_transport_rt0_stable_vertex_identities_v1,
+    pub conductivity_spm_per_element: *const f64,
+    pub conductivity_spm_per_element_len: u64,
+    pub terminals: *const fullmag_fem_accepted_terminal_charge_terminal_v1,
+    pub terminal_count: u64,
+    pub interfaces: *const fullmag_fem_accepted_terminal_charge_interface_v1,
+    pub interface_count: u64,
+    pub absolute_jump_tolerance_v: f64,
+    pub relative_jump_tolerance: f64,
+    pub algebraic_relative_tolerance: f64,
+    pub maximum_iterations: u32,
+    pub reserved_solver: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_accepted_terminal_charge_result_v1 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub canonical_payload: *mut u8,
+    pub canonical_payload_capacity: u64,
+    pub canonical_payload_len: u64,
+    pub digest_schema: [c_char; FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_TEXT_CAPACITY],
+    pub operator_version: [c_char; FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_TEXT_CAPACITY],
+    pub layout_fingerprint: [c_char; FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_TEXT_CAPACITY],
+    pub content_sha256: [c_char; 65],
+    pub error_message: [c_char; 256],
+}
+
+// Production builds enforce the new ABI independently of unit-test compilation.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<fullmag_fem_accepted_terminal_charge_terminal_v1>() == 32);
+    assert!(std::mem::size_of::<fullmag_fem_accepted_terminal_charge_interface_v1>() == 104);
+    assert!(std::mem::size_of::<fullmag_fem_accepted_terminal_charge_request_v1>() == 360);
+    assert!(std::mem::align_of::<fullmag_fem_accepted_terminal_charge_request_v1>() == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_terminal_charge_request_v1, mesh) == 24);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_terminal_charge_request_v1, stable_vertex_identities) == 256);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_terminal_charge_request_v1, maximum_iterations) == 352);
+    assert!(std::mem::size_of::<fullmag_fem_accepted_terminal_charge_result_v1>() == 656);
+    assert!(std::mem::align_of::<fullmag_fem_accepted_terminal_charge_result_v1>() == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_terminal_charge_result_v1, canonical_payload) == 16);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_terminal_charge_result_v1, content_sha256) == 328);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_terminal_charge_result_v1, error_message) == 393);
+};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -1644,6 +2084,30 @@ pub struct fullmag_fem_frequency_domain_dmi_element {
     pub d: f64,
     pub normal: [f64; 3],
 }
+
+pub const FULLMAG_FEM_FREQUENCY_DOMAIN_ARTIFACT_IDENTITY_V1: u32 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FullmagFemFrequencyDomainArtifactIdentityV1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub session_id: *const c_char,
+    pub run_id: *const c_char,
+    pub stage_id: *const c_char,
+    pub runtime_id: *const c_char,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<FullmagFemFrequencyDomainArtifactIdentityV1>() == 40);
+    assert!(std::mem::align_of::<FullmagFemFrequencyDomainArtifactIdentityV1>() == 8);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, abi_version) == 0);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, struct_size) == 4);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, session_id) == 8);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, run_id) == 16);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, stage_id) == 24);
+    assert!(std::mem::offset_of!(FullmagFemFrequencyDomainArtifactIdentityV1, runtime_id) == 32);
+};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -2745,9 +3209,39 @@ extern "C" {
         out_layout: *mut fullmag_fem_regional_field_drive_abi_layout,
     ) -> i32;
     pub fn fullmag_fem_get_mesh_abi_layout(out_layout: *mut fullmag_fem_mesh_abi_layout) -> i32;
+    pub fn fullmag_fem_prepare_mesh_space_v1(
+        request: *const fullmag_fem_mesh_space_preparation_request_v1,
+        out_evidence: *mut fullmag_fem_mesh_space_preparation_evidence_v1,
+        error_message: *mut c_char,
+        error_message_capacity: u64,
+    ) -> i32;
     pub fn fullmag_fem_solve_steady_transport_v1(
         request: *const fullmag_fem_steady_transport_request_v1,
         result: *mut fullmag_fem_steady_transport_result_v1,
+    ) -> i32;
+    pub fn fullmag_fem_solve_charge_transport_v1(
+        request: *const fullmag_fem_charge_transport_request_v1,
+        result: *mut fullmag_fem_charge_transport_result_v1,
+    ) -> i32;
+    pub fn fullmag_fem_solve_charge_transport_v2(
+        request: *const fullmag_fem_charge_transport_request_v1,
+        result: *mut fullmag_fem_charge_transport_result_v2,
+    ) -> i32;
+    pub fn fullmag_fem_solve_charge_transport_v3(
+        request: *const fullmag_fem_charge_transport_request_v3,
+        result: *mut fullmag_fem_charge_transport_result_v3,
+    ) -> i32;
+    pub fn fullmag_fem_solve_accepted_external_lead_field_v1(
+        request: *const fullmag_fem_accepted_external_lead_request_v1,
+        result: *mut fullmag_fem_accepted_external_lead_result_v1,
+    ) -> i32;
+    pub fn fullmag_fem_solve_accepted_external_lead_field_v2(
+        request: *const fullmag_fem_accepted_external_lead_request_v1,
+        result: *mut fullmag_fem_accepted_external_lead_result_v2,
+    ) -> i32;
+    pub fn fullmag_fem_solve_accepted_terminal_charge_v1(
+        request: *const fullmag_fem_accepted_terminal_charge_request_v1,
+        result: *mut fullmag_fem_accepted_terminal_charge_result_v1,
     ) -> i32;
     pub fn fullmag_fem_solve_steady_transport_m2_v1(
         request: *const fullmag_fem_steady_transport_m2_request_v1,
@@ -2764,6 +3258,27 @@ extern "C" {
     pub fn fullmag_fem_solve_steady_transport_rt0_oersted_vector_potential_v1(
         request: *const fullmag_fem_steady_transport_rt0_oersted_vector_potential_request_v1,
         result: *mut fullmag_fem_steady_transport_rt0_oersted_vector_potential_result_v1,
+    ) -> i32;
+    pub fn fullmag_fem_solve_steady_transport_rt0_with_charge_snapshot_v1(
+        request: *const fullmag_fem_steady_transport_rt0_request_v1,
+        result: *mut fullmag_fem_steady_transport_rt0_result_v1,
+        charge_snapshot: *mut fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1,
+    ) -> i32;
+    pub fn fullmag_fem_solve_steady_transport_rt0_oersted_with_charge_snapshot_v1(
+        request: *const fullmag_fem_steady_transport_rt0_oersted_request_v1,
+        result: *mut fullmag_fem_steady_transport_rt0_oersted_result_v1,
+        charge_snapshot: *mut fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1,
+    ) -> i32;
+    pub fn fullmag_fem_solve_steady_transport_rt0_oersted_with_snapshots_v1(
+        request: *const fullmag_fem_steady_transport_rt0_oersted_request_v1,
+        result: *mut fullmag_fem_steady_transport_rt0_oersted_result_v1,
+        charge_snapshot: *mut fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1,
+        quadrature_snapshot: *mut fullmag_fem_direct_oersted_snapshot_result_v1,
+    ) -> i32;
+    pub fn fullmag_fem_solve_steady_transport_rt0_oersted_vector_potential_with_charge_snapshot_v1(
+        request: *const fullmag_fem_steady_transport_rt0_oersted_vector_potential_request_v1,
+        result: *mut fullmag_fem_steady_transport_rt0_oersted_vector_potential_result_v1,
+        charge_snapshot: *mut fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1,
     ) -> i32;
     pub fn fullmag_fem_get_availability_info(out_info: *mut fullmag_fem_availability_info) -> i32;
     pub fn fullmag_fem_get_frequency_domain_availability_info(
@@ -2826,6 +3341,17 @@ extern "C" {
             fullmag_fem_frequency_domain_apply_with_potential_callback,
         out_result: *mut fullmag_fem_frequency_domain_solve_result,
     ) -> i32;
+    pub fn fullmag_fem_frequency_domain_solve_driven_response_with_identity_v1(
+        request: *const fullmag_fem_frequency_domain_driven_response_request,
+        identity: *const FullmagFemFrequencyDomainArtifactIdentityV1,
+        mfem_apply_demag_tangent_with_potential: fullmag_fem_frequency_domain_apply_with_potential_callback,
+        out_result: *mut fullmag_fem_frequency_domain_solve_result,
+    ) -> i32;
+
+    pub fn fullmag_fem_frequency_domain_validate_artifact_identity_v1(
+        identity: *const FullmagFemFrequencyDomainArtifactIdentityV1,
+    ) -> i32;
+
     pub fn fullmag_fem_frequency_domain_solve_driven_response_v10(
         request: *const fullmag_fem_frequency_domain_driven_response_request,
         mfem_apply_demag_tangent_with_potential:
@@ -2867,6 +3393,11 @@ extern "C" {
     pub fn fullmag_fem_backend_begin_stage(
         handle: *mut fullmag_fem_backend,
         stage_start_time_s: f64,
+    ) -> i32;
+    pub fn fullmag_fem_backend_begin_stage_v2(
+        handle: *mut fullmag_fem_backend,
+        segment_start_time_s: f64,
+        waveform_origin_time_s: f64,
     ) -> i32;
     pub fn fullmag_fem_backend_set_gpu_execution_request_v1(
         handle: *mut fullmag_fem_backend,
@@ -3124,7 +3655,51 @@ extern "C" {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "build-native")]
+    #[test]
+    fn artifact_identity_v1_native_boundary_rejects_aliases_and_bad_layout() {
+        use std::ffi::CString;
+        let owner = CString::new("owner:exact").unwrap();
+        let mut identity = super::FullmagFemFrequencyDomainArtifactIdentityV1 {
+            abi_version: super::FULLMAG_FEM_FREQUENCY_DOMAIN_ARTIFACT_IDENTITY_V1,
+            struct_size: std::mem::size_of::<super::FullmagFemFrequencyDomainArtifactIdentityV1>() as u32,
+            session_id: owner.as_ptr(),
+            run_id: owner.as_ptr(),
+            stage_id: owner.as_ptr(),
+            runtime_id: owner.as_ptr(),
+        };
+        let validate = |value: &super::FullmagFemFrequencyDomainArtifactIdentityV1| unsafe {
+            super::fullmag_fem_frequency_domain_validate_artifact_identity_v1(value)
+        };
+        assert_eq!(validate(&identity), super::FULLMAG_FEM_OK);
+        for invalid in ["", "current", "Run:CURRENT", "scope:Current", "runtime:not_provided", "\u{a0}CURRENT\u{a0}", "run:\u{85}"] {
+            let candidate = CString::new(invalid).unwrap();
+            identity.run_id = candidate.as_ptr();
+            assert_eq!(validate(&identity), super::FULLMAG_FEM_ERR_INVALID, "{invalid:?}");
+        }
+        let malformed_utf8 = CString::new(vec![0xc0, 0xaf]).unwrap();
+        identity.run_id = malformed_utf8.as_ptr();
+        assert_eq!(validate(&identity), super::FULLMAG_FEM_ERR_INVALID);
+        identity.run_id = owner.as_ptr();
+        identity.abi_version = 99;
+        assert_eq!(validate(&identity), super::FULLMAG_FEM_ERR_INVALID);
+        identity.abi_version = super::FULLMAG_FEM_FREQUENCY_DOMAIN_ARTIFACT_IDENTITY_V1;
+        identity.struct_size = 0;
+        assert_eq!(validate(&identity), super::FULLMAG_FEM_ERR_INVALID);
+        assert_eq!(unsafe {
+            super::fullmag_fem_frequency_domain_validate_artifact_identity_v1(std::ptr::null())
+        }, super::FULLMAG_FEM_ERR_INVALID);
+    }
+
     use super::*;
+
+    #[test]
+    fn stage_clock_v2_preserves_the_legacy_symbol() {
+        let _legacy: unsafe extern "C" fn(*mut fullmag_fem_backend, f64) -> i32 =
+            fullmag_fem_backend_begin_stage;
+        let _split_clock: unsafe extern "C" fn(*mut fullmag_fem_backend, f64, f64) -> i32 =
+            fullmag_fem_backend_begin_stage_v2;
+    }
 
     #[test]
     fn typed_mesh_v2_abi_layout_and_wire_codes_are_frozen() {
@@ -3559,6 +4134,82 @@ mod tests {
     }
 
     #[test]
+    fn charge_transport_v1_layout_is_versioned_and_stable() {
+        assert_eq!(FULLMAG_FEM_CHARGE_TRANSPORT_ABI_VERSION, 1);
+        assert_eq!(
+            std::mem::size_of::<fullmag_fem_charge_transport_request_v1>(),
+            344
+        );
+        assert_eq!(
+            std::mem::align_of::<fullmag_fem_charge_transport_request_v1>(),
+            8
+        );
+        assert_eq!(
+            std::mem::offset_of!(fullmag_fem_charge_transport_request_v1, abi_version),
+            0
+        );
+        assert_eq!(
+            std::mem::offset_of!(fullmag_fem_charge_transport_request_v1, mesh),
+            48
+        );
+        assert_eq!(
+            std::mem::offset_of!(
+                fullmag_fem_charge_transport_request_v1,
+                charge_conductivity_spm_per_element
+            ),
+            280
+        );
+        assert_eq!(
+            std::mem::offset_of!(
+                fullmag_fem_charge_transport_request_v1,
+                dirichlet_boundary_attributes
+            ),
+            320
+        );
+        assert_eq!(
+            std::mem::size_of::<fullmag_fem_charge_transport_result_v1>(),
+            1392
+        );
+        assert_eq!(
+            std::mem::align_of::<fullmag_fem_charge_transport_result_v1>(),
+            8
+        );
+        assert_eq!(
+            std::mem::offset_of!(fullmag_fem_charge_transport_result_v1, electric_potential_v),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(
+                fullmag_fem_charge_transport_result_v1,
+                charge_current_density_xyz_apm2
+            ),
+            40
+        );
+        assert_eq!(
+            std::mem::offset_of!(
+                fullmag_fem_charge_transport_result_v1,
+                current_density_volume_average_apm2
+            ),
+            88
+        );
+        assert_eq!(
+            std::mem::offset_of!(fullmag_fem_charge_transport_result_v1, error_message),
+            112
+        );
+        assert_eq!(
+            std::mem::size_of::<fullmag_fem_charge_transport_result_v2>(),
+            1416
+        );
+        assert_eq!(
+            std::mem::offset_of!(
+                fullmag_fem_charge_transport_result_v2,
+                dirichlet_boundary_currents_a
+            ),
+            1392
+        );
+    }
+
+    #[test]
     fn steady_transport_m2_request_keeps_v1_as_a_nested_prefix() {
         assert_eq!(FULLMAG_FEM_STEADY_TRANSPORT_M2_ABI_VERSION, 1);
         assert_eq!(
@@ -3624,6 +4275,25 @@ mod tests {
             402
         );
         assert_eq!(FULLMAG_FEM_STEADY_TRANSPORT_RT0_OERSTED_ABI_VERSION, 1);
+        assert_eq!(FULLMAG_FEM_STEADY_TRANSPORT_RT0_CHARGE_SNAPSHOT_ABI_VERSION, 1);
+        assert_eq!(
+            std::mem::size_of::<fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1>(),
+            512
+        );
+        assert_eq!(
+            std::mem::offset_of!(
+                fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1,
+                electric_potential_v
+            ),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(
+                fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1,
+                source_view_identity_digest
+            ),
+            184
+        );
         assert_eq!(
             std::mem::offset_of!(fullmag_fem_steady_transport_rt0_oersted_request_v1, rt0),
             16

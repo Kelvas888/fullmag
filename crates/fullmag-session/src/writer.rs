@@ -18,6 +18,18 @@ const LOCK_DESCRIPTOR: &[u8] = b"fullmag.writer.lock.v1\n";
 const LOCK_DESCRIPTOR_PATH: &str = "WRITER.lock";
 const OWNER_RECORD_PATH: &str = "WRITER.owner.json";
 
+/// A transient conflict with an active native writer, safe to retry later.
+#[derive(Debug)]
+pub struct StoreWriterBusy;
+
+impl std::fmt::Display for StoreWriterBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("session store writer is busy")
+    }
+}
+
+impl std::error::Error for StoreWriterBusy {}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct OwnerRecord {
     schema: String,
@@ -30,8 +42,22 @@ struct OwnerRecord {
     released: bool,
 }
 
-struct Held {
+// Owns only a successfully acquired native lock, including admission failures.
+struct NativeLock {
     file: File,
+}
+
+impl Drop for NativeLock {
+    fn drop(&mut self) {
+        // dup/fork may keep the open file description alive after our close.
+        if let Err(error) = File::unlock(&self.file) {
+            tracing::error!(%error, "could not release native writer lock");
+        }
+    }
+}
+
+struct Held {
+    lock: NativeLock,
     thread: ThreadId,
     depth: usize,
     record: OwnerRecord,
@@ -62,8 +88,13 @@ impl Writer {
             .lock()
             .map_err(|_| anyhow::anyhow!("writer mutex poisoned"))?;
         if let Some(active) = held.as_mut() {
+            if active.depth == 0 {
+                // A failed explicit unlock leaves a depth-zero sentinel and
+                // keeps the native descriptor open until this Writer drops.
+                return Err(StoreWriterBusy.into());
+            }
             if active.thread != std::thread::current().id() {
-                bail!("session store writer is busy on another thread");
+                return Err(StoreWriterBusy.into());
             }
             let mut record = active.record.clone();
             record.heartbeat_at = chrono::Utc::now();
@@ -79,7 +110,7 @@ impl Writer {
         if checked_path(&self.root, "LOCK")?.exists() {
             bail!("legacy session LOCK requires controlled owner recovery before writing");
         }
-        let file = open_lock_descriptor(&self.root)?;
+        let lock = open_lock_descriptor(&self.root)?;
         let host = hostname()?;
         if let Some(previous) = read_owner_record(&self.root)? {
             if previous.schema != "fullmag.writer.v1" {
@@ -109,7 +140,7 @@ impl Writer {
         crate::durability::sync_directory(&self.root)?;
         let token = record.token.clone();
         *held = Some(Held {
-            file,
+            lock,
             thread: std::thread::current().id(),
             depth: 1,
             record,
@@ -131,22 +162,31 @@ impl Drop for WriteTransaction {
             tracing::error!("refusing release of a different writer owner token");
             return;
         }
+        if active.depth == 0 {
+            tracing::error!("refusing release after writer lease depth already reached zero");
+            return;
+        }
         active.depth -= 1;
         if active.depth == 0 {
             active.record.released = true;
             active.record.heartbeat_at = chrono::Utc::now();
             if let Err(error) = write_owner_record(&self.writer.root, &active.record) {
-                tracing::error!(%error, "could not persist writer release; native handle still closes");
+                tracing::error!(%error, "could not persist writer release before native unlock");
             }
-            // Closing our own descriptor releases only our own native lock.
+            // Unlock the shared open-file-description lock before closing our
+            // descriptor. Cloned/inherited descriptors can outlive this token.
+            if let Err(error) = active.lock.file.unlock() {
+                tracing::error!(%error, "could not unlock native writer descriptor; retaining it fail-closed");
+                return;
+            }
             *held = None;
         }
     }
 }
 
-fn open_lock_descriptor(root: &Path) -> Result<File> {
+fn open_lock_descriptor(root: &Path) -> Result<NativeLock> {
     let path = checked_path(root, LOCK_DESCRIPTOR_PATH)?;
-    let mut file = match OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
@@ -161,17 +201,18 @@ fn open_lock_descriptor(root: &Path) -> Result<File> {
 
     match file.try_lock() {
         Ok(()) => {}
-        Err(TryLockError::WouldBlock) => bail!("session store writer is busy"),
+        Err(TryLockError::WouldBlock) => return Err(StoreWriterBusy.into()),
         Err(TryLockError::Error(error)) => {
             return Err(error).context("acquiring native session writer lock");
         }
     }
 
+    let mut lock = NativeLock { file };
     let mut descriptor = Vec::new();
-    file.read_to_end(&mut descriptor)?;
+    lock.file.read_to_end(&mut descriptor)?;
     if descriptor.is_empty() {
-        file.write_all(LOCK_DESCRIPTOR)?;
-        file.sync_all()?;
+        lock.file.write_all(LOCK_DESCRIPTOR)?;
+        lock.file.sync_all()?;
         crate::durability::sync_directory(root)?;
     } else if descriptor != LOCK_DESCRIPTOR {
         bail!(
@@ -180,7 +221,7 @@ fn open_lock_descriptor(root: &Path) -> Result<File> {
         );
     }
 
-    Ok(file)
+    Ok(lock)
 }
 
 fn read_owner_record(root: &Path) -> Result<Option<OwnerRecord>> {
@@ -348,6 +389,77 @@ mod tests {
             std::fs::read(root.join(LOCK_DESCRIPTOR_PATH)).unwrap(),
             LOCK_DESCRIPTOR
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn final_lease_unlocks_while_a_duplicated_descriptor_stays_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let writer = Writer::new(root.clone());
+        let outer = writer.acquire().unwrap();
+        let inner = writer.acquire().unwrap();
+        // dup and fork share the same Linux flock open file description.
+        let duplicate = writer
+            .held
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .lock
+            .file
+            .try_clone()
+            .unwrap();
+        let competitor = Writer::new(root.clone());
+        assert!(competitor
+            .acquire()
+            .err()
+            .expect("active owner must exclude another handle")
+            .is::<StoreWriterBusy>());
+        drop(outer);
+        assert!(competitor
+            .acquire()
+            .err()
+            .expect("nested owner must keep the native lock")
+            .is::<StoreWriterBusy>());
+        drop(inner);
+        // Old close-only release fails here until duplicate is also closed.
+        let successor = competitor.acquire().unwrap();
+        drop(duplicate);
+        let third_writer = Writer::new(root);
+        assert!(third_writer
+            .acquire()
+            .err()
+            .expect("dropping the old duplicate must not unlock the successor")
+            .is::<StoreWriterBusy>());
+        drop(successor);
+        let third = third_writer.acquire().unwrap();
+        drop(third);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admission_error_unlocks_while_a_duplicated_descriptor_stays_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut duplicate = None;
+        let refused: Result<()> = (|| {
+            let lock = open_lock_descriptor(root)?;
+            duplicate = Some(lock.file.try_clone()?);
+            // Admission errors must drop the local guard before publishing Held.
+            bail!("simulated admission refusal");
+        })();
+        assert!(refused.is_err());
+        let duplicate = duplicate.unwrap();
+        let next = open_lock_descriptor(root).unwrap();
+        drop(duplicate);
+        assert!(open_lock_descriptor(root)
+            .err()
+            .expect("old duplicate must not release the new owner's lock")
+            .is::<StoreWriterBusy>());
+        drop(next);
+        drop(open_lock_descriptor(root).unwrap());
     }
 
     #[test]

@@ -20,6 +20,7 @@ describe("generated OpenAPI v2 transport", () => {
         "/v2/sessions/current/data/fields/{quantity_id}/samples/vector"
       ].get.responses["200"].headers;
     const expected = {
+      "x-fullmag-artifact-generation-id": "string",
       "x-fullmag-component": "string",
       "x-fullmag-domain-generation-id": "string",
       "x-fullmag-encoding": "string",
@@ -161,6 +162,12 @@ describe("generated OpenAPI v2 transport", () => {
     for (const parameter of document.paths[
       "/v2/sessions/current/data/fields/{quantity_id}/planar-monitors/{monitor_id}/scalar"
     ].get.parameters) {
+      // Shared parameters (for example the session scope header) are `$ref`
+      // entries without an inline name or schema.
+      if (parameter.$ref) {
+        expect(parameter.$ref).toMatch(/^#\/components\/parameters\//);
+        continue;
+      }
       if (parameter.name.startsWith("expected_")) {
         expect(parameter.schema.type, parameter.name).toBe("string");
       }

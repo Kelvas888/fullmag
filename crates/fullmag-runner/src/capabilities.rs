@@ -887,6 +887,7 @@ fn base_capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilities {
                 QuantityId::HEx,
                 QuantityId::HDemag,
                 QuantityId::HExt,
+                QuantityId::HAnt,
                 QuantityId::Torque,
                 QuantityId::HEff,
                 QuantityId::HAni,
@@ -905,6 +906,7 @@ fn base_capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilities {
                 QuantityId::HEx,
                 QuantityId::HDemag,
                 QuantityId::HExt,
+                QuantityId::HAnt,
                 QuantityId::HEff,
                 QuantityId::HAni,
                 QuantityId::HDmi,
@@ -1021,7 +1023,8 @@ fn base_capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilities {
 }
 
 pub(crate) fn capabilities_for_fem_eigen_engine(engine: FemEngine) -> BackendCapabilities {
-    let mut capabilities = without_rotated_dmi_for_modal_fem(base_capabilities_for_fem_engine(engine));
+    let mut capabilities =
+        without_rotated_dmi_for_modal_fem(base_capabilities_for_fem_engine(engine));
     capabilities.engine_id = match engine {
         FemEngine::CpuNative => RuntimeEngineId::FemEigenCpuBaseline,
         FemEngine::NativeGpu => RuntimeEngineId::FemEigenNativeGpu,
@@ -1032,7 +1035,8 @@ pub(crate) fn capabilities_for_fem_eigen_engine(engine: FemEngine) -> BackendCap
 pub(crate) fn capabilities_for_fem_frequency_response_validation_engine(
     engine: FemEngine,
 ) -> BackendCapabilities {
-    let mut capabilities = without_rotated_dmi_for_modal_fem(base_capabilities_for_fem_engine(engine));
+    let mut capabilities =
+        without_rotated_dmi_for_modal_fem(base_capabilities_for_fem_engine(engine));
     #[cfg(feature = "fem-gpu")]
     {
         capabilities.engine_id = RuntimeEngineId::FemFrequencyResponseProductionCpu;

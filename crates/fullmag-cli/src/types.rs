@@ -1,6 +1,4 @@
-use fullmag_ir::{GeometryAssetsIR, OutputIR, ProblemIR, RegionalFieldDriveIR, TableAutosaveIR};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -213,11 +211,17 @@ pub(crate) struct EngineLogEntry {
     pub timestamp_unix_ms: u128,
     pub level: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub(crate) struct LiveStepView {
+    #[serde(default = "fullmag_quantities::StepDataKind::legacy_unclassified")]
+    pub kind: fullmag_quantities::StepDataKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solver_progress: Option<fullmag_quantities::SolverProgress>,
     pub step: u64,
     pub time: f64,
     pub dt: f64,
@@ -252,163 +256,34 @@ pub(crate) struct LiveStepView {
     pub finished: bool,
 }
 
-fn default_study_pipeline_enabled() -> bool {
-    true
+impl LiveStepView {
+    pub(crate) fn validate_record_kind(&self) -> Result<(), &'static str> {
+        self.kind
+            .validate_solver_progress(self.solver_progress.as_ref())?;
+        if self.kind.is_solver_progress()
+            && (!self.per_object_scalars.is_empty()
+                || self.magnetization.is_some()
+                || self.preview_field.is_some()
+                || !self.field_materialization_states.is_empty())
+        {
+            return Err("solver progress cannot include physical quantity payloads");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_physical_observation(&self) -> bool {
+        self.kind.is_physical_observation() && self.validate_record_kind().is_ok()
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct StudyPipelineDocument {
-    pub version: String,
-    #[serde(default)]
-    pub nodes: Vec<StudyPipelineNode>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-#[serde(tag = "node_kind", rename_all = "snake_case")]
-pub(crate) enum StudyPipelineNode {
-    Primitive {
-        id: String,
-        label: String,
-        #[serde(default = "default_study_pipeline_enabled")]
-        enabled: bool,
-        #[serde(default)]
-        notes: Option<String>,
-        #[serde(default)]
-        source: Option<String>,
-        stage_kind: String,
-        #[serde(default)]
-        payload: BTreeMap<String, Value>,
-    },
-    Macro {
-        id: String,
-        label: String,
-        #[serde(default = "default_study_pipeline_enabled")]
-        enabled: bool,
-        #[serde(default)]
-        notes: Option<String>,
-        #[serde(default)]
-        source: Option<String>,
-        macro_kind: String,
-        #[serde(default)]
-        config: BTreeMap<String, Value>,
-    },
-    Group {
-        id: String,
-        label: String,
-        #[serde(default = "default_study_pipeline_enabled")]
-        enabled: bool,
-        #[serde(default)]
-        notes: Option<String>,
-        #[serde(default)]
-        source: Option<String>,
-        #[serde(default)]
-        collapsed: bool,
-        #[serde(default)]
-        children: Vec<StudyPipelineNode>,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct ScriptExecutionConfig {
-    pub ir: ProblemIR,
-    #[serde(default)]
-    pub shared_geometry_assets: Option<GeometryAssetsIR>,
-    pub default_until_seconds: Option<f64>,
-    #[serde(default)]
-    pub study_pipeline: Option<StudyPipelineDocument>,
-    #[serde(default)]
-    pub stages: Vec<ScriptExecutionStage>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum ScriptExecutionStageAction {
-    SaveState {
-        #[serde(default = "default_stage_action_artifact_name")]
-        artifact_name: String,
-        #[serde(default)]
-        format: Option<String>,
-        #[serde(default)]
-        dataset: Option<String>,
-    },
-    LoadState {
-        #[serde(default)]
-        artifact_name: Option<String>,
-        #[serde(default)]
-        state_path: Option<String>,
-        #[serde(default)]
-        format: Option<String>,
-        #[serde(default)]
-        dataset: Option<String>,
-        #[serde(default)]
-        sample_index: Option<i64>,
-    },
-    Export {
-        #[serde(default)]
-        artifact_name: Option<String>,
-        quantity: String,
-        format: String,
-        #[serde(default)]
-        dataset: Option<String>,
-    },
-    ChangeDevice {
-        device: String,
-    },
-    AddFieldDrive {
-        drive: RegionalFieldDriveIR,
-    },
-    RemoveFieldDrive {
-        drive_id: String,
-    },
-    TableAutosave {
-        #[serde(default = "default_true")]
-        enabled: bool,
-        #[serde(default)]
-        table_autosave: Option<TableAutosaveIR>,
-    },
-    Autosave {
-        #[serde(default = "default_true")]
-        enabled: bool,
-        #[serde(default)]
-        quantity: Option<String>,
-        #[serde(default)]
-        output: Option<OutputIR>,
-    },
-    FftResponse {
-        #[serde(default = "default_true")]
-        enabled: bool,
-        #[serde(default)]
-        request: Option<Value>,
-    },
-    SetTransportCurrent {
-        module_id: String,
-        #[serde(rename = "terminal_outward_current_density_Apm2")]
-        terminal_outward_current_density_apm2: BTreeMap<String, f64>,
-    },
-    SetSpinTorqueEnabled {
-        module_id: String,
-        enabled: bool,
-    },
-}
-
-fn default_stage_action_artifact_name() -> String {
-    "state_snapshot".to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct ScriptExecutionStage {
-    pub ir: ProblemIR,
-    pub default_until_seconds: Option<f64>,
-    pub entrypoint_kind: String,
-    #[serde(default)]
-    pub action: Option<ScriptExecutionStageAction>,
-}
-
+#[cfg(test)]
+pub(crate) use fullmag_application::script_stage_contract::ScriptExecutionStage;
+pub(crate) use fullmag_application::script_stage_contract::{
+    ResolvedScriptStage, ResolvedScriptStageAction, ScriptExecutionConfig,
+    ScriptExecutionStageAction, StageTransitionKind, StageTransitionMetadata,
+    StageTransitionReason, StageTransitionUiPresentation, StateTransferOperatorKind,
+    StudyPipelineDocument, StudyPipelineNode,
+};
 #[derive(Debug, Serialize)]
 pub(crate) struct RuntimeResolutionSummary {
     pub script_mode: bool,
@@ -431,202 +306,6 @@ pub(crate) struct RuntimeResolutionSummary {
     pub local_engine_label: Option<String>,
     pub requires_managed_runtime: bool,
     pub entrypoint_kind: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum ResolvedScriptStageAction {
-    SaveState {
-        artifact_name: String,
-        format: Option<String>,
-        dataset: Option<String>,
-    },
-    LoadState {
-        artifact_name: Option<String>,
-        state_path: Option<String>,
-        format: Option<String>,
-        dataset: Option<String>,
-        sample_index: Option<i64>,
-    },
-    Export {
-        artifact_name: Option<String>,
-        quantity: String,
-        format: String,
-        dataset: Option<String>,
-    },
-    ChangeDevice {
-        device: String,
-    },
-    AddFieldDrive {
-        drive: RegionalFieldDriveIR,
-    },
-    RemoveFieldDrive {
-        drive_id: String,
-    },
-    TableAutosave {
-        enabled: bool,
-        table_autosave: Option<TableAutosaveIR>,
-    },
-    Autosave {
-        enabled: bool,
-        quantity: Option<String>,
-        output: Option<OutputIR>,
-    },
-    FftResponse {
-        enabled: bool,
-        request: Option<Value>,
-    },
-    SetTransportCurrent {
-        module_id: String,
-        terminal_outward_current_density_apm2: BTreeMap<String, f64>,
-    },
-    SetSpinTorqueEnabled {
-        module_id: String,
-        enabled: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum StageTransitionKind {
-    ContinueInPlace,
-    TransferState,
-    RemeshTransfer,
-    BackendTransfer,
-    LoadState,
-    SaveCheckpoint,
-    ExportOnly,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum StageTransitionReason {
-    SameRuntimeContext,
-    ExplicitRemesh,
-    BackendChange,
-    MeshGenerationChanged,
-    ObjectTopologyChanged,
-    MaterialTopologyChanged,
-    DeviceChange,
-    CheckpointLoad,
-    UserExport,
-    IncompatibleImplicitState,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum StateTransferOperatorKind {
-    IdentityCopy,
-    FemToFdmGridResample,
-    FdmToFemMeshResample,
-    MeshToMeshInterpolation,
-    CheckpointLoad,
-    SampledFieldImport,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum StageTransitionUiPresentation {
-    SmoothArrow,
-    BoundaryBar,
-    ErrorBoundary,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct StageTransitionMetadata {
-    pub kind: StageTransitionKind,
-    pub reason: StageTransitionReason,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transfer_operator: Option<StateTransferOperatorKind>,
-    pub ui_presentation: StageTransitionUiPresentation,
-}
-
-impl StageTransitionMetadata {
-    pub(crate) fn continue_in_place() -> Self {
-        Self {
-            kind: StageTransitionKind::ContinueInPlace,
-            reason: StageTransitionReason::SameRuntimeContext,
-            transfer_operator: None,
-            ui_presentation: StageTransitionUiPresentation::SmoothArrow,
-        }
-    }
-
-    pub(crate) fn boundary(
-        kind: StageTransitionKind,
-        reason: StageTransitionReason,
-        transfer_operator: Option<StateTransferOperatorKind>,
-    ) -> Self {
-        Self {
-            kind,
-            reason,
-            transfer_operator,
-            ui_presentation: StageTransitionUiPresentation::BoundaryBar,
-        }
-    }
-
-    pub(crate) fn unsupported(reason: StageTransitionReason) -> Self {
-        Self {
-            kind: StageTransitionKind::Unsupported,
-            reason,
-            transfer_operator: None,
-            ui_presentation: StageTransitionUiPresentation::ErrorBoundary,
-        }
-    }
-
-    pub(crate) fn legacy_state_transition_label(&self) -> &'static str {
-        if self.reason == StageTransitionReason::DeviceChange {
-            return "Change device";
-        }
-        match self.kind {
-            StageTransitionKind::ContinueInPlace => "continues",
-            StageTransitionKind::SaveCheckpoint => "preserved",
-            StageTransitionKind::LoadState => "restored",
-            StageTransitionKind::ExportOnly => "exported",
-            StageTransitionKind::TransferState
-            | StageTransitionKind::RemeshTransfer
-            | StageTransitionKind::BackendTransfer => "transferred",
-            StageTransitionKind::Unsupported => "unsupported",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ResolvedScriptStage {
-    pub ir: ProblemIR,
-    pub until_seconds: f64,
-    pub entrypoint_kind: String,
-    pub action: Option<ResolvedScriptStageAction>,
-    pub incoming_transition: Option<StageTransitionMetadata>,
-}
-
-impl ResolvedScriptStage {
-    pub(crate) fn solver(
-        ir: ProblemIR,
-        until_seconds: f64,
-        entrypoint_kind: impl Into<String>,
-    ) -> Self {
-        Self {
-            ir,
-            until_seconds,
-            entrypoint_kind: entrypoint_kind.into(),
-            action: None,
-            incoming_transition: None,
-        }
-    }
-
-    pub(crate) fn synthetic(
-        ir: ProblemIR,
-        entrypoint_kind: impl Into<String>,
-        action: ResolvedScriptStageAction,
-    ) -> Self {
-        Self {
-            ir,
-            until_seconds: 0.0,
-            entrypoint_kind: entrypoint_kind.into(),
-            action: Some(action),
-            incoming_transition: None,
-        }
-    }
 }
 
 pub(crate) type CurrentDisplaySelection = fullmag_runner::DisplaySelectionState;
@@ -791,6 +470,9 @@ mod solver_policy_compatibility_tests {
 #[derive(Debug, Clone, Serialize)]
 #[allow(non_snake_case)]
 pub(crate) struct CurrentLiveScalarRow {
+    pub kind: fullmag_quantities::StepDataKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solver_progress: Option<fullmag_quantities::SolverProgress>,
     pub step: u64,
     pub time: f64,
     pub solver_dt: f64,
@@ -828,10 +510,27 @@ pub(crate) struct CurrentLiveScalarRow {
     pub table_expressions: Vec<String>,
 }
 
+impl CurrentLiveScalarRow {
+    pub(crate) fn validate_record_kind(&self) -> Result<(), &'static str> {
+        self.kind
+            .validate_solver_progress(self.solver_progress.as_ref())?;
+        if self.kind.is_solver_progress() {
+            return Err("solver progress cannot be admitted as a physical scalar row");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_physical_observation(&self) -> bool {
+        self.kind.is_physical_observation() && self.validate_record_kind().is_ok()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct CurrentLiveStageExecutionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antenna_solve_stage_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     pub status: String,
@@ -845,6 +544,15 @@ pub(crate) struct CurrentLiveStageExecutionRecord {
     pub mesh_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_step: Option<u64>,
+    /// Last solver step observed for this stage, in the run's step coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_step: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_time_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -895,6 +603,9 @@ pub(crate) struct CurrentLiveStageExecutionRecord {
     pub current_settle_step_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_settle_step_method: Option<String>,
+    /// Latest real adaptive FEM CPU admission sample for this stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_execution: Option<fullmag_runner::LiveParallelExecutionTelemetry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

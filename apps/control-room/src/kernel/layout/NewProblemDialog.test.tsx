@@ -7,7 +7,9 @@ import {
   MODEL_SCENE_PATH,
   SESSIONS_PATH,
   SESSION_CURRENT_PATH,
+  PLATFORM_OUTPUT_STORAGE_PATH,
 } from "../api/apiPaths";
+import { PendingFormRegistry } from "../authoring/PendingFormRegistry";
 import { EventBus } from "../events/EventBus";
 import type { KernelEventMap } from "../events/eventTypes";
 import { KernelContext } from "../KernelContext";
@@ -23,6 +25,23 @@ import {
 
 import { NewProblemDialog } from "./NewProblemDialog";
 
+const sessionReadbackState = vi.hoisted(() => ({
+  identity: null as {
+    requestScopeEpoch: string;
+    sessionEpoch: string;
+    sessionId: string;
+  } | null,
+  sessions: null as {
+    schema_version: string;
+    sessions: Array<{
+      current: boolean;
+      name: string;
+      session_id: string;
+      status: string;
+    }>;
+  } | null,
+}));
+
 vi.mock("@/shared/ui/Dialog", () => ({
   Dialog: ({ children }: { children: ReactNode }) => <>{children}</>,
   DialogClose: ({ children }: { children: ReactNode }) => <>{children}</>,
@@ -35,21 +54,149 @@ vi.mock("@/shared/ui/Dialog", () => ({
   DialogTitle: (props: ComponentProps<"h2">) => <h2 {...props} />,
 }));
 
-afterEach(() => vi.restoreAllMocks());
+vi.mock("../resources/useOutputStorageDefaults", () => ({
+  useOutputStorageDefaults: () => ({
+    data: { output_parent: "C:/simulations", temp_parent: "C:/simulations/.fullmag-tmp",
+      data_format: "zarr", cleanup: "on_success", existing_output: "timestamp",
+      supported_formats: ["zarr"], hdf5_unavailable_reason: "HDF5 unavailable in this runtime" },
+    status: "ready", error: null, refetch: vi.fn(), revision: null,
+  }),
+}));
+
+vi.mock("../resources/useSessionStatus", () => ({
+  SESSION_STATUS_RESOURCE_KEY: "session:status",
+  useSessionResourceIdentity: () => sessionReadbackState.identity,
+}));
+
+vi.mock("../resources/useSessionCollection", () => ({
+  useSessionCollection: () => ({
+    resource: {
+      data: sessionReadbackState.sessions,
+      error: null,
+      refetch: vi.fn(),
+      revision: null,
+      status: sessionReadbackState.sessions ? "ready" : "loading",
+    },
+    state: sessionReadbackState.sessions ? "ready" : "loading",
+  }),
+}));
+
+vi.mock("@/shared/ui/Select", () => ({
+  Select: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectTrigger: (props: ComponentProps<"button">) => <button type="button" {...props} />,
+  SelectValue: () => null,
+  SelectContent: () => null,
+  SelectItem: ({ children }: { children: ReactNode }) => <span>{children}</span>,
+}));
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  sessionReadbackState.identity = null;
+  sessionReadbackState.sessions = null;
+});
 
 describe("NewProblemDialog", () => {
+  it("explains FEM domain setup and per-run device selection", async () => {
+    const create = vi.fn(async () => createResponse(3));
+    const { body, dispose } = await mountDialog({ create });
+
+    try {
+      await act(async () => findRadio(body, "FEM").click());
+
+      expect(body.textContent).toContain(
+        "Preparation preview · CPU · Double precision",
+      );
+      expect(body.textContent).toContain(
+        "Configure Universe domain policy now or later; automatic bounds are derived after geometry is added.",
+      );
+      expect(body.textContent).toContain("Configure now opens the existing Universe Inspector after this simulation is created.");
+      expect(body.textContent).toContain(
+        "CPU and double precision are preparation defaults. Choose the device per run in Study > Execution.",
+      );
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("offers FDM domain/grid setup now or later", async () => {
+    const create = vi.fn(async () => createResponse(3));
+    const { body, dispose } = await mountDialog({ create });
+
+    try {
+      expect(body.textContent).toContain(
+        "Configure Universe bounds and grid settings now or later; automatic bounds are derived after geometry is added.",
+      );
+      expect(findRadio(body, "Configure later").getAttribute("aria-checked")).toBe("true");
+      expect(findRadio(body, "Configure now").getAttribute("aria-checked")).toBe("false");
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("opens the Universe Inspector after ACK only when Configure now is selected", async () => {
+    const create = vi.fn(async () => createResponse(3));
+    const { body, layout, selection, rerender, dispose } = await mountDialog({ create });
+    sessionReadbackState.identity = {
+      requestScopeEpoch: "request-epoch-1",
+      sessionEpoch: "session-epoch-1",
+      sessionId: "scratch-session",
+    };
+
+    try {
+      await act(async () => findRadio(body, "Configure now").click());
+      await act(async () => submitDialog(body));
+      await settle();
+
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({ backend: "fdm" }));
+      expect(layout.setPanelVisible).not.toHaveBeenCalled();
+      expect(selection.set).not.toHaveBeenCalled();
+
+      sessionReadbackState.sessions = {
+        schema_version: "1",
+        sessions: [
+          {
+            current: true,
+            name: "Scratch",
+            session_id: "scratch-session",
+            status: "created",
+          },
+        ],
+      };
+      await rerender();
+      await settle();
+
+      expect(layout.setPanelVisible).toHaveBeenCalledWith("right", true);
+      expect(selection.set).toHaveBeenCalledWith(
+        {
+          kind: "universe.root",
+          label: "Universe",
+          nodeId: "model:universe",
+          objectId: null,
+          ref: null,
+        },
+        "ribbon",
+      );
+    } finally {
+      await dispose();
+    }
+  });
+
   it("submits the default FDM CPU/double request and closes only after ACK", async () => {
     const request = deferred<CreateResponse>();
     const create = vi.fn(() => request.promise);
     const { body, invalidations, onOpenChange, dispose } = await mountDialog({ create });
 
     try {
-      await act(async () => findButton(body, "Create").click());
+      await act(async () => submitDialog(body));
 
       expect(create).toHaveBeenCalledWith({
         backend: "fdm",
         device: "cpu",
-        name: "Untitled problem",
+        name: expect.stringMatching(/^Simulation /),
+        output_storage: expect.objectContaining({
+          output_dir: expect.stringMatching(/^C:\/simulations\/simulation_.*\/results\.zarr$/),
+          temp_dir: "C:/simulations/.fullmag-tmp", data_format: "zarr", cleanup: "on_success", existing_output: "timestamp",
+        }),
         precision: "double",
         replace_current: false,
       });
@@ -61,14 +208,15 @@ describe("NewProblemDialog", () => {
       });
 
       expect(invalidations.invalidate.mock.calls).toEqual([
-        [SESSIONS_PATH, 7],
-        [SESSION_STATUS_RESOURCE_KEY, 7],
-        [MODEL_SCENE_PATH, 7],
-        [MODEL_READINESS_PATH, 7],
+        [SESSIONS_PATH, "session:scratch-session"],
+        [SESSION_STATUS_RESOURCE_KEY, "session:scratch-session"],
+        [MODEL_SCENE_PATH, "session:scratch-session"],
+        [MODEL_READINESS_PATH, "session:scratch-session"],
+        [PLATFORM_OUTPUT_STORAGE_PATH, "saved:scratch-session"],
       ]);
       expect(invalidations.invalidatePrefix).toHaveBeenCalledWith(
         SESSION_CURRENT_PATH,
-        7,
+        "session:scratch-session",
       );
       expect(onOpenChange).toHaveBeenCalledWith(false);
     } finally {
@@ -82,13 +230,17 @@ describe("NewProblemDialog", () => {
 
     try {
       await act(async () => findRadio(body, "FEM").click());
-      await act(async () => findButton(body, "Create").click());
+      await act(async () => submitDialog(body));
       await settle();
 
       expect(create).toHaveBeenCalledWith({
         backend: "fem",
         device: "cpu",
-        name: "Untitled problem",
+        name: expect.stringMatching(/^Simulation /),
+        output_storage: expect.objectContaining({
+          output_dir: expect.stringMatching(/^C:\/simulations\/simulation_.*\/results\.zarr$/),
+          temp_dir: "C:/simulations/.fullmag-tmp", data_format: "zarr", cleanup: "on_success", existing_output: "timestamp",
+        }),
         precision: "double",
         replace_current: false,
       });
@@ -105,12 +257,12 @@ describe("NewProblemDialog", () => {
 
     try {
       await act(async () => findRadio(body, "FEM").click());
-      await act(async () => findButton(body, "Create").click());
+      await act(async () => submitDialog(body));
       await settle();
 
       expect(body.textContent).toContain("FEM CPU is unavailable in this runtime");
       expect(findRadio(body, "FEM").getAttribute("aria-checked")).toBe("true");
-      expect(findButton(body, "Create").disabled).toBe(false);
+      expect(findButton(body, "Create simulation").disabled).toBe(false);
       expect(onOpenChange).not.toHaveBeenCalledWith(false);
     } finally {
       await dispose();
@@ -122,7 +274,7 @@ describe("NewProblemDialog", () => {
     const { body, dispose } = await mountDialog({ create, hasActiveSession: true });
 
     try {
-      const createButton = findButton(body, "Create");
+      const createButton = findButton(body, "Create simulation");
       const checkbox = findElements(
         body,
         (element) => element.tagName === "INPUT",
@@ -136,11 +288,48 @@ describe("NewProblemDialog", () => {
       });
       expect(createButton.disabled).toBe(false);
 
-      await act(async () => createButton.click());
+      await act(async () => submitDialog(body));
       await settle();
       expect(create).toHaveBeenCalledWith(expect.objectContaining({
         replace_current: true,
       }));
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("invalidates a replacement by session identity when its state version resets", async () => {
+    const create = vi.fn(async () => createResponse(0, "session-fem-replacement"));
+    const { body, invalidations, dispose } = await mountDialog({
+      create,
+      hasActiveSession: true,
+    });
+
+    try {
+      const checkbox = findElements(
+        body,
+        (element) => element.tagName === "INPUT",
+      ).at(-1)!;
+      Object.assign(checkbox!, { checked: true });
+      await act(async () => {
+        checkbox!.dispatchEvent(new TestEvent("click", { bubbles: true }));
+      });
+
+      await act(async () => submitDialog(body));
+      await settle();
+
+      expect(invalidations.invalidate).toHaveBeenCalledWith(
+        SESSIONS_PATH,
+        "session:session-fem-replacement",
+      );
+      expect(invalidations.invalidate).toHaveBeenCalledWith(
+        SESSION_STATUS_RESOURCE_KEY,
+        "session:session-fem-replacement",
+      );
+      expect(invalidations.invalidatePrefix).toHaveBeenCalledWith(
+        SESSION_CURRENT_PATH,
+        "session:session-fem-replacement",
+      );
     } finally {
       await dispose();
     }
@@ -178,7 +367,10 @@ interface CreateResponse {
   };
 }
 
-function createResponse(revision: number): CreateResponse {
+function createResponse(
+  revision: number,
+  sessionId = "scratch-session",
+): CreateResponse {
   const execution = { backend: "fdm", device: "cpu", precision: "double" } as const;
   return {
     revisions: { scene_revision: revision, state_version: revision },
@@ -189,7 +381,7 @@ function createResponse(revision: number): CreateResponse {
       schema_version: "0.3",
       version: null,
     },
-    session_id: "scratch-session",
+    session_id: sessionId,
     status: {
       effective_execution: execution,
       fallback: null,
@@ -214,28 +406,40 @@ async function mountDialog({
     invalidate: vi.fn(),
     invalidatePrefix: vi.fn(),
   };
+  const layout = { setPanelVisible: vi.fn() };
+  const selection = { set: vi.fn() };
   const kernel = {
-    api: { sessions: { create } },
+    api: { sessions: { create }, platform: { saveOutputStorageDefaults: vi.fn(async () => ({})) } },
     bus,
+    layout,
+    // Creation goes through the pending-form guard, which needs the real registry.
+    pendingForms: new PendingFormRegistry(),
     resources: invalidations,
+    selection,
   } as unknown as KernelApi;
   const onOpenChange = vi.fn();
+  const renderDialog = () => (
+    <KernelContext.Provider value={kernel}>
+      <NewProblemDialog
+        hasActiveSession={hasActiveSession}
+        open
+        onOpenChange={onOpenChange}
+      />
+    </KernelContext.Provider>
+  );
   await act(async () => {
-    root.render(
-      <KernelContext.Provider value={kernel}>
-        <NewProblemDialog
-          hasActiveSession={hasActiveSession}
-          open
-          onOpenChange={onOpenChange}
-        />
-      </KernelContext.Provider>,
-    );
+    root.render(renderDialog());
   });
   await settle();
   return {
     body: dom.document.body,
     invalidations,
+    layout,
     onOpenChange,
+    selection,
+    rerender: async () => {
+      await act(async () => root.render(renderDialog()));
+    },
     dispose: async () => {
       await act(async () => root.unmount());
       dom.restore();
@@ -273,4 +477,9 @@ function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((accept) => { resolve = accept; });
   return { promise, resolve };
+}
+
+function submitDialog(body: TestElement): void {
+  const form = findElement(body, (element) => element.tagName === "FORM", "simulation form");
+  form.dispatchEvent(new TestEvent("submit", { bubbles: true }));
 }

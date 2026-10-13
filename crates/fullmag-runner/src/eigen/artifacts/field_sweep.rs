@@ -62,6 +62,7 @@ pub struct FrequencyDomainFieldSweepArtifact {
     pub artifact_id: String,
     pub source: ServerArtifactSource,
     pub source_revision: String,
+    pub session_id: String,
     pub run_id: String,
     pub stage_id: String,
     pub scope_id: String,
@@ -114,7 +115,9 @@ fn mode_field_payload_is_valid(mode: &SingleKModeResult) -> bool {
 /// emitted instead of inventing one from an oracle configuration.
 pub fn build_frequency_domain_field_sweep_artifact(
     result: &PathSolveResult,
+    identity: &FrequencyDomainArtifactIdentity,
 ) -> std::io::Result<Option<FrequencyDomainFieldSweepArtifact>> {
+    identity.validate()?;
     if result.samples.is_empty() {
         return Ok(None);
     }
@@ -133,6 +136,10 @@ pub fn build_frequency_domain_field_sweep_artifact(
                 && mode.angular_frequency_rad_per_s.is_finite()
                 && mode
                     .residual_norm
+                    .map(|value| value.is_finite() && value >= 0.0)
+                    .unwrap_or(true)
+                && mode
+                    .residual_relative_l2
                     .map(|value| value.is_finite() && value >= 0.0)
                     .unwrap_or(true)
         });
@@ -169,9 +176,9 @@ pub fn build_frequency_domain_field_sweep_artifact(
                         )
                     }),
                     mode_field_id: field_payload_valid.then_some(mode_field_id.clone()),
-                    mode_field_resource_key: field_payload_valid
-                        .then(|| eigen_mode_field_resource_key(&mode_field_id)),
-                    residual_relative_l2: mode.residual_norm,
+                    // Transport is projected by the API from the owning dataset.
+                    mode_field_resource_key: None,
+                    residual_relative_l2: mode.residual_relative_l2,
                     source_revision: result_source_revision(result),
                     field_status: if field_payload_valid {
                         "ready".to_string()
@@ -212,8 +219,7 @@ pub fn build_frequency_domain_field_sweep_artifact(
     let topology_consistent = samples.windows(2).all(|window| {
         window[0].topology.mesh_id == window[1].topology.mesh_id
             && window[0].topology.topology_revision == window[1].topology.topology_revision
-            && window[0].topology.topology_fingerprint
-                == window[1].topology.topology_fingerprint
+            && window[0].topology.topology_fingerprint == window[1].topology.topology_fingerprint
             && window[0].topology.mesh_generation_id == window[1].topology.mesh_generation_id
     });
     if !topology_consistent && status == ServerArtifactStatus::Complete {
@@ -251,7 +257,7 @@ pub fn build_frequency_domain_field_sweep_artifact(
     } else {
         status
     };
-    let (requested_execution, resolved_execution, runtime_id) =
+    let (requested_execution, resolved_execution, _runtime_id) =
         server_execution_from_modal_result(result);
     let source_revision = result_source_revision(result);
     let mut artifact = FrequencyDomainFieldSweepArtifact {
@@ -263,10 +269,11 @@ pub fn build_frequency_domain_field_sweep_artifact(
             revision: source_revision.clone(),
         },
         source_revision: source_revision.clone(),
-        run_id: "run:current".to_string(),
-        stage_id: "stage:eigenmodes".to_string(),
+        session_id: identity.session_id.clone(),
+        run_id: identity.run_id.clone(),
+        stage_id: identity.stage_id.clone(),
         scope_id: "scope:bias-field".to_string(),
-        runtime_id,
+        runtime_id: identity.runtime_id.clone(),
         revision: String::new(),
         content_sha256: String::new(),
         status,
@@ -306,8 +313,9 @@ pub fn build_frequency_domain_field_sweep_artifact(
 pub fn write_frequency_domain_field_sweep_artifact(
     base_dir: &Path,
     result: &PathSolveResult,
+    identity: &FrequencyDomainArtifactIdentity,
 ) -> std::io::Result<bool> {
-    let Some(mut artifact) = build_frequency_domain_field_sweep_artifact(result)? else {
+    let Some(mut artifact) = build_frequency_domain_field_sweep_artifact(result, identity)? else {
         return Ok(false);
     };
     let spectrum_path = base_dir.join("eigen").join("spectrum.v2.json");

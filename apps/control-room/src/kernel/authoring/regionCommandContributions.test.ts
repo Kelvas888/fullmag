@@ -56,6 +56,36 @@ function selectCoupling(selection: SelectionController): void {
 }
 
 describe("REGION_COMMANDS", () => {
+  it.each([
+    ["regions.delete", "deleteObjectRegion"],
+    ["couplings.delete", "deleteCoupling"],
+  ])("does not clear the new selection after a late %s ACK", async (commandId, method) => {
+    const registry = registryWithRegionCommands();
+    const selection = new SelectionController(new EventBus<KernelEventMap>());
+    if (commandId.startsWith("regions.")) selectRegion(selection);
+    else selectCoupling(selection);
+    let current = true;
+    const invalidate = vi.fn();
+    let newSelection: ReturnType<SelectionController["get"]>;
+    const mutation = vi.fn(async () => {
+      current = false;
+      selectRegion(selection);
+      newSelection = selection.get();
+      return {};
+    });
+    const result = await registry.execute(commandId, {
+      source: "test",
+      api: { model: { [method]: mutation } } as never,
+      selection,
+      resources: { invalidate } as never,
+      isCurrentSessionScope: () => current,
+    });
+    expect(mutation).toHaveBeenCalledOnce();
+    expect(result.status).toBe("cancelled");
+    expect(selection.get()).toBe(newSelection!);
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
   it("duplicates and deletes the selected authored region through the model facade", async () => {
     const registry = registryWithRegionCommands();
     const selection = new SelectionController(new EventBus<KernelEventMap>());
@@ -101,9 +131,15 @@ describe("REGION_COMMANDS", () => {
       {},
       { baseRevision: 4 },
     );
+    // The selection is part of the captured workspace state so undo/redo can
+    // restore it alongside the scene revision.
+    const workspaceState = { selection: selection.get() };
+    expect(workspaceState.selection).not.toBeNull();
     expect(record).toHaveBeenCalledWith({
       after,
+      afterWorkspaceState: workspaceState,
       before,
+      beforeWorkspaceState: workspaceState,
       committedRevision: 5,
       label: "Duplicate region core",
     });
@@ -240,9 +276,13 @@ describe("REGION_COMMANDS", () => {
       { enabled: false },
       { baseRevision: 8 },
     );
+    const workspaceState = { selection: selection.get() };
+    expect(workspaceState.selection).not.toBeNull();
     expect(record).toHaveBeenCalledWith({
       after,
+      afterWorkspaceState: workspaceState,
       before,
+      beforeWorkspaceState: workspaceState,
       committedRevision: 9,
       label: "Disable coupling exchange-core",
     });

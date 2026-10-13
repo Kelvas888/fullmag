@@ -15,6 +15,7 @@ import {
   resolveObjectMeshPolicyResourceKey,
   resolveObjectMeshQualityResourceKey,
   resolveObjectMeshReportResourceKey,
+  useMeshBuildHistoryResource,
   useMeshCapabilitiesResource,
   useObjectMeshPolicyResource,
   useObjectMeshQualityResource,
@@ -22,13 +23,26 @@ import {
   useObjectMeshSizeFieldResource,
   useObjectTopologyResource,
 } from "@/kernel/resources/geometryLifecycleResources";
+import { resolveSessionAuthoringDiscretization } from "@/kernel/resources/sessionDiscretization";
+import { publishCommittedMeshPolicyResource } from "@/kernel/resources/meshPolicyResourceCache";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
+import {
+  sessionRequestScopeKey,
+} from "@/kernel/resources/sessionResourceIdentity";
+import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
+import {
+  normalizeMeshBuildHistory,
+  type MeshBuildHistoryEntry,
+} from "@/shared/domain/mesh/meshBuildHistory";
 import { normalizeMeshQualityStatistics } from "@/shared/domain/mesh/qualityStatistics";
 import { Tabs, TabsContent } from "@/shared/ui/Tabs";
 import { Button } from "@/shared/ui/Button";
 
 import type { InspectorPanelProps } from "../inspectorTypes";
-import { useRegisterInspectorEditSession } from "../InspectorEditSession";
+import {
+  useInspectorEditSession,
+  useRegisterInspectorEditSession,
+} from "../InspectorEditSession";
 import { useInspectorActiveTab } from "../InspectorTabState";
 import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FieldRow } from "../primitives/FieldRow";
@@ -44,6 +58,8 @@ import {
 import type { MeshSizeDistributionHoverBin } from "./MeshQualityChart";
 import { MeshQualityStatisticsView } from "./MeshQualityStatisticsView";
 import { emitMeshSizeHistogramHover } from "./meshSizeHistogramHover";
+import { MeshBuildHistorySection } from "./mesh-details/MeshBuildHistorySection";
+import { FemMeshReadinessGuideCard } from "./mesh-guide/FemMeshReadinessGuideCard";
 import {
   initialInspectorDraftState,
   resolveInspectorDraftState,
@@ -258,9 +274,11 @@ function ObjectMeshPolicySummarySection({
 export function FdmObjectMeshPolicySection({
   objectId,
   resources,
+  onRebuildGrid,
 }: {
   objectId: string | null | undefined;
   resources: FdmObjectMeshInspectorResources;
+  onRebuildGrid?: () => void;
 }) {
   const model = useMemo(
     () =>
@@ -305,6 +323,18 @@ export function FdmObjectMeshPolicySection({
           }
         />
         <FieldRow label="Grid fingerprint" value={model.gridFingerprint ?? "not materialized"} mono />
+        {onRebuildGrid ? (
+          <div className="flex justify-end pt-2">
+            <Button
+              size="sm"
+              type="button"
+              variant="secondary"
+              onClick={onRebuildGrid}
+            >
+              Re-voxelize / Build Grid
+            </Button>
+          </div>
+        ) : null}
       </InspectorGroup>
     </div>
   );
@@ -337,13 +367,34 @@ function ObjectMeshOverrideSection({
   updateDraft: UpdateObjectMeshPolicyDraft;
 }) {
   return (
-    <InspectorGroup title="Override">
-      <FormField
-        checked={draft.present}
-        label="Use object policy"
-        type="checkbox"
-        onChange={(event) => updateDraft({ present: event.target.checked })}
-      />
+    <InspectorGroup
+      badge={draft.present ? "custom override" : "inherited"}
+      title="Override"
+    >
+      {!draft.present ? (
+        <FeedbackBanner
+          kind="warning"
+          message="This object currently inherits global shared-domain mesh sizing. Enable Object Override to customize per-object element sizes, sweep layers, or local refinement."
+        />
+      ) : null}
+      <div className="flex items-center justify-between gap-2">
+        <FormField
+          checked={draft.present}
+          label="Use object policy"
+          type="checkbox"
+          onChange={(event) => updateDraft({ present: event.target.checked })}
+        />
+        {!draft.present ? (
+          <Button
+            size="sm"
+            type="button"
+            variant="secondary"
+            onClick={() => updateDraft({ present: true })}
+          >
+            Enable Object Override
+          </Button>
+        ) : null}
+      </div>
     </InspectorGroup>
   );
 }
@@ -774,8 +825,10 @@ export function ObjectMeshTransactionsSection({
   feedback,
   isDirty,
   objectId,
+  sessionAvailable = true,
   onApply,
   onBuild,
+  onBuildSharedDomain,
   buildLabel,
   onRevert,
   pending,
@@ -788,8 +841,10 @@ export function ObjectMeshTransactionsSection({
   feedback: Feedback;
   isDirty: boolean;
   objectId: string | null | undefined;
+  sessionAvailable?: boolean;
   onApply: () => void;
   onBuild: () => void;
+  onBuildSharedDomain?: () => void;
   onRevert: () => void;
   pending: boolean;
 }) {
@@ -802,12 +857,17 @@ export function ObjectMeshTransactionsSection({
         />
       ) : null}
       <div className="fm-inspector-toolbar">
-        <Button disabled={pending || !objectId || Boolean(validationError)} size="sm" type="button" variant="primary" onClick={onApply}>
+        <Button disabled={!sessionAvailable || pending || !objectId || Boolean(validationError)} size="sm" type="button" variant="primary" onClick={onApply}>
           Apply Policy
         </Button>
-        <Button disabled={pending || buildPending || !objectId || Boolean(validationError)} size="sm" type="button" variant="secondary" onClick={onBuild}>
+        <Button disabled={!sessionAvailable || pending || buildPending || !objectId || Boolean(validationError)} size="sm" type="button" variant="secondary" onClick={onBuild}>
           {buildPending ? "Waiting for mesh build…" : buildLabel}
         </Button>
+        {onBuildSharedDomain ? (
+          <Button disabled={!sessionAvailable || pending || buildPending || Boolean(validationError)} size="sm" type="button" variant="secondary" onClick={onBuildSharedDomain}>
+            Build Shared-Domain Mesh
+          </Button>
+        ) : null}
         <Button disabled={pending} size="sm" type="button" variant="ghost" onClick={onRevert}>
           Revert
         </Button>
@@ -822,8 +882,9 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
   const objectId = selection.objectId;
   const kernel = useKernel();
   const { api, commands, resources } = kernel;
+  const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
   const sessionDiscretization = useSessionStatusSelector(
-    (status) => status.data?.domain.discretization ?? null,
+    (status) => resolveSessionAuthoringDiscretization(status.data),
   );
   const meshLane = resolveMeshInspectorLane(sessionDiscretization);
   const explicitFdm = meshLane === "fdm";
@@ -841,6 +902,7 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
     [fdmDomain, fdmMembership, fdmMembershipBinary],
   );
   const femResourcesEnabled = meshLane === "fem";
+  const buildHistory = useMeshBuildHistoryResource({ enabled: femResourcesEnabled });
   const policy = useObjectMeshPolicyResource(objectId, { enabled: femResourcesEnabled });
   const report = useObjectMeshReportResource(objectId, { enabled: femResourcesEnabled });
   const quality = useObjectMeshQualityResource(objectId, { enabled: femResourcesEnabled });
@@ -861,9 +923,9 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
       }),
     [effectiveTarget, resource],
   );
-  const draftKey = draftKeyForObjectMeshPolicyResource(objectId, resource, {
+  const draftKey = `${sessionScopeKey ?? "no-session"}:${draftKeyForObjectMeshPolicyResource(objectId, resource, {
     effectiveTarget,
-  });
+  })}`;
   const draftIdentityKey = draftIdentityKeyForObjectMeshPolicyResource(objectId);
   const [draftState, setDraftState] = useState<
     InspectorDraftState<ObjectMeshPolicyDraft>
@@ -874,10 +936,44 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
       identityKey: draftIdentityKey,
     }),
   );
-  const [feedback, setFeedback] = useState<Feedback>(null);
-  const [pending, setPending] = useState(false);
-  const [buildPending, setBuildPending] = useState(false);
-  const buildInFlight = useRef(false);
+  const [feedbackState, setFeedbackState] = useState<{
+    identityKey: string;
+    sessionScopeKey: string | null;
+    value: Feedback;
+  } | null>(null);
+  const feedback = feedbackState?.sessionScopeKey === sessionScopeKey &&
+    feedbackState.identityKey === draftIdentityKey
+    ? feedbackState.value
+    : null;
+  const setFeedback = useCallback((value: Feedback) => {
+    setFeedbackState({
+      identityKey: draftIdentityKey,
+      sessionScopeKey,
+      value,
+    });
+  }, [draftIdentityKey, sessionScopeKey]);
+  const [pendingOperation, setPendingOperation] = useState<{
+    id: number;
+    identityKey: string;
+    sessionScopeKey: string;
+  } | null>(null);
+  const nextPendingOperationId = useRef(0);
+  const silentApplyInFlight = useRef(false);
+  const pending = pendingOperation?.sessionScopeKey === sessionScopeKey &&
+    pendingOperation.identityKey === draftIdentityKey;
+  const [buildPendingOperation, setBuildPendingOperation] = useState<{
+    id: number;
+    identityKey: string;
+    sessionScopeKey: string;
+  } | null>(null);
+  const nextBuildOperationId = useRef(0);
+  const buildInFlight = useRef<{
+    id: number;
+    identityKey: string;
+    sessionScopeKey: string;
+  } | null>(null);
+  const buildPending = buildPendingOperation?.sessionScopeKey === sessionScopeKey &&
+    buildPendingOperation.identityKey === draftIdentityKey;
   const { dirty: isDirty, draft } = resolveInspectorDraftState({
     baseDraft,
     baseKey: draftKey,
@@ -901,10 +997,12 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
   const commandContext = useMemo(
     () =>
       createCommandContext("inspector", kernel, {
+        sessionScopeKey,
         sourceDetail: "object-mesh-policy",
       }),
-    [kernel],
+    [kernel, sessionScopeKey],
   );
+  const inspectorEditSession = useInspectorEditSession();
   const hoverSizeDistributionBin = useCallback(
     (bin: MeshSizeDistributionHoverBin | null) => {
       emitMeshSizeHistogramHover({
@@ -956,7 +1054,51 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
     });
     if (objectId && policy.status === "ready") kernel.bus.emit("mesh:build-history-editor-ready", { target: `object:${objectId}` });
     return offRestore;
-  }, [baseDraft, draftKey, draftIdentityKey, effectiveTarget, kernel.bus, objectId, policy.status, resource]);
+  }, [baseDraft, draftKey, draftIdentityKey, effectiveTarget, kernel.bus, objectId, policy.status, resource, setFeedback]);
+
+  const buildHistoryEntries = useMemo(() => {
+    const all = normalizeMeshBuildHistory(buildHistory.data?.history);
+    if (!objectId) return all;
+    return all.filter((entry) => {
+      if (!entry.meshTarget || entry.meshTarget === "all") return true;
+      if (
+        entry.meshTarget === `object:${objectId}` ||
+        entry.meshTarget === `object_mesh:${objectId}`
+      ) {
+        return true;
+      }
+      const objectSnapshots = asRecord(entry.canonicalPolicySnapshot?.objects);
+      return objectSnapshots ? Object.hasOwn(objectSnapshots, objectId) : false;
+    });
+  }, [buildHistory.data?.history, objectId]);
+
+  const onRestoreBuildToDraft = useCallback((entry: MeshBuildHistoryEntry) => {
+    if (!objectId) return;
+    const objectSnapshots = asRecord(entry.canonicalPolicySnapshot?.objects);
+    if (!objectSnapshots || !Object.hasOwn(objectSnapshots, objectId)) {
+      setFeedback({
+        kind: "error",
+        message: `Build ${entry.id} contains no mesh snapshot for object ${objectId}.`,
+      });
+      return;
+    }
+    const snapshotValue = objectSnapshots[objectId];
+    const objectSnapshot = snapshotValue === null ? null : asRecord(snapshotValue);
+    const restored = draftFromObjectMeshPolicyResource(
+      { ...resource, config: objectSnapshot as JsonObject | null },
+      { effectiveTarget },
+    );
+    setDraftState({
+      baseKey: draftKey,
+      dirty: objectMeshPolicyDraftDirty(restored, baseDraft),
+      draft: restored,
+      identityKey: draftIdentityKey,
+    });
+    setFeedback({
+      kind: "success",
+      message: `Build ${entry.id} restored to the object draft. Apply the policy before building.`,
+    });
+  }, [baseDraft, draftIdentityKey, draftKey, effectiveTarget, objectId, resource, setFeedback]);
 
   const applyPolicy = useCallback(async ({
     silentSuccess = false,
@@ -993,20 +1135,44 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
       return { ok: false };
     }
 
-    setPending(true);
+    const operationSessionScopeKey = sessionScopeKey;
+    const operationContext = commandContext;
+    const isCurrentOperation = () => Boolean(
+      operationSessionScopeKey &&
+      operationContext.sessionScopeKey === operationSessionScopeKey &&
+      operationContext.isCurrentSessionScope?.() === true,
+    );
+    if (!operationSessionScopeKey || !isCurrentOperation()) {
+      setFeedback({ kind: "error", message: "An active session is required to save this mesh policy." });
+      return { ok: false };
+    }
+    const operationId = ++nextPendingOperationId.current;
+    setPendingOperation({
+      id: operationId,
+      identityKey: draftIdentityKey,
+      sessionScopeKey: operationSessionScopeKey,
+    });
     try {
       const next = await api.meshing.replaceObjectPolicy(
         objectId,
         result.request,
+        { sessionScopeKey: operationSessionScopeKey },
       );
+      if (!isCurrentOperation()) return { ok: false };
       const revision = next.revision;
+      publishCommittedMeshPolicyResource?.(
+        resources,
+        resolveObjectMeshPolicyResourceKey(objectId),
+        operationSessionScopeKey,
+        next,
+      );
       resources.invalidate(resolveObjectMeshPolicyResourceKey(objectId), revision);
       resources.invalidate(resolveObjectMeshReportResourceKey(objectId), revision);
       resources.invalidate(resolveObjectMeshQualityResourceKey(objectId), revision);
       resources.invalidate(MESH_BUILD_CURRENT_RESOURCE_KEY, revision);
       resources.invalidate(MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY, revision);
       resources.invalidate(SCENE_RESOURCE_KEY, revision);
-      if (!silentSuccess) {
+      if (!silentSuccess && !silentApplyInFlight.current) {
         setFeedback({
           kind: "success",
           message: "Policy saved. Current solver mesh is stale until a mesh build completes.",
@@ -1014,15 +1180,45 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
       }
       return { ok: true };
     } catch (error) {
+      if (!isCurrentOperation()) return { ok: false };
       setFeedback({ kind: "error", message: errorMessage(error) });
       return { ok: false };
     } finally {
-      setPending(false);
+      setPendingOperation((current) => current?.id === operationId ? null : current);
     }
-  }, [api, draft, explicitFdm, meshLane, objectId, resources, topologyCapabilities]);
+  }, [
+    api,
+    commandContext,
+    draft,
+    draftIdentityKey,
+    explicitFdm,
+    meshLane,
+    objectId,
+    resources,
+    sessionScopeKey,
+    setFeedback,
+    topologyCapabilities,
+  ]);
 
-  async function buildMesh(): Promise<void> {
-    if (pending || buildInFlight.current) return;
+  async function buildMesh(
+    commandId: "mesh.build-selected" | "mesh.build-shared-domain" = "mesh.build-selected",
+  ): Promise<void> {
+    const operationSessionScopeKey = sessionScopeKey;
+    const operationContext = commandContext;
+    const isCurrentOperation = () => Boolean(
+      operationSessionScopeKey &&
+      operationContext.sessionScopeKey === operationSessionScopeKey &&
+      operationContext.isCurrentSessionScope?.() === true,
+    );
+    if (!operationSessionScopeKey || !isCurrentOperation()) {
+      setFeedback({ kind: "error", message: "An active session is required to build this object mesh." });
+      return;
+    }
+    if (
+      pending ||
+      (buildInFlight.current?.sessionScopeKey === operationSessionScopeKey &&
+        buildInFlight.current.identityKey === draftIdentityKey)
+    ) return;
     if (meshLane !== "fem") {
       setFeedback({
         kind: "error",
@@ -1047,24 +1243,53 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
       return;
     }
 
-    buildInFlight.current = true;
-    setBuildPending(true);
+    const operationId = ++nextBuildOperationId.current;
+    buildInFlight.current = {
+      id: operationId,
+      identityKey: draftIdentityKey,
+      sessionScopeKey: operationSessionScopeKey,
+    };
+    setBuildPendingOperation({
+      id: operationId,
+      identityKey: draftIdentityKey,
+      sessionScopeKey: operationSessionScopeKey,
+    });
     try {
-      if (isDirty && !(await applyPolicy({ silentSuccess: true })).ok) return;
-      const result = await commands.execute("mesh.build-selected", commandContext);
+      if (isDirty) {
+        let applied = false;
+        if (inspectorEditSession) {
+          silentApplyInFlight.current = true;
+          try {
+            applied = await inspectorEditSession.apply();
+          } finally {
+            silentApplyInFlight.current = false;
+          }
+        } else {
+          applied = (await applyPolicy({ silentSuccess: true })).ok;
+        }
+        if (!applied) return;
+      }
+      if (!isCurrentOperation()) return;
+      const result =
+        commandId === "mesh.build-shared-domain"
+          ? await commands.execute("mesh.build-shared-domain", operationContext)
+          : await commands.execute("mesh.build-selected", operationContext);
+      if (!isCurrentOperation()) return;
+      const labelPrefix = commandId === "mesh.build-shared-domain" ? "Shared-domain" : "Object";
       setFeedback({
         kind: result.status === "completed" ? "success" : result.status === "failed" ? "error" : "warning",
         message: result.message ?? (result.status === "completed"
-          ? "Object mesh build completed."
-          : result.status === "failed" ? "Object mesh build failed."
+          ? `${labelPrefix} mesh build completed.`
+          : result.status === "failed" ? `${labelPrefix} mesh build failed.`
           : result.status === "pending" ? "Build remains active; see Mesh Jobs."
           : "Mesh build was not submitted."),
       });
     } catch (error) {
+      if (!isCurrentOperation()) return;
       setFeedback({ kind: "error", message: errorMessage(error) });
     } finally {
-      buildInFlight.current = false;
-      setBuildPending(false);
+      if (buildInFlight.current?.id === operationId) buildInFlight.current = null;
+      setBuildPendingOperation((current) => current?.id === operationId ? null : current);
     }
   }
 
@@ -1086,12 +1311,12 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
       }),
     );
     setFeedback(null);
-  }, [baseDraft, draftIdentityKey, draftKey]);
+  }, [baseDraft, draftIdentityKey, draftKey, setFeedback]);
   useRegisterInspectorEditSession(
     "staged",
     pending,
     isDirty,
-    meshLane === "fem" && !("error" in validation) && topologyCapabilityError === null,
+    sessionScopeKey !== null && meshLane === "fem" && !("error" in validation) && topologyCapabilityError === null,
     undefined,
     applyInspectorDraft,
     resetInspectorDraft,
@@ -1099,11 +1324,27 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
   const activeTab = useInspectorActiveTab();
   const jsonError = objectMeshPolicyJsonError(draft.configText);
 
+  const executeFdmGridBuild = useCallback(async () => {
+    try {
+      const result = await commands.execute("grid.build-fdm", commandContext);
+      setFeedback({
+        kind: result.status === "completed" ? "success" : result.status === "failed" ? "error" : "warning",
+        message: result.message ?? (result.status === "completed"
+          ? "FDM grid refresh completed."
+          : result.status === "failed" ? "FDM grid refresh failed."
+          : "FDM grid refresh was not submitted."),
+      });
+    } catch (error) {
+      setFeedback({ kind: "error", message: errorMessage(error) });
+    }
+  }, [commands, commandContext, setFeedback]);
+
   if (explicitFdm) {
     return (
       <FdmObjectMeshPolicySection
         objectId={objectId}
         resources={fdmMeshResources}
+        onRebuildGrid={executeFdmGridBuild}
       />
     );
   }
@@ -1116,14 +1357,21 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
       <Tabs value={activeTab} className="fm-inspector-tabs">
 
         <TabsContent value="policy" className="fm-tabs-content">
+          <FemMeshReadinessGuideCard
+            compact
+            selectedObjectId={objectId}
+            selectedObjectPolicy={resource}
+          />
           <ObjectMeshOverrideSection draft={draft} updateDraft={updateDraft} />
           <ObjectMeshTransactionsSection
-            buildLabel={isDirty ? "Apply & Build Mesh" : "Build Mesh"}
+            buildLabel={isDirty ? "Apply & Build Object Mesh" : "Build Object Mesh"}
             feedback={feedback}
             isDirty={isDirty}
             objectId={objectId}
-            onApply={() => void applyPolicy()}
-            onBuild={() => void buildMesh()}
+            sessionAvailable={sessionScopeKey !== null}
+            onApply={() => void (inspectorEditSession?.apply() ?? applyPolicy())}
+            onBuild={() => void buildMesh("mesh.build-selected")}
+            onBuildSharedDomain={() => void buildMesh("mesh.build-shared-domain")}
             onRevert={() => {
               setDraftState(
                 initialInspectorDraftState({
@@ -1188,9 +1436,46 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
 
         <TabsContent value="history" className="fm-tabs-content">
           <div className="grid min-w-0 gap-fm-inspector-group">
-            <JsonResourceSection sectionValue="json-report" title="Object Mesh Report JSON" value={report.data} />
-            <JsonResourceSection sectionValue="json-quality" title="Object Mesh Quality JSON" value={quality.data} />
-            <JsonResourceSection sectionValue="json-size-field" title="Object Size Field JSON" value={sizeField.data} />
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-muted-foreground">
+                Showing build history entries affecting this object.
+              </span>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() =>
+                  kernel.selection.set(
+                    {
+                      kind: "mesh.builds",
+                      label: "Mesh Build Pipeline",
+                      nodeId: "model:mesh:builds",
+                      objectId: null,
+                      ref: null,
+                    },
+                    "mesh",
+                  )
+                }
+              >
+                View Mesh Pipeline
+              </Button>
+            </div>
+
+            <MeshBuildHistorySection
+              entries={buildHistoryEntries}
+              onRestore={onRestoreBuildToDraft}
+            />
+
+            <InspectorGroup
+              title="Diagnostics & Raw JSON Resources"
+              collapsible
+              defaultOpen={false}
+            >
+              <div className="grid min-w-0 gap-fm-inspector-group">
+                <JsonResourceSection sectionValue="json-report" title="Object Mesh Report JSON" value={report.data} />
+                <JsonResourceSection sectionValue="json-quality" title="Object Mesh Quality JSON" value={quality.data} />
+                <JsonResourceSection sectionValue="json-size-field" title="Object Size Field JSON" value={sizeField.data} />
+              </div>
+            </InspectorGroup>
           </div>
         </TabsContent>
       </Tabs>

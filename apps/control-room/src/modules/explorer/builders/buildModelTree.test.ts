@@ -41,6 +41,7 @@ import {
   modelTreeSnapshotFromScene,
   modelTreeSnapshotWithStageExecution,
 } from "./sceneModelTreeAdapter";
+import { resolveExplorerDomainLane } from "./meshExplorerNodes";
 
 describe("Explorer node contract", () => {
   it("preserves a valid node and its exported kind", () => {
@@ -64,6 +65,39 @@ describe("Explorer node contract", () => {
         parentId: "model:objects",
       }),
     ).toThrow("Explorer node requires a non-empty id");
+  });
+});
+
+describe("Explorer domain lane resolution", () => {
+  it("uses the resolved FEM lane over stale FDM DomainMeta presentation", () => {
+    const snapshot = modelTreeSnapshotFromScene({} as SceneResource, {
+      domainDiscretization: "fem",
+      domainPresentation: fdmExplorerPresentation(),
+    });
+
+    expect(resolveExplorerDomainLane(snapshot)).toBe("fem");
+  });
+
+  it("keeps explicit unresolved mode ahead of stale FDM artifact presentation", () => {
+    const snapshot = modelTreeSnapshotFromScene({} as SceneResource, {
+      domainMeta: {
+        discretization: "fdm",
+      } as DomainMetaResource,
+      domainDiscretization: null,
+      domainPresentation: fdmExplorerPresentation(),
+    });
+
+    expect(snapshot.domainDiscretization).toBeNull();
+    expect(resolveExplorerDomainLane(snapshot)).toBe("unresolved");
+  });
+
+  it("keeps the legacy artifact fallback when no resolved lane is supplied", () => {
+    const snapshot = modelTreeSnapshotFromScene({} as SceneResource, {
+      domainPresentation: fdmExplorerPresentation(),
+    });
+
+    expect(Object.prototype.hasOwnProperty.call(snapshot, "domainDiscretization")).toBe(false);
+    expect(resolveExplorerDomainLane(snapshot)).toBe("fdm");
   });
 });
 
@@ -882,6 +916,46 @@ describe("buildModelTree", () => {
     });
   });
 
+  it("keeps the published mesh identity visible after a failed candidate", () => {
+    const flattened = flattenExplorerNodes(
+      buildModelTree({
+        domainDiscretization: "fem",
+        mesh: {
+          lastError: "mesher rejected the candidate",
+          latestBuildStatus: "completed",
+          manifestSourceSceneRevision: 14,
+          meshName: "published-mesh",
+          meshRevision: 7,
+          sourceSceneRevision: 15,
+        },
+      }),
+    );
+
+    expect(flattened.find((node) => node.id === "model:mesh")).toMatchObject({
+      badge: "failed · retained published-mesh",
+      status: "mesh-failed",
+    });
+    expect(flattened.find((node) => node.id === "model:mesh:builds")).toMatchObject({
+      badge: "failed · retained rev 7",
+      status: "mesh-failed",
+    });
+
+    const unresolved = flattenExplorerNodes(
+      buildModelTree({
+        domainDiscretization: "fem",
+        mesh: {
+          lastError: "mesher rejected the candidate",
+          meshName: "unverified-mesh",
+          meshRevision: 8,
+        },
+      }),
+    );
+    expect(unresolved.find((node) => node.id === "model:mesh")).toMatchObject({
+      badge: "failed",
+      status: "mesh-failed",
+    });
+  });
+
   it("projects canonical SceneDocument objects into lifecycle-aware nodes", () => {
     const snapshot = modelTreeSnapshotFromScene({
       materials: [
@@ -1692,7 +1766,7 @@ describe("buildModelTree", () => {
     );
   });
 
-  it("builds an explicit Add Antenna pipeline instruction node", () => {
+  it("builds an explicit Add Field Drive pipeline instruction node", () => {
     const snapshot = modelTreeSnapshotFromScene({
       objects: [],
       study: {
@@ -1716,7 +1790,7 @@ describe("buildModelTree", () => {
     expect(node).toMatchObject({
       badge: "field drive",
       kind: "study.stage.add_field_drive",
-      label: "Add Antenna 1",
+      label: "Add Field Drive 1",
       stageId: "add-k0-antenna",
       stageIndex: 0,
     });
@@ -3543,6 +3617,7 @@ describe("buildModelTree", () => {
       buildModelTree({ domainPresentation: fdmExplorerPresentation() }),
     );
     expect(nodes.find((node) => node.id === "model:mesh")).toMatchObject({
+      contextCommands: ["grid.build-fdm", "workspace.focus-selection"],
       kind: "mesh.root",
       label: "Mesh",
     });
@@ -3558,6 +3633,7 @@ describe("buildModelTree", () => {
       "model:mesh:mask", "model:mesh:provenance", "model:mesh:region:region%3Acore",
     ]));
     expect(nodes.find((node) => node.id === "model:mesh")?.contextCommands).toEqual([
+      "grid.build-fdm",
       "workspace.focus-selection",
     ]);
     for (const nodeId of [
@@ -3607,7 +3683,7 @@ describe("buildModelTree", () => {
       domainPresentationStatus: "error",
     }));
     expect(nodes.find((node) => node.id === "model:mesh")).toMatchObject({
-      kind: "mesh.root", status: "degraded", contextCommands: ["workspace.focus-selection"],
+      kind: "mesh.root", status: "degraded", contextCommands: ["grid.build-fdm", "workspace.focus-selection"],
     });
     expect(nodes.map((node) => node.kind)).not.toEqual(expect.arrayContaining([
       "mesh.unassigned", "airbox.root", "boundary-faces.root",
@@ -3928,6 +4004,11 @@ describe("buildModelTree", () => {
       kind: "airbox.root",
       label: "Airbox",
       status: "mesh-stale",
+    });
+    expect(
+      nodes.find((node) => node.id === "model:mesh:shared-domain"),
+    ).toMatchObject({
+      contextCommands: ["grid.build-fdm"],
     });
     expect(nodes.find((node) => node.id === "model:mesh")).toMatchObject({
       kind: "mesh.root",

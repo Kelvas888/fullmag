@@ -40,7 +40,7 @@ nazwa brancha. Domyślne project storage roots to:
 
 | Host | Project storage root | Trasa wykonania |
 | --- | --- | --- |
-| Windows | `C:\git\fullmag\storage` | native FDM/Rust/Python/Control Room; Docker Desktop dla FEM |
+| Windows | `D:\git\fullmag\storage` | native FDM/Rust/Python/Control Room; Docker Desktop dla FEM |
 | dedykowany Linux runner | `/zfn2/mateuszz/git/fullmag/storage` | managed, container-backed `just` dla FEM/MFEM/CUDA |
 
 `FULLMAG_PROJECT_STORAGE_ROOT` jest kanonicznym override’em całego rootu.
@@ -91,6 +91,16 @@ zadanie jawnie. Audyt, plan i mała edycja dokumentu nie tworzą nowego
 checkoutu tylko z powodu samej izolacji.
 
 ### Build, cache i równoległość
+
+Rozszerzenie natywnego workspace Windows (P8-52): działające EXE mogą pochodzić
+z zapieczętowanej kopii w resolverowym runtime root. Publikacja i kontrola
+wszystkich hashy odbywają się pod blokadą worktree. Dopiero handshake własnego
+launchera zwalnia tę blokadę; osobna blokada runtime pozostaje do końca procesu.
+Mutowalne targety nadal wymagają dotychczasowej blokady. Watcher buduje nowe
+EXE, ale nie restartuje sesji ani nie deklaruje odtworzenia niezapisanych
+szkiców. Kopia EXE nie stanowi izolacji naukowego runu od edytowalnego Python
+DSL i zależności frontendu. Wycofanie: wyłączyć watcher i wrócić do jawnego
+release; zachować opublikowane kopie i dowody zamiast kasować aktywne dane.
 
 Profil builda powinien rozróżniać platformę, toolchain, debug/release, funkcje,
 rodzinę backendu, urządzenie, precyzję i zależności ABI. Obecny resolver używa
@@ -154,6 +164,10 @@ rzeczywisty command, inventory przed/po, manifest i ścieżki. Nie deklaruje si�
 „całkowitego zakazu zapisu” wyłącznie na podstawie dokumentacji.
 
 ### Dokument CAE a infrastruktura hosta
+
+[ADR 0048](0048-installed-windows-run-storage.md) rozszerza tę politykę
+o magazyn runów zainstalowanego produktu Windows, bez checkoutu developerskiego.
+Nie zmienia resolvera buildów ani konfiguracji storage operatora.
 
 Dokument CAE i hostowa infrastruktura mają różne tożsamości oraz cykle życia:
 

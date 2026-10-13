@@ -1,14 +1,20 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   acknowledgedAuthoringSceneRevision,
   invalidateAuthoringMutationDependents,
 } from "@/kernel/authoring/authoringMutationInvalidation";
-import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
+import {
+  authoringWriteOptions,
+  runAuthoringMutationWithHistory,
+} from "@/kernel/authoring/authoringHistoryMutation";
 import { createCommandContext } from "@/kernel/commands/commandContext";
 import { useKernel } from "@/kernel/KernelContext";
+import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
+import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import {
+  SCENE_RESOURCE_KEY,
   useModelRegionsResource,
   useSceneResource,
 } from "@/kernel/resources/geometryLifecycleResources";
@@ -19,6 +25,7 @@ import {
 } from "@/kernel/resources/useActiveLaneCapabilities";
 import {
   ObjectRegionMetadataSection,
+  type RegionAuxiliaryDraftSession,
   type RegionSubPanelProps,
 } from "./shared";
 import {
@@ -50,9 +57,12 @@ import type { Selection, RegionVisualizationTargetId } from "@/kernel/selection/
 export function ObjectRegionTexturePanel({
   model: regionModel,
   meshLane = "unknown",
+  auxiliaryDraftOwnerKey,
+  reportAuxiliaryDraftSession,
 }: RegionSubPanelProps) {
   const kernel = useKernel();
-  const { api, authoringHistory, resources } = kernel;
+  const { api, authoringHistory, commands, resources } = kernel;
+  const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
   const activeLane = useActiveLaneCapabilities();
   const scene = useSceneResource();
   const regions = useModelRegionsResource();
@@ -89,6 +99,16 @@ export function ObjectRegionTexturePanel({
   );
   const draftKey = objectMagneticTextureDraftKey(model);
   const draftIdentityKey = objectMagneticTextureDraftIdentityKey(model);
+  const resourceRevision = model.baseRevision ?? -1;
+  const [acknowledgedBaseline, setAcknowledgedBaseline] = useState<{
+    draft: ObjectMagneticTextureDraft;
+    identityKey: string;
+    revision: number;
+  }>({ draft: baseDraft, identityKey: draftIdentityKey, revision: resourceRevision });
+  const baselineDraft = acknowledgedBaseline.identityKey === draftIdentityKey &&
+    resourceRevision < acknowledgedBaseline.revision
+    ? acknowledgedBaseline.draft
+    : baseDraft;
   const [draftState, setDraftState] = useState<
     InspectorDraftState<ObjectMagneticTextureDraft>
   >(() =>
@@ -98,15 +118,27 @@ export function ObjectRegionTexturePanel({
       identityKey: draftIdentityKey,
     }),
   );
+  const draftStateRef = useRef(draftState);
+  useLayoutEffect(() => {
+    draftStateRef.current = draftState;
+  }, [draftState]);
   const [feedback, setFeedback] = useState<MagneticTextureFeedback>(null);
-  const [pending, setPending] = useState(false);
-  const { dirty, draft } = resolveInspectorDraftState({
+  const [pendingOperation, setPendingOperation] = useState<{
+    id: number;
+    sessionScopeKey: string | null;
+  } | null>(null);
+  const nextPendingOperationId = useRef(0);
+  const pending = pendingOperation?.sessionScopeKey === sessionScopeKey;
+  const resolvedDraftState = resolveInspectorDraftState({
     baseDraft,
     baseKey: draftKey,
     identityKey: draftIdentityKey,
     isDirty: objectMagneticTextureDraftDirty,
     state: draftState,
   });
+  const draft = resolvedDraftState.draft;
+  const dirty = objectMagneticTextureDraftDirty(draft, baselineDraft);
+  const mutationInFlight = useRef(false);
   const textureCapabilityOperation =
     draft.presetKind === "uniform"
       ? "initial_magnetization.uniform"
@@ -118,8 +150,13 @@ export function ObjectRegionTexturePanel({
       ? resolveActiveLaneOperation(activeLane, textureCapabilityOperation)
       : null;
 
+  function replaceDraftState(next: InspectorDraftState<ObjectMagneticTextureDraft>): void {
+    draftStateRef.current = next;
+    setDraftState(next);
+  }
+
   function updateDraft(patch: Partial<ObjectMagneticTextureDraft>): void {
-    setDraftState(
+    replaceDraftState(
       updateInspectorDraftState({
         baseDraft,
         baseKey: draftKey,
@@ -135,24 +172,63 @@ export function ObjectRegionTexturePanel({
     invalidateAuthoringMutationDependents(resources, "magnetization", revision);
   }
 
-  async function saveTexture(): Promise<void> {
+  function createHistoryMutationContext() {
+    const operationSessionScopeKey = sessionScopeKey;
+    const historyGeneration = authoringHistory?.getGeneration?.();
+    return {
+      api,
+      authoringHistory,
+      resourceData: { [SCENE_RESOURCE_KEY]: scene.data },
+      sessionScopeKey: operationSessionScopeKey,
+      isCurrentSessionScope: () =>
+        commands.getSessionScopeKey() === operationSessionScopeKey &&
+        (historyGeneration === undefined ||
+          authoringHistory?.getGeneration?.() === historyGeneration),
+    };
+  }
+
+  function beginPendingOperation(): number {
+    const operationId = ++nextPendingOperationId.current;
+    setPendingOperation({ id: operationId, sessionScopeKey });
+    return operationId;
+  }
+
+  function finishPendingOperation(operationId: number): void {
+    setPendingOperation((current) =>
+      current?.id === operationId ? null : current,
+    );
+  }
+
+  async function saveTexture(
+    submittedDraft: ObjectMagneticTextureDraft = draft,
+  ): Promise<boolean> {
+    if (mutationInFlight.current) return false;
     if (model.mode !== "committed") {
       setFeedback({ kind: "error", message: "No committed scene object." });
-      return;
+      return false;
     }
     if (textureCapability && !textureCapability.enabled) {
       setFeedback({ kind: "error", message: textureCapability.reason });
-      return;
+      return false;
     }
     if (!model.regionId) {
       setFeedback({ kind: "error", message: "No selected texture target." });
-      return;
+      return false;
     }
-    setPending(true);
+    const historyContext = createHistoryMutationContext();
+    if (!historyContext.sessionScopeKey) {
+      setFeedback({
+        kind: "error",
+        message: "Session identity is not ready. Try again after it loads.",
+      });
+      return false;
+    }
+    mutationInFlight.current = true;
+    const operationId = beginPendingOperation();
     try {
-      const asset = buildObjectMagneticTextureAssetDraft(model, draft);
+      const asset = buildObjectMagneticTextureAssetDraft(model, submittedDraft);
       const response = await runAuthoringMutationWithHistory(
-        { api, authoringHistory },
+        historyContext,
         `Save region magnetic texture ${model.regionId}`,
         async ({ baseRevision }) => {
           const request = buildMagnetizationTransactionRequest(
@@ -160,35 +236,74 @@ export function ObjectRegionTexturePanel({
             asset,
             asset.id,
           );
-          return api.model.commitTransaction({
-            ...request,
-            base_revision: baseRevision ?? request.base_revision,
-          });
+          const commitRevision = baseRevision ?? request.base_revision;
+          if (typeof commitRevision !== "number" || !Number.isFinite(commitRevision)) {
+            throw new Error(
+              "The canonical scene revision is unavailable. Refetch the scene before applying.",
+            );
+          }
+          const options = authoringWriteOptions(
+            commitRevision,
+            historyContext.sessionScopeKey,
+          );
+          if (!options?.sessionScopeKey || options.baseRevision === undefined) {
+            throw new Error(
+              "The session-scoped scene revision is unavailable. Refetch the scene before applying.",
+            );
+          }
+          return api.model.commitTransaction(
+            {
+              ...request,
+              base_revision: commitRevision,
+            },
+            options,
+          );
         },
       );
+      if (historyContext.isCurrentSessionScope() === false) return false;
       const revision = acknowledgedAuthoringSceneRevision(response);
       invalidateTextureResources(revision);
-      const syncWarning = await syncAuthoringScriptBestEffort(api);
-      setDraftState({
-        baseKey: draftKey,
-        dirty: false,
-        draft: { ...draft, magnetizationRef: asset.id },
+      const syncWarning = await syncAuthoringScriptBestEffort(
+        api,
+        historyContext.sessionScopeKey,
+      );
+      if (historyContext.isCurrentSessionScope() === false) return false;
+      const acknowledgedDraft = { ...submittedDraft, magnetizationRef: asset.id };
+      setAcknowledgedBaseline({
+        draft: acknowledgedDraft,
         identityKey: draftIdentityKey,
+        revision,
       });
+      if (
+        draftStateRef.current.identityKey === draftIdentityKey &&
+        draftStateRef.current.draft === submittedDraft
+      ) {
+        replaceDraftState({
+          baseKey: draftKey,
+          dirty: false,
+          draft: acknowledgedDraft,
+          identityKey: draftIdentityKey,
+        });
+      }
       setFeedback({
         kind: "success",
         message: syncWarning
           ? `Magnetic texture saved. Sync skipped: ${syncWarning}`
           : "Magnetic texture saved.",
       });
+      return true;
     } catch (error) {
+      if (historyContext.isCurrentSessionScope() === false) return false;
       setFeedback({ kind: "error", message: error instanceof Error ? error.message : String(error) });
+      return false;
     } finally {
-      setPending(false);
+      mutationInFlight.current = false;
+      finishPendingOperation(operationId);
     }
   }
 
   async function clearTexture(): Promise<void> {
+    if (mutationInFlight.current) return;
     if (model.mode !== "committed") {
       setFeedback({ kind: "error", message: "No committed scene object." });
       return;
@@ -197,10 +312,20 @@ export function ObjectRegionTexturePanel({
       setFeedback({ kind: "error", message: "No selected texture target." });
       return;
     }
-    setPending(true);
+    const historyContext = createHistoryMutationContext();
+    if (!historyContext.sessionScopeKey) {
+      setFeedback({
+        kind: "error",
+        message: "Session identity is not ready. Try again after it loads.",
+      });
+      return;
+    }
+    const submittedDraft = draft;
+    mutationInFlight.current = true;
+    const operationId = beginPendingOperation();
     try {
       const response = await runAuthoringMutationWithHistory(
-        { api, authoringHistory },
+        historyContext,
         `Clear region magnetic texture ${model.regionId}`,
         async ({ baseRevision }) => {
           const request = buildMagnetizationTransactionRequest(
@@ -208,21 +333,55 @@ export function ObjectRegionTexturePanel({
             null,
             null,
           );
-          return api.model.commitTransaction({
-            ...request,
-            base_revision: baseRevision ?? request.base_revision,
-          });
+          const commitRevision = baseRevision ?? request.base_revision;
+          if (typeof commitRevision !== "number" || !Number.isFinite(commitRevision)) {
+            throw new Error(
+              "The canonical scene revision is unavailable. Refetch the scene before applying.",
+            );
+          }
+          const options = authoringWriteOptions(
+            commitRevision,
+            historyContext.sessionScopeKey,
+          );
+          if (!options?.sessionScopeKey || options.baseRevision === undefined) {
+            throw new Error(
+              "The session-scoped scene revision is unavailable. Refetch the scene before applying.",
+            );
+          }
+          return api.model.commitTransaction(
+            {
+              ...request,
+              base_revision: commitRevision,
+            },
+            options,
+          );
         },
       );
+      if (historyContext.isCurrentSessionScope() === false) return;
       const revision = acknowledgedAuthoringSceneRevision(response);
       invalidateTextureResources(revision);
-      const syncWarning = await syncAuthoringScriptBestEffort(api);
-      setDraftState({
-        baseKey: draftKey,
-        dirty: false,
-        draft: { ...baseDraft, magnetizationRef: "" },
+      const syncWarning = await syncAuthoringScriptBestEffort(
+        api,
+        historyContext.sessionScopeKey,
+      );
+      if (historyContext.isCurrentSessionScope() === false) return;
+      const clearedDraft = { ...baseDraft, magnetizationRef: "" };
+      setAcknowledgedBaseline({
+        draft: clearedDraft,
         identityKey: draftIdentityKey,
+        revision,
       });
+      if (
+        draftStateRef.current.identityKey === draftIdentityKey &&
+        draftStateRef.current.draft === submittedDraft
+      ) {
+        replaceDraftState({
+          baseKey: draftKey,
+          dirty: false,
+          draft: clearedDraft,
+          identityKey: draftIdentityKey,
+        });
+      }
       setFeedback({
         kind: "success",
         message: syncWarning
@@ -230,21 +389,26 @@ export function ObjectRegionTexturePanel({
           : "Magnetic texture cleared.",
       });
     } catch (error) {
+      if (historyContext.isCurrentSessionScope() === false) return;
       setFeedback({ kind: "error", message: error instanceof Error ? error.message : String(error) });
     } finally {
-      setPending(false);
+      mutationInFlight.current = false;
+      finishPendingOperation(operationId);
     }
   }
 
   async function activateLoadTextureNode(): Promise<void> {
-    setPending(true);
+    if (mutationInFlight.current) return;
+    const operationId = beginPendingOperation();
+    const commandContext = createCommandContext("inspector", kernel, {
+      sourceDetail: "object-magnetic-texture",
+    });
     try {
       const result = await kernel.commands.execute(
         "magnetization-texture.activate-load-file",
-        createCommandContext("inspector", kernel, {
-          sourceDetail: "object-magnetic-texture",
-        }),
+        commandContext,
       );
+      if (commandContext.isCurrentSessionScope?.() === false) return;
       if (result.status !== "completed") {
         setFeedback({
           kind: "error",
@@ -254,9 +418,66 @@ export function ObjectRegionTexturePanel({
         setFeedback(null);
       }
     } finally {
-      setPending(false);
+      finishPendingOperation(operationId);
     }
   }
+
+  function resetDraft(): void {
+    if (mutationInFlight.current) return;
+    replaceDraftState(
+      initialInspectorDraftState({
+        baseDraft: baselineDraft,
+        baseKey: draftKey,
+        identityKey: draftIdentityKey,
+      }),
+    );
+    setFeedback(null);
+  }
+
+  let valid = model.mode === "committed" && Boolean(model.regionId) &&
+    (!textureCapability || textureCapability.enabled);
+  if (valid) {
+    try {
+      buildObjectMagneticTextureAssetDraft(model, draft);
+    } catch {
+      valid = false;
+    }
+  }
+  const saveTextureRef = useRef(saveTexture);
+  const auxiliaryResetRef = useRef(resetDraft);
+  // Publish the latest handler closures after every committed render.
+  useLayoutEffect(() => {
+    saveTextureRef.current = saveTexture;
+    auxiliaryResetRef.current = resetDraft;
+  });
+  const applyAuxiliaryDraft = useCallback(
+    () => saveTextureRef.current(draft),
+    [draft],
+  );
+  const resetAuxiliaryDraft = useCallback(
+    () => auxiliaryResetRef.current(),
+    [],
+  );
+  useEffect(() => {
+    if (!auxiliaryDraftOwnerKey || !reportAuxiliaryDraftSession) return;
+    const session: RegionAuxiliaryDraftSession = {
+      applying: pending && mutationInFlight.current,
+      apply: applyAuxiliaryDraft,
+      dirty,
+      reset: resetAuxiliaryDraft,
+      valid,
+    };
+    reportAuxiliaryDraftSession(auxiliaryDraftOwnerKey, session);
+    return () => reportAuxiliaryDraftSession(auxiliaryDraftOwnerKey, null);
+  }, [
+    applyAuxiliaryDraft,
+    auxiliaryDraftOwnerKey,
+    dirty,
+    pending,
+    reportAuxiliaryDraftSession,
+    resetAuxiliaryDraft,
+    valid,
+  ]);
 
   return (
     <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group">
@@ -277,16 +498,7 @@ export function ObjectRegionTexturePanel({
         model={model}
         onClear={() => void clearTexture()}
         onActivateLoad={() => void activateLoadTextureNode()}
-        onRevert={() => {
-          setDraftState(
-            initialInspectorDraftState({
-              baseDraft,
-              baseKey: draftKey,
-              identityKey: draftIdentityKey,
-            }),
-          );
-          setFeedback(null);
-        }}
+        onRevert={resetDraft}
         onSave={() => void saveTexture()}
         pending={pending}
       />

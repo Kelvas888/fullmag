@@ -137,12 +137,15 @@ export function StudyPipelineSection({
   authoringBusy = false,
   authoringFeedback,
   demagEnabled = false,
+  executionProfileBound = false,
+  executionProfileDraftDirty = false,
   k0ModalReadinessFor,
   draft,
   draftIndex,
   drafts,
   model,
   showDraftEditor = true,
+  readOnlyReason = null,
   onAddStage,
   onCommit,
   onDuplicateStage,
@@ -159,12 +162,15 @@ export function StudyPipelineSection({
   authoringBusy?: boolean;
   authoringFeedback: { kind: "success" | "danger" | "error" | "warning"; message: string } | null;
   demagEnabled?: boolean;
+  executionProfileBound?: boolean;
+  executionProfileDraftDirty?: boolean;
   k0ModalReadinessFor?: (draft: StudyStageDraft) => K0ModalExecutionReadiness;
   draft: StudyStageDraft | null;
   draftIndex: number;
   drafts: readonly StudyStageDraft[];
   model: StudyInspectorModel;
   showDraftEditor?: boolean;
+  readOnlyReason?: string | null;
   onAddStage: (kind: StudyStageDraft["kind"]) => void;
   onCommit?: () => void;
   onDuplicateStage?: (index: number) => void;
@@ -212,7 +218,8 @@ export function StudyPipelineSection({
           />
         ))}
       </div>
-      {showDraftEditor && draft ? (
+      {readOnlyReason ? <FeedbackBanner kind="warning" message={readOnlyReason} /> : null}
+      {showDraftEditor && draft && !readOnlyReason ? (
         <>
           <StudyStageDraftEditor
             draft={draft}
@@ -228,7 +235,7 @@ export function StudyPipelineSection({
           />
           <div className="fm-inspector-toolbar">
             {onDuplicateStage ? (
-              <Button disabled={authoringBusy} size="sm" type="button" variant="ghost" onClick={() => onDuplicateStage(draftIndex)}>
+              <Button disabled={authoringBusy || draft.kind === "antenna_field_solve"} size="sm" type="button" variant="ghost" onClick={() => onDuplicateStage(draftIndex)}>
                 Duplicate
               </Button>
             ) : null}
@@ -250,10 +257,12 @@ export function StudyPipelineSection({
             <span className="fm-inspector-toolbar__spacer" />
             {onCommit ? (
               <Button
-                disabled={authoringBusy || hasDraftErrors}
+                disabled={authoringBusy || hasDraftErrors || executionProfileDraftDirty}
                 size="sm"
                 title={
-                  hasDraftErrors
+                  executionProfileDraftDirty
+                    ? "Apply or cancel the Study execution profile draft before saving stages."
+                    : hasDraftErrors
                     ? "Fix stage validation errors before saving."
                     : authoringBusy
                       ? "Saving stages."
@@ -283,7 +292,7 @@ export function StudyPipelineSection({
           message={authoringFeedback.message}
         />
       ) : null}
-      {showDraftEditor ? (
+      {showDraftEditor && !readOnlyReason ? (
         <div
           className="fm-inspector-toolbar"
           data-testid="study-stage-authoring-toolbar"
@@ -304,7 +313,7 @@ export function StudyPipelineSection({
           onClick={() => onAddStage("add_field_drive")}
         >
           <Radio size={13} aria-hidden="true" />
-          Antenna
+          Field Drive
         </Button>
         <Button
           size="sm"
@@ -373,6 +382,10 @@ export function StudyPipelineSection({
           size="sm"
           type="button"
           variant="ghost"
+          disabled={executionProfileBound}
+          title={executionProfileBound
+            ? "Change device is incompatible with a bound execution profile. Clear and apply the profile first."
+            : undefined}
           onClick={() => onAddStage("change_device")}
         >
           <Plus size={13} aria-hidden="true" />
@@ -388,6 +401,18 @@ export function StudyPipelineSection({
           Save state
         </Button>
         </div>
+      ) : null}
+      {executionProfileBound ? (
+        <FeedbackBanner
+          kind="warning"
+          message="Change device authoring is disabled while an execution profile is selected. Clear and apply the profile before adding a device-change stage."
+        />
+      ) : null}
+      {executionProfileDraftDirty ? (
+        <FeedbackBanner
+          kind="warning"
+          message="Apply or cancel the Study execution profile draft before saving the stage list."
+        />
       ) : null}
 
       <div className="fm-inspector-toolbar fm-mt-2">

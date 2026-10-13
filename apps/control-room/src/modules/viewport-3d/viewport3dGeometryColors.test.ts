@@ -12,6 +12,11 @@ import {
 } from "./viewport3dGeometryColors";
 import { magnitudeColorRgb } from "./viewport3dVectorColoring";
 
+// The scalar palette API already returns linear-sRGB for vertex attributes.
+function linearMagnitudeColor(t: number): number[] {
+  return magnitudeColorRgb(t);
+}
+
 function vectorField(values: number[], nComp = 3): DecodedFieldVector {
   return {
     dtype: "float64",
@@ -46,7 +51,7 @@ describe("viewport3dGeometryColors", () => {
     const firstVersion = firstAttribute.version;
 
     expect(Array.from(firstAttribute.array)).toEqual(
-      Array.from(Float32Array.from([...magnitudeColorRgb(0), ...magnitudeColorRgb(1)])),
+      Array.from(Float32Array.from([...linearMagnitudeColor(0), ...linearMagnitudeColor(1)])),
     );
 
     expect(
@@ -68,7 +73,7 @@ describe("viewport3dGeometryColors", () => {
     expect(secondAttribute).toBe(firstAttribute);
     expect(secondAttribute.version).toBeGreaterThan(firstVersion);
     expect(Array.from(secondAttribute.array)).toEqual(
-      Array.from(Float32Array.from([...magnitudeColorRgb(1), ...magnitudeColorRgb(0)])),
+      Array.from(Float32Array.from([...linearMagnitudeColor(1), ...linearMagnitudeColor(0)])),
     );
   });
 

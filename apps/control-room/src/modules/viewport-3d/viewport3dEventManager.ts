@@ -10,6 +10,7 @@ const VIEWPORT_3D_EVENT_HANDLER_KEYS = [
   "onClick",
   "onPointerDown",
   "onPointerMove",
+  "onPointerUp",
   "onPointerLeave",
   "onPointerCancel",
   "onLostPointerCapture",
@@ -17,6 +18,10 @@ const VIEWPORT_3D_EVENT_HANDLER_KEYS = [
 ] as const satisfies readonly (keyof Events)[];
 const VIEWPORT_3D_IMMEDIATE_POINTER_DOWN_REGION_PX = 240;
 const VIEWPORT_3D_STATIC_CLICK_DELTA_PX = 2;
+
+interface Viewport3DPointerDownDispatch {
+  immediate: boolean;
+}
 
 export function pickViewport3DEventHandlers(
   handlers: EventManager<HTMLElement>["handlers"],
@@ -66,38 +71,43 @@ export function isViewport3DImmediatePointerDownRegion(event: Event): boolean {
 export function createViewport3DPointerDownHandler(
   store: Parameters<typeof createPointerEvents>[0],
   pointerDownHandler?: EventListener,
+  pointerDownDispatch?: Viewport3DPointerDownDispatch,
 ): EventListener {
   return (event) => {
-    if (pointerDownHandler && isViewport3DImmediatePointerDownRegion(event)) {
-      pointerDownHandler(event);
-      event.preventDefault?.();
-      event.stopPropagation?.();
-      (event as Event & { stopImmediatePropagation?: () => void })
-        .stopImmediatePropagation?.();
-      return;
-    }
-
     const state = store.getState();
     state.internal.initialClick = viewport3DEventOffset(event);
     state.internal.initialHits = [];
+    const immediate = Boolean(pointerDownHandler && isViewport3DImmediatePointerDownRegion(event));
+    if (pointerDownDispatch) pointerDownDispatch.immediate = immediate;
+    if (immediate) {
+      pointerDownHandler?.(event);
+      return;
+    }
   };
 }
 
 export function createViewport3DClickSelectionHandler({
   clickHandler,
   pointerDownHandler,
+  pointerDownDispatch,
   store,
+  pointerDownAlreadyHandled = () => false,
 }: {
+  pointerDownAlreadyHandled?: () => boolean;
   clickHandler?: EventListener;
   pointerDownHandler?: EventListener;
+  pointerDownDispatch?: Viewport3DPointerDownDispatch;
   store: Parameters<typeof createPointerEvents>[0];
 }): EventListener {
   return (event) => {
+    const alreadyDispatched = pointerDownDispatch?.immediate ?? false;
+    if (pointerDownDispatch) pointerDownDispatch.immediate = false;
     if (viewport3DClickDelta(store, event) > VIEWPORT_3D_STATIC_CLICK_DELTA_PX) {
       return;
     }
 
-    pointerDownHandler?.(event);
+    if (pointerDownAlreadyHandled()) return;
+    if (!alreadyDispatched) pointerDownHandler?.(event);
     if (store.getState().internal.initialHits.length > 0) return;
     clickHandler?.(event);
   };
@@ -105,36 +115,82 @@ export function createViewport3DClickSelectionHandler({
 
 export function createViewport3DPointerMoveHandler(
   handler: EventListener | undefined,
+  isPointerCaptured: (pointerId: number) => boolean = () => false,
 ): EventListener | undefined {
   if (!handler) return undefined;
 
   return (event) => {
     const pointerEvent = event as PointerEvent;
-    if (pointerEvent.buttons !== 0) return;
+    if (pointerEvent.buttons !== 0 && !isPointerCaptured(pointerEvent.pointerId)) return;
     handler(event);
   };
 }
 
 export function createViewport3DEventManager(
   store: Parameters<typeof createPointerEvents>[0],
+  isMoveToolActive: () => boolean = () => false,
 ): EventManager<HTMLElement> {
   const manager = createPointerEvents(store);
   const pickedHandlers = pickViewport3DEventHandlers(manager.handlers);
+  const pointerDownDispatch: Viewport3DPointerDownDispatch = { immediate: false };
+  let probingMoveHandle = false;
+  let movePointerDownHandled = false;
+  let connectedTarget: HTMLElement | null = null;
+  const originalFilter = manager.filter;
+  const handleMovePointerDownCapture = (event: PointerEvent) => {
+    movePointerDownHandled = false;
+    if (!isMoveToolActive() || event.button !== 0 || isViewport3DImmediatePointerDownRegion(event)) return;
+    probingMoveHandle = true;
+    try {
+      pickedHandlers?.onPointerDown?.(event);
+    } finally {
+      probingMoveHandle = false;
+    }
+    // Only gizmo intersections participate in this probe. Ordinary object
+    // selection stays deferred until click, and a miss remains an Orbit drag.
+    movePointerDownHandled = store.getState().internal.initialHits.length > 0;
+    if (!movePointerDownHandled) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+  };
   return {
     ...manager,
+    filter: (intersections, state) => {
+      const filtered = originalFilter?.(intersections, state) ?? intersections;
+      return probingMoveHandle
+        ? filtered.filter((hit) => hit.object.userData.gizmo === "move-axis")
+        : filtered;
+    },
+    connect: (target) => {
+      connectedTarget?.removeEventListener("pointerdown", handleMovePointerDownCapture, true);
+      manager.connect?.(target);
+      connectedTarget = target;
+      target.addEventListener("pointerdown", handleMovePointerDownCapture, true);
+    },
+    disconnect: () => {
+      connectedTarget?.removeEventListener("pointerdown", handleMovePointerDownCapture, true);
+      connectedTarget = null;
+      movePointerDownHandled = false;
+      manager.disconnect?.();
+    },
     handlers: {
       ...pickedHandlers,
       onClick: createViewport3DClickSelectionHandler({
+        pointerDownAlreadyHandled: () => movePointerDownHandled,
         clickHandler: pickedHandlers?.onClick,
         pointerDownHandler: pickedHandlers?.onPointerDown,
+        pointerDownDispatch,
         store,
       }),
       onPointerDown: createViewport3DPointerDownHandler(
         store,
         pickedHandlers?.onPointerDown,
+        pointerDownDispatch,
       ),
       onPointerMove: createViewport3DPointerMoveHandler(
         pickedHandlers?.onPointerMove,
+        (pointerId) => store.getState().internal.capturedMap.has(pointerId),
       ),
       onWheel: () => {
         // Native wheel event is allowed to propagate for camera controls, but we

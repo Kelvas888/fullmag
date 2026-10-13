@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 import { useKernel } from "@/kernel/KernelContext";
 import { decodeFieldVector } from "@/kernel/api/codecs";
@@ -15,7 +15,9 @@ import {
   usePlanarVectorResource,
 } from "@/kernel/resources/planarFieldResources";
 import { useDomainMetaResource } from "@/kernel/resources/geometryLifecycleResources";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
+import { useSessionScopedResourceKey } from "@/kernel/resources/useSessionScopedResourceKey";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
 import { resolveVisualizationTargetFromSelection } from "@/kernel/visualization/ObjectVisualizationController";
 import {
@@ -49,9 +51,11 @@ import {
   type PlanarRenderEvidence,
 } from "./model/fieldMapEvidence";
 import { PlanarSurface } from "./renderer/PlanarSurface";
+import { useRetainedPlanarFrame } from "./hooks/useRetainedPlanarFrame";
 
 function useFieldMapModuleController() {
   const { layout, visualizationSync } = useKernel();
+  const { resourceKey: sessionFrameKey, sessionIdentity } = useSessionScopedResourceKey("planar-render-frame");
   const [pinned, setPinned] = useState<readonly [number, number] | null>(null);
   const [renderEvidence, setRenderEvidence] =
     useState<PlanarRenderEvidence | null>(null);
@@ -82,7 +86,7 @@ function useFieldMapModuleController() {
   }, [canonicalSourceKind, canonicalSourceMonitorId]);
   const domain = useDomainMetaResource({ enabled: active });
   const runtime = useSessionStatusSelector(
-    (status) => status.data?.domain.discretization ?? null,
+    (status) => resolveSessionDiscretization(status.data),
     { enabled: active },
   );
   const selectedFieldContext = useSelectionSelector((selection) => {
@@ -310,6 +314,10 @@ function useFieldMapModuleController() {
   const planarViewIdentityKey = useMemo(
     () =>
       JSON.stringify({
+        sessionFrameKey,
+        domainGenerationId: domain.data?.generation_id ?? null,
+        defaultSlice: canonicalPlanar?.default_slice ?? null,
+        vectorBudget: canonicalPlanar?.resolution.vector_budget ?? 0,
         component: canonicalPlanar?.component ?? null,
         quality: canonicalPlanar?.quality ?? null,
         quantityId: canonicalPlanar?.quantity_id ?? null,
@@ -324,6 +332,8 @@ function useFieldMapModuleController() {
         viewScope: canonicalPlanar?.view_scope ?? null,
       }),
     [
+      sessionFrameKey,
+      domain.data?.generation_id,
       canonicalPlanar,
       canonicalSourceKind,
       canonicalSourceMonitorId,
@@ -332,8 +342,9 @@ function useFieldMapModuleController() {
     ],
   );
   const renderModel = useRetainedPlanarFrame(
+    sessionIdentity === null ? null : planarViewIdentityKey,
     freshRenderModel,
-    planarViewIdentityKey,
+    meta.data?.source ? JSON.stringify(meta.data.source) : null,
   );
   const pinnedAxisState = useMemo(() => {
     if (!renderModel || !probe.data) return null;
@@ -451,37 +462,6 @@ function useFieldMapModuleController() {
   };
 }
 
-function useRetainedPlanarFrame<T>(
-  freshRenderModel: T | null,
-  identityKey: string,
-): T | null {
-  // This ref intentionally stores the last complete raster while resource
-  // revisions are loading. It is a render snapshot, rather than mutable
-  // application state; the identity check prevents showing another view's data.
-  /* eslint-disable react-hooks/refs */
-  const retainedFrameRef = useRef<{ identityKey: string; model: T } | null>(null);
-  const retainedFrame = retainedFrameRef.current;
-  const renderModel =
-    freshRenderModel ??
-    (retainedFrame && retainedFrame.identityKey === identityKey
-      ? retainedFrame.model
-      : null);
-  useEffect(() => {
-    if (freshRenderModel) {
-      retainedFrameRef.current = { identityKey, model: freshRenderModel };
-      return;
-    }
-    if (retainedFrameRef.current?.identityKey !== identityKey) {
-      retainedFrameRef.current = null;
-    }
-  }, [freshRenderModel, identityKey]);
-  // The returned value can be the retained ref snapshot during a resource
-  // refresh; keep the intentional boundary local to this hook.
-  /* eslint-enable react-hooks/refs */
-  /* eslint-disable-next-line react-hooks/refs */
-  return renderModel;
-}
-
 export default function FieldMapModule() {
   const {
     canonicalPlanar,
@@ -545,6 +525,9 @@ export default function FieldMapModule() {
   if (!renderModel) {
     return <FieldMapStatus message="Loading planar field…" planarStatus="loading" />;
   }
+  const ambiguousSurfaceMeta = meta.data && surfaceProjectionStatus(meta.data) === "ambiguous"
+    ? meta.data
+    : null;
 
   return (
     <section className="fm-field-map">
@@ -592,10 +575,10 @@ export default function FieldMapModule() {
         <strong>{plan.quantityId}</strong>
         <span>{presentationPlanar.component}</span>
         <span>{renderModel.display.legendUnit}</span>
-        {meta.data && surfaceProjectionStatus(meta.data) === "ambiguous" ? (
+        {ambiguousSurfaceMeta ? (
           <span className="fm-field-map__diagnostic" role="status">
-            Ambiguous surface: {meta.data.overlap_count} overlaps,{" "}
-            {meta.data.fold_count} folds
+            Ambiguous surface: {ambiguousSurfaceMeta.overlap_count} overlaps,{" "}
+            {ambiguousSurfaceMeta.fold_count} folds
           </span>
         ) : null}
       </header>

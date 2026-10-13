@@ -1135,10 +1135,6 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
       usesInstanceColors,
     ],
   );
-  const surfaceMaterialRef = useRef<MeshBasicMaterial | null>(null);
-  useEffect(() => {
-    surfaceMaterialRef.current = surfaceMaterial;
-  }, [surfaceMaterial]);
   const wireframePolicy = RENDER_POLICIES.featureEdges;
   const wireframeColor = wireframeColorFromSettings(renderSettings, colors.wire);
   const wireframeOpacity = renderPlan.wireframe.opacity;
@@ -1208,8 +1204,13 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
     if (!usesInstanceColors && surface.instanceColor !== null) {
       surface.instanceColor = null;
       colorRevisionRef.current = null;
-      const material = surfaceMaterialRef.current;
-      if (material) material.needsUpdate = true;
+      const mountedSurfaceMaterial = surface.material;
+      if (
+        mountedSurfaceMaterial === surfaceMaterial &&
+        mountedSurfaceMaterial instanceof MeshBasicMaterial
+      ) {
+        mountedSurfaceMaterial.needsUpdate = true;
+      }
       colorChanged = true;
     }
     if (usesInstanceColors && surfaceColors) {
@@ -1249,6 +1250,8 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
         previousAdoption?.scalarBuffer !== surfaceColors ||
         previousAdoption?.sessionIdentity?.sessionEpoch !==
           sessionIdentity?.sessionEpoch ||
+        previousAdoption?.sessionIdentity?.requestScopeEpoch !==
+          sessionIdentity?.requestScopeEpoch ||
         previousAdoption?.sessionIdentity?.sessionId !== sessionIdentity?.sessionId;
       if (colorChanged || adoptionIdentityChanged) {
         recordSurfaceAdoption();
@@ -1262,7 +1265,7 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
     invalidate,
     preparedInstances,
     recordSurfaceAdoption,
-    surfaceMaterialRef,
+    surfaceMaterial,
     fieldBufferId,
     sessionIdentity,
     surfaceColors,

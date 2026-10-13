@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { CommandContext } from "../commands/commandTypes";
 import { PendingFormRegistry } from "../authoring/PendingFormRegistry";
+import { EMPTY_SELECTION, type Selection } from "../selection/selectionTypes";
+import type { AuthoringHistoryWorkspaceTransition } from "../authoring/AuthoringHistoryController";
 
 import { SHELL_COMMANDS } from "./shellCommands";
 
@@ -47,7 +49,62 @@ describe("SHELL_COMMANDS", () => {
     expect(togglePanel).toHaveBeenCalledWith("right");
   });
 
-  it("exports the canonical Python source through the model API", async () => {
+  it("restores authoring selection through the shared Undo command", async () => {
+    const nodeId = "model:object:magnet";
+    const previousSelection: Selection = {
+      kind: "object.root",
+      label: "magnet",
+      moduleSource: "geometry-authoring",
+      nodeId,
+      objectId: "magnet",
+      ref: {
+        kind: "object.root",
+        nodeId,
+        objectId: "magnet",
+        type: "scene-object",
+        visualizationTargetId: "object:magnet",
+      },
+    };
+    const transition: AuthoringHistoryWorkspaceTransition = {
+      expected: { selection: EMPTY_SELECTION },
+      restore: { selection: previousSelection },
+      scene: { objects: [{ object_id: "magnet" }] } as never,
+    };
+    const undo = vi.fn(async (
+      _scope: string | null | undefined,
+      onWorkspaceRestored: ((value: AuthoringHistoryWorkspaceTransition) => void) | undefined,
+    ) => {
+      onWorkspaceRestored?.(transition);
+      return { message: "Undid Delete magnet.", status: "completed" as const };
+    });
+    const selection = {
+      clear: vi.fn(),
+      get: () => EMPTY_SELECTION,
+      set: vi.fn(),
+    };
+    const setFocusedSlot = vi.fn();
+    const command = SHELL_COMMANDS.find((candidate) => candidate.id === "workspace.undo");
+
+    await expect(command?.run({
+      authoringHistory: { undo } as unknown as CommandContext["authoringHistory"],
+      layout: { get: () => ({ focusedSlot: "panel-right" }), setFocusedSlot } as never,
+      selection: selection as unknown as CommandContext["selection"],
+      sessionScopeKey: "session=test&epoch=1",
+      source: "shortcut",
+    })).resolves.toMatchObject({ status: "completed" });
+
+    expect(undo).toHaveBeenCalledWith("session=test&epoch=1", expect.any(Function));
+    expect(selection.set).toHaveBeenCalledWith({
+      kind: previousSelection.kind,
+      label: previousSelection.label,
+      nodeId: previousSelection.nodeId,
+      objectId: previousSelection.objectId,
+      ref: previousSelection.ref,
+    }, "authoring-history");
+    expect(setFocusedSlot).not.toHaveBeenCalled();
+  });
+
+  it("saves a canonical copy through the model API", async () => {
     const command = SHELL_COMMANDS.find(
       (candidate) => candidate.id === "workspace.export-python",
     );
@@ -56,7 +113,9 @@ describe("SHELL_COMMANDS", () => {
       entrypoint_kind: "flat_workspace",
       script_path: "/tmp/example.py",
       source_kind: "canonical",
+      source_script_modified: true,
       written: true,
+      written_to: "script",
     }));
     const authoringScript = vi.fn(async () => ({
       bytes: 81,
@@ -75,12 +134,48 @@ describe("SHELL_COMMANDS", () => {
       source: "test",
     });
 
-    expect(syncAuthoringScript).toHaveBeenCalledWith({});
-    expect(authoringScript).toHaveBeenCalledWith();
+    // Without a session scope there are no request options.
+    expect(syncAuthoringScript).toHaveBeenCalledWith({}, undefined);
+    expect(authoringScript).toHaveBeenCalledWith(undefined);
     expect(result).toEqual({
-      message: "Canonical Python exported from /tmp/example.py.",
+      message: "Canonical Python saved from /tmp/example.py.",
       status: "completed",
     });
+  });
+
+  it("keeps the command id but labels it as a canonical copy that never touches a user script", async () => {
+    const command = SHELL_COMMANDS.find(
+      (candidate) => candidate.id === "workspace.export-python",
+    );
+    expect(command?.title).toBe("Save canonical copy as…");
+    const syncAuthoringScript = vi.fn(async () => ({
+      bytes_written: 81,
+      entrypoint_kind: "flat_workspace",
+      managed_copy_path: "/state/exports/model.canonical.py",
+      script_path: "/state/exports/model.canonical.py",
+      source_kind: "canonical",
+      source_script_modified: false,
+      written: true,
+      written_to: "export_copy",
+    }));
+    const authoringScript = vi.fn(async () => ({
+      bytes: 81,
+      managed_copy_path: "/state/exports/model.canonical.py",
+      origin: "user_file",
+      script_path: "/state/exports/model.canonical.py",
+      source: "study = fm.study('x')",
+    }));
+
+    const result = await command?.run({
+      api: {
+        model: { authoringScript, syncAuthoringScript },
+      } as unknown as CommandContext["api"],
+      source: "test",
+    });
+
+    expect(result?.status).toBe("completed");
+    expect(result?.message).toContain("your script was not modified");
+    expect(result?.message).toContain("/state/exports/model.canonical.py");
   });
 
   it("connects New/Open/Save to the shared project document controller", async () => {

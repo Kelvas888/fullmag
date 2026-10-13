@@ -88,11 +88,16 @@ pub enum SessionCommandability {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SessionSummary {
     pub session_id: String,
-    /// Immutable identity of the active session incarnation.
+    /// Scientific session identity shared with observation frames.
     pub session_epoch: String,
+    /// API-instance and transition identity for current-session HTTP/cache ownership.
+    pub request_scope_epoch: String,
     pub name: String,
     pub created_at: String,
     pub workspace_root: String,
+    /// Origin of the session's Python script. Absent when the session has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<crate::types::SessionScriptSummary>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
