@@ -43,6 +43,7 @@ jobs:
           cargo test --locked -p fullmag-api --bin fullmag-api router_v2::handlers::analysis::results::tests -- --nocapture | tee "$RUNNER_TEMP/result-datasets.log"
           grep -F "multi_stage_hysteresis_manifests_preserve_resolved_source_paths_and_revisions ... ok" "$RUNNER_TEMP/result-datasets.log"
           grep -F "resolved_hysteresis_source_ref_rejects_parent_components ... ok" "$RUNNER_TEMP/result-datasets.log"
+          grep -F "generation_binding_replaces_every_payload_generation_query_without_changing_legacy_keys ... ok" "$RUNNER_TEMP/result-datasets.log"
       - name: Run captured artifact generation and field binary contracts
         run: |
           set -o pipefail
@@ -52,6 +53,7 @@ jobs:
           cargo test --locked -p fullmag-api --bin fullmag-api router_v2::handlers::analysis::results::generation_snapshot_tests -- --nocapture | tee "$RUNNER_TEMP/artifact-generations.log"
           grep -F "committed_field_reader_returns_only_digest_verified_generation_bytes ... ok" "$RUNNER_TEMP/artifact-generations.log"
           grep -F "legacy_capture_fence_rejects_a_new_publication ... ok" "$RUNNER_TEMP/artifact-generations.log"
+          grep -F "spectrum_v3_projection_field_link_is_bound_to_the_captured_binary_generation ... ok" "$RUNNER_TEMP/artifact-generations.log"
           cargo test --locked -p fullmag-api --bin fullmag-api router_v2::handlers::data::fields::tests::analysis_artifact_generation_precondition_requires_metadata_binding -- --exact
           cargo test --locked -p fullmag-api --bin fullmag-api router_v2::handlers::data::fields::tests::artifact_generation_header_is_emitted_only_for_a_verified_member -- --exact
       - name: Run older callback magnetization publication contract

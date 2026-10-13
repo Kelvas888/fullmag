@@ -1158,6 +1158,9 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
             ))
         })?;
     validate_generation_producer(generation.as_ref(), Some(run_id.as_str()), None)?;
+    let generation_id = generation
+        .as_ref()
+        .map(|generation| generation.commit.generation_id.as_str());
     let stage_for = |artifact_path: &str, digest: &str, byte_length: u64| {
         result_artifact_stage_id_with_identity(
             &artifact_dir,
@@ -1191,6 +1194,7 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
             digest,
             &run_id,
             stage_id.as_str(),
+            generation_id,
         )?);
     }
     if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_in_generation(
@@ -1215,12 +1219,13 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
             )?,
         )?;
         let stage_id = stage_for("eigen/spectrum.v3.json", &digest, byte_length)?;
-        datasets.push(build_spectrum_v3_index(
+        datasets.push(build_spectrum_v3_index_with_generation(
             payload,
             digest,
             &run_id,
             stage_id.as_str(),
             scope_metadata,
+            generation_id,
         )?);
     } else if let Some((value, digest, byte_length)) = read_result_artifact_snapshot_with_identity_in_generation(
         &artifact_dir,
@@ -1698,6 +1703,7 @@ fn build_field_sweep_index(
     source_digest: String,
     run_id: &str,
     stage_id: &str,
+    generation_id: Option<&str>,
 ) -> Result<ResultDatasetIndex, ApiError> {
     // The caller resolves stage ownership from the captured artifact owner;
     // the payload's legacy stage_id is descriptive data, not authority.
@@ -1804,13 +1810,14 @@ fn build_field_sweep_index(
                 invalid = true;
                 continue;
             }
-            let item = field_sweep_item(
+            let item = field_sweep_item_with_generation(
                 run_id,
                 &dataset_id,
                 &sample_id,
                 &source_revision,
                 mode,
                 mesh_ref.clone(),
+                generation_id,
             );
             sample_item_count += 1;
             items.push(item);
@@ -1938,6 +1945,77 @@ fn modal_field_vector_resource_key(field_id: Option<&str>) -> Option<String> {
     ))
 }
 
+fn bind_field_resource_key_to_generation(
+    resource_key: &str,
+    generation_id: Option<&str>,
+) -> String {
+    let Some(generation_id) = generation_id else {
+        // Preserve legacy resource keys when there is no captured generation.
+        return resource_key.to_string();
+    };
+
+    let (resource, fragment) = resource_key
+        .split_once('#')
+        .map_or((resource_key, ""), |(resource, _fragment)| {
+            (resource, &resource_key[resource.len()..])
+        });
+    let (path, query) = resource
+        .split_once('?')
+        .map_or((resource, None), |(path, query)| (path, Some(query)));
+    let query_parts = query
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter(|part| !is_artifact_generation_query_parameter(part))
+        .collect::<Vec<_>>();
+    let mut query = query_parts.join("&");
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str("expected_artifact_generation_id=");
+    query.push_str(generation_id);
+    format!("{path}?{query}{fragment}")
+}
+
+fn is_artifact_generation_query_parameter(part: &str) -> bool {
+    let name = part.split_once('=').map_or(part, |(name, _)| name);
+    let bytes = name.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let Some(high) = hex_digit(bytes[index + 1]) else {
+                    return false;
+                };
+                let Some(low) = hex_digit(bytes[index + 2]) else {
+                    return false;
+                };
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            b'%' => return false,
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    decoded == b"expected_artifact_generation_id"
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn field_sweep_item(
     run_id: &str,
     dataset_id: &str,
@@ -1946,11 +2024,34 @@ fn field_sweep_item(
     mode: FrequencyDomainFieldSweepModePayload,
     mesh_ref: Option<AnalysisResultMeshRef>,
 ) -> AnalysisResultSpectralItemSummary {
+    field_sweep_item_with_generation(
+        run_id,
+        dataset_id,
+        sample_id,
+        dataset_source_revision,
+        mode,
+        mesh_ref,
+        None,
+    )
+}
+
+fn field_sweep_item_with_generation(
+    run_id: &str,
+    dataset_id: &str,
+    sample_id: &str,
+    dataset_source_revision: &str,
+    mode: FrequencyDomainFieldSweepModePayload,
+    mesh_ref: Option<AnalysisResultMeshRef>,
+    generation_id: Option<&str>,
+) -> AnalysisResultSpectralItemSummary {
     // Derive transport only in the result projection, preserving the hashed source payload.
     let field_resource_key = mode.mode_field_resource_key.as_ref()
-        .filter(|key| !key.trim().is_empty()).cloned().or_else(|| {
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| bind_field_resource_key_to_generation(key, generation_id))
+        .or_else(|| {
             mode.mode_artifact_path.as_deref().filter(|path| !path.trim().is_empty())?;
             modal_field_vector_resource_key(mode.mode_field_id.as_deref())
+                .map(|key| bind_field_resource_key_to_generation(&key, generation_id))
         });
     let field_ready = mode.mode_field_available != Some(false)
         && mode.field_status.as_deref() == Some("ready")
@@ -2043,6 +2144,24 @@ fn build_spectrum_v3_index(
     stage_id: &str,
     scope_metadata: SpectrumOutputScopeMetadata,
 ) -> Result<ResultDatasetIndex, ApiError> {
+    build_spectrum_v3_index_with_generation(
+        payload,
+        source_digest,
+        run_id,
+        stage_id,
+        scope_metadata,
+        None,
+    )
+}
+
+fn build_spectrum_v3_index_with_generation(
+    payload: FrequencyDomainSpectrumV3ArtifactPayload,
+    source_digest: String,
+    run_id: &str,
+    stage_id: &str,
+    scope_metadata: SpectrumOutputScopeMetadata,
+    generation_id: Option<&str>,
+) -> Result<ResultDatasetIndex, ApiError> {
     let dataset_id = format!("result:{run_id}:{stage_id}:modal-eigen-spectrum");
     let source_revision = source_digest.clone();
     let mut samples = Vec::new();
@@ -2067,13 +2186,14 @@ fn build_spectrum_v3_index(
         let sample_id = sample.sample_id.clone();
         let mesh_ref = None;
         for mode in sample.modes {
-            items.push(spectrum_v3_item(
+            items.push(spectrum_v3_item_with_generation(
                 run_id,
                 &dataset_id,
                 &sample_id,
                 &source_revision,
                 mode,
                 mesh_ref.clone(),
+                generation_id,
             ));
         }
         samples.push(AnalysisResultSampleIndexEntry {
@@ -3345,9 +3465,33 @@ fn spectrum_v3_item(
     mode: FrequencyDomainSpectrumV3ModePayload,
     mesh_ref: Option<AnalysisResultMeshRef>,
 ) -> AnalysisResultSpectralItemSummary {
+    spectrum_v3_item_with_generation(
+        run_id,
+        dataset_id,
+        sample_id,
+        source_revision,
+        mode,
+        mesh_ref,
+        None,
+    )
+}
+
+fn spectrum_v3_item_with_generation(
+    run_id: &str,
+    dataset_id: &str,
+    sample_id: &str,
+    source_revision: &str,
+    mode: FrequencyDomainSpectrumV3ModePayload,
+    mesh_ref: Option<AnalysisResultMeshRef>,
+    generation_id: Option<&str>,
+) -> AnalysisResultSpectralItemSummary {
     let field_resource_key = mode.mode_field_resource_key.as_ref()
-        .filter(|key| !key.trim().is_empty()).cloned()
-        .or_else(|| modal_field_vector_resource_key(mode.mode_field_id.as_deref()));
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| bind_field_resource_key_to_generation(key, generation_id))
+        .or_else(|| {
+            modal_field_vector_resource_key(mode.mode_field_id.as_deref())
+                .map(|key| bind_field_resource_key_to_generation(&key, generation_id))
+        });
     let field_ready = mode.mode_field_available != Some(false)
         && mode.mode_field_id.as_deref().is_some_and(|id| !id.trim().is_empty())
         && field_resource_key.is_some();
@@ -5186,6 +5330,25 @@ mod tests {
     use super::*;
     use crate::router_v2::handlers::analysis::frequency_domain::FrequencyDomainArtifactExtras;
 
+    #[test]
+    fn generation_binding_replaces_every_payload_generation_query_without_changing_legacy_keys() {
+        let payload_key = "/v2/data/fields/m/samples/vector?view=complex&expected_artifact_generation_id=old&%65xpected_artifact_generation_id=older#mode";
+        let bound = bind_field_resource_key_to_generation(payload_key, Some("sha256:current"));
+
+        assert_eq!(
+            bound,
+            "/v2/data/fields/m/samples/vector?view=complex&expected_artifact_generation_id=sha256:current#mode"
+        );
+        assert_eq!(
+            bound.matches("expected_artifact_generation_id=").count(),
+            1
+        );
+        assert_eq!(
+            bind_field_resource_key_to_generation(payload_key, None),
+            payload_key
+        );
+    }
+
     fn v3_spectrum_with_signed_wavevector_samples() -> FrequencyDomainSpectrumV3ArtifactPayload {
         let participation = serde_json::json!({
             "schema_version": "modal_component_participation.v1",
@@ -5520,6 +5683,24 @@ mod tests {
         assert_eq!(
             durable_item.field_ref.as_ref().unwrap().resource_key,
             "/v2/sessions/current/data/fields/%20field%2F1%3A%CE%B1%20/samples/vector?phase_rad=0&view=phase_rotated_real",
+        );
+        let mut provided_mode = durable_mode.clone();
+        provided_mode.mode_field_resource_key = Some(
+            "/v2/data/fields/m/samples/vector?view=complex&expected_artifact_generation_id=old"
+                .to_string(),
+        );
+        let generation_bound_item = field_sweep_item_with_generation(
+            "run/1",
+            "dataset/1",
+            "sample/1",
+            "revision-1",
+            provided_mode,
+            mesh_ref.clone(),
+            Some("sha256:captured"),
+        );
+        assert_eq!(
+            generation_bound_item.field_ref.as_ref().unwrap().resource_key,
+            "/v2/data/fields/m/samples/vector?view=complex&expected_artifact_generation_id=sha256:captured"
         );
         assert_eq!(
             serde_json::to_value(&durable_mode).unwrap(),
@@ -5865,6 +6046,22 @@ mod tests {
         assert_eq!(item.field_ref.as_ref().unwrap().field_id, "analysis:eigen:field/α");
         assert_eq!(item.field_ref.as_ref().unwrap().resource_key,
             "/v2/sessions/current/data/fields/analysis%3Aeigen%3Afield%2F%CE%B1/samples/vector?phase_rad=0&view=phase_rotated_real");
+        let generation_bound_fallback = spectrum_v3_item_with_generation(
+            "run",
+            "dataset",
+            "sample",
+            "revision",
+            mode.clone(),
+            None,
+            Some("sha256:captured"),
+        );
+        let fallback_key = &generation_bound_fallback
+            .field_ref
+            .as_ref()
+            .expect("fallback field reference should remain available")
+            .resource_key;
+        assert!(fallback_key.ends_with("expected_artifact_generation_id=sha256:captured"));
+        assert_eq!(fallback_key.matches("expected_artifact_generation_id=").count(), 1);
         assert_eq!(serde_json::to_value(&mode).unwrap(), before);
         let mut legacy_mode = mode.clone();
         legacy_mode.mode_field_available = None;
@@ -6808,6 +7005,288 @@ mod generation_snapshot_tests {
             "artifact_refs": artifact_refs,
         }))
         .expect("stage owner fixture should deserialize")
+    }
+
+    fn modal_field_generation_members(
+        topology_fingerprint: &str,
+        vector_offset: f64,
+    ) -> Vec<(String, Vec<u8>)> {
+        let spectrum = serde_json::json!({
+            "schema_version": "eigen_spectrum.v3",
+            "samples": [{
+                "sample_id": "sample-0000",
+                "sample_index": 0,
+                "modes": [{
+                    "mode_id": "sample-0000/mode-0000",
+                    "raw_mode_index": 0,
+                    "frequency_hz": 1.0e9,
+                    "mode_field_id": "analysis:eigen:sample-0000:mode-0000",
+                    "mode_field_resource_key": "/v2/sessions/current/data/fields/analysis%3Aeigen%3Asample-0000%3Amode-0000/samples/vector?view=phase_rotated_real&phase_rad=0&expected_artifact_generation_id=old&%65xpected_artifact_generation_id=older",
+                    "mode_field_available": true,
+                    "residual_relative_l2": 1.0e-8,
+                    "component_participation": {
+                        "schema_version": "modal_component_participation.v1",
+                        "definition_id": "volume_weighted_complex_l2_fraction.v1",
+                        "status": "unavailable",
+                        "quantity_id": "m",
+                        "quantity_symbol": "m",
+                        "unit": "1",
+                        "component_basis": "global_xyz",
+                        "integration_method": "not_available",
+                        "qualification": "unvalidated",
+                        "provenance": {"solver_device": "cpu", "observable_lane": "reference"},
+                        "objects": [],
+                        "unavailable": {"reason_code": "not_computed", "detail": "fixture"}
+                    }
+                }]
+            }]
+        });
+        let mode_metadata = serde_json::json!({
+            "schema_version": "eigen_mode.v2",
+            "sample_index": 0,
+            "raw_mode_index": 0,
+            "source_mesh_identity": {
+                "mesh_generation_id": "42",
+                "mesh_revision": 9,
+                "topology_fingerprint": topology_fingerprint,
+                "indexing": "full_domain_node_order",
+                "node_count": 4
+            },
+            "value_kind": "complex_spatial_vector",
+            "component_basis": "global_xyz",
+            "component_count": 3,
+            "components": ["x", "y", "z"],
+            "compatibility_binary_payload_path": "eigen/mode_fields/sample_0000/mode_0000/vector.bin",
+            "payload_encoding": "f64_interleaved_real_imag_xyz",
+            "binary_layout": "complex_f64_pairs_little_endian",
+            "complex_pair_count": 12,
+            "payload_value_count": 24,
+            "available_views": ["complex", "real", "imag", "abs", "amplitude", "phase", "phase_rotated_real"],
+            "default_view": "phase_rotated_real",
+            "default_phase_rad": 0.0
+        });
+        let vector = (0..24)
+            .flat_map(|index| (vector_offset + f64::from(index)).to_le_bytes())
+            .collect::<Vec<_>>();
+        vec![
+            (
+                "eigen/spectrum.v3.json".to_string(),
+                serde_json::to_vec(&spectrum).unwrap(),
+            ),
+            (
+                "eigen/modes/sample_0000/mode_0000.json".to_string(),
+                serde_json::to_vec(&mode_metadata).unwrap(),
+            ),
+            (
+                "eigen/mode_fields/sample_0000/mode_0000/vector.bin".to_string(),
+                vector,
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn spectrum_v3_projection_field_link_is_bound_to_the_captured_binary_generation() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let temporary = TempGenerationRoot::new();
+        let artifact_root = temporary.0.clone();
+        let state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        let mesh = fullmag_runner::FemMeshPayload {
+            mesh_name: "generation-bound-mode".to_string(),
+            mesh_id: "generation-bound-mode:1".to_string(),
+            nodes: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            cells: fullmag_ir::FemConnectivityIR::from_tet4(vec![[0, 1, 2, 3]]),
+            element_markers: vec![7],
+            facets: fullmag_ir::FemFacetConnectivityIR::from_tri3(vec![[0, 1, 2]]),
+            boundary_markers: vec![3],
+            periodic_boundary_pairs: Vec::new(),
+            periodic_node_pairs: Vec::new(),
+            object_segments: vec![fullmag_runner::FemMeshObjectSegment {
+                object_id: "body".to_string(),
+                geometry_id: Some("body".to_string()),
+                node_start: 0,
+                node_count: 4,
+                element_start: 0,
+                element_count: 1,
+                boundary_face_start: 0,
+                boundary_face_count: 1,
+            }],
+            mesh_parts: Vec::new(),
+            domain_mesh_mode: Some("shared_domain".to_string()),
+            domain_frame: None,
+            generation_id: Some("42".to_string()),
+            per_domain_quality: Default::default(),
+            build_report: None,
+        };
+        let topology_fingerprint = fullmag_runner::fem_mesh_topology_fingerprint(&mesh);
+        {
+            let mut current = state.current_live_state.write().await;
+            let snapshot = current
+                .as_mut()
+                .expect("test live session should have a snapshot");
+            snapshot.session.artifact_dir = artifact_root.display().to_string();
+            snapshot.mesh_revision = 9;
+            snapshot.fem_mesh = Some(mesh);
+        }
+
+        let producer = Some(PublicationOwner {
+            run_id: "test-run".to_string(),
+            stage_id: "eigen-stage".to_string(),
+            stage_kind: "flat_eigenmodes".to_string(),
+        });
+        let first_generation = write_immutable_result_generation_for_test(
+            &artifact_root,
+            modal_field_generation_members(&topology_fingerprint, 1.0),
+            producer.clone(),
+        );
+        for (path, bytes) in [
+            ("eigen/spectrum.v3.json", b"stale root spectrum alias".as_slice()),
+            (
+                "eigen/modes/sample_0000/mode_0000.json",
+                b"stale root mode metadata".as_slice(),
+            ),
+            (
+                "eigen/mode_fields/sample_0000/mode_0000/vector.bin",
+                b"stale root vector payload".as_slice(),
+            ),
+        ] {
+            let path = artifact_root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        let app = crate::router_v2::build_v2_router().with_state(state.clone());
+        let catalog_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/sessions/current/analysis/results/runs/test-run/datasets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(catalog_response.status(), StatusCode::OK);
+        let catalog: Value = serde_json::from_slice(
+            &to_bytes(catalog_response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let dataset_id = catalog["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dataset| {
+                dataset["dataset_id"]
+                    .as_str()
+                    .is_some_and(|id| id.ends_with(":modal-eigen-spectrum"))
+            })
+            .and_then(|dataset| dataset["dataset_id"].as_str())
+            .expect("public catalog should include the V3 modal spectrum")
+            .to_string();
+        let items_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v2/sessions/current/analysis/results/runs/test-run/datasets/{dataset_id}/items"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(items_response.status(), StatusCode::OK);
+        let items: Value = serde_json::from_slice(
+            &to_bytes(items_response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let field_key = items["items"][0]["field_ref"]["resource_key"]
+            .as_str()
+            .expect("public V3 item should retain its canonical field resource key")
+            .to_string();
+        assert_eq!(
+            field_key.matches("expected_artifact_generation_id=").count(),
+            1
+        );
+        assert!(field_key.ends_with(&format!(
+            "expected_artifact_generation_id={}",
+            first_generation.commit.generation_id
+        )));
+
+        let first_field_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(field_key.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_field_response.status(), StatusCode::OK);
+        assert_eq!(
+            first_field_response
+                .headers()
+                .get("x-fullmag-artifact-generation-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(first_generation.commit.generation_id.as_str())
+        );
+        let first_field_bytes = to_bytes(first_field_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&first_field_bytes[..4], b"FMVP");
+        assert_eq!(first_field_bytes[4], 5);
+        let metadata_length =
+            u32::from_le_bytes(first_field_bytes[8..12].try_into().unwrap()) as usize;
+        let value_offset = 48 + metadata_length;
+        let first_generation_values = first_field_bytes[value_offset..]
+            .chunks_exact(8)
+            .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_generation_values,
+            vec![1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0, 21.0, 23.0]
+        );
+
+        let second_generation = write_immutable_result_generation_for_test(
+            &artifact_root,
+            modal_field_generation_members(&topology_fingerprint, 100.0),
+            producer,
+        );
+        assert_ne!(
+            first_generation.commit.generation_id,
+            second_generation.commit.generation_id
+        );
+        let stale_field_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(field_key.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_field_response.status(), StatusCode::CONFLICT);
+        let stale_error: Value = serde_json::from_slice(
+            &to_bytes(stale_field_response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(stale_error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("stale_artifact_generation_id")));
     }
 
     #[test]

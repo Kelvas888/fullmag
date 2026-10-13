@@ -97,7 +97,13 @@ Końcowy fence obowiązuje przed terminalną publikacją oraz w ścieżce retry.
 Brak markera zachowuje dotychczasowy bounded legacy read i nie nadaje mu
 statusu immutable. Nie backfillujemy attestation istniejących terminalnych runów.
 
-Implementacja tego etapu trwa; CI Linux/Windows musi potwierdzić v1/v2,
-zgodność bajtów, niezgodnego ownera, brak/uszkodzenie członka oraz zmianę
-selektora. Writer v2 pozostaje nieaktywny do ukończenia konsumentów i tych
-bramek. Runtime i naukowa kwalifikacja pozostają NOT VERIFIED.
+Read-only core i terminalne attestation zostały zweryfikowane w GitHub Actions
+38458450446 na commicie 1c5a22454464fcf7b0e280272ac6ca2bd24a71f5:
+shared reader 4 testy na każdym systemie, inspector 49 na Ubuntu / 48 na Windows
+oraz Python reader 19 na każdym systemie. Obejmuje to kontrakty v1/v2, zgodność
+bajtów, owner mismatch, brak/uszkodzenie członka i zmianę selektora.
+Writer v2 pozostaje nieaktywny: projekcja pól analysis/results musi przekazywać
+expected_artifact_generation_id wymagany przez binarny endpoint. Te same bajty
+payloadu mogą mieć link bez tego parametru; tożsamość dopisuje read-model z
+captured generation, bez zmiany hash-verified payloadu lub polityki null-owner.
+Runtime i naukowa kwalifikacja pozostają NOT VERIFIED.

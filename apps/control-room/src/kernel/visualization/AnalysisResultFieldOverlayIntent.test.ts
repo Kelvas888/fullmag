@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import type {
   AnalysisResultFieldRef,
+  FieldVectorQuery,
   FieldVectorResponseMetadata,
 } from "../api/apiTypes";
 import type { DecodedFieldVector } from "../api/codecs";
+import { fieldVectorResourceKey } from "../api/fieldQueryIdentity";
 import type { AnalysisResultSelectionRef } from "@/shared/domain/analysis/results";
 
 import {
@@ -41,7 +43,11 @@ const fieldRef: AnalysisResultFieldRef = {
   },
   quantity_id: "m",
   representation: "complex-vector-xyz",
-  resource_key: "data/fields/analysis%3Aeigen%3Asample-0001%3Amode-0002",
+  resource_key: fieldVectorResourceKey("analysis:eigen:sample-0001:mode-0002", {
+    component: "full",
+    scope_kind: "full",
+    view: "complex",
+  }),
   status: "ready",
 };
 
@@ -152,12 +158,122 @@ describe("AnalysisResultFieldOverlayIntent", () => {
       resourceRevision: fieldRef.field_revision,
       binaryQuery: { component: "full", scope_kind: "full", view: "complex" },
     });
+    expect(metadata.binaryQuery.expected_artifact_generation_id).toBeUndefined();
     expect(
       validateAnalysisResultFieldOverlayBinary(metadata, validBinary(), topology),
     ).toMatchObject({ complex: { componentCount: 3, pointCount: 2 } });
     expect(
       validateAnalysisResultFieldOverlayBinary(metadata, validBinary(5), topology),
     ).toMatchObject({ complex: { componentCount: 3, pointCount: 2 } });
+  });
+
+  it("preserves the committed artifact generation and other vector identity parameters", () => {
+    const expectedQuery: FieldVectorQuery = {
+      component: "full",
+      expected_artifact_generation_id: "publication-14",
+      expected_carrier_revision: "carrier-revision-8",
+      expected_generation_id: "domain-generation-5",
+      scope_kind: "full",
+      view: "complex",
+    };
+    const resourceKey = fieldVectorResourceKey(fieldRef.field_id, expectedQuery);
+    const intent = createAnalysisResultFieldOverlayIntent(selection, {
+      ...fieldRef,
+      resource_key: resourceKey,
+    })!;
+    const metadata = resolveAnalysisResultFieldOverlayMetadata(intent);
+
+    expect(metadata).not.toBeNull();
+    expect(metadata?.binaryQuery).toMatchObject(expectedQuery);
+    expect(
+      fieldVectorResourceKey(metadata!.fieldId, metadata!.binaryQuery),
+    ).toBe(resourceKey);
+  });
+
+  it("normalizes a canonical phase-rotated result link to the full complex overlay query", () => {
+    const resourceKey = fieldVectorResourceKey(fieldRef.field_id, {
+      component: "magnitude",
+      expected_artifact_generation_id: "publication-14",
+      expected_generation_id: "domain-generation-5",
+      phase_rad: 0.375,
+      scope_kind: "full",
+      view: "phase_rotated_real",
+    });
+    const intent = createAnalysisResultFieldOverlayIntent(selection, {
+      ...fieldRef,
+      resource_key: resourceKey,
+    })!;
+    const metadata = resolveAnalysisResultFieldOverlayMetadata(intent);
+
+    expect(metadata?.binaryQuery).toMatchObject({
+      component: "full",
+      expected_artifact_generation_id: "publication-14",
+      expected_generation_id: "domain-generation-5",
+      phase_rad: 0.375,
+      scope_kind: "full",
+      view: "complex",
+    });
+  });
+
+  it.each([
+    [
+      "a mismatched field id",
+      fieldVectorResourceKey("analysis:eigen:other-field", {
+        component: "full",
+        scope_kind: "full",
+        view: "complex",
+      }),
+    ],
+    [
+      "a duplicate generation parameter",
+      `${fieldVectorResourceKey(fieldRef.field_id, {
+        component: "full",
+        expected_artifact_generation_id: "publication-14",
+        scope_kind: "full",
+        view: "complex",
+      })}&expected_artifact_generation_id=publication-15`,
+    ],
+    [
+      "a foreign origin",
+      `https://foreign.invalid${fieldVectorResourceKey(fieldRef.field_id)}`,
+    ],
+    ["a URI fragment", `${fieldVectorResourceKey(fieldRef.field_id)}#fragment`],
+    [
+      "a non-vector path",
+      "data/fields/analysis%3Aeigen%3Asample-0001%3Amode-0002",
+    ],
+    [
+      "an unsupported component",
+      fieldVectorResourceKey(fieldRef.field_id, {
+        component: "not-a-component",
+        scope_kind: "full",
+        view: "complex",
+      }),
+    ],
+    [
+      "a non-full scope",
+      fieldVectorResourceKey(fieldRef.field_id, {
+        component: "full",
+        scope_id: "film",
+        scope_kind: "object",
+        view: "complex",
+      }),
+    ],
+    [
+      "an unsupported view",
+      fieldVectorResourceKey(fieldRef.field_id, {
+        component: "full",
+        scope_kind: "full",
+        view: "phasor",
+      }),
+    ],
+  ])("rejects a field resource key with %s", (_label, resourceKey) => {
+    const intent = createAnalysisResultFieldOverlayIntent(selection, {
+      ...fieldRef,
+      resource_key: resourceKey,
+    })!;
+
+    expect(resolveAnalysisResultFieldOverlayMetadata(intent)).toBeNull();
   });
 
   it("requires a self-consistent binary response without conflating transport and source revisions", () => {
@@ -222,6 +338,32 @@ describe("AnalysisResultFieldOverlayIntent", () => {
           { field: "meshTopologyHash", headerValue: "wrong", payloadValue: "right" },
         ],
       }),
+    ).toBe(false);
+
+    const expectedArtifactGenerationId = "publication-14";
+    const generatedIntent = createAnalysisResultFieldOverlayIntent(selection, {
+      ...fieldRef,
+      resource_key: fieldVectorResourceKey(fieldRef.field_id, {
+        component: "full",
+        expected_artifact_generation_id: expectedArtifactGenerationId,
+        scope_kind: "full",
+        view: "complex",
+      }),
+    })!;
+    expect(
+      validateAnalysisResultFieldResponseMetadata(generatedIntent, {
+        ...responseMetadata,
+        artifactGenerationId: expectedArtifactGenerationId,
+      }),
+    ).toBe(true);
+    expect(
+      validateAnalysisResultFieldResponseMetadata(generatedIntent, {
+        ...responseMetadata,
+        artifactGenerationId: "publication-stale",
+      }),
+    ).toBe(false);
+    expect(
+      validateAnalysisResultFieldResponseMetadata(generatedIntent, responseMetadata),
     ).toBe(false);
   });
 

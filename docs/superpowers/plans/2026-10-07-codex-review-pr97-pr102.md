@@ -4095,3 +4095,25 @@ Hard EPS opt-out/nearest/fresh-LU fault/window rozdzielono na cztery CLI selecto
 Native38457679244 działa na exact ed322bf97255a873271237ad80967225a6b3101d (21 testów zamiast17); nie restartujemy go przy niezależnym commicie fixture. Migration38456836046: Ubuntu4/49/19, Windows4/48/19 PASS; subset144/162,248/4,214/70 PASS. Method38456836000, API38456835980, spectrum_scope38456835996 i output-selection38456835999 SUCCESS.
 
 Cztery fixture pilota poprawione: fake DSL obejmuje istniejące StageAutosave/FieldAutosave, nearest mock jawnie otrzymuje bundle_reader=None, błędna walidacja przechodzi przez real cleanup z kompletnym context i mockiem inspekcji kontenera absent. Root review wykryło i usunęło niedeterministyczny mock subprocess.run (default argument cleanup związany wcześniej); nowe asercje sprawdzają identity/mounts oraz verified_absent. Science refusal assertions zachowane. Nowe wykonanie tych fixture pending CI.
+
+### G3 — pełne CI konsumentów i dodatkowy handoff API
+
+[CI38458450446](https://github.com/MateuszZelent/fullmag/actions/runs/38458450446), exact1c5a22454464fcf7b0e280272ac6ca2bd24a71f5: SUCCESS wszystkie3joby. Subsets144PASS162subtests,248PASS4subtests,214PASS70subtests,155PASS327subtests. Reader/terminal attestation Ubuntu i Windows SUCCESS. Fresh401inline ma komplet ID w rejestrze;51body jest niezmienionych po odwróceniu błędnego wcześniejszego dekodowania UTF-8 jako cp1250. Nie utożsamiamy kompletności rejestru z rozwiązaniem wszystkich uwag. PR102 CLOSED, PR97 OPEN/DIRTY.
+
+Review przed aktywacją writera wykryło dodatkową lukę: AnalysisResultFieldRef.resource_key w results może pomijać expected_artifact_generation_id, wymagany przez binary GET. Bezpośrednie frequency-domain reader/readers binary używają captured member bytes/fence; nullproducer pozostaje jawnie unbound. Naprawa projekcji linku i rzeczywista regresja projection->binary GET są w realizacji; writer nadal nieaktywny, native38457679244 potwierdzony live.
+
+### Wynik izolowanej bramki natywnej i granice G6
+
+[Native38457679244](https://github.com/MateuszZelent/fullmag/actions/runs/38457679244), exact ed322bf97255a873271237ad80967225a6b3101d: FAILURE,19/21PASS, exit8. Bazowy test45, sparse recovery, mixed dense/full residual, hard opt-out i hard window PASS. Hard nearest69 i fresh-LU fault70 FAIL. Nearest obecnie zwraca solve_error/floquet_slepc_solve_failed oraz obecny shifted_ksp_failure_probe (callback_count9, true_probe_attempt_count0); nie jest to wcześniejszy runtime_unsafe. Przyczyna dwóch konkretnych asercji jest diagnozowana na pełnym artefakcie. Nie zmieniono produkcyjnych progów, guardów ani oczekiwanego kontraktu.
+
+G6 source audit: zwykły production full-airbox ma scalar P2, modalny builder P1; production demag odzyskuje pole do węzłów, modalny feedback całkuje gradient potencjału bezpośrednio. Norm-preserving finite difference produkcyjnego RHS nie jest automatycznie zgodnym weak-oracle modalnego operatora. Periodic P1 pozwala niezależnie sprawdzić weak Poisson source derivative po potwierdzeniu map/BC/kwadratury. Pełny nonlinear-vs-modal gate pozostaje NOT VERIFIED. Szczegółowy raport: g6-production-rhs-oracle-boundaries-20261013.md, SHA256 FC0605C6C2F57BE49E738EE6FF5F7051DB5D13708598401C9C76F789A6B80D7E. Hashe raportu identyfikują lokalny snapshot, nie dowodzą jego zgodności z remote.
+
+G3 handoff API/UI w realizacji: result field links muszą zawierać captured generation; typed binary query i cache identity muszą zachować ten identyfikator. Nie aktywowano immutable writera. Testy nowego fragmentu tylko GitHub Actions; naukowa i browser kwalifikacja pozostają osobnymi bramkami. PR97 nadal otwarty, bez deklaracji zakończenia całego planu.
+
+### G3 — poprawka result field link i typed UI query
+
+Source checkpoint wiąże payload-provided i fallback field_ref.resource_key z captured generation, usuwa poprzednie/zdublowane parametry generacji, zachowuje pozostały query i legacy bez markera. Obejmuje aktywnych producentów Spectrum V3 i field sweep, bez zmiany hash-verified payloadu lub polityki ownera.
+
+UI korzysta z istniejącego canonical field-vector parsera; waliduje field ID, względny canonical endpoint i jednoznaczne query. Zachowuje generation/cache identity i wymaga zgodnego response generation header. Prawidłowy phase_rotated_real link jest akceptowany i przekłada się na pełne complex dane overlay. Regression obejmuje resolver, callback binarnego loadu, malformed-before-call i header mismatch/missing; zachowano legacy bez generacji.
+
+API route regression spectrum_v3_projection_field_link_is_bound_to_the_captured_binary_generation przechodzi catalog -> items -> rzeczywisty binary GET, sprawdza dokładne wartości FMVP mimo starych root aliasów i stale-link409 po nowej publikacji. Workflow jawnie wymaga PASS tej regresji i query-binding unit testu. Root przejrzał exact-remote diff i ścieżki konsumentów; wykonanie nowego fragmentu pozostaje NOT VERIFIED do GitHub Actions. Produkcyjny writer v2 nadal nieaktywny. Lokalny Git/index oraz Cargo.lock nienaruszone.
