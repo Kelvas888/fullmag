@@ -187,7 +187,10 @@ fn scratch_snapshot(
         resolved_device: Some(execution.device.clone()),
         resolved_precision: Some(execution.precision.clone()),
         resolved_mode: Some("strict".to_string()),
-        resolved_runtime_family: Some(format!("{}_cpu_reference", execution.backend)),
+        // Scratch authoring publishes a lane capability preview; no executable
+        // runtime has been resolved or launched yet. Keep runtime provenance
+        // empty until the first real resolution instead of inventing a family.
+        resolved_runtime_family: None,
         resolved_engine_id: None,
         resolved_worker: None,
         resolved_cpu_threads: None,
@@ -276,6 +279,9 @@ mod tests {
             .capabilities
             .expect("scratch sessions need a lane capability snapshot before authoring");
 
+        assert_eq!(snapshot.session.resolved_backend.as_deref(), Some("fdm"));
+        assert!(snapshot.session.resolved_runtime_family.is_none());
+        assert!(snapshot.session.resolved_engine_id.is_none());
         assert_eq!(capabilities.engine_id.as_str(), "fdm_cpu_reference");
         assert!(capabilities
             .supported_terms
@@ -300,6 +306,9 @@ mod tests {
             .capabilities
             .expect("FEM scratch sessions need a lane capability snapshot before authoring");
 
+        assert_eq!(snapshot.session.resolved_backend.as_deref(), Some("fem"));
+        assert!(snapshot.session.resolved_runtime_family.is_none());
+        assert!(snapshot.session.resolved_engine_id.is_none());
         assert_eq!(capabilities.engine_id.as_str(), "fem_cpu_native");
         assert!(capabilities
             .supported_terms

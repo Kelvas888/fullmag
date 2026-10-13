@@ -280,7 +280,7 @@ pub(crate) fn build_live_status(
 
     let display = build_display_selection_response(&display_sel, &display_presentation);
 
-    let is_fem = snapshot.fem_mesh.is_some() && !is_fdm_snapshot(snapshot);
+    let is_fem = is_fem_snapshot(snapshot);
     let fdm_grid_shape = (!is_fem).then(|| fdm_grid_shape(snapshot, latest.map(|step| step.grid)));
     let cell_count = if is_fem {
         snapshot
@@ -1127,15 +1127,56 @@ fn relaxation_algorithm_from_metadata(metadata: Option<&Value>) -> Option<Relaxa
         .and_then(RelaxationAlgorithm::parse)
 }
 
+/// Classify the domain resource representation using the existing
+/// `is_fdm_snapshot` precedence for explicit FDM plans and artifact layouts.
+/// This does not resolve or change the active runtime lane. If no mesh exists,
+/// explicit FEM backend metadata can still classify the domain as FEM.
+pub(crate) fn is_fem_snapshot(snapshot: &SessionStateResponse) -> bool {
+    if is_fdm_snapshot(snapshot) {
+        return false;
+    }
+    if snapshot.fem_mesh.is_some() {
+        return true;
+    }
+
+    let metadata_backend = snapshot.metadata.as_ref().and_then(|metadata| {
+        metadata
+            .get("execution_plan")
+            .and_then(|plan| plan.get("backend_plan"))
+            .and_then(|plan| plan.get("kind"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                metadata
+                    .get("artifact_layout")
+                    .and_then(|layout| layout.get("backend"))
+                    .and_then(Value::as_str)
+            })
+    });
+    metadata_backend
+        .or(snapshot.session.resolved_backend.as_deref())
+        .is_some_and(|backend| backend.to_ascii_lowercase().contains("fem"))
+}
+
 pub(crate) fn topology_revision(snapshot: &SessionStateResponse, domain_generation_id: u64) -> u64 {
-    if snapshot.fem_mesh.is_some() && !is_fdm_snapshot(snapshot) {
-        snapshot.mesh_revision
+    if is_fem_snapshot(snapshot) {
+        if snapshot.fem_mesh.is_some() {
+            snapshot.mesh_revision
+        } else {
+            0
+        }
     } else {
         domain_generation_id
     }
 }
 
+/// Stable, non-numeric identity for a selected FEM lane without a mesh. The
+/// resource loader only treats positive numeric revisions as materialized.
+const FEM_UNMATERIALIZED_DOMAIN_GENERATION_ID: &str = "fem:unmaterialized";
+
 pub(crate) fn domain_generation_id(snapshot: &SessionStateResponse) -> String {
+    if is_fem_snapshot(snapshot) && snapshot.fem_mesh.is_none() {
+        return FEM_UNMATERIALIZED_DOMAIN_GENERATION_ID.to_string();
+    }
     if !is_fdm_snapshot(snapshot) {
         if let Some(generation_id) = snapshot
             .fem_mesh
@@ -1152,6 +1193,9 @@ pub(crate) fn domain_generation_id(snapshot: &SessionStateResponse) -> String {
 }
 
 pub(crate) fn domain_generation_revision(snapshot: &SessionStateResponse) -> u64 {
+    if is_fem_snapshot(snapshot) && snapshot.fem_mesh.is_none() {
+        return 0;
+    }
     if !is_fdm_snapshot(snapshot) {
         if let Some(generation_id) = snapshot
             .fem_mesh

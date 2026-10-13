@@ -1552,6 +1552,157 @@ async fn create_scratch_session_accepts_explicit_fdm_and_fem_cpu_double_requests
 }
 
 #[tokio::test]
+async fn scratch_session_status_and_domain_meta_follow_resolved_lane_before_mesh_materializes() {
+    let state = test_app_state();
+    let app = build_v2_router().with_state(state.clone());
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/sessions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"name":"Scratch FEM lane","backend":"fem","device":"cpu","precision":"double"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    {
+        let guard = state.current_live_state.read().await;
+        let snapshot = guard.as_ref().expect("scratch session is active");
+        let capabilities = snapshot
+            .capabilities
+            .as_ref()
+            .expect("scratch FEM publishes lane capabilities");
+        assert_eq!(snapshot.session.resolved_backend.as_deref(), Some("fem"));
+        assert!(snapshot.session.resolved_runtime_family.is_none());
+        assert!(snapshot.session.resolved_engine_id.is_none());
+        assert_eq!(capabilities.engine_id.as_str(), "fem_cpu_native");
+        assert_eq!(
+            crate::router_v2::handlers::sessions::status::domain_generation_revision(snapshot),
+            0
+        );
+    }
+
+    let fem_status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fem_status.status(), StatusCode::OK);
+    let fem_status = body_json(fem_status).await;
+    assert_eq!(fem_status["domain"]["discretization"], "fem");
+    assert_eq!(fem_status["domain"]["cell_count"], 0);
+    assert_eq!(
+        fem_status["capabilities"]["active_lane"]["resolved"]["discretization"],
+        "fem"
+    );
+    assert_eq!(
+        fem_status["resources"]["domain_generation_id"],
+        "fem:unmaterialized"
+    );
+    assert_eq!(fem_status["resources"]["topology_revision"], 0);
+
+    let fem_domain = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/domain/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fem_domain.status(), StatusCode::OK);
+    let fem_domain = body_json(fem_domain).await;
+    assert_eq!(fem_domain["discretization"], "fem");
+    assert_eq!(fem_domain["generation_id"], "fem:unmaterialized");
+    assert_eq!(fem_domain["grid"], serde_json::Value::Null);
+    assert_eq!(
+        fem_domain["counts"],
+        serde_json::json!({
+            "cells": null,
+            "nodes": null,
+            "elements": null,
+            "boundary_faces": null
+        })
+    );
+    assert_eq!(fem_domain["bounds"]["min"], serde_json::json!([0.0, 0.0, 0.0]));
+    assert_eq!(fem_domain["bounds"]["max"], serde_json::json!([0.0, 0.0, 0.0]));
+
+    let replaced = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/sessions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"name":"Scratch FDM lane","backend":"fdm","device":"cpu","precision":"double","replace_current":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::CREATED);
+    {
+        let guard = state.current_live_state.read().await;
+        let snapshot = guard.as_ref().expect("replacement scratch session is active");
+        let capabilities = snapshot
+            .capabilities
+            .as_ref()
+            .expect("scratch FDM publishes lane capabilities");
+        assert_eq!(snapshot.session.resolved_backend.as_deref(), Some("fdm"));
+        assert!(snapshot.session.resolved_runtime_family.is_none());
+        assert!(snapshot.session.resolved_engine_id.is_none());
+        assert_eq!(capabilities.engine_id.as_str(), "fdm_cpu_reference");
+    }
+
+    let fdm_status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fdm_status.status(), StatusCode::OK);
+    let fdm_status = body_json(fdm_status).await;
+    assert_eq!(fdm_status["domain"]["discretization"], "fdm");
+    assert_eq!(fdm_status["domain"]["cell_count"], 0);
+    assert_ne!(
+        fdm_status["resources"]["domain_generation_id"],
+        "fem:unmaterialized"
+    );
+
+    let fdm_domain = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/domain/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fdm_domain.status(), StatusCode::OK);
+    let fdm_domain = body_json(fdm_domain).await;
+    assert_eq!(fdm_domain["discretization"], "fdm");
+    assert_eq!(fdm_domain["counts"]["cells"], 0);
+    assert_eq!(fdm_domain["grid"], serde_json::Value::Null);
+}
+
+#[tokio::test]
 async fn create_scratch_session_rejects_unknown_execution_and_implicit_replacement() {
     let app = test_router();
 
@@ -4047,6 +4198,158 @@ async fn domain_meta_returns_json_with_session() {
     assert_eq!(json["coordinate_system"], "cartesian");
     assert!(json["bounds"].is_object());
     assert!(json["counts"].is_object());
+}
+
+#[tokio::test]
+async fn domain_status_and_meta_preserve_built_fem_and_explicit_fdm_with_retained_mesh() {
+    let state = test_app_state_with_live_session().await;
+    {
+        let mut guard = state.current_live_state.write().await;
+        let snapshot = guard.as_mut().expect("fixture session is active");
+        snapshot.session.requested_backend = "fem".into();
+        snapshot.session.resolved_backend = Some("fem".into());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.mesh_revision = 17;
+        snapshot.metadata = None;
+    }
+    let app = build_v2_router().with_state(state.clone());
+
+    let fem_status_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fem_status_response.status(), StatusCode::OK);
+    let fem_status = body_json(fem_status_response).await;
+    assert_eq!(fem_status["domain"]["discretization"], "fem");
+    assert_eq!(fem_status["domain"]["cell_count"], 1);
+    assert_eq!(fem_status["resources"]["domain_generation_id"], "42");
+    assert_eq!(fem_status["resources"]["topology_revision"], 17);
+
+    let fem_domain_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/domain/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fem_domain_response.status(), StatusCode::OK);
+    let fem_domain = body_json(fem_domain_response).await;
+    assert_eq!(fem_domain["discretization"], "fem");
+    assert_eq!(fem_domain["generation_id"], "42");
+    assert_eq!(fem_domain["counts"]["nodes"], 4);
+    assert_eq!(fem_domain["counts"]["elements"], 1);
+    assert_eq!(fem_domain["counts"]["boundary_faces"], 1);
+    assert_eq!(fem_domain["grid"], serde_json::Value::Null);
+    for key in ["min", "max"] {
+        for coordinate in fem_domain["bounds"][key]
+            .as_array()
+            .expect("FEM bounds are three-vectors")
+        {
+            assert!(coordinate.as_f64().is_some_and(f64::is_finite));
+        }
+    }
+
+    let mut empty_fem_mesh = sample_fem_mesh_payload();
+    empty_fem_mesh.nodes.clear();
+    empty_fem_mesh.cells = fullmag_ir::FemConnectivityIR::from_tet4(Vec::new());
+    empty_fem_mesh.facets = fullmag_ir::FemFacetConnectivityIR::from_tri3(Vec::new());
+    empty_fem_mesh.element_markers.clear();
+    empty_fem_mesh.boundary_markers.clear();
+    {
+        let mut guard = state.current_live_state.write().await;
+        let snapshot = guard.as_mut().expect("fixture session is active");
+        snapshot.session.requested_backend = "fem".into();
+        snapshot.session.resolved_backend = Some("fem".into());
+        snapshot.fem_mesh = Some(empty_fem_mesh);
+        snapshot.metadata = None;
+    }
+
+    let empty_fem_domain_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/domain/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_fem_domain_response.status(), StatusCode::OK);
+    let empty_fem_domain = body_json(empty_fem_domain_response).await;
+    assert_eq!(empty_fem_domain["discretization"], "fem");
+    assert_eq!(empty_fem_domain["counts"]["nodes"], 0);
+    assert_eq!(empty_fem_domain["counts"]["elements"], 0);
+    assert_eq!(empty_fem_domain["counts"]["boundary_faces"], 0);
+    assert_eq!(empty_fem_domain["bounds"]["min"], serde_json::json!([0.0, 0.0, 0.0]));
+    assert_eq!(empty_fem_domain["bounds"]["max"], serde_json::json!([0.0, 0.0, 0.0]));
+
+    {
+        let mut guard = state.current_live_state.write().await;
+        let snapshot = guard.as_mut().expect("fixture session is active");
+        snapshot.session.requested_backend = "fdm".into();
+        snapshot.session.resolved_backend = Some("fdm".into());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.metadata = Some(serde_json::json!({
+            "artifact_layout": {
+                "backend": "fdm",
+                "grid_cells": [4, 3, 2],
+                "origin_m": [0.0, 0.0, 0.0],
+                "cell_size": [1.0, 1.0, 1.0]
+            },
+            "execution_plan": {
+                "backend_plan": {
+                    "kind": "fdm",
+                    "grid_certificate": {
+                        "grid_fingerprint": "fdm-retained-mesh-grid"
+                    }
+                }
+            }
+        }));
+    }
+
+    let fdm_status_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fdm_status_response.status(), StatusCode::OK);
+    let fdm_status = body_json(fdm_status_response).await;
+    assert_eq!(fdm_status["domain"]["discretization"], "fdm");
+    assert_eq!(fdm_status["domain"]["cell_count"], 24);
+    assert_eq!(
+        fdm_status["resources"]["domain_generation_id"],
+        "fdm-retained-mesh-grid"
+    );
+
+    let fdm_domain_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/domain/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fdm_domain_response.status(), StatusCode::OK);
+    let fdm_domain = body_json(fdm_domain_response).await;
+    assert_eq!(fdm_domain["discretization"], "fdm");
+    assert_eq!(fdm_domain["generation_id"], "fdm-retained-mesh-grid");
+    assert_eq!(fdm_domain["counts"]["cells"], 24);
+    assert_eq!(fdm_domain["grid"]["shape"], serde_json::json!([4, 3, 2]));
 }
 
 #[tokio::test]
