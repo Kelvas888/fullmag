@@ -9528,8 +9528,30 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
           "shared-domain nearest path resolves zero request tolerance before certifying");
     fullmag_fem_frequency_domain_result_destroy(&default_tolerance_result);
 
-    FullmagFemModalEigenRequest hard_ksp_nearest_request = request;
-    hard_ksp_nearest_request.max_linear_iterations = 1;
+    // Keep the hard-KSP serializer probes on the same native-count physical
+    // fixture used by the live shift-configuration contract. The compact
+    // fixture can certify its sole mode in one iteration,
+    // so a maxiter=1 request is not a reliable hard-failure trigger.
+    FloquetContourSharedDomainFixture hard_ksp_fixture{};
+    hard_ksp_fixture.initialize(5u, true);
+    initialize_native_count_fixture(hard_ksp_fixture);
+    verify_native_count_fixture_composed_operator(hard_ksp_fixture);
+    FullmagFemModalEigenRequest hard_ksp_nearest_request =
+        make_floquet_contour_request(hard_ksp_fixture, nullptr, nullptr);
+    hard_ksp_nearest_request.target_kind = "nearest_frequency";
+    hard_ksp_nearest_request.target_frequency_hz =
+        hard_ksp_fixture.reference_frequency_hz;
+    hard_ksp_nearest_request.frequency_min_hz = 0.0;
+    hard_ksp_nearest_request.frequency_max_hz = 0.0;
+    hard_ksp_nearest_request.eigensolver_family = 1;
+    hard_ksp_nearest_request.mfem_operator_enabled = 0;
+    hard_ksp_nearest_request.mfem_tangent_dof_count = 0u;
+    hard_ksp_nearest_request.mfem_stiffness_matrix_row_major = nullptr;
+    hard_ksp_nearest_request.mfem_gyrotropic_matrix_row_major = nullptr;
+    hard_ksp_nearest_request.operator_request.operator_diagnostics_json =
+        "{\"operator_family\":\"mfem_linearized_llg\","
+        "\"payload_kind\":\"certified_shared_domain\"}";
+    hard_ksp_nearest_request.max_linear_iterations = 64;
     FullmagFemFrequencyDomainResult hard_ksp_opt_out_result{};
     {
         const ScopedFloquetDiagnosticEnvironment diagnostic_environment{};
@@ -9866,8 +9888,32 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
 
     fullmag_fem_frequency_domain_result_destroy(&hard_ksp_nearest_result);
 
-    FullmagFemModalEigenRequest hard_ksp_window_request = window_request;
-    hard_ksp_window_request.max_linear_iterations = 1;
+    constexpr double hard_ksp_two_pi = 2.0 * 3.14159265358979323846;
+    // Keep a positive symmetric test window; the Ms scale may exceed H0.
+    const double hard_ksp_frequency_radius_hz = std::min(
+        0.5 * hard_ksp_fixture.reference_frequency_hz,
+        hard_ksp_fixture.payload.gamma0_m_per_a_s *
+            hard_ksp_fixture.payload.uniform_saturation_magnetisation_a_per_m /
+            hard_ksp_two_pi);
+    FullmagFemModalEigenRequest hard_ksp_window_request =
+        hard_ksp_nearest_request;
+    hard_ksp_window_request.target_kind = "frequency_window";
+    hard_ksp_window_request.frequency_min_hz =
+        hard_ksp_fixture.reference_frequency_hz - hard_ksp_frequency_radius_hz;
+    hard_ksp_window_request.frequency_max_hz =
+        hard_ksp_fixture.reference_frequency_hz + hard_ksp_frequency_radius_hz;
+    hard_ksp_window_request.requested_mode_count = 1u;
+    hard_ksp_window_request.completeness_policy = 0;
+    check(std::isfinite(hard_ksp_frequency_radius_hz) &&
+              hard_ksp_frequency_radius_hz > 0.0 &&
+              std::isfinite(hard_ksp_window_request.frequency_min_hz) &&
+              std::isfinite(hard_ksp_window_request.frequency_max_hz) &&
+              hard_ksp_window_request.frequency_min_hz > 0.0 &&
+              hard_ksp_window_request.frequency_min_hz <
+                  hard_ksp_fixture.reference_frequency_hz &&
+              hard_ksp_window_request.frequency_max_hz >
+                  hard_ksp_fixture.reference_frequency_hz,
+          "hard-KSP window centers the native material frequency scale on the Kittel target");
     FullmagFemFrequencyDomainResult hard_ksp_window_result =
         fullmag_fem_modal_eigen_solve(&hard_ksp_window_request);
     check(hard_ksp_window_result.status == FULLMAG_FEM_FD_SOLVE_ERROR &&
