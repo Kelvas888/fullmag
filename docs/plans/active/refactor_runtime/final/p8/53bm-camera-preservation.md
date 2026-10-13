@@ -460,3 +460,59 @@ Scoped lint ownerów/kontrolera: PASS, exit 0,
 Niezależny read-only review trzech plików nie znalazł P0/P1/P2.
 Screenshot odmowy ma SHA256
 `9ece6a4f798a2fa9e5dec5671f3e85b9ea300310040cd8df369721a50a2b746b`.
+
+Przyrost zapisano i wysłano na `origin/master`:
+`48d3893cca7d7f7fdd0b7408051d3955039318ac`
+(`fix: identify safe workspace capture refusal boundaries`), pięć własnych
+plików. HEAD i origin/master zgodne, staging pusty. Hook React Doctor
+wskazał `position.every(...target[index])` bez lokalnego sprawdzenia długości.
+Po odczycie kontekstu: false positive, high confidence — oba wektory
+przechodzą `validateCameraVector`, która odrzuca długość różną od 3 i zwraca
+nową trójelementową krotkę przed porównaniem. Nie dodano suppression ani
+nie zmieniono walidacji kamery.
+
+Następny `just windows-workspace-build dev dev 3258 true` jest uruchomiony
+jako build-only; uchwyt 40022 oczekuje na istniejącą blokadę ciężkiej pracy
+(limit 120s). Przy ostatniej obserwacji jest aktywny; nie ma jeszcze wyniku
+ani nowego manifestu. Nie zatrzymywano obcych prac i nie uruchamiano
+równoległego wykonawcy. Po terminalnym sukcesie przypiąć nowy manifest,
+ponowić prywatną próbę restartu i odczytać nowy komunikat odmowy lub dowód
+odtworzenia. Ta diagnostyka nie zamyka bramki P8-53.
+
+Uchwyt 40022 następnie zakończył się terminalnie: recipe exit 2,
+`Bounded wait expired before starting`, po 120 sekundach. Nie rozpoczął
+kompilacji, nie utworzył nowego snapshotu ani manifestu. Odczyt procesów
+potwierdził aktywnego managed FEM GPU build-only z worktree
+`fem-script-launch-20261013`, wrapper PID 159104. Nie zatrzymywano tej pracy.
+Kolejne żądanie ma sens po potwierdzeniu zwolnienia zasobu, nie po samym
+upływie kolejnego timeoutu. W międzyczasie uzupełniono read-only ocenę Z:
+o odrębne bramki lokalnego writera sesji, publikacji FMS i volatile TEMP
+w [ocenie storage](55-network-storage-assessment-20261013.md).
+
+### Potwierdzenie kandydata po capture — odrębna diagnostyka
+
+Odczyt `DevelopmentRestartActionService.confirmAndStart` wykazał drugi
+wrapper odrzucający szczegóły: po udanym capture ownerów ponownie sprawdza
+sesję, gotowy pakiet, chroniony host i własność operacji. Dopiero po
+potwierdzonym release zwraca teraz stały powód `candidate_confirmation`.
+Awaria cleanupu nadal zwraca `cleanupConfirmed=false` i zachowuje
+pierwszeństwo komunikatu o niepewnej ochronie. Nie zmieniono kryteriów
+tożsamości, czasu ważności proof ani reguł dopuszczania restartu.
+
+Rozszerzono istniejący fixture bannera o zmianę pakietu przy trzecim
+odczycie statusu w operacji capture, bez równoczesnej awarii cleanupu.
+Scenariusz używa produkcyjnego KernelProvider, ownerów, action service,
+kontrolera i typowanego klienta; odpowiedzi HTTP są kontrolowane.
+Potwierdza osobny komunikat, null requestId, confirmed cleanup, wznowiony
+host, brak nowego POST i brak ponowienia po remount bannera. Następna
+jawna próba nadal przechodzi istniejący test niepotwierdzonego cleanupu.
+
+`just verify-development-restart-action-browser`: PASS 13 kontroli, exit 0,
+receipt `c00a743dd0d9464f836fe8300837fe52`, profil
+`windows-control-room-browser-fixture/development-restart-action-browser`.
+Digest przed i po `55cf83e4451475dbdac7de45202567671ccae6b340b6a5f14e1712f734f5fb20`;
+serwer terminalny, brak błędów strony/konsoli. Jest to fixture-only,
+bez natywnego consumera i bez niepustego dokumentu.
+Scoped lint PASS, exit 0, `0c39a4a0de25403ebe26a99dae50f580`.
+Przyczyna odmowy rzeczywistej próby 4f501 nadal nie jest potwierdzona:
+ten przyrost usuwa lukę diagnostyczną, nie kwalifikuje restartu.
