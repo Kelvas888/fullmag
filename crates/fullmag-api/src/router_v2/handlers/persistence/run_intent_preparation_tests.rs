@@ -36,6 +36,9 @@ fn request() -> (ProjectId, ProjectRunIntentRequest) {
             ..Default::default()
         })
         .unwrap();
+    // Keep this structural identity fixture below the inline mesh exchange limit.
+    fixture["study_problem_catalog"]["entries"][0]["problem"]["study"]["dynamics"]
+        ["fixed_timestep"] = serde_json::json!(1e-15);
     let original: RunIntent = serde_json::from_value(fixture["run_intent"].clone()).unwrap();
     let authored = RunIntentAuthoring {
         run_id: original.specification.run_id,
