@@ -267,3 +267,114 @@ przyczyny ani udanego buildu. Nie znaleziono deterministycznej rozbieżności
 filtrów przy tych wejściach. Slot ciężkiej pracy zajmował w tym czasie
 aktywny managed FEM GPU build-only z worktree `fem-script-launch-20261013`;
 jego procesów ani blokad nie zmieniano.
+
+### Jawne wyczyszczenie skali kamery — implementacja w toku
+
+Istniejący wygenerowany kontrakt `VisualizationCameraPatch` dopuszcza
+opcjonalne `orthographic_scale` jako `number | null` (format `double`,
+brak w `required`). Lokalna poprawka parsera używa istniejącego w module
+`deserialize_double_option` i rozróżnia brak pola (`None`), jawne null
+(`Some(None)`) oraz liczbę (`Some(Some(value))`). Aplikacja PATCH przypisuje
+wewnętrzny Option; walidacja nadal odrzuca wartości niedodatnie i niefinitywne.
+Jawny `schema(value_type = Option<f64>)` ma zachować istniejący kontrakt.
+
+Dodano dwie regresje Rust: serde round-trip, set/preserve/clear bez zmiany
+pozostałych pól kamery oraz odmowę 0, -1, infinity i NaN. Nie kompilowano
+ich ani nie uruchamiano — zgodnie z obowiązującym zakazem kompilacji testów.
+W istniejącym zarządzanym weryfikatorze API dodano odrębną regresję HTTP
+na jego prywatnej odtworzonej sesji: set → absent → null, nowe rewizje
+i identyczny GET readback; po odmowie 0/-1 kamera i rewizja mają pozostać
+bez zmian. Parser AST tego weryfikatora przeszedł, lecz to nie wykonanie HTTP.
+
+Po zakończeniu obcego procesu uruchomiono następny managed build-only:
+log `native-build-687f97a99f144ac6b1899e7ec86f77d5.log` w istniejącym
+profilu. W momencie tego wpisu trwa capture. Wymagane są terminalny
+build receipt, regresja HTTP, porównanie eksportu OpenAPI oraz rzeczywisty
+restart kamery. Punktu P2 i P8-53 nie oznaczono jako zamkniętych.
+
+Capture następnie zakończył się poprawnie: kapsuła
+`4eae0210c3641894aac49629c7dff458e8fdb97f13e36f84f213e74cbe901525`,
+snapshot źródeł
+`e45a260b2dde7cd57ec3cfa162ccd05e970ed492a4b2f328ace4180998119e0d`,
+backend fingerprint
+`c17ea5cd5bc142136d8021c3bfcec32d630aba2018b280a78dbabf52b03345ca`,
+HEAD `29ca31c72dd1d4d7901f88843c0e87e639372956`, dirty.
+Hashy trzech zmienionych plików Rust w kapsule i checkoutcie są identyczne.
+Build przeszedł przygotowanie wersji Python; brak jeszcze terminalnego
+wyniku produkcyjnej kompilacji i żadna regresja HTTP nie ma jeszcze PASS.
+
+Review poprawki Rust i regresji HTTP nie wykazało P0/P1. Wykryto P2
+w fixture `project-document-handoff-page.tsx`: operator `??` nadal
+ignorował null. Poprawiono fixture i rozszerzono istniejący scenariusz
+rzeczywistych ownerów o hydrację kamery perspective/null do replacement API
+z początkową skalą `2.75e-6`. Wymagane są typowany PATCH ACK oraz GET
+readback przed publikacją; poprzednia semantyka fixture nie przechodziłaby
+tego scenariusza. Managed próba fixture zakończyła się odmową storage lock
+przed testami, ponieważ ten sam checkout jest zablokowany przez nasz
+aktywny build. Nie ma nowego fixture PASS. Bieżący build zakończył instalację
+zależności Python i pnpm; dalszy wynik należy odczytać z tego samego
+uchwytu procesu, bez uruchamiania kolejnej kompilacji.
+
+### Terminalny build poprawki — 13.10.2026
+
+Ten sam build zakończył się `completed`, exit 0,
+`2026-10-13T20:15:06.792704+00:00`. Receipt profilu
+`windows-native-fdm-cpu-dev/build-status.json` potwierdza tożsamość checkoutu,
+profilu i logu powyżej. API/CLI skompilowały się w 3m24s, launcher desktopowy
+w 1m32s; są to czasy faz Cargo, nie całego przygotowania pakietu.
+Digest opublikowanego `windows-runtime/build-manifest.json`:
+`1626bd35933b27d1edc6cbdb812c81429a6f5a8a21819e092b6c86e40fed872b`.
+Powstały produkcyjne `fullmag.exe`, `fullmag-api.exe` i `fullmag-ui.exe`
+w profilu `backend-dev`. Nie kompilowano testów jednostkowych.
+
+Uruchomiono na tym przypiętym manifeście
+`just verify-windows-frozen-development-backend-api
+1626bd35933b27d1edc6cbdb812c81429a6f5a8a21819e092b6c86e40fed872b`.
+Próba `1995c74607ba4a4a852388b1a854447a` jest w toku; nie ma jeszcze
+terminalnego PASS regresji HTTP ani eksportu OpenAPI. Użytkowy workspace
+na 3197 pozostaje poza zakresem tej próby. Sam sukces kompilacji nie
+zamyka P8-53, weryfikacji restartu kamery ani kwalifikacji wydania.
+
+### Regresja natywnego API — PASS
+
+Próba `1995c74607ba4a4a852388b1a854447a` zakończyła się `completed`,
+exit 0, `2026-10-13T20:26:41.494384+00:00`: 301 kontroli, 98 procesów,
+wszystkie z `waited=true`. Receipt znajduje się w profilu
+`development-backend-api-checks/checks/1995c74607ba4a4a852388b1a854447a/receipt.json`.
+API SHA256: `a8cfabccf09595b6da4582a584531b1319c892f87f74903be390d621f0f6e4d8`;
+weryfikator: `931ebdb1afedab11dd41b63b437f5038ccc44301f86a6ab60c4cacc2c94934ef`.
+
+Potwierdzone na prywatnym odtworzonym API:
+
+- `camera-scale-patch-set-revision-and-readback`;
+- `camera-scale-patch-absent-revision-and-readback`;
+- `camera-scale-patch-clear-revision-and-readback`;
+- `camera-scale-invalid-patch-preserves-state-and-revision`;
+- `camera-scale-openapi-optional-nullable-double`.
+
+Kanoniczny eksport OpenAPI ma digest
+`885325f890e91ea5ded348dbf05dbdc4169400753915c7a556b610d767b919c6`.
+Brak pola nadal zachowuje skalę; jawne null ją usuwa; 0/-1 są odrzucane
+bez mutacji stanu i rewizji. Pozostałe pola kamery są porównywane dokładnie
+w odpowiedzi PATCH i GET. Publiczny kształt opcjonalnego `number | null`
+pozostał zgodny z istniejącym klientem. Pełna próba obejmowała także
+kontrole właściciela runtime-service — frozen manifest nie pomija tej fazy.
+
+Po zwolnieniu blokady uruchomiono `just verify-project-document-handoff-browser`
+na prywatnym porcie 3251. Jej wynik i rzeczywisty restart przeglądarkowy
+pozostają na tym etapie otwarte; testy Rust nadal `NOT RUN`.
+
+### Regresja ownerów w przeglądarce — PASS 35/35
+
+Próba `2d8e25fdfbfb48aabf04169b00d72ebc` zakończyła się `passed`, exit 0,
+`2026-10-13T20:27:52.218911+00:00`, serwer fixture zakończony i port zamknięty.
+Receipt oraz raport i screenshot są w profilu
+`windows-control-room-browser-fixture/project-document-handoff-browser/2d8e25fdfbfb48aabf04169b00d72ebc/`.
+Digest źródeł przed i po:
+`54fe203a0d74c0b55f224f5f81f2a8b3842001b094784d9a305defada3eeae9f`.
+Raport potwierdza 35/35 scenariuszy, zero `page_errors` i `console_errors`,
+w tym `concrete owner clears the replacement camera scale through typed patch and readback`.
+Poprawka parsera null i odpowiadająca jej semantyka fixture mają już dowód
+natywnego HTTP i przeglądarkowy dowód ownerów. Ten ostatni używa fixture API:
+nie jest dowodem rzeczywistego restartu procesu ani zachowania WebGL.
+P8-53 nadal wymaga osobnej prywatnej próby restartu z natywnym backendem.

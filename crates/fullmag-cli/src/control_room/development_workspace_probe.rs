@@ -372,7 +372,12 @@ pub(super) fn verify() -> Result<()> {
                         last_ready_frame = Some(Instant::now());
                     }
                     Ok(None) => {}
-                    Err(_) => {
+                    Err(error) => {
+                        // Keep the fail-closed outcome, but retain the failing boundary.
+                        // This contains error contexts, never the owner request/token.
+                        eprintln!(
+                            "[development browser proof] readiness observation failed: {error:#}"
+                        );
                         failure = Some(ProbeOutcome::Unknown("readiness_observation_unconfirmed"));
                         break;
                     }
@@ -932,7 +937,9 @@ fn readiness_frame(
     {
         return Ok(None);
     }
-    let status = guard.development_consumer_status()?;
+    let status = guard
+        .development_consumer_status()
+        .context("observing owned API consumer readiness")?;
     if require_ready_identity(&status, input, true).is_err() {
         return Ok(None);
     }
@@ -941,13 +948,14 @@ fn readiness_frame(
         worktree_id,
         expected_api_instance_id,
         generation_id,
-    )?
+    )
+    .context("observing the pending restart transport slot")?
     .is_some()
     {
         return Ok(None);
     }
 
-    let observed_at_unix_ms = unix_time_ms()?;
+    let observed_at_unix_ms = unix_time_ms().context("observing readiness frame time")?;
     let valid_until_unix_ms = observed_at_unix_ms.saturating_add(READY_FRAME_TTL_MS);
     Ok(Some(json!({
         "schema": READY_SCHEMA,

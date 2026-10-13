@@ -370,9 +370,10 @@ function makeConcreteApiFixture(
               target: patch.target ?? visualizationCamera.target,
               up: patch.up ?? visualizationCamera.up,
               fov_degrees: patch.fov_degrees ?? visualizationCamera.fov_degrees,
-              // The backend camera patch uses an optional value, so JSON null
-              // means "leave unchanged". Fresh session defaults are null.
-              orthographic_scale: patch.orthographic_scale ?? visualizationCamera.orthographic_scale,
+              // Absence preserves the scale; explicit JSON null clears it.
+              orthographic_scale: patch.orthographic_scale === undefined
+                ? visualizationCamera.orthographic_scale
+                : patch.orthographic_scale,
             };
           }
           return jsonResponse({ camera: clone(options.cameraPatchAck ?? visualizationCamera) }, apiPin);
@@ -1460,8 +1461,10 @@ async function checkDevelopmentGuardFailureAndDirtyPolicy(): Promise<void> {
   next.assertCurrent(); next.release();
 }
 
-async function checkConcreteDevelopmentOwnerCaptureAndHydration(): Promise<void> {
-  const oldApiFixture = makeConcreteApiFixture(OLD_API_PIN);
+async function checkConcreteDevelopmentOwnerCaptureAndHydration(
+  camera: VisualizationStateResource["camera"] = NONDEFAULT_CAMERA,
+): Promise<void> {
+  const oldApiFixture = makeConcreteApiFixture(OLD_API_PIN, { initialCamera: camera });
   const kernel = makeConcreteOwnerKernel(oldApiFixture.api);
   let pauseCount = 0;
   let resumeCount = 0;
@@ -1484,6 +1487,7 @@ async function checkConcreteDevelopmentOwnerCaptureAndHydration(): Promise<void>
       const api = makeConcreteApiFixture(apiInstance, {
         sessionId: REPLACEMENT_SESSION_ID,
         sessionEpoch: REPLACEMENT_SESSION_EPOCH,
+        initialCamera: NONDEFAULT_CAMERA,
       });
       const replacement = makeConcreteOwnerKernel(api.api);
       preparedReplacement.api = api;
@@ -1496,7 +1500,7 @@ async function checkConcreteDevelopmentOwnerCaptureAndHydration(): Promise<void>
     },
   });
 
-  observeFixtureCamera(kernel);
+  observeFixtureCamera(kernel, camera);
   const emptyCapture = await owners.capture();
   const emptyHandoff = emptyCapture.projectDocument.snapshot as Record<string, unknown>;
   assertCondition(emptyHandoff.state === "empty", "Empty owner capture did not preserve the empty document");
@@ -1511,7 +1515,7 @@ async function checkConcreteDevelopmentOwnerCaptureAndHydration(): Promise<void>
   assertCondition(!kernel.pendingForms.getTransitionSnapshot().guarded, "Empty owner release retained the form guard");
 
   await openConcreteProject(kernel);
-  observeFixtureCamera(kernel);
+  observeFixtureCamera(kernel, camera);
   kernel.pendingForms.register(Symbol("concrete owner clean form"), pendingForm());
   kernel.layout.replace({
     ...kernel.layout.get(),
@@ -1530,7 +1534,7 @@ async function checkConcreteDevelopmentOwnerCaptureAndHydration(): Promise<void>
   assertCondition(canonical(captured.workspace.layout) === canonical(kernel.layout.get()),
     "Actual layout owner was not captured");
   assertCondition(captured.workspace.schema === "fullmag.development-layout-handoff.v2"
-    && canonical(captured.workspace.camera) === canonical(NONDEFAULT_CAMERA),
+    && canonical(captured.workspace.camera) === canonical(camera),
   "The clean nondefault camera was not captured in workspace handoff v2");
   assertCondition((captured.projectDocument.snapshot as Record<string, unknown>).state === "ready",
     "Ready document owner was not captured");
@@ -1559,7 +1563,7 @@ async function checkConcreteDevelopmentOwnerCaptureAndHydration(): Promise<void>
   assertCondition(hydratedApiFixture.calls.projectOpens.length === 1,
     "Project document hydration did not use the real typed projects.open facade");
   assertCondition(hydratedApiFixture.calls.visualizationPatches.length === 1
-    && canonical(hydratedApiFixture.calls.visualizationPatches[0]?.camera) === canonical(NONDEFAULT_CAMERA),
+    && canonical(hydratedApiFixture.calls.visualizationPatches[0]?.camera) === canonical(camera),
   "Replacement camera was not restored through the typed visualization patch facade");
   assertCondition(hydratedApiFixture.calls.requests.filter((request) =>
     request.method === "GET" && request.path === VISUALIZATION_STATE_PATH).length === 1,
@@ -1924,6 +1928,10 @@ async function runChecks(): Promise<FixtureReport> {
     ["document handoff guard blocks mutations and preserves metadata until release", checkDevelopmentDocumentGuard],
     ["dirty handoff requires explicit carry and failed guard issuance rolls back", checkDevelopmentGuardFailureAndDirtyPolicy],
     ["concrete owner factory captures empty/document/layout and hydrates fresh pinned owners", checkConcreteDevelopmentOwnerCaptureAndHydration],
+    ["concrete owner clears the replacement camera scale through typed patch and readback", () =>
+      checkConcreteDevelopmentOwnerCaptureAndHydration({
+        ...NONDEFAULT_CAMERA, projection: "perspective", orthographic_scale: null,
+      })],
     ["concrete owner identity mismatch releases every guard without submitting", checkConcreteDevelopmentOwnerMismatchCleanup],
     ["concrete owner hydrate rejects invalid owners and withholds publication on camera mismatch", checkConcreteDevelopmentHydrationRefusals],
     ["camera mutation invalidates a captured workspace handoff", checkCameraMutationInvalidatesHandoff],
