@@ -992,6 +992,12 @@ add_fem_source_facade_contract(
     fem_modal_eigen_contract
     tests/frequency_domain/modal_eigen_contract_test.cpp
 )
+add_executable(fem_modal_eigen_nodal_energy_hessian_contract
+    tests/frequency_domain/nodal_energy_hessian_contract_test.cpp
+)
+add_test(NAME fem_modal_eigen_nodal_energy_hessian_contract
+    COMMAND fem_modal_eigen_nodal_energy_hessian_contract
+)
 add_test(NAME fem_modal_eigen_poisson_iteration_policy_contract
     COMMAND $<TARGET_FILE:fem_modal_eigen_contract> --poisson-iteration-policy)
 # Isolate the generic provider contract while preserving the full modal suite.
