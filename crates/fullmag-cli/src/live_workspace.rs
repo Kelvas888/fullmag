@@ -2413,7 +2413,7 @@ mod tests {
             ));
             ingest_preview_fields_from_update(&mut state, &mut update);
 
-            assert!(state.latest_fields.get("H_demag").is_none());
+            assert!(state.latest_fields.0.get("H_demag").is_none());
             assert!(state.pending_preview_fields.is_empty());
             assert_eq!(
                 state.preview_fields.to_vec()[0].vector_field_values,
