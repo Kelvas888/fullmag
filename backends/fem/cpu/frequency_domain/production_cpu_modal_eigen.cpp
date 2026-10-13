@@ -4459,6 +4459,11 @@ FrequencyDomainContractResult solve_sparse_production_modal_payload(
         }
         result.result_json += "}";
         append_nearest_frequency_metadata(result.result_json, request, result.status);
+        if (slepc_result.floquet_dense_oracle.requested) {
+            append_optional_json_field(
+                result.result_json,
+                floquet_dense_oracle_json_field(slepc_result.floquet_dense_oracle));
+        }
         append_optional_json_field(
             result.diagnostics_json, shifted_ksp_diagnostics_json_fields);
         append_optional_json_field(result.diagnostics_json, demag_probe_json_field);
@@ -4611,6 +4616,11 @@ FrequencyDomainContractResult solve_sparse_production_modal_payload(
         ",\"modes\":" +
         mode_transport.json + "}";
     append_nearest_frequency_metadata(result.result_json, request, result.status);
+    if (slepc_result.floquet_dense_oracle.requested) {
+        append_optional_json_field(
+            result.result_json,
+            floquet_dense_oracle_json_field(slepc_result.floquet_dense_oracle));
+    }
     append_optional_json_field(
         result.diagnostics_json, shifted_ksp_diagnostics_json_fields);
     append_optional_json_field(result.diagnostics_json, demag_probe_json_field);

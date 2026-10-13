@@ -8163,6 +8163,238 @@ std::string json_object_after_key(const char *json, const char *key)
     return copy_json_object(json_member_after_key(json, key));
 }
 
+bool json_member_has_literal(const char *json, const char *key, const char *literal);
+
+std::string json_array_after_key(const char *json, const char *key)
+{
+    const char *array_begin = json_member_after_key(json, key);
+    if (array_begin == nullptr || *array_begin != '[') {
+        return {};
+    }
+    std::size_t depth = 0u;
+    bool inside_string = false;
+    bool escaped = false;
+    for (const char *cursor = array_begin; *cursor != '\0'; ++cursor) {
+        if (inside_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (*cursor == '\\') {
+                escaped = true;
+            } else if (*cursor == '"') {
+                inside_string = false;
+            }
+            continue;
+        }
+        if (*cursor == '"') {
+            inside_string = true;
+        } else if (*cursor == '[') {
+            ++depth;
+        } else if (*cursor == ']') {
+            if (depth == 0u) {
+                return {};
+            }
+            --depth;
+            if (depth == 0u) {
+                return std::string(array_begin, cursor + 1);
+            }
+        }
+    }
+    return {};
+}
+
+std::vector<std::string> json_array_objects(const std::string &json_array)
+{
+    std::vector<std::string> objects;
+    if (json_array.size() < 2u || json_array.front() != '[' ||
+        json_array.back() != ']') {
+        return objects;
+    }
+    std::size_t object_depth = 0u;
+    std::size_t object_begin = std::string::npos;
+    bool inside_string = false;
+    bool escaped = false;
+    for (std::size_t index = 1u; index + 1u < json_array.size(); ++index) {
+        const char value = json_array[index];
+        if (inside_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (value == '\\') {
+                escaped = true;
+            } else if (value == '"') {
+                inside_string = false;
+            }
+            continue;
+        }
+        if (value == '"') {
+            inside_string = true;
+        } else if (value == '{') {
+            if (object_depth == 0u) {
+                object_begin = index;
+            }
+            ++object_depth;
+        } else if (value == '}') {
+            if (object_depth == 0u) {
+                return {};
+            }
+            if (--object_depth == 0u) {
+                objects.emplace_back(
+                    json_array.substr(object_begin, index - object_begin + 1u));
+                object_begin = std::string::npos;
+            }
+        }
+    }
+    if (inside_string || object_depth != 0u) {
+        return {};
+    }
+    return objects;
+}
+
+bool json_member_is_finite_number(const char *json, const char *key)
+{
+    const char *value = json_member_after_key(json, key);
+    if (value == nullptr) {
+        return false;
+    }
+    char *end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    if (end == value || !std::isfinite(parsed)) {
+        return false;
+    }
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') {
+        ++end;
+    }
+    return *end == ',' || *end == '}';
+}
+
+bool json_member_is_nonnegative_integer(const char *json, const char *key, int *out)
+{
+    const char *value = json_member_after_key(json, key);
+    if (value == nullptr || out == nullptr) {
+        return false;
+    }
+    char *end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    if (end == value || !std::isfinite(parsed) || parsed < 0.0 ||
+        parsed > static_cast<double>(std::numeric_limits<int>::max()) ||
+        std::floor(parsed) != parsed) {
+        return false;
+    }
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') {
+        ++end;
+    }
+    if (*end != ',' && *end != '}') {
+        return false;
+    }
+    *out = static_cast<int>(parsed);
+    return true;
+}
+
+bool floquet_dense_raw_spectrum_is_consistent(
+    const char *result_json,
+    bool require_rotated_entry)
+{
+    const std::string oracle = json_object_after_key(
+        result_json, "\"floquet_dense_oracle\":");
+    if (!json_member_has_literal(
+            oracle.c_str(),
+            "\"schema_version\":",
+            "\"floquet_dense_original_schur_oracle.v1\"")) {
+        return false;
+    }
+    const std::string spectrum = json_object_after_key(
+        oracle.c_str(), "\"raw_spectrum\":");
+    const std::string entries_json = json_array_after_key(
+        spectrum.c_str(), "\"entries\":");
+    if (spectrum.empty() || entries_json.empty()) {
+        return false;
+    }
+    const std::vector<std::string> entries = json_array_objects(entries_json);
+    if (json_member_has_literal(spectrum.c_str(), "\"count_available\":", "false")) {
+        return !require_rotated_entry &&
+            json_member_has_literal(spectrum.c_str(), "\"total_count\":", "null") &&
+            json_member_has_literal(spectrum.c_str(), "\"entry_count\":", "null") &&
+            json_member_has_literal(spectrum.c_str(), "\"truncated\":", "null") &&
+            entries_json == "[]" && entries.empty();
+    }
+    if (!json_member_has_literal(spectrum.c_str(), "\"count_available\":", "true")) {
+        return false;
+    }
+    int total_count = 0;
+    int entry_count = 0;
+    int eps_converged_count = 0;
+    if (!json_member_is_nonnegative_integer(
+            spectrum.c_str(), "\"total_count\":", &total_count) ||
+        !json_member_is_nonnegative_integer(
+            spectrum.c_str(), "\"entry_count\":", &entry_count) ||
+        !json_member_is_nonnegative_integer(
+            oracle.c_str(), "\"eps_converged_count\":", &eps_converged_count) ||
+        total_count != eps_converged_count) {
+        return false;
+    }
+    const int capacity = static_cast<int>(fd::FloquetDenseOracleDiagnostics::kRawSpectrumCapacity);
+    const int expected_entries = std::min(total_count, capacity);
+    if (entry_count != expected_entries ||
+        entries.size() != static_cast<std::size_t>(expected_entries) ||
+        (expected_entries == 0 && entries_json != "[]") ||
+        !json_member_has_literal(
+            spectrum.c_str(),
+            "\"truncated\":",
+            total_count > capacity ? "true" : "false")) {
+        return false;
+    }
+    bool rotated_entry_available = false;
+    for (const std::string &entry : entries) {
+        if (json_member_has_literal(entry.c_str(), "\"available\":", "true")) {
+            if (!json_member_is_finite_number(
+                    entry.c_str(), "\"rotated_eps_real_rad_s\":") ||
+                !json_member_is_finite_number(
+                    entry.c_str(), "\"rotated_eps_imaginary_rad_s\":") ||
+                !json_member_is_finite_number(
+                    entry.c_str(), "\"raw_lambda_real_per_s\":") ||
+                !json_member_is_finite_number(
+                    entry.c_str(), "\"raw_lambda_imag_rad_per_s\":")) {
+                return false;
+            }
+            const bool shift_distance_available = json_member_has_literal(
+                entry.c_str(), "\"shift_distance_available\":", "true");
+            if ((!shift_distance_available &&
+                 !json_member_has_literal(
+                     entry.c_str(), "\"shift_distance_available\":", "false")) ||
+                (shift_distance_available &&
+                 (!json_member_is_finite_number(
+                      entry.c_str(), "\"shift_distance_rad_s\":") ||
+                  !json_member_is_finite_number(
+                      entry.c_str(), "\"shift_distance_hz\":"))) ||
+                (!shift_distance_available &&
+                 (!json_member_has_literal(
+                      entry.c_str(), "\"shift_distance_rad_s\":", "null") ||
+                  !json_member_has_literal(
+                      entry.c_str(), "\"shift_distance_hz\":", "null")))) {
+                return false;
+            }
+            rotated_entry_available = true;
+        } else if (!json_member_has_literal(
+                       entry.c_str(), "\"available\":", "false") ||
+                   !json_member_has_literal(
+                       entry.c_str(), "\"rotated_eps_real_rad_s\":", "null") ||
+                   !json_member_has_literal(
+                       entry.c_str(), "\"rotated_eps_imaginary_rad_s\":", "null") ||
+                   !json_member_has_literal(
+                       entry.c_str(), "\"raw_lambda_real_per_s\":", "null") ||
+                   !json_member_has_literal(
+                       entry.c_str(), "\"raw_lambda_imag_rad_per_s\":", "null") ||
+                   !json_member_has_literal(
+                       entry.c_str(), "\"shift_distance_available\":", "false") ||
+                   !json_member_has_literal(
+                       entry.c_str(), "\"shift_distance_rad_s\":", "null") ||
+                   !json_member_has_literal(
+                       entry.c_str(), "\"shift_distance_hz\":", "null")) {
+            return false;
+        }
+    }
+    return !require_rotated_entry || rotated_entry_available;
+}
+
 bool json_member_has_literal(const char *json, const char *key, const char *literal)
 {
     const char *value = json_member_after_key(json, key);
@@ -9585,9 +9817,13 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
         const bool opt_out_borrowed_pmat_present = contains(
             hard_ksp_opt_out_result.diagnostics_json,
             "\"borrowed_pmat_copy\"");
+        const bool opt_out_dense_oracle_present = contains(
+            hard_ksp_opt_out_result.result_json,
+            "\"floquet_dense_oracle\":");
         const bool opt_out_serializer_contract =
             hard_ksp_opt_out_result.status == FULLMAG_FEM_FD_SOLVE_ERROR &&
-            opt_out_failure_probe_present && !opt_out_borrowed_pmat_present;
+            opt_out_failure_probe_present && !opt_out_borrowed_pmat_present &&
+            !opt_out_dense_oracle_present;
         if (!opt_out_serializer_contract) {
             print_bounded_hard_ksp_opt_out_failure(
                 hard_ksp_opt_out_result,
@@ -9635,11 +9871,9 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
                      "\"live_pc_observation\":null");
         check(candidate_waits_for_true_probe,
               "hard failure keeps candidate measurements explicitly unavailable until a positive true-probe candidate exists");
-        check(contains(hard_ksp_nearest_result.diagnostics_json,
-                       "\"raw_spectrum\":{\"count_available\":") &&
-                  contains(hard_ksp_nearest_result.diagnostics_json,
-                           "\"rotated_eps_real_rad_s\":"),
-              "hard-KSP provenance carries the bounded unfiltered dense EPS raw spectrum when the existing dense oracle is requested");
+        check(floquet_dense_raw_spectrum_is_consistent(
+                  hard_ksp_nearest_result.result_json, false),
+              "hard-KSP result preserves the requested cached dense-oracle schema and truthful raw-spectrum availability");
         check(extract_json_number(
                   hard_ksp_nearest_result.diagnostics_json,
                   "\"eps_attempt_number\":",
@@ -9685,6 +9919,9 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
         fixture_request.max_linear_iterations = 1;
         FullmagFemFrequencyDomainResult control_result =
             fullmag_fem_modal_eigen_solve(&fixture_request);
+        check(floquet_dense_raw_spectrum_is_consistent(
+                  control_result.result_json, true),
+              "successful control retains actual raw rotated values with exact bounded count and truncation metadata");
         const std::string control_observation = json_object_after_key(
             control_result.diagnostics_json, "\"candidate_operator_observation\":");
         const std::string control_live_pc = json_object_after_key(
