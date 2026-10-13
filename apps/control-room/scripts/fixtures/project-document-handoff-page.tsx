@@ -1603,6 +1603,54 @@ async function checkConcreteDevelopmentOwnerMismatchCleanup(): Promise<void> {
     "Capture mismatch submitted a restart mutation");
 }
 
+async function checkConcreteCaptureFailureDiagnostics(): Promise<void> {
+  for (const scenario of ["pause", "camera", "identity", "cleanup"] as const) {
+    const apiFixture = makeConcreteApiFixture(OLD_API_PIN, scenario === "identity"
+      ? { workspaceApiInstance: FOREIGN_API_PIN } : {});
+    const kernel = makeConcreteOwnerKernel(apiFixture.api);
+    await openConcreteProject(kernel);
+    if (scenario !== "camera" && scenario !== "cleanup") observeFixtureCamera(kernel);
+    const original = kernel.projectDocument.getSnapshot();
+    let resumes = 0;
+    const owners = createDevelopmentKernelOwners(kernel, {
+      applyPendingChanges: false,
+      carryUnsavedDocument: false,
+      pauseOldKernel: () => {
+        if (scenario === "pause") throw new Error("private fixture marker");
+        return () => {
+          resumes += 1;
+          if (scenario === "cleanup") throw new Error("private fixture marker");
+        };
+      },
+      prepareReplacement: async () => { throw new Error("Rejected capture must not prepare a replacement"); },
+      publishReplacement: async () => { throw new Error("Rejected capture must not publish a replacement"); },
+    });
+    // The cleanup case rejects the unobserved camera, then fails owner resume.
+    const controller = createDevelopmentRestartController(apiFixture.api, owners);
+    await controller.start();
+    const snapshot = controller.getSnapshot();
+    const expected = scenario === "pause" ? "Workspace activity could not be paused safely."
+      : scenario === "identity" ? "The current backend and session could not be confirmed."
+        : scenario === "cleanup" ? "guard cleanup is unconfirmed"
+          : "The current camera view is not confirmed by the backend.";
+    assertCondition(snapshot.state === "failed" && snapshot.message?.includes(expected),
+      `${scenario}: capture failure lost its safe boundary diagnostic`);
+    assertCondition(snapshot.captureCleanup === (scenario === "cleanup" ? "unconfirmed" : "confirmed"),
+      `${scenario}: capture cleanup certainty changed`);
+    assertCondition(!snapshot.message?.includes("private fixture marker"),
+      `${scenario}: capture diagnostic exposed arbitrary error text`);
+    assertCondition(snapshot.requestId === null && apiFixture.calls.requests.filter((request) =>
+      request.path === PLATFORM_DEVELOPMENT_RESTART_REQUESTS_PATH).length === 0,
+    `${scenario}: refused capture submitted a restart`);
+    assertCondition(canonical(kernel.projectDocument.getSnapshot()) === canonical(original),
+      `${scenario}: refused capture changed the project document`);
+    assertCondition(resumes === (scenario === "pause" ? 0 : 1),
+      `${scenario}: capture cleanup resumed the old owner an unexpected number of times`);
+    assertCondition(!kernel.pendingForms.getTransitionSnapshot().guarded && kernel.projectDocument.canSave(),
+      `${scenario}: capture rejection retained a document or form guard`);
+  }
+}
+
 async function checkConcreteDevelopmentHydrationRefusals(): Promise<void> {
   const oldApiFixture = makeConcreteApiFixture(OLD_API_PIN);
   const kernel = makeConcreteOwnerKernel(oldApiFixture.api);
@@ -1933,6 +1981,7 @@ async function runChecks(): Promise<FixtureReport> {
         ...NONDEFAULT_CAMERA, projection: "perspective", orthographic_scale: null,
       })],
     ["concrete owner identity mismatch releases every guard without submitting", checkConcreteDevelopmentOwnerMismatchCleanup],
+    ["concrete capture reports a safe failing boundary without submitting or hiding uncertain cleanup", checkConcreteCaptureFailureDiagnostics],
     ["concrete owner hydrate rejects invalid owners and withholds publication on camera mismatch", checkConcreteDevelopmentHydrationRefusals],
     ["camera mutation invalidates a captured workspace handoff", checkCameraMutationInvalidatesHandoff],
     ["unobserved active-session camera refuses capture and releases guards", checkUnobservedCameraCaptureRefuses],

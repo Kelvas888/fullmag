@@ -378,3 +378,85 @@ Poprawka parsera null i odpowiadająca jej semantyka fixture mają już dowód
 natywnego HTTP i przeglądarkowy dowód ownerów. Ten ostatni używa fixture API:
 nie jest dowodem rzeczywistego restartu procesu ani zachowania WebGL.
 P8-53 nadal wymaga osobnej prywatnej próby restartu z natywnym backendem.
+
+### Checkpoint integracji i następna bramka
+
+Zweryfikowany fragment zapisano i wysłano na `origin/master`:
+`6b4fceba3379d5944c3f16f5329291ca9b6cafef`
+(`fix: clear nullable camera scale during development handoff`). Zakres:
+parser/aplikacja PATCH, regresje HTTP i fixture ownerów, bezpieczna
+diagnostyka granicy readiness oraz powyższe dowody. Po push HEAD i
+origin/master są zgodne; staging jest pusty. Obce zmiany pozostawiono.
+
+Uruchomiono `just verify-windows-development-workspace-browser
+12984ba740244e5e86d8878814069155`; prywatna próba
+`4f50176b319c458f87e9f8b6459c85be` korzysta z zachowanego pakietu A
+i nowego natywnego pakietu B, port 3258. Przy ostatniej obserwacji
+proces weryfikatora PID 87376 i uchwyt 24903 są aktywne. Nie ma jeszcze
+terminalnego wyniku tej próby. Kontynuować obserwację tego samego uchwytu;
+nie rozpoczynać drugiej próby wskutek samego upływu czasu. Sesji użytkownika
+na 3197 nie zatrzymywano. P8-53 i cały plan pozostają otwarte.
+
+### Prywatna próba 4f501 — capture odmówiony, bez restartu
+
+Frontend przeszedł przygotowanie i ogłosił gotowość API
+`141988c5-0839-46be-9aed-5be4307c5517`. Sterowanie rozszerzeniem Chrome
+przekroczyło limit czasu na `Page.navigate` i `Emulation.setFocusEmulationEnabled`.
+Odrębna karta przeglądarki aplikacji działała prawidłowo; nie restartowano
+procesu próby z powodu tych timeoutów.
+
+Przez produkcyjne UI utworzono projekt `project-8e053dfdd5734d4386be5d91f14ae938`,
+sesję `session-18de3127063b9ea80002219c`, obiekt
+`camera-proof-film-mv755onz` (Box 100 × 100 × 10 nm), materiał
+`mat:camera-proof-film` (`Ms=800000 A/m`, `Aex=1.3e-11 J/m`, `alpha=0.01`)
+oraz region `camera-proof-film-mv755onz:r1` o nazwie `film region`.
+Są to faktyczne definicje sceny, potwierdzone w `workspace_browser_before`,
+nie tylko tekstowe etykiety draftu. Scene revision 4, po jednym obiekcie,
+regionie i materiale. Przed przygotowaniem obiektu odświeżenie Explorera
+było potrzebne do pokazania jego podwęzłów; przyczyny nie kwalifikowano.
+
+Przełączono kamerę na orthographic. Receipt przed restartem zapisuje
+pozycję `[2e-6,1.4e-6,2e-6]`, target `[0,0,0]`, up `[0,0,1]`, FOV 45,
+skalę null. Canvas był widoczny, kontekst niezagubiony, drawing buffer
+679 × 281 (następnie 679 × 297). Projekt pozostawał dirty.
+
+Normalny przycisk **Restart backend** zakończył się komunikatem
+`Workspace capture failed; no restart was submitted.` Model pozostał
+dostępny. Nowa diagnostyka natywnej granicy readiness nie zarejestrowała
+błędu w stderr; nie utożsamiamy tego przypadku z wcześniejszym
+`readiness_observation_unconfirmed`. Dokładny etap błędu frontendowego
+capture pozostaje nieustalony, ponieważ obecny wrapper odrzuca szczegóły.
+Nie wykonano restartu ani porównania kamery po restarcie.
+
+Próbę zakończono jej istniejącym, nonce-bound protokołem `cancel`:
+terminalny receipt `failed`, exit 1, 19 procesów, wszystkie `waited=true`.
+Powód receiptu to `Private browser proof cancelled; collecting terminal custody`;
+nie jest to PASS ani diagnoza przyczyny capture. Użytkowego workspace 3197
+nie zmieniano. [Screenshot odmowy](53bm-native-capture-refusal.png).
+
+Lokalny następny przyrost rozróżnia stałe, bezpieczne przyczyny capture:
+ochrona projektu, pauza workspace, obserwacja kamery, tożsamość i layout.
+Nie propaguje arbitralnej treści wyjątków, nie osłabia guardów, nie dodaje
+ponawiania. Niepotwierdzony cleanup nadal ma pierwszeństwo przed tymi
+komunikatami. Nowa regresja używa konkretnych ownerów i kontrolera dla
+pauzy, nieobserwowanej kamery, obcego API i awarii resume; sprawdza brak
+POST restartu, zachowanie dokumentu, cleanup i brak wycieku treści błędu.
+Jej managed wynik oraz kolejna natywna próba są jeszcze otwarte.
+
+Managed regresja diagnostyki zakończyła się PASS 36/36, exit 0:
+`477ccbcbe0e540f5bc9614c3ee0f7ca6`, profil
+`windows-control-room-browser-fixture/project-document-handoff-browser`.
+Digest źródeł przed i po
+`4a66bd74e9d4326735789a87b17b1cd1e5e82108a8c7f7f1e7f3f1ee83275212`,
+serwer zakończony, brak błędów strony i konsoli. Jest to dowód konkretnych
+ownerów/kontrolera przeciw fixture API, bez natywnego restartu. Aktualna
+przyczyna odmowy w 4f501 wymaga ponownej rzeczywistej próby z tymi nowymi
+komunikatami, bez wyłączania kontroli spójności ani powtórzenia żądania
+o nieznanym wyniku. Testów jednostkowych nie kompilowano.
+
+Scoped lint ownerów/kontrolera: PASS, exit 0,
+`4b7dfee40d1a4f76b8098a75a632901b`, profil
+`windows-control-room-source-check/development-restart-action-lint`.
+Niezależny read-only review trzech plików nie znalazł P0/P1/P2.
+Screenshot odmowy ma SHA256
+`9ece6a4f798a2fa9e5dec5671f3e85b9ea300310040cd8df369721a50a2b746b`.

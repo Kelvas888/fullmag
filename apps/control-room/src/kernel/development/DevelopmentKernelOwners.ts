@@ -2,7 +2,7 @@ import type { DevelopmentRestartResource, VisualizationStatePatch, Visualization
 import type { KernelApi } from "../types";
 import type { LayoutState } from "../layout/layoutTypes";
 import { cloneBoundedProjectJsonObject, validateProjectDocumentDevelopmentHandoff } from "../persistence/ProjectDocumentDevelopmentHandoff";
-import { DevelopmentRestartCaptureError, type DevelopmentRestartOwners } from "./DevelopmentRestartController";
+import { DevelopmentRestartCaptureError, type DevelopmentRestartCaptureReason, type DevelopmentRestartOwners } from "./DevelopmentRestartController";
 
 const WORKSPACE_SCHEMA_V1 = "fullmag.development-layout-handoff.v1";
 const WORKSPACE_SCHEMA_V2 = "fullmag.development-layout-handoff.v2";
@@ -54,13 +54,17 @@ export function createDevelopmentKernelOwners(
         released = true;
         releaseAll([() => forms.release(), () => document?.release(), () => resume?.()]);
       };
+      let captureReason: DevelopmentRestartCaptureReason = "document_capture";
       try {
         document = kernel.projectDocument.beginDevelopmentHandoff({ carryUnsaved: options.carryUnsavedDocument });
+        captureReason = "workspace_pause";
         resume = options.pauseOldKernel();
         // Read the stopped registry directly. The old API transport is paused
         // by the host, so a GET here would either fail or observe stale data.
+        captureReason = "camera_observation";
         const cameraSnapshot = kernel.cameraRegistry.getSnapshot();
         const sourceCamera = validateCameraState(cameraSnapshot.camera);
+        captureReason = "workspace_identity";
         const observation = await kernel.api.platform.developmentBackend();
         const identity = observation.workspace_identity;
         if (!observation.configured || !identity || identity.api_instance_id !== kernel.api.getExpectedApiInstance()
@@ -68,12 +72,14 @@ export function createDevelopmentKernelOwners(
           || (identity.session_id !== null && (typeof identity.session_id !== "string" || !identity.session_id.trim()))) {
           throw new Error("Current workspace transition identity is unavailable.");
         }
+        captureReason = "camera_observation";
         if (identity.session_id !== null
           && (cameraSnapshot.lastRemoteRevision === null || cameraSnapshot.remoteCamera === null
             || cameraSnapshot.dirty || cameraSnapshot.syncInFlight || cameraSnapshot.error !== null
             || !sameCamera(sourceCamera, validateCameraState(cameraSnapshot.remoteCamera)))) {
           throw new Error("Current session camera has not reached a clean observed state.");
         }
+        captureReason = "workspace_layout";
         const originalLayout = kernel.layout.get();
         const workspace = cloneBoundedProjectJsonObject({
           schema: WORKSPACE_SCHEMA_V2,
@@ -103,7 +109,7 @@ export function createDevelopmentKernelOwners(
         };
       } catch {
         try { release(); } catch { throw new DevelopmentRestartCaptureError(false); }
-        throw new DevelopmentRestartCaptureError(true);
+        throw new DevelopmentRestartCaptureError(true, captureReason);
       }
     },
     hydrate: async (resource: DevelopmentRestartResource) => {
