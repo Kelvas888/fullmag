@@ -4,6 +4,7 @@ use fullmag_ir::{FemEigenPlanIR, OutputIR, ParallelExecutionModeIR, ParallelExec
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
+use std::io::Read;
 use std::path::Path;
 
 use crate::dispatch::FemEngine;
@@ -237,15 +238,210 @@ fn pool_interruption_status(action: StepAction) -> Result<RunStatus, RunError> {
     }
 }
 
-fn pool_report_artifact(
-    report: &crate::eigen::k_process_pool::ProcessPoolReportV1,
-) -> Result<AuxiliaryArtifact, RunError> {
-    Ok(AuxiliaryArtifact {
-        relative_path: "eigen/parallel_execution.v1.json".to_string(),
-        bytes: serde_json::to_vec_pretty(report).map_err(|error| RunError {
-            message: format!("failed to serialize adaptive process-pool report: {error}"),
-        })?,
+const MAX_POOL_WORKER_LOG_ARTIFACT_BYTES: u64 = 1024 * 1024;
+const POOL_REPORT_ARTIFACT_PATH: &str = "eigen/parallel_execution.v1.json";
+
+struct PoolWorkerLogPublication {
+    relative_path: Option<String>,
+    content_sha256: Option<String>,
+    size_bytes: Option<u64>,
+    publication_state: &'static str,
+    artifact_member: bool,
+    unavailable_reason: Option<&'static str>,
+    artifact: Option<AuxiliaryArtifact>,
+}
+
+fn read_pool_worker_log(
+    path: &Path,
+    relative_path: &str,
+    stream: &str,
+    interrupted: bool,
+) -> Result<PoolWorkerLogPublication, RunError> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if interrupted && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PoolWorkerLogPublication {
+                relative_path: None,
+                content_sha256: None,
+                size_bytes: None,
+                publication_state: "unavailable",
+                artifact_member: false,
+                unavailable_reason: Some("missing_after_interruption"),
+                artifact: None,
+            });
+        }
+        Err(error) => {
+            return Err(RunError {
+                message: format!(
+                    "failed to open adaptive process-pool {stream} log for publication: {error}"
+                ),
+            });
+        }
+    };
+
+    let mut bounded_reader = file.take(MAX_POOL_WORKER_LOG_ARTIFACT_BYTES + 1);
+    let mut bytes = Vec::new();
+    bounded_reader
+        .read_to_end(&mut bytes)
+        .map_err(|error| RunError {
+            message: format!(
+                "failed to read adaptive process-pool {stream} log for publication: {error}"
+            ),
+        })?;
+    if bytes.len() as u64 > MAX_POOL_WORKER_LOG_ARTIFACT_BYTES {
+        return Err(RunError {
+            message: format!(
+                "adaptive process-pool {stream} log exceeds the {MAX_POOL_WORKER_LOG_ARTIFACT_BYTES}-byte publication limit"
+            ),
+        });
+    }
+
+    let content_sha256 = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let size_bytes = bytes.len() as u64;
+    Ok(PoolWorkerLogPublication {
+        relative_path: Some(relative_path.to_string()),
+        content_sha256: Some(content_sha256),
+        size_bytes: Some(size_bytes),
+        publication_state: "published",
+        artifact_member: true,
+        unavailable_reason: None,
+        artifact: Some(AuxiliaryArtifact {
+            relative_path: relative_path.to_string(),
+            bytes,
+        }),
     })
+}
+
+fn set_pool_worker_log_publication(
+    entry: &mut serde_json::Map<String, Value>,
+    stream: &str,
+    publication: &PoolWorkerLogPublication,
+) {
+    entry.insert(
+        format!("{stream}_path"),
+        publication
+            .relative_path
+            .as_ref()
+            .map_or(Value::Null, |path| Value::String(path.clone())),
+    );
+    entry.insert(
+        format!("{stream}_content_sha256"),
+        publication
+            .content_sha256
+            .as_ref()
+            .map_or(Value::Null, |hash| Value::String(hash.clone())),
+    );
+    entry.insert(
+        format!("{stream}_size_bytes"),
+        publication.size_bytes.map_or(Value::Null, Value::from),
+    );
+    entry.insert(
+        format!("{stream}_publication_state"),
+        Value::String(publication.publication_state.to_string()),
+    );
+    entry.insert(
+        format!("{stream}_artifact_member"),
+        Value::Bool(publication.artifact_member),
+    );
+    entry.insert(
+        format!("{stream}_unavailable_reason"),
+        publication
+            .unavailable_reason
+            .map_or(Value::Null, |reason| Value::String(reason.to_string())),
+    );
+}
+
+fn pool_report_bundle(
+    report: &crate::eigen::k_process_pool::ProcessPoolReportV1,
+    interrupted: bool,
+    existing_artifacts: &[AuxiliaryArtifact],
+) -> Result<Vec<AuxiliaryArtifact>, RunError> {
+    let mut occupied_paths = existing_artifacts
+        .iter()
+        .map(|artifact| artifact.relative_path.clone())
+        .collect::<BTreeSet<_>>();
+    if !occupied_paths.insert(POOL_REPORT_ARTIFACT_PATH.to_string()) {
+        return Err(RunError {
+            message: format!(
+                "adaptive process-pool report artifact collides at {POOL_REPORT_ARTIFACT_PATH}"
+            ),
+        });
+    }
+
+    let mut sample_indices = BTreeSet::new();
+    let mut public_report = serde_json::to_value(report).map_err(|error| RunError {
+        message: format!("failed to project adaptive process-pool report: {error}"),
+    })?;
+    let Some(public_worker_logs) = public_report
+        .get_mut("worker_logs")
+        .and_then(Value::as_array_mut)
+    else {
+        return Err(RunError {
+            message: "adaptive process-pool report has no worker_logs array".into(),
+        });
+    };
+    if public_worker_logs.len() != report.worker_logs.len() {
+        return Err(RunError {
+            message: "adaptive process-pool report worker_logs projection changed length".into(),
+        });
+    }
+
+    let mut worker_log_artifacts = Vec::with_capacity(report.worker_logs.len() * 3);
+    for (worker, public_entry) in report.worker_logs.iter().zip(public_worker_logs) {
+        if !sample_indices.insert(worker.sample_index) {
+            return Err(RunError {
+                message: format!(
+                    "adaptive process-pool report contains duplicate worker-log sample_index {}",
+                    worker.sample_index
+                ),
+            });
+        }
+        let Some(public_entry) = public_entry.as_object_mut() else {
+            return Err(RunError {
+                message: "adaptive process-pool report worker-log entry is not an object".into(),
+            });
+        };
+
+        for (stream, filename, source_path) in [
+            ("stdout", "stdout.log", worker.stdout_path.as_path()),
+            ("stderr", "stderr.log", worker.stderr_path.as_path()),
+            (
+                "handshake",
+                "handshake.json",
+                worker.handshake_path.as_path(),
+            ),
+        ] {
+            let relative_path = format!(
+                "eigen/worker_logs/sample-{}/{}",
+                worker.sample_index, filename
+            );
+            if !occupied_paths.insert(relative_path.clone()) {
+                return Err(RunError {
+                    message: format!(
+                        "adaptive process-pool worker-log artifact path collision at {relative_path}"
+                    ),
+                });
+            }
+
+            let publication =
+                read_pool_worker_log(source_path, &relative_path, stream, interrupted)?;
+            set_pool_worker_log_publication(public_entry, stream, &publication);
+            if let Some(artifact) = publication.artifact {
+                worker_log_artifacts.push(artifact);
+            }
+        }
+    }
+
+    let report_bytes = serde_json::to_vec_pretty(&public_report).map_err(|error| RunError {
+        message: format!("failed to serialize adaptive process-pool report: {error}"),
+    })?;
+    let mut bundle = Vec::with_capacity(worker_log_artifacts.len() + 1);
+    bundle.push(AuxiliaryArtifact {
+        relative_path: POOL_REPORT_ARTIFACT_PATH.to_string(),
+        bytes: report_bytes,
+    });
+    bundle.extend(worker_log_artifacts);
+    Ok(bundle)
 }
 
 fn adaptive_pool_interruption_provenance(
@@ -3556,7 +3752,7 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
                             status: pool_interruption_status(action)?,
                             steps: Vec::new(),
                             provenance: adaptive_pool_interruption_provenance(execution),
-                            diagnostic_artifacts: vec![pool_report_artifact(&report)?],
+                            diagnostic_artifacts: pool_report_bundle(&report, true, &[])?,
                         };
                         let accepted_magnetization = source_relax_handoff
                             .map(|handoff| handoff.equilibrium_magnetization.clone())
@@ -4316,7 +4512,12 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
     });
     auxiliary_artifacts.extend(mode_artifacts);
     if let Some(report) = parallel_report {
-        auxiliary_artifacts.push(pool_report_artifact(&report)?);
+        let pool_artifacts = pool_report_bundle(
+            &report,
+            pool_interruption.is_some(),
+            &auxiliary_artifacts,
+        )?;
+        auxiliary_artifacts.extend(pool_artifacts);
     }
 
     let terminal_status = match pool_interruption {
@@ -4395,6 +4596,222 @@ mod checkpoint_admission_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn pool_worker_log_fixture(
+        sample_index: usize,
+        root: &Path,
+        suffix: &str,
+    ) -> crate::eigen::k_process_pool::ProcessPoolWorkerLogV1 {
+        crate::eigen::k_process_pool::ProcessPoolWorkerLogV1 {
+            sample_index,
+            stdout_path: root.join(format!("{suffix}-stdout.log")),
+            stderr_path: root.join(format!("{suffix}-stderr.log")),
+            handshake_path: root.join(format!("{suffix}-handshake.json")),
+            worker_executable_sha256: "sha256:worker-fixture".into(),
+            worker_build_identity: serde_json::json!({"fixture": true}),
+        }
+    }
+
+    fn pool_report_fixture(
+        worker_logs: Vec<crate::eigen::k_process_pool::ProcessPoolWorkerLogV1>,
+    ) -> crate::eigen::k_process_pool::ProcessPoolReportV1 {
+        crate::eigen::k_process_pool::ProcessPoolReportV1 {
+            protocol: crate::fem::eigen_k_worker::EIGEN_K_WORKER_PROTOCOL_V2.to_string(),
+            requested_mode: ParallelExecutionModeIR::Adaptive,
+            resolved_mode: "adaptive_processes".into(),
+            resolved_workers: worker_logs.len(),
+            policy: ParallelExecutionPolicyIR::default(),
+            inputs: Vec::new(),
+            thread_bindings: Vec::new(),
+            cpu_observations: Vec::new(),
+            worker_logs,
+            events: Vec::new(),
+            events_truncated: false,
+            telemetry_reason: None,
+        }
+    }
+
+    #[test]
+    fn parallel_pool_bundle_publishes_portable_self_contained_worker_logs() {
+        let source = TestDirectory::new();
+        let stdout_bytes = b"stdout\0bytes";
+        let stderr_bytes = b"stderr bytes";
+        let handshake_bytes = b"{\"handshake\":\"exact bytes\"}";
+        let worker = pool_worker_log_fixture(7, source.path(), "sample-7");
+        fs::write(&worker.stdout_path, stdout_bytes).expect("write stdout fixture");
+        fs::write(&worker.stderr_path, stderr_bytes).expect("write stderr fixture");
+        fs::write(&worker.handshake_path, handshake_bytes).expect("write handshake fixture");
+        let report = pool_report_fixture(vec![worker.clone()]);
+
+        let bundle = pool_report_bundle(&report, false, &[]).expect("publish worker log bundle");
+        let report_artifact = bundle
+            .iter()
+            .find(|artifact| artifact.relative_path == POOL_REPORT_ARTIFACT_PATH)
+            .expect("bundle contains public report");
+        let public_report: Value =
+            serde_json::from_slice(&report_artifact.bytes).expect("public report JSON");
+        let public_log = &public_report["worker_logs"][0];
+        let bundle_paths = bundle
+            .iter()
+            .map(|artifact| artifact.relative_path.as_str())
+            .collect::<BTreeSet<_>>();
+
+        for (stream, filename, bytes) in [
+            ("stdout", "stdout.log", stdout_bytes.as_slice()),
+            ("stderr", "stderr.log", stderr_bytes.as_slice()),
+            ("handshake", "handshake.json", handshake_bytes.as_slice()),
+        ] {
+            let expected_path = format!("eigen/worker_logs/sample-7/{filename}");
+            let path_key = format!("{stream}_path");
+            let hash_key = format!("{stream}_content_sha256");
+            let size_key = format!("{stream}_size_bytes");
+            let state_key = format!("{stream}_publication_state");
+            let member_key = format!("{stream}_artifact_member");
+            let published_path = public_log
+                .get(path_key.as_str())
+                .and_then(Value::as_str)
+                .expect("portable worker-log artifact reference");
+            assert_eq!(published_path, expected_path);
+            assert!(Path::new(published_path).is_relative());
+            assert!(bundle_paths.contains(published_path));
+            assert_eq!(
+                public_log.get(hash_key.as_str()),
+                Some(&Value::String(format!(
+                    "sha256:{:x}",
+                    Sha256::digest(bytes)
+                )))
+            );
+            assert_eq!(
+                public_log.get(size_key.as_str()),
+                Some(&Value::from(bytes.len() as u64))
+            );
+            assert_eq!(
+                public_log.get(state_key.as_str()),
+                Some(&Value::String("published".into()))
+            );
+            assert_eq!(
+                public_log.get(member_key.as_str()),
+                Some(&Value::Bool(true))
+            );
+            assert!(bundle.iter().any(|artifact| {
+                artifact.relative_path == expected_path && artifact.bytes.as_slice() == bytes
+            }));
+        }
+
+        let private_report = serde_json::to_value(&report).expect("private report stays intact");
+        assert_eq!(
+            private_report["worker_logs"][0]["stdout_path"].as_str(),
+            worker.stdout_path.to_str()
+        );
+        assert_eq!(
+            private_report["worker_logs"][0]["handshake_path"].as_str(),
+            worker.handshake_path.to_str()
+        );
+
+        let relocated = TestDirectory::new();
+        for artifact in &bundle {
+            let destination = relocated.path().join(&artifact.relative_path);
+            fs::create_dir_all(destination.parent().expect("artifact parent"))
+                .expect("create relocated bundle directory");
+            fs::write(destination, &artifact.bytes).expect("write relocated bundle artifact");
+        }
+        let relocated_report: Value = serde_json::from_slice(
+            &fs::read(relocated.path().join(POOL_REPORT_ARTIFACT_PATH))
+                .expect("read relocated public report"),
+        )
+        .expect("relocated public report JSON");
+        for stream in ["stdout", "stderr", "handshake"] {
+            let log = &relocated_report["worker_logs"][0];
+            let path_key = format!("{stream}_path");
+            let hash_key = format!("{stream}_content_sha256");
+            let relative_path = log
+                .get(path_key.as_str())
+                .and_then(Value::as_str)
+                .expect("relocated relative path");
+            let bytes = fs::read(relocated.path().join(relative_path))
+                .expect("relocated bundle resolves every published log");
+            assert_eq!(
+                log.get(hash_key.as_str()),
+                Some(&Value::String(format!(
+                    "sha256:{:x}",
+                    Sha256::digest(&bytes)
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_pool_bundle_marks_only_interrupted_missing_logs_unavailable() {
+        let source = TestDirectory::new();
+        let worker = pool_worker_log_fixture(8, source.path(), "sample-8");
+        fs::write(&worker.stderr_path, b"stderr").expect("write stderr fixture");
+        fs::write(&worker.handshake_path, b"handshake").expect("write handshake fixture");
+        let report = pool_report_fixture(vec![worker]);
+
+        let bundle =
+            pool_report_bundle(&report, true, &[]).expect("publish interrupted worker report");
+        let report_artifact = bundle
+            .iter()
+            .find(|artifact| artifact.relative_path == POOL_REPORT_ARTIFACT_PATH)
+            .expect("bundle contains public report");
+        let public_report: Value =
+            serde_json::from_slice(&report_artifact.bytes).expect("public report JSON");
+        let public_log = &public_report["worker_logs"][0];
+        assert!(public_log["stdout_path"].is_null());
+        assert!(public_log["stdout_content_sha256"].is_null());
+        assert!(public_log["stdout_size_bytes"].is_null());
+        assert_eq!(public_log["stdout_publication_state"], "unavailable");
+        assert_eq!(public_log["stdout_artifact_member"], false);
+        assert_eq!(
+            public_log["stdout_unavailable_reason"],
+            "missing_after_interruption"
+        );
+        assert!(!bundle.iter().any(|artifact| {
+            artifact.relative_path == "eigen/worker_logs/sample-8/stdout.log"
+        }));
+        assert!(pool_report_bundle(&report, false, &[]).is_err());
+    }
+
+    #[test]
+    fn parallel_pool_bundle_rejects_oversized_logs_duplicate_samples_and_collisions() {
+        let source = TestDirectory::new();
+        let worker = pool_worker_log_fixture(9, source.path(), "oversized");
+        fs::write(
+            &worker.stdout_path,
+            vec![0x5a; MAX_POOL_WORKER_LOG_ARTIFACT_BYTES as usize + 1],
+        )
+        .expect("write oversized worker log");
+        let report = pool_report_fixture(vec![worker.clone()]);
+        let oversized = pool_report_bundle(&report, false, &[])
+            .err()
+            .expect("oversized worker log must fail closed");
+        assert!(oversized.message.contains("exceeds"));
+
+        let small_worker = pool_worker_log_fixture(10, source.path(), "small");
+        fs::write(&small_worker.stdout_path, b"stdout").expect("write small worker stdout");
+        fs::write(&small_worker.stderr_path, b"stderr").expect("write small worker stderr");
+        fs::write(&small_worker.handshake_path, b"handshake")
+            .expect("write small worker handshake");
+
+        let duplicate_report = pool_report_fixture(vec![
+            small_worker.clone(),
+            pool_worker_log_fixture(10, source.path(), "duplicate"),
+        ]);
+        let duplicate = pool_report_bundle(&duplicate_report, true, &[])
+            .err()
+            .expect("duplicate sample id must fail");
+        assert!(duplicate.message.contains("duplicate worker-log sample_index"));
+
+        let collision = AuxiliaryArtifact {
+            relative_path: "eigen/worker_logs/sample-10/stdout.log".into(),
+            bytes: Vec::new(),
+        };
+        let collision_report = pool_report_fixture(vec![small_worker]);
+        let collided = pool_report_bundle(&collision_report, true, &[collision])
+            .err()
+            .expect("relative path collision must fail");
+        assert!(collided.message.contains("path collision"));
     }
 
     fn three_sample_plan() -> FemEigenPlanIR {

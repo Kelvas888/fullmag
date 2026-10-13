@@ -168,6 +168,7 @@ jobs:
           cargo test -p fullmag-runner completed_single_k_status_admits_and_publishes_every_path_sample --lib
           cargo test -p fullmag-runner interrupted_status_keeps_available_raw_diagnostics_with_or_without_checkpoint_root --lib
           cargo test -p fullmag-runner interrupted_checkpoint_write_failure_is_not_returned_as_cancelled --lib
+          cargo test -p fullmag-runner fem::eigen_path::checkpoint_admission_tests::parallel_pool_bundle_ --lib
       - name: Run adaptive eigen process pool contracts
         run: |
           cargo test -p fullmag-runner k_process_pool --no-fail-fast
@@ -802,6 +803,12 @@ jobs:
         run: python -B scripts/test_local_runner_container_client.py -v
       - name: Run execution and runtime retention regressions
         run: python -B -m unittest discover -s scripts -p 'test_local_runner_retention*.py' -v
+      - name: Setup Node for retention console contracts
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.18.0
+      - name: Run bounded retention console and packaged source contracts
+        run: node apps/runner-console/test.mjs
       - name: Run retention HTTP routing and coordinator binding regressions
         run: |
           python -B -m unittest discover -s scripts/tests/local_runner -p test_container_api.py -v
