@@ -364,9 +364,10 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
     (!geometryDraftChanged || geometryPatch.error === null) &&
     (!inspectorDirty || transformPatch.error === null)
   );
-  const inspectorApplyBlockReason = revisionConflictPhase !== null
-    ? "Resolve the scene revision conflict before applying this draft."
-    : undefined;
+  const inspectorApplyBlockReason =
+    revisionConflictPhase !== null && revisionConflictPhase !== "rebased"
+      ? "Resolve the scene revision conflict before applying this draft."
+      : undefined;
 
   async function applyRegisteredDraft(): Promise<boolean> {
     if (draft.mode === "draft-new") return applyCreateDraft();
@@ -536,6 +537,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
       const requestOptions = historyContext.sessionScopeKey
         ? { sessionScopeKey: historyContext.sessionScopeKey }
         : undefined;
+      let historyDegraded = false;
       const response = await runAuthoringMutationWithHistory(
         historyContext,
         "Edit geometry and placement " + draft.name,
@@ -544,6 +546,12 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
           geometry: geometryPayload,
           transform: transform.transform as JsonObject,
         }, requestOptions),
+        undefined,
+        {
+          onHistoryDegraded: () => {
+            historyDegraded = true;
+          },
+        },
       );
       if (historyContext.isCurrentSessionScope() === false) {
         objectEditSession.reject(operation);
@@ -578,7 +586,13 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
       );
       if (!currentEpoch) return false;
       preConflictBaselineRef.current = null;
-      setFeedback({ kind: "success", message: "Geometry and placement committed." });
+      setRevisionConflictPhase(null);
+      setFeedback({
+        kind: historyDegraded ? "warning" : "success",
+        message: historyDegraded
+          ? "Geometry and placement committed, but undo history was not recorded."
+          : "Geometry and placement committed.",
+      });
       return true;
     } catch (error) {
       const operationIsCurrent = objectEditSession.reject(operation);
@@ -599,6 +613,8 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
 
   function revertDraft(): void {
     if (editIdentity) objectEditSession.reset(editIdentity, baseDraft);
+    setRevisionConflictPhase(null);
+    preConflictBaselineRef.current = null;
     setFeedback(null);
   }
 

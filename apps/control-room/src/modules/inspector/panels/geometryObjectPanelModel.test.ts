@@ -87,6 +87,51 @@ describe("resolveGeometryObjectPanelModel", () => {
       translation: ["5e-8", "0", "0"],
     });
   });
+
+  it("performs per-axis 3-way rebase merging independent local and remote axis modifications", () => {
+    const baseline = resolveGeometryObjectDraft(
+      { ...baseSelection, kind: "builder.primitive", nodeId: "geometry:draft:box", objectId: null, ref: null },
+      { objects: [], revision: 12 },
+    );
+    // Local user modified only X axis to 120 nm, translation X to 1e-8
+    const dirty = {
+      ...baseline,
+      size: ["1.2e-7", baseline.size[1], baseline.size[2]] as [string, string, string],
+      translation: ["1e-8", baseline.translation[1], baseline.translation[2]] as [string, string, string],
+    };
+    // Remote concurrent change modified only Y axis to 60 nm, translation Y to 2e-8
+    const target = {
+      ...baseline,
+      baseRevision: 13,
+      size: [baseline.size[0], "6e-8", baseline.size[2]] as [string, string, string],
+      translation: [baseline.translation[0], "2e-8", baseline.translation[2]] as [string, string, string],
+    };
+
+    const rebased = rebaseGeometryObjectDraft(dirty, target, baseline);
+    expect(rebased).toEqual({
+      ...baseline,
+      baseRevision: 13,
+      // X from local, Y from remote, Z from baseline
+      size: ["1.2e-7", "6e-8", baseline.size[2]],
+      translation: ["1e-8", "2e-8", baseline.translation[2]],
+    });
+  });
+
+  it("rejects empty strings as required instead of converting to 0", () => {
+    const draft = resolveGeometryObjectDraft(
+      { ...baseSelection, kind: "builder.primitive", nodeId: "geometry:draft:box", objectId: null, ref: null },
+      { objects: [], revision: 12 },
+    );
+    const parsed = resolvePrimitiveDraft({
+      ...draft,
+      translation: ["", "  ", "1e-9"],
+      size: ["1e-7", "", "1e-8"],
+    });
+    expect(parsed.errors["translation.0"]).toBe("Translation X is required.");
+    expect(parsed.errors["translation.1"]).toBe("Translation Y is required.");
+    expect(parsed.errors["size.1"]).toBe("Box size Y is required.");
+  });
+
   it("reads committed object data from SceneDocument", () => {
     const model = resolveGeometryObjectPanelModel(baseSelection, {
       objects: [

@@ -8,7 +8,8 @@ export type ArtifactAssessmentState =
   | "incompatible"
   | "inconsistent"
   | "unknown"
-  | "loading";
+  | "loading"
+  | "failed";
 
 export interface ArtifactAssessmentInput {
   activeBuild?: Record<string, unknown> | null;
@@ -73,7 +74,50 @@ export function resolveArtifactAssessment(
   const activeStatus = status(input.activeBuild);
   const isBuilding = ACTIVE_STATUSES.has(activeStatus);
 
-  // 1. Legal not-built presence check
+  // 1. Loading state (prioritize over not-built while build is active or resources are loading)
+  if (isBuilding || input.resourceLoadState === "loading") {
+    return {
+      evidence: "legacy-revision",
+      presence: input.manifest ? "present" : "not-built",
+      reason: isBuilding
+        ? `active build status is ${activeStatus}`
+        : "loading required mesh resources",
+      runAllowed: false,
+      state: "loading",
+    };
+  }
+
+  // 2. Resource load error: network failure or server error is not a legal not-built artifact
+  if (input.resourceLoadState === "error") {
+    return {
+      evidence: "legacy-revision",
+      presence: input.manifest ? "present" : "not-built",
+      reason: "failed to load required mesh resources",
+      runAllowed: false,
+      state: "unknown",
+    };
+  }
+
+  // 3. Failed build check: latest build failed for current scene revision
+  const latestStatus = status(input.latestBuild);
+  const latestSourceRev = sourceSceneRevision(input.latestBuild);
+  if (
+    latestStatus.includes("fail") &&
+    latestSourceRev !== null &&
+    sceneRev !== null &&
+    latestSourceRev === sceneRev &&
+    manifestSourceRev !== sceneRev
+  ) {
+    return {
+      evidence: "legacy-revision",
+      presence: input.manifest ? "present" : "not-built",
+      reason: "latest build failed for the current scene revision",
+      runAllowed: false,
+      state: "failed",
+    };
+  }
+
+  // 4. Legal not-built presence check (quiescent state without mesh revision or manifest)
   if ((meshRevisionIsMissing(meshRevision) && manifestSourceRev === null) || !input.manifest) {
     return {
       evidence: "legacy-revision",
@@ -84,18 +128,7 @@ export function resolveArtifactAssessment(
     };
   }
 
-  // 2. Active building state
-  if (isBuilding) {
-    return {
-      evidence: "legacy-revision",
-      presence: "present",
-      reason: `active build status is ${activeStatus}`,
-      runAllowed: false,
-      state: "loading",
-    };
-  }
-
-  // 3. Inconsistent: source revision is ahead of known scene revision (F19)
+  // 5. Inconsistent: source revision is ahead of known scene revision (F19)
   if (
     manifestSourceRev !== null &&
     sceneRev !== null &&
@@ -110,23 +143,8 @@ export function resolveArtifactAssessment(
     };
   }
 
-  // 4. Loading state
-  if (input.resourceLoadState === "loading") {
-    return {
-      evidence: "legacy-revision",
-      presence: "present",
-      reason: "loading required mesh resources",
-      runAllowed: false,
-      state: "loading",
-    };
-  }
-
-  // 5. Unknown provenance / transport error
-  if (
-    input.resourceLoadState === "error" ||
-    manifestSourceRev === null ||
-    sceneRev === null
-  ) {
+  // 6. Unknown provenance / scene revision is incomplete
+  if (manifestSourceRev === null || sceneRev === null) {
     return {
       evidence: "legacy-revision",
       presence: "present",
@@ -136,7 +154,7 @@ export function resolveArtifactAssessment(
     };
   }
 
-  // 6. Current: exact revision match
+  // 7. Current: exact revision match
   if (manifestSourceRev === sceneRev) {
     return {
       evidence: "legacy-revision",
@@ -147,7 +165,7 @@ export function resolveArtifactAssessment(
     };
   }
 
-  // 7. Stale: manifest source revision is older than current scene
+  // 8. Stale: manifest source revision is older than current scene
   if (manifestSourceRev < sceneRev) {
     return {
       evidence: "legacy-revision",

@@ -2,7 +2,7 @@
 
 import { restoreMeshHistoryToDraft } from "@/kernel/authoring/meshBuildHistoryRestore";
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 
 import type { JsonObject, LiveStatusResource, MeshSharedDomainManifestResource } from "@/kernel/api/apiTypes";
 import { createCommandContext } from "@/kernel/commands/commandContext";
@@ -494,7 +494,7 @@ export function useMeshDetailsModel(
     statusMeshRevision: summary.data?.revision,
   });
   const meshFreshness = freshnessResult.state;
-  const meshIsStale = meshFreshness === "stale" || meshFreshness === "inconsistent";
+  const meshIsStale = meshFreshness === "stale";
   const targetCount = Object.keys(
     asRecord(activeBuild.data?.effective_per_object_targets) ?? {},
   ).length;
@@ -607,6 +607,19 @@ export function useMeshDetailsModel(
     },
     [kernel],
   );
+
+  useEffect(() => {
+    const currentGenerationId = manifest.data?.generation_id;
+    const currentSelection = kernel.selection.get();
+    if (
+      currentSelection.ref?.type === "mesh-quality-element" &&
+      currentSelection.ref.generationId &&
+      currentGenerationId &&
+      currentSelection.ref.generationId !== currentGenerationId
+    ) {
+      kernel.selection.clear("mesh");
+    }
+  }, [kernel.selection, manifest.data?.generation_id]);
 
   return {
     activeBuildRevision: activeBuild.data?.revision,

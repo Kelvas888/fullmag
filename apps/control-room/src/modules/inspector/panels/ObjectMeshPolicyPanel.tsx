@@ -1016,7 +1016,12 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
     if (!objectId) return all;
     return all.filter((entry) => {
       if (!entry.meshTarget || entry.meshTarget === "all") return true;
-      if (entry.meshTarget === `object:${objectId}`) return true;
+      if (
+        entry.meshTarget === `object:${objectId}` ||
+        entry.meshTarget === `object_mesh:${objectId}`
+      ) {
+        return true;
+      }
       const objectSnapshots = asRecord(entry.canonicalPolicySnapshot?.objects);
       return objectSnapshots ? Object.hasOwn(objectSnapshots, objectId) : false;
     });

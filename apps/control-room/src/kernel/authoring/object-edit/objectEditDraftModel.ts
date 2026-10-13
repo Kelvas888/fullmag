@@ -166,6 +166,9 @@ export function geometryDraftGeometryEquals(
 ): boolean {
   const leftKind = normalizedDraftGeometryKind(left.geometryKind);
   const rightKind = normalizedDraftGeometryKind(right.geometryKind);
+  if (leftKind === null && rightKind === null) {
+    return left.geometryKind.trim().toLowerCase() === right.geometryKind.trim().toLowerCase();
+  }
   if (leftKind === null || leftKind !== rightKind) return false;
   const characteristicLength = Math.max(
     geometryCharacteristicLength(left),
