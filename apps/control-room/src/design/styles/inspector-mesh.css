@@ -566,3 +566,322 @@ button.fm-mesh-detail-list__item:focus-visible {
   display: grid;
   gap: var(--fm-space-2);
 }
+
+/* ── FEM Mesh Readiness Guide (Quest Assistant) ── */
+.fm-mesh-guide {
+  display: grid;
+  gap: var(--fm-space-2);
+  min-width: 0;
+}
+
+.fm-mesh-guide__hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--fm-space-2);
+  padding: var(--fm-space-2);
+  border: 1px solid var(--fm-border-subtle);
+  border-radius: var(--fm-radius-md);
+  background: color-mix(in srgb, var(--fm-bg-panel-raised) 76%, transparent);
+}
+
+.fm-mesh-guide__hero-copy {
+  display: grid;
+  gap: var(--fm-space-1);
+  min-width: 0;
+}
+
+.fm-mesh-guide__hero-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--fm-space-2);
+}
+
+.fm-mesh-guide__status-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px var(--fm-space-2);
+  border-radius: var(--fm-radius-pill);
+  border: 1px solid var(--fm-border-default);
+  background: var(--fm-bg-elevated);
+  color: var(--fm-text-secondary);
+  font-family: var(--fm-font-mono);
+  font-size: var(--fm-font-size-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.fm-mesh-guide__status-pill[data-status="ready"] {
+  border-color: color-mix(in srgb, var(--fm-success) 55%, var(--fm-border-default));
+  color: var(--fm-success);
+}
+
+.fm-mesh-guide__status-pill[data-status="needs-build"],
+.fm-mesh-guide__status-pill[data-status="building"] {
+  border-color: color-mix(in srgb, var(--fm-accent) 55%, var(--fm-border-default));
+  color: var(--fm-accent);
+}
+
+.fm-mesh-guide__status-pill[data-status="stale"],
+.fm-mesh-guide__status-pill[data-status="quality-warning"] {
+  border-color: color-mix(in srgb, var(--fm-warning) 55%, var(--fm-border-default));
+  color: var(--fm-warning);
+}
+
+.fm-mesh-guide__status-pill[data-status="blocked"],
+.fm-mesh-guide__status-pill[data-status="failed"] {
+  border-color: color-mix(in srgb, var(--fm-danger) 55%, var(--fm-border-default));
+  color: var(--fm-danger);
+}
+
+.fm-mesh-guide__headline {
+  margin: 0;
+  color: var(--fm-text-primary);
+  font-size: var(--fm-font-size-xs);
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.fm-mesh-guide__subheadline {
+  margin: 0;
+  color: var(--fm-text-muted);
+  font-size: var(--fm-font-size-xs);
+  line-height: 1.4;
+}
+
+.fm-mesh-guide__hero-cta {
+  display: flex;
+  align-items: center;
+}
+
+.fm-mesh-guide__progress-track {
+  height: 6px;
+  overflow: hidden;
+  border-radius: var(--fm-radius-pill);
+  border: 1px solid var(--fm-border-subtle);
+  background: var(--fm-bg-canvas);
+}
+
+.fm-mesh-guide__progress-fill {
+  height: 100%;
+  border-radius: var(--fm-radius-pill);
+  background: var(--fm-accent);
+  transition: width var(--fm-transition-fast);
+}
+
+.fm-mesh-guide__progress-fill[data-status="ready"] {
+  background: var(--fm-success);
+}
+
+.fm-mesh-guide__progress-fill[data-status="stale"],
+.fm-mesh-guide__progress-fill[data-status="quality-warning"] {
+  background: var(--fm-warning);
+}
+
+.fm-mesh-guide__progress-fill[data-status="blocked"],
+.fm-mesh-guide__progress-fill[data-status="failed"] {
+  background: var(--fm-danger);
+}
+
+.fm-mesh-guide__feedback {
+  margin: 0;
+  padding: var(--fm-space-1) var(--fm-space-2);
+  border-radius: var(--fm-radius-md);
+  border: 1px solid var(--fm-border-subtle);
+  background: color-mix(in srgb, var(--fm-bg-panel-raised) 68%, transparent);
+  color: var(--fm-text-secondary);
+  font-size: var(--fm-font-size-xs);
+}
+
+.fm-mesh-guide__feedback[data-kind="error"] {
+  border-color: var(--fm-danger);
+  color: var(--fm-danger);
+}
+
+.fm-mesh-guide__feedback[data-kind="warning"] {
+  border-color: var(--fm-warning);
+  color: var(--fm-warning);
+}
+
+.fm-mesh-guide__feedback[data-kind="success"] {
+  border-color: var(--fm-success);
+  color: var(--fm-success);
+}
+
+.fm-mesh-guide__compact-toggle {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.fm-mesh-guide__steps {
+  display: grid;
+  gap: var(--fm-space-1);
+}
+
+.fm-mesh-guide__step {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--fm-space-2);
+  padding: var(--fm-space-2);
+  border: 1px solid var(--fm-border-subtle);
+  border-left: 2px solid var(--fm-border-default);
+  border-radius: var(--fm-radius-md);
+  background: color-mix(in srgb, var(--fm-bg-panel-raised) 64%, transparent);
+}
+
+.fm-mesh-guide__step[data-active-quest="true"] {
+  border-color: var(--fm-border-strong);
+  background: color-mix(in srgb, var(--fm-bg-panel-raised) 92%, transparent);
+}
+
+.fm-mesh-guide__step[data-status="ready"] {
+  border-left-color: var(--fm-success);
+}
+
+.fm-mesh-guide__step[data-status="recommended"],
+.fm-mesh-guide__step[data-status="in-progress"] {
+  border-left-color: var(--fm-accent);
+}
+
+.fm-mesh-guide__step[data-status="stale"],
+.fm-mesh-guide__step[data-status="warning"],
+.fm-mesh-guide__step[data-status="missing"] {
+  border-left-color: var(--fm-warning);
+}
+
+.fm-mesh-guide__step[data-status="failed"],
+.fm-mesh-guide__step[data-status="blocked"] {
+  border-left-color: var(--fm-danger);
+}
+
+.fm-mesh-guide__step-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--fm-radius-pill);
+  border: 1px solid var(--fm-border-subtle);
+  background: var(--fm-bg-canvas);
+  color: var(--fm-text-secondary);
+  font-family: var(--fm-font-mono);
+  font-size: var(--fm-font-size-2xs);
+  font-weight: 700;
+}
+
+.fm-mesh-guide__step[data-status="ready"] .fm-mesh-guide__step-indicator {
+  color: var(--fm-success);
+}
+
+.fm-mesh-guide__step[data-status="stale"] .fm-mesh-guide__step-indicator,
+.fm-mesh-guide__step[data-status="warning"] .fm-mesh-guide__step-indicator,
+.fm-mesh-guide__step[data-status="missing"] .fm-mesh-guide__step-indicator {
+  color: var(--fm-warning);
+}
+
+.fm-mesh-guide__step[data-status="failed"] .fm-mesh-guide__step-indicator,
+.fm-mesh-guide__step[data-status="blocked"] .fm-mesh-guide__step-indicator {
+  color: var(--fm-danger);
+}
+
+.fm-mesh-guide__step-body {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.fm-mesh-guide__step-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--fm-space-1);
+}
+
+.fm-mesh-guide__step-title {
+  color: var(--fm-text-primary);
+  font-size: var(--fm-font-size-xs);
+  font-weight: 600;
+}
+
+.fm-mesh-guide__step-badge {
+  color: var(--fm-text-muted);
+  font-family: var(--fm-font-mono);
+  font-size: var(--fm-font-size-2xs);
+}
+
+.fm-mesh-guide__step-badge[data-status="ready"] {
+  color: var(--fm-success);
+}
+
+.fm-mesh-guide__step-badge[data-status="stale"],
+.fm-mesh-guide__step-badge[data-status="warning"],
+.fm-mesh-guide__step-badge[data-status="missing"] {
+  color: var(--fm-warning);
+}
+
+.fm-mesh-guide__step-badge[data-status="failed"],
+.fm-mesh-guide__step-badge[data-status="blocked"] {
+  color: var(--fm-danger);
+}
+
+.fm-mesh-guide__step-summary {
+  margin: 0;
+  color: var(--fm-text-secondary);
+  font-size: var(--fm-font-size-xs);
+  font-weight: 550;
+}
+
+.fm-mesh-guide__step-detail {
+  margin: 0;
+  color: var(--fm-text-muted);
+  font-size: var(--fm-font-size-2xs);
+  line-height: 1.35;
+}
+
+.fm-mesh-guide__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--fm-space-1);
+  margin-top: var(--fm-space-1);
+}
+
+.fm-mesh-guide__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px var(--fm-space-1);
+  border-radius: var(--fm-radius-sm);
+  border: 1px solid var(--fm-border-subtle);
+  background: var(--fm-bg-canvas);
+  font-family: var(--fm-font-mono);
+  font-size: var(--fm-font-size-2xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.fm-mesh-guide__chip[data-source="authored"] {
+  border-color: color-mix(in srgb, var(--fm-accent) 45%, var(--fm-border-subtle));
+  color: var(--fm-text-primary);
+}
+
+.fm-mesh-guide__chip[data-source="effective"] {
+  color: var(--fm-text-secondary);
+}
+
+.fm-mesh-guide__chip[data-source="missing"] {
+  border-color: color-mix(in srgb, var(--fm-warning) 50%, var(--fm-border-subtle));
+  color: var(--fm-warning);
+}
+
+.fm-mesh-guide__chip-key {
+  color: var(--fm-text-muted);
+}
+
+.fm-mesh-guide__step-action {
+  display: flex;
+  align-items: center;
+}
+
