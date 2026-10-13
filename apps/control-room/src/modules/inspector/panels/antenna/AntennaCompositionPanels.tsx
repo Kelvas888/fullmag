@@ -90,7 +90,7 @@ function selectedResourceKind(
   selection: InspectorPanelProps["selection"],
 ): AntennaCompositionKind | null {
   return selection.ref?.type === "scene-object"
-    ? selection.ref.antennaResourceKind ?? null
+    ? selection.ref.antennaResourceKind === "terminals" ? null : selection.ref.antennaResourceKind ?? null
     : null;
 }
 
