@@ -11,7 +11,7 @@ import {
   recordAuthoringMutationHistory,
   runAuthoringMutationWithHistory,
 } from "@/kernel/authoring/authoringHistoryMutation";
-import type { SceneResource } from "@/kernel/api/apiTypes";
+import type { MaterialResource, SceneResource } from "@/kernel/api/apiTypes";
 import { useKernel } from "@/kernel/KernelContext";
 import {
   publishCommittedSceneResource,
@@ -36,7 +36,7 @@ import { ObjectAbsorbingBoundaryPanel } from "./ObjectAbsorbingBoundaryPanel";
 import {
   initialInspectorDraftState,
   resolveInspectorDraftState,
-  updateInspectorDraftState,
+  updateResolvedInspectorDraftState,
   type InspectorDraftState,
 } from "./inspectorDraftState";
 import { resolveGeometryObjectDraft } from "./geometryObjectPanelModel";
@@ -379,16 +379,18 @@ function useObjectMaterialPanelState(selection: InspectorPanelProps["selection"]
   const draftFieldRevisionsRef = useRef<Map<MagneticDraftField, number>>(new Map());
   const anisotropyFieldRevisionsRef = useRef<Map<AnisotropyField, number>>(new Map());
   const draftTransactionRevisionRef = useRef(0);
-  const draftStateForResolution = useMemo(() => {
+  function draftStateForResolution(
+    state: InspectorDraftState<MagneticParametersDraft>,
+  ): InspectorDraftState<MagneticParametersDraft> {
     if (assignmentBaseDecision !== "rebase" || !assignmentBaseOverrideState ||
-      draftState.identityKey !== assignmentBaseOverrideState.identityKey) {
-      return draftState;
+      state.identityKey !== assignmentBaseOverrideState.identityKey) {
+      return state;
     }
     const revisions = new Map(draftFieldRevisionsRef.current);
     const rebasedDraft = rebaseMagneticParametersDraftAfterAssignment({
       previousBaseDraft: assignmentBaseOverrideState.baseDraft,
-      draftAtStart: draftState.draft,
-      currentDraft: draftState.draft,
+      draftAtStart: state.draft,
+      currentDraft: state.draft,
       committedBaseDraft: resourceBaseDraft,
       startingRevisions: revisions,
       currentRevisions: revisions,
@@ -399,20 +401,15 @@ function useObjectMaterialPanelState(selection: InspectorPanelProps["selection"]
       draft: rebasedDraft,
       identityKey: assignmentBaseOverrideState.identityKey,
     };
-  }, [
-    assignmentBaseDecision,
-    assignmentBaseOverrideState,
-    draftState,
-    resourceBaseDraft,
-    resourceDraftKey,
-  ]);
+  }
+  const resolvedDraftState = draftStateForResolution(draftState);
 
   const { draft } = resolveInspectorDraftState({
     baseDraft,
     baseKey: draftKey,
     identityKey: draftIdentityKey,
     isDirty: magneticParametersDraftDirty,
-    state: draftStateForResolution,
+    state: resolvedDraftState,
   });
   const draftMaterialId = normalizeMaterialRef(draft.materialRef);
   const parametersTargetChanged = draftMaterialId !== materialId;
@@ -543,11 +540,10 @@ function useObjectMaterialPanelState(selection: InspectorPanelProps["selection"]
       );
     }
     setDraftState((current) =>
-      updateInspectorDraftState({
+      updateResolvedInspectorDraftState({
         baseDraft,
         baseKey: draftKey,
-        currentDraft:
-          current.identityKey === draftIdentityKey ? draftStateForResolution.draft : baseDraft,
+        currentState: draftStateForResolution(current),
         identityKey: draftIdentityKey,
         isDirty: magneticParametersDraftDirty,
         patch,
@@ -565,29 +561,30 @@ function useObjectMaterialPanelState(selection: InspectorPanelProps["selection"]
     pendingScope: PanelScope,
   ): boolean {
     if (!isCurrentScope() || pendingScope.token !== scope.token) return false;
-    const committedSnapshot = acknowledgedScenes
-      .map((acknowledgedScene) => {
-        const material = magneticParameterMaterialResourceFromSceneResource(materialId, acknowledgedScene);
-        return {
-          object: resolveGeometryObjectDraft(selection, acknowledgedScene),
-          material,
-          draft: material ? magneticParametersDraftFromResource(materialId, material) : null,
-          sceneRevision: sceneResourceRevision(acknowledgedScene),
-        };
-      })
-      .find(({ object: acknowledgedObject, draft }) =>
-        draft !== null &&
+    let acknowledgedMaterial: MaterialResource | null = null;
+    for (const acknowledgedScene of acknowledgedScenes) {
+      const candidate = magneticParameterMaterialResourceFromSceneResource(materialId, acknowledgedScene);
+      if (candidate) {
+        acknowledgedMaterial = candidate;
+        break;
+      }
+    }
+    if (!acknowledgedMaterial) return false;
+
+    const assignedObjectSnapshot = acknowledgedScenes
+      .map((acknowledgedScene) => ({
+        object: resolveGeometryObjectDraft(selection, acknowledgedScene),
+        sceneRevision: sceneResourceRevision(acknowledgedScene),
+      }))
+      .find(({ object: acknowledgedObject }) =>
         acknowledgedObject.mode === "committed" &&
         acknowledgedObject.objectId === object.objectId &&
         normalizeMaterialRef(acknowledgedObject.material) === materialId,
       );
-    if (!committedSnapshot?.draft || !committedSnapshot.material) return false;
-    const {
-      draft: committedBaseDraft,
-      object: acknowledgedObject,
-      material: acknowledgedMaterial,
-      sceneRevision: acknowledgedSceneRevision,
-    } = committedSnapshot;
+    if (!assignedObjectSnapshot) return false;
+
+    const committedBaseDraft = magneticParametersDraftFromResource(materialId, acknowledgedMaterial);
+    const { object: acknowledgedObject, sceneRevision: acknowledgedSceneRevision } = assignedObjectSnapshot;
     const committedBaseKey = `${[
       acknowledgedObject.mode,
       acknowledgedObject.objectId,

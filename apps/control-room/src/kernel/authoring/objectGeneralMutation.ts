@@ -3,13 +3,18 @@ import {
   deleteObjectTransaction,
   patchObjectTransaction,
 } from "./geometryLifecycleCommands";
-import { runAuthoringMutationWithHistory } from "./authoringHistoryMutation";
+import {
+  runAuthoringMutationWithHistory,
+  type RunAuthoringMutationWithHistoryOptions,
+} from "./authoringHistoryMutation";
 
 export interface ObjectIdentityMutation {
   baseRevision: number | null;
+  materialRef?: string | null;
   name: string;
   notes: string;
   objectId: string;
+  regionName?: string | null;
 }
 
 export interface ObjectDeleteMutation {
@@ -27,9 +32,10 @@ function requestOptions(context: CommandContext) {
 export async function patchObjectIdentityWithHistory(
   context: CommandContext,
   mutation: ObjectIdentityMutation,
+  options?: RunAuthoringMutationWithHistoryOptions,
 ) {
   if (!context.api) throw new Error("Control-room API is unavailable.");
-  const options = requestOptions(context);
+  const reqOptions = requestOptions(context);
   return runAuthoringMutationWithHistory(
     context,
     `Edit identity ${mutation.name}`,
@@ -37,21 +43,30 @@ export async function patchObjectIdentityWithHistory(
       context.api!,
       mutation.objectId,
       {
-        base_revision: preparation.baseRevision ?? mutation.baseRevision,
+        base_revision: mutation.baseRevision ?? preparation.baseRevision,
         name: mutation.name,
         notes: mutation.notes,
+        ...(mutation.materialRef === undefined
+          ? {}
+          : { material_ref: mutation.materialRef }),
+        ...(mutation.regionName === undefined
+          ? {}
+          : { region_name: mutation.regionName }),
       },
-      options,
+      reqOptions,
     ),
+    undefined,
+    options,
   );
 }
 
 export async function deleteObjectWithHistory(
   context: CommandContext,
   mutation: ObjectDeleteMutation,
+  options?: RunAuthoringMutationWithHistoryOptions,
 ) {
   if (!context.api) throw new Error("Control-room API is unavailable.");
-  const options = requestOptions(context);
+  const reqOptions = requestOptions(context);
   let selectionClearedByMutation = false;
   return runAuthoringMutationWithHistory(
     context,
@@ -61,7 +76,7 @@ export async function deleteObjectWithHistory(
         context.api!,
         mutation.objectId,
         { base_revision: preparation.baseRevision ?? mutation.baseRevision },
-        options,
+        reqOptions,
       );
       if (
         context.isCurrentSessionScope?.() !== false &&
@@ -73,6 +88,6 @@ export async function deleteObjectWithHistory(
       return response;
     },
     undefined,
-    { captureWorkspaceStateAfter: () => selectionClearedByMutation },
+    { captureWorkspaceStateAfter: () => selectionClearedByMutation, ...options },
   );
 }

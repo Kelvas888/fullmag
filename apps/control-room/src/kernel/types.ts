@@ -17,6 +17,8 @@ import type { SelectionController } from "./selection/SelectionController";
 import type { DiagnosticRecorderController } from "./performance/diagnostic-recorder/DiagnosticRecorderController";
 import type { ObjectMoveToolController } from "./authoring/ObjectMoveToolController";
 import type { AuthoringHistoryController } from "./authoring/AuthoringHistoryController";
+import type { ObjectEditSessionController } from "./authoring/object-edit/ObjectEditSessionController";
+import type { GeometryObjectDraft } from "./authoring/object-edit/objectEditTypes";
 import type { PendingFormRegistry } from "./authoring/PendingFormRegistry";
 import type { AnalysisFieldOverlayController } from "./visualization/AnalysisFieldOverlayController";
 import type { ChartViewportHandoffController } from "./visualization/ChartViewportHandoffController";
@@ -74,6 +76,7 @@ export interface KernelApi {
   readonly api: ControlRoomApi;
   readonly analysisFieldOverlay: AnalysisFieldOverlayController;
   readonly authoringHistory?: AuthoringHistoryController;
+  readonly objectEditSession: ObjectEditSessionController<GeometryObjectDraft>;
   readonly pendingForms?: PendingFormRegistry;
   readonly bus: EventBus<KernelEventMap>;
   readonly chartViewportHandoff: ChartViewportHandoffController;

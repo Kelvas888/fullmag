@@ -6,3 +6,6 @@ justfile text eol=lf
 scripts/local_runner/worker_entrypoint.py text eol=lf
 agent/skills/**/scripts/* text eol=lf
 .agents/skills/**/scripts/* text eol=lf
+
+# Preserve exact bytes validated by this audit package manifest.
+/docs/plans/active/frontned_10_2026/fullmag_frontend_audit_v2_2026-10-12/** -text

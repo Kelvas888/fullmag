@@ -1,9 +1,9 @@
 "use client";
 
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 
-import type { ProjectRunListResource, ProjectRunResource } from "../api/apiTypes";
-import { assertSolutionSetRunId } from "../api/ControlRoomApi";
+import type { ProjectRunListResource, ProjectRunResource, ProjectRunTaskCancellationRequest } from "../api/apiTypes";
+import { assertSolutionSetRunId, ControlRoomApiError } from "../api/ControlRoomApi";
 import { useKernel } from "../KernelContext";
 import { useResource } from "./useResource";
 
@@ -96,16 +96,46 @@ export function useCancelProjectRunTask(
   cursor: string | null,
 ) {
   const { api, resources } = useKernel();
+  const requests = useRef(new Map<string, {
+    cancellation_id: string;
+    expected_catalog_revision: number;
+    reason: string;
+  }>());
 
   return useCallback(
-    async (taskId: string, reason: string) => {
+    async (taskId: string, reason: string, expectedCatalogRevision?: number) => {
       if (!runId) throw new Error("A run must be selected.");
-      const cancellation = await api.persistence.projects.cancelRunTask(
-        projectId,
-        runId,
-        taskId,
-        { reason },
-      );
+      let request: ProjectRunTaskCancellationRequest = { reason };
+      if (expectedCatalogRevision !== undefined) {
+        if (!Number.isSafeInteger(expectedCatalogRevision) || expectedCatalogRevision < 1) {
+          throw new Error("A current task catalog revision is required.");
+        }
+        const key = `${projectId}:${runId}:${taskId}`;
+        const previous = requests.current.get(key);
+        if (previous && previous.reason !== reason) {
+          throw new Error("Retry the original cancellation request before changing its reason.");
+        }
+        const intent = previous ?? {
+          cancellation_id: crypto.randomUUID(),
+          expected_catalog_revision: expectedCatalogRevision,
+          reason,
+        };
+        requests.current.set(key, intent);
+        request = intent;
+      }
+      let cancellation;
+      try {
+        cancellation = await api.persistence.projects.cancelRunTask(
+          projectId, runId, taskId, request,
+        );
+      } catch (error) {
+        if (error instanceof ControlRoomApiError && error.code === "run_task_cancel_revision_conflict") {
+          // This response proves the new request was rejected before publication.
+          requests.current.delete(`${projectId}:${runId}:${taskId}`);
+        }
+        // A transport failure does not prove that the durable request was rejected.
+        throw error;
+      }
       resources.invalidate(
         projectRunResourceKey(projectId, runId),
         cancellation.catalog_revision,

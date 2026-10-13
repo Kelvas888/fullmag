@@ -203,6 +203,8 @@ import {
   PROJECT_RUN_MATERIALIZATION_PATH,
   PROJECT_RUN_PATH,
   PROJECT_RUN_TASK_CANCELLATION_PATH,
+  PROJECT_BATCHES_PATH,
+  PROJECT_BATCH_CASES_PATH,
   PLATFORM_CAPABILITIES_PATH,
   PLATFORM_OUTPUT_STORAGE_PATH,
   PLATFORM_COMPUTE_PROFILES_PATH,
@@ -506,6 +508,12 @@ import type {
   ProjectRunListResource,
   ProjectRunTaskCancellationRequest,
   ProjectRunTaskCancellationResource,
+  ProjectBatchSubmitRequest,
+  ProjectBatchSubmitResource,
+  ProjectBatchListQuery,
+  ProjectBatchListResource,
+  ProjectBatchCasesQuery,
+  ProjectBatchCasesResource,
   SolutionSetArtifactPageQuery,
   SolutionSetArtifactPageResource,
   SolutionScalarResource,
@@ -3059,6 +3067,27 @@ export class ControlRoomApi {
           options,
           { path: { project_id: projectId }, query },
         ),
+      listBatches: (
+        projectId: string,
+        query: ProjectBatchListQuery = {},
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<ProjectBatchListResource>(
+          PROJECT_BATCHES_PATH,
+          options,
+          { path: { project_id: projectId }, query },
+        ),
+      listBatchCases: (
+        projectId: string,
+        batchId: string,
+        query: ProjectBatchCasesQuery = {},
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<ProjectBatchCasesResource>(
+          PROJECT_BATCH_CASES_PATH,
+          options,
+          { path: { project_id: projectId, batch_id: batchId }, query },
+        ),
       getRun: (projectId: string, runId: string, options?: RequestOptions) =>
         this.requestJson<ProjectRunResource>(
           PROJECT_RUN_PATH,
@@ -3330,6 +3359,17 @@ export class ControlRoomApi {
           PERSISTENCE_PROJECT_AUTHORING_PATH,
           request,
           options,
+        ),
+      submitBatch: (
+        projectId: string,
+        request: ProjectBatchSubmitRequest,
+        options?: RequestOptions,
+      ) =>
+        this.postJson<ProjectBatchSubmitResource, ProjectBatchSubmitRequest>(
+          PROJECT_BATCHES_PATH,
+          request,
+          options,
+          { path: { project_id: projectId } },
         ),
       submitRun: (
         projectId: string,

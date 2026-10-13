@@ -88,6 +88,8 @@ import { VisualizationRegistrySyncController } from "./visualization/Visualizati
 import { VISUALIZATION_TARGET_COMMANDS } from "./visualization/visualizationCommandContributions";
 import { ObjectMoveToolController } from "./authoring/ObjectMoveToolController";
 import { AuthoringHistoryController } from "./authoring/AuthoringHistoryController";
+import { ObjectEditSessionController } from "./authoring/object-edit/ObjectEditSessionController";
+import type { GeometryObjectDraft } from "./authoring/object-edit/objectEditTypes";
 import { PendingFormRegistry } from "./authoring/PendingFormRegistry";
 import { ProjectDocumentController } from "./persistence/ProjectDocumentController";
 import { RunOutcomeConnector } from "./persistence/RunOutcomeConnector";
@@ -140,19 +142,25 @@ function createKernel(options: DevelopmentKernelFactoryOptions, developmentWorks
   const modules = new ModuleRegistry();
   const resources = new ResourceInvalidationController(bus);
   const authoringHistory = new AuthoringHistoryController(api, resources);
+  const objectEditSession = new ObjectEditSessionController<GeometryObjectDraft>();
   const pendingForms = new PendingFormRegistry();
   authoringHistory.subscribe(() => commands.refresh());
   pendingForms.subscribe(() => commands.refresh());
+  objectEditSession.subscribe(() => commands.refresh());
   const selection = new SelectionController(bus);
   const layout = new LayoutController(bus);
   const objectMoveTool = new ObjectMoveToolController();
   const chartViewportHandoff = new ChartViewportHandoffController();
   bus.on("session:status-changed", ({ status }) => {
-    if (status !== "connected") {
-      chartViewportHandoff.cancel("Session changed while loading a chart field.");
+    if (status === "idle") {
+      chartViewportHandoff.cancel("Session closed.");
       objectMoveTool.clear();
       authoringHistory.clear();
+      objectEditSession.clear();
       pendingForms.clear();
+    } else if (status !== "connected") {
+      chartViewportHandoff.cancel("Session connection interrupted.");
+      objectMoveTool.clear();
     }
   });
   const cameraRegistry = new CameraRegistryController({
@@ -223,6 +231,7 @@ function createKernel(options: DevelopmentKernelFactoryOptions, developmentWorks
     api,
     analysisFieldOverlay,
     authoringHistory,
+    objectEditSession,
     bus,
     chartViewportHandoff,
     cameraRegistry,

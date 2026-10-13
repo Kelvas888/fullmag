@@ -139,9 +139,13 @@ function ProfileEditor({ resource }: { resource: Profiles }) {
           <ProfileChoice label="Precision" value={draft.profile.defaults.precision} options={["single", "double"]} onChange={(value) => updateDefault("precision", value)} disabled={locked} />
           <ProfileChoice label="Execution mode" value={draft.profile.defaults.mode} options={["strict", "extended", "hybrid"]} onChange={(value) => updateDefault("mode", value)} disabled={locked} />
           <label>CPU threads per task<Input value={draft.threads} onChange={(event) => setDraft({ ...draft, threads: event.target.value })} placeholder="Inherit · auto · 8" /></label>
+          <label>RAM per task (GiB)<Input type="number" min="0" step="any" value={draft.ramGiB} onChange={(event) => setDraft({ ...draft, ramGiB: event.target.value })} placeholder={hasExplicitReset(draft.profile.defaults.resources?.ram) ? "Reset retained" : "Inherit"} /></label>
+          <label>Scratch per task (GiB)<Input type="number" min="0" step="any" value={draft.scratchGiB} onChange={(event) => setDraft({ ...draft, scratchGiB: event.target.value })} placeholder={hasExplicitReset(draft.profile.defaults.resources?.scratch) ? "Reset retained" : "Inherit"} /></label>
+          <label>GPU VRAM per device (GiB)<Input type="number" min="0" step="any" value={draft.vramGiB} onChange={(event) => setDraft({ ...draft, vramGiB: event.target.value })} placeholder={draft.profile.defaults.resources?.gpu === null || draft.profile.defaults.resources?.gpu?.vram_per_device_bytes === null ? "Reset retained" : "Inherit"} /></label>
         </fieldset>
         <p className="fm-start-compute-settings__intro">Inherit leaves the preference unset. Auto records an explicit automatic choice. GPU requests require a GPU; availability is checked when a task is submitted.</p>
-        <p className="fm-start-compute-settings__intro">Other resource settings are retained when creating a new version. Saving a profile does not assign it to a study.</p>
+        <p className="fm-start-compute-settings__intro">Blank values inherit unless an existing explicit reset is retained unchanged. RAM, scratch, and VRAM values are requested per-task limits; actual admission and allocation are resolved when a task starts.</p>
+        <p className="fm-start-compute-settings__intro">Other advanced resource settings are retained when creating a new version. Saving a profile does not assign it to a study.</p>
         <div className="fm-start-profiles__actions">
           {pending ? <>
             <Button disabled={busy} onClick={() => void checkPublication()} type="button" size="sm">Check publication</Button>
@@ -166,4 +170,8 @@ function ProfileChoice<T extends string>({ label, value, options, onChange, disa
       <SelectContent><SelectItem value="inherit">Inherit</SelectItem>{options.map((option) => <SelectItem key={option} value={option}>{option === "auto" ? "Auto" : option.toUpperCase()}</SelectItem>)}</SelectContent>
     </Select>
   </div>;
+}
+
+function hasExplicitReset(value: { reservation_bytes?: number | null } | null | undefined): boolean {
+  return value === null || value?.reservation_bytes === null;
 }

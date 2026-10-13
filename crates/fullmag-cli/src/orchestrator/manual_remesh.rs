@@ -204,6 +204,7 @@ fn prepare_fdm_grid_refresh(
             "status": "completed",
             "mesh_target": "study_domain",
             "mesh_reason": command.reason.as_deref().unwrap_or("fdm_grid_refresh"),
+            "source_scene_revision": opts.get("source_scene_revision"),
             "canonical_policy_snapshot": opts.get("canonical_policy_snapshot"),
             "requested_execution": candidate_stages[0].ir.problem_meta.runtime_metadata.get("runtime_selection"),
             "resolved_execution": metadata.get("resolved_execution"),

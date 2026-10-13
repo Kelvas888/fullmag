@@ -24,6 +24,8 @@ use std::time::Duration;
 struct SchedulerArgs {
     store_root: PathBuf,
     pool_id: String,
+    host_service_config: Option<PathBuf>,
+    host_config_sha256: Option<String>,
     preparer_executable: Option<PathBuf>,
     resident: bool,
     owner_control: bool,
@@ -197,6 +199,20 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 }
 
 fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Result<()> {
+    let host = match (&args.host_service_config, &args.host_config_sha256) {
+        (Some(configuration_path), Some(configuration_sha256)) => Some(
+            fullmag_runtime_control::host_runtime::HostRuntimeAdmission::for_scheduler(
+                configuration_path,
+                configuration_sha256,
+                &args.store_root,
+                &args.pool_id,
+                "preparation",
+                args.max_concurrency,
+            )?,
+        ),
+        (None, None) => None,
+        _ => bail!("--host-service-config and --host-config-sha256 must be supplied together"),
+    };
     let store = retry_store_writer_busy(|| SessionStore::open_existing(&args.store_root))
         .with_context(|| format!("open session store `{}`", args.store_root.display()))?;
     let preparer_executable = match args.preparer_executable {
@@ -227,6 +243,11 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
     let mut consecutive_idle_polls = 0usize;
 
     loop {
+        if let Some(host) = host.as_ref() {
+            retry_store_writer_busy(|| host.reconcile_tentative_store_admissions(&store))?;
+            retry_store_writer_busy(|| host.reconcile_released_store_reservations(&store))?;
+            retry_store_writer_busy(|| host.reconcile_task_cancellations(&store))?;
+        }
         reap_finished(
             &store,
             &args.pool_id,
@@ -253,6 +274,9 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
         let current_pool =
             retry_store_writer_busy(|| store.read_preparation_resource_pool(&args.pool_id))?;
         if let Some(pool) = &current_pool {
+            if let Some(host) = &host {
+                host.validate_preparation_pool(pool)?;
+            }
             validate_pool_progress(observed_pool.as_ref(), pool, &active)?;
             for offer in &pool.resources {
                 observed_resource_ids.insert(offer.resource_id.clone());
@@ -309,6 +333,7 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
                         args.heartbeat_interval,
                         None,
                         None,
+                        host.clone(),
                     ),
                     lease,
                 },
@@ -343,6 +368,7 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
                         pool.generation,
                         offer,
                         &candidates,
+                        host.as_ref(),
                     )?
                     else {
                         continue;
@@ -362,6 +388,7 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
                                 args.heartbeat_interval,
                                 Some(checkpoint_run_ids.clone()),
                                 next_after_admission,
+                                host.clone(),
                             ),
                             lease,
                         },
@@ -525,10 +552,11 @@ fn admit_candidate(
     pool_generation: u64,
     offer: &FmsPreparationResourceOffer,
     candidates: &[PreparationCandidate],
+    host: Option<&fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
 ) -> Result<Option<FmsPreparationResourceLease>> {
     for candidate in candidates {
         let now = chrono::Utc::now();
-        let lease = FmsPreparationResourceLease {
+        let mut lease = FmsPreparationResourceLease {
             schema_version: FMS_PREPARATION_RESOURCE_LEASE_SCHEMA.into(),
             resource_id: offer.resource_id.clone(),
             budget: offer.budget.clone(),
@@ -545,17 +573,40 @@ fn admit_candidate(
             heartbeat_at: now,
             heartbeat_sequence: 0,
             released_at: None,
+            host_launch_binding: None,
         };
-        if retry_store_writer_busy(|| {
-            store.try_commit_preparation_resource_lease_from_pool(
-                pool_id,
-                pool_generation,
-                candidate.authorization_sequence,
-                &lease,
-            )
-        })?
-        .is_some()
-        {
+        let disposition = if let Some(host) = host {
+            lease.host_launch_binding = Some(host.ledger().worker_launch_binding());
+            let cpu_ids = host.preparation_cpu_ids(&lease.resource_id)?;
+            let request =
+                fullmag_runtime_control::host_allocation::host_request_for_preparation_lease(
+                    store,
+                    host.ledger(),
+                    &lease,
+                    cpu_ids,
+                )?;
+            retry_store_writer_busy(|| {
+                host.ledger()
+                    .try_commit_preparation_resource_lease_from_pool(
+                        &request,
+                        store,
+                        pool_id,
+                        pool_generation,
+                        candidate.authorization_sequence,
+                        &lease,
+                    )
+            })?
+        } else {
+            retry_store_writer_busy(|| {
+                store.try_commit_preparation_resource_lease_from_pool(
+                    pool_id,
+                    pool_generation,
+                    candidate.authorization_sequence,
+                    &lease,
+                )
+            })?
+        };
+        if disposition.is_some() {
             return Ok(Some(lease));
         }
     }
@@ -650,21 +701,24 @@ fn spawn_supervisor(
     heartbeat_interval: Duration,
     checkpoint_run_ids: Option<Vec<String>>,
     next_run_id: Option<String>,
+    host: Option<fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
 ) -> JoinHandle<Result<CompletedPreparation>> {
     std::thread::spawn(move || {
         let store = retry_store_writer_busy(|| SessionStore::open_existing(&store_root))
             .with_context(|| format!("open session store `{}`", store_root.display()))?;
-        let result = accepted_fem_preparation_supervisor::run_supervised_accepted_fem_preparation(
-            &store,
-            &lease.run_id,
-            &lease.task_id,
-            &lease.resource_id,
-            &lease.preparation_attempt_id,
-            &lease.lease_token,
-            &preparer_executable,
-            process_timeout,
-            heartbeat_interval,
-        )?;
+        let result =
+            accepted_fem_preparation_supervisor::run_supervised_accepted_fem_preparation_with_host(
+                &store,
+                &lease.run_id,
+                &lease.task_id,
+                &lease.resource_id,
+                &lease.preparation_attempt_id,
+                &lease.lease_token,
+                &preparer_executable,
+                process_timeout,
+                heartbeat_interval,
+                host.as_ref(),
+            )?;
         Ok(CompletedPreparation {
             lease,
             result,
@@ -705,6 +759,44 @@ fn parse_args() -> Result<SchedulerArgs> {
     }
     let store_root = PathBuf::from(take_required_string(&mut values, "--store-root")?);
     let pool_id = take_required_string(&mut values, "--pool-id")?;
+    let host_service_config = values
+        .remove("--host-service-config")
+        .map(|value| {
+            let value = value.into_string().map_err(|_| {
+                anyhow::anyhow!(
+                    "preparation scheduler option `--host-service-config` must be valid UTF-8"
+                )
+            })?;
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                bail!(
+                    "preparation scheduler option `--host-service-config` must be an absolute path"
+                );
+            }
+            Ok(path)
+        })
+        .transpose()?;
+    let host_config_sha256 = values
+        .remove("--host-config-sha256")
+        .map(|value| {
+            value.into_string().map_err(|_| {
+                anyhow::anyhow!(
+                    "preparation scheduler option `--host-config-sha256` must be valid UTF-8"
+                )
+            })
+        })
+        .transpose()?;
+    if host_service_config.is_some() != host_config_sha256.is_some() {
+        bail!("--host-service-config and --host-config-sha256 must be supplied together");
+    }
+    if host_config_sha256.as_deref().is_some_and(|digest| {
+        digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }) {
+        bail!("preparation scheduler option `--host-config-sha256` must be a lowercase 64-character SHA-256 digest");
+    }
     let resident = values
         .remove("--resident")
         .map(|value| parse_bool("--resident", value))
@@ -763,6 +855,8 @@ fn parse_args() -> Result<SchedulerArgs> {
     Ok(SchedulerArgs {
         store_root,
         pool_id,
+        host_service_config,
+        host_config_sha256,
         preparer_executable,
         resident,
         owner_control,

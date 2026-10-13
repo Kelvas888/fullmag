@@ -14,6 +14,7 @@ import warnings
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -23,6 +24,7 @@ from fullmag._progress import (
     indeterminate_progress_phase,
 )
 from fullmag._validation import ensure_unique_names, require_non_empty
+from fullmag.cuda_device_identity import legacy_cuda_binding
 from fullmag.model._incomplete import IncompletePhysicsError
 from fullmag.init.textures import PresetTexture
 from fullmag.model.antenna import (
@@ -1586,8 +1588,14 @@ class RuntimeSelection:
             raise ValueError(
                 "gpu_count > 1 requests multi-GPU execution, but multi-GPU execution is not implemented"
             )
-        if self.device_index is not None and self.device_index < 0:
-            raise ValueError("device_index must be >= 0")
+        if self.device_index is not None:
+            if isinstance(self.device_index, bool) or not isinstance(
+                self.device_index, Integral
+            ):
+                raise ValueError("device_index must be a nonnegative integer")
+            object.__setattr__(self, "device_index", int(self.device_index))
+            if self.device_index < 0:
+                raise ValueError("device_index must be >= 0")
         if self.cpu_threads is not None and self.cpu_threads <= 0:
             raise ValueError("cpu_threads must be >= 1")
         if self.cpu_threads is not None and self.cpu_threads > 1:
@@ -1751,6 +1759,8 @@ class RuntimeSelection:
         }
         if self.fdm_precision_policy is not None:
             result["fdm_precision_policy"] = self.fdm_precision_policy.to_ir()
+        if self.device_index is not None:
+            result["legacy_cuda_binding"] = legacy_cuda_binding(self.device_index)
         return result
 
 

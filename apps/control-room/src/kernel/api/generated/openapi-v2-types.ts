@@ -100,6 +100,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/persistence/projects/{project_id}/batches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["persistence_get_persistence_projects_project_id_batches"];
+        put?: never;
+        post: operations["persistence_post_persistence_projects_project_id_batches"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v2/persistence/projects/{project_id}/batches/{batch_id}/cases": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["persistence_get_persistence_projects_project_id_batches_batch_id_cases"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/persistence/projects/{project_id}/runs": {
         parameters: {
             query?: never;
@@ -5460,6 +5492,8 @@ export interface components {
             client_intent_id?: string | null;
             command_id: string;
             completed_at_unix_ms?: number | null;
+            /** Format: int64 */
+            completed_step?: number | null;
             completion_status?: string | null;
             created_at_unix_ms: number;
             diagnostics?: components["schemas"]["CommandDiagnosticReferenceResource"][];
@@ -10971,6 +11005,101 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        ProjectBatchAxisSummaryResource: {
+            canonical_unit: string;
+            name: string;
+        };
+        /** @enum {string} */
+        ProjectBatchCaseState: "pending_expansion" | "pending_materialization";
+        ProjectBatchCaseSummaryResource: {
+            case_id: string;
+            parameter_tuple: {
+                [key: string]: unknown;
+            };
+            planned_run_id: string;
+            state: components["schemas"]["ProjectBatchCaseState"];
+        };
+        ProjectBatchCasesQuery: {
+            /** @description Last CaseId returned on the previous page. */
+            cursor?: string | null;
+            /**
+             * Format: int32
+             * @description Page size, from 1 to 100; defaults to 50.
+             */
+            limit?: number | null;
+        };
+        ProjectBatchCasesResource: {
+            /** @description Axis names and canonical units for the parameter tuples in this manifest. */
+            axes: components["schemas"]["ProjectBatchAxisSummaryResource"][];
+            batch_id: string;
+            cases: components["schemas"]["ProjectBatchCaseSummaryResource"][];
+            next_cursor?: string | null;
+        };
+        /** @enum {string} */
+        ProjectBatchExpansionState: "pending" | "expanding" | "complete" | "stopped";
+        /** @enum {string} */
+        ProjectBatchFailurePolicy: "continue_independent" | "stop_admission";
+        ProjectBatchListQuery: {
+            /** @description Last BatchId returned on the previous page. */
+            cursor?: string | null;
+            /**
+             * Format: int32
+             * @description Page size, from 1 to 100; defaults to 50.
+             */
+            limit?: number | null;
+        };
+        ProjectBatchListResource: {
+            batches: components["schemas"]["ProjectBatchSummaryResource"][];
+            next_cursor?: string | null;
+            project_id: string;
+        };
+        /**
+         * @description Immutable independent batch submission. The server deserializes
+         *     `batch_request` into the versioned application contract before accepting it.
+         */
+        ProjectBatchSubmitRequest: {
+            /** @description Exact base64-encoded portable project archive accepted for this batch. */
+            archive_base64: string;
+            /** @description Explicit immutable asset ID to path inside `project/assets/`. */
+            asset_paths: {
+                [key: string]: string;
+            };
+            /** @description Versioned `BatchExpansionRequest` object, including template and axes. */
+            batch_request: {
+                [key: string]: unknown;
+            };
+            /** @description Client intent key used to recover an ACK after a timeout. */
+            idempotency_key: string;
+            /** @description Versioned immutable StudyPlan used by the batch template. */
+            study_plan: {
+                [key: string]: unknown;
+            };
+            /** @description Immutable StudyProblemCatalog pinned by the batch template. */
+            study_problem_catalog: {
+                [key: string]: unknown;
+            };
+        };
+        ProjectBatchSubmitResource: {
+            batch_id: string;
+            /** Format: int64 */
+            case_count: number;
+            disposition: components["schemas"]["ProjectRunSubmitDisposition"];
+            /** @description Logical digest stored in the expansion manifest. */
+            manifest_sha256: string;
+        };
+        ProjectBatchSummaryResource: {
+            accepted_at: string;
+            batch_id: string;
+            /** Format: int64 */
+            case_count: number;
+            expansion_state: components["schemas"]["ProjectBatchExpansionState"];
+            failure_policy: components["schemas"]["ProjectBatchFailurePolicy"];
+            manifest_sha256: string;
+            /** Format: int32 */
+            max_parallel_cases?: number | null;
+            /** Format: int64 */
+            published_case_count: number;
+        };
         ProjectCreateRequest: {
             /**
              * @description User-facing project name. It is the only authoring input accepted by
@@ -11198,18 +11327,35 @@ export interface components {
         };
         /** @enum {string} */
         ProjectRunTaskCancellationDisposition: "accepted" | "replayed";
-        ProjectRunTaskCancellationRequest: {
-            /** @description Stable operator-visible reason persisted in the fenced Stop command. */
-            reason: string;
-        };
-        ProjectRunTaskCancellationResource: {
+        ProjectRunTaskCancellationIntentResource: {
+            cancellation_id: string;
+            cancellation_state: components["schemas"]["ProjectRunTaskCancellationState"];
             /** Format: int64 */
             catalog_revision: number;
-            command_id: string;
             disposition: components["schemas"]["ProjectRunTaskCancellationDisposition"];
+            /** Format: int64 */
+            expected_catalog_revision: number;
             lifecycle: components["schemas"]["ProjectRunTaskLifecycle"];
             run_id: string;
             task_id: string;
+        };
+        ProjectRunTaskCancellationRequest: {
+            /** @description Supply together with expected_catalog_revision for pre-claim cancellation. */
+            cancellation_id?: string | null;
+            /** Format: int64 */
+            expected_catalog_revision?: number | null;
+            /** @description Stable operator-visible reason persisted in the request or Stop command. */
+            reason: string;
+        };
+        ProjectRunTaskCancellationResource: components["schemas"]["ProjectRunTaskStopResource"] | components["schemas"]["ProjectRunTaskCancellationIntentResource"];
+        /** @enum {string} */
+        ProjectRunTaskCancellationState: "requested";
+        ProjectRunTaskCancellationSummary: {
+            cancellation_id: string;
+            created_at: string;
+            /** Format: int64 */
+            expected_catalog_revision: number;
+            reason: string;
         };
         /** @enum {string} */
         ProjectRunTaskLifecycle: "accepted" | "queued" | "preparing" | "running" | "stopping" | "succeeded" | "failed" | "cancelled" | "interrupted";
@@ -11225,6 +11371,7 @@ export interface components {
             accepted_state_ref?: null | components["schemas"]["AcceptedStateRefResource"];
             artifact_ids: string[];
             attempt_id?: string | null;
+            cancellation_intent?: null | components["schemas"]["ProjectRunTaskCancellationSummary"];
             input_fingerprint: string;
             lifecycle: components["schemas"]["ProjectRunTaskLifecycle"];
             observation?: null | components["schemas"]["ProjectRunObservationState"];
@@ -11233,6 +11380,15 @@ export interface components {
             readiness: components["schemas"]["ProjectRunTaskReadiness"];
             resolved_input_fingerprint?: string | null;
             resource_id?: string | null;
+            task_id: string;
+        };
+        ProjectRunTaskStopResource: {
+            /** Format: int64 */
+            catalog_revision: number;
+            command_id: string;
+            disposition: components["schemas"]["ProjectRunTaskCancellationDisposition"];
+            lifecycle: components["schemas"]["ProjectRunTaskLifecycle"];
+            run_id: string;
             task_id: string;
         };
         ProjectScriptImportResource: {
@@ -13952,6 +14108,8 @@ export interface components {
             command_id?: string | null;
             /** Format: int64 */
             completed_at_unix_ms?: number | null;
+            /** Format: int64 */
+            completed_step?: number | null;
             converged: boolean;
             /** Format: double */
             current_field_mT?: number | null;
@@ -15346,6 +15504,142 @@ export interface operations {
             };
         };
     };
+    persistence_get_persistence_projects_project_id_batches: {
+        parameters: {
+            query?: {
+                /** @description Page size, from 1 to 100; defaults to 50. */
+                limit?: number | null;
+                /** @description Last BatchId returned on the previous page. */
+                cursor?: string | null;
+            };
+            header?: never;
+            path: {
+                /** @description Pinned project identity */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page of durable batch parents for one project */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectBatchListResource"];
+                };
+            };
+            /** @description Invalid page size or cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    persistence_post_persistence_projects_project_id_batches: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Pinned project identity */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectBatchSubmitRequest"];
+            };
+        };
+        responses: {
+            /** @description Identical batch submit replayed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectBatchSubmitResource"];
+                };
+            };
+            /** @description Durable immutable batch parent accepted */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectBatchSubmitResource"];
+                };
+            };
+            /** @description Invalid immutable batch inputs */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Project identity, batch identity or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    persistence_get_persistence_projects_project_id_batches_batch_id_cases: {
+        parameters: {
+            query?: {
+                /** @description Page size, from 1 to 100; defaults to 50. */
+                limit?: number | null;
+                /** @description Last CaseId returned on the previous page. */
+                cursor?: string | null;
+            };
+            header?: never;
+            path: {
+                /** @description Pinned project identity */
+                project_id: string;
+                /** @description Durable batch identity */
+                batch_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page of planned cases from the immutable expansion manifest */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectBatchCasesResource"];
+                };
+            };
+            /** @description Invalid page size or cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Accepted batch is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Batch belongs to another project */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     persistence_get_persistence_projects_project_id_runs: {
         parameters: {
             query?: {
@@ -16162,7 +16456,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Identical Stop command replayed */
+            /** @description Identical cancellation request replayed */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -16171,7 +16465,7 @@ export interface operations {
                     "application/json": components["schemas"]["ProjectRunTaskCancellationResource"];
                 };
             };
-            /** @description Durable Stop command accepted */
+            /** @description Durable Stop command or pre-claim cancellation request accepted */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -16194,7 +16488,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Task is not preparing/running or a conflicting cancellation exists */
+            /** @description Task state, catalog revision or cancellation identity conflicts */
             409: {
                 headers: {
                     [name: string]: unknown;

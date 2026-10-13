@@ -964,7 +964,7 @@ describe("ObjectVisualizationController", () => {
   it("keeps an orphan part target separate from its Explorer node address", () => {
     expect(
       resolveVisualizationTargetFromSelection({
-        kind: "mesh-part",
+        kind: "mesh.unassigned.part",
         label: "Recovered volume",
         nodeId: "model:mesh:unassigned:part%3Aorphan",
         objectId: null,

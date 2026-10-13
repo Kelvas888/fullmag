@@ -85,6 +85,7 @@ Thumbs.db
 
 # === Logs ===
 *.log
+!docs/plans/**/reproductions/*.log
 
 # === Data & artifacts ===
 artifacts/

@@ -19,6 +19,7 @@ export interface RegionSubPanelProps {
   model: ObjectRegionPanelModel;
   draft: ObjectRegionDraft;
   pending: boolean;
+  draftApplyPending?: boolean;
   sessionAvailable?: boolean;
   buildPending?: boolean;
   membership?: MeshRegionMembershipResource | null;
@@ -40,11 +41,24 @@ export interface RegionSubPanelProps {
   removeMaterialOverride: (index: number) => void;
   materialFields: MaterialParameterFieldListResource | null;
   couplingDependencies: RegionCouplingDependency[];
+  auxiliaryDraftOwnerKey?: string;
+  reportAuxiliaryDraftSession?: (
+    ownerKey: string,
+    session: RegionAuxiliaryDraftSession | null,
+  ) => void;
   applyRegion: () => Promise<boolean>;
   duplicateRegion: () => Promise<void>;
   deleteRegion: () => Promise<void>;
   revert: () => void;
   feedback: { kind: "error" | "success" | "warning"; message: string } | null;
+}
+
+export interface RegionAuxiliaryDraftSession {
+  applying: boolean;
+  apply: () => Promise<boolean>;
+  dirty: boolean;
+  reset: () => void;
+  valid: boolean;
 }
 
 export function ObjectRegionInlineDiagnostics({

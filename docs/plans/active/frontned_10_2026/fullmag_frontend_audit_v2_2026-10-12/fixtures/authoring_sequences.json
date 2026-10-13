@@ -1,0 +1,107 @@
+{
+  "id": "EDIT-01",
+  "kind": "planned_fixture_contract",
+  "object_id": "obj-fixture-001",
+  "scene_revision": 10,
+  "geometry": {
+    "geometry_kind": "Cylinder",
+    "geometry_params": {
+      "radius": 5e-08,
+      "height": 1e-08
+    }
+  },
+  "transform": {
+    "translation": [
+      0,
+      0,
+      0
+    ],
+    "rotation_quat": [
+      0,
+      0,
+      0,
+      1
+    ],
+    "scale": [
+      1,
+      1,
+      1
+    ],
+    "pivot": [
+      0,
+      0,
+      0
+    ]
+  },
+  "events": [
+    {
+      "event": "field-edit",
+      "group": "radius",
+      "value_m": 8e-08
+    },
+    {
+      "event": "pointerup",
+      "draft_translation_m": [
+        3e-07,
+        0,
+        0
+      ],
+      "expected_mutation_count": 0
+    },
+    {
+      "event": "apply",
+      "expected_transaction_kind": "patch_object_geometry",
+      "expected_mutation_count": 1,
+      "expected_scene_revision": 11
+    },
+    {
+      "event": "post-submit-field-edit",
+      "group": "radius",
+      "raw_text": "90 nm",
+      "expected_after_ack": "90 nm remains dirty; baseline radius 80 nm"
+    }
+  ],
+  "concurrency": {
+    "writers": [
+      "A",
+      "B"
+    ],
+    "same_base_revision": 10,
+    "expected": "exactly one commit; other conflict unless one was rejected before admission"
+  },
+  "states": {
+    "unknown_ack": "no new intent; lookup same owner+intent",
+    "session_ABA": "late A completion not admitted into new A epoch"
+  },
+  "airbox_stability_case": {
+    "base_revision": 20,
+    "baseline_policy": {
+      "padding_m": [
+        1e-06,
+        1e-06,
+        1e-06
+      ],
+      "hmin_m": 5e-09,
+      "hmax_m": 5e-08
+    },
+    "submitted_hmax_m": 8e-08,
+    "post_submit_raw_hmax": "100 nm",
+    "ack_revision": 21,
+    "expected_baseline_hmax_m": 8e-08,
+    "expected_visible_raw_hmax": "100 nm",
+    "expected_dirty_after_ack": true,
+    "unrelated_controls": [
+      "visibility",
+      "opacity",
+      "camera",
+      "collapsible sections"
+    ],
+    "dom_contract": {
+      "same_panel_root": true,
+      "focus_preserved": true,
+      "scroll_top_before": 240,
+      "scroll_top_after": 240,
+      "selection_range_preserved_where_supported": true
+    }
+  }
+}

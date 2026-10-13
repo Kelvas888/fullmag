@@ -98,6 +98,7 @@ import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FormField } from "../primitives/FormField";
 import { InspectorGroup } from "../primitives/InspectorGroup";
 import { ProjectRunsSection } from "./ProjectRunsSection";
+import { ProjectBatchesSection } from "./ProjectBatchesSection";
 
 import {
   buildStudyGlobalMergePatch,
@@ -1524,6 +1525,7 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
         />
 
         <ProjectRunsSection />
+        <ProjectBatchesSection />
 
         <StudySelectedStageSection
           model={model}

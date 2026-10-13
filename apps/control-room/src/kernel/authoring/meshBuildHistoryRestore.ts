@@ -4,7 +4,7 @@ import type { MeshBuildHistoryEntry } from "@/shared/domain/mesh/meshBuildHistor
 export function meshHistoryRestoreTarget(entry: MeshBuildHistoryEntry): string | null {
   const snapshot = entry.canonicalPolicySnapshot;
   if (!snapshot) return null;
-  const objectId = entry.meshTarget?.match(/^object_mesh:(.+)$/)?.[1];
+  const objectId = entry.meshTarget?.match(/^(?:object_mesh|object):(.+)$/)?.[1];
   if (objectId && snapshot.objects && typeof snapshot.objects === "object"
     && Object.hasOwn(snapshot.objects, objectId)) return `object:${objectId}`;
   if (entry.meshTarget && /^(study_domain|shared_domain|universe|airbox)$/.test(entry.meshTarget)

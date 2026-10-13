@@ -81,6 +81,9 @@
   flex-direction: column;
   gap: var(--fm-space-2);
   min-width: 0;
+  list-style: none;
+  margin: 0;
+  padding: 0;
 }
 
 .fm-start-env__gpu {
@@ -155,6 +158,83 @@
   flex-direction: column;
   gap: var(--fm-space-1);
   min-width: 0;
+}
+
+.fm-start-env__runtime {
+  display: flex;
+  flex-direction: column;
+  gap: var(--fm-space-1);
+  min-width: 0;
+  border-top: 1px solid var(--fm-border-subtle);
+  padding-top: var(--fm-space-2);
+}
+
+.fm-start-env__runtime-title {
+  margin: 0;
+  color: var(--fm-text-secondary);
+  font-size: var(--fm-font-size-xs);
+  font-weight: var(--fm-font-weight-semibold);
+}
+
+.fm-start-env__lanes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--fm-space-1);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.fm-start-env__lane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--fm-space-1);
+  min-width: 0;
+  border: 1px solid var(--fm-border-subtle);
+  border-radius: var(--fm-radius-sm);
+  background: var(--fm-bg-panel-raised);
+  padding: var(--fm-space-2);
+}
+
+.fm-start-env__lane-name,
+.fm-start-env__lane-state {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: var(--fm-font-size-2xs);
+  line-height: var(--fm-line-height-normal);
+}
+
+.fm-start-env__lane-name {
+  color: var(--fm-text-primary);
+  font-weight: var(--fm-font-weight-medium);
+}
+
+.fm-start-env__lane-state {
+  display: flex;
+  align-items: center;
+  gap: var(--fm-space-1);
+  color: var(--fm-text-secondary);
+}
+
+.fm-start-env__lane-dot {
+  flex: none;
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: var(--fm-radius-pill);
+  background: var(--fm-degraded);
+}
+
+.fm-start-env__lane[data-availability="available"] .fm-start-env__lane-dot {
+  background: var(--fm-success);
+}
+
+.fm-start-env__lane[data-availability="unavailable"] .fm-start-env__lane-dot {
+  background: var(--fm-danger);
+}
+
+.fm-start-env__lane[data-state="loading"] .fm-start-env__lane-dot {
+  background: var(--fm-start-meta);
 }
 
 .fm-start-env__note {
@@ -331,6 +411,12 @@
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
   gap: var(--fm-space-2);
   min-width: 0;
+}
+
+.fm-start-compute-settings__gpu-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
 }
 
 .fm-start-compute-settings__gpu-card,

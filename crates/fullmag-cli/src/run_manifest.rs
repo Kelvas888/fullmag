@@ -182,16 +182,26 @@ mod tests {
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::write(stage.join("scalars.csv"), "step,time,mx\n1,1e-13,0.5\n").unwrap();
         std::fs::create_dir_all(dir.path().join("artifacts")).unwrap();
-        std::fs::write(dir.path().join("artifacts/metadata.json"), "{\"status\":\"completed\"}").unwrap();
+        std::fs::write(
+            dir.path().join("artifacts/metadata.json"),
+            "{\"status\":\"completed\"}",
+        )
+        .unwrap();
 
         let finished = finished_manifest(&sample(), dir.path(), "failed", 14, Some("no GPU"));
         assert_eq!(finished.status, "failed");
         assert_eq!(finished.exit_code, Some(14));
         assert_eq!(finished.error.as_deref(), Some("no GPU"));
-        assert!(finished.finished_at.as_deref().is_some_and(|t| t.ends_with('Z')));
+        assert!(finished
+            .finished_at
+            .as_deref()
+            .is_some_and(|t| t.ends_with('Z')));
         assert_eq!(finished.stages[0].kind.as_deref(), Some("relax"));
         assert_eq!(finished.stages[0].steps, Some(1));
-        assert!(finished.outputs.iter().any(|o| o.path == "artifacts/metadata.json"));
+        assert!(finished
+            .outputs
+            .iter()
+            .any(|o| o.path == "artifacts/metadata.json"));
         // Requested and resolved stay separate and untouched.
         assert_eq!(finished.requested["device"], "as_authored");
         assert_eq!(finished.resolved["device"], "cpu");

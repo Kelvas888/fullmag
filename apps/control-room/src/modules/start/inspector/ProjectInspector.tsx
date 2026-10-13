@@ -50,7 +50,7 @@ const INSPECTOR_HINTS: Readonly<Record<StartSection, InspectorHint>> = {
   settings: {
     icon: Settings,
     title: "Settings",
-    body: "Changes apply immediately. The full preferences dialog has the rest.",
+    body: "Review the compute host and edit reusable execution profiles. Apply saves a profile version for future studies; running jobs keep their accepted settings.",
   },
   about: {
     icon: Info,

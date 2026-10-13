@@ -68,7 +68,13 @@ interface FamilyDescriptor {
 }
 
 const EXACT_FAMILIES: Record<string, FamilyDescriptor> = {
-  "object.geometry": { tabs: [], typeLabel: "Geometry" },
+  "object.geometry": {
+    tabs: [
+      { id: "geometry", label: "Geometry" },
+      { id: "placement", label: "Placement" },
+    ],
+    typeLabel: "Geometry",
+  },
   "object.material": { tabs: [], typeLabel: "Material" },
   "object.mesh": { tabs: MESH_TABS, typeLabel: "Mesh policy" },
   "object.physics": { tabs: [], typeLabel: "Physics" },

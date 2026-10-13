@@ -45,6 +45,15 @@ Configure compute                     View jobs →
 
 - W skróconym widoku najwyżej kilka wierszy i „Show all 4”; zachowana obecna
   ograniczona wysokość i przewijanie. Pełne dane są w Settings, nie tooltipie.
+- Karta może pokazać cztery skrócone tory FDM/FEM × CPU/GPU ze stanem
+  **Available / Unavailable / Not reported** na podstawie zarejestrowanych
+  capability strict-production. Wykryta karta nie jest dowodem dostępności
+  toru solvera; brak raportu pozostaje jawny, a początkowy probe jest osobno
+  oznaczony jako **Loading**.
+- Szacunki szablonów mogą użyć sprzętu dopiero przy matching `Available` lane
+  dla danego solvera. Sam wykryty GPU lub logical CPU count nie wskazuje
+  urządzenia dla runu; gdy lane nie jest zgłoszony, pozostaje labelled reference
+  estimate, a właściwe urządzenie rozwiązuje runtime przy starcie runu.
 - CPU „allocated cores” tylko przy znanej topologii i affinity. Gdy znamy
   jedynie logical CPUs, pokazujemy właśnie tę jednostkę.
 - Reserved/allocated pochodzi z ledger; „in use” z telemetry. Nie łączymy ich
@@ -84,6 +93,14 @@ GPU 3      …           16 GiB    Display       Excluded by policy
 Solver compatibility    [FDM CPU] [FDM GPU] [FEM CPU] [FEM GPU]
 Last inventory: …       Last telemetry: …        Refresh
 ```
+
+`inventory_revision` zmienia się przy trwałej zmianie CPU topology/OS constraints
+albo GPU UUID, partition lub ich wiązań PCI/topology. `capabilities_revision`
+zmienia się niezależnie, wyłącznie wraz ze zgłoszonymi capabilities runtime.
+Próbki RAM, obciążenia i temperatury nie zmieniają żadnej z tych rewizji.
+Telemetria odświeżana co 5 sekund jest `current` najwyżej przez 30 sekund;
+później UI pokazuje `stale`, a błąd lub brak pomiaru pozostaje `unavailable`
+z przyczyną. Żaden z tych odczytów nie tworzy ani nie rezerwuje allocation.
 
 Kompatybilność rozwija się do: runtime version/build, precision, workflow,
 algorytm/strategia demag, single-device / task-parallel / distributed,
@@ -194,6 +211,12 @@ Preview execution                                      Submit
 ## 5. Sweep editor
 
 Osie mają tabelę parametrów, jednostek, zakresów i sposobu łączenia Cartesian/Zip.
+Każda oś wskazuje typowany parametr konkretnego kroku Study; wartości trafiają
+do case-local `ProblemIR` i katalogu wejściowego. `RunSpecification.parameters`
+nie zastępuje fizycznego bindingu. Obsługiwane cele to zewnętrzne pole B w
+teslach oraz prąd Zhang–Li w A/m² z wyborem konkretnego kroku i modułu.
+Nieobsługiwane cele wymagają wskazania właściwego kroku lub modułu i pozostają
+niedostępne, dopóki nie mają planner bindingu.
 Preview podaje liczbę cases przed materializacją. Limit rozmiaru wymaga
 potwierdzenia liczby/outputu, nie ładowania wszystkich cases do React state.
 
@@ -257,6 +280,7 @@ device UUID, lane, status, owner; paginacja i wirtualizacja dużych list.
 Kolumny: parameter tuple, status/reason, requested resources, allocation,
 elapsed, output status. Progress z solvera ma zakres/znaczenie; brak liczby
 postępu nie staje się procentem wymyślonym z elapsed time.
+Parameter tuple pokazuje canonical unit z przypiętego manifestu osi.
 
 Akcje i nazwy:
 

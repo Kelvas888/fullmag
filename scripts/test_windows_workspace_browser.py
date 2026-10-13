@@ -1,10 +1,12 @@
 """Interpreted scope/freshness/custody checks; not a native/browser pass."""
 import io
 import errno
+import http.client
 import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -14,6 +16,75 @@ import verify_development_backend_api as native_gate
 
 
 class BrowserProofChecks(unittest.TestCase):
+    def test_after_grid_document_pins_hashes_but_never_relaxes_archive_metadata(self):
+        before = {"archive_base64_sha256": "a" * 64, "revision": 2, "dirty": True,
+                  "project_id": "project", "scene_resource_sha256": "b" * 64,
+                  "scene_document_sha256": "c" * 64}
+        expected = {**before, "scene_resource_sha256": "d" * 64, "scene_document_sha256": "e" * 64}
+        proof.validate_after_grid_document(before, expected)
+        for key, value in (("archive_base64_sha256", "f" * 64), ("revision", 3),
+                           ("dirty", False), ("project_id", "other"),
+                           ("scene_resource_sha256", "bad"), ("scene_document_sha256", None)):
+            with self.subTest(key=key), self.assertRaises(proof.storage.StorageError):
+                proof.validate_after_grid_document(before, {**expected, key: value})
+        with self.assertRaises(proof.storage.StorageError):
+            proof.validate_after_grid_document(before, {**expected, "extra": True})
+
+    def test_successful_grid_only_clears_mesh_dirty_and_preserves_source(self):
+        scene = {"revision": 3, "objects": [
+            {"id": "a", "tags": ["mesh:dirty", "user-tag"], "material_ref": "m"},
+            {"id": "b", "tags": ["mesh:dirty"]},
+            {"id": "c", "tags": ["user-tag"]}],
+            "materials": [{"id": "m", "properties": {"alpha": 0.02}}]}
+        expected = proof.scene_after_successful_grid(scene)
+        self.assertEqual(expected["objects"][0]["tags"], ["user-tag"])
+        self.assertNotIn("tags", expected["objects"][1])
+        self.assertEqual(expected["objects"][2]["tags"], ["user-tag"])
+        self.assertEqual(expected["materials"], scene["materials"])
+        self.assertEqual(expected["revision"], 3)
+        self.assertEqual(scene["objects"][0]["tags"], ["mesh:dirty", "user-tag"])
+        for field, value in (("material_ref", "other"), ("id", "other")):
+            changed = json.loads(json.dumps(expected))
+            changed["objects"][0][field] = value
+            self.assertNotEqual(proof.canonical(expected), proof.canonical(changed))
+
+    def test_terminal_scope_requires_exact_owner_start_and_completed_lifecycle(self):
+        restored = dict(api_instance_id="api", session_id="session", backend_session_epoch=1,
+                        request_scope_epoch="api:1", session_resource_epoch="session@100")
+        terminal = {**restored, "session_resource_epoch": "session@100:tombstone:200"}
+        lifecycle = dict(solver="completed", session_resource="tombstoned", commandability="read_only")
+        self.assertEqual(proof.validate_terminal_execution_scope(terminal, restored, lifecycle, 190, 210), 200)
+        for changes in (dict(api_instance_id="other"), dict(backend_session_epoch=2),
+                        dict(request_scope_epoch="api:2"), dict(session_id="other"),
+                        dict(session_resource_epoch="session@101:tombstone:200"),
+                        dict(session_resource_epoch="session@100"),
+                        dict(session_resource_epoch="session@100:tombstone:0200"),
+                        dict(session_resource_epoch="session@100:tombstone:99")):
+            with self.subTest(changes=changes), self.assertRaises(proof.storage.StorageError):
+                proof.validate_terminal_execution_scope({**terminal, **changes}, restored, lifecycle, 190, 210)
+        for changes in (dict(solver="awaiting_command"), dict(session_resource="active"),
+                        dict(commandability="allowed")):
+            with self.subTest(lifecycle=changes), self.assertRaises(proof.storage.StorageError):
+                proof.validate_terminal_execution_scope(terminal, restored, {**lifecycle, **changes}, 190, 210)
+        for earliest, observed in ((201, 210), (190, 199)):
+            with self.subTest(earliest=earliest, observed=observed), self.assertRaises(proof.storage.StorageError):
+                proof.validate_terminal_execution_scope(terminal, restored, lifecycle, earliest, observed)
+
+    def test_session_resource_epoch_rejects_noncanonical_or_unbounded_values(self):
+        for value in ("session@0", "session@01", "session@+1", "session@1:extra", "session@1:tombstone:0",
+                      "session@1:tombstone:2:tombstone:3", "session@" + "9" * 10000):
+            with self.subTest(value=value[:60]), self.assertRaises(proof.storage.StorageError):
+                proof.parse_session_resource_epoch("session", value)
+
+    def test_solver_execution_distinguishes_application_boundary_from_completion(self):
+        self.assertTrue(proof.has_positive_solver_execution(dict(applied_step=0, completed_step=10)))
+        self.assertTrue(proof.has_positive_solver_execution(dict(applied_step=42, completed_step=52)))
+        for applied, completed in ((0, 0), (42, 42), (42, 41), (-1, 10), (None, 10),
+                                   (0, None), (True, 10), (0, True), (0, 1.0)):
+            with self.subTest(applied=applied, completed=completed):
+                self.assertFalse(proof.has_positive_solver_execution(
+                    dict(applied_step=applied, completed_step=completed)))
+
     def diagnostic_paths(self, directory):
         root = Path(directory).resolve()
         repo, app, fixture = root / "checkout", root / "frozen-product", root / "fixture"
@@ -143,7 +214,6 @@ class BrowserProofChecks(unittest.TestCase):
                     native_gate.run("unused", frozen_native_build_id=invalid)
             conflicts = {
                 "cross_build_bundle": "b" * 32,
-                "project_document_only": True,
                 "restart_transport_only": True,
                 "observer_pause_only": True,
                 "restart_consumer_only": True,
@@ -156,9 +226,14 @@ class BrowserProofChecks(unittest.TestCase):
                 with self.subTest(mode=name), self.assertRaises(proof.storage.StorageError):
                     native_gate.run("unused", frozen_native_build_id=pin, **{name: value})
             resolve.assert_not_called()
-        with patch.object(native_gate.storage, "resolve_layout", side_effect=RuntimeError("resolver reached")):
-            with self.assertRaisesRegex(RuntimeError, "resolver reached"):
-                native_gate.run("unused", frozen_native_build_id=pin)
+        # Frozen packages also support the project-document proof used by the
+        # managed archive recipe. Both accepted scopes must reach preflight;
+        # no production storage is allocated by this check.
+        for scope in ({}, {"project_document_only": True}):
+            with self.subTest(accepted_scope=scope), patch.object(
+                    native_gate.storage, "resolve_layout", side_effect=RuntimeError("resolver reached")):
+                with self.assertRaisesRegex(RuntimeError, "resolver reached"):
+                    native_gate.run("unused", frozen_native_build_id=pin, **scope)
 
     def setUp(self):
         self.expected = {"worktree_id": "fixture", "generation_id": "a" * 32,
@@ -265,6 +340,55 @@ class BrowserProofChecks(unittest.TestCase):
             for change in ({"nonce": "wrong"}, {"api_pid": 11}, {"file_name": "../" + log.name}):
                 with self.subTest(change=change), self.assertRaises(proof.storage.StorageError):
                     proof.record_api_log_frame({**frame, **change}, self.expected, state_root, {10: {}}, receipt)
+
+    def test_cancel_requires_exact_scope_and_does_not_claim_finish(self):
+        bridge = proof.ProofBridge(self.expected, 1, None, Mock())
+        body = {"schema": "fullmag.development-browser-cancel.v1", "nonce": self.expected["nonce"]}
+        for change in ({"nonce": "wrong"}, {"schema": "wrong"}, {"extra": True}):
+            with self.subTest(change=change), self.assertRaises(proof.storage.StorageError):
+                bridge.cancel({**body, **change})
+        self.assertFalse(bridge.cancelled.is_set())
+        self.assertEqual(bridge.cancel(body), {"cancel_requested": True})
+        self.assertTrue(bridge.cancelled.is_set())
+        self.assertFalse(bridge.finished.is_set())
+        self.assertIsNone(bridge.browser)
+        self.assertTrue(bridge.receipt["workspace_browser_cancel_requested"])
+        with self.assertRaisesRegex(proof.storage.StorageError, "cancellation has already"):
+            bridge.finish({})
+
+    def test_cancel_cannot_replace_a_submitted_finish(self):
+        bridge = proof.ProofBridge(self.expected, 1, None, Mock())
+        bridge.finished.set()
+        with self.assertRaises(proof.storage.StorageError):
+            bridge.cancel({"schema": "fullmag.development-browser-cancel.v1", "nonce": self.expected["nonce"]})
+        self.assertFalse(bridge.cancelled.is_set())
+
+    def test_cancel_http_rejects_foreign_origin_before_requesting_cleanup(self):
+        bridge = proof.ProofBridge(self.expected, 1, None, Mock())
+        server = proof.ThreadingHTTPServer(("127.0.0.1", 0), proof.bridge_handler(bridge))
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        body = json.dumps({"schema": "fullmag.development-browser-cancel.v1",
+                           "nonce": self.expected["nonce"]})
+        try:
+            for origin, expected_status in (("http://localhost:3197", 409),
+                                            (self.expected["ui_origin"], 200)):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                try:
+                    connection.request("POST", "/cancel", body=body,
+                                       headers={"Origin": origin, "Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, expected_status)
+                    response.read()
+                    self.assertEqual(bridge.cancelled.is_set(), expected_status == 200)
+                    self.assertFalse(bridge.finished.is_set())
+                finally:
+                    connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
 
     def test_empty_scene_cannot_be_captured_as_restart_proof(self):
         process = type("Process", (), {"poll": lambda self: None})()
