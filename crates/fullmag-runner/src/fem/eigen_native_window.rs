@@ -11,6 +11,7 @@ use super::eigen_equilibrium_contract::{
     AcceptedFemEigenEquilibriumHandoff, AcceptedFemRelaxStageHandoff, LoadedEquilibriumArtifact,
 };
 use super::eigen_execution_resolution::PlannedFemEigenExecution;
+use super::eigen_execution::interrupted_fem_eigen_run;
 use super::eigen_path::EigenPathPotentialPublication;
 use super::eigen_mass_metric::{
     canonical_shared_domain_phases, validate_shared_domain_phase_anchors, SharedDomainSparseMass,
@@ -74,7 +75,6 @@ use nalgebra::SymmetricEigen;
 use num_complex::Complex64;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -321,13 +321,13 @@ pub(super) fn native_modal_run_result(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// The numeric order is terminal priority; Pause wins if both callback actions
-// are observed, matching the runner's other stage finalizers.
+// The numeric order is terminal priority; Stop wins if both callback actions
+// are observed, without allowing a later Pause to undo cancellation.
 #[repr(u8)]
 pub(super) enum NativeModalControlRequest {
     None = 0,
-    Stop = 1,
-    Pause = 2,
+    Pause = 1,
+    Stop = 2,
 }
 
 pub(super) fn record_native_modal_control_request(
@@ -429,6 +429,46 @@ pub(super) fn apply_native_modal_terminal_diagnostics(
     Ok(())
 }
 
+fn build_native_modal_artifacts_after_progress<T>(
+    action: StepAction,
+    terminal_state: &mut NativeModalTerminalState,
+    solver_diagnostics: &mut serde_json::Value,
+    build: impl FnOnce(&serde_json::Value) -> Result<T, RunError>,
+) -> Result<T, RunError> {
+    if *terminal_state == NativeModalTerminalState::Completed {
+        let requested_control = match action {
+            StepAction::Continue => NativeModalControlRequest::None,
+            StepAction::Stop => NativeModalControlRequest::Stop,
+            StepAction::Pause => NativeModalControlRequest::Pause,
+        };
+        if requested_control != NativeModalControlRequest::None {
+            *terminal_state = NativeModalTerminalState::resolve(true, requested_control);
+        }
+    }
+    apply_native_modal_terminal_diagnostics(solver_diagnostics, *terminal_state)?;
+    build(solver_diagnostics)
+}
+
+fn append_native_modal_partial_artifact(
+    auxiliary_artifacts: &mut Vec<AuxiliaryArtifact>,
+    terminal_state: NativeModalTerminalState,
+    preserved_mode_count: usize,
+) -> Result<(), RunError> {
+    let Some(stop_reason) = terminal_state.partial_stop_reason() else {
+        return Ok(());
+    };
+    auxiliary_artifacts.push(json_artifact(
+        "eigen/partial.v1.json",
+        &serde_json::json!({
+            "schema_version": "fem_k0_modal_partial.v1",
+            "complete": false,
+            "stop_reason": stop_reason,
+            "preserved_mode_count": preserved_mode_count,
+        }),
+    )?);
+    Ok(())
+}
+
 pub(super) fn append_native_modal_terminal_artifacts(
     auxiliary_artifacts: &mut Vec<AuxiliaryArtifact>,
     terminal_state: NativeModalTerminalState,
@@ -508,7 +548,7 @@ pub(super) fn execute_native_modal_window(
         _ => NATIVE_CPU_MODAL_WINDOW_SOLVER_KIND,
     };
     let defer_mode_output_selection_binding = potential_publication.is_some();
-    emit_fem_eigen_progress(
+    let action = emit_fem_eigen_progress(
         &mut progress,
         FemEigenProgress {
             phase: "solving_native_shift_invert",
@@ -530,7 +570,22 @@ pub(super) fn execute_native_modal_window(
             warning: None,
             ..Default::default()
         },
-    )?;
+    );
+    if action != StepAction::Continue {
+        let provenance = if execution_target == native_fem::NativeModalExecutionTarget::ProductionGpu {
+            native_gpu_modal_shared_domain_execution_provenance(plan, None)
+        } else {
+            native_modal_execution_provenance(plan)
+        };
+        return interrupted_fem_eigen_run(
+            action,
+            "solving_native_shift_invert",
+            initial_magnetization.clone(),
+            equilibrium.clone(),
+            Vec::new(),
+            provenance,
+        );
+    }
 
     let shared_domain_requested = shared_domain_k0_modal_requested(plan)
         || native_cpu_modal_window_has_floquet_dynamic_demag_path(plan);
@@ -760,7 +815,7 @@ pub(super) fn execute_native_modal_window(
             }))
         })
         .transpose()?;
-    let stop_requested = AtomicBool::new(false);
+    let requested_control = AtomicU8::new(NativeModalControlRequest::None as u8);
     // Managed qualification can exercise the same native cancellation path as
     // an interactive stop without introducing a second solver implementation.
     // The deadline is opt-in and is intentionally read only by the modal
@@ -771,7 +826,7 @@ pub(super) fn execute_native_modal_window(
         .map(|milliseconds| Instant::now() + Duration::from_millis(milliseconds));
     let live_progress_sink = RefCell::new(progress.take());
     let cancel_callback = || {
-        stop_requested.load(Ordering::Relaxed)
+        requested_control.load(Ordering::Relaxed) != NativeModalControlRequest::None as u8
             || cancellation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
     };
     let progress_callback = |progress_json: &str| {
@@ -785,9 +840,7 @@ pub(super) fn execute_native_modal_window(
             return;
         };
         if let Some(callback) = live_progress_sink.borrow_mut().as_deref_mut() {
-            if callback(event) != StepAction::Continue {
-                stop_requested.store(true, Ordering::Relaxed);
-            }
+            record_native_modal_control_request(&requested_control, callback(event));
         }
     };
     let runner_stiffness_omega =
@@ -931,8 +984,9 @@ pub(super) fn execute_native_modal_window(
     .map_err(|message| RunError { message })?;
     progress = live_progress_sink.into_inner();
 
-    let interrupted = native_result.status == native_fem::NativeFrequencyDomainStatus::Interrupted;
-    if native_result.status != native_fem::NativeFrequencyDomainStatus::Ok && !interrupted {
+    let native_interrupted =
+        native_result.status == native_fem::NativeFrequencyDomainStatus::Interrupted;
+    if native_result.status != native_fem::NativeFrequencyDomainStatus::Ok && !native_interrupted {
         return Err(RunError {
             message: format!(
                 "native FEM modal_eigen production {} solve failed: {} (diagnostics_json={})",
@@ -949,6 +1003,11 @@ pub(super) fn execute_native_modal_window(
             ),
         });
     }
+    let mut terminal_state = NativeModalTerminalState::resolve(
+        native_interrupted,
+        NativeModalControlRequest::from_atomic_value(requested_control.load(Ordering::Relaxed)),
+    );
+    let interrupted = terminal_state.is_interrupted();
     let native_execution_attestation = if let Some(execution) = planned_execution {
         let resolution = execution.resolution().ok_or_else(|| RunError {
             message: "planned_fem_eigen_resolution_missing_at_native_boundary".to_string(),
@@ -1012,20 +1071,7 @@ pub(super) fn execute_native_modal_window(
             }
         }
     }
-    if interrupted {
-        if let Some(object) = solver_diagnostics.as_object_mut() {
-            object.insert("status".to_string(), serde_json::json!("interrupted"));
-            object.insert("complete".to_string(), serde_json::json!(false));
-            object.insert(
-                "stop_reason".to_string(),
-                serde_json::json!("cancel_requested"),
-            );
-            object.insert(
-                "partial_artifacts_available".to_string(),
-                serde_json::json!(true),
-            );
-        }
-    }
+    apply_native_modal_terminal_diagnostics(&mut solver_diagnostics, terminal_state)?;
     let shared_domain_full_reduction =
         shared_domain_mode.then(|| full_physical_magnetic_reduction_map(topology));
     let shared_domain_phases = if shared_domain_mode {
@@ -1120,7 +1166,7 @@ pub(super) fn execute_native_modal_window(
         });
     }
 
-    if !interrupted {
+    let write_action = if !interrupted {
         emit_fem_eigen_progress(
             &mut progress,
             FemEigenProgress {
@@ -1143,8 +1189,10 @@ pub(super) fn execute_native_modal_window(
                 warning: None,
                 ..Default::default()
             },
-        )?;
-    }
+        )
+    } else {
+        StepAction::Continue
+    };
 
     let artifact_reduction = shared_domain_full_reduction.as_ref().unwrap_or(reduction);
     let artifact_node_mass_weights = shared_mode_context_data
@@ -1154,24 +1202,32 @@ pub(super) fn execute_native_modal_window(
             runner_operator
                 .and_then(|(_, mass)| node_mass_weights_from_tangent_mass(mass, active_nodes))
         });
-    let mut auxiliary_artifacts = native_modal_artifacts_with_selection_binding(
-        plan,
-        outputs,
-        &equilibrium,
-        artifact_reduction,
-        bases,
-        &modes,
-        artifact_node_mass_weights.as_deref(),
-        solver_diagnostics,
-        relaxation_steps,
-        shared_domain_linearization_state.as_ref(),
-        source_relax_handoff,
-        relax_to_eigen_handoff.as_ref(),
-        nonshared_floquet_provenance.as_ref(),
-        artifact_sample_index,
-        state_artifact_sample_index,
-        defer_mode_output_selection_binding,
+    let mut auxiliary_artifacts = build_native_modal_artifacts_after_progress(
+        write_action,
+        &mut terminal_state,
+        &mut solver_diagnostics,
+        |solver_diagnostics| {
+            native_modal_artifacts_with_selection_binding(
+                plan,
+                outputs,
+                &equilibrium,
+                artifact_reduction,
+                bases,
+                &modes,
+                artifact_node_mass_weights.as_deref(),
+                solver_diagnostics.clone(),
+                relaxation_steps,
+                shared_domain_linearization_state.as_ref(),
+                source_relax_handoff,
+                relax_to_eigen_handoff.as_ref(),
+                nonshared_floquet_provenance.as_ref(),
+                artifact_sample_index,
+                state_artifact_sample_index,
+                defer_mode_output_selection_binding,
+            )
+        },
     )?;
+    let interrupted = terminal_state.is_interrupted();
     if shared_domain_mode && !interrupted && plan.enable_demag && plan.operator.include_demag {
         let (_, _, _, scalar_classes, scalar_class_count) =
             shared_mode_context_data.as_ref().ok_or_else(|| RunError {
@@ -1219,15 +1275,11 @@ pub(super) fn execute_native_modal_window(
         )?);
     }
     if interrupted {
-        auxiliary_artifacts.push(json_artifact(
-            "eigen/partial.v1.json",
-            &serde_json::json!({
-                "schema_version": "fem_k0_modal_partial.v1",
-                "complete": false,
-                "stop_reason": "cancelled",
-                "preserved_mode_count": modes.len(),
-            }),
-        )?);
+        append_native_modal_partial_artifact(
+            &mut auxiliary_artifacts,
+            terminal_state,
+            modes.len(),
+        )?;
     }
 
     let stats = StepStats {
@@ -1245,7 +1297,7 @@ pub(super) fn execute_native_modal_window(
     };
 
     if !interrupted {
-        emit_fem_eigen_progress(
+        let _ = emit_fem_eigen_progress(
             &mut progress,
             FemEigenProgress {
                 phase: "completed",
@@ -1264,14 +1316,10 @@ pub(super) fn execute_native_modal_window(
                 warning: None,
                 ..Default::default()
             },
-        )?;
+        );
     }
 
-    let status = if interrupted {
-        RunStatus::Cancelled
-    } else {
-        RunStatus::Completed
-    };
+    let status = terminal_state.run_status();
 
     let mut provenance = match execution_target {
         native_fem::NativeModalExecutionTarget::ProductionGpu => {
@@ -1569,7 +1617,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
     mut nonshared_floquet_provenance: Option<NonSharedFloquetProvenance>,
     defer_mode_output_selection_binding: bool,
 ) -> Result<ExecutedRun, RunError> {
-    emit_fem_eigen_progress(
+    let action = emit_fem_eigen_progress(
         &mut progress,
         FemEigenProgress {
             phase: "solving_native_shift_invert",
@@ -1591,7 +1639,17 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
             warning: None,
             ..Default::default()
         },
-    )?;
+    );
+    if action != StepAction::Continue {
+        return interrupted_fem_eigen_run(
+            action,
+            "solving_native_shift_invert",
+            initial_magnetization.clone(),
+            equilibrium.clone(),
+            Vec::new(),
+            native_modal_execution_provenance(plan),
+        );
+    }
 
     let payload = native_bloch_floquet_dense_payload_from_complex_pair(stiffness, mass)?;
     let payload = NativeBlochFloquetDensePayload {
@@ -1719,7 +1777,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
             ),
         });
     }
-    let terminal_state = NativeModalTerminalState::resolve(
+    let mut terminal_state = NativeModalTerminalState::resolve(
         native_interrupted,
         NativeModalControlRequest::from_atomic_value(requested_control.load(Ordering::Relaxed)),
     );
@@ -1805,7 +1863,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
         });
     }
 
-    if !interrupted {
+    let write_action = if !interrupted {
         emit_fem_eigen_progress(
             &mut progress,
             FemEigenProgress {
@@ -1828,27 +1886,37 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
                 warning: None,
                 ..Default::default()
             },
-        )?;
-    }
+        )
+    } else {
+        StepAction::Continue
+    };
 
-    let mut auxiliary_artifacts = native_modal_artifacts_with_selection_binding(
-        plan,
-        outputs,
-        &equilibrium,
-        reduction,
-        bases,
-        &modes,
-        None,
-        solver_diagnostics,
-        relaxation_steps,
-        None,
-        None,
-        None,
-        nonshared_floquet_provenance.as_ref(),
-        artifact_sample_index,
-        state_artifact_sample_index,
-        defer_mode_output_selection_binding,
+    let mut auxiliary_artifacts = build_native_modal_artifacts_after_progress(
+        write_action,
+        &mut terminal_state,
+        &mut solver_diagnostics,
+        |solver_diagnostics| {
+            native_modal_artifacts_with_selection_binding(
+                plan,
+                outputs,
+                &equilibrium,
+                reduction,
+                bases,
+                &modes,
+                None,
+                solver_diagnostics.clone(),
+                relaxation_steps,
+                None,
+                None,
+                None,
+                nonshared_floquet_provenance.as_ref(),
+                artifact_sample_index,
+                state_artifact_sample_index,
+                defer_mode_output_selection_binding,
+            )
+        },
     )?;
+    let interrupted = terminal_state.is_interrupted();
     append_native_modal_terminal_artifacts(
         &mut auxiliary_artifacts,
         terminal_state,
@@ -1871,7 +1939,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
     };
 
     if !interrupted {
-        emit_fem_eigen_progress(
+        let _ = emit_fem_eigen_progress(
             &mut progress,
             FemEigenProgress {
                 phase: "completed",
@@ -1890,7 +1958,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
                 warning: None,
                 ..Default::default()
             },
-        )?;
+        );
     }
 
     let status = terminal_state.run_status();

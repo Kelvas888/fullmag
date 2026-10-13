@@ -3,8 +3,10 @@ use super::eigen_math::frequency_from_eigenvalue;
 use super::eigen_progress::{emit_fem_eigen_progress, FemEigenProgress, FemEigenProgressCallback};
 use super::eigen_types::NativeBlochFloquetDensePayload;
 use crate::native_fem;
-use crate::types::RunError;
-use fullmag_engine::fem_sparse::lobpcg_generalized_with_progress;
+use crate::types::{RunError, StepAction};
+use fullmag_engine::fem_sparse::{
+    lobpcg_generalized_with_control, LobpcgControlAction, LobpcgProgressOutcome,
+};
 use fullmag_engine::fem_sparse::CsrMatrix;
 use fullmag_ir::EigenNormalizationIR;
 use fullmag_ir::FemEigenPlanIR;
@@ -18,6 +20,11 @@ use num_complex::Complex64;
 /// DOF threshold above which LOBPCG sparse eigensolver is used instead of
 /// the dense O(n³) path. Below this, Cholesky + SymmetricEigen is used.
 pub(super) const SPARSE_EIGEN_THRESHOLD: usize = 3_000;
+
+pub(super) enum SparseEigenSolveOutcome {
+    Completed(Vec<RealEigenpair>),
+    Interrupted(StepAction),
+}
 
 /// Convert a dense nalgebra DMatrix to a sparse CsrMatrix, dropping entries
 /// below `drop_tol` in absolute value.
@@ -229,7 +236,7 @@ pub(super) fn solve_real_symmetric_eigenpairs_sparse(
     progress: Option<&mut FemEigenProgressCallback<'_>>,
     active_nodes: usize,
     effective_dof: usize,
-) -> Result<Vec<RealEigenpair>, RunError> {
+) -> Result<SparseEigenSolveOutcome, RunError> {
     let mass = regularize_periodic_mass_if_needed(mass.clone(), &plan.spin_wave_bc);
     let n = stiffness.nrows();
 
@@ -248,12 +255,8 @@ pub(super) fn solve_real_symmetric_eigenpairs_sparse(
             num_modes, solver_modes
         );
     }
-    let mut interrupted: Option<RunError> = None;
     let mut progress = progress;
     let mut progress_callback = |lobpcg: fullmag_engine::fem_sparse::LobpcgProgress| {
-        if interrupted.is_some() {
-            return;
-        }
         let iter_fraction = if lobpcg.max_iterations > 0 {
             f64::from(lobpcg.iteration) / f64::from(lobpcg.max_iterations)
         } else {
@@ -265,7 +268,7 @@ pub(super) fn solve_real_symmetric_eigenpairs_sparse(
             0.0
         };
         let percent = 35.0 + 45.0 * iter_fraction.max(convergence_fraction).min(1.0);
-        let result = emit_fem_eigen_progress(
+        match emit_fem_eigen_progress(
             &mut progress,
             FemEigenProgress {
                 phase: "solving_sparse_lobpcg",
@@ -284,25 +287,37 @@ pub(super) fn solve_real_symmetric_eigenpairs_sparse(
                 warning: sparse_lobpcg_progress_warning(plan, solver_modes, num_modes),
                 ..Default::default()
             },
-        );
-        if let Err(error) = result {
-            interrupted = Some(error);
+        ) {
+            StepAction::Continue => LobpcgControlAction::Continue,
+            StepAction::Stop => LobpcgControlAction::Stop,
+            StepAction::Pause => LobpcgControlAction::Pause,
         }
     };
-    let (sparse_pairs, report) = lobpcg_generalized_with_progress(
+    let (sparse_pairs, report) = match lobpcg_generalized_with_control(
         &k_csr,
         &m_csr,
         solver_modes,
         tol,
         max_iter,
-        Some(&mut progress_callback),
+        &mut progress_callback,
     )
     .map_err(|e| RunError {
         message: format!("sparse LOBPCG eigensolver failed: {}", e.message),
-    })?;
-    if let Some(error) = interrupted {
-        return Err(error);
-    }
+    })? {
+        LobpcgProgressOutcome::Completed { eigenpairs, report } => (eigenpairs, report),
+        LobpcgProgressOutcome::Interrupted { action, .. } => {
+            let action = match action {
+                LobpcgControlAction::Stop => StepAction::Stop,
+                LobpcgControlAction::Pause => StepAction::Pause,
+                LobpcgControlAction::Continue => {
+                    return Err(RunError {
+                        message: "LOBPCG reported an interruption without a control action".into(),
+                    });
+                }
+            };
+            return Ok(SparseEigenSolveOutcome::Interrupted(action));
+        }
+    };
 
     eprintln!(
         "info: sparse LOBPCG converged={} in {} iterations (max_residual={:.2e}, {} candidates)",
@@ -344,7 +359,7 @@ pub(super) fn solve_real_symmetric_eigenpairs_sparse(
         finite_candidate_count,
         eigenpairs.len(),
     )?;
-    Ok(eigenpairs)
+    Ok(SparseEigenSolveOutcome::Completed(eigenpairs))
 }
 
 pub(super) fn sparse_lobpcg_candidate_count(

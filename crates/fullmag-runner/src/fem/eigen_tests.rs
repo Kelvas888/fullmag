@@ -10189,6 +10189,97 @@ fn native_modal_run_result_completion_matches_status() {
 }
 
 #[test]
+fn writing_artifacts_control_preserves_certified_native_mode_bytes() {
+    const MODE_BYTES: &[u8] = b"validated native mode vector bytes\0preserve";
+
+    for (action, expected_state, expected_status, expected_reason) in [
+        (
+            StepAction::Stop,
+            NativeModalTerminalState::Cancelled,
+            RunStatus::Cancelled,
+            "cancelled",
+        ),
+        (
+            StepAction::Pause,
+            NativeModalTerminalState::Paused,
+            RunStatus::Paused,
+            "pause_requested",
+        ),
+    ] {
+        let mut callback = move |event: FemEigenProgress| {
+            if event.phase == "writing_artifacts" {
+                action
+            } else {
+                StepAction::Continue
+            }
+        };
+        let mut progress: Option<&mut FemEigenProgressCallback<'_>> = Some(&mut callback);
+        let write_action = emit_fem_eigen_progress(
+            &mut progress,
+            FemEigenProgress {
+                phase: "writing_artifacts",
+                ..Default::default()
+            },
+        );
+        assert_eq!(write_action, action);
+
+        let mut terminal_state = NativeModalTerminalState::Completed;
+        let mut solver_diagnostics = serde_json::json!({
+            "status": "ready",
+            "complete": true,
+        });
+        let mut artifacts = build_native_modal_artifacts_after_progress(
+            write_action,
+            &mut terminal_state,
+            &mut solver_diagnostics,
+            |diagnostics| {
+                assert_eq!(diagnostics["status"], "interrupted");
+                assert_eq!(diagnostics["complete"], false);
+                Ok(vec![AuxiliaryArtifact {
+                    relative_path: "eigen/mode_fields/sample_0000/mode_0000/vector.bin".into(),
+                    bytes: MODE_BYTES.to_vec(),
+                }])
+            },
+        )
+        .expect("artifact builder runs after terminal control is recorded");
+        append_native_modal_partial_artifact(&mut artifacts, terminal_state, 1)
+            .expect("partial status is recorded with preserved mode count");
+
+        assert_eq!(terminal_state, expected_state);
+        assert_eq!(terminal_state.run_status(), expected_status);
+        assert_ne!(terminal_state, NativeModalTerminalState::Completed);
+        assert_eq!(solver_diagnostics["complete"], false);
+        assert_eq!(
+            solver_diagnostics["stop_reason"],
+            match action {
+                StepAction::Stop => "cancel_requested",
+                StepAction::Pause => "pause_requested",
+                StepAction::Continue => unreachable!(),
+            }
+        );
+        assert_eq!(
+            artifacts
+                .iter()
+                .find(|artifact| artifact.relative_path
+                    == "eigen/mode_fields/sample_0000/mode_0000/vector.bin")
+                .expect("certified mode artifact remains present")
+                .bytes
+                .as_slice(),
+            MODE_BYTES
+        );
+        let partial = artifacts
+            .iter()
+            .find(|artifact| artifact.relative_path == "eigen/partial.v1.json")
+            .expect("terminal partial artifact");
+        let partial: serde_json::Value =
+            serde_json::from_slice(&partial.bytes).expect("partial artifact JSON");
+        assert_eq!(partial["complete"], false);
+        assert_eq!(partial["stop_reason"], expected_reason);
+        assert_eq!(partial["preserved_mode_count"], 1);
+    }
+}
+
+#[test]
 fn direct_floquet_runtime_control_preserves_pause_and_stop_reasons() {
     let pause_request = AtomicU8::new(NativeModalControlRequest::None as u8);
     record_native_modal_control_request(&pause_request, StepAction::Pause);
@@ -10207,12 +10298,19 @@ fn direct_floquet_runtime_control_preserves_pause_and_stop_reasons() {
         NativeModalControlRequest::from_atomic_value(stop_request.load(Ordering::Relaxed)),
         NativeModalControlRequest::Stop
     );
-    let pause_wins = AtomicU8::new(NativeModalControlRequest::None as u8);
-    record_native_modal_control_request(&pause_wins, StepAction::Stop);
-    record_native_modal_control_request(&pause_wins, StepAction::Pause);
+    let pause_then_stop = AtomicU8::new(NativeModalControlRequest::None as u8);
+    record_native_modal_control_request(&pause_then_stop, StepAction::Pause);
+    record_native_modal_control_request(&pause_then_stop, StepAction::Stop);
     assert_eq!(
-        NativeModalControlRequest::from_atomic_value(pause_wins.load(Ordering::Relaxed)),
-        NativeModalControlRequest::Pause
+        NativeModalControlRequest::from_atomic_value(pause_then_stop.load(Ordering::Relaxed)),
+        NativeModalControlRequest::Stop
+    );
+    let stop_then_pause = AtomicU8::new(NativeModalControlRequest::None as u8);
+    record_native_modal_control_request(&stop_then_pause, StepAction::Stop);
+    record_native_modal_control_request(&stop_then_pause, StepAction::Pause);
+    assert_eq!(
+        NativeModalControlRequest::from_atomic_value(stop_then_pause.load(Ordering::Relaxed)),
+        NativeModalControlRequest::Stop
     );
 
     let paused =
@@ -10905,40 +11003,55 @@ fn eigen_path_mass_weights_sum_physical_nodes_into_floquet_classes() {
 }
 
 #[test]
-fn eigen_path_forwards_stop_before_single_k_execution() {
-    let mut plan = minimal_native_modal_plan();
-    plan.k_sampling = Some(KSamplingIR::Path {
-        points: vec![
-            fullmag_ir::KPointIR {
-                label: Some("Gamma".into()),
-                k_vector: [0.0; 3],
-            },
-            fullmag_ir::KPointIR {
-                label: Some("X".into()),
-                k_vector: [1.0, 0.0, 0.0],
-            },
-        ],
-        samples_per_segment: vec![1],
-        closed: false,
-    });
-    let mut phases = Vec::new();
-    let mut callback = |event: FemEigenProgress| {
-        phases.push(event.phase);
-        StepAction::Stop
-    };
-    let error = crate::dispatch::execute_fem_eigen_with_progress(
-        PlannedFemEigenExecution::legacy(FemEigenExecutionLane::Cpu),
-        &plan,
-        &[],
-        &mut callback,
-    )
-    .expect_err("path must honour Stop before entering the native solver");
-    assert!(
-        error.message.contains("interrupted by runtime control"),
-        "{}",
-        error.message
-    );
-    assert_eq!(phases, vec!["preparing_k_path_sample"]);
+fn eigen_path_returns_typed_partial_for_stop_and_pause_before_single_k_execution() {
+    for (action, expected_status, expected_reason) in [
+        (StepAction::Stop, RunStatus::Cancelled, "cancelled"),
+        (StepAction::Pause, RunStatus::Paused, "pause_requested"),
+    ] {
+        let mut plan = minimal_native_modal_plan();
+        plan.k_sampling = Some(KSamplingIR::Path {
+            points: vec![
+                fullmag_ir::KPointIR {
+                    label: Some("Gamma".into()),
+                    k_vector: [0.0; 3],
+                },
+                fullmag_ir::KPointIR {
+                    label: Some("X".into()),
+                    k_vector: [1.0, 0.0, 0.0],
+                },
+            ],
+            samples_per_segment: vec![1],
+            closed: false,
+        });
+        let mut phases = Vec::new();
+        let mut callback = |event: FemEigenProgress| {
+            phases.push(event.phase);
+            action
+        };
+        let run = crate::dispatch::execute_fem_eigen_with_progress(
+            PlannedFemEigenExecution::legacy(FemEigenExecutionLane::Cpu),
+            &plan,
+            &[],
+            &mut callback,
+        )
+        .expect("active runtime control should return a typed partial result");
+
+        assert_eq!(run.result.status, expected_status);
+        assert_eq!(phases, vec!["preparing_k_path_sample"]);
+        let partial = run
+            .auxiliary_artifacts
+            .iter()
+            .find(|artifact| artifact.relative_path == "eigen/partial.v1.json")
+            .expect("interrupted path should publish a partial diagnostic");
+        let partial: serde_json::Value = serde_json::from_slice(&partial.bytes).unwrap();
+        assert_eq!(partial["complete"], false);
+        assert_eq!(partial["stop_reason"], expected_reason);
+        assert_eq!(partial["preserved_mode_count"], 0);
+        assert!(run
+            .auxiliary_artifacts
+            .iter()
+            .all(|artifact| artifact.relative_path != "eigen/spectrum.json"));
+    }
 }
 
 #[test]

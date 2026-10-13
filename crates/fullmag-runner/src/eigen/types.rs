@@ -1,5 +1,6 @@
 pub use super::tracking_mass::ConsistentP1TrackingMetric;
 use fullmag_ir::{FemEigenDispersionValidationIR, FemEigenK0KittelValidationIR};
+use crate::types::StepAction;
 use num_complex::Complex64;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -443,6 +444,12 @@ pub struct SingleKSolveResult {
     pub solver_diagnostics: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum SingleKSolveOutcome {
+    Completed(SingleKSolveResult),
+    Interrupted(StepAction),
+}
+
 /// Evidence recorded at assignment time, rather than inferred by artifact writers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrackingEdgeProvenance {
@@ -565,6 +572,15 @@ pub struct PathSolveResult {
     pub solver_policy: Option<fullmag_ir::FemEigenSolverPolicyIR>,
     pub dispersion_analytic_reference: Option<DispersionAnalyticReferenceContext>,
     pub k0_kittel_periodic_airbox_demag: Option<K0KittelPeriodicAirboxDemagMetrics>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PathSolveOutcome {
+    Completed(PathSolveResult),
+    Interrupted {
+        action: StepAction,
+        accepted_prefix: Option<PathSolveResult>,
+    },
 }
 
 #[cfg(test)]

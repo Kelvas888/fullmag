@@ -118,6 +118,21 @@ pub(super) enum SingleKCheckpointAdmission {
     Interrupted(InterruptedSingleK),
 }
 
+enum CachedSingleKOrControl<T> {
+    Cached(T),
+    Control(StepAction),
+}
+
+fn cached_single_k_before_control<T>(
+    cached: Option<T>,
+    active_control: impl FnOnce() -> Result<StepAction, RunError>,
+) -> Result<CachedSingleKOrControl<T>, RunError> {
+    match cached {
+        Some(cached) => Ok(CachedSingleKOrControl::Cached(cached)),
+        None => active_control().map(CachedSingleKOrControl::Control),
+    }
+}
+
 pub(super) fn checkpoint_and_admit_single_k(
     checkpoint_root: Option<&Path>,
     sample: &KSampleDescriptor,
@@ -3247,8 +3262,13 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
         )?;
     }
 
-    use crate::eigen::{
-        run_path_or_single, KSampleDescriptor, SingleKModeResult, SingleKSolveResult, SingleKSolver,
+    use crate::eigen::orchestrator::{
+        run_path_or_single_controlled, run_path_prefix_or_single_controlled,
+        ControlledSingleKSolver,
+    };
+    use crate::eigen::types::{
+        KSampleDescriptor, PathSolveOutcome, SingleKModeResult, SingleKSolveOutcome,
+        SingleKSolveResult,
     };
     use crate::types::AuxiliaryArtifact;
     use std::cell::RefCell;
@@ -3272,65 +3292,13 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
         parallel_report: Option<crate::eigen::k_process_pool::ProcessPoolReportV1>,
     }
 
-    impl SingleKSolver for KSolverAdapter<'_, '_, '_> {
-        fn solve_single_k(
+    impl ControlledSingleKSolver for KSolverAdapter<'_, '_, '_> {
+        fn solve_single_k_controlled(
             &self,
             plan: &FemEigenPlanIR,
             outputs: &[OutputIR],
             sample: &KSampleDescriptor,
-        ) -> Result<SingleKSolveResult, crate::types::RunError> {
-            {
-                let mut sink = self.progress.lock().map_err(|_| RunError {
-                    message: "eigen path progress callback lock poisoned".to_string(),
-                })?;
-                super::eigen_progress::emit_fem_eigen_progress(
-                    &mut *sink,
-                    fem_eigen::FemEigenProgress {
-                        phase: "preparing_k_path_sample",
-                        requested_modes: plan.count as usize,
-                        ..Default::default()
-                    },
-                )?;
-            }
-            if let Some(precomputed) = self.precomputed.borrow_mut().remove(&sample.sample_index) {
-                if precomputed.final_magnetization.len() != plan.mesh.nodes.len()
-                    || precomputed
-                        .final_magnetization
-                        .iter()
-                        .flatten()
-                        .any(|value| !value.is_finite())
-                {
-                    return Err(RunError {
-                        message: format!(
-                            "adaptive worker sample {} did not produce a finite accepted equilibrium",
-                            sample.sample_index
-                        ),
-                    });
-                }
-                if let Some(metrics) =
-                    eigen_path_periodic_airbox_k0_metrics_from_single_k_artifacts(
-                        plan,
-                        &precomputed.mode_artifacts,
-                    )?
-                {
-                    eigen_path_merge_periodic_airbox_k0_metrics(
-                        &mut self.periodic_airbox_k0_metrics.borrow_mut(),
-                        metrics,
-                    )?;
-                }
-                self.mode_artifacts
-                    .borrow_mut()
-                    .extend(precomputed.mode_artifacts);
-                *self.previous_accepted_magnetization.borrow_mut() =
-                    Some(precomputed.final_magnetization);
-                return Ok(precomputed.result);
-            }
-
-            if k0_kittel_synthetic_demag_factor_enabled(plan) && plan.bias_field_samples.is_empty()
-            {
-                return solve_k0_kittel_synthetic_demag_factor_single_k(plan, sample);
-            }
-
+        ) -> Result<SingleKSolveOutcome, crate::types::RunError> {
             let source_stage_handoff =
                 relax_stage_handoff_for_path_sample(plan, self.source_relax_handoff.as_ref());
             let mut point_plan = eigen_path_single_k_point_plan(plan, sample, false, None)?;
@@ -3358,6 +3326,99 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
                 point_plan.bias_field_samples = prepared.bias_field_samples;
                 point_plan.k0_kittel_validation = prepared.k0_kittel_validation;
             }
+            let sample_control = cached_single_k_before_control(
+                self.precomputed.borrow_mut().remove(&sample.sample_index),
+                || {
+                    let mut sink = self.progress.lock().map_err(|_| RunError {
+                        message: "eigen path progress callback lock poisoned".to_string(),
+                    })?;
+                    Ok(super::eigen_progress::emit_fem_eigen_progress(
+                        &mut *sink,
+                        fem_eigen::FemEigenProgress {
+                            phase: "preparing_k_path_sample",
+                            requested_modes: plan.count as usize,
+                            ..Default::default()
+                        },
+                    ))
+                },
+            )?;
+            match sample_control {
+                CachedSingleKOrControl::Cached(precomputed) => {
+                    if precomputed.final_magnetization.len() != plan.mesh.nodes.len()
+                        || precomputed
+                            .final_magnetization
+                            .iter()
+                            .flatten()
+                            .any(|value| !value.is_finite())
+                    {
+                        return Err(RunError {
+                            message: format!(
+                                "adaptive worker sample {} did not produce a finite accepted equilibrium",
+                                sample.sample_index
+                            ),
+                        });
+                    }
+                    if let Some(metrics) =
+                        eigen_path_periodic_airbox_k0_metrics_from_single_k_artifacts(
+                            plan,
+                            &precomputed.mode_artifacts,
+                        )?
+                    {
+                        eigen_path_merge_periodic_airbox_k0_metrics(
+                            &mut self.periodic_airbox_k0_metrics.borrow_mut(),
+                            metrics,
+                        )?;
+                    }
+                    self.mode_artifacts
+                        .borrow_mut()
+                        .extend(precomputed.mode_artifacts);
+                    *self.previous_accepted_magnetization.borrow_mut() =
+                        Some(precomputed.final_magnetization);
+                    return Ok(SingleKSolveOutcome::Completed(precomputed.result));
+                }
+                CachedSingleKOrControl::Control(
+                    action @ (crate::types::StepAction::Stop | crate::types::StepAction::Pause),
+                ) =>
+                {
+                    let mut provenance = crate::types::ExecutionProvenance::default();
+                    self.execution.bind_execution_provenance(&mut provenance);
+                    let partial = super::eigen_execution::interrupted_fem_eigen_run(
+                        action,
+                        "preparing_k_path_sample",
+                        point_plan.equilibrium_magnetization.clone(),
+                        self.previous_accepted_magnetization
+                            .borrow()
+                            .clone()
+                            .unwrap_or_else(|| point_plan.equilibrium_magnetization.clone()),
+                        Vec::new(),
+                        provenance,
+                    )?;
+                    let interrupted = match checkpoint_and_admit_single_k(
+                        self.checkpoint_root.as_deref(),
+                        sample,
+                        &point_plan,
+                        &partial,
+                    )? {
+                        SingleKCheckpointAdmission::Interrupted(interrupted) => interrupted,
+                        SingleKCheckpointAdmission::Completed => {
+                            return Err(RunError {
+                                message: "preparing-k-path control interruption completed unexpectedly"
+                                    .into(),
+                            });
+                        }
+                    };
+                    *self.interrupted_single_k.borrow_mut() = Some(interrupted);
+                    return Ok(SingleKSolveOutcome::Interrupted(action));
+                }
+                CachedSingleKOrControl::Control(crate::types::StepAction::Continue) => {}
+            }
+
+            if k0_kittel_synthetic_demag_factor_enabled(plan) && plan.bias_field_samples.is_empty()
+            {
+                return solve_k0_kittel_synthetic_demag_factor_single_k(plan, sample)
+                    .map(SingleKSolveOutcome::Completed);
+            }
+
             let tracking_topology =
                 MeshTopology::from_ir(&point_plan.mesh).map_err(|error| RunError {
                     message: format!("eigen path tracking mesh topology: {error}"),
@@ -3450,13 +3511,20 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
                 SingleKCheckpointAdmission::Completed => {}
                 SingleKCheckpointAdmission::Interrupted(interrupted) => {
                     let status = interrupted.status;
+                    let action = match status {
+                        RunStatus::Cancelled => crate::types::StepAction::Stop,
+                        RunStatus::Paused => crate::types::StepAction::Pause,
+                        _ => {
+                            return Err(RunError {
+                                message: format!(
+                                    "FEM eigen path sample {} returned non-control status {status:?}",
+                                    sample.sample_index
+                                ),
+                            });
+                        }
+                    };
                     *self.interrupted_single_k.borrow_mut() = Some(interrupted);
-                    return Err(RunError {
-                        message: format!(
-                            "FEM eigen path sample {} ended with status {status:?}",
-                            sample.sample_index
-                        ),
-                    });
+                    return Ok(SingleKSolveOutcome::Interrupted(action));
                 }
             }
             {
@@ -3664,7 +3732,7 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
                 );
             }
 
-            Ok(SingleKSolveResult {
+            Ok(SingleKSolveOutcome::Completed(SingleKSolveResult {
                 sample: sample.clone(),
                 modes,
                 relaxation_steps,
@@ -3674,7 +3742,7 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
                 ),
                 solver_notes: vec![solver_kind],
                 solver_diagnostics,
-            })
+            }))
         }
     }
 
@@ -3794,14 +3862,14 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
         parallel_report,
     };
     let path_solve = match pool_interruption {
-        Some((_, accepted_prefix_len)) => crate::eigen::orchestrator::run_path_prefix_or_single(
+        Some((_, accepted_prefix_len)) => run_path_prefix_or_single_controlled(
             &adapter,
             plan,
             &tracking_outputs,
             accepted_prefix_len,
             plan.mode_tracking.as_ref(),
         ),
-        None => run_path_or_single(
+        None => run_path_or_single_controlled(
             &adapter,
             plan,
             &tracking_outputs,
@@ -3810,25 +3878,46 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
             plan.mode_tracking.as_ref(),
         ),
     };
-    let mut path_result = match path_solve {
-        Ok(result) => result,
+    let (mut path_result, direct_interruption) = match path_solve {
+        Ok(PathSolveOutcome::Completed(result)) => (result, None),
+        Ok(PathSolveOutcome::Interrupted {
+            action,
+            accepted_prefix: Some(result),
+        }) => {
+            let interrupted = adapter.interrupted_single_k.borrow_mut().take().ok_or_else(|| {
+                RunError {
+                    message: "controlled single-k interruption is missing its terminal record"
+                        .into(),
+                }
+            })?;
+            (result, Some((action, interrupted)))
+        }
+        Ok(PathSolveOutcome::Interrupted {
+            action: _,
+            accepted_prefix: None,
+        }) => {
+            let interrupted = adapter.interrupted_single_k.borrow_mut().take().ok_or_else(|| {
+                RunError {
+                    message: "controlled single-k interruption is missing its terminal record"
+                        .into(),
+                }
+            })?;
+            let accepted_magnetization = adapter
+                .previous_accepted_magnetization
+                .borrow()
+                .clone()
+                .or_else(|| {
+                    source_relax_handoff
+                        .map(|handoff| handoff.equilibrium_magnetization.clone())
+                })
+                .unwrap_or_else(|| plan.equilibrium_magnetization.clone());
+            return Ok(interrupted_eigen_path_run(
+                plan,
+                interrupted,
+                accepted_magnetization,
+            ));
+        }
         Err(error) => {
-            if let Some(interrupted) = adapter.interrupted_single_k.borrow_mut().take() {
-                let accepted_magnetization = adapter
-                    .previous_accepted_magnetization
-                    .borrow()
-                    .clone()
-                    .or_else(|| {
-                        source_relax_handoff
-                            .map(|handoff| handoff.equilibrium_magnetization.clone())
-                    })
-                    .unwrap_or_else(|| plan.equilibrium_magnetization.clone());
-                return Ok(interrupted_eigen_path_run(
-                    plan,
-                    interrupted,
-                    accepted_magnetization,
-                ));
-            }
             return Err(error);
         }
     };
@@ -3853,7 +3942,7 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
     if periodic_airbox_k0_runtime_supported(plan) && engine == FemEngine::NativeGpu {
         path_result.solver_model = crate::eigen::EigenSolverModel::ProductionGpuModalDeviceKrylov;
     }
-    let selection = if pool_interruption.is_some() {
+    let selection = if pool_interruption.is_some() || direct_interruption.is_some() {
         let planned_samples = crate::eigen::expand_k_sampling(plan.k_sampling.as_ref())
             .map_err(|message| RunError { message })?;
         select_eigen_outputs_with_planned_sample_descriptors(
@@ -4486,6 +4575,36 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
             serde_json::json!(path_result.samples.len()),
         );
         diagnostics.insert("interrupted".into(), serde_json::json!(true));
+    } else if direct_interruption.is_some() {
+        let requested_frequency_point_count = crate::eigen::expand_k_sampling(
+            plan.k_sampling.as_ref(),
+        )
+        .map_err(|message| RunError { message })?
+        .len();
+        let diagnostics = frequency_domain_manifest
+            .get_mut("diagnostics")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| RunError {
+                message: "k-path frequency-domain manifest has no diagnostics object".into(),
+            })?;
+        diagnostics.insert("status".into(), serde_json::json!("interrupted"));
+        diagnostics.insert("complete".into(), serde_json::json!(false));
+        diagnostics.insert(
+            "requested_frequency_point_count".into(),
+            serde_json::json!(requested_frequency_point_count),
+        );
+        diagnostics.insert(
+            "completed_frequency_point_count".into(),
+            serde_json::json!(path_result.samples.len()),
+        );
+        diagnostics.insert("interrupted".into(), serde_json::json!(true));
+        diagnostics.insert(
+            "stop_reason".into(),
+            serde_json::json!(match direct_interruption.as_ref().map(|(action, _)| action) {
+                Some(StepAction::Pause) => "pause_requested",
+                _ => "cancel_requested",
+            }),
+        );
     }
     let Some(artifacts) = frequency_domain_manifest
         .get_mut("artifacts")
@@ -4511,6 +4630,9 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
             })?,
     });
     auxiliary_artifacts.extend(mode_artifacts);
+    if let Some((_, interrupted)) = direct_interruption.as_ref() {
+        auxiliary_artifacts.extend(interrupted.diagnostic_artifacts.clone());
+    }
     if let Some(report) = parallel_report {
         let pool_artifacts = pool_report_bundle(
             &report,
@@ -4522,7 +4644,16 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
 
     let terminal_status = match pool_interruption {
         Some((action, _)) => pool_interruption_status(action)?,
-        None => RunStatus::Completed,
+        None => match direct_interruption.as_ref().map(|(action, _)| action) {
+            Some(StepAction::Stop) => RunStatus::Cancelled,
+            Some(StepAction::Pause) => RunStatus::Paused,
+            Some(StepAction::Continue) => {
+                return Err(RunError {
+                    message: "path interruption carried Continue".into(),
+                });
+            }
+            None => RunStatus::Completed,
+        },
     };
     let mut provenance = crate::ExecutionProvenance::default();
     execution.bind_execution_provenance(&mut provenance);
@@ -4550,7 +4681,11 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
 #[cfg(test)]
 mod checkpoint_admission_tests {
     use super::*;
-    use crate::eigen::{run_path_or_single, EigenSolverModel, SingleKSolver};
+    use crate::eigen::orchestrator::{run_path_or_single_controlled, ControlledSingleKSolver};
+    use crate::eigen::types::{
+        EigenSolverModel, PathSolveOutcome, SingleKModeResult, SingleKSolveOutcome,
+        SingleKSolveResult,
+    };
     use crate::types::{ExecutionProvenance, RunResult};
     use std::cell::{Cell, RefCell};
     use std::fs;
@@ -4570,6 +4705,143 @@ mod checkpoint_admission_tests {
             RunStatus::Cancelled
         );
         assert!(pool_interruption_status(StepAction::Continue).is_err());
+    }
+
+    struct CachedPoolPrefixWithPersistentControl {
+        action: StepAction,
+        calls: Cell<usize>,
+        active_control_calls: Cell<usize>,
+    }
+
+    impl ControlledSingleKSolver for CachedPoolPrefixWithPersistentControl {
+        fn solve_single_k_controlled(
+            &self,
+            _plan: &FemEigenPlanIR,
+            _outputs: &[OutputIR],
+            sample: &KSampleDescriptor,
+        ) -> Result<SingleKSolveOutcome, RunError> {
+            self.calls.set(self.calls.get() + 1);
+            let cached = (sample.sample_index == 0).then(|| SingleKSolveResult {
+                sample: sample.clone(),
+                modes: Vec::new(),
+                relaxation_steps: 0,
+                solver_model: EigenSolverModel::ReferenceScalarTangent,
+                solver_notes: vec!["completed adaptive-pool sample".into()],
+                solver_diagnostics: None,
+            });
+            match cached_single_k_before_control(cached, || {
+                self.active_control_calls
+                    .set(self.active_control_calls.get() + 1);
+                Ok(self.action)
+            })? {
+                CachedSingleKOrControl::Cached(result) => {
+                    Ok(SingleKSolveOutcome::Completed(result))
+                }
+                CachedSingleKOrControl::Control(action) => {
+                    Ok(SingleKSolveOutcome::Interrupted(action))
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_pool_prefix_precedes_persistent_stop_or_pause() {
+        for action in [StepAction::Stop, StepAction::Pause] {
+            let plan = three_sample_plan();
+            let solver = CachedPoolPrefixWithPersistentControl {
+                action,
+                calls: Cell::new(0),
+                active_control_calls: Cell::new(0),
+            };
+
+            let outcome = run_path_or_single_controlled(&solver, &plan, &[], None, None, None)
+                .expect("completed pool prefix should survive active control");
+            match outcome {
+                PathSolveOutcome::Interrupted {
+                    action: actual_action,
+                    accepted_prefix: Some(prefix),
+                } => {
+                    assert_eq!(actual_action, action);
+                    assert_eq!(prefix.samples.len(), 1);
+                    assert_eq!(prefix.samples[0].sample.sample_index, 0);
+                }
+                other => panic!("unexpected controlled path outcome: {other:?}"),
+            }
+            assert_eq!(solver.calls.get(), 2, "uncached later samples are not admitted");
+            assert_eq!(
+                solver.active_control_calls.get(),
+                1,
+                "control is checked only after the completed cached sample"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_sample_diagnostics_do_not_collide_with_accepted_prefix_paths() {
+        let plan = three_sample_plan();
+        let mut samples = crate::eigen::expand_k_sampling(plan.k_sampling.as_ref())
+            .expect("valid test path");
+        let sample = samples.remove(1);
+        let point_plan = eigen_path_single_k_point_plan(&plan, &sample, false, None)
+            .expect("valid point plan");
+        let run = ExecutedRun {
+            result: RunResult {
+                status: RunStatus::Paused,
+                steps: Vec::new(),
+                final_magnetization: plan.equilibrium_magnetization.clone(),
+                completion: Some(crate::relaxation::resolve_stage_completion(
+                    RunStatus::Paused,
+                    None,
+                    crate::relaxation::RelaxationCompletionMetrics::default(),
+                )),
+            },
+            initial_magnetization: plan.equilibrium_magnetization.clone(),
+            field_snapshots: Vec::new(),
+            field_snapshot_count: 0,
+            auxiliary_artifacts: vec![
+                AuxiliaryArtifact {
+                    relative_path: "eigen/diagnostics/solver.v1.json".into(),
+                    bytes: b"solver diagnostic".to_vec(),
+                },
+                AuxiliaryArtifact {
+                    relative_path: "eigen/partial.v1.json".into(),
+                    bytes: b"partial diagnostic".to_vec(),
+                },
+            ],
+            provenance: ExecutionProvenance::default(),
+        };
+
+        let interrupted = match checkpoint_and_admit_single_k(None, &sample, &point_plan, &run)
+            .expect("sample-local diagnostic admission")
+        {
+            SingleKCheckpointAdmission::Interrupted(interrupted) => interrupted,
+            SingleKCheckpointAdmission::Completed => panic!("paused sample cannot be admitted"),
+        };
+        let mut combined_paths = vec![
+            "eigen/diagnostics/solver.v1.json".to_string(),
+            "eigen/partial.v1.json".to_string(),
+        ];
+        combined_paths.extend(
+            interrupted
+                .diagnostic_artifacts
+                .iter()
+                .map(|artifact| artifact.relative_path.clone()),
+        );
+        let unique_paths = combined_paths.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique_paths.len(), combined_paths.len());
+        assert!(interrupted.diagnostic_artifacts.iter().all(|artifact| {
+            artifact
+                .relative_path
+                .starts_with("eigen/diagnostics/raw_single_k/sample_0001/")
+        }));
+        assert!(interrupted
+            .diagnostic_artifacts
+            .iter()
+            .any(|artifact| artifact.relative_path.ends_with("/solver.v1.json")));
+        assert!(interrupted
+            .diagnostic_artifacts
+            .iter()
+            .any(|artifact| artifact.relative_path.ends_with("/partial.v1.json")));
     }
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -4886,13 +5158,13 @@ mod checkpoint_admission_tests {
         }
     }
 
-    impl SingleKSolver for CheckpointAdmissionSolver {
-        fn solve_single_k(
+    impl ControlledSingleKSolver for CheckpointAdmissionSolver {
+        fn solve_single_k_controlled(
             &self,
             plan: &FemEigenPlanIR,
             _outputs: &[OutputIR],
             sample: &KSampleDescriptor,
-        ) -> Result<SingleKSolveResult, RunError> {
+        ) -> Result<SingleKSolveOutcome, RunError> {
             self.calls.set(self.calls.get() + 1);
             let status = self
                 .interrupt_at
@@ -4943,20 +5215,27 @@ mod checkpoint_admission_tests {
                     self.publication_count.set(self.publication_count.get() + 1);
                     *self.last_accepted_magnetization.borrow_mut() =
                         Some(run.result.final_magnetization.clone());
-                    Ok(SingleKSolveResult {
+                    Ok(SingleKSolveOutcome::Completed(SingleKSolveResult {
                         sample: sample.clone(),
                         modes: Vec::new(),
                         relaxation_steps: 0,
                         solver_model: EigenSolverModel::ReferenceScalarTangent,
                         solver_notes: Vec::new(),
                         solver_diagnostics: None,
-                    })
+                    }))
                 }
                 SingleKCheckpointAdmission::Interrupted(interrupted) => {
+                    let action = match interrupted.status {
+                        RunStatus::Cancelled => StepAction::Stop,
+                        RunStatus::Paused => StepAction::Pause,
+                        _ => {
+                            return Err(RunError {
+                                message: "test interruption status is not a control result".into(),
+                            });
+                        }
+                    };
                     *self.interrupted.borrow_mut() = Some(interrupted);
-                    Err(RunError {
-                        message: "test solver stopped after a typed terminal status".into(),
-                    })
+                    Ok(SingleKSolveOutcome::Interrupted(action))
                 }
             }
         }
@@ -4979,8 +5258,27 @@ mod checkpoint_admission_tests {
             let plan = three_sample_plan();
             let solver = CheckpointAdmissionSolver::new(checkpoint_root.path(), Some((1, status)));
 
-            let error = run_path_or_single(&solver, &plan, &[], None, None, None)
-                .expect_err("a noncompleted sample must stop the k path");
+            let outcome = run_path_or_single_controlled(&solver, &plan, &[], None, None, None);
+            let error = if status == RunStatus::Failed {
+                Some(outcome.expect_err("failed sample status must remain a solver error"))
+            } else {
+                let expected_action = if status == RunStatus::Paused {
+                    StepAction::Pause
+                } else {
+                    StepAction::Stop
+                };
+                match outcome.expect("controlled interruption should return a typed outcome") {
+                    PathSolveOutcome::Interrupted {
+                        action,
+                        accepted_prefix: Some(prefix),
+                    } => {
+                        assert_eq!(action, expected_action);
+                        assert_eq!(prefix.samples.len(), 1);
+                    }
+                    other => panic!("expected interrupted accepted prefix, got {other:?}"),
+                }
+                None
+            };
 
             assert_eq!(solver.calls.get(), 2, "the following k sample must not run");
             assert_eq!(solver.parse_count.get(), 1);
@@ -5032,7 +5330,11 @@ mod checkpoint_admission_tests {
                 }
                 RunStatus::Failed => {
                     assert!(solver.interrupted.borrow().is_none());
-                    assert!(error.message.contains("returned failed status"));
+                    assert!(error
+                        .as_ref()
+                        .expect("failed status retains its error")
+                        .message
+                        .contains("returned failed status"));
                 }
                 RunStatus::Completed => unreachable!("completed is not part of this test"),
             }
@@ -5045,8 +5347,12 @@ mod checkpoint_admission_tests {
         let plan = three_sample_plan();
         let solver = CheckpointAdmissionSolver::new(checkpoint_root.path(), None);
 
-        let result = run_path_or_single(&solver, &plan, &[], None, None, None)
-            .expect("completed samples should aggregate normally");
+        let result = match run_path_or_single_controlled(&solver, &plan, &[], None, None, None)
+            .expect("completed samples should aggregate normally")
+        {
+            PathSolveOutcome::Completed(result) => result,
+            other => panic!("expected completed path, got {other:?}"),
+        };
 
         assert_eq!(result.samples.len(), 3);
         assert_eq!(solver.calls.get(), 3);

@@ -1,4 +1,3 @@
-use crate::types::RunError;
 use crate::types::{LiveParallelExecutionTelemetry, StepAction};
 
 #[derive(Debug, Clone, Default)]
@@ -44,20 +43,16 @@ pub(crate) type FemEigenProgressCallback<'a> =
 pub(super) fn emit_fem_eigen_progress(
     progress: &mut Option<&mut FemEigenProgressCallback<'_>>,
     event: FemEigenProgress,
-) -> Result<(), RunError> {
+) -> StepAction {
     let completed_notification = event.phase == "completed";
     if let Some(callback) = progress.as_deref_mut() {
-        match callback(event) {
-            StepAction::Continue => {}
-            StepAction::Stop | StepAction::Pause if completed_notification => {}
-            StepAction::Stop | StepAction::Pause => {
-                return Err(RunError {
-                    message: "FEM eigen solve was interrupted by runtime control".to_string(),
-                });
-            }
+        match (callback(event), completed_notification) {
+            (StepAction::Stop | StepAction::Pause, true) => StepAction::Continue,
+            (action, _) => action,
         }
+    } else {
+        StepAction::Continue
     }
-    Ok(())
 }
 
 pub(super) fn native_modal_progress_event(
@@ -208,14 +203,14 @@ mod tests {
             };
             let mut progress = Some(&mut callback as &mut FemEigenProgressCallback<'_>);
 
-            emit_fem_eigen_progress(
+            let observed_action = emit_fem_eigen_progress(
                 &mut progress,
                 FemEigenProgress {
                     phase: "completed",
                     ..Default::default()
                 },
-            )
-            .expect("terminal progress action must not discard the completed result");
+            );
+            assert_eq!(observed_action, StepAction::Continue);
             drop(progress);
             drop(callback);
             assert_eq!(observed_phase, Some("completed"));
@@ -232,17 +227,14 @@ mod tests {
             };
             let mut progress = Some(&mut callback as &mut FemEigenProgressCallback<'_>);
 
-            let error = emit_fem_eigen_progress(
+            let observed_action = emit_fem_eigen_progress(
                 &mut progress,
                 FemEigenProgress {
                     phase: "solving_native_shift_invert",
                     ..Default::default()
                 },
-            )
-            .expect_err("active progress action must still interrupt the solve");
-            assert!(error
-                .message
-                .contains("FEM eigen solve was interrupted by runtime control"));
+            );
+            assert_eq!(observed_action, action);
             drop(progress);
             drop(callback);
             assert_eq!(observed_phase, Some("solving_native_shift_invert"));
@@ -258,22 +250,20 @@ mod tests {
         };
         let mut progress = Some(&mut callback as &mut FemEigenProgressCallback<'_>);
 
-        emit_fem_eigen_progress(
+        assert_eq!(emit_fem_eigen_progress(
             &mut progress,
             FemEigenProgress {
                 phase: "solving_native_shift_invert",
                 ..Default::default()
             },
-        )
-        .expect("active Continue action must proceed");
-        emit_fem_eigen_progress(
+        ), StepAction::Continue);
+        assert_eq!(emit_fem_eigen_progress(
             &mut progress,
             FemEigenProgress {
                 phase: "completed",
                 ..Default::default()
             },
-        )
-        .expect("terminal Continue action must proceed");
+        ), StepAction::Continue);
 
         drop(progress);
         drop(callback);

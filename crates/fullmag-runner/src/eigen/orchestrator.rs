@@ -19,9 +19,10 @@ use crate::eigen::path::expand_k_sampling;
 use crate::eigen::output_selection::eigen_diagnostics_request;
 use crate::eigen::tracking::track_branches;
 use crate::eigen::types::{
-    DispersionAnalyticReferenceContext, KSampleDescriptor, PathSolveResult, SingleKSolveResult,
+    DispersionAnalyticReferenceContext, KSampleDescriptor, PathSolveOutcome, PathSolveResult,
+    SingleKSolveOutcome, SingleKSolveResult,
 };
-use crate::types::RunError;
+use crate::types::{RunError, StepAction};
 use fullmag_ir::{FemEigenPlanIR, ModeTrackingIR, OutputIR};
 use std::path::Path;
 
@@ -34,6 +35,27 @@ pub trait SingleKSolver {
     ) -> Result<SingleKSolveResult, RunError>;
 }
 
+pub(crate) trait ControlledSingleKSolver {
+    fn solve_single_k_controlled(
+        &self,
+        plan: &FemEigenPlanIR,
+        outputs: &[OutputIR],
+        sample: &KSampleDescriptor,
+    ) -> Result<SingleKSolveOutcome, RunError>;
+}
+
+impl<S: SingleKSolver> ControlledSingleKSolver for S {
+    fn solve_single_k_controlled(
+        &self,
+        plan: &FemEigenPlanIR,
+        outputs: &[OutputIR],
+        sample: &KSampleDescriptor,
+    ) -> Result<SingleKSolveOutcome, RunError> {
+        self.solve_single_k(plan, outputs, sample)
+            .map(SingleKSolveOutcome::Completed)
+    }
+}
+
 pub fn run_path_or_single<S: SingleKSolver>(
     solver: &S,
     plan: &FemEigenPlanIR,
@@ -42,6 +64,29 @@ pub fn run_path_or_single<S: SingleKSolver>(
     artifact_identity: Option<&FrequencyDomainArtifactIdentity>,
     mode_tracking: Option<&ModeTrackingIR>,
 ) -> Result<PathSolveResult, RunError> {
+    match run_path_or_single_controlled(
+        solver,
+        plan,
+        outputs,
+        output_dir,
+        artifact_identity,
+        mode_tracking,
+    )? {
+        PathSolveOutcome::Completed(result) => Ok(result),
+        PathSolveOutcome::Interrupted { .. } => Err(RunError {
+            message: "single-k k-path solve was interrupted by runtime control".into(),
+        }),
+    }
+}
+
+pub(crate) fn run_path_or_single_controlled<S: ControlledSingleKSolver>(
+    solver: &S,
+    plan: &FemEigenPlanIR,
+    outputs: &[OutputIR],
+    output_dir: Option<&Path>,
+    artifact_identity: Option<&FrequencyDomainArtifactIdentity>,
+    mode_tracking: Option<&ModeTrackingIR>,
+) -> Result<PathSolveOutcome, RunError> {
     let sample_descriptors =
         expand_k_sampling(plan.k_sampling.as_ref()).map_err(|message| RunError { message })?;
     if sample_descriptors.is_empty() {
@@ -50,7 +95,7 @@ pub fn run_path_or_single<S: SingleKSolver>(
         });
     }
 
-    let mut result = solve_path_samples(
+    let outcome = solve_path_samples(
         solver,
         plan,
         outputs,
@@ -59,13 +104,24 @@ pub fn run_path_or_single<S: SingleKSolver>(
         mode_tracking,
     )?;
 
-    if let Some(output_dir) = output_dir {
+    let validated_artifact_identity = if output_dir.is_some() {
         let artifact_identity = artifact_identity.ok_or_else(|| RunError {
             message: "frequency-domain artifact output requires exact session, run, stage, and runtime identity".to_string(),
         })?;
         artifact_identity.validate().map_err(|error| RunError {
             message: format!("invalid frequency-domain artifact identity: {error}"),
         })?;
+        Some(artifact_identity)
+    } else {
+        None
+    };
+
+    if let (
+        Some(output_dir),
+        Some(artifact_identity),
+        PathSolveOutcome::Completed(result),
+    ) = (output_dir, validated_artifact_identity, &outcome)
+    {
         let has_public_spectral_output = outputs.iter().any(|output| {
             matches!(
                 output,
@@ -110,7 +166,7 @@ pub fn run_path_or_single<S: SingleKSolver>(
         })?;
     }
 
-    Ok(result)
+    Ok(outcome)
 }
 
 /// Aggregate only a contiguous planned k-sampling prefix, as used after a
@@ -123,6 +179,27 @@ pub(crate) fn run_path_prefix_or_single<S: SingleKSolver>(
     accepted_prefix_len: usize,
     mode_tracking: Option<&ModeTrackingIR>,
 ) -> Result<PathSolveResult, RunError> {
+    match run_path_prefix_or_single_controlled(
+        solver,
+        plan,
+        outputs,
+        accepted_prefix_len,
+        mode_tracking,
+    )? {
+        PathSolveOutcome::Completed(result) => Ok(result),
+        PathSolveOutcome::Interrupted { .. } => Err(RunError {
+            message: "accepted k-path prefix was interrupted during reconstruction".into(),
+        }),
+    }
+}
+
+pub(crate) fn run_path_prefix_or_single_controlled<S: ControlledSingleKSolver>(
+    solver: &S,
+    plan: &FemEigenPlanIR,
+    outputs: &[OutputIR],
+    accepted_prefix_len: usize,
+    mode_tracking: Option<&ModeTrackingIR>,
+) -> Result<PathSolveOutcome, RunError> {
     let planned_samples =
         expand_k_sampling(plan.k_sampling.as_ref()).map_err(|message| RunError { message })?;
     if accepted_prefix_len == 0 || accepted_prefix_len > planned_samples.len() {
@@ -143,14 +220,14 @@ pub(crate) fn run_path_prefix_or_single<S: SingleKSolver>(
     )
 }
 
-fn solve_path_samples<S: SingleKSolver>(
+fn solve_path_samples<S: ControlledSingleKSolver>(
     solver: &S,
     plan: &FemEigenPlanIR,
     outputs: &[OutputIR],
     sample_descriptors: &[KSampleDescriptor],
     planned_sample_count: usize,
     mode_tracking: Option<&ModeTrackingIR>,
-) -> Result<PathSolveResult, RunError> {
+) -> Result<PathSolveOutcome, RunError> {
     if sample_descriptors.is_empty() {
         return Err(RunError {
             message: "single-k solve returned no samples".to_string(),
@@ -158,9 +235,33 @@ fn solve_path_samples<S: SingleKSolver>(
     }
 
     let mut sample_results = Vec::with_capacity(sample_descriptors.len());
+    let mut interrupted = None;
     for sample in sample_descriptors {
-        let solved = solver.solve_single_k(plan, outputs, sample)?;
-        sample_results.push(solved);
+        match solver.solve_single_k_controlled(plan, outputs, sample)? {
+            SingleKSolveOutcome::Completed(solved) => sample_results.push(solved),
+            SingleKSolveOutcome::Interrupted(action @ (StepAction::Stop | StepAction::Pause)) => {
+                interrupted = Some(action);
+                break;
+            }
+            SingleKSolveOutcome::Interrupted(StepAction::Continue) => {
+                return Err(RunError {
+                    message: "single-k solver returned an interruption without a control action"
+                        .into(),
+                });
+            }
+        }
+    }
+
+    if sample_results.is_empty() {
+        if let Some(action) = interrupted {
+            return Ok(PathSolveOutcome::Interrupted {
+                action,
+                accepted_prefix: None,
+            });
+        }
+        return Err(RunError {
+            message: "single-k solve returned no samples".to_string(),
+        });
     }
 
     let solver_model = sample_results
@@ -182,12 +283,12 @@ fn solve_path_samples<S: SingleKSolver>(
             ),
         });
     }
-    let sample_note = if sample_descriptors.len() == planned_sample_count {
-        format!("{} sample(s) generated from k_sampling", sample_descriptors.len())
+    let sample_note = if sample_results.len() == planned_sample_count {
+        format!("{} sample(s) generated from k_sampling", sample_results.len())
     } else {
         format!(
-            "{} of {} planned k-sampling samples accepted before controlled pool interruption",
-            sample_descriptors.len(),
+            "{} of {} planned k-sampling samples accepted before controlled interruption",
+            sample_results.len(),
             planned_sample_count
         )
     };
@@ -222,7 +323,13 @@ fn solve_path_samples<S: SingleKSolver>(
         k0_kittel_periodic_airbox_demag: None,
     };
     track_branches(&mut result, mode_tracking);
-    Ok(result)
+    Ok(match interrupted {
+        Some(action) => PathSolveOutcome::Interrupted {
+            action,
+            accepted_prefix: Some(result),
+        },
+        None => PathSolveOutcome::Completed(result),
+    })
 }
 
 #[cfg(test)]
@@ -236,6 +343,7 @@ mod tests {
     };
     use num_complex::Complex64;
     use serde_json::Value;
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -320,6 +428,72 @@ mod tests {
                 })),
             })
         }
+    }
+
+    struct InterruptAtSample {
+        sample_index: usize,
+        calls: Cell<usize>,
+        action: StepAction,
+    }
+
+    impl ControlledSingleKSolver for InterruptAtSample {
+        fn solve_single_k_controlled(
+            &self,
+            plan: &FemEigenPlanIR,
+            outputs: &[OutputIR],
+            sample: &KSampleDescriptor,
+        ) -> Result<SingleKSolveOutcome, RunError> {
+            self.calls.set(self.calls.get() + 1);
+            if sample.sample_index == self.sample_index {
+                Ok(SingleKSolveOutcome::Interrupted(self.action))
+            } else {
+                FakeSolver
+                    .solve_single_k(plan, outputs, sample)
+                    .map(SingleKSolveOutcome::Completed)
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_k_path_retains_only_the_completed_sample_prefix() {
+        let plan = minimal_plan(Some(KSamplingIR::Path {
+            points: vec![
+                fullmag_ir::KPointIR {
+                    label: Some("G".to_string()),
+                    k_vector: [0.0, 0.0, 0.0],
+                },
+                fullmag_ir::KPointIR {
+                    label: Some("X".to_string()),
+                    k_vector: [1.0, 0.0, 0.0],
+                },
+                fullmag_ir::KPointIR {
+                    label: Some("M".to_string()),
+                    k_vector: [0.0, 1.0, 0.0],
+                },
+            ],
+            samples_per_segment: vec![1, 1],
+            closed: false,
+        }));
+        let solver = InterruptAtSample {
+            sample_index: 1,
+            calls: Cell::new(0),
+            action: StepAction::Pause,
+        };
+
+        let outcome = run_path_or_single_controlled(&solver, &plan, &[], None, None, None)
+            .expect("control interruption should be a typed path outcome");
+
+        match outcome {
+            PathSolveOutcome::Interrupted {
+                action: StepAction::Pause,
+                accepted_prefix: Some(prefix),
+            } => {
+                assert_eq!(prefix.samples.len(), 1);
+                assert_eq!(prefix.samples[0].sample.sample_index, 0);
+            }
+            other => panic!("unexpected controlled path outcome: {other:?}"),
+        }
+        assert_eq!(solver.calls.get(), 2, "later samples must not be admitted");
     }
 
     fn minimal_plan(k_sampling: Option<KSamplingIR>) -> FemEigenPlanIR {

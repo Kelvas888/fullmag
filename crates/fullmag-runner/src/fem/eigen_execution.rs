@@ -67,7 +67,7 @@ use crate::eigen::diagnostic_artifact::{
 use crate::eigen::output_selection::eigen_diagnostics_request;
 use super::eigen_solve::{
     gpu_solve_real_symmetric_eigenpairs, mode_tangent_leakage, orthogonality_rows_json,
-    solve_complex_hermitian_eigenpairs, solve_real_symmetric_eigenpairs,
+    solve_complex_hermitian_eigenpairs, solve_real_symmetric_eigenpairs, SparseEigenSolveOutcome,
     solve_real_symmetric_eigenpairs_sparse, sparse_lobpcg_candidate_count, SPARSE_EIGEN_THRESHOLD,
 };
 use super::eigen_sweep::{
@@ -80,6 +80,7 @@ use crate::types::ExecutedRun;
 use crate::types::RunError;
 use crate::types::RunResult;
 use crate::types::RunStatus;
+use crate::types::StepAction;
 use crate::types::StepStats;
 use fullmag_engine::Vector3;
 use fullmag_engine::MU0;
@@ -1530,7 +1531,7 @@ fn execute_native_gpu_k0_kittel_modal(
     validate_eigen_equilibrium_certificate(plan, expected_handoff, None)?;
     let initial_magnetization = plan.equilibrium_magnetization.clone();
     let requested_modes = plan.count as usize;
-    emit_native_gpu_k0_kittel_progress(
+    let action = emit_native_gpu_k0_kittel_progress(
         &mut progress,
         "materializing_equilibrium",
         1,
@@ -1540,7 +1541,17 @@ fn execute_native_gpu_k0_kittel_modal(
         requested_modes,
         requested_modes,
         0,
-    )?;
+    );
+    if action != StepAction::Continue {
+        return interrupted_fem_eigen_run(
+            action,
+            "materializing_equilibrium",
+            initial_magnetization.clone(),
+            initial_magnetization.clone(),
+            Vec::new(),
+            native_gpu_k0_kittel_execution_provenance(plan),
+        );
+    }
     let (problem, equilibrium, relaxation_steps, observables, _source_artifact) =
         materialize_equilibrium(plan, &initial_magnetization, None)?;
     let reduction = build_reduction_map(
@@ -1564,7 +1575,7 @@ fn execute_native_gpu_k0_kittel_modal(
     let bases = tangent_bases(&equilibrium);
     let active_nodes = reduction.active_nodes.len();
     let effective_dof = active_nodes.saturating_mul(2);
-    emit_native_gpu_k0_kittel_progress(
+    let action = emit_native_gpu_k0_kittel_progress(
         &mut progress,
         "assembling_operator",
         2,
@@ -1574,7 +1585,17 @@ fn execute_native_gpu_k0_kittel_modal(
         requested_modes,
         requested_modes,
         0,
-    )?;
+    );
+    if action != StepAction::Continue {
+        return interrupted_fem_eigen_run(
+            action,
+            "assembling_operator",
+            initial_magnetization.clone(),
+            equilibrium.clone(),
+            Vec::new(),
+            native_gpu_k0_kittel_execution_provenance(plan),
+        );
+    }
     let (stiffness_field, mass) = assemble_full_2x2_operator_real(
         plan,
         &problem.topology,
@@ -1583,7 +1604,7 @@ fn execute_native_gpu_k0_kittel_modal(
         &equilibrium,
         &bases,
     );
-    emit_native_gpu_k0_kittel_progress(
+    let action = emit_native_gpu_k0_kittel_progress(
         &mut progress,
         "solving_dense",
         3,
@@ -1593,7 +1614,17 @@ fn execute_native_gpu_k0_kittel_modal(
         requested_modes,
         requested_modes,
         0,
-    )?;
+    );
+    if action != StepAction::Continue {
+        return interrupted_fem_eigen_run(
+            action,
+            "solving_dense",
+            initial_magnetization.clone(),
+            equilibrium.clone(),
+            Vec::new(),
+            native_gpu_k0_kittel_execution_provenance(plan),
+        );
+    }
     let gpu_result = native_fem::gpu_eigen_dense_solve(
         stiffness_field.as_slice(),
         mass.as_slice(),
@@ -1603,7 +1634,7 @@ fn execute_native_gpu_k0_kittel_modal(
     .map_err(|message| RunError {
         message: format!("FEM GPU K0 Kittel modal dense solve failed: {message}"),
     })?;
-    emit_native_gpu_k0_kittel_progress(
+    let action = emit_native_gpu_k0_kittel_progress(
         &mut progress,
         "writing_artifacts",
         4,
@@ -1613,7 +1644,17 @@ fn execute_native_gpu_k0_kittel_modal(
         requested_modes,
         gpu_result.eigenvalues.len(),
         0,
-    )?;
+    );
+    if action != StepAction::Continue {
+        return interrupted_fem_eigen_run(
+            action,
+            "writing_artifacts",
+            initial_magnetization.clone(),
+            equilibrium.clone(),
+            Vec::new(),
+            native_gpu_k0_kittel_execution_provenance(plan),
+        );
+    }
     let field_eigenvalue = select_k0_kittel_gpu_field_eigenvalue(plan, &gpu_result.eigenvalues)?;
     let omega_rad_s = plan.gyromagnetic_ratio * field_eigenvalue;
     let frequency_hz = omega_rad_s / std::f64::consts::TAU;
@@ -1708,7 +1749,7 @@ fn execute_native_gpu_k0_kittel_modal(
         ..StepStats::default()
     };
 
-    emit_native_gpu_k0_kittel_progress(
+    let _ = emit_native_gpu_k0_kittel_progress(
         &mut progress,
         "completed",
         5,
@@ -1718,7 +1759,7 @@ fn execute_native_gpu_k0_kittel_modal(
         requested_modes,
         modes.len(),
         modes.len(),
-    )?;
+    );
 
     Ok(ExecutedRun {
         result: RunResult {
@@ -1749,7 +1790,7 @@ fn emit_native_gpu_k0_kittel_progress(
     requested_modes: usize,
     candidate_modes: usize,
     computed_modes: usize,
-) -> Result<(), RunError> {
+) -> StepAction {
     emit_fem_eigen_progress(
         progress,
         FemEigenProgress {
@@ -1936,8 +1977,11 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
         reject_unsupported_floquet_dynamic_demag(&plan.spin_wave_bc, plan.operator.include_demag)?;
     }
     let num_modes = plan.count as usize;
+    let initial_magnetization = initial_magnetization_override
+        .map(<[Vector3]>::to_vec)
+        .unwrap_or_else(|| plan.equilibrium_magnetization.clone());
 
-    emit_fem_eigen_progress(
+    let action = emit_fem_eigen_progress(
         &mut progress,
         FemEigenProgress {
             phase: "materializing_equilibrium",
@@ -1956,11 +2000,18 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
             warning: None,
             ..Default::default()
         },
-    )?;
+    );
+    if action != StepAction::Continue {
+        return interrupted_fem_eigen_run(
+            action,
+            "materializing_equilibrium",
+            initial_magnetization.clone(),
+            initial_magnetization.clone(),
+            Vec::new(),
+            execution_provenance(plan, try_gpu),
+        );
+    }
 
-    let initial_magnetization = initial_magnetization_override
-        .map(<[Vector3]>::to_vec)
-        .unwrap_or_else(|| plan.equilibrium_magnetization.clone());
     let (problem, equilibrium, relaxation_steps, observables, source_artifact) =
         materialize_equilibrium(plan, &initial_magnetization, source_relax_handoff)?;
     let topology = &problem.topology;
@@ -2006,7 +2057,7 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
     };
     let dense_warning = (effective_dof > 3000 && !use_sparse && !use_native_modal_production)
         .then_some("dense_o_n3_eigensolve_without_iteration_progress");
-    emit_fem_eigen_progress(
+    let action = emit_fem_eigen_progress(
         &mut progress,
         FemEigenProgress {
             phase: "assembling_operator",
@@ -2025,7 +2076,53 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
             warning: dense_warning,
             ..Default::default()
         },
-    )?;
+    );
+    if action != StepAction::Continue {
+        return interrupted_fem_eigen_run(
+            action,
+            "assembling_operator",
+            initial_magnetization.clone(),
+            equilibrium.clone(),
+            vec![StepStats {
+                step: relaxation_steps,
+                time: 0.0,
+                dt: 0.0,
+                e_ex: observables.exchange_energy_joules,
+                e_demag: observables.demag_energy_joules,
+                e_ext: observables.external_energy_joules,
+                e_total: observables.total_energy_joules,
+                max_dm_dt: observables.max_rhs_amplitude,
+                max_h_eff: observables.max_effective_field_amplitude,
+                max_h_demag: observables.max_demag_field_amplitude,
+                ..StepStats::default()
+            }],
+            execution_provenance(plan, try_gpu),
+        );
+    }
+    macro_rules! interrupt_after_materialization {
+        ($action:expr, $phase:expr) => {
+            return interrupted_fem_eigen_run(
+                $action,
+                $phase,
+                initial_magnetization.clone(),
+                equilibrium.clone(),
+                vec![StepStats {
+                    step: relaxation_steps,
+                    time: 0.0,
+                    dt: 0.0,
+                    e_ex: observables.exchange_energy_joules,
+                    e_demag: observables.demag_energy_joules,
+                    e_ext: observables.external_energy_joules,
+                    e_total: observables.total_energy_joules,
+                    max_dm_dt: observables.max_rhs_amplitude,
+                    max_h_eff: observables.max_effective_field_amplitude,
+                    max_h_demag: observables.max_demag_field_amplitude,
+                    ..StepStats::default()
+                }],
+                execution_provenance(plan, try_gpu),
+            )
+        };
+    }
 
     let bases = tangent_bases(&equilibrium);
     let mut dense_orthogonality = None;
@@ -2135,7 +2232,7 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
             );
         }
         if use_sparse {
-            emit_fem_eigen_progress(
+            let action = emit_fem_eigen_progress(
                 &mut progress,
                 FemEigenProgress {
                     phase: "solving_sparse_lobpcg",
@@ -2158,8 +2255,11 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
                     warning: None,
                     ..Default::default()
                 },
-            )?;
-            solve_real_symmetric_eigenpairs_sparse(
+            );
+            if action != StepAction::Continue {
+                interrupt_after_materialization!(action, "solving_sparse_lobpcg");
+            }
+            match solve_real_symmetric_eigenpairs_sparse(
                 plan,
                 &stiffness,
                 &mass,
@@ -2167,9 +2267,14 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
                 progress.as_deref_mut(),
                 active_n,
                 effective_dof,
-            )?
+            )? {
+                SparseEigenSolveOutcome::Completed(eigenpairs) => eigenpairs,
+                SparseEigenSolveOutcome::Interrupted(action) => {
+                    interrupt_after_materialization!(action, "solving_sparse_lobpcg");
+                }
+            }
         } else {
-            emit_fem_eigen_progress(
+            let action = emit_fem_eigen_progress(
                 &mut progress,
                 FemEigenProgress {
                     phase: "solving_dense",
@@ -2188,7 +2293,10 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
                     warning: dense_warning,
                     ..Default::default()
                 },
-            )?;
+            );
+            if action != StepAction::Continue {
+                interrupt_after_materialization!(action, "solving_dense");
+            }
             let eigenpairs = solve_real_symmetric_eigenpairs(plan, &stiffness, &mass)?;
             dense_orthogonality = Some(orthogonality_rows_json(&mass, &eigenpairs));
             eigenpairs
@@ -2233,7 +2341,7 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
                 }
             }
         } else if use_sparse {
-            emit_fem_eigen_progress(
+            let action = emit_fem_eigen_progress(
                 &mut progress,
                 FemEigenProgress {
                     phase: "solving_sparse_lobpcg",
@@ -2256,8 +2364,11 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
                     warning: None,
                     ..Default::default()
                 },
-            )?;
-            solve_real_symmetric_eigenpairs_sparse(
+            );
+            if action != StepAction::Continue {
+                interrupt_after_materialization!(action, "solving_sparse_lobpcg");
+            }
+            match solve_real_symmetric_eigenpairs_sparse(
                 plan,
                 &operator.stiffness,
                 &operator.mass,
@@ -2265,9 +2376,14 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
                 progress.as_deref_mut(),
                 active_n,
                 effective_dof,
-            )?
+            )? {
+                SparseEigenSolveOutcome::Completed(eigenpairs) => eigenpairs,
+                SparseEigenSolveOutcome::Interrupted(action) => {
+                    interrupt_after_materialization!(action, "solving_sparse_lobpcg");
+                }
+            }
         } else {
-            emit_fem_eigen_progress(
+            let action = emit_fem_eigen_progress(
                 &mut progress,
                 FemEigenProgress {
                     phase: "solving_dense",
@@ -2286,7 +2402,10 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
                     warning: dense_warning,
                     ..Default::default()
                 },
-            )?;
+            );
+            if action != StepAction::Continue {
+                interrupt_after_materialization!(action, "solving_dense");
+            }
             let eigenpairs =
                 solve_real_symmetric_eigenpairs(plan, &operator.stiffness, &operator.mass)?;
             dense_orthogonality = Some(orthogonality_rows_json(&operator.mass, &eigenpairs));
@@ -2381,7 +2500,7 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
     let participation_solver_device = if try_gpu { "gpu" } else { "cpu" };
     let gamma_rad_s_t = gamma0_rad_s_per_a_m / MU0;
     let mu0_t_m_per_a = MU0;
-    emit_fem_eigen_progress(
+    let action = emit_fem_eigen_progress(
         &mut progress,
         FemEigenProgress {
             phase: "writing_artifacts",
@@ -2400,7 +2519,10 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
             warning: None,
             ..Default::default()
         },
-    )?;
+    );
+    if action != StepAction::Continue {
+        interrupt_after_materialization!(action, "writing_artifacts");
+    }
 
     for mode_index in 0..total_modes {
         let (
@@ -2877,7 +2999,7 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
         ..StepStats::default()
     };
 
-    emit_fem_eigen_progress(
+    let _ = emit_fem_eigen_progress(
         &mut progress,
         FemEigenProgress {
             phase: "completed",
@@ -2896,7 +3018,7 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
             warning: None,
             ..Default::default()
         },
-    )?;
+    );
 
     Ok(ExecutedRun {
         result: RunResult {
@@ -2914,6 +3036,61 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
         field_snapshot_count: 0,
         auxiliary_artifacts,
         provenance: execution_provenance(plan, try_gpu),
+    })
+}
+
+pub(super) fn interrupted_fem_eigen_run(
+    action: StepAction,
+    phase: &'static str,
+    initial_magnetization: Vec<Vector3>,
+    best_known_magnetization: Vec<Vector3>,
+    steps: Vec<StepStats>,
+    provenance: crate::types::ExecutionProvenance,
+) -> Result<ExecutedRun, RunError> {
+    let (status, stop_reason) = match action {
+        StepAction::Stop => (RunStatus::Cancelled, "cancel_requested"),
+        StepAction::Pause => (RunStatus::Paused, "pause_requested"),
+        StepAction::Continue => {
+            return Err(RunError {
+                message: "cannot construct an interrupted FEM eigen result for Continue".into(),
+            });
+        }
+    };
+    let diagnostics = serde_json::json!({
+        "schema_version": "frequency_domain_modal_solver_diagnostics.v1",
+        "status": "interrupted",
+        "complete": false,
+        "stop_reason": stop_reason,
+        "interruption_phase": phase,
+        "partial_artifacts_available": true,
+    });
+    let partial = serde_json::json!({
+        "schema_version": "fem_modal_partial.v1",
+        "complete": false,
+        "stop_reason": if status == RunStatus::Paused { "pause_requested" } else { "cancelled" },
+        "interruption_phase": phase,
+        "preserved_mode_count": 0,
+    });
+    let auxiliary_artifacts = vec![
+        json_artifact("eigen/diagnostics/solver.v1.json", &diagnostics)?,
+        json_artifact("eigen/partial.v1.json", &partial)?,
+    ];
+    Ok(ExecutedRun {
+        result: RunResult {
+            status,
+            steps,
+            final_magnetization: best_known_magnetization,
+            completion: Some(crate::relaxation::resolve_stage_completion(
+                status,
+                None,
+                crate::relaxation::RelaxationCompletionMetrics::default(),
+            )),
+        },
+        initial_magnetization,
+        field_snapshots: Vec::new(),
+        field_snapshot_count: 0,
+        auxiliary_artifacts,
+        provenance,
     })
 }
 
@@ -2935,7 +3112,7 @@ mod tests {
         };
         let mut progress = Some(&mut callback as &mut FemEigenProgressCallback<'_>);
 
-        emit_native_gpu_k0_kittel_progress(
+        assert_eq!(emit_native_gpu_k0_kittel_progress(
             &mut progress,
             "materializing_equilibrium",
             1,
@@ -2945,9 +3122,8 @@ mod tests {
             1,
             1,
             0,
-        )
-        .expect("materialization boundary should continue");
-        emit_native_gpu_k0_kittel_progress(
+        ), StepAction::Continue);
+        assert_eq!(emit_native_gpu_k0_kittel_progress(
             &mut progress,
             "assembling_operator",
             2,
@@ -2957,9 +3133,8 @@ mod tests {
             1,
             1,
             0,
-        )
-        .expect("assembly boundary should continue");
-        let error = emit_native_gpu_k0_kittel_progress(
+        ), StepAction::Continue);
+        let action = emit_native_gpu_k0_kittel_progress(
             &mut progress,
             "solving_dense",
             3,
@@ -2969,8 +3144,7 @@ mod tests {
             1,
             1,
             0,
-        )
-        .expect_err("runtime stop should be propagated at the solve boundary");
+        );
 
         assert_eq!(
             boundaries,
@@ -2980,8 +3154,6 @@ mod tests {
                 ("solving_dense", 3, 35.0),
             ]
         );
-        assert!(error
-            .message
-            .contains("FEM eigen solve was interrupted by runtime control"));
+        assert_eq!(action, StepAction::Stop);
     }
 }

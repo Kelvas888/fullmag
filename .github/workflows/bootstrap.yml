@@ -115,6 +115,16 @@ jobs:
       - name: Run native modal cancellation completion contract
         run: cargo test -p fullmag-runner native_modal_run_result_completion_matches_status --lib
 
+      - name: Run typed active eigen Stop and Pause contracts
+        run: |
+          cargo test -p fullmag-engine fem_sparse::tests::lobpcg_control_ --lib
+          cargo test -p fullmag-runner controlled_k_path_retains_only_the_completed_sample_prefix --lib
+          cargo test -p fullmag-runner eigen_path_returns_typed_partial_for_stop_and_pause_before_single_k_execution --lib
+          cargo test -p fullmag-runner writing_artifacts_control_preserves_certified_native_mode_bytes --lib
+          cargo test -p fullmag-runner completed_pool_prefix_precedes_persistent_stop_or_pause --lib
+          cargo test -p fullmag-runner interrupted_sample_diagnostics_do_not_collide_with_accepted_prefix_paths --lib
+          cargo test -p fullmag-runner direct_floquet_runtime_control_preserves_pause_and_stop_reasons --lib
+
       - name: Run native modal artifact provenance contract
         run: |
           cargo test -p fullmag-runner native_modal_artifact_limitations_follow_executed_operator_payload --lib
