@@ -34,6 +34,8 @@ import type { KernelEventMap } from "../events/eventTypes";
 import { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import { SelectionController } from "../selection/SelectionController";
+import { ObjectEditSessionController } from "./object-edit/ObjectEditSessionController";
+import type { GeometryObjectDraft } from "./object-edit/objectEditTypes";
 
 import {
   FEM_GRID_COMMAND_NOT_APPLICABLE_REASON,
@@ -716,6 +718,92 @@ describe("geometry lifecycle command contributions", () => {
     expect(registry.get("mesh.build-selected")?.disabledReason?.(context)).toBe(
       "A mesh build is already running for this object.",
     );
+  });
+
+  it.each(["apply", "gesture", "dirty", "missing-scope"] as const)(
+    "rejects Delete before HTTP while %s owns editing",
+    async (phase) => {
+      const controller = new ObjectEditSessionController<GeometryObjectDraft>();
+      const scope = "session=delete&epoch=1";
+      const identity = controller.activate({ objectId: "other", targetKey: "object:other", sessionScopeKey: scope }, {} as GeometryObjectDraft);
+      if (phase === "apply") controller.beginApply(identity);
+      if (phase === "gesture") controller.beginGesture(scope, "other");
+      if (phase === "dirty") controller.setDirty(identity, true);
+      const selection = new SelectionController(new EventBus<KernelEventMap>());
+      selectBox(selection);
+      const commitTransaction = vi.fn();
+      const context: CommandContext = {
+        api: { model: { commitTransaction } } as never,
+        objectEditSession: controller,
+        selection,
+        sessionScopeKey: phase === "missing-scope" ? null : scope,
+        source: "test",
+      };
+      const command = GEOMETRY_LIFECYCLE_COMMANDS.find((item) => item.id === "geometry.delete-object")!;
+      expect(command.isEnabled?.(context)).toBe(false);
+      expect(await command.run(context)).toMatchObject({ status: "failed" });
+      expect(commitTransaction).not.toHaveBeenCalled();
+      expect(selection.get().objectId).toBe("box");
+    },
+  );
+
+  it("rechecks a newly edited draft after preparing Delete and releases its reservation", async () => {
+    const controller = new ObjectEditSessionController<GeometryObjectDraft>();
+    const scope = "session=delete&epoch=1";
+    const identity = controller.activate({ objectId: "box", targetKey: "object:box", sessionScopeKey: scope }, {} as GeometryObjectDraft);
+    const selection = new SelectionController(new EventBus<KernelEventMap>());
+    selectBox(selection);
+    const commitTransaction = vi.fn();
+    const command = GEOMETRY_LIFECYCLE_COMMANDS.find((item) => item.id === "geometry.delete-object")!;
+    const deletion = command.run({
+      api: { model: { commitTransaction } } as never,
+      objectEditSession: controller,
+      selection,
+      sessionScopeKey: scope,
+      isCurrentSessionScope: () => true,
+      source: "test",
+    });
+    expect(controller.hasPendingWrite(scope)).toBe(true);
+    controller.setDirty(identity, true);
+    expect(await deletion).toMatchObject({ status: "failed" });
+    expect(commitTransaction).not.toHaveBeenCalled();
+    expect(controller.hasPendingWrite(scope)).toBe(false);
+    expect(controller.getSnapshot().dirty).toBe(true);
+  });
+
+  it("reserves Delete across its ACK and releases it after failure for retry", async () => {
+    const controller = new ObjectEditSessionController<GeometryObjectDraft>();
+    const scope = "session=delete&epoch=1";
+    const identity = controller.activate({ objectId: "other", targetKey: "object:other", sessionScopeKey: scope }, {} as GeometryObjectDraft);
+    const selection = new SelectionController(new EventBus<KernelEventMap>());
+    selectBox(selection);
+    let rejectWrite!: (error: Error) => void;
+    let started!: () => void;
+    const submitted = new Promise<void>((resolve) => { started = resolve; });
+    const pending = new Promise<never>((_, reject) => { rejectWrite = reject; });
+    const commitTransaction = vi.fn(() => { started(); return pending; });
+    const registry = registryWithLifecycleCommands();
+    const context: CommandContext = {
+      api: { model: { commitTransaction } } as never,
+      objectEditSession: controller,
+      selection,
+      sessionScopeKey: scope,
+      isCurrentSessionScope: () => true,
+      source: "test",
+    };
+    const deletion = registry.execute("geometry.delete-object", context);
+    await submitted;
+    expect(controller.hasPendingWrite(scope)).toBe(true);
+    expect(controller.beginApply(identity)).toBeNull();
+    expect(controller.beginGesture(scope, "other")).toBeNull();
+    expect(await registry.execute("geometry.delete-object", context)).toMatchObject({ status: "failed" });
+    expect(commitTransaction).toHaveBeenCalledTimes(1);
+    rejectWrite(new Error("Delete rejected"));
+    expect(await deletion).toMatchObject({ status: "failed" });
+    expect(controller.hasPendingWrite(scope)).toBe(false);
+    expect(selection.get().objectId).toBe("box");
+    const retryApply = controller.beginApply(identity);
+    expect(retryApply).not.toBeNull();
   });
 
   it("commits delete transactions and clears deleted object selection", async () => {
