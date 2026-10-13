@@ -190,12 +190,48 @@ fn prepare_script_output_storage(
     Ok((storage_lease, settings, resolved))
 }
 
+fn prepare_grid_operation_storage(
+    workspace_dir: &Path,
+    command_id: &str,
+    script_path: &Path,
+) -> Result<(ScriptOutputStorageLease, OutputStorageIR, serde_json::Value)> {
+    let operation_id = format!("grid-{}", fullmag_session::hex_sha256(command_id.as_bytes()));
+    let operation_root = workspace_dir.join("grid-preparations").join(&operation_id);
+    let settings = OutputStorageIR {
+        output_dir: Some(operation_root.join("workspace").to_string_lossy().into_owned()),
+        temp_dir: Some(operation_root.join("temporary").to_string_lossy().into_owned()),
+        data_format: OutputDataFormatIR::Zarr,
+        cleanup: fullmag_ir::TempCleanupIR::Never,
+        existing_output: fullmag_ir::ExistingOutputIR::Error,
+    };
+    let source_dir = script_path.parent().context("grid source has no parent")?;
+    let lease = fullmag_runner::project_storage::ProjectStorageLease::prepare(
+        &settings, &operation_root.join("workspace"), source_dir, &operation_id,
+    ).map_err(|error| anyhow!("failed to prepare private grid operation storage: {error}"))?;
+    let lease = ScriptOutputStorageLease::new(lease);
+    let resolved = serde_json::to_value(lease.resolved())?;
+    Ok((lease, settings, resolved))
+}
+
 fn attached_session_id_or(generated: String) -> String {
     std::env::var("FULLMAG_ATTACHED_SESSION_ID")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or(generated)
+}
+
+fn attached_session_started_at_or(generated: u128) -> Result<u128> {
+    if std::env::var("FULLMAG_ATTACHED_SESSION_ID")
+        .ok().is_none_or(|value| value.trim().is_empty())
+    {
+        return Ok(generated);
+    }
+    let raw = std::env::var("FULLMAG_ATTACHED_SESSION_STARTED_AT_UNIX_MS")
+        .context("attached session requires its authoritative start timestamp")?;
+    let timestamp = raw.parse::<u128>().context("invalid attached session start timestamp")?;
+    anyhow::ensure!(timestamp > 0 && timestamp.to_string() == raw, "invalid attached session start timestamp");
+    Ok(timestamp)
 }
 
 fn control_room_bootstrap_disabled() -> bool {
@@ -6854,7 +6890,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     }
     crate::live_workspace::init_feature_flags(feature_flags);
 
-    let started_at_unix_ms = unix_time_millis()?;
+    let started_at_unix_ms = attached_session_started_at_or(unix_time_millis()?)?;
     let script_path = args
         .script
         .canonicalize()
@@ -6925,7 +6961,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     let preview_every_n_override = preview_every_n_override_raw
         .as_ref()
         .map(|_| field_every_n as u32);
-    let current_live_publisher = CurrentLivePublisher::spawn(&session_id);
+    let grid_refresh_command_id = std::env::var("FULLMAG_ATTACHED_GRID_REFRESH_COMMAND_ID").ok();
+    let current_live_publisher = if grid_refresh_command_id.is_some() {
+        CurrentLivePublisher::unpublished_grid_refresh()
+    } else {
+        CurrentLivePublisher::spawn(&session_id)
+    };
     let bootstrapping_runtime = requested_runtime_selection(
         &requested_backend_name,
         false,
@@ -6982,8 +7023,11 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         },
         current_live_publisher.clone(),
     );
-    let display_selection_handle =
-        CurrentLiveDisplaySelectionHandle::spawn_for_session(Some(session_id.clone()));
+    let display_selection_handle = if let Some(command_id) = grid_refresh_command_id.as_ref() {
+        CurrentLiveDisplaySelectionHandle::spawn_for_grid_refresh(session_id.clone(), command_id.clone())
+    } else {
+        CurrentLiveDisplaySelectionHandle::spawn_for_session(Some(session_id.clone()))
+    };
     live_workspace.push_log(
         "system",
         format!(
@@ -7363,8 +7407,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             return Err(error);
         }
     };
+    // Grid authoring must not reserve the user's next scientific output path
+    // or modify its existing-output policy in the canonical script/IR.
     let (mut storage_lease, storage_settings, resolved_storage) =
-        prepare_script_output_storage(&mut script_config, &args, &script_path, &run_id)?;
+        if let Some(command_id) = grid_refresh_command_id.as_deref() {
+            prepare_grid_operation_storage(&workspace_dir, command_id, &script_path)?
+        } else {
+            prepare_script_output_storage(&mut script_config, &args, &script_path, &run_id)?
+        };
     workspace_dir = storage_lease.resolved().output_dir.clone();
     crate::script_launch::note_results_dir(&workspace_dir);
     crate::script_launch::note_source_hash(script_config.ir.problem_meta.source_hash.as_deref());
@@ -8091,6 +8141,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             .unwrap_or(false);
     let _is_fem_backend = matches!(&initial_execution_plan.backend_plan, BackendPlanIR::Fem(_));
     let wait_for_solve_supported = wait_for_solve_supported(&initial_execution_plan.backend_plan);
+    if let Some(command_id) = grid_refresh_command_id.as_deref() {
+        anyhow::ensure!(
+            !command_id.is_empty()
+                && wait_for_solve_should_block(wait_for_solve_requested, wait_for_solve_supported, args.headless)
+                && matches!(&initial_execution_plan.backend_plan, BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_)),
+            "grid-only attached runtime requires an interactive FDM wait-for-solve command pin"
+        );
+    }
 
     if wait_for_solve_should_block(
         wait_for_solve_requested,
@@ -8416,6 +8474,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         }
 
         loop {
+            if display_selection_handle.grid_refresh_command_refused() {
+                bail!("grid-only control receiver refused an unpinned command");
+            }
             if display_selection_handle.owner_session_lost() {
                 live_workspace.push_log(
                     "warning",
@@ -8573,6 +8634,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     continue;
                 }
                 WaitForSolveCommandAction::StartSolver => {
+                    anyhow::ensure!(grid_refresh_command_id.is_none(), "grid-only runtime cannot execute a solver command");
                     if matches!(cmd.kind.as_str(), "relax" | "run" | "solve") {
                         let frozen_binding_summary = cmd
                             .frozen_spins_runtime_plan_binding
@@ -8606,7 +8668,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                     continue;
                                 }
                             };
-                        let Some(mut command_stage) = (match build_interactive_command_stage(
+                        let Some(mut command_stage) = (match crate::step_utils::build_initial_interactive_command_stage(
+                            &stages[0],
                             &command_base_ir,
                             &cmd,
                         ) {
@@ -8727,7 +8790,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     break;
                 }
                 WaitForSolveCommandAction::Remesh => {
-                    if let Some(summary) = execute_manual_interactive_remesh(
+                    if let Some(expected_id) = grid_refresh_command_id.as_deref() {
+                        anyhow::ensure!(
+                            cmd.kind == "fdm_grid_refresh" && cmd.command_id == expected_id,
+                            "grid-only runtime received a different command"
+                        );
+                    }
+                    let remesh_summary = execute_manual_interactive_remesh(
                         &cmd,
                         &mut stages,
                         &mut stage_execution_plans,
@@ -8743,9 +8812,17 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         &mut continuation_completion,
                         None,
                         args.backend.map(BackendTarget::from),
-                    ) {
+                    );
+                    let remesh_succeeded = remesh_summary.is_some();
+                    if let Some(summary) = remesh_summary {
                         current_plan_summary = summary;
                         continuation_relax_handoff = None;
+                    }
+                    if grid_refresh_command_id.is_some() {
+                        let payload = live_workspace.grid_refresh_snapshot()?;
+                        sync_current_live_snapshot(&session_id, &payload)?;
+                        storage_lease.finish(remesh_succeeded)?;
+                        return Ok(());
                     }
                 }
                 WaitForSolveCommandAction::Stop => {
@@ -15940,7 +16017,7 @@ mod tests {
             .find("problem_with_frozen_spins_runtime_plan_binding(")
             .expect("initial solver command must consume the Frozen Spins binding");
         let stage_index = branch
-            .find("build_interactive_command_stage(")
+            .find("build_initial_interactive_command_stage(")
             .expect("initial solver command must build a stage");
 
         assert!(

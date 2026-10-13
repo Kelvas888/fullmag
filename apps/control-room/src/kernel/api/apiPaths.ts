@@ -1073,6 +1073,14 @@ export const PROJECT_RUN_SUBMIT_PATH = openApiV2Path(
   "/v2/persistence/projects/{project_id}/runs",
 );
 
+export const PROJECT_BATCHES_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/batches",
+);
+
+export const PROJECT_BATCH_CASES_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/batches/{batch_id}/cases",
+);
+
 export const PROJECT_RUN_MATERIALIZATION_PATH = openApiV2Path(
   "/v2/persistence/projects/{project_id}/runs/{run_id}/materialization",
 );

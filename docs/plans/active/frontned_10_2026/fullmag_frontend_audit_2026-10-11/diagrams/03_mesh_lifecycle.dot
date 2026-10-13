@@ -1,0 +1,26 @@
+digraph G {
+graph [bgcolor="#f7f9fc", fontname="DejaVu Sans", fontsize=20, fontcolor="#182e47", labelloc=t, labeljust=l, pad=0.4, nodesep=0.4, ranksep=0.7, splines=polyline, dpi=130];
+node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12, fillcolor="#e6edf5", color="#adc1d7", fontcolor="#142941", penwidth=1.2, margin="0.19,0.15"];
+edge [fontname="DejaVu Sans", fontsize=10, color="#6e89a7", fontcolor="#415c78", arrowsize=0.75, penwidth=1.2];
+rankdir=TB;
+label="D03 / MESH BUILD LIFECYCLE\nRecipe, job, artifact and viewport have distinct states";
+scene [label="Committed geometry\nsource revision + geometry / partition identity"];
+recipe [label="Committed mesh recipe\nrequested → effective\nFEM policy or FDM discretization"];
+pre [label="PREFLIGHT / CONFIRM\nfreeze target + identity + policy diff\nresolve dirty drafts first",fillcolor="#d4e5f7",color="#6f99c4"];
+{rank=same;scene;recipe;}
+scene -> pre;recipe -> pre;
+job [label="ACCEPTED → QUEUED → RUNNING\nOne client intent ID\nFEM meshing OR FDM grid + membership",fillcolor="#cceae7",color="#5caaa1"];
+quality [label="QUALITY / CONTRACT CHECKS\nTopology + regions + required diagnostics"];
+publish [label="PUBLISH NEW GENERATION\nManifest + buffers + identity agree",fillcolor="#d5eada",color="#80ad8b"];
+load [label="LOAD VIEWPORT\nrender failure ≠ build failure"];
+rendered [label="RENDERED\ncurrent only if source is compatible",fillcolor="#d5eada",color="#80ad8b"];
+pre -> job -> quality -> publish -> load -> rendered;
+retained [label="PREVIOUS VALID ARTIFACT\nretained / absent\nmay be stale for current scene",fillcolor="#f7e9cc",color="#d3b465"];
+failure [label="BUILD FAILED\nphase + reason + diagnostics\nprevious artifact not destroyed",fillcolor="#f5dddd",color="#c38c8c"];
+unknown [label="OBSERVATION INTERRUPTED\nreconcile same intent\nno duplicate submission",fillcolor="#f7e9cc",color="#d3b465"];
+pre -> retained [style=dashed,label="keep old generation"];
+job -> unknown [label="disconnect"];unknown -> job [label="resume observation",constraint=false];
+job -> failure;quality -> failure;failure -> retained [style=dashed,label="still inspectable"];
+scene -> retained [label="geometry changes ⇒ stale",style=dashed,constraint=false];
+load -> load [label="retry loading only"];
+}

@@ -9,6 +9,7 @@
 //! quiescence. A caller must obtain a separate owner-authenticated drain proof
 //! before any process handoff.
 
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fullmag_authoring::SceneDocument;
@@ -166,7 +167,13 @@ pub(crate) async fn acquire_workspace_for_restart(
                             session_epoch,
                         )
                     });
-            let is_scratch = is_idle_scratch(snapshot, kind, scene_id, trusted_restore)?;
+            let is_scratch = is_idle_scratch(
+                snapshot,
+                kind,
+                scene_id,
+                trusted_restore,
+                &state.current_workspace_root,
+            )?;
             let run_id = if is_scratch {
                 None
             } else {
@@ -223,6 +230,7 @@ fn is_idle_scratch(
     runtime: RuntimeStatus,
     scene_id: &str,
     trusted_restore: bool,
+    workspace_root: &Path,
 ) -> Result<bool, ApiError> {
     if snapshot.session.status != "awaiting_command" {
         return Ok(false);
@@ -235,7 +243,11 @@ fn is_idle_scratch(
     let is_scratch = snapshot.run.is_none()
         && snapshot.session.finished_at_unix_ms == 0
         && snapshot.session.interactive_session_requested
-        && snapshot.session.script_path.is_empty()
+        // Rendering the UI scene produces an editable Python artifact, not a
+        // run. Only that exact workspace artifact is equivalent to no input
+        // script; other managed scripts still require terminal-run evidence.
+        && (snapshot.session.script_path.is_empty()
+            || Path::new(&snapshot.session.script_path) == workspace_root.join("scene_document.py"))
         && snapshot.stage_execution.is_none()
         && snapshot.live_state.is_none()
         && (scene.scene.source_of_truth == "ui" || trusted_restore)
@@ -809,14 +821,16 @@ mod tests {
             &snapshot,
             RuntimeStatus::AwaitingCommand,
             "stable-model",
-            false
+            false,
+            &state.current_workspace_root,
         )
         .unwrap());
         assert!(is_idle_scratch(
             &snapshot,
             RuntimeStatus::AwaitingCommand,
             "stable-model",
-            true
+            true,
+            &state.current_workspace_root,
         )
         .unwrap());
         snapshot.runtime_status.is_busy = true;
@@ -824,7 +838,8 @@ mod tests {
             &snapshot,
             RuntimeStatus::AwaitingCommand,
             "stable-model",
-            true
+            true,
+            &state.current_workspace_root,
         )
         .is_err());
         snapshot.runtime_status.is_busy = false;
@@ -833,7 +848,8 @@ mod tests {
             &snapshot,
             RuntimeStatus::AwaitingCommand,
             "stable-model",
-            true
+            true,
+            &state.current_workspace_root,
         )
         .unwrap());
     }
@@ -851,6 +867,81 @@ mod tests {
             completion_status,
             error: None,
         }
+    }
+
+    #[tokio::test]
+    async fn generated_scene_script_keeps_scratch_admission_without_admitting_other_scripts() {
+        let state = scratch_state().await;
+        {
+            let mut current = state.current_live_state.write().await;
+            current.as_mut().unwrap().session.script_path = state
+                .current_workspace_root
+                .join("scene_document.py")
+                .to_string_lossy()
+                .into_owned();
+        }
+        let acquisition = acquire_workspace_for_restart(&state)
+            .await
+            .expect("rendering the canonical UI script must preserve idle scratch admission");
+        let RestartableWorkspace::Session { identity, .. } = &acquisition.workspace else {
+            panic!("generated script must retain the scratch session");
+        };
+        assert!(identity.run_id.is_none());
+        drop(acquisition);
+
+        // A managed prefix alone is not proof of the canonical UI artifact.
+        for relative in [
+            "other.py",
+            "exports/scene_document.py",
+            "nested/scene_document.py",
+        ] {
+            state
+                .current_live_state
+                .write()
+                .await
+                .as_mut()
+                .unwrap()
+                .session
+                .script_path = state
+                .current_workspace_root
+                .join(relative)
+                .to_string_lossy()
+                .into_owned();
+            assert!(acquire_workspace_for_restart(&state).await.is_err());
+            assert!(state.development_admission.admit().await.is_ok());
+        }
+
+        state
+            .current_live_state
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .session
+            .script_path = state
+            .current_workspace_root
+            .join("scene_document.py")
+            .to_string_lossy()
+            .into_owned();
+        state
+            .current_live_state
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .runtime_status
+            .is_busy = true;
+        assert!(acquire_workspace_for_restart(&state).await.is_err());
+        state
+            .current_live_state
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .runtime_status
+            .is_busy = false;
+        *state.current_live_connectivity.write().await = SessionConnectivity::Disconnected;
+        assert!(acquire_workspace_for_restart(&state).await.is_err());
     }
 
     #[tokio::test]

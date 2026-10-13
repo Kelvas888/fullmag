@@ -34,8 +34,15 @@ function ProjectRunsPage({ projectId }: { projectId: string }) {
     setPendingTaskId(taskId);
     setCancelError(null);
     try {
-      await cancelTask(taskId, "Cancelled by operator from Control Room");
+      const task = selectedRun.data?.tasks.find((candidate) => candidate.task_id === taskId);
+      const beforeClaim = task?.lifecycle === "accepted" || task?.lifecycle === "queued";
+      const revision = selectedRun.data?.catalog_revision;
+      if (beforeClaim && (revision === null || revision === undefined)) {
+        throw new Error("Refresh run details before cancelling this task.");
+      }
+      await cancelTask(taskId, "Cancelled by operator from Control Room", beforeClaim ? revision! : undefined);
     } catch (error) {
+      void selectedRun.refetch();
       setCancelError({
         message: error instanceof Error ? error.message : "Cancellation failed.",
         taskId,
@@ -112,7 +119,7 @@ function ProjectRunsPage({ projectId }: { projectId: string }) {
                     <div className="truncate text-fm-muted" title={task.task_id}>
                       {task.task_id}
                     </div>
-                    {task.lifecycle === "preparing" || task.lifecycle === "running" ? (
+                    {!task.cancellation_intent && ["accepted", "queued", "preparing", "running"].includes(task.lifecycle) ? (
                       <Button
                         aria-label={`Cancel task ${task.task_id}`}
                         className="justify-self-start"
@@ -124,7 +131,7 @@ function ProjectRunsPage({ projectId }: { projectId: string }) {
                         {pendingTaskId === task.task_id ? "Cancelling…" : "Cancel"}
                       </Button>
                     ) : null}
-                    {task.lifecycle === "stopping" ? (
+                    {task.lifecycle === "stopping" || (task.cancellation_intent && !["succeeded", "failed", "cancelled", "interrupted"].includes(task.lifecycle)) ? (
                       <div className="text-fm-muted">Cancellation requested</div>
                     ) : null}
                     {cancelError?.taskId === task.task_id ? (

@@ -11,7 +11,7 @@ ADR-03/04 — rekomendacja do akceptacji geometry/IR ownera i właściciela noty
 | Walidacja geometry | S30: derive bounds sprawdza finite i quaternion; bounds stosuje scale→rotate→translate | Reuse walidacji liczb i descriptorów | Pivot nie jest użyty w odczytanej funkcji; pełny przegląd konsumentów |
 | Rust adapter | S28: nieidentyczna rotation/scale powoduje `owner_transform_rotation_scale_unsupported` | Translation lowering | Brak kompletnego TRS; guard nie jest tutaj warunkowany odczytanym lane |
 | Python scene runtime | S29: `_owner_frame_translation` odmawia rotation/scale | Translation, finite validation | TRS i pivot-aware lowering, q≡−q |
-| ProblemIR | Nie odczytano wszystkich pól i ścieżek w tej rewizji | Jeden istniejący publiczny IR, nie alternatywny frontend IR | PR13 mapuje canonical geometry do istniejącego ProblemIR/DTO; PR14 kwalifikuje lane consumers; brak dowodu nie oznacza braku wszystkich transformów |
+| ProblemIR | Nie odczytano wszystkich pól i ścieżek w tej rewizji | Jeden istniejący publiczny IR, nie alternatywny frontend IR | PR09 musi wskazać konkretne DTO i consumers; brak dowodu nie oznacza braku wszystkich transformów |
 | Eksport Python / load | Wymagany kontrakt repo: jeden edytowalny DSL | Istniejący exporter, schema versioning | Round-trip pełnego transformu/asset ref bez utraty semantyki |
 | Evaluator geometry | Brak pełnej kwalifikacji w V2 | Przenoszenie obecnych descriptorów | Inverse transform, normal rules, predicates, local/world frames |
 | FDM membership / FEM realization | Nie wykonano CPU/GPU runtime | Wspólne geometry intent | Parity geometrii i dyskretyzacji; osobne capability evidence |

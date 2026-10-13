@@ -12,7 +12,7 @@ def add(a,b): return [x+y for x,y in zip(a,b)]
 def sub(a,b): return [x-y for x,y in zip(a,b)]
 def values_close(a,b,tol): return len(a)==len(b) and all(close(x,y,tol) for x,y in zip(a,b))
 def main():
-    f=json.loads((ROOT/'fixtures/transform_oracles.json').read_text(encoding='utf-8'))
+    f=json.loads((ROOT/'fixtures/transform_oracles.json').read_text())
     q=f['quaternion_xyzw'];n=math.sqrt(sum(v*v for v in q));x,y,z,w=[v/n for v in q]
     R=[[1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)],
        [2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)],
@@ -31,7 +31,7 @@ def main():
     check('Pivot-only invariant',values_close(newt,f['pivot_only']['expected_new_translation'],tol) and values_close(newb,b,tol))
     c=math.sqrt(.5);col1=[2*c,c,0];col2=[-2*c,c,0];dot=sum(a*b for a,b in zip(col1,col2))
     check('Future hierarchy shear counterexample',close(dot,-1.5,1e-14),{'column_dot':dot,'production_status':'unsupported in proposed R1/R2'})
-    f=json.loads((ROOT/'fixtures/slice_oracle.json').read_text(encoding='utf-8'));verts=f['vertices'];n=f['plane']['normal'];off=f['plane']['offset_m'];pts=[]
+    f=json.loads((ROOT/'fixtures/slice_oracle.json').read_text());verts=f['vertices'];n=f['plane']['normal'];off=f['plane']['offset_m'];pts=[]
     for i,j in itertools.combinations(range(4),2):
         a,c=verts[i],verts[j];da=sum(x*y for x,y in zip(n,a))-off;dc=sum(x*y for x,y in zip(n,c))-off
         if da*dc<0:
@@ -39,7 +39,7 @@ def main():
     check('Tetra plane intersection',len(pts)==3 and all(any(values_close(p,e,1e-20) for p in pts) for e in f['expected_polygon_unordered']), {'computed_vertices_m':pts})
     u=sub(pts[1],pts[0]);v=sub(pts[2],pts[0]);cross=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]];area=.5*math.sqrt(sum(x*x for x in cross))
     check('Tetra intersection area',close(area,f['expected_area_m2'],f['tolerance']['area_abs_m2']),{'computed_area_m2':area})
-    nf=json.loads((ROOT/'fixtures/numeric_oracles.json').read_text(encoding='utf-8'));units={'m':1,'mm':1e-3,'um':1e-6,'µm':1e-6,'μm':1e-6,'nm':1e-9}
+    nf=json.loads((ROOT/'fixtures/numeric_oracles.json').read_text());units={'m':1,'mm':1e-3,'um':1e-6,'µm':1e-6,'μm':1e-6,'nm':1e-9}
     pattern=re.compile(r'^([+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)(?:[eE][+-]?\d+)?)(?: ?(nm|um|µm|μm|mm|m))?$')
     def parse(raw):
         s=raw.strip()

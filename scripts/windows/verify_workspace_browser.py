@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import ctypes
 from ctypes import wintypes
+import copy
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+from urllib.parse import quote
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -33,9 +35,14 @@ from verify_pinned_dataset_browser import link_directory, stop_owned_process
 WEB_PORT = 3258
 MAX_FRAME = 128 * 1024
 MAX_LOG = 2 * 1024 * 1024
+MAX_EXECUTION_OBSERVATIONS = 16
 READY_SCHEMA = "fullmag.development-browser-native-ready.v1"
 RESULT_SCHEMA = "fullmag.development-browser-native-result.v1"
 API_LOG_SCHEMA = "fullmag.development-browser-api-log.v1"
+SCRATCH_CHILD_SCHEMA = "fullmag.development-browser-scratch-child.v1"
+SCRATCH_COMMAND_KINDS = frozenset({"fdm_grid_refresh", "remesh", "run", "relax", "solve"})
+COMPUTE_CHILD_KINDS = frozenset({"run", "relax", "solve"})
+EXECUTION_SCOPE_KEYS = ("api_instance_id", "session_id", "backend_session_epoch", "request_scope_epoch")
 
 
 def utc_ms():
@@ -54,6 +61,104 @@ def utc_ms():
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def check_material_anisotropy_plans(binaries, fixture, env, receipt):
+    """Exercise the production planner without compiling tests or starting a solver."""
+    root = fixture / "material-anisotropy-plans"
+    root.mkdir(exist_ok=False)
+    verifier_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    executable_sha256 = hashlib.sha256((binaries / "fullmag.exe").read_bytes()).hexdigest()
+    receipt["workspace_browser_material_plan_identity"] = {
+        "verifier_sha256": verifier_sha256, "executable_sha256": executable_sha256}
+
+    def invoke(label, arguments):
+        stdout_path, stderr_path = root / f"{label}.stdout", root / f"{label}.stderr"
+        with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
+            child = subprocess.Popen([str(binaries / "fullmag.exe"), *arguments],
+                                     cwd=fixture, env=env, stdout=stdout, stderr=stderr,
+                                     creationflags=subprocess.CREATE_NO_WINDOW)
+            record = {"label": f"material-plan-{label}", "pid": child.pid, "waited": False}
+            receipt["processes"].append(record)
+            deadline = time.monotonic() + 30
+            try:
+                while child.poll() is None:
+                    if (time.monotonic() >= deadline
+                            or stdout_path.stat().st_size + stderr_path.stat().st_size > MAX_LOG):
+                        raise storage.StorageError(f"Production material planner {label} exceeded its bound")
+                    time.sleep(0.02)
+                child.wait(timeout=10)
+                record.update(waited=True, exit_code=child.returncode, kill_requested=False)
+            finally:
+                if not record["waited"]:
+                    try:
+                        if child.poll() is None:
+                            record["kill_requested"] = True
+                            child.kill()
+                        child.wait(timeout=10)
+                        record.update(waited=True, exit_code=child.returncode)
+                    except Exception as error:
+                        record.update(outcome="unknown", cleanup_error=str(error),
+                                      executable=str(binaries / "fullmag.exe"))
+                        raise storage.StorageError(
+                            f"Production material planner {label} has unknown cleanup outcome") from error
+        if stdout_path.stat().st_size + stderr_path.stat().st_size > MAX_LOG:
+            raise storage.StorageError(f"Production material planner {label} exceeded its output bound")
+        return child.returncode, stdout_path.read_text(encoding="utf-8"), stderr_path.read_text(encoding="utf-8")
+
+    code, stdout, stderr = invoke("example", ["example-ir"])
+    if code:
+        raise storage.StorageError(f"Production planner example failed: {stderr[:1024]}")
+    baseline = json.loads(stdout)
+    baseline["energy_terms"] = []
+    baseline["geometry"]["entries"][0]["size"] = [2e-9, 2e-9, 2e-9]
+    baseline["study"]["sampling"]["outputs"] = []
+    baseline["backend_policy"]["requested_backend"] = "fdm"
+    baseline["problem_meta"]["runtime_metadata"]["runtime_selection"] = {
+        "backend": "fdm", "device": "cpu", "precision": "double", "mode": "strict"}
+    cases = [
+        ("ku1", {"uniaxial_anisotropy": 1000.0, "anisotropy_axis": [0, 0, 1]}, True),
+        ("negative-ku1", {"uniaxial_anisotropy": -1000.0, "anisotropy_axis": [0, 0, 1]}, True),
+        ("ku2", {"uniaxial_anisotropy": 0.0, "uniaxial_anisotropy_k2": 1000.0}, True),
+        ("cubic", {"cubic_anisotropy_kc1": 1000.0}, True),
+        ("absent", {}, False),
+        ("zero", {"uniaxial_anisotropy": 0.0}, False),
+        ("ku2-without-ku1", {"uniaxial_anisotropy_k2": 1000.0}, False),
+        ("zero-axis", {"uniaxial_anisotropy": 1000.0, "anisotropy_axis": [0, 0, 0]}, False),
+        ("parallel-cubic", {"cubic_anisotropy_kc1": 1000.0,
+                            "cubic_anisotropy_axis1": [1, 0, 0],
+                            "cubic_anisotropy_axis2": [2, 0, 0]}, False),
+        ("unused-material", {}, False),
+    ]
+    observations = receipt["workspace_browser_material_plans"] = []
+    for label, coefficients, accepted in cases:
+        problem = copy.deepcopy(baseline)
+        problem["materials"][0].update(coefficients)
+        if label == "unused-material":
+            unused = copy.deepcopy(problem["materials"][0])
+            unused.update(name="unused", uniaxial_anisotropy=1000.0)
+            problem["materials"].append(unused)
+        input_path = root / f"{label}.json"
+        input_path.write_text(json.dumps(problem, allow_nan=False), encoding="utf-8")
+        code, stdout, stderr = invoke(label, ["plan-json", str(input_path), "--execution-plan"])
+        observation = {"case": label, "expected_accepted": accepted, "exit_code": code,
+                       "input_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest()}
+        observations.append(observation)
+        if accepted:
+            if code:
+                raise storage.StorageError(f"Production planner rejected {label}: {stderr[:1024]}")
+            fdm = json.loads(stdout)["backend_plan"]
+            if (fdm["kind"] != "fdm" or fdm["enable_exchange"] or fdm["enable_demag"]
+                    or fdm.get("external_field") is not None):
+                raise storage.StorageError(f"Production planner changed local-only intent for {label}")
+        elif code == 0 or not any(reason in stderr for reason in (
+                "or nonzero anisotropy in a referenced material",
+                "at least one interaction or material anisotropy is required")):
+            raise storage.StorageError(f"Production planner did not reject {label} at the physics gate")
+        observation["passed"] = True
+    if (hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != verifier_sha256
+            or hashlib.sha256((binaries / "fullmag.exe").read_bytes()).hexdigest() != executable_sha256):
+        raise storage.StorageError("Production material planner verifier or executable changed during checks")
 
 
 def valid_uuid(value):
@@ -115,6 +220,54 @@ def read_session_scope(api_port, api_instance_id, identity):
             "request_scope_epoch": session["request_scope_epoch"]}
 
 
+def read_execution_scope(api_port, api_instance_id):
+    """Read the actual pinned API/session identity used by execution resources."""
+    if not valid_uuid(api_instance_id):
+        raise storage.StorageError("Execution observation has no canonical API pin")
+    backend = read_api(api_port, api_instance_id, "/v2/platform/development-backend")
+    identity = backend.get("workspace_identity")
+    if (not isinstance(identity, dict)
+            or identity.get("api_instance_id") != api_instance_id
+            or not isinstance(identity.get("session_id"), str)
+            or not identity["session_id"].strip()
+            or type(identity.get("session_epoch")) is not int
+            or identity["session_epoch"] < 0):
+        raise storage.StorageError("Execution API has no exact workspace identity")
+    status = read_api(api_port, api_instance_id, "/v2/sessions/current/status")
+    session = status.get("session")
+    session_id = identity["session_id"]
+    if (not isinstance(session, dict)
+            or session.get("session_id") != session_id
+            or not isinstance(session.get("session_epoch"), str)
+            or not session["session_epoch"].startswith(session_id + "@")
+            or not session["session_epoch"][len(session_id) + 1:]
+            or session.get("request_scope_epoch") != f"{api_instance_id}:{identity['session_epoch']}"):
+        raise storage.StorageError("Execution status is not bound to the observed API/session transition")
+    return {
+        "api_instance_id": api_instance_id,
+        "session_id": session_id,
+        "backend_session_epoch": identity["session_epoch"],
+        "session_resource_epoch": session["session_epoch"],
+        "request_scope_epoch": session["request_scope_epoch"],
+    }
+
+
+def read_admission_observation(api_port, api_instance_id):
+    """Keep rejected prerequisites as evidence, without granting admission."""
+    before = read_execution_scope(api_port, api_instance_id)
+    status = read_api(api_port, api_instance_id, "/v2/sessions/current/status")
+    mesh = read_api(api_port, api_instance_id, "/v2/sessions/current/meshing/semantics")
+    after = read_execution_scope(api_port, api_instance_id)
+    session = status.get("session", {})
+    if (before != after or not isinstance(session, dict)
+            or session.get("session_id") != before["session_id"]
+            or session.get("session_epoch") != before["session_resource_epoch"]
+            or session.get("request_scope_epoch") != before["request_scope_epoch"]):
+        raise storage.StorageError("Admission observation crossed an API/session transition")
+    return {"scope": before, "status": status, "meshing_semantics": mesh,
+            "observed_at_unix_ms": utc_ms()}
+
+
 def record_started_frame(frame, api_records, helper_records, receipt):
     schema = frame.get("schema")
     if schema == "fullmag.development-cli-owner-progress.v1":
@@ -155,10 +308,121 @@ def record_api_log_frame(frame, expected, state_root, api_records, receipt):
         logs.append(evidence)
 
 
-def terminal_custody(api_records, helper_records):
+def record_scratch_child_frame(frame, expected, scratch_records, receipt):
+    if not isinstance(frame, dict) or frame.get("schema") != SCRATCH_CHILD_SCHEMA:
+        return False
+
+    def reject(message):
+        receipt["workspace_browser_progress_error"] = "invalid scratch child custody"
+        raise storage.StorageError(message)
+
+    fields = {"schema", "nonce", "state", "pid", "command_id", "command_kind",
+              "api_instance_id", "session_id", "session_epoch", "request_scope_epoch",
+              "waited", "exit_code", "kill_requested"}
+    if set(frame) != fields:
+        reject("Scratch child frame has an invalid shape")
+    if frame["nonce"] != expected.get("nonce"):
+        reject("Scratch child frame has a different nonce")
+    if (type(frame["pid"]) is not int or frame["pid"] <= 0
+            or not isinstance(frame["command_id"], str) or not frame["command_id"].strip()
+            or not isinstance(frame["command_kind"], str)
+            or frame["command_kind"] not in SCRATCH_COMMAND_KINDS
+            or not valid_uuid(frame["api_instance_id"])
+            or not isinstance(frame["session_id"], str) or not frame["session_id"].strip()
+            or not isinstance(frame["session_epoch"], str)
+            or not frame["session_epoch"].startswith(frame["session_id"] + "@")
+            or not frame["session_epoch"][len(frame["session_id"]) + 1:]
+            or not isinstance(frame["request_scope_epoch"], str)):
+        reject("Scratch child frame has invalid scope or command identity")
+    scope_prefix = frame["api_instance_id"] + ":"
+    request_counter = frame["request_scope_epoch"][len(scope_prefix):]
+    if (not frame["request_scope_epoch"].startswith(scope_prefix)
+            or not re.fullmatch(r"[0-9]+", request_counter)):
+        reject("Scratch child frame has an invalid request scope epoch")
+    state = frame["state"]
+    if state == "started":
+        if (type(frame["waited"]) is not bool or frame["waited"] is not False
+                or frame["exit_code"] is not None
+                or type(frame["kill_requested"]) is not bool or frame["kill_requested"] is not False):
+            reject("Scratch child start frame is not an un-waited child")
+    elif state == "waited":
+        if (type(frame["waited"]) is not bool or frame["waited"] is not True
+                or type(frame["exit_code"]) is not int
+                or type(frame["kill_requested"]) is not bool):
+            reject("Scratch child wait frame lacks an exact terminal outcome")
+    else:
+        reject("Scratch child frame has an unknown state")
+
+    identity_fields = ("pid", "command_id", "command_kind", "api_instance_id", "session_id",
+                      "session_epoch", "request_scope_epoch")
+    api_logs = receipt.get("workspace_browser_api_logs", [])
+    known_api_pins = {
+        log.get("api_instance_id")
+        for log in (api_logs if isinstance(api_logs, list) else [])
+        if isinstance(log, dict) and valid_uuid(log.get("api_instance_id"))
+    }
+    restored = receipt.get("workspace_browser_restored")
+    if isinstance(restored, dict) and valid_uuid(restored.get("new_api_instance_id")):
+        known_api_pins.add(restored["new_api_instance_id"])
+    for result_key in ("workspace_browser_result", "workspace_browser_cleanup_result"):
+        result = receipt.get(result_key)
+        if isinstance(result, dict):
+            known_api_pins.update(pin for pin in (result.get("old_api_instance_id"),
+                                                   result.get("new_api_instance_id"))
+                                  if valid_uuid(pin))
+    if frame["api_instance_id"] not in known_api_pins:
+        reject("Scratch child API pin differs from observed browser API logs")
+
+    command_id = frame["command_id"]
+    entry = scratch_records.get(command_id)
+    if state == "started":
+        if entry is not None:
+            reject("Scratch child emitted a duplicate start frame")
+        record = {
+            "label": "browser-scratch-child",
+            **{key: frame[key] for key in identity_fields},
+            "waited": False,
+            "exit_code": None,
+            "kill_requested": False,
+            "outcome": "unknown",
+        }
+        if not isinstance(receipt.get("processes"), list):
+            reject("Scratch child receipt has no process list")
+        scratch_records[command_id] = {"identity": {key: frame[key] for key in identity_fields},
+                                       "record": record, "wait_seen": False}
+        receipt["processes"].append(record)
+    else:
+        if entry is None:
+            reject("Scratch child wait frame has no observed start")
+        if entry["wait_seen"]:
+            reject("Scratch child emitted a duplicate wait frame")
+        if any(entry["identity"].get(key) != frame[key] for key in identity_fields):
+            reject("Scratch child identity changed between start and wait")
+        entry["wait_seen"] = True
+        entry["record"].update(waited=True, exit_code=frame["exit_code"],
+                               kill_requested=frame["kill_requested"], outcome="terminal")
+
+    frames = receipt.setdefault("workspace_browser_scratch_child_frames", [])
+    if not isinstance(frames, list):
+        reject("Scratch child receipt has no frame list")
+    frames.append(dict(frame))
+    return True
+
+
+def terminal_custody(api_records, helper_records, scratch_records=None, receipt=None):
+    if receipt is not None and receipt.get("workspace_browser_progress_error"):
+        return False
+    scratch_records = scratch_records or {}
     return bool(api_records) and all(
         record.get("waited") is True and type(record.get("exit_code")) is int
-        for record in [*api_records.values(), *helper_records.values()])
+        for record in [*api_records.values(), *helper_records.values()]
+    ) and all(
+        entry.get("wait_seen") is True
+        and entry.get("record", {}).get("waited") is True
+        and type(entry.get("record", {}).get("exit_code")) is int
+        and type(entry.get("record", {}).get("kill_requested")) is bool
+        for entry in scratch_records.values()
+    )
 
 
 def validate_result_frame(frame, nonce):
@@ -183,23 +447,372 @@ def validate_result_frame(frame, nonce):
         raise storage.StorageError("Native browser result duplicated helper custody")
 
 
+def completed_command_detail(frame, command_id, command_kind):
+    if (not isinstance(frame, dict)
+            or frame.get("command_id") != command_id
+            or frame.get("kind") != command_kind
+            or frame.get("status") != "completed"
+            or frame.get("completion_status") != "completed"
+            or type(frame.get("created_at_unix_ms")) is not int
+            or type(frame.get("completed_at_unix_ms")) is not int
+            or frame["created_at_unix_ms"] <= 0
+            or frame["completed_at_unix_ms"] < frame["created_at_unix_ms"]):
+        raise storage.StorageError(f"Observed {command_kind} command has no exact completed ledger receipt")
+    return {
+        "command_id": command_id,
+        "kind": command_kind,
+        "status": frame["status"],
+        "completion_status": frame["completion_status"],
+        "created_at_unix_ms": frame["created_at_unix_ms"],
+        "completed_at_unix_ms": frame["completed_at_unix_ms"],
+        "run_id": frame.get("run_id"),
+        "stage_id": frame.get("stage_id"),
+        "stage_index": frame.get("stage_index"),
+        "applied_step": frame.get("applied_step"),
+        "requested_execution": frame.get("requested_execution"),
+        "resolved_execution": frame.get("resolved_execution"),
+    }
+
+
+def completed_scratch_entry(entry, api_instance_id, scope):
+    if not isinstance(entry, dict) or entry.get("wait_seen") is not True:
+        return False
+    identity, record = entry.get("identity"), entry.get("record")
+    return (
+        isinstance(identity, dict) and isinstance(record, dict)
+        and identity.get("api_instance_id") == api_instance_id
+        and identity.get("session_id") == scope.get("session_id")
+        and identity.get("session_epoch") == scope.get("session_resource_epoch")
+        and identity.get("request_scope_epoch") == scope.get("request_scope_epoch")
+        and record.get("api_instance_id") == api_instance_id
+        and record.get("waited") is True
+        and type(record.get("exit_code")) is int and record["exit_code"] == 0
+        and record.get("kill_requested") is False
+    )
+
+
+def same_execution_scope(left, right):
+    return isinstance(left, dict) and isinstance(right, dict) and all(
+        left.get(key) == right.get(key) for key in EXECUTION_SCOPE_KEYS)
+
+
+def owned_scratch_entry_in_scope(entry, api_instance_id, scope):
+    if not isinstance(entry, dict):
+        return False
+    identity, record = entry.get("identity"), entry.get("record")
+    if (not isinstance(identity, dict) or not isinstance(record, dict)
+            or identity.get("api_instance_id") != api_instance_id
+            or identity.get("session_id") != scope.get("session_id")
+            or identity.get("session_epoch") != scope.get("session_resource_epoch")
+            or identity.get("request_scope_epoch") != scope.get("request_scope_epoch")
+            or record.get("api_instance_id") != api_instance_id
+            or record.get("kill_requested") is not False):
+        return False
+    if entry.get("wait_seen") is True:
+        return record.get("waited") is True and type(record.get("exit_code")) is int \
+            and record["exit_code"] == 0
+    return record.get("waited") is False and record.get("exit_code") is None
+
+
+def scratch_frame_positions(frames, command_ids):
+    positions = {}
+    for index, frame in enumerate(frames):
+        if not isinstance(frame, dict) or frame.get("command_id") not in command_ids:
+            continue
+        state = frame.get("state")
+        if state not in {"started", "waited"}:
+            continue
+        key = (frame["command_id"], state)
+        if key in positions:
+            raise storage.StorageError("Execution observation found duplicate scratch lifecycle frames")
+        positions[key] = index
+    return positions
+
+
 class ProofBridge:
-    def __init__(self, expected, api_port, frames, process):
+    def __init__(self, expected, api_port, frames, process, receipt=None,
+                 scratch_records=None, receipt_path=None):
         self.expected, self.api_port = expected, api_port
         self.frames, self.process = frames, process
         self.lock = threading.RLock()
+        self.execution_lock = threading.Lock()
+        self.receipt = receipt if receipt is not None else {"processes": []}
+        self.scratch_records = scratch_records if scratch_records is not None else {}
+        self.receipt_path = Path(receipt_path) if receipt_path is not None else None
         self.ready = None
         self.restored = None
         self.before = None
+        self.restore_observation = None
+        self.last_execution = None
         self.browser = None
         self.error = None
         self.finished = threading.Event()
+        self.cancelled = threading.Event()
+
+    def cancel(self, body):
+        if (set(body) != {"schema", "nonce"}
+                or body.get("schema") != "fullmag.development-browser-cancel.v1"
+                or body.get("nonce") != self.expected["nonce"]):
+            raise storage.StorageError("Private browser cancellation has an invalid scope")
+        with self.lock:
+            if self.finished.is_set():
+                raise storage.StorageError("Browser finish has already been submitted")
+            self.receipt["workspace_browser_cancel_requested"] = True
+            self.cancelled.set()
+        return {"cancel_requested": True}
 
     def eligibility(self):
         with self.lock:
             if self.process.poll() is not None or self.ready is None:
                 raise storage.StorageError("Native browser owner is not ready")
             return validate_ready(self.ready, self.expected, utc_ms())
+
+    def _store_execution_observation(self, observation):
+        with self.lock:
+            observations = self.receipt.setdefault("workspace_browser_execution_observations", [])
+            if not isinstance(observations, list):
+                raise storage.StorageError("Execution receipt has an invalid observation list")
+            if len(observations) >= MAX_EXECUTION_OBSERVATIONS:
+                raise storage.StorageError("Execution observation budget is exhausted")
+            observations.append(dict(observation))
+            self.receipt["workspace_browser_execution"] = dict(observation)
+            if self.receipt_path is not None:
+                storage.atomic_json(self.receipt_path, self.receipt)
+
+    def capture_restored_observation(self):
+        with self.execution_lock:
+            with self.lock:
+                if self.restore_observation is not None:
+                    return dict(self.restore_observation)
+                before, restored = copy.deepcopy(self.before), copy.deepcopy(self.restored)
+            if before is None or not isinstance(restored, dict):
+                raise storage.StorageError("Restored execution scope has no captured before state")
+            api_instance_id = restored.get("new_api_instance_id")
+            if (not valid_uuid(api_instance_id)
+                    or api_instance_id == before.get("api_instance_id")
+                    or type(restored.get("api_pid")) is not int or restored["api_pid"] <= 0):
+                raise storage.StorageError("Restored execution scope has no distinct native API pin")
+            scope = read_execution_scope(self.api_port, api_instance_id)
+            scene = read_api(self.api_port, api_instance_id, "/v2/sessions/current/model/scene")
+            if (canonical(scene) != canonical(before.get("scene"))
+                    or scope["api_instance_id"] != api_instance_id
+                    or scope["session_id"] == before["identity"].get("session_id")
+                    or scope["backend_session_epoch"] != 1
+                    or scope["request_scope_epoch"] == before["session_scope"].get("request_scope_epoch")
+                    or scope["session_resource_epoch"] == before["session_scope"].get("session_resource_epoch")):
+                raise storage.StorageError("Restored scene or fresh session differs from the captured before state")
+            observation = {
+                "api_instance_id": api_instance_id,
+                "api_pid": restored["api_pid"],
+                "api_response_pin": api_instance_id,
+                "scope": scope,
+                "scene_sha256": hashlib.sha256(canonical(scene).encode()).hexdigest(),
+                "object_count": len(scene.get("objects", [])) if isinstance(scene, dict) else 0,
+                "captured_at_unix_ms": utc_ms(),
+            }
+            with self.lock:
+                if self.restore_observation is None:
+                    self.restore_observation = observation
+                    self.receipt["workspace_browser_restore_observation"] = dict(observation)
+                    if self.receipt_path is not None:
+                        storage.atomic_json(self.receipt_path, self.receipt)
+                elif canonical(self.restore_observation) != canonical(observation):
+                    raise storage.StorageError("Restored execution scope changed during baseline capture")
+                return dict(self.restore_observation)
+
+    def execution(self, *, require_terminal=True):
+        observed_at = utc_ms()
+        try:
+            evidence = self._read_execution_evidence(require_terminal=require_terminal)
+        except Exception as error:
+            observation = {"observed_at_unix_ms": observed_at, "verified": False,
+                           "error": f"{type(error).__name__}: {str(error)[:512]}"}
+            try:
+                self._store_execution_observation(observation)
+            except storage.StorageError:
+                pass
+            if isinstance(error, storage.StorageError):
+                raise
+            raise storage.StorageError(f"Execution observation failed: {type(error).__name__}: {error}") from error
+        observation = {"observed_at_unix_ms": observed_at, "verified": require_terminal,
+                       "ready_to_close": not require_terminal, **evidence}
+        self._store_execution_observation(observation)
+        with self.lock:
+            self.last_execution = dict(observation)
+        return {"verified": require_terminal, "ready_to_close": not require_terminal, **evidence}
+
+    def _read_execution_evidence(self, *, require_terminal=True):
+        with self.lock:
+            before = copy.deepcopy(self.before)
+            restored = copy.deepcopy(self.restored)
+            restore = copy.deepcopy(self.restore_observation)
+            scratch = copy.deepcopy(self.scratch_records)
+            scratch_frames = copy.deepcopy(self.receipt.get("workspace_browser_scratch_child_frames", []))
+            api_logs = copy.deepcopy(self.receipt.get("workspace_browser_api_logs", []))
+        if before is None or restored is None or restore is None:
+            raise storage.StorageError("Execution observation lacks before and restored API scopes")
+        api_instance_id = restored.get("new_api_instance_id")
+        api_pid = restored.get("api_pid")
+        if (not valid_uuid(api_instance_id) or api_instance_id == before.get("api_instance_id")
+                or type(api_pid) is not int or api_pid <= 0
+                or restore.get("api_instance_id") != api_instance_id
+                or restore.get("api_response_pin") != api_instance_id):
+            raise storage.StorageError("Execution observation is not bound to the restored API response pin")
+        if not isinstance(api_logs, list) or not any(
+                isinstance(log, dict) and log.get("api_instance_id") == before.get("api_instance_id")
+                for log in api_logs):
+            raise storage.StorageError("Captured before state has no matching observed API log pin")
+
+        scope_before = read_execution_scope(self.api_port, api_instance_id)
+        queue_before = read_api(self.api_port, api_instance_id, "/v2/sessions/current/simulation/commands")
+        scene = read_api(self.api_port, api_instance_id, "/v2/sessions/current/model/scene")
+        scene_sha256 = hashlib.sha256(canonical(scene).encode()).hexdigest()
+        if (canonical(scene) != canonical(before.get("scene"))
+                or not same_execution_scope(scope_before, restore.get("scope"))):
+            raise storage.StorageError("Restored scene or session scope changed after the restore observation")
+
+        records = list(scratch.items())
+        grid_index = next((index for index in range(len(records) - 1, -1, -1)
+                           if records[index][1].get("identity", {}).get("api_instance_id") == api_instance_id
+                           and records[index][1].get("identity", {}).get("command_kind") == "fdm_grid_refresh"), None)
+        if grid_index is None:
+            raise storage.StorageError("No restored-API fdm_grid_refresh child was observed")
+        grid_id, grid_entry = records[grid_index]
+        if not completed_scratch_entry(grid_entry, api_instance_id, restore["scope"]):
+            raise storage.StorageError("fdm_grid_refresh child lacks a normal successful wait")
+
+        compute_index = next((index for index in range(len(records) - 1, grid_index, -1)
+                              if records[index][1].get("identity", {}).get("api_instance_id") == api_instance_id
+                              and records[index][1].get("identity", {}).get("command_kind") in COMPUTE_CHILD_KINDS), None)
+        if compute_index is None:
+            raise storage.StorageError("No separate normal Compute child followed the grid refresh")
+        compute_id, compute_entry = records[compute_index]
+        if ((require_terminal and not completed_scratch_entry(compute_entry, api_instance_id, restore["scope"]))
+                or grid_id == compute_id
+                or grid_entry["identity"].get("pid") == compute_entry["identity"].get("pid")):
+            raise storage.StorageError("Normal Compute child is not separate and normally waited")
+        positions = scratch_frame_positions(scratch_frames, {grid_id, compute_id})
+        grid_start, grid_wait = positions.get((grid_id, "started"), -1), positions.get((grid_id, "waited"), -1)
+        compute_start, compute_wait = positions.get((compute_id, "started"), -1), positions.get((compute_id, "waited"))
+        if (not (grid_start < grid_wait < compute_start)
+                or (compute_wait is not None and compute_wait <= compute_start)):
+            raise storage.StorageError("Scratch frames do not show grid wait before the distinct Compute child")
+        if not owned_scratch_entry_in_scope(compute_entry, api_instance_id, restore["scope"]):
+            raise storage.StorageError("Compute child lost its exact API/session scope or custody")
+
+        grid_kind = grid_entry["identity"]["command_kind"]
+        compute_kind = compute_entry["identity"]["command_kind"]
+        grid_detail = read_api(self.api_port, api_instance_id,
+                               "/v2/sessions/current/simulation/commands/" + quote(grid_id, safe=""))
+        grid_evidence = completed_command_detail(grid_detail, grid_id, grid_kind)
+        compute_detail = read_api(self.api_port, api_instance_id,
+                                  "/v2/sessions/current/simulation/commands/" + quote(compute_id, safe=""))
+        compute_evidence = completed_command_detail(compute_detail, compute_id, compute_kind)
+        if (not isinstance(compute_evidence["run_id"], str) or not compute_evidence["run_id"].strip()
+                or not ((isinstance(compute_evidence["stage_id"], str) and compute_evidence["stage_id"].strip())
+                        or (type(compute_evidence["stage_index"]) is int and compute_evidence["stage_index"] >= 0))
+                or type(compute_evidence["applied_step"]) is not int or compute_evidence["applied_step"] <= 0
+                or not isinstance(compute_evidence["requested_execution"], dict)
+                or not isinstance(compute_evidence["resolved_execution"], dict)):
+            raise storage.StorageError("Completed Compute command lacks positive stage-step and execution provenance")
+
+        run = read_api(self.api_port, api_instance_id, "/v2/sessions/current/simulation/runs/current")
+        stages = read_api(self.api_port, api_instance_id, "/v2/sessions/current/simulation/stages/execution")
+        if (not isinstance(run, dict) or run.get("run_id") != compute_evidence["run_id"]
+                or run.get("session_id") != scope_before["session_id"]
+                or run.get("status") != ("completed" if require_terminal else "awaiting_command")
+                or type(run.get("total_steps")) is not int or run["total_steps"] <= 0
+                or type(run.get("total_stages")) is not int or run["total_stages"] <= 0
+                or not isinstance(stages, dict) or type(stages.get("total_stages")) is not int
+                or stages["total_stages"] <= 0 or not isinstance(stages.get("completed_stage_indexes"), list)
+                or not isinstance(stages.get("stages"), list)):
+            raise storage.StorageError("Current run has no completed stage or positive solver-step receipt")
+        matching_stages = [item for item in stages["stages"]
+                           if isinstance(item, dict) and item.get("command_id") == compute_id]
+        if len(matching_stages) != 1:
+            raise storage.StorageError("Completed Compute has no unique stage linked by command ID")
+        if not require_terminal and any(not isinstance(item, dict) or item.get("status") != "completed"
+                                        for item in stages["stages"]):
+            raise storage.StorageError("Close requires all authored stages to be completed")
+        stage = matching_stages[0]
+        stage_index = stage.get("index")
+        completed_indexes = stages["completed_stage_indexes"]
+        if (not isinstance(stage.get("stage_id"), str) or not stage["stage_id"].strip()
+                or type(stage_index) is not int or stage_index < 0
+                or stage.get("status") != "completed"
+                or type(stage.get("started_at_unix_ms")) is not int
+                or type(stage.get("completed_at_unix_ms")) is not int
+                or stage["started_at_unix_ms"] <= 0
+                or stage["completed_at_unix_ms"] < stage["started_at_unix_ms"]
+                or any(type(index) is not int for index in completed_indexes)
+                or stage_index not in completed_indexes
+                or (compute_evidence["stage_id"] is not None
+                    and compute_evidence["stage_id"] != stage["stage_id"])
+                or (compute_evidence["stage_index"] is not None
+                    and compute_evidence["stage_index"] != stage_index)):
+            raise storage.StorageError("Compute stage is not completed with exact run and command linkage")
+        requested, resolved = compute_evidence["requested_execution"], compute_evidence["resolved_execution"]
+        expected_requested = {"backend": "fdm", "device": "cpu", "precision": "double", "mode": "strict"}
+        if any(requested.get(key) != value for key, value in expected_requested.items()):
+            raise storage.StorageError("Compute command did not request strict-double FDM CPU execution")
+        resolved_backend = resolved.get("backend")
+        if (resolved_backend != "fdm"
+                or resolved.get("device") != "cpu" or resolved.get("precision") != "double"
+                or resolved.get("mode") != "strict"):
+            raise storage.StorageError("Compute command did not resolve to strict-double FDM CPU")
+        for suffix in ("backend", "device", "precision", "mode"):
+            if run.get("requested_" + suffix) != requested[suffix]:
+                raise storage.StorageError("Current run differs from the Compute requested execution")
+            if run.get("resolved_" + suffix) != resolved.get(suffix):
+                raise storage.StorageError("Current run differs from the Compute resolved execution")
+        scope_after = read_execution_scope(self.api_port, api_instance_id)
+        if canonical(scope_after) != canonical(scope_before):
+            raise storage.StorageError("API/session observation scope changed while reading execution receipts")
+        if not same_execution_scope(scope_after, restore.get("scope")):
+            raise storage.StorageError("Stable API/session execution scope changed after restore")
+        close_precondition = None
+        if not require_terminal:
+            queue_after = read_api(self.api_port, api_instance_id, "/v2/sessions/current/simulation/commands")
+            if (not isinstance(queue_before, dict) or not isinstance(queue_after, dict)
+                    or not isinstance(queue_before.get("commands"), list)
+                    or canonical(queue_before["commands"]) != canonical(queue_after.get("commands"))
+                    or any(not isinstance(item, dict) or item.get("status") not in {"completed", "failed", "rejected"}
+                           for item in queue_before["commands"])
+                    or stages.get("runtime_state") != "awaiting_command"
+                    or type(stages.get("revision")) is not int or stages["revision"] < 0):
+                raise storage.StorageError("Close readiness changed or another command is still pending")
+            close_precondition = {"runtime_state": "awaiting_command",
+                                  "command_revision": len(queue_before["commands"]),
+                                  "stage_execution_revision": stages["revision"]}
+
+        return {
+            "api_instance_id": api_instance_id,
+            "api_pid": api_pid,
+            "api_response_pin": api_instance_id,
+            "before_api_instance_id": before.get("api_instance_id"),
+            "before_scene_sha256": hashlib.sha256(canonical(before["scene"]).encode()).hexdigest(),
+            "scene_sha256": scene_sha256,
+            "restore_scope": restore["scope"],
+            "session_resource_epoch_transition": {
+                "restored": restore["scope"]["session_resource_epoch"],
+                "observation_start": scope_before["session_resource_epoch"],
+                "observation_end": scope_after["session_resource_epoch"],
+            },
+            "observation_scope": scope_after,
+            "close_precondition": close_precondition,
+            "grid": {**grid_evidence, "child_pid": grid_entry["record"]["pid"],
+                     "child_exit_code": grid_entry["record"]["exit_code"],
+                     "kill_requested": grid_entry["record"]["kill_requested"]},
+            "compute": {**compute_evidence, "child_pid": compute_entry["record"]["pid"],
+                        "child_exit_code": compute_entry["record"]["exit_code"],
+                        "kill_requested": compute_entry["record"]["kill_requested"],
+                        "stage": {"stage_id": stage["stage_id"], "index": stage_index,
+                                  "status": stage["status"],
+                                  "started_at_unix_ms": stage["started_at_unix_ms"],
+                                  "completed_at_unix_ms": stage["completed_at_unix_ms"]},
+                        "run": {"run_id": run["run_id"], "status": run["status"],
+                                "total_steps": run["total_steps"], "total_stages": run["total_stages"]}},
+        }
 
     def capture_before(self, body):
         proof = self.eligibility()
@@ -221,15 +834,28 @@ class ProofBridge:
                 or type(identity.get("session_epoch")) is not int):
             raise storage.StorageError("Nonempty browser scene has no exact workspace identity")
         session_scope = read_session_scope(self.api_port, proof["api_instance_id"], identity)
+        admission = read_admission_observation(self.api_port, proof["api_instance_id"])
+        if (admission["scope"]["session_id"] != identity["session_id"]
+                or admission["scope"]["session_resource_epoch"] != session_scope["session_resource_epoch"]
+                or admission["scope"]["request_scope_epoch"] != session_scope["request_scope_epoch"]
+                or canonical(scene) != canonical(read_api(
+                    self.api_port, proof["api_instance_id"], "/v2/sessions/current/model/scene"))):
+            raise storage.StorageError("Before capture changed while reading admission prerequisites")
         with self.lock:
             if self.before is not None:
                 raise storage.StorageError("Browser before-capture is immutable")
-            self.before = {**body, "scene": scene, "identity": identity, "session_scope": session_scope}
+            self.before = {**body, "scene": scene, "identity": identity, "session_scope": session_scope,
+                           "admission_observation": admission}
+            self.receipt["workspace_browser_before"] = copy.deepcopy(self.before)
+            if self.receipt_path is not None:
+                storage.atomic_json(self.receipt_path, self.receipt)
         return {"captured": True, "object_count": len(objects),
                 "scene_sha256": hashlib.sha256(canonical(scene).encode()).hexdigest()}
 
     def finish(self, body):
         with self.lock:
+            if self.cancelled.is_set():
+                raise storage.StorageError("Browser proof cancellation has already been submitted")
             before, restored = self.before, self.restored
         fields = {"schema", "nonce", "new_api_instance_id", "project_document_before", "project_document_after"}
         if (set(body) != fields or body.get("schema") != "fullmag.development-browser-finish.v1"
@@ -239,6 +865,7 @@ class ProofBridge:
                 or canonical(body["project_document_before"]) != canonical(before["project_document_before"])
                 or canonical(body["project_document_after"]) != canonical(before["project_document_before"])):
             raise storage.StorageError("Browser hydration does not preserve the captured draft and new pin")
+        execution = self.execution()
         scene = read_api(self.api_port, body["new_api_instance_id"], "/v2/sessions/current/model/scene")
         backend = read_api(self.api_port, body["new_api_instance_id"], "/v2/platform/development-backend")
         identity = backend.get("workspace_identity", {})
@@ -255,6 +882,8 @@ class ProofBridge:
         command = {"schema": "fullmag.development-browser-native-command.v1", "event": "finish",
                    "nonce": self.expected["nonce"], "new_api_instance_id": body["new_api_instance_id"]}
         with self.lock:
+            if self.cancelled.is_set():
+                raise storage.StorageError("Browser proof cancellation has already been submitted")
             if self.browser is not None:
                 raise storage.StorageError("Browser finish has already been submitted")
             self.browser = {**body, "scene_sha256": hashlib.sha256(canonical(scene).encode()).hexdigest(),
@@ -262,7 +891,7 @@ class ProofBridge:
             self.process.stdin.write((canonical(command) + "\n").encode())
             self.process.stdin.flush()
             self.finished.set()
-        return {"verified": True}
+        return {"verified": True, "execution": execution}
 
 
 def bridge_handler(bridge):
@@ -281,23 +910,31 @@ def bridge_handler(bridge):
 
         def do_GET(self):
             try:
-                if self.path != "/eligibility":
+                if self.path == "/eligibility":
+                    value = bridge.eligibility()
+                elif self.path == "/execution":
+                    value = bridge.execution()
+                elif self.path == "/completed-stage":
+                    value = bridge.execution(require_terminal=False)
+                else:
                     raise storage.StorageError("Unknown private proof resource")
-                self.send_json(200, bridge.eligibility())
+                self.send_json(200, value)
             except Exception as error:
                 self.send_json(409, {"error": str(error)})
 
         def do_POST(self):
             try:
-                if self.headers.get("Origin") != bridge.expected["ui_origin"]:
-                    raise storage.StorageError("Private browser command has a different origin")
                 size = int(self.headers.get("Content-Length", "0"))
                 if not 0 < size <= MAX_FRAME:
                     raise storage.StorageError("Private browser command exceeds its byte limit")
-                body = json.loads(self.rfile.read(size))
+                raw = self.rfile.read(size)
+                if self.headers.get("Origin") != bridge.expected["ui_origin"]:
+                    raise storage.StorageError("Private browser command has a different origin")
+                body = json.loads(raw)
                 if not isinstance(body, dict):
                     raise storage.StorageError("Private browser command is not an object")
-                method = {"/before": bridge.capture_before, "/finish": bridge.finish}.get(self.path)
+                method = {"/before": bridge.capture_before, "/finish": bridge.finish,
+                          "/cancel": bridge.cancel}.get(self.path)
                 if method is None:
                     raise storage.StorageError("Unknown private browser command")
                 self.send_json(200, method(body))
@@ -403,7 +1040,8 @@ def configure_fixture(repo, run_root, manifest, receipt, owner_bundle):
     base_env = {key: os.environ[key] for key in
                 ("SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP", "COMPUTERNAME")
                 if key in os.environ}
-    env = {**base_env, "FULLMAG_REPO_ROOT": str(repo), "FULLMAG_DEVELOPMENT_OWNER_PROBE": "1",
+    env = {**base_env, "PYTHONDONTWRITEBYTECODE": "1",
+           "FULLMAG_REPO_ROOT": str(repo), "FULLMAG_DEVELOPMENT_OWNER_PROBE": "1",
            "FULLMAG_NATIVE_RUNTIME_ACTIVE": "1", "FULLMAG_STORAGE_PROFILE": "windows-native-fdm-cpu-dev",
            "FULLMAG_PROJECT_STORAGE_ROOT": str(storage_root), "FULLMAG_WORKTREE_ID": native["worktree_id"],
            "FULLMAG_RUNS_ROOT": native["runs_root"], "FULLMAG_PYTHON": str(build_root / "python/fullmag/Scripts/python.exe"),
@@ -413,7 +1051,8 @@ def configure_fixture(repo, run_root, manifest, receipt, owner_bundle):
            "FULLMAG_DEVELOPMENT_BACKEND_SOURCE": expected["ready_source_sha256"],
            "FULLMAG_DEVELOPMENT_BACKEND_VERSION": manifest["build_version"]["product_version"],
            "FULLMAG_DEVELOPMENT_BACKEND_STATUS_FILE": str(status),
-           "FULLMAG_DEVELOPMENT_RESTART_PROBE_CASE": "browser-workspace"}
+           "FULLMAG_DEVELOPMENT_RESTART_PROBE_CASE": "browser-workspace",
+           "FULLMAG_SCRATCH_PROOF_NONCE": expected["nonce"]}
     receipt["workspace_browser_fixture"] = {**expected, "api_port": api_port,
         "accepted_store_scope": scope, "accepted_store_root": str(accepted),
         "owner_bundle_id": owner_bundle, "owner_files": file_hashes,
@@ -484,7 +1123,7 @@ def start_frontend(repo, native, fixture, manifest, bridge_url, api_port, receip
         'const bridge = ' + json.dumps(bridge_url) + ';\n'
         'async function forward(request: NextRequest, context: {params: Promise<{operation: string}>}) {\n'
         ' const {operation} = await context.params;\n'
-        ' if (!["eligibility","before","finish"].includes(operation)) return new Response(null,{status:404});\n'
+        ' if (!["eligibility","execution","completed-stage","before","finish","cancel"].includes(operation)) return new Response(null,{status:404});\n'
         ' const response = await fetch(bridge+"/"+operation,{method:request.method,cache:"no-store",\n'
         ' headers:{"content-type":"application/json","origin":request.headers.get("origin")??""},\n'
         ' ...(request.method==="POST"?{body:await request.text()}:{} )});\n'
@@ -575,9 +1214,11 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
     native_error_log = None
     api_records = {}
     helper_records = {}
+    scratch_records = {}
     terminal = False
     result_confirmed = False
     try:
+        check_material_anisotropy_plans(binaries, fixture, env, receipt)
         publisher.publish({"state": "ready", "source_sha256": expected["ready_source_sha256"],
                            "ready_build_id": expected["ready_build_id"],
                            "ready_source_sha256": expected["ready_source_sha256"]})
@@ -611,7 +1252,8 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
         cli_record = {"label": "browser-native-cli", "pid": process.pid, "waited": False}
         receipt["processes"].append(cli_record)
         reader = NativeFrames(process, fixture / "native.log")
-        bridge = ProofBridge(expected, int(env["FULLMAG_API_PORT"]), reader, process)
+        bridge = ProofBridge(expected, int(env["FULLMAG_API_PORT"]), reader, process,
+                             receipt, scratch_records, run_root / "receipt.json")
         server = ThreadingHTTPServer(("127.0.0.1", 0), bridge_handler(bridge))
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
@@ -624,9 +1266,11 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
             bridge.api_port, receipt)
         check_frontend_sources(fixture, receipt)
         results = []
-        deadline = time.monotonic() + 600
+        deadline = time.monotonic() + 1800
         announced = False
         while time.monotonic() < deadline:
+            if bridge.cancelled.is_set():
+                raise storage.StorageError("Private browser proof cancelled; collecting terminal custody")
             if reader.error is not None:
                 raise storage.StorageError(f"Native browser observation failed: {reader.error}")
             try:
@@ -635,7 +1279,11 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
                 frame = None
             if frame is not None:
                 schema = frame.get("schema")
-                if record_started_frame(frame, api_records, helper_records, receipt):
+                with bridge.lock:
+                    scratch_frame = record_scratch_child_frame(frame, expected, scratch_records, receipt)
+                if scratch_frame:
+                    pass
+                elif record_started_frame(frame, api_records, helper_records, receipt):
                     pass
                 elif schema == API_LOG_SCHEMA:
                     try:
@@ -682,12 +1330,15 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
                         if pid != frame["api_pid"]:
                             record.update(waited=True, exit_code=frame["old_api_exit_code"], outcome="terminal")
                     receipt["workspace_browser_restored"] = frame
+                    # Capture the exact restored authoring state before the
+                    # browser can submit a new Grid/Compute operation.
+                    bridge.capture_restored_observation()
                 elif schema == RESULT_SCHEMA:
                     results.append(frame)
                 with bridge.lock:
                     if bridge.before is not None:
                         receipt["workspace_browser_before"] = bridge.before
-                storage.atomic_json(run_root / "receipt.json", receipt)
+                    storage.atomic_json(run_root / "receipt.json", receipt)
             if process.poll() is not None and reader.done.is_set() and reader.items.empty():
                 break
             if frontend.poll() is not None:
@@ -729,10 +1380,10 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
             helper_records[pid].update(evidence, outcome="terminal")
         if not set(helper_records).issubset(known_helpers):
             raise storage.StorageError("An early browser helper still has unknown custody")
-        terminal = terminal_custody(api_records, helper_records)
+        terminal = terminal_custody(api_records, helper_records, scratch_records, receipt)
         receipt["workspace_browser_result"] = result
         if not terminal:
-            raise storage.StorageError("Native browser API or helper terminal custody remains unknown")
+            raise storage.StorageError("Native browser API, helper, or scratch child terminal custody remains unknown")
         if (process.returncode != 0 or result.get("status") != "passed" or bridge.browser is None
                 or bridge.restored is None or result["new_api_instance_id"] != bridge.browser["new_api_instance_id"]
                 or result["old_api_instance_id"] != bridge.before["api_instance_id"]
@@ -741,7 +1392,8 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
         receipt["workspace_browser_hydration"] = bridge.browser
         receipt["checks"].extend(["browser-private-native-readiness", "browser-nonempty-scene-captured",
                                    "browser-exact-scene-restored", "browser-fresh-session-and-api-pin",
-                                   "browser-unsaved-document-restored", "browser-native-processes-waited"])
+                                   "browser-unsaved-document-restored", "browser-native-processes-waited",
+                                   "browser-restored-grid-normal-wait", "browser-restored-compute-terminal-success"])
     finally:
         if process is not None and process.poll() is None and (bridge is None or not bridge.finished.is_set()):
             # EOF is a failed proof command, handled by the native owner. It
@@ -764,6 +1416,14 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
                     cleanup_frame = reader.items.get_nowait()
                     try:
                         if record_started_frame(cleanup_frame, api_records, helper_records, receipt):
+                            continue
+                    except storage.StorageError:
+                        continue
+                    try:
+                        with bridge.lock:
+                            scratch_frame = record_scratch_child_frame(
+                                cleanup_frame, expected, scratch_records, receipt)
+                        if scratch_frame:
                             continue
                     except storage.StorageError:
                         continue
@@ -797,7 +1457,8 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
                     receipt["workspace_browser_cleanup_result"] = cleanup_frame
                 terminal = (result_confirmed and not receipt.get("workspace_browser_progress_error")
                             and reader.done.is_set() and not reader.thread.is_alive()
-                            and reader.error is None and terminal_custody(api_records, helper_records))
+                            and reader.error is None
+                            and terminal_custody(api_records, helper_records, scratch_records, receipt))
         if server is not None:
             server.shutdown()
             server.server_close()
@@ -814,4 +1475,8 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
             _restore_diagnostic_status(status, expected["worktree_id"], expected["generation_id"], prior)
         else:
             receipt["workspace_browser_retained_status"] = str(status)
-        storage.atomic_json(run_root / "receipt.json", receipt)
+        if bridge is not None:
+            with bridge.lock:
+                storage.atomic_json(run_root / "receipt.json", receipt)
+        else:
+            storage.atomic_json(run_root / "receipt.json", receipt)

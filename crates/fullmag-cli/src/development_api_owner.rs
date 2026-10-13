@@ -1317,6 +1317,9 @@ impl OwnedDevelopmentApi {
             MAX_RESPONSE_BYTES,
             "development API acquisition response",
         )?;
+        if is_generic_commit_rejection(&response_bytes) {
+            return Err(KnownAcquisitionRefusal.into());
+        }
         let response: AcquisitionResponse = serde_json::from_slice(&response_bytes)
             .context("invalid development API acquisition response")?;
         validate_acquisition_response(&response, nonce, &self.api_instance_id)?;
@@ -2447,6 +2450,20 @@ struct CommitControlRejection {
     reason: String,
 }
 
+/// Exact owner-control rejection received before an acquisition was created.
+/// The restart pump may permit a later explicit retry only while the same old
+/// owner is still confirmed Running and the refusal result has been published.
+#[derive(Debug)]
+pub(crate) struct KnownAcquisitionRefusal;
+
+impl std::fmt::Display for KnownAcquisitionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("development API refused acquisition before handoff")
+    }
+}
+
+impl std::error::Error for KnownAcquisitionRefusal {}
+
 fn is_generic_commit_rejection(response: &[u8]) -> bool {
     let Ok(rejection) = serde_json::from_slice::<CommitControlRejection>(response) else {
         return false;
@@ -2454,6 +2471,65 @@ fn is_generic_commit_rejection(response: &[u8]) -> bool {
     rejection.schema == CONTROL_SCHEMA
         && rejection.status == "rejected"
         && rejection.reason == "development_owner_request_rejected"
+}
+
+#[cfg(test)]
+mod acquisition_rejection_tests {
+    use super::*;
+
+    #[test]
+    fn acquisition_recognizes_only_the_exact_generic_owner_rejection() {
+        let legal = serde_json::json!({
+            "schema": CONTROL_SCHEMA,
+            "status": "rejected",
+            "reason": "development_owner_request_rejected"
+        });
+        assert!(is_generic_commit_rejection(
+            &serde_json::to_vec(&legal).expect("legal rejection serializes")
+        ));
+
+        let nonce = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let success = serde_json::json!({
+            "schema": ACQUISITION_SCHEMA,
+            "nonce": nonce,
+            "api_instance_id": "api-old",
+            "workspace": { "state": "no_session", "session_epoch": 0 }
+        });
+        let success_bytes = serde_json::to_vec(&success).expect("success serializes");
+        assert!(!is_generic_commit_rejection(&success_bytes));
+        let success_response: AcquisitionResponse =
+            serde_json::from_slice(&success_bytes).expect("success response stays strict");
+        validate_acquisition_response(&success_response, nonce, "api-old")
+            .expect("valid success identity remains fully checked");
+
+        for invalid in [
+            serde_json::json!({
+                "schema": "fullmag.other-control.v1",
+                "status": "rejected",
+                "reason": "development_owner_request_rejected"
+            }),
+            serde_json::json!({
+                "schema": CONTROL_SCHEMA,
+                "status": "accepted",
+                "reason": "development_owner_request_rejected"
+            }),
+            serde_json::json!({
+                "schema": CONTROL_SCHEMA,
+                "status": "rejected",
+                "reason": "different_reason"
+            }),
+            serde_json::json!({
+                "schema": CONTROL_SCHEMA,
+                "status": "rejected",
+                "reason": "development_owner_request_rejected",
+                "extra": true
+            }),
+        ] {
+            assert!(!is_generic_commit_rejection(
+                &serde_json::to_vec(&invalid).expect("invalid frame serializes")
+            ));
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]

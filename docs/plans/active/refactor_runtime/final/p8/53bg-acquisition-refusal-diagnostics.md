@@ -4,7 +4,7 @@ Stan 13.10.2026: **OPEN**. P8-53BE oraz publiczny restart nie są zamknięte.
 
 Aktualny checkpoint: produkcyjny build C zakończony PASS (manifest
 `7e9039806e8ce9046cd26c816bcb9d0727e93ea515d59482dad0eb21f82130d7`),
-archiwizacja w sesji 52054 nadal aktywna. Restore/Compute NOT VERIFIED.
+archiwizacja C zakończona PASS (33 kontrole). Restore/Compute NOT VERIFIED.
 Sekcje poniżej stanowią chronologiczny dziennik; wcześniejsze określenia
 „żywa” lub „NOT VERIFIED” opisują stan w chwili danego wpisu. Aktualne
 rozstrzygnięcia i pełne hashe są w końcowych wpisach.
@@ -381,3 +381,414 @@ Kanoniczny `windows-native-fdm-cpu-dev/build-status.json` potwierdził:
 `fullmag-0950f4dca4ffe38f`, start `10:11:20.199957+00:00`, koniec
 `10:20:04.630417+00:00`, dokładny manifest C wskazany powyżej. Zachowano
 ten sam resolver/profile/target/cache i TEMP na R:, bez buildu testów Rust.
+
+## Archiwum C PASS i kolejny kandydat
+
+Sesja 52054 zakończyła się kodem 0. Receipt
+`b375b399786841888a5d07a55f0de293`: completed, 33 checks PASS,
+wszystkie procesy waited, zakończenie `2026-10-13T10:24:36.265888+00:00`.
+Archiwum owner A:
+`17477dc817fa49aab39b8108b69967fd`, manifest C i hashe CLI/API jak wyżej.
+Kontrole obejmowały project document, authoring i zachowanie archiwum;
+nie obejmowały restartu, browser hydration ani wykonania fizyki.
+
+Checkpoint dowodów zapisano i wypchnięto na master:
+`becaf9e8f183b80413f02d181d5a56763e925c57`, tylko ten plik Markdown.
+Źródła poprawek pozostają WIP do ich odrębnego zakresowego commita.
+Uruchomiono kolejny managed build dla kandydata D, który zawiera dodatkową
+diagnostykę statycznej przyczyny. Po jego terminalnym odbiorze użyć
+archiwum `17477dc817fa49aab39b8108b69967fd` do pełnej próby browserowej.
+
+Build D: żywa sesja `22425`, log
+`native-build-373c1850ee1446e5a886f2b4fbffc89c.log`, managed recipe
+`windows-workspace-build dev dev 3258 true`. Ostatnia obserwacja nadal
+przygotowywała snapshot; nie zgłaszać kompilacji lub gotowego pakietu.
+Osobny `git ls-remote origin refs/heads/master` potwierdził dokładnie
+`becaf9e8f183b80413f02d181d5a56763e925c57` jako remote master.
+
+## Odbiór D i rozpoczęcie próby browserowej
+
+Sesja 22425 zakończyła się kodem 0. Kanoniczny build-status potwierdza
+`completed`, execution mode `windows-workspace-build`, profil
+`windows-native-fdm-cpu-dev`, zakończenie `2026-10-13T10:35:08.091950+00:00`.
+Manifest D:
+`e8d540e47135da58f44642047cd1efd4f214b8d6720b4521a1f2edc4c26225d1`.
+CLI SHA `4261c2889befbb06bbd83cf1204c79f16fff2d2d6735315e7b67e4760fcd3df9`;
+API SHA `9f2e732fc9bef10b986c5faa86c294e81c8652a2df2bd14566cfa8ac35abd7f6`.
+Produkcyjny build CLI/API i desktopu PASS; testów jednostkowych Rust nie
+kompilowano. Runtime/restore/Compute nie wynikają z tego dowodu.
+
+Snapshot D `369ed852734c37e32cfc2884dd1e93be4a0f5e15f9db180876130c4a6694cc31`
+zawiera także cudze zmiany `compute_resources.py`, `scene_document.py`,
+`scene_document_ir.py` i `script_builder.py`. Nie cofano ich ani nie
+przypisywano do własnego zadania. Odczytowe porównanie obydwu zamrożonych
+wersji Python dla dokładnej sceny z receipt `9ee08c8889f7486eab618f288474a90f`
+dało exit 0 i ten sam canonical builder SHA:
+`b504110e7c9913508980598876d18de37d8dcaa2f4d537f364d345bf71bb191f`.
+To dowód zgodności semantyki buildera tego fixture, nie wszystkich nowych
+funkcji ComputeResources ani uruchomienia solvera.
+
+Uruchomiono kanoniczny `verify-windows-development-workspace-browser`
+z archiwum A `17477dc817fa49aab39b8108b69967fd`; sesja 76723,
+receipt `f6765443de694de9899daef400434b56`, własny port 3258.
+W chwili zapisu proces jest żywy i przygotowuje runtime. Nie zgłaszać PASS
+próby przed terminalnym receipt oraz właściwym dowodem browser/Compute.
+
+## Rzeczywisty restore C→D i kolejna ujawniona blokada Compute
+
+W próbie `f6765443de694de9899daef400434b56` scoped frontend typecheck/lint
+zakończyły się kodem 0. Własna karta testowa 5, port 3258; nie restartowano
+sesji użytkownika na 3197. Scenę regresyjną odtworzono przez revision-checked
+`replace_scene`, zachowując świeżą tożsamość oraz własne output/temp.
+Payload i ACK zapisane w `scene-replay-evidence.json` przy receipt.
+
+Pierwszy Grid: `fm-7db98dcb-b0be-4a6a-b789-ed90bcdcf945`, dziecko 117632,
+waited, exit 0, kill_requested=false. Status rzeczywistego API pozostał
+`connected`, `awaiting_command`, solver idle, run null. Acquisition i restart
+następnie przeszły; stare API 89924 waited exit 0, wszyscy sześciu pomocnicy
+waited exit 0. Nowe API 132124:
+`731cf156-1956-40cd-b665-451ca497b70b`, sesja
+`session-18de10e63f0c029c0002041c`, scope
+`731cf156-1956-40cd-b665-451ca497b70b:1`.
+
+Po normalnym `Check restart` UI zmieniło pin, generation=1, paused=false.
+Dokument `project-03ede1ec4c6a45d48aec5bbeaf221baf`, revision=2, dirty=true
+zachował hash archiwum
+`f78ac01f600dcc0855051e71d65b10c486331f229ebebf3c7b538eb4b5ab22dc`
+i sceny `972af012da6f17a438220ed6e4c85f03f3b91612fc96c863085417dcba369a40`.
+Obiekt, region i materiał pozostały. Canvas widoczny, context_lost=false,
+drawing buffer 629×297.
+
+Drugi rzeczywisty Grid: `fm-bfd1f0d4-16e8-4ac0-b31b-af0cacd1513f`,
+dziecko 133384 waited exit 0, kill_requested=false, 4×4×1 i 16 aktywnych
+komórek; ledger completed. Normalny przycisk Compute Study zakończył się
+odmową `Mesh out of date - build mesh before compute` w logu komend UI.
+Run pozostał null, brak dziecka Compute. Nie przedstawiać samego enabled
+przycisku Close/Finish ani udanego Grid jako wykonania solvera.
+
+Diagnoza źródeł: `prepare_fdm_grid_refresh` publikuje `source_scene_revision`
+w historii, ale pomija ją w `last_build_summary`. API
+`successful_mesh_build_source_scene_revision` czyta podsumowanie; bez tego
+pola nie uruchamia `clear_mesh_dirty_tags_for_built_scene`. Przy `mesh:dirty`
+`geometry_blocks_solver_run` poprawnie odrzuca Compute. Dodano brakujące pole
+w podsumowaniu z tej samej intencji `opts`, bez osłabienia guardu rewizji.
+Scoped diff check PASS; poprawka nie jest jeszcze zbudowana ani sprawdzona
+w runtime. P8-53BE pozostaje OPEN. Zrzut:
+`p8-53bg-restored-compute-refusal.png`.
+
+Sesja 76723 w chwili zapisu nadal żywa; API D i frontend są własnymi zasobami
+tej próby. Brak terminalnego receipt — custody całej próby nadal pending.
+Nie rozpoczynać kopii tej próby ani ogłaszać całości PASS. Następny krok:
+kontrolowane zakończenie własnej próby, build poprawki i ponowny rzeczywisty
+Grid→Compute po restore.
+
+## Przerwanie próby — brak potwierdzonego terminalnego custody
+
+Sesja narzędzia 76723 zakończyła się kodem 1, pozostawiając żywy verifier
+Python 129672. Po kontroli exact command line i bundle A zamknięto ten
+własny verifier. CLI 120716 otrzymał EOF; późniejsza kontrola wykazała brak
+CLI i API 132124, ale nie odzyskano ich exit codes ani terminalnej ramki.
+Zweryfikowano i zamknięto własne procesy Next 111552/120416. Porty 3258
+i 57867 nie nasłuchują; 3197 nie zmieniano.
+
+Oryginalnego receipt nie nadpisano. Oddzielny `interruption-recovery.json`
+przy receipt rejestruje niepotwierdzoną oryginalną custody i późniejszy
+brak procesów. To nie jest PASS cleanup ani restore→Compute.
+
+Archiwizacja D przez `archive-windows-native-build`: sesja 64968,
+receipt `538ef5c0774846e8abe4e82fc788ce62`, ostatnia obserwacja running.
+Po jej terminalnym odbiorze przygotować build brakującej rewizji w
+`last_build_summary`. Następna regresja nadal wymaga rzeczywistego solvera,
+zgodnej sceny i provenance oraz terminalnej kontroli procesów.
+
+Archiwizacja D zakończyła się terminalnie: sesja 64968 exit 0, receipt
+`538ef5c0774846e8abe4e82fc788ce62`, completed, 33 checks PASS,
+koniec `2026-10-13T12:58:45.649085+02:00`. Brak procesów z waited=false.
+Archiwum `da3fb23a4fdf49b380ffcdeebfd7049e` zawiera zweryfikowane 13 plików,
+CLI/API i manifest D wskazane wyżej. To archiwum jest punktem wyjścia A
+dla kolejnej próby, nie dowodem Compute.
+
+Rozpoczęto managed build E z poprawką rewizji Grid:
+`windows-workspace-build dev dev 3258 true`, sesja 82028, log
+`native-build-30c25ea415ac46958655b4613ab7d5fd.log`. Nie uruchamiano raw
+Cargo ani kompilacji testów jednostkowych. Terminalny manifest i ponowna
+regresja browser/runtime pozostają wymagane przed zamknięciem poprawki.
+
+Preflight E zarejestrował aktualny wspólny HEAD
+`9112d38880f45ff85db2bbd82dd5da67b778cb40` (merge PR #150), a nie
+wcześniejszy `becaf9e8…`. Współdzielony index w chwili kontroli zawiera
+liczne zmiany innych prac oraz omawianą poprawkę i starszy checkpoint.
+Nie stage'owano, nie resetowano indexu ani nie wykonano commita tego zbioru.
+Nowe dopiski checkpointu są lokalne. Build musi być oceniany według własnego
+utrwalonego snapshotu; nie przypisywać mu automatycznie dowodów wcześniejszych
+HEAD-ów lub nowego bieżącego checkoutu.
+
+E utrwalił snapshot
+`943032b59eb9ee78abd1a0e189d4d326616114aa34577fb73a8c69954ac9bf72`.
+Odczyt tego snapshotu potwierdził pole `source_scene_revision` w
+`prepare_fdm_grid_refresh.last_build_summary`; SHA pliku
+`70bb1440c682691a743d0ba2305e6fb92524b469f201351e523e65d8de17ffc8`.
+Wersja E `0.1.0-dev.20261013.g9112d38880f4.dirty.s8134b7f3f1ad+9782`.
+Zależności pnpm przygotowane z cache, frozen lockfile, exit bez błędu;
+ostatnia obserwacja sesji 82028 nadal running. Nie przypisywać tej obserwacji
+terminalnego manifestu, udanej kompilacji ani wykonania solvera.
+
+## E failed: nowy compute-node snapshot i poprawka ograniczenia Serde
+
+Sesja 82028 zakończyła się exit 1. Kanoniczny build-status rejestruje
+exit 1 i koniec `2026-10-13T11:07:29.717316+00:00`; Cargo exit 101.
+Nie powstał zatwierdzony pakiet E ani dowód runtime dla rewizji Grid.
+Zamrożony snapshot E zawierał nowy, niezacommitowany moduł
+`fullmag-session/src/compute_node_snapshot.rs`. Kompilator zgłosił 12
+E0277 dla `Reported<CpuQuota>`, `Reported<CpuTopology>`,
+`Reported<GpuPartition>` i `Reported<GpuTopology>`: automatycznie wywiedzione
+`Deserialize` wymagało `T: Default` przy opcjonalnym `last_known`.
+
+Do bieżącego modułu dodano wyłącznie jawne Serde bound
+`T: Deserialize<'de>` oraz źródłową regresję z typem bez Default. Test
+sprawdza available, unavailable bez last_known, retained last_known oraz
+odmowę available bez value. Zachowano resztę cudzej implementacji;
+porównanie z zamrożonym E wykazuje tylko ten zakres. Rustfmt parser exit 0;
+test Rust NOT COMPILED / NOT RUN zgodnie z obowiązującą regułą.
+
+Powtórny managed build F: sesja 97293,
+`windows-workspace-build dev dev 3258 true`, log
+`native-build-4464a454f32449e28875128cbdfd85ce.log`.
+Ostatnia obserwacja: żywy proces utrwala źródła. Archiwum D
+`da3fb23a4fdf49b380ffcdeebfd7049e` pozostaje punktem wyjścia przyszłej
+próby; build i restore→Compute nadal wymagają terminalnych dowodów.
+
+Rozpoznano również brak wygodnego anulowania prywatnej próby z zachowaniem
+jej terminalnego custody. W tym etapie nie zmieniono verifiera ani UI
+anulowania; pierwszeństwo ma usunięcie konkretnej blokady kompilacji.
+
+## F: potwierdzony snapshot i kontrolowane anulowanie prywatnej próby
+
+Żywa sesja 97293 utrwaliła snapshot
+`3d2d67766d66b7c3f6b778418057c50248561feb9c7e4f50905bde22e5f9fe1e`.
+Odczyt zamrożonych plików potwierdził jawny bound Serde oraz
+`source_scene_revision` w podsumowaniu Grid. Kompilacja przeszła moduł
+fullmag-session i doszła do fullmag-cli/fullmag-api; terminalny wynik
+całego builda pozostaje niepotwierdzony. Nie uruchomiono drugiego buildu.
+
+Do prywatnego verifiera dodano `/cancel`: dokładny schema/nonce oraz
+istniejąca kontrola origin, osobny event anulowania i odmowa finish po
+anulowaniu. Pętla obserwatora przechodzi do istniejącego cleanup przez EOF,
+z odbiorem terminalnych ramek i wyników procesów. Anulowanie nie ustawia
+finished ani browser PASS, nie dotyczy publicznego UI i nie zabija sesji 3197.
+22 interpretowane kontrole skryptu przeszły (exit 0), w tym błędny scope,
+odmowa anulowania po finish i odmowa finish po anulowaniu. Diff check PASS.
+Rzeczywista próba anulowania z procesami pozostaje NOT VERIFIED;
+bramka restore→Compute nadal OPEN.
+
+## F completed i nowa próba D→F
+
+Sesja 97293 zakończyła się exit 0; build-status `completed`, zakończenie
+`2026-10-13T11:22:38.801210+00:00`. Manifest F SHA256
+`a3aaab8a14c82ceaf31cf9dd3f9faaf1475953cdf64a811c4efc793bdfd61e2f`
+zweryfikowany bezpośrednio z pliku; backend source SHA256
+`499ebdccf714fba3ff94fc2923b10bb3a8f0f9394e07a59f7f2ddcc04be9a1cd`.
+CLI/API build 3m47s, desktop 1m12s. Jest to dowód produkcyjnej kompilacji,
+nie wykonania Compute ani zamknięcia publicznego restartu.
+
+Interpretowana regresja HTTP anulowania wykazała Windows connection reset
+przy odmowie origin bez odbioru bounded request body. Handler odbiera teraz
+body w istniejącym limicie przed oceną origin; odmowa nadal poprzedza parsing
+i każdą mutację. 23/23 kontroli PASS, exit 0, w tym rzeczywisty lokalny
+HTTP: obcy origin 409 bez cancel, właściwy origin 200 z cancel bez finish.
+Nie zastępuje to terminalnego custody realnego native ownera.
+
+Uruchomiono managed browser proof D→F: sesja 89785, receipt
+`864d2e68606c4b1caa259f93e8556e22`, stan running. Stary owner D
+`da3fb23a4fdf49b380ffcdeebfd7049e`. User workspace 3197 nietknięty.
+Współdzielony checkout przeszedł na HEAD
+`a227bea56dc94109edb6b72826d55e65e8e19e6d`; nie przypisywać temu HEAD
+frozen builda F, którego recorded head pozostaje 9112d38880f4.
+
+## D→F odmowa na typecheck przed browserem
+
+Sesja 89785 terminal exit 1; recipe exit 2, receipt
+`864d2e68606c4b1caa259f93e8556e22` failed. Typecheck exit 2:
+trzy TS2339 (`failure_policy`) i jeden TS2367 (`stopped`) w
+projectBatchResources.ts / ProjectBatchesSection.tsx. Każdy proces receipt
+ma terminalny wait; CLI/API zakończyły się exit 1, helpery exit 0.
+Próba nie doszła do rzeczywistej sceny/browsera ani Compute.
+
+Backend ProjectBatchSummaryResource ma failure_policy, a session expansion
+obsługuje Stopped; obecny generated OpenAPI JSON i types nie zawierają
+tych elementów. Nie zmieniono guards ani ręcznie wygenerowanych typów.
+Rozpoczęto managed `archive-windows-native-build` dla manifestu F,
+sesja 41147, w celu uzyskania kanonicznego eksportu z receipt. Następnie
+wymagana jest regeneracja i weryfikacja typów oraz nowy zgodny frozen
+pakiet frontendu. Restore→Compute i publiczny restart pozostają OPEN.
+
+## Synchronizacja wygenerowanego kontraktu batchów
+
+Archiwizacja F: sesja 41147 exit 0, receipt
+`5f5c8885e78c4c898629bd48d7a60f7f`, completed, 33 kontrole,
+koniec `2026-10-13T13:30:30.201857+02:00`. Kanoniczny eksport zaimportowano
+przez generate-openapi-v2.mjs z expected commit 9112d38880f4, pełnym
+snapshotem 265562cc0f58 i walidacją native receipt. Zestaw endpointów bez
+zmian. Diff obejmuje tylko failure_policy, enum ProjectBatchFailurePolicy
+oraz stopped w ProjectBatchExpansionState; typów nie edytowano ręcznie.
+
+`just generate-control-room-client`: PASS, receipt
+`cac8d1da93534734881e0ff0eef10959`.
+`just check-control-room-production-source`: PASS exit 0, receipt
+`0acf208297b642f3ab6051f6ffe71459`. Wcześniejsze cztery błędy batch UI
+nie występują w aktualnych źródłach. Nie modyfikowano zamrożonego F;
+próba browserowa wymaga nowego pakietu zawierającego zregenerowane typy.
+
+Import checks PASS: receipt `f22bfa5eaecb4c9db7a3eb219f1614ba`.
+Spójna regeneracja i ten checkpoint zapisane w commicie
+`8c0b0cae6122ba3dea06a17cd2d28cd524dec849`; push origin master PASS,
+`git ls-remote` potwierdził dokładnie ten SHA. Staging obejmował wyłącznie
+OpenAPI JSON, generated types i własny checkpoint.
+
+Nowy managed build G: sesja 1188,
+`windows-workspace-build dev dev 3258 true`, log
+`native-build-e26d82a0e20a47b9904910b772106f66.log`.
+Ostatnia obserwacja: running, capturing source. Nie przypisywać mu
+terminalnego manifestu ani browser PASS. Pozostałe bramki P8-53 bez zmian.
+
+## G: frozen input i wybór ownera F
+
+Żywa sesja 1188 utrwaliła katalog snapshotu
+`fae1e5f073b4c07d010cbbd6739b0bbf5295f2678179ba333069f4c16f5f02c6`.
+Bezpośredni odczyt jego generated OpenAPI potwierdził failure_policy oraz
+stopped. Source identity v2: pełny commit
+`8c0b0cae6122ba3dea06a17cd2d28cd524dec849`, snapshot identity
+`349dba1ffe6b0c7abc45261ebbe0e38eb1484b33e7f680a42d9e6f1ca3e5a086`.
+Katalog snapshotu i source identity są różnymi identyfikatorami;
+nie utożsamiać ich. Wersja G: `0.1.0-dev.20261013.g8c0b0cae6122+9782`.
+Ostatnia obserwacja: frozen pnpm install z cache; całość nadal running.
+
+Do kolejnej próby wybrano zweryfikowane archiwum F
+`12984ba740244e5e86d8878814069155` (receipt 5f5c, 33 PASS), zamiast D.
+F zawiera poprawkę summary source_scene_revision, więc pierwszy Grid
+przed capture powinien usunąć derived mesh:dirty prawidłowo. Pozwala to
+zachować pełne, dokładne porównania sceny i dokumentu w istniejącym verifierze.
+Warunek distinct owner/candidate jest nadal egzekwowany przez configure_fixture;
+nie tworzyć sztucznej różnicy źródeł ani nie omijać tego warunku.
+
+## G completed, F→G uruchomione
+
+Build G sesja 1188 terminal exit 0, build-status completed. Manifest SHA256
+`cf76b2c47d5813fa45bd250eb162205a10ce2f89c36500b97ae9ca1ef7a9aeda`
+potwierdzony odczytem pliku, backend source SHA256
+`db2d81851d8e00f428ef0831e73c7170583cca3e5e1cc9b6927199042a9bf54a`.
+Source snapshot identity `349dba1ffe6b0c7abc45261ebbe0e38eb1484b33e7f680a42d9e6f1ca3e5a086`.
+CLI/API compile 43.51s, desktop 59.17s. Wydajność ta dotyczy etapów Cargo,
+nie całego przygotowania, które nadal weryfikuje i materializuje snapshot.
+
+Managed browser F→G uruchomione, sesja 41843, owner F
+`12984ba740244e5e86d8878814069155`. Aktualny terminalny wynik próby
+nie jest jeszcze znany; nie zaliczać Grid, Compute ani publicznego restartu
+na podstawie udanego buildu. Procesy user workspace 3197 bez ingerencji.
+
+## F→G: odtworzenie i oba Grid potwierdzone; Compute nadal OPEN
+
+Próba `7201e13e9f2b49479a169d796d85521e` zakończyła się terminalnie
+failed (sesja 41843, exit 1). Pierwszy Grid i Grid po rzeczywistym restartcie
+zakończyły się normalnym wait, exit 0, bez kill. Odtworzenie zachowało
+dokładną scenę oraz brudny dokument projektu. Viewport: context_lost=false,
+drawing buffer 668 × 297. Osobny child Compute wystartował, ale nie wykonał
+kroków solvera. Native stderr:
+
+```text
+[fullmag] wait_for_solve command 'solve' rejected: interactive 'run' command requires until_seconds
+```
+
+Scenariusz zawierał skończony Run 1 ps; jego czas jest przechowywany w
+`ResolvedScriptStage`, a początkowa komenda solve budowała etap wyłącznie
+z ProblemIR, pomijając ten czas. Poprawka źródeł przekazuje czas pierwszego
+autorskiego etapu wyłącznie początkowemu solve TimeEvolution bez jawnego
+until_seconds. Jawny override oraz wymaganie czasu dla komendy run pozostają.
+Dodano regresję źródłową; Rust unit tests NOT COMPILED/NOT RUN zgodnie
+z zakazem użytkownika. Parser rustfmt PASS; build i zachowanie poprawki
+pozostają NOT VERIFIED do nowej zarządzanej próby.
+
+Prywatny cancel odebrał terminalne zapisy wszystkich procesów (waited=true).
+Compute był zakończony przez cancel z kill_requested=true; nie jest to
+dowód normalnego zakończenia symulacji. Sesji użytkownika 3197 nie zamykano.
+Podczas startu Compute zmienił się także timestamp session_resource_epoch
+przy tym samym session_id; diagnoza właściciela tej tożsamości trwa.
+Nie osłabiono dokładnych porównań scope w verifierze.
+
+Zrzut: [Compute oczekuje, 0 kroków](p8-53bg-restored-compute-waiting.png).
+P8-53BE i publiczny restart pozostają OPEN.
+
+### Tożsamość przyłączonego solvera — poprawka przed buildem H
+
+`scratch_runtime` przekazywał child wyłącznie FULLMAG_ATTACHED_SESSION_ID.
+`run_script_mode` zachowywał ten ID, ale nadawał manifestowi czas utworzenia
+procesu child. Stąd zmiana resource epoch mimo zachowania API/session ID.
+Poprawka przekazuje timestamp z przypiętego zasobu statusu; wymaga zgodności
+prefiksu session_id oraz dodatniego, kanonicznego u128. Scope jest sprawdzany
+ponownie po model sync przed startem child. Nie zmieniono globalnego merge
+manifestów API ani warunków verifiera. Brak albo niepoprawny timestamp
+przyłączonej sesji jest błędem, a samodzielny run nadal nadaje własny czas.
+Dodana regresja źródłowa sprawdza prawidłowy timestamp i odrzuca obcy ID,
+zero, zapis niekanoniczny oraz tekst. Parser PASS; Rust unit tests nadal
+NOT COMPILED/NOT RUN. Poprawka wymaga managed build i browser/runtime proof.
+
+Scoped review timestampu: brak findings; potwierdzono właściciela u128
+w SessionManifest i jego projekcję w session_epoch zasobu statusu.
+To przegląd źródeł, nie dowód runtime. Managed build H uruchomiono receptą
+`just windows-workspace-build dev dev 3258 true`, sesja 54798, log
+`native-build-3d7a3fd5181d4f658c926fd69840024d.log`. Ostatnia obserwacja
+tej samej żywej sesji: capturing source, bez terminalnego wyniku.
+
+## H completed; próba F→H
+
+Build H terminal exit 0, build-status completed (13.10.2026 12:19:51 UTC).
+Manifest SHA256 `9b078560247379b60cc4f69c72d837a0a60e21e7e0e2b9fcce560a71dd4ffc64`,
+backend source SHA256 `8b60700a33de319ac63502f27ae666b142d5029f39d6ff9e4225541a4fba9b89`.
+Source identity v2 `831f53569a00ebb5dd71b2cde19b48b5dffdf3f26cd2cab9c57af23d4b4d8dff`,
+katalog snapshotu `42db5e929d29fb709e3f43b41d2c1eb92c85ddee8334adaf66ec29ff6fd9b546`.
+Porównanie SHA256 trzech plików CLI potwierdziło byte-equal z utrwalonymi
+poprawkami. CLI/API compile 3m27s, desktop 1m15s. Rust unit tests nie
+kompilowano. Qualification w build receipt: not_assessed.
+
+Próba browser F→H uruchomiona zarządzaną receptą z archiwum F
+`12984ba740244e5e86d8878814069155`, sesja 17081. Runtime poprawionego
+Compute i zachowania epoki pozostaje NOT VERIFIED do terminalnego wyniku.
+
+Scoped review czasu initial solve: PASS, brak findings P0/P1. Sprawdzono
+nadrzędność jawnego czasu, odmowę run bez czasu, Frozen Spins przed stage
+oraz zachowanie kolejnych etapów Run → Relax → Run. Ten ostatni scenariusz
+ma tylko dowód źródłowy; nie wykonywano niezależnego runtime multistage.
+Receipt rozpoczętej próby F→H: `11caba0f12ac4e7c8ba39ca7ee4ae342`.
+
+## F→H: Run wykonany, bramka provenance/lifecycle nadal OPEN
+
+Próba `11caba0f12ac4e7c8ba39ca7ee4ae342` terminal failed, exit 1 po
+kontrolowanym cancel; wszystkie procesy waited=true. Pierwszy Grid (85104)
+i Grid po restore (112408) normal exit 0, kill_requested=false. API F
+119580 zakończył się normalnie; nowe API H 78976 używa pina
+`291971b3-9749-4bcb-a135-d18405800099` i sesji
+`session-18de168bc9ebfb3800013480`. Dokładna scena i dokument zachowane;
+project `project-f25051f21c7442d99ff01272c2970f5a`, revision 2, dirty=true,
+archive hash `455565287234befb9ab064c7d0df2a5b0f22ce6eb32412df89c3e72958c9c237`.
+
+Compute `fm-9eb9022b-d308-43d0-954e-437dc7c024bd` wykonany przez osobny
+child 103496: ledger completed, run total_steps=10, solver_time_seconds=1e-12.
+Native stderr potwierdza wykonanie etapów i wejście w interactive workspace.
+Timestamp manifestu zachował `1791894491384`: start child nie zmienił już
+podstawowej epoki. Viewport: context_lost=false, buffer 688 × 297.
+
+Normalne Close completed solver odmówiło:
+`Completed Compute command lacks positive stage-step and execution provenance`.
+Ledger nie zawiera run_id/stage/applied_step/requested/resolved execution.
+Run raportuje requested_device=auto przy autorowanej scenie CPU. Status
+session_resource_epoch otrzymał sufiks tombstone po zakończeniu etapu,
+choć child nadal czekał interaktywnie na komendy. Wymaga to diagnozy
+projekcji statusu i completion, nie osłabienia verifiera. Native log podaje
+podsumowanie steps=2 przy zasobie run total_steps=10; rozbieżność zachowano
+jako dowód do sprawdzenia, bez twierdzenia o kwalifikacji fizyki.
+
+Pełne odpowiedzi zapisane w `post-compute-lifecycle-evidence.json` przy
+receipt. Child Compute zakończył się dopiero przez cancel (exit 1, kill=true),
+więc normalnego zakończenia procesu nie zaliczono. Sesja 17081 terminalna;
+nie ponawiać jej poll ani nie uruchamiać ponownie tylko z powodu timeoutu.
+[Zrzut odmowy](p8-53bg-restored-compute-lifecycle.png). P8-53BE nadal OPEN.
