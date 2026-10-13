@@ -77,19 +77,31 @@ _MIME_TYPES = {
 
 
 def _ui_dir() -> Path | None:
-    """Find the pre-built or source UI directory."""
-    # 1. Inside container / packaged alongside local_runner
+    """Prefer complete workspace sources, then packaged UI candidates."""
+    project_root = Path(__file__).resolve().parents[2]
+    source_ui = project_root / "apps" / "runner-console"
+
+    # In a checkout, canonical inputs must win over stale generated bundles.
+    if (
+        source_ui.is_dir()
+        and (source_ui / "index.html").is_file()
+        and (source_ui / "styles.css").is_file()
+        and (source_ui / "src").is_dir()
+    ):
+        return source_ui
+
+    # Preserve packaged candidate order for source-absent deployments.
     p1 = Path(__file__).resolve().parent / "ui_dist"
     if p1.is_dir() and (p1 / "index.html").is_file():
         return p1
-    # 2. Workspace build dist
-    p2 = Path(__file__).resolve().parents[2] / "apps" / "runner-console" / "dist"
+    p2 = project_root / "apps" / "runner-console" / "dist"
     if p2.is_dir() and (p2 / "index.html").is_file():
         return p2
-    # 3. Workspace source directory
-    p3 = Path(__file__).resolve().parents[2] / "apps" / "runner-console"
-    if p3.is_dir() and (p3 / "index.html").is_file():
-        return p3
+
+    # Keep the existing partial/source fallback for installations that do not
+    # have either a complete source tree or a packaged bundle.
+    if source_ui.is_dir() and (source_ui / "index.html").is_file():
+        return source_ui
     return None
 
 

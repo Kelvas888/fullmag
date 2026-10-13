@@ -10,6 +10,79 @@ import assert from 'node:assert';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const repositoryRoot = path.resolve(__dirname, '..', '..');
+const ignoredBuildDirectories = new Set(['dist', 'node_modules']);
+
+function collectSourceAssetInventory(root) {
+  const files = new Map();
+
+  function visit(relativePath) {
+    const absolutePath = path.join(root, relativePath);
+    const stat = fs.statSync(absolutePath);
+    if (stat.isDirectory()) {
+      for (const child of fs.readdirSync(absolutePath).sort()) {
+        if (ignoredBuildDirectories.has(child)) continue;
+        visit(path.join(relativePath, child));
+      }
+      return;
+    }
+    assert(stat.isFile(), 'unsupported source asset entry: ' + relativePath);
+    files.set(relativePath.split(path.sep).join('/'), fs.readFileSync(absolutePath));
+  }
+
+  for (const requiredInput of ['index.html', 'styles.css', 'src']) {
+    assert(fs.existsSync(path.join(root, requiredInput)),
+      'canonical Runner Console input is missing: ' + requiredInput);
+    visit(requiredInput);
+  }
+  return files;
+}
+
+function collectPackageAssetInventory(root) {
+  assert(fs.existsSync(root) && fs.statSync(root).isDirectory(),
+    'Runner Console package is missing: ' + root);
+  const files = new Map();
+
+  function visit(absolutePath, relativePath) {
+    const stat = fs.statSync(absolutePath);
+    if (stat.isDirectory()) {
+      for (const child of fs.readdirSync(absolutePath).sort()) {
+        visit(path.join(absolutePath, child), path.join(relativePath, child));
+      }
+      return;
+    }
+    assert(stat.isFile(), 'unsupported packaged asset entry: ' + relativePath);
+    files.set(relativePath.split(path.sep).join('/'), fs.readFileSync(absolutePath));
+  }
+
+  visit(root, '');
+  return files;
+}
+
+function assertPackageMatchesSources(label, outputRoot, expectedFiles) {
+  const actualFiles = collectPackageAssetInventory(outputRoot);
+  const expectedPaths = [...expectedFiles.keys()].sort();
+  const actualPaths = [...actualFiles.keys()].sort();
+  assert.deepStrictEqual(actualPaths, expectedPaths,
+    label + ' must contain the complete canonical index.html, styles.css, and src file inventory');
+  for (const relativePath of expectedPaths) {
+    assert.deepStrictEqual(actualFiles.get(relativePath), expectedFiles.get(relativePath),
+      label + ' bytes differ from canonical source at ' + relativePath);
+  }
+}
+
+const canonicalAssetFiles = collectSourceAssetInventory(__dirname);
+assertPackageMatchesSources(
+  'apps/runner-console/dist',
+  path.join(__dirname, 'dist'),
+  canonicalAssetFiles,
+);
+assertPackageMatchesSources(
+  'scripts/local_runner/ui_dist',
+  path.join(repositoryRoot, 'scripts', 'local_runner', 'ui_dist'),
+  canonicalAssetFiles,
+);
+console.log('✓ generated Runner Console package inventories and bytes match canonical inputs');
 
 console.log('[test] Running Runner Console smoke & unit test suite...');
 const browserSmokeSource = fs.readFileSync(path.join(__dirname, 'browser-smoke.cjs'), 'utf-8');

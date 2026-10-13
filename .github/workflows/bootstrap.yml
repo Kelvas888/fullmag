@@ -476,6 +476,9 @@ jobs:
       - name: Verify browser proof gate and report binding contracts
         run: python -m pytest -q scripts/test_frontend3d_required_checks.py
 
+      - name: Build Runner Console packages before parity and browser checks
+        run: node apps/runner-console/build.mjs
+
       - name: Run packaged Runner Console queue contracts
         env:
           FULLMAG_RUNNER_UI_ROOT: ${{ github.workspace }}
@@ -828,6 +831,8 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24.18.0
+      - name: Build Runner Console packages before retention contracts
+        run: node apps/runner-console/build.mjs
       - name: Run bounded retention console and packaged source contracts
         run: node apps/runner-console/test.mjs
       - name: Run retention HTTP routing and coordinator binding regressions

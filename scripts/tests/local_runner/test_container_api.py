@@ -10,12 +10,14 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parents[2]
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
+from local_runner import container_api as container_api_module  # noqa: E402
 from local_runner.container_api import (  # noqa: E402
     APICallbacks,
     MAX_RESPONSE_BYTES,
@@ -578,6 +580,54 @@ class ContainerAPITests(unittest.TestCase):
         status, _, payload = self.request("POST", "/jobs", body={"operation": "build"})
         self.assertEqual(503, status)
         self.assertEqual({"error": "runner_unavailable"}, self.json_body(payload))
+
+    def test_ui_dir_prefers_complete_workspace_sources_over_stale_generated_dirs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            module_file = repo / "scripts" / "local_runner" / "container_api.py"
+            module_file.parent.mkdir(parents=True)
+            module_file.touch()
+
+            source_ui = repo / "apps" / "runner-console"
+            (source_ui / "src").mkdir(parents=True)
+            (source_ui / "index.html").write_text("canonical source", encoding="utf-8")
+            (source_ui / "styles.css").write_text("canonical styles", encoding="utf-8")
+            (source_ui / "src" / "app.js").write_text("canonical app", encoding="utf-8")
+
+            packaged_ui = module_file.parent / "ui_dist"
+            packaged_ui.mkdir()
+            (packaged_ui / "index.html").write_text("stale packaged UI", encoding="utf-8")
+            stale_workspace_dist = source_ui / "dist"
+            stale_workspace_dist.mkdir()
+            (stale_workspace_dist / "index.html").write_text("stale workspace UI", encoding="utf-8")
+
+            with patch.object(container_api_module, "__file__", str(module_file)):
+                self.assertEqual(source_ui.resolve(), container_api_module._ui_dir())
+
+    def test_ui_dir_preserves_packaged_candidates_and_missing_ui_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            module_file = repo / "scripts" / "local_runner" / "container_api.py"
+            module_file.parent.mkdir(parents=True)
+            module_file.touch()
+
+            packaged_ui = module_file.parent / "ui_dist"
+            packaged_ui.mkdir()
+            (packaged_ui / "index.html").write_text("packaged UI", encoding="utf-8")
+            workspace_dist = repo / "apps" / "runner-console" / "dist"
+            workspace_dist.mkdir(parents=True)
+            (workspace_dist / "index.html").write_text("workspace package", encoding="utf-8")
+
+            with patch.object(container_api_module, "__file__", str(module_file)):
+                self.assertEqual(packaged_ui.resolve(), container_api_module._ui_dir())
+
+                unavailable_package = packaged_ui.with_name("ui_dist-unavailable")
+                packaged_ui.rename(unavailable_package)
+                self.assertEqual(workspace_dist.resolve(), container_api_module._ui_dir())
+
+                unavailable_dist = workspace_dist.with_name("dist-unavailable")
+                workspace_dist.rename(unavailable_dist)
+                self.assertIsNone(container_api_module._ui_dir())
 
     def test_ui_routes_serve_static_files_and_redirect(self):
         # 0. / redirects to /ui/
