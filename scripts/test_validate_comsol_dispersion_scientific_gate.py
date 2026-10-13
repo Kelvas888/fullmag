@@ -1039,6 +1039,27 @@ def _write_bundle(
     return _bundle_descriptor(case_dir, root)
 
 
+def _write_signed_k_bundle(case_dir: Path, *, negative_k: bool, band_count: int = 8):
+    primary_spectrum = json.loads((case_dir / "eigen/spectrum.v2.json").read_text(encoding="utf-8"))
+    primary_branches = json.loads((case_dir / "eigen/branches.v2.json").read_text(encoding="utf-8"))["branches"]
+    samples = copy.deepcopy(primary_spectrum["samples"])
+    branches = copy.deepcopy(primary_branches[:band_count])
+    for sample in samples:
+        vector = sample["k_vector"]
+        sign = -1.0 if negative_k else 1.0
+        sample["k_vector"] = [sign * float(value) for value in vector]
+        sample["modes"] = sample["modes"][:band_count]
+    return _write_bundle(
+        case_dir,
+        "validation/signed_k/negative_run",
+        samples,
+        branches,
+        mesh_id="mesh-L1",
+        airbox_m=2.0e-6,
+        requested_modes=24,
+    )
+
+
 def _scaled_payload(
     samples: list[dict[str, object]], branches: list[dict[str, object]], scale: float
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
@@ -2214,6 +2235,154 @@ class ScientificGateTests(unittest.TestCase):
                 self.assertEqual(check["status"], "not_verified")
                 self.assertIn("run-local branch_id and frequency", check["physical_identity_reason"])
                 self.assertEqual(report["status"], "not_qualified")
+
+    def test_signed_k_missing_evidence_is_a1_not_verified_and_c0_not_applicable(self):
+        a1 = gate._validate_signed_k_replay(
+            Path("unused"), "a1", {"signed_k": {"status": "pass"}}, {}, {}, {}, [],
+        )
+        self.assertEqual(a1["status"], "not_verified")
+        self.assertEqual(a1["numeric_status"], "not_verified")
+        self.assertEqual(a1["scientific_status"], "not_verified")
+        self.assertIn("evidence.signed_k.negative_run is missing", a1["numeric_reasons"])
+        c0 = gate._validate_signed_k_replay(
+            Path("unused"), "c0", None, {}, {}, {}, [],
+        )
+        self.assertEqual(c0["status"], "not_applicable")
+        self.assertEqual(c0["numeric_status"], "not_applicable")
+
+    def test_numeric_bundle_parses_the_exact_bytes_that_passed_hash_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = Path(directory) / "c1"
+            case_dir.mkdir()
+            frequencies = [9.0e9 + index * 1.0e8 for index in range(8)]
+            samples = [{
+                "sample_index": 0,
+                "k_vector": [0.0, 0.0, 0.0],
+                "modes": [
+                    {"raw_mode_index": index, "frequency_real_hz": frequency, "frequency_imag_hz": 0.0}
+                    for index, frequency in enumerate(frequencies)
+                ],
+            }]
+            branches = [
+                {"branch_id": index, "points": [{
+                    "sample_index": 0,
+                    "raw_mode_index": index,
+                    "frequency_real_hz": frequency,
+                    "frequency_imag_hz": 0.0,
+                }]}
+                for index, frequency in enumerate(frequencies)
+            ]
+            descriptor = _write_bundle(
+                case_dir,
+                "validation/toctou",
+                samples,
+                branches,
+                mesh_id="mesh-L1",
+                airbox_m=2.0e-6,
+                requested_modes=24,
+            )
+            spectrum_path = case_dir / "validation/toctou/eigen/spectrum.v2.json"
+            bound_bytes = spectrum_path.read_bytes()
+            bound_payload = json.loads(bound_bytes.decode("utf-8"))
+            replacement_payload = copy.deepcopy(bound_payload)
+            replacement_payload["samples"][0]["modes"][0]["frequency_real_hz"] += 5.0e6
+            replacement_bytes = json.dumps(replacement_payload).encode("utf-8")
+            original_loader = gate._load_json
+            replacement_count = 0
+
+            def replace_after_hash(path):
+                nonlocal replacement_count
+                if path == spectrum_path:
+                    replacement_count += 1
+                    path.write_bytes(replacement_bytes)
+                return original_loader(path)
+
+            reasons = []
+            with mock.patch.object(gate, "_load_json", side_effect=replace_after_hash):
+                bundle = gate._load_numeric_bundle(
+                    case_dir,
+                    descriptor,
+                    "TOCTOU comparison run",
+                    reasons,
+                    require_demag=True,
+                )
+            self.assertEqual(reasons, [])
+            self.assertIsNotNone(bundle)
+            self.assertEqual(replacement_count, 0)
+            self.assertEqual(bundle["spectrum"], bound_payload)
+
+    def test_signed_k_replay_uses_bound_bytes_and_never_qualifies_physics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "a1")
+            descriptor = _write_signed_k_bundle(case_dir, negative_k=True)
+            evidence_path = case_dir / gate.EVIDENCE_RELATIVE_PATH
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["signed_k"] = {"status": "pass", "negative_run": descriptor}
+            _write_json(evidence_path, evidence)
+
+            report = gate.validate_case(case_dir, "a1", parameters_path=PARAMETERS, kpath_path=KPATH)
+            check = report["checks"]["signed_k_replay"]
+            self.assertEqual(check["status"], "not_verified")
+            self.assertEqual(check["numeric_status"], "pass", check.get("numeric_reasons"))
+            self.assertEqual(check["scientific_status"], "not_verified")
+            self.assertEqual(check["numeric_replay"]["target_band_count"], 8)
+            self.assertEqual(check["numeric_replay"]["coverage"]["negative_sample_count"], 61)
+            self.assertEqual(check["relative_tolerance"], gate.CONVERGENCE_RELATIVE_TOLERANCE)
+            self.assertEqual(report["status"], "not_qualified")
+            self.assertTrue(any("assembled FEM operator" in item for item in check["scientific_blockers"]))
+
+            parameters, parameter_reasons = gate._load_parameters(PARAMETERS)
+            expected_path, _, path_reasons = gate._canonical_path_rows(KPATH)
+            primary_spectrum = json.loads((case_dir / "eigen/spectrum.v2.json").read_text(encoding="utf-8"))
+            primary_metadata = json.loads((case_dir / "metadata.json").read_text(encoding="utf-8"))
+            _, _, primary_quality = gate._validate_spectrum(
+                primary_spectrum, "a1", expected_path, [],
+            )
+            self.assertEqual(parameter_reasons, [])
+            self.assertEqual(path_reasons, [])
+            primary_bundle = {"metadata": primary_metadata, "spectrum": primary_spectrum}
+
+            def replay_check():
+                current_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+                return gate._validate_signed_k_replay(
+                    case_dir,
+                    "a1",
+                    current_evidence,
+                    parameters,
+                    primary_bundle,
+                    primary_quality,
+                    [],
+                )
+
+            evidence["signed_k"]["status"] = "fail"
+            _write_json(evidence_path, evidence)
+            claimed_fail = replay_check()
+            self.assertEqual(claimed_fail["numeric_status"], "pass")
+
+            spectrum_path = case_dir / "validation/signed_k/negative_run/eigen/spectrum.v2.json"
+            tampered = json.loads(spectrum_path.read_text(encoding="utf-8"))
+            tampered["samples"][10]["modes"][0]["frequency_real_hz"] += 1.0e6
+            _write_json(spectrum_path, tampered)
+            evidence["signed_k"]["status"] = "pass"
+            _write_json(evidence_path, evidence)
+            hash_mismatch = replay_check()
+            self.assertEqual(hash_mismatch["numeric_status"], "not_verified")
+            self.assertEqual(hash_mismatch["input_status"], "fail")
+            self.assertTrue(any("SHA256 does not match" in item for item in hash_mismatch["numeric_reasons"]))
+
+            swapped_descriptor = _write_signed_k_bundle(case_dir, negative_k=False)
+            evidence["signed_k"]["negative_run"] = swapped_descriptor
+            _write_json(evidence_path, evidence)
+            swapped = replay_check()
+            self.assertEqual(swapped["numeric_status"], "fail")
+            self.assertIn("is not the negative", swapped["numeric_replay"]["error"])
+
+            short_descriptor = _write_signed_k_bundle(case_dir, negative_k=True, band_count=7)
+            evidence["signed_k"]["negative_run"] = short_descriptor
+            _write_json(evidence_path, evidence)
+            insufficient = replay_check()
+            self.assertEqual(insufficient["numeric_status"], "fail")
+            self.assertTrue(any("at least 8 are required" in item for item in insufficient["numeric_reasons"]))
 
     def test_primary_and_comparison_schema_versions_are_required(self):
         for scope in ("primary", "comparison"):

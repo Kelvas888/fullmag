@@ -5890,3 +5890,104 @@ Python/ProblemIR, requested/resolved execution i fizyczne operatory bez zmian.
 
 | `backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp` | `SLEPcTinyGyrotropicModalEigenResult solve_modal_spectrum_for_request` | Source-map certyfikacji partial |
 | `backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp` | `void modal_floquet_shared_domain_original_descriptor_certification_is_fail_closed` | Source-map zaakceptowanego residualu |
+
+
+(g6-cross-run-same-mesh-diagnostic)=
+## G6 — dopasowanie pól pomiędzy uruchomieniami na identycznej siatce
+
+`match_cross_run_modes` konsumuje konteksty odczytane przez
+`load_tracking_fields`. Wymaga zgodnych fingerprintów i dokładnie tych samych
+węzłów, magnetycznych tetraedrów, support oraz objętości metryki Tet4.
+Każda próbka ma ten sam podpisany wektor falowy po obu stronach. Pełne
+zespolone pola muszą być skończone i mieć dodatnią normę magnetyczną.
+Loader wiąże odczytane bajty z hashami; matcher nie zastępuje tego odczytu.
+
+Singletony porównuje istniejącym amplitude overlap w spójnej masie P1.
+Jednakowo-rangowe klastry porównuje najmniejszym cosinusem kąta głównego,
+po ortonormalizacji w tej metryce. Dzięki temu globalna faza i rotacja bazy
+dokładnie zdegenerowanej podprzestrzeni nie zmieniają podobieństwa pola.
+Numery raw są tylko etykietami audytu. Częstotliwości sprawdzają jawne
+grupowanie degeneracji wewnątrz runu; nie wchodzą do score dopasowania.
+
+Caller podaje pełne rozłączne partycje dostarczonych kandydatów oraz jawne
+`overlap_floor` (dodatni, nie większy niż jeden), `ambiguity_tolerance`
+(skończony, nieujemny) i `degeneration_relative_tolerance` (skończony,
+nieujemny). Te argumenty nie mają domyślnych wartości. Różne rangi dostają
+score zero; nie ma fallbacku przez zgodność częstotliwości ani branch ID.
+
+```{math}
+:label: eq-g6-cross-run-admissible-assignment
+\widetilde S_{ij}=\begin{cases}
+(n+S_{ij})/(n+1),&S_{ij}\ge\tau_o,\\
+0,&S_{ij}<\tau_o.
+\end{cases}
+```
+
+| Symbol | Znaczenie | SI |
+|---|---|---|
+| $S_{ij}$ | Amplitude overlap lub minimum principal cosine pary klastrów | $1$ |
+| $\widetilde S_{ij}$ | Waga assignment z pierwszeństwem pełnej dopuszczalności | $1$ |
+| $n$ | Liczba lewych klastrów, wszystkie wymagają przypisania | $1$ |
+| $i,j$ | Indeksy lewego i prawego klastra | $1$ |
+| $\tau_o$ | Jawny dodatni próg podobieństwa pola | $1$ |
+
+Prostokątny Hungarian assignment przypisuje każdy lewy klaster do innego
+prawego. Transformacja sprawia, że pełne dopuszczalne przypisanie dominuje
+każde zawierające niedopuszczalną krawędź. Wśród pełnych przypisań zachowuje
+maksimum sumy oryginalnych score. Raport podaje oryginalne score, rangi,
+cosinusy, pokrycie i nieprzypisane dodatkowe prawe stany.
+
+Alternatywę wyznacza przez wykluczenie kolejno każdej wybranej krawędzi i
+ponowny globalny assignment z tym samym floor. Różnica sum względem
+najlepszej pełnej dopuszczalnej alternatywy musi przekraczać jawny próg
+niejednoznaczności. Brak alternatywy daje gap `null`; mówi wyłącznie o
+dostarczonym inventory. Brak pełnego przypisania lub niejednoznaczność
+pozostawia status `not_verified`. Nie rozstrzygamy remisu kolejnością ID.
+
+Jest to diagnostyka podobieństwa pól, nie kwalifikacja solvera. Caller nadal
+musi związać oba bundle, jakościowo dopuścić widma i potwierdzić kompletność
+oczekiwanego inventory oraz zgodność fizycznych konfiguracji. Cały raport
+zawsze zachowuje `qualification=NOT VERIFIED`. Różne siatki, transfer P1,
+split/merge i fizyczna identyfikacja dla zbieżności pozostają otwarte.
+FEM CPU: source implemented, hosted contracts pending, runtime/science
+NOT VERIFIED. FEM GPU: brak nowej kwalifikacji. FDM CPU/GPU: nie dotyczy
+konsumenta artefaktów FEM. Python DSL/ProblemIR i operatory bez zmian.
+
+(g6-signed-k-bundle-consumer)=
+## G6 — A1: pomiar signed-k z drugiego hash-bound bundle
+
+`checks.signed_k_replay` czyta `evidence.signed_k.negative_run` przez
+istniejący loader pięciu hash-bound artefaktów. Hash i parser JSON używają
+tego samego bufora odczytanego jednokrotnie; nie ma ponownego odczytu po
+sprawdzeniu hasha. Jest to binding per plik, nie atomowa generacja całej
+kolekcji. Dla A1 wymaga native source,
+metadanych benchmarku, identycznego pełnego backend planu, dokładnie
+61 indeksów próbek oraz co najmniej ośmiu jakościowo dopuszczonych modów
+każdej próbki. Żadne pole backend planu nie jest usuwane dla uzyskania
+zgodności. Osobny helper sprawdza przeciwność wektorów i porównuje
+najniższe osiem dodatnich zespolonych częstotliwości z krotnością.
+
+Wywołanie przekazuje jawnie istniejące `CONVERGENCE_RELATIVE_TOLERANCE`
+`2e-4` jako warunek tego pomiaru numerycznego. Nie jest to próg porównania
+Fullmag–COMSOL (`0.005`) ani dowód fizycznej wzajemności. Producerowy
+status signed-k nie jest konsumowany jako dowód. Brak descriptoru A1 jest
+`not_verified`; C0/C1 są poza zakresem tej bramki A1 (`not_applicable`).
+
+`numeric_status` może być `pass`, ale status naukowy pozostaje
+`not_verified`: brak niezależnego receipt solve, porównania rzeczywistego
+stanu m0, replay tożsamości złożonego operatora/provider'a i kontroli
+negative phase/Poisson/gauge. Agregacja nie uznaje przez to A1 za qualified.
+FEM CPU: consumer implemented, hosted contracts pending; runtime/science
+NOT VERIFIED. FEM GPU bez nowej kwalifikacji; FDM CPU/GPU nie dotyczy.
+Publiczny DSL/ProblemIR i fizyczny solver nie zmieniają się.
+
+| Źródło | Symbol | Zakres |
+|---|---|---|
+| `scripts/comsol_cross_run_matching.py` | `match_cross_run_modes` | Same-mesh field diagnostic, bez qualification |
+| `scripts/comsol_cross_run_matching.py` | `_best_admissible_alternative` | Globalna alternatywa wśród floor-valid przypisań |
+| `scripts/test_comsol_cross_run_matching.py` | `test_floor_valid_full_assignment_beats_unconstrained_invalid_optimum` | Regresja przypisania dopuszczalnego |
+| `scripts/validate_comsol_dispersion_scientific_gate.py` | `_validate_signed_k_replay` | Hash-bound A1 numeric replay i jawne scientific blockers |
+| `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_signed_k_replay_uses_bound_bytes_and_never_qualifies_physics` | Faktyczne bajty/SHA, brak fałszywego qualified |
+
+| `scripts/validate_comsol_dispersion_scientific_gate.py` | `_load_numeric_bundle` | SHA i JSON tych samych bajtów, bez TOCTOU drugiego odczytu |
+| `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_numeric_bundle_parses_the_exact_bytes_that_passed_hash_binding` | Deterministyczna regresja podmiany loadera |

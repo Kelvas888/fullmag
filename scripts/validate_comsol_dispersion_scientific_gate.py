@@ -24,6 +24,7 @@ from typing import Any, Mapping, Sequence
 
 from comsol_magnetic_support import magnetic_element_indices, tet4_cells
 from comsol_n0_field_certificate import measure_n0_field
+from comsol_signed_k_replay import replay_signed_k_spectra
 from comsol_tracking_replay import replay_tracking_fields
 from verify_fem_frequency_domain_eigen_artifacts import (
     p00_demag_factor,
@@ -3631,14 +3632,22 @@ def _load_numeric_bundle(
         except (OSError, ValueError):
             reasons.append(f"{label}.{logical} is outside the declared numeric run root")
             continue
-        if not isinstance(expected_hash, str) or expected_hash != _sha256(path):
+        try:
+            bound_bytes = path.read_bytes()
+        except OSError as error:
+            reasons.append(f"{label}.{logical} cannot be read: {error}")
+            continue
+        if not isinstance(expected_hash, str) or expected_hash != hashlib.sha256(bound_bytes).hexdigest():
             reasons.append(f"{label}.{logical} SHA256 does not match the referenced artifact")
             continue
-        value, error = _load_json(path)
-        if error:
-            reasons.append(f"{label}.{logical}: {error}")
+        try:
+            value = json.loads(bound_bytes.decode("utf-8"))
+        except (UnicodeError, ValueError) as error:
+            reasons.append(f"{label}.{logical} is not valid UTF-8 JSON bound by its SHA256: {error}")
             continue
-        assert value is not None
+        if not isinstance(value, dict):
+            reasons.append(f"{label}.{logical} JSON root must be an object")
+            continue
         loaded[logical] = value
         if logical == "metadata":
             metadata_file, metadata_hash = path, expected_hash
@@ -4307,6 +4316,233 @@ def _validate_convergence_coverage(bundle, case, label, reasons):
         quality_mode_map=quality_mode_map,
     )
     reasons.extend(f"{label}: {reason}" for reason in branch_reasons)
+
+
+_SIGNED_K_SCIENTIFIC_BLOCKERS = (
+    "hash-bound negative-run files do not establish that the -k spectrum came from an independent solve rather than copied or transformed data",
+    "the negative run's resolved m0/equilibrium state is not independently replayed and compared with the primary run",
+    "matching backend-plan metadata does not establish identity of the assembled FEM operator or dynamic-demagnetization provider",
+    "the negative-k Bloch phase exp(-i*k·r) and its boundary gauge are not independently replayed from negative-run field evidence",
+)
+
+
+def _signed_k_replay_samples(
+    spectrum: Mapping[str, Any],
+    quality_mode_map: Mapping[tuple[int, int], float],
+    label: str,
+    reasons: list[str],
+) -> list[dict[str, Any]]:
+    """Select only quality-admitted complex modes from a serialized spectrum."""
+
+    raw_samples = spectrum.get("samples")
+    if not isinstance(raw_samples, list):
+        reasons.append(f"{label} spectrum has no samples array")
+        return []
+    expected_indices = set(range(EXPECTED_PATH_SAMPLE_COUNT))
+    samples: list[dict[str, Any]] = []
+    seen_indices: set[int] = set()
+    for sample in raw_samples:
+        if not isinstance(sample, Mapping) or type(sample.get("sample_index")) is not int:
+            reasons.append(f"{label} has a sample without a nonnegative integer sample_index")
+            continue
+        sample_index = sample["sample_index"]
+        if sample_index < 0 or sample_index in seen_indices:
+            reasons.append(f"{label} has a negative or duplicate sample_index {sample_index}")
+            continue
+        seen_indices.add(sample_index)
+        vector = sample.get("k_vector")
+        if not isinstance(vector, list) or len(vector) != 3 or not all(_finite(value) for value in vector):
+            reasons.append(f"{label} sample {sample_index} has no finite three-component k_vector")
+            continue
+        raw_modes = sample.get("modes")
+        if not isinstance(raw_modes, list):
+            reasons.append(f"{label} sample {sample_index} has no modes array")
+            continue
+        admitted: list[dict[str, Any]] = []
+        for mode in raw_modes:
+            if not isinstance(mode, Mapping) or type(mode.get("raw_mode_index")) is not int:
+                reasons.append(f"{label} sample {sample_index} has a mode without an integer raw_mode_index")
+                continue
+            raw_mode_index = mode["raw_mode_index"]
+            if raw_mode_index < 0 or (sample_index, raw_mode_index) not in quality_mode_map:
+                continue
+            real = mode.get("frequency_real_hz", mode.get("frequency_hz"))
+            imaginary = mode.get("frequency_imag_hz")
+            if not _finite_positive(real) or not _finite(imaginary):
+                reasons.append(f"{label} sample {sample_index} mode {raw_mode_index} lacks a finite quality-admitted complex frequency")
+                continue
+            admitted.append({
+                "raw_mode_index": raw_mode_index,
+                "frequency_real_hz": float(real),
+                "frequency_imag_hz": float(imaginary),
+            })
+        if len(admitted) < EXPECTED_TARGET_BANDS:
+            reasons.append(
+                f"{label} sample {sample_index} has {len(admitted)} quality-admitted modes; "
+                f"at least {EXPECTED_TARGET_BANDS} are required for signed-k replay"
+            )
+        samples.append({
+            "sample_index": sample_index,
+            "k_vector": [float(value) for value in vector],
+            "modes": admitted,
+        })
+    if seen_indices != expected_indices:
+        reasons.append(
+            f"{label} sample coverage is {sorted(seen_indices)}, expected the complete 61-sample set"
+        )
+    return samples
+
+
+def _validate_signed_k_replay(
+    case_dir: Path,
+    case: str,
+    evidence: Mapping[str, Any] | None,
+    parameters: Mapping[str, Any],
+    primary_bundle: Mapping[str, Any],
+    primary_quality_mode_map: Mapping[tuple[int, int], float],
+    reasons: list[str],
+) -> dict[str, Any]:
+    """Replay A1 reciprocal frequencies while keeping physical qualification closed."""
+
+    if case != "a1":
+        reason = "signed-k replay is scoped to the A1 reciprocal antidot benchmark"
+        return _new_check(
+            "not_applicable",
+            numeric_status="not_applicable",
+            scientific_status="not_applicable",
+            input_status="not_applicable",
+            reason=reason,
+        )
+
+    scientific_blockers = list(_SIGNED_K_SCIENTIFIC_BLOCKERS)
+    signed_k = evidence.get("signed_k") if isinstance(evidence, Mapping) else None
+    descriptor = signed_k.get("negative_run") if isinstance(signed_k, Mapping) else None
+    label = "A1 signed-k negative run"
+    local_reasons: list[str] = []
+    if not isinstance(descriptor, Mapping):
+        local_reasons.append("evidence.signed_k.negative_run is missing")
+        reasons.extend(f"{label}: {item}" for item in local_reasons)
+        reasons.extend(f"A1 signed-k scientific qualification remains NOT VERIFIED: {item}" for item in scientific_blockers)
+        return _new_check(
+            "not_verified",
+            numeric_status="not_verified",
+            scientific_status="not_verified",
+            input_status="missing",
+            numeric_reasons=local_reasons,
+            scientific_blockers=scientific_blockers,
+            relative_tolerance=CONVERGENCE_RELATIVE_TOLERANCE,
+            target_band_count=EXPECTED_TARGET_BANDS,
+        )
+
+    declared_root = _safe_relative_path(
+        case_dir, descriptor.get("root"), f"{label}.root", local_reasons, directory=True,
+    )
+    if declared_root is not None and declared_root.resolve() == case_dir.resolve():
+        local_reasons.append(f"{label} must be a distinct numeric run below the case output root")
+    negative: dict[str, Any] | None = None
+    if not local_reasons:
+        try:
+            negative = _load_numeric_bundle(
+                case_dir, descriptor, label, local_reasons, require_demag=True,
+            )
+        except (AttributeError, KeyError, OSError, TypeError, ValueError) as error:
+            local_reasons.append(f"{label} could not be validated as a native numeric bundle: {error}")
+    if negative is None:
+        if not local_reasons:
+            local_reasons.append(f"{label} could not be loaded from its hash-bound descriptor")
+        reasons.extend(f"{label}: {item}" for item in local_reasons)
+        reasons.extend(f"A1 signed-k scientific qualification remains NOT VERIFIED: {item}" for item in scientific_blockers)
+        return _new_check(
+            "not_verified",
+            numeric_status="not_verified",
+            scientific_status="not_verified",
+            input_status="fail",
+            numeric_reasons=local_reasons,
+            scientific_blockers=scientific_blockers,
+            relative_tolerance=CONVERGENCE_RELATIVE_TOLERANCE,
+            target_band_count=EXPECTED_TARGET_BANDS,
+        )
+
+    for name in ("metadata", "spectrum", "branches", "manifest", "diagnostics"):
+        if not isinstance(negative.get(name), Mapping):
+            local_reasons.append(f"{label}.{name} is not a JSON object")
+    if not local_reasons:
+        _validate_numeric_source(negative["manifest"], negative["diagnostics"], case, local_reasons)
+        _validate_benchmark_metadata(
+            negative["metadata"],
+            case,
+            parameters,
+            label,
+            local_reasons,
+            require_uniform_slab=False,
+        )
+        primary_metadata = primary_bundle.get("metadata")
+        primary_signature = _backend_signature(primary_metadata) if isinstance(primary_metadata, Mapping) else None
+        negative_signature = _backend_signature(negative["metadata"])
+        if primary_signature is None or negative_signature is None:
+            local_reasons.append(f"{label} cannot be compared with the complete primary backend signature")
+        elif primary_signature != negative_signature:
+            local_reasons.append(
+                f"{label} backend signature differs from the primary run with no fields removed"
+            )
+        _validate_convergence_coverage(negative, case, label, local_reasons)
+
+    numeric_report: dict[str, Any] | None = None
+    numeric_status = "not_verified"
+    input_status = "pass" if not local_reasons else "fail"
+    primary_spectrum = primary_bundle.get("spectrum")
+    negative_spectrum = negative.get("spectrum")
+    positive_samples: list[dict[str, Any]] = []
+    negative_samples: list[dict[str, Any]] = []
+    if not isinstance(primary_spectrum, Mapping) or not isinstance(negative_spectrum, Mapping):
+        local_reasons.append("primary or negative spectrum is not a JSON object")
+        input_status = "fail"
+    else:
+        positive_samples = _signed_k_replay_samples(
+            primary_spectrum, primary_quality_mode_map, "A1 primary +k run", local_reasons,
+        )
+        negative_quality = negative.get("_quality_admitted_mode_map")
+        if not isinstance(negative_quality, Mapping):
+            local_reasons.append(f"{label} has no validated quality-admitted mode map")
+            negative_quality = {}
+        negative_samples = _signed_k_replay_samples(
+            negative_spectrum, negative_quality, label, local_reasons,
+        )
+        if local_reasons:
+            input_status = "fail"
+            if any("quality-admitted modes; at least 8 are required" in item for item in local_reasons):
+                numeric_status = "fail"
+
+    if not local_reasons:
+        try:
+            numeric_report = replay_signed_k_spectra(
+                positive_samples,
+                negative_samples,
+                relative_tolerance=CONVERGENCE_RELATIVE_TOLERANCE,
+                target_band_count=EXPECTED_TARGET_BANDS,
+            )
+            numeric_status = str(numeric_report.get("status", "not_verified"))
+        except (TypeError, ValueError, OverflowError) as error:
+            numeric_status = "fail"
+            numeric_report = {"status": "fail", "error": str(error)}
+
+    reasons.extend(f"{label}: {item}" for item in local_reasons)
+    if numeric_status == "fail" and numeric_report is not None:
+        numeric_error = numeric_report.get("error")
+        if isinstance(numeric_error, str) and numeric_error:
+            reasons.append(f"A1 signed-k numeric replay failed: {numeric_error}")
+    reasons.extend(f"A1 signed-k scientific qualification remains NOT VERIFIED: {item}" for item in scientific_blockers)
+    return _new_check(
+        "not_verified",
+        numeric_status=numeric_status,
+        scientific_status="not_verified",
+        input_status=input_status,
+        numeric_reasons=local_reasons,
+        numeric_replay=numeric_report,
+        relative_tolerance=CONVERGENCE_RELATIVE_TOLERANCE,
+        target_band_count=EXPECTED_TARGET_BANDS,
+        scientific_blockers=scientific_blockers,
+    )
 
 
 def _validate_convergence_path(bundle, primary, label, reasons):
@@ -5004,6 +5240,21 @@ def validate_case(
         )
         for key in ("mesh", "airbox", "mode_count")
     }
+    signed_k_check = _validate_signed_k_replay(
+        case_dir,
+        case,
+        evidence,
+        parameters or {},
+        {
+            "metadata": metadata,
+            "spectrum": spectrum,
+            "branches": branches,
+            "manifest": manifest,
+            "diagnostics": diagnostics,
+        },
+        quality_mode_map,
+        reasons,
+    )
     finite_check = _new_check(
         "pass" if not any("non-finite" in reason for reason in reasons) else "fail",
         sample_count=len(sample_map),
@@ -5072,6 +5323,7 @@ def validate_case(
         "mesh_convergence": convergence["mesh"],
         "airbox_convergence": convergence["airbox"],
         "mode_count_convergence": convergence["mode_count"],
+        "signed_k_replay": signed_k_check,
     }
     for name, check in checks.items():
         if check.get("status") not in {"pass", "not_applicable"}:

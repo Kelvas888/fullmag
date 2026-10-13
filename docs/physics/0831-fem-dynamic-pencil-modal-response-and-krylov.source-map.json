@@ -881,6 +881,20 @@
         "source-g6-signed-k-replay",
         "source-g6-signed-k-regression"
       ]
+    },
+    {
+      "id": "eq-g6-cross-run-admissible-assignment",
+      "symbols": [
+        "g6_cross_score",
+        "g6_cross_transformed",
+        "g6_cross_count",
+        "g6_cross_indices",
+        "g6_cross_floor"
+      ],
+      "sources": [
+        "source-g6-cross-run-matcher",
+        "source-g6-cross-run-alternative"
+      ]
     }
   ],
   "symbols": [
@@ -2058,6 +2072,36 @@
       "id": "g6_signed_relative_error",
       "latex": "$r$",
       "meaning": "Błąd względny jednej składowej częstotliwości",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_cross_score",
+      "latex": "$S_{ij}$",
+      "meaning": "Amplitude overlap lub minimum principal cosine pary klastrów",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_cross_transformed",
+      "latex": "$\\widetilde S_{ij}$",
+      "meaning": "Waga assignment z pierwszeństwem pełnej dopuszczalności",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_cross_count",
+      "latex": "$n$",
+      "meaning": "Liczba lewych klastrów",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_cross_indices",
+      "latex": "$i,j$",
+      "meaning": "Indeksy lewego i prawego klastra",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_cross_floor",
+      "latex": "$\\tau_o$",
+      "meaning": "Jawny dodatni próg podobieństwa pola",
       "si_unit": "$1$"
     }
   ],
@@ -4399,6 +4443,48 @@
       "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
       "symbol": "void modal_floquet_shared_domain_original_descriptor_certification_is_fail_closed",
       "responsibility": "Require the potential residual serialized with the accepted descriptor mode"
+    },
+    {
+      "id": "source-g6-cross-run-matcher",
+      "path": "scripts/comsol_cross_run_matching.py",
+      "symbol": "match_cross_run_modes",
+      "responsibility": "Same-mesh field similarity diagnostic without qualification"
+    },
+    {
+      "id": "source-g6-cross-run-alternative",
+      "path": "scripts/comsol_cross_run_matching.py",
+      "symbol": "_best_admissible_alternative",
+      "responsibility": "Cardinality-first floor-admissible global alternatives"
+    },
+    {
+      "id": "source-g6-cross-run-floor-regression",
+      "path": "scripts/test_comsol_cross_run_matching.py",
+      "symbol": "test_floor_valid_full_assignment_beats_unconstrained_invalid_optimum",
+      "responsibility": "Valid full assignment dominates forbidden-edge raw optimum"
+    },
+    {
+      "id": "source-g6-signed-k-bundle-gate",
+      "path": "scripts/validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "_validate_signed_k_replay",
+      "responsibility": "Hash-bound reciprocal numeric replay with independent scientific refusal"
+    },
+    {
+      "id": "source-g6-signed-k-bundle-regression",
+      "path": "scripts/test_validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "test_signed_k_replay_uses_bound_bytes_and_never_qualifies_physics",
+      "responsibility": "Actual bytes and hashes dominate producer claims"
+    },
+    {
+      "id": "source-g6-numeric-bundle-byte-binding",
+      "path": "scripts/validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "_load_numeric_bundle",
+      "responsibility": "Parse exactly the single buffer whose SHA256 matched artifact binding"
+    },
+    {
+      "id": "source-g6-numeric-bundle-toctou-regression",
+      "path": "scripts/test_validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "test_numeric_bundle_parses_the_exact_bytes_that_passed_hash_binding",
+      "responsibility": "Reject second-loader substitution after hash binding"
     }
   ],
   "public_api": {
