@@ -709,3 +709,61 @@ Production typecheck PASS, exit 0, `13d3c33c7a3643ec8f9b3719e05a04c8`,
 before/after `7160cc932c63c402d90b5472cc6dd80562501fed7c27e7145c209544946f49cf`.
 Nie zmienia to wyniku próby 57e2 ani nie kwalifikuje TypeScript 7 z remote.
 Nowy snapshot frontendu i rzeczywiste odtworzenie kamery nadal są wymagane.
+
+### Kolejny pakiet z synchronizowanym frontendem
+
+`just windows-workspace-build dev dev 3258 auto` zakończył się exit 0.
+Log: `native-build-7fa6330d12054c53a66c3efdaa1aa91c.log` w profilu
+`windows-native-fdm-cpu-dev`. Manifest SHA256
+`cd7fe207b6bc615ddc4e4b0fd7c07ba90c724ed199d0c5aff410996dd8c7be3f`.
+Kopia źródeł `e89a8bd16bc6dc3a571f5de9d5fa19a8aa4a5c9678ba96292af080d276b689a1`
+zawiera optional/nullable `node_policy` w typach wygenerowanych.
+Tożsamość źródeł `bd1ad70a52633a30e1ab2bb89f7db2dcd51c878e606695606dcc41f5912e1400`,
+backend `64b1cff84bd247a20ea3a831bedf057d6a2642e91049307e2aae88b2ad4f5184`.
+EXE API `fd4a83bde75610f41abf2f5126e6ae022058d59c3b6d71ffde8710ac88b5332f`,
+CLI `ff286708557fccb0bd692a05acb97183982f2b7f26f7d2cb8c123f8338cc4fbc`,
+desktop `1255b7bb9112090cc68219fda7b538ccf2f078b532ba05606e5f5d05ff5d1ba0`.
+`source_identity_check=passed`. Cargo API/CLI 59.48 s, desktop 1 min;
+przygotowanie źródeł i publikacja są odrębnymi kosztami. pnpm ponownie
+użył 771 pakietów, 0 pobranych, 49.8 s.
+
+Uruchomiono prywatny browser gate z bazowym owner bundle
+`12984ba740244e5e86d8878814069155`. Sukces buildu nie zamyka P8-53BM:
+wynik odtworzenia modelu i kamery po restarcie pozostaje do potwierdzenia.
+
+Próba `14152bbfe6a44c23a485176a4c0ff127` dotarła do rzeczywistego UI:
+1 obiekt, 1 region, 1 materiał, dirty document revision 2. Restart przez
+normalny przycisk, następnie Check restart, zmienił API instance
+`9e748fd2-c2f2-4f5f-878d-40149e15092e` na
+`9c0b447e-fd00-45f4-b334-f1bafd3dd955`; stary API exit 0.
+Nowy workspace zachował hash archiwum
+`a883afeee8f8dab12ec46b6b9b4f743f8c0d5f355920fc6e3e656f406efa3393`,
+dirty flag oraz authored scene hash
+`1fe9c88901466a2490c24995ca9d2030352155d6d027d53a1cad92214ec9a2f6`.
+Canvas po odtworzeniu: 700×297, context_lost=false.
+
+Uzupełniający odczyt `/visualization/state` z nowego API, z kontrolą
+response pin, porównał sześć pól kamery: projection, position, target,
+up, fov_degrees, orthographic_scale. Wszystkie identyczne, projection
+orthographic, scale null. Odczyt zapisano jako `camera-observation.json`
+pod receipt tej próby; nie jest to zamiennik pełnego browser gate.
+[Obraz odtworzonego workspace](evidence/53bm-camera-preserved-partial-20261014.png).
+
+Normalny Build Grid odmówił: obiekt nie miał `magnetization_ref`.
+Command log: `Object 'camera-proof-film-mv7bu6go' must reference a
+magnetization asset before mesh/compute.` Jest to brak wejścia mojego
+modelu kontrolnego. Próba została anulowana przez prywatny, uwierzytelniony
+protokół: failed exit 1, 24/24 procesów odebranych i frontend waited=true.
+Nie zaliczono Grid/Compute ani całego P8-53BM.
+
+Korekta wejścia następnej próby: jeszcze **przed Setup draft i restartem**
+w Inspectorze obiektu Magnetic Texture utworzyć oraz przypisać Uniform
+texture, zatwierdzić Save Texture/Apply i odczytać niepusty
+`magnetization_ref` z committed scene. Dopiero wtedy przechwycić scenę,
+dirty document i kamerę. Bieżący `ObjectMagneticTexturePanel.tsx` posiada
+`saveTexture()`, które buduje asset i zatwierdza transakcję authoring;
+`scene_after_successful_grid()` pozwala tylko usunąć tag mesh:dirty,
+więc dodawanie magnetyzacji dopiero po restarcie nie spełni bramki.
+Nie zmieniać walidatora ani oczekiwanych hashów, by akceptowały poprzednie
+niekompletne wejście. Ponowna próba używa tego samego poprawnie zbudowanego
+pakietu, lecz nowego, kompletnego modelu wejściowego.

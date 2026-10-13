@@ -1,5 +1,17 @@
 # Status realizacji całego planu refaktoryzacji
 
+Aktualizacja 14.10.2026 — nowy pakiet `cd7fe207` ukończony, exit 0.
+Realna próba `14152bbfe6a44c23a485176a4c0ff127` odtworzyła 1 obiekt,
+1 region, 1 materiał i identyczny dirty document po zmianie API instance.
+Uzupełniający odczyt nowego API potwierdził wszystkie sześć pól kamery
+identycznych przed/po; viewport 700×297, context_lost=false.
+Pełny scenariusz nie zaliczony: kontrolny obiekt nie miał magnetization
+asset, więc normalny Build Grid odmówił. Próba jawnie anulowana, 24/24
+procesów i frontend odebrane. Kolejna próba musi przypisać Uniform texture
+przed capture/restart; poprawioną kolejność opisuje
+[ledger P8-53BM](p8/53bm-camera-preservation.md).
+**P8-53BM/P8-53 nadal IN PROGRESS**, bez awansu procentów całego planu.
+
 Checkpoint 14.10.2026 — [P8-53BM](p8/53bm-camera-preservation.md):
 pakiet 94fc ukończony; poprawiono wyścig publikacji lease fixture przez
 istniejącą blokadę natywnego writera. Pełna bramka API po poprawce PASS:
