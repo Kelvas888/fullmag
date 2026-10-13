@@ -35,7 +35,9 @@ const RESTORED_SCHEMA: &str = "fullmag.development-browser-native-restored.v1";
 const RESULT_SCHEMA: &str = "fullmag.development-browser-native-result.v1";
 const MAX_INPUT_LINE_BYTES: usize = 16 * 1024;
 const MAX_COMMAND_LINE_BYTES: usize = 4 * 1024;
-const PROBE_TIMEOUT: Duration = Duration::from_secs(600);
+// Manual authoring plus real Grid/Compute needs a bounded observation window
+// separate from individual API, acquisition and cleanup timeouts.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1800);
 const API_START_TIMEOUT: Duration = Duration::from_secs(30);
 const HELPER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_FRAME_TTL_MS: u64 = 1_000;
@@ -92,6 +94,15 @@ enum ProbeOutcome {
     Finished,
     Failed(&'static str),
     Unknown(&'static str),
+}
+
+impl ProbeOutcome {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Finished => "browser_workspace_finished",
+            Self::Failed(reason) | Self::Unknown(reason) => reason,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -243,7 +254,17 @@ pub(super) fn verify() -> Result<()> {
     }
 
     let mut runtime_attach = None;
-    let mut scratch = None;
+    // Match the ordinary workspace: a real grid authoring command must be
+    // executed and reaped before acquisition can confirm quiescence.
+    let mut scratch = Some(crate::scratch_runtime::spawn(
+        api_port(),
+        // The helper above verified every executable in the sealed A bundle.
+        // Its authoring child must share A's compiled identity with the API;
+        // the B launcher is only the restart coordinator at this point.
+        api.with_file_name(format!("fullmag{}", super::EXE_SUFFIX)),
+        None,
+        old_api_instance_id.clone(),
+    ));
     let mut pump = NativeRestartPump::default();
     let mut reader_handle = Some(command_reader);
     let mut pending_finish: Option<FinishCommand> = None;
@@ -283,6 +304,24 @@ pub(super) fn verify() -> Result<()> {
             if pump_step.is_err() {
                 failure = Some(ProbeOutcome::Unknown("restart_pump_outcome_unconfirmed"));
                 break;
+            }
+            match terminal_restart_failure(
+                &transport_root,
+                &transport_worktree,
+                &old_api_instance_id,
+                &generation_id,
+            ) {
+                Ok(Some(outcome)) => {
+                    failure = Some(outcome);
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    failure = Some(ProbeOutcome::Unknown(
+                        "restart_result_observation_unconfirmed",
+                    ));
+                    break;
+                }
             }
             if !candidate_preparation_progress_matches {
                 failure = Some(ProbeOutcome::Unknown(
@@ -416,7 +455,12 @@ pub(super) fn verify() -> Result<()> {
         &helpers,
     )?;
     if status != "passed" {
-        bail!("browser workspace native proof ended without a confirmed pass");
+        // Keep the observed cause separate from the custody-qualified status.
+        // A failed observation with unconfirmed cleanup is still unknown.
+        bail!(
+            "browser workspace native proof ended without a confirmed pass: status={status}; reason={}",
+            outcome.reason()
+        );
     }
     Ok(())
 }
@@ -823,6 +867,37 @@ fn require_ready_identity(
     Ok(())
 }
 
+/// Observe only the immutable result bound to this probe's original API and
+/// generation. A terminal refusal cannot lead to restore, but still needs the
+/// same owned-process finalization as any other failed proof.
+fn terminal_restart_failure(
+    root: &Path,
+    worktree: &str,
+    api_instance_id: &str,
+    generation_id: &str,
+) -> Result<Option<ProbeOutcome>> {
+    use fullmag_session::development_restart_transport::{self as transport, RestartResultState};
+    let Some(request) =
+        transport::read_pending_request(root, worktree, api_instance_id, generation_id)?
+    else {
+        return Ok(None);
+    };
+    let Some(result) = transport::read_result(
+        root,
+        worktree,
+        &request.request_id,
+        &request.status_token_sha256,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(match result.state {
+        RestartResultState::Ready => None,
+        RestartResultState::Failed => Some(ProbeOutcome::Failed("restart_request_failed")),
+        RestartResultState::Unknown => Some(ProbeOutcome::Unknown("restart_request_unknown")),
+    })
+}
+
 fn readiness_frame(
     pump: &NativeRestartPump,
     guard: &ControlRoomGuard,
@@ -1161,4 +1236,109 @@ fn lower_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod terminal_result_tests {
+    use super::*;
+    use fullmag_session::development_restart_transport::{
+        self as transport, RestartRequest, RestartResult, RestartResultState,
+    };
+
+    #[test]
+    fn observed_failure_and_unknown_causes_remain_distinct() {
+        assert_eq!(
+            ProbeOutcome::Failed("restart_request_failed").reason(),
+            "restart_request_failed"
+        );
+        assert_eq!(
+            ProbeOutcome::Unknown("restart_result_observation_unconfirmed").reason(),
+            "restart_result_observation_unconfirmed"
+        );
+        assert_eq!(
+            ProbeOutcome::Finished.reason(),
+            "browser_workspace_finished"
+        );
+    }
+
+    #[test]
+    fn observes_only_published_results_bound_to_the_original_request() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = "browser-proof";
+        let generation = "a".repeat(32);
+        for state in [
+            RestartResultState::Failed,
+            RestartResultState::Unknown,
+            RestartResultState::Ready,
+        ] {
+            let request = RestartRequest {
+                schema: transport::RESTART_REQUEST_SCHEMA.into(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                status_token_sha256: "b".repeat(64),
+                old_api_instance_id: uuid::Uuid::new_v4().to_string(),
+                generation_id: generation.clone(),
+                session_id: None,
+                session_epoch: 0,
+                editor: json!({}),
+                workspace: json!({}),
+                project_document: json!({}),
+            };
+            transport::publish_request(root.path(), worktree, &request).unwrap();
+            assert!(terminal_restart_failure(
+                root.path(),
+                worktree,
+                &request.old_api_instance_id,
+                &generation
+            )
+            .unwrap()
+            .is_none());
+            assert!(terminal_restart_failure(
+                root.path(),
+                worktree,
+                &request.old_api_instance_id,
+                &"c".repeat(32)
+            )
+            .is_err());
+            let request_path = root.path().join(format!(
+                "runtimes/{worktree}/development-restarts/{}/request.json",
+                request.request_id,
+            ));
+            let ready = state == RestartResultState::Ready;
+            let result = RestartResult {
+                schema: transport::RESTART_RESULT_SCHEMA.into(),
+                request_id: request.request_id.clone(),
+                old_api_instance_id: request.old_api_instance_id.clone(),
+                generation_id: generation.clone(),
+                request_sha256: fullmag_session::hex_sha256(&fs::read(request_path).unwrap()),
+                status_token_sha256: request.status_token_sha256.clone(),
+                state,
+                new_api_instance_id: ready.then(|| uuid::Uuid::new_v4().to_string()),
+                session_id: None,
+                session_epoch: ready.then_some(0),
+                editor: ready.then(|| json!({})),
+                workspace: ready.then(|| json!({})),
+                project_document: ready.then(|| json!({})),
+                public_reason: None,
+            };
+            transport::publish_result(root.path(), worktree, &request, &result).unwrap();
+            let outcome = terminal_restart_failure(
+                root.path(),
+                worktree,
+                &request.old_api_instance_id,
+                &generation,
+            )
+            .unwrap();
+            assert!(match state {
+                RestartResultState::Failed => matches!(
+                    outcome,
+                    Some(ProbeOutcome::Failed("restart_request_failed"))
+                ),
+                RestartResultState::Unknown => matches!(
+                    outcome,
+                    Some(ProbeOutcome::Unknown("restart_request_unknown"))
+                ),
+                RestartResultState::Ready => outcome.is_none(),
+            });
+        }
+    }
 }

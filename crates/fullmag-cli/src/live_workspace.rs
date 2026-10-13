@@ -390,6 +390,17 @@ impl LocalLiveWorkspace {
         }
     }
 
+    pub(crate) fn grid_refresh_snapshot(&self) -> Result<CurrentLiveSnapshotPayload> {
+        let state = self.state.lock().map_err(|_| anyhow!("grid workspace state lock poisoned"))?;
+        // Do not clone the field/mesh carriers merely to discard them. Grid
+        // authoring publishes no run, bootstrap state or scientific fields.
+        Ok(CurrentLiveSnapshotPayload {
+            mesh_workspace: state.mesh_workspace.clone(),
+            engine_log: Some(state.engine_log.clone()),
+            ..Default::default()
+        })
+    }
+
     pub fn snapshot(&self) -> LocalLiveWorkspaceState {
         self.state
             .lock()
@@ -1598,6 +1609,12 @@ fn scalar_payload_finished(payload: &CurrentLiveSnapshotPayload) -> bool {
 }
 
 impl CurrentLivePublisher {
+    pub(crate) fn unpublished_grid_refresh() -> Self {
+        // A grid authoring operation has no scientific run to publish. Its
+        // exact mesh receipt is sent synchronously at the terminal boundary.
+        Self::disabled()
+    }
+
     pub fn spawn(session_id: &str) -> Self {
         if !live_api_publish_enabled(api_port()) {
             // Headless runs deliberately disable the live API.  There is no

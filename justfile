@@ -156,6 +156,19 @@ verify-windows-development-backend-api cross_build_bundle="":
 verify-windows-frozen-development-backend-api build_id:
     @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --frozen-native-build-id "{{build_id}}"
 
+# Owned HTTP cancellation protocol proof, pinned to a verified native package.
+# Uses fixture-seeded task catalogs; does not qualify Submit, solver, or host release.
+verify-compute-cancellation-api build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-cancellation-only --frozen-native-build-id "{{build_id}}"
+
+# Native operator initialization proof; fixture policy is not hardware evidence.
+verify-compute-host-initialization build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-host-initialization-only --frozen-native-build-id "{{build_id}}"
+
+# Standalone scheduler component cancellation/drain proof, not service v2 startup.
+verify-compute-scheduler-cancellation build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-scheduler-cancellation-only --frozen-native-build-id "{{build_id}}"
+
 # Native observer protocol proof; no unit-test compilation or user-session restart.
 verify-windows-development-observer-pause:
     @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --observer-pause-only
@@ -314,6 +327,10 @@ check-session-persistence:
 # Source-only API check for application/session adapters; excludes test targets.
 check-api-source:
     {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-source-check --repo-root "{{repo_root}}"
+
+# Production API, service and scheduler source check; excludes test targets.
+check-api-service-source:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-service-source-check --repo-root "{{repo_root}}"
 
 # Source-only production CLI check; excludes unit tests and native solvers.
 check-cli-source:

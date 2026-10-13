@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 use uuid::Uuid;
 
 use crate::repository_path::{checked_path, create_parent, validate_store_id};
+use crate::runtime_service_host::RuntimeServiceHostExecution;
 use crate::runtime_service_startup::RuntimeServiceStartupGuard;
 use crate::store::SessionStore;
 use crate::{
@@ -25,6 +26,8 @@ use crate::{
 };
 
 pub const RUNTIME_SERVICE_OWNER_SCHEMA: &str = "runtime_service_owner.v1";
+pub const RUNTIME_SERVICE_CONFIG_SCHEMA_V1: &str = "runtime_service_config.v1";
+pub const RUNTIME_SERVICE_CONFIG_SCHEMA_V2: &str = "runtime_service_config.v2";
 pub const RUNTIME_SERVICE_OWNER_PROTOCOL: &str = "stdin-v1";
 pub const RUNTIME_SERVICE_OWNER_LOCK_PATH: &str = "runtime-services/OWNER.lock";
 pub const RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH: &str = "runtime-services/OWNER.json";
@@ -811,6 +814,8 @@ pub struct RuntimeServiceConfig {
     pub heartbeat_interval_milliseconds: u64,
     pub startup_timeout_seconds: u64,
     pub drain_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_execution: Option<RuntimeServiceHostExecution>,
 }
 
 /// Serializes local launch decisions independently of the long-lived service lock.
@@ -1089,6 +1094,79 @@ impl RuntimeServiceConfig {
         Ok(config)
     }
 
+    /// Pin an explicitly supplied v2 host configuration and initialize its
+    /// admission ledger on a store that has never started this service.
+    ///
+    /// The startup gate excludes direct owner publication. The launch gate is
+    /// reacquired after the application writer is released and held through
+    /// ledger initialization so no launcher can publish a launch record in
+    /// between. A ledger failure leaves the exact application configuration
+    /// pinned for a safe retry.
+    pub fn initialize_host_application(store: &SessionStore, candidate: &Self) -> Result<Self> {
+        candidate.validate()?;
+        if candidate.schema_version != RUNTIME_SERVICE_CONFIG_SCHEMA_V2
+            || candidate.host_execution.is_none()
+        {
+            bail!("host application initialization requires a v2 host execution binding");
+        }
+        candidate.require_application_binding(store, &candidate.target_id)?;
+
+        let _startup_guard = RuntimeServiceStartupGuard::try_acquire(store.root())?
+            .context("runtime service startup gate is busy")?;
+        store
+            .assert_development_admission_open()
+            .context("host initialization refused while development admission is closed")?;
+        Self::require_no_existing_owner_records(store)?;
+
+        let persisted =
+            Self::for_application(store, &candidate.target_id, || Ok(candidate.clone()))?;
+        if &persisted != candidate {
+            bail!(
+                "persisted application configuration differs from the requested host configuration"
+            );
+        }
+
+        // for_application has dropped its store writer before we acquire the
+        // host ledger writer. Recheck while holding the launch gate because a
+        // launcher may have completed after for_application released it.
+        let _launch_guard = Self::acquire_host_application_ledger_guard(store)?;
+        let host_execution = persisted
+            .host_execution
+            .as_ref()
+            .context("persisted host application has no host execution binding")?;
+        crate::host_resource_ledger::HostResourceLedger::initialize(
+            &host_execution.ledger_root,
+            host_execution.policy.clone(),
+        )?;
+        Ok(persisted)
+    }
+
+    fn acquire_host_application_ledger_guard(
+        store: &SessionStore,
+    ) -> Result<RuntimeServiceLaunchGuard> {
+        let launch_guard = RuntimeServiceLaunchGuard::try_acquire(store.root())?.context(
+            "application runtime launch guard is busy before host ledger initialization",
+        )?;
+        Self::require_no_existing_owner_records(store)?;
+        Ok(launch_guard)
+    }
+
+    fn require_no_existing_owner_records(store: &SessionStore) -> Result<()> {
+        for record in [
+            RUNTIME_SERVICE_OWNER_LOCK_PATH,
+            RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH,
+            "runtime-services/LAUNCH.json",
+        ] {
+            let path = checked_path(store.root(), record)?;
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => bail!("runtime service already has an owner or launch record; conservative recovery is required"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("observe runtime service owner record"),
+            }
+        }
+        Ok(())
+    }
+
     fn require_application_binding(&self, store: &SessionStore, target_id: &str) -> Result<()> {
         if self.store_root != store.root() || self.target_id != target_id {
             bail!("application service configuration belongs to another store or target");
@@ -1117,8 +1195,17 @@ impl RuntimeServiceConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != "runtime_service_config.v1" {
-            bail!("unsupported runtime service configuration");
+        match self.schema_version.as_str() {
+            RUNTIME_SERVICE_CONFIG_SCHEMA_V1 if self.host_execution.is_none() => {}
+            RUNTIME_SERVICE_CONFIG_SCHEMA_V1 => {
+                bail!("runtime service configuration v1 cannot bind host execution")
+            }
+            RUNTIME_SERVICE_CONFIG_SCHEMA_V2 => {
+                if self.host_execution.is_none() {
+                    bail!("runtime service configuration v2 requires a host execution binding");
+                }
+            }
+            _ => bail!("unsupported runtime service configuration"),
         }
         if !self.store_root.is_absolute()
             || self
@@ -1175,6 +1262,9 @@ impl RuntimeServiceConfig {
         {
             bail!("compute and preparation resource IDs must be disjoint");
         }
+        if let Some(host_execution) = &self.host_execution {
+            host_execution.validate(&self.compute_resources, &self.preparation_resources)?;
+        }
         if [
             self.worker_timeout_seconds,
             self.preparation_timeout_seconds,
@@ -1197,12 +1287,46 @@ impl RuntimeServiceConfig {
         }
         Ok(())
     }
+
+    /// Resolve a scheduler concurrency cap from the explicitly versioned
+    /// configuration. Legacy v1 configurations retain their one-worker cap.
+    pub fn scheduler_concurrency(&self, role: &str) -> Result<usize> {
+        let compute_role = match role {
+            RUNTIME_SERVICE_COMPUTE_ROLE => true,
+            RUNTIME_SERVICE_PREPARATION_ROLE => false,
+            _ => bail!("unknown runtime service scheduler role `{role}`"),
+        };
+        self.validate()?;
+        match self.schema_version.as_str() {
+            RUNTIME_SERVICE_CONFIG_SCHEMA_V1 => Ok(1),
+            RUNTIME_SERVICE_CONFIG_SCHEMA_V2 => {
+                let host_execution = self
+                    .host_execution
+                    .as_ref()
+                    .context("runtime service v2 host execution binding is missing")?;
+                Ok(if compute_role {
+                    host_execution.compute_max_concurrency
+                } else {
+                    host_execution.preparation_max_concurrency
+                })
+            }
+            _ => bail!("unsupported runtime service configuration"),
+        }
+    }
 }
 
 #[cfg(test)]
 mod application_configuration_tests {
     use super::*;
+    use crate::host_resource_ledger::{HostResourceLedger, HostResourceLedgerPolicy};
+    use crate::runtime_service_host::{
+        RuntimeServiceHostExecution, RuntimeServiceHostPlacement,
+        RUNTIME_SERVICE_HOST_EXECUTION_SCHEMA_V1,
+    };
     use crate::{FmsResourceBudget, FmsResourceKind};
+    use std::collections::BTreeSet;
+
+    const GPU_A: &str = "GPU-00000000-0000-4000-8000-000000000001";
 
     fn config(store: &SessionStore) -> RuntimeServiceConfig {
         let budget = FmsResourceBudget {
@@ -1231,7 +1355,350 @@ mod application_configuration_tests {
             heartbeat_interval_milliseconds: 100,
             startup_timeout_seconds: 10,
             drain_timeout_seconds: 10,
+            host_execution: None,
         }
+    }
+
+    fn host_execution(config: &RuntimeServiceConfig) -> RuntimeServiceHostExecution {
+        RuntimeServiceHostExecution {
+            schema_version: RUNTIME_SERVICE_HOST_EXECUTION_SCHEMA_V1.into(),
+            ledger_root: config.store_root.join("shared-host-ledger"),
+            policy: HostResourceLedgerPolicy {
+                schema_version: crate::host_resource_ledger::HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V1
+                    .into(),
+                host_id: "host:test-local".into(),
+                topology_sha256: "a".repeat(64),
+                revision: 4,
+                owner_epoch: 9,
+                total_budget: FmsResourceBudget {
+                    cpu_millis: 4000,
+                    memory_bytes: 8192,
+                    gpu_memory_bytes: 0,
+                    storage_bytes: 8192,
+                },
+                gpu_vram_bytes_by_uuid: [(GPU_A.into(), 4096)].into_iter().collect(),
+                allowed_cpu_ids: [0, 1, 2, 3].into_iter().collect(),
+            },
+            compute_max_concurrency: 2,
+            preparation_max_concurrency: 1,
+            compute_placements: config
+                .compute_resources
+                .iter()
+                .map(|offer| {
+                    (
+                        offer.resource_id.clone(),
+                        RuntimeServiceHostPlacement {
+                            cpu_ids: [0].into_iter().collect(),
+                            gpu_uuid: None,
+                        },
+                    )
+                })
+                .collect(),
+            preparation_cpu_ids: config
+                .preparation_resources
+                .iter()
+                .map(|offer| (offer.resource_id.clone(), [1].into_iter().collect()))
+                .collect(),
+        }
+    }
+
+    fn v2_config(store: &SessionStore) -> RuntimeServiceConfig {
+        let mut config = config(store);
+        config.schema_version = RUNTIME_SERVICE_CONFIG_SCHEMA_V2.into();
+        config.host_execution = Some(host_execution(&config));
+        config
+    }
+
+    fn gpu_v2_config(store: &SessionStore) -> RuntimeServiceConfig {
+        let mut config = config(store);
+        config.compute_resources[0].kind = FmsResourceKind::Gpu;
+        config.compute_resources[0].budget.gpu_memory_bytes = 2048;
+        config.schema_version = RUNTIME_SERVICE_CONFIG_SCHEMA_V2.into();
+        let mut host_execution = host_execution(&config);
+        host_execution
+            .compute_placements
+            .get_mut("compute.cpu")
+            .unwrap()
+            .gpu_uuid = Some(GPU_A.into());
+        config.host_execution = Some(host_execution);
+        config
+    }
+
+    #[test]
+    fn v1_serialization_remains_byte_identical_and_keeps_one_worker_caps() {
+        #[derive(serde::Serialize)]
+        struct LegacyRuntimeServiceConfig<'a> {
+            schema_version: &'a str,
+            store_root: &'a PathBuf,
+            target_id: &'a str,
+            compute_pool_id: &'a str,
+            preparation_pool_id: &'a str,
+            compute_resources: &'a Vec<FmsSchedulerResourceOffer>,
+            preparation_resources: &'a Vec<FmsPreparationResourceOffer>,
+            worker_timeout_seconds: u64,
+            preparation_timeout_seconds: u64,
+            heartbeat_interval_milliseconds: u64,
+            startup_timeout_seconds: u64,
+            drain_timeout_seconds: u64,
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let config = config(&store);
+        let legacy = LegacyRuntimeServiceConfig {
+            schema_version: &config.schema_version,
+            store_root: &config.store_root,
+            target_id: &config.target_id,
+            compute_pool_id: &config.compute_pool_id,
+            preparation_pool_id: &config.preparation_pool_id,
+            compute_resources: &config.compute_resources,
+            preparation_resources: &config.preparation_resources,
+            worker_timeout_seconds: config.worker_timeout_seconds,
+            preparation_timeout_seconds: config.preparation_timeout_seconds,
+            heartbeat_interval_milliseconds: config.heartbeat_interval_milliseconds,
+            startup_timeout_seconds: config.startup_timeout_seconds,
+            drain_timeout_seconds: config.drain_timeout_seconds,
+        };
+        assert_eq!(
+            serde_json::to_vec(&config).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+        assert!(config.validate().is_ok());
+        assert_eq!(config.scheduler_concurrency("compute").unwrap(), 1);
+        assert_eq!(config.scheduler_concurrency("preparation").unwrap(), 1);
+        assert!(config.scheduler_concurrency("unknown").is_err());
+    }
+
+    #[test]
+    fn v1_rejects_host_binding_and_unknown_config_schemas() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let mut legacy = config(&store);
+        legacy.host_execution = Some(host_execution(&legacy));
+        assert!(legacy.validate().is_err());
+
+        legacy.schema_version = "runtime_service_config.v3".into();
+        legacy.host_execution = None;
+        assert!(legacy.validate().is_err());
+    }
+
+    #[test]
+    fn v2_requires_explicit_host_binding_and_uses_pinned_concurrency_caps() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let mut missing = config(&store);
+        missing.schema_version = RUNTIME_SERVICE_CONFIG_SCHEMA_V2.into();
+        assert!(missing.validate().is_err());
+
+        let config = v2_config(&store);
+        assert!(config.validate().is_ok());
+        assert_eq!(config.scheduler_concurrency("compute").unwrap(), 2);
+        assert_eq!(config.scheduler_concurrency("preparation").unwrap(), 1);
+        assert!(config.scheduler_concurrency("meshing").is_err());
+    }
+
+    #[test]
+    fn v2_requires_exact_bounded_placements_and_valid_policy_fences() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let valid = v2_config(&store);
+        assert!(valid.validate().is_ok());
+        let encoded = serde_json::to_vec(&valid).unwrap();
+        let decoded: RuntimeServiceConfig = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, valid);
+        let mut changed_policy_revision = valid.clone();
+        changed_policy_revision
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .policy
+            .revision += 1;
+        assert_ne!(
+            encoded,
+            serde_json::to_vec(&changed_policy_revision).unwrap()
+        );
+
+        let mut missing_placement = valid.clone();
+        missing_placement
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .compute_placements
+            .clear();
+        assert!(missing_placement.validate().is_err());
+
+        let mut extra_placement = valid.clone();
+        extra_placement
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .compute_placements
+            .insert(
+                "not-an-offer".into(),
+                RuntimeServiceHostPlacement {
+                    cpu_ids: BTreeSet::new(),
+                    gpu_uuid: None,
+                },
+            );
+        assert!(extra_placement.validate().is_err());
+
+        let mut missing_preparation = valid.clone();
+        missing_preparation
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .preparation_cpu_ids
+            .clear();
+        assert!(missing_preparation.validate().is_err());
+
+        let mut invalid_revision = valid.clone();
+        invalid_revision
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .policy
+            .revision = 0;
+        assert!(invalid_revision.validate().is_err());
+
+        let mut invalid_owner_epoch = valid.clone();
+        invalid_owner_epoch
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .policy
+            .owner_epoch = 0;
+        assert!(invalid_owner_epoch.validate().is_err());
+
+        let mut unknown_host_schema = valid.clone();
+        unknown_host_schema
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .schema_version = "runtime_service_host_execution.v2".into();
+        assert!(unknown_host_schema.validate().is_err());
+
+        let mut unknown_host_field = serde_json::to_value(&valid).unwrap();
+        unknown_host_field["host_execution"]["unrecognized"] = true.into();
+        assert!(serde_json::from_value::<RuntimeServiceConfig>(unknown_host_field).is_err());
+
+        let mut over_limit = valid.clone();
+        over_limit
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .compute_max_concurrency = 33;
+        assert!(over_limit.validate().is_err());
+        let mut zero_concurrency = valid.clone();
+        zero_concurrency
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .preparation_max_concurrency = 0;
+        assert!(zero_concurrency.validate().is_err());
+
+        let mut oversized_map = valid.clone();
+        let placements = &mut oversized_map
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .compute_placements;
+        placements.clear();
+        for index in 0..=4096 {
+            placements.insert(
+                format!("extra-{index}"),
+                RuntimeServiceHostPlacement {
+                    cpu_ids: BTreeSet::new(),
+                    gpu_uuid: None,
+                },
+            );
+        }
+        assert!(oversized_map.validate().is_err());
+
+        let mut parent_traversal = valid;
+        parent_traversal
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .ledger_root = PathBuf::from("/tmp/../outside");
+        assert!(parent_traversal.validate().is_err());
+    }
+
+    #[test]
+    fn v2_cpu_gpu_and_preparation_placements_enforce_resource_kind_and_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let mut cpu_gpu_claim = v2_config(&store);
+        cpu_gpu_claim
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .compute_placements
+            .get_mut("compute.cpu")
+            .unwrap()
+            .gpu_uuid = Some(GPU_A.into());
+        assert!(cpu_gpu_claim.validate().is_err());
+
+        let mut pinned_overclaim = v2_config(&store);
+        pinned_overclaim.compute_resources[0].budget.cpu_millis = 1001;
+        assert!(pinned_overclaim.validate().is_err());
+        let mut unknown_cpu = v2_config(&store);
+        unknown_cpu
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .compute_placements
+            .get_mut("compute.cpu")
+            .unwrap()
+            .cpu_ids = [9].into_iter().collect();
+        assert!(unknown_cpu.validate().is_err());
+
+        let mut gpu_without_uuid = gpu_v2_config(&store);
+        gpu_without_uuid
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .compute_placements
+            .get_mut("compute.cpu")
+            .unwrap()
+            .gpu_uuid = None;
+        assert!(gpu_without_uuid.validate().is_err());
+
+        let mut unknown_gpu_uuid = gpu_v2_config(&store);
+        unknown_gpu_uuid
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .compute_placements
+            .get_mut("compute.cpu")
+            .unwrap()
+            .gpu_uuid = Some("GPU-00000000-0000-4000-8000-000000000002".into());
+        assert!(unknown_gpu_uuid.validate().is_err());
+
+        let mut gpu_overclaim = gpu_v2_config(&store);
+        gpu_overclaim.compute_resources[0].budget.gpu_memory_bytes = 4097;
+        assert!(gpu_overclaim.validate().is_err());
+
+        let mut pinned_preparation_overclaim = v2_config(&store);
+        pinned_preparation_overclaim.preparation_resources[0]
+            .budget
+            .cpu_millis = 1001;
+        assert!(pinned_preparation_overclaim.validate().is_err());
+
+        let mut prep_gpu_claim = v2_config(&store);
+        prep_gpu_claim.preparation_resources[0]
+            .budget
+            .gpu_memory_bytes = 1;
+        assert!(prep_gpu_claim.validate().is_err());
+
+        let mut aggregate_overclaim = v2_config(&store);
+        aggregate_overclaim
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .policy
+            .total_budget
+            .memory_bytes = 1000;
+        assert!(aggregate_overclaim.validate().is_err());
     }
 
     #[test]
@@ -1259,15 +1726,226 @@ mod application_configuration_tests {
         let store = SessionStore::open(directory.path()).unwrap();
         let first = RuntimeServiceConfig::for_application(&store, "desktop", || Ok(config(&store)))
             .unwrap();
+        let saved_path = store.root().join("runtime-services/APPLICATION.json");
+        let saved_bytes = std::fs::read(&saved_path).unwrap();
         let next = RuntimeServiceConfig::for_application(&store, "desktop", || {
             panic!("saved configuration must not resample volatile capacity")
         })
         .unwrap();
         assert_eq!(first, next);
+        assert_eq!(std::fs::read(saved_path).unwrap(), saved_bytes);
         assert!(RuntimeServiceConfig::for_application(&store, "other", || {
             panic!("wrong target must not initialize another configuration")
         })
         .is_err());
+    }
+
+    #[test]
+    fn host_application_initializes_a_missing_ledger_and_repeats_exactly() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let candidate = v2_config(&store);
+        let ledger_root = candidate
+            .host_execution
+            .as_ref()
+            .unwrap()
+            .ledger_root
+            .clone();
+        assert!(!ledger_root.exists());
+
+        let first = RuntimeServiceConfig::initialize_host_application(&store, &candidate).unwrap();
+        let application_path = store.root().join("runtime-services/APPLICATION.json");
+        let application_bytes = std::fs::read(&application_path).unwrap();
+        let marker_path = ledger_root.join("HOST_RESOURCE_LEDGER.init.json");
+        let document_path = ledger_root.join("HOST_RESOURCE_LEDGER.json");
+        let marker_bytes = std::fs::read(&marker_path).unwrap();
+        let document_bytes = std::fs::read(&document_path).unwrap();
+        assert_eq!(first, candidate);
+        assert!(HostResourceLedger::open(
+            &ledger_root,
+            candidate.host_execution.as_ref().unwrap().policy.clone(),
+        )
+        .is_ok());
+
+        let repeated =
+            RuntimeServiceConfig::initialize_host_application(&store, &candidate).unwrap();
+        assert_eq!(repeated, candidate);
+        assert_eq!(std::fs::read(application_path).unwrap(), application_bytes);
+        assert_eq!(std::fs::read(marker_path).unwrap(), marker_bytes);
+        assert_eq!(std::fs::read(document_path).unwrap(), document_bytes);
+    }
+
+    #[test]
+    fn changed_host_candidate_is_rejected_before_ledger_creation_or_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let candidate = v2_config(&store);
+        RuntimeServiceConfig::for_application(&store, &candidate.target_id, || {
+            Ok(candidate.clone())
+        })
+        .unwrap();
+        let ledger_root = candidate
+            .host_execution
+            .as_ref()
+            .unwrap()
+            .ledger_root
+            .clone();
+        let application_path = store.root().join("runtime-services/APPLICATION.json");
+        let application_bytes = std::fs::read(&application_path).unwrap();
+
+        let mut changed = candidate.clone();
+        changed.host_execution.as_mut().unwrap().policy.revision += 1;
+        assert!(RuntimeServiceConfig::initialize_host_application(&store, &changed).is_err());
+        assert!(!ledger_root.exists());
+        assert_eq!(std::fs::read(&application_path).unwrap(), application_bytes);
+
+        RuntimeServiceConfig::initialize_host_application(&store, &candidate).unwrap();
+        let marker_path = ledger_root.join("HOST_RESOURCE_LEDGER.init.json");
+        let document_path = ledger_root.join("HOST_RESOURCE_LEDGER.json");
+        let marker_bytes = std::fs::read(&marker_path).unwrap();
+        let document_bytes = std::fs::read(&document_path).unwrap();
+        assert!(RuntimeServiceConfig::initialize_host_application(&store, &changed).is_err());
+        assert_eq!(std::fs::read(marker_path).unwrap(), marker_bytes);
+        assert_eq!(std::fs::read(document_path).unwrap(), document_bytes);
+    }
+
+    #[test]
+    fn host_application_rejects_v1_candidates_and_existing_v1_configurations() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let legacy = config(&store);
+        assert!(RuntimeServiceConfig::initialize_host_application(&store, &legacy).is_err());
+        assert!(!store
+            .root()
+            .join("runtime-services/APPLICATION.json")
+            .exists());
+
+        RuntimeServiceConfig::for_application(&store, &legacy.target_id, || Ok(legacy.clone()))
+            .unwrap();
+        let application_path = store.root().join("runtime-services/APPLICATION.json");
+        let application_bytes = std::fs::read(&application_path).unwrap();
+        let candidate = v2_config(&store);
+        assert!(RuntimeServiceConfig::initialize_host_application(&store, &candidate).is_err());
+        assert_eq!(std::fs::read(application_path).unwrap(), application_bytes);
+        assert!(!candidate
+            .host_execution
+            .as_ref()
+            .unwrap()
+            .ledger_root
+            .exists());
+    }
+
+    #[test]
+    fn partial_host_ledger_stays_pinned_and_is_never_rebuilt() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let candidate = v2_config(&store);
+        let ledger_root = candidate
+            .host_execution
+            .as_ref()
+            .unwrap()
+            .ledger_root
+            .clone();
+        std::fs::create_dir_all(&ledger_root).unwrap();
+        let marker_path = ledger_root.join("HOST_RESOURCE_LEDGER.init.json");
+        std::fs::write(&marker_path, b"existing partial marker").unwrap();
+
+        assert!(RuntimeServiceConfig::initialize_host_application(&store, &candidate).is_err());
+        let application_path = store.root().join("runtime-services/APPLICATION.json");
+        assert_eq!(
+            RuntimeServiceConfig::read(&application_path).unwrap(),
+            candidate
+        );
+        assert_eq!(
+            std::fs::read(&marker_path).unwrap(),
+            b"existing partial marker"
+        );
+        assert!(!ledger_root.join("HOST_RESOURCE_LEDGER.json").exists());
+        assert!(RuntimeServiceConfig::initialize_host_application(&store, &candidate).is_err());
+        assert_eq!(
+            std::fs::read(&marker_path).unwrap(),
+            b"existing partial marker"
+        );
+        assert!(!ledger_root.join("HOST_RESOURCE_LEDGER.json").exists());
+    }
+
+    #[test]
+    fn host_application_refuses_existing_owner_and_launch_records() {
+        for record in [
+            RUNTIME_SERVICE_OWNER_LOCK_PATH,
+            RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH,
+            "runtime-services/LAUNCH.json",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = SessionStore::open(directory.path()).unwrap();
+            let candidate = v2_config(&store);
+            let record_path = create_parent(store.root(), record).unwrap();
+            std::fs::write(&record_path, b"preserve owner evidence").unwrap();
+
+            assert!(RuntimeServiceConfig::initialize_host_application(&store, &candidate).is_err());
+            assert_eq!(
+                std::fs::read(record_path).unwrap(),
+                b"preserve owner evidence"
+            );
+            assert!(!store
+                .root()
+                .join("runtime-services/APPLICATION.json")
+                .exists());
+            assert!(!candidate
+                .host_execution
+                .as_ref()
+                .unwrap()
+                .ledger_root
+                .exists());
+        }
+    }
+
+    #[test]
+    fn host_application_refuses_a_development_idle_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let candidate = v2_config(&store);
+        let fence = store
+            .acquire_development_idle_fence("owner-init", "nonce-init")
+            .unwrap();
+        assert!(RuntimeServiceConfig::initialize_host_application(&store, &candidate).is_err());
+        assert_eq!(store.read_development_idle_fence().unwrap(), Some(fence));
+        assert!(!store
+            .root()
+            .join("runtime-services/APPLICATION.json")
+            .exists());
+        assert!(!candidate
+            .host_execution
+            .as_ref()
+            .unwrap()
+            .ledger_root
+            .exists());
+    }
+
+    #[test]
+    fn launch_record_created_after_application_pin_blocks_ledger_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let candidate = v2_config(&store);
+        RuntimeServiceConfig::for_application(&store, &candidate.target_id, || {
+            Ok(candidate.clone())
+        })
+        .unwrap();
+        let launch_id = Uuid::new_v4().to_string();
+        {
+            let launch = RuntimeServiceLaunchGuard::try_acquire(store.root())
+                .unwrap()
+                .unwrap();
+            launch.publish(&launch_id, "starting", None).unwrap();
+        }
+
+        assert!(RuntimeServiceConfig::acquire_host_application_ledger_guard(&store).is_err());
+        assert!(!candidate
+            .host_execution
+            .as_ref()
+            .unwrap()
+            .ledger_root
+            .exists());
     }
 
     #[test]

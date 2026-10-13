@@ -2990,26 +2990,17 @@ async fn mark_commands_dispatched(
 async fn take_next_current_control_command_after(
     state: &Arc<AppState>,
     after_seq: u64,
+    grid_refresh_command_id: Option<&str>,
 ) -> Result<Option<SessionCommand>, ApiError> {
     let mut stale = Vec::new();
     let selected = {
         let mut queue = state.current_control_queue.lock().await;
-        let index = 0usize;
-        let mut selected = None;
-        while index < queue.len() {
-            let Some(command) = queue.get(index) else {
-                break;
-            };
-            if command.seq <= after_seq {
-                if let Some(removed) = queue.remove(index) {
-                    stale.push(removed);
-                }
-                continue;
-            }
-            selected = queue.remove(index);
-            break;
-        }
-        selected
+        take_next_control_command_from_queue(
+            &mut queue,
+            after_seq,
+            grid_refresh_command_id,
+            &mut stale,
+        )
     };
 
     let mut dispatched = stale.clone();
@@ -3032,10 +3023,112 @@ async fn take_next_current_control_command_after(
     Ok(selected)
 }
 
+fn take_next_control_command_from_queue(
+    queue: &mut VecDeque<SessionCommand>,
+    after_seq: u64,
+    grid_refresh_command_id: Option<&str>,
+    stale: &mut Vec<SessionCommand>,
+) -> Option<SessionCommand> {
+    if let Some(command_id) = grid_refresh_command_id {
+        let index = queue.iter().position(|command| {
+            command.seq > after_seq
+                && command.command_id == command_id
+                && command.kind == "fdm_grid_refresh"
+        })?;
+        return queue.remove(index);
+    }
+
+    let index = 0usize;
+    while index < queue.len() {
+        let Some(command) = queue.get(index) else {
+            break;
+        };
+        if command.seq <= after_seq {
+            if let Some(removed) = queue.remove(index) {
+                stale.push(removed);
+            }
+            continue;
+        }
+        return queue.remove(index);
+    }
+    None
+}
+
+#[cfg(test)]
+mod current_control_queue_selection_tests {
+    use super::take_next_control_command_from_queue;
+    use crate::types::SessionCommand;
+    use std::collections::VecDeque;
+
+    fn command(seq: u64, command_id: &str, kind: &str) -> SessionCommand {
+        serde_json::from_value(serde_json::json!({
+            "seq": seq,
+            "command_id": command_id,
+            "kind": kind,
+            "created_at_unix_ms": seq
+        }))
+        .expect("minimal session command should deserialize")
+    }
+
+    #[test]
+    fn pinned_grid_refresh_removes_only_the_exact_new_command() {
+        let mut queue = VecDeque::from([
+            command(1, "old-solve", "solve"),
+            command(2, "other-grid", "fdm_grid_refresh"),
+            command(3, "wanted-grid", "fdm_grid_refresh"),
+            command(4, "later-solve", "solve"),
+        ]);
+        let mut stale = Vec::new();
+
+        let selected = take_next_control_command_from_queue(
+            &mut queue,
+            1,
+            Some("wanted-grid"),
+            &mut stale,
+        )
+        .expect("exact pinned grid refresh should be selected");
+
+        assert_eq!(selected.command_id, "wanted-grid");
+        assert!(stale.is_empty(), "pinned selection must not drain stale commands");
+        assert_eq!(
+            queue
+                .iter()
+                .map(|command| command.command_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-solve", "other-grid", "later-solve"]
+        );
+    }
+
+    #[test]
+    fn pinned_grid_refresh_miss_preserves_every_queued_command() {
+        let mut queue = VecDeque::from([
+            command(0, "wanted-grid", "fdm_grid_refresh"),
+            command(1, "same-id-wrong-kind", "solve"),
+            command(2, "other-grid", "fdm_grid_refresh"),
+        ]);
+        let mut stale = Vec::new();
+
+        assert!(take_next_control_command_from_queue(
+            &mut queue,
+            0,
+            Some("wanted-grid"),
+            &mut stale,
+        )
+        .is_none());
+        assert!(stale.is_empty());
+        assert_eq!(queue.len(), 3);
+    }
+}
+
 async fn sync_current_live_snapshot(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CurrentLiveSnapshotRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let kind = if is_authoring_grid_snapshot(&req) {
+        CurrentLiveSyncKind::AuthoringGridSnapshot
+    } else {
+        CurrentLiveSyncKind::Snapshot
+    };
     let has_live_state_update = req.live_state.is_some();
     let has_scalar_row_update = req.latest_scalar_row.is_some();
     let has_latest_fields_update = req.latest_fields.is_some();
@@ -3046,7 +3139,7 @@ async fn sync_current_live_snapshot(
     let session_id = req.session_id.clone();
     sync_current_live_frame_update(
         &state,
-        CurrentLiveSyncKind::Snapshot,
+        kind,
         &session_id,
         allow_previous_preview_fallback,
         has_live_state_update,
@@ -3169,6 +3262,7 @@ async fn sync_current_live_field_frame(
 #[derive(Debug, Clone, Copy)]
 enum CurrentLiveSyncKind {
     Snapshot,
+    AuthoringGridSnapshot,
     Session,
     Runtime,
     Scalars,
@@ -3178,12 +3272,80 @@ enum CurrentLiveSyncKind {
 impl CurrentLiveSyncKind {
     fn label(self) -> &'static str {
         match self {
-            Self::Snapshot => "snapshot",
+            Self::Snapshot | Self::AuthoringGridSnapshot => "snapshot",
             Self::Session => "session",
             Self::Runtime => "runtime",
             Self::Scalars => "scalars",
             Self::Fields => "fields",
         }
+    }
+}
+
+// A one-shot Grid command publishes authoring mesh metadata and exits. It is
+// not a resident solver publisher and must not start its heartbeat watchdog.
+// Keep all runtime-bearing snapshots and all typed frames on the existing path.
+fn is_authoring_grid_snapshot(req: &CurrentLiveSnapshotRequest) -> bool {
+    req.mesh_workspace.is_some()
+        && req.session.is_none()
+        && req.session_status.is_none()
+        && req.metadata.is_none()
+        && req.stage_execution.is_none()
+        && req.simulation_preparation.is_none()
+        && req.run.is_none()
+        && req.live_state.is_none()
+        && req.frozen_spins_runtime_status.is_none()
+        && req.coupled_checkpoint.is_none()
+        && req.latest_scalar_row.is_none()
+        && req.latest_fields.is_none()
+        && !req.replace_latest_fields
+        && req.field_generation.is_none()
+        && req.preview_fields.is_none()
+        && !req.clear_preview_cache
+        && req.solver_profile.is_none()
+        && req.fem_mesh.is_none()
+}
+
+#[cfg(test)]
+mod authoring_grid_heartbeat_tests {
+    use super::*;
+
+    fn grid() -> CurrentLiveSnapshotRequest {
+        serde_json::from_value(json!({
+            "session_id": "scratch-grid",
+            "mesh_workspace": {"revision": 2},
+            "engine_log": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn grid_metadata_does_not_claim_resident_runner_liveness() {
+        let mut req = grid();
+        assert!(is_authoring_grid_snapshot(&req));
+        req.mesh_workspace = None;
+        assert!(!is_authoring_grid_snapshot(&req));
+    }
+
+    #[test]
+    fn stateful_or_field_mutating_snapshots_keep_heartbeat_semantics() {
+        let mut req = grid();
+        req.session_status = Some("running".into());
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.metadata = Some(json!({"publisher": "runtime"}));
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.coupled_checkpoint = Some(json!({}));
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.clear_preview_cache = true;
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.replace_latest_fields = true;
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.preview_fields = Some(Vec::new());
+        assert!(!is_authoring_grid_snapshot(&req));
     }
 }
 
@@ -4009,7 +4171,9 @@ where
         }
         *current = Some(next);
     }
-    crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(state).await;
+    if !matches!(kind, CurrentLiveSyncKind::AuthoringGridSnapshot) {
+        crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(state).await;
+    }
 
     if let Some(sample) = scalar_sample {
         queue_current_live_realtime_scalar_sample(state.as_ref(), sample).await?;
@@ -4055,7 +4219,7 @@ async fn dequeue_current_live_command(
 ) -> Result<Response, ApiError> {
     let _permit = state.development_admission.admit().await?;
     let _transition = state.current_live_session_transition.lock().await;
-    let command = take_next_current_control_command_after(&state, 0).await?;
+    let command = take_next_current_control_command_after(&state, 0, None).await?;
     match command {
         Some(command) => Ok(Json(command).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
@@ -4075,10 +4239,14 @@ async fn wait_current_live_control(
     Query(query): Query<ControlWaitQuery>,
 ) -> Result<Response, ApiError> {
     let _ = current_live_session_id(&state).await?;
+    let after_seq = query.after_seq;
+    let requested_session_id = query.session_id.clone();
+    let grid_refresh_command_id = query.grid_refresh_command_id.clone();
     if let Some(command) = take_current_control_command_for_session(
         &state,
-        query.after_seq,
-        query.session_id.as_deref(),
+        after_seq,
+        requested_session_id.as_deref(),
+        grid_refresh_command_id.as_deref(),
     )
     .await?
     {
@@ -4088,7 +4256,7 @@ async fn wait_current_live_control(
     let timeout_ms = query.timeout_ms.clamp(100, 20_000);
     let mut rx = state.current_control_events.subscribe();
     let state_for_wait = Arc::clone(&state);
-    let requested_session_id = query.session_id.clone();
+    let grid_refresh_command_id_for_wait = grid_refresh_command_id.clone();
     let waited = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async move {
         loop {
             rx.changed()
@@ -4096,8 +4264,9 @@ async fn wait_current_live_control(
                 .map_err(|_| ApiError::internal("control command stream closed"))?;
             if let Some(command) = take_current_control_command_for_session(
                 &state_for_wait,
-                query.after_seq,
+                after_seq,
                 requested_session_id.as_deref(),
+                grid_refresh_command_id_for_wait.as_deref(),
             )
             .await?
             {
@@ -4118,6 +4287,7 @@ async fn take_current_control_command_for_session(
     state: &Arc<AppState>,
     after_seq: u64,
     requested_session_id: Option<&str>,
+    grid_refresh_command_id: Option<&str>,
 ) -> Result<Option<SessionCommand>, ApiError> {
     let _permit = state.development_admission.admit().await?;
     let _transition = state.current_live_session_transition.lock().await;
@@ -4127,7 +4297,7 @@ async fn take_current_control_command_for_session(
             return Ok(None);
         }
     }
-    take_next_current_control_command_after(state, after_seq).await
+    take_next_current_control_command_after(state, after_seq, grid_refresh_command_id).await
 }
 
 #[allow(dead_code)]

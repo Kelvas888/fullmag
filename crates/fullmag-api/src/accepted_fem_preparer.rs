@@ -73,6 +73,16 @@ pub(crate) fn prepare_accepted_fem_task(
         bail!("accepted FEM preparation lease belongs to another task attempt");
     }
 
+    if let Some(binding) = &preparation_lease.host_launch_binding {
+        let token = std::env::var("FULLMAG_HOST_PREPARATION_LAUNCH_TOKEN")
+            .context("host-bound FEM preparer requires its supervisor launch permit")?;
+        let ledger = fullmag_session::host_resource_ledger::HostResourceLedger::open(
+            &binding.ledger_root,
+            binding.policy.clone(),
+        )?;
+        ledger.validate_preparation_launch(store, &preparation_lease, &token)?;
+    }
+
     let step = accepted
         .lowered
         .steps

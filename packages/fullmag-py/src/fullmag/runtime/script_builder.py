@@ -72,6 +72,7 @@ from fullmag.model.geometry import (
 )
 from fullmag.model.output_storage import OutputStorage
 from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer
+from fullmag.model.compute_resources import ComputeResources
 from fullmag.model.outputs import (
     SaveDispersion,
     SaveField,
@@ -383,6 +384,12 @@ def export_builder_draft(loaded: LoadedProblem) -> dict[str, object]:
         draft["execution_profile"] = profile.to_ir()
         if layers:
             draft["execution_layers"] = [layer.to_ir() for layer in layers]
+    resources = _compute_resources_values(
+        _normalize_mapping(base_problem.runtime_metadata),
+        context="runtime_metadata",
+    )
+    if resources is not None:
+        draft["compute_resources"] = resources.to_ir()
     return draft
 
 
@@ -957,6 +964,7 @@ def _render_scene_document_bootstrap(
 ) -> str:
     """Build a minimal capture script that realizes the scene's typed objects."""
     profile, layers = _execution_profile_values(builder, context="builder")
+    resources = _compute_resources_values(builder, context="builder")
     backend = str(builder.get("backend") or builder.get("requested_backend") or "auto")
     mode = str(builder.get("requested_mode") or "strict")
     device = str(builder.get("requested_device") or "auto")
@@ -986,6 +994,8 @@ def _render_scene_document_bootstrap(
         cpu_threads = _positive_int(builder.get("cpu_threads"))
         if cpu_threads is not None:
             lines.append(f"study.threads({cpu_threads})")
+    if resources is not None:
+        lines.append(_render_compute_resources_call(resources))
     lines.extend(_render_output_storage(builder.get("output_storage"), surface="study"))
 
     solver = builder.get("solver")
@@ -2202,6 +2212,19 @@ def _execution_profile_values(
     return profile, [ExecutionRequestLayer.from_ir(layer) for layer in raw_layers]
 
 
+def _compute_resources_values(
+    source: Mapping[str, object],
+    *,
+    context: str,
+) -> ComputeResources | None:
+    if "compute_resources" not in source:
+        return None
+    value = source["compute_resources"]
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{context}.compute_resources must be an object")
+    return ComputeResources.from_ir(value)
+
+
 def _render_execution_profile_call(
     profile: ExecutionProfile,
     layers: Sequence[ExecutionRequestLayer],
@@ -2214,6 +2237,11 @@ def _render_execution_profile_call(
         for layer in layers
     )
     return f"study.execution_profile({profile_expr}, layers=[{layer_exprs}])"
+
+
+def _render_compute_resources_call(resources: ComputeResources) -> str:
+    resources_expr = f"fm.ComputeResources.from_ir({_python_literal(resources.to_ir())})"
+    return f"study.resources({resources_expr})"
 
 
 def _is_vector3(value: object) -> bool:
@@ -2875,6 +2903,14 @@ def _render_runtime(
             lines.append(f"{_surface_call(surface, 'device')}({_py_repr(device_spec)})")
         if cpu_threads is not None:
             lines.append(f"{_surface_call(surface, 'threads')}({cpu_threads})")
+
+    resources = _compute_resources_values(runtime_metadata, context="runtime_metadata")
+    if resources is not None:
+        if surface != "study":
+            raise ValueError("compute_resources requires the canonical study API surface")
+        lines.extend(
+            ["# Compute resources", _render_compute_resources_call(resources)]
+        )
 
     # PBC is part of the canonical physical problem, not an implicit backend
     # mesh option. Keep the authored axes and demag realization explicit in the
@@ -9298,6 +9334,8 @@ def _script_api_surface(
     surface = runtime_metadata.get("script_api_surface")
     overrides = overrides or {}
     if "execution_profile" in runtime_metadata:
+        return "study"
+    if "compute_resources" in runtime_metadata:
         return "study"
     if runtime_metadata.get("output_storage") is not None or overrides.get("output_storage") is not None:
         return "study"

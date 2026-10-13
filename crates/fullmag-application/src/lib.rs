@@ -7,6 +7,7 @@
 //! Close semantics.
 
 mod application;
+mod batch_expansion;
 mod coordinator;
 mod declared_execution;
 mod execution;
@@ -27,6 +28,14 @@ pub use application::{
     ActiveExecution, ActiveExecutionPolicy, ApplicationError, CloseRequest, CloseResult,
     CreateProjectRequest, DirtyClosePolicy, DocumentMode, DocumentView, OpenProjectResult,
     ProjectApplication, SaveAsProjectRequest, SaveProjectRequest, SaveReceipt,
+};
+pub use batch_expansion::{
+    bind_batch_case_output_storage, expand_independent_batch, materialize_independent_batch_case,
+    BatchAxis, BatchAxisJoin, BatchAxisTarget, BatchAxisValues, BatchAxisValueKind, BatchCase,
+    BatchExecutionStrategy, BatchExpansionError, BatchExpansionManifest, BatchExpansionRequest,
+    BatchFailurePolicy,
+    BatchRangeEndpoint, MaterializedBatchCase, validate_independent_batch_cases,
+    BATCH_EXPANSION_MANIFEST_SCHEMA, BATCH_EXPANSION_MAX_CASES,
 };
 pub use coordinator::{
     CoordinatorCheckpoint, CoordinatorDisposition, CoordinatorError, CoordinatorMessage,

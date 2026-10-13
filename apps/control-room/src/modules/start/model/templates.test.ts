@@ -21,6 +21,10 @@ const gpuHost = (vramGb: number): ComputeEnvironment => ({
   cpuThreads: 32,
   preferredBackend: "cuda",
   warnings: [],
+  runtimeLanes: [
+    { backend: "FDM", device: "GPU", availability: "available", precisions: ["double"] },
+    { backend: "FDM", device: "CPU", availability: "available", precisions: ["double"] },
+  ],
 });
 
 const cpuHost = (threads: number): ComputeEnvironment => ({
@@ -28,6 +32,9 @@ const cpuHost = (threads: number): ComputeEnvironment => ({
   cpuThreads: threads,
   preferredBackend: "cpu",
   warnings: [],
+  runtimeLanes: [
+    { backend: "FDM", device: "CPU", availability: "available", precisions: ["double"] },
+  ],
 });
 
 describe("STUDY_TEMPLATES", () => {
@@ -56,10 +63,23 @@ describe("estimateFor", () => {
     expect(label).toMatchObject({ basis: "gpu", text: "~25 min · 6 GB VRAM" });
   });
 
+  it("does not infer a usable GPU route from hardware detection alone", () => {
+    const detectedOnly = { ...gpuHost(24), runtimeLanes: undefined };
+    const label = estimateFor(template("spin-wave-dispersion"), detectedOnly);
+    expect(label.basis).toBe("reference");
+    expect(label.note).toContain("FDM GPU runtime lane");
+  });
+
+  it("does not borrow another solver's available GPU lane", () => {
+    const label = estimateFor(template("magnonic-crystal-bands"), gpuHost(24));
+    expect(label.basis).toBe("reference");
+    expect(label.note).toContain("FEM GPU runtime lane");
+  });
+
   it("switches to CPU figures on a machine without a GPU", () => {
     const label = estimateFor(template("spin-wave-dispersion"), cpuHost(32));
     expect(label).toMatchObject({ basis: "cpu", text: "~7 h · CPU ×32" });
-    expect(label.note).toContain("No GPU");
+    expect(label.note).toContain("available FDM CPU lane");
   });
 
   it("scales the CPU figure to the thread count", () => {
@@ -70,6 +90,19 @@ describe("estimateFor", () => {
     const label = estimateFor(template("skyrmion-phase-diagram"), gpuHost(4));
     expect(label.basis).toBe("cpu");
     expect(label.note).toContain("less than");
+  });
+
+  it("uses a reference estimate when neither matching solver lane is available", () => {
+    const host = {
+      ...gpuHost(24),
+      runtimeLanes: [
+        { backend: "FDM" as const, device: "GPU" as const, availability: "unavailable" as const, precisions: [], reason: "runtime missing" },
+        { backend: "FDM" as const, device: "CPU" as const, availability: "unknown" as const, precisions: [] },
+      ],
+    };
+    const label = estimateFor(template("spin-wave-dispersion"), host);
+    expect(label.basis).toBe("reference");
+    expect(label.note).toContain("runtime missing");
   });
 
   it("uses the labelled reference figure when the machine was not probed", () => {

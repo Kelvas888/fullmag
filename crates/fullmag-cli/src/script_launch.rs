@@ -120,8 +120,8 @@ pub(crate) fn verify_script_bytes(
     path: &Path,
     expected: Option<&str>,
 ) -> Result<std::result::Result<ScriptFacts, ScriptFacts>> {
-    let raw = std::fs::read(path)
-        .with_context(|| format!("cannot read script {}", path.display()))?;
+    let raw =
+        std::fs::read(path).with_context(|| format!("cannot read script {}", path.display()))?;
     let facts = ScriptFacts {
         sha256: sha256_hex(&raw),
         bytes: raw.len(),
@@ -241,7 +241,9 @@ pub(crate) fn display_path(path: &Path) -> String {
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
     } else {
-        text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text)
+        text.strip_prefix(r"\\?\")
+            .map(str::to_string)
+            .unwrap_or(text)
     }
 }
 
@@ -428,7 +430,10 @@ fn progress_document(report: &Report) -> Value {
 /// Write `value` to `path` through a temporary sibling, so a reader never sees
 /// a partial document.
 pub(crate) fn write_json_atomically(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
@@ -475,7 +480,11 @@ fn finalize(outcome: &Outcome) {
             eprintln!("[fullmag] could not write the run receipt: {error:#}");
         }
     }
-    crate::run_manifest::finish(outcome.status, outcome.exit_code(), outcome.error.as_deref());
+    crate::run_manifest::finish(
+        outcome.status,
+        outcome.exit_code(),
+        outcome.error.as_deref(),
+    );
 }
 
 fn stage_now() -> Stage {
@@ -571,7 +580,11 @@ fn finish_plain_manifest(result: &Result<()>) {
         runtime.as_ref(),
         None,
     );
-    crate::run_manifest::finish(outcome.status, outcome.exit_code(), outcome.error.as_deref());
+    crate::run_manifest::finish(
+        outcome.status,
+        outcome.exit_code(),
+        outcome.error.as_deref(),
+    );
 }
 
 fn run_managed(cli: &ScriptCli, raw_args: Vec<OsString>) -> (Result<()>, i32) {
@@ -689,7 +702,10 @@ fn begin_managed_manifest(cli: &ScriptCli) {
 fn prelude(cli: &ScriptCli) -> std::result::Result<(), (ExitKind, anyhow::Error)> {
     if let Some(python) = &cli.python {
         if !python.is_absolute() {
-            return Err((ExitKind::Usage, anyhow!("--python must be an absolute path")));
+            return Err((
+                ExitKind::Usage,
+                anyhow!("--python must be an absolute path"),
+            ));
         }
         std::env::set_var(PYTHON_ENV, python);
     }
@@ -896,9 +912,18 @@ mod tests {
             classify_outcome(None, None, Stage::Running, Some(&unresolved), None).exit_code(),
             14
         );
-        assert_eq!(classify_outcome(None, None, Stage::Running, Some(&gpu_ok), None).exit_code(), 0);
+        assert_eq!(
+            classify_outcome(None, None, Stage::Running, Some(&gpu_ok), None).exit_code(),
+            0
+        );
 
-        let early = classify_outcome(Some("python helper failed"), None, Stage::Materializing, None, None);
+        let early = classify_outcome(
+            Some("python helper failed"),
+            None,
+            Stage::Materializing,
+            None,
+            None,
+        );
         assert_eq!((early.status, early.exit_code()), ("failed", 13));
         let late = classify_outcome(Some("solver diverged"), None, Stage::Running, None, None);
         assert_eq!(late.exit_code(), 1);
@@ -912,7 +937,9 @@ mod tests {
         assert_eq!(gpu_error.exit_code(), 14);
         // The launcher forced a GPU (environment) and the CUDA backend is missing.
         let forced_by_launcher = classify_outcome(
-            Some("RunError: FDM CUDA execution was requested, but the CUDA backend is not available"),
+            Some(
+                "RunError: FDM CUDA execution was requested, but the CUDA backend is not available",
+            ),
             None,
             Stage::Materializing,
             None,
@@ -920,9 +947,16 @@ mod tests {
         );
         assert_eq!(forced_by_launcher.exit_code(), 14);
         // A GPU the launcher forced that resolved to CPU is a failed run, never a CPU success.
-        let launcher_gpu_on_cpu = classify_outcome(None, None, Stage::Running, Some(&cpu), Some("gpu"));
+        let launcher_gpu_on_cpu =
+            classify_outcome(None, None, Stage::Running, Some(&cpu), Some("gpu"));
         assert_eq!(launcher_gpu_on_cpu.exit_code(), 14);
-        let syntax = classify_outcome(Some("boom"), Some(ExitKind::Syntax), Stage::Starting, None, None);
+        let syntax = classify_outcome(
+            Some("boom"),
+            Some(ExitKind::Syntax),
+            Stage::Starting,
+            None,
+            None,
+        );
         assert_eq!((syntax.status, syntax.exit_code()), ("not_started", 12));
         let stopped = classify_outcome(None, Some(ExitKind::Stopped), Stage::Running, None, None);
         assert_eq!((stopped.status, stopped.exit_code()), ("cancelled", 130));
@@ -989,6 +1023,9 @@ mod tests {
     #[test]
     fn verbatim_prefixes_are_dropped_from_displayed_paths() {
         assert_eq!(display_path(Path::new(r"\\?\C:\a\b.py")), r"C:\a\b.py");
-        assert_eq!(display_path(Path::new(r"\\?\UNC\srv\share\b.py")), r"\\srv\share\b.py");
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\srv\share\b.py")),
+            r"\\srv\share\b.py"
+        );
     }
 }

@@ -48,8 +48,16 @@ pojawia się wyłącznie, kiedy host rzeczywiście ją zgłosił.
 
 Trwający pierwszy odczyt, brak odpowiedzi, nieudane odświeżenie, brak GPU
 i niedostępna telemetria GPU mają odrębne komunikaty. Po błędzie odświeżenia
-ostatnie odebrane wartości pozostają widoczne z oznaczeniem ich stanu.
+ostatnie odebrane wartości pozostają widoczne z oznaczeniem ich stanu. Próbka
+starsza niż 30 sekund jest oznaczana jako `stale`; przyszły lub niepoprawny
+czas próbki nie jest uznawany za bieżący.
 Odpowiedź `unavailable` nie staje się pomiarem 0% lub 0 GB.
+
+Przed pierwszym udanym odczytem nagłówek ma stan `Not probed`; w czasie
+oczekiwania opisuje trwający odczyt, a brak hosta lub błąd pozostaje odrębnym
+stanem. Starszy `compute_probe` jest dostarczany przez host desktopowy.
+Start screen pokazuje wykryty sprzęt i zgłoszone lanes, ale nie przypisuje
+konkretnego urządzenia do solvera. Device jest rozstrzygany przy starcie runu.
 
 Backend Windows może zgłosić liczbę logicznych CPU przy niedostępnej
 telemetrii obciążenia i RAM. Takie pola pozostają jawnie niedostępne.

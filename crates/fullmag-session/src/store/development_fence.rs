@@ -388,6 +388,7 @@ mod tests {
             heartbeat_at: now,
             heartbeat_sequence: 0,
             released_at: None,
+            host_launch_binding: None,
         };
         let path = create_parent(
             store.root(),

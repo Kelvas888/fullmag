@@ -25693,6 +25693,287 @@
         ],
         "type": "object"
       },
+      "ProjectBatchAxisSummaryResource": {
+        "properties": {
+          "canonical_unit": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "canonical_unit"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchCaseState": {
+        "enum": [
+          "pending_expansion",
+          "pending_materialization"
+        ],
+        "type": "string"
+      },
+      "ProjectBatchCaseSummaryResource": {
+        "properties": {
+          "case_id": {
+            "type": "string"
+          },
+          "parameter_tuple": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "planned_run_id": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ProjectBatchCaseState"
+          }
+        },
+        "required": [
+          "case_id",
+          "planned_run_id",
+          "parameter_tuple",
+          "state"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchCasesQuery": {
+        "properties": {
+          "cursor": {
+            "description": "Last CaseId returned on the previous page.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "Page size, from 1 to 100; defaults to 50.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ProjectBatchCasesResource": {
+        "properties": {
+          "axes": {
+            "description": "Axis names and canonical units for the parameter tuples in this manifest.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectBatchAxisSummaryResource"
+            },
+            "type": "array"
+          },
+          "batch_id": {
+            "type": "string"
+          },
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectBatchCaseSummaryResource"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "batch_id",
+          "axes",
+          "cases"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchExpansionState": {
+        "enum": [
+          "pending",
+          "expanding",
+          "complete"
+        ],
+        "type": "string"
+      },
+      "ProjectBatchListQuery": {
+        "properties": {
+          "cursor": {
+            "description": "Last BatchId returned on the previous page.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "Page size, from 1 to 100; defaults to 50.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ProjectBatchListResource": {
+        "properties": {
+          "batches": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectBatchSummaryResource"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "batches"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchSubmitRequest": {
+        "additionalProperties": false,
+        "description": "Immutable independent batch submission. The server deserializes\n`batch_request` into the versioned application contract before accepting it.",
+        "properties": {
+          "archive_base64": {
+            "description": "Exact base64-encoded portable project archive accepted for this batch.",
+            "type": "string"
+          },
+          "asset_paths": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Explicit immutable asset ID to path inside `project/assets/`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "batch_request": {
+            "additionalProperties": {},
+            "description": "Versioned `BatchExpansionRequest` object, including template and axes.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "idempotency_key": {
+            "description": "Client intent key used to recover an ACK after a timeout.",
+            "type": "string"
+          },
+          "study_plan": {
+            "additionalProperties": {},
+            "description": "Versioned immutable StudyPlan used by the batch template.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "study_problem_catalog": {
+            "additionalProperties": {},
+            "description": "Immutable StudyProblemCatalog pinned by the batch template.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "archive_base64",
+          "idempotency_key",
+          "batch_request",
+          "study_plan",
+          "study_problem_catalog",
+          "asset_paths"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchSubmitResource": {
+        "properties": {
+          "batch_id": {
+            "type": "string"
+          },
+          "case_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "disposition": {
+            "$ref": "#/components/schemas/ProjectRunSubmitDisposition"
+          },
+          "manifest_sha256": {
+            "description": "Logical digest stored in the expansion manifest.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "disposition",
+          "batch_id",
+          "manifest_sha256",
+          "case_count"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchSummaryResource": {
+        "properties": {
+          "accepted_at": {
+            "type": "string"
+          },
+          "batch_id": {
+            "type": "string"
+          },
+          "case_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expansion_state": {
+            "$ref": "#/components/schemas/ProjectBatchExpansionState"
+          },
+          "manifest_sha256": {
+            "type": "string"
+          },
+          "max_parallel_cases": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "published_case_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "batch_id",
+          "accepted_at",
+          "manifest_sha256",
+          "case_count",
+          "published_case_count",
+          "expansion_state"
+        ],
+        "type": "object"
+      },
       "ProjectCreateRequest": {
         "properties": {
           "name": {
@@ -26493,31 +26774,26 @@
         ],
         "type": "string"
       },
-      "ProjectRunTaskCancellationRequest": {
-        "additionalProperties": false,
+      "ProjectRunTaskCancellationIntentResource": {
         "properties": {
-          "reason": {
-            "description": "Stable operator-visible reason persisted in the fenced Stop command.",
+          "cancellation_id": {
             "type": "string"
-          }
-        },
-        "required": [
-          "reason"
-        ],
-        "type": "object"
-      },
-      "ProjectRunTaskCancellationResource": {
-        "properties": {
+          },
+          "cancellation_state": {
+            "$ref": "#/components/schemas/ProjectRunTaskCancellationState"
+          },
           "catalog_revision": {
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
-          "command_id": {
-            "type": "string"
-          },
           "disposition": {
             "$ref": "#/components/schemas/ProjectRunTaskCancellationDisposition"
+          },
+          "expected_catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
           },
           "lifecycle": {
             "$ref": "#/components/schemas/ProjectRunTaskLifecycle"
@@ -26533,9 +26809,80 @@
           "disposition",
           "run_id",
           "task_id",
-          "command_id",
+          "cancellation_id",
+          "cancellation_state",
           "lifecycle",
-          "catalog_revision"
+          "catalog_revision",
+          "expected_catalog_revision"
+        ],
+        "type": "object"
+      },
+      "ProjectRunTaskCancellationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "cancellation_id": {
+            "description": "Supply together with expected_catalog_revision for pre-claim cancellation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Stable operator-visible reason persisted in the request or Stop command.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "ProjectRunTaskCancellationResource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ProjectRunTaskStopResource"
+          },
+          {
+            "$ref": "#/components/schemas/ProjectRunTaskCancellationIntentResource"
+          }
+        ]
+      },
+      "ProjectRunTaskCancellationState": {
+        "enum": [
+          "requested"
+        ],
+        "type": "string"
+      },
+      "ProjectRunTaskCancellationSummary": {
+        "properties": {
+          "cancellation_id": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "expected_catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cancellation_id",
+          "reason",
+          "expected_catalog_revision",
+          "created_at"
         ],
         "type": "object"
       },
@@ -26613,6 +26960,16 @@
               "null"
             ]
           },
+          "cancellation_intent": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectRunTaskCancellationSummary"
+              }
+            ]
+          },
           "input_fingerprint": {
             "type": "string"
           },
@@ -26662,6 +27019,39 @@
           "lifecycle",
           "readiness",
           "artifact_ids"
+        ],
+        "type": "object"
+      },
+      "ProjectRunTaskStopResource": {
+        "properties": {
+          "catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "command_id": {
+            "type": "string"
+          },
+          "disposition": {
+            "$ref": "#/components/schemas/ProjectRunTaskCancellationDisposition"
+          },
+          "lifecycle": {
+            "$ref": "#/components/schemas/ProjectRunTaskLifecycle"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "disposition",
+          "run_id",
+          "task_id",
+          "command_id",
+          "lifecycle",
+          "catalog_revision"
         ],
         "type": "object"
       },
@@ -42238,6 +42628,196 @@
         ]
       }
     },
+    "/v2/persistence/projects/{project_id}/batches": {
+      "get": {
+        "operationId": "persistence_get_persistence_projects_project_id_batches",
+        "parameters": [
+          {
+            "description": "Pinned project identity",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, from 1 to 100; defaults to 50.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Last BatchId returned on the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectBatchListResource"
+                }
+              }
+            },
+            "description": "Page of durable batch parents for one project"
+          },
+          "400": {
+            "description": "Invalid page size or cursor"
+          }
+        },
+        "tags": [
+          "persistence"
+        ]
+      },
+      "post": {
+        "operationId": "persistence_post_persistence_projects_project_id_batches",
+        "parameters": [
+          {
+            "description": "Pinned project identity",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectBatchSubmitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectBatchSubmitResource"
+                }
+              }
+            },
+            "description": "Identical batch submit replayed"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectBatchSubmitResource"
+                }
+              }
+            },
+            "description": "Durable immutable batch parent accepted"
+          },
+          "400": {
+            "description": "Invalid immutable batch inputs"
+          },
+          "409": {
+            "description": "Project identity, batch identity or idempotency conflict"
+          }
+        },
+        "tags": [
+          "persistence"
+        ]
+      }
+    },
+    "/v2/persistence/projects/{project_id}/batches/{batch_id}/cases": {
+      "get": {
+        "operationId": "persistence_get_persistence_projects_project_id_batches_batch_id_cases",
+        "parameters": [
+          {
+            "description": "Pinned project identity",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Durable batch identity",
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, from 1 to 100; defaults to 50.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Last CaseId returned on the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectBatchCasesResource"
+                }
+              }
+            },
+            "description": "Page of planned cases from the immutable expansion manifest"
+          },
+          "400": {
+            "description": "Invalid page size or cursor"
+          },
+          "404": {
+            "description": "Accepted batch is missing"
+          },
+          "409": {
+            "description": "Batch belongs to another project"
+          }
+        },
+        "tags": [
+          "persistence"
+        ]
+      }
+    },
     "/v2/persistence/projects/{project_id}/runs": {
       "get": {
         "operationId": "persistence_get_persistence_projects_project_id_runs",
@@ -43477,7 +44057,7 @@
                 }
               }
             },
-            "description": "Identical Stop command replayed"
+            "description": "Identical cancellation request replayed"
           },
           "202": {
             "content": {
@@ -43487,7 +44067,7 @@
                 }
               }
             },
-            "description": "Durable Stop command accepted"
+            "description": "Durable Stop command or pre-claim cancellation request accepted"
           },
           "400": {
             "description": "Invalid task identity or cancellation reason"
@@ -43496,7 +44076,7 @@
             "description": "Accepted run intent is missing"
           },
           "409": {
-            "description": "Task is not preparing/running or a conflicting cancellation exists"
+            "description": "Task state, catalog revision or cancellation identity conflicts"
           }
         },
         "tags": [

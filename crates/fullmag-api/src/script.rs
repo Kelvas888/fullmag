@@ -370,7 +370,7 @@ pub(crate) fn rewrite_script_via_python_helper(
         None
     };
 
-    let output = run_python_helper(repo_root, &helper_args);
+    let output = run_python_helper_bounded(repo_root, workspace_root, &helper_args);
     if let Some(path) = overrides_path {
         let _ = std::fs::remove_file(path);
     }
@@ -402,7 +402,7 @@ pub(crate) fn render_scene_document_via_python_helper(
         workspace_root,
         output_path,
         scene_document,
-        PythonHelperOutputPolicy::Capture,
+        PythonHelperOutputPolicy::Bounded { workspace_root },
         false,
     )
 }

@@ -1160,6 +1160,15 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
                 .post(handlers::persistence::projects::submit_run),
         )
         .route(
+            "/v2/persistence/projects/:project_id/batches",
+            get(handlers::persistence::projects::list_batches)
+                .post(handlers::persistence::projects::submit_batch),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/batches/:batch_id/cases",
+            get(handlers::persistence::projects::list_batch_cases),
+        )
+        .route(
             "/v2/persistence/projects/:project_id/runs/:run_id",
             get(handlers::persistence::projects::get_run),
         )

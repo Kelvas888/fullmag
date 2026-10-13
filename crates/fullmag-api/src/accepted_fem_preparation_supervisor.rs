@@ -54,6 +54,32 @@ pub(crate) fn run_supervised_accepted_fem_preparation(
     process_timeout: Duration,
     heartbeat_interval: Duration,
 ) -> Result<SupervisedPreparationResult> {
+    run_supervised_accepted_fem_preparation_with_host(
+        store,
+        run_id,
+        task_id,
+        resource_id,
+        preparation_attempt_id,
+        lease_token,
+        preparer_executable,
+        process_timeout,
+        heartbeat_interval,
+        None,
+    )
+}
+
+pub(crate) fn run_supervised_accepted_fem_preparation_with_host(
+    store: &SessionStore,
+    run_id: &str,
+    task_id: &str,
+    resource_id: &str,
+    preparation_attempt_id: &str,
+    lease_token: &str,
+    preparer_executable: &Path,
+    process_timeout: Duration,
+    heartbeat_interval: Duration,
+    host: Option<&fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
+) -> Result<SupervisedPreparationResult> {
     if process_timeout.is_zero() {
         bail!("preparation process timeout must be greater than zero");
     }
@@ -70,6 +96,9 @@ pub(crate) fn run_supervised_accepted_fem_preparation(
         bail!("preparation supervisor lease identity does not match its task attempt");
     }
 
+    if host.is_none() && active_lease.host_launch_binding.is_some() {
+        bail!("host-bound preparation lease requires its pinned host supervisor context");
+    }
     let matching_exits =
         retry_store_writer_busy(|| store.list_preparation_process_exit_receipts(run_id))?
             .into_iter()
@@ -79,8 +108,7 @@ pub(crate) fn run_supervised_accepted_fem_preparation(
         bail!("preparation attempt has multiple durable process exit receipts");
     }
     if let Some(receipt) = matching_exits.into_iter().next() {
-        let finalization =
-            retry_store_writer_busy(|| store.finalize_preparation_process_exit(&receipt))?;
+        let finalization = finalize_preparation_exit(store, &receipt, host)?;
         return Ok(SupervisedPreparationResult {
             recovered: true,
             timed_out: receipt.timed_out,
@@ -95,43 +123,82 @@ pub(crate) fn run_supervised_accepted_fem_preparation(
         bail!("preparation supervisor found a released lease without a durable process exit");
     }
 
-    let matching_launches =
+    let related_launches =
         retry_store_writer_busy(|| store.list_preparation_process_launches(run_id))?
             .into_iter()
-            .filter(|launch| launch_matches_lease(launch, &active_lease))
+            .filter(|launch| {
+                launch.task_id == task_id && launch.preparation_attempt_id == preparation_attempt_id
+            })
             .collect::<Vec<_>>();
-    if !matching_launches.is_empty() {
-        bail!(
-            "preparation launch exists without a process exit; spawn outcome is ambiguous and the lease remains retained"
-        );
+    if related_launches.len() > 1
+        || related_launches
+            .first()
+            .is_some_and(|launch| !launch_matches_lease(launch, &active_lease))
+    {
+        bail!("preparation attempt has multiple or mismatched durable launch intents");
+    }
+    if host.is_none() && !related_launches.is_empty() {
+        bail!("legacy preparation launch has no process exit; spawn outcome is ambiguous and lease remains retained");
+    }
+    if let Some(host) = host {
+        host.ensure_preparation_lease_committed(store, &active_lease)?;
+        if !host
+            .ledger()
+            .preparation_lease_has_pending_launch(store, &active_lease)?
+        {
+            bail!("host preparation launch gate is not Pending; explicit migration or recovery is required before publishing a launch record");
+        }
     }
     validate_preparer_executable(preparer_executable)?;
 
     let supervisor_process_id = std::process::id();
-    let launch = FmsPreparationProcessLaunch {
-        schema_version: FMS_PREPARATION_PROCESS_LAUNCH_SCHEMA.into(),
-        launch_id: format!("prep-launch-{}", uuid::Uuid::new_v4()),
-        run_id: run_id.into(),
-        task_id: task_id.into(),
-        preparation_attempt_id: preparation_attempt_id.into(),
-        resource_id: resource_id.into(),
-        lease_token: lease_token.into(),
-        lease_heartbeat_sequence: active_lease.heartbeat_sequence,
-        supervisor_process_id,
-        supervisor_start_token: process_start_token(supervisor_process_id)?,
-        created_at: chrono::Utc::now(),
+    let spawn_supervisor_start_token = process_start_token(supervisor_process_id)?;
+    let recovered_launch = !related_launches.is_empty();
+    let launch = if let Some(existing) = related_launches.into_iter().next() {
+        existing.validate_for_lease(&active_lease)?;
+        existing
+    } else {
+        FmsPreparationProcessLaunch {
+            schema_version: FMS_PREPARATION_PROCESS_LAUNCH_SCHEMA.into(),
+            launch_id: format!("prep-launch-{}", uuid::Uuid::new_v4()),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            preparation_attempt_id: preparation_attempt_id.into(),
+            resource_id: resource_id.into(),
+            lease_token: lease_token.into(),
+            lease_heartbeat_sequence: active_lease.heartbeat_sequence,
+            supervisor_process_id,
+            supervisor_start_token: spawn_supervisor_start_token.clone(),
+            created_at: chrono::Utc::now(),
+        }
     };
     let launch_disposition =
         retry_store_writer_busy(|| store.commit_preparation_process_launch(&launch))?;
-    if launch_disposition != PreparationProcessLaunchCommitDisposition::Accepted {
-        bail!("replayed preparation launch does not authorize another process spawn");
+    if host.is_none() && launch_disposition != PreparationProcessLaunchCommitDisposition::Accepted {
+        bail!("replayed legacy preparation launch does not authorize another process spawn");
     }
-
+    if store
+        .read_task_cancellation_intent(run_id, task_id)?
+        .is_some()
+    {
+        bail!("pending cancellation requires reconciliation before preparation spawn");
+    }
+    let host_launch_token = host
+        .map(|host| {
+            host.ledger().authorize_preparation_launch(
+                store,
+                &active_lease,
+                &launch,
+                spawn_supervisor_start_token.clone(),
+            )
+        })
+        .transpose()?;
     let spawn_lease = active_lease.clone();
     let observed = observe_preparer(
         preparer_executable,
         store.root(),
         &spawn_lease,
+        host_launch_token.as_deref(),
         process_timeout,
         heartbeat_interval,
         || renew_preparation_lease(store, &mut active_lease),
@@ -169,16 +236,33 @@ pub(crate) fn run_supervised_accepted_fem_preparation(
         observed_at: chrono::Utc::now(),
     };
     retry_store_writer_busy(|| store.commit_preparation_process_exit_receipt(&receipt))?;
-    let finalization =
-        retry_store_writer_busy(|| store.finalize_preparation_process_exit(&receipt))?;
+    let finalization = finalize_preparation_exit(store, &receipt, host)?;
     Ok(SupervisedPreparationResult {
-        recovered: false,
+        recovered: recovered_launch,
         timed_out: receipt.timed_out,
         status_success: receipt.status_success,
         exit_code: receipt.exit_code,
         finalization,
         stdout: observed.stdout,
         stderr: observed.stderr,
+    })
+}
+
+fn finalize_preparation_exit(
+    store: &SessionStore,
+    receipt: &FmsPreparationProcessExitReceipt,
+    host: Option<&fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
+) -> Result<PreparationProcessFinalizationDisposition> {
+    retry_store_writer_busy(|| match host {
+        Some(host) => host
+            .ledger()
+            .release_preparation_after_exit_with_finalization(
+                store,
+                &receipt.run_id,
+                &receipt.receipt_id,
+            )
+            .map(|(_, disposition)| disposition),
+        None => store.finalize_preparation_process_exit(receipt),
     })
 }
 
@@ -223,6 +307,7 @@ fn observe_preparer<H>(
     executable: &Path,
     store_root: &Path,
     lease: &FmsPreparationResourceLease,
+    host_launch_token: Option<&str>,
     timeout: Duration,
     heartbeat_interval: Duration,
     mut heartbeat: H,
@@ -247,6 +332,11 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(token) = host_launch_token {
+        command.env("FULLMAG_HOST_PREPARATION_LAUNCH_TOKEN", token);
+    } else {
+        command.env_remove("FULLMAG_HOST_PREPARATION_LAUNCH_TOKEN");
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
