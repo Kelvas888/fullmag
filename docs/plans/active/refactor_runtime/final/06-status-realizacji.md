@@ -1,5 +1,21 @@
 # Status realizacji całego planu refaktoryzacji
 
+Checkpoint 14.10.2026 — [P8-53BM](p8/53bm-camera-preservation.md):
+pakiet 94fc ukończony; poprawiono wyścig publikacji lease fixture przez
+istniejącą blokadę natywnego writera. Pełna bramka API po poprawce PASS:
+301 kontroli, exit 0, 98/98 procesów odebranych, receipt
+`ee9dc8ae88c840b09716322aba936a9c`. Regresje interpretowane: 186 PASS.
+Kanoniczny eksport OpenAPI i bramka dokumentu: 33 PASS, 6/6 procesów;
+po synchronizacji kontraktu production typecheck PASS. Poprzednia próba
+browser 57e2 nie dotarła do UI z powodu nieaktualnych wygenerowanych typów.
+Nowy build z aktualnym frontendem jest w toku. Poprawka
+`e9b32c3bf8c486e88cde3c4472f3c19a531f9fed` jest na branchu
+`codex/camera-handoff-checkpoint-20261014` w
+[PR #160](https://github.com/MateuszZelent/fullmag/pull/160), jeszcze bez
+integracji na remote master. **P8-53BM/P8-53 pozostają IN PROGRESS**:
+brak nowego dowodu kamery po restarcie, CI merge tree wymaga napraw.
+Procentów całego planu nie zwiększono na podstawie samych bramek API.
+
 Checkpoint 13.10.2026 — [P8-53BM: zachowanie kamery](p8/53bm-camera-preservation.md):
 natywny pakiet API/CLI/desktop completed exit 0; regresja API 301 kontroli
 PASS, jawne set/absent/null skali i kanoniczny OpenAPI potwierdzone.
