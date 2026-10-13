@@ -94,3 +94,69 @@ ani jego preflight nie zmieniono w tym przyroście.
 **20 tests PASS**, exit 0. Ta aktualna weryfikacja zastępuje wcześniejszy FAIL
 tego pliku; nie jest dowodem browser/runtime. Managed 160-test receipt powyżej
 pozostaje oddzielnym wynikiem i nie obejmuje tych 20 testów.
+
+Poprawka starszego testu i checkpoint zostały zapisane na remote master w
+`f758f84404713778e1c1f2c0762c83c689bd144a`; exact remote SHA potwierdzono
+przez `git ls-remote`. Runtime diagnostyki oraz rozszerzony verifier nadal
+pozostają WIP poza tym commitem.
+
+Dodatkowa regresja before-capture sprawdza faktyczny atomowy zapis receipt
+w prywatnym katalogu testu oraz brak zapisu i brak `before` po zmianie sceny.
+Najnowszy managed wynik: **161 tests PASS**, 0 skipped, exit 0, receipt
+`59a32ad19aba4d5cbd8119492174955a`, source SHA
+`714f0f64df9c574a0cb699e4c88b13dd219d6f18311e983b2aef1e9492321cd0`.
+Nie dodawano kolejnego procesu symulacji ani Rust unit builda.
+
+Po rewalidacji braku poprzedniego łańcucha procesów managed build uzyskał
+zasób i rozpoczął capture sources. Aktywna sesja narzędzia: `30784`; log
+`native-build-0bfa7a594b1d465592dbbcb8f22488db.log` w istniejącym profilu
+`windows-native-fdm-cpu-dev`. Nie uruchamiać duplikatu po samym timeout
+obserwacji. Wynik tej kompilacji pozostaje niepotwierdzony do terminalnego
+receipt; UI użytkownika na 3197 nie restartowano.
+
+Aktualna obserwacja tej samej sesji potwierdziła snapshot
+`561e1f9bde61d2fcda2a39bdf67ba1961ab0585f59292984e78e35d02f1a9411`.
+Pliki diagnostyki są byte-equal z bieżącym checkoutem:
+
+- `development_owner_control.rs`:
+  `d58245a90b05905ed1942daa7b6009ed63a2789a56821bd5e4410407b9102ab5`;
+- `verify_workspace_browser.py`:
+  `de890fbc7b6e29ad4225ded9fd4e6ff9593796f751ebe99b3caf4bd781b6d767`.
+
+Build przygotował zależności frontendu i pakiet Python. Przy ostatniej
+obserwacji działał własny `compiler_inputs.py materialize` (PID 11724,
+rodzic launcher PID 128584); brak Cargo w tym etapie nie oznacza terminalnego
+buildu. Nie uruchomiono duplikatu. Dopiero terminalny wynik sesji 30784
+i receipt pozwolą zaliczyć kompilację diagnostyki.
+
+## Kompilacja diagnostyki i review źródeł
+
+W tej samej managed sesji 30784 kompilacja CLI/API zakończyła się
+`Finished backend-dev` po 3m21s. Potwierdza to kompilowalność nowej diagnostyki
+w byte-equal frozen source, bez kompilacji unit tests. Cały build nadal
+buduje desktop i nie ma jeszcze potwierdzonego końcowego receipt.
+
+Niezależny bounded review nowego match acquisition, observation helper oraz
+before-capture: brak actionable findings. Sprawdzono uwierzytelnienie przed
+logiem, stałe komunikaty bez sekretów/dokumentu, zachowanie wire rejection,
+zachowanie odmownych stanów oraz odrzucenie drift i fail-closed odpowiedź.
+Review dotyczy źródeł; nie potwierdza runtime ani restartu.
+
+Końcowy wynik tego managed buildu: **PASS, exit 0**, `build-status.json`
+ma `state=completed`, zakończenie `2026-10-13T09:08:52.885835+00:00`.
+Desktop zakończył kompilację po 1m27s. `verified_build_identity` zakończył
+pełną walidację pakietu kodem 0:
+
+- manifest SHA:
+  `1b7dc8aa1c7f1b0362432662b0f736d0f674a70d0c1cc67701c629c21eb43dc3`;
+- backend source SHA:
+  `744872bb1acea4d9e0ec73534ad16b69df77f2e070b0f0699821eff72afb7e56`;
+- API EXE SHA:
+  `e64cd01a9ca4bcbbe43f4cc67043e8b19ff4794c721addb4e32721789075e177`;
+- CLI EXE SHA:
+  `465a49890fafeb19ea6dc186e05db4fb87c792ec48923977516a4befbdd7fb09`.
+
+Te wyniki zamykają kompilację i integralność pakietu diagnostyki. Nie
+zamykają acquisition, restore, Compute ani publicznego restartu. Następny
+krok: managed frozen project-document proof i archiwizacja tego pakietu
+przed próbą restartu.
