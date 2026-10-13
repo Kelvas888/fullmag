@@ -233,13 +233,20 @@ export function validateAnalysisResultFieldResponseMetadata(
   // legacy analysis endpoints derive it from the active domain and payload
   // path), so it must be present and internally consistent but need not be
   // byte-for-byte equal to the result-index revision.
+  const indexingMatches = Boolean(
+    metadata &&
+      (metadata.fieldIndexing === "full_domain" ||
+        (metadata.encoding === "FMVP;version=5" &&
+          metadata.fieldIndexing === "explicit_node_indices" &&
+          metadata.nodeIndexCount === metadata.pointCount)),
+  );
   return Boolean(
     metadata &&
       metadata.fieldRevision &&
       metadata.component === "full" &&
       (metadata.encoding === "FMVP;version=3" ||
         metadata.encoding === "FMVP;version=5") &&
-      metadata.fieldIndexing === "full_domain" &&
+      indexingMatches &&
       metadata.nComp === 6 &&
       metadata.pointCount !== null &&
       metadata.pointCount > 0 &&
@@ -276,9 +283,8 @@ export function validateAnalysisResultFieldOverlayBinary(
     !sameTopologyToken(field.meshTopologyRevision, meshRef.mesh_revision) ||
     !sameTopologyToken(topology.meshTopologyRevision, meshRef.mesh_revision) ||
     field.domainGenerationId !== topology.domainGenerationId ||
-    field.indexing !== "full_domain" ||
+    !hasValidAnalysisOverlayIndexing(field, topology) ||
     field.pointCount <= 0 ||
-    field.pointCount !== topology.pointCount ||
     gridPointCount(field.grid) !== field.pointCount ||
     field.valueCount !== field.pointCount * field.nComp ||
     field.values.length !== field.valueCount ||
@@ -291,6 +297,35 @@ export function validateAnalysisResultFieldOverlayBinary(
     complex,
     phasorAmplitudeMax: complexAmplitudeMax(complex),
   });
+}
+
+function hasValidAnalysisOverlayIndexing(
+  field: DecodedFieldVector,
+  topology: ModeFieldOverlayTopologyIdentity,
+): boolean {
+  if (field.indexing === "full_domain") {
+    return field.pointCount === topology.pointCount;
+  }
+  if (
+    field.formatVersion !== 5 ||
+    field.indexing !== "explicit_node_indices" ||
+    !Number.isSafeInteger(topology.pointCount) ||
+    topology.pointCount <= 0 ||
+    !field.nodeIndices ||
+    field.nodeIndices.length !== field.pointCount
+  ) {
+    return false;
+  }
+  for (const nodeIndex of field.nodeIndices) {
+    if (
+      !Number.isSafeInteger(nodeIndex) ||
+      nodeIndex < 0 ||
+      nodeIndex >= topology.pointCount
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function nonEmpty(value: unknown): value is string {

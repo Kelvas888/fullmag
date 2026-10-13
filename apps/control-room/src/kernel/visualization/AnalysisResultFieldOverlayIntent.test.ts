@@ -183,6 +183,26 @@ describe("AnalysisResultFieldOverlayIntent", () => {
     expect(
       validateAnalysisResultFieldResponseMetadata(intent, responseMetadata),
     ).toBe(true);
+    const explicitNodeMetadata = {
+      ...responseMetadata,
+      fieldIndexing: "explicit_node_indices",
+      nodeIndexCount: responseMetadata.pointCount,
+    };
+    expect(
+      validateAnalysisResultFieldResponseMetadata(intent, explicitNodeMetadata),
+    ).toBe(true);
+    expect(
+      validateAnalysisResultFieldResponseMetadata(intent, {
+        ...explicitNodeMetadata,
+        encoding: "FMVP;version=3",
+      }),
+    ).toBe(false);
+    expect(
+      validateAnalysisResultFieldResponseMetadata(intent, {
+        ...explicitNodeMetadata,
+        nodeIndexCount: 1,
+      }),
+    ).toBe(false);
     expect(
       validateAnalysisResultFieldResponseMetadata(intent, {
         ...responseMetadata,
@@ -219,6 +239,55 @@ describe("AnalysisResultFieldOverlayIntent", () => {
         metadata,
         { ...validBinary(), ...binaryPatch },
         { ...topology, ...topologyPatch },
+      ),
+    ).toBeNull();
+  });
+
+  it("accepts FMVP v5 explicit nodes only with a valid map to the matching mesh", () => {
+    const intent = createAnalysisResultFieldOverlayIntent(selection, fieldRef)!;
+    const metadata = resolveAnalysisResultFieldOverlayMetadata(intent)!;
+    const sharedTopology = { ...topology, pointCount: 5 };
+    const explicitField: DecodedFieldVector = {
+      ...validBinary(5),
+      grid: [2, 1, 1],
+      indexing: "explicit_node_indices",
+      nodeIndices: new Uint32Array([1, 3]),
+    };
+
+    const validated = validateAnalysisResultFieldOverlayBinary(
+      metadata,
+      explicitField,
+      sharedTopology,
+    );
+    expect(validated?.binary.nodeIndices).toEqual(new Uint32Array([1, 3]));
+    expect(validated?.complex.nodeIndices).toEqual(new Uint32Array([1, 3]));
+
+    expect(
+      validateAnalysisResultFieldOverlayBinary(
+        metadata,
+        { ...explicitField, formatVersion: 3 },
+        sharedTopology,
+      ),
+    ).toBeNull();
+    expect(
+      validateAnalysisResultFieldOverlayBinary(
+        metadata,
+        { ...explicitField, nodeIndices: new Uint32Array([1, 5]) },
+        sharedTopology,
+      ),
+    ).toBeNull();
+    expect(
+      validateAnalysisResultFieldOverlayBinary(
+        metadata,
+        { ...explicitField, nodeIndices: new Uint32Array([1]) },
+        sharedTopology,
+      ),
+    ).toBeNull();
+    expect(
+      validateAnalysisResultFieldOverlayBinary(
+        metadata,
+        explicitField,
+        { ...sharedTopology, meshTopologyHash: "sha256:other-topology" },
       ),
     ).toBeNull();
   });
