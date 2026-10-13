@@ -145,3 +145,11 @@ Bieżący etap nie zamyka całego R0/R1; audyt pozostaje w dokumentacji PR150.
 - Artefakt11811061377 viewport-3d-browser-audit pobrany do storage/evidence/frontend-authoring-session-safety-20261013/ci-e357; związany z e357 exactHEAD. Inspector actions fixture job115279518285 SUCCESS nie zastępuje gestu ani rzeczywistego API.
 - Hipoteza źródłowa: punkt0.5*140nm leżał wewnątrz box +/-100nm; PrimitiveObjectLayer pointer handler stopsPropagation. Punkt0.9*140nm na odsłoniętej osi, nadal native mouse z pointer capture; asercje zachowane. Review bez nowych findings. Na timeout dodano screenshot/JSON, ponownie rzucany błąd. Skuteczność korekty browser NOT VERIFIED.
 - PR04 parser sześć plików gotowe do source review; unitpicker i stan jednostki kontrolki nadal otwarte.
+
+
+## PR04 parser ilości — etap źródłowy
+
+- quantityInput zawiera jednostki D04§9, rawText/parsedSI/lastValidSI/statusy, decimal dot/comma/exponent, jawny wymiar, osobną zmianę jednostki. Nie używa eval; hex/wyrażenia/NaN/Infinity/overflow odrzucone.
+- Preview/payload geometry oraz kernel semantic no-op korzystają ze wspólnego parsera SI. Dodatniość domenowa pozostaje oddzielna; non-positive preview dimensions pozostają null.
+- Review P2 bare wrong suffix poprawiony i pokryty regresją. Root sprawdził fix oraz dodatniość. Architecture/API/diff źródłowe PASS, unit/typecheck/browser NOT VERIFIED.
+- Pozostałe integracje: viewport placement preview Number() do zastąpienia; wybrana jednostka kontrolki i per-field unit selector do podłączenia. Ten commit nie kończy PR04 ani R0/R1.

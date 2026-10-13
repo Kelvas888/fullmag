@@ -422,6 +422,15 @@ describe("resolveGeometryObjectPanelModel", () => {
     });
   });
 
+  it.each(["0 nm", "-1 nm"])("does not render non-positive parsed dimensions: %s", (invalidSize) => {
+    const draft = resolveGeometryObjectDraft(
+      { ...baseSelection, kind: "builder.primitive", nodeId: "geometry:draft:box", objectId: null, ref: null },
+      { objects: [], revision: 12 },
+    );
+    const preview = resolvePrimitiveDraft({ ...draft, size: ["100 nm", invalidSize, "10 nm"] });
+    expect(preview.dimensions).toBeNull();
+    expect(preview.errors["size.1"]).toBe("Box size Y must be greater than 0.");
+  });
   it("returns field-scoped errors and no preview dimensions for invalid SI values", () => {
     const draft = resolveGeometryObjectDraft(
       { ...baseSelection, kind: "builder.primitive", nodeId: "geometry:draft:box", objectId: null, ref: null },
@@ -456,5 +465,88 @@ describe("resolveGeometryObjectPanelModel", () => {
         "box",
       ),
     ).toEqual(["Box is outside universe", "Material is missing"]);
+  });
+
+  it("uses the shared quantity parser for box preview and geometry payload", () => {
+    const draft = resolveGeometryObjectDraft(
+      { ...baseSelection, kind: "builder.primitive", nodeId: "geometry:draft:box", objectId: null, ref: null },
+      { objects: [], revision: 12 },
+    );
+    const edited = {
+      ...draft,
+      size: ["100 nm", "0,2 um", "30 nm"] as [string, string, string],
+      translation: ["-10 nm", "1e-8", "0"] as [string, string, string],
+    };
+
+    expect(resolvePrimitiveDraft(edited)).toEqual({
+      dimensions: [1e-7, 2e-7, 3e-8],
+      errors: {},
+      kind: "Box",
+      translation: [-1e-8, 1e-8, 0],
+    });
+    expect(buildGeometryDraftPatch(edited)).toEqual({
+      error: null,
+      geometry: {
+        geometry_kind: "Box",
+        geometry_params: { size: [1e-7, 2e-7, 3e-8] },
+      },
+    });
+  });
+
+  it("uses SI quantities for cylinder payloads and preserves the full transform", () => {
+    const draft = resolveGeometryObjectDraft(
+      { ...baseSelection, kind: "builder.primitive", nodeId: "geometry:draft:cylinder", objectId: null, ref: null },
+      { objects: [], revision: 12 },
+    );
+    const edited = {
+      ...draft,
+      height: "0.1 um",
+      radius: "50 nm",
+      translation: ["-10 nm", "20 nm", "30 nm"] as [string, string, string],
+    };
+    const existingTransform = {
+      pivot: [1e-9, 2e-9, 3e-9],
+      rotation_quat: [0, 0, 0.3826834323650898, 0.9238795325112867],
+      scale: [2, 3, 4],
+      translation: [0, 0, 0],
+    };
+
+    expect(buildGeometryDraftPatch(edited)).toEqual({
+      error: null,
+      geometry: {
+        geometry_kind: "Cylinder",
+        geometry_params: { height: 1e-7, radius: 5e-8 },
+      },
+    });
+    expect(buildTransformDraftPatch(edited, existingTransform)).toEqual({
+      error: null,
+      transform: {
+        pivot: [1e-9, 2e-9, 3e-9],
+        rotation_quat: [0, 0, 0.3826834323650898, 0.9238795325112867],
+        scale: [2, 3, 4],
+        translation: [-1e-8, 2e-8, 3e-8],
+      },
+    });
+  });
+
+  it("keeps incomplete lengths out of preview and geometry payloads", () => {
+    const draft = resolveGeometryObjectDraft(
+      { ...baseSelection, kind: "builder.primitive", nodeId: "geometry:draft:box", objectId: null, ref: null },
+      { objects: [], revision: 12 },
+    );
+    const edited = {
+      ...draft,
+      size: ["1e-7", "1e-", "3e-8"] as [string, string, string],
+    };
+
+    expect(resolvePrimitiveDraft(edited)).toMatchObject({
+      dimensions: null,
+      errors: { "size.1": "Box size Y is incomplete." },
+      kind: "Box",
+    });
+    expect(buildGeometryDraftPatch(edited)).toEqual({
+      error: "Box size 2 is incomplete.",
+      geometry: null,
+    });
   });
 });

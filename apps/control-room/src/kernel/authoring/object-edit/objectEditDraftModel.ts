@@ -1,6 +1,7 @@
 import type { SceneResource } from "@/kernel/api/apiTypes";
 
 import type { GeometryObjectDraft } from "./objectEditTypes";
+import { parseQuantityInput } from "./quantityInput";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -104,9 +105,8 @@ export function geometryObjectEditSessionTargetKey(
 }
 
 function numericDraftValue(value: string): number | null {
-  if (!value.trim()) return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  const parsed = parseQuantityInput(value, "length", "m");
+  return parsed.parseStatus === "valid" ? parsed.parsedSI : null;
 }
 
 function geometryCharacteristicLength(draft: GeometryObjectDraft): number {

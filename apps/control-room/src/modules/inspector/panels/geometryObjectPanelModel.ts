@@ -14,6 +14,7 @@ export {
   geometryDraftTranslationEquals,
 } from "@/kernel/authoring/object-edit/objectEditDraftModel";
 import { ControlRoomApiError } from "@/kernel/api/ControlRoomApi";
+import { parseQuantityInput } from "@/kernel/authoring/object-edit/quantityInput";
 
 export interface GeometryObjectPanelModel {
   dimensions: string;
@@ -289,15 +290,17 @@ export function resolveGeometryObjectDraft(
 }
 
 function parseFiniteNumber(value: string, label: string): { error: string | null; value: number } {
-  const trimmed = value.trim();
-  if (trimmed === "") {
-    return { error: `${label} is required.`, value: 0 };
+  const parsed = parseQuantityInput(value, "length", "m");
+  if (parsed.parseStatus === "empty") {
+    return { error: label + " is required.", value: 0 };
   }
-  const parsed = Number(trimmed);
-  if (!Number.isFinite(parsed)) {
-    return { error: `${label} must be a finite SI value.`, value: 0 };
+  if (parsed.parseStatus === "incomplete") {
+    return { error: label + " is incomplete.", value: 0 };
   }
-  return { error: null, value: parsed };
+  if (parsed.parseStatus !== "valid" || parsed.parsedSI === null) {
+    return { error: label + " must be a finite SI value.", value: 0 };
+  }
+  return { error: null, value: parsed.parsedSI };
 }
 
 function parsePositiveNumber(value: string, label: string): { error: string | null; value: number } {
@@ -340,18 +343,20 @@ function parseDraftComponent(
   label: string,
   positive: boolean,
 ): { error: string | null; value: number | null } {
-  const trimmed = value.trim();
-  if (trimmed === "") {
-    return { error: `${label} is required.`, value: null };
+  const parsed = parseQuantityInput(value, "length", "m");
+  if (parsed.parseStatus === "empty") {
+    return { error: label + " is required.", value: null };
   }
-  const parsed = Number(trimmed);
-  if (!Number.isFinite(parsed)) {
-    return { error: `${label} must be a finite SI value.`, value: null };
+  if (parsed.parseStatus === "incomplete") {
+    return { error: label + " is incomplete.", value: null };
   }
-  if (positive && parsed <= 0) {
-    return { error: `${label} must be greater than 0.`, value: null };
+  if (parsed.parseStatus !== "valid" || parsed.parsedSI === null) {
+    return { error: label + " must be a finite SI value.", value: null };
   }
-  return { error: null, value: parsed };
+  if (positive && parsed.parsedSI <= 0) {
+    return { error: label + " must be greater than 0.", value: null };
+  }
+  return { error: null, value: parsed.parsedSI };
 }
 
 export function resolvePrimitiveDraft(draft: GeometryObjectDraft): PrimitiveDraft {
