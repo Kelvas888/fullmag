@@ -867,6 +867,20 @@
       "sources": [
         "source-g5-hermitian-mass-projection"
       ]
+    },
+    {
+      "id": "eq-g6-signed-k-frequency-replay",
+      "symbols": [
+        "g6_signed_spectrum",
+        "g6_signed_frequency",
+        "g6_signed_wavevector",
+        "g6_signed_components",
+        "g6_signed_relative_error"
+      ],
+      "sources": [
+        "source-g6-signed-k-replay",
+        "source-g6-signed-k-regression"
+      ]
     }
   ],
   "symbols": [
@@ -2014,6 +2028,36 @@
       "id": "g5_mass_diagonal_index",
       "latex": "$a$",
       "meaning": "Indeks diagonalnego stopnia swobody",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_signed_spectrum",
+      "latex": "$\\mathcal S_\\pm$",
+      "meaning": "Uporządkowane widma z zachowaniem krotności",
+      "si_unit": "$\\mathrm{Hz}$"
+    },
+    {
+      "id": "g6_signed_frequency",
+      "latex": "$f_j$",
+      "meaning": "Niezależnie obliczona częstotliwość zespolona",
+      "si_unit": "$\\mathrm{Hz}$"
+    },
+    {
+      "id": "g6_signed_wavevector",
+      "latex": "$\\mathbf{k}$",
+      "meaning": "Podpisany wektor falowy obu obliczeń",
+      "si_unit": "$\\mathrm{rad\\,m^{-1}}$"
+    },
+    {
+      "id": "g6_signed_components",
+      "latex": "$u,v,s$",
+      "meaning": "Porównywane składowe częstotliwości i ich skala",
+      "si_unit": "$\\mathrm{Hz}$"
+    },
+    {
+      "id": "g6_signed_relative_error",
+      "latex": "$r$",
+      "meaning": "Błąd względny jednej składowej częstotliwości",
       "si_unit": "$1$"
     }
   ],
@@ -4331,6 +4375,18 @@
       "path": "backends/fem/cpu/frequency_domain/operators/poisson_airbox_shared_domain.cpp",
       "symbol": "project_positive_tangent_mass_with_complex_constraint",
       "responsibility": "Structural Hermitian projection of validated real symmetric tangent mass"
+    },
+    {
+      "id": "source-g6-signed-k-replay",
+      "path": "scripts/comsol_signed_k_replay.py",
+      "symbol": "replay_signed_k_spectra",
+      "responsibility": "Compare independently supplied signed-k frequency multisets without mode identity or qualification"
+    },
+    {
+      "id": "source-g6-signed-k-regression",
+      "path": "scripts/test_comsol_signed_k_replay.py",
+      "symbol": "test_distinct_raw_slots_and_degenerate_frequencies_preserve_multiplicity",
+      "responsibility": "Preserve multiplicity and independent raw-mode slots"
     }
   ],
   "public_api": {

@@ -5,6 +5,8 @@ on:
   push:
     branches: ['codex/**']
     paths:
+      - 'scripts/comsol_signed_k_replay.py'
+      - 'scripts/test_comsol_signed_k_replay.py'
       - 'scripts/comsol_modal_field_certificate.py'
       - 'scripts/test_comsol_modal_field_certificate.py'
       - 'scripts/validate_comsol_dispersion_scientific_gate.py'
@@ -50,5 +52,6 @@ jobs:
           python -B -m pytest -q
           scripts/test_validate_comsol_dispersion_scientific_gate.py
           scripts/test_comsol_modal_field_certificate.py
+          scripts/test_comsol_signed_k_replay.py
           scripts/test_compare_comsol_a1_frequency_reference.py
           scripts/test_run_comsol_dispersion_benchmark.py

@@ -5799,3 +5799,53 @@ przejść bez modyfikowania swojej produkcyjnie złożonej masy; science NOT VER
 | `backends/fem/cpu/frequency_domain/operators/poisson_airbox_shared_domain.cpp` | `project_positive_tangent_mass_with_complex_constraint` | Structural Hermitian projection |
 | `backends/fem/cpu/frequency_domain/operators/poisson_airbox_shared_domain.cpp` | `validate_symmetric_real_tangent_mass` | Fail-closed internally assembled input |
 | `backends/fem/tests/frequency_domain/poisson_airbox_shared_domain_test.cpp` | `floquet_positive_tangent_mass_matches_independent_phase_reduction` | Independent integration/phase oracle |
+
+
+(g6-signed-k-numeric-replay)=
+## G6 — diagnostyka dwóch niezależnych widm dla przeciwnego k
+
+Dla symetrycznego, wzajemnego benchmarku A1 porównujemy rzeczywiście policzone
+widma dla $+\mathbf{k}$ i $-\mathbf{k}$. Zakres nie obejmuje układów z fizyczną
+niewzajemnością. Helper nie generuje punktów ujemnych ani nie przypisuje
+fizycznej tożsamości modów na podstawie numerów gałęzi.
+
+```{math}
+:label: eq-g6-signed-k-frequency-replay
+\mathcal S_\pm(\mathbf{k})=\operatorname{sort}_{(\operatorname{Re}f,\operatorname{Im}f)}
+\{f_j(\pm\mathbf{k}):\operatorname{Re}f_j>0\},\qquad
+r(u,v)=\begin{cases}0,&u=v=0,\\
+\left|u/s-v/s\right|,&s=\max(|u|,|v|)>0.
+\end{cases}
+```
+
+| Symbol | Znaczenie | SI |
+|---|---|---|
+| $\mathcal S_\pm$ | Uporządkowane widma z zachowaniem krotności | $\mathrm{Hz}$ |
+| $f_j$ | Niezależnie obliczona częstotliwość zespolona | $\mathrm{Hz}$ |
+| $\mathbf{k}$ | Podpisany wektor falowy obu obliczeń | $\mathrm{rad\,m^{-1}}$ |
+| $u,v,s$ | Porównywane składowe częstotliwości i ich skala | $\mathrm{Hz}$ |
+| $r$ | Błąd względny jednej składowej częstotliwości | $1$ |
+
+Najniższe dodatnie pasma są porównywane rank-by-rank, osobno dla części
+rzeczywistej i urojonej, z zachowaniem degeneracji. Próg jest obowiązkowym
+argumentem wywołania: ta korekta nie ustanawia nowej domyślnej tolerancji.
+Zgodność komponentów przeciwnego k używa istniejącej reguły względnej1e-8,
+ze skalą co najmniej1 rad/m. Oba wejścia wymagają dokładnie tych samych indeksów
+próbek, skończonych danych i wystarczającej liczby dodatnich modów.
+
+Helper sprawdza równość pokrycia dostarczonych zestawów, nie pełność oczekiwanej
+ścieżki benchmarku. Wywołujący musi niezależnie potwierdzić pełną ścieżkę,
+pochodzenie i hashe obu bundle'ów oraz wzajemność konfiguracji A1. Brak takich
+dowodów pozostawia całość NOT VERIFIED. Numery raw pozostają tylko audytowe.
+Nawet wynik `pass` tego helpera jest diagnostyką częstotliwości; nie zastępuje
+cross-run identyfikacji pól, kompletności widma, zbieżności ani kwalifikacji.
+
+FEM CPU: helper source implemented, hosted contracts pending; runtime/science
+NOT VERIFIED. FEM GPU: brak nowej realizacji lub kwalifikacji. FDM CPU/GPU:
+nie dotyczy tej bramki artefaktów FEM. Python DSL, ProblemIR i operatory solvera
+pozostają bez zmiany; jest to konsument dostarczonych widm numerycznych.
+
+| Źródło | Symbol | Odpowiedzialność |
+|---|---|---|
+| `scripts/comsol_signed_k_replay.py` | `replay_signed_k_spectra` | Niezależne widma, pełne pokrycie wejść i pomiar błędów |
+| `scripts/test_comsol_signed_k_replay.py` | `test_distinct_raw_slots_and_degenerate_frequencies_preserve_multiplicity` | Degeneracje i różne numery raw bez fałszywej tożsamości |
