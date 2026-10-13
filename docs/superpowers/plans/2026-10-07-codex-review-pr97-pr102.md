@@ -4083,3 +4083,9 @@ AST Python oraz parser Rust PASS bez uruchamiania testów projektu. Workflow roz
 ### Potwierdzona przyczyna kwarantanny testu 45
 
 Pierwszy hard opt-out wywołuje oczekiwany błąd EPSSolve/PCApply (log 13080–13099), który zgodnie z produkcyjnym kontraktem kwarantannuje PETSc. Kolejny nearest w tym samym procesie otrzymuje więc poprawny fast-fail petsc_runtime_unsafe zamiast nowego snapshotu. Przyczyna nie wymaga osłabienia solvera: opt-out, nearest, window i fresh-LU fault potrzebują osobnych procesów/selectorów. Izolacja w toku, nowa bramka natywna pending.
+
+### Izolacja hard EPS i pierwsze wyniki migracji
+
+Remote6bf6b899: CI38456836046 Ubuntu SUCCESS (shared Rust reader4, inspector49, Pythonreader19 PASS). Pełny pilot/helper subset151PASS323subtests4FAIL: nieaktualny fake fullmag StageAutosave, mock bundle_reader=None i dwa niepełne context.job dla cleanup. Korekty fixture w toku; migracja nie jest jeszcze w całości zweryfikowana.
+
+Hard EPS opt-out/nearest/fresh-LU fault/window rozdzielono na cztery CLI selectory/CTest procesy; każdy kończy się przed następnym solver call. Root source review potwierdziło zachowanie każdej usuniętej linii starego bloku po normalizacji wcięć (poza rozszerzoną sygnaturą). Profil floquet-modal-slepc jawnie zawiera cztery nowe testy/markery. AST i diff checks PASS; runtime pending. Produkcyjna kwarantanna i residuale bez zmian.

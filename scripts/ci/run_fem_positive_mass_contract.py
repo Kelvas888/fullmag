@@ -218,6 +218,46 @@ CONTRACT_PROFILES: dict[str, dict[str, Any]] = {
                 ],
             },
             {
+                "name": "fem_modal_eigen_hard_ksp_opt_out_contract",
+                "source_suffix": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+                "marker": "PASS: modal_eigen_hard_ksp_diagnostics_opt_out_probe",
+                "compile_definitions": [
+                    "-DFULLMAG_HAS_MFEM_STACK=1",
+                    "-DFULLMAG_FEM_WITH_SLEPC=1",
+                    "-DFULLMAG_HAS_CUDA_RUNTIME=0",
+                ],
+            },
+            {
+                "name": "fem_modal_eigen_hard_ksp_nearest_contract",
+                "source_suffix": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+                "marker": "PASS: modal_eigen_hard_ksp_nearest_diagnostics_probe",
+                "compile_definitions": [
+                    "-DFULLMAG_HAS_MFEM_STACK=1",
+                    "-DFULLMAG_FEM_WITH_SLEPC=1",
+                    "-DFULLMAG_HAS_CUDA_RUNTIME=0",
+                ],
+            },
+            {
+                "name": "fem_modal_eigen_hard_ksp_fresh_setup_fault_contract",
+                "source_suffix": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+                "marker": "PASS: modal_eigen_hard_ksp_fresh_setup_fault_probe",
+                "compile_definitions": [
+                    "-DFULLMAG_HAS_MFEM_STACK=1",
+                    "-DFULLMAG_FEM_WITH_SLEPC=1",
+                    "-DFULLMAG_HAS_CUDA_RUNTIME=0",
+                ],
+            },
+            {
+                "name": "fem_modal_eigen_hard_ksp_window_contract",
+                "source_suffix": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+                "marker": "PASS: modal_eigen_hard_ksp_window_failure_probe",
+                "compile_definitions": [
+                    "-DFULLMAG_HAS_MFEM_STACK=1",
+                    "-DFULLMAG_FEM_WITH_SLEPC=1",
+                    "-DFULLMAG_HAS_CUDA_RUNTIME=0",
+                ],
+            },
+            {
                 "name": "fem_modal_eigen_certified_recovery_mixed_contract",
                 "source_suffix": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
                 "marker": "PASS: native_floquet_mixed_4x4_certified_recovery",

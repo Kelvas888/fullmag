@@ -1178,6 +1178,30 @@ if(FULLMAG_USE_MFEM_STACK AND FULLMAG_FEM_WITH_SLEPC)
         fem_modal_eigen_certified_recovery_budget_contract
         fem_modal_eigen_certified_recovery_exact_threshold_contract
         PROPERTIES TIMEOUT 120)
+    # Hard EPS errors quarantine PETSc/SLEPc for the remainder of that process.
+    # Keep each expected failure probe in its own CTest process.
+    add_custom_target(fem_modal_eigen_hard_ksp_opt_out_contract
+        DEPENDS fem_modal_eigen_contract)
+    add_test(NAME fem_modal_eigen_hard_ksp_opt_out_contract
+        COMMAND fem_modal_eigen_contract --floquet-hard-ksp-opt-out)
+    add_custom_target(fem_modal_eigen_hard_ksp_nearest_contract
+        DEPENDS fem_modal_eigen_contract)
+    add_test(NAME fem_modal_eigen_hard_ksp_nearest_contract
+        COMMAND fem_modal_eigen_contract --floquet-hard-ksp-nearest)
+    add_custom_target(fem_modal_eigen_hard_ksp_fresh_setup_fault_contract
+        DEPENDS fem_modal_eigen_contract)
+    add_test(NAME fem_modal_eigen_hard_ksp_fresh_setup_fault_contract
+        COMMAND fem_modal_eigen_contract --floquet-hard-ksp-fresh-setup-fault)
+    add_custom_target(fem_modal_eigen_hard_ksp_window_contract
+        DEPENDS fem_modal_eigen_contract)
+    add_test(NAME fem_modal_eigen_hard_ksp_window_contract
+        COMMAND fem_modal_eigen_contract --floquet-hard-ksp-window)
+    set_tests_properties(
+        fem_modal_eigen_hard_ksp_opt_out_contract
+        fem_modal_eigen_hard_ksp_nearest_contract
+        fem_modal_eigen_hard_ksp_fresh_setup_fault_contract
+        fem_modal_eigen_hard_ksp_window_contract
+        PROPERTIES TIMEOUT 120)
     target_include_directories(fem_shifted_ksp_true_convergence_contract PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/cpu/frequency_domain/modal
     )
