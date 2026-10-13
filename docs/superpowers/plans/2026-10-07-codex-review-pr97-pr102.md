@@ -3665,3 +3665,39 @@ Podstawa audytu GPT PRO: 00392a4bacd31a8e378ac1e05a44bc23f2730e85. Rewizja bież
 Żaden z tych source gates nie zamyka A1 external equivalence, zbieżności airbox/mesh, signed independent counting, GPU/BEM/RF ani managed runtime. Próg A1 nadal 0.005 per pair. PR97/integracja nadal otwarte.
 
 Chroniony local HEAD1827c3436f80ff17396c285d13c0e269eecf4b25, index SHA256 D867F6996C4A8952B025F0B8644FE5E9806628C3A59706F2D87193AC81641144 i stash a4a7d2f87508b47da6133049df6a2b91a4bfa463 pozostają niezmienione. Publikacja dokładnych fragmentów przez GitData, force:false i exact parent lease; nie wykonano lokalnego fetch/stage/reset ani lokalnych buildów/testów.
+
+
+## Audyt PRO C01–C07 — aktualizacja wdrożenia 13.10.2026
+
+Branch zadania: `codex/eigensolve-dispersion-plan-20260912`; zdalny checkpoint
+przed tym wpisem `29634c4259874fe79d86107ffbb077a279d21fa6`. Lokalny HEAD/index/stash
+pozostają chronione; GitData publikował wyłącznie dokładnie zrecenzowane fragmenty
+z kontrolą parent/lease, bez force. Nie jest to merge PR97 ani kwalifikacja wydania.
+
+| Punkt | Co wykonano | Bezpośredni dowód | Co pozostaje |
+|---|---|---|---|
+| C01 / G1 | Typowany scope w API; rozróżnienie unknown/[]; osobny per_sample/global view; eksport pełnej projekcji ponad 5000 punktów bez scalenia równych częstotliwości. | API38354208125 PASS; UI38359456109 PASS wraz z typami/architecture/Doctor85. Commity `4fa31d1a...`, `e6cd1490...`, `29634c42...`. | Realny browser i script export/reimport na artefakcie solvera NOT VERIFIED. |
+| C02 / G2 | Serial Stop zbiera terminalne success/error przed kill; Pause drain, Pause→Stop; barrier regressions. | GHA38354639821 PASS, 25 pool tests, named cases. `8dfdf625...` / `5e71a856...`. | Rzeczywisty managed/HPC sweep; osobna naprawa Slurm allocation usage/serial CPU budget w toku. |
+| C03 / G3 | Producer final-byte commit + lease; JSON/CSV i field metadata/binary capture, owner, digest/length/fences; generated API; cache/CSV join. | Producer38355093226 PASS; API38359249932 PASS; UI38357648561 PASS. | Overlay/composition query/header follow-up; real runtime/browser; immutable historical snapshot retention niewdrożone, ADR0058 jawnie fail-closed. |
+| C04 / G5 | Bounded macierz A/B/C: 39 raw snapshots, bez zaobserwowanej zmiany values; przygotowane object/attempt/copy-origin binding v2. | Native38354821723 10/12, parser measured_unpaired; native38357069909 12/14. | Full/mixed nadal FAIL, true residual 1e-10 vs próg około 2.4e-14; cause NOT VERIFIED. Nie poluzowano tolerancji. |
+| C05 / G4 | Dwa niezależne harnessy real phi host backing bytes, primary/cleanup fault; negatywne corruption controls; żadnych PETSc getterów po quarantine. | Native38357069909: dwa nowe named tests PASS, rhs/solution po32bytes, scope=production_backing_bytes_only. | Nie rozszerzać na cały stan Vec/default storage/managed solve. |
+| C06 | Success observer i pattern fixture zachowane. | Aktualny native38357069909 named pattern/quarantine tests PASS. | Nie zastępuje full/mixed correctness. |
+| C07 / G8 | Jawny Doctor base/history, scoped diagnostics; UI typy/architecture PASS. | GHA38359456109 SUCCESS, Doctor85. | Realny browser/WebGL, release gate NOT VERIFIED. |
+
+G0 i G6–G8 wymagają osobnych receipts. A1 próg0,5% pozostaje zatwierdzony,
+nie jest wynikiem zgodności COMSOL. GPU/FDM/BEM/RF/exact damping i nonuniform
+qualification nie dziedziczą PASS CPU fixture. Ta tabela nie zamyka pozostałych
+uwag PR97 w ledgerze ani nie uznaje audytu za w pełni wykonany.
+
+
+## Checkpoint weryfikacji 13.10.2026 — generacja binarna i zasoby Slurm
+
+Zdalny checkpoint kodu: `27e1efa74cab04dae9227451a756c646166051ac`.
+Nie wykonano lokalnych buildów/testów ani mutacji chronionego HEAD/index/stash.
+
+- `0d022d02994e9ee6ea434458201cc8b0f8458cd0` i `d3ed52c92e4cef8ba5ffec4c61b5d4f90551fd27`: Slurm job-wide memory accounting (również bez SLURM_MEM_*), per-task CPU, affinity/quota, serial allocation i child budget. [GHA38365181150](https://github.com/MateuszZelent/fullmag/actions/runs/38365181150) SUCCESS: 20 allocation tests, 4 worker tests, 28 pool tests oraz istniejące output/prefix/control/writer gates PASS. To kontrakty na hosted Linux, nie receipt rzeczywistego Slurm joba.
+- `04de2f5f87a1041571668acb6fb8ff1efce0e42b`: typowany artifact generation query/header, metadata preflight, collection generation consistency, exact retained identity i derived renderer keys. `27e1efa74cab04dae9227451a756c646166051ac` poprawia import helpera w fixture oraz rozłączny typ Analysis Result/Frequency Domain overlay. [GHA38366123014](https://github.com/MateuszZelent/fullmag/actions/runs/38366123014) SUCCESS: 791 testów / 41 plików, pełny typecheck, architecture i React Doctor85. Nie jest to browser/WebGL receipt.
+- [GHA38364933538](https://github.com/MateuszZelent/fullmag/actions/runs/38364933538) SUCCESS: canonical generated OpenAPI oraz API contracts, w tym named enum test (poprzedni błędny selector uruchamiał zero testów), capture/fence/field binary, 31 dataset tests, 242 FMS i 83 session tests.
+- `9f7baefcbcb809fcee3e4a587f0d8c4a001bef3f`: getter-only bounded C04 v2 IDs/configuration, parser i regresje. Parser w [GHA38364429802](https://github.com/MateuszZelent/fullmag/actions/runs/38364429802) PASS; native MFEM/SLEPc build jeszcze w toku w chwili wpisu. Nie uznano C04 full/mixed za naprawione.
+
+Publikacja C03 zachowuje fail-closed stale/conflict przy zmianie członka, bez immutable history. Ta granica ADR0058 pozostaje jawna. G0/G6/G7/G8, realny managed sweep, nauka, browser oraz integracja PR97 pozostają otwarte. A1=0.005 per pair i native tolerances nie zostały zmienione.
