@@ -284,7 +284,7 @@ def require_bundle_path(
         try:
             logical_path = bundle_reader.logical_path(relative_path)
             if not bundle_reader.has_member(relative_path):
-                fail(f"{name} is not a member of the captured artifact generation")
+                fail(f"{name}: {relative_path} is not a member of the captured artifact generation")
         except (OSError, ValueError) as error:
             fail(f"{name} is not a safe captured artifact path: {error}")
         return relative_path, logical_path
