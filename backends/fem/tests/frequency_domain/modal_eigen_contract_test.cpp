@@ -4317,8 +4317,19 @@ void modal_floquet_shared_domain_original_descriptor_certification_is_fail_close
     }
     check(floquet_typed_values_finite,
           "shared-domain Floquet typed q and phi values remain finite through the C ABI");
-    check(contains(result.diagnostics_json, "\"floquet_potential_certificate\":"),
-          "shared-domain Floquet diagnostics must retain the provider potential certificate");
+    // This request uses the sparse shared-domain descriptor.  The legacy
+    // dense Schur provider certificate describes separate basis-RHS solves;
+    // it is not emitted by this route.  Require the accepted descriptor's
+    // actual potential residual instead of borrowing that legacy certificate.
+    const double accepted_potential_residual = extract_json_number(
+        result.diagnostics_json,
+        "\"floquet_potential_relative_residual_max\":",
+        "shared_domain_floquet_accepted_potential_residual");
+    check(std::isfinite(accepted_potential_residual) &&
+              accepted_potential_residual >= 0.0 &&
+              accepted_potential_residual <= 1e-8 &&
+              contains(result.result_json, "\"floquet_descriptor_certified\":true"),
+          "sparse shared-domain Floquet publishes the certified accepted-mode potential residual");
     check(g_progress_event_count == 16,
           "shared-domain Floquet window progress must follow descriptor certification");
     fullmag_fem_frequency_domain_result_destroy(&result);
