@@ -3983,3 +3983,15 @@ Hosted wynik exact9d471a5f710cb7be1ef1f428b4ff01e7048072e9: [Reference3843543842
 
 
 `0a5a314a3451d422d145b985b311499f7e2886d0`: nearest fixture miało zgodne wymiary5nodes/10tangentDOFs, ale term_presence_mask=0. Native producer wymaga co najmniej jednego termu; deklaracja istniejącego collinear FIELD i jego digest odpowiada sąsiedniemu poprawnemu fixture. Usunięto nieużywany test-local CSR carrier zastępowany native assembly. Wyłącznie test CPP; production/thresholds/count/recovery bez zmian. [Native38436744680](https://github.com/MateuszZelent/fullmag/actions/runs/38436744680) uruchomiono na exact0a5a314; wynik pending, nie zaliczono17/17.
+
+### Aktualizacja kontraktów i oracle — 2026-10-13
+
+Decyzja użytkownika: dense pozostaje bridge walidacyjnym, recovery należy sprawdzać na sparse, a mixed osobno pełnymi residualami deskryptora. Native38436744680 na exact0a5a314 zakończył się FAILURE16/17, przy PASS sparse recovery, mixed oraz wcześniejszego nearest. Nowy blocker w test45 to frequency_window0.05–0.30Hz wywiedzione ze starego caller-dense carrier, podczas gdy kandydaci native są około0.5174055238Hz. Full log/receipt zachowano; nie są to przyjęte mody poza żądanym oknem.
+
+`49bf1eef3d001ac16cfa95a505ce44df45e0cf23`: niezależny Tet4 nodal-energy-Hessian oracle, zgodna P1 masa/sztywność, wymiana/Zeeman/anisotropia oraz świeży mean-zero Poisson surrogate przy perturbacjach; gradient, ambient Hessian i nodalna korekta c_i=-m_i·g_i sprawdzane różnicami centralnymi/Richardson. Standalone scientific source-map validator PASS. [Native-modal38439982359](https://github.com/MateuszZelent/fullmag/actions/runs/38439982359), exact49bf1: SUCCESS5/5, w tym fem_modal_eigen_nodal_energy_hessian_contract. Zakres: niezależny oracle algebraiczny bez MFEM/SLEPc, nie porównanie produkcyjnego Hessianu ani real airbox qualification.
+
+`97b6247b7dfd296f8dc62046a723920fde34de61`: wyłącznie testowe zakresy nearest/window/cap wywodzą skalę z gamma0, H i Ms deskryptora; broad search bracket odpowiada istniejącemu contour fixture. Zachowano wszystkie asercje residualów, count/completeness, recovery oraz produkcyjne tolerancje. [Native38440522035](https://github.com/MateuszZelent/fullmag/actions/runs/38440522035) pending na exact97b6247. Brak deklaracji17/17.
+
+G3 writer pozostaje lokalnym WIP bez aktywacji: benchmark, primary verifier, DE plot i resolver terminal attestation nadal wymagają domknięcia odczytów względem jednego captured generation/member cache. Zewnętrzne receipty/logi pozostają osobnym provenance; nie mogą zastąpić brakującego członka v2 przez mutable alias.
+
+G6 produkcyjny gradient wymaga bezpośredniej pochodnej dyskretnej energii baseline przy k=0. Aktualny zaakceptowany phi0 jest związany digestem, ale samo H_eff nie dowodzi wspólnego Riesz mapping dla zmiennego Ms. Należy sprawdzić P_0 phi0-b_0 i osobno dynamiczny P(k); oracle5/5 nie zamyka tej bramki. Real DE/BV/A1 oraz real solver-artifact UI nadal NOT VERIFIED. PR97 nie jest gotowy do merge.
