@@ -1,5 +1,4 @@
 import { act, type ComponentProps } from "react";
-import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -336,6 +335,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     mocks.solverStatusData = { frozen_spins: solverRuntime };
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -373,6 +373,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("requests a revision-bound preview and publishes only its preview identity", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () =>
@@ -425,6 +426,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     mocks.delete.mockResolvedValueOnce({ revision: 9 });
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -475,6 +477,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("keeps a clean Apply disabled without submitting a write", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -495,6 +498,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     mocks.patch.mockReturnValueOnce(new Promise((resolve) => { resolvePatch = resolve; }));
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -533,6 +537,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     mocks.scene.mockResolvedValueOnce(before).mockResolvedValueOnce(after);
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -573,6 +578,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     );
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -597,6 +603,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("reports an authored edit as a pending runtime revision instead of an in-place solver mutation", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -640,6 +647,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     });
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -672,6 +680,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("atomically commits the exact speculative preview candidate and awaits solver binding", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -716,6 +725,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     );
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -741,6 +751,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("disables activation after the selector diverges from the previewed selector", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -777,6 +788,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     );
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -846,6 +858,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     mocks.createPreview.mockResolvedValueOnce({ ...preview, current: false });
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(
@@ -871,6 +884,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("retains the same inspector root while a revision invalidation refetches", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     const selection = {
       kind: "object.frozen-spins",
@@ -901,6 +915,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("does not retain another constraint definition after the target changes", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     const selection = {
       kind: "object.frozen-spins",
@@ -949,6 +964,7 @@ describe("FrozenSpinsInspectorPanel", () => {
   it("does not retain the same constraint draft after the session changes", async () => {
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     const selection = {
       kind: "object.frozen-spins",
@@ -1006,6 +1022,7 @@ describe("FrozenSpinsInspectorPanel", () => {
     mocks.patch.mockReturnValueOnce(new Promise((resolve) => { resolvePatch = resolve; }));
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
     const root = createRoot(container as unknown as Element);
     try {
       await act(async () => root.render(

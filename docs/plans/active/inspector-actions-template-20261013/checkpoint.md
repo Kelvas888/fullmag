@@ -235,3 +235,16 @@ zdarzenie input. Asercja disabled przed edycją i enabled po edycji dowodzi
 aktualizacji stanu zamiast samej wartości DOM. Kontrole session/history
 i nowszej edycji pozostają zachowane. git diff --check PASS; lokalnych
 testów/kompilacji nie uruchomiono. Nowy przebieg CI wymagany przed integracją.
+
+## Końcowa diagnoza zdarzeń Frozen Spins
+
+Run38384854138 na f054b25d31ffe02b821eac10133f5e3950543b0d: oba browser,
+Rust, Python, generated-api, FDM i API hygiene PASS. Monitor w całości PASS;
+pozostało6 błędów w Frozen Spins, wszystkie na kontroli dirty po input.
+
+Jawny type=text nie usuwa problemu inicjalizacji fixture: Frozen test
+importował react-dom/client przed instalacją dokumentu. W istniejącym
+GeometryObjectPanel.dom.test.tsx klient jest ładowany dopiero po instalacji
+DOM. Frozen stosuje teraz tę samą kolejność w każdym montowaniu. Nie
+wywołuje onChange bezpośrednio i nie usuwa asercji enabled/payload/ACK.
+Kontrola diff PASS; wykonanie do potwierdzenia przez automatyczne CI.

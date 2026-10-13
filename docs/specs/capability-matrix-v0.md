@@ -758,3 +758,23 @@ możliwościach docelowej architektury. Wymuszony backend/device nie ma silent
 fallbacku, a brak primary carriera jest typed unsupported. Task 0 jest
 wyłącznie kontraktem źródłowym/dokumentacyjnym i nie promuje żadnej z czterech
 capability.
+
+### FDM: admission anizotropii materiałowej bez globalnych energii
+
+Poprawka `crates/fullmag-plan/src/fdm.rs::has_referenced_material_anisotropy`
+uzupełnia warunek obecności fizyki w single-grid i multilayer FDM o istniejącą
+realizację skalarnej anizotropii materiałowej. Uwzględnia wyłącznie materiały
+przypisane do magnesów, skończone i niezerowe współczynniki oraz poprawne osie.
+Uniaxial wymaga jawnego Ku1; Ku2 bez Ku1 nie uzyskuje nowej wykonywalności.
+Brak osi zachowuje domyślne Z dla uniaxial i X/Y dla cubic. Nie zmienia to
+definicji energii, żądanego backendu/device, precision ani polityki fallbacku.
+Kontrakty fizyczne: `docs/physics/0402-uniaxial-anisotropy.md` oraz
+`docs/physics/0403-cubic-anisotropy.md`.
+
+Zakres dowodów tej poprawki opisuje
+`docs/plans/active/refactor_runtime/final/p8/53bf-fdm-material-anisotropy-admission.md`:
+managed build, dziesięć produkcyjnych przypadków plannera i single-grid CPU Grid
+PASS. Rust regression source nie były kompilowane. Multilayer/GPU runtime
+i końcowe Compute po restore pozostają NOT VERIFIED.
+Nie promuje to FDM CPU/GPU ani FEM CPU/GPU do `validated`; kwalifikacja
+naukowa i pozostałe bramki lane'ów zachowują dotychczasowy status.

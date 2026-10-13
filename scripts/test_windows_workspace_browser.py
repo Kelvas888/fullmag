@@ -143,7 +143,6 @@ class BrowserProofChecks(unittest.TestCase):
                     native_gate.run("unused", frozen_native_build_id=invalid)
             conflicts = {
                 "cross_build_bundle": "b" * 32,
-                "project_document_only": True,
                 "restart_transport_only": True,
                 "observer_pause_only": True,
                 "restart_consumer_only": True,
@@ -156,9 +155,14 @@ class BrowserProofChecks(unittest.TestCase):
                 with self.subTest(mode=name), self.assertRaises(proof.storage.StorageError):
                     native_gate.run("unused", frozen_native_build_id=pin, **{name: value})
             resolve.assert_not_called()
-        with patch.object(native_gate.storage, "resolve_layout", side_effect=RuntimeError("resolver reached")):
-            with self.assertRaisesRegex(RuntimeError, "resolver reached"):
-                native_gate.run("unused", frozen_native_build_id=pin)
+        # Frozen packages also support the project-document proof used by the
+        # managed archive recipe. Both accepted scopes must reach preflight;
+        # no production storage is allocated by this check.
+        for scope in ({}, {"project_document_only": True}):
+            with self.subTest(accepted_scope=scope), patch.object(
+                    native_gate.storage, "resolve_layout", side_effect=RuntimeError("resolver reached")):
+                with self.assertRaisesRegex(RuntimeError, "resolver reached"):
+                    native_gate.run("unused", frozen_native_build_id=pin, **scope)
 
     def setUp(self):
         self.expected = {"worktree_id": "fixture", "generation_id": "a" * 32,
