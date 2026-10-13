@@ -1,172 +1,28 @@
-//! Final-byte membership for a committed frequency-domain publication.
-//! This proves content membership, never physics or runtime authentication.
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+//! Frequency-domain artifact generation publishing.
+//!
+//! Read-only capture and byte validation live in fullmag-session; this module
+//! preserves the runner-facing API and owns publication leases and marker writes.
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-pub const COMMIT_PATH: &str = "frequency_domain/generation.v1.json";
-pub const IMMUTABLE_COMMIT_PATH: &str = "frequency_domain/generation.v2.json";
-const GENERATION_DIRECTORY: &str = "frequency_domain/generations";
-const SCHEMA: &str = "frequency_domain_artifact_generation.v1";
-const IMMUTABLE_SCHEMA: &str = "frequency_domain_artifact_generation.v2";
-const MAX_COMMIT_BYTES: u64 = 4 * 1024 * 1024;
+pub use fullmag_session::frequency_domain_artifact_generation::{
+    capture, GenerationBody, GenerationCapture, GenerationCommit, GenerationMember,
+    PublicationOwner, COMMIT_PATH, IMMUTABLE_COMMIT_PATH,
+};
+use fullmag_session::frequency_domain_artifact_generation as generation_core;
+use fullmag_session::frequency_domain_artifact_generation::{
+    checked_directory, checked_path, digest, generation_id, hash_file_with_budget,
+    is_reparse_point, marker_path_if_present, validate_member_path, validate_relative,
+    valid_digest, GENERATION_DIRECTORY, IMMUTABLE_SCHEMA, MAX_COMMIT_BYTES, SCHEMA,
+};
+
 const MAX_PUBLICATION_LEASE_TOKEN_BYTES: usize = 64;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PublicationOwner {
-    pub run_id: String,
-    pub stage_id: String,
-    pub stage_kind: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct GenerationMember {
-    pub byte_length: u64,
-    pub sha256: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct GenerationBody {
-    pub schema_version: String,
-    /// Supplied by execution ownership; absence is not filled from the viewer.
-    pub producer: Option<PublicationOwner>,
-    pub members: BTreeMap<String, GenerationMember>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct GenerationCommit {
-    pub generation_id: String,
-    pub content: GenerationBody,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GenerationLayout {
-    MutableV1,
-    ImmutableV2,
-}
-
-#[derive(Debug, Clone)]
-pub struct GenerationCapture {
-    pub commit: GenerationCommit,
-    commit_digest: String,
-    layout: GenerationLayout,
-}
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
-
-fn digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|v| {
-        v.len() == 64 && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
-}
-
-fn validate_relative(relative: &str) -> io::Result<PathBuf> {
-    if relative.is_empty()
-        || relative.contains(char::from(92))
-        || relative.contains(':')
-        || relative.as_bytes().contains(&0)
-    {
-        return Err(invalid("generation member path is not canonical relative"));
-    }
-    let path = Path::new(relative);
-    if path.components().any(|c| !matches!(c, Component::Normal(_)))
-        || path.to_string_lossy() != relative
-        || relative.split('/').any(|part| part.is_empty() || part == "." || part == "..")
-    {
-        return Err(invalid("generation member path escapes its publication"));
-    }
-    Ok(path.to_path_buf())
-}
-
-fn is_reserved_member_path(relative: &str) -> bool {
-    [
-        COMMIT_PATH,
-        IMMUTABLE_COMMIT_PATH,
-        "WRITER.owner.json",
-        GENERATION_DIRECTORY,
-    ]
-    .iter()
-    .any(|reserved| {
-        relative == *reserved
-            || relative
-                .strip_prefix(*reserved)
-                .is_some_and(|tail| tail.starts_with('/'))
-    })
-}
-
-fn validate_member_path(relative: &str) -> io::Result<PathBuf> {
-    let path = validate_relative(relative)?;
-    if is_reserved_member_path(relative) {
-        return Err(invalid("generation member uses a reserved publication path"));
-    }
-    Ok(path)
-}
-fn checked_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
-    if relative.is_empty() || (relative.contains('\\') || relative.contains(':') || relative.contains('\0')) {
-        return Err(invalid("generation member path is not canonical relative"));
-    }
-    let path = Path::new(relative);
-    if path.components().any(|c| !matches!(c, Component::Normal(_)))
-        || path.to_string_lossy() != relative
-        || relative.split('/').any(|part| part.is_empty() || part == "." || part == "..")
-    {
-        return Err(invalid("generation member path escapes its publication"));
-    }
-    let canonical_root = fs::canonicalize(root)?;
-    let mut candidate = canonical_root.clone();
-    for part in path.components() {
-        candidate.push(part.as_os_str());
-        let metadata = fs::symlink_metadata(&candidate)?;
-        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
-            return Err(invalid("generation member contains a symlink or reparse point"));
-        }
-    }
-    let canonical = fs::canonicalize(&candidate)?;
-    if !canonical.starts_with(&canonical_root) || !fs::metadata(&canonical)?.is_file() {
-        return Err(invalid("generation member is not a regular in-root file"));
-    }
-    Ok(canonical)
-}
-
-#[cfg(windows)]
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    metadata.file_attributes() & 0x400 != 0
-}
-#[cfg(not(windows))]
-fn is_reparse_point(_: &fs::Metadata) -> bool { false }
-
-fn checked_directory(root: &Path, relative: &str) -> io::Result<PathBuf> {
-    let path = validate_relative(relative)?;
-    let canonical_root = fs::canonicalize(root)?;
-    let mut candidate = canonical_root.clone();
-    for part in path.components() {
-        candidate.push(part.as_os_str());
-        let metadata = fs::symlink_metadata(&candidate)?;
-        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) || !metadata.is_dir() {
-            return Err(invalid("generation directory contains a link or non-directory"));
-        }
-    }
-    let canonical = fs::canonicalize(&candidate)?;
-    if !canonical.starts_with(&canonical_root) || !fs::metadata(&canonical)?.is_dir() {
-        return Err(invalid("generation directory is not an in-root directory"));
-    }
-    Ok(canonical)
-}
-
 fn ensure_real_directory(path: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -241,31 +97,6 @@ fn verify_members_at_directory(
     Ok(())
 }
 
-fn marker_path_if_present(root: &Path, relative: &str) -> io::Result<Option<PathBuf>> {
-    let path = validate_relative(relative)?;
-    let canonical_root = fs::canonicalize(root)?;
-    let mut candidate = canonical_root;
-    let parts = path.components().collect::<Vec<_>>();
-    for (index, part) in parts.iter().enumerate() {
-        candidate.push(part.as_os_str());
-        let metadata = match fs::symlink_metadata(&candidate) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
-            return Err(invalid("generation commit path contains a link or reparse point"));
-        }
-        if index + 1 < parts.len() && !metadata.is_dir() {
-            return Err(invalid("generation commit parent is not a directory"));
-        }
-        if index + 1 == parts.len() && !metadata.is_file() {
-            return Err(invalid("generation commit is not a regular file"));
-        }
-    }
-    Ok(Some(candidate))
-}
-
 fn validate_publication_root(root: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(root) {
         Ok(metadata) => {
@@ -291,26 +122,6 @@ pub(crate) fn ensure_legacy_publication_allowed(root: &Path) -> io::Result<()> {
 
 fn hash_file(path: &Path) -> io::Result<GenerationMember> {
     hash_file_with_budget(path, fs::metadata(path)?.len())
-}
-
-fn hash_file_with_budget(path: &Path, byte_budget: u64) -> io::Result<GenerationMember> {
-    let mut file = fs::File::open(path)?.take(byte_budget.saturating_add(1));
-    let mut hasher = Sha256::new();
-    let mut byte_length = 0u64;
-    let mut buffer = [0u8; 65536];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 { break; }
-        byte_length = byte_length.checked_add(count as u64)
-            .ok_or_else(|| invalid("generation member length overflow"))?;
-        if byte_length > byte_budget { return Err(invalid("generation member grew during hashing")); }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(GenerationMember { byte_length, sha256: format!("sha256:{:x}", hasher.finalize()) })
-}
-
-fn generation_id(body: &GenerationBody) -> io::Result<String> {
-    Ok(digest(&serde_json::to_vec(body)?))
 }
 
 /// Exclusive final publication. A crash leaves a lease for explicit recovery;
@@ -518,12 +329,11 @@ fn publish_immutable_prepared(
 ) -> io::Result<GenerationCommit> {
     let root = lease.validate_for(root)?;
     if marker_path_if_present(&root, IMMUTABLE_COMMIT_PATH)?.is_some() {
-        capture_from_marker(
-            &root,
-            IMMUTABLE_COMMIT_PATH,
-            IMMUTABLE_SCHEMA,
-            GenerationLayout::ImmutableV2,
-        )?;
+        let current = generation_core::capture(&root)?
+            .ok_or_else(|| invalid("immutable generation disappeared"))?;
+        if !current.is_immutable() {
+            return Err(invalid("v2 generation marker resolved to a mutable capture"));
+        }
     }
     lease.validate_for(&root)?;
     let generations_directory = ensure_directory_chain(&root, GENERATION_DIRECTORY)?;
@@ -584,153 +394,6 @@ fn publish_immutable_prepared(
         .map_err(invalid)?;
     Ok(commit)
 }
-fn capture_from_marker(
-    root: &Path,
-    relative: &str,
-    expected_schema: &str,
-    layout: GenerationLayout,
-) -> io::Result<GenerationCapture> {
-    let path = checked_path(root, relative)?;
-    if fs::metadata(&path)?.len() > MAX_COMMIT_BYTES {
-        return Err(invalid("generation commit exceeds control-plane bound"));
-    }
-    let mut bytes = Vec::new();
-    fs::File::open(path)?.take(MAX_COMMIT_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_COMMIT_BYTES {
-        return Err(invalid("oversize generation commit"));
-    }
-    let commit: GenerationCommit = serde_json::from_slice(&bytes)?;
-    if serde_json::to_vec_pretty(&commit)? != bytes {
-        return Err(invalid("generation commit is not canonical or has duplicate fields"));
-    }
-    if commit.content.schema_version != expected_schema
-        || commit.content.members.is_empty()
-        || generation_id(&commit.content)? != commit.generation_id
-        || !valid_digest(&commit.generation_id)
-        || commit.content.members.iter().any(|(path, member)| {
-            validate_member_path(path).is_err() || !valid_digest(&member.sha256)
-        })
-        || commit.content.producer.as_ref().is_some_and(|owner| {
-            [&owner.run_id, &owner.stage_id, &owner.stage_kind]
-                .iter()
-                .any(|value| value.trim().is_empty())
-        })
-    {
-        return Err(invalid("invalid generation commit"));
-    }
-    Ok(GenerationCapture {
-        commit,
-        commit_digest: digest(&bytes),
-        layout,
-    })
-}
-
-pub fn capture(root: &Path) -> io::Result<Option<GenerationCapture>> {
-    let canonical_root = match fs::canonicalize(root) {
-        Ok(root) => root,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if marker_path_if_present(&canonical_root, IMMUTABLE_COMMIT_PATH)?.is_some() {
-        return capture_from_marker(
-            &canonical_root,
-            IMMUTABLE_COMMIT_PATH,
-            IMMUTABLE_SCHEMA,
-            GenerationLayout::ImmutableV2,
-        ).map(Some);
-    }
-    if marker_path_if_present(&canonical_root, COMMIT_PATH)?.is_some() {
-        return capture_from_marker(
-            &canonical_root,
-            COMMIT_PATH,
-            SCHEMA,
-            GenerationLayout::MutableV1,
-        ).map(Some);
-    }
-    Ok(None)
-}
-impl GenerationCapture {
-    /// Whether this capture resolves members inside a content-addressed v2 generation.
-    pub fn is_immutable(&self) -> bool {
-        self.layout == GenerationLayout::ImmutableV2
-    }
-
-    fn checked_member_path(&self, root: &Path, relative: &str) -> io::Result<PathBuf> {
-        validate_member_path(relative)?;
-        match self.layout {
-            GenerationLayout::MutableV1 if self.commit.content.schema_version == SCHEMA => {
-                checked_path(root, relative)
-            }
-            GenerationLayout::ImmutableV2 if self.commit.content.schema_version == IMMUTABLE_SCHEMA => {
-                let generation_name = self.commit.generation_id.strip_prefix("sha256:")
-                    .filter(|value| valid_digest(&self.commit.generation_id) && value.len() == 64)
-                    .ok_or_else(|| invalid("immutable generation ID is invalid"))?;
-                let physical = format!("{GENERATION_DIRECTORY}/{generation_name}/{relative}");
-                checked_path(root, &physical)
-            }
-            _ => Err(invalid("generation capture layout does not match its schema")),
-        }
-    }
-    pub fn ensure_current(&self, root: &Path) -> io::Result<()> {
-        let current = capture(root)?.ok_or_else(|| invalid("generation commit disappeared"))?;
-        if current.commit_digest != self.commit_digest || current.commit != self.commit || current.layout != self.layout {
-            return Err(invalid("frequency-domain generation changed"));
-        }
-        Ok(())
-    }
-
-    /// Streaming membership check for metadata endpoints. This does not pin a
-    /// later data-plane request; that request must verify its own served bytes.
-    pub fn verify_member(&self, root: &Path, relative: &str) -> io::Result<GenerationMember> {
-        let expected = self.commit.content.members.get(relative)
-            .ok_or_else(|| invalid("artifact is not a member of the captured generation"))?;
-        let path = self.checked_member_path(root, relative)?;
-        if fs::metadata(&path)?.len() != expected.byte_length {
-            return Err(invalid("frequency-domain generation member length changed"));
-        }
-        let measured = hash_file_with_budget(&path, expected.byte_length)?;
-        if measured != *expected {
-            return Err(invalid("frequency-domain generation member changed"));
-        }
-        self.ensure_current(root)?;
-        Ok(measured)
-    }
-
-    /// Returns the very bytes whose membership was verified, not a second read.
-    pub fn read_member(&self, root: &Path, relative: &str) -> io::Result<Vec<u8>> {
-        let maximum = self.commit.content.members.get(relative)
-            .ok_or_else(|| invalid("artifact is not a member of the captured generation"))?.byte_length;
-        self.read_member_bounded(root, relative, maximum)
-    }
-
-    /// Reject oversized control-plane members before allocating their contents.
-    pub fn read_member_bounded(&self, root: &Path, relative: &str, maximum: u64) -> io::Result<Vec<u8>> {
-        let expected = self.commit.content.members.get(relative)
-            .ok_or_else(|| invalid("artifact is not a member of the captured generation"))?;
-        if expected.byte_length > maximum {
-            return Err(invalid("generation member exceeds reader byte budget"));
-        }
-        let path = self.checked_member_path(root, relative)?;
-        let file = fs::File::open(path)?;
-        if file.metadata()?.len() != expected.byte_length {
-            return Err(invalid("frequency-domain generation member length changed"));
-        }
-        let read_limit = expected.byte_length.checked_add(1)
-            .ok_or_else(|| invalid("generation member length cannot be bounded"))?;
-        let reserve = usize::try_from(read_limit)
-            .map_err(|_| invalid("generation member exceeds addressable memory"))?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(reserve)
-            .map_err(|error| invalid(format!("cannot allocate bounded generation member: {error}")))?;
-        file.take(read_limit).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 != expected.byte_length || digest(&bytes) != expected.sha256 {
-            return Err(invalid("frequency-domain generation member changed"));
-        }
-        self.ensure_current(root)?;
-        Ok(bytes)
-    }
-}
-
 #[cfg(test)]
 std::thread_local! {
     static FAIL_V2_BEFORE_MARKER: std::cell::Cell<bool> = std::cell::Cell::new(false);
@@ -757,30 +420,6 @@ mod tests {
         fs::write(root.join("eigen/spectrum.json"), b"one").unwrap();
         fs::write(root.join("eigen/dispersion.csv"), b"two").unwrap();
         publish(root, None, ["eigen/spectrum.json".into(), "eigen/dispersion.csv".into()]).unwrap();
-    }
-    #[test]
-    fn rust_python_utf8_generation_body_golden_digest_agrees() {
-        let body = GenerationBody {
-            schema_version: IMMUTABLE_SCHEMA.into(),
-            producer: Some(PublicationOwner {
-                run_id: "run-\u{00e9}".into(),
-                stage_id: "stage:\u{03b1}".into(),
-                stage_kind: "frequency_response".into(),
-            }),
-            members: BTreeMap::from([(
-                "response/\u{03bc}.json".into(),
-                GenerationMember {
-                    byte_length: 2,
-                    sha256: "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(),
-                },
-            )]),
-        };
-        // The same UTF-8 body and golden digest are consumed by the Python
-        // generation reader regression; this checks the actual Rust serializer.
-        assert_eq!(
-            generation_id(&body).unwrap(),
-            "sha256:cc306e3a05680ba1855960fb03b9104397067da5bf29eb2794f62201e297a2e6",
-        );
     }
 
     #[test]

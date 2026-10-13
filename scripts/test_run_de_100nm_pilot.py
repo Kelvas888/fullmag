@@ -15,6 +15,7 @@ import json
 import zipfile
 import yaml
 import run_de_100nm_pilot as pilot
+import frequency_domain_generation as generation_contract
 
 
 class _ComposeOverrideLoader(yaml.SafeLoader):
@@ -144,6 +145,78 @@ def _write_fms_fixture(
     }
 
 
+def _install_generation_marker(case, *, immutable):
+    case = Path(case)
+    schema = generation_contract.SCHEMA_V2 if immutable else generation_contract.SCHEMA_V1
+    members = {
+        "metadata.json": (case / "metadata.json").read_bytes(),
+        "eigen/dispersion.csv": (case / "eigen/dispersion.csv").read_bytes(),
+    }
+    content = {
+        "schema_version": schema,
+        "producer": {
+            "run_id": "run-1",
+            "stage_id": "archive-physical-layout",
+            "stage_kind": "test-fixture",
+        },
+        "members": {
+            relative: {
+                "byte_length": len(payload),
+                "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+            }
+            for relative, payload in sorted(members.items())
+        },
+    }
+    canonical = json.dumps(
+        content, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    generation_id = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    marker = json.dumps(
+        {"generation_id": generation_id, "content": content},
+        ensure_ascii=False, indent=2, allow_nan=False,
+    ).encode("utf-8")
+    if immutable:
+        member_root = case / "frequency_domain/generations" / generation_id[7:]
+        for relative, payload in members.items():
+            path = member_root.joinpath(*relative.split("/"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        old_generation = (
+            case / "frequency_domain/generations" / ("0" * 64) / "eigen/old.bin"
+        )
+        old_generation.parent.mkdir(parents=True, exist_ok=True)
+        old_generation.write_bytes(b"retained physical history")
+        marker_relative = generation_contract.IMMUTABLE_COMMIT_PATH
+    else:
+        (case / "physical-history.txt").write_bytes(b"retained physical history")
+        marker_relative = generation_contract.COMMIT_PATH
+    marker_path = case.joinpath(*marker_relative.split("/"))
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker)
+    return generation_id
+
+
+def _rewrite_fms_with_physical_case_tree(archive_path, case, *, run_id="run-1"):
+    archive_path = Path(archive_path)
+    case = Path(case)
+    artifact_prefix = f"runs/{run_id}/artifacts/"
+    replacement = archive_path.with_name(archive_path.stem + ".physical.fms")
+    with zipfile.ZipFile(archive_path, "r") as source, zipfile.ZipFile(
+        replacement, "w"
+    ) as target:
+        for info in source.infolist():
+            if info.filename.startswith(artifact_prefix):
+                continue
+            target.writestr(info, source.read(info))
+        for path in sorted(case.rglob("*")):
+            if path.is_dir():
+                continue
+            if pilot.managed._is_reparse(path):
+                raise AssertionError(f"fixture contains a link or reparse point: {path}")
+            target.write(path, artifact_prefix + path.relative_to(case).as_posix())
+    return replacement
+
+
 def _schur_action_fixture(*, status="measured"):
     diagnostic = {
         "schema_version": "floquet_schur_action_diagnostic.v1",
@@ -168,6 +241,18 @@ def _schur_action_fixture(*, status="measured"):
             **{name: 0.0 for name in pilot.SCHUR_ACTION_DIAGNOSTIC_DEFECT_FIELDS},
         })
     return diagnostic
+
+
+def _fake_runtime_artifact_resolver(output, case_name, model_sha256, *, metadata_bytes_loader):
+    case_dir = Path(output) / case_name
+    case_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = case_dir / "metadata.json"
+    if not metadata_path.exists():
+        metadata_path.write_text("{}", encoding="utf-8")
+    expected = metadata_path.read_bytes()
+    if metadata_bytes_loader(case_dir) != expected:
+        raise AssertionError("resolver did not receive the captured metadata bytes")
+    return case_dir, {"run_id": "test-runtime-run", "artifact_dir": str(case_dir)}
 
 
 class PilotTests(unittest.TestCase):
@@ -199,6 +284,7 @@ class PilotTests(unittest.TestCase):
             with patch.object(pilot.managed, "_run_request", return_value=request), \
                  patch.object(pilot.managed, "_compose_environment", return_value={}) as compose_env, \
                  patch.object(pilot.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(pilot, "resolve_runtime_artifact_root", side_effect=_fake_runtime_artifact_resolver), \
                  patch.object(pilot.managed, "_validate_case_artifacts", return_value={"case": "c1"}), \
                  patch("builtins.print"):
                 self.assertEqual(pilot.execute(context, root, ["docker"], "abc"), 0)
@@ -281,17 +367,22 @@ class PilotTests(unittest.TestCase):
             with patch.object(pilot.managed, "_run_request", return_value={"source": {}, "job": {}, "runtime": {}}), \
                  patch.object(pilot.managed, "_compose_environment", return_value={}), \
                  patch.object(pilot.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(pilot, "resolve_runtime_artifact_root", side_effect=_fake_runtime_artifact_resolver), \
                  patch.object(pilot.managed, "_validate_case_artifacts", return_value={}) as validate, \
                  patch.object(pilot, "validate_rows", return_value={"qualification": "NOT VERIFIED", "sample_count": 2}) as row_check, \
                  patch.object(pilot, "validate_smoke_potential_fields", return_value={"qualification": "NOT VERIFIED"}) as field_check, \
                  patch("builtins.print"):
                 self.assertEqual(pilot.execute(context, root, ["docker"], "abc", pilot="de-smoke-two"), 0)
-            validate.assert_called_once_with(root / "de-smoke-two", "c1")
+            validate.assert_called_once()
+            bundle_reader = validate.call_args.kwargs["bundle_reader"]
+            self.assertIs(row_check.call_args.kwargs["bundle_reader"], bundle_reader)
+            self.assertIs(field_check.call_args.kwargs["bundle_reader"], bundle_reader)
             row_check.assert_called_once_with(
                 root / "de-smoke-two/eigen/dispersion.csv", "two",
                 root / "de-smoke-two/eigen/diagnostics/solver.v1.json",
-                root / "de-smoke-two/metadata.json")
-            field_check.assert_called_once_with(root / "de-smoke-two", 2)
+                root / "de-smoke-two/metadata.json", bundle_reader=bundle_reader)
+            field_check.assert_called_once_with(
+                root / "de-smoke-two", 2, bundle_reader=bundle_reader)
             request = json.loads((root / "run-request.json").read_text())
             result = json.loads((root / "run-result.json").read_text())
             self.assertEqual(request["schema"], "fullmag.de-smoke.request.v1")
@@ -309,6 +400,7 @@ class PilotTests(unittest.TestCase):
             with patch.object(pilot.managed, "_run_request", return_value={"source": {}, "job": {}, "runtime": {}}), \
                  patch.object(pilot.managed, "_compose_environment", return_value={}), \
                  patch.object(pilot.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(pilot, "resolve_runtime_artifact_root", side_effect=_fake_runtime_artifact_resolver), \
                  patch.object(pilot.managed, "_validate_case_artifacts", return_value={}), \
                  patch.object(pilot, "validate_rows", side_effect=ValueError("missing DE-SMOKE samples")), \
                  patch("builtins.print"):
@@ -339,14 +431,51 @@ class PilotTests(unittest.TestCase):
             self.assertEqual(validate.call_count, 2)
             self.assertEqual(result["mode_count"], 2)
             self.assertEqual(result["qualification"], "NOT VERIFIED")
+
             (root / "eigen/mode_fields/sample_0001/mode_0000/vector.bin").unlink()
             with self.assertRaisesRegex(pilot.managed.BenchmarkError, "cover samples"):
                 pilot.validate_smoke_potential_fields(root, 2)
             (mode / "physical_potential.v1.json").unlink()
             with patch.object(pilot, "validate_physical_potential", return_value={
-                "status": "consistent", "reconstruction_agreement": True}):
+                    "status": "consistent", "reconstruction_agreement": True}):
                 with self.assertRaises(pilot.managed.BenchmarkError):
                     pilot.validate_smoke_potential_fields(root, 2)
+
+    def test_potential_reconstruction_uses_captured_generation_inventory_without_aliases(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "generation-only"
+            root.mkdir()
+            members = {
+                "metadata.json",
+                "eigen/mode_fields/sample_0000/mode_0000/vector.bin",
+                "eigen/mode_fields/sample_0000/mode_0000/physical_potential.v1.json",
+                "eigen/modes/sample_0000/mode_0000.json",
+            }
+
+            class CapturedReader:
+                def __init__(self):
+                    self.root = root
+                    self.generation = object()
+
+                def iter_members(self, prefix):
+                    return tuple(sorted(
+                        relative for relative in members
+                        if relative == prefix or relative.startswith(prefix + "/")
+                    ))
+
+                def has_member(self, relative):
+                    return relative in members
+
+            reader = CapturedReader()
+            with patch.object(pilot, "validate_physical_potential", return_value={
+                    "status": "consistent", "reconstruction_agreement": True,
+                    "identity_binding": {"status": "consistent"},
+                    "source_mesh_binding": {"status": "consistent"}}) as validate:
+                report = pilot.validate_smoke_potential_fields(
+                    root, 1, bundle_reader=reader)
+            self.assertEqual(report["mode_count"], 1)
+            validate.assert_called_once()
+            self.assertIs(validate.call_args.kwargs["bundle_reader"], reader)
 
     def test_potential_reconstruction_rejects_missing_mode_in_same_sample(self):
         with TemporaryDirectory() as tmp:
@@ -416,6 +545,7 @@ class PilotTests(unittest.TestCase):
             with patch.object(pilot.managed, "_run_request", return_value={"source": {}, "job": {}, "runtime": {}}), \
                  patch.object(pilot.managed, "_compose_environment", return_value={}), \
                  patch.object(pilot.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(pilot, "resolve_runtime_artifact_root", side_effect=_fake_runtime_artifact_resolver), \
                  patch.object(pilot.managed, "_validate_case_artifacts", return_value={}), \
                  patch.object(pilot, "validate_rows", return_value={"sample_count": 2}), \
                  patch.object(pilot, "validate_smoke_potential_fields", side_effect=ValueError("gradient mismatch")), \
@@ -603,6 +733,7 @@ class PilotTests(unittest.TestCase):
             with patch.object(pilot.managed, "_run_request", return_value=request), \
                  patch.object(pilot.managed, "_compose_environment", return_value={}), \
                  patch.object(pilot.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(pilot, "resolve_runtime_artifact_root", side_effect=_fake_runtime_artifact_resolver), \
                  patch.object(pilot.managed, "_validate_case_artifacts", return_value={}), \
                  patch.object(pilot, "validate_rows", return_value={"sample_count": 1}), \
                  patch.object(pilot, "validate_smoke_potential_fields", return_value={}), \
@@ -790,6 +921,139 @@ class PilotTests(unittest.TestCase):
             self.assertEqual(report["run_id"], "run-1")
             self.assertTrue(report["status_scope_stable"])
 
+    def test_fms_archive_rejects_oversized_entry_before_testzip_or_read(self):
+        class FakeInfo:
+            def __init__(self, filename, file_size):
+                self.filename = filename
+                self.file_size = file_size
+
+            @staticmethod
+            def is_dir():
+                return False
+
+        class OversizedArchive:
+            def __init__(self, infos):
+                self.infos = infos
+                self.testzip_calls = 0
+                self.read_calls = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def infolist(self):
+                return self.infos
+
+            def testzip(self):
+                self.testzip_calls += 1
+                return None
+
+            def read(self, *_args):
+                self.read_calls += 1
+                return b"oversized"
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "oversized.fms"
+            path.write_bytes(b"not parsed by the fake archive")
+            cases = (
+                ([FakeInfo("project/main.py", 2)], 10, 1, 10, "byte budget"),
+                ([FakeInfo("a", 0), FakeInfo("b", 0)], 1, 10, 10, "entry-count"),
+                ([FakeInfo("a", 1), FakeInfo("b", 1)], 10, 10, 1, "uncompressed byte"),
+            )
+            for infos, entry_limit, file_limit, total_limit, message in cases:
+                with self.subTest(message=message):
+                    archive = OversizedArchive(infos)
+                    with patch.object(pilot.zipfile, "ZipFile", return_value=archive), \
+                         patch.object(pilot, "MAX_FMS_ARCHIVE_ENTRIES", entry_limit), \
+                         patch.object(pilot, "MAX_FMS_ARCHIVE_ENTRY_BYTES", file_limit), \
+                         patch.object(pilot, "MAX_FMS_ARCHIVE_TOTAL_BYTES", total_limit):
+                        with self.assertRaisesRegex(pilot.managed.BenchmarkError, message):
+                            pilot.validate_fms_archive(path)
+                    self.assertEqual(archive.testzip_calls, 0)
+                    self.assertEqual(archive.read_calls, 0)
+
+    def test_fms_archive_binds_physical_generation_layout_for_v1_and_v2(self):
+        for immutable, expected_unbound in ((False, 1), (True, 3)):
+            with self.subTest(schema="v2" if immutable else "v1"), TemporaryDirectory() as tmp:
+                archive_path, case, receipt = _write_fms_fixture(Path(tmp))
+                generation_id = _install_generation_marker(case, immutable=immutable)
+                archive_path = _rewrite_fms_with_physical_case_tree(archive_path, case)
+                reader = pilot.ArtifactBundleReader(case)
+                report = pilot.validate_fms_archive(
+                    archive_path, status_receipt=receipt, case_dir=case,
+                    solver_exit_code=0, bundle_reader=reader,
+                )
+                layout = report["artifact_layout_binding"]
+                self.assertEqual(layout["scope"], "exact_physical_export_tree")
+                self.assertEqual(layout["generation_id"], generation_id)
+                self.assertEqual(layout["captured_member_count"], 2)
+                self.assertEqual(
+                    layout["captured_member_paths"],
+                    ["eigen/dispersion.csv", "metadata.json"],
+                )
+                self.assertEqual(layout["other_physical_entry_count"], expected_unbound)
+                self.assertEqual(layout["current_fence_status"], "current")
+                artifact_names = set(report["artifact_sha256"])
+                marker_relative = (
+                    generation_contract.IMMUTABLE_COMMIT_PATH
+                    if immutable else generation_contract.COMMIT_PATH
+                )
+                self.assertIn(
+                    f"runs/run-1/artifacts/{marker_relative}", artifact_names
+                )
+                if immutable:
+                    physical_member = (
+                        f"runs/run-1/artifacts/frequency_domain/generations/"
+                        f"{generation_id[7:]}/eigen/dispersion.csv"
+                    )
+                    self.assertIn(physical_member, artifact_names)
+                    self.assertIn(
+                        "runs/run-1/artifacts/eigen/dispersion.csv", artifact_names
+                    )
+                    self.assertEqual(
+                        layout["other_physical_paths"],
+                        [
+                            "eigen/dispersion.csv",
+                            "frequency_domain/generations/" + "0" * 64 + "/eigen/old.bin",
+                            "metadata.json",
+                        ],
+                    )
+                else:
+                    self.assertEqual(layout["other_physical_paths"], ["physical-history.txt"])
+
+    def test_fms_archive_rejects_changed_physical_alias_and_generation_marker(self):
+        with TemporaryDirectory() as tmp:
+            archive_path, case, receipt = _write_fms_fixture(Path(tmp))
+            _install_generation_marker(case, immutable=True)
+            archive_path = _rewrite_fms_with_physical_case_tree(archive_path, case)
+            reader = pilot.ArtifactBundleReader(case)
+            (case / "metadata.json").write_bytes(b"changed unbound alias")
+            with self.assertRaisesRegex(pilot.managed.BenchmarkError, "artifact hash"):
+                pilot.validate_fms_archive(
+                    archive_path, status_receipt=receipt, case_dir=case,
+                    solver_exit_code=0, bundle_reader=reader,
+                )
+
+        for immutable in (False, True):
+            with self.subTest(schema="v2" if immutable else "v1"), TemporaryDirectory() as tmp:
+                archive_path, case, receipt = _write_fms_fixture(Path(tmp))
+                _install_generation_marker(case, immutable=immutable)
+                archive_path = _rewrite_fms_with_physical_case_tree(archive_path, case)
+                reader = pilot.ArtifactBundleReader(case)
+                marker_relative = (
+                    generation_contract.IMMUTABLE_COMMIT_PATH
+                    if immutable else generation_contract.COMMIT_PATH
+                )
+                marker_path = case.joinpath(*marker_relative.split("/"))
+                marker_path.write_bytes(marker_path.read_bytes() + b" ")
+                with self.assertRaisesRegex(pilot.managed.BenchmarkError, "marker changed"):
+                    pilot.validate_fms_archive(
+                        archive_path, status_receipt=receipt, case_dir=case,
+                        solver_exit_code=0, bundle_reader=reader,
+                    )
+
     def test_fms_archive_requires_the_complete_api_export_layout(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -952,6 +1216,35 @@ class PilotTests(unittest.TestCase):
                 pilot.bind_parallel_report(case, artifacts, expected_policy={**_policy(), "max_cpu_percent": 80}, expected_indices=range(3))
             with self.assertRaises(pilot.managed.BenchmarkError):
                 pilot.bind_parallel_report(case, artifacts, expected_policy=_policy(), expected_indices=range(1, 4))
+
+    def test_adaptive_report_binding_uses_captured_bytes_instead_of_root_alias(self):
+        from test_validate_parallel_execution_report import _adaptive_report, _policy
+        with TemporaryDirectory() as temporary:
+            case = Path(temporary)
+            case.mkdir(exist_ok=True)
+            path = case / "eigen/parallel_execution.v1.json"
+            path.parent.mkdir(parents=True)
+            captured = json.dumps(_adaptive_report()["report"]).encode()
+            path.write_bytes(captured)
+
+            class CapturedReader:
+                def __init__(self):
+                    self.root = case
+
+                def read_bytes(self, relative, *, maximum_bytes=None):
+                    if relative != "eigen/parallel_execution.v1.json" or maximum_bytes is None:
+                        raise ValueError("unexpected report read")
+                    return captured
+
+            reader = CapturedReader()
+            path.write_text("{stale alias", encoding="utf-8")
+            artifacts = {"required_artifact_hashes": {}}
+            pilot.bind_parallel_report(
+                case, artifacts, expected_policy=_policy(), expected_indices=range(3),
+                bundle_reader=reader)
+            entry = artifacts["required_artifact_hashes"]["eigen/parallel_execution.v1.json"]
+            self.assertEqual(entry["size"], len(captured))
+            self.assertEqual(entry["sha256"], hashlib.sha256(captured).hexdigest())
 
     def test_signed_fifteen_preserves_actual_model_commit_identity(self):
         identity = {"kind": "versioned_standalone_input", "commit": "a" * 40, "sha256": "b" * 64}

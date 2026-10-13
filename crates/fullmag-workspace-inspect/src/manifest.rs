@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use fullmag_session::frequency_domain_artifact_generation::{capture as capture_generation, GenerationCapture};
 
 /// File name of the manifest inside a results folder.
 pub const RUN_MANIFEST_FILE: &str = "fullmag-run.json";
@@ -48,6 +49,19 @@ struct RunArtifactAttestation {
     manifest_sha256: String,
 }
 
+struct ArtifactAttestationCandidate {
+    bytes: Vec<u8>,
+    generation_fence: Option<(PathBuf, GenerationCapture)>,
+}
+
+impl ArtifactAttestationCandidate {
+    fn ensure_generation_current(&self) -> io::Result<()> {
+        if let Some((root, generation)) = &self.generation_fence {
+            generation.ensure_current(root)?;
+        }
+        Ok(())
+    }
+}
 struct RunManifestWriterGate {
     _file: File,
 }
@@ -349,16 +363,26 @@ pub fn write_run_manifest(results_dir: &Path, manifest: &RunManifest) -> std::io
     } else {
         None
     };
-    if let Some(attestation) = attestation.as_deref() {
-        publish_attestation_once(&results_dir, attestation)?;
+    if let Some(attestation) = attestation.as_ref() {
+        attestation.ensure_generation_current()?;
+        publish_attestation_once(&results_dir, &attestation.bytes)?;
     }
 
     match existing.as_deref() {
-        Some(previous) => replace_running_manifest(&results_dir, previous, &bytes),
-        None => publish_new_file(&results_dir, RUN_MANIFEST_FILE, &bytes),
+        Some(previous) => replace_running_manifest(
+            &results_dir,
+            previous,
+            &bytes,
+            attestation.as_ref(),
+        ),
+        None => publish_new_file_with_generation_fence(
+            &results_dir,
+            RUN_MANIFEST_FILE,
+            &bytes,
+            attestation.as_ref(),
+        ),
     }
 }
-
 fn is_attestation_eligible(manifest: &RunManifest) -> bool {
     manifest.schema == RUN_MANIFEST_SCHEMA
         && manifest.status == "completed"
@@ -396,9 +420,39 @@ fn build_artifact_attestation(
     results_dir: &Path,
     manifest: &RunManifest,
     manifest_bytes: &[u8],
-) -> io::Result<Vec<u8>> {
-    let metadata_path = results_dir.join(METADATA_RELATIVE_PATH);
-    let metadata_bytes = read_bounded_regular_file(&metadata_path, MAX_METADATA_ARTIFACT_BYTES)?;
+) -> io::Result<ArtifactAttestationCandidate> {
+    let artifacts_root = results_dir.join("artifacts");
+    let (metadata_bytes, generation_fence) = match capture_generation(&artifacts_root)? {
+        Some(generation) => {
+            let producer = generation.commit.content.producer.as_ref();
+            if generation.is_immutable() && producer.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "immutable frequency-domain generation has no producer owner",
+                ));
+            }
+            if producer.is_some_and(|owner| owner.run_id.as_str() != manifest.run_id.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frequency-domain generation producer run does not match run manifest",
+                ));
+            }
+            let bytes = generation.read_member_bounded(
+                &artifacts_root,
+                "metadata.json",
+                MAX_METADATA_ARTIFACT_BYTES,
+            )?;
+            (bytes, Some((artifacts_root, generation)))
+        }
+        None => {
+            let metadata_path = results_dir.join(METADATA_RELATIVE_PATH);
+            (
+                read_bounded_regular_file(&metadata_path, MAX_METADATA_ARTIFACT_BYTES)?,
+                None,
+            )
+        }
+    };
+
     let source_sha256 = manifest.source.sha256.as_deref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -419,10 +473,13 @@ fn build_artifact_attestation(
         metadata_sha256: sha256_hex(&metadata_bytes),
         manifest_sha256: sha256_hex(manifest_bytes),
     };
-    serde_json::to_vec_pretty(&attestation)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let bytes = serde_json::to_vec_pretty(&attestation)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(ArtifactAttestationCandidate {
+        bytes,
+        generation_fence,
+    })
 }
-
 fn verify_terminal_retry(
     results_dir: &Path,
     manifest: &RunManifest,
@@ -430,6 +487,7 @@ fn verify_terminal_retry(
 ) -> io::Result<()> {
     if is_attestation_eligible(manifest) {
         let expected = build_artifact_attestation(results_dir, manifest, manifest_bytes)?;
+        expected.ensure_generation_current()?;
         let path = results_dir.join(RUN_ARTIFACT_ATTESTATION_FILE);
         let existing = read_optional_bounded_file(&path, MAX_RUN_ARTIFACT_ATTESTATION_BYTES)?
             .ok_or_else(|| {
@@ -438,16 +496,16 @@ fn verify_terminal_retry(
                     "refusing to backfill an attestation for an already-terminal legacy run",
                 )
             })?;
-        if existing != expected {
+        if existing != expected.bytes {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "terminal run manifest or metadata differs from its producer attestation",
             ));
         }
+        expected.ensure_generation_current()?;
     }
     Ok(())
 }
-
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -697,10 +755,28 @@ fn write_temporary(results_dir: &Path, target_name: &str, bytes: &[u8]) -> io::R
 }
 
 fn publish_new_file(results_dir: &Path, target_name: &str, bytes: &[u8]) -> io::Result<()> {
+    publish_new_file_with_generation_fence(results_dir, target_name, bytes, None)
+}
+
+fn publish_new_file_with_generation_fence(
+    results_dir: &Path,
+    target_name: &str,
+    bytes: &[u8],
+    generation_fence: Option<&ArtifactAttestationCandidate>,
+) -> io::Result<()> {
+    if let Some(candidate) = generation_fence {
+        candidate.ensure_generation_current()?;
+    }
     let temporary = write_temporary(results_dir, target_name, bytes)?;
     let target = results_dir.join(target_name);
     verify_file_contents(&temporary, bytes)?;
     reject_reparse_ancestors(&target)?;
+    if let Some(candidate) = generation_fence {
+        if let Err(error) = candidate.ensure_generation_current() {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    }
     if let Err(error) = fs::hard_link(&temporary, &target) {
         if verify_file_contents(&temporary, bytes).is_ok() {
             let _ = fs::remove_file(&temporary);
@@ -712,7 +788,6 @@ fn publish_new_file(results_dir: &Path, target_name: &str, bytes: &[u8]) -> io::
     fs::remove_file(&temporary)?;
     sync_directory(results_dir)
 }
-
 fn verify_file_contents(path: &Path, expected: &[u8]) -> io::Result<()> {
     let observed = read_bounded_regular_file(path, expected.len() as u64)?;
     if observed != expected {
@@ -742,7 +817,11 @@ fn replace_running_manifest(
     results_dir: &Path,
     previous_bytes: &[u8],
     bytes: &[u8],
+    generation_fence: Option<&ArtifactAttestationCandidate>,
 ) -> io::Result<()> {
+    if let Some(candidate) = generation_fence {
+        candidate.ensure_generation_current()?;
+    }
     let path = manifest_path(results_dir);
     let current = read_optional_bounded_file(&path, MAX_RUN_MANIFEST_BYTES)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "running run manifest disappeared")
@@ -766,12 +845,17 @@ fn replace_running_manifest(
     }
     reject_reparse_ancestors(&path)?;
     reject_reparse_ancestors(&temporary)?;
+    if let Some(candidate) = generation_fence {
+        if let Err(error) = candidate.ensure_generation_current() {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    }
     fs::rename(&temporary, &path)?;
     reject_reparse_ancestors(&path)?;
     verify_file_contents(&path, bytes)?;
     sync_directory(results_dir)
 }
-
 fn sync_directory(directory: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -921,6 +1005,68 @@ mod tests {
         std::fs::write(root.join(METADATA_RELATIVE_PATH), bytes).unwrap();
     }
 
+    fn write_generation(
+        artifacts_root: &Path,
+        immutable: bool,
+        member_path: &str,
+        member_bytes: &[u8],
+        producer: Option<fullmag_session::frequency_domain_artifact_generation::PublicationOwner>,
+    ) -> PathBuf {
+        use fullmag_session::frequency_domain_artifact_generation as generation;
+
+        let members = [(
+            member_path.to_string(),
+            generation::GenerationMember {
+                byte_length: member_bytes.len() as u64,
+                sha256: generation::digest(member_bytes),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let content = generation::GenerationBody {
+            schema_version: if immutable {
+                generation::IMMUTABLE_SCHEMA.into()
+            } else {
+                generation::SCHEMA.into()
+            },
+            producer,
+            members,
+        };
+        let generation_id = generation::generation_id(&content).unwrap();
+        let commit = generation::GenerationCommit {
+            generation_id: generation_id.clone(),
+            content,
+        };
+
+        let destination = if immutable {
+            artifacts_root
+                .join(generation::GENERATION_DIRECTORY)
+                .join(generation_id.strip_prefix("sha256:").unwrap())
+                .join(member_path)
+        } else {
+            artifacts_root.join(member_path)
+        };
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(destination, member_bytes).unwrap();
+
+        let marker = if immutable {
+            artifacts_root.join(generation::IMMUTABLE_COMMIT_PATH)
+        } else {
+            artifacts_root.join(generation::COMMIT_PATH)
+        };
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, serde_json::to_vec_pretty(&commit).unwrap()).unwrap();
+        marker
+    }
+
+    fn write_running_manifest(dir: &Path, terminal: &RunManifest) -> Vec<u8> {
+        let mut running = terminal.clone();
+        running.status = "running".into();
+        running.exit_code = None;
+        running.finished_at = None;
+        write_run_manifest(dir, &running).unwrap();
+        std::fs::read(manifest_path(dir)).unwrap()
+    }
     struct GateChild(Child);
 
     impl GateChild {
@@ -1076,14 +1222,14 @@ mod tests {
 
         // Model process exit after the stamp was durably published but before
         // the terminal manifest replaced its running predecessor.
-        publish_attestation_once(dir.path(), &candidate).unwrap();
+        publish_attestation_once(dir.path(), &candidate.bytes).unwrap();
         assert_eq!(
             std::fs::read(manifest_path(dir.path())).unwrap(),
             running_bytes
         );
         write_run_manifest(dir.path(), &terminal).unwrap();
         let first_stamp = std::fs::read(dir.path().join(RUN_ARTIFACT_ATTESTATION_FILE)).unwrap();
-        assert_eq!(first_stamp, candidate);
+        assert_eq!(first_stamp, candidate.bytes);
 
         write_run_manifest(dir.path(), &terminal).unwrap();
         assert_eq!(
@@ -1138,6 +1284,165 @@ mod tests {
         assert_eq!(std::fs::read(attestation_path).unwrap(), attestation_bytes);
     }
 
+    #[test]
+    fn generation_v1_metadata_is_read_from_its_captured_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = successful_sample();
+        let metadata = br#"{"generation":"v1"}"#;
+        write_generation(
+            &dir.path().join("artifacts"),
+            false,
+            "metadata.json",
+            metadata,
+            None,
+        );
+
+        write_run_manifest(dir.path(), &manifest).unwrap();
+
+        let attestation: RunArtifactAttestation = serde_json::from_slice(
+            &std::fs::read(dir.path().join(RUN_ARTIFACT_ATTESTATION_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attestation.metadata_relative_path, METADATA_RELATIVE_PATH);
+        assert_eq!(attestation.metadata_sha256, sha256_hex(metadata));
+    }
+
+    #[test]
+    fn generation_v2_attestation_uses_member_bytes_and_preserves_root_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = successful_sample();
+        let captured = br#"{"generation":"immutable"}"#;
+        let sentinel = b"mutable root metadata sentinel";
+        write_metadata(dir.path(), sentinel);
+        write_generation(
+            &dir.path().join("artifacts"),
+            true,
+            "metadata.json",
+            captured,
+            Some(fullmag_session::frequency_domain_artifact_generation::PublicationOwner {
+                run_id: manifest.run_id.clone(),
+                stage_id: "stage-1".into(),
+                stage_kind: "frequency_domain".into(),
+            }),
+        );
+
+        write_run_manifest(dir.path(), &manifest).unwrap();
+
+        let attestation: RunArtifactAttestation = serde_json::from_slice(
+            &std::fs::read(dir.path().join(RUN_ARTIFACT_ATTESTATION_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attestation.metadata_relative_path, METADATA_RELATIVE_PATH);
+        assert_eq!(attestation.metadata_sha256, sha256_hex(captured));
+        assert_ne!(attestation.metadata_sha256, sha256_hex(sentinel));
+        assert_eq!(std::fs::read(dir.path().join(METADATA_RELATIVE_PATH)).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn immutable_generation_without_or_with_foreign_owner_fails_closed() {
+        for producer in [
+            None,
+            Some(fullmag_session::frequency_domain_artifact_generation::PublicationOwner {
+                run_id: "different-run".into(),
+                stage_id: "stage-1".into(),
+                stage_kind: "frequency_domain".into(),
+            }),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let terminal = successful_sample();
+            let running_bytes = write_running_manifest(dir.path(), &terminal);
+            write_metadata(dir.path(), b"must not be used as fallback");
+            write_generation(
+                &dir.path().join("artifacts"),
+                true,
+                "metadata.json",
+                b"captured metadata",
+                producer,
+            );
+
+            assert!(write_run_manifest(dir.path(), &terminal).is_err());
+            assert_eq!(
+                std::fs::read(manifest_path(dir.path())).unwrap(),
+                running_bytes
+            );
+            assert!(!dir.path().join(RUN_ARTIFACT_ATTESTATION_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn immutable_missing_member_and_corrupt_pointer_never_fall_back_to_root_metadata() {
+        let missing_dir = tempfile::tempdir().unwrap();
+        let terminal = successful_sample();
+        let missing_running = write_running_manifest(missing_dir.path(), &terminal);
+        write_metadata(missing_dir.path(), b"must not be used as fallback");
+        write_generation(
+            &missing_dir.path().join("artifacts"),
+            true,
+            "other.json",
+            b"other captured member",
+            Some(fullmag_session::frequency_domain_artifact_generation::PublicationOwner {
+                run_id: terminal.run_id.clone(),
+                stage_id: "stage-1".into(),
+                stage_kind: "frequency_domain".into(),
+            }),
+        );
+
+        assert!(write_run_manifest(missing_dir.path(), &terminal).is_err());
+        assert_eq!(
+            std::fs::read(manifest_path(missing_dir.path())).unwrap(),
+            missing_running
+        );
+        assert!(!missing_dir.path().join(RUN_ARTIFACT_ATTESTATION_FILE).exists());
+
+        let corrupt_dir = tempfile::tempdir().unwrap();
+        let corrupt_running = write_running_manifest(corrupt_dir.path(), &terminal);
+        write_metadata(corrupt_dir.path(), b"must not be used as fallback");
+        let marker = corrupt_dir
+            .path()
+            .join("artifacts")
+            .join(fullmag_session::frequency_domain_artifact_generation::IMMUTABLE_COMMIT_PATH);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"{corrupt marker").unwrap();
+
+        assert!(write_run_manifest(corrupt_dir.path(), &terminal).is_err());
+        assert_eq!(
+            std::fs::read(manifest_path(corrupt_dir.path())).unwrap(),
+            corrupt_running
+        );
+        assert!(!corrupt_dir.path().join(RUN_ARTIFACT_ATTESTATION_FILE).exists());
+    }
+
+    #[test]
+    fn generation_change_between_capture_and_terminal_publication_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = successful_sample();
+        let running_bytes = write_running_manifest(dir.path(), &terminal);
+        let artifacts_root = dir.path().join("artifacts");
+        let owner = || {
+            Some(fullmag_session::frequency_domain_artifact_generation::PublicationOwner {
+                run_id: terminal.run_id.clone(),
+                stage_id: "stage-1".into(),
+                stage_kind: "frequency_domain".into(),
+            })
+        };
+        write_generation(&artifacts_root, true, "metadata.json", b"generation one", owner());
+        let terminal_bytes = serde_json::to_vec_pretty(&terminal).unwrap();
+        let candidate =
+            build_artifact_attestation(dir.path(), &terminal, &terminal_bytes).unwrap();
+        candidate.ensure_generation_current().unwrap();
+
+        write_generation(&artifacts_root, true, "metadata.json", b"generation two", owner());
+
+        assert!(replace_running_manifest(
+            dir.path(),
+            &running_bytes,
+            &terminal_bytes,
+            Some(&candidate),
+        )
+        .is_err());
+        assert_eq!(std::fs::read(manifest_path(dir.path())).unwrap(), running_bytes);
+        assert!(!dir.path().join(RUN_ARTIFACT_ATTESTATION_FILE).exists());
+    }
     #[test]
     fn eligible_attestation_read_failure_preserves_running_manifest_for_retry() {
         let fresh = tempfile::tempdir().unwrap();

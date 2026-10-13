@@ -48,7 +48,7 @@ def _walk_error(error):
     raise ValueError("state closure directory could not be fully enumerated") from error
 
 
-def collect_signed_state_closure(case: Path) -> dict[str, Any]:
+def collect_signed_state_closure(case: Path, *, bundle_reader=None) -> dict[str, Any]:
     """Collect every exported file in the state trees with bounded, strict paths.
 
     Native content digests are retained as declared identities; this function
@@ -57,61 +57,83 @@ def collect_signed_state_closure(case: Path) -> dict[str, Any]:
     """
     case = Path(case)
     _regular(case, True)
-    roots = [case / "eigen" / "metadata"]
-    _regular(case / "eigen", True)
-    _regular(roots[0], True)
-    equilibrium = case / "equilibrium"
-    try:
-        equilibrium.lstat()
-    except FileNotFoundError:
-        pass
+    generation = None if bundle_reader is None else getattr(bundle_reader, "generation", None)
+    if bundle_reader is not None:
+        reader_root = getattr(bundle_reader, "root", None)
+        if not isinstance(reader_root, Path) or case.absolute() != reader_root.absolute():
+            raise ValueError("state closure bundle reader belongs to another artifact root")
+    captured_names = None
+    if generation is not None:
+        captured_names = tuple(sorted(set(
+            bundle_reader.iter_members("eigen/metadata")
+            + bundle_reader.iter_members("equilibrium")
+        )))
+        candidates = [(name, generation.members[name].byte_length) for name in captured_names]
     else:
-        _regular(equilibrium, True)
-        roots.append(equilibrium)
+        roots = [case / "eigen" / "metadata"]
+        _regular(case / "eigen", True)
+        _regular(roots[0], True)
+        equilibrium = case / "equilibrium"
+        try:
+            equilibrium.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            _regular(equilibrium, True)
+            roots.append(equilibrium)
+        candidates = []
+        for root in roots:
+            for current, directories, files in os.walk(root, followlinks=False, onerror=_walk_error):
+                current = Path(current)
+                _regular(current, True)
+                for name in directories:
+                    _regular(current / name, True)
+                for name in sorted(files):
+                    path = current / name
+                    info = _regular(path, False)
+                    candidates.append((path.relative_to(case).as_posix(), info.st_size))
     entries = []
     total = 0
-    for root in roots:
-        for current, directories, files in os.walk(root, followlinks=False, onerror=_walk_error):
-            current = Path(current)
-            _regular(current, True)
-            for name in directories:
-                _regular(current / name, True)
-            for name in sorted(files):
-                path = current / name
-                info = _regular(path, False)
-                total += info.st_size
-                if len(entries) >= MAX_FILES or total > MAX_TOTAL_BYTES:
-                    raise ValueError("state closure exceeds bounded file/byte budget")
-                if name in STATE_SCHEMAS and (info.st_size == 0 or info.st_size > MAX_STATE_JSON_BYTES):
-                    raise ValueError("state sidecar JSON is empty or oversized")
-                digest = hashlib.sha256()
-                state_bytes = bytearray() if name in STATE_SCHEMAS else None
-                read_bytes = 0
-                with path.open("rb") as stream:
-                    for chunk in iter(lambda: stream.read(1024**2), b""):
-                        read_bytes += len(chunk)
-                        if read_bytes > info.st_size:
-                            raise ValueError("state sidecar grew during binding")
-                        digest.update(chunk)
-                        if state_bytes is not None:
-                            state_bytes.extend(chunk)
-                            if len(state_bytes) > MAX_STATE_JSON_BYTES:
-                                raise ValueError("state sidecar grew beyond bounded JSON size")
-                entry = {"path": path.relative_to(case).as_posix(),
-                         "size": info.st_size, "sha256": digest.hexdigest()}
-                if name in STATE_SCHEMAS:
-                    value = json.loads(state_bytes.decode("utf-8"),
-                                       object_pairs_hook=_pairs, parse_constant=_nonfinite)
-                    if not isinstance(value, dict) or value.get("schema_version") != STATE_SCHEMAS[name]:
-                        raise ValueError("state sidecar has an unexpected schema")
-                    content = value.get("content_sha256")
-                    if not isinstance(content, str) or CONTENT_SHA.fullmatch(content) is None:
-                        raise ValueError("state sidecar has no native content identity")
-                    entry.update(schema_version=STATE_SCHEMAS[name], native_content_sha256=content)
-                after = _regular(path, False)
-                if (after.st_size, after.st_mtime_ns, after.st_ino) != (info.st_size, info.st_mtime_ns, info.st_ino):
-                    raise ValueError("state sidecar changed during binding")
-                entries.append(entry)
+    for relative, expected_size in candidates:
+        if len(entries) >= MAX_FILES or expected_size < 0 or total + expected_size > MAX_TOTAL_BYTES:
+            raise ValueError("state closure exceeds bounded file/byte budget")
+        name = Path(relative).name
+        if name in STATE_SCHEMAS and (expected_size == 0 or expected_size > MAX_STATE_JSON_BYTES):
+            raise ValueError("state sidecar JSON is empty or oversized")
+        if bundle_reader is None:
+            path = case / Path(relative)
+            before = _regular(path, False)
+            if before.st_size != expected_size:
+                raise ValueError("state sidecar changed size during binding")
+            with path.open("rb") as stream:
+                payload = stream.read(min(expected_size, MAX_TOTAL_BYTES - total) + 1)
+            if len(payload) > min(expected_size, MAX_TOTAL_BYTES - total):
+                raise ValueError("state sidecar grew beyond its bounded size")
+            after = _regular(path, False)
+            if (after.st_size, after.st_mtime_ns, after.st_ino) != (
+                before.st_size, before.st_mtime_ns, before.st_ino
+            ):
+                raise ValueError("state sidecar changed during binding")
+        else:
+            payload = bundle_reader.read_bytes(
+                relative,
+                maximum_bytes=expected_size,
+            )
+        if len(payload) != expected_size:
+            raise ValueError("state sidecar length changed during binding")
+        total += len(payload)
+        entry = {"path": relative, "size": len(payload),
+                 "sha256": hashlib.sha256(payload).hexdigest()}
+        if name in STATE_SCHEMAS:
+            value = json.loads(payload.decode("utf-8"),
+                               object_pairs_hook=_pairs, parse_constant=_nonfinite)
+            if not isinstance(value, dict) or value.get("schema_version") != STATE_SCHEMAS[name]:
+                raise ValueError("state sidecar has an unexpected schema")
+            content = value.get("content_sha256")
+            if not isinstance(content, str) or CONTENT_SHA.fullmatch(content) is None:
+                raise ValueError("state sidecar has no native content identity")
+            entry.update(schema_version=STATE_SCHEMAS[name], native_content_sha256=content)
+        entries.append(entry)
     entries.sort(key=lambda entry: entry["path"])
     if not any(entry.get("schema_version", "").startswith("equilibrium_artifact.") for entry in entries):
         raise ValueError("state closure has no exported equilibrium artifact")
@@ -122,9 +144,9 @@ def collect_signed_state_closure(case: Path) -> dict[str, Any]:
             "producer_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
 
 
-def bind_signed_state_closure(case: Path, artifacts: dict[str, Any]) -> None:
+def bind_signed_state_closure(case: Path, artifacts: dict[str, Any], *, bundle_reader=None) -> None:
     """Extend the receipt only after the entire closure passed path/hash checks."""
-    closure = collect_signed_state_closure(case)
+    closure = collect_signed_state_closure(case, bundle_reader=bundle_reader)
     required = dict(artifacts["required_artifact_hashes"])
     for entry in closure["files"]:
         binding = {"size": entry["size"], "sha256": entry["sha256"]}

@@ -20,13 +20,16 @@ import sys
 import time
 import zipfile
 
+from comsol_modal_field_certificate import ArtifactBundleReader
 from control_room_port import is_bindable
+from frequency_domain_generation import MAX_COMMIT_BYTES
 import run_comsol_dispersion_benchmark as managed
 from managed_runtime_artifact_root import resolve_runtime_artifact_root
 from runtime_source_change_policy import is_non_runtime_path
 from de_shifted_ksp_trial import validate_shifted_ksp_trial
 from de_gamma_krylov_trial import validate_gamma_krylov_trial
 from validate_de_smoke_rows import (
+    MAX_DE_SMOKE_JSON_BYTES,
     PARALLEL_PROBE_FREQUENCY_WINDOW_HZ,
     PARALLEL_PROBE_VECTORS_RAD_PER_M,
     SAMPLING,
@@ -68,6 +71,50 @@ PARALLEL_PROBE_POLICY = {
     "max_workers": 2,
     "threads_per_worker": 1,
 }
+MAX_CASE_ARTIFACT_BYTES = 1024**3
+MAX_CASE_ARTIFACT_TOTAL_BYTES = 2 * 1024**3
+MAX_CASE_ARTIFACT_FILES = 8192
+# Bound full FMS preflight while allowing control/project files beyond artifacts.
+MAX_FMS_ARCHIVE_ENTRIES = MAX_CASE_ARTIFACT_FILES + 4096
+MAX_FMS_ARCHIVE_ENTRY_BYTES = MAX_CASE_ARTIFACT_BYTES
+MAX_FMS_ARCHIVE_TOTAL_BYTES = MAX_CASE_ARTIFACT_TOTAL_BYTES + 512 * 1024**2
+# The exported main script is a control-plane document, capped at 16 MiB.
+MAX_FMS_PROJECT_SCRIPT_BYTES = 16 * 1024**2
+
+
+def _bundle_json(case_dir, bundle_reader, relative, label):
+    path = Path(case_dir) / relative
+    try:
+        if bundle_reader is None:
+            with path.open("rb") as stream:
+                raw = stream.read(MAX_DE_SMOKE_JSON_BYTES + 1)
+        else:
+            root = getattr(bundle_reader, "root", None)
+            if not isinstance(root, Path) or Path(case_dir).absolute() != root.absolute():
+                raise ValueError("bundle reader belongs to another artifact root")
+            raw = bundle_reader.read_bytes(
+                relative, maximum_bytes=MAX_DE_SMOKE_JSON_BYTES)
+        if len(raw) > MAX_DE_SMOKE_JSON_BYTES:
+            raise ValueError("artifact exceeds its JSON byte budget")
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise managed.BenchmarkError(f"{label} is missing or invalid") from error
+    if not isinstance(value, dict):
+        raise managed.BenchmarkError(f"{label} must be a JSON object")
+    return value
+
+
+def _validate_bundle_run_id(bundle_reader, run_id):
+    descriptor = bundle_reader.generation_descriptor()
+    producer = descriptor.get("producer")
+    if descriptor.get("immutable") is True:
+        if not isinstance(producer, dict) or producer.get("run_id") != run_id:
+            raise managed.BenchmarkError(
+                "immutable artifact generation producer does not match runtime run")
+    elif producer is not None and (
+        not isinstance(producer, dict) or producer.get("run_id") != run_id
+    ):
+        raise managed.BenchmarkError("artifact generation producer does not match runtime run")
 SCHUR_ACTION_DIAGNOSTIC_STATUSES = frozenset(("measured", "failed", "unavailable"))
 SCHUR_ACTION_DIAGNOSTIC_DEFECT_FIELDS = (
     "max_potential_relative_residual",
@@ -348,41 +395,293 @@ def _validate_export_status_receipt(receipt, solver_exit_code, label="UI archive
             "run_identity_partial": (before_run is None) != (after_run is None)}
 
 
+def _zip_member_bytes(archive, name, maximum_bytes, label):
+    try:
+        info = archive.getinfo(name)
+    except KeyError as error:
+        raise managed.BenchmarkError(f"{label} is missing") from error
+    if info.is_dir() or type(info.file_size) is not int or info.file_size < 0:
+        raise managed.BenchmarkError(f"{label} is not a regular archive file")
+    if info.file_size > maximum_bytes:
+        raise managed.BenchmarkError(f"{label} exceeds its byte budget")
+    try:
+        with archive.open(info, "r") as stream:
+            payload = stream.read(maximum_bytes + 1)
+    except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+        raise managed.BenchmarkError(f"{label} is missing or unreadable") from error
+    if len(payload) > maximum_bytes or len(payload) != info.file_size:
+        raise managed.BenchmarkError(f"{label} length differs from its bounded archive entry")
+    return payload
+
+
 def _zip_json(archive, name, label):
     try:
-        value = json.loads(archive.read(name).decode("utf-8"))
-    except (KeyError, UnicodeDecodeError, ValueError, TypeError) as error:
+        value = json.loads(
+            _zip_member_bytes(archive, name, MAX_DE_SMOKE_JSON_BYTES, label).decode("utf-8")
+        )
+    except (UnicodeDecodeError, ValueError, TypeError) as error:
         raise managed.BenchmarkError(f"{label} is missing or invalid JSON") from error
     if not isinstance(value, dict):
         raise managed.BenchmarkError(f"{label} must be a JSON object")
     return value
 
 
-def _local_artifact_hashes(case_dir, artifact_prefix):
-    case_dir = Path(case_dir)
-    if not case_dir.is_dir():
-        raise managed.BenchmarkError("UI archive artifact source directory is missing")
-    expected = {}
-    for candidate in case_dir.rglob("*"):
-        if candidate.is_symlink():
+def _validate_physical_archive_path(root, path, label):
+    root = Path(os.path.abspath(str(root)))
+    path = Path(os.path.abspath(str(path)))
+    current = Path(root.anchor)
+    for part in root.parts[1:]:
+        current = current / part
+        if managed._is_reparse(current) or not current.is_dir():
             raise managed.BenchmarkError(
-                f"UI archive artifact source contains a symbolic link: {candidate}"
+                f"{label} root traverses an unsafe or missing directory: {current}"
             )
-        if not candidate.is_file():
-            continue
-        relative = candidate.relative_to(case_dir).as_posix()
-        expected[artifact_prefix + relative] = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise managed.BenchmarkError(f"{label} is outside its artifact root: {path}") from error
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if managed._is_reparse(current) or not current.is_dir():
+            raise managed.BenchmarkError(
+                f"{label} traverses an unsafe or missing directory: {current}"
+            )
+    if managed._is_reparse(path) or not path.is_file():
+        raise managed.BenchmarkError(f"{label} is not a regular physical file: {path}")
+    return path
+
+
+def _read_physical_archive_file(path, maximum_bytes, label, *, root):
+    if isinstance(maximum_bytes, bool) or not isinstance(maximum_bytes, int) or maximum_bytes < 0:
+        raise managed.BenchmarkError(f"{label} has an invalid byte budget")
+    path = _validate_physical_archive_path(root, path, label)
+    try:
+        managed._regular_file(path, label)
+        before = path.stat()
+        if before.st_size < 0 or before.st_size > maximum_bytes:
+            raise managed.BenchmarkError(f"{label} exceeds its byte budget: {path}")
+        with path.open("rb") as stream:
+            payload = stream.read(maximum_bytes + 1)
+        _validate_physical_archive_path(root, path, label)
+        managed._regular_file(path, label)
+        after = path.stat()
+    except managed.BenchmarkError:
+        raise
+    except OSError as error:
+        raise managed.BenchmarkError(f"cannot read {label}: {path}") from error
+    if len(payload) != before.st_size or len(payload) > maximum_bytes:
+        raise managed.BenchmarkError(f"{label} changed size while binding: {path}")
+    if (after.st_size, after.st_mtime_ns, after.st_ino) != (
+        before.st_size, before.st_mtime_ns, before.st_ino
+    ):
+        raise managed.BenchmarkError(f"{label} changed while binding: {path}")
+    return payload
+
+
+def _local_artifact_hashes(case_dir, artifact_prefix, *, bundle_reader=None):
+    case_dir = Path(os.path.abspath(str(case_dir)))
+    if bundle_reader is not None:
+        root = getattr(bundle_reader, "root", None)
+        if not isinstance(root, Path) or case_dir.absolute() != root.absolute():
+            raise managed.BenchmarkError("UI archive reader belongs to another artifact root")
+    current = Path(case_dir.anchor)
+    for part in case_dir.parts[1:]:
+        current = current / part
+        if managed._is_reparse(current) or not current.is_dir():
+            raise managed.BenchmarkError(
+                f"UI archive artifact source root traverses an unsafe or missing directory: {current}"
+            )
+    managed._regular_dir(case_dir, "UI archive artifact source directory")
+    expected = {}
+    generation = None if bundle_reader is None else getattr(bundle_reader, "generation", None)
+    generation_descriptor = (
+        bundle_reader.generation_descriptor() if generation is not None else None
+    )
+    marker_relative = None
+    marker_digest = None
+    immutable = False
+    member_root_prefix = None
+    if generation is not None:
+        marker_relative = generation_descriptor.get("marker_path")
+        marker_digest = generation_descriptor.get("marker_sha256")
+        immutable = generation.is_immutable()
+        if (not isinstance(marker_relative, str)
+                or not isinstance(marker_digest, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", marker_digest) is None):
+            raise managed.BenchmarkError("captured generation has an invalid physical marker identity")
+        if generation_descriptor.get("immutable") is not immutable:
+            raise managed.BenchmarkError("captured generation immutability descriptor is inconsistent")
+        if immutable:
+            try:
+                member_root_prefix = generation.member_root.relative_to(case_dir.resolve()).as_posix()
+            except (OSError, ValueError) as error:
+                raise managed.BenchmarkError(
+                    "captured generation physical member root is outside the artifact source"
+                ) from error
+            if not member_root_prefix or member_root_prefix == ".":
+                raise managed.BenchmarkError("immutable generation has no physical member prefix")
+
+    candidates = []
+    try:
+        def fail_directory_walk(error):
+            raise error
+
+        for directory, directory_names, file_names in os.walk(
+            case_dir, topdown=True, onerror=fail_directory_walk, followlinks=False
+        ):
+            parent = Path(directory)
+            for directory_name in tuple(directory_names):
+                child = parent / directory_name
+                if managed._is_reparse(child) or not child.is_dir():
+                    raise managed.BenchmarkError(
+                        f"UI archive artifact source contains an unsafe directory: {child}"
+                    )
+            directory_names.sort()
+            for file_name in sorted(file_names):
+                candidate = parent / file_name
+                if managed._is_reparse(candidate):
+                    raise managed.BenchmarkError(
+                        f"UI archive artifact source contains a symbolic link or reparse point: {candidate}"
+                    )
+                managed._regular_file(candidate, "UI archive artifact source member")
+                info = candidate.stat()
+                candidates.append((candidate.relative_to(case_dir).as_posix(), info.st_size, candidate))
+                if len(candidates) > MAX_CASE_ARTIFACT_FILES:
+                    raise managed.BenchmarkError("UI archive artifact source exceeds the file budget")
+    except managed.BenchmarkError:
+        raise
+    except OSError as error:
+        raise managed.BenchmarkError("cannot enumerate UI archive artifact source") from error
+
+    if len(candidates) > MAX_CASE_ARTIFACT_FILES:
+        raise managed.BenchmarkError("UI archive artifact source exceeds the file budget")
+    total = 0
+    candidates_by_path = {}
+    for relative, physical_size, path in sorted(candidates, key=lambda item: item[0]):
+        if type(physical_size) is not int or physical_size < 0 \
+                or physical_size > MAX_CASE_ARTIFACT_BYTES:
+            raise managed.BenchmarkError(
+                f"UI archive artifact exceeds its byte budget: {relative}"
+            )
+        total += physical_size
+        if total > MAX_CASE_ARTIFACT_TOTAL_BYTES:
+            raise managed.BenchmarkError("UI archive artifact source exceeds the total byte budget")
+        if relative in candidates_by_path:
+            raise managed.BenchmarkError(f"UI archive physical path collides: {relative}")
+        candidates_by_path[relative] = (physical_size, path)
+
+    marker_payload = None
+    if generation is not None:
+        marker_entry = candidates_by_path.get(marker_relative)
+        if marker_entry is None:
+            raise managed.BenchmarkError(
+                "captured generation marker is missing from the physical artifact tree"
+            )
+        _, marker_file = marker_entry
+        marker_payload = _read_physical_archive_file(
+            marker_file, MAX_COMMIT_BYTES,
+            "frequency-domain generation marker", root=case_dir,
+        )
+        if "sha256:" + hashlib.sha256(marker_payload).hexdigest() != marker_digest:
+            raise managed.BenchmarkError("frequency-domain generation marker changed after capture")
+
+    current_members = set()
+    unbound_physical_count = 0
+    unbound_physical_paths = []
+    for relative, physical_size, path in sorted(candidates, key=lambda item: item[0]):
+        if generation is not None and relative == marker_relative:
+            assert marker_payload is not None
+            payload = marker_payload
+        else:
+            logical = relative
+            if immutable:
+                assert member_root_prefix is not None
+                prefix = member_root_prefix.rstrip("/") + "/"
+                logical = relative[len(prefix):] if relative.startswith(prefix) else ""
+            member = generation.members.get(logical) if generation is not None and logical else None
+            if member is not None:
+                try:
+                    verified_member = generation.verify_member(logical)
+                    if verified_member.byte_length != physical_size:
+                        raise ValueError("physical current-generation member length differs from capture")
+                    payload = bundle_reader.read_bytes(
+                        logical, maximum_bytes=verified_member.byte_length)
+                except (OSError, ValueError) as error:
+                    raise managed.BenchmarkError(
+                        f"current-generation archive member failed captured verification: {logical}"
+                    ) from error
+                if len(payload) != verified_member.byte_length:
+                    raise managed.BenchmarkError(
+                        f"current-generation archive member length changed: {logical}"
+                    )
+                current_members.add(logical)
+            else:
+                payload = _read_physical_archive_file(
+                    path, physical_size, "physical UI archive artifact", root=case_dir)
+                unbound_physical_count += 1
+                unbound_physical_paths.append(relative)
+        if len(payload) != physical_size:
+            raise managed.BenchmarkError(f"UI archive artifact size changed: {relative}")
+        expected[artifact_prefix + relative] = hashlib.sha256(payload).hexdigest()
     if not expected:
         raise managed.BenchmarkError("UI archive artifact source is empty")
-    for required in ("metadata.json", "eigen/dispersion.csv"):
-        if artifact_prefix + required not in expected:
+    if generation is not None:
+        missing_members = set(generation.members) - current_members
+        if missing_members:
             raise managed.BenchmarkError(
-                f"UI archive artifact source is missing {required}"
+                "physical artifact tree is missing captured generation members: "
+                + ", ".join(sorted(missing_members)[:3])
             )
-    return expected
+        if not {"metadata.json", "eigen/dispersion.csv"}.issubset(generation.members):
+            raise managed.BenchmarkError("captured generation omits required archive artifacts")
+        artifact_layout = {
+            "schema": "fullmag.fms_physical_artifact_layout_binding.v1",
+            "scope": "exact_physical_export_tree",
+            "generation_binding_status": generation_descriptor["generation_binding_status"],
+            "current_fence_status": generation_descriptor["current_fence_status"],
+            "generation_id": generation.generation_id,
+            "schema_version": generation.schema_version,
+            "marker_path": marker_relative,
+            "marker_sha256": marker_digest,
+            "captured_member_count": len(generation.members),
+            "captured_member_paths": sorted(current_members),
+            "captured_member_physical_root": member_root_prefix or ".",
+            "other_physical_entry_count": unbound_physical_count,
+            "other_physical_paths": sorted(unbound_physical_paths),
+            "other_physical_entry_scope": "archive_layout_hash_only_not_generation_certification",
+            "physical_file_entry_count": len(candidates),
+        }
+    else:
+        for required in ("metadata.json", "eigen/dispersion.csv"):
+            if artifact_prefix + required not in expected:
+                raise managed.BenchmarkError(
+                    f"UI archive artifact source is missing {required}"
+                )
+        artifact_layout = {
+            "schema": "fullmag.fms_physical_artifact_layout_binding.v1",
+            "scope": "exact_physical_export_tree",
+            "generation_binding_status": "not_verified_legacy_physical_inventory",
+            "current_fence_status": None,
+            "generation_id": None,
+            "schema_version": None,
+            "marker_path": None,
+            "marker_sha256": None,
+            "captured_member_count": 0,
+            "captured_member_paths": [],
+            "captured_member_physical_root": None,
+            "other_physical_entry_count": len(candidates),
+            "other_physical_paths": sorted(relative for relative, _, _ in candidates),
+            "other_physical_entry_scope": "archive_layout_hash_only_not_generation_certification",
+            "physical_file_entry_count": len(candidates),
+        }
+    return expected, artifact_layout
 
 
-def validate_fms_archive(path, *, status_receipt=None, case_dir=None, solver_exit_code=0):
+def validate_fms_archive(
+    path, *, status_receipt=None, case_dir=None, solver_exit_code=0,
+    bundle_reader=None,
+):
     """Validate an API-exported FMS archive and bind it to this pilot output."""
 
     path = Path(path)
@@ -391,11 +690,21 @@ def validate_fms_archive(path, *, status_receipt=None, case_dir=None, solver_exi
     try:
         with zipfile.ZipFile(path) as archive:
             infos = archive.infolist()
+            if len(infos) > MAX_FMS_ARCHIVE_ENTRIES:
+                raise managed.BenchmarkError("UI archive exceeds the entry-count budget")
+            archive_total_bytes = 0
+            for info in infos:
+                if (type(info.file_size) is not int or info.file_size < 0
+                        or info.file_size > MAX_FMS_ARCHIVE_ENTRY_BYTES):
+                    raise managed.BenchmarkError(
+                        f"UI archive member exceeds its byte budget: {info.filename}"
+                    )
+                archive_total_bytes += info.file_size
+                if archive_total_bytes > MAX_FMS_ARCHIVE_TOTAL_BYTES:
+                    raise managed.BenchmarkError("UI archive exceeds the uncompressed byte budget")
             names = [info.filename for info in infos]
             if len(names) != len(set(names)):
                 raise managed.BenchmarkError("UI archive contains duplicate members")
-            if archive.testzip() is not None:
-                raise managed.BenchmarkError("UI archive contains a corrupt member")
             required = {
                 "manifest/session.json",
                 "manifest/workspace.json",
@@ -433,7 +742,10 @@ def validate_fms_archive(path, *, status_receipt=None, case_dir=None, solver_exi
                 raise managed.BenchmarkError(
                     "UI archive session manifest has the wrong export profile reference"
                 )
-            main_script = archive.read("project/main.py")
+            main_script = _zip_member_bytes(
+                archive, "project/main.py", MAX_FMS_PROJECT_SCRIPT_BYTES,
+                "UI archive project/main.py",
+            )
             if workspace_manifest.get("script_ref") != "project/main.py":
                 raise managed.BenchmarkError(
                     "UI archive workspace manifest has the wrong script reference"
@@ -490,6 +802,8 @@ def validate_fms_archive(path, *, status_receipt=None, case_dir=None, solver_exi
                 )
             if run_manifest.get("status") != "completed":
                 raise managed.BenchmarkError("UI archive run manifest is not completed")
+            if archive.testzip() is not None:
+                raise managed.BenchmarkError("UI archive contains a corrupt member")
             for snapshot_key, manifest_key in (
                 ("requested_backend", "backend"), ("precision", "precision")
             ):
@@ -506,6 +820,8 @@ def validate_fms_archive(path, *, status_receipt=None, case_dir=None, solver_exi
             ]
             if not artifact_infos:
                 raise managed.BenchmarkError("UI archive contains no captured run artifacts")
+            if len(artifact_infos) > MAX_CASE_ARTIFACT_FILES:
+                raise managed.BenchmarkError("UI archive artifact tree exceeds the file budget")
             other_artifacts = [
                 info.filename for info in infos
                 if info.filename.startswith("runs/")
@@ -516,14 +832,41 @@ def validate_fms_archive(path, *, status_receipt=None, case_dir=None, solver_exi
                 raise managed.BenchmarkError(
                     "UI archive contains artifacts from an unrelated run"
                 )
-            local_hashes = (
-                _local_artifact_hashes(case_dir, artifact_prefix)
-                if case_dir is not None else None
-            )
-            archive_hashes = {
-                info.filename: hashlib.sha256(archive.read(info)).hexdigest()
-                for info in artifact_infos
-            }
+            if case_dir is not None:
+                local_hashes, artifact_layout = _local_artifact_hashes(
+                    case_dir, artifact_prefix, bundle_reader=bundle_reader)
+            else:
+                local_hashes, artifact_layout = None, None
+            archive_hashes = {}
+            archive_total = 0
+            for info in artifact_infos:
+                if (type(info.file_size) is not int or info.file_size < 0
+                        or info.file_size > MAX_CASE_ARTIFACT_BYTES):
+                    raise managed.BenchmarkError(
+                        f"UI archive artifact exceeds its byte budget: {info.filename}"
+                    )
+                archive_total += info.file_size
+                if archive_total > MAX_CASE_ARTIFACT_TOTAL_BYTES:
+                    raise managed.BenchmarkError("UI archive artifacts exceed the total byte budget")
+                measured = hashlib.sha256()
+                measured_length = 0
+                with archive.open(info, "r") as stream:
+                    while True:
+                        remaining = info.file_size - measured_length
+                        chunk = stream.read(min(1024 * 1024, remaining + 1))
+                        if not chunk:
+                            break
+                        measured_length += len(chunk)
+                        if measured_length > info.file_size:
+                            raise managed.BenchmarkError(
+                                f"UI archive artifact length exceeds its directory entry: {info.filename}"
+                            )
+                        measured.update(chunk)
+                if measured_length != info.file_size:
+                    raise managed.BenchmarkError(
+                        f"UI archive artifact length differs from its directory entry: {info.filename}"
+                    )
+                archive_hashes[info.filename] = measured.hexdigest()
             if local_hashes is not None:
                 if set(archive_hashes) != set(local_hashes):
                     missing = sorted(set(local_hashes) - set(archive_hashes))
@@ -537,6 +880,7 @@ def validate_fms_archive(path, *, status_receipt=None, case_dir=None, solver_exi
                         raise managed.BenchmarkError(
                             f"UI archive artifact hash does not match local case: {name}"
                         )
+                artifact_layout["validated_archive_entry_count"] = len(archive_hashes)
             status_report = None
             if status_receipt is not None:
                 status_report = _validate_export_status_receipt(
@@ -555,6 +899,21 @@ def validate_fms_archive(path, *, status_receipt=None, case_dir=None, solver_exi
                 raise managed.BenchmarkError(
                     "UI archive requires a zero solver exit code before export"
                 )
+            if bundle_reader is not None and case_dir is not None:
+                try:
+                    bundle_reader.ensure_current()
+                except (OSError, ValueError) as error:
+                    raise managed.BenchmarkError(
+                        "frequency-domain generation changed while validating the UI archive"
+                    ) from error
+                if artifact_layout is not None:
+                    final_descriptor = bundle_reader.generation_descriptor()
+                    artifact_layout["generation_binding_status"] = final_descriptor[
+                        "generation_binding_status"
+                    ]
+                    artifact_layout["current_fence_status"] = final_descriptor[
+                        "current_fence_status"
+                    ]
     except managed.BenchmarkError:
         raise
     except (OSError, zipfile.BadZipFile) as error:
@@ -567,6 +926,7 @@ def validate_fms_archive(path, *, status_receipt=None, case_dir=None, solver_exi
         "session_id": session_id,
         "run_id": snapshot_run_id,
         "artifact_sha256": archive_hashes,
+        "artifact_layout_binding": artifact_layout,
         "status_scope_stable": bool(status_report is not None),
         "solver_exit_code": solver_exit_code,
     }
@@ -621,12 +981,33 @@ def signed_fifteen_campaign_identity(model_identity, parallel_mode):
     }
 
 
-def bind_parallel_report(case_dir, artifacts, *, expected_policy, expected_indices):
+def bind_parallel_report(
+    case_dir, artifacts, *, expected_policy, expected_indices, bundle_reader=None
+):
     """Bind actual scheduler telemetry to the numerical campaign receipt."""
     relative = "eigen/parallel_execution.v1.json"
     path = Path(case_dir) / relative
-    managed._regular_file(path, "adaptive process-pool report")
-    raw = managed._json_file(path, "adaptive process-pool report", max_bytes=4 * 1024 * 1024)
+    if bundle_reader is None:
+        managed._regular_file(path, "adaptive process-pool report")
+        with path.open("rb") as stream:
+            payload = stream.read(4 * 1024 * 1024 + 1)
+        if len(payload) > 4 * 1024 * 1024:
+            raise managed.BenchmarkError("adaptive process-pool report exceeds its byte budget")
+        try:
+            raw = json.loads(payload.decode("utf-8"))
+        except (UnicodeError, ValueError) as error:
+            raise managed.BenchmarkError("adaptive process-pool report is missing or invalid") from error
+    else:
+        root = getattr(bundle_reader, "root", None)
+        if not isinstance(root, Path) or Path(case_dir).absolute() != root.absolute():
+            raise managed.BenchmarkError("adaptive report reader belongs to another artifact root")
+        try:
+            payload = bundle_reader.read_bytes(relative, maximum_bytes=4 * 1024 * 1024)
+            raw = json.loads(payload.decode("utf-8"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+            raise managed.BenchmarkError("adaptive process-pool report is missing or invalid") from error
+        if not isinstance(raw, dict):
+            raise managed.BenchmarkError("adaptive process-pool report must be a JSON object")
     try:
         validation = validate_parallel_execution_report(
             raw, expected_mode="adaptive", expected_sample_count=len(expected_indices),
@@ -637,7 +1018,7 @@ def bind_parallel_report(case_dir, artifacts, *, expected_policy, expected_indic
         raise managed.BenchmarkError("adaptive report policy differs from the campaign request")
     if [entry["sample_index"] for entry in raw.get("inputs", [])] != list(expected_indices):
         raise managed.BenchmarkError("adaptive report sample indices differ from the campaign")
-    binding = {"size": path.stat().st_size, "sha256": managed._sha256_file(path)}
+    binding = {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
     artifacts["required_artifact_hashes"][relative] = binding
     artifacts["parallel_execution_report"] = validation
     return validation
@@ -1190,7 +1571,7 @@ def _validate_window_policy_request(pilot, policy, shifted_ksp_type):
 def _validate_krylov_trials(case_dir, sampling, requested_type, requested_rtol,
                             eps_prefilter, gmres_restart, *,
                             spectral_target="frequency_window", target_frequency_hz=None,
-                            expected_window_krylov_policy=None):
+                            expected_window_krylov_policy=None, bundle_reader=None):
     """Run the separate K0 query and nonzero Floquet residual receipt gates."""
     wavevectors = SAMPLING.get(sampling, ())
     if spectral_target not in ("frequency_window", "nearest"):
@@ -1211,6 +1592,7 @@ def _validate_krylov_trials(case_dir, sampling, requested_type, requested_rtol,
             eps_prefilter=eps_prefilter,
             gmres_restart=gmres_restart,
             expected_window_krylov_policy=expected_window_krylov_policy,
+            bundle_reader=bundle_reader,
         )
     if any(value != 0.0 for value in wavevectors):
         selection = (
@@ -1219,7 +1601,8 @@ def _validate_krylov_trials(case_dir, sampling, requested_type, requested_rtol,
             if spectral_target == "nearest" else {}
         )
         artifacts["shifted_ksp_trial"] = validate_shifted_ksp_trial(
-            case_dir, sampling, requested_type, requested_rtol, **selection
+            case_dir, sampling, requested_type, requested_rtol,
+            bundle_reader=bundle_reader, **selection
         )
     return artifacts
 
@@ -1493,9 +1876,32 @@ def compose_command(context, output, timeout_seconds=managed.DEFAULT_TIMEOUT_SEC
     return command
 
 
-def validate_smoke_potential_fields(case_dir, expected_sample_count):
+def validate_smoke_potential_fields(case_dir, expected_sample_count, *, bundle_reader=None):
     """Check every published mode's potential gradient, without qualifying T4."""
-    vectors = sorted(case_dir.glob("eigen/mode_fields/sample_*/mode_*/vector.bin"))
+    case_dir = Path(case_dir)
+    generation = None if bundle_reader is None else getattr(bundle_reader, "generation", None)
+    if bundle_reader is not None:
+        root = getattr(bundle_reader, "root", None)
+        if not isinstance(root, Path) or case_dir.absolute() != root.absolute():
+            raise managed.BenchmarkError("potential-field reader belongs to another artifact root")
+    if generation is not None:
+        vectors = [
+            case_dir / Path(relative)
+            for relative in bundle_reader.iter_members("eigen/mode_fields")
+            if relative.endswith("/vector.bin")
+        ]
+        mode_metadata_members = bundle_reader.iter_members("eigen/modes")
+        mode_field_members = bundle_reader.iter_members("eigen/mode_fields")
+    else:
+        vectors = sorted(case_dir.glob("eigen/mode_fields/sample_*/mode_*/vector.bin"))
+        mode_metadata_members = tuple(
+            path.relative_to(case_dir).as_posix()
+            for path in case_dir.glob("eigen/modes/sample_*/mode_*.json")
+        )
+        mode_field_members = tuple(
+            path.relative_to(case_dir).as_posix()
+            for path in vectors
+        )
     if not vectors:
         raise managed.BenchmarkError("DE-SMOKE has no published mode fields")
     if isinstance(expected_sample_count, bool) or not isinstance(expected_sample_count, int) or expected_sample_count <= 0:
@@ -1510,14 +1916,27 @@ def validate_smoke_potential_fields(case_dir, expected_sample_count):
         raise managed.BenchmarkError(
             f"DE-SMOKE mode fields cover samples {sorted(samples)}, expected {expected_sample_count}")
     published_modes = set()
-    for mode_metadata in case_dir.glob("eigen/modes/sample_*/mode_*.json"):
+    for relative in mode_metadata_members:
+        mode_metadata = case_dir / Path(relative)
+        if (relative.count("/") != 3
+                or not relative.startswith("eigen/modes/sample_")
+                or not mode_metadata.name.startswith("mode_")
+                or not mode_metadata.name.endswith(".json")):
+            continue
         if (re.fullmatch(r"sample_[0-9]{4}", mode_metadata.parent.name) is None
                 or re.fullmatch(r"mode_[0-9]{4}\.json", mode_metadata.name) is None):
             raise managed.BenchmarkError("DE-SMOKE published mode has invalid identity path")
-        managed._regular_file(mode_metadata, "DE-SMOKE published mode metadata")
+        if bundle_reader is None:
+            managed._regular_file(mode_metadata, "DE-SMOKE published mode metadata")
+        elif not bundle_reader.has_member(relative):
+            raise managed.BenchmarkError("DE-SMOKE published mode metadata is not captured")
         published_modes.add((mode_metadata.parent.name, mode_metadata.stem))
     field_modes = set()
-    for vector in vectors:
+    for relative in mode_field_members:
+        vector = case_dir / Path(relative)
+        if (not relative.startswith("eigen/mode_fields/")
+                or not relative.endswith("/vector.bin")):
+            continue
         if re.fullmatch(r"mode_[0-9]{4}", vector.parent.name) is None:
             raise managed.BenchmarkError("DE-SMOKE mode field has invalid mode directory")
         field_modes.add((vector.parent.parent.name, vector.parent.name))
@@ -1527,14 +1946,28 @@ def validate_smoke_potential_fields(case_dir, expected_sample_count):
             f"missing fields {sorted(published_modes - field_modes)}, "
             f"unpublished fields {sorted(field_modes - published_modes)}")
     metadata = case_dir / "metadata.json"
-    managed._regular_file(metadata, "DE-SMOKE mesh metadata")
+    if bundle_reader is None:
+        managed._regular_file(metadata, "DE-SMOKE mesh metadata")
+    elif not bundle_reader.has_member("metadata.json"):
+        raise managed.BenchmarkError("DE-SMOKE mesh metadata is not a captured member")
     reports = []
     for vector in vectors:
         manifest = vector.parent / "physical_potential.v1.json"
-        managed._regular_file(manifest, "DE-SMOKE mode potential manifest")
+        manifest_relative = manifest.relative_to(case_dir).as_posix()
+        if bundle_reader is None:
+            managed._regular_file(manifest, "DE-SMOKE mode potential manifest")
+        elif not bundle_reader.has_member(manifest_relative):
+            raise managed.BenchmarkError("DE-SMOKE mode potential manifest is not captured")
         mode_metadata = case_dir / "eigen/modes" / vector.parent.parent.name / (vector.parent.name + ".json")
-        managed._regular_file(mode_metadata, "DE-SMOKE published mode metadata")
-        report = validate_physical_potential(manifest, metadata, mode_metadata_path=mode_metadata, verify_source_mesh=True)
+        if bundle_reader is None:
+            managed._regular_file(mode_metadata, "DE-SMOKE published mode metadata")
+        else:
+            mode_relative = mode_metadata.relative_to(case_dir).as_posix()
+            if not bundle_reader.has_member(mode_relative):
+                raise managed.BenchmarkError("DE-SMOKE published mode metadata is not captured")
+        report = validate_physical_potential(
+            manifest, metadata, mode_metadata_path=mode_metadata,
+            verify_source_mesh=True, bundle_reader=bundle_reader)
         if report.get("source_mesh_binding", {}).get("status") != "consistent":
             raise managed.BenchmarkError("DE-SMOKE potential has no recomputed source mesh binding")
         if report.get("identity_binding", {}).get("status") != "consistent":
@@ -1547,7 +1980,7 @@ def validate_smoke_potential_fields(case_dir, expected_sample_count):
             "mode_count": len(reports), "modes": reports}
 
 
-def validate_schur_action_diagnostic(case_dir):
+def validate_schur_action_diagnostic(case_dir, *, bundle_reader=None):
     """Preserve and structurally validate the opt-in Schur action observation.
 
     The native probe is diagnostic evidence only.  Missing, unavailable, or
@@ -1563,11 +1996,49 @@ def validate_schur_action_diagnostic(case_dir):
         "source": relative_path,
         "native": None,
     }
+    case_dir = Path(case_dir)
+    has_generation = bundle_reader is not None and getattr(bundle_reader, "generation", None) is not None
     try:
-        payload = json.loads(
-            (Path(case_dir) / relative_path).read_text(encoding="utf-8")
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        if bundle_reader is None:
+            with (case_dir / relative_path).open("rb") as stream:
+                raw = stream.read(MAX_DE_SMOKE_JSON_BYTES + 1)
+        else:
+            root = getattr(bundle_reader, "root", None)
+            if not isinstance(root, Path) or case_dir.absolute() != root.absolute():
+                raise ValueError("Schur diagnostic reader belongs to another artifact root")
+            if not bundle_reader.has_member(relative_path):
+                raise FileNotFoundError(relative_path)
+            raw = bundle_reader.read_bytes(
+                relative_path, maximum_bytes=MAX_DE_SMOKE_JSON_BYTES)
+        if len(raw) > MAX_DE_SMOKE_JSON_BYTES:
+            raise ValueError("Schur diagnostics exceed their byte budget")
+        payload = json.loads(raw.decode("utf-8"))
+    except FileNotFoundError:
+        if has_generation:
+            return {
+                **report,
+                "status": "unavailable",
+                "validation_status": "unavailable",
+                "reason": "native_solver_diagnostics_missing_from_captured_generation",
+            }
+        try:
+            payload, evidence = read_failed_schur_action(case_dir)
+            report.update(evidence)
+        except (OSError, ValueError, UnicodeError, RecursionError):
+            return {
+                **report,
+                "status": "unavailable",
+                "validation_status": "unavailable",
+                "reason": "native_solver_diagnostics_missing_or_invalid",
+            }
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        if has_generation:
+            return {
+                **report,
+                "status": "failed",
+                "validation_status": "failed",
+                "reason": "captured_native_solver_diagnostics_invalid",
+            }
         try:
             payload, evidence = read_failed_schur_action(case_dir)
             report.update(evidence)
@@ -1750,7 +2221,9 @@ def _validate_schur_action_payload(payload, report):
     }
 
 
-def validate_selected_only_metadata(case_dir, expected_target_frequency_hz, expected_sampling=None):
+def validate_selected_only_metadata(
+    case_dir, expected_target_frequency_hz, expected_sampling=None, *, bundle_reader=None
+):
     """Validate authoring and native scope of a one-point nearest-mode pilot.
 
     Metadata proves the request, while ``solver.v1.json`` proves that the
@@ -1758,7 +2231,8 @@ def validate_selected_only_metadata(case_dir, expected_target_frequency_hz, expe
     the artifact to a complete window or dispersion result.
     """
     try:
-        metadata = json.loads((case_dir / "metadata.json").read_text(encoding="utf-8"))
+        metadata = _bundle_json(case_dir, bundle_reader, "metadata.json",
+                                "selected-only DE-SMOKE metadata")
         model = metadata["problem_meta"]["runtime_metadata"]["de_smoke"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
         raise managed.BenchmarkError(
@@ -1793,7 +2267,9 @@ def validate_selected_only_metadata(case_dir, expected_target_frequency_hz, expe
         raise managed.BenchmarkError("selected-only DE-SMOKE metadata contains more than one k vector")
     try:
         native = validate_selected_only_diagnostics(
-            case_dir / "eigen/diagnostics/solver.v1.json", expected_target_frequency_hz)
+            case_dir / "eigen/diagnostics/solver.v1.json", expected_target_frequency_hz,
+            verified_bytes=(None if bundle_reader is None else bundle_reader.read_bytes(
+                "eigen/diagnostics/solver.v1.json", maximum_bytes=MAX_DE_SMOKE_JSON_BYTES)))
     except (OSError, ValueError) as error:
         raise managed.BenchmarkError(
             "selected-only DE-SMOKE native diagnostics are missing or inconsistent"
@@ -1812,10 +2288,11 @@ def validate_selected_only_metadata(case_dir, expected_target_frequency_hz, expe
     }
 
 
-def validate_mesh_level_metadata(case_dir, requested):
+def validate_mesh_level_metadata(case_dir, requested, *, bundle_reader=None):
     """Verify authoring resolution; actual mesh convergence remains separate."""
     try:
-        metadata = json.loads((case_dir / "metadata.json").read_text(encoding="utf-8"))
+        metadata = _bundle_json(case_dir, bundle_reader, "metadata.json",
+                                "magnetic mesh metadata")
         runtime = metadata["problem_meta"]["runtime_metadata"]
         model = runtime["de_smoke"]
         requested_size = MESH_LEVEL_ELEMENT_SIZES_M[requested]
@@ -1834,13 +2311,14 @@ def validate_mesh_level_metadata(case_dir, requested):
             "qualification": "NOT VERIFIED"}
 
 
-def validate_air_growth_rate_metadata(case_dir, requested):
+def validate_air_growth_rate_metadata(case_dir, requested, *, bundle_reader=None):
     """Bind the requested air growth rate to declared and resolved metadata."""
     if type(requested) is not str or requested not in AIR_GROWTH_RATE_CHOICES:
         raise managed.BenchmarkError("unsupported air growth rate")
     expected = float(requested)
     try:
-        metadata = json.loads((case_dir / "metadata.json").read_text(encoding="utf-8"))
+        metadata = _bundle_json(case_dir, bundle_reader, "metadata.json",
+                                "air growth metadata")
         runtime = metadata["problem_meta"]["runtime_metadata"]
         model_value = runtime["de_smoke"]["air_growth_rate"]
         study_value = runtime["study_universe"]["airbox_growth_rate"]
@@ -1885,12 +2363,13 @@ def _dry_run_output_dir(layout, job_id, pilot, model_identity):
 
 
 
-def validate_thickness_layers_metadata(case, requested):
+def validate_thickness_layers_metadata(case, requested, *, bundle_reader=None):
     """Reject a model that ignored an explicit through-thickness request."""
     if requested not in THICKNESS_LAYERS_CHOICES:
         raise managed.BenchmarkError("unsupported thickness layers")
     try:
-        metadata = json.loads((case / "metadata.json").read_text(encoding="utf-8"))
+        metadata = _bundle_json(case, bundle_reader, "metadata.json",
+                                "thickness mesh metadata")
         runtime = metadata["problem_meta"]["runtime_metadata"]
         declared = runtime["de_smoke"]["through_thickness_elements"]
         geometries = runtime["mesh_workflow"]["per_geometry"]
@@ -2057,6 +2536,7 @@ def execute(context, output, command, model_sha, timeout_seconds=managed.DEFAULT
     if "parallel_campaign" in request:
         result["parallel_campaign"] = request["parallel_campaign"]
     case_dir = None
+    bundle_reader = None
     try:
         if model_identity:
             model_input.verify_model(output, model_identity)
@@ -2071,15 +2551,28 @@ def execute(context, output, command, model_sha, timeout_seconds=managed.DEFAULT
                                        + managed.HOST_COMPOSE_GRACE_SECONDS)
         result["return_code"] = completed.returncode
         if completed.returncode == 0:
-            case_dir, output_binding = resolve_runtime_artifact_root(output, pilot, model_sha)
+            def load_captured_metadata(artifact_root):
+                nonlocal bundle_reader
+                if bundle_reader is not None:
+                    raise managed.BenchmarkError("runtime resolver requested metadata more than once")
+                bundle_reader = ArtifactBundleReader(Path(artifact_root))
+                return bundle_reader.read_bytes(
+                    "metadata.json", maximum_bytes=MAX_DE_SMOKE_JSON_BYTES)
+
+            case_dir, output_binding = resolve_runtime_artifact_root(
+                output, pilot, model_sha, metadata_bytes_loader=load_captured_metadata)
+            if bundle_reader is None:
+                raise managed.BenchmarkError("runtime resolver did not capture metadata bytes")
+            _validate_bundle_run_id(bundle_reader, output_binding.get("run_id"))
             result["runtime_output_binding"] = output_binding
             # C1 artifact requirements include complex modes and full potential.
             # This reuses the artifact contract only, not C1 scientific parameters.
-            artifacts = managed._validate_case_artifacts(case_dir, "c1")
+            artifacts = managed._validate_case_artifacts(
+                case_dir, "c1", bundle_reader=bundle_reader)
             artifacts["case"] = pilot
             if air_growth_rate is not None:
                 growth_resolution = validate_air_growth_rate_metadata(
-                    case_dir, air_growth_rate
+                    case_dir, air_growth_rate, bundle_reader=bundle_reader
                 )
                 artifacts["air_growth_rate_resolution"] = growth_resolution
                 result["air_growth_rate_resolution"] = growth_resolution
@@ -2091,8 +2584,10 @@ def execute(context, output, command, model_sha, timeout_seconds=managed.DEFAULT
                     case_dir / "metadata.json",
                 )
                 artifacts["row_preflight"] = (
-                    validate_rows(*row_args, selection_scope="selected_only")
-                    if modal_target == "nearest" else validate_rows(*row_args)
+                    validate_rows(*row_args, selection_scope="selected_only",
+                                  bundle_reader=bundle_reader)
+                    if modal_target == "nearest" else
+                    validate_rows(*row_args, bundle_reader=bundle_reader)
                 )
                 if shifted_ksp_type is not None:
                     artifacts.update(_validate_krylov_trials(
@@ -2105,14 +2600,17 @@ def execute(context, output, command, model_sha, timeout_seconds=managed.DEFAULT
                         spectral_target=modal_target,
                         target_frequency_hz=target_frequency_hz,
                         expected_window_krylov_policy=expected_window_krylov_policy,
+                        bundle_reader=bundle_reader,
                     ))
                 artifacts["potential_reconstruction"] = validate_smoke_potential_fields(
-                    case_dir, artifacts["row_preflight"]["sample_count"])
+                    case_dir, artifacts["row_preflight"]["sample_count"],
+                    bundle_reader=bundle_reader)
                 if _is_parallel_probe(pilot):
                     artifacts["parallel_probe_metadata"] = validate_parallel_probe_metadata(
                         case_dir / "metadata.json",
                         model_sha256=model_sha,
                         parallel_mode=parallel_mode,
+                        bundle_reader=bundle_reader,
                     )
                     artifacts["parallel_probe_solver_artifacts"] = validate_parallel_probe_solver_artifacts(
                         case_dir,
@@ -2120,10 +2618,12 @@ def execute(context, output, command, model_sha, timeout_seconds=managed.DEFAULT
                         requested_shifted_ksp_rtol=shifted_ksp_rtol,
                         requested_gmres_restart=gmres_restart,
                         expected_sample_count=len(PARALLEL_PROBE_VECTORS_RAD_PER_M),
+                        bundle_reader=bundle_reader,
                     )
                 if modal_target == "nearest":
                     artifacts["selected_only_preflight"] = validate_selected_only_metadata(
-                        case_dir, target_frequency_hz, PILOTS[pilot][1])
+                        case_dir, target_frequency_hz, PILOTS[pilot][1],
+                        bundle_reader=bundle_reader)
             if parallel_mode == "adaptive" and (_is_parallel_probe(pilot) or pilot == SIGNED_FIFTEEN_PILOT):
                 policy = {"mode": "adaptive", **PARALLEL_PROBE_POLICY} if _is_parallel_probe(pilot) else {
                     key: request["parallel_campaign"][key] for key in (
@@ -2131,13 +2631,17 @@ def execute(context, output, command, model_sha, timeout_seconds=managed.DEFAULT
                         "max_workers", "threads_per_worker")}
                 indices = range(len(PARALLEL_PROBE_VECTORS_RAD_PER_M)) if _is_parallel_probe(pilot) else range(1, 15)
                 bind_parallel_report(case_dir, artifacts,
-                                     expected_policy=policy, expected_indices=indices)
+                                     expected_policy=policy, expected_indices=indices,
+                                     bundle_reader=bundle_reader)
             if pilot == SIGNED_FIFTEEN_PILOT:
-                bind_signed_state_closure(case_dir, artifacts)
+                bind_signed_state_closure(
+                    case_dir, artifacts, bundle_reader=bundle_reader)
             if mesh_level is not None:
-                artifacts["mesh_level_resolution"] = validate_mesh_level_metadata(case_dir, mesh_level)
+                artifacts["mesh_level_resolution"] = validate_mesh_level_metadata(
+                    case_dir, mesh_level, bundle_reader=bundle_reader)
             if thickness_layers is not None:
-                artifacts["thickness_layers_resolution"] = validate_thickness_layers_metadata(case_dir, thickness_layers)
+                artifacts["thickness_layers_resolution"] = validate_thickness_layers_metadata(
+                    case_dir, thickness_layers, bundle_reader=bundle_reader)
             if live_api_enabled:
                 receipt_path = output / f"{pilot}.fms.status.json"
                 try:
@@ -2151,6 +2655,7 @@ def execute(context, output, command, model_sha, timeout_seconds=managed.DEFAULT
                     status_receipt=status_receipt,
                     case_dir=case_dir,
                     solver_exit_code=completed.returncode,
+                    bundle_reader=bundle_reader,
                 )
             result.update(status="completed_unqualified", artifacts=artifacts)
     except subprocess.TimeoutExpired:
@@ -2166,6 +2671,31 @@ def execute(context, output, command, model_sha, timeout_seconds=managed.DEFAULT
                 model_input.verify_model(output, model_identity)
             except (OSError, ValueError) as error:
                 result.update(status="failed", error=str(error))
+        if schur_action_diagnostic:
+            artifacts = result.get("artifacts")
+            if not isinstance(artifacts, dict):
+                artifacts = {}
+            try:
+                artifacts["floquet_schur_action_diagnostic"] = validate_schur_action_diagnostic(
+                    case_dir if case_dir is not None else output / pilot,
+                    bundle_reader=bundle_reader,
+                )
+            except (OSError, ValueError, TypeError, RecursionError) as error:
+                # An optional observation never replaces the solve outcome.
+                artifacts["floquet_schur_action_diagnostic"] = {
+                    "schema": "fullmag.floquet-schur-action-diagnostic-report.v1",
+                    "qualification": "NOT VERIFIED",
+                    "physical_certificate": False,
+                    "status": "failed",
+                    "validation_status": "failed",
+                    "reason": f"schur_diagnostic_validation_failed: {error}",
+                }
+            result["artifacts"] = artifacts
+        if result["status"] == "completed_unqualified" and bundle_reader is not None:
+            try:
+                bundle_reader.ensure_current()
+            except (OSError, ValueError) as error:
+                result.update(status="failed", error=f"artifact generation changed during validation: {error}")
         if result["return_code"] != 0 or result["status"] == "failed":
             try:
                 cleanup_mounts = _cleanup_extra_mounts(
@@ -2184,25 +2714,6 @@ def execute(context, output, command, model_sha, timeout_seconds=managed.DEFAULT
                     result["container_cleanup"] = managed._cleanup_benchmark_container(context, output)
             except (managed.BenchmarkError, OSError, ValueError, TypeError, KeyboardInterrupt) as error:
                 result["container_cleanup"] = {"status": "blocked", "reason": str(error)}
-        if schur_action_diagnostic:
-            artifacts = result.get("artifacts")
-            if not isinstance(artifacts, dict):
-                artifacts = {}
-            try:
-                artifacts["floquet_schur_action_diagnostic"] = validate_schur_action_diagnostic(
-                    case_dir if case_dir is not None else output / pilot
-                )
-            except (OSError, ValueError, TypeError, RecursionError) as error:
-                # An optional observation never replaces the solve outcome.
-                artifacts["floquet_schur_action_diagnostic"] = {
-                    "schema": "fullmag.floquet-schur-action-diagnostic-report.v1",
-                    "qualification": "NOT VERIFIED",
-                    "physical_certificate": False,
-                    "status": "failed",
-                    "validation_status": "failed",
-                    "reason": f"schur_diagnostic_validation_failed: {error}",
-                }
-            result["artifacts"] = artifacts
         result["finished_at_unix"] = time.time()
         managed._write_new_json(output / "run-result.json", result)
     print(json.dumps({"output_dir": str(output), **result}, indent=2))

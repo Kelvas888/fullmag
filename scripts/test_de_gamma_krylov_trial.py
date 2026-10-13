@@ -192,6 +192,27 @@ class GammaKrylovTrialTests(unittest.TestCase):
             **kwargs,
         )
 
+    def test_captured_diagnostics_bytes_override_stale_root_alias(self):
+        with TemporaryDirectory() as temporary:
+            case = _write_case(temporary, _diagnostics())
+            path = case / "eigen/diagnostics/solver.v1.json"
+            captured = path.read_bytes()
+            path.write_text("{stale alias", encoding="utf-8")
+
+            class CapturedReader:
+                def __init__(self):
+                    self.root = case
+
+                def read_bytes(self, relative, *, maximum_bytes=None):
+                    if relative != "eigen/diagnostics/solver.v1.json" or maximum_bytes is None:
+                        raise ValueError("unexpected diagnostics read")
+                    return captured
+
+            self.assertEqual(
+                self._validate(case, bundle_reader=CapturedReader())["status"],
+                "pass",
+            )
+
     def test_standalone_gamma_accepts_exact_after_eps_query(self):
         with TemporaryDirectory() as tmp:
             case = _write_case(tmp, _diagnostics())

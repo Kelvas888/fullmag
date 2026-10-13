@@ -57,6 +57,7 @@ def _gamma(operation_count: int) -> float:
 
 GRADIENT_FORWARD_GAMMA = _gamma(GRADIENT_FORWARD_OPERATION_COUNT)
 SHA256_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
+MAX_PHYSICAL_POTENTIAL_JSON_BYTES = 16 * 1024 * 1024
 
 
 class ValidationError(ValueError):
@@ -88,19 +89,55 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _load_json(path: Path, description: str) -> dict[str, Any]:
+def _reader_bytes(reader: Any, run_root: Path, path: Path, maximum_bytes: int) -> bytes:
     try:
-        with path.open("r", encoding="utf-8") as stream:
-            value = json.load(stream, object_pairs_hook=_unique_json_object)
+        relative = path.absolute().relative_to(run_root.absolute()).as_posix()
+        return reader.read_bytes(relative, maximum_bytes=maximum_bytes)
+    except (OSError, ValueError, TypeError) as exc:
+        _fail(f"cannot read captured artifact {path}: {exc}")
+
+
+def _load_json(
+    path: Path,
+    description: str,
+    *,
+    reader: Any | None = None,
+    run_root: Path | None = None,
+) -> dict[str, Any]:
+    try:
+        if reader is None:
+            with path.open("rb") as stream:
+                raw = stream.read(MAX_PHYSICAL_POTENTIAL_JSON_BYTES + 1)
+        else:
+            if run_root is None:
+                _fail("captured JSON read has no case root")
+            raw = _reader_bytes(reader, run_root, path, MAX_PHYSICAL_POTENTIAL_JSON_BYTES)
+        _require(len(raw) <= MAX_PHYSICAL_POTENTIAL_JSON_BYTES,
+                 f"{description} exceeds bounded JSON size: {path}")
+        value = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_unique_json_object
+        )
     except FileNotFoundError as exc:
         _fail(f"{description} does not exist: {path}")
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         _fail(f"cannot read {description} {path}: {exc}")
     _require(isinstance(value, dict), f"{description} must be a JSON object: {path}")
     return value
 
 
-def _sha256(path: Path) -> str:
+def _sha256(
+    path: Path,
+    *,
+    reader: Any | None = None,
+    run_root: Path | None = None,
+    maximum_bytes: int | None = None,
+) -> str:
+    if reader is not None:
+        if run_root is None or maximum_bytes is None:
+            _fail("captured binary hash has no root or byte bound")
+        return hashlib.sha256(
+            _reader_bytes(reader, run_root, path, maximum_bytes)
+        ).hexdigest()
     digest = hashlib.sha256()
     try:
         with path.open("rb") as stream:
@@ -118,11 +155,28 @@ def _declared_digest(value: Any, field: str) -> str:
     return match.group(1).lower()
 
 
-def _resolve_declared_path(run_root: Path, declared: Any, field: str) -> Path:
+def _resolve_declared_path(
+    run_root: Path, declared: Any, field: str, *, reader: Any | None = None
+) -> Path:
     _require(isinstance(declared, str) and declared, f"manifest field {field}.path must be non-empty")
     declared_path = Path(declared)
     _require(not declared_path.is_absolute(), f"manifest field {field}.path must be relative to the run root")
     _require(".." not in declared_path.parts, f"manifest field {field}.path may not traverse outside the run root")
+    if reader is not None:
+        logical = declared_path.as_posix()
+        _require(
+            "\\" not in declared and ":" not in declared
+            and logical == declared
+            and not declared_path.is_absolute()
+            and all(part not in ("", ".", "..") for part in declared.split("/")),
+            f"manifest field {field}.path is not a canonical logical member",
+        )
+        try:
+            present = reader.has_member(logical)
+        except (OSError, ValueError, TypeError) as exc:
+            _fail(f"cannot inspect captured {field} member: {exc}")
+        _require(present, f"manifest field {field}.path is not a captured member: {logical}")
+        return run_root.joinpath(*declared_path.parts)
     root = run_root.resolve()
     candidate = (root / declared_path).resolve()
     try:
@@ -138,8 +192,17 @@ def _positive_count(value: Any, field: str) -> int:
     return int(value)
 
 
-def _validate_manifest(manifest_path: Path, run_root: Path) -> tuple[dict[str, Any], Path, int, Path, int]:
-    manifest = _load_json(manifest_path, "physical-potential manifest")
+def _validate_manifest(
+    manifest_path: Path,
+    run_root: Path,
+    *,
+    expected_node_count: int,
+    expected_element_count: int,
+    reader: Any | None = None,
+) -> tuple[dict[str, Any], Path, int, Path, int]:
+    manifest = _load_json(
+        manifest_path, "physical-potential manifest", reader=reader, run_root=run_root
+    )
     _require(manifest.get("schema_version") == SCHEMA_VERSION, "unsupported physical-potential manifest schema")
     _require(manifest.get("representation") == "full_physical_phasor", "manifest representation is not full_physical_phasor")
     _require(manifest.get("phasor_convention") == "exp(+i*omega*t)", "unsupported phasor convention")
@@ -172,25 +235,54 @@ def _validate_manifest(manifest_path: Path, run_root: Path) -> tuple[dict[str, A
 
     potential_count = _positive_count(potential.get("count"), "potential.count")
     field_count = _positive_count(field.get("count"), "demag_field.count")
+    _require(
+        potential_count == expected_node_count,
+        f"manifest potential.count={potential_count} does not match mesh node count {expected_node_count}",
+    )
+    _require(
+        field_count == expected_element_count,
+        f"manifest demag_field.count={field_count} does not match mesh element count {expected_element_count}",
+    )
     potential_digest = _declared_digest(potential.get("sha256"), "potential.sha256")
     field_digest = _declared_digest(field.get("sha256"), "demag_field.sha256")
-    potential_path = _resolve_declared_path(run_root, potential.get("path"), "potential")
-    field_path = _resolve_declared_path(run_root, field.get("path"), "demag_field")
-    _require(_sha256(potential_path) == potential_digest, "potential_full.bin does not match manifest sha256")
-    _require(_sha256(field_path) == field_digest, "demag_element_full.bin does not match manifest sha256")
+    potential_path = _resolve_declared_path(
+        run_root, potential.get("path"), "potential", reader=reader
+    )
+    field_path = _resolve_declared_path(
+        run_root, field.get("path"), "demag_field", reader=reader
+    )
+    # These bounds come from the already parsed, independently validated mesh,
+    # not from the artifact manifest being checked.
+    potential_bytes = expected_node_count * 16
+    field_bytes = expected_element_count * 3 * 16
+    _require(
+        _sha256(potential_path, reader=reader, run_root=run_root,
+                maximum_bytes=potential_bytes if reader is not None else None)
+        == potential_digest,
+        "potential_full.bin does not match manifest sha256",
+    )
+    _require(
+        _sha256(field_path, reader=reader, run_root=run_root,
+                maximum_bytes=field_bytes if reader is not None else None)
+        == field_digest,
+        "demag_element_full.bin does not match manifest sha256",
+    )
     return manifest, potential_path, potential_count, field_path, field_count
 
 
 def _validate_declared_mode_binding(
     manifest: dict[str, Any], manifest_path: Path, mode_metadata_path: Path,
     run_root: Path, potential_path: Path, field_path: Path,
+    *, reader: Any | None = None,
 ) -> dict[str, Any]:
     """Bind declared provenance to one published mode, not a physics proof."""
     try:
         mode_metadata_path.relative_to(run_root)
     except ValueError:
         _fail("published mode metadata must be inside the metadata run root")
-    mode = _load_json(mode_metadata_path, "published mode metadata")
+    mode = _load_json(
+        mode_metadata_path, "published mode metadata", reader=reader, run_root=run_root
+    )
     sample = manifest.get("sample_index")
     raw_mode = manifest.get("mode_index")
     for value, name in ((sample, "sample_index"), (raw_mode, "mode_index")):
@@ -219,11 +311,18 @@ def _validate_declared_mode_binding(
         identities[key] = "sha256:" + expected
     return {"status": "consistent", "scope": "declared_mode_provenance_only",
             "sample_index": sample, "raw_mode_index": raw_mode, **identities,
-            "mode_metadata_sha256": "sha256:" + _sha256(mode_metadata_path),
-            "manifest_sha256": "sha256:" + _sha256(manifest_path)}
+            "mode_metadata_sha256": "sha256:" + _sha256(
+                mode_metadata_path, reader=reader, run_root=run_root,
+                maximum_bytes=MAX_PHYSICAL_POTENTIAL_JSON_BYTES if reader is not None else None),
+            "manifest_sha256": "sha256:" + _sha256(
+                manifest_path, reader=reader, run_root=run_root,
+                maximum_bytes=MAX_PHYSICAL_POTENTIAL_JSON_BYTES if reader is not None else None)}
 
 
-def _validate_source_mesh_binding(manifest: dict[str, Any], metadata: dict[str, Any], metadata_path: Path) -> dict[str, Any]:
+def _validate_source_mesh_binding(
+    manifest: dict[str, Any], metadata: dict[str, Any], metadata_path: Path,
+    *, metadata_sha256: str | None = None,
+) -> dict[str, Any]:
     """Recompute the canonical v3 topology without coercing producer arrays."""
     from types import SimpleNamespace
     source = Path(__file__).resolve().parents[1] / "packages/fullmag-py/src"
@@ -250,15 +349,29 @@ def _validate_source_mesh_binding(manifest: dict[str, Any], metadata: dict[str, 
     _require(actual == expected, "recomputed source mesh topology disagrees with potential manifest")
     return {"status": "consistent", "fingerprint_version": "v3",
             "source_mesh_topology_sha256": actual,
-            "metadata_sha256": "sha256:" + _sha256(metadata_path)}
+            "metadata_sha256": "sha256:" + (
+                metadata_sha256 if metadata_sha256 is not None else _sha256(metadata_path))}
 
 
-def _read_complex_values(path: Path, count: int, description: str) -> list[complex]:
-    try:
-        raw = path.read_bytes()
-    except OSError as exc:
-        _fail(f"cannot read {description} {path}: {exc}")
+def _read_complex_values(
+    path: Path,
+    count: int,
+    description: str,
+    *,
+    reader: Any | None = None,
+    run_root: Path | None = None,
+) -> list[complex]:
     expected_size = count * 16
+    try:
+        if reader is None:
+            with path.open("rb") as stream:
+                raw = stream.read(expected_size + 1)
+        else:
+            if run_root is None:
+                _fail("captured binary read has no case root")
+            raw = _reader_bytes(reader, run_root, path, expected_size)
+    except (OSError, ValueError) as exc:
+        _fail(f"cannot read {description} {path}: {exc}")
     _require(len(raw) == expected_size, f"{description} has {len(raw)} bytes; expected {expected_size}")
     values: list[complex] = []
     for offset in range(0, len(raw), 16):
@@ -424,6 +537,7 @@ def validate_physical_potential(
     zero_scale: float = DEFAULT_ZERO_SCALE,
     mode_metadata_path: Path | str | None = None,
     verify_source_mesh: bool = False,
+    bundle_reader: Any | None = None,
 ) -> dict[str, Any]:
     """Compare stored Tet4 element fields with an independent P1 gradient.
 
@@ -439,28 +553,50 @@ def validate_physical_potential(
     _require(_is_real(rtol) and rtol >= 0.0, "rtol must be a finite non-negative number")
     _require(_is_real(zero_scale) and zero_scale > 0.0, "zero_scale must be a finite positive number")
     _require(isinstance(verify_source_mesh, bool), "verify_source_mesh must be boolean")
-    metadata_file = Path(mesh_metadata_path).resolve()
-    manifest_file = Path(manifest_path).resolve()
+    metadata_file = Path(mesh_metadata_path).absolute()
+    manifest_file = Path(manifest_path).absolute()
     run_root = metadata_file.parent
+    if bundle_reader is not None:
+        reader_root = getattr(bundle_reader, "root", None)
+        _require(isinstance(reader_root, Path) and reader_root.absolute() == run_root,
+                 "physical-potential bundle reader belongs to another metadata root")
     try:
         manifest_file.relative_to(run_root)
     except ValueError:
         _fail("physical-potential manifest must be inside the metadata run root")
-    manifest, potential_path, potential_count, field_path, field_count = _validate_manifest(manifest_file, run_root)
+    # Parse and validate the capped mesh snapshot before any binary sidecar is
+    # hashed or read. Its concrete node/Tet4 counts are the independent bounds
+    # for the manifest-declared binary members.
+    metadata = _load_json(
+        metadata_file, "run metadata", reader=bundle_reader, run_root=run_root)
+    metadata_sha256 = hashlib.sha256(
+        _reader_bytes(bundle_reader, run_root, metadata_file,
+                      MAX_PHYSICAL_POTENTIAL_JSON_BYTES)
+    ).hexdigest() if bundle_reader is not None else None
+    nodes, elements = _extract_mesh(metadata)
+    manifest, potential_path, potential_count, field_path, field_count = _validate_manifest(
+        manifest_file,
+        run_root,
+        expected_node_count=len(nodes),
+        expected_element_count=len(elements),
+        reader=bundle_reader,
+    )
     identity_binding: dict[str, Any] = {"status": "not_requested"}
     if mode_metadata_path is not None:
         identity_binding = _validate_declared_mode_binding(
-            manifest, manifest_file, Path(mode_metadata_path).resolve(),
-            run_root, potential_path, field_path)
-    metadata = _load_json(metadata_file, "run metadata")
-    nodes, elements = _extract_mesh(metadata)
-    source_mesh_binding = (_validate_source_mesh_binding(manifest, metadata, metadata_file)
+            manifest, manifest_file, Path(mode_metadata_path).absolute(),
+            run_root, potential_path, field_path, reader=bundle_reader)
+    source_mesh_binding = (_validate_source_mesh_binding(
+                               manifest, metadata, metadata_file,
+                               metadata_sha256=metadata_sha256)
                            if verify_source_mesh else {"status": "not_requested"})
-    _require(potential_count == len(nodes), f"manifest potential.count={potential_count} does not match mesh node count {len(nodes)}")
-    _require(field_count == len(elements), f"manifest demag_field.count={field_count} does not match mesh element count {len(elements)}")
 
-    phi = _read_complex_values(potential_path, potential_count, "potential_full.bin")
-    stored_field = _read_complex_values(field_path, field_count * 3, "demag_element_full.bin")
+    phi = _read_complex_values(
+        potential_path, potential_count, "potential_full.bin",
+        reader=bundle_reader, run_root=run_root)
+    stored_field = _read_complex_values(
+        field_path, field_count * 3, "demag_element_full.bin",
+        reader=bundle_reader, run_root=run_root)
     reconstructed, forward_error_bounds = _reconstruct_field_with_bounds(phi, nodes, elements)
 
     max_abs_error = 0.0
@@ -515,7 +651,7 @@ def validate_physical_potential(
     if first_mismatch is not None:
         comparison["first_mismatch"] = first_mismatch
 
-    return {
+    report = {
         "schema_version": RESULT_SCHEMA_VERSION,
         "status": status,
         "qualification": QUALIFICATION,
@@ -528,6 +664,7 @@ def validate_physical_potential(
         "comparison": comparison,
         "qualification_note": "This report covers only independent stored-field reconstruction; it does not qualify demagnetization or T4 physics.",
     }
+    return report
 
 
 def _build_parser() -> argparse.ArgumentParser:

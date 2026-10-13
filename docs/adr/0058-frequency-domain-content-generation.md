@@ -78,3 +78,26 @@ czytnik Python w hosted CI. Testy Linux/Windows nie dowodzą ochrony przed
 złośliwą równoległą podmianą całego drzewa ani power-loss durability.
 Sam moduł nie przełącza producenta ani istniejących konsumentów: ich migracja
 oraz jeden wspólny publication lease pozostają obowiązkowym kolejnym etapem.
+
+### Etap G3 — wspólny read-only core Rust i terminal attestation
+
+Kanoniczny parser koperty, typy i bounded member reader należą do
+`fullmag-session::frequency_domain_artifact_generation`, ponieważ tego samego
+formatu potrzebują producent runnera i terminalny inspector. Runner zachowuje
+publisher, staging i lease oraz re-eksportuje dotychczasowe API odczytu. Nie
+wprowadzamy zależności inspectora od silnika/runnera ani drugiego parsera.
+Inspector otrzymuje bezpośrednią zależność od session; nie powstaje cykl.
+
+Terminalne attestation zachowuje dotychczasową schema i logiczną referencję
+`artifacts/metadata.json`. Przy markerze odczytuje `metadata.json` z capture
+względem artifacts root, wylicza hash z tych samych zwróconych bajtów i sprawdza
+producer run_id względem terminalnego manifestu. V2 wymaga pełnego producenta;
+obecny błędny marker/member/owner nie dopuszcza fallbacku do rootowego aliasu.
+Końcowy fence obowiązuje przed terminalną publikacją oraz w ścieżce retry.
+Brak markera zachowuje dotychczasowy bounded legacy read i nie nadaje mu
+statusu immutable. Nie backfillujemy attestation istniejących terminalnych runów.
+
+Implementacja tego etapu trwa; CI Linux/Windows musi potwierdzić v1/v2,
+zgodność bajtów, niezgodnego ownera, brak/uszkodzenie członka oraz zmianę
+selektora. Writer v2 pozostaje nieaktywny do ukończenia konsumentów i tych
+bramek. Runtime i naukowa kwalifikacja pozostają NOT VERIFIED.

@@ -4,7 +4,12 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from validate_de_smoke_rows import SAMPLING, diagnostics_by_sample, load_solver_diagnostics
+from validate_de_smoke_rows import (
+    MAX_DE_SMOKE_JSON_BYTES,
+    SAMPLING,
+    diagnostics_by_sample,
+    load_solver_diagnostics,
+)
 
 
 _SCHEMA = "k0_common_krylov_configuration_trial.v1"
@@ -269,6 +274,7 @@ def validate_gamma_krylov_trial(
     eps_prefilter: str | None = None,
     gmres_restart: str | None = None,
     expected_window_krylov_policy: str | None = None,
+    bundle_reader=None,
 ):
     """Validate actual K0 EPS/ST queries without claiming residual or physics acceptance."""
     if not isinstance(sampling, str) or sampling not in SAMPLING:
@@ -298,7 +304,18 @@ def validate_gamma_krylov_trial(
     except TypeError:
         raise ValueError("Gamma Krylov case_dir must be path-like") from None
     diagnostics_path = case_path / "eigen" / "diagnostics" / "solver.v1.json"
-    diagnostics = load_solver_diagnostics(diagnostics_path)
+    if bundle_reader is None:
+        diagnostics = load_solver_diagnostics(diagnostics_path)
+    else:
+        root = getattr(bundle_reader, "root", None)
+        if not isinstance(root, Path) or case_path.absolute() != root.absolute():
+            raise ValueError("Gamma Krylov bundle reader belongs to another artifact root")
+        diagnostics_bytes = bundle_reader.read_bytes(
+            "eigen/diagnostics/solver.v1.json",
+            maximum_bytes=MAX_DE_SMOKE_JSON_BYTES,
+        )
+        diagnostics = load_solver_diagnostics(
+            diagnostics_path, verified_bytes=diagnostics_bytes)
     schema = diagnostics.get("schema_version")
     if schema not in {"solver.v1", "frequency_domain_modal_solver_diagnostics.v1"}:
         raise ValueError("Gamma Krylov trial requires a supported native diagnostics schema")

@@ -376,6 +376,91 @@ def _make_batches(tmp: Path, *, adaptive_frequency_hz: float = 11.2e9):
     return serial_root, adaptive_root
 
 
+def _install_generation_only_v2(root: Path, *, stale_aliases: bool = False) -> str:
+    artifact_root = _artifact_dir(root)
+    payloads = {
+        path.relative_to(artifact_root).as_posix(): path.read_bytes()
+        for path in artifact_root.rglob("*") if path.is_file()
+    }
+    members = {
+        relative: {
+            "byte_length": len(payload),
+            "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+        }
+        for relative, payload in sorted(payloads.items())
+    }
+    result_path = root / "run-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    run_id = result["runtime_output_binding"]["run_id"]
+    body = {
+        "schema_version": "frequency_domain_artifact_generation.v2",
+        "producer": {
+            "run_id": run_id,
+            "stage_id": "serial-adaptive-test-stage",
+            "stage_kind": "eigenmodes",
+        },
+        "members": members,
+    }
+    compact = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+    generation_id = "sha256:" + hashlib.sha256(compact).hexdigest()
+    marker = json.dumps(
+        {"generation_id": generation_id, "content": body},
+        ensure_ascii=False, indent=2, allow_nan=False,
+    ).encode()
+    member_root = artifact_root / "frequency_domain/generations" / generation_id[7:]
+    for relative, payload in payloads.items():
+        target = member_root.joinpath(*relative.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    for relative in payloads:
+        artifact_root.joinpath(*relative.split("/")).unlink()
+    marker_path = artifact_root / "frequency_domain/generation.v2.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker)
+    result["runtime_output_binding"]["metadata_read_source"] = "provided_verified_bytes"
+    result["runtime_output_binding"]["metadata_logical_path"] = "metadata.json"
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    if stale_aliases:
+        (artifact_root / "metadata.json").write_text("{\"stale_alias\":true}", encoding="utf-8")
+        (artifact_root / "eigen/dispersion.csv").write_text("stale,alias\n", encoding="utf-8")
+    return generation_id
+
+
+def _install_v1_generation(root: Path) -> str:
+    artifact_root = _artifact_dir(root)
+    payloads = {
+        path.relative_to(artifact_root).as_posix(): path.read_bytes()
+        for path in artifact_root.rglob("*") if path.is_file()
+    }
+    members = {
+        relative: {
+            "byte_length": len(payload),
+            "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+        }
+        for relative, payload in sorted(payloads.items())
+    }
+    result = json.loads((root / "run-result.json").read_text(encoding="utf-8"))
+    body = {
+        "schema_version": "frequency_domain_artifact_generation.v1",
+        "producer": {
+            "run_id": result["runtime_output_binding"]["run_id"],
+            "stage_id": "serial-adaptive-v1-test-stage",
+            "stage_kind": "eigenmodes",
+        },
+        "members": members,
+    }
+    compact = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+    generation_id = "sha256:" + hashlib.sha256(compact).hexdigest()
+    marker = json.dumps(
+        {"generation_id": generation_id, "content": body},
+        ensure_ascii=False, indent=2, allow_nan=False,
+    ).encode()
+    marker_path = artifact_root / "frequency_domain/generation.v1.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker)
+    return generation_id
+
+
 class SerialAdaptiveProbeTests(unittest.TestCase):
     def test_passes_parity_with_optional_serial_report_absent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -390,6 +475,43 @@ class SerialAdaptiveProbeTests(unittest.TestCase):
             self.assertNotEqual(Path(serial_binding["artifact_dir"]), serial / PILOT)
             self.assertFalse(result["structural_report"]["serial_process_pool_report"]["present"])
             self.assertEqual(result["science"]["status"], "NOT VERIFIED")
+
+    def test_generation_only_v2_ignores_stale_root_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            serial, adaptive = _make_batches(Path(directory))
+            _install_generation_only_v2(serial, stale_aliases=True)
+            _install_generation_only_v2(adaptive, stale_aliases=True)
+            result = validate_serial_adaptive_probe(serial, adaptive)
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["numeric_parity"]["status"], "pass")
+            self.assertEqual(
+                result["structural_report"]["artifact_revalidation"]["adaptive"]["status"],
+                "pass",
+            )
+
+    def test_v1_capture_preserves_byte_verified_legacy_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            serial, adaptive = _make_batches(Path(directory))
+            _install_v1_generation(serial)
+            _install_v1_generation(adaptive)
+            result = validate_serial_adaptive_probe(serial, adaptive)
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["numeric_parity"]["status"], "pass")
+            self.assertEqual(
+                result["structural_report"]["artifact_revalidation"]["serial"]["status"],
+                "pass",
+            )
+
+    def test_generation_only_v2_corrupt_member_does_not_fall_back_to_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            serial, adaptive = _make_batches(Path(directory))
+            _install_generation_only_v2(serial)
+            generation_id = _install_generation_only_v2(adaptive, stale_aliases=True)
+            artifact_root = _artifact_dir(adaptive)
+            corrupt = artifact_root / "frequency_domain/generations" / generation_id[7:] / "metadata.json"
+            corrupt.write_bytes(b"{\"stale\":true}")
+            with self.assertRaises(ValidationError):
+                validate_serial_adaptive_probe(serial, adaptive)
 
     def test_every_declared_artifact_is_bound_even_when_both_modes_match(self) -> None:
         paths = ("metadata.json", "eigen/diagnostics/solver.v1.json", "eigen/dispersion.csv",

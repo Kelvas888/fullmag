@@ -6,6 +6,9 @@ on:
       # Consumers import validators, receipts and analytic oracles across scripts.
       - 'scripts/**/*.py'
       - 'crates/fullmag-workspace-inspect/**'
+      - 'crates/fullmag-session/src/frequency_domain_artifact_generation.rs'
+      - 'crates/fullmag-session/src/lib.rs'
+      - 'crates/fullmag-runner/src/artifact_generation.rs'
       - 'packages/fullmag-py/**'
       - '.github/workflows/dispersion-artifact-consumers.yml'
   push:
@@ -14,6 +17,9 @@ on:
       # Consumers import validators, receipts and analytic oracles across scripts.
       - 'scripts/**/*.py'
       - 'crates/fullmag-workspace-inspect/**'
+      - 'crates/fullmag-session/src/frequency_domain_artifact_generation.rs'
+      - 'crates/fullmag-session/src/lib.rs'
+      - 'crates/fullmag-runner/src/artifact_generation.rs'
       - 'packages/fullmag-py/**'
       - '.github/workflows/dispersion-artifact-consumers.yml'
 
@@ -67,6 +73,18 @@ jobs:
           scripts/test_run_comsol_dispersion_benchmark.py
           packages/fullmag-py/tests/test_gmsh_quality_units.py
 
+      - name: Validate captured pilot and physical-potential consumers
+        env:
+          PYTHONPATH: scripts
+          MPLBACKEND: Agg
+        run: >-
+          python -B -m pytest -q
+          scripts/test_run_de_100nm_pilot.py
+          scripts/test_de_physical_potential.py
+          scripts/test_de_shifted_ksp_trial.py
+          scripts/test_de_gamma_krylov_trial.py
+          scripts/test_de_signed_state_closure.py
+
   terminal-artifact-attestation:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -84,6 +102,8 @@ jobs:
         with:
           python-version: '3.11'
       - name: Verify terminal producer publication and platform file safety
-        run: cargo test --locked -p fullmag-workspace-inspect --lib
+        run: |
+          cargo test --locked -p fullmag-session --lib frequency_domain_artifact_generation
+          cargo test --locked -p fullmag-workspace-inspect --lib
       - name: Verify immutable artifact binding and bounded reader races
         run: python -B scripts/test_managed_runtime_artifact_root.py -v

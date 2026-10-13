@@ -50,6 +50,54 @@ class SignedStateClosureTests(unittest.TestCase):
         self.assertNotEqual(before["file_table_sha256"], after["file_table_sha256"])
         self.assertEqual(before["files"][0]["native_content_sha256"], after["files"][0]["native_content_sha256"])
 
+    def test_captured_generation_inventory_ignores_stale_root_state_aliases(self):
+        producer = self.case / "equilibrium/producer/metadata.json"
+        producer.parent.mkdir(parents=True)
+        producer.write_bytes(b'{"producer":"exact"}')
+        nested = self.meta / "nonshared_source/mesh.bin"
+        nested.parent.mkdir()
+        nested.write_bytes(b"mesh-and-markers")
+        payloads = {
+            path.relative_to(self.case).as_posix(): path.read_bytes()
+            for path in self.case.rglob("*") if path.is_file()
+        }
+        case_root = self.case
+
+        class CapturedGeneration:
+            def __init__(self):
+                self.root = case_root
+                self.payloads = payloads
+                self.generation = type("Generation", (), {
+                    "members": {
+                        name: type("Member", (), {"byte_length": len(value)})()
+                        for name, value in payloads.items()
+                    }
+                })()
+
+            def iter_members(self, prefix):
+                return tuple(sorted(
+                    name for name in self.payloads
+                    if name == prefix or name.startswith(prefix + "/")
+                ))
+
+            def read_bytes(self, relative, *, maximum_bytes=None):
+                value = self.payloads[relative]
+                if maximum_bytes is None or len(value) > maximum_bytes:
+                    raise ValueError("captured state read was not bounded")
+                return value
+
+        reader = CapturedGeneration()
+        for relative in payloads:
+            self.case.joinpath(*relative.split("/")).unlink()
+        self.eq.write_text("{stale alias", encoding="utf-8")
+        closure_value = closure.collect_signed_state_closure(
+            self.case, bundle_reader=reader)
+        self.assertEqual(closure_value["file_count"], 3)
+        self.assertEqual(
+            {entry["path"] for entry in closure_value["files"]},
+            set(payloads),
+        )
+
     def test_invalid_schema_content_and_duplicate_keys_rejected(self):
         for payload in ('{"schema_version":"wrong"}',
                         '{"schema_version":"equilibrium_artifact.v8","content_sha256":"bad"}',
@@ -87,6 +135,18 @@ class SignedStateClosureTests(unittest.TestCase):
         from contextlib import ExitStack
         from types import SimpleNamespace
         import run_de_100nm_pilot as pilot
+
+        def resolve_case(output, case_name, _model_sha256, *, metadata_bytes_loader):
+            case_dir = Path(output) / case_name
+            metadata_path = case_dir / "metadata.json"
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            if not metadata_path.exists():
+                metadata_path.write_text("{}", encoding="utf-8")
+            raw = metadata_path.read_bytes()
+            if metadata_bytes_loader(case_dir) != raw:
+                raise AssertionError("resolver did not use captured metadata bytes")
+            return case_dir, {"run_id": "closure-test-run"}
+
         for with_equilibrium in (True, False):
             with self.subTest(with_equilibrium=with_equilibrium), tempfile.TemporaryDirectory() as temporary:
                 output = Path(temporary)
@@ -99,6 +159,7 @@ class SignedStateClosureTests(unittest.TestCase):
                     stack.enter_context(patch.object(pilot.managed, "_run_request", return_value={"source": {}, "job": {}, "runtime": {}}))
                     stack.enter_context(patch.object(pilot.managed, "_compose_environment", return_value={}))
                     stack.enter_context(patch.object(pilot.subprocess, "run", return_value=SimpleNamespace(returncode=0)))
+                    stack.enter_context(patch.object(pilot, "resolve_runtime_artifact_root", side_effect=resolve_case))
                     stack.enter_context(patch.object(pilot.managed, "_validate_case_artifacts", return_value={"required_artifact_hashes": {}}))
                     stack.enter_context(patch.object(pilot, "validate_rows", return_value={"sample_count": 15}))
                     stack.enter_context(patch.object(pilot, "validate_smoke_potential_fields", return_value={"status": "consistent"}))

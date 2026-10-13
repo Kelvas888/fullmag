@@ -18,20 +18,25 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
+from comsol_modal_field_certificate import ArtifactBundleReader
 from managed_runtime_artifact_root import (
     RuntimeArtifactRootError,
     resolve_runtime_artifact_root,
 )
-from de_pilot_receipts import verify_required_artifact_hash, validate_de_pilot_receipts
+from de_pilot_receipts import validate_de_pilot_receipts, verify_required_artifact_hash
 from validate_de_smoke_rows import (
     DENSE_CERTIFICATION_TOLERANCE,
+    MAX_DE_SMOKE_CSV_BYTES,
+    MAX_DE_SMOKE_JSON_BYTES,
     MAX_PROBE_RELATIVE_TOLERANCE,
     PARALLEL_PROBE_VECTORS_RAD_PER_M,
     load_spectrum_v3_modes,
@@ -56,6 +61,8 @@ FREQUENCY_RELATIVE_TOLERANCE = MAX_PROBE_RELATIVE_TOLERANCE
 FREQUENCY_ABSOLUTE_TOLERANCE_HZ = 1e-6
 RESIDUAL_PARITY_ABSOLUTE_TOLERANCE = PHYSICAL_RESIDUAL_TOLERANCE
 MAX_JSON_BYTES = 64 * 1024 * 1024
+MAX_CASE_ARTIFACT_BYTES = 1024**3
+MAX_CASE_ARTIFACT_TOTAL_BYTES = 2 * 1024**3
 KNOWN_MODES = frozenset(("serial", "adaptive"))
 EXPECTED_POLICY = {
     "max_cpu_percent": 90.0,
@@ -94,11 +101,20 @@ def _reject_nonfinite_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant is not allowed: {value}")
 
 
-def _load_json(path: Path, label: str) -> Mapping[str, Any]:
+def _load_json(path: Path, label: str, *, bundle_reader=None) -> Mapping[str, Any]:
     try:
-        raw = path.read_bytes()
-    except OSError as error:
+        if bundle_reader is None:
+            raw = path.read_bytes()
+        else:
+            root = getattr(bundle_reader, "root", None)
+            if not isinstance(root, Path):
+                raise ValidationError("captured artifact reader has no bound root")
+            relative = path.absolute().relative_to(root.absolute()).as_posix()
+            raw = bundle_reader.read_bytes(relative, maximum_bytes=MAX_JSON_BYTES)
+    except FileNotFoundError as error:
         raise EvidenceUnavailable(f"missing {label}: {path}") from error
+    except (OSError, ValueError) as error:
+        raise ValidationError(f"cannot read captured {label}: {error}") from error
     if len(raw) > MAX_JSON_BYTES:
         raise ValidationError(f"{label} exceeds the bounded JSON size")
     try:
@@ -374,9 +390,12 @@ def _manifest_identity(
     case_dir: Path,
     probe: Mapping[str, Any],
     solver_artifacts: Mapping[str, Any],
+    *,
+    bundle_reader=None,
 ) -> dict[str, Any]:
     manifest_path = case_dir / MANIFEST_RELATIVE_PATH
-    manifest = _load_json(manifest_path, "frequency-domain manifest")
+    manifest = _load_json(
+        manifest_path, "frequency-domain manifest", bundle_reader=bundle_reader)
     if manifest.get("schema_version") != "frequency_domain_manifest.v1":
         raise ValidationError("frequency-domain manifest schema is unsupported")
     if manifest.get("study_product") not in (None, "modal_eigen"):
@@ -386,6 +405,7 @@ def _manifest_identity(
         diagnostics = _load_json(
             case_dir / "eigen/diagnostics/solver.v1.json",
             "solver diagnostics for mesh identity",
+            bundle_reader=bundle_reader,
         )
         mesh = _first_named_value(diagnostics, _MESH_IDENTITY_KEYS)
     if mesh is None:
@@ -405,6 +425,7 @@ def _manifest_identity(
         diagnostics = _load_json(
             case_dir / "eigen/diagnostics/solver.v1.json",
             "solver diagnostics for operator identity",
+            bundle_reader=bundle_reader,
         )
         operator = _first_named_value(diagnostics, _REQUIRED_MANIFEST_DIGESTS)
     if operator is None:
@@ -449,7 +470,9 @@ def _manifest_identity(
     if found_state is None:
         raise EvidenceUnavailable("manifest has no native linearization_state_sha256")
     linearization_digest = _digest_prefixed(found_state[1], "manifest.linearization_state_sha256")
-    spectrum = _load_json(case_dir / "eigen/spectrum.v3.json", "native sample identities")
+    spectrum = _load_json(
+        case_dir / "eigen/spectrum.v3.json", "native sample identities",
+        bundle_reader=bundle_reader)
     samples = spectrum.get("samples")
     if not isinstance(samples, list) or len(samples) != EXPECTED_SAMPLE_COUNT:
         raise EvidenceUnavailable("spectrum has no complete native per-sample identities")
@@ -491,15 +514,35 @@ def _manifest_identity(
     }
 
 
-def _read_probe_rows(case_dir: Path) -> dict[tuple[int, int], dict[str, Any]]:
+def _read_probe_rows(case_dir: Path, *, bundle_reader=None) -> dict[tuple[int, int], dict[str, Any]]:
     csv_path = case_dir / "eigen/dispersion.csv"
-    spectrum = load_spectrum_v3_modes(case_dir / "eigen/spectrum.v3.json")
+    if bundle_reader is None:
+        spectrum_bytes = None
+    else:
+        root = getattr(bundle_reader, "root", None)
+        if not isinstance(root, Path) or case_dir.absolute() != root.absolute():
+            raise ValidationError("probe row reader belongs to another artifact root")
+        spectrum_bytes = bundle_reader.read_bytes(
+            "eigen/spectrum.v3.json", maximum_bytes=MAX_DE_SMOKE_JSON_BYTES)
+    spectrum = load_spectrum_v3_modes(
+        case_dir / "eigen/spectrum.v3.json", verified_bytes=spectrum_bytes)
     expected_vectors = PARALLEL_PROBE_VECTORS_RAD_PER_M
     rows: dict[tuple[int, int], dict[str, Any]] = {}
-    try:
-        stream = csv_path.open(encoding="utf-8-sig", newline="")
-    except OSError as error:
-        raise EvidenceUnavailable(f"missing dispersion CSV: {csv_path}") from error
+    if bundle_reader is None:
+        try:
+            stream = csv_path.open(encoding="utf-8-sig", newline="")
+        except OSError as error:
+            raise EvidenceUnavailable(f"missing dispersion CSV: {csv_path}") from error
+    else:
+        try:
+            csv_bytes = bundle_reader.read_bytes(
+                "eigen/dispersion.csv", maximum_bytes=MAX_DE_SMOKE_CSV_BYTES)
+            stream = io.TextIOWrapper(
+                io.BytesIO(csv_bytes), encoding="utf-8-sig", newline="")
+        except FileNotFoundError as error:
+            raise EvidenceUnavailable(f"missing dispersion CSV: {csv_path}") from error
+        except (OSError, ValueError) as error:
+            raise ValidationError(f"cannot read captured dispersion CSV: {error}") from error
     with stream:
         reader = csv.DictReader(stream)
         required = {
@@ -555,7 +598,9 @@ def _read_probe_rows(case_dir: Path) -> dict[tuple[int, int], dict[str, Any]]:
     return rows
 
 
-def _case_artifact_hash_bindings(result: Mapping[str, Any], case_dir: Path, mode: str) -> dict[str, Any]:
+def _case_artifact_hash_bindings(
+    result: Mapping[str, Any], case_dir: Path, mode: str, *, bundle_reader=None
+) -> dict[str, Any]:
     artifacts = result.get("artifacts")
     hashes = artifacts.get("required_artifact_hashes") if isinstance(artifacts, Mapping) else None
     if not isinstance(hashes, Mapping) or not hashes:
@@ -566,13 +611,40 @@ def _case_artifact_hash_bindings(result: Mapping[str, Any], case_dir: Path, mode
         raise EvidenceUnavailable(f"{mode} required artifact hash catalog omits {sorted(required - hashes.keys())}")
     if any(not isinstance(path, str) for path in hashes):
         raise ValidationError(f"{mode} artifact hash catalog has a non-string path")
+    if bundle_reader is not None:
+        root = getattr(bundle_reader, "root", None)
+        if not isinstance(root, Path) or case_dir.absolute() != root.absolute():
+            raise ValidationError(f"{mode} artifact reader belongs to another case")
     bindings = {}
+    total_size = 0
     for relative in sorted(hashes):
+        entry = hashes[relative]
+        if not isinstance(entry, Mapping):
+            raise ValidationError(f"{mode} artifact hash entry is malformed: {relative}")
+        size = entry.get("size")
+        expected_digest = entry.get("sha256")
+        if type(size) is not int or size <= 0 or size > MAX_CASE_ARTIFACT_BYTES:
+            raise ValidationError(f"{mode} artifact size binding is invalid: {relative}")
+        if not isinstance(expected_digest, str) or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None:
+            raise ValidationError(f"{mode} artifact SHA-256 binding is invalid: {relative}")
+        total_size += size
+        if total_size > MAX_CASE_ARTIFACT_TOTAL_BYTES:
+            raise ValidationError(f"{mode} artifact hash catalog exceeds its byte budget")
         try:
-            binding = verify_required_artifact_hash(result, case_dir.parent, case_dir.name, relative)
+            if bundle_reader is None:
+                binding = verify_required_artifact_hash(
+                    result, case_dir.parent, case_dir.name, relative)
+            else:
+                payload = bundle_reader.read_bytes(relative, maximum_bytes=size)
+                if len(payload) != size:
+                    raise ValueError("receipt-bound artifact size differs from run-result")
+                actual = hashlib.sha256(payload).hexdigest()
+                if actual != expected_digest:
+                    raise ValueError("receipt-bound artifact SHA-256 differs from run-result")
+                binding = {"sha256": actual, "size": len(payload)}
+        except FileNotFoundError as error:
+            raise EvidenceUnavailable(f"{mode} receipt-bound artifact is missing: {relative}") from error
         except (OSError, TypeError, ValueError) as error:
-            if isinstance(error.__cause__, FileNotFoundError):
-                raise EvidenceUnavailable(f"{mode} receipt-bound artifact is missing: {relative}") from error
             if relative == REPORT_RELATIVE_PATH:
                 raise ValidationError(f"{mode} report hash binding failed: {error}") from error
             raise ValidationError(f"{mode} receipt-bound artifact failed: {relative}: {error}") from error
@@ -584,9 +656,18 @@ def _case_artifact_hash_bindings(result: Mapping[str, Any], case_dir: Path, mode
 def _validate_case(receipt: Mapping[str, Any], mode: str) -> dict[str, Any]:
     output_root = Path(receipt["root"])
     model_sha256 = _digest(receipt["probe"]["model_sha256"], f"{mode}.model_sha256")
+    captured = {}
+
+    def load_metadata(artifact_root: Path) -> bytes:
+        if captured:
+            raise ValidationError("runtime resolver requested artifact metadata more than once")
+        reader = ArtifactBundleReader(Path(artifact_root))
+        captured["reader"] = reader
+        return reader.read_bytes("metadata.json", maximum_bytes=MAX_JSON_BYTES)
+
     try:
         case_dir, resolved_binding = resolve_runtime_artifact_root(
-            output_root, PILOT, model_sha256
+            output_root, PILOT, model_sha256, metadata_bytes_loader=load_metadata
         )
     except RuntimeArtifactRootError as error:
         if isinstance(error.__cause__, FileNotFoundError):
@@ -594,13 +675,35 @@ def _validate_case(receipt: Mapping[str, Any], mode: str) -> dict[str, Any]:
                 f"{mode} managed runtime artifacts are incomplete: {error}"
             ) from error
         raise ValidationError(f"{mode} managed runtime artifacts failed revalidation: {error}") from error
+    bundle_reader = captured.get("reader")
+    if not isinstance(bundle_reader, ArtifactBundleReader):
+        raise ValidationError(f"{mode} runtime resolver did not capture artifact bytes")
+    generation_descriptor = bundle_reader.generation_descriptor()
+    producer = generation_descriptor.get("producer")
+    if generation_descriptor.get("immutable") is True:
+        if not isinstance(producer, Mapping) or producer.get("run_id") != resolved_binding.get("run_id"):
+            raise ValidationError(f"{mode} immutable generation producer does not match captured runtime run")
+    elif producer is not None and (
+        not isinstance(producer, Mapping) or producer.get("run_id") != resolved_binding.get("run_id")
+    ):
+        raise ValidationError(f"{mode} generation producer does not match captured runtime run")
     result = receipt.get("result")
     recorded_binding = result.get("runtime_output_binding") if isinstance(result, Mapping) else None
     if not isinstance(recorded_binding, Mapping):
         raise EvidenceUnavailable(f"{mode} run-result is missing runtime_output_binding")
-    if dict(recorded_binding) != resolved_binding:
+    expected_binding = dict(resolved_binding)
+    actual_binding = dict(recorded_binding)
+    read_annotations = ("metadata_read_source", "metadata_logical_path")
+    if generation_descriptor.get("immutable") is not True:
+        for key in read_annotations:
+            expected = expected_binding.pop(key)
+            if key in actual_binding:
+                if actual_binding.pop(key) != expected:
+                    raise ValidationError(f"{mode} runtime_output_binding has an invalid {key}")
+    if actual_binding != expected_binding:
         raise ValidationError(f"{mode} runtime_output_binding differs from resolved artifacts")
-    artifact_bindings = _case_artifact_hash_bindings(result, case_dir, mode)
+    artifact_bindings = _case_artifact_hash_bindings(
+        result, case_dir, mode, bundle_reader=bundle_reader)
     metadata_path = case_dir / "metadata.json"
     diagnostics_path = case_dir / "eigen/diagnostics/solver.v1.json"
     try:
@@ -608,6 +711,7 @@ def _validate_case(receipt: Mapping[str, Any], mode: str) -> dict[str, Any]:
             metadata_path,
             model_sha256=_digest(receipt["probe"]["model_sha256"], f"{mode}.model_sha256"),
             parallel_mode=mode,
+            bundle_reader=bundle_reader,
         )
         solver_result = validate_parallel_probe_solver_artifacts(
             case_dir,
@@ -616,20 +720,24 @@ def _validate_case(receipt: Mapping[str, Any], mode: str) -> dict[str, Any]:
             requested_gmres_restart="8",
             expected_sample_count=EXPECTED_SAMPLE_COUNT,
             physical_residual_tolerance=PHYSICAL_RESIDUAL_TOLERANCE,
+            bundle_reader=bundle_reader,
         )
         validate_rows(
             case_dir / "eigen/dispersion.csv",
             "parallel-probe",
             diagnostics_path,
             metadata_path,
+            bundle_reader=bundle_reader,
         )
     except EvidenceUnavailable:
         raise
     except (OSError, TypeError, ValueError) as error:
         raise ValidationError(f"{mode} native probe artifacts failed revalidation: {error}") from error
-    rows = _read_probe_rows(case_dir)
-    identity = _manifest_identity(case_dir, receipt["probe"], solver_result)
-    if _case_artifact_hash_bindings(result, case_dir, mode) != artifact_bindings:
+    rows = _read_probe_rows(case_dir, bundle_reader=bundle_reader)
+    identity = _manifest_identity(
+        case_dir, receipt["probe"], solver_result, bundle_reader=bundle_reader)
+    if _case_artifact_hash_bindings(
+        result, case_dir, mode, bundle_reader=bundle_reader) != artifact_bindings:
         raise ValidationError(f"{mode} artifact binding changed during revalidation")
     return {
         "status": "pass",
@@ -639,6 +747,7 @@ def _validate_case(receipt: Mapping[str, Any], mode: str) -> dict[str, Any]:
         "solver_artifacts": solver_result,
         "rows": rows,
         "mesh_identity": identity,
+        "bundle_reader": bundle_reader,
     }
 
 
@@ -676,7 +785,9 @@ def _report_inputs(value: Mapping[str, Any], probe: Mapping[str, Any]) -> dict[i
     return result
 
 
-def _artifact_hash_binding(result: Mapping[str, Any], report_path: Path) -> dict[str, Any]:
+def _artifact_hash_binding(
+    result: Mapping[str, Any], report_path: Path, *, bundle_reader=None
+) -> dict[str, Any]:
     artifacts = result.get("artifacts")
     if not isinstance(artifacts, Mapping):
         raise EvidenceUnavailable("run-result has no artifact hash catalog for the adaptive report")
@@ -687,10 +798,22 @@ def _artifact_hash_binding(result: Mapping[str, Any], report_path: Path) -> dict
     if not isinstance(entry, Mapping):
         raise EvidenceUnavailable("run-result does not bind eigen/parallel_execution.v1.json")
     declared = _digest(entry.get("sha256"), "required_artifact_hashes.parallel_execution.sha256")
+    expected_size = entry.get("size")
+    if type(expected_size) is not int or expected_size <= 0 or expected_size > MAX_JSON_BYTES:
+        raise ValidationError("adaptive process-pool report has an invalid size binding")
     try:
-        actual = hashlib.sha256(report_path.read_bytes()).hexdigest()
-    except OSError as error:
+        if bundle_reader is None:
+            payload = report_path.read_bytes()
+        else:
+            payload = bundle_reader.read_bytes(
+                REPORT_RELATIVE_PATH, maximum_bytes=expected_size)
+        if len(payload) != expected_size:
+            raise ValueError("report length differs from run-result binding")
+        actual = hashlib.sha256(payload).hexdigest()
+    except FileNotFoundError as error:
         raise EvidenceUnavailable(f"cannot read adaptive process-pool report: {report_path}") from error
+    except (OSError, ValueError) as error:
+        raise ValidationError(f"cannot verify adaptive process-pool report: {error}") from error
     if declared != actual:
         raise ValidationError("adaptive process-pool report hash differs from run-result binding")
     return {"status": "pass", "relative_path": REPORT_RELATIVE_PATH, "sha256": actual}
@@ -702,9 +825,15 @@ def _validate_process_report(
     case: Mapping[str, Any],
     *,
     required: bool,
+    bundle_reader=None,
 ) -> dict[str, Any]:
     report_path = Path(case["case_dir"]) / REPORT_RELATIVE_PATH
-    if not report_path.is_file():
+    try:
+        present = (report_path.is_file() if bundle_reader is None
+                   else bundle_reader.has_member(REPORT_RELATIVE_PATH))
+    except (OSError, ValueError) as error:
+        raise ValidationError(f"{mode} process-pool report membership is invalid: {error}") from error
+    if not present:
         if required:
             return {
                 "present": False,
@@ -718,7 +847,8 @@ def _validate_process_report(
             "status": "not_required",
             "reason": "serial producer may omit a process-pool report",
         }
-    raw = _load_json(report_path, f"{mode} process-pool report")
+    raw = _load_json(
+        report_path, f"{mode} process-pool report", bundle_reader=bundle_reader)
     try:
         report_inputs = _report_inputs(raw, receipt["probe"])
     except EvidenceUnavailable as error:
@@ -727,6 +857,7 @@ def _validate_process_report(
             "required": required,
             "status": "not_verified",
             "reason": str(error),
+            "_source_report": raw,
         }
     validation = validate_parallel_execution_report(
         raw,
@@ -736,7 +867,8 @@ def _validate_process_report(
     )
     if required:
         try:
-            binding = _artifact_hash_binding(receipt["result"], report_path)
+            binding = _artifact_hash_binding(
+                receipt["result"], report_path, bundle_reader=bundle_reader)
         except EvidenceUnavailable as error:
             return {
                 "present": True,
@@ -745,6 +877,7 @@ def _validate_process_report(
                 "reason": str(error),
                 "validation": validation,
                 "input_binding": report_inputs,
+                "_source_report": raw,
             }
         concurrency = validation.get("concurrency", {})
         if concurrency.get("status") != "observed_from_active_count":
@@ -756,6 +889,7 @@ def _validate_process_report(
                 "validation": validation,
                 "input_binding": report_inputs,
                 "artifact_binding": binding,
+                "_source_report": raw,
             }
         if validation.get("resource_quality", {}).get("status") == "not_verified":
             return {
@@ -766,6 +900,7 @@ def _validate_process_report(
                 "validation": validation,
                 "input_binding": report_inputs,
                 "artifact_binding": binding,
+                "_source_report": raw,
             }
         return {
             "present": True,
@@ -776,6 +911,7 @@ def _validate_process_report(
             "input_binding": report_inputs,
             "artifact_binding": binding,
             "completion_bound_to_run_result": True,
+            "_source_report": raw,
         }
     return {
         "present": True,
@@ -784,6 +920,7 @@ def _validate_process_report(
         "reason": "serial process-pool report is optional structural evidence",
         "validation": validation,
         "input_binding": report_inputs,
+        "_source_report": raw,
     }
 
 
@@ -907,20 +1044,31 @@ def validate_serial_adaptive_probe(serial_dir: str | Path, adaptive_dir: str | P
         }
 
     serial_report = _validate_process_report(
-        serial_receipt, "serial", serial_case, required=False
+        serial_receipt, "serial", serial_case, required=False,
+        bundle_reader=serial_case["bundle_reader"],
     )
     adaptive_report = _validate_process_report(
-        adaptive_receipt, "adaptive", adaptive_case, required=True
+        adaptive_receipt, "adaptive", adaptive_case, required=True,
+        bundle_reader=adaptive_case["bundle_reader"],
     )
+    serial_report_source = serial_report.pop("_source_report", None)
+    adaptive_report_source = adaptive_report.pop("_source_report", None)
     report_parity: dict[str, Any] = {
         "status": "not_required",
         "reason": "serial producer may omit eigen/parallel_execution.v1.json",
     }
     if serial_report.get("present") and adaptive_report.get("present"):
-        serial_report_path = Path(serial_case["case_dir"]) / REPORT_RELATIVE_PATH
-        adaptive_report_path = Path(adaptive_case["case_dir"]) / REPORT_RELATIVE_PATH
-        report_parity = compare_serial_adaptive_policy(serial_report_path, adaptive_report_path)
+        if not isinstance(serial_report_source, Mapping) or not isinstance(adaptive_report_source, Mapping):
+            raise ValidationError("captured serial/adaptive process report bytes were not retained")
+        report_parity = compare_serial_adaptive_policy(
+            serial_report_source, adaptive_report_source)
         report_parity = {**report_parity, **_compare_report_inputs(serial_report, adaptive_report)}
+
+    for mode, case in (("serial", serial_case), ("adaptive", adaptive_case)):
+        try:
+            case["bundle_reader"].ensure_current()
+        except (OSError, ValueError) as error:
+            raise ValidationError(f"{mode} artifact generation changed during validation: {error}") from error
 
     structural_status = "pass" if adaptive_report.get("status") == "pass" \
         and mesh_identity.get("status") == "pass" else "not_verified"

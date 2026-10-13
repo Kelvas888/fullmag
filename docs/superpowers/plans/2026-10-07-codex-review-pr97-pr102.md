@@ -4057,3 +4057,29 @@ CI [38451279472](https://github.com/MateuszZelent/fullmag/actions/runs/384512794
 UI CI [38451138313](https://github.com/MateuszZelent/fullmag/actions/runs/38451138313), exact `03b960143ca6641bfc2c1140e4b086c82e5c09e2`: 1000 passed / 13 failed. Stare pozytywne fixture komend nie przekazywały kanonicznej pary; typecheck wykrył zbyt szerokie rzutowanie SelectionRef. Korekta dotyczy dwóch testów: jawna para odpowiada stored data_ref, dodatkowa odmowa bez pary przed wywołaniem API, konkretny typ frequency-domain zamiast rzutowania. Asercje historii, sesji i deduplikacji zachowane. Architecture hygiene PASS w poprzednim CI; nowa bramka UI pending, browser/runtime NOT VERIFIED.
 
 Native CI [38451671677](https://github.com/MateuszZelent/fullmag/actions/runs/38451671677), exact `3088fe864bb0e22b1917f3fee6d13c7c02a7f9e9`, trwa. Dense zachowuje rolę bridge walidacyjnego z pełnymi residualami mixed; recovery ma osobny kontrakt sparse. PR97 nadal otwarty; nie uznajemy całego planu za zakończony.
+
+UI CI [38452643432](https://github.com/MateuszZelent/fullmag/actions/runs/38452643432), exact `7b1ff405f8f32027a7419956ee1b4dc29e9c6ea7`: SUCCESS. 48 plików / 1014 tests PASS, pełny typecheck oraz architecture hygiene PASS. React Doctor ukończył skan 232 plików: 85/100, dziewięć ostrzeżeń (barrel imports 4, useReducer 1, exports 3, property access 1), bez utożsamiania wyniku CI z brakiem długu. Ostrzeżenia wymagają oceny w źródłach, nie automatycznego suppress. Browser z rzeczywistymi artefaktami pozostaje NOT VERIFIED.
+
+### Review pilota — kontrakt archiwum FMS
+
+Eksporter `fullmag-session/src/fms.rs::plan_artifact_directory` kopiuje fizyczne drzewo, w tym markery, immutable generation storage/history i pozostałe aliasy. Nowy reader pilota nie może utożsamiać logical membership z listą nazw ZIP. Wymagane są oddzielne kontrole: exact physical archive binding z ograniczonymi odczytami oraz certyfikacja current generation z jego readera. Obecny selector jest związany z captured marker digest, a current members z captured member bytes; historyczne pliki/aliasy są tylko elementami layoutu eksportu. Końcowy fence i kompletność bieżących członków pozostają obowiązkowe. Korekta w toku; nie jest jeszcze dowodem eksportu runtime.
+
+### Dodatkowa korekta limitu sidecarów potencjału
+
+Review migracji `validate_de_physical_potential.py` wykazało, że `_validate_manifest` pobierał i buforował sidecary z limitem obliczonym z niezweryfikowanych `potential.count`/`demag_field.count`, przed porównaniem z siatką. Wcześniejsze member verification było streamingowe i nie ustanawiało niezależnego limitu alokacji. Wymagana korekta: bounded metadata (16 MiB), walidacja rzeczywistych tablic w `_extract_mesh`, porównanie deklarowanych counts przed binary hash/read, a dopiero potem limit wyniku wynikający z liczby sprawdzonych węzłów/Tet4. Tolerancja rekonstrukcji, jednostki i admission fizyczne nie zmieniają się. Regresja ma odmówić nadmiernego count bez odczytu binary member; runtime pending.
+
+### Wynik natywnej bramki 38451671677
+
+CI na exact `3088fe864bb0e22b1917f3fee6d13c7c02a7f9e9`: FAILURE, 16/17 CTest PASS. Wszystkie trzy sparse certified recovery, forced inner failure, gamma admission oraz mixed dense/full residual PASS. Test45 nadal FAIL: nearest hard KSP failure serializes its failure-only scalar probe. Nowy artefakt pokazuje `stop_reason=petsc_runtime_unsafe`, `ksp_diagnostics_available=false`, `solve_complete=false`, przed dostępnością oczekiwanego scalar probe. Pięciowęzłowa candidate fixture nie zapewniła właściwego wyzwolenia scenariusza. Wymagane prześledzenie wcześniejszego quarantine i izolacji testu; nie zmieniono progu, reasonu ani admission. To nie jest nowy poprawny punkt dyspersji ani pełna kwalifikacja natywna.
+
+### Zamrożony checkpoint migracji konsumentów i terminalnego attestation
+
+Pilot/serial-probe oraz helpery potencjału, KSP Gamma/nonzero i signed closure korzystają ze wspólnego captured readera do parsowania i hashy oraz obowiązkowego końcowego fence. Review całego diffu wykryło i poprawiło przecięty test, fizyczny układ FMS, weryfikację markera przed członkami oraz alokację sidecarów przed kontrolą siatki. ZIP ma preflight zasobów przed odczytem/CRC; raw history/aliases pozostają tylko layout binding, a current members osobną certyfikacją. Regresje count mismatch i uszkodzonej siatki obejmują świeże legacy i rzeczywiste v2; legacy binary read ma limit expected_size+1.
+
+Rust read-only core przeniesiono do fullmag-session, zachowując facade runnera. Źródłowe porównanie 19 ciał funkcji z exact remote 7b1ff405 nie wykazało zmian; to kontrola ekstrakcji, nie runtime. Golden UTF-8 i reader regressions znajdują się w nowym module; terminalny inspector ma v1/v2, owner/no-fallback/fence checks i utrzymuje wcześniejszy manifest running przy błędzie. Lokalny Cargo.lock pozostaje nienaruszony; remote-only tree dodaje wyłącznie bezpośrednią zależność inspectora fullmag-session w odpowiedniej sekcji lockfile. Nie zmieniono wersji zależności.
+
+AST Python oraz parser Rust PASS bez uruchamiania testów projektu. Workflow rozszerzony o pełne testy pilota/potencjału/KSP/closure i wspólny Rust reader na Ubuntu/Windows. Wykonanie nowego fragmentu pozostaje NOT VERIFIED do rzeczywistego CI. Produkcyjny immutable writer nadal nieaktywny; native test45 i naukowe DE/BV/A1 oraz browser/runtime pozostają otwarte. PR97 niegotowy do merge.
+
+### Potwierdzona przyczyna kwarantanny testu 45
+
+Pierwszy hard opt-out wywołuje oczekiwany błąd EPSSolve/PCApply (log 13080–13099), który zgodnie z produkcyjnym kontraktem kwarantannuje PETSc. Kolejny nearest w tym samym procesie otrzymuje więc poprawny fast-fail petsc_runtime_unsafe zamiast nowego snapshotu. Przyczyna nie wymaga osłabienia solvera: opt-out, nearest, window i fresh-LU fault potrzebują osobnych procesów/selectorów. Izolacja w toku, nowa bramka natywna pending.

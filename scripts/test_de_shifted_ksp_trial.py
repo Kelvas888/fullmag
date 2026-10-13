@@ -139,6 +139,26 @@ def _write_case(root, diagnostics):
 
 
 class ShiftedKspTrialValidatorTests(unittest.TestCase):
+    def test_captured_diagnostics_bytes_override_stale_root_alias(self):
+        with TemporaryDirectory() as temporary:
+            case = _write_case(temporary, _diagnostics("k2"))
+            path = case / "eigen/diagnostics/solver.v1.json"
+            captured = path.read_bytes()
+            path.write_text("{stale alias", encoding="utf-8")
+
+            class CapturedReader:
+                def __init__(self):
+                    self.root = case
+
+                def read_bytes(self, relative, *, maximum_bytes=None):
+                    if relative != "eigen/diagnostics/solver.v1.json" or maximum_bytes is None:
+                        raise ValueError("unexpected diagnostics read")
+                    return captured
+
+            report = validate_shifted_ksp_trial(
+                case, "k2", "gmres", "1e-9", bundle_reader=CapturedReader())
+            self.assertEqual(report["status"], "pass")
+
     def test_de_and_bv_sample_vectors_use_their_declared_axes(self):
         cases = (("k2", 0, [0.0, 2e6, 0.0]),
                  ("bv-k25", 0, [25e6, 0.0, 0.0]))

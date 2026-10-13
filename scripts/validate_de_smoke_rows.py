@@ -50,11 +50,22 @@ MAX_DE_SMOKE_CSV_BYTES = 8 * 1024 * 1024
 PHASE_CONSTRAINT_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
+def _captured_member_bytes(bundle_reader, case_dir: Path, relative: str, maximum_bytes: int) -> bytes:
+    root = getattr(bundle_reader, "root", None)
+    if not isinstance(root, Path) or Path(case_dir).absolute() != root.absolute():
+        raise ValueError("DE-SMOKE bundle reader belongs to another artifact root")
+    read_member = getattr(bundle_reader, "read_bytes", None)
+    if not callable(read_member):
+        raise TypeError("DE-SMOKE bundle reader must provide read_bytes")
+    return read_member(relative, maximum_bytes=maximum_bytes)
+
+
 def validate_parallel_probe_metadata(
     metadata_path: Path,
     *,
     model_sha256: str,
     parallel_mode: str,
+    bundle_reader=None,
 ):
     """Validate the closed probe's authoring and native execution metadata.
 
@@ -68,8 +79,16 @@ def validate_parallel_probe_metadata(
             or any(character not in "0123456789abcdef" for character in model_sha256):
         raise ValueError("parallel probe model hash is invalid")
     try:
-        metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        if bundle_reader is None:
+            raw_metadata = Path(metadata_path).read_bytes()
+        else:
+            raw_metadata = _captured_member_bytes(
+                bundle_reader, Path(metadata_path).absolute().parent,
+                "metadata.json", MAX_DE_SMOKE_JSON_BYTES)
+        if len(raw_metadata) > MAX_DE_SMOKE_JSON_BYTES:
+            raise ValueError("parallel probe metadata exceeds its byte budget")
+        metadata = json.loads(raw_metadata.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         raise ValueError("missing or invalid parallel probe metadata") from error
     try:
         model = metadata["problem_meta"]["runtime_metadata"]["de_smoke"]
@@ -169,6 +188,7 @@ def validate_parallel_probe_solver_artifacts(
     requested_gmres_restart: str,
     expected_sample_count: int | None = None,
     physical_residual_tolerance: float = DENSE_CERTIFICATION_TOLERANCE,
+    bundle_reader=None,
 ):
     """Validate resolved modal, KSP and Floquet evidence from native artifacts.
 
@@ -200,11 +220,21 @@ def validate_parallel_probe_solver_artifacts(
             or expected_sample_count <= 0):
         raise ValueError("parallel probe expected sample count is invalid")
     case_dir = Path(case_dir)
+    if bundle_reader is not None:
+        root = getattr(bundle_reader, "root", None)
+        if not isinstance(root, Path) or Path(case_dir).absolute() != root.absolute():
+            raise ValueError("parallel probe bundle reader belongs to another artifact root")
 
     def read_json(relative, label):
         try:
-            value = json.loads((case_dir / relative).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            if bundle_reader is None:
+                raw = (case_dir / relative).read_bytes()
+            else:
+                raw = bundle_reader.read_bytes(relative, maximum_bytes=MAX_DE_SMOKE_JSON_BYTES)
+            if len(raw) > MAX_DE_SMOKE_JSON_BYTES:
+                raise ValueError("artifact exceeds its byte budget")
+            value = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
             raise ValueError(f"parallel probe {label} artifact is missing or invalid") from error
         if not isinstance(value, dict):
             raise ValueError(f"parallel probe {label} artifact must be an object")

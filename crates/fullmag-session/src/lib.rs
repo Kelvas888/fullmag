@@ -25,6 +25,7 @@ mod durability;
 mod development_owner;
 pub mod development_restart_transport;
 pub mod execution_profiles;
+pub mod frequency_domain_artifact_generation;
 pub mod fms;
 pub mod host_resource_ledger;
 pub mod mesh_operation;
