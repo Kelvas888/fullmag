@@ -621,3 +621,20 @@ Rozpoczęto managed `archive-windows-native-build` dla manifestu F,
 sesja 41147, w celu uzyskania kanonicznego eksportu z receipt. Następnie
 wymagana jest regeneracja i weryfikacja typów oraz nowy zgodny frozen
 pakiet frontendu. Restore→Compute i publiczny restart pozostają OPEN.
+
+## Synchronizacja wygenerowanego kontraktu batchów
+
+Archiwizacja F: sesja 41147 exit 0, receipt
+`5f5c8885e78c4c898629bd48d7a60f7f`, completed, 33 kontrole,
+koniec `2026-10-13T13:30:30.201857+02:00`. Kanoniczny eksport zaimportowano
+przez generate-openapi-v2.mjs z expected commit 9112d38880f4, pełnym
+snapshotem 265562cc0f58 i walidacją native receipt. Zestaw endpointów bez
+zmian. Diff obejmuje tylko failure_policy, enum ProjectBatchFailurePolicy
+oraz stopped w ProjectBatchExpansionState; typów nie edytowano ręcznie.
+
+`just generate-control-room-client`: PASS, receipt
+`cac8d1da93534734881e0ff0eef10959`.
+`just check-control-room-production-source`: PASS exit 0, receipt
+`0acf208297b642f3ab6051f6ffe71459`. Wcześniejsze cztery błędy batch UI
+nie występują w aktualnych źródłach. Nie modyfikowano zamrożonego F;
+próba browserowa wymaga nowego pakietu zawierającego zregenerowane typy.

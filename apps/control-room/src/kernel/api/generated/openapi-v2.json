@@ -25799,7 +25799,15 @@
         "enum": [
           "pending",
           "expanding",
-          "complete"
+          "complete",
+          "stopped"
+        ],
+        "type": "string"
+      },
+      "ProjectBatchFailurePolicy": {
+        "enum": [
+          "continue_independent",
+          "stop_admission"
         ],
         "type": "string"
       },
@@ -25947,6 +25955,9 @@
           "expansion_state": {
             "$ref": "#/components/schemas/ProjectBatchExpansionState"
           },
+          "failure_policy": {
+            "$ref": "#/components/schemas/ProjectBatchFailurePolicy"
+          },
           "manifest_sha256": {
             "type": "string"
           },
@@ -25969,6 +25980,7 @@
           "accepted_at",
           "manifest_sha256",
           "case_count",
+          "failure_policy",
           "published_case_count",
           "expansion_state"
         ],

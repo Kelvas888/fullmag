@@ -11034,7 +11034,9 @@ export interface components {
             next_cursor?: string | null;
         };
         /** @enum {string} */
-        ProjectBatchExpansionState: "pending" | "expanding" | "complete";
+        ProjectBatchExpansionState: "pending" | "expanding" | "complete" | "stopped";
+        /** @enum {string} */
+        ProjectBatchFailurePolicy: "continue_independent" | "stop_admission";
         ProjectBatchListQuery: {
             /** @description Last BatchId returned on the previous page. */
             cursor?: string | null;
@@ -11089,6 +11091,7 @@ export interface components {
             /** Format: int64 */
             case_count: number;
             expansion_state: components["schemas"]["ProjectBatchExpansionState"];
+            failure_policy: components["schemas"]["ProjectBatchFailurePolicy"];
             manifest_sha256: string;
             /** Format: int32 */
             max_parallel_cases?: number | null;
