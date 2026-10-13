@@ -67,6 +67,9 @@ SOURCE_PATHS = (
     "scripts/windows/run_fullmag.ps1",
     "scripts/test_windows_development_recovery.py",
     "scripts/test_windows_development_status.py",
+    "scripts/windows/verify_workspace_browser.py",
+    "scripts/test_windows_development_scratch_process_frames.py",
+    "scripts/test_windows_development_admission_observation.py",
     "scripts/just_storage_shell.sh",
     "justfile",
 )

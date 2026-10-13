@@ -1,10 +1,12 @@
 """Interpreted scope/freshness/custody checks; not a native/browser pass."""
 import io
 import errno
+import http.client
 import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -269,6 +271,55 @@ class BrowserProofChecks(unittest.TestCase):
             for change in ({"nonce": "wrong"}, {"api_pid": 11}, {"file_name": "../" + log.name}):
                 with self.subTest(change=change), self.assertRaises(proof.storage.StorageError):
                     proof.record_api_log_frame({**frame, **change}, self.expected, state_root, {10: {}}, receipt)
+
+    def test_cancel_requires_exact_scope_and_does_not_claim_finish(self):
+        bridge = proof.ProofBridge(self.expected, 1, None, Mock())
+        body = {"schema": "fullmag.development-browser-cancel.v1", "nonce": self.expected["nonce"]}
+        for change in ({"nonce": "wrong"}, {"schema": "wrong"}, {"extra": True}):
+            with self.subTest(change=change), self.assertRaises(proof.storage.StorageError):
+                bridge.cancel({**body, **change})
+        self.assertFalse(bridge.cancelled.is_set())
+        self.assertEqual(bridge.cancel(body), {"cancel_requested": True})
+        self.assertTrue(bridge.cancelled.is_set())
+        self.assertFalse(bridge.finished.is_set())
+        self.assertIsNone(bridge.browser)
+        self.assertTrue(bridge.receipt["workspace_browser_cancel_requested"])
+        with self.assertRaisesRegex(proof.storage.StorageError, "cancellation has already"):
+            bridge.finish({})
+
+    def test_cancel_cannot_replace_a_submitted_finish(self):
+        bridge = proof.ProofBridge(self.expected, 1, None, Mock())
+        bridge.finished.set()
+        with self.assertRaises(proof.storage.StorageError):
+            bridge.cancel({"schema": "fullmag.development-browser-cancel.v1", "nonce": self.expected["nonce"]})
+        self.assertFalse(bridge.cancelled.is_set())
+
+    def test_cancel_http_rejects_foreign_origin_before_requesting_cleanup(self):
+        bridge = proof.ProofBridge(self.expected, 1, None, Mock())
+        server = proof.ThreadingHTTPServer(("127.0.0.1", 0), proof.bridge_handler(bridge))
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        body = json.dumps({"schema": "fullmag.development-browser-cancel.v1",
+                           "nonce": self.expected["nonce"]})
+        try:
+            for origin, expected_status in (("http://localhost:3197", 409),
+                                            (self.expected["ui_origin"], 200)):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                try:
+                    connection.request("POST", "/cancel", body=body,
+                                       headers={"Origin": origin, "Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, expected_status)
+                    response.read()
+                    self.assertEqual(bridge.cancelled.is_set(), expected_status == 200)
+                    self.assertFalse(bridge.finished.is_set())
+                finally:
+                    connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
 
     def test_empty_scene_cannot_be_captured_as_restart_proof(self):
         process = type("Process", (), {"poll": lambda self: None})()
