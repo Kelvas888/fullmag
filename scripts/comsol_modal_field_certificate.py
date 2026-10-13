@@ -393,7 +393,12 @@ def _read_bytes(
                 return None
             record = _file_record(path, data, case_dir)
     except (OSError, ValueError) as error:
-        reasons.append(f"{label} cannot be read: {error}")
+        if label.endswith(".potential_full.bin") and isinstance(error, ValueError):
+            reasons.append(
+                f"{label} cannot be read (expected maximum byte length {maximum_bytes}): {error}"
+            )
+        else:
+            reasons.append(f"{label} cannot be read: {error}")
         return None
     file_hashes[record["path"]] = record
     return data

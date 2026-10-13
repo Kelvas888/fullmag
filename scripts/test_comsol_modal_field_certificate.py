@@ -629,8 +629,39 @@ def test_full_potential_bytes_require_exact_size_and_manifest_hash(tmp_path: Pat
     )
 
     assert report["status"] == "fail"
-    assert any("length" in reason and "expected" in reason for reason in report["reasons"])
+    assert any(
+        "potential_full.bin" in reason and "length" in reason and "expected" in reason
+        for reason in report["reasons"]
+    )
+    potential_relative = "eigen/mode_fields/sample_0000/mode_0007/potential_full.bin"
+    assert potential_relative not in {item["path"] for item in report["file_hashes"]}
+    mode = report["modes"][0]
+    assert not any(
+        key in mode for key in ("potential_path", "potential_size_bytes", "potential_sha256")
+    )
+
+
+def test_full_potential_manifest_hash_rejects_same_length_corruption(tmp_path: Path) -> None:
+    module = load_module()
+    case_dir, _ = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    _, payload_path = write_full_potential(case_dir, good_potential_values())
+    original_payload = payload_path.read_bytes()
+    corrupted_payload = bytearray(original_payload)
+    corrupted_payload[0] ^= 1
+    payload_path.write_bytes(corrupted_payload)
+
+    report = module.validate_modal_potential_phase_certificate(
+        case_dir,
+        mode_selections=[(0, 7)],
+    )
+
+    assert report["status"] == "fail"
     assert any("SHA-256 does not match" in reason for reason in report["reasons"])
+    potential_relative = "eigen/mode_fields/sample_0000/mode_0007/potential_full.bin"
+    expected_hash = "sha256:" + hashlib.sha256(corrupted_payload).hexdigest()
+    hashes = {item["path"]: item["sha256"] for item in report["file_hashes"]}
+    assert hashes[potential_relative] == expected_hash
+    assert report["modes"][0]["potential_sha256"] == expected_hash
 
 
 def test_nonfinite_derived_potential_magnitude_cannot_pass_phase(tmp_path: Path) -> None:
