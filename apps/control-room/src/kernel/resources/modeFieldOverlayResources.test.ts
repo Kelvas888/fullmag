@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { FrequencyDomainFieldResource } from "../api/apiTypes";
-import { createModeFieldOverlayIntent } from "../visualization/ModeFieldOverlayIntent";
 import {
+  createModeFieldOverlayIntent,
   modeFieldOverlayArtifactGenerationMatches,
+} from "../visualization/ModeFieldOverlayIntent";
+import {
   resolveModeFieldOverlayMetadataRevision,
   resolveModeFieldOverlayResource,
 } from "./modeFieldOverlayResources";

@@ -11,7 +11,7 @@ import type {
 } from "../api/apiTypes";
 import type { SelectionRef } from "../selection/selectionTypes";
 import {
-  type AnalysisResultFieldOverlayIntent,
+  isAnalysisResultFieldOverlayIntent,
   type AnalysisResultFieldOverlayMetadata,
   resolveAnalysisResultFieldOverlayMetadata,
   validateAnalysisResultFieldOverlayBinary,
@@ -39,8 +39,8 @@ export interface ModeFieldOverlayIntent {
   readonly sampleIndex: number;
 }
 
-export interface ResolvedModeFieldOverlayMetadata {
-  readonly analysisResultFieldRef?: AnalysisResultFieldRef;
+interface ResolvedFrequencyDomainModeFieldOverlayMetadata {
+  readonly analysisResultFieldRef?: never;
   readonly artifactGenerationId: string | null;
   readonly artifactGenerationStatus: ModeFieldArtifactGenerationStatus;
   readonly artifactPath: string;
@@ -52,6 +52,16 @@ export interface ResolvedModeFieldOverlayMetadata {
   readonly payloadValueCount: number | null;
   readonly resourceRevision: string;
 }
+
+export interface ResolvedAnalysisResultModeFieldOverlayMetadata
+  extends AnalysisResultFieldOverlayMetadata {
+  readonly artifactGenerationId: null;
+  readonly artifactGenerationStatus: "legacy_unverified";
+}
+
+export type ResolvedModeFieldOverlayMetadata =
+  | ResolvedAnalysisResultModeFieldOverlayMetadata
+  | ResolvedFrequencyDomainModeFieldOverlayMetadata;
 
 export interface ModeFieldOverlayTopologyIdentity {
   readonly domainGenerationId: string | null;
@@ -233,13 +243,8 @@ export function validateModeFieldOverlayBinary(
   field: DecodedFieldVector | null | undefined,
   topology: ModeFieldOverlayTopologyIdentity,
 ): ValidatedModeFieldOverlayBinary | null {
-  if (isAnalysisResultFieldOverlayIntent(metadata.intent)) {
-    const validated = validateAnalysisResultFieldOverlayBinary(
-      metadata as AnalysisResultFieldOverlayMetadata,
-      field,
-      topology,
-    );
-    return validated;
+  if (isResolvedAnalysisResultModeFieldOverlayMetadata(metadata)) {
+    return validateAnalysisResultFieldOverlayBinary(metadata, field, topology);
   }
   const complex = asDecodedComplexFieldVector(field);
   if (
@@ -274,12 +279,12 @@ export function validateModeFieldOverlayBinary(
   });
 }
 
-function isAnalysisResultFieldOverlayIntent(
-  intent: ModeFieldOverlayIntent,
-): intent is AnalysisResultFieldOverlayIntent {
+function isResolvedAnalysisResultModeFieldOverlayMetadata(
+  metadata: ResolvedModeFieldOverlayMetadata,
+): metadata is ResolvedAnalysisResultModeFieldOverlayMetadata {
   return (
-    (intent as ModeFieldOverlayIntent & { sourceKind?: unknown }).sourceKind ===
-    "analysis-result"
+    "analysisResultFieldRef" in metadata &&
+    isAnalysisResultFieldOverlayIntent(metadata.intent)
   );
 }
 
