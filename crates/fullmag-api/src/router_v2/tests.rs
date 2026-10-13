@@ -27034,7 +27034,14 @@ async fn session_import_inspect_round_trips_exported_session() {
         .await
         .unwrap();
 
-    assert_eq!(export_response.status(), StatusCode::OK);
+    if export_response.status() != StatusCode::OK {
+        let status = export_response.status();
+        let body = body_bytes(export_response).await;
+        panic!(
+            "compact export returned {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
     let exported = body_json(export_response).await;
     let fms_base64 = exported["fms_base64"]
         .as_str()
@@ -28976,7 +28983,14 @@ async fn coupled_m3_restore_rejects_every_identity_and_state_shape_mismatch_with
             snapshot.coupled_checkpoint = Some(expected.clone());
             continue;
         }
-        assert_eq!(create.status(), StatusCode::OK, "capture {label}");
+        if create.status() != StatusCode::OK {
+            let status = create.status();
+            let body = body_bytes(create).await;
+            panic!(
+                "capture {label} returned {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
         let checkpoint_id = body_json(create).await["checkpoint"]["checkpoint_id"]
             .as_str()
             .unwrap()
