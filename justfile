@@ -546,6 +546,9 @@ verify-antenna-cpw-viewport-browser:
 verify-antenna-microstrip-stations-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3253 --scenario antenna-microstrip-stations
 
+verify-antenna-drive-editor-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3265 --scenario antenna-drive-editor
+
 # Production transport draft/conflict lifecycle; controlled HTTP, no native solve.
 verify-antenna-transport-drafts-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3254 --scenario antenna-transport-drafts
