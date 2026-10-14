@@ -1,6 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
+import type { ComputeNodesResource } from "@/kernel/api/apiTypes";
+
 import { ComputeNodeInventoryDetails } from "../ComputeNodeInventoryDetails";
 import { ComputeNodeInventoryStatus } from "../ComputeNodeInventoryStatus";
 import { parseComputeNodeSnapshot, summarizeComputeNodeInventory } from "./computeNodeInventory";
@@ -55,6 +57,10 @@ const snapshot = {
     storage_quota: "unavailable",
   },
 };
+
+// The API deliberately exposes opaque JSON; the production parser validates it.
+const apiSnapshot = snapshot as unknown as ComputeNodesResource["nodes"][number]["snapshot"];
+type ApiNodePolicy = NonNullable<ComputeNodesResource["nodes"][number]["node_policy"]>["policy"];
 
 describe("compute-node snapshot inventory", () => {
   it("parses stable host topology and renders explicit last-known GPU identity", () => {
@@ -115,7 +121,7 @@ describe("compute-node snapshot inventory", () => {
         schema_version: "compute_nodes.v1",
         state: "current",
         stale_after_seconds: 30,
-        nodes: [{ node_id: "desktop-host", state: "current", stale_after_seconds: 30, snapshot }],
+        nodes: [{ node_id: "desktop-host", state: "current", stale_after_seconds: 30, snapshot: apiSnapshot }],
       },
       status: "ready" as const,
       refreshError: new Error("host did not respond"),
@@ -148,7 +154,7 @@ describe("compute-node snapshot inventory", () => {
         schema_version: "compute_nodes.v1",
         state: "unavailable",
         stale_after_seconds: 30,
-        nodes: [{ node_id: "desktop-host", state: "unavailable", stale_after_seconds: 30, snapshot }],
+        nodes: [{ node_id: "desktop-host", state: "unavailable", stale_after_seconds: 30, snapshot: apiSnapshot }],
       },
       status: "ready",
       refreshError: null,
@@ -169,7 +175,7 @@ describe("compute-node snapshot inventory", () => {
           node_id: "desktop-host",
           state: "current",
           stale_after_seconds: 30,
-          snapshot,
+          snapshot: apiSnapshot,
           node_policy: {
             policy: {
               schema_version: "compute_node_policy.v1",
@@ -188,7 +194,7 @@ describe("compute-node snapshot inventory", () => {
               priority_order: [0, 10],
               draining: true,
               allowed_parallelism_patterns: [{ kind: "single_process" }],
-            },
+            } as unknown as ApiNodePolicy,
             status: {
               revision: 4,
               active_workers: 3,
