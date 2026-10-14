@@ -57,12 +57,15 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def validate_managed_build(root, expected_commit, *, source_digest=None, native_snapshot_sha256=None):
+def validate_managed_build(root, expected_commit, *, source_digest=None, native_snapshot_sha256=None,
+                           expected_profile="fem-cpu-release"):
+    if expected_profile not in {"fem-cpu-release", "fem-gpu-release"}:
+        raise ValueError("Unsupported managed release profile")
     journal = read_json(storage.validate_path(root / "receipt.json", root))
     context = read_json(storage.validate_path(root / "trusted/context.json", root))
     if journal.get("phase") != "terminal" or journal.get("state") != "succeeded" \
-            or journal.get("exit_code") != 0 or journal.get("profile") != "fem-cpu-release":
-        raise ValueError("Managed CPU release must be terminal and successful")
+            or journal.get("exit_code") != 0 or journal.get("profile") != expected_profile:
+        raise ValueError("Managed release must be terminal and successful")
     if root.name != context.get("job_id") or any(journal.get(k) != context.get(k)
             for k in ("job_id", "source_digest", "profile", "image_digest")):
         raise ValueError("Coordinator and build identities differ")

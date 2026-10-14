@@ -87,6 +87,14 @@ fi
 # Admit this fixed helper before generic diagnostic substring handling, so a
 # composite command cannot use a diagnostic marker to bypass its argument check.
 case "${recipe}" in
+  *"scripts/fullmag_docker_runtime.py"*)
+    docker_runtime_pattern="^[^[:space:]]+ \"[^\"]+/scripts/fullmag_docker_runtime.py\" --repo-root \"[^\"]+\" (build-image --job-id '[a-f0-9]{32}' --commit '[a-f0-9]{40}'|start --assembly-receipt '[^']+' --port '[0-9]{4,5}')$"
+    if [[ ! "${recipe}" =~ ${docker_runtime_pattern} ]]; then
+      echo "[fullmag just] invalid all-in-Docker recipe" >&2
+      exit 2
+    fi
+    exec "${python_cmd}" "${resolver}" run --repo-root "${repo_root}" --profile docker-all-gpu -- "${bash_executable}" -euo pipefail -c "${recipe}"
+    ;;
   *"scripts/verify_antenna_field_reader.py"*)
     antenna_reader_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_antenna_field_reader.py" --repo-root "[^"]+"$'
     if [[ ! "${recipe}" =~ ${antenna_reader_pattern} ]]; then
