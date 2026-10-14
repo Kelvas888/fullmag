@@ -5454,15 +5454,15 @@ export interface components {
             base_revision?: number | null;
             /** @enum {string} */
             kind: "replace_scene";
-            scene: Record<string, never>;
+            scene: Record<string, unknown>;
         } | {
             /** Format: int64 */
             base_revision?: number | null;
             /** @enum {string} */
             kind: "merge_patch";
-            merge_patch: Record<string, never>;
+            merge_patch: Record<string, unknown>;
         } | {
-            asset?: Record<string, never> | null;
+            asset?: Record<string, unknown> | null;
             /** Format: int64 */
             base_revision?: number | null;
             /** @enum {string} */
@@ -5473,27 +5473,27 @@ export interface components {
         } | {
             /** Format: int64 */
             base_revision?: number | null;
-            geometry: Record<string, never>;
+            geometry: Record<string, unknown>;
             /** @enum {string} */
             kind: "patch_object_geometry";
             object_id: string;
-            transform?: Record<string, never> | null;
+            transform?: Record<string, unknown> | null;
         } | {
             /** Format: int64 */
             base_revision?: number | null;
-            geometry: Record<string, never>;
+            geometry: Record<string, unknown>;
             /** @enum {string} */
             kind: "create_object";
-            magnetization_asset?: Record<string, never> | null;
+            magnetization_asset?: Record<string, unknown> | null;
             magnetization_ref?: string | null;
-            material_asset?: Record<string, never> | null;
+            material_asset?: Record<string, unknown> | null;
             material_ref?: string | null;
             name: string;
             object_id: string;
             region_name?: string | null;
-            study_universe_mesh?: Record<string, never> | null;
-            transform?: Record<string, never> | null;
-            universe?: Record<string, never> | null;
+            study_universe_mesh?: Record<string, unknown> | null;
+            transform?: Record<string, unknown> | null;
+            universe?: Record<string, unknown> | null;
         } | {
             /** Format: int64 */
             base_revision?: number | null;
@@ -5535,14 +5535,14 @@ export interface components {
             /** @enum {string} */
             kind: "commit_object_transform";
             object_id: string;
-            transform: Record<string, never>;
+            transform: Record<string, unknown>;
         } | {
             /** Format: int64 */
             base_revision?: number | null;
             /** @enum {string} */
             kind: "patch_universe";
             sync_study_universe_mesh?: boolean;
-            universe: Record<string, never>;
+            universe: Record<string, unknown>;
         } | {
             /** Format: int64 */
             base_revision?: number | null;
@@ -5905,7 +5905,7 @@ export interface components {
          */
         ComputeNodePolicyResource: {
             /** @description Versioned NodePolicy document, kept open for forward-compatible fields. */
-            policy: Record<string, never>;
+            policy: Record<string, unknown>;
             status: components["schemas"]["ComputeNodePolicyStatusResource"];
         };
         ComputeNodePolicyStatusResource: {
@@ -5925,7 +5925,7 @@ export interface components {
              * @description Durable snapshot payload. Its versioned shapes are defined by
              *     `compute_node_snapshot.v1` and `compute_node_snapshot.v2` in the session model.
              */
-            snapshot: Record<string, never>;
+            snapshot: Record<string, unknown>;
             /** Format: int64 */
             stale_after_seconds: number;
             state: components["schemas"]["ComputeNodesState"];
@@ -7621,7 +7621,7 @@ export interface components {
             mesh_generation_id?: string | null;
             mesh_id?: string | null;
             schema_version: string;
-            source_identity: Record<string, never>;
+            source_identity: Record<string, unknown>;
             topology_fingerprint?: string | null;
         };
         FrequencyDomainCapabilityEntryResource: {
@@ -9690,16 +9690,16 @@ export interface components {
         };
         MeshActiveBuildResource: {
             /** @description Current active build descriptor and progress metadata. */
-            active_build?: Record<string, never> | null;
+            active_build?: Record<string, unknown> | null;
             /** @description Resolved target for the current build. Summary-level copies are transitional dashboard projections. */
-            effective_airbox_target?: Record<string, never> | null;
+            effective_airbox_target?: Record<string, unknown> | null;
             /** @description Resolved per-object targets for the current build. Summary-level copies are transitional dashboard projections. */
-            effective_per_object_targets?: Record<string, never> | null;
+            effective_per_object_targets?: Record<string, unknown> | null;
             /** Format: int64 */
             geometry_realization_revision?: number | null;
             last_build_error?: string | null;
             /** @description Current/last build summary for build panels. Latest-success endpoint owns stable successful build references. */
-            last_build_summary?: Record<string, never> | null;
+            last_build_summary?: Record<string, unknown> | null;
             /** @description Build/pipeline state for build panels. */
             mesh_pipeline_status?: components["schemas"]["MeshBuildPipelinePhaseResource"][] | null;
             mixed_layer_topology_rejection?: null | components["schemas"]["MeshMixedLayerTopologyRejectionResource"];
@@ -9708,7 +9708,7 @@ export interface components {
             provenance?: null | components["schemas"]["MeshBuildProvenanceResource"];
             published_resources?: null | components["schemas"]["MeshBuildPublishedResourcesResource"];
             /** @description Resolved policy used by the build. This is execution reality, not the authoring draft. */
-            resolved_policy?: Record<string, never> | null;
+            resolved_policy?: Record<string, unknown> | null;
             /** Format: int64 */
             revision: number;
             shared_domain_build_report?: null | components["schemas"]["MeshSharedDomainBuildReportResource"];
@@ -9724,23 +9724,23 @@ export interface components {
             minimum_element_size?: number | null;
         };
         MeshBuildCommandRequest: {
-            mesh_options?: Record<string, never> | null;
+            mesh_options?: Record<string, unknown> | null;
             mesh_reason?: string | null;
             mesh_target?: null | components["schemas"]["MeshCommandTarget"];
         };
         MeshBuildDiagnosticsResource: {
             last_build_error?: string | null;
             /** @description Detailed latest build summary for diagnostics and inspectors. */
-            last_build_summary?: Record<string, never> | null;
+            last_build_summary?: Record<string, unknown> | null;
             /** @description Detailed build pipeline state for diagnostics and build panels. */
             mesh_pipeline_status?: components["schemas"]["MeshBuildPipelinePhaseResource"][] | null;
             /** @description Detailed mesh-build quality diagnostics. Dashboard quality summaries are transitional projections only. */
-            mesh_quality_summary?: Record<string, never> | null;
+            mesh_quality_summary?: Record<string, unknown> | null;
             /** @description Full mesh statistics report for realized solver mesh diagnostics. */
-            mesh_statistics?: Record<string, never> | null;
+            mesh_statistics?: Record<string, unknown> | null;
         };
         MeshBuildHistoryResource: {
-            history: Record<string, never>[];
+            history: Record<string, unknown>[];
             /** Format: int64 */
             revision: number;
         };
@@ -9758,9 +9758,9 @@ export interface components {
         MeshBuildPolicyDiffResource: {
             effect?: string | null;
             path: string;
-            previous?: Record<string, never> | null;
-            realized?: Record<string, never> | null;
-            requested?: Record<string, never> | null;
+            previous?: Record<string, unknown> | null;
+            realized?: Record<string, unknown> | null;
+            requested?: Record<string, unknown> | null;
             scope: string;
         };
         MeshBuildProvenanceResource: {
@@ -9837,38 +9837,38 @@ export interface components {
             part_id: string;
         };
         MeshInterfaceConfigReplaceRequest: {
-            config?: Record<string, never> | null;
+            config?: Record<string, unknown> | null;
             owner_a?: string | null;
             owner_b?: string | null;
         };
         MeshInterfaceConfigResource: {
-            config?: Record<string, never> | null;
+            config?: Record<string, unknown> | null;
             interface_id: string;
             /** Format: int64 */
             revision: number;
         };
         MeshInterfaceQualityResource: {
             interface_id: string;
-            quality?: Record<string, never> | null;
+            quality?: Record<string, unknown> | null;
             /** Format: int64 */
             revision: number;
         };
         MeshInterfaceReportResource: {
             interface_id: string;
-            report?: Record<string, never> | null;
+            report?: Record<string, unknown> | null;
             /** Format: int64 */
             revision: number;
         };
         MeshLastSuccessfulBuildResource: {
             /** @description Transitional target projection retained for current frontend adapters. */
-            effective_airbox_target?: Record<string, never> | null;
+            effective_airbox_target?: Record<string, unknown> | null;
             /** @description Transitional target projection retained for current frontend adapters. */
-            effective_per_object_targets?: Record<string, never> | null;
+            effective_per_object_targets?: Record<string, unknown> | null;
             /** Format: int64 */
             geometry_realization_revision?: number | null;
             last_build_error?: string | null;
             /** @description Last successful build artifact/reference summary. It must not become a copy of the active build resource. */
-            last_success?: Record<string, never> | null;
+            last_success?: Record<string, unknown> | null;
             /** Format: int64 */
             revision: number;
             /** Format: int64 */
@@ -9978,13 +9978,13 @@ export interface components {
         };
         MeshObjectQualityResource: {
             object_id: string;
-            quality?: Record<string, never> | null;
+            quality?: Record<string, unknown> | null;
             /** Format: int64 */
             revision: number;
         };
         MeshObjectReportResource: {
             object_id: string;
-            report?: Record<string, never> | null;
+            report?: Record<string, unknown> | null;
             /** Format: int64 */
             revision: number;
         };
@@ -10015,7 +10015,7 @@ export interface components {
             object_id: string;
             /** Format: int64 */
             revision: number;
-            size_field?: Record<string, never> | null;
+            size_field?: Record<string, unknown> | null;
         };
         MeshOperationStatusResource: {
             actual_method?: string | null;
@@ -10167,7 +10167,7 @@ export interface components {
             topology_fingerprint?: string | null;
         };
         MeshQualityGatesResource: {
-            gates?: Record<string, never> | null;
+            gates?: Record<string, unknown> | null;
             mixed_certificate: components["schemas"]["MeshMixedCertificateQualityEvidenceResource"];
             /** Format: int64 */
             revision: number;
@@ -10177,7 +10177,7 @@ export interface components {
             /** Format: int64 */
             gmsh_field_id?: number | null;
             kind: string;
-            params?: Record<string, never> | null;
+            params?: Record<string, unknown> | null;
             reason?: string | null;
             source?: string | null;
             status: string;
@@ -10229,7 +10229,7 @@ export interface components {
             topology_fingerprint?: string | null;
         };
         MeshRegionQualityResource: {
-            quality?: Record<string, never> | null;
+            quality?: Record<string, unknown> | null;
             region_id: string;
             /** Format: int64 */
             revision: number;
@@ -10259,7 +10259,7 @@ export interface components {
             shared_domain_config: unknown;
             solver_mesh?: null | components["schemas"]["MeshSolverMeshResource"];
             /** @description Solver-domain universe mesh policy. This endpoint owns mesh semantics, not build diagnostics. */
-            universe_config?: Record<string, never> | null;
+            universe_config?: Record<string, unknown> | null;
         };
         MeshSharedDomainBuildReportResource: {
             /** Format: int32 */
@@ -10284,16 +10284,16 @@ export interface components {
             gmsh_version?: string | null;
             mixed_layer_topology_certificate?: null | components["schemas"]["MeshMixedLayerTopologyCertificateSummaryResource"];
             mixed_topology_provenance?: null | components["schemas"]["MeshMixedTopologyProvenanceResource"];
-            object_region_markers?: Record<string, never>[];
+            object_region_markers?: Record<string, unknown>[];
             operation_statuses?: components["schemas"]["MeshOperationStatusResource"][];
             orphan_entities?: components["schemas"]["MeshOrphanEntityResource"][];
             /** Format: int32 */
             realized_regions_count?: number | null;
             region_markers?: components["schemas"]["MeshDomainRegionMarkerResource"][];
-            rejected_element_types?: Record<string, never>[];
+            rejected_element_types?: Record<string, unknown>[];
             requested_layered_policy?: null | components["schemas"]["MeshLayeredPolicyResource"];
             resolved_layered_policy?: null | components["schemas"]["MeshLayeredPolicyResource"];
-            selector_resolution?: Record<string, never>[];
+            selector_resolution?: Record<string, unknown>[];
             size_fields_realized?: components["schemas"]["MeshRealizedSizeFieldResource"][];
             thin_film_diagnostics?: components["schemas"]["MeshThinFilmDiagnosticResource"][];
             /** Format: int32 */
@@ -10301,7 +10301,7 @@ export interface components {
             used_size_field_kinds?: string[];
         };
         MeshSharedDomainConfigReplaceRequest: {
-            config: Record<string, never>;
+            config: Record<string, unknown>;
         };
         MeshSharedDomainConfigResource: {
             config: {
@@ -10425,12 +10425,12 @@ export interface components {
             revision: number;
         };
         MeshUniverseQualityResource: {
-            quality?: Record<string, never> | null;
+            quality?: Record<string, unknown> | null;
             /** Format: int64 */
             revision: number;
         };
         MeshUniverseReportResource: {
-            report?: Record<string, never> | null;
+            report?: Record<string, unknown> | null;
             /** Format: int64 */
             revision: number;
         };
@@ -10598,17 +10598,17 @@ export interface components {
         ObjectCreateRequest: {
             /** Format: int64 */
             base_revision?: number | null;
-            geometry: Record<string, never>;
-            magnetization_asset?: Record<string, never> | null;
+            geometry: Record<string, unknown>;
+            magnetization_asset?: Record<string, unknown> | null;
             magnetization_ref?: string | null;
-            material_asset?: Record<string, never> | null;
+            material_asset?: Record<string, unknown> | null;
             material_ref?: string | null;
             name: string;
             object_id: string;
             region_name?: string | null;
-            study_universe_mesh?: Record<string, never> | null;
-            transform?: Record<string, never> | null;
-            universe?: Record<string, never> | null;
+            study_universe_mesh?: Record<string, unknown> | null;
+            transform?: Record<string, unknown> | null;
+            universe?: Record<string, unknown> | null;
         };
         ObjectEnergySummary: {
             /** Format: double */
@@ -10627,21 +10627,21 @@ export interface components {
         ObjectGeometryPatchRequest: {
             /** Format: int64 */
             base_revision?: number | null;
-            geometry: Record<string, never>;
-            transform?: Record<string, never> | null;
+            geometry: Record<string, unknown>;
+            transform?: Record<string, unknown> | null;
         };
         ObjectInteractionPatchRequest: {
             /** Format: int64 */
             base_revision?: number | null;
             enabled?: boolean | null;
-            params: Record<string, never>;
+            params: Record<string, unknown>;
             present?: boolean | null;
         };
         ObjectInteractionResource: {
             enabled: boolean;
             interaction_kind: string;
             object_id: string;
-            params: Record<string, never>;
+            params: Record<string, unknown>;
             present: boolean;
             /** Format: int64 */
             scene_revision: number;
@@ -10668,16 +10668,16 @@ export interface components {
             time_seconds: number;
         };
         ObjectPatchRequest: {
-            absorbing_boundary?: Record<string, never> | null;
+            absorbing_boundary?: Record<string, unknown> | null;
             /** Format: int64 */
             base_revision?: number | null;
-            geometry?: Record<string, never> | null;
+            geometry?: Record<string, unknown> | null;
             magnetization_ref?: string | null;
             material_ref?: string | null;
             name?: string | null;
             notes?: string | null;
             region_name?: string | null;
-            transform?: Record<string, never> | null;
+            transform?: Record<string, unknown> | null;
             visible?: boolean | null;
         };
         ObjectRegionCreateRequest: {
@@ -12746,7 +12746,7 @@ export interface components {
             texture_override?: null | components["schemas"]["SceneTextureOverride"];
         };
         SceneObjectResource: {
-            absorbing_boundary?: Record<string, never> | null;
+            absorbing_boundary?: Record<string, unknown> | null;
             allocated_region_ids?: string[];
             geometry?: {
                 [key: string]: unknown;
@@ -12814,7 +12814,7 @@ export interface components {
             t0: number;
         };
         ScenePatchRequest: {
-            merge_patch: Record<string, never>;
+            merge_patch: Record<string, unknown>;
         };
         ScenePrescribedSotDrive: {
             /** Format: double */
@@ -12898,7 +12898,7 @@ export interface components {
             /** Format: double */
             radius: number;
         } | {
-            expression: Record<string, never>;
+            expression: Record<string, unknown>;
             /** @enum {string} */
             kind: "csg";
         };
@@ -14669,14 +14669,14 @@ export interface components {
             /** @enum {string} */
             kind: "close";
         }) | (components["schemas"]["RuntimeCommandIntent"] & {
-            mesh_options?: Record<string, never> | null;
+            mesh_options?: Record<string, unknown> | null;
             mesh_reason?: string | null;
             mesh_target?: null | components["schemas"]["MeshCommandTarget"];
         } & {
             /** @enum {string} */
             kind: "mesh_build";
         }) | (components["schemas"]["RuntimeCommandIntent"] & {
-            mesh_options?: Record<string, never> | null;
+            mesh_options?: Record<string, unknown> | null;
         } & {
             /** @enum {string} */
             kind: "fdm_grid_refresh";
@@ -14843,7 +14843,7 @@ export interface components {
             qualification_validator_schema?: string | null;
             runtime_source_inputs_sha256?: string | null;
             timestep_policy: string;
-            validated_scope?: Record<string, never> | null;
+            validated_scope?: Record<string, unknown> | null;
             validation_state: components["schemas"]["TimestepValidationStateResource"];
         };
         /** @enum {string} */
@@ -15151,7 +15151,7 @@ export interface components {
             /** Format: int64 */
             base_revision?: number | null;
             sync_study_universe_mesh?: boolean;
-            universe: Record<string, never>;
+            universe: Record<string, unknown>;
         };
         UniverseResource: {
             mesh_dirty: boolean;
@@ -15159,8 +15159,8 @@ export interface components {
             object_bounds_min?: number[] | null;
             /** Format: int64 */
             scene_revision: number;
-            study_universe_mesh: Record<string, never> | null;
-            universe: Record<string, never> | null;
+            study_universe_mesh: Record<string, unknown> | null;
+            universe: Record<string, unknown> | null;
         };
         UnsupportedAuthoringRecord: {
             [key: string]: unknown;
@@ -15524,7 +15524,7 @@ export interface components {
             /** @description `desktop`, `cli`, `python` or `web`. */
             actor: string;
             at: string;
-            detail: Record<string, never>;
+            detail: Record<string, unknown>;
             /** @description Row id as a decimal string. */
             id: string;
             /** @description `open`, `save`, `run`, `create`, `import`, `pin`, `unpin`, `forget` or `edit`. */
@@ -15546,7 +15546,7 @@ export interface components {
             kind: components["schemas"]["WorkspaceItemKind"];
             last_used_at: string;
             /** @description Per-kind facts written by Fullmag front ends; unknown keys are kept. */
-            meta: Record<string, never>;
+            meta: Record<string, unknown>;
             modified_at?: string | null;
             name: string;
             /** @description Absolute path as the person would type it (no `\\?\` prefix). */
@@ -15675,7 +15675,7 @@ export interface components {
             /** @description `telemetry.enabled` or `update.available`. */
             key: string;
             /** @description The stored value, or the default (`false` / `null`) when unset. */
-            value: Record<string, never>;
+            value: Record<string, unknown>;
             /**
              * @description The API accepts `PUT` for the key. `update.available` is written by an
              *     updater, never by the renderer.
@@ -15683,7 +15683,7 @@ export interface components {
             writable: boolean;
         };
         WorkspaceSettingRequest: {
-            value: Record<string, never>;
+            value: Record<string, unknown>;
         };
         WorkspaceStageLayout: {
             bottom_dock?: string | null;
