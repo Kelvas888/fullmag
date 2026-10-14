@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import fullmag_storage as storage
 
 PROFILE = "windows-control-room-source-check"
-ROUTES = ("generate-client", "production-source", "api-hygiene", "lint", "openapi-import-check", "react-doctor", "development-restart-check", "resource-client-cache-check", "development-kernel-host-check", "development-transport-pause-check", "development-run-outcome-handoff-check", "development-run-outcome-handoff-lint", "development-restart-action-check", "development-restart-action-lint", "development-backend-build-action-check", "material-assignment-draft-check")
+ROUTES = ("generate-client", "production-source", "api-hygiene", "lint", "openapi-import-check", "typecheck-cli-check", "react-doctor", "development-restart-check", "resource-client-cache-check", "development-kernel-host-check", "development-transport-pause-check", "development-run-outcome-handoff-check", "development-run-outcome-handoff-lint", "development-restart-action-check", "development-restart-action-lint", "development-backend-build-action-check", "material-assignment-draft-check")
 
 
 def timestamp():
@@ -88,6 +88,10 @@ def run(repo: Path, route: str):
                 commands = [cli("openapi-typescript", "bin/cli.js") + ["src/kernel/api/generated/openapi-v2.json", "--output", "src/kernel/api/generated/openapi-v2-types.ts"], [node, "scripts/generate-v2-client.mjs"]]
             elif route == "openapi-import-check":
                 commands = [[node, "--test", "scripts/normalize-openapi-build-identity.node-test.mjs", "scripts/managed-openapi-import.node-test.mjs"]]
+                receipt["interpreted_node_checks"] = True
+                receipt["unit_tests"] = "interpreted_node_only_no_compilation"
+            elif route == "typecheck-cli-check":
+                commands = [[node, "--test", "scripts/typecheck-control-room.node-test.mjs"]]
                 receipt["interpreted_node_checks"] = True
                 receipt["unit_tests"] = "interpreted_node_only_no_compilation"
             elif route == "development-restart-check":

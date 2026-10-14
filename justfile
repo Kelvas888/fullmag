@@ -452,6 +452,9 @@ check-control-room-production-source:
     {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route production-source --repo-root "{{repo_root}}"
 
 # Interpreted Node contract checks in isolated managed fixtures; no unit builds.
+verify-control-room-typecheck-cli:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route typecheck-cli-check --repo-root "{{repo_root}}"
+
 verify-control-room-openapi-import:
     {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route openapi-import-check --repo-root "{{repo_root}}"
 

@@ -34,3 +34,46 @@ lokalnej definicji ani nie zmieniono cudzej pracy w fullmag-runner/lib.rs.
 Główny checkout zawiera kilkadziesiąt cudzych zmian Compute/API/FEM;
 bezpieczne poprawki integracyjne wymagają odrębnej izolacji i dokładnej bazy.
 Pełne P8/cutover/release pozostaje niezaliczone.
+
+## Przyrost: kompatybilny launcher TypeScript
+
+Na autoryzowanym lokalnym masterze wdrożono mały, zgodny z dotychczasową
+wersją TypeScript fragment wcześniej przygotowanej poprawki
+`b3ebfeda07591926c0cc917f2332598908761717` z odrębnej izolacji.
+Nie scalono całego worktree ani zależności. Przed zmianą launcher był zgodny
+z HEAD (git diff --quiet exit 0); nowa regresja nie istniała. Kopię zachowano
+w katalogu dowodów tej sesji. Nie zmieniono cudzych plików Compute/API/FEM.
+
+Launcher odczytuje jawny bin.tsc z eksportowalnego package.json TypeScript
+zamiast rozwiązywać blokowany subpath typescript/bin/tsc. Zachowuje kolejność
+Next typegen → tsc, odtworzenie next-env.d.ts i propagację błędów. Regresja
+uruchamia rzeczywisty launcher z lokalnymi fixture CLI, bez kompilatora
+TypeScript/Rust, instalacji zależności ani Next build.
+
+Nowa stała recepta `just verify-control-room-typecheck-cli` jest dopuszczona
+przez dokładny preflight argumentów i korzysta z managed source wrappera,
+profilu windows-control-room-source-check, locka, kontrolowanego TEMP i
+terminalnego receiptu. Ogólny storage run odmówił tej trasy jako ciężkiej;
+nie obchodzono odmowy ręcznym uruchomieniem. Dodano również interpretowaną
+regresję przed dotychczasowym typecheckiem w istniejącym kroku CI.
+
+- Receipt `3ed564ad912c4df1b8589c46f56df5f2`: **PASS, 4/4**, exit 0.
+  Ograniczone exports, brak bin.tsc, błąd Next i błąd tsc sprawdzone.
+- Production source receipt `50d0f234fed3416582c75c587c4dc26f`: **PASS**,
+  exit 0, test sources wykluczone, source_changed_during_run=false.
+- W obu source digest before=after:
+  `ce8eec8a3f1add30b7e5413bdd0cb6a4f067308701c1d61c9634397aed670c85`.
+- Bash parser obu zmienionych skryptów, Python AST i scoped diff check PASS.
+- Launcher SHA-256:
+  `95264ed31106b1794c99f7e640c81e8c9f3c35154eb0f9970ebacc73473f7812`.
+- Regresja SHA-256:
+  `86ff334f4a53fac47f493d2b7b2227fcbc1f735d27593b3b83f3555d5b0317a5`.
+
+Nie uruchomiono testów kompilowanych. Nie wykonano nowego buildu backendu,
+ponieważ zmiana dotyczy narzędzia kontroli źródeł. Aktualne hosted CI dla
+nowej poprawki pozostaje NOT VERIFIED. Publikacja napraw wywołująca workflow
+kompilujące testy czeka na odpowiedź użytkownika dotyczącą aktualnego zakazu
+z AGENTS.md. Cała integracja i P8 pozostają IN PROGRESS.
+
+Bounded independent source review tego przyrostu: brak actionable P0/P1/P2.
+Review nie uruchamiał kompilacji ani CI; odwołuje się do powyższych receiptów.
