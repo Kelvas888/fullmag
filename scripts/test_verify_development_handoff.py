@@ -3,6 +3,7 @@
 from contextlib import nullcontext, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -114,8 +115,17 @@ class ManagedHandoffCheckReceiptTests(unittest.TestCase):
 
     def test_shell_rejects_composite_or_extra_arguments_before_preflight(self):
         bash = shutil.which("bash")
+        if os.name == "nt":
+            # System32 bash is a WSL launcher and cannot consume native paths.
+            # Exercise the same Windows Git shell used for repository scripts.
+            git = shutil.which("git")
+            candidates = [] if git is None else [
+                Path(git).resolve().parent.parent / "bin" / "bash.exe",
+                Path(git).resolve().parent.parent / "usr" / "bin" / "bash.exe",
+            ]
+            bash = next((str(candidate) for candidate in candidates if candidate.is_file()), None)
         if bash is None:
-            self.skipTest("Bash is unavailable")
+            self.skipTest("Native repository Bash is unavailable")
         repo = Path(__file__).resolve().parent.parent
         helper = (repo / "scripts/verify_development_handoff.py").as_posix()
         valid = f'python "{helper}" --repo-root "{repo.as_posix()}"'
