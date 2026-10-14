@@ -34,6 +34,8 @@ SOURCE_PATHS = (
     "scripts/windows/development_scene_handoff.py",
     "scripts/windows/development_browser_chain.py",
     "scripts/test_windows_development_browser_chain.py",
+    "scripts/test_windows_development_restore_frames.py",
+    "crates/fullmag-cli/src/control_room/development_workspace_probe.rs",
     "scripts/test_windows_development_scene_handoff.py",
     "scripts/windows/development_scene_assets.py",
     "scripts/test_windows_development_scene_assets.py",

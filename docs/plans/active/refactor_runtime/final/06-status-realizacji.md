@@ -1,4 +1,11 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53BU](p8/53bu-authenticated-restore-frame.md):
+natywny probe publikuje ramkę v2 z uwierzytelnionym request ID/generation
+i źródłowym API/PID. Konsument odróżnia legacy v1 bez awansu jego dowodu.
+Managed checks **209/209**, zero skipów; native CLI/API/desktop build-only
+**exit 0**, manifest b08a5648. Realny odbiór v2 i A→B→C nadal NOT VERIFIED;
+publiczny restart zablokowany. Procentów całego planu nie podniesiono.
+
 Checkpoint 14.10.2026 — [P8-53BT](p8/53bt-browser-chain-ledger.md):
 wdrożono immutable ledger maksymalnie dwóch cykli z bindingiem
 nonce/request/API/session/build i właściwą custody starego API. Końcowe

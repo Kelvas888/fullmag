@@ -42,6 +42,8 @@ READY_SCHEMA = "fullmag.development-browser-native-ready.v1"
 RESULT_SCHEMA = "fullmag.development-browser-native-result.v1"
 API_LOG_SCHEMA = "fullmag.development-browser-api-log.v1"
 SCRATCH_CHILD_SCHEMA = "fullmag.development-browser-scratch-child.v1"
+RESTORED_SCHEMA_V1 = "fullmag.development-browser-native-restored.v1"
+RESTORED_SCHEMA_V2 = "fullmag.development-browser-native-restored.v2"
 SCRATCH_COMMAND_KINDS = frozenset({"fdm_grid_refresh", "remesh", "run", "relax", "solve"})
 COMPUTE_CHILD_KINDS = frozenset({"run", "relax", "solve"})
 EXECUTION_SCOPE_KEYS = ("api_instance_id", "session_id", "backend_session_epoch", "request_scope_epoch")
@@ -255,6 +257,60 @@ def terminal_record(value):
             or value.get("waited") is not True or type(value.get("exit_code")) is not int):
         raise storage.StorageError("Native browser proof lacks terminal process custody")
     return dict(value)
+
+
+def validate_restored_frame(frame, expected, before, source_api_pid=None):
+    """Validate custody metadata; v2 additionally binds the consumed request.
+
+    This does not replace HTTP scene/camera hydration or terminal process
+    verification. Legacy v1 carries no request identity and cannot qualify it.
+    """
+    fields = {"schema", "nonce", "new_api_instance_id", "api_pid",
+              "old_api_exit_code", "helper_processes"}
+    if not isinstance(frame, dict) or frame.get("schema") not in {RESTORED_SCHEMA_V1, RESTORED_SCHEMA_V2}:
+        raise storage.StorageError("Native browser restore has an unsupported schema")
+    v2 = frame["schema"] == RESTORED_SCHEMA_V2
+    if v2:
+        fields |= {"request_id", "generation_id", "old_api_instance_id", "old_api_pid"}
+    if (set(frame) != fields or frame.get("nonce") != expected.get("nonce")
+            or not valid_uuid(frame.get("new_api_instance_id"))
+            or not isinstance(before, dict)
+            or frame["new_api_instance_id"] == before.get("api_instance_id")
+            or type(frame.get("api_pid")) is not int or frame["api_pid"] <= 0
+            or type(frame.get("old_api_exit_code")) is not int):
+        raise storage.StorageError("Native browser restore has invalid custody or scope")
+    helpers = frame["helper_processes"]
+    if not isinstance(helpers, list) or not helpers:
+        raise storage.StorageError("Native browser restore lacks helper custody")
+    seen = set()
+    for helper in helpers:
+        record = terminal_record(helper)
+        if (record["pid"] in seen or record["pid"] == frame["api_pid"]
+                or (source_api_pid is not None and record["pid"] == source_api_pid)):
+            raise storage.StorageError("Native browser restore duplicated process custody")
+        seen.add(record["pid"])
+    if v2 and (not valid_uuid(frame["request_id"])
+            or not valid_uuid(frame["old_api_instance_id"])
+            or frame["old_api_instance_id"] != before.get("api_instance_id")
+            or not isinstance(frame["generation_id"], str)
+            or not BUNDLE_ID_RE.fullmatch(frame["generation_id"])
+            or frame["generation_id"] != expected.get("generation_id")
+            or type(source_api_pid) is not int or source_api_pid <= 0
+            or type(frame["old_api_pid"]) is not int
+            or frame["old_api_pid"] != source_api_pid
+            or frame["old_api_pid"] == frame["api_pid"]):
+        raise storage.StorageError("Native browser restore differs from the consumed request scope")
+    return copy.deepcopy(frame)
+
+
+def restore_protocol_scope(validated_frame):
+    """Classify an already validated frame without promoting legacy proof."""
+    schema = validated_frame.get("schema")
+    if schema not in {RESTORED_SCHEMA_V1, RESTORED_SCHEMA_V2}:
+        raise storage.StorageError("Restore protocol scope has an unsupported schema")
+    return {"schema": schema, "authenticated_request_binding": schema == RESTORED_SCHEMA_V2,
+            "qualification": "authenticated_v2" if schema == RESTORED_SCHEMA_V2
+            else "legacy_v1_without_request_identity"}
 
 
 def read_api(port, pin, path):
@@ -1456,12 +1512,14 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
                             + validated["api_instance_id"])
                         print(canonical({"event": "browser-ready", "url": receipt["workspace_browser_url"],
                                          "receipt": str(run_root / "receipt.json")}), flush=True)
-                elif schema == "fullmag.development-browser-native-restored.v1":
-                    if (frame.get("nonce") != expected["nonce"]
-                            or not valid_uuid(frame.get("new_api_instance_id"))
-                            or type(frame.get("api_pid")) is not int or frame["api_pid"] <= 0
-                            or type(frame.get("old_api_exit_code")) is not int):
-                        raise storage.StorageError("Native browser restore has invalid custody or scope")
+                elif schema in {RESTORED_SCHEMA_V1, RESTORED_SCHEMA_V2}:
+                    with bridge.lock:
+                        before = copy.deepcopy(bridge.before)
+                    source_pids = {log["pid"] for log in receipt.get("workspace_browser_api_logs", [])
+                                   if before is not None and log["api_instance_id"] == before.get("api_instance_id")}
+                    source_pid = next(iter(source_pids)) if len(source_pids) == 1 else None
+                    frame = validate_restored_frame(frame, expected, before, source_pid)
+                    receipt["workspace_browser_restore_protocol"] = restore_protocol_scope(frame)
                     with bridge.lock:
                         bridge.restored = dict(frame)
                         bridge.ready = None
@@ -1533,6 +1591,8 @@ def exercise(repo, run_root, manifest, receipt, binaries, owner_bundle):
                 or result["new_api_pid"] == result["old_api_pid"]):
             raise storage.StorageError("Native custody and actual browser hydration did not both pass")
         receipt["workspace_browser_hydration"] = bridge.browser
+        if receipt.get("workspace_browser_restore_protocol", {}).get("authenticated_request_binding") is True:
+            receipt["checks"].append("browser-authenticated-v2-request-and-source-custody")
         receipt["checks"].extend(["browser-private-native-readiness", "browser-nonempty-scene-captured",
                                    "browser-exact-scene-restored", "browser-fresh-session-and-api-pin",
                                    "browser-unsaved-document-restored", "browser-native-processes-waited",
