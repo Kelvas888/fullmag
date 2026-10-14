@@ -1,5 +1,17 @@
 # Status realizacji całego planu refaktoryzacji
 
+Aktualizacja 14.10.2026 — pełna bramka natywnego restartu z kamerą,
+autoringiem modelu i wykonaniem Grid/Compute **PASS**:
+`2998926363e84fd5b32569767c9a44b0`, exit 0, 10 kontroli, 27/27 procesów
+odebranych. Kamera ma wszystkie sześć pól identycznych przed/po;
+scena i dirty document zachowane. Compute wykonał 10 kroków i 1 etap;
+Grid, Compute oraz normalne Close zakończyły się completed w nowym API.
+Dowód dotyczy Windows/FDM CPU-reference, double/strict, małego boxu
+z komórką5nm, Uniform i jawną anizotropią. Nie kwalifikuje innych lane.
+PR #160 jest nadal otwarty; modal Grid wymaga osobnej poprawki korelacji
+requestId. **P8-53 i cały plan pozostają IN PROGRESS.**
+Szczegóły: [P8-53BM](p8/53bm-camera-preservation.md).
+
 Checkpoint 14.10.2026 — poprawka niekompletnej fizyki `2d767a5b2252855f33579f94e89158c4ba7b5798`
 jest na branchu PR #160, jeszcze nie na remote master. Nowy produkcyjny
 pakiet `1bcaf4c1` ukończony exit 0; frozen API 303 PASS, 99/99 procesów

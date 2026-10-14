@@ -2,9 +2,13 @@
 
 ## Status
 
-Potwierdzony błąd P1: restart zachowuje scenę, lecz traci projekcję kamery.
-Poprawka ownera jest w realizacji; runtime po poprawce pozostaje **NOT VERIFIED**.
-Nie zamyka to P8-53 ani całego planu.
+Potwierdzony wcześniej błąd P1 odtworzenia kamery ma poprawkę ownera
+oraz dodatni dowód natywnego restartu Windows/FDM CPU z Grid/Compute.
+Terminalna bramka `2998926363e84fd5b32569767c9a44b0`: **10 PASS, exit 0,
+27/27 procesów odebranych**, wszystkie sześć pól kamery preserved=true.
+Guard capture kamery także ma regresję z rzeczywistego UI.
+Integracja PR #160 i odrębna poprawka korelacji modalu Grid pozostają
+otwarte. Nie zamyka to P8-53, pozostałych lane ani całego planu.
 
 ## Dowód przed poprawką
 
@@ -926,3 +930,50 @@ FDM default cell (np. 5e-9 m dla tego małego boxu), jawne Ku1, Uniform
 oraz skończony Run przed capture, a następnie wykonać Grid/Compute/Close
 i Finish proof. Wynik tego małego scenariusza nie kwalifikuje naukowo
 pozostałych lane ani wydania.
+
+### Pełna bramka Windows/FDM CPU — PASS 14.10.2026
+
+Receipt `2998926363e84fd5b32569767c9a44b0`: completed, exit 0,
+10 kontroli i 27/27 procesów waited=true. Pakiet B to manifest
+`1bcaf4c15c4acf4a813d172021c9b00c5ffdbe84ad7c2d8a2c16b41efdd10d0e`;
+backend source before/after identyczny:
+`a79bc49d271115f57bbdee8c72f40dbcc452623888a954b54a78aa236cb7d46e`.
+Nie ponawiano kompilacji ani nie zmieniono weryfikatora, aby uzyskać PASS.
+
+Model przed capture zawierał jawne default_cell=[5e-9,5e-9,5e-9] m,
+Ku1=1000 J/m³, Uniform +X i Run do 1e-12 s. Dane API zapisano jako
+`pre-capture-authoring-input.json` pod receipt. Kontrolka Apply Grid
+wykonała też Grid w starym API przed capture; ten sukces nie zastąpił
+wymaganej nowej komendy Grid po restarcie.
+
+API zmieniło się z `1fc80b0b-e160-46e4-a511-0c2127127402` na
+`7648c98c-cfc5-4e28-96ac-afd867748001`, z nową sesją i request scope.
+Scena before/after ma hash dowodu
+`5c28a2a69063f2720bd1e4cadd00f848903e707e11da967d45c5c6da319246cf`.
+Dirty document zachował revision=2 i archive SHA-256
+`1effe614c3cb7ccb42c38e636418a3abec654d1a8c53bb570bb33f182fe91c39`.
+Kamera before/after: orthographic, position=[2e-6,1.4e-6,2e-6],
+target=[0,0,0], up=[0,0,1], fov_degrees=45, orthographic_scale=null.
+Receipt `workspace_browser_camera.preserved=true` porównuje sześć pól.
+Canvas po restore/Compute pozostał 700×297, context_lost=false.
+
+Nowy Grid `fm-1325a9f8-a33e-449a-884e-0ff826ad790b` oraz Compute
+`fm-eae55ced-5114-4289-88ff-190a7ccf0fcd` zakończyły się completed.
+Compute: etap stage-000, completed_step=10, total_stages=1.
+Oba dzieci zakończone exit 0, kill_requested=false. Requested/resolved:
+fdm/cpu/double/strict; runtime_family=cpu-reference,
+engine_id=fdm_cpu_reference. Nie przedstawiać tego jako wykonania GPU
+ani przyszłego compiled-native FDM CPU.
+
+Normalne Close `fm-b7b0e542-9b15-47b2-9f6b-119708c31f0f` zakończyło
+solver i opublikowało tombstone sesji; Finish proof zweryfikował ten
+przepływ oraz niezmieniony dokument. Nie zamykano workspace3197.
+[Dowód UI po Grid/Compute/Close](evidence/53bm-camera-grid-compute-completed-20261014.png).
+
+Niezależnie potwierdzono problem prezentacji: modal Grid pozostał
+submitting mimo status=completed z listy i szczegółu tej samej komendy.
+Read-only diagnoza: grid.build-fdm gubi confirmation.requestId
+(`mesh-confirm-*`), a runFdmGridRefreshOperation generuje inne
+`fdm-grid-refresh-*`. Reducer modalu odrzuca niepasujące eventy.
+Wymagana jest osobna korekta korelacji oraz browser proof modalu;
+PASS natywnej bramki kamery nie dowodzi naprawy tego UI.
