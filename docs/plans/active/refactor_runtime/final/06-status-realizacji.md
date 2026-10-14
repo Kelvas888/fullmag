@@ -1,4 +1,12 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53BT](p8/53bt-browser-chain-ledger.md):
+wdrożono immutable ledger maksymalnie dwóch cykli z bindingiem
+nonce/request/API/session/build i właściwą custody starego API. Końcowe
+managed checks **201/201, zero skipów**, receipt 35b7439f, source identity
+before=after. To prerequisite danych; native reader i ProofBridge v2 oraz
+rzeczywisty A→B→C nadal otwarte, publiczny restart pozostaje zablokowany.
+Procentów całego planu nie podniesiono.
+
 Checkpoint 14.10.2026 — [P8-53BS](p8/53bs-restart-remaining-gates.md):
 audyt odróżnił historyczne braki od najnowszego dowodu pojedynczego restartu
 z kamerą (81eb7f40 ponownie odczytany: completed/0, 10 checks, 27 waited).

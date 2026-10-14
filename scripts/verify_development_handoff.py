@@ -32,6 +32,8 @@ SOURCE_PATHS = (
     "scripts/test_windows_development_restore_launch.py",
     "scripts/windows/development_handoff.py",
     "scripts/windows/development_scene_handoff.py",
+    "scripts/windows/development_browser_chain.py",
+    "scripts/test_windows_development_browser_chain.py",
     "scripts/test_windows_development_scene_handoff.py",
     "scripts/windows/development_scene_assets.py",
     "scripts/test_windows_development_scene_assets.py",
