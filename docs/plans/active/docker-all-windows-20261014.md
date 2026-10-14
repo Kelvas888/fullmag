@@ -231,3 +231,12 @@ Test `test_multi_object_sizing_cylinder_and_waveguide` z `FULLMAG_GMSH_THREADS=1
 Końcowy obraz/HMR/GPU/session storage i integracja nadal **NOT VERIFIED**: ostatni pomiar C: 0.66 GiB wolnego, wymagane minimum runnera 8 GiB; required managed FEM runner offline/queued. Cache, źródła, wyniki i cudze zmiany zachowane.
 
 Test fake konfiguratora izoluje tylko dwa ambient thread overrides; nie zmienia resolvera ani asercji requested=4. Dwa interpreted thread checks z ambient FULLMAG_GMSH_THREADS=1: **PASS, exit 0**. YAML, embedded Python i niezależny review: **PASS**. Timeout 15 min zachowano: poprzedni pełny job trwał 451.18 s, publiczny gate 281.58 s, 338-testowy zestaw 130.738 s.
+
+
+### Checkpoint — pojedyncza synchronizacja outputów Study
+
+Dla `surface == "study"` usunięto ponowne clear/redeclare po `_sync_stage_output_snapshot`. Flat/legacy zachowuje dotychczasową kolejność, a Stage bez Study metadata ma istniejący continue guard. Testów nie zmieniono.
+
+`PYTHONPATH=packages/fullmag-py/src python3 -m pytest -q packages/fullmag-py/tests/test_script_builder_roundtrip.py packages/fullmag-py/tests/test_study_stages.py`: **82 PASS, 39 subtests PASS, exit 0, 92.88 s**. Exact output-storage checker: **PASS, exit 0**. Diff check i niezależny review: **PASS**. Pierwszy lokalny brak editable package odtworzono przez PYTHONPATH, bez zmiany suite.
+
+Ponowny pomiar native Windows: **9.64 GiB wolnego**, minimum runnera spełnione. Retencja: zachowujemy cache przyrostowy, ostatni zweryfikowany pakiet b581, kapsuły, logi i receipty; brak autoryzowanego usuwania. Po commicie czystego źródła kolejnym krokiem jest managed GPU build, następnie obraz i dwa kontenery. Required Linux FEM runner nadal pozostaje niedostępny.

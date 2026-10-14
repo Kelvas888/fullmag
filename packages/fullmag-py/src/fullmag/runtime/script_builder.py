@@ -8367,8 +8367,9 @@ def _render_stages(
             )
         # Reproduce non-action sampling changes between Runs without inserting
         # configuration stages into the authored pipeline.
-        lines.append(f"{_surface_call(surface, 'clear_outputs')}()")
-        lines.extend(_render_outputs(stage.problem, _magnet_variable_names(stage.problem, overrides=overrides), surface=surface))
+        if not is_study_surface:
+            lines.append(f"{_surface_call(surface, 'clear_outputs')}()")
+            lines.extend(_render_outputs(stage.problem, _magnet_variable_names(stage.problem, overrides=overrides), surface=surface))
         if is_study_surface:
             run_parts: list[str] = []
             if stage.stage_id is not None:
