@@ -1464,7 +1464,9 @@ study.pbc(x=True, y=True, demag="truncated_images", images=(2, 3, 0))
                 &source_path,
                 Some(&overrides),
                 Some(&export_copy),
-                PythonHelperOutputPolicy::Capture,
+                PythonHelperOutputPolicy::Bounded {
+                    workspace_root: workspace.path(),
+                },
             )
             .expect("rewrite managed copy through Python with Rust overrides");
             let restored = load_scene_document_state(&root, workspace.path(), &export_copy)

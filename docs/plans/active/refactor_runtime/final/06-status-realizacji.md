@@ -1,4 +1,31 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53CH](p8/53ch-canonical-api-generation-and-antenna-scope.md)
+i [P8-53CI](p8/53ci-scoped-exact-layer-mesher-diagnosis.md):
+CI odebrało **87/87 API session** i **315/315 fullmag-session**, w tym late
+standalone regression. Control Room poprawił się do 8535 PASS / 6 FAIL;
+uzupełniono pozostały scope mocka anteny, wymagane nowe CI. Kontrakt API
+odtworzono maszynowo do bajtowej zgodności z przypiętym CI artefaktem;
+managed generate-client, production TS7 i API hygiene PASS. Mesher exact
+layers wymaga naprawy spełniającej count i niezależne owner/air fields;
+diagnoza nie zastępuje implementacji. **Pełny plan IN PROGRESS.**
+
+Checkpoint 14.10.2026 — [P8-53CF](p8/53cf-frontend-integration-fixtures-and-debug.md)
+i [P8-53CG](p8/53cg-standalone-runtime-preview-finalization.md):
+przywrócono Debug anteny i canonical compute-node path; naprawiono mocks API,
+KernelContext i formularza Radix oraz nieaktualne fixtures/assertions.
+Produkcyjny TS7 PASS `cb7fbcad`, końcowy lint PASS `47b0e7a1`, source review
+bez P0/P1/P2. Poprawiono ordering late preview w standalone inspection;
+odbiory CI/browser/runtime tej poprawki pozostają wymagane. Drift generated
+API oraz 4 błędy Python layered airbox są nadal otwarte. Procentów nie podniesiono.
+
+Checkpoint 14.10.2026 — [P8-53CE](p8/53ce-current-integration-gates.md):
+CI na `868a224b` potwierdziło **315/315 sesji** oraz **1039/1039** w modal
+observables z pełnym frontend typecheck. Pełna seria Control Room:
+8525 PASS / 16 FAIL / 13 skipped i 9 unhandled errors. Cztery kolejne
+blokady kompilacji fixtures API poprawione źródłowo; odbiór ich CI wymagany.
+Pełny build desktopu nadal nieodebrany; retencja nieuzyskana (HTTP 500).
+**P8 i cały plan IN PROGRESS; procentów nie podniesiono.**
+
 Checkpoint 14.10.2026 — [P8-53CB](p8/53cb-frontend-compiler-api-and-native-cli.md):
 rozdzielono compiler API 6 od natywnego CLI 7; poprawiono zgodność pluginów
 z ESLint 10 bez wyłączania reguł. Pełny lint PASS `909b25eb`, produkcyjne
