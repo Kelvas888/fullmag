@@ -1053,6 +1053,169 @@ describe("buildModelTree", () => {
     );
   });
 
+  it("combines Study and object flags for Exchange and Demag snapshots", () => {
+    const scenarios = [
+      {
+        enabled: false,
+        id: "study-disabled-defaults",
+        physicsStack: undefined,
+        study: { exchange_enabled: false, demag_enabled: false },
+      },
+      {
+        enabled: true,
+        id: "study-enabled-defaults",
+        physicsStack: undefined,
+        study: { exchange_enabled: true, demag_enabled: true },
+      },
+      {
+        enabled: true,
+        id: "missing-study-flags-default-on",
+        physicsStack: undefined,
+        study: {},
+      },
+      {
+        enabled: false,
+        id: "study-disabled-overrides-object",
+        physicsStack: [
+          { enabled: true, kind: "exchange" },
+          { enabled: true, kind: "demag" },
+        ],
+        study: { exchange_enabled: false, demag_enabled: false },
+      },
+      {
+        enabled: false,
+        id: "object-disabled",
+        physicsStack: [
+          { enabled: false, kind: "exchange" },
+          { enabled: false, kind: "demag" },
+        ],
+        study: { exchange_enabled: true, demag_enabled: true },
+      },
+      {
+        exchangeEnabled: false,
+        demagEnabled: true,
+        id: "mixed-study-flags",
+        physicsStack: [
+          { enabled: true, kind: "exchange" },
+          { enabled: true, kind: "demag" },
+        ],
+        study: { exchange_enabled: false, demag_enabled: true },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const snapshot = modelTreeSnapshotFromScene({
+        objects: [
+          {
+            id: scenario.id,
+            name: scenario.id,
+            physics_stack: scenario.physicsStack,
+          },
+        ],
+        study: scenario.study,
+      } as SceneResource);
+      const tree = flattenExplorerNodes(buildModelTree(snapshot));
+
+      for (const kind of ["exchange", "demag"] as const) {
+        const enabled = "enabled" in scenario
+          ? scenario.enabled
+          : kind === "exchange"
+            ? scenario.exchangeEnabled
+            : scenario.demagEnabled;
+        const expectedEnabledCount = enabled ? 1 : 0;
+        const expectedBadge = enabled ? "active" : "disabled";
+        const expectedStatus = enabled ? "ready" : "degraded";
+
+        expect(
+          snapshot.physicsInteractions?.find((item) => item.id === kind),
+        ).toMatchObject({ enabledCount: expectedEnabledCount, objectCount: 1 });
+        expect(
+          snapshot.objects?.[0]?.physicsInteractions?.find(
+            (item) => item.id === kind,
+          ),
+        ).toMatchObject({ enabledCount: expectedEnabledCount, objectCount: 1 });
+        expect(
+          tree.find(
+            (node) =>
+              node.id === `model:object:${scenario.id}:magnetic-parameters:${kind}`,
+          ),
+        ).toMatchObject({ badge: expectedBadge, status: expectedStatus });
+      }
+    }
+  });
+
+  it("ignores interaction stacks and inferred material physics for non-magnetic roles", () => {
+    const snapshot = modelTreeSnapshotFromScene({
+      materials: [
+        {
+          id: "aux-material",
+          name: "Auxiliary material",
+          properties: { Dbulk: 0.002, Dind: 0.001 },
+        },
+      ],
+      objects: [
+        {
+          id: "aux",
+          material_ref: "aux-material",
+          name: "Auxiliary",
+          physics_stack: [
+            { enabled: true, kind: "exchange" },
+            { enabled: true, kind: "demag" },
+            { enabled: true, kind: "uniaxial_anisotropy" },
+          ],
+          role: "auxiliary",
+        },
+        {
+          id: "antenna",
+          material_ref: "aux-material",
+          name: "Antenna",
+          physics_stack: [
+            { enabled: true, kind: "exchange" },
+            { enabled: true, kind: "demag" },
+            { enabled: true, kind: "uniaxial_anisotropy" },
+          ],
+          role: "antenna",
+        },
+        {
+          id: "compat-air",
+          name: "Legacy Airbox",
+          physics_stack: [
+            { enabled: true, kind: "exchange" },
+            { enabled: true, kind: "demag" },
+          ],
+          role: "airbox",
+        },
+      ],
+      study: { exchange_enabled: false, demag_enabled: true },
+    } as SceneResource);
+    const tree = flattenExplorerNodes(buildModelTree(snapshot));
+
+    expect(snapshot.objects?.map((object) => object.id)).toEqual([
+      "aux",
+      "antenna",
+    ]);
+    expect(
+      snapshot.objects?.map((object) => object.physicsInteractions),
+    ).toEqual([[], []]);
+    expect(snapshot.physicsInteractions).toEqual([]);
+    for (const objectId of ["aux", "antenna"] as const) {
+      for (const kind of [
+        "exchange",
+        "demag",
+        "uniaxial_anisotropy",
+        "interfacial_dmi",
+        "bulk_dmi",
+      ]) {
+        expect(
+          tree.some(
+            (node) =>
+              node.id === `model:object:${objectId}:magnetic-parameters:${kind}`,
+          ),
+        ).toBe(false);
+      }
+    }
+  });
+
   it("projects antenna scene objects without magnetic object children", () => {
     const snapshot = modelTreeSnapshotFromScene({
       current_modules: {

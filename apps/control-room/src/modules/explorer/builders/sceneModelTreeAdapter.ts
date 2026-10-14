@@ -69,6 +69,7 @@ export function modelTreeSnapshotFromScene(
   scene: SceneLike | null | undefined,
   resources: ModelTreeResourceInputs = {},
 ): ModelTreeSnapshot {
+  const study = scene?.study;
   const materials = sceneMaterials(scene?.materials);
   const materialById = new Map(
     materials.map((material) => [material.id, material]),
@@ -116,6 +117,7 @@ export function modelTreeSnapshotFromScene(
             materialFieldsByObject,
             resources.domainPresentation,
             resources.meshManifest,
+            study,
           );
           if (snapshot) {
             objects.push(snapshot);
@@ -123,14 +125,14 @@ export function modelTreeSnapshotFromScene(
           return objects;
         }, [])
       : [],
-    physicsInteractions: scenePhysicsInteractions(scene?.objects),
+    physicsInteractions: scenePhysicsInteractions(scene?.objects, study),
     ...(resources.physicsGraph !== undefined
       ? { physicsGraph: resources.physicsGraph }
       : {}),
     ...(resources.physicsGraphStatus !== undefined
       ? { physicsGraphStatus: resources.physicsGraphStatus }
       : {}),
-    study: sceneStudySnapshot(scene?.study),
+    study: sceneStudySnapshot(study),
     universe: sceneUniverseSnapshot(scene?.universe),
   };
 }
@@ -341,14 +343,28 @@ function materialPropertyKeys(value: unknown): string[] {
 
 function scenePhysicsInteractions(
   objects: unknown,
+  study: unknown,
 ): ModelTreePhysicsInteractionSnapshot[] {
   if (!Array.isArray(objects)) return [];
 
   const byKind = new Map<string, { enabledCount: number; objectCount: number }>();
 
   for (const object of objects) {
-    if (!object || typeof object !== "object") continue;
-    const stack = (object as Record<string, unknown>).physics_stack;
+    const sceneObject = recordValue(object);
+    if (!sceneObject) continue;
+    if (isSyntheticAirboxSceneObject(sceneObject)) continue;
+    if (sceneObjectRole(sceneObject) !== "magnet") continue;
+    const stack = sceneObject.physics_stack;
+
+    for (const kind of studyGlobalInteractionKinds) {
+      const current = byKind.get(kind) ?? { enabledCount: 0, objectCount: 0 };
+      current.objectCount += 1;
+      if (effectiveStudyInteractionEnabled(study, stack, kind)) {
+        current.enabledCount += 1;
+      }
+      byKind.set(kind, current);
+    }
+
     if (!Array.isArray(stack)) continue;
 
     for (const value of stack) {
@@ -356,6 +372,7 @@ function scenePhysicsInteractions(
       const interaction = value as Record<string, unknown>;
       const kind = stringValue(interaction.kind);
       if (!kind) continue;
+      if (isStudyGlobalInteractionKind(kind)) continue;
       const current = byKind.get(kind) ?? { enabledCount: 0, objectCount: 0 };
       current.objectCount += 1;
       if (interaction.enabled !== false) {
@@ -383,6 +400,7 @@ function sceneObjectSnapshot(
   materialFieldsByObject: ReadonlyMap<string, ModelTreeMaterialFieldSnapshot[]>,
   domainPresentation: DomainPresentation | null | undefined,
   meshManifest: MeshSharedDomainManifestResource | null | undefined,
+  study: unknown,
 ): ModelTreeObjectSnapshot | null {
   if (!value || typeof value !== "object") return null;
   const object = value as Record<string, unknown>;
@@ -402,6 +420,7 @@ function sceneObjectSnapshot(
   const regionMagnetization = regionMagnetizationRef
     ? magnetizationById.get(regionMagnetizationRef)
     : undefined;
+  const objectRole = sceneObjectRole(object);
 
   return {
     geometryKind: geometryKind(object.geometry),
@@ -419,12 +438,15 @@ function sceneObjectSnapshot(
       meshManifest,
       domainPresentation,
     ),
-    objectRole: sceneObjectRole(object),
-    physicsInteractions: sceneObjectPhysicsInteractions(
-      object.physics_stack,
-      materialHasDind(material),
-      materialHasDbulk(material),
-    ),
+    objectRole,
+    physicsInteractions: objectRole === "magnet"
+      ? sceneObjectPhysicsInteractions(
+          object.physics_stack,
+          materialHasDind(material),
+          materialHasDbulk(material),
+          study,
+        )
+      : [],
     region: stringValue(object.region_name),
     regionId,
     regionMagnetization: regionMagnetizationRef,
@@ -713,10 +735,16 @@ function sceneObjectPhysicsInteractions(
   value: unknown,
   materialDindEnabled: boolean,
   materialDbulkEnabled: boolean,
+  study: unknown,
 ): ModelTreePhysicsInteractionSnapshot[] {
   const byKind = new Map<string, { enabledCount: number; objectCount: number }>();
-  byKind.set("exchange", { enabledCount: 1, objectCount: 1 });
-  byKind.set("demag", { enabledCount: 1, objectCount: 1 });
+  for (const kind of studyGlobalInteractionKinds) {
+    byKind.set(kind, {
+      enabledCount:
+        effectiveStudyInteractionEnabled(study, value, kind) ? 1 : 0,
+      objectCount: 1,
+    });
+  }
   if (materialDindEnabled) {
     byKind.set("interfacial_dmi", { enabledCount: 1, objectCount: 1 });
   }
@@ -730,6 +758,17 @@ function sceneObjectPhysicsInteractions(
       const interaction = item as Record<string, unknown>;
       const kind = stringValue(interaction.kind);
       if (!kind) continue;
+      if (isStudyGlobalInteractionKind(kind)) {
+        byKind.set(kind, {
+          enabledCount:
+            studyGlobalInteractionEnabled(study, kind) &&
+            interaction.enabled !== false
+              ? 1
+              : 0,
+          objectCount: 1,
+        });
+        continue;
+      }
       byKind.set(kind, {
         enabledCount: interaction.enabled === false ? 0 : 1,
         objectCount: 1,
@@ -751,6 +790,44 @@ function sceneObjectPhysicsInteractions(
     },
     [],
   );
+}
+
+type StudyGlobalInteractionKind = "exchange" | "demag";
+
+const studyGlobalInteractionKinds: readonly StudyGlobalInteractionKind[] = [
+  "exchange",
+  "demag",
+];
+
+function isStudyGlobalInteractionKind(
+  kind: string,
+): kind is StudyGlobalInteractionKind {
+  return kind === "exchange" || kind === "demag";
+}
+
+function studyGlobalInteractionEnabled(
+  study: unknown,
+  kind: StudyGlobalInteractionKind,
+): boolean {
+  return recordValue(study)?.[`${kind}_enabled`] !== false;
+}
+
+function effectiveStudyInteractionEnabled(
+  study: unknown,
+  stack: unknown,
+  kind: StudyGlobalInteractionKind,
+): boolean {
+  if (!studyGlobalInteractionEnabled(study, kind)) return false;
+  if (!Array.isArray(stack)) return true;
+
+  let objectEnabled = true;
+  for (const value of stack) {
+    const interaction = recordValue(value);
+    if (stringValue(interaction?.kind) === kind) {
+      objectEnabled = interaction?.enabled !== false;
+    }
+  }
+  return objectEnabled;
 }
 
 const interactionOrder = [
