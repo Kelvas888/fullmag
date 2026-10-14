@@ -42,12 +42,12 @@ def image_id(value):
     return observed
 
 
-def compose_spec(image, state, port):
+def compose_spec(image, state, port, host_certificate=None):
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("A full immutable image ID is required")
     if not 1024 <= port <= 65535:
         raise ValueError("Port must be between 1024 and 65535")
-    return {"services": {"fullmag": {
+    result = {"services": {"fullmag": {
         "image": image, "pull_policy": "never", "init": True,
         "read_only": True, "user": "65532:65532", "gpus": "all",
         "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],
@@ -56,6 +56,14 @@ def compose_spec(image, state, port):
         "tmpfs": ["/tmp:rw,nosuid,nodev,size=512m"],
         "stop_grace_period": "30s",
     }}}
+    if host_certificate is not None:
+        service = result["services"]["fullmag"]
+        service["volumes"].append({"type": "bind", "source": str(host_certificate),
+                                   "target": "/run/fullmag/windows-folder-host.json", "read_only": True})
+        service["environment"] = {"FULLMAG_SESSION_STORAGE_PROFILE": "windows-folder-v1",
+                                   "FULLMAG_RUNTIME_IMAGE_ID": image}
+        service["hostname"] = "fullmag-" + Path(state).parent.name
+    return result
 
 
 def prepare_gpu_release(layout, job_id, commit):
@@ -158,8 +166,9 @@ def build_image(repo, job_id, commit):
             # The trusted capsule excludes .env, Git internals and host caches.
             shutil.copytree(capsule / "tree", stage / "source", symlinks=False)
             shutil.copytree(package, stage / "package", symlinks=False)
-            for name in ("Dockerfile", "entrypoint.py"):
-                shutil.copyfile(repo / "docker/all-in-one" / name, stage / name)
+            receipt["binary_hashes"] = {path.name: digest(path) for path in (stage / "package/bin").iterdir() if path.is_file()}
+            for name in ("Dockerfile", "entrypoint.py", "windows_folder_probe.py"):
+                shutil.copyfile(capsule / "tree/docker/all-in-one" / name, stage / name)
             (stage / "provenance.json").write_text(json.dumps(receipt, indent=2) + "\n")
             # Docker FROM expects a repository reference, so create an explicit
             # local alias and attest its ID immediately before the offline build.
@@ -209,15 +218,55 @@ def start(repo, assembly_receipt, port):
     register_runtime_reference_root(layout, root)
     project = "fullmag-all-" + root.name
     spec = root / "compose.json"
-    storage.atomic_json(spec, compose_spec(image, state.resolve(), port))
+    host_certificate = root / "windows-folder-host.json"
     receipt = {"schema": "fullmag.docker-all-run.v1", "state": "starting", "image_id": image,
                "compose_project": project, "compose_file": str(spec), "state_root": str(state),
                "assembly_receipt": str(assembly_receipt), "assembly_receipt_sha256": digest(assembly_receipt),
                "native_source_identity": assembly["native_source_identity"],
                "url": f"http://localhost:{port}/workspace", "qualification": "NOT VERIFIED"}
+    storage.atomic_json(root / "receipt.json", receipt)
     try:
         args = ["compose", "-f", str(spec), "--project-name", project]
+        if os.name != "nt":
+            raise ValueError("This Windows-folder launcher requires native Windows host attestation")
+        from windows_folder_host import attest, local_volume, read_owned_regular
+        certificate = attest(state, assembly, docker("info", "--format", "{{.ID}}"), assembly["binary_hashes"])
+        storage.atomic_json(host_certificate, certificate)
+        configured = compose_spec(image, state.resolve(), port, host_certificate.resolve())
+        probe_service = configured["services"]["fullmag"]
+        probe_service["command"] = ["--storage-probe"]
+        probe_service["healthcheck"] = {"disable": True}
+        storage.atomic_json(spec, configured)
         docker(*args, "config", "--quiet")
+        docker(*args, "up", "--detach", "--no-build", "--pull", "never")
+        probe_container = docker(*args, "ps", "--all", "--quiet", "fullmag")
+        receipt["probe_container_id"] = probe_container
+        receipt["first_probe_exit_code"] = docker("wait", probe_container)
+        (root / "storage-first.log").write_text(docker("logs", probe_container, combined=True))
+        if receipt["first_probe_exit_code"] != "0":
+            raise ValueError("Windows storage first probe failed: " + docker("logs", probe_container, combined=True))
+        docker("start", probe_container)
+        receipt["restart_probe_exit_code"] = docker("wait", probe_container)
+        (root / "storage-restart.log").write_text(docker("logs", probe_container, combined=True))
+        if receipt["restart_probe_exit_code"] != "0":
+            raise ValueError("Windows storage restart probe failed: " + docker("logs", probe_container, combined=True))
+        probe = json.loads(read_owned_regular(state / ".windows-folder-probe/probe-restart.json"))
+        CHECKS = ("file_sync", "directory_sync", "atomic_replace", "atomic_directory_publish",
+                  "process_lock", "no_follow_symlink", "no_follow_junction",
+                  "sqlite_transactions", "restart_readback")
+        if set(probe["checks"]) != set(CHECKS) or not all(value is True for value in probe["checks"].values()):
+            raise ValueError("Windows session storage probes were not all successful")
+        import hashlib
+        if hashlib.sha256(read_owned_regular(state / ".windows-folder-probe/restart-sentinel.bin")).hexdigest() != certificate["restart_expected_sha256"]:
+            raise ValueError("Native Windows restart readback differs from the guest")
+        if any(certificate[key] != value for key, value in local_volume(state).items()):
+            raise ValueError("Native Windows volume identity changed during preflight")
+        certificate["restart_verified"] = True
+        storage.atomic_json(state / ".fullmag-windows-folder-owner.json", certificate)
+        storage.atomic_json(host_certificate, certificate)
+        receipt["storage_operational_checks"] = probe["checks"]
+        receipt["storage_power_loss"] = "NOT VERIFIED"
+        storage.atomic_json(spec, compose_spec(image, state.resolve(), port, host_certificate.resolve()))
         docker(*args, "up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "90")
         container = docker(*args, "ps", "--quiet", "fullmag")
         receipt["container_id"] = container
@@ -229,13 +278,17 @@ def start(repo, assembly_receipt, port):
         mounts = [m for m in actual["Mounts"] if m["Destination"] == "/state"]
         if len(mounts) != 1 or mounts[0]["Type"] != "bind" or not mounts[0]["RW"] or host_path(mounts[0]["Source"]) != state.resolve():
             raise ValueError("Runtime state mount attestation mismatch")
+        certificates = [m for m in actual["Mounts"] if m["Destination"] == "/run/fullmag/windows-folder-host.json"]
+        if (len(certificates) != 1 or certificates[0]["Type"] != "bind" or certificates[0]["RW"]
+                or host_path(certificates[0]["Source"]) != host_certificate.resolve()):
+            raise ValueError("Readonly Windows host attestation mount mismatch")
         if not host.get("ReadonlyRootfs") or host.get("Privileged") or actual["Config"].get("User") != "65532:65532":
             raise ValueError("Runtime isolation attestation mismatch")
         if not any(d.get("Count") == -1 and ["gpu"] in d.get("Capabilities", []) for d in host.get("DeviceRequests", [])):
             raise ValueError("Runtime NVIDIA GPU request is missing")
         provenance = json.loads(docker("exec", container, "cat", "/opt/fullmag/provenance.json"))
         if any(provenance.get(key) != assembly.get(key) for key in
-               ("commit", "job_id", "source_digest", "base_image", "native_source_identity")):
+               ("commit", "job_id", "source_digest", "base_image", "native_source_identity", "binary_hashes", "build_receipt_sha256")):
             raise ValueError("Runtime image provenance differs from assembly receipt")
         receipt.update(state="running", health="PASS", gpu_preflight="PASS",
                        attestation="image, provenance, port, storage, GPU request, isolation")

@@ -17,6 +17,7 @@
 mod archive_capacity;
 mod archive_document;
 mod archive_source;
+mod docker_desktop_storage;
 pub mod capture;
 pub mod cas;
 pub mod communication_policy;

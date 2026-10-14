@@ -67,12 +67,27 @@ Kontekst składania, logi, provenance, receipty i pliki Compose pozostają w sto
 projektu. Nie kopiuje hostowego `.env` ani Git do obrazu. Nie wykonuje prune ani
 automatycznego kasowania kontekstu, obrazów lub sesji.
 
-Kontener odrzuca system plików sesji nieobsługiwany przez writer Fullmaga.
-Bind mount Windows w Docker Desktop może mieć typ `9p` (`0x1021997`), który
-obecny writer odrzuca. Taki katalog nie jest kwalifikowanym miejscem trwałej
-sesji; start ma zakończyć się błędem, bez zamiany na nietrwały katalog kontenera.
+Sesje pozostają bezpośrednio w nowym folderze kanonicznego storage Windows,
+montowanym do `/state`. Launcher działa natywnie w Windows i sprawdza lokalny
+NTFS/ReFS, wolumen fixed oraz brak reparse points w przodkach. Nie używa wolumenu
+nazwanego ani zastępczego katalogu kontenera. Utworzony namespace należy do
+Dockera; bieżący natywny writer Windows odrzuca jego marker właściciela.
+Do przenoszenia sesji między runtime’ami używaj eksportu `.fms`.
+
+Dla bind mountu 9p (`0x1021997`) wymagany jest jawny `windows-folder-v1`.
+Przed API launcher uruchamia i restartuje własny kontener próbny, weryfikuje
+native readback oraz dziewięć kontroli: fsync pliku i katalogu, atomic replace,
+publikację katalogu, blokadę między procesami, no-follow symlink/junction,
+transakcje SQLite i odczyt po restarcie. Certyfikat hosta jest montowany readonly;
+grant startowy wiąże go z obrazem, źródłem, binariami i bieżącym mount namespace.
+Domyślna odmowa 9p pozostaje w mocy poza tym konkretnym profilem i folderem.
+
+Te kontrole dopuszczają operacyjne użycie folderu. Nie dowodzą odporności na
+utratę zasilania ani restart całej VM Docker Desktop. Power-loss pozostaje
+`NOT VERIFIED`, zgodnie z istniejącym kontraktem trwałości Fullmaga.
 
 Zielony receipt składania obrazu oznacza tylko złożenie sprawdzonych artefaktów.
 Health API nie dowodzi działania canvas/WebGL, symulacji FEM GPU ani poprawności
-naukowej. Te bramki wymagają osobnych dowodów. Zakaz kompilowania testów
-jednostkowych pozostaje w mocy.
+naukowej. Te bramki wymagają osobnych dowodów. Lokalny zakaz kompilowania testów
+jednostkowych pozostaje w mocy; użytkownik dopuścił wyjątek wyłącznie dla CI
+tego zadania.

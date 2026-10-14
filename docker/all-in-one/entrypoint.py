@@ -2,6 +2,7 @@
 import ctypes
 import os
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -9,7 +10,10 @@ from pathlib import Path
 def preflight():
     kind = subprocess.check_output(["stat", "-f", "-c", "%t", "/state"], text=True).strip()
     # Same supported writer filesystem types as the managed browser route.
-    if kind.lower().lstrip("0") not in {"ef53", "58465342", "9123683e", "1021994", "794c7630"}:
+    if kind.lower().lstrip("0") == "1021997" and os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") == "windows-folder-v1":
+        from windows_folder_probe import run
+        run(require_restart="--storage-probe" not in sys.argv)
+    elif kind.lower().lstrip("0") not in {"ef53", "58465342", "9123683e", "1021994", "794c7630"}:
         raise RuntimeError(f"Unsupported durable session filesystem 0x{kind}; "
                            "configure supported project storage; no ephemeral fallback")
     driver = ctypes.CDLL("libcuda.so.1")
@@ -30,4 +34,6 @@ def preflight():
 
 if __name__ == "__main__":
     preflight()
+    if "--storage-probe" in sys.argv:
+        sys.exit(0)
     os.execv("/opt/fullmag/package/bin/fullmag-api", ["fullmag-api"])

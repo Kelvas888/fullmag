@@ -21,6 +21,60 @@ class DockerRuntimeContract(unittest.TestCase):
         self.assertTrue(service["read_only"])
         self.assertEqual([m["target"] for m in service["volumes"]], ["/state"])
 
+    def test_windows_certificate_is_read_only_and_profile_is_explicit(self):
+        service = runtime.compose_spec("sha256:" + "a" * 64, Path("C:/owned/state"), 3197,
+                                       Path("C:/owned/host.json"))["services"]["fullmag"]
+        self.assertEqual(service["environment"]["FULLMAG_SESSION_STORAGE_PROFILE"], "windows-folder-v1")
+        self.assertTrue(service["volumes"][1]["read_only"])
+        self.assertEqual(service["volumes"][1]["target"], "/run/fullmag/windows-folder-host.json")
+
+    @unittest.skipIf(os.name == "nt", "Guest probes require Linux no-follow and flock")
+    def test_guest_probes_require_restart_before_grant_and_reject_junction(self):
+        import hashlib
+        import uuid
+        path = Path(__file__).resolve().parents[1] / "docker/all-in-one/windows_folder_probe.py"
+        spec = importlib.util.spec_from_file_location("windows_folder_probe_test", path)
+        guest = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guest)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / ".windows-folder-probe"
+            directory.mkdir()
+            target = directory / "junction-target"
+            target.mkdir()
+            (directory / "host-junction").symlink_to(target, target_is_directory=True)
+            image = "sha256:" + "a" * 64
+            owner = str(uuid.uuid4())
+            host = {"schema": "fullmag.windows-folder-host.v1", "storage_profile": "windows-folder-v1",
+                    "role": "session", "owner_scope": "docker-desktop-linux", "host_root_no_reparse": True,
+                    "host_drive_type": 3, "host_filesystem": "NTFS", "image_id": image,
+                    "owner_token": owner, "restart_verified": False,
+                    "restart_expected_sha256": hashlib.sha256((owner + ":" + image).encode()).hexdigest()}
+            certificate = root / "host.json"
+            marker = root / ".fullmag-windows-folder-owner.json"
+            certificate.write_text(json.dumps(host))
+            marker.write_text(json.dumps(host))
+            with patch.object(guest, "ROOT", root), patch.object(guest, "HOST", certificate), \
+                    patch.dict(os.environ, {"FULLMAG_RUNTIME_IMAGE_ID": image}):
+                first = guest.run(False)
+                self.assertFalse(first["checks"]["restart_readback"])
+                with self.assertRaisesRegex(RuntimeError, "Native host has not confirmed"):
+                    guest.run(True)
+                self.assertFalse((root / ".fullmag-windows-folder-grant.json").exists())
+                restart = guest.run(False)
+                self.assertTrue(all(restart["checks"].values()))
+                host["restart_verified"] = True
+                certificate.write_text(json.dumps(host))
+                marker.write_text(json.dumps(host))
+                grant = guest.run(True)
+                self.assertTrue(all(grant["checks"].values()))
+                self.assertEqual(grant["host_attestation_sha256"], hashlib.sha256(certificate.read_bytes()).hexdigest())
+                self.assertTrue((root / ".fullmag-windows-folder-grant.json").is_file())
+                (directory / "host-junction").unlink()
+                (directory / "host-junction").mkdir()
+                with self.assertRaisesRegex(RuntimeError, "Guest did not expose"):
+                    guest.run(True)
+
     def test_rejects_mutable_image_and_invalid_port(self):
         for image, port in (("fullmag:latest", 3197), ("sha256:" + "a" * 64, 80)):
             with self.assertRaises(ValueError):

@@ -5,7 +5,8 @@ COPY source/ /opt/fullmag/source/
 COPY package/ /opt/fullmag/package/
 COPY provenance.json /opt/fullmag/provenance.json
 COPY entrypoint.py /opt/fullmag/entrypoint.py
-RUN mkdir -p /opt/fullmag/source/.fullmag /state && chown 65532:65532 /state && \
+COPY windows_folder_probe.py /opt/fullmag/windows_folder_probe.py
+RUN mkdir -p /opt/fullmag/source/.fullmag /state /run/fullmag && chown 65532:65532 /state && \
     ln -s /opt/fullmag/package /opt/fullmag/source/.fullmag/local && \
     chmod -R a+rX /opt/fullmag && \
     chmod 755 /opt/fullmag/package/bin/* && \
