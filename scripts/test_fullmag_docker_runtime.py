@@ -314,7 +314,7 @@ class DockerRuntimeContract(unittest.TestCase):
                     patch("local_runner.source.capture_source", return_value=manifest) as capture, \
                     patch("local_runner.container_client.request", side_effect=[
                         {"accepting_jobs": True, "allowed_profiles": ["fem-gpu-release"]},
-                        {"job_id": "d" * 32}]) as request, \
+                        {"job_id": "d" * 32, "state": "queued"}]) as request, \
                     patch("builtins.print"):
                 runtime.submit_build(root / "repo", commit)
                 self.assertIsNone(capture.call_args.kwargs["content_store"])
@@ -329,6 +329,12 @@ class DockerRuntimeContract(unittest.TestCase):
                                  "runs/test-worktree/" + payload["request_key"] + "/source")
                 self.assertEqual(request.call_args_list[0].kwargs["method"], "GET")
                 self.assertEqual(request.call_args_list[1].kwargs["method"], "POST")
+                accepted = json.loads(next((root / "runs/test-worktree").glob("*/submission.json")).read_text())
+                self.assertEqual(accepted["state"], "submitted")
+                self.assertEqual(accepted["queue_state_at_submission"], "queued")
+                self.assertFalse(accepted["build_claimed_at_submission"])
+                self.assertEqual(accepted["build_qualification"], "NOT VERIFIED")
+                self.assertIn("never stops or restarts", accepted["queue_policy"])
                 request.reset_mock()
                 request.side_effect = [{"accepting_jobs": True, "allowed_profiles": ["fem-gpu-release"]},
                                        TimeoutError("response lost after POST")]

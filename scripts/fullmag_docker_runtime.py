@@ -187,7 +187,12 @@ def submit_build(repo, commit=None, *, development=False):
     storage.atomic_json(receipt_path, receipt)
     try:
         result = request(layout, owner=owner, method="POST", path="/jobs", payload=submitted)
-        receipt.update(state="submitted", result=result)
+        receipt.update(state="submitted", result=result,
+                       queue_state_at_submission=result.get("state", "unconfirmed"),
+                       build_claimed_at_submission=result.get("state") == "running",
+                       build_qualification="NOT VERIFIED",
+                       next_step="Use runner-status/runner-wait; assemble only a terminal succeeded build",
+                       queue_policy="Running Fullmag runtime containers postpone the heavy build; submission never stops or restarts them")
     except Exception as error:
         receipt.update(state="submission_unconfirmed", error=str(error))
         raise

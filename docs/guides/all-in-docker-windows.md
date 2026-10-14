@@ -24,7 +24,13 @@ just docker-all-image <job-id> <pelny-sha>
 Zgłoszenie używa obsługiwanej niezależnej kopii niezmiennej kapsuły źródeł,
 bez hardlinków do współdzielonego source CAS. Nie modyfikuje ani nie naprawia
 obiektów CAS odrzuconych przez kontrolę niezmienności. Job nadal wykonuje
-jeden istniejący koordynator, z profilem `fem-gpu-release`.
+jeden istniejący koordynator, z profilem `fem-gpu-release`. Receipt
+`state=submitted` oznacza przyjęcie do kolejki, nie rozpoczęcie ani sukces buildu.
+Pole `queue_state_at_submission` dotyczy chwili zgłoszenia; aktualny stan
+sprawdzaj przez `runner-status` i `runner-wait`. `build_claimed_at_submission`
+sygnalizuje przejęcie joba przez koordynatora, nie uruchomienie kompilatora.
+Kod 124 z `runner-wait` oznacza
+koniec czasu obserwacji, a nie anulowanie joba.
 Przed POST do kolejki zapisuje `submission.json` z `capture_id`, `request_key`
 i ścieżką kapsuły. Po timeoutcie stan `submission_unconfirmed` wymaga sprawdzenia
 kolejki według `request_key`; nie zgłaszaj ponownie nowego capture, dopóki nie
@@ -129,6 +135,14 @@ Wartości tożsamości pochodzą z receiptu zgłoszenia. Edycja podczas capture
 powoduje odmowę, późniejsze zmiany nie odrzucają przyjętego snapshotu ani nie
 uruchamiają kolejnego buildu. Niezarejestrowane nowe pliki wymagane przez runtime
 powodują odmowę zamiast cichego pominięcia; dodaj je do Git przed capture.
+Ciężki build jest serializowany z działającymi kontenerami Fullmaga. Przy aktywnym
+workspace zgłoszenie pozostaje w kolejce jako `queued`, z przyczyną
+`waiting_for_existing_fullmag_container` w stanie koordynatora. Przed wykonaniem
+buildu operator musi bezpiecznie zatrzymać własny workspace, gdy jego zadania się
+zakończą. Launcher nie zatrzymuje ani nie restartuje runtime'u automatycznie.
+Jeżeli runtime pojawi się podczas admission, job może otrzymać `blocked`;
+sprawdź jego stan przed kolejną operacją. `docker-all-dev-image` wymaga
+terminalnego `succeeded` oraz zweryfikowanych artefaktów.
 Nowy obraz nie zastępuje działającego backendu. Zastosowanie wymaga kontrolowanego
 uruchomienia. Ten tryb nie deklaruje automatycznego odtworzenia niezapisanego
 workspace po zmianie obrazu backendu.
