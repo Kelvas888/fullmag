@@ -1144,6 +1144,175 @@ describe("buildModelTree", () => {
     }
   });
 
+  it("infers material DMI only from finite nonzero canonical scalar values", () => {
+    const snapshot = modelTreeSnapshotFromScene({
+      materials: [
+        { id: "missing", properties: { Ms: 800000 } },
+        { id: "null", properties: { Dind: null, Dbulk: null } },
+        { id: "zero", properties: { Dind: 0, Dbulk: -0 } },
+        {
+          id: "nonfinite",
+          properties: { Dind: Number.NaN, Dbulk: "Infinity" },
+        },
+        { id: "positive", properties: { Dind: 0.25, Dbulk: "0.5" } },
+        { id: "negative", properties: { Dind: "-0.25", Dbulk: -0.5 } },
+        { id: "nondecimal", properties: { Dind: " ", Dbulk: "0x10" } },
+      ],
+      objects: [
+        { id: "missing", material_ref: "missing" },
+        { id: "null", material_ref: "null" },
+        { id: "zero", material_ref: "zero" },
+        { id: "nonfinite", material_ref: "nonfinite" },
+        { id: "positive", material_ref: "positive" },
+        { id: "negative", material_ref: "negative" },
+        { id: "nondecimal", material_ref: "nondecimal" },
+        {
+          id: "zero-explicit",
+          material_ref: "zero",
+          physics_stack: [{ enabled: true, kind: "interfacial_dmi" }],
+        },
+      ],
+    } as SceneResource);
+    const tree = flattenExplorerNodes(buildModelTree(snapshot));
+    const interactionsFor = (objectId: string) =>
+      snapshot.objects?.find((object) => object.id === objectId)
+        ?.physicsInteractions ?? [];
+
+    for (const objectId of [
+      "missing",
+      "null",
+      "zero",
+      "nonfinite",
+      "nondecimal",
+    ]) {
+      expect(
+        interactionsFor(objectId).map((interaction) => interaction.id),
+      ).toEqual(["exchange", "demag"]);
+    }
+    for (const objectId of ["positive", "negative"]) {
+      expect(
+        interactionsFor(objectId).map((interaction) => interaction.id),
+      ).toEqual([
+        "exchange",
+        "demag",
+        "interfacial_dmi",
+        "bulk_dmi",
+      ]);
+      expect(
+        tree.find(
+          (node) =>
+            node.id === `model:object:${objectId}:magnetic-parameters:interfacial_dmi`,
+        ),
+      ).toMatchObject({ badge: "active", status: "ready" });
+    }
+    expect(
+      interactionsFor("zero-explicit").map((interaction) => interaction.id),
+    ).toEqual(["exchange", "demag", "interfacial_dmi"]);
+
+    expect(
+      snapshot.physicsInteractions?.find(
+        (item) => item.id === "interfacial_dmi",
+      ),
+    )
+      .toMatchObject({ enabledCount: 3, objectCount: 3 });
+    expect(
+      snapshot.physicsInteractions?.find((item) => item.id === "bulk_dmi"),
+    )
+      .toMatchObject({ enabledCount: 2, objectCount: 2 });
+  });
+
+  it("aggregates the last normalized known interaction once per magnetic object", () => {
+    const snapshot = modelTreeSnapshotFromScene({
+      materials: [
+        {
+          id: "nonzero",
+          properties: { Dind: 0.25, Dbulk: -0.5 },
+        },
+      ],
+      objects: [
+        {
+          id: "film-a",
+          material_ref: "nonzero",
+          physics_stack: [
+            { enabled: true, kind: "interfacial_dmi" },
+            { enabled: false, kind: " interfacial_dmi " },
+            { enabled: false, kind: "bulk_dmi" },
+            { enabled: true, kind: " bulk_dmi " },
+            { enabled: true, kind: "uniaxial_anisotropy" },
+            { enabled: false, kind: " uniaxial_anisotropy " },
+            { enabled: true, kind: "unknown_future_interaction" },
+            { enabled: true, kind: "exchange" },
+          ],
+        },
+        {
+          id: "film-b",
+          material_ref: "nonzero",
+          physics_stack: [
+            { enabled: true, kind: " interfacial_dmi " },
+            { enabled: false, kind: " demag " },
+            { enabled: true, kind: "demag" },
+          ],
+        },
+      ],
+      study: { exchange_enabled: false, demag_enabled: true },
+    } as SceneResource);
+    const tree = flattenExplorerNodes(buildModelTree(snapshot));
+    const aggregate = (kind: string) =>
+      snapshot.physicsInteractions?.find((interaction) => interaction.id === kind);
+    const objectInteraction = (objectId: string, kind: string) =>
+      snapshot.objects
+        ?.find((object) => object.id === objectId)
+        ?.physicsInteractions?.find((interaction) => interaction.id === kind);
+
+    expect(aggregate("interfacial_dmi")).toMatchObject({
+      enabledCount: 1,
+      objectCount: 2,
+    });
+    expect(aggregate("bulk_dmi")).toMatchObject({
+      enabledCount: 2,
+      objectCount: 2,
+    });
+    expect(aggregate("uniaxial_anisotropy")).toMatchObject({
+      enabledCount: 0,
+      objectCount: 1,
+    });
+    expect(aggregate("exchange")).toMatchObject({
+      enabledCount: 0,
+      objectCount: 2,
+    });
+    expect(aggregate("demag")).toMatchObject({ enabledCount: 2, objectCount: 2 });
+    expect(aggregate("unknown_future_interaction")).toBeUndefined();
+
+    expect(objectInteraction("film-a", "interfacial_dmi")?.enabledCount).toBe(0);
+    expect(objectInteraction("film-b", "interfacial_dmi")?.enabledCount).toBe(1);
+    expect(objectInteraction("film-a", "bulk_dmi")?.enabledCount).toBe(1);
+    expect(
+      objectInteraction("film-a", "uniaxial_anisotropy")?.enabledCount,
+    ).toBe(0);
+    expect(
+      objectInteraction("film-a", "unknown_future_interaction"),
+    ).toBeUndefined();
+
+    expect(
+      tree.find(
+        (node) =>
+          node.id === "model:object:film-a:magnetic-parameters:interfacial_dmi",
+      ),
+    ).toMatchObject({ badge: "disabled", status: "degraded" });
+    expect(
+      tree.find(
+        (node) =>
+          node.id === "model:object:film-b:magnetic-parameters:interfacial_dmi",
+      ),
+    ).toMatchObject({ badge: "active", status: "ready" });
+    expect(
+      tree.some(
+        (node) =>
+          node.id === "model:object:film-a:magnetic-parameters:unknown_future_interaction",
+      ),
+    ).toBe(false);
+  });
+
   it("ignores interaction stacks and inferred material physics for non-magnetic roles", () => {
     const snapshot = modelTreeSnapshotFromScene({
       materials: [
@@ -1162,6 +1331,8 @@ describe("buildModelTree", () => {
             { enabled: true, kind: "exchange" },
             { enabled: true, kind: "demag" },
             { enabled: true, kind: "uniaxial_anisotropy" },
+            { enabled: true, kind: "interfacial_dmi" },
+            { enabled: true, kind: "bulk_dmi" },
           ],
           role: "auxiliary",
         },
@@ -1173,6 +1344,8 @@ describe("buildModelTree", () => {
             { enabled: true, kind: "exchange" },
             { enabled: true, kind: "demag" },
             { enabled: true, kind: "uniaxial_anisotropy" },
+            { enabled: true, kind: "interfacial_dmi" },
+            { enabled: true, kind: "bulk_dmi" },
           ],
           role: "antenna",
         },

@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import fullmag_storage as storage
 
 PROFILE = "windows-control-room-source-check"
-ROUTES = ("generate-client", "production-source", "api-hygiene", "lint", "openapi-import-check", "typecheck-cli-check", "react-doctor", "development-restart-check", "resource-client-cache-check", "development-kernel-host-check", "development-transport-pause-check", "development-run-outcome-handoff-check", "development-run-outcome-handoff-lint", "development-restart-action-check", "development-restart-action-lint", "development-backend-build-action-check", "material-assignment-draft-check")
+ROUTES = ("generate-client", "production-source", "api-hygiene", "lint", "openapi-import-check", "typecheck-cli-check", "explorer-physics-reporting-check", "react-doctor", "development-restart-check", "resource-client-cache-check", "development-kernel-host-check", "development-transport-pause-check", "development-run-outcome-handoff-check", "development-run-outcome-handoff-lint", "development-restart-action-check", "development-restart-action-lint", "development-backend-build-action-check", "material-assignment-draft-check")
 
 
 def timestamp():
@@ -94,6 +94,10 @@ def run(repo: Path, route: str):
                 commands = [[node, "--test", "scripts/typecheck-control-room.node-test.mjs"]]
                 receipt["interpreted_node_checks"] = True
                 receipt["unit_tests"] = "interpreted_node_only_no_compilation"
+            elif route == "explorer-physics-reporting-check":
+                commands = [[node, "--experimental-vm-modules", "scripts/check-explorer-physics-reporting.mjs"]]
+                receipt["interpreted_node_checks"] = True
+                receipt["unit_tests"] = "none_native_type_erasure_of_production_source_only"
             elif route == "development-restart-check":
                 commands = [[node, "--experimental-vm-modules", "scripts/check-development-restart-controller.mjs"]]
                 receipt["interpreted_node_checks"] = True

@@ -1,4 +1,14 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53BQ](p8/53bq-explorer-physics-normalization.md):
+naprawiono dwa odrębne P2 raportowania DMI oraz duplikatów interakcji.
+Rzeczywisty adapter przed poprawką odtworzył błąd (RED b3c09083), po poprawce
+**31/31 PASS** (4ff5cba7), production source typecheck PASS (a1f721ad).
+Nie zmieniono solvera ani publicznego API; unit sources pozostają NOT RUN.
+Nowy browser proof i integracja są NOT VERIFIED. Kompatybilny launcher
+TypeScript z [P8-53BP](p8/53bp-pr160-integration-gates.md) jest lokalnie
+zacommitowany w `50929f025798eed85f69b98fc63c01bec8ae3877`; push napraw
+czeka na decyzję dotyczącą automatycznego CI kompilującego unit testy.
+**P8 i cały plan pozostają IN PROGRESS; procentów nie podniesiono.**
 
 Checkpoint 14.10.2026 — nowy pakiet `cb9c2825` z poprawkami
 [P8-53BN](p8/53bn-explorer-effective-physics.md) i

@@ -319,7 +319,7 @@ case "${recipe}" in
   *"scripts/verify_control_room_sources.py"*)
     # Never execute the recipe text: accept only the fixed argument shape and
     # invoke the trusted helper from this checkout with the selected route.
-    source_recipe_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_control_room_sources.py" --route (generate-client|production-source|api-hygiene|lint|openapi-import-check|typecheck-cli-check|react-doctor|development-restart-check|resource-client-cache-check|development-kernel-host-check|development-transport-pause-check|development-run-outcome-handoff-check|development-run-outcome-handoff-lint|development-restart-action-check|development-restart-action-lint|development-backend-build-action-check) --repo-root "[^"]+"$'
+    source_recipe_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_control_room_sources.py" --route (generate-client|production-source|api-hygiene|lint|openapi-import-check|typecheck-cli-check|explorer-physics-reporting-check|react-doctor|development-restart-check|resource-client-cache-check|development-kernel-host-check|development-transport-pause-check|development-run-outcome-handoff-check|development-run-outcome-handoff-lint|development-restart-action-check|development-restart-action-lint|development-backend-build-action-check) --repo-root "[^"]+"$'
     if [[ ! "${recipe}" =~ ${source_recipe_pattern} ]]; then
       echo "[fullmag just] invalid lightweight frontend recipe" >&2
       exit 2
