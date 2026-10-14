@@ -767,3 +767,42 @@ więc dodawanie magnetyzacji dopiero po restarcie nie spełni bramki.
 Nie zmieniać walidatora ani oczekiwanych hashów, by akceptowały poprzednie
 niekompletne wejście. Ponowna próba używa tego samego poprawnie zbudowanego
 pakietu, lecz nowego, kompletnego modelu wejściowego.
+
+### Próba z assetem Uniform: kolejka oraz timing punktu before
+
+Próba `40e080f9a0af4c3d9e1cfb47f4de5f32` używa pakietu cd7fe207.
+Przed capture odczyt zatwierdzonej sceny z kontrolą response pin potwierdził
+`material_ref=mat:complete-proof-film` oraz
+`magnetization_ref=mag:complete-proof-film-mv7cagtf:uniform`; odpowiadający
+asset ma kind=preset_texture. Utworzono również authored region.
+Restart zmienił API instance z `c1d7dde5-0a5d-4fa8-b029-53be97d9d5bb`
+na `d28d631b-02a3-4536-a504-a7685d3446a7`, stary API exit 0;
+nowy API zachował to samo przypisanie magnetyzacji, model i dirty document.
+
+Normalny Build Grid został przyjęty do kolejki: command
+`fm-6f9ffaa7-e555-4d4f-835c-34819bf6cc0d`, kind=fdm_grid_refresh,
+seq=1, status=queued, created_at_unix_ms=1791935937616.
+Odczyt szczegółów z przypiętego nowego API nadal pokazuje
+started_at_unix_ms=null i completed_at_unix_ms=null; nie wysłano duplikatu.
+Po utrwaleniu obserwacji próbę anulowano kontrolowanym protokołem:
+failed exit 1, 24/24 procesów odebranych i frontend waited=true.
+Native cleanup result także ma status=failed; nie oznaczono go PASS.
+Diagnoza wykonawcy po restore trwa na zachowanych źródłach i logach.
+[Obserwacja UI](evidence/53bm-grid-queued-after-restore-20261014.png).
+
+Ten punkt before zapisał perspective, a odczyt po restore orthographic.
+Zmianę projekcji i Setup draft wykonano bez oczekiwania na ACK; domyślny
+idle flush w CameraRegistryController to 8000 ms. Produkcyjny capture
+w DevelopmentKernelOwners wymaga czystego, zaobserwowanego registry,
+natomiast diagnostyczny capture_before czyta API bez takiej bramki.
+To wspiera hipotezę wyścigu punktu pomiaru; nie dowodzi nowego błędu
+odtworzenia kamery. `pending-observation.json` pod receipt zachowuje oba
+odczyty i kolejkę. Porównania ani receipt nie zmieniono dla uzyskania PASS.
+
+WIP strony diagnostycznej: `assertConfirmedCameraForCapture` odmawia przy
+dirty/syncInFlight/error, braku remote revision/camera lub różnicy między
+camera i remoteCamera. Wywołania przed przygotowaniem oraz przed claim
+zapobiegają utrwaleniu punktu before podczas oczekiwania na zapis.
+Diff check PASS; staged-page typecheck/lint i rzeczywista regresja
+toggle→odmowa Setup draft→potwierdzony zapis→ponowne Setup draft pozostają
+NOT VERIFIED. Cały P8-53BM/P8-53 nadal IN PROGRESS.
