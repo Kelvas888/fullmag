@@ -1,4 +1,12 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53BR](p8/53br-explorer-physics-browser-proof.md):
+produkcyjne drzewo Explorera przeszło trzy browser scenariusze normalizacji
+fizyki (receipt `96d56620e5914b2eb596927758850904`, exit 0). Brak błędów
+strony, mutacji i nieoczekiwanych odczytów API; źródła stabilne, własny serwer
+zamknięty. Jest to dowód renderowania per obiekt na danych kontrolnych,
+nie realnego API/solvera ani wydania. **P8 i cały plan pozostają IN PROGRESS;
+procentów nie podniesiono.**
+
 Checkpoint 14.10.2026 — [P8-53BQ](p8/53bq-explorer-physics-normalization.md):
 naprawiono dwa odrębne P2 raportowania DMI oraz duplikatów interakcji.
 Rzeczywisty adapter przed poprawką odtworzył błąd (RED b3c09083), po poprawce

@@ -33,6 +33,7 @@ SCENARIO_SMOKES = {
     "execution-profiles": "smoke-execution-profiles.mjs",
     "study-execution-profile": "smoke-study-execution-profile.mjs",
     "inspector-actions": "smoke-inspector-actions.mjs",
+    "explorer-physics-reporting": "smoke-explorer-physics-reporting.mjs",
 }
 SCENARIO_SCHEMAS = {
     "pinned-dataset": "fullmag_pinned_dataset_browser_fixture_v1",
@@ -43,11 +44,13 @@ SCENARIO_SCHEMAS = {
     "execution-profiles": "fullmag_execution_profiles_browser_fixture_v1",
     "study-execution-profile": "fullmag_study_execution_profile_browser_fixture_v1",
     "inspector-actions": "fullmag_inspector_actions_browser_fixture_v1",
+    "explorer-physics-reporting": "fullmag_explorer_physics_reporting_browser_fixture_v1",
 }
 SCENARIO_PORTS = {
     "execution-profiles": 3255,
     "study-execution-profile": 3256,
     "inspector-actions": 3257,
+    "explorer-physics-reporting": 3259,
 }
 
 
@@ -219,7 +222,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                 env["FULLMAG_PINNED_DATASET_BROWSER_CHANNEL"] = BROWSER_CHANNEL
             if scenario != "pinned-dataset":
                 env["CONTROL_ROOM_URL"] = f"http://127.0.0.1:{port}/{scenario}"
-                if scenario in {"development-kernel-host", "development-restart-action", "execution-profiles", "study-execution-profile"}:
+                if scenario in {"development-kernel-host", "development-restart-action", "execution-profiles", "study-execution-profile", "explorer-physics-reporting"}:
                     env["CONTROL_ROOM_URL"] += "?fullmag_api_instance=11111111-1111-4111-8111-111111111111"
                 report_prefix = {
                     "development-run-outcome-handoff": "FULLMAG_DEVELOPMENT_RUN_OUTCOME",
@@ -227,6 +230,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                     "execution-profiles": "FULLMAG_EXECUTION_PROFILES",
                     "study-execution-profile": "FULLMAG_STUDY_EXECUTION_PROFILE",
                     "inspector-actions": "FULLMAG_INSPECTOR_ACTIONS",
+                    "explorer-physics-reporting": "FULLMAG_EXPLORER_PHYSICS_REPORTING",
                 }.get(scenario, "FULLMAG_PROJECT_DOCUMENT")
                 env[report_prefix + "_REPORT_DIR"] = str(run_root / "browser")
                 if BROWSER_CHANNEL:
@@ -282,7 +286,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
             )
             if receipt["source_changed_during_run"]:
                 receipt.update(state="failed", exit_code=1)
-            if scenario == "inspector-actions":
+            if scenario in {"inspector-actions", "explorer-physics-reporting"}:
                 browser_root = run_root / "browser"
                 artifacts = []
                 if browser_root.is_dir():
@@ -296,7 +300,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                 receipt["browser_artifacts"] = artifacts
             receipt["finished_at"] = timestamp()
             storage.atomic_json(receipt_path, receipt)
-        if scenario == "inspector-actions" and receipt["state"] != "passed":
+        if scenario in {"inspector-actions", "explorer-physics-reporting"} and receipt["state"] != "passed":
             for key in ("error", "cleanup_error"):
                 if receipt.get(key):
                     print(f"{key}: {str(receipt[key])[:2000]}", file=sys.stderr, flush=True)

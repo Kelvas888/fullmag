@@ -115,3 +115,11 @@ Adapter nie uległ dalszej zmianie; produkcyjny typecheck a1f721ad pozostaje
 aktualnym dowodem jego źródeł. Driver SHA-256:
 `9f51c860156dd3e8f1aeed31ccb2f2ecdc6bd0da765c809f851431a7f7bd2480`.
 Commity pozostają lokalne; nie uruchomiono remote CI ani merge.
+
+## Uzupełnienie dowodu UI
+
+[P8-53BR](53br-explorer-physics-browser-proof.md) potwierdza produkcyjne
+renderowanie per-object węzłów, statusów i badge: trzy scenariusze PASS,
+receipt `96d56620e5914b2eb596927758850904`, exit 0. Agregaty nadal mają
+odrębny dowód drivera 31/31; fixture nie kwalifikuje rzeczywistego API,
+runtime, solvera ani wydania. Remote integracja pozostaje niezakończona.

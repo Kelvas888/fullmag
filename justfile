@@ -513,6 +513,10 @@ verify-development-restart-action-browser:
 verify-study-execution-profile-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3256 --scenario study-execution-profile
 
+# Production Explorer tree against controlled scene inputs; no solver or unit builds.
+verify-explorer-physics-reporting-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3259 --scenario explorer-physics-reporting
+
 # Actual production Inspector actions against controlled staged/live/read-only sessions.
 verify-inspector-actions-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3257 --scenario inspector-actions

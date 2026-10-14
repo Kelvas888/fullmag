@@ -309,6 +309,10 @@ case "${recipe}" in
     if [[ "${recipe}" =~ ${study_profile_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3256 --scenario study-execution-profile
     fi
+    explorer_physics_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3259 --scenario explorer-physics-reporting$'
+    if [[ "${recipe}" =~ ${explorer_physics_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3259 --scenario explorer-physics-reporting
+    fi
     browser_recipe_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+"$'
     if [[ ! "${recipe}" =~ ${browser_recipe_pattern} ]]; then
       echo "[fullmag just] invalid pinned dataset browser recipe" >&2
