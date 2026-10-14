@@ -26,3 +26,15 @@ w nowym CI pozostaje **NOT RUN**.
 Nowy browser smoke, API hygiene, Control Room i generated API dla aa0f
 są zielone; Python nadal FAIL. Nie przenosimy tych wyników na inne źródła
 ani na native runtime, solver, Windows packaging lub cały P8.
+
+## Odbiór po publikacji 720fcda27
+
+Run `38578366031`, job `115901370257`, źródła
+`720fcda2765029911ee66965541666c978272e0f`: job przeszedł kompilację testów API
+i kroki 8–14 zakończył SUCCESS (session reachability/archive, compact import,
+retention preview cancellation, Relax→Eigen input, deterministic eigen input,
+native modal cancellation oraz typed active eigen Stop/Pause).
+Poprzednie dwa E0277 nie blokują już tej kompilacji. Nie wyprowadzamy z tego
+wykonania samej asercji `host_worker_does_not_inherit_parent_thread_or_affinity_overrides`,
+jeżeli dany krok jej nie wybierał. Krok 15, modal artifact provenance, w chwili
+odczytu był IN_PROGRESS; cały Rust job pozostaje nieodebrany.
