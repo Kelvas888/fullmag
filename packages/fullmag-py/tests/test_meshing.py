@@ -8590,7 +8590,12 @@ class MeshScaffoldTests(unittest.TestCase):
                 self.option = _FakeOption()
 
         fake = _FakeGmsh()
-        actual = _configure_gmsh_threads(fake, requested_threads=4)
+        with patch.dict(
+            os.environ,
+            {"FULLMAG_GMSH_THREADS": "", "FULLMAG_CPU_THREADS": ""},
+            clear=False,
+        ):
+            actual = _configure_gmsh_threads(fake, requested_threads=4)
         self.assertEqual(actual, 4)
         self.assertEqual(fake.option.values["General.NumThreads"], 4)
         self.assertEqual(fake.option.values["Mesh.MaxNumThreads1D"], 4)

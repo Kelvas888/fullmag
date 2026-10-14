@@ -220,3 +220,14 @@ CI końcowego `cf54c6b5de72e1ab5ead82d58ef989fff88687f3` potwierdziło 127 scene
 `python3 scripts/check_output_storage_contract.py`: **PASS, exit 0**, `output-storage interpreted contract: ok`. Niezależny review i diff check: **PASS**. Nie kompilowano lokalnych testów.
 
 Pełny push-run scoped Gmsh przeszedł; PR-run zatrzymał się na jednej multi-object conformity regresji. Porównanie faktycznych checkoutów i przyczyny algorytmu jest w toku; nie obniżono wymagania conformal_occ. Końcowy build/runtime i integracja nadal blokowane przez wolne miejsce i niedostępny required FEM runner.
+
+
+### Checkpoint — kontrola powtarzalności scoped Gmsh CI
+
+PR-run `38646416166` (merge commit `72be6528...`) i push-run `38646406470` (`cf54c6b5...`) mają identyczny tree SHA i blob hashes meshera, testu oraz workflow. Używały Gmsh 4.15.2/Python 3.11.17 i tych samych zależności, ale różnych obrazów Ubuntu runnera. W jednym runie Cylinder + ArchWaveguide odrzucił zdegenerowane Tet4 w OCC, a fallback nie spełnił wymagania `conformal_occ`; drugi run przeszedł. Nowe source-plane seedowanie nie jest wywoływane przez ten przypadek.
+
+Test `test_multi_object_sizing_cylinder_and_waveguide` z `FULLMAG_GMSH_THREADS=1`: **PASS, exit 0, 53.477 s**, przy zachowanych progach i konforemności. Log SHA256 `01fb0f197ae472dac6b94553d7161b5cabc15bc225365ae375edd021c2b31210`. Scoped CI przypina jeden wątek i rejestruje wersje, CPU/affinity oraz ustawienia wątków. Jest to ograniczenie zmienności scheduling w tej bramce, nie dowód ostatecznej przyczyny ani kwalifikacja produkcyjnego OCC. Production runtime parallelism pozostaje bez zmian. Pełny scoped zestaw oczekuje na nowe CI.
+
+Końcowy obraz/HMR/GPU/session storage i integracja nadal **NOT VERIFIED**: ostatni pomiar C: 0.66 GiB wolnego, wymagane minimum runnera 8 GiB; required managed FEM runner offline/queued. Cache, źródła, wyniki i cudze zmiany zachowane.
+
+Test fake konfiguratora izoluje tylko dwa ambient thread overrides; nie zmienia resolvera ani asercji requested=4. Dwa interpreted thread checks z ambient FULLMAG_GMSH_THREADS=1: **PASS, exit 0**. YAML, embedded Python i niezależny review: **PASS**. Timeout 15 min zachowano: poprzedni pełny job trwał 451.18 s, publiczny gate 281.58 s, 338-testowy zestaw 130.738 s.
