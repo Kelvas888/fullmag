@@ -28,6 +28,7 @@ import { resolveInspectorRoute } from "@/modules/inspector/inspectorRouteCatalog
 import { VisualizationDebugSampleTable } from "@/modules/inspector/panels/visualization-debug/VisualizationDebugSampleTable";
 import type { VisualizationDebugPanelModel } from "@/modules/inspector/panels/visualization-debug/VisualizationDebugPanelModel";
 import { buildFieldVectorDebugSamples } from "@/modules/viewport-3d/model/scanFieldVectorDebugStatistics";
+import { makeClosedLoopBrowserFixture } from "../../scripts/fixtures/closed-loop-inspection-data";
 
 const instance = "55555555-5555-4555-8555-555555555555";
 const owner = { session_id: "antenna-viz-fixture", session_epoch: "antenna-viz-fixture@1", request_scope_epoch: `${instance}:1` };
@@ -41,6 +42,7 @@ declare global { interface Window { __antennaVisualizationFixture?: { read(): { 
 function makeFixture() {
   const scenario = new URL(window.location.href).searchParams.get("scenario") ?? "ready";
   const isInspection = scenario.startsWith("inspection");
+  const closedFixture = scenario.startsWith("inspection-closed") ? makeClosedLoopBrowserFixture(owner) : null;
   const isCurrent = scenario.startsWith("inspection-current");
   const scene = {
     revision: 1, objects: [{ id: "antenna", name: "Antenna", role: "antenna" }],
@@ -181,14 +183,22 @@ function makeFixture() {
     if (url.pathname === MODEL_SCENE_PATH) return json(scene);
     if (url.pathname === metadataPath) return isInspection ? new Response("{}", { status: 404, headers }) : json(solution);
     if (url.pathname === catalogPath) return json({ ...owner, stage_id: "solve", status: "ready", outputs: [{ output_id: "solution", solution_ref: { asset_id: solution.asset_id, content_digest: digest, stage_id: "solve" } }] });
-    if (url.pathname === path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, "stage_id", "runtime-solve-001")) { if (isInspection) await displayMetadata(); return isInspection ? json(inspection) : new Response("{}", { status: 404, headers }); }
+    if (url.pathname === path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, "stage_id", "runtime-solve-001")) { if (closedFixture) { const closed = await closedFixture; if (scenario === "inspection-closed-foreign") closed.inspection.run_id = "foreign-run"; return json(closed.inspection); } if (isInspection) await displayMetadata(); return isInspection ? json(inspection) : new Response("{}", { status: 404, headers }); }
     if (url.pathname === path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, "stage_id", "runtime-solve-001")) {
       if (!isInspection || url.searchParams.get("content_digest") !== digest) throw new Error("Unexpected display metadata contract");
+      if (closedFixture) return json((await closedFixture).display);
       return json(await displayMetadata());
     }
     const inspectionPrefix = path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, "stage_id", "runtime-solve-001").split("{payload_kind}")[0];
     if (url.pathname.startsWith(inspectionPrefix)) {
       const kind = url.pathname.slice(inspectionPrefix.length) as keyof typeof rawPayloads;
+      if (closedFixture) {
+        const closed = await closedFixture;
+        const selected = kind as keyof typeof closed.payloads;
+        const data = closed.payloads[selected], descriptor = closed.inspection.closed_loop_manifest.payloads[selected];
+        if (!data || !descriptor || request.headers.get("range") !== `bytes=0-${data.byteLength - 1}` || url.searchParams.get("content_digest") !== digest) throw new Error("Closed-loop fixture payload identity/range differs");
+        return new Response(data, { status: 206, headers: { ...headers, "content-type": "application/octet-stream", etag: await antennaInspectionPayloadEtag(closed.inspection as unknown as AntennaExternalLeadInspectionResource, selected, descriptor.sha256), "content-range": `bytes 0-${data.byteLength - 1}/${data.byteLength}` } });
+      }
       if (!isInspection || !Object.hasOwn(rawPayloads, kind) || url.searchParams.get("content_digest") !== digest) throw new Error("Unexpected inspection payload contract");
       const metadata = await displayMetadata();
       const currentDescriptors = {

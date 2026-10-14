@@ -288,6 +288,42 @@ try {
     assert.equal(rejected.sampleCount, 0); assert.equal(rejected.surfaceTriangles, 0); assert.equal(rejected.paletteTextures, 0); assert.equal(rejected.lost, false);
   }
   checks.push("J rejects mixed archive generations and wrong SI before reads; correctly hashed but foreign trace coordinates or nonfinite J never produce a scientific surface");
+  await open("inspection-closed");
+  await page.waitForFunction(() => document.querySelector('button[aria-label="Toggle Points"]')?.matches(":enabled"));
+  const closedCases = [
+    ["device_potential", "Electric potential V [V]", 4, -2, 4],
+    ["electric_potential_per_ampere", "Inspection potential V/Ic [V/A]", 4, -2, 1],
+    ["current_density", "Current density J [A/m^2]", 1, 8e7, 1e8],
+    ["current_density_per_ampere", "Inspection current J/Ic [1/m^2]", 1, -5e7, -4e7],
+    ["magnetic_field", "Inspection Oersted field H [A/m]", 4, -100, 70],
+    ["magnetic_field_per_ampere", "Inspection Oersted field H/Ic [1/m]", 4, -35, 50],
+  ];
+  for (const [quantity, label, count, minimum, maximum] of closedCases) {
+    await root.getByRole("combobox", { name: "Antenna quantity", exact: true }).click();
+    await page.getByRole("option", { name: label, exact: true }).click();
+    const points = root.getByRole("button", { name: "Toggle Points", exact: true });
+    if (await points.getAttribute("aria-pressed") !== "true") await points.click();
+    if (!quantity.includes("potential")) await root.getByRole("combobox", { name: "Component", exact: true }).selectOption("x");
+    await page.waitForFunction(([q, n]) => window.__antennaFieldCanvas?.().quantity === q && window.__antennaFieldCanvas?.().pointCount === n, [quantity, count]);
+    await root.getByRole("button", { name: "Toggle Surface", exact: true }).click();
+    await page.waitForFunction(() => window.__antennaFieldCanvas?.().surfaceTriangles === 4);
+    const rendered = await page.evaluate(() => window.__antennaFieldCanvas());
+    assert.equal(rendered.lost, false); assert.ok(rendered.width > 0 && rendered.height > 0);
+    assert.equal(rendered.minimum, minimum); assert.equal(rendered.maximum, maximum);
+    assert.equal(rendered.normalization, quantity.endsWith("_per_ampere") ? "per_ampere" : "raw_authored_current");
+    assert.ok((await root.innerText()).includes("NOT VERIFIED"));
+    assert.ok((await root.innerText()).includes("not a reusable basis, source FFT or LLG drive"));
+  }
+  assert.deepEqual((await page.evaluate(() => window.__antennaVisualizationFixture.read())).unexpected, []);
+  await shot("15-closed-loop-signed-H-sampling-Tet4");
+  await page.evaluate(() => window.__antennaVisualizationFixture.selectOther());
+  await page.waitForFunction(() => window.__antennaFieldCanvas?.().sampleCount === 0);
+  checks.push("Closed-loop controlled V/J/H raw and signed per-A use retained stable-u64 device and independent H sampling Tet4 carriers, correct ranges and units; not basis/FFT/LLG qualified; owner switch removes overlay");
+  await open("inspection-closed-foreign");
+  await page.waitForTimeout(500);
+  assert.equal(await root.getByRole("combobox", { name: "Antenna quantity", exact: true }).isEnabled(), false);
+  assert.equal((await page.evaluate(() => window.__antennaVisualizationFixture.read())).calls.filter((call) => call.range).length, 0);
+  checks.push("Closed-loop record with foreign run identity is refused before binary reads");
   await open("tensor-table");
   const matrices = page.getByRole("table", { name: /Flow-major tensor sample/ });
   await matrices.first().getByRole("cell", { name: "Q_zz", exact: true }).waitFor();
