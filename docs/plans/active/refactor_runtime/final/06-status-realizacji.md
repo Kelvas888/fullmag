@@ -1,4 +1,31 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53CP](p8/53cp-worker-environment-fixture-types.md)
+i [P8-53CQ](p8/53cq-owner-air-separated-field-controls.md):
+fixture kompozycji anteny **3/3 PASS w CI**. Dwa kolejne E0277 testu
+środowiska workera poprawiono i opublikowano jako `720fcda27`; odbiór trwa.
+Diagnostyka wykonała 10 obserwacji ze stabilnymi źródłami: oddzielne kontrole
+pól nadal nie odtwarzają referencji owner XY. Box **44/45 PASS**, numeric WIP
+pozostaje niezakwalifikowany. Pełny plan **IN PROGRESS**, procenty bez awansu.
+
+Checkpoint 14.10.2026 — [P8-53CN](p8/53cn-owner-air-repeatability-and-gates.md):
+publiczny Box po doprecyzowaniu air-plane contract **44/45 PASS**, bez skip;
+pozostała rzeczywista porażka niezależności owner XY. Powtórzenia ring dają
+identyczne wyniki dla identycznych wejść, lecz 30/50 nm nadal różnią się.
+Browser fixture PR #168 **PASS**; Rust CI ujawniło kolejny fixture anteny,
+Python CI nadal **FAIL**. Numeric candidate jest lokalnym WIP.
+Procenty bez awansu; pełny plan **IN PROGRESS**.
+
+Checkpoint 14.10.2026 — [P8-53CJ](p8/53cj-exact-layer-diagnostic-checkpoint.md),
+[P8-53CK](p8/53ck-ir-antenna-fixture-contract.md),
+[P8-53CL](p8/53cl-inspector-topology-si-fixture.md) i
+[P8-53CM](p8/53cm-production-mesh-gate-results.md):
+PR #165 scalony; CI Control Room 8541 PASS / 13 skip i generated API PASS.
+Naprawy fixture IR i jednostek FMMT Inspectora są w draft PR #168; CI trwa.
+Mesher candidate: scoped-ring/implicit-cap 2/2 PASS; publiczny Box 36/39 PASS,
+3 porażki zakresu air planes i osobny rzeczywisty FAIL owner XY ring.
+Kandydat pozostaje lokalnym WIP; nie zmieniono oczekiwań ani tolerancji testów.
+Procenty P0–P8 bez awansu; pełny plan IN PROGRESS.
+
 Checkpoint 14.10.2026 — [P8-53CH](p8/53ch-canonical-api-generation-and-antenna-scope.md)
 i [P8-53CI](p8/53ci-scoped-exact-layer-mesher-diagnosis.md):
 CI odebrało **87/87 API session** i **315/315 fullmag-session**, w tym late

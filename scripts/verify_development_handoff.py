@@ -85,7 +85,6 @@ SOURCE_PATHS = (
     "scripts/test_windows_compiler_inputs.py",
     "scripts/test_windows_development_compiler_inputs.py",
     "scripts/windows/development_status.py",
-    "scripts/windows/watch_backend.py",
     "scripts/windows/workspace_backend_identity.py",
     "scripts/windows/runtime_lease.py",
     "scripts/windows/recover_runtime.py",

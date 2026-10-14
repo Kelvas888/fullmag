@@ -23,6 +23,7 @@ const INSPECTOR_SCENE_TRACE_LIMIT = 20;
 const INSPECTOR_MODAL_FIELD_ID = "analysis:eigen:sample-0001:mode-0002";
 const INSPECTOR_MODAL_FIELD_ARRAY_PATH =
   "eigen/mode_fields.zarr/sample_0001/mode_0002/vector_xyz_complex";
+const INSPECTOR_MODAL_TOPOLOGY_COORDINATE_SCALE_M = 100e-9;
 const INSPECTOR_MODAL_FIELD_PAYLOAD_PATH =
   `${INSPECTOR_MODAL_FIELD_ARRAY_PATH}/0.0.0`;
 const INSPECTOR_DRIVEN_RESPONSE_FIELD_ID =
@@ -3813,6 +3814,12 @@ function createInspectorFixture() {
     },
   };
   const requestBudget = createInspectorRequestBudgetState();
+  const topology = inspectorTopologyBuffer();
+  assertInspectorTopologyGeometry(
+    topology,
+    scene.objects[0].geometry.geometry_params.size,
+    scene.universe.size,
+  );
   return {
     fdmBuildGridMode,
     gridCommandBodies: [],
@@ -3854,7 +3861,7 @@ function createInspectorFixture() {
     unknownGetPaths: [],
     revision,
     scene,
-    topology: inspectorTopologyBuffer(),
+    topology,
     texturePatchDelayMs: 0,
     geometryPatchDelayMs: 0,
     geometryPatchPending: false,
@@ -3999,10 +4006,6 @@ async function installInspectorFixtureApi(page, fixture) {
       );
     }
     if (request.method() === "OPTIONS") return fulfillEmpty(route, 204);
-    // No managed development backend is attached to the fixture session.
-    if (path === "/v2/platform/development-backend" && request.method() === "GET") {
-      return fulfillEmpty(route, 204);
-    }
     // The fixture run has no durable observation frames.
     if (path === "/v2/sessions/current/data/observation-frames" && request.method() === "GET") {
       return fulfillJson(route, {
@@ -5373,6 +5376,29 @@ async function fulfillTopology(route, topology, manifest) {
   });
 }
 
+function assertInspectorTopologyGeometry(topology, filmSize, universeSize) {
+  const values = Array.from(new Float64Array(topology, 32, 12 * 3));
+  const spans = [0, 1, 2].map((axis) => {
+    const axisValues = values.filter((_, index) => index % 3 === axis);
+    return Math.max(...axisValues) - Math.min(...axisValues);
+  });
+  const largestSpan = Math.max(...spans);
+  const filmLargestAxis = Math.max(...filmSize);
+  const universeLargestAxis = Math.max(...universeSize);
+  assert(
+    values.every((value) => Number.isFinite(value)) &&
+      spans.every((span) => Number.isFinite(span) && span > 0) &&
+      largestSpan <= filmLargestAxis * 2 &&
+      largestSpan <= universeLargestAxis,
+    `The Inspector topology fixture must stay in finite SI scene scale: ${JSON.stringify({
+      filmLargestAxis,
+      largestSpan,
+      spans,
+      universeLargestAxis,
+    })}`,
+  );
+}
+
 function inspectorTopologyBuffer() {
   const nodeCount = 12;
   const elementCount = 3;
@@ -5390,25 +5416,14 @@ function inspectorTopologyBuffer() {
   view.setUint32(20, elementCount, true);
   view.setUint32(24, elementCount, true);
   let offset = 32;
-  const [domainMinX, domainMinY, domainMinZ] = INSPECTOR_FEM_DOMAIN_BOUNDS_MIN;
-  const [domainMaxX, domainMaxY, domainMaxZ] = INSPECTOR_FEM_DOMAIN_BOUNDS_MAX;
-  const [filmMinX, filmMinY, filmMinZ] = INSPECTOR_FILM_BOUNDS_MIN;
-  const [filmMaxX, filmMaxY, filmMaxZ] = INSPECTOR_FILM_BOUNDS_MAX;
-  const [orphanMinX, orphanMinY, orphanMinZ] = INSPECTOR_ORPHAN_BOUNDS_MIN;
-  const [orphanMaxX, orphanMaxY, orphanMaxZ] = INSPECTOR_ORPHAN_BOUNDS_MAX;
+  const scale = INSPECTOR_MODAL_TOPOLOGY_COORDINATE_SCALE_M;
   new Float64Array(buffer, offset, nodeCount * 3).set([
-    domainMinX, domainMinY, domainMinZ,
-    domainMaxX, domainMinY, domainMinZ,
-    domainMinX, domainMaxY, domainMinZ,
-    domainMinX, domainMinY, domainMaxZ,
-    filmMinX, filmMinY, filmMinZ,
-    filmMaxX, filmMinY, filmMinZ,
-    filmMinX, filmMaxY, filmMinZ,
-    filmMinX, filmMinY, filmMaxZ,
-    orphanMinX, orphanMinY, orphanMinZ,
-    orphanMaxX, orphanMinY, orphanMinZ,
-    orphanMinX, orphanMaxY, orphanMinZ,
-    orphanMinX, orphanMinY, orphanMaxZ,
+    // The synthetic topology remains structurally identical, but its node
+    // coordinates are expressed in the scene's SI metre scale.
+    0, 0, 0, scale, 0, 0, 0, scale, 0, 0, 0, scale,
+    -scale, -scale, -scale, 2 * scale, -scale, -scale,
+    -scale, 2 * scale, -scale, -scale, -scale, 2 * scale,
+    0, 0, scale, scale, 0, scale, 0, scale, scale, 0, 0, 2 * scale,
   ]);
   offset += nodeCount * 3 * Float64Array.BYTES_PER_ELEMENT;
   new Uint32Array(buffer, offset, elementCount * 4).set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
@@ -5907,6 +5922,13 @@ function inspectorFrequencyResponseSweep(
 
 
 async function qualifyFirstRunGuideRouting(page, inspector, screenshotFiles, fixture) {
+  const trigger = page.getByTestId("header-readiness-helper-trigger");
+  await trigger.waitFor({ state: "visible", timeout: 30_000 });
+  assert(
+    !(await page.getByTestId("scratch-authoring-guide").count()),
+    "Readiness helper must not be permanently mounted in the main window before the user opens it.",
+  );
+  await trigger.click();
   const guide = page.getByTestId("scratch-authoring-guide");
   await guide.waitFor({ state: "visible", timeout: 30_000 });
   const material = guide.locator('[data-check-id="material"]');
