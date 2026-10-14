@@ -249,3 +249,8 @@ Finalny scoped CI `38651245873` / job `116150299032` wykonał 338 testów: jeden
 Przy `FULLMAG_GMSH_THREADS=1`: exact invariance fixture **PASS, exit 0, 1.307 s**; najbliższy frozen-signature consumer **PASS, exit 0, 34.541 s**. Native Git diff/check: **PASS**.
 
 Managed job `5d3a5982650b47fea8b3f214caa959ea` nadal jest przypięty do czystego `fa60821af3da9285d6083f951ca3057d4b79f270`, source digest `011371071f6e6471d7e570e36335925c62eb50c27f93f6462ecd1c7d1ac61b4e`, snapshot `4173a13617362474f6484d2d330c7a14b22713cdeddb27289ab8db604bc7278c`. Odczyt otwartego pliku koordynatora potwierdził verify_source kapsuły 8686 plików/356489140 B. Worker/kompilacja nie były jeszcze potwierdzone w tym checkpointcie. Ta późniejsza korekta testu nie zmienia produkcyjnych źródeł budowanego pakietu. Pełny Python contracts job `116150299762` dla fa608 zakończył się success.
+
+
+### Checkpoint — zgodne ustawienie wątków bramek Python
+
+Scoped Gmsh CI `38654772329` przeszedł pełny zestaw 338 testów z `FULLMAG_GMSH_THREADS=1`. Bootstrap Python contracts `116161809040` nie miał tego ustawienia i otrzymał różne sygnatury w tej samej bramce invariance. Job `python-contracts` otrzymuje identyczne ustawienie jednego wątku; zakres pozostaje wyłącznie CI. YAML parse i kontrola diff: PASS. Nie powtarzano lokalnie pełnego zestawu ani nie kompilowano testów jednostkowych. Nowy wynik Bootstrap wymaga CI. Produkcyjne źródła pakietu fa608 pozostają bez zmian; tożsamości artefaktu nie przepisujemy na późniejszy commit.
