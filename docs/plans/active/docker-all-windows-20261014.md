@@ -184,3 +184,13 @@ Noty i mapy 0102/0104 opisują implemented candidate. Density, managed runtime,
 solver i produkcyjna kwalifikacja FEM CPU/GPU pozostają NOT VERIFIED.
 AST, JSON, source-map validator i 41 kontraktów dokumentacji przeszły;
 nie kompilowano lokalnych testów Rust/C++.
+
+### Checkpoint — kontrakty Python i potwierdzony build wcześniejszego SHA
+
+- Testy prywatnego helpera eigen przekazują wymagane `magnet_vars={}`.
+- Test auxiliary identity sprawdza osobno `object_id`, `name` i `geometry_id`, zgodnie z istniejącym adapterem; produkcyjna ścieżka SceneDocument pozostała niezmieniona.
+- Dokładny zestaw CI Python: **127 PASS w 66,08 s**; publiczny verifier tożsamości i rename: **1 PASS**. Nie kompilowano lokalnych testów Rust/C++ ani Vitest.
+- Managed job `e8a13bc0d2914851a27667fa0a575989`, źródło `b5814b313a2d8a500d2e24576f16cbfc48934955`: terminalny koordynator **succeeded, exit 0**. Wszystkie trzy etapy (`native-build`, `frontend-dependencies`, `frontend-build`) zakończyły się kodem 0.
+- Natywny validator sprawdził immutable source, 127 hashy oraz wymagane 12 binariów, PyO3 i statyczny frontend. To dowód buildu wcześniejszego źródła; nie obejmuje końcowego obrazu, HMR, API ani wykonania FEM GPU.
+- Własne zgłoszenie `996c0d7f284e4cefb08972d959a860d0` anulowano w stanie `queued`, aby zastąpić je poprawionym spójnym źródłem. Kapsuła i dowody pozostają w storage.
+- Pozostała korekta fixture meshing: większy clearance przechodzi niezmieniony próg jakości 0.1, ale asercja kontrastu source-face wymaga dalszej diagnozy. Nie obniżono progu ani ratio.
