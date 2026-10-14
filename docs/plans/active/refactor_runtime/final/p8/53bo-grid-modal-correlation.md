@@ -81,3 +81,29 @@ stage-000, completed_step=10. Cały receipt ma jednak failed/exit1:
 28/28 procesów odebranych. Nie zmieniono limitu ani weryfikatora dla PASS.
 Te obserwacje dowodzą korelacji oraz zachowania modalu, nie zaliczenia
 pełnej bramki nowego pakietu. Wymagana jest krótsza kompletna próba.
+
+## Pełna bramka nowego pakietu — 14.10.2026
+
+Kolejna próba `81eb7f40d2c8428baae938f5be5bef73` zakończyła się
+**completed / exit 0**, 10 kontroli, 27/27 procesów odebranych.
+Pakiet `cb9c2825e1723592f17d76045434ce186bb22df906d72dc8290ad100052fc86c`
+zawiera poprawkę korelacji. Nowy API:
+`20dc8dd8-495b-4a01-adcd-a432b7bacd4c`.
+
+Jedno potwierdzenie Grid uruchomiło
+`fm-887a8183-db52-471a-8bfa-4c469da0c6f1`; completed,
+completed_at=1791945654779. Modal pokazał **FDM Grid Build Complete / published**
+oraz „New grid revision published. Viewport update complete.”
+[Dowód UI](evidence/53bo-full-frontend-proof-20261014.png).
+Compute `fm-d3b4adb8-65e1-4148-89d8-37e9574c7688` zakończył
+stage-000 i 10 kroków. Close
+`fm-0d4dbb2c-5536-48d4-84e4-a3e308760876` completed,
+session tombstone=1791945690167. Dzieci Grid i Compute exit 0,
+kill_requested=false. Scena, dirty document i kamera zachowane.
+
+Staged production typecheck/lint exit 0. Bramka odnotowuje końcowy exit 1
+replacement API, exit 0 starego API i odebranie obu; nie dowodzi, że każdy
+proces zakończył się exit 0. Normalne Close dotyczy solvera i ma osobny
+completed oraz naturalny exit dziecka. Zakres: Windows/FDM CPU-reference,
+double/strict, box 100×100×10 nm, cell 5 nm, Uniform +X i Ku1=1000 J/m³.
+Pozostałe lane’y i wydanie pozostają NOT VERIFIED; PR #160 nie jest scalony.

@@ -76,3 +76,16 @@ kroków, lecz przed Close/Finish wyczerpała limit czasu:
 Nie przedstawiać jej jako PASS całej bramki restartu. Powtórzenie pełnego
 scenariusza pozostaje wymagane dla nowego pakietu; source regresje
 auxiliary/antenna nadal NOT RUN, a odrębne P2 nadal otwarte.
+
+## Końcowy dowód nowego pakietu — 14.10.2026
+
+Pełna próba `81eb7f40d2c8428baae938f5be5bef73` zakończyła się
+completed / exit 0: 10 kontroli, 27/27 procesów odebranych.
+Pakiet `cb9c2825e1723592f17d76045434ce186bb22df906d72dc8290ad100052fc86c`
+zawiera tę poprawkę; staged production typecheck/lint exit 0.
+Rzeczywisty Explorer po utworzeniu obiektu pokazał Exchange disabled
+i Demagnetization disabled; jawna anizotropia pozostała aktywna.
+Model z materiałem, regionem, Uniform +X oraz Ku1=1000 J/m³ zachowano
+po restarcie i wykonano 10 kroków FDM CPU-reference, double/strict.
+Unit regresje pozostają NOT RUN; przypadki aux/antenna mają dowód źródłowy,
+nie osobny runtime proof. Integracja PR #160 pozostaje nieukończona.

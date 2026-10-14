@@ -1,5 +1,19 @@
 # Status realizacji całego planu refaktoryzacji
 
+Checkpoint 14.10.2026 — nowy pakiet `cb9c2825` z poprawkami
+[P8-53BN](p8/53bn-explorer-effective-physics.md) i
+[P8-53BO](p8/53bo-grid-modal-correlation.md) przeszedł pełną natywną bramkę:
+receipt `81eb7f40d2c8428baae938f5be5bef73`, **completed / exit 0,
+10 kontroli, 27/27 procesów odebranych**. Zachowano scenę, dirty document
+revision 2 i sześć pól kamery; Grid published, Compute completed
+(10 kroków / jeden etap), normalne Close completed. Staged production
+typecheck/lint exit 0. Nie kompilowano testów jednostkowych.
+Poprawki są na branchu PR #160 (`c5b0da654`, `8327547da`), nie na remote master.
+CI sprawdza merge `9b3dd8d1627fdd6d7ab3c8005dbc49ba04148b07`
+z remote `e40295e419aaf212fb69885c573ac6d6e60c9e69` i nadal jest czerwone:
+[diagnoza integracji P8-53BP](p8/53bp-pr160-integration-gates.md).
+**P8-53 i cały plan pozostają IN PROGRESS; procentów nie podniesiono.**
+
 Aktualizacja 14.10.2026 — pełna bramka natywnego restartu z kamerą,
 autoringiem modelu i wykonaniem Grid/Compute **PASS**:
 `2998926363e84fd5b32569767c9a44b0`, exit 0, 10 kontroli, 27/27 procesów
