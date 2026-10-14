@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   invalidate: vi.fn(),
   replaceFieldDrive: vi.fn(),
   refetch: vi.fn(),
+  sessionScopeKey: "session=antenna-session&epoch=1&request_scope_epoch=antenna-request",
   sceneResource: {
     data: {
       field_drives: {
@@ -59,6 +60,7 @@ vi.mock("@/kernel/KernelContext", async (importOriginal) => ({
       },
     },
     resources: { invalidate: mocks.invalidate },
+    commands: { getSessionScopeKey: () => mocks.sessionScopeKey },
   }),
 }));
 
@@ -75,7 +77,7 @@ vi.mock("@/kernel/resources/useSessionStatus", () => ({
 }));
 
 const sessionRequestOptions = {
-  sessionScopeKey: "session=antenna-session&epoch=1&request_scope_epoch=antenna-request",
+  sessionScopeKey: mocks.sessionScopeKey,
 };
 
 const selection: Selection = {
