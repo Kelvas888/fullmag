@@ -21,5 +21,18 @@ Weryfikacja roota: `node --check` PASS; wykonany konstruktor i validator PASS.
 Porównanie z HEAD potwierdziło bajtowo niezmieniony header i całą część po
 współrzędnych. Każda z 36 pozycji jest dokładnie starym polem×100 nm.
 Negatywna próba ze starym buforem metrowym została odrzucona przez validator.
-Pełny browser smoke i gest Apply/Undo po tej zmianie: **NOT RUN**, oczekują CI.
+Na checkpoint źródeł pełny browser smoke był **NOT RUN**; jego późniejszy
+odbiór opisano poniżej. Odrębnej kwalifikacji Undo nie wyprowadzamy z samego gestu Apply.
 Nie zmieniono publicznego restart_available ani procentu zakończenia planu.
+
+## Odbiór CI po zmianie
+
+Browser-fixture-smoke zakończył się SUCCESS dla `f53dc54f8d82d2e982f25461df0a4eea18aaf81d`
+w pull-request run `38555157810`, job `115822361266`:
+https://github.com/MateuszZelent/fullmag/actions/runs/38555157810/job/115822361266.
+Log potwierdza `objectMoveGesture`, niezerowy drawing buffer 703×436 i
+`isContextLost=false` przed i po geście. Przeszły też wcześniejsze kontrole
+mutacji wizualizacji Object/Airbox oraz dalsze przypadki całego smoke.
+To odbiór syntetycznego fixture i rzeczywistego frontendu w przeglądarce;
+nie jest dowodem solvera ani restartu A→B→C. PR pozostaje otwarty do czasu
+pozostałych wymaganych kontroli i bezpiecznej integracji.

@@ -1,4 +1,12 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53CN](p8/53cn-owner-air-repeatability-and-gates.md):
+publiczny Box po doprecyzowaniu air-plane contract **44/45 PASS**, bez skip;
+pozostała rzeczywista porażka niezależności owner XY. Powtórzenia ring dają
+identyczne wyniki dla identycznych wejść, lecz 30/50 nm nadal różnią się.
+Browser fixture PR #168 **PASS**; Rust CI ujawniło kolejny fixture anteny,
+Python CI nadal **FAIL**. Numeric candidate jest lokalnym WIP.
+Procenty bez awansu; pełny plan **IN PROGRESS**.
+
 Checkpoint 14.10.2026 — [P8-53CJ](p8/53cj-exact-layer-diagnostic-checkpoint.md),
 [P8-53CK](p8/53ck-ir-antenna-fixture-contract.md),
 [P8-53CL](p8/53cl-inspector-topology-si-fixture.md) i
