@@ -230,6 +230,13 @@
       "evidence_status": "interpreted_gmsh_owner_field_consumers_passed_density_not_verified"
     },
     {
+      "id": "scoped-source-plane-seeds",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
+      "symbol": "_embed_mixed_source_face_seed_points",
+      "responsibility": "Projects scoped ComponentRestrictedBox targets and owner lower bounds onto the magnetic source plane, excludes trimmed holes with gmsh.model.isInside, and embeds the points before 2-D generation while preserving exact layers and independent exterior-air planes.",
+      "evidence_status": "focused_interpreted_gmsh_passed_runtime_not_verified"
+    },
+    {
       "id": "scoped-layer-density-regression",
       "path": "packages/fullmag-py/tests/test_meshing.py",
       "symbol": "test_direct_layered_box_region_floor_beats_eligible_upper_actual_density",

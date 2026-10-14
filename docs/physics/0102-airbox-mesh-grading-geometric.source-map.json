@@ -346,6 +346,13 @@
       "evidence_status": "interpreted_gmsh_owner_field_consumers_passed_density_runtime_not_verified"
     },
     {
+      "id": "scoped-source-plane-seeds",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
+      "symbol": "_embed_mixed_source_face_seed_points",
+      "responsibility": "Projects ComponentRestrictedBox and owner lower-bound composition into source-plane coordinates, filters trimmed surfaces with gmsh.model.isInside, and embeds bounded point targets before 2-D generation without changing CAD boundaries.",
+      "evidence_status": "focused_interpreted_gmsh_passed_runtime_not_verified"
+    },
+    {
       "id": "public-box-cad-air-guard",
       "path": "scripts/test_box_layered_airbox_mesh.py",
       "symbol": "_assert_public_box_planes",

@@ -66,6 +66,7 @@ from ._gmsh_fields import (
     _add_surface_threshold_field,
     _apply_mesh_options,
     _apply_post_mesh_options,
+    _exact_plane_cap_seed_points,
 )
 from ._gmsh_airbox import (
     _MIXED_SHARED_GMSH_VERSION,
@@ -397,6 +398,192 @@ def _add_source_face_lower_bound_fields(
     return field_ids
 
 
+def _localize_source_plane_seed_descriptor(
+    config: dict[str, Any],
+    *,
+    normal_axis: int,
+    face_axes: list[int],
+) -> dict[str, Any] | None:
+    """Project one restricted box descriptor into source-plane coordinates."""
+    params = config.get("params")
+    if config.get("kind") != "ComponentRestrictedBox" or not isinstance(params, dict):
+        return None
+    bounds_min = [float(params[f"{axis}Min"]) for axis in "XYZ"]
+    bounds_max = [float(params[f"{axis}Max"]) for axis in "XYZ"]
+    center = [0.5 * (bounds_min[axis] + bounds_max[axis]) for axis in range(3)]
+    size = [bounds_max[axis] - bounds_min[axis] for axis in range(3)]
+    return {
+        "kind": "ComponentRestrictedGradedBox",
+        "params": {
+            "VIn": float(params["VIn"]),
+            "VOut": float(params.get("VOut", params["VIn"])),
+            "Center": [
+                center[face_axes[0]],
+                center[face_axes[1]],
+                center[normal_axis],
+            ],
+            "Size": [
+                size[face_axes[0]],
+                size[face_axes[1]],
+                size[normal_axis],
+            ],
+        },
+    }
+
+
+def _localize_source_plane_lower_bound(
+    config: dict[str, Any],
+    *,
+    normal_axis: int,
+    face_axes: list[int],
+) -> dict[str, Any]:
+    """Copy a lower-bound descriptor with its shape axes in plane order."""
+    localized = dict(config)
+    params = config.get("params")
+    if not isinstance(params, dict):
+        return localized
+    localized_params = dict(params)
+    for key in ("Center", "Size", "Axis"):
+        values = params.get(key)
+        if isinstance(values, (list, tuple)) and len(values) == 3:
+            values_float = [float(value) for value in values]
+            localized_params[key] = [
+                values_float[face_axes[0]],
+                values_float[face_axes[1]],
+                values_float[normal_axis],
+            ]
+    localized["params"] = localized_params
+    return localized
+
+
+def _embed_mixed_source_face_seed_points(
+    gmsh: Any,
+    *,
+    source_surface: int,
+    opts: MeshOptions,
+    hscale: float,
+    source_geometry_name: str | None,
+) -> None:
+    """Embed projected scoped targets so Gmsh's 2-D sampler sees them.
+
+    A three-dimensional ``Box`` field can be correct at the source surface
+    while remaining invisible to Gmsh's initial 2-D triangulation when its
+    footprint is smaller than the first boundary triangles.  Embed points on
+    the actual trimmed surface instead of thickening the box or changing the
+    owner field.  The existing plane-seed helper composes the upper target
+    with the owner lower bound; ``isInside`` excludes holes in difference
+    surfaces before embedding.
+    """
+    restricted_boxes = [
+        config
+        for config in opts.size_fields
+        if isinstance(config, dict)
+        and config.get("kind") == "ComponentRestrictedBox"
+    ]
+    if not restricted_boxes:
+        return
+
+    raw_bbox = gmsh.model.getBoundingBox(2, int(source_surface))
+    try:
+        bbox = tuple(float(value) for value in raw_bbox)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "mixed source-face seed embedding received a non-numeric "
+            "source-surface bounding-box"
+        ) from exc
+    if len(bbox) != 6:
+        raise RuntimeError(
+            "mixed source-face seed embedding requires six source-surface "
+            f"bounding-box values, got {len(bbox)}"
+        )
+    if not all(math.isfinite(value) for value in bbox):
+        raise RuntimeError(
+            "mixed source-face seed embedding requires finite source-surface "
+            "bounding-box values"
+        )
+    if any(bbox[3 + axis] < bbox[axis] for axis in range(3)):
+        raise RuntimeError(
+            "mixed source-face seed embedding received inverted source-surface "
+            "bounding-box bounds"
+        )
+
+    spans = [bbox[3 + axis] - bbox[axis] for axis in range(3)]
+    normal_axis = min(range(3), key=lambda axis: spans[axis])
+    face_axes = [axis for axis in range(3) if axis != normal_axis]
+    normal_span_si = spans[normal_axis] / hscale
+    normal_si = 0.5 * (bbox[normal_axis] + bbox[3 + normal_axis]) / hscale
+    normal_tolerance = max(1.0e-15, 1.0e-9 * max(normal_span_si, 1.0e-12))
+
+    upper_descriptors: list[dict[str, Any]] = []
+    for config in restricted_boxes:
+        params = config.get("params")
+        if not isinstance(params, dict):
+            continue
+        if (
+            source_geometry_name is not None
+            and params.get("GeometryName") != source_geometry_name
+        ):
+            continue
+        bounds_min = [float(params[f"{axis}Min"]) for axis in "XYZ"]
+        bounds_max = [float(params[f"{axis}Max"]) for axis in "XYZ"]
+        if (
+            normal_si < bounds_min[normal_axis] - normal_tolerance
+            or normal_si > bounds_max[normal_axis] + normal_tolerance
+        ):
+            continue
+        localized = _localize_source_plane_seed_descriptor(
+            config,
+            normal_axis=normal_axis,
+            face_axes=face_axes,
+        )
+        if localized is not None:
+            upper_descriptors.append(localized)
+    if not upper_descriptors:
+        return
+
+    lower_descriptors = [
+        _localize_source_plane_lower_bound(
+            config,
+            normal_axis=normal_axis,
+            face_axes=face_axes,
+        )
+        for config in opts.lower_bound_fields
+        if isinstance(config, dict)
+    ]
+    bounds_xy = (
+        bbox[face_axes[0]] / hscale,
+        bbox[face_axes[1]] / hscale,
+        bbox[3 + face_axes[0]] / hscale,
+        bbox[3 + face_axes[1]] / hscale,
+    )
+    seed_points = _exact_plane_cap_seed_points(
+        size_fields=upper_descriptors,
+        lower_bound_fields=lower_descriptors,
+        layer_planes=[normal_si],
+        bounds_xy=bounds_xy,
+    )
+    is_inside = getattr(gmsh.model, "isInside", None)
+    if not callable(is_inside):
+        raise RuntimeError(
+            "mixed source-face seed embedding requires Gmsh model.isInside"
+        )
+    embedded: list[int] = []
+    for x, y, mesh_size in seed_points:
+        point = [0.0, 0.0, 0.0]
+        point[face_axes[0]] = x * hscale
+        point[face_axes[1]] = y * hscale
+        point[normal_axis] = normal_si * hscale
+        if int(is_inside(2, int(source_surface), point)) != 1:
+            continue
+        embedded.append(
+            int(gmsh.model.geo.addPoint(*point, float(mesh_size) * hscale))
+        )
+    if not embedded:
+        return
+    gmsh.model.geo.synchronize()
+    gmsh.model.mesh.embed(0, embedded, 2, int(source_surface))
+
+
 def _apply_mixed_source_face_mesh_options(
     gmsh: Any,
     *,
@@ -405,6 +592,7 @@ def _apply_mixed_source_face_mesh_options(
     order: int,
     opts: MeshOptions,
     hscale: float,
+    source_geometry_name: str | None = None,
 ) -> int:
     """Apply canonical film sizing only to the pre-extrusion source face."""
     source_field_ids: list[int] = []
@@ -491,6 +679,13 @@ def _apply_mixed_source_face_mesh_options(
     gmsh.model.mesh.field.setNumber(restricted, "InField", source_field)
     gmsh.model.mesh.field.setNumbers(restricted, "SurfacesList", [source_surface])
     gmsh.model.mesh.field.setAsBackgroundMesh(restricted)
+    _embed_mixed_source_face_seed_points(
+        gmsh,
+        source_surface=source_surface,
+        opts=opts,
+        hscale=hscale,
+        source_geometry_name=source_geometry_name,
+    )
     return int(restricted)
 
 
@@ -2438,6 +2633,7 @@ def _generate_coincident_ring_airbox_mesh(
                         order=order,
                         opts=options,
                         hscale=SCALE,
+                        source_geometry_name=geometry.geometry_name,
                     )
                 )
             else:
@@ -3052,6 +3248,7 @@ def generate_swept_box_cylinder_ring_mesh(
                     order=order,
                     opts=opts,
                     hscale=SCALE,
+                    source_geometry_name=geometry.geometry_name,
                 )
             )
         else:
@@ -3816,6 +4013,7 @@ def generate_swept_box_mesh(
                 order=order,
                 opts=opts,
                 hscale=SCALE,
+                source_geometry_name=geometry_name,
             )
             gmsh.model.mesh.generate(2)
             _set_mixed_volume_mesh_size_options(

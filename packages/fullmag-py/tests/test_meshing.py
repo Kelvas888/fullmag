@@ -9879,7 +9879,7 @@ class FieldStackAcceptanceTests(unittest.TestCase):
 
         generated: list[tuple[str, float, list[dict[str, object]]]] = []
 
-        def generate(_geometry, *, hmax, order, options):
+        def generate(_geometry, *, hmax, order, options, object_id=None):
             generated.append(
                 (
                     _geometry.geometry_name,
@@ -9988,7 +9988,7 @@ class FieldStackAcceptanceTests(unittest.TestCase):
             tuple[float, list[dict[str, object]], list[dict[str, object]]],
         ] = {}
 
-        def generate(_geometry, *, hmax, order, options):
+        def generate(_geometry, *, hmax, order, options, object_id=None):
             generated[_geometry.geometry_name] = (
                 float(hmax),
                 list(options.size_fields),
@@ -14076,7 +14076,7 @@ class RegionMeshPolicyTests(unittest.TestCase):
                     symmetric=False,
                     recombine=False,
                     airbox=AirboxOptions(
-                        size=(100e-9, 80e-9, 100e-9),
+                        size=(160e-9, 120e-9, 100e-9),
                         center=(0.0, 0.0, 0.0),
                         maximum_element_size=30e-9,
                     ),
@@ -14114,6 +14114,49 @@ class RegionMeshPolicyTests(unittest.TestCase):
         self.assertGreater(core_median, 4e-9)
         self.assertLess(core_median, 16e-9)
         self.assertGreater(bulk_median, core_median)
+
+    def test_source_plane_seed_rejects_invalid_surface_bounding_box(self) -> None:
+        options = MeshOptions(
+            size_fields=[
+                {
+                    "kind": "ComponentRestrictedBox",
+                    "params": {
+                        "GeometryName": "source-owner",
+                        "VIn": 2e-9,
+                        "VOut": 20e-9,
+                        "XMin": -18e-9,
+                        "XMax": 18e-9,
+                        "YMin": -13e-9,
+                        "YMax": 13e-9,
+                        "ZMin": -10e-9,
+                        "ZMax": 6e-9,
+                    },
+                }
+            ]
+        )
+        invalid_boxes = (
+            object(),
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 1.0, float("nan")],
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        )
+        for invalid_bbox in invalid_boxes:
+            with self.subTest(invalid_bbox=repr(invalid_bbox)):
+                fake_gmsh = SimpleNamespace(
+                    model=SimpleNamespace(
+                        getBoundingBox=lambda _dim, _tag, value=invalid_bbox: value
+                    )
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "source-surface bounding-box"
+                ):
+                    gmsh_swept._embed_mixed_source_face_seed_points(
+                        fake_gmsh,
+                        source_surface=7,
+                        opts=options,
+                        hscale=1.0e6,
+                        source_geometry_name="source-owner",
+                    )
 
     def test_ring_chordal_bound_guard_and_refinement(self) -> None:
         quarter_circle_gaps = np.full(4, 0.5 * np.pi, dtype=np.float64)

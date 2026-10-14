@@ -198,3 +198,16 @@ nie kompilowano lokalnych testów Rust/C++.
 ### Checkpoint — test-only blokady kompilacji Rust w CI
 
 W `fullmag-application` uzupełniono dwa importy `#[cfg(test)]` i domyślne `antenna_inventory` w testowym literalze `ScriptExecutionConfig`. Są to przyczyny pięciu błędów kompilacji kroku `cargo test -p fullmag-application --no-fail-fast` w CI `38633512350` / job `116090784830`. Parser-only rustfmt i diff check: PASS. Lokalnych testów Rust/C++ nie kompilowano; potwierdzenie kompilacji i działania oczekuje na wymagane CI poprawionego brancha.
+
+
+### Checkpoint — realizacja lokalnego celu na źródłowej powierzchni
+
+Przyczyną regresji kontrastu siatki był lokalny Box pomijany przez początkową triangulację 2D. Plane-aware seedowanie osadza punkty na rzeczywistej przyciętej powierzchni, uwzględnia owner lower bounds i wyklucza otwory CSG. Zakres Box i progi testu pozostają niezmienione; fixture otrzymała większy clearance powietrza bez obniżenia jakości 0.1 ani ratio 1.5. Dwie mock fixtures przyjmują kanoniczne object_id.
+
+- Pięć focused interpreted Gmsh regressions: **PASS, exit 0, 10.519 s**. Log SHA256 `32ae2b8c28a75c16e711265cedf197cc9d045b4efc4274cd6aeb8c0530a7aad3`.
+- Publiczny harness: **3 PASS, 42 deselected, exit 0, 300.79 s**, Python 3.10.12/Gmsh 4.15.2. Log SHA256 `f7f70dcc947880130f4f1788e9ba7709867160d10125e2f141095387ac1a5cec`.
+- AST oraz source-map validators 0102/0104: **PASS**. Niezależny review: PASS po korekcie fail-closed bounding box.
+- Runner zdrowy i idle, lecz aktualny pomiar Windows i runnera wykazuje około **2.03 GiB wolnego**. Wymagane minimum kolejnego buildu wynosi 8 GiB; operator otrzymał prośbę o zwolnienie miejsca. Nie usunięto cache, kapsuł, wyników ani dowodów.
+- Końcowy build poprawionego SHA, obraz, dwa kontenery, HMR i runtime GPU/storage pozostają **NOT VERIFIED**.
+
+Niepoprawny bbox (konwersja, długość, NaN/Inf, odwrócone granice) kończy się RuntimeError zamiast pominięcia seedowania; wyjątki CAD propagują. Nowa wykonywalna regresja i powtórzone focused Gmsh consumers: PASS. Dowody i bieżące raw/LF SHA zapisano w `scientific-evidence/source-plane-seed-evidence.json`.
