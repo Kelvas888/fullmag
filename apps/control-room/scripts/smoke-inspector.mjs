@@ -3985,10 +3985,6 @@ async function installInspectorFixtureApi(page, fixture) {
       );
     }
     if (request.method() === "OPTIONS") return fulfillEmpty(route, 204);
-    // No managed development backend is attached to the fixture session.
-    if (path === "/v2/platform/development-backend" && request.method() === "GET") {
-      return fulfillEmpty(route, 204);
-    }
     // The fixture run has no durable observation frames.
     if (path === "/v2/sessions/current/data/observation-frames" && request.method() === "GET") {
       return fulfillJson(route, {
