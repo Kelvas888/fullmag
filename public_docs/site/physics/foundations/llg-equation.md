@@ -13,7 +13,8 @@ source_of_truth: packages/fullmag-py/src/fullmag/model/dynamics.py and backends/
 (foundation-llg-problem-statement)=
 # Landau–Lifshitz–Gilbert (LLG) Equation
 
-(problem-statement)=
+(physics-foundations-llg-equation-problem-statement)=
+<!-- (problem-statement)= -->
 ## 1. Physical problem and overview
 
 The Landau–Lifshitz–Gilbert (LLG) equation is the foundational equation of motion for continuum micromagnetics in Fullmag. It governs the precessional and dissipative evolution of the reduced magnetization field $\mathbf{m}(\mathbf{x}, t)$ on the unit sphere $\|\mathbf{m}(\mathbf{x}, t)\|_2 = 1$ under the total effective magnetic field $\mathbf{H}_{\mathrm{eff}}(\mathbf{x}, t)$ and optional spin-torque contributions.
@@ -25,7 +26,8 @@ This document specifies:
 3. the discrete normalization invariant, conservative torque orthogonality, and energy dissipation rate,
 4. the complete public Python DSL (`fm.LLG`, `fm.AdaptiveTimestep`, `fm.FieldRefreshPolicy`, and `study.solver(...)`), `ProblemIR` serialization, and verified source-code index across FEM/FDM CPU/GPU lanes.
 
-(governing-equations)=
+(physics-foundations-llg-equation-governing-equations)=
+<!-- (governing-equations)= -->
 ## 2. Governing equations
 
 Let $\Omega_m \subset \mathbb{R}^3$ denote the ferromagnetic support where $M_s(\mathbf{x}) > 0$. The dimensional magnetization is parameterized by the saturation magnetization $M_s$ and the dimensionless unit-vector field $\mathbf{m}$:
@@ -100,7 +102,8 @@ Under a stationary external field and zero direct current torque ($\boldsymbol{\
 \le 0.
 ```
 
-(symbols-and-si-units)=
+(physics-foundations-llg-equation-symbols-and-si-units)=
+<!-- (symbols-and-si-units)= -->
 ## 3. Symbols and SI units
 
 | Symbol | Meaning | SI unit | Notes |
@@ -117,7 +120,8 @@ Under a stationary external field and zero direct current torque ($\boldsymbol{\
 | $\mu_0$ | Vacuum permeability | $\mathrm{N\,A^{-2}}$ | $4\pi \times 10^{-7}\,\mathrm{N\,A^{-2}}$ |
 | $t$ | Physical simulation time | $\mathrm{s}$ | Independent time variable |
 
-(assumptions-and-validity)=
+(physics-foundations-llg-equation-assumptions-and-validity)=
+<!-- (assumptions-and-validity)= -->
 ## 4. Assumptions and limits of validity
 
 - **Constant local saturation magnitude**: The LLG equation assumes $\|\mathbf{M}(\mathbf{x}, t)\|_2 = M_s(\mathbf{x})$ at temperatures well below the Curie temperature $T_C$. Longitudinal magnitude fluctuations require Landau–Lifshitz–Bloch (LLB) extensions not modeled by {eq}`eq-llg-explicit`.
@@ -125,7 +129,8 @@ Under a stationary external field and zero direct current torque ($\boldsymbol{\
 - **Discrete sphere renormalization**: Explicit Runge–Kutta stages accumulate $\mathcal{O}(\Delta t^{p+1})$ radial drift off $\mathbb{S}^2$. Both CPU and GPU steppers re-normalize active spins to $\|\mathbf{m}_i\|_2 = 1$ at stage/step boundaries and enforce the optional `norm_tolerance` and `max_spin_rotation` guards during adaptive stepping (`LLG-TD-MAX-ERR-V1`).
 - **Precession switch provenance**: Disabling precession ($s_{\mathrm{prec}} = 0$) accelerates convergence toward a local energy minimum in `llg_overdamped` relaxation but alters the transient trajectory and saddle-basin capture relative to physical damped precession ($s_{\mathrm{prec}} = 1$).
 
-(python-api)=
+(physics-foundations-llg-equation-python-api)=
+<!-- (python-api)= -->
 ## 5. Python API and parameter contract
 
 ### Canonical stage-workflow configuration (`study.solver(...)`)
@@ -220,7 +225,8 @@ assert ir["study"]["dynamics"]["integrator"] == "rk45"
 assert ir["study"]["dynamics"]["gyromagnetic_ratio"] == 2.211e5
 ```
 
-(problem-ir)=
+(physics-foundations-llg-equation-problem-ir)=
+<!-- (problem-ir)= -->
 ## 6. `ProblemIR` and canonical script representation
 
 The `LLG` policy serializes into `study.dynamics` inside `ProblemIR`:
@@ -252,14 +258,16 @@ The `LLG` policy serializes into `study.dynamics` inside `ProblemIR`:
 }
 ```
 
-(round-trip-and-failure-semantics)=
+(physics-foundations-llg-equation-round-trip-and-failure-semantics)=
+<!-- (round-trip-and-failure-semantics)= -->
 ## 7. Round-trip, provenance, and failure semantics
 
 - **Requested intent vs. resolved execution**: Setting `integrator="auto"` preserves `"auto"` in `ProblemIR` (`requested intent`) while the planner records the concrete resolved integrator (`rk45` on adaptive time evolution) and execution lane in the runtime receipt (`resolved execution`).
 - **Validation errors**: Non-positive `gamma`, negative `alpha`, simultaneous `fixed_timestep` and `adaptive_timestep`, or incompatible integrator/stepping pairs (`fixed_timestep` with `rk23`/`rk45`, or `adaptive_timestep` with `heun`/`rk4`/`abm3`/`coupled_imex_ark2`) raise immediate `ValueError` validation errors in Python and planner diagnostics in Rust.
 - **Unsupported combinations**: Requesting FDM-only integrators (`abm3`, `coupled_imex_ark2`) on `target="fem"` or forcing GPU execution without a qualified native kernel fails closed without silent CPU fallback.
 
-(discrete-realization)=
+(physics-foundations-llg-equation-discrete-realization)=
+<!-- (discrete-realization)= -->
 ## 8. Discrete realization and numerical operators
 
 After spatial discretization of $\mathbf{H}_{\mathrm{eff}}$ on either an unstructured finite-element mesh (FEM) or a uniform Cartesian grid (FDM), {eq}`eq-llg-explicit` becomes a coupled system of ordinary differential equations $\dot{\mathbf{m}}_i = \mathbf{f}_i(\mathbf{m}, t)$ over all active magnetic degrees of freedom $i \in \mathcal{A}$:
@@ -268,7 +276,8 @@ After spatial discretization of $\mathbf{H}_{\mathrm{eff}}$ on either an unstruc
 - **FEM GPU (`backends/fem/gpu/cuda/integrators/llg/llg_rhs_kernels.cu`)**: Evaluates the fused device kernel `fullmag_cuda_llg_rhs_fused` directly on device-resident SoA/AoS buffers without host readback during explicit RK stage execution.
 - **FDM CPU & GPU (`crates/fullmag-engine/src/fdm/cpu/integrators.rs` and `backends/fdm/gpu/cuda/`)**: Evaluates the cell-centered LLG right-hand side across active cells $M_{s,i} > 0$, supporting explicit `heun`, `rk4`, `rk23`, `rk45`, fixed-step `abm3`, and `coupled_imex_ark2` (for coupled magnetoelastic elastodynamics).
 
-(implementation-mapping)=
+(physics-foundations-llg-equation-implementation-mapping)=
+<!-- (implementation-mapping)= -->
 ## 9. Backend and device implementation mapping
 
 | Solver | Device | Support status | Implementation notes |
@@ -281,27 +290,31 @@ After spatial discretization of $\mathbf{H}_{\mathrm{eff}}$ on either an unstruc
 - **Control Room Dynamics & Solver Inspector**: Exposes `gamma`, `integrator`, fixed vs. adaptive timestep mode, and `AdaptiveTimestep` tolerances (`atol`, `rtol`, `dt_initial`, `dt_min`, `dt_max`, `safety`, `growth_limit`, `shrink_limit`).
 - **Control Room Material Inspector**: Exposes region-level `Ms` ($\mathrm{A\,m^{-1}}$) and Gilbert damping `alpha` ($1$).
 
-(validation)=
+(physics-foundations-llg-equation-validation)=
+<!-- (validation)= -->
 ## 10. Validation and benchmark gates
 
 - **Analytical macrospin precession**: Verified against exact Larmor frequency $f_0 = \gamma_0 H_0 / [2\pi(1+\alpha^2)]$ and exponential relaxation envelope in `packages/fullmag-py/tests/test_llg_solver_contract.py` and `backends/fem/tests/llg_rhs_contract.cpp`.
 - **Standard Problem #4 & #5**: Validated across FEM and FDM lanes in `packages/fullmag-py/tests/test_standard_problem_4_fem.py`, `test_standard_problem_5_fdm.py`, and `test_standard_problem_5_fem.py`.
 
-(limitations)=
+(physics-foundations-llg-equation-limitations)=
+<!-- (limitations)= -->
 ## 11. Known limitations and operational constraints
 
 - **Zero-saturation vacuum regions**: Cells or nodes with $M_{s,i} = 0$ are excluded from the active set $\mathcal{A}$ and maintain $\dot{\mathbf{m}}_i = \mathbf{0}$.
 - **Explicit exchange stiffness**: On fine meshes or grids, the exchange operator eigenvalues scale as $\mathcal{O}(h^{-2})$, bounding the maximum stable explicit Runge–Kutta timestep (`LLG-TD-STIFF-V1`).
 - **Stochastic thermal and callback fields**: When stochastic Brown thermal fluctuations or callback-driven stage currents are active, First-Same-As-Last (FSAL) stage reuse is automatically disabled (`gpu_rk_rhs_allows_fsal_reuse`).
 
-(scientific-bibliography)=
+(physics-foundations-llg-equation-scientific-bibliography)=
+<!-- (scientific-bibliography)= -->
 ## 12. Scientific bibliography
 
 1. L. D. Landau and E. M. Lifshitz, *On the theory of the dispersion of magnetic permeability in ferromagnetic bodies*, Phys. Z. Sowjetunion **8**, 153 (1935).
 2. T. L. Gilbert, *A phenomenological theory of damping in ferromagnetic materials*, IEEE Trans. Magn. **40**, 3443 (2004).
 3. W. F. Brown Jr., *Micromagnetics*, Interscience Publishers, New York (1963).
 
-(source-code-index)=
+(physics-foundations-llg-equation-source-code-index)=
+<!-- (source-code-index)= -->
 ## 13. Source-code index
 
 | Layer | File | Symbol / entrypoint | Responsibility |

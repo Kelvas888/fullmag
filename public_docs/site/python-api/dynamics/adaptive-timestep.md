@@ -9,12 +9,14 @@ owner: fullmag-public-docs
 (public-docs-python-api-dynamics-adaptive-timestep)=
 # `AdaptiveTimestep` Contract
 
-(problem-statement)=
+(python-api-dynamics-adaptive-timestep-problem-statement)=
+<!-- (problem-statement)= -->
 ## 1. Physical problem and overview
 
 `fm.AdaptiveTimestep` configures the embedded Runge–Kutta error tolerances, step-size bounds, proportional–integral (PI) controller gains/limits, and optional spin-rotation and norm-drift guards used by `rk23`, `rk45`, and `auto` time integration across FEM and FDM CPU/GPU realizations (`0960`: `LLG-TD-POLICY-V1` through `LLG-TD-ATOMIC-V1`).
 
-(governing-equations)=
+(python-api-dynamics-adaptive-timestep-governing-equations)=
+<!-- (governing-equations)= -->
 ## 2. Governing equations
 
 For an attempted step $\Delta t_k$ on an embedded Runge–Kutta pair of error order $p$ ($p=2$ for `rk23`, $p=4$ for `rk45`), the active-node normalized error metric (`LLG-TD-MAX-ERR-V1`) is
@@ -44,7 +46,8 @@ s\,\rho_k^{-0.7/(p+1)}\,\rho_{k-1}^{0.4/(p+1)}, & \text{accepted step with prior
 \end{cases}
 ```
 
-(symbols-and-si-units)=
+(python-api-dynamics-adaptive-timestep-symbols-and-si-units)=
+<!-- (symbols-and-si-units)= -->
 ## 3. Symbols and SI units
 
 | Symbol | Meaning | SI unit |
@@ -66,14 +69,16 @@ s\,\rho_k^{-0.7/(p+1)}\,\rho_{k-1}^{0.4/(p+1)}, & \text{accepted step with prior
 | $\Delta t_{\max}$ | Maximum allowed time step (`dt_max`) | $\mathrm{s}$ |
 | $\mathcal{A}$ | Active magnetic cell/node index set ($M_{s,i} > 0$) | $1$ |
 
-(assumptions-and-validity)=
+(python-api-dynamics-adaptive-timestep-assumptions-and-validity)=
+<!-- (assumptions-and-validity)= -->
 ## 4. Assumptions and limits of validity
 
 - **Non-degenerate tolerance scale**: Both `atol` and `rtol` must be non-negative and at least one must be strictly positive so that the denominator in {eq}`eq-python-adaptive-error` is positive on active magnetic nodes.
 - **Step-bound ordering**: When `dt_max` is supplied, $\Delta t_{\max} \ge \Delta t_{\min} > 0$; when `dt_initial` is supplied, $\Delta t_{\min} \le \Delta t_{\mathrm{initial}} \le \Delta t_{\max}$.
 - **Atomic rejection and `dt_min` floor**: Rejected steps ($\rho_k > 1$ or violated `max_spin_rotation`/`norm_tolerance`) restore the pre-attempt state and retry with $\Delta t_{k+1}$. If $\rho_k > 1$ at $\Delta t_k = \Delta t_{\min}$, execution fails closed with a typed `dt_min` underflow error.
 
-(python-api)=
+(python-api-dynamics-adaptive-timestep-python-api)=
+<!-- (python-api)= -->
 ## 5. Python API and parameter contract
 
 ### Constructor signature
@@ -154,7 +159,8 @@ assert ir["study"]["dynamics"]["adaptive_timestep"]["atol"] == 1e-6
 assert ir["study"]["dynamics"]["adaptive_timestep"]["max_spin_rotation"] == 0.35
 ```
 
-(problem-ir)=
+(python-api-dynamics-adaptive-timestep-problem-ir)=
+<!-- (problem-ir)= -->
 ## 6. `ProblemIR` and canonical script representation
 
 ```json
@@ -174,21 +180,24 @@ assert ir["study"]["dynamics"]["adaptive_timestep"]["max_spin_rotation"] == 0.35
 }
 ```
 
-(round-trip-and-failure-semantics)=
+(python-api-dynamics-adaptive-timestep-round-trip-and-failure-semantics)=
+<!-- (round-trip-and-failure-semantics)= -->
 ## 7. Round-trip, provenance, and failure semantics
 
 - **Requested intent vs. resolved execution**: `AdaptiveTimestep` fields serialize verbatim into `ProblemIR` (`requested intent`) and are recorded alongside the resolved integrator and step statistics in the execution receipt (`resolved execution`).
 - **Validation errors**: Negative tolerances, `atol == 0` and `rtol == 0`, `dt_min <= 0`, `dt_max < dt_min`, `dt_initial` outside `[dt_min, dt_max]`, `safety` outside `(0, 1]`, `growth_limit <= 1`, or `shrink_limit` outside `(0, 1)` raise immediate `ValueError` validation errors.
 - **Unsupported combinations**: Supplying `AdaptiveTimestep` alongside `fixed_timestep` or with a fixed-step integrator (`heun`, `rk4`, `abm3`, `coupled_imex_ark2`) is rejected as an unsupported combination.
 
-(discrete-realization)=
+(python-api-dynamics-adaptive-timestep-discrete-realization)=
+<!-- (discrete-realization)= -->
 ## 8. Discrete realization and numerical operators
 
 - **Shared PI decision header**: `decide_adaptive_step` in `native/include/fullmag_adaptive_step_decision.hpp`.
 - **FEM CPU & GPU**: `compute_adaptive_error_norm` / `adaptive_pi_step` (CPU) and `adaptive_error_norm_blocks_kernel` / `gpu_rk_adaptive_pi_step` (GPU).
 - **FDM CPU & GPU**: `max_error_norm_buf` / `decide_adaptive_step` (CPU) and `reduce_adaptive_error_policy` (GPU).
 
-(implementation-mapping)=
+(python-api-dynamics-adaptive-timestep-implementation-mapping)=
+<!-- (implementation-mapping)= -->
 ## 9. Backend and device implementation mapping
 
 | Solver | Device | Status | Notes |
@@ -198,22 +207,26 @@ assert ir["study"]["dynamics"]["adaptive_timestep"]["max_spin_rotation"] == 0.35
 | FDM | CPU | `documented` | Active-cell error reduction and history PI controller in `integrators.rs`. |
 | FDM | GPU | `documented` | CUDA `reduce_adaptive_error_policy` in `reductions_fp64.cu`. |
 
-(validation)=
+(python-api-dynamics-adaptive-timestep-validation)=
+<!-- (validation)= -->
 ## 10. Validation and benchmark gates
 
 - Validated in `packages/fullmag-py/tests/test_llg_solver_contract.py`, `backends/fem/tests/adaptive_dt_contract.cpp`, and `backends/fem/tests/adaptive_error_policy_contract.cpp`.
 
-(limitations)=
+(python-api-dynamics-adaptive-timestep-limitations)=
+<!-- (limitations)= -->
 ## 11. Known limitations and operational constraints
 
 - Local truncation error control bounds single-step error but does not by itself certify static equilibrium in `Relaxation` stages; equilibrium requires the independent torque and energy stopping criteria (`RelaxStop`).
 
-(scientific-bibliography)=
+(python-api-dynamics-adaptive-timestep-scientific-bibliography)=
+<!-- (scientific-bibliography)= -->
 ## 12. Scientific bibliography
 
 1. G. Söderlind, *Automatic control and adaptive time-stepping*, Numer. Algorithms **31**, 281–310 (2002).
 
-(source-code-index)=
+(python-api-dynamics-adaptive-timestep-source-code-index)=
+<!-- (source-code-index)= -->
 ## 13. Source-code index
 
 | Layer | File | Symbol / entrypoint | Responsibility |

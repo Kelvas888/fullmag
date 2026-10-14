@@ -12,12 +12,14 @@ source_of_truth: "Relaxation validation, relax-stage lowering, and planner capab
 (public-docs-numerical-methods-time-integration-tangent-plane-methods)=
 # Tangent-Plane Projection and Linearly Implicit Relaxation
 
-(problem-statement)=
+(numerical-methods-time-integration-tangent-plane-methods-problem-statement)=
+<!-- (problem-statement)= -->
 ## Scope and purpose
 
 This chapter documents the tangent-plane projection formalism and the native FEM linearly implicit tangent-plane relaxation method (`tangent_plane_implicit` in `backends/fem/cpu/mfem/relaxation/tangent_plane_implicit.cpp`). Because the reduced magnetization $\mu_i \in \mathbb{S}^2$ evolves on the unit sphere, any physically admissible velocity or quasi-Newton step $\delta\mu_i$ must lie in the local tangent space $T_{\mu_i}\mathbb{S}^2$. `tangent_plane_implicit` solves a global tangent-space mass-plus-exchange linear system at each step, retracts the trial increment back onto $\mathbb{S}^2$, and enforces a strict Armijo energy-decrease gate with roundoff bounds.
 
-(governing-equations)=
+(numerical-methods-time-integration-tangent-plane-methods-governing-equations)=
+<!-- (governing-equations)= -->
 ## Scientific and numerical model
 
 At each active magnetic node $i \in \mathcal{A}$ with unit magnetization $\mu_i \in \mathbb{S}^2$ ($\|\mu_i\|_2 = 1$), the orthogonal projector onto the local tangent plane $T_{\mu_i}\mathbb{S}^2 = \{v \in \mathbb{R}^3 : \mu_i \cdot v = 0\}$ is
@@ -53,7 +55,8 @@ In `run_tangent_plane_implicit_step` (`backends/fem/cpu/mfem/relaxation/tangent_
 
 The retracted trial state $\mu^{\mathrm{trial}}(\tau)$ is accepted only when the certified upper bound on the energy change $\Delta E + \varepsilon_{\mathrm{roundoff}}$ satisfies the Armijo descent condition; otherwise $\tau$ is halved and the pre-trial state is restored via `restore_after_rejected_trial`.
 
-(symbols-and-si-units)=
+(numerical-methods-time-integration-tangent-plane-methods-symbols-and-si-units)=
+<!-- (symbols-and-si-units)= -->
 ### Symbols and SI units
 
 | Symbol | Meaning | SI unit |
@@ -69,15 +72,18 @@ The retracted trial state $\mu^{\mathrm{trial}}(\tau)$ is accepted only when the
 | $r_{\perp}$ | tangent-projected energy-gradient residual | $\mathrm{J}$ |
 | $\tau$ | implicit tangent-plane trial step size | $1$ |
 
-(assumptions-and-validity)=
+(numerical-methods-time-integration-tangent-plane-methods-assumptions-and-validity)=
+<!-- (assumptions-and-validity)= -->
 ### Assumptions, Armijo certification, and lane scope
 
 - **Orthonormal tangent basis**: At each step, `TangentFrame` constructs $(\mathbf{e}_{1,i}, \mathbf{e}_{2,i})$ orthogonal to $\mu_i$ so that $\mu_i \cdot \delta\mu_i = 0$ holds to machine precision before retraction.
 - **Armijo energy gate with roundoff certification**: `run_tangent_plane_implicit_step` requires $\Delta E + \varepsilon_{\mathrm{roundoff}} \le \Delta E_{\mathrm{Armijo}} \le 0$ and validates the accepted tangent gradient before advancing.
 - **Development-lane scope**: `tangent_plane_implicit` is an extended-mode FEM CPU/MFEM algorithm (`target="fem"`, `execution_mode="extended"`). It is rejected on FDM, forced GPU lanes, and `execution_mode="strict"`.
 
-(discrete-realization)=
-(implementation-mapping)=
+(numerical-methods-time-integration-tangent-plane-methods-discrete-realization)=
+<!-- (discrete-realization)= -->
+(numerical-methods-time-integration-tangent-plane-methods-implementation-mapping)=
+<!-- (implementation-mapping)= -->
 ### Discrete realization and backend support matrix
 
 | Solver | Device | Status | Realization notes |
@@ -95,7 +101,8 @@ The retracted trial state $\mu^{\mathrm{trial}}(\tau)$ is accepted only when the
 | `RelaxStop.torque_tolerance_apm` | `float \| None` | `0.7957747154594767` | $\mathrm{A\,m^{-1}}$ | positive when set | torque stopping threshold | FEM/FDM relaxation stop contract | `study.relaxation.stop.torque_tolerance_apm` |
 | `RelaxStop.max_steps` | `int \| None` | `50000` | $1$ | positive integer when set | iteration limit | FEM/FDM relaxation stop contract | `study.relaxation.stop.max_steps` |
 
-(python-api)=
+(numerical-methods-time-integration-tangent-plane-methods-python-api)=
+<!-- (python-api)= -->
 ## Python API
 
 ```python
@@ -137,7 +144,8 @@ ir = study.to_problem_ir()
 assert ir["study"]["stages"][0]["algorithm"] == "tangent_plane_implicit"
 ```
 
-(problem-ir)=
+(numerical-methods-time-integration-tangent-plane-methods-problem-ir)=
+<!-- (problem-ir)= -->
 ### `ProblemIR` excerpt
 
 ```json
@@ -166,22 +174,27 @@ assert ir["study"]["stages"][0]["algorithm"] == "tangent_plane_implicit"
 - **Relaxation Stage Inspector**: Exposes `algorithm="tangent_plane_implicit"` when `target="fem"` and `execution_mode="extended"` are selected, along with stopping thresholds (`torque_tolerance_apm`, `energy_tolerance_j`, `max_steps`).
 - **Execution Provenance**: Records `requested_energy_minimizer="tangent_plane_implicit"` and `resolved_energy_minimizer="tangent_plane_implicit"` in the relaxation stage receipt.
 
-(round-trip-and-failure-semantics)=
-(validation)=
-(limitations)=
+(numerical-methods-time-integration-tangent-plane-methods-round-trip-and-failure-semantics)=
+<!-- (round-trip-and-failure-semantics)= -->
+(numerical-methods-time-integration-tangent-plane-methods-validation)=
+<!-- (validation)= -->
+(numerical-methods-time-integration-tangent-plane-methods-limitations)=
+<!-- (limitations)= -->
 ## Diagnostics and failure semantics
 
 - **Requested intent and resolved execution**: `ProblemIR` records `algorithm="tangent_plane_implicit"` (`requested intent`), and the FEM runner records the CPU/MFEM development lane in the execution receipt (`resolved execution`).
 - **Validation errors**: Unknown algorithm names or non-positive stopping tolerances raise immediate `ValueError` validation errors in Python and planner diagnostics in Rust.
 - **Unsupported combinations**: Requesting `tangent_plane_implicit` on `target="fdm"`, `execution_mode="strict"`, or `device="gpu"` is rejected as an unsupported combination with an explicit diagnostic (`crates/fullmag-plan/src/validate.rs`).
 
-(scientific-bibliography)=
+(numerical-methods-time-integration-tangent-plane-methods-scientific-bibliography)=
+<!-- (scientific-bibliography)= -->
 ### Scientific bibliography
 
 1. S. Bartels and A. Prohl, *Convergence of an implicit finite element method for the Landau–Lifshitz–Gilbert equation*, SIAM J. Numer. Anal. **44**, 1405–1419 (2006).
 2. F. Alouges, *A new finite element scheme for Landau–Lifshitz equations*, Discrete Contin. Dyn. Syst. Ser. S **1**, 187–196 (2008).
 
-(source-code-index)=
+(numerical-methods-time-integration-tangent-plane-methods-source-code-index)=
+<!-- (source-code-index)= -->
 ## Where this is implemented
 
 | Layer | File | Symbol | Responsibility |

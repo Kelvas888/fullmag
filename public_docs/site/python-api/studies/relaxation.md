@@ -9,7 +9,8 @@ owner: fullmag-public-docs
 (public-docs-python-api-studies-relaxation)=
 # `Relaxation` Study, `RelaxStop`, and `add_relax` Stage Contract
 
-(problem-statement)=
+(python-api-studies-relaxation-problem-statement)=
+<!-- (problem-statement)= -->
 ## 1. Physical problem and overview
 
 `fm.Relaxation` (together with `fm.RelaxStop` and the stage-workflow builder `study.stages.add_relax(...)` / `world.relax_stage(...)`) defines a micromagnetic equilibrium relaxation study or stage. It drives the magnetization field $\mathbf{m}(\mathbf{x})$ to a local minimum of the total micromagnetic energy $E[\mathbf{m}]$ where the local torque residual $\|\mathbf{m}_i \times \mathbf{H}_{\mathrm{eff},i}\|_2$ falls below the canonical stopping threshold $\varepsilon_{\tau}$ across at least three consecutive accepted states.
@@ -21,7 +22,8 @@ Fullmag supports four relaxation algorithm families (`Relaxation.algorithm`):
 3. `"nonlinear_cg"` — Riemannian nonlinear conjugate gradient minimization on $\mathbb{S}^2$ with vector transport and Armijo line search,
 4. `"tangent_plane_implicit"` — linearly implicit tangent-space mass-plus-exchange solve with unit-sphere retraction and Armijo certification on the FEM CPU/MFEM development lane (`execution_mode="extended"`).
 
-(governing-equations)=
+(python-api-studies-relaxation-governing-equations)=
+<!-- (governing-equations)= -->
 ## 2. Governing equations
 
 At a local equilibrium on $\mathbb{S}^2$, the tangential component of the effective magnetic field vanishes at every active magnetic node or cell $i \in \mathcal{A}$ ($M_{s,i} > 0$):
@@ -40,7 +42,8 @@ When a user supplies `torque_tolerance` in tesla ($\tau_{\mathrm{T}}$ via `tolT`
 \varepsilon_{\tau} = \frac{\tau_{\mathrm{T}}}{\mu_0}.
 ```
 
-(symbols-and-si-units)=
+(python-api-studies-relaxation-symbols-and-si-units)=
+<!-- (symbols-and-si-units)= -->
 ## 3. Symbols and SI units
 
 | Symbol | Meaning | SI unit |
@@ -54,14 +57,16 @@ When a user supplies `torque_tolerance` in tesla ($\tau_{\mathrm{T}}$ via `tolT`
 | $\mu_0$ | Vacuum permeability ($4\pi \times 10^{-7}\,\mathrm{N\,A^{-2}}$) | $\mathrm{N\,A^{-2}}$ |
 | $\mathcal{A}$ | Active magnetic cell/node index set ($M_{s,i} > 0$) | $1$ |
 
-(assumptions-and-validity)=
+(python-api-studies-relaxation-assumptions-and-validity)=
+<!-- (assumptions-and-validity)= -->
 ## 4. Assumptions and limits of validity
 
 - **Local vs. global minimum**: All four relaxation algorithms converge to a local minimum (or stationary point) of $E[\mathbf{m}]$ within the basin of attraction of the initial state $\mathbf{m}_0$.
 - **Three-consecutive-sample confirmation**: To prevent premature termination during transient zero crossings, `RelaxationTorqueConfirmation::observe` requires at least three consecutive accepted states satisfying $\tau_{\max} \le \varepsilon_{\tau}$ (and $\Delta E \le \varepsilon_E$ when `energy_tolerance_j` is active).
 - **Direct-minimizer exclusivity with `LLG` dynamics**: Direct energy minimizers (`projected_gradient_bb`, `nonlinear_cg`, `tangent_plane_implicit`) manage their own line-search step sizes and reject an explicit `LLG` dynamics payload.
 
-(python-api)=
+(python-api-studies-relaxation-python-api)=
+<!-- (python-api)= -->
 ## 5. Python API and parameter contract
 
 ### Constructor and stage-builder signatures
@@ -151,7 +156,8 @@ assert ir["study"]["stages"][0]["kind"] == "relax"
 assert ir["study"]["stages"][0]["algorithm"] == "projected_gradient_bb"
 ```
 
-(problem-ir)=
+(python-api-studies-relaxation-problem-ir)=
+<!-- (problem-ir)= -->
 ## 6. `ProblemIR` and canonical script representation
 
 ```json
@@ -175,21 +181,24 @@ assert ir["study"]["stages"][0]["algorithm"] == "projected_gradient_bb"
 }
 ```
 
-(round-trip-and-failure-semantics)=
+(python-api-studies-relaxation-round-trip-and-failure-semantics)=
+<!-- (round-trip-and-failure-semantics)= -->
 ## 7. Round-trip, provenance, and failure semantics
 
 - **Requested intent vs. resolved execution**: `ProblemIR` stores the canonical `algorithm` and `stop` payload (`requested intent`), while the execution receipt records the resolved minimizer/integrator, terminal torque $\tau_{\max}$, accepted step count, and convergence status (`resolved execution`).
 - **Validation errors**: Supplying both `tolT` and `tolA`, supplying `dynamics` to a direct minimizer (`projected_gradient_bb`, `nonlinear_cg`, `tangent_plane_implicit`), or non-positive tolerances/step limits raise immediate `ValueError` validation errors.
 - **Unsupported combinations**: Requesting `tangent_plane_implicit` on `target="fdm"`, `device="gpu"`, or `execution_mode="strict"` is rejected as an unsupported combination by the planner.
 
-(discrete-realization)=
+(python-api-studies-relaxation-discrete-realization)=
+<!-- (discrete-realization)= -->
 ## 8. Discrete realization and numerical operators
 
 - **Overdamped LLG (`llg_overdamped`)**: Disables precession ($s_{\mathrm{prec}} = 0$) via `llg_overdamped_uses_pure_damping` and integrates the pure-damping ODE with adaptive (`rk45`, `rk23`) or fixed (`heun`, `rk4`, `abm3`) stepping.
 - **Direct Riemannian minimizers (`projected_gradient_bb`, `nonlinear_cg`)**: Compute the sphere-projected gradient and advance with certified Armijo energy decrease on FEM CPU/GPU (`backends/fem/gpu/cuda/relaxation/pgbb.cpp`, `nonlinear_cg.cpp`) and FDM CPU/GPU (`execute_projected_gradient_bb`, `execute_nonlinear_cg`).
 - **Tangent-plane implicit (`tangent_plane_implicit`)**: Solves the tangent-space mass-plus-exchange linear system in `run_tangent_plane_implicit_step` (`backends/fem/cpu/mfem/relaxation/tangent_plane_implicit.cpp`).
 
-(implementation-mapping)=
+(python-api-studies-relaxation-implementation-mapping)=
+<!-- (implementation-mapping)= -->
 ## 9. Backend and device implementation mapping
 
 | Solver | Device | Status | Supported algorithms |
@@ -199,23 +208,27 @@ assert ir["study"]["stages"][0]["algorithm"] == "projected_gradient_bb"
 | FDM | CPU | `documented` | `llg_overdamped`, `projected_gradient_bb`, `nonlinear_cg` |
 | FDM | GPU | `documented` | `llg_overdamped`, `projected_gradient_bb`, `nonlinear_cg` |
 
-(validation)=
+(python-api-studies-relaxation-validation)=
+<!-- (validation)= -->
 ## 10. Validation and benchmark gates
 
 - Validated in `backends/fem/tests/relaxation_operator_contract.cpp`, `backends/fem/tests/relaxation_energy_derivative_contract.cpp`, and `packages/fullmag-py/tests/test_problem_ir.py`.
 
-(limitations)=
+(python-api-studies-relaxation-limitations)=
+<!-- (limitations)= -->
 ## 11. Known limitations and operational constraints
 
 - Reaching `max_steps` or `max_time_s` without satisfying the three-sample torque/energy predicate fails closed and marks the relaxation stage as unconverged.
 
-(scientific-bibliography)=
+(python-api-studies-relaxation-scientific-bibliography)=
+<!-- (scientific-bibliography)= -->
 ## 12. Scientific bibliography
 
 1. J. Barzilai and J. M. Borwein, *Two-point step size gradient methods*, IMA J. Numer. Anal. **8**, 141–148 (1988).
 2. S. Bartels and A. Prohl, *Convergence of an implicit finite element method for the Landau–Lifshitz–Gilbert equation*, SIAM J. Numer. Anal. **44**, 1405–1419 (2006).
 
-(source-code-index)=
+(python-api-studies-relaxation-source-code-index)=
+<!-- (source-code-index)= -->
 ## 13. Source-code index
 
 | Layer | File | Symbol / entrypoint | Responsibility |

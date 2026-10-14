@@ -53,14 +53,40 @@ user-authored physical intent (`ProblemIR`), capability and solver planning (`Fe
 multi-process execution orchestration (`EigenKProcessPool`), native C++ operator assembly and
 spectral solving, branch tracking, and binary/JSON publication to the Control Room UI.
 
-```mermaid
-flowchart TD
-    A["1. Python Authoring DSL<br/>study.stages.add_eigenmodes / EigenmodesStageSpec<br/>FemEigenSolverPolicy, KPath, BiasFieldSweep, ModeTracking"] --> B["2. Canonical Lowering (ProblemIR)<br/>StudyIR::Eigenmodes, EigenOperatorIR, EigenTargetIR<br/>KSamplingIR, SpatialRepresentationIR, ParallelExecutionPolicyIR"]
-    B --> C["3. Planner & Capability Gate (fullmag-plan)<br/>plan_fem_eigen -> FemEigenPlanIR<br/>Gamma-point classification, BC/airbox compatibility, output legality"]
-    C --> D["4. Stage Handoff & R4 Equilibrium Certificate<br/>accepted_relax_handoff_for_eigen_stage / materialize_equilibrium<br/>Immutable m0 digest & torque verification across k/H sweeps"]
-    D --> E["5. Runner Orchestration & Process Pool (fullmag-runner)<br/>run_path_or_single_controlled / EigenKProcessPool<br/>Multi-process k-point parallelism & thread budget isolation"]
-    E --> F["6. Native C++ FEM Modal Engine (backends/fem)<br/>petsc_slepc_process_mutex -> solve_modal_eigen_contract<br/>Shared-domain Schur complement, Real-split rotated SLEPc pencil, GPU Krylov"]
-    F --> G["7. Mode Tracking & Publication<br/>track_branches / mass_weighted_subspace_transport<br/>spectrum.v2.json, branches.v2.json, dispersion.csv, binary mode fields"]
+```text
+[1. Python Authoring DSL]
+   study.stages.add_eigenmodes / EigenmodesStageSpec
+   FemEigenSolverPolicy, KPath, BiasFieldSweep, ModeTracking
+        |
+        v
+[2. Canonical Lowering (ProblemIR)]
+   StudyIR::Eigenmodes, EigenOperatorIR, EigenTargetIR
+   KSamplingIR, SpatialRepresentationIR, ParallelExecutionPolicyIR
+        |
+        v
+[3. Planner & Capability Gate (fullmag-plan)]
+   plan_fem_eigen -> FemEigenPlanIR
+   Gamma-point classification, BC/airbox compatibility, output legality
+        |
+        v
+[4. Stage Handoff & R4 Equilibrium Certificate]
+   accepted_relax_handoff_for_eigen_stage / materialize_equilibrium
+   Immutable m0 digest & torque verification across k/H sweeps
+        |
+        v
+[5. Runner Orchestration & Process Pool (fullmag-runner)]
+   run_path_or_single_controlled / EigenKProcessPool
+   Multi-process k-point parallelism & thread budget isolation
+        |
+        v
+[6. Native C++ FEM Modal Engine (backends/fem)]
+   petsc_slepc_process_mutex -> solve_modal_eigen_contract
+   Shared-domain Schur complement, Real-split rotated SLEPc pencil, GPU Krylov
+        |
+        v
+[7. Mode Tracking & Publication]
+   track_branches / mass_weighted_subspace_transport
+   spectrum.v2.json, branches.v2.json, dispersion.csv, binary mode fields
 ```
 
 ### 1. Python authoring DSL (`packages/fullmag-py`)

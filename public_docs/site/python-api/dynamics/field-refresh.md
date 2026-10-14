@@ -9,12 +9,14 @@ owner: fullmag-public-docs
 (public-docs-python-api-dynamics-field-refresh)=
 # `FieldRefreshPolicy` Contract
 
-(problem-statement)=
+(python-api-dynamics-field-refresh-problem-statement)=
+<!-- (problem-statement)= -->
 ## 1. Physical problem and overview
 
 `fm.FieldRefreshPolicy` specifies an optional cadence $\Delta t_{\mathrm{demag}}$ (`demag_interval_s`) for refreshing the non-local demagnetization field $\mathbf{H}_{\mathrm{d}}$ during time-domain LLG integration. When `demag_interval_s=None` (the default), the demagnetization operator is evaluated at every Runge–Kutta stage. When a positive `demag_interval_s` is configured on a lane that supports split-cadence refresh, the demagnetization field is recomputed whenever the elapsed physical time since the last refresh satisfies $t - t_{\mathrm{last}} \ge \Delta t_{\mathrm{demag}}$.
 
-(governing-equations)=
+(python-api-dynamics-field-refresh-governing-equations)=
+<!-- (governing-equations)= -->
 ## 2. Governing equations
 
 Splitting the total effective field into fast local/exchange contributions $\mathbf{H}_{\mathrm{fast}}(\mathbf{m}, t)$ and the non-local demagnetizing field $\mathbf{H}_{\mathrm{d}}(\mathbf{m})$ yields
@@ -30,7 +32,8 @@ Splitting the total effective field into fast local/exchange contributions $\mat
 t - t_{\mathrm{last}} < \Delta t_{\mathrm{demag}}.
 ```
 
-(symbols-and-si-units)=
+(python-api-dynamics-field-refresh-symbols-and-si-units)=
+<!-- (symbols-and-si-units)= -->
 ## 3. Symbols and SI units
 
 | Symbol | Meaning | SI unit |
@@ -42,13 +45,15 @@ t - t_{\mathrm{last}} < \Delta t_{\mathrm{demag}}.
 | $t_{\mathrm{last}}$ | Physical time of the most recent demagnetization evaluation | $\mathrm{s}$ |
 | $t$ | Current simulation time | $\mathrm{s}$ |
 
-(assumptions-and-validity)=
+(python-api-dynamics-field-refresh-assumptions-and-validity)=
+<!-- (assumptions-and-validity)= -->
 ## 4. Assumptions and limits of validity
 
 - **Time-scale separation**: Holding $\mathbf{H}_{\mathrm{d}}$ frozen over $\Delta t_{\mathrm{demag}}$ is accurate only when $\Delta t_{\mathrm{demag}}$ is much smaller than the magnetostatic precession period $(\gamma_0 M_s)^{-1}$.
 - **First-order splitting error**: Freezing $\mathbf{H}_{\mathrm{d}}$ across intermediate Runge–Kutta stages reduces the formal temporal order of accuracy for dipolar-dominated modes to $\mathcal{O}(\Delta t_{\mathrm{demag}})$ whenever $\Delta t_{\mathrm{demag}} > \Delta t$.
 
-(python-api)=
+(python-api-dynamics-field-refresh-python-api)=
+<!-- (python-api)= -->
 ## 5. Python API and parameter contract
 
 ### Constructor signature
@@ -104,7 +109,8 @@ ir = study.to_problem_ir()
 assert ir["study"]["dynamics"]["field_refresh"]["demag_interval_s"] == 5e-13
 ```
 
-(problem-ir)=
+(python-api-dynamics-field-refresh-problem-ir)=
+<!-- (problem-ir)= -->
 ## 6. `ProblemIR` and canonical script representation
 
 ```json
@@ -122,20 +128,23 @@ assert ir["study"]["dynamics"]["field_refresh"]["demag_interval_s"] == 5e-13
 }
 ```
 
-(round-trip-and-failure-semantics)=
+(python-api-dynamics-field-refresh-round-trip-and-failure-semantics)=
+<!-- (round-trip-and-failure-semantics)= -->
 ## 7. Round-trip, provenance, and failure semantics
 
 - **Requested intent vs. resolved execution**: `FieldRefreshPolicy` serializes into `study.dynamics.field_refresh` (`requested intent`) and is validated against the selected backend lane during planning (`resolved execution`).
 - **Validation errors**: Non-positive or non-finite `demag_interval_s` values raise immediate `ValueError` validation errors in Python.
 - **Unsupported combinations**: When a backend or strict qualification mode requires full stage-wise demagnetization evaluation, non-null `demag_interval_s` is rejected as an unsupported combination by the planner.
 
-(discrete-realization)=
+(python-api-dynamics-field-refresh-discrete-realization)=
+<!-- (discrete-realization)= -->
 ## 8. Discrete realization and numerical operators
 
 - **Default (`demag_interval_s=None`)**: Full stage-wise demagnetization evaluation at every RK stage (`evaluate_rk_stage_rhs` on FEM CPU, `rk_demag_dispatch.cu` on FEM GPU, and FFT/Poisson demag on FDM).
 - **Interval-gated refresh**: Caches the most recent $\mathbf{H}_{\mathrm{d}}$ buffer until the accumulated step time reaches `demag_interval_s`.
 
-(implementation-mapping)=
+(python-api-dynamics-field-refresh-implementation-mapping)=
+<!-- (implementation-mapping)= -->
 ## 9. Backend and device implementation mapping
 
 | Solver | Device | Status | Notes |
@@ -145,22 +154,26 @@ assert ir["study"]["dynamics"]["field_refresh"]["demag_interval_s"] == 5e-13
 | FDM | CPU | `documented` | Reference FDM stage evaluation and refresh cadence. |
 | FDM | GPU | `documented` | CUDA FFT demagnetization evaluation. |
 
-(validation)=
+(python-api-dynamics-field-refresh-validation)=
+<!-- (validation)= -->
 ## 10. Validation and benchmark gates
 
 - Validated in `packages/fullmag-py/tests/test_llg_solver_contract.py` and `packages/fullmag-py/tests/test_problem_ir.py`.
 
-(limitations)=
+(python-api-dynamics-field-refresh-limitations)=
+<!-- (limitations)= -->
 ## 11. Known limitations and operational constraints
 
 - Using `demag_interval_s` disables FSAL derivative reuse across steps where a deferred demagnetization refresh occurs at the step boundary.
 
-(scientific-bibliography)=
+(python-api-dynamics-field-refresh-scientific-bibliography)=
+<!-- (scientific-bibliography)= -->
 ## 12. Scientific bibliography
 
 1. M. J. Donahue and D. G. Porter, *OOMMF User's Guide, Version 1.0*, NISTIR 6376 (1999).
 
-(source-code-index)=
+(python-api-dynamics-field-refresh-source-code-index)=
+<!-- (source-code-index)= -->
 ## 13. Source-code index
 
 | Layer | File | Symbol / entrypoint | Responsibility |
