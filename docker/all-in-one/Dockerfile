@@ -6,16 +6,28 @@ COPY package/ /opt/fullmag/package/
 COPY provenance.json /opt/fullmag/provenance.json
 COPY entrypoint.py /opt/fullmag/entrypoint.py
 COPY windows_folder_probe.py /opt/fullmag/windows_folder_probe.py
+COPY runtime_service.py /opt/fullmag/runtime_service.py
 RUN mkdir -p /opt/fullmag/source/.fullmag /state /run/fullmag && chown 65532:65532 /state && \
     ln -s /opt/fullmag/package /opt/fullmag/source/.fullmag/local && \
     chmod -R a+rX /opt/fullmag && \
     chmod 755 /opt/fullmag/package/bin/* && \
-    test -x /opt/fullmag/package/bin/fullmag-api
+    for binary in fullmag-api fullmag-bin fullmag-runtime-service \
+        fullmag-api-resource-pool fullmag-api-preparation-resource-pool \
+        fullmag-api-accepted-scheduler fullmag-api-accepted-fem-preparation-scheduler \
+        fullmag-api-accepted-worker fullmag-api-accepted-supervisor \
+        fullmag-api-accepted-fem-preparer fullmag-api-accepted-fem-preparation-supervisor \
+        fullmag-api-preparation-retry; do \
+        test -x "/opt/fullmag/package/bin/$binary" || exit 1; \
+    done
 LABEL org.fullmag.runtime="docker-all-gpu-v1"
 ENV FULLMAG_REPO_ROOT=/opt/fullmag/source \
     FULLMAG_STATE_ROOT=/state/.fullmag \
     FULLMAG_STATE_DIR=/state/.fullmag \
     HOME=/state \
+    FULLMAG_PROJECT_STORAGE_ROOT=/state \
+    FULLMAG_RUNS_ROOT=/state/runs/docker-all \
+    FULLMAG_WORKTREE_ID=docker-all \
+    FULLMAG_RUNTIME_SERVICE_CONFIG=/state/.fullmag/runtime-service/docker-all.json \
     FULLMAG_RUNTIME_ROOT=/opt/fullmag/package \
     FULLMAG_WEB_STATIC_DIR=/opt/fullmag/package/web \
     FULLMAG_API_PORT=8081 \
@@ -30,12 +42,12 @@ ENV FULLMAG_REPO_ROOT=/opt/fullmag/source \
     FULLMAG_FEM_MFEM_DEVICE="" \
     FULLMAG_FEM_MESH_CACHE_DIR=/state/.fullmag/mesh-cache \
     CUDA_CACHE_PATH=/state/cuda-cache \
-    OMP_NUM_THREADS=16 \
-    FULLMAG_CPU_THREADS=16
+    OMP_NUM_THREADS=4 \
+    FULLMAG_CPU_THREADS=4
 ENV PATH=/opt/fullmag/source/.fullmag/local/bin:/opt/fullmag-deps/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin
 WORKDIR /state
 USER 65532:65532
 EXPOSE 8081
 ENTRYPOINT ["/usr/local/bin/python3", "/opt/fullmag/entrypoint.py"]
-HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=6 \
-    CMD /usr/local/bin/python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2)"
+HEALTHCHECK --interval=5s --timeout=5s --start-period=30s --retries=6 \
+    CMD /usr/local/bin/python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2); import json; status=json.load(urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/runtime-service', timeout=2)); assert status['state'] == 'ready'"

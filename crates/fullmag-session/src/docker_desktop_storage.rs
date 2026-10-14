@@ -540,6 +540,54 @@ pub(crate) fn admit(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn initialize_store_under(parent: &Path, relative: &str) -> Result<(PathBuf, bool)> {
+    let root = crate::repository_path::checked_path(parent, relative)?;
+    let created = match fs::symlink_metadata(&root) {
+        Ok(_) => {
+            // Existing or partial data never grants initialization or takeover.
+            for relative in [
+                "manifests",
+                "runs",
+                "scheduler_pools",
+                "live_command_journals",
+                "recovery",
+                "temp",
+                "objects/sha256",
+                "objects/pins",
+            ] {
+                if !crate::repository_path::checked_path(&root, relative)?.is_dir() {
+                    bail!("Docker accepted store is partially initialized; controlled recovery required");
+                }
+            }
+            drop(crate::SessionStore::open_existing(&root)?);
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let checked = crate::repository_path::create_new_directory(parent, relative)?;
+            drop(crate::SessionStore::open(checked)?);
+            true
+        }
+        Err(error) => return Err(error).context("inspecting the Docker accepted store"),
+    };
+    Ok((root, created))
+}
+
+/// Bootstrap only the fixed Docker accepted store after full Windows-folder
+/// admission. This is internal launcher plumbing, not a general initializer.
+#[doc(hidden)]
+pub fn initialize_attested_docker_accepted_store() -> Result<(PathBuf, bool)> {
+    #[cfg(target_os = "linux")]
+    {
+        let parent = Path::new("/state/runs/docker-all");
+        admit(parent)?;
+        initialize_store_under(parent, "session-store")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        bail!("Docker Windows-folder bootstrap requires the attested Linux container");
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn reject_docker_owned_windows_root(root: &Path) -> Result<()> {
     let mut candidate = absolute_path(root)?;
@@ -661,6 +709,25 @@ mod tests {
         let path = directory.path().join("evidence.json");
         fs::write(&path, b"12345").unwrap();
         assert!(read_bounded_regular_file(&path, 4).is_err());
+    }
+
+    #[test]
+    fn store_bootstrap_opens_valid_data_and_preserves_partial_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, created) = initialize_store_under(directory.path(), "session-store").unwrap();
+        assert!(created);
+        let (reopened, created) =
+            initialize_store_under(directory.path(), "session-store").unwrap();
+        assert_eq!(root, reopened);
+        assert!(!created);
+        let partial = directory.path().join("partial-store");
+        fs::create_dir(&partial).unwrap();
+        fs::write(partial.join("evidence"), b"retain partial failure").unwrap();
+        assert!(initialize_store_under(directory.path(), "partial-store").is_err());
+        assert_eq!(
+            fs::read(partial.join("evidence")).unwrap(),
+            b"retain partial failure"
+        );
     }
 
     #[cfg(unix)]

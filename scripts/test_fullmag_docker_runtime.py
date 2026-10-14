@@ -21,6 +21,135 @@ class DockerRuntimeContract(unittest.TestCase):
         self.assertTrue(service["read_only"])
         self.assertEqual([m["target"] for m in service["volumes"]], ["/state"])
 
+    def test_package_requires_every_runtime_service_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory)
+            artifacts = [*("bin/" + name for name in runtime.REQUIRED_BINARIES),
+                         "web/index.html", "_fullmag_core.so"]
+            for relative in artifacts:
+                path = package / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            runtime.validate_runtime_artifacts(package)
+            for name in runtime.REQUIRED_BINARIES:
+                path = package / "bin" / name
+                path.unlink()
+                with self.assertRaisesRegex(ValueError, "Missing runtime artifact"):
+                    runtime.validate_runtime_artifacts(package)
+                path.touch()
+
+    def load_service(self):
+        import sys
+        path = Path(__file__).resolve().parents[1] / "docker/all-in-one/runtime_service.py"
+        spec = importlib.util.spec_from_file_location("all_docker_service_test", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_service_budget_is_cpu_only_and_fits_container(self):
+        service = self.load_service()
+        config = service.build_configuration(service.RuntimePaths(), {})
+        self.assertEqual(config["schema_version"], "runtime_service_config.v1")
+        self.assertIsNone(config["host_execution"])
+        compute = config["compute_resources"][0]
+        self.assertEqual(compute["kind"], "cpu")
+        prep = config["preparation_resources"][0]
+        self.assertEqual(compute["budget"]["gpu_memory_bytes"], 0)
+        self.assertLessEqual(compute["budget"]["cpu_millis"] + prep["budget"]["cpu_millis"], 4000)
+        for env in ({"FULLMAG_RUNTIME_COMPUTE_CPU_MILLIS": "4001"},
+                    {"FULLMAG_RUNTIME_COMPUTE_MEMORY_BYTES": str(8 * 1024**3)},
+                    {"FULLMAG_RUNTIME_PREPARATION_CPU_MILLIS": "0"}):
+            with self.assertRaises(service.RuntimeServiceError):
+                service.build_configuration(service.RuntimePaths(), env)
+
+    def test_service_shutdown_rejects_changed_owner_without_drain(self):
+        service = self.load_service()
+        owner = {"owner_token": "old", "children": [{"role": "compute", "pid": 3},
+                                                      {"role": "preparation", "pid": 4}]}
+        changed = {**owner, "owner_token": "new"}
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081)
+        with patch.object(service, "_wait_api_closed"), \
+                patch.object(service, "_service_status", return_value=changed), \
+                patch.object(service, "_run_cli") as cli:
+            with self.assertRaises(service.RuntimeServiceUnknown):
+                service.stop(handle)
+            cli.assert_not_called()
+
+    def test_service_stop_delegates_terminal_proof_to_canonical_rust(self):
+        service = self.load_service()
+        owner = {"owner_token": "known", "children": [{"role": "compute", "pid": 3},
+                                                        {"role": "preparation", "pid": 4}]}
+        terminal = {**owner, "children": [{**child, "status": "exited_success"} for child in owner["children"]]}
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081)
+        with patch.object(service, "_wait_api_closed"), \
+                patch.object(service, "_service_status", return_value=owner), \
+                patch.object(service, "_pin_owner", return_value=Path("/state/pinned-owner.json")), \
+                patch.object(service, "_run_cli", return_value={"schema_version": "runtime_service_discovery.v1",
+                             "status": "drained", "owner": terminal}) as cli:
+            self.assertEqual(service.stop(handle), terminal)
+            self.assertIn("service-drain-confirmed", cli.call_args.args[1])
+            cli.side_effect = service.RuntimeServiceUnknown("unconfirmed outcome")
+            with self.assertRaises(service.RuntimeServiceUnknown):
+                service.stop(handle)
+            self.assertEqual(cli.call_count, 2)
+
+    def test_start_retains_confirmed_owner_when_later_observation_fails(self):
+        service = self.load_service()
+        identity = {"api_instance_id": "instance", "api_contract_version": "1.0.0",
+                    "build_identity": {"git_commit": "commit"},
+                    "runtime_store_binding": {"binding": "a" * 64}}
+        owner = {"owner_token": "known", "children": [{"role": "compute", "pid": 3}]}
+        for failure_at in ("_pin_owner", "_service_status"):
+            with patch.object(service, "prepare_storage"), \
+                    patch.object(service, "ensure_configuration", return_value={}), \
+                    patch.object(service, "wait_for_api", return_value=identity), \
+                    patch.object(service, "_run_cli", return_value={"schema_version": "runtime_service_discovery.v1",
+                                 "status": "ready", "owner": owner}), \
+                    patch.object(service, "_pin_owner"), \
+                    patch.object(service, "_service_status", return_value=owner), \
+                    patch.object(service, failure_at, side_effect=OSError("lost observation")):
+                with self.assertRaises(Exception) as caught:
+                    service.start(service.RuntimePaths(), expected_binding="a" * 64)
+                self.assertEqual(caught.exception.pinned_handle.owner, owner)
+
+    def test_supervision_rejects_api_binding_change(self):
+        service = self.load_service()
+        identity = {"api_instance_id": "instance", "api_contract_version": "1.0.0",
+                    "build_identity": {"git_commit": "commit"},
+                    "runtime_store_binding": {"binding": "a" * 64}}
+        owner = {"owner_token": "known", "children": []}
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
+        changed = {**identity, "runtime_store_binding": {"binding": "b" * 64}}
+        with patch.object(service, "_probe_api_liveness"), \
+                patch.object(service, "_probe_api_identity", return_value=(changed, {})), \
+                patch.object(service, "_service_status", return_value=owner):
+            with self.assertRaises(service.RuntimeServiceUnknown):
+                service.check(handle)
+
+    @unittest.skipIf(os.name == "nt", "Container metadata fsync/no-follow is tested on Linux")
+    def test_service_config_preserves_existing_operator_profile(self):
+        service = self.load_service()
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory).resolve() / "runtime.json"
+            paths = replace(service.RuntimePaths(), config=config)
+            first = service.ensure_configuration(paths)
+            original = config.read_bytes()
+            changed = {**first, "startup_timeout_seconds": 61}
+            config.write_text(json.dumps(changed))
+            retained = config.read_bytes()
+            with self.assertRaises(service.RuntimeServiceError):
+                service.ensure_configuration(paths)
+            self.assertEqual(config.read_bytes(), retained)
+            target = config.with_name("target.json")
+            target.write_bytes(original)
+            config.unlink()
+            config.symlink_to(target)
+            with self.assertRaises((service.RuntimeServiceError, OSError)):
+                service.ensure_configuration(paths)
+            self.assertEqual(target.read_bytes(), original)
+
     def test_runtime_rejects_toolchain_policy_that_overrides_model_requests(self):
         valid = {"Env": ['FULLMAG_FEM_REQUIRE_GPU=0', 'FULLMAG_FEM_MFEM_DEVICE=']}
         runtime.validate_workspace_environment(valid)

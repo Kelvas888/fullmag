@@ -5,6 +5,8 @@ on:
     paths:
       # Consumers import validators, receipts and analytic oracles across scripts.
       - 'scripts/**/*.py'
+      - 'docker/all-in-one/**'
+      - 'crates/fullmag-session/src/docker_desktop_storage.rs'
       - 'crates/fullmag-workspace-inspect/**'
       - 'crates/fullmag-session/src/frequency_domain_artifact_generation.rs'
       - 'crates/fullmag-session/src/lib.rs'
@@ -16,6 +18,8 @@ on:
     paths:
       # Consumers import validators, receipts and analytic oracles across scripts.
       - 'scripts/**/*.py'
+      - 'docker/all-in-one/**'
+      - 'crates/fullmag-session/src/docker_desktop_storage.rs'
       - 'crates/fullmag-workspace-inspect/**'
       - 'crates/fullmag-session/src/frequency_domain_artifact_generation.rs'
       - 'crates/fullmag-session/src/lib.rs'
@@ -104,6 +108,7 @@ jobs:
       - name: Verify terminal producer publication and platform file safety
         run: |
           cargo test --locked -p fullmag-session --lib frequency_domain_artifact_generation
+          cargo test --locked -p fullmag-session --lib docker_desktop_storage
           cargo test --locked -p fullmag-session --lib docker_desktop_storage
           cargo test --locked -p fullmag-workspace-inspect --lib
       - name: Verify immutable artifact binding and bounded reader races

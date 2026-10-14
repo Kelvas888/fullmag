@@ -20,6 +20,21 @@ from local_runner.worker_entrypoint import verify_source
 from run_managed_browser import digest, host_path, read_json, validate_managed_build
 
 PROFILE = "docker-all-gpu"
+REQUIRED_BINARIES = (
+    "fullmag-api", "fullmag-bin", "fullmag-runtime-service",
+    "fullmag-api-resource-pool", "fullmag-api-preparation-resource-pool",
+    "fullmag-api-accepted-scheduler", "fullmag-api-accepted-fem-preparation-scheduler",
+    "fullmag-api-accepted-worker", "fullmag-api-accepted-supervisor",
+    "fullmag-api-accepted-fem-preparer", "fullmag-api-accepted-fem-preparation-supervisor",
+    "fullmag-api-preparation-retry",
+)
+
+
+def validate_runtime_artifacts(package):
+    for relative in (*("bin/" + name for name in REQUIRED_BINARIES),
+                     "web/index.html", "_fullmag_core.so"):
+        if not (package / relative).is_file():
+            raise ValueError(f"Missing runtime artifact: {relative}")
 
 
 def docker(*args, combined=False):
@@ -59,11 +74,12 @@ def compose_spec(image, state, port, host_certificate=None):
     result = {"services": {"fullmag": {
         "image": image, "pull_policy": "never", "init": True,
         "read_only": True, "user": "65532:65532", "gpus": "all",
+        "cpus": 4, "mem_limit": "8g",
         "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],
         "ports": [f"127.0.0.1:{port}:8081"],
         "volumes": [{"type": "bind", "source": str(state), "target": "/state"}],
         "tmpfs": ["/tmp:rw,nosuid,nodev,size=512m"],
-        "stop_grace_period": "30s",
+        "stop_grace_period": "60s",
     }}}
     if host_certificate is not None:
         service = result["services"]["fullmag"]
@@ -89,9 +105,7 @@ def prepare_gpu_release(layout, job_id, commit):
     if manifest.get("resolved_commit") != commit or manifest.get("source_mode") != "commit":
         raise ValueError("A clean commit build is required for the distributable image")
     package = storage.validate_path(root / "artifacts/outputs/.fullmag/local", root)
-    for relative in ("bin/fullmag-api", "bin/fullmag-bin", "web/index.html", "_fullmag_core.so"):
-        if not (package / relative).is_file():
-            raise ValueError(f"Missing runtime artifact: {relative}")
+    validate_runtime_artifacts(package)
     image_id(context["image_digest"])
     return root, context, built, capsule, package
 
@@ -176,7 +190,7 @@ def build_image(repo, job_id, commit):
             shutil.copytree(capsule / "tree", stage / "source", symlinks=False)
             shutil.copytree(package, stage / "package", symlinks=False)
             receipt["binary_hashes"] = {path.name: digest(path) for path in (stage / "package/bin").iterdir() if path.is_file()}
-            for name in ("Dockerfile", "entrypoint.py", "windows_folder_probe.py"):
+            for name in ("Dockerfile", "entrypoint.py", "windows_folder_probe.py", "runtime_service.py"):
                 shutil.copyfile(capsule / "tree/docker/all-in-one" / name, stage / name)
             (stage / "provenance.json").write_text(json.dumps(receipt, indent=2) + "\n")
             # Docker FROM expects a repository reference, so create an explicit
@@ -304,6 +318,10 @@ def start(repo, assembly_receipt, port):
                        attestation="image, provenance, port, storage, GPU request, isolation")
     except Exception as error:
         receipt.update(state="failed_resources_retained", error=str(error))
+        try:
+            receipt["retained_container_ids"] = docker(*args, "ps", "--all", "--quiet", "fullmag").splitlines()
+        except Exception as inspection_error:
+            receipt["container_inspection_error"] = str(inspection_error)
         raise
     finally:
         storage.atomic_json(root / "receipt.json", receipt)

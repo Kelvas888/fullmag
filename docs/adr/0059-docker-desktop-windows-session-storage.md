@@ -24,6 +24,13 @@ Native Windows writer odmawia użycia wewnętrznego namespace oznaczonego jako
 Docker-owned. Nie zakładamy współdzielenia locków Win32/Linux. Portable `.fms`
 pozostaje sposobem przenoszenia danych pomiędzy odrębnymi runtime'ami.
 
+Kontener mapuje kanoniczny storage na `/state` i bootstrapuje wyłącznie
+attested store `/state/runs/docker-all/session-store`. Rust tworzy nowy store
+albo otwiera kompletny istniejący store bez przejmowania częściowego katalogu.
+Python nadzoruje proces API; kanoniczny Rust runtime service nadal posiada
+scheduler, resource pools, owner metadata i authenticated drain. Nie rozszerzamy
+publicznego API ani kwalifikacji host execution v2.
+
 ## Obowiązki i rollback
 
 Launcher oraz entrypoint muszą wydawać i sprawdzać dowody; `fullmag-session`

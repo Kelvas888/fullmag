@@ -84,3 +84,56 @@ Skill `fullmag-build-stage-cleanup` jest niedostępny; zastosowano retencję gov
 Pozostałe bramki: nowy managed build końcowego commita, złożenie obrazu,
 API/save/reopen/restart sesji, rzeczywista realizacja FEM GPU, przeglądarka/WebGL,
 CI zadania i pełny cykl PR/integracji. Wyjątek kompilacji testów dotyczy tylko CI.
+
+## Uzupełnienie startu pełnego workspace
+
+Review wykazał, że standalone API nie uruchamia canonical runtime service.
+Pakiet release ma schedulery/workery/resource publishers; należy podpiąć
+`fullmag-bin runtime service-ensure` i `service-status` do entrypointu,
+z read-only konfiguracją usługi API oraz tym samym accepted-store bindingiem.
+Dodany wewnętrzny bootstrap inicjalizuje tylko `/state/runs/docker-all/session-store`
+po ścisłym Windows-folder admission; istniejący/niepełny store nie jest nadpisywany.
+Nie używamy windows-only managed initializer ani Pythonowej imitacji SessionStore.
+
+Domyślne jawne budżety operatora: kontener 4 CPU/8 GiB; compute 3 CPU/6 GiB,
+preparation 1 CPU/1 GiB oraz pozostała pamięć dla API. Nie są to pomiary sprzętu.
+Usługa accepted zachowuje bieżący v1 CPU contract; guard host execution v2 pozostaje.
+Bieżąca accepted ścieżka FEM nie obsługuje GPU; GPU w obrazie używa istniejącej
+trasy CLI. Nie rozszerzamy capability map ani API.
+
+Driver CUDA zainicjalizował się w przypiętym obrazie GPU i wykrył jedną kartę;
+nie jest to dowód wykonania solvera FEM. Job `df2c236db17340f0a742af0beb328be1`
+potwierdził anulowanie (exit 143), więc jego diagnostyka/kapsuła pozostają zachowane.
+
+
+## Naprawy bazowe zatwierdzone przez użytkownika
+
+Włączono zapisane lokalne commity 059d7a2e6330233fa75da6e5d97fc9d95cd4c109,
+c0edb5b82cb22b0107c6dc35c3f8f910db734c96, ea8acefc0c6dfc0300d63f37908db189acb108a7
+i ec416fe3bd9f04bcb68558e9cbfe489fa10a8916. Niezapisane cudze zmiany głównego
+checkoutu pozostały nietknięte. Minimalna naprawa czterech fixture'ów API została
+zapisana jako a1c80f59ba98ee1fce5715e88a31e308c052c2eb; diff check i review źródeł
+przeszły. Kompilacja tych fixture'ów pozostaje bramką CI, nie została wykonana
+lokalnie. Pozostałe naprawy obejmują generator otwartych JSON i swept mesh Gmsh.
+
+Rejestr zadania ma stan implementation. Nie usuwano danych etapu; zachowano
+kapsuły, execution błędu/anulowania, logi i próbki storage. Ostatni pomiar wolnego
+miejsca przed końcowym buildem: 16 185 716 736 bajtów. Ponowna ocena retencji
+po kwalifikacji runtime; sam rozmiar lub wiek danych nie jest dowodem zbędności.
+
+
+Runtime service jest podpięty do entrypointu. Read-only health wymaga gotowej
+usługi. Bootstrap i terminal drain wykorzystują kanoniczne Rust API; częściowy
+store, zmieniony owner, niepewny start lub drain zachowują dowody i wymagają
+recovery. Nadzór przypina API instance/build/accepted binding oraz service owner.
+Review poprawił reeksport drain, admission wszystkich binariów release i
+zachowanie ownera po błędzie późniejszej obserwacji. 17 interpreted checks
+przeszło na Linux; na Windows 14 przeszło, 3 Linux-only zostały pominięte.
+AST, rustfmt nowego modułu i Bash syntax przeszły. Nowa kompilacja CLI i
+wykonanie Rust regresji pozostają wyłącznie do CI/managed build.
+
+Poprawka generatora OpenAPI została zapisana jako
+f6b904d308307df4b63ee60c577313067cd19836. Canonical openapi-typescript 7.13.0
+wygenerował typy; ponowna generacja była identyczna, strict noEmit realistycznej
+fixture snapshot/policy przeszedł. Local Vitest został odrzucony przez automatic
+approval review: wyjątek dotyczy tylko CI zadania. Nie wykonano obejścia.

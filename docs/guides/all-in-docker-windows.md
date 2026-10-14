@@ -53,6 +53,18 @@ nadpisuje wyboru CPU/GPU/auto w kanonicznym modelu. Jawne żądanie GPU nie ma
 cichego fallbacku CPU; dostępność konkretnych zadań nadal określa capability map
 bieżącego Fullmaga.
 
+Kontener uruchamia również kanoniczny runtime service, scheduler i publikatory
+puli zasobów. Health wymaga gotowego API oraz runtime service. Budżet kontenera
+wynosi 4 CPU i 8 GiB RAM; konfiguracja dzieli go na compute (3 CPU, 6 GiB)
+i przygotowanie (1 CPU, 1 GiB), pozostawiając 1 GiB dla API. Nie deklaruje
+niezmierzonych zasobów GPU w puli. Bieżąca ścieżka accepted runs obsługuje CPU;
+FEM GPU pozostaje dostępny przez istniejącą ścieżkę CLI w tym samym obrazie.
+Obecność CUDA nie rozszerza capability map workspace.
+
+Pierwszy start tworzy nowy accepted store. Kolejne starty otwierają kompletny
+store; częściowy katalog, obcy owner lub niezgodna konfiguracja wymagają
+kontrolowanego recovery. Nie są automatycznie zastępowane.
+
 Start zapisuje Compose i receipt z nazwą projektu, ID kontenera, ścieżką stanu
 oraz URL. Stan sesji jest osobnym montowaniem `/state`. Zatrzymanie kontenera
 nie usuwa danych. Dla konkretnego projektu z receiptu:
@@ -61,6 +73,13 @@ nie usuwa danych. Dla konkretnego projektu z receiptu:
 docker compose -f <compose.json> --project-name <compose-project> stop
 docker compose -f <compose.json> --project-name <compose-project> start
 ```
+
+Zatrzymanie najpierw zamyka admission API, następnie żąda drain od dokładnie
+tego ownera runtime service i sprawdza terminalne receipty obu dzieci.
+Compose daje 60 sekund na tę procedurę. Timeout lub utrata potwierdzenia
+pozostawia stan nieznany i dowody do recovery. Nieudany start lub nadzór
+zamyka API, zachowuje możliwie działający service i utrzymuje niezdrowy kontener
+do jawnego zatrzymania przez operatora; nie wykonuje automatycznego takeover.
 
 ## Storage i granice weryfikacji
 
