@@ -210,7 +210,7 @@ study.storage()
         OutputStorage(data_format="h5").to_ir(),
     )[0]["autosave"]
     require(time_stage["format"] == "hdf5", "hdf5 stage format mismatch")
-    require(time_stage["fields"][0]["quantity"] == "magnetization", "authored output quantity changed")
+    require(time_stage["fields"][0]["quantity"] == "m", "authored output quantity changed")
     require(time_stage["fields"][0]["every_seconds"] == 0.5, "authored output cadence changed")
 
     time_fallback = configure_scene_stage_autosaves(

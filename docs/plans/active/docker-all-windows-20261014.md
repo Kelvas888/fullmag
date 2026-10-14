@@ -211,3 +211,12 @@ Przyczyną regresji kontrastu siatki był lokalny Box pomijany przez początkow�
 - Końcowy build poprawionego SHA, obraz, dwa kontenery, HMR i runtime GPU/storage pozostają **NOT VERIFIED**.
 
 Niepoprawny bbox (konwersja, długość, NaN/Inf, odwrócone granice) kończy się RuntimeError zamiast pominięcia seedowania; wyjątki CAD propagują. Nowa wykonywalna regresja i powtórzone focused Gmsh consumers: PASS. Dowody i bieżące raw/LF SHA zapisano w `scientific-evidence/source-plane-seed-evidence.json`.
+
+
+### Checkpoint — przywrócenie kontraktu autosave w eksporcie
+
+CI końcowego `cf54c6b5de72e1ab5ead82d58ef989fff88687f3` potwierdziło 127 scene/eigen, 45 Gmsh i 20 Göbel contracts, lecz checker output storage nie mógł zaimportować `_scene_stage_autosave`. Helper wydzielono z istniejącego parsera `_render_scene_stage_autosave_suffix`, zachowując strict nested-field validation, cadence, aliases, defaults oraz None semantics. Renderer korzysta z tej samej ścieżki. Asercja quantity dla authored `name: "m"` oczekuje kanonicznego `m`, zgodnie z lowererem.
+
+`python3 scripts/check_output_storage_contract.py`: **PASS, exit 0**, `output-storage interpreted contract: ok`. Niezależny review i diff check: **PASS**. Nie kompilowano lokalnych testów.
+
+Pełny push-run scoped Gmsh przeszedł; PR-run zatrzymał się na jednej multi-object conformity regresji. Porównanie faktycznych checkoutów i przyczyny algorytmu jest w toku; nie obniżono wymagania conformal_occ. Końcowy build/runtime i integracja nadal blokowane przez wolne miejsce i niedostępny required FEM runner.
