@@ -103,8 +103,8 @@ def run(repo: Path, route: str, dependency_workspace: Path | None = None):
         run_root.mkdir(parents=True)
         workspace_evidence = {}
         if dependency_workspace is not None:
-            if route not in {"generate-client", "production-source", "api-hygiene"}:
-                raise storage.StorageError("Native dependency workspace is supported only for API generation and production source checks")
+            if route not in {"generate-client", "production-source", "api-hygiene", "lint"}:
+                raise storage.StorageError("Native dependency workspace is supported only for API generation, production source checks and lint")
             from frontend_source_workspace import prepare_source_workspace, validate_dependency_workspace
             dependency_before = validate_dependency_workspace(repo, layout, dependency_workspace)
             prepared = prepare_source_workspace(repo, layout, run_root, dependency_workspace)
@@ -232,7 +232,7 @@ def run(repo: Path, route: str, dependency_workspace: Path | None = None):
                 config = run_root / "tsconfig.production.json"
                 exclude = ["node_modules", "out", ".next/dev", "**/*.test.ts", "**/*.test.tsx", "**/*.spec.ts", "**/*.spec.tsx", "**/__tests__/**"]
                 config.write_text(json.dumps({"extends": str(app / "tsconfig.typecheck.json"), "compilerOptions": {"noEmit": True, "incremental": False}, "exclude": [(app / pattern).as_posix() for pattern in exclude]}, indent=2), encoding="utf-8")
-                commands = [cli("typescript", "bin/tsc") + ["--noEmit", "--project", str(config)]]
+                commands = [cli("typescript-native", "bin/tsc") + ["--noEmit", "--project", str(config)]]
                 receipt["test_exclusions"] = exclude
             receipt["steps"] = []
             return_code = 0

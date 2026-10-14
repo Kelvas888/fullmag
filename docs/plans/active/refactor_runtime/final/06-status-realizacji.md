@@ -1,4 +1,28 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53CB](p8/53cb-frontend-compiler-api-and-native-cli.md):
+rozdzielono compiler API 6 od natywnego CLI 7; poprawiono zgodność pluginów
+z ESLint 10 bez wyłączania reguł. Pełny lint PASS `909b25eb`, produkcyjne
+źródła TS7 PASS `898a6f7f`, regresje CLI **5/5 PASS**.
+CLI/API skompilowane; desktop i pełny pakiet nadal blokuje brak miejsca.
+Browser/runtime i CI pozostają odrębnymi bramkami; procentów nie podniesiono.
+
+Checkpoint 14.10.2026 — [P8-53CA](p8/53ca-verified-frozen-frontend-dependencies.md):
+walidator przyjmuje poprawnie przypięte zależności z sealed source snapshotu;
+końcowe interpreted regresje **16/16 PASS**, receipt `a435001e`.
+Production source TS7 PASS `00a38ea0`; CLI/API z nowego snapshotu skompilowane.
+Cały native build failed przy desktopie z powodu braku miejsca. Świeży lint
+ujawnił niezgodność parsera ESLint z API TS7; wymagany kolejny przyrost.
+**Pełny pakiet, browser/runtime, P8 i cały plan pozostają IN PROGRESS.**
+
+Checkpoint 14.10.2026 — [P8-53BZ](p8/53bz-typed-authoring-and-browser-buffer-contracts.md):
+naprawiono typowany ACK authoringu, przeglądarkowe granice buforów i import
+helpera ribbonu; uzupełniono fixtures scope/nazw i rozdzielono TypeScript 7
+od oficjalnego compiler API 6 dla testów AST. Managed production source
+typecheck PASS (`1fbabb24`); lokalnie nie kompilowano unit tests.
+Nowe CI, build oraz browser/runtime nadal wymagają odbioru. Dwie próby
+buildu zakończyły oczekiwanie przed kompilacją z powodu zajętego slotu.
+**P8 i cały plan pozostają IN PROGRESS; procentów nie podniesiono.**
+
 Checkpoint 14.10.2026 — [P8-53BU](p8/53bu-authenticated-restore-frame.md):
 natywny probe publikuje ramkę v2 z uwierzytelnionym request ID/generation
 i źródłowym API/PID. Konsument odróżnia legacy v1 bez awansu jego dowodu.
