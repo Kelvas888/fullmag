@@ -1,4 +1,12 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53CP](p8/53cp-worker-environment-fixture-types.md)
+i [P8-53CQ](p8/53cq-owner-air-separated-field-controls.md):
+fixture kompozycji anteny **3/3 PASS w CI**. Dwa kolejne E0277 testu
+środowiska workera poprawiono i opublikowano jako `720fcda27`; odbiór trwa.
+Diagnostyka wykonała 10 obserwacji ze stabilnymi źródłami: oddzielne kontrole
+pól nadal nie odtwarzają referencji owner XY. Box **44/45 PASS**, numeric WIP
+pozostaje niezakwalifikowany. Pełny plan **IN PROGRESS**, procenty bez awansu.
+
 Checkpoint 14.10.2026 — [P8-53CN](p8/53cn-owner-air-repeatability-and-gates.md):
 publiczny Box po doprecyzowaniu air-plane contract **44/45 PASS**, bez skip;
 pozostała rzeczywista porażka niezależności owner XY. Powtórzenia ring dają
