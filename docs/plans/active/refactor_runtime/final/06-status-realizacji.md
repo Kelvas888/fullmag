@@ -1,4 +1,12 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53CE](p8/53ce-current-integration-gates.md):
+CI na `868a224b` potwierdziło **315/315 sesji** oraz **1039/1039** w modal
+observables z pełnym frontend typecheck. Pełna seria Control Room:
+8525 PASS / 16 FAIL / 13 skipped i 9 unhandled errors. Cztery kolejne
+blokady kompilacji fixtures API poprawione źródłowo; odbiór ich CI wymagany.
+Pełny build desktopu nadal nieodebrany; retencja nieuzyskana (HTTP 500).
+**P8 i cały plan IN PROGRESS; procentów nie podniesiono.**
+
 Checkpoint 14.10.2026 — [P8-53CB](p8/53cb-frontend-compiler-api-and-native-cli.md):
 rozdzielono compiler API 6 od natywnego CLI 7; poprawiono zgodność pluginów
 z ESLint 10 bez wyłączania reguł. Pełny lint PASS `909b25eb`, produkcyjne
