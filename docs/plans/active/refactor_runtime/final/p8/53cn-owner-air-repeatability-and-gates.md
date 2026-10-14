@@ -42,6 +42,18 @@ oczekiwanej niezależności owner XY, PBC ani liczby warstw.
 
 ## Stan integracji
 
+### Odbiór niezmienionych klonów
+
+Receipt `df2a0323353049afb93142e955d42526` zebrał wszystkie osiem
+obserwacji. PID 187656 odczekany, exit 0, bez timeout/terminate/kill;
+fingerprints źródeł stabilne. Niezmieniony clone 30 nm ma ten sam body XY
+digest co oryginał 30 nm, a clone 50 nm taki sam jak oryginał 50 nm.
+Również późniejsze powtórzenia zachowują te wyniki. W tej próbie różnica
+wykonania oryginał/clone nie wyjaśnia trzeciego wyniku fixed controls.
+Następna diagnoza rozdzieli air grading od owner VOut/global ceiling,
+z zachowaniem wszystkich authored inputs i guardów. To nadal obserwacje,
+nie zaliczenie niezależności siatki.
+
 PR #168 pozostaje otwarty. Błędy CI i lokalna niezależność owner/air są
 rzeczywistymi niedomkniętymi bramkami. Mesher pozostaje WIP; ta diagnostyka
 nie kwalifikuje FEM CPU/GPU, solvera, wydania ani pełnego pakietu Windows.
