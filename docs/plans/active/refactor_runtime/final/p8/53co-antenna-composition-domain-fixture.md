@@ -28,3 +28,11 @@ Review źródła i scoped format/diff check nie zastępują wykonania testu.
 Lokalna kompilacja Rust unit tests pozostaje zabroniona. Odbiór poprawki w CI
 jest **NOT RUN** do czasu publikacji nowego commita i terminalnego wyniku.
 Nie dowodzi to transportu FEM CPU/GPU ani ukończenia P8.
+
+## Późniejszy odbiór CI
+
+Run `38562458536`, job `115846662601`, SHA `aa0f42f78a25453cb4a430a378823511a80e805f`
+potwierdził wszystkie trzy testy kompozycji portu: **3/3 PASS**.
+Wcześniejszy zapis NOT RUN dotyczył momentu przed publikacją; został
+rozstrzygnięty tym wynikiem. Cały job nadal FAIL na dwóch błędach typów
+fixture środowiska workera, opisanych w [53CP](53cp-worker-environment-fixture-types.md).
