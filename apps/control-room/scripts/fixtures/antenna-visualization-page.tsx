@@ -42,7 +42,9 @@ declare global { interface Window { __antennaVisualizationFixture?: { read(): { 
 function makeFixture() {
   const scenario = new URL(window.location.href).searchParams.get("scenario") ?? "ready";
   const isInspection = scenario.startsWith("inspection");
-  const closedFixture = scenario.startsWith("inspection-closed") ? makeClosedLoopBrowserFixture(owner) : null;
+  const cancellation = scenario === "inspection-closed-current-cancellation" ? "current"
+    : scenario === "inspection-closed-magnetic-cancellation" ? "magnetic" : undefined;
+  const closedFixture = scenario.startsWith("inspection-closed") ? makeClosedLoopBrowserFixture(owner, cancellation) : null;
   const isCurrent = scenario.startsWith("inspection-current");
   const scene = {
     revision: 1, objects: [{ id: "antenna", name: "Antenna", role: "antenna" }],

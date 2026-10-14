@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { verifyClosedLoopVectorDisplay } from "./lib/closed-loop-vector-browser-checks.mjs";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -319,6 +320,7 @@ try {
   await page.evaluate(() => window.__antennaVisualizationFixture.selectOther());
   await page.waitForFunction(() => window.__antennaFieldCanvas?.().sampleCount === 0);
   checks.push("Closed-loop controlled V/J/H raw and signed per-A use retained stable-u64 device and independent H sampling Tet4 carriers, correct ranges and units; not basis/FFT/LLG qualified; owner switch removes overlay");
+  checks.push(...await verifyClosedLoopVectorDisplay({ page, root, open, shot }));
   await open("inspection-closed-foreign");
   await page.waitForTimeout(500);
   assert.equal(await root.getByRole("combobox", { name: "Antenna quantity", exact: true }).isEnabled(), false);
