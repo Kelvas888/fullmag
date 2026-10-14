@@ -21,6 +21,15 @@ class DockerRuntimeContract(unittest.TestCase):
         self.assertTrue(service["read_only"])
         self.assertEqual([m["target"] for m in service["volumes"]], ["/state"])
 
+    def test_runtime_rejects_toolchain_policy_that_overrides_model_requests(self):
+        valid = {"Env": ['FULLMAG_FEM_REQUIRE_GPU=0', 'FULLMAG_FEM_MFEM_DEVICE=']}
+        runtime.validate_workspace_environment(valid)
+        for assignment in ('FULLMAG_FDM_EXECUTION=gpu', 'FULLMAG_FEM_EXECUTION=auto',
+                           'FULLMAG_FEM_REQUIRE_GPU=1', 'FULLMAG_FEM_MFEM_DEVICE=cuda'):
+            config = {"Env": [*valid["Env"], assignment]}
+            with self.assertRaisesRegex(ValueError, "overrides model execution"):
+                runtime.validate_workspace_environment(config)
+
     def test_windows_certificate_is_read_only_and_profile_is_explicit(self):
         service = runtime.compose_spec("sha256:" + "a" * 64, Path("C:/owned/state"), 3197,
                                        Path("C:/owned/host.json"))["services"]["fullmag"]

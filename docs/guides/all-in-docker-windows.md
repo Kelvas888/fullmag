@@ -48,8 +48,10 @@ Port hosta jest konfigurowalny. W kontenerze zawsze używany jest port `8081`;
 publikacja następuje wyłącznie na `127.0.0.1` Windows. Statyczny frontend
 korzysta z tego samego originu dla API i WebSocket; nie ma osobnego serwera Node.
 Docker Desktop musi używać silnika Linux i udostępniać GPU NVIDIA. Brak drivera
-CUDA lub GPU kończy start przed uruchomieniem API. Wymuszenie GPU nie ma
-cichego fallbacku CPU.
+CUDA lub GPU kończy start przed uruchomieniem API. Dostępne urządzenie nie
+nadpisuje wyboru CPU/GPU/auto w kanonicznym modelu. Jawne żądanie GPU nie ma
+cichego fallbacku CPU; dostępność konkretnych zadań nadal określa capability map
+bieżącego Fullmaga.
 
 Start zapisuje Compose i receipt z nazwą projektu, ID kontenera, ścieżką stanu
 oraz URL. Stan sesji jest osobnym montowaniem `/state`. Zatrzymanie kontenera

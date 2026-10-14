@@ -42,6 +42,15 @@ def image_id(value):
     return observed
 
 
+def validate_workspace_environment(config):
+    environment = dict(value.split("=", 1) for value in config.get("Env", []) if "=" in value)
+    if (any(name in environment for name in ("FULLMAG_FDM_EXECUTION", "FULLMAG_FEM_EXECUTION"))
+            or environment.get("FULLMAG_FEM_REQUIRE_GPU", "0") != "0"
+            or environment.get("FULLMAG_FEM_ALL_IN_GPU", "0") != "0"
+            or environment.get("FULLMAG_FEM_MFEM_DEVICE", "") != ""):
+        raise ValueError("Runtime toolchain environment overrides model execution intent")
+
+
 def compose_spec(image, state, port, host_certificate=None):
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("A full immutable image ID is required")
@@ -185,7 +194,7 @@ def build_image(repo, job_id, commit):
                           "RUNTIME_BASE=" + alias, "--iidfile", str(iid), str(stage), combined=True)
             (output / "assembly.log").write_text(logs)
             immutable = iid.read_text().strip()
-            image_id(immutable)
+            validate_workspace_environment(image_id(immutable)["Config"])
             verify_source(capsule, context["source_digest"])
             receipt.update(state="succeeded", image_id=immutable, exit_code=0)
         except Exception as error:
@@ -206,6 +215,7 @@ def start(repo, assembly_receipt, port):
         raise ValueError("A successful all-in-Docker assembly receipt is required")
     image = assembly.get("image_id", "")
     observed = image_id(image)
+    validate_workspace_environment(observed["Config"])
     if observed.get("Config", {}).get("Labels", {}).get("org.fullmag.runtime") != "docker-all-gpu-v1":
         raise ValueError("Image is not a Fullmag all-in-Docker GPU runtime")
     storage.initialize(layout)
