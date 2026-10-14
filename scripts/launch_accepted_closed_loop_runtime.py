@@ -273,9 +273,21 @@ def launch(request_path, request_sha):
                "owner": token, "container_id": None, "runtime_verified": False,
                "storage_preflight": layout, "managed_package": evidence}
     cid = None
+    windows_storage = None
+    storage_can_cleanup = True
     try:
         for name in ("inputs", "proof", "runs"):
             (output / name).mkdir()
+        if os.name == "nt":
+            storage_path = Path(__file__).resolve().with_name("accepted_closed_loop_windows_storage.py")
+            storage_raw = bounded_bytes(storage_path, 256 << 10)
+            storage_spec = importlib.util.spec_from_file_location("accepted_closed_loop_windows_storage", storage_path)
+            windows_loop_storage = importlib.util.module_from_spec(storage_spec)
+            exec(compile(storage_raw, str(storage_path), "exec"), windows_loop_storage.__dict__)
+            receipt["windows_storage_adapter_sha256"] = hashlib.sha256(storage_raw).hexdigest()
+            windows_storage = windows_loop_storage.prepare(
+                output, root, token, request["image"], docker, path_checked, save)
+            receipt["windows_storage"] = windows_storage
         for name, source in inputs.items():
             bounded_copy(source, output / "inputs" / name, request[name]["sha256"], input_sizes[name])
         marker = output / "marker.json"
@@ -319,6 +331,9 @@ def launch(request_path, request_sha):
         verifier.verify_source(capsule, request["source_digest"])
         if hashlib.sha256(bounded_bytes(request_path, 64 << 10)).hexdigest() != request_sha:
             raise ValueError("Request changed before start")
+        if windows_storage:
+            windows_loop_storage.verify(windows_storage, token, request["image"], docker)
+        storage_can_cleanup = False
         docker("start", cid)
         code = int(docker("wait", cid, timeout=4 * request["solve_timeout_seconds"] + 180))
         observed = inspect_owned(cid, token)
@@ -326,6 +341,9 @@ def launch(request_path, request_sha):
         if observed["State"]["Running"] or observed["State"].get("OOMKilled") or code != 0:
             raise ValueError("Owned runtime gate failed")
         verifier.verify_source(capsule, request["source_digest"])
+        if windows_storage:
+            driver_receipt = windows_loop_storage.export_receipt(output, request["image"], docker)
+            save(output / "driver-receipt.json", parse_json(driver_receipt.encode("utf-8")))
         # Launcher success proves process completion, not the driver's scientific assertions.
         receipt.update(state="completed", driver_exit_code=code)
         return 0
@@ -340,12 +358,23 @@ def launch(request_path, request_sha):
             try:
                 observed = inspect_owned(cid, token)
                 if observed["State"]["Running"]:
+                    storage_can_cleanup = False
                     receipt.update(cleanup="retained-running-no-stop", state="retained")
                 else:
                     docker("rm", cid)
                     receipt["cleanup"] = "removed-owned-stopped"
+                    storage_can_cleanup = True
             except Exception as error:
+                storage_can_cleanup = False
                 receipt["cleanup"] = "retained-control-error: " + str(error)
+        if windows_storage and storage_can_cleanup:
+            try:
+                windows_loop_storage.cleanup(windows_storage, output, token, request["image"], docker, save)
+                receipt["storage_cleanup"] = "unmounted-owned; backing-images-retained"
+            except Exception as error:
+                receipt["storage_cleanup"] = "retained-control-error: " + str(error)
+        elif windows_storage:
+            receipt["storage_cleanup"] = "retained-with-container"
         save(output / "terminal-receipt.json", receipt)
 
 
