@@ -806,3 +806,78 @@ zapobiegają utrwaleniu punktu before podczas oczekiwania na zapis.
 Diff check PASS; staged-page typecheck/lint i rzeczywista regresja
 toggle→odmowa Setup draft→potwierdzony zapis→ponowne Setup draft pozostają
 NOT VERIFIED. Cały P8-53BM/P8-53 nadal IN PROGRESS.
+
+### Przyczyna kolejki: potwierdzona niekompletna fizyka jako HTTP 500
+
+Po terminalnym zamknięciu próby 40e08 log `native.stderr.log` zachował:
+`model sync returned HTTP 500 Internal Server Error; helper shutdown is not confirmed`.
+Scratch supervisor uruchamia sync przed solverem; na takim wyniku przechodzi
+w synchronization_unknown i nie odtwarza write automatycznie.
+Nowy scratch observer jest uruchamiany w CLI development_restart.rs;
+queued Grid nie dowodzi braku przepięcia obserwatora ani błędu plannera.
+
+Diagnostyka bez API POST, zapisu i solvera: renderer z zainstalowanego
+zamrożonego pakietu cd7fe207 otrzymał dokładną captured scene z receipt.
+Zgłosił `IncompletePhysicsError: Problem requires at least one interaction
+or material anisotropy`. Study miał exchange_enabled=false,
+demag_enabled=false i brak object physics_stack. Sam asset Uniform
+i materiał nie aktywują modułów fizyki. To potwierdzona przyczyna błędu
+renderowania; nie zmienia wymagań fizyki ani dowodów scientific qualification.
+
+WIP poprawki: wejście CLI helpera przechwytuje wyłącznie typed
+IncompletePhysicsError dla render-scene-document, emituje dwupolowy
+`fullmag.scene-render-rejection.v1` / incomplete_physics i exit 2 przed
+publikacją źródła. Direct helper.main/renderer oraz --allow-incomplete
+zachowują dotychczasową semantykę. API uznaje za znaną odmowę tylko
+dokładny exit 2 i envelope o dokładnie dwóch polach; zwraca HTTP 400,
+code=scene_incomplete_physics. Unknown/malformed/timeout nadal 500.
+Scratch klient odczytuje ograniczone body wyłącznie HTTP 400 i dla tego
+kodu pokazuje stały komunikat o aktywacji interakcji/anizotropii;
+pozostałe 4xx/5xx zachowują poprzednią klasyfikację.
+
+Regresja red `b85bbc5fd93148cfbc0422322cbac854`: 189 kontroli, 3 błędy
+wyłącznie brakującego _run_cli. Green po poprawce
+`bf7a73ec129b490eb6d7de045d2529d4`: 189 PASS, exit 0, 0 skips;
+before/after `115c0e96e8ee0ca4e1d2ffcd8720518bf9319b2638c7b9eb94f8684a17f6f76a`.
+Pokrycie: zachowanie istniejącego pliku przy typed odmowie, brak połknięcia
+nieznanego ValueError i niekompletna persistence z written=false.
+Review podstawowego mapowania i guardu kamery: brak P0/P1, source only.
+
+Dodano dwa native API assertions: odmowa 400/code oraz niezmieniona scena
+i rewizja. Są NOT RUN do nowego buildu; nie kompilowano testów jednostkowych.
+Nowy managed build z dirty snapshotem jest w toku, log
+`native-build-996985fbff454e83847b2c2f88eed31e.log`.
+Kolejne wymagane dowody: kompilacja API/CLI, kanoniczny OpenAPI/client,
+frozen native API gate, regresja guardu kamery oraz pełny browser restart
+z jawnie aktywną fizyką przed capture. Nie oznaczono poprawki ani P8-53BM
+jako ukończonych na podstawie samego green Pythona.
+
+### Ukończony build poprawki — 14.10.2026
+
+Managed `just windows-workspace-build dev dev 3258 auto` zakończył się
+exit 0. Zbudowano produkcyjne API, CLI i desktop w profilu backend-dev;
+nie kompilowano testów jednostkowych. Manifest pakietu:
+`1bcaf4c15c4acf4a813d172021c9b00c5ffdbe84ad7c2d8a2c16b41efdd10d0e`.
+Commit bazowy `99d6be2f97976f5392b419f2ecd03b70b4fdaac1`, dirty source
+`9f2473863cf9959f3cb163a9456398b53a4c126fda2d6a921e4751f0f3bcb9f1`,
+backend `a79bc49d271115f57bbdee8c72f40dbcc452623888a954b54a78aa236cb7d46e`.
+Log: `native-build-996985fbff454e83847b2c2f88eed31e.log`.
+
+Przypięta do manifestu frozen API gate zakończyła się exit 0:
+**303 PASS, 99/99 procesów odebranych**, receipt
+`a6c4edb5665f46709d61fa5b535fd3d9`. Nowe kontrole
+`incomplete-physics-render-is-confirmed-input-rejection` oraz
+`incomplete-physics-render-preserves-scene-and-revision` potwierdzają
+HTTP 400/code i brak zmiany sceny/revision. Końcowy backend source pozostał
+`a79bc49d271115f57bbdee8c72f40dbcc452623888a954b54a78aa236cb7d46e`.
+Kanoniczny OpenAPI SHA-256:
+`54c16a8be054a9eadeb034dc40f023e72e72e8249f6d25f3ce85a82482d9acdf`.
+Import przypięty do terminalnego receipt oraz generate-client PASS,
+receipt `9d12898d331f4be9a0218bcf070e6018`.
+Istniejące cudze wygenerowane pliki zachowano przed importem w
+`contracts-before-sync` pod receipt API; do commita zadania wolno włączyć
+wyłącznie własne hunki odpowiedzi 400.
+
+Te dowody nie potwierdzają jeszcze terminalnej obsługi Grid przez scratch
+po odmowie ani pełnego Grid/Compute po restarcie. Regresja kamery i pełna
+próba przeglądarkowa pozostają NOT VERIFIED; P8-53BM nadal IN PROGRESS.

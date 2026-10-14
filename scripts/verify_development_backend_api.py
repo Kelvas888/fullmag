@@ -2590,6 +2590,27 @@ def exercise(api: Path, repo: Path, run_root: Path, receipt: dict, *, project_do
     if start_freeze_race_only:
         return
 
+    incomplete_physics_scene = json.loads(json.dumps(start_race_scene))
+    incomplete_physics_scene["objects"][0].pop("physics_stack", None)
+    incomplete_physics_scene["study"].update(exchange_enabled=False, demag_enabled=False)
+
+    def incomplete_physics_render(get):
+        _, _, before = get("/v2/sessions/current/model/scene")
+        try:
+            get("/v2/sessions/current/model/syncs", method="POST", payload={})
+        except urllib.error.HTTPError as error:
+            failure = json.loads(error.read())
+            assert error.code == 400 and failure.get("code") == "scene_incomplete_physics", failure
+        else:
+            raise AssertionError("Incomplete physics render was not explicitly rejected")
+        checks.append("incomplete-physics-render-is-confirmed-input-rejection")
+        _, _, after = get("/v2/sessions/current/model/scene")
+        assert after == before, "Render rejection changed authoring data"
+        checks.append("incomplete-physics-render-preserves-scene-and-revision")
+
+    with_api("incomplete-physics-render", restore_config, incomplete_physics_render,
+             restore_input=json.dumps({**restore_envelope, "scene_document": incomplete_physics_scene}).encode())
+
     def restored(get):
         code, _, current = get("/v2/sessions/current")
         assert code == 200 and current["session_id"] not in {"old-session-fixture", "stable-model-fixture"}, current

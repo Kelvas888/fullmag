@@ -1,6 +1,7 @@
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
+use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -995,6 +996,7 @@ fn pending_compute_command(client: &Client, api_base: &str) -> Option<(String, b
 #[derive(Debug)]
 enum SceneSynchronizationError {
     Rejected(reqwest::StatusCode),
+    IncompletePhysics,
     Unknown(anyhow::Error),
 }
 
@@ -1008,6 +1010,7 @@ impl std::fmt::Display for SceneSynchronizationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rejected(status) => write!(formatter, "model sync returned HTTP {status}"),
+            Self::IncompletePhysics => write!(formatter, "Enable an interaction or material anisotropy before preparing this model for execution"),
             Self::Unknown(error) => write!(formatter, "{error:#}"),
         }
     }
@@ -1028,7 +1031,17 @@ fn render_current_scene(client: &Client, api_base: &str) -> Result<PathBuf, Scen
                 "model sync returned HTTP {}; helper shutdown is not confirmed", response.status()
             )));
         }
-        return Err(SceneSynchronizationError::Rejected(response.status()));
+        let status = response.status();
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            let mut body = Vec::new();
+            if response.take(4097).read_to_end(&mut body).is_ok() && body.len() <= 4096
+                && serde_json::from_slice::<Value>(&body).ok().is_some_and(|value|
+                    value.get("code").and_then(Value::as_str) == Some("scene_incomplete_physics"))
+            {
+                return Err(SceneSynchronizationError::IncompletePhysics);
+            }
+        }
+        return Err(SceneSynchronizationError::Rejected(status));
     }
     let body = response.json::<Value>()
         .map_err(|error| SceneSynchronizationError::Unknown(error.into()))?;

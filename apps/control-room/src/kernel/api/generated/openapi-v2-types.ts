@@ -26993,6 +26993,13 @@ export interface operations {
                     "application/json": components["schemas"]["ScriptSyncResponse"];
                 };
             };
+            /** @description Scene physics is incomplete; no canonical source was written */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description No active workspace */
             404: {
                 headers: {

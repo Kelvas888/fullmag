@@ -3682,6 +3682,7 @@ pub async fn get_authoring_script_source(
     request_body = ScriptSyncRequest,
     responses(
         (status = 200, description = "Canonical Python rewritten from authoring state", body = ScriptSyncResponse),
+        (status = 400, description = "Scene physics is incomplete; no canonical source was written"),
         (status = 404, description = "No active workspace"),
     ),
     tag = "model"

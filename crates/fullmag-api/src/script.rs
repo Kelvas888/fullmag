@@ -462,6 +462,20 @@ impl Drop for TemporaryFileGuard {
     }
 }
 
+fn scene_render_rejected_as_incomplete(exit_code: Option<i32>, stdout: &[u8]) -> bool {
+    if exit_code != Some(2) {
+        return false;
+    }
+    serde_json::from_slice::<Value>(stdout).ok().is_some_and(|value| {
+        value.as_object().is_some_and(|envelope| {
+            envelope.len() == 2
+                && envelope.get("schema").and_then(Value::as_str)
+                    == Some("fullmag.scene-render-rejection.v1")
+                && envelope.get("code").and_then(Value::as_str) == Some("incomplete_physics")
+        })
+    })
+}
+
 fn render_scene_document_via_python_helper_with_policy(
     repo_root: &Path,
     workspace_root: &Path,
@@ -495,6 +509,11 @@ fn render_scene_document_via_python_helper_with_policy(
     let output = run_python_helper_with_policy(repo_root, &helper_args, policy);
     let output = output?;
     if !output.status.success() {
+        if scene_render_rejected_as_incomplete(output.status.code(), &output.stdout) {
+            return Err(ApiError::bad_request(
+                "scene_incomplete_physics: Enable an interaction or material anisotropy before preparing this model for execution.",
+            ));
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ApiError::internal(format!(
             "python SceneDocument render helper failed: {}",

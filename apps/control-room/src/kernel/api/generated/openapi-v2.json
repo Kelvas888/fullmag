@@ -59980,6 +59980,9 @@
             },
             "description": "Canonical Python rewritten from authoring state"
           },
+          "400": {
+            "description": "Scene physics is incomplete; no canonical source was written"
+          },
           "404": {
             "description": "No active workspace"
           }
