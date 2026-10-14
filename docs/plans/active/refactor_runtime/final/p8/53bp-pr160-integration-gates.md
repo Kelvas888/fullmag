@@ -77,3 +77,13 @@ z AGENTS.md. Cała integracja i P8 pozostają IN PROGRESS.
 
 Bounded independent source review tego przyrostu: brak actionable P0/P1/P2.
 Review nie uruchamiał kompilacji ani CI; odwołuje się do powyższych receiptów.
+
+## Zgoda na CI — 14.10.2026
+
+Użytkownik odpowiedział: „Tak, zezwalam na testy w CI tych napraw” na pytanie
+o wyjątek dla napraw integracji i PR #160. Wcześniejsze oczekiwanie na tę
+odpowiedź jest zakończone. Wyjątek obejmuje CI wskazanych napraw; nie odwołuje
+zakazu lokalnego kompilowania unit testów. Samo zezwolenie nie dowodzi
+zielonych kontroli ani scalenia. Ponowny readback PR potwierdza OPEN,
+head `bd60ca1f0735a06abf95bdb71b80fbce9c80396f`, merge state UNSTABLE.
+Aktualne niepowodzenia wymagają naprawy oraz nowego wyniku CI przed merge.

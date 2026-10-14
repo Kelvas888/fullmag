@@ -270,11 +270,9 @@ def resolve_layout(repo_root, profile=None, environ=None):
     registrations = worktree_records(repo)
     main_repo = Path(registrations[0]["worktree"]).resolve()
     env = {**storage_dotenv(main_repo), **env}
-    # This Windows checkout keeps its worktrees below the canonical checkout
-    # itself (`D:\\git\\fullmag\\worktrees`), so its durable storage belongs
-    # to the checkout (`D:\\git\\fullmag\\storage`). Linux keeps the existing
-    # sibling-project layout used by the managed native storage contract.
-    project = main_repo if os.name == "nt" else main_repo.parent
+    # Derive the shared project boundary from Git on every platform. Storage
+    # and worktrees are siblings of the main checkout, regardless of cwd.
+    project = main_repo.parent
     canonical_storage = project / "storage"
     profile = profile or env.get("FULLMAG_STORAGE_PROFILE") or ("windows-native" if os.name == "nt" else "linux-host")
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", profile):
@@ -299,13 +297,8 @@ def resolve_layout(repo_root, profile=None, environ=None):
         if candidate.is_absolute():
             checkouts.append(candidate.resolve())
     for checkout in checkouts:
-        # The Windows canonical storage directory is deliberately inside the
-        # main checkout, but remains outside every worktree checkout. No other
-        # in-repository or worktree-overlapping path receives this exception.
-        if os.name == "nt" and checkout == main_repo and root == canonical_storage:
-            continue
         if inside(root, checkout) or inside(checkout, root):
-            raise StorageError(f"Storage must be outside all worktrees and non-canonical checkout paths: {root} overlaps {checkout}")
+            raise StorageError(f"Storage must be outside the repository and all worktrees: {root} overlaps {checkout}")
     wt = identifier(repo)
     platform = "windows" if os.name == "nt" else "linux"
     infrastructure = linux_infrastructure(root, env) if os.name != "nt" else {}
@@ -899,7 +892,13 @@ def _run_logged_command(command, repo_root, child_env, log_path, *, cancelled=No
             for line in iter(child.stdout.readline, b""):
                 log.write(line)
                 log.flush()
-                print(line.decode("utf-8", errors="replace"), end="", flush=True)
+                console_line = line.decode("utf-8", errors="replace")
+                encoding = getattr(sys.stdout, "encoding", None)
+                if encoding:
+                    # The binary log is authoritative. A legacy Windows console
+                    # must not interrupt the child merely to display Unicode.
+                    console_line = console_line.encode(encoding, errors="backslashreplace").decode(encoding)
+                print(console_line, end="", flush=True)
             return subprocess.CompletedProcess(command, child.wait())
 
 

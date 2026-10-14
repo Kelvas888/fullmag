@@ -14,7 +14,20 @@ import verify_development_handoff as checks
 
 
 class ManagedHandoffCheckReceiptTests(unittest.TestCase):
-    def exercise(self, output, identities=("a", "a"), child_code=0):
+    def test_restart_pump_change_invalidates_source_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            for relative in checks.SOURCE_PATHS:
+                path = repo / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("baseline\n", encoding="utf-8")
+            before = checks.source_identity(repo)
+            pump = repo / "crates/fullmag-cli/src/development_restart.rs"
+            self.assertTrue(pump.is_file())
+            pump.write_text("changed pump\n", encoding="utf-8")
+            self.assertNotEqual(checks.source_identity(repo), before)
+
+    def exercise(self, output, identities=("a", "a"), child_code=0, suite="handoff"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             repo = root / "repo"
@@ -32,7 +45,8 @@ class ManagedHandoffCheckReceiptTests(unittest.TestCase):
                       "env": {}}
 
             def child(command, **kwargs):
-                self.assertEqual(command[-2:], ["test_*development_*.py", "-v"])
+                pattern = "test_fullmag_storage.py" if suite == "storage" else "test_*development_*.py"
+                self.assertEqual(command[-2:], [pattern, "-v"])
                 self.assertEqual(kwargs["env"]["FULLMAG_TEST_TEMP_ROOT"], kwargs["env"]["TEMP"])
                 kwargs["stdout"].write(output)
                 return type("Result", (), {"returncode": child_code})()
@@ -46,7 +60,7 @@ class ManagedHandoffCheckReceiptTests(unittest.TestCase):
                     patch.object(checks.subprocess, "run", side_effect=child), \
                     redirect_stdout(io.StringIO()):
                 try:
-                    result = checks.run(str(repo))
+                    result = checks.run(str(repo), suite)
                 except Exception as error:
                     result, failure = None, error
             receipts = list(Path(layout["build_root"]).glob("checks/*/receipt.json"))
@@ -60,6 +74,18 @@ class ManagedHandoffCheckReceiptTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(receipt["state"], "completed")
         self.assertEqual(receipt["tests_run"], 4)
+
+    def test_storage_suite_records_its_fixed_scope(self):
+        result, error, receipt = self.exercise("Ran 4 tests in 0.01s\n\nOK\n", suite="storage")
+        self.assertEqual(result, 0)
+        self.assertIsNone(error)
+        self.assertEqual(receipt["suite"], "storage")
+
+    def test_unknown_suite_is_rejected_before_storage_resolution(self):
+        with patch.object(checks.storage, "resolve_layout") as resolve:
+            with self.assertRaises(checks.storage.StorageError):
+                checks.run("unused", "arbitrary")
+            resolve.assert_not_called()
 
     def test_zero_checks_or_all_skipped_is_not_success(self):
         for output in ("Ran 0 tests in 0.01s\n\nOK\n",
