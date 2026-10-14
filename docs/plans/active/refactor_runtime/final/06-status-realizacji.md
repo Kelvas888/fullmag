@@ -1,4 +1,13 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53CF](p8/53cf-frontend-integration-fixtures-and-debug.md)
+i [P8-53CG](p8/53cg-standalone-runtime-preview-finalization.md):
+przywrócono Debug anteny i canonical compute-node path; naprawiono mocks API,
+KernelContext i formularza Radix oraz nieaktualne fixtures/assertions.
+Produkcyjny TS7 PASS `cb7fbcad`, końcowy lint PASS `47b0e7a1`, source review
+bez P0/P1/P2. Poprawiono ordering late preview w standalone inspection;
+odbiory CI/browser/runtime tej poprawki pozostają wymagane. Drift generated
+API oraz 4 błędy Python layered airbox są nadal otwarte. Procentów nie podniesiono.
+
 Checkpoint 14.10.2026 — [P8-53CE](p8/53ce-current-integration-gates.md):
 CI na `868a224b` potwierdziło **315/315 sesji** oraz **1039/1039** w modal
 observables z pełnym frontend typecheck. Pełna seria Control Room:
