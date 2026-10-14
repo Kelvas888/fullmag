@@ -55,6 +55,15 @@ const INSPECTOR_MODAL_MESH_TOPOLOGY_REVISION = 7;
 const INSPECTOR_MODAL_TOPOLOGY_HASH = "0123456789abcdef".repeat(4);
 const INSPECTOR_MODAL_TOPOLOGY_HEADER_HASH =
   `sha256:${INSPECTOR_MODAL_TOPOLOGY_HASH}`;
+const INSPECTOR_FEM_DOMAIN_BOUNDS_MIN = [-500e-9, -500e-9, -500e-9];
+const INSPECTOR_FEM_DOMAIN_BOUNDS_MAX = [500e-9, 500e-9, 500e-9];
+const INSPECTOR_FILM_BOUNDS_MIN = [-100e-9, -40e-9, -2.5e-9];
+const INSPECTOR_FILM_BOUNDS_MAX = [100e-9, 40e-9, 2.5e-9];
+// Keep the semantic orphan part in the same FEM domain, one authored-film
+// extent away from the Film object, without introducing a normalized mesh
+// coordinate system into the SI fixture.
+const INSPECTOR_ORPHAN_BOUNDS_MIN = [100e-9, 40e-9, 2.5e-9];
+const INSPECTOR_ORPHAN_BOUNDS_MAX = [300e-9, 120e-9, 7.5e-9];
 const INSPECTOR_REQUEST_LIMITS = new Map([
   [
     "GET /v2/sessions/current/model/regions",
@@ -3859,12 +3868,17 @@ function createInspectorFixture() {
 }
 
 function inspectorMeshPart(id, role, objectId, ordinal) {
+  const bounds = id === "airbox"
+    ? { max: INSPECTOR_FEM_DOMAIN_BOUNDS_MAX, min: INSPECTOR_FEM_DOMAIN_BOUNDS_MIN }
+    : id === "film-part"
+      ? { max: INSPECTOR_FILM_BOUNDS_MAX, min: INSPECTOR_FILM_BOUNDS_MIN }
+      : { max: INSPECTOR_ORPHAN_BOUNDS_MAX, min: INSPECTOR_ORPHAN_BOUNDS_MIN };
   return {
     boundary_face_count: 4,
     boundary_face_indices: [0, 1, 2, 3].map((index) => index + ordinal * 4),
     boundary_face_start: ordinal * 4,
-    bounds_max: [1 + ordinal, 1 + ordinal, 1 + ordinal],
-    bounds_min: [-1 + ordinal, -1 + ordinal, -1 + ordinal],
+    bounds_max: [...bounds.max],
+    bounds_min: [...bounds.min],
     element_count: 1,
     element_start: ordinal,
     id,
@@ -4307,8 +4321,8 @@ async function installInspectorFixtureApi(page, fixture) {
     if (path === "/v2/sessions/current/model/planar-monitors") return fulfillJson(route, { count: 0, monitors: [], scene_revision: fixture.revision });
     if (path === "/v2/sessions/current/model/universe") return fulfillJson(route, {
       mesh_dirty: false,
-      object_bounds_max: [16e-9, 8e-9, 2e-9],
-      object_bounds_min: [0, 0, 0],
+      object_bounds_max: INSPECTOR_FILM_BOUNDS_MAX,
+      object_bounds_min: INSPECTOR_FILM_BOUNDS_MIN,
       scene_revision: fixture.revision,
       study_universe_mesh: null,
       universe: null,
@@ -5376,10 +5390,25 @@ function inspectorTopologyBuffer() {
   view.setUint32(20, elementCount, true);
   view.setUint32(24, elementCount, true);
   let offset = 32;
+  const [domainMinX, domainMinY, domainMinZ] = INSPECTOR_FEM_DOMAIN_BOUNDS_MIN;
+  const [domainMaxX, domainMaxY, domainMaxZ] = INSPECTOR_FEM_DOMAIN_BOUNDS_MAX;
+  const [filmMinX, filmMinY, filmMinZ] = INSPECTOR_FILM_BOUNDS_MIN;
+  const [filmMaxX, filmMaxY, filmMaxZ] = INSPECTOR_FILM_BOUNDS_MAX;
+  const [orphanMinX, orphanMinY, orphanMinZ] = INSPECTOR_ORPHAN_BOUNDS_MIN;
+  const [orphanMaxX, orphanMaxY, orphanMaxZ] = INSPECTOR_ORPHAN_BOUNDS_MAX;
   new Float64Array(buffer, offset, nodeCount * 3).set([
-    0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
-    -1, -1, -1, 2, -1, -1, -1, 2, -1, -1, -1, 2,
-    0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 2,
+    domainMinX, domainMinY, domainMinZ,
+    domainMaxX, domainMinY, domainMinZ,
+    domainMinX, domainMaxY, domainMinZ,
+    domainMinX, domainMinY, domainMaxZ,
+    filmMinX, filmMinY, filmMinZ,
+    filmMaxX, filmMinY, filmMinZ,
+    filmMinX, filmMaxY, filmMinZ,
+    filmMinX, filmMinY, filmMaxZ,
+    orphanMinX, orphanMinY, orphanMinZ,
+    orphanMaxX, orphanMinY, orphanMinZ,
+    orphanMinX, orphanMaxY, orphanMinZ,
+    orphanMinX, orphanMinY, orphanMaxZ,
   ]);
   offset += nodeCount * 3 * Float64Array.BYTES_PER_ELEMENT;
   new Uint32Array(buffer, offset, elementCount * 4).set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
