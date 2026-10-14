@@ -162,3 +162,25 @@ job `e8a13bc0d2914851a27667fa0a575989`, profil `fem-gpu-release`, source
 `b5814b313a2d8a500d2e24576f16cbfc48934955`. To wersja sprzed korekty pnpm;
 jej build nie będzie dowodem kompletnego końcowego obrazu. Nie uruchomiono
 równoległego ciężkiego buildu ani nie zatrzymano obserwowanego joba.
+
+
+## Korekta bazowej siatki dla bramek CI
+
+Scoped magnetic intervals używają pojedynczej recombined extrusion, a zewnętrzne
+powietrze pozostaje geometry-only. Pole właściciela nie eksportuje `VOut` do
+powietrza. Ring otrzymuje osobny powierzchniowy target ziarna 2D, ponieważ
+późniejszy volume-only scope nie obejmował źródłowej płaszczyzny w dolnym airboxie.
+Zachowano wszystkie guardy CAD, exact magnetic layers, dodatnich komórek i PBC.
+
+Dowody końcowego zachowania: 2 owner-field consumers, 6 ring i 6 periodic
+przechodzą; 3 publiczne przypadki Box/DE przechodzą. Sześć syntetycznych guardów
+przechodziło dla niezmienionej fixture. Pełny wcześniejszy wynik 4 przypadków Box
+jest pre-seed evidence dla statycznie niezmienionej ścieżki Box. Świeży retest
+cap-below został przerwany kodem 130; nie raportujemy go jako świeżego PASS.
+Manifest wiąże logi, komendy, wersje i raw/LF SHA źródeł; dowody zachowano
+pod `storage/tmp/<worktree-id>/docker-all-gpu/scientific-evidence`.
+
+Noty i mapy 0102/0104 opisują implemented candidate. Density, managed runtime,
+solver i produkcyjna kwalifikacja FEM CPU/GPU pozostają NOT VERIFIED.
+AST, JSON, source-map validator i 41 kontraktów dokumentacji przeszły;
+nie kompilowano lokalnych testów Rust/C++.

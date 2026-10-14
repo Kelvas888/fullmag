@@ -2467,17 +2467,30 @@ def _generate_coincident_ring_airbox_mesh(
                 [(2, current_hole)] if current_hole is not None else []
             )
             # Keep every requested z interval as a separate CAD volume. The
-            # unscoped compatibility route still extrudes its premeshed source
-            # triangulation; scoped fields require geometry-only extrusion so
+            # unscoped compatibility route still extrudes its premeshed
+            # source triangulation. Scoped air slabs remain geometry-only so
             # the final conforming 3D mesh resolves magnetic-owner and air
-            # sizing independently instead of copying one cap mesh everywhere.
+            # sizing independently. Magnetic intervals use one recombined
+            # prism layer; the existing coordinate-based converter then gives
+            # periodic copies the same deterministic tetrahedral split.
             if scoped_layer_partitioning:
-                extruded = gmsh.model.geo.extrude(
-                    source_entities,
-                    0.0,
-                    0.0,
-                    step,
-                )
+                if body_bottom < 0.5 * (levels[level_index] + levels[level_index + 1]) < body_top:
+                    extruded = gmsh.model.geo.extrude(
+                        source_entities,
+                        0.0,
+                        0.0,
+                        step,
+                        numElements=[1],
+                        heights=[1.0],
+                        recombine=True,
+                    )
+                else:
+                    extruded = gmsh.model.geo.extrude(
+                        source_entities,
+                        0.0,
+                        0.0,
+                        step,
+                    )
             else:
                 extruded = gmsh.model.geo.extrude(
                     source_entities,
@@ -2611,6 +2624,15 @@ def _generate_coincident_ring_airbox_mesh(
                 airbox_shape="bbox",
                 air_volume_tags=air_volumes,
             )
+            if airbox_field is not None:
+                # Keep the graded air field active on the shared interface;
+                # the owner-volume Restrict field below provides the magnetic
+                # target without exporting its VOut into the air domain.
+                gmsh.model.mesh.field.setNumber(
+                    airbox_field,
+                    "IncludeBoundary",
+                    1 if h_inner_scaled <= body_hmax_scaled else 0,
+                )
 
         final_options = _dc_replace(
             options,
@@ -2637,7 +2659,46 @@ def _generate_coincident_ring_airbox_mesh(
             "VOut",
             max(body_hmax_scaled, h_outer_scaled),
         )
-        preexisting_fields = [*source_fields, int(body_upper_field)]
+        body_upper_restricted = gmsh.model.mesh.field.add("Restrict")
+        gmsh.model.mesh.field.setNumber(
+            body_upper_restricted, "InField", body_upper_field
+        )
+        gmsh.model.mesh.field.setNumbers(
+            body_upper_restricted, "VolumesList", body_volumes
+        )
+        gmsh.model.mesh.field.setNumber(
+            body_upper_restricted, "IncludeBoundary", 1
+        )
+        # The scoped route starts from a lower outer-air source face and
+        # extrudes that CAD face through the magnetic intervals.  A volume
+        # Restrict field constrains the 3-D owner scope, not the two-dimensional
+        # source face while it is meshed as the pre-3-D extrusion seed; the
+        # corresponding 3-D GEO owner volumes already exist at that point.
+        # Without an explicit source-surface target, a far-air cap can change
+        # the ring's source triangulation even when the resolved owner target is
+        # unchanged.  Pin both the annulus and complementary hole seed to the
+        # owner target.  The neutral VOut keeps this seed field from becoming
+        # an air-domain cap.
+        owner_source_seed = None
+        if scoped_layer_partitioning and hole_surface is not None:
+            owner_source_seed = gmsh.model.mesh.field.add("Constant")
+            owner_source_entities = [int(annulus_surface)]
+            if hole_surface is not None:
+                owner_source_entities.append(int(hole_surface))
+            gmsh.model.mesh.field.setNumbers(
+                owner_source_seed, "SurfacesList", owner_source_entities
+            )
+            gmsh.model.mesh.field.setNumber(
+                owner_source_seed, "VIn", body_hmax_scaled
+            )
+            gmsh.model.mesh.field.setNumber(
+                owner_source_seed, "VOut", 1.0e22
+            )
+            gmsh.model.mesh.field.setNumber(owner_source_seed, "IncludeBoundary", 1)
+
+        preexisting_fields = [*source_fields, int(body_upper_restricted)]
+        if owner_source_seed is not None:
+            preexisting_fields.append(int(owner_source_seed))
         if airbox_field is not None:
             preexisting_fields.append(int(airbox_field))
         _apply_mesh_options(

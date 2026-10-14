@@ -300,15 +300,15 @@
       "id": "ring-volume-source",
       "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
       "symbol": "_generate_coincident_ring_airbox_mesh",
-      "responsibility": "Creates exact-layer Box/ring CAD volumes; scoped fields are resolved by one conforming 3D mesh using owner-volume and air-volume fields rather than a copied source-face triangulation.",
-      "evidence_status": "implemented"
+      "responsibility": "Creates exact CAD volumes; magnetic intervals use one recombined extrusion layer and exterior-air intervals use geometry-only extrusion before scoped owner/air fields are meshed; the ring-only source seed pins the annulus and hole surfaces before that 3D meshing step.",
+      "evidence_status": "interpreted_gmsh_passed_runtime_not_verified"
     },
     {
       "id": "ring-volume-regression",
       "path": "packages/fullmag-py/tests/test_meshing.py",
       "symbol": "test_scoped_exact_ring_lower_bound_uses_layer_route_and_report",
       "responsibility": "Verifies exact body planes, positive tetrahedra, closed body boundary geometry, shared body-seam incidence, owner-floor provenance, body/air size separation in one region, and actual periodic node translations before the conditional chordal volume bound.",
-      "evidence_status": "implemented"
+      "evidence_status": "interpreted_gmsh_passed_runtime_not_verified"
     },
     {
       "id": "ring-prism-bound-regression",
@@ -318,11 +318,39 @@
       "evidence_status": "implemented"
     },
     {
-      "id": "scoped-layer-geometry-only",
+      "id": "scoped-layer-partitioned-extrusion",
       "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
       "symbol": "_generate_coincident_ring_airbox_mesh",
-      "responsibility": "Creates scoped exact CAD partitions with geometry-only extrusion, then applies owner-volume floors/upper targets and air-volume grading in one conforming 3D mesh; GHA qualification remains pending. CAD partitioning alone does not prove exact magnetic mesh planes; public Box/DE integration fixtures currently fail the unchanged layer-count guard. Constraint candidates must preserve all owner/air and topology gates.",
-      "evidence_status": "implemented"
+      "responsibility": "Creates scoped exact CAD partitions, applies one recombined magnetic layer and geometry-only exterior air, then composes owner-volume and air-volume fields in one 3D mesh; density and managed-runtime qualification remain open.",
+      "evidence_status": "interpreted_gmsh_passed_runtime_not_verified"
+    },
+    {
+      "id": "scoped-magnetic-extrusion",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
+      "symbol": "_generate_coincident_ring_airbox_mesh",
+      "responsibility": "Applies numElements=[1], heights=[1.0] and recombine=True to intervals whose midpoint is inside the magnetic owner; ring hole-air is grouped in those intervals.",
+      "evidence_status": "interpreted_gmsh_passed_runtime_not_verified"
+    },
+    {
+      "id": "scoped-exterior-air-extrusion",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
+      "symbol": "_generate_coincident_ring_airbox_mesh",
+      "responsibility": "Leaves intervals outside the magnetic owner geometry-only so air grading can add independent levels; ring hole-air in magnetic intervals remains grouped with the magnetic sweep.",
+      "evidence_status": "interpreted_gmsh_passed_runtime_not_verified"
+    },
+    {
+      "id": "owner-air-boundary-policy",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
+      "symbol": "_generate_coincident_ring_airbox_mesh",
+      "responsibility": "Selects air IncludeBoundary from h_inner <= body_hmax, restricts the owner upper field to body volumes, and pins ring annulus/hole source surfaces with a neutral-VOut owner seed.",
+      "evidence_status": "interpreted_gmsh_owner_field_consumers_passed_density_runtime_not_verified"
+    },
+    {
+      "id": "public-box-cad-air-guard",
+      "path": "scripts/test_box_layered_airbox_mesh.py",
+      "symbol": "_assert_public_box_planes",
+      "responsibility": "Requires CAD boundaries, exact magnetic L+1, nonempty intervals, no CAD-crossing tetrahedra, positive cells and incident exterior-air planes while allowing extra air levels.",
+      "evidence_status": "interpreted_gmsh_passed_runtime_not_verified"
     },
     {
       "id": "box-layer-size-resolution",
@@ -336,7 +364,7 @@
       "path": "packages/fullmag-py/tests/test_meshing.py",
       "symbol": "test_exact_layer_implicit_airbox_cap_coarsens_far_air",
       "responsibility": "Measures near- and far-air tetrahedral sizes on the exact-layer route when no outer target is authored, checking that geometric growth produces actual far-air coarsening.",
-      "evidence_status": "implemented"
+      "evidence_status": "interpreted_gmsh_passed_runtime_not_verified"
     },
     {
       "id": "effective-airbox-target-report",

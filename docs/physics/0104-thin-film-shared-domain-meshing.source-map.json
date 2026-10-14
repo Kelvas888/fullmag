@@ -184,8 +184,8 @@
       "id": "periodic-layer-owner",
       "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
       "symbol": "_generate_coincident_ring_airbox_mesh",
-      "responsibility": "Preserves exact layers and physical regions; classifies only the combined domain boundary as exterior.",
-      "evidence_status": "source_regression_passed_runtime_not_verified"
+      "responsibility": "Preserves exact magnetic owner layers and physical regions; classifies the combined-domain boundary as exterior, pins the pre-3D ring source surfaces to the owner target, and leaves exterior-air planes independently gradable.",
+      "evidence_status": "source_regression_passed_owner_field_consumers_passed_runtime_not_verified"
     },
     {
       "id": "periodic-layer-regression",
@@ -205,8 +205,29 @@
       "id": "scoped-layer-meshed-extrusion",
       "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
       "symbol": "_generate_coincident_ring_airbox_mesh",
-      "responsibility": "Uses fixed meshed extrusion that copies one source-face triangulation through exact z levels; current finite ROI density gate fails.",
-      "evidence_status": "source_mechanism_reviewed_actual_density_failed"
+      "responsibility": "Uses one recombined extrusion layer in magnetic intervals and geometry-only extrusion in exterior air; the finite ROI density gate remains unqualified after the candidate.",
+      "evidence_status": "interpreted_gmsh_passed_density_not_verified"
+    },
+    {
+      "id": "scoped-magnetic-extrusion",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
+      "symbol": "_generate_coincident_ring_airbox_mesh",
+      "responsibility": "Constrains magnetic intervals to one recombined GEO layer while preserving exact owner planes; a ring hole-air volume is grouped in those intervals.",
+      "evidence_status": "interpreted_gmsh_passed_runtime_not_verified"
+    },
+    {
+      "id": "scoped-exterior-air-extrusion",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
+      "symbol": "_generate_coincident_ring_airbox_mesh",
+      "responsibility": "Leaves exterior-air intervals outside the magnetic thickness geometry-only for independent air grading; grouped ring hole-air remains constrained in magnetic intervals.",
+      "evidence_status": "interpreted_gmsh_passed_runtime_not_verified"
+    },
+    {
+      "id": "scoped-air-boundary-policy",
+      "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
+      "symbol": "_generate_coincident_ring_airbox_mesh",
+      "responsibility": "Uses the h_inner/body_hmax boundary rule, owner-volume Restrict field, and ring-only owner source-surface seed to separate magnetic and air targets.",
+      "evidence_status": "interpreted_gmsh_owner_field_consumers_passed_density_not_verified"
     },
     {
       "id": "scoped-layer-density-regression",
