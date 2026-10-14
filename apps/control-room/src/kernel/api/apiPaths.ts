@@ -1170,3 +1170,4 @@ export function workspaceItemThumbnailUrl(baseUrl: string, id: string): string {
 }
 export const PLATFORM_COMPUTE_PROFILES_PATH = openApiV2Path("/v2/platform/compute/profiles");
 export const PLATFORM_COMPUTE_PREVIEW_PATH = openApiV2Path("/v2/platform/compute/preview");
+export const PLATFORM_COMPUTE_NODES_PATH = openApiV2Path("/v2/platform/compute/nodes");

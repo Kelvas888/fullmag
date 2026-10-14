@@ -209,6 +209,7 @@ import {
   PLATFORM_OUTPUT_STORAGE_PATH,
   PLATFORM_COMPUTE_PROFILES_PATH,
   PLATFORM_COMPUTE_PREVIEW_PATH,
+  PLATFORM_COMPUTE_NODES_PATH,
   PLATFORM_HEALTH_PATH,
   PLATFORM_DEVELOPMENT_BACKEND_PATH,
   WORKSPACE_ITEMS_PATH,
@@ -270,6 +271,7 @@ import type { OutputStorageDefaultsResource, OutputStorageDefaultsRequest } from
 import type {
   ExecutionProfileCatalogQuery, ExecutionProfileCatalogResource,
   ComputePreviewRequest, ComputePreviewResource,
+  ComputeNodesResource,
   PublishExecutionProfileRequest, PublishExecutionProfileResource,
 } from "./apiTypes";
 import type {
@@ -1181,6 +1183,8 @@ export class ControlRoomApi {
   };
 
   readonly platform = {
+    computeNodes: (options?: RequestOptions) =>
+      this.requestJson<ComputeNodesResource>(PLATFORM_COMPUTE_NODES_PATH, options),
     computeExecutionPreview: (input: ComputePreviewRequest, options?: RequestOptions) =>
       this.postJson<ComputePreviewResource, ComputePreviewRequest>(PLATFORM_COMPUTE_PREVIEW_PATH, input, options),
     computeProfiles: (query: ExecutionProfileCatalogQuery = {}, options?: RequestOptions) =>

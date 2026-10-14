@@ -388,6 +388,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/platform/compute/nodes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["platform_get_platform_compute_nodes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v2/platform/compute/nodes/{node_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["platform_get_platform_compute_nodes_node_id"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/platform/compute/preview": {
         parameters: {
             query?: never;
@@ -5622,6 +5654,51 @@ export interface components {
         CompressionProfile: "speed" | "balanced" | "smallest";
         /** @enum {string} */
         ComputeAdmissionState: "not_evaluated";
+        /**
+         * @description Read-only host policy snapshot. Mutations require the separate operator
+         *     authorization contract and are intentionally not part of this resource.
+         */
+        ComputeNodePolicyResource: {
+            /** @description Versioned NodePolicy document, kept open for forward-compatible fields. */
+            policy: Record<string, never>;
+            status: components["schemas"]["ComputeNodePolicyStatusResource"];
+        };
+        ComputeNodePolicyStatusResource: {
+            /** Format: int32 */
+            active_workers: number;
+            blocking_reasons: string[];
+            draining: boolean;
+            over_budget: boolean;
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description One host inventory and the freshness of its latest observation. */
+        ComputeNodeResource: {
+            node_id: string;
+            node_policy?: null | components["schemas"]["ComputeNodePolicyResource"];
+            /**
+             * @description Durable snapshot payload. Its versioned shapes are defined by
+             *     `compute_node_snapshot.v1` and `compute_node_snapshot.v2` in the session model.
+             */
+            snapshot: Record<string, never>;
+            /** Format: int64 */
+            stale_after_seconds: number;
+            state: components["schemas"]["ComputeNodesState"];
+        };
+        /** @description Read-only compute-node inventory observed from the configured desktop host. */
+        ComputeNodesResource: {
+            /** @description This local provider returns at most its one configured desktop host. */
+            nodes: components["schemas"]["ComputeNodeResource"][];
+            schema_version: string;
+            /**
+             * Format: int64
+             * @description Maximum age, in seconds, before the last sample is considered stale.
+             */
+            stale_after_seconds: number;
+            state: components["schemas"]["ComputeNodesState"];
+        };
+        /** @enum {string} */
+        ComputeNodesState: "not_probed" | "current" | "stale" | "unavailable";
         ComputeParallelismSchema: {
             /** @enum {string} */
             kind: "single_process";
@@ -11009,15 +11086,28 @@ export interface components {
             canonical_unit: string;
             name: string;
         };
+        ProjectBatchCasePublishedRunResource: {
+            /** Format: int64 */
+            catalog_revision?: number | null;
+            catalog_state: components["schemas"]["ProjectRunCatalogState"];
+            /** @description Run identity confirmed by the durable child RunIntent. */
+            run_id: string;
+            tasks: components["schemas"]["ProjectBatchCaseTaskSummaryResource"][];
+        };
         /** @enum {string} */
-        ProjectBatchCaseState: "pending_expansion" | "pending_materialization";
+        ProjectBatchCaseState: "pending_expansion" | "pending_materialization" | "materialized";
         ProjectBatchCaseSummaryResource: {
             case_id: string;
             parameter_tuple: {
                 [key: string]: unknown;
             };
             planned_run_id: string;
+            published_run?: null | components["schemas"]["ProjectBatchCasePublishedRunResource"];
             state: components["schemas"]["ProjectBatchCaseState"];
+        };
+        ProjectBatchCaseTaskSummaryResource: {
+            lifecycle: components["schemas"]["ProjectRunTaskLifecycle"];
+            task_id: string;
         };
         ProjectBatchCasesQuery: {
             /** @description Last CaseId returned on the previous page. */
@@ -11092,12 +11182,17 @@ export interface components {
             batch_id: string;
             /** Format: int64 */
             case_count: number;
+            /** @description State of the committed expansion cursor, which can lag a durable child. */
             expansion_state: components["schemas"]["ProjectBatchExpansionState"];
             failure_policy: components["schemas"]["ProjectBatchFailurePolicy"];
             manifest_sha256: string;
             /** Format: int32 */
             max_parallel_cases?: number | null;
-            /** Format: int64 */
+            /**
+             * Format: int64
+             * @description Committed `next_case_index` watermark; a durable child may be visible in
+             *     Cases before this cursor advances after publication.
+             */
             published_case_count: number;
         };
         ProjectCreateRequest: {
@@ -15608,7 +15703,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Page of planned cases from the immutable expansion manifest */
+            /** @description Page of manifest cases with verified published child run and task catalog lifecycle */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -15633,6 +15728,13 @@ export interface operations {
             };
             /** @description Batch belongs to another project */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Durable manifest, child run, or task catalog is incomplete or inconsistent */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -16534,6 +16636,84 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["RuntimeCapabilityMatrix"];
                 };
+            };
+        };
+    };
+    platform_get_platform_compute_nodes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Latest read-only local compute-node snapshot and its freshness */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ComputeNodesResource"];
+                };
+            };
+            /** @description Compute-node snapshot is unchanged for the supplied ETag */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Configured host inventory could not be safely observed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    platform_get_platform_compute_nodes_node_id: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Stable compute-node identity */
+                node_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Latest read-only compute-node snapshot and its freshness */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ComputeNodeResource"];
+                };
+            };
+            /** @description Compute-node snapshot is unchanged for the supplied ETag */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The requested compute node is not currently observable */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Configured host inventory could not be safely observed */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

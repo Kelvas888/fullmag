@@ -4,6 +4,7 @@ pub mod commands;
 pub mod common;
 pub mod compute_profiles;
 pub mod compute_preview;
+pub mod compute_nodes;
 #[allow(dead_code)]
 pub mod decimal_u64;
 pub mod development_backend;

@@ -114,7 +114,10 @@ pub(crate) struct ProjectBatchSummaryResource {
     pub case_count: u64,
     pub max_parallel_cases: Option<u32>,
     pub failure_policy: ProjectBatchFailurePolicy,
+    /// Committed `next_case_index` watermark; a durable child may be visible in
+    /// Cases before this cursor advances after publication.
     pub published_case_count: u64,
+    /// State of the committed expansion cursor, which can lag a durable child.
     pub expansion_state: ProjectBatchExpansionState,
 }
 
@@ -160,8 +163,12 @@ pub(crate) struct ProjectBatchAxisSummaryResource {
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProjectBatchCaseState {
+    /// No durable child RunIntent is published for this case yet.
     PendingExpansion,
+    /// The child RunIntent is published, but its task catalog is not present.
     PendingMaterialization,
+    /// The child task catalog is durable; task lifecycle is reported below.
+    Materialized,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -170,6 +177,23 @@ pub(crate) struct ProjectBatchCaseSummaryResource {
     pub planned_run_id: String,
     pub parameter_tuple: BTreeMap<String, serde_json::Value>,
     pub state: ProjectBatchCaseState,
+    /// Present only when the durable child intent matches this batch case.
+    pub published_run: Option<ProjectBatchCasePublishedRunResource>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchCasePublishedRunResource {
+    /// Run identity confirmed by the durable child RunIntent.
+    pub run_id: String,
+    pub catalog_state: ProjectRunCatalogState,
+    pub catalog_revision: Option<u64>,
+    pub tasks: Vec<ProjectBatchCaseTaskSummaryResource>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct ProjectBatchCaseTaskSummaryResource {
+    pub task_id: String,
+    pub lifecycle: ProjectRunTaskLifecycle,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -301,17 +325,7 @@ pub(crate) enum ProjectRunObservationState {
 
 impl From<FmsTaskCatalogEntry> for ProjectRunTaskResource {
     fn from(task: FmsTaskCatalogEntry) -> Self {
-        let lifecycle = match task.lifecycle {
-            FmsTaskLifecycle::Accepted => ProjectRunTaskLifecycle::Accepted,
-            FmsTaskLifecycle::Queued => ProjectRunTaskLifecycle::Queued,
-            FmsTaskLifecycle::Preparing => ProjectRunTaskLifecycle::Preparing,
-            FmsTaskLifecycle::Running => ProjectRunTaskLifecycle::Running,
-            FmsTaskLifecycle::Stopping => ProjectRunTaskLifecycle::Stopping,
-            FmsTaskLifecycle::Succeeded => ProjectRunTaskLifecycle::Succeeded,
-            FmsTaskLifecycle::Failed => ProjectRunTaskLifecycle::Failed,
-            FmsTaskLifecycle::Cancelled => ProjectRunTaskLifecycle::Cancelled,
-            FmsTaskLifecycle::Interrupted => ProjectRunTaskLifecycle::Interrupted,
-        };
+        let lifecycle = ProjectRunTaskLifecycle::from(task.lifecycle);
         let readiness = match task.readiness {
             FmsTaskReadiness::Ready => ProjectRunTaskReadiness::Ready,
             FmsTaskReadiness::Blocked { reason } => ProjectRunTaskReadiness::Blocked { reason },
@@ -335,6 +349,22 @@ impl From<FmsTaskCatalogEntry> for ProjectRunTaskResource {
             resource_id: task.resource_id,
             accepted_state_ref: None,
             cancellation_intent: None,
+        }
+    }
+}
+
+impl From<FmsTaskLifecycle> for ProjectRunTaskLifecycle {
+    fn from(lifecycle: FmsTaskLifecycle) -> Self {
+        match lifecycle {
+            FmsTaskLifecycle::Accepted => ProjectRunTaskLifecycle::Accepted,
+            FmsTaskLifecycle::Queued => ProjectRunTaskLifecycle::Queued,
+            FmsTaskLifecycle::Preparing => ProjectRunTaskLifecycle::Preparing,
+            FmsTaskLifecycle::Running => ProjectRunTaskLifecycle::Running,
+            FmsTaskLifecycle::Stopping => ProjectRunTaskLifecycle::Stopping,
+            FmsTaskLifecycle::Succeeded => ProjectRunTaskLifecycle::Succeeded,
+            FmsTaskLifecycle::Failed => ProjectRunTaskLifecycle::Failed,
+            FmsTaskLifecycle::Cancelled => ProjectRunTaskLifecycle::Cancelled,
+            FmsTaskLifecycle::Interrupted => ProjectRunTaskLifecycle::Interrupted,
         }
     }
 }

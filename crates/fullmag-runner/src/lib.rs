@@ -551,7 +551,9 @@ use crate::quantities::{
     active_fdm_multilayer_preview_quantities, active_fdm_preview_quantities,
     active_fem_preview_quantities,
 };
-use fullmag_ir::{BackendPlanIR, FdmMultilayerPlanIR, FdmPlanIR, FemPlanIR, OutputIR, ProblemIR};
+use fullmag_ir::{
+    BackendPlanIR, ExecutionPlanIR, FdmMultilayerPlanIR, FdmPlanIR, FemPlanIR, OutputIR, ProblemIR,
+};
 use interactive::InteractiveBackend;
 use serde_json::Value;
 
@@ -2659,7 +2661,7 @@ fn run_planned_problem_with_artifact_context(
     let artifact_writer = Some(artifact_pipeline.sender());
     let runtime_outputs = runtime_outputs_with_table_autosave(problem, plan);
 
-    let cpu_threads = configured_cpu_threads(problem);
+    let cpu_threads = configured_control_pool_threads(problem, plan);
     let executed_result = with_cpu_parallelism(cpu_threads, || match &plan.backend_plan {
         BackendPlanIR::Fdm(fdm) => {
             let resolution = dispatch::resolve_fdm_engine_for_plan_with_trail(problem, fdm)?;
@@ -3098,7 +3100,7 @@ fn run_planned_problem_with_callback_artifact_context(
     let artifact_writer = Some(artifact_pipeline.sender());
     let runtime_outputs = runtime_outputs_with_table_autosave(problem, plan);
 
-    let cpu_threads = configured_cpu_threads(problem);
+    let cpu_threads = configured_control_pool_threads(problem, plan);
     let executed_result = with_cpu_parallelism(cpu_threads, || match &plan.backend_plan {
         BackendPlanIR::Fdm(fdm) => {
             let grid = fdm.grid.cells;
@@ -3634,7 +3636,7 @@ fn run_planned_problem_with_live_preview_artifact_context(
     let artifact_writer = Some(artifact_pipeline.sender());
     let runtime_outputs = runtime_outputs_with_table_autosave(problem, plan);
 
-    let cpu_threads = configured_cpu_threads(problem);
+    let cpu_threads = configured_control_pool_threads(problem, plan);
     let live_display_selection = (field_every_n != u64::MAX).then_some(display_selection);
     let mut terminal_fdm_fields = None;
     let executed_result = with_cpu_parallelism(cpu_threads, || match &plan.backend_plan {
@@ -5175,9 +5177,63 @@ pub(crate) fn requested_cpu_threads(problem: &ProblemIR) -> Option<u32> {
 }
 
 pub(crate) fn configured_cpu_threads(problem: &ProblemIR) -> usize {
+    configured_cpu_threads_with_auto_resolution(problem, external_auto_resolved_cpu_threads())
+}
+
+fn configured_control_pool_threads(problem: &ProblemIR, plan: &ExecutionPlanIR) -> usize {
+    let native_fem_lane = matches!(
+        &plan.backend_plan,
+        BackendPlanIR::Fem(_)
+            | BackendPlanIR::FemEigen(_)
+            | BackendPlanIR::FemFrequencyResponse(_)
+    );
+    let configured_threads = configured_cpu_threads(problem);
+    let native_threads = native_fem_lane
+        .then(|| configured_native_fem_threads(problem, configured_threads));
+    effective_control_pool_threads(configured_threads, native_threads)
+}
+
+fn configured_native_fem_threads(problem: &ProblemIR, fallback: usize) -> usize {
+    let requested = fullmag_ir::ComputeResourcesIR::from_problem(problem)
+        .ok()
+        .flatten()
+        .and_then(|resources| resources.cpu.native_threads.count())
+        .map(|threads| threads as usize);
+    requested
+        .or_else(|| positive_environment_thread_count("FULLMAG_NATIVE_THREADS_AUTO_RESOLVED"))
+        .or_else(|| positive_environment_thread_count("OMP_NUM_THREADS"))
+        .or_else(|| positive_environment_thread_count("FULLMAG_CPU_THREADS"))
+        .unwrap_or_else(|| fallback.max(1))
+}
+
+fn positive_environment_thread_count(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+}
+
+fn effective_control_pool_threads(
+    configured_threads: usize,
+    native_threads: Option<usize>,
+) -> usize {
+    // Native FEM shares its CPU allocation with OpenMP. A multi-thread OpenMP
+    // team owns the lane; a single-thread native path can leave Rayon capacity
+    // available for host-side work without multiplying active pools.
+    if native_threads.is_some_and(|threads| threads > 1) {
+        1
+    } else {
+        configured_threads.max(1)
+    }
+}
+
+fn configured_cpu_threads_with_auto_resolution(
+    problem: &ProblemIR,
+    external_auto_resolved: Option<usize>,
+) -> usize {
     if let Ok(Some(resources)) = fullmag_ir::ComputeResourcesIR::from_problem(problem) {
         return resources.cpu.threads.count().map_or_else(
-            || resolve_auto_cpu_threads(default_cpu_threads(), None),
+            || resolve_auto_cpu_threads(default_cpu_threads(), external_auto_resolved),
             |threads| threads as usize,
         );
     }
@@ -5214,17 +5270,20 @@ fn env_cpu_threads() -> Option<usize> {
         .as_deref()
         .is_some_and(|value| value.eq_ignore_ascii_case("auto"))
     {
-        let external_resolved = std::env::var("FULLMAG_CPU_THREADS_AUTO_RESOLVED")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&threads| threads >= 1);
         return Some(resolve_auto_cpu_threads(
             default_cpu_threads(),
-            external_resolved,
+            external_auto_resolved_cpu_threads(),
         ));
     }
     fullmag_value
         .or_else(|| std::env::var("RAYON_NUM_THREADS").ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&threads| threads >= 1)
+}
+
+fn external_auto_resolved_cpu_threads() -> Option<usize> {
+    std::env::var("FULLMAG_CPU_THREADS_AUTO_RESOLVED")
+        .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&threads| threads >= 1)
 }
@@ -8539,8 +8598,40 @@ mod tests {
         );
         assert_eq!(requested_cpu_threads(&problem), None);
         assert_eq!(
-            configured_cpu_threads(&problem),
+            configured_cpu_threads_with_auto_resolution(&problem, None),
             resolve_auto_cpu_threads(default_cpu_threads(), None)
+        );
+    }
+
+    #[test]
+    fn native_fem_uses_one_rayon_control_thread_beside_multi_thread_openmp() {
+        assert_eq!(effective_control_pool_threads(4, Some(4)), 1);
+        assert_eq!(effective_control_pool_threads(4, Some(1)), 4);
+        assert_eq!(effective_control_pool_threads(4, None), 4);
+    }
+
+    #[test]
+    fn typed_auto_cpu_request_uses_external_resolution_without_erasing_auto() {
+        let mut problem = fullmag_ir::ProblemIR::bootstrap_example();
+        problem.problem_meta.runtime_metadata.insert(
+            "compute_resources".into(),
+            json!({"schema_version":"compute_resources.v1", "cpu":{"threads":"auto"}}),
+        );
+
+        assert_eq!(requested_cpu_threads(&problem), None);
+        assert_eq!(
+            configured_cpu_threads_with_auto_resolution(&problem, Some(7)),
+            resolve_auto_cpu_threads(default_cpu_threads(), Some(7))
+        );
+
+        problem.problem_meta.runtime_metadata.insert(
+            "compute_resources".into(),
+            json!({"schema_version":"compute_resources.v1", "cpu":{"threads":3}}),
+        );
+        assert_eq!(
+            configured_cpu_threads_with_auto_resolution(&problem, Some(7)),
+            3,
+            "an explicit profile count must keep precedence over an auto resolution"
         );
     }
 

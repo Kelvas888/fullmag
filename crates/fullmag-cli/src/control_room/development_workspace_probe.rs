@@ -305,7 +305,10 @@ pub(super) fn verify() -> Result<()> {
                 },
             );
             collect_completed_readiness_helpers(&pump, &mut completed_readiness_helpers);
-            if pump_step.is_err() {
+            if let Err(error) = pump_step {
+                // Contexts identify the failed boundary; never dump the
+                // private owner request or transport credential payload.
+                eprintln!("[development browser proof] restart pump failed: {error:#}");
                 failure = Some(ProbeOutcome::Unknown("restart_pump_outcome_unconfirmed"));
                 break;
             }
@@ -1198,28 +1201,22 @@ fn cleanup_owned_scope(guard: &mut ControlRoomGuard, expected: &[(&str, u32)]) -
 }
 
 fn drain_pump_cancellation(
-    repo_root: &Path,
-    guard: &mut ControlRoomGuard,
+    _repo_root: &Path,
+    _guard: &mut ControlRoomGuard,
     pump: &mut NativeRestartPump,
-    runtime_attach: &mut Option<
+    _runtime_attach: &mut Option<
         fullmag_runtime_control::application_attach::BackgroundApplicationAttach,
     >,
-    scratch: &mut Option<crate::scratch_runtime::ScratchRuntimeHandle>,
+    _scratch: &mut Option<crate::scratch_runtime::ScratchRuntimeHandle>,
 ) -> bool {
     let deadline = Instant::now() + HELPER_CLEANUP_TIMEOUT;
     loop {
-        match pump.candidate_preparation_state_for_probe() {
-            Ok(None) => return true,
-            Ok(Some(_)) => {}
+        match pump.drain_candidate_preparation_for_probe() {
+            Ok(true) => return true,
+            Ok(false) => {}
             Err(_) => return false,
         }
         if Instant::now() >= deadline {
-            return false;
-        }
-        if pump
-            .step_observed(repo_root, guard, runtime_attach, scratch, |_| {})
-            .is_err()
-        {
             return false;
         }
         thread::sleep(Duration::from_millis(10));

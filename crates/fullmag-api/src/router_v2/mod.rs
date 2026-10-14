@@ -31,6 +31,14 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
                 .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route(
+            "/v2/platform/compute/nodes",
+            get(handlers::platform::compute_nodes::get_compute_nodes),
+        )
+        .route(
+            "/v2/platform/compute/nodes/:node_id",
+            get(handlers::platform::compute_nodes::get_compute_node),
+        )
+        .route(
             "/v2/platform/compute/profiles",
             get(handlers::platform::compute_profiles::get_compute_profiles)
                 .post(handlers::platform::compute_profiles::post_compute_profile)

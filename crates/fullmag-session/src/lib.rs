@@ -20,6 +20,7 @@ mod archive_source;
 pub mod capture;
 pub mod cas;
 pub mod communication_policy;
+pub mod compute_node_policy;
 pub mod compute_node_snapshot;
 pub mod dataset_slice_adapter;
 mod durability;

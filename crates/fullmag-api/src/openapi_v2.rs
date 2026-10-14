@@ -9,6 +9,8 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::platform::compute_profiles::get_compute_profiles,
         crate::router_v2::handlers::platform::compute_profiles::post_compute_profile,
         crate::router_v2::handlers::platform::compute_preview::post_compute_preview,
+        crate::router_v2::handlers::platform::compute_nodes::get_compute_nodes,
+        crate::router_v2::handlers::platform::compute_nodes::get_compute_node,
         crate::router_v2::handlers::platform::realtime::get_asyncapi_document,
         crate::router_v2::handlers::platform::realtime::get_asyncapi_docs,
         crate::router_v2::handlers::platform::realtime::get_communication_policy,

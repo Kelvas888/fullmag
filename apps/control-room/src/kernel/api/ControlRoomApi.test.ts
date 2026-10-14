@@ -3427,7 +3427,7 @@ describe("ControlRoomApi", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 
-  it("loads typed platform health and capabilities through generated v2 paths", async () => {
+  it("loads typed platform health, capabilities, and compute nodes through generated v2 paths", async () => {
     const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {
       const path = new URL(String(url)).pathname;
       if (path === "/v2/platform/health") {
@@ -3436,6 +3436,14 @@ describe("ControlRoomApi", () => {
           api_contract_version: "1.0.0",
           status: "ok",
           uptime_seconds: 12,
+        });
+      }
+      if (path === "/v2/platform/compute/nodes") {
+        return jsonResponse({
+          nodes: [],
+          schema_version: "compute_nodes.v1",
+          stale_after_seconds: 30,
+          state: "not_probed",
         });
       }
       return jsonResponse({ engines: [], profile_version: "runtime-capabilities.v1" });
@@ -3449,9 +3457,14 @@ describe("ControlRoomApi", () => {
     await expect(api.platform.capabilities()).resolves.toMatchObject({
       profile_version: "runtime-capabilities.v1",
     });
+    await expect(api.platform.computeNodes()).resolves.toMatchObject({
+      state: "not_probed",
+      stale_after_seconds: 30,
+    });
     expect(fetchImpl.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
       "/v2/platform/health",
       "/v2/platform/capabilities",
+      "/v2/platform/compute/nodes",
     ]);
   });
 

@@ -4207,6 +4207,135 @@
         ],
         "type": "string"
       },
+      "ComputeNodePolicyResource": {
+        "description": "Read-only host policy snapshot. Mutations require the separate operator\nauthorization contract and are intentionally not part of this resource.",
+        "properties": {
+          "policy": {
+            "description": "Versioned NodePolicy document, kept open for forward-compatible fields.",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ComputeNodePolicyStatusResource"
+          }
+        },
+        "required": [
+          "policy",
+          "status"
+        ],
+        "type": "object"
+      },
+      "ComputeNodePolicyStatusResource": {
+        "properties": {
+          "active_workers": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "blocking_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "draining": {
+            "type": "boolean"
+          },
+          "over_budget": {
+            "type": "boolean"
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "active_workers",
+          "draining",
+          "over_budget",
+          "blocking_reasons"
+        ],
+        "type": "object"
+      },
+      "ComputeNodeResource": {
+        "description": "One host inventory and the freshness of its latest observation.",
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "node_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComputeNodePolicyResource",
+                "description": "Current operator-controlled admission policy and its live ledger status."
+              }
+            ]
+          },
+          "snapshot": {
+            "description": "Durable snapshot payload. Its versioned shapes are defined by\n`compute_node_snapshot.v1` and `compute_node_snapshot.v2` in the session model.",
+            "type": "object"
+          },
+          "stale_after_seconds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ComputeNodesState"
+          }
+        },
+        "required": [
+          "node_id",
+          "state",
+          "stale_after_seconds",
+          "snapshot"
+        ],
+        "type": "object"
+      },
+      "ComputeNodesResource": {
+        "description": "Read-only compute-node inventory observed from the configured desktop host.",
+        "properties": {
+          "nodes": {
+            "description": "This local provider returns at most its one configured desktop host.",
+            "items": {
+              "$ref": "#/components/schemas/ComputeNodeResource"
+            },
+            "type": "array"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "stale_after_seconds": {
+            "description": "Maximum age, in seconds, before the last sample is considered stale.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ComputeNodesState"
+          }
+        },
+        "required": [
+          "schema_version",
+          "state",
+          "stale_after_seconds",
+          "nodes"
+        ],
+        "type": "object"
+      },
+      "ComputeNodesState": {
+        "enum": [
+          "not_probed",
+          "current",
+          "stale",
+          "unavailable"
+        ],
+        "type": "string"
+      },
       "ComputeParallelismSchema": {
         "oneOf": [
           {
@@ -25716,10 +25845,42 @@
         ],
         "type": "object"
       },
+      "ProjectBatchCasePublishedRunResource": {
+        "properties": {
+          "catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "catalog_state": {
+            "$ref": "#/components/schemas/ProjectRunCatalogState"
+          },
+          "run_id": {
+            "description": "Run identity confirmed by the durable child RunIntent.",
+            "type": "string"
+          },
+          "tasks": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectBatchCaseTaskSummaryResource"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "run_id",
+          "catalog_state",
+          "tasks"
+        ],
+        "type": "object"
+      },
       "ProjectBatchCaseState": {
         "enum": [
           "pending_expansion",
-          "pending_materialization"
+          "pending_materialization",
+          "materialized"
         ],
         "type": "string"
       },
@@ -25738,6 +25899,17 @@
           "planned_run_id": {
             "type": "string"
           },
+          "published_run": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectBatchCasePublishedRunResource",
+                "description": "Present only when the durable child intent matches this batch case."
+              }
+            ]
+          },
           "state": {
             "$ref": "#/components/schemas/ProjectBatchCaseState"
           }
@@ -25747,6 +25919,21 @@
           "planned_run_id",
           "parameter_tuple",
           "state"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchCaseTaskSummaryResource": {
+        "properties": {
+          "lifecycle": {
+            "$ref": "#/components/schemas/ProjectRunTaskLifecycle"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "lifecycle"
         ],
         "type": "object"
       },
@@ -25961,7 +26148,8 @@
             "type": "integer"
           },
           "expansion_state": {
-            "$ref": "#/components/schemas/ProjectBatchExpansionState"
+            "$ref": "#/components/schemas/ProjectBatchExpansionState",
+            "description": "State of the committed expansion cursor, which can lag a durable child."
           },
           "failure_policy": {
             "$ref": "#/components/schemas/ProjectBatchFailurePolicy"
@@ -25978,6 +26166,7 @@
             ]
           },
           "published_case_count": {
+            "description": "Committed `next_case_index` watermark; a durable child may be visible in\nCases before this cursor advances after publication.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -42829,7 +43018,7 @@
                 }
               }
             },
-            "description": "Page of planned cases from the immutable expansion manifest"
+            "description": "Page of manifest cases with verified published child run and task catalog lifecycle"
           },
           "400": {
             "description": "Invalid page size or cursor"
@@ -42839,6 +43028,9 @@
           },
           "409": {
             "description": "Batch belongs to another project"
+          },
+          "500": {
+            "description": "Durable manifest, child run, or task catalog is incomplete or inconsistent"
           }
         },
         "tags": [
@@ -44143,6 +44335,72 @@
               }
             },
             "description": "Runtime capabilities"
+          }
+        },
+        "tags": [
+          "platform"
+        ]
+      }
+    },
+    "/v2/platform/compute/nodes": {
+      "get": {
+        "operationId": "platform_get_platform_compute_nodes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComputeNodesResource"
+                }
+              }
+            },
+            "description": "Latest read-only local compute-node snapshot and its freshness"
+          },
+          "304": {
+            "description": "Compute-node snapshot is unchanged for the supplied ETag"
+          },
+          "503": {
+            "description": "Configured host inventory could not be safely observed"
+          }
+        },
+        "tags": [
+          "platform"
+        ]
+      }
+    },
+    "/v2/platform/compute/nodes/{node_id}": {
+      "get": {
+        "operationId": "platform_get_platform_compute_nodes_node_id",
+        "parameters": [
+          {
+            "description": "Stable compute-node identity",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComputeNodeResource"
+                }
+              }
+            },
+            "description": "Latest read-only compute-node snapshot and its freshness"
+          },
+          "304": {
+            "description": "Compute-node snapshot is unchanged for the supplied ETag"
+          },
+          "404": {
+            "description": "The requested compute node is not currently observable"
+          },
+          "503": {
+            "description": "Configured host inventory could not be safely observed"
           }
         },
         "tags": [
