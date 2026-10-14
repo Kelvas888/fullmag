@@ -1310,7 +1310,7 @@ def start_frontend(repo, native, fixture, manifest, bridge_url, api_port, receip
     next_cli = dependencies / "next/dist/bin/next"
     if not node or not next_cli.is_file():
         raise storage.StorageError("Browser proof needs existing verified Node/Next dependencies")
-    for required in ("typescript/bin/tsc", "@types/node/index.d.ts", "@types/react/index.d.ts"):
+    for required in ("typescript-native/bin/tsc", "@types/node/index.d.ts", "@types/react/index.d.ts"):
         if not (dependencies / required).is_file():
             raise storage.StorageError(f"Frozen frontend dependencies are incomplete: {required}; no automatic install")
     page, diagnostic = stage_diagnostic_page(repo, app, fixture)
@@ -1379,7 +1379,7 @@ def check_frontend_sources(fixture, receipt):
         time.sleep(0.1)
     node = shutil.which("node")
     commands = [
-        ("typecheck", [node, str(dependencies / "typescript/bin/tsc"), "--noEmit", "--project", str(config)]),
+        ("typecheck", [node, str(dependencies / "typescript-native/bin/tsc"), "--noEmit", "--project", str(config)]),
         ("lint", [node, str(dependencies / "eslint/bin/eslint.js"), "--no-cache", staged["test_route"]]),
     ]
     checks = receipt.setdefault("workspace_browser_source_checks", [])

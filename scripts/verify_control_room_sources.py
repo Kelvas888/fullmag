@@ -232,7 +232,7 @@ def run(repo: Path, route: str, dependency_workspace: Path | None = None):
                 config = run_root / "tsconfig.production.json"
                 exclude = ["node_modules", "out", ".next/dev", "**/*.test.ts", "**/*.test.tsx", "**/*.spec.ts", "**/*.spec.tsx", "**/__tests__/**"]
                 config.write_text(json.dumps({"extends": str(app / "tsconfig.typecheck.json"), "compilerOptions": {"noEmit": True, "incremental": False}, "exclude": [(app / pattern).as_posix() for pattern in exclude]}, indent=2), encoding="utf-8")
-                commands = [cli("typescript", "bin/tsc") + ["--noEmit", "--project", str(config)]]
+                commands = [cli("typescript-native", "bin/tsc") + ["--noEmit", "--project", str(config)]]
                 receipt["test_exclusions"] = exclude
             receipt["steps"] = []
             return_code = 0
