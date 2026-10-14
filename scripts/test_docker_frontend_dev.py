@@ -110,7 +110,6 @@ def isolated(module):
             "DEVELOPMENT_ROOT": root,
             "WORKSPACE_ROOT": workspace,
             "FRONTEND_ROOT": root / "cache",
-            "NODE_MODULES_ROOT": root / "node_modules",
             "PNPM_STORE_ROOT": root / "pnpm-store",
             "PNPM_HOME": root / "pnpm-home",
             "COREPACK_HOME": root / "corepack",
@@ -235,17 +234,99 @@ class FrontendDevContractTests(TestCase):
             self.module._prepare_state_directories()
             target = self.module._prepare_managed_frontend(inputs)
             app = workspace / "apps" / "control-room"
-            self.assertEqual(target, self.module.NODE_MODULES_ROOT / "control-room")
+            self.assertEqual(target, workspace / "node_modules")
             self.assertEqual((app / ".fullmag-frontend").resolve(), self.module.FRONTEND_ROOT.resolve())
             self.assertEqual(
                 (app / ".next-control-room-8080").resolve(),
                 (self.module.FRONTEND_ROOT / "next" / "dev-8080").resolve(),
             )
-            self.assertEqual((app / "node_modules").resolve(), target.resolve())
-            self.assertEqual(
-                (workspace / "node_modules").resolve(),
-                (self.module.NODE_MODULES_ROOT / "workspace").resolve(),
+            self.assertEqual((workspace / "node_modules").resolve(), target.resolve())
+            self.assertTrue((workspace / "node_modules").is_dir())
+            self.assertFalse((workspace / "node_modules").is_symlink())
+            self.assertTrue((app / "node_modules").is_dir())
+            self.assertFalse((app / "node_modules").is_symlink())
+            self.assertFalse((root / "node_modules").exists())
+
+    @skipIf(os.name == "nt", "symlink support is a Linux container filesystem contract")
+    def test_old_external_node_modules_alias_is_rejected(self):
+        with isolated(self.module) as (root, workspace, inputs):
+            self.module._prepare_state_directories()
+            legacy_target = root / "legacy-node-modules"
+            legacy_target.mkdir()
+            (workspace / "node_modules").symlink_to(legacy_target, target_is_directory=True)
+            with self.assertRaises(self.module.FrontendDevError):
+                self.module._prepare_managed_frontend(inputs)
+
+    @skipIf(os.name == "nt", "symlink support is a Linux container filesystem contract")
+    def test_next_binary_may_resolve_through_workspace_virtual_store(self):
+        with isolated(self.module) as (root, workspace, inputs):
+            self.module._prepare_state_directories()
+            self.module._prepare_managed_frontend(inputs)
+            virtual_next = (
+                workspace
+                / "node_modules"
+                / ".pnpm"
+                / "next@16.3.8"
+                / "node_modules"
+                / "next"
             )
+            binary = virtual_next / "dist" / "bin" / "next"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            app_next = workspace / "apps" / "control-room" / "node_modules" / "next"
+            app_next.symlink_to(virtual_next, target_is_directory=True)
+            self.assertEqual(
+                self.module._next_binary(inputs),
+                app_next / "dist" / "bin" / "next",
+            )
+
+    @skipIf(os.name == "nt", "symlink support is a Linux container filesystem contract")
+    def test_check_rejects_managed_target_tamper_without_repair(self):
+        with isolated(self.module) as (root, workspace, inputs):
+            self.module._prepare_state_directories()
+            self.module._prepare_managed_frontend(inputs)
+            self.module._freeze_inputs(inputs, allow_generated=False)
+            process = _RunningProcess()
+            identity = {
+                "pid": process.pid,
+                "pid_namespace": "pid:[4026531836]",
+                "process_start_time_ticks": 18,
+                "session_id": process.pid,
+                "process_group_id": process.pid,
+            }
+            handle = self.module.FrontendHandle(
+                process=process,
+                inputs=inputs,
+                stopping_event=object(),
+                kind="next",
+                pid=process.pid,
+                owner_token="owner-token",
+                log_path=self.module.LOG_PATH,
+                process_group_id=process.pid,
+                process_identity=identity,
+            )
+            self.module._atomic_json(
+                self.module.RECEIPT_PATH,
+                {
+                    "schema": self.module.RECEIPT_SCHEMA,
+                    "state": "running",
+                    "pid": process.pid,
+                    "owner_token": handle.owner_token,
+                    **{field: identity[field] for field in self.module.PROCESS_IDENTITY_FIELDS},
+                },
+                "receipt",
+            )
+            tampered_target = root / "tampered-cache"
+            tampered_target.mkdir()
+            alias = workspace / "apps" / "control-room" / self.module.NEXT_DIST_DIR
+            alias.unlink()
+            alias.symlink_to(tampered_target, target_is_directory=True)
+            with self.assertRaises(self.module.FrontendDevError):
+                self.module.check(handle)
+            self.assertEqual(alias.resolve(), tampered_target.resolve())
+            saved = json.loads(self.module.RECEIPT_PATH.read_text(encoding="utf-8"))
+            self.assertEqual(saved["state"], "failed")
+            self.assertEqual(saved["failure_evidence"]["kind"], "frontend-input-change")
 
     @skipIf(os.name == "nt", "directory fsync is a Linux container filesystem contract")
     def test_stop_preserves_failure_and_does_not_force_kill(self):

@@ -138,3 +138,27 @@ f6b904d308307df4b63ee60c577313067cd19836. Canonical openapi-typescript 7.13.0
 wygenerował typy; ponowna generacja była identyczna, strict noEmit realistycznej
 fixture snapshot/policy przeszedł. Local Vitest został odrzucony przez automatic
 approval review: wyjątek dotyczy tylko CI zadania. Nie wykonano obejścia.
+
+
+## Korekta instalacji frontendu Docker
+
+Próba `290c6c55e2284d0699a8829895e747ca` potwierdziła Node 24.18.0 i pnpm
+10.8.1, lecz instalacja zakończyła się `ENOTDIR` dla symlinkowanego
+`workspace/node_modules`. Next i HMR nie wystartowały. Poprzedni stan, logi
+i cache pozostają zachowane; nowa próba użyje świeżego workspace.
+
+Frontend przekazuje pnpm rzeczywiste katalogi importerów pod
+`state/development/workspace`. Niemutujący polling sprawdza te katalogi
+oraz dokładne cele aliasów cache; zmiana kończy nadzór przez istniejącą
+ścieżkę błędu, bez naprawiania mountów, takeover ani wymuszonego kill.
+15 interpretowanych kontroli Linux przeszło; Windows: 5 PASS i 10 pominiętych
+kontroli specyficznych dla Linux. AST i niezależny review przeszły.
+Cold/warm Docker oraz HMR pozostają NOT VERIFIED do nowej próby.
+
+Runner potwierdził po zwolnieniu miejsca około 31,7 GB wolnego storage.
+Preview `plan-3b71bc43f0c344a18a41e40eed65ad1c` dla dwóch zakończonych jobów
+zadania ma 0 kandydatów; danych nie usunięto. W istniejącej kolejce obserwujemy
+job `e8a13bc0d2914851a27667fa0a575989`, profil `fem-gpu-release`, source
+`b5814b313a2d8a500d2e24576f16cbfc48934955`. To wersja sprzed korekty pnpm;
+jej build nie będzie dowodem kompletnego końcowego obrazu. Nie uruchomiono
+równoległego ciężkiego buildu ani nie zatrzymano obserwowanego joba.

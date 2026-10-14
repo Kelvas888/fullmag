@@ -61,7 +61,6 @@ INPUTS_PATH = Path("/run/fullmag/development-inputs.json")
 DEVELOPMENT_ROOT = Path("/state/development")
 WORKSPACE_ROOT = DEVELOPMENT_ROOT / "workspace"
 FRONTEND_ROOT = DEVELOPMENT_ROOT / "cache"
-NODE_MODULES_ROOT = DEVELOPMENT_ROOT / "node_modules"
 PNPM_STORE_ROOT = DEVELOPMENT_ROOT / "pnpm-store"
 PNPM_HOME = DEVELOPMENT_ROOT / "pnpm-home"
 COREPACK_HOME = DEVELOPMENT_ROOT / "corepack"
@@ -700,7 +699,6 @@ def _prepare_state_directories() -> None:
     for path, name in (
         (DEVELOPMENT_ROOT, "development root"),
         (FRONTEND_ROOT, "frontend cache root"),
-        (NODE_MODULES_ROOT, "Linux node_modules root"),
         (PNPM_STORE_ROOT, "pnpm store"),
         (PNPM_HOME, "pnpm home"),
         (COREPACK_HOME, "Corepack home"),
@@ -739,21 +737,88 @@ def _ensure_managed_link(link: Path, target: Path, name: str) -> None:
         _fail(f"managed frontend link mismatch: {link} -> {resolved_link}; expected {resolved_target}")
 
 
-def _ensure_node_modules_alias(inputs: DevelopmentInputs) -> Path:
-    workspace_target = NODE_MODULES_ROOT / "workspace"
-    _ensure_directory(workspace_target, "workspace Linux node_modules")
-    _ensure_managed_link(
-        inputs.workspace_root / "node_modules",
-        workspace_target,
-        "workspace node_modules",
-    )
+def _ensure_node_modules_layout(inputs: DevelopmentInputs) -> Path:
+    """Keep pnpm's dependency trees as real directories in the RW workspace.
+
+    PNPM manages two importer roots below the writable workspace.  A symlinked
+    importer root makes PNPM resolve virtual-store writes through a non-
+    directory path and fail with ``ENOTDIR``; both roots therefore remain real
+    directories owned by PNPM.
+    """
+
+    workspace_node_modules = inputs.workspace_root / "node_modules"
+    _ensure_directory(workspace_node_modules, "workspace node_modules")
     app_root = inputs.workspace_root / "apps" / "control-room"
     _assert_no_links(app_root, "Control Room app root")
-    target = NODE_MODULES_ROOT / "control-room"
-    _ensure_directory(target, "Control Room Linux node_modules")
-    alias = app_root / "node_modules"
-    _ensure_managed_link(alias, target, "Control Room node_modules")
-    return target
+    _ensure_directory(app_root / "node_modules", "Control Room node_modules")
+    return workspace_node_modules
+
+
+def _require_real_directory(path: Path, name: str) -> None:
+    """Check a state directory without creating or repairing it."""
+
+    _path_without_parent(path, name)
+    _assert_no_links(path, name)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise FrontendDevError(f"{name} is missing: {path}") from error
+    except OSError as error:
+        raise FrontendDevError(f"cannot inspect {name}: {error}") from error
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        _fail(f"{name} is not a real directory: {path}")
+    if bool(getattr(metadata, "st_file_attributes", 0) & 0x400):
+        _fail(f"{name} is a reparse point: {path}")
+
+
+def _validate_managed_link(link: Path, target: Path, name: str) -> None:
+    """Validate one managed alias without creating, replacing, or pruning it."""
+
+    _path_without_parent(link, name)
+    _assert_no_links(link.parent, f"{name} parent")
+    _assert_no_links(target, f"{name} target")
+    try:
+        metadata = link.lstat()
+    except FileNotFoundError as error:
+        raise FrontendDevError(f"managed frontend link is missing: {link}") from error
+    except OSError as error:
+        raise FrontendDevError(f"cannot inspect managed frontend link {name}: {error}") from error
+    if not stat.S_ISLNK(metadata.st_mode):
+        _fail(f"managed frontend path is not a symlink: {link}")
+    try:
+        resolved_link = link.resolve(strict=True)
+        resolved_target = target.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        _fail(f"cannot resolve managed frontend link {name}: {error}")
+    if resolved_link != resolved_target:
+        _fail(f"managed frontend link mismatch: {link} -> {resolved_link}; expected {resolved_target}")
+
+
+def _validate_managed_frontend_layout(inputs: DevelopmentInputs) -> None:
+    """Check the immutable cache aliases and PNPM directories during polling."""
+
+    if inputs.frontend_root != FRONTEND_ROOT:
+        _fail("frontend cache root is not canonical")
+    _require_real_directory(FRONTEND_ROOT, "frontend cache root")
+    for relative in ("out", "next/default", f"next/dev-{INTERNAL_PORT}"):
+        _require_real_directory(FRONTEND_ROOT / relative, f"frontend cache {relative}")
+
+    app_root = inputs.workspace_root / "apps" / "control-room"
+    _assert_no_links(app_root, "Control Room app root")
+    _require_real_directory(inputs.workspace_root / "node_modules", "workspace node_modules")
+    _require_real_directory(app_root / "node_modules", "Control Room node_modules")
+    _validate_managed_link(
+        app_root / ".fullmag-frontend", FRONTEND_ROOT, "frontend root"
+    )
+    _validate_managed_link(app_root / "out", FRONTEND_ROOT / "out", "static output")
+    _validate_managed_link(
+        app_root / ".next", FRONTEND_ROOT / "next" / "default", "default Next cache"
+    )
+    _validate_managed_link(
+        app_root / NEXT_DIST_DIR,
+        FRONTEND_ROOT / "next" / f"dev-{INTERNAL_PORT}",
+        "development Next cache",
+    )
 
 
 def _prepare_managed_frontend(inputs: DevelopmentInputs) -> Path:
@@ -768,7 +833,7 @@ def _prepare_managed_frontend(inputs: DevelopmentInputs) -> Path:
         FRONTEND_ROOT / "next" / f"dev-{INTERNAL_PORT}",
         "development Next cache",
     )
-    return _ensure_node_modules_alias(inputs)
+    return _ensure_node_modules_layout(inputs)
 
 
 def _validate_live_directories(inputs: DevelopmentInputs) -> None:
@@ -1016,8 +1081,8 @@ def _next_binary(inputs: DevelopmentInputs) -> Path:
     # itself need not carry an executable bit.
     if not resolved.is_file():
         _fail("Next binary is not a regular file")
-    if not _is_within(resolved, NODE_MODULES_ROOT):
-        _fail("Next binary resolves outside Linux development node_modules")
+    if not _is_within(resolved, inputs.workspace_root / "node_modules"):
+        _fail("Next binary resolves outside workspace node_modules")
     return binary
 
 
@@ -1267,9 +1332,10 @@ def start(stopping_event: Any) -> FrontendHandle:
     try:
         if previous is None or previous.get("dependency_install") != "ready":
             _run_pnpm_install(inputs, stopping_event, log_stream, receipt)
-            # pnpm must leave the state-owned aliases intact. Re-validate the
-            # managed layout before resolving Next so a package-manager change
-            # cannot redirect execution into the Windows source mount.
+            # pnpm owns the real dependency directories below the writable
+            # workspace. Re-validate that layout before resolving Next so a
+            # package-manager change cannot redirect execution into the
+            # Windows source mount.
             _prepare_managed_frontend(inputs)
         _assert_not_stopping(stopping_event)
         _next_binary(inputs)
@@ -1317,6 +1383,7 @@ def check(handle: FrontendHandle) -> None:
         if current.manifest_digest != handle.inputs.manifest_digest:
             _fail("Docker development input manifest changed; restart requires a new seed")
         _validate_live_directories(current)
+        _validate_managed_frontend_layout(current)
         _freeze_inputs(current, allow_generated=allow_generated)
     except Exception as error:
         if receipt is not None:
