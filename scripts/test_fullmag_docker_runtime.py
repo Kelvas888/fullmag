@@ -21,6 +21,35 @@ class DockerRuntimeContract(unittest.TestCase):
         self.assertTrue(service["read_only"])
         self.assertEqual([m["target"] for m in service["volumes"]], ["/state"])
 
+    def test_development_separates_live_frontend_from_session_writer(self):
+        from docker_development_inputs import extend_compose
+        inputs = {"host_port": 3197, "live_directories": [
+            {"source": "/checkout/app", "target": "/state/development/workspace/apps/control-room/app"}]}
+        spec = runtime.compose_spec("sha256:" + "a" * 64, Path("/owned/state"), 3197,
+                                    Path("/owned/windows-folder-host.json"))
+        extend_compose(spec, inputs, Path("/owned/development-inputs.json"))
+        backend, frontend = spec["services"]["fullmag"], spec["services"]["frontend"]
+        self.assertEqual(backend["ports"], [])
+        self.assertEqual(backend["gpus"], "all")
+        self.assertEqual(frontend["ports"], ["127.0.0.1:3197:8080"])
+        self.assertNotIn("gpus", frontend)
+        self.assertEqual(frontend["environment"]["NVIDIA_VISIBLE_DEVICES"], "void")
+        self.assertEqual(frontend["depends_on"], {"fullmag": {"condition": "service_healthy"}})
+        self.assertEqual(frontend["environment"]["FULLMAG_API_PROXY_TARGET"], "http://fullmag:8081")
+        self.assertEqual([m["target"] for m in frontend["volumes"] if not m.get("read_only")],
+                         ["/state/development"])
+        self.assertNotIn("/state", [m["target"] for m in frontend["volumes"]])
+        self.assertFalse(any(m["source"] == "/checkout/app" for m in backend["volumes"]))
+
+    def test_docker_timeout_preserves_unknown_operation_without_retry(self):
+        with patch.object(runtime.subprocess, "run", side_effect=subprocess.TimeoutExpired(["docker"], 3)) as run:
+            with self.assertRaises(runtime.DockerOutcomeUnknown) as caught:
+                runtime.docker("wait", "owned-container", timeout=3)
+            self.assertEqual(caught.exception.operation, ["wait", "owned-container"])
+            self.assertEqual(caught.exception.timeout_seconds, 3)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.kwargs["timeout"], 3)
+
     def test_package_requires_every_runtime_service_binary(self):
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory)
@@ -229,13 +258,21 @@ class DockerRuntimeContract(unittest.TestCase):
             probe.chmod(0o755)
             env = {**os.environ, "FULLMAG_STORAGE_PYTHON": str(probe)}
             command = ["bash", str(repo / "scripts/just_storage_shell.sh")]
-            accepted = subprocess.run([*command, recipe], env=env, text=True, capture_output=True)
-            self.assertEqual(accepted.returncode, 0, accepted.stderr)
-            self.assertIn("docker-all-gpu", accepted.stdout)
-            rejected = subprocess.run([*command, recipe + "; true"], env=env,
-                                      text=True, capture_output=True)
-            self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn("invalid all-in-Docker recipe", rejected.stderr)
+            recipes = [recipe,
+                       f'python3 "{repo}/scripts/fullmag_docker_runtime.py" --repo-root "{repo}" submit-development',
+                       recipe + " --source-digest '" + "c" * 64 + "' --native-snapshot-sha256 '" + "d" * 64 + "'",
+                       f'python3 "{repo}/scripts/fullmag_docker_runtime.py" --repo-root "{repo}" '
+                       "start --assembly-receipt '/owned/receipt.json' --port '3197' --frontend 'dev'",
+                       f'python3 "{repo}/scripts/verify_docker_all_runtime.py" --repo-root "{repo}" '
+                       "'/owned/receipt.json'"]
+            for candidate in recipes:
+                accepted = subprocess.run([*command, candidate], env=env, text=True, capture_output=True)
+                self.assertEqual(accepted.returncode, 0, accepted.stderr)
+                self.assertIn("docker-all-gpu", accepted.stdout)
+                rejected = subprocess.run([*command, candidate + "; true"], env=env,
+                                          text=True, capture_output=True)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn("invalid all-in-Docker", rejected.stderr)
 
     def test_gpu_release_keeps_receipt_profile(self):
         commit = "b" * 40
@@ -303,6 +340,43 @@ class DockerRuntimeContract(unittest.TestCase):
                 self.assertEqual(pending[0]["request_key"], pending[0]["submission"]["request_key"])
                 self.assertEqual(pending[0]["capture_id"], pending[0]["request_key"])
                 self.assertEqual(request.call_count, 2)
+
+    def test_development_build_captures_main_and_rejects_capture_races(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            layout = {"storage_root": str(root), "runs_root": str(root / "runs/task"),
+                      "worktree_id": "task", "repo_root": str(root / "main")}
+            main = root / "main"
+            manifest = {"resolved_commit": "b" * 40, "source_digest": "c" * 64}
+            native = {"source_snapshot_sha256": "e" * 64}
+            with patch.object(runtime.storage, "git", side_effect=lambda repo, *args: args[-1]), \
+                    patch.object(runtime.storage, "resolve_layout", return_value=layout), \
+                    patch.object(runtime, "read_json", return_value={"worktree_id": "task", "repo_root": layout["repo_root"]}), \
+                    patch.object(runtime.storage, "initialize"), \
+                    patch.object(runtime.storage, "build_lock", return_value=nullcontext()), \
+                    patch("docker_development_inputs.main_checkout", return_value=main), \
+                    patch("local_runner.build_executor.configured_build"), \
+                    patch("local_runner.build_source.native_identity", return_value=native) as identity, \
+                    patch("local_runner.build_source.bind_identity", return_value=native), \
+                    patch("local_runner.source.capture_source", return_value=manifest) as capture, \
+                    patch("local_runner.container_client.request", side_effect=[
+                        {"accepting_jobs": True, "allowed_profiles": ["fem-gpu-release"]},
+                        {"job_id": "d" * 32}]) as request, patch("builtins.print"):
+                runtime.submit_build(root / "task", development=True)
+                self.assertEqual(capture.call_args.args[0], main)
+                self.assertEqual(capture.call_args.kwargs["mode"], "snapshot")
+                self.assertIsNone(capture.call_args.kwargs["ref"])
+                self.assertIsNone(capture.call_args.kwargs["content_store"])
+                payload = request.call_args.kwargs["payload"]["payload"]
+                self.assertEqual(payload["origin_repo"], str(main))
+                self.assertEqual(payload["source_mode"], "snapshot")
+                request.reset_mock()
+                request.side_effect = [{"accepting_jobs": True, "allowed_profiles": ["fem-gpu-release"]}]
+                identity.side_effect = [native, {"source_snapshot_sha256": "f" * 64}]
+                with self.assertRaisesRegex(ValueError, "changed during backend snapshot"):
+                    runtime.submit_build(root / "task", development=True)
+                self.assertEqual(request.call_count, 1)
+                self.assertEqual(request.call_args.kwargs["method"], "GET")
 
     def test_entrypoint_rejects_windows_9p_before_cuda_or_writes(self):
         path = Path(__file__).resolve().parents[1] / "docker/all-in-one/entrypoint.py"

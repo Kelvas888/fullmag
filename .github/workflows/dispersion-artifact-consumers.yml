@@ -109,9 +109,10 @@ jobs:
         run: |
           cargo test --locked -p fullmag-session --lib frequency_domain_artifact_generation
           cargo test --locked -p fullmag-session --lib docker_desktop_storage
-          cargo test --locked -p fullmag-session --lib docker_desktop_storage
           cargo test --locked -p fullmag-workspace-inspect --lib
       - name: Verify immutable artifact binding and bounded reader races
         run: |
           python -B scripts/test_managed_runtime_artifact_root.py -v
           python -B scripts/test_fullmag_docker_runtime.py -v
+          python -B scripts/test_docker_frontend_dev.py -v
+          python -B scripts/test_verify_docker_all_runtime.py -v

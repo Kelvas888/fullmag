@@ -34,6 +34,21 @@ docker-all-image job_id commit:
 docker-all-start assembly_receipt port="3197":
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" start --assembly-receipt {{quote(assembly_receipt)}} --port {{quote(port)}}
 
+# Live Control Room sources come from the Git-resolved main Windows checkout.
+docker-all-dev assembly_receipt port="3197":
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" start --assembly-receipt {{quote(assembly_receipt)}} --port {{quote(port)}} --frontend 'dev'
+
+# Explicit immutable snapshot of the Git-resolved main checkout; no restart.
+docker-all-dev-backend-build:
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" submit-development
+
+docker-all-dev-image job_id commit source_digest native_snapshot_sha256:
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" build-image --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}}
+
+# Fixed GPU execution and FMS round-trip; never build or restart a runtime.
+docker-all-verify run_receipt:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_docker_all_runtime.py" --repo-root "{{repo_root}}" {{quote(run_receipt)}}
+
 storage-inventory:
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_storage.py" inventory --repo-root "{{repo_root}}" --format json
 

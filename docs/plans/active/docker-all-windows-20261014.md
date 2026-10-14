@@ -1,6 +1,7 @@
 # Fullmag all-in-Docker na Windows — plan i kontrakt storage
 
-Cel: jeden kontener z UI, API, Pythonem, FEM i GPU NVIDIA; port hosta 3197;
+Cel: obraz release z UI, API, Pythonem, FEM i GPU NVIDIA oraz tryb developerski
+z dwoma kontenerami: frontend HMR z głównego checkoutu i backend FEM/GPU; port hosta 3197;
 sesje bezpośrednio w skonfigurowanym storage Windows, bez named volume.
 Jednorazowy wyjątek użytkownika dotyczy wymaganej kompilacji testów w CI,
 nie lokalnego kompilowania unit testów. Pozostała praca użytkownika zostaje zachowana.

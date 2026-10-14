@@ -81,6 +81,58 @@ pozostawia stan nieznany i dowody do recovery. Nieudany start lub nadzór
 zamyka API, zachowuje możliwie działający service i utrzymuje niezdrowy kontener
 do jawnego zatrzymania przez operatora; nie wykonuje automatycznego takeover.
 
+## Tryb deweloperski: dwa kontenery
+
+```text
+just docker-all-dev <absolutna-sciezka-do-assembly-receipt.json> 3197
+```
+
+Compose uruchamia `frontend` (Next.js dev z HMR) oraz `fullmag` (API, Python,
+FEM/GPU i runtime service). Oba korzystają z tego samego przypiętego obrazu;
+role mają osobne procesy, montowania i budżety. Frontend ma 2 CPU i 4 GiB RAM,
+backend 4 CPU i 8 GiB RAM. GPU udostępniane jest wyłącznie backendowi.
+
+Adres przeglądarki pozostaje `http://localhost:3197/workspace`. Port 8080
+frontendu publikowany jest na loopback Windows. Backend słucha na 8081
+wewnątrz sieci Compose; frontend przekazuje do niego API. Nie wymaga CORS
+ani osobnego adresu API w przeglądarce.
+
+Launcher ustala główny checkout przez Git. Jego katalogi Control Room
+`app`, `src`, `public` i `scripts` są montowane readonly do frontendu.
+pnpm 10.8.1 jest przygotowany offline w obrazie, z narzędzia już obecnego
+w przypiętym builderze. Pierwszy start pobiera tylko zależności workspace.
+Zapis źródeł w głównym checkoutcie jest wykrywany przez polling Watchpack
+(500 ms); Next aktualizuje stronę przez HMR i kompiluje ją przy pierwszym wejściu.
+Cold-start ma limit 35 minut, obejmujący instalację zależności z limitem 30 minut
+oraz przygotowanie API/Next; zwykły restart używa zachowanych
+zależności. Cache, logi i `node_modules` pozostają w osobnym
+podkatalogu `state/development` kanonicznego storage Windows. Nie używamy
+hostowych `node_modules`, `.env` ani katalogu Git w kontenerze.
+
+Pliki konfiguracji i manifesty zależności są utrwalane przy przygotowaniu
+workspace. Ich zmiana wymaga przygotowania nowego workspace; HMR obejmuje
+katalogi źródeł. Frontend nie ma montowania accepted store ani certyfikatu
+zapisu sesji. Sesje i wyniki zapisuje backend bezpośrednio w swoim `/state`,
+mapowanym do rzeczywistego storage Windows.
+
+Zmiana kodu backendu nie wywołuje automatycznej kompilacji ani restartu
+symulacji. Jawne żądanie utrwala snapshot głównego checkoutu i zgłasza istniejącą
+kolejkę managed GPU release:
+
+```text
+just docker-all-dev-backend-build
+just runner-wait <job-id> 30
+just docker-all-dev-image <job-id> <commit> <source-digest> <native-snapshot-sha256>
+```
+
+Wartości tożsamości pochodzą z receiptu zgłoszenia. Edycja podczas capture
+powoduje odmowę, późniejsze zmiany nie odrzucają przyjętego snapshotu ani nie
+uruchamiają kolejnego buildu. Niezarejestrowane nowe pliki wymagane przez runtime
+powodują odmowę zamiast cichego pominięcia; dodaj je do Git przed capture.
+Nowy obraz nie zastępuje działającego backendu. Zastosowanie wymaga kontrolowanego
+uruchomienia. Ten tryb nie deklaruje automatycznego odtworzenia niezapisanego
+workspace po zmianie obrazu backendu.
+
 ## Storage i granice weryfikacji
 
 Launcher rozwiązuje storage przez `fullmag_storage.py`, przed pierwszym zapisem.

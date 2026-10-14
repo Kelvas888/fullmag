@@ -121,7 +121,33 @@ def serve():
     return result
 
 
+def serve_frontend():
+    import frontend_dev
+    stopping = threading.Event()
+    for number in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(number, lambda *_: stopping.set())
+    handle = None
+    try:
+        handle = frontend_dev.start(stopping)
+        while not stopping.wait(1):
+            frontend_dev.check(handle)
+        return 0
+    except Exception as error:
+        handle = getattr(error, "frontend_handle", handle)
+        raise
+    finally:
+        if handle is not None:
+            frontend_dev.stop(handle)
+
+
 if __name__ == "__main__":
+    role = os.environ.get("FULLMAG_DOCKER_ROLE", "backend")
+    if role == "frontend":
+        if "--storage-probe" in sys.argv:
+            raise RuntimeError("Frontend cannot run the session storage probe")
+        sys.exit(serve_frontend())
+    if role != "backend":
+        raise RuntimeError("Unsupported Fullmag Docker role")
     preflight()
     if "--storage-probe" in sys.argv:
         sys.exit(0)

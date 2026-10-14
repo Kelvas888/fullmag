@@ -4,7 +4,7 @@ Status: implementacja i kwalifikacja w toku, 2026-10-14.
 
 ## Kontekst
 
-Użytkownik wymaga UI/API/Python/FEM/GPU w jednym kontenerze oraz sesji zapisanej
+Użytkownik wymaga obrazu z UI/API/Python/FEM/GPU oraz sesji zapisanej
 bezpośrednio w Windows storage. Docker Desktop udostępnia lokalny NTFS jako 9p,
 który istniejący writer słusznie odrzuca jako niekwalifikowany. Named volume nie
 spełnia uzgodnionego wymagania. Nie zmieniamy fizyki, DSL, ProblemIR, API ani
@@ -30,6 +30,26 @@ albo otwiera kompletny istniejący store bez przejmowania częściowego katalogu
 Python nadzoruje proces API; kanoniczny Rust runtime service nadal posiada
 scheduler, resource pools, owner metadata i authenticated drain. Nie rozszerzamy
 publicznego API ani kwalifikacji host execution v2.
+
+## Granica trybu developerskiego
+
+Obraz release zachowuje statyczny frontend. Tryb developerski uruchamia dwa
+kontenery z tego samego niezmiennego obrazu: frontend Next/HMR oraz backend
+API/Python/FEM/GPU. Frontend publikuje jeden port loopback Windows i przekazuje
+API do backendu w prywatnej sieci Compose. Cztery katalogi źródeł Control Room
+z głównego checkoutu są montowane readonly, z pollingiem zmian. Manifesty
+zależności i konfiguracja są utrwalane przy przygotowaniu workspace.
+
+Frontend zapisuje wyłącznie swój katalog `state/development`; nie otrzymuje
+accepted store, certyfikatu writera ani GPU. Backend pozostaje jedynym writerem
+sesji i właścicielem runtime service. HMR nie zmienia modelu ani kontraktu API.
+Build backendu wymaga jawnego zlecenia do managed runnera i nie restartuje
+bieżącej symulacji. Zmiana obrazu nie deklaruje odtworzenia niezapisanej sesji.
+
+Implementacja: `scripts/docker_development_inputs.py`, launcher
+`scripts/fullmag_docker_runtime.py`, `docker/all-in-one/frontend_dev.py`,
+entrypoint/healthcheck i recepta `docker-all-dev`. Kontrole podziału montowań,
+freeze oraz lifecycle są osobne od dowodu HMR w rzeczywistej przeglądarce.
 
 ## Obowiązki i rollback
 
