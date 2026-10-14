@@ -1,5 +1,22 @@
 # Status realizacji całego planu refaktoryzacji
 
+Checkpoint 14.10.2026 — poprawka niekompletnej fizyki `2d767a5b2252855f33579f94e89158c4ba7b5798`
+jest na branchu PR #160, jeszcze nie na remote master. Nowy produkcyjny
+pakiet `1bcaf4c1` ukończony exit 0; frozen API 303 PASS, 99/99 procesów
+odebranych, receipt `a6c4edb5665f46709d61fa5b535fd3d9`. Znana odmowa
+renderowania niekompletnej fizyki zwraca 400 zamiast 500 i nie zmienia
+sceny/revision; pozostałe nieznane wyniki zachowują fail-closed.
+Generacja klienta i production source typecheck PASS.
+
+Próba browserowa `a7e054cc1fb44299b8caf33a59877b11` potwierdziła guard
+capture kamery, capture po zapisie oraz zachowanie sześciu pól kamery,
+modelu i dirty document po restarcie. Staged typecheck/lint exit 0.
+Grid doszedł do nowego wykonawcy, lecz odmówił z powodu brakującego
+rozmiaru komórki FDM w wejściu kontrolnym. Próba anulowana terminalnie,
+25/25 procesów odebranych; całej bramki nie oznaczono PASS.
+**P8-53BM/P8-53 nadal IN PROGRESS; procentów całego planu nie podniesiono.**
+Szczegóły i następny kompletny zestaw wejść: [ledger P8-53BM](p8/53bm-camera-preservation.md).
+
 Aktualizacja 14.10.2026 — nowy pakiet `cd7fe207` ukończony, exit 0.
 Realna próba `14152bbfe6a44c23a485176a4c0ff127` odtworzyła 1 obiekt,
 1 region, 1 materiał i identyczny dirty document po zmianie API instance.

@@ -881,3 +881,48 @@ wyłącznie własne hunki odpowiedzi 400.
 Te dowody nie potwierdzają jeszcze terminalnej obsługi Grid przez scratch
 po odmowie ani pełnego Grid/Compute po restarcie. Regresja kamery i pełna
 próba przeglądarkowa pozostają NOT VERIFIED; P8-53BM nadal IN PROGRESS.
+
+### Regresja capture kamery i jawna odmowa Grid — 14.10.2026
+
+Prywatna próba `a7e054cc1fb44299b8caf33a59877b11` użyła pakietu
+`1bcaf4c15c4acf4a813d172021c9b00c5ffdbe84ad7c2d8a2c16b41efdd10d0e`.
+Staged diagnostyczna strona przeszła typecheck i lint, oba exit 0.
+Normalnymi kontrolkami UI utworzono box `film-mv7ehc2v`, region
+`film-mv7ehc2v:r1`, materiał `mat:proof-film`, Uniform texture
+`mag:film-mv7ehc2v:uniform`, jawną anizotropię Ku1=1000 J/m³ z osią
+[0,0,1] oraz Run `run-1` do 1e-12 s. Wszystko przygotowano przed capture.
+
+Regresja guardu: View → toggle projection i natychmiast Setup draft
+zwróciły `Wait for camera synchronization before preparing the
+before-capture. No before-capture was submitted.`. Po potwierdzonym
+odczycie camera.projection=orthographic z przypiętego API ponowne
+Setup draft utrwaliło punkt before. [Dowód odmowy](evidence/53bm-camera-capture-refused-20261014.png).
+
+Restart zmienił API `d5a6b8f0-1725-4cd2-b28f-7dc375c9fe5c` na
+`07e9ad04-190f-49f1-baa2-bb56fbd471a0`; stary API zakończył się exit 0.
+Dirty document zachował revision=2 i archive SHA-256
+`b0e09ad307e0fb81c72ce2e323868e79eac2e5318907b648f2cba9504ebdac04`.
+Odczyt nowego API oraz before z terminalnego receipt mają identyczne
+projection, position, target, up, fov_degrees i orthographic_scale.
+Viewport po restore: 700×297, context_lost=false.
+
+Build Grid `fm-00ef8ee5-d09b-4017-9833-acd1218f4f36` doszedł do nowego
+scratch wykonawcy i zakończył się status=failed, pending_count=0.
+Log materializacji wskazuje: `FDM discretization hints (cell size) are
+required for Phase 1 execution`. To kolejna brakująca właściwość wejścia
+kontrolnego: w Study nie ustawiono rozmiaru komórki przed capture.
+Modal nadal pokazywał submitting mimo terminalnej odmowy w katalogu
+komend; wymaga to odrębnego sprawdzenia obsługi terminalnego failure.
+Nie wysłano duplikatu Grid i nie zmiękczono porównania sceny.
+
+Odczyty kamery, sceny i komend zapisano osobno jako
+`camera-and-grid-observation.json` pod receipt. Próba została świadomie
+anulowana: terminalny failed/exit 1, 25/25 procesów waited=true.
+Nie uznano jej za PASS całej bramki. [Stan po restore](evidence/53bm-camera-preserved-grid-cell-refusal-20261014.png).
+
+Guard capture kamery ma dowód negatywny i pozytywny z rzeczywistego UI.
+Pełne P8-53BM/P8-53 pozostaje IN PROGRESS: kolejna próba musi ustawić
+FDM default cell (np. 5e-9 m dla tego małego boxu), jawne Ku1, Uniform
+oraz skończony Run przed capture, a następnie wykonać Grid/Compute/Close
+i Finish proof. Wynik tego małego scenariusza nie kwalifikuje naukowo
+pozostałych lane ani wydania.

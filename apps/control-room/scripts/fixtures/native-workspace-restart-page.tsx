@@ -496,6 +496,15 @@ function summarizeScene(scene: SceneResource): SceneSummary {
   };
 }
 
+function assertConfirmedCameraForCapture(kernel: ReturnType<typeof useKernel>): void {
+  const camera = kernel.cameraRegistry.getSnapshot();
+  if (camera.dirty || camera.syncInFlight || camera.error !== null
+    || camera.lastRemoteRevision === null || camera.remoteCamera === null
+    || canonicalJson(camera.camera) !== canonicalJson(camera.remoteCamera)) {
+    throw new Error("Wait for camera synchronization before preparing the before-capture. No before-capture was submitted.");
+  }
+}
+
 function assertUsefulScene(scene: SceneResource): SceneSummary {
   const summary = summarizeScene(scene);
   if (summary.object_count === 0 || summary.region_count === 0 || summary.material_count === 0) {
@@ -780,6 +789,7 @@ function NativeWorkspaceRestartFixtureBody() {
       if (!sessionIdentity || !kernel.projectDocument) {
         throw new Error("The workspace needs a confirmed live session and project-document owner.");
       }
+      assertConfirmedCameraForCapture(kernel);
       const sceneBefore = await kernel.api.model.scene();
       assertUsefulScene(sceneBefore);
       const [backendBefore, eligibilityBefore, sessionStatusBefore] = await Promise.all([
@@ -891,6 +901,7 @@ function NativeWorkspaceRestartFixtureBody() {
         || freshProof.ready_source_sha256 !== prepared.ready_source_sha256) {
         throw new Error("The verified ready build changed while the draft was being prepared.");
       }
+      assertConfirmedCameraForCapture(kernel);
       fixture.claimBeforeCapture();
       const captured = await fixture.postPrivate("before", {
         schema: BEFORE_SCHEMA,
