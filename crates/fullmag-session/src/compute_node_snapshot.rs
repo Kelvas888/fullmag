@@ -1350,6 +1350,8 @@ mod tests {
         assert_eq!(inventory_next.capabilities_revision, same.capabilities_revision);
 
         let mut capability_change = valid_data(at + Duration::seconds(3));
+        capability_change.cpu.os_constraints.allowed_logical_cpu_ids =
+            available(BTreeSet::from([0]));
         capability_change.capabilities = available(vec!["fdm.cpu".into()]);
         let capability_next = ComputeNodeSnapshot::successor(
             capability_change,
