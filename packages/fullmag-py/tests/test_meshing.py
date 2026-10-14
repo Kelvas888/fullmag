@@ -11126,7 +11126,7 @@ class FieldStackAcceptanceTests(unittest.TestCase):
             10.0e-9,
         )
 
-    def test_periodic_airbox_z_padding_reports_magnetic_submesh_signature_drift(self) -> None:
+    def test_periodic_airbox_z_padding_preserves_magnetic_submesh_signature(self) -> None:
         try:
             import gmsh  # noqa: F401
         except ImportError:
@@ -11237,19 +11237,23 @@ class FieldStackAcceptanceTests(unittest.TestCase):
 
         baseline = _build_report_signature(90.0e-9)
         padded = _build_report_signature(90.1e-9)
-        self.assertNotEqual(
-            (
-                baseline["node_count"],
-                baseline["tetra_count"],
-                baseline["edge_count"],
-                baseline["digest"],
-            ),
-            (
-                padded["node_count"],
-                padded["tetra_count"],
-                padded["edge_count"],
-                padded["digest"],
-            ),
+        baseline_key = (
+            baseline["node_count"],
+            baseline["tetra_count"],
+            baseline["edge_count"],
+            baseline["digest"],
+        )
+        padded_key = (
+            padded["node_count"],
+            padded["tetra_count"],
+            padded["edge_count"],
+            padded["digest"],
+        )
+        self.assertEqual(
+            baseline_key,
+            padded_key,
+            "magnetic submesh signature changed with exterior airbox padding: "
+            f"baseline={baseline_key!r}, padded={padded_key!r}",
         )
 
     def test_periodic_antidot_frozen_magnetic_submesh_stays_stable_across_airbox_z_padding(self) -> None:
