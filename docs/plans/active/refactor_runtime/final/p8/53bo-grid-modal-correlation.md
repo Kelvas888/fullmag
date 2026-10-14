@@ -107,3 +107,25 @@ proces zakończył się exit 0. Normalne Close dotyczy solvera i ma osobny
 completed oraz naturalny exit dziecka. Zakres: Windows/FDM CPU-reference,
 double/strict, box 100×100×10 nm, cell 5 nm, Uniform +X i Ku1=1000 J/m³.
 Pozostałe lane’y i wydanie pozostają NOT VERIFIED; PR #160 nie jest scalony.
+## Ustalenie granicy cleanupu API — 14.10.2026
+
+Końcowy exit 1 replacement API w receipt
+`81eb7f40d2c8428baae938f5be5bef73` nie jest dowodem awarii Compute.
+Log replacement API kończy się synchronizacją sceny i nie pokazuje
+końcowego wyjątku. Ścieżka `development_workspace_probe.rs::shutdown_exact_api`
+sprawdza dokładne api_instance_id oraz child_pid, a następnie wywołuje
+`DevelopmentApiSupervisor::shutdown`. Dla nadal działającego procesu ten
+kod stosuje child.kill() i child.wait(); odmawia cleanupu unknown handoff.
+To zgodne z zarejestrowanym exit 1 po zakończeniu kontrolnej próby na Windows,
+ale odczyt logu i źródeł nie dowodzi naturalnego zamknięcia API.
+
+Zgodność dwóch odczytanych źródeł z zamrożonym capsule 924ff846... PASS:
+- development_api_supervisor.rs SHA-256
+  `f777765d03918ed0cfe5e19abe397f7bd0525e08113bc22a9300ce25dfa17213`;
+- control_room/development_workspace_probe.rs SHA-256
+  `146e63c3c24770378503fb7686e9f422b12eb190b92d675197055ded656af7dd`.
+
+Normalne solver Close i odebranie dzieci z exit 0 mają oddzielny dowód
+w tym samym receipcie. Nie zmieniono progu PASS, API ani żadnego procesu;
+to odczyt sealed wyniku i odpowiadających mu źródeł. Runtime qualifier
+nadal nie powinien sugerować, że wszystkie procesy zakończyły się exit 0.
