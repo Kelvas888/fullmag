@@ -103,8 +103,8 @@ def run(repo: Path, route: str, dependency_workspace: Path | None = None):
         run_root.mkdir(parents=True)
         workspace_evidence = {}
         if dependency_workspace is not None:
-            if route not in {"generate-client", "production-source", "api-hygiene"}:
-                raise storage.StorageError("Native dependency workspace is supported only for API generation and production source checks")
+            if route not in {"generate-client", "production-source", "api-hygiene", "lint"}:
+                raise storage.StorageError("Native dependency workspace is supported only for API generation, production source checks and lint")
             from frontend_source_workspace import prepare_source_workspace, validate_dependency_workspace
             dependency_before = validate_dependency_workspace(repo, layout, dependency_workspace)
             prepared = prepare_source_workspace(repo, layout, run_root, dependency_workspace)
