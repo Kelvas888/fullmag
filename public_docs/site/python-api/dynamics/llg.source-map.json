@@ -20,7 +20,7 @@
     {"id": "m_i", "latex": "\\mathbf{m}_i", "meaning": "Reduced magnetization unit vector at active node/cell $i$", "si_unit": "1"},
     {"id": "H_eff_i", "latex": "\\mathbf{H}_{\\mathrm{eff},i}", "meaning": "Total effective magnetic field at node/cell $i$", "si_unit": "\\mathrm{A\\,m^{-1}}"},
     {"id": "gamma0", "latex": "\\gamma_0", "meaning": "Reduced gyromagnetic ratio (`LLG.gamma`)", "si_unit": "\\mathrm{m\\,A^{-1}\\,s^{-1}}"},
-    {"id": "alpha_i", "latex": "\\alpha_i", "meaning": "Dimensionless Gilbert damping parameter (`Material.alpha`)", "si_unit": "1"},
+    {"id": "alpha_i", "latex": "\\alpha_i", "meaning": "Dimensionless Gilbert damping parameter (`alpha`)", "si_unit": "1"},
     {"id": "s_prec", "latex": "s_{\\mathrm{prec}}", "meaning": "Precession switch ($1$ in time evolution, $0$ in pure-damping relaxation)", "si_unit": "1"},
     {"id": "tau_direct_i", "latex": "\\boldsymbol{\\tau}_{\\mathrm{direct},i}", "meaning": "Optional direct current-driven spin torque rate", "si_unit": "\\mathrm{s^{-1}}"},
     {"id": "t", "latex": "t", "meaning": "Physical simulation time", "si_unit": "\\mathrm{s}"}

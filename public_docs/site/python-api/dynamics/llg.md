@@ -43,7 +43,7 @@ s_{\mathrm{prec}}\,\mathbf{m}_i \times \mathbf{H}_{\mathrm{eff},i}(\mathbf{m}, t
 | $\mathbf{m}_i$ | Reduced magnetization unit vector at active node/cell $i$ | $1$ |
 | $\mathbf{H}_{\mathrm{eff},i}$ | Total effective magnetic field at node/cell $i$ | $\mathrm{A\,m^{-1}}$ |
 | $\gamma_0$ | Reduced gyromagnetic ratio (`LLG.gamma`) | $\mathrm{m\,A^{-1}\,s^{-1}}$ |
-| $\alpha_i$ | Dimensionless Gilbert damping parameter (`Material.alpha`) | $1$ |
+| $\alpha_i$ | Dimensionless Gilbert damping parameter (`alpha`) | $1$ |
 | $s_{\mathrm{prec}}$ | Precession switch ($1$ in time evolution, $0$ in pure-damping relaxation) | $1$ |
 | $\boldsymbol{\tau}_{\mathrm{direct},i}$ | Optional direct current-driven spin torque rate | $\mathrm{s^{-1}}$ |
 | $t$ | Physical simulation time | $\mathrm{s}$ |

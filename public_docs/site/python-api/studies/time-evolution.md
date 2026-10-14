@@ -44,7 +44,7 @@ subject to $\|\mathbf{m}_i(t)\|_2 = 1$ and $\dot{\mathbf{m}}_j(t) = \mathbf{0}$ 
 | --- | --- | --- |
 | $\mathbf{m}_i$ | Reduced magnetization unit vector at active node/cell $i$ | $1$ |
 | $\mathbf{H}_{\mathrm{eff},i}$ | Total effective magnetic field at node/cell $i$ | $\mathrm{A\,m^{-1}}$ |
-| $\gamma_0$ | Reduced gyromagnetic ratio (`LLG.gamma`) | $\mathrm{m\,A^{-1}\,s^{-1}}$ |
+| $\gamma_0$ | Reduced gyromagnetic ratio (`gamma`) | $\mathrm{m\,A^{-1}\,s^{-1}}$ |
 | $\alpha_i$ | Dimensionless Gilbert damping parameter | $1$ |
 | $\boldsymbol{\tau}_{\mathrm{direct},i}$ | Direct current-induced spin-torque rate | $\mathrm{s^{-1}}$ |
 | $t_0$ | Stage initial physical time | $\mathrm{s}$ |
