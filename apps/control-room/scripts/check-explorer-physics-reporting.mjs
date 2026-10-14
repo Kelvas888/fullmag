@@ -27,7 +27,7 @@ await adapter.link((specifier) => {
 await adapter.evaluate();
 const snapshotFromScene = adapter.namespace.modelTreeSnapshotFromScene;
 const kind = (interactions, id) => interactions.find((item) => item.id === id);
-const plain = (value) => JSON.parse(JSON.stringify(value));
+const plain = (value) => structuredClone(value);
 const magnet = (id, extra = {}) => ({ id, name: id, ...extra });
 let cases = 0;
 function inspect(scene) {

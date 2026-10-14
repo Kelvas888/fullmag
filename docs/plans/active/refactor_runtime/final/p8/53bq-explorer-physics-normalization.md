@@ -103,3 +103,15 @@ Końcowy production source receipt `a1f721ad479f475085ea9eab61bb4c12`:
 **PASS / exit 0**, po korekcie; bez kompilacji unit targets.
 Review drivera i korekty agregatu zakończone: brak dalszych P0/P1/P2
 w objętym zakresie. Pozostałe granice browser/remote/release pozostają otwarte.
+## Checkpoint lokalnego commita i korekta drivera
+
+Przyrost zapisano lokalnie w `c974b2e0654d2348743e44541ce76c7871af3d78`.
+Pre-commit React Doctor wskazał warning JSON parse/stringify clone wyłącznie
+w driverze. Konwersję wyniku zastąpiono structuredClone; daje lokalną
+reprezentację obiektu z VM i zachowuje wartości bez JSON-owej utraty danych.
+Po tej małej zmianie końcowy driver receipt
+`392b3c8fdf2f4029846db7c9a0bf0bca`: **PASS / exit 0 / 31 przypadków**.
+Adapter nie uległ dalszej zmianie; produkcyjny typecheck a1f721ad pozostaje
+aktualnym dowodem jego źródeł. Driver SHA-256:
+`9f51c860156dd3e8f1aeed31ccb2f2ecdc6bd0da765c809f851431a7f7bd2480`.
+Commity pozostają lokalne; nie uruchomiono remote CI ani merge.
