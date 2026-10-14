@@ -194,3 +194,7 @@ nie kompilowano lokalnych testów Rust/C++.
 - Natywny validator sprawdził immutable source, 127 hashy oraz wymagane 12 binariów, PyO3 i statyczny frontend. To dowód buildu wcześniejszego źródła; nie obejmuje końcowego obrazu, HMR, API ani wykonania FEM GPU.
 - Własne zgłoszenie `996c0d7f284e4cefb08972d959a860d0` anulowano w stanie `queued`, aby zastąpić je poprawionym spójnym źródłem. Kapsuła i dowody pozostają w storage.
 - Pozostała korekta fixture meshing: większy clearance przechodzi niezmieniony próg jakości 0.1, ale asercja kontrastu source-face wymaga dalszej diagnozy. Nie obniżono progu ani ratio.
+
+### Checkpoint — test-only blokady kompilacji Rust w CI
+
+W `fullmag-application` uzupełniono dwa importy `#[cfg(test)]` i domyślne `antenna_inventory` w testowym literalze `ScriptExecutionConfig`. Są to przyczyny pięciu błędów kompilacji kroku `cargo test -p fullmag-application --no-fail-fast` w CI `38633512350` / job `116090784830`. Parser-only rustfmt i diff check: PASS. Lokalnych testów Rust/C++ nie kompilowano; potwierdzenie kompilacji i działania oczekuje na wymagane CI poprawionego brancha.
