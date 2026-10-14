@@ -88,7 +88,7 @@ fi
 # composite command cannot use a diagnostic marker to bypass its argument check.
 case "${recipe}" in
   *"scripts/fullmag_docker_runtime.py"*)
-    docker_runtime_pattern="^[^[:space:]]+ \"[^\"]+/scripts/fullmag_docker_runtime.py\" --repo-root \"[^\"]+\" (build-image --job-id '[a-f0-9]{32}' --commit '[a-f0-9]{40}'|start --assembly-receipt '[^']+' --port '[0-9]{4,5}')$"
+    docker_runtime_pattern="^[^[:space:]]+ \"[^\"]+/scripts/fullmag_docker_runtime.py\" --repo-root \"[^\"]+\" (submit --commit '[a-f0-9]{40}'|build-image --job-id '[a-f0-9]{32}' --commit '[a-f0-9]{40}'|start --assembly-receipt '[^']+' --port '[0-9]{4,5}')$"
     if [[ ! "${recipe}" =~ ${docker_runtime_pattern} ]]; then
       echo "[fullmag just] invalid all-in-Docker recipe" >&2
       exit 2

@@ -1,11 +1,13 @@
 """Source-only checks; no Rust/native test compilation or Docker mutation."""
 import importlib.util
+import json
 import tempfile
 import os
 import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from contextlib import nullcontext
 
 import fullmag_docker_runtime as runtime
 import run_managed_browser as managed
@@ -65,6 +67,50 @@ class DockerRuntimeContract(unittest.TestCase):
              "profile": "fem-gpu-release"}, {}]):
             with self.assertRaisesRegex(ValueError, "terminal and successful"):
                 managed.validate_managed_build(Path(tempfile.gettempdir()).resolve() / "job", "b" * 40)
+
+    def test_submission_uses_gpu_queue_and_independent_source_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            layout = {"storage_root": str(root), "runs_root": str(root / "runs" / "test-worktree"),
+                      "worktree_id": "test-worktree", "repo_root": str(root / "repo")}
+            commit = "b" * 40
+            manifest = {"resolved_commit": commit, "source_digest": "c" * 64}
+            with patch.object(runtime.storage, "resolve_layout", return_value=layout), \
+                    patch.object(runtime, "read_json", return_value={"worktree_id": layout["worktree_id"], "repo_root": layout["repo_root"]}), \
+                    patch.object(runtime.storage, "initialize"), \
+                    patch.object(runtime.storage, "build_lock", return_value=nullcontext()), \
+                    patch("local_runner.build_executor.configured_build"), \
+                    patch("local_runner.build_source.native_identity", return_value={}), \
+                    patch("local_runner.build_source.bind_identity", return_value={}), \
+                    patch("local_runner.source.capture_source", return_value=manifest) as capture, \
+                    patch("local_runner.container_client.request", side_effect=[
+                        {"accepting_jobs": True, "allowed_profiles": ["fem-gpu-release"]},
+                        {"job_id": "d" * 32}]) as request, \
+                    patch("builtins.print"):
+                runtime.submit_build(root / "repo", commit)
+                self.assertIsNone(capture.call_args.kwargs["content_store"])
+                self.assertEqual(capture.call_args.kwargs["ref"], commit)
+                payload = request.call_args.kwargs["payload"]
+                self.assertEqual(payload["profile"], "fem-gpu-release")
+                self.assertEqual(payload["operation"], "build")
+                self.assertEqual(payload["source_digest"], manifest["source_digest"])
+                self.assertEqual(payload["payload"]["source_mode"], "commit")
+                self.assertEqual(payload["payload"]["capture_id"], payload["request_key"])
+                self.assertEqual(payload["payload"]["capsule_relative"],
+                                 "runs/test-worktree/" + payload["request_key"] + "/source")
+                self.assertEqual(request.call_args_list[0].kwargs["method"], "GET")
+                self.assertEqual(request.call_args_list[1].kwargs["method"], "POST")
+                request.reset_mock()
+                request.side_effect = [{"accepting_jobs": True, "allowed_profiles": ["fem-gpu-release"]},
+                                       TimeoutError("response lost after POST")]
+                with self.assertRaises(TimeoutError):
+                    runtime.submit_build(root / "repo", commit)
+                receipts = [json.loads(path.read_text()) for path in (root / "runs/test-worktree").glob("*/submission.json")]
+                pending = [value for value in receipts if value["state"] == "submission_unconfirmed"]
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0]["request_key"], pending[0]["submission"]["request_key"])
+                self.assertEqual(pending[0]["capture_id"], pending[0]["request_key"])
+                self.assertEqual(request.call_count, 2)
 
     def test_entrypoint_rejects_windows_9p_before_cuda_or_writes(self):
         path = Path(__file__).resolve().parents[1] / "docker/all-in-one/entrypoint.py"

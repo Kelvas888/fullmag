@@ -5,6 +5,7 @@ No compiler is invoked here. Full builds remain owned by Fullmag_build_runner.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -76,6 +77,57 @@ def prepare_gpu_release(layout, job_id, commit):
             raise ValueError(f"Missing runtime artifact: {relative}")
     image_id(context["image_digest"])
     return root, context, built, capsule, package
+
+
+def submit_build(repo, commit):
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("A full commit SHA is required")
+    from local_runner.build_executor import configured_build
+    from local_runner.build_source import native_identity, bind_identity
+    from local_runner.container_client import request
+    from local_runner.source import capture_source
+
+    layout = storage.resolve_layout(repo, PROFILE)
+    owner = getpass.getuser()
+    configured_build(layout, owner, "fem-gpu-release")
+    health = request(layout, owner=owner, method="GET", path="/health")
+    if health.get("accepting_jobs") is not True or "fem-gpu-release" not in health.get("allowed_profiles", []):
+        raise ValueError("The existing runner is not accepting the GPU release profile")
+    registration_path = storage.validate_path(Path(layout["storage_root"]) / "index" / (layout["worktree_id"] + ".json"),
+                                              Path(layout["storage_root"]))
+    registration = read_json(registration_path)
+    if registration.get("worktree_id") != layout["worktree_id"] or Path(registration.get("repo_root", "")) != Path(layout["repo_root"]):
+        raise ValueError("The source worktree must be registered before build submission")
+    storage.initialize(layout)
+    capture_id = uuid.uuid4().hex
+    destination = storage.validate_path(Path(layout["runs_root"]) / capture_id / "source",
+                                        Path(layout["storage_root"]))
+    with storage.build_lock(layout):
+        destination.mkdir(parents=True, exist_ok=False)
+        # Independent immutable copies are an existing capsule contract. Never
+        # weaken or repair a rejected shared CAS object during task submission.
+        manifest = capture_source(repo, destination, mode="commit", ref=commit, content_store=None)
+        native = bind_identity(native_identity(repo, "commit", manifest["resolved_commit"]), manifest)
+    submitted = {"worktree_id": layout["worktree_id"], "source_digest": manifest["source_digest"],
+                 "profile": "fem-gpu-release", "operation": "build", "request_key": capture_id,
+                 "payload": {"source_mode": "commit", "origin_repo": layout["repo_root"],
+                             "capture_id": capture_id, "native_source_identity": native,
+                             "capsule_relative": destination.relative_to(Path(layout["storage_root"])).as_posix()}}
+    receipt = {"schema": "fullmag.docker-all-submission.v1", "state": "submitting",
+               "source_storage": "independent-copy", "capture_id": capture_id,
+               "request_key": submitted["request_key"], "capsule_relative": submitted["payload"]["capsule_relative"],
+               "commit": commit, "source_digest": manifest["source_digest"], "submission": submitted}
+    receipt_path = destination.parent / "submission.json"
+    storage.atomic_json(receipt_path, receipt)
+    try:
+        result = request(layout, owner=owner, method="POST", path="/jobs", payload=submitted)
+        receipt.update(state="submitted", result=result)
+    except Exception as error:
+        receipt.update(state="submission_unconfirmed", error=str(error))
+        raise
+    finally:
+        storage.atomic_json(receipt_path, receipt)
+        print(json.dumps(receipt, indent=2))
 
 
 def build_image(repo, job_id, commit):
@@ -199,6 +251,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, required=True)
     commands = parser.add_subparsers(dest="action", required=True)
+    submit = commands.add_parser("submit")
+    submit.add_argument("--commit", required=True)
     build = commands.add_parser("build-image")
     build.add_argument("--job-id", required=True)
     build.add_argument("--commit", required=True)
@@ -206,7 +260,9 @@ if __name__ == "__main__":
     launch.add_argument("--assembly-receipt", type=Path, required=True)
     launch.add_argument("--port", type=int, default=3197)
     args = parser.parse_args()
-    if args.action == "build-image":
+    if args.action == "submit":
+        submit_build(args.repo_root.resolve(), args.commit)
+    elif args.action == "build-image":
         build_image(args.repo_root.resolve(), args.job_id, args.commit)
     else:
         start(args.repo_root.resolve(), args.assembly_receipt, args.port)

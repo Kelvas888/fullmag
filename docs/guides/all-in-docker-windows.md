@@ -11,14 +11,24 @@ socketu Dockera ani hostowego Pythona podczas uruchomienia.
 Pełną kompilację wykonuje istniejący `Fullmag_build_runner`. Nie uruchamiaj
 równoległego ciężkiego buildu przez `docker build` ani hostowy Cargo.
 Przed zgłoszeniem sprawdź zdrowie runnera i konfigurację `fem-gpu-release`.
-Źródłem jest pełny SHA commita właściwego checkoutu:
+Worktree musi być wcześniej zarejestrowany przez `fullmag_storage.py register`
+w ramach cyklu zadania. Źródłem jest pełny SHA commita właściwego checkoutu:
 
 ```text
 just runner-container-status
-just runner-build commit fem-gpu-release <pelny-sha>
+just docker-all-build <pelny-sha>
 just runner-wait <job-id> 30
 just docker-all-image <job-id> <pelny-sha>
 ```
+
+Zgłoszenie używa obsługiwanej niezależnej kopii niezmiennej kapsuły źródeł,
+bez hardlinków do współdzielonego source CAS. Nie modyfikuje ani nie naprawia
+obiektów CAS odrzuconych przez kontrolę niezmienności. Job nadal wykonuje
+jeden istniejący koordynator, z profilem `fem-gpu-release`.
+Przed POST do kolejki zapisuje `submission.json` z `capture_id`, `request_key`
+i ścieżką kapsuły. Po timeoutcie stan `submission_unconfirmed` wymaga sprawdzenia
+kolejki według `request_key`; nie zgłaszaj ponownie nowego capture, dopóki nie
+ustalisz, czy koordynator przyjął poprzedni job.
 
 Ostatnie polecenie nie kompiluje kodu. Sprawdza terminalny receipt, profil GPU,
 hashy artefaktów, tożsamość commita i kapsułę źródeł. Następnie składa obraz
