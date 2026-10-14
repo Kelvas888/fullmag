@@ -21,3 +21,18 @@ nie wykonywano; wykonanie poprawionych regresji w CI: NOT VERIFIED.**
 
 To naprawa wejść testowych, nie dowód poprawnego runtime ani nauki.
 P8 i cały plan pozostają IN PROGRESS.
+
+## Kolejna weryfikacja CI i ostatnia korekta
+
+Job `115762682735` (physical-field-source-contracts) wykonał serię
+fullmag-session: **314 PASS / 1 FAIL**, zero ignored. Pozostał reboot fixture
+w `successor_assigns_revisions_from_durable_digests_and_fences_owner_changes`:
+nowy boot używał owner epoch 3 po prawidłowym przejściu poprzednika do epoch 4.
+Validator słusznie zabrania cofnięcia epoch dla tego samego node, również przy
+nowym boot. Fixture zachowuje teraz epoch poprzednika. Dodana asercja najpierw
+potwierdza odmowę starej próbki ze spadkiem epoch, następnie sprawdza restart
+inventory/capabilities revisions do 1 na nowym boot. Produkcja bez zmian.
+
+Parser Rust bez zapisu i diff check końcowej korekty: PASS.
+Wykonanie tej końcowej regresji w CI nadal **NOT VERIFIED**; nie należy
+przedstawiać historycznych 314 PASS jako 315 PASS na poprawionych źródłach.
