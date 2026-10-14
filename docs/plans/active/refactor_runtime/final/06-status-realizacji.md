@@ -1,4 +1,12 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 14.10.2026 — [P8-53BS](p8/53bs-restart-remaining-gates.md):
+audyt odróżnił historyczne braki od najnowszego dowodu pojedynczego restartu
+z kamerą (81eb7f40 ponownie odczytany: completed/0, 10 checks, 27 waited).
+Potwierdzono ograniczenie harnessu do jednego cyklu i jednego Finish;
+następny przyrost to jawny łańcuch A→B→C z dwoma immutable baseline,
+świeżymi pinami i pełnym process custody. Dowód dwóch restartów oraz pełna
+macierz stanów Inspectora/fault nadal NOT VERIFIED. Procentów nie podniesiono.
+
 Checkpoint 14.10.2026 — [P8-53BR](p8/53br-explorer-physics-browser-proof.md):
 produkcyjne drzewo Explorera przeszło trzy browser scenariusze normalizacji
 fizyki (receipt `96d56620e5914b2eb596927758850904`, exit 0). Brak błędów

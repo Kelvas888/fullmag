@@ -1,6 +1,14 @@
 # P8-53 — bezpieczne zastosowanie nowego backendu w workspace
 
-[P8-53BM](53bm-camera-preservation.md), 13.10.2026:
+Aktualny odbiór 14.10.2026: [P8-53BO](53bo-grid-modal-correlation.md)
+potwierdził pełny pojedynczy restart niepustego modelu z dirty dokumentem
+i kamerą, a następnie Grid/Compute/Close (81eb7f40, exit 0). Historyczne
+checkpointy poniżej nie cofają tego dowodu. Nadal otwarte są dwa restarty
+w jednej sesji, pełna macierz Inspector/view state/fault, integracja i wydanie.
+Dokładne granice i kontrakt następnego przyrostu:
+[P8-53BS](53bs-restart-remaining-gates.md). **P8-53 pozostaje IN PROGRESS.**
+
+Historyczny checkpoint wejściowy — [P8-53BM](53bm-camera-preservation.md), 13.10.2026:
 potwierdzono utratę projekcji kamery podczas rzeczywistego restartu.
 Owner v2 przenosi ścisły snapshot przez typowane API i wymaga zgodnego
 ACK/readback przed publikacją. Aktywna sesja bez zaobserwowanej kamery
@@ -9,8 +17,10 @@ Managed Chrome fixture: 36/36 PASS w zakresie ownerów i diagnostyki capture.
 Natywna bramka API pakietu `1626bd35933b27d1edc6cbdb812c81429a6f5a8a21819e092b6c86e40fed872b`
 potwierdziła rewizję camera-only PATCH oraz absent/null/number skali
 (301 kontroli, receipt `1995c74607ba4a4a852388b1a854447a`).
-Rzeczywisty restart z odtworzeniem kamery po poprawce pozostaje otwarty;
-fixture i bramka HTTP nie zastępują tego dowodu.
+W tym checkpointcie rzeczywisty restart z odtworzeniem kamery po poprawce
+pozostawał otwarty. Najnowszy 53BO potwierdza jeden taki przebieg; fixture
+i bramka HTTP same nie zastępowały tego dowodu. Publiczny restart pozostaje
+nieudostępniony (`restart_available=false`), niezależnie od prywatnego PASS.
 
 [P8-53BL](53bl-inspector-owner-inventory.md), 13.10.2026:
 inwentaryzacja 23 zarejestrowanych ownerów Inspectora zakończona w źródłach.
