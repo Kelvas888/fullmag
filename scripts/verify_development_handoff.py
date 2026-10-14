@@ -71,6 +71,9 @@ SOURCE_PATHS = (
     "scripts/test_windows_development_fixture_publication.py",
     "scripts/fullmag_storage.py",
     "scripts/test_fullmag_storage.py",
+    "scripts/test_bootstrap_workflow_contract.py",
+    ".github/workflows/bootstrap.yml",
+    "scripts/ci/run_frontend3d_required_gate.sh",
     "scripts/windows/runtime_bundle.py",
     "scripts/windows/compiler_inputs.py",
     "scripts/windows/build_snapshot.py",
@@ -106,7 +109,8 @@ def source_identity(repo: Path) -> str:
 
 
 def run(repo_root: str, suite: str = "handoff") -> int:
-    patterns = {"handoff": "test_*development_*.py", "storage": "test_fullmag_storage.py"}
+    patterns = {"handoff": "test_*development_*.py", "storage": "test_fullmag_storage.py",
+                "bootstrap": "test_bootstrap_workflow_contract.py"}
     if suite not in patterns:
         raise storage.StorageError("Unknown interpreted check suite")
     layout = storage.resolve_layout(repo_root, "development-handoff-checks")
@@ -188,7 +192,7 @@ def run(repo_root: str, suite: str = "handoff") -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", required=True)
-    parser.add_argument("--suite", choices=("handoff", "storage"), default="handoff")
+    parser.add_argument("--suite", choices=("handoff", "storage", "bootstrap"), default="handoff")
     args = parser.parse_args()
     try:
         return run(args.repo_root, args.suite)

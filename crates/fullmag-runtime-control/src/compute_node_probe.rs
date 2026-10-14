@@ -635,7 +635,7 @@ fn read_linux_v2_cpu_quota(
 
     let mut path = current.to_path_buf();
     let mut found_quota_file = false;
-    let mut tightest_limit = None;
+    let mut tightest_limit: Option<u64> = None;
     loop {
         match fs::read_to_string(path.join("cpu.max")) {
             Ok(value) => {
@@ -694,7 +694,7 @@ fn read_linux_v1_cpu_quota(
     use std::fs;
 
     let mut path = current.to_path_buf();
-    let mut tightest_limit = None;
+    let mut tightest_limit: Option<u64> = None;
     loop {
         let quota = fs::read_to_string(path.join("cpu.cfs_quota_us"))
             .with_context(|| format!("read cgroup v1 CPU quota at {}", path.display()))?;

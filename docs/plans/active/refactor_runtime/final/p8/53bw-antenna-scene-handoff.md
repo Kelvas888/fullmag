@@ -124,3 +124,8 @@ AST przed/po jest identyczne. Testowany raw SHA-256 helpera:
 końcowy raw SHA-256:
 `c19b096eb7df401d931ea4a977fbe092e07d5cfce5242edfe0d32bf7e3a09362`.
 Nie utożsamia się końcowego raw fingerprintu z testowanym, mimo niezmienionego AST.
+
+Aktualizacja: użytkownik zatwierdził usunięcie wyłącznie własnego formattera.
+Operacja jest zakończona i potwierdzona w
+[53BY](53by-ci-harness-and-quota-types.md); wcześniejsze oczekiwanie powyżej
+jest zapisem historycznej blokady, nie aktualnym stanem.

@@ -243,7 +243,17 @@ jobs:
         steps = workflow["jobs"]["rust-contracts"]["steps"]
         index = next(i for i, step in enumerate(steps)
                      if step.get("name") == "Resolve storage for API artifact fixtures")
-        self.assertEqual(steps[index + 1]["name"], "Run Rust quantity, API and CLI contracts")
+        contract_indices = [
+            i for i, step in enumerate(steps)
+            if "cargo test" in step.get("run", "")
+            or "rust-quantity-api-cli-contracts" in step.get("run", "")
+        ]
+        self.assertTrue(contract_indices, "Rust contract steps must be present")
+        self.assertIn("Run Rust quantity, API and CLI contracts",
+                      [steps[i].get("name") for i in contract_indices])
+        for contract_index in contract_indices:
+            self.assertLess(index, contract_index,
+                            f"Storage must precede {steps[contract_index].get('name')}")
         lines = steps[index]["run"].rstrip().splitlines()
         self.assertEqual(lines[-1], "PY")
         source = "\n".join(lines[1:-1])
@@ -292,14 +302,12 @@ jobs:
             python_job,
         )
         self.assertNotIn("actions/checkout@v4", workflow)
-        self.assertEqual(
-            workflow.count("actions/checkout@v7"),
-            workflow.count("- name: Checkout"),
-        )
-        self.assertEqual(
-            workflow.count("actions/setup-node@v7"),
-            workflow.count("- name: Setup Node.js"),
-        )
+        references = _workflow_uses(workflow)
+        for action in ("actions/checkout", "actions/setup-node"):
+            action_references = [reference for reference in references
+                                 if reference.startswith(action + "@")]
+            self.assertTrue(action_references, f"Required action is missing: {action}")
+            self.assertEqual(set(action_references), {action + "@v7"})
         self.assertIn("actions/setup-python@v7", workflow)
         self.assertIn("actions/upload-artifact@v7", workflow)
         self.assertIn("pnpm/action-setup@v6", workflow)
