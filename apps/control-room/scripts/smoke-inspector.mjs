@@ -5878,6 +5878,13 @@ function inspectorFrequencyResponseSweep(
 
 
 async function qualifyFirstRunGuideRouting(page, inspector, screenshotFiles, fixture) {
+  const trigger = page.getByTestId("header-readiness-helper-trigger");
+  await trigger.waitFor({ state: "visible", timeout: 30_000 });
+  assert(
+    !(await page.getByTestId("scratch-authoring-guide").count()),
+    "Readiness helper must not be permanently mounted in the main window before the user opens it.",
+  );
+  await trigger.click();
   const guide = page.getByTestId("scratch-authoring-guide");
   await guide.waitFor({ state: "visible", timeout: 30_000 });
   const material = guide.locator('[data-check-id="material"]');
