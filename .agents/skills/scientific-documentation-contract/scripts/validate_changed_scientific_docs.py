@@ -48,6 +48,7 @@ EXEMPT_NAMES = {"README.md", "index.md"}
 EXEMPT_PATHS = {
     # Governance for authoring physics notes, not a physical/numerical model note.
     "docs/physics/0000-physics-documentation-standard.md",
+    "public_docs/site/physics/conventions.md",
 }
 
 
