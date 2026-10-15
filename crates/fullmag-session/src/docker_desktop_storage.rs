@@ -283,6 +283,97 @@ fn reject_link_ancestors(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn open_regular_nofollow(path: &Path) -> Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let absolute = absolute_path(path)?;
+    let mut components = Vec::new();
+    for component in absolute.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => components.push(name),
+            Component::ParentDir => {
+                bail!(
+                    "evidence path contains a parent-directory component: {}",
+                    path.display()
+                );
+            }
+            Component::Prefix(_) => {
+                bail!(
+                    "evidence path has an unsupported path prefix: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    let Some((file_name, parents)) = components.split_last() else {
+        bail!(
+            "evidence path has no regular file component: {}",
+            path.display()
+        );
+    };
+
+    // Path checks followed by a path-based open leave a race in which a
+    // Windows-folder ancestor can be replaced by a reparse point.  Pin every
+    // ancestor directory and resolve children through its descriptor instead.
+    let mut directory = {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        options
+            .open("/")
+            .context("opening the evidence path root directory")?
+    };
+    for component in parents {
+        let name = CString::new(component.as_bytes())
+            .context("evidence path component contains an embedded NUL")?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "opening evidence directory component {}",
+                    component.to_string_lossy()
+                )
+            });
+        }
+        directory = unsafe { File::from_raw_fd(descriptor) };
+    }
+
+    let name = CString::new(file_name.as_bytes())
+        .context("evidence file name contains an embedded NUL")?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening evidence file {}", path.display()));
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let opened = file.metadata()?;
+    if !opened.is_file() || is_reparse(&opened) {
+        bail!(
+            "opened evidence file is not a regular non-link file: {}",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
+#[cfg(not(target_os = "linux"))]
 fn open_regular_nofollow(path: &Path) -> Result<File> {
     reject_link_ancestors(path)?;
     let metadata = fs::symlink_metadata(path)
@@ -428,62 +519,124 @@ fn validate_runtime_identity(attestation: &HostAttestation) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn canonical_candidate(root: &Path, state: &Path) -> Result<(PathBuf, PathBuf)> {
-    let absolute = absolute_path(root)?;
-    if absolute
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        bail!("session root contains a parent-directory component");
+struct PinnedCandidate {
+    candidate: PathBuf,
+    existing: PathBuf,
+    state_path: PathBuf,
+    state_file: File,
+    existing_file: File,
+}
+
+#[cfg(target_os = "linux")]
+fn normalized_components(path: &Path, label: &str) -> Result<(PathBuf, Vec<std::ffi::OsString>)> {
+    let absolute = absolute_path(path)?;
+    let mut components = Vec::new();
+    for component in absolute.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => components.push(name.to_os_string()),
+            Component::ParentDir => {
+                bail!("{label} contains a parent-directory component");
+            }
+            Component::Prefix(_) => {
+                bail!("{label} has an unsupported path prefix");
+            }
+        }
     }
-    let state = absolute_path(state)?;
-    reject_link_ancestors(&state)?;
-    let state_canonical = fs::canonicalize(&state)?;
-    let mut existing_probe = absolute.clone();
-    loop {
-        match fs::symlink_metadata(&existing_probe) {
-            Ok(_) => {
-                reject_link_ancestors(&existing_probe)?;
+    let mut normalized = PathBuf::from("/");
+    for component in &components {
+        normalized.push(component);
+    }
+    Ok((normalized, components))
+}
+
+#[cfg(target_os = "linux")]
+fn open_directory_child(parent: &File, component: &std::ffi::OsStr) -> std::io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(component.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path component contains an embedded NUL",
+        )
+    })?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_root_directory() -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    options.open("/")
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_candidate(root: &Path, state: &Path) -> Result<PinnedCandidate> {
+    let (state_path, state_components) = normalized_components(state, "Docker state path")?;
+    let (candidate_path, root_components) = normalized_components(root, "session root")?;
+    if root_components.len() < state_components.len()
+        || !root_components
+            .iter()
+            .zip(state_components.iter())
+            .all(|(root, state)| root == state)
+    {
+        bail!("session root escapes the Docker state mount");
+    }
+
+    let mut state_file = open_root_directory().context("opening the Docker state root")?;
+    for component in &state_components {
+        state_file = open_directory_child(&state_file, component).with_context(|| {
+            format!(
+                "opening Docker state directory component {}",
+                component.to_string_lossy()
+            )
+        })?;
+    }
+
+    let mut existing_file = state_file.try_clone()?;
+    let mut existing_path = state_path.clone();
+    for component in root_components.iter().skip(state_components.len()) {
+        match open_directory_child(&existing_file, component) {
+            Ok(next) => {
+                existing_file = next;
+                existing_path.push(component);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 break;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if !existing_probe.pop() {
-                    bail!("session root has no existing ancestor");
-                }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "opening session root directory component {}",
+                        component.to_string_lossy()
+                    )
+                });
             }
-            Err(error) => return Err(error).context("checking session root path components"),
         }
     }
-    let mut existing = absolute.clone();
-    let mut missing = Vec::new();
-    loop {
-        match fs::symlink_metadata(&existing) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || is_reparse(&metadata) {
-                    bail!("session root traverses a symlink or reparse point");
-                }
-                let canonical = fs::canonicalize(&existing)?;
-                let candidate = missing
-                    .iter()
-                    .rev()
-                    .fold(canonical, |path, component| path.join(component));
-                if !candidate.starts_with(&state_canonical) {
-                    bail!("session root escapes the Docker state mount");
-                }
-                return Ok((candidate, existing));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let component = existing
-                    .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("session root has no existing ancestor"))?;
-                missing.push(component.to_os_string());
-                if !existing.pop() {
-                    bail!("session root has no existing ancestor");
-                }
-            }
-            Err(error) => return Err(error).context("checking session root ancestors"),
-        }
-    }
+
+    Ok(PinnedCandidate {
+        candidate: candidate_path,
+        existing: existing_path,
+        state_path,
+        state_file,
+        existing_file,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -491,7 +644,11 @@ fn admit_container_identity(root: &Path, grant: &SessionGrant) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     let state = Path::new(CONTAINER_ROOT);
-    let state_metadata = fs::metadata(state).context("statting Docker state mount")?;
+    let pinned = canonical_candidate(root, state)?;
+    let state_metadata = pinned
+        .state_file
+        .metadata()
+        .context("statting pinned Docker state mount")?;
     if !state_metadata.is_dir()
         || state_metadata.dev() != grant.root_device
         || state_metadata.ino() != grant.root_inode
@@ -503,12 +660,15 @@ fn admit_container_identity(root: &Path, grant: &SessionGrant) -> Result<()> {
     if namespace.ino() != grant.mount_namespace_inode {
         bail!("current mount namespace differs from the session grant");
     }
-    let (candidate, existing) = canonical_candidate(root, state)?;
-    let state_canonical = fs::canonicalize(state)?;
-    if !candidate.starts_with(&state_canonical) {
+    if !pinned.candidate.starts_with(&pinned.state_path) {
         bail!("session root is outside the Docker state mount");
     }
-    let existing_metadata = fs::metadata(&existing)?;
+    let existing_metadata = pinned.existing_file.metadata().with_context(|| {
+        format!(
+            "statting pinned session root ancestor {}",
+            pinned.existing.display()
+        )
+    })?;
     if existing_metadata.dev() != state_metadata.dev() {
         bail!("session root crosses a filesystem device boundary");
     }
@@ -740,5 +900,47 @@ mod tests {
         fs::write(&target, b"{}").unwrap();
         symlink(&target, &link).unwrap();
         assert!(read_bounded_regular_file(&link, 32).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_rejects_existing_ancestor_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let link = directory.path().join("link");
+        let target = real.join("target.json");
+        fs::create_dir(&real).unwrap();
+        fs::write(&target, b"{}").unwrap();
+        symlink(&real, &link).unwrap();
+        assert!(read_bounded_regular_file(&link.join("target.json"), 32).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_candidate_rejects_existing_ancestor_symlink() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let real = state.join("real");
+        let link = state.join("link");
+        fs::create_dir_all(&real).unwrap();
+        symlink(&real, &link).unwrap();
+        let root = link.join("session-store");
+        assert!(canonical_candidate(&root, &state).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_reader_rejects_parent_component_before_descriptor_walk() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.json");
+        fs::write(&target, b"{}").unwrap();
+        let escaped = directory
+            .path()
+            .join("child")
+            .join("..")
+            .join("target.json");
+        assert!(read_bounded_regular_file(&escaped, 32).is_err());
     }
 }

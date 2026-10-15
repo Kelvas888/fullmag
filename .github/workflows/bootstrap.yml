@@ -686,6 +686,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libglu1-mesa
 
+      - name: Verify Docker storage probes and runtime lifecycle contracts
+        run: |
+          python -B scripts/test_fullmag_docker_runtime.py -v
+          python -B scripts/test_windows_folder_evidence.py -v
+          python -B scripts/test_windows_folder_probe.py -v
+
       - name: Audit managed FEM CPU-only verification configuration
         run: python scripts/test_audit_fem_cpu_only_runtime.py -v
 
@@ -832,6 +838,9 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+
+      - name: Verify Windows Docker attestation publication barriers
+        run: python -B scripts/test_windows_folder_evidence.py -v
 
       - name: Verify disposable compiler storage and environment restoration
         run: python scripts/test_windows_volatile_build_storage.py -v
