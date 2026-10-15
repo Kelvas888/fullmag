@@ -605,6 +605,96 @@ class DockerRuntimeContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runtime.compose_spec(image, Path("/state-host"), port)
 
+    def test_toolchain_preflight_is_pinned_isolated_and_validates_manifest(self):
+        manifest = {
+            "schema": runtime.TOOLCHAIN_MANIFEST_SCHEMA,
+            "declared": {},
+            "actual": {"source_commits": {
+                name: "a" * 40 for name in runtime.TOOLCHAIN_SOURCE_COMMITS
+            }},
+            "latest": {"status": "not-queried"},
+            "build": {"phase": "runtime"},
+        }
+        with patch.object(runtime, "docker", return_value=json.dumps(manifest)) as docker_call:
+            self.assertEqual(runtime._preflight_toolchain_image("sha256:" + "b" * 64), manifest)
+        command = docker_call.call_args.args
+        self.assertEqual(command[:8], (
+            "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--cap-drop",
+        ))
+        self.assertIn("no-new-privileges:true", command)
+        self.assertIn("--entrypoint", command)
+        self.assertIn("/usr/local/bin/python3", command)
+        self.assertNotIn("--gpus", command)
+        self.assertNotIn("--mount", command)
+        self.assertNotIn("--env", command)
+        self.assertEqual(
+            docker_call.call_args.kwargs["timeout"],
+            runtime.TOOLCHAIN_PREFLIGHT_TIMEOUT_SECONDS,
+        )
+
+        for changed in (
+            {**manifest, "schema": "fullmag.old-toolchain.v0"},
+            {**manifest, "actual": {}},
+            {**manifest, "actual": {"source_commits": {
+                **manifest["actual"]["source_commits"], "petsc": ""
+            }}},
+        ):
+            with self.subTest(changed=changed):
+                with patch.object(runtime, "docker", return_value=json.dumps(changed)):
+                    with self.assertRaises(ValueError):
+                        runtime._preflight_toolchain_image("sha256:" + "b" * 64)
+
+        with self.assertRaisesRegex(ValueError, "immutable SHA-256"):
+            runtime._preflight_toolchain_image("fullmag/fem-gpu:latest")
+
+    @unittest.skipIf(os.name == "nt", "Linux O_NOFOLLOW probe contract")
+    def test_toolchain_probe_requires_bounded_regular_nonsymlink_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "dependency-versions.json"
+            manifest.write_text('{"schema":"fullmag.docker.fem-gpu-dependencies.v1"}', encoding="utf-8")
+            command = [sys.executable, "-c", runtime._TOOLCHAIN_MANIFEST_PROBE,
+                       str(manifest), str(runtime.TOOLCHAIN_MANIFEST_MAX_BYTES)]
+            accepted = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(json.loads(accepted.stdout), {"schema": runtime.TOOLCHAIN_MANIFEST_SCHEMA})
+
+            link = root / "manifest-link"
+            link.symlink_to(manifest)
+            rejected_link = subprocess.run(
+                [sys.executable, "-c", runtime._TOOLCHAIN_MANIFEST_PROBE,
+                 str(link), str(runtime.TOOLCHAIN_MANIFEST_MAX_BYTES)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(rejected_link.returncode, 0)
+
+            oversized = root / "oversized"
+            oversized.write_bytes(b"x" * 33)
+            rejected_size = subprocess.run(
+                [sys.executable, "-c", runtime._TOOLCHAIN_MANIFEST_PROBE,
+                 str(oversized), "32"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(rejected_size.returncode, 0)
+
+    def test_old_configured_toolchain_is_rejected_before_capture_or_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            layout = {"storage_root": str(root), "runs_root": str(root / "runs" / "task"),
+                      "worktree_id": "task", "repo_root": str(root / "repo")}
+            with patch.object(runtime.storage, "resolve_layout", return_value=layout), \
+                    patch("local_runner.build_executor.configured_build",
+                          return_value={"image_digest": "sha256:" + "e" * 64}), \
+                    patch.object(runtime, "_preflight_toolchain_image",
+                                 side_effect=ValueError("missing dependency manifest")) as preflight, \
+                    patch("local_runner.source.capture_source") as capture, \
+                    patch("local_runner.container_client.request") as request:
+                with self.assertRaisesRegex(ValueError, "missing dependency manifest"):
+                    runtime.submit_build(root / "repo", "b" * 40)
+            preflight.assert_called_once_with("sha256:" + "e" * 64)
+            capture.assert_not_called()
+            request.assert_not_called()
+
     @unittest.skipIf(os.name == "nt", "Bash shell admission is checked on Linux")
     def test_just_shell_admits_quoted_recipe_and_rejects_composite(self):
         repo = Path(__file__).resolve().parents[1]
@@ -667,7 +757,9 @@ class DockerRuntimeContract(unittest.TestCase):
                     patch.object(runtime, "read_json", return_value={"worktree_id": layout["worktree_id"], "repo_root": layout["repo_root"]}), \
                     patch.object(runtime.storage, "initialize"), \
                     patch.object(runtime.storage, "build_lock", return_value=nullcontext()), \
-                    patch("local_runner.build_executor.configured_build"), \
+                    patch("local_runner.build_executor.configured_build",
+                          return_value={"image_digest": "sha256:" + "e" * 64}), \
+                    patch.object(runtime, "_preflight_toolchain_image", return_value={}), \
                     patch("local_runner.build_source.native_identity", return_value={}), \
                     patch("local_runner.build_source.bind_identity", return_value={}), \
                     patch("local_runner.source.capture_source", return_value=manifest) as capture, \
@@ -742,7 +834,9 @@ class DockerRuntimeContract(unittest.TestCase):
                     patch.object(runtime.storage, "build_lock", return_value=nullcontext()), \
                     patch("docker_development_inputs.main_checkout", return_value=main), \
                     patch.object(runtime.storage, "worktree_records", return_value=[{"worktree": str(main)}]), \
-                    patch("local_runner.build_executor.configured_build"), \
+                    patch("local_runner.build_executor.configured_build",
+                          return_value={"image_digest": "sha256:" + "e" * 64}), \
+                    patch.object(runtime, "_preflight_toolchain_image", return_value={}), \
                     patch("local_runner.build_source.native_identity", return_value=native) as identity, \
                     patch("local_runner.build_source.bind_identity", return_value=native), \
                     patch("local_runner.source.capture_source", return_value=manifest) as capture, \

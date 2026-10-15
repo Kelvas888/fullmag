@@ -41,6 +41,38 @@ REQUIRED_BINARIES = (
     "fullmag-api-accepted-fem-preparer", "fullmag-api-accepted-fem-preparation-supervisor",
     "fullmag-api-preparation-retry",
 )
+TOOLCHAIN_MANIFEST_PATH = "/opt/fullmag-deps/share/fullmag/dependency-versions.json"
+TOOLCHAIN_MANIFEST_SCHEMA = "fullmag.docker.fem-gpu-dependencies.v1"
+TOOLCHAIN_SOURCE_COMMITS = ("mfem", "libceed", "hypre", "petsc", "slepc")
+TOOLCHAIN_PREFLIGHT_TIMEOUT_SECONDS = 60
+TOOLCHAIN_MANIFEST_MAX_BYTES = 2 * 1024 * 1024
+_TOOLCHAIN_MANIFEST_PROBE = r'''
+import os
+import stat
+import sys
+
+path, maximum_text = sys.argv[1:]
+maximum = int(maximum_text)
+flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+descriptor = os.open(path, flags)
+try:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit("dependency manifest is not a regular file")
+    if metadata.st_size <= 0 or metadata.st_size > maximum:
+        raise SystemExit("dependency manifest exceeds its bounded size")
+    chunks = bytearray()
+    while len(chunks) <= maximum:
+        chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - len(chunks)))
+        if not chunk:
+            break
+        chunks.extend(chunk)
+finally:
+    os.close(descriptor)
+if len(chunks) > maximum:
+    raise SystemExit("dependency manifest exceeds its bounded size")
+sys.stdout.buffer.write(chunks)
+'''
 
 
 def validate_runtime_artifacts(package):
@@ -48,6 +80,59 @@ def validate_runtime_artifacts(package):
                      "web/index.html", "_fullmag_core.so"):
         if not (package / relative).is_file():
             raise ValueError(f"Missing runtime artifact: {relative}")
+
+
+def _validate_toolchain_manifest(value):
+    if not isinstance(value, dict):
+        raise ValueError("Configured FEM/GPU image returned a non-object dependency manifest")
+    if value.get("schema") != TOOLCHAIN_MANIFEST_SCHEMA:
+        raise ValueError("Configured FEM/GPU image has an unsupported dependency manifest schema")
+    for field in ("declared", "actual", "latest"):
+        if field not in value or not isinstance(value[field], dict):
+            raise ValueError(f"Configured FEM/GPU dependency manifest is missing object field: {field}")
+    actual = value["actual"]
+    commits = actual.get("source_commits")
+    if not isinstance(commits, dict):
+        raise ValueError("Configured FEM/GPU dependency manifest has no actual.source_commits object")
+    missing = [
+        name for name in TOOLCHAIN_SOURCE_COMMITS
+        if not isinstance(commits.get(name), str) or not commits[name].strip()
+    ]
+    if missing:
+        raise ValueError(
+            "Configured FEM/GPU dependency manifest has missing source commits: "
+            + ", ".join(missing)
+        )
+    return value
+
+
+def _preflight_toolchain_image(image):
+    """Read and validate the runtime dependency manifest from one pinned image."""
+
+    if not isinstance(image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+        raise ValueError("Configured fem-gpu-release image must be a full immutable SHA-256 ID")
+    command = [
+        "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true", "--user", "65532:65532",
+        "--pids-limit", "16", "--memory", "64m", "--cpus", "0.25",
+        "--entrypoint", "/usr/local/bin/python3", image, "-c",
+        _TOOLCHAIN_MANIFEST_PROBE, TOOLCHAIN_MANIFEST_PATH, str(TOOLCHAIN_MANIFEST_MAX_BYTES),
+    ]
+    try:
+        raw = docker(*command, timeout=TOOLCHAIN_PREFLIGHT_TIMEOUT_SECONDS)
+    except DockerOutcomeUnknown:
+        raise
+    except Exception as error:
+        raise ValueError(
+            "Configured fem-gpu-release image failed the dependency manifest preflight"
+        ) from error
+    if not isinstance(raw, str) or len(raw.encode("utf-8", "replace")) > TOOLCHAIN_MANIFEST_MAX_BYTES:
+        raise ValueError("Configured FEM/GPU dependency manifest exceeds its bounded output size")
+    try:
+        manifest = json.loads(raw)
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise ValueError("Configured FEM/GPU image returned invalid dependency manifest JSON") from error
+    return _validate_toolchain_manifest(manifest)
 
 
 class DockerOutcomeUnknown(RuntimeError):
@@ -277,7 +362,10 @@ def submit_build(repo, commit=None, *, development=False, source_root=None):
     # A main-checkout snapshot must use the main layout and registration too.
     layout = storage.resolve_layout(source_repo, PROFILE)
     owner = getpass.getuser()
-    configured_build(layout, owner, "fem-gpu-release")
+    configured = configured_build(layout, owner, "fem-gpu-release")
+    if not isinstance(configured, dict):
+        raise ValueError("Configured fem-gpu-release build profile is not an object")
+    _preflight_toolchain_image(configured.get("image_digest"))
     health = request(layout, owner=owner, method="GET", path="/health")
     if health.get("accepting_jobs") is not True or "fem-gpu-release" not in health.get("allowed_profiles", []):
         raise ValueError("The existing runner is not accepting the GPU release profile")
