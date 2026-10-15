@@ -779,14 +779,14 @@ fn parse_docker_host_init_args(
     Ok(args)
 }
 
-fn required_reported<T>(value: &Reported<T>, label: &str) -> Result<&T> {
+fn required_reported<'a, T>(value: &'a Reported<T>, label: &str) -> Result<&'a T> {
     match value {
         Reported::Available { value } => Ok(value),
         Reported::Unavailable { .. } => bail!("Docker host profile requires current {label}"),
     }
 }
 
-fn required_observation<T>(value: &fullmag_session::compute_node_snapshot::Observation<T>, label: &str) -> Result<&T> {
+fn required_observation<'a, T>(value: &'a fullmag_session::compute_node_snapshot::Observation<T>, label: &str) -> Result<&'a T> {
     match value {
         fullmag_session::compute_node_snapshot::Observation::Available { value } => Ok(value),
         fullmag_session::compute_node_snapshot::Observation::Unavailable { .. } => {

@@ -268,9 +268,11 @@ fn verify_host_worker_launch_for_claim(
         .read_active_resource_lease_for_task(claim.run_id.as_str(), claim.task_id.as_str())?
         .context("worker execution requires its active local lease")?;
     validate_active_fms_lease_matches_claim(&lease, claim)?;
+    let require_gpu_binding =
+        requires_gpu_host_binding(lease.kind, require_gpu_binding);
     let Some(binding) = lease.host_launch_binding.as_ref() else {
         if require_gpu_binding {
-            bail!("accepted FEM GPU execution requires a host launch binding");
+            bail!("accepted GPU execution requires a host launch binding");
         }
         return Ok(None);
     };
@@ -304,6 +306,13 @@ fn verify_host_worker_launch_for_claim(
         return Ok(Some(uuid.clone()));
     }
     Ok(None)
+}
+
+fn requires_gpu_host_binding(
+    lease_kind: fullmag_session::FmsResourceKind,
+    caller_requires_gpu_binding: bool,
+) -> bool {
+    caller_requires_gpu_binding || lease_kind == fullmag_session::FmsResourceKind::Gpu
 }
 
 fn verify_host_worker_launch(
@@ -2854,5 +2863,21 @@ mod accepted_fem_runtime_tests {
         ] {
             assert!(source.contains(needle), "missing host GPU fence: {needle}");
         }
+    }
+
+    #[test]
+    fn common_host_launch_gate_requires_binding_for_gpu_but_not_cpu() {
+        assert!(super::requires_gpu_host_binding(
+            fullmag_session::FmsResourceKind::Gpu,
+            false
+        ));
+        assert!(!super::requires_gpu_host_binding(
+            fullmag_session::FmsResourceKind::Cpu,
+            false
+        ));
+        assert!(super::requires_gpu_host_binding(
+            fullmag_session::FmsResourceKind::Cpu,
+            true
+        ));
     }
 }

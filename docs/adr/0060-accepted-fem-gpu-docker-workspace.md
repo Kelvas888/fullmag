@@ -53,6 +53,19 @@ na globalny ledger ani nie tworzymy ukrytego named volume. Jednorazowy helper
 montowania jest narzędziem utrzymania; frontend i backend pozostają dwiema
 usługami aplikacji. Frontend nie otrzymuje ledgeru, GPU ani accepted store.
 
+## Granica aktualnej implementacji UI
+
+Durable accepted task i bieżący journal komend live Workspace są odrębnymi
+ścieżkami. Ten etap dodaje GPU do workera accepted; nie podłącza automatycznie
+komend formularza `mesh/run/relax/solve` do tego workera. Backend Docker
+uruchamia obecnie API i runtime service, bez owned konsumenta live command
+queue. Wpięcie formularza wymaga kanonicznej materializacji task/lease oraz
+committed host allocation przed uruchomieniem solvera; ta część jest nadal
+**NOT IMPLEMENTED**. Samo dodanie attached CLI ominęłoby wspólny ledger CPU/GPU
+i nie jest dopuszczonym rozwiązaniem. Uruchomienie skryptu z aktywnym modelem
+oraz `wait_for_solve` pozostaje osobnym niezakończonym etapem. Nie należy
+przedstawiać obecnego Docker Workspace jako gotowego do Compute z formularza.
+
 ## Kontrakty i konsumenci
 
 Zmiana korzysta z istniejących typed study outputs, accepted-state reference,
