@@ -16,6 +16,27 @@ import run_managed_browser as managed
 
 
 class DockerRuntimeContract(unittest.TestCase):
+    def test_development_backend_package_does_not_require_static_frontend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory)
+            (package / "bin").mkdir()
+            for name in runtime.REQUIRED_BINARIES:
+                (package / "bin" / name).write_bytes(b"artifact")
+            (package / "_fullmag_core.so").write_bytes(b"extension")
+            runtime.validate_runtime_artifacts(package, development=True)
+            with self.assertRaisesRegex(ValueError, "web/index.html"):
+                runtime.validate_runtime_artifacts(package)
+            (package / "bin" / "fullmag-api").unlink()
+            with self.assertRaisesRegex(ValueError, "bin/fullmag-api"):
+                runtime.validate_runtime_artifacts(package, development=True)
+
+    def test_direct_project_name_is_validated_before_startup_mutations(self):
+        with patch.object(runtime.storage, "resolve_layout") as resolve:
+            for name in ("../fullmag", "Fullmag", "fullmag;other", ""):
+                with self.assertRaisesRegex(ValueError, "Invalid Compose project name"):
+                    runtime.start(None, None, 3197, project_name=name)
+            resolve.assert_not_called()
+
     @unittest.skipUnless(os.environ.get("FULLMAG_TEST_COMPOSE_CONFIG") == "1", "Read-only Compose CLI integration gate")
     def test_workspace_uses_one_loopback_port_and_explicit_gpu(self):
         service = runtime.compose_spec("sha256:" + "a" * 64, Path("/state-host"), 3197,

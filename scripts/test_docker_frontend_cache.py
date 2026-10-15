@@ -80,6 +80,23 @@ class FakeDocker:
 
 
 class FrontendCacheTests(unittest.TestCase):
+    def test_new_windows_cache_checks_full_allocation_capacity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {"storage_root": root, "backing_image": root / "cache.ext4"}
+            with mock.patch.object(cache.shutil, "disk_usage", return_value=type("Usage", (), {"free": 1})()):
+                with self.assertRaisesRegex(cache.FrontendCacheError, "free bytes"):
+                    cache._require_cache_capacity(paths, windows=True)
+            self.assertFalse(paths["backing_image"].exists())
+
+    def test_existing_windows_cache_does_not_reserve_its_size_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {"storage_root": root, "backing_image": root / "cache.ext4"}
+            paths["backing_image"].touch()
+            with mock.patch.object(cache.shutil, "disk_usage", side_effect=AssertionError("unexpected reservation")):
+                cache._require_cache_capacity(paths, windows=True)
+
     def test_guest_v1_preserves_seed_contract_without_host_cache_metadata(self):
         from docker_development_inputs import guest_manifest, HOST_CACHE_METADATA_KEYS
 

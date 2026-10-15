@@ -1,17 +1,16 @@
 # Fullmag development on Docker Desktop. Sources stay in the selected checkout.
-# The managed launcher resolves these paths, builds the backend on request,
-# checks Windows storage, and records the fully resolved Compose configuration.
-name: fullmag-development
+# The direct development launcher resolves paths, builds inside the backend
+# service on request, checks Windows storage and records the resolved config.
+name: fullmag
 
 services:
   backend:
-    image: ${FULLMAG_DEV_IMAGE:?Prepare the development image with the managed launcher}
+    image: ${FULLMAG_DEV_IMAGE:?Prepare the development toolchain image}
     build:
       context: ./docker/all-in-one
-      dockerfile: Dockerfile.dev
+      dockerfile: Dockerfile.backend
       args:
-        RUNTIME_BASE: ${FULLMAG_TOOLCHAIN_IMAGE:?Build the Fullmag toolchain first}
-        FULLMAG_TOOLCHAIN_IMAGE_ID: ${FULLMAG_TOOLCHAIN_IMAGE_ID:?Pin the inspected toolchain image ID}
+        DEV_BASE: ${FULLMAG_DEVELOPMENT_BASE_IMAGE:-fullmag/development-base:local}
     pull_policy: never
     init: true
     user: "65532:65532"
@@ -38,12 +37,12 @@ services:
         bind: {create_host_path: false}
       # Compiled backend output, not a Windows executable or source copy.
       - type: bind
-        source: ${FULLMAG_BACKEND_PACKAGE:?Build the backend through the managed queue}
+        source: ${FULLMAG_BACKEND_PACKAGE:?Build the backend inside its Compose service}
         target: /opt/fullmag/package
         read_only: true
         bind: {create_host_path: false}
       - type: bind
-        source: ${FULLMAG_PACKAGE_PROVENANCE:?Managed package provenance is required}
+        source: ${FULLMAG_PACKAGE_PROVENANCE:?Backend build provenance is required}
         target: /opt/fullmag/provenance.json
         read_only: true
         bind: {create_host_path: false}
@@ -82,6 +81,11 @@ services:
       NVIDIA_VISIBLE_DEVICES: void
     ports: ["127.0.0.1:${FULLMAG_HTTP_PORT:-3197}:8080"]
     volumes:
+      - type: bind
+        source: ${FULLMAG_SOURCE_ROOT:?Select the Windows source checkout}
+        target: /opt/fullmag/source
+        read_only: true
+        bind: {create_host_path: false}
       # Linux dependencies, Next output and HMR logs stay out of the checkout.
       # The frontend-cache-v1 overlay replaces only the four Linux cache/dependency
       # children below; the Windows state bind remains the owner of sessions, logs

@@ -1,0 +1,34 @@
+# Apply to compose.dev.yaml and compose.backend-cache.yaml for an explicit build.
+# Application compilers run in this backend service, outside the legacy queue.
+services:
+  backend:
+    entrypoint: ["/usr/local/bin/python3", "/opt/fullmag/backend_dev.py"]
+    command:
+      - prepare
+      - --source-tar
+      - /input/source.tar
+      - --manifest
+      - /input/manifest.json
+      - --output
+      - /opt/fullmag/package
+    healthcheck: {disable: true}
+    environment:
+      HOME: /build/home
+      CARGO_HOME: /build/cargo
+      FULLMAG_TOOLCHAIN_IMAGE_ID: ${FULLMAG_TOOLCHAIN_IMAGE_ID:?Pin the toolchain identity}
+    volumes:
+      - type: bind
+        source: ${FULLMAG_BACKEND_SOURCE_TAR:?Capture the selected checkout first}
+        target: /input/source.tar
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${FULLMAG_BACKEND_SOURCE_MANIFEST:?Capture the selected checkout first}
+        target: /input/manifest.json
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${FULLMAG_BACKEND_PACKAGE:?Select this build's output directory}
+        target: /opt/fullmag/package
+        read_only: false
+        bind: {create_host_path: false}

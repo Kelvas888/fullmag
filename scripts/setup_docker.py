@@ -348,14 +348,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         result = apply_configuration(prepared)
         print(f"Zapisano konfigurację: {result['settings_path']}")
-        print("\nDalej: konfiguracja lokalnego toolchaina i Fullmag_build_runner, build backendu, "
-              "składanie obrazu oraz start frontend/backend. Instrukcja: "
-              "docs/guides/all-in-docker-windows.md. GPU/runtime nadal NOT VERIFIED.")
+        print("\nDalej: przygotowanie obrazu narzędziowego i bezpośredni start dwóch usług Compose. "
+              "Instrukcja: docs/guides/docker-development-architecture.md. "
+              "Pełna ścieżka runtime wymaga jeszcze kwalifikacji.")
         source_argument = "'" + str(prepared["source_root"]).replace("'", "''") + "'"
-        print("Po przygotowaniu koordynatora zbuduj wybrane źródła poleceniem:")
-        print("  just docker-all-dev-backend-build " + source_argument)
-        print("Wybrane źródła i port są zapisane w settings; podaj je jako jawne argumenty "
-              "docker-all-dev przy uruchomieniu.")
+        print("Uruchom wybrane źródła poleceniem:")
+        print("  just docker-dev " + source_argument + " " + str(prepared["port"]))
+        print("Opcjonalny trzeci argument docker-dev wskazuje skrypt symulacji w tym checkoutcie.")
         return 0
     except (SetupError, storage.StorageError, OSError, ValueError, EOFError) as error:
         print(f"Konfiguracja Docker: {error}", file=sys.stderr)

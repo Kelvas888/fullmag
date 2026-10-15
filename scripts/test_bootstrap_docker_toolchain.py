@@ -69,6 +69,20 @@ class ToolchainBootstrapTests(unittest.TestCase):
             bootstrap.bounded_command([sys.executable, "-c", "import time; time.sleep(30)"],
                                       maximum=128, timeout=0.1)
 
+    def test_direct_mode_admission_allows_enrolled_host(self):
+        (self.storage / "index/local-runner-container.json").write_text("{}")
+        bootstrap.assert_bootstrap_reconciled(self.storage)
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "already has a build runner"):
+            bootstrap.assert_fresh_host(self.storage)
+
+    def test_direct_mode_retains_unknown_build_barrier(self):
+        path = self.storage / "index/docker-toolchain-bootstrap.json"
+        path.write_text(json.dumps({"schema": "fullmag.docker-toolchain-bootstrap.v1",
+                                    "state": "outcome_unknown_resources_retained"}))
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "reconciliation"):
+            bootstrap.assert_bootstrap_reconciled(self.storage)
+        self.assertTrue(path.exists())
+
     def test_unconfirmed_prior_daemon_build_blocks_retry(self):
         path = self.storage / "index/docker-toolchain-bootstrap.json"
         path.write_text(json.dumps({"schema":"fullmag.docker-toolchain-bootstrap.v1",

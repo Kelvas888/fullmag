@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build the pinned dependency image on a fresh Windows Docker host.
 
-This is a first-enrollment operation, not a bypass around an existing build
-runner. Application sources are never part of its frozen Docker context.
+The default operation is first enrollment. Explicit direct-development mode
+shares the host heavy-work lock without enrolling or submitting to the old
+runner. Application sources are absent from the frozen dependency context.
 """
 from __future__ import annotations
 
@@ -41,6 +42,17 @@ def assert_fresh_host(root):
             raise BootstrapError(
                 "This host already has a build runner; dependency updates require its managed maintenance route"
             )
+    assert_bootstrap_reconciled(root)
+    database = storage.validate_path(root / "index/runner-jobs.sqlite", root)
+    if os.path.lexists(database):
+        # Even an idle queue proves prior enrollment. Do not infer that it is
+        # safe to bypass its owner from a missing config or an empty active set.
+        raise BootstrapError("An existing build queue requires managed maintenance; bootstrap refused")
+
+
+def assert_bootstrap_reconciled(root):
+    """A previous unknown Docker outcome requires reconciliation in either mode."""
+    root = Path(root)
     admission = storage.validate_path(root / "index/docker-toolchain-bootstrap.json", root)
     if os.path.lexists(admission):
         previous = json.loads(read_input(root, Path("index/docker-toolchain-bootstrap.json")))
@@ -48,11 +60,6 @@ def assert_fresh_host(root):
                 or previous.get("schema") != "fullmag.docker-toolchain-bootstrap.v1"
                 or previous.get("state") not in {"built", "failed_confirmed"}):
             raise BootstrapError("Previous Docker bootstrap outcome requires explicit resource reconciliation")
-    database = storage.validate_path(root / "index/runner-jobs.sqlite", root)
-    if os.path.lexists(database):
-        # Even an idle queue proves prior enrollment. Do not infer that it is
-        # safe to bypass its owner from a missing config or an empty active set.
-        raise BootstrapError("An existing build queue requires managed maintenance; bootstrap refused")
 
 
 def input_files(repo):
@@ -205,7 +212,7 @@ def initialize_host_storage(layout, volume_probe):
     volume_probe(root)
 
 
-def build(repo):
+def build(repo, *, direct_development=False):
     if os.name != "nt":
         raise BootstrapError("Use PowerShell in the Windows checkout for this host bootstrap")
     repo = Path(repo).resolve(strict=True)
@@ -216,11 +223,12 @@ def build(repo):
         raise BootstrapError("Docker Desktop must use the Linux engine")
     initialize_host_storage(layout, local_volume)
     root = Path(layout["storage_root"])
-    assert_fresh_host(root)
+    admission_check = assert_bootstrap_reconciled if direct_development else assert_fresh_host
+    admission_check(root)
     lock = storage.validate_path(root / "locks/fullmag-heavy.lock", root)
     # Hold the same durable host slot through capture, Docker and inspection.
-    with storage.file_lock(lock, "fresh-host Docker toolchain bootstrap"):
-        assert_fresh_host(root)
+    with storage.file_lock(lock, "Docker dependency toolchain build"):
+        admission_check(root)
         run = storage.validate_path(Path(layout["runs_root"]) / ("toolchain-bootstrap-" + uuid.uuid4().hex),
                                     layout["build_storage_root"])
         run.mkdir(mode=0o700)
@@ -232,7 +240,8 @@ def build(repo):
                    "repo_root": str(repo), "worktree_id": layout["worktree_id"],
                    "source_commit": storage.git(repo, "rev-parse", "HEAD"),
                    "context_root": str(context), "receipt_path": str(receipt_path),
-                   "qualification": "NOT VERIFIED"}
+                   "qualification": "NOT VERIFIED",
+                   "build_route": "direct-development" if direct_development else "fresh-host-enrollment"}
         storage.atomic_json(receipt_path, receipt)
         storage.atomic_json(admission_path, receipt)
         try:
@@ -293,7 +302,9 @@ def build(repo):
             receipt.update(state="built", dependency_manifest=DEPENDENCY_MANIFEST,
                            installed_manifest=str(manifest_path),
                            installed_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
-                           next_step="Configure one managed worker/coordinator; this image does not prove GPU execution")
+                           next_step=("Start the direct Compose development services; GPU execution is not yet verified"
+                                      if direct_development else
+                                      "Configure one managed worker/coordinator; this image does not prove GPU execution"))
         except BaseException as error:
             uncertain = ((receipt["state"] == "building" and "exit_code" not in receipt)
                          or receipt["state"] == "reading_dependency_manifest")
@@ -310,9 +321,11 @@ def build(repo):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--direct-development", action="store_true",
+                        help="Build dependencies for the independent Compose development route")
     args = parser.parse_args(argv)
     try:
-        build(args.repo_root)
+        build(args.repo_root, direct_development=args.direct_development)
     except (BootstrapError, storage.StorageError, OSError, subprocess.SubprocessError) as error:
         parser.exit(2, f"Docker toolchain bootstrap: {error}\n")
     return 0

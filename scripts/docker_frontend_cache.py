@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
@@ -530,6 +531,21 @@ def _validate_host_receipt(receipt: Mapping[str, Any], values: Mapping[str, Any]
         raise FrontendCacheError("frontend cache size or image attestation mismatch")
 
 
+def _require_cache_capacity(paths: Mapping[str, Any], *, windows: bool | None = None) -> None:
+    """Windows 9p may allocate the entire backing despite Linux truncate."""
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows or Path(paths["backing_image"]).exists():
+        return
+    required = CACHE_SIZE_BYTES + 2 * 1024 * 1024 * 1024
+    free = shutil.disk_usage(paths["storage_root"]).free
+    if free < required:
+        raise FrontendCacheError(
+            f"New frontend cache needs at least {required} free bytes on Windows; "
+            f"available: {free}. Existing caches and results were retained."
+        )
+
+
 def prepare(
     layout: Mapping[str, Any],
     repo: str | os.PathLike[str],
@@ -553,6 +569,7 @@ def prepare(
         toolpins,
     )
     paths = _cache_paths(layout, identity["key"])
+    _require_cache_capacity(paths)
     repo_path = Path(repo).resolve(strict=True)
     run_path = Path(run_root)
     if not run_path.is_absolute() or run_path.is_symlink():

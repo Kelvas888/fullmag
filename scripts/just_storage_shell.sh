@@ -88,7 +88,7 @@ fi
 # composite command cannot use a diagnostic marker to bypass its argument check.
 case "${recipe}" in
   *"scripts/bootstrap_docker_toolchain.py"*)
-    toolchain_bootstrap_pattern='^[^[:space:]]+ "[^"]+/scripts/bootstrap_docker_toolchain.py" --repo-root "[^"]+"$'
+    toolchain_bootstrap_pattern='^[^[:space:]]+ "[^"]+/scripts/bootstrap_docker_toolchain.py" --repo-root "[^"]+"( --direct-development)?$'
     if [[ ! "${recipe}" =~ ${toolchain_bootstrap_pattern} ]]; then
       echo "[fullmag just] invalid Docker toolchain bootstrap recipe" >&2
       exit 2
@@ -96,7 +96,17 @@ case "${recipe}" in
     # This fresh-host operation owns its own storage initialization, global
     # heavy lock, and enrolled-runner admission. Do not run prepare-links or
     # the generic runner around it.
-    exec "${python_cmd}" "${script_dir}/bootstrap_docker_toolchain.py" --repo-root "${repo_root}"
+    toolchain_mode=()
+    if [[ "${recipe}" == *" --direct-development" ]]; then toolchain_mode+=(--direct-development); fi
+    exec "${python_cmd}" "${script_dir}/bootstrap_docker_toolchain.py" --repo-root "${repo_root}" "${toolchain_mode[@]}"
+    ;;
+  *"scripts/docker_dev.py"*)
+    docker_dev_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" (build|up --port '[0-9]{4,5}')( --source-root '[^']+')?( --script '[^']+')?[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${docker_dev_pattern} ]]; then
+      echo "[fullmag just] invalid direct Docker development recipe" >&2
+      exit 2
+    fi
+    exec "${python_cmd}" "${resolver}" run --repo-root "${repo_root}" --profile docker-all-gpu -- "${bash_executable}" -euo pipefail -c "${recipe}"
     ;;
   *"scripts/verify_docker_all_runtime.py"*)
     docker_verify_pattern="^[^[:space:]]+ \"[^\"]+/scripts/verify_docker_all_runtime.py\" --repo-root \"[^\"]+\" '[^']+'$"

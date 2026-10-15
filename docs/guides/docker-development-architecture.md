@@ -96,3 +96,23 @@ niezależnej listy wersji.
 5. Sesje i wyniki są widoczne w wybranym rzeczywistym storage Windows po restarcie.
 6. Start ze skryptem aktywuje właściwy model i respektuje interaktywny `wait_for_solve`.
 7. Osobne dowody wykonania CPU/GPU; sam build, wykrycie GPU i HTTP 200 nie są takim dowodem.
+
+## Kolejność wdrożenia — stałe numery zadań
+
+1. Zapisać uzgodnioną architekturę.
+2. Zdefiniować w Compose dwa serwisy, źródła, storage, sieć i port.
+3. Przygotować obraz narzędziowy.
+4. Podłączyć wybór checkoutu/worktree i przygotowanie źródeł backendu.
+5. Uruchomić trwały cache kompilacji backendu.
+6. Zbudować pełny backend: FDM/FEM, CPU/GPU.
+7. Uruchomić frontend Next.js z montowanych źródeł.
+8. Uruchomić oba kontenery w grupie `fullmag`.
+9. Sprawdzić widoczny Home i komunikację UI–API.
+10. Potwierdzić HMR po edycji pliku w Windows.
+11. Potwierdzić przyrostową przebudowę backendu bez utraty cache.
+12. Sprawdzić parametr skryptu, aktywację modelu, wykonanie GPU i zapis wyników w Windows.
+13. Uzupełnić instrukcję, przeprowadzić wymagane CI/review i scalić na `master`.
+
+Aktualizacje postępu używają formatu „Zadanie X/13”. Numery oznaczają stałe
+etapy, nie deklarację ich ukończenia; dowody i bieżący stan trafiają do
+checkpointu zadania w rozwiązanym storage.

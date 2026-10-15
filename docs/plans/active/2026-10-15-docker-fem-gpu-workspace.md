@@ -40,8 +40,8 @@ zasobu. CPU zachowuje własny istniejący kontrakt i recovery.
    v2 i typed outputs; zmieniać OpenAPI oraz generowane typy tylko przy
    rzeczywistej zmianie schematu. W jednym workspace wykazać GPU allocation,
    accepted run, końcowe native provenance i odczyt opublikowanego wyniku.
-5. Zbudować końcowy backend i frontend przez istniejącą kolejkę na jednym
-   commit/snapshot. Uruchomić oba kontenery, wykazać HMR po zapisie pliku
+5. Zbudować pełny backend i frontend bezpośrednio we własnych usługach Compose,
+   bez starej kolejki runnera (decyzja użytkownika 16.10.2026). Uruchomić oba kontenery, wykazać HMR po zapisie pliku
    Windows, poprawny WebGL, połączenie API, GPU execution oraz zachowanie
    zapisanego FMS i jego hashy po normalnym stop/start. Wymagane CI/review,
    commit/push/PR/merge, bezpieczny fast-forward głównego checkoutu i qualified
@@ -141,3 +141,112 @@ mutacji journalu oraz pełny ExecutionProfileIR zamiast referencji. Lookup
 katalogu sprawdza również hash i treść authored profilu. Cztery regresje
 journalu mają jawne selektory CI. Bootstrap run `38786312168` jest w toku;
 wynik parsera nie zastępuje jego kompilacji.
+
+## Korekta cache i gotowości po rzeczywistym starcie Windows
+
+Dowód z kontenera diagnostycznego: instalacja pnpm zakończyła się po 28 min
+13 s. Kontrolowany restart zachował node_modules i pominął install; probe pnpm
+zajął 0,439 s. Poprawka 67f4e5f24 naprawia require.resolve z wygenerowanego
+cache i publikuje postęp do Docker stdout. Sam Workspace nadal nie załadował
+się nawet w 600-sekundowej próbie. Profil Next zawiera 9765/10521 próbek idle;
+worker threads czekają w p9_client_rpc/d_alloc_parallel. Nie ma dowodu OOM
+ani CPU throttlingu. Surowy odczyt pliku 1 MiB trwa 26 ms, więc rozdzielamy
+koszt metadata od przepustowości. Dotychczasowy healthcheck HEAD / akceptował
+redirect, a nie gotowy Workspace; poprawka wymaga 2xx z HEAD /workspace.
+
+Launcher tworzy nowy state root z UUID dla każdego pełnego startu. Obecny
+cache przeżywa restart tego samego kontenera, lecz nie jest ponownie używany
+przez taki nowy launch. Nie wolno przedstawiać tego jako pełnego trwałego
+cache developerskiego.
+
+Decyzja implementacyjna: zależności i cache Next mają korzystać z osobnego
+zarządzanego ext4 backing pod kanonicznym storage/build-volumes, z jawnym
+profilem frontend-cache-v1 i attestation rzeczywistego mountu. Źródła pozostają
+readonly bindem checkoutu Windows; sesje, wyniki, logi i receipty pozostają
+bezpośrednio w storage Windows. Nie używamy ukrytego named volume ani ledgeru
+hosta jako cache frontendu. Docelowy backing 8 GiB jest zasobem cache;
+nie usuwamy starego cache jako skutku wdrożenia.
+
+1. Dodać osobny adapter/maintenance Compose/helper, korzystając z wzorców
+   docker_host_ledger: exact project/layout/engine/image identity, regular
+   backing, ext4 UUID, kontrolowany loop/mount i ograniczone katalogi cache.
+   Nie zmieniać profilu host ledger ani nie udostępniać go frontendowi.
+2. Ustalić stabilny cache key z worktree/source identity, host portu i digestu
+   zamrożonych dependency inputs. Odmówić użycia cache podłączonego do innego
+   aktywnego procesu/kontenera. Nowy launch z tym samym kluczem ma odzyskać
+   dependencies; zmiana zależności wybiera nowy klucz zamiast nadpisywania
+   aktywnego środowiska.
+3. Compose montuje jawnie native cache, pnpm-store oraz oba realne importer
+   node_modules pod obecnymi guest paths; seeder i receipts pozostają Windows.
+   Launcher wiąże cache receipt z input manifest i sprawdza mounty po starcie.
+4. Regresje interpretowane: layout i traversal/symlink rejection, attestation,
+   konflikt aktywnego cache, zgodność Compose/input manifest oraz reuse nowego
+   run UUID. Testy nie kompilują unit tests. Weryfikacja runtime wymaga
+   prawdziwego ext4 mountu i faktycznej odpowiedzi Workspace.
+5. Po review/commicie wykonać kontrolowany restart własnego diagnostycznego
+   frontendu z zachowaniem starego cache/logów. Potwierdzić Windows source
+   mount, widoczną stronę, HMR A→B→C z zachowaniem stanu oraz brak restartu
+   procesu. Zmierzyć drugi launch używający tego samego cache. Te dowody nie
+   zastępują końcowego startu dwóch usług ani GPU/FMS qualification.
+
+## Checkpoint 16.10.2026 — frontend nadal bez kwalifikacji
+
+Adapter frontend-cache-v1 jest wdrożony w commitach 2cd5739579 i 71fbad8a6e.
+Rzeczywisty mount ext4 UUID `8f88ffb4-51eb-4785-8670-eab20953cb35`
+został potwierdzony w Docker Desktop i kontenerze. Zimna instalacja zależności
+trwała 160,141 s, a Next zgłosił ready po 0,428 s. Źródła aplikacji pozostały
+readonly bindami Windows; Windows zachował sesje, wyniki, logi i receipty.
+
+Próba przeglądarki zwróciła HTTP 200 i tytuł Workspace, ale widoczny był tylko
+`Checking for sessions`. To nie dowodzi działania Home ani aktywnego Workspace.
+Kontener diagnostyczny nie miał backendu. Został normalnie zatrzymany, ponieważ
+blokował admission kolejki. Potwierdzony przez użytkownika adres to
+`http://127.0.0.1:32871/workspace`; po zatrzymaniu port nie nasłuchiwał.
+Wynik HMR A→B→C, zachowanie stanu, WebGL i pełna aplikacja pozostają NOT VERIFIED.
+Eksperyment piątego bindu parent workspace nie dał dowodu poprawy; produkcyjny
+Compose nadal montuje cztery katalogi cache. Nie usunięto starych danych.
+
+Job `11e18560e1f74022871a1bff39d7cf4b` uruchomił się na starym przypiętym
+obrazie e5f70bd63201, bez wymaganego `dependency-versions.json`. Został jawnie
+anulowany: terminal `cancelled`, exit 143, bez pakietu aplikacji. Profil
+fem-gpu-release przypięto do istniejącego obrazu
+`sha256:f9e5a4fe2393dfd6c84af9a6518cfc23a772b0bd7b7fcb427c8004286c446d85`,
+zachowując 8 CPU i 24 GiB. Faktyczny manifest tego obrazu podaje CUDA 12.4.1,
+MFEM 4.10, HYPRE 3.1.0, libCEED 0.12.0, PETSc 3.24.6 i SLEPc 3.24.3 oraz
+commity wszystkich pięciu bibliotek. To odczyt z obrazu, nie założenie z tagu.
+
+Nowy job `6395e30ff26740dda1bf45922872d837` buduje ten sam commit
+`2cd573957926e7f1d9c2cc81c9a33aabd6cd879f` i digest kapsuły
+`b4b3a183b075b6812ce349baf8d5f4926b9e56d89ea78e2e05afdb88ac4116cb`.
+Kapsuła została ponownie zweryfikowana natywnie; kanoniczne POST /jobs dostało
+nowy request_key i niezmieniony payload capture. Osobny receipt resubmission
+zachowuje przyczynę retry. Nie modyfikowano SQLite ani nie naprawiano kapsuły.
+
+Commit `1678b4875b12ee94833e635b85e424e93c1d99d6` dodaje kontrolę manifestu
+przed capture i zgłoszeniem kolejnego buildu. Interpretowane regresje:
+36 uruchomionych, 3 pominięte, exit 0. Rzeczywisty smoke odrzuca stary obraz
+i przyjmuje właściwy. Nie kompilowano lokalnie testów jednostkowych.
+
+Kolejny dowód musi obejmować oba kontenery: gotowe API, odpowiedź pustej listy
+sesji, widoczny Home z wyborem symulacji i brak `session-loading`. Dopiero
+potem aktywny Workspace/WebGL, HMR oraz GPU Compute i zapis/reopen FMS.
+Wykryty niezależny błąd ukrywania błędu current/status jako wiecznego loading
+jest poprawiany w zasobach UI; nie zastępuje to faktycznego podłączenia API.
+
+## Doprecyzowanie 16.10.2026 — bezpośredni tryb Compose
+
+Kontrakt: [architektura developerska](../../guides/docker-development-architecture.md).
+Backend obejmuje wszystkie cztery realizacje FDM/FEM CPU/GPU. Frontend ma HMR
+z zamontowanego checkoutu; backend jawny build przyrostowy w swoim kontenerze.
+Poprzednia zależność od pakietu z kolejki nie obowiązuje w tej ścieżce.
+Dwa działające serwisy i rzeczywisty Home/API pozostają NOT VERIFIED.
+
+Bieżący stan bezpośredniej trasy: stary job `6395e30ff26740dda1bf45922872d837`
+jest terminalny (`failed`, exit 2); nie stanowi zależności nowego buildu.
+Obraz helperów oraz bezpośredni builder powstały w Docker Desktop. Rzeczywisty
+cache backendu ma ext4 UUID `b61b3161-c4ec-41c9-996e-13e6780d4444` i przeszedł
+ponowne verify. Windows/9p zaalokował fizyczne 12 GiB; opis „sparse” nie jest
+potwierdzony. Nowy backing wymaga sprawdzenia miejsca przed utworzeniem.
+Próba snapshotu `cefde6f0d6404cea8266cfcf2f5ba320` zakończyła się przed
+kompilacją, ponieważ agenci edytowali launcher podczas capture. Kolejny build
+musi wystartować po zapisaniu i zamrożeniu spójnego etapu źródeł.

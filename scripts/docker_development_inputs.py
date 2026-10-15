@@ -117,7 +117,7 @@ def seed(source, state, port):
             "workspace_root": WORKSPACE, "frontend_root": FRONTEND,
             "live_directories": directories, "files": files,
             "configuration_changes": "prepare_new_workspace",
-            "backend_build": "explicit_managed_runner_only"}
+            "backend_build": "explicit_request_only"}
 
 
 

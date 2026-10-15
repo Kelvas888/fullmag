@@ -23,6 +23,19 @@ help:
 storage-info:
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_storage.py" resolve --repo-root "{{repo_root}}" --format json
 
+# Build the dependency toolchain for direct Compose development, without enrollment.
+docker-dev-toolchain:
+    @{{storage_python}} "{{repo_root}}/scripts/bootstrap_docker_toolchain.py" --repo-root "{{repo_root}}" --direct-development
+
+# Direct two-service development: each application part builds in its container.
+# The source parameter selects the main checkout or a registered worktree.
+docker-dev source_root="" port="3197" script="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" up --port {{quote(port)}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}} {{if script == "" { "" } else { "--script " + quote(script) }}}
+
+# Build the current backend snapshot with persistent cache; do not restart a simulation.
+docker-dev-build source_root="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" build {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
+
 # Submit a clean commit to the shared runner using independent source copies.
 docker-all-build commit:
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" submit --commit {{quote(commit)}}

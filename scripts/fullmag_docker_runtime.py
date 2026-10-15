@@ -75,9 +75,10 @@ sys.stdout.buffer.write(chunks)
 '''
 
 
-def validate_runtime_artifacts(package):
+def validate_runtime_artifacts(package, *, development=False):
+    web = () if development else ("web/index.html",)
     for relative in (*("bin/" + name for name in REQUIRED_BINARIES),
-                     "web/index.html", "_fullmag_core.so"):
+                     *web, "_fullmag_core.so"):
         if not (package / relative).is_file():
             raise ValueError(f"Missing runtime artifact: {relative}")
 
@@ -714,7 +715,9 @@ def _require_static_source_identity(assembly, selected_source):
 
 
 def start(repo, assembly_receipt, port, frontend="static", source_root=None,
-          startup_script=None):
+          startup_script=None, *, project_name=None, compose_template=None):
+    if project_name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project_name):
+        raise ValueError("Invalid Compose project name")
     if not 1024 <= port <= 65535:
         raise ValueError("Port must be between 1024 and 65535")
     layout = storage.resolve_layout(repo, PROFILE)
@@ -738,7 +741,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 or observed["Config"].get("Labels", {}).get("org.fullmag.development") != "source-bind-v1"):
             raise ValueError("Development requires a source-bind image without copied application sources")
         package = storage.validate_path(Path(assembly["package_root"]), Path(layout["storage_root"]))
-        validate_runtime_artifacts(package)
+        validate_runtime_artifacts(package, development=True)
         if any(digest(package / "bin" / name) != assembly["binary_hashes"].get(name)
                for name in REQUIRED_BINARIES):
             raise ValueError("Mounted backend package changed since image assembly")
@@ -752,7 +755,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
     state.mkdir(mode=0o777)
     state.chmod(0o777)
     register_runtime_reference_root(layout, root)
-    project = "fullmag-all-" + root.name
+    project = project_name or "fullmag-all-" + root.name
     spec = root / "compose.json"
     host_certificate = root / "windows-folder-host.json"
     receipt = {"schema": "fullmag.docker-all-run.v1", "state": "starting", "image_id": image,
@@ -896,8 +899,8 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             storage.atomic_json(root / "receipt.json", receipt)
         certificate = attest(state, assembly, docker("info", "--format", "{{.ID}}"), assembly["binary_hashes"])
         publish_evidence(host_certificate, certificate)
-        shutil.copyfile(repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml"),
-                        root / "compose.source.yaml")
+        source_template = Path(compose_template) if compose_template is not None else repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml")
+        shutil.copyfile(source_template, root / "compose.source.yaml")
         receipt["compose_source"] = str(root / "compose.source.yaml")
         receipt["compose_source_sha256"] = digest(root / "compose.source.yaml")
         configured = configured_spec()
