@@ -97,3 +97,34 @@ projektu i podłączenia istniejących edytorów do tego właściciela oraz muta
 Nie tworzyć sztucznej RuntimeSession ani drugiego store dokumentu. Zmiana
 kontraktu/projekcji i odpowiedni ADR muszą poprzedzić zależną implementację.
 Ta mapa jest dowodem źródłowego ograniczenia i następnym krokiem, nie odbiorem P2.
+
+## Kolejny wynik CI
+
+Opublikowano poprawki fixture/audytu jako
+`77e14c3481798da0b42ed71d2989ee5ae947535b` i raportowanie lifecycle jako
+`8dd76eb9b39bdd5b9b97ac67b00877400820fe82`. Bootstrap 38710742438,
+Control Room job 116341194142: typecheck/lint przeszły do Vitest, wynik
+827 plików PASS / 1 FAIL / 1 skip; 8535 testów PASS / 1 FAIL / 13 skip.
+Sześć wcześniejszych porażek zniknęło. Pozostał first-preparation test
+WorkspaceShellClient: testowy window nie udostępnia localStorage, wymagany
+przez restoreFromStorage dockingu. Naprawa fixture oraz dodatkowa próba
+retencji realnej powłoki przy refresh failure są w przygotowaniu; runtime
+produktu nie jest zmieniany dla sztucznego DOM. Cała bramka pozostaje FAIL.
+
+Fixture uzupełniono o map-backed localStorage; dodatkowa regresja montuje
+rzeczywisty WorkspaceShellClient i po błędach refresh obu canonical resources
+sprawdza ten sam input/body, szkic/focus, lokalny stale/Reconnecting i brak
+launchera/inert/modalu. Source diff check PASS, wykonanie w nowym CI wymagane.
+
+Ordered-stage Python roundtrip: oba globalne tekstowe zakazy save zastąpiono
+niezależnymi literalnymi snapshotami wyjść stage i końcowego modelu dla loaded
+oraz rewritten. Pełne study IR porównania i kolejność stage/action zachowane;
+renderer produkcyjny bez zmian. Interpretowany pytest: **56 PASS + 35 subtestów**,
+JUnit 91, failures/errors/skips=0, exit 0. Receipt:
+`runs/fullmag-0950f4dca4ffe38f/python-script-builder-roundtrip/20261015T091135Z-0ef89e06b34d457e8b241f40a25b2f63/receipt.json`.
+HEAD przed/po 8dd76eb9b39bdd5b9b97ac67b00877400820fe82. Hash testu
+2e31a757425535f20abf4ded8dd877792e0ec34d573d65a21974ebb86b198473,
+script_builder.py 36a4233cb7c39dd012262b8ba6a5d728092cf8102c932ce57d05d91762313323;
+pary przed/po zgodne i ponownie odczytane przez roota. Bez bytecode,
+pytest cache/plugin autoload, z resolverowym worktree lock i managed tmp/log/JUnit.
+To zamyka lokalne dwie porażki roundtrip, pełny Python CI nadal wymagany.

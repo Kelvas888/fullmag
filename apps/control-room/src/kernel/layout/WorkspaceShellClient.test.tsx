@@ -7,6 +7,7 @@ import type {
   LiveStatusResource,
   SimulationPreparationResource,
 } from "../api/apiTypes";
+import { SESSIONS_PATH } from "../api/apiPaths";
 import { CommandRegistry } from "../commands/CommandRegistry";
 import { EventBus } from "../events/EventBus";
 import type { KernelEventMap } from "../events/eventTypes";
@@ -15,6 +16,7 @@ import { ModuleRegistry } from "../module/ModuleRegistry";
 import { DiagnosticRecorderController } from "../performance/diagnostic-recorder/DiagnosticRecorderController";
 import { RealtimeConnectionController } from "../realtime/RealtimeConnectionController";
 import { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
+import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import {
   resetSharedResourceRuntimeStoreForTests,
 } from "../resources/ResourceRuntimeStore";
@@ -135,6 +137,115 @@ describe("WorkspaceShellClient session collection gate", () => {
       ).toBeTruthy();
       expect(viewportDraft).toBeTruthy();
       expect(preparationStatus?.getAttribute("data-state")).toBe("connecting");
+      expect(findByAttribute(container, "aria-modal", "true")).toBeNull();
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("retains the focused workspace draft when session and status refreshes fail", async () => {
+    const sessionList = {
+      schema_version: "2.0.0",
+      sessions: [{
+        current: true,
+        name: "workspace-shell-test",
+        session_id: "workspace-shell-session",
+        status: "running",
+      }],
+    };
+    const list = vi.fn(async () => sessionList)
+      .mockResolvedValueOnce(sessionList)
+      .mockRejectedValueOnce(new Error("session list transport unavailable"));
+
+    const liveStatus = {
+      resources: { simulation_preparation_revision: 7 },
+      session: {
+        name: "workspace-shell-test",
+        request_scope_epoch: "api-instance:workspace-shell-test",
+        session_epoch: "workspace-shell-session@1700000000000",
+        session_id: "workspace-shell-session",
+      },
+      solver: { state: "bootstrapping" },
+    } as LiveStatusResource;
+    const currentStatus = vi.fn(async () => liveStatus)
+      .mockResolvedValueOnce(liveStatus)
+      .mockRejectedValueOnce(new Error("current status transport unavailable"));
+
+    const preparation = vi.fn(async () => ({
+      active_stage_id: "planning",
+      completed_at_unix_ms: null,
+      failure: null,
+      log_tail: [],
+      preparation_id: "workspace-shell-preparation",
+      requested_execution: {
+        backend: "fdm",
+        device: "gpu",
+        engine_id: null,
+        mode: "strict",
+        precision: "double",
+        runtime_family: null,
+        worker: null,
+      },
+      resolved_execution: null,
+      revision: 7,
+      stages: [],
+      started_at_unix_ms: 1_000,
+      status: "running",
+    } satisfies SimulationPreparationResource));
+    const kernel = makeKernel(list, currentStatus, preparation);
+    const { container, dispose } = await mountWorkspace(kernel);
+
+    try {
+      await settle();
+
+      const workspaceBody = findElements(
+        container,
+        (element) =>
+          element
+            .getAttribute("class")
+            ?.split(/\s+/)
+            .includes("fm-workspace-body") === true,
+      )[0];
+      const draft = findByAttribute(container, "aria-label", "Workspace draft");
+      const preparationStatus = findElements(
+        container,
+        (element) => element.getAttribute("class") === "fm-simulation-startup",
+      )[0];
+      expect(workspaceBody).toBeTruthy();
+      expect(draft).toBeTruthy();
+      expect(preparation).toHaveBeenCalledTimes(1);
+      draft!.value = "Unsaved workspace draft";
+      draft!.focus();
+
+      await act(async () => {
+        kernel.resources.invalidate(SESSIONS_PATH, "transport-refresh:1");
+        kernel.resources.invalidate(SESSION_STATUS_RESOURCE_KEY, "transport-refresh:1");
+        kernel.realtimeConnection.update("disconnected");
+      });
+      await settle();
+
+      expect(list).toHaveBeenCalledTimes(2);
+      expect(currentStatus).toHaveBeenCalledTimes(2);
+      expect(findByAttribute(container, "aria-label", "Workspace draft")).toBe(draft);
+      expect(draft!.value).toBe("Unsaved workspace draft");
+      expect(draft!.ownerDocument.activeElement).toBe(draft);
+      expect(
+        findElements(
+          container,
+          (element) =>
+            element
+              .getAttribute("class")
+              ?.split(/\s+/)
+              .includes("fm-workspace-body") === true,
+        )[0],
+      ).toBe(workspaceBody);
+      expect(workspaceBody!.hasAttribute("inert")).toBe(false);
+      expect(workspaceBody!.hasAttribute("aria-hidden")).toBe(false);
+      expect(findByAttribute(container, "data-state", "session-error")).toBeNull();
+      expect(findByAttribute(container, "data-state", "session-loading")).toBeNull();
+      expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeNull();
+      expect(preparationStatus?.getAttribute("data-state")).toBe("stale");
+      expect(container.textContent).toContain("Reconnecting…");
       expect(findByAttribute(container, "aria-modal", "true")).toBeNull();
     } finally {
       await dispose();
@@ -265,6 +376,15 @@ async function mountWorkspace(kernel: KernelApi): Promise<{
   dispose: () => Promise<void>;
 }> {
   const dom = installSimulationPreparationTestDom();
+  const storage = new Map<string, string>();
+  Object.defineProperty(dom.document.defaultView!, "localStorage", {
+    configurable: true,
+    value: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      removeItem: (key: string) => { storage.delete(key); },
+      setItem: (key: string, value: string) => { storage.set(key, value); },
+    },
+  });
   const container = dom.document.createElement("div");
   dom.document.body.appendChild(container);
   const root = createRoot(container as unknown as Element);

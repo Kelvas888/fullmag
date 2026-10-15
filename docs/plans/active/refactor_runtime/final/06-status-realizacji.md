@@ -1,4 +1,11 @@
 # Status realizacji całego planu refaktoryzacji
+Aktualizacja [P8-53CZ](p8/53cz-nonblocking-preparation-ci-followup.md):
+najnowszy odbiór UI **8535 PASS / 1 FAIL / 13 skip**; pozostały brak
+localStorage w fixture poprawiono, dodano test zachowania realnej powłoki
+przy błędzie transportu. Wymaga nowego CI. Python ordered-stage roundtrip
+**56 PASS + 35 subtestów**, 0 błędów/pominięć, renderer bez zmian.
+Pakiet Windows i pełny lifecycle nadal NOT VERIFIED. Procenty bez awansu.
+
 Checkpoint 15.10.2026 — [P8-53CZ](p8/53cz-nonblocking-preparation-ci-followup.md):
 CI wykryło własną regresję propsów testu, następnie 7 porażek testów/audytu
 po zmianie preparation UI. Przygotowano poprawki fixture i audytu przy
