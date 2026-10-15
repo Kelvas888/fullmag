@@ -16,6 +16,39 @@ OWNER_NAME = ".fullmag-windows-folder-owner.json"
 HOST_CERT_PATH = "/run/fullmag/windows-folder-host.json"
 
 
+def _replace_write_through(source, destination):
+    if os.name != "nt":
+        os.replace(source, destination)
+        return
+    from ctypes import wintypes
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    api.MoveFileExW.restype = wintypes.BOOL
+    # Keep atomic same-volume replacement and wait for the move to reach disk.
+    if not api.MoveFileExW(str(source), str(destination), 0x1 | 0x8):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def publish_evidence(path, value):
+    """Flush scoped attestation bytes before atomic Windows write-through publication.
+
+    This is an operational restart barrier, not a power-loss qualification.
+    """
+    import json
+    path = Path(path)
+    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        _replace_write_through(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def read_owned_regular(path, maximum=1024 * 1024):
     """Bounded native read that rejects final reparse points and their ancestors."""
     from ctypes import wintypes
@@ -143,5 +176,5 @@ def attest(state, assembly, engine_id, binary_hashes):
     marker = Path(state) / OWNER_NAME
     if marker.exists():
         raise ValueError("Docker session folder already has owner metadata")
-    storage.atomic_json(marker, certificate)
+    publish_evidence(marker, certificate)
     return certificate

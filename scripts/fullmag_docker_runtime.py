@@ -365,9 +365,9 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
                                 toolchain_image=assembly.get("base_image"), template=root / "compose.source.yaml")
         if os.name != "nt":
             raise ValueError("This Windows-folder launcher requires native Windows host attestation")
-        from windows_folder_host import attest, local_volume, read_owned_regular
+        from windows_folder_host import attest, local_volume, publish_evidence, read_owned_regular
         certificate = attest(state, assembly, docker("info", "--format", "{{.ID}}"), assembly["binary_hashes"])
-        storage.atomic_json(host_certificate, certificate)
+        publish_evidence(host_certificate, certificate)
         shutil.copyfile(repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml"),
                         root / "compose.source.yaml")
         receipt["compose_source"] = str(root / "compose.source.yaml")
@@ -402,8 +402,8 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
         if any(certificate[key] != value for key, value in local_volume(state).items()):
             raise ValueError("Native Windows volume identity changed during preflight")
         certificate["restart_verified"] = True
-        storage.atomic_json(state / ".fullmag-windows-folder-owner.json", certificate)
-        storage.atomic_json(host_certificate, certificate)
+        publish_evidence(state / ".fullmag-windows-folder-owner.json", certificate)
+        publish_evidence(host_certificate, certificate)
         receipt["storage_operational_checks"] = probe["checks"]
         receipt["storage_power_loss"] = "NOT VERIFIED"
         storage.atomic_json(spec, configured_spec())
