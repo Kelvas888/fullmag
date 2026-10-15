@@ -33,6 +33,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from typing import Any, Mapping, NoReturn
@@ -130,6 +131,9 @@ INSTALL_TIMEOUT_SECONDS = 60 * 60
 # container fail during ordinary startup latency.
 TOOL_TIMEOUT_SECONDS = 120
 STOP_TIMEOUT_SECONDS = 15
+LOG_TAIL_CHUNK_BYTES = 8 * 1024
+LOG_TAIL_POLL_SECONDS = 0.25
+LOG_TAIL_STOP_TIMEOUT_SECONDS = 1.0
 PROCESS_IDENTITY_FIELDS = (
     "pid_namespace",
     "process_start_time_ticks",
@@ -177,6 +181,7 @@ class FrontendHandle:
     owner_token: str
     log_path: Path
     log_stream: Any | None = None
+    log_tailer: Any | None = None
     stopped: bool = False
     process_group_id: int | None = None
     process_identity: Mapping[str, Any] | None = None
@@ -819,12 +824,18 @@ def _validate_managed_frontend_layout(inputs: DevelopmentInputs) -> None:
         FRONTEND_ROOT / "next" / f"dev-{INTERNAL_PORT}",
         "development Next cache",
     )
+    _validate_managed_link(
+        FRONTEND_ROOT / "node_modules",
+        app_root / "node_modules",
+        "frontend dependency resolution",
+    )
 
 
 def _prepare_managed_frontend(inputs: DevelopmentInputs) -> Path:
     app_root = inputs.workspace_root / "apps" / "control-room"
     _assert_no_links(app_root, "Control Room app root")
     _ensure_cache_layout(inputs)
+    node_modules_target = _ensure_node_modules_layout(inputs)
     _ensure_managed_link(app_root / ".fullmag-frontend", FRONTEND_ROOT, "frontend root")
     _ensure_managed_link(app_root / "out", FRONTEND_ROOT / "out", "static output")
     _ensure_managed_link(app_root / ".next", FRONTEND_ROOT / "next" / "default", "default Next cache")
@@ -833,7 +844,12 @@ def _prepare_managed_frontend(inputs: DevelopmentInputs) -> Path:
         FRONTEND_ROOT / "next" / f"dev-{INTERNAL_PORT}",
         "development Next cache",
     )
-    return _ensure_node_modules_layout(inputs)
+    _ensure_managed_link(
+        FRONTEND_ROOT / "node_modules",
+        app_root / "node_modules",
+        "frontend dependency resolution",
+    )
+    return node_modules_target
 
 
 def _validate_live_directories(inputs: DevelopmentInputs) -> None:
@@ -1049,6 +1065,97 @@ def _write_lifecycle_log(event: str, **fields: Any) -> None:
         return
 
 
+class _LogTailer:
+    """Bounded read-only tail of the owned log file for Docker stdout."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._stopping = threading.Event()
+        self._stdout_enabled = True
+        self._thread = threading.Thread(
+            target=self._run,
+            name="fullmag-frontend-log-tail",
+            daemon=True,
+        )
+
+    @classmethod
+    def start(cls) -> "_LogTailer":
+        _assert_no_links(LOG_PATH, "frontend development log")
+        descriptor: int | None = None
+        stream: Any | None = None
+        try:
+            descriptor = os.open(
+                LOG_PATH,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise FrontendDevError("frontend development log is not a regular file")
+            stream = os.fdopen(descriptor, "rb")
+            descriptor = None
+            stream.seek(0, os.SEEK_END)
+            tailer = cls(stream)
+            tailer._thread.start()
+            return tailer
+        except (FrontendDevError, OSError, RuntimeError):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            raise
+
+    def _write_stdout(self, chunk: bytes) -> None:
+        if not self._stdout_enabled:
+            return
+        try:
+            binary = getattr(sys.stdout, "buffer", None)
+            if binary is not None:
+                binary.write(chunk)
+                binary.flush()
+            else:
+                sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                sys.stdout.flush()
+        except (BrokenPipeError, OSError, TypeError, ValueError):
+            # Diagnostics must not affect the owned child or startup result.
+            self._stdout_enabled = False
+
+    def _run(self) -> None:
+        try:
+            while not self._stopping.is_set():
+                chunk = self._stream.read(LOG_TAIL_CHUNK_BYTES)
+                if chunk:
+                    self._write_stdout(chunk)
+                    continue
+                self._stopping.wait(LOG_TAIL_POLL_SECONDS)
+        finally:
+            self._stream.close()
+
+    def stop(self) -> None:
+        self._stopping.set()
+        self._thread.join(LOG_TAIL_STOP_TIMEOUT_SECONDS)
+
+
+def _start_log_tailer() -> _LogTailer | None:
+    try:
+        return _LogTailer.start()
+    except (FrontendDevError, OSError, RuntimeError) as error:
+        _write_lifecycle_log("log_tail", status="disabled", error=str(error))
+        return None
+
+
+def _stop_log_tailer(log_tailer: _LogTailer | None) -> None:
+    if log_tailer is not None:
+        log_tailer.stop()
+
+
 def _run_pnpm_install(
     inputs: DevelopmentInputs,
     stopping_event: Any,
@@ -1216,6 +1323,7 @@ def _new_handle(
     stopping_event: Any,
     kind: str,
     log_stream: Any,
+    log_tailer: _LogTailer | None = None,
 ) -> FrontendHandle:
     handle = FrontendHandle(
         process=process,
@@ -1226,6 +1334,7 @@ def _new_handle(
         owner_token=str(uuid.uuid4()),
         log_path=LOG_PATH,
         log_stream=log_stream,
+        log_tailer=log_tailer,
     )
     try:
         identity = _read_process_identity(process.pid)
@@ -1337,6 +1446,7 @@ def _start_next(
     inputs: DevelopmentInputs,
     stopping_event: Any,
     log_stream: Any,
+    log_tailer: _LogTailer | None,
     receipt: dict[str, Any],
 ) -> FrontendHandle:
     _next_binary(inputs)
@@ -1379,7 +1489,14 @@ def _start_next(
         )
         _fail(f"Next development process could not start: {error}")
     try:
-        handle = _new_handle(process, inputs, stopping_event, "next", log_stream)
+        handle = _new_handle(
+            process,
+            inputs,
+            stopping_event,
+            "next",
+            log_stream,
+            log_tailer,
+        )
     except Exception as error:
         owned_handle = getattr(error, "frontend_handle", None)
         if isinstance(owned_handle, FrontendHandle):
@@ -1490,6 +1607,7 @@ def start(stopping_event: Any) -> FrontendHandle:
         except OSError:
             pass
         raise
+    log_tailer = _start_log_tailer()
     handle: FrontendHandle | None = None
     try:
         if previous is None or previous.get("dependency_install") != "ready":
@@ -1502,7 +1620,7 @@ def start(stopping_event: Any) -> FrontendHandle:
         _assert_not_stopping(stopping_event)
         _next_binary(inputs)
         _assert_not_stopping(stopping_event)
-        handle = _start_next(inputs, stopping_event, log_stream, receipt)
+        handle = _start_next(inputs, stopping_event, log_stream, log_tailer, receipt)
         return handle
     except Exception as error:
         owned_handle = handle or getattr(error, "frontend_handle", None)
@@ -1517,6 +1635,7 @@ def start(stopping_event: Any) -> FrontendHandle:
             _publish_receipt(receipt)
         except Exception:
             pass
+        _stop_log_tailer(log_tailer)
         if not isinstance(owned_handle, FrontendHandle):
             log_stream.close()
         raise
@@ -1733,6 +1852,9 @@ def stop(handle: FrontendHandle, *, timeout: float = STOP_TIMEOUT_SECONDS) -> di
         )
 
     handle.stopped = True
+    if handle.log_tailer is not None:
+        handle.log_tailer.stop()
+        handle.log_tailer = None
     if handle.log_stream is not None:
         handle.log_stream.close()
         handle.log_stream = None

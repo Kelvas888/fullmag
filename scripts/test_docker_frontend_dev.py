@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from types import ModuleType
@@ -213,6 +214,75 @@ class FrontendDevContractTests(TestCase):
                 )
         self.assertIn("status=mismatch", mismatch_log.getvalue().decode("utf-8"))
 
+    @skipIf(os.name == "nt", "the bounded tailer regression uses POSIX no-follow file semantics")
+    def test_log_tailer_streams_only_bytes_appended_after_start(self):
+        with isolated(self.module) as (_root, _workspace, _inputs):
+            self.module._prepare_state_directories()
+            log_stream = self.module._log_stream()
+            tailer = None
+            try:
+                log_stream.write(
+                    b"frontend tool probe result name=pnpm status=ok\n"
+                    b"old install progress 1/758\n"
+                )
+                log_stream.flush()
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    tailer = self.module._start_log_tailer()
+                    self.assertIsNotNone(tailer)
+                    log_stream.write(b"pnpm install progress 572/758\n")
+                    log_stream.flush()
+                    deadline = time.monotonic() + 2.0
+                    while "pnpm install progress 572/758" not in stdout.getvalue():
+                        if time.monotonic() >= deadline:
+                            self.fail("the appended frontend log bytes were not streamed")
+                        time.sleep(0.01)
+                    tailer.stop()
+                    tailer = None
+                streamed = stdout.getvalue()
+                self.assertIn("pnpm install progress 572/758", streamed)
+                self.assertNotIn("frontend tool probe result", streamed)
+                self.assertNotIn("old install progress 1/758", streamed)
+            finally:
+                if tailer is not None:
+                    tailer.stop()
+                log_stream.close()
+
+    @skipIf(os.name == "nt", "FIFO no-follow regression uses the Linux container filesystem")
+    def test_log_tailer_rejects_fifo_without_blocking(self):
+        with tempfile.TemporaryDirectory(prefix="fullmag-frontend-log-fifo-") as raw:
+            fifo = Path(raw) / "next.log"
+            os.mkfifo(fifo)
+            script = """
+import importlib.util
+import pathlib
+import sys
+
+module_path = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("fullmag_fifo_frontend_dev", module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("cannot load frontend_dev.py")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.LOG_PATH = pathlib.Path(sys.argv[2])
+try:
+    module._LogTailer.start()
+except module.FrontendDevError as error:
+    if "regular file" not in str(error):
+        raise
+else:
+    raise SystemExit("FIFO was accepted as the frontend log")
+"""
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(MODULE_PATH), str(fifo)],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
     def test_browser_origin_and_internal_api_target_are_separate(self):
         with isolated(self.module) as (root, workspace, inputs):
             environment = self.module._safe_environment(inputs)
@@ -318,7 +388,43 @@ class FrontendDevContractTests(TestCase):
             self.assertFalse((workspace / "node_modules").is_symlink())
             self.assertTrue((app / "node_modules").is_dir())
             self.assertFalse((app / "node_modules").is_symlink())
+            self.assertEqual(
+                (root / "cache" / "node_modules").resolve(),
+                (app / "node_modules").resolve(),
+            )
+            self.assertTrue((root / "cache" / "node_modules").is_symlink())
             self.assertFalse((root / "node_modules").exists())
+
+    @skipIf(os.name == "nt", "Node module resolution regression uses Linux symlink semantics")
+    def test_generated_cache_path_requires_from_managed_dependency_alias(self):
+        node = self.module.NODE_BINARY
+        if not node.is_file() or not os.access(node, os.X_OK):
+            self.skipTest(f"pinned Node executable is unavailable: {node}")
+        with isolated(self.module) as (root, workspace, inputs):
+            self.module._prepare_state_directories()
+            self.module._prepare_managed_frontend(inputs)
+            package = workspace / "apps" / "control-room" / "node_modules" / "frontend-resolution-fixture"
+            package.mkdir()
+            (package / "index.js").write_text("module.exports = 'state-owned';\n", encoding="utf-8")
+            generated = root / "cache" / "next" / "dev-8080" / "dev" / "server" / "app"
+            generated.mkdir(parents=True)
+            page = generated / "page.js"
+            page.write_text(
+                "const value = require('frontend-resolution-fixture');\n"
+                "if (value !== 'state-owned') process.exit(2);\n"
+                "process.stdout.write(value);\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [str(node), str(page)],
+                cwd=str(workspace),
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            self.assertEqual(result.stdout, "state-owned")
 
     @skipIf(os.name == "nt", "symlink support is a Linux container filesystem contract")
     def test_old_external_node_modules_alias_is_rejected(self):
@@ -329,6 +435,16 @@ class FrontendDevContractTests(TestCase):
             (workspace / "node_modules").symlink_to(legacy_target, target_is_directory=True)
             with self.assertRaises(self.module.FrontendDevError):
                 self.module._prepare_managed_frontend(inputs)
+
+        with isolated(self.module) as (root, workspace, inputs):
+            self.module._prepare_state_directories()
+            legacy_target = root / "legacy-cache-node-modules"
+            legacy_target.mkdir()
+            cache_alias = root / "cache" / "node_modules"
+            cache_alias.symlink_to(legacy_target, target_is_directory=True)
+            with self.assertRaises(self.module.FrontendDevError):
+                self.module._prepare_managed_frontend(inputs)
+            self.assertEqual(cache_alias.resolve(), legacy_target.resolve())
 
     @skipIf(os.name == "nt", "symlink support is a Linux container filesystem contract")
     def test_next_binary_may_resolve_through_workspace_virtual_store(self):
