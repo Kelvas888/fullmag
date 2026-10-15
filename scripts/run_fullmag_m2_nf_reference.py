@@ -158,7 +158,7 @@ def _problem(resolution: Resolution) -> fm.Problem:
         g_up_Spm2=1.0e15,
         g_down_Spm2=0.5e15,
         g_r_Spm2=BORIS_GMIX_SPM2[0],
-        g_i_Spm2=BORIS_GI_SPM2,
+        g_i_Spm2=BORIS_GMIX_SPM2[1],
     )
     spin = fm.SpinDriftDiffusion(
         id="spin",
