@@ -1263,7 +1263,7 @@ mod resource_requirement_tests {
 
 #[cfg(test)]
 mod accepted_start_tests {
-    use super::ACCEPTED_TASK_AWAITING_DEPENDENCY_RESOLUTION;
+    use crate::ACCEPTED_TASK_AWAITING_DEPENDENCY_RESOLUTION;
     use fullmag_application::{
         ProjectId, ProjectSnapshot, RequestedExecution, RequestedResourceBudget, ResourceBudget,
         ResourceKind, RunId, RunSpecification, StudyId, StudyReference,

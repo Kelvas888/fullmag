@@ -161,7 +161,7 @@ mod recovery_tests {
                 inventory_owner.descriptor().host_owner_epoch,
             ),
             expected_topology_sha256: policy.topology_sha256.clone(),
-            budget,
+            budget: budget.clone(),
             cpu_ids: BTreeSet::new(),
             exclusive_gpu_uuids: BTreeSet::new(),
             gpu_vram_bytes_by_uuid: BTreeMap::new(),
