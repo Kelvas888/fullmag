@@ -1,4 +1,13 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 15.10.2026 — [P8-53CR](p8/53cr-application-fixture-imports-and-inventory.md)
+i [P8-53CS](p8/53cs-staged-mesher-negative-evidence.md):
+naprawiono pięć kolejnych błędów kompilacji fixture aplikacji i opublikowano
+`90d35237d`; odbiór CI wymagany. Kandydat fazowego meshera nie zachowuje body
+XY ani tetraedrów i został odrzucony jako rozwiązanie. Zachowano negatywne
+dowody i oceniono retencję bez usuwania. Restart backendu z UI jest poza
+aktualnym zakresem produktu; obowiązuje zapis i ponowny start CLI.
+Pełny plan **IN PROGRESS**, procenty bez awansu.
+
 Checkpoint 14.10.2026 — [P8-53CP](p8/53cp-worker-environment-fixture-types.md)
 i [P8-53CQ](p8/53cq-owner-air-separated-field-controls.md):
 fixture kompozycji anteny **3/3 PASS w CI**. Dwa kolejne E0277 testu
