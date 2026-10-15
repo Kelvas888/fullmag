@@ -53,3 +53,20 @@ Nie dodano hostowego obejścia zakazu kompilowania testów.
 Brak nowych lokalnych danych solvera i native builda w tym fragmencie.
 Receipty 53CU, nieudany build 53CT i cache przyrostowe pozostają zachowane;
 nie uruchamiano prune ani usuwania danych. Pełny plan P0–P8 pozostaje aktywny.
+
+## Publikacja i odbiór
+
+Poprawka na remote: `f4c15a8781a8bc43fa72464b81d074aaa973898c`.
+[CI 38700675368](https://github.com/MateuszZelent/fullmag/actions/runs/38700675368)
+jest aktywny: Python job `116307821097` wykonuje Gmsh exact-layer regressions,
+Rust job `116307821115` wykonuje compact workspace import regression.
+Nie ma jeszcze terminalnego odbioru nowych testów aplikacji/IR.
+Kontrakty volatile Windows storage, native modal ABI i API hygiene przeszły;
+nie dowodzą działania solvera ani całego produktu.
+
+Ponowny managed `windows-workspace-build dev dev 3197 auto`, sesja `4051`,
+zakończył się exit 2 przed kompilacją: limit 120 s oczekiwania na globalny
+slot `native Windows Fullmag build`. Wcześniejsze konkretne procesy z 53CV
+już nie istniały, ale globalny slot pozostał zajęty. Nie ustalano właściciela
+ani stanu jego joba wyłącznie na podstawie komunikatu blokady.
+Nie obchodzono blokady i nie zatrzymywano procesów; brak nowego pakietu.

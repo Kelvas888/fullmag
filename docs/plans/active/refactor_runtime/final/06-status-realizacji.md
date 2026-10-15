@@ -1,4 +1,11 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 15.10.2026 — [P8-53CX](p8/53cx-python-scene-contract-acceptance.md):
+CI potwierdziło Gmsh exact-layer airbox SUCCESS. Kolejne 8 porażek testów
+sceny Python poprawiono zgodnie z rendererem i canonical auxiliary identity;
+dokładny zestaw pięciu plików CI lokalnie **127/127 PASS**, bez skip.
+Odbiór nowych poprawek w CI i nowe regresje Rust pozostają wymagane.
+Pełny plan **IN PROGRESS**, procenty bez awansu.
+
 Checkpoint 15.10.2026 — [P8-53CW](p8/53cw-nested-pipeline-and-application-fixtures.md):
 naprawiono rekurencyjną walidację aktywnych etapów i zachowano deklaracje
 scope wyłączonych etapów. Przygotowano sześć napraw fixture batch/RunIntent,
