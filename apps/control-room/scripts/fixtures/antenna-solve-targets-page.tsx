@@ -43,7 +43,7 @@ function makeFixture() {
     }],
     antenna_field_solve_stages: [{ id: solveId, source_object_id: sourceId, current_transport_id: "current-fixed", port_mode_ids: ["port-fixed"],
       conductor_mesh_policy: "inherit_source", solver_policy: "default", model: "quasistatic_conduction_biot_savart3d", oersted_realization: "direct_tetra_quadrature",
-      field_sampling_domain: { kind: "global" }, outputs: [{ id: "basis", quantity: "H_ant_basis" }], target_refs: [{ kind: "global" }],
+      field_sampling_domain: typeof window !== "undefined" && new URL(window.location.href).searchParams.get("sampling") === "region" ? { kind: "region", object_id: "immutable-waveguide", region_id: "core" } : { kind: "global" }, outputs: [{ id: "basis", quantity: "H_ant_basis" }], target_refs: [{ kind: "global" }],
     }], antenna_target_projections: [], solved_antenna_drives: [],
   });
   const state = { name: "A" as "A" | "B", clock: 1, scenes: { A: makeScene("A"), B: makeScene("B") }, renders: 0 };

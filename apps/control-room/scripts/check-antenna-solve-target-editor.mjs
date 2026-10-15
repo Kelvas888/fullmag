@@ -11,7 +11,7 @@ const path = resolve(root, "src/modules/inspector/panels/antenna/AntennaSolveTar
 const sourceModule = new vm.SourceTextModule(stripTypeScriptTypes(readFileSync(path, "utf8")), { identifier: path });
 await sourceModule.link((specifier) => { throw new Error(`Unexpected runtime dependency: ${specifier}`); });
 await sourceModule.evaluate();
-const { antennaSolveTargetKey: key, antennaSolveTargetOptions: options, buildAntennaSolveTargetsTransaction: build, acknowledgeAntennaSolveTargetsDraft: ack } = sourceModule.namespace;
+const { antennaSolveTargetKey: key, antennaSolveTargetOptions: options, antennaSamplingDomainOptions: samplingOptions, buildAntennaSolveTargetsTransaction: build, acknowledgeAntennaSolveTargetsDraft: ack } = sourceModule.namespace;
 let checks = 0;
 const check = (name, run) => { run(); checks++; console.log(`PASS ${name}`); };
 const global = { kind: "global" };
@@ -82,6 +82,20 @@ check("keys distinguish delimiter-containing IDs without conflating region/objec
   assert.notEqual(key({ kind: "region", object_id: "a/b", region_id: "c" }), key({ kind: "region", object_id: "a", region_id: "b/c" }));
   assert.notEqual(key(object), key({ ...region, region_id: object.object_id }));
 });
+check("sampling options expose only executable domain kinds, not region point clouds", () => {
+  assert.ok(samplingOptions(scene).every((option) => option.target.kind !== "region"));
+  assert.equal(samplingOptions(scene).length, 3);
+});
+check("sampling and targets share one transaction while preserving policies, pins, IDs and other stages", () => {
+  const result = build(scene, "immutable-antenna", "solve-basis", 3, [region, object], object);
+  const next = result.merge_patch.antenna_field_solve_stages;
+  assert.deepEqual(next[0], { ...solve, field_sampling_domain: object });
+  assert.strictEqual(next[1], scene.antenna_field_solve_stages[1]);
+  assert.notStrictEqual(next[0].field_sampling_domain, object);
+  assert.equal(JSON.stringify(scene), original);
+  assert.throws(() => build(scene, "immutable-antenna", "solve-basis", 3, [object], region), /point-cloud/);
+  assert.throws(() => build(scene, "immutable-antenna", "solve-basis", 3, [object], { kind: "object", object_id: "missing" }), /existing/);
+});
 const submitted = { key: "session-epoch|source|solve", baseRevision: 3, dirty: true, targets: [region] };
 check("ACK clears only the exact submitted draft and advances its revision", () => {
   assert.deepEqual(ack(submitted, submitted, 4), { ...submitted, baseRevision: 4, dirty: false });
@@ -97,5 +111,11 @@ check("ACK preserves edits made in flight while rebasing against acknowledged re
 check("stale ACK cannot modify another session/target/rebase or reverted draft", () => {
   for (const current of [null, { ...submitted, key: "different-session" }, { ...submitted, baseRevision: 9 }]) assert.strictEqual(ack(current, submitted, 4), current);
   for (const revision of [3, 2, NaN, Infinity, 4.5]) assert.throws(() => ack(submitted, submitted, revision), /ACK revision/);
+});
+check("sampling-only in-flight edit survives the older targets ACK", () => {
+  const newer = { ...submitted, samplingDomain: object };
+  const next = ack(newer, submitted, 4);
+  assert.deepEqual(next, { ...newer, baseRevision: 4, dirty: true });
+  assert.strictEqual(next.samplingDomain, object);
 });
 console.log(`PASS ${checks} actual-model checks; browser lifecycle and runtime solve NOT VERIFIED.`);

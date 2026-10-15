@@ -25,6 +25,8 @@ try {
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error" && !message.text().startsWith("Failed to load resource:")) consoleErrors.push(message.text()); });
   const editor = page.getByTestId("solve-editor"), select = editor.getByRole("combobox", { name: "Add field-solve target", exact: true });
+  const sampling = editor.getByRole("combobox", { name: "Field-sampling domain", exact: true });
+  const globalKey = JSON.stringify(["global"]);
   const button = (name) => editor.getByRole("button", { name, exact: true });
   const click = (name) => button(name).evaluate((element) => element.click());
   const read = () => page.evaluate(() => window.__antennaSolveTargetsFixture.read());
@@ -32,9 +34,9 @@ try {
   const wait = (predicate) => page.waitForFunction(predicate, undefined, { timeout });
   const screenshot = async (name) => { const path = resolve(reportDirectory, `${name}.png`); await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
   const ready = async () => { await select.waitFor({ timeout }); await page.waitForFunction(() => !document.querySelector('[data-testid="solve-editor"] select')?.disabled, undefined, { timeout }); };
-  const boot = async () => { await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 }); await wait(() => Boolean(window.__antennaSolveTargetsFixture)); await ready(); };
+  const boot = async (samplingKind = "") => { const target = new URL(url); if (samplingKind) target.searchParams.set("sampling", samplingKind); await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 60_000 }); await wait(() => Boolean(window.__antennaSolveTargetsFixture)); await ready(); };
   const add = async (value) => { await select.selectOption(value); await click("Add target"); };
-  const apply = async () => { await button("Apply field-solve targets").waitFor(); assert.equal(await button("Apply field-solve targets").isDisabled(), false); await click("Apply field-solve targets"); await wait(() => window.__antennaSolveTargetsFixture.read().pending === 1); };
+  const apply = async () => { await button("Apply field-solve settings").waitFor(); assert.equal(await button("Apply field-solve settings").isDisabled(), false); await click("Apply field-solve settings"); await wait(() => window.__antennaSolveTargetsFixture.read().pending === 1); };
   const release = async () => { await page.evaluate(() => window.__antennaSolveTargetsFixture.release()); await wait(() => window.__antennaSolveTargetsFixture.read().pending === 0); };
   const budget = async (label) => {
     const final = await read();
@@ -46,6 +48,8 @@ try {
   };
 
   await boot();
+  assert.equal(await sampling.locator(`option[value='${regionKey}']`).count(), 0);
+  await sampling.selectOption(objectKey);
   await add(objectKey);
   await select.selectOption(regionKey);
   await page.evaluate(() => {
@@ -72,19 +76,23 @@ try {
   const before = await read();
   await apply();
   assert.equal(await select.isDisabled(), false);
-  assert.equal(await button("Revert targets").isDisabled(), true);
+  assert.equal(await button("Revert field-solve settings").isDisabled(), true);
   const pending = await read();
   assert.equal(writes(pending).length, 1);
   assert.equal(writes(pending)[0].body.base_revision, 1);
   assert.deepEqual(Object.keys(writes(pending)[0].body.merge_patch), ["antenna_field_solve_stages"]);
   assert.deepEqual(writes(pending)[0].body.merge_patch.antenna_field_solve_stages[0].target_refs, [{ kind: "global" }, { kind: "object", object_id: "immutable-waveguide" }]);
+  assert.deepEqual(writes(pending)[0].body.merge_patch.antenna_field_solve_stages[0].field_sampling_domain, { kind: "object", object_id: "immutable-waveguide" });
+  assert.equal(await sampling.isEnabled(), true);
+  await sampling.selectOption(globalKey);
   await click("Add target");
   await screenshot("02-pending-newer-region-draft");
   await release();
-  await page.waitForFunction(() => [...document.querySelectorAll('[data-testid="solve-editor"] button')].some((button) => button.textContent === "Apply field-solve targets" && !button.disabled), undefined, { timeout });
+  await page.waitForFunction(() => [...document.querySelectorAll('[data-testid="solve-editor"] button')].some((button) => button.textContent === "Apply field-solve settings" && !button.disabled), undefined, { timeout });
   assert.equal(await editor.getByRole("button", { name: /^Remove field-solve target/ }).count(), 3);
   assert.equal(await select.inputValue(), regionKey);
-  assert.equal(await button("Rebase targets").count(), 0);
+  assert.equal(await sampling.inputValue(), globalKey, "ACK erased the newer sampling draft");
+  assert.equal(await button("Rebase field-solve settings").count(), 0);
   const proof = await page.evaluate(() => {
     const { proof, sample, observer } = window.__solveStability; sample(); observer.disconnect();
     return { rootChanges: proof.rootChanges, controlChanges: proof.controlChanges, disabledChanges: proof.disabledChanges, opacityChanges: proof.opacityChanges, opacityAnimations: proof.opacityAnimations, focus: document.activeElement === proof.input, maxScrollDelta: proof.maxScrollDelta };
@@ -98,19 +106,52 @@ try {
   await apply();
   const second = writes(await read())[1];
   assert.equal(second.body.base_revision, 2);
+  assert.deepEqual(second.body.merge_patch.antenna_field_solve_stages[0].field_sampling_domain, { kind: "global" });
   assert.deepEqual(second.body.merge_patch.antenna_field_solve_stages[0].target_refs[2], { kind: "region", object_id: "immutable-waveguide", region_id: "core" });
   await release();
   await wait(() => document.querySelector('[data-testid="solve-dirty"]')?.textContent === "false");
   await budget("two explicit writes preserve region and ACK revision");
 
-  await boot(); await add(regionKey);
+  await boot();
+  await sampling.selectOption(objectKey);
+  await click("Revert field-solve settings");
+  assert.equal(await sampling.inputValue(), globalKey);
+  assert.equal(writes(await read()).length, 0);
+  await sampling.selectOption(objectKey); await apply();
+  const samplingOnly = writes(await read())[0].body.merge_patch.antenna_field_solve_stages[0];
+  assert.deepEqual(samplingOnly.target_refs, [{ kind: "global" }]);
+  assert.deepEqual(samplingOnly.field_sampling_domain, { kind: "object", object_id: "immutable-waveguide" });
+  assert.equal(samplingOnly.solver_policy, "default"); assert.equal(samplingOnly.conductor_mesh_policy, "inherit_source");
+  await sampling.selectOption(globalKey); await release();
+  await page.waitForFunction(() => [...document.querySelectorAll('[data-testid="solve-editor"] button')].some((button) => button.textContent === "Apply field-solve settings" && !button.disabled), undefined, { timeout });
+  assert.equal(await sampling.inputValue(), globalKey);
+  await click("Revert field-solve settings");
+  assert.equal(await sampling.inputValue(), objectKey);
+  checks.push({ name: "sampling-only write preserves targets and policies, held ACK retains newer domain, explicit revert restores acknowledged domain without extra writes", passed: true });
+  await screenshot("04-sampling-only-ack");
+  await budget("sampling-only ACK and explicit revert");
+
+  await boot("region");
+  assert.equal(await sampling.inputValue(), regionKey);
+  assert.ok((await editor.innerText()).includes("point-cloud"));
+  assert.equal(await button("Apply field-solve settings").isDisabled(), true);
+  assert.equal(writes(await read()).length, 0);
+  await sampling.selectOption(objectKey); await apply(); await release();
+  await wait(() => document.querySelector('[data-testid="solve-dirty"]')?.textContent === "false");
+  assert.equal(await sampling.inputValue(), objectKey);
+  checks.push({ name: "unsupported persisted region sampling is visible and blocked without silent conversion; explicit Object correction preserves targets", passed: true });
+  await screenshot("04-corrected-region-sampling");
+  await budget("explicit correction of unsupported sampling");
+
+  await boot(); await sampling.selectOption(objectKey); await add(regionKey);
   await page.evaluate(() => window.__antennaSolveTargetsFixture.conflict());
-  await button("Rebase targets").waitFor({ timeout });
-  assert.equal(await button("Apply field-solve targets").isDisabled(), true);
+  await button("Rebase field-solve settings").waitFor({ timeout });
+  assert.equal(await button("Apply field-solve settings").isDisabled(), true);
   assert.equal(writes(await read()).length, 0);
   await screenshot("04-explicit-conflict");
-  await click("Rebase targets"); await apply();
+  await click("Rebase field-solve settings"); await apply();
   assert.equal(writes(await read())[0].body.base_revision, 2);
+  assert.deepEqual(writes(await read())[0].body.merge_patch.antenna_field_solve_stages[0].field_sampling_domain, { kind: "object", object_id: "immutable-waveguide" });
   await release();
   await wait(() => document.querySelector('[data-testid="solve-dirty"]')?.textContent === "false");
   checks.push({ name: "external scene revision blocks writes until explicit rebase", passed: true });
@@ -120,12 +161,12 @@ try {
   await page.evaluate(() => window.__antennaSolveTargetsFixture.resetHistory());
   const resetBefore = await read();
   await release();
-  await page.waitForFunction(() => [...document.querySelectorAll('[data-testid="solve-editor"] button')].some((button) => button.textContent === "Apply field-solve targets" && !button.disabled), undefined, { timeout });
+  await page.waitForFunction(() => [...document.querySelectorAll('[data-testid="solve-editor"] button')].some((button) => button.textContent === "Apply field-solve settings" && !button.disabled), undefined, { timeout });
   const resetAfter = await read();
   assert.equal(resetAfter.canUndo, false); assert.equal(resetAfter.invalidations, resetBefore.invalidations);
   assert.equal(await page.getByTestId("solve-dirty").textContent(), "true");
-  assert.equal(await editor.getByText(/Field-solve targets committed/).count(), 0);
-  await click("Revert targets");
+  assert.equal(await editor.getByText(/Field-solve settings committed/).count(), 0);
+  await click("Revert field-solve settings");
   await wait(() => document.querySelector('[data-testid="solve-dirty"]')?.textContent === "false");
   checks.push({ name: "history reset fences late ACK publication and retains dirty draft until explicit revert", passed: true });
   await budget("history reset and explicit draft reset");
@@ -143,7 +184,7 @@ try {
   assert.equal(await editor.getByRole("button", { name: /^Remove field-solve target/ }).count(), 2);
   assert.equal(await select.inputValue(), regionKey);
   assert.equal(await page.getByTestId("solve-dirty").textContent(), "true");
-  assert.equal(await editor.getByText(/Field-solve targets committed/).count(), 0);
+  assert.equal(await editor.getByText(/Field-solve settings committed/).count(), 0);
   checks.push({ name: "session A→B→A fences old owner token despite identical returned session identity", passed: true });
   await screenshot("05-aba-stale-ack-retained-current-draft");
   await budget("session ABA");

@@ -12,6 +12,7 @@ export interface AntennaSolveTargetsDraft {
   baseRevision: number;
   dirty: boolean;
   targets: AntennaSolveTarget[];
+  samplingDomain?: AntennaSolveTarget;
 }
 
 export function antennaSolveTargetKey(target: AntennaSolveTarget): string {
@@ -39,8 +40,13 @@ export function antennaSolveTargetOptions(scene: SceneResource | null): AntennaS
   return targets;
 }
 
+/** The planner accepts domain/object Tet4 carriers; region point clouds are not implemented. */
+export function antennaSamplingDomainOptions(scene: SceneResource | null): AntennaSolveTargetOption[] {
+  return antennaSolveTargetOptions(scene).filter((option) => option.target.kind !== "region");
+}
+
 export function buildAntennaSolveTargetsTransaction(
-  scene: SceneResource, objectId: string, stageId: string, baseRevision: number, targets: readonly AntennaSolveTarget[],
+  scene: SceneResource, objectId: string, stageId: string, baseRevision: number, targets: readonly AntennaSolveTarget[], samplingDomain?: AntennaSolveTarget,
 ): AuthoringTransactionRequest {
   if (!Number.isSafeInteger(baseRevision) || baseRevision < 0 || scene.revision !== baseRevision) {
     throw new Error("Scene changed. Refresh and explicitly rebase field-solve targets.");
@@ -59,9 +65,15 @@ export function buildAntennaSolveTargetsTransaction(
     if (seen.has(key)) throw new Error("Duplicate field-solve targets are not allowed.");
     seen.add(key);
   }
+  if (samplingDomain) {
+    if (samplingDomain.kind === "region") throw new Error("Region sampling requires an explicit point-cloud carrier; this runtime supports Global or Object Tet4 sampling only.");
+    if (!antennaSamplingDomainOptions(scene).some((option) => option.key === antennaSolveTargetKey(samplingDomain))) {
+      throw new Error("Select an existing Global or Object field-sampling domain.");
+    }
+  }
   return {
     kind: "merge_patch", base_revision: baseRevision,
-    merge_patch: { antenna_field_solve_stages: stages.map((stage) => stage.id === stageId ? { ...stage, target_refs: targets.map((target) => ({ ...target })) } : stage) },
+    merge_patch: { antenna_field_solve_stages: stages.map((stage) => stage.id === stageId ? { ...stage, target_refs: targets.map((target) => ({ ...target })), ...(samplingDomain ? { field_sampling_domain: { ...samplingDomain } } : {}) } : stage) },
   };
 }
 
