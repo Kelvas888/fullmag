@@ -400,7 +400,7 @@ fn manifest_integrity_rejects_child_or_digest_tampering() {
         .validate_integrity()
         .unwrap_err()
         .to_string()
-        .contains("does not match its axis position"));
+        .contains("parameter tuple does not match its axis position"));
 
     let mut changed_digest = expand_independent_batch(request(vec![axis(
         "field",

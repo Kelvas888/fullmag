@@ -14167,6 +14167,132 @@ class RegionMeshPolicyTests(unittest.TestCase):
                         source_geometry_name="source-owner",
                     )
 
+    def test_source_plane_seed_supports_graded_component_fields(self) -> None:
+        class _SourceFaceGmsh:
+            def __init__(self) -> None:
+                self.field = _RecordingFieldApi()
+                self.field.list = lambda: list(self.field.kinds)  # type: ignore[attr-defined]
+                self.points: list[tuple[float, float, float, float]] = []
+                self.embeds: list[tuple[int, list[int], int, int]] = []
+                self.inside_calls: list[tuple[int, int, list[float]]] = []
+                self.option = SimpleNamespace(setNumber=lambda _name, _value: None)
+                self.model = SimpleNamespace(
+                    mesh=SimpleNamespace(
+                        field=self.field,
+                        embed=self._embed,
+                    ),
+                    geo=SimpleNamespace(
+                        addPoint=self._add_point,
+                        synchronize=lambda: None,
+                    ),
+                    getBoundingBox=lambda _dim, _tag: (
+                        -4.0, -3.0, 0.0, 4.0, 3.0, 0.0
+                    ),
+                    isInside=self._is_inside,
+                )
+
+            def _add_point(
+                self, x: float, y: float, z: float, mesh_size: float
+            ) -> int:
+                self.points.append((x, y, z, mesh_size))
+                return len(self.points)
+
+            def _embed(
+                self, dimension: int, tags: list[int], target_dimension: int, target: int
+            ) -> None:
+                self.embeds.append((dimension, list(tags), target_dimension, target))
+
+            def _is_inside(
+                self, dimension: int, tag: int, point: list[float]
+            ) -> int:
+                self.inside_calls.append((dimension, tag, list(point)))
+                # Simulate the circular CSG hole in the source face.
+                return int(np.hypot(point[0], point[1]) >= 0.5)
+
+        graded_box = {
+            "kind": "ComponentRestrictedGradedBox",
+            "params": {
+                "GeometryName": "source-owner",
+                "VIn": 1.0,
+                "VOut": 8.0,
+                "TransitionDistance": 2.0,
+                "Size": [4.0, 4.0, 4.0],
+                "Center": [0.0, 0.0, 0.0],
+            },
+        }
+        graded_cylinder = {
+            "kind": "ComponentRestrictedGradedCylinder",
+            "params": {
+                "GeometryName": "source-owner",
+                "VIn": 1.0,
+                "VOut": 8.0,
+                "TransitionDistance": 2.0,
+                "Radius": 1.0,
+                "Height": 4.0,
+                "Center": [0.0, 0.0, 0.0],
+                "Axis": [0.0, 0.0, 1.0],
+            },
+        }
+        options = MeshOptions(size_fields=[graded_box, graded_cylinder])
+        gmsh = _SourceFaceGmsh()
+        with patch.object(gmsh_swept, "_apply_mesh_options") as apply_mesh_options:
+            restricted = gmsh_swept._apply_mixed_source_face_mesh_options(
+                gmsh,
+                source_surface=7,
+                hmax_scaled=8.0,
+                order=1,
+                opts=options,
+                hscale=1.0,
+                source_geometry_name="source-owner",
+            )
+
+        apply_mesh_options.assert_called_once()
+        self.assertIsInstance(restricted, int)
+        self.assertTrue(gmsh.embeds)
+        self.assertTrue(gmsh.inside_calls)
+        self.assertTrue(
+            all(np.hypot(point[0], point[1]) >= 0.5 for point in gmsh.points)
+        )
+        self.assertEqual(
+            gmsh_swept._localize_source_plane_seed_descriptor(
+                graded_box, normal_axis=2, face_axes=[0, 1]
+            )["params"]["TransitionDistance"],
+            2.0,
+        )
+        default_axis_cylinder = {
+            "kind": graded_cylinder["kind"],
+            "params": {
+                key: value
+                for key, value in graded_cylinder["params"].items()
+                if key != "Axis"
+            },
+        }
+        self.assertEqual(
+            gmsh_swept._localize_source_plane_seed_descriptor(
+                default_axis_cylinder, normal_axis=2, face_axes=[0, 1]
+            )["params"]["Axis"],
+            [0.0, 0.0, 1.0],
+        )
+
+        non_projectable_cylinder = {
+            "kind": "ComponentRestrictedGradedCylinder",
+            "params": {
+                **graded_cylinder["params"],
+                "Axis": [1.0, 0.0, 0.0],
+            },
+        }
+        bad_options = MeshOptions(size_fields=[non_projectable_cylinder])
+        with self.assertRaisesRegex(ValueError, "axis parallel to the source-face normal"):
+            gmsh_swept._apply_mixed_source_face_mesh_options(
+                _SourceFaceGmsh(),
+                source_surface=7,
+                hmax_scaled=8.0,
+                order=1,
+                opts=bad_options,
+                hscale=1.0,
+                source_geometry_name="source-owner",
+            )
+
     def test_ring_chordal_bound_guard_and_refinement(self) -> None:
         quarter_circle_gaps = np.full(4, 0.5 * np.pi, dtype=np.float64)
         square_ring_cap_area = _polygonal_ring_annular_cap_area(

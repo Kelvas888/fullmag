@@ -36,7 +36,12 @@ def test_eigen_capture_preserves_solver_controls_and_separate_floquet_kind():
 ])
 def test_invalid_authored_values_are_not_replaced_with_defaults(field, value):
     with pytest.raises(ValueError):
-        _render_scene_stage_bootstrap({"kind": "eigenmodes", field: value}, index=0, solver=None, magnet_vars={})
+        _render_scene_stage_bootstrap(
+            {"kind": "eigenmodes", field: value},
+            index=0,
+            solver=None,
+            magnet_vars={},
+        )
 
 
 def test_conflicting_k_vector_and_path_are_rejected_before_rendering():

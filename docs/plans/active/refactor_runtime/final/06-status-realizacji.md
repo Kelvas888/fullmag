@@ -1,4 +1,41 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 15.10.2026 — [P8-53CX](p8/53cx-python-scene-contract-acceptance.md):
+CI potwierdziło Gmsh exact-layer airbox SUCCESS. Kolejne 8 porażek testów
+sceny Python poprawiono zgodnie z rendererem i canonical auxiliary identity;
+dokładny zestaw pięciu plików CI lokalnie **127/127 PASS**, bez skip.
+Odbiór nowych poprawek w CI i nowe regresje Rust pozostają wymagane.
+Pełny plan **IN PROGRESS**, procenty bez awansu.
+
+Checkpoint 15.10.2026 — [P8-53CW](p8/53cw-nested-pipeline-and-application-fixtures.md):
+naprawiono rekurencyjną walidację aktywnych etapów i zachowano deklaracje
+scope wyłączonych etapów. Przygotowano sześć napraw fixture batch/RunIntent,
+zachowując FDM/FEM intent, pełne fingerprinty i negatywne assert’y.
+Parser/diff i source review PASS; wykonanie nowych regresji Rust wymaga CI.
+Pełny plan **IN PROGRESS**, procenty bez awansu przed odbiorem.
+
+Checkpoint 15.10.2026 — [P8-53CV](p8/53cv-ci-application-followup.md):
+poprawka meshera opublikowana jako `6b58b6f10`. Starszy CI napraw fixture
+doszedł do wykonania aplikacji: **101 PASS / 9 FAIL**. Trwa diagnoza
+replay/typed modules/preparation/antenna; walidatorów nie osłabiano.
+Ponowny build Windows zakończył limit oczekiwania przed startem kompilacji;
+brak nowego pakietu. Pełny plan **IN PROGRESS**, procenty bez awansu.
+
+Checkpoint 15.10.2026 — [P8-53CU](p8/53cu-body-first-production-regression.md):
+body-first CAD w produkcyjnym generatorze przechodzi pełny Box **45/45**,
+owner-fields **2/2** i scoped-ring **2/2**, bez skip i przy stabilnych źródłach.
+Zamknięto lokalną porażkę owner XY; pełny Python CI, pakiet Windows oraz
+solver/device/release qualification nadal wymagają osobnych dowodów.
+Pełny plan **IN PROGRESS**, procenty bez awansu przed odbiorem integracji.
+
+Checkpoint 15.10.2026 — [P8-53CR](p8/53cr-application-fixture-imports-and-inventory.md)
+i [P8-53CS](p8/53cs-staged-mesher-negative-evidence.md):
+naprawiono pięć kolejnych błędów kompilacji fixture aplikacji i opublikowano
+`90d35237d`; odbiór CI wymagany. Kandydat fazowego meshera nie zachowuje body
+XY ani tetraedrów i został odrzucony jako rozwiązanie. Zachowano negatywne
+dowody i oceniono retencję bez usuwania. Restart backendu z UI jest poza
+aktualnym zakresem produktu; obowiązuje zapis i ponowny start CLI.
+Pełny plan **IN PROGRESS**, procenty bez awansu.
+
 Checkpoint 14.10.2026 — [P8-53CP](p8/53cp-worker-environment-fixture-types.md)
 i [P8-53CQ](p8/53cq-owner-air-separated-field-controls.md):
 fixture kompozycji anteny **3/3 PASS w CI**. Dwa kolejne E0277 testu

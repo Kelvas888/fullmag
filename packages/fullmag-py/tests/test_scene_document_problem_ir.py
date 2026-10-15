@@ -316,6 +316,20 @@ study.geometry_object(fm.Box(20e-9, 10e-9, 5e-9), name='lead', type='conductor')
         "lead",
         "lead",
     )
+    assert problem_ir["physics_objects"] == [
+        {
+            "schema_version": "physics_object.v1",
+            "object_id": "stable-lead-id",
+            "name": "lead",
+            "type": "conductor",
+            "geometry_id": "lead",
+            "material_assignment_ids": [],
+        }
+    ]
+    assert [magnet["object_id"] for magnet in problem_ir["magnets"]] == ["film"]
+    assert "stable-lead-id" not in {
+        magnet["object_id"] for magnet in problem_ir["magnets"]
+    }
 
 
 @pytest.mark.parametrize(
