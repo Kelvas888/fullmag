@@ -178,7 +178,6 @@ describe("WorkspaceShellClient session collection gate", () => {
   });
 
   it("retains the focused workspace draft when session and status refreshes fail", async () => {
-    vi.useFakeTimers();
     const sessionList = {
       schema_version: "2.0.0",
       sessions: [{
@@ -231,11 +230,7 @@ describe("WorkspaceShellClient session collection gate", () => {
     const { container, dispose } = await mountWorkspace(kernel);
 
     try {
-      await settleWithFakeTimers();
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(statusRefreshIntervalMs() + 1);
-      });
+      await settle();
 
       const workspaceBody = findElements(
         container,
@@ -256,12 +251,14 @@ describe("WorkspaceShellClient session collection gate", () => {
       draft!.value = "Unsaved workspace draft";
       draft!.focus();
 
+      // Invalidate after the real status throttle, without waiting on wall time.
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + statusRefreshIntervalMs() + 1);
       await act(async () => {
         kernel.resources.invalidate(SESSIONS_PATH, "transport-refresh:1");
         kernel.resources.invalidate(SESSION_STATUS_RESOURCE_KEY, "transport-refresh:1");
         kernel.realtimeConnection.update("disconnected");
       });
-      await settleWithFakeTimers();
+      await settle();
 
       expect(list).toHaveBeenCalledTimes(2);
       expect(currentStatus).toHaveBeenCalledTimes(2);
@@ -287,11 +284,7 @@ describe("WorkspaceShellClient session collection gate", () => {
       expect(container.textContent).toContain("Reconnecting…");
       expect(findByAttribute(container, "aria-modal", "true")).toBeNull();
     } finally {
-      try {
-        await dispose();
-      } finally {
-        vi.useRealTimers();
-      }
+      await dispose();
     }
   });
 
@@ -451,14 +444,6 @@ async function settle(): Promise<void> {
   for (let index = 0; index < 6; index += 1) {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-  }
-}
-
-async function settleWithFakeTimers(): Promise<void> {
-  for (let index = 0; index < 6; index += 1) {
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
     });
   }
 }

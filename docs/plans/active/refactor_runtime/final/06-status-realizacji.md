@@ -1,4 +1,14 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 15.10.2026 — [P8-53DA](p8/53da-native-capture-and-runtime-free-browser.md):
+utrwalanie natywnych wejść przed długą kopią frontendu/docs: **17/17 PASS**.
+Pięć błędów fixture meshing poprawiono; celowany odbiór **4 PASS + 2 subtesty**.
+Rzeczywista odmowa jakości tet4 pozostaje otwarta, próg 0.1 zachowany.
+UI **8536 PASS / 1 FAIL / 13 skip**: przygotowano poprawkę zegara testu
+retencji, wymagany nowy CI. Bramka rzeczywistego browser lifecycle bez
+RuntimeSession przygotowana; runtime **NOT VERIFIED**. Nowy natywny build
+e87965eccad443abba20c0a4441e3f4a uruchomiony, wynik jeszcze nieznany.
+Pełny plan **IN PROGRESS**, procenty bez awansu.
+
 Aktualizacja [P8-53CZ](p8/53cz-nonblocking-preparation-ci-followup.md):
 najnowszy odbiór UI **8535 PASS / 1 FAIL / 13 skip**; pozostały brak
 localStorage w fixture poprawiono, dodano test zachowania realnej powłoki

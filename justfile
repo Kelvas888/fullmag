@@ -289,6 +289,10 @@ verify-windows-project-document:
 verify-windows-project-document-frozen build_id:
     @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only --frozen-native-build-id "{{build_id}}"
 
+# Real product workspace and project archive lifecycle without a runtime session.
+verify-windows-project-document-browser build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only --frozen-native-build-id "{{build_id}}" --project-document-browser
+
 # Preserve a verified old API package for an owned subsequent restart proof.
 archive-windows-native-build build_id:
     @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --project-document-only --frozen-native-build-id "{{build_id}}" --archive-frozen-bundle
