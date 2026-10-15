@@ -1,4 +1,11 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 15.10.2026 — [P8-53CU](p8/53cu-body-first-production-regression.md):
+body-first CAD w produkcyjnym generatorze przechodzi pełny Box **45/45**,
+owner-fields **2/2** i scoped-ring **2/2**, bez skip i przy stabilnych źródłach.
+Zamknięto lokalną porażkę owner XY; pełny Python CI, pakiet Windows oraz
+solver/device/release qualification nadal wymagają osobnych dowodów.
+Pełny plan **IN PROGRESS**, procenty bez awansu przed odbiorem integracji.
+
 Checkpoint 15.10.2026 — [P8-53CR](p8/53cr-application-fixture-imports-and-inventory.md)
 i [P8-53CS](p8/53cs-staged-mesher-negative-evidence.md):
 naprawiono pięć kolejnych błędów kompilacji fixture aplikacji i opublikowano
