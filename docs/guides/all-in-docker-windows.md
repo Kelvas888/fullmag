@@ -10,16 +10,41 @@ opisanych niżej.
 
 ## Główna ścieżka developerska
 
-Wersjonowany developerski Compose uruchamia się przez istniejący launcher:
+Z głównego checkoutu lub worktree wykonaj kolejno:
 
 ```text
+just runner-container-status
+just docker-all-dev-backend-build [source_root=""]
+just runner-wait <job_id> 30
+just docker-all-dev-image <job_id> <commit> <source_digest> <native_snapshot_sha256> [source_root=""]
 just docker-all-dev <assembly_receipt> [port=3197] [source_root=""]
 ```
+
+`job_id`, `commit` oraz oba digesty pochodzą z receiptu zgłoszenia backendu.
+Składanie obrazu zwraca `assembly_receipt`. Po kodzie 124 z `runner-wait`
+obserwuj ten sam job; nie zgłaszaj kolejnego buildu. Do składania i startu
+przejdź dopiero po terminalnym `succeeded`. Jeżeli wybierasz worktree, używaj
+tego samego `source_root` w zgłoszeniu, składaniu obrazu i starcie.
+
+Wersjonowane pliki definiują poszczególne części:
+
+| Plik | Odpowiedzialność |
+| --- | --- |
+| `compose.dev.yaml` | frontend/backend, readonly źródła, rzeczywisty storage Windows, prywatna sieć i publiczny port frontendu |
+| `compose.toolchain.yaml` | budowanie zależności z kanonicznego Dockerfile, obraz CUDA z digestem |
+| `docker/fem-gpu/Dockerfile` | pobieranie i budowanie bibliotek FEM/CUDA oraz deklaracje ich wersji |
+| `docker/all-in-one/Dockerfile.dev` | helpery uruchomieniowe; źródła i pakiet aplikacji są bind mountami |
+| `compose.static.yaml` | opcjonalny wariant ze statycznym frontendem |
+
+Istniejący `compose.yaml` zachowuje kanoniczne profile FEM i nie jest plikiem
+startowym dwóch usług developerskich. Launcher odczytuje `compose.dev.yaml`,
+rozwiązuje jego parametry i wykonuje admission storage przed startem.
 
 Pusty `source_root` wybiera checkout Git główny, a jawna ścieżka wybiera
 zarejestrowany worktree. W obu przypadkach launcher zapisuje resolved Compose
 JSON oraz kopię źródłowego YAML w owned run; nie generuje topologii w Pythonie.
-Konfiguracja i cold-start/HMR pozostają **VERIFICATION PENDING**.
+Renderowanie Compose przeszło kontrole źródeł i rzeczywisty parser Compose;
+cold-start, HMR i pełny runtime pozostają **VERIFICATION PENDING**.
 
 ## Budowanie obrazu release (opcjonalne)
 
@@ -62,9 +87,19 @@ Obraz zawiera pełny toolchain i może być duży; nie jest wersją slim.
 Zależności FEM są pobierane wyłącznie z kanonicznego
 `docker/fem-gpu/Dockerfile`, w tym z jego stage `fem-gpu-dev` i przypiętych
 wersji. `Dockerfile.dev` integruje ten toolchain dla obrazu developerskiego;
-nie utrzymujemy drugiej listy wersji w Compose ani w tym przewodniku. Raport
-zależności i śledzenie wersji pozostają osobnym obowiązkiem review. Ten etap
-integracji jest **VERIFICATION PENDING**.
+nie utrzymujemy drugiej listy wersji bibliotek w Compose ani w tym przewodniku.
+Opis pinów jest w [`docker/DEPENDENCIES.md`](../../docker/DEPENDENCIES.md).
+Polecenie `python scripts/docker_dependency_report.py --check-updates` porównuje
+przypięte wersje z oficjalnymi stabilnymi wydaniami bez modyfikowania obrazu lub źródeł.
+Toolchain publikuje faktycznie zbudowane wersje i commity w
+`/opt/fullmag-deps/share/fullmag/dependency-versions.json`; obraz developerski
+odmawia składania bez tego manifestu. Stary obraz toolchaina bez
+manifestu wymaga ponownego zbudowania kanonicznego toolchaina i przypisania jego
+zweryfikowanego ID do profilu `fem-gpu-release` koordynatora. Na tym hoście
+ciężką pracę wykonuje istniejący koordynator lub odrębna bramka managed FEM
+z blokadą ciężkich prac; nie uruchamiaj równoległego ręcznego buildu Compose.
+Rust `nightly` i pakiety pip nie są w pełni przypięte. Końcowe wykonanie nowego
+toolchaina i obrazu aplikacji pozostaje **VERIFICATION PENDING**.
 
 ## CI: routowanie managed FEM
 
@@ -168,10 +203,10 @@ pozostaje jedynym writerem sesji i właścicielem runtime service.
 `compose.static.yaml` jest opcjonalną, osobną ścieżką release/legacy dla
 statycznego frontendu. Nie jest używany do HMR ani do developerskiego proxy.
 
-Rootowy Compose, renderowanie launchera oraz cold-start/HMR są obecnie
-**VERIFICATION PENDING**. Poniższe istniejące recepty opisują zamierzony
-przepływ, ale ich końcowe argumenty i gotowość zostaną potwierdzone po integracji
-launchera; nie należy dopisywać nowych flag na podstawie samego dokumentu.
+Rootowy Compose i argumenty launchera są zaimplementowane i przeszły kontrole
+źródeł, parsera Compose oraz admission poleceń. Cold-start/HMR, przeglądarka,
+zapis sesji i FEM/GPU w końcowym obrazie pozostają **VERIFICATION PENDING**;
+same kontrole źródeł nie dowodzą tych zachowań.
 
 Compose uruchamia `frontend` (Next.js dev z HMR) oraz `backend` (API, Python,
 FEM/GPU i runtime service). Oba korzystają z tego samego przypiętego obrazu;
@@ -194,7 +229,10 @@ Cold-start ma limit 35 minut, obejmujący instalację zależności z limitem 30 
 oraz przygotowanie API/Next; zwykły restart używa zachowanych
 zależności. Cache, logi i `node_modules` pozostają w osobnym
 podkatalogu `state/development` kanonicznego storage Windows. Nie używamy
-hostowych `node_modules`, `.env` ani katalogu Git w kontenerze.
+hostowych `node_modules`, `.env` ani katalogu Git w kontenerze frontendu.
+Backend montuje cały wybrany checkout readonly i pobiera publiczny Python DSL
+z `/opt/fullmag/source/packages/fullmag-py/src`; skompilowane binaria pobiera
+z osobnego montowania pakietu.
 
 Pliki konfiguracji i manifesty zależności są utrwalane przy przygotowaniu
 workspace. Ich zmiana wymaga przygotowania nowego workspace; HMR obejmuje
