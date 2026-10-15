@@ -646,6 +646,12 @@ właściwego kontenera nie wymaga usuwania danych. Osobny browser smoke musi
 potwierdzić działanie UI; zdrowe `/healthz` nie jest kwalifikacją solvera,
 fizyki ani wydania.
 
+Tryb sesji tymczasowej: `just run-managed-browser-snapshot-ram <pełny-job-id> <pełny-commit> <source-digest> <native-snapshot-sha256> 3106` stosuje te same walidatory pakietu i źródeł, ale umieszcza `/state` w prywatnym tmpfs o limicie 1 GiB. Hostowy bind stanu nie jest wtedy montowany; źródła i pakiet pozostają tylko do odczytu. Launcher sprawdza obecność zadeklarowanego tmpfs i jego rzeczywisty typ. Domyślny tryb z bindem pozostaje bez zmian. Port 3197 jest odrzucany, ponieważ należy do instancji użytkownika.
+
+Receipt oznacza ten wariant jako `session_storage: disposable_tmpfs` i `durable_session_storage_qualified: false`. Dokumenty uruchomienia pozostają w storage, ale dane sesji znikają po zatrzymaniu kontenera. Tryb służy sprawdzaniu własnego workspace/API; nie kwalifikuje trwałego zapisu ani cold-load po restarcie kontenera. Sam start nie potwierdza działania UI ani fizyki.
+
+Sesja RAM nie spełnia istniejącego wyjątku koordynatora pozwalającego na build przy działającym managed browser z hostowym bindem stanu. Przed kolejnym buildem należy zakończyć wyłącznie tę własną sesję, sprawdzając container ID i projekt Compose z receipt; nie zmieniać współdzielonego koordynatora ani cudzych kontenerów. Weryfikacja startu tego wariantu z rzeczywistym pakietem pozostaje **NOT VERIFIED** do czasu zachowania udanego receipt uruchomienia.
+
 ### Eksport OpenAPI z dokładnego snapshotu
 
 `just export-runner-openapi <job-id> <pełny-commit>` pozostaje trasą dla

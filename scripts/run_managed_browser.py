@@ -1,7 +1,8 @@
 """Start a receipt-verified CPU release in an isolated browser workspace.
 
 No build, dependency installation, shared runtime replacement or solver start.
-The exact Compose container and retained state are recorded for later shutdown.
+The exact Compose container is recorded for later shutdown. RAM mode retains
+launch evidence only; session data disappears when the container stops.
 """
 from __future__ import annotations
 
@@ -99,15 +100,18 @@ def validate_managed_build(root, expected_commit, *, source_digest=None, native_
     return context, built
 
 
-def compose_spec(image, source, package, state, port):
+def compose_spec(image, source, package, state, port, *, ephemeral=False):
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("Immutable build image digest required")
-    if not 1024 <= port <= 65535:
+    if type(ephemeral) is not bool:
+        raise ValueError("Ephemeral mode must be an explicit boolean")
+    if not 1024 <= port <= 65535 or port == 3197:
         raise ValueError("Invalid loopback browser port")
     mounts = [{"type": "bind", "source": str(path.resolve()), "target": target,
                "read_only": readonly}
               for path, target, readonly in ((source, "/source", True),
-                  (package, "/package", True), (state, "/state", False))]
+                  (package, "/package", True), (state, "/state", False))
+              if not (ephemeral and target == "/state")]
     # The capsule cannot acquire mountpoint directories. Create only symlinks
     # in private state; all source members still resolve into the read-only bind.
     entry = ('set -eu; [ ! -L /state/workspace ] || exit 2; '
@@ -130,7 +134,8 @@ def compose_spec(image, source, package, state, port):
         "user": "65532:65532", "cpus": 4, "mem_limit": "2g", "pids_limit": 128,
         "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],
         "ports": [f"127.0.0.1:{port}:8081"], "volumes": mounts,
-        "tmpfs": ["/tmp:rw,nosuid,nodev,size=256m"],
+        "tmpfs": ["/tmp:rw,nosuid,nodev,size=256m"] + (
+            ["/state:rw,nosuid,nodev,size=1g,mode=0700,uid=65532,gid=65532"] if ephemeral else []),
         "environment": {
             "FULLMAG_REPO_ROOT": "/state/workspace", "FULLMAG_STATE_ROOT": "/state/workspace/.fullmag",
             "FULLMAG_WEB_STATIC_DIR": "/package/web", "FULLMAG_API_PORT": "8081",
@@ -154,16 +159,16 @@ def docker(*args):
     return result.stdout.strip()
 
 
-def run(repo, job_id, commit, port, *, source_digest=None, native_snapshot_sha256=None):
+def run(repo, job_id, commit, port, *, source_digest=None, native_snapshot_sha256=None, ephemeral=False):
     if not re.fullmatch(r"[0-9a-f]{32}", job_id):
         raise ValueError("Full managed job ID required")
     layout = storage.resolve_layout(repo, PROFILE)
     with runtime_package_use(layout):
         return _run_protected(layout, job_id, commit, port,
-            source_digest=source_digest, native_snapshot_sha256=native_snapshot_sha256)
+            source_digest=source_digest, native_snapshot_sha256=native_snapshot_sha256, ephemeral=ephemeral)
 
 
-def _run_protected(layout, job_id, commit, port, *, source_digest=None, native_snapshot_sha256=None):
+def _run_protected(layout, job_id, commit, port, *, source_digest=None, native_snapshot_sha256=None, ephemeral=False):
     base = Path(layout["storage_root"])
     build = storage.validate_path(Path(layout["runs_root"]) / job_id, base)
     context, built = validate_managed_build(build, commit,
@@ -193,7 +198,7 @@ def _run_protected(layout, job_id, commit, port, *, source_digest=None, native_s
     state = root / "state"
     state.mkdir()
     project = "fullmag-browser-" + root.name
-    spec = compose_spec(context["image_digest"], source, package, state, port)
+    spec = compose_spec(context["image_digest"], source, package, state, port, ephemeral=ephemeral)
     spec_path = root / "compose.json"
     storage.atomic_json(spec_path, spec)
     receipt = {"schema": "fullmag.managed-browser.v1", "state": "starting",
@@ -204,7 +209,9 @@ def _run_protected(layout, job_id, commit, port, *, source_digest=None, native_s
                "image_digest": context["image_digest"], "url": f"http://localhost:{port}/workspace",
                "run_root": str(root), "build_receipt_sha256": digest(build / "artifacts/build-receipt.json"),
                "launcher_sha256": digest(__file__), "compose_sha256": digest(spec_path),
-               "solver_started": False, "unit_tests_compiled": False}
+               "solver_started": False, "unit_tests_compiled": False,
+               "session_storage": "disposable_tmpfs" if ephemeral else "host_bind",
+               "durable_session_storage_qualified": False}
     receipt_path = root / "receipt.json"
     storage.atomic_json(receipt_path, receipt)
     try:
@@ -240,6 +247,9 @@ def _run_protected(layout, job_id, commit, port, *, source_digest=None, native_s
         filesystem = docker("exec", container, "stat", "-f", "-c", "%t", "/state")
         receipt["session_filesystem_magic"] = filesystem
         require_session_filesystem(filesystem)
+        if ephemeral and (filesystem.lower().lstrip("0") != "1021994"
+                or "/state" not in host_config.get("Tmpfs", {})):
+            raise ValueError("Ephemeral session must use the declared private tmpfs")
         receipt["session_filesystem"] = "SUPPORTED_TYPE_NOT_QUALIFIED"
         for _ in range(45):
             try:
@@ -283,6 +293,7 @@ if __name__ == "__main__":
     parser.add_argument("--source-digest", help="Exact capsule digest; requires --native-snapshot-sha256")
     parser.add_argument("--native-snapshot-sha256", help="Exact native snapshot digest; requires --source-digest")
     parser.add_argument("--port", type=int, default=3104)
+    parser.add_argument("--ephemeral", action="store_true", help="Private RAM session; no durable storage qualification")
     args = parser.parse_args()
     raise SystemExit(run(args.repo_root, args.job_id, args.commit, args.port,
-        source_digest=args.source_digest, native_snapshot_sha256=args.native_snapshot_sha256))
+        source_digest=args.source_digest, native_snapshot_sha256=args.native_snapshot_sha256, ephemeral=args.ephemeral))
