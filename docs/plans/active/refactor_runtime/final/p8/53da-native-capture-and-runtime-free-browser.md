@@ -97,3 +97,11 @@ przed jego minRefetchIntervalMs; kolekcja odświeżyła się, status jeszcze nie
 Test przesuwa zegar Date.now poza rzeczywisty statusRefreshIntervalMs przed
 invalidacją, zachowując wymóg wykonania obu odrzuconych żądań i retained draft.
 Nowy odbiór CI wymagany; produkcja bez zmian.
+
+Odbiór po publikacji c689caee2188a86e645e26aa03270e9212c1f7ca:
+[bootstrap 38717371012, job 116363230322](https://github.com/MateuszZelent/fullmag/actions/runs/38717371012/job/116363230322)
+**SUCCESS**. Typecheck/lint oraz 828 plików testowych: **8537 PASS / 13 skip**,
+0 FAIL; compute performance audit, dodatkowe 3 testy benchmarku i produkcyjny
+build Next również zakończone poprawnie. Zamknięto źródłowy odbiór regresji
+retencji powłoki. To nie zastępuje natywnego browser lifecycle ani kwalifikacji
+solverów. Python/Rust tego runu nadal w toku w chwili checkpointu.

@@ -1,4 +1,10 @@
 # Status realizacji całego planu refaktoryzacji
+Odbiór CI 15.10.2026 — [P8-53DA](p8/53da-native-capture-and-runtime-free-browser.md):
+Control Room job 116363230322 dla c689caee2 **SUCCESS**: typecheck, lint,
+**8537 PASS / 13 skip / 0 FAIL**, audyt wydajności i produkcyjny build Next.
+Regresja retencji powłoki ma zielony odbiór. Natywny build i rzeczywisty
+browser lifecycle nadal w toku/NOT VERIFIED; pełny plan **IN PROGRESS**.
+
 Checkpoint 15.10.2026 — [P8-53DA](p8/53da-native-capture-and-runtime-free-browser.md):
 utrwalanie natywnych wejść przed długą kopią frontendu/docs: **17/17 PASS**.
 Pięć błędów fixture meshing poprawiono; celowany odbiór **4 PASS + 2 subtesty**.
