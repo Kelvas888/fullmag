@@ -10,21 +10,50 @@ opisanych niżej.
 
 ## Główna ścieżka developerska
 
-Z głównego checkoutu lub worktree wykonaj kolejno:
+Dla głównego checkoutu, gdy `FULLMAG_SOURCE_ROOT` jest puste lub nieustawione,
+launcher wybiera zarejestrowany checkout główny. Uzupełnij wartości
+receiptów przed wykonaniem zależnych poleceń; argumenty recept są pozycyjne:
 
 ```text
+$jobId = '<job-id-from-submission-receipt>'
+$commit = '<resolved-40-character-commit-sha>'
+$sourceDigest = '<64-hex-source-digest>'
+$nativeSnapshotSha256 = '<64-hex-native-snapshot-sha256>'
+$assemblyReceipt = '<assembly-receipt.json>'
+
 just runner-container-status
-just docker-all-dev-backend-build [source_root=""]
-just runner-wait <job_id> 30
-just docker-all-dev-image <job_id> <commit> <source_digest> <native_snapshot_sha256> [source_root=""]
-just docker-all-dev <assembly_receipt> [port=3197] [source_root=""]
+just docker-all-dev-backend-build
+just runner-wait $jobId 30
+just docker-all-dev-image $jobId $commit $sourceDigest $nativeSnapshotSha256
+just docker-all-dev $assemblyReceipt 3197
 ```
 
-`job_id`, `commit` oraz oba digesty pochodzą z receiptu zgłoszenia backendu.
-Składanie obrazu zwraca `assembly_receipt`. Po kodzie 124 z `runner-wait`
-obserwuj ten sam job; nie zgłaszaj kolejnego buildu. Do składania i startu
-przejdź dopiero po terminalnym `succeeded`. Jeżeli wybierasz worktree, używaj
-tego samego `source_root` w zgłoszeniu, składaniu obrazu i starcie.
+Dla zarejestrowanego worktree użyj tej samej wartości `$sourceRoot` w trzech
+krokach wyboru źródeł: zgłoszeniu snapshotu, składaniu obrazu i uruchomieniu.
+Poniższy przykład nie zakłada żadnej hostowej ścieżki; `<registered-worktree>`
+musi być ścieżką zarejestrowaną przez `fullmag_storage.py register`:
+
+```text
+$sourceRoot = (Resolve-Path '<registered-worktree>').Path
+$jobId = '<job-id-from-submission-receipt>'
+$commit = '<resolved-40-character-commit-sha>'
+$sourceDigest = '<64-hex-source-digest>'
+$nativeSnapshotSha256 = '<64-hex-native-snapshot-sha256>'
+$assemblyReceipt = '<assembly-receipt.json>'
+
+# 1. Capture the selected worktree as an immutable managed snapshot.
+just docker-all-dev-backend-build $sourceRoot
+# 2. After the receipt reports the job ID and terminal success, assemble it.
+just runner-wait $jobId 30
+just docker-all-dev-image $jobId $commit $sourceDigest $nativeSnapshotSha256 $sourceRoot
+# 3. Start the assembled image with the same selected worktree.
+just docker-all-dev $assemblyReceipt 3197 $sourceRoot
+```
+
+`jobId`, `commit` oraz oba digesty pochodzą z receiptu zgłoszenia backendu;
+`assemblyReceipt` pochodzi z receiptu składania obrazu. Po kodzie 124 z
+`runner-wait` obserwuj ten sam job i nie zgłaszaj kolejnego buildu. Do składania
+i startu przejdź dopiero po terminalnym `succeeded`.
 
 Wersjonowane pliki definiują poszczególne części:
 
@@ -40,9 +69,11 @@ Istniejący `compose.yaml` zachowuje kanoniczne profile FEM i nie jest plikiem
 startowym dwóch usług developerskich. Launcher odczytuje `compose.dev.yaml`,
 rozwiązuje jego parametry i wykonuje admission storage przed startem.
 
-Pusty `source_root` wybiera checkout Git główny, a jawna ścieżka wybiera
-zarejestrowany worktree. W obu przypadkach launcher zapisuje resolved Compose
-JSON oraz kopię źródłowego YAML w owned run; nie generuje topologii w Pythonie.
+Jawny pozycyjny `source_root` wybiera zarejestrowany worktree i ma pierwszeństwo.
+Jeżeli argumentu nie podano, launcher używa niepustego `FULLMAG_SOURCE_ROOT`; gdy
+zmienna jest pusta lub nieustawiona, wybiera zarejestrowany checkout główny.
+W obu przypadkach launcher zapisuje resolved Compose JSON oraz kopię źródłowego
+YAML w owned run; nie generuje topologii w Pythonie.
 Renderowanie Compose przeszło kontrole źródeł i rzeczywisty parser Compose;
 cold-start, HMR i pełny runtime pozostają **VERIFICATION PENDING**.
 
@@ -55,10 +86,13 @@ Worktree musi być wcześniej zarejestrowany przez `fullmag_storage.py register`
 w ramach cyklu zadania. Źródłem jest pełny SHA commita właściwego checkoutu:
 
 ```text
+$commit = '<full-40-character-commit-sha>'
+$jobId = '<job-id-from-submission-receipt>'
+
 just runner-container-status
-just docker-all-build <pelny-sha>
-just runner-wait <job-id> 30
-just docker-all-image <job-id> <pelny-sha>
+just docker-all-build $commit
+just runner-wait $jobId 30
+just docker-all-image $jobId $commit
 ```
 
 Zgłoszenie używa obsługiwanej niezależnej kopii niezmiennej kapsuły źródeł,
@@ -138,7 +172,8 @@ sesje FMS.
 ## Uruchomienie
 
 ```text
-just docker-all-start <absolutna-sciezka-do-assembly-receipt.json> 3197
+$assemblyReceipt = '<assembly-receipt.json>'
+just docker-all-start $assemblyReceipt 3197
 ```
 
 Port hosta jest konfigurowalny. W kontenerze zawsze używany jest port `8081`;
@@ -181,8 +216,12 @@ do jawnego zatrzymania przez operatora; nie wykonuje automatycznego takeover.
 ## Tryb deweloperski: dwa kontenery
 
 ```text
-just docker-all-dev <assembly_receipt> [port=3197] [source_root=""]
+$assemblyReceipt = '<assembly-receipt.json>'
+just docker-all-dev $assemblyReceipt 3197
 ```
+
+Trzeci argument pozycyjny `source_root` dodaj tylko dla zarejestrowanego
+worktree, tak jak w przykładzie z `$sourceRoot` powyżej.
 
 ### Wersjonowany kontrakt rootowego Compose
 
@@ -192,17 +231,20 @@ Definiuje dokładnie usługi `backend` i `frontend` oraz prywatną sieć Compose
 tej sieci. `frontend` publikuje `127.0.0.1:3197:8080` (z konfigurowalnym
 portem hosta) i używa proxy `http://backend:8081`. GPU otrzymuje tylko backend.
 
-`FULLMAG_SOURCE_ROOT` wskazuje główny checkout Git domyślnie albo jawnie wybrany
-worktree. Dev image nie kopiuje do warstwy źródeł aplikacji ani pakietu
-runtime. Backend dostaje readonly bindy:
+Wartość wybranego checkoutu jest ustalana w tej kolejności: jawny pozycyjny
+`source_root`, następnie niepusty `FULLMAG_SOURCE_ROOT`, a na końcu główny
+checkout Git. Każdy wybrany worktree musi być zarejestrowany. Dev image nie
+kopiuje do warstwy źródeł aplikacji ani pakietu runtime. Backend dostaje
+readonly bindy:
 
 - `FULLMAG_SOURCE_ROOT` → `/opt/fullmag/source`;
 - `FULLMAG_BACKEND_PACKAGE` → `/opt/fullmag/package`;
 - `FULLMAG_PACKAGE_PROVENANCE` → `/opt/fullmag/provenance.json`.
 
-Frontend dostaje readonly bindy czterech żywych katalogów tego samego checkoutu:
-`apps/control-room/app`, `src`, `public` i `scripts`. Polling/HMR obserwuje te
-katalogi; konfiguracja, manifesty i metadane freeze są utrwalane osobno.
+Frontend dostaje readonly bindy dokładnie czterech żywych katalogów wybranego
+checkoutu: `apps/control-room/app`, `src`, `public` i `scripts`. Polling/HMR
+obserwuje te cztery katalogi z checkoutu; konfiguracja, manifesty i metadane
+freeze są utrwalane osobno.
 Frontend nie dostaje accepted store, certyfikatu writera ani GPU. Backend
 pozostaje jedynym writerem sesji i właścicielem runtime service.
 
@@ -224,13 +266,15 @@ frontendu publikowany jest na loopback Windows. Backend słucha na 8081
 wewnątrz sieci Compose; frontend przekazuje do niego API. Nie wymaga CORS
 ani osobnego adresu API w przeglądarce.
 
-Launcher ustala `FULLMAG_SOURCE_ROOT` przez Git, wskazując główny checkout albo
-wybrany worktree. Katalogi Control Room
-`app`, `src`, `public` i `scripts` są montowane readonly do frontendu.
+Launcher wybiera checkout przez jawny pozycyjny `source_root`, niepusty
+`FULLMAG_SOURCE_ROOT` albo — gdy żadnego z nich nie podano — główny checkout
+Git. Katalogi Control Room `app`, `src`, `public` i `scripts` są montowane
+readonly do frontendu.
 pnpm 10.8.1 jest przygotowany offline w obrazie, z narzędzia już obecnego
 w przypiętym builderze. Pierwszy start pobiera tylko zależności workspace.
-Zapis źródeł w wybranym checkoutcie jest wykrywany przez polling Watchpack
-(500 ms); Next aktualizuje stronę przez HMR i kompiluje ją przy pierwszym wejściu.
+Zapis źródeł w tych czterech żywych katalogach jest wykrywany przez polling
+Watchpack (500 ms); Next aktualizuje stronę przez HMR i kompiluje ją przy
+pierwszym wejściu. Zmiany poza tymi katalogami nie są obietnicą HMR.
 Cold-start ma limit 35 minut, obejmujący instalację zależności z limitem 30 minut
 oraz przygotowanie API/Next; zwykły restart używa zachowanych
 zależności. Cache, logi i `node_modules` pozostają w osobnym
@@ -247,20 +291,33 @@ zapisu sesji. Sesje i wyniki zapisuje backend bezpośrednio w swoim `/state`,
 mapowanym do rzeczywistego storage Windows.
 
 Zmiana kodu backendu nie wywołuje automatycznej kompilacji ani restartu
-symulacji. Jawne żądanie utrwala immutable snapshot wybranego
-`FULLMAG_SOURCE_ROOT` (domyślnie głównego checkoutu) i zgłasza istniejącą
-kolejkę managed GPU release:
+symulacji. Budowanie backendu jest wyłącznie na żądanie przez
+`docker-all-dev-backend-build`; `docker-all-dev` uruchamia już złożony obraz i
+nie kompiluje kodu ani nie przełącza działającej symulacji na nowy pakiet.
+Zgłoszenie utrwala immutable snapshot
+wybranego checkoutu (wybór: jawny pozycyjny `source_root`, potem
+`FULLMAG_SOURCE_ROOT`, potem główny checkout) i zgłasza istniejącą kolejkę
+managed GPU release.
+
+`docker-all-dev-backend-build` zawsze tworzy job w trybie `snapshot`, także dla
+głównego checkoutu. Dlatego oba digesty (`source_digest`,
+`native_snapshot_sha256`) są wymagane przy późniejszym
+`docker-all-dev-image` i muszą pochodzić z tego samego receiptu:
 
 ```text
-just docker-all-dev-backend-build [source_root=""]
-just runner-wait <job-id> 30
-just docker-all-dev-image <job_id> <commit> [source_digest=""] [native_snapshot_sha256=""] [source_root=""]
+$jobId = '<job-id-from-submission-receipt>'
+$commit = '<resolved-40-character-commit-sha>'
+$sourceDigest = '<64-hex-source-digest>'
+$nativeSnapshotSha256 = '<64-hex-native-snapshot-sha256>'
+
+just runner-wait $jobId 30
+just docker-all-dev-image $jobId $commit $sourceDigest $nativeSnapshotSha256
 ```
 
-Dla clean commit wystarczają dwa pierwsze argumenty obrazu; snapshot wybranego
-worktree wymaga także `source_digest` i `native_snapshot_sha256`. Jeżeli job
-pochodzi z innego zarejestrowanego worktree niż główny checkout, podaj tę samą
-ścieżkę jako piąty argument `source_root` albo ustaw `FULLMAG_SOURCE_ROOT`.
+Dla zarejestrowanego worktree dodaj `$sourceRoot` jako piąty argument obrazu,
+po przekazaniu tych czterech wartości. Dwa argumenty (`job_id`, `commit`) dotyczą
+wyłącznie `docker-all-image` dla joba zgłoszonego przez `docker-all-build`
+w trybie `commit`; nie dotyczą receiptu z `docker-all-dev-backend-build`.
 Obraz developerski nie kopiuje źródeł aplikacji ani pakietu do warstwy obrazu;
 bindy
 `/opt/fullmag/source` i `/opt/fullmag/package` pozostają częścią runtime.
