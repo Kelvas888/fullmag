@@ -128,3 +128,15 @@ script_builder.py 36a4233cb7c39dd012262b8ba6a5d728092cf8102c932ce57d05d917623133
 pary przed/po zgodne i ponownie odczytane przez roota. Bez bytecode,
 pytest cache/plugin autoload, z resolverowym worktree lock i managed tmp/log/JUnit.
 To zamyka lokalne dwie porażki roundtrip, pełny Python CI nadal wymagany.
+
+Bootstrap 38712104335 / Control Room 116345739547: 8535 PASS / 2 FAIL /
+13 skip. Oba nowe testy realnej powłoki doszły do browser-only hit regions
+react-resizable-panels; custom DOM nie implementuje browser layout API.
+Po powtarzających się brakach fixture root zmienił granicę testu zamiast
+dopisywać kolejną emulację geometrii: prawdziwe WorkspaceShellClient,
+WorkspaceDockLayout, SlotHost i zasoby pozostają; jedynie Resizable/Sortable
+gesture primitives są kontenerami w tej fixture. Atrybuty inert kontenerów
+są przekazywane, testy mount/identity/focus i stanu transportu zachowane.
+Próba wykrywałaby starą bramkę odmontowującą workspace, lecz nie kwalifikuje
+drag/resize ani geometrii przeglądarki. Te wymagają oddzielnego browser proof.
+Diff check PASS; nowy CI wymagany, produkcja bez zmian.

@@ -1,4 +1,4 @@
-import { act } from "react";
+import { act, type ComponentProps, type ReactNode } from "react";
 import { hydrateRoot, createRoot } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -35,6 +35,39 @@ import { startScreenStore } from "@/modules/start/model/startScreenState";
 import { StartScreen } from "@/modules/start/StartScreen";
 
 const LAUNCH_TILE_NAMES = ["FDM simulation", "FEM simulation", "From template", "Import"];
+
+// This custom DOM checks shell lifetime; browser layout and gestures need a browser.
+vi.mock("@/shared/ui/Resizable", () => {
+  const Container = ({ children, className, id, inert }: {
+    children?: ReactNode;
+    className?: string;
+    id?: string;
+    inert?: boolean;
+  }) => <div className={className} id={id} inert={inert}>{children}</div>;
+  return {
+    ResizablePanelGroup: Container,
+    ResizablePanel: Container,
+    ResizableHandle: () => <div data-testid="resize-handle" />,
+  };
+});
+
+vi.mock("@/shared/ui/Sortable", () => ({
+  SortableList: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SortableItem: ({ children }: ComponentProps<typeof import("@/shared/ui/Sortable").SortableItem>) => children({
+    attributes: {
+      role: "button",
+      tabIndex: 0,
+      "aria-disabled": false,
+      "aria-pressed": undefined,
+      "aria-roledescription": "sortable item",
+      "aria-describedby": "",
+    },
+    isDragging: false,
+    listeners: undefined,
+    setNodeRef: () => undefined,
+    style: {},
+  }),
+}));
 
 afterEach(() => {
   resetSharedResourceRuntimeStoreForTests();
