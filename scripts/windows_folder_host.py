@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import contextmanager
 import stat
 import os
 import shutil
@@ -27,6 +28,68 @@ def _replace_write_through(source, destination):
     # Keep atomic same-volume replacement and wait for the move to reach disk.
     if not api.MoveFileExW(str(source), str(destination), 0x1 | 0x8):
         raise ctypes.WinError(ctypes.get_last_error())
+
+
+@contextmanager
+def _pinned_no_reparse_ancestors(path):
+    """Hold native directory handles without FILE_SHARE_DELETE during a write.
+
+    The existing bounded reader rejects reparse points at one instant.  Frozen
+    file creation also needs to prevent a concurrent rename/delete of any
+    ancestor while the exclusive destination handle is opened and verified.
+    """
+    path = Path(path)
+    if os.name != "nt":
+        yield
+        return
+    from ctypes import wintypes
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    api.CreateFileW.restype = wintypes.HANDLE
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+    class AttributeTag(ctypes.Structure):
+        _fields_ = [("attributes", wintypes.DWORD), ("tag", wintypes.DWORD)]
+    api.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD
+    ]
+    api.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    invalid = ctypes.c_void_p(-1).value
+    handles = []
+    ancestors = [path, *path.parents]
+    try:
+        for ancestor in reversed(ancestors):
+            if storage.is_link(ancestor) or not ancestor.is_dir():
+                raise ValueError("Owned write traverses a missing or reparse-point ancestor")
+            # FILE_READ_ATTRIBUTES, FILE_SHARE_READ|FILE_SHARE_WRITE (no
+            # FILE_SHARE_DELETE), OPEN_EXISTING, BACKUP_SEMANTICS and
+            # OPEN_REPARSE_POINT.  Omitting FILE_SHARE_DELETE pins the path
+            # component against rename/delete until this context exits.
+            handle = api.CreateFileW(
+                str(ancestor), 0x80, 0x3, None, 3, 0x02000000 | 0x00200000, None
+            )
+            if handle == invalid:
+                raise ctypes.WinError(ctypes.get_last_error())
+            attributes = AttributeTag()
+            try:
+                if not api.GetFileInformationByHandleEx(
+                    handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                if not (attributes.attributes & 0x10) or attributes.attributes & 0x400:
+                    raise ValueError(
+                        "Owned write opened a non-directory or reparse-point ancestor"
+                    )
+            except BaseException:
+                api.CloseHandle(handle)
+                raise
+            handles.append(handle)
+        yield
+    finally:
+        for handle in reversed(handles):
+            api.CloseHandle(handle)
 
 
 def publish_evidence(path, value):

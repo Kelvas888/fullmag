@@ -117,3 +117,4 @@ jobs:
           python -B scripts/test_fullmag_docker_runtime.py -v
           python -B scripts/test_docker_frontend_dev.py -v
           python -B scripts/test_verify_docker_all_runtime.py -v
+          python -B scripts/test_docker_host_ledger.py -v

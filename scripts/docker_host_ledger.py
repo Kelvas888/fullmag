@@ -6,13 +6,13 @@ keeps every Docker mutation bounded by an owned container name and receipt.
 """
 from __future__ import annotations
 
-import copy
+from contextlib import nullcontext
 import hashlib
 import json
 import ntpath
 import os
 import re
-import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -38,11 +38,22 @@ MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 _PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
 _IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:[\\/].*")
-_TEMPLATE_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::([?!-])(.*?))?\}")
 
 
 class HostLedgerError(RuntimeError):
     """A fail-closed host-ledger adapter error."""
+
+
+class DockerInvocationUnknown(HostLedgerError):
+    """The Docker callable failed after its side effect boundary was entered."""
+
+    def __init__(self, args: tuple[str, ...], timeout: int, cause: TypeError) -> None:
+        self.operation = list(args)
+        self.timeout_seconds = timeout
+        super().__init__(
+            "Docker callable raised TypeError; outcome is unknown and no retry is allowed: "
+            f"{cause}"
+        )
 
 
 def _text(value: Any, field: str) -> str:
@@ -120,9 +131,48 @@ def _same_daemon_path(left: Any, right: Any) -> bool:
         return False
 
 
+def _owned_path(path: Path, field: str) -> Path:
+    try:
+        resolved = storage.absolute(Path(path), field)
+    except storage.StorageError as error:
+        raise HostLedgerError(str(error)) from error
+    if storage.is_link(resolved):
+        raise HostLedgerError(f"{field} must not be a symlink or reparse point: {resolved}")
+    return resolved
+
+
+def _read_owned_bytes(path: Path, maximum: int, field: str) -> bytes:
+    path = _owned_path(path, field)
+    if os.name == "nt":
+        try:
+            from windows_folder_host import read_owned_regular
+
+            return read_owned_regular(path, maximum)
+        except (OSError, ValueError) as error:
+            raise HostLedgerError(f"{field} could not be read without following a reparse point") from error
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise HostLedgerError(f"{field} could not be opened without following a link") from error
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum:
+            raise HostLedgerError(f"{field} is not a bounded regular file")
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            data = stream.read(maximum + 1)
+        if len(data) > maximum:
+            raise HostLedgerError(f"{field} exceeds its bounded size")
+        return data
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
 def _regular_file(path: Path, field: str, maximum: int) -> Path:
-    path = Path(path)
-    if path.is_symlink() or not path.is_file():
+    path = _owned_path(Path(path), field)
+    if not path.is_file():
         raise HostLedgerError(f"{field} must be a regular non-symlink file: {path}")
     size = path.stat().st_size
     if size <= 0 or size > maximum:
@@ -132,34 +182,54 @@ def _regular_file(path: Path, field: str, maximum: int) -> Path:
 
 def _digest(path: Path, maximum: int | None = None) -> str:
     path = _regular_file(path, "managed file", maximum or 64 * 1024 * 1024)
-    checksum = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            checksum.update(block)
-    return checksum.hexdigest()
+    return hashlib.sha256(
+        _read_owned_bytes(path, maximum or 64 * 1024 * 1024, "managed file")
+    ).hexdigest()
 
 
 def _atomic_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink():
-        raise HostLedgerError(f"refusing to replace symlink: {path}")
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    if temporary.exists() or temporary.is_symlink():
-        raise HostLedgerError(f"temporary receipt path already exists: {temporary}")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    except BaseException:
+    path = _owned_path(Path(path), "managed output")
+    parent = _owned_path(path.parent, "managed output parent")
+    parent.mkdir(parents=True, exist_ok=True)
+    parent = _owned_path(parent, "managed output parent")
+    if os.name == "nt":
+        from windows_folder_host import _pinned_no_reparse_ancestors
+
+        guard = _pinned_no_reparse_ancestors(parent)
+    else:
+        guard = nullcontext()
+    with guard:
+        path = _owned_path(path, "managed output")
+        temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+        temporary = _owned_path(temporary, "managed output temporary")
+        if temporary.exists():
+            raise HostLedgerError(f"temporary receipt path already exists: {temporary}")
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, mode)
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+            with os.fdopen(fd, "wb") as stream:
+                fd = -1
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Recheck every managed path immediately before publication.  Native
+            # Windows uses the existing write-through replacement helper rather
+            # than duplicating Win32 move code in this adapter.
+            _owned_path(path.parent, "managed output parent")
+            _owned_path(temporary, "managed output temporary")
+            _owned_path(path, "managed output")
+            if os.name == "nt":
+                from windows_folder_host import _replace_write_through
+
+                _replace_write_through(temporary, path)
+            else:
+                os.replace(temporary, path)
+        except BaseException:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -167,30 +237,76 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def _copy_immutable(source: Path, destination: Path, maximum: int, mode: int) -> str:
+    """Freeze a helper/overlay without replacing an existing destination."""
     source = _regular_file(Path(source), "source helper/overlay", maximum)
-    source_hash = _digest(source, maximum)
-    destination = Path(destination)
-    if destination.is_symlink():
-        raise HostLedgerError(f"refusing symlink destination: {destination}")
-    if destination.exists():
-        if not destination.is_file() or _digest(destination, maximum) != source_hash:
-            raise HostLedgerError(f"owned frozen file differs from source: {destination}")
+    source_bytes = _read_owned_bytes(source, maximum, "source helper/overlay")
+    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    destination = _owned_path(Path(destination), "owned frozen destination")
+    parent = _owned_path(destination.parent, "owned frozen destination parent")
+    parent.mkdir(parents=True, exist_ok=True)
+    parent = _owned_path(parent, "owned frozen destination parent")
+    if os.name == "nt":
+        from windows_folder_host import _pinned_no_reparse_ancestors
+
+        guard = _pinned_no_reparse_ancestors(parent)
     else:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with source.open("rb") as source_stream, destination.open("xb") as target_stream:
-            shutil.copyfileobj(source_stream, target_stream, length=1024 * 1024)
-            target_stream.flush()
-            os.fsync(target_stream.fileno())
-    destination.chmod(mode)
+        guard = nullcontext()
+    with guard:
+        destination = _owned_path(destination, "owned frozen destination")
+        if destination.exists():
+            try:
+                existing = _read_owned_bytes(destination, maximum, "owned frozen destination")
+            except HostLedgerError as error:
+                raise HostLedgerError(
+                    f"owned frozen file is not a bounded regular file: {destination}"
+                ) from error
+            if hashlib.sha256(existing).hexdigest() != source_hash:
+                raise HostLedgerError(f"owned frozen file differs from source: {destination}")
+        else:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(destination, flags, mode)
+            except FileExistsError as error:
+                raise HostLedgerError(
+                    f"owned frozen destination appeared during exclusive creation: {destination}"
+                ) from error
+            try:
+                with os.fdopen(fd, "wb") as target_stream:
+                    fd = -1
+                    target_stream.write(source_bytes)
+                    target_stream.flush()
+                    os.fsync(target_stream.fileno())
+            finally:
+                if fd != -1:
+                    os.close(fd)
+            # This is a handle-based no-follow read on native Windows and an
+            # O_NOFOLLOW read on POSIX; it catches a replacement before the
+            # frozen file becomes usable.
+            if _read_owned_bytes(destination, maximum, "owned frozen destination") != source_bytes:
+                raise HostLedgerError(
+                    f"owned frozen destination changed while being written: {destination}"
+                )
+        _owned_path(destination, "owned frozen destination")
+        # The native writer sets the mode at O_EXCL creation.  Do not chmod an
+        # existing Windows path after the no-reparse read: that API has no
+        # pinned directory handle and a late junction swap must never reach a
+        # target.  POSIX can apply the mode without following a symlink.
+        if os.name != "nt":
+            os.chmod(destination, mode, follow_symlinks=False)
     return source_hash
 
 
 def _within(path: Any, parent: Any) -> bool:
     raw_path = _raw_path(path, "path")
     raw_parent = _raw_path(parent, "parent")
-    if _WINDOWS_ABS_RE.fullmatch(raw_path) != _WINDOWS_ABS_RE.fullmatch(raw_parent):
+    windows_path = bool(_WINDOWS_ABS_RE.fullmatch(raw_path))
+    if windows_path != bool(_WINDOWS_ABS_RE.fullmatch(raw_parent)):
         return False
     try:
+        if windows_path:
+            candidate = ntpath.normcase(ntpath.normpath(raw_path.replace("/", "\\")))
+            root = ntpath.normcase(ntpath.normpath(raw_parent.replace("/", "\\")))
+            return ntpath.commonpath([candidate, root]) == root
         candidate = _local_normalized(raw_path)
         root = _local_normalized(raw_parent)
         return os.path.commonpath([candidate, root]) == root
@@ -264,8 +380,22 @@ def _capture(value: Any) -> tuple[str, str, str]:
     if isinstance(value, subprocess.CompletedProcess):
         stdout = value.stdout or ""
         stderr = value.stderr or ""
+        if value.returncode != 0:
+            detail = str(stderr or stdout).strip()
+            raise HostLedgerError(
+                f"Docker operation returned exit code {value.returncode}: {detail[-4096:]}"
+            )
         return str(stdout), str(stderr), str(stdout) + str(stderr)
     if isinstance(value, Mapping):
+        returncode = value.get("returncode")
+        if returncode is not None:
+            if isinstance(returncode, bool) or not isinstance(returncode, int):
+                raise HostLedgerError("Docker operation returned an invalid exit code")
+            if returncode != 0:
+                detail = str(value.get("stderr") or value.get("stdout") or "").strip()
+                raise HostLedgerError(
+                    f"Docker operation returned exit code {returncode}: {detail[-4096:]}"
+                )
         stdout = str(value.get("stdout") or "")
         stderr = str(value.get("stderr") or "")
         combined = str(value.get("combined") or (stdout + stderr))
@@ -285,11 +415,10 @@ def _invoke(docker_callable: Callable[..., Any], *args: str, timeout: int = 60,
     try:
         value = docker_callable(*args, **kwargs)
     except TypeError as error:
-        # Small test doubles may expose only positional arguments; the real
-        # launcher wrapper accepts all kwargs above.  Do not hide Docker errors.
-        if "unexpected keyword" not in str(error) and "positional argument" not in str(error):
-            raise
-        value = docker_callable(*args)
+        # The callable may have entered Docker before raising TypeError.  A
+        # compatibility retry could duplicate a privileged mutation or lose
+        # the exact environment, so preserve the outcome as unknown.
+        raise DockerInvocationUnknown(tuple(args), timeout, error) from error
     return _capture(value)
 
 
@@ -331,12 +460,22 @@ def _image_attestation(image_id: str, docker_callable: Callable[..., Any]) -> di
 
 
 def _parse_json_lines(text: str, schema: str) -> dict[str, Any] | None:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise HostLedgerError(f"JSON receipt for {schema} has duplicate keys")
+            value[key] = item
+        return value
+
     for line in reversed(text.splitlines()):
         line = line.strip()
         if not line.startswith("{") or not line.endswith("}"):
             continue
         try:
-            value = json.loads(line)
+            value = json.loads(line, object_pairs_hook=reject_duplicate_keys)
+        except HostLedgerError:
+            raise
         except ValueError:
             continue
         if isinstance(value, dict) and value.get("schema") == schema:
@@ -384,66 +523,218 @@ def _write_output(run_root: Path, prefix: str, stdout: str, stderr: str, combine
 
 
 def _validate_host_receipt(value: Mapping[str, Any], values: Mapping[str, str]) -> None:
+    required = (
+        "schema", "profile", "state", "project_id", "backing_image", "mount_root",
+        "ledger_root", "mount_target", "filesystem", "filesystem_uuid",
+        "image_size_bytes", "loop_device", "mount_active",
+    )
+    if not isinstance(value, Mapping) or any(value.get(key) in (None, "") for key in required):
+        raise HostLedgerError("host-ledger maintenance receipt is incomplete")
     if value.get("schema") != HOST_RECEIPT_SCHEMA or value.get("profile") != PROFILE:
         raise HostLedgerError("host-ledger maintenance receipt schema/profile mismatch")
     if value.get("state") not in {"ready", "validated"} or value.get("filesystem") != "ext4":
         raise HostLedgerError("host-ledger maintenance did not report a validated ext4 filesystem")
-    if value.get("mount_active") is not True or value.get("mount_root") != values["mount_root"]:
+    if value.get("mount_active") is not True or value.get("mount_root") != values.get("mount_root"):
         raise HostLedgerError("host-ledger maintenance did not leave the expected mount active")
-    if value.get("backing_image") != values["backing_image"] or not value.get("filesystem_uuid"):
+    expected_project = values.get("project_id")
+    if expected_project and value.get("project_id") != expected_project:
+        raise HostLedgerError("host-ledger receipt project identity differs from the resolved project")
+    if value.get("backing_image") != values.get("backing_image"):
         raise HostLedgerError("host-ledger receipt identity does not match the resolved backing image")
-    if value.get("ledger_root") != values["mount_root"] + "/ledger":
+    if value.get("ledger_root") != str(values.get("mount_root")) + "/ledger":
         raise HostLedgerError("host-ledger receipt ledger child differs from the resolved mount")
     if value.get("mount_target") != MOUNT_TARGET or value.get("image_size_bytes") != IMAGE_SIZE_BYTES:
         raise HostLedgerError("host-ledger receipt resource contract mismatch")
+    filesystem_uuid = value.get("filesystem_uuid")
+    if not isinstance(filesystem_uuid, str) or not re.fullmatch(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}", filesystem_uuid):
+        raise HostLedgerError("host-ledger receipt filesystem UUID is invalid")
+    loop_device = value.get("loop_device")
+    if not isinstance(loop_device, str) or not re.fullmatch(r"/dev/loop[0-9]+", loop_device):
+        raise HostLedgerError("host-ledger receipt loop device is invalid")
+    if not isinstance(value.get("image_size_bytes"), int) or isinstance(value.get("image_size_bytes"), bool):
+        raise HostLedgerError("host-ledger receipt image size is invalid")
+    if "created_image" in value and not isinstance(value["created_image"], bool):
+        raise HostLedgerError("host-ledger receipt created_image flag is invalid")
+    if "qualification" in value and value["qualification"] != "storage-admission-only":
+        raise HostLedgerError("host-ledger receipt qualification is invalid")
 
 
-def _render_maintenance(source: Path, destination: Path, *, environment: Mapping[str, str], image_id: str) -> None:
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise HostLedgerError(f"JSON object has duplicate key: {key}")
+        value[key] = item
+    return value
+
+
+def _parse_json_document(text: str, field: str) -> Any:
     try:
-        import yaml
-    except ImportError as error:
-        raise HostLedgerError("PyYAML is required to freeze the maintenance overlay") from error
+        return json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
+    except HostLedgerError:
+        raise
+    except (UnicodeError, ValueError, TypeError) as error:
+        raise HostLedgerError(f"{field} is not valid JSON") from error
+
+
+def _expected_maintenance_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    names = (
+        "FULLMAG_HOST_LEDGER_PROFILE", "FULLMAG_HOST_LEDGER_PROJECT_ID",
+        "FULLMAG_HOST_LEDGER_STORAGE_ROOT", "FULLMAG_HOST_LEDGER_BACKING_IMAGE",
+        "FULLMAG_HOST_LEDGER_MOUNT_ROOT", "FULLMAG_HOST_LEDGER_LOCK_PATH",
+        "FULLMAG_HOST_LEDGER_OWNER_MARKER", "FULLMAG_HOST_LEDGER_SIZE_BYTES",
+        "FULLMAG_HOST_LEDGER_MOUNT_TARGET", "FULLMAG_HOST_LEDGER_LEDGER_ROOT",
+        "FULLMAG_HOST_LEDGER_HOST_PID", "FULLMAG_HOST_LEDGER_RUNTIME_UID",
+        "FULLMAG_HOST_LEDGER_RUNTIME_GID", "FULLMAG_HOST_LEDGER_LOCK_WAIT_SECONDS",
+    )
+    expected = {name: environment.get(name) for name in names}
+    if any(not isinstance(value, str) or not value for value in expected.values()):
+        raise HostLedgerError("maintenance environment is incomplete")
+    return expected
+
+
+def _validate_maintenance_service(
+    service: Mapping[str, Any], *, environment: Mapping[str, str], image_id: str
+) -> None:
+    if service.get("image") != image_id:
+        raise HostLedgerError("maintenance image did not resolve to the immutable image ID")
+    expected_scalars = {
+        "profiles": ["host-ledger-maintenance"],
+        "user": "0:0",
+        "privileged": True,
+        "pid": "host",
+        "network_mode": "none",
+        "restart": "no",
+        "read_only": True,
+        "entrypoint": ["/bin/bash", "/usr/local/sbin/docker_host_ledger.sh"],
+        "command": ["ensure"],
+    }
+    for key, expected in expected_scalars.items():
+        if service.get(key) != expected:
+            raise HostLedgerError(f"maintenance service contract differs at {key}")
+    allowed_service_keys = {
+        "command", "entrypoint", "environment", "image", "network_mode", "pid",
+        "profiles", "privileged", "read_only", "restart", "user", "volumes",
+    }
+    if set(service) - allowed_service_keys:
+        raise HostLedgerError("maintenance service has an unsupported Compose field")
+    if service.get("environment") != _expected_maintenance_environment(environment):
+        raise HostLedgerError("maintenance service environment differs from the resolved contract")
+
+    volumes = service.get("volumes")
+    if not isinstance(volumes, list) or len(volumes) != 3:
+        raise HostLedgerError("maintenance service must have exactly three controlled bind mounts")
+    expected_volumes = {
+        "/usr/local/sbin/docker_host_ledger.sh": (
+            environment["FULLMAG_HOST_LEDGER_HELPER_PATH"], True, False
+        ),
+        environment["FULLMAG_HOST_LEDGER_STORAGE_ROOT"]: (
+            environment["FULLMAG_HOST_LEDGER_STORAGE_ROOT"], False, False
+        ),
+        environment["FULLMAG_HOST_LEDGER_MOUNT_ROOT"]: (
+            environment["FULLMAG_HOST_LEDGER_MOUNT_ROOT"], False, True
+        ),
+    }
+    seen_targets: set[str] = set()
+    for volume in volumes:
+        if not isinstance(volume, Mapping):
+            raise HostLedgerError("maintenance bind mount is not an object")
+        allowed = {"type", "source", "target", "read_only", "bind"}
+        if set(volume) - allowed:
+            raise HostLedgerError("maintenance bind mount has unsupported fields")
+        target = volume.get("target")
+        if not isinstance(target, str) or target in seen_targets or target not in expected_volumes:
+            raise HostLedgerError("maintenance bind mount target is not controlled")
+        seen_targets.add(target)
+        expected_source, expected_read_only, create_host_path = expected_volumes[target]
+        if volume.get("type") != "bind" or not _same_daemon_path(volume.get("source"), expected_source):
+            raise HostLedgerError(f"maintenance bind mount source differs at {target}")
+        if "read_only" not in volume:
+            actual_read_only = False
+        else:
+            actual_read_only = volume["read_only"]
+            if not isinstance(actual_read_only, bool):
+                raise HostLedgerError(f"maintenance bind mount mode is not boolean at {target}")
+        if actual_read_only is not expected_read_only:
+            raise HostLedgerError(f"maintenance bind mount mode differs at {target}")
+        bind = volume.get("bind")
+        if not isinstance(bind, Mapping) or set(bind) - {"create_host_path"}:
+            raise HostLedgerError(f"maintenance bind options differ at {target}")
+        if "create_host_path" not in bind:
+            actual_create_host_path = True
+        else:
+            actual_create_host_path = bind["create_host_path"]
+            if not isinstance(actual_create_host_path, bool):
+                raise HostLedgerError(f"maintenance bind creation policy is not boolean at {target}")
+        if actual_create_host_path is not create_host_path:
+            raise HostLedgerError(f"maintenance bind creation policy differs at {target}")
+    if seen_targets != set(expected_volumes):
+        raise HostLedgerError("maintenance bind mount set is incomplete")
+
+
+
+def _render_maintenance(
+    source: Path,
+    destination: Path,
+    *,
+    environment: Mapping[str, str],
+    image_id: str,
+    docker_callable: Callable[..., Any],
+) -> None:
+    """Resolve the versioned overlay with Compose, then retain maintenance only.
+
+    The source deliberately contains an incomplete backend service.  Compose is
+    therefore the only supported resolver for interpolation, short syntax and
+    defaults; a host YAML parser would produce a different contract and adds a
+    dependency that the operator image does not install.
+    """
     source = _regular_file(source, "host-ledger Compose overlay", MAX_COMPOSE_BYTES)
-    try:
-        document = yaml.safe_load(source.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError) as error:
-        raise HostLedgerError("host-ledger Compose overlay is not valid YAML") from error
+    values = dict(environment)
+    values["FULLMAG_HOST_LEDGER_HELPER_IMAGE"] = image_id
+    stdout, _, combined = _invoke(
+        docker_callable,
+        "compose",
+        "-f",
+        str(source),
+        "--profile",
+        "host-ledger-maintenance",
+        "config",
+        "--format",
+        "json",
+        "--no-consistency",
+        timeout=60,
+        environment=values,
+    )
+    rendered = stdout.strip() or combined.strip()
+    if len(rendered.encode("utf-8", "replace")) > MAX_COMPOSE_BYTES:
+        raise HostLedgerError("resolved host-ledger Compose overlay exceeds its bound")
+    document = _parse_json_document(rendered, "Docker Compose host-ledger overlay")
     if not isinstance(document, dict) or not isinstance(document.get("services"), dict):
-        raise HostLedgerError("host-ledger Compose overlay has no services mapping")
+        raise HostLedgerError("resolved host-ledger Compose overlay has no services mapping")
     services = document["services"]
     if set(services) != {"backend", "host-ledger-maintenance"}:
         raise HostLedgerError("host-ledger overlay service topology changed")
-    values = dict(environment)
-    values["FULLMAG_HOST_LEDGER_HELPER_IMAGE"] = image_id
-    maintenance = copy.deepcopy(services["host-ledger-maintenance"])
+    maintenance = services["host-ledger-maintenance"]
+    if not isinstance(maintenance, dict):
+        raise HostLedgerError("resolved maintenance service is not an object")
+    _validate_maintenance_service(maintenance, environment=values, image_id=image_id)
 
-    def substitute(value: Any) -> Any:
-        if isinstance(value, str):
-            def replace(match: re.Match[str]) -> str:
-                name, operator, fallback = match.groups()
-                present = values.get(name)
-                if present not in (None, ""):
-                    return str(present)
-                if operator in {"-"}:
-                    return fallback or ""
-                if operator in {"?", "!"}:
-                    raise HostLedgerError(f"missing Compose variable {name}")
-                return ""
-            return _TEMPLATE_RE.sub(replace, value)
-        if isinstance(value, list):
-            return [substitute(item) for item in value]
-        if isinstance(value, dict):
-            return {key: substitute(item) for key, item in value.items()}
-        return value
-
-    maintenance = substitute(maintenance)
-    if maintenance.get("image") != image_id:
-        raise HostLedgerError("maintenance image did not resolve to the immutable image ID")
-    if maintenance.get("privileged") is not True or maintenance.get("pid") != "host" or maintenance.get("network_mode") != "none":
-        raise HostLedgerError("maintenance service lost its privileged host-namespace contract")
-    if maintenance.get("ports") or maintenance.get("gpus") or maintenance.get("devices"):
-        raise HostLedgerError("maintenance service must not publish ports or request GPUs/devices")
     _atomic_json(destination, {"services": {"host-ledger-maintenance": maintenance}})
+    # Validate the frozen, standalone file with normal Compose consistency
+    # checks.  The incomplete backend is absent at this point, so no bypass is
+    # needed for this final validation.
+    _invoke(
+        docker_callable,
+        "compose",
+        "-f",
+        str(destination),
+        "--profile",
+        "host-ledger-maintenance",
+        "config",
+        "--quiet",
+        timeout=60,
+        environment=values,
+    )
 
 
 def _container_name(prefix: str, run_root: Path) -> str:
@@ -482,14 +773,16 @@ def _run_owned_container(*, args: list[str], name: str, image_id: str, label_val
     state = document["State"]
     if int(state.get("ExitCode", -1)) != 0:
         raise HostLedgerError(f"owned maintenance container {name!r} exited with {state.get('ExitCode')}")
-    _remove_owned(document, name=name, image_id=image_id, label_key=label_key, label_value=label_value, docker_callable=docker_callable)
     output = _parse_json_lines(_capture((stdout, stderr))[2], HOST_RECEIPT_SCHEMA)
     if output is None:
         try:
+            # Capture daemon logs while the owned terminal container still
+            # exists.  Removing it first makes this fallback impossible.
             _, _, logs = _invoke(docker_callable, "logs", name, timeout=60)
             output = _parse_json_lines(logs, HOST_RECEIPT_SCHEMA)
         except BaseException:
             output = None
+    _remove_owned(document, name=name, image_id=image_id, label_key=label_key, label_value=label_value, docker_callable=docker_callable)
     return document, output or {}
 
 
@@ -505,7 +798,9 @@ def _probe_host_python(run_root: Path, image_id: str, docker_callable: Callable[
                                             run_root=run_root, prefix="host-python", docker_callable=docker_callable,
                                             timeout=120)
         receipt["host_python_probe_state"] = document.get("State", {}).get("Status")
-        stdout = (run_root / "host-python.stdout.log").read_text(encoding="utf-8") if (run_root / "host-python.stdout.log").is_file() else ""
+        stdout = _read_owned_bytes(
+            run_root / "host-python.stdout.log", MAX_OUTPUT_BYTES, "host python probe output"
+        ).decode("utf-8", "replace")
         if "fullmag-host-ledger-host-python3-v1" not in stdout:
             raise HostLedgerError("host namespace python3 probe did not return its marker")
         receipt["host_python_probe"] = "PASS"
@@ -526,7 +821,11 @@ def _run_maintenance(run_root: Path, compose_file: Path, image_id: str, project:
     document, host_receipt = _run_owned_container(args=args, name=name, image_id=image_id, label_value=label_value,
                                                    run_root=run_root, prefix=f"maintenance-{action}",
                                                    docker_callable=docker_callable, timeout=timeout)
-    values = {"mount_root": receipt["mount_root"], "backing_image": receipt["backing_image"]}
+    values = {
+        "project_id": receipt.get("project_id"),
+        "mount_root": receipt["mount_root"],
+        "backing_image": receipt["backing_image"],
+    }
     _validate_host_receipt(host_receipt, values)
     receipt[f"{action}_container_state"] = document.get("State", {}).get("Status")
     receipt[f"{action}_receipt"] = host_receipt
@@ -545,8 +844,11 @@ def prepare(layout: Mapping[str, Any], repo: Any, image_id: str, run_root: Any,
     runs_root = _layout_value(layout, "runs_root")
     if runs_root is not None and not _within(run_root, runs_root):
         raise HostLedgerError("host-ledger run root is outside the resolved runs root")
-    if run_root.is_symlink():
-        raise HostLedgerError("host-ledger run root must not be a symlink")
+    # Resolve and inspect the existing ancestor chain before creating any
+    # run-owned files.  Native Windows callers additionally recheck each file
+    # through the no-reparse reader before it is consumed.
+    run_root = _owned_path(run_root, "host-ledger run root")
+    _owned_path(run_root.parent, "host-ledger run root parent")
     run_root.mkdir(parents=True, exist_ok=True)
     helper_source = repo / "scripts" / "lib" / HELPER_COPY_NAME
     overlay_source = repo / "compose.host-ledger.yaml"
@@ -606,7 +908,13 @@ def prepare(layout: Mapping[str, Any], repo: Any, image_id: str, run_root: Any,
     _atomic_json(receipt_path, receipt)
     try:
         maintenance_doc = run_root / COMPOSE_MAINTENANCE_NAME
-        _render_maintenance(overlay_copy, maintenance_doc, environment=environment, image_id=image_id)
+        _render_maintenance(
+            overlay_copy,
+            maintenance_doc,
+            environment=environment,
+            image_id=image_id,
+            docker_callable=docker_callable,
+        )
         receipt["maintenance_compose"] = str(maintenance_doc)
         receipt["maintenance_compose_sha256"] = _digest(maintenance_doc, MAX_COMPOSE_BYTES)
         _atomic_json(receipt_path, receipt)
@@ -614,8 +922,11 @@ def prepare(layout: Mapping[str, Any], repo: Any, image_id: str, run_root: Any,
         _atomic_json(receipt_path, receipt)
         project = f"fullmag-host-ledger-{run_root.name}"
         host_receipt = _run_maintenance(run_root, maintenance_doc, image_id, project, "ensure", docker_callable, receipt, 300)
-        _validate_host_receipt(host_receipt, {"mount_root": values["mount_root"],
-                                            "backing_image": environment["FULLMAG_HOST_LEDGER_BACKING_IMAGE"]})
+        _validate_host_receipt(host_receipt, {
+            "project_id": values["project_id"],
+            "mount_root": values["mount_root"],
+            "backing_image": environment["FULLMAG_HOST_LEDGER_BACKING_IMAGE"],
+        })
         receipt["state"] = "ready"
         receipt["host_receipt"] = host_receipt
         receipt["environment"] = environment
@@ -722,6 +1033,7 @@ def validate_container(document: Mapping[str, Any] | list[Mapping[str, Any]], pr
         run_id = profile_values.get("run_id") or hashlib.sha256(str(run_root).encode()).hexdigest()[:32]
         verify_receipt: dict[str, Any] = {
             "run_id": run_id,
+            "project_id": profile_values.get("project_id"),
             "mount_root": profile_values.get("mount_root"),
             "backing_image": profile_values.get("backing_image", ""),
         }
@@ -730,8 +1042,14 @@ def validate_container(document: Mapping[str, Any] | list[Mapping[str, Any]], pr
                                         docker_callable, verify_receipt, 180)
     elif not isinstance(host_receipt, Mapping):
         raise HostLedgerError("live host-ledger verification evidence is missing")
-    if host_receipt.get("filesystem") != "ext4" or host_receipt.get("mount_active") is not True:
-        raise HostLedgerError("live host-ledger verification did not prove an active ext4 mount")
+    expected_receipt_values = {
+        "project_id": profile_values.get("project_id"),
+        "mount_root": profile_values.get("mount_root"),
+        "backing_image": profile_values.get("backing_image"),
+    }
+    if any(not isinstance(value, str) or not value for value in expected_receipt_values.values()):
+        raise HostLedgerError("live host-ledger verification lacks stable receipt identity")
+    _validate_host_receipt(host_receipt, expected_receipt_values)
     return {
         "schema": "fullmag.docker-host-ledger-attestation.v1",
         "profile": PROFILE,
