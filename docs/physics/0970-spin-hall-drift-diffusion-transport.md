@@ -2790,6 +2790,133 @@ pozostają faktyczną bramką preflight: brak FFTW3/X11/TBB odmawia przed compil
 Actual source implementation: scripts/local_runner/boris_cpu.py::run_build,
 validate_abi_outputs, validate_outputs; output membership scripts/local_runner/build_entrypoint.py::required_outputs_for_profile.
 
+(boris-fixed-m-transport-v2-contract)=
+### E1: generator fixed-M i dowód l_J v2
+
+**Stan z 2026-10-15: kontrakt prerejestrowany przed kodem, implementacja
+`SOURCE_ONLY`; runtime `NOT VERIFIED`, scenariusz `SCENARIO_NOT_QUALIFIED`.**
+Przerejestracja poprzedziła zmianę generatora i walidatorów. Zapisane źródła
+zastępują `statictransportsolver(1)` oraz `Relax`/`Run`, które nie zamrażają M,
+przez `statictransportsolver(0)` i `computefields` z pomiarem przed/po.
+W przypiętym BORIS `048503d2ca6475e91b073eb1762ecf9d3634c3e1`
+publiczna nazwa parametru to `l_J` (wewnętrzny `l_ex`), a `computefields`
+aktualizuje pola/transport bez kroku `odeSolver.Iterate`. To podstawa
+wyboru metody, nie dowód zrealizowania stanu przez binarium.
+
+Nowe schematy to dokładnie `fullmag.boris_she_nf.scenario.v2`,
+`fullmag.boris_she_nf.native.v2` i `fullmag.boris_she_nf.v2` dla summary.
+`fullmag.boris.runtime.v2` oraz `fullmag.boris_flow_major_units.v2` pozostają
+bez zmiany. Nowy publiczny admission wymaga poniższego pomiaru i odrzuca
+scenario/native/summary v1; historycznych bytes ani receipts nie retaguje się.
+Generator zachowuje eksperymentalne N/T/F, lecz publiczny/managed benchmark
+nadal dopuszcza tylko N/F; nie przyznaje się kwalifikacji bariery.
+
+| Wersjonowane pole | Dokładny typ, wartość i walidacja | SI / zakres |
+|---|---|---|
+| `scenario.execution` | exact object: `mode="fixed_m_transport_only"`, `ode="LLGStatic-SA"`, `transport_call="computefields"`, `static_transport=false`, `magnetization_relative_tolerance=1e-6`, `magnetization_absolute_tolerance_apm=1e-6`, `l_J_relative_tolerance=1e-6`; nieznane pola i zamienne typy odrzucone | $1$ poza absolute tolerance w $\mathrm{A\,m^{-1}}$; immutable intent, nie pomiar |
+| `NfCaseConfig.magnetization` | dokładnie `(1,0,0)`; inne kierunki odrzucone przed renderowaniem, bo historyczny renderer ustawia literalne +X | $1$; brak udawanej obsługi dowolnego m |
+| `ferromagnet.param.l_J` | ustawione jawnie z finite positive `config.l_ex_m` | $\mathrm m$; nie wnioskowanie z defaultu BORIS |
+| `native.fixed_m` | exact object: `schema_version="fullmag.boris_fixed_m.v1"`, `M_before="f_M_before.ovf"`, `M_after="f_M_after.ovf"`, `l_J_readback_m` jako finite positive scalar non-bool, `execution_mode="fixed_m_transport_only"` | M w $\mathrm{A\,m^{-1}}$, readback w $\mathrm m$ |
+| `ns.setparam("ferromagnet","l_J")` | zapytanie bez wartości; dokładnie skończony dodatni skalar; string, list i bool odrzucone bez heurystycznego parsowania | $\mathrm m$; źródłowo C++ `get_meshparam_value_sci` → unitless `ToString(get0)` → pojedyncze pole float NetSocks; runtime readback jeszcze niewykonany |
+| `f_M_before.ovf`, `f_M_after.ovf` | dwa pełne F-grid OVF, `valuedim=3`, exact shape; origin i step zgodne z manifestem i `f_V` przy relative $10^{-12}$ i absolute $10^{-18}\,\mathrm m$ | pozycja $\mathrm m$, M $\mathrm{A\,m^{-1}}$; wszystkie komórki, nie średnia ani pojedynczy probe |
+| `l_J_readback_m` względem `config.l_ex_m` | relative tolerance $10^{-6}$, absolute $0\,\mathrm m$; nie niefinitywny, zerowy ani bool | $\mathrm m$; ten proof nie poświadcza wszystkich innych parametrów |
+| `summary.fixed_m_proof` | exact recomputed object opisany poniżej; deklaracja caller JSON nie jest dowodem | $1$ jako envelope pomiaru |
+
+#### Kanoniczna ścieżka wyjścia generowanego skryptu
+
+**Dopisek prerejestrowany przed kodem host-path; implementacja `SOURCE_ONLY`,
+runtime `NOT VERIFIED`.** Renderowanie `Path("/export").resolve()` na Windows
+może dać hostowe `D:\export`, a odtworzenie na Linux `/export`. Wewnętrzne
+`render_boris_script(config, *, execution_output_dir=None)` rozdziela teraz
+default lokalnego generatora od stałego celu kontenera:
+
+| Parametr wewnętrzny | Typ/default i walidacja | SI / znaczenie |
+|---|---|---|
+| `execution_output_dir` | `str or None`, default `None`; jedyny dopuszczony override to dokładny literal `/export`, bez `Path.resolve`; inna wartość odrzucona | $1$ jako identyfikator ścieżki; nie zmienia konfiguracji storage |
+
+Przy `None` zachowuje się dotychczasowe `str(config.output_dir.resolve())`.
+`run_managed_boris_nf.py::fixed_inputs` przekazuje wyłącznie stałe
+`execution_output_dir="/export"`, dzięki czemu host Windows i worker Linux
+muszą uzyskać identyczne bytes skryptu. `/export` jest **stałym celem wyjścia
+wewnątrz kontenera, nie rootem storage**. Faktyczne hostowe storage i mount
+nadal wyznacza istniejący resolver i managed launcher. Factory nie przyjmuje
+user-root, environment lub CLI override; nie dodaje mountów. Exact byteguard
+`fixed_inputs`/worker pozostaje obowiązkowy i nie jest osłabiany.
+
+Generator zachowuje wybór `LLGStatic-SA` do aktywacji transportu, ale wykonuje
+`statictransportsolver(0)` oraz `computefields()`, bez `setstages(Relax)` i
+`Run`. Eksporty M następują bezpośrednio przed i po tym wywołaniu. Nie zmienia
+się znaków Ts/Tsi, gamma, jednostek ani porównywalności torque.
+
+Dla każdej składowej każdej komórki wymagane są trzy kontrole: before względem
+$M_s(1,0,0)$, after względem tej samej wartości oraz after względem before.
+Norma poniżej jest maksimum bezwzględnych błędów **składowych po wszystkich
+komórkach**, a nie normą wektora ani błędem średniej:
+
+```{math}
+:label: boris-fixed-m-all-cell-admission
+M_\star=(M_s,0,0),\qquad
+\max\left(\lVert M^{\mathrm{before}}-M_\star\rVert_\infty,
+\lVert M^{\mathrm{after}}-M_\star\rVert_\infty,
+\lVert M^{\mathrm{after}}-M^{\mathrm{before}}\rVert_\infty\right)
+\le\epsilon_{\mathrm{abs}}+\epsilon_{\mathrm{rel}}M_s.
+```
+
+| Symbol | Znaczenie | SI |
+|---|---|---|
+| $M^{\mathrm{before}}$ | pełne pole magnetyzacji przed transportem | $\mathrm{A\,m^{-1}}$ |
+| $M^{\mathrm{after}}$ | pełne pole magnetyzacji po transporcie | $\mathrm{A\,m^{-1}}$ |
+| $M_\star$ | oczekiwana magnetyzacja każdej komórki F | $\mathrm{A\,m^{-1}}$ |
+| $\lVert\cdot\rVert_\infty$ | maksimum błędu składowych po wszystkich komórkach F | $\mathrm{A\,m^{-1}}$ |
+| $\epsilon_{\mathrm{abs}}$ | bezwzględna tolerancja tekstowego eksportu M | $\mathrm{A\,m^{-1}}$ |
+| $\epsilon_{\mathrm{rel}}$ | względna tolerancja eksportu M | $1$ |
+
+Zamrożone wartości to $\epsilon_{\mathrm{abs}}=10^{-6}\,\mathrm{A\,m^{-1}}$
+i $\epsilon_{\mathrm{rel}}=10^{-6}$. Wspólny istniejący helper
+`scripts/verify_boris_nf_interface.py::validate_fixed_m(root,scenario,native)`
+ponownie czyta pełne OVF, oblicza trzy maksima i sprawdza l_J oraz geometrię.
+Reader oblicza hash z tych samych surowych bytes, z których dekoduje OVF;
+`require_fixed_m_members` wiąże oba hashe z retained output closure.
+Wynik ma dokładnie: `schema_version="fullmag.boris_fixed_m.proof.v1"`,
+`M_before_sha256`, `M_after_sha256` (64 lowerhex), `sample_count` (dodatni int,
+liczba komórek), `maximum_before_error_apm`, `maximum_after_error_apm`,
+`maximum_change_apm` (finite nonnegative) i `l_J_readback_m` (finite positive).
+Nie publikuje tablic M w summary. `summary.fixed_m_proof` musi być dokładnie
+równy ponownemu obliczeniu, a `RAW_OUTPUTS` i runtime output closure muszą
+wiązać oba nowe OVF; v2 ma 16 OVF zamiast historycznych 14.
+
+Przy managed publikacji i identity re-open `_artifact_summary` otrzymuje
+`retained_outputs` z tego samego `verified_outputs`. Jego końcowy pomiar M
+musi pasować do tych hashów, a `read_json` sprawdza hash tych samych bounded
+surowych bytes `boris_native_samples.json` przed parsowaniem readbacku l_J.
+`verify_runtime_identity` zwraca te entries dopiero po ponownym porównaniu
+summary, przez `validate_runtime_identity` do publicznego admission.
+Publiczny walidator wiąże z nimi również swój ostatni pomiar M i odczyt
+native JSON. Porównanie summary zachowuje rozróżnienie JSON bool/liczba.
+
+| Wewnętrzny parametr pomiaru | Typ/default i walidacja | SI / zakres |
+|---|---|---|
+| `_artifact_summary.retained_outputs` | `Sequence[Mapping[str,object]] or None`, default `None`; managed publikacja/re-open przekazują zweryfikowane entries, z których pobiera się dokładne hashe M i native JSON | $1$ jako manifest; `None` nie przyznaje managed identity |
+| `read_json.expected_sha256` | `str or None`, default `None`; przekazany hash musi odpowiadać pojedynczemu bounded odczytowi raw bytes przed decode/parse | $1$ jako SHA256; przy ponownym odczycie native JSON w managed/public v2 pochodzi z tej samej retained closure |
+
+Zmiana A→B między admission a końcowym odczytem ma być odrzucona nawet,
+gdy nowe M nadal mieści się w tolerancji fizycznej. Kontrolowane przypadki
+publikacji i obu re-open wykonują te gałęzie ze stubami zależności admission;
+nie są dowodem rzeczywistej tożsamości runtime.
+
+
+Mapowanie nie tworzy Python DSL ani `ProblemIR`: zmienia wyłącznie
+wersjonowany zewnętrzny generator i jego pomiar. Summary, publiczny walidator,
+worker i managed re-open wywołują ten sam helper; źródła kontrolowanego
+`check_fixed_m_contract` obejmują odmowy zmienionych M/siatki/l_J/proof/v1
+oraz porównanie bytes skryptu przy rozwiązywaniu ścieżek Windows i Linux.
+Dowód odbioru nadal wymaga rzeczywistego managed wykonania. Syntetyczne
+OVF, kontrolowane przypadki i AST nie dowodzą braku ewolucji M w BORIS. Nawet PASS
+tego ograniczonego pomiaru nie nadaje parity, konwergencji ani statusu
+„all parameters verified”. Nie dowodzi równoważności modeli ani
+obwodów zasilania BORIS i Fullmaga. FDM CPU/GPU i FEM CPU/GPU nie otrzymują nowej
+kwalifikacji; nowy benchmark nadal `NOT VERIFIED`.
+
 (boris-managed-runtime-v2-contract)=
 ### E1: trusted managed runtime admission v2
 
@@ -2805,7 +2932,8 @@ FEM-only validate_managed_build oraz sześć pozostałych profili nie zmieniają
 
 Fixed coarse/medium/fine N/F zachowuje istniejące parametry, tolerance=1e-5,
 max_iterations=200, CPU -g -1 i timeout180s. New managed run wymaga strict
-actual solver exit=0, stage marker, full native samples i 14 OVF; historyczne
+actual solver exit=0, stage marker i full native samples; historyczny v1 miał
+14 OVF, prerejestrowany fixed-M v2 wymaga 16 OVF; historyczne
 exit143 lub post-stage StdoutCatcher flush exit1 są odmową nowej ścieżki,
 nie synthetic sukcesem. Fullmag torque conversion refusal pozostaje bez zmian.
 Nie instaluje się pakietów ani nie pobiera obrazu podczas run. Brak dependencies
@@ -2819,7 +2947,7 @@ lub niezgodna embedded Python wersja/imports oznacza jawną odmowę.
 | precision / string | double dopiero po verified actual ABI + same compiler/types/flags build i actual CPU run | $1$; binary64 storage, bez strict IEEE claim z -Ofast |
 | source_files_sha256 / map | full capsule verified; host imports compare frozen files, brak drift | $1$; helper/adapter bindings |
 | scenario.py, scenario.json / bytes | generated exact fixed defaults/resolution; SHA256 before/after run | $1$; scientific input identity |
-| outputs / entries | exact14 OVF + native samples + runtime probe/logs; unique safe members <=32, aggregate <=256 MiB, each <=64 MiB | $1$; heavy payload files, bez JSON arrays |
+| outputs / entries | historyczny v1: 14 OVF; prerejestrowany fixed-M v2: exact16 OVF + native samples + runtime probe/logs; unique safe members <=32, aggregate <=256 MiB, each <=64 MiB | $1$; heavy payload files, bez JSON arrays |
 | container attestation / JSON | exact image/argv/env/mounts/runc/NVIDIA_VISIBLE_DEVICES=void/noGPU/noNetwork/UID65532/readonly/cap_drop/resource caps | $1$; rzeczywista lane/isolation |
 | summary/runtime/receipt digests / string | external digest framing; no receipt self-hash/cycle; summary recomputed from verified outputs | $1$; immutable closure |
 
@@ -2892,7 +3020,7 @@ a qualified workload without the validation gates above.
 | boris-offline-source-image-contract | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:boris-offline-source-image-provisioning | Separate observed source-image build and readback from pending native compile, ABI, solver runtime and benchmark. | planned_contract; source-image only |
 | boris-managed-runtime-publication | scripts/run_managed_boris_nf.py | observe | Exclusive runtime storage lock, full bundle before exact terminal receipt LAST; precommit resumable I/O failure and immutable postcommit verification. | source_only; interpreted crash/reentrant checks, runtime NOT VERIFIED |
 | boris-managed-runtime-admission | scripts/run_managed_boris_nf.py | resolved_boris_build | Authenticated same-actor/worktree terminal job, four trusted hashes, source/ABI/binary/flags/image receipt verification; source only. | source_only; interpreted regressions, native/runtime NOT VERIFIED |
-| boris-managed-runtime-reopen | scripts/run_managed_boris_nf.py | verify_runtime_identity | Explicit trusted repo/root, actual CPU container/output closure, receipt/identity binding and independent summary recomputation; no runtime qualification. | source_only; interpreted regressions, native/runtime NOT VERIFIED |
+| boris-managed-runtime-reopen | scripts/run_managed_boris_nf.py | verify_runtime_identity | Explicit trusted repo/root i retained closure; końcowe summary recompute wiąże M oraz native JSON z tymi samymi entries, które wracają do public admission; source-only, runtime NOT VERIFIED. | source_only; interpreted regressions, native/runtime NOT VERIFIED |
 | boris-managed-runtime-v2-contract | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:boris-managed-runtime-v2-contract | explicit trusted managed CPU run and public reopen gate | planned_contract; runtime NOT VERIFIED |
 | boris-cpu-abi-build-source | scripts/local_runner/boris_cpu.py | run_build | Fixed actual-source CPU ABI production stages share solver compiler flags/link/environment; no execution proof. | source_only; interpreted guards, no native run |
 | boris-cpu-abi-verifier-source | scripts/local_runner/boris_cpu.py | validate_abi_outputs | Bounded witness/source/flags/same-job observation and exact stage command binding; no runtime identity admission. | source_only; interpreted guards, no native run |
@@ -2984,6 +3112,20 @@ a qualified workload without the validation gates above.
 
 | Kontrakt | Ścieżka | Symbol | Odpowiedzialność i dowód |
 |---|---|---|---|
+| boris-fixed-m-managed-factory-boundary | scripts/run_managed_boris_nf.py | fixed_inputs | Fixed factory przekazuje wyłącznie execution_output_dir=/export, stały cel kontenera bez nowego storage-root/override; exact-script byteguard zachowany, runtime NOT VERIFIED. |
+| boris-fixed-m-v2-contract | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:boris-fixed-m-transport-v2-contract | Przerejestracja przed kodem fixed-M N/F v2; implementacja SOURCE_ONLY, runtime NOT VERIFIED i SCENARIO_NOT_QUALIFIED. |
+| boris-fixed-m-generator-boundary | scripts/boris_nf_interface_smoke.py | render_boris_script | Zapisany renderer static0/computefields, jawny l_J, dwa eksporty M i literal-only /export; implementacja źródłowa, runtime NOT VERIFIED. |
+| boris-fixed-m-ovf-reader-boundary | scripts/verify_boris_nf_interface.py | read_text_ovf | Jednorazowy odczyt surowych bytes OVF, dekodowanie i hash tych samych bytes; geometria i wszystkie komórki, bez dowodu runtime. |
+| boris-fixed-m-summary-boundary | scripts/run_boris_nf_interface.py | _artifact_summary | Summary v2 recompute z retained_outputs wiąże końcowy proof M oraz raw native JSON z tymi samymi verified entries; source-only, bez authority caller JSON. |
+| boris-fixed-m-public-admission-boundary | scripts/verify_boris_nf_interface.py | validate_boris_artifact | Publiczny admission v2 wiąże ostatni pomiar M i odczyt native JSON z entries zwróconymi przez identity reopen, dokładnie porównuje proof i odmawia v1; source-only. |
+| boris-fixed-m-managed-closure-boundary | scripts/run_managed_boris_nf.py | verified_outputs | Managed re-open ponownie oblicza pomiar M/l_J i wiąże hashe obu nowych OVF z retained closure; source-only, runtime NOT VERIFIED. |
+| boris-fixed-m-config-guard | scripts/boris_nf_interface_smoke.py | class NfCaseConfig | NfCaseConfig.__post_init__ odmawia kierunków innych niż dokładne +X przed renderowaniem; source-only. |
+| boris-fixed-m-execution-contract | scripts/boris_nf_interface_smoke.py | FIXED_M_EXECUTION | Wspólne dokładne wartości execution v2, tolerancji M/l_J i metody fixed_m_transport_only; source-only. |
+| boris-fixed-m-recompute | scripts/verify_boris_nf_interface.py | validate_fixed_m | Jeden owner ponownego pomiaru pełnych pól M, geometrii i l_J oraz dokładnego obiektu proof; source-only, nie wykonanie BORIS. |
+| boris-fixed-m-closure-binding | scripts/run_managed_boris_nf.py | require_fixed_m_members | Wiąże hashe sparsowanych M_before/M_after z tymi samymi raw closure members w worker, publikacji, identity i public re-open; source-only. |
+| boris-fixed-m-controlled-source-checks | scripts/check_boris_fixed_m_contract.py | check_fixed_m_contract | Kontrolowane syntetyczne OVF, host-path byteguard i A→B odmowy końcowych gałęzi ze stubami admission; bez solvera, builda i nadania runtime identity. |
+| boris-fixed-m-native-json-reader | scripts/run_managed_boris_nf.py | read_json | expected_sha256 weryfikuje pojedynczy bounded raw odczyt native JSON przed decode/parse; readback l_J pozostaje przypięty do tych samych retained entries. |
+| boris-fixed-m-identity-pin-forwarding | scripts/run_boris_nf_interface.py | validate_runtime_identity | Runtime v2 wrapper przekazuje zwrócone verified entries do ostatniego publicznego pomiaru; nie tworzy odrębnego admission. |
 | fdm-cpu-gilbert-stage-helper | crates/fullmag-engine/src/fdm/cpu/fields/direct_torques.rs | external_stage_terms_from_gilbert_source | Jedna konwersja owned Gilbert source z trial m i lokalnym alpha_at do istniejącego explicit ExternalStageTerms; źródła zapisane, runtime NOT VERIFIED. |
 | fdm-cpu-gilbert-stage-source-regression | crates/fullmag-engine/tests/fdm_cpu_gilbert_stage.rs | gilbert_stage_uses_local_damping_and_preserves_field_and_source_observations | Zapisana regresja lokalnego alpha, obu flag precesji, zero source, zachowania pól i shape guards; niekompilowana, niewykonana. |
 | fdm-cpu-gilbert-stage-field-equivalence | crates/fullmag-engine/tests/fdm_cpu_gilbert_stage.rs | gilbert_source_matches_independent_field_rhs_through_heun_and_ars_trials | Zapisana niezależna tożsamość Gilbert source z polem w czterech krokach Heuna/ARS; niekompilowana, niewykonana. |

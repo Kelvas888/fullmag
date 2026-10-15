@@ -24,6 +24,7 @@ from verify_boris_nf_interface import (
     compute_interface_slice,
     read_text_ovf,
     validate_boris_artifact,
+    validate_fixed_m,
 )
 
 
@@ -177,11 +178,10 @@ def capture_runtime_identity(
 
 
 def validate_runtime_identity(identity: Mapping[str, object], *, repo_root: Path | None = None,
-                              artifact_root: Path | None = None) -> None:
+                              artifact_root: Path | None = None) -> list[dict[str, object]]:
     if identity.get("schema_version") == "fullmag.boris.runtime.v2":
         from run_managed_boris_nf import verify_runtime_identity
-        verify_runtime_identity(identity, repo_root, artifact_root)
-        return
+        return verify_runtime_identity(identity, repo_root, artifact_root)
     required = (
         "schema_version",
         "source_manifest_sha256",
@@ -376,8 +376,19 @@ def _mesh_fields(root: Path, prefix: str) -> MeshFields:
     )
 
 
-def _artifact_summary(root: Path, config: NfCaseConfig, identity: Mapping[str, object]) -> dict[str, object]:
+def _artifact_summary(
+    root: Path, config: NfCaseConfig, identity: Mapping[str, object],
+    *, retained_outputs: Sequence[Mapping[str, object]] | None = None,
+) -> dict[str, object]:
     manifest = scenario_manifest(config)
+    from run_managed_boris_nf import read_json, require_fixed_m_members
+    native_hash = None if retained_outputs is None else {
+        entry["path"]: entry["sha256"] for entry in retained_outputs
+    }["boris_native_samples.json"]
+    native = read_json(root / "boris_native_samples.json", expected_sha256=native_hash)
+    fixed_m_proof = validate_fixed_m(root, manifest, native)
+    if retained_outputs is not None:
+        require_fixed_m_members(fixed_m_proof, retained_outputs)
     normal = _mesh_fields(root, "n")
     ferromagnet = _mesh_fields(root, "f")
     parameters = manifest["parameters"]
@@ -421,8 +432,9 @@ def _artifact_summary(root: Path, config: NfCaseConfig, identity: Mapping[str, o
         "ferromagnet": {name: f"f_{name}.ovf" for name in REQUIRED_FERROMAGNET_FIELDS},
     }
     return {
-        "schema_version": "fullmag.boris_she_nf.v1",
+        "schema_version": "fullmag.boris_she_nf.v2",
         "runtime": dict(identity),
+        "fixed_m_proof": fixed_m_proof,
         "scenario": manifest,
         "fields": field_map,
         "residuals": residuals,
@@ -505,12 +517,12 @@ def run_boris_case(
         for prefix, names in (("n", REQUIRED_NORMAL_FIELDS), ("f", REQUIRED_FERROMAGNET_FIELDS))
         for name in names
     ]
-    required_files.append(output_dir / "boris_native_samples.json")
+    required_files.extend(output_dir / name for name in ("f_M_before.ovf", "f_M_after.ovf", "boris_native_samples.json"))
     missing = [str(path.name) for path in required_files if not path.is_file()]
     if missing:
         raise RuntimeError(f"BORIS N/F stage marker was emitted but fields are missing: {', '.join(missing)}")
     native = json.loads((output_dir / "boris_native_samples.json").read_text(encoding="utf-8"))
-    if native.get("stage_complete") is not True or native.get("schema_version") != "fullmag.boris_she_nf.native.v1":
+    if native.get("stage_complete") is not True or native.get("schema_version") != "fullmag.boris_she_nf.native.v2":
         raise RuntimeError("BORIS native samples do not prove stage completion")
     probe = _probe_from_managed_log(completed.stdout, completed.stderr, device)
     if device == "cuda":

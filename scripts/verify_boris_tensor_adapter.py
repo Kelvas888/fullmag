@@ -79,7 +79,7 @@ def fixture(root: Path) -> tuple[dict[str, dict[str, Path]], list[list[float]]]:
         "torque": [11e-9, 13e-9, 17e-9],
     }
     summary = {
-        "schema_version": "fullmag.boris_she_nf.v1",
+        "schema_version": "fullmag.boris_she_nf.v2",
         "runtime": {"schema_version": "fullmag.boris.runtime.v1", "identity_complete": False,
                     "precision": None, "kind": "synthetic_raw_ovf_fixture",
                     "solver_executed": False},

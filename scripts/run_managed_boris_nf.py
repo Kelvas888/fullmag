@@ -24,6 +24,7 @@ RESOLUTIONS = ("coarse", "medium", "fine")
 RAW_FIELDS = tuple(f"{prefix}_{name}.ovf" for prefix, names in (
     ("n", ("V","S","Jc","Jsx","Jsy","Jsz")),
     ("f", ("V","S","Jc","Jsx","Jsy","Jsz","Ts","Tsi"))) for name in names)
+RAW_FIELDS = (*RAW_FIELDS, "f_M_before.ovf", "f_M_after.ovf")
 RAW_OUTPUTS = (*RAW_FIELDS, "boris_native_samples.json", "solver.stdout.log", "solver.stderr.log", "runtime_probe.json")
 SOURCE_FILES = ("scripts/run_managed_boris_nf.py", "scripts/run_boris_nf_interface.py",
     "scripts/verify_boris_nf_interface.py", "scripts/compare_boris_fullmag_she_nf.py",
@@ -31,7 +32,7 @@ SOURCE_FILES = ("scripts/run_managed_boris_nf.py", "scripts/run_boris_nf_interfa
     "scripts/verify_saved_fem_archive_roundtrip.py")
 
 
-def read_json(path, bound=4*1024*1024):
+def read_json(path, bound=4*1024*1024, *, expected_sha256=None):
     path=Path(path)
     if storage.is_link(path) or not path.is_file():
         raise ValueError("Managed BORIS JSON must be a regular file")
@@ -39,6 +40,10 @@ def read_json(path, bound=4*1024*1024):
         raw=stream.read(bound+1)
     if not 0<len(raw)<=bound:
         raise ValueError("Managed BORIS JSON exceeds bound")
+    if expected_sha256 is not None:
+        import hashlib
+        if hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise ValueError("Managed BORIS JSON bytes differ from retained output closure")
     def unique(pairs):
         result={}
         for key,value in pairs:
@@ -122,7 +127,7 @@ def fixed_inputs(resolution):
     config=_resolution_config(resolution,Path("/export"))
     # The embedded interpreter, not the external launcher, produces this identity.
     prefix='import sys,json\nprint("BORIS_EMBEDDED_IDENTITY:"+json.dumps({"python_version":sys.version}),flush=True)\n'
-    return config, (prefix+render_boris_script(config)).encode("utf-8"),boris.canonical(scenario_manifest(config))
+    return config, (prefix+render_boris_script(config, execution_output_dir="/export")).encode("utf-8"),boris.canonical(scenario_manifest(config))
 
 
 def scientific_spec(image,source,outputs,inputs,export):
@@ -176,6 +181,15 @@ def output_closure(root):
     return entries
 
 
+def require_fixed_m_members(proof, entries):
+    """Bind parsed M samples to the same immutable raw closure members."""
+    members = {entry["path"]: entry["sha256"] for entry in entries}
+    if any(members.get(name) != proof[key] for name, key in (
+        ("f_M_before.ovf", "M_before_sha256"), ("f_M_after.ovf", "M_after_sha256")
+    )):
+        raise ValueError("BORIS fixed-M parsed bytes differ from retained output closure")
+
+
 def _worker():
     # Fixed Linux image paths only; no user binary/script/argv selections.
     if os.name != "posix" or Path(__file__).resolve()!=Path("/source/scripts/run_managed_boris_nf.py"):
@@ -209,9 +223,13 @@ def _worker():
         device="cpu",precision_abi=boris.load_manifest(Path("/boris/cpu_abi_witness.json")),
         numpy_version=numpy.__version__,matplotlib_version=matplotlib.__version__))
     native=read_json(Path("/export/boris_native_samples.json"))
-    if native.get("schema_version")!="fullmag.boris_she_nf.native.v1" or native.get("stage_complete") is not True or native.get("scenario")!=json.loads(scenario):
+    if native.get("schema_version")!="fullmag.boris_she_nf.native.v2" or native.get("stage_complete") is not True or native.get("scenario")!=json.loads(scenario):
         raise ValueError("BORIS native stage/scenario differs")
-    print(json.dumps(dict(schema="fullmag.boris.output_closure.v1",outputs=output_closure(Path("/export")))),flush=True)
+    from verify_boris_nf_interface import validate_fixed_m
+    fixed_m = validate_fixed_m(Path("/export"), json.loads(scenario), native)
+    entries = output_closure(Path("/export"))
+    require_fixed_m_members(fixed_m, entries)
+    print(json.dumps(dict(schema="fullmag.boris.output_closure.v1",outputs=entries)),flush=True)
 
 
 def runtime_root(layout,runtime_id):
@@ -295,8 +313,11 @@ def verified_outputs(root,receipt,observed):
         raise ValueError("BORIS actual runtime probe differs")
     native=read_json(root/"export/boris_native_samples.json")
     scenario=json.loads(fixed_inputs(receipt["resolution"])[2])
-    if native.get("schema_version")!="fullmag.boris_she_nf.native.v1" or native.get("stage_complete") is not True or native.get("scenario")!=scenario:
+    if native.get("schema_version")!="fullmag.boris_she_nf.native.v2" or native.get("stage_complete") is not True or native.get("scenario")!=scenario:
         raise ValueError("BORIS native stage/scenario differs")
+    from verify_boris_nf_interface import validate_fixed_m
+    fixed_m = validate_fixed_m(root / "export", scenario, native)
+    require_fixed_m_members(fixed_m, entries)
     log=root/"export/solver.stdout.log"
     if log.stat().st_size>64*1024**2:raise ValueError("BORIS solver log exceeds bound")
     text=log.read_text(encoding="utf-8")
@@ -362,7 +383,7 @@ def _observe_locked(repo,runtime_id):
         import hashlib
         identity=identity_from_receipt(root,final,probe,receipt_sha256=hashlib.sha256(raw).hexdigest())
         from run_boris_nf_interface import _artifact_summary
-        summary=_artifact_summary(root/"export",fixed_inputs(receipt["resolution"])[0],identity)
+        summary=_artifact_summary(root/"export",fixed_inputs(receipt["resolution"])[0],identity,retained_outputs=entries)
     except Exception as error:
         storage.atomic_json(root/"receipt.json",dict(receipt,state="failed_resources_retained",error=str(error)))
         raise
@@ -390,11 +411,12 @@ def verify_runtime_identity(identity,repo,artifact_root):
         or identity!=identity_from_receipt(root,receipt,probe)):
         raise ValueError("BORIS runtime identity/retained closure differs")
     from run_boris_nf_interface import _artifact_summary
-    expected=_artifact_summary(root/"export",fixed_inputs(receipt["resolution"])[0],identity)
-    if read_json(root/"export/summary.json")!=expected or read_json(root/"export/runtime.json")!=identity:
+    expected=_artifact_summary(root/"export",fixed_inputs(receipt["resolution"])[0],identity,retained_outputs=entries)
+    if boris.canonical(read_json(root/"export/summary.json"))!=boris.canonical(expected) or read_json(root/"export/runtime.json")!=identity:
         raise ValueError("BORIS summary differs from independently recomputed diagnostics")
     if resolved_boris_build(repo,receipt["build_job_id"])[3]!=receipt["binding"]:
         raise ValueError("BORIS build changed during public verification")
+    return entries
 
 
 def main():
