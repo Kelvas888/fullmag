@@ -780,7 +780,9 @@ jobs:
           packages/fullmag-py/tests/test_runtime_source_snapshot.py
 
       - name: Run FEM tested/runtime library identity contracts
-        run: python scripts/test_fem_modal_library_identity.py -v
+        run: |
+          python scripts/test_fem_modal_library_identity.py -v
+          python -B scripts/test_fem_mfem_hypre_stream_compat.py
 
       - name: Run managed runtime artifact root contracts
         run: python scripts/test_managed_runtime_artifact_root.py -v
