@@ -288,6 +288,97 @@ describe("WorkspaceShellClient session collection gate", () => {
     }
   });
 
+  it("keeps the focused workspace draft mounted when only current status refresh fails", async () => {
+    const sessionList = {
+      schema_version: "2.0.0",
+      sessions: [{
+        current: true,
+        name: "workspace-shell-test",
+        session_id: "workspace-shell-session",
+        status: "running",
+      }],
+    };
+    const liveStatus = {
+      resources: { simulation_preparation_revision: 7 },
+      session: {
+        name: "workspace-shell-test",
+        request_scope_epoch: "api-instance:workspace-shell-test",
+        session_epoch: "workspace-shell-session@1700000000000",
+        session_id: "workspace-shell-session",
+      },
+      solver: { state: "bootstrapping" },
+    } as LiveStatusResource;
+    const list = vi.fn(async () => sessionList);
+    const currentStatus = vi.fn(async () => liveStatus)
+      .mockResolvedValueOnce(liveStatus)
+      .mockRejectedValueOnce(new Error("current status refresh unavailable"));
+    const preparation = vi.fn(async () => ({
+      active_stage_id: "planning",
+      completed_at_unix_ms: null,
+      failure: null,
+      log_tail: [],
+      preparation_id: "workspace-shell-preparation",
+      requested_execution: {
+        backend: "fdm",
+        device: "gpu",
+        engine_id: null,
+        mode: "strict",
+        precision: "double",
+        runtime_family: null,
+        worker: null,
+      },
+      resolved_execution: null,
+      revision: 7,
+      stages: [],
+      started_at_unix_ms: 1_000,
+      status: "running",
+    } satisfies SimulationPreparationResource));
+    const kernel = makeKernel(list, currentStatus, preparation);
+    const { container, dispose } = await mountWorkspace(kernel);
+
+    try {
+      await settle();
+      const workspaceBody = findElements(
+        container,
+        (element) =>
+          element
+            .getAttribute("class")
+            ?.split(/\s+/)
+            .includes("fm-workspace-body") === true,
+      )[0];
+      const draft = findByAttribute(container, "aria-label", "Workspace draft");
+      expect(workspaceBody).toBeTruthy();
+      expect(draft).toBeTruthy();
+      draft!.value = "Unsaved status-refresh draft";
+      draft!.focus();
+
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + statusRefreshIntervalMs() + 1);
+      await act(async () => {
+        kernel.resources.invalidate(SESSION_STATUS_RESOURCE_KEY, "transport-refresh:status-only");
+        kernel.realtimeConnection.update("disconnected");
+      });
+      await settle();
+
+      expect(list).toHaveBeenCalledTimes(1);
+      expect(currentStatus).toHaveBeenCalledTimes(2);
+      expect(findByAttribute(container, "aria-label", "Workspace draft")).toBe(draft);
+      expect(draft!.value).toBe("Unsaved status-refresh draft");
+      expect(draft!.ownerDocument.activeElement).toBe(draft);
+      expect(findElements(
+        container,
+        (element) =>
+          element
+            .getAttribute("class")
+            ?.split(/\s+/)
+            .includes("fm-workspace-body") === true,
+      )[0]).toBe(workspaceBody);
+      expect(findByAttribute(container, "data-state", "session-status-error")).toBeNull();
+      expect(findByAttribute(container, "data-state", "session-status-inconsistent")).toBeNull();
+    } finally {
+      await dispose();
+    }
+  });
+
   it("renders transport failure separately from confirmed absence, with the launcher below it", async () => {
     const currentStatus = vi.fn();
     const { container, dispose } = await mountWorkspace(
@@ -308,6 +399,130 @@ describe("WorkspaceShellClient session collection gate", () => {
       expect(launchTile(container, "start.import")?.getAttribute("disabled")).toBeNull();
       expect(container.textContent).toContain("Browse…");
       expect(currentStatus).not.toHaveBeenCalled();
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("renders current-session status failure separately and retries the status resource", async () => {
+    const sessionList = {
+      schema_version: "2.0.0",
+      sessions: [{
+        current: true,
+        name: "workspace-shell-test",
+        session_id: "workspace-shell-session",
+        status: "running",
+      }],
+    };
+    const liveStatus = {
+      resources: { simulation_preparation_revision: 7 },
+      session: {
+        name: "workspace-shell-test",
+        request_scope_epoch: "api-instance:workspace-shell-test",
+        session_epoch: "workspace-shell-session@1700000000000",
+        session_id: "workspace-shell-session",
+      },
+      solver: { state: "bootstrapping" },
+    } as LiveStatusResource;
+    const list = vi.fn(async () => sessionList);
+    const statusFailure = Object.assign(
+      new Error("current status unavailable"),
+      { status: 409 },
+    );
+    const currentStatus = vi.fn()
+      .mockRejectedValueOnce(statusFailure)
+      .mockResolvedValueOnce(liveStatus);
+    const { container, dispose } = await mountWorkspace(
+      makeKernel(list, currentStatus),
+    );
+
+    try {
+      await settle();
+      expect(findByAttribute(container, "data-state", "session-status-error")).toBeTruthy();
+      expect(container.textContent).toContain("Current session status unavailable");
+      expect(container.textContent).not.toContain("Checking for sessions");
+      expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeNull();
+      expect(currentStatus).toHaveBeenCalledTimes(1);
+
+      const retry = findElements(
+        container,
+        (element) => element.tagName === "BUTTON" && element.textContent === "Retry",
+      )[0];
+      expect(retry).toBeTruthy();
+      await act(async () => {
+        retry!.click();
+        await settle();
+      });
+
+      expect(currentStatus).toHaveBeenCalledTimes(2);
+      expect(findByAttribute(container, "data-state", "session-status-error")).toBeNull();
+      expect(findByAttribute(container, "data-slot-id", "viewport-main")).toBeTruthy();
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("does not treat a ready status with an unconfirmed identity as loading", async () => {
+    const sessionList = {
+      schema_version: "2.0.0",
+      sessions: [{
+        current: true,
+        name: "workspace-shell-test",
+        session_id: "workspace-shell-session",
+        status: "running",
+      }],
+    };
+    const statusForOtherSession = {
+      resources: { simulation_preparation_revision: 7 },
+      session: {
+        name: "other-session",
+        request_scope_epoch: "api-instance:other-session",
+        session_epoch: "other-session@1700000000000",
+        session_id: "other-session",
+      },
+      solver: { state: "bootstrapping" },
+    } as LiveStatusResource;
+    const statusForListedSession = {
+      ...statusForOtherSession,
+      session: {
+        ...statusForOtherSession.session,
+        name: "workspace-shell-test",
+        request_scope_epoch: "api-instance:workspace-shell-test",
+        session_epoch: "workspace-shell-session@1700000000000",
+        session_id: "workspace-shell-session",
+      },
+    } as LiveStatusResource;
+    const currentStatus = vi.fn()
+      .mockResolvedValueOnce(statusForOtherSession)
+      .mockResolvedValueOnce(statusForListedSession);
+    const list = vi.fn(async () => sessionList);
+    const { container, dispose } = await mountWorkspace(
+      makeKernel(list, currentStatus),
+    );
+
+    try {
+      await settle();
+      expect(findByAttribute(container, "data-state", "session-status-inconsistent")).toBeTruthy();
+      expect(container.textContent).toContain("Current session is out of sync");
+      expect(container.textContent).not.toContain("Checking for sessions");
+      expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeNull();
+      expect(list).toHaveBeenCalledTimes(1);
+      expect(currentStatus).toHaveBeenCalledTimes(1);
+
+      const retry = findElements(
+        container,
+        (element) => element.tagName === "BUTTON" && element.textContent === "Retry",
+      )[0];
+      expect(retry).toBeTruthy();
+      await act(async () => {
+        retry!.click();
+        await settle();
+      });
+
+      expect(currentStatus).toHaveBeenCalledTimes(2);
+      expect(list).toHaveBeenCalledTimes(2);
+      expect(findByAttribute(container, "data-state", "session-status-inconsistent")).toBeNull();
+      expect(findByAttribute(container, "data-slot-id", "viewport-main")).toBeTruthy();
     } finally {
       await dispose();
     }

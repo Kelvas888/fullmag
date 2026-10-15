@@ -1,13 +1,13 @@
 "use client";
 
-import { useEffect } from "react";
+import { useCallback, useEffect } from "react";
 
 import {
   SimulationStartupOverlayView,
   useSimulationStartupOverlayState,
 } from "./SimulationStartupOverlay";
 import { useSessionCollection } from "../resources/useSessionCollection";
-import { useSessionResourceIdentity } from "../resources/useSessionStatus";
+import { useSessionBootstrapStatus } from "../resources/useSessionStatus";
 import { Button } from "@/shared/ui/Button";
 import { WorkspaceRenderProfiler } from "../performance/reactRenderProfiler";
 import { SlotHost } from "./SlotHost";
@@ -22,10 +22,41 @@ import { useLayoutSelector } from "./useLayout";
 export function WorkspaceShellClient() {
   const sessions = useSessionCollection();
   const project = useProjectDocumentSnapshot();
-  const identity = useSessionResourceIdentity();
-  const sessionState = sessions.state === "ready" && !identity ? "loading" : sessions.state;
+  const sessionStatus = useSessionBootstrapStatus({
+    collection: sessions.resource.data,
+    enabled: sessions.state === "ready",
+  });
+  const identity = sessionStatus.identity;
+  const statusError =
+    sessions.state === "ready" &&
+    sessionStatus.status === "error" &&
+    !identity;
+  const statusInconsistent =
+    sessions.state === "ready" &&
+    sessionStatus.status === "ready" &&
+    (sessions.resource.data?.sessions.length ?? 0) > 0 &&
+    !identity;
+  const sessionState = statusError
+    ? "status-error"
+    : statusInconsistent
+      ? "status-inconsistent"
+      : sessions.state === "ready" && !identity
+        ? "loading"
+        : sessions.state;
   const sessionScopeKey = sessionRequestScopeKey(identity);
   const startOwnsPage = sessionState !== "ready" && project.state !== "ready";
+  const refetchSessions = sessions.resource.refetch;
+  const refetchStatus = sessionStatus.refetch;
+  const retryStatusAndCollection = useCallback(() => {
+    refetchSessions();
+    refetchStatus();
+  }, [refetchSessions, refetchStatus]);
+  const onRetry =
+    sessionState === "status-error"
+      ? refetchStatus
+      : sessionState === "status-inconsistent"
+        ? retryStatusAndCollection
+        : refetchSessions;
 
   // The overlay is a visit, not a mode: starting or opening something, or the
   // workspace going away, ends it so it cannot reappear on top of the next one.
@@ -34,7 +65,7 @@ export function WorkspaceShellClient() {
   }, [sessionScopeKey, startOwnsPage]);
 
   if (sessionState !== "ready" && project.state === "ready") {
-    return <ProjectWorkspaceShell sessionState={sessionState} />;
+    return <ProjectWorkspaceShell sessionState={sessionState} onRetry={onRetry} />;
   }
 
   if (sessionState !== "ready") return (
@@ -46,6 +77,10 @@ export function WorkspaceShellClient() {
         </div>
       ) : sessionState === "error" ? (
         <SessionCollectionError onRetry={sessions.resource.refetch} />
+      ) : sessionState === "status-error" ? (
+        <SessionStatusError onRetry={onRetry} />
+      ) : sessionState === "status-inconsistent" ? (
+        <SessionStatusError kind="inconsistent" onRetry={onRetry} />
       ) : (
         <SessionCollectionLoading />
       )}
@@ -62,8 +97,10 @@ export function WorkspaceShellClient() {
 
 function ProjectWorkspaceShell({
   sessionState,
+  onRetry,
 }: {
-  sessionState: "loading" | "error" | "no-session";
+  sessionState: "loading" | "error" | "status-error" | "status-inconsistent" | "no-session";
+  onRetry: () => void;
 }) {
   const kernel = useKernel();
   const panels = useLayoutSelector((layout) => layout.panelVisible);
@@ -72,7 +109,12 @@ function ProjectWorkspaceShell({
     ? "No active session. Saved project results are available independently."
     : sessionState === "error"
       ? "Session list unavailable. Saved project results remain available."
-      : "Checking for sessions. Saved project results remain available.";
+      : sessionState === "status-error"
+        ? "Current session status unavailable. Saved project results remain available."
+        : sessionState === "status-inconsistent"
+          ? "Current session does not match the session list. Saved project results remain available."
+          : "Checking for sessions. Saved project results remain available.";
+  const isError = sessionState === "error" || sessionState === "status-error" || sessionState === "status-inconsistent";
   return (
     <WorkspaceContentScopeProvider scope="project">
       <SlotHost slotId="app-menu" />
@@ -83,9 +125,10 @@ function ProjectWorkspaceShell({
       >
         <div>
           <h1 className="m-0 text-fm-sm font-semibold text-fm-primary">Saved project results</h1>
-          <p className="m-0 text-fm-xs text-fm-muted" role={sessionState === "error" ? "alert" : "status"}>{detail}</p>
+          <p className="m-0 text-fm-xs text-fm-muted" role={isError ? "alert" : "status"}>{detail}</p>
         </div>
         <div className="flex gap-2">
+          {isError ? <Button size="sm" variant="secondary" onClick={onRetry}>Retry</Button> : null}
           {!panels.left ? <Button size="sm" variant="secondary" onClick={() => kernel.layout.togglePanel("left")}>Show saved results</Button> : null}
           {!panels.right ? <Button size="sm" variant="secondary" onClick={() => kernel.layout.togglePanel("right")}>Show Inspector</Button> : null}
         </div>
@@ -135,6 +178,41 @@ function SessionCollectionError({ onRetry }: { readonly onRetry: () => void }) {
         </div>
       </section>
       <SlotHost slotId="start-screen" />
+    </div>
+  );
+}
+
+function SessionStatusError({
+  kind = "error",
+  onRetry,
+}: {
+  readonly kind?: "error" | "inconsistent";
+  readonly onRetry: () => void;
+}) {
+  const inconsistent = kind === "inconsistent";
+  return (
+    <div
+      className="fm-start-host"
+      data-state={inconsistent ? "session-status-inconsistent" : "session-status-error"}
+    >
+      <section
+        className="border-b border-fm-border bg-fm-surface px-6 py-3"
+        role="alert"
+      >
+        <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
+          <div>
+            <h1 className="font-fm-ui text-lg font-semibold text-fm-danger">
+              {inconsistent ? "Current session is out of sync" : "Current session status unavailable"}
+            </h1>
+            <p className="text-fm-secondary">
+              {inconsistent
+                ? "Fullmag received a current status that does not match the session list. Retry before creating or opening a session."
+                : "Fullmag could not confirm the current session. Project files remain available independently."}
+            </p>
+          </div>
+          <Button type="button" onClick={onRetry}>Retry</Button>
+        </div>
+      </section>
     </div>
   );
 }
