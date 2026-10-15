@@ -1335,6 +1335,23 @@ mod accepted_start_tests {
         .expect("manual scheduler study fixture is valid");
         let mut problem = ProblemIR::bootstrap_example();
         problem.backend_policy.requested_backend = fullmag_ir::BackendTarget::Fdm;
+        problem.object_regions.push(fullmag_ir::ObjectRegionIR {
+            region_id: "strip:core".into(),
+            owner_object: "strip".into(),
+            name: "core".into(),
+            shape: fullmag_ir::RegionShapeIR::Box {
+                size: [200e-9, 20e-9, 6e-9],
+                center: [0.0, 0.0, 0.0],
+            },
+            frame: fullmag_ir::RegionFrameIR::Object,
+            enabled: true,
+            priority: 1,
+            mesh_policy: None,
+            material_overrides: Vec::new(),
+            texture_override: None,
+            material_transition: None,
+            realization_policy: fullmag_ir::RegionRealizationPolicyIR::Inherit,
+        });
         problem
             .problem_meta
             .runtime_metadata

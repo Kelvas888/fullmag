@@ -3099,8 +3099,8 @@ fn device_name(device: ExecutionDevice) -> &'static str {
 mod accepted_start_preparation_tests {
     use super::*;
     use fullmag_application::{
-        ProjectId, ProjectSnapshot, RequestedExecution, RunId, RunSpecification, StudyId,
-        StudyReference,
+        ProjectId, ProjectSnapshot, RequestedExecution, RequestedResourceBudget, RunId,
+        RunSpecification, StudyId, StudyReference,
     };
     use fullmag_authoring::{
         PrimitiveStageNode, StudyDiscretizationReference, StudyExecutionProfileReference,
@@ -3192,7 +3192,12 @@ mod accepted_start_preparation_tests {
                 device: "cpu".into(),
                 precision: "double".into(),
                 mode: "strict".into(),
-                minimum_resources: None,
+                minimum_resources: Some(RequestedResourceBudget {
+                    cpu_millis: 100,
+                    memory_bytes: 1,
+                    gpu_memory_bytes: 0,
+                    storage_bytes: 1,
+                }),
             },
         );
         specification.run_id = RunId::parse(run_id).expect("accepted preparation run id is valid");
@@ -3311,12 +3316,27 @@ mod accepted_start_preparation_tests {
 
     #[test]
     fn manual_accepted_run_allows_fdm_and_fem_preparation_before_release() {
-        let fdm = manual_run_snapshot(
-            {
-                let mut problem = ProblemIR::bootstrap_example();
-                problem.backend_policy.requested_backend = BackendTarget::Fdm;
-                problem
+        let mut fdm_problem = ProblemIR::bootstrap_example();
+        fdm_problem.backend_policy.requested_backend = BackendTarget::Fdm;
+        fdm_problem.object_regions.push(fullmag_ir::ObjectRegionIR {
+            region_id: "strip:core".into(),
+            owner_object: "strip".into(),
+            name: "core".into(),
+            shape: fullmag_ir::RegionShapeIR::Box {
+                size: [200e-9, 20e-9, 6e-9],
+                center: [0.0, 0.0, 0.0],
             },
+            frame: fullmag_ir::RegionFrameIR::Object,
+            enabled: true,
+            priority: 1,
+            mesh_policy: None,
+            material_overrides: Vec::new(),
+            texture_override: None,
+            material_transition: None,
+            realization_policy: fullmag_ir::RegionRealizationPolicyIR::Inherit,
+        });
+        let fdm = manual_run_snapshot(
+            fdm_problem,
             "fdm",
             "run-manual-fdm-preparation",
         );
