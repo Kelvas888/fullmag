@@ -53,6 +53,29 @@ na globalny ledger ani nie tworzymy ukrytego named volume. Jednorazowy helper
 montowania jest narzędziem utrzymania; frontend i backend pozostają dwiema
 usługami aplikacji. Frontend nie otrzymuje ledgeru, GPU ani accepted store.
 
+## Migracja poleceń live w Dockerze
+
+Backend Docker nie ma konsumenta starszej kolejki live. Dlatego w tej trasie
+zarówno CPU, GPU, jak i `auto` przechodzą przez istniejący accepted pipeline.
+Natywny launcher zachowuje dotychczasową trasę legacy; rozpoznanie trasy należy
+do granicy API, a nie do czystego helpera aplikacyjnego.
+
+Dla sceny bez zadeklarowanego profilu adapter używa kanonicznego, pustego
+`ExecutionProfileIR::default()` (`exec:default@1`). Wybory autora trafiają do
+jawnej warstwy `Study` lub `Script`, łącznie z `auto` i pełnym
+`ComputeResourcesIR`. Profil nie może ukrywać domyślnego CPU ani nadpisywać
+zasobów. API jawnie publikuje lub odczytuje niezmienny profil w katalogu;
+niezgodny istniejący hash lub konflikt rewizji kończy admission. Efektywna
+kopia sceny użyta do materializacji nie zmienia po cichu sceny autora.
+
+Helper migracyjny nie czyta hosta, nie zapisuje storage i nie tworzy UUID GPU.
+Starszy ordinal nie staje się tożsamością fizycznego urządzenia: pojedynczy
+ordinal 0 oznacza wyłącznie dopuszczalny indeks po ograniczeniu widoczności
+przez przydział hosta. Żądanie wielu GPU lub innego ordinału jest odrzucane.
+`MeshBuild` i `FdmGridRefresh` pozostają przygotowaniem modelu, bez Solve;
+Run/Relax wymagają osobnego accepted admission oraz publikacji do istniejącego
+live read model. Sam helper migracyjny nie potwierdza wykonania tych etapów.
+
 ## Granica aktualnej implementacji UI
 
 Durable accepted task i bieżący journal komend live Workspace są odrębnymi

@@ -74,7 +74,26 @@ kontrole Python, parsery, formatowanie i przegląd nie zastępują wykonania GPU
 Managed runtime i browser proof są osobnymi bramkami. Udane wykonanie bounded
 workload nie jest ogólną kwalifikacją fizyki FEM GPU.
 
-Znane blokery przed rozpoczęciem tego rozszerzenia: bootstrap CI ma jeden
+Historyczne blokery przed rozpoczęciem tego rozszerzenia: bootstrap CI ma jeden
 nieudany test batcha (1101 PASS), a tymczasowy runner nie zawierał Buildx.
 Diagnoza i naprawa tych przyczyn są częścią tego samego zadania. Cudzy dirty
 master, procesy, cache i wyniki pozostają zachowane.
+
+
+## Stan bramek i dowody odbioru
+
+| Obszar | Obecny dowód | Wymagane do odbioru |
+| --- | --- | --- |
+| Konfigurator nowego hosta | PR #174 scalony do mastera `f9179caf`; skrypt istnieje lokalnie i na GitHub | Pełny bootstrap toolchaina/runnera na czystym hoście pozostaje osobnym etapem |
+| Compose i storage | Wersjonowane definicje, kontrole parsera, host ledger i regresje interpretowane | Realny start dwóch usług, odczyt plików Windows i restart |
+| Toolchain FEM/CUDA | Naprawione CPU SLEPc/PETSC_ARCH, prywatna etykieta wykonawcy CI | Udana managed FEM qualification na poprawionym obrazie |
+| Zgodność źródeł i CI | `eigensolve-method-contracts` i `dispersion-artifact-consumers` przeszły dla `ea2a659` | Wymagane kontrole dla końcowego commita |
+| Polecenia live CPU/auto/GPU | Powstaje adapter accepted i czysta migracja legacy z pełnymi zasobami | Kompilacja w CI, admission, lifecycle i wynik w tym samym Workspace |
+| FEM przygotowanie / wait_for_solve | Trwa podłączenie kanonicznego przygotowania live | Widoczny aktywny model i siatka przed Compute, bez solver side effect |
+| Uruchomienie skryptu | Kontrakt i ograniczenia opisane powyżej | Ścieżka Windows, aktywacja, auto-run oraz wariant wait_for_solve |
+| Frontend HMR i WebGL | Definicja source bind i przygotowane procedury dowodowe | Zapis pliku w Windows widoczny w przeglądarce, zachowanie stanu i żywy WebGL |
+| FDM/FEM GPU | Source admission, worker i receipt nie stanowią runtime proof | Formularz → fizyczny GPU → terminalny wynik, native receipt i zwolnienie lease |
+| Integracja | Pozostałe zmiany w PR #175, master zachowany z cudzym dirty submodule | Review/CI, merge, lokalny fast-forward i qualified cleanup |
+
+Aktualizując tę tabelę, zachowujemy rozdział konfiguracji, kompilacji, runtime,
+przeglądarki i walidacji naukowej. Stan jednej bramki nie promuje pozostałych.
