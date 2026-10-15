@@ -332,6 +332,8 @@ export interface ExplorerNode {
   normalization?: string;
   observationFrame?: ObservationFrameResource;
   badge?: string;
+  /** Plain-language reason derived from the owning resource or validator. */
+  statusReason?: string;
   children?: ExplorerNode[];
   contextCommands?: CommandId[];
   contextCommandInputs?: Partial<Record<CommandId, unknown>>;

@@ -231,6 +231,29 @@ try {
     await capture("explorer-physics-reporting-explicit-overrides.png");
   });
 
+  await step("antenna-readiness-reasons-and-source-spectrum", async () => {
+    await page.getByRole("button", { name: "Antenna readiness and source spectrum", exact: true }).click();
+    const row = suffix => tree.locator(`[data-node-id="model:object:antenna:antenna:${suffix}"]`);
+    const description = row => row.locator(".fm-explorer-tree-row__description").innerText();
+    const configured = row("port:configured-port"), broken = row("port:broken-port"), solve = row("solution:blocked-solve");
+    await configured.waitFor();
+    assert.equal(await configured.getAttribute("aria-describedby"), await configured.locator(".fm-explorer-tree-row__description").getAttribute("id"));
+    assert.equal(await configured.getAttribute("data-status"), "ready");
+    assert.match(await description(configured), /qualification still require execution/);
+    assert.match(await configured.getAttribute("title"), /qualification still require execution/);
+    assert.match(await configured.locator(".fm-explorer-tree-row__badge").innerText(), /configured/);
+    assert.equal(await broken.getAttribute("data-status"), "warning");
+    assert.equal(await broken.locator(".fm-explorer-tree-row__status").innerText(), "Needs review");
+    assert.match(await description(broken), /missing-transport.*missing or ambiguous/);
+    assert.equal(await solve.getAttribute("data-status"), "validation-blocked");
+    assert.equal(await solve.locator(".fm-explorer-tree-row__status").innerText(), "Blocked");
+    assert.match(await solve.getAttribute("title"), /missing current transport/);
+    assert.equal(await row("spectrum:source-k").locator(".fm-explorer-tree-row__label").innerText(), "Source spectrum source-k");
+    assert.match(await description(row("spectrum:source-k")), /not a measured magnetization response/);
+    await solve.scrollIntoViewIfNeeded();
+    await capture("explorer-antenna-readiness.png");
+  });
+
   assert.ok(report.api_requests.some((request) => request.path === "/v2/sessions"));
   report.session_status_get_count = report.api_requests.filter(
     (request) => request.path === "/v2/sessions/current/status",

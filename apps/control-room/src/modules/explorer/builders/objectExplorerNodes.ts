@@ -9,7 +9,7 @@ import type {
   FrozenSpinsDefinition,
   FrozenSpinsSelectionExpression,
 } from "@/kernel/api/apiTypes";
-import { antennaPortStatus } from "@/shared/domain/physics/antennaPortValidation";
+import { antennaPortValidationMessages } from "@/shared/domain/physics/antennaPortValidation";
 import { antennaStageValidationMessages } from "@/shared/domain/physics/antennaStageValidation";
 
 import { buildPhysicsGraphObjectNode } from "./physicsGraphTree";
@@ -294,13 +294,16 @@ function antennaCompositionNodes(
       contextCommands: ["workspace.focus-selection"],
     },
     ...portModes.map((mode) => {
-      const status = antennaPortStatus(mode, scene ?? null);
+      const validationMessages = antennaPortValidationMessages(mode, scene ?? null);
+      const status = validationMessages.length === 0 ? "ready" as const : "warning" as const;
       return {
         id: `${antennaParentId}:port:${encodeURIComponent(mode.id)}`,
         kind: "object.antenna.port" as const,
         label: `Port ${mode.id}`,
         parentId: antennaParentId,
-        badge: `${mode.branches.length} branches${status === "ready" ? " · authoring" : " · invalid"}`,
+        badge: `${mode.branches.length} branches · ${validationMessages.length ? `${validationMessages.length} issues` : "configured"}`,
+        statusReason: validationMessages.length ? validationMessages.join("; ")
+          : "Port inputs are configured. Current balance and field-source qualification still require execution.",
         icon: "activity" as const,
         objectId,
         objectRole: "antenna" as const,
@@ -311,19 +314,22 @@ function antennaCompositionNodes(
       };
     }),
     ...solveStages.map((stage) => {
-      const invalid = antennaStageValidationMessages(stage, scene ?? null).length > 0;
+      const validationMessages = antennaStageValidationMessages(stage, scene ?? null);
+      const invalid = validationMessages.length > 0;
       return {
         id: `${antennaParentId}:solution:${encodeURIComponent(stage.id)}`,
         kind: "object.antenna.solution" as const,
         label: `Field solve ${stage.id}`,
         parentId: antennaParentId,
-        badge: `${stage.outputs.length} outputs · ${invalid ? "invalid" : "configured"}`,
+        badge: `${stage.outputs.length} outputs · ${invalid ? `${validationMessages.length} issues` : "configured"}`,
+        statusReason: invalid ? validationMessages.join("; ")
+          : "Field-solve inputs are configured. This node does not establish that a result has been computed.",
         icon: "mesh" as const,
         objectId,
         objectRole: "antenna" as const,
         antennaResourceId: stage.id,
         antennaResourceKind: "solution" as const,
-        status: "warning" as const,
+        status: invalid ? "validation-blocked" as const : "warning" as const,
         contextCommands: ["study.add-antenna-field-solve-stage", "workspace.focus-selection"],
         contextCommandInputs: {
           "study.add-antenna-field-solve-stage": { objectId, stageId: stage.id },
@@ -361,9 +367,10 @@ function antennaCompositionNodes(
     ...spectra.map((request) => ({
       id: `${antennaParentId}:spectrum:${encodeURIComponent(request.id)}`,
       kind: "object.antenna.spectrum" as const,
-      label: `Spectrum ${request.id}`,
+      label: `Source spectrum ${request.id}`,
       parentId: antennaParentId,
       badge: `${request.transform} · configured`,
+      statusReason: "Spatial spectrum of the antenna source field. This is not a measured magnetization response or evidence of an excited mode.",
       icon: "activity" as const,
       objectId,
       objectRole: "antenna" as const,

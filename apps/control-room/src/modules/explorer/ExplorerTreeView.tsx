@@ -23,6 +23,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -57,7 +58,7 @@ import {
 } from "@/shared/ui/ContextMenu";
 
 import { selectExplorerNode } from "./explorerSelection";
-import { explorerStatusClassName } from "./explorerStatusClass";
+import { explorerStatusClassName, explorerStatusLabel } from "./explorerStatusClass";
 import { cn } from "@/shared/utils/className";
 import {
   setExplorerKeyboardRow,
@@ -312,6 +313,7 @@ const ExplorerTreeRow = memo(function ExplorerTreeRow({
   rowIds: readonly string[];
   tabId: ExplorerTabId;
 }) {
+  const statusReasonId = useId();
   const [selectedCommandId, setSelectedCommandId] = useState<string | null>(null);
   const commandDetail = useCommandDetailResource(selectedCommandId);
   const commandItems = contextCommandItemsForNode({
@@ -371,8 +373,9 @@ const ExplorerTreeRow = memo(function ExplorerTreeRow({
   }
 
   const tooltipParts: string[] = [node.label];
-  if (node.status && node.status !== "ready") tooltipParts.push(`[${node.status}]`);
+  if (node.status && node.status !== "ready") tooltipParts.push(`[${explorerStatusLabel(node.status)}]`);
   if (node.badge) tooltipParts.push(`— ${node.badge}`);
+  if (node.statusReason) tooltipParts.push(node.statusReason);
 
   const row = (
     <div
@@ -388,6 +391,7 @@ const ExplorerTreeRow = memo(function ExplorerTreeRow({
       role="treeitem"
       tabIndex={focusable ? 0 : -1}
       title={tooltipParts.length > 1 ? tooltipParts.join(" ") : undefined}
+      aria-describedby={node.statusReason ? statusReasonId : undefined}
       aria-expanded={hasChildren ? expanded : undefined}
       aria-selected={selectable ? active : undefined}
       onClick={selectable ? handleSelect : undefined}
@@ -443,9 +447,10 @@ const ExplorerTreeRow = memo(function ExplorerTreeRow({
       >
         {node.icon ? ICONS[node.icon] : ICONS.file}
       </span>
+      {node.statusReason ? <span id={statusReasonId} className="fm-explorer-tree-row__description sr-only">{node.statusReason}</span> : null}
       <span className="fm-explorer-tree-row__label">{node.label}</span>
       {node.status && node.status !== "ready" ? (
-        <span className="fm-explorer-tree-row__status">{node.status}</span>
+        <span className="fm-explorer-tree-row__status">{explorerStatusLabel(node.status)}</span>
       ) : null}
       {node.activeAnalysisField ? (
         <span className="fm-explorer-tree-row__active-field">active</span>
