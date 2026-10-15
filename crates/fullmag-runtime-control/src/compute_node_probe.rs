@@ -4,13 +4,15 @@
 //! A sample is observation only; it never creates a scheduler offer.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use chrono::{DateTime, Utc};
 use fullmag_session::{
     compute_node_snapshot::{
@@ -19,7 +21,8 @@ use fullmag_session::{
         EnforcementStatus, GpuDeviceSnapshot, GpuPartition, MemorySnapshot, Observation, Reported,
         SampleSource, UnavailableReason,
     },
-    host_resource_ledger::{HostInventoryOwnerDescriptor, HostResourceLedger},
+    host_resource_ledger::{HostInventoryOwnerDescriptor, HostResourceLedger, HostRuntimeReadiness},
+    repository_path::read_bounded_regular_file,
 };
 
 const NVIDIA_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -31,7 +34,14 @@ pub fn sample_compute_node(
     ledger: &HostResourceLedger,
     previous: Option<&ComputeNodeSnapshot>,
 ) -> Result<ComputeNodeSnapshot> {
-    sample_compute_node_inner(ledger, None, previous)
+    sample_compute_node_inner(
+        ledger.node_id(),
+        ledger.owner_id(),
+        ledger.policy().owner_epoch,
+        None,
+        previous,
+        None,
+    )
 }
 
 /// Collect one host observation pinned to the active shared-host inventory owner.
@@ -40,13 +50,237 @@ pub fn sample_compute_node_for_owner(
     owner: &HostInventoryOwnerDescriptor,
     previous: Option<&ComputeNodeSnapshot>,
 ) -> Result<ComputeNodeSnapshot> {
-    sample_compute_node_inner(ledger, Some(owner), previous)
+    sample_compute_node_inner(
+        ledger.node_id(),
+        ledger.owner_id(),
+        ledger.policy().owner_epoch,
+        Some(owner),
+        previous,
+        None,
+    )
+}
+
+/// Collect a host observation with the typed native FEM/GPU ABI result. The
+/// readiness result is injected rather than inferred from `nvidia-smi`.
+pub fn sample_compute_node_for_owner_with_readiness(
+    ledger: &HostResourceLedger,
+    owner: &HostInventoryOwnerDescriptor,
+    previous: Option<&ComputeNodeSnapshot>,
+    readiness: &HostRuntimeReadiness,
+) -> Result<ComputeNodeSnapshot> {
+    sample_compute_node_inner(
+        ledger.node_id(),
+        ledger.owner_id(),
+        ledger.policy().owner_epoch,
+        Some(owner),
+        previous,
+        Some(readiness),
+    )
+}
+
+/// Probe a host before a ledger exists, using identities supplied by the
+/// canonical host-profile initializer.
+pub fn sample_compute_node_for_identity(
+    node_id: String,
+    runtime_owner_id: String,
+    owner_epoch: u64,
+    host_owner: &HostInventoryOwnerDescriptor,
+    previous: Option<&ComputeNodeSnapshot>,
+    readiness: &HostRuntimeReadiness,
+) -> Result<ComputeNodeSnapshot> {
+    sample_compute_node_inner(
+        node_id,
+        runtime_owner_id,
+        owner_epoch,
+        Some(host_owner),
+        previous,
+        Some(readiness),
+    )
+}
+
+/// Read and validate the bounded typed native FEM/GPU readiness ABI result.
+/// Query the in-process native FEM/GPU ABI and the current physical GPU
+/// inventory.  This is the production initializer path; a JSON readiness file
+/// remains available only for typed fixture tests and is never its authority.
+pub fn probe_native_fem_gpu_readiness() -> Result<HostRuntimeReadiness> {
+    let build = fullmag_build_info::identity();
+    let source_snapshot_sha256 = build.source_snapshot_sha256.to_owned();
+    let status = fullmag_runner::native_fem_gpu_status();
+    if !fullmag_runner::is_native_fem_gpu_available() || !status.available {
+        bail!(
+            "native FEM/GPU ABI is unavailable: {}",
+            status.reason_gpu
+        );
+    }
+    if !status.cpu_available {
+        bail!("native FEM/GPU ABI has no usable FEM CPU lane");
+    }
+    if status.visible_cuda_device_count != 1 || status.resolved_gpu_index < 0 {
+        bail!(
+            "native FEM/GPU ABI must expose exactly one resolved CUDA device (visible={}, resolved={})",
+            status.visible_cuda_device_count,
+            status.resolved_gpu_index
+        );
+    }
+    if status.memory_total_bytes == 0 || status.memory_free_bytes > status.memory_total_bytes {
+        bail!("native FEM/GPU ABI returned invalid CUDA memory bounds");
+    }
+
+    let devices = discover_nvidia_gpus()?;
+    if devices.len() != usize::try_from(status.visible_cuda_device_count)? {
+        bail!(
+            "native CUDA visibility ({}) differs from the current NVIDIA inventory ({})",
+            status.visible_cuda_device_count,
+            devices.len()
+        );
+    }
+    let mut gpu_runtime_compatibility = BTreeMap::new();
+    for device in devices {
+        if !matches!(
+            &device.partition,
+            Reported::Available {
+                value: GpuPartition::FullDevice
+            }
+        ) {
+            bail!(
+                "native FEM/GPU readiness requires a full physical GPU partition for {}",
+                device.uuid
+            );
+        }
+        if !matches!(
+            &device.vram_bytes,
+            Reported::Available { value } if *value > 0
+        ) {
+            bail!(
+                "native FEM/GPU readiness requires positive VRAM for {}",
+                device.uuid
+            );
+        }
+        gpu_runtime_compatibility.insert(device.uuid, vec!["fem.gpu".to_owned()]);
+    }
+    if gpu_runtime_compatibility.is_empty() {
+        bail!("native FEM/GPU ABI exposed no physical GPU UUID");
+    }
+    let cuda_uuids = crate::cuda_device_identity::discover_cuda_device_uuids()?;
+    let cuda_uuid_set = cuda_uuids.into_iter().collect::<BTreeSet<_>>();
+    let nvidia_uuid_set = gpu_runtime_compatibility
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if cuda_uuid_set != nvidia_uuid_set {
+        bail!(
+            "CUDA Driver API UUIDs differ from the current NVIDIA inventory"
+        );
+    }
+
+    // Keep this identity independent of transient free memory and probe
+    // diagnostics. It binds persisted readiness to this build and the ABI
+    // selection/enforcement result that was actually observed.
+    let runtime_identity_sha256 = native_fem_gpu_runtime_identity(
+        build.git_commit,
+        &source_snapshot_sha256,
+        &status,
+    );
+    let readiness = HostRuntimeReadiness {
+        schema_version: fullmag_session::host_resource_ledger::HOST_RUNTIME_READINESS_SCHEMA_V1
+            .to_owned(),
+        status: "ready".to_owned(),
+        source_kind: "native_fem_gpu_abi".to_owned(),
+        source_snapshot_sha256,
+        runtime_identity_sha256,
+        capabilities: vec!["fem.gpu".to_owned()],
+        gpu_runtime_compatibility,
+        gpu_visibility: EnforcementStatus::Supported,
+        inventory_sha256: None,
+        capabilities_sha256: None,
+    };
+    readiness.validate_probe()?;
+    Ok(readiness)
+}
+
+/// Revalidate the persisted native ABI identity against this exact binary.
+/// The caller-provided readiness record cannot manufacture a current GPU
+/// capability or silently survive a source/runtime image change.
+pub fn validate_native_fem_gpu_readiness(readiness: &HostRuntimeReadiness) -> Result<()> {
+    readiness.validate_probe()?;
+    let build = fullmag_build_info::identity();
+    if readiness.source_snapshot_sha256 != build.source_snapshot_sha256 {
+        bail!(
+            "native readiness source identity differs from the running build"
+        );
+    }
+    let status = fullmag_runner::native_fem_gpu_status();
+    if !fullmag_runner::is_native_fem_gpu_available()
+        || !status.available
+        || !status.cpu_available
+    {
+        bail!(
+            "native FEM/GPU ABI is no longer available: {}",
+            status.reason_gpu
+        );
+    }
+    if status.visible_cuda_device_count != 1 || status.resolved_gpu_index < 0 {
+        bail!(
+            "native FEM/GPU ABI no longer exposes exactly one resolved CUDA device"
+        );
+    }
+    let expected_runtime_identity = native_fem_gpu_runtime_identity(
+        build.git_commit,
+        build.source_snapshot_sha256,
+        &status,
+    );
+    if readiness.runtime_identity_sha256 != expected_runtime_identity {
+        bail!(
+            "native readiness runtime identity differs from the running FEM/GPU ABI"
+        );
+    }
+    Ok(())
+}
+
+fn native_fem_gpu_runtime_identity(
+    git_commit: &str,
+    source_snapshot_sha256: &str,
+    status: &fullmag_runner::NativeFemGpuStatus,
+) -> String {
+    let runtime_material = format!(
+        "fullmag.native-fem-gpu.v1\ngit={git_commit}\nsource={source_snapshot_sha256}\navailable={}\ncpu_available={}\nvisible={}\nrequested={}\nresolved={}\n",
+        status.available,
+        status.cpu_available,
+        status.visible_cuda_device_count,
+        status.requested_gpu_index,
+        status.resolved_gpu_index,
+    );
+    format!("{:x}", Sha256::digest(runtime_material.as_bytes()))
+}
+
+pub fn load_native_fem_gpu_readiness(path: &Path) -> Result<HostRuntimeReadiness> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("native FEM/GPU readiness path must be absolute without parent traversal");
+    }
+    let parent = path.parent().context("native readiness path has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("native readiness file name is not UTF-8")?;
+    let bytes = read_bounded_regular_file(parent, name, 256 * 1024)
+        .context("read native FEM/GPU readiness ABI result")?;
+    let readiness: HostRuntimeReadiness = serde_json::from_slice(&bytes)
+        .context("parse native FEM/GPU readiness ABI result")?;
+    readiness.validate_probe()?;
+    Ok(readiness)
 }
 
 fn sample_compute_node_inner(
-    ledger: &HostResourceLedger,
+    node_id: String,
+    runtime_owner_id: String,
+    owner_epoch: u64,
     host_owner: Option<&HostInventoryOwnerDescriptor>,
     previous: Option<&ComputeNodeSnapshot>,
+    readiness: Option<&HostRuntimeReadiness>,
 ) -> Result<ComputeNodeSnapshot> {
     let cpu_topology_probe = observe_cpu_topology();
     let allowed_cpu_ids_probe = match &cpu_topology_probe {
@@ -105,12 +339,59 @@ fn sample_compute_node_inner(
             },
         ),
     };
-    let gpu_inventory = match gpus {
-        Ok(devices) => Reported::Available { value: devices },
-        Err(error) => Reported::Unavailable {
-            reason: gpu_failure_reason(&error),
-            last_known: previous.and_then(|snapshot| snapshot.gpus.known_value().cloned()),
-        },
+    let (gpu_inventory, capabilities, gpu_visibility) = match (gpus, readiness) {
+        (Ok(mut devices), Some(readiness)) => {
+            readiness.validate_probe()?;
+            let observed = devices
+                .iter()
+                .map(|device| device.uuid.clone())
+                .collect::<BTreeSet<_>>();
+            let expected = readiness
+                .gpu_runtime_compatibility
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if observed != expected {
+                bail!("native FEM/GPU readiness UUIDs differ from current NVIDIA inventory");
+            }
+            for device in &mut devices {
+                let compatibility = readiness
+                    .gpu_runtime_compatibility
+                    .get(&device.uuid)
+                    .context("native readiness is missing a current GPU UUID")?
+                    .clone();
+                device.runtime_compatibility = Reported::Available {
+                    value: compatibility,
+                };
+            }
+            (
+                Reported::Available { value: devices },
+                Reported::Available {
+                    value: readiness.capabilities.clone(),
+                },
+                readiness.gpu_visibility,
+            )
+        }
+        (Ok(devices), None) => (
+            Reported::Available { value: devices },
+            Reported::Unavailable {
+                reason: UnavailableReason::NotReported,
+                last_known: previous.and_then(|snapshot| snapshot.capabilities.known_value().cloned()),
+            },
+            EnforcementStatus::Unavailable,
+        ),
+        (Err(error), Some(_)) => return Err(error).context("native FEM/GPU readiness requires a current NVIDIA inventory"),
+        (Err(error), None) => (
+            Reported::Unavailable {
+                reason: gpu_failure_reason(&error),
+                last_known: previous.and_then(|snapshot| snapshot.gpus.known_value().cloned()),
+            },
+            Reported::Unavailable {
+                reason: UnavailableReason::NotReported,
+                last_known: previous.and_then(|snapshot| snapshot.capabilities.known_value().cloned()),
+            },
+            EnforcementStatus::Unavailable,
+        ),
     };
 
     let topology = reported_probe(
@@ -129,18 +410,14 @@ fn sample_compute_node_inner(
             .and_then(|snapshot| snapshot.cpu.os_constraints.quota.known_value())
             .cloned(),
     );
-    let capabilities = Reported::Unavailable {
-        reason: UnavailableReason::NotReported,
-        last_known: previous.and_then(|snapshot| snapshot.capabilities.known_value().cloned()),
-    };
     let sample_error = (cpu_failed && memory_failed && gpu_failed)
         .then_some(UnavailableReason::ProbeFailed);
 
     let data = ComputeNodeSnapshotData {
-        node_id: ledger.node_id(),
+        node_id,
         boot_id,
-        runtime_owner_id: ledger.owner_id(),
-        owner_epoch: ledger.policy().owner_epoch,
+        runtime_owner_id,
+        owner_epoch,
         host_owner_id: host_owner.map(|owner| owner.host_owner_id.clone()),
         host_owner_epoch: host_owner.map(|owner| owner.host_owner_epoch),
         inventory_revision: 1,
@@ -167,9 +444,9 @@ fn sample_compute_node_inner(
             cpu_affinity: EnforcementStatus::Unavailable,
             cpu_quota: EnforcementStatus::Advisory,
             memory_cap: EnforcementStatus::Advisory,
-            // Inventory visibility is not proof that a worker launch enforces
-            // a UUID mask; E3 must publish that evidence separately.
-            gpu_visibility: EnforcementStatus::Unavailable,
+            // Native readiness is the only accepted proof for v2 GPU
+            // visibility; v1 keeps the historical explicit-unavailable state.
+            gpu_visibility,
             storage_quota: EnforcementStatus::Advisory,
         },
     };

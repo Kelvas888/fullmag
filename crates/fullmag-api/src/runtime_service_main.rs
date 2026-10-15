@@ -1,18 +1,29 @@
 //! Native accepted-run service. UI is an attaching client, never its owner.
 use anyhow::{bail, Context, Result};
 use fullmag_session::{
-    host_resource_ledger::{HostInventoryOwner, HostResourceLedger},
+    compute_node_snapshot::Reported,
+    host_resource_ledger::{
+        HostInventoryOwner, HostInventoryOwnerDescriptor, HostResourceLedger,
+        HostResourceLedgerPolicy, HostRuntimeReadiness,
+        HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2,
+    },
     repository_path::{checked_path, validate_store_id},
     runtime_service::{
         RuntimeServiceChild, RuntimeServiceConfig as ServiceConfig, RuntimeServiceOwner,
-        RuntimeServiceState,
+        RuntimeServiceState, RUNTIME_SERVICE_CONFIG_SCHEMA_V2,
     },
-    FmsPreparationResourceOffer, FmsPreparationResourcePool, FmsSchedulerResourceOffer,
-    FmsSchedulerResourcePool, SessionStore, FMS_PREPARATION_RESOURCE_POOL_SCHEMA,
-    FMS_SCHEDULER_RESOURCE_POOL_SCHEMA,
+    runtime_service_host::{
+        RuntimeServiceHostExecution, RuntimeServiceHostPlacement,
+        RUNTIME_SERVICE_HOST_EXECUTION_SCHEMA_V1,
+    },
+    FmsPreparationResourceOffer, FmsPreparationResourcePool, FmsResourceBudget, FmsResourceKind,
+    FmsSchedulerResourceOffer, FmsSchedulerResourcePool, SessionStore,
+    FMS_PREPARATION_RESOURCE_POOL_SCHEMA, FMS_SCHEDULER_RESOURCE_POOL_SCHEMA,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -48,11 +59,26 @@ async fn publish_compute_node_sample(
             return Ok(None);
         };
         let previous = ledger.read_compute_node_snapshot()?;
-        let snapshot = fullmag_runtime_control::compute_node_probe::sample_compute_node_for_owner(
-            &ledger,
-            inventory_owner.descriptor(),
-            previous.as_ref(),
-        )?;
+        let snapshot = if ledger.policy().schema_version
+            == fullmag_session::host_resource_ledger::HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2
+        {
+            let readiness = ledger.read_runtime_readiness()?;
+            fullmag_runtime_control::compute_node_probe::validate_native_fem_gpu_readiness(
+                &readiness,
+            )?;
+            fullmag_runtime_control::compute_node_probe::sample_compute_node_for_owner_with_readiness(
+                &ledger,
+                inventory_owner.descriptor(),
+                previous.as_ref(),
+                &readiness,
+            )?
+        } else {
+            fullmag_runtime_control::compute_node_probe::sample_compute_node_for_owner(
+                &ledger,
+                inventory_owner.descriptor(),
+                previous.as_ref(),
+            )?
+        };
         ledger.publish_compute_node_snapshot_with_owner(&inventory_owner, &snapshot)?;
         Ok(Some(inventory_owner))
     })
@@ -664,6 +690,377 @@ fn pools_match(
     })
 }
 
+#[derive(Debug, Serialize)]
+struct DockerHostIdentity {
+    host_id: String,
+    node_id: String,
+    runtime_owner_id: String,
+    boot_id: String,
+    inventory_sha256: String,
+    capabilities_sha256: String,
+    allowed_cpu_ids: BTreeSet<u32>,
+    gpu_uuids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DockerHostProfile {
+    schema_version: String,
+    configuration: ServiceConfig,
+    host_identity: DockerHostIdentity,
+    readiness: HostRuntimeReadiness,
+}
+
+struct DockerHostInitArgs {
+    ledger_root: PathBuf,
+    store_root: PathBuf,
+    readiness_path: Option<PathBuf>,
+    host_id: String,
+}
+
+fn explicit_absolute_path(value: OsString, field: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || path.file_name().is_none()
+    {
+        bail!("{field} must be an absolute path without parent traversal");
+    }
+    Ok(path)
+}
+
+fn parse_docker_host_init_args(
+    mut args: impl Iterator<Item = OsString>,
+) -> Result<DockerHostInitArgs> {
+    let mut ledger_root = None;
+    let mut store_root = None;
+    let mut readiness_path = None;
+    let mut host_id = None;
+    while let Some(flag) = args.next() {
+        let name = flag.to_str().context("initializer argument is not UTF-8")?;
+        let value = args.next().with_context(|| format!("missing value for {name}"))?;
+        match name {
+            "--ledger-root" => ledger_root = Some(explicit_absolute_path(value, name)?),
+            "--store-root" => store_root = Some(explicit_absolute_path(value, name)?),
+            "--native-fem-gpu-readiness" => {
+                readiness_path = Some(explicit_absolute_path(value, name)?)
+            }
+            "--host-id" => {
+                let value = value.to_str().context("host ID is not UTF-8")?.to_owned();
+                if host_id.replace(value).is_some() {
+                    bail!("initializer received duplicate --host-id");
+                }
+            }
+            _ => bail!("unsupported Docker host initializer argument `{name}`"),
+        }
+    }
+    let host_id = host_id
+        .or_else(|| std::env::var("FULLMAG_DOCKER_HOST_ID").ok())
+        .unwrap_or_else(|| "docker-all-host".into());
+    let readiness_path = readiness_path
+        .or_else(|| std::env::var_os("FULLMAG_NATIVE_FEM_GPU_READINESS").map(PathBuf::from))
+        .map(|path| explicit_absolute_path(path.into_os_string(), "native readiness"))
+        .transpose()?;
+    let args = DockerHostInitArgs {
+        ledger_root: ledger_root.context("missing --ledger-root")?,
+        store_root: store_root.context("missing --store-root")?,
+        readiness_path,
+        host_id,
+    };
+    if args.ledger_root == args.store_root
+        || args.readiness_path.as_ref().is_some_and(|path| path == &args.ledger_root)
+    {
+        bail!("Docker host initializer paths must identify distinct namespaces");
+    }
+    Ok(args)
+}
+
+fn required_reported<T>(value: &Reported<T>, label: &str) -> Result<&T> {
+    match value {
+        Reported::Available { value } => Ok(value),
+        Reported::Unavailable { .. } => bail!("Docker host profile requires current {label}"),
+    }
+}
+
+fn required_observation<T>(value: &fullmag_session::compute_node_snapshot::Observation<T>, label: &str) -> Result<&T> {
+    match value {
+        fullmag_session::compute_node_snapshot::Observation::Available { value } => Ok(value),
+        fullmag_session::compute_node_snapshot::Observation::Unavailable { .. } => {
+            bail!("Docker host profile requires current {label}")
+        }
+    }
+}
+
+fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
+    let args = parse_docker_host_init_args(args)?;
+    let fixture_readiness = std::env::var("FULLMAG_DOCKER_HOST_READINESS_FIXTURE")
+        .ok()
+        .is_some_and(|value| value == "1");
+    if args.readiness_path.is_some() && !fixture_readiness {
+        bail!(
+            "--native-fem-gpu-readiness is restricted to FULLMAG_DOCKER_HOST_READINESS_FIXTURE=1"
+        );
+    }
+    let readiness = match (fixture_readiness, args.readiness_path.as_deref()) {
+        (true, Some(path)) => {
+            fullmag_runtime_control::compute_node_probe::load_native_fem_gpu_readiness(path)?
+        }
+        (true, None) => bail!(
+            "FULLMAG_DOCKER_HOST_READINESS_FIXTURE=1 requires --native-fem-gpu-readiness"
+        ),
+        (false, None) => {
+            fullmag_runtime_control::compute_node_probe::probe_native_fem_gpu_readiness()?
+        }
+        (false, Some(_)) => unreachable!("fixture readiness path was rejected above"),
+    };
+    let node_id = HostResourceLedger::node_id_for_host_id(&args.host_id);
+    let runtime_owner_id = HostResourceLedger::owner_id_for_host_id(&args.host_id);
+    let provisional_owner = HostInventoryOwnerDescriptor {
+        host_owner_id: runtime_owner_id.clone(),
+        host_owner_epoch: 1,
+    };
+    let provisional = fullmag_runtime_control::compute_node_probe::sample_compute_node_for_identity(
+        node_id.clone(),
+        runtime_owner_id.clone(),
+        1,
+        &provisional_owner,
+        None,
+        &readiness,
+    )?;
+    let allowed_cpu_ids = required_reported(
+        &provisional.cpu.os_constraints.allowed_logical_cpu_ids,
+        "OS-allowed CPU IDs",
+    )?
+    .clone();
+    let cpu_millis = *required_observation(
+        &provisional.cpu.effective_capacity_millis,
+        "effective CPU capacity",
+    )?;
+    let memory_bytes = *required_observation(
+        &provisional.memory.total_bytes,
+        "total host memory",
+    )?;
+    if cpu_millis == 0 || memory_bytes == 0 {
+        bail!("Docker host profile requires positive CPU and memory capacity");
+    }
+    let cpu_millis = cpu_millis.min(4000);
+    let cpu_millis = if allowed_cpu_ids.is_empty() {
+        cpu_millis
+    } else {
+        cpu_millis.min(
+            u64::try_from(allowed_cpu_ids.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1000),
+        )
+    };
+    let memory_bytes = memory_bytes.min(7 * 1024 * 1024 * 1024);
+    if cpu_millis == 0 || memory_bytes == 0 {
+        bail!("Docker host profile has no bounded CPU or memory capacity");
+    }
+    let devices = required_reported(&provisional.gpus, "NVIDIA GPU inventory")?;
+    let mut gpu_vram_bytes_by_uuid = BTreeMap::new();
+    for device in devices {
+        let partition = required_reported(&device.partition, "GPU partition")?;
+        if *partition != fullmag_session::compute_node_snapshot::GpuPartition::FullDevice {
+            bail!("Docker host profile requires full physical GPU partitions");
+        }
+        let vram = *required_reported(&device.vram_bytes, "GPU VRAM")?;
+        if vram == 0 {
+            bail!("Docker host profile requires positive GPU VRAM");
+        }
+        if gpu_vram_bytes_by_uuid
+            .insert(device.uuid.clone(), vram)
+            .is_some()
+        {
+            bail!("Docker host profile received duplicate GPU UUIDs");
+        }
+    }
+    if gpu_vram_bytes_by_uuid.len() != 1 {
+        bail!("Docker host profile currently requires exactly one full physical NVIDIA GPU");
+    }
+    let storage_bytes = std::env::var("FULLMAG_DOCKER_STORAGE_BYTES")
+        .ok()
+        .map(|value| value.parse::<u64>().context("parse FULLMAG_DOCKER_STORAGE_BYTES"))
+        .transpose()?
+        .unwrap_or(7 * 1024 * 1024 * 1024);
+    if storage_bytes == 0 {
+        bail!("Docker host profile storage capacity must be positive");
+    }
+    let policy = HostResourceLedgerPolicy {
+        schema_version: HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2.into(),
+        host_id: args.host_id.clone(),
+        topology_sha256: provisional.inventory_sha256.clone(),
+        revision: 1,
+        owner_epoch: 1,
+        total_budget: FmsResourceBudget {
+            cpu_millis,
+            memory_bytes,
+            gpu_memory_bytes: 0,
+            storage_bytes,
+        },
+        gpu_vram_bytes_by_uuid,
+        allowed_cpu_ids,
+    };
+    policy.validate()?;
+    let mut persisted_readiness = readiness.clone();
+    let capabilities_sha256 = provisional.computed_capabilities_sha256()?;
+    if persisted_readiness
+        .inventory_sha256
+        .as_ref()
+        .is_some_and(|value| value != &provisional.inventory_sha256)
+        || persisted_readiness
+            .capabilities_sha256
+            .as_ref()
+            .is_some_and(|value| value != &capabilities_sha256)
+    {
+        bail!("native readiness digests differ from the current host probe");
+    }
+    persisted_readiness.inventory_sha256 = Some(provisional.inventory_sha256.clone());
+    persisted_readiness.capabilities_sha256 = Some(capabilities_sha256.clone());
+    let ledger = HostResourceLedger::initialize_with_readiness(
+        &args.ledger_root,
+        policy.clone(),
+        persisted_readiness.clone(),
+    )?;
+    let snapshot = if let Some(active_owner) = ledger.active_inventory_owner()? {
+        let snapshot = ledger
+            .read_compute_node_snapshot()?
+            .context("active Docker host inventory owner has no published snapshot")?;
+        if ledger.active_inventory_owner()?.as_ref() != Some(&active_owner) {
+            bail!("Docker host inventory owner changed while reading its snapshot");
+        }
+        snapshot
+    } else {
+        let inventory_owner = ledger
+            .try_acquire_inventory_owner()?
+            .context("Docker host inventory owner became busy during initialization")?;
+        let snapshot = fullmag_runtime_control::compute_node_probe::sample_compute_node_for_owner_with_readiness(
+            &ledger,
+            inventory_owner.descriptor(),
+            None,
+            &persisted_readiness,
+        )?;
+        if snapshot.inventory_sha256 != policy.topology_sha256
+            || snapshot.computed_capabilities_sha256()? != capabilities_sha256
+        {
+            bail!("current host probe changed while initializing the Docker ledger");
+        }
+        ledger.publish_compute_node_snapshot_with_owner(&inventory_owner, &snapshot)?;
+        snapshot
+    };
+    let cpu_offer_id = "docker-all.compute.cpu".to_owned();
+    let prep_offer_id = "docker-all.preparation.cpu".to_owned();
+    let offer_cpu_millis = cpu_millis.min(1000).max(1);
+    let offer_memory = memory_bytes.min(1024 * 1024 * 1024).max(1);
+    let cpu_offer_cpu_millis = cpu_millis.min(3000).max(1);
+    let cpu_offer_memory = memory_bytes.min(6 * 1024 * 1024 * 1024).max(1);
+    let offer_budget = |gpu_memory_bytes| FmsResourceBudget {
+        cpu_millis: offer_cpu_millis,
+        memory_bytes: offer_memory,
+        gpu_memory_bytes,
+        storage_bytes,
+    };
+    let mut compute_resources = vec![FmsSchedulerResourceOffer {
+        resource_id: cpu_offer_id.clone(),
+        kind: FmsResourceKind::Cpu,
+        budget: FmsResourceBudget {
+            cpu_millis: cpu_offer_cpu_millis,
+            memory_bytes: cpu_offer_memory,
+            gpu_memory_bytes: 0,
+            storage_bytes,
+        },
+    }];
+    let mut compute_placements = BTreeMap::from([(
+        cpu_offer_id,
+        RuntimeServiceHostPlacement {
+            // The host policy records the admissible CPU topology. The
+            // aggregate offer does not claim process-affinity enforcement.
+            cpu_ids: BTreeSet::new(),
+            gpu_uuid: None,
+        },
+    )]);
+    for (uuid, vram) in &policy.gpu_vram_bytes_by_uuid {
+        let resource_id = format!("docker-all.compute.gpu-{}", uuid.trim_start_matches("GPU-"));
+        validate_store_id(&resource_id)?;
+        compute_resources.push(FmsSchedulerResourceOffer {
+            resource_id: resource_id.clone(),
+            kind: FmsResourceKind::Gpu,
+            budget: offer_budget(*vram),
+        });
+        compute_placements.insert(
+            resource_id,
+            RuntimeServiceHostPlacement {
+                cpu_ids: BTreeSet::new(),
+                gpu_uuid: Some(uuid.clone()),
+            },
+        );
+    }
+    let preparation_resources = vec![FmsPreparationResourceOffer {
+        resource_id: prep_offer_id.clone(),
+        budget: offer_budget(0),
+    }];
+    let host_execution = RuntimeServiceHostExecution {
+        schema_version: RUNTIME_SERVICE_HOST_EXECUTION_SCHEMA_V1.into(),
+        ledger_root: args.ledger_root.clone(),
+        policy,
+        compute_max_concurrency: 1,
+        preparation_max_concurrency: 1,
+        compute_placements,
+        preparation_cpu_ids: BTreeMap::from([(prep_offer_id.clone(), BTreeSet::new())]),
+    };
+    let configuration = ServiceConfig {
+        schema_version: RUNTIME_SERVICE_CONFIG_SCHEMA_V2.into(),
+        store_root: args.store_root.clone(),
+        target_id: "docker-all".into(),
+        compute_pool_id: "docker-all.compute".into(),
+        preparation_pool_id: "docker-all.preparation".into(),
+        compute_resources,
+        preparation_resources,
+        worker_timeout_seconds: 31_536_000,
+        preparation_timeout_seconds: 31_536_000,
+        heartbeat_interval_milliseconds: 1000,
+        startup_timeout_seconds: 60,
+        drain_timeout_seconds: 60,
+        host_execution: Some(host_execution),
+    };
+    configuration.validate()?;
+    let gpu_uuids = snapshot
+        .gpus
+        .known_value()
+        .context("published host snapshot has no GPU list")?
+        .iter()
+        .map(|device| device.uuid.clone())
+        .collect::<Vec<_>>();
+    let profile = DockerHostProfile {
+        schema_version: "fullmag.docker-host-profile.v1".into(),
+        configuration,
+        host_identity: DockerHostIdentity {
+            host_id: args.host_id,
+            node_id,
+            runtime_owner_id,
+            boot_id: snapshot.boot_id,
+            inventory_sha256: snapshot.inventory_sha256,
+            capabilities_sha256,
+            allowed_cpu_ids: snapshot
+                .cpu
+                .os_constraints
+                .allowed_logical_cpu_ids
+                .known_value()
+                .cloned()
+                .context("published host snapshot has no allowed CPU IDs")?,
+            gpu_uuids,
+        },
+        readiness: persisted_readiness,
+    };
+    let bytes = serde_json::to_vec(&profile)?;
+    if bytes.len() > 256 * 1024 {
+        bail!("Docker host profile exceeds its bounded output size");
+    }
+    println!("{}", String::from_utf8(bytes).context("Docker host profile is not UTF-8")?);
+    Ok(())
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("native runtime service failed: {error:#}");
@@ -672,17 +1069,23 @@ fn main() {
 }
 fn run() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref() != Some(std::ffi::OsStr::new("--config")) {
-        bail!("usage: fullmag-runtime-service --config <absolute-json-path>");
+    match args.next() {
+        Some(value) if value == OsString::from("--initialize-docker-host") => {
+            initialize_docker_host(args)
+        }
+        Some(value) if value == OsString::from("--config") => {
+            let path = PathBuf::from(args.next().context("missing --config path")?);
+            if !path.is_absolute() || args.next().is_some() {
+                bail!("service requires exactly one absolute config path");
+            }
+            run_service(path)
+        }
+        _ => bail!("usage: fullmag-runtime-service --config <absolute-json-path> | --initialize-docker-host --ledger-root <absolute-path> --store-root <absolute-path> [--native-fem-gpu-readiness <absolute-json-path>] [--host-id <stable-id>]")
     }
-    let path = PathBuf::from(args.next().context("missing --config path")?);
-    if !path.is_absolute() || args.next().is_some() {
-        bail!("service requires exactly one absolute config path");
-    }
+}
+
+fn run_service(path: PathBuf) -> Result<()> {
     let config = ServiceConfig::read(&path)?;
-    if config.host_execution.is_some() {
-        bail!("v2 host execution requires completed recovery, owner lifecycle, topology and enforcement gates; service startup remains unavailable");
-    }
     let startup_deadline = Instant::now() + Duration::from_secs(config.startup_timeout_seconds);
     let store = fullmag_runtime_control::retry_store_writer_busy(|| {
         SessionStore::open_existing(&config.store_root)
@@ -740,6 +1143,8 @@ fn run() -> Result<()> {
         let mut children = Schedulers::default();
         let mut generations = None;
         let mut inventory_owner = None;
+        let mut host_admission = None;
+        let mut admission_unknown = false;
         let mut unknown_publishers = Vec::new();
         let mut drain_confirmation = None;
         let work: Result<()> = async {
@@ -767,7 +1172,7 @@ fn run() -> Result<()> {
             )
             .await?;
             if let Some(ledger) = host_ledger.as_ref() {
-                let admission = fullmag_runtime_control::host_runtime::HostRuntimeAdmission::open(
+                host_admission = fullmag_runtime_control::host_runtime::HostRuntimeAdmission::open(
                     &config,
                 )?
                 .context("host execution requires an initialized runtime admission context")?;
@@ -778,7 +1183,11 @@ fn run() -> Result<()> {
                     )
                     .await
                     .context("initial compute-node sample is required before releasing host schedulers")?;
-                    if admission.has_current_compute_snapshot()? {
+                    if host_admission
+                        .as_ref()
+                        .context("host admission context disappeared during startup")?
+                        .has_current_compute_snapshot()?
+                    {
                         break;
                     }
                     if Instant::now() >= startup_deadline {
@@ -819,7 +1228,18 @@ fn run() -> Result<()> {
                         {
                             Ok(owner) => inventory_owner = owner,
                             Err(error) => {
-                                tracing::warn!(error = %error, "compute-node sample publication failed");
+                                admission_unknown = true;
+                                owner.publish(
+                                    RuntimeServiceState::Unknown,
+                                    generations.map(|p| p.0),
+                                    generations.map(|p| p.1),
+                                    children
+                                        .describe()
+                                        .into_iter()
+                                        .chain(unknown_publishers.iter().cloned())
+                                        .collect(),
+                                )?;
+                                bail!("compute-node sample publication failed; host admission is unknown: {error:#}");
                             }
                         }
                     }
@@ -833,6 +1253,31 @@ fn run() -> Result<()> {
                     }
                 }
                 if heartbeat.elapsed() >= Duration::from_secs(1) {
+                    if let Some(admission) = host_admission.as_ref() {
+                        match admission.has_current_compute_snapshot() {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                admission_unknown = true;
+                                owner.publish(
+                                    RuntimeServiceState::Unknown,
+                                    generations.map(|p| p.0),
+                                    generations.map(|p| p.1),
+                                    children.describe(),
+                                )?;
+                                bail!("host compute-node freshness or topology admission was lost");
+                            }
+                            Err(error) => {
+                                admission_unknown = true;
+                                owner.publish(
+                                    RuntimeServiceState::Unknown,
+                                    generations.map(|p| p.0),
+                                    generations.map(|p| p.1),
+                                    children.describe(),
+                                )?;
+                                bail!("host compute-node admission observation failed: {error:#}");
+                            }
+                        }
+                    }
                     let compute = store
                         .read_scheduler_resource_pool(&config.compute_pool_id)?
                         .context("service compute pool disappeared")?;
@@ -926,7 +1371,8 @@ fn run() -> Result<()> {
         owner.publish(
             if clean {
                 RuntimeServiceState::Drained
-            } else if !generations_known
+            } else if admission_unknown
+                || !generations_known
                 || !unknown_publishers.is_empty()
                 || children.0.iter().any(|c| c.status.is_none())
             {

@@ -30,6 +30,8 @@ PREPARATION_POOL_ID = "docker-all.preparation"
 WINDOWS_STORAGE_PROFILE = "windows-folder-v1"
 STORAGE_SCHEMA = "fullmag_storage_v1"
 RUNTIME_CONFIG_SCHEMA = "runtime_service_config.v1"
+HOST_PROFILE_SCHEMA = "fullmag.docker-host-profile.v1"
+HOST_LEDGER_ROOT = Path("/host-ledger/ledger")
 CONFIG_RELATIVE = Path(".fullmag/runtime-service/docker-all.json")
 MAX_JSON_BYTES = 256 * 1024
 MAX_HTTP_BYTES = 4 * 1024 * 1024
@@ -371,9 +373,115 @@ def build_configuration(
     }
 
 
+def _validate_host_profile(value: Mapping[str, Any], paths: RuntimePaths) -> dict[str, Any]:
+    """Check the fixed Docker boundary around the canonical Rust host factory."""
+    if value.get("schema_version") != HOST_PROFILE_SCHEMA:
+        _fail("native Docker host profile has an unsupported schema")
+    config = value.get("configuration")
+    if not isinstance(config, dict) or config.get("schema_version") != "runtime_service_config.v2":
+        _fail("native Docker host profile requires runtime service configuration v2")
+    fixed = {
+        "store_root": str(paths.store),
+        "target_id": TARGET_ID,
+        "compute_pool_id": COMPUTE_POOL_ID,
+        "preparation_pool_id": PREPARATION_POOL_ID,
+    }
+    if any(config.get(key) != expected for key, expected in fixed.items()):
+        _fail("native Docker host profile changed the accepted-store or pool boundary")
+    host = config.get("host_execution")
+    if not isinstance(host, dict) or host.get("ledger_root") != str(HOST_LEDGER_ROOT):
+        _fail("native Docker host profile must bind the managed /host-ledger/ledger")
+    if host.get("schema_version") != "runtime_service_host_execution.v1":
+        _fail("native Docker host execution schema is unsupported")
+    if host.get("compute_max_concurrency") != 1 or host.get("preparation_max_concurrency") != 1:
+        _fail("Docker host profile requires one compute and one preparation worker")
+    policy = host.get("policy")
+    if not isinstance(policy, dict) or policy.get("schema_version") != "host_resource_ledger_policy.v2":
+        _fail("Docker GPU requires the native readiness/topology-bound host policy v2")
+    compute = config.get("compute_resources")
+    preparation = config.get("preparation_resources")
+    if (not isinstance(compute, list) or len(compute) != 2
+            or not all(isinstance(offer, dict) for offer in compute)
+            or {offer.get("kind") for offer in compute} != {"cpu", "gpu"}
+            or not isinstance(preparation, list) or len(preparation) != 1
+            or not isinstance(preparation[0], dict)):
+        _fail("Docker host profile requires CPU, GPU and preparation offers")
+    placements = host.get("compute_placements")
+    prep_placements = host.get("preparation_cpu_ids")
+    uuids = policy.get("gpu_vram_bytes_by_uuid")
+    if (not isinstance(placements, dict) or not isinstance(prep_placements, dict)
+            or not isinstance(uuids, dict) or len(uuids) != 1):
+        _fail("Docker host profile lacks exact physical resource placements")
+    gpu_uuid, vram = next(iter(uuids.items()))
+    if (not isinstance(gpu_uuid, str)
+            or not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", gpu_uuid)
+            or type(vram) is not int or vram <= 0):
+        _fail("Docker host profile requires one full physical NVIDIA UUID and measured VRAM")
+    cpu_budgets, memory_budgets = [], []
+    for offer in [*compute, *preparation]:
+        budget = offer.get("budget")
+        if not isinstance(budget, dict) or any(
+            type(budget.get(key)) is not int or budget[key] <= 0
+            for key in ("cpu_millis", "memory_bytes", "storage_bytes")
+        ):
+            _fail("Docker host profile has an invalid execution budget")
+        gpu_bytes = budget.get("gpu_memory_bytes")
+        if type(gpu_bytes) is not int or gpu_bytes < 0:
+            _fail("Docker host profile has an invalid GPU memory budget")
+        if offer.get("kind") == "gpu":
+            placement = placements.get(offer.get("resource_id"))
+            if (not isinstance(placement, dict) or placement.get("gpu_uuid") != gpu_uuid
+                    or not 0 < gpu_bytes <= vram):
+                _fail("Docker GPU offer differs from its physical device allocation")
+        elif gpu_bytes != 0:
+            _fail("Docker CPU/preparation offer cannot reserve GPU memory")
+        cpu_budgets.append(budget["cpu_millis"])
+        memory_budgets.append(budget["memory_bytes"])
+    # Compute offers are mutually exclusive; preparation has its own slot.
+    if max(cpu_budgets[:2]) + cpu_budgets[2] > 4000:
+        _fail("Docker host offers exceed the backend CPU quota")
+    if max(memory_budgets[:2]) + memory_budgets[2] > 7 * GIB:
+        _fail("Docker host offers exceed memory minus API headroom")
+    return config
+
+
+def initialize_host_configuration(paths: RuntimePaths) -> dict[str, Any]:
+    """Discover native devices and initialize the exact shared Rust ledger."""
+    executable = paths.package / "bin" / "fullmag-runtime-service"
+    _assert_no_links(executable, "runtime service executable")
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        _fail("native runtime service executable is unavailable")
+    try:
+        result = subprocess.run(
+            [str(executable), "--initialize-docker-host", "--ledger-root", str(HOST_LEDGER_ROOT),
+             "--store-root", str(paths.store)],
+            cwd=str(paths.state), env=process_environment(paths, service=True),
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeServiceUnknown(
+            "native host initialization timed out; retain the ledger and do not retry automatically"
+        ) from error
+    if result.returncode:
+        detail = (result.stderr or result.stdout).decode("utf-8", errors="replace")[-4096:]
+        _fail("native Docker host profile initialization failed: " + detail)
+    if len(result.stdout) > MAX_JSON_BYTES:
+        _fail("native Docker host profile exceeds its bounded size")
+    try:
+        value = json.loads(result.stdout, object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeServiceError("native Docker host profile is invalid JSON") from error
+    if not isinstance(value, dict):
+        _fail("native Docker host profile must contain an object")
+    return _validate_host_profile(value, paths)
+
+
 def ensure_configuration(paths: RuntimePaths | None = None) -> dict[str, Any]:
     paths = paths or canonical_paths()
-    expected = build_configuration(paths)
+    host_mode = os.environ.get("FULLMAG_DOCKER_HOST_EXECUTION", "0")
+    if host_mode not in {"0", "1"}:
+        _fail("FULLMAG_DOCKER_HOST_EXECUTION must be 0 or 1")
+    expected = initialize_host_configuration(paths) if host_mode == "1" else build_configuration(paths)
     try:
         current = _read_json(paths.config, "runtime service configuration")
     except FileNotFoundError:
@@ -687,12 +795,19 @@ def start(
     cli: Path | None = None,
     timeout: float = 90.0,
     expected_binding: str,
+    configuration: Mapping[str, Any] | None = None,
 ) -> RuntimeHandle:
     """Attach or launch the service after API/store admission."""
 
     paths = paths or canonical_paths()
     prepare_storage(paths)
-    configuration = ensure_configuration(paths)
+    if configuration is None:
+        configuration = ensure_configuration(paths)
+    else:
+        persisted = _read_json(paths.config, "runtime service configuration")
+        if persisted != configuration:
+            _fail("runtime service configuration changed after native host initialization")
+        configuration = persisted
     port = api_port or int(os.environ.get("FULLMAG_API_PORT", "8081"))
     if not 1 <= port <= 65535:
         _fail("API port is outside the valid range")

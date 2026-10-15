@@ -41,8 +41,8 @@ def serve():
     for number in (signal.SIGTERM, signal.SIGINT):
         signal.signal(number, lambda *_: stopping.set())
     paths = service.prepare_storage()
-    service.ensure_configuration(paths)
     bootstrap = service.initialize_accepted_store(paths)
+    configuration = service.ensure_configuration(paths)
     api = subprocess.Popen(["/opt/fullmag/package/bin/fullmag-api"],
                            env=service.process_environment(paths))
     handle = None
@@ -54,7 +54,8 @@ def serve():
     last_full_api_probe = 0.0
     try:
         service._atomic_json(receipt_path, receipt, "process tree receipt")
-        handle = service.start(paths, api_port=8081, expected_binding=bootstrap["binding"])
+        handle = service.start(paths, api_port=8081, expected_binding=bootstrap["binding"],
+                               configuration=configuration)
         last_full_api_probe = time.monotonic()
         receipt.update(state="ready", service_owner=handle.owner)
         service._atomic_json(receipt_path, receipt, "process tree receipt")

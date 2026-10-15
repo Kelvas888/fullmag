@@ -81,7 +81,7 @@ def validate_workspace_environment(config):
 
 def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs=None,
                  inputs_path=None, package=None, provenance=None, toolchain_image=None,
-                 project="fullmag-config-check", template=None):
+                 project="fullmag-config-check", template=None, host_ledger=None):
     """Resolve the versioned Compose definition; do not generate service topology."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("A full immutable image ID is required")
@@ -106,9 +106,15 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
                            FULLMAG_BACKEND_PACKAGE=str(package),
                            FULLMAG_PACKAGE_PROVENANCE=str(provenance),
                            FULLMAG_DEVELOPMENT_INPUTS=str(inputs_path))
+    definitions = ["-f", str(template)]
+    if host_ledger is not None:
+        environment.update(host_ledger["environment"])
+        definitions.extend(["-f", host_ledger["compose_overlay"]])
     configured = json.loads(docker("compose", "--project-name", project,
-                                   "--project-directory", str(repo), "-f", str(template),
+                                   "--project-directory", str(repo), *definitions,
                                    "config", "--format", "json", environment=environment))
+    if host_ledger is not None:
+        configured.get("services", {}).pop("host-ledger-maintenance", None)
     expected = {"backend", "frontend"} if inputs is not None else {"backend"}
     if set(configured.get("services", {})) != expected:
         raise ValueError("Versioned Compose has unexpected services")
@@ -338,6 +344,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
                "frontend_mode": frontend, "container_http_port": 8080 if frontend == "dev" else 8081}
     storage.atomic_json(root / "receipt.json", receipt)
     inputs = None
+    host_ledger = None
     inputs_path = root / "development-inputs.json"
     try:
         if frontend not in {"static", "dev"}:
@@ -362,10 +369,15 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
                                 repo=repo, inputs=inputs, inputs_path=inputs_path.resolve(),
                                 package=assembly.get("package_root"),
                                 provenance=assembly_receipt, project=project,
-                                toolchain_image=assembly.get("base_image"), template=root / "compose.source.yaml")
+                                toolchain_image=assembly.get("base_image"), template=root / "compose.source.yaml",
+                                host_ledger=host_ledger)
         if os.name != "nt":
             raise ValueError("This Windows-folder launcher requires native Windows host attestation")
         from windows_folder_host import attest, local_volume, publish_evidence, read_owned_regular
+        from docker_host_ledger import prepare as prepare_host_ledger
+        host_ledger = prepare_host_ledger(layout, repo, image, root, docker)
+        receipt["host_ledger"] = host_ledger
+        storage.atomic_json(root / "receipt.json", receipt)
         certificate = attest(state, assembly, docker("info", "--format", "{{.ID}}"), assembly["binary_hashes"])
         publish_evidence(host_certificate, certificate)
         shutil.copyfile(repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml"),
@@ -412,6 +424,8 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
         container = docker(*args, "ps", "--quiet", "backend")
         receipt["container_id"] = container
         actual = json.loads(docker("inspect", container))[0]
+        from docker_host_ledger import validate_container as validate_host_ledger
+        receipt["host_ledger_attestation"] = validate_host_ledger(actual, host_ledger, docker)
         bindings = {str(receipt["container_http_port"]) + "/tcp":
                     [{"HostIp": "127.0.0.1", "HostPort": str(port)}]}
         if inputs is not None:

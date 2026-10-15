@@ -154,6 +154,65 @@ class DockerRuntimeContract(unittest.TestCase):
             with self.assertRaises(service.RuntimeServiceError):
                 service.build_configuration(service.RuntimePaths(), env)
 
+    def host_profile_fixture(self, service):
+        import copy
+        config = service.build_configuration(service.RuntimePaths(), {})
+        config["schema_version"] = "runtime_service_config.v2"
+        cpu = config["compute_resources"][0]
+        gpu = copy.deepcopy(cpu)
+        gpu.update(resource_id="docker-all.compute.gpu", kind="gpu")
+        gpu["budget"]["gpu_memory_bytes"] = 2 * service.GIB
+        config["compute_resources"].append(gpu)
+        gpu_uuid = "GPU-01234567-89ab-cdef-0123-456789abcdef"
+        config["host_execution"] = {
+            "schema_version": "runtime_service_host_execution.v1",
+            "ledger_root": "/host-ledger/ledger",
+            "compute_max_concurrency": 1,
+            "preparation_max_concurrency": 1,
+            "policy": {"schema_version": "host_resource_ledger_policy.v2",
+                       "gpu_vram_bytes_by_uuid": {gpu_uuid: 4 * service.GIB}},
+            "compute_placements": {
+                cpu["resource_id"]: {"cpu_ids": [0, 1, 2], "gpu_uuid": None},
+                gpu["resource_id"]: {"cpu_ids": [0, 1, 2], "gpu_uuid": gpu_uuid},
+            },
+            "preparation_cpu_ids": {"docker-all.preparation.cpu": [3]},
+        }
+        return {"schema_version": service.HOST_PROFILE_SCHEMA, "configuration": config}
+
+    def test_native_host_profile_rejects_wrong_store_device_policy_and_overcommit(self):
+        import copy
+        service = self.load_service()
+        value = self.host_profile_fixture(service)
+        self.assertEqual(service._validate_host_profile(value, service.RuntimePaths()),
+                         value["configuration"])
+        mutations = [
+            lambda c: c.update(store_root="/tmp/session-store"),
+            lambda c: c.update(schema_version="runtime_service_config.v1"),
+            lambda c: c["host_execution"].update(ledger_root="/state/shared-ledger"),
+            lambda c: c["host_execution"].update(compute_max_concurrency=2),
+            lambda c: c["host_execution"]["policy"].update(schema_version="host_resource_ledger_policy.v1"),
+            lambda c: c["compute_resources"][1]["budget"].update(gpu_memory_bytes=0),
+            lambda c: c["compute_resources"][0]["budget"].update(gpu_memory_bytes=1),
+            lambda c: c["compute_resources"][1]["budget"].update(cpu_millis=4000),
+            lambda c: c["compute_resources"][1]["budget"].update(memory_bytes=8 * service.GIB),
+            lambda c: c["host_execution"]["compute_placements"]["docker-all.compute.gpu"].update(gpu_uuid="GPU-other"),
+        ]
+        for mutate in mutations:
+            changed = copy.deepcopy(value)
+            mutate(changed["configuration"])
+            with self.subTest(profile=changed), self.assertRaises(service.RuntimeServiceError):
+                service._validate_host_profile(changed, service.RuntimePaths())
+
+    def test_requested_host_mode_never_falls_back_to_cpu_profile(self):
+        service = self.load_service()
+        with patch.dict(os.environ, {"FULLMAG_DOCKER_HOST_EXECUTION": "1"}), \
+                patch.object(service, "initialize_host_configuration",
+                             side_effect=service.RuntimeServiceError("GPU unavailable")), \
+                patch.object(service, "build_configuration") as legacy:
+            with self.assertRaisesRegex(service.RuntimeServiceError, "GPU unavailable"):
+                service.ensure_configuration(service.RuntimePaths())
+            legacy.assert_not_called()
+
     def test_service_shutdown_rejects_changed_owner_without_drain(self):
         service = self.load_service()
         owner = {"owner_token": "old", "children": [{"role": "compute", "pid": 3},
