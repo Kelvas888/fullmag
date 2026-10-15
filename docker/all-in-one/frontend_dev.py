@@ -125,10 +125,10 @@ MAX_SEED_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_SEED_FILES = 4096
 MAX_RELATIVE_BYTES = 512
 INSTALL_TIMEOUT_SECONDS = 30 * 60
-# A Corepack shim may resolve the packageManager declared by the seeded root
-# manifest on its first invocation. Keep that initialization bounded without
-# making a healthy cold container fail during ordinary registry latency.
-TOOL_TIMEOUT_SECONDS = 30
+# The pinned pnpm executable can pay cold filesystem and initialization I/O on
+# its first invocation. Keep that probe bounded without making a healthy cold
+# container fail during ordinary startup latency.
+TOOL_TIMEOUT_SECONDS = 120
 STOP_TIMEOUT_SECONDS = 15
 PROCESS_IDENTITY_FIELDS = (
     "pid_namespace",
@@ -852,6 +852,36 @@ def _validate_live_directories(inputs: DevelopmentInputs) -> None:
             _fail(f"read-only live directory is not a directory: {name}")
 
 
+def _write_tool_probe_log(log_stream: Any | None, message: str) -> None:
+    """Append one bounded probe event without changing probe admission."""
+
+    if log_stream is None:
+        return
+    try:
+        log_stream.write(f"{message}\n".encode("utf-8"))
+        log_stream.flush()
+    except (AttributeError, OSError, TypeError):
+        # A probe failure must retain its exact tool error even if the
+        # diagnostic stream is unavailable or has just been closed.
+        return
+
+
+def _emit_tool_probe_event(log_stream: Any | None, event: str, **fields: Any) -> None:
+    """Emit one probe event to both the durable log and supervisor stdout."""
+
+    def log_value(key: str, value: Any) -> str:
+        if key in {"output", "version", "expected"}:
+            return repr(value)
+        return str(value)
+
+    values = " ".join(f"{key}={log_value(key, value)}" for key, value in fields.items())
+    message = f"frontend tool probe {event}"
+    if values:
+        message = f"{message} {values}"
+    _write_tool_probe_log(log_stream, message)
+    _write_lifecycle_log(f"tool_probe_{event}", **fields)
+
+
 def _tool_version(
     executable: Path,
     expected: str,
@@ -859,9 +889,32 @@ def _tool_version(
     *,
     cwd: Path | None = None,
     environment: Mapping[str, str] | None = None,
+    log_stream: Any | None = None,
 ) -> str:
+    started = time.monotonic()
+    _emit_tool_probe_event(
+        log_stream,
+        "start",
+        name=name,
+        executable=executable,
+        budget_seconds=TOOL_TIMEOUT_SECONDS,
+    )
+
+    def emit_result(status: str, **fields: Any) -> None:
+        _emit_tool_probe_event(
+            log_stream,
+            "result",
+            name=name,
+            status=status,
+            elapsed_seconds=f"{time.monotonic() - started:.3f}",
+            budget_seconds=TOOL_TIMEOUT_SECONDS,
+            **fields,
+        )
+
     if not executable.is_file() or not os.access(executable, os.X_OK):
-        _fail(f"pinned {name} executable is missing or not executable: {executable}")
+        error = f"pinned {name} executable is missing or not executable: {executable}"
+        emit_result("missing", error=error)
+        _fail(error)
     try:
         result = subprocess.run(
             [str(executable), "--version"],
@@ -875,12 +928,23 @@ def _tool_version(
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
+        status = "timeout" if isinstance(error, subprocess.TimeoutExpired) else "error"
+        emit_result(status, error=str(error))
+        if isinstance(error, subprocess.TimeoutExpired):
+            elapsed = time.monotonic() - started
+            _fail(
+                f"pinned {name} version probe timed out after {elapsed:.3f}s "
+                f"(budget {TOOL_TIMEOUT_SECONDS}s)"
+            )
         _fail(f"pinned {name} version probe failed: {error}")
     version = result.stdout.strip()
     if result.returncode != 0 or not version:
+        emit_result("error", output=version, returncode=result.returncode)
         _fail(f"pinned {name} version probe returned {version!r}")
     if version != expected:
+        emit_result("mismatch", version=version, expected=expected)
         _fail(f"pinned {name} version is {version!r}; expected {expected!r}")
+    emit_result("ok", version=version)
     return version
 
 
@@ -970,6 +1034,21 @@ def _log_stream() -> Any:
         _fail(f"cannot open frontend development log: {error}")
 
 
+def _write_lifecycle_log(event: str, **fields: Any) -> None:
+    """Write a short current-phase marker to the container supervisor stdout."""
+
+    values = " ".join(f"{key}={value}" for key, value in fields.items())
+    line = f"[fullmag-frontend] lifecycle event={event}"
+    if values:
+        line = f"{line} {values}"
+    try:
+        print(line, flush=True)
+    except (BrokenPipeError, OSError):
+        # Supervisor diagnostics must not change the process ownership or
+        # fail-closed startup decisions when stdout is being closed.
+        return
+
+
 def _run_pnpm_install(
     inputs: DevelopmentInputs,
     stopping_event: Any,
@@ -989,6 +1068,12 @@ def _run_pnpm_install(
     ]
     receipt.update(state="installing", dependency_install="initial-frozen-pnpm", command=command)
     _publish_receipt(receipt)
+    install_started = time.monotonic()
+    _write_lifecycle_log(
+        "frozen_install_start",
+        budget_seconds=INSTALL_TIMEOUT_SECONDS,
+        log_path=LOG_PATH,
+    )
     try:
         process = subprocess.Popen(
             command,
@@ -1000,6 +1085,13 @@ def _run_pnpm_install(
             start_new_session=True,
         )
     except OSError as error:
+        _write_lifecycle_log(
+            "frozen_install_result",
+            status="failed",
+            elapsed_seconds=f"{time.monotonic() - install_started:.3f}",
+            budget_seconds=INSTALL_TIMEOUT_SECONDS,
+            error=str(error),
+        )
         _fail(f"frozen pnpm install could not start: {error}")
     try:
         install_handle = _new_handle(process, inputs, stopping_event, "pnpm-install", log_stream)
@@ -1011,12 +1103,26 @@ def _run_pnpm_install(
                 _publish_receipt(receipt)
             except Exception:
                 pass
+        _write_lifecycle_log(
+            "frozen_install_result",
+            status="failed",
+            elapsed_seconds=f"{time.monotonic() - install_started:.3f}",
+            budget_seconds=INSTALL_TIMEOUT_SECONDS,
+            error=str(error),
+        )
         raise
     _record_handle_identity(receipt, install_handle)
     try:
         _publish_receipt(receipt)
     except Exception as error:
         _attach_frontend_handle(error, install_handle)
+        _write_lifecycle_log(
+            "frozen_install_result",
+            status="failed",
+            elapsed_seconds=f"{time.monotonic() - install_started:.3f}",
+            budget_seconds=INSTALL_TIMEOUT_SECONDS,
+            error=str(error),
+        )
         raise
     deadline = time.monotonic() + INSTALL_TIMEOUT_SECONDS
     try:
@@ -1044,6 +1150,13 @@ def _run_pnpm_install(
                     )
                     _attach_frontend_handle(error, install_handle)
                     raise error
+                _write_lifecycle_log(
+                    "frozen_install_result",
+                    status="ready",
+                    elapsed_seconds=f"{time.monotonic() - install_started:.3f}",
+                    budget_seconds=INSTALL_TIMEOUT_SECONDS,
+                    log_path=LOG_PATH,
+                )
                 return
             if getattr(stopping_event, "is_set", lambda: False)():
                 try:
@@ -1066,6 +1179,13 @@ def _run_pnpm_install(
             time.sleep(0.1)
     except Exception as error:
         _attach_frontend_handle(error, install_handle)
+        _write_lifecycle_log(
+            "frozen_install_result",
+            status="failed",
+            elapsed_seconds=f"{time.monotonic() - install_started:.3f}",
+            budget_seconds=INSTALL_TIMEOUT_SECONDS,
+            error=str(error),
+        )
         raise
 
 
@@ -1232,6 +1352,13 @@ def _start_next(
         str(INTERNAL_PORT),
     ]
     environment = _safe_environment(inputs)
+    next_started = time.monotonic()
+    _write_lifecycle_log(
+        "next_start",
+        url=f"http://localhost:{inputs.host_port}",
+        internal_port=INTERNAL_PORT,
+        log_path=LOG_PATH,
+    )
     try:
         process = subprocess.Popen(
             command,
@@ -1243,6 +1370,13 @@ def _start_next(
             start_new_session=True,
         )
     except OSError as error:
+        _write_lifecycle_log(
+            "next_result",
+            status="failed",
+            elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
+            url=f"http://localhost:{inputs.host_port}",
+            error=str(error),
+        )
         _fail(f"Next development process could not start: {error}")
     try:
         handle = _new_handle(process, inputs, stopping_event, "next", log_stream)
@@ -1254,6 +1388,13 @@ def _start_next(
                 _publish_receipt(receipt)
             except Exception:
                 pass
+        _write_lifecycle_log(
+            "next_result",
+            status="failed",
+            elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
+            url=f"http://localhost:{inputs.host_port}",
+            error=str(error),
+        )
         raise
     receipt.update(
         state="running",
@@ -1267,6 +1408,14 @@ def _start_next(
     except Exception as error:
         _attach_frontend_handle(error, handle)
         raise
+    _write_lifecycle_log(
+        "next_result",
+        status="started",
+        readiness="owned_process",
+        elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
+        url=f"http://localhost:{inputs.host_port}",
+        log_path=LOG_PATH,
+    )
     return handle
 
 
@@ -1295,6 +1444,14 @@ def start(stopping_event: Any) -> FrontendHandle:
         generated_files_gate=("next-started-v1" if allow_generated else "seed-only-v1"),
     )
     _publish_receipt(receipt)
+    _write_lifecycle_log(
+        "frontend_start",
+        tool_probe_budget_seconds=TOOL_TIMEOUT_SECONDS,
+        install_budget_seconds=INSTALL_TIMEOUT_SECONDS,
+        log_path=LOG_PATH,
+        url=f"http://localhost:{inputs.host_port}",
+    )
+    log_stream = _log_stream()
     try:
         node_version = _tool_version(
             NODE_BINARY,
@@ -1302,6 +1459,7 @@ def start(stopping_event: Any) -> FrontendHandle:
             "Node",
             cwd=inputs.workspace_root,
             environment=tool_environment,
+            log_stream=log_stream,
         )
         receipt["tool_versions"] = {"node": node_version}
         _publish_receipt(receipt)
@@ -1312,6 +1470,7 @@ def start(stopping_event: Any) -> FrontendHandle:
             "pnpm",
             cwd=inputs.workspace_root,
             environment=tool_environment,
+            log_stream=log_stream,
         )
         receipt["tool_versions"]["pnpm"] = pnpm_version
         _publish_receipt(receipt)
@@ -1326,8 +1485,11 @@ def start(stopping_event: Any) -> FrontendHandle:
             _publish_receipt(receipt)
         except Exception:
             pass
+        try:
+            log_stream.close()
+        except OSError:
+            pass
         raise
-    log_stream = _log_stream()
     handle: FrontendHandle | None = None
     try:
         if previous is None or previous.get("dependency_install") != "ready":

@@ -7,13 +7,15 @@ owned-child shutdown receipt semantics.
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib.util
 import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from types import ModuleType
 from unittest import TestCase, main, skipIf
@@ -139,6 +141,77 @@ class FrontendDevContractTests(TestCase):
         self.assertFalse(self.module.enabled({"FULLMAG_DOCKER_FRONTEND": "DEV"}))
         self.assertFalse(self.module.enabled({}))
         self.assertEqual(self.module.EXPECTED_PNPM_VERSION, "10.8.1")
+
+    def test_tool_version_logs_bounded_success_with_elapsed_time(self):
+        log_stream = io.BytesIO()
+        stdout = io.StringIO()
+        result = subprocess.CompletedProcess(
+            args=[sys.executable, "--version"],
+            returncode=0,
+            stdout="v24.18.0\n",
+        )
+        with patch.object(self.module.subprocess, "run", return_value=result) as run:
+            with redirect_stdout(stdout):
+                version = self.module._tool_version(
+                    Path(sys.executable),
+                    "v24.18.0",
+                    "Node",
+                    log_stream=log_stream,
+                )
+        self.assertEqual(version, "v24.18.0")
+        self.assertEqual(run.call_args.kwargs["timeout"], 120)
+        log = log_stream.getvalue().decode("utf-8")
+        self.assertIn("frontend tool probe start name=Node", log)
+        self.assertRegex(log, r"status=ok elapsed_seconds=[0-9.]+ budget_seconds=120")
+        self.assertIn("lifecycle event=tool_probe_start", stdout.getvalue())
+        self.assertIn("lifecycle event=tool_probe_result", stdout.getvalue())
+
+    def test_tool_version_rejects_timeout_and_wrong_version_with_result_logs(self):
+        timeout_log = io.BytesIO()
+        timeout_stdout = io.StringIO()
+        with patch.object(
+            self.module.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(
+                [sys.executable, "--version"], self.module.TOOL_TIMEOUT_SECONDS
+            ),
+        ):
+            with redirect_stdout(timeout_stdout):
+                with self.assertRaisesRegex(
+                    self.module.FrontendDevError,
+                    r"pinned Node version probe timed out.*budget 120s",
+                ):
+                    self.module._tool_version(
+                        Path(sys.executable),
+                        "v24.18.0",
+                        "Node",
+                        log_stream=timeout_log,
+                    )
+        timeout_text = timeout_log.getvalue().decode("utf-8")
+        self.assertRegex(
+            timeout_text,
+            r"status=timeout elapsed_seconds=[0-9.]+ budget_seconds=120",
+        )
+        self.assertIn("status=timeout", timeout_stdout.getvalue())
+
+        mismatch_log = io.BytesIO()
+        mismatch = subprocess.CompletedProcess(
+            args=[sys.executable, "--version"],
+            returncode=0,
+            stdout="v24.18.1\n",
+        )
+        with patch.object(self.module.subprocess, "run", return_value=mismatch):
+            with self.assertRaisesRegex(
+                self.module.FrontendDevError,
+                r"pinned Node version is 'v24\.18\.1'; expected 'v24\.18\.0'",
+            ):
+                self.module._tool_version(
+                    Path(sys.executable),
+                    "v24.18.0",
+                    "Node",
+                    log_stream=mismatch_log,
+                )
+        self.assertIn("status=mismatch", mismatch_log.getvalue().decode("utf-8"))
 
     def test_browser_origin_and_internal_api_target_are_separate(self):
         with isolated(self.module) as (root, workspace, inputs):
