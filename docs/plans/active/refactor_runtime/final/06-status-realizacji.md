@@ -1,4 +1,11 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 15.10.2026 — [P8-53CZ](p8/53cz-nonblocking-preparation-ci-followup.md):
+CI wykryło własną regresję propsów testu, następnie 7 porażek testów/audytu
+po zmianie preparation UI. Przygotowano poprawki fixture i audytu przy
+zachowaniu nowych kontraktów; ponowny odbiór CI wymagany. Interpretowany
+audyt PASS. Build Windows nie wystartował przez zajęty slot. Zmapowano
+otwarty authoring bez RuntimeSession w P2. Pełny plan **IN PROGRESS**.
+
 Checkpoint 15.10.2026 — [P8-53CY](p8/53cy-nonblocking-preparation-workspace.md):
 usunięto globalny preparation gate/inert; status jest kompaktowy i nieblokujący.
 Scenariusz komponentów w przeglądarce: 7 kroków PASS, retained draft/focus/canvas,

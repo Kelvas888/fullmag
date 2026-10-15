@@ -13,6 +13,7 @@ import type { KernelEventMap } from "../events/eventTypes";
 import { KernelContext } from "../KernelContext";
 import { ModuleRegistry } from "../module/ModuleRegistry";
 import { DiagnosticRecorderController } from "../performance/diagnostic-recorder/DiagnosticRecorderController";
+import { RealtimeConnectionController } from "../realtime/RealtimeConnectionController";
 import { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
 import {
   resetSharedResourceRuntimeStoreForTests,
@@ -252,6 +253,7 @@ function makeKernel(
     bus,
     commands,
     diagnosticRecorder: new DiagnosticRecorderController({ config: { enabled: false } }),
+    realtimeConnection: new RealtimeConnectionController(),
     layout: new LayoutController(bus),
     modules,
     resources: new ResourceInvalidationController(bus),

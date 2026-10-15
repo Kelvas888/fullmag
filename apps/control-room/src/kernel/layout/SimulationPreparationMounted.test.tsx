@@ -55,6 +55,7 @@ import {
   TestEvent,
 } from "./simulationPreparationTestDom.test-support";
 import { footerManifest } from "../../modules/footer/manifest";
+import { SlotHost } from "./SlotHost";
 
 vi.mock("@/shared/ui/Dialog", async () => {
   const React = await import("react");
@@ -650,6 +651,10 @@ describe("mounted simulation preparation UI", () => {
     });
     await settleDialog();
 
+    await act(async () => findButton(container, "View failure details").click());
+    await act(async () => findButton(container, "View error details").click());
+    await settleDialog();
+
     const countMessage =
       "2 predicate(s) were omitted from the analysis. See the collapsed Full diagnostic report for complete details.";
     expect(dom.document.body.textContent).toContain(countMessage);
@@ -690,8 +695,11 @@ describe("mounted simulation preparation UI", () => {
       await Promise.resolve();
     });
     await settleDialog();
+    await act(async () => findButton(container, "View failure details").click());
+    await act(async () => findButton(container, "View error details").click());
+    await settleDialog();
     await act(async () => {
-      findButton(dom.document.body, "Copy full diagnostic report").click();
+      findButton(container, "Copy full diagnostic report").click();
       await Promise.resolve();
     });
 
@@ -729,6 +737,7 @@ describe("mounted simulation preparation UI", () => {
           <>
             <div data-slot-id="viewport-main">Viewport module</div>
             <SimulationStartupOverlayView state={model} />
+            <SlotHost slotId="panel-bottom" />
           </>
         </KernelContext.Provider>,
       );

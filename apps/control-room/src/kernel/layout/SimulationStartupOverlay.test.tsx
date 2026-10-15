@@ -276,10 +276,19 @@ describe("SimulationStartupOverlay", () => {
       </>,
     );
 
+    const viewportTag = html.match(
+      /<div[^>]*data-slot-id="viewport-main"[^>]*>/,
+    )?.[0];
+    const startupStatusTag = html.match(
+      /<aside[^>]*class="fm-simulation-startup"[^>]*>/,
+    )?.[0];
+
     expect(html).toContain("Preparing simulation");
     expect(html).toContain("viewport-main");
-    expect(html).not.toContain(" inert");
-    expect(html).not.toContain('aria-hidden="true"');
+    expect(viewportTag).toBeDefined();
+    expect(viewportTag).not.toMatch(/\s(?:inert|aria-hidden)(?:=|\s|>)/);
+    expect(startupStatusTag).toBeDefined();
+    expect(startupStatusTag).not.toContain("aria-modal");
   });
 
   it("selects startup overlay state instead of subscribing to full session status", () => {

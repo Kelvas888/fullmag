@@ -114,9 +114,22 @@ describe("WorkspaceDockLayout", () => {
       </KernelContext.Provider>,
     );
 
+    const workspaceBodyTag = html.match(
+      /<div[^>]*class="fm-workspace-body"[^>]*>/,
+    )?.[0];
+    const dockColumnTags = Array.from(
+      html.matchAll(/<div[^>]*class="fm-dock-column"[^>]*>/g),
+      (match) => match[0],
+    );
+
     expect(html).toContain("data-slot-id=\"viewport-main\"");
     expect(html).not.toContain(" inert");
-    expect(html).not.toContain("aria-hidden=\"true\"");
+    expect(workspaceBodyTag).toBeDefined();
+    expect(workspaceBodyTag ?? "").not.toMatch(/\s(?:inert|aria-hidden)(?:=|\s|>)/);
+    expect(dockColumnTags.length).toBeGreaterThan(0);
+    for (const tag of dockColumnTags) {
+      expect(tag).not.toMatch(/\s(?:inert|aria-hidden)(?:=|\s|>)/);
+    }
   });
 
   it("keeps diagnostics in the existing bottom panel without mounting a second slot", () => {
