@@ -51,7 +51,13 @@ function makeFixture() {
     antenna_field_solve_stages: scenario === "empty" ? [] : [{ id: "solve", source_object_id: "antenna", current_transport_id: "transport", port_mode_ids: ["port"], model: "quasistatic_conduction_biot_savart3d", oersted_realization: "direct_tetra_quadrature", conductor_mesh_policy: "inherit_source", solver_policy: "default", field_sampling_domain: { kind: "global" }, target_refs: [{ kind: "global" }], outputs: [{ id: "solution", quantity: "H_ant_basis" }] }],
     antenna_port_modes: [{ id: "port", schema_version: "antenna_port_mode.v2", source_object_id: "antenna", current_transport_id: "transport", normalization_current_a: 1, branches: [{ id: "signal", inlet_terminal_ref: "signal-in", outlet_terminal_ref: "signal-out", signed_weight: 1 }, { id: "return", inlet_terminal_ref: "return-in", outlet_terminal_ref: "return-out", signed_weight: -1 }] }],
     // Synthetic fixture-only contract; never submitted to a solver.
-    current_transports: [{ name: "transport", conservative_current_view: { stable_vertex_ids: [1], boundary_faces: [{}], identity: {}, pins: {}, closure: {} } }],
+    current_transports: [{ name: "transport", kind: "current_transport", model: "ohmic_poisson",
+      domain: [{ object_id: "antenna" }],
+      boundaries: ["signal-in", "signal-out", "return-in", "return-out"].map((id) => ({
+        id, kind: "voltage_electrode", potential_V: 0, surfaces: [{ object_id: "antenna", surface_id: id }],
+      })),
+      conservative_current_view: { stable_vertex_ids: [1], boundary_faces: [{}], identity: {}, pins: {}, closure: {} },
+    }],
   } as unknown as SceneResource;
   const ref = (layout: string, unit: string, value_count: number) => ({ layout, unit, value_count, scalar_type: "float64_le", sha256: "a".repeat(64), path: "fixture-only" });
   const solution: AntennaFieldSolutionResource = {
@@ -186,7 +192,7 @@ function makeFixture() {
     calls.push({ path: url.pathname, range: request.headers.get("range"), scope: request.headers.get("x-fullmag-session-scope"), port: url.searchParams.get("port_mode_id") });
     if (calls.length > 80 || request.method !== "GET") throw new Error("Fixture budget/method violation");
     if (url.pathname === SESSIONS_PATH) return json({ schema_version: "1.0", sessions: [{ session_id: owner.session_id, name: "Fixture", current: true, status: "idle" }] });
-    if (url.pathname === SESSION_STATUS_PATH) return json({ session: { ...owner, name: "Fixture", created_at: "fixture", workspace_root: "fixture" }, resources: { scene_revision: 1 }, capabilities: {}, lifecycle: { solver: "idle", session_resource: "active", connectivity: "connected", commandability: "writable" } });
+    if (url.pathname === SESSION_STATUS_PATH) return json({ session: { ...owner, name: "Fixture", created_at: "fixture", workspace_root: "fixture" }, run: { run_id: execution.run_id }, resources: { scene_revision: 1 }, capabilities: {}, lifecycle: { solver: "idle", session_resource: "active", connectivity: "connected", commandability: "writable" } });
     if (url.pathname === DATA_QUANTITIES_PATH && scenario === "tensor-table") return json({ schema_version: "tensor-fixture.v1", quantities: [{ id: "spin_current_tensor", tensor: { rank: 2, shape: [3, 3], layout: "flow_major", axes: ["flow", "spin"], component_labels: ["Q_xx", "Q_xy", "Q_xz", "Q_yx", "Q_yy", "Q_yz", "Q_zx", "Q_zy", "Q_zz"] } }] });
     if (url.pathname === MODEL_SCENE_PATH) return json(scene);
     if (url.pathname === SIMULATION_STAGES_EXECUTION_PATH) return json(execution);

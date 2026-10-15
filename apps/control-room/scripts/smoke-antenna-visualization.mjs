@@ -50,8 +50,10 @@ try {
   const node = tree.children.find((child) => child.id.endsWith(":visualization"));
   assert.equal(node.kind, "object.antenna.visualization");
   assert.equal(node.objectRole, "antenna");
-  assert.equal(node.children?.length ?? 0, 0);
-  checks.push("Antenna Explorer has a dedicated visualization node, no magnetic/debug/mode children; no fabricated results without solve");
+  assert.deepEqual((node.children ?? []).map(({ id, kind, label, parentId, objectId }) => ({ id, kind, label, parentId, objectId })), [{
+    id: `${node.id}:debug`, kind: "object.visualization.debug", label: "Debug", parentId: node.id, objectId: node.objectId,
+  }]);
+  checks.push("Antenna Explorer has a dedicated visualization node and observation-only Debug child with the same owner; no magnetic/mode children or fabricated results without solve");
   await shot("01-empty");
   await open("ready");
   await sharedTemplate(true);
