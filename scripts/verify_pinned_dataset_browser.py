@@ -25,6 +25,7 @@ from verify_control_room_sources import fingerprint, timestamp
 PROFILE = "windows-control-room-browser-fixture"
 BROWSER_CHANNEL = "chrome" if os.name == "nt" else None
 SCENARIOS = {
+    "antenna-regional-drive": ("smoke-antenna-regional-drive.mjs", "fullmag_antenna_regional_drive_browser_fixture_v1", "antenna-regional-drive", "FULLMAG_ANTENNA_REGIONAL"),
     "inspector-actions": ("smoke-inspector-actions.mjs", "fullmag_inspector_actions_browser_fixture_v1", "inspector-actions", "FULLMAG_INSPECTOR_ACTIONS"),
     "explorer-physics-reporting": ("smoke-explorer-physics-reporting.mjs", "fullmag_explorer_physics_reporting_browser_fixture_v1", "explorer-physics-reporting", "FULLMAG_EXPLORER_PHYSICS_REPORTING"),
     "object-material-editor": ("smoke-object-material-editor.mjs", "fullmag_object_material_editor_browser_fixture_v1", "object-material-editor", "FULLMAG_OBJECT_MATERIAL_EDITOR"),
@@ -111,6 +112,8 @@ def print_fixture_log_tails(run_root: Path):
 def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
     if scenario not in SCENARIOS:
         raise storage.StorageError("Unknown fixed browser fixture scenario")
+    if scenario == "antenna-regional-drive" and port != 3272:
+        raise storage.StorageError("Antenna regional drive browser fixture uses fixed port 3272")
     if scenario == "object-material-editor" and port != 3266:
         raise storage.StorageError("Object material editor browser fixture uses fixed port 3266")
     if scenario == "antenna-drive-editor" and port != 3265:
@@ -314,6 +317,7 @@ if __name__ == "__main__":
     parser.add_argument("--scenario", choices=tuple(SCENARIOS), default="pinned-dataset")
     args = parser.parse_args()
     port = args.port if args.port is not None else {
+        "antenna-regional-drive": 3272,
         "execution-profiles": 3255,
         "study-execution-profile": 3256,
         "inspector-routing": 3261,

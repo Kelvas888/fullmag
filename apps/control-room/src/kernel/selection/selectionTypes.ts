@@ -548,6 +548,8 @@ export type SelectionRef =
     }
   | {
       draft?: boolean;
+      /** Explicit source geometry for a newly authored regional field. */
+      sourceObjectId?: string;
       fieldDriveId?: string;
       kind: "physics.field-drives" | "physics.field-drive";
       nodeId: string;
@@ -1273,7 +1275,9 @@ export function selectionRefEquals(
         right.type === "physics-field-drive" &&
         left.kind === right.kind &&
         left.nodeId === right.nodeId &&
-        left.fieldDriveId === right.fieldDriveId
+        left.fieldDriveId === right.fieldDriveId &&
+        left.draft === right.draft &&
+        left.sourceObjectId === right.sourceObjectId
       );
     case "analysis-chart":
       return (

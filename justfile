@@ -578,6 +578,10 @@ verify-inspector-routing-browser:
 verify-study-execution-profile-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3256 --scenario study-execution-profile
 
+# Regional source creation through production Inspectors and controlled HTTP.
+verify-antenna-regional-drive-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3272 --scenario antenna-regional-drive
+
 # Production Explorer tree against controlled scene inputs; no solver or unit builds.
 verify-explorer-physics-reporting-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3259 --scenario explorer-physics-reporting

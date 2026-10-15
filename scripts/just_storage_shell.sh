@@ -486,6 +486,10 @@ case "${recipe}" in
     if [[ "${recipe}" =~ ${object_material_editor_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3266 --scenario object-material-editor
     fi
+    regional_drive_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3272 --scenario antenna-regional-drive$'
+    if [[ "${recipe}" =~ ${regional_drive_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3272 --scenario antenna-regional-drive
+    fi
     drive_editor_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3265 --scenario antenna-drive-editor$'
     if [[ "${recipe}" =~ ${drive_editor_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3265 --scenario antenna-drive-editor
