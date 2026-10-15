@@ -98,6 +98,12 @@ manifestu wymaga ponownego zbudowania kanonicznego toolchaina i przypisania jego
 zweryfikowanego ID do profilu `fem-gpu-release` koordynatora. Na tym hoście
 ciężką pracę wykonuje istniejący koordynator lub odrębna bramka managed FEM
 z blokadą ciężkich prac; nie uruchamiaj równoległego ręcznego buildu Compose.
+Kanoniczny profil `fem-gpu` w `compose.yaml` przekazuje opcjonalne
+`FULLMAG_CUDA_BASE_IMAGE` i `FULLMAG_CUDA_BASE_IMAGE_DIGEST` do tego samego
+Dockerfile. Bez tych zmiennych zachowuje jego dotychczasowe defaults. Dzięki
+temu managed kwalifikacja może użyć dokładnego zestawu argumentów z
+`compose.toolchain.yaml`, bez zmiany bramki CPU/GPU i bez drugiej listy wersji.
+
 Rust `nightly` i pakiety pip nie są w pełni przypięte. Końcowe wykonanie nowego
 toolchaina i obrazu aplikacji pozostaje **VERIFICATION PENDING**.
 
