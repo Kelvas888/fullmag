@@ -701,7 +701,10 @@ mod source_contract_tests {
 
     #[test]
     fn cancellation_is_structured_before_common_stop_handling() {
-        let source = include_str!("accepted_fem_study_worker.rs");
+        let source = include_str!("accepted_fem_study_worker.rs")
+            .split_once("#[cfg(test)]")
+            .expect("source contracts follow the production execution adapter")
+            .0;
         assert!(source.contains("AcceptedFemExecutionOutcome::Cancelled"));
         assert!(source.contains("FemStaticPbcLane attestation"));
         assert!(!source.contains("runner was cancelled before final-state publication"));
