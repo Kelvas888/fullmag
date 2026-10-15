@@ -560,6 +560,10 @@ verify-study-execution-profile-browser:
 verify-explorer-physics-reporting-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3259 --scenario explorer-physics-reporting
 
+# Production preparation status, Inspector and viewport; controlled preparation, no solver.
+verify-preparation-workspace-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3268 --scenario preparation-workspace
+
 # Production antenna Inspector and resource hooks in an isolated browser fixture.
 verify-antenna-source-spectrum-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3265 --scenario antenna-source-spectrum

@@ -1,4 +1,28 @@
 # Status realizacji całego planu refaktoryzacji
+Aktualizacja [P8-53CZ](p8/53cz-nonblocking-preparation-ci-followup.md):
+najnowszy odbiór UI **8535 PASS / 1 FAIL / 13 skip**; pozostały brak
+localStorage w fixture poprawiono, dodano test zachowania realnej powłoki
+przy błędzie transportu. Wymaga nowego CI. Python ordered-stage roundtrip
+**56 PASS + 35 subtestów**, 0 błędów/pominięć, renderer bez zmian.
+Pakiet Windows i pełny lifecycle nadal NOT VERIFIED. Procenty bez awansu.
+
+Checkpoint 15.10.2026 — [P8-53CZ](p8/53cz-nonblocking-preparation-ci-followup.md):
+CI wykryło własną regresję propsów testu, następnie 7 porażek testów/audytu
+po zmianie preparation UI. Przygotowano poprawki fixture i audytu przy
+zachowaniu nowych kontraktów; ponowny odbiór CI wymagany. Interpretowany
+audyt PASS. Build Windows nie wystartował przez zajęty slot. Zmapowano
+otwarty authoring bez RuntimeSession w P2. Pełny plan **IN PROGRESS**.
+
+Checkpoint 15.10.2026 — [P8-53CY](p8/53cy-nonblocking-preparation-workspace.md):
+usunięto globalny preparation gate/inert; status jest kompaktowy i nieblokujący.
+Scenariusz komponentów w przeglądarce: 7 kroków PASS, retained draft/focus/canvas,
+WebGL 1000×620 bez utraty kontekstu; wykryto i poprawiono widoczność zwiniętych
+szczegółów. Świeże powtórzenie c7e641e dało cały receipt PASS przy stabilnych
+źródłach. Typecheck wykazał 7 błędów w obcych dirty zmianach compute/batch,
+lint jeden obcy błąd; React Doctor PASS. Review: brak P0–P2 w zakresie poprawki.
+Checker output storage poprawiony i opublikowany jako `b7051deb5`.
+Pełny plan **IN PROGRESS**, procenty bez awansu do zakończenia bramek.
+
 Checkpoint 15.10.2026 — [P8-53CX](p8/53cx-python-scene-contract-acceptance.md):
 CI potwierdziło Gmsh exact-layer airbox SUCCESS. Kolejne 8 porażek testów
 sceny Python poprawiono zgodnie z rendererem i canonical auxiliary identity;
