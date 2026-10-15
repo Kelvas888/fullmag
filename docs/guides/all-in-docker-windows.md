@@ -44,6 +44,34 @@ Wynik zawiera `image_id` oraz ścieżkę `receipt.json` pod resolverowym
 Kontekst składania pozostaje pod profilem `storage/builds/<worktree-id>/docker-all-gpu`.
 Obraz zawiera pełny toolchain i może być duży; nie jest wersją slim.
 
+## CI: routowanie managed FEM
+
+Workflow `.github/workflows/frontend-3d-managed-fem.yml` zachowuje ten sam
+job, środowisko i rzeczywistą bramkę kwalifikacji. Używa dokładnie czterech
+etykiet runnera:
+
+```text
+self-hosted, linux, x64, ${{ vars.FULLMAG_FEM_RUNNER_LABEL || 'fem-managed' }}
+```
+
+Operator może skierować nowy run do lokalnego, ephemeral runnera przez zmienną
+repozytorium `FULLMAG_FEM_RUNNER_LABEL=fem-managed-docker`. Taki runner musi
+mieć wyłącznie etykiety `self-hosted`, `linux`, `x64` i `fem-managed-docker`;
+nie wolno dodawać mu generycznej `fem-managed`, ponieważ przejąłby starsze,
+już oczekujące joby. Po wyłączeniu zmiennej workflow wraca do dotychczasowego
+`fem-managed`; jest to ścieżka rollbacku i nie wymaga anulowania cudzych jobów.
+
+`fem-managed-docker` zachowuje istniejący kontrakt `linux-ext4-loop-v1`
+realizowany w Docker Desktop Linux. Przed ustawieniem zmiennej operator musi
+potwierdzić dokładny zestaw etykiet, profil Docker, ext4 z `findmnt` i
+proweniencją loop/backing, `nsenter`, dostępność NVIDIA oraz wszystkie
+prerequisites rzeczywistej bramki CPU/GPU. Sama etykieta ani sonda GPU nie
+świadczą o gotowości runnera. Bramka
+`run_frontend3d_required_gate.sh managed-fem-qualification` musi przejść w
+całości; nie zmieniamy jej warunków, fallbacków, kodów wyjścia ani required
+check. Ten routing nie kwalifikuje Windows-folder storage używanego przez
+sesje FMS.
+
 ## Uruchomienie
 
 ```text
