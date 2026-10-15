@@ -1,8 +1,8 @@
 """Interpreted contract checks for the Docker Control Room dev supervisor.
 
 This deliberately avoids pnpm, Node, Docker, Rust, and compiled test targets.
-It exercises only the bounded manifest/freeze boundary, managed links, and
-owned-child shutdown receipt semantics.
+It exercises the bounded manifest/freeze boundary, managed links, dependency
+cache reconciliation, and owned-child shutdown receipt semantics.
 """
 from __future__ import annotations
 
@@ -124,7 +124,12 @@ def isolated(module):
             "FREEZE_PATH": root / "inputs-freeze.json",
             "RECEIPT_PATH": root / "frontend-dev-receipt.json",
             "LOG_PATH": root / "next.log",
+            "RUNTIME_LOCK_PATH": root / "cache" / ".fullmag-frontend-runtime.lock",
         }
+        (root / "cache").mkdir(parents=True, exist_ok=True)
+        runtime_lock = root / "cache" / ".fullmag-frontend-runtime.lock"
+        runtime_lock.write_bytes(b"")
+        runtime_lock.chmod(0o660)
         old = {name: getattr(module, name) for name in names}
         for name, value in names.items():
             setattr(module, name, value)
@@ -448,6 +453,88 @@ else:
             )
             self.assertTrue((root / "cache" / "node_modules").is_symlink())
             self.assertFalse((root / "node_modules").exists())
+
+    @skipIf(os.name == "nt", "dependency readiness regression uses Linux symlink semantics")
+    def test_dependency_ready_does_not_trust_an_old_receipt_over_empty_cache(self):
+        with isolated(self.module) as (_root, workspace, inputs):
+            self.module._prepare_state_directories()
+            self.module._prepare_managed_frontend(inputs)
+            self.assertFalse(self.module._dependency_tree_ready(inputs))
+
+            virtual_next = (
+                workspace
+                / "node_modules"
+                / ".pnpm"
+                / "next@16.3.8"
+                / "node_modules"
+                / "next"
+            )
+            binary = virtual_next / "dist" / "bin" / "next"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            app_next = workspace / "apps" / "control-room" / "node_modules" / "next"
+            app_next.symlink_to(virtual_next, target_is_directory=True)
+            self.assertTrue(self.module._dependency_tree_ready(inputs))
+
+    @skipIf(os.name == "nt", "dependency reconciliation regression uses Linux symlink semantics")
+    def test_start_reconciles_ready_receipt_when_cache_is_empty(self):
+        with isolated(self.module) as (_root, workspace, inputs):
+            self.module._prepare_state_directories()
+            self.module._prepare_managed_frontend(inputs)
+            self.module._atomic_json(
+                self.module.RECEIPT_PATH,
+                {
+                    "schema": self.module.RECEIPT_SCHEMA,
+                    "state": "failed",
+                    "dependency_install": "ready",
+                },
+                "frontend development receipt",
+            )
+
+            def fake_install(_inputs, _stopping_event, _log_stream, _receipt, _runtime_lock):
+                virtual_next = (
+                    workspace
+                    / "node_modules"
+                    / ".pnpm"
+                    / "next@16.3.8"
+                    / "node_modules"
+                    / "next"
+                )
+                binary = virtual_next / "dist" / "bin" / "next"
+                binary.parent.mkdir(parents=True)
+                binary.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+                (workspace / "apps" / "control-room" / "node_modules" / "next").symlink_to(
+                    virtual_next, target_is_directory=True
+                )
+
+            stopping = type("Stopping", (), {"is_set": lambda self: False})()
+            log_stream = io.BytesIO()
+            with patch.dict(os.environ, {"FULLMAG_DOCKER_FRONTEND": "dev"}, clear=False):
+                with patch.object(
+                    self.module,
+                    "_tool_version",
+                    side_effect=[self.module.EXPECTED_NODE_VERSION, self.module.EXPECTED_PNPM_VERSION],
+                ):
+                    with patch.object(self.module, "_log_stream", return_value=log_stream):
+                        with patch.object(self.module, "_run_pnpm_install", side_effect=fake_install) as install:
+                            with patch.object(self.module, "_start_log_tailer", return_value=None):
+                                with patch.object(self.module, "_start_next", return_value=object()):
+                                    self.module.start(stopping)
+            install.assert_called_once()
+            log_stream.close()
+
+    @skipIf(os.name == "nt", "runtime flock regression uses POSIX file locking")
+    def test_runtime_lock_rejects_a_second_active_consumer(self):
+        with isolated(self.module):
+            first = self.module._acquire_runtime_lock()
+            try:
+                with self.assertRaisesRegex(
+                    self.module.FrontendDevError,
+                    "already held by an active consumer",
+                ):
+                    self.module._acquire_runtime_lock()
+            finally:
+                self.module._release_runtime_lock(first)
 
     @skipIf(os.name == "nt", "Node module resolution regression uses Linux symlink semantics")
     def test_generated_cache_path_requires_from_managed_dependency_alias(self):

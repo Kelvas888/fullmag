@@ -50,18 +50,22 @@ def seed(source, state, port):
         directories.append({"name": name, "source": str(path),
                             "target": WORKSPACE + "/apps/control-room/" + name})
     relative_files = {Path(name) for name in ("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml")}
+    dependency_files = set(relative_files)
     # The lockfile can contain other workspace importers. Copy their manifests,
     # while only Control Room sources become live container inputs.
     from windows.stage_workspace_frontend import _parse_lock_importers, _direct_app_package_manifests
     importers = _parse_lock_importers(source / "pnpm-lock.yaml")
     for path in _direct_app_package_manifests(source, importers):
-        relative_files.add(path.relative_to(source))
+        relative = path.relative_to(source)
+        relative_files.add(relative)
+        dependency_files.add(relative)
     for path in app.iterdir():
         # Generated cache junctions may be broken from another host/runtime.
         # Do not follow them merely to enumerate regular app configuration.
         if path.suffix in {".ts", ".tsx", ".json", ".mjs", ".css"} and path.is_file():
             relative_files.add(path.relative_to(source))
     files = []
+    dependency_entries = {}
     destination = storage.validate_path(state / "development/workspace", state,
                                         "isolated Docker frontend workspace")
     destination.mkdir(parents=True, exist_ok=False)
@@ -73,7 +77,10 @@ def seed(source, state, port):
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        files.append({"relative": relative.as_posix(), "sha256": hashlib.sha256(data).hexdigest()})
+        digest = hashlib.sha256(data).hexdigest()
+        files.append({"relative": relative.as_posix(), "sha256": digest})
+        if relative in dependency_files:
+            dependency_entries[relative.as_posix()] = digest
     commit = storage.git(source, "rev-parse", "HEAD")
     if commit != initial_commit:
         raise ValueError("Main checkout HEAD changed during frontend metadata capture")
@@ -83,9 +90,17 @@ def seed(source, state, port):
             raise ValueError("Frontend configuration changed during metadata capture: " + file["relative"])
     if not re.fullmatch(r"[a-f0-9]{40}", commit):
         raise ValueError("Live source checkout has no full commit identity")
+    from docker_frontend_cache import default_toolpins, dependency_seed_digest, toolpins_digest
+    toolpins = default_toolpins()
+    dependency_seed_sha256 = dependency_seed_digest(dependency_entries)
     return {"schema": "fullmag.docker-development-inputs.v1", "source_root": str(source),
             "source_commit": commit, "source_selection": "live_windows_selected_checkout",
             "source_volume": source_volume, "host_port": port,
+            "worktree_id": storage.identifier(source),
+            "dependency_seed_files": sorted(dependency_entries),
+            "dependency_seed_sha256": dependency_seed_sha256,
+            "toolpins": toolpins,
+            "toolpins_sha256": toolpins_digest(toolpins),
             "workspace_root": WORKSPACE, "frontend_root": FRONTEND,
             "live_directories": directories, "files": files,
             "configuration_changes": "prepare_new_workspace",

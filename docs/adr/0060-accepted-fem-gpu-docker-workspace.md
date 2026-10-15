@@ -59,6 +59,34 @@ na globalny ledger ani nie tworzymy ukrytego named volume. Jednorazowy helper
 montowania jest narzędziem utrzymania; frontend i backend pozostają dwiema
 usługami aplikacji. Frontend nie otrzymuje ledgeru, GPU ani accepted store.
 
+## Trwały cache frontendu developerskiego
+
+Rzeczywisty start na Docker Desktop ujawnił koszt operacji metadata na bindzie
+Windows: instalacja zależności trwała ponad 28 minut, a kompilacja Workspace
+nie zakończyła się podczas dziesięciominutowej próby. Nowy run UUID tworzył
+również nowy cache. Sam otwarty port i przekierowanie HTTP nie dowodzą gotowości.
+
+Zależności pnpm, oba importer node_modules i cache Next otrzymują oddzielny
+profil `fullmag-frontend-cache-v1`, z backing ext4 w kanonicznym
+`storage/build-volumes`. Stabilny klucz obejmuje ścieżkę checkoutu, worktree,
+port, dependency seed i wersje narzędzi. Zwykła edycja źródeł lub nowy commit
+nie zmienia klucza; zmiana zależności wybiera inny cache. Źródła nadal pochodzą
+z readonly bindu Windows, a sesje, wyniki, logi i receipty pozostają bezpośrednio
+w storage Windows. Frontend nie otrzymuje host ledgeru ani GPU.
+
+Jednorazowy helper przygotowuje i weryfikuje dokładny backing, loop mount,
+UUID ext4 i owner marker. Compose jawnie deklaruje cztery writable bindy;
+nie stosuje ukrytych named volumes. Aktywny konsument tego samego cache
+blokuje konkurencyjny start. Launcher zapisuje tożsamość cache i sprawdza
+rzeczywiste mounty kontenera. Zmiana nie usuwa wcześniejszego cache ani nie
+modyfikuje aktywnego środowiska. Gotowość wymaga odpowiedzi 2xx z `/workspace`.
+
+Implementacja cache, jego ponowne użycie po restarcie Docker Desktop i
+HMR z checkoutu Windows wymagają odrębnych dowodów runtime; pozostają
+**NOT VERIFIED**, dopóki te bramki nie przejdą. Wycofanie polega na zatrzymaniu
+własnego frontendu i przywróceniu wcześniejszej konfiguracji z jej zachowanym
+cache; backing ani wyniki nie są kasowane.
+
 ## Migracja poleceń live w Dockerze
 
 Backend Docker nie ma konsumenta starszej kolejki live. Dlatego w tej trasie

@@ -83,6 +83,9 @@ services:
     ports: ["127.0.0.1:${FULLMAG_HTTP_PORT:-3197}:8080"]
     volumes:
       # Linux dependencies, Next output and HMR logs stay out of the checkout.
+      # The frontend-cache-v1 overlay replaces only the four Linux cache/dependency
+      # children below; the Windows state bind remains the owner of sessions, logs
+      # and receipts.
       - type: bind
         source: ${FULLMAG_STATE_ROOT}/development
         target: /state/development

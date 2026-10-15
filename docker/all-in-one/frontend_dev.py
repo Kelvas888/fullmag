@@ -24,6 +24,10 @@ from __future__ import annotations
 
 import dataclasses
 import errno
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the managed frontend runs on Linux
+    fcntl = None
 import hashlib
 import json
 import os
@@ -71,6 +75,7 @@ FREEZE_ROOT = DEVELOPMENT_ROOT / "frozen-inputs"
 FREEZE_PATH = DEVELOPMENT_ROOT / "inputs-freeze.json"
 RECEIPT_PATH = DEVELOPMENT_ROOT / "frontend-dev-receipt.json"
 LOG_PATH = DEVELOPMENT_ROOT / "next.log"
+RUNTIME_LOCK_PATH = FRONTEND_ROOT / ".fullmag-frontend-runtime.lock"
 
 NODE_BINARY = Path("/usr/local/bin/node")
 PNPM_BINARY = Path("/usr/local/bin/pnpm")
@@ -182,6 +187,7 @@ class FrontendHandle:
     log_path: Path
     log_stream: Any | None = None
     log_tailer: Any | None = None
+    runtime_lock: Any | None = None
     stopped: bool = False
     process_group_id: int | None = None
     process_identity: Mapping[str, Any] | None = None
@@ -1030,6 +1036,53 @@ def _publish_receipt(receipt: Mapping[str, Any]) -> None:
     _atomic_json(RECEIPT_PATH, dict(receipt), "frontend development receipt")
 
 
+def _acquire_runtime_lock() -> Any:
+    """Own this cache key across dependency installation and the Next process."""
+
+    if fcntl is None:
+        _fail("frontend cache runtime locking is unavailable")
+    _assert_no_links(RUNTIME_LOCK_PATH.parent, "frontend runtime lock parent")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            RUNTIME_LOCK_PATH,
+            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise FrontendDevError("frontend runtime lock is not a regular file")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise FrontendDevError("frontend cache is already held by an active consumer") from error
+        return os.fdopen(descriptor, "a+b", buffering=0)
+    except FrontendDevError:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    except FileNotFoundError as error:
+        _fail(f"frontend runtime lock is missing: {RUNTIME_LOCK_PATH}")
+    except OSError as error:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _fail(f"cannot acquire frontend runtime lock: {error}")
+
+
+def _release_runtime_lock(lock: Any | None) -> None:
+    if lock is None:
+        return
+    try:
+        lock.close()
+    except OSError:
+        pass
+
+
 def _log_stream() -> Any:
     _ensure_directory(DEVELOPMENT_ROOT, "development root")
     descriptor: int | None = None
@@ -1161,6 +1214,7 @@ def _run_pnpm_install(
     stopping_event: Any,
     log_stream: Any,
     receipt: dict[str, Any],
+    runtime_lock: Any,
 ) -> None:
     app_root = inputs.workspace_root / "apps" / "control-room"
     environment = _safe_environment(inputs)
@@ -1201,7 +1255,14 @@ def _run_pnpm_install(
         )
         _fail(f"frozen pnpm install could not start: {error}")
     try:
-        install_handle = _new_handle(process, inputs, stopping_event, "pnpm-install", log_stream)
+        install_handle = _new_handle(
+            process,
+            inputs,
+            stopping_event,
+            "pnpm-install",
+            log_stream,
+            runtime_lock=runtime_lock,
+        )
     except Exception as error:
         owned_handle = getattr(error, "frontend_handle", None)
         if isinstance(owned_handle, FrontendHandle):
@@ -1313,6 +1374,21 @@ def _next_binary(inputs: DevelopmentInputs) -> Path:
     return binary
 
 
+def _dependency_tree_ready(inputs: DevelopmentInputs) -> bool:
+    """Require a real state-owned dependency tree before trusting its receipt."""
+
+    _require_real_directory(inputs.workspace_root / "node_modules", "workspace node_modules")
+    app_root = inputs.workspace_root / "apps" / "control-room"
+    _require_real_directory(app_root / "node_modules", "Control Room node_modules")
+    binary = app_root / NEXT_RELATIVE
+    try:
+        binary.lstat()
+    except FileNotFoundError:
+        return False
+    _next_binary(inputs)
+    return True
+
+
 def _attach_frontend_handle(error: Exception, handle: FrontendHandle) -> None:
     setattr(error, "frontend_handle", handle)
 
@@ -1324,6 +1400,7 @@ def _new_handle(
     kind: str,
     log_stream: Any,
     log_tailer: _LogTailer | None = None,
+    runtime_lock: Any | None = None,
 ) -> FrontendHandle:
     handle = FrontendHandle(
         process=process,
@@ -1335,6 +1412,7 @@ def _new_handle(
         log_path=LOG_PATH,
         log_stream=log_stream,
         log_tailer=log_tailer,
+        runtime_lock=runtime_lock,
     )
     try:
         identity = _read_process_identity(process.pid)
@@ -1448,6 +1526,7 @@ def _start_next(
     log_stream: Any,
     log_tailer: _LogTailer | None,
     receipt: dict[str, Any],
+    runtime_lock: Any,
 ) -> FrontendHandle:
     _next_binary(inputs)
     app_root = inputs.workspace_root / "apps" / "control-room"
@@ -1496,6 +1575,7 @@ def _start_next(
             "next",
             log_stream,
             log_tailer,
+            runtime_lock=runtime_lock,
         )
     except Exception as error:
         owned_handle = getattr(error, "frontend_handle", None)
@@ -1552,23 +1632,28 @@ def start(stopping_event: Any) -> FrontendHandle:
     _prepare_state_directories()
     _validate_live_directories(inputs)
     _freeze_inputs(inputs, allow_generated=allow_generated)
-    node_modules_target = _prepare_managed_frontend(inputs)
-    tool_environment = _safe_environment(inputs)
-    receipt = _receipt_base(inputs, previous)
-    receipt.update(
-        state="starting",
-        dependency_root=str(node_modules_target),
-        generated_files_gate=("next-started-v1" if allow_generated else "seed-only-v1"),
-    )
-    _publish_receipt(receipt)
-    _write_lifecycle_log(
-        "frontend_start",
-        tool_probe_budget_seconds=TOOL_TIMEOUT_SECONDS,
-        install_budget_seconds=INSTALL_TIMEOUT_SECONDS,
-        log_path=LOG_PATH,
-        url=f"http://localhost:{inputs.host_port}",
-    )
-    log_stream = _log_stream()
+    runtime_lock = _acquire_runtime_lock()
+    try:
+        node_modules_target = _prepare_managed_frontend(inputs)
+        tool_environment = _safe_environment(inputs)
+        receipt = _receipt_base(inputs, previous)
+        receipt.update(
+            state="starting",
+            dependency_root=str(node_modules_target),
+            generated_files_gate=("next-started-v1" if allow_generated else "seed-only-v1"),
+        )
+        _publish_receipt(receipt)
+        _write_lifecycle_log(
+            "frontend_start",
+            tool_probe_budget_seconds=TOOL_TIMEOUT_SECONDS,
+            install_budget_seconds=INSTALL_TIMEOUT_SECONDS,
+            log_path=LOG_PATH,
+            url=f"http://localhost:{inputs.host_port}",
+        )
+        log_stream = _log_stream()
+    except Exception:
+        _release_runtime_lock(runtime_lock)
+        raise
     try:
         node_version = _tool_version(
             NODE_BINARY,
@@ -1606,12 +1691,22 @@ def start(stopping_event: Any) -> FrontendHandle:
             log_stream.close()
         except OSError:
             pass
+        _release_runtime_lock(runtime_lock)
         raise
     log_tailer = _start_log_tailer()
     handle: FrontendHandle | None = None
     try:
-        if previous is None or previous.get("dependency_install") != "ready":
-            _run_pnpm_install(inputs, stopping_event, log_stream, receipt)
+        needs_install = previous is None or previous.get("dependency_install") != "ready"
+        if not needs_install and not _dependency_tree_ready(inputs):
+            needs_install = True
+            _write_lifecycle_log(
+                "dependency_install_reconcile",
+                status="missing",
+                reason="state-owned dependency tree is absent",
+                log_path=LOG_PATH,
+            )
+        if needs_install:
+            _run_pnpm_install(inputs, stopping_event, log_stream, receipt, runtime_lock)
             # pnpm owns the real dependency directories below the writable
             # workspace. Re-validate that layout before resolving Next so a
             # package-manager change cannot redirect execution into the
@@ -1620,7 +1715,7 @@ def start(stopping_event: Any) -> FrontendHandle:
         _assert_not_stopping(stopping_event)
         _next_binary(inputs)
         _assert_not_stopping(stopping_event)
-        handle = _start_next(inputs, stopping_event, log_stream, log_tailer, receipt)
+        handle = _start_next(inputs, stopping_event, log_stream, log_tailer, receipt, runtime_lock)
         return handle
     except Exception as error:
         owned_handle = handle or getattr(error, "frontend_handle", None)
@@ -1638,6 +1733,7 @@ def start(stopping_event: Any) -> FrontendHandle:
         _stop_log_tailer(log_tailer)
         if not isinstance(owned_handle, FrontendHandle):
             log_stream.close()
+            _release_runtime_lock(runtime_lock)
         raise
 
 
@@ -1858,6 +1954,8 @@ def stop(handle: FrontendHandle, *, timeout: float = STOP_TIMEOUT_SECONDS) -> di
     if handle.log_stream is not None:
         handle.log_stream.close()
         handle.log_stream = None
+    runtime_lock = handle.runtime_lock
+    handle.runtime_lock = None
     if had_failure or (not was_running and returncode not in (None, 0)):
         receipt.update(
             state="stopped-after-failure",
@@ -1868,7 +1966,10 @@ def stop(handle: FrontendHandle, *, timeout: float = STOP_TIMEOUT_SECONDS) -> di
         )
     else:
         receipt.update(state="stopped", exit_code=returncode, stopped_at=time.time())
-    _publish_receipt(receipt)
+    try:
+        _publish_receipt(receipt)
+    finally:
+        _release_runtime_lock(runtime_lock)
     return receipt
 
 

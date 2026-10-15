@@ -164,7 +164,7 @@ def validate_workspace_environment(config):
 def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs=None,
                  inputs_path=None, package=None, provenance=None, toolchain_image=None,
                  project="fullmag-config-check", template=None, host_ledger=None,
-                 startup=None):
+                 startup=None, frontend_cache=None):
     """Resolve the versioned Compose definition; do not generate service topology."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("A full immutable image ID is required")
@@ -193,6 +193,19 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
     if host_ledger is not None:
         environment.update(host_ledger["environment"])
         definitions.extend(["-f", host_ledger["compose_overlay"]])
+    if frontend_cache is not None:
+        if inputs is None:
+            raise ValueError("Frontend cache requires development inputs")
+        overlay = frontend_cache.get("compose_overlay")
+        cache_environment = frontend_cache.get("environment")
+        if not isinstance(overlay, str) or not Path(overlay).is_file():
+            raise ValueError("Frontend cache Compose overlay is missing")
+        if not isinstance(cache_environment, dict):
+            raise ValueError("Frontend cache has no resolved Compose environment")
+        if not cache_environment.get("FULLMAG_FRONTEND_CACHE_FILESYSTEM_UUID"):
+            raise ValueError("Frontend cache has no attested ext4 UUID")
+        environment.update(cache_environment)
+        definitions.extend(["-f", overlay])
     if startup is not None:
         overlay = startup.get("compose_overlay")
         if not isinstance(overlay, str) or not Path(overlay).is_file():
@@ -203,6 +216,8 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
                                    "config", "--format", "json", environment=environment))
     if host_ledger is not None:
         configured.get("services", {}).pop("host-ledger-maintenance", None)
+    if frontend_cache is not None:
+        configured.get("services", {}).pop("frontend-cache-maintenance", None)
     expected = {"backend", "frontend"} if inputs is not None else {"backend"}
     if set(configured.get("services", {})) != expected:
         raise ValueError("Versioned Compose has unexpected services")
@@ -661,6 +676,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
     storage.atomic_json(root / "receipt.json", receipt)
     inputs = None
     host_ledger = None
+    frontend_cache = None
     startup = None
     inputs_path = root / "development-inputs.json"
     try:
@@ -748,7 +764,8 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                                 package=assembly.get("package_root"),
                                 provenance=assembly_receipt, project=project,
                                 toolchain_image=assembly.get("base_image"), template=root / "compose.source.yaml",
-                                host_ledger=host_ledger, startup=startup)
+                                host_ledger=host_ledger, startup=startup,
+                                frontend_cache=frontend_cache)
         if os.name != "nt":
             raise ValueError("This Windows-folder launcher requires native Windows host attestation")
         from windows_folder_host import attest, local_volume, publish_evidence, read_owned_regular
@@ -756,6 +773,35 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         host_ledger = prepare_host_ledger(layout, repo, image, root, docker)
         receipt["host_ledger"] = host_ledger
         storage.atomic_json(root / "receipt.json", receipt)
+        if inputs is not None:
+            from docker_frontend_cache import prepare as prepare_frontend_cache
+
+            frontend_cache = prepare_frontend_cache(
+                layout,
+                repo,
+                image,
+                root,
+                docker,
+                source_root=inputs["source_root"],
+                worktree_id=inputs["worktree_id"],
+                host_port=inputs["host_port"],
+                dependency_seed_sha256=inputs["dependency_seed_sha256"],
+                toolpins=inputs["toolpins"],
+            )
+            receipt["frontend_cache"] = {
+                "schema": frontend_cache["schema"],
+                "profile": frontend_cache["profile"],
+                "cache_key": frontend_cache["cache_key"],
+                "project_id": frontend_cache["project_id"],
+                "filesystem_uuid": frontend_cache["filesystem_uuid"],
+                "mount_root": frontend_cache["mount_root"],
+                "children": frontend_cache["children"],
+                "guest_targets": frontend_cache["guest_targets"],
+                "helper_sha256": frontend_cache["helper_sha256"],
+                "compose_overlay_sha256": frontend_cache["compose_overlay_sha256"],
+                "receipt_path": frontend_cache["receipt_path"],
+            }
+            storage.atomic_json(root / "receipt.json", receipt)
         certificate = attest(state, assembly, docker("info", "--format", "{{.ID}}"), assembly["binary_hashes"])
         publish_evidence(host_certificate, certificate)
         shutil.copyfile(repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml"),
@@ -819,11 +865,18 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                     or front["Config"].get("User") != "65532:65532"
                     or front_host.get("DeviceRequests")):
                 raise ValueError("Frontend image, loopback port or isolation attestation mismatch")
+            if frontend_cache is None:
+                raise ValueError("Development frontend cache was not prepared before startup")
+            from docker_frontend_cache import validate_container as validate_frontend_cache
+            receipt["frontend_cache_attestation"] = validate_frontend_cache(front, frontend_cache)
             writable = [m for m in front["Mounts"] if m.get("RW") and m["Type"] == "bind"]
-            if (len(writable) != 1 or writable[0]["Destination"] != "/state/development"
-                    or writable[0]["Type"] != "bind"
-                    or host_path(writable[0]["Source"]) != (state / "development").resolve()):
-                raise ValueError("Frontend writable mount must be its isolated development directory")
+            expected_writable_targets = {"/state/development", *frontend_cache["guest_targets"].values()}
+            actual_writable_targets = {mount["Destination"] for mount in writable}
+            if actual_writable_targets != expected_writable_targets:
+                raise ValueError("Frontend writable mounts must be the isolated state root and four cache binds")
+            state_mounts = [mount for mount in writable if mount["Destination"] == "/state/development"]
+            if (len(state_mounts) != 1 or host_path(state_mounts[0]["Source"]) != (state / "development").resolve()):
+                raise ValueError("Frontend writable state mount must be its isolated development directory")
             bindings = {}
         from docker_compose_attestation import service_network, network_owner
         network_id = service_network(actual, project, hostname="fullmag-" + root.name)
