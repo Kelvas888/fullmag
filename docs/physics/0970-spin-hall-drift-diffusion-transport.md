@@ -370,8 +370,96 @@ execution disables error-based rejection but still executes the same versioned
 ARS stages. `coupled_bdf2_small_oracle.v1` remains validation-only and is not a
 production authoring choice in M3.
 
+(spin-transport-frozen-free-error-support)=
+### 2.6.1. Frozen M, free target i zaakceptowany czas — prerejestracja
+
+**Stan: `planned_contract`, runtime `NOT VERIFIED`.** To doprecyzowanie
+istniejącego zerowania wag masked/nonmagnetic DOF, nie zmiana równań transportu.
+Support błędu zewnętrznego kroku jest przecięciem fizycznych torque targetów
+ze swobodnymi aktywnymi magnetycznymi DOF resolved constraintu:
+
+```{math}
+:label: spin-transport-free-target-support
+\Omega_{T,U}=\Omega_T\cap\Omega_U.
+```
+
+Dla niepustego supportu obie normy mają identyczny support i wagę objętościową:
+
+```{math}
+:label: spin-transport-free-target-error-budget
+\Delta t\sqrt{\frac{\int_{\Omega_{T,U}}
+\lVert\Delta\mathbf T_{\mathrm{tr}}\rVert^2\,\mathrm dV}
+{\lvert\Omega_{T,U}\rvert}}
+\le\eta_{\mathrm{tr}}\sqrt{\frac{\int_{\Omega_{T,U}}
+\lVert\delta\mathbf m_{\mathrm{emb}}\rVert^2\,\mathrm dV}
+{\lvert\Omega_{T,U}\rvert}}.
+```
+
+| Symbol | Znaczenie | Jednostka SI |
+|---|---|---|
+| $\Omega_{T,U}$ | Wspólny free torque-target support | $\mathrm{m^3}$ |
+| $\Omega_T$ | Fizyczny obszar targetów torque | $\mathrm{m^3}$ |
+| $\Omega_U$ | Obszar swobodnych aktywnych magnetycznych DOF | $\mathrm{m^3}$ |
+| $\Delta\mathbf T_{\mathrm{tr}}$ | Różnica transportowych źródeł Gilberta użyta w istniejącym outer-error gate | $\mathrm{s^{-1}}$ |
+| $\delta\mathbf m_{\mathrm{emb}}$ | Istniejący embedded estimator przed renormalizacją, projektowany na free support | $1$ |
+| $\Delta t$ | Rzeczywisty czas kroku | $\mathrm{s}$ |
+| $\eta_{\mathrm{tr}}$ | Istniejący udział błędu transportu w budżecie kroku | $1$ |
+| $\lvert\Omega_{T,U}\rvert$ | Objętość wspólnego supportu | $\mathrm{m^3}$ |
+| $\mathrm dV$ | Miara objętościowa | $\mathrm{m^3}$ |
+
+Dla pustego supportu obie redukcje mają wartość zero, a wyłącznie powyższe
+kryterium wpływu błędu torque na swobodne M jest vacuous. Nie dzieli się przez
+zero i nie ustanawia dodatniego floor dla LTE. Nie wolno usuwać zamrożonych
+targetów z fizycznego torque, mu/Q, reakcji, obserwabli ani bilansów. Niezależne
+charge/spin residuals, physical balances, finite-value oraz nonlinear-update
+gates pozostają obowiązkowe. Błąd odrzuca trial bez publikacji accepted.
+Nie wystarczy wyłączyć cały M2 gate, gdy wszystkie M są zamrożone.
+
+Obecny scalar embedded_lte_m jest redukowany po wszystkich komórkach n i
+przekazywany każdemu modułowi M2. Z samego scalaru nie można odtworzyć normy
+na odmiennym target∩free support. Wymagana jest wystarczająca informacja
+per-cell z istniejącego predictor/corrector przed renormalizacją do jednakowej,
+per-module redukcji obu norm. Nie przeskalowuje się arbitralnie scalaru i nie
+narzuca nowego globalnego stanu ani sposobu alokacji. Różnica torque pozostaje
+różnicą źródeł Gilberta, nie nową definicją explicit RHS. Istniejący
+TransportStageErrorBudget oraz jego przekazanie przez execute_coupled_heun_trial
+są granicą integracji; ich dotychczasowe dt_s i scalar nie są pełnym dowodem
+wymaganego scope.
+
+All-frozen TimeEvolution wykonuje istniejące coupled Heun (steady M1/M2)
+lub ARS (M3), z końcową maską pełnego RHS i restore M w każdym candidate;
+nie wykonuje fikcyjnego dt=0. M3 adaptive nadal ocenia transportowe observables
+i spinową historię w full/two-half comparison mimo zerowej różnicy M.
+Czysto magnetyczny all-frozen pozostaje no-op zgodnie z 0996.
+
+Stage i istniejący time-event scheduler są jednym właścicielem czasu. Każde
+źródło jest oceniane w rzeczywistym czasie etapu z zachowaniem authored origin.
+Fixed/adaptive krok musi trafić w current-envelope breakpoint, wymagany output
+i końcowy endpoint; partial fixed M3 step zachowuje swoje rzeczywiste dt i
+historię. Nie wolno nadawać wynikowi innego czasu przez canonicalization po
+solve. Zmiana dt podlega istniejącemu kontraktowi historii, bez nowego ownera.
+`accepted.evaluated_time_s`, state time, report, counters i checkpoint muszą
+opisywać ten sam stan. Pause/cancel nie oznacza completed/converged ani nie
+przeskakuje czasu; success wymaga rzeczywistego accepted endpoint transportu.
+
+Publiczny Relax odrzuca aktywne niekonserwatywne torque przez
+`crates/fullmag-plan/src/validate.rs::validate_conservative_relaxation`.
+Prerejestrowana polityka dodatkowo odrzuca aktywny M3 w Relax również bez torque:
+brak kanonicznego kryterium zbieżności transient transportu. To wymaganie
+przyszłej walidacji, nie claim istniejącej implementacji. Zachowane steady
+zero-current/disabled-torque grafy nie otrzymują nowej odmowy przez tę regułę.
+Nie implementuje się nowej zbieżności ani pseudoczasu minimizatora.
+
+Zakres realizacji: FDM CPU/double fixed Heun M1/M2 oraz fixed/adaptive
+`coupled_imex_ark2` M3 wymagają odrębnych managed gates. Inne integratory,
+FEM/GPU i single nie dziedziczą kwalifikacji. Nie zmienia się publicznych
+parametrów, ProblemIR ani source/torque modelu dla dopasowania BORIS.
+Bramki: dokładne M w każdym etapie, physical balances, empty/partial free-target,
+czasowy pulse/PWL napęd, off-grid events/final endpoint, late-failure rollback,
+pause/cancel oraz checkpoint/restart; dowody samego źródła nie kwalifikują runtime.
+
 (fdm-cpu-transport-gilbert-rhs-boundary)=
-### 2.6.1 Jedna konwersja transportowego źródła Gilberta — FDM CPU
+### 2.6.2 Jedna konwersja transportowego źródła Gilberta — FDM CPU
 
 **Stan z 2026-10-15: historyczny `SOURCE_BUG_CONFIRMED`; prerejestracja
 poprzedziła zapis poprawki. Obecnie implementacja `SOURCE_ONLY`, runtime
@@ -3002,6 +3090,19 @@ a qualified workload without the validation gates above.
 
 | Claim | Path | Symbol | Responsibility | Evidence |
 |---|---|---|---|---|
+| Prerejestracja frozen transport | `docs/physics/0996-frozen-spins-constraint.md` | `DOC-ANCHOR:frozen-spins-auxiliary-transport-time` | Prerejestracja no-op M oraz aktywnego transportu w fizycznym czasie; runtime niezweryfikowany. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `planned_contract`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `docs/specs/frozen-spins-v1.md` | `DOC-ANCHOR:frozen-v1-all-frozen` | Executed steps, czas, pause/cancel i odmowa Relax+M3. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `planned_contract`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `docs/physics/0970-spin-hall-drift-diffusion-transport.md` | `DOC-ANCHOR:spin-transport-frozen-free-error-support` | Wspólny free-target support outer-error gate; bez zmiany bilansów. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `planned_contract`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-runner/src/fdm/cpu/reference.rs` | `execute_reference_fdm_with_coupled_checkpoint` | Istniejący owner czasu, counters, outputs i completion; shortcut/gates wymagają naprawy. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-runner/src/fdm/cpu/reference.rs` | `execute_coupled_heun_trial` | Istniejący transaction Heun evaluate/commit/rollback. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-runner/src/fdm/cpu/reference.rs` | `execute_coupled_ars_trial` | Istniejący transaction ARS i historia M3. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-engine/src/fdm/cpu/integrators.rs` | `heun_trial_with_external_stage_terms_and_lte` | Etapowe callbacks, mask/restore i estimator; free-target scope niezweryfikowany. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-engine/src/fdm/shared/types.rs` | `TransportStageErrorBudget` | Istniejące dt_s i scalar LTE na granicy integrator-workflow; per-module free-target informacja wymaga implementacji. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-engine/src/fdm/cpu/transport/coupled_charge_spin.rs` | `CoupledTransportOuterErrorBudget` | Istniejący budżet outer-error z Gilbert-source delta; nie wprowadzać arbitralnego floor. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-runner/src/fdm/cpu/spin_transport.rs` | `FdmSpinTransportWorkflow` | Istniejący accepted/rejected counters, cache, snapshot i checkpoint. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-engine/src/fdm/cpu/transport/coupled_charge_spin.rs` | `transport_torque_delta_l2` | Istniejąca norma targetów; dodanie free constraint scope pozostaje prerejestracją. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-runner/src/time_events.rs` | `build_resolved_stage_event_schedule_with_origin` | Istniejący owner zdarzeń; envelope current i fixed M3 clipping wymagają dowodów/naprawy. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-plan/src/validate.rs` | `validate_conservative_relaxation` | Istniejąca odmowa niekonserwatywnych torque; jawna odmowa Relax+M3 jeszcze niezaimplementowana. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
 | boris-offline-toolchain-dependency-selection | scripts/local_runner/boris_toolchain.py | dependency_selection | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
 | boris-offline-toolchain-validate-bundle | scripts/local_runner/boris_toolchain.py | validate_bundle | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
 | boris-offline-toolchain-validate-wheels | scripts/local_runner/boris_toolchain.py | validate_wheels | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |

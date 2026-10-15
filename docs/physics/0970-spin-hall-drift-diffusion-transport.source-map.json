@@ -27,6 +27,9 @@
     }
   ],
   "equations": [
+    {"id": "spin-transport-free-target-support", "symbols": ["frozen_target_support", "frozen_raw_target", "frozen_free_support"], "sources": ["frozen-free-error-contract", "frozen-outer-norm"]},
+    {"id": "spin-transport-free-target-error-budget", "symbols": ["frozen_target_support", "frozen_delta_torque", "frozen_delta_m", "frozen_dt", "frozen_eta", "frozen_support_volume", "frozen_dv"], "sources": ["frozen-free-error-contract", "frozen-outer-norm", "frozen-heun-stages"]},
+
     {"id": "spin-current-tensor-display-projections", "symbols": ["Q", "tensor_flow_axis", "tensor_spin_axis", "tensor_component_index", "tensor_frobenius", "tensor_spin_flow_vector"], "sources": ["spin-current-tensor-projection-contract"]},
     {
       "id": "m1-constitutive-block",
@@ -119,6 +122,16 @@
     {"id": "boris-fixed-m-all-cell-admission", "symbols": ["M_s", "boris_M_before", "boris_M_after", "boris_M_expected", "boris_M_component_max", "boris_M_atol", "boris_M_rtol"], "sources": ["boris-fixed-m-v2-contract", "boris-fixed-m-generator-boundary", "boris-fixed-m-ovf-reader-boundary", "boris-fixed-m-recompute"]}
   ],
   "symbols": [
+    {"id": "frozen_target_support", "latex": "\\Omega_{T,U}", "meaning": "Wspólny free torque-target support", "si_unit": "\\mathrm{m^3}"},
+    {"id": "frozen_raw_target", "latex": "\\Omega_T", "meaning": "Fizyczny obszar targetów torque", "si_unit": "\\mathrm{m^3}"},
+    {"id": "frozen_free_support", "latex": "\\Omega_U", "meaning": "Obszar swobodnych aktywnych magnetycznych DOF", "si_unit": "\\mathrm{m^3}"},
+    {"id": "frozen_delta_torque", "latex": "\\Delta\\mathbf T_{\\mathrm{tr}}", "meaning": "Różnica transportowych źródeł Gilberta użyta w istniejącym outer-error gate", "si_unit": "\\mathrm{s^{-1}}"},
+    {"id": "frozen_delta_m", "latex": "\\delta\\mathbf m_{\\mathrm{emb}}", "meaning": "Istniejący embedded estimator przed renormalizacją, projektowany na free support", "si_unit": "1"},
+    {"id": "frozen_dt", "latex": "\\Delta t", "meaning": "Rzeczywisty czas kroku", "si_unit": "\\mathrm{s}"},
+    {"id": "frozen_eta", "latex": "\\eta_{\\mathrm{tr}}", "meaning": "Istniejący udział błędu transportu w budżecie kroku", "si_unit": "1"},
+    {"id": "frozen_support_volume", "latex": "\\lvert\\Omega_{T,U}\\rvert", "meaning": "Objętość wspólnego supportu", "si_unit": "\\mathrm{m^3}"},
+    {"id": "frozen_dv", "latex": "\\mathrm dV", "meaning": "Miara objętościowa", "si_unit": "\\mathrm{m^3}"},
+
     {"id": "tensor_flow_axis", "latex": "$i$", "meaning": "indeks osi przepływu x/y/z jako 0/1/2", "si_unit": "$1$"},
     {"id": "tensor_spin_axis", "latex": "$a$", "meaning": "indeks polaryzacji spinu x/y/z jako 0/1/2", "si_unit": "$1$"},
     {"id": "tensor_component_index", "latex": "$c$", "meaning": "indeks komponentu payloadu flow-major", "si_unit": "$1$"},
@@ -188,6 +201,20 @@
     {"id": "boris_M_rtol", "latex": "\\epsilon_{\\mathrm{rel}}", "meaning": "względna tolerancja eksportu M", "si_unit": "1"}
   ],
   "sources": [
+    {"id": "frozen-aux-contract", "path": "docs/physics/0996-frozen-spins-constraint.md", "symbol": "DOC-ANCHOR:frozen-spins-auxiliary-transport-time", "responsibility": "Prerejestracja no-op M oraz aktywnego transportu w fizycznym czasie; runtime niezweryfikowany.", "evidence_status": "planned_contract"},
+    {"id": "frozen-aux-spec", "path": "docs/specs/frozen-spins-v1.md", "symbol": "DOC-ANCHOR:frozen-v1-all-frozen", "responsibility": "Executed steps, czas, pause/cancel i odmowa Relax+M3.", "evidence_status": "planned_contract"},
+    {"id": "frozen-free-error-contract", "path": "docs/physics/0970-spin-hall-drift-diffusion-transport.md", "symbol": "DOC-ANCHOR:spin-transport-frozen-free-error-support", "responsibility": "Wspólny free-target support outer-error gate; bez zmiany bilansów.", "evidence_status": "planned_contract"},
+    {"id": "frozen-coupled-runner", "path": "crates/fullmag-runner/src/fdm/cpu/reference.rs", "symbol": "execute_reference_fdm_with_coupled_checkpoint", "responsibility": "Istniejący owner czasu, counters, outputs i completion; shortcut/gates wymagają naprawy.", "evidence_status": "source_only_unqualified"},
+    {"id": "frozen-coupled-heun", "path": "crates/fullmag-runner/src/fdm/cpu/reference.rs", "symbol": "execute_coupled_heun_trial", "responsibility": "Istniejący transaction Heun evaluate/commit/rollback.", "evidence_status": "source_only_unqualified"},
+    {"id": "frozen-coupled-ars", "path": "crates/fullmag-runner/src/fdm/cpu/reference.rs", "symbol": "execute_coupled_ars_trial", "responsibility": "Istniejący transaction ARS i historia M3.", "evidence_status": "source_only_unqualified"},
+    {"id": "frozen-heun-stages", "path": "crates/fullmag-engine/src/fdm/cpu/integrators.rs", "symbol": "heun_trial_with_external_stage_terms_and_lte", "responsibility": "Etapowe callbacks, mask/restore i estimator; free-target scope niezweryfikowany.", "evidence_status": "source_only_unqualified"},
+    {"id": "frozen-stage-budget", "path": "crates/fullmag-engine/src/fdm/shared/types.rs", "symbol": "TransportStageErrorBudget", "responsibility": "Istniejące dt_s i scalar LTE na granicy integrator-workflow; per-module free-target informacja wymaga implementacji.", "evidence_status": "source_only_unqualified"},
+    {"id": "frozen-outer-budget", "path": "crates/fullmag-engine/src/fdm/cpu/transport/coupled_charge_spin.rs", "symbol": "CoupledTransportOuterErrorBudget", "responsibility": "Istniejący budżet outer-error z Gilbert-source delta; nie wprowadzać arbitralnego floor.", "evidence_status": "source_only_unqualified"},
+    {"id": "frozen-workflow", "path": "crates/fullmag-runner/src/fdm/cpu/spin_transport.rs", "symbol": "FdmSpinTransportWorkflow", "responsibility": "Istniejący accepted/rejected counters, cache, snapshot i checkpoint.", "evidence_status": "source_only_unqualified"},
+    {"id": "frozen-outer-norm", "path": "crates/fullmag-engine/src/fdm/cpu/transport/coupled_charge_spin.rs", "symbol": "transport_torque_delta_l2", "responsibility": "Istniejąca norma targetów; dodanie free constraint scope pozostaje prerejestracją.", "evidence_status": "source_only_unqualified"},
+    {"id": "frozen-time-events", "path": "crates/fullmag-runner/src/time_events.rs", "symbol": "build_resolved_stage_event_schedule_with_origin", "responsibility": "Istniejący owner zdarzeń; envelope current i fixed M3 clipping wymagają dowodów/naprawy.", "evidence_status": "source_only_unqualified"},
+    {"id": "frozen-relax-policy", "path": "crates/fullmag-plan/src/validate.rs", "symbol": "validate_conservative_relaxation", "responsibility": "Istniejąca odmowa niekonserwatywnych torque; jawna odmowa Relax+M3 jeszcze niezaimplementowana.", "evidence_status": "source_only_unqualified"},
+
     {"id": "boris-source-image-admit-toolchain", "path": "scripts/local_runner/boris_cpu.py", "symbol": "admit_toolchain", "responsibility": "Bind exact source bytes and qualified toolchain inputs or verify offline source-image provenance; no solver qualification.", "evidence_status": "source_only"},
     {"id": "boris-source-image-clean-blob-ids", "path": "scripts/local_runner/boris_cpu.py", "symbol": "clean_blob_ids", "responsibility": "Bind exact source bytes and qualified toolchain inputs or verify offline source-image provenance; no solver qualification.", "evidence_status": "source_only"},
     {"id": "boris-source-image-prepare-context", "path": "scripts/local_runner/boris_cpu.py", "symbol": "prepare_context", "responsibility": "Bind exact source bytes and qualified toolchain inputs or verify offline source-image provenance; no solver qualification.", "evidence_status": "source_only"},

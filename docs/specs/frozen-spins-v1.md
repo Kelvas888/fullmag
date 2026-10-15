@@ -213,24 +213,63 @@ capability IDs, backend realization, mask/reference fingerprints, counts,
 precision i diagnostykę driftu.
 
 (frozen-v1-all-frozen)=
-## 11. Wszystkie aktywne DOF zamrożone
+## 11. Wszystkie aktywne magnetyczne DOF zamrożone
 
-Gdy $U=\varnothing$, stage jest deterministycznym no-op:
+Poniższa prerejestracja rozdziela magnetyczny no-op od ewolucji aktywnych
+pól transportu. Rozszerzenie all-frozen + transport pozostaje
+`planned_contract`, runtime `NOT VERIFIED`; nie rozszerza wcześniejszej
+kwalifikacji samego constraintu.
 
-```json
-{
-  "converged": true,
-  "stop_reason": "all_active_dofs_frozen",
-  "executed_steps": 0,
-  "active_dof_count": 128,
-  "free_dof_count": 0
-}
-```
+### 11.1. Czysto magnetyczny all-frozen
 
-Pola/energia mogą zostać odświeżone raz na potrzeby wymaganych outputs. Nie
-wykonuje się integratora ani minimizatora. `max_torque_all_Apm` może być
-niezerowe i jest diagnostyczne; stop metric po $U$ ma wartość zerową z jawnym
-powodem zakończenia, a nie wynik pustej redukcji NaN.
+Gdy $U=\varnothing$ i stage nie wykonuje pomocniczego transportu, zachowany
+jest deterministyczny no-op magnetyczny: `executed_steps=0`,
+`converged=true`, `stop_reason=all_active_dofs_frozen`. Nie uruchamia się
+integratora ani minimizatora. W dynamice zegar może osiągnąć zadany endpoint
+analitycznie; relaksacja/minimizator nie wytwarza czasu fizycznego. Pola/energia
+mogą być odświeżone na potrzeby wymaganych outputs. Diagnostyczne
+`max_torque_all_Apm` może być niezerowe; redukcje po pustym $U$ wynoszą zero.
+
+### 11.2. Aktywny transport w TimeEvolution
+
+All-frozen dotyczy M, nie zamraża potencjału ładunkowego ani stanu spinowego.
+Aktywny transport w `TimeEvolution` wykonuje istniejący coupled integrator:
+M1/M2 — obsługiwany fixed Heun; M3 — `coupled_imex_ark2`, fixed lub adaptive
+zgodnie z oddzielnymi bramkami lane. Na każdym etapie pełny RHS podlega
+final-mask, a każdy candidate przywraca tę samą referencję M. Nie zmienia się
+fizycznego torque/obserwabli na zamrożonych targetach.
+
+`executed_steps` oraz istniejące workflow `accepted_steps/rejected_steps`
+raportują rzeczywiste próby/kroki fizycznego czasu; nie wolno podmienić ich
+zerem dlatego, że M się nie zmieniło. `step_count`, `StepStats.time/dt`,
+`accepted.evaluated_time_s` i historia/checkpoint opisują ten sam zaakceptowany
+stan. Tylko istniejący begin-attempt/evaluate/commit/rollback promuje transport.
+Błąd nie publikuje trialu ani nie zmienia accepted/cache/history. Zerowy krok,
+ręczne nadanie accepted i przeskok zegara bez rozwiązanego transportu są zabronione.
+
+Jedynym właścicielem czasu pozostaje stage i istniejący harmonogram zdarzeń.
+Oceny źródeł używają rzeczywistego czasu podkroku oraz uzgodnionej authored
+semantyki absolute/stage-local. Krok jest obcinany do najbliższego breakpointu
+źródła, wymaganego outputu i finalnego endpointu. Stała siatka M3 nie może
+pominąć zdarzenia; partial step zachowuje rzeczywiste dt i historię. Nie wolno
+przepisać wyniku solve dla jednego czasu na inny `canonical_fixed_target`.
+
+Sukces wymaga faktycznie zaakceptowanego transportu dla końcowego czasu;
+`Paused`/`Cancelled` zachowuje rzeczywisty czas i spójny StageCompletionIR,
+bez completed/converged ani analytical jump. All-frozen metric opisuje M,
+nie stanowi dowodu zbieżności transportu. Restart odtwarza M reference oraz
+właściwy accepted transport, historię i kontroler albo odmawia bez fallbacku.
+
+### 11.3. Relaksacja i minimalizacja
+
+`Relaxation` pozostaje konserwatywnym workflow. Aktywne niekonserwatywne
+torque jest już odrzucane przez `validate_conservative_relaxation`.
+Transport transient M3 w Relax jest w tej prerejestracji jawnie unsupported,
+także z nieaktywnym torque: brak kanonicznego kryterium zbieżności transient
+transportu w Relax. Nie dodaje się takiego kryterium ani pseudoczasu.
+Direct PG-BB/NCG + dynamic transport nadal podlega istniejącej odmowie.
+Nie wynika stąd nowa odmowa istniejącego statycznego grafu steady/zero-current
+z wyłączonym torque; jego dotychczasowe bramki pozostają w mocy.
 
 (frozen-v1-capabilities)=
 ## 12. Capability vocabulary i failure semantics
