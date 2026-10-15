@@ -193,6 +193,11 @@ pub(crate) fn execute_accepted_fem_attempt(
         bail!("accepted FEM state output decoded to a non-magnetization artifact");
     };
     let accepted_state_ref = if prepared.resolved_device == "gpu" {
+        let algorithm = match &prepared.problem.study {
+            StudyIR::Relaxation { algorithm, .. } => *algorithm,
+            _ => RelaxationAlgorithmIR::LlgOverdamped,
+        };
+        validate_projected_gradient_bb_receipt(algorithm, &state.provenance)?;
         let gpu_uuid = prepared
             .gpu_uuid
             .as_deref()
@@ -302,6 +307,11 @@ pub(crate) fn accepted_state_ref_from_attempt_snapshot(
         let DecodedStudyArtifact::MagnetizationState(state) = decoded else {
             bail!("accepted FEM GPU recovery final state is not a magnetization artifact");
         };
+        let algorithm = match &accepted_step.problem.study {
+            StudyIR::Relaxation { algorithm, .. } => *algorithm,
+            _ => RelaxationAlgorithmIR::LlgOverdamped,
+        };
+        validate_projected_gradient_bb_receipt(algorithm, &state.provenance)?;
         let rebuilt = FemGpuAcceptedStateSnapshotV1::from_magnetization_state(&state, gpu_uuid)
             .map_err(anyhow::Error::msg)
             .context("rebuild accepted FEM GPU state identity during recovery")?;
@@ -409,17 +419,82 @@ fn validate_fem_request(
 fn validate_gpu_study_scope(problem: &fullmag_ir::ProblemIR) -> Result<()> {
     match &problem.study {
         StudyIR::TimeEvolution { .. } => Ok(()),
-        StudyIR::Relaxation {
-            algorithm: RelaxationAlgorithmIR::LlgOverdamped,
-            ..
-        } => Ok(()),
+        StudyIR::Relaxation { algorithm, .. }
+            if accepted_gpu_relaxation_algorithm(*algorithm) => Ok(()),
         StudyIR::Relaxation { algorithm, .. } => bail!(
             "accepted FEM GPU does not have a native execution receipt for relaxation algorithm {algorithm:?}"
         ),
         _ => bail!(
-            "accepted FEM GPU requires TimeEvolution or LLG-overdamped Relaxation scope"
+            "accepted FEM GPU requires TimeEvolution, LLG-overdamped Relaxation, or ProjectedGradientBb scope"
         ),
     }
+}
+
+fn accepted_gpu_relaxation_algorithm(algorithm: RelaxationAlgorithmIR) -> bool {
+    matches!(
+        algorithm,
+        RelaxationAlgorithmIR::LlgOverdamped | RelaxationAlgorithmIR::ProjectedGradientBb
+    )
+}
+
+/// Bind the newly accepted FEM GPU PG-BB scope to the runner's typed native
+/// receipt and direct-minimizer realization.  The state snapshot constructor
+/// remains the authority for the complete strict device receipt; this check
+/// adds the algorithm-specific identity that the generic receipt cannot carry.
+fn validate_projected_gradient_bb_receipt(
+    algorithm: RelaxationAlgorithmIR,
+    provenance: &serde_json::Value,
+) -> Result<()> {
+    if algorithm != RelaxationAlgorithmIR::ProjectedGradientBb {
+        return Ok(());
+    }
+
+    for (key, expected) in [
+        ("execution_engine", "fem_native_gpu"),
+        ("execution_mode", "strict"),
+        ("requested_energy_minimizer", "projected_gradient_bb"),
+        ("resolved_energy_minimizer", "projected_gradient_bb"),
+        ("energy_minimizer_realization", "native_cuda_pgbb"),
+    ] {
+        if provenance.get(key).and_then(serde_json::Value::as_str) != Some(expected) {
+            bail!(
+                "accepted FEM GPU ProjectedGradientBb receipt has {key} other than `{expected}`"
+            );
+        }
+    }
+    if provenance
+        .get("resolved_fallback")
+        .is_some_and(|fallback| !fallback.is_null())
+        || provenance
+            .get("lossy_fallback_used")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        bail!("accepted FEM GPU ProjectedGradientBb receipt records a fallback");
+    }
+
+    let receipt: fullmag_runner::FemGpuExecutionReceipt = serde_json::from_value(
+        provenance
+            .get("fem_gpu_execution_receipt")
+            .cloned()
+            .context("accepted FEM GPU ProjectedGradientBb receipt is missing")?,
+    )
+    .context("decode accepted FEM GPU ProjectedGradientBb receipt")?;
+    if receipt.requested != "strict_device"
+        || receipt.resolved != "device_resident"
+        || receipt.executed != "cuda_fem"
+        || receipt.precision != "double"
+        || receipt.device_ordinal != 0
+        || receipt.accepted_step_count == 0
+    {
+        bail!(
+            "accepted FEM GPU ProjectedGradientBb receipt is not the strict double CUDA realization"
+        );
+    }
+    receipt
+        .validate_strict_device()
+        .map_err(|error| anyhow::anyhow!("native FEM GPU receipt rejected: {error}"))?;
+    Ok(())
 }
 
 fn validate_native_fem_preflight(
@@ -539,6 +614,75 @@ fn is_truthy(value: &str) -> bool {
 
 #[cfg(test)]
 mod source_contract_tests {
+    use super::{
+        accepted_gpu_relaxation_algorithm, validate_projected_gradient_bb_receipt,
+    };
+    use fullmag_ir::RelaxationAlgorithmIR;
+    use serde_json::json;
+
+    #[test]
+    fn accepted_gpu_scope_admits_pgbb_and_rejects_unqualified_direct_minimizers() {
+        assert!(accepted_gpu_relaxation_algorithm(
+            RelaxationAlgorithmIR::ProjectedGradientBb
+        ));
+        assert!(accepted_gpu_relaxation_algorithm(
+            RelaxationAlgorithmIR::LlgOverdamped
+        ));
+        assert!(!accepted_gpu_relaxation_algorithm(
+            RelaxationAlgorithmIR::NonlinearCg
+        ));
+        assert!(!accepted_gpu_relaxation_algorithm(
+            RelaxationAlgorithmIR::TangentPlaneImplicit
+        ));
+    }
+
+    #[test]
+    fn projected_gradient_bb_requires_the_typed_native_cuda_receipt() {
+        let provenance = json!({
+            "execution_engine": "fem_native_gpu",
+            "execution_mode": "strict",
+            "requested_energy_minimizer": "projected_gradient_bb",
+            "resolved_energy_minimizer": "projected_gradient_bb",
+            "energy_minimizer_realization": "native_cuda_pgbb",
+            "fem_gpu_execution_receipt": {
+                "requested": "strict_device",
+                "resolved": "device_resident",
+                "executed": "cuda_fem",
+                "execution_class": "device_resident",
+                "device_ordinal": 0,
+                "precision": "double",
+                "integrator": "heun",
+                "required_operator_mask": 1023,
+                "resolved_device_operator_mask": 1023,
+                "resolved_host_operator_mask": 0,
+                "resolved_unknown_operator_mask": 0,
+                "executed_device_operator_mask": 1023,
+                "executed_host_operator_mask": 0,
+                "executed_unknown_operator_mask": 0,
+                "fallback_count": 0,
+                "accepted_step_count": 1,
+                "rejected_attempt_count": 0,
+                "failed_attempt_count": 0,
+                "hot_loop_compute_h2d_bytes": 0,
+                "hot_loop_compute_d2h_bytes": 0,
+                "hot_loop_compute_host_sync_count": 0,
+                "accounting_valid": true
+            }
+        });
+        assert!(validate_projected_gradient_bb_receipt(
+            RelaxationAlgorithmIR::ProjectedGradientBb,
+            &provenance
+        )
+        .is_ok());
+        let mut wrong_realization = provenance.clone();
+        wrong_realization["energy_minimizer_realization"] = json!("native_mfem_pgbb");
+        assert!(validate_projected_gradient_bb_receipt(
+            RelaxationAlgorithmIR::ProjectedGradientBb,
+            &wrong_realization
+        )
+        .is_err());
+    }
+
     #[test]
     fn common_worker_retains_stop_completion_and_recovery_fences() {
         let source = include_str!("accepted_study_worker.rs");
@@ -621,6 +765,7 @@ mod source_contract_tests {
             "RUNNER_FINAL_STATE_FILE",
             "read_explicit_runner_artifact",
             "FemGpuAcceptedStateSnapshotV1::from_magnetization_state",
+            "validate_projected_gradient_bb_receipt",
             "rebuilt != snapshot",
             "authoritative device UUID",
         ] {

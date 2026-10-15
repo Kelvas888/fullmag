@@ -23,8 +23,9 @@ Requested `cpu` lub `gpu` musi zgadzać się z rzeczywistym lease. `auto` pozost
 w authored intent; jawny override managed launchera wskazuje przydzielony
 resolved device. Brak zgodnego lease, natywnego runtime lub dowodu urządzenia
 kończy preflight przed solver side effect i `started receipt`. GPU nie może
-spaść do CPU. Pierwszy adapter GPU obejmuje H1/P1, double, strict, time evolution
-i LLG-overdamped relaxation z istniejącej capability map. Inne minimizery,
+spaść do CPU. Pierwszy adapter GPU obejmuje H1/P1, double, strict, time evolution,
+LLG-overdamped relaxation oraz jawnie wybrany FEM `ProjectedGradientBb` z
+realizacją `native_cuda_pgbb`. Inne minimizery, FDM direct minimizers,
 nieobsługiwane outputs oraz niezakwalifikowane kombinacje pozostają odrzucone.
 Nie promujemy przy tym statusu naukowej walidacji żadnej fizyki.
 
@@ -45,6 +46,11 @@ host/unknown, zera fallbacków i transferów compute w hot loop. Pozytywny krok
 i zegar pochodzą z natywnego snapshotu. Recovery odczytuje bounded immutable
 `m_final.json`, ponownie dekoduje receipt i porównuje odtworzony envelope;
 nie uruchamia solvera ponownie. CPU zachowuje własny schema v1 i carriers.
+Dla FEM `ProjectedGradientBb` final provenance musi dodatkowo zachować
+`requested_energy_minimizer=projected_gradient_bb`,
+`resolved_energy_minimizer=projected_gradient_bb` oraz
+`energy_minimizer_realization=native_cuda_pgbb`; brak zgodności kończy attempt
+failure bez fallbacku.
 
 Wspólny ledger hosta używa oddzielnego profilu `host-ledger-v1`: ext4 backing
 pod kanonicznym `storage/build-volumes`, zarządzany mount i bind `/host-ledger`
@@ -148,7 +154,8 @@ receipty. Nie zastępuje GPU ofertą CPU i nie restartuje działającej symulacj
 ## Weryfikacja
 
 Wymagane są regresje request/lease/auto, UUID i launch binding, niepełnych lub
-hybrydowych native receipts, topology/freshness, recovery oraz zgodności CPU.
+hybrydowych native receipts, strict `native_cuda_pgbb` provenance,
+topology/freshness, recovery oraz zgodności CPU.
 Kompilacja unit tests odbywa się wyłącznie w CI tego zadania, zgodnie z wyjątkiem
 użytkownika. Do odbioru potrzebny jest końcowy managed build frontendu i backendu,
 realne zadanie FEM GPU przez API, FDM GPU z formularza, terminal release,

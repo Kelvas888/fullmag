@@ -1025,7 +1025,7 @@ fn materialize_live_accepted(
             return Err(ApiError::unprocessable_with_code(
                 "accepted_gpu_scope_unsupported",
                 format!(
-                    "accepted GPU execution for study step `{}` is limited to TimeEvolution and LLG-overdamped Relaxation",
+                    "accepted GPU execution for study step `{}` is limited to TimeEvolution, LLG-overdamped Relaxation, and explicit FEM ProjectedGradientBb",
                     entry.step_id()
                 ),
             ));
@@ -1248,14 +1248,36 @@ fn select_live_step(
 }
 
 fn bounded_gpu_scope(problem: &fullmag_ir::ProblemIR) -> bool {
-    matches!(
-        &problem.study,
+    match &problem.study {
         fullmag_ir::StudyIR::TimeEvolution { .. }
-            | fullmag_ir::StudyIR::Relaxation {
-                algorithm: fullmag_ir::RelaxationAlgorithmIR::LlgOverdamped,
-                ..
-            }
-    )
+        | fullmag_ir::StudyIR::Relaxation {
+            algorithm: fullmag_ir::RelaxationAlgorithmIR::LlgOverdamped,
+            ..
+        } => true,
+        fullmag_ir::StudyIR::Relaxation {
+            algorithm: fullmag_ir::RelaxationAlgorithmIR::ProjectedGradientBb,
+            ..
+        } => bounded_gpu_relaxation_algorithm(
+            problem.backend_policy.requested_backend,
+            fullmag_ir::RelaxationAlgorithmIR::ProjectedGradientBb,
+        ),
+        _ => false,
+    }
+}
+
+/// Accepted GPU direct-minimizer scope is deliberately narrower than the
+/// runner support matrix: the first durable Workspace extension is the
+/// explicit FEM native CUDA PG-BB lane.  FDM PG-BB and other direct minimizers
+/// stay fail-closed until their own accepted receipt contract exists.
+fn bounded_gpu_relaxation_algorithm(
+    backend: fullmag_ir::BackendTarget,
+    algorithm: fullmag_ir::RelaxationAlgorithmIR,
+) -> bool {
+    backend == fullmag_ir::BackendTarget::Fem
+        && matches!(
+            algorithm,
+            fullmag_ir::RelaxationAlgorithmIR::ProjectedGradientBb
+        )
 }
 
 fn minimum_resource_budget(
@@ -1444,7 +1466,29 @@ fn profile_catalog_error(message: String) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::request_accepted_stop_for_catalog;
+    use super::{bounded_gpu_relaxation_algorithm, request_accepted_stop_for_catalog};
+
+    #[test]
+    fn accepted_gpu_scope_allows_only_explicit_fem_projected_gradient_bb() {
+        use fullmag_ir::{BackendTarget, RelaxationAlgorithmIR};
+
+        assert!(bounded_gpu_relaxation_algorithm(
+            BackendTarget::Fem,
+            RelaxationAlgorithmIR::ProjectedGradientBb
+        ));
+        assert!(!bounded_gpu_relaxation_algorithm(
+            BackendTarget::Fdm,
+            RelaxationAlgorithmIR::ProjectedGradientBb
+        ));
+        assert!(!bounded_gpu_relaxation_algorithm(
+            BackendTarget::Fem,
+            RelaxationAlgorithmIR::NonlinearCg
+        ));
+        assert!(!bounded_gpu_relaxation_algorithm(
+            BackendTarget::Fem,
+            RelaxationAlgorithmIR::TangentPlaneImplicit
+        ));
+    }
 
     fn queued_task(task_id: &str) -> fullmag_session::FmsTaskCatalogEntry {
         fullmag_session::FmsTaskCatalogEntry {

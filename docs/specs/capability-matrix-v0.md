@@ -48,8 +48,9 @@ korzysta z istniejącego API v2, compute profiles i typed study outputs.
 GPU oferta musi pochodzić z aktualnego natywnego probe i host ledgeru,
 a forced GPU nie może konsumować lease CPU.
 
-Pierwszy accepted FEM GPU zakres obejmuje H1/P1, double, strict, time evolution
-i LLG-overdamped relaxation, `final_state` i opcjonalny `total_energy`.
+Pierwszy accepted FEM GPU zakres obejmuje H1/P1, double, strict, time evolution,
+LLG-overdamped relaxation oraz jawnie wybrany FEM `ProjectedGradientBb` z
+realizacją `native_cuda_pgbb`, `final_state` i opcjonalnym `total_energy`.
 Native strict-device receipt, mapa węzłów, indexed geometry i zegar finalnego
 snapshotu są wymagane do publikacji; ich brak kończy attempt failure.
 Bez odpowiedniego profilu hosta GPU pozostaje niedostępne dla accepted runs,
