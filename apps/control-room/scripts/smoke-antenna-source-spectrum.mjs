@@ -25,8 +25,8 @@ try {
   page = await browser.newPage({ viewport: { width: 1280, height: 1000 } });
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
-  const readyScenarios = ["ready", "ready-vector", "ready-unitary"];
-  const malformedMetadata = ["wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha"];
+  const readyScenarios = ["ready", "ready-vector", "ready-unitary", "ready-large"];
+  const malformedMetadata = ["oversized-grid", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha"];
   const malformedBytes = ["truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"];
   const readyScenarioSet = new Set(readyScenarios);
   const malformedMetadataSet = new Set(malformedMetadata);
@@ -58,11 +58,55 @@ try {
     const ready = readyScenarioSet.has(scenario), bytesFailure = malformedBytesSet.has(scenario);
     if (bytesFailure) assert.ok(text.includes(binaryDiagnostics[scenario]), `${scenario} did not report the intended rejection: ${text}`);
     if (ready) {
+      const payloadBox = await page.locator('section[aria-label="Antenna source spectrum payload"]').boundingBox();
+      assert.ok(payloadBox && payloadBox.y < 450, "The source chart must precede long configuration/provenance details");
+      const gridBox = await page.getByRole("grid").boundingBox();
+      assert.ok(gridBox && Math.abs(gridBox.x + gridBox.width / 2 - payloadBox.x - payloadBox.width / 2) < 2, "The bounded source map must remain centered in the Inspector");
+      assert.equal(await page.getByRole("button", { name: /Configuration and provenance/ }).getAttribute("aria-expanded"), "false");
       const unit = scenario === "ready-unitary" ? "(A/m/A)^2" : "(A*m/A)^2";
-      assert.ok(text.includes(`Peak ${scenario === "ready-vector" ? "4.800e+1" : "1.600e+1"} ${unit}`), "Peak power or normalization unit differs from controlled complex amplitudes");
+      assert.ok(text.includes(`Peak ${scenario === "ready-vector" ? "4.800e+1" : scenario === "ready-large" ? "1.897e+7" : "1.600e+1"} ${unit}`), "Peak power or normalization unit differs from controlled complex amplitudes");
       assert.ok((await page.getByRole("gridcell").first().getAttribute("aria-label"))?.includes(unit), "Scientific cell tooltip lost power SI unit");
+      assert.ok((await page.getByRole("group", { name: "Source spectrum color scale" }).innerText()).includes(unit), "Color scale lost its physical power unit");
     }
-    const passed = ready ? payloads.length === 4 && sectionCount === 1 && gridCells === 4
+    if (scenario === "ready-large") {
+      const grid = page.getByRole("grid");
+      assert.equal(await grid.getAttribute("aria-rowcount"), "64"); assert.equal(await grid.getAttribute("aria-colcount"), "64");
+      await grid.getByRole("gridcell").first().focus(); await page.keyboard.press("Control+End");
+      const sample = await page.getByRole("group", { name: "Selected source spectrum sample" }).innerText();
+      assert.ok(sample.includes("Bin maximum") && sample.includes("3.200e+1 rad/m") && sample.includes("3.300e+1 rad/m") && sample.includes("1.897e+7"));
+      assert.ok(text.includes("max-pooled") && text.includes("sample indices, not k-distance"));
+      assert.ok(text.includes("k_u range: -3.200e+1") && text.includes("k_v range: -3.300e+1"));
+      const payloadScreenshot = resolve(directory, "ready-large-payload.png");
+      await page.locator('section[aria-label="Antenna source spectrum payload"]').screenshot({ path: payloadScreenshot }); screenshots.push(payloadScreenshot);
+      checks.push({ name: "65×67 source grid stays within 4096 DOM cells and preserves the exact global peak and SI coordinates through max pooling and keyboard inspection", passed: true });
+    }
+    if (scenario === "oversized-grid") assert.ok(text.includes("64 MiB interactive display budget"), "The large manifest must be refused before binary reads");
+    if (scenario === "ready") {
+      const grid = page.getByRole("grid");
+      await page.evaluate(() => { window.__spectrumKeyboardGrid = document.querySelector('[role="grid"]'); });
+      const mouseCell = grid.getByRole("gridcell").nth(1);
+      await mouseCell.click();
+      assert.equal(await mouseCell.getAttribute("aria-selected"), "true");
+      assert.equal(await mouseCell.evaluate(cell => getComputedStyle(cell).outlineWidth), "2px");
+      assert.ok((await page.getByRole("group", { name: "Selected source spectrum sample" }).innerText()).includes("4.000e+0"));
+      await grid.getByRole("gridcell").first().focus();
+      const focusedIndex = () => page.evaluate(() => document.activeElement?.getAttribute("data-spectrum-cell-index"));
+      await page.keyboard.press("ArrowRight");
+      assert.equal(await focusedIndex(), "1", "ArrowRight must inspect the next column");
+      await page.keyboard.press("ArrowDown");
+      assert.equal(await focusedIndex(), "3", "ArrowDown must preserve the column");
+      await page.keyboard.press("Control+Home");
+      assert.equal(await focusedIndex(), "0", "Ctrl+Home must reach the first sample");
+      await page.keyboard.press("Control+End");
+      assert.equal(await focusedIndex(), "3", "Ctrl+End must reach the last sample");
+      assert.equal(await grid.locator('[role="gridcell"][tabindex="0"]').count(), 1, "The grid must have one tab stop");
+      assert.ok((await page.getByRole("group", { name: "Selected source spectrum sample" }).innerText()).includes("Power"));
+      assert.equal(await page.evaluate(() => document.querySelector('[role="grid"]') === window.__spectrumKeyboardGrid), true);
+      const afterKeyboard = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+      assert.equal(afterKeyboard.calls.length, before.calls.length, "Keyboard inspection must not refetch payloads");
+      checks.push({ name: "Mouse and keyboard preserve grid DOM, show a selected-cell outline, use one tab stop, expose sample SI values and make no requests", passed: true });
+    }
+    const passed = ready ? payloads.length === 4 && sectionCount === 1 && gridCells === (scenario === "ready-large" ? 4096 : 4)
       : bytesFailure ? payloads.length > 0 && payloads.length <= 4 && gridCells === 0 && text.includes("FFT payload")
         : payloads.length === 0 && gridCells === 0 && (malformedMetadataSet.has(scenario) ? text.includes("Antenna spectrum") : sectionCount === 0);
     checks.push({ name: `${scenario}: ${ready ? "matched metadata renders four scoped carriers" : bytesFailure ? "refuses corrupt binary grid" : "refuses binary reads and payload view"}`, passed, payloadRequests: payloads.length, sectionCount, gridCells });

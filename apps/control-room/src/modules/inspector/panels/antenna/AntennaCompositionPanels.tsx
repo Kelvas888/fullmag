@@ -741,8 +741,9 @@ function sourceSpectrumRuntimeRows(
 ): DetailRow[] {
   const data = result.data;
   const rows: DetailRow[] = [{ label: "Runtime result", value: verifiedStatus }];
-  if (result.error) {
-    rows.push({ label: "Runtime error", value: result.error.message });
+  const error = result.error ?? result.refreshError;
+  if (error) {
+    rows.push({ label: "Runtime error", value: error.message });
   }
   if (!data || verifiedStatus !== "ready") return rows;
   rows.push(
@@ -750,7 +751,7 @@ function sourceSpectrumRuntimeRows(
     { label: "Content digest", value: data.content_digest, mono: true },
     { label: "Quantity", value: `${data.quantity} / ${data.component}` },
     { label: "Field signature", value: data.field_signature, mono: true },
-    { label: "k-grid", value: `${data.k_u_count} × ${data.k_v_count}` },
+    { label: "Published k-grid", value: `${data.k_u_count} × ${data.k_v_count}` },
     {
       label: "Amplitude samples",
       value: `${data.amplitude_count} · ${data.amplitude_unit}`,
@@ -775,8 +776,9 @@ function stageOutputCatalogRuntimeRows(
   const status = runtimeStatus(stageId, result);
   const data = result.data;
   const rows: DetailRow[] = [{ label: "Stage catalog result", value: status }];
-  if (result.error) {
-    rows.push({ label: "Stage catalog error", value: result.error.message });
+  const error = result.error ?? result.refreshError;
+  if (error) {
+    rows.push({ label: "Stage catalog error", value: error.message });
   }
   if (!data) return rows;
   rows.push(
@@ -848,10 +850,11 @@ function enrichRuntimeModel(
   }
   if (kind === "spectrum") {
     const spectrumStatus = antennaSpectrumIdentityStatus(ids, sourceSpectrum, stageOutputCatalog);
-    rows.push(...sourceSpectrumRuntimeRows(sourceSpectrum, spectrumStatus));
+    const currentStatus = model.badge.startsWith("invalid") ? "authoring invalid" : spectrumStatus;
+    rows.push(...sourceSpectrumRuntimeRows(sourceSpectrum, currentStatus));
     return {
       ...model,
-      badge: runtimeBadge(model.badge, spectrumStatus),
+      badge: currentStatus === "authoring invalid" ? model.badge : runtimeBadge(model.badge, spectrumStatus),
       rows,
     };
   }
@@ -908,7 +911,21 @@ export function AntennaCompositionPanel({
 
   return (
     <div className="fm-inspector-panel">
-      {kind === "conductor" ? <AntennaConductorDetails objectId={objectId} scene={scene.data} /> : <InspectorGroup title={model.title} badge={model.badge}>
+      {kind === "spectrum" ? <InspectorGroup title={model.title} badge={model.badge}>
+        {model.rows.filter(row => ["Validation", "Runtime result", "Runtime error", "Stage catalog error"].includes(row.label)).map(row => <FieldRow key={row.label} label={row.label} value={row.value} />)}
+        <p className="fm-inspector-hint">Spatial spectrum of the antenna source field. Magnetic response and excited modes require separate analysis.</p>
+      </InspectorGroup> : null}
+      {kind === "spectrum" &&
+      ids.spectrumOutputId &&
+      model.badge === "ready" &&
+      antennaSpectrumIdentityStatus(ids, sourceSpectrum, stageOutputCatalog) === "ready" &&
+      sourceSpectrum.data?.payloads ? (
+        <AntennaSourceSpectrumPayloadView
+          outputId={ids.spectrumOutputId}
+          spectrum={sourceSpectrum.data}
+        />
+      ) : null}
+      {kind === "conductor" ? <AntennaConductorDetails objectId={objectId} scene={scene.data} /> : <InspectorGroup title={kind === "spectrum" ? "Configuration and provenance" : model.title} badge={model.badge} collapsible={kind === "spectrum"} defaultOpen={kind !== "spectrum"}>
         {model.rows.map((row) => (
           <FieldRow
             key={row.label}
@@ -945,14 +962,7 @@ export function AntennaCompositionPanel({
       {kind === "solution" && resourceId ? <AntennaSpectrumComposer key={`spectrum:${resourceId}`} stageId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {(kind === "port" || kind === "projection" || kind === "spectrum") && resourceId ? <AntennaResourceEditor kind={kind} resourceId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "drive" && resourceId ? <SolvedAntennaDriveEditor driveId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
-      {kind === "spectrum" &&
-      ids.spectrumOutputId &&
-      sourceSpectrum.data?.payloads ? (
-        <AntennaSourceSpectrumPayloadView
-          outputId={ids.spectrumOutputId}
-          spectrum={sourceSpectrum.data}
-        />
-      ) : null}
+
     </div>
   );
 }

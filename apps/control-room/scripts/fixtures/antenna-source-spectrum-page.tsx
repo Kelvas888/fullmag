@@ -18,7 +18,7 @@ import { EMPTY_SELECTION } from "@/kernel/selection/selectionTypes";
 import type { KernelApi } from "@/kernel/types";
 import { AntennaCompositionPanel } from "@/modules/inspector/panels/antenna/AntennaCompositionPanels";
 
-const SCENARIOS = ["ready", "ready-vector", "ready-unitary", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"] as const;
+const SCENARIOS = ["ready", "ready-vector", "ready-unitary", "ready-large", "oversized-grid", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"] as const;
 const subscribe = () => () => {};
 type RefreshKind = "metadata" | "catalog" | "power";
 interface Evidence { scenario: string; calls: { path: string; scope: string | null }[]; unexpected: string[]; pending: number; streamCancelled: boolean; snapshots: Record<RefreshKind, { status: string; hasData: boolean; error: string | null }>; }
@@ -30,22 +30,31 @@ function makeFixture() {
   const calls: Evidence["calls"] = [], unexpected: string[] = [];
   const owner = { session_id: "spectrum-fixture", session_epoch: "spectrum-fixture@1:tombstone:0", request_scope_epoch: "11111111-1111-4111-8111-111111111111:1" };
   const vector = scenario === "ready-vector";
+  const uCount = scenario === "ready-large" ? 65 : 2, vCount = scenario === "ready-large" ? 67 : 2;
+  const cellCount = uCount * vCount;
   const normalization = scenario === "ready-unitary" ? "unitary_discrete" : "integral_si";
   const amplitudeUnit = normalization === "integral_si" ? "A*m/A" : "A/m/A";
-  const plane = { origin_m: [0, 0, 0], axis_u: [1, 0, 0], axis_v: [0, 1, 0], extent_u_m: 1e-6, extent_v_m: 1e-6, sample_count_u: 2, sample_count_v: 2, interpolation: "fem_element", outside_policy: "error" as const };
+  const plane = { origin_m: [0, 0, 0], axis_u: [1, 0, 0], axis_v: [0, 1, 0], extent_u_m: 1e-6, extent_v_m: 1e-6, sample_count_u: uCount, sample_count_v: vCount, interpolation: "fem_element", outside_policy: "error" as const };
   const ref = { kind: "stage_output", stage_id: "solve", output_id: "basis" };
   const scene = { revision: 1, objects: [], antenna_port_modes: [{ id: "port" }], antenna_field_solve_stages: [{ id: "solve", port_mode_ids: ["port"], outputs: [{ id: "basis", quantity: "H_ant_basis" }] }], antenna_spectrum_requests: [{ id: "request", output_id: "fft", solution_ref: ref, target: { kind: "global" }, component: scenario === "invalid-authoring" ? "transverse" : vector ? "vector_power" : "x", transform: "spatial_fft", window: "rectangular", normalization, port_mode_id: "port", sampling_plane: plane, nonuniform_k_grid: null }] };
-  const componentAmplitudes = [1, 0, 2, 0, 3, 0, 4, 0];
-  const payloadValues = { k_u_rad_per_m: [-1, 1], k_v_rad_per_m: [-1, 1], amplitudes_re_im: vector ? [...componentAmplitudes, ...componentAmplitudes, ...componentAmplitudes] : componentAmplitudes, power: [1, 4, 9, 16].map((value) => value * (vector ? 3 : 1)) };
+  const componentAmplitudes = Array.from({ length: cellCount * 2 }, (_, index) => index % 2 ? 0 : Math.floor(index / 2) + 1);
+  const payloadValues = { k_u_rad_per_m: uCount === 2 ? [-1, 1] : Array.from({ length: uCount }, (_, index) => index - 32), k_v_rad_per_m: vCount === 2 ? [-1, 1] : Array.from({ length: vCount }, (_, index) => index - 33), amplitudes_re_im: vector ? [...componentAmplitudes, ...componentAmplitudes, ...componentAmplitudes] : componentAmplitudes, power: Array.from({ length: cellCount }, (_, index) => (index + 1) ** 2 * (vector ? 3 : 1)) };
   type PayloadKind = keyof typeof payloadValues;
   const layouts = { k_u_rad_per_m: "axis_u_1d", k_v_rad_per_m: "axis_v_1d", amplitudes_re_im: "component_kv_ku_complex_re_im", power: "kv_ku_power" };
   const descriptor = (kind: PayloadKind) => ({ path: `antenna/source_spectra/fft/${kind}.f64le`, sha256: `sha256:${"b".repeat(64)}`, value_count: payloadValues[kind].length, scalar_type: "float64_le", layout: layouts[kind], unit: kind.startsWith("k_") ? "rad/m" : kind === "power" ? `(${amplitudeUnit})^2` : amplitudeUnit });
   const spectrum: AntennaSourceSpectrumResource = {
-    ...owner, schema_version: "antenna_source_spectrum_artifact.v2", resource_id: "fixture", output_id: "fft", request_id: scenario === "foreign-request" ? "foreign" : "request", solution_id: "basis", solution_content_digest: scenario === "foreign-digest" ? "foreign-digest" : "basis-digest", content_digest: "fft-digest", source_object_id: "antenna", port_mode_id: "port", quantity: "H_ant_source_spectrum", component: vector ? "vector_power" : "x", component_labels: vector ? ["x", "y", "z"] : ["x"], amplitude_unit: amplitudeUnit, wave_vector_unit: "rad/m", normalization, coherent_gain: 1, equivalent_noise_bandwidth_bins: 1, field_signature: "fixture", k_u_count: 2, k_v_count: 2, amplitude_count: vector ? 12 : 4, power_count: 4,
+    ...owner, schema_version: "antenna_source_spectrum_artifact.v2", resource_id: "fixture", output_id: "fft", request_id: scenario === "foreign-request" ? "foreign" : "request", solution_id: "basis", solution_content_digest: scenario === "foreign-digest" ? "foreign-digest" : "basis-digest", content_digest: "fft-digest", source_object_id: "antenna", port_mode_id: "port", quantity: "H_ant_source_spectrum", component: vector ? "vector_power" : "x", component_labels: vector ? ["x", "y", "z"] : ["x"], amplitude_unit: amplitudeUnit, wave_vector_unit: "rad/m", normalization, coherent_gain: 1, equivalent_noise_bandwidth_bins: 1, field_signature: "fixture", k_u_count: uCount, k_v_count: vCount, amplitude_count: cellCount * (vector ? 3 : 1), power_count: cellCount,
     payload: { content_type: "application/octet-stream", format: "fixture", path: "fixture" },
     payloads: { k_u_rad_per_m: descriptor("k_u_rad_per_m"), k_v_rad_per_m: descriptor("k_v_rad_per_m"), amplitudes_re_im: descriptor("amplitudes_re_im"), power: descriptor("power") },
-    sampling: { ...plane, schema_version: "fixture", target: { kind: "global" }, solution_id: "basis", source_object_id: "antenna", port_mode_id: "port", source_sample_count: 4, realization: "fixture", mapping_digest: "fixture", outside_count: 0, fourier_origin_uv_m: [0, 0], fourier_phase_convention: "fixture" },
+    sampling: { ...plane, schema_version: "fixture", target: { kind: "global" }, solution_id: "basis", source_object_id: "antenna", port_mode_id: "port", source_sample_count: cellCount, realization: "fixture", mapping_digest: "fixture", outside_count: 0, fourier_origin_uv_m: [0, 0], fourier_phase_convention: "fixture" },
   };
+  if (scenario === "oversized-grid") {
+    spectrum.k_u_count = 4096; spectrum.k_v_count = 4096;
+    spectrum.power_count = 4096 ** 2; spectrum.amplitude_count = spectrum.power_count;
+    for (const kind of ["k_u_rad_per_m", "k_v_rad_per_m"] as const) spectrum.payloads![kind].value_count = 4096;
+    spectrum.payloads!.power.value_count = spectrum.power_count;
+    spectrum.payloads!.amplitudes_re_im.value_count = spectrum.power_count * 2;
+  }
   if (scenario === "wrong-layout") spectrum.payloads!.power.layout = "ku_kv_power";
   if (scenario === "wrong-unit") spectrum.payloads!.power.unit = "W";
   if (scenario === "wrong-scalar") spectrum.payloads!.power.scalar_type = "float32_le";

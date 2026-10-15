@@ -1,11 +1,12 @@
 "use client";
 
-import { useMemo } from "react";
+import { useId, useMemo, useState } from "react";
 
 import type {
   AntennaSourceSpectrumResource,
   BinaryResourceResult,
 } from "@/kernel/api/apiTypes";
+import { antennaSpectrumPayloadByteLengths } from "@/kernel/api/codecs/antennaSpectrumManifestCodec";
 import { ControlRoomApiError } from "@/kernel/api/ControlRoomApi";
 import {
   antennaSpectrumPayloadEtag,
@@ -14,6 +15,7 @@ import {
 import type { ResourceResult } from "@/kernel/resources/resourceTypes";
 
 const MAX_AXIS_CELLS = 64;
+const MAX_DISPLAY_PAYLOAD_BYTES = 64 * 1024 * 1024;
 
 interface SpectrumPayloadViewProps {
   outputId: string;
@@ -42,24 +44,65 @@ export function AntennaSourceSpectrumPayloadView({
   outputId,
   spectrum,
 }: SpectrumPayloadViewProps) {
+  const manifest = useMemo(() => {
+    try {
+      const lengths = antennaSpectrumPayloadByteLengths(spectrum);
+      if (lengths.total > MAX_DISPLAY_PAYLOAD_BYTES) throw new Error("Antenna spectrum exceeds the 64 MiB interactive display budget. No binary payload was requested.");
+      return {
+        kind: "ready" as const,
+        lengths,
+        etags: {
+          k_u_rad_per_m: antennaSpectrumPayloadEtag(spectrum, "k_u_rad_per_m"),
+          k_v_rad_per_m: antennaSpectrumPayloadEtag(spectrum, "k_v_rad_per_m"),
+          amplitudes_re_im: antennaSpectrumPayloadEtag(spectrum, "amplitudes_re_im"),
+          power: antennaSpectrumPayloadEtag(spectrum, "power"),
+        },
+      };
+    } catch (error) {
+      return { kind: "error" as const,
+        error: error instanceof Error ? error : new Error("spectrum manifest validation failed") };
+    }
+  }, [spectrum]);
   const kU = useAntennaSourceSpectrumPayloadResource(outputId, "k_u_rad_per_m", {
-    expectedEtag: antennaSpectrumPayloadEtag(spectrum, "k_u_rad_per_m"),
+    enabled: manifest.kind === "ready",
+    expectedEtag: manifest.kind === "ready" ? manifest.etags.k_u_rad_per_m : undefined,
+    maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.k_u_rad_per_m : undefined,
   });
   const kV = useAntennaSourceSpectrumPayloadResource(outputId, "k_v_rad_per_m", {
-    expectedEtag: antennaSpectrumPayloadEtag(spectrum, "k_v_rad_per_m"),
+    enabled: manifest.kind === "ready",
+    expectedEtag: manifest.kind === "ready" ? manifest.etags.k_v_rad_per_m : undefined,
+    maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.k_v_rad_per_m : undefined,
   });
   const amplitudes = useAntennaSourceSpectrumPayloadResource(
     outputId,
     "amplitudes_re_im",
-    { expectedEtag: antennaSpectrumPayloadEtag(spectrum, "amplitudes_re_im") },
+    {
+      enabled: manifest.kind === "ready",
+      expectedEtag: manifest.kind === "ready" ? manifest.etags.amplitudes_re_im : undefined,
+      maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.amplitudes_re_im : undefined,
+    },
   );
   const power = useAntennaSourceSpectrumPayloadResource(outputId, "power", {
-    expectedEtag: antennaSpectrumPayloadEtag(spectrum, "power"),
+    enabled: manifest.kind === "ready",
+    expectedEtag: manifest.kind === "ready" ? manifest.etags.power : undefined,
+    maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.power : undefined,
   });
   const payloads = useMemo(
-    () => decodePayloads(kU, kV, amplitudes, power),
-    [amplitudes, kU, kV, power],
+    () => manifest.kind === "ready"
+      ? decodePayloads(kU, kV, amplitudes, power)
+      : { kind: "pending" as const },
+    [amplitudes, kU, kV, manifest, power],
   );
+
+  if (manifest.kind === "error") {
+    return (
+      <section className="fm-antenna-spectrum" aria-label="Antenna source spectrum payload">
+        <p className="fm-antenna-spectrum__status fm-antenna-spectrum__status--error" role="alert">
+          FFT manifest unavailable: {formatPayloadError(manifest.error)}
+        </p>
+      </section>
+    );
+  }
 
   if (payloads.kind === "pending") {
     return (
@@ -92,13 +135,9 @@ export function AntennaSourceSpectrumPayloadView({
   }
 
   const cells = heatmapCells(payloads.value.kU, payloads.value.kV, payloads.value.power);
-  const peak = payloads.value.power.reduce<{
-    index: number;
-    value: number;
-  } | null>((current, value, index) => {
-    if (!Number.isFinite(value)) return current;
-    return current === null || value > current.value ? { index, value } : current;
-  }, null);
+  const extrema = spectrumPowerExtrema(payloads.value.power);
+  const rangeU = spectrumPowerExtrema(payloads.value.kU), rangeV = spectrumPowerExtrema(payloads.value.kV);
+  const peak = extrema ? { index: extrema.peakIndex, value: extrema.maximum } : null;
   const peakKU = peak ? payloads.value.kU[peak.index % payloads.value.kU.length] : null;
   const peakKV = peak
     ? payloads.value.kV[Math.floor(peak.index / payloads.value.kU.length)]
@@ -122,28 +161,14 @@ export function AntennaSourceSpectrumPayloadView({
           {isBinned ? "max-pooled" : "full grid"}
         </span>
       </div>
-      <div
-        className="fm-antenna-spectrum__heatmap"
-        role="grid"
-        aria-label={`${renderedCellCount} source-spectrum power cells`}
-        style={{
-          gridTemplateColumns: `repeat(${Math.max(1, Math.min(MAX_AXIS_CELLS, payloads.value.kU.length))}, minmax(2px, 1fr))`,
-        }}
-      >
-        {cells.map((cell) => (
-          <span
-            aria-label={`${isBinned ? "bin maximum at " : ""}k_u ${formatScientific(payloads.value.kU[cell.kUIndex])} ${spectrum.wave_vector_unit}, k_v ${formatScientific(payloads.value.kV[cell.kVIndex])} ${spectrum.wave_vector_unit}, power ${formatScientific(cell.power)} ${powerUnit}`}
-            className="fm-antenna-spectrum__cell"
-            key={`${cell.kVIndex}:${cell.kUIndex}`}
-            role="gridcell"
-            style={{ opacity: 0.08 + 0.92 * cell.normalizedPower }}
-            title={`${isBinned ? "bin maximum: " : ""}k_u=${formatScientific(payloads.value.kU[cell.kUIndex])} ${spectrum.wave_vector_unit}; k_v=${formatScientific(payloads.value.kV[cell.kVIndex])} ${spectrum.wave_vector_unit}; |H|²=${formatScientific(cell.power)} ${powerUnit}`}
-          />
-        ))}
-      </div>
+      <SpectrumPowerGrid cells={cells} kU={payloads.value.kU} kV={payloads.value.kV}
+        waveVectorUnit={spectrum.wave_vector_unit} powerUnit={powerUnit} isBinned={isBinned} />
+      {extrema ? <SpectrumPowerScale minimum={extrema.minimum} maximum={extrema.maximum} unit={powerUnit} /> : null}
       <div className="fm-antenna-spectrum__axes" aria-label="Source spectrum axes">
         <span>u: {Math.min(MAX_AXIS_CELLS, payloads.value.kU.length)} / {payloads.value.kU.length} · {spectrum.wave_vector_unit}</span>
         <span>v: {Math.min(MAX_AXIS_CELLS, payloads.value.kV.length)} / {payloads.value.kV.length} · {spectrum.wave_vector_unit}</span>
+        <span>k_u range: {formatScientific(rangeU?.minimum)} … {formatScientific(rangeU?.maximum)} {spectrum.wave_vector_unit}</span>
+        <span>k_v range: {formatScientific(rangeV?.minimum)} … {formatScientific(rangeV?.maximum)} {spectrum.wave_vector_unit}</span>
         <span>cells: {renderedCellCount}{isBinned ? " (max-pooled)" : ""}</span>
       </div>
       <div className="fm-antenna-spectrum__summary" aria-label="Source spectrum peak">
@@ -156,6 +181,95 @@ export function AntennaSourceSpectrumPayloadView({
       </div>
     </section>
   );
+}
+
+function spectrumPowerExtrema(power: readonly number[]): { minimum: number; maximum: number; peakIndex: number } | null {
+  let minimum = Infinity;
+  let maximum = -Infinity;
+  let peakIndex = -1;
+  for (let index = 0; index < power.length; index += 1) {
+    const value = power[index]!;
+    if (!Number.isFinite(value)) continue;
+    minimum = Math.min(minimum, value);
+    if (value > maximum) { maximum = value; peakIndex = index; }
+  }
+  return peakIndex < 0 ? null : { minimum, maximum, peakIndex };
+}
+
+function SpectrumPowerScale({ minimum, maximum, unit }: { minimum: number; maximum: number; unit: string }) {
+  return <div className="fm-antenna-spectrum__scale" role="group" aria-label="Source spectrum color scale">
+    {minimum === maximum ? <span>Uniform power: {formatScientific(minimum)} {unit}</span> : <>
+      <span>Linear power scale</span>
+      <span>{formatScientific(minimum)} {unit}</span>
+      <span className="fm-antenna-spectrum__scale-bar" aria-hidden="true" />
+      <span>{formatScientific(maximum)} {unit}</span>
+    </>}
+  </div>;
+}
+
+function spectrumGridTarget(key: string, index: number, columns: number, count: number, wholeGrid = false): number | null {
+  const rowStart = Math.floor(index / columns) * columns;
+  const rowEnd = Math.min(count - 1, rowStart + columns - 1);
+  switch (key) {
+    case "ArrowLeft": return Math.max(rowStart, index - 1);
+    case "ArrowRight": return Math.min(rowEnd, index + 1);
+    case "ArrowUp": return index >= columns ? index - columns : index;
+    case "ArrowDown": return index + columns < count ? index + columns : index;
+    case "Home": return wholeGrid ? 0 : rowStart;
+    case "End": return wholeGrid ? count - 1 : rowEnd;
+    default: return null;
+  }
+}
+
+/** Selection stays local: keyboard inspection never redecodes payloads or refetches resources. */
+function SpectrumPowerGrid({ cells, kU, kV, waveVectorUnit, powerUnit, isBinned }: {
+  cells: readonly HeatmapCell[]; kU: readonly number[]; kV: readonly number[];
+  waveVectorUnit: string; powerUnit: string; isBinned: boolean;
+}) {
+  const [activeIndex, setActiveIndex] = useState(0);
+  const helpId = useId();
+  const columns = Math.min(MAX_AXIS_CELLS, kU.length);
+  const rows = Math.ceil(cells.length / columns);
+  const selectedIndex = Math.min(activeIndex, cells.length - 1);
+  const selected = cells[selectedIndex];
+  return <>
+    <p id={helpId} className="fm-antenna-spectrum__subtitle">
+      Arrow keys inspect cells. Home/End move within a row; Ctrl+Home/End move to the grid edges.
+      Cells follow the published k-grid order. Cell spacing represents sample indices, not k-distance; pooled cells report their strongest sample.
+    </p>
+    <div className="fm-antenna-spectrum__heatmap" role="grid"
+      aria-label={`${cells.length} source-spectrum power cells`} aria-describedby={helpId}
+      aria-rowcount={rows} aria-colcount={columns}
+      style={{ gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))` }}>
+      {Array.from({ length: rows }, (_, row) => <div role="row" aria-rowindex={row + 1}
+        className="fm-antenna-spectrum__row" key={row}
+        style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}>
+        {cells.slice(row * columns, (row + 1) * columns).map((cell, column) => {
+          const index = row * columns + column;
+          const label = `${isBinned ? "bin maximum at " : ""}k_u=${formatScientific(kU[cell.kUIndex])} ${waveVectorUnit}, k_v=${formatScientific(kV[cell.kVIndex])} ${waveVectorUnit}, power=${formatScientific(cell.power)} ${powerUnit}`;
+          return <span role="gridcell" key={`${cell.kVIndex}:${cell.kUIndex}`}
+            className="fm-antenna-spectrum__cell" aria-colindex={column + 1}
+            aria-label={label} title={label} aria-selected={index === selectedIndex}
+            data-spectrum-cell-index={index} tabIndex={index === selectedIndex ? 0 : -1}
+            onFocus={() => setActiveIndex(index)} onClick={(event) => event.currentTarget.focus()}
+            onKeyDown={(event) => {
+              const next = spectrumGridTarget(event.key, index, columns, cells.length, event.ctrlKey || event.metaKey);
+              if (next === null) return;
+              event.preventDefault();
+              event.currentTarget.closest('[role="grid"]')
+                ?.querySelector<HTMLElement>(`[data-spectrum-cell-index="${next}"]`)?.focus();
+            }}
+            style={{ background: `color-mix(in srgb, var(--fm-accent) ${8 + 92 * cell.normalizedPower}%, var(--fm-bg-panel-raised))` }} />;
+        })}
+      </div>)}
+    </div>
+    <div className="fm-antenna-spectrum__sample" role="group" aria-label="Selected source spectrum sample">
+      <span>{isBinned ? "Bin maximum" : "Selected sample"}</span>
+      <span>k_u {formatScientific(selected ? kU[selected.kUIndex] : undefined)} {waveVectorUnit}</span>
+      <span>k_v {formatScientific(selected ? kV[selected.kVIndex] : undefined)} {waveVectorUnit}</span>
+      <span>Power {formatScientific(selected?.power)} {powerUnit}</span>
+    </div>
+  </>;
 }
 
 function decodePayloads(
