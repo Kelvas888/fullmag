@@ -1,4 +1,6 @@
 import type { ReactNode } from "react";
+import { useKernel } from "@/kernel/KernelContext";
+import { Button } from "@/shared/ui/Button";
 
 import type { SceneResource } from "@/kernel/api/apiTypes";
 import { antennaPortValidationMessages } from "@/shared/domain/physics/antennaPortValidation";
@@ -23,8 +25,6 @@ import { AntennaStudyStageComposer } from "./AntennaStudyStageComposer";
 import { AntennaPortEditor } from "./AntennaPortEditor";
 import { AntennaSpectrumComposer } from "./AntennaSpectrumComposer";
 import { AntennaResourceEditor } from "./AntennaResourceEditor";
-import { MicrostripGeometryEditor } from "./MicrostripGeometryEditor";
-import { AntennaPlacementEditor } from "./AntennaPlacementEditor";
 import { SolvedAntennaDriveEditor } from "./SolvedAntennaDriveEditor";
 import { antennaWaveformBandwidthValue } from "./AntennaCompositionModel";
 import {
@@ -159,56 +159,42 @@ function activationValue(activation: AntennaDrive["activation"]): string {
       : "no stages selected";
 }
 
-function conductorDetails(
-  objectId: string | null,
-  scene: SceneResource | null,
-): DetailModel {
-  const object = scene?.objects?.find((candidate) => candidate.id === objectId);
-  const geometry = recordValue(object?.geometry);
-  const isCpw = geometry?.geometry_kind === "CPWAntennaLayout";
-  const params = isCpw || geometry?.geometry_kind === "MicrostripAntennaLayout"
-    ? recordValue(geometry.geometry_params)
-    : null;
-  const stations = Array.isArray(params?.stations) ? params.stations : [];
+function conductorDetails(objectId: string | null, scene: SceneResource | null): DetailModel {
+  const object = scene?.objects?.find(candidate => candidate.id === objectId);
+  const geometry = recordValue(object?.geometry), params = recordValue(geometry?.geometry_params);
+  const partIds = Array.isArray(params?.conductors) ? params.conductors.map(recordValue)
+    .flatMap(part => typeof part?.id === "string" ? [part.id] : []) : [];
+  const loop = recordValue(params?.loop);
+  if (loop?.enabled === true) for (const key of ["inlet_connection_part_id", "outlet_connection_part_id"]) {
+    if (typeof loop[key] === "string") partIds.push(loop[key]);
+  }
+  const parts = [...new Set(partIds)].join(" · ") || "unavailable";
+  const currents = objectId ? (scene?.current_transports ?? []).map(recordValue).filter(current => Array.isArray(current?.domain)
+    && current.domain.some(ref => recordValue(ref)?.object_id === objectId)) : [];
   return {
-    title: "Antenna conductor",
-    badge: "3D geometry",
+    title: "Antenna conductor", badge: object ? currents.length ? `${currents.length} current modules` : "no current transport" : "missing",
     rows: [
       { label: "Object", value: objectId ?? "none", mono: true },
       { label: "Name", value: textValue(object?.name, objectId ?? "unavailable") },
-      { label: "Role", value: textValue(object?.role) },
-      { label: "Geometry", value: textValue(geometry?.geometry_kind ?? geometry?.kind) },
-      ...(params ? [
-        { label: "Length", value: numberValue(params.length_m, "m") },
-        { label: "Thickness", value: numberValue(params.thickness_m, "m") },
-        { label: "Conductivity", value: numberValue(params.conductivity_s_per_m, "S/m") },
-        ...(!isCpw ? [
-          { label: "Return width", value: numberValue(params.return_width_m, "m") },
-          { label: "Return offset", value: numberValue(params.return_offset_m, "m") },
-        ] : []),
-        ...stations.flatMap((entry, index) => {
-          const station = recordValue(entry);
-          if (isCpw) return [
-            { label: `Station ${index + 1}`, value: `s=${numberValue(station?.s)}` },
-            ...[
-              ["Signal width", "signal_width_m"],
-              ["Left gap", "left_gap_m"],
-              ["Right gap", "right_gap_m"],
-              ["Left ground", "left_ground_width_m"],
-              ["Right ground", "right_ground_width_m"],
-            ].map(([label, key]) => ({
-              label: `${index + 1} · ${label}`,
-              value: numberValue(station?.[key], "m"),
-            })),
-          ];
-          return [{
-            label: `Station ${index + 1}`,
-            value: `s=${numberValue(station?.s)}, signal width=${numberValue(station?.signal_width_m, "m")}`,
-          }];
-        }),
-      ] : []),
-      { label: "Material", value: textValue(object?.material_ref, "unassigned") },
-      { label: "Mesh policy", value: object?.object_mesh ? "authored" : "default" },
+      { label: "Layout", value: textValue(geometry?.geometry_kind ?? geometry?.kind) },
+      { label: "Part IDs", value: parts, mono: true },
+      { label: "Layout conductivity", value: numberValue(params?.conductivity_s_per_m, "S/m") },
+      { label: "Object material ref", value: textValue(object?.material_ref, "unassigned") },
+      { label: "Authored mesh policy", value: object ? object.object_mesh ? "authored" : "default" : "unavailable" },
+      ...currents.flatMap(current => {
+        const name = textValue(current?.name);
+        const materials = Array.isArray(current?.materials) ? current.materials.map(recordValue)
+          .filter(assignment => recordValue(assignment?.region)?.object_id === objectId) : [];
+        return [
+          { label: `Transport ${name}`, value: textValue(current?.model), mono: true },
+          ...materials.map((assignment, index) => ({
+            label: `Charge conductivity · ${name} · ${textValue(recordValue(assignment?.region)?.region_id, `whole object ${index + 1}`)}`,
+            value: numberValue(recordValue(assignment?.material)?.sigma_Spm, "S/m"),
+          })),
+          ...(!materials.length ? [{ label: `Charge materials · ${name}`, value: "No explicit charge-material assignment for this object." }] : []),
+        ];
+      }),
+      ...(!currents.length ? [{ label: "Charge transport", value: "No explicit current module is assigned to this object." }] : []),
     ],
   };
 }
@@ -879,6 +865,7 @@ export function AntennaCompositionPanel({
   kind,
   selection,
 }: InspectorPanelProps & { kind: AntennaCompositionKind }) {
+  const { selection: selectionController } = useKernel();
   const scene = useSceneResource();
   const objectId = selectedObjectId(selection);
   const resourceId = selectedResourceId(selection);
@@ -910,7 +897,7 @@ export function AntennaCompositionPanel({
   );
 
   return (
-    <div className="fm-inspector-panel">
+    <div className="fm-inspector-panel" data-inspector-owner={kind === "conductor" ? "object.antenna.conductor" : undefined}>
       {kind === "spectrum" ? <InspectorGroup title={model.title} badge={model.badge}>
         {model.rows.filter(row => ["Validation", "Runtime result", "Runtime error", "Stage catalog error"].includes(row.label)).map(row => <FieldRow key={row.label} label={row.label} value={row.value} />)}
         <p className="fm-inspector-hint">Spatial spectrum of the antenna source field. Magnetic response and excited modes require separate analysis.</p>
@@ -944,8 +931,14 @@ export function AntennaCompositionPanel({
           />
         ) : null}
       </InspectorGroup>}
-      {kind === "conductor" && objectId ? <MicrostripGeometryEditor objectId={objectId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
-      {kind === "conductor" && objectId ? <AntennaPlacementEditor objectId={objectId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
+      {kind === "conductor" && objectId ? <>
+        <p className="fm-inspector-hint">Layout conductivity is an authored geometry value. Charge-material assignments above describe the current model; this view does not certify a solve.</p>
+        <Button type="button" disabled={!scene.data?.objects?.some(object => object.id === objectId)} onClick={() => {
+          const nodeId = `model:object:${objectId}:geometry`;
+          selectionController.set({ kind: "object.antenna.geometry", objectId, nodeId, label: "Geometry",
+            ref: { type: "scene-object", kind: "object.antenna.geometry", objectId, nodeId, visualizationTargetId: `object:${objectId}` } }, "inspector");
+        }}>Open Geometry</Button>
+      </> : null}
       {kind === "port" && objectId && resourceId ? <AntennaPortEditor objectId={objectId} portId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "solution" && objectId && resourceId ? <AntennaSolveTargetsEditor key={`targets:${objectId}:${resourceId}`} objectId={objectId} stageId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "solution" && objectId && resourceId ? <AntennaStudyStageComposer objectId={objectId} stageId={resourceId} scene={scene.data} status={scene.status} /> : null}

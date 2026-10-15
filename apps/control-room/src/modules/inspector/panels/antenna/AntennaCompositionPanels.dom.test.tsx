@@ -112,6 +112,7 @@ vi.mock("./AntennaExternalLeadInspectionPanel", () => ({
 }));
 
 import { AntennaCompositionPanel } from "./AntennaCompositionPanels";
+import { AntennaGeometryPanel } from "./AntennaGeometryPanel";
 
 function committedDriveAck(transaction: {
   base_revision: number;
@@ -980,14 +981,14 @@ describe("AntennaCompositionPanel runtime results", () => {
           <AntennaCompositionPanel kind="conductor" selection={conductorSelection()} />,
         ),
       );
-      expect(container.textContent).toContain("GeometryBox");
+      expect(container.textContent).toContain("LayoutBox");
     } finally {
       await act(async () => root.unmount());
       dom.restore();
     }
   });
 
-  it("shows the authored microstrip dimensions and width stations", async () => {
+  it("keeps conductor materials separate from geometry dimensions", async () => {
     mocks.scene.data = {
       objects: [{
         id: "antenna-1",
@@ -1018,17 +1019,19 @@ describe("AntennaCompositionPanel runtime results", () => {
           <AntennaCompositionPanel kind="conductor" selection={conductorSelection()} />,
         ),
       );
-      expect(container.textContent).toContain("GeometryMicrostripAntennaLayout");
-      expect(container.textContent).toContain("Length1.0000e-6 m");
-      expect(container.textContent).toContain("Station 1s=0.0000e+0, signal width=5.0000e-8 m");
-      expect(container.textContent).toContain("Station 2s=1.0000e+0, signal width=2.5000e-8 m");
+      expect(container.textContent).toContain("LayoutMicrostripAntennaLayout");
+      expect(container.textContent).toContain("Layout conductivity5.8000e+7 S/m");
+      expect(container.textContent).toContain("No explicit current module is assigned to this object.");
+      expect(container.textContent).not.toContain("Station 1");
+      expect(container.textContent).not.toContain("Return width");
+      expect(mocks.commitTransaction).not.toHaveBeenCalled();
     } finally {
       await act(async () => root.unmount());
       dom.restore();
     }
   });
 
-  it("keeps the conductor Inspector stable while saving a width station", async () => {
+  it("keeps the Geometry Inspector stable while saving a width station", async () => {
     const geometry = {
       geometry_kind: "MicrostripAntennaLayout",
       geometry_params: {
@@ -1056,8 +1059,8 @@ describe("AntennaCompositionPanel runtime results", () => {
       return found[0];
     };
     try {
-      await act(async () => root.render(<AntennaCompositionPanel kind="conductor" selection={conductorSelection()} />));
-      const panel = find("DIV", "Antenna conductor");
+      await act(async () => root.render(<AntennaGeometryPanel selection={{ ...conductorSelection(), kind: "object.antenna.geometry" }} />));
+      const panel = find("DIV", "Antenna geometry");
       const input = find("INPUT", "Station 1 signal width");
       const unrelatedInput = find("INPUT", "Station 2 signal width");
       Object.getOwnPropertyDescriptor(TestElement.prototype, "value")?.set?.call(input, "60e-9");
@@ -1069,7 +1072,7 @@ describe("AntennaCompositionPanel runtime results", () => {
           stations: [{ s: 0, signal_width_m: 60e-9 }, { s: 1, signal_width_m: 25e-9 }],
         }) }),
       }), { sessionScopeKey: "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7" });
-      expect(find("DIV", "Antenna conductor")).toBe(panel);
+      expect(find("DIV", "Antenna geometry")).toBe(panel);
       expect(find("INPUT", "Station 1 signal width")).toBe(input);
       expect(unrelatedInput.disabled).toBe(false);
       await act(async () => acknowledge?.({ scene_revision: 5, committed_scene: { ...mocks.scene.data, revision: 5 } }));
@@ -1104,14 +1107,14 @@ describe("AntennaCompositionPanel runtime results", () => {
       return found[0];
     };
     try {
-      await act(async () => root.render(<AntennaCompositionPanel kind="conductor" selection={conductorSelection()} />));
+      await act(async () => root.render(<AntennaGeometryPanel selection={{ ...conductorSelection(), kind: "object.antenna.geometry" }} />));
       const input = find("INPUT", "Station 1 signal width");
       Object.getOwnPropertyDescriptor(TestElement.prototype, "value")?.set?.call(input, "60e-9");
       await act(async () => input.dispatchEvent(new TestEvent("input", { bubbles: true })));
       mocks.scene.data = { revision: 5, objects: [{ id: "antenna-1", geometry: {
         ...geometry, geometry_params: { ...geometry.geometry_params, return_width_m: 400e-9 },
       } }] } as unknown as SceneResource;
-      await act(async () => root.render(<AntennaCompositionPanel kind="conductor" selection={conductorSelection()} />));
+      await act(async () => root.render(<AntennaGeometryPanel selection={{ ...conductorSelection(), kind: "object.antenna.geometry" }} />));
       expect(container.textContent).toContain("Conductor geometry changed on the server");
       expect(find("BUTTON", "Save width stations").disabled).toBe(true);
       expect(mocks.commitTransaction).not.toHaveBeenCalled();
