@@ -684,9 +684,13 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             raise ValueError("Frontend mode must be static or dev")
         args = ["compose", "-f", str(spec), "--project-name", project]
         if frontend == "dev":
-            from docker_development_inputs import seed, select_checkout
+            from docker_development_inputs import guest_manifest, seed, select_checkout
             inputs = seed(select_checkout(repo, source_root), state, port)
-            storage.atomic_json(inputs_path, inputs)
+            host_inputs_path = root / "development-inputs-host.json"
+            storage.atomic_json(host_inputs_path, inputs)
+            storage.atomic_json(inputs_path, guest_manifest(inputs))
+            receipt["frontend_host_inputs"] = str(host_inputs_path)
+            receipt["frontend_host_inputs_sha256"] = digest(host_inputs_path)
             from local_runner.build_source import native_identity
             receipt["mounted_source_identity_at_start"] = native_identity(Path(inputs["source_root"]), "snapshot")
             receipt["source_selection"] = "live_windows_selected_checkout"

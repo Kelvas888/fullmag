@@ -394,6 +394,21 @@ else:
             receipt = json.loads(self.module.RECEIPT_PATH.read_text(encoding="utf-8"))
             self.assertEqual(receipt["state"], "unknown")
 
+    def test_host_cache_manifest_remains_compatible_with_the_pinned_v1_guest(self):
+        from docker_development_inputs import guest_manifest, HOST_CACHE_METADATA_KEYS
+
+        with isolated(self.module) as (_, _, inputs):
+            host = {**inputs.manifest, **{name: "host-only" for name in HOST_CACHE_METADATA_KEYS}}
+            legacy_optional = {"source_selection", "source_volume", "configuration_changes", "backend_build"}
+            with patch.object(self.module, "OPTIONAL_MANIFEST_KEYS", frozenset(legacy_optional)):
+                self.module.INPUTS_PATH.write_text(json.dumps(host))
+                with self.assertRaisesRegex(self.module.FrontendDevError, "unexpected field set"):
+                    self.module.read_inputs(self.module.INPUTS_PATH)
+                self.module.INPUTS_PATH.write_text(json.dumps(guest_manifest(host)))
+                compatible = self.module.read_inputs(self.module.INPUTS_PATH)
+                self.assertEqual(compatible.manifest, inputs.manifest)
+                self.module._freeze_inputs(compatible, allow_generated=False)
+
     def test_host_cache_metadata_is_accepted_and_frozen_with_the_seed(self):
         with isolated(self.module) as (_, _, inputs):
             manifest = dict(inputs.manifest)

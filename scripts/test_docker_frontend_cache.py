@@ -80,6 +80,20 @@ class FakeDocker:
 
 
 class FrontendCacheTests(unittest.TestCase):
+    def test_guest_v1_preserves_seed_contract_without_host_cache_metadata(self):
+        from docker_development_inputs import guest_manifest, HOST_CACHE_METADATA_KEYS
+
+        legacy = {"schema": "fullmag.docker-development-inputs.v1",
+                  "source_root": "C:/git/fullmag/fullmag", "source_commit": "a" * 40,
+                  "host_port": 32871, "workspace_root": "/state/development/workspace",
+                  "frontend_root": "/state/development/cache", "files": [],
+                  "live_directories": []}
+        host = {**legacy, **{name: "retained-host-metadata" for name in HOST_CACHE_METADATA_KEYS}}
+        before = dict(host)
+        self.assertEqual(guest_manifest(host), legacy)
+        self.assertEqual(host, before, "guest publication must retain all host cache evidence")
+        self.assertEqual(guest_manifest(legacy), legacy)
+
     def test_python_shell_contract_uses_short_label_and_identical_paths(self):
         helper = Path(cache.__file__).parents[1] / "scripts" / "lib" / "docker_frontend_cache.sh"
         source = helper.read_text(encoding="utf-8")

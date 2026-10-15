@@ -13,6 +13,19 @@ DIRECTORIES = ("app", "src", "public", "scripts")
 WORKSPACE = "/state/development/workspace"
 FRONTEND = "/state/development/cache"
 CONFIG_TARGET = "/run/fullmag/development-inputs.json"
+HOST_CACHE_METADATA_KEYS = frozenset({
+    "worktree_id", "dependency_seed_files", "dependency_seed_sha256",
+    "toolpins", "toolpins_sha256",
+})
+
+
+def guest_manifest(inputs):
+    """Keep the pinned v1 guest contract independent of host cache metadata.
+
+    The complete host document is retained beside the guest manifest and
+    remains the source of cache preparation and mount attestation.
+    """
+    return {name: value for name, value in inputs.items() if name not in HOST_CACHE_METADATA_KEYS}
 
 
 def main_checkout(repo):
