@@ -49,6 +49,13 @@ docker-all-dev-image job_id commit source_digest="" native_snapshot_sha256="" so
 docker-all-verify run_receipt:
     @{{storage_python}} "{{repo_root}}/scripts/verify_docker_all_runtime.py" --repo-root "{{repo_root}}" {{quote(run_receipt)}}
 
+# Bootstrap only the pinned FEM/GPU dependency image on a fresh Windows host.
+# The helper owns storage initialization, the global heavy lock, and its
+# enrolled-runner admission; this route must not run generic compatibility
+# preparation first.
+docker-all-toolchain-bootstrap:
+    @{{storage_python}} "{{justfile_directory()}}/scripts/bootstrap_docker_toolchain.py" --repo-root "{{justfile_directory()}}"
+
 storage-inventory:
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_storage.py" inventory --repo-root "{{repo_root}}" --format json
 

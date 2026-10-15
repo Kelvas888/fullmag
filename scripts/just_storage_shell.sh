@@ -87,6 +87,17 @@ fi
 # Admit this fixed helper before generic diagnostic substring handling, so a
 # composite command cannot use a diagnostic marker to bypass its argument check.
 case "${recipe}" in
+  *"scripts/bootstrap_docker_toolchain.py"*)
+    toolchain_bootstrap_pattern='^[^[:space:]]+ "[^"]+/scripts/bootstrap_docker_toolchain.py" --repo-root "[^"]+"$'
+    if [[ ! "${recipe}" =~ ${toolchain_bootstrap_pattern} ]]; then
+      echo "[fullmag just] invalid Docker toolchain bootstrap recipe" >&2
+      exit 2
+    fi
+    # This fresh-host operation owns its own storage initialization, global
+    # heavy lock, and enrolled-runner admission. Do not run prepare-links or
+    # the generic runner around it.
+    exec "${python_cmd}" "${script_dir}/bootstrap_docker_toolchain.py" --repo-root "${repo_root}"
+    ;;
   *"scripts/verify_docker_all_runtime.py"*)
     docker_verify_pattern="^[^[:space:]]+ \"[^\"]+/scripts/verify_docker_all_runtime.py\" --repo-root \"[^\"]+\" '[^']+'$"
     if [[ ! "${recipe}" =~ ${docker_verify_pattern} ]]; then

@@ -118,3 +118,4 @@ jobs:
           python -B scripts/test_docker_frontend_dev.py -v
           python -B scripts/test_verify_docker_all_runtime.py -v
           python -B scripts/test_docker_host_ledger.py -v
+          python -B scripts/test_bootstrap_docker_toolchain.py -v
