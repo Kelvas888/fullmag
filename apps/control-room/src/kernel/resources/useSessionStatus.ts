@@ -99,7 +99,7 @@ export interface SessionBootstrapStatus {
 }
 
 /**
- * Expose the current-session bootstrap result without creating another
+ * Expose the current-session initialization result without creating another
  * transport. The workspace needs the status error and its refetch callback in
  * addition to the identity, otherwise a failed current/status request is
  * indistinguishable from a request that is still loading.
