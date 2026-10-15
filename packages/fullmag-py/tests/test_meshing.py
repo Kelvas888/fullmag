@@ -15275,7 +15275,11 @@ class RegionMeshPolicyTests(unittest.TestCase):
         assert bounds is not None
         scale = 1.0e6
         xmin, ymin, zmin, xmax, ymax, zmax = (value * scale for value in bounds)
-        levels = {"z": zmin}
+        # The production route starts at the source face's body_bottom and
+        # resets to that same CAD face before traversing the lower intervals.
+        # Track the source surface tag rather than accumulating one global z
+        # cursor; this keeps the double faithful to signed GEO extrusion.
+        body_bottom = -0.5 * float(geometry.size[2]) * scale
         surface_planes: dict[int, float] = {}
         next_tag_value = 1
 
@@ -15285,11 +15289,13 @@ class RegionMeshPolicyTests(unittest.TestCase):
             next_tag_value += 1
             return tag
 
-        def extrude(_source, _dx, _dy, step, **_kwargs):
-            levels["z"] += float(step)
+        def extrude(source_entities, _dx, _dy, step, **_kwargs):
+            source_tag = int(source_entities[0][1])
+            source_plane = surface_planes.get(source_tag, body_bottom)
+            target_plane = source_plane + float(step)
             volume_tag = next_tag()
             top_surface_tag = next_tag()
-            surface_planes[top_surface_tag] = levels["z"]
+            surface_planes[top_surface_tag] = target_plane
             return [(3, volume_tag), (2, top_surface_tag)]
 
         def bounding_box(dimension, tag):
