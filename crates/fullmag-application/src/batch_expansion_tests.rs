@@ -783,15 +783,16 @@ fn output_storage_binding_rejects_missing_and_relative_paths() {
 fn materialization_binds_zhang_li_axis_to_named_executable_module() {
     let study = materialization_study();
     let mut problem = ProblemIR::bootstrap_example();
+    problem.magnets[0].object_id = Some("batch-magnet".into());
     problem.spin_torque_modules = vec![SpinTorqueModuleIR::ZhangLi {
         schema_version: Some("zhang_li_torque.v1".into()),
         id: Some("batch-zl".into()),
         target: Some(RegionRefIR {
-            object_id: "strip".into(),
+            object_id: "batch-magnet".into(),
             region_id: None,
         }),
-        formula_version: "zhang_li.fullmag.v1".into(),
-        operator_version: Some("zl_central_reference_v1".into()),
+        formula_version: "zhang_li.mumax3.v1".into(),
+        operator_version: Some("zl_mumax3_central_v1".into()),
         current_density: Some([1.0e11, 0.0, 0.0]),
         current_source: None,
         degree: 0.4,
