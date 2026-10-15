@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shlex
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ import uuid
 
 
 SCHEMA = "fullmag_storage_v1"
+DOTENV_MAX_BYTES = 1024 * 1024
 NATIVE_BUILD_LOCK_WAIT_SECONDS = 120
 WINDOWS_WORKSPACE_BUILD_REQUEST_RECEIPT_SCHEMA = "fullmag.windows-workspace-build-request-receipt.v1"
 WINDOWS_WORKSPACE_BUILD_REQUEST_RECEIPT_FIELDS = frozenset({
@@ -272,11 +274,32 @@ def validate_managed_view(layout):
 
 def storage_dotenv(main_repo):
     """Read only storage settings; never execute or interpolate dotenv values."""
-    path = main_repo / ".env"
-    if not path.is_file():
+    path = absolute(Path(main_repo) / ".env", "storage dotenv")
+    if not path.exists():
         return {}
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        raise StorageError(f"Cannot read storage dotenv {path}: {error}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > DOTENV_MAX_BYTES:
+            raise StorageError(f"Storage dotenv must be a bounded regular file: {path}")
+        if getattr(metadata, "st_file_attributes", 0) & 0x400:
+            raise StorageError(f"Storage dotenv must not be a Windows reparse point: {path}")
+        data = os.read(descriptor, DOTENV_MAX_BYTES + 1)
+    except OSError as error:
+        raise StorageError(f"Cannot read storage dotenv {path}: {error}") from error
+    finally:
+        os.close(descriptor)
+    if len(data) > DOTENV_MAX_BYTES:
+        raise StorageError(f"Storage dotenv is too large: {path}")
     values = {}
-    for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+    managed_seen = set()
+    for number, line in enumerate(data.decode("utf-8-sig").splitlines(), 1):
         line = line.strip()
         if line.startswith("export "):
             line = line[7:].lstrip()
@@ -284,6 +307,9 @@ def storage_dotenv(main_repo):
         key = key.strip()
         if not sep or key not in MANAGED_VARIABLES:
             continue
+        if key in managed_seen:
+            raise StorageError(f"Duplicate storage setting at {path}:{number}: {key}")
+        managed_seen.add(key)
         value = value.strip()
         if value.startswith(("'", '"')):
             if len(value) < 2 or value[-1] != value[0]:

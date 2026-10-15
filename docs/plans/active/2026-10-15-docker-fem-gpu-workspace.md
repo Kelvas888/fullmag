@@ -47,6 +47,23 @@ zasobu. CPU zachowuje własny istniejący kontrakt i recovery.
    commit/push/PR/merge, bezpieczny fast-forward głównego checkoutu i qualified
    cleanup własnego worktree kończą cykl.
 
+## Uruchomienie skryptu w Dockerze — doprecyzowanie użytkownika
+
+Polecenie wskazujące skrypt ma zachować istniejący kontrakt Fullmaga:
+Workspace od razu przedstawia załadowany, aktywny model. Przygotowanie modelu
+oraz siatki poprzedza Solve. Symulacja uruchamia się automatycznie według
+skryptu, chyba że interaktywny skrypt ma `wait_for_solve=True`; wówczas
+przygotowany model czeka na Compute. Nie wolno bezwarunkowo wymuszać headless,
+zmieniać authored auto na CPU ani omijać wspólnego ledgeru GPU.
+
+Launcher ma tłumaczyć ścieżkę Windows względem wybranego readonly checkoutu.
+`docker compose run fullmag <ścieżka>` nie jest obecnie działającym
+interfejsem: usługi aplikacji to frontend/backend, a ich entrypoint uruchamia
+Workspace. Implementacja i dowód startupu skryptowego są osobnym wymaganym
+etapem. Skrypt `tests/vlad/4.5GHz_fem.py` zawiera `device=auto`, wiele etapów
+BB/PG-BB i długą symulację anteny; prosty bounded LLG proof nie kwalifikuje
+jego całej sekwencji.
+
 ## Weryfikacja i granice
 
 Lokalnie nie kompilujemy testów jednostkowych. Wyjątek użytkownika obejmuje

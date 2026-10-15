@@ -2082,11 +2082,31 @@ impl HostResourceLedger {
         Ok(ledger)
     }
 
-    /// Derive a stable store identity from the canonical path of an existing
-    /// local SessionStore root. The path itself is never persisted.
+    /// Derive a stable store identity from an existing SessionStore root.
+    ///
+    /// Ordinary stores retain the v1 canonical-path identity.  The explicit
+    /// Docker Windows-folder profile uses the validated host grant instead:
+    /// host root, volume serial, engine, owner token, and the state-relative
+    /// path are stable across container restarts, while Linux device/inode and
+    /// mount-namespace values remain admission evidence and never enter the ID.
     pub fn store_id(store_root: &Path) -> Result<String> {
         if !store_root.is_absolute() {
             bail!("store root must be an explicit absolute path");
+        }
+        if std::env::var("FULLMAG_SESSION_STORAGE_PROFILE").ok().as_deref()
+            == Some("windows-folder-v1")
+        {
+            #[cfg(target_os = "linux")]
+            {
+                let identity =
+                    crate::docker_desktop_storage::admitted_docker_store_identity(store_root)?;
+                let value = identity.stable_value()?;
+                return Ok(format!("sha256:{}", crate::canonical_json_sha256(&value)));
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                bail!("Docker Windows-folder store identity requires the attested Linux container");
+            }
         }
         crate::writer::require_local_filesystem(store_root)?;
         reject_link(store_root)?;
@@ -3661,7 +3681,7 @@ fn validate_gpu_uuid(value: &str) -> Result<()> {
 fn validate_store_identity(value: &str) -> Result<()> {
     let digest = value
         .strip_prefix("sha256:")
-        .context("store_id must be derived as sha256 of the canonical store root")?;
+        .context("store_id must use the canonical sha256 identity prefix")?;
     validate_sha256(digest, "store_id digest")
 }
 
@@ -4696,6 +4716,47 @@ mod tests {
             gpu_vram_bytes_by_uuid: [(GPU_A.to_string(), 4096)].into_iter().collect(),
             allowed_cpu_ids: [0, 1, 2, 3].into_iter().collect(),
         }
+    }
+
+    #[test]
+    fn docker_store_identity_is_restart_stable_and_excludes_mount_runtime_ids() {
+        let base = crate::docker_desktop_storage::DockerAdmittedStoreIdentity {
+            host_root: "c:/fullmag/storage/runs/session".into(),
+            host_volume_serial: 7,
+            engine_id: "desktop-engine".into(),
+            owner_token: "123e4567-e89b-42d3-a456-426614174000".into(),
+            relative_state_path: "runs/docker-all/session-store".into(),
+        };
+        let stable_value = base.stable_value().unwrap();
+        let first = format!("sha256:{}", crate::canonical_json_sha256(&stable_value));
+        let restarted = base.clone();
+        let second = format!(
+            "sha256:{}",
+            crate::canonical_json_sha256(&restarted.stable_value().unwrap())
+        );
+        assert_eq!(first, second);
+        assert!(stable_value.get("root_device").is_none());
+        assert!(stable_value.get("root_inode").is_none());
+        assert!(stable_value.get("mount_namespace_inode").is_none());
+
+        let mut moved = base.clone();
+        moved.relative_state_path = "runs/other/session-store".into();
+        assert_ne!(
+            first,
+            format!(
+                "sha256:{}",
+                crate::canonical_json_sha256(&moved.stable_value().unwrap())
+            )
+        );
+        let mut different_volume = base;
+        different_volume.host_volume_serial = 8;
+        assert_ne!(
+            first,
+            format!(
+                "sha256:{}",
+                crate::canonical_json_sha256(&different_volume.stable_value().unwrap())
+            )
+        );
     }
 
     fn compute_node_snapshot(

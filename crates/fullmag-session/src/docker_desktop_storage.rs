@@ -26,6 +26,8 @@ const CONTAINER_ROOT: &str = "/state";
 const GRANT_NAME: &str = ".fullmag-windows-folder-grant.json";
 #[cfg(windows)]
 const OWNER_MARKER_NAME: &str = ".fullmag-windows-folder-owner.json";
+pub(crate) const DOCKER_ADMITTED_STORE_IDENTITY_SCHEMA_V2: &str =
+    "fullmag.docker-admitted-store-identity.v2";
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
 const SHA256_HEX_LENGTH: usize = 64;
 const SOURCE_COMMIT_HEX_LENGTH: usize = 40;
@@ -80,6 +82,51 @@ struct SessionGrant {
     checks: BTreeMap<String, bool>,
 }
 
+/// Stable identity for one accepted Docker session store.
+///
+/// The identity deliberately contains the validated Windows grant's stable
+/// host and mount scope only.  Linux device/inode and mount-namespace values
+/// remain admission evidence; they are not part of this restart-stable ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DockerAdmittedStoreIdentity {
+    pub(crate) host_root: String,
+    pub(crate) host_volume_serial: u32,
+    pub(crate) engine_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) relative_state_path: String,
+}
+
+impl DockerAdmittedStoreIdentity {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_windows_drive_path(&self.host_root)?;
+        if self.host_root != stable_windows_host_root(&self.host_root)? {
+            bail!("Docker store identity host_root is not normalized");
+        }
+        if self.host_volume_serial == 0 {
+            bail!("Docker store identity host volume serial must be nonzero");
+        }
+        validate_scalar(&self.engine_id, "Docker store identity engine_id", 256)?;
+        validate_uuid(&self.owner_token, "Docker store identity owner_token")?;
+        if Uuid::parse_str(&self.owner_token)?.to_string() != self.owner_token {
+            bail!("Docker store identity owner_token must be canonical");
+        }
+        validate_relative_state_path(&self.relative_state_path)?;
+        Ok(())
+    }
+
+    pub(crate) fn stable_value(&self) -> Result<serde_json::Value> {
+        self.validate()?;
+        Ok(serde_json::json!({
+            "schema": DOCKER_ADMITTED_STORE_IDENTITY_SCHEMA_V2,
+            "host_root": self.host_root,
+            "host_volume_serial": self.host_volume_serial,
+            "engine_id": self.engine_id,
+            "owner_token": self.owner_token,
+            "relative_state_path": self.relative_state_path,
+        }))
+    }
+}
+
 fn validate_hex(value: &str, length: usize, label: &str) -> Result<()> {
     if value.len() != length
         || !value
@@ -123,6 +170,24 @@ fn validate_windows_drive_path(value: &str) -> Result<()> {
         if component.is_empty() || component == "." || component == ".." {
             bail!("host_root contains an unsafe Windows path component");
         }
+    }
+    Ok(())
+}
+
+fn stable_windows_host_root(value: &str) -> Result<String> {
+    validate_windows_drive_path(value)?;
+    Ok(value.replace('\\', "/").to_ascii_lowercase())
+}
+
+fn validate_relative_state_path(value: &str) -> Result<()> {
+    if value.is_empty() || value.starts_with('/') || value.len() > 4096 {
+        bail!("Docker store identity relative_state_path is invalid");
+    }
+    for component in value.split('/') {
+        if component.is_empty() || matches!(component, "." | "..") {
+            bail!("Docker store identity relative_state_path contains an unsafe component");
+        }
+        validate_scalar(component, "Docker store identity path component", 255)?;
     }
     Ok(())
 }
@@ -675,11 +740,34 @@ fn admit_container_identity(root: &Path, grant: &SessionGrant) -> Result<()> {
     Ok(())
 }
 
-/// Admit one Linux 9p-backed session root under the explicit Windows-folder
-/// profile.  Every evidence file is reread for each admission; only the
-/// immutable current executable hash is cached for the lifetime of the process.
 #[cfg(target_os = "linux")]
-pub(crate) fn admit(root: &Path) -> Result<()> {
+fn relative_state_path(root: &Path) -> Result<String> {
+    let (_, state_components) = normalized_components(Path::new(CONTAINER_ROOT), "Docker state path")?;
+    let (_, root_components) = normalized_components(root, "session root")?;
+    if root_components.len() <= state_components.len()
+        || !root_components
+            .iter()
+            .zip(state_components.iter())
+            .all(|(root, state)| root == state)
+    {
+        bail!("session root must be a nonempty child of the Docker state mount");
+    }
+    let components = root_components
+        .iter()
+        .skip(state_components.len())
+        .map(|component| {
+            component
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("session root has a non-portable path component"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let relative = components.join("/");
+    validate_relative_state_path(&relative)?;
+    Ok(relative)
+}
+
+#[cfg(target_os = "linux")]
+fn read_validated_admission(root: &Path) -> Result<(HostAttestation, SessionGrant, String)> {
     if env::var("FULLMAG_SESSION_STORAGE_PROFILE").ok().as_deref() != Some("windows-folder-v1") {
         bail!("9p session storage requires FULLMAG_SESSION_STORAGE_PROFILE=windows-folder-v1");
     }
@@ -697,6 +785,35 @@ pub(crate) fn admit(root: &Path) -> Result<()> {
     }
     validate_runtime_identity(&host)?;
     admit_container_identity(root, &grant)?;
+    let relative = relative_state_path(root)?;
+    Ok((host, grant, relative))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn admitted_docker_store_identity(root: &Path) -> Result<DockerAdmittedStoreIdentity> {
+    let (host, grant, relative_state_path) = read_validated_admission(root)?;
+    let identity = DockerAdmittedStoreIdentity {
+        host_root: stable_windows_host_root(&host.host_root)?,
+        host_volume_serial: host.host_volume_serial,
+        engine_id: host.engine_id,
+        owner_token: Uuid::parse_str(&grant.owner_token)?.to_string(),
+        relative_state_path,
+    };
+    identity.validate()?;
+    Ok(identity)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn admitted_docker_store_identity(_root: &Path) -> Result<DockerAdmittedStoreIdentity> {
+    bail!("Docker Windows-folder admission requires the attested Linux container")
+}
+
+/// Admit one Linux 9p-backed session root under the explicit Windows-folder
+/// profile.  Every evidence file is reread for each admission; only the
+/// immutable current executable hash is cached for the lifetime of the process.
+#[cfg(target_os = "linux")]
+pub(crate) fn admit(root: &Path) -> Result<()> {
+    read_validated_admission(root)?;
     Ok(())
 }
 

@@ -226,6 +226,8 @@ def plan(repo: Path, storage_root: str, source_root: str, port: int) -> dict:
     source = storage.absolute(source_root, "source checkout")
     if source not in context["checkouts"] or not source.is_dir():
         raise SetupError("Źródła muszą być zarejestrowanym checkoutem tego projektu")
+    validate_windows_volume(context["main"])
+    validate_windows_volume(source)
     env_path = context["main"] / ".env"
     original = bounded_file(env_path) if env_path.exists() else None
     template = context["main"] / ".env.example"
@@ -310,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise SetupError("Brak FULLMAG_PROJECT_STORAGE_ROOT; uruchom kreator w PowerShell")
             root = validate_storage_root(root_value, context)
             validate_windows_volume(root)
+            validate_windows_volume(context["main"])
             storage.resolve_layout(context["repo"], "docker-all-gpu")
             for key in ("POSTGRES_PASSWORD", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD"):
                 if not configured.get(key):
