@@ -1,5 +1,10 @@
 # Fullmag w całości w Docker Desktop
 
+> Aktualizacja 16.10.2026: docelowy tryb developerski określa
+> [Architektura developerska Compose](docker-development-architecture.md).
+> Poniższe polecenia z kolejką runnera opisują wcześniejszą ścieżkę i nie są
+> instrukcją nowego bezpośredniego buildu obu usług. Nowa ścieżka jest w implementacji.
+
 Tryb release składa jeden obraz uruchomieniowy zawierający backend API, statyczny
 Control Room, publiczny Python DSL, rozszerzenie PyO3 oraz biblioteki FEM/CUDA.
 Windows udostępnia przeglądarkę i Docker Desktop. UI i API używają tego samego
