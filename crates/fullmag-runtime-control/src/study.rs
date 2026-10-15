@@ -1,5 +1,5 @@
 //! Resolve accepted study inputs without mutable session state.
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use fullmag_application::{
     COORDINATOR_TRANSITION_SCHEMA, CoordinatorError, CoordinatorMessage, CoordinatorTransition,
     DurableWorkerCoordinator, AcceptedPreparationReceipt, ClosedLoopPreparationReceipt, PreparationBinding, PreparationReceipt, ProjectId, ResolvedInput,
@@ -9,10 +9,12 @@ use fullmag_application::{
 use fullmag_authoring::{
     StudyInputPort, StudyInputSource, StudyPlan, StudyPortDataKind, StudyStep,
 };
-use fullmag_ir::{ExecutionDevice, ExecutionMode, ExecutionPlanIR, ExecutionPrecision, ProblemIR};
+use fullmag_ir::{
+    BackendTarget, ExecutionDevice, ExecutionMode, ExecutionPlanIR, ExecutionPrecision, ProblemIR,
+};
 use fullmag_plan::{
-    PreparationMaterialization, PreparationPlanSource, StudyExecutionPlan, StudyProblemCatalog,
-    StudyStepLoweringStatus, lower_study_plan_with_catalog,
+    lower_study_plan_with_catalog, PreparationMaterialization, PreparationPlanSource,
+    StudyExecutionPlan, StudyProblemCatalog, StudyStepLoweringStatus,
 };
 use fullmag_session::SessionStore;
 use serde::Deserialize;
@@ -23,6 +25,12 @@ pub struct AcceptedStudySnapshot {
     pub study: StudyPlan,
     pub catalog: StudyProblemCatalog,
     pub lowered: StudyExecutionPlan,
+}
+
+#[derive(Clone, Copy)]
+enum NativeFemPreparationKind {
+    TimeDomain,
+    AntennaExternalLeadInspection,
 }
 
 impl AcceptedStudySnapshot {
@@ -108,6 +116,37 @@ impl AcceptedStudySnapshot {
         step_id: &str,
         native: &fullmag_plan::NativeFemMeshSpaceEvidence,
     ) -> Result<PreparationReceipt> {
+        self.materialize_native_fem_preparation_receipt(
+            preparation_id,
+            step_id,
+            native,
+            NativeFemPreparationKind::TimeDomain,
+        )
+    }
+
+    /// Prepare the combined conductor/lead H1 P1 mesh of a pinned inspection
+    /// step. This does not certify current, Oersted fields, or LLG coupling.
+    pub fn materialize_antenna_external_lead_inspection_preparation_receipt(
+        &self,
+        preparation_id: impl Into<String>,
+        step_id: &str,
+        native: &fullmag_plan::NativeFemMeshSpaceEvidence,
+    ) -> Result<PreparationReceipt> {
+        self.materialize_native_fem_preparation_receipt(
+            preparation_id,
+            step_id,
+            native,
+            NativeFemPreparationKind::AntennaExternalLeadInspection,
+        )
+    }
+
+    fn materialize_native_fem_preparation_receipt(
+        &self,
+        preparation_id: impl Into<String>,
+        step_id: &str,
+        native: &fullmag_plan::NativeFemMeshSpaceEvidence,
+        kind: NativeFemPreparationKind,
+    ) -> Result<PreparationReceipt> {
         let step = self
             .lowered
             .steps
@@ -152,15 +191,30 @@ impl AcceptedStudySnapshot {
             "schema_version": "display_projection.v1",
             "payload": {"source": "accepted_run_default"},
         });
-        let materialization = PreparationMaterialization::from_fem_execution_plan_for_accepted_run(
-            problem_fingerprint,
-            source,
-            problem.backend_policy.requested_backend,
-            execution_plan,
-            preparation_fingerprint(&geometry_projection),
-            preparation_fingerprint(&display_projection),
-            native,
-        )?;
+        let geometry_fingerprint = preparation_fingerprint(&geometry_projection);
+        let display_fingerprint = preparation_fingerprint(&display_projection);
+        let materialization = match kind {
+            NativeFemPreparationKind::TimeDomain =>
+                PreparationMaterialization::from_fem_execution_plan_for_accepted_run(
+                    problem_fingerprint,
+                    source,
+                    problem.backend_policy.requested_backend,
+                    execution_plan,
+                    geometry_fingerprint,
+                    display_fingerprint,
+                    native,
+                )?,
+            NativeFemPreparationKind::AntennaExternalLeadInspection =>
+                PreparationMaterialization::from_antenna_external_lead_inspection_execution_plan_for_accepted_run(
+                    problem_fingerprint,
+                    source,
+                    problem.backend_policy.requested_backend,
+                    execution_plan,
+                    geometry_fingerprint,
+                    display_fingerprint,
+                    native,
+                )?,
+        };
         PreparationReceipt::ready_for_accepted_run(
             preparation_id,
             materialization.plan,
@@ -730,7 +784,15 @@ pub fn load_accepted_worker_step(
     if serde_json::to_value(&replanned)? != serde_json::to_value(execution_plan)? {
         bail!("worker execution plan differs from the accepted canonical plan");
     }
-    if matches!(problem.study, fullmag_ir::StudyIR::TimeEvolution { .. })
+    let inspection = matches!(
+        &execution_plan.backend_plan,
+        fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(_)
+    );
+    if inspection && (execution_step.until_seconds.is_some() || !execution_step.inputs.is_empty()) {
+        bail!("accepted antenna inspection must not declare a magnetic horizon or inputs");
+    }
+    if !inspection
+        && matches!(problem.study, fullmag_ir::StudyIR::TimeEvolution { .. })
         && execution_step.until_seconds.is_none()
     {
         bail!("accepted TimeEvolution worker step has no pinned until_seconds");
@@ -2312,7 +2374,9 @@ fn validate_study_input_dependencies(
     Ok(())
 }
 
-fn resolve_accepted_study_inputs(
+/// Resolve the exact accepted step's declared inputs from durable artifact and
+/// run catalogs. This read-only projection does not create or claim a task.
+pub fn resolve_accepted_study_inputs(
     store: &SessionStore,
     run_id: &str,
     accepted_steps: &[StudyStep],
@@ -2357,9 +2421,9 @@ mod dependency_tests {
     use super::*;
     use fullmag_authoring::StudyPortDataKind;
     use fullmag_session::{
-        FMS_ARTIFACT_CATALOG_SCHEMA, FMS_RUN_CATALOG_SCHEMA, FmsArtifactCatalog,
-        FmsArtifactCatalogEntry, FmsArtifactStatus, FmsObservationState, FmsRunCatalog,
-        FmsStudyArtifactOutput, FmsTaskCatalogEntry, FmsTaskLifecycle, FmsTaskReadiness,
+        FmsArtifactCatalog, FmsArtifactCatalogEntry, FmsArtifactStatus, FmsObservationState,
+        FmsRunCatalog, FmsStudyArtifactOutput, FmsTaskCatalogEntry, FmsTaskLifecycle,
+        FmsTaskReadiness, FMS_ARTIFACT_CATALOG_SCHEMA, FMS_RUN_CATALOG_SCHEMA,
     };
     use std::collections::BTreeMap;
 
@@ -2490,26 +2554,22 @@ mod dependency_tests {
     fn study_dispatch_requires_declared_inputs_and_succeeded_step_outputs() {
         let inputs = ports();
         let run_catalog = catalog(FmsTaskLifecycle::Succeeded);
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &resolved_inputs(),
-                &run_catalog,
-                Some(&artifact_catalog()),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &BTreeMap::new(),
-                &run_catalog,
-                Some(&artifact_catalog()),
-            )
-            .is_err()
-        );
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &resolved_inputs(),
+            &run_catalog,
+            Some(&artifact_catalog()),
+        )
+        .is_ok());
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &BTreeMap::new(),
+            &run_catalog,
+            Some(&artifact_catalog()),
+        )
+        .is_err());
         let mut extra = resolved_inputs();
         extra.insert(
             "undeclared".into(),
@@ -2519,58 +2579,50 @@ mod dependency_tests {
                 study_artifact: None,
             },
         );
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &extra,
-                &run_catalog,
-                Some(&artifact_catalog()),
-            )
-            .is_err()
-        );
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &resolved_inputs(),
-                &catalog(FmsTaskLifecycle::Running),
-                Some(&artifact_catalog()),
-            )
-            .is_err()
-        );
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &extra,
+            &run_catalog,
+            Some(&artifact_catalog()),
+        )
+        .is_err());
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &resolved_inputs(),
+            &catalog(FmsTaskLifecycle::Running),
+            Some(&artifact_catalog()),
+        )
+        .is_err());
 
         let mut wrong_digest = resolved_inputs();
         wrong_digest
             .get_mut("initial_state")
             .expect("resolved input")
             .content_sha256 = "d".repeat(64);
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &wrong_digest,
-                &catalog(FmsTaskLifecycle::Succeeded),
-                Some(&artifact_catalog()),
-            )
-            .is_err()
-        );
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &wrong_digest,
+            &catalog(FmsTaskLifecycle::Succeeded),
+            Some(&artifact_catalog()),
+        )
+        .is_err());
 
         let mut wrong_artifact = resolved_inputs();
         wrong_artifact
             .get_mut("initial_state")
             .expect("resolved input")
             .source = "another-artifact".into();
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &wrong_artifact,
-                &catalog(FmsTaskLifecycle::Succeeded),
-                Some(&artifact_catalog()),
-            )
-            .is_err()
-        );
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &wrong_artifact,
+            &catalog(FmsTaskLifecycle::Succeeded),
+            Some(&artifact_catalog()),
+        )
+        .is_err());
 
         let mut wrong_output = artifact_catalog();
         wrong_output.entries[1]
@@ -2578,16 +2630,14 @@ mod dependency_tests {
             .as_mut()
             .expect("study output")
             .case_id = "other-case".into();
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &resolved_inputs(),
-                &catalog(FmsTaskLifecycle::Succeeded),
-                Some(&wrong_output),
-            )
-            .is_err()
-        );
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &resolved_inputs(),
+            &catalog(FmsTaskLifecycle::Succeeded),
+            Some(&wrong_output),
+        )
+        .is_err());
     }
 
     #[test]
@@ -2610,16 +2660,14 @@ mod dependency_tests {
             .get_mut("initial_state")
             .expect("resolved input")
             .content_sha256 = "f".repeat(64);
-        assert!(
-            resolve_step_output_inputs(
-                "run-study-dependency",
-                &ports,
-                &forged,
-                &run_catalog,
-                Some(&artifact_catalog),
-            )
-            .is_err()
-        );
+        assert!(resolve_step_output_inputs(
+            "run-study-dependency",
+            &ports,
+            &forged,
+            &run_catalog,
+            Some(&artifact_catalog),
+        )
+        .is_err());
 
         let mut missing_case = artifact_catalog;
         missing_case.entries[1]
@@ -2627,16 +2675,14 @@ mod dependency_tests {
             .as_mut()
             .expect("study output")
             .case_id = "other-case".into();
-        assert!(
-            resolve_step_output_inputs(
-                "run-study-dependency",
-                &ports,
-                &BTreeMap::new(),
-                &run_catalog,
-                Some(&missing_case),
-            )
-            .is_err()
-        );
+        assert!(resolve_step_output_inputs(
+            "run-study-dependency",
+            &ports,
+            &BTreeMap::new(),
+            &run_catalog,
+            Some(&missing_case),
+        )
+        .is_err());
     }
 }
 
@@ -2840,10 +2886,13 @@ pub fn load_accepted_study_snapshot(
                 asset.asset_id
             );
         }
-        let asset_bytes=if study.schema_version==fullmag_authoring::STUDY_PLAN_SCHEMA_VERSION_V4 {
-            store.cas().get_bounded(object_ref,32*1024*1024)?
-        } else { store.cas().get(object_ref)? };
-        asset_bytes.with_context(|| {
+        // Verify all bytes without retaining a discarded buffer, preserving the v4 cap.
+        let length = store.cas().verified_length(object_ref)?;
+        if study.schema_version == fullmag_authoring::STUDY_PLAN_SCHEMA_VERSION_V4
+            && length.is_some_and(|bytes| bytes > 32 * 1024 * 1024) {
+            bail!("accepted v4 run asset exceeds its metadata budget");
+        }
+        length.with_context(|| {
             format!("accepted run asset `{}` object is missing", asset.asset_id)
         })?;
     }
@@ -2965,6 +3014,38 @@ pub fn validate_requested_execution(
 
         let planned_precision = match &execution.backend_plan {
             fullmag_ir::BackendPlanIR::AntennaFieldOnly(_) => Some(fullmag_ir::ExecutionPrecision::Double),
+            fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
+                let intent = &inspection.requested_execution;
+                if step_requested.backend != "fem"
+                    || !matches!(step_requested.device.as_str(), "cpu" | "auto")
+                    || step_requested.precision != "double"
+                    || step_requested.mode != "strict"
+                    || intent.discretization != BackendTarget::Fem
+                    || !matches!(intent.device, ExecutionDevice::Cpu | ExecutionDevice::Auto)
+                    || intent.precision != ExecutionPrecision::Double
+                    || intent.execution_mode != ExecutionMode::Strict
+                    || device_name(intent.device) != step_requested.device
+                    || execution.common.resolved_backend != BackendTarget::Fem
+                    || step.until_seconds.is_some()
+                    || !matches!(
+                        &step.kind,
+                        fullmag_authoring::StudyStepKind::Primitive {
+                            stage_kind:
+                                fullmag_authoring::StudyPrimitiveStageKind::AntennaFieldSolve,
+                        }
+                    )
+                    || !step.inputs.is_empty()
+                    || step.outputs.len() != 1
+                    || step.outputs[0].port_id
+                        != fullmag_authoring::ANTENNA_INSPECTION_OUTPUT_PORT_ID
+                    || step.outputs[0].data_kind != fullmag_authoring::StudyPortDataKind::Artifact
+                {
+                    bail!(
+                        "antenna inspection accepted-study requires FEM CPU-or-auto double strict and its sole inspection/Artifact port, without magnetic inputs or horizon"
+                    );
+                }
+                Some(intent.precision)
+            }
             fullmag_ir::BackendPlanIR::Fdm(plan) => Some(plan.precision),
             fullmag_ir::BackendPlanIR::FdmMultilayer(plan) => Some(plan.precision),
             fullmag_ir::BackendPlanIR::FemEigen(plan) => Some(plan.precision),

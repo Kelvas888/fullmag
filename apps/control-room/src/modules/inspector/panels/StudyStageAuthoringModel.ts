@@ -10,6 +10,7 @@ import {
   type ActiveLaneOperationId,
 } from "@/kernel/resources/useActiveLaneCapabilities";
 import { DEFAULT_RELAX_TORQUE_APM } from "@/shared/domain/physics/torqueUnits";
+import { readStudyStageSource } from "@/shared/domain/study/studyStageSource";
 import { validateFieldDriveDraft } from "@/shared/domain/physics/fieldDrive";
 import {
   DEFAULT_HYSTERESIS_BRANCH_MODE,
@@ -157,6 +158,7 @@ const MAX_HYSTERESIS_AUTHORING_FIELD_POINTS = 10_000;
 
 export type StudyStageDraftKind =
   | "add_field_drive"
+  | "antenna_field_solve"
   | "autosave"
   | "change_device"
   | "eigenmodes"
@@ -276,6 +278,9 @@ export interface StudyStageDraft {
   // Hysteresis expansion fields
   protocolKind: string;
   rawStage?: JsonObject;
+  pipelineNodeId?: string;
+  pipelineEnabled?: boolean;
+  pipelineGroupIds?: readonly string[];
   initialStatePolicy: string;
   initialStateRef: string;
   orientationMode: string;
@@ -772,7 +777,7 @@ export function createStudyStageDraft(
   const kind = stageKind(record);
   const action = asRecord(record?.action);
   const payload = asRecord(record?.payload);
-  if (kind === "unsupported") {
+  if (kind === "unsupported" || kind === "antenna_field_solve") {
     return cloneStudyStageDraft({
       ...DEFAULT_RELAX_STAGE_DRAFT,
       kind,
@@ -1242,6 +1247,9 @@ export function createDefaultStudyStageDraft(
   kind: StudyStageDraftKind,
   stageCount: number,
 ): StudyStageDraft {
+  if (kind === "antenna_field_solve") {
+    throw new Error("Add an existing antenna field-solve definition to Study instead of creating an unbound stage.");
+  }
   const base =
     kind === "add_field_drive"
       ? DEFAULT_ADD_FIELD_DRIVE_STAGE_DRAFT
@@ -1274,9 +1282,9 @@ export function createDefaultStudyStageDraft(
 export function studyStageDraftToSceneStage(
   draft: StudyStageDraft,
 ): JsonObject {
-  if (draft.kind === "unsupported") {
+  if (draft.kind === "unsupported" || draft.kind === "antenna_field_solve") {
     if (!draft.rawStage) {
-      throw new Error("unsupported study stage requires its preserved raw payload");
+      throw new Error("reference-only study stage requires its preserved raw payload");
     }
     return structuredClone(draft.rawStage);
   }
@@ -1647,6 +1655,15 @@ export function studyStageDraftToSceneStage(
   return stage;
 }
 
+export function antennaFieldSolvePortReferences(raw: JsonObject | undefined): string[] {
+  if (raw && "port_mode_id" in raw) {
+    if ("port_mode_ids" in raw && (!Array.isArray(raw.port_mode_ids) || raw.port_mode_ids.length !== 0)) return [];
+    return typeof raw.port_mode_id === "string" && raw.port_mode_id.trim() ? [raw.port_mode_id] : [];
+  }
+  return Array.isArray(raw?.port_mode_ids) && raw.port_mode_ids.every((id) => typeof id === "string" && id.trim())
+    ? raw.port_mode_ids as string[] : [];
+}
+
 export function validateStudyStageDraft(
   draft: StudyStageDraft,
   execution?: K0ModalExecutionReadiness & {
@@ -1662,6 +1679,14 @@ export function validateStudyStageDraft(
   const issues: StudyStageDraftValidation[] = [];
   if (!draft.stageId.trim()) {
     issues.push({ message: "Stage ID is required.", severity: "error" });
+  }
+  if (draft.kind === "antenna_field_solve") {
+    const raw = draft.rawStage;
+    if (!raw || typeof raw.stage_id !== "string" || !raw.stage_id.trim()
+      || antennaFieldSolvePortReferences(raw).length !== 1) {
+      issues.push({ message: "Antenna field solve requires an explicit definition ID and exactly one executable port reference.", severity: "error" });
+    }
+    return issues;
   }
   if (draft.kind === "unsupported") {
     issues.push({
@@ -2117,7 +2142,12 @@ function joinOptions(options: readonly string[]): string {
 export function buildStudyStagesMergePatch(
   stages: readonly StudyStageDraft[],
   baseRevision?: number | null,
+  scene?: unknown,
 ): AuthoringTransactionRequest {
+  const study = asRecord(asRecord(scene)?.study);
+  if (readStudyStageSource(study).kind !== "flat" || stages.some((stage) => stage.pipelineNodeId)) {
+    throw new Error("Editing a canonical pipeline through the flat-stage editor is not supported; no dormant stages were written.");
+  }
   return {
     kind: "merge_patch",
     ...(baseRevision === undefined || baseRevision === null
@@ -3393,6 +3423,7 @@ function stageKind(record: JsonRecord | null): StudyStageDraftKind {
   }
   const kind = String(authoredKind);
   const normalized = kind.toLowerCase();
+  if (normalized === "antenna_field_solve" || normalized === "flat_antenna_field_solve") return "antenna_field_solve";
   if (normalized.includes("add_field_drive")) return "add_field_drive";
   if (normalized.includes("table_autosave")) return "table_autosave";
   if (normalized.includes("fft_response")) return "fft_response";

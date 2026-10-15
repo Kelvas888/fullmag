@@ -226,6 +226,28 @@ pub struct AntennaInspectionDisplayResource {
     pub device_current: Option<AntennaInspectionCurrentDisplayResource>,
 }
 
+/// Shared verified display contract, without Live or accepted-run ownership.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AntennaInspectionDisplayDataResource {
+    pub content_digest: String,
+    pub source_object_id: String,
+    pub status: String,
+    pub qualification: String,
+    pub field_scope: String,
+    pub normalization: String,
+    pub capabilities: AntennaInspectionDisplayCapabilities,
+    pub device_node_count: u64,
+    pub device_cell_count: u64,
+    pub sampling_carrier: AntennaInspectionSamplingResource,
+    pub device_positions: AntennaInspectionPayloadResource,
+    pub device_topology: AntennaInspectionPayloadResource,
+    pub device_potential: AntennaInspectionPayloadResource,
+    pub sample_positions: AntennaInspectionPayloadResource,
+    pub magnetic_field: AntennaInspectionPayloadResource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_current: Option<AntennaInspectionCurrentDisplayResource>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AntennaInspectionPayloadQuery {
@@ -497,7 +519,7 @@ fn json_value<T: Serialize>(value: &T) -> Result<Value, ApiError> {
     serde_json::to_value(value).map_err(|e| ApiError::internal(e.to_string()))
 }
 
-fn manifest_resource(
+pub(super) fn manifest_resource(
     manifest: AntennaExternalLeadSolutionManifest,
 ) -> Result<AntennaInspectionManifestResource, ApiError> {
     let domain = match manifest.sampling_carrier.domain {
@@ -714,6 +736,39 @@ fn current_display_resource(
     }))
 }
 
+pub(super) fn inspection_display_data(
+    loaded: &LoadedAntennaExternalLeadSolution,
+) -> Result<AntennaInspectionDisplayDataResource, ApiError> {
+    let [(positions, _), (topology, _)] = device_display_payloads(loaded)?;
+    let device_current = current_display_resource(loaded)?;
+    if device_current.as_ref().is_some_and(|current| current.receipt.cell_count != topology.value_count / 4) {
+        return Err(invalid("current display carrier differs from device topology"));
+    }
+    let has_current = device_current.is_some();
+    let manifest = manifest_resource(loaded.manifest.clone())?;
+    Ok(AntennaInspectionDisplayDataResource {
+        content_digest: manifest.content_digest,
+        source_object_id: manifest.source_object_id,
+        status: "inspection_only".into(),
+        qualification: "NOT VERIFIED".into(),
+        field_scope: "external_electrode_truncation".into(),
+        normalization: "raw_authored_current".into(),
+        capabilities: AntennaInspectionDisplayCapabilities {
+            display: true, per_ampere_basis: false, source_fft: false,
+            llg_drive: false, current_density: has_current,
+        },
+        device_node_count: positions.value_count / 3,
+        device_cell_count: topology.value_count / 4,
+        sampling_carrier: manifest.sampling_carrier,
+        device_positions: positions.into(),
+        device_topology: topology.into(),
+        device_potential: manifest.device_potential,
+        sample_positions: manifest.sample_positions,
+        magnetic_field: manifest.magnetic_field,
+        device_current,
+    })
+}
+
 #[utoipa::path(
     get,
     path = "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/display",
@@ -755,13 +810,8 @@ pub async fn get_antenna_external_lead_inspection_display(
             &captured.owner.artifact_dir, &output.inspection_ref.runner_reference(),
         ).map_err(|e| invalid(e.message))?;
         validate_port(&record, &loaded.manifest)?;
-        let [(positions, _), (topology, _)] = device_display_payloads(&loaded)?;
-        let device_current = current_display_resource(&loaded)?;
-        if device_current.as_ref().is_some_and(|current| current.receipt.cell_count != topology.value_count / 4) {
-            return Err(invalid("current display carrier differs from device topology"));
-        }
-        let has_current = device_current.is_some();
-        let manifest = manifest_resource(loaded.manifest)?;
+        let display = inspection_display_data(&loaded)?;
+        let has_current = display.device_current.is_some();
         Ok::<_, ApiError>(AntennaInspectionDisplayResource {
             schema_version: if has_current { "antenna_inspection_display.v2" } else { "antenna_inspection_display.v1" }.into(),
             resource_id: format!("data/antenna/stages/{}/external-lead-inspection/display", captured.owner.runtime_stage_id),
@@ -772,25 +822,22 @@ pub async fn get_antenna_external_lead_inspection_display(
             runtime_stage_id: captured.owner.runtime_stage_id,
             stage_revision: captured.stage_revision,
             record_content_digest: format!("sha256:{}", digest(&record_bytes)),
-            content_digest: manifest.content_digest,
-            source_object_id: manifest.source_object_id,
-            status: "inspection_only".into(),
-            qualification: "NOT VERIFIED".into(),
-            field_scope: "external_electrode_truncation".into(),
-            normalization: "raw_authored_current".into(),
-            capabilities: AntennaInspectionDisplayCapabilities {
-                display: true, per_ampere_basis: false, source_fft: false,
-                llg_drive: false, current_density: has_current,
-            },
-            device_node_count: positions.value_count / 3,
-            device_cell_count: topology.value_count / 4,
-            sampling_carrier: manifest.sampling_carrier,
-            device_positions: positions.into(),
-            device_topology: topology.into(),
-            device_potential: manifest.device_potential,
-            sample_positions: manifest.sample_positions,
-            magnetic_field: manifest.magnetic_field,
-            device_current,
+            content_digest: display.content_digest,
+            source_object_id: display.source_object_id,
+            status: display.status,
+            qualification: display.qualification,
+            field_scope: display.field_scope,
+            normalization: display.normalization,
+            capabilities: display.capabilities,
+            device_node_count: display.device_node_count,
+            device_cell_count: display.device_cell_count,
+            sampling_carrier: display.sampling_carrier,
+            device_positions: display.device_positions,
+            device_topology: display.device_topology,
+            device_potential: display.device_potential,
+            sample_positions: display.sample_positions,
+            magnetic_field: display.magnetic_field,
+            device_current: display.device_current,
         })
     }).await.map_err(|e| ApiError::internal(format!("inspection display worker: {e}")))??;
     check_owner(&state, &owner).await?;
@@ -800,7 +847,19 @@ pub async fn get_antenna_external_lead_inspection_display(
     Ok(crate::router_v2::handlers::shared::conditional_json_response(&headers, &etag, &resource))
 }
 
-fn select_payload(
+pub(super) fn validate_payload_kind(kind: &str) -> Result<(), ApiError> {
+    if ![
+        "bundle", "sample_positions", "magnetic_field", "device_vertex_ids",
+        "device_potential", "device_positions", "device_topology",
+        "current_center_positions", "current_center_density", "current_trace_positions",
+        "current_trace_density", "current_snapshot",
+    ].contains(&kind) {
+        return Err(ApiError::bad_request("unknown inspection payload kind"));
+    }
+    Ok(())
+}
+
+pub(super) fn select_payload(
     loaded: LoadedAntennaExternalLeadSolution,
     kind: &str,
 ) -> Result<(AntennaExternalLeadPayloadRef, Vec<u8>), ApiError> {
@@ -903,24 +962,7 @@ pub async fn get_antenna_external_lead_inspection_payload(
     let Query(query) = query.map_err(|error| {
         ApiError::bad_request(format!("invalid inspection payload query: {error}"))
     })?;
-    if ![
-        "bundle",
-        "sample_positions",
-        "magnetic_field",
-        "device_vertex_ids",
-        "device_potential",
-        "device_positions",
-        "device_topology",
-        "current_center_positions",
-        "current_center_density",
-        "current_trace_positions",
-        "current_trace_density",
-        "current_snapshot",
-    ]
-    .contains(&payload_kind.as_str())
-    {
-        return Err(ApiError::bad_request("unknown inspection payload kind"));
-    }
+    validate_payload_kind(&payload_kind)?;
     let snapshot = snapshot(&state, &stage_id).await?;
     let owner = snapshot.owner.clone();
     let (etag, bytes) = tokio::task::spawn_blocking(move || {

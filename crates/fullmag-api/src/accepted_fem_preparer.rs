@@ -73,6 +73,16 @@ pub(crate) fn prepare_accepted_fem_task(
         bail!("accepted FEM preparation lease belongs to another task attempt");
     }
 
+    if let Some(binding) = &preparation_lease.host_launch_binding {
+        let token = std::env::var("FULLMAG_HOST_PREPARATION_LAUNCH_TOKEN")
+            .context("host-bound FEM preparer requires its supervisor launch permit")?;
+        let ledger = fullmag_session::host_resource_ledger::HostResourceLedger::open(
+            &binding.ledger_root,
+            binding.policy.clone(),
+        )?;
+        ledger.validate_preparation_launch(store, &preparation_lease, &token)?;
+    }
+
     let step = accepted
         .lowered
         .steps
@@ -100,8 +110,10 @@ pub(crate) fn prepare_accepted_fem_task(
             let fullmag_plan::AntennaFieldSolveExecutionPlan::ClosedLoopInspection { input, .. } = operation else { bail!("native preparation operation mismatch"); };
             (input.source_mesh, 1)
         }
-        (_, BackendPlanIR::Fem(plan)) => (plan.mesh.clone(), plan.fe_order),
-        _ => bail!("native preparation requires a time-domain FEM or typed inspection plan"),
+        (_, plan) => {
+            let (mesh, order) = accepted_preparation_mesh(plan)?;
+            (mesh.clone(), order)
+        }
     };
 
     if let Some(existing) = store.read_task_preparation_receipt(run_id.as_str(), task_id)? {
@@ -134,10 +146,20 @@ pub(crate) fn prepare_accepted_fem_task(
     }
 
     let native = produce_native_fem_evidence(&mesh, fe_order)?;
+    let preparation_id = format!("prep-{task_id}");
     let receipt = if matches!(step.kind, fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. }) {
-        AcceptedPreparationReceipt::ClosedLoop(ClosedLoopPreparationReceipt::ready(&specification, task_id, step, entry.problem(), native)?)
+        AcceptedPreparationReceipt::ClosedLoop(ClosedLoopPreparationReceipt::ready(
+            &specification, task_id, step, entry.problem(), native)?)
     } else {
-        AcceptedPreparationReceipt::Solver(accepted.materialize_fem_preparation_receipt(format!("prep-{task_id}"), &step.step_id, &native)?)
+        let solver = match &execution_plan.backend_plan {
+            BackendPlanIR::Fem(_) => accepted.materialize_fem_preparation_receipt(
+                preparation_id, &step.step_id, &native),
+            BackendPlanIR::AntennaExternalLeadInspection(_) => accepted
+                .materialize_antenna_external_lead_inspection_preparation_receipt(
+                    preparation_id, &step.step_id, &native),
+            _ => bail!("accepted FEM preparer requires a FEM or typed inspection plan"),
+        }.with_context(|| format!("materialize accepted preparation for `{}`", step.step_id))?;
+        AcceptedPreparationReceipt::Solver(solver)
     };
     let payload = receipt.payload().context("serialize accepted native preparation receipt")?;
     let durable = FmsTaskPreparationReceipt::new(
@@ -170,6 +192,18 @@ pub(crate) fn prepare_accepted_fem_task(
     })
 }
 
+/// Select only the mesh consumed by the pinned workflow. Inspection uses the
+/// conductor plus leads, never the original device or a magnetic target mesh.
+fn accepted_preparation_mesh(plan: &BackendPlanIR) -> Result<(&fullmag_ir::MeshIR, u32)> {
+    match plan {
+        BackendPlanIR::Fem(fem) => Ok((&fem.mesh, fem.fe_order)),
+        BackendPlanIR::AntennaExternalLeadInspection(antenna) => {
+            Ok((&antenna.input.combined_mesh, 1))
+        }
+        _ => bail!("accepted FEM preparer requires a time-domain FEM or antenna inspection plan"),
+    }
+}
+
 #[cfg(feature = "fem-native")]
 fn produce_native_fem_evidence(
     mesh: &fullmag_ir::MeshIR,
@@ -186,4 +220,29 @@ fn produce_native_fem_evidence(
     _fe_order: u32,
 ) -> Result<fullmag_plan::NativeFemMeshSpaceEvidence> {
     bail!("accepted FEM preparation requires the fem-native feature")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mesh_selection_preserves_magnetic_mesh_order_and_rejects_fdm() {
+        let mut fem = fullmag_ir::FemPlanIR::default();
+        fem.fe_order = 2;
+        let plan = BackendPlanIR::Fem(fem);
+        let (mesh, order) = accepted_preparation_mesh(&plan).unwrap();
+        let BackendPlanIR::Fem(fem) = &plan else {
+            panic!("test fixture must be FEM");
+        };
+        assert!(std::ptr::eq(mesh, &fem.mesh));
+        // Selection must not silently coerce magnetic order; native H1
+        // validation remains responsible for rejecting unsupported orders.
+        assert_eq!(order, 2);
+        let error = accepted_preparation_mesh(
+            &BackendPlanIR::Fdm(fullmag_ir::FdmPlanIR::default()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("time-domain FEM or antenna inspection"));
+    }
 }

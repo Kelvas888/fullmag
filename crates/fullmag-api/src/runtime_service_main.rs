@@ -1,6 +1,7 @@
 //! Native accepted-run service. UI is an attaching client, never its owner.
 use anyhow::{bail, Context, Result};
 use fullmag_session::{
+    host_resource_ledger::{HostInventoryOwner, HostResourceLedger},
     repository_path::{checked_path, validate_store_id},
     runtime_service::{
         RuntimeServiceChild, RuntimeServiceConfig as ServiceConfig, RuntimeServiceOwner,
@@ -16,6 +17,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -31,6 +33,31 @@ struct SchedulerChild {
     released: bool,
     status: Option<std::process::ExitStatus>,
     observation_unknown: bool,
+}
+
+async fn publish_compute_node_sample(
+    ledger: Arc<HostResourceLedger>,
+    inventory_owner: Option<Arc<HostInventoryOwner>>,
+) -> Result<Option<Arc<HostInventoryOwner>>> {
+    tokio::task::spawn_blocking(move || -> Result<Option<Arc<HostInventoryOwner>>> {
+        let inventory_owner = match inventory_owner {
+            Some(owner) => Some(owner),
+            None => ledger.try_acquire_inventory_owner()?.map(Arc::new),
+        };
+        let Some(inventory_owner) = inventory_owner else {
+            return Ok(None);
+        };
+        let previous = ledger.read_compute_node_snapshot()?;
+        let snapshot = fullmag_runtime_control::compute_node_probe::sample_compute_node_for_owner(
+            &ledger,
+            inventory_owner.descriptor(),
+            previous.as_ref(),
+        )?;
+        ledger.publish_compute_node_snapshot_with_owner(&inventory_owner, &snapshot)?;
+        Ok(Some(inventory_owner))
+    })
+    .await
+    .context("compute-node sampling worker failed")?
 }
 
 impl SchedulerChild {
@@ -345,11 +372,13 @@ fn publish_pools(
 
 fn spawn_scheduler(
     config: &ServiceConfig,
+    configuration_path: &Path,
     bin: &Path,
     logs: &Path,
     role: &'static str,
     owner: &str,
 ) -> Result<SchedulerChild> {
+    let max_concurrency = config.scheduler_concurrency(role)?;
     let (name, pool) = if role == "compute" {
         ("fullmag-api-accepted-scheduler", &config.compute_pool_id)
     } else {
@@ -373,15 +402,24 @@ fn spawn_scheduler(
             "stdin-v1",
             "--startup-gate",
             "stdin-v1",
-            "--max-concurrency",
-            "1",
             "--max-tasks",
             "0",
             "--max-idle-polls",
             "0",
         ])
+        .arg("--max-concurrency")
+        .arg(max_concurrency.to_string())
         .arg("--heartbeat-interval-milliseconds")
         .arg(config.heartbeat_interval_milliseconds.to_string());
+    if config.host_execution.is_some() {
+        command
+            .arg("--host-service-config")
+            .arg(configuration_path)
+            .arg("--host-config-sha256")
+            .arg(fullmag_session::canonical_json_sha256(
+                &serde_json::to_value(config)?,
+            ));
+    }
     if role == "compute" {
         command
             .args(["--discover-runs", "true", "--discover-resources", "true"])
@@ -642,6 +680,9 @@ fn run() -> Result<()> {
         bail!("service requires exactly one absolute config path");
     }
     let config = ServiceConfig::read(&path)?;
+    if config.host_execution.is_some() {
+        bail!("v2 host execution requires completed recovery, owner lifecycle, topology and enforcement gates; service startup remains unavailable");
+    }
     let startup_deadline = Instant::now() + Duration::from_secs(config.startup_timeout_seconds);
     let store = fullmag_runtime_control::retry_store_writer_busy(|| {
         SessionStore::open_existing(&config.store_root)
@@ -672,6 +713,15 @@ fn run() -> Result<()> {
         executable(&bin, name)?;
     }
     let mut owner = RuntimeServiceOwner::acquire(&store, &config.target_id)?;
+    let host_ledger = config
+        .host_execution
+        .as_ref()
+        .map(|binding| {
+            HostResourceLedger::open(&binding.ledger_root, binding.policy.clone())
+                .context("open the configured host ledger for compute-node sampling")
+                .map(Arc::new)
+        })
+        .transpose()?;
     owner.set_execution_identity(
         identity.git_commit,
         identity.source_snapshot_sha256,
@@ -689,6 +739,7 @@ fn run() -> Result<()> {
         owner.set_control_address(Some(listener.local_addr()?.to_string()))?;
         let mut children = Schedulers::default();
         let mut generations = None;
+        let mut inventory_owner = None;
         let mut unknown_publishers = Vec::new();
         let mut drain_confirmation = None;
         let work: Result<()> = async {
@@ -704,7 +755,7 @@ fn run() -> Result<()> {
             for role in ["compute", "preparation"] {
                 children
                     .0
-                    .push(spawn_scheduler(&config, &bin, &logs, role, &token)?);
+                    .push(spawn_scheduler(&config, &path, &bin, &logs, role, &token)?);
             }
             await_event(
                 &mut children,
@@ -715,6 +766,27 @@ fn run() -> Result<()> {
                 startup_deadline,
             )
             .await?;
+            if let Some(ledger) = host_ledger.as_ref() {
+                let admission = fullmag_runtime_control::host_runtime::HostRuntimeAdmission::open(
+                    &config,
+                )?
+                .context("host execution requires an initialized runtime admission context")?;
+                loop {
+                    inventory_owner = publish_compute_node_sample(
+                        Arc::clone(ledger),
+                        inventory_owner.take(),
+                    )
+                    .await
+                    .context("initial compute-node sample is required before releasing host schedulers")?;
+                    if admission.has_current_compute_snapshot()? {
+                        break;
+                    }
+                    if Instant::now() >= startup_deadline {
+                        bail!("no current host-owner sample became available before startup deadline");
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
             for child in &mut children.0 {
                 child.release()?;
             }
@@ -734,8 +806,25 @@ fn run() -> Result<()> {
                 children.describe(),
             )?;
             let mut heartbeat = Instant::now();
+            let mut last_compute_node_sample = Instant::now();
             loop {
                 children.poll()?;
+                if last_compute_node_sample.elapsed() >= Duration::from_secs(5) {
+                    if let Some(ledger) = host_ledger.as_ref() {
+                        match publish_compute_node_sample(
+                            Arc::clone(ledger),
+                            inventory_owner.take(),
+                        )
+                        .await
+                        {
+                            Ok(owner) => inventory_owner = owner,
+                            Err(error) => {
+                                tracing::warn!(error = %error, "compute-node sample publication failed");
+                            }
+                        }
+                    }
+                    last_compute_node_sample = Instant::now();
+                }
                 match drain_requested(&listener, &owner, &config, &store).await? {
                     ControlObservation::Continue => {}
                     ControlObservation::Drain(confirmation) => {
@@ -1022,6 +1111,7 @@ mod tests {
             heartbeat_interval_milliseconds: 100,
             startup_timeout_seconds: 10,
             drain_timeout_seconds: 10,
+            host_execution: None,
         }
     }
     #[test]

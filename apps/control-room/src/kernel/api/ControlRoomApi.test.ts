@@ -25,6 +25,12 @@ import type {
   SimulationPreparationResource,
   AnalysisResultPageQuery,
   OutputStorageSettings,
+  ProjectBatchCasesQuery,
+  ProjectBatchCasesResource,
+  ProjectBatchListQuery,
+  ProjectBatchListResource,
+  ProjectBatchSubmitRequest,
+  ProjectBatchSubmitResource,
 } from "./apiTypes";
 import {
   ANALYSIS_RESULT_BRANCH_POINTS_PATH,
@@ -291,6 +297,7 @@ describe("field vector response metadata", () => {
   it("parses every documented response header and reports invalid numbers", () => {
     const headers = new Headers({
       "x-fullmag-component": "full",
+      "x-fullmag-artifact-generation-id": "artifact-generation-8",
       "x-fullmag-domain-generation-id": "12",
       "x-fullmag-encoding": "FMVP;version=3",
       "x-fullmag-field-indexing": "explicit_node_indices",
@@ -307,6 +314,7 @@ describe("field vector response metadata", () => {
     });
     expect(parseFieldVectorResponseMetadata(headers)).toMatchObject({
       component: "full",
+      artifactGenerationId: "artifact-generation-8",
       domainGenerationId: "12",
       encoding: "FMVP;version=3",
       fieldIndexing: "explicit_node_indices",
@@ -322,6 +330,7 @@ describe("field vector response metadata", () => {
       valueCount: null,
     });
     expect(parseFieldVectorResponseMetadata(new Headers())).toMatchObject({
+      artifactGenerationId: null,
       pointCount: null,
       quantityId: null,
     });
@@ -330,6 +339,7 @@ describe("field vector response metadata", () => {
   it("returns null independently for every absent response header", () => {
     const mappings = [
       ["x-fullmag-component", "component"],
+      ["x-fullmag-artifact-generation-id", "artifactGenerationId"],
       ["x-fullmag-domain-generation-id", "domainGenerationId"],
       ["x-fullmag-encoding", "encoding"],
       ["x-fullmag-field-indexing", "fieldIndexing"],
@@ -2517,6 +2527,51 @@ describe("ControlRoomApi", () => {
     );
   });
 
+  it("sends the artifact generation precondition and rejects missing or mismatched response headers", async () => {
+    let observedUrl = "";
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url) => {
+        observedUrl = String(url);
+        return binaryResponse(makeFieldVectorBuffer(), {
+          headers: {
+            ...contractHeaders,
+            "x-fullmag-artifact-generation-id": "publication-14",
+          },
+        });
+      },
+    });
+
+    const result = await api.data.fields.vector("m", {
+      expected_artifact_generation_id: "publication-14",
+    });
+    expect(observedUrl).toContain("expected_artifact_generation_id=publication-14");
+    expect(result).toMatchObject({
+      responseMetadata: { artifactGenerationId: "publication-14" },
+      status: "ready",
+    });
+
+    for (const responseGenerationId of [null, "publication-stale"]) {
+      const headers: Record<string, string> = { ...contractHeaders };
+      if (responseGenerationId !== null) {
+        headers["x-fullmag-artifact-generation-id"] = responseGenerationId;
+      }
+      const rejectingApi = new ControlRoomApi({
+        baseUrl: "http://127.0.0.1:8765",
+        fetchImpl: async () =>
+          binaryResponse(makeFieldVectorBuffer(), { headers }),
+      });
+      await expect(
+        rejectingApi.data.fields.vector("m", {
+          expected_artifact_generation_id: "publication-14",
+        }),
+      ).rejects.toMatchObject({
+        message: "Field vector artifact generation did not match the requested generation.",
+        status: 409,
+      });
+    }
+  });
+
   it.each([
     ["object", "object:film", "film"],
     ["region", "edge", "edge"],
@@ -3591,7 +3646,7 @@ describe("ControlRoomApi", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 
-  it("loads typed platform health and capabilities through generated v2 paths", async () => {
+  it("loads typed platform health, capabilities, and compute nodes through generated v2 paths", async () => {
     const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {
       const path = new URL(String(url)).pathname;
       if (path === "/v2/platform/health") {
@@ -3600,6 +3655,14 @@ describe("ControlRoomApi", () => {
           api_contract_version: "1.0.0",
           status: "ok",
           uptime_seconds: 12,
+        });
+      }
+      if (path === "/v2/platform/compute/nodes") {
+        return jsonResponse({
+          nodes: [],
+          schema_version: "compute_nodes.v1",
+          stale_after_seconds: 30,
+          state: "not_probed",
         });
       }
       return jsonResponse({ engines: [], profile_version: "runtime-capabilities.v1" });
@@ -3613,9 +3676,14 @@ describe("ControlRoomApi", () => {
     await expect(api.platform.capabilities()).resolves.toMatchObject({
       profile_version: "runtime-capabilities.v1",
     });
+    await expect(api.platform.computeNodes()).resolves.toMatchObject({
+      state: "not_probed",
+      stale_after_seconds: 30,
+    });
     expect(fetchImpl.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
       "/v2/platform/health",
       "/v2/platform/capabilities",
+      "/v2/platform/compute/nodes",
     ]);
   });
 
@@ -5328,6 +5396,85 @@ describe("ControlRoomApi", () => {
     expect(url.pathname).toBe("/v2/persistence/projects/project-1/runs");
     expect(url.searchParams.get("limit")).toBe("10");
     expect(url.searchParams.get("cursor")).toBe("run-prev");
+  });
+
+  it("submits and pages project batches through the typed persistence facade", async () => {
+    const requests: Array<{ body: unknown; method: string | undefined; url: string }> = [];
+    const batchRequest: ProjectBatchSubmitRequest = {
+      archive_base64: "Zg==",
+      idempotency_key: "submit-batch-1",
+      batch_request: { batch_id: "batch-1" },
+      study_plan: { schema_version: "study_plan.v2" },
+      study_problem_catalog: { schema_version: "study_problem_catalog.v3" },
+      asset_paths: {},
+    };
+    const accepted: ProjectBatchSubmitResource = {
+      disposition: "accepted",
+      batch_id: "batch-1",
+      manifest_sha256: "a".repeat(64),
+      case_count: 2,
+    };
+    const batchPage: ProjectBatchListResource = {
+      project_id: "project-1",
+      batches: [{
+        batch_id: "batch-1",
+        accepted_at: "2026-10-07T00:00:00Z",
+        manifest_sha256: accepted.manifest_sha256,
+        case_count: 2,
+        max_parallel_cases: 2,
+        failure_policy: "continue_independent",
+        published_case_count: 0,
+        expansion_state: "pending",
+      }],
+      next_cursor: null,
+    };
+    const casesPage: ProjectBatchCasesResource = {
+      batch_id: "batch-1",
+      axes: [{ name: "field_z", canonical_unit: "T" }],
+      cases: [{
+        case_id: "case-" + "b".repeat(64),
+        planned_run_id: "run-planned-1",
+        parameter_tuple: { field_z: -0.01 },
+        state: "pending_expansion",
+      }],
+      next_cursor: null,
+    };
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          body: init?.body ? parseRequestBody(init.body) : null,
+          method: init?.method,
+          url,
+        });
+        if (init?.method === "POST") return jsonResponse(accepted, { status: 201 });
+        if (url.includes("/cases")) return jsonResponse(casesPage);
+        return jsonResponse(batchPage);
+      },
+    });
+
+    const submitted = await api.persistence.projects.submitBatch("project-1", batchRequest);
+    const batchQuery: ProjectBatchListQuery = { limit: 25, cursor: "batch-prev" };
+    const listed = await api.persistence.projects.listBatches("project-1", batchQuery);
+    const casesQuery: ProjectBatchCasesQuery = { limit: 10 };
+    const cases = await api.persistence.projects.listBatchCases(
+      "project-1", "batch-1", casesQuery,
+    );
+
+    expect(submitted).toEqual(accepted);
+    expect(listed).toEqual(batchPage);
+    expect(cases).toEqual(casesPage);
+    expect(requests.map(({ method, url }) => ({ method, url: new URL(url).pathname }))).toEqual([
+      { method: "POST", url: "/v2/persistence/projects/project-1/batches" },
+      { method: "GET", url: "/v2/persistence/projects/project-1/batches" },
+      { method: "GET", url: "/v2/persistence/projects/project-1/batches/batch-1/cases" },
+    ]);
+    expect(requests[0]?.body).toEqual(batchRequest);
+    const batchListUrl = new URL(requests[1]!.url);
+    expect(batchListUrl.searchParams.get("limit")).toBe("25");
+    expect(batchListUrl.searchParams.get("cursor")).toBe("batch-prev");
+    expect(new URL(requests[2]!.url).searchParams.get("limit")).toBe("10");
   });
 
   it("loads and patches object interaction resources through v2 model facade methods", async () => {

@@ -8,6 +8,7 @@
 
 mod antenna_inspection_bundle;
 mod application;
+mod batch_expansion;
 mod coordinator;
 mod declared_execution;
 mod execution;
@@ -19,7 +20,9 @@ mod closed_loop_preparation;
 mod script_pipeline_acceptance;
 mod project;
 mod repository;
+mod run_intent_materialization;
 mod run_spec;
+mod script_antenna_inspection_planning;
 mod script_pipeline_compilation;
 pub mod script_stage_contract;
 pub mod script_stage_materialization;
@@ -36,6 +39,14 @@ pub use application::{
     ActiveExecution, ActiveExecutionPolicy, ApplicationError, CloseRequest, CloseResult,
     CreateProjectRequest, DirtyClosePolicy, DocumentMode, DocumentView, OpenProjectResult,
     ProjectApplication, SaveAsProjectRequest, SaveProjectRequest, SaveReceipt,
+};
+pub use batch_expansion::{
+    bind_batch_case_output_storage, expand_independent_batch, materialize_independent_batch_case,
+    BatchAxis, BatchAxisJoin, BatchAxisTarget, BatchAxisValues, BatchAxisValueKind, BatchCase,
+    BatchExecutionStrategy, BatchExpansionError, BatchExpansionManifest, BatchExpansionRequest,
+    BatchFailurePolicy,
+    BatchRangeEndpoint, MaterializedBatchCase, validate_independent_batch_cases,
+    BATCH_EXPANSION_MANIFEST_SCHEMA, BATCH_EXPANSION_MAX_CASES,
 };
 pub use coordinator::{
     CoordinatorCheckpoint, CoordinatorDisposition, CoordinatorError, CoordinatorMessage,
@@ -62,6 +73,7 @@ pub use file_repository::{FileProjectRepository, FileRepositoryError};
 pub use closed_loop_preparation::{AcceptedPreparationProof, AcceptedPreparationReceipt, ClosedLoopPreparationPlan, ClosedLoopPreparationReceipt, CLOSED_LOOP_PREPARATION_SCHEMA, CLOSED_LOOP_PREPARATION_BINDING_SCHEMA};
 pub use script_pipeline_acceptance::{compile_accepted_closed_loop_pipeline, validate_accepted_script_pipeline_source, validate_script_source_assets, AcceptedScriptPipeline, SCRIPT_PIPELINE_SOURCE_ASSET_ID, SCRIPT_PIPELINE_SOURCE_SCHEMA};
 pub use preparation::{
+    materialize_antenna_external_lead_inspection_preparation_from_problem,
     materialize_fdm_preparation_from_problem, materialize_fem_preparation_from_problem,
     AcceptedRunPreparationSource, PreparationBinding, PreparationMaterializationError,
     PreparationReceipt, PreparationReceiptError, ACCEPTED_RUN_PREPARATION_SOURCE_SCHEMA,
@@ -82,6 +94,8 @@ pub use run_spec::{
     RunDependency, RunId, RunIntent, RunIntentLedger, RunSpecError, RunSpecification, StudyId,
     StudyReference, SubmitDisposition, SubmitReceipt, RUN_INTENT_SCHEMA, RUN_SPEC_SCHEMA,
 };
+pub use run_intent_materialization::{materialize_run_intent, RunIntentAuthoring};
+pub use script_antenna_inspection_planning::plan_script_antenna_inspection;
 pub use script_pipeline_compilation::{
     materialize_script_pipeline_with_output_policy_bounded, CompiledScriptExecution,
     ScriptPipelineCompilation, ScriptPipelineNodeBinding, ScriptPipelineNodeKind,
@@ -89,8 +103,9 @@ pub use script_pipeline_compilation::{
 pub use study_artifact::{
     decode_magnetization_field_semantics, decode_study_artifact, decode_study_artifact_bytes,
     encode_study_scalar_artifact, study_artifact_content_sha256, study_state_layout_sha256,
-    DecodedStudyArtifact, MagnetizationStateArtifact, StudyScalarArtifact,
-    MAGNETIZATION_STATE_IDENTITY_SCHEMA, STUDY_MAGNETIZATION_CODEC_ID,
+    AntennaInspectionArtifact, DecodedStudyArtifact, MagnetizationStateArtifact,
+    StudyScalarArtifact, MAGNETIZATION_STATE_IDENTITY_SCHEMA, STUDY_ANTENNA_INSPECTION_CODEC_ID,
+    STUDY_ANTENNA_INSPECTION_CODEC_VERSION, STUDY_MAGNETIZATION_CODEC_ID,
     STUDY_MAGNETIZATION_CODEC_VERSION, STUDY_SCALAR_ARTIFACT_SCHEMA, STUDY_SCALAR_CODEC_ID,
     STUDY_SCALAR_CODEC_VERSION,
 };

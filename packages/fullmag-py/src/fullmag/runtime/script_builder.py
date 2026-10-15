@@ -75,9 +75,11 @@ from fullmag.model.geometry import (
     Union,
 )
 from fullmag.model.output_storage import OutputStorage
-from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer
+from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer, _parallel_execution_lane
+from fullmag.model.compute_resources import ComputeResources
 from fullmag.model.outputs import (
     SaveDispersion,
+    SaveEigenDiagnostics,
     SaveField,
     SaveMode,
     SaveResponse,
@@ -85,8 +87,9 @@ from fullmag.model.outputs import (
     SaveSpectrum,
     Snapshot,
 )
-from fullmag.model.problem import Problem
+from fullmag.model.problem import FdmPbc, ParallelExecutionPolicy, Problem
 from fullmag.model.study import (
+    AntennaFieldSolve,
     DEFAULT_RELAXATION_MAX_STEPS,
     DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM,
     DEFAULT_TABLE_AUTOSAVE_QUANTITIES,
@@ -252,6 +255,13 @@ def export_builder_draft(loaded: LoadedProblem) -> dict[str, object]:
     exact_max_err = (
         adaptive_policy is not None and _is_exact_max_err_policy(adaptive_policy)
     )
+    pbc = base_problem.pbc
+    if isinstance(pbc, FdmPbc):
+        pbc_ir = pbc.to_ir()
+    elif pbc is None:
+        pbc_ir = None
+    else:
+        pbc_ir = FdmPbc(tuple(bool(value) for value in pbc)).to_ir()
 
     draft = {
         "revision": 1,
@@ -262,6 +272,8 @@ def export_builder_draft(loaded: LoadedProblem) -> dict[str, object]:
         "requested_precision": base_problem.runtime.execution_precision.value,
         "requested_mode": base_problem.runtime.execution_mode.value,
         "cpu_threads": base_problem.runtime.cpu_threads,
+        "parallel_execution": base_problem.runtime.parallel_execution.to_ir(),
+        "pbc": pbc_ir,
         "fem_demag_solver_policy": _export_fem_demag_solver_policy(base_problem),
         "exchange_enabled": _problem_has_exchange(base_problem),
         "demag_enabled": _problem_has_demag(base_problem),
@@ -405,6 +417,12 @@ def export_builder_draft(loaded: LoadedProblem) -> dict[str, object]:
         draft["execution_profile"] = profile.to_ir()
         if layers:
             draft["execution_layers"] = [layer.to_ir() for layer in layers]
+    resources = _compute_resources_values(
+        _normalize_mapping(base_problem.runtime_metadata),
+        context="runtime_metadata",
+    )
+    if resources is not None:
+        draft["compute_resources"] = resources.to_ir()
     return draft
 
 
@@ -646,7 +664,13 @@ def render_loaded_problem_as_script(
         lines.append("")
         lines.extend(excitation_lines)
 
-    stage_lines = _render_stages(stages, overrides=overrides, surface=surface)
+    stage_lines = _render_stages(
+        stages,
+        overrides=overrides,
+        surface=surface,
+        magnet_vars=magnet_vars,
+        initial_outputs=_study_outputs(base_problem.study),
+    )
     if stage_lines:
         lines.append("")
         lines.extend(stage_lines)
@@ -1013,6 +1037,7 @@ def _render_scene_document_bootstrap(
 ) -> str:
     """Build a minimal capture script that realizes the scene's typed objects."""
     profile, layers = _execution_profile_values(builder, context="builder")
+    resources = _compute_resources_values(builder, context="builder")
     backend = str(builder.get("backend") or builder.get("requested_backend") or "auto")
     mode = str(builder.get("requested_mode") or "strict")
     device = str(builder.get("requested_device") or "auto")
@@ -1042,6 +1067,11 @@ def _render_scene_document_bootstrap(
         cpu_threads = _positive_int(builder.get("cpu_threads"))
         if cpu_threads is not None:
             lines.append(f"study.threads({cpu_threads})")
+    parallel_policy = builder.get("parallel_execution")
+    if isinstance(parallel_policy, Mapping):
+        lines.append(f"study.parallel_execution({_python_keyword_args(dict(parallel_policy))})")
+    if resources is not None:
+        lines.append(_render_compute_resources_call(resources))
     lines.extend(_render_output_storage(builder.get("output_storage"), surface="study"))
 
     solver = builder.get("solver")
@@ -1148,6 +1178,17 @@ def _render_scene_document_bootstrap(
             anis_u = material.get("anisU") or material.get("anis_u")
             if isinstance(anis_u, (list, tuple)) and len(anis_u) == 3:
                 lines.append(f"{handle}.anisU = {_python_literal(tuple(anis_u))}")
+        # Match the final renderer before stage capture validates the Problem.
+        # Explicit object anisotropy is already authored physics, not a fallback.
+        normalized_stack = _ensure_geometry_physics_stack(
+            physics_stack,
+            material_dind=material.get("Dind") if isinstance(material, Mapping) else None,
+            material_dbulk=material.get("Dbulk") if isinstance(material, Mapping) else None,
+        )
+        uniaxial = _physics_stack_uniaxial_params(normalized_stack)
+        if uniaxial is not None:
+            lines.append(f"{handle}.Ku1 = {_python_literal(uniaxial['ku1'])}")
+            lines.append(f"{handle}.anisU = {_python_literal(tuple(uniaxial['axis']))}")
         magnetization = raw_object.get("magnetization")
         if isinstance(magnetization, Mapping):
             texture_expression = _render_texture_expression(magnetization)
@@ -1605,6 +1646,12 @@ def _render_scene_stage_bootstrap(
                 "gamma",
                 "g",
                 "eigen_count",
+                "eigen_solver_rtol",
+                "eigen_solver_residual_tolerance",
+                "eigen_solver_max_outer_iterations",
+                "max_outer_iterations",
+                "eigen_solver_max_linear_iterations",
+                "max_linear_iterations",
                 "eigen_target",
                 "eigen_target_frequency",
                 "eigen_frequency_min",
@@ -1623,9 +1670,13 @@ def _render_scene_stage_bootstrap(
                 "eigen_bias_field_sweep",
             },
         )
+        raw_count = stage.get("eigen_count")
+        count = 10 if raw_count in (None, "") else _positive_int(raw_count)
+        if count is None:
+            raise ValueError(f"SceneDocument eigenmodes stage {index} has invalid eigen_count.")
         kwargs: dict[str, object] = {}
         values: tuple[tuple[str, object], ...] = (
-            ("count", _positive_int(stage.get("eigen_count")) or 10),
+            ("count", count),
             ("target", _text_value(stage.get("eigen_target")) or "lowest"),
             ("operator", _text_value(stage.get("eigen_operator")) or "linearized_llg"),
             ("include_demag", stage.get("eigen_include_demag", True)),
@@ -1643,12 +1694,52 @@ def _render_scene_stage_bootstrap(
         )
         for target, source in optional_numbers:
             value = _finite_number(stage.get(source))
-            if value is not None:
+            if stage.get(source) not in (None, ""):
+                if value is None:
+                    raise ValueError(f"SceneDocument eigenmodes stage {index} has invalid {source}.")
                 kwargs[target] = value
         equilibrium_artifact = _text_value(stage.get("eigen_equilibrium_artifact"))
         if equilibrium_artifact:
             kwargs["equilibrium_artifact"] = equilibrium_artifact
-        k_vector = _scene_float_sequence(stage.get("eigen_k_vector"), count=3)
+        solver_fields = (
+            ("solver_rtol", "eigen_solver_rtol", ("eigen_solver_residual_tolerance",)),
+            (
+                "solver_max_outer_iterations",
+                "eigen_solver_max_outer_iterations",
+                ("max_outer_iterations",),
+            ),
+            (
+                "solver_max_linear_iterations",
+                "eigen_solver_max_linear_iterations",
+                ("max_linear_iterations",),
+            ),
+        )
+        for field, key, aliases in solver_fields:
+            raw_value = stage.get(key)
+            if raw_value in (None, ""):
+                for alias in aliases:
+                    raw_value = stage.get(alias)
+                    if raw_value not in (None, ""):
+                        break
+            if raw_value in (None, ""):
+                continue
+            value = (
+                _finite_number(raw_value)
+                if field == "solver_rtol"
+                else _positive_int(raw_value)
+            )
+            if value is None:
+                raise ValueError(
+                    f"SceneDocument eigenmodes stage {index} has invalid {key}."
+                )
+            kwargs[field] = value
+
+        raw_vector = stage.get("eigen_k_vector")
+        if isinstance(raw_vector, str):
+            raw_vector = [item.strip() for item in raw_vector.split(",")] if raw_vector.strip() else None
+        k_vector = _scene_float_sequence(raw_vector, count=3)
+        if raw_vector not in (None, "") and k_vector is None:
+            raise ValueError(f"SceneDocument eigenmodes stage {index} has invalid eigen_k_vector.")
         if k_vector is not None:
             kwargs["k_vector"] = k_vector
         if stage.get("eigen_bias_field_sweep") not in (None, "", {}, []):
@@ -1656,6 +1747,8 @@ def _render_scene_stage_bootstrap(
                 "SceneDocument eigenmodes bias_field_sweep requires the typed canonical renderer"
             )
         raw_k_path = stage.get("eigen_k_path")
+        if raw_k_path not in (None, "") and k_vector is not None:
+            raise ValueError(f"SceneDocument eigenmodes stage {index} cannot set both eigen_k_path and eigen_k_vector.")
         rendered_k_path = (
             _render_stage_k_path_expr(raw_k_path)
             if raw_k_path not in (None, "")
@@ -1668,7 +1761,10 @@ def _render_scene_stage_bootstrap(
         ]
         if rendered_k_path is not None:
             call_parts.append(f"k_sampling={rendered_k_path}")
-        bc = stage.get("eigen_spin_wave_bc_config") or stage.get("eigen_spin_wave_bc")
+        raw_bc = stage.get("eigen_spin_wave_bc_config")
+        bc = dict(raw_bc) if isinstance(raw_bc, Mapping) else stage.get("eigen_spin_wave_bc")
+        if isinstance(bc, dict) and isinstance(stage.get("eigen_spin_wave_bc"), str):
+            bc["kind"] = stage["eigen_spin_wave_bc"]
         if isinstance(bc, (str, Mapping)) and bc:
             call_parts.append(f"bc={_render_spin_wave_bc_expr(bc)}")
         spec = f"fm.eigenmodes_stage({', '.join(call_parts)})"
@@ -2273,6 +2369,15 @@ def _render_shape_expression(entry: Mapping[str, object]) -> str:
             params,
             name=str(entry.get("name") or params.get("name") or "antenna"),
         )
+    elif kind in {"importedgeometry", "imported_geometry"}:
+        path = params.get("source")
+        if not isinstance(path, str) or not path:
+            raise ValueError("ImportedGeometry requires an explicit path")
+        kwargs = [f"source={_python_literal(path)}"]
+        for key in ("scale", "volume", "name"):
+            if params.get(key) is not None:
+                kwargs.append(f"{key}={_python_literal(params[key])}")
+        expression = f"fm.ImportedGeometry({', '.join(kwargs)})"
     elif kind in {"difference", "union", "intersection"}:
         operands = ("base", "tool") if kind == "difference" else ("a", "b")
         operator = {"difference": "-", "union": "+", "intersection": "&"}[kind]
@@ -2458,6 +2563,19 @@ def _execution_profile_values(
     return profile, [ExecutionRequestLayer.from_ir(layer) for layer in raw_layers]
 
 
+def _compute_resources_values(
+    source: Mapping[str, object],
+    *,
+    context: str,
+) -> ComputeResources | None:
+    if "compute_resources" not in source:
+        return None
+    value = source["compute_resources"]
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{context}.compute_resources must be an object")
+    return ComputeResources.from_ir(value)
+
+
 def _render_execution_profile_call(
     profile: ExecutionProfile,
     layers: Sequence[ExecutionRequestLayer],
@@ -2470,6 +2588,11 @@ def _render_execution_profile_call(
         for layer in layers
     )
     return f"study.execution_profile({profile_expr}, layers=[{layer_exprs}])"
+
+
+def _render_compute_resources_call(resources: ComputeResources) -> str:
+    resources_expr = f"fm.ComputeResources.from_ir({_python_literal(resources.to_ir())})"
+    return f"study.resources({resources_expr})"
 
 
 def _is_vector3(value: object) -> bool:
@@ -2821,6 +2944,7 @@ def _export_stage_draft(stage: LoadedStage) -> dict[str, object]:
         return payload
     dynamics = study.dynamics
     if isinstance(study, Eigenmodes):
+        solver_policy = study.solver_policy
         return {
             "kind": "eigenmodes",
             "entrypoint_kind": stage.entrypoint_kind,
@@ -2847,6 +2971,21 @@ def _export_stage_draft(stage: LoadedStage) -> dict[str, object]:
             "eigen_spin_wave_bc": _spin_wave_bc_kind(study.spin_wave_bc),
             "eigen_spin_wave_bc_config": _spin_wave_bc_config(study.spin_wave_bc),
             "eigen_magnetostatic_bc": study.magnetostatic_bc,
+            "eigen_solver_rtol": _text_number(
+                solver_policy.residual_tolerance if solver_policy is not None else None
+            ),
+            "eigen_solver_max_outer_iterations": (
+                str(solver_policy.max_outer_iterations)
+                if solver_policy is not None
+                and solver_policy.max_outer_iterations is not None
+                else ""
+            ),
+            "eigen_solver_max_linear_iterations": (
+                str(solver_policy.max_linear_iterations)
+                if solver_policy is not None
+                and solver_policy.max_linear_iterations is not None
+                else ""
+            ),
         }
     if isinstance(study, FrequencyResponse):
         return {
@@ -3180,11 +3319,36 @@ def _render_runtime(
             lines.append(f"{_surface_call(surface, 'device')}({_py_repr(device_spec)})")
         if cpu_threads is not None:
             lines.append(f"{_surface_call(surface, 'threads')}({cpu_threads})")
+    # Presence is significant: null explicitly restores the canonical default.
+    # Validate before rendering so an invalid edit cannot replace the source.
+    parallel_policy = ParallelExecutionPolicy.from_ir(
+        runtime_override["parallel_execution"]
+        if runtime_override and "parallel_execution" in runtime_override
+        else runtime.parallel_execution
+    )
+    parallel_policy.validate_for_runtime(*_parallel_execution_lane(runtime_metadata, runtime.backend_target, runtime.device_target))
+    lines.append(
+        f"{_surface_call(surface, 'parallel_execution')}({_python_keyword_args(parallel_policy.to_ir())})"
+    )
+
+    resources = _compute_resources_values(runtime_metadata, context="runtime_metadata")
+    if resources is not None:
+        if surface != "study":
+            raise ValueError("compute_resources requires the canonical study API surface")
+        lines.extend(
+            ["# Compute resources", _render_compute_resources_call(resources)]
+        )
 
     # PBC is part of the canonical physical problem, not an implicit backend
     # mesh option. Keep the authored axes and demag realization explicit in the
     # exported script so UI/Python round-trips cannot silently drop it.
     pbc = problem.pbc
+    if "pbc" in overrides:
+        # SceneDocument uses field presence to distinguish an explicit reset
+        # from an absent override that should retain the loaded Problem value.
+        from fullmag.runtime.scene_document import _scene_pbc_from_ir
+
+        pbc = _scene_pbc_from_ir(overrides["pbc"])
     if pbc is not None:
         raw_axes = getattr(pbc, "axes", pbc)
         axes = tuple(bool(value) for value in raw_axes)
@@ -7325,7 +7489,17 @@ def _render_outputs(problem: Problem, magnet_vars: dict[str, str], *, surface: s
 def _render_output_specs(outputs: Sequence[object], magnet_vars: dict[str, str], *, surface: str) -> list[str]:
     if not outputs:
         return []
-    lines = ["# Outputs"]
+    statements = _render_output_statements(outputs, magnet_vars, surface=surface)
+    return ["# Outputs", *statements] if statements else []
+
+
+def _render_output_statements(
+    outputs: Sequence[object],
+    magnet_vars: dict[str, str],
+    *,
+    surface: str,
+) -> list[str]:
+    lines: list[str] = []
     for output in outputs:
         if isinstance(output, SaveField):
             lines.append(
@@ -7349,14 +7523,58 @@ def _render_output_specs(outputs: Sequence[object], magnet_vars: dict[str, str],
                 )
             continue
         if isinstance(output, SaveSpectrum):
-            lines.append(f"{_surface_call(surface, 'save')}(\"spectrum\")")
+            kwargs: list[str] = []
+            if output.quantity != "eigenfrequency":
+                kwargs.append(f"spectrum_quantity={_py_repr(output.quantity)}")
+            if output.scope != "per_sample":
+                kwargs.append(f"spectrum_scope={_py_repr(output.scope)}")
+            suffix = f", {', '.join(kwargs)}" if kwargs else ""
+            lines.append(f"{_surface_call(surface, 'save')}(\"spectrum\"{suffix})")
             continue
         if isinstance(output, SaveMode):
-            indices_repr = repr(list(output.indices))
-            lines.append(f"{_surface_call(surface, 'save')}(\"mode\", indices={indices_repr})")
+            kwargs: list[str] = []
+            if output.all_modes:
+                kwargs.append("all_modes=True")
+            if output.field != "mode":
+                kwargs.append(f"field={_py_repr(output.field)}")
+            if output.indices:
+                kwargs.append(f"indices={_py_literal(list(output.indices))}")
+            if output.branches:
+                kwargs.append(f"branches={_py_literal(list(output.branches))}")
+            if output.sample_indices:
+                kwargs.append(
+                    f"sample_indices={_py_literal(list(output.sample_indices))}"
+                )
+            if output.sample_labels:
+                kwargs.append(
+                    f"sample_labels={_py_literal(list(output.sample_labels))}"
+                )
+            lines.append(
+                f"{_surface_call(surface, 'save')}(\"mode\", {', '.join(kwargs)})"
+            )
             continue
         if isinstance(output, SaveDispersion):
-            lines.append(f"{_surface_call(surface, 'save')}(\"dispersion\")")
+            kwargs = []
+            if output.name != "dispersion":
+                kwargs.append(f"name={_py_repr(output.name)}")
+            if not output.include_branch_table:
+                kwargs.append("include_branch_table=False")
+            suffix = f", {', '.join(kwargs)}" if kwargs else ""
+            lines.append(f"{_surface_call(surface, 'save')}(\"dispersion\"{suffix})")
+            continue
+        if isinstance(output, SaveEigenDiagnostics):
+            kwargs = []
+            for name, value, default in (
+                ("include_tracking", output.include_tracking, True),
+                ("include_residuals", output.include_residuals, True),
+                ("include_overlaps", output.include_overlaps, True),
+                ("include_tangent_leakage", output.include_tangent_leakage, True),
+                ("include_orthogonality", output.include_orthogonality, True),
+            ):
+                if value != default:
+                    kwargs.append(f"{name}={_py_literal(value)}")
+            suffix = f", {', '.join(kwargs)}" if kwargs else ""
+            lines.append(f"{_surface_call(surface, 'save')}(\"diagnostics\"{suffix})")
             continue
         if isinstance(output, SaveResponse):
             lines.append(
@@ -7365,6 +7583,104 @@ def _render_output_specs(outputs: Sequence[object], magnet_vars: dict[str, str],
             continue
         raise ValueError(f"unsupported output type: {type(output).__name__}")
     return lines
+
+
+def _output_family(output: object) -> str | None:
+    if isinstance(output, (SaveSpectrum, SaveMode, SaveDispersion, SaveEigenDiagnostics)):
+        return "eigen"
+    if isinstance(output, SaveResponse):
+        return "response"
+    if isinstance(output, (SaveField, SaveScalar, Snapshot)):
+        return "time"
+    return None
+
+
+def _stage_output_families(study: object) -> frozenset[str]:
+    if isinstance(study, Eigenmodes):
+        return frozenset(("eigen",))
+    if isinstance(study, FrequencyResponse):
+        return frozenset(("eigen", "response"))
+    if isinstance(study, (Hysteresis, Relaxation, TimeEvolution)):
+        return frozenset(("time",))
+    return frozenset()
+
+
+def _sync_stage_output_snapshot(
+    active_outputs: Sequence[object],
+    stage: LoadedStage,
+    magnet_vars: dict[str, str],
+    *,
+    surface: str,
+) -> tuple[list[str], list[object]]:
+    """Reconcile only the output families captured by this immutable stage."""
+    study = stage.problem.study
+    if study is None or surface != "study":
+        return [], list(active_outputs)
+
+    families = _stage_output_families(study)
+    if not families:
+        return [], list(active_outputs)
+
+    desired = list(_study_outputs(study))
+    active = list(active_outputs)
+    current = [output for output in active if _output_family(output) in families]
+    is_prefix = len(current) <= len(desired) and current == desired[: len(current)]
+    if is_prefix:
+        missing = desired[len(current) :]
+        statements = _render_output_statements(
+            missing,
+            magnet_vars,
+            surface=surface,
+        )
+        return statements, [*active, *missing]
+
+    # A stage snapshot can reflect a clear or replacement that happened after
+    # an earlier stage. Rebuild the output state at this boundary, retaining
+    # other families already known to be active while replacing this stage's
+    # own family with its exact captured selectors.
+    retained = [output for output in active if _output_family(output) not in families]
+    restored = [*retained, *desired]
+    statements = [f"{_surface_call(surface, 'clear_outputs')}()"]
+    statements.extend(
+        _render_output_statements(restored, magnet_vars, surface=surface)
+    )
+    return statements, restored
+
+
+def _periodic_output_name(output: object) -> str | None:
+    if isinstance(output, SaveField):
+        return output.field
+    if isinstance(output, SaveScalar):
+        return output.scalar
+    return None
+
+
+def _apply_autosave_output_action(
+    active_outputs: Sequence[object],
+    *,
+    enabled: bool,
+    quantity: str | None,
+    output_name: str | None = None,
+    output_kind: object = None,
+    every: SamplingPeriod | None = None,
+) -> list[object]:
+    active = list(active_outputs)
+    if not enabled:
+        if quantity is None:
+            return []
+        return [output for output in active if _periodic_output_name(output) != quantity]
+
+    if output_name is None or every is None:
+        raise ValueError("enabled autosave output requires a name and sampling cadence")
+    if output_kind in {"field", "field_auto", "field_resolved_auto"}:
+        replacement: object = SaveField(field=output_name, every=every)
+    elif output_kind in {"scalar", "scalar_auto", "scalar_resolved_auto"}:
+        replacement = SaveScalar(scalar=output_name, every=every)
+    else:
+        raise ValueError(f"unsupported autosave output kind: {output_kind!r}")
+    return [
+        output for output in active if _periodic_output_name(output) != output_name
+    ] + [replacement]
 
 
 def _render_table_autosave(
@@ -7468,15 +7784,26 @@ def _render_stages(
     *,
     overrides: dict[str, object],
     surface: str,
+    magnet_vars: dict[str, str],
+    initial_outputs: Sequence[object],
 ) -> list[str]:
     if not stages:
         return []
     solver_override = _normalize_mapping(overrides.get("solver"))
     stage_overrides = overrides.get("stages")
     is_study_surface = surface == "study"
+    active_outputs = list(initial_outputs)
     lines = ["# Stages" if is_study_surface else "# Run"]
     previous_dynamics_signature: dict[str, object] | None = None
     for index, stage in enumerate(stages):
+        if is_study_surface and stage.problem.study is not None:
+            output_lines, active_outputs = _sync_stage_output_snapshot(
+                active_outputs,
+                stage,
+                magnet_vars,
+                surface=surface,
+            )
+            lines.extend(output_lines)
         if stage.action is not None:
             action_kind = str(stage.action.get("kind") if isinstance(stage.action, dict) else "").strip().lower()
             if action_kind == "antenna_field_solve":
@@ -7653,10 +7980,14 @@ def _render_stages(
                     raise ValueError("autosave action requires the study API surface")
                 call_parts = []
                 enabled = bool(stage.action.get("enabled", True))
-                quantity = _text_value(stage.action.get("quantity"))
+                quantity = _text_value(stage.action.get("quantity")) or None
+                output_name = None
+                output_kind = None
+                every = None
                 if enabled:
                     output = _normalize_mapping(stage.action.get("output"))
                     output_name = _text_value(output.get("name")) or quantity
+                    output_kind = output.get("kind")
                     every = _requested_sampling_period_from_ir(output, "every_seconds")
                     if not output_name or every is None:
                         raise ValueError("enabled autosave action requires output name and cadence")
@@ -7673,6 +8004,14 @@ def _render_stages(
                 if stage.stage_id is not None:
                     call_parts.append(f"stage_id={_py_repr(stage.stage_id)}")
                 lines.append(f"study.stages.autosave({', '.join(call_parts)})")
+                active_outputs = _apply_autosave_output_action(
+                    active_outputs,
+                    enabled=enabled,
+                    quantity=quantity,
+                    output_name=output_name,
+                    output_kind=output_kind,
+                    every=every,
+                )
                 continue
             if action_kind == "fft_response":
                 if not is_study_surface:
@@ -7734,7 +8073,7 @@ def _render_stages(
                 f"study.stages.add_hysteresis_sweep({', '.join(_render_hysteresis_stage_args(study))})"
             )
             continue
-        if isinstance(study, FieldOnly):
+        if isinstance(study, (FieldOnly, AntennaFieldSolve)):
             continue
         stage_dynamics = stage.problem.study.dynamics
         dynamics_signature = (
@@ -7765,7 +8104,13 @@ def _render_stages(
         previous_dynamics_signature = dynamics_signature
 
         if isinstance(study, Eigenmodes):
-            count = _override_int(stage_override, "eigen_count", study.count) or study.count
+            raw_count = stage_override.get("eigen_count")
+            if raw_count in (None, ""):
+                count = study.count
+            else:
+                count = _positive_int(raw_count)
+                if count is None:
+                    raise ValueError("canonical rewrite received an invalid eigen_count")
             target = _override_string(stage_override, "eigen_target", study.target) or study.target
             operator = _override_string(stage_override, "eigen_operator", study.operator) or study.operator
             include_demag_ov = stage_override.get("eigen_include_demag")
@@ -7777,6 +8122,8 @@ def _render_stages(
                 f"count={count}",
                 f"target={_py_repr(target)}",
             ]
+            if stage.stage_id is not None:
+                call_parts.insert(0, f"stage_id={_py_repr(stage.stage_id)}")
             target_frequency = _override_number(stage_override, "eigen_target_frequency", study.target_frequency)
             if target_frequency is not None:
                 call_parts.append(f"target_frequency={_py_number(target_frequency)}")
@@ -7817,19 +8164,58 @@ def _render_stages(
             ) or study.magnetostatic_bc
             if magnetostatic_bc != "open":
                 call_parts.append(f"magnetostatic_bc={_py_repr(magnetostatic_bc)}")
-            k_vector_raw = _override_string(stage_override, "eigen_k_vector", None)
-            k_path_expr = _render_stage_k_path_expr(
-                _override_string(stage_override, "eigen_k_path", None)
+            solver_policy = study.solver_policy
+            solver_rtol = _override_number(
+                stage_override,
+                "eigen_solver_rtol",
+                solver_policy.residual_tolerance if solver_policy is not None else None,
             )
+            if solver_rtol is not None:
+                call_parts.append(f"solver_rtol={_py_number(solver_rtol)}")
+            solver_max_outer_iterations = _override_int(
+                stage_override,
+                "eigen_solver_max_outer_iterations",
+                solver_policy.max_outer_iterations if solver_policy is not None else None,
+            )
+            if solver_max_outer_iterations is not None:
+                call_parts.append(
+                    f"solver_max_outer_iterations={solver_max_outer_iterations}"
+                )
+            solver_max_linear_iterations = _override_int(
+                stage_override,
+                "eigen_solver_max_linear_iterations",
+                solver_policy.max_linear_iterations if solver_policy is not None else None,
+            )
+            if solver_max_linear_iterations is not None:
+                call_parts.append(
+                    f"solver_max_linear_iterations={solver_max_linear_iterations}"
+                )
+            k_path_raw = _override_string(stage_override, "eigen_k_path", None)
+            k_path_expr = _render_stage_k_path_expr(
+                k_path_raw
+            )
+            if k_path_raw is not None and k_path_raw.strip() and k_path_expr is None:
+                raise ValueError("canonical rewrite received an invalid eigen_k_path")
+            k_vector_raw = _override_string(stage_override, "eigen_k_vector", None)
+            if k_path_expr is not None and k_vector_raw is not None and k_vector_raw.strip():
+                raise ValueError(
+                    "canonical rewrite cannot set both eigen_k_path and eigen_k_vector"
+                )
             if k_path_expr is not None:
                 call_parts.append(f"k_sampling={k_path_expr}")
             elif k_vector_raw is not None and k_vector_raw.strip():
+                components = [component.strip() for component in k_vector_raw.split(",")]
+                if len(components) != 3:
+                    raise ValueError("canonical rewrite received an invalid eigen_k_vector")
                 try:
-                    parsed = tuple(float(component.strip()) for component in k_vector_raw.split(","))
-                    if len(parsed) == 3:
-                        call_parts.append(f"k_vector={parsed!r}")
-                except ValueError:
-                    pass
+                    parsed = tuple(float(component) for component in components)
+                except ValueError as exc:
+                    raise ValueError(
+                        "canonical rewrite received an invalid eigen_k_vector"
+                    ) from exc
+                if not all(math.isfinite(component) for component in parsed):
+                    raise ValueError("canonical rewrite received an invalid eigen_k_vector")
+                call_parts.append(f"k_vector={parsed!r}")
             elif study.k_vector is not None:
                 call_parts.append(f"k_vector={study.k_vector!r}")
             elif study.k_sampling is not None:
@@ -9952,13 +10338,13 @@ def _normalize_bounds_pair(
 
 
 def _study_outputs(
-    study: FieldOnly | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse,
+    study: FieldOnly | AntennaFieldSolve | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | Hysteresis | None,
 ) -> Sequence[object]:
-    return tuple(study.outputs)
+    return tuple(study.outputs) if study is not None else ()
 
 
 def _study_table_autosave(
-    study: FieldOnly | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse,
+    study: FieldOnly | AntennaFieldSolve | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | Hysteresis | None,
 ) -> TableAutosave | None:
     table_autosave = getattr(study, "_table_autosave", None)
     return table_autosave if isinstance(table_autosave, TableAutosave) else None
@@ -10079,6 +10465,8 @@ def _script_api_surface(
     surface = runtime_metadata.get("script_api_surface")
     overrides = overrides or {}
     if "execution_profile" in runtime_metadata:
+        return "study"
+    if "compute_resources" in runtime_metadata:
         return "study"
     if runtime_metadata.get("output_storage") is not None or overrides.get("output_storage") is not None:
         return "study"

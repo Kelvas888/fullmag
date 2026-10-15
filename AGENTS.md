@@ -73,18 +73,19 @@ FEM/MFEM ani dowolny ręczny `cargo`, `cmake` lub Docker.
 
 | Polecenie | Działanie |
 |---|---|
-| `just windows-ui dev` | Uruchamia pusty workspace na porcie 3197, frontend Next.js z HMR i odbiornik jawnych żądań buildu backendu. Brakujący lub nieaktualny pakiet buduje przed startem. |
+| `just windows-ui dev` | Uruchamia pusty workspace na porcie 3197, frontend Next.js z HMR. Brakujący lub nieaktualny pakiet buduje przed startem. |
 | `just windows-ui dev 3197 auto dev` | Jawnie wybiera ten sam tryb: automatyczny wybór buildu i backendowy profil dev. |
 | `just windows-workspace-build dev dev 3197 auto` | Buduje brakujący lub nieaktualny pakiet dev bez uruchamiania UI. |
 | `just windows-runtime-recover 3197` | Odzyskuje niepotwierdzony owner record dopiero po sprawdzeniu braku procesów i zamkniętego portu; zachowuje oryginalny zapis. Nie zatrzymuje procesów ani nie odtwarza modelu. |
-| `just windows-backend-dev 3197` | Jednorazowo buduje backend dev na żądanie, bez restartu workspace. Nie uruchamia drugiego watchera. |
+| `just windows-backend-dev 3197` | Jednorazowo buduje backend dev na żądanie, bez restartu workspace. |
 | `just windows-ui static` | Uruchamia workspace z produkcyjnie zbudowanym frontendem i backendem release; brakujący lub nieaktualny pakiet buduje przed startem. |
 
 - Frontend reaguje na zapis plików przez HMR. Backend buduje się wyłącznie
-  na jawne żądanie (przycisk **Build backend** lub zarządzane polecenie),
+  na jawne zarządzane polecenie CLI lub podczas przygotowania pakietu przed startem,
   z utrwalonej kopii źródeł. Późniejsze edycje checkoutu nie odrzucają wyniku
   ani nie uruchamiają następnego buildu. Decyzja użytkownika z 05.10.2026
-  zastępuje wcześniejsze automatyczne odliczanie 120 sekund.
+  zastępuje wcześniejsze automatyczne odliczanie 120 sekund. Decyzja z 14.10.2026
+  usuwa panel Development backend, ręczne żądania buildu i restart z UI.
   Profil Cargo `backend-dev` zachowuje target/cache; nie usuwaj ich dla
   zwykłej iteracji. Zmiany zależności działającego workspace nadal wymagają
   bezpiecznego zamknięcia, zgodnie z kontrolą `assert_frozen_dependencies`.
@@ -92,12 +93,11 @@ FEM/MFEM ani dowolny ręczny `cargo`, `cmake` lub Docker.
   `true` wymusza build, a `false` dopuszcza wyłącznie istniejący, zgodny pakiet.
   Przyrostowy build nie oznacza ponownej kompilacji wszystkich zależności.
 - Działające procesy korzystają ze zweryfikowanej kopii EXE, odrębnej od
-  mutowalnego katalogu Cargo. Watcher kompiluje w tle, lecz **nie restartuje
-  backendu ani symulacji**. Nie zabijaj procesu tylko dlatego, że build się zakończył.
-- Kontrolowany restart z UI z zachowaniem modelu i szkiców jest realizowany
+  mutowalnego katalogu Cargo. Build CLI **nie restartuje backendu ani symulacji**. Nie zabijaj procesu tylko dlatego, że build się zakończył.
+- Panel i restart developerskiego backendu z UI zostały usunięte z zakresu produktu.
+  Przed zamknięciem workspace użytkownik zapisuje projekt; kolejny start nie obiecuje
+  automatycznego odtworzenia niezapisanego modelu ani szkiców. Historia prac pozostaje
   w [P8-53](docs/plans/active/refactor_runtime/final/p8/53-development-restart-workspace.md).
-  Dopóki jego bramki nie są potwierdzone, nie przedstawiaj go jako gotowego
-  ani nie obiecuj automatycznego odtworzenia niezapisanego workspace.
 - Recepty nadal wymagają resolvera storage, preflight, lease i terminalnego
   receipt; natywny build korzysta z blokady ciężkich prac tego hosta.
   Zachowuj tożsamość źródeł, profilu i pakietu. Zakaz kompilowania testów
@@ -107,6 +107,13 @@ Szczegóły i dowody:
 [Windows-first development](docs/guides/windows-first-development.md),
 [P8-52 — przyrostowy backend dev](docs/plans/active/refactor_runtime/final/p8/52-native-backend-dev.md),
 [P8-54 — build na żądanie](docs/plans/active/refactor_runtime/final/p8/54-manual-native-build-snapshot.md).
+
+## Sprzątanie danych po etapie deweloperskim
+
+- Po zakończeniu etapu (także błędem lub anulowaniem) i przed kolejnym ciężkim buildem oceń dane wygenerowane przez ten etap. Użyj skilla `fullmag-build-stage-cleanup`; jeżeli nie jest dostępny, zastosuj reguły retencji z build-storage governance i zgłoś brak skilla.
+- Najpierw kwalifikuj zakończone `execution`, następnie zbędny staging i kopie źródeł, a potem zastąpione pakiety runtime. Przestarzałość oznacza wykazaną zbędność: sam wiek, rozmiar lub nowszy commit nie wystarczają. Zachowaj używany cache przyrostowy, ostatni zweryfikowany pakiet i dane referencjonowane przez wyniki, projekty, sesje lub rollback.
+- Przed wykonaniem autoryzowanego planu ponownie sprawdź stan jobów, aktywne procesy, kontenery, mounty, lease oraz dokładne cele w rozwiązanym storage. Zachowaj wyniki, logi, receipty, manifesty i provenance. Nie rozszerzaj zgody na inne katalogi ani nie używaj globalnego prune.
+- W checkpointcie etapu zapisz decyzję dla każdego kandydata, dowód zbędności, zachowywane dane, plan/receipt i pomiar wolnego miejsca. Dla pozostawionych danych podaj warunek ponownej oceny. Preview ani zapis skilla nie dowodzą wykonania lub wdrożenia automatycznego sprzątania.
 
 ## Szczegółowe reguły — ładuj według zakresu
 

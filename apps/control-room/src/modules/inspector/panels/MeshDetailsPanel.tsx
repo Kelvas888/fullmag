@@ -24,6 +24,7 @@ import {
 import { MeshEditorCapabilitiesSection } from "./mesh-details/MeshEditorCapabilitiesSection";
 import { MeshViewportDeliverySection } from "./mesh-details/MeshViewportDeliverySection";
 import { MixedTopologyProvenanceSection } from "./mesh-details/MixedTopologyProvenanceSection";
+import { SharedDomainMeshPolicySection } from "./mesh-details/SharedDomainMeshPolicySection";
 import { FdmGridInspectorPanel } from "./fdm-grid/FdmGridInspectorPanel";
 import {
   type MeshDetailsLane,
@@ -73,6 +74,7 @@ function meshDetailsInspectorSections(selectionKind: string | null): string[] {
     case "mesh.root":
       return [
         "overview",
+        "shared-policy",
         "identity",
         "pipeline",
         "mixed-topology",
@@ -86,6 +88,7 @@ function meshDetailsInspectorSections(selectionKind: string | null): string[] {
     case "mesh.shared-domain":
       return [
         "overview",
+        "shared-policy",
         "identity",
         "counts",
         "mixed-topology",
@@ -197,6 +200,7 @@ export function MeshDetailsPanel({ selection }: InspectorPanelProps) {
           title={model.title}
         />
       ) : null}
+      {showSection("shared-policy") ? <SharedDomainMeshPolicySection /> : null}
       {showSection("identity") ? (
         <SolverMeshIdentitySection
           badge={model.manifestStatus}

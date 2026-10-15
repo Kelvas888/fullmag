@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createHash, webcrypto } from "node:crypto";
 import { stripTypeScriptTypes } from "node:module";
 import vm from "node:vm";
 
@@ -8,6 +9,8 @@ import vm from "node:vm";
 const context = vm.createContext({
   AbortController,
   DOMException,
+  crypto: webcrypto,
+  TextEncoder,
   clearTimeout,
   setTimeout,
   structuredClone,
@@ -546,7 +549,7 @@ const renderAntenna = (name, args) => {
 };
 const samplePayload = (kind, unit) => ({
   path: `antenna/external_lead_solutions/output/${kind}.bin`,
-  sha256: `sha256:${"b".repeat(64)}`,
+  sha256: "b".repeat(64),
   byte_count: 24, value_count: 3, scalar_type: "float64_le", layout: kind, unit,
 });
 const inspectionDigest = `sha256:${"a".repeat(64)}`;
@@ -578,6 +581,32 @@ const inspection = {
     device_vertex_ids: samplePayload("device_vertex_ids", "1"), device_potential: samplePayload("device_potential", "V"),
   },
 };
+// Independently hash the canonical ordered wire identity using Node's hash API.
+const expectedInspectionEtag = (candidate, payloadKind) => `"${createHash("sha256").update(JSON.stringify([
+  candidate.session_id, candidate.session_epoch, candidate.request_scope_epoch,
+  candidate.run_id, candidate.stage_revision, candidate.runtime_stage_id,
+  candidate.stage_id, candidate.output_id, candidate.outputs[0].inspection_ref.content_digest,
+  payloadKind, candidate.manifest[payloadKind].sha256,
+])).digest("hex")}"`;
+let inspectionPayloadIdentityCases = 0;
+for (const payloadKind of ["bundle", "sample_positions", "magnetic_field", "device_vertex_ids", "device_potential"]) {
+  assert.equal(await antennaHooks.namespace.antennaInspectionPayloadEtag(
+    inspection, payloadKind, inspection.manifest[payloadKind].sha256,
+  ), expectedInspectionEtag(inspection, payloadKind));
+  inspectionPayloadIdentityCases += 1;
+}
+for (const digest of ["", "sha256:" + "b".repeat(64), "b".repeat(63), "b".repeat(65), "B".repeat(64), "g".repeat(64)]) {
+  await assert.rejects(antennaHooks.namespace.antennaInspectionPayloadEtag(
+    inspection, "magnetic_field", digest,
+  ), /invalid owner or digest/);
+  inspectionPayloadIdentityCases += 1;
+}
+for (const change of [{ stage_revision: 1.5 }, { stage_revision: Number.MAX_SAFE_INTEGER + 1 }, { outputs: [] }, { outputs: [inspection.outputs[0], inspection.outputs[0]] }]) {
+  await assert.rejects(antennaHooks.namespace.antennaInspectionPayloadEtag(
+    { ...inspection, ...change }, "magnetic_field", inspection.manifest.magnetic_field.sha256,
+  ), /invalid owner or digest/);
+  inspectionPayloadIdentityCases += 1;
+}
 const antennaHookCases = [
   ["useAntennaFieldSolutionResource", ["solution 1"], "DATA_ANTENNA_FIELD_SOLUTION_PATH"],
   ["useAntennaStageOutputCatalogResource", ["runtime/stage 007"], "DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH"],
@@ -593,7 +622,7 @@ const identityScope = antennaIdentity.namespace.sessionRequestScopeKey(identity)
 const loadScope = antennaIdentity.namespace.sessionRequestScopeKey({ ...identity, requestScopeEpoch: "load-context:99" });
 const signal = new AbortController().signal;
 const loadAntenna = (definition) => definition.load({ signal, sessionScopeKey: loadScope });
-antennaResponse = { status: "ready", etag: '"server-owned-etag"', data: new ArrayBuffer(24) };
+antennaResponse = { status: "ready", etag: expectedInspectionEtag(inspection, "magnetic_field"), data: new ArrayBuffer(24) };
 for (const [name, args, pathName] of antennaHookCases) {
   const definition = renderAntenna(name, args);
   assert.equal(definition.enabled, true, name);
@@ -644,9 +673,10 @@ for (const status of ["failed", "cancelled"]) {
 const payloadHook = "useAntennaExternalLeadInspectionPayloadResource";
 const payloadKinds = ["bundle", "sample_positions", "magnetic_field", "device_vertex_ids", "device_potential"];
 const range = "bytes=0-7";
-antennaResponse = { status: "ready", etag: '"server-owned-etag"', data: new ArrayBuffer(8) };
+antennaResponse = { status: "ready", etag: expectedInspectionEtag(inspection, "magnetic_field"), data: new ArrayBuffer(8) };
 const initialPayloadKey = renderAntenna(payloadHook, [inspection, "magnetic_field"]).resourceKey;
 for (const payloadKind of payloadKinds) {
+  antennaResponse = { ...antennaResponse, etag: expectedInspectionEtag(inspection, payloadKind) };
   const definition = renderAntenna(payloadHook, [inspection, payloadKind, { range }]);
   assert.equal(definition.enabled, true);
   assert.ok(definition.resourceKey.includes(`content_digest=${encodeURIComponent(inspectionDigest)}`));
@@ -663,6 +693,23 @@ for (const payloadKind of payloadKinds) {
   assert.equal(result, antennaResponse);
   assert.equal(definition.resolveRevision(result), result.etag);
   assert.notEqual(definition.resourceKey, initialPayloadKey);
+}
+for (const etag of ['"unrelated-server-etag"', null, undefined]) {
+  const definition = renderAntenna(payloadHook, [inspection, "magnetic_field"]);
+  antennaResponse = { status: "ready", etag, data: new ArrayBuffer(24) };
+  await assert.rejects(loadAntenna(definition), /revision does not match selected manifest/);
+  assert.equal(antennaCalls.length, 1);
+  inspectionPayloadIdentityCases += 1;
+}
+for (const candidate of [
+  { ...inspection, manifest: { ...inspection.manifest, magnetic_field: undefined } },
+  { ...inspection, manifest: { ...inspection.manifest, magnetic_field: { ...inspection.manifest.magnetic_field, sha256: "sha256:" + "b".repeat(64) } } },
+]) {
+  const definition = renderAntenna(payloadHook, [candidate, "magnetic_field"]);
+  assert.equal(definition.enabled, true);
+  await assert.rejects(loadAntenna(definition), /no selected payload descriptor|invalid owner or digest/);
+  assert.equal(antennaCalls.length, 0, "Invalid descriptor must fail before a binary request");
+  inspectionPayloadIdentityCases += 1;
 }
 assert.equal(inspection.manifest.magnetic_field.unit, "A/m");
 assert.equal(inspection.outputs[0].payload_units.H, "A/m");
@@ -1064,6 +1111,7 @@ console.log(JSON.stringify({
   preserved_prior_groups: 19,
   antenna_hooks: antennaHookCases.length,
   antenna_payload_kinds: payloadKinds.length,
+  antenna_inspection_payload_identity_cases: inspectionPayloadIdentityCases,
   antenna_disabled_payload_cases: disabledInspections.length + 1,
   antenna_error_cases: antennaErrorCases,
   antenna_composition_aba_cases: 2,

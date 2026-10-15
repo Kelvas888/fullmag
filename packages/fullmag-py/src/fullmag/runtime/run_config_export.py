@@ -206,6 +206,14 @@ def _runtime_stage_action(
     definition = action.get("definition")
     if not isinstance(definition, dict):
         raise ValueError("antenna_field_solve action requires a serialized field-solve definition")
+    study = stage_ir.get("study")
+    standalone = isinstance(study, dict) and study.get("kind") == "antenna_field_solve"
+    if standalone:
+        ports = definition.get("port_mode_ids")
+        if (not isinstance(definition.get("id"), str) or not definition["id"].strip()
+                or not isinstance(ports, list) or len(ports) != 1
+                or not isinstance(ports[0], str) or not ports[0].strip()):
+            raise ValueError("standalone antenna solve requires one explicit definition and port mode")
     # Captured authoring state precedes the action. Materialize only this
     # definition, without importing future stage definitions from the root IR.
     definitions = stage_ir["antenna_field_solve_stages"]
@@ -216,6 +224,8 @@ def _runtime_stage_action(
             break
     else:
         definitions.append(copy.deepcopy(definition))
+    if standalone:
+        study["selection"] = {"stage_id": definition["id"], "port_mode_id": ports[0]}
     # Runtime resolves the full definition from ProblemIR, not from the action.
     return {
         "kind": "antenna_field_solve",

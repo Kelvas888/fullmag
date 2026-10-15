@@ -77,6 +77,7 @@ import { RegistryInspectorDialog } from "./RegistryInspectorDialog";
 import { DiagnosticRecorderDialog } from "./diagnostic-recorder/DiagnosticRecorderDialog";
 import { useHomeViewOpen } from "./homeView";
 import { NewProblemDialog, useNewProblemRequest } from "./NewProblemDialog";
+import { ReadinessHelperHeaderControl } from "./ReadinessHelperDialog";
 
 function subscribeToHydration(): () => void {
   return () => {};
@@ -410,11 +411,26 @@ function appMenuDialogReducer(
 export function AppMenuBar() {
   const sessions = useSessionCollection();
   const identity = useSessionResourceIdentity();
+  const [newProblem, setNewProblemOpen] = useNewProblemRequest();
+  const hasActiveSession = sessions.state === "ready" && Boolean(identity);
 
-  return sessions.state === "ready" && identity ? (
-    <SessionAppMenuBar />
-  ) : (
-    <NoSessionAppMenuBar state={sessions.state === "ready" ? "loading" : sessions.state} />
+  return (
+    <>
+      {hasActiveSession ? (
+        <SessionAppMenuBar />
+      ) : (
+        <NoSessionAppMenuBar
+          state={sessions.state === "ready" ? "loading" : sessions.state}
+        />
+      )}
+      <NewProblemDialog
+        hasActiveSession={hasActiveSession}
+        initialBackend={newProblem.backend}
+        key={newProblem.key}
+        open={newProblem.open}
+        onOpenChange={setNewProblemOpen}
+      />
+    </>
   );
 }
 
@@ -425,7 +441,6 @@ function NoSessionAppMenuBar({
 }) {
   const kernel = useKernel();
   const { theme, setTheme } = useTheme();
-  const [newProblem, setNewProblemOpen] = useNewProblemRequest();
   const homeOpen = useHomeViewOpen();
   const project = useProjectDocumentSnapshot();
   // Without a session the start screen is the page itself, unless a project is open.
@@ -514,13 +529,6 @@ function NoSessionAppMenuBar({
         <ProjectDocumentStatus />
         <ThemeSwitcher theme={theme} onThemeChange={setTheme} />
       </div>
-      <NewProblemDialog
-        hasActiveSession={false}
-        initialBackend={newProblem.backend}
-        key={newProblem.key}
-        open={state === "no-session" && newProblem.open}
-        onOpenChange={setNewProblemOpen}
-      />
     </header>
   );
 }
@@ -536,6 +544,7 @@ function SessionAppMenuBar() {
     serverHydratedSnapshot,
   );
   const sessionStatus = useSessionStatusSelector(selectHeaderSessionSource, {
+    enabled: sessionIdentity !== null,
     isEqual: headerSessionSourceEquals,
   });
   const visibleSessionStatus = resolveHydrationSafeHeaderSessionSource(
@@ -546,7 +555,6 @@ function SessionAppMenuBar() {
     appMenuDialogReducer,
     APP_MENU_DIALOG_INITIAL_STATE,
   );
-  const [newProblem, setNewProblemOpen] = useNewProblemRequest();
   const homeOpen = useHomeViewOpen();
   const setDataPreviewOpen = (open: boolean) =>
     dispatchDialogState({ open, type: "data-preview" });
@@ -566,7 +574,9 @@ function SessionAppMenuBar() {
   const visualizationSnapshot = useObjectVisualizationSelector((snapshot) =>
     dialogState.registryOpen ? snapshot : EMPTY_OBJECT_VISUALIZATION_SNAPSHOT,
   );
-  const runtimeResourceData = useRuntimeCommandControlResourceData();
+  const runtimeResourceData = useRuntimeCommandControlResourceData({
+    enabled: sessionIdentity !== null,
+  });
   const sessionDisplay = resolveHeaderSessionDisplay(
     visibleSessionStatus,
     readDetailedRuntimeState(runtimeResourceData[SIMULATION_SOLVER_STATUS_PATH]),
@@ -702,6 +712,11 @@ function SessionAppMenuBar() {
         </span>
       </button>
 
+      <ReadinessHelperHeaderControl
+        commandContext={commandContext}
+        kernel={kernel}
+      />
+
       <ApiConnectionErrorDialog
         details={apiErrorDetails}
         onOpenChange={onApiDialogOpenChange}
@@ -739,14 +754,6 @@ function SessionAppMenuBar() {
       <CommunicationPolicyDialog
         onOpenChange={setCommunicationOpen}
         open={dialogState.communicationOpen}
-      />
-
-      <NewProblemDialog
-        hasActiveSession
-        initialBackend={newProblem.backend}
-        key={newProblem.key}
-        open={newProblem.open}
-        onOpenChange={setNewProblemOpen}
       />
 
       <div className="fm-header__separator" />

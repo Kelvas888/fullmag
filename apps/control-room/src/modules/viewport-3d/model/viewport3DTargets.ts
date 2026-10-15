@@ -318,6 +318,7 @@ export function resolveViewport3DSelectionBounds(
   fallbackBounds: Viewport3DBounds | null,
   fdmGrid: FdmSelectionGrid | null = null,
   fdmUniverseOverlay: FdmUniverseOutsideSupportOverlayModel | null = null,
+  activeGenerationId?: string | null,
 ): Viewport3DBounds | null {
   if (!selection.kind) return null;
 
@@ -326,7 +327,7 @@ export function resolveViewport3DSelectionBounds(
   }
 
   return (
-    resolveMeshQualityElementBounds(selection, fallbackBounds) ??
+    resolveMeshQualityElementBounds(selection, fallbackBounds, activeGenerationId) ??
     resolveMeshPartBounds(
       selection.nodeId ? domain.partsById.get(selection.nodeId) : null,
     ) ??
@@ -493,8 +494,16 @@ function boundsFromCenterAndSize(
 function resolveMeshQualityElementBounds(
   selection: Selection,
   fallbackBounds: Viewport3DBounds | null,
+  activeGenerationId?: string | null,
 ): Viewport3DBounds | null {
   if (selection.ref?.type !== "mesh-quality-element" || !selection.ref.centroid) {
+    return null;
+  }
+  if (
+    activeGenerationId &&
+    selection.ref.generationId &&
+    selection.ref.generationId !== activeGenerationId
+  ) {
     return null;
   }
   const radius = Math.max((fallbackBounds?.radius ?? 1e-9) * 0.03, 1e-12);

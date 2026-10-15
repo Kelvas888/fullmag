@@ -2821,7 +2821,7 @@
       "id": "antenna-external-inspection-carrier",
       "path": "crates/fullmag-cli/src/orchestrator/antenna_external_lead_inspection/carrier.rs",
       "symbol": "plan_carrier",
-      "responsibility": "Re-resolve oryginału i jawny non-executable mesh/m read-model bridge, bez LLG/native init.",
+      "responsibility": "Re-resolve oryginału i exact input/request/output w dedykowanym niemagnetycznym planie; historyczny mesh/m bridge usunięty. Runtime NOT VERIFIED.",
       "evidence_status": "source_only"
     },
     {
@@ -2871,27 +2871,6 @@
       "path": "crates/fullmag-cli/src/orchestrator/antenna_external_lead_inspection.rs",
       "symbol": "inspection_stage_record_is_not_accepted_as_a_legacy_ready_catalog",
       "responsibility": "Rzeczywisty legacy catalog reader odmawia osobnego schema; niekompilowany.",
-      "evidence_status": "source_only"
-    },
-    {
-      "id": "antenna-external-inspection-carrier-immutable-regression",
-      "path": "crates/fullmag-cli/src/orchestrator/antenna_external_lead_inspection/carrier.rs",
-      "symbol": "carrier_sanitization_preserves_authored_mesh_material_and_initial_state",
-      "responsibility": "Oryginał niemutowany, nośniki snapshot zachowane; niekompilowany.",
-      "evidence_status": "source_only"
-    },
-    {
-      "id": "antenna-external-inspection-carrier-idempotence-regression",
-      "path": "crates/fullmag-cli/src/orchestrator/antenna_external_lead_inspection/carrier.rs",
-      "symbol": "carrier_sampling_is_snapshot_only_and_sanitization_is_idempotent",
-      "responsibility": "Neutralna study i walidacja carrier clone bez solver execution; niekompilowany.",
-      "evidence_status": "source_only"
-    },
-    {
-      "id": "antenna-external-inspection-carrier-material-regression",
-      "path": "crates/fullmag-cli/src/orchestrator/antenna_external_lead_inspection/carrier.rs",
-      "symbol": "carrier_strips_material_physics_without_losing_snapshot_scalars",
-      "responsibility": "Anisotropy/DMI usunięte w kopii, Ms metadata retained; niekompilowany.",
       "evidence_status": "source_only"
     },
     {
@@ -2980,7 +2959,7 @@
     },
     {
       "id": "antenna-external-inspection-manifest",
-      "path": "crates/fullmag-runner/src/antenna_external_lead_solution.rs",
+      "path": "crates/fullmag-antenna-artifacts/src/solution.rs",
       "symbol": "AntennaExternalLeadSolutionManifest",
       "responsibility": "Osobny thin inspection-only manifest z raw V/RT0/H bundle, input pins i requested/resolved execution; bez per-ampere reinterpretacji.",
       "evidence_status": "source_only"
@@ -3633,14 +3612,14 @@
     },
     {
       "id": "antenna-external-bundle-physical-topology",
-      "path": "crates/fullmag-runner/src/native_fem/accepted_external_lead/record.rs",
+      "path": "crates/fullmag-antenna-artifacts/src/bundle.rs",
       "symbol": "validate_source_topology",
       "responsibility": "Complete device/lead ownership i role, opposite interface sides w jednym physical ordering, graph actual faces+typed interfaces, bijekcja H1 labels i pełny support każdego komponentu; source-only.",
       "evidence_status": "source_only"
     },
     {
       "id": "antenna-owned-charge-retained-metadata",
-      "path": "crates/fullmag-runner/src/native_fem/accepted_terminal_charge/record.rs",
+      "path": "crates/fullmag-antenna-artifacts/src/charge.rs",
       "symbol": "AcceptedTerminalChargeRecord",
       "responsibility": "Owned exact charge bytes/maps z zachowanymi reference terminals, component residuals, gauge IDs i omitted constraints; nie niezależne odtworzenie rank proof.",
       "evidence_status": "source_only"
@@ -4235,7 +4214,7 @@
     },
     {
       "id": "antenna-accepted-charge-record-codec-test",
-      "path": "crates/fullmag-runner/src/native_fem/accepted_terminal_charge/record.rs",
+      "path": "crates/fullmag-antenna-artifacts/src/charge.rs",
       "symbol": "self_consistent_hash_does_not_bypass_structural_or_current_gates",
       "responsibility": "Source synthetic codec corruption regression nawet z ponownie przeliczonym hashem; niekompilowana.",
       "evidence_status": "source_only"
@@ -5236,16 +5215,124 @@
       "responsibility": "Istniejący wspólny right-handed rigid transform; plane object-frame v2 pozostaje planned.",
       "evidence_status": "source_only"
     },
-    {"id": "antenna-finite-k-authoring-contract", "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md", "symbol": "DOC-ANCHOR:antenna-finite-k-authoring-monitor-contract", "responsibility": "Projekt E9c: typed request i rzeczywiste monitory m/H_drive, bez kwalifikacji runtime.", "evidence_status": "planned_contract"},
-    {"id": "antenna-finite-k-python-request", "path": "packages/fullmag-py/src/fullmag/model/study.py", "symbol": "class FiniteKResponseAnalysis", "responsibility": "Walidacja parametrów SI i canonical runtime metadata finite-k.", "evidence_status": "source_only"},
-    {"id": "antenna-finite-k-ir-count-regression", "path": "crates/fullmag-ir/src/validation.rs", "symbol": "finite_k_request_rejects_invalid_count_types_and_ranges", "responsibility": "Zapisana regresja typów i zakresu liczby sond; test Rust niekompilowany i niewykonany.", "evidence_status": "source_only"},
-    {"id": "antenna-finite-k-ui-monitors", "path": "apps/control-room/src/modules/inspector/panels/stages/studyWorkflowState.ts", "symbol": "validateStudyWorkflow", "responsibility": "Finite-k sprawdza field outputs m/H_drive i zgodność zadanych zegarów; nie zastępuje readback artefaktów.", "evidence_status": "source_only"},
-    {"id": "antenna-finite-k-active-source", "path": "crates/fullmag-plan/src/lib.rs", "symbol": "has_active_finite_k_source", "responsibility": "Stage-local gate lokalnego lub solved źródła; accepted basis sprawdzana osobno runtime.", "evidence_status": "source_only"},
-    {"id": "antenna-finite-k-active-source-regression", "path": "crates/fullmag-plan/src/lib.rs", "symbol": "finite_k_source_gate_respects_antenna_stage_and_current", "responsibility": "Zapisany test aktywacji, companion i prądu; NOT COMPILED/NOT RUN.", "evidence_status": "source_only"},
-    {"id": "antenna-finite-k-options-regression", "path": "crates/fullmag-ir/src/validation.rs", "symbol": "finite_k_request_rejects_ignored_gamma_options_and_nonstring_components", "responsibility": "Zapisany test Gamma-only options i niełańcuchowych komponentów; NOT COMPILED/NOT RUN.", "evidence_status": "source_only"},
-    {"id": "antenna-finite-k-scene-roundtrip", "path": "packages/fullmag-py/src/fullmag/runtime/script_builder.py", "symbol": "_render_scene_stage_bootstrap", "responsibility": "SceneDocument eksportuje wszystkie parametry finite-k i odrzuca ignorowane parametry Gamma; interpretowany roundtrip bez solvera.", "evidence_status": "source_only"},
-    {"id": "antenna-finite-k-runtime-solved-source", "path": "crates/fullmag-runner/src/spin_wave_sampling.rs", "symbol": "requested_finite_k_artifacts", "responsibility": "Istniejący reader dopuszcza niezerową aktywną solved basis; walidacja artefaktów i monitory pozostają wymagane.", "evidence_status": "source_only"},
-    {"id": "antenna-finite-k-resolved-activation", "path": "crates/fullmag-runner/src/time_events.rs", "symbol": "resolved_solved_antenna_drive_is_active", "responsibility": "Canonical stage activation współdzielona z accepted antenna execution; nie kwalifikuje basis.", "evidence_status": "source_only"}
+    {
+      "id": "antenna-finite-k-authoring-contract",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-finite-k-authoring-monitor-contract",
+      "responsibility": "Projekt E9c: typed request i rzeczywiste monitory m/H_drive, bez kwalifikacji runtime.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-finite-k-python-request",
+      "path": "packages/fullmag-py/src/fullmag/model/study.py",
+      "symbol": "class FiniteKResponseAnalysis",
+      "responsibility": "Walidacja parametrów SI i canonical runtime metadata finite-k.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-finite-k-ir-count-regression",
+      "path": "crates/fullmag-ir/src/validation.rs",
+      "symbol": "finite_k_request_rejects_invalid_count_types_and_ranges",
+      "responsibility": "Zapisana regresja typów i zakresu liczby sond; test Rust niekompilowany i niewykonany.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-finite-k-ui-monitors",
+      "path": "apps/control-room/src/modules/inspector/panels/stages/studyWorkflowState.ts",
+      "symbol": "validateStudyWorkflow",
+      "responsibility": "Finite-k sprawdza field outputs m/H_drive i zgodność zadanych zegarów; nie zastępuje readback artefaktów.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-finite-k-active-source",
+      "path": "crates/fullmag-plan/src/lib.rs",
+      "symbol": "has_active_finite_k_source",
+      "responsibility": "Stage-local gate lokalnego lub solved źródła; accepted basis sprawdzana osobno runtime.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-finite-k-active-source-regression",
+      "path": "crates/fullmag-plan/src/lib.rs",
+      "symbol": "finite_k_source_gate_respects_antenna_stage_and_current",
+      "responsibility": "Zapisany test aktywacji, companion i prądu; NOT COMPILED/NOT RUN.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-finite-k-options-regression",
+      "path": "crates/fullmag-ir/src/validation.rs",
+      "symbol": "finite_k_request_rejects_ignored_gamma_options_and_nonstring_components",
+      "responsibility": "Zapisany test Gamma-only options i niełańcuchowych komponentów; NOT COMPILED/NOT RUN.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-finite-k-scene-roundtrip",
+      "path": "packages/fullmag-py/src/fullmag/runtime/script_builder.py",
+      "symbol": "_render_scene_stage_bootstrap",
+      "responsibility": "SceneDocument eksportuje wszystkie parametry finite-k i odrzuca ignorowane parametry Gamma; interpretowany roundtrip bez solvera.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-finite-k-runtime-solved-source",
+      "path": "crates/fullmag-runner/src/spin_wave_sampling.rs",
+      "symbol": "requested_finite_k_artifacts",
+      "responsibility": "Istniejący reader dopuszcza niezerową aktywną solved basis; walidacja artefaktów i monitory pozostają wymagane.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-finite-k-resolved-activation",
+      "path": "crates/fullmag-runner/src/time_events.rs",
+      "symbol": "resolved_solved_antenna_drive_is_active",
+      "responsibility": "Canonical stage activation współdzielona z accepted antenna execution; nie kwalifikuje basis.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-external-inspection-carrier-regression",
+      "path": "crates/fullmag-cli/src/orchestrator/antenna_external_lead_inspection/carrier.rs",
+      "symbol": "inspection_session_planning_has_no_magnetic_scaffold",
+      "responsibility": "Zastępuje historyczne testy sanitizacji Zeeman/Heun: dedicated plan bez synthetic m i z exact input/request/output comparison; niekompilowany.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-standalone-study-contract",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-standalone-study-contract",
+      "responsibility": "Addytywna niemagnetyczna rodzina studium; wymagania, rozdzielenie sampling i brak fikcyjnego LLG. WIP, runtime NOT VERIFIED.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-standalone-study-ir",
+      "path": "crates/fullmag-ir/src/study.rs",
+      "symbol": "StudyIR",
+      "responsibility": "Wariant AntennaFieldSolve: typed study bez dynamics, z osobnym sampling; nie kwalifikacja source solve.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-standalone-study-no-dynamics-test",
+      "path": "crates/fullmag-ir/tests/ir_tests.rs",
+      "symbol": "antenna_study_has_no_dynamics_and_preserves_empty_sampling",
+      "responsibility": "Serializacja study i brak LLG controls; test niekompilowany zgodnie z ograniczeniem hosta.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-current-display-real-ram-comparison",
+      "path": "scripts/compare_managed_antenna_ram.py",
+      "symbol": "compare",
+      "responsibility": "Rzeczywisty FEM CPU/double run 92cdc1e909c242c58c81f1aa495df435: fixed V/J/H, geometryczne momenty RT0 i bilanse PASS; nie pełna nauka ani native canonical cold-loader.",
+      "evidence_status": "runtime_fixed_fixture_passed"
+    },
+    {
+      "id": "antenna-current-display-retained-report",
+      "path": "scripts/compare_managed_antenna_ram.py",
+      "symbol": "main",
+      "responsibility": "Opcjonalny raport pod validated run/export, dopiero po PASS i zgodności SHA bezpośrednich źródeł przed/po porównaniu; bez zmiany qualification flags."
+    },
+    {
+      "id": "antenna-current-display-real-ram-contract",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-current-source-fixture-native-v-j-h-20261011",
+      "responsibility": "Pełne tożsamości buildu/runu i zamrożone tolerancje rzeczywistego odbioru V/J/H wraz z granicami dowodu.",
+      "evidence_status": "planned_contract"
+    }
   ],
   "public_api": {
     "parameters": [
@@ -5829,10 +5916,46 @@
         "backend_support": "immutable FEM antenna asset; multi-port assets require explicit selection",
         "problem_ir": "antenna_spectrum_requests[].port_mode_id"
       },
-      {"python": "FiniteKResponseAnalysis.response_component", "type": "str", "default": "my", "si_unit": "$1$", "validation": "mx/my/mz; niełańcuchowy request IR odrzucony", "meaning": "komponent m i tego samego H_drive", "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported", "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.response_component"},
-      {"python": "FiniteKResponseAnalysis.probe_count", "type": "int", "default": "128", "si_unit": "$1$", "validation": "int nie bool; 4..2048; odd/even dozwolone", "meaning": "liczba sond przekrojowych x", "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported", "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.probe_count"},
-      {"python": "FiniteKResponseAnalysis.analysis_x_min_m", "type": "float | None", "default": "None", "si_unit": "$\\mathrm{m}$", "validation": "None pomijane; inne float conversion, nie bool, finite; przy obu max > min", "meaning": "dolna granica przekrojów, None oznacza inferencję domeny", "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported", "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.analysis_x_min_m"},
-      {"python": "FiniteKResponseAnalysis.analysis_x_max_m", "type": "float | None", "default": "None", "si_unit": "$\\mathrm{m}$", "validation": "None pomijane; inne float conversion, nie bool, finite; przy obu max > min", "meaning": "górna granica przekrojów, None oznacza inferencję domeny", "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported", "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.analysis_x_max_m"}
+      {
+        "python": "FiniteKResponseAnalysis.response_component",
+        "type": "str",
+        "default": "my",
+        "si_unit": "$1$",
+        "validation": "mx/my/mz; niełańcuchowy request IR odrzucony",
+        "meaning": "komponent m i tego samego H_drive",
+        "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported",
+        "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.response_component"
+      },
+      {
+        "python": "FiniteKResponseAnalysis.probe_count",
+        "type": "int",
+        "default": "128",
+        "si_unit": "$1$",
+        "validation": "int nie bool; 4..2048; odd/even dozwolone",
+        "meaning": "liczba sond przekrojowych x",
+        "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported",
+        "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.probe_count"
+      },
+      {
+        "python": "FiniteKResponseAnalysis.analysis_x_min_m",
+        "type": "float | None",
+        "default": "None",
+        "si_unit": "$\\mathrm{m}$",
+        "validation": "None pomijane; inne float conversion, nie bool, finite; przy obu max > min",
+        "meaning": "dolna granica przekrojów, None oznacza inferencję domeny",
+        "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported",
+        "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.analysis_x_min_m"
+      },
+      {
+        "python": "FiniteKResponseAnalysis.analysis_x_max_m",
+        "type": "float | None",
+        "default": "None",
+        "si_unit": "$\\mathrm{m}$",
+        "validation": "None pomijane; inne float conversion, nie bool, finite; przy obu max > min",
+        "meaning": "górna granica przekrojów, None oznacza inferencję domeny",
+        "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported",
+        "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.analysis_x_max_m"
+      }
     ]
   }
 }

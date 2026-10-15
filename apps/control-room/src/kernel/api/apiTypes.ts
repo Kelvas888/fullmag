@@ -118,6 +118,21 @@ export type PlanarSampleSourceResource =
   components["schemas"]["PlanarSampleSourceResource"];
 export type PlanarFieldProbeResource =
   components["schemas"]["PlanarFieldProbeResource"];
+export type PostprocessingDataRef = components["schemas"]["PostprocessingDataRef"];
+export type PostprocessingDefinition = components["schemas"]["PostprocessingDefinition"];
+export type AnalyticReferenceModelCollectionResource =
+  components["schemas"]["AnalyticReferenceModelCollectionResource"];
+export type AnalyticReferenceModelResource = components["schemas"]["AnalyticReferenceModelResource"];
+export type PostprocessingDefinitionCollectionResource =
+  components["schemas"]["PostprocessingDefinitionCollectionResource"];
+export type PostprocessingDefinitionCreateRequest =
+  components["schemas"]["PostprocessingDefinitionCreateRequest"];
+export type PostprocessingDefinitionDeleteRequest =
+  components["schemas"]["PostprocessingDefinitionDeleteRequest"];
+export type PostprocessingDefinitionPatchRequest =
+  components["schemas"]["PostprocessingDefinitionPatchRequest"];
+export type PostprocessingDefinitionResource =
+  components["schemas"]["PostprocessingDefinitionResource"];
 export type PlanarMonitorCollectionResource =
   components["schemas"]["PlanarMonitorCollectionResource"];
 export type PlanarMonitorCreateRequest =
@@ -221,21 +236,6 @@ export type GeometryRealizationResource =
 export type GeometryValidationResource =
   components["schemas"]["GeometryValidationResource"];
 export type HealthResource = components["schemas"]["HealthResponse"];
-export type DevelopmentBackendResource =
-  components["schemas"]["DevelopmentBackendResource"];
-export type DevelopmentBackendBuildRequest =
-  components["schemas"]["DevelopmentBackendBuildRequest"] & {
-    schema: "fullmag.development-backend-build-request.v1";
-  };
-export type DevelopmentBackendBuildRequestResource =
-  components["schemas"]["DevelopmentBackendBuildRequestResource"] & {
-    ready_build_id: string | null;
-    ready_source_sha256: string | null;
-  };
-export type DevelopmentRestartRequest =
-  components["schemas"]["DevelopmentRestartRequest"];
-export type DevelopmentRestartResource =
-  components["schemas"]["DevelopmentRestartResource"];
 export type ImportSessionAssetRequest =
   components["schemas"]["ImportSessionAssetRequest"];
 export type SessionAssetImportResponse =
@@ -905,6 +905,15 @@ export type ProjectRunMaterializationResource =
 export type ProjectRunResource = components["schemas"]["ProjectRunResource"];
 export type ProjectRunListQuery = components["schemas"]["ProjectRunListQuery"];
 export type ProjectRunListResource = components["schemas"]["ProjectRunListResource"];
+export type ProjectBatchSubmitRequest = components["schemas"]["ProjectBatchSubmitRequest"];
+export type ProjectBatchSubmitResource = components["schemas"]["ProjectBatchSubmitResource"];
+export type ProjectBatchListQuery = components["schemas"]["ProjectBatchListQuery"];
+export type ProjectBatchListResource = components["schemas"]["ProjectBatchListResource"];
+export type ProjectBatchSummaryResource = components["schemas"]["ProjectBatchSummaryResource"];
+export type ProjectBatchAxisSummaryResource = components["schemas"]["ProjectBatchAxisSummaryResource"];
+export type ProjectBatchCasesQuery = components["schemas"]["ProjectBatchCasesQuery"];
+export type ProjectBatchCasesResource = components["schemas"]["ProjectBatchCasesResource"];
+export type ProjectBatchCaseSummaryResource = components["schemas"]["ProjectBatchCaseSummaryResource"];
 export type ProjectRunTaskCancellationRequest =
   components["schemas"]["ProjectRunTaskCancellationRequest"];
 export type ProjectRunTaskCancellationResource =
@@ -1024,6 +1033,7 @@ export interface FieldVectorIdentityIssue {
 export interface FieldVectorResponseMetadata {
   component: string | null;
   domainGenerationId: string | null;
+  artifactGenerationId?: string | null;
   encoding: string | null;
   fieldIndexing: string | null;
   fieldGenerationId?: string | null;
@@ -1108,6 +1118,8 @@ export type ExecutionProfileCatalogResource = components["schemas"]["ExecutionPr
 export type ComputePreviewRequest = components["schemas"]["ComputePreviewRequest"];
 export type ExecutionRequestLayer = components["schemas"]["ExecutionLayerSchema"];
 export type ComputePreviewResource = components["schemas"]["ComputePreviewResource"];
+export type ComputeNodesResource = components["schemas"]["ComputeNodesResource"];
+export type ComputeNodesState = components["schemas"]["ComputeNodesState"];
 export type ExecutionProfileVersionResource = components["schemas"]["ExecutionProfileVersionResource"];
 export type ExecutionProfile = ExecutionProfileVersionResource["profile"];
 export type PublishExecutionProfileRequest = components["schemas"]["PublishExecutionProfileRequest"];

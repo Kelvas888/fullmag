@@ -182,9 +182,11 @@ describe("PrimitiveObjectLayer geometry resources", () => {
     expect(createPrimitiveObjectGeometry(primitiveObject("sphere")).type).toBe(
       "SphereGeometry",
     );
-    expect(createPrimitiveObjectGeometry(primitiveObject("cylinder")).type).toBe(
-      "CylinderGeometry",
-    );
+    const cylinderGeometry = createPrimitiveObjectGeometry(primitiveObject("cylinder"));
+    expect(cylinderGeometry.type).toBe("CylinderGeometry");
+    cylinderGeometry.computeBoundingBox();
+    expect(cylinderGeometry.boundingBox?.min.z).toBeCloseTo(-3);
+    expect(cylinderGeometry.boundingBox?.max.z).toBeCloseTo(3);
   });
 
   it("creates a visible CSG preview for box-minus-cylinder objects", () => {

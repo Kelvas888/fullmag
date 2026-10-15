@@ -141,6 +141,18 @@ fn main() -> Result<()> {
         Command::Runtime(RuntimeCommand::InitializeScopedAcceptedStore) => {
             control_room::initialize_scoped_accepted_store()?;
         }
+        Command::Runtime(RuntimeCommand::InitializeHostApplication {
+            config,
+            config_sha256,
+        }) => {
+            println!(
+                "{}",
+                serde_json::to_string(&runtime_service_client::initialize_host_application(
+                    &config,
+                    &config_sha256,
+                )?)?
+            );
+        }
         Command::Runtime(RuntimeCommand::VerifyDevelopmentHandoffCommit {
             store,
             corrupt_store,
@@ -202,7 +214,7 @@ fn main() -> Result<()> {
         Command::Runtime(RuntimeCommand::FemAvailability { json }) => {
             let gpu = fullmag_runner::native_fem_gpu_status();
             let payload = serde_json::json!({
-                "native_fem_cpu_available": fullmag_runner::is_native_fem_cpu_available(),
+                "native_fem_cpu_available": gpu.cpu_available,
                 "native_fem_gpu_available": gpu.available,
                 "visible_cuda_device_count": gpu.visible_cuda_device_count,
                 "requested_gpu_index": gpu.requested_gpu_index,
@@ -328,6 +340,14 @@ fn main() -> Result<()> {
             let result=accepted_script_run::submit_script(&script,&project,&execution_profile,&resources,&idempotency_key,&api_url,submit_only)?;
             println!("{}",serde_json::to_string_pretty(&result)?);
         }
+        Command::PrepareRunJson {
+            path,
+            project_id,
+            api_url,
+        } => {
+            let result = accepted_run_transport::prepare_run_json(&path, &project_id, &api_url)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         Command::RunJson {
             path,
             api_url,
@@ -444,6 +464,10 @@ fn main() -> Result<()> {
             } else {
                 println!("{}", serde_json::to_string(&resolution)?);
             }
+        }
+        Command::EigenKWorker { request } => {
+            fullmag_runner::run_eigen_k_worker_request_file(&request)
+                .map_err(|error| anyhow!(error.message))?;
         }
         Command::Project(cmd) => handle_project(cmd)?,
         Command::Script(cmd) => script_inspect::handle_script(cmd)?,
@@ -925,6 +949,7 @@ fn is_script_mode(raw_args: &[OsString]) -> bool {
         "run-problem-json-direct",
         "resume-json",
         "resolve-runtime-invocation",
+        "__eigen-k-worker",
         "session",
         "project",
         "script",
@@ -1866,6 +1891,26 @@ mod tests {
     }
 
     #[test]
+    fn cli_prepares_run_identity_without_an_implicit_submit() {
+        let cli = Cli::try_parse_from([
+            "fullmag",
+            "prepare-run-json",
+            "authored-run.json",
+            "--project-id",
+            "project-submit",
+            "--api-url",
+            "http://127.0.0.1:8000",
+        ])
+        .expect("cli parse");
+        assert!(matches!(
+            cli.command,
+            Command::PrepareRunJson { path, project_id, api_url }
+                if path == std::path::Path::new("authored-run.json")
+                    && project_id == "project-submit" && api_url == "http://127.0.0.1:8000"
+        ));
+    }
+
+    #[test]
     fn cli_keeps_hidden_submit_run_json_compatibility_alias() {
         let cli = Cli::try_parse_from([
             "fullmag",
@@ -2133,6 +2178,7 @@ mod tests {
                 stage_autosave: None,
                 outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                     quantity: "eigenfrequency".to_string(),
+                    scope: None,
                 }],
             },
         };

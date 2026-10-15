@@ -1,16 +1,16 @@
 "use client";
 
 import { useState } from "react";
-import { closedLoopManifest, isClosedLoopDisplay } from "@/kernel/resources/antennaClosedLoopInspectionModel";
+import { closedLoopManifest } from "@/kernel/resources/antennaClosedLoopInspectionModel";
 
 import type { SceneResource } from "@/kernel/api/apiTypes";
 import { useSceneResource } from "@/kernel/resources/geometryLifecycleResources";
-import { useStageExecutionResource } from "@/kernel/resources/studyRuntimeResources";
 import { resolveInspectionRuntimeStage, inspectionMatchesRuntimeStage, inspectionSelectionMatchesContext, type InspectionRuntimeSelection } from "./AntennaExternalLeadInspectionModel";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
+import { useStageExecutionResource } from "@/kernel/resources/studyRuntimeResources";
 import { antennaInspectionDisplayMatchesOwner, useAntennaFieldSolutionResource, useAntennaStageOutputCatalogResource, useAntennaExternalLeadInspectionResource, useAntennaInspectionDisplayResource } from "@/kernel/resources/antennaResources";
 import { useObjectVisualizationController, useObjectVisualizationSelector } from "@/kernel/visualization/useObjectVisualization";
-import { antennaInspectionIntentMatchesOwner, type AntennaFieldIntent, type AntennaFieldQuantity } from "@/kernel/visualization/antennaFieldIntent";
+import { type AntennaFieldIntent, type AntennaFieldQuantity } from "@/kernel/visualization/antennaFieldIntent";
 import { antennaStageValidationMessages } from "@/shared/domain/physics/antennaStageValidation";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/Select";
 
@@ -24,17 +24,10 @@ import { VisualizationInspectorOverview } from "../ObjectVisualizationOverview";
 import { AntennaFieldBasisPreview } from "./AntennaFieldBasisPreview";
 import { ANTENNA_BASIS_QUANTITIES, type AntennaBasisQuantity } from "./AntennaFieldBasisPreviewModel";
 import { antennaFieldSolutionIdentityStatus, resolveAntennaRuntimeIds } from "./AntennaCompositionRuntime";
-import { ANTENNA_RAW_QUANTITIES, ANTENNA_CLOSED_LOOP_QUANTITIES, antennaInspectionHasCurrent, antennaVisualizationQuantity } from "./AntennaVisualizationQuantity";
+import { ANTENNA_RAW_QUANTITIES, ANTENNA_CLOSED_LOOP_QUANTITIES } from "./AntennaVisualizationQuantity";
+import { antennaVisualizationPresentation, resolveAntennaVisualizationSelection } from "./AntennaVisualizationModel";
 
 type SceneRead = ReturnType<typeof useSceneResource>;
-
-export function isAntennaVisualizationObject(scene: SceneResource | null, objectId: string | null): boolean {
-  const object = scene?.objects?.find((candidate) => candidate.id === objectId);
-  if (!object) return false;
-  const hint = (object as Record<string, unknown>).visualization_hint as { role?: unknown } | null | undefined;
-  if (object.role && object.role !== "magnet") return object.role === "antenna";
-  return hint?.role === "antenna" || object.tags?.includes("role:antenna") === true;
-}
 
 export function AntennaVisualizationPanel(props: InspectorPanelProps) {
   const scene = useSceneResource();
@@ -68,9 +61,12 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
   const owner = useSessionResourceIdentity();
   const execution = useStageExecutionResource();
   const [inspectionSelection, setInspectionSelection] = useState<InspectionRuntimeSelection | null>(null);
-  if (inspectionSelection && !inspectionSelectionMatchesContext(inspectionSelection, stageId ?? "", execution.data, owner)) setInspectionSelection(null);
-  const inspectionMapping = resolveInspectionRuntimeStage(stageId ?? "", execution.data, owner, inspectionSelection);
-  const inspection = useAntennaExternalLeadInspectionResource(inspectionMapping.state === "mapped" ? inspectionMapping.runtimeStageId : null, { pauseLoad: execution.status !== "ready" || Boolean(execution.refreshError) });
+  if (inspectionSelection && !inspectionSelectionMatchesContext(inspectionSelection, stageId ?? "", execution.data, owner)) {
+    setInspectionSelection(null);
+  }
+  const mapping = resolveInspectionRuntimeStage(stageId ?? "", execution.data, owner, inspectionSelection);
+  const executionCurrent = execution.status === "ready" && !execution.refreshError;
+  const inspection = useAntennaExternalLeadInspectionResource(mapping.state === "mapped" ? mapping.runtimeStageId : null, { pauseLoad: !executionCurrent });
   const visualization = useObjectVisualizationController();
   const requested = useObjectVisualizationSelector((snapshot) => snapshot.antennaFieldIntent ?? null);
   const displayStatus = useObjectVisualizationSelector((snapshot) => snapshot.antennaFieldDisplayStatus ?? null);
@@ -86,27 +82,16 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
   const raw = inspection.data;
   const closed = raw ? closedLoopManifest(raw) : null;
   const rawManifest = closed ?? raw?.manifest;
-  const rawOwnerMatches = sceneStatus === "ready" && execution.status === "ready" && !execution.refreshError && inspection.status === "ready" && !inspection.refreshError && raw?.status === "inspection_only" && rawManifest?.source_object_id === objectId && inspectionMatchesRuntimeStage(raw, stageId ?? "", inspectionMapping, owner) && raw.session_id === owner?.sessionId && raw.session_epoch === owner?.sessionEpoch && raw.request_scope_epoch === owner?.requestScopeEpoch && raw.outputs.length === 1 && raw.outputs[0].inspection_ref.content_digest === rawManifest.content_digest;
+  const supportedInspection = Boolean(closed) || raw?.qualification === "NOT VERIFIED" && raw.field_scope === "external_electrode_truncation";
+  const rawOwnerMatches = sceneStatus === "ready" && executionCurrent && inspection.status === "ready" && !inspection.refreshError && raw?.status === "inspection_only" && supportedInspection &&
+    rawManifest?.source_object_id === objectId && inspectionMatchesRuntimeStage(raw, stageId ?? "", mapping, owner) &&
+    raw.outputs.length === 1 && raw.outputs[0].inspection_ref.stage_id === stageId && raw.outputs[0].inspection_ref.output_id === raw.output_id &&
+    raw.outputs[0].inspection_ref.content_digest === rawManifest.content_digest;
   const rawDisplay = useAntennaInspectionDisplayResource(rawOwnerMatches ? raw : null);
   const rawAvailable = Boolean(rawOwnerMatches && raw && rawDisplay.status === "ready" && !rawDisplay.refreshError && rawDisplay.data && antennaInspectionDisplayMatchesOwner(raw, rawDisplay.data));
-  const inspectionMode = displaySource === "inspection" || (!basisAvailable && rawAvailable);
-  const available = inspectionMode ? rawAvailable : basisAvailable;
-  const ports = inspectionMode ? raw ? [raw.port_mode_id] : [] : field.data?.bases.map((basis) => basis.port_mode_id) ?? [];
-  const matchingIntent = requested?.sourceObjectId === objectId && requested.stageId === stageId
-    && requested.sessionId === owner?.sessionId && requested.sessionEpoch === owner?.sessionEpoch
-    && requested.requestScopeEpoch === owner?.requestScopeEpoch && requested.kind === (inspectionMode ? "inspection" : "basis")
-    && requested.contentDigest === (inspectionMode ? rawManifest?.content_digest : field.data?.content_digest)
-    && requested.solutionId === (inspectionMode ? raw?.output_id : field.data?.solution_id)
-    && (!inspectionMode || (rawOwnerMatches && raw && antennaInspectionIntentMatchesOwner(requested, raw))) ? requested : null;
-  const port = ports.includes(preferredPort) ? preferredPort : matchingIntent && ports.includes(matchingIntent.portModeId) ? matchingIntent.portModeId : ports.length === 1 ? ports[0] : "";
-  const currentAvailable = rawAvailable && antennaInspectionHasCurrent(rawDisplay.data);
-  const effectiveQuantity = antennaVisualizationQuantity(matchingIntent?.quantity ?? quantity, inspectionMode, currentAvailable, Boolean(closed));
-  const current = effectiveQuantity === "current_density" || effectiveQuantity === "current_density_per_ampere";
-  const perAmpereInspection = inspectionMode && Boolean(closed) && effectiveQuantity.endsWith("per_ampere");
-  const legacyDisplay = rawDisplay.data && !isClosedLoopDisplay(rawDisplay.data) ? rawDisplay.data : null;
-  const magnetic = effectiveQuantity === "magnetic_field_per_ampere" || effectiveQuantity === "magnetic_field";
-  const surfaceAvailable = inspectionMode && rawAvailable && ((magnetic && Boolean(closed?.sample_cell_count)) || (effectiveQuantity === "device_potential" || effectiveQuantity === "electric_potential_per_ampere" || current) && (closed?.cell_count ?? legacyDisplay?.device_cell_count ?? 0) > 0 && (closed?.vertex_count ?? legacyDisplay?.device_node_count ?? 0) > 0);
-  const active = matchingIntent?.quantity === effectiveQuantity && matchingIntent.portModeId === port ? matchingIntent : null;
+  const { inspectionMode, available, ports, port, currentAvailable, effectiveQuantity, current, perAmpereInspection, magnetic, surfaceAvailable, active } =
+    resolveAntennaVisualizationSelection({ objectId, stageId, owner, basisAvailable, rawAvailable, rawOwnerMatches,
+      raw, field: field.data, display: rawDisplay.data, requested, quantity, preferredPort, displaySource });
   const setDisplay = (patch: Partial<AntennaFieldIntent>) => {
     const selectedPort = patch.portModeId ?? port;
     if (!available || !owner || !objectId || !stageId || !selectedPort || !ports.includes(selectedPort)) return;
@@ -124,17 +109,9 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
       component: active?.component ?? "magnitude", palette: active?.palette ?? "viridis", ...patch,
     });
   };
-  const unavailableReason = rawDisplay.error?.message ?? inspection.error?.message ?? (inspectionMode && inspectionMapping.state !== "mapped" ? inspectionMapping.message : null) ?? (!stageId ? "No configured antenna solve stage" : validation.join("; ") || (identity === "ready" && !sourceMatches ? "source/transport mismatch" : identity === "ready" && !ownerMatches ? "session owner mismatch" : sceneStatus !== "ready" ? `scene ${sceneStatus}` : identity));
-  const quantitySpec = inspectionMode && closed ? ANTENNA_CLOSED_LOOP_QUANTITIES[effectiveQuantity] : effectiveQuantity === "device_potential" || effectiveQuantity === "magnetic_field" || effectiveQuantity === "current_density" ? ANTENNA_RAW_QUANTITIES[effectiveQuantity] : ANTENNA_BASIS_QUANTITIES[effectiveQuantity];
-  const carrier = magnetic ? inspectionMode ? closed?.sample_carrier ?? raw?.manifest?.sampling_carrier : field.data?.sample_carrier : null;
-  const carrierLabel = magnetic
-    ? carrier ? `${carrier.carrier_kind} · ${carrier.location} · ${carrier.domain.kind}` : "Published field sampling domain (not available)"
-    : current ? `Device Tet4 cell centers / cell-local vertex traces · ${objectId ?? "not selected"}` : `Conductor nodes · ${objectId ?? "not selected"}`;
-  const renderReason = surfaceAvailable
-    ? magnetic ? "H uses its independently retained sampling Tet4 mesh and actual nodal Cartesian vectors. The surface interpolates the vector before evaluating its magnitude or component. No conductor or primitive topology is adopted." : current ? "J uses the actual retained device Tet4 mesh and accepted cell-local vertex traces. The surface interpolates the Cartesian vector before evaluating magnitude or a component; traces are never averaged into nodal J. Points and full-XYZ vector glyphs use cell centers. Full reads are limited to 100000 cells / 400000 local vertices / 64 MiB; invalid or oversized data are rejected, not decimated."
-      : "V uses the actual retained device Tet4 mesh: outward exterior faces, vertex colors and boundary wireframe. No primitive geometry is recolored. Full reads are limited to 100000 nodes / 100000 cells / 64 MiB; invalid topology or oversized datasets are rejected, not decimated."
-    : "No compatible surface topology is published for this carrier. Points and vectors use the actual complete sample positions; the conductor primitive is never recolored. Full reads are limited to 100000 samples / 64 MiB; oversized or incompatible datasets are rejected, not decimated.";
-  const rangeHint = current ? "Magnitude: zero to the global sampled maximum over all cell centers and cell-local vertex traces. Components: full sampled extrema over the same data. One shared range for all display passes." : "Full finite nodal/sample dataset range. Surface vertex colors share the same range as the device points; no guessed carrier.";
+  const unavailableReason = rawDisplay.error?.message ?? inspection.error?.message ?? (inspectionMode && mapping.state !== "mapped" ? mapping.message : null) ?? (!stageId ? "No configured antenna solve stage" : validation.join("; ") || (identity === "ready" && !sourceMatches ? "source/transport mismatch" : identity === "ready" && !ownerMatches ? "session owner mismatch" : sceneStatus !== "ready" ? `scene ${sceneStatus}` : identity));
+  const { quantitySpec, carrierLabel, renderReason, rangeHint } =
+    antennaVisualizationPresentation({ objectId, effectiveQuantity, inspectionMode, surfaceAvailable, current, raw, field: field.data });
   return <>
     <VisualizationInspectorOverview
       dataState={available ? "Published snapshot" : "Unavailable"}
@@ -142,6 +119,16 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
       quantitySource={`${quantitySpec.label} [${quantitySpec.unit}]`}
       enabledPassCount={Number(active?.points ?? false) + Number(active?.vectors ?? false) + Number(active?.surface ?? false) + Number(active?.wireframe ?? false)}
       display={<>
+        <Select value={mapping.state === "mapped" ? mapping.runtimeStageId : ""} disabled={!executionCurrent || mapping.candidates.length === 0} onValueChange={(runtimeStageId) => {
+          if (owner && stageId && execution.data && mapping.candidates.some((candidate) => candidate.runtimeStageId === runtimeStageId)) {
+            setInspectionSelection({ authoredStageId: stageId, runtimeStageId, runId: execution.data.run_id, identity: owner });
+            visualization.setAntennaFieldIntent(null);
+          }
+        }}>
+          <SelectTrigger aria-label="Antenna visualization execution"><SelectValue placeholder="Select an inspection execution" /></SelectTrigger>
+          <SelectContent>{mapping.candidates.map((candidate) => <SelectItem key={candidate.runtimeStageId} value={candidate.runtimeStageId}>{candidate.runtimeStageId} · {candidate.status}</SelectItem>)}</SelectContent>
+        </Select>
+        {mapping.state !== "mapped" ? <p role="status">{mapping.message}</p> : null}
         <VisualizationDisplayPassesControl items={[
           { id: "surface", label: "Surface", pressed: active?.surface ?? false, disabled: !surfaceAvailable || !port, onToggle: () => setDisplay({ surface: !active?.surface }) },
           { id: "wireframe", label: "Wireframe", pressed: active?.wireframe ?? false, disabled: !surfaceAvailable || !port, onToggle: () => setDisplay({ wireframe: !active?.wireframe }) },
@@ -154,13 +141,6 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
           <SelectTrigger aria-label="Antenna quantity"><SelectValue /></SelectTrigger>
           <SelectContent>{Object.entries(inspectionMode ? closed ? ANTENNA_CLOSED_LOOP_QUANTITIES : ANTENNA_RAW_QUANTITIES : ANTENNA_BASIS_QUANTITIES).filter(([id]) => id !== "current_density" || currentAvailable).map(([id, spec]) => <SelectItem key={id} value={id}>{spec.label} [{spec.unit}]</SelectItem>)}</SelectContent>
         </Select>
-        <FormField label="Inspection execution" type="select" value={inspectionMapping.state === "mapped" ? inspectionMapping.runtimeStageId : ""} disabled={inspectionMapping.candidates.length === 0} onChange={(event) => {
-          const runtimeStageId = event.target.value;
-          if (owner && stageId && execution.data && inspectionMapping.candidates.some((candidate) => candidate.runtimeStageId === runtimeStageId)) {
-            setInspectionSelection({ authoredStageId: stageId, runtimeStageId, runId: execution.data.run_id, identity: owner });
-            visualization.setAntennaFieldIntent(null);
-          }
-        }}><option value="" disabled>Select an execution</option>{inspectionMapping.candidates.map((candidate) => <option key={candidate.runtimeStageId} value={candidate.runtimeStageId}>{candidate.runtimeStageId} · {candidate.status}</option>)}</FormField>
         <FormField label="Snapshot" type="select" value={inspectionMode ? "inspection" : "basis"} onChange={(event) => { setQuantity(effectiveQuantity); setDisplaySource(event.target.value); visualization.setAntennaFieldIntent(null); }}><option value="basis" disabled={!basisAvailable}>Published per-ampere basis</option><option value="inspection" disabled={!rawAvailable}>Inspection only · raw current · NOT VERIFIED</option></FormField>
         <FormField label="Port mode" type="select" disabled={!available} value={port} onChange={(event) => { setPreferredPort(event.target.value); setDisplay({ portModeId: event.target.value }); }}><option value="" disabled>Select a published port</option>{ports.map((id) => <option key={id} value={id}>{id}</option>)}</FormField>
         <p role="status">{available ? inspectionMode ? `${perAmpereInspection ? "Signed per-A snapshot" : "Raw recorded drive"} ${quantitySpec.label} [${quantitySpec.unit}], inspection only · NOT VERIFIED; not a reusable basis, source FFT or LLG drive.` : "Per-ampere published snapshot; waveform scaling is not applied." : unavailableReason}</p>

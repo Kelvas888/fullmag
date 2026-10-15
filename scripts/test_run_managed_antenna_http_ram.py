@@ -1,12 +1,106 @@
 """Interpreted lifecycle/isolation regressions; never compile native tests."""
 import copy
 import json
+import io
 from pathlib import Path
 import subprocess
+import shutil
+import sys
 
 import pytest
 from scripts import run_managed_antenna_http_ram as gate
-from scripts import run_managed_antenna_ram as ram
+import run_managed_antenna_ram as ram
+
+
+def test_sha_supports_container_python_without_file_digest(tmp_path, monkeypatch):
+    monkeypatch.delattr(gate.hashlib, "file_digest", raising=False)
+    payload = b"abc" * 30000
+    path = tmp_path / "bounded-tool.py"
+    path.write_bytes(payload)
+    assert gate.sha(path) == gate.hashlib.sha256(payload).hexdigest()
+
+
+def test_http_error_preserves_bounded_real_failure(monkeypatch):
+    class Opener:
+        def open(self, url, timeout):
+            raise gate.HTTPError(url, 404, "missing", {}, io.BytesIO(b"x" * 9000))
+    monkeypatch.setattr(gate, "build_opener", lambda *args: Opener())
+    with pytest.raises(ValueError) as caught:
+        gate.get_json("/missing")
+    assert caught.value.diagnostic["status"] == 404
+    assert gate.base64.b64decode(caught.value.diagnostic["body_base64"]) == b"x" * 9000
+    assert caught.value.diagnostic["body_truncated"] is False
+
+
+def terminal_status():
+    return {"session": {"session_id": "session", "session_epoch": "scientific@123",
+                        "request_scope_epoch": "api-instance:7"},
+            "run": {"run_id": "run"}, "resources": {"fields": {"revision": 3}},
+            "lifecycle": {"connectivity": "connected"}}
+
+
+def owner_error(code):
+    message = "terminal_snapshot_owner_stale" if code == 409 else "invalid terminal snapshot owner header"
+    error_code = message if code == 409 else "bad_request"
+    return json.dumps({"code": error_code, "error": message, "message": message}).encode()
+
+
+def test_terminal_owner_probe_checks_real_rejections_without_scientific_injection(monkeypatch):
+    requests = []
+    status = terminal_status()
+    monkeypatch.setattr(gate, "get_json", lambda path: status)
+    class Opener:
+        def open(self, request, timeout):
+            assert timeout == 5
+            assert request.full_url.endswith("/internal/live/snapshot")
+            body = json.loads(request.data)
+            assert set(body) == {"session_id", "metadata"}
+            guard = json.loads(request.get_header("X-fullmag-terminal-owner"))
+            requests.append(guard)
+            code = 400 if "unknown" in guard else 409
+            raise gate.HTTPError(request.full_url, code, "rejected", {}, io.BytesIO(owner_error(code)))
+    monkeypatch.setattr(gate, "build_opener", lambda *args: Opener())
+    result = gate.reject_stale_terminal_owners()
+    assert result["status"] == "pass" and len(result["cases"]) == 5
+    assert result["concurrent_race_qualified"] is False
+    assert result["timeout_qualified"] is False
+    assert requests[0]["session_epoch"] == 7
+    assert requests[1]["session_epoch"] == 8
+
+
+@pytest.mark.parametrize("failure", ["accepted", "wrong_code", "oversized", "changed_resources",
+                                     "changed_lifecycle", "unrelated_error", "wrong_guard_code"])
+def test_terminal_owner_probe_fails_closed(monkeypatch, failure):
+    calls = []
+    def status(path):
+        value = terminal_status()
+        if calls and failure == "changed_resources":
+            value["resources"]["fields"]["revision"] = 4
+        if calls and failure == "changed_lifecycle":
+            value["lifecycle"]["connectivity"] = "degraded"
+        return value
+    monkeypatch.setattr(gate, "get_json", status)
+    class Response:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+    class Opener:
+        def open(self, request, timeout):
+            calls.append(request)
+            if failure == "accepted": return Response()
+            guard = json.loads(request.get_header("X-fullmag-terminal-owner"))
+            code = 400 if "unknown" in guard else 409
+            if failure == "wrong_code": code = 500
+            body = b"x" * 5000 if failure == "oversized" else owner_error(code)
+            if failure == "unrelated_error": body = b'{}'
+            if failure == "wrong_guard_code" and code == 400:
+                detail = json.loads(body)
+                detail["code"] = "unrelated_error"
+                body = json.dumps(detail).encode()
+            raise gate.HTTPError(request.full_url, code, "rejected", {}, io.BytesIO(body))
+    monkeypatch.setattr(gate, "build_opener", lambda *args: Opener())
+    with pytest.raises(ValueError):
+        gate.reject_stale_terminal_owners()
 
 
 def document(tmp_path):
@@ -39,6 +133,102 @@ def test_readonly_tools_are_distinct_from_capsule_and_state_is_ram(tmp_path):
     assert service["environment"]["FULLMAG_STATE_ROOT"] == "/ram/workspace/.fullmag"
     assert service["environment"]["FULLMAG_STATE_DIR"] == "/ram/user-state"
     assert service["command"] == ["python3", "-I", "-B", "/tools/run_managed_antenna_http_ram.py", "execute"]
+
+
+def test_cold_mode_is_explicit_and_does_not_change_isolation(tmp_path):
+    warm = document(tmp_path)
+    cold = gate.http_spec("sha256:" + "a" * 64, tmp_path / "source",
+        tmp_path / "package", tmp_path / "input", tmp_path / "export", tmp_path / "tools", True)
+    warm["services"]["antenna"]["command"].append("--verify-cold-import")
+    assert cold == warm
+    with pytest.raises(ValueError, match="Invalid cold import gate mode"):
+        gate.http_spec("image", tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, "yes")
+
+
+def test_standalone_command_is_explicit_and_preserves_isolation(tmp_path):
+    warm = document(tmp_path)
+    standalone = gate.http_spec("sha256:" + "a" * 64, tmp_path / "source",
+        tmp_path / "package", tmp_path / "input", tmp_path / "export", tmp_path / "tools",
+        standalone=True)
+    warm["services"]["antenna"]["command"].append("--standalone")
+    assert standalone == warm
+    with pytest.raises(ValueError, match="standalone gate mode"):
+        gate.http_spec("image", tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, standalone="yes")
+
+
+@pytest.mark.parametrize("mutation", [None, "fields", "missing_catalog", "malformed_catalog",
+    "duplicate_m", "capability", "solver", "materialization", "requestable", "materializable",
+    "mesh", "ownership"])
+def test_standalone_read_model_rejects_magnetic_carriers_and_stale_ownership(monkeypatch, mutation):
+    entries = [{"id": quantity, "capability_state": "unsupported", "solver_capability": "unsupported",
+                "materialization_state": "unsupported", "requestable": False, "materializable": False}
+               for quantity in ("m", "H_eff", "H_demag")]
+    fields, catalog, mesh = {"quantities": []}, {"quantities": entries}, {"revision": 1}
+    if mutation == "fields": fields["quantities"] = [{"quantity_id": "m"}]
+    elif mutation == "missing_catalog": entries.pop()
+    elif mutation == "malformed_catalog": entries.append("m")
+    elif mutation == "duplicate_m": entries.append(dict(entries[0]))
+    elif mutation == "capability": entries[0]["capability_state"] = "supported"
+    elif mutation == "solver": entries[0]["solver_capability"] = "supported"
+    elif mutation == "materialization": entries[0]["materialization_state"] = "complete"
+    elif mutation in ("requestable", "materializable"): entries[0][mutation] = True
+    elif mutation == "mesh": mesh["mesh_summary"] = {"node_count": 4}
+    calls = []
+    def fetch(path):
+        calls.append(path)
+        if path.endswith("/status"):
+            status = terminal_status()
+            if mutation == "ownership" and len(calls) > 1:
+                status["session"]["request_scope_epoch"] = "other:8"
+            return status
+        return {"/v2/sessions/current/data/fields": fields,
+                "/v2/sessions/current/data/quantities": catalog,
+                "/v2/sessions/current/meshing/summary": mesh}[path]
+    monkeypatch.setattr(gate, "get_json", fetch)
+    if mutation is None:
+        result = gate.check_standalone_read_model()
+        assert result["status"] == "pass"
+        assert result["transition_from_magnetic_session_qualified"] is False
+        assert result["field_catalog"] == fields
+        assert len(calls) == 5
+    else:
+        with pytest.raises(ValueError, match="Standalone"):
+            gate.check_standalone_read_model()
+
+
+@pytest.mark.parametrize("mutation", [None, "missing_proof", "wrong_variant", "input", "manifest"])
+def test_standalone_http_observer_requires_bound_input_and_read_model_proof(tmp_path, monkeypatch, mutation):
+    root, receipt, result, observed, _ = retained_gate(tmp_path, monkeypatch)
+    generated = b"standalone fixture"
+    script = root / "input" / ram.SCRIPT_NAME
+    script.write_bytes(generated)
+    hashes = {**receipt["fixture_sha256"], ram.SCRIPT_NAME: gate.sha(script)}
+    monkeypatch.setattr(ram, "fixture_identity", lambda *args, **kwargs: ({}, hashes, generated))
+    manifest = {"tools_sha256": receipt["tools_sha256"], "fixture_sha256": hashes,
+                "fixture": "magnetic", "fixture_script": ram.SCRIPT_NAME,
+                "solver_capsule_attribution": False, "fixture_variant": "standalone"}
+    if mutation == "manifest": manifest["fixture_variant"] = "magnetic_probe"
+    (root / "tools/manifest.json").write_text(json.dumps(manifest))
+    spec = json.loads((root / "compose.json").read_text())
+    spec["services"]["antenna"]["command"].append("--standalone")
+    observed["Config"]["Cmd"] = spec["services"]["antenna"]["command"]
+    (root / "compose.json").write_text(json.dumps(spec))
+    receipt.update(fixture_variant="standalone", fixture_script=ram.SCRIPT_NAME, fixture_sha256=hashes,
+                   tool_manifest_sha256=gate.sha(root / "tools/manifest.json"),
+                   compose_sha256=gate.sha(root / "compose.json"))
+    result.update(fixture_variant="standalone", standalone_read_model={"status": "pass"},
+                  standalone_restarted_read_model={"status": "pass"},
+                  tool_manifest_sha256=receipt["tool_manifest_sha256"])
+    if mutation == "missing_proof": result.pop("standalone_read_model")
+    elif mutation == "wrong_variant": result["fixture_variant"] = "magnetic_probe"
+    elif mutation == "input": script.write_bytes(b"changed input")
+    (root / "receipt.json").write_text(json.dumps(receipt))
+    (root / "export/gate-result.json").write_text(json.dumps(result))
+    if mutation is None:
+        assert gate.observe(tmp_path, root)["state"] == "cold_http_pass_resources_retained"
+    else:
+        with pytest.raises(ValueError):
+            gate.observe(tmp_path, root)
 
 
 @pytest.mark.parametrize("mutation", ["tools_rw", "ports", "network", "state", "image", "command", "tmpfs"])
@@ -83,6 +273,16 @@ def test_tool_manifest_matches_actual_import_dependencies():
     assert set(manifest) == set(gate.TOOLS)
     assert "antenna_current_source_oracle.py" in manifest
     assert "run_managed_antenna_ram.py" not in manifest
+
+
+def test_cold_probe_imports_with_only_pinned_tools_in_isolated_python(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    for name in gate.TOOLS:
+        shutil.copyfile(repo / "scripts" / name, tmp_path / name)
+    code = "import sys; sys.path.insert(0,sys.argv[1]); import antenna_inspection_cold_import_check"
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(tmp_path)],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("script,status", [
@@ -334,3 +534,140 @@ def test_wrong_200_stage_is_retained_but_correct_stage_writes_no_failure(tmp_pat
     monkeypatch.setattr(gate, "get_json", lambda path: correct)
     assert gate.wait_inspection(tmp_path) == correct
     assert not (tmp_path / "inspection-failure-diagnostic.json").exists()
+def retained_gate(tmp_path, monkeypatch):
+    import fullmag_storage as storage
+    import verify_saved_fem_archive_roundtrip as archive
+    root = tmp_path / "runs" / ("1" * 32)
+    root.mkdir(parents=True)
+    for name in ("tools", "input", "export"):
+        (root / name).mkdir()
+    fixture = root / "input/fem_antenna_current_source_inspection.py"
+    fixture.write_bytes(b"fixed")
+    fixtures = {fixture.name: gate.sha(fixture)}
+    monkeypatch.setattr(ram, "FIXTURE_FILES", fixtures)
+    tools = root / "tools"
+    for name in gate.TOOLS:
+        (tools / name).write_bytes(name.encode())
+    tool_digests = gate.tool_manifest(tools)
+    (tools / "manifest.json").write_text(json.dumps({"tools_sha256": tool_digests,
+        "fixture_sha256": fixtures, "fixture": "magnetic",
+        "fixture_script": fixture.name, "solver_capsule_attribution": False}))
+    build, capsule, package = tmp_path / "build", tmp_path / "capsule", tmp_path / "package"
+    (build / "artifacts").mkdir(parents=True)
+    (build / "artifacts/build-receipt.json").write_bytes(b"build receipt")
+    native = {"head_commit_full": "a" * 40, "source_snapshot_sha256": "b" * 64,
+              "source_snapshot_dirty": True}
+    image = "sha256:" + "c" * 64
+    spec = gate.http_spec(image, capsule / "tree", package, root / "input", root / "export", tools)
+    (root / "compose.json").write_text(json.dumps(spec))
+    receipt = {"schema": gate.SCHEMA, "run_root": str(root),
+        "compose_sha256": gate.sha(root / "compose.json"), "managed_job_id": "d" * 32,
+        "source_digest": "e" * 64, "native_source_identity": native, "image_digest": image,
+        "tools_sha256": tool_digests, "tool_manifest_sha256": gate.sha(tools / "manifest.json"),
+        "fixture_sha256": fixtures, "build_receipt_sha256": gate.sha(build / "artifacts/build-receipt.json"),
+        "compose_project": "fullmag-antenna-http-ram-" + root.name, "container_id": "owned",
+        "fixture": "magnetic", "fixture_script": fixture.name}
+    (root / "receipt.json").write_text(json.dumps(receipt))
+    (root / "export/snapshot.fms").write_bytes(b"controlled native archive fixture" * 2)
+    metadata = {"runtime_stage_id": "stage-000", "outputs": [{"inspection_ref": {"content_digest": "sha256:fixture"}}]}
+    for name in ("inspection-metadata.json", "cold-inspection-metadata.json"):
+        (root / "export" / name).write_text(json.dumps(metadata))
+    result = {"schema": gate.SCHEMA, "state": "cold_http_pass", "solver_exit_code": 0,
+        "cold_archive_import": "PASS", "cold_solver_executed": False,
+        "cold_process_state_root": "/ram/cold-state", "warm_api_pid": 10, "cold_api_pid": 20,
+        "archive_sha256": gate.sha(root / "export/snapshot.fms"),
+        "native_canonical_bundle_redecoded": True, "physics_qualified": False,
+        "durable_session_storage_qualified": False, "reuse_LLG_FFT_qualified": False,
+        "tool_manifest_sha256": receipt["tool_manifest_sha256"]}
+    (root / "export/gate-result.json").write_text(json.dumps(result))
+    for log in ("api.log", "solver.log", "cold-api.log"):
+        (root / "export" / log).write_text("startup")
+    (root / "export/result.zarr").mkdir()
+    monkeypatch.setattr(storage, "resolve_layout", lambda *args: {"build_root": str(tmp_path)})
+    def resolved(*args):
+        assert args[1:] == ("d" * 32, "a" * 40, "e" * 64, "b" * 64)
+        return {}, build, {"image_digest": image}, {"native_source_identity": native}, capsule, package
+    monkeypatch.setattr(gate, "resolved", resolved)
+    observed = inspection(spec)[0]
+    observed["Config"]["Labels"]["com.docker.compose.project"] = receipt["compose_project"]
+    observed["State"] = {"Status": "exited", "Running": False, "ExitCode": 0,
+                         "OOMKilled": False, "Error": ""}
+    monkeypatch.setattr(ram, "docker", lambda *args: json.dumps([observed]))
+    stamps = []
+    monkeypatch.setattr(archive, "check_stamp", lambda *args, **kwargs: stamps.append((args, kwargs)))
+    return root, receipt, result, observed, stamps
+
+
+def test_terminal_gate_verifies_both_startup_identities(tmp_path, monkeypatch):
+    root, receipt, _, _, stamps = retained_gate(tmp_path, monkeypatch)
+    result = gate.observe(tmp_path, root)
+    assert result["state"] == "cold_http_pass_resources_retained"
+    assert len(stamps) == 3
+    assert all(args[1:] == ("a" * 40, "b" * 64) and kwargs == {"dirty": True}
+               for args, kwargs in stamps)
+    stored = json.loads((root / "receipt.json").read_text())
+    assert stored["cold_archive_import"] == "PASS"
+    assert stored["gate_result_sha256"] == gate.sha(root / "export/gate-result.json")
+
+
+@pytest.mark.parametrize("mutation", ["exit", "oom", "result", "scope", "canonical",
+    "tools", "fixture", "image", "startup"])
+def test_failed_or_tampered_terminal_gate_cannot_pass(tmp_path, monkeypatch, mutation):
+    import verify_saved_fem_archive_roundtrip as archive
+    root, receipt, result, observed, _ = retained_gate(tmp_path, monkeypatch)
+    if mutation == "exit": observed["State"]["ExitCode"] = 1
+    elif mutation == "oom": observed["State"]["OOMKilled"] = True
+    elif mutation == "result": result["state"] = "failed"
+    elif mutation == "scope": result["physics_qualified"] = True
+    elif mutation == "canonical": result["native_canonical_bundle_redecoded"] = False
+    elif mutation == "tools": (root / "tools" / gate.TOOLS[1]).write_bytes(b"changed")
+    elif mutation == "fixture": (root / "input/fem_antenna_current_source_inspection.py").write_bytes(b"changed")
+    elif mutation == "image": receipt["image_digest"] = "sha256:" + "f" * 64
+    elif mutation == "startup":
+        def reject(*args, **kwargs): raise ValueError("startup identity differs")
+        monkeypatch.setattr(archive, "check_stamp", reject)
+    (root / "receipt.json").write_text(json.dumps(receipt))
+    (root / "export/gate-result.json").write_text(json.dumps(result))
+    with pytest.raises(ValueError):
+        gate.observe(tmp_path, root)
+
+
+def test_live_gate_remains_pending_without_success_receipt(tmp_path, monkeypatch):
+    root, _, _, observed, stamps = retained_gate(tmp_path, monkeypatch)
+    observed["State"].update(Status="running", Running=True)
+    assert gate.observe(tmp_path, root)["state"] == "pending"
+    assert not stamps
+
+
+@pytest.mark.parametrize("mutation", [None, "missing", "durability", "root", "scope", "receipt", "archive"])
+def test_cold_gate_requires_retained_roundtrip_evidence(tmp_path, monkeypatch, mutation):
+    root, receipt, result, observed, _ = retained_gate(tmp_path, monkeypatch)
+    spec = json.loads((root / "compose.json").read_text())
+    spec["services"]["antenna"]["command"].append("--verify-cold-import")
+    observed["Config"]["Cmd"] = spec["services"]["antenna"]["command"]
+    (root / "compose.json").write_text(json.dumps(spec))
+    receipt.update(verify_cold_import=True, compose_sha256=gate.sha(root / "compose.json"))
+    archive = root / "export/antenna-cold.fms"
+    archive.write_bytes(b"archive" * 10)
+    cold = {"status": "pass", "durable_session_storage_qualified": False,
+        "physics_qualified": False, "reuse_LLG_FFT_qualified": False,
+        "api_process_restarted": False, "original_output_restored": True,
+        "original_root_unavailable_during_import_and_reads": True,
+        "old_request_scope_rejected": True, "warm_request_scope": "instance:1",
+        "cold_request_scope": "instance:2",
+        "archive": {"bytes": archive.stat().st_size, "sha256": gate.sha(archive)}}
+    result.update(cold_archive_import="PASS", cold_import_result=cold)
+    if mutation == "missing": result.pop("cold_import_result")
+    elif mutation == "durability": cold["durable_session_storage_qualified"] = True
+    elif mutation == "root": cold["original_root_unavailable_during_import_and_reads"] = False
+    elif mutation == "scope": cold["cold_request_scope"] = cold["warm_request_scope"]
+    elif mutation == "archive": archive.write_bytes(b"changed" * 10)
+    (root / "export/cold-import-result.json").write_text(json.dumps({} if mutation == "receipt" else cold))
+    (root / "receipt.json").write_text(json.dumps(receipt))
+    (root / "export/gate-result.json").write_text(json.dumps(result))
+    if mutation is None:
+        gate.observe(tmp_path, root)
+        assert json.loads((root / "receipt.json").read_text())["cold_archive_import"] == "PASS"
+    else:
+        with pytest.raises(ValueError):
+            gate.observe(tmp_path, root)

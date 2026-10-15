@@ -20,11 +20,14 @@ mod archive_source;
 pub mod capture;
 pub mod cas;
 pub mod communication_policy;
+pub mod compute_node_policy;
+pub mod compute_node_snapshot;
 pub mod dataset_slice_adapter;
 mod durability;
 mod development_owner;
 pub mod development_restart_transport;
 pub mod execution_profiles;
+pub mod frequency_domain_artifact_generation;
 pub mod fms;
 pub mod host_resource_ledger;
 pub mod mesh_operation;
@@ -32,12 +35,14 @@ pub mod materialized_dataset;
 pub mod reachability;
 pub mod repository_path;
 pub mod runtime_service;
+pub mod runtime_service_host;
 pub mod runtime_service_startup;
 pub mod solution_set_catalog;
 pub mod solution_field_geometry;
 pub mod solution_scalar_source;
 pub mod solution_tensor_field;
 pub mod solution_tensor_source;
+pub mod task_cancellation;
 pub mod store;
 pub mod types;
 mod typed_documents;
@@ -62,8 +67,14 @@ pub use durability::{
     PublicationUncertain, WriterReleaseUnconfirmed,
 };
 pub use fms::{
-    inspect_fms, pack_fms, pack_fms_file, preflight_fms, preflight_fms_staged, unpack_fms, unpack_fms_staged, FmsPreflight, FmsStagedPreflight, PackOptions,
+    inspect_fms, pack_fms, pack_fms_file, preflight_fms, preflight_fms_staged,
+    unpack_fms, unpack_fms_for_visualization, unpack_fms_staged, FmsPreflight,
+    FmsStagedPreflight, PackOptions,
 };
 pub use store::{CheckpointStillReferenced, GcPlan, RunBacklogFull, SessionStore};
+pub use task_cancellation::{
+    FmsTaskCancellationIntent, TaskCancellationIntentCommitDisposition,
+    TaskCancellationIntentConflict, FMS_TASK_CANCELLATION_INTENT_SCHEMA,
+};
 pub use types::*;
 pub use writer::{StoreWriterBusy, WriteTransaction};

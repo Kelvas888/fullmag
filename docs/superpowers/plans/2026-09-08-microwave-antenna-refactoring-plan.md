@@ -1,5 +1,2040 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Checkpoint T03, 2026-10-11 — przenośne ID i przekazanie do recenzji:**
+
+`script_pipeline_compilation.rs::materialize_script_pipeline_with_output_policy_bounded`
+generuje teraz `script-execution-<SHA>` zamiast `script-execution:<SHA>`.
+Dwukropek jest odrzucany przez
+`crates/fullmag-session/src/repository_path.rs::validate_store_id`.
+Tekst autorskiego ID pozostaje w provenance i wejściu hasha, nie w ścieżce.
+Dodano źródłową regresję
+`execution_ids_are_portable_even_when_authored_ids_are_not_path_components`
+z autorskim ID zawierającym Unicode, slash i dwukropek. Rustfmt check obu
+plików exit 0; testu Rust nie kompilowano ani nie wykonano.
+
+Read-only inspekcja wykazała osobną lukę kolejności: Study topological_order
+nie jest barierą schedulera. Niezależne accepted kroki mogą być wybierane
+równolegle, a raw antenna worker odrzuca input adapters. Nie dodano fikcyjnych
+portów Artifact ani nie uznano kolejności snapshotów za gwarancję wykonania.
+Jawny kontrakt zależności sterowania i rzeczywiste porty basis→LLG pozostają
+do implementacji. T03 nie zamknięto.
+
+Na żądanie użytkownika przygotowano checkpoint WIP wszystkich lokalnych
+zmian do publikacji na branchu zadania, bez merge do mastera. Prompt dla
+niezależnej recenzji znajduje się w
+`docs/superpowers/plans/2026-10-11-microwave-antenna-pro-review-prompt.md`.
+Publikacja nie certyfikuje builda, aktualnego runtime, UI ani nauki.
+
+**Checkpoint T03, 2026-10-11 — kanoniczny wybór definicji/portu w snapshotach:**
+
+Inspekcja obecnych konsumentów wykazała, że katalog przechowuje ProblemIR,
+nie ResolvedScriptStageAction; preparation i accepted worker ponownie używają
+zwykłego `fullmag_plan::plan`. Sam helper typowanej akcji nie wystarczał do
+odtworzenia wyboru z wielodefinicyjnego pipeline.
+
+`crates/fullmag-ir/src/study.rs::AntennaFieldSolveSelectionIR` dodaje
+`stage_id: String` i `port_mode_id: String` w opcjonalnym
+`StudyIR::AntennaFieldSolve.selection`. Są to bezwymiarowe identyfikatory
+już zadeklarowanego modelu, nie nowa fizyka ani solver configuration.
+Brak/null serializuje się bez selection i zachowuje historyczne reguły.
+Obiekt wyboru odrzuca nieznane pola; `ProblemIR::validate` wymaga dokładnie
+jednej pasującej definicji oraz zawartego w niej niepustego portu.
+Nieprawidłowy jawny wybór nie przechodzi do fallbacku active_stage_id.
+
+`crates/fullmag-application/src/script_stage_materialization.rs::standalone_antenna_study`
+wiąże wybór z rzeczywistą akcją, osobno dla flat i pipeline.
+`packages/fullmag-py/src/fullmag/runtime/run_config_export.py::_runtime_stage_action`
+serializuje te same referencje w niemagnetycznym stage IR, przed eksportem
+sprawdzając dokładnie jeden port. Wcześniejsze definicje nie są usuwane.
+Publiczny builder anteny pozostaje źródłem wyboru; nie dodano kolejnego
+parametru użytkownika ani wyboru zależnego od nazwy obiektu.
+
+`crates/fullmag-plan/src/antenna_field_solve.rs::plan_standalone_antenna`
+korzysta z kanonicznego wyboru, a `plan_antenna_external_lead_inspection`
+odrzuca niezgodną akcję. `study_catalog.rs::capture_study_input_references`
+hashuje całe IR, więc selection jest objęte dotychczasowym v3 fingerprintem
+bez nowego schematu katalogu. Źródłowa regresja application wymaga zgodności
+planu jawnej akcji ze zwykłym plannerem dla dwóch definicji i zmiany pinu
+po zmianie wyłącznie selection. Rust IR/planner mają regresje optional wire,
+odmów błędnych referencji i braku fallbacku; ich wykonanie pozostaje otwarte.
+
+Interpretowane `test_antenna_standalone_authoring`: 10/10 PASS, pliki tmp
+w istniejącym storage na D. Pierwsza próba w sandboxie dała cztery błędy
+braku zapisywalnego tmp; powtórzenie z właściwymi uprawnieniami zakończyło
+się exit 0. Rust parser/diff PASS nie oznacza kompilacji. Brak jeszcze
+terminalnego buildu tego przyrostu, accepted runtime ani UI qualification.
+Pełny compiler katalogu, stanowe porty i kwalifikowana baza nadal wymagane.
+T03 pozostaje otwarte; checkpoint nie jest publikacją terminalnej noty naukowej.
+
+Review wskazał konieczność pokrycia także ProblemIRV04 oraz odmowy starego
+captured digest. Uzupełniono wspólny
+`StudyIR::validate_antenna_selection`, wywoływany przez obie realizacje IR,
+regresję `both_ir_versions_reject_a_missing_antenna_selection_reference`
+oraz `study_catalog.rs::tests::captured_identity_rejects_a_selection_only_change`.
+Ta ostatnia utrzymuje wszystkie inne bajty IR, w tym metadata i pełną
+inwentaryzację, zmienia wyłącznie selection, wymaga innego SHA i odmowy
+starej identity. W każdym snapshotcie regression application sprawdza
+zachowanie obu definicji. Są to uzupełnienia źródłowe, bez wykonania Rust.
+
+**Checkpoint T03, 2026-10-11 — wspólne planowanie dokładnej akcji inspekcji:**
+
+`crates/fullmag-application/src/script_antenna_inspection_planning.rs::plan_script_antenna_inspection`
+przejmuje istniejącą kontrolę z prywatnego CLI carrier. Ponownie rozwiązuje
+model według jawnych `input.stage.id` i `input.port.id`, następnie porównuje
+całe typowane wejście, requested execution i output. Różnica jest błędem;
+metadata autora pozostaje nietknięte. CLI
+`crates/fullmag-cli/src/orchestrator/antenna_external_lead_inspection/carrier.rs::plan_carrier`
+deleguje do wspólnego właściciela zamiast utrzymywać drugą realizację kontroli.
+Nie zmieniono równań, polityki fizycznej ani schematów publicznych.
+
+Dodano źródłowe regresje w
+`crates/fullmag-application/src/script_antenna_inspection_planning_tests.rs`:
+`exact_action_plans_each_definition_without_rewriting_authored_activation`
+materializuje dwie różne definicje w tym samym pipeline i planuje każdą
+według jej akcji bez fallbacku do selektora autorskiego;
+`stale_input_execution_and_output_are_rejected_independently` odrzuca
+osobno zmienioną przewodność wejścia, precision i output. To testy napisane,
+nie wykonane. Rustfmt parser/diff PASS i niezależny review źródłowy bez
+wymaganych poprawek nie zastępują builda/runtime/nauki.
+
+Odczyt kolejki potwierdził job `5414da4f92414d3b9281a0a18aee2bf3`
+w stanie queued, exit null; jego kapsuła nie obejmuje tego przyrostu.
+Pojedyncza sonda container-status odmówiła żądania koordynatora, ale ponowny
+odczyt tego samego joba przez API zakończył się exit 0. Nie anulowano joba,
+nie restartowano runnera ani workspace użytkownika. Nadal wymagane są
+typowane lowering akcji do accepted catalog, porty stanów i pełna
+kwalifikacja. Wspólny helper nie zamyka T03 ani nie promuje raw H do bazy.
+
+**Checkpoint T03, 2026-10-11 — ID autora a definicja samodzielnego solve:**
+
+`crates/fullmag-plan/src/antenna_field_solve.rs::plan_standalone_antenna`
+wybiera jedyną definicję solve niezależnie od autorskiego `active_stage_id`.
+Przy wielu definicjach zachowuje dokładny historyczny selektor ID i odmawia
+przy braku dopasowania albo duplikatach; nie wybiera pierwszej definicji.
+Nie zmienia metadata, nie dodaje publicznego pola IR ani nie kwalifikuje bazy.
+Regresje w `crates/fullmag-plan/src/antenna_current_source.rs::tests`
+porównują cały plan i sprawdzają zachowanie metadata oraz odmowy.
+Review źródłowy selektora nie wskazał blokera; Rust pozostaje niewykonany.
+
+`crates/fullmag-application/src/script_pipeline_compilation_tests.rs::standalone_antenna_pipeline_replans_without_conflating_authored_and_physical_ids`
+dodaje integracyjną regresję źródłową: grupa zawiera dwa różne węzły autora
+korzystające z jednej definicji solve. Test przechodzi przez rzeczywisty
+materializer i ponowne `fullmag_plan::plan`; wymaga osobnych ID wykonania,
+zachowanych przodków i autorskiej aktywacji oraz tego samego fizycznego planu.
+Fixture `tests/fixtures/runtime/antenna-standalone-pipeline.json` pochodzi
+z istniejącego przykładu Python z usuniętym wyłącznie magnetyzmem probe;
+ścieżki i metadata źródłowe są znormalizowane, siatki i prądy pozostają dokładne.
+`packages/fullmag-py/tests/test_antenna_standalone_authoring.py::AntennaStandaloneAuthoringTests.test_rust_pipeline_fixture_matches_actual_standalone_python_inputs`
+wykonano: 1/1 PASS. To dowód pochodzenia wejść Python, nie wykonania Rust,
+solvera, HTTP ani UI. Parser rustfmt i `git diff --check` PASS.
+Aktualne testy Rust nie były kompilowane zgodnie z obowiązującym zakazem.
+Wielodefinicyjny pipeline nadal wymaga jawnego typowanego selektora przy
+lowering akcji do katalogu wykonania; ten checkpoint nie zamyka T03.
+
+**Checkpoint T03, 2026-10-11 — rozdzielenie drzewa autora i ekspansji wykonania:**
+
+Nowy `crates/fullmag-application/src/script_pipeline_compilation.rs::materialize_script_pipeline_with_output_policy_bounded`
+zwraca ScriptPipelineCompilation: oryginalny typowany pipeline i jego
+kanoniczny SHA, inventory wszystkich węzłów z inherited enablement oraz
+listę rzeczywistych ResolvedScriptStage. Istniejący bounded materializer
+wywoływany jest dokładnie raz. Dodatkowy traversal jedynie indeksuje
+deklaracje, nie interpretuje payloadów, nie ekspanduje makr ani nie
+produkuje własnego ProblemIR. Zachowuje także mutator po ostatnim
+wykonaniu oraz wyłączone poddrzewa. Grupa i mutator nie otrzymują
+fikcyjnego wykonania ani skopiowanego bazowego IR.
+
+Wiązanie sprawdza authored ID, przodków, effective enablement i ciągłość
+expansion_index. execution_id powstaje deterministycznie z kanonicznego
+rekordu fullmag.script-execution-identity.v1 (authored_step_id i indeks);
+kolizja wygenerowanych ID jest błędem. ID identyfikuje pozycję rozwinięcia,
+nie bajty modelu ani globalny run. Przyszłe zasoby wymagają nadal scope
+projekt/run i fingerprintu. active_stage_id zachowuje autorską semantykę
+aktywacji drives; nie zastąpiono go ID wykonań. Wynik aplikacyjny nie
+zmienia serde schematów StudyPlan/ProblemIR ani nie jest accepted catalog.
+
+Dodano siedem regresji źródłowych: pełne drzewo/control→macro→control,
+deterministyczne ID przy zmianie etykiety, kolizja/brak pipeline,
+empty/all-disabled bez legacy solve, limit makra, primitive po makrze
+z nowym prądem oraz odmowa mixed explicit/pipeline input.
+Rustfmt --edition 2021 --check nowych plików i git diff --check PASS.
+Niezależny review źródłowy nie wykrył blokera; uzupełniono wskazane
+przypadki graniczne. Testów Rust nie kompilowano ani nie uruchamiano.
+Brak jeszcze produkcyjnego konsumenta wyniku; kolejne kroki to typed
+action lowering, content-owned katalog v3, jawne porty stanu oraz
+kwalifikowana baza anteny/projekcja. Raw inspection nie jest tą bazą.
+T03 pozostaje otwarte.
+
+**Checkpoint T01/T14, 2026-10-11 — aktualny snapshot konsumentów w kolejce:**
+
+Runner potwierdził health ok, accepting_jobs=true, worker_alive=true,
+worker_error=null i działający job 57 (42a5ccb122a54981b2cc967fe5407eb7).
+Zgłoszono job **67**, 5414da4f92414d3b9281a0a18aee2bf3,
+request key antenna-cli-provenance-identity-20261011, profile fem-cpu-release.
+Source capsule digest: 2ffb8aab5232182ac597a96b07c04f7a651d93bce682d71da498af66586fde2b.
+Native snapshot SHA: da0e5dede7dc373da17318b338fc4cae2169094b552149e7512fb74b3df8be75.
+HEAD: 41a5b8936b3eaa38420e9ba358cbf22ac7e2d803. Kapsuła obejmuje tracked WIP
+i 37 jawnie sprawdzonych nowych plików, w tym CLI prepare/fingerprint,
+provenance i globalną walidację ID. Edycje wstrzymano do zakończenia capture.
+Stan zgłoszenia queued, bez dowodu kompilacji/runtime. Nowy moduł
+script_pipeline_compilation i jego testy dodano później, więc job 67 ich
+nie obejmuje. Nie uruchomiono drugiego runnera ani hostowego buildu,
+nie przerwano cudzych zadań i nie zmieniono workspace użytkownika.
+
+**Checkpoint T03/T08, 2026-10-11 — globalna tożsamość węzłów pipeline:**
+
+W `crates/fullmag-authoring/src/validation.rs::validate_study_pipeline_nodes`
+zbiór zajętych ID był tworzony osobno dla każdego poziomu drzewa. Pozwalało
+to zaakceptować scenę z tym samym ID w różnych grupach lub z kolizją
+grupa–dziecko, mimo że StudyPlan::validate wymaga unikalności globalnej.
+Walidacja dokumentu przekazuje teraz jeden wspólny BTreeSet do wszystkich
+potomków, także wyłączonych grup. Zachowano kontrole wersji, pustych ID,
+etykiet i istniejące komunikaty błędów.
+
+`crates/fullmag-application/src/script_stage_materialization.rs::materialize_study_pipeline`
+wykonuje analogiczny preflight przez validate_pipeline_node_ids przed
+ekspansją i mutacjami modelu. Direct script capture nie może więc ominąć
+reguły sceny. ID nie są normalizowane ani automatycznie zmieniane; autor
+musi rozstrzygnąć kolizję. Makro nadal może emitować wiele wykonań pod
+jednym autorskim ID, rozróżnionych istniejącym expansion_index; nie są
+to duplikaty dwóch deklaracji. Nie zmieniono StudyPlan ani formatu IR.
+
+Dodano cztery regresje źródłowe authoringu oraz jedną parametryzowaną
+regresję rzeczywistego materializera: rodzeństwo, różne grupy, grupa–dziecko,
+wyłączony potomek i pusty ID. Poprawne zagnieżdżone drzewa pozostają objęte
+testami. Parser rustfmt --edition 2021 --emit stdout obu plików i
+git diff --check PASS; review źródłowe obu zmian bez wykrytego blokera.
+Nie kompilowano ani nie uruchamiano testów Rust. Bieżący odczyt joba 63:
+5d8062970f8a4aaca25881e5e84e9780, queued, exit_code=null. Żaden dotychczasowy
+snapshot nie obejmuje tej późniejszej poprawki. T03/T08 pozostają otwarte;
+zmiana usuwa niejednoznaczność ID, nie wdraża jeszcze pełnego kompilatora
+authoring→execution ani przepływu stanów i baz pola między etapami.
+
+**Checkpoint T03/T14, 2026-10-11 — fingerprint Submit i odczytu CLI:**
+
+`crates/fullmag-cli/src/accepted_run_transport.rs::submit_run_json` parsuje
+teraz kanoniczny RunIntent, wykonuje jego validate i oblicza
+RunIntent::payload_fingerprint przed żądaniem HTTP. Wspólny
+validate_run_receipt wymaga dokładnego run_id i payload_fingerprint zarówno
+w odpowiedzi Submit, jak i późniejszym GET runu. Niezgodny Submit przerywa
+ścieżkę przed POST materialization; GET nadal sprawdza także project_id.
+Fingerprint pochodzi z istniejącego RunSpecification::fingerprint, nie
+z nowego algorytmu ani z hasha surowego JSON. Nie zmieniono schematu API.
+
+Dodano źródłową regresję zgodnego receiptu oraz zmiany, braku, null i
+niewłaściwego typu obu kontrolowanych pól. Rustfmt --edition 2021 --check
+transportu oraz git diff --check PASS. Niezależny review źródłowy nie
+wskazał błędu poprawności. Testów Rust nie kompilowano ani nie uruchamiano;
+test helpera i odczyt kolejności wywołań nie zastępują regresji HTTP,
+która potwierdzi brak materializacji po błędnej odpowiedzi serwera.
+
+Bieżący odczyt runnera: job 66, 3534b67c3e9a4f0d890860c00590d605,
+pozostaje queued, exit_code=null. Jego kapsuła powstała przed zmianami CLI,
+więc nie będzie dowodem ich kompilacji. T03/T14 pozostają otwarte;
+kolejny pełny snapshot konsumentów oraz rzeczywisty test prepare→Submit
+muszą objąć aktualny kod. Nie zmieniono działającego workspace użytkownika.
+
+**Checkpoint T01/T14, 2026-10-11 — zweryfikowany pełny pakiet joba 56:**
+
+Odczytowy `_validate_managed_build` z istniejącego export_runner_openapi
+zweryfikował queue/context/coordinator receipt, trusted inputs, source capsule
+i build receipt wraz z hashami **127 artefaktów** dla joba
+`4dc9fed201aa4a04a97b155999394321`: succeeded, exit 0.
+Przypięte źródła: HEAD `41a5b8936b3eaa38420e9ba358cbf22ac7e2d803`,
+source digest `a6c9bf8cc42446a36667d4a1d1f9df9403adfb85c5fe83053964edeb409026df`,
+native snapshot `e6da8f8672298d3467fee8943902f50d3452f026dc48fd9dab71bdf524ab0e15`.
+Build receipt SHA `acacb4af4b2430690cc3b5b38fe8b2cb512c7717e4d8dbe9c9ef3a234be2ad9c`,
+API binary SHA `168b181774b0d0201baa107a790da4559989d0ee50705c9027f2f3c952ca779f`,
+source manifest SHA `987639c57cafabbd6c31881c3c704470d784b29807b67990e9e87a7ba10d096b`.
+
+Nie uruchomiono tego API ani solvera, nie eksportowano starego OpenAPI i nie
+generowano z niego klienta aktualnego kontraktu. Receipt zachowuje
+qualification=NOT VERIFIED. Job 56 nie dowodzi zmian producer/prepare API/CLI
+ani typowanego provenance dodanych po jego capture. Bezpośrednie bieżące
+odczyty jobów 63, 65 i 66: queued, exit_code=null. Weryfikacja pakietu usuwa
+niepewność integralności joba 56, nie zamyka T01/T14 ani bramek naukowych.
+
+**Checkpoint T03, 2026-10-11 — rzeczywiste powiązanie autorskiego węzła z ekspansją:**
+
+Rozpoznanie kodu potwierdziło, że scene_document_to_study_plan zachowuje
+grupy/controls/makra, a materialize_script_stages_with_output_policy_bounded
+emituje wyłącznie rzeczywiste wykonania. Mutacje modelu mogą emitować None;
+macro ma kilka wyników z tym samym active_stage_id. materialize_study_execution
+wymaga natomiast wejść dla każdego enabled StudyStep. Zatem nie wolno zipować
+tych list ani przypisać jednego bazowego IR wszystkim węzłom. Pipeline ekspanduje
+Rust, nie drugi niezależny walker Python. Istniejące scene capture helpers
+w script.rs nie mają jeszcze produkcyjnego konsumenta poza własnym wrapperem.
+
+Dodano ScriptStageProvenance i opcjonalne ResolvedScriptStage.provenance.
+Ten sam walk_study_pipeline_nodes zapisuje authored_step_id, zerowy lub
+deterministyczny macro expansion_index, ścieżkę ancestor_group_ids oraz
+label/notes/source. Disabled grupy nadal pomijają całe poddrzewo; grupa nie
+tworzy zadania native, a controls nie są zamieniane w fikcyjny solve. Nie
+zmieniono ProblemIR, active_stage_id, kolejności etapów, polityki output ani
+budżetu ekspansji. Nowe dane są oddzielnym typowanym powiązaniem aplikacyjnym,
+nie nowym modelem fizyki i nie publicznym schematem IR.
+
+Źródłowo dodano regresję macro relax→run (dwa indeksy, jedno autorskie ID,
+notes/source), rozszerzono nested-group i disabled-group regressions.
+Review źródłowe nie wskazało blokera; na jego sugestię dodano osobną
+regresję powrotu z inner/outer do rodzeństwa (odpowiednio [outer] i []).
+Parser rustfmt obu plików oraz git diff --check PASS. Testów Rust nie
+kompilowano/uruchamiano. Explicit flat stages nadal korzystają z istniejącego
+active_stage_id w swoim IR; ich provenance konstruktorów pozostaje None.
+Wymagany kolejny fragment: typowany kompilator zachowujący drzewo authoring
+i jawnie mapujący je na rzeczywiste wykonania, porty/stany oraz katalog v3
+przez materialize_captured_study_input, bez ponownego bindu profilu.
+Mutacje modelu i zależności stanów wymagają własnych dowodów; nowy opis źródła
+sam ich nie kwalifikuje. T03 pozostaje otwarte, zmiana po capture joba 66.
+
+**Checkpoint T03/T14, 2026-10-11 — jawny konsument CLI prepare→Submit, źródłowo:**
+
+Dodano Command::PrepareRunJson i
+`crates/fullmag-cli/src/accepted_run_transport.rs::prepare_run_json`.
+Przyjmuje dokładny ProjectRunIntentRequest oraz jawne project_id/API origin,
+wywołuje nowy endpoint, sprawdza RunIntent.validate, wszystkie pola
+RunIntentAuthoring, project/revision oraz lokalnie wyliczony fingerprint.
+`prepared_submission` zwraca dokładnie pięć pól dotychczasowego Submit,
+zachowując wejściowe archive/Study/catalog/asset_paths. Stdout jest JSON
+dla osobnego run-json; brak automatycznego Submit, store, solve i zapisu pliku.
+Nie jest to jeszcze scene/script→Study/ProblemIR compiler ani integracja UI.
+
+Dodano trzy regresje Rust źródłowo: parser osobnej komendy, zachowanie
+Submit shape/exact inputs i odmowy dla zmienionych IDs/revision/key/fingerprint
+oraz priority. Nie kompilowano/uruchamiano testów. Rustfmt check transportu,
+parser main/args i git diff --check PASS. Review wskazało nieograniczony
+Response::text; poprawiono wspólny odczyt response_json na Read::take:
+success maksymalnie 96 MiB + sentinel, błąd maksymalnie 2 KiB przed alokacją.
+Usunięto sprzeczny komentarz komendy. Nie jest to runtime proof.
+Zmiana CLI powstała po capture joba 66 i nie jest objęta jego snapshotem.
+Następny finalny build konsumentów oraz rzeczywisty prepare→Submit test,
+kanoniczny compiler, generated client i UI pozostają do wykonania.
+
+**Checkpoint T03/T14, 2026-10-11 — pełny snapshot producenta i API w kolejce:**
+
+Po zakończeniu capture zgłoszono jeden managed build FEM CPU release:
+job **66**, `3534b67c3e9a4f0d890860c00590d605`, request key
+`antenna-run-intent-api-20261011`, source capsule digest
+`18b900283c8307b678fc618c90c4a68213f8ce36273a21c1c9aad752e38ac489`.
+Native source snapshot SHA:
+`1b59d3a84102fa81a340a952a85fc4e4cb20bf414e2b16e57df6d0a62781ce3f`,
+HEAD `41a5b8936b3eaa38420e9ba358cbf22ac7e2d803` z uwzględnionym dirty WIP.
+Snapshot obejmuje tracked WIP i 37 jawnie wskazanych nowych plików, w tym
+RunIntent producer, API handler, nowe schematy/router/OpenAPI, neutralny
+pakiet anteny oraz narzędzia HTTP/worker. Edycje wstrzymano na czas capture.
+To build release, nie zadanie kompilacji testów jednostkowych; obecność źródeł
+testów w snapshotcie nie oznacza ich wykonania. Nie anulowano starszych jobów.
+
+Przed zgłoszeniem health runnera: ok/accepting_jobs/worker_alive=true,
+worker_error=null, aktywny job 57 running. Job 56 przy bezpośrednim odczycie
+jest succeeded/exit 0; nie przypisano jego sukcesu nowemu producerowi ani API,
+nie zweryfikowano w tym checkpointcie jego receipt i kompletu artefaktów.
+Job 66 pozostaje queued, nie dowodzi kompilacji, runtime, API generation,
+frontend integration ani fizyki. Następna bramka wymaga terminalnego sukcesu,
+weryfikacji receipt/hashów, wygenerowanego klienta oraz prepare→Submit runu
+z tym samym fingerprintem. Cały cel T00–T18 pozostaje otwarty.
+
+**Checkpoint T03/T14, 2026-10-11 — konsument producenta w API, źródłowo:**
+
+Dodano `router_v2/handlers/persistence/run_intent_preparation.rs::prepare`
+oraz POST `/v2/persistence/projects/{project_id}/run-intent`, schematy
+ProjectRunIntentRequest/Resource i rejestrację router/OpenAPI. Handler otwiera
+dokładne bounded archive bytes przez FileProjectRepository, odrzuca read-only,
+sprawdza archived ProjectId/revision, parsuje RunIntentAuthoring/Study/katalog,
+wywołuje wspólny producent oraz snapshot-only validate_requested_execution.
+Nie otwiera store/sesji, nie publikuje CAS, nie przyjmuje runu ani nie wykonuje
+solvera. Published profiles/admission pozostają odpowiednio granicą Submit
+i późniejszego runtime. expected_revision nie oznacza porównania z latest scene.
+
+Zapisano cztery regresje Rust: deterministyczne ponowienie z jawnym RunID/key,
+konflikt ID/revision, błędne archiwum/brak assetu oraz unknown authoring/conflict
+execution. Nie kompilowano ani nie uruchamiano ich zgodnie z zakazem repo.
+Rustfmt z właściwą edition=2021 i git diff --check PASS; review źródłowe bez
+wskazanego blokera, nie kwalifikacja runtime. Wcześniejszy test producenta
+uzupełniono o niepuste parameters/seeds/dependencies i priority=7. Brakuje
+regresji katalogu v3 z execution_materialization, read-only HTTP oraz realnego
+prepare→Submit z identycznym fingerprintem. Nie edytowano generated client.
+
+Job 65 przy aktualnym odczycie nadal queued, bez exit code; jego snapshot nie
+obejmuje producenta ani tego handlera. Pełny build nowych źródeł, zweryfikowana
+generacja OpenAPI/client, scene/script compiler i UI flow pozostają otwarte.
+Nie zamknięto checkboxów T03/T14 i nie zmieniono localhost:3197.
+
+**Checkpoint T03/T14, 2026-10-11 — wspólny producent RunIntent, źródłowo:**
+
+Dodano `crates/fullmag-application/src/run_intent_materialization.rs::materialize_run_intent`
+oraz jawne wejście `RunIntentAuthoring`. Producent przyjmuje już skompilowany
+StudyPlan/katalog i ProjectEnvelope, zachowuje RunID/idempotency, parametry,
+seeds, dependencies, scheduling priority oraz requested execution. Używa
+istniejących ProjectSnapshot, StudyReference, RunSpecification i RunIntent;
+hash katalogu wyznacza przez `fullmag_ir::canonical_ir_json_sha256`, a referencje
+assetów przez rzeczywiste bytes OpaqueAsset i jawne wiązania ID→path. Nie czyta
+hosta, nie publikuje CAS, nie otwiera sesji i nie wykonuje solvera. Sprawdza
+Study/katalog, materializację profili, lowering i per-problem konflikt requestu.
+Pełna kontrola execution plan oraz published profiles nadal należy do
+dotychczasowej granicy Submit; wynik producenta nie oznacza admission/readiness.
+
+Cztery regresje Rust zapisano źródłowo: stabilny replay, exact raw definition
+bytes, asset bytes/missing path oraz konflikt requestu/niespójny envelope.
+**Nie kompilowano ani nie uruchamiano tych testów** zgodnie z ograniczeniem
+AGENTS.md. Parser/formatowanie dwóch nowych plików przez rustfmt oraz
+`git diff --check` PASS; to nie jest dowód kompilacji ani runtime.
+Brakuje jeszcze wywołania producenta w produkcyjnej granicy API/CLI,
+kanonicznego scene/script→Study/per-step IR, regeneracji klienta oraz UI Submit.
+Nie dodano alternatywnego formatu fizyki ani ręcznie generowanego OpenAPI.
+Job 65 nadal queued i jego wcześniejszy snapshot nie zawiera tego producenta;
+potrzebuje on późniejszego pełnego managed buildu wraz z konsumentem API.
+
+**Checkpoint T12/T14, 2026-10-11 — kontynuacja rzeczywistego accepted workera:**
+
+Dodano `scripts/accepted_antenna_runtime.py::execute`, wywoływalną kontynuację
+od już przyjętego i przygotowanego pojedynczego zadania antenowego. Korzysta
+z produkcyjnego resource publishera, schedulera i workera, bez kompilacji;
+odczytuje zwolniony lease, journal i terminalne receipts, następnie wykonuje
+istniejącą bramkę HTTP V/J/H. `validate_worker_publication` wiąże opublikowany
+pakiet z run/task/attempt/epoch/case, CPU budgetem i dokładną komendą Start.
+Wymaga jednego `inspection/Artifact`, nie fikcyjnego stanu magnetyzacji.
+Obserwacyjny timeout zachowuje proces zgodnie z istniejącym `run_process`.
+Pięć interpretowanych regresji powiązań PASS; `git diff --check` PASS.
+Źródłowy review nie wskazał blokera; fixture lease poprawiono do rzeczywistego
+pięciopolowego ResourceLease, odrębnego od trwałego lease receipt.
+Kontrola plan_fingerprint sprawdza format i tożsamość started/completed,
+nie zastępuje porównania z oczekiwanym planem przygotowania ani jego kwalifikacji.
+Nie wykonano jeszcze tej kontynuacji na realnym pakiecie ani nie podłączono
+jej do kompletnego managed RAM drivera: to nie jest kwalifikacja runtime.
+Wywołujący musi poświadczyć pakiet/obraz, izolację całego Submit store w tmpfs,
+kanoniczne wejścia oraz osobny manifest narzędzi hostowych.
+
+Rozpoznanie producentów potwierdziło, że
+`router_v2/handlers/platform/compute_preview.rs::build_preview` materializuje
+kanoniczny katalog i jego hash. CLI `accepted_run_transport.rs::submit_run_json`
+tylko przesyła gotowy request. Nie znaleziono produkcyjnego producenta całego
+RunIntent ze sceny/skryptu; znalezione konstruktory RunSpecification/RunIntent
+pozostają w testach. Następna integracja T03/T14/T15 wymaga wspólnego producenta
+prepared submission, z dokładnymi bytes projektu, StudyPlan, per-step ProblemIR,
+profilem i kompletnym zestawem immutable assets. Nie zastępować go ręcznie
+zmodyfikowanym fixture magnetycznego runu. Job 65 nadal queued; runner zdrowy,
+job 56 running. Nie przerywano buildu ani workspace użytkownika.
+
+**Checkpoint T14, 2026-10-11 — niezależne porównanie retained V/J/H:**
+
+`scripts/smoke_accepted_antenna_inspection.py::verify_retained_payloads`
+sprawdza teraz projekcje bajt po bajcie względem zachowanego bundle i ordered
+current snapshot: ID/współrzędne/potencjał węzłów, kolejność Tet4, środki
+i cell-local vertex samples J, pozycje próbkowania i H. Sprawdza hashe
+wewnętrznych rekordów oraz powiązanie H z charge/current source. Nie odtwarza
+J interpolacją ani nie skaluje przez prąd. Łączny budżet retained porównania
+to 2 MiB; większa scena nie jest kwalifikowana tym małym narzędziem.
+To porównanie wybranej projekcji/framing, nie pełny native canonical decoder
+ani niezależna walidacja solvera. Capabilities FFT/per-ampere/LLG pozostają false.
+
+Pięć interpretowanych regresji PASS. Nowa regresja akceptuje syntetyczny
+retained fixture i odrzuca zmienione V, XYZ, Tet4, ID, sampling positions, H
+oraz cztery projekcje J mimo możliwości ponownego podpisania deskryptorów.
+Mock transportu jawnie nie kwalifikuje framing; odrębna regresja go sprawdza.
+
+Nowy verifier wykonano również offline na zachowanym archiwum wcześniejszego
+managed RAM runu `d13d6b1cc2cc41e193bbd5135fcbdf57`: PASS,
+16 device nodes, 12 cells, 4 H samples, 12 payloadów. Archiwum
+`storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/managed-antenna-http-ram-cpu/runs/d13d6b1cc2cc41e193bbd5135fcbdf57/export/antenna-cold.fms`
+ma SHA-256 `43df8b864dee25beaf38edb097f5d4c904a6cf074dd6320cc3a1aab51b474a19`.
+Podstawowe payloady odczytano bezpośrednio z bounded ZIP; odtworzone projekcje
+geometrii/J porównano z hashami zachowanych cold API display descriptors.
+Nie było nowego solve ani nowego HTTP. Wynik nie kwalifikuje accepted Study
+API, aktualnego UI, durable store ani LLG/FFT. Job 65 przy odczycie nadal queued;
+nowy skrypt jest narzędziem hostowym, a jego tożsamość przyszły runtime gate
+musi przypiąć osobnym tools manifest, nie przypisać do starszego solver snapshotu.
+
+**Checkpoint T12/T14, 2026-10-11 — recovery i bramka HTTP accepted wyników:**
+
+Read-only review wskazał dwa konkretne problemy źródłowe.
+`accepted_study_worker.rs::execute_accepted_antenna_worker_start` finalizuje teraz
+eksport projektu przez `AcceptedProjectStorage::finish` przed zapisaniem completed
+receipt, jak sąsiednie ścieżki FDM/FEM. Zewnętrzna finalizacja failure/cancellation
+pozostaje; powtórne `finish` po sukcesie jest istniejącym idempotentnym no-op.
+Nie przeprowadzono jeszcze testu przerwania procesu między tymi operacjami.
+
+`recover_completed_worker_execution` sprawdza zadeklarowany łączny budżet
+unikalnych obiektów przed ich alokacją, odrzuca sprzeczne długości dla jednego
+CAS ref oraz stosuje istniejący limit kodeka pakietu anteny.
+`read_recovered_worker_object` sprawdza pełny hash/długość strumieniowo i używa
+ograniczonego `get_verified_range`, zamiast `CAS.get`. Obejmuje również
+observation snapshot/state w wspólnej ścieżce recovery. Pusty obiekt pozostaje
+pustym buforem przekazywanym do dotychczasowej walidacji kodeka.
+Nie jest to globalny limit RSS, nie kwalifikuje też równoległych requestów.
+
+Dodano `scripts/smoke_accepted_antenna_inspection.py::verify`: odczytowy test
+wymaga jawnych project/run/Study step, wybiera dokładnie jedną publikację
+i sprawdza wspólny display V/J/H, SI, geometrię/liczności, 12 payloadów,
+SHA, ETag zależny od durable owner, 304/206/416 oraz 6 odmów 409 dla starych
+attempt/epoch/package mimo If-None-Match/Range. Nie przypisuje Live session
+i nie promuje raw inspection do per-ampere, FFT ani LLG. Nie tworzy wyników
+solverowych ani nie mutuje sceny. Cztery interpretowane regresje narzędzia
+w `test_smoke_accepted_antenna_inspection.py` PASS, w tym mock pełnego HTTP.
+Mock nie jest dowodem wykonania backendu, poprawności RT0 ani fizyki.
+
+Rust syntax parse przez rustfmt stdout PASS (bez zmiany pliku i bez kompilacji);
+interpretowane kontrole kolejności/budżetów PASS; diff check PASS.
+Kompilacja nowych zmian, real accepted HTTP i crash recovery: **NOT VERIFIED**.
+Job 56 potwierdzono jako running, job 63 jako queued; koordynator zdrowy.
+Lista całej kolejki zwróciła HTTP 500, lecz odczyt konkretnego joba działał;
+nie restartowano runnera ani workspace. Snapshot 63 nie obejmuje tych poprawek.
+
+Ponowny read-only review poprawek nie wykazał konkretnej regresji. Otwarte:
+nieograniczony odczyt JSON attempt receipt, kopie payloadów przy dekodowaniu
+i wielokrotne materializacje tego samego CAS ref; budżet storage nie jest RSS.
+Awaria po eksporcie, ale przed completed receipt pozostawia próbę unknown
+i recovery odmawia ponownego solve — brak fault-injection dowodu.
+Zlecono normalny build aktualnych źródeł (bez kompilacji unit testów):
+seq 65, job `51d0e494bcd948be97288981a6868310`, stan po submit `queued`,
+source digest `0263a84769dd15f980d370a774b392c4e0b1c99964b5362a1375662809452884`.
+Capture zawierał 31 jawnie wskazanych nieśledzonych wejść; edycje były
+wstrzymane do zakończenia capture. To zgłoszenie, nie dowód kompilacji.
+
+**Checkpoint T12/T14, 2026-10-11 — weryfikacja pakietu 55 i strumieniowanie assetów:**
+
+`fullmag-runtime-control/src/study.rs::load_accepted_study_snapshot` sprawdza
+teraz przypięte immutable assets przez
+`fullmag-session/src/cas.rs::CasStore::verified_length`, zamiast alokować
+pełny bufor przez `get` i następnie go odrzucać. Sprawdzenie całej zawartości
+SHA-256, powiązania z RunSpec i błędu brakującego obiektu pozostaje zachowane.
+Istniejący `stream_file_identity` używa bufora 64 KiB i sprawdza również
+niezmienność długości. Nie jest to globalny limit RSS endpointu: JSON study
+i catalog nadal są materializowane, podobnie jak wybrany pakiet pól.
+
+Dodano regresje Rust dla uszkodzenia obiektu bez zmiany długości oraz pustego,
+brakującego i nieprawidłowego object ref. Testów jednostkowych nie kompilowano
+ani nie uruchamiano zgodnie z ograniczeniem repozytorium. Interpretowana
+kontrola źródeł zachowania integralności i braku pełnej alokacji assetu PASS;
+`git diff --check` PASS. Scoped rustfmt wykazał wcześniejsze różnice formatowania
+w niezmienionych fragmentach CAS; nie wykonano pobocznego formatowania.
+Kompilacja i pomiar pamięci tej poprawki pozostają **NOT VERIFIED**;
+snapshot 63 jej nie obejmuje.
+
+Job 55 `713429ba647141248db59382c09522a7` potwierdzono terminalnie
+`succeeded`, exit 0. `scripts/export_runner_openapi.py::_validate_managed_build`
+zweryfikował receipt, kapsułę źródeł i 127 artefaktów; dodatkowe
+`ManagedBuild::input_hash_mismatches` zwróciło pustą listę.
+Source digest: `6c508b09ca0f55a54c6b75d4f3c2fb605dfdda45fa35fb0814badc8ed7013313`;
+native snapshot: `703524bf128d209d2994b35568a6d0fcee03edaf820e4c618882b5a658f16c23`;
+receipt SHA-256: `f293b1787bc5e43cfc60ced30ec08ccc9e6a6302dc77d5c59bc54036a30ecf23`.
+Pakiet: `storage/runs/microwave-antenna-latest-2026090-78aaec16ccf52671/713429ba647141248db59382c09522a7/artifacts/outputs/.fullmag/local`.
+Jest to dowód starszego buildu, nie najnowszego accepted API ani kwalifikacji
+fizyki/UI. Joby 61, 62 i 63 przy ponownym odczycie nadal `queued`.
+Nie uruchomiono ani nie restartowano workspace użytkownika.
+
+**Checkpoint T14/T15, 2026-10-11 — katalog accepted wyników i wspólny opis V/J/H:**
+
+Dodano zasoby `accepted_antenna_resource.rs::get_accepted_antenna_catalog`
+oraz `get_accepted_antenna_inspection`. Collection
+`GET /v2/persistence/projects/{project_id}/runs/{run_id}/antenna-inspections`
+zwraca aktualne published owner identities, w tym Study/native stage, task,
+attempt/epoch oraz manifest/package/artifact/case. Nie dekoduje pakietów pól
+i deklaruje tylko `validation_scope=published_output_manifest`, bez display
+capabilities. To konieczne, ponieważ dotychczasowy zasób runu nie udostępnia
+frontendowi pinu pakietu anteny; klient nie powinien go zgadywać.
+
+Pojedynczy zasób pod `/antenna-inspections/{step_id}` wymaga pinu
+attempt/epoch/package i po pełnej walidacji pakietu oraz accepted plan zwraca
+manifest, jawne port/output ID oraz wspólny display contract. Manifest tego
+zasobu deklaruje `validation_scope=accepted_plan_and_payloads`. JSON zawiera
+deskryptory, liczności i provenance, nie tablice V/J/H ani topologię liczbową.
+Numeryczne dane pozostają w endpointach binarnych. Accepted identity nie
+zawiera fikcyjnego session scope, revision Live ani rekordu CLI.
+
+`antenna_inspection.rs::inspection_display_data` jest wspólną projekcją dla
+Live i accepted: V na obliczonej geometrii urządzenia, cell-local J z RT0,
+H w domenie próbkowania, jednostki i SHA tych samych payloadów. Publiczny
+kształt dotychczasowego `AntennaInspectionDisplayResource` pozostaje bez zmian.
+Kontrola liczności J/topologii, opcjonalnego legacy J oraz v1/v2 pozostaje.
+Capabilities per-ampere/source-FFT/LLG pozostają false; walidacja bytes/plan
+nie jest kwalifikacją fizycznej bazy wymuszenia.
+
+Provider współdzieli kontrole accepted publication przez
+`with_accepted_antenna_publications`: discovery odwiedza tylko metadata,
+a pinned reader sprawdza query identity przed odczytem pakietu wybranego
+etapu. Fence katalogów wykonuje się po visitorze, również po dekodowaniu pól.
+Ograniczenia peak RSS snapshotu i brak kwalifikacji równoległych requestów
+z poprzedniego checkpointu pozostają otwarte; discovery nie usuwa tego limitu.
+
+Weryfikacja: interpretowane kontrole kontraktu źródeł PASS, w tym porównanie
+pól Live schema z HEAD i ich mapowania do wspólnej projekcji; scoped rustfmt
+trzech accepted plików PASS, global diff check PASS. Dwa read-only review
+(projekcja/metadata oraz faktoryzacja discovery/pinned reads) nie wykazały
+konkretnego defektu. Dodano nieuruchomione regresje OpenAPI required pins,
+braku fikcyjnego Live scope oraz walidacji query. Unit testów nie kompilowano.
+Kompilacja, wygenerowane OpenAPI i HTTP tego fragmentu: **NOT VERIFIED**.
+Seq 55 potwierdzono `running`, seq 62 `queued`; snapshot 62 nie obejmuje
+tego nowego metadata/discovery fragmentu. Zlecono własny normalny build
+`fem-cpu-release`: seq 63, job `5d8062970f8a4aaca25881e5e84e9780`,
+stan po submit `queued`, source digest
+`fa43863e3ac435f89bf3563f61e01ce16c7e2653c54007e0d31942d123f85412`;
+29 jawnie wskazanych nieśledzonych plików anteny. Nie jest to dowód kompilacji.
+Końcówka logu starszego seq 55 pokazała native-build i frontend-build exit 0,
+lecz odczytany stan kolejki pozostawał `running`; nie promowano pakietu do
+terminalnego succeeded ani nie restartowano koordynatora.
+Generated client/facade/hooks oraz podłączenie wyboru do wspólnego Inspectora
+i browser V/J/H pozostają kolejnymi krokami. Workspace użytkownika bez zmian.
+
+**Checkpoint T14/T15, 2026-10-11 — trwały endpoint binarny accepted inspection:**
+
+Provider `accepted_antenna_inspection.rs::load_accepted_antenna_inspection`
+odczytuje teraz jeden jawnie wskazany Study step, zamiast dekodować pakiety
+wszystkich anten w runie. Przed odczytem pakietu sprawdza wymagane
+`attempt_id`, `ownership_epoch` i `package_object_ref`. Zachowuje kontrolę
+published membership, manifestu, pełnego package→plan binding oraz ponowny
+odczyt katalogów. Osobna kontrola RunSpec zwraca konflikt dla projektu innego
+niż właściciel runu. Po walidacji neutralnego kodeka jego payloady są zwalniane
+przed walidacją runnera; zachowywany jest tylko reference, a następnie loaded
+result. Nie oznacza to pojedynczego dekodowania ani globalnego limitu RSS.
+
+Dodano `accepted_antenna_payload.rs::get_accepted_antenna_payload`, route
+`GET /v2/persistence/projects/{project_id}/runs/{run_id}/antenna-inspections/{step_id}/payloads/{payload_kind}`
+i rejestrację w `openapi_v2.rs`. Jest to trwały zasób projektu/runu, nie
+adapter bieżącej sesji i nie udawany rekord CLI. `step_id` oznacza ID Study;
+native stage ID pozostaje oddzielną częścią owner identity. Query wymaga
+trzech pinów publikacji powyżej. Nieznany payload kind jest odrzucany przed
+odczytem storage. Endpoint współdzieli `antenna_inspection.rs::select_payload`
+oraz `validate_payload_kind`, więc V/J/H, geometria i ich długości/SHA mają
+tę samą projekcję co istniejąca ścieżka Live. ETag obejmuje projekt, run,
+Study/native stage, task, attempt, epoch, manifest/package/artifact, kind
+i SHA payloadu. Conditional response i Range następują dopiero po pełnej
+walidacji. Nie dodano nowych ilości fizycznych, bazy na amper ani LLG/FFT.
+
+Review źródłowy wskazał otwartą bramkę pamięci: istniejący
+`fullmag_runtime_control::load_accepted_study_snapshot` materializuje dodatkowo
+Study, catalog i immutable assets przez CAS `get`. Limit wejścia FMANTPK1
+nie ogranicza całego peak RSS ani równoległych requestów. Potrzebna pozostaje
+kwalifikacja limitów i reader metadata/streaming verification bez pomijania
+hashy zasobów. Ponowna kontrola całych katalogów jest konserwatywna: zmiana
+niepowiązanego tasku może dać 409; nie należy usuwać fence bez zastępczej
+kontroli dokładnego ownera i published entries.
+
+Weryfikacja tego fragmentu: interpretowane kontrole kontraktu źródeł PASS,
+scoped `rustfmt --check` dwóch nowych plików PASS, `git diff --check` PASS.
+Regresja pinów jest zapisana w Rust, lecz unit testów nie kompilowano ani
+nie uruchamiano. Kompilacja i HTTP nowego endpointu pozostają **NOT VERIFIED**.
+Zlecono normalny kontenerowy build `fem-cpu-release`: seq 62,
+job `6af20983967842d18a9cd89e674220a2`, stan po submit `queued`,
+source digest `e80f38d577e6f066e5c4fa62a1372ebfcb4d18c83ced96f7d8326c4aa2bd884a`.
+Snapshot zawiera 28 jawnie wskazanych nieśledzonych plików anteny; receipt
+submit nie jest dowodem udanej kompilacji. Starszy seq 61 nadal queued przy
+ostatnim odczycie. Koordynator potwierdził `ok`, `accepting_jobs` i `worker_alive`;
+sprawdzenie wymagało dostępu poza sandboxem, bez restartu koordynatora.
+Generated frontend client nie został ręcznie zmieniony; regeneracja wymaga
+zarządzanego eksportu OpenAPI aktualnego buildu. Metadata/display resources,
+facade/hooks, wybór accepted wyniku i browser V/J/H pozostają do podłączenia.
+Nie zmieniano modelu ani nie restartowano workspace 3197. Poniższe wcześniejsze
+checkpointy opisują stan historyczny, nie aktualną sygnaturę providera.
+
+**Checkpoint T14/T15, 2026-10-11 — ścisły accepted CAS reader i wybór wykonania UI:**
+
+Zaimplementowano i zarejestrowano wewnętrzny provider
+`crates/fullmag-api/src/router_v2/handlers/data/accepted_antenna_inspection.rs`
+(`load_accepted_antenna_inspections`). Caller musi podać zaufane ProjectId/RunId
+i ogrodzić kontekst bieżącej sesji; helper nie definiuje nowego endpointu.
+Odczyt wiąże immutable accepted Study i execution plan, aktualny succeeded
+task/attempt/ownership epoch, Published membership w katalogu, pojedynczy
+manifest bez duplicate JSON keys, exact inspection/artifact/codec tuple,
+registered artifact/case/CAS SHA i pełny package→plan binding. Magnetic
+state/observation refs są odrzucane. Oba katalogi są sprawdzane ponownie po
+odczycie. Manifest ma oddzielny limit 1 MiB; verified CAS reads są ograniczone,
+a suma zachowanych pakietów runu nie może przekroczyć maksymalnego budżetu
+jednego FMANTPK1. Nie ma filesystem discovery ani promocji do bazy na amper.
+API otrzymało jawną zależność od neutralnego crate'a; Cargo.lock jest zgodny
+z tą nową lokalną zależnością. Provider nie jest jeszcze wywoływany przez HTTP.
+
+Naprawiono frontendową ścieżkę legacy/current-live:
+`AntennaVisualizationPanel.tsx::AntennaPublishedVisualization` używa istniejącego
+`resolveInspectionRuntimeStage`, kontroli confirmed StageExecutionResource
+i explicit selektora przy wielu wykonaniach. Authored `stageId` pozostaje ID
+definicji; osobne `runtimeStageId` oraz `runId` są małymi, nietrwałymi polami
+display intent. Nie kopiują server resource ani danych liczbowych do store'a.
+Wspólny `antennaFieldIntent.ts::antennaInspectionIntentMatchesOwner` wiąże
+scope/run/oba stage IDs/source/port/output/record digest/package digest/revision,
+qualification i field scope. `useAntennaFieldOverlay` odczytuje exact runtime
+ID, odrzuca stare intent bez tego ID oraz refreshError; nie zgaduje zgodności.
+Żadne nowe quantity ani równania fizyczne nie zostały dodane.
+
+Weryfikacja aktualnych źródeł: TypeScript `tsc --noEmit --incremental false`
+z `tsconfig.typecheck.json` PASS (exit 0), scoped ESLint czterech plików PASS,
+API hygiene PASS, architecture hygiene PASS, rustfmt providera/rejestracji
+PASS i global `git diff --check` PASS. Negatywne regresje identity w
+`antennaFieldIntent.test.ts` i providera są zapisane, ale zgodnie z zakazem
+nie uruchamiano ani nie kompilowano unit testów. Starszy seq 61 nadal queued;
+nie zawiera nowego providera ani tej poprawki frontendu. Kompilacja Rust i
+runtime aktualnego fragmentu pozostają **NOT VERIFIED**.
+
+Odczyt istniejącej karty na 3197 pokazał obecnie pusty model (Objects 0),
+nie wcześniejszą scenę microstrip. Read-only DOM potwierdził widoczny canvas
+o atrybutach 444×381. Browser API nie udostępniło `getContext`, a screenshot
+zakończył się `Unable to capture screenshot`; nie dowodzi to stanu WebGL,
+drawing buffer ani wizualnej poprawności V/J/H. Browser qualification nadal
+**NOT VERIFIED**. Nie odtwarzano modelu, nie przeładowywano strony i nie
+restartowano procesu użytkownika.
+
+Kolejny krok pozostaje pełny: accepted provider→jawny OpenAPI owner/scope
+kontrakt→generated client→resource hooks→wspólna projekcja metadata/display/
+binary i pinned wybór wyniku→RAM accepted runtime gate→browser V/J/H.
+Nie wolno uznać naprawy mapowania legacy ID za ukończenie accepted UI ani T14/T15.
+
+**Checkpoint T14/T15, 2026-10-11 — wykonanie inspection przez accepted Study:**
+
+Flat Study i pipeline deklarują wspólny, pojedynczy port `inspection/Artifact`
+dla primitive `antenna_field_solve`. Nie deklarują magnetyzacji, magnetycznego
+stanu wejściowego ani horyzontu LLG. Regresja pipeline zachowuje odrębność ID
+węzła Study (`antenna-field-solve:antenna-solve`) i native stage ID
+(`antenna-solve`); ich utożsamienie byłoby błędem normalnej ścieżki UI.
+
+Dedykowany `accepted_antenna_inspection_worker` jest zarejestrowany w obu
+binary roots API. Dispatch i admission obejmują tylko typed
+`AntennaExternalLeadInspection`, FEM CPU lub requested auto, double, strict,
+jeden port artifact, bez inputs i czasu końcowego. Requested auto pozostaje
+w provenance, resolved execution musi być native FEM CPU bez fallbacku.
+Legacy FieldBasis nie jest automatycznie promowany do inspection.
+
+Przed solve sprawdzane są immutable accepted request, preparation binding,
+certyfikat H1/P1, ponownie zmaterializowany plan, native runtime preflight
+i budżet wyjściowy. Jednorazowy solve zwraca retained V/RT0/H/J w pełnym
+FMANTPK1. `completed_step_count=1` oznacza jedną operację inspection,
+nie krok LLG. Stop jest obsługiwany przez istniejący control loop i typed
+cancellation; obliczenie natywne nie jest preemptive. Obowiązują wspólne
+started/completed receipts, CAS, lease/epoch fencing i kontrola budżetu.
+Recovery weryfikuje cały pakiet względem planu bez ponownego solve;
+started bez completed nadal nie uprawnia do ponownego wykonania.
+
+Domknięto także eksport dla świeżego wykonania z jawną polityką output storage:
+przed completed receipt plan-bound pakiet przechodzi przez istniejący
+`publish_antenna_inspection_package_atomically` do prywatnego staging root.
+`AcceptedProjectStorage::finish` publikuje ten sam manifest i binarne payloady
+w katalogu projektu, zamiast eksportować wyłącznie `m_final.json`.
+To kopia użytkowa; authoritative output pozostaje w CAS. Nie skanuje się
+katalogu attempt ani nie zmienia zabezpieczeń SessionStore. Legacy request
+bez output_storage zachowuje wcześniejszy kontrakt CAS-only. Recovery completed
+receipt nie naprawia automatycznie uprzednio nieudanego eksportu użytkowego;
+bramka awarii publikacji i jej jawnego odzyskania pozostaje do kwalifikacji.
+
+Zapisano negatywne regresje portów, requested/resolved intent, niedozwolonych
+backendów/precision/mode i primitive Run. Zgodnie z zakazem repozytorium nie
+kompilowano ani nie uruchamiano unit testów. Formatowanie i `git diff --check`
+PASS. Kompilacja oraz accepted Study runtime, CAS→zasoby anteny i przeglądarka
+pozostają **NOT VERIFIED**. Starszy build seq 59 jest nadal queued i nie
+zawiera tego fragmentu; runner przyjmuje joby, seq 55 jest running.
+Sceny użytkownika na localhost:3197 nie restartowano ani nie zmieniano.
+
+Zlecono spójny managed `fem-cpu-release` seq 61, job
+`22d2a7df30284bb8a89dd8a31d2a7134`, HEAD
+`41a5b8936b3eaa38420e9ba358cbf22ac7e2d803`, source digest
+`4431d6a3a0e94acb44a1f7da38d637f0230577cab3b07bd2be592ff47ef72d8d`,
+native snapshot
+`ac265e63b01b40778f6e9470e20cda24dd308bcdcab183751d04eb9278c4a419`.
+Capture zawiera 25 jawnych nieśledzonych wejść zadania, oba binary roots,
+projekcję output ports, worker oraz eksport staging. Przy zgłoszeniu `queued`;
+to nie jest dowód ukończonego buildu. Interpretowana kontrola źródeł potwierdza
+granicę zależności neutralnego crate'a, registration obu binary roots,
+staging-before-receipt i brak magnetycznego state/observation output.
+Wpis identyfikatorów dodano po capture.
+
+Zakres kontroli formatowania PASS: nowy adapter, accepted study worker
+i trzy zmienione pliki authoringu. Szerszy `rustfmt --check` obu binary roots
+i runtime-control zgłasza różnice kolejności modułów oraz istniejącego stylu
+formatowania w dirty źródłach; ta szersza kontrola **FAIL**. Nie wykonano
+masowego reformatowania pozostałego WIP. `git diff --check` całego checkoutu
+pozostaje PASS. Żaden z tych wyników nie zastępuje kompilacji.
+
+**Następny fragment T14/T15 — accepted CAS → zasoby i wizualizacja:**
+
+Odczyt kodu potwierdza brak tej integracji. W
+`crates/fullmag-api/src/router_v2/handlers/data/antenna_inspection.rs`
+`snapshot`/`capture` korzystają wyłącznie z current-live `stage_execution`,
+a `read_registered_record` wymaga wpisu artifact_refs i recordu
+`antenna/external_lead_stage_outputs/{runtime_stage_id}/antenna_external_lead_stage_output.v1.json`.
+Sam eksport `external_lead_solutions` ani typed CAS output tego nie wytwarza.
+`handlers/simulation/runtime.rs::get_stage_execution` również nie projektuje
+accepted RunCatalog. Nie wolno obchodzić tej granicy sztucznym recordem CLI.
+
+1. Dodać provider accepted output oparty na autorytatywnym SessionStore,
+   RunCatalog i `FmsStudyOutputManifest`, odrębny od legacy current-live.
+   Wzorzec admission odczytu: `handlers/data/observation_frames.rs`
+   (`load_observation_frames`, `active_run_id`), bez kopiowania magnetycznej
+   semantyki observation/state. Wymagać succeeded aktualnej próby, Published,
+   zgodnych run/task/Study step/attempt/ownership epoch, port/case/codec,
+   rejestracji artifact ID, CAS SHA i pełnego accepted plan binding.
+2. Ustalić jawny owner/scope kontrakt zasobów metadata/display/binary i OpenAPI.
+   Identity musi wiązać accepted run/task/step/attempt/epoch, manifest/CAS,
+   package digest oraz native solve/output ID. ETag i revision wynikają
+   z autorytatywnego ownera; nie nadawać nowego live scope starym danym.
+   Reuse wspólnego dekodera i projekcji V/J/H, nie drugi format pól.
+3. Naprawić wybór wykonania w
+   `apps/control-room/src/modules/inspector/panels/antenna/AntennaVisualizationPanel.tsx`
+   (`AntennaPublishedVisualization`): obecnie authored stage ID jest przekazywany
+   jako runtime stage ID i porównywany z `raw.runtime_stage_id`.
+   Istniejący `AntennaExternalLeadInspectionModel.ts::resolveInspectionRuntimeStage`
+   obsługuje różnicę ID dla CLI, lecz jeszcze nie accepted provider.
+   Typowany klient, resource hooks, panel i overlay muszą współdzielić jeden
+   jawnie wybrany, pinned wynik; wiele wykonań wymaga selekcji użytkownika.
+4. Bramka RAM: accepted solve→Publish→metadata→binary V/J/H, recovery bez solve,
+   odrzucenie starego scope/run/epoch/CAS, niewidoczność Stop/nieopublikowanej
+   próby, odmienne trzy rodzaje ID, wiele wykonań i stale payload po selekcji.
+   Następnie browser smoke: canvas/WebGL/drawing buffer i przełączanie V/J/H.
+
+Ten fragment jest zaplanowany na podstawie źródeł, **nie zaimplementowany**.
+Nie nadaje kwalifikacji bazy na amper, source FFT ani LLG drive. Należy zachować
+`raw_authored_current`, `external_electrode_truncation` oraz jawne ograniczenia
+naukowe inspection. Nie oznaczać modułu ani przepływu UI jako ukończonego.
+
+**Checkpoint T14/T15, 2026-10-11 — wspólny kodek manifestu/pakietu i granica Study:**
+
+Neutralny `fullmag-antenna-artifacts::solution` przejmuje manifesty v1/v2,
+ich ścisłą walidację oraz pełny retained loader V/RT0/H/J. `package` przejmuje
+kodowanie/dekodowanie `FMANTPK1`. Runner zachowuje dotychczasowe publiczne
+sygnatury z `RunError`, adaptery borrowed payload views oraz przenoszenie
+owned payloadów bez kopii przy decode. Geometry display pozostaje dostępne
+przez facade; request/plan binding, solve i publikacja filesystem pozostają
+w runnerze. Nie wprowadzono kolejnego formatu ani osłabionego importera.
+
+Application rejestruje dokładnie tuple
+`artifact / fullmag.antenna.inspection_package / v1` oraz wariant
+`DecodedStudyArtifact::AntennaInspection`. Zgodność bajtów z zewnętrznym CAS hash
+jest sprawdzana przed odczytem pakietu. Self-describing decoder wydobywa
+wewnętrzną referencję ze ścisłego manifestu i deleguje do pełnego pinned decoder;
+nie dowodzi pochodzenia, freshness, zgodności z requestem ani kwalifikacji bazy
+na amper. Dwa źródłowe regression checks obejmują exact tuple/framing oraz
+kolejność CAS-before-decode. Nie kompilowano ani nie uruchamiano unit testów.
+
+Neutralny crate potrzebuje teraz `fullmag-ir` dla kanonicznych typów manifestu,
+lecz nadal nie zależy od runnera, application, planera ani MFEM/FFI. Application
+zależy od neutralnego crate'a. Interpretowana kontrola lokalnego grafu zależności
+i Cargo.lock wykazała brak cyklu oraz zgodność nowych lokalnych zależności.
+
+Wykonanie przez accepted Study **nie jest jeszcze dopuszczone**: istniejące
+guards runtime oraz output binding pozostają zamknięte do implementacji
+dedykowanego inspection worker, deklarowanych artifact outputs i odczytu CAS
+przez zasoby anteny. Sam wpis kodeka nie oznacza działającej komendy UI.
+Build seq 58 nadal był `queued` w tej kontynuacji i nie zawiera tego fragmentu.
+Kompilacja, runtime i browser qualification aktualnych zmian pozostają
+**NOT VERIFIED**; sceny na 3197 nie zmieniano.
+
+Kontrole tego fragmentu: porównanie źródłowe czternastu funkcji metadata/loader
+i wydzielonego parsera manifestu, pięciu native adapter functions oraz dwóch
+plan/request binding functions PASS po wyłącznie zmianach typów/importów
+i adapterach payload views. Encoder i pomocnicze framing functions zachowują
+format. `rustfmt --check` i `git diff --check` PASS; wyszukiwanie nie wykazało
+zależności runner/plan/FFI/filesystem w neutralnych solution/package.
+Dwie dodatkowe źródłowe regresje pakietu obejmują bounded/versioned framing
+oraz duplicate JSON keys przed wydobyciem self-reference. Nie były uruchamiane.
+
+W tej kontynuacji API runnera potwierdziło seq 53 jako `succeeded`, exit 0,
+job `6b4e16db7616430f96c98dd11e09a899`. Jest to starszy snapshot pipeline/port
+binding, nie dowód kompilacji obecnej ekstrakcji, application codec ani runtime.
+
+Zlecono spójny `fem-cpu-release` seq 59, job
+`d4d091b5fc4247eba8d91653c189f459`, HEAD
+`41a5b8936b3eaa38420e9ba358cbf22ac7e2d803`, source digest
+`babd04d2904bcc2e60eacd5a025f725528d260324bdfb51c70d055f059a61f56`,
+native snapshot
+`afad3672c089045653f03846e6cb5f4b6791fa857b039e5476c31cc94eac089a`.
+Capture zawiera 24 jawne untracked wejścia zadania oraz całą ekstrakcję i kodek
+application. Przy zgłoszeniu stan `queued`; nie jest to receipt ukończonego
+buildu. Wpis z identyfikatorami dodano po capture.
+
+**Checkpoint T14/T15, 2026-10-11 — neutralny odczyt bundle i gęstości prądu:**
+
+Kontynuacja ekstrakcji obejmuje `fullmag-antenna-artifacts/src/bundle.rs`
+oraz `current_display.rs`: pełny odczyt zachowanego V/RT0/H, bilanse
+komponentów/elementów/ścian, diagnostykę kwadratury oraz cell-local próbki J.
+Runner korzysta z delegujących facade'ów z zachowaniem `RunError`.
+Typy boundary/branch/quadrature należą do neutralnego właściciela; native
+request, preflight, wiązanie wyniku do requestu i solve pozostają w runnerze.
+Format binarny, jednostki, normalizacja i zakres `inspection_only` nie zmieniają
+się. J nie jest uśredniane na wspólnych wierzchołkach ani rekonstruowane ponownie.
+
+Neutralny crate nadal nie potrzebuje `ProblemIR`, MFEM, FFI, runnera ani
+application. Istniejące fixture'y request-bound pozostają przy runnerze;
+produkcyjny dekoder jest jeden. Sama ekstrakcja nie włącza jeszcze Study codec,
+accepted inspection worker ani CAS read-adapter. Manifest i FMANTPK1 wymagają
+kolejnej ekstrakcji przed podłączeniem tego samego walidatora do application.
+
+Build seq 57 nadal był `queued` przy odczycie stanu w tej kontynuacji i nie
+obejmuje powyższych nowych plików. Kompilacja i runtime tego fragmentu pozostają
+**NOT VERIFIED**. Nie uruchamiano ani nie kompilowano testów jednostkowych.
+Nie restartowano sceny użytkownika na porcie 3197.
+
+Weryfikacja źródeł: pełne porównanie pure bundle i J po normalizacji
+whitespace/importów/widoczności/error type PASS; bramki, komunikaty i algorytmy
+pozostały niezmienione. `rustfmt --check`, `git diff --check` oraz interpretowana
+kontrola zgodności workspace/package/runner/Cargo.lock i neutralnej granicy
+zależności PASS. Request-bound fixture'y pozostają przy runnerze; pomocnicze
+`key`, `current_gate`, `Sum` są tam dostępne wyłącznie pod `cfg(test)`.
+
+Zlecono zwykły `fem-cpu-release` seq 58, job
+`f47fead0ceb34bb99b3b1e129f02f805`, HEAD
+`41a5b8936b3eaa38420e9ba358cbf22ac7e2d803`, source digest
+`8f7114ee6b329905e4a73bc9eed304c084a3d13862b70a79dcbe83f4008134c1`,
+native snapshot
+`96f81634962d734b345e55c925d002cdb017ea7d3dcbcc4a3590fcd49546cd22`.
+Capture obejmuje 22 jawnie wskazane untracked wejścia zadania, w tym nowe
+bundle/current-display. Stan po zgłoszeniu `queued`; terminalny build receipt
+i runtime nadal do sprawdzenia. Ten wpis identyfikacyjny powstał po capture.
+
+**Checkpoint T14/T15, 2026-10-11 — rozpoczęta ekstrakcja neutralnych artefaktów:**
+
+Utworzono `crates/fullmag-antenna-artifacts` jako członka workspace i zależność
+runnera. Pierwszy przeniesiony podsystem: `charge.rs` zawiera pełny dotychczasowy
+dekoder retained charge, bounded `Reader`, typy rekordu i interface oraz stałe
+limitu/schema/operator. Crate zależy wyłącznie od serde/serde_json/sha2; nie ma
+MFEM, FFI, runnera, application ani wykonywania solvera. Runnerowy
+`native_fem/accepted_terminal_charge/record.rs` jest cienkim facade'em; zachowuje
+sygnaturę dekodera z `RunError`, a konwersja `ArtifactError` zachowuje message.
+Request, pakowanie, solve i weryfikacja względem native requestu pozostają
+w dotychczasowym ownerze. Limit 128 MiB i assertion zgodności z ABI zachowano.
+
+`artifact_json.rs` przeniesiono do tego samego neutralnego właściciela, a runner
+re-eksportuje istniejący parser. Wszystkie dotychczasowe artifact readers nadal
+odrzucają duplicate JSON keys; dodano dwie źródłowe regresje top-level/nested/array
+oraz odczytu unambiguous wartości. Trzy istniejące regresje charge przeniesiono
+razem z dekoderem, nie usunięto pokrycia. Mechanical source comparison po
+zmianie importów/widoczności/error type i formatowaniu wykazało niezmieniony
+dekoder, bramki, komunikaty oraz testy. Parser Rust i diff-check PASS.
+Unit testów nie kompilowano ani nie uruchamiano. Typecheck i runtime ekstrakcji
+pozostają NOT VERIFIED. Cargo.lock aktualizuje wyłącznie nowy lokalny package
+i zależność runnera; bez zmian wersji zewnętrznych zależności.
+
+To **pierwsza część**, nie kompletny codec anteny: bundle/current-display,
+manifest i FMANTPK1 nadal są w runnerze. Application nie dopuszcza jeszcze
+inspection artifact. Kolejne kroki: wydzielić ich pełne czyste dekodery,
+zachować runnerowe request-bound adapters, podłączyć ten sam decoder do Study
+codec, następnie output binding/accepted inspection dispatch i CAS read-adapter.
+Aktualne źródła są późniejsze niż seq 56; jego build nie weryfikuje ekstrakcji.
+
+Zlecono normalny `fem-cpu-release` seq 57,
+job `42a5ccb122a54981b2cc967fe5407eb7`, HEAD
+`41a5b8936b3eaa38420e9ba358cbf22ac7e2d803`, source digest
+`92a2c1a880e11b56af37ba4d1186c2655174da2604b8bd83c3a1225ac77befa2`,
+native snapshot `a59cafc4e03f03a587c3264791af18c9baf526af1bbd418027af2a070d058d93`.
+Capture obejmuje cztery nowe pliki neutralnego crate'a i szesnaście wcześniejszych
+untracked plików zadania. Zawiera także walidację package względem execution plan
+powstałą po seq 56. Przy zgłoszeniu queued; terminalny build receipt i runtime
+pozostają do weryfikacji. Kontrola TOML workspace/package/runner/Cargo.lock PASS.
+
+**Checkpoint T14/T15, 2026-10-11 — wiązanie retained package do rzeczywistego inputu:**
+
+`package.rs::load_antenna_inspection_package_for_execution_plan` wymaga dokładnie
+`AntennaExternalLeadInspection`, właściwego requested/resolved FEM i trybu,
+zgodności stage/output oraz ponownego materializowania authored inputu przez
+istniejący planner. Następnie dekoduje i waliduje cały pakiet oraz porównuje
+manifest z input pins, source/transport/port/drive, solver policy, execution,
+closure revision, sampling carrier, dokładną kolejnością device vertex IDs
+i współrzędnymi próbkowania. Nie przyjmuje magnetycznego planu.
+
+Samo skopiowanie input pins do manifestu nie wystarcza: `validate_retained_input`
+używa istniejącego `with_materialized_external_lead_request` i
+`validate_bundle_request`. Ten validator porównuje retained charge z faktycznym
+requestem, podział device/lead, boundary role/circuit, branches, targety i
+quadrature policy. Nie wywołuje solve. Na kompilacji bez feature native FEM
+request binding odmawia działania; ogólny dekoder pakietu pozostaje osobny.
+To wiązanie nie zastępuje zewnętrznego CAS hash, accepted run/step, lease/epoch
+ani kwalifikacji naukowej. Walidacja obejmuje dodatkowy bounded decode bundle;
+nie jest cache ani ścieżką wykonywaną w hot loop LLG.
+
+Dodano źródłową regresję odmowy magnetycznego FDM przed odczytem payloadu.
+Parser Rust/diff-check PASS, bez kompilacji testów jednostkowych. Cała ta zmiana
+jest **po snapshot seq 56**; jego przyszły wynik nie dowodzi kompilacji nowej
+funkcji. Accepted worker i endpoints jeszcze jej nie wywołują.
+
+Read-only review granicy codeca wykazało, że application nie może importować
+runnera, a quantities nie może importować IR (cykl: IR już korzysta z quantities).
+Przed rejestracją inspection codeca potrzebna jest ekstrakcja istniejącego
+pełnego retained-result decodera do neutralnego właściciela, bez FFI i solve:
+manifest/reference, duplicate-safe JSON, charge/bundle/current-display records
+i package framing. Nie tworzyć drugiego tolerancyjnego dekodera ani opaque JSON.
+Proponowany nowy crate `fullmag-antenna-artifacts` **jeszcze nie istnieje**;
+API runnera ma zachować zgodność przez re-export/conversion wrappers.
+Nowy application codec będzie mógł używać tego samego pełnego walidatora;
+self-reference manifestu nie zastąpi wiązania do przyjętego planu.
+Ta ekstrakcja jest kolejnym krokiem implementacji, nie ukończonym komponentem.
+
+**Checkpoint T14/T15, 2026-10-11 — pakiet wyników i rzeczywisty warm/cold API:**
+
+`crates/fullmag-runner/src/antenna_external_lead_solution/package.rs`
+dodaje `encode_antenna_inspection_package` i `decode_antenna_inspection_package`.
+Format: magic `FMANTPK1`, długość manifestu u64 LE, dokładne bajty manifestu,
+a następnie długość u64 LE i bajty każdego payloadu w stałej kolejności
+deskryptorów manifestu: bundle, pozycje, H, identyfikatory wierzchołków, V,
+opcjonalnie current_display v2. Pakiet nie przechowuje dowolnych nazw plików;
+schema walidatora wyznacza dokładny zestaw pięciu/sześciu payloadów.
+Limit wynika z istniejących ograniczeń: 1 MiB manifestu i do sześciu
+payloadów po 128 MiB, z narzutem framingu. Budżet CAS/workera pozostaje
+odrębną, potencjalnie ostrzejszą bramką. Duże bufory używają fallible reserve.
+
+Dekoder odrzuca skrócone dane, niezgodne długości, nadmiarowe końcowe bajty,
+złą tożsamość i uszkodzone payloady. Obie strony korzystają z istniejącego
+pełnego walidatora manifestu, hashy i zgodności V/RT0/H/J. Nie jest to
+kwalifikacja aktualności modelu, bazy per-A, LLG ani FFT. Zewnętrzny digest
+CAS dokładnych bajtów pakietu nie jest semantic `content_digest` wyniku;
+caller musi zweryfikować oba oraz wiązanie przyjętego wykonania.
+
+`publication.rs::publish_antenna_inspection_package_atomically` łączy odczyt
+pakietu z dotychczasową atomową publikacją immutable revision, bez solvera.
+Sprawdza cancellation przed/po dekodowaniu; błędny pakiet nie tworzy plików.
+Nie zmienia istniejącego zestawu plików ani formatu stage record.
+Dodano cztery źródłowe regresje: byte-exact round-trip v1/v2 i deterministyczna
+kolejność, uszkodzenia/framing/tożsamość, brak/duplikaty/path traversal oraz
+publikacja/reuse/cancellation bez częściowego zapisu. Parser Rust i diff-check
+PASS; testów jednostkowych nie kompilowano ani nie wykonywano zgodnie z zakazem.
+Te zmiany są późniejsze niż snapshot seq 55. Codec application/CAS, dispatch
+accepted workera i nowe endpointy nie są jeszcze podłączone.
+
+Zlecono zwykły build `fem-cpu-release` seq 56,
+job `4dc9fed201aa4a04a97b155999394321`, ze snapshotu HEAD
+`41a5b8936b3eaa38420e9ba358cbf22ac7e2d803`; source digest
+`a6c9bf8cc42446a36667d4a1d1f9df9403adfb85c5fe83053964edeb409026df`,
+native snapshot `e6da8f8672298d3467fee8943902f50d3452f026dc48fd9dab71bdf524ab0e15`.
+Capture obejmuje nowy package, adapter publikacji i wcześniejsze WIP, z jawnie
+wskazanymi szesnastoma untracked plikami zadania. Przy zgłoszeniu `queued`;
+nie jest dowodem kompilacji ani runtime nowego pakietu. Następny krok:
+terminalny receipt i weryfikacja buildu, następnie podłączenie wersjonowanego
+codeca do output binding/CAS oraz oddzielnego accepted inspection workera.
+
+**Wykonany dowód runtime, odrębny od powyższego nowego pakietu:** managed build
+seq 51 `5f67b9064e8f466dbc6689abe1d55ba6` zakończył się `succeeded`, exit 0.
+Recepta `just run-managed-antenna-standalone-cold-http-ram` zweryfikowała receipt,
+źródła i pakiet oraz uruchomiła wyłącznie zatwierdzoną scenę anteny w tmpfs.
+Run `d13d6b1cc2cc41e193bbd5135fcbdf57`: solver exit 0, warm HTTP PASS,
+cold archive import PASS, ponowny odczyt natywnego bundle PASS. V/J/H i topology
+przeszły odczyt przez API przed/po imporcie; `m`, `H_eff`, `H_demag` są unsupported
+w obu read-modelach. W trakcie importu pierwotny root wyników był niedostępny;
+stary request scope został odrzucony. Procesu API nie restartowano.
+Dowód: `storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/managed-antenna-http-ram-cpu/runs/d13d6b1cc2cc41e193bbd5135fcbdf57/receipt.json`
+oraz `export/gate-result.json`. Nie dowodzi trwałości sesji, zmiany sceny
+magnetycznej na antenową, poprawności browser/WebGL, pełnej naukowej kwalifikacji
+ani reuse LLG/FFT; odpowiednie flagi wyniku nadal false. Nie zmieniono localhost:3197.
+
+**Checkpoint T14/T15, 2026-10-11 — capture wykonania i zależności workera:**
+
+`crates/fullmag-api/src/script.rs::scene_document_to_prepared_script_config`
+jest jawnym capture pełnego authored graph przez istniejący Python DSL.
+`SceneCaptureKind::PreparedExecutionConfig` używa wyłącznie
+`export-scene-config --materialize-geometry-assets`. Dotychczasowe
+`ProblemIr` i `ExecutionConfig` nie dostają flagi i zachowują lekki eksport.
+Nie dodano wyboru pierwszego etapu/portu, drugiego meshera ani wykonania solvera.
+Wybór konkretnego source step, wiązanie profili i gotowość pozostają zadaniem
+callera; **nowego capture nie podłączono jeszcze do endpointu ani Study compiler**.
+Dodano źródłową regresję rozdzielenia trzech trybów helpera.
+Parser Rust/diff-check PASS; test Rust nie był kompilowany ani wykonywany.
+Zmiana jest późniejsza niż capsule seq 55.
+
+Read-only przegląd rzeczywistego workera doprecyzował kolejność dalszej pracy:
+
+1. `accepted_study_worker.rs::expected_output_binding` weryfikuje porty
+   przed dispatch i wspiera tylko magnetyzację oraz total_energy.
+   `fullmag-application/src/execution.rs::is_supported_study_artifact_codec`
+   i `study_artifact.rs::DecodedStudyArtifact` również nie mają inspection.
+   Najpierw potrzebny jest jawny wersjonowany artifact codec dla inspection;
+   nazwa nowego codeca/portu nie jest istniejącym API.
+2. `AntennaExternalLeadSolutionArtifact` zawiera manifest i osobne binarne
+   payloady. Sam JSON manifest z nazwami plików nie wystarcza do cold CAS
+   recovery. Preferowany minimalny kontrakt: jeden bezstratny ograniczony
+   pakiet manifest+payloady, z dokładnymi bajtami, długościami, SHA256,
+   odrzuceniem duplikatów, path traversal i nieoczekiwanych plików.
+   Warstwa application pozostaje bez zależności solverowej; runnerowy
+   `load_antenna_external_lead_solution_manifest` i dekodery sprawdzają
+   semantykę naukową pakietu w adapterze wykonania/odczytu.
+3. Osobny adapter accepted inspection wywoła istniejący
+   `fullmag_runner::execute_antenna_external_lead_inspection`, bez LLG,
+   final_state, horyzontu czasu i magnetycznego accepted state. Native solve
+   jest niepreemptive: cancellation musi być sprawdzone przed/po solve
+   oraz przed publikacją. Nie każdy błąd solvera oznacza anulowanie.
+4. Dopiero z gotowym codec/output/adapter można zastąpić jawny rejection
+   w `study.rs::validate_requested_execution` walidacją legalnego requestu
+   inspection i dodać dispatch według rzeczywistego backend_plan.
+   Magnetyczne guards `accepted_fem_study_worker` pozostają osobne.
+5. Zachować immutable started/completed receipts, CAS budget, deklarację
+   portów, lease/epoch fences, Completing barrier i recovery bez powtórnego
+   solve. Started-only ambiguity nie upoważnia do ponowienia solvera.
+6. CAS publikacja musi mieć adapter do obecnych endpointów inspection;
+   nie tworzy automatycznie CLI stage record. Dowodem końcowym będzie warm
+   oraz cold odczyt V/J/H, brak magnetycznych quantities i zachowanie Stop.
+
+Plan tej ścieżki nie oznacza jej implementacji ani kwalifikacji LLG/per-A/FFT.
+Wymagane regresje: niewłaściwy plan/port/receipt przed solve, zmienione/brakujące
+payloady, przekroczony budget, cancellation, stale lease/epoch, cold recovery
+bez solvera, started-only odmowa i brak regresji magnetycznego workera.
+Przy odczycie seq 51 running, seq 55 queued; istniejących jobów nie restartowano.
+
+**Checkpoint T14/T15, 2026-10-11 — accepted preparation bez odblokowania LLG:**
+
+`crates/fullmag-runtime-control/src/study.rs::AcceptedStudySnapshot::materialize_antenna_external_lead_inspection_preparation_receipt`
+korzysta z osobnego konstruktora inspection. Wspólna prywatna ścieżka z
+dotychczasowym przygotowaniem magnetycznego FEM zachowuje exact step lookup,
+status Planned, niezmienny katalog ProblemIR, ponowne planowanie i porównanie
+z pinned plan, fingerprint RunSpecification, źródło accepted run/step v2
+oraz `PreparationReceipt::ready_for_accepted_run`. Dotychczasowa metoda
+`materialize_fem_preparation_receipt` nadal wybiera tylko constructor time-domain.
+
+`crates/fullmag-api/src/accepted_fem_preparer.rs::accepted_preparation_mesh`
+wybiera własną siatkę/order dla Fem, a `input.combined_mesh` i order 1 dla
+inspection; inne warianty odrzuca. `prepare_accepted_fem_task` wybiera właściwą
+metodę receipt bez zmian w walidacji lease/attempt, replay, lifecycle,
+aktywnym lease, atomowym zapisie i końcowym ponownym odczycie receipt.
+Dodano źródłową regresję zachowania mesh/order magnetycznego Fem i odrzucenia
+Fdm. Parser Rust i diff-check PASS; regresji nie kompilowano ani nie wykonano.
+
+**Istotna otwarta zależność:** `load_accepted_study_snapshot` wywołuje
+`validate_requested_execution`, która nadal jawnie odrzuca inspection.
+Nowy branch preparera nie jest więc jeszcze osiągalnym trwałym workflow
+anteny. `accepted_fem_study_worker.rs::validate_fem_cpu_request` i
+`validate_native_fem_cpu_preflight` również wymagają dokładnie magnetycznego
+Fem; tych bramek nie rozluźniono. Osobne wykonanie inspection musi dostać
+właściwy kontrakt request/provenance/worker/artifacts przed dopuszczeniem.
+Nie należy jedynie usuwać rejection albo przepuszczać inspection do LLG.
+Read-only review subagenta potwierdziło te zależności w rzeczywistych źródłach.
+
+Ten fragment powstał **po capture seq 55** i nie należy do jego kapsuły.
+Przy odczycie runnera seq 51 nadal running, seq 55 queued. Kompilacja,
+runtime replay i kompletna ścieżka browser-to-solve pozostają NOT VERIFIED;
+bez nowego endpointu/OpenAPI, bez restartu localhost:3197 i bez zmiany fizyki.
+
+**Checkpoint T14/T15, 2026-10-11 — osobny kontrakt przygotowania źródła:**
+
+`crates/fullmag-plan/src/preparation.rs::PreparationMaterialization`
+ma osobne konstruktory
+`from_antenna_external_lead_inspection_execution_plan` i
+`from_antenna_external_lead_inspection_execution_plan_for_accepted_run`.
+Wymagają dokładnie wariantu `AntennaExternalLeadInspection`, zgodności
+requested backend oraz resolved FEM. Weryfikują native evidence dla
+`input.combined_mesh`, H1/P1, bez przypisywania raportu jakości pierwotnego
+urządzenia do siatki z doprowadzeniami. Wspólny prywatny producer zachowuje
+dotychczasowe pięć certyfikatów, walidację markerów, DOF, Jacobianu i fingerprintów.
+Stare konstruktory time-domain FEM nadal odrzucają wariant antenowy.
+Accepted constructor zachowuje źródło run/step v2 bez Live scene revision.
+
+`crates/fullmag-application/src/preparation.rs::materialize_antenna_external_lead_inspection_preparation_from_problem`
+planuje kanoniczny ProblemIR i wiąże receipt z pełnym fingerprintem problemu,
+geometrią oraz display projection. Odrzuca nieobiektową projekcję, zerową
+rewizję oraz magnetyczny plan FEM. Jest eksportowany przez application API,
+ale **nie podłączono go jeszcze do Live/accepted materializer ani UI readiness**.
+Nie zmieniono lease/replay ani zabezpieczeń Run/Relax.
+
+Dodano cztery regresje źródłowe w
+`crates/fullmag-plan/src/antenna_current_source.rs::tests` wykorzystujące
+rzeczywisty istniejący fixture planu inspection: combined vs original mesh,
+typed variant/backend guards, błędny native producer/order/DOF/Jacobian/marker
+correspondence oraz accepted identity. Native evidence jest jawnie syntetyczną
+fixture kontraktu, nie wynikiem uruchomienia MFEM. Piąta regresja w
+`crates/fullmag-application/src/preparation.rs::tests` sprawdza odrzucenie
+nieprawidłowych wejść Live i magnetycznego planu.
+
+Dowody bieżącego fragmentu: parser Rust przez `rustfmt --emit stdout` PASS,
+diff-check PASS, review źródeł i konsumentów. **Testów Rust nie kompilowano
+ani nie wykonano** zgodnie z tymczasowym zakazem; typecheck/build/runtime
+nowego fragmentu pozostają NOT VERIFIED do terminalnego buildu i właściwych
+bramek. Receipt H1 nie dowodzi rozwiązania V/J/H, RT0, zamkniętego obwodu,
+normalizacji per-A, FFT ani kwalifikacji sprzężenia LLG. Scena localhost:3197
+nie została zmieniona ani zrestartowana.
+
+Snapshot tego fragmentu wraz z wcześniejszym WIP zgłoszono do jednego
+runnera jako **seq 55**, job `713429ba647141248db59382c09522a7`, profil
+`fem-cpu-release`, stan zgłoszenia `queued`, base HEAD
+`41a5b8936b3eaa38420e9ba358cbf22ac7e2d803`.
+Source digest:
+`6c508b09ca0f55a54c6b75d4f3c2fb605dfdda45fa35fb0814badc8ed7013313`.
+Native snapshot:
+`703524bf128d209d2994b35568a6d0fcee03edaf820e4c618882b5a658f16c23`.
+Jawnie włączono 15 nieśledzonych plików wymaganych przez wcześniejsze WIP,
+w tym composer i jego regresję DOM. Capture wykonano po zakończeniu zapisów
+subagenta. Odczyt zdrowia runnera poza sandboxem: running/accepting_jobs true,
+executor_error null; nie restartowano koordynatora. Sukces wymaga terminalnego
+receipt i weryfikacji hashy artefaktów, nie samego przyjęcia zadania. Ten wpis
+z numerem joba powstał już po capture; nie zmienia to tożsamości kapsuły.
+
+**Checkpoint T14/T15, 2026-10-11 — geometry-full capture jako jawne opt-in:**
+
+Zapisano lokalny commit etapu
+`41a5b8936b3eaa38420e9ba358cbf22ac7e2d803`:
+`Preserve scene pipeline ownership and opt in to execution geometry`.
+Obejmuje wyłącznie `scene_document_ir.py`, `helper.py` i
+`test_scene_execution_config.py`, bez innych zmian worktree.
+
+`packages/fullmag-py/src/fullmag/runtime/scene_document_ir.py::scene_document_to_execution_config`
+ma keyword-only `materialize_geometry_assets: bool = False`. Domyślnie
+pozostaje geometry-light. Jawne True propaguje istniejącą opcję
+`include_geometry_assets` do base IR oraz `RunConfigExportOptions`, więc
+rzeczywiste etapy korzystają z dotychczasowego `Problem.to_ir` i jego
+producerów geometrii/doprowadzeń. Nie wprowadzono drugiego meshera,
+nowego ProblemIR ani fallbacku urządzenia. Nieboolean daje TypeError.
+`helper.py::build_parser` i `main` udostępniają flagę
+`export-scene-config --materialize-geometry-assets`; zwykły `export-scene-ir`
+pozostaje bez tego opt-in. Nie podłączono jeszcze Rust Live/accepted caller.
+
+Dowody: **28/28** interpretowanych regresji sceny oraz **32/32** testy
+eksportu anteny, round-trip doprowadzeń i inventory z **35** podtestami PASS.
+Pierwsze uruchomienie inventory odmówiło z powodu brakującego
+FULLMAG_TEST_TEMP_ROOT; po wskazaniu istniejącego katalogu na D cały zestaw
+przeszedł. Regresje nowego routing opt-in używają jawnych mocków producerów:
+nie są dowodem zbudowania rzeczywistej siatki ani wykonania solvera.
+Sprawdzają brak mutacji sceny, zachowanie requested backend, propagację do
+każdego etapu, domyślny lekki eksport, typ flagi oraz argumenty helpera.
+Przejrzano cały staged diff; staged/diff-check PASS. Commit nie oznacza
+integracji z master ani kwalifikacji całego modułu.
+
+Seq 51 nadal running, seq 53 queued przy ostatnim odczycie API. Ich kapsuły
+mają wcześniejszy base HEAD i nie zawierają tego opt-in ani późniejszego
+composera portu. Nie należy używać nowego HEAD jako pinu starszego buildu.
+
+Doprecyzowany następny krok receipt: osobne konstruktory inspection w
+`crates/fullmag-plan/src/preparation.rs::PreparationMaterialization` mogą
+ponownie wykorzystać istniejące pięć producer kinds, certyfikaty i native
+H1/P1 validation bez zmiany wire shape. Stare time-domain konstruktory
+muszą nadal odrzucać inspection. Źródłem jest wyłącznie
+`AntennaExternalLeadInspectionBackendPlanIR.input.combined_mesh`, order 1,
+bez podpinania raportu jakości original device ani magnetic shared mesh.
+Full ProblemIR fingerprint i immutable accepted identity wiążą sigma,
+port, sampling i interfejsy; mesh/space reuse nie certyfikuje operatora
+przewodnictwa. Receipt dowodzi przygotowania siatki/H1, nie RT0/V/J/H,
+zamkniętego obwodu, per-A, FFT ani LLG. Materializacja Live/accepted,
+lease/replay, właściwa readiness frontendu i runtime pozostają otwarte.
+
+**Checkpoint T14/T15, 2026-10-11 — jawny wybór portu w Inspectorze:**
+
+`apps/control-room/src/modules/inspector/panels/antenna/AntennaStudyStageComposer.tsx::AntennaStudyStageComposer`
+jest częścią `AntennaCompositionPanels.tsx::AntennaCompositionPanel` dla
+węzła solution. Pokazuje porty dokładnej definicji i dodaje do Study jeden
+jawnie wybrany port przez istniejącą komendę i historię authoringu. Nie
+kopiuje definicji, nie uruchamia transportu/LLG/Relax i nie certyfikuje pola.
+Przy jednym porcie wybór jest jednoznaczny; przy wielu portach nie ma
+automatycznego wyboru pierwszego. Zmieniona komenda
+`antennaFieldSolveStudyCommand.ts::antennaFieldSolveStudyStages` przyjmuje
+opcjonalny `portModeId`, sprawdza jego jednoznaczne członkostwo w definicji
+oraz właściciela i transport. Powtórzenie tego samego wyboru jest idempotentne;
+inny port przy już istniejącej referencji daje konflikt, nie nadpisanie.
+Inspector etapu sprawdza jeden wybrany port w inventory, zamiast błędnie
+wymagać równości z całym katalogiem portów definicji.
+
+Lokalny stan zawiera wyłącznie wybór portu i feedback. Komenda odczytuje
+autorytatywną scenę i zachowuje base_revision/Undo/session fences. Pending
+dotyczy tylko przycisku enqueue; selektor i inne kontrolki nie są przygaszane.
+ACK starej sesji lub opuszczonego targetu nie aktualizuje nowego panelu.
+Źródłowe regresje obejmują multiport, niezmienność definicji, idempotencję,
+konflikt, tożsamość selektora podczas refresh/pending/ACK i starą sesję.
+TypeScript noEmit, targeted ESLint, API hygiene, architecture hygiene oraz
+diff-check: **PASS**. Vitest/DOM **NIEWYKONANE**, browser **NOT VERIFIED**.
+Te zmiany powstały po capture seq 53 i **nie są w jego kapsule**.
+
+**Następny etap — dedykowana preparacja źródła, nie usunięcie guardów:**
+
+Przegląd rzeczywistego kodu potwierdził niezależny producer wejść:
+`packages/fullmag-py/src/fullmag/runtime/antenna_lead_materialization.py::materialize_antenna_lead_preparations`
+oraz `packages/fullmag-py/src/fullmag/meshing/_antenna_external_lead_preparation.py::prepare_antenna_external_lead_source`.
+Tworzą siatkę przewodnika/stubów i konserwatywne wejście prądowe; receipt
+`input_prepared_not_solved` przy external_electrode_truncation nie kwalifikuje
+zamkniętego obwodu, per-A, source FFT ani LLG. Nie należy opisywać go jako
+wyniku rozwiązania V/J/H. Natywny
+`crates/fullmag-runner/src/native_fem/mesh_preparation.rs::prepare_fem_mesh_space`
+może przygotować H1/P1 na rzeczywistym combined_mesh bez magnetyzacji;
+nie produkuje sam RT0 ani wyniku transportu.
+
+Potwierdzone bariery do naprawy w jednej spójnej ścieżce:
+
+1. `crates/fullmag-api/src/script.rs::scene_document_to_problem_ir` odmawia
+   explicit FEM już przed plannerem. Nie wystarczy zmienić późniejszy guard.
+2. Geometry-light capture w
+   `scene_document_ir.py::scene_document_to_execution_config` nie wykonuje
+   materializacji doprowadzeń. Potrzebna jest jawna execution-only trasa
+   geometry-full, bez zmiany domyślnego lekkiego eksportu authoringu.
+3. `live_scene_preparation.rs::materialize_live_scene_preparation`,
+   `accepted_fem_preparer.rs::prepare_accepted_fem_task` oraz
+   `preparation.rs::PreparationMaterialization::from_fem_execution_plan_with_identity`
+   wymagają time-domain `BackendPlanIR::Fem`. Potrzebny jest osobny typed
+   materializer dla istniejącego `AntennaExternalLeadInspection`, bez
+   podmieniania planu na magnetyczny FEM i bez wyłączania lease/replay guards.
+4. Receipt musi związać immutable step/port/current/source, input pins,
+   stable IDs, sigma, interfaces, combined_mesh/native H1 oraz oddzielne
+   sampling provenance. Gotowość raw inspection nie oznacza per-A/FFT/LLG.
+5. Frontend musi rozróżnić source preparation i magnetic shared-domain
+   preparation. Run/Relax zachowują dotychczasowe wymagania. Regresje muszą
+   objąć zmianę geometrii/sigma/portu, obce native evidence, forced GPU,
+   standalone oraz mixed pipeline i zachowanie magnetycznej continuation.
+
+To otwarty zakres implementacji, nie gotowy produkt ani nowa kwalifikacja.
+Sesja użytkownika na 3197 pozostała nienaruszona.
+
+**Checkpoint T14/T15, 2026-10-11 — pusty pipeline bez ukrytego Run/Relax:**
+
+`crates/fullmag-authoring/src/scene_study_plan.rs::scene_document_to_study_plan`
+i `packages/fullmag-py/src/fullmag/runtime/scene_document_ir.py::scene_document_to_execution_config`
+respektują obecność kanonicznego dokumentu także przy pustych lub wszystkich
+wyłączonych węzłach. Nie wznawiają dormant flat stages. Brak dokumentu albo
+`null` zachowuje ścieżkę płaską. Nieobsługiwana wersja jest odrzucana.
+Python odrzuca także nieobiektowy dokument i niepoprawny typ listy nodes.
+
+Zgodnie z serde w `builder.rs::StudyPipelineDocument` pominięte version
+oznacza `study_pipeline.v1`, a pominięte nodes pustą listę. Adapter
+`studyStageSource.ts::readStudyStageSource` obsługuje te same defaults;
+explicit null dla tych pól pozostaje błędem. Nie dopisuje defaults do
+oryginalnego dokumentu. Polecenie
+`antennaFieldSolveStudyCommand.ts::antennaFieldSolveStudyStages` sprawdza
+ten adapter przed enqueue; nie waliduje dormant flat list jako wykonywanego
+źródła i potrafi dodać węzeł do legalnego `{}`. Odmawia definicjom z zerem
+lub wieloma portami, ponieważ obecne materializery obsługują dokładnie
+jeden jawny port na etap. Nie wybiera pierwszego portu automatycznie.
+Wybór jednego portu z definicji wieloportowej w UI pozostaje otwarty.
+
+Interpretowany `test_scene_execution_config.py`: **20/20 PASS**. Istniejąca
+regresja autosave wcześniej edytowała dormant flat payload przy aktywnym
+pipeline; teraz osobno sprawdza round-trip rzeczywistego źródła flat i
+pipeline, z tymi samymi wymaganiami dla table_id i expressions.
+TypeScript noEmit, targeted ESLint, API hygiene, architecture hygiene
+i diff-check: **PASS**. Regresje Rust/Vitest są zapisane, lecz zgodnie
+z zakazem **NIEKOMPILOWANE/NIEWYKONANE**. Nowe zmiany nie są w kapsule 51.
+Build 51 osiągnął stan running; nie jest jeszcze dowodem terminalnego
+sukcesu. Browser, wykonanie aktualnej wersji, przygotowanie źródła,
+pełny obwód, per-A, LLG/FFT i kwalifikacja wydania pozostają otwarte.
+
+Aktualny snapshot zgłoszono jako **seq 53**, job
+`6b4e16db7616430f96c98dd11e09a899`, profil `fem-cpu-release`, stan queued:
+base HEAD `bbdf165066fc51a925e873f71f1f21ee943399e9`, source digest
+`4afa3892120a40065c10cd4c5604a0617ec1e41c8060f08784867082708c8236`,
+native snapshot
+`2707892ce285f74a9255f6d2a7e956b679fe6129cf16b70efa6b444de658d9d7`.
+Capture jawnie obejmuje wszystkie 13 nowych plików wymienionych w aktualnym
+git status, w tym wspólny adapter, dedykowany Inspector i regresje.
+To zwykły build backendu/frontendu, nie zadanie kompilacji testów.
+Nie anulowano starszego joba ani nie zmieniono sesji użytkownika na 3197.
+Po terminalnym sukcesie należy zweryfikować receipt/artefakty, wykonać
+oddzielny standalone V/J/H warm+cold API gate oraz browser gate tej wersji;
+sukcesy starszych kapsuł nie kwalifikują nowych zmian.
+
+**Checkpoint T14/T15, 2026-10-11 — jeden wybór portu w obu materializerach:**
+
+Po poprzednim checkpointcie ujednolicono źródłowo regułę wyboru portu:
+`crates/fullmag-application/src/script_stage_materialization.rs::select_antenna_port_reference`
+jest używany przez `resolve_explicit_stage_action` oraz
+`materialize_pipeline_antenna_field_solve`. Dozwolony jest niepusty singular
+przy pominiętym/pustym plural albo plural z dokładnie jednym niepustym stringiem
+przy pominiętym singular. Oba niepuste pola są odrzucane, także gdy wskazują
+ten sam port; identyfikatory nie są automatycznie trimowane ani podmieniane.
+Pipeline sprawdza również typ plural, zamiast ignorować go przy singular.
+Nieprawidłowy wybór kończy się przed wyborem inventory i mutacją current IR.
+
+To celowe zaostrzenie wcześniejszej ścieżki pipeline, a nie migracja payloadu:
+importy korzystające z dawnego ignorowania plural muszą jawnie usunąć
+niejednoznaczne pole. Semantyka poprawnych singular/plural oraz format JSON
+nie zmieniły się. `StudyStageAuthoringModel.ts::antennaFieldSolvePortReferences`
+i `validateStudyStageDraft` stosują tę samą regułę; niepusty dual-form jest
+błędem, nie tylko ostrzeżeniem. Inspector korzysta z tego samego helpera.
+
+Dodano źródłowe regresje resolvera i odmowy bez mutacji oraz dopasowano
+regresję UI. Rust/Cargo/Vitest **NIEKOMPILOWANE/NIEWYKONANE** zgodnie z zakazem.
+TypeScript noEmit, targeted ESLint, API hygiene, architecture hygiene i
+diff-check: **PASS**. Kompilacja zwykłego backendu i wykonanie tej poprawki
+pozostają **NOT VERIFIED**; nie należy przypisywać jej wyników buildu 50 ani
+kapsuły 51, utrwalonej przed zmianą. Build 51 nadal queued; źródłowa poprawka
+nie zamyka bramek przygotowania anteny, pełnego obwodu, per-A, LLG/FFT ani UI.
+
+**Checkpoint T14/T15, 2026-10-11 — odczyt kanonicznego pipeline i ochrona zapisu:**
+
+Dodano wspólny adapter
+`apps/control-room/src/shared/domain/study/studyStageSource.ts::readStudyStageSource`.
+Korzystają z niego `sceneModelTreeAdapter.ts::sceneStudySnapshot`,
+`StudyInspectorPanelModel.ts::studySnapshotFromScene` oraz kontroler
+`StudyInspectorPanel.tsx::useStudyInspectorPanelController` i jego
+`rawStudyStages`. Istniejący pipeline ma pierwszeństwo nad płaską listą,
+również gdy jest pusty. Nieznana wersja, brakujące/duplikowane ID, nieprawidłowy
+payload lub rodzaj węzła dają stan invalid, bez ożywienia dormant stages.
+Makro czytane jest z `config`, nie z `payload`, i nie jest pozornie rozwijane.
+
+Projekcja zachowuje kolejność liści, oryginalny payload/config, zewnętrzne ID,
+etykietę, ścieżkę ID grup i efektywne enabled uwzględniające przodków.
+Metadane adaptera pozostają poza publicznym payloadem. Węzeł anteny rozwiązuje
+definicję przez oryginalne `payload.stage_id`, a wybór oraz telemetrię przez
+outer ID. Explorer oznacza wyłączenie w badge; Inspector pokazuje efektywne
+enabled i grupy. `sceneModelTreeAdapter.ts::modelTreeSnapshotWithStageExecution`
+i `StudyInspectorPanelModel.ts::resolveStudyInspectorModel` nie fallbackują
+na indeks dla węzłów pipeline. Aktywny indeks runtime jest tłumaczony przez
+ID rzeczywistego runtime record, zamiast wskazywać inny authored leaf.
+
+To etap inspekcji, **nie kompletna edycja strukturalna pipeline**. Szkice
+pipeline są zachowane do odczytu, bez rekonstrukcji Run/Relax z defaultów.
+Save jest wyłączony; toolbar płaskiej edycji nie jest dostępny.
+`StudyStageAuthoringModel.ts::buildStudyStagesMergePatch` odmawia zapisu przy
+pipeline z najnowszej sceny lub pipeline-bound draft. Komendy płaskiego
+Add/Remove sprawdzają zasób i ponownie authoritative scene przed transakcją.
+Dedykowane referencyjne enqueue anteny pozostaje osobną, zachowującą dokument
+ścieżką. Pełna edycja musi aktualizować dokładny węzeł najnowszego dokumentu
+z base_revision, zachowując grupy, rodzeństwo, makra, enabled/collapsed,
+source/notes i oba rodzaje ID; ta część nadal jest otwarta.
+
+Przegląd źródeł ujawnił dwa niezależne kontrakty wymagające dalszej naprawy:
+
+- `crates/fullmag-application/src/script_stage_materialization.rs::materialize_pipeline_antenna_field_solve`
+  nadaje pierwszeństwo `port_mode_id`; przy jego braku przyjmuje dokładnie
+  jeden element `port_mode_ids`. `resolve_explicit_stage_action` odrzuca
+  część kombinacji obu pól, zamiast stosować tę samą regułę. UI teraz
+  odczytuje singular, zachowuje oba pola bez normalizacji i ostrzega o dual-form.
+  Walidacja szkicu nie przedstawia wieloportowej instrukcji jako wykonawczego
+  etapu obsługiwanego przez obecną ścieżkę. Backendowe ujednolicenie jest otwarte.
+- `crates/fullmag-application/src/script_stage_materialization.rs::materialize_script_stages_with_stage_limit`
+  respektuje pusty/all-disabled pipeline, ale
+  `crates/fullmag-authoring/src/scene_study_plan.rs::scene_document_to_study_plan`
+  oraz `packages/fullmag-py/src/fullmag/runtime/scene_document_ir.py::scene_document_to_execution_config`
+  mają warunki niepustych nodes. Frontend nie naprawia tej niespójności
+  cichym fallbackiem; potrzebne są osobne regresje i zgodność round-trip/runtime.
+
+Dowody dla aktualnych źródeł: TypeScript noEmit **PASS**, narrow ESLint
+**PASS**, API hygiene **PASS**, architecture hygiene **PASS**, diff-check
+**PASS**. Dodano regresje projekcji, pustej/nieznanej wersji, grup/makr,
+duplikatów ID, singular/dual-form, odmowy flat write i obcego runtime ID.
+Vitest **NIEWYKONANY**; browser gate nowych zmian **NOT VERIFIED**.
+Nie zmieniano sceny ani procesu localhost:3197. Zmiany nie są częścią buildu 51.
+Koordynator zwrócił running=true, accepting_jobs=true, executor_error=null;
+job `5f67b9064e8f466dbc6689abe1d55ba6` nadal queued, bez terminalnego wyniku.
+Pełny T00–T18 pozostaje nieukończony, w tym source preparation, zamknięcie
+obwodu/kwalifikacja pól per-A, sprzężenie LLG/FFT, browser acceptance i integracja.
+
+**Checkpoint T14/T15, 2026-10-11 — dedykowany etap i Inspector, weryfikacja źródeł:**
+
+Po utrwaleniu kapsuły buildu 51 dodano semantyczny węzeł
+`study.stage.antenna_field_solve` oraz dedykowany
+`AntennaFieldSolveStageInspector`. Explorer zachowuje identyfikator wpisu
+kolejki, oddzielny od referencji `payload.stage_id`. Router korzysta z jednego
+istniejącego kontrolera Study i zasobu sceny; panel nie dodaje własnych
+endpointów ani subskrypcji. `StudyStageAuthoringModel.ts::createStudyStageDraft`
+rozpoznaje referencyjny solve, a `studyStageDraftToSceneStage` zachowuje jego
+pełny payload bez dodawania parametrów Run/Relax. Definicja, obiekt źródłowy,
+transport, uporządkowane porty, model, realizacja i deklarowane wyjścia są
+pokazane osobno; brak lub niejednoznaczność definicji i rozbieżność portów
+wywołują błąd informacyjny. Nie jest to certyfikat gotowości fizycznej.
+
+Parametry mają jednego właściciela w inventory anteny. Referencji nie można
+utworzyć jako pustego default stage ani zmienić jej rodzaju/ID tym edytorem.
+`StudyInspectorPanel.tsx::studyInspectorPanelReducer` blokuje duplikowanie takiego
+wpisu, a przycisk Duplicate jest wyłączony: zmiana samego ID szkicu nie
+tworzyłaby drugiej definicji solve. Dla regionalnego wymuszenia etykiety
+Explorer, Ribbon, komendy i Inspector zmieniono z „Antenna” na „Field Drive”.
+Opis jawnie odróżnia zadane pole i FFT przebiegu czasowego od solve
+przewodnictwa/Oersteda i przestrzennego widma wzbudzenia.
+
+Dowody: TypeScript `--noEmit --incremental false` **PASS**, narrow ESLint
+**PASS** (w tym nowe panele i zmienione etykiety), API hygiene **PASS**,
+architecture hygiene **PASS**, `git diff --check` **PASS**. Dodano regresje
+referencji, niedozwolonych portów, braku jawnej definicji, selekcji outer ID
+i routingu. Vitest **NIEWYKONANY** zgodnie z zakazem kompilowania testów
+jednostkowych. Browser gate nowego panelu **NOT VERIFIED**: tylko odczyt
+istniejącej karty localhost:3197 wykazał pustą scenę oraz inną wersję backendu;
+nie importowano fixture, nie restartowano i nie zmieniono modelu użytkownika.
+Te nowe zmiany UI nie należą do kapsuły buildu 51.
+
+Potwierdzona luka pipeline jest szersza niż sam builder węzła:
+`sceneModelTreeAdapter.ts::sceneStudySnapshot` oraz
+`StudyInspectorPanel.tsx::rawStudyStages` czytają tylko `study.stages`.
+`StudyStageAuthoringModel.ts::buildStudyStagesMergePatch` zapisuje tę płaską
+listę. Dlatego obsługa `study_pipeline.v1` przez enqueue nie dowodzi, że
+Explorer/Inspector potrafią ją pokazać i edytować. Dalsza implementacja musi
+wspólnie obsłużyć adapter, model szkicu, selekcję i revision-scoped zapis,
+zachowując grupy, disabled nodes, payload, outer ID oraz pierwszeństwo
+kanonicznego pipeline. Niedopuszczalne jest pozorne „spłaszczenie naprawcze”
+ani zapis ignorowanej listy `stages` obok aktywnego pipeline. Ta bramka,
+niemagnetyczne source preparation oraz rzeczywisty solve z UI pozostają otwarte.
+
+Ostatni odczyt kolejki: build 51 `5f67b9064e8f466dbc6689abe1d55ba6`
+pozostaje `queued`, exit code nieustalony. Poprawka katalogu standalone
+quantities nadal wymaga jego terminalnego sukcesu oraz powtórzenia warm/cold
+HTTP na dokładnej kapsule. Nie przypisujemy wyników buildu 50 nowszym źródłom.
+
+**Checkpoint wykonania 2026-10-11 — build 50 i rzeczywiste V/J/H:**
+
+Job `42545c4994424eeca8c2c9bd21ce365c` zakończył się `succeeded`, exit 0.
+Managed launcher zweryfikował terminalny receipt, trusted documents, wymagane
+artefakty oraz dokładną kapsułę źródeł przed uruchomieniem solvera.
+Baza: `bbdf165066fc51a925e873f71f1f21ee943399e9`; source digest
+`20af0bafd6f2e571a963125eea5b48a66875edb134d735617635b10506b2a821`;
+native snapshot `1e7bbecf1f8b85966e2fc59091c9cdba6d0835ab9601982e92ba7123dc259a93`.
+Backend, Python core, frontend produkcyjny i TypeScript zostały zbudowane.
+
+Przypięty standalone RAM run `b411a99ff8874f3ca38f051ca5627b33`
+wykonał solve bez magnetyka, Run i Relax. Porównanie eksportu: **PASS**.
+Maksymalne błędy: V `1.1102230246251565e-16 V`, J
+`4.440892098500626e-16 A/m²`, H `6.760249178929324e-9 A/m`, momenty
+RT0 `2.220446049250313e-16 A`; suma strumieni każdego elementu `0 A`.
+Zakres: 16 próbek V, 4 H, 12 środków J, 48 lokalnych próbek J,
+108 ścian i 36 elementów RT0. Raport `export/V-J-H-comparison.json`
+w run directory profilu `managed-antenna-ram-cpu` jest zachowany w storage.
+Jest to jeden model z obcięciem na elektrodach, nie kwalifikacja zamkniętego
+obwodu, per-A, całej fizyki, reusable LLG/FFT ani trwałego storage.
+
+HTTP/cold run z probe `b48ce621f4d84ba690a2e71b2e8436c4`
+w profilu `managed-antenna-http-ram-cpu`: solver exit 0, warm read-back
+V/J/H **PASS**, `cold_archive_import=PASS`,
+`native_canonical_bundle_redecoded=true`. Sprawdzono 12 rodzajów payloadów
+display i odmowy pięciu nieprawidłowych owner guards. Nie jest to test
+konkurencyjnego wyścigu, timeoutu, LLG ani authoringu UI. Scena użytkownika
+na localhost:3197 nie została zmieniona.
+
+Standalone HTTP run `65577b5774544e87ba1e69b1c7588092` zaliczył
+solver i oba smokes V/J/H, ale **cała bramka FAIL przed cold import**.
+Diagnostyczne powtórzenie `df572324891f490882ae3e2f1221c60d` wykazało
+dokładny stan `m`: capability/solver `unknown`, materialization
+`unmaterialized`, requestable/materializable `false`. Nie było dostępnego
+magnetycznego payloadu; błędem jest nierozstrzygnięty katalog dla jawnie
+niemagnetycznego planu. `router_v2/handlers/data/quantities.rs::annotate_runtime_quantity_state`
+wracał przed użyciem kanonicznego unavailable resolvera przy capabilities=None.
+Poprawka źródłowa kieruje standalone do tego resolvera dla całego katalogu,
+pozostawiając `unknown` dla nieprzygotowanego workspace. Dwie regresje Rust
+są napisane, **niekompilowane**. Poprawka powstała po buildzie 50 i wymaga
+nowego buildu oraz rzeczywistej ponownej bramki standalone warm/cold.
+
+Po buildzie 50 dodano również komendę
+`antennaFieldSolveStudyCommand.ts::addAntennaFieldSolveStudyCommand`
+i menu Explorer „Add Field Solve to Study”. Referencja jest revision-scoped,
+bez kopiowania fizyki i bez certyfikowania readiness. Zachowuje pipeline v1,
+grupy, disabled nodes i oddzielne outer ID / payload.stage_id; konflikty
+odmawiają, wersje nieobsługiwane nie są zgadywane. Kontrola TypeScript
+`--noEmit --incremental false`, targeted ESLint, API hygiene i diff-check:
+**PASS** po uzupełnieniu typed fixture. Regresje Vitest napisane, niewykonane;
+browser gate, stage Inspector i właściwe source preparation nadal otwarte.
+
+Rzeczywisty start standalone ujawnił też brak dopuszczenia `--standalone`
+w `scripts/just_storage_shell.sh`. Naprawiono oba dispatchery RAM/HTTP
+bez wykonania dowolnego recipe text. Interpretowany test odtworzył odmowę
+obu nowych recept przed poprawką; po poprawce **10 testów PASS**, w tym
+odmowy composite commands, dodatkowych i powtórzonych flag. Te zmiany host
+tools nie są przypisywane kapsule solvera 50.
+
+**T14/T15 — luka pełnego przepływu UI, 2026-10-11, potwierdzona w kodzie:**
+Aktualizacja po checkpointcie powyżej: enqueue jest teraz zaimplementowane
+i ma zielony typecheck/lint; jego browser gate nadal otwarty. Build 51
+`5f67b9064e8f466dbc6689abe1d55ba6` z poprawką katalogu i enqueue został
+przyjęty jako `queued`, bez terminalnego wyniku. Source digest
+`2d6d101f508a4a126a82385a3647ba7b51e3997a3fe746fa8ad965be556625ba`,
+native snapshot `493d0d5964af176f69f36cf26cb4f258905f3746329efd3cc776268d3292199e`,
+baza jak w buildzie 50. Kapsuła jawnie zawiera sześć nowych nieśledzonych
+plików; późniejsze checkpointy nie są przypisywane temu buildowi.
+Regresje host HTTP po poprawie diagnostyki: **68 testów PASS**.
+
+Niezależny od buildu 50 przegląd wykazał, że obecnego UI nie można jeszcze
+uznać za kwalifikowane „utwórz antenę → oblicz → pokaż V/J/H”.
+`geometryLifecycleCommandContributions.ts` zapisuje inventory solve/port/current,
+lecz nie etap `study.stages`. Ribbon „Antenna” wywołuje
+`study.add-field-drive-stage` (regionalne pole sinc), nie solve przewodnictwa.
+`StudyStageAuthoringModel.ts::stageKind` nie obsługuje `antenna_field_solve`;
+importowany payload jest zachowany jako unsupported/read-only. Panel solution
+czyta wyniki, ale nie dołącza solve do pipeline.
+
+Druga luka jest w execution, nie tylko w przycisku:
+`crates/fullmag-api/src/live_scene_preparation.rs::materialize_live_scene_preparation`
+odmawia dla FEM każdego wariantu innego niż `BackendPlanIR::Fem`.
+`studyRuntimeCommandContributions.ts::runtimeCommand` oraz
+`livePreparationMaterialization.ts::materializeCurrentLivePreparation`
+wymagają aktualnego shared-domain mesh także przed solve standalone.
+Nie wolno obejść tego fake magnetykiem ani time-domain planem.
+To dowód źródłowy; request preparation nie został jeszcze wykonany.
+
+Wymagane dalsze kroki T14/T15, bez tworzenia drugiego endpointu/fizyki:
+1. Dodać jawną, scoped komendę dołączenia istniejącej definicji solve do Study:
+   referencyjny payload `kind=antenna_field_solve`, `stage_id`, `port_mode_ids`,
+   zgodny z `script_builder.py::_export_study_pipeline_node`; kontrola
+   ownership, revision, konfliktów i duplikatów, zachowanie innych etapów.
+2. Dodać dedykowany Inspector/Explorer etapu i rozdzielić etykiety regionalnego
+   wymuszenia od solve prądu/pola. Parametry fizyczne mają jednego właściciela
+   w inventory anteny; etap nie tworzy ich kopii.
+3. Zaprojektować i wdrożyć preparation receipt/readiness dla rzeczywistego
+   standalone planu, oddzielnie od magnetycznej shared-domain mesh.
+   Zachować requested/resolved execution, scene revision i integralność źródeł.
+4. Rozdzielić readiness authoringu od kwalifikacji wyników basis w
+   `shared/domain/physics/antennaStageValidation.ts::antennaStageValidationMessages`.
+   Obecny wymóg gotowego ConservativeCurrentView daje błędny status dla
+   jawnego current-source/lead-preparation requestu. Walidator nie steruje
+   prepare/solve eligibility; jego poluzowanie samo nie uruchomi solvera.
+5. Uzupełnić edytory faktycznego source/lead-preparation, prądów i geometrii
+   doprowadzeń/powrotu. Domyślny microstrip ma jedynie terminale/materiały
+   oraz umowny view ref; nie jest gotowym fizycznym źródłem.
+6. Wykonać browser gate create/configure → prepare → solve → real V/J/H,
+   ze stabilnością Inspectora i ownership. Import wcześniej kompletnego DSL
+   nie zastępuje bramki authoringu nowej anteny w UI. Raw inspection nie
+   kwalifikuje per-A, źródłowego FFT ani sprzężenia LLG.
+
+**Standalone → jawnie zadany Run — 2026-10-11, authoring/export PASS:**
+Regresja `test_standalone_then_run_captures_independent_authored_magnetic_state`
+w `packages/fullmag-py/tests/test_antenna_standalone_authoring.py` sprawdza
+oba integratory Heun/RK4. Pierwszy etap pozostaje niemagnetyczny, bez dynamics
+i energii; drugi ma osobno zadany magnetyk, magnetyzację początkową +x,
+`fix_dt=1e-15 s` i politykę tabeli mx/my/mz. Eksport zachowuje rozdzielone IR
+oraz czas Run; nie dodaje fikcyjnego action Run ani domyślnego solved drive.
+Tabela pozostaje `sampling.table_autosave`, nie polem w `sampling.outputs`.
+Wynik pliku: **7 testów i 4 subtesty PASS**, bez uruchamiania solvera.
+To dowód capture/eksportu, nie wykonania LLG, continuation magnetyzacji
+ani sprzężenia pola anteny z Run. Test dopisano po utrwaleniu kapsuły buildu 50;
+nie należy przypisywać go źródłom tego buildu. Native/runtime pozostają otwarte.
+Łączna kontrola bieżących bramek RAM/HTTP/porównania i authoringu:
+**136 testów i 4 subtesty PASS**. Walidator mapy źródeł noty 0950: exit 0.
+Następnie dodano `test_standalone_then_relax_preserves_nonmagnetic_stage_snapshot`:
+eksport późniejszego Relax z jawnie zadanym magnetykiem i m0=+y nie zmienia
+wcześniejszego niemagnetycznego IR anteny ani nie aktywuje automatycznego drive.
+Aktualny plik authoringu: **8 testów i 4 subtesty PASS**. Nie wykonano Relax;
+nie jest to kwalifikacja runtime continuation ani reuse pola w LLG.
+
+**Build 50 i baseline Run — 2026-10-11, obserwacja wykonania:**
+Potwierdzono żywy, dokładnie przypisany jobowi kontener builda
+`3e80f8dfa4d286efd70cc7c3bf54e22733a382ba04e3c7cfbc1f58d39ce86cb0`.
+Początkowo działał tylko trusted Python przygotowujący/weryfikujący źródła;
+nie był to jeszcze dowód kompilacji. Następny odczyt procesów potwierdził
+make/Cargo/rustc/CMake oraz zapis `artifacts/logs/native-build.*.log`.
+Kolejny odczyt logu potwierdził dwa zakończone wywołania release
+(`Finished ... in 11m 35s` i `11m 31s`) oraz rozpoczęcie budowy
+`fullmag-py-core` do certyfikacji siatek. Nie jest to ukończenie całego joba:
+pozostają wymagane moduł Pythona, frontend i finalny receipt/hash pakietu.
+Stan nadal `running`, bez dowodu ukończenia pakietu.
+Ograniczone timeouty obserwatora nie anulowały
+wykonania i nie spowodowały restartu.
+
+Znana regresja `test_build_entrypoint_run_pipeline_contains_only_run_owned_controls`
+została odtworzona zarówno na WIP, jak i na **dokładnych wersjonowanych
+źródłach Pythona HEAD `bbdf165066fc51a925e873f71f1f21ee943399e9`**.
+Baseline odczytał wszystkie importy fullmag przez izolowany import hook
+z `git show` tego SHA, odmawiając brakujących modułów, bez checkout/reset
+i bez edycji testu. Obie próby: 1 FAIL, identyczny nadmiar integrator/fixed_timestep,
+sampling oraz pustych pól relaxation w payloadzie Run. To potwierdzona
+wcześniejsza rozbieżność test/eksport, nie regresja obecnego standalone.
+Nie rozstrzygnięto jeszcze docelowego kontraktu payloadu i nie wyciszono testu;
+pełny suite nadal nie jest GREEN. Natywna continuation do Run pozostaje otwarta.
+
+**Standalone warm/cold HTTP — 2026-10-11, bramka przygotowana / runtime otwarty:**
+Dodano `just run-managed-antenna-standalone-cold-http-ram` i jawny wariant
+`--standalone` w `scripts/run_managed_antenna_http_ram.py`. Komenda, manifest
+narzędzi, wejście i receipt muszą wskazywać ten sam wariant; generated script
+zachowuje osobny digest. `check_standalone_read_model` odczytuje kanoniczne
+zasoby v2: pusty katalog pól przestrzennych, unsupported/not-requestable m,
+H_eff i H_demag oraz brak read-modelu magnetycznej siatki. Kontrola powtarza
+się po cold import i wymaga niezmienionego ownera/revisions podczas odczytów.
+Nie ukrywa całego globalnego katalogu definicji quantities; sprawdza jego
+runtime capability/materialization zamiast błędnie wymagać pustego katalogu.
+
+Regresje HTTP/cold-import: **94 testy PASS**, w tym odmowy starego carrieru,
+dostępnej quantity, zmienionego ownera, wejścia/manifestu i brakującego dowodu.
+Helper transformacji znajduje się w zahashowanym manifestcie host tools,
+nie jest przypisywany kapsule solvera. Izolacja RAM i kwalifikacje false
+pozostają bez zmian. Bramka dopiero przygotowana: nie uruchomiono jej na
+buildzie 50, który nadal jest `running`. Nie potwierdzono także przejścia
+z aktywnej magnetycznej sesji do standalone, continuation do Run ani UI.
+
+**Odbiór standalone V/J/H — 2026-10-11, interpretowany PASS / native otwarty:**
+Usunięto lukę w `scripts/compare_managed_antenna_ram.py::compare`: porównanie
+wybiera teraz rzeczywiście wykonany wariant skryptu z receiptu, zamiast zawsze
+odtwarzać oryginalny magnetic probe. `reconstruct_inputs` używa izolowanego
+publicznego DSL z dokładnej kapsuły i dla standalone wymaga pustych
+magnets/energy oraz dokładnego study bez dynamics. Rozróżnia authored asset
+`probe` od historycznego magnetycznego `probe_geom`; nie zmienia siatki ani
+pinów wzorca. Nieznany wariant i magnetic probe podany jako standalone odmawiają.
+
+`scripts/test_compare_managed_antenna_ram.py::test_actual_standalone_input_preserves_physical_oracle_pin`
+potwierdził rzeczywiste odtworzenie wejścia standalone z tym samym digestem
+`a7f2c4f5326cfe5fca253ba99e4e7d47f8b6162d765211abecf68aecaffabb74`
+co bazowy model. Regresje porównywarki, RT0 i skojarzenia obserwabli:
+**99 testów PASS**. Raport zachowuje wariant i informację o niemagnetycznym
+odtworzonym wejściu; nadal jawnie nie jest dumpem wykonanego native IR ani
+kwalifikacją LLG/FFT, pełnego obwodu czy trwałego storage. Build 50 przeszedł
+z `queued` do `running`; ograniczone oczekiwanie nie dało jeszcze stanu
+terminalnego. Nie wykonano nowego solve ani porównania rzeczywistego
+eksportu standalone. Rzeczywisty odbiór pozostaje kolejną bramką.
+
+**Bramka standalone RAM — 2026-10-11, testy interpretowane PASS / native otwarty:**
+Dodano receptę `just run-managed-antenna-standalone-ram` z tymi samymi czterema
+pinami buildu co istniejąca trasa RAM. `scripts/antenna_standalone_fixture.py::standalone_source`
+tworzy osobny skrypt z przypiętego oryginału: zmienia probe na niemagnetyczny
+`geometry_object` i usuwa dokładnie Ms/Aex/alpha/m. Oryginał, doprowadzenia,
+port, prądy i siatki pozostają niezmienione; nie powstaje nowy model fizyczny
+zamknięcia obwodu. Transformacja odmawia nieoczekiwanego konstruktora,
+niekompletnego/powtórzonego stanu probe i braku etapu solve.
+
+`scripts/run_managed_antenna_ram.py::start` zapisuje wariant i SHA wygenerowanego
+wejścia obok trzech oryginalnych pinów. `observe` ponownie wyprowadza to wejście,
+sprawdza jego rzeczywiste bajty, receipt i dokładną komendę kontenera przed
+odczytem wyniku. Nie osłabiono kontroli pakietu/kapsuły ani izolacji tmpfs;
+nieznany wariant lub zamiana standalone na magnetic_probe powodują odmowę.
+Stare receipt bez wariantu zachowują kontrakt oryginalnego przykładu.
+
+Regresje czterech modułów RAM/HTTP/cold-import: **122 testy + 11 podtestów PASS**.
+`scripts/test_run_managed_antenna_ram.py::test_generated_standalone_lowers_without_magnetic_state`
+sprawdza prawdziwe lowering Pythona: magnets/energy puste, study bez dynamics,
+exact current/port/stage zgodne z oryginałem. Osobne testy sprawdzają odmowę
+zmienionych bajtów, digestów i wariantu. To testy interpretowane, bez native
+i bez kwalifikacji naukowej. Nowy launcher jest przyrostem **po capture builda 50**;
+nie przypisujemy go tej kapsule. Użyje osobno zahashowanego wejścia i tylko
+zweryfikowanego terminalnego pakietu; nie wymaga kolejnej kompilacji tego samego
+kodu solvera. Build 50 nadal oczekuje. Po jego sukcesie trzeba uruchomić tę
+receptę, odebrać V/J/H i niezależnie porównać wynik; exit 0 pozostaje tylko
+`solver_succeeded_comparison_pending`. Standalone HTTP, czyszczenie sesji,
+continuation do Run oraz rzeczywiste UI nadal wymagają osobnych dowodów.
+
+**Build standalone 50 — 2026-10-11, queued / runtime otwarty:**
+Zamrożony snapshot zgłoszono do zdrowej wspólnej kolejki po zakończeniu
+wszystkich zapisów agentów. Job `42545c4994424eeca8c2c9bd21ce365c`,
+profil `fem-cpu-release`, base `bbdf165066fc51a925e873f71f1f21ee943399e9`,
+source digest `20af0bafd6f2e571a963125eea5b48a66875edb134d735617635b10506b2a821`,
+native snapshot `1e7bbecf1f8b85966e2fc59091c9cdba6d0835ab9601982e92ba7123dc259a93`,
+capture `c342ae789e6b4e0ba1ecc7cef9f65fa8`. Stan przy przyjęciu: `queued`.
+Jawnie włączono oba nowe moduły Rust publikacji/importu oraz regression
+`test_antenna_standalone_authoring.py`. Build nie kompiluje unit tests.
+
+Read-only review znalazł błąd continuation: inspection bez poprzedniego
+magnetycznego etapu mógł zamienić `None` w `Some([])` i zepsuć authored
+initial state kolejnego Run. Poprawka pomija cały replacement continuation
+dla `AntennaExternalLeadInspection`; semantyka ChangeDevice pozostaje.
+Stan/certificate rzeczywistej wcześniejszej magnetyzacji jest tylko handoff,
+nie nowym wynikiem inspection. Test runtime tej granicy pozostaje otwarty.
+Nowy build obejmuje także czyszczenie starych magnetic carriers w API oraz
+poprawkę E0369. Nie używaj pinów builda 47 do odbioru tego przyrostu.
+Po succeeded/0 i pełnej weryfikacji receiptu: rzeczywisty warm/cold V/J/H,
+standalone bez m/Ms/LLG oraz odmowy Run/Relax i błędnych owner/digest.
+Nie restartowano workspace na 3197 ani obcych kontenerów.
+
+**Checkpoint standalone — 2026-10-11, GREEN authoring / WIP native:**
+Ten wpis zastępuje stan RED opisany niżej. Dodano Python
+`AntennaFieldSolve` i Rust `StudyIR::AntennaFieldSolve` bez dynamics,
+dedykowany niemagnetyczny plan inspection, scoped walidację oraz eksport
+sceny bez sztucznego magnetyka. Run/Relax nadal wymagają magnetyka.
+Przypięty przykład i jego fizyczne wejście pozostają niezmienione.
+Interpretowane regresje Pythona: **116 testów + 72 podtesty PASS**,
+w tym standalone lowering i dwa eksporty/ponowne importy zachowujące
+exact current/source/port/stage IDs. Osobny szerszy test starego pipeline
+Run (`test_build_entrypoint_run_pipeline_contains_only_run_owned_controls`)
+pozostaje czerwony; nie zaliczono całego suite ani nie wyciszono tego błędu.
+Walidator noty 0950: PASS; 33 interpretowane testy kontraktu dokumentacji: PASS.
+Testy Rust napisano, ale nie kompilowano zgodnie z ograniczeniem hosta.
+Nie jest to dowód natywnego solve ani wizualizacji rzeczywistych pól.
+
+Build 47 zakończył się terminalnie **failed / exit 2**. Kompilator wykazał
+E0369 w `live_workspace.rs::publish_terminal_and_wait`: operator `>=`
+na `FieldSourcePrecedence` bez `PartialOrd`. Poprawka wykorzystuje istniejący
+kanoniczny `cmp` (scientific step/revision/time, potem materialization time),
+zamiast dodawać porządek pochodny. Kolejna kapsuła będzie zawierać tę poprawkę
+oraz standalone. Warm/cold HTTP pozostaje niewykonany do czasu poprawnego
+terminalnego buildu. Nie restartowano runnera ani workspace użytkownika.
+Weryfikacja sesji musi objąć usunięcie starych magnetic mesh/fields przy
+przejściu do standalone; rzeczywiste V/J/H pozostają zasobami inspection,
+nie katalogiem magnetycznym i nie qualified per-ampere basis.
+
+**Historyczny checkpoint standalone — 2026-10-11, reprodukcja RED:**
+WIP `packages/fullmag-py/tests/test_antenna_standalone_authoring.py`
+zachowuje oryginalny input przewodnika, doprowadzeń, portu i siatki próbkowania.
+Transformacja AST zmienia wyłącznie konstruktor probe na `geometry_object`
+typu `geometry` oraz usuwa dokładnie Ms/Aex/alpha/m; nie zmienia przypiętego
+przykładu używanego przez managed RAM gate. Test wymaga pustych magnets/energy,
+braku dynamics oraz tej samej definicji current/port/stage. Obecny wynik:
+**1 failed, 2 passed, 2 podtesty passed**. RED jest rzeczywistą odmową
+`world.py::_build_problem` (`No magnets defined`) przy
+`StudyStagesBuilder.add_antenna_field_solve`, nie nieudanym solve.
+Niezmieniony przykład magnetyczny i odmowy Run/Relax bez magnetyka przeszły.
+Pierwsza negatywna próba Relax miała niekompletny timestep; uzupełniono
+`dt=1e-13`, aby sprawdzać odmowę braku magnetyka, nie błąd konfiguracji.
+Nie wyciszono czerwonej bramki i nie kompilowano unit tests.
+
+Read-only przegląd ustalił konieczne granice: Python `world.py::_build_problem`
+i `Problem.__post_init__`, Rust `ProblemIR::validate`/`StudyIR`, dispatch
+plannera, dedicated carrier sesji oraz script export. Native
+`antenna_external_lead_solution/execution.rs::execute_antenna_external_lead_inspection`
+nie potrzebuje magnetyzacji. Nie wolno usuwać wymogu magnetyka globalnie ani
+uznać obecnego Zero-Zeeman/Heun carrieru za rozwiązanie standalone.
+Następna implementacja wymaga jawnej rodziny antenowego studium bez dynamics,
+dedykowanego planu/nośnika niemagnetycznego i snapshotu bez fikcyjnego m;
+zwykły LLG/Relax nadal musi odmówić takiego wejścia. Test jest lokalnym WIP,
+nie ukończonym fragmentem ani zmianą produkcyjnego Python/IR.
+
+Build 47 ma obecnie queue state `running`; obserwacja nie wykazała jeszcze
+runrootu, worker logu ani osobnego kontenera joba. Koordynator jest aktywny.
+To stan przygotowania zadania, nie dowód kompilacji. Nie restartowano procesu,
+nie powtórzono submit ani nie uruchomiono warm/cold gate bez terminalnego receipt.
+
+**Checkpoint T15 — 2026-10-11, pełny cykl edycji gałęzi portu:**
+Rozszerzono kontrolowany browser fixture o jawnie istniejące dodatkowe
+referencje terminali, bez tworzenia ich przez edytor. Poprawne dodanie trzeciej
+gałęzi z wagami `1, -0.5, -0.5`, jej zmiana ID po ACK oraz usunięcie z powrotem
+do dwóch gałęzi przeszły przez rzeczywisty klient transakcji i panel produkcyjny.
+Payload zachował current transports i drugi port; kolejne zapisy użyły dokładnie
+rewizji 1, 2 i 3. Osobna próba z serwerową zmianą ID gałęzi potwierdziła, że
+jawny Rebase nie wskrzesza starej gałęzi: szkic pozostaje, Apply jest zablokowane,
+a Revert przyjmuje aktualny identyfikator. Nie zmieniano kodu edytora.
+
+`verify-antenna-port-editor-browser`: **11 scenariuszy PASS**, dziewięć workflow,
+4–11 żądań i 14–36 renderów; zachowane wcześniejsze kontrole stabilności oraz
+idle, brak błędów strony/konsoli. Receipt i raport:
+`storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-browser-fixture/antenna-port-editor-browser/b4a2861a820344d8adee70272159bc60/`.
+TypeScript rozszerzonego fixture: **PASS**, receipt
+`storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-source-check/production-source/7f44c01208c5447bba6bb5b94bf63a47/receipt.json`.
+Końcowy ESLint: **PASS**, receipt `lint/4a295223dc824c638e36d9e57d4e18f0`
+w tym samym profilu source-check. Nie zmieniono produkcyjnych endpointów,
+resource hooks ani edytora; wcześniejsza zielona kontrola API tych źródeł
+pozostaje ważna. Oczekiwanie `runner-wait` na konkretny build 47 zakończyło
+się timeoutem obserwacji, nadal `queued`; nie jest to awaria ani zgoda na restart.
+Jest to authoring z kontrolowanym HTTP, nie rzeczywisty backend ani
+kwalifikacja dwóch fizycznych ścieżek powrotnych. Nie kompilowano unit tests.
+Build 47 i bieżący kod natywny pozostają przypięte do poprzedniej kapsuły;
+rozszerzenie fixture nie zmienia tamtych źródeł.
+
+**Kontynuacja odbioru — 2026-10-11, build 47 queued:**
+Zweryfikowany fragment edytora portu zapisano w commicie
+`5c573ac4fcd2b9db13a7cf954fc06e82274055f1`.
+Po potwierdzeniu zdrowia runnera i osobnego aktywnego zadania nr 46 zgłoszono
+nową kapsułę przez zaufany klient tej samej kolejki, bez zatrzymywania kontenerów:
+job `f11d42f1ab354cb38870baba73c652f3`, profil `fem-cpu-release`,
+base `5c573ac4fcd2b9db13a7cf954fc06e82274055f1`, source digest
+`fbd49d5fbb22cafb7d9a47ed33e2d3daad5720dd16723ceea8060b35445e5ace`,
+native snapshot `8453732232feabeefc7218e76e6a3ed2c909299bb036d408f16e4ec62215fe55`,
+capture `d59822fcd7204527b7656adc34fd96b8`. Stan przy zgłoszeniu: `queued`.
+Kapsuła jawnie zawiera oba nowe moduły Rust; siedem zmian natywnych pozostaje
+WIP. Build 45 zachowuje terminalne `blocked`; nie zmieniano jego rekordu.
+To nie sukces kompilacji ani odbioru naukowego. Po terminalnym sukcesie 47
+należy wykonać `run-managed-antenna-cold-http-ram` z dokładnie powyższymi
+czterema pinami, sprawdzić warm/cold metadata/display/binary V/J/H i negatywne
+próby importu. Brak poprawnego receipt blokuje ten run, nie upoważnia do fallbacku.
+
+**Checkpoint T15 — 2026-10-11, edycja istniejącego portu; build 45 blocked:**
+Ten wpis aktualizuje stan wcześniejszych checkpointów: edytor istniejącego
+portu jest zaimplementowany, a build nr 45 nie jest już `queued`, lecz `blocked`.
+Poprzedni fragment diagnostyki zapisano w commicie
+`0198274fbbde810ba929e397787b9b9670de16fa`.
+
+`AntennaPortEditor.tsx::AntennaPortEditor` obsługuje transport, identyfikatory
+gałęzi, pary inlet/outlet i jawne signed weights. Umożliwia dodanie pustej
+gałęzi, usunięcie gałęzi, Apply, Revert, Refresh i jawny Rebase.
+Nie tworzy terminali, drive ani fizycznego domknięcia obwodu; nie tworzy
+ani nie usuwa samego portu. Nie zmienia source, schema ani normalization.
+`AntennaPortEditorModel.ts::buildAntennaPortTransaction` korzysta ze wspólnej
+scene-aware walidacji, wymaga dokładnej base revision i emituje wyłącznie
+kanoniczny merge patch `antenna_port_modes`, zachowując pozostałe porty oraz
+nieznane atrybuty. Nie normalizuje wag i nie zamienia pustego inputu na zero.
+ACK waliduje `committedAntennaPortScene` przed publikacją historii i cache;
+`acknowledgeAntennaPortDraft` zachowuje nowszy szkic oraz lokalne klucze wierszy.
+Owner token, session request scope i history generation odcinają stare ACK.
+HTTP 409 i nieprawidłowy ACK nie wywołują automatycznego retry.
+
+`just verify-antenna-port-editor-browser`: **9 scenariuszy PASS** na porcie
+3264. Kontrolowany HTTP używa rzeczywistego klienta, resource hooks, historii
+i komponentu produkcyjnego. Zweryfikowano nieprawidłowe dane, opóźniony ACK,
+nowszy szkic, konflikt rewizji, HTTP 409, błędną normalization/scene_revision,
+reset historii oraz przejście sesji A→B→A. W siedmiu workflow odnotowano
+5–11 żądań oraz 14–34 renderów; przez 700 ms idle nie było nowych żądań
+ani renderów. DOM root, input, fokus, scroll, disabled i opacity pozostają
+stabilne; zero aktywnych animacji opacity oraz błędów strony/konsoli.
+Raport i trzy zrzuty:
+`storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-browser-fixture/antenna-port-editor-browser/d5c92062702c42bdbd780cdd50a9bdfb/`.
+Pierwsza próba `2bd95b54ad2b49fb8af740aed908a222` pozostała failed:
+niejednoznaczny selektor testu zastąpiono dokładnym selektorem textbox;
+nie zmieniano dostępności komponentu ani nie zaliczono nieudanej próby.
+
+Regresja dotychczasowego inspektora po integracji edytora: **PASS**, receipt
+`antenna-port-diagnostics-browser/588bec62c7df443fb7525fe6d3e84f7c`
+w tym samym katalogu profilu browser. TypeScript źródeł produkcyjnych
+`production-source/e2abd660a35841f982b30223f3691587`, ESLint
+`lint/96003b1f81f9484d9ae99e5307b077c5` oraz API hygiene
+`api-hygiene/7ffc2c1d7e5547e793eeb57ad99b651a`: **PASS**, receipts pod
+`storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-source-check/`.
+Interpretowany dispatcher: **8 PASS + 10 podtestów**. Niezależne review:
+Required dotyczący kontroli scene_revision poprawiono; finalnie brak
+Required/Blocker. Zapisane testy Vitest nie były kompilowane ani uruchamiane.
+
+Build 45 `fc763cf735b74842bc07fbe92915b6e0` zakończył się stanem
+`blocked` przed kompilacją. Zdrowy koordynator raportował
+`Existing Fullmag container must finish before queued build`; brak runrootu
+i logu kompilacji nie jest dowodem wykonania solvera. Nie zatrzymywano cudzych
+kontenerów ani nie restartowano runnera. Kolejnym krokiem jest bezpieczne
+rozstrzygnięcie blokady kolejki, managed build z przypiętych źródeł oraz
+real warm/cold V/J/H readback. Ten checkpoint nie kwalifikuje backendu,
+pełnego workspace/WebGL, fizycznego obwodu, per-A, LLG ani FFT.
+Workspace 3197 i scena użytkownika pozostają bez zmian; T00–T18 są otwarte.
+
+**Checkpoint T15 — 2026-10-11, diagnostyka referencji portu w UI:**
+`antennaPortValidation.ts::antennaPortValidationMessages` otrzymuje aktualny
+`SceneResource`; wspólną walidację wykorzystują Explorer i `AntennaPortPanel`.
+Sprawdza jednoznaczny transport static one-way OhmicPoisson, istniejący source,
+przynależność terminali do domeny, parę na jednym obiekcie oraz dodatnią gałąź
+na source. Zachowuje kanoniczną kolejność namespace: current-source observations
+→ lead-preparation extensions → electrical boundaries. Obecny nieprawidłowy
+source nie może zostać zastąpiony poprawnymi historycznymi boundaries.
+Source/preparation wymaga dokładnie jednego jawnego drive dla portu.
+Poprawne referencje są opisane jako `valid authoring references` / `authoring`,
+nie jako kwalifikacja domknięcia prądu, siatki ani pola.
+
+Wykonano `verify-antenna-port-diagnostics-browser` na izolowanym porcie 3263:
+**8 wariantów + stabilność PASS**, 11 żądań GET, 30 renderów, zachowany DOM root,
+fokus i lokalny szkic; zero aktywnych animacji opacity, błędów strony/konsoli
+oraz dodatkowych żądań/renderów przez 700 ms po ustaleniu stanu.
+Raport i dwa wizualnie sprawdzone zrzuty są w
+`storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-browser-fixture/antenna-port-diagnostics-browser/cc29b41b715241d8b3a1766248a9cc4f/`.
+Pierwsza próba fixture nie zadeklarowała current session, druga miała błędnie
+zakotwiczony selektor względny; obie zostały zachowane jako failed i poprawione,
+nie zaliczone. TypeScript finalnych źródeł, ESLint całego frontendu
+i API hygiene: **PASS**. Receipts source-check:
+`production-source/42ef3e127fe54fc297de8f6c4924aff4`,
+`lint/c36f0b24a72d4ac9ba7477116e6d0825`,
+`api-hygiene/d187219093ad41aa8d9ce14baa4a8960`
+pod `storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-source-check/`.
+Interpretowane regresje dispatchera: **7 PASS + 10 podtestów**.
+Niezależny source review: brak Required/Blocker. Testy Vitest zapisano, lecz
+nie kompilowano ani nie uruchamiano zgodnie z zakazem budowania unit tests.
+
+To kontrolowany HTTP fixture rzeczywistych komponentów, nie odbiór backendu,
+WebGL ani fizyki. Edytor portu nadal wymaga implementacji; nie dodano mutacji,
+nie zmieniono sceny ani workspace 3197. Build 45 nadal `queued`; terminalny ACK,
+canonical V/J/H readback i cold import oraz pełne T00–T18 pozostają otwarte.
+
+**Checkpoint narzędzi odbioru — 2026-10-11, wykonanie natywne nadal otwarte:**
+Dodano jawną receptę `run-managed-antenna-cold-http-ram` i narzędzie
+`scripts/antenna_inspection_cold_import_check.py::verify_cold_import`.
+Po rzeczywistym solve oraz warm HTTP eksportuje oryginalne FMS przez API,
+sprawdza istniejące refs i komplet payloadów, odrzucenie uciętego archiwum
+bez zmiany sesji, ukrywa pierwotny `/ram/result.zarr`, importuje niezmienione
+archiwum i porównuje metadane naukowe oraz SHA-256 wszystkich 12 payloadów.
+Sprawdza odcięcie starego request scope i przywrócenie oryginalnego katalogu.
+Rewizja sesji/etapu nie jest digestem naukowym: po imporcie może się zmienić;
+powiązanie metadata/display wewnątrz każdego odczytu nadal jest wymagane.
+Observer wymaga zachowanego raportu, tożsamości FMS oraz jawnych dowodów;
+błąd cold importu nie może pozostawić sukcesu warm gate.
+Weryfikacja interpretowana: **81 PASS + 10 podtestów**, następnie osobna
+nowa regresja importu wyłącznie przypiętych narzędzi w Pythonie `-I`: **1 PASS**.
+Nie kompilowano testów Rust. Nowe narzędzia są przypinane osobno i nie należą
+do wcześniej zgłoszonej kapsuły nr 45. Build 45 pozostaje `queued`;
+odczyt zdrowia runnera potwierdził inne aktywne zadanie nr 42. Lista zadań
+zwróciła HTTP 500; nie restartowano koordynatora ani cudzych prac.
+Warm/cold runtime, browser/WebGL, kwalifikacja fizyki i trwałego zapisu,
+per-A/LLG/FFT oraz pełne T00–T18 pozostają **NOT VERIFIED / otwarte**.
+Workspace 3197 i scena użytkownika bez zmian.
+
+**Snapshot do odbioru — build nr 45, queued:**
+Po zakończeniu review i zamrożeniu wszystkich writerów zgłoszono
+`fc763cf735b74842bc07fbe92915b6e0` z base
+`47323b145006b8f9148bbf0113fef910bcc99723`, source digest
+`03d5128036b8ef790435045ffe48d3530970b14168a0268921b6860ab4a22b77`,
+native snapshot `71a01b577cc4bab9ed6ace95f2f1d1a4114b7bc33bf234de73a711a5186ee181`.
+Kapsuła obejmuje terminalny ACK, guard bez zmiany connectivity przy odmowie
+oraz cold-import normalization, z dwoma jawnie dołączonymi nowymi modułami.
+To snapshot WIP, nie clean commit ani sukces buildu. Następny krok:
+terminalny receipt i walidacja pakietu → `run-managed-antenna-http-ram`
+z dokładnie tymi pinami → rzeczywisty cold import → browser/UI.
+Zweryfikowane narzędzie negatywnej bramki zapisano w powyższym base commicie;
+same poprawki Rust pozostają WIP do odbioru managed. Workspace 3197 bez zmian.
+
+**Cold import — kod po review, odbiór runtime otwarty:**
+`session_persistence.rs::import_session_commit_with_context` normalizuje
+istniejące refs inspekcji przed zmianą katalogu artefaktów i publikacją importu.
+`session_persistence_antenna_import.rs::normalize_registered_refs` zachowuje
+autorstwo etapu, wymaga dokładnego runtime stage/run namespace, starego rootu
+oraz faktycznej obecności rekordu w `FmsStagedPreflight::contains_document`.
+Przepisuje ref na względny suffix; nigdy nie odczytuje starego hosta i nie
+odtwarza refs przez skanowanie archiwum. Plan całej zamiany jest walidowany
+przed mutacją. Obce rooty, traversal, aliasy, duplikaty i brakujące rekordy
+kończą import błędem przed publikacją. Compact/bez artefaktów i nieznane
+etykiety nie są przepisywane. Payloady nadal waliduje canonical reader.
+Niezależny source review nie wykazał Required/Blocker; pięć regresji Rust
+zapisano, ale nie uruchomiono ani nie skompilowano. Wymagane pozostają managed
+build oraz real warm → archive → cold import z niedostępnym starym rootem,
+następnie metadata/display/binary V/J/H i negatywne próby archiwum.
+
+**Przyrost terminalnej publikacji — kod po review, runtime NOT VERIFIED:**
+Dodano `live_workspace.rs::LocalLiveWorkspace::publish_terminal_and_wait`
+oraz `terminal_publication.rs::TerminalPublication`: niezmienny snapshot,
+monotoniczny numer, ograniczone oczekiwanie i dokładny ACK przez istniejący
+serialny worker. Orchestrator czeka przed zakończeniem lease; błąd zachowuje
+wyniki i scratch. API off pozostaje no-op. Worker najpierw odprowadza próbki
+skalarne i istniejącą transakcję generacji pól, potem końcowe metadane oraz
+diagnostykę. Nie wymusza nielegalnego zastąpienia pól ani powtórzenia generacji.
+Prywatny istniejący RPC snapshot przyjmuje precondition owner w nagłówku
+`x-fullmag-terminal-owner`. `main.rs::validate_terminal_snapshot_owner`
+sprawdza session/run oraz licznik i instancję request scope pod blokadą
+przejścia, przed apply. Sprawdzenie GET przed/po POST nie zastępuje tej kontroli.
+Pierwszy frame może wymagać rzeczywiście pustego workspace; po wcześniejszej
+próbie publikacji worker nie odtwarza znikniętej sesji. Bootstrap nie publikuje
+najnowszej próbki przed starszymi. Publiczne OpenAPI i frontend nie zmieniają się.
+Niezależny source review: wcześniejsze Required poprawione; diff check PASS.
+Regresje Rust zapisano, ale **nie kompilowano ani nie uruchamiano** zgodnie
+z obowiązującym zakazem. Managed build i rzeczywiste V/J/H HTTP smokes muszą
+dopiero potwierdzić poprawkę. Nie zmienia to negatywnego wyniku buildu nr 41
+w bramie HTTP ani pozostałych otwartych bramek fizycznych T00–T18.
+Zgłoszono snapshot buildu nr 44: `17744d15abc742eabb56dfee08cf04a6`,
+base `b66fa562e1e9e32021517b9ffe352ca69f1575d8`, source digest
+`b8cf3d4fe776eca4bf4cb1f5a1f9fea2e2b9d2d2fc123ba975af4613683e187a`,
+native snapshot `9eaf08f0fb60923796f9fbd309ce93f2b11dc5f99a584254ab041cfb754a9f16`.
+Build pozostał w kolejce i został anulowany przed rozpoczęciem kompilacji
+po wykryciu dodatkowego skutku ubocznego odrzucenia ownera. Stan terminalny
+`cancelled` potwierdzono; kapsuła pozostaje zachowana. Następny snapshot musi
+zawierać poprawkę: tylko typowane błędy admission `terminal_snapshot_owner_stale`
+i `terminal_snapshot_owner_busy` nie oznaczają bieżącej sesji jako degraded.
+Pozostałe błędy apply zachowują dotychczasowe zachowanie.
+Osobno przypinane narzędzie `run_managed_antenna_http_ram.py::reject_stale_terminal_owners`
+sprawdza po rzeczywistym read-back odrzucenie złego runu, epoki, instancji API,
+bootstrapu bez wymaganej jawnej koperty session/run i nieznanego pola guardu.
+Nie wstrzykuje pól naukowych ani refs; wymaga rzeczywistego kodu i komunikatu
+błędu oraz niezmienności właściciela, rewizji zasobów i lifecycle.
+Regresje interpretowane helpera: **41 PASS**. To nie jest runtime dowód
+wyścigu współbieżnego, timeoutu ani bootstrapu poprawnej koperty do niepustej
+sesji; te kwalifikacje pozostają otwarte. Regresję odrzucenia ownera bez zmiany
+connectivity zapisano także w Rust, lecz nie uruchomiono.
+Narzędzie uzupełniono po capture i nie przypisuje się go kapsule buildu nr 44.
+
+**Brama rzeczywistego HTTP — wynik negatywny, 2026-10-11:**
+Dodano kontrolowaną receptę `just run-managed-antenna-http-ram` i obserwator,
+używające istniejącego buildu nr 41, osobno przypiętych SHA narzędzi oraz
+sesji tmpfs. Kontener nie publikuje portów hosta, ma sieć `none`, API działa
+wyłącznie na jego loopback; nie zmieniono workspace 3197.
+Po naprawie dokładnego dispatchera `just` i zgodności SHA z Pythonem kontenera
+próby `22b7919f7700414d90ba0919e459fe64` oraz
+`2089836736454d189938c8140dcfb333` wykonały solver z exit 0, ale nie przeszły
+bramy HTTP. Ostatnia odpowiedź endpointu etapu: HTTP 404,
+`missing_antenna_inspection`, `stage has no registered inspection result`.
+API odbierało aktualizacje sesji. Odczyt z uwzględnieniem ukrytych katalogów
+potwierdził kompletną kopię artefaktów V/J/H, bundle, manifest v2 i record
+etapu w `result.zarr/artifacts/antenna`; digest manifestu odpowiada udanemu
+runowi bez API (`4cd5b183…`). Początkowy odczyt bez `-Force` pominął ukryte
+katalogi; nie jest to utrata danych ani błąd cleanup.
+Source review wykazał brak końcowego flush/ACK asynchronicznego publishera
+przed powrotem z orchestratora. To kandydat na przyczynę braku końcowego ref;
+poprawka wymaga reprodukcji i bramy runtime, nie samego przeglądu źródeł.
+Raport błędu i logi pozostają w storage profilu `managed-antenna-http-ram-cpu`.
+Canonical Rust re-decode przez API, prawdziwe HTTP smokes i cold import
+pozostają **NOT VERIFIED**. Nie rejestrować sztucznych refs, nie zastępować
+próby fixture-em API ani nie wyłączać guardów SessionStore.
+Regresje helpera/launchera: **38 PASS + 7 subtestów**; wcześniejszy łączny
+pakiet readerów, transportu i helpera: **181 PASS + 49 subtestów**.
+Komparator V/J/H poniżej dotyczy odrębnego, zakończonego sukcesem runu bez API.
+
+**Kontrakt przyrostu — terminalny ACK publikacji (kod powyżej, odbiór otwarty):**
+`crates/fullmag-cli/src/live_workspace.rs::CurrentLivePublisher` uruchamia
+worker bez zachowania `JoinHandle`; `request_publish` jedynie kolejkuje wake.
+`current_live_publisher_loop` ma drain po zamknięciu kanału, ale orchestrator
+nie czeka na jego zakończenie przed wyjściem procesu.
+Implementacja musi przesłać niezmienny końcowy snapshot po ostatnim update/log
+przez ten sam serialny worker i przydzielić mu monotoniczny numer publikacji.
+ACK powinien potwierdzać dokładny numer, session_id i run_id dopiero po
+pełnym sukcesie istniejącego cyklu HTTP, nie po samym session-frame.
+Nie wystarczy obserwacja `pending=false`/`sending=false` ani arbitralny sleep.
+Wyłączone API pozostaje jawnym no-op; deadline, zerwany worker, zmiana ownera
+i błąd HTTP kończą próbę błędem bez usuwania wyników naukowych.
+Regresje: brak ACK starszego preview, zachowanie terminalnych artifact_refs,
+serializacja z trwającym publish, odmowa obcego ownera, timeout i API off.
+Odbiór: nowy managed build, ta sama brama rzeczywistego HTTP i oba smokes
+V/J/H; dopiero wtedy canonical API re-decode może uzyskać PASS.
+
+**Rzeczywisty odbiór V/J/H — 2026-10-11:**
+Build nr 41 `1128d9f468ee4b0981387a8cdf448451` zakończył się
+`succeeded`, exit 0, dla commita `62d9618b2eebec639e52eeea842ffde19525a4bd`.
+Pełny validator launchera sprawdził pakiet, trusted documents i kapsułę.
+Zatwierdzony `just run-managed-antenna-ram` wykonał przypięty model na
+FEM CPU/double: run `92cdc1e909c242c58c81f1aa495df435`, solver exit 0,
+startup identity i izolacja PASS. Rzeczywisty eksport v2 zawiera V/J/H.
+Independent fixed-fixture comparison PASS: maksymalny błąd V
+`1.1102230246251565e-16 V`, J `4.440892098500626e-16 A/m²`,
+H `6.760249178929324e-9 A/m`; 12 środków i 48 lokalnych śladów J,
+108 geometrycznych momentów RT0 oraz 36 bilansów elementów.
+Odbiór dotyczy tego modelu i próbek poza źródłem, nie taper/inside-source,
+zamknięcia obwodu ani zakwalifikowanej bazy do LLG/FFT.
+Pełny raport zachowuje `physics_qualified=false`,
+`native_canonical_bundle_redecoded=false` i brak kwalifikacji trwałości.
+Nowe `--write-report` zapisuje wynik z SHA narzędzi w `export/V-J-H-comparison.json`
+wyłącznie po sukcesie i przy niezmienionych źródłach podczas porównania.
+Kolejny etap: rzeczywista publikacja HTTP i canonical disk-loader w osobnej
+sesji RAM przez publiczny runtime, bez sztucznych stage refs ani zmiany
+guardów SessionStore. Workspace 3197 nie był zmieniany.
+
 **Odbiór narzędzi porównania V/J/H — 2026-10-11:**
 Hostowy reader rozdziela exact export v1/v2, w tym manifest, jednostki,
 receipt i payload snapshotu J. Legacy v1 pozostaje bez J; mieszane generacje,
@@ -25,11 +2060,10 @@ To syntetyczne testy readerów i transportu oraz prywatny fixed-fixture oracle,
 nie dowód native solve, canonical re-decode, rzeczywistego endpointu ani fizyki.
 Nie kompilowano testów jednostkowych. Nowe narzędzia powstały po capture
 buildu nr 41; nie zmieniają jego zamrożonych źródeł ani pakietu.
-Odczyt API tego samego joba `1128d9f468ee4b0981387a8cdf448451` nadal
-zwraca `running`, exit code null. Nie wykonano kolejnego submit ani RAM runu.
-Następny krok: terminalny receipt i integralność pakietu nr 41 → uzgodniony
-`run-managed-antenna-ram` → rzeczywiste porównanie V/J/H → odbiór
-publikacji/cold-load/HTTP. Obwód, per-A, FFT, LLG i T00–T18 pozostają otwarte.
+W chwili tego wcześniejszego checkpointu odczyt API joba nr 41 zwracał
+`running`, exit code null. Późniejszy odbiór terminalnego sukcesu i rzeczywisty
+RAM run opisano powyżej; nie zgłoszono drugiego buildu.
+Publikacja/cold-load/HTTP, obwód, per-A, FFT, LLG i T00–T18 pozostają otwarte.
 Workspace 3197 i jego sesja nie zostały zmienione.
 
 **Zapis etapu i build integracyjny — 2026-10-11:**

@@ -19,6 +19,8 @@ import { AntennaFieldBasisPreview } from "./AntennaFieldBasisPreview";
 import { AntennaExternalLeadInspectionPanel } from "./AntennaExternalLeadInspectionPanel";
 import { AntennaProjectionDriveComposer } from "./AntennaProjectionDriveComposer";
 import { AntennaSolveTargetsEditor } from "./AntennaSolveTargetsEditor";
+import { AntennaStudyStageComposer } from "./AntennaStudyStageComposer";
+import { AntennaPortEditor } from "./AntennaPortEditor";
 import { AntennaSpectrumComposer } from "./AntennaSpectrumComposer";
 import { AntennaResourceEditor } from "./AntennaResourceEditor";
 import { MicrostripGeometryEditor } from "./MicrostripGeometryEditor";
@@ -234,12 +236,13 @@ function portDetails(
   if (!mode) {
     return { title: "Antenna port", badge: "missing", rows: [{ label: "Status", value: "Port mode is not present in SceneResource." }] };
   }
-  const validationMessages = antennaPortValidationMessages(mode);
+  const validationMessages = antennaPortValidationMessages(mode, scene);
   return {
     title: `Antenna port ${mode.id}`,
     badge: `${mode.branches.length} branches${validationMessages.length > 0 ? " · invalid" : ""}`,
     rows: [
-      { label: "Validation", value: validationMessages.join("; ") || "ready" },
+      { label: "Validation", value: validationMessages.join("; ") || "valid authoring references" },
+      { label: "Qualification", value: "Authoring only; no current-closure, mesh or field qualification." },
       { label: "ID", value: mode.id, mono: true },
       { label: "Schema", value: mode.schema_version, mono: true },
       { label: "Source object", value: mode.source_object_id, mono: true },
@@ -926,7 +929,9 @@ export function AntennaCompositionPanel({
       </InspectorGroup>}
       {kind === "conductor" && objectId ? <MicrostripGeometryEditor objectId={objectId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "conductor" && objectId ? <AntennaPlacementEditor objectId={objectId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
+      {kind === "port" && objectId && resourceId ? <AntennaPortEditor objectId={objectId} portId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "solution" && objectId && resourceId ? <AntennaSolveTargetsEditor key={`targets:${objectId}:${resourceId}`} objectId={objectId} stageId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
+      {kind === "solution" && objectId && resourceId ? <AntennaStudyStageComposer objectId={objectId} stageId={resourceId} scene={scene.data} status={scene.status} /> : null}
       {kind === "solution" && ids.stageId ? <AntennaExternalLeadInspectionPanel authoredStageId={ids.stageId} /> : null}
       {kind === "solution" && fieldSolution.data &&
       model.badge === "ready" &&

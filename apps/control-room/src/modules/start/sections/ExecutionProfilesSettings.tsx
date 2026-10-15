@@ -9,11 +9,18 @@ import { Button } from "@/shared/ui/Button";
 import { Input } from "@/shared/ui/Input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/Select";
 
-import { newProfileDraft, profileFromDraft, sameProfile, type ExecutionProfileDraft } from "../model/executionProfileDraft";
+import {
+  duplicateProfileDraft,
+  newProfileDraft,
+  profileFromDraft,
+  sameProfile,
+  type ExecutionProfileDraft,
+} from "../model/executionProfileDraft";
 
 type Profiles = ReturnType<typeof useExecutionProfilesResource>;
 type Defaults = ExecutionProfile["defaults"];
 type PublicationRequest = Omit<PublishExecutionProfileRequest, "profile"> & { profile: ExecutionProfile };
+const GIB_FORMAT = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 
 export function ExecutionProfilesSettings() {
   const resource = useExecutionProfilesResource();
@@ -94,6 +101,11 @@ function ProfileEditor({ resource }: { resource: Profiles }) {
     setRefreshRequired(false);
     report("");
   };
+  const beginDuplicate = (profile: ExecutionProfile) => {
+    setDraft(duplicateProfileDraft(profile, `exec:copy:${crypto.randomUUID()}`));
+    setRefreshRequired(false);
+    report("");
+  };
   const update = (patch: Partial<ExecutionProfile>) => setDraft((current) => current
     ? { ...current, profile: { ...current.profile, ...patch } } : current);
   const updateDefault = <K extends keyof Defaults>(key: K, value: Defaults[K] | "inherit") => {
@@ -125,8 +137,28 @@ function ProfileEditor({ resource }: { resource: Profiles }) {
           {[...resource.data.entries].reverse().map((entry) => <li key={entry.client_intent_id}>
             <div><strong>{entry.profile.profile_id}</strong><span>Version {entry.profile.version}</span>
               {entry.profile.description ? <p>{entry.profile.description}</p> : null}
+              <ProfileInspection profile={entry.profile} />
             </div>
-            <Button disabled={!ready} onClick={() => begin(entry.profile)} size="sm" variant="secondary" aria-label={`New version of ${entry.profile.profile_id} ${entry.profile.version}`}>New version</Button>
+            <div className="fm-start-profiles__list-actions">
+              <Button
+                aria-label={`Duplicate ${entry.profile.profile_id} ${entry.profile.version}`}
+                disabled={!ready}
+                onClick={() => beginDuplicate(entry.profile)}
+                size="sm"
+                variant="secondary"
+              >
+                Duplicate
+              </Button>
+              <Button
+                aria-label={`New version of ${entry.profile.profile_id} ${entry.profile.version}`}
+                disabled={!ready}
+                onClick={() => begin(entry.profile)}
+                size="sm"
+                variant="secondary"
+              >
+                New version
+              </Button>
+            </div>
           </li>)}
         </ul> : ready ? <p className="fm-start-compute-settings__intro">No profiles yet. Create a version to save your preferred solver settings.</p> : null}
       </> : <form onSubmit={(event) => { event.preventDefault(); apply(); }}>
@@ -139,9 +171,13 @@ function ProfileEditor({ resource }: { resource: Profiles }) {
           <ProfileChoice label="Precision" value={draft.profile.defaults.precision} options={["single", "double"]} onChange={(value) => updateDefault("precision", value)} disabled={locked} />
           <ProfileChoice label="Execution mode" value={draft.profile.defaults.mode} options={["strict", "extended", "hybrid"]} onChange={(value) => updateDefault("mode", value)} disabled={locked} />
           <label>CPU threads per task<Input value={draft.threads} onChange={(event) => setDraft({ ...draft, threads: event.target.value })} placeholder="Inherit · auto · 8" /></label>
+          <label>RAM per task (GiB)<Input type="number" min="0" step="any" value={draft.ramGiB} onChange={(event) => setDraft({ ...draft, ramGiB: event.target.value })} placeholder={hasExplicitReset(draft.profile.defaults.resources?.ram) ? "Reset retained" : "Inherit"} /></label>
+          <label>Scratch per task (GiB)<Input type="number" min="0" step="any" value={draft.scratchGiB} onChange={(event) => setDraft({ ...draft, scratchGiB: event.target.value })} placeholder={hasExplicitReset(draft.profile.defaults.resources?.scratch) ? "Reset retained" : "Inherit"} /></label>
+          <label>GPU VRAM per device (GiB)<Input type="number" min="0" step="any" value={draft.vramGiB} onChange={(event) => setDraft({ ...draft, vramGiB: event.target.value })} placeholder={draft.profile.defaults.resources?.gpu === null || draft.profile.defaults.resources?.gpu?.vram_per_device_bytes === null ? "Reset retained" : "Inherit"} /></label>
         </fieldset>
         <p className="fm-start-compute-settings__intro">Inherit leaves the preference unset. Auto records an explicit automatic choice. GPU requests require a GPU; availability is checked when a task is submitted.</p>
-        <p className="fm-start-compute-settings__intro">Other resource settings are retained when creating a new version. Saving a profile does not assign it to a study.</p>
+        <p className="fm-start-compute-settings__intro">Blank values inherit unless an existing explicit reset is retained unchanged. RAM, scratch, and VRAM values are requested per-task limits; actual admission and allocation are resolved when a task starts.</p>
+        <p className="fm-start-compute-settings__intro">Other advanced resource settings are retained when creating a new version. Saving a profile does not assign it to a study.</p>
         <div className="fm-start-profiles__actions">
           {pending ? <>
             <Button disabled={busy} onClick={() => void checkPublication()} type="button" size="sm">Check publication</Button>
@@ -157,6 +193,85 @@ function ProfileEditor({ resource }: { resource: Profiles }) {
   );
 }
 
+function ProfileInspection({ profile }: { readonly profile: ExecutionProfile }) {
+  const { defaults } = profile;
+  const resources = defaults.resources;
+  const cpu = resources?.cpu;
+  const gpu = resources?.gpu;
+  const target = resources?.target;
+  const parallelism = resources?.parallelism;
+  const targetValue = target
+    ? target.kind === "local"
+      ? "Local"
+      : `${target.kind}: ${target.id}`
+    : "Inherit";
+  const parallelismValue = parallelism?.kind === "distributed"
+    ? `${parallelism.ranks} ranks · ${parallelism.threads_per_rank} threads/rank · ${parallelism.gpus_per_rank} GPUs/rank`
+    : scalarValue(parallelism?.kind === "single_process" ? "Single process" : undefined);
+  const gpuSelectorValue = gpu === null
+    ? "Reset"
+    : gpu?.selector === "any_compatible"
+      ? "Any compatible device"
+      : gpu?.selector === "allow_list"
+        ? "Allowed UUIDs"
+        : gpu?.selector === "required"
+          ? "Required UUID"
+          : scalarValue(gpu?.selector);
+  const gpuIdsValue = gpu === null
+    ? "Reset"
+    : gpu === undefined
+      ? "Inherit"
+      : gpu.device_uuids?.length
+        ? gpu.device_uuids.join(", ")
+        : gpu.selector === "any_compatible"
+          ? "No UUID restriction"
+          : "No UUIDs configured";
+
+  return (
+    <details className="fm-start-profiles__inspection">
+      <summary>Inspect</summary>
+      <dl>
+        <ProfileDetail label="Target" value={targetValue} />
+        <ProfileDetail label="Backend" value={scalarValue(defaults.backend)} />
+        <ProfileDetail label="Device" value={scalarValue(defaults.device)} />
+        <ProfileDetail label="Precision" value={scalarValue(defaults.precision)} />
+        <ProfileDetail label="Execution mode" value={scalarValue(defaults.mode)} />
+        <ProfileDetail label="CPU threads/task" value={scalarValue(cpu?.threads)} />
+        <ProfileDetail label="CPU core policy" value={scalarValue(cpu?.core_policy)} />
+        <ProfileDetail label="CPU affinity" value={scalarValue(cpu?.affinity)} />
+        <ProfileDetail label="Native threads" value={scalarValue(cpu?.native_threads)} />
+        <ProfileDetail label="BLAS threads" value={scalarValue(cpu?.blas_threads)} />
+        <ProfileDetail label="NUMA node" value={scalarValue(cpu?.numa_node)} />
+        <ProfileDetail label="GPU selector" value={gpuSelectorValue} />
+        <ProfileDetail label="GPU UUIDs" value={gpuIdsValue} />
+        <ProfileDetail label="GPUs/task" value={gpu === null ? "Reset" : scalarValue(gpu?.devices_per_task)} />
+        <ProfileDetail label="VRAM/device" value={gpu === null ? "Reset" : memoryValue(gpu?.vram_per_device_bytes)} />
+        <ProfileDetail label="RAM/task" value={memoryValue(resources?.ram?.reservation_bytes)} />
+        <ProfileDetail label="Scratch/task" value={memoryValue(resources?.scratch?.reservation_bytes)} />
+        <ProfileDetail label="Parallelism" value={parallelismValue} />
+        <ProfileDetail label="Placement" value={scalarValue(resources?.placement)} />
+      </dl>
+    </details>
+  );
+}
+
+function ProfileDetail({ label, value }: { readonly label: string; readonly value: string }) {
+  return <><dt>{label}</dt><dd>{value}</dd></>;
+}
+
+function scalarValue(value: string | number | null | undefined): string {
+  if (value === undefined) return "Inherit";
+  if (value === null) return "Reset";
+  return value === "auto" ? "Auto" : String(value);
+}
+
+function memoryValue(bytes: number | null | undefined): string {
+  if (bytes === undefined) return "Inherit";
+  if (bytes === null) return "Reset";
+  if (!Number.isSafeInteger(bytes) || bytes < 0) return "Not safely displayable";
+  return `${GIB_FORMAT.format(bytes / 1024 ** 3)} GiB`;
+}
+
 function ProfileChoice<T extends string>({ label, value, options, onChange, disabled }: {
   label: string; value?: T; options: readonly T[]; onChange: (value: T | "inherit") => void; disabled: boolean;
 }) {
@@ -166,4 +281,8 @@ function ProfileChoice<T extends string>({ label, value, options, onChange, disa
       <SelectContent><SelectItem value="inherit">Inherit</SelectItem>{options.map((option) => <SelectItem key={option} value={option}>{option === "auto" ? "Auto" : option.toUpperCase()}</SelectItem>)}</SelectContent>
     </Select>
   </div>;
+}
+
+function hasExplicitReset(value: { reservation_bytes?: number | null } | null | undefined): boolean {
+  return value === null || value?.reservation_bytes === null;
 }

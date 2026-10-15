@@ -349,6 +349,36 @@ mod tests {
         }
     }
 
+    fn recertify_interactive_fdm_grid_certificate(plan: &mut FdmPlanIR) {
+        let cost = fullmag_plan::checked_fdm_grid_cost(
+            plan.grid.cells,
+            fullmag_plan::FDM_GRID_ESTIMATED_BYTES_PER_CELL,
+        )
+        .expect("interactive FDM fixture grid cost should fit u64");
+        let total_cells_len = usize::try_from(cost.cells)
+            .expect("interactive FDM fixture cell count should fit usize");
+        assert_eq!(plan.region_mask.len(), total_cells_len);
+        if let Some(active_mask) = plan.active_mask.as_deref() {
+            assert_eq!(active_mask.len(), total_cells_len);
+        }
+        let active_cells = plan.active_mask.as_deref().map_or(cost.cells, |mask| {
+            u64::try_from(mask.iter().filter(|active| **active).count())
+                .expect("interactive FDM fixture active-cell count should fit u64")
+        });
+        plan.grid_certificate = Some(
+            FdmGridCertificateIR::new_with_masks(
+                plan.origin_m,
+                plan.grid.cells,
+                plan.cell_size,
+                active_cells,
+                cost.estimated_bytes,
+                plan.active_mask.as_deref(),
+                &plan.region_mask,
+            )
+            .expect("interactive FDM certificate should match the final fixture masks"),
+        );
+    }
+
     fn resolved_frozen_spins(mask: Vec<bool>) -> ResolvedFrozenSpinsPlanIR {
         let grid_fingerprint = interactive_fdm_grid_certificate().grid_fingerprint;
         let active_dof_count = mask.len() as u64;
@@ -1207,6 +1237,7 @@ mod tests {
             }),
             field_xyz: vec![[0.0, 250.0, -125.0]; plan.initial_magnetization.len()],
         }];
+        recertify_interactive_fdm_grid_certificate(&mut plan);
         let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
             &plan,
             FdmEngine::CpuReference,
@@ -1612,6 +1643,7 @@ mod tests {
         plan.initial_magnetization = std::iter::once([1.0, 0.0, 0.0])
             .chain(std::iter::repeat_n([0.0, 0.0, 0.0], 7))
             .collect();
+        recertify_interactive_fdm_grid_certificate(&mut plan);
         let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
             &plan,
             FdmEngine::CpuReference,
@@ -1659,6 +1691,7 @@ mod tests {
         plan.initial_magnetization = std::iter::once([1.0, 0.0, 0.0])
             .chain(std::iter::repeat_n([0.0, 0.0, 0.0], 7))
             .collect();
+        recertify_interactive_fdm_grid_certificate(&mut plan);
         let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
             &plan,
             FdmEngine::CpuReference,
@@ -2406,6 +2439,10 @@ impl InteractiveFemPreviewRuntime {
         }
     }
 
+    /// Low-level in-memory execution. This returns a `RunResult` without
+    /// publishing producer provenance or a qualified relaxation artifact bundle.
+    /// Artifact-producing callers use the runner entry point that binds the
+    /// execution identity before dispatch and writes the exact payloads.
     pub fn execute_with_live_preview(
         &mut self,
         plan: &FemPlanIR,

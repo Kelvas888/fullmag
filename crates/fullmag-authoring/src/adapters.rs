@@ -92,16 +92,21 @@ pub fn scene_document_from_script_builder(builder: &ScriptBuilderState) -> Scene
         study: SceneStudyState {
             backend: builder.backend.clone(),
             requested_backend: builder
-                .backend
+                .requested_backend
                 .clone()
+                .or_else(|| builder.backend.clone())
                 .unwrap_or_else(|| "auto".to_string()),
-            requested_device: "auto".to_string(),
-            requested_precision: "double".to_string(),
+            requested_device: builder.requested_device.clone()
+                .unwrap_or_else(|| "auto".to_string()),
+            requested_precision: builder.requested_precision.clone()
+                .unwrap_or_else(|| "double".to_string()),
             requested_mode: builder
                 .requested_mode
                 .clone()
                 .unwrap_or_else(|| "strict".to_string()),
             requested_cpu_threads: builder.cpu_threads,
+            parallel_execution: builder.parallel_execution.clone().unwrap_or_default(),
+            pbc: Some(builder.pbc.clone()),
             fem_demag_solver_policy: builder.fem_demag_solver_policy.clone(),
             exchange_enabled: builder.exchange_enabled,
             demag_enabled: builder.demag_enabled,
@@ -132,6 +137,7 @@ pub fn scene_document_from_script_builder(builder: &ScriptBuilderState) -> Scene
         },
         outputs: SceneOutputsState::default(),
         editor: SceneEditorState::default(),
+        analysis: Default::default(),
     }
 }
 
@@ -234,8 +240,13 @@ pub fn scene_document_to_script_builder(
     Ok(ScriptBuilderState {
         revision: scene.revision,
         backend: normalized_scene.study.backend.clone(),
+        requested_backend: Some(normalized_scene.study.requested_backend.clone()),
+        requested_device: Some(normalized_scene.study.requested_device.clone()),
+        requested_precision: Some(normalized_scene.study.requested_precision.clone()),
         requested_mode: Some(normalized_scene.study.requested_mode.clone()),
         cpu_threads: normalized_scene.study.requested_cpu_threads,
+        parallel_execution: Some(normalized_scene.study.parallel_execution.clone()),
+        pbc: normalized_scene.study.pbc.clone().flatten(),
         fem_demag_solver_policy: normalized_scene.study.fem_demag_solver_policy.clone(),
         exchange_enabled: normalized_scene.study.exchange_enabled,
         demag_enabled: normalized_scene.study.demag_enabled,
@@ -457,13 +468,17 @@ pub fn scene_document_to_script_builder_overrides(
             "precision": scene.study.requested_precision,
             "mode": scene.study.requested_mode,
             "cpu_threads": scene.study.requested_cpu_threads,
+            "parallel_execution": scene.study.parallel_execution,
             "fem_demag_solver_policy": scene.study.fem_demag_solver_policy,
             "explicit_selection": scene.study.requested_backend != "auto"
                 || scene.study.requested_device != "auto"
                 || scene.study.requested_precision != "double"
                 || scene.study.requested_mode != "strict"
-                || scene.study.requested_cpu_threads.is_some(),
+                || scene.study.requested_cpu_threads.is_some()
+                || scene.study.parallel_execution
+                    != fullmag_ir::ParallelExecutionPolicyIR::default(),
         },
+        "pbc": builder.pbc,
         "exchange_enabled": builder.exchange_enabled,
         "demag_enabled": builder.demag_enabled,
         "demag_realization": builder.demag_realization,
@@ -546,38 +561,53 @@ pub fn scene_document_to_script_builder_overrides(
             "airbox_growth_rate": universe.airbox_growth_rate,
             "airbox_grading": universe.airbox_grading,
         })).unwrap_or(Value::Null),
-        "stages": builder.stages.iter().map(|stage| serde_json::json!({
-            "kind": stage.kind,
-            "entrypoint_kind": stage.entrypoint_kind,
-            "integrator": string_or_null(&stage.integrator),
-            "fixed_timestep": parse_optional_text_f64(&stage.fixed_timestep),
-            "adaptive_timestep": stage.adaptive_timestep.as_ref().map(adaptive_timestep_override_value).unwrap_or(Value::Null),
-            "until_seconds": parse_optional_text_f64(&stage.until_seconds),
-            "relax_algorithm": string_or_null(&stage.relax_algorithm),
-            "torque_tolerance": parse_optional_text_f64(&stage.torque_tolerance),
-            "energy_tolerance": parse_optional_text_f64(&stage.energy_tolerance),
-            "max_steps": parse_optional_text_u64(&stage.max_steps),
-            "eigen_count": parse_optional_text_u64(&stage.eigen_count),
-            "eigen_target_frequency": parse_optional_text_f64(&stage.eigen_target_frequency),
-            "eigen_k_vector": parse_optional_text_vec3(&stage.eigen_k_vector),
-            "eigen_target": string_or_null(&stage.eigen_target),
-            "eigen_include_demag": stage.eigen_include_demag,
-            "eigen_equilibrium_source": if stage.eigen_equilibrium_source.is_empty() {
-                stage.extra.get("equilibrium_source").cloned().unwrap_or(Value::Null)
-            } else {
-                string_or_null(&stage.eigen_equilibrium_source)
-            },
-            "eigen_equilibrium_artifact": stage.extra.get("eigen_equilibrium_artifact")
-                .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
-                .or_else(|| stage.extra.get("equilibrium_artifact")),
-            "frequency_equilibrium_source": stage.extra.get("frequency_equilibrium_source")
-                .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
-                .or_else(|| stage.extra.get("equilibrium_source")),
-            "frequency_equilibrium_artifact": stage.extra.get("frequency_equilibrium_artifact")
-                .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
-                .or_else(|| stage.extra.get("equilibrium_artifact")),
-            "eigen_normalization": string_or_null(&stage.eigen_normalization),
-        })).collect::<Vec<_>>(),
+        "stages": builder.stages.iter().map(|stage| {
+            let mut stage_override = serde_json::json!({
+                "kind": stage.kind,
+                "entrypoint_kind": stage.entrypoint_kind,
+                "integrator": string_or_null(&stage.integrator),
+                "fixed_timestep": parse_optional_text_f64(&stage.fixed_timestep),
+                "adaptive_timestep": stage.adaptive_timestep.as_ref().map(adaptive_timestep_override_value).unwrap_or(Value::Null),
+                "until_seconds": parse_optional_text_f64(&stage.until_seconds),
+                "relax_algorithm": string_or_null(&stage.relax_algorithm),
+                "torque_tolerance": parse_optional_text_f64(&stage.torque_tolerance),
+                "energy_tolerance": parse_optional_text_f64(&stage.energy_tolerance),
+                "max_steps": parse_optional_text_u64(&stage.max_steps),
+                "eigen_count": parse_optional_text_u64(&stage.eigen_count),
+                "eigen_target_frequency": parse_optional_text_f64(&stage.eigen_target_frequency),
+                "eigen_k_vector": parse_optional_text_vec3(&stage.eigen_k_vector),
+                "eigen_target": string_or_null(&stage.eigen_target),
+                "eigen_include_demag": stage.eigen_include_demag,
+                "eigen_equilibrium_source": if stage.eigen_equilibrium_source.is_empty() {
+                    stage.extra.get("equilibrium_source").cloned().unwrap_or(Value::Null)
+                } else {
+                    string_or_null(&stage.eigen_equilibrium_source)
+                },
+                "eigen_equilibrium_artifact": stage.extra.get("eigen_equilibrium_artifact")
+                    .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                    .or_else(|| stage.extra.get("equilibrium_artifact")),
+                "frequency_equilibrium_source": stage.extra.get("frequency_equilibrium_source")
+                    .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                    .or_else(|| stage.extra.get("equilibrium_source")),
+                "frequency_equilibrium_artifact": stage.extra.get("frequency_equilibrium_artifact")
+                    .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                    .or_else(|| stage.extra.get("equilibrium_artifact")),
+                "eigen_normalization": string_or_null(&stage.eigen_normalization),
+            });
+            let stage_fields = stage_override
+                .as_object_mut()
+                .expect("script builder stage overrides are an object");
+            for key in [
+                "eigen_solver_rtol",
+                "eigen_solver_max_outer_iterations",
+                "eigen_solver_max_linear_iterations",
+            ] {
+                if let Some(value) = stage.extra.get(key) {
+                    stage_fields.insert(key.to_string(), value.clone());
+                }
+            }
+            stage_override
+        }).collect::<Vec<_>>(),
         "study_pipeline": builder.study_pipeline.as_ref().map(|document| {
             serde_json::to_value(document).unwrap_or(Value::Null)
         }).unwrap_or(Value::Null),
@@ -649,6 +679,12 @@ pub fn scene_document_to_script_builder_overrides(
             "samples": analysis.samples,
         })).unwrap_or(Value::Null),
     });
+    if scene.study.pbc.is_none() {
+        overrides
+            .as_object_mut()
+            .expect("script builder overrides are an object")
+            .remove("pbc");
+    }
     if let Some(profile) = builder.execution_profile.as_ref() {
         overrides["execution_profile"] =
             serde_json::to_value(profile).expect("execution profile is serializable");
@@ -2400,12 +2436,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adaptive_scene_builder_roundtrip_preserves_requested_runtime() {
+        let mut scene = scene_document_from_script_builder(&sample_builder());
+        scene.study.backend = None;
+        scene.study.requested_backend = "fem".into();
+        scene.study.requested_device = "cpu".into();
+        scene.study.requested_precision = "single".into();
+        scene.study.parallel_execution.mode = fullmag_ir::ParallelExecutionModeIR::Adaptive;
+        let builder = scene_document_to_script_builder(&scene).expect("valid adaptive scene");
+        let restored = scene_document_from_script_builder(&builder);
+        assert_eq!(restored.study.backend, None);
+        assert_eq!(restored.study.requested_backend, scene.study.requested_backend);
+        assert_eq!(restored.study.requested_device, scene.study.requested_device);
+        assert_eq!(restored.study.requested_precision, scene.study.requested_precision);
+        assert_eq!(restored.study.parallel_execution, scene.study.parallel_execution);
+        crate::validate_scene_document_for_authoring(&restored)
+            .expect("round-trip must preserve the legal lane");
+    }
+
+    #[test]
+    fn legacy_builder_keeps_runtime_defaults_without_policy_inference() {
+        let scene = scene_document_from_script_builder(&sample_builder());
+        assert_eq!(scene.study.requested_backend, "fem");
+        assert_eq!(scene.study.requested_device, "auto");
+        assert_eq!(scene.study.requested_precision, "double");
+    }
+
+    #[test]
+    fn scene_pbc_roundtrip_preserves_axes_demag_images_and_null_override() {
+        let mut builder = sample_builder();
+        builder.pbc = Some(fullmag_ir::FdmPeriodicityIR {
+            axes: [fullmag_ir::AxisBoundary::Periodic, fullmag_ir::AxisBoundary::Open,
+                   fullmag_ir::AxisBoundary::Periodic],
+            demag: fullmag_ir::FdmDemagPeriodicityIR::TruncatedImages,
+            image_counts: Some([4, 0, 7]),
+        });
+        let scene = scene_document_from_script_builder(&builder);
+        assert_eq!(scene.study.pbc, Some(builder.pbc.clone()));
+        let restored = scene_document_to_script_builder(&scene).expect("valid PBC scene");
+        assert_eq!(restored.pbc, builder.pbc);
+        let overrides = scene_document_to_script_builder_overrides(&scene).unwrap();
+        assert_eq!(overrides["pbc"], serde_json::to_value(&builder.pbc).unwrap());
+        let encoded = serde_json::to_value(&scene).unwrap();
+        let decoded: SceneDocument = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.study.pbc, Some(builder.pbc.clone()));
+
+        let mut cleared = decoded;
+        cleared.study.pbc = Some(None);
+        assert!(scene_document_to_script_builder(&cleared).unwrap().pbc.is_none());
+        assert!(scene_document_to_script_builder_overrides(&cleared).unwrap()["pbc"].is_null());
+        let mut legacy = serde_json::to_value(&cleared).unwrap();
+        // Keep an explicit reset through serde; absence is not a clear override.
+        assert_eq!(legacy["study"].get("pbc"), Some(&serde_json::Value::Null));
+        legacy["study"].as_object_mut().unwrap().remove("pbc");
+        let legacy: SceneDocument = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.study.pbc.is_none());
+        let legacy_overrides = scene_document_to_script_builder_overrides(&legacy).unwrap();
+        assert!(legacy_overrides.get("pbc").is_none());
+        assert!(serde_json::to_value(&legacy).unwrap()["study"].get("pbc").is_none());
+
+        let explicit_clear: SceneDocument =
+            serde_json::from_value(serde_json::to_value(&cleared).unwrap()).unwrap();
+        assert_eq!(explicit_clear.study.pbc, Some(None));
+        assert_eq!(
+            scene_document_to_script_builder_overrides(&explicit_clear).unwrap().get("pbc"),
+            Some(&serde_json::Value::Null),
+        );
+    }
+
+    #[test]
+    fn scene_pbc_rejects_inconsistent_demag_policy() {
+        let mut scene = scene_document_from_script_builder(&sample_builder());
+        scene.study.pbc = Some(Some(fullmag_ir::FdmPeriodicityIR {
+            axes: [fullmag_ir::AxisBoundary::Periodic, fullmag_ir::AxisBoundary::Open,
+                   fullmag_ir::AxisBoundary::Open],
+            demag: fullmag_ir::FdmDemagPeriodicityIR::PeriodicAirboxK0,
+            image_counts: None,
+        }));
+        assert!(scene_document_to_script_builder(&scene).is_err());
+        let pbc = scene.study.pbc.as_mut().unwrap().as_mut().unwrap();
+        pbc.demag = fullmag_ir::FdmDemagPeriodicityIR::Open;
+        pbc.image_counts = Some([1, 0, 0]);
+        assert!(scene_document_to_script_builder(&scene).is_err());
+    }
+
     fn sample_builder() -> ScriptBuilderState {
         ScriptBuilderState {
             revision: 7,
             backend: Some("fem".to_string()),
+            requested_backend: None,
+            requested_device: None,
+            requested_precision: None,
             requested_mode: Some("strict".to_string()),
             cpu_threads: Some(8),
+            parallel_execution: None,
+            pbc: None,
             fem_demag_solver_policy: Some(fullmag_ir::FemLinearSolverPolicy::default()),
             exchange_enabled: true,
             demag_enabled: true,
@@ -4074,6 +4200,76 @@ mod tests {
                 "storage/preserved.json"
             );
         }
+    }
+
+    #[test]
+    fn scene_override_preserves_explicit_eigen_solver_policy() {
+        let mut encoded = serde_json::to_value(sample_builder()).unwrap();
+        encoded["stages"][0]["kind"] = serde_json::json!("eigenmodes");
+        encoded["stages"][0]["eigen_solver_rtol"] = serde_json::json!(2.5e-8);
+        encoded["stages"][0]["eigen_solver_max_outer_iterations"] = serde_json::json!(145);
+        encoded["stages"][0]["eigen_solver_max_linear_iterations"] = serde_json::json!(245);
+        let builder: ScriptBuilderState = serde_json::from_value(encoded).unwrap();
+        let scene = scene_document_from_script_builder(&builder);
+        let overrides = scene_document_to_script_builder_overrides(&scene).unwrap();
+
+        assert_eq!(
+            overrides["stages"][0]["eigen_solver_rtol"],
+            serde_json::json!(2.5e-8)
+        );
+        assert_eq!(
+            overrides["stages"][0]["eigen_solver_max_outer_iterations"],
+            serde_json::json!(145)
+        );
+        assert_eq!(
+            overrides["stages"][0]["eigen_solver_max_linear_iterations"],
+            serde_json::json!(245)
+        );
+    }
+
+    #[test]
+    fn scene_override_omits_unset_eigen_solver_policy_for_legacy_stage() {
+        let mut encoded = serde_json::to_value(sample_builder()).unwrap();
+        encoded["stages"][0]["kind"] = serde_json::json!("eigenmodes");
+        let builder: ScriptBuilderState = serde_json::from_value(encoded).unwrap();
+        let scene = scene_document_from_script_builder(&builder);
+        let overrides = scene_document_to_script_builder_overrides(&scene).unwrap();
+        let stage_overrides = overrides["stages"][0]
+            .as_object()
+            .expect("stage override should be an object");
+
+        for key in [
+            "eigen_solver_rtol",
+            "eigen_solver_max_outer_iterations",
+            "eigen_solver_max_linear_iterations",
+        ] {
+            assert!(
+                !stage_overrides.contains_key(key),
+                "legacy stage must not emit absent solver key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn scene_override_preserves_explicit_eigen_solver_policy_clears_and_mixed_values() {
+        let mut encoded = serde_json::to_value(sample_builder()).unwrap();
+        encoded["stages"][0]["kind"] = serde_json::json!("eigenmodes");
+        encoded["stages"][0]["eigen_solver_rtol"] = Value::Null;
+        encoded["stages"][0]["eigen_solver_max_outer_iterations"] = serde_json::json!("");
+        encoded["stages"][0]["eigen_solver_max_linear_iterations"] = serde_json::json!(57);
+        let builder: ScriptBuilderState = serde_json::from_value(encoded).unwrap();
+        let scene = scene_document_from_script_builder(&builder);
+        let overrides = scene_document_to_script_builder_overrides(&scene).unwrap();
+
+        assert_eq!(overrides["stages"][0]["eigen_solver_rtol"], Value::Null);
+        assert_eq!(
+            overrides["stages"][0]["eigen_solver_max_outer_iterations"],
+            serde_json::json!("")
+        );
+        assert_eq!(
+            overrides["stages"][0]["eigen_solver_max_linear_iterations"],
+            serde_json::json!(57)
+        );
     }
 
     #[test]

@@ -26,6 +26,7 @@ import {
   useSessionResourceIdentity,
   useSessionStatusSelector,
 } from "@/kernel/resources/useSessionStatus";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import {
   findInteractionSpec,
   interactionAvailabilityForDiscretization,
@@ -181,7 +182,7 @@ export function PhysicsInteractionPanel({ selection }: InspectorPanelProps) {
   const { api, authoringHistory, resources } = useKernel();
   const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
   const sessionDiscretization = useSessionStatusSelector(
-    (status) => status.data?.domain.discretization ?? null,
+    (status) => resolveSessionDiscretization(status.data),
   );
   const sessionId = useSessionStatusSelector(
     (status) => status.data?.session.session_id ?? "current",

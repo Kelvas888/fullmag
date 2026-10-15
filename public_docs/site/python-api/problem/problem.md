@@ -143,7 +143,7 @@ constraint = FrozenSpins(
 | `Problem.mechanical_loads` | sequence | `()` | mixed | mechanical loads | `mechanical_loads` |
 | `Problem.selections` | `Sequence[SelectionDefinition]` | `()` | $1$ | unique definitions; reference existence, cycles, and complexity validated | canonical selection definitions |
 | `Problem.magnetization_constraints` | `Sequence[FrozenSpins]` | `()` | $1$ | typed constraints; selection/object/region/stage references validated | canonical magnetization constraints |
-| `Problem.parameters` | `ParameterLibrary \| None` | `None` | mixed | optional versioned authoring parameter library; resolved at construction (unknown references, cycles, dimension conflicts rejected), lowered as authoring metadata only | `parameters` |
+| `Problem.parameters` | `ParameterLibrary \| None` | `None` | mixed | optional versioned SI-normalized authoring parameter library; resolved at construction (unknown references, cycles, dimension conflicts rejected), lowered as authoring metadata only | `parameters` |
 | `Problem.pbc` | `FdmPbc \| tuple[bool,bool,bool] \| None` | `None` | $1$ | requested periodic axes and demag policy | `backend_policy.pbc` |
 
 
@@ -295,6 +295,6 @@ Frontend source owner: `apps/control-room/src/modules/inspector/panels/StudyInsp
 
 | Claim | Path | Stable symbol | Responsibility | Evidence |
 |---|---|---|---|---|
-| aggregate API and IR | `packages/fullmag-py/src/fullmag/model/problem.py` | `class Problem` | graph validation and lowering | signature/source-map/round-trip tests |
+| aggregate API and IR | [`packages/fullmag-py/src/fullmag/model/problem.py`](https://github.com/MateuszZelent/fullmag/blob/5e99782acbb7fb3f65d0cad872e102bf67733103/packages/fullmag-py/src/fullmag/model/problem.py#L2601) | [`class Problem`](https://github.com/MateuszZelent/fullmag/blob/5e99782acbb7fb3f65d0cad872e102bf67733103/packages/fullmag-py/src/fullmag/model/problem.py#L2601) | graph validation and lowering | signature/source-map/round-trip tests |
 | selections | `packages/fullmag-py/src/fullmag/model/selection.py` | `SelectionDefinition` | canonical selection graph | selection validation tests |
 | constraints | `packages/fullmag-py/src/fullmag/model/constraints.py` | `FrozenSpins` | magnetization constraint semantics | constraint tests |

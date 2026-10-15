@@ -35,6 +35,10 @@
 //! │     ├─ coordinator_journal/
 //! │     ├─ checkpoints/
 //! │     └─ artifacts/
+//! ├─ batches/
+//! │  └─ <batch_id>/
+//! │     ├─ batch_intent.json
+//! │     └─ expansion_progress.json
 //! ├─ solutions/
 //! │  └─ <sha256(logical-id)>/
 //! │     ├─ manifest.json
@@ -52,8 +56,8 @@ use anyhow::{bail, Context, Result};
 use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
 
-use crate::archive_source::ArchiveSource;
 use crate::archive_document::{ArchiveDocuments, ArchiveFileSnapshot, MAX_CONTROL_DOCUMENT_BYTES};
+use crate::archive_source::ArchiveSource;
 use crate::reachability::{self, ReachabilityMode, ReachabilityReport};
 use crate::store::SessionStore;
 use crate::types::*;
@@ -102,14 +106,23 @@ struct PackEntry {
 
 impl PackEntry {
     fn from_bytes(archive_path: String, data: Vec<u8>) -> Self {
-        Self { archive_path, snapshot: ArchiveFileSnapshot::from_bytes(&data) }
+        Self {
+            archive_path,
+            snapshot: ArchiveFileSnapshot::from_bytes(&data),
+        }
     }
 
     fn from_file(
-        archive_path: String, store_root: &Path, canonical_root: &Path, source: &Path,
+        archive_path: String,
+        store_root: &Path,
+        canonical_root: &Path,
+        source: &Path,
     ) -> Result<Self> {
         validate_store_source(store_root, canonical_root, source, false)?;
-        Ok(Self { archive_path, snapshot: ArchiveFileSnapshot::capture(source)? })
+        Ok(Self {
+            archive_path,
+            snapshot: ArchiveFileSnapshot::capture(source)?,
+        })
     }
 }
 
@@ -206,6 +219,7 @@ pub fn pack_fms<W: Write + Seek>(
     validate_pack_input(workspace, documents)?;
     let canonical_root = canonical_store_root(store.root())?;
     let mut run_entries = plan_run_entries(store.root(), &canonical_root, session, export_profile)?;
+    let batch_entries = plan_batch_entries(store.root(), &canonical_root, session)?;
     let solution_entries = plan_solution_entries(store.root(), &canonical_root, export_profile)?;
     plan_solution_tensor_owner_entries(
         store.root(),
@@ -217,7 +231,9 @@ pub fn pack_fms<W: Write + Seek>(
         store.root(),
         &canonical_root,
         &run_entries,
+        &batch_entries,
         &solution_entries,
+        documents,
     )?;
     validate_export_plan(
         session,
@@ -225,6 +241,7 @@ pub fn pack_fms<W: Write + Seek>(
         export_profile,
         documents,
         &run_entries,
+        &batch_entries,
         &solution_entries,
         &cas_entries,
     )?;
@@ -255,7 +272,23 @@ pub fn pack_fms<W: Write + Seek>(
         let source = store.root().join(&entry.archive_path);
         validate_store_source(store.root(), &canonical_root, &source, false)?;
         crate::cas::copy_verified_file(
-            &source, &entry.snapshot.content_sha256, entry.snapshot.byte_count, &mut zip,
+            &source,
+            &entry.snapshot.content_sha256,
+            entry.snapshot.byte_count,
+            &mut zip,
+        )?;
+    }
+
+    // ── batches/ ──────────────────────────────────────────────────────
+    for entry in batch_entries {
+        zip.start_file(&entry.archive_path, fopts)?;
+        let source = store.root().join(&entry.archive_path);
+        validate_store_source(store.root(), &canonical_root, &source, false)?;
+        crate::cas::copy_verified_file(
+            &source,
+            &entry.snapshot.content_sha256,
+            entry.snapshot.byte_count,
+            &mut zip,
         )?;
     }
 
@@ -265,7 +298,10 @@ pub fn pack_fms<W: Write + Seek>(
         let source = store.root().join(&entry.archive_path);
         validate_store_source(store.root(), &canonical_root, &source, false)?;
         crate::cas::copy_verified_file(
-            &source, &entry.snapshot.content_sha256, entry.snapshot.byte_count, &mut zip,
+            &source,
+            &entry.snapshot.content_sha256,
+            entry.snapshot.byte_count,
+            &mut zip,
         )?;
     }
 
@@ -364,10 +400,16 @@ fn plan_cas_entries(
     store_root: &Path,
     canonical_root: &Path,
     run_entries: &[PackEntry],
+    batch_entries: &[PackEntry],
     solution_entries: &[PackEntry],
+    project_documents: &HashMap<String, Vec<u8>>,
 ) -> Result<Vec<CasPackEntry>> {
     let mut documents = HashMap::new();
-    for entry in run_entries.iter().chain(solution_entries) {
+    for entry in run_entries
+        .iter()
+        .chain(batch_entries)
+        .chain(solution_entries)
+    {
         documents.insert(entry.archive_path.clone(), entry.snapshot.clone());
     }
 
@@ -385,7 +427,21 @@ fn plan_cas_entries(
             validate_store_source(store_root, canonical_root, &entry.path(), false)?;
         }
     }
-    let report = reachability::walk_export_file_documents(&documents, canonical_root)?;
+    // The separately supplied current workspace snapshot carries both CAS
+    // and ordinary run-artifact edges. Validate its exact export bytes against
+    // the selected inventory, not against extra files left in the source store.
+    let snapshot = project_documents.get("current_live_snapshot.json")
+        .or_else(|| project_documents.get("project/current_live_snapshot.json"));
+    let report = if let Some(snapshot) = snapshot {
+        let inline = HashMap::from([(
+            "project/current_live_snapshot.json".to_string(), snapshot.clone(),
+        )]);
+        reachability::walk_export_file_documents_with_project(
+            &documents, canonical_root, &inline,
+        )?
+    } else {
+        reachability::walk_export_file_documents(&documents, canonical_root)?
+    };
     report.require_complete()?;
 
     let mut entries = Vec::new();
@@ -463,13 +519,11 @@ fn plan_solution_tensor_owner_entries(
             );
         }
         let has_tensor = solution.members.iter().any(|member| {
-            member
-                .artifacts
-                .iter()
-                .any(|artifact| {
-                    artifact.schema_id == crate::solution_tensor_source::SOLUTION_TENSOR_SCHEMA
-                        || artifact.schema_id == crate::materialized_dataset::MATERIALIZED_DATASET_SCHEMA
-                })
+            member.artifacts.iter().any(|artifact| {
+                artifact.schema_id == crate::solution_tensor_source::SOLUTION_TENSOR_SCHEMA
+                    || artifact.schema_id
+                        == crate::materialized_dataset::MATERIALIZED_DATASET_SCHEMA
+            })
         });
         if !has_tensor {
             continue;
@@ -571,7 +625,10 @@ fn push_unique_pack_entry(entries: &mut Vec<PackEntry>, entry: PackEntry) -> Res
         {
             return Ok(());
         }
-        bail!("duplicate archive path with conflicting content `{}`", entry.archive_path);
+        bail!(
+            "duplicate archive path with conflicting content `{}`",
+            entry.archive_path
+        );
     }
     entries.push_entry(entry)
 }
@@ -596,23 +653,35 @@ fn plan_run_entries(
         }
         let run_intent = run_dir.join("run_intent.json");
         if let Some(data) = read_store_file_if_exists(store_root, canonical_root, &run_intent)? {
-            entries.push_entry(PackEntry::from_bytes(format!("runs/{run_id}/run_intent.json"), data))?;
+            entries.push_entry(PackEntry::from_bytes(
+                format!("runs/{run_id}/run_intent.json"),
+                data,
+            ))?;
         }
         let run_catalog = run_dir.join("run_catalog.json");
         if let Some(data) = read_store_file_if_exists(store_root, canonical_root, &run_catalog)? {
-            entries.push_entry(PackEntry::from_bytes(format!("runs/{run_id}/run_catalog.json"), data))?;
+            entries.push_entry(PackEntry::from_bytes(
+                format!("runs/{run_id}/run_catalog.json"),
+                data,
+            ))?;
         }
         let artifact_catalog = run_dir.join("artifact_catalog.json");
         if let Some(data) =
             read_store_file_if_exists(store_root, canonical_root, &artifact_catalog)?
         {
-            entries.push_entry(PackEntry::from_bytes(format!("runs/{run_id}/artifact_catalog.json"), data))?;
+            entries.push_entry(PackEntry::from_bytes(
+                format!("runs/{run_id}/artifact_catalog.json"),
+                data,
+            ))?;
         }
         let preparation_receipt = run_dir.join("preparation_receipt.json");
         if let Some(data) =
             read_store_file_if_exists(store_root, canonical_root, &preparation_receipt)?
         {
-            entries.push_entry(PackEntry::from_bytes(format!("runs/{run_id}/preparation_receipt.json"), data))?;
+            entries.push_entry(PackEntry::from_bytes(
+                format!("runs/{run_id}/preparation_receipt.json"),
+                data,
+            ))?;
         }
         let task_receipt_dir = run_dir.join("task_preparation_receipts");
         if store_source_exists(&task_receipt_dir)? {
@@ -666,6 +735,7 @@ fn plan_run_entries(
         plan_resource_lease_entries(store_root, canonical_root, run_id, &mut entries)?;
         plan_preparation_resource_lease_entries(store_root, canonical_root, run_id, &mut entries)?;
         plan_task_admission_entries(store_root, canonical_root, run_id, &mut entries)?;
+        plan_task_cancellation_entries(store_root, canonical_root, run_id, &mut entries)?;
         plan_retry_decision_entries(store_root, canonical_root, run_id, &mut entries)?;
         plan_preparation_retry_decision_entries(store_root, canonical_root, run_id, &mut entries)?;
         plan_worker_process_exit_receipt_entries(store_root, canonical_root, run_id, &mut entries)?;
@@ -706,6 +776,59 @@ fn plan_run_entries(
         }
         if profile.include_artifacts() {
             plan_artifact_entries(store_root, canonical_root, run_id, &mut entries)?;
+        }
+    }
+    Ok(entries)
+}
+
+fn plan_batch_entries(
+    store_root: &Path,
+    canonical_root: &Path,
+    session: &FmsSessionManifest,
+) -> Result<Vec<PackEntry>> {
+    let mut entries = Vec::new();
+    let mut seen_refs = HashSet::new();
+    for batch_ref in &session.batch_refs {
+        let batch_id = parse_batch_ref(batch_ref)?;
+        if !seen_refs.insert(batch_ref) {
+            bail!("duplicate batch reference `{batch_ref}`");
+        }
+        let source = store_root
+            .join("batches")
+            .join(batch_id)
+            .join("batch_intent.json");
+        let data = read_store_file_if_exists(store_root, canonical_root, &source)?
+            .with_context(|| format!("session references missing batch intent `{batch_ref}`"))?;
+        let intent: FmsBatchIntent = serde_json::from_slice(&data)
+            .with_context(|| format!("batch intent `{batch_ref}` is not typed"))?;
+        intent
+            .validate()
+            .with_context(|| format!("batch intent `{batch_ref}` is invalid"))?;
+        if intent.batch_id != batch_id {
+            bail!("batch intent `{batch_ref}` contains mismatched batch_id");
+        }
+        entries.push_entry(PackEntry::from_bytes(batch_ref.clone(), data))?;
+        let progress_ref = format!("batches/{batch_id}/expansion_progress.json");
+        let progress_path = store_root.join(&progress_ref);
+        if let Some(progress_data) =
+            read_store_file_if_exists(store_root, canonical_root, &progress_path)?
+        {
+            validate_portable_namespace_path(&progress_ref)?;
+            let progress: FmsBatchExpansionProgress = serde_json::from_slice(&progress_data)
+                .with_context(|| format!("batch expansion progress `{progress_ref}` is not typed"))?;
+            let manifest_path = store_root
+                .join("objects/sha256")
+                .join(&intent.manifest_object_ref);
+            let manifest_bytes = read_store_file_if_exists(
+                store_root,
+                canonical_root,
+                &manifest_path,
+            )?
+            .context("batch expansion manifest object is missing during export")?;
+            progress
+                .validate_for_manifest(&intent, &manifest_bytes)
+                .with_context(|| format!("batch expansion progress `{progress_ref}` is invalid"))?;
+            entries.push_entry(PackEntry::from_bytes(progress_ref, progress_data))?;
         }
     }
     Ok(entries)
@@ -1035,6 +1158,51 @@ fn plan_preparation_process_launch_entries(
     Ok(())
 }
 
+fn plan_task_cancellation_entries(
+    store_root: &Path,
+    _canonical_root: &Path,
+    run_id: &str,
+    entries: &mut Vec<PackEntry>,
+) -> Result<()> {
+    let root = store_root
+        .join("runs")
+        .join(run_id)
+        .join("task_cancellation_intents");
+    if !store_source_exists(&root)? {
+        return Ok(());
+    }
+    crate::repository_path::reject_link(&root)?;
+    if !root.is_dir() {
+        bail!("task_cancellation_intents path is not a directory");
+    }
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        crate::repository_path::reject_link(&entry.path())?;
+        if !entry.file_type()?.is_file() {
+            bail!("task cancellation intent is not a regular file");
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("non-UTF8 cancellation intent filename"))?;
+        let task_id = name
+            .strip_suffix(".json")
+            .context("task cancellation intent must be JSON")?;
+        crate::repository_path::validate_store_id(task_id)?;
+        let relative = format!("runs/{run_id}/task_cancellation_intents/{name}");
+        validate_portable_namespace_path(&relative)?;
+        let data =
+            crate::repository_path::read_bounded_regular_file(store_root, &relative, 256 * 1024)?;
+        let record: crate::FmsTaskCancellationIntent = serde_json::from_slice(&data)?;
+        record.validate()?;
+        if record.run_id != run_id || record.task.task_id != task_id {
+            bail!("task cancellation intent identity differs from pack path");
+        }
+        entries.push_entry(PackEntry::from_bytes(relative, data))?;
+    }
+    Ok(())
+}
+
 fn plan_task_admission_entries(
     store_root: &Path,
     canonical_root: &Path,
@@ -1163,6 +1331,25 @@ fn parse_run_ref(run_ref: &str) -> Result<&str> {
     Ok(run_id)
 }
 
+fn parse_batch_ref(batch_ref: &str) -> Result<&str> {
+    let Some(batch_id) = batch_ref
+        .strip_prefix("batches/")
+        .and_then(|value| value.strip_suffix("/batch_intent.json"))
+    else {
+        bail!("invalid batch reference `{batch_ref}`");
+    };
+    if batch_id.is_empty() || batch_id.contains('/') {
+        bail!("invalid batch reference `{batch_ref}`");
+    }
+    let canonical_ref = format!("batches/{batch_id}/batch_intent.json");
+    if canonical_ref != batch_ref {
+        bail!("invalid batch reference `{batch_ref}`");
+    }
+    validate_portable_namespace_path(&canonical_ref)
+        .with_context(|| format!("invalid batch reference `{batch_ref}`"))?;
+    Ok(batch_id)
+}
+
 fn plan_checkpoint_entries(
     store_root: &Path,
     canonical_root: &Path,
@@ -1205,7 +1392,12 @@ fn plan_checkpoint_entries(
             let name = portable_file_name(&file)?;
             let archive_path = format!("{checkpoint_prefix}/{name}");
             validate_portable_namespace_path(&archive_path)?;
-            entries.push_entry(PackEntry::from_file(archive_path, store_root, canonical_root, &file.path())?)?;
+            entries.push_entry(PackEntry::from_file(
+                archive_path,
+                store_root,
+                canonical_root,
+                &file.path(),
+            )?)?;
         }
     }
     Ok(())
@@ -1260,7 +1452,12 @@ fn plan_artifact_directory(
                 entries,
             )?;
         } else if file_type.is_file() {
-            entries.push_entry(PackEntry::from_file(archive_path, store_root, canonical_root, &entry.path())?)?;
+            entries.push_entry(PackEntry::from_file(
+                archive_path,
+                store_root,
+                canonical_root,
+                &entry.path(),
+            )?)?;
         } else {
             anyhow::bail!("unsupported artifact source: {}", entry.path().display());
         }
@@ -1301,12 +1498,19 @@ fn read_store_file(store_root: &Path, canonical_root: &Path, source: &Path) -> R
     validate_store_source(store_root, canonical_root, source, false)?;
     let file = File::open(source)?;
     if file.metadata()?.len() > MAX_CONTROL_DOCUMENT_BYTES {
-        bail!("structural export document exceeds metadata budget: {}", source.display());
+        bail!(
+            "structural export document exceeds metadata budget: {}",
+            source.display()
+        );
     }
     let mut data = Vec::new();
-    file.take(MAX_CONTROL_DOCUMENT_BYTES + 1).read_to_end(&mut data)?;
+    file.take(MAX_CONTROL_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut data)?;
     if data.len() as u64 > MAX_CONTROL_DOCUMENT_BYTES {
-        bail!("structural export document exceeds metadata budget: {}", source.display());
+        bail!(
+            "structural export document exceeds metadata budget: {}",
+            source.display()
+        );
     }
     Ok(data)
 }
@@ -1398,6 +1602,7 @@ fn validate_export_plan(
     export_profile: &FmsExportProfile,
     documents: &HashMap<String, Vec<u8>>,
     run_entries: &[PackEntry],
+    batch_entries: &[PackEntry],
     solution_entries: &[PackEntry],
     cas_entries: &[CasPackEntry],
 ) -> Result<()> {
@@ -1423,6 +1628,12 @@ fn validate_export_plan(
     );
     entries.extend(
         run_entries
+            .iter()
+            .map(|entry| Ok((entry.archive_path.clone(), entry.snapshot.byte_count)))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    entries.extend(
+        batch_entries
             .iter()
             .map(|entry| Ok((entry.archive_path.clone(), entry.snapshot.byte_count)))
             .collect::<Result<Vec<_>>>()?,
@@ -1460,7 +1671,8 @@ fn validate_export_entry_metadata(entries: Vec<(String, u64)>) -> Result<()> {
         }
         // Fixed central header and room for all three ZIP64 u64 fields.
         // Export has no entry comments or caller-supplied extra fields.
-        directory_bytes = directory_bytes.checked_add(46 + path.len() as u64 + 28)
+        directory_bytes = directory_bytes
+            .checked_add(46 + path.len() as u64 + 28)
             .context("ZIP central directory budget overflow")?;
         if directory_bytes > MAX_ZIP_DIRECTORY_BYTES {
             bail!("ZIP central directory exceeds metadata budget");
@@ -1522,7 +1734,9 @@ pub fn preflight_fms<R: Read + Seek>(
         }
 
         let mut data = Vec::new();
-        let read_limit = metadata.uncompressed_size.checked_add(1)
+        let read_limit = metadata
+            .uncompressed_size
+            .checked_add(1)
             .context("ZIP entry read limit overflow")?;
         (&mut entry).take(read_limit).read_to_end(&mut data)?;
         if data.len() as u64 != metadata.uncompressed_size {
@@ -1571,7 +1785,12 @@ pub fn preflight_fms<R: Read + Seek>(
     }
 
     let reachability = reachability::walk_archive_documents(&documents, ReachabilityMode::Restore)?;
-    let inspection = build_inspection(&session, &ArchiveDocuments::Memory(&documents), scan.total_compressed, &reachability);
+    let inspection = build_inspection(
+        &session,
+        &ArchiveDocuments::Memory(&documents),
+        scan.total_compressed,
+        &reachability,
+    );
     Ok(FmsPreflight {
         session,
         workspace,
@@ -1603,7 +1822,9 @@ impl FmsStagedPreflight {
     /// Read one explicitly requested control document within the metadata budget.
     pub fn read_document(&self, name: &str) -> Result<Vec<u8>> {
         validate_portable_namespace_path(name)?;
-        self.documents.get(name).context("required archive document is missing")?
+        self.documents
+            .get(name)
+            .context("required archive document is missing")?
             .read_control(&self.root, name)
     }
 }
@@ -1633,87 +1854,147 @@ pub fn preflight_fms_staged<R: Read + Seek>(
     crate::repository_path::reject_link(staging_parent)?;
     let parent = fs::canonicalize(staging_parent)?;
     let decoded = scan.entries.iter().try_fold(0u64, |sum, entry| {
-        sum.checked_add(entry.uncompressed_size).context("archive disk budget overflow")
+        sum.checked_add(entry.uncompressed_size)
+            .context("archive disk budget overflow")
     })?;
-    let metadata_budget = (scan.entries.len() as u64).checked_mul(16 * 1024)
+    let metadata_budget = (scan.entries.len() as u64)
+        .checked_mul(16 * 1024)
         .context("archive metadata disk budget overflow")?;
-    let required = decoded.checked_mul(2)
+    let required = decoded
+        .checked_mul(2)
         .and_then(|size| size.checked_add(metadata_budget))
         .and_then(|size| size.checked_add(256 * 1024 * 1024))
         .context("archive disk admission overflow")?;
     crate::archive_capacity::require_capacity(&parent, required)?;
     let root = parent.join(format!(".fms-decode-{}", uuid::Uuid::new_v4()));
     let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(&root).context("creating exclusive archive staging")?;
+    builder
+        .create(&root)
+        .context("creating exclusive archive staging")?;
     let mut owner = ArchiveStagingOwner(root);
     let mut documents = HashMap::new();
     source.seek(SeekFrom::Start(0))?;
     let mut archive = zip::ZipArchive::new(source)?;
-    if archive.len() != scan.entries.len() { bail!("ZIP central directory entry count is inconsistent"); }
+    if archive.len() != scan.entries.len() {
+        bail!("ZIP central directory entry count is inconsistent");
+    }
     for (index, metadata) in scan.entries.iter().enumerate() {
         let name = &metadata.name;
         let mut entry = archive.by_index(index)?;
-        if entry.name_raw() != name.as_bytes() || entry.size() != metadata.uncompressed_size
-            || entry.compressed_size() != metadata.compressed_size {
+        if entry.name_raw() != name.as_bytes()
+            || entry.size() != metadata.uncompressed_size
+            || entry.compressed_size() != metadata.compressed_size
+        {
             bail!("ZIP entry metadata disagrees with validated central directory");
         }
-        if entry.is_symlink() { bail!("symlink entries are not permitted (`{name}`)"); }
-        if name.ends_with('/') { continue; }
+        if entry.is_symlink() {
+            bail!("symlink entries are not permitted (`{name}`)");
+        }
+        if name.ends_with('/') {
+            continue;
+        }
         let path = crate::repository_path::checked_path(&owner.0, name)?;
         fs::create_dir_all(path.parent().context("archive document parent missing")?)?;
-        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
         let mut hasher = Sha256::new();
         let mut length = 0u64;
         let mut buffer = [0u8; 64 * 1024];
         // One additional byte forces CRC/EOF validation and rejects underdeclared sizes.
-        let mut bounded = (&mut entry).take(metadata.uncompressed_size.checked_add(1)
-            .context("ZIP entry read limit overflow")?);
+        let mut bounded = (&mut entry).take(
+            metadata
+                .uncompressed_size
+                .checked_add(1)
+                .context("ZIP entry read limit overflow")?,
+        );
         loop {
             let count = bounded.read(&mut buffer)?;
-            if count == 0 { break; }
-            length = length.checked_add(count as u64).context("decoded length overflow")?;
-            if length > metadata.uncompressed_size { bail!("ZIP entry `{name}` exceeds declared length"); }
+            if count == 0 {
+                break;
+            }
+            length = length
+                .checked_add(count as u64)
+                .context("decoded length overflow")?;
+            if length > metadata.uncompressed_size {
+                bail!("ZIP entry `{name}` exceeds declared length");
+            }
             hasher.update(&buffer[..count]);
             file.write_all(&buffer[..count])?;
         }
-        if length != metadata.uncompressed_size { bail!("ZIP entry `{name}` actual length differs from declaration"); }
+        if length != metadata.uncompressed_size {
+            bail!("ZIP entry `{name}` actual length differs from declaration");
+        }
         file.flush()?;
         let digest = format!("{:x}", hasher.finalize());
         if let Some(expected) = cas_digest_from_path(name)? {
-            if digest != expected { bail!("CAS SHA-256 mismatch for `{name}`"); }
+            if digest != expected {
+                bail!("CAS SHA-256 mismatch for `{name}`");
+            }
         }
-        documents.insert(name.clone(), ArchiveFileSnapshot { byte_count: length, content_sha256: digest });
+        documents.insert(
+            name.clone(),
+            ArchiveFileSnapshot {
+                byte_count: length,
+                content_sha256: digest,
+            },
+        );
     }
-    let view = ArchiveDocuments::Files { snapshots: &documents, root: &owner.0 };
+    let view = ArchiveDocuments::Files {
+        snapshots: &documents,
+        root: &owner.0,
+    };
     let json = |name: &str| -> Result<Vec<u8>> {
-        view.read(name)?.map(|value| value.into_owned()).with_context(|| format!("entry `{name}` missing"))
+        view.read(name)?
+            .map(|value| value.into_owned())
+            .with_context(|| format!("entry `{name}` missing"))
     };
     let session: FmsSessionManifest = serde_json::from_slice(&json("manifest/session.json")?)?;
-    let workspace: FmsWorkspaceManifest = serde_json::from_slice(&json("manifest/workspace.json")?)?;
-    let export_profile: FmsExportProfile = serde_json::from_slice(&json("manifest/export_profile.json")?)?;
-    if workspace.script_ref != "project/main.py" { bail!("workspace script_ref must be `project/main.py`"); }
-    let script = documents.get("project/main.py").context("new .fms archives require `project/main.py`")?;
+    let workspace: FmsWorkspaceManifest =
+        serde_json::from_slice(&json("manifest/workspace.json")?)?;
+    let export_profile: FmsExportProfile =
+        serde_json::from_slice(&json("manifest/export_profile.json")?)?;
+    if workspace.script_ref != "project/main.py" {
+        bail!("workspace script_ref must be `project/main.py`");
+    }
+    let script = documents
+        .get("project/main.py")
+        .context("new .fms archives require `project/main.py`")?;
     if script.byte_count == 0 || script.content_sha256 != workspace.script_sha256 {
         bail!("archive script is empty or SHA-256 mismatched");
     }
     for required in required_documents {
         validate_portable_namespace_path(required)?;
-        if !documents.contains_key(*required) { bail!("required archive document `{required}` is missing"); }
+        if !documents.contains_key(*required) {
+            bail!("required archive document `{required}` is missing");
+        }
     }
     let reachability = reachability::walk_import_file_documents(&documents, &owner.0)?;
     let inspection = build_inspection(&session, &view, scan.total_compressed, &reachability);
     let root = std::mem::take(&mut owner.0);
-    Ok(FmsStagedPreflight { session, workspace, export_profile, inspection, reachability, root, documents })
+    Ok(FmsStagedPreflight {
+        session,
+        workspace,
+        export_profile,
+        inspection,
+        reachability,
+        root,
+        documents,
+    })
 }
 
 struct ArchiveStagingOwner(PathBuf);
 impl Drop for ArchiveStagingOwner {
     fn drop(&mut self) {
-        if self.0.as_os_str().is_empty() { return; }
+        if self.0.as_os_str().is_empty() {
+            return;
+        }
         if crate::repository_path::reject_link(&self.0).is_ok() {
             if let Err(error) = fs::remove_dir_all(&self.0) {
                 tracing::warn!(path = %self.0.display(), %error, "archive staging cleanup failed");
@@ -1723,9 +2004,17 @@ impl Drop for ArchiveStagingOwner {
 }
 
 /// Publish an already validated archive without decoding it a second time.
-pub fn unpack_fms_staged(preflight: &FmsStagedPreflight, store: &SessionStore) -> Result<FmsSessionManifest> {
-    if matches!(preflight.session.profile, SaveProfile::Solved | SaveProfile::Resume | SaveProfile::Archive) {
+pub fn unpack_fms_staged(
+    preflight: &FmsStagedPreflight,
+    store: &SessionStore,
+) -> Result<FmsSessionManifest> {
+    if matches!(
+        preflight.session.profile,
+        SaveProfile::Solved | SaveProfile::Resume | SaveProfile::Archive
+    ) {
         preflight.reachability.require_complete()?;
+    } else {
+        preflight.reachability.require_visualization_safe()?;
     }
     let _lease = store.write_transaction()?;
     ensure_unpack_destination_pristine(store.root())?;
@@ -1733,12 +2022,22 @@ pub fn unpack_fms_staged(preflight: &FmsStagedPreflight, store: &SessionStore) -
         for (name, snapshot) in &preflight.documents {
             let object = name.starts_with("objects/sha256/");
             let marker = name.ends_with("/checkpoint.json");
-            if (phase == 0 && object) || (phase == 1 && !object && !marker) || (phase == 2 && !object && marker) {
+            if (phase == 0 && object)
+                || (phase == 1 && !object && !marker)
+                || (phase == 2 && !object && marker)
+            {
                 let source = crate::repository_path::checked_path(&preflight.root, name)?;
                 if object {
-                    store.cas().put_file(&source, &snapshot.content_sha256, snapshot.byte_count)?;
+                    store
+                        .cas()
+                        .put_file(&source, &snapshot.content_sha256, snapshot.byte_count)?;
                 } else {
-                    store.write_import_document_file(name, &source, &snapshot.content_sha256, snapshot.byte_count)?;
+                    store.write_import_document_file(
+                        name,
+                        &source,
+                        &snapshot.content_sha256,
+                        snapshot.byte_count,
+                    )?;
                 }
             }
         }
@@ -1753,16 +2052,23 @@ fn scan_zip_directory<R: Read + Seek>(source: &mut ArchiveSource<R>) -> Result<Z
     let tail_length = source.len().min(22 + u16::MAX as u64);
     let tail_offset = source.len() - tail_length;
     let tail = source.read_at(tail_offset, tail_length as usize)?;
-    let eocd_in_tail = tail.windows(4).enumerate().rev().find_map(|(offset, signature)| {
-        if signature != b"PK\x05\x06" || offset + 22 > tail.len() {
-            return None;
-        }
-        let comment_length = u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]) as usize;
-        (offset + 22 + comment_length == tail.len()).then_some(offset)
-    }).context("ZIP end-of-central-directory record not found or invalid comment length")?;
+    let eocd_in_tail = tail
+        .windows(4)
+        .enumerate()
+        .rev()
+        .find_map(|(offset, signature)| {
+            if signature != b"PK\x05\x06" || offset + 22 > tail.len() {
+                return None;
+            }
+            let comment_length =
+                u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]) as usize;
+            (offset + 22 + comment_length == tail.len()).then_some(offset)
+        })
+        .context("ZIP end-of-central-directory record not found or invalid comment length")?;
     let eocd = tail_offset + eocd_in_tail as u64;
     let standard = &tail[eocd_in_tail..eocd_in_tail + 22];
-    if u16_le(standard, 4)? != 0 || u16_le(standard, 6)? != 0
+    if u16_le(standard, 4)? != 0
+        || u16_le(standard, 6)? != 0
         || u16_le(standard, 8)? != u16_le(standard, 10)?
     {
         bail!("multi-disk ZIP archives are not supported");
@@ -1776,57 +2082,65 @@ fn scan_zip_directory<R: Read + Seek>(source: &mut ArchiveSource<R>) -> Result<Z
         Vec::new()
     };
     let has_zip64_locator = locator.get(..4) == Some(b"PK\x06\x07".as_slice());
-    let (entry_count, directory_size, directory_offset, metadata_start) =
-        if has_zip64_locator || standard_entry_count == u16::MAX as u64
-            || standard_directory_size == u32::MAX as u64
-            || standard_directory_offset == u32::MAX as u64
+    let (entry_count, directory_size, directory_offset, metadata_start) = if has_zip64_locator
+        || standard_entry_count == u16::MAX as u64
+        || standard_directory_size == u32::MAX as u64
+        || standard_directory_offset == u32::MAX as u64
+    {
+        let locator_offset = eocd.checked_sub(20).context("ZIP64 locator not found")?;
+        if !has_zip64_locator {
+            bail!("ZIP64 locator not found");
+        }
+        if u32_le(&locator, 4)? != 0 || u32_le(&locator, 16)? != 1 {
+            bail!("multi-disk ZIP64 archives are not supported");
+        }
+        let zip64_offset = u64_le(&locator, 8)?;
+        let zip64 = source.read_at(zip64_offset, 56)?;
+        if &zip64[..4] != b"PK\x06\x06" || u64_le(&zip64, 4)? < 44 {
+            bail!("ZIP64 end-of-central-directory record not found");
+        }
+        let record_size = u64_le(&zip64, 4)?;
+        if record_size > MAX_ZIP_DIRECTORY_BYTES {
+            bail!("ZIP64 end record exceeds metadata budget");
+        }
+        let record_end = zip64_offset
+            .checked_add(12)
+            .and_then(|offset| offset.checked_add(record_size))
+            .context("ZIP64 record size overflow")?;
+        if record_end > locator_offset {
+            bail!("ZIP64 record overlaps locator");
+        }
+        if u32_le(&zip64, 16)? != 0
+            || u32_le(&zip64, 20)? != 0
+            || u64_le(&zip64, 24)? != u64_le(&zip64, 32)?
         {
-            let locator_offset = eocd.checked_sub(20).context("ZIP64 locator not found")?;
-            if !has_zip64_locator {
-                bail!("ZIP64 locator not found");
-            }
-            if u32_le(&locator, 4)? != 0 || u32_le(&locator, 16)? != 1 {
-                bail!("multi-disk ZIP64 archives are not supported");
-            }
-            let zip64_offset = u64_le(&locator, 8)?;
-            let zip64 = source.read_at(zip64_offset, 56)?;
-            if &zip64[..4] != b"PK\x06\x06" || u64_le(&zip64, 4)? < 44 {
-                bail!("ZIP64 end-of-central-directory record not found");
-            }
-            let record_size = u64_le(&zip64, 4)?;
-            if record_size > MAX_ZIP_DIRECTORY_BYTES {
-                bail!("ZIP64 end record exceeds metadata budget");
-            }
-            let record_end = zip64_offset.checked_add(12)
-                .and_then(|offset| offset.checked_add(record_size))
-                .context("ZIP64 record size overflow")?;
-            if record_end > locator_offset {
-                bail!("ZIP64 record overlaps locator");
-            }
-            if u32_le(&zip64, 16)? != 0 || u32_le(&zip64, 20)? != 0
-                || u64_le(&zip64, 24)? != u64_le(&zip64, 32)?
-            {
-                bail!("multi-disk ZIP64 archives are not supported");
-            }
-            let count = u64_le(&zip64, 32)?;
-            let size = u64_le(&zip64, 40)?;
-            let offset = u64_le(&zip64, 48)?;
-            if (standard_entry_count != u16::MAX as u64 && standard_entry_count != count)
-                || (standard_directory_size != u32::MAX as u64 && standard_directory_size != size)
-                || (standard_directory_offset != u32::MAX as u64 && standard_directory_offset != offset)
-            {
-                bail!("ZIP64 and standard directory declarations disagree");
-            }
-            (count, size, offset, zip64_offset)
-        } else {
-            (standard_entry_count, standard_directory_size, standard_directory_offset, eocd)
-        };
+            bail!("multi-disk ZIP64 archives are not supported");
+        }
+        let count = u64_le(&zip64, 32)?;
+        let size = u64_le(&zip64, 40)?;
+        let offset = u64_le(&zip64, 48)?;
+        if (standard_entry_count != u16::MAX as u64 && standard_entry_count != count)
+            || (standard_directory_size != u32::MAX as u64 && standard_directory_size != size)
+            || (standard_directory_offset != u32::MAX as u64 && standard_directory_offset != offset)
+        {
+            bail!("ZIP64 and standard directory declarations disagree");
+        }
+        (count, size, offset, zip64_offset)
+    } else {
+        (
+            standard_entry_count,
+            standard_directory_size,
+            standard_directory_offset,
+            eocd,
+        )
+    };
 
     ArchiveLimitAccounting::validate_declared_entry_count(entry_count)?;
     if directory_size > MAX_ZIP_DIRECTORY_BYTES {
         bail!("ZIP central directory exceeds metadata budget");
     }
-    let directory_end = directory_offset.checked_add(directory_size)
+    let directory_end = directory_offset
+        .checked_add(directory_size)
         .context("ZIP central directory size overflow")?;
     if directory_end > metadata_start {
         bail!("truncated or overlapping ZIP central directory");
@@ -1853,14 +2167,16 @@ fn scan_zip_directory<R: Read + Seek>(source: &mut ArchiveSource<R>) -> Result<Z
         let extra_length = u16_le(&header, 30)? as usize;
         let comment_length = u16_le(&header, 32)? as usize;
         let variable_length = name_length + extra_length + comment_length;
-        let entry_end = offset.checked_add(46 + variable_length as u64)
+        let entry_end = offset
+            .checked_add(46 + variable_length as u64)
             .context("ZIP central directory entry size overflow")?;
         if entry_end > directory_end {
             bail!("truncated ZIP central directory entry");
         }
         let variable = source.read_at(offset + 46, variable_length)?;
         let name = std::str::from_utf8(&variable[..name_length])
-            .context("ZIP entry name is not valid UTF-8")?.to_owned();
+            .context("ZIP entry name is not valid UTF-8")?
+            .to_owned();
         validate_portable_namespace_path(&name)?;
         if !seen_names.insert(portable_extraction_key(&name)) {
             bail!("duplicate ZIP entry or case-fold collision `{name}`");
@@ -1872,22 +2188,31 @@ fn scan_zip_directory<R: Read + Seek>(source: &mut ArchiveSource<R>) -> Result<Z
             let (zip64_uncompressed, zip64_compressed) =
                 zip64_sizes(extra, needs_uncompressed, needs_compressed)?;
             if needs_uncompressed {
-                uncompressed_size = zip64_uncompressed.context("ZIP64 uncompressed size is missing")?;
+                uncompressed_size =
+                    zip64_uncompressed.context("ZIP64 uncompressed size is missing")?;
             }
             if needs_compressed {
                 compressed_size = zip64_compressed.context("ZIP64 compressed size is missing")?;
             }
         }
         limits.account_entry(uncompressed_size)?;
-        total_compressed = total_compressed.checked_add(compressed_size)
+        total_compressed = total_compressed
+            .checked_add(compressed_size)
             .context("compressed ZIP size overflow")?;
-        entries.push(ZipDirectoryEntry { name, compressed_size, uncompressed_size });
+        entries.push(ZipDirectoryEntry {
+            name,
+            compressed_size,
+            uncompressed_size,
+        });
         offset = entry_end;
     }
     if offset != directory_end {
         bail!("ZIP central directory has trailing data");
     }
-    Ok(ZipDirectoryScan { entries, total_compressed })
+    Ok(ZipDirectoryScan {
+        entries,
+        total_compressed,
+    })
 }
 
 fn zip64_sizes(
@@ -2091,14 +2416,43 @@ fn build_inspection(
 
 /// Extract a `.fms` archive into a `SessionStore`.
 pub fn unpack_fms<R: Read + Seek>(reader: R, store: &SessionStore) -> Result<FmsSessionManifest> {
+    unpack_fms_inner(reader, store, true)
+}
+
+/// Extract an archive for a read-only visualization import.
+///
+/// The archive is still fully preflighted: paths, ZIP limits, document
+/// digests, and typed checkpoint payloads are validated before anything is
+/// written. A read-only import may retain the two known opaque project
+/// documents, but missing payloads and unknown references remain fail-closed.
+pub fn unpack_fms_for_visualization<R: Read + Seek>(
+    reader: R,
+    store: &SessionStore,
+) -> Result<FmsSessionManifest> {
+    unpack_fms_inner(reader, store, false)
+}
+
+fn unpack_fms_inner<R: Read + Seek>(
+    reader: R,
+    store: &SessionStore,
+    require_complete_reachability: bool,
+) -> Result<FmsSessionManifest> {
     let preflight = preflight_fms(reader, &[])?;
 
-    if matches!(
-        preflight.session.profile,
-        SaveProfile::Solved | SaveProfile::Resume | SaveProfile::Archive
-    ) && !preflight.reachability.complete
+    let contains_batch_records = preflight
+        .documents
+        .keys()
+        .any(|name| name.starts_with("batches/"));
+    if contains_batch_records
+        || (require_complete_reachability
+            && matches!(
+                preflight.session.profile,
+                SaveProfile::Solved | SaveProfile::Resume | SaveProfile::Archive
+            ))
     {
         preflight.reachability.require_complete()?;
+    } else {
+        preflight.reachability.require_visualization_safe()?;
     }
 
     let _lease = store.write_transaction()?;
@@ -2303,7 +2657,7 @@ mod tests {
         SolutionArtifactRef, SolutionExecutionStatus, SolutionMember, SolutionSet,
         SolutionSetManifestState, SolutionSetProvenance, SOLUTION_SET_SCHEMA_VERSION,
     };
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
 
     fn test_session() -> FmsSessionManifest {
         FmsSessionManifest::new("s-001", "Test", SaveProfile::Compact)
@@ -2326,6 +2680,51 @@ mod tests {
             latest_checkpoint_ref: None,
             artifact_index_ref: None,
         }
+    }
+
+    fn test_batch_intent(store: &SessionStore, batch_id: &str) -> FmsBatchIntent {
+        let mut manifest_value = serde_json::json!({
+            "schema_version": FMS_BATCH_EXPANSION_MANIFEST_SCHEMA,
+            "batch_id": batch_id,
+            "cases": [{ "case_id": "case-1" }],
+            "manifest_sha256": ""
+        });
+        let mut unsigned_manifest = manifest_value.clone();
+        unsigned_manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("manifest_sha256");
+        let manifest_sha256 = canonical_json_sha256(&unsigned_manifest);
+        manifest_value["manifest_sha256"] = serde_json::json!(manifest_sha256);
+        let manifest_bytes = canonical_json_bytes(&manifest_value);
+        let manifest_object_ref = store.cas().put(&manifest_bytes).unwrap();
+        let definition = store.cas().put(b"batch definition").unwrap();
+        let study = store.cas().put(b"batch study plan").unwrap();
+        let study_catalog = store.cas().put(b"batch study catalog").unwrap();
+        let specification = serde_json::json!({
+            "schema_version": FMS_BATCH_SUBMIT_SNAPSHOT_LEGACY_SCHEMA,
+            "batch_id": batch_id,
+            "manifest_sha256": manifest_sha256,
+            "request": {
+                "batch_id": batch_id,
+                "template": {
+                    "snapshot": { "definition_sha256": definition },
+                    "study": { "plan_sha256": study },
+                    "study_catalog_sha256": study_catalog,
+                    "immutable_assets": []
+                }
+            }
+        });
+        FmsBatchIntent::new(
+            batch_id,
+            format!("idempotency-{batch_id}"),
+            specification,
+            manifest_object_ref,
+            definition,
+            study,
+            study_catalog,
+            BTreeMap::new(),
+        )
     }
 
     fn test_workspace(script: &[u8]) -> FmsWorkspaceManifest {
@@ -2455,29 +2854,100 @@ mod tests {
     }
 
     #[test]
-    fn staged_preflight_restores_opaque_files_and_removes_only_owned_staging() {
+    fn staged_preflight_rejects_unknown_project_files_and_removes_only_owned_staging() {
         let parent = tempfile::tempdir().unwrap();
         let sentinel = parent.path().join("preserved");
         fs::write(&sentinel, b"foreign").unwrap();
         let script = b"print('verified')".to_vec();
         let workspace = test_workspace(&script);
         let payload = vec![13u8; MAX_CONTROL_DOCUMENT_BYTES as usize + 1];
-        let archive = archive_with_entries(&workspace, [
-            ("project/main.py".to_string(), script),
-            ("project/opaque.json".to_string(), payload.clone()),
-        ]);
+        let archive = archive_with_entries(
+            &workspace,
+            [
+                ("project/main.py".to_string(), script),
+                ("project/opaque.json".to_string(), payload.clone()),
+            ],
+        );
         let staged = preflight_fms_staged(Cursor::new(&archive), &[], parent.path()).unwrap();
         let root = staged.root.clone();
-        assert!(staged.contains_document("project/opaque.json"));
-        assert!(staged.read_document("project/opaque.json").is_err());
+        let opaque_path = "project/opaque.json";
+        assert!(staged.contains_document(opaque_path));
+        assert!(staged.read_document(opaque_path).is_err());
         let legacy = preflight_fms(Cursor::new(&archive), &[]).unwrap();
         assert_eq!(staged.inspection.restore_class, legacy.inspection.restore_class);
+        assert_eq!(fs::read(root.join(opaque_path)).unwrap(), payload);
+        assert!(!staged.reachability.complete);
+
         let store = SessionStore::open(parent.path().join("restored")).unwrap();
-        unpack_fms_staged(&staged, &store).unwrap();
-        assert_eq!(store.read_document("project/opaque.json").unwrap().unwrap(), payload);
+        let owner_before = fs::read(store.root().join("WRITER.owner.json")).unwrap();
+        let error = unpack_fms(Cursor::new(&archive), &store).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("project/opaque.json"),
+            "{error:#}"
+        );
+        assert_snapshot_import_left_destination_pristine(&store, &owner_before);
+        assert_eq!(store.read_document(opaque_path).unwrap(), None);
+
+        let error = unpack_fms_for_visualization(Cursor::new(&archive), &store).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("project/opaque.json"),
+            "{error:#}"
+        );
+        assert_snapshot_import_left_destination_pristine(&store, &owner_before);
+
+        let error = unpack_fms_staged(&staged, &store).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("project/opaque.json"),
+            "{error:#}"
+        );
+        assert_snapshot_import_left_destination_pristine(&store, &owner_before);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"foreign");
+
         drop(staged);
         assert!(!root.exists());
-        assert_eq!(fs::read(sentinel).unwrap(), b"foreign");
+        assert!(store.root().exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn staged_preflight_restores_large_referenced_opaque_artifact_and_removes_only_owned_staging() {
+        let parent = tempfile::tempdir().unwrap();
+        let sentinel = parent.path().join("preserved");
+        fs::write(&sentinel, b"foreign").unwrap();
+        let script = b"print('snapshot artifacts')";
+        let relative = "runs/run-live/artifacts/opaque.bin";
+        let payload = vec![29u8; MAX_CONTROL_DOCUMENT_BYTES as usize + 1];
+        let snapshot = live_snapshot_bytes("run-live", &[("opaque.bin", "field_state")], None);
+        let archive = archive_with_live_snapshot(
+            script,
+            &snapshot,
+            [(relative.to_string(), payload.clone())],
+        );
+        let staged = preflight_fms_staged(Cursor::new(&archive), &[], parent.path()).unwrap();
+        let root = staged.root.clone();
+        assert!(
+            staged.reachability.complete,
+            "{:?}",
+            staged.reachability.warnings
+        );
+        assert!(staged.contains_document(relative));
+        assert_eq!(
+            staged.documents.get(relative).unwrap().byte_count,
+            payload.len() as u64
+        );
+
+        let store = SessionStore::open(parent.path().join("restored")).unwrap();
+        unpack_fms_staged(&staged, &store).unwrap();
+        assert_eq!(fs::read(store.root().join(relative)).unwrap(), payload);
+        assert_eq!(
+            store.current_session().unwrap().unwrap().session_id,
+            "s-001"
+        );
+
+        drop(staged);
+        assert!(!root.exists());
+        assert!(store.root().exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"foreign");
     }
 
     #[test]
@@ -2485,7 +2955,10 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let script = b"print('verified')".to_vec();
         let workspace = test_workspace(&script);
-        let invalid = archive_with_entries(&workspace, [("project/main.py".to_string(), b"changed".to_vec())]);
+        let invalid = archive_with_entries(
+            &workspace,
+            [("project/main.py".to_string(), b"changed".to_vec())],
+        );
         assert!(preflight_fms_staged(Cursor::new(invalid), &[], parent.path()).is_err());
         assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
         let archive = archive_with_entries(&workspace, [("project/main.py".to_string(), script)]);
@@ -2518,14 +2991,20 @@ mod tests {
             }
         }
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        writer.start_file("project/large.bin", SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Stored)).unwrap();
+        writer
+            .start_file(
+                "project/large.bin",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .unwrap();
         writer.write_all(&vec![31; 4 * 1024 * 1024]).unwrap();
         let bytes = writer.finish().unwrap().into_inner();
         let count = Rc::new(Cell::new(0));
         let mut source = ArchiveSource::new(CountReads {
-            input: Cursor::new(bytes), bytes: count.clone(),
-        }).unwrap();
+            input: Cursor::new(bytes),
+            bytes: count.clone(),
+        })
+        .unwrap();
         let scan = scan_zip_directory(&mut source).unwrap();
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].uncompressed_size, 4 * 1024 * 1024);
@@ -2535,8 +3014,10 @@ mod tests {
     #[test]
     fn preflight_preserves_nonzero_input_position() {
         let script = b"print('window')";
-        let archive = archive_with_entries(&test_workspace(script),
-            [("project/main.py".to_string(), script.to_vec())]);
+        let archive = archive_with_entries(
+            &test_workspace(script),
+            [("project/main.py".to_string(), script.to_vec())],
+        );
         let mut bytes = b"ignored prefix".to_vec();
         let start = bytes.len();
         bytes.extend(archive);
@@ -2562,9 +3043,14 @@ mod tests {
     #[test]
     fn preflight_rejects_actual_size_mismatch_and_entry_disk_number() {
         let script = b"print('size')";
-        let original = archive_with_entries(&test_workspace(script),
-            [("project/main.py".to_string(), script.to_vec())]);
-        let eocd = original.windows(4).rposition(|bytes| bytes == b"PK\x05\x06").unwrap();
+        let original = archive_with_entries(
+            &test_workspace(script),
+            [("project/main.py".to_string(), script.to_vec())],
+        );
+        let eocd = original
+            .windows(4)
+            .rposition(|bytes| bytes == b"PK\x05\x06")
+            .unwrap();
         let directory = u32_le(&original, eocd + 16).unwrap() as usize;
         let mut offset = directory;
         let target = loop {
@@ -2572,7 +3058,9 @@ mod tests {
             if &original[offset + 46..offset + 46 + length] == b"project/main.py" {
                 break offset;
             }
-            offset += 46 + length + u16_le(&original, offset + 30).unwrap() as usize
+            offset += 46
+                + length
+                + u16_le(&original, offset + 30).unwrap() as usize
                 + u16_le(&original, offset + 32).unwrap() as usize;
         };
         for declared in [script.len() as u32 - 1, script.len() as u32 + 1] {
@@ -2585,7 +3073,11 @@ mod tests {
         let mut malformed = original;
         malformed[target + 34..target + 36].copy_from_slice(&1_u16.to_le_bytes());
         let mut source = ArchiveSource::new(Cursor::new(malformed)).unwrap();
-        assert!(scan_zip_directory(&mut source).err().unwrap().to_string().contains("multi-disk"));
+        assert!(scan_zip_directory(&mut source)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("multi-disk"));
     }
 
     fn empty_zip64_fixture() -> Vec<u8> {
@@ -2609,8 +3101,12 @@ mod tests {
         let bytes = empty_zip64_fixture();
         let mut source = ArchiveSource::new(Cursor::new(bytes.clone())).unwrap();
         assert!(scan_zip_directory(&mut source).unwrap().entries.is_empty());
-        for (offset, value) in [(4, u64::MAX), (40, MAX_ZIP_DIRECTORY_BYTES + 1),
-            (48, u64::MAX), (56 + 8, u64::MAX)] {
+        for (offset, value) in [
+            (4, u64::MAX),
+            (40, MAX_ZIP_DIRECTORY_BYTES + 1),
+            (48, u64::MAX),
+            (56 + 8, u64::MAX),
+        ] {
             let mut malformed = bytes.clone();
             malformed[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
             let mut source = ArchiveSource::new(Cursor::new(malformed)).unwrap();
@@ -2689,14 +3185,23 @@ mod tests {
         .unwrap();
         let canonical_root = canonical_store_root(store.root()).unwrap();
         let entries = plan_solution_entries(store.root(), &canonical_root, &profile).unwrap();
-        let snapshots = entries.iter()
+        let snapshots = entries
+            .iter()
             .map(|entry| (entry.archive_path.clone(), entry.snapshot.clone()))
             .collect::<HashMap<_, _>>();
         let disk = reachability::walk_export_file_documents(&snapshots, &canonical_root).unwrap();
-        let mut documents = entries.iter().map(|entry| (
-            entry.archive_path.clone(),
-            entry.snapshot.read_control(&canonical_root, &entry.archive_path).unwrap(),
-        )).collect::<HashMap<_, _>>();
+        let mut documents = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.archive_path.clone(),
+                    entry
+                        .snapshot
+                        .read_control(&canonical_root, &entry.archive_path)
+                        .unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         disk.require_complete().unwrap();
         documents.insert(format!("objects/sha256/{object_ref}"), payload.clone());
         let memory =
@@ -2705,11 +3210,11 @@ mod tests {
         assert_eq!(disk.object_refs, memory.object_refs);
         assert_eq!(disk.file_refs, memory.file_refs);
         assert!(!disk.object_refs.contains(&unused_ref));
-        let plan = plan_cas_entries(store.root(), &canonical_root, &[], &entries).unwrap();
+        let plan = plan_cas_entries(store.root(), &canonical_root, &[], &[], &entries, &HashMap::new()).unwrap();
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].byte_count, payload.len() as u64);
         fs::write(&plan[0].source, vec![24_u8; payload.len()]).unwrap();
-        assert!(plan_cas_entries(store.root(), &canonical_root, &[], &entries).is_err());
+        assert!(plan_cas_entries(store.root(), &canonical_root, &[], &[], &entries, &HashMap::new()).is_err());
     }
 
     #[test]
@@ -2723,27 +3228,46 @@ mod tests {
         file.set_len(MAX_CONTROL_DOCUMENT_BYTES + 1).unwrap();
         let root = canonical_store_root(store.root()).unwrap();
         let mut entries = Vec::new();
-        plan_artifact_directory(store.root(), &root, source.parent().unwrap(),
-            "runs/run-opaque/artifacts", &mut entries).unwrap();
+        plan_artifact_directory(
+            store.root(),
+            &root,
+            source.parent().unwrap(),
+            "runs/run-opaque/artifacts",
+            &mut entries,
+        )
+        .unwrap();
         assert_eq!(entries.len(), 1);
-        let snapshots = entries.iter().map(|entry|
-            (entry.archive_path.clone(), entry.snapshot.clone())).collect();
+        let snapshots = entries
+            .iter()
+            .map(|entry| (entry.archive_path.clone(), entry.snapshot.clone()))
+            .collect();
         reachability::walk_export_file_documents(&snapshots, &root)
-            .unwrap().require_complete().unwrap();
+            .unwrap()
+            .require_complete()
+            .unwrap();
         let entry = &entries[0];
         assert_eq!(entry.snapshot.byte_count, MAX_CONTROL_DOCUMENT_BYTES + 1);
-        crate::cas::copy_verified_file(&source, &entry.snapshot.content_sha256,
-            entry.snapshot.byte_count, &mut std::io::sink()).unwrap();
+        crate::cas::copy_verified_file(
+            &source,
+            &entry.snapshot.content_sha256,
+            entry.snapshot.byte_count,
+            &mut std::io::sink(),
+        )
+        .unwrap();
         assert!(entry.snapshot.read_control(&root, relative).is_err());
     }
 
     #[test]
     fn document_inventory_rejects_entry_count_before_growth() {
-        let mut entries = (0..MAX_ZIP_ENTRIES).map(|index|
-            PackEntry::from_bytes(format!("runs/r/artifacts/{index}"), Vec::new()))
+        let mut entries = (0..MAX_ZIP_ENTRIES)
+            .map(|index| PackEntry::from_bytes(format!("runs/r/artifacts/{index}"), Vec::new()))
             .collect::<Vec<_>>();
-        assert!(entries.push_entry(PackEntry::from_bytes(
-            "runs/r/artifacts/overflow".to_string(), Vec::new())).is_err());
+        assert!(entries
+            .push_entry(PackEntry::from_bytes(
+                "runs/r/artifacts/overflow".to_string(),
+                Vec::new()
+            ))
+            .is_err());
         assert_eq!(entries.len(), MAX_ZIP_ENTRIES);
     }
 
@@ -3571,7 +4095,16 @@ mod tests {
         let store = SessionStore::open(dir.path().join("store")).unwrap();
 
         // Prepare session.
-        let session = FmsSessionManifest::new("s-001", "Test", SaveProfile::Compact);
+        let mut session = FmsSessionManifest::new("s-001", "Test", SaveProfile::Compact);
+        let batch_intent = test_batch_intent(&store, "batch-001");
+        store.commit_batch_intent(&batch_intent).unwrap();
+        let batch_progress = FmsBatchExpansionProgress::new(&batch_intent, 1, 0, 1).unwrap();
+        store
+            .commit_batch_expansion_progress(0, &batch_progress)
+            .unwrap();
+        session
+            .batch_refs
+            .push("batches/batch-001/batch_intent.json".to_string());
         store.commit_session(&session).unwrap();
 
         let script = b"# fullmag script\nprint('hello')".to_vec();
@@ -3614,6 +4147,17 @@ mod tests {
         // that protects inspect and unpack.
         let preflight = preflight_fms(Cursor::new(&fms_data), &[]).unwrap();
         assert_eq!(preflight.session.session_id, "s-001");
+        assert_eq!(preflight.session.batch_refs, session.batch_refs);
+        assert!(preflight
+            .documents
+            .contains_key("batches/batch-001/batch_intent.json"));
+        assert!(preflight
+            .documents
+            .contains_key("batches/batch-001/expansion_progress.json"));
+        assert!(preflight
+            .reachability
+            .object_refs
+            .contains(&batch_intent.manifest_object_ref));
 
         // Inspect.
         let inspection = inspect_fms(Cursor::new(&fms_data)).unwrap();
@@ -3625,6 +4169,14 @@ mod tests {
         let store2 = SessionStore::open(dir2.path().join("store")).unwrap();
         let loaded = unpack_fms(Cursor::new(&fms_data), &store2).unwrap();
         assert_eq!(loaded.session_id, "s-001");
+        assert_eq!(loaded.batch_refs, session.batch_refs);
+        assert_eq!(store2.read_batch_intent("batch-001").unwrap(), Some(batch_intent));
+        assert_eq!(
+            store2
+                .read_batch_expansion_progress("batch-001")
+                .unwrap(),
+            Some(batch_progress)
+        );
 
         // Verify documents were extracted.
         let script = store2.read_document("project/main.py").unwrap();
@@ -3692,6 +4244,401 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("no packaged artifacts")));
     }
+    fn live_snapshot_bytes(
+        run_id: &str,
+        artifacts: &[(&str, &str)],
+        object_ref: Option<&str>,
+    ) -> Vec<u8> {
+        let artifacts = artifacts
+            .iter()
+            .map(|&(path, kind)| serde_json::json!({"path": path, "kind": kind}))
+            .collect::<Vec<_>>();
+        let latest_fields = object_ref
+            .map(|object_ref| serde_json::json!({"m": {"payload_ref": object_ref}}))
+            .unwrap_or_else(|| serde_json::json!({}));
+        serde_json::to_vec(&serde_json::json!({
+            "session_protocol_version": "v2",
+            "capability_profile_version": "v1",
+            "session": {"session_id": "s-001", "run_id": run_id},
+            "runtime_status": {},
+            "artifacts": artifacts,
+            "display_selection": {},
+            "preview_config": {},
+            "mesh_revision": 1,
+            "mesh_build_revision": 1,
+            "latest_fields": latest_fields,
+        }))
+        .unwrap()
+    }
+
+    fn archive_with_live_snapshot(
+        script: &[u8],
+        snapshot: &[u8],
+        run_artifacts: impl IntoIterator<Item = (String, Vec<u8>)>,
+    ) -> Vec<u8> {
+        let mut entries = vec![
+            ("project/main.py".to_string(), script.to_vec()),
+            ("project/ui_state.json".to_string(), b"{}".to_vec()),
+            ("project/scene_document.json".to_string(), b"{}".to_vec()),
+            (
+                "project/current_live_snapshot.json".to_string(),
+                snapshot.to_vec(),
+            ),
+        ];
+        entries.extend(run_artifacts);
+        archive_with_entries(&test_workspace(script), entries)
+    }
+
+    fn assert_snapshot_import_left_destination_pristine(
+        store: &SessionStore,
+        owner_before: &[u8],
+    ) {
+        assert_eq!(
+            fs::read(store.root().join("WRITER.owner.json")).unwrap(),
+            owner_before
+        );
+        assert!(store.current_session().unwrap().is_none());
+        for relative in [
+            "project/main.py",
+            "project/ui_state.json",
+            "project/scene_document.json",
+            "project/current_live_snapshot.json",
+        ] {
+            assert_eq!(store.read_document(relative).unwrap(), None, "{relative}");
+        }
+        assert!(store.cas().list().unwrap().is_empty());
+        assert!(
+            !store
+                .root()
+                .join("runs/run-live/artifacts/eigen/spectrum.json")
+                .exists()
+        );
+        assert_eq!(
+            fs::read_dir(store.root().join("manifests"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    fn assert_imported_live_artifacts(store: &SessionStore) {
+        assert_eq!(
+            store.current_session().unwrap().unwrap().session_id,
+            "s-001"
+        );
+        assert_eq!(
+            store
+                .read_document("runs/run-live/artifacts/eigen/spectrum.json")
+                .unwrap()
+                .as_deref(),
+            Some(&b"spectrum bytes"[..])
+        );
+        assert_eq!(
+            store
+                .read_document("runs/run-live/artifacts/fields/m.zarr/.zgroup")
+                .unwrap()
+                .as_deref(),
+            Some(&b"{}"[..])
+        );
+        assert_eq!(
+            store
+                .read_document("runs/run-live/artifacts/fields/m.zarr/0")
+                .unwrap()
+                .as_deref(),
+            Some(&b"zarr chunk"[..])
+        );
+    }
+
+    #[test]
+    fn public_unpackers_reject_missing_snapshot_artifacts_before_store_mutation() {
+        let script = b"print('snapshot artifact')";
+        let snapshot = live_snapshot_bytes(
+            "run-live",
+            &[("eigen/spectrum.json", "json")],
+            None,
+        );
+        let archive = archive_with_live_snapshot(script, &snapshot, std::iter::empty::<(String, Vec<u8>)>());
+
+        let parent = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(parent.path().join("store")).unwrap();
+        let owner_before = fs::read(store.root().join("WRITER.owner.json")).unwrap();
+
+        let error = unpack_fms(Cursor::new(archive.clone()), &store).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("runs/run-live/artifacts/eigen/spectrum.json"),
+            "{error:#}"
+        );
+        assert_snapshot_import_left_destination_pristine(&store, &owner_before);
+
+        let error = unpack_fms_for_visualization(Cursor::new(archive.clone()), &store)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("runs/run-live/artifacts/eigen/spectrum.json"),
+            "{error:#}"
+        );
+        assert_snapshot_import_left_destination_pristine(&store, &owner_before);
+
+        let staged = preflight_fms_staged(Cursor::new(archive), &[], parent.path()).unwrap();
+        assert!(!staged.reachability.complete);
+        let error = unpack_fms_staged(&staged, &store).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("runs/run-live/artifacts/eigen/spectrum.json"),
+            "{error:#}"
+        );
+        assert_snapshot_import_left_destination_pristine(&store, &owner_before);
+        drop(staged);
+    }
+
+    #[test]
+    fn public_unpackers_accept_snapshot_file_and_nonempty_zarr_subtree() {
+        let script = b"print('snapshot artifacts')";
+        let snapshot = live_snapshot_bytes(
+            "run-live",
+            &[
+                ("eigen/spectrum.json", "json"),
+                ("fields/m.zarr", "zarr"),
+            ],
+            None,
+        );
+        let archive = archive_with_live_snapshot(
+            script,
+            &snapshot,
+            [
+                (
+                    "runs/run-live/artifacts/eigen/spectrum.json".to_string(),
+                    b"spectrum bytes".to_vec(),
+                ),
+                (
+                    "runs/run-live/artifacts/fields/m.zarr/.zgroup".to_string(),
+                    b"{}".to_vec(),
+                ),
+                (
+                    "runs/run-live/artifacts/fields/m.zarr/0".to_string(),
+                    b"zarr chunk".to_vec(),
+                ),
+            ],
+        );
+
+        let unpack_parent = tempfile::tempdir().unwrap();
+        let unpack_store = SessionStore::open(unpack_parent.path().join("store")).unwrap();
+        unpack_fms(Cursor::new(archive.clone()), &unpack_store).unwrap();
+        assert_imported_live_artifacts(&unpack_store);
+
+        let visualization_parent = tempfile::tempdir().unwrap();
+        let visualization_store =
+            SessionStore::open(visualization_parent.path().join("store")).unwrap();
+        unpack_fms_for_visualization(Cursor::new(archive.clone()), &visualization_store).unwrap();
+        assert_imported_live_artifacts(&visualization_store);
+
+        let staged_parent = tempfile::tempdir().unwrap();
+        let staged = preflight_fms_staged(
+            Cursor::new(archive),
+            &[],
+            staged_parent.path(),
+        )
+        .unwrap();
+        let staged_store = SessionStore::open(staged_parent.path().join("store")).unwrap();
+        unpack_fms_staged(&staged, &staged_store).unwrap();
+        assert_imported_live_artifacts(&staged_store);
+        drop(staged);
+    }
+
+    #[test]
+    fn compact_export_binds_snapshot_artifacts_and_preserves_cas_references() {
+        let (_directory, store, mut session, workspace, profile, base_documents) =
+            pack_fixture(SaveProfile::Compact);
+        assert!(matches!(profile.include_artifacts, ArtifactPolicy::None));
+        session
+            .run_refs
+            .push("runs/run-export/run_manifest.json".to_string());
+        store.commit_run(&test_run("run-export")).unwrap();
+
+        let payload = b"snapshot-owned CAS payload";
+        let object_ref = store.cas().put(payload).unwrap();
+        let source_artifact = store
+            .root()
+            .join("runs/run-export/artifacts/eigen/spectrum.json");
+        fs::create_dir_all(source_artifact.parent().unwrap()).unwrap();
+        fs::write(&source_artifact, b"spectrum exists in source store").unwrap();
+
+        for snapshot_key in [
+            "current_live_snapshot.json",
+            "project/current_live_snapshot.json",
+        ] {
+            let mut documents = base_documents.clone();
+            documents.insert("ui_state.json".to_string(), b"{}".to_vec());
+            documents.insert("scene_document.json".to_string(), b"{}".to_vec());
+            documents.insert(
+                snapshot_key.to_string(),
+                live_snapshot_bytes(
+                    "run-export",
+                    &[("eigen/spectrum.json", "json")],
+                    Some(&object_ref),
+                ),
+            );
+
+            let error = pack_fms(
+                Cursor::new(Vec::new()),
+                &store,
+                &session,
+                &workspace,
+                &profile,
+                &documents,
+                &PackOptions::default(),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}")
+                    .contains("runs/run-export/artifacts/eigen/spectrum.json"),
+                "{error:#}"
+            );
+
+            documents.insert(
+                snapshot_key.to_string(),
+                live_snapshot_bytes("run-export", &[], Some(&object_ref)),
+            );
+            let mut output = Cursor::new(Vec::new());
+            pack_fms(
+                &mut output,
+                &store,
+                &session,
+                &workspace,
+                &profile,
+                &documents,
+                &PackOptions::default(),
+            )
+            .unwrap();
+            let archive = output.into_inner();
+            {
+                let mut zip = zip::ZipArchive::new(Cursor::new(&archive)).unwrap();
+                let name = format!("objects/sha256/{object_ref}");
+                let mut cas_object = zip.by_name(&name).unwrap();
+                let mut archived_payload = Vec::new();
+                cas_object.read_to_end(&mut archived_payload).unwrap();
+                assert_eq!(archived_payload, payload);
+            }
+            let preflight = preflight_fms(Cursor::new(archive), &[]).unwrap();
+            assert!(preflight.reachability.object_refs.contains(&object_ref));
+        }
+    }
+
+    #[test]
+    fn compact_export_preserves_auxiliary_scene_snapshot_and_rejects_invalid_magnet_material() {
+        let (_directory, store, mut session, workspace, profile, base_documents) =
+            pack_fixture(SaveProfile::Compact);
+        session
+            .run_refs
+            .push("runs/run-export/run_manifest.json".to_string());
+        store.commit_run(&test_run("run-export")).unwrap();
+
+        let payload = b"scene snapshot CAS payload";
+        let object_ref = store.cas().put(payload).unwrap();
+        let make_snapshot = |scene_document: serde_json::Value| {
+            let mut snapshot: serde_json::Value =
+                serde_json::from_slice(&live_snapshot_bytes("run-export", &[], Some(&object_ref)))
+                    .unwrap();
+            snapshot["scene_document"] = scene_document;
+            serde_json::to_vec(&snapshot).unwrap()
+        };
+
+        for (role, material_ref) in [
+            ("airbox", None),
+            ("airbox", Some("")),
+            ("antenna", None),
+            ("antenna", Some("")),
+        ] {
+            let mut auxiliary = serde_json::json!({
+                "object_id": format!("{role}-object"),
+                "role": role,
+            });
+            if let Some(material_ref) = material_ref {
+                auxiliary["material_ref"] = serde_json::json!(material_ref);
+            }
+            let scene_document = serde_json::json!({
+                "version": "scene.v2",
+                "materials": [{"id": "mat:body"}],
+                "objects": [
+                    {
+                        "object_id": "body",
+                        "role": "magnet",
+                        "material_ref": "mat:body",
+                    },
+                    auxiliary,
+                ],
+            });
+            let mut documents = base_documents.clone();
+            documents.insert("ui_state.json".to_string(), b"{}".to_vec());
+            documents.insert(
+                "scene_document.json".to_string(),
+                serde_json::to_vec(&scene_document).unwrap(),
+            );
+            documents.insert(
+                "project/current_live_snapshot.json".to_string(),
+                make_snapshot(scene_document),
+            );
+
+            let mut output = Cursor::new(Vec::new());
+            pack_fms(
+                &mut output,
+                &store,
+                &session,
+                &workspace,
+                &profile,
+                &documents,
+                &PackOptions::default(),
+            )
+            .unwrap_or_else(|error| panic!("{role} material_ref {material_ref:?}: {error:#}"));
+            let archive = output.into_inner();
+            {
+                let mut zip = zip::ZipArchive::new(Cursor::new(&archive)).unwrap();
+                let name = format!("objects/sha256/{object_ref}");
+                let mut cas_object = zip.by_name(&name).unwrap();
+                let mut archived_payload = Vec::new();
+                cas_object.read_to_end(&mut archived_payload).unwrap();
+                assert_eq!(archived_payload, payload);
+            }
+            let preflight = preflight_fms(Cursor::new(archive), &[]).unwrap();
+            preflight.reachability.require_complete().unwrap();
+            assert!(preflight.reachability.object_refs.contains(&object_ref));
+        }
+
+        let invalid_scene_document = serde_json::json!({
+            "version": "scene.v2",
+            "materials": [{"id": "mat:body"}],
+            "objects": [{
+                "object_id": "body",
+                "role": "magnet",
+                "material_ref": "mat:missing",
+            }],
+        });
+        let mut documents = base_documents;
+        documents.insert("ui_state.json".to_string(), b"{}".to_vec());
+        documents.insert(
+            "scene_document.json".to_string(),
+            serde_json::to_vec(&invalid_scene_document).unwrap(),
+        );
+        documents.insert(
+            "project/current_live_snapshot.json".to_string(),
+            make_snapshot(invalid_scene_document),
+        );
+        let error = pack_fms(
+            Cursor::new(Vec::new()),
+            &store,
+            &session,
+            &workspace,
+            &profile,
+            &documents,
+            &PackOptions::default(),
+        )
+        .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic
+                .contains("scene_document.objects[0].material_ref is not a declared material id"),
+            "{diagnostic}"
+        );
+    }
+
 }
 
 #[cfg(test)]

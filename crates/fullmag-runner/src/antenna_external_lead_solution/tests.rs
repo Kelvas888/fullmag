@@ -359,6 +359,94 @@ impl Fixture {
 }
 
 #[test]
+fn inspection_package_execution_binding_rejects_magnetic_plan_before_payload_read() {
+    let plan = fullmag_ir::ExecutionPlanIR {
+        common: fullmag_ir::CommonPlanMeta {
+            ir_version: "test-only".into(),
+            requested_backend: BackendTarget::Fdm,
+            resolved_backend: BackendTarget::Fdm,
+            execution_mode: ExecutionMode::Strict,
+            material_field_plans: Vec::new(),
+        },
+        backend_plan: fullmag_ir::BackendPlanIR::Fdm(fullmag_ir::FdmPlanIR::default()),
+        output_plan: fullmag_ir::OutputPlanIR { outputs: Vec::new() },
+        provenance: fullmag_ir::ProvenancePlanIR::default(),
+    };
+    let error = load_antenna_inspection_package_for_execution_plan(
+        &[], &Fixture::new().reference, &plan,
+    ).err().unwrap();
+    assert!(error.message.contains("not a magnetic plan"));
+}
+
+#[test]
+fn inspection_package_round_trips_all_v1_and_v2_bytes_without_files_or_solver() {
+    for fixture in [Fixture::new(), Fixture::new().with_current()] {
+        let mut artifact = fixture.artifact();
+        let package = encode_antenna_inspection_package(&artifact).unwrap();
+        artifact.payloads.reverse();
+        assert_eq!(package, encode_antenna_inspection_package(&artifact).unwrap());
+        let decoded = decode_antenna_inspection_package(&package, &fixture.reference).unwrap();
+        assert_eq!(decoded.reference, fixture.reference);
+        assert_eq!(decoded.manifest_bytes, fixture.bytes());
+        for payload in &fixture.payloads {
+            assert!(decoded.payloads.iter().any(|decoded| decoded == payload));
+        }
+        assert_eq!(decoded.payloads.len(), fixture.payloads.len());
+        assert_eq!(package, encode_antenna_inspection_package(&decoded).unwrap());
+        let restored = load_antenna_external_lead_solution(
+            &decoded.manifest_bytes, &decoded.payloads, &fixture.reference,
+        ).unwrap();
+        let baseline = fixture.load().unwrap();
+        assert_eq!(restored.canonical_bundle, baseline.canonical_bundle);
+        assert_eq!(restored.device_potential_v, baseline.device_potential_v);
+        assert_eq!(restored.magnetic_field_xyz_apm, baseline.magnetic_field_xyz_apm);
+        assert_eq!(restored.device_current.as_ref().map(|current| &current.canonical_payload),
+            baseline.device_current.as_ref().map(|current| &current.canonical_payload));
+    }
+}
+
+#[test]
+fn inspection_package_rejects_corrupt_framing_payloads_and_wrong_identity() {
+    let fixture = Fixture::new().with_current();
+    let package = encode_antenna_inspection_package(&fixture.artifact()).unwrap();
+    let first_payload_length = 16 + fixture.bytes().len();
+    for end in [0, 7, 8, 15, 16, first_payload_length - 1,
+        first_payload_length, first_payload_length + 7, package.len() / 2, package.len() - 1] {
+        assert!(decode_antenna_inspection_package(&package[..end], &fixture.reference).is_err(), "prefix {end}");
+    }
+    for mutation in 0..5 {
+        let mut corrupt = package.clone();
+        match mutation {
+            0 => corrupt[0] ^= 1,
+            1 => corrupt[8..16].copy_from_slice(&u64::MAX.to_le_bytes()),
+            2 => corrupt[first_payload_length..first_payload_length + 8]
+                .copy_from_slice(&u64::MAX.to_le_bytes()),
+            3 => corrupt[first_payload_length + 8] ^= 1,
+            _ => corrupt.push(0),
+        }
+        assert!(decode_antenna_inspection_package(&corrupt, &fixture.reference).is_err(), "mutation {mutation}");
+    }
+    let mut wrong = fixture.reference.clone();
+    wrong.stage_id = "another-stage".into();
+    assert!(decode_antenna_inspection_package(&package, &wrong).is_err());
+}
+
+#[test]
+fn inspection_package_encoder_rejects_missing_duplicate_and_modified_payloads() {
+    let fixture = Fixture::new();
+    for mutation in 0..4 {
+        let mut artifact = fixture.artifact();
+        match mutation {
+            0 => { artifact.payloads.pop(); },
+            1 => artifact.payloads[1] = artifact.payloads[0].clone(),
+            2 => artifact.payloads[0].relative_path = "../bundle.v1.bin".into(),
+            _ => artifact.payloads[0].bytes[0] ^= 1,
+        }
+        assert!(encode_antenna_inspection_package(&artifact).is_err(), "mutation {mutation}");
+    }
+}
+
+#[test]
 fn manifest_only_loader_does_not_claim_payload_integrity() {
     let mut f = Fixture::new();
     assert_eq!(
@@ -760,6 +848,39 @@ fn cleanup_publication_test(root: &Path, references: &[AntennaExternalLeadSoluti
     fs::remove_dir(root.join("antenna").join("external_lead_solutions")).unwrap();
     fs::remove_dir(root.join("antenna")).unwrap();
     fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn inspection_package_publication_restores_exact_fields_and_reuses_revision() {
+    for fixture in [Fixture::new(), Fixture::new().with_current()] {
+        let root = publication_test_root();
+        let package = encode_antenna_inspection_package(&fixture.artifact()).unwrap();
+        let interrupted = AtomicBool::new(true);
+        assert!(publish_antenna_inspection_package_atomically(
+            &root, &package, &fixture.reference, Some(&interrupted),
+        ).is_err());
+        let mut corrupt = package.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(publish_antenna_inspection_package_atomically(
+            &root, &corrupt, &fixture.reference, None,
+        ).is_err());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        let first = publish_antenna_inspection_package_atomically(
+            &root, &package, &fixture.reference, None,
+        ).unwrap();
+        assert!(!first.reused_existing);
+        let loaded = load_published_antenna_external_lead_solution(&root, &fixture.reference).unwrap();
+        let baseline = fixture.load().unwrap();
+        assert_eq!(loaded.canonical_bundle, baseline.canonical_bundle);
+        assert_eq!(loaded.device_potential_v, baseline.device_potential_v);
+        assert_eq!(loaded.magnetic_field_xyz_apm, baseline.magnetic_field_xyz_apm);
+        assert_eq!(loaded.device_current.as_ref().map(|current| &current.canonical_payload),
+            baseline.device_current.as_ref().map(|current| &current.canonical_payload));
+        assert!(publish_antenna_inspection_package_atomically(
+            &root, &package, &fixture.reference, None,
+        ).unwrap().reused_existing);
+        cleanup_publication_test(&root, &[fixture.reference]);
+    }
 }
 
 #[test]

@@ -7,6 +7,17 @@ import fullmag as fm
 import fullmag.world as flat_world
 import pytest
 from fullmag.runtime.loader import load_problem_from_script
+from fullmag.runtime.scene_document import (
+    build_builder_from_scene_document,
+    build_scene_document_from_builder,
+    builder_overrides_from_scene_document,
+)
+from fullmag.runtime.scene_document_ir import scene_document_to_problem_ir
+from fullmag.runtime.script_builder import (
+    export_builder_draft,
+    render_loaded_problem_as_script,
+    render_scene_document_as_script,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +60,79 @@ def test_compute_resources_default_payload_matches_canonical_wire_shape() -> Non
         "parallelism": {"kind": "single_process"},
         "placement": "balanced",
     }
+
+
+def test_compute_resources_wire_decoder_round_trips_canonical_fixture() -> None:
+    fixture = Path(__file__).parent / "fixtures" / "compute_resources.v1.json"
+    expected = json.loads(fixture.read_text(encoding="utf-8"))
+
+    assert fm.ComputeResources.from_ir(expected).to_ir() == expected
+
+
+def test_compute_resources_survives_builder_scene_ir_and_script_round_trip(
+    tmp_path: Path,
+) -> None:
+    resources = fm.ComputeResources(
+        target=fm.ComputeTarget(kind="pool", id="gpu-pool"),
+        cpu=fm.CpuResources(threads=8, core_policy="physical_first"),
+        gpu=fm.GpuResources(
+            selector="allow_list",
+            device_uuids=("GPU-1", "GPU-2"),
+            devices_per_task=2,
+            vram_per_device_bytes=2_147_483_648,
+        ),
+        ram=fm.MemoryReservation(reservation_bytes=8_589_934_592),
+        parallelism=fm.DistributedResources(
+            ranks=2, threads_per_rank=8, ranks_per_node=2, gpus_per_rank=1
+        ),
+        placement="throughput",
+    )
+    expected = resources.to_ir()
+    source = tmp_path / "compute_resources_round_trip.py"
+    source.write_text(
+        "import fullmag as fm\n"
+        "study = fm.study('compute-resources-round-trip')\n"
+        f"study.resources(fm.ComputeResources.from_ir({expected!r}))\n"
+        "body = study.geometry(fm.Box(size=(20e-9, 10e-9, 5e-9)), name='film')\n"
+        "body.Ms = 800e3\n"
+        "body.Aex = 13e-12\n"
+        "body.m = fm.texture.uniform(1, 0, 0)\n",
+        encoding="utf-8",
+    )
+    loaded = load_problem_from_script(source, lightweight_assets=True)
+
+    builder = export_builder_draft(loaded)
+    assert builder["compute_resources"] == expected
+    scene = build_scene_document_from_builder(builder)
+    assert scene["study"]["compute_resources"] == expected
+    projected_builder = build_builder_from_scene_document(scene)
+    assert projected_builder["compute_resources"] == expected
+    assert builder_overrides_from_scene_document(scene)["compute_resources"] == expected
+
+    scene_ir = scene_document_to_problem_ir(
+        scene,
+        requested_backend="fdm",
+        requested_device="cpu",
+        requested_precision="double",
+        requested_mode="strict",
+        source_root=tmp_path,
+    )
+    assert scene_ir["problem_meta"]["runtime_metadata"]["compute_resources"] == expected
+
+    for label, rendered in (
+        ("loaded", render_loaded_problem_as_script(loaded)),
+        ("scene", render_scene_document_as_script(scene)),
+    ):
+        assert "study.resources(fm.ComputeResources.from_ir(" in rendered
+        rendered_path = tmp_path / f"compute_resources_{label}_rendered.py"
+        rendered_path.write_text(rendered, encoding="utf-8")
+        rendered_loaded = load_problem_from_script(
+            rendered_path, lightweight_assets=True
+        )
+        assert (
+            rendered_loaded.problem.runtime_metadata["compute_resources"]
+            == expected
+        )
 
 
 def test_study_resources_lowers_full_request_to_problem_ir(tmp_path: Path) -> None:

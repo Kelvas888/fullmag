@@ -1,5 +1,6 @@
 """Interpreted isolation checks; no compiled unit-test targets."""
 import copy
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -96,6 +97,95 @@ def test_actual_fixed_input_and_tamper_fail_closed(tmp_path):
     (examples / "fem_antenna_current_source_inspection.py").write_text("changed")
     with pytest.raises(ValueError, match="input differs"):
         launcher.fixture_paths(tmp_path)
+
+
+def test_standalone_changes_only_probe_physics(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    paths, hashes, generated = launcher.fixture_identity(repo, standalone=True)
+    original = ast.parse(paths["fem_antenna_current_source_inspection.py"].read_text())
+    actual = ast.parse(generated)
+    expected = []
+    for node in original.body[1:]:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "probe":
+                continue
+            if isinstance(target, ast.Name) and target.id == "probe":
+                node.value.func.attr = "geometry_object"
+                node.value.keywords.append(ast.keyword(arg="type", value=ast.Constant(value="geometry")))
+        expected.append(node)
+    assert [ast.dump(node) for node in actual.body[1:]] == [ast.dump(node) for node in expected]
+    assert {k: v for k, v in hashes.items() if k != launcher.SCRIPT_NAME} == launcher.FIXTURE_FILES
+    assert hashes[launcher.SCRIPT_NAME] == hashlib.sha256(generated).hexdigest()
+    document = launcher.scientific_spec("sha256:" + "a" * 64, tmp_path / "source",
+        tmp_path / "package", tmp_path / "input", tmp_path / "export",
+        standalone_hash=hashes[launcher.SCRIPT_NAME])
+    command = document["services"]["antenna"]["command"][2]
+    assert "/input/" + launcher.SCRIPT_NAME in command
+    assert "--expect-script-sha256 " + hashes[launcher.SCRIPT_NAME] in command
+
+
+@pytest.mark.parametrize("mutation", ["missing_state", "duplicate_state", "constructor", "missing_solve"])
+def test_standalone_transform_refuses_changed_input(mutation):
+    repo = Path(__file__).resolve().parents[1]
+    source = launcher.fixture_paths(repo)["fem_antenna_current_source_inspection.py"].read_text()
+    if mutation == "missing_state": source = source.replace("probe.alpha = 0.02", "")
+    elif mutation == "duplicate_state": source += "\nprobe.alpha = 0.02\n"
+    elif mutation == "constructor": source = source.replace("probe = study.geometry(", "probe = study.antenna_object(")
+    elif mutation == "missing_solve": source = source.replace("add_antenna_field_solve(", "add_other_stage(")
+    with pytest.raises(ValueError, match="probe|Standalone"):
+        launcher.standalone_source(source)
+
+
+def test_unknown_fixture_variant_rejected_before_docker(tmp_path, monkeypatch):
+    root, _, receipt, _ = retained_run(tmp_path, monkeypatch)
+    receipt["fixture_variant"] = "arbitrary-script"
+    (root / "receipt.json").write_text(json.dumps(receipt))
+    monkeypatch.setattr(launcher, "docker", lambda *args: pytest.fail("must reject before Docker"))
+    with pytest.raises(ValueError, match="variant"):
+        launcher.observe(tmp_path, root)
+
+
+def test_generated_standalone_lowers_without_magnetic_state():
+    import fullmag as fm
+    import fullmag.world as world
+    from fullmag.runtime.loader import load_problem_from_script
+    repo = Path(__file__).resolve().parents[1]
+    paths, _, generated = launcher.fixture_identity(repo, standalone=True)
+    original = paths["fem_antenna_current_source_inspection.py"]
+    baseline = load_problem_from_script(original, lightweight_assets=True).problem.to_ir(include_geometry_assets=False)
+    fm.reset()
+    world.begin_script_capture(original.parent)
+    try:
+        exec(compile(generated, launcher.SCRIPT_NAME, "exec"),
+             {"__file__": str(original.parent / launcher.SCRIPT_NAME), "__name__": "__main__"})
+        actual = world._build_problem().to_ir(include_geometry_assets=False)
+        assert actual["magnets"] == []
+        assert actual["energy_terms"] == []
+        assert actual["study"] == {"kind": "antenna_field_solve", "sampling": {"outputs": []}}
+        for key in ("current_modules", "antenna_port_modes", "antenna_field_solve_stages"):
+            assert actual[key] == baseline[key]
+    finally:
+        world.finish_script_capture()
+        fm.reset()
+
+
+@pytest.mark.parametrize("mutation", ["bytes", "hash", "variant"])
+def test_standalone_observer_refuses_tampered_binding(tmp_path, monkeypatch, mutation):
+    root, _, receipt, _ = retained_run(tmp_path, monkeypatch)
+    generated = b"standalone test input"
+    hashes = {**receipt["fixture_sha256"], launcher.SCRIPT_NAME: hashlib.sha256(generated).hexdigest()}
+    monkeypatch.setattr(launcher, "fixture_identity", lambda *args, **kwargs: ({}, hashes, generated))
+    (root / "input" / launcher.SCRIPT_NAME).write_bytes(generated)
+    receipt["fixture_sha256"] = dict(hashes)
+    receipt["fixture_variant"] = "standalone"
+    if mutation == "bytes": (root / "input" / launcher.SCRIPT_NAME).write_bytes(b"modified test input")
+    elif mutation == "hash": receipt["fixture_sha256"][launcher.SCRIPT_NAME] = "a" * 64
+    elif mutation == "variant": receipt["fixture_variant"] = "magnetic_probe"
+    (root / "receipt.json").write_text(json.dumps(receipt))
+    monkeypatch.setattr(launcher, "docker", lambda *args: pytest.fail("must reject before Docker"))
+    with pytest.raises(ValueError, match="changed|differs"):
+        launcher.observe(tmp_path, root)
 
 
 def test_running_build_is_rejected_before_docker_or_storage(tmp_path, monkeypatch):

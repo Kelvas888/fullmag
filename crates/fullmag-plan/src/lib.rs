@@ -54,7 +54,10 @@ pub mod boundary_geometry;
 pub use antenna_composition::{bind_antenna_field_solve, bind_antenna_field_solve_v03};
 pub use antenna_field_only::plan_antenna_field_only_carrier;
 pub use antenna_current_source::{materialize_antenna_external_lead_current_input, materialize_antenna_closed_loop_current_input};
-pub use antenna_field_solve::{plan_antenna_field_solve_execution, AntennaFieldSolveExecutionPlan};
+pub use antenna_field_solve::{
+    plan_antenna_external_lead_inspection, plan_antenna_field_solve_execution,
+    AntennaFieldSolveExecutionPlan,
+};
 pub use antenna_projection::resolve_fem_antenna_projection_mask;
 pub use antenna_validity::{
     antenna_validity_notes, antenna_waveform_bandwidth_aggregate_note,
@@ -157,6 +160,9 @@ pub fn plan(problem: &ProblemIR) -> Result<ExecutionPlanIR, PlanError> {
             return Err(PlanError { reasons: vec!["field_only requires exactly one selected port mode".into()] });
         }
         return plan_antenna_field_only_carrier(problem, stage_id, &stage.port_mode_ids[0]);
+    }
+    if matches!(problem.study, StudyIR::AntennaFieldSolve { .. }) {
+        return antenna_field_solve::plan_standalone_antenna(problem);
     }
     if sampling::has_unresolved_auto_sampling(problem) {
         let context = if util::active_stage_id(problem).is_none() {

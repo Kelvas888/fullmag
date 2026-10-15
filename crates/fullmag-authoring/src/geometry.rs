@@ -578,6 +578,27 @@ fn collect_geometry_diagnostics(
     for object in &scene.objects {
         validate_object_geometry(scene, object, backend_target, &mut diagnostics);
     }
+    if let Some(universe) = scene
+        .study
+        .universe_mesh
+        .as_ref()
+        .or(scene.universe.as_ref())
+    {
+        if universe.mode.eq_ignore_ascii_case("manual")
+            && (!universe
+                .size
+                .is_some_and(|size| size.iter().all(|value| value.is_finite() && *value > 0.0))
+                || universe
+                    .center
+                    .is_some_and(|center| center.iter().any(|value| !value.is_finite())))
+        {
+            diagnostics.push(error(
+                "GEOMETRY_UNIVERSE_INVALID_BOUNDS",
+                "Manual Universe requires positive finite size and a finite center. Configure Universe bounds before building or running.".to_string(),
+                None, Some("study.universe_mesh".to_string()), &["build_mesh", "run_solver"],
+            ));
+        }
+    }
     validate_region_names(scene, &mut diagnostics);
     validate_object_overlaps(scene, &mut diagnostics);
     diagnostics
@@ -674,10 +695,16 @@ fn validate_object_geometry(
         diagnostics,
     );
     validate_tiny_features(scene, object, &object_path, diagnostics);
-    if let (Some((bounds_min, bounds_max)), Some(universe)) =
-        (derive_object_bounds(object), scene.universe.as_ref())
-    {
-        if let (Some(universe_size), Some(universe_center)) = (universe.size, universe.center) {
+    if let (Some((bounds_min, bounds_max)), Some(universe)) = (
+        derive_object_bounds(object),
+        scene
+            .study
+            .universe_mesh
+            .as_ref()
+            .or(scene.universe.as_ref()),
+    ) {
+        if let Some(universe_size) = universe.size {
+            let universe_center = universe.center.unwrap_or([0.0; 3]);
             let universe_min = [
                 universe_center[0] - universe_size[0] / 2.0,
                 universe_center[1] - universe_size[1] / 2.0,
@@ -691,7 +718,13 @@ fn validate_object_geometry(
             if (0..3).any(|axis| {
                 bounds_min[axis] < universe_min[axis] || bounds_max[axis] > universe_max[axis]
             }) {
-                diagnostics.push(warning(
+                let manual = universe.mode.eq_ignore_ascii_case("manual");
+                diagnostics.push(diagnostic(
+                    if manual {
+                        GeometryDiagnosticSeverity::Error
+                    } else {
+                        GeometryDiagnosticSeverity::Warning
+                    },
                     "GEOMETRY_OBJECT_OUTSIDE_UNIVERSE",
                     format!(
                         "Object '{}' extends outside the declared Universe bounds.",
@@ -699,7 +732,11 @@ fn validate_object_geometry(
                     ),
                     Some(object.id.clone()),
                     Some(object_path),
-                    &[],
+                    if manual {
+                        &["build_mesh", "run_solver"]
+                    } else {
+                        &[]
+                    },
                 ));
             }
         }
@@ -1854,6 +1891,7 @@ mod tests {
             study: SceneStudyState::default(),
             outputs: SceneOutputsState::default(),
             editor: SceneEditorState::default(),
+            analysis: Default::default(),
         }
     }
 
@@ -2197,5 +2235,66 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "GEOMETRY_TINY_FEATURE_BELOW_MESH_SIZE"));
+    }
+
+    #[test]
+    fn manual_universe_outside_blocks_mesh_and_solver_but_auto_does_not() {
+        let mut scene = scene_with_object(SceneGeometry {
+            geometry_kind: "Box".into(),
+            geometry_params: json!({"size": [2.0, 2.0, 2.0]}),
+            bounds_min: None,
+            bounds_max: None,
+        });
+        scene.objects[0].tags.clear();
+        for mode in ["manual", "auto"] {
+            scene.study.universe_mesh = Some(
+                serde_json::from_value(json!({
+                    "mode": mode, "size": [1.0, 1.0, 1.0], "center": [0.0, 0.0, 0.0]
+                }))
+                .unwrap(),
+            );
+            let validation = validate_geometry_scene(&scene, GeometryBackendTarget::Fem);
+            let outside = validation
+                .diagnostics
+                .iter()
+                .find(|d| d.code == "GEOMETRY_OBJECT_OUTSIDE_UNIVERSE")
+                .unwrap();
+            assert_eq!(outside.blocks.is_empty(), mode == "auto");
+            assert_eq!(
+                geometry_blocks_mesh_build(&scene, GeometryBackendTarget::Fem).is_some(),
+                mode == "manual"
+            );
+            assert_eq!(
+                geometry_blocks_solver_run(&scene, GeometryBackendTarget::Fem).is_some(),
+                mode == "manual"
+            );
+        }
+        // The accepted policy overrides an older materialized scene projection.
+        scene.universe = Some(
+            serde_json::from_value(json!({"mode": "manual", "size": [1.0, 1.0, 1.0]})).unwrap(),
+        );
+        scene.study.universe_mesh = Some(
+            serde_json::from_value(json!({"mode": "manual", "size": [4.0, 4.0, 4.0]})).unwrap(),
+        );
+        assert!(geometry_blocks_mesh_build(&scene, GeometryBackendTarget::Fem).is_none());
+    }
+
+    #[test]
+    fn manual_universe_requires_finite_positive_size_even_without_geometry() {
+        let mut scene = scene_with_object(SceneGeometry {
+            geometry_kind: "Box".into(),
+            geometry_params: json!({"size": [1.0, 1.0, 1.0]}),
+            bounds_min: None,
+            bounds_max: None,
+        });
+        scene.objects.clear();
+        scene.study.universe_mesh =
+            Some(serde_json::from_value(json!({"mode": "manual"})).unwrap());
+        let validation = validate_geometry_scene(&scene, GeometryBackendTarget::Fem);
+        assert!(validation
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "GEOMETRY_UNIVERSE_INVALID_BOUNDS"
+                && d.blocks.iter().any(|b| b == "build_mesh")));
     }
 }

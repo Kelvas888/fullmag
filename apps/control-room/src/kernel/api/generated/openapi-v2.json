@@ -14,6 +14,134 @@
       }
     },
     "schemas": {
+      "AcceptedAntennaInspectionCatalogResource": {
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/AcceptedAntennaInspectionIdentity"
+            },
+            "type": "array"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "resource_id": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "validation_scope": {
+            "description": "Publication evidence only; pinned reads separately validate numerical packages.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "resource_id",
+          "project_id",
+          "run_id",
+          "validation_scope",
+          "entries"
+        ],
+        "type": "object"
+      },
+      "AcceptedAntennaInspectionIdentity": {
+        "description": "The Study step and native antenna stage are deliberately separate identities.",
+        "properties": {
+          "artifact_id": {
+            "type": "string"
+          },
+          "attempt_id": {
+            "type": "string"
+          },
+          "case_id": {
+            "type": "string"
+          },
+          "manifest_artifact_id": {
+            "type": "string"
+          },
+          "manifest_object_ref": {
+            "type": "string"
+          },
+          "native_stage_id": {
+            "type": "string"
+          },
+          "ownership_epoch": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "package_object_ref": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "study_step_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "task_id",
+          "study_step_id",
+          "native_stage_id",
+          "attempt_id",
+          "ownership_epoch",
+          "manifest_artifact_id",
+          "manifest_object_ref",
+          "artifact_id",
+          "package_object_ref",
+          "case_id"
+        ],
+        "type": "object"
+      },
+      "AcceptedAntennaInspectionResource": {
+        "properties": {
+          "display": {
+            "$ref": "#/components/schemas/AntennaInspectionDisplayDataResource"
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/AntennaInspectionManifestResource"
+          },
+          "output_id": {
+            "type": "string"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/AcceptedAntennaInspectionIdentity"
+          },
+          "port_mode_id": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "resource_id": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "resource_id",
+          "project_id",
+          "owner",
+          "port_mode_id",
+          "output_id",
+          "manifest",
+          "display"
+        ],
+        "type": "object"
+      },
       "AcceptedObservationFrameRef": {
         "properties": {
           "domain_generation_id": {
@@ -1117,6 +1245,16 @@
             },
             "type": "array"
           },
+          "spectrum_output_scopes": {
+            "description": "Requested output scopes declared by the producer manifest. This does not\ndescribe which requested outputs completed or were resolved.",
+            "items": {
+              "$ref": "#/components/schemas/AnalysisResultSpectrumOutputScope"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "stage_id": {
             "type": "string"
           },
@@ -1422,7 +1560,8 @@
           "modal_eigen",
           "driven_response",
           "time_domain_spectrum",
-          "dynamic_structure_factor"
+          "dynamic_structure_factor",
+          "hysteresis_loop"
         ],
         "type": "string"
       },
@@ -2020,6 +2159,13 @@
         ],
         "type": "object"
       },
+      "AnalysisResultSpectrumOutputScope": {
+        "enum": [
+          "per_sample",
+          "global"
+        ],
+        "type": "string"
+      },
       "AnalysisResultStatusFacets": {
         "properties": {
           "completeness": {
@@ -2052,6 +2198,89 @@
           "execution",
           "completeness",
           "qualification"
+        ],
+        "type": "object"
+      },
+      "AnalyticReferenceModelCollectionResource": {
+        "properties": {
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/AnalyticReferenceModelResource"
+            },
+            "type": "array"
+          },
+          "schema_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "models"
+        ],
+        "type": "object"
+      },
+      "AnalyticReferenceModelResource": {
+        "properties": {
+          "assumptions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bibliography": {
+            "type": "string"
+          },
+          "boundary_assumption": {
+            "description": "Boundary assumption compared with the run's, e.g. `open_film`.",
+            "type": "string"
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "physics_note": {
+            "type": "string"
+          },
+          "surface_pinning": {
+            "type": "string"
+          },
+          "thickness_mode_order": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "validity": {
+            "$ref": "#/components/schemas/AnalyticReferenceValidity"
+          }
+        },
+        "required": [
+          "model_id",
+          "title",
+          "boundary_assumption",
+          "surface_pinning",
+          "thickness_mode_order",
+          "assumptions",
+          "validity",
+          "bibliography",
+          "physics_note"
+        ],
+        "type": "object"
+      },
+      "AnalyticReferenceValidity": {
+        "properties": {
+          "note": {
+            "type": "string"
+          },
+          "wavevector_limit_source": {
+            "description": "Field of the run's validation intent that bounds the compared |k| [rad/m].",
+            "type": "string"
+          }
+        },
+        "required": [
+          "wavevector_limit_source",
+          "note"
         ],
         "type": "object"
       },
@@ -2626,6 +2855,88 @@
           "source_fft",
           "llg_drive",
           "current_density"
+        ],
+        "type": "object"
+      },
+      "AntennaInspectionDisplayDataResource": {
+        "description": "Shared verified display contract, without Live or accepted-run ownership.",
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/AntennaInspectionDisplayCapabilities"
+          },
+          "content_digest": {
+            "type": "string"
+          },
+          "device_cell_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "device_current": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaInspectionCurrentDisplayResource"
+              }
+            ]
+          },
+          "device_node_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "device_positions": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "device_potential": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "device_topology": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "field_scope": {
+            "type": "string"
+          },
+          "magnetic_field": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "normalization": {
+            "type": "string"
+          },
+          "qualification": {
+            "type": "string"
+          },
+          "sample_positions": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "sampling_carrier": {
+            "$ref": "#/components/schemas/AntennaInspectionSamplingResource"
+          },
+          "source_object_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content_digest",
+          "source_object_id",
+          "status",
+          "qualification",
+          "field_scope",
+          "normalization",
+          "capabilities",
+          "device_node_count",
+          "device_cell_count",
+          "sampling_carrier",
+          "device_positions",
+          "device_topology",
+          "device_potential",
+          "sample_positions",
+          "magnetic_field"
         ],
         "type": "object"
       },
@@ -4733,7 +5044,7 @@
       "AuthoringTransactionResponse": {
         "properties": {
           "committed_scene": {
-            "type": "object"
+            "$ref": "#/components/schemas/SceneResource"
           },
           "scene_revision": {
             "format": "int64",
@@ -5419,6 +5730,14 @@
               "null"
             ]
           },
+          "completed_step": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "completion_status": {
             "type": [
               "string",
@@ -6015,6 +6334,135 @@
       "ComputeAdmissionState": {
         "enum": [
           "not_evaluated"
+        ],
+        "type": "string"
+      },
+      "ComputeNodePolicyResource": {
+        "description": "Read-only host policy snapshot. Mutations require the separate operator\nauthorization contract and are intentionally not part of this resource.",
+        "properties": {
+          "policy": {
+            "description": "Versioned NodePolicy document, kept open for forward-compatible fields.",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ComputeNodePolicyStatusResource"
+          }
+        },
+        "required": [
+          "policy",
+          "status"
+        ],
+        "type": "object"
+      },
+      "ComputeNodePolicyStatusResource": {
+        "properties": {
+          "active_workers": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "blocking_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "draining": {
+            "type": "boolean"
+          },
+          "over_budget": {
+            "type": "boolean"
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "active_workers",
+          "draining",
+          "over_budget",
+          "blocking_reasons"
+        ],
+        "type": "object"
+      },
+      "ComputeNodeResource": {
+        "description": "One host inventory and the freshness of its latest observation.",
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "node_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComputeNodePolicyResource",
+                "description": "Current operator-controlled admission policy and its live ledger status."
+              }
+            ]
+          },
+          "snapshot": {
+            "description": "Durable snapshot payload. Its versioned shapes are defined by\n`compute_node_snapshot.v1` and `compute_node_snapshot.v2` in the session model.",
+            "type": "object"
+          },
+          "stale_after_seconds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ComputeNodesState"
+          }
+        },
+        "required": [
+          "node_id",
+          "state",
+          "stale_after_seconds",
+          "snapshot"
+        ],
+        "type": "object"
+      },
+      "ComputeNodesResource": {
+        "description": "Read-only compute-node inventory observed from the configured desktop host.",
+        "properties": {
+          "nodes": {
+            "description": "This local provider returns at most its one configured desktop host.",
+            "items": {
+              "$ref": "#/components/schemas/ComputeNodeResource"
+            },
+            "type": "array"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "stale_after_seconds": {
+            "description": "Maximum age, in seconds, before the last sample is considered stale.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ComputeNodesState"
+          }
+        },
+        "required": [
+          "schema_version",
+          "state",
+          "stale_after_seconds",
+          "nodes"
+        ],
+        "type": "object"
+      },
+      "ComputeNodesState": {
+        "enum": [
+          "not_probed",
+          "current",
+          "stale",
+          "unavailable"
         ],
         "type": "string"
       },
@@ -7164,304 +7612,6 @@
           "operator"
         ],
         "type": "object"
-      },
-      "DevelopmentBackendBuildRequest": {
-        "additionalProperties": false,
-        "description": "Explicit build-only intent. The API derives and pins the managed worktree scope.",
-        "properties": {
-          "api_instance_id": {
-            "type": "string"
-          },
-          "request_id": {
-            "type": "string"
-          },
-          "schema": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "schema",
-          "request_id",
-          "api_instance_id"
-        ],
-        "type": "object"
-      },
-      "DevelopmentBackendBuildRequestResource": {
-        "description": "Bounded status for one authenticated build-only intent.",
-        "properties": {
-          "ready_build_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "ready_source_sha256": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "request_id": {
-            "type": "string"
-          },
-          "schema": {
-            "type": "string"
-          },
-          "state": {
-            "$ref": "#/components/schemas/DevelopmentBackendBuildRequestState"
-          }
-        },
-        "required": [
-          "schema",
-          "request_id",
-          "state"
-        ],
-        "type": "object"
-      },
-      "DevelopmentBackendBuildRequestState": {
-        "enum": [
-          "pending",
-          "building",
-          "ready",
-          "failed",
-          "unknown"
-        ],
-        "type": "string"
-      },
-      "DevelopmentBackendReason": {
-        "enum": [
-          "disabled",
-          "configuration_invalid",
-          "observation_unavailable",
-          "observation_invalid",
-          "observation_stale",
-          "watcher_stopped",
-          "build_pending",
-          "build_failed",
-          "restart_integration_pending"
-        ],
-        "type": "string"
-      },
-      "DevelopmentBackendResource": {
-        "description": "Compilation observation only; applying a build requires a separate guarded command.",
-        "properties": {
-          "build_available": {
-            "description": "True when this pinned development API can accept an explicit build-only request.",
-            "type": "boolean"
-          },
-          "build_request_id": {
-            "description": "Owner request currently reflected by the native watcher status frame.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "configured": {
-            "type": "boolean"
-          },
-          "current_build": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/DevelopmentBuildIdentity"
-              }
-            ]
-          },
-          "ready_build": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/DevelopmentBuildIdentity"
-              }
-            ]
-          },
-          "reason": {
-            "$ref": "#/components/schemas/DevelopmentBackendReason"
-          },
-          "restart_available": {
-            "type": "boolean"
-          },
-          "revision": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "schema_version": {
-            "type": "string"
-          },
-          "state": {
-            "$ref": "#/components/schemas/DevelopmentBackendState"
-          },
-          "workspace_identity": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/DevelopmentBackendWorkspaceIdentity"
-              }
-            ]
-          }
-        },
-        "required": [
-          "schema_version",
-          "configured",
-          "revision",
-          "state",
-          "restart_available",
-          "reason"
-        ],
-        "type": "object"
-      },
-      "DevelopmentBackendState": {
-        "enum": [
-          "disabled",
-          "waiting",
-          "building",
-          "ready",
-          "failed",
-          "superseded",
-          "stopped",
-          "unknown"
-        ],
-        "type": "string"
-      },
-      "DevelopmentBackendWorkspaceIdentity": {
-        "properties": {
-          "api_instance_id": {
-            "type": "string"
-          },
-          "session_epoch": {
-            "description": "Exact transition counter, including when there is no current session.",
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "session_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "api_instance_id",
-          "session_epoch"
-        ],
-        "type": "object"
-      },
-      "DevelopmentBuildIdentity": {
-        "properties": {
-          "id": {
-            "description": "Opaque identity: running product version or verified candidate manifest digest.",
-            "type": "string"
-          },
-          "source_sha256": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "source_sha256"
-        ],
-        "type": "object"
-      },
-      "DevelopmentRestartRequest": {
-        "additionalProperties": false,
-        "description": "Independent UI owners; the canonical scene is acquired privately by the launcher.",
-        "properties": {
-          "editor": {},
-          "project_document": {},
-          "request_id": {
-            "type": "string"
-          },
-          "schema": {
-            "type": "string"
-          },
-          "session_epoch": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "session_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "workspace": {}
-        },
-        "required": [
-          "schema",
-          "request_id",
-          "session_id",
-          "session_epoch",
-          "editor",
-          "workspace",
-          "project_document"
-        ],
-        "type": "object"
-      },
-      "DevelopmentRestartResource": {
-        "properties": {
-          "editor": {},
-          "new_api_instance_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "project_document": {},
-          "public_reason": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "request_id": {
-            "type": "string"
-          },
-          "schema": {
-            "type": "string"
-          },
-          "session_epoch": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "session_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "state": {
-            "$ref": "#/components/schemas/DevelopmentRestartState"
-          },
-          "workspace": {}
-        },
-        "required": [
-          "schema",
-          "request_id",
-          "state"
-        ],
-        "type": "object"
-      },
-      "DevelopmentRestartState": {
-        "enum": [
-          "pending",
-          "ready",
-          "failed",
-          "unknown"
-        ],
-        "type": "string"
       },
       "DisplayPatch": {
         "properties": {
@@ -11644,6 +11794,13 @@
               "null"
             ]
           },
+          "expected_artifact_generation_id": {
+            "description": "Optional optimistic-concurrency precondition for a committed analysis artifact generation.\nThis is distinct from `expected_generation_id`, which identifies the mesh/domain generation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "expected_carrier_revision": {
             "description": "Optional optimistic-concurrency precondition for the resolved field carrier.",
             "type": [
@@ -11915,6 +12072,14 @@
       "FrequencyDomainArtifactExtras": {
         "additionalProperties": true,
         "type": "object"
+      },
+      "FrequencyDomainArtifactGenerationStatus": {
+        "enum": [
+          "legacy_unverified",
+          "member_verified_unbound",
+          "member_verified_owner_bound"
+        ],
+        "type": "string"
       },
       "FrequencyDomainAvailabilitySummaryResource": {
         "properties": {
@@ -12328,7 +12493,7 @@
             "type": "array"
           },
           "content_digest": {
-            "description": "SHA-256 digest of the immutable field payload bytes.",
+            "description": "SHA-256 digest of the field metadata and exact payload member identity.",
             "type": [
               "string",
               "null"
@@ -12346,6 +12511,24 @@
           },
           "field_id": {
             "type": "string"
+          },
+          "generation_id": {
+            "description": "Committed publication containing this exact field member; absent for legacy artifacts.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FrequencyDomainArtifactGenerationStatus",
+                "description": "Membership verification state for the returned field member."
+              }
+            ]
           },
           "missing_reason": {
             "type": [
@@ -12374,7 +12557,7 @@
             "type": "string"
           },
           "revision": {
-            "description": "Content-addressed revision of the immutable field payload bytes.",
+            "description": "Content-addressed revision of the returned field metadata and immutable payload member.",
             "type": [
               "string",
               "null"
@@ -12832,6 +13015,13 @@
                   "null"
                 ]
               },
+              "mode_field_available": {
+                "description": "Explicit availability; absent values use legacy reference checks.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
               "mode_field_id": {
                 "type": [
                   "string",
@@ -13264,11 +13454,36 @@
           "artifact_path": {
             "type": "string"
           },
+          "artifact_set_id": {
+            "description": "Opaque identity of the canonical artifact directory shared by its files.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "content_digest": {
             "description": "SHA-256 digest of the immutable JSON artifact bytes.",
             "type": [
               "string",
               "null"
+            ]
+          },
+          "generation_id": {
+            "description": "Committed publication containing this member; only consumed member bytes are verified.\nAbsent for legacy artifacts without a generation receipt, which remain unverified.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FrequencyDomainArtifactGenerationStatus",
+                "description": "Verification state for a returned artifact member."
+              }
             ]
           },
           "mesh_generation_id": {
@@ -14401,6 +14616,13 @@
                 "format": "double",
                 "type": "number"
               },
+              "mode_field_available": {
+                "description": "Explicit availability; absent values use legacy reference checks.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
               "mode_field_id": {
                 "type": [
                   "string",
@@ -14422,15 +14644,18 @@
                 "type": "integer"
               },
               "residual_relative_l2": {
+                "description": "Missing solver evidence remains unavailable, never an inferred zero.",
                 "format": "double",
-                "type": "number"
+                "type": [
+                  "number",
+                  "null"
+                ]
               }
             },
             "required": [
               "mode_id",
               "raw_mode_index",
               "frequency_hz",
-              "residual_relative_l2",
               "component_participation"
             ],
             "type": "object"
@@ -14563,8 +14788,45 @@
           "artifact_path": {
             "type": "string"
           },
+          "artifact_set_id": {
+            "description": "Opaque identity of the canonical artifact directory shared by its files.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_digest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "content_type": {
             "type": "string"
+          },
+          "generation_id": {
+            "description": "Committed publication containing this member; only consumed member bytes are verified.\nAbsent for legacy artifacts without a generation receipt, which remain unverified.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FrequencyDomainArtifactGenerationStatus",
+                "description": "Verification state for a returned artifact member."
+              }
+            ]
+          },
+          "mesh_generation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "missing_reason": {
             "type": [
@@ -14585,8 +14847,32 @@
           "resource_key": {
             "type": "string"
           },
+          "revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "schema_version": {
             "type": "string"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stage_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "status": {
             "type": "string"
@@ -25226,6 +25512,183 @@
         },
         "type": "object"
       },
+      "ParallelExecutionModeResource": {
+        "enum": [
+          "serial",
+          "adaptive"
+        ],
+        "type": "string"
+      },
+      "ParallelExecutionResource": {
+        "additionalProperties": false,
+        "properties": {
+          "max_cpu_percent": {
+            "format": "double",
+            "type": "number"
+          },
+          "max_memory_percent": {
+            "format": "double",
+            "type": "number"
+          },
+          "max_workers": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_reserve_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ParallelExecutionModeResource"
+          },
+          "threads_per_worker": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mode",
+          "max_cpu_percent",
+          "max_memory_percent",
+          "memory_reserve_bytes",
+          "threads_per_worker"
+        ],
+        "type": "object"
+      },
+      "ParallelExecutionTelemetryResource": {
+        "properties": {
+          "active_workers": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "admission_desired_workers": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "admission_pending_samples": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "admission_reason": {
+            "type": "string"
+          },
+          "admission_worker_limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "allocated_cpu_cores": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cpu_available_cores": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cpu_busy_percent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cpu_target_kind": {
+            "type": "string"
+          },
+          "cpu_target_percent": {
+            "format": "double",
+            "type": "number"
+          },
+          "memory_available_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_limit_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_reserve_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "memory_target_percent": {
+            "format": "double",
+            "type": "number"
+          },
+          "resolved_workers": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sampled_at_unix_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "terminal": {
+            "type": "boolean"
+          },
+          "worker_peak_cpu_cores": {
+            "description": "Admission CPU demand envelope, including a conservative resolved-team\nbound when a short or sparsely observed worker lacks CPU sampling coverage.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "worker_peak_rss_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "sampled_at_unix_ms",
+          "active_workers",
+          "admission_desired_workers",
+          "admission_pending_samples",
+          "cpu_target_percent",
+          "memory_target_percent",
+          "memory_reserve_bytes",
+          "cpu_target_kind",
+          "admission_reason",
+          "terminal"
+        ],
+        "type": "object"
+      },
       "PeriodicValidationStatus": {
         "enum": [
           "valid",
@@ -27142,6 +27605,194 @@
         "minimum": 1,
         "type": "integer"
       },
+      "PostprocessingDataRef": {
+        "description": "Published data identity a definition refers to; never array indices.",
+        "properties": {
+          "branch_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dataset_id": {
+            "type": "string"
+          },
+          "dataset_revision": {
+            "type": "string"
+          },
+          "field_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "sample_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "run_id",
+          "dataset_id",
+          "dataset_revision"
+        ],
+        "type": "object"
+      },
+      "PostprocessingDefinition": {
+        "properties": {
+          "data_ref": {
+            "$ref": "#/components/schemas/PostprocessingDataRef"
+          },
+          "definition_id": {
+            "type": "string"
+          },
+          "definition_schema": {
+            "description": "Versioned settings schema, e.g. `analysis.dispersion.mode_visualization.v1`.",
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "module_id": {
+            "description": "Owning analysis module, e.g. `analysis.dispersion`.",
+            "type": "string"
+          },
+          "module_version": {
+            "type": "string"
+          },
+          "node_kind": {
+            "description": "Node template kind; must start with `<module_id>.`.",
+            "type": "string"
+          },
+          "parent_definition_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "revision": {
+            "description": "Bumped by the server on every change to this definition.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "settings": {
+            "additionalProperties": true,
+            "description": "Module-owned settings validated by `definition_schema` on the client.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "definition_id",
+          "module_id",
+          "module_version",
+          "definition_schema",
+          "node_kind",
+          "label",
+          "data_ref"
+        ],
+        "type": "object"
+      },
+      "PostprocessingDefinitionCollectionResource": {
+        "properties": {
+          "count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "definitions": {
+            "items": {
+              "$ref": "#/components/schemas/PostprocessingDefinition"
+            },
+            "type": "array"
+          },
+          "scene_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "scene_revision",
+          "count",
+          "definitions"
+        ],
+        "type": "object"
+      },
+      "PostprocessingDefinitionCreateRequest": {
+        "properties": {
+          "definition": {
+            "$ref": "#/components/schemas/PostprocessingDefinition"
+          },
+          "expected_scene_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_scene_revision",
+          "definition"
+        ],
+        "type": "object"
+      },
+      "PostprocessingDefinitionDeleteRequest": {
+        "properties": {
+          "expected_scene_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_scene_revision"
+        ],
+        "type": "object"
+      },
+      "PostprocessingDefinitionPatchRequest": {
+        "properties": {
+          "definition": {
+            "$ref": "#/components/schemas/PostprocessingDefinition"
+          },
+          "expected_scene_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_scene_revision",
+          "definition"
+        ],
+        "type": "object"
+      },
+      "PostprocessingDefinitionResource": {
+        "properties": {
+          "definition": {
+            "$ref": "#/components/schemas/PostprocessingDefinition"
+          },
+          "scene_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "scene_revision",
+          "definition"
+        ],
+        "type": "object"
+      },
       "PreparationClockAdjustment": {
         "properties": {
           "backward_delta_ms": {
@@ -27581,6 +28232,359 @@
           "expected_project_id",
           "expected_revision",
           "scene_document"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchAxisSummaryResource": {
+        "properties": {
+          "canonical_unit": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "canonical_unit"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchCasePublishedRunResource": {
+        "properties": {
+          "catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "catalog_state": {
+            "$ref": "#/components/schemas/ProjectRunCatalogState"
+          },
+          "run_id": {
+            "description": "Run identity confirmed by the durable child RunIntent.",
+            "type": "string"
+          },
+          "tasks": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectBatchCaseTaskSummaryResource"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "run_id",
+          "catalog_state",
+          "tasks"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchCaseState": {
+        "enum": [
+          "pending_expansion",
+          "pending_materialization",
+          "materialized"
+        ],
+        "type": "string"
+      },
+      "ProjectBatchCaseSummaryResource": {
+        "properties": {
+          "case_id": {
+            "type": "string"
+          },
+          "parameter_tuple": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "planned_run_id": {
+            "type": "string"
+          },
+          "published_run": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectBatchCasePublishedRunResource",
+                "description": "Present only when the durable child intent matches this batch case."
+              }
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/ProjectBatchCaseState"
+          }
+        },
+        "required": [
+          "case_id",
+          "planned_run_id",
+          "parameter_tuple",
+          "state"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchCaseTaskSummaryResource": {
+        "properties": {
+          "lifecycle": {
+            "$ref": "#/components/schemas/ProjectRunTaskLifecycle"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "lifecycle"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchCasesQuery": {
+        "properties": {
+          "cursor": {
+            "description": "Last CaseId returned on the previous page.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "Page size, from 1 to 100; defaults to 50.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ProjectBatchCasesResource": {
+        "properties": {
+          "axes": {
+            "description": "Axis names and canonical units for the parameter tuples in this manifest.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectBatchAxisSummaryResource"
+            },
+            "type": "array"
+          },
+          "batch_id": {
+            "type": "string"
+          },
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectBatchCaseSummaryResource"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "batch_id",
+          "axes",
+          "cases"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchExpansionState": {
+        "enum": [
+          "pending",
+          "expanding",
+          "complete",
+          "stopped"
+        ],
+        "type": "string"
+      },
+      "ProjectBatchFailurePolicy": {
+        "enum": [
+          "continue_independent",
+          "stop_admission"
+        ],
+        "type": "string"
+      },
+      "ProjectBatchListQuery": {
+        "properties": {
+          "cursor": {
+            "description": "Last BatchId returned on the previous page.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "Page size, from 1 to 100; defaults to 50.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ProjectBatchListResource": {
+        "properties": {
+          "batches": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectBatchSummaryResource"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "batches"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchSubmitRequest": {
+        "additionalProperties": false,
+        "description": "Immutable independent batch submission. The server deserializes\n`batch_request` into the versioned application contract before accepting it.",
+        "properties": {
+          "archive_base64": {
+            "description": "Exact base64-encoded portable project archive accepted for this batch.",
+            "type": "string"
+          },
+          "asset_paths": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Explicit immutable asset ID to path inside `project/assets/`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "batch_request": {
+            "additionalProperties": {},
+            "description": "Versioned `BatchExpansionRequest` object, including template and axes.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "idempotency_key": {
+            "description": "Client intent key used to recover an ACK after a timeout.",
+            "type": "string"
+          },
+          "study_plan": {
+            "additionalProperties": {},
+            "description": "Versioned immutable StudyPlan used by the batch template.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "study_problem_catalog": {
+            "additionalProperties": {},
+            "description": "Immutable StudyProblemCatalog pinned by the batch template.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "archive_base64",
+          "idempotency_key",
+          "batch_request",
+          "study_plan",
+          "study_problem_catalog",
+          "asset_paths"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchSubmitResource": {
+        "properties": {
+          "batch_id": {
+            "type": "string"
+          },
+          "case_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "disposition": {
+            "$ref": "#/components/schemas/ProjectRunSubmitDisposition"
+          },
+          "manifest_sha256": {
+            "description": "Logical digest stored in the expansion manifest.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "disposition",
+          "batch_id",
+          "manifest_sha256",
+          "case_count"
+        ],
+        "type": "object"
+      },
+      "ProjectBatchSummaryResource": {
+        "properties": {
+          "accepted_at": {
+            "type": "string"
+          },
+          "batch_id": {
+            "type": "string"
+          },
+          "case_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expansion_state": {
+            "$ref": "#/components/schemas/ProjectBatchExpansionState",
+            "description": "State of the committed expansion cursor, which can lag a durable child."
+          },
+          "failure_policy": {
+            "$ref": "#/components/schemas/ProjectBatchFailurePolicy"
+          },
+          "manifest_sha256": {
+            "type": "string"
+          },
+          "max_parallel_cases": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "published_case_count": {
+            "description": "Committed `next_case_index` watermark; a durable child may be visible in\nCases before this cursor advances after publication.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "batch_id",
+          "accepted_at",
+          "manifest_sha256",
+          "case_count",
+          "failure_policy",
+          "published_case_count",
+          "expansion_state"
         ],
         "type": "object"
       },
@@ -28054,6 +29058,90 @@
         ],
         "type": "string"
       },
+      "ProjectRunIntentRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "archive_base64": {
+            "type": "string"
+          },
+          "asset_paths": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "expected_revision": {
+            "description": "Revision of the exact archived definition observed by the author.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "run_authoring": {
+            "additionalProperties": {},
+            "description": "Explicit RunIntentAuthoring: run_id, idempotency_key, parameters, seeds,\ndependencies, scheduling_priority and requested_execution. No defaults\nor identities are inferred from a live session.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "study_plan": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "study_problem_catalog": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "archive_base64",
+          "expected_revision",
+          "run_authoring",
+          "study_plan",
+          "study_problem_catalog",
+          "asset_paths"
+        ],
+        "type": "object"
+      },
+      "ProjectRunIntentResource": {
+        "properties": {
+          "definition_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "payload_fingerprint": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "run_intent": {
+            "additionalProperties": {},
+            "description": "Canonical run_intent.v1 for the existing Submit operation. Submit must\nreceive the same archive, Study, catalog and asset bindings. It repeats\nvalidation and checks published profiles before durable acceptance.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "project_id",
+          "definition_revision",
+          "payload_fingerprint",
+          "run_intent"
+        ],
+        "type": "object"
+      },
       "ProjectRunListQuery": {
         "properties": {
           "cursor": {
@@ -28384,31 +29472,26 @@
         ],
         "type": "string"
       },
-      "ProjectRunTaskCancellationRequest": {
-        "additionalProperties": false,
+      "ProjectRunTaskCancellationIntentResource": {
         "properties": {
-          "reason": {
-            "description": "Stable operator-visible reason persisted in the fenced Stop command.",
+          "cancellation_id": {
             "type": "string"
-          }
-        },
-        "required": [
-          "reason"
-        ],
-        "type": "object"
-      },
-      "ProjectRunTaskCancellationResource": {
-        "properties": {
+          },
+          "cancellation_state": {
+            "$ref": "#/components/schemas/ProjectRunTaskCancellationState"
+          },
           "catalog_revision": {
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
-          "command_id": {
-            "type": "string"
-          },
           "disposition": {
             "$ref": "#/components/schemas/ProjectRunTaskCancellationDisposition"
+          },
+          "expected_catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
           },
           "lifecycle": {
             "$ref": "#/components/schemas/ProjectRunTaskLifecycle"
@@ -28424,9 +29507,80 @@
           "disposition",
           "run_id",
           "task_id",
-          "command_id",
+          "cancellation_id",
+          "cancellation_state",
           "lifecycle",
-          "catalog_revision"
+          "catalog_revision",
+          "expected_catalog_revision"
+        ],
+        "type": "object"
+      },
+      "ProjectRunTaskCancellationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "cancellation_id": {
+            "description": "Supply together with expected_catalog_revision for pre-claim cancellation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Stable operator-visible reason persisted in the request or Stop command.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "ProjectRunTaskCancellationResource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ProjectRunTaskStopResource"
+          },
+          {
+            "$ref": "#/components/schemas/ProjectRunTaskCancellationIntentResource"
+          }
+        ]
+      },
+      "ProjectRunTaskCancellationState": {
+        "enum": [
+          "requested"
+        ],
+        "type": "string"
+      },
+      "ProjectRunTaskCancellationSummary": {
+        "properties": {
+          "cancellation_id": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "expected_catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cancellation_id",
+          "reason",
+          "expected_catalog_revision",
+          "created_at"
         ],
         "type": "object"
       },
@@ -28504,6 +29658,16 @@
               "null"
             ]
           },
+          "cancellation_intent": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectRunTaskCancellationSummary"
+              }
+            ]
+          },
           "input_fingerprint": {
             "type": "string"
           },
@@ -28553,6 +29717,39 @@
           "lifecycle",
           "readiness",
           "artifact_ids"
+        ],
+        "type": "object"
+      },
+      "ProjectRunTaskStopResource": {
+        "properties": {
+          "catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "command_id": {
+            "type": "string"
+          },
+          "disposition": {
+            "$ref": "#/components/schemas/ProjectRunTaskCancellationDisposition"
+          },
+          "lifecycle": {
+            "$ref": "#/components/schemas/ProjectRunTaskLifecycle"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "disposition",
+          "run_id",
+          "task_id",
+          "command_id",
+          "lifecycle",
+          "catalog_revision"
         ],
         "type": "object"
       },
@@ -39160,6 +40357,14 @@
               "null"
             ]
           },
+          "completed_step": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "converged": {
             "type": "boolean"
           },
@@ -39283,6 +40488,16 @@
             "type": [
               "number",
               "null"
+            ]
+          },
+          "parallel_execution": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ParallelExecutionTelemetryResource"
+              }
             ]
           },
           "progress_detail": {
@@ -40094,6 +41309,16 @@
       },
       "StudyRuntimePatchRequest": {
         "properties": {
+          "parallel_execution": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ParallelExecutionResource"
+              }
+            ]
+          },
           "requested_backend": {
             "type": [
               "string",
@@ -40139,6 +41364,9 @@
               "null"
             ]
           },
+          "parallel_execution": {
+            "$ref": "#/components/schemas/ParallelExecutionResource"
+          },
           "requested_backend": {
             "type": "string"
           },
@@ -40164,7 +41392,8 @@
           "requested_backend",
           "requested_device",
           "requested_precision",
-          "requested_mode"
+          "requested_mode",
+          "parallel_execution"
         ],
         "type": "object"
       },
@@ -44259,6 +45488,246 @@
         ]
       }
     },
+    "/v2/persistence/projects/{project_id}/batches": {
+      "get": {
+        "operationId": "persistence_get_persistence_projects_project_id_batches",
+        "parameters": [
+          {
+            "description": "Pinned project identity",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, from 1 to 100; defaults to 50.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Last BatchId returned on the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectBatchListResource"
+                }
+              }
+            },
+            "description": "Page of durable batch parents for one project"
+          },
+          "400": {
+            "description": "Invalid page size or cursor"
+          }
+        },
+        "tags": [
+          "persistence"
+        ]
+      },
+      "post": {
+        "operationId": "persistence_post_persistence_projects_project_id_batches",
+        "parameters": [
+          {
+            "description": "Pinned project identity",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectBatchSubmitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectBatchSubmitResource"
+                }
+              }
+            },
+            "description": "Identical batch submit replayed"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectBatchSubmitResource"
+                }
+              }
+            },
+            "description": "Durable immutable batch parent accepted"
+          },
+          "400": {
+            "description": "Invalid immutable batch inputs"
+          },
+          "409": {
+            "description": "Project identity, batch identity or idempotency conflict"
+          }
+        },
+        "tags": [
+          "persistence"
+        ]
+      }
+    },
+    "/v2/persistence/projects/{project_id}/batches/{batch_id}/cases": {
+      "get": {
+        "operationId": "persistence_get_persistence_projects_project_id_batches_batch_id_cases",
+        "parameters": [
+          {
+            "description": "Pinned project identity",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Durable batch identity",
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, from 1 to 100; defaults to 50.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Last CaseId returned on the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectBatchCasesResource"
+                }
+              }
+            },
+            "description": "Page of manifest cases with verified published child run and task catalog lifecycle"
+          },
+          "400": {
+            "description": "Invalid page size or cursor"
+          },
+          "404": {
+            "description": "Accepted batch is missing"
+          },
+          "409": {
+            "description": "Batch belongs to another project"
+          },
+          "500": {
+            "description": "Durable manifest, child run, or task catalog is incomplete or inconsistent"
+          }
+        },
+        "tags": [
+          "persistence"
+        ]
+      }
+    },
+    "/v2/persistence/projects/{project_id}/run-intent": {
+      "post": {
+        "operationId": "persistence_post_persistence_projects_project_id_run_intent",
+        "parameters": [
+          {
+            "description": "Exact archived project identity",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectRunIntentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectRunIntentResource"
+                }
+              }
+            },
+            "description": "Prepared immutable identity; not accepted or admitted"
+          },
+          "400": {
+            "description": "Invalid archive or compiled authoring inputs"
+          },
+          "409": {
+            "description": "Project identity or revision conflict; read-only archive"
+          }
+        },
+        "tags": [
+          "persistence"
+        ]
+      }
+    },
     "/v2/persistence/projects/{project_id}/runs": {
       "get": {
         "operationId": "persistence_get_persistence_projects_project_id_runs",
@@ -44416,6 +45885,309 @@
           },
           "409": {
             "description": "Run belongs to another project"
+          }
+        },
+        "tags": [
+          "persistence"
+        ]
+      }
+    },
+    "/v2/persistence/projects/{project_id}/runs/{run_id}/antenna-inspections": {
+      "get": {
+        "operationId": "persistence_get_persistence_projects_project_id_runs_run_id_antenna_inspections",
+        "parameters": [
+          {
+            "description": "Pinned project identity",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Accepted durable run identity",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Previous strong ETag",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptedAntennaInspectionCatalogResource"
+                }
+              }
+            },
+            "description": "Current published inspection identities; no field packages are decoded"
+          },
+          "304": {
+            "description": "Unchanged after accepted publication checks"
+          },
+          "400": {
+            "description": "Invalid identity"
+          },
+          "404": {
+            "description": "Accepted run or catalogs are missing"
+          },
+          "409": {
+            "description": "Project/run mismatch or catalogs changed during read"
+          },
+          "500": {
+            "description": "Invalid accepted state or publication metadata"
+          }
+        },
+        "tags": [
+          "persistence"
+        ]
+      }
+    },
+    "/v2/persistence/projects/{project_id}/runs/{run_id}/antenna-inspections/{step_id}": {
+      "get": {
+        "operationId": "persistence_get_persistence_projects_project_id_runs_run_id_antenna_inspections_step_id",
+        "parameters": [
+          {
+            "description": "Pinned project identity",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Accepted durable run identity",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact accepted Study step ID, not the native stage ID",
+            "in": "path",
+            "name": "step_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current successful task attempt",
+            "in": "query",
+            "name": "attempt_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current task ownership epoch",
+            "in": "query",
+            "name": "ownership_epoch",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Required package CAS SHA-256 from the published artifact catalog",
+            "in": "query",
+            "name": "package_object_ref",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Previous strong ETag",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptedAntennaInspectionResource"
+                }
+              }
+            },
+            "description": "Fully verified accepted inspection metadata and display descriptors, no numerical arrays"
+          },
+          "304": {
+            "description": "Unchanged after current-attempt and full integrity checks"
+          },
+          "400": {
+            "description": "Invalid identity or query"
+          },
+          "404": {
+            "description": "Selected step has no published inspection"
+          },
+          "409": {
+            "description": "Project/run mismatch or stale publication identity"
+          },
+          "500": {
+            "description": "Invalid accepted state, package or storage failure"
+          }
+        },
+        "tags": [
+          "persistence"
+        ]
+      }
+    },
+    "/v2/persistence/projects/{project_id}/runs/{run_id}/antenna-inspections/{step_id}/payloads/{payload_kind}": {
+      "get": {
+        "operationId": "persistence_get_persistence_projects_project_id_runs_run_id_antenna_inspections_step_id_payloads_payload_kind",
+        "parameters": [
+          {
+            "description": "Pinned project identity",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Accepted durable run identity",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact accepted Study step ID, not the native stage ID",
+            "in": "path",
+            "name": "step_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Same verified V/J/H and geometry payload kinds as the Live inspection API",
+            "in": "path",
+            "name": "payload_kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current successful task attempt",
+            "in": "query",
+            "name": "attempt_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current task ownership epoch",
+            "in": "query",
+            "name": "ownership_epoch",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Required package CAS SHA-256 from the published artifact catalog",
+            "in": "query",
+            "name": "package_object_ref",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Previous strong ETag",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "One byte range",
+            "in": "header",
+            "name": "Range",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "Verified accepted antenna payload"
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "Verified payload byte range"
+          },
+          "304": {
+            "description": "Unchanged after current-attempt and full integrity checks"
+          },
+          "400": {
+            "description": "Invalid identity, query or payload kind"
+          },
+          "404": {
+            "description": "Selected step has no published inspection"
+          },
+          "409": {
+            "description": "Project/run mismatch or stale publication identity"
+          },
+          "416": {
+            "description": "Invalid byte range"
+          },
+          "500": {
+            "description": "Invalid accepted state, package or storage failure"
           }
         },
         "tags": [
@@ -45498,7 +47270,7 @@
                 }
               }
             },
-            "description": "Identical Stop command replayed"
+            "description": "Identical cancellation request replayed"
           },
           "202": {
             "content": {
@@ -45508,7 +47280,7 @@
                 }
               }
             },
-            "description": "Durable Stop command accepted"
+            "description": "Durable Stop command or pre-claim cancellation request accepted"
           },
           "400": {
             "description": "Invalid task identity or cancellation reason"
@@ -45517,7 +47289,7 @@
             "description": "Accepted run intent is missing"
           },
           "409": {
-            "description": "Task is not preparing/running or a conflicting cancellation exists"
+            "description": "Task state, catalog revision or cancellation identity conflicts"
           }
         },
         "tags": [
@@ -45556,6 +47328,72 @@
               }
             },
             "description": "Runtime capabilities"
+          }
+        },
+        "tags": [
+          "platform"
+        ]
+      }
+    },
+    "/v2/platform/compute/nodes": {
+      "get": {
+        "operationId": "platform_get_platform_compute_nodes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComputeNodesResource"
+                }
+              }
+            },
+            "description": "Latest read-only local compute-node snapshot and its freshness"
+          },
+          "304": {
+            "description": "Compute-node snapshot is unchanged for the supplied ETag"
+          },
+          "503": {
+            "description": "Configured host inventory could not be safely observed"
+          }
+        },
+        "tags": [
+          "platform"
+        ]
+      }
+    },
+    "/v2/platform/compute/nodes/{node_id}": {
+      "get": {
+        "operationId": "platform_get_platform_compute_nodes_node_id",
+        "parameters": [
+          {
+            "description": "Stable compute-node identity",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComputeNodeResource"
+                }
+              }
+            },
+            "description": "Latest read-only compute-node snapshot and its freshness"
+          },
+          "304": {
+            "description": "Compute-node snapshot is unchanged for the supplied ETag"
+          },
+          "404": {
+            "description": "The requested compute node is not currently observable"
+          },
+          "503": {
+            "description": "Configured host inventory could not be safely observed"
           }
         },
         "tags": [
@@ -45732,266 +47570,6 @@
           },
           "503": {
             "description": "No configured profile store"
-          }
-        },
-        "tags": [
-          "platform"
-        ]
-      }
-    },
-    "/v2/platform/development-backend": {
-      "get": {
-        "operationId": "platform_get_platform_development_backend",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DevelopmentBackendResource"
-                }
-              }
-            },
-            "description": "Read-only native development compilation status"
-          },
-          "304": {
-            "description": "Development backend status has not changed"
-          }
-        },
-        "tags": [
-          "platform"
-        ]
-      }
-    },
-    "/v2/platform/development-backend/build-requests": {
-      "post": {
-        "operationId": "platform_post_platform_development_backend_build_requests",
-        "parameters": [
-          {
-            "description": "Bearer token generated before submission",
-            "in": "header",
-            "name": "Authorization",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Exact launcher UI origin",
-            "in": "header",
-            "name": "Origin",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Current API instance pin",
-            "in": "header",
-            "name": "x-fullmag-api-instance",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DevelopmentBackendBuildRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DevelopmentBackendBuildRequestResource"
-                }
-              }
-            },
-            "description": "Build-only intent durably queued"
-          },
-          "409": {
-            "description": "Build coordinator unavailable or request conflicts"
-          }
-        },
-        "tags": [
-          "platform"
-        ]
-      }
-    },
-    "/v2/platform/development-backend/build-requests/{request_id}": {
-      "get": {
-        "operationId": "platform_get_platform_development_backend_build_requests_request_id",
-        "parameters": [
-          {
-            "description": "Opaque build request identity",
-            "in": "path",
-            "name": "request_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Bearer status token",
-            "in": "header",
-            "name": "Authorization",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Exact launcher UI origin when sent",
-            "in": "header",
-            "name": "Origin",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Exact launcher UI origin echo for same-origin GET",
-            "in": "header",
-            "name": "x-fullmag-ui-origin",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Current API instance pin",
-            "in": "header",
-            "name": "x-fullmag-api-instance",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DevelopmentBackendBuildRequestResource"
-                }
-              }
-            },
-            "description": "Token-bound build request state"
-          },
-          "404": {
-            "description": "Request unavailable"
-          }
-        },
-        "tags": [
-          "platform"
-        ]
-      }
-    },
-    "/v2/platform/development-restart-requests": {
-      "post": {
-        "operationId": "platform_post_platform_development_restart_requests",
-        "parameters": [
-          {
-            "description": "Bearer token generated before submission",
-            "in": "header",
-            "name": "Authorization",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Exact launcher UI origin",
-            "in": "header",
-            "name": "Origin",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Current API instance pin",
-            "in": "header",
-            "name": "x-fullmag-api-instance",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DevelopmentRestartRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DevelopmentRestartResource"
-                }
-              }
-            },
-            "description": "Restart intent durably queued; no process restart is implied"
-          },
-          "409": {
-            "description": "Restart coordinator unavailable or request conflicts"
-          }
-        },
-        "tags": [
-          "platform"
-        ]
-      }
-    },
-    "/v2/platform/development-restart-requests/{request_id}": {
-      "get": {
-        "operationId": "platform_get_platform_development_restart_requests_request_id",
-        "parameters": [
-          {
-            "description": "Opaque restart request identity",
-            "in": "path",
-            "name": "request_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Bearer status token; omit stale API instance header",
-            "in": "header",
-            "name": "Authorization",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DevelopmentRestartResource"
-                }
-              }
-            },
-            "description": "Token-bound restart status and confirmed restore payload"
-          },
-          "404": {
-            "description": "Request unavailable"
           }
         },
         "tags": [
@@ -47612,6 +49190,228 @@
               }
             },
             "description": "Settle trace for a point"
+          }
+        },
+        "tags": [
+          "analysis"
+        ]
+      }
+    },
+    "/v2/sessions/current/analysis/postprocessing/definitions": {
+      "get": {
+        "operationId": "analysis_get_sessions_current_analysis_postprocessing_definitions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PostprocessingDefinitionCollectionResource"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "analysis"
+        ]
+      },
+      "post": {
+        "operationId": "analysis_post_sessions_current_analysis_postprocessing_definitions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostprocessingDefinitionCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PostprocessingDefinitionResource"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Invalid definition"
+          },
+          "409": {
+            "description": "Revision or identity conflict"
+          }
+        },
+        "tags": [
+          "analysis"
+        ]
+      }
+    },
+    "/v2/sessions/current/analysis/postprocessing/definitions/{definition_id}": {
+      "delete": {
+        "operationId": "analysis_delete_sessions_current_analysis_postprocessing_definitions_definition_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "definition_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostprocessingDefinitionDeleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PostprocessingDefinitionCollectionResource"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "description": "Definition missing"
+          },
+          "409": {
+            "description": "Revision conflict or definition has children"
+          }
+        },
+        "tags": [
+          "analysis"
+        ]
+      },
+      "get": {
+        "operationId": "analysis_get_sessions_current_analysis_postprocessing_definitions_definition_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "definition_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PostprocessingDefinitionResource"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "description": "Definition missing"
+          }
+        },
+        "tags": [
+          "analysis"
+        ]
+      },
+      "patch": {
+        "operationId": "analysis_patch_sessions_current_analysis_postprocessing_definitions_definition_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "definition_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostprocessingDefinitionPatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PostprocessingDefinitionResource"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "Invalid definition"
+          },
+          "404": {
+            "description": "Definition missing"
+          },
+          "409": {
+            "description": "Revision conflict"
+          }
+        },
+        "tags": [
+          "analysis"
+        ]
+      }
+    },
+    "/v2/sessions/current/analysis/references/analytic-models": {
+      "get": {
+        "operationId": "analysis_get_sessions_current_analysis_references_analytic_models",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticReferenceModelCollectionResource"
+                }
+              }
+            },
+            "description": ""
           }
         },
         "tags": [
@@ -56101,6 +57901,18 @@
             }
           },
           {
+            "description": "Optional optimistic-concurrency precondition for a committed analysis artifact generation.\nThis is distinct from `expected_generation_id`, which identifies the mesh/domain generation.",
+            "in": "query",
+            "name": "expected_artifact_generation_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "Optional optimistic-concurrency precondition for the resolved field carrier.",
             "in": "query",
             "name": "expected_carrier_revision",
@@ -56121,8 +57933,14 @@
             "content": {
               "application/octet-stream": {}
             },
-            "description": "Binary FMVP field vector. Scoped FEM and FDM payloads use FMVP v3 metadata with domain_generation_id, carrier topology revision/hash, scope kind/id, indexing, and optional node_indices. Multilayer FDM layer/object scopes identify their native grid carrier. Full-domain regular-grid FDM uses FMVP v3 sampled indices when max_samples is supplied and may use FMVP v2 for an uncapped complete payload.",
+            "description": "Binary FMVP field vector. Analysis response and eigen-mode vectors use FMVP v5 metadata with the full quantity ID and domain generation identity; when a mesh carrier is available they also include topology, scope, and indexing metadata. Analysis vectors without a mesh use the explicit legacy_count_only absent-topology sentinel and cannot establish topology-bound overlay compatibility. Other scoped FEM and FDM payloads use FMVP v3 metadata with domain_generation_id, carrier topology revision/hash, scope kind/id, indexing, and optional node_indices. Multilayer FDM layer/object scopes identify their native grid carrier. Full-domain regular-grid FDM uses FMVP v3 sampled indices when max_samples is supplied and may use FMVP v2 for an uncapped complete payload.",
             "headers": {
+              "x-fullmag-artifact-generation-id": {
+                "description": "Committed analysis artifact generation identity; present only when the served field member is verified",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-fullmag-component": {
                 "description": "Resolved component projection",
                 "schema": {
@@ -56142,7 +57960,7 @@
                 }
               },
               "x-fullmag-field-indexing": {
-                "description": "Optional FMVP v3 field indexing",
+                "description": "Optional FMVP v3/v5 field indexing",
                 "schema": {
                   "type": "string"
                 }
@@ -56154,7 +57972,7 @@
                 }
               },
               "x-fullmag-mesh-topology-hash": {
-                "description": "Optional FMVP v3 mesh topology hash",
+                "description": "Optional FMVP v3/v5 mesh topology hash",
                 "schema": {
                   "type": "string"
                 }
@@ -56167,14 +57985,14 @@
                 }
               },
               "x-fullmag-node-index-count": {
-                "description": "Optional FMVP v3 node-index count",
+                "description": "Optional FMVP v3/v5 node-index count",
                 "schema": {
                   "minimum": 0,
                   "type": "integer"
                 }
               },
               "x-fullmag-payload-state": {
-                "description": "current for metadata-complete FMVP v3; legacy_unverified for FMVP v2",
+                "description": "current for metadata-complete FMVP v3 through v5; legacy_unverified for FMVP v2",
                 "schema": {
                   "type": "string"
                 }
@@ -62210,6 +64028,9 @@
               }
             },
             "description": "Canonical Python rewritten from authoring state"
+          },
+          "400": {
+            "description": "Scene physics is incomplete; no canonical source was written"
           },
           "404": {
             "description": "No active workspace"

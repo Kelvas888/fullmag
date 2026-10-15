@@ -1,7 +1,60 @@
 use super::*;
+use crate::script_stage_contract::ResolvedScriptStageAction;
 use crate::script_stage_contract::ScriptAntennaAuthoringInventory;
 use fullmag_ir::ProblemIR;
 use serde_json::json;
+
+#[test]
+fn standalone_antenna_pipeline_replans_without_conflating_authored_and_physical_ids() {
+    let input: ScriptExecutionConfig = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/runtime/antenna-standalone-pipeline.json"
+    ))
+    .unwrap();
+    let expected_plan = serde_json::to_value(fullmag_plan::plan(&input.ir).unwrap()).unwrap();
+    let compiled = materialize_script_pipeline_with_output_policy_bounded(
+        input,
+        fullmag_ir::configure_project_autosave_policy,
+        2,
+    )
+    .unwrap();
+    assert_eq!(compiled.executions.len(), 2);
+    assert_ne!(
+        compiled.executions[0].execution_id,
+        compiled.executions[1].execution_id
+    );
+    assert!(compiled.nodes[0].execution_ids.is_empty());
+    for (index, owner) in ["first-inspection", "repeat-inspection"].iter().enumerate() {
+        let execution = &compiled.executions[index];
+        let stage = &execution.stage;
+        let provenance = stage.provenance.as_ref().unwrap();
+        assert_eq!(provenance.authored_step_id, *owner);
+        assert_eq!(provenance.ancestor_group_ids, vec!["antenna-group"]);
+        assert_eq!(provenance.expansion_index, 0);
+        assert_eq!(
+            stage.ir.problem_meta.runtime_metadata["active_stage_id"],
+            *owner
+        );
+        assert_eq!(stage.until_seconds, 0.0);
+        assert!(stage.ir.magnets.is_empty());
+        assert!(stage.ir.energy_terms.is_empty());
+        assert_eq!(stage.ir.antenna_field_solve_stages.len(), 1);
+        let Some(ResolvedScriptStageAction::AntennaExternalLeadInspection {
+            input, output_id, ..
+        }) = &stage.action
+        else {
+            panic!("raw external-lead inspection must not become a field basis or LLG stage");
+        };
+        assert_eq!(input.stage.id, "inspect_antenna");
+        assert_eq!(input.port.id, "port");
+        assert_eq!(output_id, "inspection");
+        let plan = fullmag_plan::plan(&stage.ir).unwrap();
+        assert_eq!(serde_json::to_value(plan).unwrap(), expected_plan);
+        assert_eq!(
+            compiled.nodes[index + 1].execution_ids,
+            vec![execution.execution_id.clone()]
+        );
+    }
+}
 
 fn config() -> ScriptExecutionConfig {
     ScriptExecutionConfig {

@@ -1,5 +1,6 @@
 """Interpreted comparison orchestration checks, not native qualification."""
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,26 @@ def test_actual_isolated_public_lowering_matches_fixture_pin():
     inputs = comparison.reconstruct_inputs(
         repo, repo / "examples/fem_antenna_current_source_inspection.py")
     assert comparison.fixture_input_digest(inputs) == comparison.FIXTURE_INPUT_SHA256
+
+
+def test_actual_standalone_input_preserves_physical_oracle_pin(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    paths, _, generated = comparison.launcher.fixture_identity(repo, standalone=True)
+    for name, path in paths.items():
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+    script = tmp_path / comparison.launcher.SCRIPT_NAME
+    script.write_bytes(generated)
+    inputs = comparison.reconstruct_inputs(repo, script, standalone=True)
+    assert comparison.fixture_input_digest(inputs) == comparison.FIXTURE_INPUT_SHA256
+
+
+def test_standalone_reconstruction_rejects_original_magnetic_probe():
+    repo = Path(__file__).resolve().parents[1]
+    with pytest.raises(ValueError, match="Standalone input contains magnetic state or dynamics"):
+        comparison.reconstruct_inputs(repo, repo / "examples/fem_antenna_current_source_inspection.py",
+                                      standalone=True)
 
 
 def test_reconstruction_rejects_wrong_python_source_tree(tmp_path):
@@ -93,6 +114,34 @@ def test_uses_exact_run_values_and_never_promotes_scope(tmp_path, monkeypatch):
     assert result["native_canonical_bundle_redecoded"] is False
     assert result["rt0_fixture"] == {"comparison": "PASS", "physics_qualified": False}
     assert result["qualification"] == "NOT VERIFIED"
+
+
+def test_standalone_comparison_reconstructs_executed_script_not_magnetic_original(tmp_path, monkeypatch):
+    root = prepared_comparison(tmp_path, monkeypatch)
+    receipt = comparison.launcher.read_json(None)
+    receipt["fixture_variant"] = "standalone"
+    calls = []
+    def reconstruct(source, script, *, standalone=False):
+        assert source == tmp_path / "capsule/tree"
+        assert script == root / "input" / comparison.launcher.SCRIPT_NAME
+        assert standalone is True
+        calls.append(script)
+        return {"exact_reconstructed_input": True}
+    monkeypatch.setattr(comparison, "reconstruct_inputs", reconstruct)
+    monkeypatch.setattr(comparison, "compare_fixture", lambda *args, **kwargs: {"comparison": "PASS"})
+    result = comparison.compare(tmp_path, root)
+    assert len(calls) == 1
+    assert result["fixture_variant"] == "standalone"
+    assert result["standalone_input_nonmagnetic"] is True
+    assert result["physics_qualified"] is False
+
+
+def test_unknown_variant_cannot_reconstruct_or_report_success(tmp_path, monkeypatch):
+    root = prepared_comparison(tmp_path, monkeypatch)
+    comparison.launcher.read_json(None)["fixture_variant"] = "other"
+    monkeypatch.setattr(comparison, "reconstruct_inputs", lambda *args: pytest.fail("no input"))
+    with pytest.raises(ValueError, match="variant"):
+        comparison.compare(tmp_path, root)
 
 
 def test_oracle_mismatch_is_not_success(tmp_path, monkeypatch):

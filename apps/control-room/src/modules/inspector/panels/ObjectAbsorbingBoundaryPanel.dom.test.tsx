@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   installSimulationPreparationTestDom,
   TestElement,
+  TestEvent,
   TestNode,
 } from "@/kernel/layout/simulationPreparationTestDom.test-support";
 
@@ -14,11 +15,17 @@ const mocks = vi.hoisted(() => ({
   patchObject: vi.fn(),
   readScene: vi.fn(),
   recordHistory: vi.fn(),
-  sceneData: { objects: [{ id: "object-a" }], revision: 10 },
+  sceneData: {
+    objects: [] as Array<{ id: string; absorbing_boundary?: unknown }>,
+    revision: 10,
+  },
 }));
 
-vi.mock("@/kernel/KernelContext", () => ({
-  useKernel: () => ({
+vi.mock("@/kernel/KernelContext", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/kernel/KernelContext")>();
+  return {
+    ...actual,
+    useKernel: () => ({
     api: {
       model: {
         patchObject: mocks.patchObject,
@@ -32,7 +39,8 @@ vi.mock("@/kernel/KernelContext", () => ({
     commands: { getSessionScopeKey: mocks.getSessionScopeKey },
     resources: { invalidate: mocks.invalidate },
   }),
-}));
+  };
+});
 
 vi.mock("@/kernel/resources/geometryLifecycleResources", async (importOriginal) => {
   const original = await importOriginal<
@@ -145,6 +153,85 @@ describe("ObjectAbsorbingBoundaryPanel session fence", () => {
     }
   });
 
+  it("keeps edits made during a pending write after acknowledging its submitted draft", async () => {
+    let finishPatch: ((value: unknown) => void) | null = null;
+    const patchResult = new Promise((resolve) => {
+      finishPatch = resolve;
+    });
+    mocks.patchObject.mockReturnValue(patchResult);
+    mocks.sceneData = {
+      objects: [{
+        id: "object-a",
+        absorbing_boundary: {
+          total_width_m: 4e-7,
+          ramp_width_m: 3e-7,
+          max_damping: 0.5,
+          faces: ["x+"],
+          profile: "smootherstep",
+          frame: "universe",
+        },
+      }],
+      revision: 10,
+    };
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <ObjectAbsorbingBoundaryPanel objectId="object-a" baseRevision={10} />,
+      ));
+      const totalWidth = findControl(container, "Total width");
+      totalWidth.value = "5e-7";
+      await act(async () => totalWidth.dispatchEvent(new TestEvent("input", { bubbles: true })));
+      await act(async () => {
+        findButton(container, "Apply boundary").click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(mocks.patchObject).toHaveBeenCalledWith(
+        "object-a",
+        expect.objectContaining({
+          absorbing_boundary: expect.objectContaining({ total_width_m: 5e-7 }),
+        }),
+        expect.any(Object),
+      );
+      const rampWidth = findControl(container, "Ramp width");
+      rampWidth.value = "2e-7";
+      await act(async () => rampWidth.dispatchEvent(new TestEvent("input", { bubbles: true })));
+
+      await act(async () => {
+        finishPatch?.({
+          committed_scene: {
+            objects: [{
+              id: "object-a",
+              absorbing_boundary: {
+                total_width_m: 5e-7,
+                ramp_width_m: 3e-7,
+                max_damping: 0.5,
+                faces: ["x+"],
+                profile: "smootherstep",
+                frame: "universe",
+              },
+            }],
+            revision: 11,
+            scene_revision: 11,
+          },
+          revision: 11,
+          scene_revision: 11,
+        });
+        await patchResult;
+      });
+
+      expect(findControl(container, "Total width").value).toBe("5e-7");
+      expect(findControl(container, "Ramp width").value).toBe("2e-7");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
   it("fails closed until the active session identity is available", async () => {
     mocks.getSessionScopeKey.mockReturnValue(null);
     const dom = installSimulationPreparationTestDom();
@@ -172,6 +259,15 @@ function findButton(root: TestNode, text: string): TestElement {
     element.tagName === "BUTTON" && element.textContent.includes(text))[0];
   if (!button) throw new Error(`Missing button ${text}`);
   return button;
+}
+
+function findControl(root: TestNode, label: string): TestElement {
+  const control = findElements(
+    root,
+    (element) => element.getAttribute("aria-label") === label,
+  )[0];
+  if (!control) throw new Error(`Missing control ${label}`);
+  return control;
 }
 
 function findElements(

@@ -139,6 +139,13 @@ export function buildObjectExplorerNode(
           objectRole: "antenna",
           status: "ready",
           contextCommands: ["workspace.focus-selection"],
+          children: [
+            visualizationDebugNode({
+              kind: "object.visualization.debug",
+              objectId,
+              parentId: `${parentId}:visualization`,
+            }),
+          ],
         },
         ...physicsGraphObjectChildren(object, physicsGraph, resources.currentTransports),
       ],
@@ -287,13 +294,13 @@ function antennaCompositionNodes(
       contextCommands: ["workspace.focus-selection"],
     },
     ...portModes.map((mode) => {
-      const status = antennaPortStatus(mode);
+      const status = antennaPortStatus(mode, scene ?? null);
       return {
         id: `${antennaParentId}:port:${encodeURIComponent(mode.id)}`,
         kind: "object.antenna.port" as const,
         label: `Port ${mode.id}`,
         parentId: antennaParentId,
-        badge: `${mode.branches.length} branches${status === "ready" ? "" : " · invalid"}`,
+        badge: `${mode.branches.length} branches${status === "ready" ? " · authoring" : " · invalid"}`,
         icon: "activity" as const,
         objectId,
         objectRole: "antenna" as const,
@@ -317,7 +324,10 @@ function antennaCompositionNodes(
         antennaResourceId: stage.id,
         antennaResourceKind: "solution" as const,
         status: "warning" as const,
-        contextCommands: ["workspace.focus-selection"],
+        contextCommands: ["study.add-antenna-field-solve-stage", "workspace.focus-selection"],
+        contextCommandInputs: {
+          "study.add-antenna-field-solve-stage": { objectId, stageId: stage.id },
+        },
       };
     }),
     ...projections.map((projection) => ({

@@ -169,14 +169,91 @@ może zatrzymać lease przy niejednoznacznym efekcie. Ledger utrwala bounded,
 content-addressed proof przed zmianą stanu na Released; każdy odczyt tego
 stanu sprawdza proof. Brak lub corruption blokuje ponowne użycie capacity.
 
-Moduł nie jest jeszcze połączony ze schedulerem/preparation ani physical
-inventory/config. Preparation ma własny typed owner z process attempt ID,
+Ledger ma źródłowe połączenie ze schedulerem, preparation i przypiętą
+konfiguracją; physical inventory/lifecycle i runtime odbiór są nadal otwarte.
+Preparation ma własny typed owner z process attempt ID,
 bez fikcyjnego solver ownership epoch. Common identity zawiera local resource
 ID, a request digest uniemożliwia podmianę oferty przy replay. Runtime-control
 tworzy request z exact claimu i jawnego placement; nie wyprowadza physical
 UUID z etykiety. Wariant dispatch z host ledger zatrzymuje odmowę przed
-Prepare/Start, lecz usługa wymaga jeszcze podłączenia konfiguracji.
+Prepare/Start; start usługi v2 pozostaje zablokowany przez niezamknięte bramki.
 Nie podnosimy cap=1,
 nie zmieniamy aktywnych leases i nie deklarujemy E2 ukończonego. Dopiero
 integracja wszystkich ścieżek admission/release oraz test dwóch store'ów
 z recovery/fencing mogą otworzyć równoległe wykonanie.
+
+RuntimeServiceConfig v2 przypina explicit host policy/root, role-specific
+concurrency i exact placement maps. V1 zachowuje format, cap=1 i trwałe reuse;
+migracja nie następuje przy discovery lub odczycie APPLICATION.json.
+HostRuntimeAdmission porównuje pełny config digest/store/pool/role/cap
+i otwiera już istniejący ledger bez fallbacku lub initialization. Service
+przekazuje binding do schedulerów; start v2 jest jawnie odrzucany do odbioru
+pełnego recovery, owner/policy lifecycle, topology i runtime.
+
+### Właściciel próbki inventory na wspólnym hoście
+
+`RuntimeServiceOwner` pozostaje właścicielem jednego `SessionStore` i jego
+schedulerów. Własność próbkowania fizycznego hosta należy do osobnego,
+wyłącznego `HostInventoryOwner` zakotwiczonego we wspólnym root `HostResourceLedger`.
+Wiele usług store'owych może korzystać z tej samej próbki i ledgeru; tylko
+proces z hostowym lease'em publikuje snapshot. Per-store lock nie może być
+traktowany jako wyłączna własność hosta.
+
+Host inventory owner ma trwałą, stabilną tożsamość oraz własną monotoniczną
+`host_owner_epoch`, odrębną od `HostResourceLedgerPolicy.owner_epoch` (fence
+przypiętej polityki). W następnej wersji snapshot i każdy request admission są
+przypięte do bieżącej epoki host ownera. Publikacja weryfikuje lease i epokę pod
+blokadą writera host ledgeru. Przejęcie po kontrolowanym recovery inkrementuje
+epokę; restart jednego `SessionStore` jej nie zmienia, jeśli inny store nadal
+trzyma lease hosta. Format v1 zachowuje swoje dotychczasowe pola i znaczenie.
+
+Po przejęciu poprzedni snapshot nie staje się bieżący nawet wtedy, gdy ma mniej
+niż 30 sekund. Admission dla wszystkich store'ów czeka na pierwszą poprawną
+próbkę nowej epoki. Rezerwacje z poprzedniej epoki pozostają zajęte lub
+quarantined do exact reconciliation/release; samo przejęcie lease'a i wiek
+heartbeat nie zwalniają zasobów. Ten kontrakt wymaga wersjonowania snapshotu
+oraz odrębnych testów dwóch store'ów, właściciela inventory, awarii pierwszej
+próbki i recovery przed odblokowaniem admission.
+
+Try admission rozróżnia typed capacity contention nowego candidate od
+corruption/fencing/unknown publication. Tylko contention przed publikacją
+pozostawia task queued bez local claim i Prepare/Start. Nie wyprowadzamy
+tego wyniku z tekstu dowolnego błędu lub wieku heartbeat.
+
+Solver lease przechowuje optional `host_launch_binding.v1` jako część trwałej
+tożsamości. Supervisor trwale zużywa launch gate Pending→Consumed przed spawn,
+a worker weryfikuje matching permit z durable lease, niezależnie od argv.
+Stare rekordy hosta bez gate nie są migrowane do Pending automatycznie.
+
+No-spawn release jest odrębnym typem proof: wymaga gate trwale Closed pod
+host→store lock i exact Released local lease. Closed może powstać wyłącznie
+z niewykorzystanego Pending, a nie z Consumed na podstawie PID/heartbeat.
+Proof jest publikowany przed host Released i walidowany przy każdym odczycie.
+Awaria po local release jest uzgadniana przez scheduler przed kolejną ofertą.
+Partial admission bez local lease, awaria między consume i spawn, protokół
+preparation oraz owner lifecycle nadal wymagają pełnego odbioru E2.
+
+
+Rollback przed lokalnym admission wymaga oddzielnego AdmissionAbsent proof,
+wydanego pod host→store locks z exact queued/unclaimed task epoch, bez local
+lease, admission i journalu próby. Nie jest oparty na wieku/PID ani samym braku
+pliku. Taki rollback nie zużywa solver epoch; exact identity i attempt pozostają
+trwale zabronione do reuse, a nowa próba może użyć następnej epoki niezmienionego
+tasku. Jest to wąski wyjątek od monotoniczności rezerwacji, uzasadniony brakiem
+ustanowionego claimu. Runtime i fault-injection odbiór tej ścieżki są oddzielne.
+
+Preparation ma oddzielną launch gate, lecz wspólny typ bindingu host policy/root.
+Supervisor trwale zużywa jednorazowy permit przed utworzeniem procesu; preparer
+weryfikuje go z durable lease przed native preparation. Stare bramki nie są
+automatycznie migrowane, a no-spawn i Consumed recovery nadal wymagają odbioru.
+
+
+Żądanie anulowania przed claimem zapisujemy jako osobny immutable intent
+ze snapshotem i expected catalog revision, bez fikcyjnego solver attempt lub
+WorkerCommand. NEW admission i Pending→Consumed launch sprawdzają intent
+pod właściwymi writer locks; exact wcześniej opublikowany admission pozostaje
+naprawialny. Właścicielem zastosowania żądania jest scheduler/host gate protocol,
+a samo requested nie potwierdza zakończenia ani nie zwalnia capacity.
+Wire contract zachowuje dotychczasowy Stop dla rzeczywistego claimu; nowa gałąź
+pre-claim wymaga odrębnego wyniku i odbioru API/OpenAPI/UI. Reguły i aktualne
+ograniczenia określa sekcja 13.28 specyfikacji; pełna integracja jest w toku.

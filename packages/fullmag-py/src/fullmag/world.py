@@ -116,14 +116,14 @@ from fullmag.model.dynamics import (
     FieldRefreshPolicy,
     LLG,
 )
-from fullmag.model.outputs import SaveField, SaveScalar, SaveSpectrum, SaveMode, SaveDispersion, SaveResponse, Snapshot, parse_snapshot_quantity
+from fullmag.model.outputs import SaveEigenDiagnostics, SaveField, SaveScalar, SaveSpectrum, SaveMode, SaveDispersion, SaveResponse, Snapshot, parse_snapshot_quantity
 from fullmag.model.planar_monitor import (
     PlanarMonitor,
     StudyMonitorRegistry,
 )
 from fullmag.model.output_storage import OutputStorage
 from fullmag.model.compute_resources import ComputeResources
-from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer
+from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer, _parallel_execution_lane
 from fullmag.model.study import (
     FieldOnly,
     DEFAULT_RELAXATION_TORQUE_TOLERANCE_T,
@@ -137,6 +137,7 @@ from fullmag.model.study import (
     MeasurementAxis,
     MinorLoop,
     PiecewiseFieldSchedule,
+    FemEigenSolverPolicy,
     FrequencyResponseSolverPolicy,
     GammaResponseAnalysis,
     FiniteKResponseAnalysis,
@@ -148,6 +149,7 @@ from fullmag.model.study import (
     StageAutosave,
     TableAutosave,
     TimeEvolution,
+    AntennaFieldSolve,
     DEFAULT_RELAXATION_MAX_STEPS,
     DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM,
 )
@@ -167,6 +169,7 @@ from fullmag.model.problem import (
     ExecutionMode,
     ExecutionPrecision,
     FdmPbc,
+    ParallelExecutionPolicy,
     Problem,
     resolve_geometry_sources,
     RuntimeSelection,
@@ -2517,6 +2520,7 @@ class _WorldState:
     _precision: str | None = None
     _execution_mode: str | None = None
     _cpu_threads: int | None = None
+    _parallel_execution: ParallelExecutionPolicy | None = None
     _boundary_correction: str | None = None  # "none" | "volume" | "full"
 
     # Grid
@@ -2837,6 +2841,7 @@ class EigenmodesStageSpec:
     bias_field_sweep: BiasFieldSweep | None = None
     bc: str | dict[str, object] = "free"
     magnetostatic_bc: str = "open"
+    solver_policy: FemEigenSolverPolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3266,7 +3271,15 @@ def eigenmodes_stage(
     bias_field_sweep: BiasFieldSweep | None = None,
     bc: str | dict[str, object] = "free",
     magnetostatic_bc: str = "open",
+    solver_rtol: float | None = None,
+    solver_max_outer_iterations: int | None = None,
+    solver_max_linear_iterations: int | None = None,
 ) -> EigenmodesStageSpec:
+    solver_policy = _fem_eigen_solver_policy(
+        solver_rtol=solver_rtol,
+        solver_max_outer_iterations=solver_max_outer_iterations,
+        solver_max_linear_iterations=solver_max_linear_iterations,
+    )
     return EigenmodesStageSpec(
         count=count,
         target=target,
@@ -3284,6 +3297,7 @@ def eigenmodes_stage(
         bias_field_sweep=bias_field_sweep,
         bc=bc,
         magnetostatic_bc=magnetostatic_bc,
+        solver_policy=solver_policy,
     )
 
 
@@ -3367,6 +3381,25 @@ def _frequency_response_solver_policy(
     )
 
 
+def _fem_eigen_solver_policy(
+    *,
+    solver_rtol: float | None,
+    solver_max_outer_iterations: int | None,
+    solver_max_linear_iterations: int | None,
+) -> FemEigenSolverPolicy | None:
+    if (
+        solver_rtol is None
+        and solver_max_outer_iterations is None
+        and solver_max_linear_iterations is None
+    ):
+        return None
+    return FemEigenSolverPolicy(
+        residual_tolerance=solver_rtol,
+        max_outer_iterations=solver_max_outer_iterations,
+        max_linear_iterations=solver_max_linear_iterations,
+    )
+
+
 def save_state_stage(
     *,
     artifact_name: str = "state_snapshot",
@@ -3442,7 +3475,7 @@ def _capture_stage(stage_spec: object) -> CapturedStage:
             default_until_seconds=None,
         )
     if isinstance(stage_spec, RunStageSpec):
-        problem = _build_problem()
+        problem = _build_problem(study_kind="time_evolution")
         if not isinstance(problem.study, TimeEvolution):
             raise TypeError("run stage requires a time-evolution study")
         return CapturedStage(
@@ -3470,6 +3503,7 @@ def _capture_stage(stage_spec: object) -> CapturedStage:
                 eigen_bias_field_sweep=stage_spec.bias_field_sweep,
                 eigen_spin_wave_bc=stage_spec.bc,
                 eigen_magnetostatic_bc=stage_spec.magnetostatic_bc,
+                eigen_solver_policy=stage_spec.solver_policy,
             ),
             entrypoint_kind="flat_eigenmodes",
             default_until_seconds=None,
@@ -3909,7 +3943,13 @@ def capture_executed_stages() -> list[CapturedStage]:
 
 def capture_workspace_problem() -> Problem | None:
     """Materialize the current flat-script world without requiring run()/relax()."""
-    if not _capture_binding.current().enabled or not (_state._magnets or _state._auxiliary_geometries):
+    has_antenna_stage = bool(
+        _state._declared_stages
+        and _state._declared_stages[-1].entrypoint_kind == "flat_antenna_field_solve"
+    )
+    if not _capture_binding.current().enabled or not (
+        _state._magnets or _state._auxiliary_geometries or has_antenna_stage
+    ):
         return None
     previous_interactive = _state._interactive
     _state._interactive = True
@@ -4364,7 +4404,15 @@ class StudyStagesBuilder:
             raise ValueError(
                 "antenna field solve requires exactly one H_ant_basis output"
             )
-        problem_before_action = _build_problem()
+        closed_loop = any(
+            module.name == normalized_definition.current_transport_id
+            and module.structured_current_closure is not None
+            and module.structured_current_closure.schema_version == "structured_current_closure.v2"
+            for module in _state._current_modules
+        )
+        problem_before_action = _build_problem(
+            study_kind="time_evolution" if closed_loop else "antenna_field_solve"
+        )
         _state._antenna_field_solve_stages.append(normalized_definition)
         _state._declared_stages.append(
             CapturedStage(
@@ -4632,6 +4680,7 @@ class StudyStagesBuilder:
     def add_eigenmodes(
         self,
         *,
+        stage_id: str | None = None,
         count: int = 10,
         target: str = "lowest",
         target_frequency: float | None = None,
@@ -4648,6 +4697,9 @@ class StudyStagesBuilder:
         bias_field_sweep: BiasFieldSweep | None = None,
         bc: str | dict[str, object] = "free",
         magnetostatic_bc: str = "open",
+        solver_rtol: float | None = None,
+        solver_max_outer_iterations: int | None = None,
+        solver_max_linear_iterations: int | None = None,
     ) -> "StudyStagesBuilder":
         return self.add_stage(
             eigenmodes_stage(
@@ -4667,7 +4719,12 @@ class StudyStagesBuilder:
                 bias_field_sweep=bias_field_sweep,
                 bc=bc,
                 magnetostatic_bc=magnetostatic_bc,
-            )
+                solver_rtol=solver_rtol,
+                solver_max_outer_iterations=solver_max_outer_iterations,
+                solver_max_linear_iterations=solver_max_linear_iterations,
+            ),
+            stage_id=stage_id,
+            id_kind="eigenmodes",
         )
 
     def add_frequency_response(
@@ -6117,6 +6174,14 @@ class StudyBuilder:
         _record_legacy_execution_selection("resources")
         return self
 
+    def parallel_execution(
+        self,
+        policy: ParallelExecutionPolicy | Mapping[str, object] | None = None,
+        **kwargs: object,
+    ) -> "StudyBuilder":
+        parallel_execution(policy, **kwargs)
+        return self
+
     def storage(
         self,
         output_storage: OutputStorage | None = None,
@@ -6466,8 +6531,40 @@ class StudyBuilder:
         *,
         every: SamplingPeriod | None = None,
         indices: Sequence[int] | None = None,
+        branches: Sequence[int] | None = None,
+        all_modes: bool = False,
+        sample_indices: Sequence[int] | None = None,
+        sample_labels: Sequence[str] | None = None,
+        field: str = "mode",
+        name: str = "dispersion",
+        include_branch_table: bool = True,
+        spectrum_quantity: str = "eigenfrequency",
+        spectrum_scope: str = "per_sample",
+        include_tracking: bool = True,
+        include_residuals: bool = True,
+        include_overlaps: bool = True,
+        include_tangent_leakage: bool = True,
+        include_orthogonality: bool = True,
     ) -> "StudyBuilder":
-        save(quantity, every=every, indices=indices)
+        save(
+            quantity,
+            every=every,
+            indices=indices,
+            branches=branches,
+            all_modes=all_modes,
+            sample_indices=sample_indices,
+            sample_labels=sample_labels,
+            field=field,
+            name=name,
+            include_branch_table=include_branch_table,
+            spectrum_quantity=spectrum_quantity,
+            spectrum_scope=spectrum_scope,
+            include_tracking=include_tracking,
+            include_residuals=include_residuals,
+            include_overlaps=include_overlaps,
+            include_tangent_leakage=include_tangent_leakage,
+            include_orthogonality=include_orthogonality,
+        )
         return self
 
     def save_response(self, observable: str = "susceptibility_tensor") -> "StudyBuilder":
@@ -7009,6 +7106,26 @@ def threads(cpu_threads: int) -> None:
         raise ValueError("threads() requires cpu_threads >= 1")
     _state._cpu_threads = resolved
     _record_legacy_execution_selection("threads")
+
+
+def parallel_execution(
+    policy: ParallelExecutionPolicy | Mapping[str, object] | None = None,
+    **kwargs: object,
+) -> ParallelExecutionPolicy:
+    """Set the policy for admitting independent work items.
+
+    ``policy`` may be a :class:`ParallelExecutionPolicy` or an IR-shaped
+    mapping.  Keyword arguments are a convenience for generated scripts.
+    The policy controls admission targets; it does not replace the native
+    runtime's process/thread limits.
+    """
+    if policy is not None and kwargs:
+        raise TypeError("parallel_execution accepts either policy or keyword fields")
+    candidate: ParallelExecutionPolicy | Mapping[str, object]
+    candidate = kwargs if policy is None else policy
+    resolved = ParallelExecutionPolicy.from_ir(candidate)
+    _state._parallel_execution = resolved
+    return resolved
 
 
 def fem_demag_solver(
@@ -9030,7 +9147,7 @@ _SCALAR_QUANTITIES = {
     "max_dm_dt",
     "max_h_demag",
 }
-_EIGEN_QUANTITIES = {"spectrum", "mode", "dispersion"}
+_EIGEN_QUANTITIES = {"spectrum", "mode", "dispersion", "diagnostics"}
 
 
 def save(
@@ -9038,6 +9155,20 @@ def save(
     *,
     every: SamplingPeriod | None = None,
     indices: Sequence[int] | None = None,
+    branches: Sequence[int] | None = None,
+    all_modes: bool = False,
+    sample_indices: Sequence[int] | None = None,
+    sample_labels: Sequence[str] | None = None,
+    field: str = "mode",
+    name: str = "dispersion",
+    include_branch_table: bool = True,
+    spectrum_quantity: str = "eigenfrequency",
+    spectrum_scope: str = "per_sample",
+    include_tracking: bool = True,
+    include_residuals: bool = True,
+    include_overlaps: bool = True,
+    include_tangent_leakage: bool = True,
+    include_orthogonality: bool = True,
 ) -> None:
     """Register an output quantity to save periodically.
 
@@ -9046,23 +9177,67 @@ def save(
     quantity : str
         Field name (``"m"``, ``"H_demag"``, ``"H_eff"``),
         scalar name (``"E_ex"``, ``"E_total"``, ``"max_h_eff"``),
-        or eigen quantity (``"spectrum"``, ``"mode"``, ``"dispersion"``).
+        or eigen quantity (``"spectrum"``, ``"mode"``, ``"dispersion"``,
+        ``"diagnostics"``).
     every : float or "auto", optional
         Save interval in seconds, or automatic sampling derived from an active
         sinc drive. Required for field/scalar outputs, ignored for eigen outputs.
-    indices : sequence of int, optional
-        Mode indices for ``"mode"`` output.
+    indices, branches : sequence of int, optional
+        Raw mode indices or tracked branch indices for ``"mode"`` output.
+    all_modes : bool, optional
+        Save every returned solver mode at selected samples. Cannot be
+        combined with indices or branches; does not request extra eigenpairs.
+    sample_indices, sample_labels : sequence, optional
+        Optional sample selectors for ``"mode"`` output.
     """
+    if type(all_modes) is not bool:
+        raise ValueError("all_modes must be a boolean")
+    if all_modes and quantity != "mode":
+        raise ValueError("all_modes applies only to mode output")
+    if quantity == "spectrum":
+        output = SaveSpectrum(quantity=spectrum_quantity, scope=spectrum_scope)
+        _state._outputs_explicit = True
+        _state._outputs.append(output)
+        return
+    if quantity == "diagnostics":
+        output = SaveEigenDiagnostics(
+            include_tracking=include_tracking,
+            include_residuals=include_residuals,
+            include_overlaps=include_overlaps,
+            include_tangent_leakage=include_tangent_leakage,
+            include_orthogonality=include_orthogonality,
+        )
+        _state._outputs_explicit = True
+        _state._outputs.append(output)
+        return
     _state._outputs_explicit = True
     if quantity in _EIGEN_QUANTITIES:
-        if quantity == "spectrum":
-            _state._outputs.append(SaveSpectrum())
-        elif quantity == "mode":
-            if indices is None:
-                raise ValueError("save('mode', indices=[...]) requires mode indices")
-            _state._outputs.append(SaveMode(indices=tuple(indices)))
+        if quantity == "mode":
+            _state._outputs.append(
+                SaveMode(
+                    field=field,
+                    indices=(
+                        tuple(indices) if indices is not None else ()
+                    ),
+                    branches=(
+                        tuple(branches) if branches is not None else ()
+                    ),
+                    all_modes=all_modes,
+                    sample_indices=(
+                        tuple(sample_indices) if sample_indices is not None else ()
+                    ),
+                    sample_labels=(
+                        tuple(sample_labels) if sample_labels is not None else ()
+                    ),
+                )
+            )
         elif quantity == "dispersion":
-            _state._outputs.append(SaveDispersion())
+            _state._outputs.append(
+                SaveDispersion(
+                    name=name,
+                    include_branch_table=include_branch_table,
+                )
+            )
         return
     if every is None:
         raise ValueError("save() requires every= for field/scalar outputs")
@@ -9356,7 +9531,7 @@ def _build_relax_llg_dynamics(
 
 def _build_problem(
     *,
-    study_kind: str = "time_evolution",
+    study_kind: str | None = None,
     relax_algorithm: str = "llg_overdamped",
     relax_torque_tolerance: float = DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM,
     relax_torque_tolerance_unit: str = "T",
@@ -9383,6 +9558,7 @@ def _build_problem(
     eigen_bias_field_sweep: BiasFieldSweep | None = None,
     eigen_spin_wave_bc: str | dict[str, object] = "free",
     eigen_magnetostatic_bc: str = "open",
+    eigen_solver_policy: FemEigenSolverPolicy | None = None,
     frequency_frequencies_hz: Sequence[float] = (1.0e9,),
     frequency_excitation_field_au_per_m: tuple[float, float, float] = (0.0, 0.0, 1.0),
     frequency_excitation_phase_rad: float = 0.0,
@@ -9402,11 +9578,20 @@ def _build_problem(
     """Construct a Problem from the current world state."""
     s = _state
 
+    if study_kind is None:
+        study_kind = "time_evolution"
+        if s._declared_stages and s._declared_stages[-1].entrypoint_kind == "flat_antenna_field_solve":
+            previous_study = s._declared_stages[-1].problem.study
+            if isinstance(previous_study, AntennaFieldSolve):
+                study_kind = "antenna_field_solve"
+            elif isinstance(previous_study, FieldOnly) and not s._magnets:
+                study_kind = "field_only"
+
     _validate_current_compute_resources_runtime_intent()
 
     # ── Validate ──
-    field_only = not s._magnets and study_kind == "time_evolution"
-    if not s._magnets and not (field_only and s._auxiliary_geometries):
+    field_only = study_kind == "field_only" or (not s._magnets and study_kind == "time_evolution")
+    if not s._magnets and study_kind != "antenna_field_solve" and not (field_only and s._auxiliary_geometries):
         raise ValueError("No magnets defined — call fm.geometry(...) first")
 
     # Convert handles to Ferromagnet objects
@@ -9415,9 +9600,9 @@ def _build_problem(
     # Energy terms default to Exchange + Demag, but UI/Python authoring may
     # explicitly remove either contribution from H_eff.
     energy: list = []
-    if s._exchange_enabled and not field_only:
+    if s._magnets and s._exchange_enabled:
         energy.append(Exchange())
-    if s._demag_enabled and not field_only:
+    if s._magnets and s._demag_enabled:
         energy.append(Demag(realization=s._demag_realization))
     # Check if any magnet has DMI
     for h in s._magnets:
@@ -9461,7 +9646,7 @@ def _build_problem(
         llg_kwargs["field_refresh"] = FieldRefreshPolicy(
             demag_interval_s=s._demag_interval_s
         )
-    dynamics = LLG(**llg_kwargs)
+    dynamics = None if field_only or study_kind == "antenna_field_solve" else LLG(**llg_kwargs)
 
     # Discretization
     disc_kwargs: dict[str, Any] = {}
@@ -9528,6 +9713,14 @@ def _build_problem(
         rt = rt.mode(s._execution_mode)
     if s._cpu_threads is not None:
         rt = rt.threads(s._cpu_threads)
+    if s._parallel_execution is not None:
+        if s._parallel_execution.mode == "adaptive" and "execution_profile" in s._extra_runtime_metadata:
+            backend, device = _parallel_execution_lane(s._extra_runtime_metadata, rt.backend_target, rt.device_target)
+            s._parallel_execution.validate_for_runtime(backend, device)
+            # Capture the declared concrete lane without changing live state or
+            # minting a materialization; Rust still replays all profile/layers.
+            rt = rt.engine(backend).cpu()
+        rt = rt.with_parallel_execution(s._parallel_execution)
 
     runtime_metadata: dict[str, Any] = {"interactive_session_requested": s._interactive}
     runtime_metadata["script_api_surface"] = s._api_surface
@@ -9551,7 +9744,7 @@ def _build_problem(
     runtime_metadata.update(copy.deepcopy(s._extra_runtime_metadata))
 
     # Partition outputs by study family.
-    _EIGEN_OUTPUT_TYPES = (SaveSpectrum, SaveMode, SaveDispersion)
+    _EIGEN_OUTPUT_TYPES = (SaveSpectrum, SaveMode, SaveDispersion, SaveEigenDiagnostics)
     _RESPONSE_OUTPUT_TYPES = (SaveResponse,)
     eigen_outputs = [o for o in outputs if isinstance(o, _EIGEN_OUTPUT_TYPES)]
     response_outputs = [o for o in outputs if isinstance(o, _RESPONSE_OUTPUT_TYPES)]
@@ -9609,6 +9802,7 @@ def _build_problem(
             k_sampling=eigen_k_sampling,
             k_vector=eigen_k_vector,
             bias_field_sweep=eigen_bias_field_sweep,
+            solver_policy=eigen_solver_policy,
             dynamics=dynamics,
         )
     elif study_kind == "frequency_response":
@@ -9632,6 +9826,8 @@ def _build_problem(
             k_vector=frequency_k_vector,
             dynamics=dynamics,
         )
+    elif study_kind == "antenna_field_solve":
+        study = AntennaFieldSolve()
     elif study_kind == "hysteresis":
         study = hysteresis_spec
     else:
@@ -9696,7 +9892,7 @@ def run(until: float) -> Any:
     if until <= 0.0:
         raise ValueError("run(until) requires a positive stop time")
     from fullmag.runtime import Simulation
-    problem = _build_problem()
+    problem = _build_problem(study_kind="time_evolution")
     if _capture_binding.current().enabled:
         _capture_binding.current().stages.append(
             CapturedStage(

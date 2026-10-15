@@ -75,6 +75,81 @@ def run_helper(arguments: list[str]) -> tuple[int, dict[str, object]]:
 
 
 class SceneRenderIncompleteChecks(unittest.TestCase):
+    def test_cli_reports_confirmed_incomplete_physics_without_touching_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            scene = self.write_scene(directory, interaction_enabled=False)
+            output = directory / "existing.py"
+            output.write_bytes(b"preserved managed source\n")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = helper._run_cli(self.render_arguments(scene, output, allow_incomplete=False))
+            self.assertEqual(status, 2)
+            self.assertEqual(json.loads(stdout.getvalue()), {
+                "schema": "fullmag.scene-render-rejection.v1", "code": "incomplete_physics",
+            })
+            self.assertEqual(output.read_bytes(), b"preserved managed source\n")
+            self.assertEqual(sorted(path.name for path in directory.iterdir()), ["existing.py", "scene.json"])
+
+    def test_cli_does_not_reclassify_an_unknown_render_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            scene = self.write_scene(directory, interaction_enabled=False)
+            output = directory / "scene.py"
+            with patch.object(helper, "render_scene_document_as_script", side_effect=ValueError("unknown render error")):
+                with self.assertRaisesRegex(ValueError, "unknown render error"):
+                    helper._run_cli(self.render_arguments(scene, output, allow_incomplete=False))
+            self.assertFalse(output.exists())
+
+    def test_cli_preserves_incomplete_persistence_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            scene = self.write_scene(directory, interaction_enabled=False)
+            output = directory / "scene.py"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = helper._run_cli(self.render_arguments(scene, output, allow_incomplete=True))
+            self.assertEqual(status, 0)
+            self.assertIs(json.loads(stdout.getvalue())["written"], False)
+            self.assertFalse(output.exists())
+
+    def test_explicit_object_anisotropy_is_executable_without_global_interactions(self) -> None:
+        from fullmag.runtime.loader import load_problem_from_script
+
+        scene = scene_document(interaction_enabled=False)
+        scene["objects"][0]["physics_stack"] = [
+            {"kind": "uniaxial_anisotropy", "enabled": True,
+             "params": {"ku1": 1000.0, "axis": [0.0, 0.0, 1.0]}}
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / "scene.json"
+            output = directory / "scene.py"
+            source.write_text(json.dumps(scene), encoding="utf-8")
+            status, payload = run_helper(self.render_arguments(source, output, allow_incomplete=False))
+            self.assertEqual(status, 0)
+            self.assertTrue(payload["written"])
+            loaded = load_problem_from_script(output, lightweight_assets=True)
+            material = loaded.problem.magnets[0].material
+            self.assertEqual(material.Ku1, 1000.0)
+            self.assertEqual(tuple(material.anisU), (0.0, 0.0, 1.0))
+            self.assertFalse(loaded.problem.energy)
+
+    def test_disabled_object_anisotropy_does_not_make_an_empty_model_executable(self) -> None:
+        scene = scene_document(interaction_enabled=False)
+        scene["objects"][0]["physics_stack"] = [
+            {"kind": "uniaxial_anisotropy", "enabled": False,
+             "params": {"ku1": 1000.0, "axis": [0.0, 0.0, 1.0]}}
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / "scene.json"
+            output = directory / "scene.py"
+            source.write_text(json.dumps(scene), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "interaction or material anisotropy"):
+                run_helper(self.render_arguments(source, output, allow_incomplete=False))
+            self.assertFalse(output.exists())
+
     def write_scene(self, directory: Path, *, interaction_enabled: bool) -> Path:
         scene_path = directory / "scene.json"
         scene_path.write_text(

@@ -31,6 +31,14 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
                 .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route(
+            "/v2/platform/compute/nodes",
+            get(handlers::platform::compute_nodes::get_compute_nodes),
+        )
+        .route(
+            "/v2/platform/compute/nodes/:node_id",
+            get(handlers::platform::compute_nodes::get_compute_node),
+        )
+        .route(
             "/v2/platform/compute/profiles",
             get(handlers::platform::compute_profiles::get_compute_profiles)
                 .post(handlers::platform::compute_profiles::post_compute_profile)
@@ -44,28 +52,6 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
         .route(
             "/v2/platform/runtime-service",
             get(handlers::platform::runtime_service::get_runtime_service),
-        )
-        .route(
-            "/v2/platform/development-backend",
-            get(handlers::platform::development_backend::get_development_backend),
-        )
-        .route(
-            "/v2/platform/development-backend/build-requests",
-            post(handlers::platform::development_backend_build_request::post_development_backend_build_request)
-                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
-        )
-        .route(
-            "/v2/platform/development-backend/build-requests/:request_id",
-            get(handlers::platform::development_backend_build_request::get_development_backend_build_request),
-        )
-        .route(
-            "/v2/platform/development-restart-requests",
-            post(handlers::platform::development_restart_request::post_development_restart_request)
-                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
-        )
-        .route(
-            "/v2/platform/development-restart-requests/:request_id",
-            get(handlers::platform::development_restart_request::get_development_restart_request),
         )
         .route("/v2", get(get_v2_index))
         .route("/v2/", get(get_v2_index))
@@ -131,6 +117,21 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
         .route(
             "/v2/sessions/current/model/planar-monitors/:monitor_id/duplicate",
             post(handlers::model::duplicate_planar_monitor),
+        )
+        .route(
+            "/v2/sessions/current/analysis/references/analytic-models",
+            get(handlers::analysis::list_analytic_reference_models),
+        )
+        .route(
+            "/v2/sessions/current/analysis/postprocessing/definitions",
+            get(handlers::analysis::list_postprocessing_definitions)
+                .post(handlers::analysis::create_postprocessing_definition),
+        )
+        .route(
+            "/v2/sessions/current/analysis/postprocessing/definitions/:definition_id",
+            get(handlers::analysis::get_postprocessing_definition)
+                .patch(handlers::analysis::patch_postprocessing_definition)
+                .delete(handlers::analysis::delete_postprocessing_definition),
         )
         .route(
             "/v2/sessions/current/model/frozen-spins",
@@ -1187,13 +1188,38 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
             post(handlers::persistence::script_project::from_script),
         )
         .route(
+            "/v2/persistence/projects/:project_id/run-intent",
+            post(handlers::persistence::projects::run_intent_preparation::prepare),
+        )
+        .route(
             "/v2/persistence/projects/:project_id/runs",
             get(handlers::persistence::projects::list_runs)
                 .post(handlers::persistence::projects::submit_run),
         )
         .route(
+            "/v2/persistence/projects/:project_id/batches",
+            get(handlers::persistence::projects::list_batches)
+                .post(handlers::persistence::projects::submit_batch),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/batches/:batch_id/cases",
+            get(handlers::persistence::projects::list_batch_cases),
+        )
+        .route(
             "/v2/persistence/projects/:project_id/runs/:run_id",
             get(handlers::persistence::projects::get_run),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/antenna-inspections/:step_id/payloads/:payload_kind",
+            get(handlers::data::accepted_antenna_payload::get_accepted_antenna_payload),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/antenna-inspections/:step_id",
+            get(handlers::data::accepted_antenna_resource::get_accepted_antenna_inspection),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/antenna-inspections",
+            get(handlers::data::accepted_antenna_resource::get_accepted_antenna_catalog),
         )
         .route(
             "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets/:solution_set_id/revisions/:revision",

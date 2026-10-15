@@ -14,6 +14,7 @@ import warnings
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -23,6 +24,7 @@ from fullmag._progress import (
     indeterminate_progress_phase,
 )
 from fullmag._validation import ensure_unique_names, require_non_empty
+from fullmag.cuda_device_identity import legacy_cuda_binding
 from fullmag.model._incomplete import IncompletePhysicsError
 from fullmag.init.textures import PresetTexture
 from fullmag.model.antenna import (
@@ -65,6 +67,7 @@ from fullmag.model.physics_scope import build_physics_graph
 from fullmag.model.parameters import ParameterLibrary
 from fullmag.model.outputs import (
     SaveDispersion,
+    SaveEigenDiagnostics,
     SaveField,
     SaveMode,
     SaveScalar,
@@ -79,7 +82,7 @@ from fullmag.model.structure import (
     ObjectRegion,
     Region,
 )
-from fullmag.model.study import Eigenmodes, FieldOnly, FrequencyResponse, Relaxation, TimeEvolution
+from fullmag.model.study import AntennaFieldSolve, Eigenmodes, FieldOnly, FrequencyResponse, Relaxation, TimeEvolution
 from fullmag.model.selection import SelectionDefinition
 
 IR_VERSION = "0.3.0"
@@ -92,10 +95,10 @@ _FEM_M2_OPERATOR_VERSION = "fem_charge_spin_conforming_h1_p1.reciprocal_m2.v1"
 # Keep the shared-domain cache namespace separate from the older per-object
 # ``.npz`` cache.  The version is part of the digest, so changing the cache
 # document or the generation contract cannot silently reuse an old artifact.
-# v8 invalidates artifacts made with the v7 source-face corner target.  The
-# mixed swept source is now uniformly targeted; reusing a v7 artifact would
-# silently retain the unnecessary corner refinement and its old topology.
-_FEM_MESH_CACHE_VERSION = "v8"
+# v8 invalidated v7 source-face corner targets. v9 invalidates meshes generated
+# with alias-shadowed per-geometry hmax policies; reusing them could retain a
+# neighboring geometry's size field after canonical owner binding changes.
+_FEM_MESH_CACHE_VERSION = "v9"
 _FEM_SHARED_DOMAIN_CACHE_SCHEMA = "fullmag.fem.shared-domain-cache.v1"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -701,9 +704,15 @@ def _fem_mesh_cache_key(
     study_universe: dict[str, object] | None = None,
     mesh_workflow: dict[str, object] | None = None,
     per_object_recipes: Mapping[str, PerObjectMeshRecipe] | None = None,
+    owner_geometry_names: Sequence[str] | None = None,
     object_id: str | None = None,
     _coincident_closure: object | None = None,
 ) -> str:
+    resolved_owner_geometry_names = sorted(
+        owner_geometry_names
+        if owner_geometry_names is not None
+        else (str(getattr(geometry, "geometry_name", "")),)
+    )
     payload = {
         "version": _FEM_MESH_CACHE_VERSION,
         "geometry": _geometry_cache_fingerprint(geometry),
@@ -711,6 +720,7 @@ def _fem_mesh_cache_key(
         "fem": hints.to_ir(),
         "study_universe": study_universe,
         "mesh_workflow": mesh_workflow,
+        "owner_geometry_names": resolved_owner_geometry_names,
         "per_object_recipes": {
             str(name): recipe.to_ir()
             for name, recipe in (per_object_recipes or {}).items()
@@ -1020,6 +1030,9 @@ def build_geometry_assets_for_request(
         )
 
         if not has_shared_domain_mesh_asset:
+            owner_geometry_names = tuple(
+                candidate.geometry_name for candidate in geometries
+            )
             for geometry in geometries:
                 imported_surface_only = (
                     discretization.fem.mesh is None
@@ -1062,6 +1075,7 @@ def build_geometry_assets_for_request(
                         study_universe=study_universe,
                         mesh_workflow=mesh_workflow,
                         per_object_recipes=per_object_recipes,
+                        owner_geometry_names=owner_geometry_names,
                         object_id=(geometry_object_ids or {}).get(geometry.geometry_name),
                         _coincident_closure=(_coincident_closures or {}).get(geometry.geometry_name),
                     )
@@ -1102,6 +1116,7 @@ def build_geometry_assets_for_request(
                             study_universe=study_universe,
                             mesh_workflow=mesh_workflow,
                             per_object_recipes=dict(per_object_recipes or {}),
+                            _owner_geometry_names=owner_geometry_names,
                             object_id=(geometry_object_ids or {}).get(geometry.geometry_name),
                             _coincident_closure=(_coincident_closures or {}).get(geometry.geometry_name),
                         )
@@ -1595,6 +1610,160 @@ class FdmPrecisionPolicy(str, Enum):
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ParallelExecutionPolicy:
+    """Authoring policy for admitting independent work items.
+
+    The CPU and memory percentages are soft admission targets inside the
+    effective process/container allocation.  They do not replace the native
+    runtime's hard resource limits or its existing Rayon pool.
+    """
+
+    mode: str = "serial"
+    max_cpu_percent: float = 90.0
+    max_memory_percent: float = 80.0
+    memory_reserve_bytes: int = 1_073_741_824
+    max_workers: int | None = None
+    threads_per_worker: int = 1
+
+    _U32_MAX = 4_294_967_295
+    _U64_MAX = 18_446_744_073_709_551_615
+
+    def __post_init__(self) -> None:
+        mode = str(self.mode).strip().lower()
+        if mode not in {"serial", "adaptive"}:
+            raise ValueError("parallel execution mode must be 'serial' or 'adaptive'")
+        object.__setattr__(self, "mode", mode)
+
+        if isinstance(self.max_cpu_percent, bool) or not isinstance(
+            self.max_cpu_percent, (int, float)
+        ):
+            raise ValueError("parallel_execution.max_cpu_percent must be numeric")
+        if isinstance(self.max_memory_percent, bool) or not isinstance(
+            self.max_memory_percent, (int, float)
+        ):
+            raise ValueError("parallel_execution.max_memory_percent must be numeric")
+        max_cpu_percent = float(self.max_cpu_percent)
+        max_memory_percent = float(self.max_memory_percent)
+        for name, value in (
+            ("max_cpu_percent", max_cpu_percent),
+            ("max_memory_percent", max_memory_percent),
+        ):
+            if not math.isfinite(value) or value <= 0.0 or value > 100.0:
+                raise ValueError(
+                    f"parallel_execution.{name} must be finite and in (0, 100]"
+                )
+        object.__setattr__(self, "max_cpu_percent", max_cpu_percent)
+        object.__setattr__(self, "max_memory_percent", max_memory_percent)
+
+        memory_reserve_bytes = self._integral_value(
+            self.memory_reserve_bytes,
+            "memory_reserve_bytes",
+            self._U64_MAX,
+        )
+        object.__setattr__(self, "memory_reserve_bytes", memory_reserve_bytes)
+
+        max_workers = None if self.max_workers is None else self._integral_value(
+            self.max_workers,
+            "max_workers",
+            self._U32_MAX,
+        )
+        if max_workers is not None and max_workers < 1:
+            raise ValueError("parallel_execution.max_workers must be >= 1")
+        object.__setattr__(self, "max_workers", max_workers)
+
+        threads_per_worker = self._integral_value(
+            self.threads_per_worker,
+            "threads_per_worker",
+            self._U32_MAX,
+        )
+        if threads_per_worker < 1:
+            raise ValueError("parallel_execution.threads_per_worker must be >= 1")
+        object.__setattr__(self, "threads_per_worker", threads_per_worker)
+
+    @staticmethod
+    def _integral_value(value: object, name: str, maximum: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"parallel_execution.{name} must be an integer")
+        if value < 0 or value > maximum:
+            raise ValueError(
+                f"parallel_execution.{name} must be in the range [0, {maximum}]"
+            )
+        return value
+
+    @classmethod
+    def from_ir(
+        cls,
+        value: "ParallelExecutionPolicy | Mapping[str, object] | None",
+    ) -> "ParallelExecutionPolicy":
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError("parallel_execution must be a mapping or ParallelExecutionPolicy")
+        known = {
+            "mode",
+            "max_cpu_percent",
+            "max_memory_percent",
+            "memory_reserve_bytes",
+            "max_workers",
+            "threads_per_worker",
+        }
+        unknown = sorted(str(key) for key in set(value) - known)
+        if unknown:
+            raise ValueError(
+                "parallel_execution contains unknown fields: " + ", ".join(unknown)
+            )
+        defaults = cls()
+        return cls(
+            mode=value.get("mode", defaults.mode),
+            max_cpu_percent=value.get("max_cpu_percent", defaults.max_cpu_percent),
+            max_memory_percent=value.get(
+                "max_memory_percent", defaults.max_memory_percent
+            ),
+            memory_reserve_bytes=value.get(
+                "memory_reserve_bytes", defaults.memory_reserve_bytes
+            ),
+            max_workers=value.get("max_workers", defaults.max_workers),
+            threads_per_worker=value.get(
+                "threads_per_worker", defaults.threads_per_worker
+            ),
+        )
+
+    def to_ir(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "max_cpu_percent": self.max_cpu_percent,
+            "max_memory_percent": self.max_memory_percent,
+            "memory_reserve_bytes": self.memory_reserve_bytes,
+            "max_workers": self.max_workers,
+            "threads_per_worker": self.threads_per_worker,
+        }
+
+    def validate_for_runtime(self, backend: object, device: object) -> None:
+        """Reject adaptive scheduling outside its qualified FEM CPU lane.
+
+        The native runner additionally checks that the study is an independent
+        eigen k-sweep.  The authoring layers can already fail closed on the
+        requested backend and device, so an adaptive request is never silently
+        ignored by an FDM or GPU realization.
+        """
+        if self.mode != "adaptive":
+            return
+        backend_value = getattr(backend, "value", backend)
+        device_value = getattr(device, "value", device)
+        if (
+            str(backend_value).strip().lower() != "fem"
+            or str(device_value).strip().lower() != "cpu"
+        ):
+            raise ValueError(
+                "unsupported parallel_execution realization: adaptive mode "
+                "requires requested_backend='fem' and requested_device='cpu' "
+                "for independent eigen k execution"
+            )
+
+
 class DeviceTarget(str, Enum):
     AUTO = "auto"
     CPU = "cpu"
@@ -1612,6 +1781,9 @@ class RuntimeSelection:
     execution_mode: ExecutionMode = ExecutionMode.STRICT
     execution_precision: ExecutionPrecision = ExecutionPrecision.DOUBLE
     fdm_precision_policy: FdmPrecisionPolicy | None = None
+    parallel_execution: ParallelExecutionPolicy = field(
+        default_factory=ParallelExecutionPolicy
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "backend_target", BackendTarget(self.backend_target))
@@ -1625,14 +1797,29 @@ class RuntimeSelection:
                 raise ValueError(
                     "fdm_precision_policy conflicts with execution_precision"
                 )
+        object.__setattr__(
+            self,
+            "parallel_execution",
+            ParallelExecutionPolicy.from_ir(self.parallel_execution),
+        )
+        self.parallel_execution.validate_for_runtime(
+            self.backend_target,
+            self.device_target,
+        )
         if self.gpu_count < 0:
             raise ValueError("gpu_count must be >= 0")
         if self.gpu_count > 1:
             raise ValueError(
                 "gpu_count > 1 requests multi-GPU execution, but multi-GPU execution is not implemented"
             )
-        if self.device_index is not None and self.device_index < 0:
-            raise ValueError("device_index must be >= 0")
+        if self.device_index is not None:
+            if isinstance(self.device_index, bool) or not isinstance(
+                self.device_index, Integral
+            ):
+                raise ValueError("device_index must be a nonnegative integer")
+            object.__setattr__(self, "device_index", int(self.device_index))
+            if self.device_index < 0:
+                raise ValueError("device_index must be >= 0")
         if self.cpu_threads is not None and self.cpu_threads <= 0:
             raise ValueError("cpu_threads must be >= 1")
         if self.cpu_threads is not None and self.cpu_threads > 1:
@@ -1658,6 +1845,7 @@ class RuntimeSelection:
             execution_mode=self.execution_mode,
             execution_precision=self.execution_precision,
             fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def device(self, index: int) -> "RuntimeSelection":
@@ -1672,6 +1860,7 @@ class RuntimeSelection:
             execution_mode=self.execution_mode,
             execution_precision=self.execution_precision,
             fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def cpu(self) -> "RuntimeSelection":
@@ -1684,6 +1873,7 @@ class RuntimeSelection:
             execution_mode=self.execution_mode,
             execution_precision=self.execution_precision,
             fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def cuda(self, gpu_count: int = 1) -> "RuntimeSelection":
@@ -1696,6 +1886,7 @@ class RuntimeSelection:
             execution_mode=self.execution_mode,
             execution_precision=self.execution_precision,
             fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def gpu(self, gpu_count: int = 1) -> "RuntimeSelection":
@@ -1718,6 +1909,7 @@ class RuntimeSelection:
             execution_mode=self.execution_mode,
             execution_precision=self.execution_precision,
             fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def mode(self, execution_mode: ExecutionMode | str) -> "RuntimeSelection":
@@ -1733,6 +1925,7 @@ class RuntimeSelection:
             execution_mode=ExecutionMode(normalized_mode),
             execution_precision=self.execution_precision,
             fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def precision(self, execution_precision: ExecutionPrecision | str) -> "RuntimeSelection":
@@ -1749,6 +1942,7 @@ class RuntimeSelection:
             cpu_threads=self.cpu_threads,
             execution_mode=self.execution_mode,
             execution_precision=ExecutionPrecision(normalized_precision),
+            parallel_execution=self.parallel_execution,
         )
 
     def precision_policy(
@@ -1764,6 +1958,24 @@ class RuntimeSelection:
             execution_mode=self.execution_mode,
             execution_precision=resolved_policy.execution_precision,
             fdm_precision_policy=resolved_policy,
+            parallel_execution=self.parallel_execution,
+        )
+
+    def with_parallel_execution(
+        self,
+        policy: ParallelExecutionPolicy | Mapping[str, object],
+    ) -> "RuntimeSelection":
+        """Return a copy with the independent-work admission policy changed."""
+        return RuntimeSelection(
+            backend_target=self.backend_target,
+            device_target=self.device_target,
+            gpu_count=self.gpu_count,
+            device_index=self.device_index,
+            cpu_threads=self.cpu_threads,
+            execution_mode=self.execution_mode,
+            execution_precision=self.execution_precision,
+            fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=ParallelExecutionPolicy.from_ir(policy),
         )
 
     def resolved(
@@ -1796,6 +2008,9 @@ class RuntimeSelection:
         }
         if self.fdm_precision_policy is not None:
             result["fdm_precision_policy"] = self.fdm_precision_policy.to_ir()
+        result["parallel_execution"] = self.parallel_execution.to_ir()
+        if self.device_index is not None:
+            result["legacy_cuda_binding"] = legacy_cuda_binding(self.device_index)
         return result
 
 
@@ -1805,7 +2020,7 @@ backend = RuntimeSelection()
 EnergyTerm = Exchange | Demag | InterfacialDMI | RotatedInterfacialDMI | BulkDMI | Zeeman | StaticFieldMap | Magnetoelastic | UniaxialAnisotropy | OerstedCylinder | OerstedField | CubicAnisotropy | ThermalNoise
 CurrentModule = AntennaFieldSource | CurrentTransport
 LegacyOutputSpec = SaveField | SaveScalar | Snapshot
-OutputSpec = LegacyOutputSpec | SaveSpectrum | SaveMode | SaveDispersion
+OutputSpec = LegacyOutputSpec | SaveSpectrum | SaveMode | SaveDispersion | SaveEigenDiagnostics
 
 
 def _material_has_anisotropy(material: Material) -> bool:
@@ -2398,7 +2613,7 @@ class Problem:
     name: str
     magnets: Sequence[Ferromagnet]
     energy: Sequence[EnergyTerm]
-    study: FieldOnly | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | None = None
+    study: FieldOnly | AntennaFieldSolve | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | None = None
     dynamics: LLG | None = None
     outputs: Sequence[LegacyOutputSpec] | None = None
     discretization: DiscretizationHints | None = None
@@ -2499,7 +2714,7 @@ class Problem:
             )
         object.__setattr__(self, "auxiliary_geometry_object_ids", auxiliary_object_ids)
         field_only = isinstance(self.study, FieldOnly)
-        if not self.magnets and not field_only:
+        if not self.magnets and not (field_only or isinstance(self.study, AntennaFieldSolve)):
             raise ValueError("Problem requires at least one magnet")
         if field_only:
             if not self.auxiliary_geometries:
@@ -2508,7 +2723,7 @@ class Problem:
                 raise ValueError("FieldOnly cannot contain magnetic state, energy or LLG drives")
             if self.spin_torque is not None or self.spin_torques or self.spin_transports or self.magnetization_constraints:
                 raise ValueError("FieldOnly cannot contain magnetic torque, spin transport or constraints")
-        if not field_only and not self.energy and not any(
+        if not (field_only or isinstance(self.study, AntennaFieldSolve)) and not self.energy and not any(
             _material_has_anisotropy(magnet.material) for magnet in self.magnets
         ):
             raise IncompletePhysicsError(
@@ -2797,6 +3012,8 @@ class Problem:
         effective_asset_cache = asset_cache if asset_cache is not None else self.geometry_asset_cache
         runtime_metadata = dict(self.runtime_metadata)
         runtime_metadata["runtime_selection"] = runtime.to_runtime_metadata()
+        if isinstance(self.study, Eigenmodes) and self.study.solver_policy is not None:
+            runtime_metadata["modal_solver_policy"] = self.study.solver_policy.to_ir()
         effective_study_pipeline = _normalize_study_pipeline_value(study_pipeline)
         if effective_study_pipeline is None:
             effective_study_pipeline = _normalize_study_pipeline_value(
@@ -3119,7 +3336,7 @@ class Problem:
             hybrid=self.discretization.hybrid,
         )
 
-    def _normalize_study(self) -> FieldOnly | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse:
+    def _normalize_study(self) -> FieldOnly | AntennaFieldSolve | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse:
         if self.study is not None and (self.dynamics is not None or self.outputs is not None):
             raise ValueError(
                 "Problem accepts either study=... or the legacy dynamics=... and outputs=... shape, not both"

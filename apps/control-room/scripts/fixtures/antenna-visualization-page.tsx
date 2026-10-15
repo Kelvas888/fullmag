@@ -5,7 +5,7 @@ import { useThree } from "@react-three/fiber";
 import { BufferGeometry, ShaderMaterial, SRGBColorSpace, Vector2, Vector3, WebGLRenderTarget } from "three";
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
 import { DATA_ANTENNA_FIELD_SOLUTION_PATH, DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, MODEL_SCENE_PATH, SESSIONS_PATH, SESSION_STATUS_PATH, SIMULATION_STAGES_EXECUTION_PATH, DATA_QUANTITIES_PATH } from "@/kernel/api/apiPaths";
-import type { AntennaFieldSolutionResource, AntennaExternalLeadInspectionResource, AntennaInspectionDisplayResource, SceneResource } from "@/kernel/api/apiTypes";
+import type { AntennaFieldSolutionResource, AntennaExternalLeadInspectionResource, AntennaInspectionDisplayResource, SceneResource, StageExecutionResource } from "@/kernel/api/apiTypes";
 import { RequestDiagnosticsController } from "@/kernel/api/RequestDiagnosticsController";
 import { EventBus } from "@/kernel/events/EventBus";
 import type { KernelEventMap } from "@/kernel/events/eventTypes";
@@ -79,6 +79,16 @@ function makeFixture() {
       device_potential: { ...ref("authored_device_vertex_order", "V", 10), byte_count: 80 },
       bundle: { ...ref("bundle", "1", 0), scalar_type: "bytes", byte_count: 0 },
     },
+  };
+  const executionStages: StageExecutionResource["stages"] = isInspection ? [{
+    stage_id: inspection.runtime_stage_id, antenna_solve_stage_id: inspection.stage_id,
+    index: 0, status: "completed", converged: false,
+    kind: "study_pipeline_antenna_field_solve", label: "Synthetic inspection execution", artifact_refs: [],
+  }] : [];
+  const execution: StageExecutionResource = {
+    ...owner, run_id: inspection.run_id, revision: 1, runtime_state: "completed",
+    total_stages: executionStages.length, stages: executionStages,
+    stage_statuses: executionStages.map((stage) => stage.status), completed_stage_indexes: isInspection ? [0] : [],
   };
   const f64 = (values: number[]) => { const data = new ArrayBuffer(values.length * 8), view = new DataView(data); values.forEach((value, index) => view.setFloat64(index * 8, value, true)); return data; };
   const deviceCoordinates = Array.from({ length: 10 }, (_, node) => {
@@ -177,12 +187,9 @@ function makeFixture() {
     if (calls.length > 80 || request.method !== "GET") throw new Error("Fixture budget/method violation");
     if (url.pathname === SESSIONS_PATH) return json({ schema_version: "1.0", sessions: [{ session_id: owner.session_id, name: "Fixture", current: true, status: "idle" }] });
     if (url.pathname === SESSION_STATUS_PATH) return json({ session: { ...owner, name: "Fixture", created_at: "fixture", workspace_root: "fixture" }, resources: { scene_revision: 1 }, capabilities: {}, lifecycle: { solver: "idle", session_resource: "active", connectivity: "connected", commandability: "writable" } });
-    if (url.pathname === SIMULATION_STAGES_EXECUTION_PATH) {
-      const stages = isInspection ? [{ stage_id: "runtime-solve-001", antenna_solve_stage_id: "solve", index: 0, status: "completed", converged: false, kind: "study_pipeline_antenna_field_solve", label: "Fixture antenna solve", artifact_refs: [] }] : [];
-      return json({ ...owner, run_id: "fixture-run", revision: 1, runtime_state: "completed", total_stages: stages.length, stages, stage_statuses: stages.map((stage) => stage.status), completed_stage_indexes: [] });
-    }
     if (url.pathname === DATA_QUANTITIES_PATH && scenario === "tensor-table") return json({ schema_version: "tensor-fixture.v1", quantities: [{ id: "spin_current_tensor", tensor: { rank: 2, shape: [3, 3], layout: "flow_major", axes: ["flow", "spin"], component_labels: ["Q_xx", "Q_xy", "Q_xz", "Q_yx", "Q_yy", "Q_yz", "Q_zx", "Q_zy", "Q_zz"] } }] });
     if (url.pathname === MODEL_SCENE_PATH) return json(scene);
+    if (url.pathname === SIMULATION_STAGES_EXECUTION_PATH) return json(execution);
     if (url.pathname === metadataPath) return isInspection ? new Response("{}", { status: 404, headers }) : json(solution);
     if (url.pathname === catalogPath) return json({ ...owner, stage_id: "solve", status: "ready", outputs: [{ output_id: "solution", solution_ref: { asset_id: solution.asset_id, content_digest: digest, stage_id: "solve" } }] });
     if (url.pathname === path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, "stage_id", "runtime-solve-001")) { if (closedFixture) { const closed = await closedFixture; if (scenario === "inspection-closed-foreign") closed.inspection.run_id = "foreign-run"; return json(closed.inspection); } if (isInspection) await displayMetadata(); return isInspection ? json(inspection) : new Response("{}", { status: 404, headers }); }

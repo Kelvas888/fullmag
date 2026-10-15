@@ -13,9 +13,7 @@ use std::time::{Duration, Instant};
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const COMMAND_SETTLE_GRACE: Duration = Duration::from_secs(2);
 const API_INSTANCE_HEADER: &str = "x-fullmag-api-instance";
-const MODEL_SYNC_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_BOOTSTRAP_ATTEMPTS: u8 = 3;
-const MAX_SYNC_ERROR_BODY_BYTES: u64 = 4 * 1024;
 const MAX_BOOTSTRAP_ERROR_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -62,14 +60,71 @@ impl BootstrapRetryState {
     }
 }
 
-fn retryable_bootstrap_error(error: &anyhow::Error) -> bool {
-    let Some(error) = error.downcast_ref::<reqwest::Error>() else {
-        return false;
-    };
-    match error.status() {
-        Some(status) => status.is_server_error() || matches!(status.as_u16(), 408 | 429),
-        None => error.is_timeout() || error.is_connect(),
+#[derive(Clone, PartialEq, Eq)]
+struct GridSessionScope {
+    api_instance_id: String,
+    session_id: String,
+    session_epoch: String,
+    request_scope_epoch: String,
+}
+
+impl GridSessionScope {
+    fn started_at_unix_ms(&self) -> anyhow::Result<u128> {
+        let prefix = format!("{}@", self.session_id);
+        let timestamp = self.session_epoch.strip_prefix(&prefix)
+            .ok_or_else(|| anyhow::anyhow!("attached session epoch does not match its session ID"))?;
+        let value = timestamp.parse::<u128>()?;
+        anyhow::ensure!(value > 0 && value.to_string() == timestamp, "invalid attached session timestamp");
+        Ok(value)
     }
+}
+
+#[cfg(test)]
+mod session_scope_tests {
+    use super::GridSessionScope;
+
+    #[test]
+    fn attached_timestamp_requires_exact_session_and_canonical_positive_time() {
+        let mut scope = GridSessionScope {
+            api_instance_id: "api".into(), session_id: "session-a".into(),
+            session_epoch: "session-a@1700000000000".into(), request_scope_epoch: "api:1".into(),
+        };
+        assert_eq!(scope.started_at_unix_ms().unwrap(), 1_700_000_000_000);
+        for invalid in ["session-b@1700000000000", "session-a@0", "session-a@01",
+                        "session-a@+1", "session-a@invalid"] {
+            scope.session_epoch = invalid.into();
+            assert!(scope.started_at_unix_ms().is_err(), "{invalid}");
+        }
+    }
+}
+
+struct GridCommandCustody {
+    command_id: String,
+    scope: GridSessionScope,
+}
+
+struct ScratchChildProof {
+    pid: u32,
+    command_id: String,
+    command_kind: String,
+    scope: GridSessionScope,
+}
+
+fn emit_scratch_child_proof(proof: &ScratchChildProof, state: &str, exit_code: Option<i32>, killed: bool) {
+    let Ok(nonce) = std::env::var("FULLMAG_SCRATCH_PROOF_NONCE") else { return; };
+    if !canonical_non_nil_uuid(&nonce) { return; }
+    let value = serde_json::json!({
+        "schema": "fullmag.development-browser-scratch-child.v1", "nonce": nonce,
+        "state": state, "pid": proof.pid, "command_id": proof.command_id,
+        "command_kind": proof.command_kind, "api_instance_id": proof.scope.api_instance_id,
+        "session_id": proof.scope.session_id, "session_epoch": proof.scope.session_epoch,
+        "request_scope_epoch": proof.scope.request_scope_epoch,
+        "waited": state == "waited", "exit_code": exit_code, "kill_requested": killed,
+    });
+    use std::io::Write;
+    let mut output = std::io::stdout().lock();
+    let _ = writeln!(output, "{value}");
+    let _ = output.flush();
 }
 
 enum CurrentSession {
@@ -500,19 +555,32 @@ fn run(
     let mut pending_failure: Option<(String, String)> = None;
     let mut child: Option<Child> = None;
     let mut bootstrap_retry = BootstrapRetryState::default();
+    let mut grid_command: Option<GridCommandCustody> = None;
+    let mut child_proof: Option<ScratchChildProof> = None;
+    // A lost synchronization response cannot prove that its writer stopped.
+    // Retain ownership until explicit workspace recovery, without replaying it.
+    let mut synchronization_unknown = false;
 
     loop {
         let idle = child.is_none()
             && handled_command_id.is_none()
             && settling_command.is_none()
-            && pending_failure.is_none();
+            && pending_failure.is_none()
+            && !synchronization_unknown;
         if !control.wait_before_iteration(idle) {
             break;
+        }
+        if synchronization_unknown {
+            control.wait_poll_interval(POLL_INTERVAL);
+            continue;
         }
 
         if let Some(active_child) = child.as_mut() {
             match active_child.try_wait() {
                 Ok(Some(status)) => {
+                    if let Some(proof) = child_proof.take() {
+                        emit_scratch_child_proof(&proof, "waited", status.code(), false);
+                    }
                     eprintln!("[fullmag] scratch attached runtime exited with status {status}");
                     child = None;
                     if let Some(command_id) = handled_command_id.take() {
@@ -526,19 +594,47 @@ fn run(
                 Ok(None) => {}
                 Err(error) => {
                     eprintln!("[fullmag] scratch attached runtime status check failed: {error}");
-                    child = None;
-                    if let Some(command_id) = handled_command_id.take() {
-                        settling_command =
-                            Some((command_id, false, Instant::now() + COMMAND_SETTLE_GRACE));
-                    }
+                    // A failed observation is not an exit or a released handle.
+                    control.wait_poll_interval(POLL_INTERVAL);
+                    continue;
                 }
+            }
+        }
+
+        if let Some(grid) = grid_command.as_ref() {
+            // Grid-only custody is independent of later scene edits. The child
+            // never accepts a solver command and must finish with its own wait.
+            if child.is_some() {
+                control.wait_poll_interval(POLL_INTERVAL);
+                continue;
+            }
+            if grid_command_is_terminal(&client, &api_base, grid) == Some(true) {
+                grid_command = None;
+                settling_command = None;
+                handled_command_id = None;
+                attached_session = None;
+                attached_backend = None;
+                attached_scene_revision = None;
+            } else {
+                if settling_command.as_ref().is_some_and(|(_, _, deadline)| Instant::now() >= *deadline)
+                    && current_grid_scope(&client, &api_base, &expected_api_instance_id).as_ref() == Some(&grid.scope)
+                {
+                    let _ = report_command_failure(
+                        &client, &api_base, &grid.command_id,
+                        "grid-only attached runtime exited before an exact terminal receipt",
+                    );
+                }
+                // Missing/foreign receipts remain unknown; do not acknowledge
+                // observer pause or attach another runtime on that evidence.
+                control.wait_poll_interval(POLL_INTERVAL);
+                continue;
             }
         }
 
         let session = current_session(&client, &api_base);
         match session {
             CurrentSession::NoActive => {
-                terminate_child(&mut child);
+                terminate_child(&mut child, &mut child_proof);
                 attached_session = None;
                 attached_backend = None;
                 attached_scene_revision = None;
@@ -553,7 +649,7 @@ fn run(
                 backend: _,
                 scene_revision: _,
             } if ignored_session.as_deref() == Some(session_id.as_str()) => {
-                terminate_child(&mut child);
+                terminate_child(&mut child, &mut child_proof);
                 attached_session = None;
                 attached_backend = None;
                 attached_scene_revision = None;
@@ -578,7 +674,7 @@ fn run(
                     .zip(scene_revision)
                     .is_some_and(|(active, current)| active != current);
                 if session_changed || backend_changed || scene_changed {
-                    terminate_child(&mut child);
+                    terminate_child(&mut child, &mut child_proof);
                     if session_changed {
                         handled_command_id = None;
                         settling_command = None;
@@ -633,7 +729,7 @@ fn run(
                 }
 
                 if child.is_none() && matches!(backend.as_str(), "fdm" | "fem") {
-                    if let Some(command_id) = pending_compute_command(&client, &api_base) {
+                    if let Some((command_id, grid_refresh_only, command_kind)) = pending_compute_command(&client, &api_base) {
                         let owner = BootstrapOwner {
                             session_id: session_id.clone(),
                             backend: backend.clone(),
@@ -642,7 +738,9 @@ fn run(
                         };
                         bootstrap_retry.select_owner(owner.clone());
                         if let Some(error) = bootstrap_retry.terminal_error.as_deref() {
-                            if bootstrap_owner_is_current(&client, &api_base, &owner) {
+                            if bootstrap_owner_is_current(&client, &api_base, &owner)
+                                && current_grid_scope(&client, &api_base, &expected_api_instance_id)
+                                    .is_some_and(|scope| scope.session_id == owner.session_id) {
                                 if report_command_failure(&client, &api_base, &command_id, error) {
                                     bootstrap_retry = BootstrapRetryState::default();
                                 }
@@ -650,13 +748,28 @@ fn run(
                             control.wait_poll_interval(POLL_INTERVAL);
                             continue;
                         }
+                        let proof_scope = current_grid_scope(&client, &api_base, &expected_api_instance_id)
+                            .filter(|scope| scope.session_id == session_id);
+                        let Some(attached_scope) = proof_scope.as_ref() else {
+                            control.wait_poll_interval(POLL_INTERVAL);
+                            continue;
+                        };
+                        let grid_scope = if grid_refresh_only {
+                            let Some(scope) = proof_scope.clone() else {
+                                control.wait_poll_interval(POLL_INTERVAL);
+                                continue;
+                            };
+                            Some(scope)
+                        } else {
+                            None
+                        };
                         if current_session_matches(
                             &client,
                             &api_base,
                             &session_id,
                             &backend,
                             scene_revision,
-                        ) && pending_compute_command(&client, &api_base).as_deref()
+                        ) && pending_compute_command(&client, &api_base).as_ref().map(|(id, _, _)| id.as_str())
                             == Some(command_id.as_str())
                         {
                             match render_current_scene(&client, &api_base) {
@@ -667,9 +780,9 @@ fn run(
                                         &session_id,
                                         &backend,
                                         scene_revision,
-                                    ) && pending_compute_command(&client, &api_base).as_deref()
-                                        == Some(command_id.as_str())
-                                    {
+                                    ) && pending_compute_command(&client, &api_base)
+                                        .as_ref().map(|(id, _, _)| id.as_str()) == Some(command_id.as_str())
+                                        && current_grid_scope(&client, &api_base, &expected_api_instance_id).as_ref() == Some(attached_scope) {
                                         match spawn_attached_runtime(
                                             &executable,
                                             api_port,
@@ -677,14 +790,26 @@ fn run(
                                             &backend,
                                             &script_path,
                                             &publisher_scope,
+                                            grid_refresh_only.then_some(command_id.as_str()),
+                                            attached_scope,
                                         ) {
                                             Ok(next_child) => {
+                                                child_proof = proof_scope.map(|scope| ScratchChildProof {
+                                                    pid: next_child.id(), command_id: command_id.clone(),
+                                                    command_kind, scope,
+                                                });
+                                                if let Some(proof) = child_proof.as_ref() {
+                                                    emit_scratch_child_proof(proof, "started", None, false);
+                                                }
                                                 eprintln!(
                                                     "[fullmag] attached scratch runtime started for {backend} session {session_id} command {command_id}"
                                                 );
                                                 attached_session = Some(session_id);
                                                 attached_backend = Some(backend);
                                                 attached_scene_revision = scene_revision;
+                                                grid_command = grid_scope.map(|scope| GridCommandCustody {
+                                                    command_id: command_id.clone(), scope,
+                                                });
                                                 handled_command_id = Some(command_id);
                                                 child = Some(next_child);
                                                 bootstrap_retry = BootstrapRetryState::default();
@@ -701,11 +826,17 @@ fn run(
                                     }
                                 }
                                 Err(error) => {
+                                    if error.is_unknown() {
+                                        synchronization_unknown = true;
+                                        eprintln!("[fullmag] model synchronization outcome is unknown; automatic replay and runtime attachment are fenced until workspace recovery: {error}");
+                                        continue;
+                                    }
                                     eprintln!(
                                         "[fullmag] scratch runtime bootstrap sync failed: {error:#}"
                                     );
-                                    bootstrap_retry
-                                        .record_failure(&error, retryable_bootstrap_error(&error));
+                                    let retryable = matches!(error,
+                                        SceneSynchronizationError::Rejected(status) if status.as_u16() == 429);
+                                    bootstrap_retry.record_failure(&anyhow::anyhow!("{error}"), retryable);
                                 }
                             }
                         }
@@ -717,7 +848,7 @@ fn run(
         control.wait_poll_interval(POLL_INTERVAL);
     }
 
-    terminate_child(&mut child);
+    terminate_child(&mut child, &mut child_proof);
 }
 
 fn current_session(client: &Client, api_base: &str) -> CurrentSession {
@@ -912,7 +1043,53 @@ mod bootstrap_tests {
     }
 }
 
-fn pending_compute_command(client: &Client, api_base: &str) -> Option<String> {
+fn current_grid_scope(client: &Client, api_base: &str, expected_api_instance_id: &str) -> Option<GridSessionScope> {
+    let response = client.get(format!("{api_base}/v2/sessions/current/status"))
+        .send().ok()?.error_for_status().ok()?;
+    if response.headers().get(API_INSTANCE_HEADER)?.to_str().ok()? != expected_api_instance_id {
+        return None;
+    }
+    let body = response.json::<Value>().ok()?;
+    let session = body.get("session")?;
+    let text = |name| session.get(name)?.as_str().filter(|value| !value.is_empty()).map(str::to_owned);
+    Some(GridSessionScope {
+        api_instance_id: expected_api_instance_id.to_string(),
+        session_id: text("session_id")?,
+        session_epoch: text("session_epoch")?,
+        request_scope_epoch: text("request_scope_epoch")?,
+    })
+}
+
+fn grid_terminal_receipt(body: &Value, command_id: &str) -> bool {
+    let status = body.get("status").and_then(Value::as_str);
+    let completion = body.get("completion_status").and_then(Value::as_str);
+    let created = body.get("created_at_unix_ms").and_then(Value::as_u64);
+    let completed = body.get("completed_at_unix_ms").and_then(Value::as_u64);
+    body.get("command_id").and_then(Value::as_str) == Some(command_id)
+        && body.get("kind").and_then(Value::as_str) == Some("fdm_grid_refresh")
+        && matches!(status, Some("completed" | "failed" | "rejected"))
+        && status == completion
+        && created.zip(completed).is_some_and(|(created, completed)| completed > 0 && completed >= created)
+}
+
+fn grid_command_is_terminal(client: &Client, api_base: &str, grid: &GridCommandCustody) -> Option<bool> {
+    if current_grid_scope(client, api_base, &grid.scope.api_instance_id).as_ref() != Some(&grid.scope) {
+        return None;
+    }
+    let response = client.get(format!(
+        "{api_base}/v2/sessions/current/simulation/commands/{}", grid.command_id
+    )).send().ok()?.error_for_status().ok()?;
+    if response.headers().get(API_INSTANCE_HEADER)?.to_str().ok()? != grid.scope.api_instance_id {
+        return None;
+    }
+    let body = response.json::<Value>().ok()?;
+    if current_grid_scope(client, api_base, &grid.scope.api_instance_id).as_ref() != Some(&grid.scope) {
+        return None;
+    }
+    Some(grid_terminal_receipt(&body, &grid.command_id))
+}
+
+fn pending_compute_command(client: &Client, api_base: &str) -> Option<(String, bool, String)> {
     let Ok(response) = client
         .get(format!(
             "{api_base}/v2/sessions/current/simulation/commands"
@@ -936,14 +1113,12 @@ fn pending_compute_command(client: &Client, api_base: &str) -> Option<String> {
                 if matches!(
                     status,
                     Some("queued" | "pending" | "accepted" | "dispatched")
-                ) && matches!(
-                    kind,
-                    Some("remesh" | "fdm_grid_refresh" | "relax" | "run" | "solve")
-                ) {
+                ) && matches!(kind, Some("fdm_grid_refresh" | "remesh" | "relax" | "run" | "solve"))
+                {
                     command
                         .get("command_id")
                         .and_then(Value::as_str)
-                        .map(str::to_string)
+                        .map(|id| (id.to_string(), kind == Some("fdm_grid_refresh"), kind.unwrap_or_default().to_string()))
                 } else {
                     None
                 }
@@ -951,34 +1126,69 @@ fn pending_compute_command(client: &Client, api_base: &str) -> Option<String> {
         })
 }
 
-fn render_current_scene(client: &Client, api_base: &str) -> anyhow::Result<(PathBuf, String)> {
+#[derive(Debug)]
+enum SceneSynchronizationError {
+    Rejected(reqwest::StatusCode),
+    IncompletePhysics,
+    Unknown(anyhow::Error),
+}
+
+impl SceneSynchronizationError {
+    fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown(_))
+    }
+}
+
+impl std::fmt::Display for SceneSynchronizationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(status) => write!(formatter, "model sync returned HTTP {status}"),
+            Self::IncompletePhysics => write!(formatter, "Enable an interaction or material anisotropy before preparing this model for execution"),
+            Self::Unknown(error) => write!(formatter, "{error:#}"),
+        }
+    }
+}
+
+fn render_current_scene(client: &Client, api_base: &str) -> Result<(PathBuf, String), SceneSynchronizationError> {
     let response = client
         .post(format!("{api_base}/v2/sessions/current/model/syncs"))
-        .timeout(MODEL_SYNC_TIMEOUT)
+        // The server bounds and waits for its Python helper at 30 seconds.
+        // Keep fast metadata polling unchanged while allowing the write to finish.
+        .timeout(Duration::from_secs(45))
         .json(&serde_json::json!({}))
-        .send()?;
-    if let Err(error) = response.error_for_status_ref() {
+        .send()
+        .map_err(|error| SceneSynchronizationError::Unknown(error.into()))?;
+    if !response.status().is_success() {
+        if response.status().is_server_error() {
+            return Err(SceneSynchronizationError::Unknown(anyhow::anyhow!(
+                "model sync returned HTTP {}; helper shutdown is not confirmed", response.status()
+            )));
+        }
         let status = response.status();
-        let mut bytes = Vec::new();
-        let _ = response
-            .take(MAX_SYNC_ERROR_BODY_BYTES)
-            .read_to_end(&mut bytes);
-        let detail = String::from_utf8_lossy(&bytes);
-        return Err(anyhow::Error::new(error)
-            .context(format!("model sync returned {status}: {}", detail.trim(),)));
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            let mut body = Vec::new();
+            if response.take(4097).read_to_end(&mut body).is_ok() && body.len() <= 4096
+                && serde_json::from_slice::<Value>(&body).ok().is_some_and(|value|
+                    value.get("code").and_then(Value::as_str) == Some("scene_incomplete_physics"))
+            {
+                return Err(SceneSynchronizationError::IncompletePhysics);
+            }
+        }
+        return Err(SceneSynchronizationError::Rejected(status));
     }
     let scope = response.headers().get(crate::control_room::live_publisher_scope::HEADER_NAME)
-        .ok_or_else(|| anyhow::anyhow!("model sync did not acknowledge publisher session scope"))?
-        .to_str()?.to_string();
+        .ok_or_else(|| SceneSynchronizationError::Unknown(anyhow::anyhow!("model sync did not acknowledge publisher session scope")))?
+        .to_str().map_err(|error| SceneSynchronizationError::Unknown(error.into()))?.to_string();
     let parsed = crate::control_room::live_publisher_scope::parse_expected_session_scope(&scope)
-        .map_err(anyhow::Error::msg)?;
-    parsed.validate(&parsed.session_id)?;
-    let body = response.json::<Value>()?;
+        .map_err(|error| SceneSynchronizationError::Unknown(anyhow::Error::msg(error)))?;
+    parsed.validate(&parsed.session_id).map_err(SceneSynchronizationError::Unknown)?;
+    let body = response.json::<Value>()
+        .map_err(|error| SceneSynchronizationError::Unknown(error.into()))?;
     let path = body
         .get("script_path")
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("model sync did not return script_path"))?;
+        .ok_or_else(|| SceneSynchronizationError::Unknown(anyhow::anyhow!("model sync did not return script_path")))?;
     Ok((PathBuf::from(path), scope))
 }
 
@@ -989,7 +1199,7 @@ fn bootstrap_owner_is_current(client: &Client, api_base: &str, owner: &Bootstrap
         &owner.session_id,
         &owner.backend,
         owner.scene_revision,
-    ) && pending_compute_command(client, api_base).as_deref() == Some(owner.command_id.as_str())
+    ) && pending_compute_command(client, api_base).as_ref().map(|(id, _, _)| id.as_str()) == Some(owner.command_id.as_str())
         && current_session_matches(
             client,
             api_base,
@@ -1006,10 +1216,17 @@ fn spawn_attached_runtime(
     backend: &str,
     script_path: &PathBuf,
     publisher_scope: &str,
+    grid_refresh_command_id: Option<&str>,
+    session_scope: &GridSessionScope,
 ) -> anyhow::Result<Child> {
     let scope = crate::control_room::live_publisher_scope::parse_expected_session_scope(publisher_scope)
         .map_err(anyhow::Error::msg)?;
     scope.validate(session_id)?;
+    anyhow::ensure!(session_scope.session_id == session_id, "attached runtime session scope mismatch");
+    anyhow::ensure!(scope.session_epoch == session_scope.session_epoch
+        && scope.request_scope_epoch == session_scope.request_scope_epoch,
+        "model sync publisher scope differs from the attached runtime owner");
+    let started_at_unix_ms = session_scope.started_at_unix_ms()?;
     let mut command = Command::new(executable);
     command
         .arg(script_path)
@@ -1023,20 +1240,58 @@ fn spawn_attached_runtime(
         .env("FULLMAG_API_PORT", api_port.to_string())
         .env("FULLMAG_ATTACHED_SESSION_ID", session_id)
         .env(crate::control_room::live_publisher_scope::ATTACHED_SCOPE_ENV, publisher_scope)
+        .env("FULLMAG_ATTACHED_SESSION_STARTED_AT_UNIX_MS", started_at_unix_ms.to_string())
         .env("FULLMAG_ATTACHED_WAIT_FOR_SOLVE", "1")
         .env("FULLMAG_SKIP_CONTROL_ROOM", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    command.env_remove("FULLMAG_ATTACHED_GRID_REFRESH_COMMAND_ID");
+    if let Some(command_id) = grid_refresh_command_id {
+        command.env("FULLMAG_ATTACHED_GRID_REFRESH_COMMAND_ID", command_id);
+    }
     Ok(command.spawn()?)
 }
 
-fn terminate_child(child: &mut Option<Child>) {
+fn terminate_child(child: &mut Option<Child>, proof: &mut Option<ScratchChildProof>) {
     let Some(mut child_process) = child.take() else {
         return;
     };
     let _ = child_process.kill();
-    let _ = child_process.wait();
+    if let Ok(status) = child_process.wait() {
+        if let Some(proof) = proof.take() {
+            emit_scratch_child_proof(&proof, "waited", status.code(), true);
+        }
+    }
+}
+
+#[cfg(test)]
+mod grid_receipt_tests {
+    use super::grid_terminal_receipt;
+
+    #[test]
+    fn grid_receipt_requires_exact_command_and_matching_terminal_completion() {
+        let good = serde_json::json!({
+            "command_id": "grid-command", "kind": "fdm_grid_refresh",
+            "status": "completed", "completion_status": "completed",
+            "created_at_unix_ms": 10, "completed_at_unix_ms": 11
+        });
+        assert!(grid_terminal_receipt(&good, "grid-command"));
+        assert!(!grid_terminal_receipt(&good, "different-command"));
+        for (field, value) in [
+            ("kind", serde_json::json!("solve")),
+            ("status", serde_json::json!("running")),
+            ("completion_status", serde_json::json!("failed")),
+            ("completed_at_unix_ms", serde_json::json!(0)),
+            ("completed_at_unix_ms", serde_json::json!(9)),
+            ("completed_at_unix_ms", serde_json::Value::Null),
+        ] {
+            let mut invalid = good.clone();
+            invalid[field] = value;
+            assert!(!grid_terminal_receipt(&invalid, "grid-command"));
+        }
+        assert!(!grid_terminal_receipt(&serde_json::Value::Null, "grid-command"));
+    }
 }
 
 fn spawn_pause_diagnostic_handle<F>(

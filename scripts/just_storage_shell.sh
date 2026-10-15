@@ -161,21 +161,24 @@ case "${recipe}" in
     if [[ -n "${build_only}" ]]; then launcher_arguments+=(-BuildOnly); fi
     exec powershell.exe "${launcher_arguments[@]}"
     ;;
-  *"scripts/windows/watch_backend.py"*)
-    backend_watch_pattern='^python "[^"]+/scripts/windows/watch_backend.py" --repo-root "[^"]+" --web-port "([1-9][0-9]{0,4})"$'
-    if [[ ! "${recipe}" =~ ${backend_watch_pattern} ]]; then
-      echo "[fullmag just] invalid native backend watcher recipe" >&2
+  *"scripts/verify_control_room_sources.py"*)
+    # Never execute the recipe text: accept only the fixed argument shape and
+    # invoke the trusted helper from this checkout with the selected route.
+    source_recipe_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_control_room_sources.py" --route (generate-client|production-source|api-hygiene|lint|openapi-import-check|typecheck-cli-check|explorer-physics-reporting-check|react-doctor|resource-client-cache-check) --repo-root "[^"]+"( --dependency-workspace "([^"]+)")?[[:space:]]*$'
+    if [[ ! "${recipe}" =~ ${source_recipe_pattern} ]]; then
+      echo "[fullmag just] invalid lightweight frontend recipe" >&2
       exit 2
     fi
-    web_port="${BASH_REMATCH[1]}"
-    if ! is_windows_shell || (( web_port > 65535 )); then
-      echo "[fullmag just] native backend watcher requires Windows and a port from 1 to 65535" >&2
-      exit 2
+    source_route="${BASH_REMATCH[1]}"
+    dependency_workspace="${BASH_REMATCH[3]:-}"
+    if [[ -n "${dependency_workspace}" ]]; then
+      case "${source_route}" in
+        generate-client|production-source|api-hygiene) ;;
+        *) echo "[fullmag just] dependency workspace is unsupported for this source route" >&2; exit 2 ;;
+      esac
+      exec "${python_cmd}" -B "${script_dir}/verify_control_room_sources.py" --route "${source_route}" --repo-root "${repo_root}" --dependency-workspace "${dependency_workspace}"
     fi
-    # The watcher acquires its own closed watch lease and delegates each build
-    # to run-windows-workspace-build; do not wrap its lifetime in the generic
-    # worktree build lock.
-    exec "${python_cmd}" "${script_dir}/windows/watch_backend.py" --repo-root "${repo_root}" --web-port "${web_port}"
+    exec "${python_cmd}" -B "${script_dir}/verify_control_room_sources.py" --route "${source_route}" --repo-root "${repo_root}"
     ;;
   *"scripts/export_runner_openapi.py"*)
     export_openapi_pattern='^[^[:space:]]+ "[^"]+/scripts/export_runner_openapi.py" --repo-root "[^"]+" --job-id "([0-9a-f]{32})" --expected-commit "([0-9a-f]{40})"$'
@@ -204,18 +207,30 @@ case "${recipe}" in
       fi
       exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --project-document-only --frozen-native-build-id "${BASH_REMATCH[1]}" "${archive_args[@]}"
     fi
-    frozen_native_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --frozen-native-build-id "([0-9a-f]{64})"$'
-    if [[ "${recipe}" =~ ${frozen_native_pattern} ]]; then
+    compute_cancellation_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --compute-cancellation-only --frozen-native-build-id "([0-9a-f]{64})"$'
+    if [[ "${recipe}" =~ ${compute_cancellation_pattern} ]]; then
       if ! is_windows_shell; then
-        echo "[fullmag just] frozen native package verification requires Windows" >&2
+        echo "[fullmag just] compute cancellation API verification requires Windows" >&2
         exit 2
       fi
-      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --frozen-native-build-id "${BASH_REMATCH[1]}"
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --compute-cancellation-only --frozen-native-build-id "${BASH_REMATCH[1]}"
     fi
-      workspace_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --workspace-browser-owner-bundle "([0-9a-f]{32})"$'
-      if [[ "${recipe}" =~ ${workspace_browser_pattern} ]]; then
-        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --workspace-browser-owner-bundle "${BASH_REMATCH[1]}"
+    compute_host_initialization_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --compute-host-initialization-only --frozen-native-build-id "([0-9a-f]{64})"$'
+    compute_scheduler_cancellation_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --compute-scheduler-cancellation-only --frozen-native-build-id "([0-9a-f]{64})"$'
+    if [[ "${recipe}" =~ ${compute_scheduler_cancellation_pattern} ]]; then
+      if ! is_windows_shell; then
+        echo "[fullmag just] compute scheduler cancellation verification requires Windows" >&2
+        exit 2
       fi
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --compute-scheduler-cancellation-only --frozen-native-build-id "${BASH_REMATCH[1]}"
+    fi
+    if [[ "${recipe}" =~ ${compute_host_initialization_pattern} ]]; then
+      if ! is_windows_shell; then
+        echo "[fullmag just] compute host initialization verification requires Windows" >&2
+        exit 2
+      fi
+      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --compute-host-initialization-only --frozen-native-build-id "${BASH_REMATCH[1]}"
+    fi
       candidate_preparation_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --candidate-preparation-only$'
       if [[ "${recipe}" =~ ${candidate_preparation_pattern} ]]; then
         exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --candidate-preparation-only
@@ -260,20 +275,12 @@ case "${recipe}" in
       if [[ "${recipe}" =~ ${observer_pause_pattern} ]]; then
         exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --observer-pause-only
       fi
-      restart_transport_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --restart-transport-only$'
-      if [[ "${recipe}" =~ ${restart_transport_pattern} ]]; then
-        exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --restart-transport-only
-      fi
       project_document_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --project-document-only$'
       if [[ "${recipe}" =~ ${project_document_pattern} ]]; then
         exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --project-document-only
       fi
-      development_api_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_backend_api.py" --repo-root "[^"]+" --cross-build-bundle "([0-9a-f]{32})?"$'
-      if [[ ! "${recipe}" =~ ${development_api_pattern} ]]; then
-        echo "[fullmag just] invalid development API check recipe" >&2
-        exit 2
-      fi
-      exec "${python_cmd}" "${script_dir}/verify_development_backend_api.py" --repo-root "${repo_root}" --cross-build-bundle "${BASH_REMATCH[1]:-}"
+      echo "[fullmag just] unsupported development API check recipe" >&2
+      exit 2
       ;;
     *"scripts/verify_development_handoff.py"*)
     handoff_check_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_development_handoff.py" --repo-root "[^"]+"$'
@@ -358,6 +365,21 @@ case "${recipe}" in
   *"scripts/local_runner_cli.py"*)
     FULLMAG_STORAGE_PYTHON="${python_cmd}" exec bash -euo pipefail -c "${recipe}"
     ;;
+  *"scripts/diagnose_managed_fem_startup.py"*)
+    "${python_cmd}" "${resolver}" resolve --repo-root "${repo_root}" >/dev/null
+    export PYTHONDONTWRITEBYTECODE=1
+    exec bash -euo pipefail -c "${recipe}"
+    ;;
+  *"scripts/run_comsol_dispersion_benchmark.py"*|*"scripts/run_de_100nm_pilot.py"*)
+    # The benchmark consumes an already completed runner build.  Its Python
+    # entry point acquires the per-worktree build lock around the immutable
+    # receipt check and Compose run, so it must not enter the generic heavy
+    # lock that rejects all commands while the container coordinator is
+    # enrolled on Windows.
+    "${python_cmd}" "${resolver}" resolve --repo-root "${repo_root}" >/dev/null
+    export PYTHONDONTWRITEBYTECODE=1
+    exec bash -euo pipefail -c "${recipe}"
+    ;;
 esac
 
 # These plain-Rust package routes have fixed commands and own their resolver
@@ -377,9 +399,13 @@ case "${recipe}" in
     exit 2
     ;;
   *"scripts/run_managed_antenna_http_ram.py"*)
-    antenna_http_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_http_ram.py\" --repo-root \"[^\"]+\" start --job-id '([0-9a-f]{32})' --commit '([0-9a-f]{40})' --source-digest '([0-9a-f]{64})' --native-snapshot-sha256 '([0-9a-f]{64})' --fixture '(magnetic|nonmagnetic)'$"
+    antenna_http_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_http_ram.py\" --repo-root \"[^\"]+\" start --job-id '([0-9a-f]{32})' --commit '([0-9a-f]{40})' --source-digest '([0-9a-f]{64})' --native-snapshot-sha256 '([0-9a-f]{64})'( --fixture '(magnetic|nonmagnetic)')?( --verify-cold-import)?( --standalone)?$"
     if [[ "${recipe}" =~ ${antenna_http_start_pattern} ]]; then
-      exec "${python_cmd}" "${script_dir}/run_managed_antenna_http_ram.py" --repo-root "${repo_root}" start --job-id "${BASH_REMATCH[1]}" --commit "${BASH_REMATCH[2]}" --source-digest "${BASH_REMATCH[3]}" --native-snapshot-sha256 "${BASH_REMATCH[4]}" --fixture "${BASH_REMATCH[5]}"
+      antenna_http_args=()
+      if [[ -n "${BASH_REMATCH[6]}" ]]; then antenna_http_args+=(--fixture "${BASH_REMATCH[6]}"); fi
+      if [[ -n "${BASH_REMATCH[7]}" ]]; then antenna_http_args+=(--verify-cold-import); fi
+      if [[ -n "${BASH_REMATCH[8]}" ]]; then antenna_http_args+=(--standalone); fi
+      exec "${python_cmd}" "${script_dir}/run_managed_antenna_http_ram.py" --repo-root "${repo_root}" start --job-id "${BASH_REMATCH[1]}" --commit "${BASH_REMATCH[2]}" --source-digest "${BASH_REMATCH[3]}" --native-snapshot-sha256 "${BASH_REMATCH[4]}" "${antenna_http_args[@]}"
     fi
     antenna_http_observe_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_http_ram.py\" --repo-root \"[^\"]+\" observe --run-root '([^']+)'$"
     if [[ "${recipe}" =~ ${antenna_http_observe_pattern} ]]; then
@@ -389,9 +415,11 @@ case "${recipe}" in
     exit 2
     ;;
   *"scripts/run_managed_antenna_ram.py"*)
-    antenna_ram_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_ram.py\" --repo-root \"[^\"]+\" start --job-id '([0-9a-f]{32})' --commit '([0-9a-f]{40})' --source-digest '([0-9a-f]{64})' --native-snapshot-sha256 '([0-9a-f]{64})'$"
+    antenna_ram_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_ram.py\" --repo-root \"[^\"]+\" start --job-id '([0-9a-f]{32})' --commit '([0-9a-f]{40})' --source-digest '([0-9a-f]{64})' --native-snapshot-sha256 '([0-9a-f]{64})'( --standalone)?$"
     if [[ "${recipe}" =~ ${antenna_ram_start_pattern} ]]; then
-      exec "${python_cmd}" "${script_dir}/run_managed_antenna_ram.py" --repo-root "${repo_root}" start --job-id "${BASH_REMATCH[1]}" --commit "${BASH_REMATCH[2]}" --source-digest "${BASH_REMATCH[3]}" --native-snapshot-sha256 "${BASH_REMATCH[4]}"
+      standalone_args=()
+      if [[ -n "${BASH_REMATCH[5]}" ]]; then standalone_args=(--standalone); fi
+      exec "${python_cmd}" "${script_dir}/run_managed_antenna_ram.py" --repo-root "${repo_root}" start --job-id "${BASH_REMATCH[1]}" --commit "${BASH_REMATCH[2]}" --source-digest "${BASH_REMATCH[3]}" --native-snapshot-sha256 "${BASH_REMATCH[4]}" "${standalone_args[@]}"
     fi
     antenna_ram_observe_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_ram.py\" --repo-root \"[^\"]+\" observe --run-root '([^']+)'$"
     if [[ "${recipe}" =~ ${antenna_ram_observe_pattern} ]]; then
@@ -417,6 +445,10 @@ case "${recipe}" in
     exec "${python_cmd}" "${script_dir}/verify_saved_fem_archive_roundtrip.py" --repo-root "${repo_root}"
     ;;
   *"scripts/verify_pinned_dataset_browser.py"*)
+    antenna_spectrum_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3265 --scenario antenna-source-spectrum$'
+    if [[ "${recipe}" =~ ${antenna_spectrum_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3265 --scenario antenna-source-spectrum
+    fi
     antenna_visualization_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3262 --scenario antenna-visualization$'
     if [[ "${recipe}" =~ ${antenna_visualization_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3262 --scenario antenna-visualization
@@ -429,27 +461,35 @@ case "${recipe}" in
     if [[ "${recipe}" =~ ${cpw_viewport_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3260 --scenario antenna-cpw-viewport
     fi
-    restart_action_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3254 --scenario development-restart-action$'
-    if [[ "${recipe}" =~ ${restart_action_browser_pattern} ]]; then
-      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3254 --scenario development-restart-action
-    fi
-    outcome_handoff_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3253 --scenario development-run-outcome-handoff$'
-    if [[ "${recipe}" =~ ${outcome_handoff_browser_pattern} ]]; then
-      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3253 --scenario development-run-outcome-handoff
-    fi
-    kernel_host_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3252 --scenario development-kernel-host$'
-    if [[ "${recipe}" =~ ${kernel_host_browser_pattern} ]]; then
-      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3252 --scenario development-kernel-host
-    fi
     transport_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3254 --scenario antenna-transport-drafts$'
     if [[ "${recipe}" =~ ${transport_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3254 --scenario antenna-transport-drafts
+    fi
+    port_diagnostics_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3263 --scenario antenna-port-diagnostics$'
+    if [[ "${recipe}" =~ ${port_diagnostics_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3263 --scenario antenna-port-diagnostics
+    fi
+    port_editor_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3264 --scenario antenna-port-editor$'
+    if [[ "${recipe}" =~ ${port_editor_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3264 --scenario antenna-port-editor
+    fi
+    inspector_actions_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3257 --scenario inspector-actions$'
+    if [[ "${recipe}" =~ ${inspector_actions_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3257 --scenario inspector-actions
     fi
     primitive_color_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3257 --scenario primitive-color-inspector$'
     if [[ "${recipe}" =~ ${primitive_color_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3257 --scenario primitive-color-inspector
     fi
     stations_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3253 --scenario antenna-microstrip-stations$'
+    object_material_editor_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3266 --scenario object-material-editor$'
+    if [[ "${recipe}" =~ ${object_material_editor_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3266 --scenario object-material-editor
+    fi
+    drive_editor_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3265 --scenario antenna-drive-editor$'
+    if [[ "${recipe}" =~ ${drive_editor_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3265 --scenario antenna-drive-editor
+    fi
     if [[ "${recipe}" =~ ${stations_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3253 --scenario antenna-microstrip-stations
     fi
@@ -457,13 +497,13 @@ case "${recipe}" in
     if [[ "${recipe}" =~ ${antenna_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3252 --scenario antenna-external-lead-inspection
     fi
-    project_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3251 --scenario project-document-handoff$'
-    if [[ "${recipe}" =~ ${project_browser_pattern} ]]; then
-      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3251 --scenario project-document-handoff
-    fi
     study_profile_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3256 --scenario study-execution-profile$'
     if [[ "${recipe}" =~ ${study_profile_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3256 --scenario study-execution-profile
+    fi
+    explorer_physics_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3259 --scenario explorer-physics-reporting$'
+    if [[ "${recipe}" =~ ${explorer_physics_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3259 --scenario explorer-physics-reporting
     fi
     browser_recipe_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+"$'
     if [[ ! "${recipe}" =~ ${browser_recipe_pattern} ]]; then
@@ -471,16 +511,6 @@ case "${recipe}" in
       exit 2
     fi
     exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}"
-    ;;
-  *"scripts/verify_control_room_sources.py"*)
-    # Never execute the recipe text: accept only the fixed argument shape and
-    # invoke the trusted helper from this checkout with the selected route.
-    source_recipe_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_control_room_sources.py" --route (generate-client|production-source|api-hygiene|lint|openapi-import-check|react-doctor|development-restart-check|resource-client-cache-check|development-kernel-host-check|development-transport-pause-check|development-run-outcome-handoff-check|development-run-outcome-handoff-lint|development-restart-action-check|development-restart-action-lint|development-backend-build-action-check) --repo-root "[^"]+"$'
-    if [[ ! "${recipe}" =~ ${source_recipe_pattern} ]]; then
-      echo "[fullmag just] invalid lightweight frontend recipe" >&2
-      exit 2
-    fi
-    exec "${python_cmd}" "${script_dir}/verify_control_room_sources.py" --route "${BASH_REMATCH[1]}" --repo-root "${repo_root}"
     ;;
   *"scripts/verify_project_entrypoint_runtime.py"*)
     exec "${python_cmd}" "${script_dir}/verify_project_entrypoint_runtime.py" --repo-root "${repo_root}"
@@ -532,6 +562,9 @@ case "${recipe}" in
     ;;
   *"scripts/verify_session_persistence.py"*"--route api-source-check"*)
     exec "${python_cmd}" "${script_dir}/verify_session_persistence.py" --route api-source-check --repo-root "${repo_root}"
+    ;;
+  *"scripts/verify_session_persistence.py"*"--route api-service-source-check"*)
+    exec "${python_cmd}" "${script_dir}/verify_session_persistence.py" --route api-service-source-check --repo-root "${repo_root}"
     ;;
   *"scripts/verify_session_persistence.py"*"--route api-resource-pool-check"*)
     exec "${python_cmd}" "${script_dir}/verify_session_persistence.py" --route api-resource-pool-check --repo-root "${repo_root}"

@@ -13,9 +13,11 @@ use anyhow::{bail, Context, Result};
 use fullmag_quantities::SolutionSet;
 
 use crate::archive_document::{ArchiveDocuments, ArchiveFileSnapshot};
+use crate::typed_documents::{LiveSnapshotArtifactReference, LiveSnapshotArtifactReferences};
 use crate::types::{
     ArtifactIndex, BackendStatePayload, CommonSolverState, FieldRole, FmsArtifactCatalog,
-    FmsCheckpoint, FmsCoordinatorJournalDirection, FmsExportProfile,
+    FmsBatchExpansionProgress, FmsBatchIntent, FmsCheckpoint, FmsCoordinatorJournalDirection,
+    FmsExportProfile,
     FmsPreparationProcessExitReceipt, FmsPreparationProcessLaunch, FmsPreparationReceipt,
     FmsPreparationResourceLease, FmsPreparationResourcePool, FmsPreparationRetryDecision,
     FmsResourceLease, FmsRetryDecision, FmsRunCatalog, FmsRunIntent, FmsRunManifest,
@@ -85,6 +87,12 @@ pub struct ReachabilityReport {
     /// graph cannot be advertised as solved or resumable.
     pub warnings: Vec<String>,
     pub complete: bool,
+    /// True when incompleteness comes only from the two known project
+    /// documents whose object references are intentionally opaque today.
+    pub opaque_project_documents_only: bool,
+    /// Monotonic safety bit for missing payloads and unknown references.
+    /// Once set, the report cannot become visualization-safe again.
+    pub has_blocking_incompleteness: bool,
     /// Number of checkpoints and material primary/restart payloads proved by
     /// the walk.  These counters let archive inspection downgrade honestly
     /// instead of treating a descriptor-only checkpoint as resumable.
@@ -110,18 +118,51 @@ impl ReachabilityReport {
     }
 
     fn missing(&mut self, message: impl Into<String>) -> Result<()> {
-        self.conservative(message);
+        let message = message.into();
+        self.complete = false;
+        self.has_blocking_incompleteness = true;
+        self.opaque_project_documents_only = false;
+        self.warnings.push(message.clone());
         Ok(())
     }
 
-    fn conservative(&mut self, message: impl Into<String>) {
+    fn mark_blocking_incomplete(&mut self, message: impl Into<String>) {
         self.complete = false;
+        self.has_blocking_incompleteness = true;
+        self.opaque_project_documents_only = false;
         self.warnings.push(message.into());
+    }
+
+    fn mark_opaque_project_document(&mut self, message: impl Into<String>) {
+        self.complete = false;
+        if !self.has_blocking_incompleteness {
+            self.opaque_project_documents_only = true;
+        }
+        self.warnings.push(message.into());
+    }
+
+    fn conservative(&mut self, message: impl Into<String>) {
+        self.mark_blocking_incomplete(message);
     }
 
     /// Refuse to publish a graph which is missing a required payload.
     pub fn require_complete(&self) -> Result<()> {
         if self.complete {
+            return Ok(());
+        }
+        bail!(
+            "incomplete session object graph: {}",
+            self.warnings.join("; ")
+        )
+    }
+
+    /// Allow only the known opaque project documents during a read-only
+    /// visualization import. Missing files, checkpoint payloads, and unknown
+    /// references remain fail-closed.
+    pub fn require_visualization_safe(&self) -> Result<()> {
+        if self.complete
+            || (self.opaque_project_documents_only && !self.has_blocking_incompleteness)
+        {
             return Ok(());
         }
         bail!(
@@ -153,7 +194,10 @@ fn register_materialized_dataset_revision(
     revisions: &mut BTreeSet<(String, u64)>,
     manifest: &crate::materialized_dataset::MaterializedDatasetManifest,
 ) -> Result<()> {
-    let key = (manifest.dataset.dataset_id.clone(), manifest.dataset.revision);
+    let key = (
+        manifest.dataset.dataset_id.clone(),
+        manifest.dataset.revision,
+    );
     if !revisions.insert(key) {
         bail!("materialized dataset revision is duplicated in the containing SolutionSet");
     }
@@ -233,6 +277,7 @@ fn classify_run_path(relative: &str) -> Result<RunPathKind> {
                 | "worker_process_exit_receipts"
                 | "preparation_process_exit_receipts"
                 | "preparation_process_launches"
+                | "task_cancellation_intents"
         )
         && is_json_record_name(parts[1])
     {
@@ -280,8 +325,12 @@ fn is_reserved_run_container(parts: &[&str]) -> bool {
                     | "resource_leases"
                     | "preparation_resource_leases"
                     | "task_admissions"
+                    | "task_cancellation_intents"
                     | "coordinator_journal"
-            ) => true,
+            ) =>
+        {
+            true
+        }
         [container, _]
             if matches!(
                 *container,
@@ -290,7 +339,10 @@ fn is_reserved_run_container(parts: &[&str]) -> bool {
                     | "preparation_resource_leases"
                     | "task_admissions"
                     | "coordinator_journal"
-            ) => true,
+            ) =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -349,7 +401,10 @@ pub(crate) fn walk_export_file_documents(
     }
     let root = fs::canonicalize(root)?;
     let mut walker = ArchiveWalker {
-        documents: ArchiveDocuments::Files { snapshots: documents, root: &root },
+        documents: ArchiveDocuments::Files {
+            snapshots: documents,
+            root: &root,
+        },
         cas_root: Some(&root),
         mode: ReachabilityMode::Export,
         report: ReachabilityReport::new(),
@@ -361,14 +416,54 @@ pub(crate) fn walk_export_file_documents(
     walker.walk_archive()
 }
 
+/// Export planning reads project documents separately from the run-file
+/// inventory. Overlay the already-read project documents so live snapshot
+/// artifact refs receive the same graph validation without materializing run
+/// payloads in memory.
+pub(crate) fn walk_export_file_documents_with_project(
+    documents: &HashMap<String, ArchiveFileSnapshot>,
+    root: &Path,
+    inline_project_documents: &HashMap<String, Vec<u8>>,
+) -> Result<ReachabilityReport> {
+    for name in inline_project_documents.keys() {
+        validate_file_ref(name).with_context(|| format!("invalid inline project document `{name}`"))?;
+        if !name.starts_with("project/") || name.starts_with("objects/") {
+            bail!("inline export overlay accepts only project documents: `{name}`");
+        }
+        if documents.contains_key(name) {
+            bail!("inline project document shadows file inventory entry `{name}`");
+        }
+    }
+    let root = fs::canonicalize(root)?;
+    let mut walker = ArchiveWalker {
+        documents: ArchiveDocuments::FilesWithInline {
+            snapshots: documents,
+            root: &root,
+            inline: inline_project_documents,
+        },
+        cas_root: Some(&root),
+        mode: ReachabilityMode::Export,
+        report: ReachabilityReport::new(),
+        seen_checkpoints: HashSet::new(),
+        tensor_descriptor_cache: None,
+        namespace_files: HashSet::new(),
+        unclassified_paths: HashSet::new(),
+    };
+    walker.walk_archive()
+}
 /// Traverse a decoded import inventory using the same typed restore graph.
 pub(crate) fn walk_import_file_documents(
-    documents: &HashMap<String, ArchiveFileSnapshot>, root: &Path,
+    documents: &HashMap<String, ArchiveFileSnapshot>,
+    root: &Path,
 ) -> Result<ReachabilityReport> {
     let root = fs::canonicalize(root)?;
     let mut walker = ArchiveWalker {
-        documents: ArchiveDocuments::Files { snapshots: documents, root: &root },
-        cas_root: Some(&root), mode: ReachabilityMode::Restore,
+        documents: ArchiveDocuments::Files {
+            snapshots: documents,
+            root: &root,
+        },
+        cas_root: Some(&root),
+        mode: ReachabilityMode::Restore,
         report: ReachabilityReport::new(),
         seen_checkpoints: HashSet::new(),
         tensor_descriptor_cache: None,
@@ -428,6 +523,7 @@ impl StoreWalker {
         self.walk_recovery_dir()?;
         self.walk_scheduler_pools_dir()?;
         self.walk_live_command_journals_dir()?;
+        self.walk_batches_dir()?;
         self.walk_runs_dir()?;
         self.walk_solutions_dir()?;
         self.walk_objects_dir()?;
@@ -458,6 +554,7 @@ impl StoreWalker {
                     }
                 }
                 "manifests"
+                | "batches"
                 | "runs"
                 | "scheduler_pools"
                 | "live_command_journals"
@@ -501,8 +598,7 @@ impl StoreWalker {
                         self.walk_project_namespace(&entry.path())?;
                     } else {
                         self.walk_arbitrary_files(&entry.path(), &name)?;
-                        self.report.complete = false;
-                        self.report.warnings.push(format!(
+                        self.report.mark_blocking_incomplete(format!(
                             "untyped session document root `{name}` requires conservative GC"
                         ));
                     }
@@ -561,27 +657,31 @@ impl StoreWalker {
             let relative = format!("project/{name}");
             let data = self.read_file(&entry.path(), &relative)?;
             if name == "current_live_snapshot.json" {
-                match crate::typed_documents::inspect_live_snapshot(&data) {
-                    crate::typed_documents::TypedInspection::Typed { object_refs } => {
+                let inspection = crate::typed_documents::inspect_live_snapshot(&data);
+                match inspection.object_refs {
+                    Ok(object_refs) => {
                         for object_ref in object_refs {
                             self.follow_store_object_ref(&object_ref, &relative, "live snapshot")?;
                         }
                     }
-                    crate::typed_documents::TypedInspection::Untyped(reason) => {
-                        self.report.complete = false;
-                        self.report.warnings.push(format!(
-                            "project document `{relative}` has untyped object references ({reason}); conservative GC required"
-                        ));
+                    Err(reason) => self.report.mark_opaque_project_document(format!(
+                        "project document `{relative}` has untyped object references ({reason}); conservative GC required"
+                    )),
+                }
+                match inspection.artifact_refs {
+                    Ok(artifact_refs) => {
+                        self.follow_store_live_snapshot_artifacts(&artifact_refs, &relative)?;
                     }
+                    Err(reason) => self.report.mark_blocking_incomplete(format!(
+                        "project document `{relative}` has invalid live artifact references ({reason}); conservative GC required"
+                    )),
                 }
             } else if !KNOWN_LEAFS.contains(&name.as_str()) {
-                self.report.complete = false;
-                self.report.warnings.push(format!(
+                self.report.mark_blocking_incomplete(format!(
                     "unknown project document `{relative}` requires conservative GC"
                 ));
             } else if name == "asset_index.json" {
-                self.report.complete = false;
-                self.report.warnings.push(format!(
+                self.report.mark_opaque_project_document(format!(
                     "project document `{relative}` has untyped object references; conservative GC required"
                 ));
             }
@@ -589,6 +689,77 @@ impl StoreWalker {
         Ok(())
     }
 
+    fn follow_store_live_snapshot_artifacts(
+        &mut self,
+        references: &LiveSnapshotArtifactReferences,
+        source: &str,
+    ) -> Result<()> {
+        for artifact in &references.artifacts {
+            let relative = live_snapshot_artifact_path(&references.run_id, &artifact.path)
+                .with_context(|| format!("invalid live artifact reference in `{source}`"))?;
+            self.follow_store_live_artifact(&relative, &artifact.kind, source)?;
+        }
+        Ok(())
+    }
+
+    fn follow_store_live_artifact(
+        &mut self,
+        relative: &str,
+        kind: &str,
+        source: &str,
+    ) -> Result<()> {
+        reject_link_chain(&self.root, relative)?;
+        let path = self.root.join(relative);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.missing(format!(
+                    "live snapshot `{source}` references missing run artifact `{relative}`"
+                ));
+            }
+            Err(error) => return Err(error).with_context(|| format!("checking live artifact `{relative}`")),
+        };
+        if metadata.is_file() {
+            self.report.file_refs.insert(relative.to_string());
+            return Ok(());
+        }
+        // Persisted `ArtifactEntry.kind == "zarr"` is emitted for Zarr
+        // directory roots (and may also identify a single Zarr file). No path
+        // suffix heuristic is used to decide whether a subtree is legal.
+        if !metadata.is_dir() || kind != "zarr" {
+            bail!("live snapshot artifact `{relative}` is not a file or supported Zarr directory");
+        }
+
+        let mut pending = vec![(path, relative.to_string())];
+        let mut file_count = 0usize;
+        while let Some((directory, directory_relative)) = pending.pop() {
+            reject_link_chain(&self.root, &directory_relative)?;
+            for entry in read_directory(&directory)? {
+                let name = entry.file_name();
+                let name = name
+                    .to_str()
+                    .context("live Zarr artifact contains a non-portable path component")?;
+                let child_relative = format!("{directory_relative}/{name}");
+                validate_file_ref(&child_relative)?;
+                reject_link_chain(&self.root, &child_relative)?;
+                let child_metadata = fs::symlink_metadata(entry.path())?;
+                if child_metadata.is_dir() {
+                    pending.push((entry.path(), child_relative));
+                } else if child_metadata.is_file() {
+                    file_count = file_count.saturating_add(1);
+                    self.report.file_refs.insert(child_relative);
+                } else {
+                    bail!("unsupported live Zarr artifact entry `{child_relative}`");
+                }
+            }
+        }
+        if file_count == 0 {
+            self.missing(format!(
+                "live snapshot `{source}` references an empty Zarr artifact subtree `{relative}`"
+            ))?;
+        }
+        Ok(())
+    }
     fn walk_objects_dir(&mut self) -> Result<()> {
         let objects = self.root.join("objects");
         if !objects.exists() {
@@ -796,7 +967,11 @@ impl StoreWalker {
                     }
                     crate::solution_field_geometry::SOLUTION_FIELD_GEOMETRY_SCHEMA => {
                         self.follow_field_geometry_artifact(
-                            artifact, solution, &member.member_id, &mut geometry_sources, source,
+                            artifact,
+                            solution,
+                            &member.member_id,
+                            &mut geometry_sources,
+                            source,
                         )?;
                     }
                     _ => {}
@@ -828,7 +1003,10 @@ impl StoreWalker {
         }
 
         use std::io::Read;
-        reject_link_chain(&self.root, &format!("objects/sha256/{}", artifact.object_ref))?;
+        reject_link_chain(
+            &self.root,
+            &format!("objects/sha256/{}", artifact.object_ref),
+        )?;
         let mut data = Vec::new();
         fs::File::open(&object_path)?
             .take(crate::solution_tensor_source::MAX_SOLUTION_TENSOR_METADATA_BYTES + 1)
@@ -839,9 +1017,8 @@ impl StoreWalker {
                 artifact.object_ref
             )
         }
-        let descriptor = crate::solution_tensor_source::parse_solution_tensor_artifact(
-            &data, artifact,
-        )?;
+        let descriptor =
+            crate::solution_tensor_source::parse_solution_tensor_artifact(&data, artifact)?;
         for chunk in &descriptor.chunks {
             self.follow_solution_object_ref(&chunk.object_ref, chunk.length as u64, source)?;
         }
@@ -870,7 +1047,10 @@ impl StoreWalker {
             )
         }
         use std::io::Read;
-        reject_link_chain(&self.root, &format!("objects/sha256/{}", artifact.object_ref))?;
+        reject_link_chain(
+            &self.root,
+            &format!("objects/sha256/{}", artifact.object_ref),
+        )?;
         let mut data = Vec::new();
         fs::File::open(&object_path)?
             .take(crate::materialized_dataset::MAX_MATERIALIZED_DATASET_METADATA_BYTES + 1)
@@ -882,9 +1062,8 @@ impl StoreWalker {
                 artifact.object_ref
             )
         }
-        let manifest = crate::materialized_dataset::parse_materialized_dataset_artifact(
-            &data, artifact,
-        )?;
+        let manifest =
+            crate::materialized_dataset::parse_materialized_dataset_artifact(&data, artifact)?;
         register_materialized_dataset_revision(dataset_revisions, &manifest)?;
         if artifact.accepted_state != manifest.field.accepted_state {
             bail!("materialized dataset artifact accepted state differs from its field");
@@ -908,8 +1087,12 @@ impl StoreWalker {
         if owner.solution_revision == solution.revision {
             crate::materialized_dataset::validate_materialized_dataset_owner(&manifest, solution)?;
         } else {
-            let historical = self.read_solution_revision(owner.solution_set_id.as_str(), owner.solution_revision)?;
-            crate::materialized_dataset::validate_materialized_dataset_owner(&manifest, &historical)?;
+            let historical = self
+                .read_solution_revision(owner.solution_set_id.as_str(), owner.solution_revision)?;
+            crate::materialized_dataset::validate_materialized_dataset_owner(
+                &manifest,
+                &historical,
+            )?;
         }
         self.follow_solution_object_ref(
             &manifest.field.tensor_artifact.object_ref,
@@ -934,36 +1117,62 @@ impl StoreWalker {
     ) -> Result<()> {
         use crate::solution_field_geometry as geometry;
         use std::io::Read;
-        if artifact.byte_length == 0 || artifact.byte_length > geometry::MAX_FIELD_GEOMETRY_MANIFEST_BYTES {
+        if artifact.byte_length == 0
+            || artifact.byte_length > geometry::MAX_FIELD_GEOMETRY_MANIFEST_BYTES
+        {
             bail!("saved field geometry binding exceeds its metadata budget");
         }
         let relative = format!("objects/sha256/{}", artifact.object_ref);
         let path = self.root.join(&relative);
-        if !path.exists() { return Ok(()); }
+        if !path.exists() {
+            return Ok(());
+        }
         reject_link_chain(&self.root, &relative)?;
         let mut bytes = Vec::new();
-        fs::File::open(path)?.take(geometry::MAX_FIELD_GEOMETRY_MANIFEST_BYTES + 1).read_to_end(&mut bytes)?;
+        fs::File::open(path)?
+            .take(geometry::MAX_FIELD_GEOMETRY_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)?;
         let manifest = geometry::parse_solution_field_geometry_manifest(&bytes, artifact)?;
         drop(bytes);
-        if !geometry_sources.insert((manifest.source.member_id.clone(), manifest.source.artifact_id.clone())) {
+        if !geometry_sources.insert((
+            manifest.source.member_id.clone(),
+            manifest.source.artifact_id.clone(),
+        )) {
             bail!("saved field geometry is duplicated for the same tensor");
         }
         geometry::validate_field_geometry_owner(&manifest, solution, member_id, false)?;
         if manifest.source.solution_revision != solution.revision {
-            let historical = self.read_solution_revision(&manifest.source.solution_set_id, manifest.source.solution_revision)?;
+            let historical = self.read_solution_revision(
+                &manifest.source.solution_set_id,
+                manifest.source.solution_revision,
+            )?;
             geometry::validate_field_geometry_owner(&manifest, &historical, member_id, true)?;
         }
-        self.follow_solution_object_ref(&manifest.geometry.object_ref, manifest.geometry.byte_length, source)?;
+        self.follow_solution_object_ref(
+            &manifest.geometry.object_ref,
+            manifest.geometry.byte_length,
+            source,
+        )?;
         let relative = format!("objects/sha256/{}", manifest.geometry.object_ref);
         let path = self.root.join(&relative);
-        if !path.exists() { return Ok(()); }
+        if !path.exists() {
+            return Ok(());
+        }
         reject_link_chain(&self.root, &relative)?;
         let mut bytes = Vec::new();
-        fs::File::open(path)?.take(geometry::MAX_FEM_P1_GEOMETRY_BYTES + 1).read_to_end(&mut bytes)?;
+        fs::File::open(path)?
+            .take(geometry::MAX_FEM_P1_GEOMETRY_BYTES + 1)
+            .read_to_end(&mut bytes)?;
         let saved = geometry::parse_saved_fem_p1_geometry(&bytes, &manifest.geometry)?;
         drop(bytes);
-        self.follow_solution_object_ref(&manifest.tensor_artifact.object_ref, manifest.tensor_artifact.byte_length, source)?;
-        if let Some(tensor) = self.follow_solution_tensor_artifact(&manifest.tensor_artifact, source)? {
+        self.follow_solution_object_ref(
+            &manifest.tensor_artifact.object_ref,
+            manifest.tensor_artifact.byte_length,
+            source,
+        )?;
+        if let Some(tensor) =
+            self.follow_solution_tensor_artifact(&manifest.tensor_artifact, source)?
+        {
             geometry::validate_saved_geometry_tensor(&saved, &tensor)?;
         }
         Ok(())
@@ -997,9 +1206,7 @@ impl StoreWalker {
         revision: u64,
     ) -> Result<SolutionSet> {
         let directory = crate::cas::hex_sha256(solution_set_id.as_bytes());
-        let relative = format!(
-            "solutions/{directory}/revisions/{revision:020}.json"
-        );
+        let relative = format!("solutions/{directory}/revisions/{revision:020}.json");
         let path = self.root.join(&relative);
         let data = self.read_file(&path, &relative)?;
         let historical: SolutionSet = parse_json(&data, &relative)?;
@@ -1090,6 +1297,119 @@ impl StoreWalker {
         Ok(())
     }
 
+    fn walk_batches_dir(&mut self) -> Result<()> {
+        let directory = self.root.join("batches");
+        if !directory.exists() {
+            return Ok(());
+        }
+        for batch_entry in read_directory(&directory)? {
+            if batch_entry.file_type()?.is_symlink() || !batch_entry.file_type()?.is_dir() {
+                bail!("unsafe batch root `{}`", batch_entry.path().display())
+            }
+            let batch_id = batch_entry.file_name().to_string_lossy().into_owned();
+            validate_component(&batch_id)
+                .with_context(|| format!("invalid batch directory `{batch_id}`"))?;
+            let batch_directory = batch_entry.path();
+            let mut intent_path = None;
+            let mut progress_path = None;
+            for entry in read_directory(&batch_directory)? {
+                let entry_name = entry.file_name().to_string_lossy().into_owned();
+                if entry.file_type()?.is_symlink() || !entry.file_type()?.is_file() {
+                    bail!(
+                        "unknown batch namespace entry `{}`",
+                        entry.path().display()
+                    )
+                }
+                match entry_name.as_str() {
+                    "batch_intent.json" => intent_path = Some(entry.path()),
+                    "expansion_progress.json" => progress_path = Some(entry.path()),
+                    _ => bail!(
+                        "unknown batch namespace entry `{}`",
+                        entry.path().display()
+                    ),
+                }
+            }
+            let intent_path = intent_path.with_context(|| {
+                format!("batch directory `{batch_id}` is missing batch_intent.json")
+            })?;
+            self.walk_batch_intent_file(&intent_path, &batch_id)?;
+            if let Some(progress_path) = progress_path {
+                self.walk_batch_expansion_progress_file(&progress_path, &batch_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn walk_batch_intent_file(&mut self, path: &Path, expected_batch_id: &str) -> Result<()> {
+        let relative = format!("batches/{expected_batch_id}/batch_intent.json");
+        let data = self.read_file(path, &relative)?;
+        let intent: FmsBatchIntent = parse_json(&data, &relative)?;
+        intent.validate()?;
+        if intent.batch_id != expected_batch_id {
+            bail!(
+                "batch intent `{relative}` contains mismatched batch_id `{}`",
+                intent.batch_id
+            )
+        }
+        self.follow_store_object_ref(
+            &intent.manifest_object_ref,
+            &relative,
+            "batch expansion manifest",
+        )?;
+        let manifest_path = self
+            .root
+            .join("objects/sha256")
+            .join(&intent.manifest_object_ref);
+        if manifest_path.exists() {
+            let manifest_bytes = fs::read(&manifest_path)?;
+            intent.validate_manifest_bytes(&manifest_bytes)?;
+        }
+        self.follow_store_object_ref(
+            &intent.definition_object_ref,
+            &relative,
+            "batch project definition",
+        )?;
+        self.follow_store_object_ref(&intent.study_object_ref, &relative, "batch study")?;
+        self.follow_store_object_ref(
+            &intent.study_catalog_object_ref,
+            &relative,
+            "batch source study catalog",
+        )?;
+        for object_ref in intent.asset_object_refs.values() {
+            self.follow_store_object_ref(object_ref, &relative, "batch asset")?;
+        }
+        Ok(())
+    }
+
+    fn walk_batch_expansion_progress_file(&mut self, path: &Path, batch_id: &str) -> Result<()> {
+        let relative = format!("batches/{batch_id}/expansion_progress.json");
+        let data = self.read_file(path, &relative)?;
+        let progress: FmsBatchExpansionProgress = parse_json(&data, &relative)?;
+        progress.validate()?;
+        let intent_relative = format!("batches/{batch_id}/batch_intent.json");
+        let intent_path = self.root.join(&intent_relative);
+        let intent_data = self.read_file(&intent_path, &intent_relative)?;
+        let intent: FmsBatchIntent = parse_json(&intent_data, &intent_relative)?;
+        intent.validate()?;
+        if intent.batch_id != batch_id {
+            bail!("batch intent identity does not match expansion progress path");
+        }
+        self.follow_store_object_ref(
+            &intent.manifest_object_ref,
+            &relative,
+            "batch expansion manifest",
+        )?;
+        let manifest_path = self
+            .root
+            .join("objects/sha256")
+            .join(&intent.manifest_object_ref);
+        if manifest_path.exists() {
+            let manifest_bytes = fs::read(&manifest_path)?;
+            progress.validate_for_manifest(&intent, &manifest_bytes)?;
+        }
+        Ok(())
+    }
+
     fn walk_runs_dir(&mut self) -> Result<()> {
         let directory = self.root.join("runs");
         if !directory.exists() {
@@ -1126,6 +1446,7 @@ impl StoreWalker {
             }
             self.walk_task_preparation_receipts(&run_entry.path(), &run_id)?;
             self.walk_run_task_admissions(&run_entry.path(), &run_id)?;
+            self.walk_run_task_cancellations(&run_entry.path(), &run_id)?;
             self.walk_run_retry_decisions(&run_entry.path(), &run_id)?;
             self.walk_run_preparation_retry_decisions(&run_entry.path(), &run_id)?;
             self.walk_run_worker_process_exit_receipts(&run_entry.path(), &run_id)?;
@@ -1197,7 +1518,10 @@ impl StoreWalker {
             for entry in read_directory(&directory)? {
                 let file_type = entry.file_type()?;
                 if file_type.is_symlink() {
-                    bail!("symlink under session run namespace: {}", entry.path().display());
+                    bail!(
+                        "symlink under session run namespace: {}",
+                        entry.path().display()
+                    );
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let relative = format!("{prefix}/{name}");
@@ -1237,9 +1561,8 @@ impl StoreWalker {
                 } else {
                     "unconsumed session run document"
                 };
-                self.report.conservative(format!(
-                    "{kind} `{relative}` requires conservative GC"
-                ));
+                self.report
+                    .conservative(format!("{kind} `{relative}` requires conservative GC"));
             }
         }
     }
@@ -1773,6 +2096,20 @@ impl StoreWalker {
             }
             self.walk_run_file(run_ref, run_id)?;
         }
+        for batch_ref in &session.batch_refs {
+            let batch_id = batch_ref
+                .strip_prefix("batches/")
+                .and_then(|value| value.strip_suffix("/batch_intent.json"))
+                .context("validated session batch ref lost its identity")?;
+            let path = self.root.join(batch_ref);
+            if !path.exists() {
+                self.missing(format!(
+                    "session references missing batch intent `{batch_ref}`"
+                ))?;
+                continue;
+            }
+            self.walk_batch_intent_file(&path, batch_id)?;
+        }
         Ok(())
     }
 
@@ -1926,6 +2263,52 @@ impl StoreWalker {
         Ok(())
     }
 
+    fn walk_run_task_cancellations(&mut self, run_path: &Path, run_id: &str) -> Result<()> {
+        let root = run_path.join("task_cancellation_intents");
+        match fs::symlink_metadata(&root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("reading cancellation intent directory"),
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                bail!("unsafe cancellation intent directory")
+            }
+            Ok(_) => {}
+        }
+        let catalog_ref = format!("runs/{run_id}/run_catalog.json");
+        let catalog: FmsRunCatalog = parse_json(
+            &self.read_file(&run_path.join("run_catalog.json"), &catalog_ref)?,
+            &catalog_ref,
+        )?;
+        catalog.validate()?;
+        if catalog.run_id != run_id {
+            bail!("cancellation intent catalog belongs to another run");
+        }
+        for entry in read_directory(&root)? {
+            crate::repository_path::reject_link(&entry.path())?;
+            if !entry.file_type()?.is_file() {
+                bail!("cancellation intent must be a regular file");
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 cancellation intent filename"))?;
+            let task_id = name
+                .strip_suffix(".json")
+                .context("cancellation intent must be JSON")?;
+            validate_component(task_id)?;
+            let relative = format!("runs/{run_id}/task_cancellation_intents/{name}");
+            let data = crate::repository_path::read_bounded_regular_file(
+                &self.root,
+                &relative,
+                256 * 1024,
+            )?;
+            let record: crate::FmsTaskCancellationIntent = parse_json(&data, &relative)?;
+            record.validate()?;
+            validate_cancellation_catalog_identity(&record, &catalog, run_id, task_id)?;
+            self.report.file_refs.insert(relative);
+        }
+        Ok(())
+    }
+
     fn walk_run_task_admissions(&mut self, run_path: &Path, expected_run_id: &str) -> Result<()> {
         let root = run_path.join("task_admissions");
         crate::repository_path::reject_link(&root)?;
@@ -1975,6 +2358,15 @@ impl StoreWalker {
                     || record.lease.attempt_id != attempt_id
                 {
                     bail!("task admission identity does not match its path");
+                }
+                if let Some(snapshot) = &record.resolved_inputs_snapshot {
+                    for object_ref in snapshot.object_refs()? {
+                        self.follow_store_object_ref(
+                            &object_ref,
+                            &relative,
+                            "task admission resolved input",
+                        )?;
+                    }
                 }
                 let current = catalog
                     .tasks
@@ -2233,8 +2625,7 @@ impl StoreWalker {
                 // this walker cannot interpret.  Retaining the file itself is
                 // insufficient for a safe mark set, so GC/export stays
                 // incomplete until the document schema gets a typed walker.
-                self.report.complete = false;
-                self.report.warnings.push(format!(
+                self.report.mark_blocking_incomplete(format!(
                     "untyped session reference `{source}` requires conservative retention"
                 ));
             }
@@ -2326,7 +2717,9 @@ impl<'a> ArchiveWalker<'a> {
             match fs::symlink_metadata(&path) {
                 Ok(_) => {
                     return crate::cas::verified_file_length(&path, object_ref)
-                        .with_context(|| format!("CAS SHA-256 verification failed for `{relative}`"))
+                        .with_context(|| {
+                            format!("CAS SHA-256 verification failed for `{relative}`")
+                        })
                         .map(Some);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2360,7 +2753,10 @@ impl<'a> ArchiveWalker<'a> {
             }
             return Ok(data);
         }
-        self.documents.read(&relative)?.map(|data| data.into_owned()).context("validated archive object disappeared")
+        self.documents
+            .read(&relative)?
+            .map(|data| data.into_owned())
+            .context("validated archive object disappeared")
     }
 
     fn walk_archive(&mut self) -> Result<ReachabilityReport> {
@@ -2381,6 +2777,13 @@ impl<'a> ArchiveWalker<'a> {
                     bail!("session run ref is not a run manifest: `{run_ref}`")
                 }
             }
+            for batch_ref in &session.batch_refs {
+                let batch_id = batch_ref
+                    .strip_prefix("batches/")
+                    .and_then(|value| value.strip_suffix("/batch_intent.json"))
+                    .context("validated session batch ref lost its identity")?;
+                self.walk_batch_intent(batch_ref, batch_id)?;
+            }
         }
 
         // A portable archive may contain a run that was not selected by the
@@ -2397,6 +2800,37 @@ impl<'a> ArchiveWalker<'a> {
                 };
                 validate_component(run_id)?;
                 self.walk_run(&name, run_id)?;
+            }
+        }
+
+        // Durable batch parents may exist before any child run has been
+        // published, so they are roots in their own right during preflight.
+        let names = self.documents.keys().cloned().collect::<Vec<_>>();
+        for name in names {
+            let Some(batch_id) = name
+                .strip_prefix("batches/")
+                .and_then(|value| value.strip_suffix("/batch_intent.json"))
+            else {
+                continue;
+            };
+            validate_component(batch_id)?;
+            self.walk_batch_intent(&name, batch_id)?;
+        }
+        let progress_names = self
+            .documents
+            .keys()
+            .filter(|name| name.starts_with("batches/") && name.ends_with("/expansion_progress.json"))
+            .cloned()
+            .collect::<Vec<_>>();
+        for progress_ref in progress_names {
+            let batch_id = progress_ref
+                .strip_prefix("batches/")
+                .and_then(|value| value.strip_suffix("/expansion_progress.json"))
+                .context("validated batch progress ref lost its identity")?;
+            validate_component(batch_id)?;
+            let intent_ref = format!("batches/{batch_id}/batch_intent.json");
+            if !self.documents.contains_key(&intent_ref) {
+                bail!("batch expansion progress `{progress_ref}` has no parent intent");
             }
         }
 
@@ -2586,20 +3020,85 @@ impl<'a> ArchiveWalker<'a> {
         let Some(data) = self.documents.read(NAME)? else {
             return Ok(());
         };
-        match crate::typed_documents::inspect_live_snapshot(&data) {
-            crate::typed_documents::TypedInspection::Typed { object_refs } => {
-                self.report.file_refs.insert(NAME.to_string());
+        self.report.file_refs.insert(NAME.to_string());
+        let inspection = crate::typed_documents::inspect_live_snapshot(&data);
+        match inspection.object_refs {
+            Ok(object_refs) => {
                 for object_ref in object_refs {
                     self.add_archive_payload(&object_ref, NAME, None)?;
                 }
             }
-            crate::typed_documents::TypedInspection::Untyped(reason) => {
-                self.report.conservative(format!(
-                    "archive project document `{NAME}` has untyped object references ({reason}); conservative retention required"
-                ));
+            Err(reason) => self.report.mark_opaque_project_document(format!(
+                "archive project document `{NAME}` has untyped object references ({reason}); conservative retention required"
+            )),
+        }
+        match inspection.artifact_refs {
+            Ok(artifact_refs) => {
+                self.follow_archive_live_snapshot_artifacts(&artifact_refs, NAME)?;
+            }
+            Err(reason) => self.report.mark_blocking_incomplete(format!(
+                "archive project document `{NAME}` has invalid live artifact references ({reason}); conservative retention required"
+            )),
+        }
+        Ok(())
+    }
+
+    fn follow_archive_live_snapshot_artifacts(
+        &mut self,
+        references: &LiveSnapshotArtifactReferences,
+        source: &str,
+    ) -> Result<()> {
+        for artifact in &references.artifacts {
+            let relative = live_snapshot_artifact_path(&references.run_id, &artifact.path)
+                .with_context(|| format!("invalid live artifact reference in `{source}`"))?;
+            let exact_member = self.documents.contains_key(&relative);
+            let prefix = format!("{relative}/");
+            let descendants = self
+                .documents
+                .keys()
+                .filter(|name| name.starts_with(&prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            if exact_member && !descendants.is_empty() {
+                bail!("archive live artifact `{relative}` is both a file and a subtree");
+            }
+            if exact_member {
+                if !self.archive_live_artifact_member_present(&relative)? {
+                    self.report.missing(format!(
+                        "live snapshot `{source}` references missing archived artifact `{relative}`"
+                    ))?;
+                }
+            } else if artifact.kind == "zarr" && !descendants.is_empty() {
+                for member in descendants {
+                    if !self.archive_live_artifact_member_present(&member)? {
+                        self.report.missing(format!(
+                            "live snapshot `{source}` references missing archived Zarr member `{member}`"
+                        ))?;
+                    }
+                }
+            } else {
+                self.report.missing(format!(
+                    "live snapshot `{source}` references missing archived artifact `{relative}`"
+                ))?;
             }
         }
         Ok(())
+    }
+
+    fn archive_live_artifact_member_present(&self, relative: &str) -> Result<bool> {
+        if !self.documents.contains_key(relative) {
+            return Ok(false);
+        }
+        let Some(root) = self.cas_root else {
+            return Ok(true);
+        };
+        reject_link_chain(root, relative)?;
+        match fs::symlink_metadata(root.join(relative)) {
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => bail!("archived live artifact member `{relative}` is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("checking archived artifact `{relative}`")),
+        }
     }
 
     fn validate_archive_namespace(&mut self) -> Result<()> {
@@ -2631,13 +3130,11 @@ impl<'a> ArchiveWalker<'a> {
                 }
                 "project" => {
                     if !KNOWN_PROJECT_LEAFS.contains(&remainder) {
-                        self.report.complete = false;
-                        self.report.warnings.push(format!(
+                        self.report.mark_blocking_incomplete(format!(
                             "unknown archive project document `{name}` requires conservative retention"
                         ));
                     } else if remainder == "asset_index.json" {
-                        self.report.complete = false;
-                        self.report.warnings.push(format!(
+                        self.report.mark_opaque_project_document(format!(
                             "archive project document `{name}` has untyped object references; conservative retention required"
                         ));
                     }
@@ -2656,6 +3153,16 @@ impl<'a> ArchiveWalker<'a> {
                         self.unclassified_paths.insert(name.clone());
                     }
                 },
+                "batches" => {
+                    let Some((batch_id, record)) = remainder.split_once('/') else {
+                        bail!("batch namespace root must be a directory `{name}`")
+                    };
+                    validate_component(batch_id)?;
+                    if !matches!(record, "batch_intent.json" | "expansion_progress.json") {
+                        bail!("unknown batch archive document `{name}`")
+                    }
+                    self.namespace_files.insert(name.clone());
+                }
                 "solutions" => validate_solution_archive_path(name)?,
                 "objects" => {
                     let Some(object_ref) = name.strip_prefix("objects/sha256/") else {
@@ -2721,12 +3228,17 @@ impl<'a> ArchiveWalker<'a> {
                     bail!("solution-set revision history has a gap")
                 }
                 let solution: SolutionSet = {
-                    let data = self.documents.read(name)?
+                    let data = self
+                        .documents
+                        .read(name)?
                         .context("solution-set revision disappeared during archive walk")?;
                     parse_json(&data, name)?
                 };
                 self.validate_archive_solution_identity(
-                    &solution, &directory, Some(*revision), name,
+                    &solution,
+                    &directory,
+                    Some(*revision),
+                    name,
                 )?;
                 self.walk_archive_solution_objects(&solution, name)?;
                 self.report.file_refs.insert(name.clone());
@@ -2807,7 +3319,11 @@ impl<'a> ArchiveWalker<'a> {
                     }
                     crate::solution_field_geometry::SOLUTION_FIELD_GEOMETRY_SCHEMA => {
                         self.add_archive_field_geometry_artifact(
-                            artifact, solution, &member.member_id, &mut geometry_sources, source,
+                            artifact,
+                            solution,
+                            &member.member_id,
+                            &mut geometry_sources,
+                            source,
                         )?;
                     }
                     _ => {
@@ -2831,7 +3347,9 @@ impl<'a> ArchiveWalker<'a> {
     fn follow_solution_run_owner(&mut self, solution: &SolutionSet) -> Result<()> {
         crate::repository_path::validate_store_id(&solution.run_id)?;
         let relative = format!("runs/{}/run_intent.json", solution.run_id);
-        let bytes = self.documents.read(&relative)?
+        let bytes = self
+            .documents
+            .read(&relative)?
             .context("typed solution tensor requires its archived run intent owner")?;
         if bytes.len() as u64 > crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES {
             bail!("solution tensor run intent exceeds metadata budget");
@@ -2868,15 +3386,16 @@ impl<'a> ArchiveWalker<'a> {
         let Some(bytes) = self.bounded_archive_object(
             &artifact.object_ref,
             crate::solution_tensor_source::MAX_SOLUTION_TENSOR_METADATA_BYTES,
-        )? else {
+        )?
+        else {
             self.report.missing(format!(
-                "solution set `{source}` references missing object `{}`", artifact.object_ref
+                "solution set `{source}` references missing object `{}`",
+                artifact.object_ref
             ))?;
             return Ok(None);
         };
-        let descriptor = crate::solution_tensor_source::parse_solution_tensor_artifact(
-            &bytes, artifact,
-        )?;
+        let descriptor =
+            crate::solution_tensor_source::parse_solution_tensor_artifact(&bytes, artifact)?;
         for chunk in &descriptor.chunks {
             self.add_archive_solution_object(&chunk.object_ref, chunk.length as u64, source)?;
         }
@@ -2896,12 +3415,12 @@ impl<'a> ArchiveWalker<'a> {
         let Some(bytes) = self.bounded_archive_object(
             &artifact.object_ref,
             crate::materialized_dataset::MAX_MATERIALIZED_DATASET_METADATA_BYTES,
-        )? else {
+        )?
+        else {
             return Ok(());
         };
-        let manifest = crate::materialized_dataset::parse_materialized_dataset_artifact(
-            &bytes, artifact,
-        )?;
+        let manifest =
+            crate::materialized_dataset::parse_materialized_dataset_artifact(&bytes, artifact)?;
         register_materialized_dataset_revision(dataset_revisions, &manifest)?;
         if artifact.accepted_state != manifest.field.accepted_state {
             bail!("materialized dataset artifact accepted state differs from its field");
@@ -2925,11 +3444,12 @@ impl<'a> ArchiveWalker<'a> {
         if owner.solution_revision == solution.revision {
             crate::materialized_dataset::validate_materialized_dataset_owner(&manifest, solution)?;
         } else {
-            let historical = self.read_archive_solution_revision(
-                &owner.solution_set_id,
-                owner.solution_revision,
+            let historical = self
+                .read_archive_solution_revision(&owner.solution_set_id, owner.solution_revision)?;
+            crate::materialized_dataset::validate_materialized_dataset_owner(
+                &manifest,
+                &historical,
             )?;
-            crate::materialized_dataset::validate_materialized_dataset_owner(&manifest, &historical)?;
         }
         let Some(descriptor) =
             self.add_archive_solution_tensor_artifact(&manifest.field.tensor_artifact, source)?
@@ -2948,30 +3468,52 @@ impl<'a> ArchiveWalker<'a> {
         source: &str,
     ) -> Result<()> {
         use crate::solution_field_geometry as geometry;
-        if artifact.byte_length == 0 || artifact.byte_length > geometry::MAX_FIELD_GEOMETRY_MANIFEST_BYTES {
+        if artifact.byte_length == 0
+            || artifact.byte_length > geometry::MAX_FIELD_GEOMETRY_MANIFEST_BYTES
+        {
             bail!("saved field geometry binding exceeds its metadata budget");
         }
         self.add_archive_solution_object(&artifact.object_ref, artifact.byte_length, source)?;
-        let Some(bytes) = self.bounded_archive_object(&artifact.object_ref, geometry::MAX_FIELD_GEOMETRY_MANIFEST_BYTES)? else {
+        let Some(bytes) = self.bounded_archive_object(
+            &artifact.object_ref,
+            geometry::MAX_FIELD_GEOMETRY_MANIFEST_BYTES,
+        )?
+        else {
             return Ok(());
         };
         let manifest = geometry::parse_solution_field_geometry_manifest(&bytes, artifact)?;
         drop(bytes);
-        if !geometry_sources.insert((manifest.source.member_id.clone(), manifest.source.artifact_id.clone())) {
+        if !geometry_sources.insert((
+            manifest.source.member_id.clone(),
+            manifest.source.artifact_id.clone(),
+        )) {
             bail!("saved field geometry is duplicated for the same tensor");
         }
         geometry::validate_field_geometry_owner(&manifest, solution, member_id, false)?;
         if manifest.source.solution_revision != solution.revision {
-            let historical = self.read_archive_solution_revision(&manifest.source.solution_set_id, manifest.source.solution_revision)?;
+            let historical = self.read_archive_solution_revision(
+                &manifest.source.solution_set_id,
+                manifest.source.solution_revision,
+            )?;
             geometry::validate_field_geometry_owner(&manifest, &historical, member_id, true)?;
         }
-        self.add_archive_solution_object(&manifest.geometry.object_ref, manifest.geometry.byte_length, source)?;
-        let Some(bytes) = self.bounded_archive_object(&manifest.geometry.object_ref, geometry::MAX_FEM_P1_GEOMETRY_BYTES)? else {
+        self.add_archive_solution_object(
+            &manifest.geometry.object_ref,
+            manifest.geometry.byte_length,
+            source,
+        )?;
+        let Some(bytes) = self.bounded_archive_object(
+            &manifest.geometry.object_ref,
+            geometry::MAX_FEM_P1_GEOMETRY_BYTES,
+        )?
+        else {
             return Ok(());
         };
         let saved = geometry::parse_saved_fem_p1_geometry(&bytes, &manifest.geometry)?;
         drop(bytes);
-        if let Some(tensor) = self.add_archive_solution_tensor_artifact(&manifest.tensor_artifact, source)? {
+        if let Some(tensor) =
+            self.add_archive_solution_tensor_artifact(&manifest.tensor_artifact, source)?
+        {
             geometry::validate_saved_geometry_tensor(&saved, &tensor)?;
         }
         Ok(())
@@ -3005,9 +3547,7 @@ impl<'a> ArchiveWalker<'a> {
         revision: u64,
     ) -> Result<SolutionSet> {
         let directory = crate::cas::hex_sha256(solution_set_id.as_bytes());
-        let relative = format!(
-            "solutions/{directory}/revisions/{revision:020}.json"
-        );
+        let relative = format!("solutions/{directory}/revisions/{revision:020}.json");
         let data = self
             .documents
             .read(&relative)?
@@ -3023,15 +3563,12 @@ impl<'a> ArchiveWalker<'a> {
         Ok(historical)
     }
 
-    fn bounded_archive_object(
-        &self,
-        object_ref: &str,
-        max_bytes: u64,
-    ) -> Result<Option<Vec<u8>>> {
+    fn bounded_archive_object(&self, object_ref: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
         validate_object_ref(object_ref)?;
         let relative = format!("objects/sha256/{object_ref}");
         let file_root = self.cas_root.or_else(|| match &self.documents {
-            ArchiveDocuments::Files { root, .. } => Some(*root),
+            ArchiveDocuments::Files { root, .. }
+            | ArchiveDocuments::FilesWithInline { root, .. } => Some(*root),
             ArchiveDocuments::Memory(_) => None,
         });
         if let Some(root) = file_root {
@@ -3042,7 +3579,9 @@ impl<'a> ArchiveWalker<'a> {
             }
             reject_link_chain(root, &relative)?;
             let mut data = Vec::new();
-            fs::File::open(path)?.take(max_bytes + 1).read_to_end(&mut data)?;
+            fs::File::open(path)?
+                .take(max_bytes + 1)
+                .read_to_end(&mut data)?;
             if data.len() as u64 > max_bytes {
                 bail!("CAS object `{object_ref}` exceeds bounded metadata budget");
             }
@@ -3128,6 +3667,7 @@ impl<'a> ArchiveWalker<'a> {
         }
         self.walk_task_preparation_receipts(expected_run_id)?;
         self.walk_task_admissions(expected_run_id)?;
+        self.walk_task_cancellations(expected_run_id)?;
         let lease_prefix = format!("runs/{expected_run_id}/resource_leases/");
         let lease_names = self.documents.keys().cloned().collect::<Vec<_>>();
         for name in lease_names {
@@ -3191,8 +3731,15 @@ impl<'a> ArchiveWalker<'a> {
         }
         validate_journal_streams(&journal_entries)?;
         let inbox_prefix = format!("runs/{expected_run_id}/worker_inbox/");
-        for name in self.documents.keys().filter(|name| name.starts_with(&inbox_prefix)) {
-            let data = self.documents.read(name)?.context("worker inbox disappeared during archive walk")?;
+        for name in self
+            .documents
+            .keys()
+            .filter(|name| name.starts_with(&inbox_prefix))
+        {
+            let data = self
+                .documents
+                .read(name)?
+                .context("worker inbox disappeared during archive walk")?;
             let record: crate::FmsWorkerInboxRecord = parse_json(&data, name)?;
             if record.relative_path()? != *name {
                 bail!("worker inbox path identity mismatch");
@@ -3238,6 +3785,82 @@ impl<'a> ArchiveWalker<'a> {
         }
         for object_ref in intent.asset_object_refs.values() {
             self.add_archive_payload(object_ref, relative, None)?;
+        }
+        self.report.file_refs.insert(relative.to_string());
+        Ok(())
+    }
+
+    fn walk_batch_intent(&mut self, relative: &str, expected_batch_id: &str) -> Result<()> {
+        let Some(data) = self.documents.read(relative)? else {
+            return self.report.missing(format!(
+                "archive references missing batch intent `{relative}`"
+            ));
+        };
+        let intent: FmsBatchIntent = parse_json(&data, relative)?;
+        intent.validate()?;
+        if intent.batch_id != expected_batch_id {
+            bail!(
+                "batch intent `{relative}` contains mismatched batch_id `{}`",
+                intent.batch_id
+            )
+        }
+        let manifest_ref = intent.manifest_object_ref.as_str();
+        let manifest_bytes = if self.add_archive_payload(manifest_ref, relative, None)? {
+            Some(self.object_document(manifest_ref)?)
+        } else {
+            None
+        };
+        if let Some(manifest_bytes) = &manifest_bytes {
+            intent.validate_manifest_bytes(manifest_bytes)?;
+        }
+        for object_ref in [
+            intent.definition_object_ref.as_str(),
+            intent.study_object_ref.as_str(),
+            intent.study_catalog_object_ref.as_str(),
+        ]
+        .into_iter()
+        .chain(intent.asset_object_refs.values().map(String::as_str))
+        {
+            self.add_archive_payload(object_ref, relative, None)?;
+        }
+        self.report.file_refs.insert(relative.to_string());
+        let progress_ref = format!("batches/{expected_batch_id}/expansion_progress.json");
+        if self.documents.contains_key(&progress_ref) {
+            self.walk_batch_expansion_progress(
+                &progress_ref,
+                &intent,
+                manifest_bytes.as_deref(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn walk_batch_expansion_progress(
+        &mut self,
+        relative: &str,
+        intent: &FmsBatchIntent,
+        manifest_bytes: Option<&[u8]>,
+    ) -> Result<()> {
+        let Some(data) = self.documents.read(relative)? else {
+            return self.report.missing(format!(
+                "archive references missing batch expansion progress `{relative}`"
+            ));
+        };
+        let progress: FmsBatchExpansionProgress = parse_json(&data, relative)?;
+        progress.validate()?;
+        let manifest_sha256 = intent
+            .specification
+            .get("manifest_sha256")
+            .and_then(serde_json::Value::as_str)
+            .context("batch intent has no manifest digest")?;
+        if progress.batch_id != intent.batch_id
+            || progress.manifest_object_ref != intent.manifest_object_ref
+            || progress.manifest_sha256 != manifest_sha256
+        {
+            bail!("batch expansion progress `{relative}` differs from its parent intent");
+        }
+        if let Some(manifest_bytes) = manifest_bytes {
+            progress.validate_for_manifest(intent, manifest_bytes)?;
         }
         self.report.file_refs.insert(relative.to_string());
         Ok(())
@@ -3351,6 +3974,48 @@ impl<'a> ArchiveWalker<'a> {
         Ok(())
     }
 
+    fn walk_task_cancellations(&mut self, run_id: &str) -> Result<()> {
+        let prefix = format!("runs/{run_id}/task_cancellation_intents/");
+        let mut names = self
+            .documents
+            .keys()
+            .filter(|name| name.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Ok(());
+        }
+        names.sort();
+        let catalog_ref = format!("runs/{run_id}/run_catalog.json");
+        let bytes = self
+            .documents
+            .read(&catalog_ref)?
+            .context("archive cancellation intent requires its run catalog")?;
+        let catalog: FmsRunCatalog = parse_json(&bytes, &catalog_ref)?;
+        catalog.validate()?;
+        for relative in names {
+            let rest = relative
+                .strip_prefix(&prefix)
+                .context("invalid cancellation archive path")?;
+            let task_id = rest
+                .strip_suffix(".json")
+                .context("cancellation archive record must be JSON")?;
+            validate_component(task_id)?;
+            let bytes = self
+                .documents
+                .read(&relative)?
+                .context("archive cancellation intent disappeared")?;
+            if bytes.len() > 256 * 1024 {
+                bail!("archive cancellation intent exceeds metadata limit");
+            }
+            let record: crate::FmsTaskCancellationIntent = parse_json(&bytes, &relative)?;
+            record.validate()?;
+            validate_cancellation_catalog_identity(&record, &catalog, run_id, task_id)?;
+            self.report.file_refs.insert(relative);
+        }
+        Ok(())
+    }
+
     fn walk_task_admissions(&mut self, expected_run_id: &str) -> Result<()> {
         let prefix = format!("runs/{expected_run_id}/task_admissions/");
         let mut names = self
@@ -3402,6 +4067,11 @@ impl<'a> ArchiveWalker<'a> {
                 || record.lease.attempt_id != attempt_id
             {
                 bail!("task admission identity does not match archive path");
+            }
+            if let Some(snapshot) = &record.resolved_inputs_snapshot {
+                for object_ref in snapshot.object_refs()? {
+                    self.add_archive_payload(&object_ref, &relative, None)?;
+                }
             }
             let current = catalog
                 .tasks
@@ -3832,8 +4502,7 @@ impl<'a> ArchiveWalker<'a> {
                 }
             }
             ReferenceKind::Unknown => {
-                self.report.complete = false;
-                self.report.warnings.push(format!(
+                self.report.mark_blocking_incomplete(format!(
                     "untyped archive reference `{source}` requires conservative retention"
                 ));
             }
@@ -3912,6 +4581,32 @@ impl<'a> ArchiveWalker<'a> {
     }
 }
 
+fn validate_cancellation_catalog_identity(
+    record: &crate::FmsTaskCancellationIntent,
+    catalog: &FmsRunCatalog,
+    run_id: &str,
+    task_id: &str,
+) -> Result<()> {
+    if catalog.run_id != run_id || record.run_id != run_id || record.task.task_id != task_id {
+        bail!("cancellation intent identity differs from run path");
+    }
+    if catalog.revision < record.expected_catalog_revision {
+        bail!("cancellation intent expected revision is ahead of its run catalog");
+    }
+    let current = catalog
+        .tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .context("cancellation intent target is missing from run catalog")?;
+    if current.input_fingerprint != record.task.input_fingerprint {
+        bail!("cancellation intent input fingerprint differs from run catalog");
+    }
+    if catalog.revision == record.expected_catalog_revision && current != &record.task {
+        bail!("cancellation intent pre-bump task snapshot differs from run catalog");
+    }
+    Ok(())
+}
+
 fn validate_session(session: &FmsSessionManifest, source: &str) -> Result<()> {
     if session.format != "fullmag.session.v1" {
         bail!("unknown session schema `{}` in `{source}`", session.format)
@@ -3922,6 +4617,21 @@ fn validate_session(session: &FmsSessionManifest, source: &str) -> Result<()> {
         || session.export_profile_ref != "manifest/export_profile.json"
     {
         bail!("unsupported workspace or export profile reference in `{source}`")
+    }
+    let mut batch_ids = HashSet::new();
+    for batch_ref in &session.batch_refs {
+        validate_file_ref(batch_ref)
+            .with_context(|| format!("invalid session batch ref `{batch_ref}`"))?;
+        let Some(batch_id) = batch_ref
+            .strip_prefix("batches/")
+            .and_then(|value| value.strip_suffix("/batch_intent.json"))
+        else {
+            bail!("session batch ref is not a batch intent: `{batch_ref}`")
+        };
+        validate_component(batch_id)?;
+        if !batch_ids.insert(batch_id) {
+            bail!("session contains duplicate batch reference `{batch_ref}`")
+        }
     }
     Ok(())
 }
@@ -4143,6 +4853,13 @@ fn is_object_ref(value: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+fn live_snapshot_artifact_path(run_id: &str, artifact_path: &str) -> Result<String> {
+    validate_component(run_id).context("invalid live snapshot session.run_id")?;
+    validate_file_ref(artifact_path).context("unsafe live snapshot artifact path")?;
+    let relative = format!("runs/{run_id}/artifacts/{artifact_path}");
+    validate_file_ref(&relative).context("unsafe session run artifact path")?;
+    Ok(relative)
+}
 fn validate_component(component: &str) -> Result<()> {
     crate::repository_path::validate_store_id(component)
 }
@@ -4162,12 +4879,10 @@ fn reject_link_chain(root: &Path, relative: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::materialized_dataset::{
-        MaterializedDatasetManifest, MATERIALIZED_DATASET_SCHEMA,
-    };
+    use crate::materialized_dataset::{MaterializedDatasetManifest, MATERIALIZED_DATASET_SCHEMA};
     use crate::solution_tensor_field::{TensorFieldBinding, TENSOR_FIELD_BINDING_SCHEMA};
     use crate::solution_tensor_source::SOLUTION_TENSOR_SCHEMA;
-    use crate::{FmsRunIntent, TensorChunk, TensorDtype, TensorDescriptor};
+    use crate::{FmsRunIntent, TensorChunk, TensorDescriptor, TensorDtype};
     use fullmag_quantities::{
         ActiveSupportDescriptor, DatasetFieldDescriptor, DatasetSlicePlane, DatasetSource,
         FieldAxisDescriptor, FieldFrameDescriptor, FieldFrameKind, FieldNormalization,
@@ -4182,6 +4897,322 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    #[test]
+    fn conservative_after_opaque_project_document_blocks_visualization() {
+        let mut report = ReachabilityReport::new();
+        report.mark_opaque_project_document("opaque project document");
+        report.conservative("unknown run document");
+
+        assert!(report.has_blocking_incompleteness);
+        assert!(!report.opaque_project_documents_only);
+        assert!(report.require_visualization_safe().is_err());
+    }
+
+    #[test]
+    fn opaque_project_document_after_conservative_blocks_visualization() {
+        let mut report = ReachabilityReport::new();
+        report.conservative("unknown run document");
+        report.mark_opaque_project_document("opaque project document");
+
+        assert!(report.has_blocking_incompleteness);
+        assert!(!report.opaque_project_documents_only);
+        assert!(report.require_visualization_safe().is_err());
+    }
+
+    fn live_snapshot_bytes(
+        run_id: &str,
+        artifacts: &[(&str, &str)],
+        opaque_inline_field: bool,
+    ) -> Vec<u8> {
+        let artifacts = artifacts
+            .iter()
+            .map(|(path, kind)| json!({"path": path, "kind": kind}))
+            .collect::<Vec<_>>();
+        let mut snapshot = json!({
+            "session_protocol_version": "v2",
+            "capability_profile_version": "v1",
+            "session": {"session_id": "session-1", "run_id": run_id},
+            "runtime_status": {},
+            "artifacts": artifacts,
+            "display_selection": {},
+            "preview_config": {},
+            "mesh_revision": 1,
+            "mesh_build_revision": 1,
+        });
+        if opaque_inline_field {
+            snapshot["metadata"] = json!({"legacy_payload_ref": "not-a-cas-object"});
+        }
+        serde_json::to_vec(&snapshot).unwrap()
+    }
+
+    #[test]
+    fn live_snapshot_artifacts_retain_spectrum_and_zarr_in_store_archive_and_export_inventory() {
+        let directory = tempfile::tempdir().unwrap();
+        let run_id = "run-live";
+        let spectrum_relative = "eigen/spectrum.v2.json";
+        let zarr_relative = "fields/m.zarr";
+        let zarr_file_relative = "single.zarr";
+        let snapshot = live_snapshot_bytes(
+            run_id,
+            &[(spectrum_relative, "json"), (zarr_relative, "zarr"), (zarr_file_relative, "zarr")],
+            false,
+        );
+
+        let store_root = directory.path().join("store");
+        let store_snapshot = store_root.join("project/current_live_snapshot.json");
+        fs::create_dir_all(store_snapshot.parent().unwrap()).unwrap();
+        fs::write(&store_snapshot, &snapshot).unwrap();
+        let store_artifacts = store_root.join("runs/run-live/artifacts");
+        fs::create_dir_all(store_artifacts.join("eigen")).unwrap();
+        fs::write(store_artifacts.join(spectrum_relative), b"spectrum").unwrap();
+        fs::write(store_artifacts.join(zarr_file_relative), b"single-zarr-file").unwrap();
+        let zarr_root = store_artifacts.join(zarr_relative);
+        fs::create_dir_all(&zarr_root).unwrap();
+        fs::write(zarr_root.join(".zgroup"), b"{}").unwrap();
+
+        let store_report = walk_store_root(&store_root, ReachabilityMode::Restore).unwrap();
+        assert!(store_report.complete, "{:?}", store_report.warnings);
+        assert!(store_report.file_refs.contains("runs/run-live/artifacts/eigen/spectrum.v2.json"));
+        assert!(store_report.file_refs.contains("runs/run-live/artifacts/fields/m.zarr/.zgroup"));
+        assert!(store_report.file_refs.contains("runs/run-live/artifacts/single.zarr"));
+
+        let spectrum_path = "runs/run-live/artifacts/eigen/spectrum.v2.json";
+        let zarr_member_path = "runs/run-live/artifacts/fields/m.zarr/.zgroup";
+        let zarr_file_path = "runs/run-live/artifacts/single.zarr";
+        let archive = HashMap::from([
+            ("project/current_live_snapshot.json".to_string(), snapshot.clone()),
+            (spectrum_path.to_string(), b"spectrum".to_vec()),
+            (zarr_member_path.to_string(), b"{}".to_vec()),
+            (zarr_file_path.to_string(), b"single-zarr-file".to_vec()),
+        ]);
+        let archive_report = walk_archive_documents(&archive, ReachabilityMode::Export).unwrap();
+        assert!(archive_report.complete, "{:?}", archive_report.warnings);
+        assert!(archive_report.file_refs.contains(spectrum_path));
+        assert!(archive_report.file_refs.contains(zarr_member_path));
+        assert!(archive_report.file_refs.contains(zarr_file_path));
+
+        let inventory_root = directory.path().join("inventory");
+        let inventory_spectrum = inventory_root.join(spectrum_path);
+        let inventory_zarr_member = inventory_root.join(zarr_member_path);
+        let inventory_zarr_file = inventory_root.join(zarr_file_path);
+        fs::create_dir_all(inventory_spectrum.parent().unwrap()).unwrap();
+        fs::create_dir_all(inventory_zarr_member.parent().unwrap()).unwrap();
+        fs::create_dir_all(inventory_zarr_file.parent().unwrap()).unwrap();
+        fs::write(&inventory_spectrum, b"spectrum").unwrap();
+        fs::write(&inventory_zarr_member, b"{}").unwrap();
+        fs::write(&inventory_zarr_file, b"single-zarr-file").unwrap();
+        let snapshots = HashMap::from([
+            (
+                spectrum_path.to_string(),
+                ArchiveFileSnapshot::capture(&inventory_spectrum).unwrap(),
+            ),
+            (
+                zarr_member_path.to_string(),
+                ArchiveFileSnapshot::capture(&inventory_zarr_member).unwrap(),
+            ),
+            (
+                zarr_file_path.to_string(),
+                ArchiveFileSnapshot::capture(&inventory_zarr_file).unwrap(),
+            ),
+        ]);
+        let inline_project = HashMap::from([(
+            "project/current_live_snapshot.json".to_string(),
+            snapshot,
+        )]);
+        let export_report = walk_export_file_documents_with_project(
+            &snapshots,
+            &inventory_root,
+            &inline_project,
+        )
+        .unwrap();
+        assert!(export_report.complete, "{:?}", export_report.warnings);
+        assert!(export_report.file_refs.contains(spectrum_path));
+        assert!(export_report.file_refs.contains(zarr_member_path));
+        assert!(export_report.file_refs.contains(zarr_file_path));
+    }
+
+    #[test]
+    fn missing_live_artifacts_block_store_gc_and_archive_even_when_snapshot_is_opaque() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = live_snapshot_bytes(
+            "run-missing",
+            &[("eigen/spectrum.v2.json", "json"), ("fields/m.zarr", "zarr")],
+            true,
+        );
+        let store_root = directory.path().join("store");
+        let snapshot_path = store_root.join("project/current_live_snapshot.json");
+        fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+        fs::write(&snapshot_path, &snapshot).unwrap();
+
+        let store_report = walk_store_root(&store_root, ReachabilityMode::Restore).unwrap();
+        assert!(!store_report.complete);
+        assert!(store_report.has_blocking_incompleteness);
+        assert!(!store_report.opaque_project_documents_only);
+        assert!(store_report.require_visualization_safe().is_err());
+        assert!(walk_store_root(&store_root, ReachabilityMode::Gc).is_err());
+
+        let archive = HashMap::from([(
+            "project/current_live_snapshot.json".to_string(),
+            snapshot.clone(),
+        )]);
+        let archive_report = walk_archive_documents(&archive, ReachabilityMode::Export).unwrap();
+        assert!(!archive_report.complete);
+        assert!(archive_report.has_blocking_incompleteness);
+        assert!(!archive_report.opaque_project_documents_only);
+        assert!(archive_report.require_visualization_safe().is_err());
+
+        let inventory_root = directory.path().join("empty-inventory");
+        fs::create_dir_all(&inventory_root).unwrap();
+        let inline_project = HashMap::from([(
+            "project/current_live_snapshot.json".to_string(),
+            snapshot,
+        )]);
+        let export_report =
+            walk_export_file_documents_with_project(&HashMap::new(), &inventory_root, &inline_project)
+                .unwrap();
+        assert!(!export_report.complete);
+        assert!(export_report.has_blocking_incompleteness);
+        assert!(!export_report.opaque_project_documents_only);
+        assert!(export_report.require_visualization_safe().is_err());
+    }
+
+    #[test]
+    fn unsafe_live_artifact_paths_and_run_ids_fail_closed_in_store_and_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        for path in [
+            "../outside.json",
+            "C:/outside.json",
+            "fields\\m.zarr",
+            "/absolute.json",
+            "fields//spectrum.json",
+        ] {
+            let snapshot = live_snapshot_bytes("run-safe", &[(path, "json")], false);
+            let store_root = directory.path().join(format!("store-{}", path.len()));
+            let snapshot_path = store_root.join("project/current_live_snapshot.json");
+            fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+            fs::write(&snapshot_path, &snapshot).unwrap();
+            assert!(
+                walk_store_root(&store_root, ReachabilityMode::Restore).is_err(),
+                "store accepted artifact path {path:?}"
+            );
+            let archive = HashMap::from([(
+                "project/current_live_snapshot.json".to_string(),
+                snapshot,
+            )]);
+            assert!(
+                walk_archive_documents(&archive, ReachabilityMode::Export).is_err(),
+                "archive accepted artifact path {path:?}"
+            );
+        }
+        for run_id in ["../outside", "C:drive", "nested/run", "bad\\run"] {
+            let snapshot = live_snapshot_bytes(run_id, &[("spectrum.json", "json")], false);
+            let store_root = directory.path().join(format!("run-{}", run_id.len()));
+            let snapshot_path = store_root.join("project/current_live_snapshot.json");
+            fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+            fs::write(&snapshot_path, &snapshot).unwrap();
+            assert!(
+                walk_store_root(&store_root, ReachabilityMode::Restore).is_err(),
+                "store accepted run id {run_id:?}"
+            );
+            let archive = HashMap::from([(
+                "project/current_live_snapshot.json".to_string(),
+                snapshot,
+            )]);
+            assert!(
+                walk_archive_documents(&archive, ReachabilityMode::Export).is_err(),
+                "archive accepted run id {run_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn store_and_file_export_reject_live_artifact_symlinks_or_reparse_points() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = directory.path().join("outside.bin");
+        fs::write(&external, b"outside").unwrap();
+        let external_directory = directory.path().join("outside-directory");
+        fs::create_dir_all(&external_directory).unwrap();
+        fs::write(external_directory.join("payload.bin"), b"outside directory").unwrap();
+
+        let store_root = directory.path().join("store-link");
+        let snapshot_path = store_root.join("project/current_live_snapshot.json");
+        fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+        fs::write(
+            &snapshot_path,
+            live_snapshot_bytes("run-link", &[("fields/m.zarr", "zarr")], false),
+        )
+        .unwrap();
+        let zarr_root = store_root.join("runs/run-link/artifacts/fields/m.zarr");
+        fs::create_dir_all(&zarr_root).unwrap();
+        let zarr_link = zarr_root.join("linked-directory");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external_directory, &zarr_link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&external_directory, &zarr_link).unwrap();
+        assert!(walk_store_root(&store_root, ReachabilityMode::Restore).is_err());
+
+        let inventory_root = directory.path().join("inventory-link");
+        let relative = "runs/run-link/artifacts/spectrum.json";
+        let inventory_path = inventory_root.join(relative);
+        fs::create_dir_all(inventory_path.parent().unwrap()).unwrap();
+        let inventory_link = inventory_path;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &inventory_link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&external, &inventory_link).unwrap();
+        let snapshots = HashMap::from([(
+            relative.to_string(),
+            ArchiveFileSnapshot::from_bytes(b"outside"),
+        )]);
+        let inline_project = HashMap::from([(
+            "project/current_live_snapshot.json".to_string(),
+            live_snapshot_bytes("run-link", &[("spectrum.json", "json")], false),
+        )]);
+        assert!(walk_export_file_documents_with_project(
+            &snapshots,
+            &inventory_root,
+            &inline_project,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn file_export_project_overlay_rejects_nonproject_and_shadow_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot_path = "project/current_live_snapshot.json";
+        let snapshots = HashMap::from([(
+            snapshot_path.to_string(),
+            ArchiveFileSnapshot::from_bytes(b"inventory"),
+        )]);
+        let shadow = HashMap::from([(snapshot_path.to_string(), b"inline".to_vec())]);
+        assert!(walk_export_file_documents_with_project(&snapshots, directory.path(), &shadow).is_err());
+
+        let nonproject = HashMap::from([(
+            "objects/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            b"inline".to_vec(),
+        )]);
+        assert!(walk_export_file_documents_with_project(&HashMap::new(), directory.path(), &nonproject).is_err());
+    }
+
+    #[test]
+    fn archive_rejects_live_artifact_file_and_subtree_collision() {
+        let snapshot = live_snapshot_bytes("run-conflict", &[("fields/m.zarr", "zarr")], false);
+        let archive = HashMap::from([
+            (
+                "project/current_live_snapshot.json".to_string(),
+                snapshot,
+            ),
+            (
+                "runs/run-conflict/artifacts/fields/m.zarr".to_string(),
+                b"file payload".to_vec(),
+            ),
+            (
+                "runs/run-conflict/artifacts/fields/m.zarr/.zgroup".to_string(),
+                b"{}".to_vec(),
+            ),
+        ]);
+        assert!(walk_archive_documents(&archive, ReachabilityMode::Export).is_err());
+    }
     fn digest(letter: char) -> String {
         format!("sha256:{}", letter.to_string().repeat(64))
     }
@@ -4234,7 +5265,9 @@ mod tests {
             modal_semantics: None,
             resolution: FieldResolution::Quantitative,
         };
-        descriptor.validate().expect("reachability field fixture is valid");
+        descriptor
+            .validate()
+            .expect("reachability field fixture is valid");
         descriptor
     }
 
@@ -4286,10 +5319,7 @@ mod tests {
             byte_length: descriptor_bytes.len() as u64,
             accepted_state: None,
         };
-        let objects = HashMap::from([
-            (chunk_ref, chunk_bytes),
-            (descriptor_ref, descriptor_bytes),
-        ]);
+        let objects = HashMap::from([(chunk_ref, chunk_bytes), (descriptor_ref, descriptor_bytes)]);
         TensorFixture {
             artifact,
             descriptor,
@@ -4459,11 +5489,12 @@ mod tests {
         .expect("build second dataset fixture");
         let (first_artifact, first_bytes) = materialized_artifact(&first_manifest);
         let (second_artifact, second_bytes) = materialized_artifact(&second_manifest);
-        solution.members[0].artifacts.extend([
-            first_artifact.clone(),
-            second_artifact.clone(),
-        ]);
-        solution.validate().expect("duplicate fixture solution is structural");
+        solution.members[0]
+            .artifacts
+            .extend([first_artifact.clone(), second_artifact.clone()]);
+        solution
+            .validate()
+            .expect("duplicate fixture solution is structural");
 
         let mut objects = fixture_objects(&[&first, &second]);
         objects.insert(first_artifact.object_ref.clone(), first_bytes);
@@ -4510,10 +5541,16 @@ mod tests {
         manifest.field.source.solution_revision = 1;
         manifest.dataset.source = historical_source.clone();
         manifest.definition.source = historical_source;
-        manifest.validate().expect("historical dataset fixture is structural");
+        manifest
+            .validate()
+            .expect("historical dataset fixture is structural");
         let (manifest_artifact, manifest_bytes) = materialized_artifact(&manifest);
-        solution.members[0].artifacts.push(manifest_artifact.clone());
-        solution.validate().expect("historical fixture solution is structural");
+        solution.members[0]
+            .artifacts
+            .push(manifest_artifact.clone());
+        solution
+            .validate()
+            .expect("historical fixture solution is structural");
 
         let mut objects = fixture_objects(&[&tensor]);
         objects.insert(manifest_artifact.object_ref.clone(), manifest_bytes);
@@ -4522,7 +5559,9 @@ mod tests {
         write_store_fixture(&store_root, &solution, &intent, &objects);
         let store_error = walk_store_root(&store_root, ReachabilityMode::Restore)
             .expect_err("store walker accepted missing historical owner");
-        assert!(store_error.to_string().contains("revisions/00000000000000000001"));
+        assert!(store_error
+            .to_string()
+            .contains("revisions/00000000000000000001"));
 
         let archive_error = walk_archive_documents(
             &archive_fixture(&solution, &intent, &objects),

@@ -197,6 +197,8 @@ pub(crate) fn execute_fem_eigen(
             }),
             plan,
             outputs,
+            None,
+            None,
         );
     }
 

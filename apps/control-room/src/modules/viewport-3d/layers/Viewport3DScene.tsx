@@ -28,6 +28,7 @@ import {
 import { OrthographicCamera, PerspectiveCamera } from "@react-three/drei";
 import { useThree } from "@react-three/fiber";
 import {
+  useCallback,
   useEffect,
   useEffectEvent,
   useLayoutEffect,
@@ -161,7 +162,11 @@ import {
 } from "../viewport3dVisualProfile";
 import { resolveViewport3DMaterialProfile } from "./viewport3DMaterialProfile";
 import { clampNumber, sameTuple3 } from "../viewport3dMath";
-import { createViewport3DCameraGestureRef } from "./viewport3DCameraGesture";
+import {
+  cancelViewport3DCameraGesture,
+  createViewport3DCameraGestureRef,
+  viewport3DCameraGestureEpoch,
+} from "./viewport3DCameraGesture";
 import type { Viewport3DRenderAdoptionRegistry } from "../model/viewport3DRenderAdoptionRegistry";
 import type { FdmUniverseOutsideSupportOverlayModel } from "../model/fdmUniverseOverlay";
 import type { Viewport3DFdmTargetRenderView } from "../model/viewport3DFdmTargetViews";
@@ -264,6 +269,8 @@ interface Viewport3DSceneProps {
     translation: Translation3,
     baseRevision: number,
   ) => Promise<boolean | void> | boolean | void;
+  onBeginGesture?: () => boolean;
+  onMoveGestureActiveChange?: (active: boolean) => void;
   moveToolObjectId: string | null;
   moveDraftResetRevision: number;
   orbitDebugAngles: Viewport3DOrbitDebugAngles;
@@ -1144,6 +1151,7 @@ function Viewport3DModelLayerStack({
   onInspectClear,
   onInspectSample,
   onMoveCommit,
+  onBeginGesture,
   moveToolObjectId,
   moveDraftResetRevision,
   onMoveGestureActiveChange,
@@ -1207,6 +1215,8 @@ function Viewport3DModelLayerStack({
   | "onInspectClear"
   | "onInspectSample"
   | "onMoveCommit"
+  | "onBeginGesture"
+  | "onMoveGestureActiveChange"
   | "moveToolObjectId"
   | "moveDraftResetRevision"
   | "onSelectDomain"
@@ -1236,7 +1246,6 @@ function Viewport3DModelLayerStack({
   savedViewportActive: boolean;
   sceneLayersEnabled: boolean;
   stageVisibility: Viewport3DModelLayerStageVisibility;
-  onMoveGestureActiveChange: (active: boolean) => void;
 }) {
   const hasMeshBackedRegionOverlays = meshRegionOverlays.length > 0;
   const overlayLayersEnabled = viewport3DOverlayLayersEnabledFromBrowserConfig();
@@ -1463,6 +1472,7 @@ function Viewport3DModelLayerStack({
         moveDraftResetRevision={moveDraftResetRevision}
         moveToolObjectId={moveToolObjectId}
         onCommit={onMoveCommit}
+        onBeginGesture={onBeginGesture}
         onGestureActiveChange={onMoveGestureActiveChange}
         primitiveModel={primitiveModel}
         selectedObjectId={selectedObjectId}
@@ -1652,6 +1662,7 @@ function Viewport3DInteractionAndHudStack({
       />
       {viewport3DOrientationHudEnabledFromBrowserConfig() ? (
         <OrientationHudLayer
+          cameraGestureRef={cameraGestureRef}
           colors={colors}
           hslReferenceVisible={hslReferenceVisible}
           onCameraChange={onCameraChange}
@@ -1820,6 +1831,8 @@ export function Viewport3DScene({
   onInspectClear,
   onInspectSample,
   onMoveCommit,
+  onBeginGesture,
+  onMoveGestureActiveChange,
   moveToolObjectId,
   moveDraftResetRevision,
   scaleLabelsVisible,
@@ -1837,7 +1850,18 @@ export function Viewport3DScene({
     clip: Viewport3DCameraClip;
   } | null>(null);
   const cameraGestureRef = useMemo(() => createViewport3DCameraGestureRef(), []);
+  useEffect(() => () => {
+    const epoch = viewport3DCameraGestureEpoch(cameraGestureRef);
+    // Cancel rather than dispose: StrictMode can replay effects with this ref.
+    if (cancelViewport3DCameraGesture(cameraGestureRef, epoch)) {
+      onCameraInteractionEnd?.(epoch);
+    }
+  }, [cameraGestureRef, onCameraInteractionEnd]);
   const [moveGestureActive, setMoveGestureActive] = useState(false);
+  const handleMoveGestureActiveChange = useCallback((active: boolean) => {
+    onMoveGestureActiveChange?.(active);
+    setMoveGestureActive(active);
+  }, [onMoveGestureActiveChange]);
   const inspectClearArbitrator = useMemo(
     () =>
       createFdmInspectClearArbitrator({
@@ -2095,9 +2119,10 @@ export function Viewport3DScene({
         onInspectClear={inspectClearArbitrator.clear}
         onInspectSample={handleArbitratedInspectSample}
         onMoveCommit={onMoveCommit}
+        onBeginGesture={onBeginGesture}
         moveToolObjectId={moveToolObjectId}
         moveDraftResetRevision={moveDraftResetRevision}
-        onMoveGestureActiveChange={setMoveGestureActive}
+        onMoveGestureActiveChange={handleMoveGestureActiveChange}
         onSelectDomain={onSelectDomain}
         onSelectFdmTarget={onSelectFdmTarget}
         onSelectFdmUniverseOutsideSupport={onSelectFdmUniverseOutsideSupport}

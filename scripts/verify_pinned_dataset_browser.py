@@ -1,4 +1,4 @@
-"""Managed browser fixture proof of pinned results, without solver or unit builds.
+"""Managed browser fixtures for fixed Control Room routes; no solver or unit builds.
 
 An immutable frontend source view and isolated Next outputs stay in storage.
 Existing checkout dependencies are read, never installed, copied or rebound.
@@ -14,6 +14,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 import uuid
@@ -24,14 +25,17 @@ from verify_control_room_sources import fingerprint, timestamp
 PROFILE = "windows-control-room-browser-fixture"
 BROWSER_CHANNEL = "chrome" if os.name == "nt" else None
 SCENARIOS = {
+    "inspector-actions": ("smoke-inspector-actions.mjs", "fullmag_inspector_actions_browser_fixture_v1", "inspector-actions", "FULLMAG_INSPECTOR_ACTIONS"),
+    "explorer-physics-reporting": ("smoke-explorer-physics-reporting.mjs", "fullmag_explorer_physics_reporting_browser_fixture_v1", "explorer-physics-reporting", "FULLMAG_EXPLORER_PHYSICS_REPORTING"),
+    "object-material-editor": ("smoke-object-material-editor.mjs", "fullmag_object_material_editor_browser_fixture_v1", "object-material-editor", "FULLMAG_OBJECT_MATERIAL_EDITOR"),
+    "antenna-drive-editor": ("smoke-antenna-drive-editor.mjs", "fullmag_antenna_drive_editor_browser_fixture_v1", "antenna-drive-editor", "FULLMAG_ANTENNA_DRIVE_EDITOR"),
+    "antenna-source-spectrum": ("smoke-antenna-source-spectrum.mjs", "fullmag_antenna_source_spectrum_browser_fixture_v1", "antenna-source-spectrum", "FULLMAG_ANTENNA_SOURCE_SPECTRUM"),
+    "antenna-port-editor": ("smoke-antenna-port-editor.mjs", "fullmag_antenna_port_editor_browser_fixture_v1", "antenna-port-editor", "FULLMAG_ANTENNA_PORT_EDITOR"),
+    "antenna-port-diagnostics": ("smoke-antenna-port-diagnostics.mjs", "fullmag_antenna_port_diagnostics_browser_fixture_v1", "antenna-port-diagnostics", "FULLMAG_ANTENNA_PORT_DIAGNOSTICS"),
     "antenna-visualization": ("smoke-antenna-visualization.mjs", "fullmag_antenna_visualization_browser_fixture_v1", "antenna-visualization", "FULLMAG_ANTENNA_VISUALIZATION"),
     "inspector-routing": ("smoke-inspector.mjs", "fullmag_inspector_routing_browser_fixture_v1", None, "CONTROL_ROOM_INSPECTOR"),
     "antenna-cpw-viewport": ("smoke-antenna-cpw-viewport.mjs", "fullmag_antenna_cpw_viewport_browser_fixture_v1", "antenna-cpw-viewport", "FULLMAG_ANTENNA_CPW_VIEWPORT"),
     "pinned-dataset": ("smoke-pinned-materialized-dataset.mjs", "fullmag_pinned_dataset_browser_fixture_v1", None, "FULLMAG_PINNED_DATASET"),
-    "project-document-handoff": ("smoke-project-document-handoff.mjs", "fullmag_project_document_browser_fixture_v1", "project-document-handoff", "FULLMAG_PROJECT_DOCUMENT"),
-    "development-kernel-host": ("smoke-development-kernel-host.mjs", "fullmag_development_kernel_host_browser_fixture_v1", "development-kernel-host", "FULLMAG_PROJECT_DOCUMENT"),
-    "development-run-outcome-handoff": ("smoke-development-run-outcome-handoff.mjs", "fullmag_development_run_outcome_handoff_browser_fixture_v1", "development-run-outcome-handoff", "FULLMAG_DEVELOPMENT_RUN_OUTCOME"),
-    "development-restart-action": ("smoke-development-restart-action.mjs", "fullmag_development_restart_action_browser_fixture_v1", "development-restart-action", "FULLMAG_DEVELOPMENT_RESTART_ACTION"),
     "antenna-external-lead-inspection": ("smoke-antenna-external-lead-inspection.mjs", "fullmag_antenna_inspection_browser_fixture_v1", "antenna-external-lead-inspection", "FULLMAG_ANTENNA_INSPECTION"),
     "antenna-microstrip-stations": ("smoke-antenna-microstrip-stations.mjs", "fullmag_antenna_microstrip_stations_browser_fixture_v1", "antenna-microstrip-stations", "FULLMAG_ANTENNA_STATIONS"),
     "antenna-transport-drafts": ("smoke-antenna-transport-drafts.mjs", "fullmag_antenna_transport_drafts_browser_fixture_v1", "antenna-transport-drafts", "FULLMAG_ANTENNA_TRANSPORT"),
@@ -78,15 +82,51 @@ def port_is_open(port: int):
         return probe.connect_ex(("127.0.0.1", port)) == 0
 
 
+def print_fixture_log_tails(run_root: Path):
+    max_bytes = 12_000
+    max_lines = 80
+    for name in ("browser.log", "next.log"):
+        path = run_root / name
+        print(f"--- fixture-owned {name} tail (at most {max_bytes} bytes) ---",
+              file=sys.stderr, flush=True)
+        try:
+            if not path.is_file():
+                print("(log not created)", file=sys.stderr, flush=True)
+                continue
+            with path.open("rb") as log:
+                log.seek(0, os.SEEK_END)
+                size = log.tell()
+                log.seek(max(0, size - max_bytes), os.SEEK_SET)
+                tail = log.read(max_bytes).decode("utf-8", errors="replace")
+            if size > max_bytes:
+                print("[earlier log bytes omitted]", file=sys.stderr)
+            lines = tail.splitlines()[-max_lines:]
+            print("\n".join(lines) if lines else "(empty log)",
+                  file=sys.stderr, flush=True)
+        except OSError as error:
+            print(f"(cannot read fixture-owned log: {error})",
+                  file=sys.stderr, flush=True)
+
+
 def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
     if scenario not in SCENARIOS:
         raise storage.StorageError("Unknown fixed browser fixture scenario")
+    if scenario == "object-material-editor" and port != 3266:
+        raise storage.StorageError("Object material editor browser fixture uses fixed port 3266")
+    if scenario == "antenna-drive-editor" and port != 3265:
+        raise storage.StorageError("Antenna drive editor browser fixture uses fixed port 3265")
+    if scenario == "antenna-port-editor" and port != 3264:
+        raise storage.StorageError("Antenna port editor browser fixture uses fixed port 3264")
     if scenario == "execution-profiles" and port != 3255:
         raise storage.StorageError("Execution profiles browser fixture uses fixed port 3255")
     if scenario == "study-execution-profile" and port != 3256:
         raise storage.StorageError("Study execution profile browser fixture uses fixed port 3256")
     if scenario == "inspector-routing" and port != 3261:
         raise storage.StorageError("Inspector routing browser fixture uses fixed port 3261")
+    if scenario == "inspector-actions" and port != 3257:
+        raise storage.StorageError("Inspector actions browser fixture uses fixed port 3257")
+    if scenario == "explorer-physics-reporting" and port != 3259:
+        raise storage.StorageError("Explorer physics reporting browser fixture uses fixed port 3259")
     smoke_name, receipt_schema, fixture_route, report_prefix = SCENARIOS[scenario]
     layout = storage.resolve_layout(repo, PROFILE)
     storage.initialize(layout)
@@ -95,7 +135,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
     node = shutil.which("node")
     next_cli = app / "node_modules/next/dist/bin/next"
     if not node or not next_cli.is_file() or not smoke.is_file():
-        raise storage.StorageError("Existing Node, Next and pinned dataset smoke are required; no bootstrap")
+        raise storage.StorageError("Existing Node, Next and scenario smoke are required; no bootstrap")
     dependencies = app / "node_modules"
     real_dependencies = dependencies.resolve()
     if not (real_dependencies == dependencies or
@@ -191,7 +231,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                 env[report_prefix + "_BROWSER_CHANNEL"] = BROWSER_CHANNEL
             if fixture_route:
                 env["CONTROL_ROOM_URL"] = f"http://127.0.0.1:{port}/{fixture_route}"
-                if scenario in {"development-kernel-host", "development-restart-action", "execution-profiles", "study-execution-profile"}:
+                if scenario in {"execution-profiles", "study-execution-profile", "inspector-actions", "explorer-physics-reporting"}:
                     env["CONTROL_ROOM_URL"] += "?fullmag_api_instance=11111111-1111-4111-8111-111111111111"
             receipt["source_view"] = str(fixture_app)
             receipt["dependency_root"] = str(real_dependencies)
@@ -244,8 +284,25 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
             )
             if receipt["source_changed_during_run"]:
                 receipt.update(state="failed", exit_code=1)
+            if scenario in {"inspector-actions", "explorer-physics-reporting"}:
+                browser_root = run_root / "browser"
+                artifacts = []
+                if browser_root.is_dir():
+                    for artifact in sorted(path for path in browser_root.rglob("*") if path.is_file()):
+                        artifacts.append({
+                            "path": str(artifact.relative_to(run_root)),
+                            "size_bytes": artifact.stat().st_size,
+                            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                        })
+                receipt["browser_artifact_root"] = str(browser_root)
+                receipt["browser_artifacts"] = artifacts
             receipt["finished_at"] = timestamp()
             storage.atomic_json(receipt_path, receipt)
+        if scenario in {"inspector-actions", "explorer-physics-reporting"} and receipt["state"] != "passed":
+            for key in ("error", "cleanup_error"):
+                if receipt.get(key):
+                    print(f"{key}: {str(receipt[key])[:2000]}", file=sys.stderr, flush=True)
+            print_fixture_log_tails(run_root)
         print(json.dumps({"receipt": str(receipt_path), "state": receipt["state"]}))
         return receipt["exit_code"]
 
@@ -260,6 +317,8 @@ if __name__ == "__main__":
         "execution-profiles": 3255,
         "study-execution-profile": 3256,
         "inspector-routing": 3261,
+        "inspector-actions": 3257,
+        "explorer-physics-reporting": 3259,
     }.get(args.scenario, 3250)
     if not 1 <= port <= 65535:
         parser.error("port must be between 1 and 65535")

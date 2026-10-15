@@ -182,6 +182,55 @@ fn validate_scene_document_with_mode(
             scene.study.requested_mode
         )));
     }
+    scene
+        .study
+        .parallel_execution
+        .validate()
+        .map_err(SceneDocumentValidationError::new)?;
+    if scene.study.parallel_execution.mode == fullmag_ir::ParallelExecutionModeIR::Adaptive {
+        let explicit_fem_cpu = if let Some(profile) = scene.study.execution_profile.as_ref() {
+            let materialized = fullmag_ir::materialize_execution_request(
+                Some(profile.clone()),
+                scene.study.execution_layers.clone(),
+            )
+            .map_err(|error| {
+                SceneDocumentValidationError::new(format!(
+                    "study.execution_profile materialization is invalid: {error}"
+                ))
+            })?;
+            materialized.requested.backend == fullmag_ir::BackendTarget::Fem
+                && materialized.requested.device == fullmag_ir::ExecutionDevice::Cpu
+        } else {
+            scene.study.requested_backend.eq_ignore_ascii_case("fem")
+                && scene.study.requested_device.eq_ignore_ascii_case("cpu")
+        };
+        if !explicit_fem_cpu {
+            return Err(SceneDocumentValidationError::new(concat!(
+                "unsupported parallel_execution realization: adaptive mode requires ",
+                "effective requested_backend='fem' and requested_device='cpu' for independent eigen k execution",
+            )));
+        }
+    }
+    if let Some(Some(pbc)) = &scene.study.pbc {
+        if pbc.demag != fullmag_ir::FdmDemagPeriodicityIR::TruncatedImages
+            && pbc.image_counts.is_some()
+        {
+            return Err(SceneDocumentValidationError::new(
+                "study.pbc.image_counts require demag='truncated_images'",
+            ));
+        }
+        if pbc.demag == fullmag_ir::FdmDemagPeriodicityIR::PeriodicAirboxK0
+            && pbc.axes != [
+                fullmag_ir::AxisBoundary::Periodic,
+                fullmag_ir::AxisBoundary::Periodic,
+                fullmag_ir::AxisBoundary::Open,
+            ]
+        {
+            return Err(SceneDocumentValidationError::new(
+                "study.pbc.demag='periodic_airbox_k0' requires x/y periodic axes and open z",
+            ));
+        }
+    }
     validate_solver_state(&scene.study.solver, false, "study.solver")?;
     validate_fdm_discretization(scene.study.fdm.as_ref())?;
     let fdm_lane = scene.study.requested_backend.eq_ignore_ascii_case("fdm")
@@ -304,6 +353,7 @@ fn validate_scene_document_with_mode(
     }
     validate_scene_field_drives(scene, &object_ids)?;
     validate_scene_planar_monitors(scene, &object_ids)?;
+    validate_scene_postprocessing_definitions(scene)?;
     validate_scene_magnetization_constraints(scene, &object_ids)?;
 
     Ok(())
@@ -829,6 +879,78 @@ fn validate_scene_planar_monitors(
                     )));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// User-created Results nodes (ADR 0054): stable ids, module ownership, a
+/// published data identity, and parents that exist and are not cyclic.
+fn validate_scene_postprocessing_definitions(
+    scene: &SceneDocument,
+) -> Result<(), SceneDocumentValidationError> {
+    let definitions = &scene.analysis.postprocessing_definitions;
+    let mut ids = BTreeSet::new();
+    for (index, definition) in definitions.iter().enumerate() {
+        let context = format!("analysis.postprocessing_definitions[{index}]");
+        if definition.definition_id.trim().is_empty() || !ids.insert(definition.definition_id.as_str()) {
+            return Err(SceneDocumentValidationError::new(format!(
+                "{context} definition_id must be non-empty and unique"
+            )));
+        }
+        for (field, value) in [
+            ("module_id", &definition.module_id),
+            ("module_version", &definition.module_version),
+            ("definition_schema", &definition.definition_schema),
+            ("node_kind", &definition.node_kind),
+            ("label", &definition.label),
+            ("data_ref.run_id", &definition.data_ref.run_id),
+            ("data_ref.dataset_id", &definition.data_ref.dataset_id),
+            ("data_ref.dataset_revision", &definition.data_ref.dataset_revision),
+        ] {
+            if value.trim().is_empty() {
+                return Err(SceneDocumentValidationError::new(format!(
+                    "{context} {field} must be non-empty"
+                )));
+            }
+        }
+        if !definition.module_id.starts_with("analysis.")
+            || !definition.node_kind.starts_with(&format!("{}.", definition.module_id))
+        {
+            return Err(SceneDocumentValidationError::new(format!(
+                "{context} node_kind '{}' must belong to module '{}'",
+                definition.node_kind, definition.module_id
+            )));
+        }
+        if !definition.settings.is_null() && !definition.settings.is_object() {
+            let settings_kind = match &definition.settings {
+                Value::Array(_) => "array",
+                Value::String(_) => "string",
+                Value::Number(_) => "number",
+                Value::Bool(_) => "boolean",
+                Value::Null | Value::Object(_) => unreachable!("settings kind checked above"),
+            };
+            return Err(SceneDocumentValidationError::new(format!(
+                "{context}.settings must be an object or null, got {settings_kind}"
+            )));
+        }
+    }
+    for (index, definition) in definitions.iter().enumerate() {
+        let mut parent = definition.parent_definition_id.as_deref();
+        let mut hops = 0usize;
+        while let Some(parent_id) = parent {
+            if parent_id == definition.definition_id || hops > definitions.len() {
+                return Err(SceneDocumentValidationError::new(format!(
+                    "analysis.postprocessing_definitions[{index}] parent chain is cyclic"
+                )));
+            }
+            let Some(next) = definitions.iter().find(|candidate| candidate.definition_id == parent_id) else {
+                return Err(SceneDocumentValidationError::new(format!(
+                    "analysis.postprocessing_definitions[{index}] parent '{parent_id}' does not exist"
+                )));
+            };
+            parent = next.parent_definition_id.as_deref();
+            hops += 1;
         }
     }
     Ok(())
@@ -3329,14 +3451,14 @@ fn validate_study_pipeline_document(
             document.version
         )));
     }
-    validate_study_pipeline_nodes(&document.nodes)?;
+    validate_study_pipeline_nodes(&document.nodes, &mut BTreeSet::new())?;
     Ok(())
 }
 
 fn validate_study_pipeline_nodes(
     nodes: &[StudyPipelineNode],
+    node_ids: &mut BTreeSet<String>,
 ) -> Result<(), SceneDocumentValidationError> {
-    let mut node_ids = BTreeSet::new();
     for node in nodes {
         match node {
             StudyPipelineNode::Primitive(node) => {
@@ -3395,7 +3517,7 @@ fn validate_study_pipeline_nodes(
                         node.id
                     )));
                 }
-                validate_study_pipeline_nodes(&node.children)?;
+                validate_study_pipeline_nodes(&node.children, node_ids)?;
             }
         }
     }
@@ -3405,6 +3527,69 @@ fn validate_study_pipeline_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pipeline_with_nodes(nodes: Value) -> StudyPipelineDocument {
+        serde_json::from_value(serde_json::json!({
+            "version": "study_pipeline.v1",
+            "nodes": nodes,
+        }))
+        .expect("pipeline fixture must deserialize")
+    }
+
+    #[test]
+    fn study_pipeline_rejects_duplicate_ids_in_different_groups() {
+        let document = pipeline_with_nodes(serde_json::json!([
+            {"node_kind": "group", "id": "first", "label": "First", "children": [
+                {"node_kind": "primitive", "id": "shared", "label": "Solve", "stage_kind": "antenna_field_solve"}
+            ]},
+            {"node_kind": "group", "id": "second", "label": "Second", "children": [
+                {"node_kind": "macro", "id": "shared", "label": "Relax and run", "macro_kind": "relax_run"}
+            ]}
+        ]));
+        let error = validate_study_pipeline_document(&document)
+            .expect_err("IDs must be unique across groups and node kinds");
+        assert_eq!(error.message, "duplicate study pipeline node id 'shared'");
+    }
+
+    #[test]
+    fn study_pipeline_rejects_group_child_id_collision() {
+        let document = pipeline_with_nodes(serde_json::json!([
+            {"node_kind": "group", "id": "shared", "label": "Group", "children": [
+                {"node_kind": "primitive", "id": "shared", "label": "Run", "stage_kind": "run"}
+            ]}
+        ]));
+        let error = validate_study_pipeline_document(&document)
+            .expect_err("a group and its child cannot share an ID");
+        assert_eq!(error.message, "duplicate study pipeline node id 'shared'");
+    }
+
+    #[test]
+    fn study_pipeline_rejects_id_collision_inside_disabled_group() {
+        let document = pipeline_with_nodes(serde_json::json!([
+            {"node_kind": "group", "id": "disabled", "label": "Disabled", "enabled": false, "children": [
+                {"node_kind": "primitive", "id": "shared", "label": "Solve", "stage_kind": "antenna_field_solve", "enabled": false}
+            ]},
+            {"node_kind": "primitive", "id": "shared", "label": "Run", "stage_kind": "run"}
+        ]));
+        let error = validate_study_pipeline_document(&document)
+            .expect_err("disabled authored nodes still reserve their IDs");
+        assert_eq!(error.message, "duplicate study pipeline node id 'shared'");
+    }
+
+    #[test]
+    fn study_pipeline_accepts_globally_distinct_nested_ids() {
+        let document = pipeline_with_nodes(serde_json::json!([
+            {"node_kind": "group", "id": "outer", "label": "Outer", "children": [
+                {"node_kind": "group", "id": "inner", "label": "Inner", "enabled": false, "children": [
+                    {"node_kind": "primitive", "id": "solve", "label": "Solve", "stage_kind": "antenna_field_solve"}
+                ]},
+                {"node_kind": "macro", "id": "relax-run", "label": "Relax and run", "macro_kind": "relax_run"}
+            ]},
+            {"node_kind": "primitive", "id": "run", "label": "Run", "stage_kind": "run"}
+        ]));
+        validate_study_pipeline_document(&document)
+            .expect("distinct IDs remain valid across nested and disabled groups");
+    }
 
     fn valid_generic_swept_prism() -> crate::ScriptBuilderPerGeometryMeshState {
         crate::ScriptBuilderPerGeometryMeshState {
@@ -3477,6 +3662,134 @@ mod tests {
     }
 
     #[test]
+    fn postprocessing_settings_accept_objects_and_null_defaults() {
+        let definition = serde_json::json!({
+            "definition_id": "pin-1",
+            "module_id": "analysis.dispersion",
+            "module_version": "0.1.0",
+            "definition_schema": "analysis.dispersion.mode_visualization.v1",
+            "node_kind": "analysis.dispersion.mode_visualization",
+            "label": "Mode 1",
+            "data_ref": {
+                "run_id": "run-1",
+                "dataset_id": "dataset-1",
+                "dataset_revision": "revision-1"
+            }
+        });
+        let definition_with_settings = |settings: Value| {
+            let mut value = definition.clone();
+            value["settings"] = settings;
+            value
+        };
+
+        for settings in [
+            serde_json::json!({}),
+            serde_json::json!({ "placement": "beside", "metadata": { "visible": true } }),
+            Value::Null,
+        ] {
+            let mut scene_value = serde_json::json!({
+                "version": "scene.v2",
+                "analysis": { "postprocessing_definitions": [] }
+            });
+            scene_value["analysis"]["postprocessing_definitions"] =
+                serde_json::json!([definition_with_settings(settings.clone())]);
+            let scene: SceneDocument = serde_json::from_value(scene_value)
+                .expect("object and null settings should deserialize");
+
+            validate_scene_document_for_authoring(&scene)
+                .expect("object and null settings should satisfy the authoring contract");
+            assert_eq!(scene.analysis.postprocessing_definitions[0].settings, settings);
+
+            let serialized = serde_json::to_value(&scene).expect("scene should serialize");
+            if settings.is_null() {
+                assert!(serialized["analysis"]["postprocessing_definitions"][0]
+                    .get("settings")
+                    .is_none());
+            } else {
+                assert_eq!(
+                    serialized["analysis"]["postprocessing_definitions"][0]["settings"],
+                    settings
+                );
+            }
+            let restored: SceneDocument = serde_json::from_value(serialized)
+                .expect("serialized settings should round-trip");
+            assert_eq!(restored.analysis.postprocessing_definitions[0].settings, settings);
+        }
+
+        let mut missing_settings = definition.clone();
+        missing_settings["definition_id"] = serde_json::json!("pin-default");
+        let scene: SceneDocument = serde_json::from_value(serde_json::json!({
+            "version": "scene.v2",
+            "analysis": { "postprocessing_definitions": [missing_settings] }
+        }))
+        .expect("omitted settings should use the null default");
+        assert!(scene.analysis.postprocessing_definitions[0].settings.is_null());
+        validate_scene_document_for_authoring(&scene)
+            .expect("the omitted settings default should remain valid");
+        let serialized = serde_json::to_value(&scene).expect("default scene should serialize");
+        assert!(serialized["analysis"]["postprocessing_definitions"][0]
+            .get("settings")
+            .is_none());
+        let restored: SceneDocument = serde_json::from_value(serialized)
+            .expect("omitted default settings should round-trip");
+        assert!(restored.analysis.postprocessing_definitions[0]
+            .settings
+            .is_null());
+    }
+
+    #[test]
+    fn postprocessing_settings_reject_non_objects_without_mutating_input() {
+        let base_definition = serde_json::json!({
+            "definition_id": "pin-invalid",
+            "module_id": "analysis.dispersion",
+            "module_version": "0.1.0",
+            "definition_schema": "analysis.dispersion.mode_visualization.v1",
+            "node_kind": "analysis.dispersion.mode_visualization",
+            "label": "Mode 1",
+            "data_ref": {
+                "run_id": "run-1",
+                "dataset_id": "dataset-1",
+                "dataset_revision": "revision-1"
+            }
+        });
+
+        for (settings, expected_kind) in [
+            (serde_json::json!(["placement", "beside"]), "array"),
+            (serde_json::json!("beside"), "string"),
+            (serde_json::json!(3), "number"),
+            (serde_json::json!(true), "boolean"),
+        ] {
+            let mut definition = base_definition.clone();
+            definition["settings"] = settings.clone();
+            let input = serde_json::json!({
+                "version": "scene.v2",
+                "analysis": { "postprocessing_definitions": [definition] }
+            });
+            let scene: SceneDocument = serde_json::from_value(input.clone())
+                .expect("opaque settings values should remain available for validation");
+            let before = scene.clone();
+
+            let error = validate_scene_document_for_authoring(&scene)
+                .expect_err("non-object settings must be rejected");
+
+            assert!(
+                error.message.contains(
+                    "analysis.postprocessing_definitions[0].settings"
+                ),
+                "{error}"
+            );
+            assert!(error.message.contains(expected_kind), "{error}");
+            assert_eq!(scene, before, "validation must not mutate the scene");
+            assert_eq!(
+                serde_json::to_value(&scene).expect("scene should remain serializable")
+                    ["analysis"]["postprocessing_definitions"][0]["settings"],
+                settings,
+                "invalid settings should not be silently normalized"
+            );
+        }
+    }
+
+    #[test]
     fn authoring_and_execution_reject_explicit_dangling_object_assignments() {
         for role in ["magnet", "antenna", "conductor", "geometry"] {
             let mut scene = region_owned_scene();
@@ -3499,6 +3812,75 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_parallel_execution_requires_explicit_fem_cpu_lane() {
+        let mut scene = SceneDocument::default();
+        scene.study.parallel_execution.mode = fullmag_ir::ParallelExecutionModeIR::Adaptive;
+
+        for (backend, device) in [("fdm", "cpu"), ("fem", "gpu"), ("auto", "cpu")] {
+            scene.study.requested_backend = backend.to_string();
+            scene.study.requested_device = device.to_string();
+            let error = validate_scene_document_for_authoring(&scene)
+                .expect_err("unsupported adaptive lane must fail closed");
+            assert!(
+                error
+                    .message
+                    .contains("unsupported parallel_execution realization"),
+                "{}",
+                error.message
+            );
+        }
+
+        scene.study.requested_backend = "fem".to_string();
+        scene.study.requested_device = "cpu".to_string();
+        validate_scene_document_for_authoring(&scene)
+            .expect("explicit FEM CPU adaptive authoring should remain valid");
+    }
+
+    #[test]
+    fn adaptive_parallel_execution_uses_materialized_profile_instead_of_stale_legacy_lane() {
+        use fullmag_ir::{
+            BackendTarget, ExecutionDevice, ExecutionProfileIR, ExecutionRequestPatchIR,
+            FieldPatch, ParallelExecutionModeIR,
+        };
+        let mut scene = SceneDocument::default();
+        scene.study.parallel_execution.mode = ParallelExecutionModeIR::Adaptive;
+        scene.study.requested_backend = "fdm".into();
+        scene.study.requested_device = "gpu".into();
+        scene.study.execution_profile = Some(ExecutionProfileIR {
+            defaults: ExecutionRequestPatchIR {
+                backend: FieldPatch::Value(BackendTarget::Fem),
+                device: FieldPatch::Value(ExecutionDevice::Cpu),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let before = scene.clone();
+        validate_scene_document_for_authoring(&scene)
+            .expect("profile FEM CPU must override stale legacy scene fields");
+        assert_eq!(scene, before, "admission must not rewrite authored intent");
+        scene.study.requested_backend = "fem".into();
+        scene.study.requested_device = "cpu".into();
+        for (backend, device) in [
+            (BackendTarget::Fdm, ExecutionDevice::Cpu),
+            (BackendTarget::Fem, ExecutionDevice::Gpu),
+            (BackendTarget::Auto, ExecutionDevice::Cpu),
+        ] {
+            let profile = scene.study.execution_profile.as_mut().unwrap();
+            profile.defaults.backend = FieldPatch::Value(backend);
+            profile.defaults.device = FieldPatch::Value(device);
+            let error = validate_scene_document_for_authoring(&scene).expect_err(
+                "stale FEM CPU fields cannot legalize a different effective profile lane",
+            );
+            assert!(
+                error
+                    .message
+                    .contains("unsupported parallel_execution realization"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn auxiliary_authoring_does_not_require_magnetic_assignments() {
         for role in ["antenna", "conductor", "geometry"] {
             let mut scene = region_owned_scene();
@@ -3512,6 +3894,52 @@ mod tests {
             validate_scene_document(&scene)
                 .expect("auxiliary geometry does not require magnetic solve assets");
         }
+    }
+
+    #[test]
+    fn adaptive_parallel_execution_replays_layers_and_preserves_weakening_guard() {
+        use fullmag_ir::{
+            BackendTarget, ExecutionDevice, ExecutionFieldOriginIR, ExecutionOriginKindIR,
+            ExecutionProfileIR, ExecutionRequestLayerIR, ExecutionRequestPatchIR, FieldPatch,
+            ParallelExecutionModeIR,
+        };
+        let mut scene = SceneDocument::default();
+        scene.study.parallel_execution.mode = ParallelExecutionModeIR::Adaptive;
+        scene.study.execution_profile = Some(ExecutionProfileIR {
+            defaults: ExecutionRequestPatchIR {
+                backend: FieldPatch::Value(BackendTarget::Auto),
+                device: FieldPatch::Value(ExecutionDevice::Auto),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        scene.study.execution_layers = vec![ExecutionRequestLayerIR {
+            origin: ExecutionFieldOriginIR {
+                kind: ExecutionOriginKindIR::Study,
+                location: "study.adaptive".into(),
+            },
+            request: ExecutionRequestPatchIR {
+                backend: FieldPatch::Value(BackendTarget::Fem),
+                device: FieldPatch::Value(ExecutionDevice::Cpu),
+                ..Default::default()
+            },
+        }];
+        let before = scene.clone();
+        validate_scene_document_for_authoring(&scene)
+            .expect("explicit FEM CPU layer can narrow authored Auto defaults");
+        assert_eq!(scene, before);
+        let profile = scene.study.execution_profile.as_mut().unwrap();
+        profile.defaults.backend = FieldPatch::Value(BackendTarget::Fem);
+        profile.defaults.device = FieldPatch::Value(ExecutionDevice::Cpu);
+        scene.study.execution_layers[0].request.device = FieldPatch::Value(ExecutionDevice::Auto);
+        let error = validate_scene_document_for_authoring(&scene)
+            .expect_err("a Study layer requesting Auto is not explicit FEM CPU adaptive intent");
+        assert!(error.message.contains("unsupported parallel_execution realization"), "{error}");
+        scene.study.execution_layers[0].origin.kind = ExecutionOriginKindIR::Submit;
+        scene.study.execution_layers[0].origin.location = "submit.adaptive".into();
+        let error = validate_scene_document_for_authoring(&scene)
+            .expect_err("Submit must not weaken a pinned explicit CPU profile to Auto");
+        assert!(error.message.contains("materialization is invalid"), "{error}");
     }
 
     #[test]

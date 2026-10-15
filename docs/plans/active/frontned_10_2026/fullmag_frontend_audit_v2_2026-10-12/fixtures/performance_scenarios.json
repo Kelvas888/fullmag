@@ -1,0 +1,59 @@
+{
+  "id": "PERF-01",
+  "kind": "measurement_protocol_not_results",
+  "profiles": [
+    {
+      "id": "small",
+      "objects": 1,
+      "model": "Cylinder, r=50nm h=10nm",
+      "triangle_count": null
+    },
+    {
+      "id": "medium",
+      "objects": 100,
+      "model": "deterministic Box/Cylinder array, no implicit geometry hierarchy",
+      "triangle_count": null
+    },
+    {
+      "id": "import-small",
+      "objects": 1,
+      "triangle_count": 10000,
+      "role": "construction-only initially"
+    },
+    {
+      "id": "import-large",
+      "objects": 1,
+      "triangle_count": 1000000,
+      "role": "at proposed admission boundary; qualification required"
+    },
+    {
+      "id": "mesh-mixed",
+      "objects": 2,
+      "topology": "backend fixture with declared family counts",
+      "element_count": null
+    }
+  ],
+  "protocol": {
+    "warmups": 5,
+    "measured_repetitions": 30,
+    "create_delete_switch_cycles": 50,
+    "idle_window_seconds": 60,
+    "repetitions_role": "proposed_protocol_not_measurement",
+    "report_percentiles": [
+      "p50",
+      "p95",
+      "p99"
+    ],
+    "screens": "fixed viewport resolution/dpr captured in evidence",
+    "quality": "unchanged enabled layers/LOD/precision"
+  },
+  "baseline": {
+    "hardware": null,
+    "browser": null,
+    "backend": null,
+    "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+    "measurements": null,
+    "approved_budgets": null,
+    "status": "not_measured"
+  }
+}

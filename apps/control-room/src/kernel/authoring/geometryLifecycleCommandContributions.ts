@@ -62,9 +62,30 @@ import {
 import { awaitMeshBuildConfirmation, type MeshBuildConfirmCommandId } from "./meshBuildConfirmation";
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import {
-  resolveActiveLaneDiscretization,
   resolveActiveLaneOperation,
 } from "../resources/useActiveLaneCapabilities";
+import { resolveSessionAuthoringDiscretization } from "../resources/sessionDiscretization";
+
+function deleteObjectBlockedReason(context: CommandContext, ignoreReservation = false): string | null {
+  const controller = context.objectEditSession;
+  const scope = context.sessionScopeKey ?? null;
+  if (controller) {
+    if (!scope) return "Wait for the current project session before deleting.";
+    if (!ignoreReservation && controller.hasPendingWrite(scope)) {
+      return "Wait for the pending scene change before deleting.";
+    }
+    if (controller.hasActiveGesture(scope)) return "Finish the active move before deleting.";
+    const draft = controller.getSnapshot();
+    if (draft.identity?.sessionScopeKey === scope && draft.dirty) {
+      return "Apply or revert geometry changes before deleting.";
+    }
+  }
+  const forms = context.pendingForms?.getTransitionSnapshot();
+  if (forms && (forms.applyingOwnerCount > 0 || forms.dirtyOwnerCount > 0 || forms.guarded || forms.preparing)) {
+    return "Apply or revert Inspector changes before deleting.";
+  }
+  return null;
+}
 
 type JsonRecord = Record<string, unknown>;
 
@@ -91,7 +112,8 @@ function sessionRequestOptions(
 }
 
 function sceneBaseRevision(context: CommandContext): number | null {
-  const revision = asRecord(resourceData(context, MODEL_SCENE_PATH))?.revision;
+  const scene = asRecord(resourceData(context, MODEL_SCENE_PATH));
+  const revision = scene?.revision ?? scene?.scene_revision;
   return typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0
     ? revision
     : null;
@@ -231,7 +253,7 @@ export const FDM_MESH_COMMAND_NOT_APPLICABLE_REASON =
   "FEM mesh commands are not applicable to an FDM structured-grid session.";
 
 export const UNKNOWN_MESH_COMMAND_LANE_REASON =
-  "Session discretization is unresolved; FEM mesh commands remain unavailable until an explicit FEM lane is published.";
+  "Choose FEM or FDM in Study settings. If a method is already selected, review session diagnostics before building a mesh.";
 
 /**
  * Resolve the current command lane from the session-status resource only.
@@ -248,8 +270,9 @@ export function resolveMeshCommandLane(
 }
 
 function meshCommandLane(context: CommandContext): MeshCommandLane {
-  const status = resourceData(context, SESSION_STATUS_RESOURCE_KEY) as LiveStatusResource | null;
-  return resolveActiveLaneDiscretization(status?.capabilities?.active_lane ?? null);
+  const status = asRecord(resourceData(context, SESSION_STATUS_RESOURCE_KEY));
+  const payload = asRecord(status?.data ?? status);
+  return resolveMeshCommandLane(resolveSessionAuthoringDiscretization(payload));
 }
 
 function femMeshCommandDisabledReason(context: CommandContext): string | null {
@@ -265,7 +288,7 @@ export const FEM_GRID_COMMAND_NOT_APPLICABLE_REASON =
   "Build Grid is only applicable to an FDM structured-grid session.";
 
 export const UNKNOWN_GRID_COMMAND_LANE_REASON =
-  "Session discretization is unresolved; Build Grid remains unavailable until an explicit FDM lane is published.";
+  "Choose FDM in Study settings to build a structured grid. If FDM is already selected, review session diagnostics.";
 
 function fdmGridBuildDisabledReason(context: CommandContext): string | null {
   if (!context.api) return "Control-room API is unavailable.";
@@ -534,6 +557,7 @@ function invalidateObjectMeshResources(
   objectId: string,
   revision: string | number,
 ): void {
+  context.resources?.invalidate(MESHING_BUILDS_PATH, revision);
   context.resources?.invalidate(MESHING_BUILDS_CURRENT_PATH, revision);
   context.resources?.invalidate(MODEL_READINESS_PATH, revision);
   context.resources?.invalidate(MESHING_SUMMARY_PATH, revision);
@@ -587,11 +611,12 @@ function currentMeshRevision(context: CommandContext): number | null {
 }
 
 function authoritativeMeshCommandRevision(detail: CommandDetailResource): number {
-  return detail.resource_invalidations!.find((entry) => {
+  const matching = detail.resource_invalidations?.find((entry) => {
     const key = entry.resource_key;
     return key === "meshing/shared-domain/manifest" || key === "data/domain/topology" ||
       (key.startsWith("meshing/objects/") && key.endsWith("/topology"));
-  })!.revision;
+  });
+  return matching?.revision ?? 0;
 }
 
 function invalidateMeshBuildStatus(context: CommandContext, revision: string | number): void {
@@ -678,7 +703,7 @@ async function reconcileMeshSubmission(
   const candidates = queue.commands.filter((entry) =>
     meshCommandKindMatches(entry.kind, operation.commandKind),
   )
-    .sort((left, right) => right.seq - left.seq).slice(0, 8);
+    .sort((left, right) => right.seq - left.seq);
   for (const entry of candidates) {
     const detail = requestOptions
       ? await api.detail(entry.command_id, requestOptions)
@@ -956,6 +981,7 @@ let fdmGridRefreshSequence = 0;
 export function runFdmGridRefreshOperation(
   context: CommandContext,
   request: FdmGridRefreshRequest,
+  confirmationRequestId?: string,
 ): Promise<CommandResult> {
   const api = context.api?.commands;
   if (!api) {
@@ -982,7 +1008,8 @@ export function runFdmGridRefreshOperation(
     });
   }
 
-  const requestId = `fdm-grid-refresh-${Date.now()}-${++fdmGridRefreshSequence}`;
+  const requestId = confirmationRequestId ??
+    `fdm-grid-refresh-${Date.now()}-${++fdmGridRefreshSequence}`;
   const operation: MeshBuildOperation = {
     announced: false,
     baseMeshRevision: currentMeshRevision(context),
@@ -1444,7 +1471,7 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
     scope: "workspace",
     isEnabled: (context) => fdmGridBuildDisabledReason(context) === null,
     disabledReason: fdmGridBuildDisabledReason,
-    run: (context) => {
+    run: async (context) => {
       const disabledReason = fdmGridBuildDisabledReason(context);
       if (disabledReason) {
         return { message: disabledReason, status: "failed" };
@@ -1457,11 +1484,20 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
           status: "failed",
         };
       }
+      const confirmation = await awaitMeshBuildConfirmation(context, "grid.build-fdm", {
+        ...asRecord(context.input),
+        kind: "fdm_grid_refresh",
+        reason: "explicit_build_grid",
+        scene_revision: sceneRevision,
+      });
+      if (!confirmation.confirmed) {
+        return { status: "cancelled" };
+      }
       return runFdmGridRefreshOperation(context, {
         kind: "fdm_grid_refresh",
-        precondition: { scene_revision: sceneRevision },
+        precondition: confirmation.precondition ?? { scene_revision: sceneRevision },
         reason: "explicit_build_grid",
-      });
+      }, confirmation.requestId);
     },
   },
   ...(["microstrip", "cpw"] as const).map((layout): CommandContribution => ({
@@ -1607,8 +1643,8 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
     category: "Geometry",
     group: "geometry",
     scope: "selection",
-    isEnabled: (context) => Boolean(selectedObjectId(context)),
-    disabledReason: selectedObjectDisabledReason,
+    isEnabled: (context) => Boolean(selectedObjectId(context)) && !deleteObjectBlockedReason(context),
+    disabledReason: (context) => selectedObjectDisabledReason(context) ?? deleteObjectBlockedReason(context),
     run: async (context) => {
       const obsolete = obsoleteSessionResult(context);
       if (obsolete) return obsolete;
@@ -1620,33 +1656,46 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
         return { message: "Control-room API is unavailable.", status: "failed" };
       }
 
-      const preparation = await prepareAuthoringMutation(context);
-      assertCurrentSessionScope(context);
-      const response = await deleteObjectTransaction(
-        context.api,
-        objectId,
-        {},
-        sessionRequestOptions(context),
-      );
-      const obsoleteAfterWrite = obsoleteSessionResult(context);
-      if (obsoleteAfterWrite) return obsoleteAfterWrite;
-      let selectionClearedByMutation = false;
-      if (context.selection?.get().objectId === objectId) {
-        context.selection.clear("geometry-authoring");
-        selectionClearedByMutation = true;
+      const blocked = deleteObjectBlockedReason(context);
+      if (blocked) return { message: blocked, status: "failed" };
+      const controller = context.objectEditSession;
+      const lease = controller?.beginSceneMutation(context.sessionScopeKey ?? null, objectId) ?? null;
+      if (controller && lease === null) {
+        return { message: "Wait for the pending scene change before deleting.", status: "failed" };
       }
-      await recordAuthoringMutationHistory(
-        context,
-        `Delete ${objectId}`,
-        preparation,
-        response.committed_scene,
-        selectionClearedByMutation
-          ? captureAuthoringHistoryWorkspaceState(context)
-          : preparation.beforeWorkspaceState ?? null,
-      );
-      assertCurrentSessionScope(context);
-      invalidateSceneAuthoringResources(context, response.scene_revision);
-      return { status: "completed" };
+      try {
+        const preparation = await prepareAuthoringMutation(context);
+        assertCurrentSessionScope(context);
+        const blockedBeforeWrite = deleteObjectBlockedReason(context, true);
+        if (blockedBeforeWrite) return { message: blockedBeforeWrite, status: "failed" };
+        const response = await deleteObjectTransaction(
+          context.api,
+          objectId,
+          {},
+          sessionRequestOptions(context),
+        );
+        const obsoleteAfterWrite = obsoleteSessionResult(context);
+        if (obsoleteAfterWrite) return obsoleteAfterWrite;
+        let selectionClearedByMutation = false;
+        if (context.selection?.get().objectId === objectId) {
+          context.selection.clear("geometry-authoring");
+          selectionClearedByMutation = true;
+        }
+        await recordAuthoringMutationHistory(
+          context,
+          `Delete ${objectId}`,
+          preparation,
+          response.committed_scene,
+          selectionClearedByMutation
+            ? captureAuthoringHistoryWorkspaceState(context)
+            : preparation.beforeWorkspaceState ?? null,
+        );
+        assertCurrentSessionScope(context);
+        invalidateSceneAuthoringResources(context, response.scene_revision);
+        return { status: "completed" };
+      } finally {
+        if (lease !== null) controller?.endSceneMutation(lease);
+      }
     },
   },
   {

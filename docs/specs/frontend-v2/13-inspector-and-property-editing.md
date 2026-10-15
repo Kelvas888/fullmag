@@ -257,3 +257,54 @@ Required tests:
 - topological-charge panel renders every scientific computation/trust state and every resource lifecycle/error state, every warning, orientation, SI coordinates, full profile rows, and provenance;
 - unsupported object, missing field, high-order FEM, stale provenance, transport error, and invalidated on-demand result remain visibly distinct;
 - enabling or refreshing topological charge does not change visualization state or mount another viewport.
+
+
+## Shared Inspector presentation and action contract (2026-10-13)
+
+All semantic Explorer selections use `InspectorShell` for identity,
+breadcrumbs, tabs, scrolling and the shared action footer. The selected node
+kind determines its Inspector view; typed resource/carrier refs remain the
+address for visualization and resource access. In particular, unassigned mesh
+parent and part selections retain distinct Inspector routes with a `mesh-part`
+ref. Coverage must exercise node -> selection -> panel resolution.
+
+Use these presentation variants, sharing `InspectorGroup`, `FieldRow`,
+`InspectorPropertyRow`, feedback and the central `--fm-*` tokens:
+
+| View responsibility | Composition | Families |
+|---|---|---|
+| Display / physical overview | `InspectorOverviewFrame`: metrics, primary card, semantic sections | Visualization, Physics, Field Quantity |
+| Authored draft | Validated fields in stable semantic groups | Geometry, Placement, Material, Regions, Mesh parameters, Texture, Constraints, Study and transport editors |
+| Resource / scientific result | `ScientificInspectorTemplate` or typed read-only groups with status and provenance | Results, definitions/navigators, runtime resources, jobs and diagnostics |
+| Project library | Start project/script/result composition | Start Inspectors |
+
+These are variants of the same design system, not a requirement to copy
+Visualization-specific metrics or Display controls into an authoring form.
+Every actionable view must describe the selected target, readable units,
+resource/draft state and the actions that actually apply to it. Raw JSON, when
+needed, belongs to an explicitly labeled advanced/debug section.
+
+Footer behavior is owned by the active panel's `InspectorEditSession`:
+
+- `staged`: show Apply and Revert connected to the real commit and draft-reset
+  callbacks. Apply requires dirty, valid, unlocked state and no pending commit;
+  rejected writes keep the draft and an actionable error. Revert discards local
+  edits to the last acknowledged baseline, not domain defaults.
+- `liveViewport`: show Reset display and explain immediate application; do not
+  show Apply. Reset restores the panel's display baseline.
+- `immediate`: use the panel's named operation buttons; do not show global Apply
+  or Revert that have no draft to operate on.
+- no edit session: no global mutation buttons. The footer explains that this
+  view has no staged edits. Read-only panels need no dummy session.
+
+The footer must not advertise unsupported operations, including an always
+disabled Isolate placeholder. Blocked staged actions expose their reason as
+visible text, associated with the controls. Async actions must avoid duplicate
+submits and report rejection without discarding the draft. Only one active
+form owns the shared session; an overview must not override its nested editor.
+
+Persistent and conditional Inspector controls remain opaque during disclosure,
+resource invalidation and ACK. No opacity transitions. Same-target refreshes
+preserve root identity, focus, scroll and drafts. Browser regression uses the
+production shell and controls, verifies Object/Airbox where applicable, and
+separates controlled fixtures from backend/runtime qualification.

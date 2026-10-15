@@ -19,12 +19,32 @@ mod carrier;
 pub(super) use carrier::{plan_carrier, plan_closed_loop_carrier};
 
 pub(super) fn is_carrier(plan: &fullmag_ir::ExecutionPlanIR) -> bool {
-    plan.provenance
+    matches!(plan.backend_plan, BackendPlanIR::AntennaExternalLeadInspection(_))
+        || plan.provenance
         .notes
         .iter()
         .any(|note| matches!(note.as_str(),
             "antenna_external_lead_inspection_carrier_only:no_llg_execution"
             | "antenna_closed_loop_inspection_carrier_only:no_llg_execution"))
+}
+
+/// Real magnetic continuation is retained by the orchestrator for later stages,
+/// never published as a field belonging to this nonmagnetic inspection stage.
+pub(super) fn clear_magnetic_snapshot(state: &mut crate::live_workspace::LocalLiveWorkspaceState) {
+    state.fem_mesh = None;
+    state.mesh_workspace = None;
+    state.latest_fields = crate::types::CurrentLiveLatestFields::default();
+    state.preview_fields.clear();
+    state.pending_preview_fields.clear();
+    state.superseded_pending_preview_fields.clear();
+    state.clear_preview_cache = true;
+    state.live_state.latest_step.magnetization = None;
+    state.live_state.latest_step.fem_mesh_generation_id = None;
+    state.live_state.latest_step.grid = [0; 3];
+    state.live_state.latest_step.preview_field = None;
+    state.live_state.latest_step.per_object_scalars.clear();
+    state.live_state.latest_step.field_materialization_states.clear();
+    state.live_state.coupled_checkpoint = None;
 }
 
 fn read_record(path: &Path) -> Result<Vec<u8>> {

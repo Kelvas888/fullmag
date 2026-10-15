@@ -93,7 +93,9 @@ fn run_helper(
     let value: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("inspect-script returned invalid JSON: {error}"))?;
     match value {
-        Value::Object(document) if document.get("schema") == Some(&json!(SCRIPT_INSPECT_SCHEMA)) => {
+        Value::Object(document)
+            if document.get("schema") == Some(&json!(SCRIPT_INSPECT_SCHEMA)) =>
+        {
             Ok(document)
         }
         _ => Err(format!(
@@ -105,7 +107,9 @@ fn run_helper(
 /// Path as the user would type it: no `\\?\` verbatim prefix on Windows.
 fn display_path(path: &Path) -> String {
     let text = path.display().to_string();
-    text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text)
+    text.strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(text)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -143,7 +147,8 @@ fn byte_facts(raw: &[u8]) -> ByteFacts {
 /// Rust-only result. Facts that require Python are `null` and `degraded` is
 /// true, so a consumer can never mistake "not checked" for "clean".
 fn degraded(path: &Path, interpreter: Value, helper_error: Option<&str>) -> Result<Value> {
-    let raw = std::fs::read(path).map_err(|error| anyhow!("cannot read {}: {error}", path.display()))?;
+    let raw =
+        std::fs::read(path).map_err(|error| anyhow!("cannot read {}: {error}", path.display()))?;
     let facts = byte_facts(&raw);
     let reason = match helper_error {
         Some(error) => format!("the Python helper failed: {error}"),
@@ -178,7 +183,9 @@ fn human_summary(document: &Value) -> String {
         (Some(Value::Bool(true)), _) => "syntax:   ok".to_string(),
         (Some(Value::Bool(false)), _) => format!(
             "syntax:   error at line {} column {}: {}",
-            syntax["line"], syntax["column"], syntax["message"].as_str().unwrap_or("")
+            syntax["line"],
+            syntax["column"],
+            syntax["message"].as_str().unwrap_or("")
         ),
         _ => "syntax:   not checked".to_string(),
     });
@@ -196,7 +203,10 @@ fn human_summary(document: &Value) -> String {
             interpreter["version"].as_str().unwrap_or("?"),
             interpreter["source"].as_str().unwrap_or("?")
         ),
-        _ => format!("python:   {}", interpreter["message"].as_str().unwrap_or("unresolved")),
+        _ => format!(
+            "python:   {}",
+            interpreter["message"].as_str().unwrap_or("unresolved")
+        ),
     });
     lines.join("\n")
 }
@@ -255,7 +265,10 @@ mod tests {
         let interpreter = json!({ "status": "resolved", "path": "python", "version": "3.12.2" });
         let document = degraded(&script, interpreter, Some("boom")).unwrap();
         assert_eq!(document["interpreter"]["status"], "resolved");
-        assert!(document["degraded_reason"].as_str().unwrap().contains("boom"));
+        assert!(document["degraded_reason"]
+            .as_str()
+            .unwrap()
+            .contains("boom"));
     }
 
     #[test]
@@ -266,8 +279,15 @@ mod tests {
 
     #[test]
     fn script_is_a_registered_subcommand_not_a_script_name() {
-        let raw = |parts: &[&str]| parts.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
-        assert!(!crate::is_script_mode(&raw(&["fullmag", "script", "inspect", "x.py", "--json"])));
+        let raw = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert!(!crate::is_script_mode(&raw(&[
+            "fullmag", "script", "inspect", "x.py", "--json"
+        ])));
         assert!(crate::is_script_mode(&raw(&["fullmag", "x.py"])));
     }
 }

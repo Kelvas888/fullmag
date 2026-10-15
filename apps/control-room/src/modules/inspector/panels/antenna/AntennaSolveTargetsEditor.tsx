@@ -125,7 +125,7 @@ export function AntennaSolveTargetsEditor({ objectId, stageId, scene, status, re
     <FieldRow label="Solve stage" value={stageId} mono />
     <FieldRow label="Sampling domain" value={stage ? antennaSolveTargetLabel(stage.field_sampling_domain) : "unavailable"} />
     <p className="fm-inspector-hint">Targets select where the source field is calculated. They do not activate LLG, projections or drives. The sampling domain is unchanged.</p>
-    {targets.map((target, index) => <div className="fm-microstrip-station-actions" key={`${antennaSolveTargetKey(target)}|${index}`}>
+    {targets.map((target, index) => <div className="fm-microstrip-station-actions" key={antennaSolveTargetKey(target)}>
       <FieldRow label={`Target ${index + 1}`} value={antennaSolveTargetLabel(target)} />
       <Button type="button" disabled={!editable} aria-label={`Remove field-solve target ${index + 1}`} onClick={() => update(targets.filter((_, itemIndex) => itemIndex !== index))}>Remove target</Button>
     </div>)}

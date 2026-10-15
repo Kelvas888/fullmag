@@ -5671,7 +5671,8 @@ odrębnego resource schema/API nie wolno wysyłać tego record jako istniejąceg
 `stage_output_catalog.v1` — stary endpoint pozostaje fail-closed. To kontrakt
 integracji, nie dowód wykonania; runtime i kwalifikacja pozostają otwarte.
 
-Wspólny session shell nadal wymaga planu nośnika magnetyzacji/siatki. Dla
+Historyczny bridge (zastępowany przyrostem standalone poniżej) wymagał
+planu nośnika magnetyzacji/siatki. Dla
 inspection nie może rozwiązywać zwykłego CurrentTransport ani inicjalizować
 LLG. Osobny, jawnie opisany read-model clone zachowuje geometrię, nośniki
 Ms/A/alpha i initial state, a odłącza wykonawczy transport, drives i graf
@@ -5695,8 +5696,55 @@ Session metadata i runtime selection rozpoznają explicit carrier provenance
 i podają `antenna_external_lead_inspection` jako engine, CPU/double/strict oraz
 `NOT VERIFIED`; nie publikują kwalifikacji timestep ani planu nośnika jako
 wykonywanego LLG. Snapshot `m` nie jest wynikiem nowego kroku magnetyzacji.
-Bridge ma właściciela w dedicated CLI stage; jego kryterium usunięcia to
-osobny typed session carrier niewymagający imitacji `ExecutionPlanIR`.
+Bridge miał właściciela w dedicated CLI stage; jego kryterium usunięcia to
+osobny typed session carrier niewymagający imitacji magnetycznego planu.
+
+(antenna-standalone-study-contract)=
+Kontrakt usunięcia bridge jest addytywny: `StudyIR::AntennaFieldSolve`
+serializuje `kind: antenna_field_solve` oraz `sampling`, bez `dynamics`.
+Istniejące `study.stages.add_antenna_field_solve(...)` wybiera tę rodzinę
+explicit stage capture, a nie przez nazwę lub prezentacyjny typ obiektu.
+Wyłącznie ta rodzina może mieć puste `magnets`, magnetyczne `materials`,
+`regions` i `energy_terms`. Geometria, prąd, elektrody, doprowadzenia,
+sampling i ich walidacja pozostają obowiązkowe; niepusta geometria nie jest
+certyfikatem poprawności źródła. Run, Relax i odpowiedź spinowa nadal
+wymagają magnetyka. Eksport sceny bez magnetyka nie dodaje Exchange,
+Demag, initial magnetization ani pozornej dynamiki LLG.
+
+Dedykowany niemagnetyczny wariant `BackendPlanIR` służy wyłącznie
+planowaniu i snapshotom inspection. Zachowuje oryginalny resolved input,
+requested execution i output selector oraz sprawdza ich zgodność przy
+ponownym rozwiązaniu planu. Nie zawiera `initial_magnetization` ani
+neutralnego Zeemana/Heun. Snapshot zawiera geometrię i opublikowane
+V/J/H, nie syntetyczną średnią magnetyzację ani wykonany timestep.
+Zwykły runner LLG odrzuca ten wariant. Fizyczne równania oraz jednostki
+inspection powyżej nie zmieniają się; raw H nie staje się bazą per ampere.
+
+Stan wdrożenia tego przyrostu: **WIP / NOT VERIFIED runtime**.
+Interpretowany regression `test_antenna_standalone_authoring.py` odtwarza
+dotychczasową odmowę bez magnetyka; zielone lowering/round-trip po poprawce
+nie zastąpią buildu, publikacji HTTP ani walidacji numerycznej.
+Realizacją solve pozostaje FEM CPU/double/strict; FEM GPU, FDM CPU i
+FDM GPU nie otrzymują przez ten przyrost własnego solve anteny ani
+cichego fallbacku. Ograniczenia projekcji, LLG i FFT pozostają bez zmian.
+
+| Powierzchnia / parametr | Typ i wartość domyślna | Jednostka | Walidacja i mapowanie |
+|---|---|---|---|
+| `fm.AntennaFieldSolve()` | immutable study, bez argumentów | $1$ | `kind=antenna_field_solve`, `sampling.outputs=[]`, bez dynamics; parametry czasowe nie są przyjmowane |
+| `study.stages.add_antenna_field_solve(...)` | istniejące wymagane `definition` i wybrany port | $1$ dla ID | dotychczasowe tabele definition/port/source obowiązują; capture tej rodziny nie zmienia source ani units |
+| `ProblemIR.study` | tagged `StudyIR::AntennaFieldSolve` | $1$ | brak magnetyka dozwolony tylko dla tej rodziny; planner wymaga rzeczywistej definicji solve i jednego wybranego portu |
+| `BackendPlanIR::AntennaExternalLeadInspection` | resolved input, requested execution, output ID | $1$ dla ID; jednostki pól jak wyżej | zachowane exact input/request/output; ordinary magnetic runner odmawia przed wykonaniem |
+
+Mapowanie źródeł: `packages/fullmag-py/src/fullmag/model/study.py`
++ `AntennaFieldSolve`, `world.py` + `StudyStagesBuilder.add_antenna_field_solve`,
+`crates/fullmag-ir/src/study.rs` + `StudyIR`, `lib.rs` + `ProblemIR::validate`,
+`crates/fullmag-plan/src/antenna_field_solve.rs`
++ `plan_antenna_external_lead_inspection`. Interpretowane testy
+`AntennaStandaloneAuthoringTests` przeszły wraz z round-trip SceneDocument;
+nie wykonują solvera. Testy Rust `antenna_study_has_no_dynamics_and_preserves_empty_sampling`
+oraz `standalone_plan_contains_only_resolved_charge_current_and_sampling_input`
+pozostają niekompilowane. Dla mieszanej sceny z magnetykiem pipeline zachowuje
+autorstwo dynamiki kolejnego Run/Relax; etap inspection sam jej nie wykonuje.
 
 (antenna-current-source-inspection-example)=
 Przykład stage-first `examples/fem_antenna_current_source_inspection.py`
@@ -5846,6 +5894,7 @@ sumuje outward w każdym device Tet4. Nie odtwarza się RT0 w nowym solverze.
 | `inputs`, `values` | dict / required | jednostki obserwabli powyżej | exact fixed input pin, 12 komórek, snapshot v2; v1 jawnie bez sprawdzenia J | hostowa rekonstrukcja z executed capsule, nie native IR dump |
 | `current_tolerance_apm2` | float / $10^{-8}$ | $\mathrm{A\,m^{-2}}$ | finite, dodatnia, nie bool; norma błędu każdego wektora i affine center relation | próg odbioru tego przykładu, nie solver policy |
 | `flux_tolerance_a` | float / $10^{-8}$ | $\mathrm A$ | finite, dodatnia, nie bool; każdy moment oraz suma outward device Tet4 | próg odbioru tego przykładu, nie certyfikat obwodu |
+| `--write-report` | bool / false | $1$ | zapis tylko po udanym porównaniu i przy niezmienionych SHA źródeł checkera; stały plik `export/V-J-H-comparison.json` pod zweryfikowanym run root | prywatna opcja hostowego odbioru, bez nowego Python/IR |
 
 Realizacja: tylko odbiór FEM CPU/double tego przykładu; FEM GPU nie wykonano,
 FDM CPU/GPU nie produkują wymaganego accepted Tet4 snapshotu. Publiczny
@@ -5854,6 +5903,44 @@ Interpretowane testy syntetycznych bytes dowodzą odmów/orkiestracji, nie
 native wykonania. Wynik zachowuje `physics_qualified=false`, brak kwalifikacji
 trwałej sesji, obwodu, per-A, LLG/FFT; realny receipt i scientific comparison
 muszą pochodzić z właściwej kapsuły zarządzanego buildu.
+
+(antenna-current-source-fixture-native-v-j-h-20261011)=
+<!-- DOC-ANCHOR:antenna-current-source-fixture-native-v-j-h-20261011 -->
+#### Wykonany odbiór FEM CPU/double z 2026-10-11
+
+Terminalny build `1128d9f468ee4b0981387a8cdf448451` ma `succeeded`, exit 0,
+commit `62d9618b2eebec639e52eeea842ffde19525a4bd`, kapsułę
+`164ce78afc59e0e195b82c34d9a959762a420416abf4a6fdf0c91669c5059d57`
+i natywny snapshot
+`ad8075fbd2d058c120537e316de8aff14b7b98563875e0e2668436418cb2e0a2`.
+`scripts/run_managed_antenna_ram.py::observe` potwierdził solver exit 0,
+startup identity, przypięte wejścia, pakiet i izolację runu
+`92cdc1e909c242c58c81f1aa495df435`.
+`scripts/compare_managed_antenna_ram.py::compare` zwrócił PASS dla eksportu
+v2: 16 wartości V, 4 wektorów H, 12 środków i 48 lokalnych śladów J,
+108 geometrycznych momentów RT0 oraz 36 bilansów elementów.
+
+| Obserwabla | Maksymalny zmierzony błąd | Zamrożony próg odbioru |
+|---|---|---|
+| V | $1.1102230246251565\times10^{-16}\,\mathrm V$ | $10^{-8}\,\mathrm V$ |
+| wektor J | $4.440892098500626\times10^{-16}\,\mathrm{A\,m^{-2}}$ | $10^{-8}\,\mathrm{A\,m^{-2}}$ |
+| wektor H | $6.760249178929324\times10^{-9}\,\mathrm{A\,m^{-1}}$ | $10^{-8}\,\mathrm{A\,m^{-1}}+10^{-6}\lVert\mathbf H_{\rm ref}\rVert$ |
+| moment normalny RT0 | $2.220446049250313\times10^{-16}\,\mathrm A$ | $10^{-8}\,\mathrm A$ |
+| suma outward w elemencie | $0\,\mathrm A$ | $10^{-8}\,\mathrm A$ |
+
+Wynik dotyczy dokładnego przykładu, stałego prądu i czterech próbek poza
+źródłem. Nie jest dowodem dla taper, próbek wewnątrz przewodnika, błędu
+pominiętego obwodu ani bazy do LLG/FFT. Pełny raport jest zachowany w
+kanonicznym storage pod tym runem, `export/V-J-H-comparison.json`, wraz
+z SHA bezpośrednich źródeł porównania. SHA solver logu to
+`76e17c20ff1474e9b0f9aa2c126952a0b5d9852a9e35d73ad7736a8c5fd32eb1`,
+a build receipt ma SHA
+`fe2b21e8af2828e5c7d699d0ed7812001672c3de6c449fd05a3f131a5ca3d493`.
+Hostowa rekonstrukcja używa dokładnego skryptu i Python DSL kapsuły;
+nie jest dumpem wykonanego IR. `native_input_pins_recomputed=false`,
+`native_canonical_bundle_redecoded=false`, `physics_qualified=false`,
+`durable_session_storage_qualified=false`, `reuse_LLG_FFT_qualified=false`.
+Rzeczywisty HTTP/cold-load i pełna kwalifikacja pozostają osobnymi bramkami.
 
 (antenna-current-source-fixture-observable-association)=
 #### Związanie obserwabli eksportu z retained bundle
@@ -7236,7 +7323,7 @@ evidence and cannot promote a capability lane.
 | `crates/fullmag-cli/src/orchestrator/antenna_external_lead_inspection.rs` | `write_record` | bounded no-overwrite stage record i anulowanie; trzy niewykonane regresje |
 | `crates/fullmag-cli/src/orchestrator/antenna_external_lead_inspection/carrier.rs` | `plan_carrier` | jawny non-executable carrier bridge, source re-resolution przed sanitizacją; trzy niewykonane regresje |
 | `crates/fullmag-cli/src/orchestrator.rs` | `current_live_metadata`, `session_runtime_selection_for_problem` | engine inspection bez fałszywej LLG/timestep kwalifikacji; source-only |
-| `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `AntennaExternalLeadSolutionManifest` | thin raw V/RT0/H inspection schema, requested/resolved execution i pięć binary refs; source-only |
+| `crates/fullmag-antenna-artifacts/src/solution.rs` | `AntennaExternalLeadSolutionManifest` | thin raw V/RT0/H inspection schema, requested/resolved execution i pięć binary refs; source-only |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `build_antenna_external_lead_solution` | alternatywna ścieżka retained bytes: actual input, exact decode i request binding, bez dodatkowego solve |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `load_antenna_external_lead_solution` | solver-free bounded decode, bitowe H/xyz/device V checks; nie freshness lub authentication |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `LoadedAntennaExternalLeadSolution::device_display` | retained device XYZ/Tet4 projection, exact ownership; runtime niewykonany |
@@ -7340,8 +7427,8 @@ evidence and cannot promote a capability lane.
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/record.rs` | `decode_bundle` | wrapper zachowujący odmowy: preflight, owned decode i rzeczywisty request binding; source-only |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/record.rs` | `decode_owned_bundle` | bounded standalone reader, exact nested bytes/SHA, retained ledger i recursive refinement bound; source-only |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/record.rs` | `validate_bundle_request` | osobny binding rzeczywistego charge/closure/roles/branches/target/policy bez phantom request; source-only |
-| `crates/fullmag-runner/src/native_fem/accepted_external_lead/record.rs` | `validate_source_topology` | actual face-connected graph i typed interfaces, bijekcja H1 labels, complete role/support; source-only |
-| `crates/fullmag-runner/src/native_fem/accepted_terminal_charge/record.rs` | `AcceptedTerminalChargeRecord` | retained references/residuals/gauges/omitted rows i exact charge bytes; source-only |
+| `crates/fullmag-antenna-artifacts/src/bundle.rs` | `validate_source_topology` | actual face-connected graph i typed interfaces, bijekcja H1 labels, complete role/support; source-only |
+| `crates/fullmag-antenna-artifacts/src/charge.rs` | `AcceptedTerminalChargeRecord` | retained references/residuals/gauges/omitted rows i exact charge bytes; source-only |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/bundle_tests.rs` | `owned_bundle_retains_exact_nested_bytes_and_physical_ledgers_without_request` | exact retention źródła/pola/charge oraz physical DTO bez request; niekompilowana |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/bundle_tests.rs` | `owned_integrity_accepts_changed_intent_but_real_request_binding_refuses_it` | separate integrity/request freshness dla fully rehashed zmiany target/policy/closure; niekompilowana |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/bundle_tests.rs` | `owned_rehashed_source_corruption_and_degenerate_geometry_are_rejected` | odmowy rehashed source corruption i degeneracji po valid baseline; niekompilowana |
@@ -7413,7 +7500,7 @@ evidence and cannot promote a capability lane.
 | `crates/fullmag-fem-sys/src/lib.rs` | `fullmag_fem_accepted_terminal_charge_request_v1` | Rust repr(C), append-only FFI i production layout assertions |
 | `crates/fullmag-runner/src/native_fem/accepted_terminal_charge.rs` | `solve_accepted_terminal_charge` | jeden call, bounded input/output, hash z tych samych bytes i request binding; prywatny niepodłączony adapter |
 | `crates/fullmag-runner/src/native_fem/accepted_terminal_charge/record.rs` | `decode_accepted_terminal_charge_record` | independent typed decoder, structural map/current gates i pełne consumption; nie numerical qualification |
-| `crates/fullmag-runner/src/native_fem/accepted_terminal_charge/record.rs` | `self_consistent_hash_does_not_bypass_structural_or_current_gates` | source codec regression corrupt rehashed counts/maps/scalars/text; niekompilowana |
+| `crates/fullmag-antenna-artifacts/src/charge.rs` | `self_consistent_hash_does_not_bypass_structural_or_current_gates` | source codec regression corrupt rehashed counts/maps/scalars/text; niekompilowana |
 | `backends/fem/tests/charge_transport_abi_contract.cpp` | `void accepted_charge_abi_headers_policies_and_gpu_fail_atomically` | source ABI header/policy/GPU/capacity i atomowość; niekompilowana |
 | `backends/fem/tests/charge_transport_abi_contract.cpp` | `void accepted_charge_abi_mesh_and_descriptors_fail_closed` | source ABI CSR/boundary/material/IDs/selector/periodic odmowy; niekompilowana |
 | `backends/fem/tests/charge_transport_abi_contract.cpp` | `void accepted_charge_truncated_result_keeps_prefix_and_canary_untouched` | source ABI truncated prefix i no-write canary; niekompilowana |

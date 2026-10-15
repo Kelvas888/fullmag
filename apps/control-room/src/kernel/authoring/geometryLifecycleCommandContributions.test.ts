@@ -35,6 +35,8 @@ import { ResourceInvalidationController } from "../resources/ResourceInvalidatio
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import { activeLaneCapabilityFixture } from "../resources/activeLaneCapabilityFixture.testSupport";
 import { SelectionController } from "../selection/SelectionController";
+import { ObjectEditSessionController } from "./object-edit/ObjectEditSessionController";
+import type { GeometryObjectDraft } from "./object-edit/objectEditTypes";
 
 import {
   FEM_GRID_COMMAND_NOT_APPLICABLE_REASON,
@@ -745,6 +747,92 @@ describe("geometry lifecycle command contributions", () => {
     expect(registry.get("mesh.build-selected")?.disabledReason?.(context)).toBe(
       "A mesh build is already running for this object.",
     );
+  });
+
+  it.each(["apply", "gesture", "dirty", "missing-scope"] as const)(
+    "rejects Delete before HTTP while %s owns editing",
+    async (phase) => {
+      const controller = new ObjectEditSessionController<GeometryObjectDraft>();
+      const scope = "session=delete&epoch=1";
+      const identity = controller.activate({ objectId: "other", targetKey: "object:other", sessionScopeKey: scope }, {} as GeometryObjectDraft);
+      if (phase === "apply") controller.beginApply(identity);
+      if (phase === "gesture") controller.beginGesture(scope, "other");
+      if (phase === "dirty") controller.setDirty(identity, true);
+      const selection = new SelectionController(new EventBus<KernelEventMap>());
+      selectBox(selection);
+      const commitTransaction = vi.fn();
+      const context: CommandContext = {
+        api: { model: { commitTransaction } } as never,
+        objectEditSession: controller,
+        selection,
+        sessionScopeKey: phase === "missing-scope" ? null : scope,
+        source: "test",
+      };
+      const command = GEOMETRY_LIFECYCLE_COMMANDS.find((item) => item.id === "geometry.delete-object")!;
+      expect(command.isEnabled?.(context)).toBe(false);
+      expect(await command.run(context)).toMatchObject({ status: "failed" });
+      expect(commitTransaction).not.toHaveBeenCalled();
+      expect(selection.get().objectId).toBe("box");
+    },
+  );
+
+  it("rechecks a newly edited draft after preparing Delete and releases its reservation", async () => {
+    const controller = new ObjectEditSessionController<GeometryObjectDraft>();
+    const scope = "session=delete&epoch=1";
+    const identity = controller.activate({ objectId: "box", targetKey: "object:box", sessionScopeKey: scope }, {} as GeometryObjectDraft);
+    const selection = new SelectionController(new EventBus<KernelEventMap>());
+    selectBox(selection);
+    const commitTransaction = vi.fn();
+    const command = GEOMETRY_LIFECYCLE_COMMANDS.find((item) => item.id === "geometry.delete-object")!;
+    const deletion = command.run({
+      api: { model: { commitTransaction } } as never,
+      objectEditSession: controller,
+      selection,
+      sessionScopeKey: scope,
+      isCurrentSessionScope: () => true,
+      source: "test",
+    });
+    expect(controller.hasPendingWrite(scope)).toBe(true);
+    controller.setDirty(identity, true);
+    expect(await deletion).toMatchObject({ status: "failed" });
+    expect(commitTransaction).not.toHaveBeenCalled();
+    expect(controller.hasPendingWrite(scope)).toBe(false);
+    expect(controller.getSnapshot().dirty).toBe(true);
+  });
+
+  it("reserves Delete across its ACK and releases it after failure for retry", async () => {
+    const controller = new ObjectEditSessionController<GeometryObjectDraft>();
+    const scope = "session=delete&epoch=1";
+    const identity = controller.activate({ objectId: "other", targetKey: "object:other", sessionScopeKey: scope }, {} as GeometryObjectDraft);
+    const selection = new SelectionController(new EventBus<KernelEventMap>());
+    selectBox(selection);
+    let rejectWrite!: (error: Error) => void;
+    let started!: () => void;
+    const submitted = new Promise<void>((resolve) => { started = resolve; });
+    const pending = new Promise<never>((_, reject) => { rejectWrite = reject; });
+    const commitTransaction = vi.fn(() => { started(); return pending; });
+    const registry = registryWithLifecycleCommands();
+    const context: CommandContext = {
+      api: { model: { commitTransaction } } as never,
+      objectEditSession: controller,
+      selection,
+      sessionScopeKey: scope,
+      isCurrentSessionScope: () => true,
+      source: "test",
+    };
+    const deletion = registry.execute("geometry.delete-object", context);
+    await submitted;
+    expect(controller.hasPendingWrite(scope)).toBe(true);
+    expect(controller.beginApply(identity)).toBeNull();
+    expect(controller.beginGesture(scope, "other")).toBeNull();
+    expect(await registry.execute("geometry.delete-object", context)).toMatchObject({ status: "failed" });
+    expect(commitTransaction).toHaveBeenCalledTimes(1);
+    rejectWrite(new Error("Delete rejected"));
+    expect(await deletion).toMatchObject({ status: "failed" });
+    expect(controller.hasPendingWrite(scope)).toBe(false);
+    expect(selection.get().objectId).toBe("box");
+    const retryApply = controller.beginApply(identity);
+    expect(retryApply).not.toBeNull();
   });
 
   it("commits delete transactions and clears deleted object selection", async () => {
@@ -1623,7 +1711,53 @@ describe("geometry lifecycle command contributions", () => {
     expect(submit).toHaveBeenCalledOnce();
   });
 
-  it("bounds lost-ACK reconciliation and reports pending when the queue is unreachable", async () => {
+  it.each(["fem", "fdm"])("recovers the %s intent behind more than eight newer candidates without resubmission", async (lane) => {
+    const registry = registryWithLifecycleCommands();
+    let intentId: string | undefined;
+    const commandKind = lane === "fem" ? "mesh_build" : "fdm_grid_refresh";
+    const submit = vi.fn(async (request) => {
+      intentId = request.client_intent_id;
+      throw new Error("ACK lost after server acceptance");
+    });
+    const list = vi.fn().mockResolvedValueOnce({ commands: [] }).mockResolvedValue({
+      commands: [
+        { command_id: "accepted-old", kind: lane === "fem" ? "remesh" : commandKind, seq: 1 },
+        ...Array.from({ length: 12 }, (_, index) => ({ command_id: `newer-${index}`, kind: commandKind, seq: index + 2 })),
+        { command_id: "unrelated", kind: "run", seq: 100 },
+      ],
+    });
+    const detail = vi.fn(async (id: string, options?: { sessionScopeKey: string }) => {
+      void options;
+      return {
+        command_id: id,
+        client_intent_id: id === "accepted-old" ? intentId : "different-intent",
+        status: "completed",
+        seq: id === "accepted-old" ? 1 : 20,
+        resource_invalidations: [{ resource_key: "data/domain/topology", revision: 10 }],
+      };
+    });
+    const scope = `session=${lane}&epoch=1`;
+    const context: CommandContext = {
+      api: { commands: { submit, detail, list } } as never,
+      resourceData: sessionStatus(lane),
+      sessionScopeKey: scope,
+      isCurrentSessionScope: () => true,
+      source: "test",
+    };
+    const initial = lane === "fem"
+      ? await registry.execute("mesh.build-shared-domain", context)
+      : await runFdmGridRefreshOperation(context, { kind: "fdm_grid_refresh" });
+    expect(initial).toMatchObject({ status: "pending", observation: "publication-unconfirmed" });
+    expect(await resumeMeshBuildObservation(context)).toEqual({ commandId: "accepted-old", status: "completed" });
+    expect(submit).toHaveBeenCalledOnce();
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(detail).toHaveBeenCalledWith("accepted-old", { sessionScopeKey: scope });
+    expect(detail.mock.calls[0]).toEqual(["newer-11", { sessionScopeKey: scope }]);
+    expect(detail.mock.calls.some(([id]) => id === "unrelated")).toBe(false);
+    expect(detail.mock.calls.every(([, options]) => options?.sessionScopeKey === scope)).toBe(true);
+  });
+
+  it("examines all lost-ACK candidates and reports pending when the queue is unreachable", async () => {
     const registry = registryWithLifecycleCommands();
     const bus = new EventBus<KernelEventMap>();
     const observed = vi.fn();
@@ -1636,7 +1770,7 @@ describe("geometry lifecycle command contributions", () => {
     const context = { api: { commands: { submit, detail, list } } as never, bus,
       resourceData: sessionStatus("fem"), source: "test" as const };
     expect(await registry.execute("mesh.build-shared-domain", context)).toMatchObject({ status: "pending" });
-    expect(detail).toHaveBeenCalledTimes(8);
+    expect(detail).toHaveBeenCalledTimes(50);
     expect(await resumeMeshBuildObservation(context)).toMatchObject({
       status: "pending", observation: "disconnected",
     });
@@ -1783,6 +1917,19 @@ describe("geometry lifecycle command contributions", () => {
 
   it("builds the committed FDM grid through an explicit command", async () => {
     const registry = registryWithLifecycleCommands();
+    const bus = new EventBus<KernelEventMap>();
+    let confirmationRequestId: string | undefined;
+    let submittedEvent: KernelEventMap["mesh:build-submitted"] | undefined;
+    let observedEvent: KernelEventMap["mesh:build-observed"] | undefined;
+    bus.on("mesh:build-confirm-requested", (event) => {
+      confirmationRequestId = event.requestId;
+    });
+    bus.on("mesh:build-submitted", (event) => {
+      submittedEvent = event;
+    });
+    bus.on("mesh:build-observed", (event) => {
+      observedEvent = event;
+    });
     const submit = vi.fn(async () => ({
       accepted: true,
       command_id: "cmd-explicit-fdm-grid",
@@ -1799,6 +1946,7 @@ describe("geometry lifecycle command contributions", () => {
     }));
     const context: CommandContext = {
       api: { commands: { detail, submit } } as never,
+      bus,
       resourceData: {
         ...sessionStatus("fdm"),
         [MODEL_SCENE_PATH]: { revision: 17 },
@@ -1811,8 +1959,19 @@ describe("geometry lifecycle command contributions", () => {
       commandId: "cmd-explicit-fdm-grid",
       status: "completed",
     });
+    expect(confirmationRequestId).toMatch(/^mesh-confirm-/);
+    expect(submittedEvent).toMatchObject({
+      commandId: "cmd-explicit-fdm-grid",
+      requestId: confirmationRequestId,
+    });
+    expect(observedEvent).toMatchObject({
+      commandId: "cmd-explicit-fdm-grid",
+      meshRevision: 18,
+      requestId: confirmationRequestId,
+      status: "completed",
+    });
     expect(submit).toHaveBeenCalledWith({
-      client_intent_id: expect.stringMatching(/^fdm-grid-refresh-/),
+      client_intent_id: confirmationRequestId,
       kind: "fdm_grid_refresh",
       precondition: { scene_revision: 17 },
       reason: "explicit_build_grid",

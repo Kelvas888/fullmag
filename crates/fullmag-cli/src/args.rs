@@ -150,6 +150,16 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = false)]
         execution_plan: bool,
     },
+    /// Prepare submission JSON without accepting a run or starting a solver.
+    PrepareRunJson {
+        /// JSON containing the exact archive, expected_revision, explicit
+        /// run_authoring, compiled Study/catalog and asset_paths.
+        path: PathBuf,
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        api_url: String,
+    },
     /// Submit and materialize an immutable accepted-run request through the public API v2.
     RunJson {
         /// JSON containing archive_base64, RunIntent, StudyPlan, and StudyProblemCatalog.
@@ -211,6 +221,13 @@ pub(crate) enum Command {
         shell: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         raw_args: Vec<OsString>,
+    },
+    /// Internal allowlisted FEM eigen k worker.  This command is launched
+    /// only by the runner's process pool and exchanges data through files.
+    #[command(name = "__eigen-k-worker", hide = true)]
+    EigenKWorker {
+        #[arg(long)]
+        request: PathBuf,
     },
     /// Session persistence commands (save, open, inspect, recover, gc)
     #[command(subcommand)]
@@ -347,6 +364,14 @@ pub(crate) enum RuntimeCommand {
     /// Initialize only a new explicitly scoped accepted store.
     #[command(hide = true)]
     InitializeScopedAcceptedStore,
+    /// Initialize a pinned host policy for a never-started application store.
+    #[command(hide = true)]
+    InitializeHostApplication {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        config_sha256: String,
+    },
     /// Internal managed proof of one-shot durable handoff acceptance.
     #[command(hide = true)]
     VerifyDevelopmentHandoffCommit {

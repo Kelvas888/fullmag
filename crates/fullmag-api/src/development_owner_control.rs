@@ -213,7 +213,24 @@ impl PreparedOwnerControl {
         .await
         {
             Ok(Ok(acquisition)) => acquisition,
-            _ => return reject(stream).await,
+            Ok(Err(error)) => {
+                // The authenticated owner needs a local explanation of the
+                // failed admission gate. Keep the wire rejection unchanged:
+                // it must not disclose workspace data or enable a retry.
+                tracing::warn!(
+                    status = %error.status,
+                    code = ?error.code,
+                    reason = %error.message,
+                    "development workspace acquisition refused before handoff"
+                );
+                return reject(stream).await;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "development workspace acquisition timed out before handoff"
+                );
+                return reject(stream).await;
+            }
         };
         let workspace = match &acquisition.workspace {
             RestartableWorkspace::NoSession { session_epoch, .. } => json!({
@@ -544,7 +561,7 @@ impl PreparedOwnerControl {
         let resource = &observation.resource;
         if !resource.configured
             || resource.state
-                != crate::schemas::development_backend::DevelopmentBackendState::Ready
+                != crate::router_v2::handlers::platform::development_backend::DevelopmentBackendState::Ready
         {
             return None;
         }

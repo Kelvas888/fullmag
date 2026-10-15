@@ -1,0 +1,18 @@
+{
+  "scope": "browser validation of documentation HTML only; not the Fullmag UI",
+  "status": "pass",
+  "engine": "144.0.7559.96",
+  "views": 17,
+  "loaded_images": 11,
+  "tested_navigation": [
+    "doc-00_ROZSTRZYGNIECIA_Q01_Q24",
+    "doc-07_PLAN_WDROZENIA",
+    "doc-08_TESTY_I_REPRODUKCJE",
+    "gallery"
+  ],
+  "page_errors": [],
+  "offline_embedded_content": true,
+  "entry_mode": "set_content; file URL navigation blocked by environment policy",
+  "fullmag_started": false,
+  "fullmag_webgl_qualified": false
+}

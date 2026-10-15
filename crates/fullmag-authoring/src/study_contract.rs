@@ -19,6 +19,7 @@ pub const STUDY_PLAN_SCHEMA_VERSION_V1: &str = "study_plan.v1";
 pub const STUDY_PLAN_SCHEMA_VERSION_V2: &str = "study_plan.v2";
 pub const STUDY_PLAN_SCHEMA_VERSION: &str = "study_plan.v3";
 pub const STUDY_PLAN_SCHEMA_VERSION_V4: &str = "study_plan.v4";
+pub const ANTENNA_INSPECTION_OUTPUT_PORT_ID: &str = "inspection";
 
 /// An immutable reference to the model definition captured by a study step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +107,19 @@ pub struct StudyInputPort {
 pub struct StudyOutputPort {
     pub port_id: String,
     pub data_kind: StudyPortDataKind,
+}
+
+/// Project only explicitly supported primitive output semantics.
+pub(crate) fn authored_stage_output_ports(kind: &StudyStepKind) -> Vec<StudyOutputPort> {
+    match kind {
+        StudyStepKind::Primitive {
+            stage_kind: StudyPrimitiveStageKind::AntennaFieldSolve,
+        } => vec![StudyOutputPort {
+            port_id: ANTENNA_INSPECTION_OUTPUT_PORT_ID.into(),
+            data_kind: StudyPortDataKind::Artifact,
+        }],
+        _ => Vec::new(),
+    }
 }
 
 /// A typed scientific acceptance policy, kept separate from task lifecycle.
@@ -752,6 +766,7 @@ fn migrate_node(
         _ => None,
     };
 
+    let outputs = authored_stage_output_ports(&kind);
     steps.push(StudyStep {
         completion_dependencies: Vec::new(),
         step_id: step_id.clone(),
@@ -766,7 +781,7 @@ fn migrate_node(
         execution_profile: defaults.execution_profile.clone(),
         until_seconds,
         inputs: Vec::new(),
-        outputs: Vec::new(),
+        outputs,
         acceptance: StudyAcceptancePolicy::Any,
         acquisition: StudyAcquisitionPolicy::Exclusive,
         legacy_payload,

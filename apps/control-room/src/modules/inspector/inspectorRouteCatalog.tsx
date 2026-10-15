@@ -7,6 +7,7 @@ import {
   AirboxMeshTopologyLanePanel,
   AirboxOverviewLanePanel,
 } from "./panels/airbox/AirboxInspectorLanePanel";
+import { PinnedVisualizationsInspectorPanel } from "./panels/analysis-results/PinnedVisualizationsInspectorPanel";
 import { FdmMultilayerAirboxTargetPanel } from "./panels/airbox/FdmMultilayerAirboxTargetPanel";
 import { AirboxVisualizationDebugInspectorPanel } from "./panels/airbox/AirboxVisualizationDebugInspectorPanel";
 import { AntennaObjectPanel } from "./panels/AntennaObjectPanel";
@@ -266,6 +267,7 @@ import {
   FrequencyResponseSolverStageInspectorPanel,
   FrequencyResponseStageOverviewInspectorPanel,
   FrequencyResponseSweepStageInspectorPanel,
+  StudyStageInspectorRouter,
 } from "./panels/StudyStageInspectorRouter";
 import { resolveFrequencyDomainNodeDetail } from "./panels/frequencyDomainNodeDetails";
 import type {
@@ -686,6 +688,12 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
     title: "State Snapshots",
     selectionKinds: ["results.observation_frames.root"],
     component: ObservationFramesOverviewPanel,
+  },
+  {
+    id: "pinned-visualizations",
+    title: "Pinned Visualizations",
+    selectionKinds: ["results.pinned_visualizations.root"],
+    component: PinnedVisualizationsInspectorPanel,
   },
   {
     id: "observation-frame",
@@ -1450,6 +1458,12 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
     component: StudyStageAddFieldDriveInspectorPanel,
   },
   {
+    id: "study-stage-antenna-field-solve",
+    title: "Antenna Field Solve",
+    selectionKinds: ["study.stage.antenna_field_solve"],
+    component: StudyStageInspectorRouter,
+  },
+  {
     id: "study-stage-autosave",
     title: "Study Stage Autosave",
     selectionKinds: ["study.stage.autosave"],
@@ -1501,7 +1515,7 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
   {
     id: "analysis-result",
     title: "Analysis result",
-    selectionKinds: ["analysis.result"],
+    selectionKinds: ["analysis.result", "results.hysteresis.dataset"],
     component: AnalysisResultInspectorPanel,
   },
   {

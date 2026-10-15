@@ -63,7 +63,7 @@ export function InspectorGroup({
         <button
           aria-controls={contentId}
           aria-expanded={open}
-          className="fm-inspector-group-nav-trigger flex w-full min-w-0 items-center gap-3 px-fm-inline py-2.5 text-left outline-none transition-all hover:bg-fm-hover active:scale-[0.99] focus-visible:ring-2 focus-visible:ring-fm-accent"
+          className="fm-inspector-group-nav-trigger flex w-full min-w-0 items-center gap-3 px-fm-inline py-2.5 text-left outline-none transition-[background-color,box-shadow,transform] hover:bg-fm-hover active:scale-[0.99] focus-visible:ring-2 focus-visible:ring-fm-accent"
           data-slot="inspector-group-trigger"
           type="button"
           onClick={() => setOpen((current) => !current)}
@@ -112,7 +112,7 @@ export function InspectorGroup({
         <button
           aria-controls={contentId}
           aria-expanded={open}
-          className="flex h-fm-control-sm w-full min-w-0 items-center gap-1.5 rounded-fm-disclosure px-1.5 text-left outline-none transition-all hover:bg-fm-disabled active:scale-[0.99] focus-visible:ring-2 focus-visible:ring-fm-accent"
+          className="flex h-fm-control-sm w-full min-w-0 items-center gap-1.5 rounded-fm-disclosure px-1.5 text-left outline-none transition-[background-color,box-shadow,transform] hover:bg-fm-disabled active:scale-[0.99] focus-visible:ring-2 focus-visible:ring-fm-accent"
           data-slot="inspector-group-trigger"
           type="button"
           onClick={() => setOpen((current) => !current)}

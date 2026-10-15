@@ -400,6 +400,8 @@ pub(crate) fn live_state_manifest_from_update(
         runtime_status: Some(fullmag_runner::RuntimeStatus::from_status_code(status_str)),
         updated_at_unix_ms: unix_time_millis().unwrap_or(0),
         latest_step: LiveStepView {
+            kind: update.stats.kind.clone(),
+            solver_progress: update.stats.solver_progress.clone(),
             step: update.stats.step,
             time: update.stats.time,
             dt: update.stats.dt,
@@ -435,6 +437,7 @@ pub(crate) fn running_run_manifest_from_update(
     artifact_dir: &Path,
     update: &fullmag_runner::StepUpdate,
 ) -> RunManifest {
+    let physical = update.stats.is_physical_observation();
     RunManifest {
         run_id: run_id.to_string(),
         session_id: session_id.to_string(),
@@ -443,15 +446,21 @@ pub(crate) fn running_run_manifest_from_update(
         } else {
             "running".to_string()
         },
-        total_steps: update.stats.step as usize,
-        final_time: Some(update.stats.time),
-        final_e_ex: Some(update.stats.e_ex),
-        final_e_demag: Some(update.stats.e_demag),
-        final_e_ext: Some(update.stats.e_ext),
-        final_e_ani: Some(update.stats.e_ani),
-        final_e_dmi: Some(update.stats.e_dmi),
-        final_e_rotated_dmi: Some(update.stats.e_rotated_dmi),
-        final_e_total: Some(update.stats.e_total),
+        // Modal iteration/phase counters belong to progress diagnostics, not
+        // the number of accepted physical time-integration steps.
+        total_steps: if physical {
+            update.stats.step as usize
+        } else {
+            0
+        },
+        final_time: physical.then_some(update.stats.time),
+        final_e_ex: physical.then_some(update.stats.e_ex),
+        final_e_demag: physical.then_some(update.stats.e_demag),
+        final_e_ext: physical.then_some(update.stats.e_ext),
+        final_e_ani: physical.then_some(update.stats.e_ani),
+        final_e_dmi: physical.then_some(update.stats.e_dmi),
+        final_e_rotated_dmi: physical.then_some(update.stats.e_rotated_dmi),
+        final_e_total: physical.then_some(update.stats.e_total),
         artifact_dir: artifact_dir.display().to_string(),
     }
 }
@@ -484,6 +493,9 @@ pub(crate) fn initial_step_update(
             hysteresis_settle_step_method: None, scalar_row_due: false,
             terminal_field_snapshot: false, finished: false,
         },
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            antenna_inspection_step_update(stats, false)
+        }
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: None,
             stats,
@@ -580,6 +592,29 @@ pub(crate) fn initial_step_update(
     }
 }
 
+fn antenna_inspection_step_update(
+    stats: fullmag_runner::StepStats,
+    finished: bool,
+) -> fullmag_runner::StepUpdate {
+    fullmag_runner::StepUpdate {
+        coupled_checkpoint: None,
+        stats,
+        grid: [0, 0, 0],
+        fem_mesh_generation_id: None,
+        magnetization: None,
+        preview_field: None,
+        cached_preview_fields: None,
+        hysteresis_field_m_t: None,
+        hysteresis_point_index: None,
+        hysteresis_settle_step_index: None,
+        hysteresis_settle_step_kind: None,
+        hysteresis_settle_step_method: None,
+        scalar_row_due: false,
+        terminal_field_snapshot: false,
+        finished,
+    }
+}
+
 fn initial_frequency_response_progress_scalars(
     fem: &fullmag_ir::FemFrequencyResponsePlanIR,
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, f64>> {
@@ -645,6 +680,9 @@ pub(crate) fn final_stage_step_update(
 
     Some(match backend_plan {
         BackendPlanIR::AntennaFieldOnly(_) => return None,
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            antenna_inspection_step_update(stats, finished)
+        }
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: checkpoint,
             stats,
@@ -750,6 +788,9 @@ pub(crate) fn snapshot_step_update_from_stats(
             update.stats = stats;
             update.finished = finished;
             update
+        }
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            antenna_inspection_step_update(stats, finished)
         }
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: None,
@@ -909,6 +950,9 @@ pub(crate) fn validate_imported_magnetization(
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let expected_vectors = match &plan.backend_plan {
         BackendPlanIR::AntennaFieldOnly(_) => bail!("field_only cannot import magnetic state"),
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            bail!("antenna inspection does not accept a magnetization import")
+        }
         BackendPlanIR::Fdm(fdm) => fdm.initial_magnetization.len(),
         BackendPlanIR::FdmMultilayer(fdm) => fdm
             .layers
@@ -1079,7 +1123,9 @@ fn planned_fem_mesh_node_count(problem: &ProblemIR) -> Result<Option<usize>> {
         BackendPlanIR::Fem(fem) => Some(fem.mesh.nodes.len()),
         BackendPlanIR::FemEigen(fem) => Some(fem.mesh.nodes.len()),
         BackendPlanIR::FemFrequencyResponse(fem) => Some(fem.mesh.nodes.len()),
-        BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => None,
+        BackendPlanIR::AntennaExternalLeadInspection(_)
+        | BackendPlanIR::Fdm(_)
+        | BackendPlanIR::FdmMultilayer(_) => None,
     })
 }
 
@@ -1140,6 +1186,9 @@ pub(crate) fn continuation_source_from_backend_plan(
 ) -> ContinuationSource {
     match backend_plan {
         BackendPlanIR::AntennaFieldOnly(_) => ContinuationSource::Unsupported("field_only has no magnetic continuation state".to_string()),
+        BackendPlanIR::AntennaExternalLeadInspection(_) => ContinuationSource::Unsupported(
+            "antenna inspection does not define a magnetic continuation carrier".to_string(),
+        ),
         BackendPlanIR::Fdm(plan) => match fdm_continuation_identity(plan) {
             Ok(identity) => ContinuationSource::Fdm(identity),
             Err(error) => ContinuationSource::Unsupported(error.to_string()),
@@ -1313,6 +1362,9 @@ pub(crate) fn resample_continuation_if_cross_backend(
         (ContinuationSource::Fem(_), BackendPlanIR::FdmMultilayer(_)) => {
             // Multi-layer FDM continuation from FEM is not yet supported.
             bail!("FEM → FDM-multilayer cross-backend continuation is not yet supported");
+        }
+        (_, BackendPlanIR::AntennaExternalLeadInspection(_)) => {
+            bail!("antenna inspection does not accept cross-backend magnetization transfer")
         }
         (ContinuationSource::Unsupported(_), _) => unreachable!(),
     }
@@ -1613,6 +1665,23 @@ fn resolve_interactive_llg_policy(
     Ok(())
 }
 
+pub(crate) fn build_initial_interactive_command_stage(
+    authored_stage: &ResolvedScriptStage,
+    bound_problem: &ProblemIR,
+    command: &crate::types::SessionCommand,
+) -> Result<Option<ResolvedScriptStage>> {
+    let mut effective_command = command.clone();
+    // Compute solves the already materialized study; TimeEvolution IR keeps
+    // its duration in ResolvedScriptStage rather than in StudyIR.
+    if command.kind == "solve"
+        && command.until_seconds.is_none()
+        && matches!(&bound_problem.study, fullmag_ir::StudyIR::TimeEvolution { .. })
+    {
+        effective_command.until_seconds = Some(authored_stage.until_seconds);
+    }
+    build_interactive_command_stage(bound_problem, &effective_command)
+}
+
 pub(crate) fn build_interactive_command_stage(
     base_problem: &ProblemIR,
     command: &crate::types::SessionCommand,
@@ -1625,6 +1694,7 @@ pub(crate) fn build_interactive_command_stage(
                 fullmag_ir::StudyIR::Relaxation { .. } => "relax".to_string(),
                 fullmag_ir::StudyIR::TimeEvolution { .. } => "run".to_string(),
                 fullmag_ir::StudyIR::FieldOnly { .. }
+                | fullmag_ir::StudyIR::AntennaFieldSolve { .. }
                 | fullmag_ir::StudyIR::Eigenmodes { .. }
                 | fullmag_ir::StudyIR::FrequencyResponse { .. }
                 | fullmag_ir::StudyIR::Hysteresis { .. } => {
@@ -2168,6 +2238,29 @@ mod tests {
         assert!(requires_antenna_lead_materialization(&config));
         config.stages[0].ir.current_modules.clear();
         assert!(!requires_antenna_lead_materialization(&config));
+    }
+
+    #[test]
+    fn initial_solve_uses_authored_run_duration_and_preserves_explicit_override() {
+        let problem = sample_problem_ir();
+        let authored = ResolvedScriptStage::solver(problem.clone(), 7e-12, "flat_run");
+        let mut command = solver_command("solve");
+        command.until_seconds = None;
+        let stage = build_initial_interactive_command_stage(&authored, &problem, &command)
+            .expect("authored solve should build")
+            .expect("solve should produce a stage");
+        assert_eq!(stage.until_seconds, 7e-12);
+        assert_eq!(command.until_seconds, None);
+
+        command.until_seconds = Some(2e-12);
+        let overridden = build_initial_interactive_command_stage(&authored, &problem, &command)
+            .expect("explicit solve duration should build")
+            .expect("solve should produce a stage");
+        assert_eq!(overridden.until_seconds, 2e-12);
+
+        command.kind = "run".to_string();
+        command.until_seconds = None;
+        assert!(build_initial_interactive_command_stage(&authored, &problem, &command).is_err());
     }
 
     fn frozen_spins_binding_command(source_scene_revision: u64) -> crate::types::SessionCommand {
@@ -6387,10 +6480,14 @@ mod tests {
         sampling.outputs = vec![
             fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "spectrum".to_string(),
+                scope: None,
             },
             fullmag_ir::OutputIR::EigenMode {
                 field: "mode".to_string(),
+                all_modes: false,
                 indices: vec![0, 1],
+                branches: vec![],
+                sample_selector: None,
             },
         ];
         target_ir.study = fullmag_ir::StudyIR::Eigenmodes {
@@ -6570,6 +6667,7 @@ mod tests {
         let mut sampling = eigen_ir.study.sampling().clone();
         sampling.outputs = vec![fullmag_ir::OutputIR::EigenSpectrum {
             quantity: "spectrum".to_string(),
+            scope: None,
         }];
         eigen_ir.study = fullmag_ir::StudyIR::Eigenmodes {
             dynamics,
@@ -6635,10 +6733,14 @@ mod tests {
                 },
                 fullmag_ir::OutputIR::EigenSpectrum {
                     quantity: "spectrum".to_string(),
+                    scope: None,
                 },
                 fullmag_ir::OutputIR::EigenMode {
                     field: "mode".to_string(),
+                    all_modes: false,
                     indices: vec![0, 1, 7],
+                    branches: vec![],
+                    sample_selector: None,
                 },
             ];
         }
@@ -6736,10 +6838,14 @@ mod tests {
         sampling.outputs = vec![
             fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "spectrum".to_string(),
+                scope: None,
             },
             fullmag_ir::OutputIR::EigenMode {
                 field: "mode".to_string(),
+                all_modes: false,
                 indices: vec![0, 1, 7],
+                branches: vec![],
+                sample_selector: None,
             },
         ];
         base.study = fullmag_ir::StudyIR::TimeEvolution {

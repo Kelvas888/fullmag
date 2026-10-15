@@ -1,0 +1,24 @@
+digraph G {
+graph [bgcolor="#f7f9fc", fontname="DejaVu Sans", fontsize=20, fontcolor="#182e47", labelloc=t, labeljust=l, pad=0.4, nodesep=0.4, ranksep=0.7, splines=polyline, dpi=130];
+node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12, fillcolor="#e6edf5", color="#adc1d7", fontcolor="#142941", penwidth=1.2, margin="0.19,0.15"];
+edge [fontname="DejaVu Sans", fontsize=10, color="#6e89a7", fontcolor="#415c78", arrowsize=0.75, penwidth=1.2];
+rankdir=TB;
+label="D04 / IMPORTED GEOMETRY PIPELINE\nSource triangles are not automatically a computational volume mesh";
+file [label="FILE / PROJECT ASSET\nformat + encoding + size limits"];
+upload [label="STAGED IMMUTABLE ASSET\ncontent hash + provenance\nno scene-object yet",fillcolor="#d4e5f7",color="#6f99c4"];
+units [label="UNITS & PLACEMENT\nexplicit source unit → SI once\nobject transform stored separately",fillcolor="#cceae7",color="#5caaa1"];
+preview [label="SURFACE PREVIEW / LOD\noriginal bounds + converted bounds\nnot evidence of volume readiness"];
+checks [label="CHECKS WITH EVIDENCE\nfinite vertices / topology / closure\norientation / intersections / components"];
+repair [label="OPTIONAL REPAIR\nuser-approved diff\nnew asset version, original retained",fillcolor="#f7e9cc",color="#d3b465"];
+commit [label="COMMIT SCENE OBJECT\nrole + semantic selection + material refs\nsource identity + transform + base revision",fillcolor="#1d405f",fontcolor="white",color="#1d405f"];
+fem [label="FEM REALIZATION\nqualified domain + mesh recipe\nvolume meshing + quality"];
+fdm [label="FDM REALIZATION\nqualified occupancy / support\ngrid + canonical membership"];
+construct [label="CONSTRUCTION SURFACE\nexplicit surface-only role\nnot a magnetic volume"];
+file -> upload -> units -> preview -> checks;
+checks -> repair [label="fixable issue"];repair -> checks [label="revalidate new asset",constraint=false];
+checks -> commit [label="capabilities and role validated"];
+commit -> fem;commit -> fdm;commit -> construct;
+{rank=same;fem;fdm;construct;}
+cancel [label="CANCEL\nno object committed\nasset retention policy applies",shape=note,fillcolor="#edf1f7",color="#b6c5d6"];
+upload -> cancel [style=dashed];
+}

@@ -108,10 +108,15 @@ import {
   type DecodedTopology,
 } from "../api/codecs";
 import { ControlRoomApiError } from "../api/ControlRoomApi";
+import {
+  resolveArtifactAssessment,
+  type ArtifactAssessment,
+} from "@/shared/domain/mesh/artifactAssessment";
 import { useKernel } from "../KernelContext";
 import type { ResourceInvalidationController } from "./ResourceInvalidationController";
 import {
   sharedResourceRuntimeStore,
+  type ResourceRuntimeSnapshot,
   type ResourceRuntimeStore,
 } from "./ResourceRuntimeStore";
 import { ResourceCache } from "./ResourceCache";
@@ -541,28 +546,62 @@ export function publishCommittedSceneResource(
   sessionScopeKey?: string | null,
   resourceCacheScope?: string | null,
 ): void {
-  const publish = resourceCacheScope
-    ? runtimeStore.updateObservedData.bind(runtimeStore)
-    : runtimeStore.updateData.bind(runtimeStore);
-  publish(
+  const finiteNumericRevision =
+    typeof revision !== "number" || Number.isFinite(revision);
+  const safeNumericRevision =
+    typeof revision !== "number" ||
+    (Number.isSafeInteger(revision) && revision >= 0);
+  const incomingSceneRevision = safeSceneRevision(scene.revision);
+  const coherentNumericSceneRevision =
+    typeof revision !== "number" ||
+    (safeNumericRevision &&
+      incomingSceneRevision !== null &&
+      scene.revision === revision);
+
+  const publishIfCurrent = (
+    resourceKey: string,
+    runtimeResourceKey: string,
+  ): void => {
+    const snapshot = runtimeStore.getSnapshot<SceneResource>(runtimeResourceKey);
+    if (
+      !safeNumericRevision ||
+      !coherentNumericSceneRevision ||
+      !canPublishCommittedSceneAtRevision({
+        hasClientScope: Boolean(resourceCacheScope),
+        incomingSceneRevision,
+        hasPendingLoad: runtimeStore.hasPendingLoad(runtimeResourceKey),
+        requestedRevision: resources.getRevision(resourceKey),
+        snapshot,
+      })
+    ) {
+      return;
+    }
+
+    if (resourceCacheScope) {
+      runtimeStore.updateObservedData(runtimeResourceKey, scene, revision);
+    } else {
+      runtimeStore.updateData(runtimeResourceKey, scene, revision);
+    }
+  };
+
+  publishIfCurrent(
+    SCENE_RESOURCE_KEY,
     resourceRuntimeKeyForClientScope(SCENE_RESOURCE_KEY, resourceCacheScope),
-    scene,
-    revision,
   );
   // Client-owned publications must not create unobserved aliases or resurrect
   // a disposed owner's snapshots. Canonical invalidation lets future observers
   // fetch authoritative data through their own session and client scope.
   if (sessionScopeKey) {
-    publish(
+    const scopedResourceKey = `${sessionScopeKey}|${SCENE_RESOURCE_KEY}`;
+    publishIfCurrent(
+      scopedResourceKey,
       resourceRuntimeKeyForClientScope(
-        `${sessionScopeKey}|${SCENE_RESOURCE_KEY}`,
+        scopedResourceKey,
         resourceCacheScope,
       ),
-      scene,
-      revision,
     );
   }
-  if (invalidate) {
+  if (invalidate && finiteNumericRevision) {
     if (sessionScopeKey) {
       resources.invalidate(
         `${sessionScopeKey}|${SCENE_RESOURCE_KEY}`,
@@ -572,6 +611,175 @@ export function publishCommittedSceneResource(
       resources.invalidate(SCENE_RESOURCE_KEY, revision);
     }
   }
+}
+
+function safeSceneRevision(revision: unknown): number | null {
+  return (
+    typeof revision === "number" &&
+    Number.isSafeInteger(revision) &&
+    revision >= 0
+  )
+    ? revision
+    : null;
+}
+
+function canPublishCommittedSceneAtRevision({
+  hasClientScope,
+  incomingSceneRevision,
+  hasPendingLoad,
+  requestedRevision,
+  snapshot,
+}: {
+  hasClientScope: boolean;
+  incomingSceneRevision: number | null;
+  hasPendingLoad: boolean;
+  requestedRevision: ResourceRevision | null;
+  snapshot: ResourceRuntimeSnapshot<SceneResource>;
+}): boolean {
+  if (snapshot.data !== null) {
+    const cachedSceneRevision = safeSceneRevision(snapshot.data.revision);
+    if (cachedSceneRevision === null && incomingSceneRevision !== null) {
+      return false;
+    }
+    if (
+      cachedSceneRevision !== null &&
+      (incomingSceneRevision === null ||
+        cachedSceneRevision > incomingSceneRevision)
+    ) {
+      return false;
+    }
+  }
+
+  for (const currentRevision of [
+    snapshot.revision,
+    snapshot.settledExternalRevision,
+    requestedRevision,
+  ]) {
+    if (typeof currentRevision !== "number") continue;
+    if (!Number.isSafeInteger(currentRevision) || currentRevision < 0) {
+      return false;
+    }
+    if (
+      incomingSceneRevision === null ||
+      currentRevision > incomingSceneRevision
+    ) {
+      return false;
+    }
+  }
+
+  if (
+    typeof requestedRevision === "string" &&
+    snapshot.settledExternalRevision !== requestedRevision
+  ) {
+    // Invalidation may reach the controller before the hook starts its load.
+    // A ready snapshot for an older opaque token has not settled this request.
+    return false;
+  }
+
+  // The initial snapshot is also marked loading even without a request. Only
+  // the legacy unscoped cache may be bootstrapped in this truly empty state.
+  if (
+    !hasClientScope && !hasPendingLoad && snapshot.status === "loading" &&
+    snapshot.data === null && snapshot.revision === null &&
+    snapshot.settledExternalRevision === null &&
+    snapshot.settledResourceKey === null && requestedRevision === null
+  ) {
+    return true;
+  }
+
+  if (snapshot.status === "loading" || snapshot.status === "stale") {
+    const inFlightSceneRevision = safeSceneRevision(snapshot.revision);
+    const currentRequestedRevision = safeSceneRevision(requestedRevision);
+    if (
+      inFlightSceneRevision === null ||
+      currentRequestedRevision === null ||
+      incomingSceneRevision === null ||
+      inFlightSceneRevision >= incomingSceneRevision
+    ) {
+      // `stale` retains prior data while a refresh is pending. Do not let a
+      // commit ACK cancel that refresh unless both its active and requested
+      // revisions prove it is older than the committed scene.
+      return false;
+    }
+  }
+
+  if (!hasClientScope) return true;
+  if (incomingSceneRevision === null) return false;
+  return true;
+}
+
+let meshPolicyPublicationSequence = 0;
+
+export function resolveMeshPolicyResourceRevision(
+  resource:
+    | {
+        config?: unknown;
+        effective_config?: unknown;
+        revision?: ResourceRevision | null;
+      }
+    | null
+    | undefined,
+): ResourceRevision | null {
+  if (!resource) return null;
+  const baseRevision = resolveRevisionProperty(resource, "revision") ?? 0;
+  const configFingerprint =
+    resource.config === undefined || resource.config === null
+      ? "null"
+      : JSON.stringify(resource.config);
+  return `${baseRevision}:${configFingerprint}`;
+}
+
+export function publishCommittedMeshPolicyResource<
+  TPolicy extends {
+    config?: unknown;
+    effective_config?: unknown;
+    revision?: number;
+  },
+>(
+  resources: ResourceInvalidationController,
+  unscopedResourceKey: string,
+  policyResource: TPolicy,
+  sessionScopeKey?: string | null,
+  resourceCacheScope?: string | null,
+  runtimeStore: ResourceRuntimeStore<TPolicy> =
+    sharedResourceRuntimeStore as ResourceRuntimeStore<TPolicy>,
+): ResourceRevision {
+  const revisionToken: ResourceRevision =
+    resolveMeshPolicyResourceRevision(policyResource) ??
+    `policy:${policyResource.revision ?? 0}:${++meshPolicyPublicationSequence}`;
+  const publish = resourceCacheScope
+    ? runtimeStore.updateObservedData.bind(runtimeStore)
+    : runtimeStore.updateData.bind(runtimeStore);
+  publish(
+    resourceRuntimeKeyForClientScope(unscopedResourceKey, resourceCacheScope),
+    policyResource,
+    revisionToken,
+  );
+  if (sessionScopeKey) {
+    publish(
+      resourceRuntimeKeyForClientScope(
+        `${sessionScopeKey}|${unscopedResourceKey}`,
+        resourceCacheScope,
+      ),
+      policyResource,
+      revisionToken,
+    );
+    resources.invalidate(
+      `${sessionScopeKey}|${unscopedResourceKey}`,
+      revisionToken,
+    );
+  } else {
+    resources.invalidate(unscopedResourceKey, revisionToken);
+  }
+  const dependentRevision: ResourceRevision = `${revisionToken}:${++meshPolicyPublicationSequence}`;
+  resources.invalidate(MESH_SEMANTICS_RESOURCE_KEY, dependentRevision);
+  resources.invalidate(MESH_SUMMARY_RESOURCE_KEY, dependentRevision);
+  resources.invalidate(MESH_BUILD_CURRENT_RESOURCE_KEY, dependentRevision);
+  resources.invalidate(
+    MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY,
+    dependentRevision,
+  );
+  return dependentRevision;
 }
 
 export function useSceneResource(options: ResourceHookOptions = {}) {
@@ -962,7 +1170,7 @@ export function useMeshSharedDomainPolicyResource(options: ResourceHookOptions =
   return useResource<MeshSharedDomainConfigResource>({
     enabled: options.enabled !== false && sessionIdentity !== null,
     load,
-    resolveRevision: resolveJsonResourceRevision,
+    resolveRevision: resolveMeshPolicyResourceRevision,
     resourceKey,
   });
 }
@@ -1854,7 +2062,7 @@ export function useObjectMeshPolicyResource(
   return useResource<MeshObjectConfigResource>({
     enabled,
     load,
-    resolveRevision: resolveJsonResourceRevision,
+    resolveRevision: resolveMeshPolicyResourceRevision,
     resourceKey,
   });
 }
@@ -1873,7 +2081,7 @@ export function useUniverseMeshPolicyResource(options: ResourceHookOptions = {})
   return useResource<MeshUniverseConfigResource>({
     enabled: options.enabled !== false && sessionIdentity !== null,
     load,
-    resolveRevision: resolveJsonResourceRevision,
+    resolveRevision: resolveMeshPolicyResourceRevision,
     resourceKey,
   });
 }
@@ -1964,4 +2172,36 @@ function resolveRevisionProperty(
   }
 
   return null;
+}
+
+/**
+ * Single shared artifact assessment selector across Control Room (PR08/PR10/D06).
+ */
+export function useMeshArtifactAssessment(
+  options: ResourceHookOptions = {},
+): ArtifactAssessment {
+  const scene = useSceneResource(options);
+  const manifest = useMeshSharedDomainManifestResource(options);
+  const activeBuild = useMeshBuildCurrent(options);
+  const latestBuild = useMeshBuildLatestSuccessful(options);
+  const summary = useMeshSummaryResource(options);
+
+  return useMemo(() => {
+    return resolveArtifactAssessment({
+      activeBuild: activeBuild.data?.active_build,
+      latestBuild: latestBuild.data?.last_success,
+      manifest: manifest.data as Record<string, unknown> | null | undefined,
+      resourceLoadState: manifest.status,
+      sceneRevision: scene.data?.revision ?? scene.data?.scene_revision,
+      statusMeshRevision: summary.data?.revision,
+    });
+  }, [
+    activeBuild.data?.active_build,
+    latestBuild.data?.last_success,
+    manifest.data,
+    manifest.status,
+    scene.data?.revision,
+    scene.data?.scene_revision,
+    summary.data?.revision,
+  ]);
 }

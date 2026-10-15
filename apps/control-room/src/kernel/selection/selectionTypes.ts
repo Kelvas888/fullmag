@@ -297,6 +297,13 @@ export type SelectionRef =
       type: "observation-frame";
     }
   | {
+      kind: "results.pinned_visualizations.root";
+      moduleId: string;
+      nodeId: string;
+      runId: string;
+      type: "analysis-pinned-group";
+    }
+  | {
       constraintId: string;
       kind: "object.frozen-spins";
       nodeId: string;
@@ -429,9 +436,12 @@ export type SelectionRef =
       visualizationTargetId: string;
     }
   | {
+      artifactId?: string | null;
       centroid: [number, number, number] | null;
       elementIndex: number;
+      generationId?: string | null;
       kind: "mesh.quality.element";
+      meshRevision?: number | null;
       metric?: MeshQualitySelectionMetric;
       nodeId: string;
       type: "mesh-quality-element";
@@ -609,6 +619,7 @@ export type SelectionRef =
       kind:
         | "study.stage.action"
         | "study.stage.add_field_drive"
+        | "study.stage.antenna_field_solve"
         | "study.stage.autosave"
         | "study.stage.eigenmodes"
         | "study.stage.eigenmodes.setup"
@@ -697,6 +708,8 @@ export type SelectionRef =
       analysisRunId?: string;
       analysisStageId?: string;
       artifactRevision?: number | string;
+      datasetId?: string;
+      datasetRevision?: string;
       availability?: ResourceAvailability;
       contractGap?: string | null;
       equilibriumId?: string;
@@ -900,6 +913,14 @@ export function selectionRefEquals(
         left.runtimeEpoch === right.runtimeEpoch &&
         left.stageId === right.stageId &&
         left.stateDigest === right.stateDigest
+      );
+    case "analysis-pinned-group":
+      return (
+        right.type === "analysis-pinned-group" &&
+        left.kind === right.kind &&
+        left.moduleId === right.moduleId &&
+        left.nodeId === right.nodeId &&
+        left.runId === right.runId
       );
     case "analysis-result":
       return (
@@ -1130,6 +1151,9 @@ export function selectionRefEquals(
         left.elementIndex === right.elementIndex &&
         nullableStringEquals(left.metric, right.metric) &&
         centroidEquals(left.centroid, right.centroid) &&
+        nullableStringEquals(left.artifactId, right.artifactId) &&
+        nullableStringEquals(left.generationId, right.generationId) &&
+        left.meshRevision === right.meshRevision &&
         left.visualizationTargetId === right.visualizationTargetId
       );
     case "mesh-quality-metric":
@@ -1352,6 +1376,8 @@ export function selectionRefEquals(
         nullableStringEquals(left.contractGap, right.contractGap) &&
         nullableStringEquals(left.analysisRunId, right.analysisRunId) &&
         nullableStringEquals(left.analysisStageId, right.analysisStageId) &&
+        nullableStringEquals(left.datasetId, right.datasetId) &&
+        nullableStringEquals(left.datasetRevision, right.datasetRevision) &&
         nullableStringEquals(left.artifactPath, right.artifactPath) &&
         nullableStringEquals(left.branchId, right.branchId) &&
         nullableStringEquals(left.calculationMode, right.calculationMode) &&

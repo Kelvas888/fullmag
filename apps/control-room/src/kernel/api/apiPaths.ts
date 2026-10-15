@@ -23,54 +23,9 @@ export const PLATFORM_HEALTH_PATH = openApiV2Path(
   "/v2/platform/health",
 );
 
-export const PLATFORM_DEVELOPMENT_BACKEND_PATH = openApiV2Path(
-  "/v2/platform/development-backend",
-);
-
-export const PLATFORM_DEVELOPMENT_BACKEND_BUILD_REQUESTS_PATH =
-  openApiV2Path("/v2/platform/development-backend/build-requests");
-
-export const PLATFORM_DEVELOPMENT_BACKEND_BUILD_REQUEST_PATH =
-  openApiV2Path("/v2/platform/development-backend/build-requests/{request_id}");
-
-export function developmentBackendBuildRequestPathParams(requestId: string) {
-  return { path: { request_id: requestId } };
-}
-
 export const PLATFORM_RUNTIME_SERVICE_PATH = openApiV2Path(
   "/v2/platform/runtime-service",
 );
-
-export const PLATFORM_DEVELOPMENT_RESTART_REQUESTS_PATH = openApiV2Path(
-  "/v2/platform/development-restart-requests",
-);
-
-export const PLATFORM_DEVELOPMENT_RESTART_REQUEST_PATH = openApiV2Path(
-  "/v2/platform/development-restart-requests/{request_id}",
-);
-
-export function developmentRestartRequestPathParams(requestId: string) {
-  return { path: { request_id: requestId } };
-}
-
-export function isDevelopmentRestartRequestStatusPath(path: string): boolean {
-  const pathParameter = "{request_id}";
-  const parameterOffset = PLATFORM_DEVELOPMENT_RESTART_REQUEST_PATH.indexOf(
-    pathParameter,
-  );
-  if (parameterOffset < 0 || path.includes("?")) return false;
-
-  const prefix = PLATFORM_DEVELOPMENT_RESTART_REQUEST_PATH.slice(
-    0,
-    parameterOffset,
-  );
-  const requestId = path.slice(prefix.length);
-  return (
-    path.startsWith(prefix) &&
-    requestId.length > 0 &&
-    !requestId.includes("/")
-  );
-}
 
 export const PLATFORM_OPENAPI_PATH = openApiV2Path(
   "/v2/platform/openapi.json",
@@ -827,6 +782,18 @@ export const MODEL_PLANAR_MONITOR_PATH = openApiV2Path(
   "/v2/sessions/current/model/planar-monitors/{monitor_id}",
 );
 
+export const ANALYSIS_ANALYTIC_REFERENCE_MODELS_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/references/analytic-models",
+);
+
+export const ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/postprocessing/definitions",
+);
+
+export const ANALYSIS_POSTPROCESSING_DEFINITION_PATH = openApiV2Path(
+  "/v2/sessions/current/analysis/postprocessing/definitions/{definition_id}",
+);
+
 export const MODEL_PLANAR_MONITOR_DUPLICATE_PATH = openApiV2Path(
   "/v2/sessions/current/model/planar-monitors/{monitor_id}/duplicate",
 );
@@ -1101,8 +1068,32 @@ export const PERSISTENCE_PROJECT_FROM_SCRIPT_PATH = openApiV2Path(
   "/v2/persistence/projects/from-script",
 );
 
+export const PROJECT_RUN_INTENT_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/run-intent",
+);
+
+export const PROJECT_RUN_ANTENNA_INSPECTIONS_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/antenna-inspections",
+);
+
+export const PROJECT_RUN_ANTENNA_INSPECTION_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/antenna-inspections/{step_id}",
+);
+
+export const PROJECT_RUN_ANTENNA_INSPECTION_PAYLOAD_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/runs/{run_id}/antenna-inspections/{step_id}/payloads/{payload_kind}",
+);
+
 export const PROJECT_RUN_SUBMIT_PATH = openApiV2Path(
   "/v2/persistence/projects/{project_id}/runs",
+);
+
+export const PROJECT_BATCHES_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/batches",
+);
+
+export const PROJECT_BATCH_CASES_PATH = openApiV2Path(
+  "/v2/persistence/projects/{project_id}/batches/{batch_id}/cases",
 );
 
 export const PROJECT_RUN_MATERIALIZATION_PATH = openApiV2Path(
@@ -1194,3 +1185,5 @@ export function workspaceItemThumbnailUrl(baseUrl: string, id: string): string {
 }
 export const PLATFORM_COMPUTE_PROFILES_PATH = openApiV2Path("/v2/platform/compute/profiles");
 export const PLATFORM_COMPUTE_PREVIEW_PATH = openApiV2Path("/v2/platform/compute/preview");
+export const PLATFORM_COMPUTE_NODES_PATH = openApiV2Path("/v2/platform/compute/nodes");
+export const PLATFORM_COMPUTE_NODE_PATH = openApiV2Path("/v2/platform/compute/nodes/{node_id}");

@@ -20,7 +20,13 @@ describe("antenna composition explorer nodes", () => {
     );
     const solve = node.children?.find((child) => child.kind === "object.antenna")
       ?.children?.find((child) => child.kind === "object.antenna.solution");
-    expect(solve).toMatchObject({ badge: "1 outputs · invalid", status: "warning" });
+    expect(solve).toMatchObject({
+      badge: "1 outputs · invalid", status: "warning",
+      contextCommands: ["study.add-antenna-field-solve-stage", "workspace.focus-selection"],
+      contextCommandInputs: {
+        "study.add-antenna-field-solve-stage": { objectId: "antenna", stageId: "solve-1" },
+      },
+    });
   });
 
   it("marks an incomplete port as warning instead of ready", () => {
@@ -56,6 +62,13 @@ describe("antenna composition explorer nodes", () => {
       { id: "antenna", label: "CPW", objectRole: "antenna" } as never,
       {
         scene: {
+          objects: [{ id: "antenna", role: "antenna" }],
+          current_transports: [{ name: "transport-1", kind: "current_transport", model: "ohmic_poisson",
+            domain: [{ object_id: "antenna" }],
+            boundaries: ["inlet", "outlet", "return-inlet", "return-outlet"].map((id) => ({
+              id, kind: "equipotential_current_terminal", surfaces: [{ object_id: "antenna", surface_id: id, orientation: [0, 1, 0] }],
+            })),
+          }],
           antenna_port_modes: [{
             id: "mode-1",
             schema_version: "antenna_port_mode.v2",
@@ -152,7 +165,7 @@ describe("antenna composition explorer nodes", () => {
     ]);
 
     const port = antenna?.children?.find((child) => child.kind === "object.antenna.port");
-    expect(port).toMatchObject({ status: "ready", badge: "2 branches" });
+    expect(port).toMatchObject({ status: "ready", badge: "2 branches · authoring" });
     expect(selectionRefFromNode(port!)).toMatchObject({
       type: "scene-object",
       kind: "object.antenna.port",

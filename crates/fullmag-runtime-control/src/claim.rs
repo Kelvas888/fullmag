@@ -21,8 +21,9 @@ pub fn commit_claimed_task_admission(
     commit_claimed_task_admission_with(store, task, claim, |lease| {
         let _writer = store.write_transaction()?;
         crate::study_completion::require_task_dependencies_locked(store, &claim.run_id, claim.task_id.as_str())?;
-        store.commit_task_admission(lease)
-    })
+        store.commit_task_admission(lease).map(Some)
+    })?
+    .context("local task admission unexpectedly returned no disposition")
 }
 
 /// Admit through the shared physical-host ledger when the caller has resolved
@@ -35,20 +36,54 @@ pub fn commit_claimed_task_admission_with_host(
     claim: &TaskClaim,
     ledger: &fullmag_session::host_resource_ledger::HostResourceLedger,
     request: &fullmag_session::host_resource_ledger::HostReservationRequest,
+    inputs: &std::collections::BTreeMap<String, fullmag_application::ResolvedInput>,
 ) -> Result<fullmag_session::TaskAdmissionCommitDisposition> {
+    let inputs = capture_admission_inputs(inputs)?;
     commit_claimed_task_admission_with(store, task, claim, |lease| {
-        ledger.commit_task_admission_checked(request, store, lease, || {
+        ledger
+            .commit_task_admission_checked(request, store, lease, &inputs, || {
+                crate::study_completion::require_task_dependencies_locked(store, &claim.run_id, claim.task_id.as_str())
+            })
+            .map(Some)
+    })?
+    .context("host task admission unexpectedly returned no disposition")
+}
+
+/// Capacity contention leaves the ready task queued without publishing a local
+/// claim. Unknown publication, invalid state and fencing failures remain errors.
+pub fn try_commit_claimed_task_admission_with_host(
+    store: &SessionStore,
+    task: &TaskRecord,
+    claim: &TaskClaim,
+    ledger: &fullmag_session::host_resource_ledger::HostResourceLedger,
+    request: &fullmag_session::host_resource_ledger::HostReservationRequest,
+    inputs: &std::collections::BTreeMap<String, fullmag_application::ResolvedInput>,
+) -> Result<Option<fullmag_session::TaskAdmissionCommitDisposition>> {
+    let inputs = capture_admission_inputs(inputs)?;
+    commit_claimed_task_admission_with(store, task, claim, |lease| {
+        ledger.try_commit_task_admission_checked(request, store, lease, &inputs, || {
             crate::study_completion::require_task_dependencies_locked(store, &claim.run_id, claim.task_id.as_str())
         })
     })
+}
+
+fn capture_admission_inputs(
+    inputs: &std::collections::BTreeMap<String, fullmag_application::ResolvedInput>,
+) -> Result<fullmag_session::FmsResolvedInputsSnapshot> {
+    for input in inputs.values() {
+        input.validate().map_err(|error| anyhow::anyhow!(error))?;
+    }
+    fullmag_session::FmsResolvedInputsSnapshot::new(serde_json::to_value(inputs)?)
 }
 
 fn commit_claimed_task_admission_with(
     store: &SessionStore,
     task: &TaskRecord,
     claim: &TaskClaim,
-    admit: impl FnOnce(&FmsResourceLease) -> Result<fullmag_session::TaskAdmissionCommitDisposition>,
-) -> Result<fullmag_session::TaskAdmissionCommitDisposition> {
+    admit: impl FnOnce(
+        &FmsResourceLease,
+    ) -> Result<Option<fullmag_session::TaskAdmissionCommitDisposition>>,
+) -> Result<Option<fullmag_session::TaskAdmissionCommitDisposition>> {
     task.fence(claim)
         .context("application task does not own the supplied claim")?;
     if task.run_id != claim.run_id
@@ -136,13 +171,16 @@ fn commit_claimed_task_admission_with(
         heartbeat_at: now,
         heartbeat_sequence: claim.lease.heartbeat_sequence,
         released_at: None,
+        host_launch_binding: None,
     };
-    let disposition = admit(&lease)?;
+    let Some(disposition) = admit(&lease)? else {
+        return Ok(None);
+    };
     let persisted_claim = load_current_task_claim(store, &claim.run_id, claim.task_id.as_str())?;
     if persisted_claim != *claim {
         bail!("durable admission recovered a claim different from the application claim");
     }
-    Ok(disposition)
+    Ok(Some(disposition))
 }
 
 /// Confirm the claimed resource realizes both the immutable RunSpec device

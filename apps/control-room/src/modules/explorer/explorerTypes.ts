@@ -1,3 +1,4 @@
+import type { AnalysisModuleId } from "@/kernel/analysis-modules/analysisModuleContract";
 import type { CommandId } from "@/kernel/commands/commandTypes";
 import type {
   ResourceAvailability,
@@ -132,6 +133,7 @@ export type ExplorerNodeKind =
   | "study.stages"
   | "study.stage.action"
   | "study.stage.add_field_drive"
+  | "study.stage.antenna_field_solve"
   | "study.stage.autosave"
   | "study.stage.fft_response"
   | "study.stage.eigenmodes"
@@ -193,7 +195,9 @@ export type ExplorerNodeKind =
   | "results.dispersion.driven.field_at_k"
   | "results.dispersion.driven.provenance"
   | "results.hysteresis.root"
+  | "results.hysteresis.dataset"
   | "results.observation_frames.root"
+  | "results.pinned_visualizations.root"
   | "results.observation_frame"
   | "results.analysis_views.root"
   | "results.analysis_views.definition"
@@ -321,6 +325,10 @@ export interface ExplorerNode {
   parentId: string | null;
   activeAnalysisField?: boolean;
   analysisFieldRepresentation?: "complex-vector-xyz";
+  /** Analysis feature module that owns this Results node (ADR 0054). */
+  analysisModuleId?: AnalysisModuleId;
+  /** Marks the root row for a published analysis module's pinned visualizations. */
+  analysisPinnedGroup?: boolean;
   normalization?: string;
   observationFrame?: ObservationFrameResource;
   badge?: string;
@@ -330,6 +338,9 @@ export interface ExplorerNode {
   analysisRunId?: string;
   analysisStageId?: string;
   artifactRevision?: number | string;
+  /** Canonical dataset identity from the typed analysis-result catalog. */
+  datasetId?: string;
+  datasetRevision?: string;
   contractGap?: string | null;
   postprocessingCatalogRevision?: ResourceRevision | null;
   postprocessingContractGap?: string | null;
@@ -388,6 +399,7 @@ export interface ExplorerNode {
   meshPartId?: string;
   monitorId?: string;
   visualizationTargetId?: string;
+  modeId?: string;
   modeIndex?: number;
   objectId?: string;
   objectRole?: "antenna" | "magnet" | "auxiliary";
@@ -429,6 +441,7 @@ export interface ExplorerNode {
    * descriptor still depends on yAxisIds.
    */
   yAxisIds?: readonly string[];
+  sampleId?: string;
   sampleIndex?: number;
   wavevectorKf?: readonly [number, number, number];
   stageId?: string;
@@ -612,6 +625,9 @@ interface ModelTreeStudySnapshot {
 }
 
 export interface ModelTreeStudyStageSnapshot {
+  pipelineNodeId?: string;
+  pipelineEnabled?: boolean;
+  pipelineLabel?: string | null;
   artifactName?: string | null;
   boundaryCondition?: string | null;
   calculationMode?: string | null;

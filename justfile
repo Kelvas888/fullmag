@@ -44,6 +44,17 @@ observe-managed-antenna-ram run_root:
 # Real API publication/read-back: fixed CPU fixture, loopback-only RAM session.
 run-managed-antenna-http-ram job_id commit source_digest native_snapshot_sha256 fixture="magnetic":
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}} --fixture {{quote(fixture)}}
+# Same pinned current input, but no magnetic probe physics or LLG scaffold.
+run-managed-antenna-standalone-ram job_id commit source_digest native_snapshot_sha256:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}} --standalone
+
+# Explicit archive round-trip gate in the same disposable RAM ownership boundary.
+run-managed-antenna-cold-http-ram job_id commit source_digest native_snapshot_sha256:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}} --verify-cold-import
+
+# Separate source-only API gate; also checks magnetic read-model absence after import.
+run-managed-antenna-standalone-cold-http-ram job_id commit source_digest native_snapshot_sha256:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}} --verify-cold-import --standalone
 
 observe-managed-antenna-http-ram run_root:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" observe --run-root {{quote(run_root)}}
@@ -66,8 +77,8 @@ storage-prepare:
 runner-image:
     docker build --network none --pull=false -t fullmag/local-runner-source:development scripts/local_runner
 
-runner-build-image toolchain_image tag="fullmag/local-runner-build:development":
-    docker --context desktop-linux build --network none --pull=false --build-arg TOOLCHAIN_IMAGE={{quote(toolchain_image)}} -f scripts/local_runner/Dockerfile.build -t {{quote(tag)}} scripts/local_runner
+runner-build-image toolchain_image tag="fullmag/local-runner-build:development" cpu_mfem="0" network="none":
+    docker --context desktop-linux build --network {{quote(network)}} --pull=false --build-arg TOOLCHAIN_IMAGE={{quote(toolchain_image)}} --build-arg CPU_MFEM_ONLY={{quote(cpu_mfem)}} -f scripts/local_runner/Dockerfile.build -t {{quote(tag)}} scripts/local_runner
 
 # Diagnostic legacy producer; use the frozen recipes for deployment evidence.
 runner-coordinator-image:
@@ -165,6 +176,29 @@ run-managed-boris-nf job_id resolution:
 observe-managed-boris-nf runtime_id:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_boris_nf.py" --repo-root {{quote(repo_root)}} observe --runtime-id {{quote(runtime_id)}}
 
+# Consume one completed managed CPU/SLEPc build; this recipe never builds an
+# image or native target and writes only a new run below canonical storage.
+run-comsol-dispersion-benchmark job_id cases="c0,c1,a1" timeout_seconds="21600":
+    {{storage_python}} "{{repo_root}}/scripts/run_comsol_dispersion_benchmark.py" --repo-root "{{repo_root}}" --job-id {{quote(job_id)}} --cases {{quote(cases)}} --timeout-seconds {{quote(timeout_seconds)}}
+
+# Numerical DE pilot; science qualification is a separate postsolve gate.
+run-de-100nm-pilot job_id:
+    {{storage_python}} "{{repo_root}}/scripts/run_de_100nm_pilot.py" --repo-root "{{repo_root}}" --job-id {{quote(job_id)}}
+
+# Bounded forensic startup probe; consumes only a terminal failed CPU/SLEPc job.
+diagnose-managed-fem-startup job_id:
+    {{storage_python}} "{{repo_root}}/scripts/diagnose_managed_fem_startup.py" --repo-root "{{repo_root}}" --job-id {{quote(job_id)}}
+
+# Frozen 10 nm DE control; sampling is k0, k2, two, five or signed-eleven.
+run-de-smoke job_id sampling="two" model_ref="":
+    {{storage_python}} "{{repo_root}}/scripts/run_de_100nm_pilot.py" --repo-root "{{repo_root}}" --job-id {{quote(job_id)}} --pilot {{quote("de-smoke-" + sampling)}} {{if model_ref == "" { "" } else { "--model-ref " + quote(model_ref) }}}
+
+# Closed serial/adaptive parity probe. The driver verifies the completed
+# managed runtime job and source digest against the pinned input manifest.
+# Build FIFO and runtime execution remain separate contracts.
+run-de-smoke-parallel-probe job_id source_digest mode="serial":
+    {{storage_python}} "{{repo_root}}/scripts/run_de_100nm_pilot.py" --repo-root "{{repo_root}}" --job-id {{quote(job_id)}} --probe-build-source-digest {{quote(source_digest)}} --pilot de-smoke-parallel-probe --parallel-mode {{quote(mode)}}
+
 runner-configure-build profile image_id:
     {{storage_python}} scripts/local_runner_cli.py configure-build --profile {{quote(profile)}} --image-id {{quote(image_id)}}
 
@@ -174,8 +208,17 @@ runner-container-resume:
 runner-retention-plan:
     {{storage_python}} scripts/local_runner_cli.py retention-plan
 
-runner-container-replace image_id:
-    {{storage_python}} scripts/local_runner_cli.py container-replace --image-id {{quote(image_id)}}
+runner-retention-preview scope="execution":
+    {{storage_python}} scripts/local_runner_cli.py retention-preview --scope {{quote(scope)}}
+
+runner-retention-get plan_id:
+    {{storage_python}} scripts/local_runner_cli.py retention-get {{quote(plan_id)}}
+
+runner-retention-apply plan_id:
+    {{storage_python}} scripts/local_runner_cli.py retention-apply {{quote(plan_id)}}
+
+runner-container-replace image_id preview_id="":
+    {{storage_python}} scripts/local_runner_cli.py container-replace --image-id {{quote(image_id)}} {{if preview_id == "" { "" } else { "--abandon-readonly-preview " + quote(preview_id) }}}
 
 runner-reconcile job:
     {{storage_python}} scripts/local_runner_cli.py reconcile {{quote(job)}}
@@ -215,13 +258,18 @@ windows-backend-dev web_port="3197":
 verify-windows-development-handoff:
     @{{storage_python}} "{{repo_root}}/scripts/verify_development_handoff.py" --repo-root "{{repo_root}}"
 
-# Observe the development resource in an owned empty API; no unit compilation.
-verify-windows-development-backend-api cross_build_bundle="":
-    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --cross-build-bundle "{{cross_build_bundle}}"
+# Owned HTTP cancellation protocol proof, pinned to a verified native package.
+# Uses fixture-seeded task catalogs; does not qualify Submit, solver, or host release.
+verify-compute-cancellation-api build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-cancellation-only --frozen-native-build-id "{{build_id}}"
 
-# Explicit frozen native package gate, pinned to the completed manifest digest.
-verify-windows-frozen-development-backend-api build_id:
-    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --frozen-native-build-id "{{build_id}}"
+# Native operator initialization proof; fixture policy is not hardware evidence.
+verify-compute-host-initialization build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-host-initialization-only --frozen-native-build-id "{{build_id}}"
+
+# Standalone scheduler component cancellation/drain proof, not service v2 startup.
+verify-compute-scheduler-cancellation build_id:
+    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --compute-scheduler-cancellation-only --frozen-native-build-id "{{build_id}}"
 
 # Native observer protocol proof; no unit-test compilation or user-session restart.
 verify-windows-development-observer-pause:
@@ -251,17 +299,9 @@ verify-windows-development-active-run-paused-refusal owner_bundle:
 verify-windows-development-start-freeze-race:
     @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --start-freeze-race-only
 
-# Owned native restart with a real nonempty browser workspace and unsaved draft.
-verify-windows-development-workspace-browser owner_bundle:
-    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --workspace-browser-owner-bundle "{{owner_bundle}}"
-
 # Real candidate helper faults in owned processes; no API or unit compilation.
 verify-windows-candidate-preparation:
     @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --candidate-preparation-only
-
-# Native request transport proof; no unit-test compilation or user-session restart.
-verify-windows-development-restart-transport:
-    @{{storage_python}} "{{repo_root}}/scripts/verify_development_backend_api.py" --repo-root "{{repo_root}}" --restart-transport-only
 
 # Observe actual runtime-free project archives without compiling unit tests.
 verify-windows-project-document:
@@ -382,6 +422,10 @@ check-session-persistence:
 check-api-source:
     {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-source-check --repo-root "{{repo_root}}"
 
+# Production API, service and scheduler source check; excludes test targets.
+check-api-service-source:
+    {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route api-service-source-check --repo-root "{{repo_root}}"
+
 # Source-only production CLI check; excludes unit tests and native solvers.
 check-cli-source:
     {{storage_python}} "{{repo_root}}/scripts/verify_session_persistence.py" --route cli-source-check --repo-root "{{repo_root}}"
@@ -499,45 +543,27 @@ export-runner-openapi-snapshot job_id expected_commit source_digest native_snaps
     {{storage_python}} "{{repo_root}}/scripts/export_runner_openapi.py" --repo-root "{{repo_root}}" --job-id "{{job_id}}" --expected-commit "{{expected_commit}}" --source-digest "{{source_digest}}" --native-snapshot-sha256 "{{native_snapshot_sha256}}"
 
 # Lightweight generated client and production source checks; no unit builds.
-generate-control-room-client:
-    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route generate-client --repo-root "{{repo_root}}"
+generate-control-room-client dependency_workspace="":
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route generate-client --repo-root "{{repo_root}}" {{if dependency_workspace != "" { "--dependency-workspace \"" + dependency_workspace + "\"" } else { "" }}}
 
-check-control-room-production-source:
-    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route production-source --repo-root "{{repo_root}}"
+check-control-room-production-source dependency_workspace="":
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route production-source --repo-root "{{repo_root}}" {{if dependency_workspace != "" { "--dependency-workspace \"" + dependency_workspace + "\"" } else { "" }}}
 
 # Interpreted Node contract checks in isolated managed fixtures; no unit builds.
+verify-control-room-explorer-physics:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route explorer-physics-reporting-check --repo-root "{{repo_root}}"
+
+verify-control-room-typecheck-cli:
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route typecheck-cli-check --repo-root "{{repo_root}}"
+
 verify-control-room-openapi-import:
     {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route openapi-import-check --repo-root "{{repo_root}}"
 
-check-control-room-api-hygiene:
-    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route api-hygiene --repo-root "{{repo_root}}"
-
-verify-control-room-development-restart:
-    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-restart-check --repo-root "{{repo_root}}"
+check-control-room-api-hygiene dependency_workspace="":
+    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route api-hygiene --repo-root "{{repo_root}}" {{if dependency_workspace != "" { "--dependency-workspace \"" + dependency_workspace + "\"" } else { "" }}}
 
 verify-control-room-resource-client-cache:
     {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route resource-client-cache-check --repo-root "{{repo_root}}"
-
-verify-control-room-development-kernel-host:
-    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-kernel-host-check --repo-root "{{repo_root}}"
-
-verify-control-room-development-transport-pause:
-    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-transport-pause-check --repo-root "{{repo_root}}"
-
-verify-control-room-development-run-outcome-handoff:
-    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-run-outcome-handoff-check --repo-root "{{repo_root}}"
-
-lint-control-room-development-run-outcome-handoff:
-    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-run-outcome-handoff-lint --repo-root "{{repo_root}}"
-
-verify-control-room-development-restart-action:
-    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-restart-action-check --repo-root "{{repo_root}}"
-
-lint-control-room-development-restart-action:
-    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-restart-action-lint --repo-root "{{repo_root}}"
-
-verify-control-room-development-backend-build-action:
-    {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route development-backend-build-action-check --repo-root "{{repo_root}}"
 
 # Actual browser interaction on an isolated managed frontend source snapshot.
 # Responses are fixtures; this is neither a backend runtime nor a solver gate.
@@ -548,24 +574,18 @@ verify-pinned-dataset-browser:
 verify-inspector-routing-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3261 --scenario inspector-routing
 
-# Production project controller in an isolated Next browser fixture; no unit builds.
-verify-project-document-handoff-browser:
-    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3251 --scenario project-document-handoff
-
-verify-development-kernel-host-browser:
-    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3252 --scenario development-kernel-host
-
-verify-development-run-outcome-handoff-browser:
-    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3253 --scenario development-run-outcome-handoff
-
-verify-development-restart-action-browser:
-    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3254 --scenario development-restart-action
-
 # Real Study profile component/facade against controlled HTTP; no solver gate.
 verify-study-execution-profile-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3256 --scenario study-execution-profile
 
+# Production Explorer tree against controlled scene inputs; no solver or unit builds.
+verify-explorer-physics-reporting-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3259 --scenario explorer-physics-reporting
+
 # Production antenna Inspector and resource hooks in an isolated browser fixture.
+verify-antenna-source-spectrum-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3265 --scenario antenna-source-spectrum
+
 verify-antenna-visualization-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3262 --scenario antenna-visualization
 
@@ -580,13 +600,32 @@ verify-antenna-cpw-viewport-browser:
 verify-antenna-microstrip-stations-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3253 --scenario antenna-microstrip-stations
 
+verify-antenna-drive-editor-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3265 --scenario antenna-drive-editor
+
+# Production Object material scope/ACK lifecycle with controlled HTTP.
+verify-object-material-editor-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3266 --scenario object-material-editor
+
 # Production transport draft/conflict lifecycle; controlled HTTP, no native solve.
 verify-antenna-transport-drafts-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3254 --scenario antenna-transport-drafts
 
+# Read-only production port diagnostics with controlled scoped HTTP.
+verify-antenna-port-diagnostics-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3263 --scenario antenna-port-diagnostics
+
+# Production existing-port authoring with delayed scoped HTTP acknowledgements.
+verify-antenna-port-editor-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3264 --scenario antenna-port-editor
+
 # Production primitive color preferences and Object/Airbox Inspector stability.
 verify-primitive-color-inspector-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3257 --scenario primitive-color-inspector
+
+# Actual production Inspector actions against controlled staged/live/read-only sessions.
+verify-inspector-actions-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3257 --scenario inspector-actions
 
 lint-control-room-source:
     {{storage_python}} "{{repo_root}}/scripts/verify_control_room_sources.py" --route lint --repo-root "{{repo_root}}"
@@ -2286,6 +2325,23 @@ verify-fem-frequency-domain-real-frequency-rotated:
 verify-fem-frequency-domain-floquet-bloch-scalar:
     docker compose --profile fem-gpu run --rm \
       fem-gpu bash -lc 'cd /workspace && cmake -S native -B ${FULLMAG_BUILD_ROOT:-/workspace/.fullmag-build}/native -DFULLMAG_ENABLE_CUDA=ON -DFULLMAG_ENABLE_FEM_GPU=ON -DFULLMAG_USE_MFEM_STACK=ON -DFULLMAG_FEM_WITH_SLEPC=ON && cmake --build ${FULLMAG_BUILD_ROOT:-/workspace/.fullmag-build}/native --target fem_floquet_bloch_scalar_contract && LD_LIBRARY_PATH=${FULLMAG_BUILD_ROOT:-/workspace/.fullmag-build}/native/backends/fem:${LD_LIBRARY_PATH:-} ${FULLMAG_BUILD_ROOT:-/workspace/.fullmag-build}/native/backends/fem/fem_floquet_bloch_scalar_contract'
+
+# Managed source contracts for the nonzero-k modal foundation.  These targets
+# validate the phase-reduced magnetic operator and the bounded demag-k bridges;
+# they do not claim a production mesh assembly or physics qualification.
+verify-fem-modal-floquet-magnetic-contract:
+    just ensure-managed-fem-runtime
+    docker compose --profile fem-gpu run --rm \
+      fem-gpu bash -lc 'cd /workspace && cmake -S native -B ${FULLMAG_BUILD_ROOT:-/workspace/.fullmag-build}/native -DFULLMAG_ENABLE_CUDA=ON -DFULLMAG_ENABLE_FEM_GPU=ON -DFULLMAG_USE_MFEM_STACK=ON -DFULLMAG_FEM_WITH_SLEPC=ON && cmake --build ${FULLMAG_BUILD_ROOT:-/workspace/.fullmag-build}/native --target fem_floquet_magnetic_operator_contract && LD_LIBRARY_PATH=${FULLMAG_BUILD_ROOT:-/workspace/.fullmag-build}/native/backends/fem:${LD_LIBRARY_PATH:-} ${FULLMAG_BUILD_ROOT:-/workspace/.fullmag-build}/native/backends/fem/fem_floquet_magnetic_operator_contract'
+
+# CPU contracts use the dependency-complete image as a toolchain.  CUDA linkage
+# is needed by that MFEM build; the Fullmag GPU realization is disabled.  Keep
+# this configuration separate from the managed production native build.
+verify-fem-modal-floquet-airbox-cpu:
+    just ensure-managed-fem-runtime
+    docker compose --profile fem-gpu run --rm \
+      -e FULLMAG_FEM_REQUIRE_GPU=0 -e FULLMAG_FEM_REQUIRE_CEED=0 -e FULLMAG_MANAGED_FEM_DEVICE=cpu \
+      fem-gpu bash -euo pipefail -c 'cd /workspace; build="${FULLMAG_BUILD_ROOT:?managed build root required}/native/floquet-cpu-contracts"; cmake -S native -B "$build" -DFULLMAG_ENABLE_CUDA=ON -DFULLMAG_ENABLE_FEM_GPU=OFF -DFULLMAG_USE_MFEM_STACK=ON -DFULLMAG_FEM_WITH_SLEPC=ON; cmake --build "$build" --target fem_floquet_magnetic_operator_contract fem_floquet_bloch_scalar_contract fem_floquet_airbox_operator_contract fem_floquet_dynamic_demag_k_contract fem_floquet_waveguide_demag_k_contract fem_floquet_waveguide_cross_section_contract fem_floquet_modal_solver_contract; export LD_LIBRARY_PATH="$build/backends/fem:/opt/fullmag-deps/lib:${LD_LIBRARY_PATH:-}"; ctest --test-dir "$build/backends/fem" --output-on-failure --no-tests=error -R "^fem_floquet_(magnetic_operator|bloch_scalar|airbox_operator|dynamic_demag_k|waveguide_demag_k|waveguide_cross_section|modal_solver)_contract$"'
 
 verify-fem-frequency-domain-native-contract:
     powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{{repo_root}}/scripts/windows/verify_fem_frequency_domain_native_contract.ps1" -Device gpu
@@ -5860,7 +5916,7 @@ run-headless script:
     just build fullmag
     PATH="{{local_bin}}:$PATH" FULLMAG_PYTHON="{{repo_python}}" fullmag {{script}} --headless --json
 
-# Run headless without 3D preview or chart data (no rendering overhead — good for benchmarks)
+# Run headless without 3D preview or chart data (no rendering overhead â€” good for benchmarks)
 run-headless-bench script:
     just ensure-python
     just build fullmag
@@ -7207,7 +7263,7 @@ build-all-fem-hypre-memory-variants:
 rebuild-gpu-runtime:
     just rebuild-fem-runtime
 
-# ── Benchmarks ──────────────────────────────────────────────────────────
+# â”€â”€ Benchmarks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # Run the Box500 FEM CPU/GPU consistency matrix.
 # Writes CSV rows and a CPU/GPU summary JSON. Override defaults with

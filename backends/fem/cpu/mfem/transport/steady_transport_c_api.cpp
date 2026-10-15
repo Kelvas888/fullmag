@@ -14,6 +14,8 @@
 #include <limits>
 #include <stdexcept>
 
+#include <cstdio>
+
 #if FULLMAG_HAS_MFEM_STACK
 #include "cpu/mfem/transport/steady_transport.hpp"
 #include "cpu/mfem/transport/conservative_current_view.hpp"

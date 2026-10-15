@@ -37,6 +37,16 @@ The canonical read-model resources are:
 Both resources expose command ids, queue sequence, command kind, lifecycle
 status, timestamps, optional completion outcome, and error details.
 
+Stage-linked solver progress is exposed through the optional
+`completed_step` field. `StageExecutionRecordResource.completed_step` and the
+stage linkage in `CommandDetailResource.completed_step` carry the actual
+terminal solver-step offset within the run. This is distinct from
+`applied_step`, which identifies the command-application boundary and may be
+`0`. The value is omitted when the runtime has no authoritative terminal step,
+including legacy payloads and in-flight stages. It is copied from the linked
+stage record and must never be inferred from `run.total_steps` or elapsed
+time.
+
 `status.resources.command_completion_revision` is the canonical invalidation
 pointer for command completion. It advances from the command ledger sequence and
 is separate from `commands_revision`, which remains the queue/ledger collection

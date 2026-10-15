@@ -81,6 +81,7 @@ impl PhysicsGraphExecutionContext {
             }
             BackendPlanIR::FdmMultilayer(_)
             | BackendPlanIR::FemEigen(_)
+            | BackendPlanIR::AntennaExternalLeadInspection(_)
             | BackendPlanIR::FemFrequencyResponse(_) => {}
         }
         workflow.extend(energy.iter().cloned());

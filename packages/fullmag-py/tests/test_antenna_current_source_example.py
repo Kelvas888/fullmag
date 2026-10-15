@@ -12,7 +12,8 @@ import unittest
 import fullmag as fm
 import fullmag.world as world
 from fullmag.runtime.loader import load_problem_from_script
-from fullmag.runtime.helper import _runtime_stage_action, main as helper_main
+from fullmag.runtime.helper import main as helper_main
+from fullmag.runtime.run_config_export import _runtime_stage_action
 from fullmag.runtime.script_builder import render_loaded_problem_as_script
 
 

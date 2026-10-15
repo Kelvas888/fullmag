@@ -28,6 +28,18 @@ describe("AppMenuBar", () => {
     expect(source).not.toContain("const sessionStatus = useSessionStatus();");
   });
 
+  it("keeps the new-simulation dialog mounted across session-header transitions", () => {
+    const source = readFileSync(appMenuBarSourceUrl, "utf8");
+    const appMenuBar = source.slice(
+      source.indexOf("export function AppMenuBar()"),
+      source.indexOf("function NoSessionAppMenuBar"),
+    );
+
+    expect(appMenuBar).toContain("useNewProblemRequest()");
+    expect(appMenuBar).toContain("<NewProblemDialog");
+    expect(source.match(/<NewProblemDialog/g)).toHaveLength(1);
+  });
+
   it("renders header controls through shared shadcn-style button primitives", () => {
     const html = renderToStaticMarkup(
       <ThemeProvider>
@@ -57,6 +69,17 @@ describe("AppMenuBar", () => {
     expect(source).toContain(
       '<DialogDescription id="fm-api-connection-error-description">',
     );
+  });
+
+  it("mounts the on-demand readiness helper trigger next to Local API instead of permanently in the ribbon", () => {
+    const source = readFileSync(appMenuBarSourceUrl, "utf8");
+    const ribbonSource = readFileSync(
+      new URL("../../modules/ribbon/RibbonModule.tsx", import.meta.url),
+      "utf8",
+    );
+
+    expect(source).toContain("<ReadinessHelperHeaderControl");
+    expect(ribbonSource).not.toContain("<ScratchAuthoringGuide");
   });
 
   it("derives the header title and runtime badge from session status", () => {

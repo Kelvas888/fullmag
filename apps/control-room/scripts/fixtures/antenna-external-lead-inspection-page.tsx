@@ -14,6 +14,7 @@ import type { KernelEventMap } from "@/kernel/events/eventTypes";
 import { KernelContext } from "@/kernel/KernelContext";
 import { DiagnosticRecorderController } from "@/kernel/performance/diagnostic-recorder/DiagnosticRecorderController";
 import { ResourceInvalidationController } from "@/kernel/resources/ResourceInvalidationController";
+import { antennaInspectionPayloadEtag } from "@/kernel/resources/antennaResources";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
 import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus";
 import type { KernelApi } from "@/kernel/types";
@@ -78,7 +79,7 @@ function makeFixture() {
   };
   const inspection = (runtimeStageId: string): AntennaExternalLeadInspectionResource => {
     const descriptor = (kind: string, unit: string, count = SAMPLE_COUNT * 3) => ({
-      path: `antenna/external_lead_solutions/fixture/${runtimeStageId}/${kind}.bin`, sha256: `sha256:${"b".repeat(64)}`,
+      path: `antenna/external_lead_solutions/fixture/${runtimeStageId}/${kind}.bin`, sha256: "b".repeat(64),
       value_count: count, byte_count: count * 8, scalar_type: "float64_le", layout: "sample_xyz_interleaved", unit,
     });
     const status = state.scenario === "failed" || state.scenario === "cancelled" ? state.scenario : "inspection_only";
@@ -172,7 +173,9 @@ function makeFixture() {
         const fieldOffset = route.stageId === SECOND_RUNTIME_STAGE ? 1000 : 0;
         for (let index = 0; index < 24; index += 1) values.setFloat64(index * 8, kind === "sample_positions" ? index * 1e-9 : index + 1 + fieldOffset, true);
         call.status = 206;
-        return new Response(bytes, { status: 206, headers: { ...headers(), "content-type": "application/octet-stream", "content-length": "192", "content-range": `bytes 0-191/${FULL_BYTES}`, etag: `"fixture-${identity.request_scope_epoch}-${runId()}-${route.stageId}-${state.revision}-${kind}"` } });
+        const record = inspection(route.stageId);
+        const etag = await antennaInspectionPayloadEtag(record, kind as "sample_positions" | "magnetic_field", "b".repeat(64));
+        return new Response(bytes, { status: 206, headers: { ...headers(), "content-type": "application/octet-stream", "content-length": "192", "content-range": `bytes 0-191/${FULL_BYTES}`, etag } });
       }
       unexpected.push(url.pathname);
       throw new Error(`Unexpected fixture GET ${url.pathname}`);

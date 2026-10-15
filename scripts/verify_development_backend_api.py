@@ -1,4 +1,4 @@
-"""Verify native development API scopes, including active-run restart refusal."""
+"""Verify private native development handoff, compute and project API scopes."""
 from __future__ import annotations
 
 import argparse
@@ -52,6 +52,36 @@ def _validate_start_freeze_race_scope(enabled: bool, conflicting_scope: bool) ->
         raise storage.StorageError("Start/freeze race is a separate owned native verification scope")
 
 
+def _publish_owned_store_fixture_json(store: Path, path: Path, document: dict) -> None:
+    """Publish this verifier's fixture under the existing native writer lock."""
+    store = storage.validate_path(store, store, "owned fixture store")
+    path = storage.validate_path(path, store, "owned fixture document")
+    lock_path = storage.validate_path(store / "WRITER.lock", store, "native fixture writer lock")
+    # Never create or replace the native descriptor or its owner metadata.
+    with lock_path.open("r+b", buffering=0) as descriptor:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                descriptor.seek(0)
+                msvcrt.locking(descriptor.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as error:
+                if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise storage.StorageError("Owned fixture writer lock remained busy") from error
+                time.sleep(0.01)
+        try:
+            descriptor.seek(0)
+            if descriptor.read(256) != b"fullmag.writer.lock.v1\n":
+                raise storage.StorageError("Owned fixture has an unsupported native writer descriptor")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            storage.atomic_json(path, document)
+        finally:
+            descriptor.seek(0)
+            msvcrt.locking(descriptor.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def _can_reuse_active_binaries(source_bin: Path, stable_bin: Path, expected: dict) -> bool:
     from windows.runtime_bundle import BINARY_NAMES, _check_path_chain, _require_directory, _require_regular_file
 
@@ -78,7 +108,7 @@ def _can_reuse_active_binaries(source_bin: Path, stable_bin: Path, expected: dic
 
 
 def run(repo_root: str, cross_build_bundle: str = "", project_document_only: bool = False,
-        restart_transport_only: bool = False, observer_pause_only: bool = False,
+        observer_pause_only: bool = False,
         restart_consumer_only: bool = False, consumer_readiness_only: bool = False,
         consumer_pump_owner_bundle: str | None = None,
         candidate_preparation_only: bool = False,
@@ -87,17 +117,36 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
         active_run_refusal_owner_bundle: str | None = None,
         active_run_scenario: str = "running",
         start_freeze_race_only: bool = False,
+        compute_cancellation_only: bool = False,
+        compute_host_initialization_only: bool = False,
+        compute_scheduler_cancellation_only: bool = False,
         archive_frozen_bundle: bool = False) -> int:
+    if workspace_browser_owner_bundle is not None:
+        raise storage.StorageError(
+            "Browser workspace verification was retired with the UI restart feature"
+        )
     if archive_frozen_bundle and (not project_document_only or frozen_native_build_id is None):
         raise storage.StorageError("Native bundle archive requires the frozen project-document verification scope")
+    compute_scope_count = sum((compute_cancellation_only, compute_host_initialization_only,
+                               compute_scheduler_cancellation_only))
+    if compute_scope_count and (
+        cross_build_bundle or project_document_only or observer_pause_only
+        or restart_consumer_only or consumer_readiness_only
+        or consumer_pump_owner_bundle is not None or candidate_preparation_only
+        or active_run_refusal_owner_bundle is not None or start_freeze_race_only
+        or compute_scope_count > 1
+    ):
+        raise storage.StorageError(
+            "Compute verification requires one separate native verification scope"
+        )
     active_run_refusal = active_run_refusal_owner_bundle is not None
     _validate_start_freeze_race_scope(
         start_freeze_race_only,
         bool(
-            cross_build_bundle or project_document_only or restart_transport_only
-            or observer_pause_only or restart_consumer_only or consumer_readiness_only
+            cross_build_bundle or project_document_only or observer_pause_only
+            or restart_consumer_only or consumer_readiness_only
             or consumer_pump_owner_bundle is not None or candidate_preparation_only
-            or workspace_browser_owner_bundle is not None or frozen_native_build_id is not None
+            or frozen_native_build_id is not None
             or active_run_refusal
         ),
     )
@@ -105,60 +154,46 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
     _validate_active_run_refusal_scope(
         active_run_refusal_owner_bundle,
         conflicting_scope=bool(
-            cross_build_bundle or project_document_only or restart_transport_only
-            or observer_pause_only or restart_consumer_only or consumer_readiness_only
+            cross_build_bundle or project_document_only or observer_pause_only
+            or restart_consumer_only or consumer_readiness_only
             or consumer_pump_owner_bundle is not None or candidate_preparation_only
-            or workspace_browser_owner_bundle is not None
         ),
         frozen_native_build_id=frozen_native_build_id,
     )
     if frozen_native_build_id is not None:
         if not re.fullmatch(r"[0-9a-f]{64}", frozen_native_build_id):
             raise storage.StorageError("Frozen native build ID must be a lowercase SHA-256")
-        if (cross_build_bundle or restart_transport_only
-                or observer_pause_only or restart_consumer_only or consumer_readiness_only
-                or consumer_pump_owner_bundle is not None or candidate_preparation_only
-                or active_run_refusal
-                or workspace_browser_owner_bundle is not None):
-            raise storage.StorageError("Frozen native package verification allows only the default or project-document scope")
-    if workspace_browser_owner_bundle is not None:
-        if (cross_build_bundle or project_document_only or restart_transport_only
-                or observer_pause_only or restart_consumer_only or consumer_readiness_only
+        if (cross_build_bundle or observer_pause_only
+                or restart_consumer_only or consumer_readiness_only
                 or consumer_pump_owner_bundle is not None or candidate_preparation_only
                 or active_run_refusal):
-            raise storage.StorageError("Browser workspace restart is a separate verification scope")
-        if not re.fullmatch(r"[0-9a-f]{32}", workspace_browser_owner_bundle):
-            raise storage.StorageError("Browser workspace owner must be a canonical bundle ID")
+            raise storage.StorageError("Frozen native package verification allows only the default or project-document scope")
     frozen_probe = (consumer_pump_owner_bundle is not None or active_run_refusal
-                    or candidate_preparation_only
-                    or workspace_browser_owner_bundle is not None or start_freeze_race_only)
+                    or candidate_preparation_only or start_freeze_race_only)
     frozen_source_binding = frozen_probe or frozen_native_build_id is not None
     if candidate_preparation_only and (
-        cross_build_bundle or project_document_only or restart_transport_only
-        or observer_pause_only or restart_consumer_only or consumer_readiness_only
+        cross_build_bundle or project_document_only or observer_pause_only
+        or restart_consumer_only or consumer_readiness_only
         or consumer_pump_owner_bundle is not None or active_run_refusal
     ):
         raise storage.StorageError("Candidate preparation faults are a separate verification scope")
     if consumer_pump_owner_bundle is not None and (
-        cross_build_bundle or project_document_only or restart_transport_only
-        or observer_pause_only or restart_consumer_only or consumer_readiness_only or active_run_refusal
+        cross_build_bundle or project_document_only or observer_pause_only
+        or restart_consumer_only or consumer_readiness_only or active_run_refusal
     ):
         raise storage.StorageError("Consumer pump is a separate verification scope")
     if consumer_pump_owner_bundle is not None and not re.fullmatch(
         r"[0-9a-f]{32}", consumer_pump_owner_bundle
     ):
         raise storage.StorageError("Consumer pump owner must be a canonical bundle ID")
-    if consumer_readiness_only and (cross_build_bundle or project_document_only or restart_transport_only
+    if consumer_readiness_only and (cross_build_bundle or project_document_only
                                    or observer_pause_only or restart_consumer_only or active_run_refusal):
         raise storage.StorageError("Consumer readiness is a separate verification scope")
-    if restart_consumer_only and (cross_build_bundle or project_document_only or restart_transport_only
+    if restart_consumer_only and (cross_build_bundle or project_document_only
                                   or observer_pause_only or active_run_refusal):
         raise storage.StorageError("Restart consumer is a separate verification scope")
-    if observer_pause_only and (cross_build_bundle or project_document_only or restart_transport_only
-                                or active_run_refusal):
+    if observer_pause_only and (cross_build_bundle or project_document_only or active_run_refusal):
         raise storage.StorageError("Observer pause is a separate verification scope")
-    if restart_transport_only and (cross_build_bundle or project_document_only or active_run_refusal):
-        raise storage.StorageError("Restart transport observation is a separate verification scope")
     if project_document_only and (cross_build_bundle or active_run_refusal):
         raise storage.StorageError("Project document observation does not use a cross-build candidate")
     if cross_build_bundle and not re.fullmatch(r"[0-9a-f]{32}", cross_build_bundle):
@@ -246,7 +281,7 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
                    "build_snapshot_sha256": manifest["source_snapshot_sha256"],
                    "build_commit": manifest["git_commit"], "cross_build_bundle": cross_build_bundle,
                    "started_at": storage.now(), "checks": [], "processes": [],
-                   "scope": "native resource observation, private owner-authorized acquisition and admission freeze/abort/disconnect, cold handoff acceptance with ACK/lost-ACK reconciliation and graceful owned API exit, committed candidate prelisten asset-backed authoring restore and live cold completion with HTTP mutation admission, interrupted store completion journals and repeated store cycles, empty-service terminal drain; no UI hydration, end-to-end compute reopening, solver or release qualification"}
+                   "scope": "private owner-authorized acquisition and admission freeze/abort/disconnect, cold handoff acceptance with ACK/lost-ACK reconciliation and graceful owned API exit, committed candidate prelisten asset-backed authoring restore and live cold completion with HTTP mutation admission, interrupted store completion journals and repeated store cycles, empty-service terminal drain; no UI hydration, end-to-end compute reopening, solver or release qualification"}
         receipt["project_document_only"] = project_document_only
         if project_source_binding is not None:
             receipt["project_python_source_binding"] = project_source_binding
@@ -257,8 +292,6 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
             receipt["source_binding"] = "verified_frozen_native_package"
         if project_document_only:
             receipt["scope"] = "runtime-free project archive create/open identity and canonical bytes; no UI hydration, restart, solver or release qualification"
-        if restart_transport_only:
-            receipt["scope"] = "owned native API restart request transport, immutable storage, identity and token guards; no process replacement, UI hydration, solver or release qualification"
         if observer_pause_only:
             receipt["scope"] = "native observer pause protocol with actual threads; no API, process replacement, UI hydration, solver or release qualification"
         if restart_consumer_only:
@@ -289,11 +322,37 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
             receipt["checkout_source_sha256_before"] = checkout_source_before
             receipt["source_binding"] = "verified_frozen_native_package"
             receipt["scope"] = "real candidate helper completion, transport failures, timeout and cancellation; no API, restart, UI, solver or release qualification"
-        if workspace_browser_owner_bundle is not None:
-            receipt["workspace_browser_owner_bundle"] = workspace_browser_owner_bundle
-            receipt["checkout_source_sha256_before"] = checkout_source_before
-            receipt["source_binding"] = "verified_frozen_native_package"
-            receipt["scope"] = "owned A-to-B native restart with real nonempty scene and browser dirty-document hydration; private eligibility only, no public capability, solver or release qualification"
+        if compute_cancellation_only:
+            receipt["compute_cancellation_only"] = True
+            if frozen_native_build_id is not None:
+                receipt["checkout_source_sha256_before"] = checkout_source_before
+                receipt["source_binding"] = "verified_frozen_native_package"
+            receipt["scope"] = (
+                "production native API durable pre-claim cancellation request, retry, "
+                "revision/identity conflicts and real store-writer contention using a "
+                "fixture-seeded accepted run; no Submit, worker claim, solver execution, "
+                "terminal cancellation, resource-release, physics or release qualification"
+            )
+        if compute_host_initialization_only:
+            receipt["compute_host_initialization_only"] = True
+            if frozen_native_build_id is not None:
+                receipt["checkout_source_sha256_before"] = checkout_source_before
+                receipt["source_binding"] = "verified_frozen_native_package"
+            receipt["scope"] = (
+                "production native operator host-config and ledger initialization, "
+                "exact replay and refusal cases using explicit fixture policy; "
+                "no physical topology, service lifecycle, scheduler or solver proof"
+            )
+        if compute_scheduler_cancellation_only:
+            receipt["compute_scheduler_cancellation_only"] = True
+            if frozen_native_build_id is not None:
+                receipt["checkout_source_sha256_before"] = checkout_source_before
+                receipt["source_binding"] = "verified_frozen_native_package"
+            receipt["scope"] = (
+                "production native API cancellation and standalone scheduler projection "
+                "with explicit component drain using fixture metadata and policy; "
+                "no runtime-service lifecycle, physical topology, enforcement or solver proof"
+            )
         storage.atomic_json(receipt_path, receipt)
         code = 1
         try:
@@ -353,11 +412,7 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
             binary_hash = hashlib.sha256(api.read_bytes()).hexdigest()
             if binary_hash != manifest["api_binary_sha256"] or hashlib.sha256(source_api.read_bytes()).hexdigest() != binary_hash:
                 raise storage.StorageError("Native API changed while sealing its diagnostic copy")
-            if workspace_browser_owner_bundle is not None:
-                from windows.verify_workspace_browser import exercise as exercise_workspace_browser
-                exercise_workspace_browser(repo, run_root, manifest, receipt, api.parent,
-                                           workspace_browser_owner_bundle)
-            elif candidate_preparation_only:
+            if candidate_preparation_only:
                 from windows.verify_candidate_preparation import exercise as exercise_candidate_preparation
                 exercise_candidate_preparation(repo, run_root, manifest, receipt, api.parent)
             elif observer_pause_only:
@@ -378,13 +433,24 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
                 )
             elif start_freeze_race_only:
                 exercise(api, repo, run_root, receipt, start_freeze_race_only=True)
+            elif compute_cancellation_only:
+                from windows.verify_compute_cancellation_api import exercise as exercise_compute_cancellation_api
+                exercise_compute_cancellation_api(api, repo, run_root, receipt)
+            elif compute_host_initialization_only:
+                from windows.verify_compute_host_initialization import exercise as exercise_compute_host_initialization
+                exercise_compute_host_initialization(api, repo, run_root, receipt)
+            elif compute_scheduler_cancellation_only:
+                from windows.verify_compute_scheduler_cancellation import exercise as exercise_compute_scheduler_cancellation
+                exercise_compute_scheduler_cancellation(api, repo, run_root, receipt)
             else:
                 exercise(api, repo, run_root, receipt, project_document_only=project_document_only,
                          project_source_root=project_source_root,
-                         restart_transport_only=restart_transport_only,
                          consumer_readiness_only=consumer_readiness_only)
-            if (not project_document_only and not restart_transport_only and not observer_pause_only
+            if (not project_document_only and not observer_pause_only
                     and not restart_consumer_only and not consumer_readiness_only
+                    and not compute_cancellation_only
+                    and not compute_host_initialization_only
+                    and not compute_scheduler_cancellation_only
                     and not frozen_probe):
                 exercise_service(repo, run_root, manifest, receipt, api.parent)
             # Use the canonical codegen branch rather than persisting the live
@@ -397,10 +463,44 @@ def run(repo_root: str, cross_build_bundle: str = "", project_document_only: boo
                 raise storage.StorageError("Canonical native OpenAPI export failed")
             spec = json.loads(export.stdout)
             identity = spec["x-fullmag-build-identity"]
+            removed_paths = {
+                "/v2/platform/development-backend",
+                "/v2/platform/development-backend/build-requests",
+                "/v2/platform/development-backend/build-requests/{request_id}",
+                "/v2/platform/development-restart-requests",
+                "/v2/platform/development-restart-requests/{request_id}",
+            }
+            removed_schemas = {
+                "DevelopmentBackendResource",
+                "DevelopmentBackendState",
+                "DevelopmentBackendReason",
+                "DevelopmentBuildIdentity",
+                "DevelopmentBackendWorkspaceIdentity",
+                "DevelopmentBackendBuildRequest",
+                "DevelopmentBackendBuildRequestResource",
+                "DevelopmentBackendBuildRequestState",
+                "DevelopmentRestartRequest",
+                "DevelopmentRestartResource",
+                "DevelopmentRestartState",
+            }
+            present_paths = sorted(removed_paths.intersection(spec.get("paths", {})))
+            schemas = spec.get("components", {}).get("schemas", {})
+            present_schemas = sorted(removed_schemas.intersection(schemas))
             if (identity["git_commit"] != receipt["build_commit"]
-                    or identity["source_snapshot_sha256"] != receipt["build_snapshot_sha256"]
-                    or "/v2/platform/development-backend" not in spec["paths"]):
+                    or identity["source_snapshot_sha256"] != receipt["build_snapshot_sha256"]):
                 raise storage.StorageError("Canonical native OpenAPI identity does not match the verified build")
+            if present_paths or present_schemas:
+                raise storage.StorageError(
+                    f"Retired development API contract is still exported: paths={present_paths}, schemas={present_schemas}"
+                )
+            receipt["checks"].append("canonical-openapi-removed-development-backend-and-restart-contract")
+            camera_patch_schema = spec["components"]["schemas"]["VisualizationCameraPatch"]
+            scale_schema = camera_patch_schema["properties"]["orthographic_scale"]
+            if (set(scale_schema.get("type", [])) != {"number", "null"}
+                    or scale_schema.get("format") != "double"
+                    or "orthographic_scale" in camera_patch_schema.get("required", [])):
+                raise storage.StorageError("Camera scale PATCH lost its optional nullable number contract")
+            receipt["checks"].append("camera-scale-openapi-optional-nullable-double")
             storage.atomic_json(run_root / "openapi-v2.json", spec)
             receipt["openapi_sha256"] = hashlib.sha256((run_root / "openapi-v2.json").read_bytes()).hexdigest()
             receipt["checks"].append("canonical-codegen-identity")
@@ -1437,8 +1537,7 @@ def exercise_service(repo: Path, run_root: Path, manifest: dict, receipt: dict, 
                     preparation_attempt_id="fixture-preparation")),
             ):
                 lease_path = store / "runs/idle-fence-lease" / family / "outside-pool/fixture-lease.json"
-                lease_path.parent.mkdir(parents=True)
-                storage.atomic_json(lease_path, document)
+                _publish_owned_store_fixture_json(store, lease_path, document)
                 denied = control("drain_idle_confirmed", owner["owner_token"], uuid.uuid4().hex)
                 assert denied == {"status": "rejected", "reason": "idle_not_proven"}, denied
                 assert control("status", owner["owner_token"], uuid.uuid4().hex)["owner"]["state"] == "ready"
@@ -1446,7 +1545,7 @@ def exercise_service(repo: Path, run_root: Path, manifest: dict, receipt: dict, 
                 receipt["checks"].append(family + "-outside-pool-refuses-idle-drain")
                 # Keep the document to prove that terminal lease history does
                 # not prevent the eventual idle drain. No process owns it.
-                storage.atomic_json(lease_path, {**document, "state": "released",
+                _publish_owned_store_fixture_json(store, lease_path, {**document, "state": "released",
                     "released_at": "2026-10-03T00:01:00Z"})
             fence_path = store / "development/ADMISSION-FENCE.json"
             fence_path.parent.mkdir(exist_ok=True)
@@ -1555,7 +1654,7 @@ def exercise_service(repo: Path, run_root: Path, manifest: dict, receipt: dict, 
 
 def exercise(api: Path, repo: Path, run_root: Path, receipt: dict, *, project_document_only: bool = False,
              project_source_root: Path | None = None,
-             restart_transport_only: bool = False, consumer_readiness_only: bool = False,
+             consumer_readiness_only: bool = False,
              start_freeze_race_only: bool = False) -> None:
     generation, source, worktree = "1" * 32, "a" * 64, "fixture-worktree"
     fixture_storage = run_root / "fixture-storage"
@@ -1577,15 +1676,8 @@ def exercise(api: Path, repo: Path, run_root: Path, receipt: dict, *, project_do
         value.update(changes)
         storage.atomic_json(status, value)
 
-    def check(name, body, state, reason):
-        assert body["state"] == state and body["reason"] == reason, (name, body)
-        assert body["restart_available"] is False, (name, body)
-        serialized = json.dumps(body)
-        assert not any(secret in serialized for secret in (str(fixture_storage), generation, "generation_id", "updated_unix_ms", "status_file", "pid")), body
-        checks.append(name)
-
     def with_api(label, config, callback, *, restore_input=None, reject_startup=False, hold_input_open=False):
-        # Only this route's child can be stopped. It never accepts computation.
+        # Only this fixture's API child can be stopped. It never accepts computation.
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
@@ -1605,7 +1697,7 @@ def exercise(api: Path, repo: Path, run_root: Path, receipt: dict, *, project_do
             receipt["processes"].append(record)
             base = f"http://127.0.0.1:{port}/v2/platform/"
 
-            def get(path="development-backend", etag=None, *, method="GET", payload=None, timeout=2, extra_headers=None):
+            def get(path="health", etag=None, *, method="GET", payload=None, timeout=2, extra_headers=None):
                 url = f"http://127.0.0.1:{port}" + path if path.startswith("/") else base + path
                 headers = {"If-None-Match": etag} if etag else {}
                 headers.update(extra_headers or {})
@@ -1665,8 +1757,7 @@ def exercise(api: Path, repo: Path, run_root: Path, receipt: dict, *, project_do
                 record["waited"] = True
                 record["log_sha256"] = hashlib.sha256(log_path.read_bytes()).hexdigest()
 
-    def disabled(get):
-        check("non-dev-disabled", get()[2], "disabled", "disabled")
+    def admission(get):
         status_code, _, created = get("/v2/sessions", method="POST", payload={
             "name": "Owned admission fixture", "backend": "fdm", "device": "cpu", "precision": "double",
         })
@@ -1900,102 +1991,6 @@ def exercise(api: Path, repo: Path, run_root: Path, receipt: dict, *, project_do
                            checks=checks, receipt=receipt)
         return
 
-    if restart_transport_only:
-        route = "/v2/platform/development-restart-requests"
-        origin = "http://localhost:3197"
-        def observe_transport(get):
-            get("health")
-            instance = get.instance_id
-            assert str(uuid.UUID(instance)) == instance
-            workspace_identity = get()[2]["workspace_identity"]
-            assert workspace_identity == {"api_instance_id": instance, "session_id": None, "session_epoch": 0}
-            checks.append("restart-transport-empty-workspace-transition-identity")
-            token = uuid.uuid4().hex
-            request_id = str(uuid.uuid4())
-            request = {"schema": "fullmag.development-ui-restart-request.v1",
-                       "request_id": request_id, "session_id": None, "session_epoch": 0,
-                       "editor": {"source": "unsaved editor"}, "workspace": {"inspector": False},
-                       "project_document": {"separate_document": True}}
-            headers = {"Authorization": "Bearer " + token, "Origin": origin,
-                       "x-fullmag-api-instance": instance}
-            def refused(label, status_code, *, body=request, sent_headers=headers, method="POST", path=route):
-                try:
-                    get(path, method=method, payload=body if method == "POST" else None,
-                        extra_headers=sent_headers)
-                    raise AssertionError("refused request was accepted: " + label)
-                except urllib.error.HTTPError as error:
-                    assert error.code == status_code, (label, error.code, error.read(4096))
-                    data = error.read(4096)
-                    assert str(fixture_storage).encode() not in data and token.encode() not in data
-                checks.append("restart-transport-" + label)
-            refused("foreign-origin", 409, sent_headers={**headers, "Origin": "https://foreign.invalid"})
-            refused("missing-pin", 409, sent_headers={key: value for key, value in headers.items() if key != "x-fullmag-api-instance"})
-            refused("stale-pin", 409, sent_headers={**headers, "x-fullmag-api-instance": str(uuid.uuid4())})
-            refused("wrong-epoch", 409, body={**request, "session_epoch": 1})
-            refused("foreign-session", 409, body={**request, "session_id": str(uuid.uuid4())})
-            refused("missing-nullable-session", 422, body={key: value for key, value in request.items() if key != "session_id"})
-            refused("nil-request-identity", 400, body={**request, "request_id": str(uuid.UUID(int=0))})
-            refused("missing-status-token", 404, sent_headers={key: value for key, value in headers.items() if key != "Authorization"})
-            refused("invalid-ui-shape", 400, body={**request, "editor": []})
-            refused("unknown-field", 422, body={**request, "pid": 123})
-            status_code, _, accepted = get(route, method="POST", payload=request, extra_headers=headers)
-            assert status_code == 202 and accepted["request_id"] == request_id and accepted["state"] == "pending"
-            assert accepted["editor"] is None and accepted["new_api_instance_id"] is None
-            checks.append("restart-transport-accepted-without-restart-claim")
-            record_path = fixture_storage / "runtimes" / worktree / "development-restarts" / request_id / "request.json"
-            raw_record = record_path.read_bytes()
-            record = json.loads(raw_record)
-            assert token.encode() not in raw_record
-            assert record["status_token_sha256"] == hashlib.sha256(token.encode()).hexdigest()
-            assert record["old_api_instance_id"] == instance and record["generation_id"] == generation
-            for owner_name in ("editor", "workspace", "project_document"):
-                assert record[owner_name] == request[owner_name]
-            checks.append("restart-transport-durable-independent-ui-owners-and-token-hash")
-            assert get(route, method="POST", payload=request, extra_headers=headers)[0] == 202
-            assert record_path.read_bytes() == raw_record
-            checks.append("restart-transport-identical-replay-keeps-bytes")
-            refused("changed-replay", 409, body={**request, "editor": {"source": "changed"}})
-            refused("second-request-slot", 409, body={**request, "request_id": str(uuid.uuid4())})
-            status_headers = {"Authorization": "Bearer " + token}
-            assert get(route + "/" + request_id, extra_headers=status_headers)[2]["state"] == "pending"
-            checks.append("restart-transport-status-without-old-http-pin")
-            refused("wrong-status-token", 404, sent_headers={"Authorization": "Bearer " + uuid.uuid4().hex},
-                    method="GET", path=route + "/" + request_id)
-            assert record_path.read_bytes() == raw_record
-            assert get()[2]["restart_available"] is False
-            checks.append("restart-transport-does-not-enable-unverified-ui-command")
-            _, _, spec = get("openapi.json")
-            assert route in spec["paths"] and route + "/{request_id}" in spec["paths"]
-            schema = spec["components"]["schemas"]["DevelopmentRestartRequest"]
-            assert "session_id" in schema["required"]
-            assert schema["additionalProperties"] is False
-            checks.append("restart-transport-openapi-strict-required-nullable-session")
-            identity_schema = spec["components"]["schemas"]["DevelopmentBackendWorkspaceIdentity"]
-            assert {"api_instance_id", "session_epoch"}.issubset(identity_schema["properties"])
-            assert "workspace_identity" in spec["components"]["schemas"]["DevelopmentBackendResource"]["properties"]
-            checks.append("restart-transport-openapi-workspace-transition-identity")
-        def observe_workspace_identity(get):
-            get("health")
-            instance = get.instance_id
-            for expected_epoch in (1, 2):
-                code, _, created = get("/v2/sessions", method="POST", payload={
-                    "name": "Owned UI identity fixture", "backend": "fdm", "device": "cpu", "precision": "double",
-                    "replace_current": True,
-                })
-                assert code == 201 and created["session_id"]
-                observed_identity = get()[2]["workspace_identity"]
-                assert observed_identity == {"api_instance_id": instance, "session_id": created["session_id"], "session_epoch": expected_epoch}
-                checks.append("restart-transport-exact-workspace-transition-epoch-" + str(expected_epoch))
-        frame()
-        transport_config = {**configured, "FULLMAG_DEVELOPMENT_OWNER_TOKEN": uuid.uuid4().hex,
-                            "FULLMAG_DEVELOPMENT_RESTART_COORDINATOR": "1",
-                            "FULLMAG_DEVELOPMENT_RESTART_UI_ORIGIN": origin}
-        # A durable pending restart correctly closes mutation admission. Exercise
-        # ordinary session transitions before that intent, on a separate owned API.
-        with_api("workspace-identity", transport_config, observe_workspace_identity)
-        with_api("restart-transport", transport_config, observe_transport)
-        return
-
     if project_document_only:
         with_api("project-document", {}, project_document)
         from windows.verify_scene_stage_authoring import exercise as exercise_scene_stages
@@ -2093,8 +2088,7 @@ def exercise(api: Path, repo: Path, run_root: Path, receipt: dict, *, project_do
             with_api("renderer-" + fault, {"FULLMAG_REPO_ROOT": str(helper_root)}, renderer_fault)
         return
     if not start_freeze_race_only:
-        with_api("disabled", {}, disabled)
-        with_api("partial", {"FULLMAG_DEVELOPMENT_BACKEND_GENERATION": generation}, lambda get: check("partial-configuration", get()[2], "unknown", "configuration_invalid"))
+        with_api("admission", {}, admission)
 
     # This tests the private prelisten consumer, not capsule authenticity or
     # the manager's complete restart. No previous process/session is stopped.
@@ -2509,6 +2503,27 @@ def exercise(api: Path, repo: Path, run_root: Path, receipt: dict, *, project_do
     if start_freeze_race_only:
         return
 
+    incomplete_physics_scene = json.loads(json.dumps(start_race_scene))
+    incomplete_physics_scene["objects"][0].pop("physics_stack", None)
+    incomplete_physics_scene["study"].update(exchange_enabled=False, demag_enabled=False)
+
+    def incomplete_physics_render(get):
+        _, _, before = get("/v2/sessions/current/model/scene")
+        try:
+            get("/v2/sessions/current/model/syncs", method="POST", payload={})
+        except urllib.error.HTTPError as error:
+            failure = json.loads(error.read())
+            assert error.code == 400 and failure.get("code") == "scene_incomplete_physics", failure
+        else:
+            raise AssertionError("Incomplete physics render was not explicitly rejected")
+        checks.append("incomplete-physics-render-is-confirmed-input-rejection")
+        _, _, after = get("/v2/sessions/current/model/scene")
+        assert after == before, "Render rejection changed authoring data"
+        checks.append("incomplete-physics-render-preserves-scene-and-revision")
+
+    with_api("incomplete-physics-render", restore_config, incomplete_physics_render,
+             restore_input=json.dumps({**restore_envelope, "scene_document": incomplete_physics_scene}).encode())
+
     def restored(get):
         code, _, current = get("/v2/sessions/current")
         assert code == 200 and current["session_id"] not in {"old-session-fixture", "stable-model-fixture"}, current
@@ -2548,6 +2563,39 @@ def exercise(api: Path, repo: Path, run_root: Path, receipt: dict, *, project_do
         assert edited["scene"]["name"] == "Edited restored model", edited
         checks.append("prelisten-restored-authoring-is-editable")
 
+        # Real owned API regression: JSON null must clear a previously set scale.
+        camera_path = "/v2/sessions/current/visualization/state"
+        code, _, initial_view = get(camera_path)
+        assert code == 200, initial_view
+        original_camera = dict(initial_view["camera"])
+        previous_revision = initial_view["revision"]
+        for label, camera_patch, expected_scale in (
+            ("set", {"orthographic_scale": 2.0}, 2.0),
+            ("absent", {}, 2.0),
+            ("clear", {"orthographic_scale": None}, None),
+        ):
+            code, _, view = get(camera_path, method="PATCH", payload={"camera": camera_patch})
+            assert code == 200, view
+            assert view["revision"] > previous_revision, view
+            expected_camera = {**original_camera, "orthographic_scale": expected_scale}
+            assert view["camera"] == expected_camera, view
+            code, _, readback = get(camera_path)
+            assert code == 200 and readback["camera"] == expected_camera, readback
+            assert readback["revision"] == view["revision"], readback
+            previous_revision = view["revision"]
+            checks.append("camera-scale-patch-" + label + "-revision-and-readback")
+        for invalid_scale in (0.0, -1.0):
+            try:
+                get(camera_path, method="PATCH", payload={"camera": {"orthographic_scale": invalid_scale}})
+            except urllib.error.HTTPError as error:
+                assert error.code == 400, error.code
+            else:
+                raise AssertionError("Invalid camera scale was accepted")
+            code, _, readback = get(camera_path)
+            assert code == 200 and readback["camera"] == expected_camera, readback
+            assert readback["revision"] == previous_revision, readback
+        checks.append("camera-scale-invalid-patch-preserves-state-and-revision")
+
     with_api("restored", restore_config, restored, restore_input=json.dumps(restore_envelope).encode())
     for label, config, envelope in (
         ("restore-nonmanaged", {"FULLMAG_DEVELOPMENT_RESTORE_STDIN": "1"}, restore_envelope),
@@ -2560,46 +2608,6 @@ def exercise(api: Path, repo: Path, run_root: Path, receipt: dict, *, project_do
     with_api("restore-oversize-input", restore_config, None,
              restore_input=b" " * (64 * 1024 * 1024 + 1), reject_startup=True)
 
-    def managed(get):
-        frame()
-        _, etag, body = get()
-        check("waiting", body, "waiting", "build_pending")
-        frame(updated_unix_ms=int(time.time() * 1000) + 1)
-        assert get(etag=etag)[0] == 304
-        checks.append("heartbeat-stable-etag")
-        frame("building")
-        changed_status, changed_etag, _ = get(etag=etag)
-        assert changed_status == 200 and changed_etag != etag
-        checks.append("state-change-invalidates-etag")
-        for state, reason in (("building", "build_pending"), ("failed", "build_failed"), ("superseded", "build_pending"), ("stopped", "watcher_stopped")):
-            frame(state)
-            check(state, get()[2], state, reason)
-        frame("ready", ready_build_id="b" * 64, ready_source_sha256=source)
-        check("ready-with-restart-blocked", get()[2], "ready", "restart_integration_pending")
-        assert get()[2]["ready_build"]["source_sha256"] == source
-        for name, change in (("wrong-generation", {"generation_id": "2" * 32}), ("wrong-worktree", {"worktree_id": "other"}), ("unexpected-private-field", {"host_path": "secret"}), ("invalid-source", {"source_sha256": "bad"})):
-            frame(**change)
-            check(name, get()[2], "unknown", "observation_invalid")
-        frame("ready", ready_build_id="b" * 64, ready_source_sha256="c" * 64)
-        check("candidate-source-mismatch", get()[2], "unknown", "observation_invalid")
-        for label, delta in (("stale", -20_000), ("future", 20_000)):
-            frame(updated_unix_ms=int(time.time() * 1000) + delta)
-            check(label, get()[2], "unknown", "observation_stale")
-        status.write_bytes(b"x" * 8193)
-        check("oversized-file", get()[2], "unknown", "observation_unavailable")
-        status.unlink()  # Only this run's disposable fixture, never live watcher metadata.
-        check("missing-file", get()[2], "unknown", "observation_unavailable")
-        frame()
-        _, _, spec = get("openapi.json")
-        assert "/v2/platform/development-backend" in spec["paths"]
-        identity = spec["x-fullmag-build-identity"]
-        assert identity["git_commit"] == receipt["build_commit"]
-        assert identity["source_snapshot_sha256"] == receipt["build_snapshot_sha256"]
-        storage.atomic_json(run_root / "openapi-v2.json", spec)
-        receipt["openapi_sha256"] = hashlib.sha256((run_root / "openapi-v2.json").read_bytes()).hexdigest()
-        checks.append("generated-openapi-resource")
-    frame()
-    with_api("managed", configured, managed)
 
 
 if __name__ == "__main__":
@@ -2607,7 +2615,6 @@ if __name__ == "__main__":
     parser.add_argument("--repo-root", required=True)
     parser.add_argument("--cross-build-bundle", default="")
     parser.add_argument("--project-document-only", action="store_true")
-    parser.add_argument("--restart-transport-only", action="store_true")
     parser.add_argument("--observer-pause-only", action="store_true")
     parser.add_argument("--restart-consumer-only", action="store_true")
     parser.add_argument("--consumer-readiness-only", action="store_true")
@@ -2616,18 +2623,23 @@ if __name__ == "__main__":
     parser.add_argument("--active-run-scenario", choices=("running", "paused"), default="running")
     parser.add_argument("--start-freeze-race-only", action="store_true")
     parser.add_argument("--candidate-preparation-only", action="store_true")
-    parser.add_argument("--workspace-browser-owner-bundle")
+    parser.add_argument("--workspace-browser-owner-bundle", help=argparse.SUPPRESS)
     parser.add_argument("--frozen-native-build-id")
     parser.add_argument("--archive-frozen-bundle", action="store_true")
+    parser.add_argument("--compute-cancellation-only", action="store_true")
+    parser.add_argument("--compute-host-initialization-only", action="store_true")
+    parser.add_argument("--compute-scheduler-cancellation-only", action="store_true")
     args = parser.parse_args()
     try:
         raise SystemExit(run(args.repo_root, args.cross_build_bundle, args.project_document_only,
-                             args.restart_transport_only, args.observer_pause_only,
+                             args.observer_pause_only,
                              args.restart_consumer_only, args.consumer_readiness_only,
                              args.consumer_pump_owner_bundle, args.candidate_preparation_only,
                              args.workspace_browser_owner_bundle, args.frozen_native_build_id,
                               args.active_run_refusal_owner_bundle, args.active_run_scenario,
-                              args.start_freeze_race_only,
+                              args.start_freeze_race_only, args.compute_cancellation_only,
+                              args.compute_host_initialization_only,
+                              args.compute_scheduler_cancellation_only,
                               archive_frozen_bundle=args.archive_frozen_bundle))
     except Exception as error:
         print(f"Native development resource verification failed: {error}", file=sys.stderr)

@@ -226,8 +226,10 @@ if (liveIndex !== -1) {
   assert.ok(response.ok, `Live scene GET failed: ${response.status}`);
   const scene = await response.json();
   const liveModel = model(scene, null);
+  const carriersByObjectId = new Map(liveModel.objects.map((carrier) => [carrier.objectId, carrier]));
+  assert.equal(carriersByObjectId.size, liveModel.objects.length, "Live object IDs must be unique");
   for (const authored of scene.objects.filter((candidate) => candidate.geometry?.geometry_kind === "MicrostripAntennaLayout")) {
-    const carrier = liveModel.objects.find((candidate) => candidate.objectId === authored.id);
+    const carrier = carriersByObjectId.get(authored.id);
     assert.ok(carrier, JSON.stringify(liveModel.diagnostics));
     assert.equal(carrier.kind, "microstrip");
     console.log(`LIVE scene=${scene.revision} object=${carrier.objectId} kind=${carrier.kind} size_m=${JSON.stringify(carrier.bounds.size)} parts=${JSON.stringify(carrier.antennaPreview.parts.map((part) => part.id))}`);

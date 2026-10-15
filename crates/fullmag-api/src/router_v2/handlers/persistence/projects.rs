@@ -13,9 +13,9 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use fullmag_application::{
-    ApplicationError, CreateProjectRequest, DocumentMode, FileProjectRepository, OpaqueDocument,
-    ProjectApplication, ProjectId, ProjectSource, RawJsonEnvelope, RunId, RunIntent,
-    RunSpecification, SubmitDisposition,
+    ApplicationError, BatchExpansionRequest, CreateProjectRequest, DocumentMode,
+    FileProjectRepository, OpaqueDocument, ProjectApplication, ProjectId, ProjectSource,
+    RawJsonEnvelope, RunId, RunIntent, RunSpecification, SubmitDisposition,
 };
 use fullmag_authoring::{
     validate_scene_document, validate_scene_document_for_authoring, SceneDocument, StudyPlan,
@@ -31,14 +31,20 @@ use std::sync::Arc;
 use crate::error::ApiError;
 use crate::schemas::projects::{
     ProjectArchiveDurability, ProjectArchiveRequest, ProjectAuthoringUpdateRequest,
+    ProjectBatchSubmitRequest, ProjectBatchSubmitResource, ProjectBatchAxisSummaryResource,
+    ProjectBatchCasesQuery, ProjectBatchCasesResource, ProjectBatchCasePublishedRunResource,
+    ProjectBatchCaseState, ProjectBatchCaseSummaryResource, ProjectBatchCaseTaskSummaryResource,
+    ProjectBatchExpansionState, ProjectBatchListQuery, ProjectBatchFailurePolicy,
+    ProjectBatchListResource, ProjectBatchSummaryResource,
     ProjectCreateRequest, ProjectDocumentMode, ProjectDocumentResource, ProjectMigrationResource,
     ProjectRunCatalogState, ProjectRunExecutionState, ProjectRunListQuery, ProjectRunListResource,
     ProjectRunMaterializationResource, ProjectRunMinimumResourceBudgetResource,
     ProjectRunRequestedExecutionResource, ProjectRunResource, ProjectRunSubmitDisposition,
     ProjectRunSubmitRequest, ProjectRunSubmitResource, ProjectRunSummaryResource,
-    ProjectRunTaskCancellationDisposition, ProjectRunTaskCancellationRequest,
-    ProjectRunTaskCancellationResource, ProjectRunTaskLifecycle, ProjectRunTaskResource,
-    PROJECT_ARCHIVE_MAX_BYTES,
+    ProjectRunTaskCancellationDisposition, ProjectRunTaskCancellationIntentResource,
+    ProjectRunTaskCancellationRequest, ProjectRunTaskCancellationResource,
+    ProjectRunTaskCancellationState, ProjectRunTaskCancellationSummary, ProjectRunTaskLifecycle,
+    ProjectRunTaskResource, ProjectRunTaskStopResource, PROJECT_ARCHIVE_MAX_BYTES,
 };
 use crate::types::AppState;
 
@@ -46,6 +52,9 @@ const AUTHORING_SOURCE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 #[path = "execution_profile_submission.rs"]
 mod execution_profile_submission;
+
+#[path = "run_intent_preparation.rs"]
+pub(crate) mod run_intent_preparation;
 
 /// Removes only the known generated source file.  The helper owns its
 /// `scene-export-*.json` lifecycle; any unexpected file left in the private
@@ -93,6 +102,7 @@ fn project_run_task_resource(
     store: &fullmag_session::SessionStore,
     run_id: &str,
     artifact_catalog: Option<&fullmag_session::FmsArtifactCatalog>,
+    catalog_revision: u64,
     task: fullmag_session::FmsTaskCatalogEntry,
 ) -> Result<ProjectRunTaskResource, ApiError> {
     let accepted_state_ref = match (task.attempt_id.as_deref(), task.ownership_epoch) {
@@ -152,9 +162,126 @@ fn project_run_task_resource(
         }
         _ => None,
     };
+    let cancellation = store
+        .read_task_cancellation_intent(run_id, &task.task_id)
+        .map_err(|error| ApiError::internal(format!("reading cancellation intent: {error:#}")))?;
+    if let Some(intent) = &cancellation {
+        intent
+            .validate_task_scope(store, &task, catalog_revision)
+            .map_err(|error| {
+                ApiError::internal(format!("invalid cancellation task scope: {error:#}"))
+            })?;
+    }
     let mut resource = ProjectRunTaskResource::from(task);
     resource.accepted_state_ref = accepted_state_ref.map(Into::into);
+    resource.cancellation_intent = cancellation.map(|intent| ProjectRunTaskCancellationSummary {
+        cancellation_id: intent.cancellation_id,
+        reason: intent.reason,
+        expected_catalog_revision: intent.expected_catalog_revision,
+        created_at: intent.created_at.to_rfc3339(),
+    });
     Ok(resource)
+}
+
+fn project_batch_case_published_run(
+    store: &fullmag_session::SessionStore,
+    batch_intent: &fullmag_session::FmsBatchIntent,
+    project_id: &ProjectId,
+    case: &fullmag_application::BatchCase,
+    child_intent: fullmag_session::FmsRunIntent,
+) -> Result<ProjectBatchCasePublishedRunResource, ApiError> {
+    let expected_run_id = case.specification.run_id.as_str();
+    let expected_idempotency_key =
+        batch_case_idempotency_key(&batch_intent.batch_id, &case.case_id);
+    if child_intent.run_id != expected_run_id
+        || child_intent.idempotency_key != expected_idempotency_key
+    {
+        return Err(ApiError::internal(format!(
+            "published batch case `{}` has a mismatched child run identity",
+            case.case_id
+        )));
+    }
+
+    let specification: RunSpecification =
+        serde_json::from_value(child_intent.specification.clone()).map_err(|error| {
+            ApiError::internal(format!("invalid durable batch child RunSpec: {error}"))
+        })?;
+    let fingerprint = specification
+        .fingerprint()
+        .map_err(|error| {
+            ApiError::internal(format!("invalid durable batch child RunSpec: {error}"))
+        })?;
+    let mut expected_specification = case.specification.clone();
+    // Case materialization deterministically binds per-case StudyPlan/catalog
+    // digests. Every other RunSpecification field must remain the accepted
+    // manifest value.
+    expected_specification.study.plan_sha256 = specification.study.plan_sha256.clone();
+    expected_specification.study_catalog_sha256 = specification.study_catalog_sha256.clone();
+    if specification != expected_specification
+        || specification.run_id.as_str() != expected_run_id
+        || specification.snapshot.project_id.as_str() != project_id.as_str()
+        || case.specification.snapshot.project_id.as_str() != project_id.as_str()
+        || child_intent.payload_sha256 != fingerprint
+        || child_intent.definition_object_ref.as_deref()
+            != Some(batch_intent.definition_object_ref.as_str())
+        || child_intent.study_object_ref.as_deref()
+            != Some(specification.study.plan_sha256.as_str())
+        || child_intent.study_catalog_object_ref.as_deref()
+            != Some(specification.study_catalog_sha256.as_str())
+        || child_intent.asset_object_refs != batch_intent.asset_object_refs
+    {
+        return Err(ApiError::internal(format!(
+            "published batch case `{}` child intent differs from its accepted identity",
+            case.case_id
+        )));
+    }
+
+    let catalog = store
+        .read_run_catalog(expected_run_id)
+        .map_err(|error| ApiError::internal(format!("read batch child task catalog: {error:#}")))?;
+    let (catalog_state, catalog_revision, tasks) = match catalog {
+        Some(catalog) => {
+            if catalog.run_id != expected_run_id || catalog.tasks.is_empty() {
+                return Err(ApiError::internal(format!(
+                    "published batch case `{}` has an incomplete child task catalog",
+                    case.case_id
+                )));
+            }
+            let tasks = catalog
+                .tasks
+                .into_iter()
+                .map(|task| ProjectBatchCaseTaskSummaryResource {
+                    task_id: task.task_id,
+                    lifecycle: task.lifecycle.into(),
+                })
+                .collect();
+            (
+                ProjectRunCatalogState::Materialized,
+                Some(catalog.revision),
+                tasks,
+            )
+        }
+        None => (
+            ProjectRunCatalogState::PendingMaterialization,
+            None,
+            Vec::new(),
+        ),
+    };
+
+    Ok(ProjectBatchCasePublishedRunResource {
+        run_id: child_intent.run_id,
+        catalog_state,
+        catalog_revision,
+        tasks,
+    })
+}
+
+fn batch_case_idempotency_key(batch_id: &str, case_id: &str) -> String {
+    let identity = format!("{batch_id}\0{case_id}");
+    format!(
+        "batch-case-{}",
+        fullmag_session::hex_sha256(identity.as_bytes())
+    )
 }
 
 #[utoipa::path(
@@ -282,6 +409,481 @@ pub async fn submit_run(
 
 #[utoipa::path(
     post,
+    path = "/v2/persistence/projects/{project_id}/batches",
+    params(("project_id" = String, Path, description = "Pinned project identity")),
+    request_body = ProjectBatchSubmitRequest,
+    responses(
+        (status = 201, description = "Durable immutable batch parent accepted", body = ProjectBatchSubmitResource),
+        (status = 200, description = "Identical batch submit replayed", body = ProjectBatchSubmitResource),
+        (status = 400, description = "Invalid immutable batch inputs"),
+        (status = 409, description = "Project identity, batch identity or idempotency conflict")
+    ),
+    tag = "persistence"
+)]
+pub async fn submit_batch(
+    Path(project_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ProjectBatchSubmitRequest>,
+) -> Result<(StatusCode, Json<ProjectBatchSubmitResource>), ApiError> {
+    let project_id = ProjectId::parse(project_id)
+        .map_err(|error| ApiError::bad_request(format!("invalid project_id: {error}")))?;
+    let archive = STANDARD
+        .decode(request.archive_base64.as_bytes())
+        .map_err(|error| {
+            ApiError::bad_request(format!("invalid_project_archive_encoding: {error}"))
+        })?;
+    if archive.len() > PROJECT_ARCHIVE_MAX_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "project archive exceeds {} byte transport limit",
+            PROJECT_ARCHIVE_MAX_BYTES
+        )));
+    }
+    let batch_request: BatchExpansionRequest = serde_json::from_value(serde_json::Value::Object(
+        request.batch_request.into_iter().collect(),
+    ))
+    .map_err(|error| ApiError::bad_request(format!("invalid_batch_request: {error}")))?;
+    let study: StudyPlan = serde_json::from_value(serde_json::Value::Object(
+        request.study_plan.into_iter().collect(),
+    ))
+    .map_err(|error| ApiError::bad_request(format!("invalid_study_plan: {error}")))?;
+    let catalog: StudyProblemCatalog = serde_json::from_value(serde_json::Value::Object(
+        request.study_problem_catalog.into_iter().collect(),
+    ))
+    .map_err(|error| ApiError::bad_request(format!("invalid_study_problem_catalog: {error}")))?;
+    if batch_request.template.snapshot.project_id != project_id {
+        return Err(ApiError::conflict(
+            "batch template project_id differs from request path",
+        ));
+    }
+    let idempotency_key = request.idempotency_key;
+    let asset_paths = request.asset_paths;
+    let receipt = tokio::task::spawn_blocking(move || {
+        let store_root = state
+            .submit_store_root
+            .as_ref()
+            .ok_or_else(|| ApiError::internal("managed batch storage is not configured"))?;
+        let store = fullmag_session::SessionStore::open(store_root).map_err(|error| {
+            map_run_store_error(error, |error| ApiError::internal(error.to_string()))
+        })?;
+        let batch_already_accepted = store
+            .find_batch_intent(&idempotency_key)
+            .map_err(|error| ApiError::internal(format!("read batch intent: {error:#}")))?
+            .is_some();
+        if !batch_already_accepted {
+            execution_profile_submission::validate_published_profiles(&store, &study, &catalog)?;
+        }
+        let output_storage_defaults = if batch_already_accepted {
+            None
+        } else {
+            let settings = crate::router_v2::handlers::platform::output_storage::load_defaults()?;
+            settings.validate().map_err(|error| {
+                ApiError::internal(format!("resolved OutputStorage defaults are invalid: {error}"))
+            })?;
+            Some(settings)
+        };
+        let result = crate::run_intent_persistence::commit_archived_batch_intent(
+            &store,
+            &project_id,
+            &idempotency_key,
+            &batch_request,
+            &archive,
+            &study,
+            &catalog,
+            &asset_paths,
+            output_storage_defaults,
+        );
+        let receipt = result.map_err(|error| {
+            let detail = format!("{error:#}");
+            if detail.contains("idempotency key")
+                && detail.contains("already accepted for another payload")
+                || detail.contains("batch intent path already exists")
+            {
+                ApiError::conflict("batch identity or idempotency key is already in use")
+            } else {
+                map_run_store_error(error, |error| {
+                    ApiError::bad_request(format!("invalid_batch_submission: {error:#}"))
+                })
+            }
+        })?;
+        Ok::<_, ApiError>(receipt)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("batch submission task failed: {error}")))??;
+    let (status, disposition) = match receipt.disposition {
+        crate::run_intent_persistence::BatchSubmitDisposition::Accepted => {
+            (StatusCode::CREATED, ProjectRunSubmitDisposition::Accepted)
+        }
+        crate::run_intent_persistence::BatchSubmitDisposition::Replayed => {
+            (StatusCode::OK, ProjectRunSubmitDisposition::Replayed)
+        }
+    };
+    Ok((
+        status,
+        Json(ProjectBatchSubmitResource {
+            disposition,
+            batch_id: receipt.batch_id,
+            manifest_sha256: receipt.manifest_sha256,
+            case_count: receipt.case_count,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/persistence/projects/{project_id}/batches",
+    params(
+        ("project_id" = String, Path, description = "Pinned project identity"),
+        ProjectBatchListQuery
+    ),
+    responses(
+        (status = 200, description = "Page of durable batch parents for one project", body = ProjectBatchListResource),
+        (status = 400, description = "Invalid page size or cursor")
+    ),
+    tag = "persistence"
+)]
+pub async fn list_batches(
+    Path(project_id): Path<String>,
+    Query(query): Query<ProjectBatchListQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ProjectBatchListResource>, ApiError> {
+    let project_id = ProjectId::parse(project_id)
+        .map_err(|error| ApiError::bad_request(format!("invalid project_id: {error}")))?;
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(ApiError::bad_request(
+            "batch list limit must be from 1 to 100",
+        ));
+    }
+    let cursor = query
+        .cursor
+        .map(|value| {
+            fullmag_session::repository_path::validate_store_id(&value)
+                .map_err(|error| ApiError::bad_request(format!("invalid batch cursor: {error}")))?;
+            Ok::<_, ApiError>(value)
+        })
+        .transpose()?;
+    let resource = tokio::task::spawn_blocking(move || {
+        let store_root = state
+            .submit_store_root
+            .as_ref()
+            .ok_or_else(|| ApiError::internal("managed batch storage is not configured"))?;
+        if !store_root.exists() {
+            return Ok::<_, ApiError>(ProjectBatchListResource {
+                project_id: project_id.as_str().into(),
+                batches: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let store = fullmag_session::SessionStore::open_existing(store_root)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let mut matched = Vec::new();
+        for intent in store
+            .list_batch_intents()
+            .map_err(|error| ApiError::internal(format!("list durable batches: {error:#}")))?
+        {
+            if intent
+                .specification
+                .pointer("/request/template/snapshot/project_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(project_id.as_str())
+            {
+                continue;
+            }
+            let manifest_bytes = store
+                .cas()
+                .get(&intent.manifest_object_ref)
+                .map_err(|error| ApiError::internal(format!("read batch manifest: {error:#}")))?
+                .ok_or_else(|| ApiError::internal("durable batch manifest is missing"))?;
+            intent
+                .validate_manifest_bytes(&manifest_bytes)
+                .map_err(|error| ApiError::internal(format!("invalid batch manifest: {error:#}")))?;
+            let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+                .map_err(|error| ApiError::internal(format!("decode batch manifest: {error}")))?;
+            let case_count = manifest
+                .get("cases")
+                .and_then(serde_json::Value::as_array)
+                .map(|cases| cases.len() as u64)
+                .ok_or_else(|| ApiError::internal("batch manifest has no cases array"))?;
+            let progress = store
+                .read_batch_expansion_progress(&intent.batch_id)
+                .map_err(|error| ApiError::internal(format!("read batch expansion progress: {error:#}")))?;
+            let (published_case_count, expansion_state) = progress.map_or(
+                (0, ProjectBatchExpansionState::Pending),
+                |progress| {
+                    let state = match progress.state {
+                        fullmag_session::FmsBatchExpansionState::Pending => {
+                            ProjectBatchExpansionState::Pending
+                        }
+                        fullmag_session::FmsBatchExpansionState::Expanding => {
+                            ProjectBatchExpansionState::Expanding
+                        }
+                        fullmag_session::FmsBatchExpansionState::Complete => {
+                            ProjectBatchExpansionState::Complete
+                        }
+                        fullmag_session::FmsBatchExpansionState::Stopped => {
+                            ProjectBatchExpansionState::Stopped
+                        }
+                    };
+                    (progress.next_case_index, state)
+                },
+            );
+            let max_parallel_cases = intent
+                .specification
+                .pointer("/request/max_parallel_cases")
+                .and_then(serde_json::Value::as_u64)
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| ApiError::internal("batch max_parallel_cases exceeds u32"))?;
+            matched.push((
+                intent,
+                case_count,
+                max_parallel_cases,
+                published_case_count,
+                expansion_state,
+            ));
+        }
+        let start = if let Some(cursor) = cursor {
+            matched
+                .iter()
+                .position(|(intent, _, _, _, _)| intent.batch_id == cursor)
+                .map(|position| position + 1)
+                .ok_or_else(|| ApiError::bad_request("batch cursor is not in this project"))?
+        } else {
+            0
+        };
+        let mut page = matched
+            .into_iter()
+            .skip(start)
+            .take(limit as usize + 1)
+            .collect::<Vec<_>>();
+        let has_more = page.len() > limit as usize;
+        if has_more {
+            page.pop();
+        }
+        let next_cursor = if has_more {
+            page.last().map(|(intent, _, _, _, _)| intent.batch_id.clone())
+        } else {
+            None
+        };
+        let batches = page
+            .into_iter()
+            .map(|(intent, case_count, max_parallel_cases, published_case_count, expansion_state)| {
+                let manifest_sha256 = intent
+                    .specification
+                    .get("manifest_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| ApiError::internal("batch intent has no manifest digest"))?;
+                let failure_policy = match intent
+                    .specification
+                    .pointer("/request/failure_policy")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("continue_independent")
+                {
+                    "continue_independent" => ProjectBatchFailurePolicy::ContinueIndependent,
+                    "stop_admission" => ProjectBatchFailurePolicy::StopAdmission,
+                    _ => return Err(ApiError::internal("batch intent has an invalid failure policy")),
+                };
+                Ok(ProjectBatchSummaryResource {
+                    batch_id: intent.batch_id,
+                    accepted_at: intent.accepted_at.to_rfc3339(),
+                    manifest_sha256: manifest_sha256.to_string(),
+                    case_count,
+                    max_parallel_cases,
+                    failure_policy,
+                    published_case_count,
+                    expansion_state,
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok::<_, ApiError>(ProjectBatchListResource {
+            project_id: project_id.as_str().into(),
+            batches,
+            next_cursor,
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("batch list task failed: {error}")))??;
+    Ok(Json(resource))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/persistence/projects/{project_id}/batches/{batch_id}/cases",
+    params(
+        ("project_id" = String, Path, description = "Pinned project identity"),
+        ("batch_id" = String, Path, description = "Durable batch identity"),
+        ProjectBatchCasesQuery
+    ),
+    responses(
+        (status = 200, description = "Page of manifest cases with verified published child run and task catalog lifecycle", body = ProjectBatchCasesResource),
+        (status = 400, description = "Invalid page size or cursor"),
+        (status = 404, description = "Accepted batch is missing"),
+        (status = 409, description = "Batch belongs to another project"),
+        (status = 500, description = "Durable manifest, child run, or task catalog is incomplete or inconsistent")
+    ),
+    tag = "persistence"
+)]
+pub async fn list_batch_cases(
+    Path((project_id, batch_id)): Path<(String, String)>,
+    Query(query): Query<ProjectBatchCasesQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ProjectBatchCasesResource>, ApiError> {
+    let project_id = ProjectId::parse(project_id)
+        .map_err(|error| ApiError::bad_request(format!("invalid project_id: {error}")))?;
+    fullmag_session::repository_path::validate_store_id(&batch_id)
+        .map_err(|error| ApiError::bad_request(format!("invalid batch_id: {error}")))?;
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(ApiError::bad_request(
+            "batch case list limit must be from 1 to 100",
+        ));
+    }
+    let cursor = query.cursor;
+    let resource = tokio::task::spawn_blocking(move || {
+        let store_root = state
+            .submit_store_root
+            .as_ref()
+            .ok_or_else(|| ApiError::internal("managed batch storage is not configured"))?;
+        let store = open_existing_run_store(store_root)?;
+        let intent = store
+            .read_batch_intent(&batch_id)
+            .map_err(|error| ApiError::internal(format!("read batch intent: {error:#}")))?
+            .ok_or_else(|| ApiError::not_found("accepted batch is missing"))?;
+        if intent
+            .specification
+            .pointer("/request/template/snapshot/project_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(project_id.as_str())
+        {
+            return Err(ApiError::conflict("batch belongs to another project"));
+        }
+        let manifest_bytes = store
+            .cas()
+            .get(&intent.manifest_object_ref)
+            .map_err(|error| ApiError::internal(format!("read batch manifest: {error:#}")))?
+            .ok_or_else(|| ApiError::internal("durable batch manifest is missing"))?;
+        let manifest: fullmag_application::BatchExpansionManifest =
+            serde_json::from_slice(&manifest_bytes)
+                .map_err(|error| ApiError::internal(format!("decode batch manifest: {error}")))?;
+        manifest
+            .validate_integrity()
+            .map_err(|error| ApiError::internal(format!("invalid batch manifest: {error:#}")))?;
+        if manifest.batch_id != batch_id {
+            return Err(ApiError::internal("batch manifest identity differs from its path"));
+        }
+        let axes = manifest
+            .axes
+            .iter()
+            .map(|axis| ProjectBatchAxisSummaryResource {
+                name: axis.name.clone(),
+                canonical_unit: axis.canonical_unit.clone(),
+            })
+            .collect();
+        let progress = store
+            .read_batch_expansion_progress(&batch_id)
+            .map_err(|error| ApiError::internal(format!("read batch expansion progress: {error:#}")))?;
+        let published_case_count = progress.map_or(0, |progress| progress.next_case_index);
+        let total_case_count = u64::try_from(manifest.cases.len())
+            .map_err(|_| ApiError::internal("batch manifest case count exceeds u64"))?;
+        if published_case_count > total_case_count {
+            return Err(ApiError::internal(
+                "batch expansion cursor exceeds the immutable manifest",
+            ));
+        }
+        let start = if let Some(cursor) = cursor {
+            fullmag_session::repository_path::validate_store_id(&cursor)
+                .map_err(|error| ApiError::bad_request(format!("invalid case cursor: {error}")))?;
+            manifest
+                .cases
+                .iter()
+                .position(|case| case.case_id == cursor)
+                .map(|position| position + 1)
+                .ok_or_else(|| ApiError::bad_request("case cursor is not in this batch"))?
+        } else {
+            0
+        };
+        let mut page = manifest
+            .cases
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(limit as usize + 1)
+            .collect::<Vec<_>>();
+        let has_more = page.len() > limit as usize;
+        if has_more {
+            page.pop();
+        }
+        let next_cursor = if has_more {
+            page.last().map(|(_, case)| case.case_id.clone())
+        } else {
+            None
+        };
+        let cases = page
+            .into_iter()
+            .map(|(case_index, case)| {
+                let case_index = u64::try_from(case_index)
+                    .map_err(|_| ApiError::internal("batch case index exceeds u64"))?;
+                let child_intent = store
+                    .read_run_intent(case.specification.run_id.as_str())
+                    .map_err(|error| {
+                        ApiError::internal(format!("read batch child run intent: {error:#}"))
+                    })?;
+                let published_run = match child_intent {
+                    Some(child_intent) => {
+                        if case_index > published_case_count {
+                            return Err(ApiError::internal(format!(
+                                "batch case `{}` has a durable child beyond the contiguous expansion cursor",
+                                case.case_id
+                            )));
+                        }
+                        Some(project_batch_case_published_run(
+                            &store,
+                            &intent,
+                            &project_id,
+                            case,
+                            child_intent,
+                        )?)
+                    }
+                    None if case_index < published_case_count => {
+                        return Err(ApiError::internal(format!(
+                            "batch expansion cursor includes case `{}` without a durable child run",
+                            case.case_id
+                        )));
+                    }
+                    None => None,
+                };
+                let state = match published_run.as_ref().map(|run| run.catalog_state) {
+                    Some(ProjectRunCatalogState::Materialized) => {
+                        ProjectBatchCaseState::Materialized
+                    }
+                    Some(ProjectRunCatalogState::PendingMaterialization) => {
+                        ProjectBatchCaseState::PendingMaterialization
+                    }
+                    None => ProjectBatchCaseState::PendingExpansion,
+                };
+                Ok(ProjectBatchCaseSummaryResource {
+                    case_id: case.case_id.clone(),
+                    planned_run_id: case.specification.run_id.as_str().into(),
+                    parameter_tuple: case.parameter_tuple.clone(),
+                    state,
+                    published_run,
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok::<_, ApiError>(ProjectBatchCasesResource {
+            batch_id,
+            axes,
+            cases,
+            next_cursor,
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("batch case list task failed: {error}")))??;
+    Ok(Json(resource))
+}
+
+#[utoipa::path(
+    post,
     path = "/v2/persistence/projects/{project_id}/runs/{run_id}/materialization",
     params(
         ("project_id" = String, Path, description = "Pinned project identity"),
@@ -349,11 +951,11 @@ pub async fn materialize_run(
     ),
     request_body = ProjectRunTaskCancellationRequest,
     responses(
-        (status = 202, description = "Durable Stop command accepted", body = ProjectRunTaskCancellationResource),
-        (status = 200, description = "Identical Stop command replayed", body = ProjectRunTaskCancellationResource),
+        (status = 202, description = "Durable Stop command or pre-claim cancellation request accepted", body = ProjectRunTaskCancellationResource),
+        (status = 200, description = "Identical cancellation request replayed", body = ProjectRunTaskCancellationResource),
         (status = 400, description = "Invalid task identity or cancellation reason"),
         (status = 404, description = "Accepted run intent is missing"),
-        (status = 409, description = "Task is not preparing/running or a conflicting cancellation exists")
+        (status = 409, description = "Task state, catalog revision or cancellation identity conflicts")
     ),
     tag = "persistence"
 )]
@@ -368,64 +970,143 @@ pub async fn cancel_run_task(
         .map_err(|error| ApiError::bad_request(format!("invalid run_id: {error}")))?;
     let task_id = fullmag_application::TaskId::parse(task_id)
         .map_err(|error| ApiError::bad_request(format!("invalid task_id: {error}")))?;
-    if request.reason.trim().is_empty() {
+    if request.reason.trim().is_empty()
+        || (request.cancellation_id.is_some() && request.reason.len() > 4096)
+    {
         return Err(ApiError::bad_request(
-            "cancellation reason must not be empty",
+            "cancellation reason must be nonempty and at most 4096 bytes",
         ));
     }
-    let response_run_id = run_id.as_str().to_owned();
-    let response_task_id = task_id.as_str().to_owned();
-    let reason = request.reason;
+    if request.cancellation_id.is_some() != request.expected_catalog_revision.is_some() {
+        return Err(ApiError::bad_request(
+            "cancellation_id and expected_catalog_revision must be supplied together",
+        ));
+    }
+    if let Some(id) = &request.cancellation_id {
+        fullmag_application::TaskId::parse(id)
+            .map_err(|error| ApiError::bad_request(format!("invalid cancellation_id: {error}")))?;
+        if request.expected_catalog_revision == Some(0) {
+            return Err(ApiError::bad_request(
+                "expected_catalog_revision must be positive",
+            ));
+        }
+    }
     let result = tokio::task::spawn_blocking(move || {
         let store_root = state
             .submit_store_root
             .as_ref()
             .ok_or_else(|| ApiError::internal("managed project run storage is not configured"))?;
         let store = open_existing_run_store(store_root)?;
-        let intent = store
+        let run_intent = store
             .read_run_intent(run_id.as_str())
             .map_err(|error| ApiError::internal(error.to_string()))?
             .ok_or_else(|| ApiError::not_found("accepted run intent is missing"))?;
-        let specification: RunSpecification = serde_json::from_value(intent.specification)
+        let specification: RunSpecification = serde_json::from_value(run_intent.specification)
             .map_err(|error| ApiError::internal(format!("invalid durable RunSpec: {error}")))?;
         if specification.snapshot.project_id != project_id {
             return Err(ApiError::conflict("run belongs to another project"));
         }
-        fullmag_runtime_control::request_accepted_task_stop(
+        if let (Some(id), Some(revision)) =
+            (request.cancellation_id, request.expected_catalog_revision)
+        {
+            let _writer = store.write_transaction().map_err(|error| {
+                map_run_store_error(error, |error| {
+                    ApiError::internal(format!("acquiring cancellation writer: {error:#}"))
+                })
+            })?;
+            let (disposition, intent, current_revision) = store
+                .request_task_cancellation_intent(
+                    run_id.as_str(),
+                    task_id.as_str(),
+                    &id,
+                    revision,
+                    &request.reason,
+                )
+                .map_err(|error| {
+                    map_run_store_error(error, |error| {
+                        if let Some(conflict) = error.downcast_ref::<fullmag_session::TaskCancellationIntentConflict>() {
+                            let code = match conflict {
+                                fullmag_session::TaskCancellationIntentConflict::CatalogRevision { expected, actual } if actual > expected => "run_task_cancel_revision_conflict",
+                                fullmag_session::TaskCancellationIntentConflict::IntentConflict => "run_task_cancel_identity_conflict",
+                                _ => "run_task_cancel_state_conflict",
+                            };
+                            ApiError::conflict_with_code(code, format!("{error:#}"))
+                        } else {
+                            ApiError::internal(format!("recording cancellation intent: {error:#}"))
+                        }
+                    })
+                })?;
+            let catalog = store
+                .read_run_catalog(run_id.as_str())
+                .map_err(|error| ApiError::internal(error.to_string()))?
+                .ok_or_else(|| ApiError::internal("cancellation catalog disappeared"))?;
+            let task = catalog
+                .tasks
+                .into_iter()
+                .find(|task| task.task_id == task_id.as_str())
+                .ok_or_else(|| ApiError::internal("cancellation task disappeared"))?;
+            let (status, disposition) = match disposition {
+                fullmag_session::TaskCancellationIntentCommitDisposition::Recorded => (
+                    StatusCode::ACCEPTED,
+                    ProjectRunTaskCancellationDisposition::Accepted,
+                ),
+                fullmag_session::TaskCancellationIntentCommitDisposition::Replayed => (
+                    StatusCode::OK,
+                    ProjectRunTaskCancellationDisposition::Replayed,
+                ),
+            };
+            return Ok((
+                status,
+                ProjectRunTaskCancellationResource::Requested(
+                    ProjectRunTaskCancellationIntentResource {
+                        disposition,
+                        run_id: run_id.as_str().into(),
+                        task_id: task_id.as_str().into(),
+                        cancellation_id: intent.cancellation_id,
+                        cancellation_state: ProjectRunTaskCancellationState::Requested,
+                        lifecycle: ProjectRunTaskResource::from(task).lifecycle,
+                        catalog_revision: current_revision,
+                        expected_catalog_revision: intent.expected_catalog_revision,
+                    },
+                ),
+            ));
+        }
+        let stopped = fullmag_runtime_control::request_accepted_task_stop(
             &store,
             &run_id,
             task_id.as_str(),
-            &reason,
+            &request.reason,
         )
         .map_err(|error| {
             map_run_store_error(error, |error| {
                 ApiError::conflict_with_code("run_task_cancel_rejected", format!("{error:#}"))
             })
-        })
+        })?;
+        let (status, disposition) = match stopped.disposition {
+            fullmag_runtime_control::AcceptedTaskStopDisposition::Accepted => (
+                StatusCode::ACCEPTED,
+                ProjectRunTaskCancellationDisposition::Accepted,
+            ),
+            fullmag_runtime_control::AcceptedTaskStopDisposition::Replayed => (
+                StatusCode::OK,
+                ProjectRunTaskCancellationDisposition::Replayed,
+            ),
+        };
+        Ok((
+            status,
+            ProjectRunTaskCancellationResource::Stop(ProjectRunTaskStopResource {
+                disposition,
+                run_id: run_id.as_str().into(),
+                task_id: task_id.as_str().into(),
+                command_id: stopped.command.message_id,
+                lifecycle: ProjectRunTaskLifecycle::Stopping,
+                catalog_revision: stopped.catalog_revision,
+            }),
+        ))
     })
     .await
     .map_err(|error| ApiError::internal(format!("run cancellation task failed: {error}")))??;
-    let (status, disposition) = match result.disposition {
-        fullmag_runtime_control::AcceptedTaskStopDisposition::Accepted => (
-            StatusCode::ACCEPTED,
-            ProjectRunTaskCancellationDisposition::Accepted,
-        ),
-        fullmag_runtime_control::AcceptedTaskStopDisposition::Replayed => (
-            StatusCode::OK,
-            ProjectRunTaskCancellationDisposition::Replayed,
-        ),
-    };
-    Ok((
-        status,
-        Json(ProjectRunTaskCancellationResource {
-            disposition,
-            run_id: response_run_id,
-            task_id: response_task_id,
-            command_id: result.command.message_id,
-            lifecycle: ProjectRunTaskLifecycle::Stopping,
-            catalog_revision: result.catalog_revision,
-        }),
-    ))
+    Ok((result.0, Json(result.1)))
 }
 
 fn open_existing_run_store(root: &FsPath) -> Result<fullmag_session::SessionStore, ApiError> {
@@ -539,6 +1220,7 @@ pub async fn get_run(
                             &store,
                             run_id.as_str(),
                             artifact_catalog.as_ref(),
+                            catalog.revision,
                             task,
                         )
                     })

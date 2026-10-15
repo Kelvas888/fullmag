@@ -2,11 +2,19 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { usePlatformCapabilitiesResource } from "@/kernel/resources/runtimeExplorerResources";
+import {
+  usePlatformCapabilitiesResource,
+  usePlatformComputeNodesResource,
+} from "@/kernel/resources/runtimeExplorerResources";
 import { useCpuTelemetryResource, useGpuTelemetryResource } from "@/kernel/resources/studyRuntimeResources";
 
 import { probeCompute } from "./computeProbe";
-import { computeFromTelemetry, describeRuntimeLanes } from "./computeTelemetry";
+import {
+  computeFromTelemetry,
+  describeRuntimeLanes,
+  isTelemetrySampleStale,
+} from "./computeTelemetry";
+import { summarizeComputeNodeInventory } from "./computeNodeInventory";
 import type { ComputeProbeController, ComputeProbeState } from "./types";
 
 export const COMPUTE_POLL_MS = 5000;
@@ -16,6 +24,19 @@ export function useComputeProbe(): ComputeProbeController {
   const cpu = useCpuTelemetryResource();
   const gpu = useGpuTelemetryResource();
   const capabilities = usePlatformCapabilitiesResource();
+  const nodeInventoryResource = usePlatformComputeNodesResource();
+  const nodeInventoryData = nodeInventoryResource.data;
+  const nodeInventoryStatus = nodeInventoryResource.status;
+  const nodeInventoryRefreshError = nodeInventoryResource.refreshError;
+  const [freshnessNow, setFreshnessNow] = useState<number | undefined>(undefined);
+  const nodeInventory = useMemo(
+    () => summarizeComputeNodeInventory({
+      data: nodeInventoryData,
+      status: nodeInventoryStatus,
+      refreshError: nodeInventoryRefreshError,
+    }, freshnessNow),
+    [freshnessNow, nodeInventoryData, nodeInventoryRefreshError, nodeInventoryStatus],
+  );
   const [desktop, setDesktop] = useState<ComputeProbeState>(undefined);
   const [desktopRefreshing, setDesktopRefreshing] = useState(false);
   const [desktopFailed, setDesktopFailed] = useState(false);
@@ -53,19 +74,24 @@ export function useComputeProbe(): ComputeProbeController {
   const { refetch: refetchCpu } = cpu;
   const { refetch: refetchGpu } = gpu;
   const { refetch: refetchCapabilities } = capabilities;
+  const { refetch: refetchNodeInventory } = nodeInventoryResource;
   const refresh = useCallback(() => {
+    setFreshnessNow(Date.now());
     refetchCpu();
     refetchGpu();
     refetchCapabilities();
+    refetchNodeInventory();
     setDesktopRefreshId((id) => id + 1);
-  }, [refetchCpu, refetchGpu, refetchCapabilities]);
+  }, [refetchCpu, refetchGpu, refetchCapabilities, refetchNodeInventory]);
 
   // Sampling owns no extra cache or transport. Hidden windows do not request samples.
   useEffect(() => {
     const sample = () => {
       if (document.hidden) return;
+      setFreshnessNow(Date.now());
       if (cpu.data?.status === "available" && cpu.status === "ready") refetchCpu();
       if (gpu.data?.status === "available" && gpu.status === "ready") refetchGpu();
+      refetchNodeInventory();
     };
     const timer = setInterval(sample, COMPUTE_POLL_MS);
     document.addEventListener("visibilitychange", sample);
@@ -73,7 +99,15 @@ export function useComputeProbe(): ComputeProbeController {
       clearInterval(timer);
       document.removeEventListener("visibilitychange", sample);
     };
-  }, [cpu.data?.status, cpu.status, gpu.data?.status, gpu.status, refetchCpu, refetchGpu]);
+  }, [
+    cpu.data?.status,
+    cpu.status,
+    gpu.data?.status,
+    gpu.status,
+    refetchCpu,
+    refetchGpu,
+    refetchNodeInventory,
+  ]);
 
   const compute = useMemo<ComputeProbeState>(() => {
     if (!gpu.data && gpu.status === "loading" && !desktop) return undefined;
@@ -94,14 +128,27 @@ export function useComputeProbe(): ComputeProbeController {
   const resources = [cpu, gpu, capabilities];
   const usingDesktop = needsDesktop && Boolean(desktop);
   const observedResources = usingDesktop ? [capabilities] : resources;
-  const stale = observedResources.some((resource) => resource.data &&
-    (resource.status === "error" || resource.refreshError)) || (usingDesktop && desktopFailed);
+  const sampleTimes = usingDesktop
+    ? [desktop?.sampledAt]
+    : [
+        cpu.data?.status === "available" ? cpu.data.sample_time_unix_ms : undefined,
+        gpu.data?.status === "available" ? gpu.data.sample_time_unix_ms : undefined,
+      ];
+  const staleByAge = freshnessNow !== undefined &&
+    sampleTimes.some((timestamp) => isTelemetrySampleStale(timestamp, freshnessNow));
+  const stale = staleByAge ||
+    observedResources.some((resource) => resource.data &&
+      (resource.status === "error" || resource.refreshError)) || (usingDesktop && desktopFailed);
   const failed = observedResources.some((resource) => resource.status === "error" || resource.refreshError) ||
     (usingDesktop && desktopFailed);
   return {
     compute,
-    refreshing: (needsDesktop && desktopRefreshing) || resources.some((resource) =>
-      resource.status === "loading" || (resource.status === "stale" && !resource.refreshError)),
+    nodeInventory,
+    refreshing: (needsDesktop && desktopRefreshing) ||
+      nodeInventoryResource.status === "loading" ||
+      (nodeInventoryResource.status === "stale" && !nodeInventoryResource.refreshError) ||
+      resources.some((resource) =>
+        resource.status === "loading" || (resource.status === "stale" && !resource.refreshError)),
     stale,
     error: failed
       ? stale

@@ -37,7 +37,7 @@ import type { MeshSizeHistogramHighlight } from "@/kernel/events/eventTypes";
 import { useMeshHistogramBinElementsResource } from "@/kernel/resources/geometryLifecycleResources";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { sessionResourceIdentityKey, type SessionResourceIdentity } from "@/kernel/resources/sessionResourceIdentity";
-import { useFieldMetaResource } from "@/kernel/resources/studyRuntimeResources";
+import { useFieldMetaResource, useSolverStatusResource } from "@/kernel/resources/studyRuntimeResources";
 import {
   frozenSpinsMaskIdFromResource,
   useFrozenSpinsActivePreviewId,
@@ -59,6 +59,7 @@ import {
   type SemanticRenderTargetCatalog,
 } from "@/kernel/selection/semanticRenderTargetCatalog";
 import { WorkspaceRenderProfiler } from "@/kernel/performance/reactRenderProfiler";
+import { useObjectEditSelector } from "@/kernel/authoring/object-edit/useObjectEditSelector";
 import { recordVisualizationDebugResourceCounts } from "@/kernel/performance/visualizationDebugPerformanceProbe";
 import type { ModuleProps } from "@/kernel/types";
 import {
@@ -90,6 +91,7 @@ import {
 } from "@/shared/ui/Dialog";
 
 import { useViewport3DColors } from "./hooks/useViewport3DColors";
+import { withObjectPlacementDraftPreview } from "./viewport3dPrimitiveModel";
 import {
   useViewport3DSceneModel,
   type Viewport3DFieldDataIssue,
@@ -116,13 +118,16 @@ import {
 import { Viewport3DScene } from "./layers/Viewport3DScene";
 import {
   useViewport3DObjectMoveInteraction,
-  Viewport3DMoveConflictPanel,
+  Viewport3DMoveStatus,
 } from "./Viewport3DObjectMoveInteraction";
 import type { Viewport3DAirboxFrameState } from "./layers/Viewport3DScene";
 import { recordViewport3DCameraTrajectorySample } from "./layers/viewport3DCameraTrajectoryProbe";
 import { resolveViewport3DTargetSurfaceLayerInput } from "./layers/viewport3DLayerPassInputs";
 import type { RegionOverlaySelection } from "./layers/RegionOverlayLayer";
-import { buildFrozenSpinsOverlayModel } from "./layers/FrozenSpinsOverlay";
+import {
+  buildFrozenSpinsOverlayModel,
+  buildFrozenSpinsOverlayModelFromField,
+} from "./layers/FrozenSpinsOverlay";
 import {
   DEFAULT_REGION_DIAGNOSTIC_OVERLAY_STATE,
   regionDiagnosticOverlayMode,
@@ -163,6 +168,9 @@ import {
 } from "./viewport3dDiagnostics";
 import { useViewport3DWorkerRuntime } from "./viewport3dWorkerRuntime";
 import { createViewport3DEventManager } from "./viewport3dEventManager";
+import {
+  useViewport3DFieldVectorRequest,
+} from "./viewport3dResources";
 import { retainViewport3DMeshSizeHighlight } from "./viewport3dMeshSizeHighlight";
 import {
   formatViewport3DInspectComponents,
@@ -205,8 +213,7 @@ import {
   type Viewport3DVisualProfile,
 } from "./viewport3dVisualProfile";
 import {
-  beginViewport3DFieldUpdateHold,
-  endViewport3DFieldUpdateHold,
+  createViewport3DInteractionFieldHold,
 } from "./viewport3dFieldUpdateHold";
 import type { ScalarColorBuffer } from "./viewport3dFieldMapping";
 import { installViewport3DThreeConsolePolicy } from "./viewport3dThreeConsolePolicy";
@@ -1339,6 +1346,8 @@ interface Viewport3DFrameProps
     | "moveToolObjectId"
     | "onOrbitDebugAnglesChange"
     | "onMoveCommit"
+    | "onBeginGesture"
+    | "onMoveGestureActiveChange"
     | "onVisualizationFrameCommitted"
     | "orbitDebugAngles"
     | "orbitDebugCommitRevision"
@@ -1374,14 +1383,14 @@ interface Viewport3DFrameProps
   onRegionOverlayVisibilityChange: (visible: boolean) => void;
   regionDiagnosticOverlayState: RegionDiagnosticOverlayState;
   quantityId: string;
+  /** Human label for the HUD: the mode while a mode field is the viewport quantity. */
+  quantityLabel: string;
   renderedMeshRevision: number | string | null;
   scalarColorPalette: string;
   savedViewportActive: boolean;
   sessionIdentity: SessionResourceIdentity | null;
+  sessionDiscretization: "fdm" | "fem" | null;
   selectedLabel: string;
-  sceneRefetch: () => void;
-  sceneRevision: number | null;
-  sceneStatus: string;
   slotId: ModuleProps["slotId"];
   status: string;
   topologyRevision: number | string | null;
@@ -1455,6 +1464,36 @@ export default function Viewport3DModule({
     selection,
     tracker,
   });
+  const solverStatus = useSolverStatusResource({ enabled: true });
+  const runtimeFrozenSpins = solverStatus.data?.frozen_spins ?? null;
+  const runtimeFrozenSpinsFieldRequest = useMemo(
+    () => ({
+      consumers: ["frozen-spins-runtime-overlay"],
+      quantityId: "frozen_spins",
+      query: { component: "full", scope_kind: "full" } as const,
+      requestId: "frozen_spins-runtime-overlay",
+    }),
+    [],
+  );
+  const runtimeFrozenSpinsFieldEnabled = Boolean(solverStatus.data?.run_id);
+  const runtimeFrozenSpinsFieldResource = useViewport3DFieldVectorRequest(
+    runtimeFrozenSpinsFieldRequest,
+    runtimeFrozenSpinsFieldEnabled,
+  );
+  const runtimeFrozenSpinsFieldVector = runtimeFrozenSpinsFieldResource.data;
+  const objectEditSnapshot = useObjectEditSelector(kernel.objectEditSession);
+  const primitiveModelWithPlacementDraft = useMemo(
+    () => withObjectPlacementDraftPreview(
+      sceneModel.primitiveModel,
+      objectEditSnapshot.draft,
+      sceneModel.selectedObjectId,
+    ),
+    [
+      objectEditSnapshot.draft,
+      sceneModel.primitiveModel,
+      sceneModel.selectedObjectId,
+    ],
+  );
   const {
     beginInteraction: beginSavedCameraInteraction,
     endInteraction: endSavedCameraInteraction,
@@ -1522,6 +1561,35 @@ export default function Viewport3DModule({
       sceneModel.fdmDomain,
     ],
   );
+  const runtimeFrozenSpinsRunId = solverStatus.data?.run_id ?? "";
+  const runtimeFrozenSpinsFieldRevision =
+    runtimeFrozenSpinsFieldResource.payloadRevision ?? "field";
+  const runtimeFrozenSpinsPreviewId = runtimeFrozenSpinsRunId
+    ? `runtime:${runtimeFrozenSpinsRunId}:${runtimeFrozenSpins?.mask_sha256 ?? runtimeFrozenSpinsFieldRevision}`
+    : "";
+  const runtimeFrozenSpinsOverlayModel = useMemo(
+    () =>
+      buildFrozenSpinsOverlayModelFromField({
+        current: true,
+        expectedTopologyFingerprint: runtimeFrozenSpins?.topology_fingerprint,
+        fdmDomain: sceneModel.fdmDomain,
+        femCarrier: femFrozenSpinsCarrier,
+        fieldVector: runtimeFrozenSpinsFieldVector,
+        maskSha256:
+          runtimeFrozenSpins?.mask_sha256 ?? runtimeFrozenSpinsFieldRevision,
+        previewId: runtimeFrozenSpinsPreviewId,
+      }),
+    [
+      femFrozenSpinsCarrier,
+      runtimeFrozenSpins,
+      runtimeFrozenSpinsFieldRevision,
+      runtimeFrozenSpinsFieldVector,
+      runtimeFrozenSpinsPreviewId,
+      sceneModel.fdmDomain,
+    ],
+  );
+  const effectiveFrozenSpinsOverlayModel =
+    frozenSpinsOverlayModel ?? runtimeFrozenSpinsOverlayModel;
   const { onSelectDomain, onSelectFdmCell, onSelectFdmTarget, onSelectFdmUniverseOutsideSupport, onSelectObject, onSelectPart, onSelectPlanarMonitor, onSelectRegion } =
     useViewport3DSelectionHandlers({
       domainId,
@@ -1647,44 +1715,26 @@ export default function Viewport3DModule({
     },
     [kernel.cameraRegistry, saveSavedCameraState, sceneModel.savedViewportActive],
   );
-  const cameraFieldUpdateHoldRef = useRef(false);
+  const cameraFieldUpdateHold = useMemo(() => createViewport3DInteractionFieldHold(), []);
   const beginCameraInteraction = useCallback((epoch?: number) => {
-    if (!cameraFieldUpdateHoldRef.current) {
-      cameraFieldUpdateHoldRef.current = true;
-      beginViewport3DFieldUpdateHold();
-    }
+    cameraFieldUpdateHold.begin(epoch);
     if (sceneModel.savedViewportActive) {
       beginSavedCameraInteraction(epoch);
-      return;
+    } else {
+      kernel.cameraRegistry.beginInteraction(epoch);
     }
-    kernel.cameraRegistry.beginInteraction(epoch);
-  }, [
-    beginSavedCameraInteraction,
-    kernel.cameraRegistry,
-    sceneModel.savedViewportActive,
-  ]);
+  }, [cameraFieldUpdateHold, beginSavedCameraInteraction, kernel.cameraRegistry, sceneModel.savedViewportActive]);
   const endCameraInteraction = useCallback((epoch?: number) => {
     if (sceneModel.savedViewportActive) {
       endSavedCameraInteraction(epoch);
     } else {
       kernel.cameraRegistry.endInteraction(epoch);
     }
-    if (cameraFieldUpdateHoldRef.current) {
-      cameraFieldUpdateHoldRef.current = false;
-      endViewport3DFieldUpdateHold();
-    }
-  }, [
-    endSavedCameraInteraction,
-    kernel.cameraRegistry,
-    sceneModel.savedViewportActive,
-  ]);
+    cameraFieldUpdateHold.end(epoch);
+  }, [cameraFieldUpdateHold, endSavedCameraInteraction, kernel.cameraRegistry, sceneModel.savedViewportActive]);
   useEffect(
-    () => () => {
-      if (!cameraFieldUpdateHoldRef.current) return;
-      cameraFieldUpdateHoldRef.current = false;
-      endViewport3DFieldUpdateHold();
-    },
-    [],
+    () => () => cameraFieldUpdateHold.end(),
+    [cameraFieldUpdateHold],
   );
   useEffect(() => {
     if (!sceneModel.savedViewportActive) return;
@@ -1725,6 +1775,7 @@ export default function Viewport3DModule({
         <WorkspaceRenderProfiler id="Viewport3DModule">
         <Viewport3DFrame
       {...sceneModel}
+      primitiveModel={primitiveModelWithPlacementDraft ?? null}
       clientReady={clientReady}
       colors={colors}
       cameraDialogOpen={commandState.widgets.cameraDialogOpen}
@@ -1740,7 +1791,7 @@ export default function Viewport3DModule({
       onCameraPatch={patchCameraState}
       onClearSelection={clear}
       onFdmUniverseOverlayVisibilityChange={changeFdmUniverseOverlayVisibility}
-      frozenSpinsOverlayModel={frozenSpinsOverlayModel}
+      frozenSpinsOverlayModel={effectiveFrozenSpinsOverlayModel}
       frozenSpinsOverlayVisible={frozenSpinsOverlayVisible}
       onFrozenSpinsOverlayVisibilityChange={setFrozenSpinsOverlayVisible}
       onRegionOverlaySourceChange={changeRegionOverlaySource}
@@ -1960,12 +2011,11 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   onRegionOverlayVisibilityChange,
   regionDiagnosticOverlayState,
   quantityId,
+  quantityLabel,
   savedViewportActive,
   sessionIdentity,
+  sessionDiscretization,
   selectedLabel,
-  sceneRefetch,
-  sceneRevision,
-  sceneStatus,
   slotId,
   status,
   visualizationEffectiveRenderMode,
@@ -1980,6 +2030,11 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
         (object) => object.objectId === antennaFieldOverlay.intent.sourceObjectId,
       )?.label ?? antennaFieldOverlay.intent.sourceObjectId
     : null;
+  const createCanvasEvents = useCallback(
+    (store: Parameters<typeof createViewport3DEventManager>[0]) =>
+      createViewport3DEventManager(store, () => kernel.objectMoveTool.getSnapshot() !== null),
+    [kernel.objectMoveTool],
+  );
   const pendingCaptureRevisionRef = useRef<number | null>(null);
   const primitiveObjectIds =
     sceneProps.primitiveModel?.objects
@@ -2024,9 +2079,6 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   );
   const moveInteraction = useViewport3DObjectMoveInteraction({
     moveTargetEligible,
-    sceneRefetch,
-    sceneRevision,
-    sceneStatus,
     selectedObjectId: sceneProps.selectedObjectId,
     sessionId: sessionIdentity?.sessionId ?? null,
   });
@@ -2101,11 +2153,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     }),
     [initialCameraFit.far, initialCameraFit.near],
   );
-  const discretizationKind = sceneProps.fdmDomain
-    ? "FDM"
-    : sceneProps.femDomain.magneticParts.length > 0
-      ? "FEM"
-      : null;
+  const discretizationKind = sessionDiscretization?.toUpperCase() ?? null;
   const meshQualityLegend = resolveViewport3DMeshQualityLegend(
     sceneProps.meshQualityOverlayVisible,
     meshQualityMetric,
@@ -2617,6 +2665,9 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       data-frozen-spins-preview-current={
         sceneProps.frozenSpinsOverlayModel?.current ? "true" : "false"
       }
+      data-frozen-spins-overlay-source={
+        sceneProps.frozenSpinsOverlayModel?.source ?? "none"
+      }
       data-inspect-enabled={sceneProps.inspectEnabled ? "true" : "false"}
       data-primitive-object-count={sceneProps.primitiveModel?.objects.length ?? 0}
       data-primitive-object-ids={primitiveObjectIds}
@@ -2658,7 +2709,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             </Button>
           </fieldset>
         ) : null}
-        <span>{antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityId}</span>
+        <span data-quantity-id={quantityId}>{antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityLabel}</span>
         <span>{antennaFieldSourceLabel ?? selectedLabel}</span>
         {hysteresisReplayLabel ? <span>{hysteresisReplayLabel}</span> : null}
         <span>{antennaFieldOverlay ? `${antennaFieldOverlay.count} samples` : domainSummary}</span>
@@ -2800,6 +2851,9 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
               {sceneProps.frozenSpinsOverlayModel.carrierKind === "fdm-cells"
                 ? "FDM cells"
                 : "FEM true DOFs"}
+              {sceneProps.frozenSpinsOverlayModel.source === "runtime-field"
+                ? " · runtime field"
+                : " · preview mask"}
               {sceneProps.frozenSpinsOverlayModel.current
                 ? " · current"
                 : " · stale preview"}
@@ -2814,7 +2868,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           camera={canvasCamera}
           className="fm-viewport-3d__canvas"
           dpr={canvasDpr}
-          events={createViewport3DEventManager}
+          events={createCanvasEvents}
           frameloop={VIEWPORT_3D_FRAMELOOP}
           gl={canvasGlOptions}
           key={canvasContextKey}
@@ -2844,6 +2898,8 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             onInspectClear={clearInspectHover}
             onInspectSample={updateInspectHover}
             onMoveCommit={moveInteraction.commitMove}
+            onBeginGesture={moveInteraction.onBeginGesture}
+            onMoveGestureActiveChange={moveInteraction.onGestureActiveChange}
             moveToolObjectId={moveInteraction.moveToolObjectId}
             moveDraftResetRevision={moveInteraction.moveDraftResetRevision}
             onVisualizationFrameCommitted={onVisualizationFrameCommitted}
@@ -2874,7 +2930,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           provenance={visibleInspectProvenance}
         />
       ) : null}
-      <Viewport3DMoveConflictPanel interaction={moveInteraction} />
+      <Viewport3DMoveStatus error={moveInteraction.moveError} />
       <Viewport3DFdmSelectionAnnouncement
         announcement={fdmSelectionAnnouncement}
       />
@@ -3526,10 +3582,11 @@ function Viewport3DOrbitDebugSlider({
   value: number;
 }) {
   return (
-    <label className="fm-viewport-3d__orbit-debug-field">
+    <div className="fm-viewport-3d__orbit-debug-field">
       <span>{label}</span>
       <output>{value.toFixed(3)}</output>
       <input
+        aria-label={label}
         max={max}
         min={min}
         step="0.001"
@@ -3542,6 +3599,6 @@ function Viewport3DOrbitDebugSlider({
         onPointerDown={onInteractionStart}
         onPointerUp={onInteractionEnd}
       />
-    </label>
+    </div>
   );
 }

@@ -3,6 +3,7 @@ import type {
   BinaryResourceResult,
   StageExecutionResource,
 } from "@/kernel/api/apiTypes";
+import type { ResourceState } from "@/kernel/resources/resourceState";
 import {
   sessionResourceIdentitiesEqual,
   type SessionResourceIdentity,
@@ -157,4 +158,55 @@ export function decodeInspectionPreview(
     }
     return { positionM: vectors[0], fieldApm: vectors[1] };
   });
+}
+
+export function resolveInspectionPreviewState({ authoredStageId, identity, execution, inspection, mapping }: {
+  authoredStageId: string;
+  identity: SessionResourceIdentity | null;
+  execution: Pick<ResourceState<StageExecutionResource>, "status" | "error" | "refreshError">;
+  inspection: Pick<ResourceState<AntennaExternalLeadInspectionResource>, "status" | "data" | "error" | "refreshError">;
+  mapping: InspectionRuntimeMapping;
+}) {
+  const executionCurrent = execution.status === "ready" && !execution.refreshError;
+  const viewRecord = inspection.data &&
+    inspectionMatchesRuntimeStage(inspection.data, authoredStageId, mapping, identity)
+    ? inspection.data : null;
+  const current = executionCurrent && inspection.status === "ready" && !inspection.refreshError
+    ? viewRecord : null;
+  let state: string = "unavailable";
+  let message: string | null = null;
+  let count = 0;
+  if (execution.error || execution.refreshError || inspection.error || inspection.refreshError) {
+    state = "error";
+    message = (execution.error ?? execution.refreshError ?? inspection.error ?? inspection.refreshError)?.message ?? "Inspection unavailable.";
+  } else if (!identity || !executionCurrent) {
+    state = "loading";
+    message = "Waiting for confirmed stage execution…";
+  } else if (mapping.state !== "mapped") {
+    state = mapping.state;
+    message = mapping.message;
+  } else if (inspection.status === "loading" || inspection.status === "stale" || inspection.status === "idle") {
+    state = "loading";
+    message = "Loading the exact runtime stage inspection…";
+  } else if (!inspection.data) {
+    message = "This runtime stage has no external-lead inspection record.";
+  } else if (!current) {
+    state = "identity_mismatch";
+    message = "Inspection identity does not match this antenna definition, run and session incarnation.";
+  } else if (current.qualification !== "NOT VERIFIED" || current.field_scope !== "external_electrode_truncation") {
+    state = "error";
+    message = "Inspection has an unsupported qualification or field scope.";
+  } else if (current.status === "failed" || current.status === "cancelled") {
+    state = current.status;
+    message = current.diagnostic ?? `Inspection ${current.status}; no numerical payload is available.`;
+  } else {
+    try {
+      count = inspectionPreviewCount(current);
+      state = "inspection_only";
+    } catch (error) {
+      state = "error";
+      message = error instanceof Error ? error.message : String(error);
+    }
+  }
+  return { viewRecord, current, state, message, count };
 }

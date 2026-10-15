@@ -184,6 +184,39 @@ Submit zachowuje ten sam klucz idempotencji. Konflikt blokady nie oznacza
 błędnego payloadu ani przyjęcia nowego runu. Nie wolno omijać blokady,
 zmieniać klucza ani tworzyć zastępczego magazynu w ramach takiego ponowienia.
 
+Przygotowanie tożsamości przed Submit:
+`POST /v2/persistence/projects/{project_id}/run-intent` przyjmuje dokładne
+archiwum `.fms`, `expected_revision`, jawne `RunIntentAuthoring`, skompilowany
+StudyPlan/katalog oraz wiązania asset ID→ścieżka. Zwraca kanoniczny RunIntent
+i fingerprint specyfikacji. Klucz idempotencji nie jest częścią tego
+fingerprintu; oba jawne identyfikatory są zachowane, nie generowane przez API.
+Rewizja jest porównywana wyłącznie z dostarczonym archiwum, nie z najnowszą
+sceną, aktywną sesją ani stanem projektu na dysku. Nieznane pola authoring,
+brak assetu, niespójny Study i konflikt żądanego wykonania powodują odmowę.
+Archiwum ma limit 64 MiB po dekodowaniu oraz odpowiadający limit base64
+sprawdzany przed dekodowaniem; obowiązuje też globalny limit body API.
+
+Operacja nie otwiera accepted-run store, nie zapisuje CAS/journal, nie
+uruchamia meshing/solvera i nie wykonuje admission ani rozpoznania hosta.
+Nie poświadcza istnienia opublikowanego profilu. Submit musi otrzymać ten sam
+zestaw wejść i ponownie sprawdza kontrakty oraz opublikowane wersje profili.
+Sukces przygotowania nie oznacza przyjęcia runu ani naukowej kwalifikacji.
+Stan wdrożenia 2026-10-11: handler/router/OpenAPI zapisane źródłowo; build,
+regeneracja typowanego klienta, integracja UI i prepare→Submit runtime
+pozostają **NOT VERIFIED**.
+
+Produkcyjny konsument CLI przygotowania jest podłączony źródłowo przez
+`fullmag prepare-run-json authored.json --project-id <id> --api-url <origin>`.
+Wejście ma dokładnie kształt ProjectRunIntentRequest, bez gotowego RunIntent.
+Stdout zawiera pięciopolowy ProjectRunSubmitRequest przeznaczony dla jawnego
+późniejszego `fullmag run-json prepared.json --api-url <origin>`. Komenda nie
+zapisuje pliku wyjściowego ani nie wykonuje Submit automatycznie. Kontroluje
+zwrotny project/revision, wszystkie pola RunIntentAuthoring i fingerprint.
+Odczyt pliku oraz poprawnej odpowiedzi HTTP ma limit 96 MiB, odczyt błędu
+HTTP limit 2 KiB. To transport skompilowanych wejść, nie kompilator sceny
+lub skryptu do Study/ProblemIR. Build i wykonanie nowej komendy pozostają
+**NOT VERIFIED**; snapshot joba 66 nie obejmuje tej późniejszej zmiany CLI.
+
 Recovery bieżącej sesji: `GET` i `DELETE /v2/sessions/current/persistence/recovery`
 obejmują wyłącznie snapshot o `session_id` przechwyconej aktywnej sesji.
 Walidacja kontekstu i operacja pozostają pod blokadą zmiany sesji. Usuwanie
@@ -849,7 +882,16 @@ Current object-authoring routes:
 region endpoint references the deleted object, so the committed scene cannot
 retain dangling coupling endpoints. The response includes `transaction_kind`,
 `scene_revision`, and `committed_scene`. Direct object and region mutation
-routes also return the committed scene. Material mutation returns the committed
+routes also return the committed scene.
+
+Pole `committed_scene` jest typowanym `SceneResource`, identycznym z projekcją
+`GET model/scene` dla tej samej rewizji; `scene_revision` musi odpowiadać
+`committed_scene.revision`. Nie zastępuje prywatnego `SceneDocument` w storage.
+Klient może opublikować ten zasób przez centralnego właściciela cache przed
+unieważnieniem zależności, pod warunkiem związania z sesją, klientem i rewizją.
+Starszy ACK nie może zastąpić nowszego zasobu ani przerwać jego odczytu.
+Odczyt sceny przed mutacją potrzebny do historii pozostaje wymagany.
+Material mutation returns the committed
 material asset and must invalidate `model/scene` because material changes can
 synchronize interaction state such as interfacial DMI. There is currently no
 `GET /v2/sessions/current/model/objects/{object_id}` read route; browser
@@ -1566,3 +1608,70 @@ uszkodzony CAS albo niepoprawny scalar 500.
 Status implementacji: backend source i rejestracja OpenAPI. Managed export,
 generated transport, facade/hook i UI pozostają NOT VERIFIED; nie edytujemy
 ręcznie wygenerowanego kontraktu przed odbiorem buildu.
+
+
+## Proponowane rozszerzenie FMVP v5: pelna tozsamosc pola
+
+Status: implementacja w toku, runtime/browser NOT VERIFIED. Decyzja i dokladny
+layout: [ADR0053](../adr/0053-fmvp-full-field-identity.md). FMVPv5/FMMIv4
+zachowuje48-bajtowy header oraztopology/indexing/scope;88-bajtowa stala czesc
+metadata rozszerza FMMIv3 o dlugosc pelnego UTF-8quantityID podoffsetem80.
+Pelne ID pochodzi z binarnego payloadu;prefix16bajtow zheadera jest sprawdzany
+bajtowo, nie nadpisywany HTTP. Reader v2/v3/v4 pozostaje zgodny.
+
+Brak topologii dla headless artifact reads jest jawny: LegacyCountOnly,
+puste indices, revision0/hashzero, decoder null topologyidentity. Taki payload
+nie spelnia wymagania full_domain dla overlay. Sourcequalification pozostaje
+odrebna: calkowicie nieobecna albo kompletna jak w v4; nigdy fikcyjne live.
+
+Rollout producer/codec/overlay jest jednym etapem; standardowe modalne i
+response field IDs musza przejsc API orazbrowserproof bezskracania nazw.
+
+
+### R2: wybor magnetyzacji razem z fizycznym zrodlem
+
+Dla `m` bieżąca kwalifikowana magnetyzacja live ma pierwszenstwo nad
+Latest/Preview tylko wtedy, gdy jej rzeczywisty payload source step jest
+scisle nowszy. Rowne lub nowsze cached source zachowuje pierwszenstwo.
+Regula nie zmienia pozostalych quantities ani provenance/domain guards.
+Wartosci, meta/catalog freshness, observation frame, bundle i command
+readiness musza odnosic sie do tego samego wybranego zrodla. Nie laczymy
+wartosci kroku 8 z frame kroku 7. Quantity/resource revision i source
+request revision pozostaja odrebnymi znaczeniami; brak scientific identity
+nie moze byc uzupelniony resource counterem.
+
+Bare magnetization poprzedniego physical step nie jest kopiowana do nowego
+kroku bez payloadu. Przed zmiana state/mesh mozna zachowac ja w istniejacym
+cache Latest, przez canonical binder i accepted-source registry, z oryginalnym
+step/time/frame oraz historyczna projekcja revision/timestamp. Snapshotujemy
+wylacznie wybrane qualified live values; istniejący wybrany cache pozostaje.
+Nowy progress nie staje sie scientific observation. Nie dodajemy publicznego
+schematu ani drugiego store. Zachowanie dotyczy atomowego runtime candidate;
+przy zmianie run/session epoch nie przenosimy bare payloadu do nowej pracy.
+Stary bufor moze byc current field wylacznie przy zgodnej frame epoch, domain
+generation i topology revision. Sama liczba wezlow/komorek nie wystarcza.
+
+Materializer pending/error dotyczacy scisle starszego source step nie moze
+degradowac wybranej nowszej kwalifikowanej fizycznej magnetyzacji, także zachowanej
+w Latest/Preview. Brak accepted frame nie pozwala pominąć statusu. Status dotyczacy tego samego
+lub nowszego zrodla zachowuje dotychczasowe ograniczenia. Exact scope,
+generation i carrier guards nadal obowiazuja. Bundle jest tworzone tylko
+gdy wybrana frame odpowiada przyjetej physical scalar row i carrierowi;
+w przeciwnym razie pozostaje unavailable.
+
+Wymagana regresja obejmuje vector/meta/catalog/frame/bundle/readiness,
+Latest i Preview precedence, rowne/nowsze cached step, brak live payloadu,
+progress/nonfinite/bad cardinality, same-cardinality mesh change oraz status
+pending/error starszego i tego samego kroku. Source code nie jest dowodem
+wykonania; testy wykonujemy tylko w GHA.
+
+
+Doprecyzowanie R2 po review: w tej samej session/run i niezmienionej
+siatce zachowujemy także wybraną magnetyzację live przed nadejściem
+ściśle starszego fizycznego payloadu. Runtime frame nie zmienia run;
+nie przenosimy tej reguły na reset epoch lub zmianę ownership.
+Registered m frame jest sprawdzana również w actual binderach, zanim
+nowy current step mógłby ponownie certyfikować stare dane. Stary m preview
+nie jest kopiowany przez zmianę domain/topology. Dowód bundle wymaga
+obowiązkowego nonnull carrier/frame/physical-row match w positive fixture;
+warunkowe sprawdzenie tylko gdy bundle istnieje jest niewystarczające.

@@ -141,6 +141,7 @@ from .problem import (
     ExecutionPrecision,
     FdmPrecisionPolicy,
     FdmPbc,
+    ParallelExecutionPolicy,
     Problem,
     RuntimeSelection,
     backend,
@@ -204,7 +205,7 @@ from .structure import (
     RegionMaterialOverride,
     RegionTextureOverride,
 )
-from .study import Eigenmodes, FieldAutosave, FloquetBC, FrequencyResponse, FrequencyResponseSolverPolicy, GammaResponseAnalysis, PeriodicBC, RelaxStop, Relaxation, StageAutosave, TableAutosave, FieldOnly, TimeEvolution, FieldOrientation, MeasurementAxis, HysteresisAngularVariant, HysteresisAngularFamily, SaturationProbe, HysteresisStorage, MinorLoop, FieldSegment, PiecewiseFieldSchedule, FieldWindow, AdaptiveRefinement, SettleStep, RelaxStep, MinimizeStep, DynamicsSettleStep, SettleBranch, SettlePipeline, SettleTree, Hysteresis
+from .study import AntennaFieldSolve, FieldOnly, Eigenmodes, FemEigenSolverPolicy, FieldAutosave, FloquetBC, FrequencyResponse, FrequencyResponseSolverPolicy, GammaResponseAnalysis, PeriodicBC, RelaxStop, Relaxation, StageAutosave, TableAutosave, TimeEvolution, FieldOrientation, MeasurementAxis, HysteresisAngularVariant, HysteresisAngularFamily, SaturationProbe, HysteresisStorage, MinorLoop, FieldSegment, PiecewiseFieldSchedule, FieldWindow, AdaptiveRefinement, SettleStep, RelaxStep, MinimizeStep, DynamicsSettleStep, SettleBranch, SettlePipeline, SettleTree, Hysteresis
 from .study import FiniteKResponseAnalysis
 from .eigen import (
     BiasFieldSweep,
@@ -334,6 +335,7 @@ __all__ = [
     "ExecutionMode",
     "ExecutionPrecision",
     "FdmPrecisionPolicy",
+    "ParallelExecutionPolicy",
     "FieldRefreshPolicy",
     "FdmPbc",
     "FDM",
@@ -396,6 +398,7 @@ __all__ = [
     "UniformFieldProfile",
     "FrequencyResponse",
     "FrequencyResponseSolverPolicy",
+    "FemEigenSolverPolicy",
     "FrozenSpins",
     "BiasFieldSweep",
     "DispersionValidationScenario",
@@ -407,6 +410,7 @@ __all__ = [
     "ThinFilmDEBVDispersionValidation",
     "FieldOnly",
     "TimeEvolution",
+    "AntennaFieldSolve",
     "Translate",
     "RigidTransform",
     "Union",

@@ -6,6 +6,7 @@ use fullmag_session::{
     FMS_WORKER_PROCESS_EXIT_RECEIPT_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -358,6 +359,30 @@ pub(crate) fn run_supervised_accepted_worker(
     heartbeat_interval: Duration,
     max_automatic_retries: usize,
 ) -> Result<SupervisedWorkerResult> {
+    run_supervised_accepted_worker_with_host(
+        store,
+        run_id,
+        task_id,
+        worker_executable,
+        max_concurrency,
+        worker_timeout,
+        heartbeat_interval,
+        max_automatic_retries,
+        None,
+    )
+}
+
+pub(crate) fn run_supervised_accepted_worker_with_host(
+    store: &SessionStore,
+    run_id: &str,
+    task_id: &str,
+    worker_executable: &Path,
+    max_concurrency: usize,
+    worker_timeout: Duration,
+    heartbeat_interval: Duration,
+    max_automatic_retries: usize,
+    host: Option<&fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
+) -> Result<SupervisedWorkerResult> {
     if max_concurrency == 0 {
         bail!("accepted-worker supervisor max concurrency must be positive");
     }
@@ -376,6 +401,14 @@ pub(crate) fn run_supervised_accepted_worker(
         worker_process_exit_receipt_for_current_task(store, run_id, task_id)
             .context("inspect durable process exit before supervisor slot acquisition")?
             .is_some();
+    let host_recovery_exit = if host.is_some() {
+        worker_process_exit_receipt_for_current_task(store, run_id, task_id)?
+    } else {
+        None
+    };
+    if host.is_some() && recoverable_retry && host_recovery_exit.is_none() {
+        bail!("host retry recovery requires the exact durable worker process exit proof");
+    }
     let catalog = store
         .read_run_catalog(run_id)
         .context("read run catalog before supervisor slot acquisition")?
@@ -399,16 +432,26 @@ pub(crate) fn run_supervised_accepted_worker(
         )
     })
     .context("acquire accepted-worker supervisor slot")?;
-    if let Some(result) = reconcile_durable_retry_before_spawn(store, run_id, task_id)
-        .context("reconcile durable retry before accepted-worker spawn")?
-    {
+    let retry_reconciliation = reconcile_durable_retry_before_spawn(store, run_id, task_id)
+        .context("reconcile durable retry before accepted-worker spawn");
+    if !matches!(&retry_reconciliation, Ok(None)) {
+        if let (Some(host), Some(receipt)) = (host, host_recovery_exit.as_ref()) {
+            finish_host_worker_exit(host, store, receipt, retry_reconciliation.is_ok())?;
+        }
+    }
+    if let Some(result) = retry_reconciliation? {
         slot.release()?;
         return Ok(result);
     }
-    if let Some(result) =
+    let exit_reconciliation =
         reconcile_durable_worker_exit_before_spawn(store, run_id, task_id, max_automatic_retries)
-            .context("reconcile durable process exit before accepted-worker spawn")?
-    {
+            .context("reconcile durable process exit before accepted-worker spawn");
+    if !matches!(&exit_reconciliation, Ok(None)) {
+        if let (Some(host), Some(receipt)) = (host, host_recovery_exit.as_ref()) {
+            finish_host_worker_exit(host, store, receipt, exit_reconciliation.is_ok())?;
+        }
+    }
+    if let Some(result) = exit_reconciliation? {
         slot.release()?;
         return Ok(result);
     }
@@ -432,7 +475,16 @@ pub(crate) fn run_supervised_accepted_worker(
     {
         bail!("resource lease changed while the supervisor captured its task claim");
     }
-    let gpu_uuid = worker_gpu_uuid(&lease)?;
+    let (gpu_uuid, cpu_ids) = if let Some(host) = host {
+        host.ensure_solver_claim_committed(store, &claim)?;
+        let placement = host.solver_placement(&lease.resource_id)?;
+        (placement.gpu_uuid.clone(), placement.cpu_ids.clone())
+    } else {
+        if lease.host_launch_binding.is_some() {
+            bail!("host-bound worker lease requires its pinned host supervisor context");
+        }
+        (worker_gpu_uuid(&lease)?, BTreeSet::new())
+    };
 
     let recovered_before_spawn =
         retry_store_writer_busy(|| fullmag_runtime_control::recover_coordinator(store, &claim))
@@ -443,12 +495,26 @@ pub(crate) fn run_supervised_accepted_worker(
             .iter()
             .any(|event| matches!(&event.event, WorkerEvent::Started))
     {
+        if let Some(host) = host {
+            host.ledger()
+                .close_worker_launch_before_spawn(store, &lease)?;
+        }
         let mut coordinator =
             fullmag_application::DurableWorkerCoordinator::new(recovered_before_spawn.coordinator);
         commit_worker_event(store, &mut coordinator, WorkerEvent::Stopped)
             .context("persist cancellation before accepted worker spawn")?;
         retry_store_writer_busy(|| store.release_resource_lease(&lease))
             .context("release pre-start cancelled worker resource lease")?;
+        if let Some(host) = host {
+            let request = fullmag_runtime_control::host_allocation::host_request_for_task_claim(
+                store,
+                host.ledger(),
+                &claim,
+                host.solver_placement(&lease.resource_id)?,
+            )?;
+            host.ledger()
+                .release_worker_without_spawn(store, &request.identity)?;
+        }
         slot.release()?;
         return Ok(SupervisedWorkerResult {
             recovered_terminal_completion: false,
@@ -461,13 +527,66 @@ pub(crate) fn run_supervised_accepted_worker(
         });
     }
 
+    if store
+        .read_task_cancellation_intent(run_id, task_id)?
+        .is_some()
+    {
+        bail!("pending cancellation requires reconciliation before worker spawn");
+    }
+    let cpu_thread_environment = if host.is_some() {
+        let starts = recovered_before_spawn
+            .commands
+            .iter()
+            .filter(|command| {
+                command.claim.matches_claim(&claim)
+                    && matches!(
+                        &command.command,
+                        fullmag_application::WorkerCommand::Start
+                    )
+            })
+            .collect::<Vec<_>>();
+        if starts.len() != 1 {
+            bail!("host-bound worker requires exactly one durable Start for its claim");
+        }
+        let run_intent = retry_store_writer_busy(|| store.read_run_intent(run_id))
+            .context("read accepted RunIntent for worker CPU environment")?
+            .context("host-bound worker requires its accepted RunIntent")?;
+        let specification: fullmag_application::RunSpecification =
+            serde_json::from_value(run_intent.specification)
+                .context("accepted worker RunSpec is invalid")?;
+        if specification.run_id != claim.run_id {
+            bail!("accepted worker RunSpec belongs to another run");
+        }
+        let accepted_step = retry_store_writer_busy(|| {
+            fullmag_runtime_control::load_accepted_worker_step_for_start(
+                store,
+                &specification.snapshot.project_id,
+                starts[0],
+            )
+        })
+        .context("load exact accepted worker step for CPU environment")?;
+        worker_thread_environment(
+            &accepted_step.problem,
+            &accepted_step.execution_plan,
+            &cpu_ids,
+            gpu_uuid.is_some(),
+        )?
+    } else {
+        Vec::new()
+    };
     let mut active_lease = lease;
+    let host_launch_token = host
+        .map(|host| host.ledger().authorize_worker_launch(store, &active_lease))
+        .transpose()?;
     let outcome = match spawn_worker(
         worker_executable,
         store.root(),
         run_id,
         task_id,
         gpu_uuid.as_deref(),
+        &cpu_ids,
+        &cpu_thread_environment,
+        host_launch_token.as_deref(),
         worker_timeout,
         heartbeat_interval,
         || renew_resource_lease(store, &mut active_lease),
@@ -514,6 +633,14 @@ pub(crate) fn run_supervised_accepted_worker(
         Some(&outcome.output),
         max_automatic_retries,
     );
+    if let Some(host) = host {
+        if let Err(error) =
+            finish_host_worker_exit(host, store, &process_exit_receipt, reconciliation.is_ok())
+        {
+            slot.release()?;
+            return Err(error.context("reconcile exact host reservation after worker exit"));
+        }
+    }
     match reconciliation {
         Ok(result) => {
             slot.release()?;
@@ -527,6 +654,43 @@ pub(crate) fn run_supervised_accepted_worker(
             Err(error)
         }
     }
+}
+
+fn finish_host_worker_exit(
+    host: &fullmag_runtime_control::host_runtime::HostRuntimeAdmission,
+    store: &SessionStore,
+    receipt: &FmsWorkerProcessExitReceipt,
+    require_release: bool,
+) -> Result<()> {
+    let lease = store
+        .read_resource_lease(&receipt.run_id, &receipt.resource_id, &receipt.lease_token)?
+        .context("host exit reconciliation requires the exact local resource lease")?;
+    if lease.state == fullmag_session::FmsResourceLeaseState::Released {
+        retry_store_writer_busy(|| {
+            host.ledger()
+                .release_worker_after_exit(store, &receipt.run_id, &receipt.receipt_id)
+        })?;
+        return Ok(());
+    }
+    receipt.validate_for_lease(&lease)?;
+    let identity = fullmag_session::host_resource_ledger::HostReservationIdentity {
+        store_id: fullmag_session::host_resource_ledger::HostResourceLedger::store_id(
+            store.root(),
+        )?,
+        run_id: receipt.run_id.clone(),
+        task_id: receipt.task_id.clone(),
+        resource_id: receipt.resource_id.clone(),
+        lease_token: receipt.lease_token.clone(),
+        owner: fullmag_session::host_resource_ledger::HostReservationOwner::Solver {
+            attempt_id: receipt.attempt_id.clone(),
+            ownership_epoch: receipt.ownership_epoch,
+        },
+    };
+    host.ledger().quarantine_reservation(&identity)?;
+    if require_release {
+        bail!("successful worker reconciliation retained its local lease; host capacity remains quarantined");
+    }
+    Ok(())
 }
 
 fn task_is_terminal(store: &SessionStore, lease: &FmsResourceLease) -> Result<bool> {
@@ -707,6 +871,9 @@ fn spawn_worker<H, C>(
     run_id: &str,
     task_id: &str,
     gpu_uuid: Option<&str>,
+    cpu_ids: &BTreeSet<u32>,
+    cpu_thread_environment: &[(&'static str, String)],
+    host_launch_token: Option<&str>,
     worker_timeout: Duration,
     heartbeat_interval: Duration,
     heartbeat: H,
@@ -726,6 +893,27 @@ where
         bail!("accepted worker executable must be a regular file");
     }
     let mut command = Command::new(worker_executable);
+    for (name, value) in worker_environment(gpu_uuid, host_launch_token.is_some()) {
+        if let Some(value) = value {
+            command.env(name, value);
+        } else {
+            command.env_remove(name);
+        }
+    }
+    if host_launch_token.is_some() && cpu_thread_environment.is_empty() {
+        bail!("host-bound worker requires an allocation-derived CPU thread environment");
+    }
+    if host_launch_token.is_none() && !cpu_thread_environment.is_empty() {
+        bail!("unbound worker cannot receive a host allocation CPU environment");
+    }
+    for (name, value) in cpu_thread_environment {
+        command.env(*name, value.as_str());
+    }
+    if let Some(token) = host_launch_token {
+        command.env("FULLMAG_HOST_LAUNCH_TOKEN", token);
+    } else {
+        command.env_remove("FULLMAG_HOST_LAUNCH_TOKEN");
+    }
     command
         .arg("--store-root")
         .arg(store_root)
@@ -736,20 +924,16 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(gpu_uuid) = gpu_uuid {
-        // The local resource publisher embeds the physical NVIDIA UUID in the
-        // durable resource id. Mask the child to that exact lease, then use
-        // ordinal zero inside the one-device view.
-        command
-            .env("CUDA_VISIBLE_DEVICES", gpu_uuid)
-            .env("FULLMAG_FDM_GPU_INDEX", "0");
-    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+        let mut flags = windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+        if !cpu_ids.is_empty() {
+            flags |= windows_sys::Win32::System::Threading::INHERIT_PARENT_AFFINITY;
+        }
+        command.creation_flags(flags);
     }
-    let child = OwnedWorkerProcess::spawn(&mut command)
+    let child = OwnedWorkerProcess::spawn(&mut command, cpu_ids)
         .with_context(|| format!("spawn accepted worker `{}`", worker_executable.display()))?;
     observe_child(
         child,
@@ -758,6 +942,188 @@ where
         heartbeat,
         stop_requested,
     )
+}
+
+fn worker_environment(
+    gpu_uuid: Option<&str>,
+    host_bound: bool,
+) -> Vec<(&'static str, Option<String>)> {
+    let mut environment = vec![
+        ("CUDA_VISIBLE_DEVICES", Some(String::new())),
+        ("FULLMAG_FDM_GPU_INDEX", None),
+        ("FULLMAG_FEM_GPU_INDEX", None),
+        ("FULLMAG_CUDA_DEVICE_INDEX", None),
+    ];
+    if let Some(gpu_uuid) = gpu_uuid {
+        // The lease identifies the physical card. Mask to that UUID and use
+        // ordinal zero in the one-device view for both solver backends.
+        environment[0].1 = Some(gpu_uuid.to_owned());
+        environment[1].1 = Some("0".into());
+        environment[2].1 = Some("0".into());
+    }
+    if host_bound {
+        environment.extend(
+            HOST_WORKER_PARENT_THREAD_ENV
+                .iter()
+                .map(|name| (*name, None)),
+        );
+    }
+    environment
+}
+
+const HOST_WORKER_PARENT_THREAD_ENV: [&str; 20] = [
+    "FULLMAG_CPU_THREADS",
+    "FULLMAG_CPU_THREADS_AUTO_RESOLVED",
+    "FULLMAG_NATIVE_THREADS_AUTO_RESOLVED",
+    "RAYON_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OMP_THREAD_LIMIT",
+    "OMP_DYNAMIC",
+    "OMP_NESTED",
+    "OMP_MAX_ACTIVE_LEVELS",
+    "OMP_PLACES",
+    "OMP_PROC_BIND",
+    "OPENBLAS_NUM_THREADS",
+    "GOTO_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "MKL_DOMAIN_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "GOMP_CPU_AFFINITY",
+    "KMP_AFFINITY",
+];
+
+fn worker_thread_environment(
+    problem: &fullmag_ir::ProblemIR,
+    execution_plan: &fullmag_ir::ExecutionPlanIR,
+    cpu_ids: &BTreeSet<u32>,
+    gpu_allocated: bool,
+) -> Result<Vec<(&'static str, String)>> {
+    let resources = fullmag_ir::ComputeResourcesIR::from_problem(problem)
+        .map_err(anyhow::Error::msg)?;
+    if let Some(resources) = &resources {
+        resources
+            .validate()
+            .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
+    }
+    let requested_cpu_threads = match resources.as_ref() {
+        Some(resources) => resources.cpu.threads.count(),
+        None => problem
+            .problem_meta
+            .runtime_metadata
+            .get("runtime_selection")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|selection| selection.get("cpu_threads"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|threads| u32::try_from(threads).ok()),
+    };
+    let allocated_cpu_threads = u32::try_from(cpu_ids.len())
+        .context("host CPU placement has more entries than the thread policy can represent")?;
+    build_worker_thread_environment(
+        requested_cpu_threads,
+        resources
+            .as_ref()
+            .and_then(|resources| resources.cpu.native_threads.count()),
+        resources
+            .as_ref()
+            .and_then(|resources| resources.cpu.blas_threads.count()),
+        resources.is_some(),
+        allocated_cpu_threads,
+        gpu_allocated,
+        matches!(
+            &execution_plan.backend_plan,
+            fullmag_ir::BackendPlanIR::Fem(_)
+                | fullmag_ir::BackendPlanIR::FemEigen(_)
+                | fullmag_ir::BackendPlanIR::FemFrequencyResponse(_)
+        ),
+    )
+}
+
+fn build_worker_thread_environment(
+    requested_cpu_threads: Option<u32>,
+    requested_native_threads: Option<u32>,
+    requested_blas_threads: Option<u32>,
+    has_typed_resources: bool,
+    allocated_cpu_threads: u32,
+    gpu_allocated: bool,
+    native_fem_lane: bool,
+) -> Result<Vec<(&'static str, String)>> {
+    if allocated_cpu_threads == 0 {
+        bail!("host-bound worker has no allocated CPU IDs for thread policy");
+    }
+    let cpu_threads = requested_cpu_threads.unwrap_or(allocated_cpu_threads);
+    if cpu_threads == 0 || cpu_threads > allocated_cpu_threads {
+        bail!(
+            "requested CPU thread count {cpu_threads} exceeds the allocated CPU set of {allocated_cpu_threads}"
+        );
+    }
+
+    let native_threads_auto = requested_native_threads.is_none()
+        && (has_typed_resources || requested_cpu_threads.is_none());
+    let native_threads = requested_native_threads.unwrap_or_else(|| {
+        if gpu_allocated {
+            1
+        } else {
+            cpu_threads
+        }
+    });
+    let blas_threads = requested_blas_threads.unwrap_or(1);
+    let rayon_threads = if native_fem_lane && native_threads > 1 {
+        1
+    } else {
+        cpu_threads
+    };
+    if native_threads == 0
+        || blas_threads == 0
+        || native_threads > allocated_cpu_threads
+        || native_threads
+            .checked_mul(blas_threads)
+            .is_none_or(|nested_threads| nested_threads > allocated_cpu_threads)
+    {
+        bail!(
+            "native/BLAS thread policy exceeds the allocated CPU set of {allocated_cpu_threads}"
+        );
+    }
+
+    let mut environment = vec![
+        ("RAYON_NUM_THREADS", rayon_threads.to_string()),
+        (
+            "FULLMAG_NATIVE_THREADS_AUTO_RESOLVED",
+            native_threads.to_string(),
+        ),
+        (
+            "FULLMAG_CPU_THREADS",
+            if native_threads_auto {
+                "auto".into()
+            } else {
+                native_threads.to_string()
+            },
+        ),
+        ("OMP_NUM_THREADS", native_threads.to_string()),
+        ("OMP_THREAD_LIMIT", native_threads.to_string()),
+        ("OMP_DYNAMIC", "FALSE".into()),
+        ("OMP_NESTED", "FALSE".into()),
+        ("OMP_MAX_ACTIVE_LEVELS", "1".into()),
+    ];
+    if requested_cpu_threads.is_none() {
+        environment.push((
+            "FULLMAG_CPU_THREADS_AUTO_RESOLVED",
+            cpu_threads.to_string(),
+        ));
+    }
+    for name in [
+        "OPENBLAS_NUM_THREADS",
+        "GOTO_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "MKL_DOMAIN_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ] {
+        environment.push((name, blas_threads.to_string()));
+    }
+    Ok(environment)
 }
 
 fn worker_gpu_uuid(lease: &fullmag_session::FmsResourceLease) -> Result<Option<String>> {
@@ -801,8 +1167,18 @@ where
     let stdout_reader = spawn_output_reader(stdout);
     let stderr_reader = spawn_output_reader(stderr);
     if let Some(reason) = child.take_startup_failure() {
-        let status = child.wait().context("confirm failed worker startup cleanup")?;
-        let mut outcome = collect_child_output(status, false, false, process_id, None, stdout_reader, stderr_reader)?;
+        let status = child
+            .wait()
+            .context("confirm failed worker startup cleanup")?;
+        let mut outcome = collect_child_output(
+            status,
+            false,
+            false,
+            process_id,
+            None,
+            stdout_reader,
+            stderr_reader,
+        )?;
         outcome.control_failure_reason = Some(reason);
         return Ok(outcome);
     }
@@ -1739,37 +2115,71 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn zero_exit_cannot_publish_success_after_control_failure_or_timeout() {
+        use fullmag_application::{
+            AttemptId, LeaseToken, OwnershipEpoch, ResourceBudget, ResourceKind, ResourceLease,
+            RunId, TaskClaim, TaskId,
+        };
         #[cfg(unix)]
         use std::os::unix::process::ExitStatusExt;
         #[cfg(windows)]
         use std::os::windows::process::ExitStatusExt;
-        use fullmag_application::{AttemptId, LeaseToken, OwnershipEpoch, ResourceBudget,
-            ResourceKind, ResourceLease, RunId, TaskClaim, TaskId};
-        let budget = ResourceBudget { cpu_millis: 1000, memory_bytes: 1048576,
-            gpu_memory_bytes: 0, storage_bytes: 1048576 };
+        let budget = ResourceBudget {
+            cpu_millis: 1000,
+            memory_bytes: 1048576,
+            gpu_memory_bytes: 0,
+            storage_bytes: 1048576,
+        };
         let claim = TaskClaim {
             run_id: RunId::parse("run-test").unwrap(),
             task_id: TaskId::parse("task-test").unwrap(),
             attempt_id: AttemptId::parse("attempt-test").unwrap(),
             ownership_epoch: OwnershipEpoch::new(1).unwrap(),
-            lease: ResourceLease { resource_id: "cpu-test".into(), kind: ResourceKind::Cpu,
-                budget, lease_token: LeaseToken::parse("lease-test").unwrap(), heartbeat_sequence: 1 },
+            lease: ResourceLease {
+                resource_id: "cpu-test".into(),
+                kind: ResourceKind::Cpu,
+                budget,
+                lease_token: LeaseToken::parse("lease-test").unwrap(),
+                heartbeat_sequence: 1,
+            },
         };
         let now = chrono::Utc::now();
         let lease = FmsResourceLease {
             schema_version: fullmag_session::FMS_RESOURCE_LEASE_SCHEMA.into(),
-            resource_id: "cpu-test".into(), kind: fullmag_session::FmsResourceKind::Cpu,
-            budget: fullmag_session::FmsResourceBudget { cpu_millis: 1000, memory_bytes: 1048576,
-                gpu_memory_bytes: 0, storage_bytes: 1048576 },
-            run_id: "run-test".into(), task_id: "task-test".into(), attempt_id: "attempt-test".into(),
-            ownership_epoch: 1, lease_token: "lease-test".into(),
+            resource_id: "cpu-test".into(),
+            kind: fullmag_session::FmsResourceKind::Cpu,
+            budget: fullmag_session::FmsResourceBudget {
+                cpu_millis: 1000,
+                memory_bytes: 1048576,
+                gpu_memory_bytes: 0,
+                storage_bytes: 1048576,
+            },
+            run_id: "run-test".into(),
+            task_id: "task-test".into(),
+            attempt_id: "attempt-test".into(),
+            ownership_epoch: 1,
+            lease_token: "lease-test".into(),
             state: fullmag_session::FmsResourceLeaseState::Active,
-            acquired_at: now, heartbeat_at: now, heartbeat_sequence: 1, released_at: None,
+            acquired_at: now,
+            heartbeat_at: now,
+            heartbeat_sequence: 1,
+            released_at: None,
+            host_launch_binding: None,
         };
-        for (timed_out, control_failure) in [(false, Some("startup release failed")), (true, None), (false, None)] {
+        for (timed_out, control_failure) in [
+            (false, Some("startup release failed")),
+            (true, None),
+            (false, None),
+        ] {
             let outcome = ObservedWorkerProcess {
-                output: Output { status: ExitStatus::from_raw(0), stdout: Vec::new(), stderr: Vec::new() },
-                timed_out, stop_requested: false, process_id: 42, process_start_token: None,
+                output: Output {
+                    status: ExitStatus::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                timed_out,
+                stop_requested: false,
+                process_id: 42,
+                process_start_token: None,
                 control_failure_reason: control_failure.map(str::to_owned),
             };
             let receipt = worker_process_exit_receipt(&claim, &lease, &outcome).unwrap();
@@ -1777,7 +2187,9 @@ mod tests {
             assert_eq!(receipt.exit_code, Some(0));
             if timed_out || control_failure.is_some() {
                 assert_eq!(json["status_success"], false);
-                assert!(json["failure_reason"].as_str().is_some_and(|value| !value.is_empty()));
+                assert!(json["failure_reason"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()));
             } else {
                 assert_eq!(json["status_success"], true);
                 assert!(receipt.failure_reason.is_none());
@@ -1849,6 +2261,9 @@ mod tests {
             "run-a",
             "task-a",
             None,
+            &BTreeSet::new(),
+            &[],
+            None,
             Duration::from_secs(5),
             Duration::from_secs(1),
             || Ok(true),
@@ -1861,6 +2276,136 @@ mod tests {
         );
         assert!(!outcome.output.stderr.is_empty());
         assert!(!outcome.timed_out);
+    }
+
+    #[test]
+    fn worker_environment_is_derived_from_the_exact_lease() {
+        assert_eq!(
+            worker_environment(None, false),
+            vec![
+                ("CUDA_VISIBLE_DEVICES", Some(String::new())),
+                ("FULLMAG_FDM_GPU_INDEX", None),
+                ("FULLMAG_FEM_GPU_INDEX", None),
+                ("FULLMAG_CUDA_DEVICE_INDEX", None),
+            ]
+        );
+        assert_eq!(
+            worker_environment(Some("GPU-1234"), false),
+            vec![
+                ("CUDA_VISIBLE_DEVICES", Some("GPU-1234".into())),
+                ("FULLMAG_FDM_GPU_INDEX", Some("0".into())),
+                ("FULLMAG_FEM_GPU_INDEX", Some("0".into())),
+                ("FULLMAG_CUDA_DEVICE_INDEX", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn host_worker_does_not_inherit_parent_thread_or_affinity_overrides() {
+        let legacy_environment = worker_environment(None, false);
+        let host_environment = worker_environment(None, true);
+        for name in HOST_WORKER_PARENT_THREAD_ENV {
+            assert!(!legacy_environment.iter().any(|(key, _)| *key == name));
+            assert_eq!(
+                host_environment
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value),
+                Some(&None),
+                "host worker must remove inherited {name}"
+            );
+        }
+    }
+
+    fn worker_thread_env_value<'a>(
+        environment: &'a [(&str, String)],
+        name: &str,
+    ) -> Option<&'a str> {
+        environment
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn host_worker_thread_environment_resolves_auto_from_its_allocation() {
+        let environment =
+            build_worker_thread_environment(None, None, None, true, 4, false, false).unwrap();
+        assert_eq!(
+            worker_thread_env_value(&environment, "RAYON_NUM_THREADS"),
+            Some("4")
+        );
+        assert_eq!(
+            worker_thread_env_value(&environment, "FULLMAG_CPU_THREADS_AUTO_RESOLVED"),
+            Some("4")
+        );
+        assert_eq!(
+            worker_thread_env_value(&environment, "FULLMAG_NATIVE_THREADS_AUTO_RESOLVED"),
+            Some("4")
+        );
+        assert_eq!(
+            worker_thread_env_value(&environment, "FULLMAG_CPU_THREADS"),
+            Some("auto")
+        );
+        assert_eq!(
+            worker_thread_env_value(&environment, "OMP_NUM_THREADS"),
+            Some("4")
+        );
+        assert_eq!(
+            worker_thread_env_value(&environment, "OPENBLAS_NUM_THREADS"),
+            Some("1")
+        );
+
+        let gpu_environment =
+            build_worker_thread_environment(None, None, None, true, 4, true, false).unwrap();
+        assert_eq!(
+            worker_thread_env_value(&gpu_environment, "FULLMAG_CPU_THREADS_AUTO_RESOLVED"),
+            Some("4")
+        );
+        assert_eq!(
+            worker_thread_env_value(&gpu_environment, "FULLMAG_NATIVE_THREADS_AUTO_RESOLVED"),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn host_worker_thread_environment_rejects_nested_pool_oversubscription() {
+        assert!(
+            build_worker_thread_environment(Some(4), Some(4), Some(2), true, 4, false, false)
+                .is_err()
+        );
+        assert!(
+            build_worker_thread_environment(Some(5), None, None, true, 4, false, false).is_err()
+        );
+    }
+
+    #[test]
+    fn native_fem_thread_environment_uses_one_pool_for_cpu_native_execution() {
+        let environment =
+            build_worker_thread_environment(None, None, None, true, 4, false, true).unwrap();
+        assert_eq!(
+            worker_thread_env_value(&environment, "RAYON_NUM_THREADS"),
+            Some("1")
+        );
+        assert_eq!(
+            worker_thread_env_value(&environment, "OMP_NUM_THREADS"),
+            Some("4")
+        );
+        assert_eq!(
+            worker_thread_env_value(&environment, "FULLMAG_CPU_THREADS_AUTO_RESOLVED"),
+            Some("4")
+        );
+
+        let gpu_environment =
+            build_worker_thread_environment(None, None, None, true, 4, true, true).unwrap();
+        assert_eq!(
+            worker_thread_env_value(&gpu_environment, "RAYON_NUM_THREADS"),
+            Some("4")
+        );
+        assert_eq!(
+            worker_thread_env_value(&gpu_environment, "OMP_NUM_THREADS"),
+            Some("1")
+        );
     }
 
     #[test]

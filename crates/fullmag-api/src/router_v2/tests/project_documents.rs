@@ -133,7 +133,13 @@ async fn coordinator_transition_survives_store_reopen_and_writer_conflict() {
     use fullmag_application::*;
     use fullmag_session::*;
     let (_app, _state, directory) = test_router_with_session_store_state().await;
-    let store = SessionStore::open(directory.join("coordinator-store")).unwrap();
+    let open_coordinator_store = |stage: &str| {
+        let root = directory.join("coordinator-store");
+        SessionStore::open(&root).unwrap_or_else(|error| {
+            panic!("coordinator store {stage}; root={}; error={error:#}", root.display())
+        })
+    };
+    let store = open_coordinator_store("initial open");
     let mut task =
         TaskRecord::new(RunId::parse("run-coordinator").unwrap(), "a".repeat(64)).unwrap();
     task.queue().unwrap();
@@ -196,6 +202,7 @@ async fn coordinator_transition_survives_store_reopen_and_writer_conflict() {
             heartbeat_at: now,
             heartbeat_sequence: claim.lease.heartbeat_sequence,
             released_at: None,
+            host_launch_binding: None,
         })
         .unwrap();
     let mut coordinator =
@@ -279,7 +286,7 @@ async fn coordinator_transition_survives_store_reopen_and_writer_conflict() {
         CoordinatorGenesisCommitDisposition::Replayed
     );
     let initial = coordinator.checkpoint();
-    let competing_store = SessionStore::open(directory.join("coordinator-store")).unwrap();
+    let competing_store = open_coordinator_store("competing handle before deliberate conflict");
     let lock = store.write_transaction().unwrap();
     let failed = coordinator.commit_command(WorkerCommand::Start, None, |transition| {
         crate::coordinator_persistence::commit_transition(&competing_store, transition)
@@ -345,7 +352,7 @@ async fn coordinator_transition_survives_store_reopen_and_writer_conflict() {
         serde_json::from_slice::<WorkerCommandEnvelope>(&effect_bytes).unwrap(),
         start
     );
-    let reopened_receiver_store = SessionStore::open(directory.join("coordinator-store")).unwrap();
+    let reopened_receiver_store = open_coordinator_store("receiver recovery");
     let mut restored_receiver = fullmag_runtime_control::DurableWorkerInbox::recover(
         reopened_receiver_store,
         coordinator.claim().clone(),
@@ -355,7 +362,7 @@ async fn coordinator_transition_survives_store_reopen_and_writer_conflict() {
         .receive(&start, |_| panic!("pending after reopen must not execute"))
         .is_err());
     restored_receiver.confirm_applied(&start).unwrap();
-    let applied_receiver_store = SessionStore::open(directory.join("coordinator-store")).unwrap();
+    let applied_receiver_store = open_coordinator_store("applied receiver recovery");
     let mut applied_receiver = fullmag_runtime_control::DurableWorkerInbox::recover(
         applied_receiver_store,
         coordinator.claim().clone(),
@@ -400,7 +407,7 @@ async fn coordinator_transition_survives_store_reopen_and_writer_conflict() {
             Ok(())
         })
         .unwrap();
-    let reopened = SessionStore::open(directory.join("coordinator-store")).unwrap();
+    let reopened = open_coordinator_store("coordinator recovery");
     let journal = reopened
         .read_coordinator_journal("run-coordinator")
         .unwrap();
@@ -560,7 +567,7 @@ async fn coordinator_transition_survives_store_reopen_and_writer_conflict() {
     store.release_resource_lease(&durable_lease).unwrap();
     let stop_command = after_exit.commands[1].clone();
     let mut stale_inbox = fullmag_runtime_control::DurableWorkerInbox::recover(
-        SessionStore::open(directory.join("coordinator-store")).unwrap(),
+        open_coordinator_store("receiver restart"),
         after_exit.coordinator.claim().clone(),
     )
     .unwrap();
@@ -1105,7 +1112,8 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
     assert!(state.current_live_state.read().await.is_none());
     let store =
-        fullmag_session::SessionStore::open(state.submit_store_root.as_ref().unwrap()).unwrap();
+        fullmag_session::SessionStore::open_existing(state.submit_store_root.as_ref().unwrap())
+            .unwrap();
     assert!(store
         .read_run_intent(accepted["run_id"].as_str().unwrap())
         .unwrap()
@@ -3760,6 +3768,407 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
 }
 
 #[tokio::test]
+async fn project_batch_submit_replays_and_lists_durable_parent() {
+    use fullmag_application::{
+        BatchAxis, BatchAxisJoin, BatchAxisTarget, BatchAxisValueKind, BatchAxisValues,
+        BatchExecutionStrategy, BatchExpansionRequest, FileProjectRepository, ProjectEnvelope,
+        ProjectId, ProjectSnapshot, RequestedExecution, RequestedResourceBudget, StudyId,
+        StudyReference, RunSpecification,
+    };
+    use fullmag_authoring::{
+        PrimitiveStageNode, StudyDiscretizationReference, StudyExecutionProfileReference,
+        StudyModelReference, StudyPipelineDocument, StudyPipelineNode, StudyPipelineNodeSource,
+        StudyPlan, StudyPlanMigrationDefaults, StudyPrimitiveStageKind, StudySolverConfigReference,
+        STUDY_PLAN_SCHEMA_VERSION,
+    };
+    use fullmag_ir::ProblemIR;
+    use fullmag_plan::{StudyProblemCatalog, StudyProblemCatalogEntry};
+    use serde_json::json;
+
+    let (app, state, _repo_root) = test_router_with_session_store_state().await;
+    *state.current_live_state.write().await = None;
+    let definition = ProjectEnvelope::blank(
+        ProjectId::parse("project-batch-http").unwrap(),
+        "Batch",
+    )
+    .unwrap();
+    let archive = FileProjectRepository::new()
+        .encode_archive(&definition)
+        .unwrap();
+    let study = StudyPlan::from_pipeline(
+        "study-batch-http",
+        1,
+        &StudyPipelineDocument {
+            version: "study_pipeline.v2".into(),
+            nodes: vec![StudyPipelineNode::Primitive(PrimitiveStageNode {
+                id: "step:run".into(),
+                label: "Run".into(),
+                enabled: true,
+                notes: None,
+                source: Some(StudyPipelineNodeSource::UiAuthored),
+                stage_kind: StudyPrimitiveStageKind::Run,
+                payload: [("until_seconds".into(), json!("1e-9"))]
+                    .into_iter()
+                    .collect(),
+            })],
+        },
+        &StudyPlanMigrationDefaults {
+            model: StudyModelReference {
+                model_id: "model:batch".into(),
+                version: "v1".into(),
+            },
+            solver_config: StudySolverConfigReference {
+                preset_id: "solver:default".into(),
+                version: "v1".into(),
+            },
+            discretization: StudyDiscretizationReference {
+                recipe_id: "mesh:default".into(),
+                version: "v1".into(),
+            },
+            execution_profile: StudyExecutionProfileReference {
+                profile_id: "exec:auto".into(),
+                version: "v1".into(),
+            },
+        },
+    )
+    .unwrap();
+    let catalog = StudyProblemCatalog::from_entries(
+        &study,
+        vec![StudyProblemCatalogEntry::from_step(
+            &study.steps[0],
+            ProblemIR::bootstrap_example(),
+        )],
+    )
+    .unwrap();
+    let catalog_value = serde_json::to_value(&catalog).unwrap();
+    let template = RunSpecification::new(
+        ProjectSnapshot::from_envelope(&definition).unwrap(),
+        StudyReference {
+            study_id: StudyId::parse(study.study_id.clone()).unwrap(),
+            plan_version: STUDY_PLAN_SCHEMA_VERSION.into(),
+            plan_sha256: study.canonical_sha256().unwrap(),
+        },
+        fullmag_session::canonical_json_sha256(&catalog_value),
+        json!({}),
+        RequestedExecution {
+            backend: "fdm".into(),
+            device: "cpu".into(),
+            precision: "double".into(),
+            mode: "strict".into(),
+            minimum_resources: Some(RequestedResourceBudget {
+                cpu_millis: 100,
+                memory_bytes: 1,
+                gpu_memory_bytes: 0,
+                storage_bytes: 1,
+            }),
+        },
+    );
+    let batch_request = BatchExpansionRequest {
+        batch_id: "batch-http".into(),
+        strategy: BatchExecutionStrategy::Independent,
+        failure_policy: fullmag_application::BatchFailurePolicy::ContinueIndependent,
+        template,
+        axes: vec![BatchAxis {
+            name: "field_z".into(),
+            target: BatchAxisTarget::ExternalFieldB {
+                step_id: "step:run".into(),
+                direction: [0.0, 0.0, 1.0],
+            },
+            value_kind: BatchAxisValueKind::Number,
+            canonical_unit: "T".into(),
+            values: BatchAxisValues::List {
+                values: vec![json!(-0.01), json!(0.02)],
+            },
+            join: BatchAxisJoin::Cartesian,
+        }],
+        master_seed: 42,
+        seed_name: "batch_seed".into(),
+        max_cases: 16,
+        max_parallel_cases: Some(2),
+    };
+    let body = json!({
+        "archive_base64": base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &archive,
+        ),
+        "idempotency_key": "submit-batch-http",
+        "batch_request": batch_request,
+        "study_plan": study,
+        "study_problem_catalog": catalog,
+        "asset_paths": {},
+    });
+    let submit = |body: String| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v2/persistence/projects/project-batch-http/batches")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let first = app
+        .clone()
+        .oneshot(submit(body.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let accepted = body_json(first).await;
+    assert_eq!(accepted["disposition"], "accepted");
+    assert_eq!(accepted["batch_id"], "batch-http");
+    assert_eq!(accepted["case_count"], 2);
+
+    let replay = app
+        .clone()
+        .oneshot(submit(body.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(body_json(replay).await["disposition"], "replayed");
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v2/persistence/projects/project-batch-http/batches?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = body_json(listed).await;
+    assert_eq!(listed["batches"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["batches"][0]["manifest_sha256"], accepted["manifest_sha256"]);
+    assert_eq!(listed["batches"][0]["published_case_count"], 0);
+    assert_eq!(listed["batches"][0]["expansion_state"], "pending");
+
+    let cases_route = concat!(
+        "/v2/persistence/projects/project-batch-http/batches/batch-http/cases",
+        "?limit=10",
+    );
+    let cases = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(cases_route)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cases.status(), StatusCode::OK);
+    let cases = body_json(cases).await;
+    assert_eq!(cases["axes"][0]["name"], "field_z");
+    assert_eq!(cases["axes"][0]["canonical_unit"], "T");
+    assert_eq!(cases["cases"].as_array().unwrap().len(), 2);
+    assert_eq!(cases["cases"][0]["state"], "pending_expansion");
+    assert!(cases["cases"][0]["planned_run_id"].as_str().is_some());
+    assert!(cases["cases"][0]["published_run"].is_null());
+
+    let store = fullmag_session::SessionStore::open_existing(
+        state.submit_store_root.as_ref().unwrap(),
+    )
+    .unwrap();
+    let batch_intent = store
+        .read_batch_intent("batch-http")
+        .unwrap()
+        .expect("accepted batch intent is durable");
+    let manifest_bytes = store
+        .cas()
+        .get(&batch_intent.manifest_object_ref)
+        .unwrap()
+        .expect("accepted batch manifest is durable");
+    let mut manifest: fullmag_application::BatchExpansionManifest =
+        serde_json::from_slice(&manifest_bytes).unwrap();
+    let initial_progress = fullmag_session::FmsBatchExpansionProgress::new(
+        &batch_intent,
+        u64::try_from(manifest.cases.len()).unwrap(),
+        0,
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        store.commit_batch_expansion_progress(0, &initial_progress).unwrap(),
+        fullmag_session::BatchExpansionProgressCommitDisposition::Accepted
+    );
+
+    // Recreate the publisher crash window: the child intent commits before
+    // next_case_index advances, so the first child is at the cursor boundary.
+    let source_study: StudyPlan = serde_json::from_value(body["study_plan"].clone()).unwrap();
+    let source_catalog: StudyProblemCatalog =
+        serde_json::from_value(body["study_problem_catalog"].clone()).unwrap();
+    let first_case_id = manifest.cases[0].case_id.clone();
+    let materialized_case = fullmag_application::materialize_independent_batch_case(
+        &mut manifest,
+        &first_case_id,
+        &source_study,
+        &source_catalog,
+    )
+    .unwrap();
+    let output_storage: fullmag_ir::OutputStorageIR = serde_json::from_value(
+        batch_intent.specification["output_storage"]["settings"].clone(),
+    )
+    .unwrap();
+    let materialized_case = fullmag_application::bind_batch_case_output_storage(
+        &materialized_case,
+        &output_storage,
+    )
+    .unwrap();
+    let child_identity = format!("{}\0{}", batch_intent.batch_id, first_case_id);
+    let child_intent = fullmag_application::RunIntent::new(
+        format!(
+            "batch-case-{}",
+            fullmag_session::hex_sha256(child_identity.as_bytes())
+        ),
+        materialized_case.specification,
+    );
+    let pre_cursor_receipt =
+        crate::run_intent_persistence::commit_validated_run_intent_with_backlog_limit(
+            &store,
+            &child_intent,
+            &definition,
+            &materialized_case.study,
+            &materialized_case.catalog,
+            &std::collections::BTreeMap::new(),
+            std::num::NonZeroUsize::new(8).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        pre_cursor_receipt.disposition,
+        fullmag_application::SubmitDisposition::Accepted
+    );
+    assert_eq!(
+        pre_cursor_receipt.run_id.as_str(),
+        child_intent.specification.run_id.as_str()
+    );
+
+    let pending_materialization = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(cases_route)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending_materialization.status(), StatusCode::OK);
+    let pending_materialization = body_json(pending_materialization).await;
+    let pending_run = &pending_materialization["cases"][0]["published_run"];
+    assert_eq!(
+        pending_materialization["cases"][0]["state"],
+        "pending_materialization"
+    );
+    assert_eq!(pending_run["run_id"], cases["cases"][0]["planned_run_id"]);
+    assert_eq!(pending_run["catalog_state"], "pending_materialization");
+    assert!(pending_run["catalog_revision"].is_null());
+    assert_eq!(pending_run["tasks"].as_array().unwrap().len(), 0);
+
+    let batches_with_unadvanced_child = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v2/persistence/projects/project-batch-http/batches?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(batches_with_unadvanced_child.status(), StatusCode::OK);
+    let batches_with_unadvanced_child = body_json(batches_with_unadvanced_child).await;
+    assert_eq!(
+        batches_with_unadvanced_child["batches"][0]["published_case_count"],
+        0
+    );
+    assert_eq!(
+        batches_with_unadvanced_child["batches"][0]["expansion_state"],
+        "pending"
+    );
+
+    // Recovery replays the same child intent idempotently, then advances the
+    // durable cursor; the case row was already visible before that advance.
+    assert_eq!(
+        crate::run_intent_persistence::expand_pending_batch_children(
+            &store,
+            1,
+            std::num::NonZeroUsize::new(8).unwrap(),
+        )
+        .unwrap(),
+        1
+    );
+
+    let first_run_id = cases["cases"][0]["planned_run_id"].as_str().unwrap();
+    crate::run_intent_persistence::materialize_accepted_run_catalog(
+        &store,
+        first_run_id,
+        &ProjectId::parse("project-batch-http").unwrap(),
+    )
+    .unwrap();
+    drop(store);
+
+    let materialized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(concat!(
+                    "/v2/persistence/projects/project-batch-http/batches/batch-http/cases",
+                    "?limit=1",
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(materialized.status(), StatusCode::OK);
+    let materialized = body_json(materialized).await;
+    assert_eq!(materialized["cases"].as_array().unwrap().len(), 1);
+    assert_eq!(materialized["cases"][0]["state"], "materialized");
+    assert_eq!(
+        materialized["next_cursor"],
+        materialized["cases"][0]["case_id"]
+    );
+    let published_run = &materialized["cases"][0]["published_run"];
+    assert_eq!(published_run["run_id"], first_run_id);
+    assert_eq!(published_run["catalog_state"], "materialized");
+    assert_eq!(published_run["catalog_revision"], 1);
+    assert_eq!(published_run["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(published_run["tasks"][0]["lifecycle"], "accepted");
+
+    let second_page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/v2/persistence/projects/project-batch-http/batches/batch-http/cases?limit=1&cursor={}",
+                    materialized["next_cursor"].as_str().unwrap(),
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_page.status(), StatusCode::OK);
+    let second_page = body_json(second_page).await;
+    assert_eq!(second_page["cases"].as_array().unwrap().len(), 1);
+    assert_eq!(second_page["cases"][0]["state"], "pending_expansion");
+    assert!(second_page["cases"][0]["published_run"].is_null());
+
+    let mut changed = body;
+    changed["batch_request"]["axes"][0]["values"]["values"][0] = json!(-0.02);
+    let conflict = app
+        .oneshot(submit(changed.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert!(state.current_live_state.read().await.is_none());
+}
+
+#[tokio::test]
 async fn project_document_transport_creates_and_reopens_without_runtime_mutation() {
     let state = test_app_state();
     let app = build_v2_router().with_state(state.clone());
@@ -4171,16 +4580,25 @@ async fn from_script_embeds_script_provenance_and_survives_open_and_authoring() 
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "from-script response: {json:?}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "from-script response: {json:?}"
+    );
 
     let sha = format!("{:x}", Sha256::digest(FROM_SCRIPT_VALID.as_bytes()));
     assert_eq!(json["name"], "from script demo");
     assert_eq!(json["script_import"]["name"], "from script demo.py");
     assert_eq!(json["script_import"]["sha256"], sha);
     assert_eq!(json["script_import"]["origin"], "template:demo");
-    assert_eq!(json["script_import"]["script_path"], "project/source/script.py");
+    assert_eq!(
+        json["script_import"]["script_path"],
+        "project/source/script.py"
+    );
     assert_eq!(json["script_import"]["fidelity"]["scene_exported"], true);
-    let round_trip = json["script_import"]["fidelity"]["round_trip"].as_str().unwrap();
+    let round_trip = json["script_import"]["fidelity"]["round_trip"]
+        .as_str()
+        .unwrap();
     assert!(
         matches!(round_trip, "verified" | "failed" | "not_checked"),
         "round_trip: {round_trip}"
@@ -4254,7 +4672,10 @@ async fn from_script_embeds_script_provenance_and_survives_open_and_authoring() 
         "project/source/script.json",
         "project/provenance.json",
     ] {
-        assert_eq!(reopened_documents[path], documents[path], "{path} survives open");
+        assert_eq!(
+            reopened_documents[path], documents[path],
+            "{path} survives open"
+        );
     }
 
     // An authoring update replaces project/source.py, never the embedded script.
@@ -4327,7 +4748,10 @@ async fn from_script_reports_export_failure_as_422_and_keeps_nothing() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json:?}");
     assert_eq!(json["code"], "script_export_failed");
     assert!(
-        json["message"].as_str().unwrap().contains("boom-marker-4711"),
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("boom-marker-4711"),
         "the helper's error is returned: {json:?}"
     );
     let leftovers = fs::read_dir(root.join("workspace")).unwrap().count();
@@ -4423,15 +4847,17 @@ async fn from_script_survey_over_example_files() {
             let fidelity = &json["script_import"]["fidelity"];
             println!(
                 "SURVEY {name} | 201 | round_trip={} | {seconds:.1}s | notes={}",
-                fidelity["round_trip"],
-                fidelity["notes"]
+                fidelity["round_trip"], fidelity["notes"]
             );
         } else {
             println!(
                 "SURVEY {name} | {} | {} | {seconds:.1}s | {}",
                 status.as_u16(),
                 json["code"],
-                json["message"].as_str().unwrap_or_default().replace('\n', " ")
+                json["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .replace('\n', " ")
             );
         }
     }

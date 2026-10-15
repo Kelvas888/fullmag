@@ -1,9 +1,11 @@
-import { act } from "react";
+import { act, type ReactNode } from "react";
 import { createRoot, hydrateRoot } from "react-dom/client";
 import { renderToString, renderToStaticMarkup } from "react-dom/server";
 import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { KernelContext } from "@/kernel/KernelContext";
+import type { KernelApi } from "@/kernel/types";
 import {
   installSimulationPreparationTestDom,
   TestElement,
@@ -16,7 +18,8 @@ import {
   resetCrossSectionWorkspaceForTests,
 } from "@/kernel/workspace/crossSectionWorkspace";
 
-import { PlanarMonitorDraftInspectorPanel } from "./PlanarMonitorDraftInspectorPanel";
+import { InspectorEditSessionProvider } from "../InspectorEditSession";
+import { PlanarMonitorDraftInspectorPanel as UnwrappedPlanarMonitorDraftInspectorPanel } from "./PlanarMonitorDraftInspectorPanel";
 
 const mocks = vi.hoisted(() => ({
   authoringHistory: undefined as { record: ReturnType<typeof vi.fn>; getGeneration?: () => number } | undefined,
@@ -24,6 +27,7 @@ const mocks = vi.hoisted(() => ({
   currentSessionScopeKey: "session=A&epoch=1&request_scope_epoch=1" as string | null,
   historyGeneration: 0,
   invalidate: vi.fn(),
+  kernel: null as unknown,
   scene: vi.fn(),
   setActiveViewportMainModule: vi.fn(),
   setFocusedSlot: vi.fn(),
@@ -42,12 +46,22 @@ const sessionA = {
 } as const;
 const sessionAScopeKey = "session=A&epoch=1&request_scope_epoch=1";
 
-vi.mock("@/kernel/KernelContext", () => ({
-  useKernel: () => ({
+vi.mock("@/kernel/KernelContext", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@/kernel/KernelContext")>();
+  return {
+    ...original,
+    useKernel: () => mocks.kernel,
+  };
+});
+
+function createTestKernel(): KernelApi {
+  return {
     api: { model: { planarMonitors: { create: mocks.create }, scene: mocks.scene } },
-    authoringHistory: mocks.authoringHistory
-      ? { ...mocks.authoringHistory, getGeneration: () => mocks.historyGeneration }
-      : undefined,
+    get authoringHistory() {
+      return mocks.authoringHistory
+        ? { ...mocks.authoringHistory, getGeneration: () => mocks.historyGeneration }
+        : undefined;
+    },
     commands: { getSessionScopeKey: () => mocks.currentSessionScopeKey },
     layout: {
       setActiveViewportMainModule: mocks.setActiveViewportMainModule,
@@ -57,8 +71,24 @@ vi.mock("@/kernel/KernelContext", () => ({
     resources: { invalidate: mocks.invalidate },
     selection: { set: mocks.setSelection },
     visualizationSync: { queuePatch: mocks.queuePatch },
-  }),
-}));
+  } as unknown as KernelApi;
+}
+
+function TestProviders({ children }: { children: ReactNode }) {
+  return (
+    <KernelContext.Provider value={mocks.kernel as KernelApi}>
+      <InspectorEditSessionProvider>{children}</InspectorEditSessionProvider>
+    </KernelContext.Provider>
+  );
+}
+
+function PlanarMonitorDraftInspectorPanel() {
+  return (
+    <TestProviders>
+      <UnwrappedPlanarMonitorDraftInspectorPanel />
+    </TestProviders>
+  );
+}
 
 vi.mock("@/kernel/resources/useSessionStatus", () => ({
   useSessionResourceIdentity: () => mocks.sessionIdentity,
@@ -90,6 +120,7 @@ describe("PlanarMonitorDraftInspectorPanel", () => {
     mocks.authoringHistory = undefined;
     mocks.currentSessionScopeKey = sessionAScopeKey;
     mocks.historyGeneration = 0;
+    mocks.kernel = createTestKernel();
     mocks.sessionIdentity = sessionA;
     mocks.scene.mockReset();
     mocks.create.mockResolvedValue({

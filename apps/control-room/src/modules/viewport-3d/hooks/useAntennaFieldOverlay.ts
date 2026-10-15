@@ -3,11 +3,12 @@
 import { useEffect, useMemo } from "react";
 import { isClosedLoopDisplay } from "@/kernel/resources/antennaClosedLoopInspectionModel";
 import { useClosedLoopAntennaOverlay } from "./useClosedLoopAntennaOverlay";
-import { antennaFieldPayloadEtag, antennaInspectionDisplayMatchesOwner, useAntennaFieldSolutionPayloadResource, useAntennaFieldSolutionResource, useAntennaStageOutputCatalogResource, useAntennaExternalLeadInspectionResource, useAntennaInspectionDisplayResource, useAntennaInspectionDisplayPayloadResource } from "@/kernel/resources/antennaResources";
+import { antennaInspectionDisplayMatchesOwner, useAntennaFieldSolutionPayloadResource, useAntennaFieldSolutionResource, useAntennaStageOutputCatalogResource, useAntennaExternalLeadInspectionResource, useAntennaInspectionDisplayResource, useAntennaInspectionDisplayPayloadResource } from "@/kernel/resources/antennaResources";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
 import { useObjectVisualizationSelector, useObjectVisualizationController } from "@/kernel/visualization/useObjectVisualization";
 import { antennaDisplayShape, antennaDisplayTopologyShape, buildAntennaFieldOverlayModel } from "../model/antennaFieldOverlayModel";
+import { resolveAntennaBasisOverlayPlan } from "../model/antennaFieldOverlayPlan";
 import { antennaCurrentTraceShape, buildAntennaCurrentOverlayModel, projectAntennaCurrentOverlayModel } from "../model/antennaCurrentOverlayModel";
 import { antennaInspectionIntentMatchesOwner, type AntennaFieldIntent } from "@/kernel/visualization/antennaFieldIntent";
 
@@ -49,31 +50,9 @@ export function useAntennaFieldOverlay() {
     }
     catch { return null; }
   }, [intent, inspection.data, inspectionOwnerMatches, display.data, display.status, display.refreshError]);
-  const plan = useMemo(() => {
-    if (!intent || intent.kind !== "basis" || solution.status !== "ready" || catalog.status !== "ready") return null;
-    const data = solution.data;
-    const stage = catalog.data;
-    const output = stage?.outputs.find((item) => item.output_id === intent.solutionId);
-    if (!data || !stage || data.status !== "ready" || stage.status !== "ready" ||
-        data.solution_id !== intent.solutionId || data.stage_id !== intent.stageId || data.quantity !== "H_ant_basis" ||
-        data.source_object_id !== intent.sourceObjectId || data.content_digest !== intent.contentDigest ||
-        data.session_id !== intent.sessionId || data.session_epoch !== intent.sessionEpoch || data.request_scope_epoch !== intent.requestScopeEpoch ||
-        stage.stage_id !== intent.stageId || stage.session_id !== intent.sessionId || stage.session_epoch !== intent.sessionEpoch || stage.request_scope_epoch !== intent.requestScopeEpoch ||
-        output?.solution_ref.content_digest !== intent.contentDigest || output.solution_ref.asset_id !== data.asset_id || output.solution_ref.stage_id !== intent.stageId) return null;
-    const basis = data.bases.find((candidate) => candidate.port_mode_id === intent.portModeId);
-    if (!basis) return null;
-    const quantity = intent.quantity;
-    if (quantity === "device_potential" || quantity === "current_density" || quantity === "magnetic_field") return null;
-    const positionKind = quantity === "magnetic_field_per_ampere" ? "sample_positions" as const : "conductor_positions" as const;
-    const positions = data[positionKind];
-    const values = basis[quantity];
-    try {
-      const count = antennaDisplayShape(positions, values, intent);
-      return { count, quantity, positionKind, positions, values,
-        positionEtag: antennaFieldPayloadEtag(data, positionKind),
-        fieldEtag: antennaFieldPayloadEtag(data, quantity, intent.portModeId) };
-    } catch { return null; }
-  }, [intent, solution.data, solution.status, catalog.data, catalog.status]);
+  const plan = useMemo(() => resolveAntennaBasisOverlayPlan(intent,
+    { data: solution.data, status: solution.status }, { data: catalog.data, status: catalog.status }),
+  [intent, solution.data, solution.status, catalog.data, catalog.status]);
   const positions = useAntennaFieldSolutionPayloadResource(plan ? intent?.solutionId : null, plan?.positionKind, null, {
     enabled: Boolean(plan), expectedEtag: plan?.positionEtag,
     maxResponseBytes: plan ? plan.positions.value_count * 8 : undefined,

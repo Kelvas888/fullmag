@@ -2,7 +2,7 @@
 
 import { restoreMeshHistoryToDraft } from "@/kernel/authoring/meshBuildHistoryRestore";
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 
 import type { JsonObject, LiveStatusResource, MeshSharedDomainManifestResource } from "@/kernel/api/apiTypes";
 import { createCommandContext } from "@/kernel/commands/commandContext";
@@ -28,7 +28,12 @@ import {
   shouldLoadRuntimeMeshManifest,
   shouldLoadRuntimeMeshSummary,
 } from "@/kernel/resources/studyRuntimeResources";
+import {
+  projectFlatActiveLaneDiscretization,
+  resolveSessionDiscretization,
+} from "@/kernel/resources/sessionDiscretization";
 import { useKernel } from "@/kernel/KernelContext";
+import type { SessionDiscretizationCapabilitiesProjection } from "@/kernel/resources/sessionDiscretization";
 import {
   SESSION_STATUS_RESOURCE_KEY,
   useSessionStatusSelector,
@@ -42,6 +47,7 @@ import {
   normalizeMeshBuildHistory,
   type MeshBuildHistoryEntry,
 } from "@/shared/domain/mesh/meshBuildHistory";
+import { resolveMeshBuildFreshness } from "@/shared/domain/mesh/meshBuildFreshness";
 import {
   type MeshPolicyDiffRow,
   diffMeshPolicies,
@@ -92,7 +98,8 @@ export function shouldLoadMeshDetailsFemResources(
 }
 
 type MeshDetailsRuntimeStatus = {
-  capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology">;
+  capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology"> &
+    SessionDiscretizationCapabilitiesProjection;
   domain: Pick<LiveStatusResource["domain"], "discretization">;
   resources: Pick<
     LiveStatusResource["resources"],
@@ -170,9 +177,19 @@ function selectMeshDetailsRuntimeStatus(status: {
   data: LiveStatusResource | null;
 }): MeshDetailsRuntimeStatus | null {
   if (!status.data) return null;
+  const sourceCapabilities = status.data.capabilities;
+  const flatLane = projectFlatActiveLaneDiscretization(sourceCapabilities);
+  const hasActiveLane = Object.prototype.hasOwnProperty.call(
+    sourceCapabilities ?? {},
+    "active_lane",
+  );
   return {
     capabilities: {
-      explicit_topology: status.data.capabilities.explicit_topology,
+      explicit_topology: status.data.capabilities?.explicit_topology ?? false,
+      ...(hasActiveLane
+        ? { active_lane: sourceCapabilities?.active_lane ?? null }
+        : {}),
+      ...(flatLane ? { active_lane_discretization: flatLane.value } : {}),
     },
     domain: {
       discretization: status.data.domain.discretization,
@@ -191,6 +208,22 @@ function meshDetailsRuntimeStatusEquals(
   if (previous === next) return true;
   if (!previous || !next) return previous === next;
   return (
+    Object.prototype.hasOwnProperty.call(
+      previous.capabilities,
+      "active_lane",
+    ) === Object.prototype.hasOwnProperty.call(next.capabilities, "active_lane") &&
+    previous.capabilities.active_lane?.resolved?.discretization ===
+      next.capabilities.active_lane?.resolved?.discretization &&
+    Object.prototype.hasOwnProperty.call(
+      previous.capabilities,
+      "active_lane_discretization",
+    ) ===
+      Object.prototype.hasOwnProperty.call(
+        next.capabilities,
+        "active_lane_discretization",
+      ) &&
+    previous.capabilities.active_lane_discretization ===
+      next.capabilities.active_lane_discretization &&
     previous.capabilities.explicit_topology ===
       next.capabilities.explicit_topology &&
     previous.domain.discretization === next.domain.discretization &&
@@ -390,7 +423,7 @@ export function useMeshDetailsModel(
     selectMeshDetailsRuntimeStatus,
     { isEqual: meshDetailsRuntimeStatusEquals },
   );
-  const lane = resolveMeshDetailsLane(runtimeStatus?.domain.discretization);
+  const lane = resolveMeshDetailsLane(resolveSessionDiscretization(runtimeStatus));
   const femLane = lane === "fem";
   const loadMeshSummary = shouldLoadMeshDetailsFemResources(
     lane,
@@ -485,15 +518,15 @@ export function useMeshDetailsModel(
     recordField(lastBuildGeometryRealization, "source_scene_revision"),
     recordField(activeBuildRecord, "source_scene_revision"),
   );
-  const meshIsStale =
-    sceneRevision !== null &&
-    meshSourceSceneRevision !== null &&
-    meshSourceSceneRevision < sceneRevision;
-  const meshFreshness = meshIsStale
-    ? "stale"
-    : sceneRevision !== null && meshSourceSceneRevision !== null
-      ? "current"
-      : "unknown";
+  const freshnessResult = resolveMeshBuildFreshness({
+    activeBuild: activeBuildRecord,
+    latestBuild: asRecord(lastBuildSummary),
+    manifest: manifest.data as Record<string, unknown> | null | undefined,
+    sceneRevision,
+    statusMeshRevision: summary.data?.revision,
+  });
+  const meshFreshness = freshnessResult.state;
+  const meshIsStale = meshFreshness === "stale";
   const targetCount = Object.keys(
     asRecord(activeBuild.data?.effective_per_object_targets) ?? {},
   ).length;
@@ -534,9 +567,12 @@ export function useMeshDetailsModel(
           nodeId,
           objectId: null,
           ref: {
+            artifactId: manifest.data?.mesh_id ?? null,
             centroid: element.centroid,
             elementIndex: element.elementIndex,
+            generationId: manifest.data?.generation_id ?? null,
             kind: "mesh.quality.element",
+            meshRevision: numericRevision(summary.data?.revision),
             metric: "gamma",
             nodeId,
             type: "mesh-quality-element",
@@ -547,7 +583,7 @@ export function useMeshDetailsModel(
       );
       kernel.layout.setActiveTab("mesh");
     },
-    [kernel],
+    [kernel, manifest.data?.generation_id, manifest.data?.mesh_id, summary.data?.revision],
   );
   const selectQualityMetric = useCallback(
     (metric: MeshQualityMetric["id"]) => {
@@ -603,6 +639,19 @@ export function useMeshDetailsModel(
     },
     [kernel],
   );
+
+  useEffect(() => {
+    const currentGenerationId = manifest.data?.generation_id;
+    const currentSelection = kernel.selection.get();
+    if (
+      currentSelection.ref?.type === "mesh-quality-element" &&
+      currentSelection.ref.generationId &&
+      currentGenerationId &&
+      currentSelection.ref.generationId !== currentGenerationId
+    ) {
+      kernel.selection.clear("mesh");
+    }
+  }, [kernel.selection, manifest.data?.generation_id]);
 
   return {
     activeBuildRevision: activeBuild.data?.revision,
