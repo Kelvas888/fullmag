@@ -46,6 +46,10 @@ host() {
   nsenter -t "${HOST_PID}" -m -- "$@"
 }
 
+host_root_path() {
+  printf '/proc/%s/root%s' "${HOST_PID}" "$1"
+}
+
 fail() {
   echo "[docker_host_ledger] $*" >&2
   exit 2
@@ -88,6 +92,7 @@ validate_inputs() {
   [[ "$(id -u)" == "0" ]] || fail "maintenance helper must run as uid 0"
   require_command nsenter
   require_command flock
+  require_command python3
   [[ "${PROFILE_VALUE}" == "${PROFILE}" ]] || fail "FULLMAG_HOST_LEDGER_PROFILE must be ${PROFILE}"
   [[ "${PROJECT_ID}" =~ ^[a-z0-9][a-z0-9._-]{0,79}$ ]] || fail "invalid host-ledger project id"
   require_uint FULLMAG_HOST_LEDGER_HOST_PID "${HOST_PID}"
@@ -130,7 +135,7 @@ validate_inputs() {
   assert_safe_path FULLMAG_HOST_LEDGER_MOUNT_ROOT "${MOUNT_ROOT}"
   assert_safe_path FULLMAG_HOST_LEDGER_LOCK_PATH "${LOCK_PATH}"
   host test "$(host id -u)" = "0" || fail "host mount namespace is not controlled by uid 0"
-  for command_name in cat chmod chown find findmnt flock losetup mount mkfs.ext4 blkid mkdir mv rm stat test truncate umount python3; do
+  for command_name in cat chmod chown find findmnt flock losetup mount mkfs.ext4 blkid mkdir mv rm stat test truncate umount; do
     require_host_command "${command_name}"
   done
 }
@@ -141,7 +146,7 @@ validate_storage_marker() {
   local marker="${STORAGE_ROOT}/.fullmag-storage.json"
   host test -f "${marker}" || fail "resolved storage marker is missing: ${marker}"
   host test ! -L "${marker}" || fail "resolved storage marker is a symlink"
-  host python3 -c 'import json, os, stat, sys
+  python3 -c 'import json, os, stat, sys
 path = sys.argv[1]
 st = os.lstat(path)
 if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > 16384:
@@ -160,7 +165,7 @@ if any(part in {".", ".."} for part in normalized.split("/")):
     raise SystemExit("storage marker project_root contains traversal")
 if normalized.startswith("//"):
     raise SystemExit("storage marker project_root must not be UNC")
-' "${marker}" || fail "resolved storage marker is invalid"
+' "$(host_root_path "${marker}")" || fail "resolved storage marker is invalid"
 }
 
 read_mount_state() {
@@ -214,7 +219,7 @@ verify_loop_identity() {
 verify_owner_marker() {
   host test -f "${OWNER_MARKER}" || fail "host-ledger owner marker is missing"
   host test ! -L "${OWNER_MARKER}" || fail "host-ledger owner marker is a symlink"
-  host python3 -c 'import json, os, re, stat, sys, uuid
+  python3 -c 'import json, os, re, stat, sys, uuid
 path, profile, project, image, mount, fs_uuid, size, target, uid, gid = sys.argv[1:]
 st = os.lstat(path)
 if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_gid != 0 or stat.S_IMODE(st.st_mode) != 0o444:
@@ -241,7 +246,7 @@ except (ValueError, TypeError, AttributeError):
     raise SystemExit("owner marker token is invalid")
 if str(token) != value["owner_token"] or token.int == 0:
     raise SystemExit("owner marker token is not canonical")
-' "${OWNER_MARKER}" "${PROFILE}" "${PROJECT_ID}" "${BACKING_IMAGE}" "${MOUNT_ROOT}" "${FILESYSTEM_UUID}" "${IMAGE_SIZE_BYTES}" "${MOUNT_TARGET}" "${RUNTIME_UID}" "${RUNTIME_GID}" || fail "host-ledger owner marker is invalid"
+' "$(host_root_path "${OWNER_MARKER}")" "${PROFILE}" "${PROJECT_ID}" "${BACKING_IMAGE}" "${MOUNT_ROOT}" "${FILESYSTEM_UUID}" "${IMAGE_SIZE_BYTES}" "${MOUNT_TARGET}" "${RUNTIME_UID}" "${RUNTIME_GID}" || fail "host-ledger owner marker is invalid"
 }
 
 verify_runtime_directory() {
@@ -283,7 +288,7 @@ acquire_lock() {
   host test ! -L "${LOCK_PATH}" || fail "host-ledger lock is a symlink"
   # The storage root is bind-mounted at the same absolute path in the helper;
   # locking this inode coordinates all maintenance containers on this host.
-  exec {LOCK_FD}>"${LOCK_PATH}" || fail "cannot open host-ledger lock"
+  exec {LOCK_FD}>"$(host_root_path "${LOCK_PATH}")" || fail "cannot open host-ledger lock"
   if [[ "${mode}" == "exclusive" ]]; then
     flock -x -w "${LOCK_WAIT}" "${LOCK_FD}" || fail "timed out waiting for host-ledger lock"
   else
@@ -323,7 +328,7 @@ allocate_and_mount() {
   reject_associated_loop
   host mkdir -p "${MOUNT_ROOT}" || fail "cannot create host-ledger mount root"
   inspect_unmounted_mount_root
-  LOOP_DEVICE="$(host losetup --find --show --read-write "${BACKING_IMAGE}")" || fail "cannot allocate a loop device for host ledger"
+  LOOP_DEVICE="$(host losetup --find --show "${BACKING_IMAGE}")" || fail "cannot allocate a loop device for host ledger"
   [[ "${LOOP_DEVICE}" =~ ^/dev/loop[0-9]+$ ]] || fail "losetup returned an invalid loop device: ${LOOP_DEVICE}"
   ALLOCATED_LOOP=1
   local loop_name="${LOOP_DEVICE#/dev/}"
@@ -365,7 +370,7 @@ print(json.dumps({
 PY
 )"
   temporary="${OWNER_MARKER}.tmp.$$.${RANDOM}"
-  host python3 -c 'import os, sys
+  python3 -c 'import os, sys
 path, temporary, payload = sys.argv[1:]
 if os.path.lexists(path):
     raise SystemExit("owner marker already exists")
@@ -386,7 +391,7 @@ except BaseException:
     except OSError:
         pass
     raise
-' "${OWNER_MARKER}" "${temporary}" "${payload}" || fail "cannot publish host-ledger owner marker"
+' "$(host_root_path "${OWNER_MARKER}")" "$(host_root_path "${temporary}")" "${payload}" || fail "cannot publish host-ledger owner marker"
   OWNER_MARKER_WRITTEN=1
 }
 
@@ -428,7 +433,7 @@ cleanup() {
   [[ "${SUCCESS}" == "1" ]] && return "${status}"
   local cleanup_failed=0 owner_safe=1 unmounted=0
   if [[ "${OWNER_MARKER_WRITTEN}" == "1" ]]; then
-    host python3 -c 'import json, os, sys
+    python3 -c 'import json, os, sys
 path, token, profile, project, image, mount, fs_uuid, size, target, uid, gid = sys.argv[1:]
 try:
     with open(path, "rb") as stream:
@@ -447,7 +452,7 @@ checks = {
 if any(value.get(key) != expected_value for key, expected_value in checks.items()):
     raise SystemExit(4)
 os.unlink(path)
-' "${OWNER_MARKER}" "${OWNER_TOKEN:-}" "${PROFILE}" "${PROJECT_ID}" "${BACKING_IMAGE}" "${MOUNT_ROOT}" "${FILESYSTEM_UUID}" "${IMAGE_SIZE_BYTES}" "${MOUNT_TARGET}" "${RUNTIME_UID}" "${RUNTIME_GID}" || { cleanup_failed=1; owner_safe=0; }
+' "$(host_root_path "${OWNER_MARKER}")" "${OWNER_TOKEN:-}" "${PROFILE}" "${PROJECT_ID}" "${BACKING_IMAGE}" "${MOUNT_ROOT}" "${FILESYSTEM_UUID}" "${IMAGE_SIZE_BYTES}" "${MOUNT_TARGET}" "${RUNTIME_UID}" "${RUNTIME_GID}" || { cleanup_failed=1; owner_safe=0; }
   fi
   if [[ "${MOUNTED_BY_HELPER}" == "1" && -n "${LOOP_DEVICE}" && "${owner_safe}" == "1" ]]; then
     local current_source

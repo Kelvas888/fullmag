@@ -30,6 +30,9 @@ class FakeDocker:
             return json.dumps([{"Id": IMAGE, "Config": {"Volumes": None},
                                 "Os": "linux", "Architecture": "amd64"}])
         if args[0] == "compose" and "config" in args:
+            # Compose omits profiled services unless their profile is enabled.
+            if "--profile" not in args or cache.MAINTENANCE_PROFILE not in args:
+                return json.dumps({"services": {"frontend": {"volumes": []}}})
             env = kwargs["environment"]
             volumes = [
                 {"type": "bind", "source": env[cache.ENV_CACHE_SOURCE],

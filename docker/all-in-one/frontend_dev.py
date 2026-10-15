@@ -104,7 +104,11 @@ REQUIRED_MANIFEST_KEYS = frozenset(
 # contract.  It is frozen and included in the digest, but never interpreted as
 # a guest path or copied into the workspace.
 OPTIONAL_MANIFEST_KEYS = frozenset(
-    {"source_selection", "source_volume", "configuration_changes", "backend_build"}
+    {
+        "source_selection", "source_volume", "configuration_changes", "backend_build",
+        "worktree_id", "dependency_seed_files", "dependency_seed_sha256",
+        "toolpins", "toolpins_sha256",
+    }
 )
 GENERATED_RELATIVES = frozenset(
     {

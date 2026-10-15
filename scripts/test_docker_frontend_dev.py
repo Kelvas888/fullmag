@@ -394,6 +394,26 @@ else:
             receipt = json.loads(self.module.RECEIPT_PATH.read_text(encoding="utf-8"))
             self.assertEqual(receipt["state"], "unknown")
 
+    def test_host_cache_metadata_is_accepted_and_frozen_with_the_seed(self):
+        with isolated(self.module) as (_, _, inputs):
+            manifest = dict(inputs.manifest)
+            manifest.update(
+                worktree_id="fullmag-main-0123456789abcdef",
+                dependency_seed_files=["package.json", "pnpm-lock.yaml"],
+                dependency_seed_sha256="a" * 64,
+                toolpins={"node": "v24.18.0", "pnpm": "10.8.1", "watchpack_polling_ms": "500"},
+                toolpins_sha256="b" * 64,
+            )
+            self.module.INPUTS_PATH.write_text(json.dumps(manifest))
+            parsed = self.module.read_inputs(self.module.INPUTS_PATH)
+            self.assertEqual(parsed.manifest["dependency_seed_sha256"], "a" * 64)
+            self.module._freeze_inputs(parsed, allow_generated=False)
+            changed = dict(manifest, dependency_seed_sha256="c" * 64)
+            self.module.INPUTS_PATH.write_text(json.dumps(changed))
+            changed_inputs = self.module.read_inputs(self.module.INPUTS_PATH)
+            with self.assertRaisesRegex(self.module.FrontendDevError, "configuration or source identity changed"):
+                self.module._freeze_inputs(changed_inputs, allow_generated=False)
+
     def test_host_mount_descriptors_are_bound_to_the_fixed_workspace_targets(self):
         with isolated(self.module) as (root, workspace, inputs):
             manifest = json.loads(self.module.INPUTS_PATH.read_text(encoding="utf-8"))

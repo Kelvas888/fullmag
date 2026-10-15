@@ -234,7 +234,7 @@ main() {
   if [[ "$action" == ensure ]]; then lock_cache exclusive; else lock_cache shared; fi
   mount_state
   if [[ "$action" == verify ]]; then verify_current; emit validated 0
-  elif [[ "$MOUNT_ACTIVE" == 1 ]]; then lock_runtime; verify_current; emit ready 0
+  elif [[ "$MOUNT_ACTIVE" == 1 ]]; then verify_current; lock_runtime; verify_current; emit ready 0
   else ensure_cache; emit ready "$CREATED_IMAGE"
   fi
   SUCCESS=1

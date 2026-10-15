@@ -253,6 +253,17 @@ class HostLedgerTests(unittest.TestCase):
         source = Path(ledger.__file__).read_text(encoding="utf-8")
         self.assertNotIn("import yaml", source)
 
+    def test_helper_uses_container_python_and_host_root_filesystem_paths(self):
+        helper = Path(ledger.__file__).parents[1] / "scripts" / "lib" / ledger.HELPER_COPY_NAME
+        source = helper.read_text(encoding="utf-8")
+        self.assertIn("host_root_path()", source)
+        self.assertIn("/proc/%s/root%s", source)
+        self.assertNotIn("host python3", source)
+        self.assertIn('require_command python3', source)
+        self.assertIn('exec {LOCK_FD}>"$(host_root_path "${LOCK_PATH}")"', source)
+        self.assertNotIn("losetup --find --show --read-write", source)
+        self.assertIn('host losetup --find --show "${BACKING_IMAGE}"', source)
+
     def test_invoke_type_error_is_unknown_without_retry_or_environment_loss(self):
         docker = TypeErrorDocker()
         with self.assertRaises(ledger.DockerInvocationUnknown) as raised:
