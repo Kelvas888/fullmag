@@ -1,3 +1,4 @@
+import type { AntennaColorRange } from "./antennaColorRange";
 import type { AntennaExternalLeadInspectionResource } from "@/kernel/api/apiTypes";
 import { closedLoopManifest } from "@/kernel/resources/antennaClosedLoopInspectionModel";
 
@@ -35,8 +36,13 @@ export interface AntennaFieldIntent {
   wireframe?: boolean;
   points: boolean;
   vectors: boolean;
+  /** Explicit inspection overlay; ignores surface depth without changing vector data. */
+  vectorsOnTop?: boolean;
+  vectorThickness?: 1 | 2 | 4;
+  glyphLengthScale?: 1 | 2 | 4;
   component: "magnitude" | "x" | "y" | "z";
   palette: "viridis" | "coolwarm";
+  colorRange?: AntennaColorRange;
 }
 
 export function antennaInspectionIntentMatchesOwner(intent: AntennaFieldIntent, inspection: AntennaExternalLeadInspectionResource): boolean {

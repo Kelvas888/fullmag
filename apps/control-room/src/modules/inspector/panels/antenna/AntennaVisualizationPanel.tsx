@@ -4,6 +4,7 @@ import { useState } from "react";
 import { AntennaClippingControls } from "./AntennaClippingControls";
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
 import { AntennaCameraControls } from "./AntennaCameraControls";
+import { AntennaColorRangeControl } from "./AntennaColorRangeControl";
 import { closedLoopManifest } from "@/kernel/resources/antennaClosedLoopInspectionModel";
 
 import type { SceneResource } from "@/kernel/api/apiTypes";
@@ -22,7 +23,7 @@ import { ScientificInspectorContext, ScientificInspectorIdentity } from "../../c
 import { FieldRow } from "../../primitives/FieldRow";
 import { FormField } from "../../primitives/FormField";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
-import { VisualizationDisplayPassesControl, VisualizationRenderModeControl } from "../../visualization/VisualizationInspectorControls";
+import { VisualizationDisplayPassesControl, VisualizationRenderModeControl, type VisualizationRenderModeValue } from "../../visualization/VisualizationInspectorControls";
 import { VisualizationInspectorOverview } from "../ObjectVisualizationOverview";
 import { AntennaFieldBasisPreview } from "./AntennaFieldBasisPreview";
 import { ANTENNA_BASIS_QUANTITIES, type AntennaBasisQuantity } from "./AntennaFieldBasisPreviewModel";
@@ -111,12 +112,18 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
       portModeId: selectedPort, quantity: effectiveQuantity, points: active?.points ?? false,
       surface: surfaceAvailable && (active?.surface ?? false), wireframe: surfaceAvailable && (active?.wireframe ?? false),
       vectors: effectiveQuantity === "electric_potential_per_ampere" || effectiveQuantity === "device_potential" ? false : active?.vectors ?? false,
-      component: active?.component ?? "magnitude", palette: active?.palette ?? "viridis", ...patch,
+      vectorsOnTop: active?.vectorsOnTop ?? false, vectorThickness: active?.vectorThickness ?? 1, glyphLengthScale: active?.glyphLengthScale ?? 1,
+      component: active?.component ?? "magnitude", palette: active?.palette ?? "viridis",
+      colorRange: patch.quantity !== undefined && patch.quantity !== effectiveQuantity || patch.component !== undefined && patch.component !== active?.component || patch.portModeId !== undefined && patch.portModeId !== port ? undefined : active?.colorRange, ...patch,
     });
   };
   const unavailableReason = rawDisplay.error?.message ?? inspection.error?.message ?? (inspectionMode && mapping.state !== "mapped" ? mapping.message : null) ?? (!stageId ? "No configured antenna solve stage" : validation.join("; ") || (identity === "ready" && !sourceMatches ? "source/transport mismatch" : identity === "ready" && !ownerMatches ? "session owner mismatch" : sceneStatus !== "ready" ? `scene ${sceneStatus}` : identity));
   const { quantitySpec, carrierLabel, renderReason, rangeHint } =
     antennaVisualizationPresentation({ objectId, effectiveQuantity, inspectionMode, surfaceAvailable, current, raw, field: field.data });
+  const renderModes: Array<VisualizationRenderModeValue | "vectors"> = [
+    ...(surfaceAvailable ? ["surface", "surface+edges", "wireframe"] as const : []), "points",
+    ...(quantitySpec.components === 1 ? [] : ["vectors"] as const), "off",
+  ];
   return <>
     <VisualizationInspectorOverview
       dataState={available ? "Published snapshot" : "Unavailable"}
@@ -140,7 +147,7 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
           { id: "points", label: "Points", pressed: active?.points ?? false, disabled: !available || !port, onToggle: () => setDisplay({ points: !active?.points }) },
           { id: "vectors", label: "Vectors", pressed: active?.vectors ?? false, disabled: !available || !port || quantitySpec.components === 1, onToggle: () => setDisplay({ vectors: !active?.vectors }) },
         ]} />
-        <VisualizationRenderModeControl disabled={!available || !port} options={surfaceAvailable ? ["surface", "surface+edges", "wireframe", "points", "off"] : ["points", "off"]} value={active?.surface ? active.wireframe ? "surface+edges" : "surface" : active?.wireframe ? "wireframe" : active?.points ? "points" : "off"} onValueChange={(value) => setDisplay({ surface: value === "surface" || value === "surface+edges", wireframe: value === "wireframe" || value === "surface+edges", points: value === "points", vectors: value === "off" ? false : active?.vectors ?? false })} />
+        <VisualizationRenderModeControl disabled={!available || !port} options={renderModes} value={active?.surface ? active.wireframe ? "surface+edges" : "surface" : active?.wireframe ? "wireframe" : active?.points ? "points" : active?.vectors ? "vectors" : "off"} onValueChange={(value) => setDisplay({ surface: value === "surface" || value === "surface+edges", wireframe: value === "wireframe" || value === "surface+edges", points: value === "points", vectors: value === "vectors" ? true : value === "off" ? false : active?.vectors ?? false })} />
         <FieldRow label="Quantity" value={quantitySpec.label} />
         <Select disabled={!available} value={effectiveQuantity} onValueChange={(value) => { setQuantity(value as AntennaFieldQuantity); setDisplay({ quantity: value as AntennaFieldQuantity, surface: false, wireframe: false, vectors: value === "electric_potential_per_ampere" || value === "device_potential" ? false : active?.vectors ?? false }); }}>
           <SelectTrigger aria-label="Antenna quantity"><SelectValue /></SelectTrigger>
@@ -154,16 +161,26 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
         <p role="status">{renderReason}</p>
         {active && displayStatus?.intentKey === JSON.stringify(active) ? <>
           <FieldRow label="Field display" value={`${displayStatus.status}: ${displayStatus.reason}`} />
-          {displayStatus.status === "ready" ? <><FieldRow label="Rendered samples" value={String(displayStatus.sampleCount)} /><FieldRow label="Full color range" value={`${displayStatus.minimum?.toExponential(4)} … ${displayStatus.maximum?.toExponential(4)}`} unit={quantitySpec.unit} /></> : null}
+          {displayStatus.status === "ready" ? <><FieldRow label="Rendered samples" value={String(displayStatus.sampleCount)} /><FieldRow label="Automatic color range" value={`${displayStatus.minimum?.toExponential(4)} … ${displayStatus.maximum?.toExponential(4)}`} unit={quantitySpec.unit} /></> : null}
         </> : null}
       </>}
       surfaceColoring={<InspectorGroup title="Surface Coloring" badge={surfaceAvailable ? magnetic ? "sampling Tet4" : "device Tet4" : "unavailable"}>
         <FormField label="Color source" type="select" disabled value="basis" hint={renderReason}><option value="basis">{quantitySpec.label}</option></FormField>
-        <FormField label="Color range" type="select" disabled value={surfaceAvailable ? "auto" : "unavailable"} hint={rangeHint}><option value="unavailable">No surface binding</option><option value="auto">{current ? "Global sampled J range" : "Full finite nodal range"}</option></FormField>
-        <FormField label="Point / vector palette" type="select" disabled={!available || !port} value={active?.palette ?? "viridis"} onChange={(event) => setDisplay({ palette: event.target.value as AntennaFieldIntent["palette"] })} hint={current ? rangeHint : "Auto range over all complete, finite field samples; no primitive surface colors."}><option value="viridis">Viridis</option><option value="coolwarm">Coolwarm</option></FormField>
+        <AntennaColorRangeControl context={JSON.stringify([owner, objectId, stageId, inspectionMode, active?.solutionId, active?.runtimeStageId, active?.runId, active?.contentDigest, effectiveQuantity, port, active?.component ?? "magnitude"])} range={active?.colorRange}
+          data={displayStatus?.status === "ready" && displayStatus.intentKey === JSON.stringify(active) && displayStatus.minimum !== undefined && displayStatus.maximum !== undefined ? { minimum: displayStatus.minimum, maximum: displayStatus.maximum } : undefined}
+          unit={quantitySpec.unit} disabled={!available || !port} onApply={(colorRange) => setDisplay({ colorRange })} />
+        <FormField label="Point / vector palette" type="select" disabled={!available || !port} value={active?.palette ?? "viridis"} onChange={(event) => setDisplay({ palette: event.target.value as AntennaFieldIntent["palette"] })} hint={active?.colorRange ? "Manual SI limits shared by all display passes. Values outside the limits use endpoint colors." : current ? rangeHint : "Auto range over all complete, finite field samples; no primitive surface colors."}><option value="viridis">Viridis</option><option value="coolwarm">Coolwarm</option></FormField>
       </InspectorGroup>}
       vectors={<InspectorGroup title="Vectors" badge={quantitySpec.components === 1 ? "scalar" : "published carrier"}>
         <FormField label="Show vectors" type="checkbox" disabled={!available || !port || quantitySpec.components === 1} checked={active?.vectors ?? false} onChange={(event) => setDisplay({ vectors: event.target.checked })} hint={quantitySpec.components === 1 ? "Electric potential is scalar; vector glyphs do not apply." : "Full Cartesian glyphs, one global amplitude-preserving display scale derived from carrier bounds, independent of camera."} />
+        <FormField label="Glyph length" type="select" disabled={!available || !port || quantitySpec.components === 1} value={String(active?.glyphLengthScale ?? 1)} onChange={(event) => setDisplay({ glyphLengthScale: Number(event.target.value) as 1 | 2 | 4 })}
+          hint="One global display multiplier preserves directions and relative amplitudes. SI field values are unchanged; camera distance does not set glyph length."><option value="1">Standard</option><option value="2">2× length</option><option value="4">4× length</option></FormField>
+        <FormField label="Vector width" type="select" disabled={!available || !port || quantitySpec.components === 1} value={String(active?.vectorThickness ?? 1)} onChange={(event) => setDisplay({ vectorThickness: Number(event.target.value) as 1 | 2 | 4 })}
+          hint="Display width only. Vector direction, length and relative amplitudes are preserved."><option value="1">Standard</option><option value="2">2× width</option><option value="4">4× width</option></FormField>
+        <FormField label="Vector occlusion" type="select" disabled={!available || !port || quantitySpec.components === 1} value={active?.vectorsOnTop ? "overlay" : "depth"} onChange={(event) => setDisplay({ vectorsOnTop: event.target.value === "overlay" })}
+          hint={active?.vectorsOnTop ? "Inspection overlay ignores surface depth. Vector positions, directions and physical amplitude scaling are unchanged." : "Surface depth hides vectors inside opaque carriers. Choose Through surfaces to inspect interior samples."}>
+          <option value="depth">Surface depth</option><option value="overlay">Through surfaces</option>
+        </FormField>
         <FormField label="Vector component" type="select" disabled value={quantitySpec.components === 1 ? "none" : "xyz"}><option value="none">Not applicable (scalar)</option><option value="xyz">Cartesian vector</option></FormField>
       </InspectorGroup>}
       clipping={<AntennaClippingControls resource={sectionState} ownerKey={JSON.stringify(owner)} />}

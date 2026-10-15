@@ -45,6 +45,7 @@ export async function verifyAntennaClipping({ page, root, open, shot }) {
     assert.equal(clipped.sampleCount, initial.sampleCount); assert.equal(clipped.surfaceTriangles, initial.surfaceTriangles);
     assert.equal(clipped.lost, false); assert.ok(clipped.width > 0 && clipped.height > 0);
     await shot(`section-${quantity}-flipped`, true);
+    if (quantity === "current_density") await shot("section-controls-current-density", false, ".fm-antenna-clipping");
     await root.getByRole("switch", { name: "Section enabled", exact: true }).click();
     await page.waitForFunction(() => window.__antennaFieldCanvas?.().clippingPlanes === 0);
     assert.deepEqual(await pixel(), originalPixel);

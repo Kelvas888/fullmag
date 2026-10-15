@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { verifyAntennaGlyphCardinality } from "./lib/antenna-glyph-cardinality-browser-checks.mjs";
 import { verifyAntennaClipping } from "./lib/antenna-clipping-browser-checks.mjs";
 import { verifyClosedLoopVectorDisplay } from "./lib/closed-loop-vector-browser-checks.mjs";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
@@ -28,7 +29,7 @@ try {
     await page.goto(target.href);
     await root.waitFor({ state: "visible", timeout: 60000 });
   };
-  const shot = async (name, viewportOnly = false) => { const path = resolve(directory, `${name}.png`); if (viewportOnly) await page.locator("[data-antenna-field-viewport]").screenshot({ path }); else await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
+  const shot = async (name, viewportOnly = false, selector = null) => { const path = resolve(directory, `${name}.png`); if (selector) await page.locator(selector).screenshot({ path }); else if (viewportOnly) await page.locator("[data-antenna-field-viewport]").screenshot({ path }); else await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
   const sharedTemplate = async (ready = false) => {
     // A stable Inspector mounts before its asynchronous publication metadata arrives.
     if (ready) await page.waitForFunction(() => document.querySelector('[data-inspector-owner="object.antenna.visualization"] button[aria-label="Toggle Points"]')?.matches(":enabled"));
@@ -36,11 +37,17 @@ try {
     assert.equal(await root.getByRole("radiogroup", { name: "Render mode", exact: true }).count(), 1);
     for (const enabled of await Promise.all(["Surface", "Wireframe"].map((label) => root.getByRole("button", { name: `Toggle ${label}`, exact: true }).isEnabled()))) assert.equal(enabled, false);
     for (const enabled of await Promise.all(["Points", "Vectors"].map((label) => root.getByRole("button", { name: `Toggle ${label}`, exact: true }).isEnabled()))) assert.equal(enabled, ready);
-    for (const enabled of await Promise.all(["Carrier", "Color source", "Color range", "Vector component"].map((label) => root.getByRole("combobox", { name: label, exact: true }).isEnabled()))) assert.equal(enabled, false);
+    for (const enabled of await Promise.all(["Carrier", "Color source", "Vector component"].map((label) => root.getByRole("combobox", { name: label, exact: true }).isEnabled()))) assert.equal(enabled, false);
     assert.equal(await root.getByRole("combobox", { name: "Component", exact: true }).isEnabled(), ready);
+    assert.equal(await root.getByRole("textbox", { name: "Color minimum", exact: true }).isEnabled(), ready);
     assert.equal(await root.getByRole("checkbox", { name: "Show vectors", exact: true }).isEnabled(), ready);
+    assert.equal(await root.getByRole("combobox", { name: "Vector occlusion", exact: true }).isEnabled(), ready);
+    assert.equal(await root.getByRole("combobox", { name: "Vector width", exact: true }).isEnabled(), ready);
+    assert.equal(await root.getByRole("combobox", { name: "Glyph length", exact: true }).isEnabled(), ready);
+    assert.equal(await root.getByRole("radio", { name: "Vectors", exact: true }).isEnabled(), ready);
     assert.ok((await root.innerText()).includes("conductor primitive is never recolored"));
   };
+  checks.push(...await verifyAntennaGlyphCardinality({ page, root, open, shot }));
   checks.push(...await verifyAntennaClipping({ page, root, open, shot }));
   await open("camera-unavailable");
   await root.getByRole("button", { name: /Camera & View/ }).click();
@@ -200,6 +207,27 @@ try {
   assert.equal(canvas.lost, false); assert.ok(canvas.width > 0 && canvas.height > 0);
   assert.ok(Number.isFinite(canvas.colorMinimum) && Number.isFinite(canvas.colorMaximum) && canvas.colorMinimum >= 0 && canvas.colorMaximum <= 1);
   assert.ok((await root.innerText()).includes("Raw recorded drive Electric potential V [V], inspection only"));
+  const beforeVRange = await page.evaluate(() => window.__antennaVisualizationFixture.read().calls.length);
+  await root.getByRole("textbox", { name: "Color minimum", exact: true }).fill("-1");
+  await root.getByRole("textbox", { name: "Color maximum", exact: true }).fill("1");
+  await root.getByRole("button", { name: "Apply color range", exact: true }).click();
+  await page.waitForFunction(previous => {
+    const state = window.__antennaFieldCanvas?.();
+    return state?.rangeMinimum === -1 && state.rangeMaximum === 1 && JSON.stringify(state.pointColors) !== JSON.stringify(previous) && JSON.stringify(state.pointColors) === JSON.stringify(state.surfaceColors);
+  }, canvas.pointColors);
+  const manualV = await page.evaluate(() => window.__antennaFieldCanvas());
+  assert.equal(manualV.surfaceUuid, canvas.surfaceUuid); assert.equal(manualV.pointsUuid, canvas.pointsUuid);
+  assert.deepEqual([manualV.minimum, manualV.maximum], [canvas.minimum, canvas.maximum]);
+  for (const index of [1, 2, 3]) assert.deepEqual(manualV.pointColors.slice(index * 3, index * 3 + 3), manualV.pointColors.slice(0, 3));
+  for (const index of [6, 7, 8]) assert.deepEqual(manualV.pointColors.slice(index * 3, index * 3 + 3), manualV.pointColors.slice(27, 30));
+  const actionGap = await root.locator(".fm-antenna-color-range__actions button").evaluateAll(buttons => buttons[1].getBoundingClientRect().left - buttons[0].getBoundingClientRect().right);
+  assert.ok(actionGap >= 4, `Color action buttons touch: ${actionGap}`);
+  assert.equal(await root.getByRole("combobox", { name: "Vector occlusion", exact: true }).isEnabled(), false);
+  await shot("manual-color-range-device-potential");
+  await root.getByRole("button", { name: "Reset color range to Auto", exact: true }).click();
+  await page.waitForFunction(previous => JSON.stringify(window.__antennaFieldCanvas?.().pointColors) === JSON.stringify(previous), canvas.pointColors);
+  assert.equal(await page.evaluate(() => window.__antennaVisualizationFixture.read().calls.length), beforeVRange);
+  checks.push("Raw V manual SI range changes identical nodal point/surface RGB, clamps both endpoints, preserves geometry/data stats, restores Auto colors without any reads");
   await root.getByRole("radio", { name: "Shaded + Wireframe", exact: true }).click();
   await page.waitForFunction(() => window.__antennaFieldCanvas?.().pointCount === 0 && window.__antennaFieldCanvas?.().surfaceTriangles === 12 && window.__antennaFieldCanvas?.().wireframeEdges === 18);
   await shot("10-inspection-raw-V-device-Tet4");

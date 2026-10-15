@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { useThree } from "@react-three/fiber";
-import { BufferGeometry, ShaderMaterial, SRGBColorSpace, Vector2, Vector3, WebGLRenderTarget } from "three";
+import { BufferGeometry, InstancedMesh, Matrix4, ShaderMaterial, SRGBColorSpace, Vector2, Vector3, WebGLRenderTarget } from "three";
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
 import { DATA_ANTENNA_FIELD_SOLUTION_PATH, DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, VISUALIZATION_STATE_PATH, MODEL_SCENE_PATH, SESSIONS_PATH, SESSION_STATUS_PATH, SIMULATION_STAGES_EXECUTION_PATH, DATA_QUANTITIES_PATH } from "@/kernel/api/apiPaths";
 import type { VisualizationStateResource, VisualizationStatePatch, AntennaFieldSolutionResource, AntennaExternalLeadInspectionResource, AntennaInspectionDisplayResource, SceneResource, StageExecutionResource } from "@/kernel/api/apiTypes";
@@ -47,10 +47,11 @@ const subscribe = () => () => {};
 const client = () => true;
 const server = () => false;
 type Call = { method: string; path: string; range: string | null; scope: string | null; port: string | null };
-declare global { interface Window { __antennaVisualizationFixture?: { read(): { calls: Call[]; tree: unknown; unexpected: string[] }; selectOther(): void; }; __antennaFieldPixel?: (position: number[]) => number[]; __antennaFieldCanvas?: () => { clippingPlanes: number; lost: boolean; width: number; height: number; sampleCount: number; pointCount: number; glyphCount: number; surfaceTriangles: number; wireframeEdges: number; normalization: string; quantity: string; colorMinimum: number; colorMaximum: number; currentVertices: number; currentMaterial: string; currentComponent: number; paletteTextures: number; minimum: number; maximum: number; surfaceUuid: string; wireUuid: string; pointsUuid: string; materialUuid: string; paletteUuid: string; }; } }
+declare global { interface Window { __antennaVisualizationFixture?: { read(): { calls: Call[]; tree: unknown; unexpected: string[] }; selectOther(): void; }; __antennaFieldPixel?: (position: number[]) => number[]; __antennaFieldCanvas?: () => { glyphMeshUuids: string[]; glyphMaterialUuids: string[]; clippingPlanes: number; lost: boolean; width: number; height: number; sampleCount: number; pointCount: number; glyphCount: number; surfaceTriangles: number; wireframeEdges: number; normalization: string; quantity: string; colorMinimum: number; colorMaximum: number; pointColors: number[]; surfaceColors: number[]; glyphColors: number[][]; glyphMatrices: number[][]; glyphPixelBounds: number[][]; glyphDepthTests: boolean[]; glyphDepthWrites: boolean[]; rangeMinimum: number; rangeMaximum: number; shaderMinimum: number; shaderMaximum: number; vectorScale: number; currentVertices: number; currentMaterial: string; currentComponent: number; paletteTextures: number; minimum: number; maximum: number; surfaceUuid: string; wireUuid: string; pointsUuid: string; materialUuid: string; paletteUuid: string; }; } }
 
 function makeFixture() {
   const scenario = new URL(window.location.href).searchParams.get("scenario") ?? "ready";
+  const sampleCount = scenario === "glyph-count-7" ? 7 : scenario === "glyph-count-14" ? 14 : 10;
   const isInspection = scenario.startsWith("inspection");
   const cancellation = scenario === "inspection-closed-current-cancellation" ? "current"
     : scenario === "inspection-closed-magnetic-cancellation" ? "magnetic" : undefined;
@@ -74,9 +75,9 @@ function makeFixture() {
     ...owner, solution_id: "solution", stage_id: "solve", status: "ready", quantity: "H_ant_basis", asset_id: "fixture-asset", content_digest: digest,
     source_object_id: scenario === "foreign" ? "foreign-antenna" : "antenna", current_transport_id: "transport", geometry_revision: "historical-geometry", material_revision: "historical-material", mesh_digest: "historical-mesh",
     schema_version: "fixture-only", resource_id: "fixture-only", assumptions: ["Synthetic UI fixture; not a solver result"], component: "vector_basis", gauge_policy: "fixture-only", requested_execution: {}, resolved_execution: {}, solver_policy: {}, signatures: { current_solution_signature: "fixture-current", field_solution_signature: "fixture-field", target_projection_signatures: {} },
-    conductor_positions: ref("node_xyz_interleaved", "m", 30), sample_positions: ref("sample_xyz_interleaved", "m", 30),
+    conductor_positions: ref("node_xyz_interleaved", "m", sampleCount * 3), sample_positions: ref("sample_xyz_interleaved", "m", sampleCount * 3),
     sample_carrier: { domain: { kind: "global" }, carrier_kind: "mesh_nodes", location: "node", topology_digest: "field-topology" },
-    bases: [{ port_mode_id: "port", normalization_current_a: 1, measured_positive_terminal_current_a: 1, normalization_scale: 1, current_balance_certificate_digest: "fixture-only", quadrature_diagnostics: {}, electric_potential_per_ampere: ref("node_scalar", "V/A", 10), current_density_per_ampere: ref("sample_xyz_interleaved", "A/m^2/A", 30), magnetic_field_per_ampere: ref(scenario === "malformed" ? "wrong_layout" : "sample_xyz_interleaved", "A/m/A", 30) }],
+    bases: [{ port_mode_id: "port", normalization_current_a: 1, measured_positive_terminal_current_a: 1, normalization_scale: 1, current_balance_certificate_digest: "fixture-only", quadrature_diagnostics: {}, electric_potential_per_ampere: ref("node_scalar", "V/A", sampleCount), current_density_per_ampere: ref("sample_xyz_interleaved", "A/m^2/A", sampleCount * 3), magnetic_field_per_ampere: ref(scenario === "malformed" ? "wrong_layout" : "sample_xyz_interleaved", "A/m/A", sampleCount * 3) }],
   };
   if (scenario === "cardinality") solution.bases[0].magnetic_field_per_ampere.value_count = 27;
   if (scenario === "multiport") solution.bases.push({ ...solution.bases[0], port_mode_id: "port-two" });
@@ -275,7 +276,7 @@ function makeFixture() {
         view.setFloat64(index * 8, scenario === "nonfinite" && index === 9 && !kind.endsWith("positions") ? NaN : value, true);
       }
       const etag = scenario === "etag" ? '"wrong-revision"' : antennaFieldPayloadEtag(solution, kind, port);
-      return new Response(scenario === "short" ? data.slice(0, Math.max(0, bytes - 8)) : data, { status: 206, headers: { ...headers, "content-type": "application/octet-stream", etag, "content-range": `bytes 0-${bytes - 1}/${kind === "electric_potential_per_ampere" ? 80 : 240}`, "x-fullmag-scalar-type": "float64_le" } });
+      return new Response(scenario === "short" ? data.slice(0, Math.max(0, bytes - 8)) : data, { status: 206, headers: { ...headers, "content-type": "application/octet-stream", etag, "content-range": `bytes 0-${bytes - 1}/${kind === "electric_potential_per_ampere" ? sampleCount * 8 : sampleCount * 24}`, "x-fullmag-scalar-type": "float64_le" } });
     }
     unexpected.push(url.pathname); throw new Error(`Unexpected fixture request: ${url.pathname}`);
   } });
@@ -308,7 +309,31 @@ function FieldCanvasProbe({ tracker }: { tracker: Viewport3DResourceTracker }) {
     window.__antennaFieldCanvas = () => {
       const size = gl.getDrawingBufferSize(new Vector2());
       let glyphCount = 0;
-      scene.traverse((object) => { if ("isInstancedMesh" in object && object.isInstancedMesh && "count" in object) glyphCount = Math.max(glyphCount, Number(object.count)); });
+      const glyphColors: number[][] = [], glyphMatrices: number[][] = [];
+      const glyphMeshUuids: string[] = [], glyphMaterialUuids: string[] = [];
+      const glyphDepthTests: boolean[] = [], glyphDepthWrites: boolean[] = [];
+      const glyphPixelBounds: number[][] = [];
+      scene.traverse((object) => { if (object instanceof InstancedMesh) {
+        glyphCount = Math.max(glyphCount, object.count);
+        glyphMeshUuids.push(object.uuid);
+        for (const material of Array.isArray(object.material) ? object.material : [object.material]) {
+          glyphMaterialUuids.push(material.uuid);
+          glyphDepthTests.push(material.depthTest); glyphDepthWrites.push(material.depthWrite);
+        }
+        glyphColors.push(Array.from(object.instanceColor?.array.slice(0, object.count * 3) ?? []));
+        glyphMatrices.push(Array.from(object.instanceMatrix.array.slice(0, object.count * 16)));
+        object.geometry.computeBoundingBox();
+        const bounds = object.geometry.boundingBox!;
+        for (let index = 0; index < object.count; index++) {
+          const matrix = new Matrix4(); object.getMatrixAt(index, matrix);
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const x of [bounds.min.x, bounds.max.x]) for (const y of [bounds.min.y, bounds.max.y]) for (const z of [bounds.min.z, bounds.max.z]) {
+            const point = new Vector3(x, y, z).applyMatrix4(matrix).applyMatrix4(object.matrixWorld).project(camera);
+            minX = Math.min(minX, point.x); maxX = Math.max(maxX, point.x); minY = Math.min(minY, point.y); maxY = Math.max(maxY, point.y);
+          }
+          glyphPixelBounds.push([(maxX - minX) * size.x / 2, (maxY - minY) * size.y / 2]);
+        }
+      } });
       const field = scene.getObjectByName("antenna-scientific-field");
       const points = scene.getObjectByName("antenna-field-samples");
       const surface = scene.getObjectByName("antenna-field-surface"), wireframe = scene.getObjectByName("antenna-field-wireframe");
@@ -320,7 +345,12 @@ function FieldCanvasProbe({ tracker }: { tracker: Viewport3DResourceTracker }) {
       }
       const indices = (object: typeof surface) => object && "geometry" in object && object.geometry instanceof BufferGeometry ? object.geometry.index?.count ?? 0 : 0;
       const currentMaterial = surface && "material" in surface && surface.material instanceof ShaderMaterial ? surface.material : null;
-      return { clippingPlanes: gl.clippingPlanes.length, lost: gl.getContext().isContextLost(), width: size.x, height: size.y, sampleCount: field?.userData.sampleCount ?? 0, pointCount: points ? field?.userData.sampleCount ?? 0 : 0, glyphCount, surfaceTriangles: indices(surface) / 3, wireframeEdges: indices(wireframe) / 2, quantity: field?.userData.quantity ?? "", normalization: field?.userData.normalization ?? "", colorMinimum, colorMaximum,
+      return { glyphMeshUuids, glyphMaterialUuids, clippingPlanes: gl.clippingPlanes.length, lost: gl.getContext().isContextLost(), width: size.x, height: size.y, sampleCount: field?.userData.sampleCount ?? 0, pointCount: points ? field?.userData.sampleCount ?? 0 : 0, glyphCount, surfaceTriangles: indices(surface) / 3, wireframeEdges: indices(wireframe) / 2, quantity: field?.userData.quantity ?? "", normalization: field?.userData.normalization ?? "", colorMinimum, colorMaximum,
+        pointColors: points && "geometry" in points && points.geometry instanceof BufferGeometry ? Array.from(points.geometry.getAttribute("color")?.array ?? []) : [], glyphColors, glyphMatrices, glyphPixelBounds, glyphDepthTests, glyphDepthWrites,
+        surfaceColors: surface && "geometry" in surface && surface.geometry instanceof BufferGeometry ? Array.from(surface.geometry.getAttribute("color")?.array ?? []) : [],
+        rangeMinimum: field?.userData.colorRange?.minimum ?? 0, rangeMaximum: field?.userData.colorRange?.maximum ?? 0,
+        shaderMinimum: currentMaterial?.uniforms.fmAntennaMinimum.value ?? 0, shaderMaximum: currentMaterial?.uniforms.fmAntennaMaximum.value ?? 0,
+        vectorScale: field?.userData.surfaceVectorScale ?? 1,
         currentVertices: geometry instanceof BufferGeometry ? geometry.getAttribute("fmAntennaCurrentVector")?.count ?? 0 : 0,
         currentMaterial: currentMaterial?.name ?? "", currentComponent: currentMaterial?.uniforms.fmAntennaComponent.value ?? -1,
         paletteTextures: tracker.getSnapshot().textures, minimum: field?.userData.minimum ?? 0, maximum: field?.userData.maximum ?? 0,

@@ -1,3 +1,4 @@
+import { antennaSurfaceColorRange, resolveAntennaColorRange } from "@/kernel/visualization/antennaColorRange";
 import { DataTexture, DoubleSide, LinearFilter, RGBAFormat, ShaderMaterial, SRGBColorSpace, UnsignedByteType } from "three";
 import { scalarColorSrgb } from "@/shared/visualization/scalarColorPalette";
 import type { AntennaFieldOverlayModel } from "../model/antennaFieldOverlayModel";
@@ -55,8 +56,9 @@ export function createAntennaCurrentSurfaceMaterial() {
 export function updateAntennaCurrentSurfaceMaterial(material: ShaderMaterial, palette: DataTexture, model: AntennaFieldOverlayModel): void {
   const scale = model.surfaceVectorScale ?? 1;
   material.uniforms.fmAntennaComponent.value = model.intent.component === "x" ? 1 : model.intent.component === "y" ? 2 : model.intent.component === "z" ? 3 : 0;
-  material.uniforms.fmAntennaMinimum.value = model.minimum / scale;
-  material.uniforms.fmAntennaMaximum.value = model.maximum / scale;
+  const range = antennaSurfaceColorRange(resolveAntennaColorRange(model, model.intent.colorRange), scale);
+  material.uniforms.fmAntennaMinimum.value = range.minimum;
+  material.uniforms.fmAntennaMaximum.value = range.maximum;
   if (palette.userData.antennaPalette === model.intent.palette) return;
   const bytes = palette.image.data;
   if (!(bytes instanceof Uint8Array) || bytes.length !== 1024) throw new Error("Invalid antenna palette storage.");
