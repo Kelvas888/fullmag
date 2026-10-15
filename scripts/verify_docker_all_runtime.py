@@ -823,7 +823,7 @@ def _validate_frontend_dev_container(
     if (
         environment.get("FULLMAG_DOCKER_ROLE") != "frontend"
         or environment.get("FULLMAG_DOCKER_FRONTEND") != "dev"
-        or environment.get("FULLMAG_API_PROXY_TARGET") != "http://fullmag:8081"
+        or environment.get("FULLMAG_API_PROXY_TARGET") != "http://backend:8081"
         or environment.get("HOME") != "/state/development"
     ):
         raise VerificationError("frontend development proxy environment differs from the receipt")
@@ -835,6 +835,28 @@ def _validate_frontend_dev_container(
         "isolation": "PASS",
         "inputs": inputs,
     }
+
+
+def _validate_development_backend_mounts(document, receipt, assembly):
+    """Keep live source identity separate from the immutable compiled package."""
+    if assembly.get("runtime_mode") != "development_source_bind":
+        raise VerificationError("dev runtime does not use a source-bind image")
+    values = {
+        "/opt/fullmag/source": receipt.get("source_root"),
+        "/opt/fullmag/package": assembly.get("package_root"),
+        "/opt/fullmag/provenance.json": receipt.get("assembly_receipt"),
+    }
+    mounts = document.get("Mounts") or []
+    for target, source in values.items():
+        if not isinstance(source, str) or not source:
+            raise VerificationError("dev runtime lacks readonly bind provenance: " + target)
+        matches = [mount for mount in mounts if mount.get("Destination") == target]
+        if (len(matches) != 1 or matches[0].get("Type") != "bind"
+                or matches[0].get("RW") is not False
+                or not _same_path(host_path(matches[0].get("Source", "")), host_path(source))):
+            raise VerificationError("dev runtime readonly bind differs: " + target)
+    if receipt.get("compiled_source_commit") != assembly.get("commit"):
+        raise VerificationError("dev runtime compiled source identity differs from package")
 
 
 def _validate_container(
@@ -862,9 +884,21 @@ def _validate_container(
     container_labels = document.get("Config", {}).get("Labels") or {}
     if (
         container_labels.get("com.docker.compose.project") != receipt.get("compose_project")
-        or container_labels.get("com.docker.compose.service") != "fullmag"
+        or container_labels.get("com.docker.compose.service") != "backend"
     ):
         raise VerificationError("Docker backend compose ownership labels differ from the run receipt")
+    if mode == "dev":
+        if labels.get("org.fullmag.development") != "source-bind-v1":
+            raise VerificationError("dev image does not declare source-bind development")
+        _validate_development_backend_mounts(document, receipt, assembly)
+    from docker_compose_attestation import service_network, network_owner
+    network_id = service_network(document, receipt["compose_project"], hostname="fullmag-" + run_root.name)
+    if receipt.get("network_id") != network_id:
+        raise VerificationError("Backend network ID differs from the launch receipt")
+    network_documents = _docker_json("network", "inspect", network_id)
+    if not isinstance(network_documents, list) or len(network_documents) != 1:
+        raise VerificationError("Docker network inspect did not return one network")
+    network_owner(network_documents[0], receipt["compose_project"], network_id)
     _validate_isolation(document, "backend", gpu=True)
     host_config = document.get("HostConfig") or {}
     if mode == "static":
@@ -947,9 +981,11 @@ def _validate_container(
     frontend_attestation = None
     if mode == "dev":
         assert frontend_id is not None
-        _, frontend_attestation = _validate_frontend_dev_container(
+        frontend_document, frontend_attestation = _validate_frontend_dev_container(
             receipt, run_root, state, image, public_port, frontend_id
         )
+        if service_network(frontend_document, receipt["compose_project"]) != network_id:
+            raise VerificationError("Frontend and backend network IDs differ")
     return document, {
         "image": image_document,
         "provenance": provenance,
@@ -1009,9 +1045,8 @@ def _python_probe(container: str, log_root: Path) -> dict[str, Any]:
         for key in ("python_version", "executable", "fullmag_module", "fullmag_core_module")
     ):
         raise VerificationError("Python DSL probe omitted interpreter or module identity")
-    if not str(value["fullmag_module"]).startswith("/opt/fullmag/") or not str(
-        value["fullmag_core_module"]
-    ).startswith("/opt/fullmag/"):
+    if (not str(value["fullmag_module"]).startswith("/opt/fullmag/source/packages/fullmag-py/src/fullmag/")
+            or str(value["fullmag_core_module"]) != "/opt/fullmag/package/_fullmag_core.so"):
         raise VerificationError("Python DSL modules resolved outside the immutable image")
     return {"status": "PASS", **value}
 

@@ -32,6 +32,50 @@ class DockerAllRuntimeVerifierTests(unittest.TestCase):
                 value[key] = override
         return value
 
+    def test_service_rejects_foreign_network_extra_attachment_and_changed_hostname(self):
+        import copy
+        from docker_compose_attestation import service_network, network_owner
+        project, network_id = "fullmag-all-" + "a" * 32, "b" * 64
+        name, hostname = project + "_fullmag", "fullmag-" + "a" * 32
+        actual = {"HostConfig": {"NetworkMode": name}, "Config": {"Hostname": hostname},
+                  "NetworkSettings": {"Networks": {name: {"NetworkID": network_id}}}}
+        self.assertEqual(service_network(actual, project, hostname=hostname), network_id)
+        changed = copy.deepcopy(actual)
+        changed["NetworkSettings"]["Networks"]["foreign"] = {"NetworkID": "c" * 64}
+        with self.assertRaisesRegex(ValueError, "project-scoped"):
+            service_network(changed, project)
+        with self.assertRaisesRegex(ValueError, "hostname"):
+            service_network(actual, project, hostname="foreign-host")
+        owner = {"Id": network_id, "Name": name, "Driver": "bridge", "Scope": "local",
+                 "Labels": {"com.docker.compose.project": project, "com.docker.compose.network": "fullmag"}}
+        network_owner(owner, project, network_id)
+        with self.assertRaisesRegex(ValueError, "ownership"):
+            network_owner({**owner, "Labels": {}}, project, network_id)
+
+    def test_development_source_and_package_are_distinct_readonly_binds(self):
+        import copy
+        receipt = {"source_root": "/owned/checkout", "assembly_receipt": "/owned/assembly.json",
+                   "compiled_source_commit": "a" * 40}
+        assembly = {"runtime_mode": "development_source_bind", "package_root": "/owned/package",
+                    "commit": "a" * 40}
+        mounts = [{"Type": "bind", "Source": source, "Destination": target, "RW": False}
+                  for target, source in (("/opt/fullmag/source", "/owned/checkout"),
+                                         ("/opt/fullmag/package", "/owned/package"),
+                                         ("/opt/fullmag/provenance.json", "/owned/assembly.json"))]
+        verifier._validate_development_backend_mounts({"Mounts": mounts}, receipt, assembly)
+        for index in range(3):
+            changed = copy.deepcopy(mounts)
+            changed[index]["RW"] = True
+            with self.assertRaisesRegex(verifier.VerificationError, "readonly bind"):
+                verifier._validate_development_backend_mounts({"Mounts": changed}, receipt, assembly)
+        changed = copy.deepcopy(mounts)
+        changed[1]["Source"] = "/foreign/package"
+        with self.assertRaisesRegex(verifier.VerificationError, "readonly bind"):
+            verifier._validate_development_backend_mounts({"Mounts": changed}, receipt, assembly)
+        with self.assertRaisesRegex(verifier.VerificationError, "compiled source identity"):
+            verifier._validate_development_backend_mounts({"Mounts": mounts},
+                {**receipt, "compiled_source_commit": "b" * 40}, assembly)
+
     def test_smoke_command_has_explicit_workspace_and_output(self):
         command = verifier._verification_command(
             "/state/verification/abc", "/state/verification/abc/fem-gpu-receipt.json"

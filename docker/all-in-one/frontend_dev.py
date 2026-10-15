@@ -77,7 +77,7 @@ EXPECTED_NODE_VERSION = "v24.18.0"
 EXPECTED_PNPM_VERSION = "10.8.1"
 
 INTERNAL_PORT = 8080
-API_PROXY_TARGET = "http://fullmag:8081"
+API_PROXY_TARGET = "http://backend:8081"
 NEXT_DIST_DIR = ".next-control-room-8080"
 NEXT_RELATIVE = Path("node_modules/next/dist/bin/next")
 LIVE_DIRECTORY_NAMES = ("app", "src", "public", "scripts")

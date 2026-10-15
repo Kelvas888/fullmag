@@ -44,13 +44,14 @@ class DockerOutcomeUnknown(RuntimeError):
         self.timeout_seconds = timeout
 
 
-def docker(*args, combined=False, timeout=60):
+def docker(*args, combined=False, timeout=60, environment=None):
     # Windows talks directly to Desktop; Linux uses its active Linux socket.
     command = ["docker"]
     if os.name == "nt":
         command += ["--context", "desktop-linux"]
     try:
-        result = subprocess.run([*command, *args], text=True, capture_output=True, timeout=timeout)
+        result = subprocess.run([*command, *args], text=True, capture_output=True, timeout=timeout,
+                                env=None if environment is None else {**os.environ, **environment})
     except subprocess.TimeoutExpired as error:
         # Only the client is bounded. Docker-managed resources may still exist;
         # callers retain evidence and must not infer failure or retry mutation.
@@ -78,29 +79,44 @@ def validate_workspace_environment(config):
         raise ValueError("Runtime toolchain environment overrides model execution intent")
 
 
-def compose_spec(image, state, port, host_certificate=None):
+def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs=None,
+                 inputs_path=None, package=None, provenance=None, toolchain_image=None,
+                 project="fullmag-config-check", template=None):
+    """Resolve the versioned Compose definition; do not generate service topology."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("A full immutable image ID is required")
     if not 1024 <= port <= 65535:
         raise ValueError("Port must be between 1024 and 65535")
-    result = {"services": {"fullmag": {
-        "image": image, "pull_policy": "never", "init": True,
-        "read_only": True, "user": "65532:65532", "gpus": "all",
-        "cpus": 4, "mem_limit": "8g", "pids_limit": 512,
-        "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],
-        "ports": [f"127.0.0.1:{port}:8081"],
-        "volumes": [{"type": "bind", "source": str(state), "target": "/state"}],
-        "tmpfs": ["/tmp:rw,nosuid,nodev,size=512m"],
-        "stop_grace_period": "60s",
-    }}}
-    if host_certificate is not None:
-        service = result["services"]["fullmag"]
-        service["volumes"].append({"type": "bind", "source": str(host_certificate),
-                                   "target": "/run/fullmag/windows-folder-host.json", "read_only": True})
-        service["environment"] = {"FULLMAG_SESSION_STORAGE_PROFILE": "windows-folder-v1",
-                                   "FULLMAG_RUNTIME_IMAGE_ID": image}
-        service["hostname"] = "fullmag-" + Path(state).parent.name
-    return result
+    if host_certificate is None:
+        raise ValueError("Windows host certificate is required")
+    repo = Path(repo or Path(__file__).resolve().parents[1])
+    template = Path(template) if template is not None else repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml")
+    environment = {
+        "FULLMAG_RELEASE_IMAGE": image, "FULLMAG_DEV_IMAGE": image,
+        "FULLMAG_TOOLCHAIN_IMAGE": toolchain_image or image,
+        "FULLMAG_TOOLCHAIN_IMAGE_ID": toolchain_image or image,
+        "FULLMAG_STATE_ROOT": str(state), "FULLMAG_HTTP_PORT": str(port),
+        "FULLMAG_HOST_CERTIFICATE": str(host_certificate),
+        "FULLMAG_BACKEND_HOSTNAME": "fullmag-" + state.parent.name,
+    }
+    if inputs is not None:
+        if package is None or provenance is None or inputs_path is None:
+            raise ValueError("Development Compose requires a managed package and provenance")
+        environment.update(FULLMAG_SOURCE_ROOT=str(inputs["source_root"]),
+                           FULLMAG_BACKEND_PACKAGE=str(package),
+                           FULLMAG_PACKAGE_PROVENANCE=str(provenance),
+                           FULLMAG_DEVELOPMENT_INPUTS=str(inputs_path))
+    configured = json.loads(docker("compose", "--project-name", project,
+                                   "--project-directory", str(repo), "-f", str(template),
+                                   "config", "--format", "json", environment=environment))
+    expected = {"backend", "frontend"} if inputs is not None else {"backend"}
+    if set(configured.get("services", {})) != expected:
+        raise ValueError("Versioned Compose has unexpected services")
+    # A running configuration pins an existing image and never triggers a build.
+    # Keep the original YAML beside it for review and future image preparation.
+    for service in configured["services"].values():
+        service.pop("build", None)
+    return configured
 
 
 def prepare_gpu_release(layout, job_id, commit, *, source_digest=None, native_snapshot_sha256=None):
@@ -124,7 +140,7 @@ def prepare_gpu_release(layout, job_id, commit, *, source_digest=None, native_sn
     return root, context, built, capsule, package
 
 
-def submit_build(repo, commit=None, *, development=False):
+def submit_build(repo, commit=None, *, development=False, source_root=None):
     if not development and not re.fullmatch(r"[0-9a-f]{40}", commit or ""):
         raise ValueError("A full commit SHA is required")
     from local_runner.build_executor import configured_build
@@ -133,14 +149,14 @@ def submit_build(repo, commit=None, *, development=False):
     from local_runner.source import capture_source
 
     if development:
-        from docker_development_inputs import main_checkout
-        source_repo = main_checkout(repo)
-        required_helpers = ("Dockerfile", "entrypoint.py", "windows_folder_probe.py",
+        from docker_development_inputs import select_checkout
+        source_repo = select_checkout(repo, source_root)
+        required_helpers = ("Dockerfile", "Dockerfile.dev", "entrypoint.py", "windows_folder_probe.py",
                             "runtime_service.py", "frontend_dev.py", "healthcheck.py")
         for name in required_helpers:
             relative = "docker/all-in-one/" + name
             if storage.git(source_repo, "ls-files", "--", relative) != relative:
-                raise ValueError("Integrate the Docker runtime into the main checkout before its backend snapshot build")
+                raise ValueError("Integrate the Docker runtime into the selected checkout before its backend snapshot build")
         mode = "snapshot"
     else:
         source_repo = repo
@@ -170,7 +186,7 @@ def submit_build(repo, commit=None, *, development=False):
         manifest = capture_source(source_repo, destination, mode=mode, ref=commit, content_store=None)
         after = native_identity(source_repo, mode, manifest["resolved_commit"])
         if before is not None and before != after:
-            raise ValueError("Main checkout changed during backend snapshot capture")
+            raise ValueError("Selected checkout changed during backend snapshot capture")
         native = bind_identity(after, manifest)
         commit = manifest["resolved_commit"]
     submitted = {"worktree_id": layout["worktree_id"], "source_digest": manifest["source_digest"],
@@ -201,10 +217,22 @@ def submit_build(repo, commit=None, *, development=False):
         print(json.dumps(receipt, indent=2))
 
 
-def build_image(repo, job_id, commit, *, source_digest=None, native_snapshot_sha256=None):
-    if source_digest is not None or native_snapshot_sha256 is not None:
-        from docker_development_inputs import main_checkout
-        repo = main_checkout(repo)
+def stage_image_context(capsule, package, stage, *, development):
+    """Stage operational helpers; application inputs are mounted in development."""
+    if not development:
+        shutil.copytree(capsule / "tree", stage / "source", symlinks=False)
+        shutil.copytree(package, stage / "package", symlinks=False)
+    for name in ("entrypoint.py", "windows_folder_probe.py", "runtime_service.py", "frontend_dev.py", "healthcheck.py"):
+        shutil.copyfile(capsule / "tree/docker/all-in-one" / name, stage / name)
+    shutil.copyfile(capsule / "tree/docker/all-in-one" / ("Dockerfile.dev" if development else "Dockerfile"),
+                    stage / "Dockerfile")
+    return {path.name: digest(path) for path in (package / "bin").iterdir() if path.is_file()}
+
+
+def build_image(repo, job_id, commit, *, source_digest=None, native_snapshot_sha256=None, development=False, source_root=None):
+    if source_root is not None or source_digest is not None:
+        from docker_development_inputs import select_checkout
+        repo = select_checkout(repo, source_root)
     layout = storage.resolve_layout(repo, PROFILE)
     # Resolve before the first write, then retain the package-use lease during copy.
     with runtime_package_use(layout):
@@ -220,7 +248,9 @@ def build_image(repo, job_id, commit, *, source_digest=None, native_snapshot_sha
                    "source_digest": context["source_digest"], "base_image": context["image_digest"],
                    "native_source_identity": built["native_source_identity"],
                    "build_receipt_sha256": digest(root / "artifacts/build-receipt.json"),
-                   "output": str(output), "unit_tests_compiled": False}
+                   "output": str(output), "unit_tests_compiled": False,
+                   "runtime_mode": "development_source_bind" if development else "packaged_release",
+                   "package_root": str(package)}
         consumer = storage.validate_path(Path(layout["runtime_root"]) / "docker-all-images" / output.name,
                                          Path(layout["build_storage_root"]))
         consumer.mkdir(parents=True, exist_ok=False)
@@ -232,11 +262,7 @@ def build_image(repo, job_id, commit, *, source_digest=None, native_snapshot_sha
             stage = output / "context"
             stage.mkdir()
             # The trusted capsule excludes .env, Git internals and host caches.
-            shutil.copytree(capsule / "tree", stage / "source", symlinks=False)
-            shutil.copytree(package, stage / "package", symlinks=False)
-            receipt["binary_hashes"] = {path.name: digest(path) for path in (stage / "package/bin").iterdir() if path.is_file()}
-            for name in ("Dockerfile", "entrypoint.py", "windows_folder_probe.py", "runtime_service.py", "frontend_dev.py", "healthcheck.py"):
-                shutil.copyfile(capsule / "tree/docker/all-in-one" / name, stage / name)
+            receipt["binary_hashes"] = stage_image_context(capsule, package, stage, development=development)
             (stage / "provenance.json").write_text(json.dumps(receipt, indent=2) + "\n")
             # Docker FROM expects a repository reference, so create an explicit
             # local alias and attest its ID immediately before the offline build.
@@ -250,7 +276,8 @@ def build_image(repo, job_id, commit, *, source_digest=None, native_snapshot_sha
                 raise ValueError("Offline assembly requires the existing engine-integrated Docker builder")
             iid = output / "image-id.txt"
             logs = docker("build", "--builder", builder, "--network", "none", "--pull=false", "--build-arg",
-                          "RUNTIME_BASE=" + alias, "--iidfile", str(iid), str(stage), combined=True, timeout=1800)
+                          "RUNTIME_BASE=" + alias, "--build-arg",
+                          "FULLMAG_TOOLCHAIN_IMAGE_ID=" + context["image_digest"], "--iidfile", str(iid), str(stage), combined=True, timeout=1800)
             (output / "assembly.log").write_text(logs)
             immutable = iid.read_text().strip()
             validate_workspace_environment(image_id(immutable)["Config"])
@@ -268,7 +295,7 @@ def build_image(repo, job_id, commit, *, source_digest=None, native_snapshot_sha
             print(json.dumps(receipt, indent=2))
 
 
-def start(repo, assembly_receipt, port, frontend="static"):
+def start(repo, assembly_receipt, port, frontend="static", source_root=None):
     if not 1024 <= port <= 65535:
         raise ValueError("Port must be between 1024 and 65535")
     layout = storage.resolve_layout(repo, PROFILE)
@@ -281,8 +308,17 @@ def start(repo, assembly_receipt, port, frontend="static"):
     validate_workspace_environment(observed["Config"])
     if observed.get("Config", {}).get("Labels", {}).get("org.fullmag.runtime") != "docker-all-gpu-v1":
         raise ValueError("Image is not a Fullmag all-in-Docker GPU runtime")
-    if frontend == "dev" and observed["Config"].get("Labels", {}).get("org.fullmag.development") != "two-container-hmr-v1":
-        raise ValueError("Image does not contain the two-container HMR development runtime")
+    if frontend == "dev":
+        if (assembly.get("runtime_mode") != "development_source_bind"
+                or observed["Config"].get("Labels", {}).get("org.fullmag.development") != "source-bind-v1"):
+            raise ValueError("Development requires a source-bind image without copied application sources")
+        package = storage.validate_path(Path(assembly["package_root"]), Path(layout["storage_root"]))
+        validate_runtime_artifacts(package)
+        if any(digest(package / "bin" / name) != assembly["binary_hashes"].get(name)
+               for name in REQUIRED_BINARIES):
+            raise ValueError("Mounted backend package changed since image assembly")
+    elif assembly.get("runtime_mode") == "development_source_bind":
+        raise ValueError("Static mode requires a packaged release image")
     storage.initialize(layout)
     root = storage.validate_path(Path(layout["runs_root"]) / "docker-all" / uuid.uuid4().hex,
                                  Path(layout["build_storage_root"]))
@@ -308,33 +344,42 @@ def start(repo, assembly_receipt, port, frontend="static"):
             raise ValueError("Frontend mode must be static or dev")
         args = ["compose", "-f", str(spec), "--project-name", project]
         if frontend == "dev":
-            from docker_development_inputs import seed, main_checkout
-            inputs = seed(main_checkout(repo), state, port)
+            from docker_development_inputs import seed, select_checkout
+            inputs = seed(select_checkout(repo, source_root), state, port)
             storage.atomic_json(inputs_path, inputs)
+            from local_runner.build_source import native_identity
+            receipt["mounted_source_identity_at_start"] = native_identity(Path(inputs["source_root"]), "snapshot")
+            receipt["source_selection"] = "live_windows_selected_checkout"
+            receipt["source_root"] = inputs["source_root"]
+            receipt["compiled_source_commit"] = assembly["commit"]
             receipt["frontend_source_root"] = inputs["source_root"]
             receipt["frontend_source_commit"] = inputs["source_commit"]
             receipt["frontend_inputs"] = str(inputs_path)
             receipt["frontend_inputs_sha256"] = digest(inputs_path)
 
         def configured_spec():
-            configured = compose_spec(image, state.resolve(), port, host_certificate.resolve())
-            if inputs is not None:
-                from docker_development_inputs import extend_compose
-                extend_compose(configured, inputs, inputs_path.resolve())
-            return configured
+            return compose_spec(image, state.resolve(), port, host_certificate.resolve(),
+                                repo=repo, inputs=inputs, inputs_path=inputs_path.resolve(),
+                                package=assembly.get("package_root"),
+                                provenance=assembly_receipt, project=project,
+                                toolchain_image=assembly.get("base_image"), template=root / "compose.source.yaml")
         if os.name != "nt":
             raise ValueError("This Windows-folder launcher requires native Windows host attestation")
         from windows_folder_host import attest, local_volume, read_owned_regular
         certificate = attest(state, assembly, docker("info", "--format", "{{.ID}}"), assembly["binary_hashes"])
         storage.atomic_json(host_certificate, certificate)
+        shutil.copyfile(repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml"),
+                        root / "compose.source.yaml")
+        receipt["compose_source"] = str(root / "compose.source.yaml")
+        receipt["compose_source_sha256"] = digest(root / "compose.source.yaml")
         configured = configured_spec()
-        probe_service = configured["services"]["fullmag"]
+        probe_service = configured["services"]["backend"]
         probe_service["command"] = ["--storage-probe"]
         probe_service["healthcheck"] = {"disable": True}
         storage.atomic_json(spec, configured)
         docker(*args, "config", "--quiet")
-        docker(*args, "up", "--detach", "--no-build", "--pull", "never", "fullmag")
-        probe_container = docker(*args, "ps", "--all", "--quiet", "fullmag")
+        docker(*args, "up", "--detach", "--no-build", "--pull", "never", "backend")
+        probe_container = docker(*args, "ps", "--all", "--quiet", "backend")
         receipt["probe_container_id"] = probe_container
         receipt["first_probe_exit_code"] = docker("wait", probe_container, timeout=120)
         (root / "storage-first.log").write_text(docker("logs", probe_container, combined=True))
@@ -364,7 +409,7 @@ def start(repo, assembly_receipt, port, frontend="static"):
         storage.atomic_json(spec, configured_spec())
         docker(*args, "up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout",
                "2100" if inputs is not None else "90", timeout=2160 if inputs is not None else 150)
-        container = docker(*args, "ps", "--quiet", "fullmag")
+        container = docker(*args, "ps", "--quiet", "backend")
         receipt["container_id"] = container
         actual = json.loads(docker("inspect", container))[0]
         bindings = {str(receipt["container_http_port"]) + "/tcp":
@@ -387,9 +432,25 @@ def start(repo, assembly_receipt, port, frontend="static"):
                     or host_path(writable[0]["Source"]) != (state / "development").resolve()):
                 raise ValueError("Frontend writable mount must be its isolated development directory")
             bindings = {}
+        from docker_compose_attestation import service_network, network_owner
+        network_id = service_network(actual, project, hostname="fullmag-" + root.name)
+        if inputs is not None and service_network(front, project) != network_id:
+            raise ValueError("Frontend and backend are attached to different networks")
+        network_owner(json.loads(docker("network", "inspect", network_id))[0], project, network_id)
+        receipt["network_id"] = network_id
+        receipt["network_name"] = project + "_fullmag"
         host = actual["HostConfig"]
         if actual["Image"] != image or (host.get("PortBindings") or {}) != bindings:
             raise ValueError("Runtime image or loopback port attestation mismatch")
+        if inputs is not None:
+            expected_readonly = {"/opt/fullmag/source": Path(inputs["source_root"]).resolve(),
+                                 "/opt/fullmag/package": package.resolve(),
+                                 "/opt/fullmag/provenance.json": assembly_receipt.resolve()}
+            for destination, source in expected_readonly.items():
+                bound = [m for m in actual["Mounts"] if m["Destination"] == destination]
+                if (len(bound) != 1 or bound[0]["Type"] != "bind" or bound[0]["RW"]
+                        or host_path(bound[0]["Source"]) != source):
+                    raise ValueError("Development readonly bind differs: " + destination)
         mounts = [m for m in actual["Mounts"] if m["Destination"] == "/state"]
         if len(mounts) != 1 or mounts[0]["Type"] != "bind" or not mounts[0]["RW"] or host_path(mounts[0]["Source"]) != state.resolve():
             raise ValueError("Runtime state mount attestation mismatch")
@@ -428,23 +489,27 @@ if __name__ == "__main__":
     commands = parser.add_subparsers(dest="action", required=True)
     submit = commands.add_parser("submit")
     submit.add_argument("--commit", required=True)
-    commands.add_parser("submit-development")
+    development = commands.add_parser("submit-development")
+    development.add_argument("--source-root", type=Path)
     build = commands.add_parser("build-image")
     build.add_argument("--job-id", required=True)
     build.add_argument("--commit", required=True)
+    build.add_argument("--development", action="store_true")
+    build.add_argument("--source-root", type=Path)
     build.add_argument("--source-digest")
     build.add_argument("--native-snapshot-sha256")
     launch = commands.add_parser("start")
     launch.add_argument("--assembly-receipt", type=Path, required=True)
     launch.add_argument("--port", type=int, default=3197)
+    launch.add_argument("--source-root", type=Path)
     launch.add_argument("--frontend", choices=("static", "dev"), default="static")
     args = parser.parse_args()
     if args.action == "submit":
         submit_build(args.repo_root.resolve(), args.commit)
     elif args.action == "submit-development":
-        submit_build(args.repo_root.resolve(), development=True)
+        submit_build(args.repo_root.resolve(), development=True, source_root=args.source_root)
     elif args.action == "build-image":
         build_image(args.repo_root.resolve(), args.job_id, args.commit,
-                    source_digest=args.source_digest, native_snapshot_sha256=args.native_snapshot_sha256)
+                    source_digest=args.source_digest, native_snapshot_sha256=args.native_snapshot_sha256, development=args.development, source_root=args.source_root)
     else:
-        start(args.repo_root.resolve(), args.assembly_receipt, args.port, args.frontend)
+        start(args.repo_root.resolve(), args.assembly_receipt, args.port, args.frontend, args.source_root)

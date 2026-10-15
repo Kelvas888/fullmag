@@ -22,6 +22,18 @@ def main_checkout(repo):
     return Path(records[0]["worktree"]).resolve()
 
 
+def select_checkout(repo, source_root=None):
+    """Choose one Git-registered checkout of this project, never an inferred path."""
+    source_root = source_root or os.environ.get("FULLMAG_SOURCE_ROOT")
+    selected = Path(source_root).resolve(strict=True) if source_root else main_checkout(repo)
+    known = {Path(record["worktree"]).resolve() for record in storage.worktree_records(repo)}
+    if selected not in known:
+        raise ValueError("Development sources must be a registered checkout of this project")
+    if os.name == "nt":
+        local_volume(selected)
+    return selected
+
+
 def seed(source, state, port):
     if os.name != "nt":
         raise ValueError("Live Docker development sources require native Windows preflight")
@@ -72,40 +84,13 @@ def seed(source, state, port):
     if not re.fullmatch(r"[a-f0-9]{40}", commit):
         raise ValueError("Live source checkout has no full commit identity")
     return {"schema": "fullmag.docker-development-inputs.v1", "source_root": str(source),
-            "source_commit": commit, "source_selection": "live_windows_main_checkout",
+            "source_commit": commit, "source_selection": "live_windows_selected_checkout",
             "source_volume": source_volume, "host_port": port,
             "workspace_root": WORKSPACE, "frontend_root": FRONTEND,
             "live_directories": directories, "files": files,
             "configuration_changes": "prepare_new_workspace",
             "backend_build": "explicit_managed_runner_only"}
 
-
-def extend_compose(spec, inputs, inputs_path):
-    backend = spec["services"]["fullmag"]
-    backend["ports"] = []
-    backend["environment"]["FULLMAG_DOCKER_ROLE"] = "backend"
-    service = {
-        "image": backend["image"], "pull_policy": "never", "init": True,
-        "read_only": True, "user": "65532:65532", "cpus": 2,
-        "mem_limit": "4g", "pids_limit": 512, "cap_drop": ["ALL"],
-        "security_opt": ["no-new-privileges:true"],
-        "ports": [f"127.0.0.1:{inputs['host_port']}:8080"],
-        "tmpfs": ["/tmp:rw,nosuid,nodev,size=512m"], "stop_grace_period": "60s",
-        "environment": {"FULLMAG_DOCKER_ROLE": "frontend", "FULLMAG_DOCKER_FRONTEND": "dev",
-                        "FULLMAG_API_PROXY_TARGET": "http://fullmag:8081",
-                        "HOME": "/state/development", "NVIDIA_VISIBLE_DEVICES": "void"},
-        "depends_on": {"fullmag": {"condition": "service_healthy"}},
-        "volumes": [{"type": "bind", "source": str(inputs_path.parent / "state/development"),
-                     "target": "/state/development"},
-                    {"type": "bind", "source": str(inputs_path),
-                     "target": CONFIG_TARGET, "read_only": True}],
-        "healthcheck": {"start_period": "1920s"},
-    }
-    for directory in inputs["live_directories"]:
-        service["volumes"].append({"type": "bind", "source": directory["source"],
-                                    "target": directory["target"], "read_only": True})
-    spec["services"]["frontend"] = service
-    return spec
 
 
 def attest_mounts(actual, inputs, inputs_path):

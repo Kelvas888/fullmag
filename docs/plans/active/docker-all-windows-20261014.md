@@ -6,6 +6,59 @@ sesje bezpośrednio w skonfigurowanym storage Windows, bez named volume.
 Jednorazowy wyjątek użytkownika dotyczy wymaganej kompilacji testów w CI,
 nie lokalnego kompilowania unit testów. Pozostała praca użytkownika zostaje zachowana.
 
+## Uzgodniony kontrakt developerskiego Compose
+
+Źródłem topologii trybu developerskiego jest wersjonowany rootowy `compose.dev.yaml`.
+Ma dokładnie dwie usługi, `backend` i `frontend`, oraz prywatną sieć Compose:
+
+- `backend` nie publikuje portu hosta i udostępnia `8081` tylko w sieci Compose;
+- `frontend` publikuje `127.0.0.1:3197:8080` (port hosta może być rozwiązany
+  przez launcher) i kieruje API przez `http://backend:8081`;
+- GPU i accepted store otrzymuje wyłącznie backend; frontend nie dostaje
+  certyfikatu writera ani montowania sesji.
+
+Wspólnym parametrem źródła jest `FULLMAG_SOURCE_ROOT`: domyślnie wskazuje
+główny checkout Git, a operator może jawnie wskazać wybrany worktree. Dev image
+nie kopiuje źródeł aplikacji ani pakietu runtime. Backend używa readonly bindów
+`FULLMAG_SOURCE_ROOT` → `/opt/fullmag/source`, pakietu → `/opt/fullmag/package`
+oraz provenance → `/opt/fullmag/provenance.json`. Frontend montuje readonly
+`apps/control-room/app`, `src`, `public` i `scripts` z tego samego checkoutu;
+polling/HMR dotyczy tych katalogów. Konfiguracja, manifesty i metadane freeze są
+utrwalane osobno i nie zmieniają się przez HMR.
+
+`compose.static.yaml` pozostaje opcjonalną, osobną ścieżką release/legacy dla
+statycznego frontendu. Nie jest wariantem developerskiego HMR.
+
+Zmiana backendu wymaga jawnego capture immutable source i zlecenia do istniejącej
+kolejki managed build. Build nie uruchamia automatycznego restartu Rust/API ani
+bieżącej symulacji. Obraz developerski oraz integracja rootowego Compose są
+**VERIFICATION PENDING** do zakończenia implementacji launchera/renderowania;
+ta sekcja nie ustanawia nowych flag recept.
+
+Interfejs launchera po integracji jest jawny i ograniczony do istniejących
+recept:
+
+```text
+just docker-all-dev <assembly_receipt> [port=3197] [source_root=""]
+just docker-all-dev-backend-build [source_root=""]
+just docker-all-dev-image <job_id> <commit> [source_digest=""] [native_snapshot_sha256=""] [source_root=""]
+```
+
+Pusty `source_root` oznacza główny checkout Git; jawny parametr wymaga
+zarejestrowanego worktree. Dwa argumenty obrazu dotyczą clean commit, a cztery
+pierwsze argumenty służą immutable snapshotowi (w tym dwa digesty); dla
+snapshotu z innego worktree piąty argument
+`source_root` (albo `FULLMAG_SOURCE_ROOT`) musi wskazywać ten sam checkout co
+submission. Launcher zamraża resolved Compose JSON i kopię źródłowego
+YAML w owned run; nie generuje topologii przez Python. `docker-all-image`
+pozostaje opcjonalną ścieżką packaged release dla `compose.static.yaml`.
+
+Zależności FEM pozostają kanoniczne dla `docker/fem-gpu/Dockerfile`, w tym
+stage `fem-gpu-dev` i przypięte wersje z tego pliku. Nie tworzymy drugiej listy
+wersji w Compose ani w planie. Obraz agenta dostarcza `Dockerfile.dev` i
+integrację toolchaina; osobny przegląd utrzymuje raport zależności i śledzenie
+wersji.
+
 ## Zakończone etapy
 
 - Recepty build/image/start, walidacja managed GPU release i immutable image.

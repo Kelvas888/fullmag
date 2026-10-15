@@ -34,16 +34,16 @@ docker-all-image job_id commit:
 docker-all-start assembly_receipt port="3197":
     @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" start --assembly-receipt {{quote(assembly_receipt)}} --port {{quote(port)}}
 
-# Live Control Room sources come from the Git-resolved main Windows checkout.
-docker-all-dev assembly_receipt port="3197":
-    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" start --assembly-receipt {{quote(assembly_receipt)}} --port {{quote(port)}} --frontend 'dev'
+# Live source defaults to the Git main checkout; source_root can select a worktree.
+docker-all-dev assembly_receipt port="3197" source_root="":
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" start --assembly-receipt {{quote(assembly_receipt)}} --port {{quote(port)}} --frontend 'dev' {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
 
-# Explicit immutable snapshot of the Git-resolved main checkout; no restart.
-docker-all-dev-backend-build:
-    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" submit-development
+# Explicit immutable snapshot of the selected checkout; no restart.
+docker-all-dev-backend-build source_root="":
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" submit-development {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
 
-docker-all-dev-image job_id commit source_digest native_snapshot_sha256:
-    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" build-image --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}}
+docker-all-dev-image job_id commit source_digest="" native_snapshot_sha256="" source_root="":
+    @{{storage_python}} "{{repo_root}}/scripts/fullmag_docker_runtime.py" --repo-root "{{repo_root}}" build-image --job-id {{quote(job_id)}} --commit {{quote(commit)}} --development {{if (source_digest + native_snapshot_sha256) == "" { "" } else { "--source-digest " + quote(source_digest) + " --native-snapshot-sha256 " + quote(native_snapshot_sha256) }}} {{if source_root == "" { "" } else { "--source-root " + quote(source_root) }}}
 
 # Fixed GPU execution and FMS round-trip; never build or restart a runtime.
 docker-all-verify run_receipt:

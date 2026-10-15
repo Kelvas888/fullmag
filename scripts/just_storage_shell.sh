@@ -96,7 +96,7 @@ case "${recipe}" in
     exec "${python_cmd}" "${resolver}" run --repo-root "${repo_root}" --profile docker-all-gpu -- "${bash_executable}" -euo pipefail -c "${recipe}"
     ;;
   *"scripts/fullmag_docker_runtime.py"*)
-    docker_runtime_pattern="^[^[:space:]]+ \"[^\"]+/scripts/fullmag_docker_runtime.py\" --repo-root \"[^\"]+\" (submit-development|submit --commit '[a-f0-9]{40}'|build-image --job-id '[a-f0-9]{32}' --commit '[a-f0-9]{40}'( --source-digest '[a-f0-9]{64}' --native-snapshot-sha256 '[a-f0-9]{64}')?|start --assembly-receipt '[^']+' --port '[0-9]{4,5}'( --frontend 'dev')?)$"
+    docker_runtime_pattern="^[^[:space:]]+ \"[^\"]+/scripts/fullmag_docker_runtime.py\" --repo-root \"[^\"]+\" (submit-development( --source-root '[^']+')?|submit --commit '[a-f0-9]{40}'|build-image --job-id '[a-f0-9]{32}' --commit '[a-f0-9]{40}'( --development)?( --source-digest '[a-f0-9]{64}' --native-snapshot-sha256 '[a-f0-9]{64}')?( --source-root '[^']+')?|start --assembly-receipt '[^']+' --port '[0-9]{4,5}'( --frontend 'dev')?( --source-root '[^']+')?)[[:space:]]*$"
     if [[ ! "${recipe}" =~ ${docker_runtime_pattern} ]]; then
       echo "[fullmag just] invalid all-in-Docker recipe" >&2
       exit 2

@@ -14,32 +14,45 @@ import run_managed_browser as managed
 
 
 class DockerRuntimeContract(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("FULLMAG_TEST_COMPOSE_CONFIG") == "1", "Read-only Compose CLI integration gate")
     def test_workspace_uses_one_loopback_port_and_explicit_gpu(self):
-        service = runtime.compose_spec("sha256:" + "a" * 64, Path("/state-host"), 3197)["services"]["fullmag"]
-        self.assertEqual(service["ports"], ["127.0.0.1:3197:8081"])
-        self.assertEqual(service["gpus"], "all")
+        service = runtime.compose_spec("sha256:" + "a" * 64, Path("/state-host"), 3197,
+                                       Path("/owned/host.json"))["services"]["backend"]
+        self.assertEqual(service["ports"][0]["host_ip"], "127.0.0.1")
+        self.assertEqual(service["ports"][0]["published"], "3197")
+        self.assertEqual(service["ports"][0]["target"], 8081)
+        self.assertEqual(service["gpus"][0]["count"], -1)
         self.assertTrue(service["read_only"])
-        self.assertEqual([m["target"] for m in service["volumes"]], ["/state"])
+        self.assertEqual([m["target"] for m in service["volumes"]],
+                         ["/state", "/run/fullmag/windows-folder-host.json"])
 
+    @unittest.skipUnless(os.environ.get("FULLMAG_TEST_COMPOSE_CONFIG") == "1", "Read-only Compose CLI integration gate")
     def test_development_separates_live_frontend_from_session_writer(self):
-        from docker_development_inputs import extend_compose
-        inputs = {"host_port": 3197, "live_directories": [
-            {"source": "/checkout/app", "target": "/state/development/workspace/apps/control-room/app"}]}
+        inputs = {"source_root": "/checkout"}
         spec = runtime.compose_spec("sha256:" + "a" * 64, Path("/owned/state"), 3197,
-                                    Path("/owned/windows-folder-host.json"))
-        extend_compose(spec, inputs, Path("/owned/development-inputs.json"))
-        backend, frontend = spec["services"]["fullmag"], spec["services"]["frontend"]
-        self.assertEqual(backend["ports"], [])
-        self.assertEqual(backend["gpus"], "all")
-        self.assertEqual(frontend["ports"], ["127.0.0.1:3197:8080"])
+                                    Path("/owned/host.json"), inputs=inputs,
+                                    inputs_path=Path("/owned/inputs.json"),
+                                    package=Path("/owned/package"), provenance=Path("/owned/assembly.json"))
+        self.assertEqual(set(spec["services"]), {"backend", "frontend"})
+        backend, frontend = spec["services"]["backend"], spec["services"]["frontend"]
+        self.assertFalse(backend.get("ports"))
+        self.assertEqual(backend["gpus"][0]["count"], -1)
         self.assertNotIn("gpus", frontend)
-        self.assertEqual(frontend["environment"]["NVIDIA_VISIBLE_DEVICES"], "void")
-        self.assertEqual(frontend["depends_on"], {"fullmag": {"condition": "service_healthy"}})
-        self.assertEqual(frontend["environment"]["FULLMAG_API_PROXY_TARGET"], "http://fullmag:8081")
+        self.assertEqual(frontend["ports"][0]["host_ip"], "127.0.0.1")
+        self.assertEqual(frontend["ports"][0]["target"], 8080)
+        self.assertEqual(frontend["environment"]["FULLMAG_API_PROXY_TARGET"], "http://backend:8081")
+        self.assertEqual(frontend["depends_on"]["backend"]["condition"], "service_healthy")
         self.assertEqual([m["target"] for m in frontend["volumes"] if not m.get("read_only")],
                          ["/state/development"])
         self.assertNotIn("/state", [m["target"] for m in frontend["volumes"]])
-        self.assertFalse(any(m["source"] == "/checkout/app" for m in backend["volumes"]))
+        source = next(m for m in backend["volumes"] if m["target"] == "/opt/fullmag/source")
+        self.assertTrue(source["read_only"])
+        self.assertEqual(source["source"], "/checkout")
+        self.assertFalse(source["bind"]["create_host_path"])
+        self.assertEqual(set(backend["networks"]), {"fullmag"})
+        self.assertEqual(set(frontend["networks"]), {"fullmag"})
+        self.assertFalse(spec["networks"]["fullmag"].get("external", False))
+        self.assertNotIn("volumes", spec)
 
     def test_docker_timeout_preserves_unknown_operation_without_retry(self):
         with patch.object(runtime.subprocess, "run", side_effect=subprocess.TimeoutExpired(["docker"], 3)) as run:
@@ -49,6 +62,55 @@ class DockerRuntimeContract(unittest.TestCase):
             self.assertEqual(caught.exception.timeout_seconds, 3)
             self.assertEqual(run.call_count, 1)
             self.assertEqual(run.call_args.kwargs["timeout"], 3)
+
+    def test_artifact_digest_handles_empty_and_multiblock_files_on_python_310(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "artifact"
+            for data in (b"", b"abc", b"artifact-block" * 100000):
+                path.write_bytes(data)
+                self.assertEqual(runtime.digest(path), hashlib.sha256(data).hexdigest())
+
+    def test_development_image_context_contains_no_application_sources_or_binaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helpers = root / "capsule/tree/docker/all-in-one"
+            helpers.mkdir(parents=True)
+            for name in ("Dockerfile", "Dockerfile.dev", "entrypoint.py", "windows_folder_probe.py",
+                         "runtime_service.py", "frontend_dev.py", "healthcheck.py"):
+                (helpers / name).write_text(name)
+            (root / "capsule/tree/application-secret-sentinel").write_text("source")
+            package = root / "package"
+            (package / "bin").mkdir(parents=True)
+            (package / "bin/fullmag-bin").write_bytes(b"immutable compiled backend")
+            stage = root / "development-context"
+            stage.mkdir()
+            hashes = runtime.stage_image_context(root / "capsule", package, stage, development=True)
+            self.assertFalse((stage / "source").exists())
+            self.assertFalse((stage / "package").exists())
+            self.assertEqual((stage / "Dockerfile").read_text(), "Dockerfile.dev")
+            self.assertEqual(hashes["fullmag-bin"], __import__("hashlib").sha256(b"immutable compiled backend").hexdigest())
+            release = root / "release-context"
+            release.mkdir()
+            runtime.stage_image_context(root / "capsule", package, release, development=False)
+            self.assertEqual((release / "source/application-secret-sentinel").read_text(), "source")
+            self.assertEqual((release / "package/bin/fullmag-bin").read_bytes(), b"immutable compiled backend")
+
+    def test_source_selection_accepts_main_or_registered_worktree_and_rejects_foreign(self):
+        from docker_development_inputs import select_checkout
+        with tempfile.TemporaryDirectory() as directory:
+            main, task, foreign = [Path(directory) / name for name in ("main", "task", "foreign")]
+            for path in (main, task, foreign):
+                path.mkdir()
+            records = [{"worktree": str(main)}, {"worktree": str(task)}]
+            with patch("docker_development_inputs.main_checkout", return_value=main), \
+                    patch.object(runtime.storage, "worktree_records", return_value=records), \
+                    patch("docker_development_inputs.local_volume"), \
+                    patch.dict(os.environ, {"FULLMAG_SOURCE_ROOT": ""}):
+                self.assertEqual(select_checkout(task), main.resolve())
+                self.assertEqual(select_checkout(main, task), task.resolve())
+                with self.assertRaisesRegex(ValueError, "registered checkout"):
+                    select_checkout(main, foreign)
 
     def test_package_requires_every_runtime_service_binary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -188,9 +250,10 @@ class DockerRuntimeContract(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "overrides model execution"):
                 runtime.validate_workspace_environment(config)
 
+    @unittest.skipUnless(os.environ.get("FULLMAG_TEST_COMPOSE_CONFIG") == "1", "Read-only Compose CLI integration gate")
     def test_windows_certificate_is_read_only_and_profile_is_explicit(self):
         service = runtime.compose_spec("sha256:" + "a" * 64, Path("C:/owned/state"), 3197,
-                                       Path("C:/owned/host.json"))["services"]["fullmag"]
+                                       Path("C:/owned/host.json"))["services"]["backend"]
         self.assertEqual(service["environment"]["FULLMAG_SESSION_STORAGE_PROFILE"], "windows-folder-v1")
         self.assertTrue(service["volumes"][1]["read_only"])
         self.assertEqual(service["volumes"][1]["target"], "/run/fullmag/windows-folder-host.json")
@@ -258,7 +321,8 @@ class DockerRuntimeContract(unittest.TestCase):
             probe.chmod(0o755)
             env = {**os.environ, "FULLMAG_STORAGE_PYTHON": str(probe)}
             command = ["bash", str(repo / "scripts/just_storage_shell.sh")]
-            recipes = [recipe,
+            recipes = [recipe, recipe + " --development", recipe + " --development --source-root '/checkout'",
+                       f'python3 "{repo}/scripts/fullmag_docker_runtime.py" --repo-root "{repo}" submit-development' + " --source-root '/checkout'",
                        f'python3 "{repo}/scripts/fullmag_docker_runtime.py" --repo-root "{repo}" submit-development',
                        recipe + " --source-digest '" + "c" * 64 + "' --native-snapshot-sha256 '" + "d" * 64 + "'",
                        f'python3 "{repo}/scripts/fullmag_docker_runtime.py" --repo-root "{repo}" '
@@ -347,6 +411,22 @@ class DockerRuntimeContract(unittest.TestCase):
                 self.assertEqual(pending[0]["capture_id"], pending[0]["request_key"])
                 self.assertEqual(request.call_count, 2)
 
+    def test_development_image_uses_the_selected_worktree_for_snapshot_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected = root / "worktree"
+            selected.mkdir()
+            with patch("docker_development_inputs.select_checkout", return_value=selected) as choose, \
+                    patch.object(runtime.storage, "resolve_layout", return_value={}) as resolve, \
+                    patch.object(runtime, "runtime_package_use", return_value=nullcontext()), \
+                    patch.object(runtime, "prepare_gpu_release", side_effect=ValueError("stop before outputs")):
+                with self.assertRaisesRegex(ValueError, "stop before outputs"):
+                    runtime.build_image(root / "client", "a" * 32, "b" * 40, development=True,
+                                        source_digest="c" * 64, native_snapshot_sha256="d" * 64,
+                                        source_root=selected)
+                choose.assert_called_once_with(root / "client", selected)
+                resolve.assert_called_once_with(selected, runtime.PROFILE)
+
     def test_development_build_captures_main_and_rejects_capture_races(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -361,6 +441,7 @@ class DockerRuntimeContract(unittest.TestCase):
                     patch.object(runtime.storage, "initialize"), \
                     patch.object(runtime.storage, "build_lock", return_value=nullcontext()), \
                     patch("docker_development_inputs.main_checkout", return_value=main), \
+                    patch.object(runtime.storage, "worktree_records", return_value=[{"worktree": str(main)}]), \
                     patch("local_runner.build_executor.configured_build"), \
                     patch("local_runner.build_source.native_identity", return_value=native) as identity, \
                     patch("local_runner.build_source.bind_identity", return_value=native), \

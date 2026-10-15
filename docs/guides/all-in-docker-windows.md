@@ -1,12 +1,27 @@
 # Fullmag w całości w Docker Desktop
 
-Ten tryb składa jeden obraz uruchomieniowy zawierający backend API, statyczny
+Tryb release składa jeden obraz uruchomieniowy zawierający backend API, statyczny
 Control Room, publiczny Python DSL, rozszerzenie PyO3 oraz biblioteki FEM/CUDA.
 Windows udostępnia przeglądarkę i Docker Desktop. UI i API używają tego samego
-portu: `http://localhost:3197/workspace`. Kontener nie potrzebuje checkoutu,
-socketu Dockera ani hostowego Pythona podczas uruchomienia.
+portu: `http://localhost:3197/workspace`. Release nie potrzebuje checkoutu,
+socketu Dockera ani hostowego Pythona podczas uruchomienia. Tryb developerski
+ma osobny kontrakt dwóch usług i korzysta z readonly bindów wybranego checkoutu,
+opisanych niżej.
 
-## Budowanie
+## Główna ścieżka developerska
+
+Wersjonowany developerski Compose uruchamia się przez istniejący launcher:
+
+```text
+just docker-all-dev <assembly_receipt> [port=3197] [source_root=""]
+```
+
+Pusty `source_root` wybiera checkout Git główny, a jawna ścieżka wybiera
+zarejestrowany worktree. W obu przypadkach launcher zapisuje resolved Compose
+JSON oraz kopię źródłowego YAML w owned run; nie generuje topologii w Pythonie.
+Konfiguracja i cold-start/HMR pozostają **VERIFICATION PENDING**.
+
+## Budowanie obrazu release (opcjonalne)
 
 Pełną kompilację wykonuje istniejący `Fullmag_build_runner`. Nie uruchamiaj
 równoległego ciężkiego buildu przez `docker build` ani hostowy Cargo.
@@ -43,6 +58,13 @@ Wynik zawiera `image_id` oraz ścieżkę `receipt.json` pod resolverowym
 `storage/runtimes/<worktree-id>/docker-all-images/<id>`.
 Kontekst składania pozostaje pod profilem `storage/builds/<worktree-id>/docker-all-gpu`.
 Obraz zawiera pełny toolchain i może być duży; nie jest wersją slim.
+
+Zależności FEM są pobierane wyłącznie z kanonicznego
+`docker/fem-gpu/Dockerfile`, w tym z jego stage `fem-gpu-dev` i przypiętych
+wersji. `Dockerfile.dev` integruje ten toolchain dla obrazu developerskiego;
+nie utrzymujemy drugiej listy wersji w Compose ani w tym przewodniku. Raport
+zależności i śledzenie wersji pozostają osobnym obowiązkiem review. Ten etap
+integracji jest **VERIFICATION PENDING**.
 
 ## CI: routowanie managed FEM
 
@@ -118,10 +140,40 @@ do jawnego zatrzymania przez operatora; nie wykonuje automatycznego takeover.
 ## Tryb deweloperski: dwa kontenery
 
 ```text
-just docker-all-dev <absolutna-sciezka-do-assembly-receipt.json> 3197
+just docker-all-dev <assembly_receipt> [port=3197] [source_root=""]
 ```
 
-Compose uruchamia `frontend` (Next.js dev z HMR) oraz `fullmag` (API, Python,
+### Wersjonowany kontrakt rootowego Compose
+
+Źródłem topologii developerskiej jest wersjonowany rootowy `compose.dev.yaml`.
+Definiuje dokładnie usługi `backend` i `frontend` oraz prywatną sieć Compose.
+`backend` nie publikuje portu hosta i słucha na `8081` wyłącznie wewnątrz
+tej sieci. `frontend` publikuje `127.0.0.1:3197:8080` (z konfigurowalnym
+portem hosta) i używa proxy `http://backend:8081`. GPU otrzymuje tylko backend.
+
+`FULLMAG_SOURCE_ROOT` wskazuje główny checkout Git domyślnie albo jawnie wybrany
+worktree. Dev image nie kopiuje do warstwy źródeł aplikacji ani pakietu
+runtime. Backend dostaje readonly bindy:
+
+- `FULLMAG_SOURCE_ROOT` → `/opt/fullmag/source`;
+- `FULLMAG_BACKEND_PACKAGE` → `/opt/fullmag/package`;
+- `FULLMAG_PACKAGE_PROVENANCE` → `/opt/fullmag/provenance.json`.
+
+Frontend dostaje readonly bindy czterech żywych katalogów tego samego checkoutu:
+`apps/control-room/app`, `src`, `public` i `scripts`. Polling/HMR obserwuje te
+katalogi; konfiguracja, manifesty i metadane freeze są utrwalane osobno.
+Frontend nie dostaje accepted store, certyfikatu writera ani GPU. Backend
+pozostaje jedynym writerem sesji i właścicielem runtime service.
+
+`compose.static.yaml` jest opcjonalną, osobną ścieżką release/legacy dla
+statycznego frontendu. Nie jest używany do HMR ani do developerskiego proxy.
+
+Rootowy Compose, renderowanie launchera oraz cold-start/HMR są obecnie
+**VERIFICATION PENDING**. Poniższe istniejące recepty opisują zamierzony
+przepływ, ale ich końcowe argumenty i gotowość zostaną potwierdzone po integracji
+launchera; nie należy dopisywać nowych flag na podstawie samego dokumentu.
+
+Compose uruchamia `frontend` (Next.js dev z HMR) oraz `backend` (API, Python,
 FEM/GPU i runtime service). Oba korzystają z tego samego przypiętego obrazu;
 role mają osobne procesy, montowania i budżety. Frontend ma 2 CPU i 4 GiB RAM,
 backend 4 CPU i 8 GiB RAM. GPU udostępniane jest wyłącznie backendowi.
@@ -131,11 +183,12 @@ frontendu publikowany jest na loopback Windows. Backend słucha na 8081
 wewnątrz sieci Compose; frontend przekazuje do niego API. Nie wymaga CORS
 ani osobnego adresu API w przeglądarce.
 
-Launcher ustala główny checkout przez Git. Jego katalogi Control Room
+Launcher ustala `FULLMAG_SOURCE_ROOT` przez Git, wskazując główny checkout albo
+wybrany worktree. Katalogi Control Room
 `app`, `src`, `public` i `scripts` są montowane readonly do frontendu.
 pnpm 10.8.1 jest przygotowany offline w obrazie, z narzędzia już obecnego
 w przypiętym builderze. Pierwszy start pobiera tylko zależności workspace.
-Zapis źródeł w głównym checkoutcie jest wykrywany przez polling Watchpack
+Zapis źródeł w wybranym checkoutcie jest wykrywany przez polling Watchpack
 (500 ms); Next aktualizuje stronę przez HMR i kompiluje ją przy pierwszym wejściu.
 Cold-start ma limit 35 minut, obejmujący instalację zależności z limitem 30 minut
 oraz przygotowanie API/Next; zwykły restart używa zachowanych
@@ -150,14 +203,23 @@ zapisu sesji. Sesje i wyniki zapisuje backend bezpośrednio w swoim `/state`,
 mapowanym do rzeczywistego storage Windows.
 
 Zmiana kodu backendu nie wywołuje automatycznej kompilacji ani restartu
-symulacji. Jawne żądanie utrwala snapshot głównego checkoutu i zgłasza istniejącą
+symulacji. Jawne żądanie utrwala immutable snapshot wybranego
+`FULLMAG_SOURCE_ROOT` (domyślnie głównego checkoutu) i zgłasza istniejącą
 kolejkę managed GPU release:
 
 ```text
-just docker-all-dev-backend-build
+just docker-all-dev-backend-build [source_root=""]
 just runner-wait <job-id> 30
-just docker-all-dev-image <job-id> <commit> <source-digest> <native-snapshot-sha256>
+just docker-all-dev-image <job_id> <commit> [source_digest=""] [native_snapshot_sha256=""] [source_root=""]
 ```
+
+Dla clean commit wystarczają dwa pierwsze argumenty obrazu; snapshot wybranego
+worktree wymaga także `source_digest` i `native_snapshot_sha256`. Jeżeli job
+pochodzi z innego zarejestrowanego worktree niż główny checkout, podaj tę samą
+ścieżkę jako piąty argument `source_root` albo ustaw `FULLMAG_SOURCE_ROOT`.
+Obraz developerski nie kopiuje źródeł aplikacji ani pakietu do warstwy obrazu;
+bindy
+`/opt/fullmag/source` i `/opt/fullmag/package` pozostają częścią runtime.
 
 Wartości tożsamości pochodzą z receiptu zgłoszenia. Edycja podczas capture
 powoduje odmowę, późniejsze zmiany nie odrzucają przyjętego snapshotu ani nie
