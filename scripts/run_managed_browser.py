@@ -156,10 +156,11 @@ def run(repo, job_id, commit, port, *, source_digest=None, native_snapshot_sha25
         raise ValueError("Full managed job ID required")
     layout = storage.resolve_layout(repo, PROFILE)
     with runtime_package_use(layout):
-        return _run_protected(layout, job_id, commit, port)
+        return _run_protected(layout, job_id, commit, port,
+            source_digest=source_digest, native_snapshot_sha256=native_snapshot_sha256)
 
 
-def _run_protected(layout, job_id, commit, port):
+def _run_protected(layout, job_id, commit, port, *, source_digest=None, native_snapshot_sha256=None):
     base = Path(layout["storage_root"])
     build = storage.validate_path(Path(layout["runs_root"]) / job_id, base)
     context, built = validate_managed_build(build, commit,
