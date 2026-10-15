@@ -130,6 +130,16 @@ jobs:
       - name: Run complete session reachability and archive contracts
         run: cargo test -p fullmag-session --lib --no-fail-fast
 
+      - name: Verify accepted provenance archive export and read-only import
+        if: ${{ !cancelled() && steps.install-rust.outcome == 'success' && steps.install-python-runtime.outcome == 'success' }}
+        env:
+          RUST_MIN_STACK: 8388608
+        run: |
+          cargo test -p fullmag-session --lib accepted_provenance
+          cargo test -p fullmag-session --lib session_schema_guard_distinguishes_v1_and_readonly_v2_provenance
+          cargo test -p fullmag-api --bin fullmag-api accepted_fms_export_inspect_readonly_import_and_tamper_rejection
+          cargo test -p fullmag-api --bin fullmag-api context_bound_export_rejects_session_identity_before_script_read
+
       - name: Run fail-closed compact workspace import regression
         if: ${{ !cancelled() && steps.install-rust.outcome == 'success' && steps.install-python-runtime.outcome == 'success' }}
         env:
