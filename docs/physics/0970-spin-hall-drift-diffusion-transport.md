@@ -370,6 +370,87 @@ execution disables error-based rejection but still executes the same versioned
 ARS stages. `coupled_bdf2_small_oracle.v1` remains validation-only and is not a
 production authoring choice in M3.
 
+(fdm-cpu-transport-gilbert-rhs-boundary)=
+### 2.6.1 Jedna konwersja transportowego źródła Gilberta — FDM CPU
+
+**Stan z 2026-10-15: historyczny `SOURCE_BUG_CONFIRMED`; prerejestracja
+poprzedziła zapis poprawki. Obecnie implementacja `SOURCE_ONLY`, runtime
+`NOT VERIFIED`.** Norma 0960, `governing-equations`, odróżnia źródło
+Gilberta od jawnego RHS. Dla jednostkowego $m$ i stycznego źródła obowiązuje:
+
+```{math}
+:label: fdm-cpu-transport-gilbert-explicit-source
+T_{\mathrm{tr,RHS}}=
+\frac{T_{\mathrm{tr},G}+\alpha\,m\times T_{\mathrm{tr},G}}{1+\alpha^2}.
+```
+
+| Symbol | Znaczenie | SI |
+|---|---|---|
+| $T_{\mathrm{tr},G}$ | źródło transportowe przed konwersją Gilberta | $\mathrm{s^{-1}}$ |
+| $T_{\mathrm{tr,RHS}}$ | jawny wkład transportowy do pochodnej magnetyzacji | $\mathrm{s^{-1}}$ |
+| $m$ | zredukowana magnetyzacja bieżącej próbki etapu | $1$ |
+| $\alpha$ | lokalne tłumienie Gilberta | $1$ |
+
+`crates/fullmag-runner/src/fdm/cpu/spin_transport.rs::FdmSpinTransportWorkflow::evaluate_stage_internal`
+sumuje surowe `transport_gilbert_torque_per_s` producentów M1/M2/M3.
+Przed poprawką `reference.rs::execute_coupled_ars_trial` i
+`execute_coupled_heun_trial` przekazywały tę sumę bez konwersji do
+`ExternalStageTerms.direct_torque_per_s`.
+Jednak `crates/fullmag-engine/src/fdm/shared/types.rs::ExternalStageTerms`
+jawnie definiuje to pole jako **już jawne** $dm/dt$; CPU
+`integrators.rs::apply_external_stage_terms` dodaje je po obliczeniu RHS pola.
+Poprawna implementacja tego kontraktu nie konwertuje direct drugi raz.
+Potwierdzona historyczna luka leżała na granicy przekazania źródła przez oba
+callbacki, nie w samym dodawaniu jawnego RHS.
+
+Przerejestrowany pojedynczy owner jest już zapisany jako metoda
+`ExchangeLlgProblem::external_stage_terms_from_gilbert_source` w CPU
+`fields/direct_torques.rs`. Tworzy istniejące `ExternalStageTerms` z dokładnego
+trial $m$ i lokalnego `ExchangeLlgProblem::alpha_at`, konwertując wyłącznie
+przekazane źródło Gilberta. Oba callbacki wywołują ten sam helper. To kontrola
+źródeł, bez kompilacji lub wykonania helpera; snapshoty transportowe pozostają
+surowym źródłem, a Oersted pozostaje polem
+w $\mathrm{A/m}$. Nie zmienia się semantyki istniejącego direct pola,
+Python, `ProblemIR`, znaków absorpcji ani operatorów transportu.
+
+| Argument Rust / typ | Default i walidacja | SI / znaczenie |
+|---|---|---|
+| `magnetization: &[Vector3]` | required; dokładnie `grid.cell_count()`; bez nowej normalizacji | $1$; dokładny trial bieżącego callbacku |
+| `additional_field_apm: Vec<Vector3>` | required; dokładnie grid count; pole przekazane bez przeliczenia | $\mathrm{A/m}$; dodatkowe pole, nie źródło Gilberta |
+| `gilbert_source_per_s: Vec<Vector3>` | required; dokładnie grid count; owned buffer konwertowany in-place; raw obserwacje są zachowane przez caller clone | $\mathrm{s^{-1}}$; źródło przed konwersją, wynik w istniejącym direct polu jest jawny |
+
+Niezgodna liczność daje `InvalidInput`; istniejąca późniejsza kontrola
+`apply_external_stage_terms` nadal odrzuca niefinitywne external terms.
+Nie dodano nowego parametru Python ani `ProblemIR`.
+
+Obowiązuje dotychczasowa konwencja trialu z
+`ProjectionPolicy::project` i `ExchangeLlgProblem::llg_rhs_from_field_at`:
+bez nowej normalizacji, korekty mianownika normą $m$ ani zmiany projekcji RK.
+Zero źródła w nieaktywnych komórkach pozostaje zerem; zamrożone DOF nadal
+podlegają istniejącej końcowej masce. Nowy adapter nie może włączać torque
+w domenie niemagnetycznej ani zmieniać maski targetu.
+`precession_enabled=false` nie jest globalnie odrzucane przez engine;
+dotychczasowy RHS wyłącza nim wyłącznie precesyjną część pola. Adapter nie
+zmienia tej flagi i nie pomija z jej powodu konwersji źródła. Kanoniczny
+`crates/fullmag-plan/src/validate.rs::validate_conservative_relaxation`
+odrzuca aktywne niekonserwatywne torque w Relax; dostępność niskopoziomowego
+engine API nie kwalifikuje takiego publicznego workflow.
+
+Zakres luki: stały krok Heuna dla M1/M2 oraz ARS(2,3,2)
+`coupled_imex_ark2` dla M3, także jego adaptacyjne pełny/dwa półkroki.
+To nie ustalenie o innych integratorach, FEM ani GPU. Bramka poprawki wymaga
+odrębnych dowodów źródłowych/algebry i rzeczywistego runtime: lokalne różne
+$\alpha$, nieosiowe $m$, wszystkie próbki obu metod, brak podwójnej konwersji,
+zero źródła, nieaktywne/zamrożone komórki i rollback. Te bramki nie są tutaj
+wykonane. Sam rename artefaktu lub porównanie z BORIS nie naprawia równania.
+
+Zapisane regresje w `crates/fullmag-engine/tests/fdm_cpu_gilbert_stage.rs`:
+`gilbert_stage_uses_local_damping_and_preserves_field_and_source_observations`
+oraz `gilbert_source_matches_independent_field_rhs_through_heun_and_ars_trials`
+obejmują lokalne tłumienie, zachowanie obserwabli oraz niezależną tożsamość
+źródło–pole dla Heuna i ARS. Ich stan to **source-only: niekompilowane i
+niewykonane**; nie zamykają bramek powyżej.
+
 (symbols-and-si-units)=
 ### 2.7 Symbols and SI units
 
@@ -1999,13 +2080,24 @@ stiff-limit convergence to steady M1/M2 are not established by the current M1
 reference slice. BORIS and published models remain planned comparisons after
 explicit unit/sign conversion, not primary proof.
 
-The current FDM CPU-double M2 reference slice has an executable six-case
-matrix (three N/F resolutions and two tolerances) with independent charge and
-spin residuals; its artifact and binary identity are recorded in the audit
-plan. The corresponding BORIS matrix is intentionally diagnostic only: after
-the explicit `Q_ia=Js_ia/MUB_E` normalization, potential profiles improve with
-refinement but `mu_s`, interface fluxes, and torque do not meet the comparison
-contract. This does not promote either solver to cross-backend validation.
+Historyczna macierz referencyjna FDM CPU-double M2 obejmowała trzy
+rozdzielczości N/F i dwie tolerancje z niezależnymi residualami charge/spin;
+jej zapis w audycie nie jest wykonaniem aktualnego adaptera ani nową
+kwalifikacją. Historyczne porównanie BORIS po `Q_ia=Js_ia/MUB_E` pozostaje
+diagnostyczne: poprawa potencjału nie zamyka zgodności `mu_s`, strumieni
+interfejsowych ani torque.
+
+Aktualny `scripts/run_boris_fullmag_she_nf_matrix.py::run_resolution_matrix`
+wykonuje wyłącznie na Windows sześć przypadków **Fullmaga**: trzy istniejące,
+odrębne managed BORIS CPU `runtime.v2` coarse/medium/fine są ponownie używane
+przy dwóch tolerancjach Fullmaga (domyślnie $10^{-8}$ i $10^{-10}$).
+Tolerancja BORIS pozostaje stałym parametrem jego managed scenariusza;
+nie jest to sweep tolerancji BORIS ani przywrócenie dawnych siatek 10/20/40.
+`_require_reference_pin` sprawdza dokładne bytes summary/runtime/receipt/scenario
+wokół normalizacji, wykonania Fullmaga i porównania; binaria Fullmaga mają
+osobne piny. Drift przerywa macierz, a `validate_matrix_summary` kontroluje
+strukturę/metryki bez ponownego wykonania i bez nadania authority runtime.
+Nowej macierzy, benchmarku i zgodności solverów **nie zaliczono**.
 
 The bounded FEM CPU M2 lane also has a nontrivial managed constitutive oracle,
 `just verify-fem-steady-transport-m2-affine-contract`. It uses a
@@ -2743,6 +2835,20 @@ error handler nie nadpisuje sukcesu. Reobserve succeeded bundle jest verify-only
 bez naprawiania dowodów; identity pin odnosi się do exact final receipt bytes,
 bez checksum cycle. To zmiana lifecycle/provenance, nie tolerancji ani fizyki.
 
+(boris-managed-matrix-v2-contract)=
+Macierz porównawcza używa wyłącznie trzech już zakończonych managed CPU
+runtime v2 i nie uruchamia BORIS ponownie przez `observe`. Jej execution
+odrzuca Linux, CUDA, legacy build-root i legacy grids. Dwa przypadki tolerancji
+Fullmaga korzystają z tych samych dokładnie przypiętych referencji BORIS;
+`run_boris_fullmag_she_nf_matrix.py::_managed_reference` ponownie otwiera
+zaufany łańcuch i sprawdza zgodność wspólnych parametrów oraz rzeczywistej
+siatki. Piny obejmują summary.json, runtime.json, receipt.json i scenario.json;
+revalidation i ponowne piny binariów otaczają każdy przypadek. Nie jest to
+dowód konwergencji BORIS. Stałe referencje oznaczają niezmienne retained bytes,
+nie potwierdzenie zamrożonego $M$ ani wszystkich zrealizowanych parametrów.
+Scenariusz pozostaje `SCENARIO_NOT_QUALIFIED`; nowy benchmark i dynamika
+transportowego RHS Fullmaga pozostają `NOT VERIFIED`.
+
 Public validate_boris_artifact i normalize_boris_artifact wymagają dla v2
 jawnego trusted repo/storage context i ponownego otwarcia źródeł/receipt/output
 closure; legacy v1 odmowy pozostają. Brak operatora lub retained evidence
@@ -2878,6 +2984,20 @@ a qualified workload without the validation gates above.
 
 | Kontrakt | Ścieżka | Symbol | Odpowiedzialność i dowód |
 |---|---|---|---|
+| fdm-cpu-gilbert-stage-helper | crates/fullmag-engine/src/fdm/cpu/fields/direct_torques.rs | external_stage_terms_from_gilbert_source | Jedna konwersja owned Gilbert source z trial m i lokalnym alpha_at do istniejącego explicit ExternalStageTerms; źródła zapisane, runtime NOT VERIFIED. |
+| fdm-cpu-gilbert-stage-source-regression | crates/fullmag-engine/tests/fdm_cpu_gilbert_stage.rs | gilbert_stage_uses_local_damping_and_preserves_field_and_source_observations | Zapisana regresja lokalnego alpha, obu flag precesji, zero source, zachowania pól i shape guards; niekompilowana, niewykonana. |
+| fdm-cpu-gilbert-stage-field-equivalence | crates/fullmag-engine/tests/fdm_cpu_gilbert_stage.rs | gilbert_source_matches_independent_field_rhs_through_heun_and_ars_trials | Zapisana niezależna tożsamość Gilbert source z polem w czterech krokach Heuna/ARS; niekompilowana, niewykonana. |
+| fdm-cpu-gilbert-rhs-contract | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:fdm-cpu-transport-gilbert-rhs-boundary | Prerejestracja przed kodem, historyczny SOURCE_BUG_CONFIRMED i obecna źródłowa poprawka; runtime NOT VERIFIED. |
+| fdm-cpu-gilbert-normative | docs/physics/0960-spin-torque-sign-units-and-prescribed-sot.md | DOC-ANCHOR:governing-equations | Normatywne rozdzielenie Gilbert source i explicit RHS oraz jedna konwersja; bez nowego dowodu runtime. |
+| fdm-cpu-external-stage-type | crates/fullmag-engine/src/fdm/shared/types.rs | ExternalStageTerms | Istniejące direct_torque_per_s to już jawny wkład dm/dt; zmiana jego semantyki jest niedopuszczalna. |
+| fdm-cpu-coupled-ars-source | crates/fullmag-runner/src/fdm/cpu/reference.rs | execute_coupled_ars_trial | Historyczny raw-Gilbert/direct mismatch potwierdzony; obecny callback wywołuje jeden CPU engine helper. Source-only, runtime NOT VERIFIED. |
+| fdm-cpu-coupled-heun-source | crates/fullmag-runner/src/fdm/cpu/reference.rs | execute_coupled_heun_trial | Historyczny raw-Gilbert/direct mismatch potwierdzony; obecny callback wywołuje jeden CPU engine helper. Source-only, runtime NOT VERIFIED. |
+| fdm-cpu-external-rhs-assembly | crates/fullmag-engine/src/fdm/cpu/integrators.rs | apply_external_stage_terms | Dodawanie już jawnych external terms po RHS pola i istniejąca maska; bez zmiany obecnej semantyki. |
+| fdm-cpu-local-alpha | crates/fullmag-engine/src/fdm/shared/problem.rs | alpha_at | Istniejący owner lokalnego tłumienia potrzebnego przyszłemu adapterowi; bez korekty normy trial m. |
+| fdm-cpu-direct-torque-owner | crates/fullmag-engine/src/fdm/cpu/fields/direct_torques.rs | direct_torques_add_into | Istniejąca granica CPU direct RHS; osobny helper konwertuje wyłącznie zewnętrzne źródło Gilberta, bez drugiej konwersji istniejących torque. |
+| boris-managed-matrix-v2-driver | scripts/run_boris_fullmag_she_nf_matrix.py | run_resolution_matrix | Windows-only trzy stałe managed BORIS CPU runtime.v2 razy dwie tolerancje Fullmaga; source-only, benchmark NOT VERIFIED. |
+| boris-managed-matrix-v2-pin | scripts/run_boris_fullmag_she_nf_matrix.py | _require_reference_pin | Exact bytes summary/runtime/receipt/scenario przed i po wykorzystaniu; drift odmawia, bez runtime qualification. |
+| boris-managed-matrix-v2-validation | scripts/run_boris_fullmag_she_nf_matrix.py | validate_matrix_summary | Walidacja struktury i metryk sześciu rekordów nie zastępuje admission ani nowego wykonania solvera. |
 | Mandatory raw FEM identity | crates/fullmag-runner/src/native_fem/steady_transport/artifact_identity.rs | actual_transport_identity; tagged_json_digest | hash actual prepared request, full topology v3, descriptor and result; source-only, runtime unverified |
 | Independent public FEM readback | scripts/verify_transport_public_oracles.py | validate_fem_identity; check_fem | exact mesh/intent/operator binding and existing analytical gates; no PASS without managed observation |
 | Fixed managed FEM oracle | scripts/run_managed_transport_oracles.py | start; observe; transport_spec | source/package/container/log-output binding; no builds, runtime unverified |

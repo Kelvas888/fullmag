@@ -114,7 +114,8 @@
       "id": "racetrack-neel-seed",
       "symbols": ["seed_xy", "seed_center", "seed_rho", "seed_phi", "seed_theta", "seed_phase", "seed_radius", "seed_wall_width", "seed_polarity", "seed_m_raw", "m"],
       "sources": ["python-neel-skyrmion-authoring", "python-neel-skyrmion-evaluator", "rust-neel-skyrmion-evaluator", "racetrack-m1-v1-contract"]
-    }
+    },
+    {"id": "fdm-cpu-transport-gilbert-explicit-source", "symbols": ["T_tr_G", "T_tr_RHS", "m", "alpha"], "sources": ["fdm-cpu-gilbert-normative", "fdm-cpu-gilbert-rhs-contract", "fdm-cpu-gilbert-stage-helper"]}
   ],
   "symbols": [
     {"id": "tensor_flow_axis", "latex": "$i$", "meaning": "indeks osi przepływu x/y/z jako 0/1/2", "si_unit": "$1$"},
@@ -176,7 +177,8 @@
     {"id": "seed_radius", "latex": "R", "meaning": "frozen seed radius", "si_unit": "\\mathrm{m}"},
     {"id": "seed_wall_width", "latex": "\\Delta", "meaning": "frozen seed wall width", "si_unit": "\\mathrm{m}"},
     {"id": "seed_polarity", "latex": "p", "meaning": "serialized polarity multiplier in the repository profile", "si_unit": "$1$"},
-    {"id": "seed_m_raw", "latex": "\\mathbf m_{\\mathrm{raw}}", "meaning": "pre-normalization seed vector", "si_unit": "$1$"}
+    {"id": "seed_m_raw", "latex": "\\mathbf m_{\\mathrm{raw}}", "meaning": "pre-normalization seed vector", "si_unit": "$1$"},
+    {"id": "T_tr_RHS", "latex": "T_{\\mathrm{tr,RHS}}", "meaning": "jawny wkład transportowy do pochodnej magnetyzacji", "si_unit": "\\mathrm{s^{-1}}"}
   ],
   "sources": [
     {"id": "boris-source-image-admit-toolchain", "path": "scripts/local_runner/boris_cpu.py", "symbol": "admit_toolchain", "responsibility": "Bind exact source bytes and qualified toolchain inputs or verify offline source-image provenance; no solver qualification.", "evidence_status": "source_only"},
@@ -288,7 +290,21 @@
     {"id": "racetrack-stage-current-action", "path": "crates/fullmag-application/src/script_stage_materialization.rs", "symbol": "apply_pipeline_set_transport_current", "responsibility": "Mutate exactly the complete named normal-current electrode set between solved-current workflow stages.", "evidence_status": "source_contract"},
     {"id": "racetrack-stage-torque-action", "path": "crates/fullmag-application/src/script_stage_materialization.rs", "symbol": "apply_pipeline_set_spin_torque_enabled", "responsibility": "Atomically switch one typed spin-torque graph module and all of its incoming edge statuses between active and inactive.", "evidence_status": "source_contract"},
     {"id": "racetrack-zero-drive-torque-gate", "path": "crates/fullmag-plan/src/spin_transport.rs", "symbol": "materialize_fdm_descriptor", "responsibility": "Permit a provenance-preserved inactive torque only when every named normal-current terminal is exactly zero, while retaining fail-closed nonzero-drive conservation.", "evidence_status": "source_contract"},
-    {"id": "racetrack-m1-v1-contract", "path": "docs/physics/0970-spin-hall-drift-diffusion-transport.md", "symbol": "DOC-ANCHOR:racetrack-m1-v1-contract", "responsibility": "Freeze the synthetic solved-current racetrack fixture, complete M1 equations, sign operations, parameter provenance, and qualification boundary without claiming implementation.", "evidence_status": "planned_contract"}
+    {"id": "racetrack-m1-v1-contract", "path": "docs/physics/0970-spin-hall-drift-diffusion-transport.md", "symbol": "DOC-ANCHOR:racetrack-m1-v1-contract", "responsibility": "Freeze the synthetic solved-current racetrack fixture, complete M1 equations, sign operations, parameter provenance, and qualification boundary without claiming implementation.", "evidence_status": "planned_contract"},
+    {"id": "fdm-cpu-gilbert-rhs-contract", "path": "docs/physics/0970-spin-hall-drift-diffusion-transport.md", "symbol": "DOC-ANCHOR:fdm-cpu-transport-gilbert-rhs-boundary", "responsibility": "Prerejestracja przed kodem, historyczny SOURCE_BUG_CONFIRMED i obecna źródłowa poprawka; runtime NOT VERIFIED.", "evidence_status": "planned_contract"},
+    {"id": "fdm-cpu-gilbert-normative", "path": "docs/physics/0960-spin-torque-sign-units-and-prescribed-sot.md", "symbol": "DOC-ANCHOR:governing-equations", "responsibility": "Normatywne rozdzielenie Gilbert source i explicit RHS oraz jedna konwersja; bez nowego dowodu runtime.", "evidence_status": "planned_contract"},
+    {"id": "fdm-cpu-external-stage-type", "path": "crates/fullmag-engine/src/fdm/shared/types.rs", "symbol": "ExternalStageTerms", "responsibility": "Istniejące direct_torque_per_s to już jawny wkład dm/dt; zmiana jego semantyki jest niedopuszczalna.", "evidence_status": "source_only"},
+    {"id": "fdm-cpu-coupled-ars-source", "path": "crates/fullmag-runner/src/fdm/cpu/reference.rs", "symbol": "execute_coupled_ars_trial", "responsibility": "Historyczny raw-Gilbert/direct mismatch potwierdzony; obecny callback wywołuje jeden CPU engine helper. Source-only, runtime NOT VERIFIED.", "evidence_status": "source_only"},
+    {"id": "fdm-cpu-coupled-heun-source", "path": "crates/fullmag-runner/src/fdm/cpu/reference.rs", "symbol": "execute_coupled_heun_trial", "responsibility": "Historyczny raw-Gilbert/direct mismatch potwierdzony; obecny callback wywołuje jeden CPU engine helper. Source-only, runtime NOT VERIFIED.", "evidence_status": "source_only"},
+    {"id": "fdm-cpu-external-rhs-assembly", "path": "crates/fullmag-engine/src/fdm/cpu/integrators.rs", "symbol": "apply_external_stage_terms", "responsibility": "Dodawanie już jawnych external terms po RHS pola i istniejąca maska; bez zmiany obecnej semantyki.", "evidence_status": "source_only"},
+    {"id": "fdm-cpu-local-alpha", "path": "crates/fullmag-engine/src/fdm/shared/problem.rs", "symbol": "alpha_at", "responsibility": "Istniejący owner lokalnego tłumienia potrzebnego przyszłemu adapterowi; bez korekty normy trial m.", "evidence_status": "source_only"},
+    {"id": "fdm-cpu-direct-torque-owner", "path": "crates/fullmag-engine/src/fdm/cpu/fields/direct_torques.rs", "symbol": "direct_torques_add_into", "responsibility": "Istniejąca granica CPU direct RHS; osobny helper konwertuje wyłącznie zewnętrzne źródło Gilberta, bez drugiej konwersji istniejących torque.", "evidence_status": "source_only"},
+    {"id": "boris-managed-matrix-v2-driver", "path": "scripts/run_boris_fullmag_she_nf_matrix.py", "symbol": "run_resolution_matrix", "responsibility": "Windows-only trzy stałe managed BORIS CPU runtime.v2 razy dwie tolerancje Fullmaga; source-only, benchmark NOT VERIFIED.", "evidence_status": "source_only"},
+    {"id": "boris-managed-matrix-v2-pin", "path": "scripts/run_boris_fullmag_she_nf_matrix.py", "symbol": "_require_reference_pin", "responsibility": "Exact bytes summary/runtime/receipt/scenario przed i po wykorzystaniu; drift odmawia, bez runtime qualification.", "evidence_status": "source_only"},
+    {"id": "boris-managed-matrix-v2-validation", "path": "scripts/run_boris_fullmag_she_nf_matrix.py", "symbol": "validate_matrix_summary", "responsibility": "Walidacja struktury i metryk sześciu rekordów nie zastępuje admission ani nowego wykonania solvera.", "evidence_status": "source_only"},
+    {"id": "fdm-cpu-gilbert-stage-helper", "path": "crates/fullmag-engine/src/fdm/cpu/fields/direct_torques.rs", "symbol": "external_stage_terms_from_gilbert_source", "responsibility": "Jedna konwersja owned Gilbert source z trial m i lokalnym alpha_at do istniejącego explicit ExternalStageTerms; źródła zapisane, runtime NOT VERIFIED.", "evidence_status": "source_only"},
+    {"id": "fdm-cpu-gilbert-stage-source-regression", "path": "crates/fullmag-engine/tests/fdm_cpu_gilbert_stage.rs", "symbol": "gilbert_stage_uses_local_damping_and_preserves_field_and_source_observations", "responsibility": "Zapisana regresja lokalnego alpha, obu flag precesji, zero source, zachowania pól i shape guards; niekompilowana, niewykonana.", "evidence_status": "source_only"},
+    {"id": "fdm-cpu-gilbert-stage-field-equivalence", "path": "crates/fullmag-engine/tests/fdm_cpu_gilbert_stage.rs", "symbol": "gilbert_source_matches_independent_field_rhs_through_heun_and_ars_trials", "responsibility": "Zapisana niezależna tożsamość Gilbert source z polem w czterech krokach Heuna/ARS; niekompilowana, niewykonana.", "evidence_status": "source_only"}
   ],
   "planned_symbols": [
     {

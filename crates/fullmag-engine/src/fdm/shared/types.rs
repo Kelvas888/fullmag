@@ -106,6 +106,7 @@ pub struct ExternalStageTerms {
     /// Additional magnetic field in A/m, assembled before the Gilbert RHS.
     pub additional_field_apm: Vec<Vector3>,
     /// Direct contribution to `dm/dt` in 1/s, added after the Gilbert RHS.
+    /// This is already an explicit RHS, not an unconverted Gilbert source.
     pub direct_torque_per_s: Vec<Vector3>,
 }
 

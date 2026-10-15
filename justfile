@@ -1120,19 +1120,11 @@ verify-boris-nf-interface:
         PYTHONPATH=scripts python3 scripts/verify_boris_nf_interface.py "$run_dir" --output "$run_dir/validation-rerun.json"; \
       done'
 
-verify-boris-fullmag-she-nf:
-    bash -euo pipefail -c '\
-      boris_root="${FULLMAG_BORIS_BUILD_ROOT:-/zfn2/mateuszz/git/fullmag/boris-build/source}"; \
-      fullmag_bin="${FULLMAG_FULLMAG_BINARY:-{{repo_root}}/.fullmag/local/bin/fullmag}"; \
-      report_root="${FULLMAG_BORIS_FULLMAG_SHE_REPORT_ROOT:-/zfn2/mateuszz/git/fullmag/boris-build/reports/fullmag-boris-she-nf-v1}"; \
-      case "$boris_root" in /zfn2/mateuszz/git/fullmag/*) ;; *) echo "BORIS build root must be below /zfn2/mateuszz/git/fullmag" >&2; exit 2 ;; esac; \
-      case "$report_root" in /zfn2/mateuszz/git/fullmag/*) ;; *) echo "matrix report root must be below /zfn2/mateuszz/git/fullmag" >&2; exit 2 ;; esac; \
-      test -x "$boris_root/BorisLin"; \
-      test -f "$boris_root/source_manifest.json" || test -f "$boris_root/source-manifest.json"; \
-      test -x "$fullmag_bin"; \
-      if [ -e "$report_root/matrix.json" ]; then echo "matrix report already exists: $report_root/matrix.json" >&2; exit 3; fi; \
-      mkdir -p "$report_root"; \
-      PYTHONPATH="packages/fullmag-py/src:scripts${PYTHONPATH:+:$PYTHONPATH}" python3 scripts/run_boris_fullmag_she_nf_matrix.py --boris-build-root "$boris_root" --fullmag "$fullmag_bin" --report-root "$report_root" --device "${FULLMAG_BORIS_DEVICE:-cuda}"'
+# Windows-only: observe managed CPU references; never build or start BORIS.
+# Both Fullmag tolerances reuse each fixed BORIS reference, not a BORIS sweep.
+[windows]
+verify-boris-fullmag-she-nf-windows coarse_runtime medium_runtime fine_runtime fullmag fullmag_sha256 report_root native_sha256="":
+    @PYTHONPATH="{{repo_root}}/packages/fullmag-py/src" {{storage_python}} "{{repo_root}}/scripts/run_boris_fullmag_she_nf_matrix.py" --repo-root {{quote(repo_root)}} --boris-runtime-coarse {{quote(coarse_runtime)}} --boris-runtime-medium {{quote(medium_runtime)}} --boris-runtime-fine {{quote(fine_runtime)}} --fullmag {{quote(fullmag)}} --fullmag-sha256 {{quote(fullmag_sha256)}} --report-root {{quote(report_root)}} {{if native_sha256 == "" { "" } else { "--fullmag-native-sha256 " + quote(native_sha256) }}}
 
 verify-fdm-zhang-li-native-contract:
     docker compose --profile fem-gpu run --rm \
