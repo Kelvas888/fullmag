@@ -12,6 +12,11 @@ import { KernelContext } from "@/kernel/KernelContext";
 import { DiagnosticRecorderController } from "@/kernel/performance/diagnostic-recorder/DiagnosticRecorderController";
 import { GEOMETRY_LIFECYCLE_COMMANDS } from "@/kernel/authoring/geometryLifecycleCommandContributions";
 import type { CommandResult } from "@/kernel/commands/commandTypes";
+import { CommandRegistry } from "@/kernel/commands/CommandRegistry";
+import { addAntennaFieldSolveStudyCommand } from "@/kernel/runtime/antennaFieldSolveStudyCommand";
+import { AntennaStudyStageComposer } from "@/modules/inspector/panels/antenna/AntennaStudyStageComposer";
+import { modelTreeSnapshotFromScene } from "@/modules/explorer/builders/sceneModelTreeAdapter";
+import { buildStudyNodes } from "@/modules/explorer/builders/study/studyExplorerNodes";
 import { SelectionController } from "@/kernel/selection/SelectionController";
 import { useSceneResource } from "@/kernel/resources/geometryLifecycleResources";
 import { ResourceInvalidationController } from "@/kernel/resources/ResourceInvalidationController";
@@ -34,6 +39,7 @@ const serverHydrated = () => false;
 interface Call { method: string; path: string; scope: string | null; revision: number; body: unknown; }
 interface FixtureControl {
   selectGeometry(objectId: string): void;
+  studyNodeRef(stageId: string): unknown;
   readSelection(): Selection;
   subscribeSelection(listener: () => void): () => void;
   read(): { calls: Call[]; pendingWrites: number; pendingSceneReads: number; renderCommits: number; revision: number; scene: SceneResource; unexpected: string[]; invalidations: { resourceKey: string; revision: unknown }[] };
@@ -69,7 +75,7 @@ function makeFixture() {
     }));
     params.conductors = [{ id: "trace", kind: "signal" }, { id: "left", kind: "ground_left" }, { id: "right", kind: "ground_right" }];
   }
-  const state = { scene: { revision: 1, scene_revision: 1, objects: [{ id: OBJECT_ID, name: "Microstrip fixture", geometry, notes: "initial" }] } as SceneResource, renderCommits: 0, holdScene: false };
+  const state = { scene: { revision: 1, scene_revision: 1, scene: { id: "session-antenna-stations-fixture", name: "Fixture", authoring_schema: "fixture", source_of_truth: "fixture" }, objects: [{ id: OBJECT_ID, name: "Microstrip fixture", geometry, notes: "initial" }] } as SceneResource, renderCommits: 0, holdScene: false };
   const calls: Call[] = [];
   const unexpected: string[] = [];
   const invalidations: { resourceKey: string; revision: unknown }[] = [];
@@ -151,13 +157,23 @@ function makeFixture() {
     if (!node) throw new Error("Production antenna route node is missing");
     selection.set({ ...EMPTY_SELECTION, kind: node.kind, objectId: OBJECT_ID, nodeId: node.id, ref: selectionRefFromNode(node) }, "explorer");
   }
-  const kernel = { api, bus, resources, diagnostics, diagnosticRecorder, selection } as unknown as KernelApi;
+  const commands = new CommandRegistry();
+  commands.attach(bus);
+  commands.attachSessionScopeSource({ getScopeKey: () => expectedScope, subscribe: () => () => {} });
+  commands.register(addAntennaFieldSolveStudyCommand);
+  const kernel = { api, bus, resources, diagnostics, diagnosticRecorder, selection, commands } as unknown as KernelApi;
   const control: FixtureControl = {
     selectGeometry: (objectId) => {
       if (!state.scene.objects?.some(object => object.id === objectId)) throw new Error("Unknown fixture object");
       const node = buildObjectExplorerNode({ id: objectId, label: "Antenna", objectRole: "antenna" }, {}).children?.find(child => child.kind === "object.antenna.geometry");
       if (!node) throw new Error("Production Geometry route is missing");
       selection.set({ ...EMPTY_SELECTION, kind: node.kind, objectId, nodeId: node.id, ref: selectionRefFromNode(node) }, "explorer");
+    },
+    studyNodeRef: stageId => {
+      const snapshot = modelTreeSnapshotFromScene(state.scene);
+      const stages = buildStudyNodes(snapshot.study).children?.find(node => node.kind === "study.stages");
+      const node = stages?.children?.find(node => node.stageId === stageId);
+      return node ? selectionRefFromNode(node) : null;
     },
     readSelection: () => selection.get(),
     subscribeSelection: listener => selection.subscribe(listener),
@@ -213,9 +229,13 @@ function EditorHarness({ control }: { control: FixtureControl }) {
   const resource = useSceneResource();
   const created = resource.data?.objects?.findLast((object) => object.id !== OBJECT_ID);
   const routedInspector = new URL(window.location.href).searchParams.has("inspector");
+  const studyMode = new URL(window.location.href).searchParams.has("study");
+  const ownerId = selected.ref?.type === "scene-object" ? selected.ref.objectId : null;
+  const solves = resource.data?.antenna_field_solve_stages?.filter(stage => stage.source_object_id === ownerId) ?? [];
   const Panel = selected.kind === "object.antenna.geometry" || selected.kind === "object.antenna.conductor" ? resolveInspectorRoute(selected.kind)?.component : undefined;
   return <div data-testid="antenna-stations-editor" data-resource-status={resource.status} data-scene-revision={resource.data?.revision}>
     {routedInspector && Panel ? <Panel selection={selected} /> : <MicrostripGeometryEditor objectId={OBJECT_ID} scene={resource.data} status={resource.status} refetch={resource.refetch} />}
+    {studyMode && ownerId && solves.length === 1 ? <AntennaStudyStageComposer objectId={ownerId} stageId={solves[0].id} scene={resource.data} status={resource.status} /> : null}
     {created ? <div data-testid="antenna-created-details" data-object-id={created.id} style={{ width: 320, maxWidth: "100%" }}>
       <AntennaConductorDetails objectId={created.id} scene={resource.data} />
     </div> : null}

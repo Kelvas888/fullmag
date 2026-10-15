@@ -22,6 +22,7 @@ import { AntennaStudyStageComposer } from "./AntennaStudyStageComposer";
 function fixture(): SceneResource {
   return {
     scene: { id: "A", name: "fixture", authoring_schema: "fixture", source_of_truth: "fixture" }, revision: 7,
+    objects: [{ id: "source", role: "antenna" }],
     antenna_field_solve_stages: [{
       id: "solve", source_object_id: "source", current_transport_id: "current",
       port_mode_ids: ["port-2"], model: "quasistatic_conduction_biot_savart3d",

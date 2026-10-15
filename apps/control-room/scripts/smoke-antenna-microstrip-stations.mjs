@@ -554,6 +554,39 @@ try {
     await screenshot("22-circuit-rejected-partial-ack");
     checks.push({ name: "Partial circuit ACK without port normalization is refused before success/cache publication and preserves newer voltage and panel", passed: true });
   }
+  if (layout === "microstrip") {
+    const studyUrl = new URL(layoutUrl); studyUrl.searchParams.set("inspector", "geometry"); studyUrl.searchParams.set("study", "1");
+    await page.goto(studyUrl.href, { waitUntil: "domcontentloaded", timeout }); await ready();
+    await page.evaluate(() => { window.__studyCreation = window.__antennaStationsFixture.createAntenna("microstrip"); });
+    await page.waitForFunction(() => window.__antennaStationsFixture.read().pendingWrites === 1, undefined, { timeout });
+    await page.evaluate(() => window.__antennaStationsFixture.releaseWrite()); await page.evaluate(() => window.__studyCreation); await ready();
+    const created = (await read()).scene.objects.at(-1), sourceId = created.id;
+    const solve = (await read()).scene.antenna_field_solve_stages.find(stage => stage.source_object_id === sourceId);
+    await page.evaluate(id => window.__antennaStationsFixture.selectGeometry(id), sourceId);
+    const add = page.getByRole("button", { name: "Add Field Solve to Study", exact: true });
+    assert.equal(await add.isEnabled(), true);
+    await add.click(); await page.waitForFunction(() => window.__antennaStationsFixture.read().pendingWrites === 1, undefined, { timeout });
+    const before = await read(), transaction = before.calls.filter(call => call.method === "POST").at(-1).body;
+    assert.deepEqual(Object.keys(transaction.merge_patch), ["study"]);
+    assert.equal(transaction.merge_patch.study.stages.length, 1);
+    assert.equal(transaction.merge_patch.study.stages[0].kind, "antenna_field_solve");
+    assert.equal(transaction.merge_patch.study.stages[0].stage_id, solve.id);
+    assert.equal(await add.isDisabled(), true);
+    await page.evaluate(() => window.__antennaStationsFixture.releaseWrite()); await ready();
+    const open = page.getByRole("button", { name: "Open Study stage", exact: true }); await open.waitFor({ timeout });
+    assert.equal(await add.isDisabled(), true, "An existing Study reference must not permit duplicate add");
+    const beforeNavigation = await read();
+    await open.scrollIntoViewIfNeeded(); await screenshot("24-study-reference-ready");
+    await open.click();
+    const selected = await page.evaluate(() => window.__antennaStationsFixture.readSelection());
+    assert.equal(selected.kind, "study.stage.antenna_field_solve");
+    assert.equal(selected.objectId, null, "Study navigation must clear the previous source object");
+    assert.equal(selected.ref.stageId, solve.id); assert.equal(selected.ref.stageIndex, 0);
+    assert.deepEqual(selected.ref, await page.evaluate(id => window.__antennaStationsFixture.studyNodeRef(id), solve.id));
+    assert.equal((await read()).calls.filter(call => call.method === "POST").length, beforeNavigation.calls.filter(call => call.method === "POST").length);
+    assert.deepEqual((await read()).unexpected, []);
+    checks.push({ name: "Actual command registry adds one antenna-only Study reference; duplicate add is disabled and navigation matches the canonical Explorer selection without starting execution", passed: true });
+  }
   await page.close();
   page = null;
   }

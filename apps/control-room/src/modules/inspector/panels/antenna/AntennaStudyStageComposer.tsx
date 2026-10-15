@@ -4,12 +4,13 @@ import type { SceneResource } from "@/kernel/api/apiTypes";
 import { useKernel } from "@/kernel/KernelContext";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
-import { ADD_ANTENNA_FIELD_SOLVE_STAGE_COMMAND } from "@/kernel/runtime/antennaFieldSolveStudyCommand";
+import { ADD_ANTENNA_FIELD_SOLVE_STAGE_COMMAND, antennaFieldSolveStudyReference } from "@/kernel/runtime/antennaFieldSolveStudyCommand";
 import { Button } from "@/shared/ui/Button";
 import { antennaFieldSolveDefinitionPortError } from "@/shared/domain/study/antennaFieldSolveCapability";
 
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
 import { FormField } from "../../primitives/FormField";
+import { FieldRow } from "../../primitives/FieldRow";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 
 interface Props { objectId: string; stageId: string; scene: SceneResource | null; status: string }
@@ -40,8 +41,18 @@ export function AntennaStudyStageComposer({ objectId, stageId, scene, status }: 
     && selectedPorts[0].source_object_id === objectId
     && selectedPorts[0].current_transport_id === definition?.current_transport_id;
 
+  const studyReference = scene && definition && validPort && !capabilityError
+    ? antennaFieldSolveStudyReference(scene, { objectId, stageId, portModeId: portId }) : null;
+
+  function openStudyStage() {
+    if (!currentScene || studyReference?.state !== "present" || commands.getSessionScopeKey() !== scope) return;
+    const nodeId = `model:study:stages:stage:${studyReference.queueId}`;
+    selection.set({ kind: "study.stage.antenna_field_solve", nodeId, objectId: null, label: "Antenna Field Solve",
+      ref: { type: "study-stage", kind: "study.stage.antenna_field_solve", nodeId, stageId: studyReference.queueId, stageIndex: studyReference.index } }, "inspector");
+  }
+
   async function add() {
-    if (!currentScene || !validPort || capabilityError || !scope || inflight.current === token) return;
+    if (!currentScene || !validPort || capabilityError || studyReference?.state !== "missing" || !scope || inflight.current === token) return;
     const isCurrent = () => owner.current === token && commands.getSessionScopeKey() === scope;
     inflight.current = token;
     setPendingToken(token);
@@ -74,7 +85,14 @@ export function AntennaStudyStageComposer({ objectId, stageId, scene, status }: 
     {!definition ? <FeedbackBanner kind="error" message="The field-solve definition is missing or ambiguous." /> : null}
     {capabilityError ? <FeedbackBanner kind="error" message={capabilityError} /> : null}
     {portId && !validPort ? <FeedbackBanner kind="error" message="The selected port must belong uniquely to this source and current transport." /> : null}
+    {studyReference?.state === "invalid" ? <FeedbackBanner kind="error" message={studyReference.message} /> : null}
+    {studyReference?.state === "present" ? <>
+      <FieldRow label="Study stage ID" value={studyReference.queueId} mono />
+      <p className="fm-inspector-hint">{studyReference.enabled ? "Reference is in Study. Open its stage to review preparation and execution; no calculation has started here."
+        : "The stage or its parent group is disabled. Open Study and enable it explicitly before execution."}</p>
+      <Button type="button" disabled={!currentScene} onClick={openStudyStage}>Open Study stage</Button>
+    </> : null}
     {feedback?.key === key && !capabilityError ? <FeedbackBanner kind={feedback.kind} message={feedback.message} /> : null}
-    <Button type="button" disabled={!currentScene || !validPort || Boolean(capabilityError) || pending} onClick={() => void add()}>Add Field Solve to Study</Button>
+    <Button type="button" disabled={!currentScene || !validPort || Boolean(capabilityError) || studyReference?.state !== "missing" || pending} onClick={() => void add()}>Add Field Solve to Study</Button>
   </InspectorGroup>;
 }
