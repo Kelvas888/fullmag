@@ -25,6 +25,7 @@ import {
   useSessionStatusSelector,
 } from "@/kernel/resources/useSessionStatus";
 import { Button } from "@/shared/ui/Button";
+import { getTransportAuthoringCapability } from "@/shared/domain/physics/transportAuthoringCapabilities";
 
 import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import type { InspectorPanelProps } from "../inspectorTypes";
@@ -109,7 +110,9 @@ export function SpinInterfaceInspectorPanel({ selection }: InspectorPanelProps) 
   const [validationState, setValidationState] = useState<{ key: string; response: TransportValidationResponse | null }>({ key: "", response: null });
   const validation = validationState.key === validationKey ? validationState.response : null;
   const readOnly = selected ? !selected.known : false;
-  const capability = useSessionStatusSelector((status) => status.data?.capabilities.transport_authoring?.m1_one_way_steady ?? null);
+  const capabilities = useSessionStatusSelector((status) => status.data?.capabilities.transport_authoring ?? null);
+  const owner = (transports.data?.items ?? []).find((item) => record(item)?.id === ownerId) ?? null;
+  const capability = getTransportAuthoringCapability("spin_transport", owner, geometry.data, capabilities);
   const dirty = JSON.stringify(draft) !== JSON.stringify(baseDraft);
   const valid = Boolean(
     !readOnly && !targetUnavailable && resolved.conflicts.length === 0 &&

@@ -6,7 +6,6 @@ import type {
   SceneResource,
   SceneCurrentTransport,
   SceneSpinTransport,
-  TransportAuthoringCapabilityMap,
   TransportValidationRequest,
   TransportValidationResponse,
 } from "@/kernel/api/apiTypes";
@@ -32,6 +31,7 @@ import {
   useSessionStatusSelector,
 } from "@/kernel/resources/useSessionStatus";
 import { Button } from "@/shared/ui/Button";
+import { getTransportAuthoringCapability } from "@/shared/domain/physics/transportAuthoringCapabilities";
 import { Switch } from "@/shared/ui/Switch";
 
 import { useRegisterInspectorEditSession } from "../InspectorEditSession";
@@ -69,24 +69,6 @@ type Family = "current_transport" | "spin_transport";
 type Draft = CurrentTransportDraft | SpinTransportDraft;
 
 const TRANSPORT_VALIDATION_VERSION = "transport-authoring-validation.v1";
-
-function requestedCapability(
-  family: Family,
-  draft: Draft,
-  capabilities: TransportAuthoringCapabilityMap | null,
-) {
-  if (!capabilities) return null;
-  if (family === "current_transport") {
-    return (draft as CurrentTransportDraft).coupling === "bidirectional"
-      ? capabilities.m2_reciprocal
-      : capabilities.m1_one_way_steady;
-  }
-  const spin = draft as SpinTransportDraft;
-  if (spin.mode === "transient") return capabilities.m3_transient;
-  if (spin.executionDevice === "gpu") return capabilities.gpu;
-  if (spin.executionPrecision === "single") return capabilities.single_precision;
-  return capabilities.m1_one_way_steady;
-}
 
 export function TransportAuthoringInspector({
   family,
@@ -213,7 +195,13 @@ export function TransportAuthoringInspector({
     (status) => status.data?.capabilities.transport_authoring ?? null,
     { enabled: true },
   );
-  const capability = requestedCapability(family, draft, capabilities);
+  const capabilityResource = family === "current_transport"
+    ? { name: (draft as CurrentTransportDraft).name, model: (draft as CurrentTransportDraft).model, coupling: (draft as CurrentTransportDraft).coupling }
+    : { current_source_id: (draft as SpinTransportDraft).currentSourceId, mode: (draft as SpinTransportDraft).mode,
+        constitutive_version: (draft as SpinTransportDraft).constitutiveVersion,
+        requested_execution: { device: (draft as SpinTransportDraft).executionDevice, precision: (draft as SpinTransportDraft).executionPrecision,
+          discretization: (draft as SpinTransportDraft).executionDiscretization, execution_mode: (draft as SpinTransportDraft).executionMode } };
+  const capability = getTransportAuthoringCapability(family, capabilityResource, geometry.data, capabilities);
   const dirty = !transportDraftValuesEqual(draft, baseDraft);
   const valid = Boolean(
     known && !targetUnavailable &&
