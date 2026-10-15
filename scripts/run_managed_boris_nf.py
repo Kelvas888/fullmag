@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,6 @@ from local_runner import boris_cpu as boris
 from local_runner.build_executor import capsule_path, validate_build_receipt
 from local_runner.container_client import request
 from local_runner.worker_entrypoint import verify_source
-from run_managed_browser import SYSTEM_MOUNT_TARGETS, digest, docker, host_path
 
 SCHEMA = "fullmag.boris.managed_run.v1"
 RUNTIME_SCHEMA = "fullmag.boris.runtime.v2"
@@ -28,8 +28,36 @@ RAW_FIELDS = (*RAW_FIELDS, "f_M_before.ovf", "f_M_after.ovf")
 RAW_OUTPUTS = (*RAW_FIELDS, "boris_native_samples.json", "solver.stdout.log", "solver.stderr.log", "runtime_probe.json")
 SOURCE_FILES = ("scripts/run_managed_boris_nf.py", "scripts/run_boris_nf_interface.py",
     "scripts/verify_boris_nf_interface.py", "scripts/compare_boris_fullmag_she_nf.py",
-    "scripts/boris_nf_interface_smoke.py", "scripts/run_managed_browser.py", "scripts/fullmag_storage.py",
+    "scripts/boris_nf_interface_smoke.py", "scripts/fullmag_storage.py",
     "scripts/verify_saved_fem_archive_roundtrip.py")
+
+
+SYSTEM_MOUNT_TARGETS = {"/etc/hosts", "/etc/hostname", "/etc/resolv.conf"}
+
+
+def host_path(value):
+    raw = str(value).replace("\\", "/")
+    if os.name == "nt":
+        alias = re.fullmatch(r"/(?:run/desktop/mnt/host|host_mnt)/([A-Za-z])/(.*)", raw)
+        if alias:
+            raw = alias.group(1) + ":/" + alias.group(2)
+    return Path(raw).resolve()
+
+
+def digest(path):
+    result = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024*1024), b""):
+            result.update(block)
+    return result.hexdigest()
+
+
+def docker(*args):
+    result = subprocess.run(["docker", "--context", "desktop-linux", *args],
+                            capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or "Docker operation failed")
+    return result.stdout.strip()
 
 
 def read_json(path, bound=4*1024*1024, *, expected_sha256=None):
