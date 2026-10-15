@@ -1931,9 +1931,16 @@ mod tests {
             )
             .unwrap()
         };
-        let mut plan = PreparationPlan::new(
+        let specification_fingerprint = format!("sha256:{}", specification.fingerprint().unwrap());
+        let source = fullmag_plan::PreparationPlanSource::accepted_run_step(
+            specification.run_id.as_str(),
+            specification_fingerprint,
+            step_id,
+        )
+        .unwrap();
+        let plan = PreparationPlan::new_for_accepted_run(
             fingerprint('b'),
-            1,
+            source,
             BackendTarget::Auto,
             BackendTarget::Fdm,
             producer(PreparationProducerKind::Geometry, '1'),
@@ -1943,19 +1950,6 @@ mod tests {
             producer(PreparationProducerKind::Space, '5'),
         )
         .unwrap();
-        let specification_fingerprint = format!(
-            "sha256:{}",
-            specification.fingerprint().unwrap()
-        );
-        plan.scene_revision = None;
-        plan.source = Some(
-            fullmag_plan::PreparationPlanSource::accepted_run_step(
-                specification.run_id.as_str(),
-                specification_fingerprint,
-                step_id,
-            )
-            .unwrap(),
-        );
         let marker_map = fingerprint('c');
         let certificates = vec![
             PreparationCertificate {
