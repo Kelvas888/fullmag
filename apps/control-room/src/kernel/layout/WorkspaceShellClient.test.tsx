@@ -15,6 +15,7 @@ import { KernelContext } from "../KernelContext";
 import { ModuleRegistry } from "../module/ModuleRegistry";
 import { DiagnosticRecorderController } from "../performance/diagnostic-recorder/DiagnosticRecorderController";
 import { RealtimeConnectionController } from "../realtime/RealtimeConnectionController";
+import { statusRefreshIntervalMs } from "../realtime/communicationPolicy";
 import { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import {
@@ -250,6 +251,8 @@ describe("WorkspaceShellClient session collection gate", () => {
       draft!.value = "Unsaved workspace draft";
       draft!.focus();
 
+      // Invalidate after the real status throttle, without waiting on wall time.
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + statusRefreshIntervalMs() + 1);
       await act(async () => {
         kernel.resources.invalidate(SESSIONS_PATH, "transport-refresh:1");
         kernel.resources.invalidate(SESSION_STATUS_RESOURCE_KEY, "transport-refresh:1");
