@@ -77,6 +77,37 @@ YAML w owned run; nie generuje topologii w Pythonie.
 Renderowanie Compose przeszło kontrole źródeł i rzeczywisty parser Compose;
 cold-start, HMR i pełny runtime pozostają **VERIFICATION PENDING**.
 
+## Jawny skrypt przy uruchomieniu Workspace
+
+Opcjonalny czwarty argument `docker-all-dev` wskazuje skrypt w wybranym
+checkoutcie. Podaj ten sam `$sourceRoot`, którego użyto do budowania:
+
+```powershell
+$startupScript = Join-Path $sourceRoot 'tests/vlad/4.5GHz_fem.py'
+just docker-all-dev $assemblyReceipt 3197 $sourceRoot $startupScript
+```
+
+Wariant ze statycznym frontendem przyjmuje te same argumenty:
+`just docker-all-start $assemblyReceipt 3197 $sourceRoot $startupScript`.
+Skrypt musi być plikiem UTF-8 do 1 MiB wewnątrz wybranego checkoutu.
+Launcher zapisuje jego ścieżkę względną i SHA-256 oraz montuje źródła readonly.
+Helper aktywacji należy do niezmiennego obrazu; kod użytkownika jest ładowany
+przez kanoniczny importer API. Nie korzystamy z `docker compose run fullmag`.
+
+Odbiór startu wymaga potwierdzenia aktywacji tego samego skryptu w receipcie
+procesu backendu. Sam HTTP healthcheck nie potwierdza przygotowania modelu.
+Aktywacja HTTP ma limit 1800 sekund; obserwacja gotowości ma limit 2100 sekund.
+Timeout nie uruchamia drugiej próby ani drugiego solvera i pozostawia dane
+uruchomienia do sprawdzenia. Docelowo authored Study uruchamia się w całości,
+a interaktywne `wait_for_solve` zatrzymuje je przed Compute, po przygotowaniu
+modelu i siatki.
+
+**NOT VERIFIED:** trwa integracja admitted FEM preparation z Workspace/API.
+Powyższy interfejs launchera ma regresje interpretowane; nie stanowią one
+dowodu wykonania pełnego skryptu `4.5GHz_fem.py`, GPU ani gotowego modelu
+w przeglądarce. Końcowa kwalifikacja wymaga zbudowania nowego pakietu API
+z obsługą wewnętrznej trasy aktywacji i wykonania obu wariantów skryptu.
+
 ## Budowanie obrazu release (opcjonalne)
 
 Pełną kompilację wykonuje istniejący `Fullmag_build_runner`. Nie uruchamiaj

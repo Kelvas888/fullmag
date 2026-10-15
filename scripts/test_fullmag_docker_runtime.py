@@ -63,6 +63,57 @@ class DockerRuntimeContract(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             self.assertEqual(run.call_args.kwargs["timeout"], 3)
 
+    def test_startup_script_uses_long_bounded_compose_wait_even_without_dev_frontend(self):
+        self.assertEqual(
+            runtime._runtime_ready_timeouts(None, {"authorization": {}}),
+            (runtime.STARTUP_READY_TIMEOUT_SECONDS, runtime.STARTUP_DOCKER_CLIENT_TIMEOUT_SECONDS),
+        )
+        self.assertEqual(
+            runtime._runtime_ready_timeouts({}, None),
+            (runtime.STARTUP_READY_TIMEOUT_SECONDS, runtime.STARTUP_DOCKER_CLIENT_TIMEOUT_SECONDS),
+        )
+        self.assertEqual(runtime._runtime_ready_timeouts(None, None), (90, 150))
+
+    def test_startup_receipt_requires_ready_matching_activation(self):
+        authorization = {
+            "schema": "fullmag.docker-startup-script.v1",
+            "authorization": "explicit_startup_script",
+            "request_id": "startup-receipt-test",
+            "source_sha256": "a" * 64,
+            "source_relative": "models/scene.py",
+        }
+        response = {
+            "schema": "fullmag.startup-script-activation.v1",
+            "authorization": "explicit_startup_script",
+            "request_id": authorization["request_id"],
+            "source_sha256": authorization["source_sha256"],
+            "status": "ready",
+            "execution": {
+                "mode": "canonical_live_v2",
+                "auto_study": True,
+                "interactive": "script_metadata",
+                "wait_for_solve": "script_metadata",
+                "legacy_cli": False,
+            },
+        }
+        receipt = {
+            "schema": "fullmag.docker-process-tree.v1",
+            "state": "ready",
+            "startup_activation": {
+                "schema": "fullmag.startup-script-activation.v1",
+                "state": "activated",
+                "request_id": authorization["request_id"],
+                "source_sha256": authorization["source_sha256"],
+                "source_relative": authorization["source_relative"],
+                "response": response,
+            },
+        }
+        self.assertIs(runtime._validate_startup_process_receipt(receipt, authorization), receipt)
+        changed = json.loads(json.dumps(receipt))
+        changed["startup_activation"]["request_id"] = "other-request"
+        with self.assertRaisesRegex(ValueError, "fence"):
+            runtime._validate_startup_process_receipt(changed, authorization)
+
     def test_artifact_digest_handles_empty_and_multiblock_files_on_python_310(self):
         import hashlib
         with tempfile.TemporaryDirectory() as directory:
@@ -79,6 +130,10 @@ class DockerRuntimeContract(unittest.TestCase):
             for name in ("Dockerfile", "Dockerfile.dev", "entrypoint.py", "windows_folder_probe.py",
                          "runtime_service.py", "frontend_dev.py", "healthcheck.py"):
                 (helpers / name).write_text(name)
+            scripts = root / "capsule/tree/scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "docker_startup_script.py").write_text("pinned startup helper")
+            (scripts / "fullmag_storage.py").write_text("pinned storage helper")
             (root / "capsule/tree/application-secret-sentinel").write_text("source")
             package = root / "package"
             (package / "bin").mkdir(parents=True)
@@ -89,6 +144,8 @@ class DockerRuntimeContract(unittest.TestCase):
             self.assertFalse((stage / "source").exists())
             self.assertFalse((stage / "package").exists())
             self.assertEqual((stage / "Dockerfile").read_text(), "Dockerfile.dev")
+            self.assertEqual((stage / "docker_startup_script.py").read_text(), "pinned startup helper")
+            self.assertEqual((stage / "fullmag_storage.py").read_text(), "pinned storage helper")
             self.assertEqual(hashes["fullmag-bin"], __import__("hashlib").sha256(b"immutable compiled backend").hexdigest())
             release = root / "release-context"
             release.mkdir()
@@ -492,6 +549,11 @@ class DockerRuntimeContract(unittest.TestCase):
             layout = {"storage_root": str(root), "runs_root": str(root / "runs/task"),
                       "worktree_id": "task", "repo_root": str(root / "main")}
             main = root / "main"
+            # Native Windows admission verifies every selected checkout
+            # ancestor before capture.  Keep this fixture a real registered
+            # directory so the test exercises capture-race behavior rather
+            # than the intended missing-path rejection.
+            main.mkdir()
             manifest = {"resolved_commit": "b" * 40, "source_digest": "c" * 64}
             native = {"source_snapshot_sha256": "e" * 64}
             with patch.object(runtime.storage, "git", side_effect=lambda repo, *args: args[-1]), \

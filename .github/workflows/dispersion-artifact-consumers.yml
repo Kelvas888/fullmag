@@ -115,6 +115,7 @@ jobs:
         run: |
           python -B scripts/test_managed_runtime_artifact_root.py -v
           python -B scripts/test_fullmag_docker_runtime.py -v
+          python -B scripts/test_docker_startup_script.py -v
           python -B scripts/test_docker_frontend_dev.py -v
           python -B scripts/test_verify_docker_all_runtime.py -v
           python -B scripts/test_docker_host_ledger.py -v

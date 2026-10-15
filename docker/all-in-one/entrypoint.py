@@ -1,9 +1,11 @@
 """Fail before API startup when GPU or durable state storage is unavailable."""
 import ctypes
+import hashlib
 import os
 import subprocess
 import sys
 import signal
+import stat
 import threading
 import time
 import uuid
@@ -35,6 +37,53 @@ def preflight():
     probe.unlink()
 
 
+def activate_startup_script():
+    """Activate the optional host-attested script through the live API only."""
+    if os.environ.get("FULLMAG_STARTUP_ENABLED") != "1":
+        if any(name in os.environ for name in (
+                "FULLMAG_STARTUP_SCRIPT", "FULLMAG_STARTUP_PROVENANCE",
+                "FULLMAG_STARTUP_API", "FULLMAG_STARTUP_PROVENANCE_SHA256",
+                "FULLMAG_STARTUP_HELPER_SHA256")):
+            raise RuntimeError("startup activation environment is incomplete")
+        return None
+    helper_path = Path("/opt/fullmag/docker_startup_script.py")
+    expected_hash = os.environ.get("FULLMAG_STARTUP_HELPER_SHA256", "")
+    if len(expected_hash) != 64 or any(character not in "0123456789abcdef" for character in expected_hash):
+        raise RuntimeError("startup helper hash is missing or invalid")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(helper_path, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+            raise RuntimeError("startup helper is not a bounded regular file")
+        checksum = hashlib.sha256()
+        for block in iter(lambda: os.read(descriptor, 64 * 1024), b""):
+            checksum.update(block)
+        if checksum.hexdigest() != expected_hash:
+            raise RuntimeError("startup helper differs from the image-attested bytes")
+    except OSError as error:
+        raise RuntimeError("Docker startup-script helper is unavailable from the image") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    try:
+        import importlib.util
+
+        helper_root = "/opt/fullmag"
+        if helper_root not in sys.path:
+            sys.path.insert(0, helper_root)
+        spec = importlib.util.spec_from_file_location("docker_startup_script", helper_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Docker startup-script helper cannot be loaded")
+        docker_startup_script = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = docker_startup_script
+        spec.loader.exec_module(docker_startup_script)
+        return docker_startup_script.run_from_environment()
+    except (ImportError, OSError, RuntimeError) as error:
+        raise RuntimeError("Docker startup-script helper is missing from the image") from error
+
+
 def serve():
     import runtime_service as service
     stopping = threading.Event()
@@ -57,6 +106,9 @@ def serve():
         handle = service.start(paths, api_port=8081, expected_binding=bootstrap["binding"],
                                configuration=configuration)
         last_full_api_probe = time.monotonic()
+        startup_result = activate_startup_script()
+        if startup_result is not None:
+            receipt["startup_activation"] = startup_result
         receipt.update(state="ready", service_owner=handle.owner)
         service._atomic_json(receipt_path, receipt, "process tree receipt")
         while not stopping.wait(1):

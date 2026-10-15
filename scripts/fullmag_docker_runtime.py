@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -20,6 +21,8 @@ from local_runner.worker_entrypoint import verify_source
 from run_managed_browser import digest, host_path, read_json, validate_managed_build
 
 PROFILE = "docker-all-gpu"
+STARTUP_READY_TIMEOUT_SECONDS = 2100
+STARTUP_DOCKER_CLIENT_TIMEOUT_SECONDS = 2160
 REQUIRED_BINARIES = (
     "fullmag-api", "fullmag-bin", "fullmag-runtime-service",
     "fullmag-api-resource-pool", "fullmag-api-preparation-resource-pool",
@@ -42,6 +45,72 @@ class DockerOutcomeUnknown(RuntimeError):
         super().__init__(f"Docker client timed out after {timeout}s; container/build outcome is unconfirmed")
         self.operation = list(args)
         self.timeout_seconds = timeout
+
+
+class StartupOutcomeUnknown(RuntimeError):
+    """The container remained owned but did not publish startup activation."""
+
+    def __init__(self, request_id, timeout):
+        super().__init__(f"Startup activation {request_id!r} did not reach a durable ready receipt within {timeout}s")
+        self.operation = ["startup-activation", request_id]
+        self.timeout_seconds = timeout
+
+
+def _startup_process_receipt_path(state):
+    return Path(state) / ".fullmag/runtime-service/process-tree.json"
+
+
+def _validate_startup_process_receipt(value, authorization=None):
+    if not isinstance(value, dict) or value.get("schema") != "fullmag.docker-process-tree.v1":
+        raise ValueError("Runtime process-tree receipt schema mismatch")
+    if value.get("state") != "ready":
+        raise ValueError("Runtime process-tree receipt is not ready")
+    if authorization is None:
+        return value
+    activation = value.get("startup_activation")
+    if not isinstance(activation, dict):
+        raise ValueError("Runtime process-tree receipt has no startup activation")
+    if (activation.get("schema") != "fullmag.startup-script-activation.v1"
+            or activation.get("state") != "activated"
+            or activation.get("request_id") != authorization.get("request_id")
+            or activation.get("source_sha256") != authorization.get("source_sha256")
+            or activation.get("source_relative") != authorization.get("source_relative")):
+        raise ValueError("Runtime startup activation fence differs from the host authorization")
+    response = activation.get("response")
+    if not isinstance(response, dict):
+        raise ValueError("Runtime startup activation response is missing")
+    # Reuse the exact request/response contract; this does not create a second
+    # endpoint or relax the API's live-v2 execution policy.
+    import docker_startup_script as startup_helper
+    startup_helper.validate_activation_response(response, authorization)
+    return value
+
+
+def _wait_for_startup_ready(state, authorization=None, *, timeout=90):
+    if timeout <= 0:
+        raise ValueError("Startup activation observation timeout must be positive")
+    path = _startup_process_receipt_path(state)
+    deadline = time.monotonic() + timeout
+    while True:
+        if path.exists():
+            value = read_json(path)
+            if value.get("state") in {"failed_outcome_retained", "shutdown_unknown"}:
+                raise ValueError("Runtime process-tree receipt records an unconfirmed startup outcome")
+            if value.get("state") == "ready":
+                return _validate_startup_process_receipt(value, authorization)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            request_id = authorization.get("request_id") if authorization is not None else "runtime-ready"
+            raise StartupOutcomeUnknown(request_id, timeout)
+        time.sleep(min(0.25, remaining))
+
+
+def _runtime_ready_timeouts(inputs, startup):
+    """Return bounded wait/client budgets for the actual startup contract."""
+
+    if inputs is not None or startup is not None:
+        return STARTUP_READY_TIMEOUT_SECONDS, STARTUP_DOCKER_CLIENT_TIMEOUT_SECONDS
+    return 90, 150
 
 
 def docker(*args, combined=False, timeout=60, environment=None):
@@ -81,7 +150,8 @@ def validate_workspace_environment(config):
 
 def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs=None,
                  inputs_path=None, package=None, provenance=None, toolchain_image=None,
-                 project="fullmag-config-check", template=None, host_ledger=None):
+                 project="fullmag-config-check", template=None, host_ledger=None,
+                 startup=None):
     """Resolve the versioned Compose definition; do not generate service topology."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("A full immutable image ID is required")
@@ -110,6 +180,11 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
     if host_ledger is not None:
         environment.update(host_ledger["environment"])
         definitions.extend(["-f", host_ledger["compose_overlay"]])
+    if startup is not None:
+        overlay = startup.get("compose_overlay")
+        if not isinstance(overlay, str) or not Path(overlay).is_file():
+            raise ValueError("Startup script Compose overlay is missing")
+        definitions.extend(["-f", overlay])
     configured = json.loads(docker("compose", "--project-name", project,
                                    "--project-directory", str(repo), *definitions,
                                    "config", "--format", "json", environment=environment))
@@ -163,6 +238,9 @@ def submit_build(repo, commit=None, *, development=False, source_root=None):
             relative = "docker/all-in-one/" + name
             if storage.git(source_repo, "ls-files", "--", relative) != relative:
                 raise ValueError("Integrate the Docker runtime into the selected checkout before its backend snapshot build")
+        for relative in ("scripts/docker_startup_script.py", "scripts/fullmag_storage.py"):
+            if storage.git(source_repo, "ls-files", "--", relative) != relative:
+                raise ValueError("Integrate the pinned Docker startup helper dependencies into the selected checkout before its backend snapshot build")
         mode = "snapshot"
     else:
         source_repo = repo
@@ -230,6 +308,11 @@ def stage_image_context(capsule, package, stage, *, development):
         shutil.copytree(package, stage / "package", symlinks=False)
     for name in ("entrypoint.py", "windows_folder_probe.py", "runtime_service.py", "frontend_dev.py", "healthcheck.py"):
         shutil.copyfile(capsule / "tree/docker/all-in-one" / name, stage / name)
+    for name in ("docker_startup_script.py", "fullmag_storage.py"):
+        source = capsule / "tree/scripts" / name
+        if not source.is_file():
+            raise ValueError(f"Missing pinned Docker startup helper dependency: scripts/{name}")
+        shutil.copyfile(source, stage / name)
     shutil.copyfile(capsule / "tree/docker/all-in-one" / ("Dockerfile.dev" if development else "Dockerfile"),
                     stage / "Dockerfile")
     return {path.name: digest(path) for path in (package / "bin").iterdir() if path.is_file()}
@@ -269,6 +352,10 @@ def build_image(repo, job_id, commit, *, source_digest=None, native_snapshot_sha
             stage.mkdir()
             # The trusted capsule excludes .env, Git internals and host caches.
             receipt["binary_hashes"] = stage_image_context(capsule, package, stage, development=development)
+            receipt["startup_helper_hashes"] = {
+                name: digest(stage / name)
+                for name in ("docker_startup_script.py", "fullmag_storage.py")
+            }
             (stage / "provenance.json").write_text(json.dumps(receipt, indent=2) + "\n")
             # Docker FROM expects a repository reference, so create an explicit
             # local alias and attest its ID immediately before the offline build.
@@ -301,7 +388,60 @@ def build_image(repo, job_id, commit, *, source_digest=None, native_snapshot_sha
             print(json.dumps(receipt, indent=2))
 
 
-def start(repo, assembly_receipt, port, frontend="static", source_root=None):
+def _write_startup_overlay(path, authorization, *, include_source,
+                           provenance_sha256=None, helper_sha256=None):
+    """Create a JSON Compose overlay for one already-admitted script.
+
+    The base Compose files intentionally have no optional host path.  This
+    overlay is created only after the bounded source admission succeeds, so an
+    ordinary runtime has exactly the old mounts and environment.
+    """
+    source_root = Path(authorization["source_root"])
+    provenance = Path(path).with_name("startup-provenance.json")
+    volumes = [
+        {
+            "type": "bind",
+            "source": str(provenance),
+            "target": "/run/fullmag/startup-provenance.json",
+            "read_only": True,
+            "bind": {"create_host_path": False},
+        }
+    ]
+    if include_source:
+        volumes.insert(0, {
+            "type": "bind",
+            "source": str(source_root),
+            "target": "/opt/fullmag/source",
+            "read_only": True,
+            "bind": {"create_host_path": False},
+        })
+    environment = {
+        "FULLMAG_STARTUP_ENABLED": "1",
+        "FULLMAG_STARTUP_SCRIPT": authorization["container_script_path"],
+        "FULLMAG_STARTUP_PROVENANCE": "/run/fullmag/startup-provenance.json",
+        "FULLMAG_STARTUP_API": "http://127.0.0.1:8081",
+    }
+    if provenance_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", provenance_sha256):
+            raise ValueError("Startup provenance digest is invalid")
+        environment["FULLMAG_STARTUP_PROVENANCE_SHA256"] = provenance_sha256
+    if helper_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", helper_sha256):
+            raise ValueError("Startup helper digest is invalid")
+        environment["FULLMAG_STARTUP_HELPER_SHA256"] = helper_sha256
+    overlay = {
+        "services": {
+            "backend": {
+                "environment": environment,
+                "volumes": volumes,
+            }
+        }
+    }
+    storage.atomic_json(path, overlay)
+
+
+def start(repo, assembly_receipt, port, frontend="static", source_root=None,
+          startup_script=None):
     if not 1024 <= port <= 65535:
         raise ValueError("Port must be between 1024 and 65535")
     layout = storage.resolve_layout(repo, PROFILE)
@@ -312,6 +452,12 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
     image = assembly.get("image_id", "")
     observed = image_id(image)
     validate_workspace_environment(observed["Config"])
+    helper_hashes = assembly.get("startup_helper_hashes")
+    if (not isinstance(helper_hashes, dict)
+            or set(helper_hashes) != {"docker_startup_script.py", "fullmag_storage.py"}
+            or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                   for value in helper_hashes.values())):
+        raise ValueError("Assembly receipt has no complete pinned startup helper inventory")
     if observed.get("Config", {}).get("Labels", {}).get("org.fullmag.runtime") != "docker-all-gpu-v1":
         raise ValueError("Image is not a Fullmag all-in-Docker GPU runtime")
     if frontend == "dev":
@@ -345,6 +491,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
     storage.atomic_json(root / "receipt.json", receipt)
     inputs = None
     host_ledger = None
+    startup = None
     inputs_path = root / "development-inputs.json"
     try:
         if frontend not in {"static", "dev"}:
@@ -364,13 +511,68 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
             receipt["frontend_inputs"] = str(inputs_path)
             receipt["frontend_inputs_sha256"] = digest(inputs_path)
 
+        if startup_script is not None:
+            from docker_development_inputs import select_checkout
+            import docker_startup_script as startup_helper
+
+            selected_source = (
+                Path(inputs["source_root"])
+                if inputs is not None
+                else select_checkout(repo, source_root)
+            )
+            source_commit = (
+                inputs.get("source_commit")
+                if inputs is not None
+                else storage.git(selected_source, "rev-parse", "HEAD")
+            )
+            startup_authorization = startup_helper.prepare(
+                selected_source,
+                startup_script,
+                request_id="startup-" + root.name,
+                source_commit=source_commit,
+            )
+            if inputs is not None and startup_authorization.source_root != Path(inputs["source_root"]).resolve():
+                raise ValueError("Startup script checkout differs from the mounted development checkout")
+            startup_provenance = root / "startup-provenance.json"
+            provenance_sha256 = startup_helper.write_provenance(startup_provenance, startup_authorization)
+            helper_hashes = assembly.get("startup_helper_hashes", {})
+            helper_sha256 = helper_hashes.get("docker_startup_script.py")
+            if not re.fullmatch(r"[0-9a-f]{64}", helper_sha256 or ""):
+                raise ValueError("Assembly receipt has no pinned startup helper digest")
+            startup_overlay = root / "compose.startup.json"
+            authorization = startup_authorization.as_dict()
+            _write_startup_overlay(
+                startup_overlay,
+                authorization,
+                include_source=inputs is None,
+                provenance_sha256=provenance_sha256,
+                helper_sha256=helper_sha256,
+            )
+            startup = {"authorization": authorization, "compose_overlay": str(startup_overlay),
+                       "provenance_sha256": provenance_sha256, "helper_sha256": helper_sha256}
+            receipt["startup_script"] = {
+                "source_relative": authorization["source_relative"],
+                "source_sha256": authorization["source_sha256"],
+                "source_size_bytes": authorization["source_size_bytes"],
+                "source_commit": authorization["source_commit"],
+                "source_root": authorization["source_root"],
+                "source_path": authorization["source_path"],
+                "container_script_path": authorization["container_script_path"],
+                "request_id": authorization["request_id"],
+                "provenance": str(startup_provenance),
+                "provenance_sha256": provenance_sha256,
+                "helper_sha256": helper_sha256,
+                "compose_overlay": str(startup_overlay),
+                "execution_policy": authorization["execution_policy"],
+            }
+
         def configured_spec():
             return compose_spec(image, state.resolve(), port, host_certificate.resolve(),
                                 repo=repo, inputs=inputs, inputs_path=inputs_path.resolve(),
                                 package=assembly.get("package_root"),
                                 provenance=assembly_receipt, project=project,
                                 toolchain_image=assembly.get("base_image"), template=root / "compose.source.yaml",
-                                host_ledger=host_ledger)
+                                host_ledger=host_ledger, startup=startup)
         if os.name != "nt":
             raise ValueError("This Windows-folder launcher requires native Windows host attestation")
         from windows_folder_host import attest, local_volume, publish_evidence, read_owned_regular
@@ -419,8 +621,9 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
         receipt["storage_operational_checks"] = probe["checks"]
         receipt["storage_power_loss"] = "NOT VERIFIED"
         storage.atomic_json(spec, configured_spec())
+        ready_timeout, docker_client_timeout = _runtime_ready_timeouts(inputs, startup)
         docker(*args, "up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout",
-               "2100" if inputs is not None else "90", timeout=2160 if inputs is not None else 150)
+               str(ready_timeout), timeout=docker_client_timeout)
         container = docker(*args, "ps", "--quiet", "backend")
         receipt["container_id"] = container
         actual = json.loads(docker("inspect", container))[0]
@@ -460,11 +663,38 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
             expected_readonly = {"/opt/fullmag/source": Path(inputs["source_root"]).resolve(),
                                  "/opt/fullmag/package": package.resolve(),
                                  "/opt/fullmag/provenance.json": assembly_receipt.resolve()}
+        elif startup is not None:
+            expected_readonly = {"/opt/fullmag/source": Path(startup["authorization"]["source_root"]).resolve()}
+        else:
+            expected_readonly = {}
+        if inputs is not None or startup is not None:
             for destination, source in expected_readonly.items():
                 bound = [m for m in actual["Mounts"] if m["Destination"] == destination]
                 if (len(bound) != 1 or bound[0]["Type"] != "bind" or bound[0]["RW"]
                         or host_path(bound[0]["Source"]) != source):
                     raise ValueError("Development readonly bind differs: " + destination)
+        if startup is not None:
+            startup_mounts = [m for m in actual["Mounts"]
+                              if m["Destination"] == "/run/fullmag/startup-provenance.json"]
+            if (len(startup_mounts) != 1 or startup_mounts[0]["Type"] != "bind"
+                    or startup_mounts[0]["RW"]
+                    or host_path(startup_mounts[0]["Source"]) != (root / "startup-provenance.json").resolve()):
+                raise ValueError("Startup provenance must be a readonly run-owned bind")
+            environment = dict(
+                value.split("=", 1)
+                for value in actual["Config"].get("Env", [])
+                if "=" in value
+            )
+            expected_environment = {
+                "FULLMAG_STARTUP_ENABLED": "1",
+                "FULLMAG_STARTUP_SCRIPT": startup["authorization"]["container_script_path"],
+                "FULLMAG_STARTUP_PROVENANCE": "/run/fullmag/startup-provenance.json",
+                "FULLMAG_STARTUP_API": "http://127.0.0.1:8081",
+                "FULLMAG_STARTUP_PROVENANCE_SHA256": startup["provenance_sha256"],
+                "FULLMAG_STARTUP_HELPER_SHA256": startup["helper_sha256"],
+            }
+            if any(environment.get(key) != value for key, value in expected_environment.items()):
+                raise ValueError("Startup activation environment attestation mismatch")
         mounts = [m for m in actual["Mounts"] if m["Destination"] == "/state"]
         if len(mounts) != 1 or mounts[0]["Type"] != "bind" or not mounts[0]["RW"] or host_path(mounts[0]["Source"]) != state.resolve():
             raise ValueError("Runtime state mount attestation mismatch")
@@ -478,14 +708,33 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None):
             raise ValueError("Runtime NVIDIA GPU request is missing")
         provenance = json.loads(docker("exec", container, "cat", "/opt/fullmag/provenance.json"))
         if any(provenance.get(key) != assembly.get(key) for key in
-               ("commit", "job_id", "source_digest", "base_image", "native_source_identity", "binary_hashes", "build_receipt_sha256")):
+               ("commit", "job_id", "source_digest", "base_image", "native_source_identity",
+                "binary_hashes", "startup_helper_hashes", "build_receipt_sha256")):
             raise ValueError("Runtime image provenance differs from assembly receipt")
+        for name, expected in helper_hashes.items():
+            observed_helper = docker("exec", container, "sha256sum", "/opt/fullmag/" + name).split()[0]
+            if observed_helper != expected:
+                raise ValueError("Runtime image startup helper differs from assembly inventory: " + name)
+        process_tree_receipt = _wait_for_startup_ready(
+            state, startup["authorization"] if startup is not None else None,
+            timeout=ready_timeout,
+        )
+        receipt["process_tree_receipt"] = str(_startup_process_receipt_path(state))
+        receipt["process_tree_receipt_sha256"] = digest(_startup_process_receipt_path(state))
+        if startup is not None:
+            receipt["startup_process_tree_receipt"] = str(_startup_process_receipt_path(state))
+            receipt["startup_process_tree_receipt_sha256"] = receipt["process_tree_receipt_sha256"]
+            receipt["startup_activation"] = process_tree_receipt["startup_activation"]
         receipt.update(state="running", health="PASS", gpu_preflight="PASS",
                        attestation="image, provenance, port, storage, GPU request, isolation")
     except Exception as error:
         receipt.update(state="failed_resources_retained", error=str(error))
         if isinstance(error, DockerOutcomeUnknown):
             receipt.update(operation_outcome="unknown", timed_out_operation=error.operation,
+                           client_timeout_seconds=error.timeout_seconds)
+        elif isinstance(error, StartupOutcomeUnknown):
+            receipt.update(startup_activation_outcome="unknown",
+                           timed_out_operation=error.operation,
                            client_timeout_seconds=error.timeout_seconds)
         try:
             receipt["retained_container_ids"] = docker(*args, "ps", "--all", "--quiet").splitlines()
@@ -517,6 +766,7 @@ if __name__ == "__main__":
     launch.add_argument("--port", type=int, default=3197)
     launch.add_argument("--source-root", type=Path)
     launch.add_argument("--frontend", choices=("static", "dev"), default="static")
+    launch.add_argument("--startup-script", type=Path)
     args = parser.parse_args()
     if args.action == "submit":
         submit_build(args.repo_root.resolve(), args.commit)
@@ -526,4 +776,5 @@ if __name__ == "__main__":
         build_image(args.repo_root.resolve(), args.job_id, args.commit,
                     source_digest=args.source_digest, native_snapshot_sha256=args.native_snapshot_sha256, development=args.development, source_root=args.source_root)
     else:
-        start(args.repo_root.resolve(), args.assembly_receipt, args.port, args.frontend, args.source_root)
+        start(args.repo_root.resolve(), args.assembly_receipt, args.port, args.frontend,
+              args.source_root, args.startup_script)

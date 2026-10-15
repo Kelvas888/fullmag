@@ -18,6 +18,8 @@ COPY windows_folder_probe.py /opt/fullmag/windows_folder_probe.py
 COPY runtime_service.py /opt/fullmag/runtime_service.py
 COPY frontend_dev.py /opt/fullmag/frontend_dev.py
 COPY healthcheck.py /opt/fullmag/healthcheck.py
+COPY docker_startup_script.py /opt/fullmag/docker_startup_script.py
+COPY fullmag_storage.py /opt/fullmag/fullmag_storage.py
 
 # The pinned builder already prepared pnpm 10.8.1. Publish that immutable tool
 # for the unprivileged frontend instead of extracting it into Windows per run.
@@ -32,7 +34,8 @@ RUN mkdir -p /opt/fullmag/tooling && \
 # package, provenance, state, and the Windows host certificate.
 RUN mkdir -p /opt/fullmag/source /opt/fullmag/package /state /run/fullmag && \
     touch /opt/fullmag/provenance.json && \
-    chown 65532:65532 /opt/fullmag /state /run/fullmag && \
+    chown 65532:65532 /state /run/fullmag && \
+    chown root:root /opt/fullmag /opt/fullmag/docker_startup_script.py /opt/fullmag/fullmag_storage.py && \
     chmod 0755 /opt/fullmag /opt/fullmag/source /opt/fullmag/package /state /run/fullmag && \
     chmod 0644 /opt/fullmag/provenance.json && \
     chmod -R a+rX /opt/fullmag

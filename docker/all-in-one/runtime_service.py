@@ -10,7 +10,7 @@ import dataclasses
 import http.client
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import socket
 import stat
@@ -31,7 +31,10 @@ WINDOWS_STORAGE_PROFILE = "windows-folder-v1"
 STORAGE_SCHEMA = "fullmag_storage_v1"
 RUNTIME_CONFIG_SCHEMA = "runtime_service_config.v1"
 HOST_PROFILE_SCHEMA = "fullmag.docker-host-profile.v1"
-HOST_LEDGER_ROOT = Path("/host-ledger/ledger")
+# This is a path inside the Linux container, even when the source-only
+# contract tests are imported by native Windows Python.  PurePosixPath keeps
+# the serialized CLI/profile value stable across host operating systems.
+HOST_LEDGER_ROOT = PurePosixPath("/host-ledger/ledger")
 CONFIG_RELATIVE = Path(".fullmag/runtime-service/docker-all.json")
 MAX_JSON_BYTES = 256 * 1024
 MAX_HTTP_BYTES = 4 * 1024 * 1024
