@@ -11,7 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
-use crate::types::{AppState, CurrentLiveFieldFrameRequest, SessionStateResponse};
+use crate::types::{
+    AppState, CurrentLiveFieldFrameRequest, CurrentLiveFieldGeneration, SessionStateResponse,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -40,8 +42,10 @@ struct ProjectionCursor {
 #[derive(Debug, Clone)]
 struct VerifiedOutput {
     task_order: usize,
+    step_id: String,
     object_ref: String,
     data_kind: String,
+    accepted_state_ref: Option<fullmag_quantities::AcceptedStateRef>,
     decoded: fullmag_application::DecodedStudyArtifact,
 }
 
@@ -116,6 +120,19 @@ async fn poll_once(
     };
     if cursor.as_ref() == Some(&next_cursor) {
         return Ok(());
+    }
+    // The accepted task-preparation bridge expects its caller to own the
+    // transition fence.  Publish a stage-specific pinned domain before the
+    // output field is admitted, then apply the field under that same fence.
+    let _transition = state.current_live_session_transition.lock().await;
+    if let Err(error) = ensure_stage_preparation(state, &context, &projection).await {
+        if let Err(clear_error) = clear_stale_magnetization(state, &context).await {
+            tracing::error!(
+                error = %clear_error,
+                "failed to clear stale accepted magnetization after domain admission failure"
+            );
+        }
+        return Err(error);
     }
     apply_projection(state, &context, projection).await?;
     *cursor = Some(next_cursor);
@@ -484,6 +501,8 @@ fn load_verified_outputs(
                 "accepted output manifest ownership identity mismatch",
             ));
         }
+        let step_id = manifest.step_id.clone();
+        let accepted_state_ref = manifest.accepted_state_ref.clone();
         for output in manifest.outputs {
             let artifact = artifact_catalog
                 .entries
@@ -529,8 +548,10 @@ fn load_verified_outputs(
             })?;
             outputs.push(VerifiedOutput {
                 task_order,
+                step_id: step_id.clone(),
                 object_ref,
                 data_kind: output.data_kind,
+                accepted_state_ref: accepted_state_ref.clone(),
                 decoded,
             });
         }
@@ -538,22 +559,400 @@ fn load_verified_outputs(
     Ok(outputs)
 }
 
-async fn apply_projection(
+#[derive(Debug, Clone)]
+struct PreparedProjectionDomain {
+    preparation_id: String,
+    execution_plan: fullmag_ir::ExecutionPlanIR,
+    plan_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FemProjectionDomainIdentity {
+    backend: &'static str,
+    fe_order: u32,
+    node_count: usize,
+    topology_fingerprint: String,
+}
+
+/// Ensure that the state output is preceded by the exact preparation receipt
+/// for its accepted Study step.  The existing preparation bridge owns receipt,
+/// plan, native mesh, and current-session publication; this projector only
+/// selects the step and verifies the decoded output against that pinned plan.
+async fn ensure_stage_preparation(
     state: &Arc<AppState>,
     context: &ProjectionContext,
-    projection: DurableProjection,
+    projection: &DurableProjection,
 ) -> Result<(), ApiError> {
-    let _transition = state.current_live_session_transition.lock().await;
-    let mut next = state
-        .current_live_state
-        .read()
-        .await
-        .as_ref()
-        .cloned()
+    let Some(output) = projection.latest_state.as_ref() else {
+        return Ok(());
+    };
+    let fullmag_application::DecodedStudyArtifact::MagnetizationState(state_output) =
+        &output.decoded
+    else {
+        return Ok(());
+    };
+
+    let existing = {
+        let current = state.current_live_state.read().await;
+        current.as_ref().and_then(|snapshot| {
+            let workspace = snapshot.mesh_workspace.as_ref()?;
+            if workspace.get("accepted_run_id").and_then(Value::as_str)
+                != Some(context.run_id.as_str())
+                || workspace.get("accepted_step_id").and_then(Value::as_str)
+                    != Some(output.step_id.as_str())
+            {
+                return None;
+            }
+            let preparation_id = workspace.get("preparation_id").and_then(Value::as_str)?;
+            let plan_fingerprint = workspace.get("plan_fingerprint").and_then(Value::as_str)?;
+            if !accepted_state_ref_matches_plan(
+                output.accepted_state_ref.as_ref(),
+                context.run_id.as_str(),
+                output.step_id.as_str(),
+                plan_fingerprint,
+            ) {
+                return None;
+            }
+            let metadata = snapshot.metadata.as_ref()?;
+            let execution_plan = serde_json::from_value::<fullmag_ir::ExecutionPlanIR>(
+                metadata.get("execution_plan")?.clone(),
+            )
+            .ok()?;
+            Some(PreparedProjectionDomain {
+                preparation_id: preparation_id.to_owned(),
+                execution_plan,
+                plan_fingerprint: plan_fingerprint.to_owned(),
+            })
+        })
+    };
+
+    let prepared = if let Some(existing) = existing {
+        reread_durable_stage_preparation(state, context, output, &existing).await?;
+        existing
+    } else {
+        let live_context = crate::types::CurrentLiveRequestContext {
+            session_id: context.session_id.clone(),
+            run_id: Some(context.run_id.clone()),
+            session_epoch: context.session_epoch,
+            request_scope_epoch: format!("{}:{}", context.api_instance_id, context.session_epoch),
+        };
+        let published =
+            crate::live_scene_preparation::publish_accepted_task_preparation_with_transition(
+                state,
+                &live_context,
+                &context.run_id,
+                &output.step_id,
+                "accepted_projection_stage_preparation",
+            )
+            .await?;
+        PreparedProjectionDomain {
+            preparation_id: published.read_model.preparation_id,
+            execution_plan: published.read_model.execution_plan,
+            plan_fingerprint: published.read_model.plan_fingerprint,
+        }
+    };
+
+    validate_accepted_state_domain(
+        state_output,
+        &prepared.execution_plan,
+        &prepared.plan_fingerprint,
+        context.run_id.as_str(),
+        output.step_id.as_str(),
+        output.accepted_state_ref.as_ref(),
+    )
+}
+
+/// Re-read the durable stage and its exact task receipt before trusting an
+/// in-memory mesh workspace. A matching JSON snapshot is only a cache; it
+/// cannot authorize output after deletion, corruption, or stage substitution.
+async fn reread_durable_stage_preparation(
+    state: &Arc<AppState>,
+    context: &ProjectionContext,
+    output: &VerifiedOutput,
+    domain: &PreparedProjectionDomain,
+) -> Result<(), ApiError> {
+    let store_root = state.submit_store_root.clone().ok_or_else(|| {
+        ApiError::with_status_and_code(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "accepted_projection_store_unavailable",
+            "accepted projection requires the configured durable run store",
+        )
+    })?;
+    let run_id = context.run_id.clone();
+    let step_id = output.step_id.clone();
+    let expected_preparation_id = domain.preparation_id.clone();
+    let expected_plan_fingerprint = domain.plan_fingerprint.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = fullmag_session::SessionStore::open_existing(&store_root).map_err(|error| {
+            ApiError::with_status_and_code(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "accepted_projection_store_unavailable",
+                format!("failed to open accepted projection store: {error}"),
+            )
+        })?;
+        let stage = store
+            .read_accepted_stage_preparation_receipt(&run_id, &step_id)
+            .map_err(|error| {
+                ApiError::conflict_with_code(
+                    "accepted_projection_stage_receipt_invalid",
+                    format!("accepted stage preparation receipt read failed: {error}"),
+                )
+            })?;
+        let Some(stage) = stage else {
+            return Err(ApiError::conflict_with_code(
+                "accepted_projection_stage_receipt_missing",
+                "accepted projection has no durable stage preparation receipt",
+            ));
+        };
+        let task_id = fullmag_session::task_id_for_study_step(&run_id, &step_id)
+            .map_err(|error| {
+                ApiError::conflict(format!("accepted projection step identity is invalid: {error}"))
+            })?;
+        let task = store
+            .read_task_preparation_receipt(&run_id, &task_id)
+            .map_err(|error| {
+                ApiError::conflict_with_code(
+                    "accepted_projection_task_receipt_invalid",
+                    format!("accepted task preparation receipt read failed: {error}"),
+                )
+            })?;
+        let Some(task) = task else {
+            return Err(ApiError::conflict_with_code(
+                "accepted_projection_task_receipt_missing",
+                "accepted projection has no durable task preparation receipt",
+            ));
+        };
+        let expected_stage =
+            fullmag_session::FmsAcceptedStagePreparationReceipt::from_task_receipt(&task)
+                .map_err(|error| {
+                    ApiError::conflict_with_code(
+                        "accepted_projection_stage_receipt_invalid",
+                        format!("accepted task preparation receipt is invalid: {error}"),
+                    )
+                })?;
+        if !stage_receipt_matches_projection(
+            Some(&stage),
+            Some(&expected_stage),
+            &run_id,
+            &step_id,
+            &expected_preparation_id,
+            &expected_plan_fingerprint,
+        ) {
+            return Err(ApiError::conflict_with_code(
+                "accepted_projection_stage_receipt_mismatch",
+                "durable accepted stage does not match the live projection domain",
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("accepted projection receipt task failed: {error}")))?
+}
+
+fn stage_receipt_matches_projection(
+    stage: Option<&fullmag_session::FmsAcceptedStagePreparationReceipt>,
+    task_stage: Option<&fullmag_session::FmsAcceptedStagePreparationReceipt>,
+    run_id: &str,
+    step_id: &str,
+    preparation_id: &str,
+    plan_fingerprint: &str,
+) -> bool {
+    let Some(stage) = stage else {
+        return false;
+    };
+    let Some(task_stage) = task_stage else {
+        return false;
+    };
+    stage.same_immutable_payload(task_stage)
+        && stage.run_id == run_id
+        && stage.step_id == step_id
+        && stage.preparation_id == preparation_id
+        && stage.plan_fingerprint == plan_fingerprint
+}
+
+fn accepted_state_ref_matches_plan(
+    accepted_state_ref: Option<&fullmag_quantities::AcceptedStateRef>,
+    run_id: &str,
+    step_id: &str,
+    plan_fingerprint: &str,
+) -> bool {
+    let Some(reference) = accepted_state_ref else {
+        return true;
+    };
+    reference.id.run_id == run_id
+        && reference.id.stage_id.as_deref() == Some(step_id)
+        && reference.id.domain_digest == plan_fingerprint
+}
+
+fn validate_accepted_state_domain(
+    state: &fullmag_application::MagnetizationStateArtifact,
+    execution_plan: &fullmag_ir::ExecutionPlanIR,
+    plan_fingerprint: &str,
+    run_id: &str,
+    step_id: &str,
+    accepted_state_ref: Option<&fullmag_quantities::AcceptedStateRef>,
+) -> Result<(), ApiError> {
+    if !accepted_state_ref_matches_plan(accepted_state_ref, run_id, step_id, plan_fingerprint) {
+        return Err(domain_mismatch(
+            "accepted state identity does not match the pinned run, stage, and preparation receipt",
+        ));
+    }
+
+    let backend = state
+        .layout
+        .get("backend")
+        .and_then(Value::as_str)
+        .ok_or_else(|| domain_mismatch("accepted state layout has no backend identity"))?;
+    match (&execution_plan.backend_plan, backend) {
+        (fullmag_ir::BackendPlanIR::Fdm(_), "fdm")
+        | (fullmag_ir::BackendPlanIR::FdmMultilayer(_), "fdm_multilayer") => {
+            validate_exact_study_layout(&state.layout, execution_plan)?;
+        }
+        (fullmag_ir::BackendPlanIR::Fem(plan), "fem") => {
+            validate_fem_domain(
+                &state.layout,
+                &FemProjectionDomainIdentity {
+                    backend: "fem",
+                    fe_order: plan.fe_order,
+                    node_count: plan.mesh.nodes.len(),
+                    topology_fingerprint: plan.mesh.topology_fingerprint_v6(),
+                },
+            )?;
+        }
+        (fullmag_ir::BackendPlanIR::FemEigen(plan), "fem_eigen") => {
+            validate_fem_domain(
+                &state.layout,
+                &FemProjectionDomainIdentity {
+                    backend: "fem_eigen",
+                    fe_order: plan.fe_order,
+                    node_count: plan.mesh.nodes.len(),
+                    topology_fingerprint: plan.mesh.topology_fingerprint_v6(),
+                },
+            )?;
+        }
+        (fullmag_ir::BackendPlanIR::FemFrequencyResponse(plan), "fem_frequency_response") => {
+            validate_fem_domain(
+                &state.layout,
+                &FemProjectionDomainIdentity {
+                    backend: "fem_frequency_response",
+                    fe_order: plan.fe_order,
+                    node_count: plan.mesh.nodes.len(),
+                    topology_fingerprint: plan.mesh.topology_fingerprint_v6(),
+                },
+            )?;
+        }
+        (fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(_), _) => {
+            return Err(domain_mismatch(
+                "magnetization output cannot use an antenna-only preparation domain",
+            ));
+        }
+        (expected, actual) => {
+            return Err(domain_mismatch(format!(
+                "accepted state backend `{actual}` does not match pinned plan `{expected:?}`",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_study_layout(
+    layout: &Value,
+    execution_plan: &fullmag_ir::ExecutionPlanIR,
+) -> Result<(), ApiError> {
+    let expected =
+        fullmag_runner::study_magnetization_layout_for_plan(execution_plan).map_err(|error| {
+            domain_mismatch(format!(
+                "pinned study layout is unavailable: {}",
+                error.message
+            ))
+        })?;
+    if layout != &expected {
+        return Err(domain_mismatch(
+            "accepted state layout does not exactly match the pinned study domain",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fem_domain(
+    layout: &Value,
+    expected: &FemProjectionDomainIdentity,
+) -> Result<(), ApiError> {
+    let actual_nodes = layout
+        .get("n_nodes")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    let actual_order = layout.get("fe_order").and_then(Value::as_u64);
+    if layout.get("backend").and_then(Value::as_str) != Some(expected.backend)
+        || actual_order != Some(u64::from(expected.fe_order))
+        || actual_nodes != Some(expected.node_count)
+        || layout.get("topology_fingerprint").and_then(Value::as_str)
+            != Some(expected.topology_fingerprint.as_str())
+    {
+        return Err(domain_mismatch(format!(
+            "accepted FEM field does not match pinned {} topology",
+            expected.backend
+        )));
+    }
+    Ok(())
+}
+
+fn domain_mismatch(message: impl Into<String>) -> ApiError {
+    ApiError::conflict_with_code("accepted_projection_domain_mismatch", message)
+}
+
+async fn clear_stale_magnetization(
+    state: &Arc<AppState>,
+    context: &ProjectionContext,
+) -> Result<(), ApiError> {
+    let mut current = state.current_live_state.write().await;
+    let snapshot = current
+        .as_mut()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
-    if next.session.session_id != context.session_id
-        || next.run.as_ref().map(|run| run.run_id.as_str()) != Some(context.run_id.as_str())
-        || next.scene_document.as_ref().map(|scene| scene.revision) != Some(context.scene_revision)
+    ensure_projection_context(state, context, snapshot)?;
+    if snapshot.latest_fields.get("m").is_none() {
+        return Ok(());
+    }
+    let mut fields = snapshot.latest_fields.clone();
+    fields.remove("m");
+    let sequence = snapshot
+        .terminal_field_generations
+        .get(&context.run_id)
+        .copied()
+        .unwrap_or_default()
+        .saturating_add(1);
+    crate::session::apply_current_live_field_frame(
+        snapshot,
+        CurrentLiveFieldFrameRequest {
+            session_id: context.session_id.clone(),
+            latest_fields: Some(fields),
+            replace_latest_fields: true,
+            field_generation: Some(CurrentLiveFieldGeneration {
+                run_id: context.run_id.clone(),
+                sequence,
+            }),
+            preview_fields: None,
+            clear_preview_cache: true,
+        },
+    )?;
+    let cleared = snapshot.clone();
+    drop(current);
+    crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(state).await;
+    let display_revision = state.current_display_selection.read().await.revision;
+    let realtime_state =
+        crate::current_live_realtime_state_from_snapshot(state, &cleared, display_revision).await;
+    crate::publish_current_live_realtime_batch_changed(state, &realtime_state, true, 100).await
+}
+
+fn ensure_projection_context(
+    state: &AppState,
+    context: &ProjectionContext,
+    snapshot: &SessionStateResponse,
+) -> Result<(), ApiError> {
+    if snapshot.session.session_id != context.session_id
+        || snapshot.run.as_ref().map(|run| run.run_id.as_str()) != Some(context.run_id.as_str())
+        || snapshot.scene_document.as_ref().map(|scene| scene.revision)
+            != Some(context.scene_revision)
         || state
             .current_live_session_epoch
             .load(std::sync::atomic::Ordering::Acquire)
@@ -564,6 +963,22 @@ async fn apply_projection(
             "current live session changed while accepted output was being projected",
         ));
     }
+    Ok(())
+}
+
+async fn apply_projection(
+    state: &Arc<AppState>,
+    context: &ProjectionContext,
+    projection: DurableProjection,
+) -> Result<(), ApiError> {
+    let mut next = state
+        .current_live_state
+        .read()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    ensure_projection_context(state, context, &next)?;
 
     let previous_status = next.session.status.clone();
     let terminal = matches!(projection.status, "completed" | "failed" | "cancelled");
@@ -854,8 +1269,10 @@ mod tests {
         ) -> VerifiedOutput {
             VerifiedOutput {
                 task_order,
+                step_id: "step".into(),
                 object_ref: object_ref.into(),
                 data_kind: "state".into(),
+                accepted_state_ref: None,
                 decoded: fullmag_application::DecodedStudyArtifact::MagnetizationState(
                     fullmag_application::MagnetizationStateArtifact {
                         step,
@@ -929,5 +1346,105 @@ mod tests {
             latest_output_identity: None,
         };
         assert!(!cursor_matches_context(&previous, &context));
+    }
+
+    #[test]
+    fn fem_domain_rejects_same_node_count_with_different_topology() {
+        let topology = format!("sha256:{}", "a".repeat(64));
+        let expected = FemProjectionDomainIdentity {
+            backend: "fem",
+            fe_order: 1,
+            node_count: 3,
+            topology_fingerprint: topology.clone(),
+        };
+        let matching = json!({
+            "backend": "fem",
+            "fe_order": 1,
+            "n_nodes": 3,
+            "topology_fingerprint": topology,
+        });
+        assert!(validate_fem_domain(&matching, &expected).is_ok());
+
+        let mut different_topology = matching;
+        different_topology["topology_fingerprint"] = json!(format!("sha256:{}", "b".repeat(64)));
+        assert!(validate_fem_domain(&different_topology, &expected).is_err());
+    }
+
+    #[test]
+    fn accepted_projection_requires_durable_stage_for_a_cached_domain() {
+        let stage = fullmag_session::FmsAcceptedStagePreparationReceipt {
+            schema_version: fullmag_session::FMS_ACCEPTED_STAGE_PREPARATION_RECEIPT_SCHEMA.into(),
+            run_id: "run-a".into(),
+            step_id: "stage-a".into(),
+            task_id: "task-a".into(),
+            input_fingerprint: "input-a".into(),
+            preparation_id: "prep-a".into(),
+            plan_fingerprint: "plan-a".into(),
+            task_receipt_payload_sha256: "payload-a".into(),
+        };
+        assert!(!stage_receipt_matches_projection(
+            None,
+            Some(&stage),
+            "run-a",
+            "stage-a",
+            "prep-a",
+            "plan-a",
+        ));
+        assert!(stage_receipt_matches_projection(
+            Some(&stage),
+            Some(&stage),
+            "run-a",
+            "stage-a",
+            "prep-a",
+            "plan-a",
+        ));
+        let mut next_stage = stage.clone();
+        next_stage.preparation_id = "prep-b".into();
+        assert!(!stage_receipt_matches_projection(
+            Some(&next_stage),
+            Some(&stage),
+            "run-a",
+            "stage-a",
+            "prep-a",
+            "plan-a",
+        ));
+    }
+
+    #[test]
+    fn accepted_state_reference_must_match_run_stage_and_preparation_domain() {
+        let domain = format!("sha256:{}", "d".repeat(64));
+        let reference = fullmag_quantities::AcceptedStateRef {
+            id: fullmag_quantities::AcceptedStateId {
+                run_id: "run-1".into(),
+                stage_id: Some("stage-2".into()),
+                accepted_step: 1,
+                clock_digest: format!("sha256:{}", "a".repeat(64)),
+                state_digest: format!("sha256:{}", "b".repeat(64)),
+                domain_digest: domain.clone(),
+                plan_digest: format!("sha256:{}", "c".repeat(64)),
+            },
+            generation: fullmag_quantities::AcceptedStateGeneration {
+                runtime_epoch: 1,
+                accepted_revision: 1,
+            },
+        };
+        assert!(accepted_state_ref_matches_plan(
+            Some(&reference),
+            "run-1",
+            "stage-2",
+            domain.as_str(),
+        ));
+        assert!(!accepted_state_ref_matches_plan(
+            Some(&reference),
+            "run-1",
+            "stage-1",
+            "sha256:domain",
+        ));
+        assert!(!accepted_state_ref_matches_plan(
+            Some(&reference),
+            "run-1",
+            "stage-2",
+            "sha256:other",
+        ));
     }
 }

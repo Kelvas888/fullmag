@@ -107,6 +107,7 @@ jobs:
       - name: Run accepted explicit Compute start-gate contracts
         run: |
           cargo test -p fullmag-session --lib accepted_start_gate
+          cargo test -p fullmag-session --lib accepted_stage_receipt
           cargo test -p fullmag-runtime-control --lib accepted_start
           cargo test -p fullmag-runtime-control --lib accepted_recovery_requires_release
           cargo test -p fullmag-api --bin fullmag-api-accepted-worker restored_manual_worker_requires_exact_compute_release

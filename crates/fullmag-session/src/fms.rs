@@ -23,6 +23,8 @@
 //! │     ├─ preparation_receipt.json
 //! │     ├─ task_preparation_receipts/
 //! │     │  └─ <task_id>.json
+//! │     ├─ accepted_stage_preparation_receipts/
+//! │     │  └─ <task_id>.json
 //! │     ├─ task_admissions/
 //! │     │  └─ <task_id>/<attempt_id>.json
 //! │     ├─ resource_leases/
@@ -734,6 +736,73 @@ fn plan_run_entries(
                     }
                     receipt.validate_for_catalog(&catalog)?;
                     receipt.validate_for_run_intent(&intent)?;
+                    entries.push_entry(PackEntry::from_bytes(archive_path, data))?;
+                }
+            }
+        }
+        let stage_receipt_dir = run_dir.join("accepted_stage_preparation_receipts");
+        if store_source_exists(&stage_receipt_dir)? {
+            validate_store_source(store_root, canonical_root, &stage_receipt_dir, true)?;
+            let mut receipt_files = Vec::new();
+            for entry in fs::read_dir(&stage_receipt_dir)? {
+                let entry = entry?;
+                crate::repository_path::reject_link(&entry.path())?;
+                if !entry.file_type()?.is_file() {
+                    bail!("accepted stage preparation receipt entry must be a file");
+                }
+                receipt_files.push(entry);
+            }
+            if !receipt_files.is_empty() {
+                let catalog_path = run_dir.join("run_catalog.json");
+                let catalog_data =
+                    read_store_file_if_exists(store_root, canonical_root, &catalog_path)?
+                        .context("accepted stage receipts require a durable run catalog")?;
+                let catalog: FmsRunCatalog = serde_json::from_slice(&catalog_data)
+                    .context("accepted stage receipt run catalog is not typed")?;
+                catalog.validate()?;
+                if catalog.run_id != run_id {
+                    bail!("accepted stage receipt catalog identity does not match run path");
+                }
+                let intent_path = run_dir.join("run_intent.json");
+                let intent_data =
+                    read_store_file_if_exists(store_root, canonical_root, &intent_path)?
+                        .context("accepted stage receipts require an accepted run intent")?;
+                let intent: FmsRunIntent = serde_json::from_slice(&intent_data)
+                    .context("accepted stage receipt run intent is not typed")?;
+                intent.validate()?;
+                for entry in receipt_files {
+                    let file_name = entry.file_name().to_string_lossy().into_owned();
+                    let archive_path = format!(
+                        "runs/{run_id}/accepted_stage_preparation_receipts/{file_name}"
+                    );
+                    validate_portable_namespace_path(&archive_path)?;
+                    let data =
+                        read_store_file_if_exists(store_root, canonical_root, &entry.path())?
+                            .context("accepted stage receipt disappeared during export")?;
+                    let stage: FmsAcceptedStagePreparationReceipt = serde_json::from_slice(&data)
+                        .context("accepted stage receipt is not typed")?;
+                    if stage.relative_path()? != archive_path {
+                        bail!("accepted stage receipt path identity mismatch");
+                    }
+                    let task_path = run_dir
+                        .join("task_preparation_receipts")
+                        .join(format!("{}.json", stage.task_id));
+                    let task_archive_path = format!(
+                        "runs/{run_id}/task_preparation_receipts/{}.json",
+                        stage.task_id
+                    );
+                    let task_data =
+                        read_store_file_if_exists(store_root, canonical_root, &task_path)?
+                            .context("accepted stage receipt requires its task receipt")?;
+                    let task: FmsTaskPreparationReceipt = serde_json::from_slice(&task_data)
+                        .context("accepted stage task receipt is not typed")?;
+                    if task.relative_path()? != task_archive_path
+                        || !stage.matches_task_receipt(&task)
+                    {
+                        bail!("accepted stage receipt does not match its task receipt");
+                    }
+                    task.validate_for_catalog(&catalog)?;
+                    task.validate_for_run_intent(&intent)?;
                     entries.push_entry(PackEntry::from_bytes(archive_path, data))?;
                 }
             }
@@ -1502,23 +1571,17 @@ fn store_source_exists(source: &Path) -> Result<bool> {
 
 fn read_store_file(store_root: &Path, canonical_root: &Path, source: &Path) -> Result<Vec<u8>> {
     validate_store_source(store_root, canonical_root, source, false)?;
-    let file = File::open(source)?;
-    if file.metadata()?.len() > MAX_CONTROL_DOCUMENT_BYTES {
-        bail!(
-            "structural export document exceeds metadata budget: {}",
-            source.display()
-        );
-    }
-    let mut data = Vec::new();
-    file.take(MAX_CONTROL_DOCUMENT_BYTES + 1)
-        .read_to_end(&mut data)?;
-    if data.len() as u64 > MAX_CONTROL_DOCUMENT_BYTES {
-        bail!(
-            "structural export document exceeds metadata budget: {}",
-            source.display()
-        );
-    }
-    Ok(data)
+    let relative = source
+        .strip_prefix(store_root)
+        .with_context(|| format!("store source is outside root: {}", source.display()))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    crate::repository_path::read_bounded_regular_file(
+        store_root,
+        &relative,
+        MAX_CONTROL_DOCUMENT_BYTES as usize,
+    )
+    .with_context(|| format!("reading structural export document {}", source.display()))
 }
 
 fn validate_store_source(

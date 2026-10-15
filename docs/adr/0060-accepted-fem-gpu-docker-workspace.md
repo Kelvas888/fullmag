@@ -113,16 +113,67 @@ pozostają oddzielnymi bramkami od samego modułu persistence.
 
 ## Granica aktualnej implementacji UI
 
-Durable accepted task i bieżący journal komend live Workspace są odrębnymi
-ścieżkami. Ten etap dodaje GPU do workera accepted; nie podłącza automatycznie
-komend formularza `mesh/run/relax/solve` do tego workera. Backend Docker
-uruchamia obecnie API i runtime service, bez owned konsumenta live command
-queue. Wpięcie formularza wymaga kanonicznej materializacji task/lease oraz
-committed host allocation przed uruchomieniem solvera; ta część jest nadal
-**NOT IMPLEMENTED**. Samo dodanie attached CLI ominęłoby wspólny ledger CPU/GPU
-i nie jest dopuszczonym rozwiązaniem. Uruchomienie skryptu z aktywnym modelem
-oraz `wait_for_solve` pozostaje osobnym niezakończonym etapem. Nie należy
-przedstawiać obecnego Docker Workspace jako gotowego do Compute z formularza.
+Kod trasy Docker kieruje komendy przygotowania i Compute przez
+`live_accepted_execution`, zamiast wymagać konsumenta starszej kolejki live.
+Journal komendy jest rezerwowany przed długim przygotowaniem; publikacja wyniku
+ponownie sprawdza exact run/session context. Compute materializuje kanoniczny
+accepted Study, a Stop korzysta z durable accepted control. Pause pozostaje
+odrzucone do czasu implementacji jawnego protokołu workera.
+
+Wewnętrzny startup API przyjmuje cały authored Study i przygotowuje aktywny
+model. `wait_for_solve` zachowuje opisany wyżej trwały start gate. Projector
+udostępnia przygotowaną geometrię i zaakceptowany stan przez istniejący live
+read model; nie tworzy drugiego viewportu. Te ścieżki są zaimplementowane
+źródłowo, lecz końcowa kwalifikacja formularz → GPU → widoczny wynik oraz
+skrypt → aktywny model → Solve nadal ma status **NOT VERIFIED**. Działający
+frontend lub build obrazu nie dowodzą wykonania tych bramek.
+
+## Trwałe przygotowanie kolejnych etapów Study
+
+Jeden accepted run może zmieniać geometrię pomiędzy etapami. Niezmienny
+run-level preparation receipt pozostaje kotwicą pierwszej publikacji; nie
+zastępujemy go receipt kolejnego etapu. Oddzielne append-only stage receipts
+w `accepted_stage_preparation_receipts/<task_id>.json` wiążą run, Study step,
+deterministyczny task, input fingerprint, preparation ID, plan fingerprint
+oraz digest niezmiennego payloadu task preparation receipt.
+
+Przed publikacją pola projector odczytuje przygotowanie dokładnego etapu.
+Stan musi pasować do tego samego run/stage i preparation domain; FEM sprawdza
+także rząd elementu, liczbę węzłów i fingerprint topologii. Zgodna liczba
+węzłów sama nie wystarcza. Błąd powiązania usuwa stare pole magnetyzacji
+z bieżącego read model zamiast nakładać je na inną siatkę.
+
+Po restarcie wybór etapu wymaga ponownego odczytu i rewalidacji trwałego stage
+receipt względem exact task receipt, katalogu i intentu. Stage receipt nie
+przyznaje uprawnień wykonania, schedulera, zasobów hosta ani solvera.
+Brakujące, sprzeczne, nieaktualne, podlinkowane, nieregularne lub zbyt duże
+rekordy zamykają publikację. Reachability sprawdza powiązanie tych rekordów;
+rollback zachowuje je wraz z task receipts.
+
+Accepted anchor, catalog, intent, task i stage należą do skonfigurowanego
+accepted store. Legacy MeshBuild i command journal zachowują odrębny live
+store. Przeniesienie samego wskaźnika do pamięci lub zapis accepted receipt
+w live store nie zastępuje tego powiązania. Regresje muszą używać różnych
+fizycznych rootów obu store.
+
+## Provenance accepted run w archiwum FMS
+
+Eksport live snapshotu nie może utożsamiać lokalnego session run ID z accepted
+run ID ani kopiować autorytatywnego drzewa accepted run do live runtime store.
+Archiwum z accepted wynikami otrzymuje osobne evidence-only closure: exact
+intent/catalog/task/stage, manifesty wyników i zweryfikowane referencje CAS.
+Claims, leases, coordinator journals, inboxy i stan procesów nie należą do
+tego closure. Nie tworzymy drugiego katalogu SolutionSet ani formatu fizyki.
+
+Dotychczasowy manifest fullmag.session.v1 pozostaje bez zmian. Archiwum
+z accepted closure wymaga jawnego fullmag.session.v2 i typed referencji
+manifest/accepted_provenance.json. Import odkłada dowody pod własnym stagingiem
+imports, bez zapisu do accepted store i bez uprawnień Resume lub recovery.
+Historyczny binding źródłowego store nie staje się bindingiem nowego hosta.
+Brak zgodnego closure dla zadeklarowanego accepted context blokuje publikację
+archiwum. Zgodność v1, cross-store export/import, tampering i odrzucenie
+authority records wymagają regresji oraz rzeczywistego Windows save/reopen.
+Implementacja i kwalifikacja tej części FMS pozostają **NOT VERIFIED**.
 
 ## Kontrakty i konsumenci
 

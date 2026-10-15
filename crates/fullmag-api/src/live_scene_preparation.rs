@@ -1102,6 +1102,12 @@ pub(crate) async fn commit_live_preparation_receipt_for_context_under_transition
         .simulation_preparation
         .as_ref()
         .map(|preparation| preparation.preparation_id.clone());
+    let snapshot_accepted_run_id = snapshot
+        .mesh_workspace
+        .as_ref()
+        .and_then(|workspace| workspace.get("accepted_run_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     if expected_run_id.is_some_and(|expected| expected != current_run_id.as_str()) {
         return Err(ApiError::conflict(
             "current_live_preparation_materialization_run_id_mismatch",
@@ -1115,47 +1121,152 @@ pub(crate) async fn commit_live_preparation_receipt_for_context_under_transition
         .is_some_and(|preparation_id| preparation_id != receipt.preparation_id.as_str());
     drop(current);
 
-    if preparation_id_differs {
-        // An explicit MeshBuild may have populated the shared read model for
-        // the previous live run before Docker accepted a new RunIntent.  The
-        // accepted worker is then allowed to replace that stale preparation
-        // only when the durable receipt already proves the old run identity.
-        // Same-run mismatches still fail closed, as do unproven stale frames.
-        let previous_receipt_run_id = state
-            .current_live_preparation_receipt
-            .read()
-            .await
-            .as_ref()
-            .map(|receipt| receipt.run_id.clone());
-        let stale_accepted_replacement = receipt.accepted_run_source.is_some()
-            && previous_receipt_run_id
-                .as_deref()
-                .is_some_and(|run_id| run_id != current_run_id);
-        if !stale_accepted_replacement {
-            return Err(ApiError::conflict(
-                "current_live_preparation_receipt_id_mismatch",
-            ));
-        }
-    }
-
     if let Some(source) = receipt.accepted_run_source.as_ref() {
         validate_live_accepted_run_source(state, &current_run_id, &receipt, source)?;
+    } else if preparation_id_differs {
+        return Err(ApiError::conflict(
+            "current_live_preparation_receipt_id_mismatch",
+        ));
     }
 
+    let accepted_source_step = receipt
+        .accepted_run_source
+        .as_ref()
+        .map(|source| source.step_id.clone());
     let payload = serde_json::to_value(&receipt).map_err(|error| {
         ApiError::internal(format!("failed to encode preparation receipt: {error}"))
     })?;
-    let receipt = fullmag_session::FmsPreparationReceipt::new(
+    let durable_receipt = fullmag_session::FmsPreparationReceipt::new(
         receipt.preparation_id.clone(),
         current_run_id,
         receipt.plan_fingerprint.clone(),
         payload,
     );
-    let store = crate::session_persistence::open_store(state)?;
-    let disposition = store
-        .commit_preparation_receipt(&receipt)
-        .map_err(|error| ApiError::conflict(error.to_string()))?;
-    *state.current_live_preparation_receipt.write().await = Some(receipt);
+    // The live workspace anchor and accepted task/stage receipts have
+    // different durable owners. Keep the roots explicit: legacy live
+    // preparations use the current-live journal store, while an accepted run
+    // keeps its catalog, RunIntent, anchor, task, and stage provenance in the
+    // accepted store.
+    let live_store = crate::session_persistence::open_store(state)?;
+    let accepted_store = if accepted_source_step.is_some() {
+        let store_root = state.submit_store_root.as_ref().ok_or_else(|| {
+            ApiError::with_status_and_code(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "accepted_preparation_store_unavailable",
+                "accepted preparation provenance requires the configured durable run store",
+            )
+        })?;
+        Some(fullmag_session::SessionStore::open_existing(store_root).map_err(|error| {
+            ApiError::with_status_and_code(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "accepted_preparation_store_unavailable",
+                format!("failed to open the configured accepted run store: {error}"),
+            )
+        })?)
+    } else {
+        None
+    };
+    let previous_live_receipt = state.current_live_preparation_receipt.read().await.clone();
+    let previous_durable_receipt = match accepted_store.as_ref() {
+        Some(accepted_store) => {
+            read_durable_preparation_anchor(accepted_store, &durable_receipt.run_id)?
+        }
+        None => read_durable_preparation_anchor(&live_store, &durable_receipt.run_id)?,
+    };
+    let disposition = if let Some(step_id) = accepted_source_step.as_deref() {
+        let accepted_store = accepted_store.as_ref().ok_or_else(|| {
+            ApiError::with_status_and_code(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "accepted_preparation_store_unavailable",
+                "accepted preparation provenance store was not opened",
+            )
+        })?;
+        let task_id = fullmag_session::task_id_for_study_step(&durable_receipt.run_id, step_id)
+            .map_err(|error| ApiError::bad_request(format!("accepted preparation step is invalid: {error}")))?;
+        let task_receipt = accepted_store
+            .read_task_preparation_receipt(&durable_receipt.run_id, &task_id)
+            .map_err(|error| {
+                ApiError::conflict(format!("accepted task preparation receipt read failed: {error}"))
+            })?
+            .ok_or_else(|| {
+                ApiError::conflict_with_code(
+                    "accepted_preparation_task_receipt_missing",
+                    "accepted preparation source has no immutable task preparation receipt",
+                )
+            })?;
+        let stage_receipt = fullmag_session::FmsAcceptedStagePreparationReceipt::from_task_receipt(
+            &task_receipt,
+        )
+        .map_err(|error| {
+            ApiError::conflict(format!("accepted stage preparation receipt is invalid: {error}"))
+        })?;
+        if stage_receipt.preparation_id != durable_receipt.preparation_id
+            || stage_receipt.plan_fingerprint != durable_receipt.plan_fingerprint
+        {
+            return Err(ApiError::conflict_with_code(
+                "accepted_preparation_stage_receipt_mismatch",
+                "accepted stage receipt differs from the immutable task preparation receipt",
+            ));
+        }
+
+        let stale_accepted_replacement = match previous_live_receipt.as_ref() {
+            Some(previous) if previous.run_id != durable_receipt.run_id => {
+                prove_stale_accepted_replacement(
+                    &live_store,
+                    accepted_store,
+                    previous,
+                    current_preparation_id.as_deref(),
+                    snapshot_accepted_run_id.as_deref(),
+                )?
+            }
+            _ => false,
+        };
+        let previous_stage_id = previous_live_receipt
+            .as_ref()
+            .and_then(|previous| accepted_stage_step_for_run(previous, &durable_receipt.run_id));
+        let same_run_previous_stage_is_durable = if let Some(step_id) = previous_stage_id {
+            accepted_store
+                .read_accepted_stage_preparation_receipt(&durable_receipt.run_id, &step_id)
+                .map(|receipt| receipt.is_some())
+                .map_err(|error| ApiError::conflict(error.to_string()))?
+        } else if let Some(preparation_id) = current_preparation_id.as_deref() {
+            accepted_store
+                .find_accepted_stage_preparation_receipt_by_preparation_id(
+                    &durable_receipt.run_id,
+                    preparation_id,
+                )
+                .map(|receipt| receipt.is_some())
+                .map_err(|error| ApiError::conflict(error.to_string()))?
+        } else {
+            false
+        };
+        if preparation_id_differs
+            && !stale_accepted_replacement
+            && !same_run_previous_stage_is_durable
+        {
+            return Err(ApiError::conflict(
+                "current_live_preparation_receipt_id_mismatch",
+            ));
+        }
+
+        let stage_disposition = accepted_store
+            .commit_accepted_stage_preparation_receipt(&stage_receipt)
+            .map_err(|error| ApiError::conflict(error.to_string()))?;
+        match previous_durable_receipt.as_ref() {
+            None => accepted_store
+                .commit_preparation_receipt(&durable_receipt)
+                .map_err(|error| ApiError::conflict(error.to_string()))?,
+            Some(existing) if existing.same_immutable_payload(&durable_receipt) => {
+                fullmag_session::PreparationReceiptCommitDisposition::Replayed
+            }
+            Some(_) => stage_disposition,
+        }
+    } else {
+        live_store
+            .commit_preparation_receipt(&durable_receipt)
+            .map_err(|error| ApiError::conflict(error.to_string()))?
+    };
+    *state.current_live_preparation_receipt.write().await = Some(durable_receipt);
     Ok(disposition)
 }
 
@@ -1284,6 +1395,191 @@ fn validate_accepted_receipt_payload_identity(
             "accepted preparation receipt differs from the immutable task receipt",
         ))
     }
+}
+
+fn stale_replacement_snapshot_matches(
+    previous: &fullmag_session::FmsPreparationReceipt,
+    current_preparation_id: Option<&str>,
+    snapshot_accepted_run_id: Option<&str>,
+) -> bool {
+    current_preparation_id == Some(previous.preparation_id.as_str())
+        && snapshot_accepted_run_id.is_none_or(|run_id| run_id == previous.run_id)
+}
+
+fn stale_replacement_durable_evidence_matches(
+    previous_run_id: &str,
+    anchor_run_id: &str,
+    anchor_matches_previous: bool,
+    accepted_source_run_id: Option<&str>,
+    task_matches_previous: bool,
+    stage_matches_previous: bool,
+) -> bool {
+    if anchor_run_id != previous_run_id {
+        return false;
+    }
+    match accepted_source_run_id {
+        None => anchor_matches_previous,
+        Some(source_run_id) => {
+            source_run_id == previous_run_id
+                && task_matches_previous
+                && stage_matches_previous
+        }
+    }
+}
+
+/// Prove that a preparation from a previous run may replace the current
+/// in-memory live receipt. A run-id difference alone is not sufficient: the
+/// current snapshot must still point at the previous preparation, and the
+/// previous run's immutable anchor, task receipt, and stage pointer must all
+/// reproduce the in-memory payload. The run-level anchor remains the first
+/// immutable preparation for the run, so an accepted later-stage receipt is
+/// proven by its task/stage records instead of being compared to that anchor.
+fn prove_stale_accepted_replacement(
+    live_store: &fullmag_session::SessionStore,
+    accepted_store: &fullmag_session::SessionStore,
+    previous: &fullmag_session::FmsPreparationReceipt,
+    current_preparation_id: Option<&str>,
+    snapshot_accepted_run_id: Option<&str>,
+) -> Result<bool, ApiError> {
+    if !stale_replacement_snapshot_matches(
+        previous,
+        current_preparation_id,
+        snapshot_accepted_run_id,
+    ) {
+        return Ok(false);
+    }
+
+    let Ok(application) =
+        serde_json::from_value::<PreparationReceipt>(previous.payload.clone())
+    else {
+        return Ok(false);
+    };
+    if application.validate().is_err() {
+        return Ok(false);
+    }
+    let anchor_store = if application.accepted_run_source.is_some() {
+        accepted_store
+    } else {
+        live_store
+    };
+    let Some(anchor) = read_durable_preparation_anchor(anchor_store, &previous.run_id)?
+    else {
+        return Ok(false);
+    };
+    let Some(source) = application.accepted_run_source.as_ref() else {
+        return Ok(stale_replacement_durable_evidence_matches(
+            &previous.run_id,
+            &anchor.run_id,
+            anchor.same_immutable_payload(previous),
+            None,
+            false,
+            false,
+        ));
+    };
+    let Ok(task_id) =
+        fullmag_session::task_id_for_study_step(&previous.run_id, &source.step_id)
+    else {
+        return Ok(false);
+    };
+    let task_receipt = accepted_store
+        .read_task_preparation_receipt(&previous.run_id, &task_id)
+        .map_err(|error| {
+            ApiError::conflict(format!(
+                "previous accepted task preparation receipt read failed: {error}"
+            ))
+        })?;
+    let Some(task_receipt) = task_receipt else {
+        return Ok(false);
+    };
+    let task_matches_previous = task_receipt.payload == previous.payload;
+    let stage_receipt = accepted_store
+        .read_accepted_stage_preparation_receipt(&previous.run_id, &source.step_id)
+        .map_err(|error| {
+            ApiError::conflict(format!(
+                "previous accepted stage preparation receipt read failed: {error}"
+            ))
+        })?;
+    let Some(stage_receipt) = stage_receipt else {
+        return Ok(false);
+    };
+    let stage_matches_previous = stage_receipt.preparation_id == previous.preparation_id
+        && stage_receipt.plan_fingerprint == previous.plan_fingerprint
+        && stage_receipt.matches_task_receipt(&task_receipt);
+    Ok(stale_replacement_durable_evidence_matches(
+        &previous.run_id,
+        &anchor.run_id,
+        anchor.same_immutable_payload(previous),
+        Some(source.run_id.as_str()),
+        task_matches_previous,
+        stage_matches_previous,
+    ))
+}
+
+fn read_durable_preparation_anchor(
+    store: &fullmag_session::SessionStore,
+    run_id: &str,
+) -> Result<Option<fullmag_session::FmsPreparationReceipt>, ApiError> {
+    fullmag_session::repository_path::validate_store_id(run_id)
+        .map_err(|error| ApiError::conflict(format!("previous accepted run id is invalid: {error}")))?;
+    let relative = format!("runs/{run_id}/preparation_receipt.json");
+    let path = store.root().join(&relative);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(ApiError::conflict(
+                "previous accepted preparation anchor is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ApiError::conflict(format!(
+                "checking previous accepted preparation anchor failed: {error}"
+            )));
+        }
+    }
+    let data = fullmag_session::repository_path::read_bounded_regular_file(
+        store.root(),
+        &relative,
+        16 * 1024 * 1024,
+    )
+    .map_err(|error| {
+        ApiError::conflict(format!(
+            "previous accepted preparation anchor read failed: {error}"
+        ))
+    })?;
+    let anchor: fullmag_session::FmsPreparationReceipt =
+        serde_json::from_slice(&data).map_err(|error| {
+            ApiError::conflict(format!(
+                "previous accepted preparation anchor is invalid: {error}"
+            ))
+        })?;
+    anchor.validate().map_err(|error| {
+        ApiError::conflict(format!(
+            "previous accepted preparation anchor validation failed: {error}"
+        ))
+    })?;
+    if anchor.run_id != run_id {
+        return Err(ApiError::conflict(
+            "previous accepted preparation anchor identity does not match its path",
+        ));
+    }
+    Ok(Some(anchor))
+}
+
+/// Recover the accepted stage selected by an earlier in-memory receipt.
+/// Only an accepted-run payload for the same run is eligible; malformed or
+/// legacy receipts return `None` and therefore cannot authorize a replacement.
+fn accepted_stage_step_for_run(
+    receipt: &fullmag_session::FmsPreparationReceipt,
+    run_id: &str,
+) -> Option<String> {
+    if receipt.run_id != run_id {
+        return None;
+    }
+    let application: PreparationReceipt = serde_json::from_value(receipt.payload.clone()).ok()?;
+    application.validate().ok()?;
+    let source = application.accepted_run_source?;
+    (source.run_id == run_id).then_some(source.step_id)
 }
 
 fn validate_live_read_model_binding(
@@ -1556,6 +1852,16 @@ fn validate_requested_device_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fullmag_application::{
+        ProjectId, ProjectSnapshot, RequestedExecution, RequestedResourceBudget, RunId,
+        RunSpecification, StudyId, StudyReference,
+    };
+    use fullmag_ir::BackendTarget;
+    use fullmag_plan::{
+        PreparationCertificate, PreparationMarkerCertificate, PreparationPlan,
+        PreparationProducer, PreparationProducerKind, PreparationQualityCertificate,
+        PreparationSpaceCertificate,
+    };
     use serde_json::json;
 
     fn digest(character: char) -> String {
@@ -1575,6 +1881,156 @@ mod tests {
             step_id: step_id.into(),
             problem_fingerprint: digest(problem_character),
         }
+    }
+
+    fn accepted_test_specification(run_id: &str) -> RunSpecification {
+        let mut specification = RunSpecification::new(
+            ProjectSnapshot {
+                project_id: ProjectId::parse("project-cross-store").unwrap(),
+                definition_revision: 1,
+                definition_sha256: "a".repeat(64),
+            },
+            StudyReference {
+                study_id: StudyId::parse("study-cross-store").unwrap(),
+                plan_version: "study_plan.v1".into(),
+                plan_sha256: "b".repeat(64),
+            },
+            "c".repeat(64),
+            json!({"temperature": 300}),
+            RequestedExecution {
+                backend: "fdm".into(),
+                device: "cpu".into(),
+                precision: "double".into(),
+                mode: "strict".into(),
+                minimum_resources: Some(RequestedResourceBudget {
+                    cpu_millis: 100,
+                    memory_bytes: 1,
+                    gpu_memory_bytes: 0,
+                    storage_bytes: 1,
+                }),
+            },
+        );
+        specification.run_id = RunId::parse(run_id).unwrap();
+        specification
+    }
+
+    fn accepted_test_receipt(
+        specification: &RunSpecification,
+        step_id: &str,
+        preparation_id: &str,
+    ) -> PreparationReceipt {
+        let fingerprint = |hex: char| format!("sha256:{}", hex.to_string().repeat(64));
+        let producer = |kind: PreparationProducerKind, output: char| {
+            PreparationProducer::new(
+                kind,
+                format!("fullmag.{}", kind.as_str()),
+                format!("{}.producer.v1", kind.as_str()),
+                "test",
+                fingerprint('a'),
+                fingerprint(output),
+            )
+            .unwrap()
+        };
+        let mut plan = PreparationPlan::new(
+            fingerprint('b'),
+            1,
+            BackendTarget::Auto,
+            BackendTarget::Fdm,
+            producer(PreparationProducerKind::Geometry, '1'),
+            producer(PreparationProducerKind::Display, '2'),
+            producer(PreparationProducerKind::Grid, '3'),
+            producer(PreparationProducerKind::Mesh, '4'),
+            producer(PreparationProducerKind::Space, '5'),
+        )
+        .unwrap();
+        let specification_fingerprint = format!(
+            "sha256:{}",
+            specification.fingerprint().unwrap()
+        );
+        plan.scene_revision = None;
+        plan.source = Some(
+            fullmag_plan::PreparationPlanSource::accepted_run_step(
+                specification.run_id.as_str(),
+                specification_fingerprint,
+                step_id,
+            )
+            .unwrap(),
+        );
+        let marker_map = fingerprint('c');
+        let certificates = vec![
+            PreparationCertificate {
+                schema_version: fullmag_plan::PREPARATION_CERTIFICATE_SCHEMA.into(),
+                producer: plan.geometry.clone(),
+                quality: None,
+                marker_map: None,
+                cell_count: None,
+                space: None,
+            },
+            PreparationCertificate {
+                schema_version: fullmag_plan::PREPARATION_CERTIFICATE_SCHEMA.into(),
+                producer: plan.display.clone(),
+                quality: None,
+                marker_map: None,
+                cell_count: None,
+                space: None,
+            },
+            PreparationCertificate {
+                schema_version: fullmag_plan::PREPARATION_CERTIFICATE_SCHEMA.into(),
+                producer: plan.grid.clone(),
+                quality: None,
+                marker_map: None,
+                cell_count: Some(4),
+                space: None,
+            },
+            PreparationCertificate {
+                schema_version: fullmag_plan::PREPARATION_CERTIFICATE_SCHEMA.into(),
+                producer: plan.mesh.clone(),
+                quality: Some(PreparationQualityCertificate {
+                    cell_count: 4,
+                    invalid_cell_count: 0,
+                    min_quality: Some(0.2),
+                    max_aspect_ratio: Some(3.0),
+                    jacobian: None,
+                    quality_fingerprint: fingerprint('d'),
+                    mesh_source: None,
+                }),
+                marker_map: Some(PreparationMarkerCertificate {
+                    marker_map_fingerprint: marker_map.clone(),
+                    marker_ids: vec![1],
+                }),
+                cell_count: Some(4),
+                space: None,
+            },
+            PreparationCertificate {
+                schema_version: fullmag_plan::PREPARATION_CERTIFICATE_SCHEMA.into(),
+                producer: plan.space.clone(),
+                quality: None,
+                marker_map: Some(PreparationMarkerCertificate {
+                    marker_map_fingerprint: marker_map.clone(),
+                    marker_ids: vec![1],
+                }),
+                cell_count: None,
+                space: Some(PreparationSpaceCertificate {
+                    mesh_fingerprint: plan.mesh.output_fingerprint.clone(),
+                    marker_map_fingerprint: Some(marker_map),
+                    dof_count: 8,
+                    space_fingerprint: plan.space.output_fingerprint.clone(),
+                    fe_family: None,
+                    fe_order: None,
+                    local_dof_count: None,
+                    true_dof_count: None,
+                }),
+            },
+        ];
+        PreparationReceipt::ready_for_accepted_run(
+            preparation_id,
+            plan,
+            certificates,
+            Vec::new(),
+            specification,
+            step_id,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1611,6 +2067,311 @@ mod tests {
         assert_eq!(
             mismatch.message,
             "live_preparation_accepted_source_plan_mismatch"
+        );
+    }
+
+    #[test]
+    fn stale_accepted_replacement_requires_previous_preparation_identity() {
+        let previous = fullmag_session::FmsPreparationReceipt::new(
+            "prep-previous",
+            "run-previous",
+            digest('a'),
+            json!({
+                "schema_version": fullmag_session::FMS_PREPARATION_RECEIPT_SCHEMA,
+                "preparation_id": "prep-previous",
+                "plan_fingerprint": digest('a'),
+            }),
+        );
+        assert!(stale_replacement_snapshot_matches(
+            &previous,
+            Some("prep-previous"),
+            Some("run-previous"),
+        ));
+        assert!(stale_replacement_snapshot_matches(
+            &previous,
+            Some("prep-previous"),
+            None,
+        ));
+        assert!(!stale_replacement_snapshot_matches(
+            &previous,
+            Some("prep-next"),
+            Some("run-previous"),
+        ));
+        assert!(!stale_replacement_snapshot_matches(
+            &previous,
+            Some("prep-previous"),
+            Some("run-next"),
+        ));
+        assert!(!stale_replacement_snapshot_matches(&previous, None, None));
+    }
+
+    #[test]
+    fn stale_accepted_replacement_accepts_stage_receipt_beyond_run_anchor() {
+        // The live store keeps the first immutable anchor (stage A), while
+        // the accepted store keeps the selected later stage (stage B).
+        assert!(stale_replacement_durable_evidence_matches(
+            "run-previous",
+            "run-previous",
+            false,
+            Some("run-previous"),
+            true,
+            true,
+        ));
+
+        // A legacy MeshBuild has no accepted source and is eligible only when
+        // its payload is exactly the live run anchor.
+        assert!(stale_replacement_durable_evidence_matches(
+            "run-legacy",
+            "run-legacy",
+            true,
+            None,
+            false,
+            false,
+        ));
+
+        assert!(!stale_replacement_durable_evidence_matches(
+            "run-previous",
+            "run-current",
+            false,
+            Some("run-previous"),
+            true,
+            true,
+        ));
+        assert!(!stale_replacement_durable_evidence_matches(
+            "run-previous",
+            "run-previous",
+            false,
+            Some("run-current"),
+            true,
+            true,
+        ));
+        assert!(!stale_replacement_durable_evidence_matches(
+            "run-previous",
+            "run-previous",
+            false,
+            Some("run-previous"),
+            false,
+            true,
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_commit_uses_submit_store_for_anchor_and_stage_with_distinct_live_store() {
+        let temporary = tempfile::tempdir().unwrap();
+        let accepted_root = temporary.path().join("accepted-store");
+        let live_root = temporary.path().join("live-store");
+        let run_id = "test-run";
+        let step_id = "step-a";
+        let next_step_id = "step-b";
+        let specification = accepted_test_specification(run_id);
+        let task_id = fullmag_session::task_id_for_study_step(run_id, step_id).unwrap();
+        let next_task_id =
+            fullmag_session::task_id_for_study_step(run_id, next_step_id).unwrap();
+        let preparation_id = format!("prep-{task_id}");
+        let next_preparation_id = format!("prep-{next_task_id}");
+        let receipt = accepted_test_receipt(&specification, step_id, &preparation_id);
+        let next_receipt =
+            accepted_test_receipt(&specification, next_step_id, &next_preparation_id);
+        let payload = serde_json::to_value(&receipt).unwrap();
+        let next_payload = serde_json::to_value(&next_receipt).unwrap();
+        let accepted_store = fullmag_session::SessionStore::open(&accepted_root).unwrap();
+        let intent = fullmag_session::FmsRunIntent::new(
+            run_id,
+            "intent-cross-store",
+            serde_json::to_value(&specification).unwrap(),
+        );
+        accepted_store.commit_run_intent(&intent).unwrap();
+        accepted_store
+            .commit_run_catalog(&fullmag_session::FmsRunCatalog {
+                schema_version: fullmag_session::FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: run_id.into(),
+                revision: 1,
+                updated_at: chrono::Utc::now(),
+                tasks: vec![fullmag_session::FmsTaskCatalogEntry {
+                    task_id: task_id.clone(),
+                    input_fingerprint: "d".repeat(64),
+                    lifecycle: fullmag_session::FmsTaskLifecycle::Accepted,
+                    readiness: fullmag_session::FmsTaskReadiness::Blocked {
+                        reason: "awaiting preparation".into(),
+                    },
+                    observation: None,
+                    attempt_id: None,
+                    ownership_epoch: None,
+                    resolved_input_fingerprint: None,
+                    artifact_ids: Vec::new(),
+                    resource_id: None,
+                    coordinator_watermark: None,
+                    coordinator_genesis: None,
+                },
+                fullmag_session::FmsTaskCatalogEntry {
+                    task_id: next_task_id.clone(),
+                    input_fingerprint: "e".repeat(64),
+                    lifecycle: fullmag_session::FmsTaskLifecycle::Accepted,
+                    readiness: fullmag_session::FmsTaskReadiness::Blocked {
+                        reason: "awaiting preparation".into(),
+                    },
+                    observation: None,
+                    attempt_id: None,
+                    ownership_epoch: None,
+                    resolved_input_fingerprint: None,
+                    artifact_ids: Vec::new(),
+                    resource_id: None,
+                    coordinator_watermark: None,
+                    coordinator_genesis: None,
+                }],
+            })
+            .unwrap();
+        accepted_store
+            .commit_task_preparation_receipt(
+                &fullmag_session::FmsTaskPreparationReceipt::new(
+                    run_id,
+                    step_id,
+                    "d".repeat(64),
+                    preparation_id.clone(),
+                    receipt.plan_fingerprint.clone(),
+                    payload,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        accepted_store
+            .commit_task_preparation_receipt(
+                &fullmag_session::FmsTaskPreparationReceipt::new(
+                    run_id,
+                    next_step_id,
+                    "e".repeat(64),
+                    next_preparation_id.clone(),
+                    next_receipt.plan_fingerprint.clone(),
+                    next_payload,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let mut state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        let state_mut = std::sync::Arc::get_mut(&mut state).unwrap();
+        state_mut.submit_store_root = Some(accepted_root.clone());
+        state_mut.current_command_journal_store_root = Some(live_root.clone());
+        let context = crate::capture_current_live_request_context(&state)
+            .await
+            .unwrap();
+        let _transition = state.current_live_session_transition.lock().await;
+        let disposition = commit_live_preparation_receipt_for_context_under_transition(
+            &state, &context, receipt.clone(), None, None, Some(run_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            disposition,
+            fullmag_session::PreparationReceiptCommitDisposition::Accepted
+        );
+        let accepted_anchor = accepted_store
+            .read_preparation_receipt(run_id)
+            .unwrap()
+            .expect("accepted run anchor must be in the accepted store");
+        assert_eq!(accepted_anchor.preparation_id, preparation_id);
+        let stage = accepted_store
+            .read_accepted_stage_preparation_receipt(run_id, step_id)
+            .unwrap()
+            .expect("accepted stage pointer must be in the accepted store");
+        assert_eq!(stage.preparation_id, preparation_id);
+        let live_store = fullmag_session::SessionStore::open(&live_root).unwrap();
+        assert!(
+            live_store.read_preparation_receipt(run_id).unwrap().is_none(),
+            "live journal store must not receive an accepted run anchor"
+        );
+        assert!(
+            live_store.read_run_catalog(run_id).unwrap().is_none(),
+            "live journal store must not receive an accepted run catalog"
+        );
+
+        drop(_transition);
+        let _transition = state.current_live_session_transition.lock().await;
+        let replay = commit_live_preparation_receipt_for_context_under_transition(
+            &state, &context, receipt.clone(), None, None, Some(run_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay,
+            fullmag_session::PreparationReceiptCommitDisposition::Replayed
+        );
+
+        drop(_transition);
+        let _transition = state.current_live_session_transition.lock().await;
+        let next_stage = commit_live_preparation_receipt_for_context_under_transition(
+            &state,
+            &context,
+            next_receipt.clone(),
+            None,
+            None,
+            Some(run_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next_stage,
+            fullmag_session::PreparationReceiptCommitDisposition::Accepted
+        );
+        assert_eq!(
+            accepted_store
+                .read_preparation_receipt(run_id)
+                .unwrap()
+                .unwrap()
+                .preparation_id,
+            preparation_id
+        );
+        assert!(accepted_store
+            .read_accepted_stage_preparation_receipt(run_id, next_step_id)
+            .unwrap()
+            .is_some());
+
+        drop(_transition);
+        let _transition = state.current_live_session_transition.lock().await;
+        let next_replay = commit_live_preparation_receipt_for_context_under_transition(
+            &state,
+            &context,
+            next_receipt.clone(),
+            None,
+            None,
+            Some(run_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next_replay,
+            fullmag_session::PreparationReceiptCommitDisposition::Replayed
+        );
+
+        let next_stage_receipt = accepted_store
+            .read_accepted_stage_preparation_receipt(run_id, next_step_id)
+            .unwrap()
+            .unwrap();
+        let stage_path = accepted_root.join(next_stage_receipt.relative_path().unwrap());
+        std::fs::remove_file(stage_path).unwrap();
+        *state.current_live_preparation_receipt.write().await = None;
+        drop(_transition);
+        let _transition = state.current_live_session_transition.lock().await;
+        let recovered = commit_live_preparation_receipt_for_context_under_transition(
+            &state,
+            &context,
+            next_receipt,
+            None,
+            None,
+            Some(run_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered,
+            fullmag_session::PreparationReceiptCommitDisposition::Accepted
+        );
+        assert!(
+            accepted_store
+                .read_accepted_stage_preparation_receipt(run_id, next_step_id)
+                .unwrap()
+                .is_some(),
+            "missing stage pointer must be rebuilt from the immutable task receipt"
         );
     }
 
@@ -1852,6 +2613,7 @@ mod tests {
         }))
         .unwrap();
         let mut snapshot = crate::session::default_current_live_state(&request);
+        snapshot.metadata = request.metadata.clone();
         let model = prepared_fem_read_model(true);
         let (metadata, mesh) = prepared_domain_publication(&snapshot, &model).unwrap();
         assert_eq!(metadata["docker_startup"]["request_id"], "startup-domain");

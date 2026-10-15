@@ -1618,6 +1618,110 @@ impl FmsTaskPreparationReceipt {
     }
 }
 
+/// Immutable pointer proving that the live accepted projection selected one
+/// study-stage preparation. The task receipt remains the authoritative
+/// payload; this record stores the exact task/plan identity needed to recover
+/// the selected stage after an API restart without replacing the run-level
+/// live preparation anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FmsAcceptedStagePreparationReceipt {
+    pub schema_version: String,
+    pub run_id: String,
+    pub step_id: String,
+    pub task_id: String,
+    pub input_fingerprint: String,
+    pub preparation_id: String,
+    pub plan_fingerprint: String,
+    pub task_receipt_payload_sha256: String,
+}
+
+pub const FMS_ACCEPTED_STAGE_PREPARATION_RECEIPT_SCHEMA: &str =
+    "accepted_stage_preparation_receipt.v1";
+
+impl FmsAcceptedStagePreparationReceipt {
+    pub fn from_task_receipt(receipt: &FmsTaskPreparationReceipt) -> Result<Self> {
+        receipt.validate()?;
+        let stage = Self {
+            schema_version: FMS_ACCEPTED_STAGE_PREPARATION_RECEIPT_SCHEMA.into(),
+            run_id: receipt.run_id.clone(),
+            step_id: receipt.step_id.clone(),
+            task_id: receipt.task_id.clone(),
+            input_fingerprint: receipt.input_fingerprint.clone(),
+            preparation_id: receipt.preparation_id.clone(),
+            plan_fingerprint: receipt.plan_fingerprint.clone(),
+            task_receipt_payload_sha256: receipt.payload_sha256.clone(),
+        };
+        stage.validate()?;
+        Ok(stage)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != FMS_ACCEPTED_STAGE_PREPARATION_RECEIPT_SCHEMA {
+            bail!(
+                "unsupported accepted stage preparation receipt schema `{}`",
+                self.schema_version
+            );
+        }
+        crate::repository_path::validate_store_id(&self.run_id)
+            .context("invalid accepted stage receipt run_id")?;
+        validate_study_step_id(&self.step_id)?;
+        crate::repository_path::validate_store_id(&self.task_id)
+            .context("invalid accepted stage receipt task_id")?;
+        validate_sha256(
+            &self.input_fingerprint,
+            "accepted stage receipt input_fingerprint",
+        )?;
+        crate::repository_path::validate_store_id(&self.preparation_id)
+            .context("invalid accepted stage receipt preparation_id")?;
+        validate_prefixed_sha256(
+            &self.plan_fingerprint,
+            "accepted stage receipt plan_fingerprint",
+        )?;
+        validate_sha256(
+            &self.task_receipt_payload_sha256,
+            "accepted stage receipt task_receipt_payload_sha256",
+        )?;
+        let expected_task_id = task_id_for_study_step(&self.run_id, &self.step_id)?;
+        if self.task_id != expected_task_id {
+            bail!("accepted stage receipt task_id does not match run_id and step_id");
+        }
+        if self.preparation_id != format!("prep-{}", self.task_id) {
+            bail!("accepted stage receipt preparation_id is not deterministic for its task");
+        }
+        Ok(())
+    }
+
+    pub fn relative_path(&self) -> Result<String> {
+        self.validate()?;
+        Ok(format!(
+            "runs/{}/accepted_stage_preparation_receipts/{}.json",
+            self.run_id, self.task_id
+        ))
+    }
+
+    pub fn matches_task_receipt(&self, receipt: &FmsTaskPreparationReceipt) -> bool {
+        self.run_id == receipt.run_id
+            && self.step_id == receipt.step_id
+            && self.task_id == receipt.task_id
+            && self.input_fingerprint == receipt.input_fingerprint
+            && self.preparation_id == receipt.preparation_id
+            && self.plan_fingerprint == receipt.plan_fingerprint
+            && self.task_receipt_payload_sha256 == receipt.payload_sha256
+    }
+
+    pub fn same_immutable_payload(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.run_id == other.run_id
+            && self.step_id == other.step_id
+            && self.task_id == other.task_id
+            && self.input_fingerprint == other.input_fingerprint
+            && self.preparation_id == other.preparation_id
+            && self.plan_fingerprint == other.plan_fingerprint
+            && self.task_receipt_payload_sha256 == other.task_receipt_payload_sha256
+    }
+}
+
 fn validate_study_step_id(value: &str) -> Result<()> {
     if value.trim().is_empty()
         || value.len() > 256

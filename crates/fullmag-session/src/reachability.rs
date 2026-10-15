@@ -18,6 +18,7 @@ use crate::types::{
     ArtifactIndex, BackendStatePayload, CommonSolverState, FieldRole, FmsArtifactCatalog,
     FmsBatchExpansionProgress, FmsBatchIntent, FmsCheckpoint, FmsCoordinatorJournalDirection,
     FmsExportProfile,
+    FmsAcceptedStagePreparationReceipt,
     FmsPreparationProcessExitReceipt, FmsPreparationProcessLaunch, FmsPreparationReceipt,
     FmsPreparationResourceLease, FmsPreparationResourcePool, FmsPreparationRetryDecision,
     FmsResourceLease, FmsRetryDecision, FmsRunCatalog, FmsRunIntent, FmsRunManifest,
@@ -272,6 +273,7 @@ fn classify_run_path(relative: &str) -> Result<RunPathKind> {
         && matches!(
             parts[0],
             "task_preparation_receipts"
+                | "accepted_stage_preparation_receipts"
                 | "worker_inbox"
                 | "retry_decisions"
                 | "preparation_retry_decisions"
@@ -318,6 +320,7 @@ fn is_reserved_run_container(parts: &[&str]) -> bool {
                     | "checkpoints"
                     | "worker_inbox"
                     | "task_preparation_receipts"
+                    | "accepted_stage_preparation_receipts"
                     | "retry_decisions"
                     | "preparation_retry_decisions"
                     | "worker_process_exit_receipts"
@@ -1436,10 +1439,10 @@ impl StoreWalker {
             let start_release_path = run_entry.path().join("start_release.json");
             if start_release_path.exists() {
                 let relative = format!("runs/{run_id}/start_release.json");
-                let data = self.read_file(&start_release_path, &relative)?;
+                let data = self.read_json(&relative)?;
                 let release: crate::AcceptedRunStartRelease = parse_json(&data, &relative)?;
                 let intent_relative = format!("runs/{run_id}/run_intent.json");
-                let intent_data = self.read_file(&intent_path, &intent_relative)?;
+                let intent_data = self.read_json(&intent_relative)?;
                 let intent: FmsRunIntent = parse_json(&intent_data, &intent_relative)?;
                 if intent.run_id != run_id {
                     bail!("start release owner intent differs from the run path");
@@ -1459,6 +1462,7 @@ impl StoreWalker {
                 self.walk_preparation_receipt_file(&preparation_receipt_path, &run_id)?;
             }
             self.walk_task_preparation_receipts(&run_entry.path(), &run_id)?;
+            self.walk_accepted_stage_preparation_receipts(&run_entry.path(), &run_id)?;
             self.walk_run_task_admissions(&run_entry.path(), &run_id)?;
             self.walk_run_task_cancellations(&run_entry.path(), &run_id)?;
             self.walk_run_retry_decisions(&run_entry.path(), &run_id)?;
@@ -2247,16 +2251,14 @@ impl StoreWalker {
             return Ok(());
         }
         let catalog_relative = format!("runs/{expected_run_id}/run_catalog.json");
-        let catalog_path = run_path.join("run_catalog.json");
-        let catalog_data = self.read_file(&catalog_path, &catalog_relative)?;
+        let catalog_data = self.read_json(&catalog_relative)?;
         let catalog: FmsRunCatalog = parse_json(&catalog_data, &catalog_relative)?;
         catalog.validate()?;
         if catalog.run_id != expected_run_id {
             bail!("task preparation receipt catalog identity does not match run path");
         }
         let intent_relative = format!("runs/{expected_run_id}/run_intent.json");
-        let intent_path = run_path.join("run_intent.json");
-        let intent_data = self.read_file(&intent_path, &intent_relative)?;
+        let intent_data = self.read_json(&intent_relative)?;
         let intent: FmsRunIntent = parse_json(&intent_data, &intent_relative)?;
         intent.validate()?;
         for entry in entries {
@@ -2266,13 +2268,74 @@ impl StoreWalker {
             }
             let file_name = entry.file_name().to_string_lossy().into_owned();
             let relative = format!("runs/{expected_run_id}/task_preparation_receipts/{file_name}");
-            let data = self.read_file(&entry.path(), &relative)?;
+            let data = self.read_json(&relative)?;
             let receipt: FmsTaskPreparationReceipt = parse_json(&data, &relative)?;
             if receipt.relative_path()? != relative {
                 bail!("task preparation receipt path identity mismatch");
             }
             receipt.validate_for_catalog(&catalog)?;
             receipt.validate_for_run_intent(&intent)?;
+        }
+        Ok(())
+    }
+
+    fn walk_accepted_stage_preparation_receipts(
+        &mut self,
+        run_path: &Path,
+        expected_run_id: &str,
+    ) -> Result<()> {
+        let directory = run_path.join("accepted_stage_preparation_receipts");
+        crate::repository_path::reject_link(&directory)?;
+        if !directory.exists() {
+            return Ok(());
+        }
+        let metadata = fs::symlink_metadata(&directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "unsafe accepted stage preparation receipt directory `{}`",
+                directory.display()
+            );
+        }
+        let entries = read_directory(&directory)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let catalog_relative = format!("runs/{expected_run_id}/run_catalog.json");
+        let catalog_data = self.read_json(&catalog_relative)?;
+        let catalog: FmsRunCatalog = parse_json(&catalog_data, &catalog_relative)?;
+        catalog.validate()?;
+        if catalog.run_id != expected_run_id {
+            bail!("accepted stage receipt catalog identity does not match run path");
+        }
+        let intent_relative = format!("runs/{expected_run_id}/run_intent.json");
+        let intent_data = self.read_json(&intent_relative)?;
+        let intent: FmsRunIntent = parse_json(&intent_data, &intent_relative)?;
+        intent.validate()?;
+        for entry in entries {
+            crate::repository_path::reject_link(&entry.path())?;
+            if !entry.file_type()?.is_file() {
+                bail!("accepted stage preparation receipt entry must be a file");
+            }
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let relative = format!(
+                "runs/{expected_run_id}/accepted_stage_preparation_receipts/{file_name}"
+            );
+            let data = self.read_json(&relative)?;
+            let stage: FmsAcceptedStagePreparationReceipt = parse_json(&data, &relative)?;
+            if stage.relative_path()? != relative {
+                bail!("accepted stage preparation receipt path identity mismatch");
+            }
+            let task_relative = format!(
+                "runs/{expected_run_id}/task_preparation_receipts/{}.json",
+                stage.task_id
+            );
+            let task_data = self.read_json(&task_relative)?;
+            let task: FmsTaskPreparationReceipt = parse_json(&task_data, &task_relative)?;
+            if task.relative_path()? != task_relative || !stage.matches_task_receipt(&task) {
+                bail!("accepted stage preparation receipt does not match its task receipt");
+            }
+            task.validate_for_catalog(&catalog)?;
+            task.validate_for_run_intent(&intent)?;
         }
         Ok(())
     }
@@ -2689,6 +2752,19 @@ impl StoreWalker {
         self.report.object_refs.insert(object_ref.to_string());
     }
 
+    fn read_json(&mut self, relative: &str) -> Result<Vec<u8>> {
+        validate_file_ref(relative)?;
+        reject_link_chain(&self.root, relative)?;
+        self.report.file_refs.insert(relative.to_string());
+        self.seen_files.insert(relative.to_string());
+        crate::repository_path::read_bounded_regular_file(
+            &self.root,
+            relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+        )
+        .with_context(|| format!("reading session JSON `{relative}`"))
+    }
+
     fn read_file(&mut self, path: &Path, relative: &str) -> Result<Vec<u8>> {
         validate_file_ref(relative)?;
         reject_link_chain(&self.root, relative)?;
@@ -2889,6 +2965,24 @@ impl<'a> ArchiveWalker<'a> {
             let run_manifest_ref = format!("runs/{run_id}/run_manifest.json");
             if !self.documents.contains_key(&run_manifest_ref) {
                 self.walk_task_preparation_receipts(&run_id)?;
+            }
+        }
+
+        let stage_receipt_marker = "/accepted_stage_preparation_receipts/";
+        let stage_receipt_runs = self
+            .documents
+            .keys()
+            .filter_map(|name| {
+                let rest = name.strip_prefix(receipt_prefix)?;
+                let (run_id, _) = rest.split_once(stage_receipt_marker)?;
+                Some(run_id.to_string())
+            })
+            .collect::<HashSet<_>>();
+        for run_id in stage_receipt_runs {
+            validate_component(&run_id)?;
+            let run_manifest_ref = format!("runs/{run_id}/run_manifest.json");
+            if !self.documents.contains_key(&run_manifest_ref) {
+                self.walk_accepted_stage_preparation_receipts(&run_id)?;
             }
         }
 
@@ -3702,6 +3796,7 @@ impl<'a> ArchiveWalker<'a> {
             self.walk_preparation_receipt(&preparation_receipt_ref, expected_run_id)?;
         }
         self.walk_task_preparation_receipts(expected_run_id)?;
+        self.walk_accepted_stage_preparation_receipts(expected_run_id)?;
         self.walk_task_admissions(expected_run_id)?;
         self.walk_task_cancellations(expected_run_id)?;
         let lease_prefix = format!("runs/{expected_run_id}/resource_leases/");
@@ -4005,6 +4100,66 @@ impl<'a> ArchiveWalker<'a> {
             }
             receipt.validate_for_catalog(&catalog)?;
             receipt.validate_for_run_intent(&intent)?;
+            self.report.file_refs.insert(relative);
+        }
+        Ok(())
+    }
+
+    fn walk_accepted_stage_preparation_receipts(&mut self, expected_run_id: &str) -> Result<()> {
+        let prefix = format!("runs/{expected_run_id}/accepted_stage_preparation_receipts/");
+        let mut names = self
+            .documents
+            .keys()
+            .filter(|name| name.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Ok(());
+        }
+        names.sort();
+        let catalog_ref = format!("runs/{expected_run_id}/run_catalog.json");
+        let catalog_data = self.documents.read(&catalog_ref)?.with_context(|| {
+            format!("archive accepted stage receipts require run catalog `{catalog_ref}`")
+        })?;
+        let catalog: FmsRunCatalog = parse_json(&catalog_data, &catalog_ref)?;
+        catalog.validate()?;
+        if catalog.run_id != expected_run_id {
+            bail!("archive accepted stage receipt catalog identity does not match run path");
+        }
+        let intent_ref = format!("runs/{expected_run_id}/run_intent.json");
+        let intent_data = self.documents.read(&intent_ref)?.with_context(|| {
+            format!("archive accepted stage receipts require run intent `{intent_ref}`")
+        })?;
+        let intent: FmsRunIntent = parse_json(&intent_data, &intent_ref)?;
+        intent.validate()?;
+        for relative in names {
+            let rest = relative
+                .strip_prefix(&prefix)
+                .context("invalid accepted stage receipt archive path")?;
+            if rest.is_empty() || rest.contains('/') || !rest.ends_with(".json") {
+                bail!("invalid accepted stage receipt archive path `{relative}`");
+            }
+            let data = self
+                .documents
+                .read(&relative)?
+                .context("archive accepted stage receipt disappeared")?;
+            let stage: FmsAcceptedStagePreparationReceipt = parse_json(&data, &relative)?;
+            if stage.relative_path()? != relative {
+                bail!("accepted stage receipt path identity mismatch");
+            }
+            let task_relative = format!(
+                "runs/{expected_run_id}/task_preparation_receipts/{}.json",
+                stage.task_id
+            );
+            let task_data = self.documents.read(&task_relative)?.with_context(|| {
+                format!("archive accepted stage receipt requires task receipt `{task_relative}`")
+            })?;
+            let task: FmsTaskPreparationReceipt = parse_json(&task_data, &task_relative)?;
+            if task.relative_path()? != task_relative || !stage.matches_task_receipt(&task) {
+                bail!("accepted stage receipt does not match its task receipt");
+            }
+            task.validate_for_catalog(&catalog)?;
+            task.validate_for_run_intent(&intent)?;
             self.report.file_refs.insert(relative);
         }
         Ok(())
