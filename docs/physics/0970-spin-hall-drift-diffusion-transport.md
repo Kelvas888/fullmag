@@ -415,16 +415,23 @@ charge/spin residuals, physical balances, finite-value oraz nonlinear-update
 gates pozostają obowiązkowe. Błąd odrzuca trial bez publikacji accepted.
 Nie wystarczy wyłączyć cały M2 gate, gdy wszystkie M są zamrożone.
 
-Obecny scalar embedded_lte_m jest redukowany po wszystkich komórkach n i
-przekazywany każdemu modułowi M2. Z samego scalaru nie można odtworzyć normy
-na odmiennym target∩free support. Wymagana jest wystarczająca informacja
-per-cell z istniejącego predictor/corrector przed renormalizacją do jednakowej,
-per-module redukcji obu norm. Nie przeskalowuje się arbitralnie scalaru i nie
-narzuca nowego globalnego stanu ani sposobu alokacji. Różnica torque pozostaje
-różnicą źródeł Gilberta, nie nową definicją explicit RHS. Istniejący
-TransportStageErrorBudget oraz jego przekazanie przez execute_coupled_heun_trial
-są granicą integracji; ich dotychczasowe dt_s i scalar nie są pełnym dowodem
-wymaganego scope.
+Historyczny scalar embedded_lte_m był redukowany po wszystkich komórkach n
+po projekcji i przekazywany każdemu modułowi M2. Nie zawierał informacji
+potrzebnej do redukcji na odmiennym target∩free support.
+
+Implementacja źródłowa przenosi teraz pożyczoną surową różnicę kandydatów
+Heuna i Eulera przed normalizacją w istniejącym scratch k[2]
+przez synchroniczny corrected callback i TransportStageErrorBudget. Właściciel
+normy redukuje błąd oraz zmianę torque po identycznym per-module target∩free
+support. Maska nie zmienia fizycznych targetów ani obserwabli. Normy i ich
+iloczyny muszą pozostać finite przed oceną ratio; empty support daje (0,0),
+bez dodatniego floor. Nie dodano alokacji gridowej dla estimatora ani maski.
+Różnica torque pozostaje różnicą źródeł Gilberta.
+
+Ten fragment ma status SOURCE_ONLY: składnia i kontrolowane sprawdzenia
+źródeł nie dowodzą typów/lifetimes ani wykonania solvera. Build 78 nie zawiera
+tej zmiany. Naprawy shortcutu all-frozen, czasu, completion i polityki Relax+M3
+pozostają planned_contract; poniższe runtime gates nadal są wymagane.
 
 All-frozen TimeEvolution wykonuje istniejące coupled Heun (steady M1/M2)
 lub ARS (M3), z końcową maską pełnego RHS i restore M w każdym candidate;
@@ -3096,11 +3103,11 @@ a qualified workload without the validation gates above.
 | Prerejestracja frozen transport | `crates/fullmag-runner/src/fdm/cpu/reference.rs` | `execute_reference_fdm_with_coupled_checkpoint` | Istniejący owner czasu, counters, outputs i completion; shortcut/gates wymagają naprawy. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
 | Prerejestracja frozen transport | `crates/fullmag-runner/src/fdm/cpu/reference.rs` | `execute_coupled_heun_trial` | Istniejący transaction Heun evaluate/commit/rollback. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
 | Prerejestracja frozen transport | `crates/fullmag-runner/src/fdm/cpu/reference.rs` | `execute_coupled_ars_trial` | Istniejący transaction ARS i historia M3. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
-| Prerejestracja frozen transport | `crates/fullmag-engine/src/fdm/cpu/integrators.rs` | `heun_trial_with_external_stage_terms_and_lte` | Etapowe callbacks, mask/restore i estimator; free-target scope niezweryfikowany. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
-| Prerejestracja frozen transport | `crates/fullmag-engine/src/fdm/shared/types.rs` | `TransportStageErrorBudget` | Istniejące dt_s i scalar LTE na granicy integrator-workflow; per-module free-target informacja wymaga implementacji. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-engine/src/fdm/cpu/integrators.rs` | `heun_trial_with_external_stage_terms_and_lte` | Źródłowy raw embedded Heun estimator w borrowed k[2], mask/restore; typy i runtime NOT VERIFIED. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-engine/src/fdm/shared/types.rs` | `TransportStageErrorBudget` | Źródłowy borrowed per-cell estimator i resolved frozen mask; synchroniczny zakres callback/solve bez nowego stanu; runtime NOT VERIFIED. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
 | Prerejestracja frozen transport | `crates/fullmag-engine/src/fdm/cpu/transport/coupled_charge_spin.rs` | `CoupledTransportOuterErrorBudget` | Istniejący budżet outer-error z Gilbert-source delta; nie wprowadzać arbitralnego floor. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
 | Prerejestracja frozen transport | `crates/fullmag-runner/src/fdm/cpu/spin_transport.rs` | `FdmSpinTransportWorkflow` | Istniejący accepted/rejected counters, cache, snapshot i checkpoint. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
-| Prerejestracja frozen transport | `crates/fullmag-engine/src/fdm/cpu/transport/coupled_charge_spin.rs` | `transport_torque_delta_l2` | Istniejąca norma targetów; dodanie free constraint scope pozostaje prerejestracją. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
+| Prerejestracja frozen transport | `crates/fullmag-engine/src/fdm/cpu/transport/coupled_charge_spin.rs` | `transport_torque_delta_l2` | Źródłowa wspólna redukcja obu norm po target∩free, empty support i finite guards; runtime NOT VERIFIED. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
 | Prerejestracja frozen transport | `crates/fullmag-runner/src/time_events.rs` | `build_resolved_stage_event_schedule_with_origin` | Istniejący owner zdarzeń; envelope current i fixed M3 clipping wymagają dowodów/naprawy. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
 | Prerejestracja frozen transport | `crates/fullmag-plan/src/validate.rs` | `validate_conservative_relaxation` | Istniejąca odmowa niekonserwatywnych torque; jawna odmowa Relax+M3 jeszcze niezaimplementowana. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `source_only_unqualified`; `worktree/uncommitted`; path + symbol |
 | boris-offline-toolchain-dependency-selection | scripts/local_runner/boris_toolchain.py | dependency_selection | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |

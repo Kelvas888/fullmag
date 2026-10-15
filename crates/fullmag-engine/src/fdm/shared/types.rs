@@ -141,9 +141,12 @@ impl CoupledImexArk2Tableau {
 /// Coupled transport uses it to bound transport-induced torque error before
 /// either subsystem commits state.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TransportStageErrorBudget {
+pub struct TransportStageErrorBudget<'a> {
     pub dt_s: f64,
-    pub embedded_lte_m: f64,
+    /// Raw embedded Heun-minus-Euler error, borrowed only during the callback.
+    pub embedded_error_m: &'a [Vector3],
+    /// Excluded frozen cells; physical transport target fields remain intact.
+    pub frozen_cells: Option<&'a [bool]>,
 }
 
 // ── Grid & Cell ────────────────────────────────────────────────────────
