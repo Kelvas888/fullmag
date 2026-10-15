@@ -50,3 +50,30 @@ otwarcia; hash indexu nie zmienił się. Późniejszą próbę zachowania pusteg
 pliku przerwano po zmianie timestampu. Nie zakończono procesu systemowego,
 nie usunięto locka i nie wymuszano historii. Następny odczyt wykazał zwolnienie
 index.lock; staging nadal wymaga osobnej kontroli cudzych wpisów.
+
+## Terminalny wynik buildu i dalsze obserwacje
+
+Build `e5a6aae5110b439aa0466bc6677fa195` zakończył się **FAIL**: cargo exit 101,
+wrapper/just exit 1, sesja `6897` odczekana. Nie przerwano go z powodu późniejszych
+edycji checkoutu: kompilator odczytał utrwalony snapshot i zgłosił E0382
+w `router_v2/handlers/platform/compute_nodes.rs:171` (`node_id` przeniesione
+do closure, następnie użyte przy ETag). Była to część współdzielonego WIP.
+W bieżącym checkoutcie dodano wyłącznie osobną kopię `policy_node_id` dla closure;
+nie dołączono całego cudzego handlera do commita. Diff check PASS, parser rustfmt
+przetwarza plik, ale format check wskazuje wcześniejsze różnice poza poprawką.
+Odbiór tej poprawki przez nowy produkcyjny build pozostaje wymagany.
+
+Nie ma nowego kompletnego pakietu runtime. Snapshot, log i stan końcowy należy
+zachować do diagnozy i odtworzenia; nie modyfikowano kopii frozen. Cache Cargo,
+compiler mirror, wcześniejszy manifest i pakiety rollback pozostają zachowane.
+Brak kwalifikacji do usunięcia oraz brak operacji prune; ponowna ocena po
+potwierdzeniu kompletnego pakietu zastępującego ten nieudany etap.
+
+Po zwolnieniu blokady wykonano driver 14 wariantów: receipt
+`84350daa85c449e3b5924494f33e9c9d`, PID 192184 odczekany, exit 0,
+bez timeout/terminate/kill, fingerprints stabilne. Oba `body_first_cad_30/50`
+mają status observed, body tags `[1,3,5]` i body XY digest
+`20947abb5339b7a562623a057cbb7727db67ca7d7aea0445381245a96da4f320`.
+Dwie fazowe próby pozostają error; ich porażki nie zmieniają się w PASS
+z powodu sukcesu innych wariantów. Nowa obserwacja uzasadnia roboczą poprawkę
+kolejności CAD; nadal wymagane pełne regresje Box/owner-fields/scoped-ring.

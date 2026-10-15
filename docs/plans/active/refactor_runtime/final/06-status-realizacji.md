@@ -1,4 +1,11 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 15.10.2026 — [P8-53CV](p8/53cv-ci-application-followup.md):
+poprawka meshera opublikowana jako `6b58b6f10`. Starszy CI napraw fixture
+doszedł do wykonania aplikacji: **101 PASS / 9 FAIL**. Trwa diagnoza
+replay/typed modules/preparation/antenna; walidatorów nie osłabiano.
+Ponowny build Windows zakończył limit oczekiwania przed startem kompilacji;
+brak nowego pakietu. Pełny plan **IN PROGRESS**, procenty bez awansu.
+
 Checkpoint 15.10.2026 — [P8-53CU](p8/53cu-body-first-production-regression.md):
 body-first CAD w produkcyjnym generatorze przechodzi pełny Box **45/45**,
 owner-fields **2/2** i scoped-ring **2/2**, bez skip i przy stabilnych źródłach.
