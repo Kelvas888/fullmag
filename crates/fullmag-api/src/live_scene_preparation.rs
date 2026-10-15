@@ -51,6 +51,82 @@ pub(crate) struct LiveScenePreparationReadModel {
 pub(crate) const LIVE_SCENE_PREPARATION_READ_MODEL_SCHEMA: &str =
     "fullmag.live_scene_preparation_read_model.v1";
 
+/// Build the native-layer carrier for a prepared multilayer magnetization.
+///
+/// The runner owns the canonical field layout.  The values are flattened in
+/// that layout's layer order, while every native grid and offset stays in the
+/// layout so consumers never interpret independent layers as one common grid.
+fn prepared_multilayer_initial_state(
+    execution_plan: &fullmag_ir::ExecutionPlanIR,
+) -> Result<(Vec<[f64; 3]>, Value), ApiError> {
+    let fullmag_ir::BackendPlanIR::FdmMultilayer(plan) = &execution_plan.backend_plan else {
+        return Err(ApiError::conflict_with_code(
+            "accepted_preparation_multilayer_layout_invalid",
+            "prepared initial state is not an FDM multilayer plan",
+        ));
+    };
+    if plan.layers.is_empty() {
+        return Err(ApiError::conflict_with_code(
+            "accepted_preparation_multilayer_layout_invalid",
+            "prepared multilayer plan has no native layers",
+        ));
+    }
+
+    let layout = fullmag_runner::study_magnetization_layout_for_plan(execution_plan).map_err(
+        |error| {
+            ApiError::conflict_with_code(
+                "accepted_preparation_multilayer_layout_invalid",
+                format!("prepared multilayer field layout is invalid: {}", error.message),
+            )
+        },
+    )?;
+    let mut values = Vec::new();
+    for layer in &plan.layers {
+        let native_cell_count = layer
+            .native_grid
+            .iter()
+            .try_fold(1usize, |count, axis| {
+                (*axis > 0)
+                    .then_some(count.checked_mul(usize::try_from(*axis).ok()?))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                ApiError::conflict_with_code(
+                    "accepted_preparation_multilayer_layout_invalid",
+                    format!(
+                        "prepared multilayer layer '{}' has an invalid native grid",
+                        layer.layer_id
+                    ),
+                )
+            })?;
+        if layer.initial_magnetization.len() != native_cell_count {
+            return Err(ApiError::conflict_with_code(
+                "accepted_preparation_multilayer_layout_invalid",
+                format!(
+                    "prepared multilayer layer '{}' initial magnetization length does not match its native grid",
+                    layer.layer_id
+                ),
+            ));
+        }
+        if layer
+            .initial_magnetization
+            .iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+        {
+            return Err(ApiError::conflict_with_code(
+                "accepted_preparation_multilayer_layout_invalid",
+                format!(
+                    "prepared multilayer layer '{}' has non-finite initial magnetization",
+                    layer.layer_id
+                ),
+            ));
+        }
+        values.extend(layer.initial_magnetization.iter().copied());
+    }
+    Ok((values, layout))
+}
+
 /// Project the pinned preparation plan through the existing live metadata and
 /// mesh consumers. The mesh workspace envelope alone is diagnostic state: the
 /// binary topology resources require the solver-domain FemMeshPayload.
@@ -69,6 +145,16 @@ fn prepared_domain_publication(
             ApiError::internal(format!("failed to encode prepared execution plan: {error}"))
         })?,
     );
+    if matches!(
+        &read_model.execution_plan.backend_plan,
+        fullmag_ir::BackendPlanIR::FdmMultilayer(_)
+    ) {
+        let (_, layout) = prepared_multilayer_initial_state(&read_model.execution_plan)?;
+        // A previous multilayer run may have a valid-looking layout with
+        // different native grids. The pinned plan is the current authority;
+        // retaining that older layout would misroute native-layer offsets.
+        metadata.insert("artifact_layout".into(), layout);
+    }
     let metadata = Value::Object(metadata);
     let fem_mesh = crate::quantities::extract_fem_mesh_from_metadata(&metadata);
     if matches!(
@@ -93,19 +179,24 @@ fn publish_prepared_initial_state(
     snapshot: &mut SessionStateResponse,
     read_model: &LiveScenePreparationReadModel,
 ) -> Result<(), ApiError> {
-    let (values, start_time_s, layout) = match &read_model.execution_plan.backend_plan {
-        fullmag_ir::BackendPlanIR::Fdm(plan) => (
-            &plan.initial_magnetization,
-            plan.time_stage.start_time_s,
-            serde_json::json!({"backend": "fdm", "grid_cells": plan.grid.cells}),
-        ),
-        fullmag_ir::BackendPlanIR::Fem(plan) => (
-            &plan.initial_magnetization,
-            plan.time_stage.start_time_s,
-            serde_json::json!({"backend": "fem", "location": "node", "node_count": plan.mesh.nodes.len()}),
-        ),
-        _ => return Ok(()),
-    };
+    let (values, start_time_s, layout): (Vec<[f64; 3]>, f64, Value) =
+        match &read_model.execution_plan.backend_plan {
+            fullmag_ir::BackendPlanIR::Fdm(plan) => (
+                plan.initial_magnetization.clone(),
+                plan.time_stage.start_time_s,
+                serde_json::json!({"backend": "fdm", "grid_cells": plan.grid.cells}),
+            ),
+            fullmag_ir::BackendPlanIR::FdmMultilayer(_) => {
+                let (values, layout) = prepared_multilayer_initial_state(&read_model.execution_plan)?;
+                (values, 0.0, layout)
+            }
+            fullmag_ir::BackendPlanIR::Fem(plan) => (
+                plan.initial_magnetization.clone(),
+                plan.time_stage.start_time_s,
+                serde_json::json!({"backend": "fem", "location": "node", "node_count": plan.mesh.nodes.len()}),
+            ),
+            _ => return Ok(()),
+        };
     if values.is_empty()
         || values.iter().flatten().any(|value| !value.is_finite())
         || !start_time_s.is_finite()
@@ -1614,6 +1705,143 @@ mod tests {
                 },
             },
         }
+    }
+
+    fn prepared_multilayer_read_model() -> LiveScenePreparationReadModel {
+        let layer = |layer_id: &str,
+                     object_id: &str,
+                     magnet_name: &str,
+                     native_grid: [u32; 3],
+                     native_origin: [f64; 3],
+                     initial_magnetization: Vec<[f64; 3]>| {
+            fullmag_ir::FdmLayerPlanIR {
+                magnet_name: magnet_name.into(),
+                layer_id: layer_id.into(),
+                object_id: object_id.into(),
+                native_grid,
+                native_cell_size: [1.0, 1.0, 1.0],
+                native_origin,
+                native_active_mask: None,
+                native_region_mask: None,
+                native_region_legend: None,
+                initial_magnetization,
+                material: fullmag_ir::FdmMaterialIR::default(),
+                convolution_grid: [2, 1, 2],
+                convolution_cell_size: [1.0, 1.0, 1.0],
+                convolution_origin: [0.0, 0.0, 0.0],
+                transfer_kind: "identity".into(),
+            }
+        };
+        let multilayer = fullmag_ir::FdmMultilayerPlanIR {
+            mode: "two_d_stack".into(),
+            common_cells: [2, 1, 2],
+            requested_common_cell_size: None,
+            grid_certificate: None,
+            layers: vec![
+                layer(
+                    "layer:top",
+                    "object:top",
+                    "top",
+                    [2, 1, 1],
+                    [0.0, 0.0, 0.0],
+                    vec![[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+                ),
+                layer(
+                    "layer:bottom",
+                    "object:bottom",
+                    "bottom",
+                    [1, 1, 2],
+                    [0.0, 0.0, 2.0],
+                    vec![[3.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+                ),
+            ],
+            frozen_spins: None,
+            enable_exchange: false,
+            enable_demag: true,
+            fft: None,
+            external_field: None,
+            interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
+            bulk_dmi: None,
+            gyromagnetic_ratio: 1.0,
+            precision: fullmag_ir::ExecutionPrecision::Double,
+            precision_policy: fullmag_ir::FdmPrecisionPolicyIR::default(),
+            exchange_bc: fullmag_ir::ExchangeBoundaryCondition::Neumann,
+            periodicity: None,
+            resolved_periodic_images: None,
+            integrator: fullmag_ir::IntegratorChoice::Heun,
+            fixed_timestep: Some(1e-13),
+            field_refresh: None,
+            relaxation: None,
+            planner_summary: fullmag_ir::FdmMultilayerSummaryIR {
+                requested_strategy: "multilayer_convolution".into(),
+                selected_strategy: "multilayer_convolution".into(),
+                requested_mode: "two_d_stack".into(),
+                resolved_mode: "two_d_stack".into(),
+                eligibility: "eligible".into(),
+                estimated_pair_kernels: 1,
+                estimated_unique_kernels: 1,
+                estimated_kernel_bytes: 0,
+                warnings: Vec::new(),
+            },
+        };
+        let mut model = prepared_fem_read_model(true);
+        model.requested_execution.backend = "fdm".into();
+        model.execution_plan.common.requested_backend = fullmag_ir::BackendTarget::Fdm;
+        model.execution_plan.common.resolved_backend = fullmag_ir::BackendTarget::Fdm;
+        model.execution_plan.backend_plan = fullmag_ir::BackendPlanIR::FdmMultilayer(multilayer);
+        model
+    }
+
+    #[test]
+    fn prepared_multilayer_initial_state_preserves_native_layer_offsets() {
+        let request: CurrentLiveSnapshotRequest = serde_json::from_value(json!({
+            "session_id": "prepared-multilayer-session",
+        }))
+        .unwrap();
+        let mut snapshot = crate::session::default_current_live_state(&request);
+        snapshot.metadata = Some(json!({
+            "artifact_layout": {
+                "backend": "fdm_multilayer",
+                "stale_marker": "previous-run",
+                "layers": [{"layer_id": "layer:top", "value_offset": 999, "value_count": 999}]
+            }
+        }));
+        let model = prepared_multilayer_read_model();
+        let (metadata, mesh) = prepared_domain_publication(&snapshot, &model).unwrap();
+        assert!(mesh.is_none());
+        assert_eq!(metadata["artifact_layout"]["backend"], "fdm_multilayer");
+        assert!(metadata["artifact_layout"].get("stale_marker").is_none());
+        assert_eq!(metadata["artifact_layout"]["layers"][0]["value_offset"], 0);
+        assert_eq!(metadata["artifact_layout"]["layers"][0]["value_count"], 2);
+        assert_eq!(metadata["artifact_layout"]["layers"][1]["value_offset"], 2);
+        assert_eq!(metadata["artifact_layout"]["layers"][1]["value_count"], 2);
+
+        let mut publication: CurrentLiveSnapshotRequest = serde_json::from_value(json!({
+            "session_id": "prepared-multilayer-session",
+        }))
+        .unwrap();
+        publication.metadata = Some(metadata);
+        crate::session::apply_current_live_snapshot(&mut snapshot, publication).unwrap();
+        publish_prepared_initial_state(&mut snapshot, &model).unwrap();
+
+        let field = snapshot.latest_fields.get("m").expect("initial m field");
+        assert_eq!(
+            field["values"],
+            json!([
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0]
+            ])
+        );
+        assert_eq!(field["layout"]["backend"], "fdm_multilayer");
+        assert!(field["layout"].get("grid_cells").is_none());
+        assert_eq!(field["layout"]["layers"][0]["native_grid"], json!([2, 1, 1]));
+        assert_eq!(field["layout"]["layers"][1]["native_grid"], json!([1, 1, 2]));
+        assert_eq!(field["layout"]["layers"][1]["value_offset"], 2);
+        assert_eq!(field["source_time_seconds"], 0.0);
+        assert!(snapshot.scalar_rows.is_empty());
     }
 
     #[test]

@@ -120,10 +120,12 @@ pozostają podstawą retry/replay; nie cofamy durable preparation ani nie
 uruchamiamy drugiego solvera. Brak zgodnego read modelu nadal blokuje zwolnienie
 manualnego gate przez startup.
 
-W tym checkpointcie pole początkowe obejmuje pojedynczy FDM i FEM.
-Multilayer wymaga jeszcze publikacji kanonicznych descriptorów native warstw;
-sama konkatenacja wartości nie może być traktowana jako pole common-grid.
-Ten wariant pozostaje jawnie NOT VERIFIED i nie stanowi zamknięcia celu.
+Pole początkowe obejmuje pojedynczy FDM, FEM oraz FDM multilayer. Multilayer
+używa kanonicznego layoutu runnera: niezależnych native grids i offsetów
+wartości. Bieżący pinned plan zastępuje wcześniejszy artifact_layout nawet
+wtedy, gdy poprzedni layout również należał do multilayer. Regresja obejmuje
+dwie różne siatki warstw i stary błędny offset; parser Rust przechodzi.
+Kompilacja regresji w CI i runtime pozostają NOT VERIFIED.
 Przełączenie metadata FEM → fdm_multilayer czyści poprzednią typed siatkę FEM.
 
 Review projectora wykrył jeszcze brak jawnego bindingu późniejszego stanu do
@@ -132,3 +134,10 @@ liczba węzłów nie dowodzi zgodnej topologii. Przed odbiorem wymagane są
 publikacja pinned preparation właściwego etapu i regresja dwóch topologii
 o tej samej liczbie węzłów. Ten checkpoint służy kompilacji CI, nie jest
 kwalifikacją poprawnego wykonania całego Study ani zgodą na merge.
+
+CI checkpointu `916e2c3d8` wykrył osiem błędów kompilacji nowej ścieżki API.
+Commit `a3154eadc` poprawia ownership Arc pod transition guard, typ wyniku
+mutacji journalu oraz pełny ExecutionProfileIR zamiast referencji. Lookup
+katalogu sprawdza również hash i treść authored profilu. Cztery regresje
+journalu mają jawne selektory CI. Bootstrap run `38786312168` jest w toku;
+wynik parsera nie zastępuje jego kompilacji.
