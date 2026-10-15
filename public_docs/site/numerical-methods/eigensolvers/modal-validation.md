@@ -1,6 +1,6 @@
 ---
-title: Modal Validation and Dispersion Qualification
-status: implemented
+title: Modal Validation
+status: partial
 doc_kind: reference
 audience: user
 owner: fullmag-public-docs

@@ -1,13 +1,13 @@
 ---
-title: Frequency-Domain Solvers
-status: partial
-doc_kind: architecture
+title: Frequency Domain
+status: implemented
+doc_kind: reference
 audience: user
 owner: fullmag-public-docs
 source_of_truth: docs/physics/0700-frequency-domain-linearized-llg.md
 ---
 
-(public-docs-numerical-methods-frequency-domain-index)=
+(public-docs-numerical-methods-frequency-domain-root)=
 (numerical-methods-frequency-domain-index)=
 # Frequency-domain solvers
 

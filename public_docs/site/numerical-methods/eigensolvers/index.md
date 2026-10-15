@@ -1,13 +1,13 @@
 ---
 title: Eigensolvers
 status: implemented
-doc_kind: architecture
+doc_kind: reference
 audience: user
 owner: fullmag-public-docs
 source_of_truth: docs/physics/0600-fem-eigenmodes-linearized-llg.md
 ---
 
-(public-docs-numerical-methods-eigensolvers-index)=
+(public-docs-numerical-methods-eigensolvers-root)=
 (numerical-methods-eigensolvers-index)=
 # Eigensolvers
 

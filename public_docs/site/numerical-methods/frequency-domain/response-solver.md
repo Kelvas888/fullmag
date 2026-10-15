@@ -1,5 +1,5 @@
 ---
-title: Driven Frequency-Response Solver
+title: Response Solver
 status: partial
 doc_kind: reference
 audience: user

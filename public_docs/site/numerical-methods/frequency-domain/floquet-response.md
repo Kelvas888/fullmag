@@ -1,5 +1,5 @@
 ---
-title: Floquet Frequency-Domain Response
+title: Floquet Response
 status: partial
 doc_kind: reference
 audience: user

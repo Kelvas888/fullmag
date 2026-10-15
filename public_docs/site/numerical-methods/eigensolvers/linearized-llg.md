@@ -1,6 +1,6 @@
 ---
-title: Linearized LLG Eigenvalue Problem
-status: implemented
+title: Linearized LLG
+status: partial
 doc_kind: reference
 audience: user
 owner: fullmag-public-docs
