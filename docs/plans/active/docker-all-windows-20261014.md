@@ -254,3 +254,10 @@ Managed job `5d3a5982650b47fea8b3f214caa959ea` nadal jest przypięty do czystego
 ### Checkpoint — zgodne ustawienie wątków bramek Python
 
 Scoped Gmsh CI `38654772329` przeszedł pełny zestaw 338 testów z `FULLMAG_GMSH_THREADS=1`. Bootstrap Python contracts `116161809040` nie miał tego ustawienia i otrzymał różne sygnatury w tej samej bramce invariance. Job `python-contracts` otrzymuje identyczne ustawienie jednego wątku; zakres pozostaje wyłącznie CI. YAML parse i kontrola diff: PASS. Nie powtarzano lokalnie pełnego zestawu ani nie kompilowano testów jednostkowych. Nowy wynik Bootstrap wymaga CI. Produkcyjne źródła pakietu fa608 pozostają bez zmian; tożsamości artefaktu nie przepisujemy na późniejszy commit.
+
+
+### Checkpoint — izolacja bramki blokady manifestu
+
+CI bdb74: pełny scoped Gmsh i Python contracts PASS. Ubuntu terminal-artifact-attestation `38657642161` / job `116171098417` miał 48 PASS i jeden błąd WouldBlock w eligible_attestation_read_failure_preserves_running_manifest_for_retry. Nie znaleziono dowodu wycieku guardu; krótkie dziedziczenie deskryptora przy równoległym fork/spawn pozostaje hipotezą, nie dowiedzioną przyczyną. Wyłącznie ten binarny zestaw CI otrzymuje --test-threads=1, aby izolować niezależne testy flock od testu tworzącego proces potomny. Test rzeczywistej blokady między procesami i wszystkie asercje pozostają aktywne; runtime i locki nie są zmieniane. YAML/parser i diff check PASS; kompilacja oraz wynik pozostają do potwierdzenia wyłącznie w CI.
+
+Agent omyłkowo edytował workflow w main. Native Git wykazał wyłącznie własny dwuliniowy fragment; przeniesiono go do worktree zadania i odtworzono dokładny fragment main bez nadpisywania innych kroków ani cudzych zmian.
