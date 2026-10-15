@@ -11,6 +11,7 @@ import io
 import importlib.util
 import json
 import os
+import runpy
 import signal
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "docker" / "all-in-one" / "frontend_dev.py"
+HEALTHCHECK_PATH = MODULE_PATH.with_name("healthcheck.py")
 
 
 def load_module() -> ModuleType:
@@ -142,6 +144,58 @@ class FrontendDevContractTests(TestCase):
         self.assertFalse(self.module.enabled({"FULLMAG_DOCKER_FRONTEND": "DEV"}))
         self.assertFalse(self.module.enabled({}))
         self.assertEqual(self.module.EXPECTED_PNPM_VERSION, "10.8.1")
+
+    def test_frontend_healthcheck_requires_workspace_2xx_without_redirect(self):
+        import urllib.error
+        import urllib.request
+
+        class Response:
+            def __init__(self, status):
+                self.status = status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        class Opener:
+            def __init__(self, status):
+                self.status = status
+                self.requests = []
+
+            def open(self, request, timeout):
+                self.requests.append((request, timeout))
+                if self.status != 200:
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        self.status,
+                        "mock healthcheck response",
+                        {},
+                        None,
+                    )
+                return Response(self.status)
+
+        for status in (200, 307, 500):
+            with self.subTest(status=status):
+                opener = Opener(status)
+                with patch.dict(
+                    os.environ,
+                    {"FULLMAG_DOCKER_ROLE": "frontend", "FULLMAG_DOCKER_FRONTEND": "dev"},
+                    clear=False,
+                ):
+                    with patch.object(urllib.request, "build_opener", return_value=opener):
+                        if status == 200:
+                            runpy.run_path(str(HEALTHCHECK_PATH), run_name="__main__")
+                        else:
+                            with self.assertRaises(urllib.error.HTTPError) as raised:
+                                runpy.run_path(str(HEALTHCHECK_PATH), run_name="__main__")
+                            self.assertEqual(raised.exception.code, status)
+                self.assertEqual(len(opener.requests), 1)
+                request, timeout = opener.requests[0]
+                self.assertEqual(request.full_url, "http://127.0.0.1:8080/workspace")
+                self.assertEqual(request.method, "HEAD")
+                self.assertEqual(timeout, 2)
 
     def test_tool_version_logs_bounded_success_with_elapsed_time(self):
         log_stream = io.BytesIO()
