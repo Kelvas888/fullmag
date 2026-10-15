@@ -73,6 +73,53 @@ class StorageTests(unittest.TestCase):
             self.resolve(profile="windows-native")
         self.assertFalse((self.repo / "storage").exists())
 
+    def test_registered_main_checkout_storage_is_explicit_and_shared(self):
+        custom = self.repo / "storage"
+        custom.mkdir()
+        (custom / ".fullmag-storage.json").write_text(json.dumps({
+            "schema": storage.SCHEMA, "project_root": str(self.project)}))
+        self.assertEqual(Path(self.resolve()["storage_root"]), self.project / "storage")
+        (self.repo / ".env").write_text(f'FULLMAG_PROJECT_STORAGE_ROOT="{custom}"\n')
+        main = self.resolve()
+        self.assertEqual(Path(main["storage_root"]), custom)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c",
+                        "user.email=test@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "fixture"], check=True)
+        worktree = self.project / "worktrees" / "task"
+        subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "--quiet", "--detach", str(worktree)], check=True)
+        other = storage.resolve_layout(worktree, profile="test", environ={})
+        self.assertEqual(other["storage_root"], main["storage_root"])
+        self.assertNotEqual(other["build_root"], main["build_root"])
+
+    def test_main_checkout_storage_rejects_foreign_marker(self):
+        custom = self.repo / "storage"
+        custom.mkdir()
+        (custom / ".fullmag-storage.json").write_text(json.dumps({
+            "schema": storage.SCHEMA, "project_root": str(self.project / "foreign")}))
+        self.env["FULLMAG_PROJECT_STORAGE_ROOT"] = str(custom)
+        with self.assertRaises(storage.StorageError):
+            self.resolve()
+
+    def test_registered_other_checkout_descendant_is_rejected(self):
+        for relative in ("other-storage", "nested/storage", "storage/nested"):
+            custom = self.repo / relative
+            custom.mkdir(parents=True, exist_ok=True)
+            (custom / ".fullmag-storage.json").write_text(json.dumps({
+                "schema": storage.SCHEMA, "project_root": str(self.project)}))
+            self.env["FULLMAG_PROJECT_STORAGE_ROOT"] = str(custom)
+            with self.subTest(path=relative), self.assertRaises(storage.StorageError):
+                self.resolve()
+
+    def test_registered_main_storage_cannot_contain_additional_worktree(self):
+        custom = self.repo / "storage"
+        custom.mkdir()
+        (custom / ".fullmag-storage.json").write_text(json.dumps({
+            "schema": storage.SCHEMA, "project_root": str(self.project)}))
+        self.env["FULLMAG_PROJECT_STORAGE_ROOT"] = str(custom)
+        records = [{"worktree": str(self.repo)}, {"worktree": str(custom / "task")}]
+        with patch.object(storage, "worktree_records", return_value=records):
+            with self.assertRaises(storage.StorageError):
+                self.resolve()
+
     def test_inventory_ignores_non_registration_json_arrays(self):
         layout = self.resolve()
         index = Path(layout["storage_root"]) / "index"

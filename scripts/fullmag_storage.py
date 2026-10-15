@@ -296,7 +296,12 @@ def resolve_layout(repo_root, profile=None, environ=None):
         # their relative spelling as a directory in the current checkout.
         if candidate.is_absolute():
             checkouts.append(candidate.resolve())
+    # Compatibility for an operator-registered storage directory in the main
+    # checkout only. All other checkout and worktree overlaps remain forbidden.
+    registered_main_storage = bool(env.get("FULLMAG_PROJECT_STORAGE_ROOT")) and marker.is_file() and root == main_repo / "storage"
     for checkout in checkouts:
+        if checkout == main_repo and registered_main_storage:
+            continue
         if inside(root, checkout) or inside(checkout, root):
             raise StorageError(f"Storage must be outside the repository and all worktrees: {root} overlaps {checkout}")
     wt = identifier(repo)
