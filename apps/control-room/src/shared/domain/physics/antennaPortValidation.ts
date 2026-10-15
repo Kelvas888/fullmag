@@ -8,9 +8,16 @@ function portStructureMessages(
   mode: AntennaPortModeResource,
 ): string[] {
   const messages: string[] = [];
-  if (mode.schema_version !== "antenna_port_mode.v2") {
-    messages.push("schema must be antenna_port_mode.v2");
+  const closedLoop = mode.schema_version === "antenna_port_mode.v3";
+  if (mode.schema_version !== "antenna_port_mode.v2" && !closedLoop) {
+    messages.push("schema must be antenna_port_mode.v2 or antenna_port_mode.v3");
   }
+  const normalization = record(record(mode)?.normalization);
+  if (closedLoop && (normalization?.kind !== "source_cut_rt0" || !text(normalization.source_cut_ref)
+      || normalization.orientation !== "minus_outward")) {
+    messages.push("v3 normalization requires an explicit source_cut_rt0 reference with minus_outward orientation");
+  }
+  if (!closedLoop && normalization) messages.push("source-cut normalization requires explicit port v3");
   if (mode.branches.length < 2) {
     messages.push("requires at least two branches");
   }
@@ -44,18 +51,18 @@ function portStructureMessages(
   let positiveWeight = 0;
   let hasNegativeWeight = false;
   for (const branch of mode.branches) {
-    if (!Number.isFinite(branch.signed_weight) || branch.signed_weight === 0) {
-      messages.push(`branch ${branch.id} weight must be finite and non-zero`);
+    if (!Number.isFinite(branch.signed_weight) || (!closedLoop && branch.signed_weight === 0)) {
+      messages.push(`branch ${branch.id} weight must be ${closedLoop ? "finite" : "finite and non-zero"}`);
       continue;
     }
     totalWeight += branch.signed_weight;
     if (branch.signed_weight > 0) positiveWeight += branch.signed_weight;
     if (branch.signed_weight < 0) hasNegativeWeight = true;
   }
-  if (Math.abs(positiveWeight - 1) > 1e-12 || !hasNegativeWeight) {
+  if (!closedLoop && (Math.abs(positiveWeight - 1) > 1e-12 || !hasNegativeWeight)) {
     messages.push("positive branch weights must sum to 1 and include a return branch");
   }
-  if (Math.abs(totalWeight) > 1e-12) {
+  if (!closedLoop && Math.abs(totalWeight) > 1e-12) {
     messages.push("all branch weights must sum to 0");
   }
   return messages;
@@ -70,6 +77,43 @@ function record(value: unknown): RecordValue | null {
 
 function text(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && !value.includes("\0");
+}
+
+/** v3 uses its explicit source cut, never legacy boundary-current normalization. */
+function closedLoopReferenceMessages(mode: AntennaPortModeResource, transport: RecordValue): string[] {
+  const normalization = record(record(mode)?.normalization);
+  const authored = record(transport.structured_current_closure);
+  const prepared = record(transport.conservative_current_source);
+  const pending = authored?.kind === "closed_geometry" && authored.schema_version === "structured_current_closure.v2";
+  const source = prepared?.kind === "closed_geometry_potential_jump" && prepared.schema_version === "conservative_current_source.v2"
+    ? prepared : null;
+  const closure = pending ? authored : record(source?.closure);
+  const cuts = Array.isArray(closure?.source_cuts) ? closure.source_cuts.map(record) : [];
+  const cutId = cuts.length === 1 ? cuts[0]?.[pending ? "source_cut_id" : "id"] : null;
+  const messages: string[] = [];
+  if ((!pending && (!source || closure?.kind !== "closed_geometry")) || !text(cutId)
+      || normalization?.source_cut_ref !== cutId) {
+    messages.push("v3 port requires its exact single authored or prepared closed-loop source cut");
+    return messages;
+  }
+  if (pending) {
+    if (record(cuts[0]?.region)?.object_id !== mode.source_object_id) messages.push("source cut belongs to a different object");
+    return messages;
+  }
+  if (source?.object_id !== mode.source_object_id || mode.branches.length !== 2) {
+    messages.push("prepared v3 requires two observed branches of the same source object");
+  }
+  const observations = Array.isArray(source?.terminal_observations) ? source.terminal_observations.map(record) : [];
+  for (const branch of mode.branches) {
+    const inlet = observations.filter((item) => item?.id === branch.inlet_terminal_ref);
+    const outlet = observations.filter((item) => item?.id === branch.outlet_terminal_ref);
+    if (inlet.length !== 1 || outlet.length !== 1 || !text(inlet[0]?.part_id)
+        || inlet[0]?.part_id !== outlet[0]?.part_id || inlet[0]?.selector !== "local_u_min"
+        || outlet[0]?.selector !== "local_u_max") {
+      messages.push(`branch '${branch.id}' requires unique inlet/outlet observations on the same conductor part`);
+    }
+  }
+  return messages;
 }
 
 /** Only reference authoring is checked here; native mesh/source validation remains authoritative. */
@@ -95,12 +139,20 @@ function portReferenceMessages(mode: AntennaPortModeResource, scene: SceneResour
     messages.push(`current transport '${mode.current_transport_id}' requires static one-way OhmicPoisson authoring`);
     return messages;
   }
+  if (transport.structured_current_closure != null && transport.conservative_current_source != null) {
+    messages.push("current transport cannot combine structured_current_closure with conservative_current_source; choose one explicit source");
+    return messages;
+  }
   const domain = transport.domain;
   if (!Array.isArray(domain) || domain.length === 0 || domain.some((region) => !text(record(region)?.object_id))) {
     messages.push(`current transport '${mode.current_transport_id}' has an unavailable or malformed domain`);
     return messages;
   }
   const domainObjects = new Set(domain.map((region) => record(region)!.object_id as string));
+  if (mode.schema_version === "antenna_port_mode.v3") {
+    if (!domainObjects.has(mode.source_object_id)) messages.push("v3 source object is outside the transport domain");
+    return [...messages, ...closedLoopReferenceMessages(mode, transport)];
+  }
   const terminals = new Map<string, { objectId: string | null; valid: boolean }>();
   let inventory: unknown[];
   let inventoryKind: string;

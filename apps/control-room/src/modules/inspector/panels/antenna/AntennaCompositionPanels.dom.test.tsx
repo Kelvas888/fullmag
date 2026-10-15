@@ -1065,7 +1065,7 @@ describe("AntennaCompositionPanel runtime results", () => {
       const unrelatedInput = find("INPUT", "Station 2 signal width");
       Object.getOwnPropertyDescriptor(TestElement.prototype, "value")?.set?.call(input, "60e-9");
       await act(async () => input.dispatchEvent(new TestEvent("input", { bubbles: true })));
-      await act(async () => find("BUTTON", "Save width stations").dispatchEvent(new TestEvent("click", { bubbles: true })));
+      await act(async () => find("BUTTON", "Save conductor authoring").dispatchEvent(new TestEvent("click", { bubbles: true })));
       expect(mocks.commitTransaction).toHaveBeenCalledWith(expect.objectContaining({
         kind: "patch_object_geometry", object_id: "antenna-1", base_revision: 4,
         geometry: expect.objectContaining({ geometry_params: expect.objectContaining({
@@ -1116,11 +1116,11 @@ describe("AntennaCompositionPanel runtime results", () => {
       } }] } as unknown as SceneResource;
       await act(async () => root.render(<AntennaGeometryPanel selection={{ ...conductorSelection(), kind: "object.antenna.geometry" }} />));
       expect(container.textContent).toContain("Conductor geometry changed on the server");
-      expect(find("BUTTON", "Save width stations").disabled).toBe(true);
+      expect(find("BUTTON", "Save conductor authoring").disabled).toBe(true);
       expect(mocks.commitTransaction).not.toHaveBeenCalled();
       expect(input.value).toBe("60e-9");
       await act(async () => find("BUTTON", "Rebase draft").dispatchEvent(new TestEvent("click", { bubbles: true })));
-      expect(find("BUTTON", "Save width stations").disabled).toBe(false);
+      expect(find("BUTTON", "Save conductor authoring").disabled).toBe(false);
     } finally {
       await act(async () => root.unmount());
       dom.restore();

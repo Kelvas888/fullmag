@@ -20,7 +20,7 @@ import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus
 import type { KernelApi } from "@/kernel/types";
 import { MicrostripGeometryEditor } from "@/modules/inspector/panels/antenna/MicrostripGeometryEditor";
 import { AntennaConductorDetails } from "@/modules/inspector/panels/antenna/AntennaCompositionPanels";
-import { EMPTY_SELECTION } from "@/kernel/selection/selectionTypes";
+import { EMPTY_SELECTION, type Selection } from "@/kernel/selection/selectionTypes";
 import { buildObjectExplorerNode } from "@/modules/explorer/builders/objectExplorerNodes";
 import { selectionRefFromNode } from "@/modules/explorer/explorerSelection";
 import { resolveInspectorRoute } from "@/modules/inspector/inspectorRouteCatalog";
@@ -33,11 +33,16 @@ const serverHydrated = () => false;
 
 interface Call { method: string; path: string; scope: string | null; revision: number; body: unknown; }
 interface FixtureControl {
+  selectGeometry(objectId: string): void;
+  readSelection(): Selection;
+  subscribeSelection(listener: () => void): () => void;
   read(): { calls: Call[]; pendingWrites: number; pendingSceneReads: number; renderCommits: number; revision: number; scene: SceneResource; unexpected: string[]; invalidations: { resourceKey: string; revision: unknown }[] };
+  corruptNextCircuitAck(): void;
   releaseWrite(): void;
   refreshUnrelated(): void;
   releaseScene(): void;
   insertFormerPosition(): void;
+  resizeLengthOnServer(lengthM: number): void;
   createAntenna(layout: "microstrip" | "cpw"): Promise<CommandResult>;
 }
 declare global { interface Window { __antennaStationsFixture?: FixtureControl; } }
@@ -68,6 +73,7 @@ function makeFixture() {
   const calls: Call[] = [];
   const unexpected: string[] = [];
   const invalidations: { resourceKey: string; revision: unknown }[] = [];
+  let corruptCircuitAck = false;
   const pendingWrites: (() => void)[] = [];
   const pendingSceneReads: (() => void)[] = [];
   const bus = new EventBus<KernelEventMap>();
@@ -107,7 +113,12 @@ function makeFixture() {
           return new Promise<Response>((resolve) => pendingWrites.push(() => {
             const revision = Number(state.scene.revision) + 1;
             state.scene = { ...state.scene, ...structuredClone(transaction.merge_patch), revision, scene_revision: revision } as SceneResource;
-            resolve(json({ scene_revision: revision, transaction_kind: transaction.kind, committed_scene: structuredClone(state.scene) }));
+            const acknowledged = structuredClone(state.scene);
+            if (corruptCircuitAck) {
+              corruptCircuitAck = false;
+              acknowledged.antenna_port_modes = acknowledged.antenna_port_modes?.map(port => ({ ...port, normalization: null }));
+            }
+            resolve(json({ scene_revision: revision, transaction_kind: transaction.kind, committed_scene: acknowledged }));
           }));
         }
         if (transaction.kind !== "patch_object_geometry" || transaction.object_id !== OBJECT_ID || transaction.base_revision !== state.scene.revision) {
@@ -125,15 +136,38 @@ function makeFixture() {
     },
   });
   // Production hooks, shared cache, API facade and editor are not replaced.
-  const kernel = { api, bus, resources, diagnostics, diagnosticRecorder } as unknown as KernelApi;
   const selection = new SelectionController(bus);
+  const inspector = typeof window === "undefined" ? null : new URL(window.location.href).searchParams.get("inspector");
+  const charge = typeof window === "undefined" ? null : new URL(window.location.href).searchParams.get("charge");
+  if (inspector === "conductor" && charge !== "none") {
+    const parts = (geometry.geometry_params as JsonObject).conductors as JsonObject[];
+    state.scene.current_transports = [{ name: "explicit-charge", kind: "current_transport", model: "ohmic_poisson", domain: [{ object_id: OBJECT_ID }],
+      materials: charge === "empty" ? [] : parts.map((part, index) => ({ region: { object_id: OBJECT_ID, region_id: String(part.id) }, material: { sigma_Spm: index ? 4.1e7 : 3.2e7 } })) }];
+  }
+  if (inspector === "geometry" || inspector === "conductor") {
+    const object = buildObjectExplorerNode({ id: OBJECT_ID, label: "Antenna", objectRole: "antenna" }, {});
+    const node = inspector === "geometry" ? object.children?.find(child => child.kind === "object.antenna.geometry")
+      : object.children?.flatMap(child => child.children ?? []).find(child => child.kind === "object.antenna.conductor");
+    if (!node) throw new Error("Production antenna route node is missing");
+    selection.set({ ...EMPTY_SELECTION, kind: node.kind, objectId: OBJECT_ID, nodeId: node.id, ref: selectionRefFromNode(node) }, "explorer");
+  }
+  const kernel = { api, bus, resources, diagnostics, diagnosticRecorder, selection } as unknown as KernelApi;
   const control: FixtureControl = {
+    selectGeometry: (objectId) => {
+      if (!state.scene.objects?.some(object => object.id === objectId)) throw new Error("Unknown fixture object");
+      const node = buildObjectExplorerNode({ id: objectId, label: "Antenna", objectRole: "antenna" }, {}).children?.find(child => child.kind === "object.antenna.geometry");
+      if (!node) throw new Error("Production Geometry route is missing");
+      selection.set({ ...EMPTY_SELECTION, kind: node.kind, objectId, nodeId: node.id, ref: selectionRefFromNode(node) }, "explorer");
+    },
+    readSelection: () => selection.get(),
+    subscribeSelection: listener => selection.subscribe(listener),
     createAntenna: async (layout) => {
       const command = GEOMETRY_LIFECYCLE_COMMANDS.find((entry) => entry.id === `geometry.add-${layout}-antenna`);
       if (!command) throw new Error("Production antenna command is absent");
       return command.run({ source: "ribbon", api, resources, selection, sessionScopeKey: expectedScope, isCurrentSessionScope: () => true });
     },
     read: () => ({ calls: structuredClone(calls), pendingWrites: pendingWrites.length, pendingSceneReads: pendingSceneReads.length, renderCommits: state.renderCommits, revision: Number(state.scene.revision), scene: structuredClone(state.scene), unexpected: [...unexpected], invalidations: [...invalidations] }),
+    corruptNextCircuitAck: () => { corruptCircuitAck = true; },
     releaseWrite: () => {
       const release = pendingWrites.shift();
       if (!release) throw new Error("No fixture write is pending");
@@ -147,6 +181,17 @@ function makeFixture() {
       resources.invalidate(SESSION_STATUS_RESOURCE_KEY, revision);
     },
     releaseScene: () => { state.holdScene = false; for (const release of pendingSceneReads.splice(0)) release(); },
+    resizeLengthOnServer: (lengthM) => {
+      if (!Number.isFinite(lengthM) || lengthM <= 0) throw new Error("Invalid fixture length");
+      const revision = Number(state.scene.revision) + 1;
+      state.scene = { ...state.scene, revision, scene_revision: revision, objects: state.scene.objects?.map((entry) => {
+        if (entry.id !== OBJECT_ID) return entry;
+        const geometry = entry.geometry as JsonObject;
+        return { ...entry, geometry: { ...geometry, geometry_params: { ...geometry.geometry_params as JsonObject, length_m: lengthM } } };
+      }) };
+      resources.invalidate(MODEL_SCENE_PATH, revision);
+      resources.invalidate(SESSION_STATUS_RESOURCE_KEY, revision);
+    },
     insertFormerPosition: () => {
       const object = state.scene.objects?.find((entry) => entry.id === OBJECT_ID);
       const current = object?.geometry as JsonObject | undefined;
@@ -163,14 +208,14 @@ function makeFixture() {
   return { kernel, control, onRender: () => { state.renderCommits += 1; } };
 }
 
-function EditorHarness() {
+function EditorHarness({ control }: { control: FixtureControl }) {
+  const selected = useSyncExternalStore(control.subscribeSelection, control.readSelection, () => EMPTY_SELECTION);
   const resource = useSceneResource();
   const created = resource.data?.objects?.findLast((object) => object.id !== OBJECT_ID);
-  const geometryInspector = new URL(window.location.href).searchParams.get("inspector") === "geometry";
-  const node = buildObjectExplorerNode({ id: OBJECT_ID, label: "Antenna", objectRole: "antenna" }, {}).children?.find((child) => child.id.endsWith(":geometry"));
-  const GeometryPanel = node ? resolveInspectorRoute(node.kind)?.component : undefined;
+  const routedInspector = new URL(window.location.href).searchParams.has("inspector");
+  const Panel = selected.kind === "object.antenna.geometry" || selected.kind === "object.antenna.conductor" ? resolveInspectorRoute(selected.kind)?.component : undefined;
   return <div data-testid="antenna-stations-editor" data-resource-status={resource.status} data-scene-revision={resource.data?.revision}>
-    {geometryInspector && GeometryPanel && node ? <GeometryPanel selection={{ ...EMPTY_SELECTION, kind: node.kind, objectId: OBJECT_ID, ref: selectionRefFromNode(node) }} /> : <MicrostripGeometryEditor objectId={OBJECT_ID} scene={resource.data} status={resource.status} refetch={resource.refetch} />}
+    {routedInspector && Panel ? <Panel selection={selected} /> : <MicrostripGeometryEditor objectId={OBJECT_ID} scene={resource.data} status={resource.status} refetch={resource.refetch} />}
     {created ? <div data-testid="antenna-created-details" data-object-id={created.id} style={{ width: 320, maxWidth: "100%" }}>
       <AntennaConductorDetails objectId={created.id} scene={resource.data} />
     </div> : null}
@@ -187,7 +232,7 @@ export default function AntennaMicrostripStationsFixturePage() {
     {mounted ? <KernelContext.Provider value={fixture.kernel}>
       <label>Persistent unrelated control <input data-testid="antenna-stations-unrelated" defaultValue="stable unrelated draft" /></label>
       <div data-testid="antenna-stations-scroll" style={{ height: 480, overflow: "auto", padding: 16, border: "1px solid var(--fm-border-subtle)" }}>
-        <Profiler id="antenna-stations" onRender={fixture.onRender}><EditorHarness /></Profiler>
+        <Profiler id="antenna-stations" onRender={fixture.onRender}><EditorHarness control={fixture.control} /></Profiler>
       </div>
     </KernelContext.Provider> : <p role="status">Loading fixture harness…</p>}
   </main>;

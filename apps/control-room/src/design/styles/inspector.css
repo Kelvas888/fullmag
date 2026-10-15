@@ -1063,6 +1063,23 @@
   border-radius: var(--fm-radius-sm);
 }
 
+.fm-antenna-circuit-part {
+  display: grid;
+  min-inline-size: 0;
+  margin: 0;
+  padding: var(--fm-space-2);
+  gap: var(--fm-inspector-control-gap);
+  border: 1px solid var(--fm-border-subtle);
+  border-radius: var(--fm-radius-sm);
+}
+
+.fm-antenna-circuit-part > legend {
+  padding-inline: var(--fm-space-1);
+  color: var(--fm-text-primary);
+  font-size: var(--fm-font-size-xs);
+  font-weight: 600;
+}
+
 .fm-microstrip-station-actions {
   display: flex;
   flex-wrap: wrap;
