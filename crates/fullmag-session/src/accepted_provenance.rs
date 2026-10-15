@@ -1397,7 +1397,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn context() -> AcceptedProvenanceContext {
+    pub(super) fn context() -> AcceptedProvenanceContext {
         AcceptedProvenanceContext {
             source_store_binding: format!("sha256:{}", "a".repeat(64)),
             accepted_run_id: "run-accepted".into(),
@@ -1521,6 +1521,7 @@ mod tests {
 #[cfg(test)]
 mod accepted_provenance_closure_tests {
     use super::*;
+    use super::tests::context;
     use crate::types::{
         FmsArtifactCatalogEntry, FmsArtifactStatus, FmsTaskCatalogEntry, FmsTaskLifecycle,
         FmsTaskReadiness, FMS_ARTIFACT_CATALOG_SCHEMA, FMS_RUN_CATALOG_SCHEMA,

@@ -137,6 +137,7 @@ impl PackEntry {
         Ok(Self {
             archive_path,
             snapshot: ArchiveFileSnapshot::capture(source)?,
+            inline_data: None,
         })
     }
 }
@@ -2560,7 +2561,7 @@ fn validate_v2_readonly_archive(preflight: &FmsStagedPreflight) -> Result<()> {
         if name.starts_with("objects/sha256/") {
             let object_ref =
                 cas_digest_from_path(name)?.context("v2 archive contains an invalid CAS path")?;
-            if !preflight.reachability.object_refs.contains(&object_ref) {
+            if !preflight.reachability.object_refs.contains(object_ref) {
                 bail!("v2 archive contains an unreferenced CAS object `{name}`");
             }
             continue;
