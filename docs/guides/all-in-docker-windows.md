@@ -313,8 +313,10 @@ w przypiętym builderze. Pierwszy start pobiera tylko zależności workspace.
 Zapis źródeł w tych czterech żywych katalogach jest wykrywany przez polling
 Watchpack (500 ms); Next aktualizuje stronę przez HMR i kompiluje ją przy
 pierwszym wejściu. Zmiany poza tymi katalogami nie są obietnicą HMR.
-Cold-start ma limit 35 minut, obejmujący instalację zależności z limitem 30 minut
-oraz przygotowanie API/Next; zwykły restart używa zachowanych
+Cold-start developerskiego frontendu ma limit 65 minut: obejmuje dwa bounded
+probe narzędzi po 120 sekund, instalację zależności z limitem 60 minut oraz
+60-sekundowy margines uruchomienia Next. Launcher używa 3900 sekund na
+gotowość dev i 3960 sekund na klienta Docker; zwykły restart używa zachowanych
 zależności. Cache, logi i `node_modules` pozostają w osobnym
 podkatalogu `state/development` kanonicznego storage Windows. Nie używamy
 hostowych `node_modules`, `.env` ani katalogu Git w kontenerze frontendu.

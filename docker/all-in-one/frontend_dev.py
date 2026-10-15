@@ -124,7 +124,7 @@ MAX_SEED_FILE_BYTES = 8 * 1024 * 1024
 MAX_SEED_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_SEED_FILES = 4096
 MAX_RELATIVE_BYTES = 512
-INSTALL_TIMEOUT_SECONDS = 30 * 60
+INSTALL_TIMEOUT_SECONDS = 60 * 60
 # The pinned pnpm executable can pay cold filesystem and initialization I/O on
 # its first invocation. Keep that probe bounded without making a healthy cold
 # container fail during ordinary startup latency.

@@ -25,6 +25,12 @@ from local_runner.worker_entrypoint import verify_source
 from run_managed_browser import digest, host_path, read_json, validate_managed_build
 
 PROFILE = "docker-all-gpu"
+# Development frontend grace covers both pinned tool probes, the cold pnpm
+# install on the Windows bind, and the bounded Next process startup margin.
+FRONTEND_DEV_READY_TIMEOUT_SECONDS = 3900
+FRONTEND_DEV_DOCKER_CLIENT_TIMEOUT_SECONDS = 3960
+# These remain the separate backend/startup-script contract. Static mode keeps
+# its short observation window below; it has no development frontend service.
 STARTUP_READY_TIMEOUT_SECONDS = 2400
 STARTUP_DOCKER_CLIENT_TIMEOUT_SECONDS = 2460
 REQUIRED_BINARIES = (
@@ -113,7 +119,9 @@ def _wait_for_startup_ready(state, authorization=None, *, startup_helper=None, t
 def _runtime_ready_timeouts(inputs, startup):
     """Return bounded wait/client budgets for the actual startup contract."""
 
-    if inputs is not None or startup is not None:
+    if inputs is not None:
+        return FRONTEND_DEV_READY_TIMEOUT_SECONDS, FRONTEND_DEV_DOCKER_CLIENT_TIMEOUT_SECONDS
+    if startup is not None:
         return STARTUP_READY_TIMEOUT_SECONDS, STARTUP_DOCKER_CLIENT_TIMEOUT_SECONDS
     return 90, 150
 

@@ -114,7 +114,8 @@ services:
         bind: {create_host_path: false}
     tmpfs: ["/tmp:rw,nosuid,nodev,size=512m"]
     healthcheck:
-      start_period: 1920s
+      # Two 120s tool probes + 60m frozen install + 60s Next startup margin.
+      start_period: 3900s
     networks: [fullmag]
 
 # A separate project-scoped bridge; no external networks, static IPs or host mode.

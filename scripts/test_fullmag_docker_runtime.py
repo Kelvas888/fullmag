@@ -3,6 +3,7 @@ import importlib.util
 import json
 import tempfile
 import os
+import re
 import sys
 import subprocess
 import unittest
@@ -64,7 +65,7 @@ class DockerRuntimeContract(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             self.assertEqual(run.call_args.kwargs["timeout"], 3)
 
-    def test_startup_script_uses_long_bounded_compose_wait_even_without_dev_frontend(self):
+    def test_dev_frontend_and_startup_script_use_distinct_bounded_compose_waits(self):
         import docker_startup_script as startup
         self.assertGreaterEqual(runtime.STARTUP_READY_TIMEOUT_SECONDS,
                                 startup.STARTUP_ACTIVATION_TIMEOUT_SECONDS + 60)
@@ -76,9 +77,26 @@ class DockerRuntimeContract(unittest.TestCase):
         )
         self.assertEqual(
             runtime._runtime_ready_timeouts({}, None),
-            (runtime.STARTUP_READY_TIMEOUT_SECONDS, runtime.STARTUP_DOCKER_CLIENT_TIMEOUT_SECONDS),
+            (runtime.FRONTEND_DEV_READY_TIMEOUT_SECONDS,
+             runtime.FRONTEND_DEV_DOCKER_CLIENT_TIMEOUT_SECONDS),
         )
         self.assertEqual(runtime._runtime_ready_timeouts(None, None), (90, 150))
+        self.assertGreaterEqual(
+            runtime.FRONTEND_DEV_READY_TIMEOUT_SECONDS,
+            2 * 120 + (60 * 60) + 60,
+        )
+        self.assertGreaterEqual(
+            runtime.FRONTEND_DEV_DOCKER_CLIENT_TIMEOUT_SECONDS,
+            runtime.FRONTEND_DEV_READY_TIMEOUT_SECONDS + 60,
+        )
+        repository = Path(__file__).resolve().parents[1]
+        dev_compose = (repository / "compose.dev.yaml").read_text(encoding="utf-8")
+        frontend_block = dev_compose.split("\n  frontend:\n", 1)[1]
+        health = re.search(r"(?m)^      start_period: (?P<seconds>[0-9]+)s$", frontend_block)
+        self.assertIsNotNone(health)
+        self.assertEqual(int(health.group("seconds")), runtime.FRONTEND_DEV_READY_TIMEOUT_SECONDS)
+        static_compose = (repository / "compose.static.yaml").read_text(encoding="utf-8")
+        self.assertNotIn("\n  frontend:", static_compose)
 
     def test_startup_receipt_requires_ready_matching_activation(self):
         authorization = {
