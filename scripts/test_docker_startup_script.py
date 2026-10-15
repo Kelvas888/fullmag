@@ -87,6 +87,11 @@ class DockerStartupScriptTests(unittest.TestCase):
             "request_id": "startup-test-4",
             "source_sha256": "b" * 64,
             "status": "waiting_for_solve",
+            "session_id": "session-startup-test-4",
+            "run_id": "run-startup-test-4",
+            "step_ids": ["step-startup-test-4"],
+            "scene_revision": 0,
+            "runtime_metadata": {"interactive": True, "wait_for_solve": True},
             "execution": {
                 "mode": "canonical_live_v2",
                 "auto_study": True,
@@ -118,6 +123,11 @@ class DockerStartupScriptTests(unittest.TestCase):
             "request_id": authorization["request_id"],
             "source_sha256": authorization["source_sha256"],
             "status": "waiting_for_solve",
+            "session_id": "session-startup-timeout",
+            "run_id": "run-startup-timeout",
+            "step_ids": ["step-startup-timeout"],
+            "scene_revision": 1,
+            "runtime_metadata": {"interactive": True, "wait_for_solve": True},
             "execution": {
                 "mode": "canonical_live_v2",
                 "auto_study": True,
@@ -150,7 +160,7 @@ class DockerStartupScriptTests(unittest.TestCase):
             result = startup.activate(authorization)
         self.assertEqual(result, response)
         self.assertEqual(observed["timeout"], startup.STARTUP_ACTIVATION_TIMEOUT_SECONDS)
-        self.assertEqual(startup.STARTUP_ACTIVATION_TIMEOUT_SECONDS, 1800.0)
+        self.assertEqual(startup.STARTUP_ACTIVATION_TIMEOUT_SECONDS, 2100.0)
 
     def test_activation_rejects_unbounded_timeout(self) -> None:
         authorization = {
@@ -162,8 +172,8 @@ class DockerStartupScriptTests(unittest.TestCase):
             "container_script_path": "/opt/fullmag/source/models/scene.py",
             "container_source_root": "/opt/fullmag/source",
         }
-        with self.assertRaisesRegex(startup.StartupScriptError, "between 0 and 1800"):
-            startup.activate(authorization, timeout=1801)
+        with self.assertRaisesRegex(startup.StartupScriptError, "between 0 and 2100"):
+            startup.activate(authorization, timeout=2101)
 
     def test_activation_response_rejects_legacy_cli_claim(self) -> None:
         authorization = {
@@ -178,6 +188,11 @@ class DockerStartupScriptTests(unittest.TestCase):
             "request_id": "startup-test-5",
             "source_sha256": "d" * 64,
             "status": "accepted",
+            "session_id": "session-startup-test-5",
+            "run_id": "run-startup-test-5",
+            "step_ids": ["step-startup-test-5"],
+            "scene_revision": 2,
+            "runtime_metadata": {"interactive": False, "wait_for_solve": False},
             "execution": {
                 "mode": "canonical_live_v2",
                 "auto_study": True,
@@ -201,7 +216,12 @@ class DockerStartupScriptTests(unittest.TestCase):
             "authorization": startup.AUTHORIZATION_KIND,
             "request_id": "startup-test-6",
             "source_sha256": "e" * 64,
-            "status": "ready",
+            "status": "accepted",
+            "session_id": "session-startup-test-6",
+            "run_id": "run-startup-test-6",
+            "step_ids": ["step-startup-test-6"],
+            "scene_revision": 3,
+            "runtime_metadata": {"interactive": False, "wait_for_solve": False},
             "execution": {
                 "mode": "canonical_live_v2",
                 "auto_study": True,
@@ -214,6 +234,49 @@ class DockerStartupScriptTests(unittest.TestCase):
             tampered = json.loads(json.dumps(response))
             tampered["execution"].pop(field)
             with self.subTest(field=field), self.assertRaises(startup.StartupScriptError):
+                startup.validate_activation_response(tampered, authorization)
+
+    def test_activation_response_requires_server_execution_identity_and_wait_state(self) -> None:
+        authorization = {
+            "schema": startup.AUTHORIZATION_SCHEMA,
+            "authorization": startup.AUTHORIZATION_KIND,
+            "request_id": "startup-test-dto",
+            "source_sha256": "f" * 64,
+        }
+        response = {
+            "schema": startup.RESPONSE_SCHEMA,
+            "authorization": startup.AUTHORIZATION_KIND,
+            "request_id": authorization["request_id"],
+            "source_sha256": authorization["source_sha256"],
+            "status": "accepted",
+            "session_id": "session-startup-dto",
+            "run_id": "run-startup-dto",
+            "step_ids": ["step-startup-dto"],
+            "scene_revision": 4,
+            "runtime_metadata": {"interactive": True, "wait_for_solve": False},
+            "execution": {
+                "mode": "canonical_live_v2",
+                "auto_study": True,
+                "interactive": "script_metadata",
+                "wait_for_solve": "script_metadata",
+                "legacy_cli": False,
+            },
+        }
+        self.assertEqual(startup.validate_activation_response(response, authorization), response)
+        for field, value in (
+            ("session_id", ""),
+            ("run_id", None),
+            ("step_ids", []),
+            ("step_ids", ["duplicate", "duplicate"]),
+            ("scene_revision", True),
+            ("scene_revision", 2**64),
+            ("runtime_metadata", {"interactive": 1, "wait_for_solve": False}),
+            ("runtime_metadata", {"interactive": False, "wait_for_solve": True}),
+            ("status", "waiting_for_solve"),
+        ):
+            tampered = json.loads(json.dumps(response))
+            tampered[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(startup.StartupScriptError):
                 startup.validate_activation_response(tampered, authorization)
 
     def test_overlay_is_readonly_and_mounts_selected_checkout_only_when_enabled(self) -> None:

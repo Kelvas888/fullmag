@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import sys
 import time
+import types
 import uuid
 from pathlib import Path
 
@@ -21,8 +25,8 @@ from local_runner.worker_entrypoint import verify_source
 from run_managed_browser import digest, host_path, read_json, validate_managed_build
 
 PROFILE = "docker-all-gpu"
-STARTUP_READY_TIMEOUT_SECONDS = 2100
-STARTUP_DOCKER_CLIENT_TIMEOUT_SECONDS = 2160
+STARTUP_READY_TIMEOUT_SECONDS = 2400
+STARTUP_DOCKER_CLIENT_TIMEOUT_SECONDS = 2460
 REQUIRED_BINARIES = (
     "fullmag-api", "fullmag-bin", "fullmag-runtime-service",
     "fullmag-api-resource-pool", "fullmag-api-preparation-resource-pool",
@@ -60,7 +64,7 @@ def _startup_process_receipt_path(state):
     return Path(state) / ".fullmag/runtime-service/process-tree.json"
 
 
-def _validate_startup_process_receipt(value, authorization=None):
+def _validate_startup_process_receipt(value, authorization=None, startup_helper=None):
     if not isinstance(value, dict) or value.get("schema") != "fullmag.docker-process-tree.v1":
         raise ValueError("Runtime process-tree receipt schema mismatch")
     if value.get("state") != "ready":
@@ -81,12 +85,13 @@ def _validate_startup_process_receipt(value, authorization=None):
         raise ValueError("Runtime startup activation response is missing")
     # Reuse the exact request/response contract; this does not create a second
     # endpoint or relax the API's live-v2 execution policy.
-    import docker_startup_script as startup_helper
+    if startup_helper is None:
+        raise ValueError("Startup receipt validation requires the attested helper module")
     startup_helper.validate_activation_response(response, authorization)
     return value
 
 
-def _wait_for_startup_ready(state, authorization=None, *, timeout=90):
+def _wait_for_startup_ready(state, authorization=None, *, startup_helper=None, timeout=90):
     if timeout <= 0:
         raise ValueError("Startup activation observation timeout must be positive")
     path = _startup_process_receipt_path(state)
@@ -97,7 +102,7 @@ def _wait_for_startup_ready(state, authorization=None, *, timeout=90):
             if value.get("state") in {"failed_outcome_retained", "shutdown_unknown"}:
                 raise ValueError("Runtime process-tree receipt records an unconfirmed startup outcome")
             if value.get("state") == "ready":
-                return _validate_startup_process_receipt(value, authorization)
+                return _validate_startup_process_receipt(value, authorization, startup_helper)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             request_id = authorization.get("request_id") if authorization is not None else "runtime-ready"
@@ -440,6 +445,163 @@ def _write_startup_overlay(path, authorization, *, include_source,
     storage.atomic_json(path, overlay)
 
 
+_STARTUP_HELPERS = ("docker_startup_script.py", "fullmag_storage.py")
+_STARTUP_HELPER_MODULES = {
+    "docker_startup_script.py": "docker_startup_script",
+    "fullmag_storage.py": "fullmag_storage",
+}
+_MAX_STARTUP_HELPER_BYTES = 4 * 1024 * 1024
+
+
+def _read_startup_helper_bytes(path):
+    """Read one helper through a bounded native no-follow file operation."""
+
+    path = Path(path)
+    if os.name == "nt":
+        from windows_folder_host import read_owned_regular
+
+        return read_owned_regular(path, maximum=_MAX_STARTUP_HELPER_BYTES)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"Cannot open startup helper: {path}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_STARTUP_HELPER_BYTES:
+            raise ValueError("Startup helper is not a bounded regular file")
+        chunks = bytearray()
+        while len(chunks) <= _MAX_STARTUP_HELPER_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, _MAX_STARTUP_HELPER_BYTES + 1 - len(chunks)),
+            )
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        if len(chunks) > _MAX_STARTUP_HELPER_BYTES:
+            raise ValueError("Startup helper exceeds its size bound")
+        return bytes(chunks)
+    except OSError as error:
+        raise ValueError(f"Cannot read startup helper: {path}") from error
+    finally:
+        os.close(descriptor)
+
+
+def _verified_startup_helper(path, expected_hash):
+    data = _read_startup_helper_bytes(path)
+    observed = hashlib.sha256(data).hexdigest()
+    return data, observed == expected_hash, observed
+
+
+def _exec_verified_startup_helpers(helpers):
+    """Execute an already-read helper pair under temporary canonical names."""
+
+    module_names = tuple(_STARTUP_HELPER_MODULES.values())
+    missing = object()
+    saved = {name: sys.modules.get(name, missing) for name in module_names}
+    try:
+        loaded = {}
+        for filename in ("fullmag_storage.py", "docker_startup_script.py"):
+            module_name = _STARTUP_HELPER_MODULES[filename]
+            path, data = helpers[filename]
+            module = types.ModuleType(module_name)
+            module.__file__ = str(path)
+            module.__package__ = ""
+            module.__loader__ = None
+            module.__spec__ = None
+            sys.modules[module_name] = module
+            code = compile(data, str(path), "exec", dont_inherit=True)
+            exec(code, module.__dict__)
+            loaded[module_name] = module
+        return loaded["docker_startup_script"]
+    finally:
+        for name, previous in saved.items():
+            if previous is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+
+def _assembly_helper_context(assembly, layout):
+    """Return the immutable helper context recorded by the assembly receipt."""
+
+    expected = assembly.get("startup_helper_hashes")
+    if not isinstance(expected, dict) or set(expected) != set(_STARTUP_HELPERS):
+        raise ValueError("Assembly receipt has no complete pinned startup helper inventory")
+    output = assembly.get("output")
+    if not isinstance(output, str) or not output:
+        raise ValueError("Assembly receipt has no frozen helper context")
+    build_root = Path(layout["build_storage_root"])
+    context = storage.validate_path(Path(output) / "context", build_root,
+                                    "assembly helper context")
+    verified = {}
+    for name in _STARTUP_HELPERS:
+        helper = storage.validate_path(context / name, context, "assembly helper")
+        data, matches, _observed = _verified_startup_helper(helper, expected[name])
+        if not matches:
+            raise ValueError("Frozen assembly helper differs from its receipt inventory: " + name)
+        verified[name] = (helper, data)
+    return verified
+
+
+def _startup_helper_for_start(assembly, layout, selected_source):
+    """Use the selected checkout only when its helper bytes match the image."""
+
+    expected = assembly["startup_helper_hashes"]
+    observed = {}
+    verified = {}
+    matches = True
+    for name in _STARTUP_HELPERS:
+        path = Path(selected_source) / "scripts" / name
+        if not os.path.lexists(path):
+            observed[name] = None
+        else:
+            # A helper that exists through a symlink/junction is not treated as
+            # a harmless inventory mismatch: the selected checkout itself must
+            # remain a real, owned tree before its bytes are considered.
+            path = storage.validate_path(path, Path(selected_source), "startup helper")
+            if not path.is_file():
+                observed[name] = None
+            else:
+                data, matches_hash, observed[name] = _verified_startup_helper(
+                    path, expected[name]
+                )
+                verified[name] = (path, data)
+                matches = matches and matches_hash
+        if name not in verified:
+            matches = False
+    if matches:
+        startup_helper = _exec_verified_startup_helpers(verified)
+        return startup_helper, {"source": "selected_checkout", "hashes": observed}
+    frozen = _assembly_helper_context(assembly, layout)
+    return _exec_verified_startup_helpers(frozen), {
+        "source": "assembly_context",
+        "hashes": observed,
+        "expected_hashes": dict(expected),
+    }
+
+
+def _require_static_source_identity(assembly, selected_source):
+    """Require a static/startup source bind to name the assembled Git tree."""
+
+    expected = assembly.get("native_source_identity")
+    mode = assembly.get("source_mode")
+    commit = assembly.get("commit")
+    if (mode not in {"commit", "snapshot"}
+            or not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+            or not isinstance(expected, dict)):
+        raise ValueError("Static startup source bind has no complete assembly source identity")
+    from local_runner.build_source import native_identity
+    # The bind exposes the selected checkout's working-tree bytes.  A
+    # commit-mode identity alone would only prove that the requested Git
+    # object exists and could miss a dirty file that the container would read.
+    observed = native_identity(Path(selected_source), "snapshot")
+    if observed != expected:
+        raise ValueError("Static startup source bind differs from the assembled native source identity")
+    return observed
+
+
 def start(repo, assembly_receipt, port, frontend="static", source_root=None,
           startup_script=None):
     if not 1024 <= port <= 65535:
@@ -513,12 +675,16 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
 
         if startup_script is not None:
             from docker_development_inputs import select_checkout
-            import docker_startup_script as startup_helper
 
             selected_source = (
                 Path(inputs["source_root"])
                 if inputs is not None
                 else select_checkout(repo, source_root)
+            )
+            if inputs is None:
+                _require_static_source_identity(assembly, selected_source)
+            startup_helper, helper_attestation = _startup_helper_for_start(
+                assembly, layout, selected_source
             )
             source_commit = (
                 inputs.get("source_commit")
@@ -559,6 +725,8 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 "source_path": authorization["source_path"],
                 "container_script_path": authorization["container_script_path"],
                 "request_id": authorization["request_id"],
+                "helper_source": helper_attestation["source"],
+                "helper_hashes_observed": helper_attestation["hashes"],
                 "provenance": str(startup_provenance),
                 "provenance_sha256": provenance_sha256,
                 "helper_sha256": helper_sha256,
@@ -717,6 +885,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 raise ValueError("Runtime image startup helper differs from assembly inventory: " + name)
         process_tree_receipt = _wait_for_startup_ready(
             state, startup["authorization"] if startup is not None else None,
+            startup_helper=startup_helper if startup is not None else None,
             timeout=ready_timeout,
         )
         receipt["process_tree_receipt"] = str(_startup_process_receipt_path(state))

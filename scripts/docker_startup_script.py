@@ -37,7 +37,7 @@ STARTUP_ENDPOINT = "/v1/internal/live/current/startup"
 MAX_SCRIPT_BYTES = 1024 * 1024
 MAX_PROVENANCE_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
-STARTUP_ACTIVATION_TIMEOUT_SECONDS = 1800.0
+STARTUP_ACTIVATION_TIMEOUT_SECONDS = 2100.0
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -373,8 +373,21 @@ def validate_activation_response(
         raise StartupScriptError("startup activation response request fence mismatch")
     if response.get("source_sha256") != authorization.get("source_sha256"):
         raise StartupScriptError("startup activation response source hash mismatch")
+    for field in ("session_id", "run_id"):
+        value = response.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise StartupScriptError(f"startup activation response {field} is missing")
+    step_ids = response.get("step_ids")
+    if (not isinstance(step_ids, list) or not step_ids
+            or any(not isinstance(step_id, str) or not step_id.strip() for step_id in step_ids)
+            or len(set(step_ids)) != len(step_ids)):
+        raise StartupScriptError("startup activation response step_ids are invalid")
+    scene_revision = response.get("scene_revision")
+    if (isinstance(scene_revision, bool) or not isinstance(scene_revision, int)
+            or not 0 <= scene_revision <= 2**64 - 1):
+        raise StartupScriptError("startup activation response scene_revision is invalid")
     status = response.get("status")
-    if status not in {"ready", "accepted", "waiting_for_solve"}:
+    if status not in {"accepted", "waiting_for_solve"}:
         raise StartupScriptError("startup activation did not reach a recognized terminal state")
     execution = response.get("execution")
     expected_execution = {
@@ -388,6 +401,17 @@ def validate_activation_response(
         execution.get(key) != value for key, value in expected_execution.items()
     ):
         raise StartupScriptError("startup activation response does not attest canonical live execution")
+    runtime_metadata = response.get("runtime_metadata")
+    if (not isinstance(runtime_metadata, Mapping)
+            or type(runtime_metadata.get("interactive")) is not bool
+            or type(runtime_metadata.get("wait_for_solve")) is not bool):
+        raise StartupScriptError("startup activation response runtime metadata is invalid")
+    wait_for_solve = runtime_metadata["wait_for_solve"]
+    if wait_for_solve and not runtime_metadata["interactive"]:
+        raise StartupScriptError("startup activation response wait_for_solve requires interactive")
+    if (wait_for_solve and status != "waiting_for_solve") or (
+            not wait_for_solve and status != "accepted"):
+        raise StartupScriptError("startup activation response status disagrees with wait_for_solve")
     return dict(response)
 
 

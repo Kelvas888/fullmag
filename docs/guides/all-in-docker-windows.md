@@ -55,6 +55,11 @@ just docker-all-dev $assemblyReceipt 3197 $sourceRoot
 `runner-wait` obserwuj ten sam job i nie zgłaszaj kolejnego buildu. Do składania
 i startu przejdź dopiero po terminalnym `succeeded`.
 
+Zachowaj katalog `output/context` wskazany przez receipt złożonego obrazu.
+Launcher może odczytać z niego zweryfikowane helpery startowe, gdy ich bajty
+w wybranym checkoutcie różnią się od obrazu (np. przez CRLF). Ten katalog
+pozostaje zależnością obrazu do czasu wycofania jego receiptu.
+
 Wersjonowane pliki definiują poszczególne części:
 
 | Plik | Odpowiedzialność |
@@ -96,7 +101,9 @@ przez kanoniczny importer API. Nie korzystamy z `docker compose run fullmag`.
 
 Odbiór startu wymaga potwierdzenia aktywacji tego samego skryptu w receipcie
 procesu backendu. Sam HTTP healthcheck nie potwierdza przygotowania modelu.
-Aktywacja HTTP ma limit 1800 sekund; obserwacja gotowości ma limit 2100 sekund.
+Przygotowanie siatki przez API ma limit 1800 sekund. Aktywacja HTTP czeka do
+2100 sekund, uwzględniając wcześniejsze eksporty Pythona; obserwacja gotowości
+procesu ma limit 2400 sekund.
 Timeout nie uruchamia drugiej próby ani drugiego solvera i pozostawia dane
 uruchomienia do sprawdzenia. Docelowo authored Study uruchamia się w całości,
 a interaktywne `wait_for_solve` zatrzymuje je przed Compute, po przygotowaniu

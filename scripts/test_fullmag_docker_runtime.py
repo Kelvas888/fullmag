@@ -3,6 +3,7 @@ import importlib.util
 import json
 import tempfile
 import os
+import sys
 import subprocess
 import unittest
 from pathlib import Path
@@ -64,6 +65,11 @@ class DockerRuntimeContract(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["timeout"], 3)
 
     def test_startup_script_uses_long_bounded_compose_wait_even_without_dev_frontend(self):
+        import docker_startup_script as startup
+        self.assertGreaterEqual(runtime.STARTUP_READY_TIMEOUT_SECONDS,
+                                startup.STARTUP_ACTIVATION_TIMEOUT_SECONDS + 60)
+        self.assertGreaterEqual(runtime.STARTUP_DOCKER_CLIENT_TIMEOUT_SECONDS,
+                                runtime.STARTUP_READY_TIMEOUT_SECONDS + 60)
         self.assertEqual(
             runtime._runtime_ready_timeouts(None, {"authorization": {}}),
             (runtime.STARTUP_READY_TIMEOUT_SECONDS, runtime.STARTUP_DOCKER_CLIENT_TIMEOUT_SECONDS),
@@ -87,7 +93,12 @@ class DockerRuntimeContract(unittest.TestCase):
             "authorization": "explicit_startup_script",
             "request_id": authorization["request_id"],
             "source_sha256": authorization["source_sha256"],
-            "status": "ready",
+            "status": "accepted",
+            "session_id": "session-startup-receipt-test",
+            "run_id": "run-startup-receipt-test",
+            "step_ids": ["step-startup-receipt-test"],
+            "scene_revision": 0,
+            "runtime_metadata": {"interactive": False, "wait_for_solve": False},
             "execution": {
                 "mode": "canonical_live_v2",
                 "auto_study": True,
@@ -108,11 +119,161 @@ class DockerRuntimeContract(unittest.TestCase):
                 "response": response,
             },
         }
-        self.assertIs(runtime._validate_startup_process_receipt(receipt, authorization), receipt)
+        import docker_startup_script as startup_helper
+        self.assertIs(runtime._validate_startup_process_receipt(
+            receipt, authorization, startup_helper
+        ), receipt)
         changed = json.loads(json.dumps(receipt))
         changed["startup_activation"]["request_id"] = "other-request"
         with self.assertRaisesRegex(ValueError, "fence"):
-            runtime._validate_startup_process_receipt(changed, authorization)
+            runtime._validate_startup_process_receipt(changed, authorization, startup_helper)
+
+    def test_static_startup_bind_requires_assembled_native_identity(self):
+        expected = {"head_commit_full": "a" * 40,
+                    "source_snapshot_sha256": "b" * 64,
+                    "source_snapshot_dirty": False}
+        assembly = {"commit": "a" * 40, "source_mode": "commit",
+                    "native_source_identity": expected}
+        with tempfile.TemporaryDirectory() as directory:
+            selected = Path(directory).resolve()
+            with patch("local_runner.build_source.native_identity", return_value=expected) as identity:
+                self.assertEqual(runtime._require_static_source_identity(assembly, selected), expected)
+            identity.assert_called_once_with(selected, "snapshot")
+            with patch("local_runner.build_source.native_identity", return_value={**expected, "source_snapshot_dirty": True}):
+                with self.assertRaisesRegex(ValueError, "assembled native source identity"):
+                    runtime._require_static_source_identity(assembly, selected)
+
+    def test_startup_helper_inventory_uses_frozen_assembly_bytes_on_crlf_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            output = root / "image-output"
+            context = output / "context"
+            context.mkdir(parents=True)
+            source = root / "selected"
+            (source / "scripts").mkdir(parents=True)
+            repository = Path(__file__).resolve().parents[1]
+            for name in runtime._STARTUP_HELPERS:
+                frozen = repository / "scripts" / name
+                (context / name).write_bytes(frozen.read_bytes())
+                # A Windows checkout can expose the same text with CRLF.  The
+                # byte contract must select the frozen assembly helper instead
+                # of normalizing or silently accepting a different digest.
+                (source / "scripts" / name).write_bytes(
+                    frozen.read_bytes().replace(b"\n", b"\r\n")
+                )
+            assembly = {
+                "startup_helper_hashes": {
+                    name: runtime.digest(context / name) for name in runtime._STARTUP_HELPERS
+                },
+                "output": str(output),
+            }
+            helper, attestation = runtime._startup_helper_for_start(
+                assembly, {"build_storage_root": str(root)}, source
+            )
+            self.assertEqual(attestation["source"], "assembly_context")
+            self.assertEqual(Path(helper.__file__).resolve(), (context / "docker_startup_script.py").resolve())
+            self.assertNotEqual(attestation["hashes"], assembly["startup_helper_hashes"])
+
+    def test_startup_helper_exec_uses_selected_bytes_and_restores_foreign_modules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            selected = root / "selected-checkout"
+            (selected / "scripts").mkdir(parents=True)
+            repository = Path(__file__).resolve().parents[1]
+            for name in runtime._STARTUP_HELPERS:
+                (selected / "scripts" / name).write_bytes(
+                    (repository / "scripts" / name).read_bytes()
+                )
+            assembly = {
+                "startup_helper_hashes": {
+                    name: runtime.digest(selected / "scripts" / name)
+                    for name in runtime._STARTUP_HELPERS
+                }
+            }
+            foreign_startup = object()
+            # Preserve a present None entry exactly as well as a foreign
+            # startup object; temporary execution must not perturb either.
+            foreign_storage = None
+            with patch.dict(sys.modules, {
+                "docker_startup_script": foreign_startup,
+                "fullmag_storage": foreign_storage,
+            }, clear=False):
+                before = {
+                    name: sys.modules.get(name)
+                    for name in runtime._STARTUP_HELPER_MODULES.values()
+                }
+                helper, attestation = runtime._startup_helper_for_start(
+                    assembly, {"build_storage_root": str(root)}, selected
+                )
+                after = {
+                    name: sys.modules.get(name)
+                    for name in runtime._STARTUP_HELPER_MODULES.values()
+                }
+            self.assertEqual(attestation["source"], "selected_checkout")
+            self.assertEqual(Path(helper.__file__).resolve(),
+                             (selected / "scripts/docker_startup_script.py").resolve())
+            self.assertIsNot(helper, foreign_startup)
+            self.assertEqual(before, after)
+
+    def test_startup_helper_exec_restores_sys_modules_after_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = Path(__file__).resolve().parents[1]
+            helpers = {}
+            for name in runtime._STARTUP_HELPERS:
+                path = root / name
+                path.write_bytes((repository / "scripts" / name).read_bytes())
+                helpers[name] = (path, path.read_bytes())
+            broken_path = root / "docker_startup_script.py"
+            helpers["docker_startup_script.py"] = (broken_path, b"def broken(:\n")
+            foreign_startup = object()
+            foreign_storage = None
+            with patch.dict(sys.modules, {
+                "docker_startup_script": foreign_startup,
+                "fullmag_storage": foreign_storage,
+            }, clear=False):
+                before = {
+                    name: sys.modules.get(name)
+                    for name in runtime._STARTUP_HELPER_MODULES.values()
+                }
+                with self.assertRaises(SyntaxError):
+                    runtime._exec_verified_startup_helpers(helpers)
+                after = {
+                    name: sys.modules.get(name)
+                    for name in runtime._STARTUP_HELPER_MODULES.values()
+                }
+            self.assertEqual(before, after)
+
+    def test_startup_helper_exec_uses_captured_bytes_after_path_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            selected = root / "selected-checkout"
+            (selected / "scripts").mkdir(parents=True)
+            repository = Path(__file__).resolve().parents[1]
+            for name in runtime._STARTUP_HELPERS:
+                (selected / "scripts" / name).write_bytes(
+                    (repository / "scripts" / name).read_bytes()
+                )
+            assembly = {
+                "startup_helper_hashes": {
+                    name: runtime.digest(selected / "scripts" / name)
+                    for name in runtime._STARTUP_HELPERS
+                }
+            }
+            original_exec = runtime._exec_verified_startup_helpers
+            startup_path = selected / "scripts/docker_startup_script.py"
+
+            def mutate_after_capture(helpers):
+                startup_path.write_bytes(b"raise RuntimeError('path was reread')\n")
+                return original_exec(helpers)
+
+            with patch.object(runtime, "_exec_verified_startup_helpers",
+                              side_effect=mutate_after_capture):
+                helper, attestation = runtime._startup_helper_for_start(
+                    assembly, {"build_storage_root": str(root)}, selected
+                )
+            self.assertEqual(attestation["source"], "selected_checkout")
+            self.assertEqual(helper.RESPONSE_SCHEMA, "fullmag.startup-script-activation.v1")
 
     def test_artifact_digest_handles_empty_and_multiblock_files_on_python_310(self):
         import hashlib
