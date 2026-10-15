@@ -564,7 +564,13 @@ try {
     const solve = (await read()).scene.antenna_field_solve_stages.find(stage => stage.source_object_id === sourceId);
     await page.evaluate(id => window.__antennaStationsFixture.selectGeometry(id), sourceId);
     const add = page.getByRole("button", { name: "Add Field Solve to Study", exact: true });
-    assert.equal(await add.isEnabled(), true);
+    assert.equal((await read()).scene.scene.id, "restored-authoring-model");
+    assert.equal(await add.isEnabled(), true, "A restored model ID must not be mistaken for the session ID");
+    const previousScope = page.getByRole("checkbox", { name: "Use previous-session scene scope", exact: true });
+    const beforeForeignAdd = (await read()).calls.filter(call => call.method === "POST").length;
+    await previousScope.check(); assert.equal(await add.isDisabled(), true);
+    assert.equal((await read()).calls.filter(call => call.method === "POST").length, beforeForeignAdd);
+    await previousScope.uncheck(); assert.equal(await add.isEnabled(), true);
     await add.click(); await page.waitForFunction(() => window.__antennaStationsFixture.read().pendingWrites === 1, undefined, { timeout });
     const before = await read(), transaction = before.calls.filter(call => call.method === "POST").at(-1).body;
     assert.deepEqual(Object.keys(transaction.merge_patch), ["study"]);
@@ -576,6 +582,9 @@ try {
     const open = page.getByRole("button", { name: "Open Study stage", exact: true }); await open.waitFor({ timeout });
     assert.equal(await add.isDisabled(), true, "An existing Study reference must not permit duplicate add");
     const beforeNavigation = await read();
+    await previousScope.check(); assert.equal(await open.isDisabled(), true);
+    await previousScope.uncheck(); assert.equal(await open.isEnabled(), true);
+    checks.push({ name: "Restored model with independent scene ID permits Add/Open only under its confirmed full session scope; a previous-session scope disables both without writes", passed: true });
     await open.scrollIntoViewIfNeeded(); await screenshot("24-study-reference-ready");
     await open.click();
     const selected = await page.evaluate(() => window.__antennaStationsFixture.readSelection());

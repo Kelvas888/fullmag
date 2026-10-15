@@ -13,10 +13,10 @@ import { FormField } from "../../primitives/FormField";
 import { FieldRow } from "../../primitives/FieldRow";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 
-interface Props { objectId: string; stageId: string; scene: SceneResource | null; status: string }
+interface Props { objectId: string; stageId: string; scene: SceneResource | null; sceneScopeKey: string | null; status: string }
 
 /** Only the port choice is local; the command owns the revisioned transaction. */
-export function AntennaStudyStageComposer({ objectId, stageId, scene, status }: Props) {
+export function AntennaStudyStageComposer({ objectId, stageId, scene, sceneScopeKey, status }: Props) {
   const { api, resources, commands, authoringHistory, selection } = useKernel();
   const identity = useSessionResourceIdentity();
   const scope = sessionRequestScopeKey(identity);
@@ -35,7 +35,8 @@ export function AntennaStudyStageComposer({ objectId, stageId, scene, status }: 
   const capabilityError = definition ? antennaFieldSolveDefinitionPortError(portIds) : null;
   const portId = choice?.key === key ? choice.portId : portIds.length === 1 ? portIds[0] : "";
   const pending = pendingToken === token;
-  const currentScene = Boolean(scope && scene?.scene?.id === identity?.sessionId && status === "ready");
+  // A restored model keeps its scene ID while receiving a new session identity.
+  const currentScene = Boolean(scope && scene && sceneScopeKey === scope && status === "ready");
   const selectedPorts = (scene?.antenna_port_modes ?? []).filter((port) => port.id === portId);
   const validPort = portIds.filter((id) => id === portId).length === 1 && selectedPorts.length === 1
     && selectedPorts[0].source_object_id === objectId

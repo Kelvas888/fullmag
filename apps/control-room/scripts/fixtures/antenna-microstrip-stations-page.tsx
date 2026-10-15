@@ -1,6 +1,6 @@
 "use client";
 
-import { Profiler, useEffect, useMemo, useSyncExternalStore } from "react";
+import { Profiler, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
 import { MODEL_GEOMETRY_REALIZATION_CURRENT_PATH, MODEL_SCENE_PATH, MODEL_TRANSACTIONS_PATH, SESSION_STATUS_PATH, SESSIONS_PATH } from "@/kernel/api/apiPaths";
@@ -75,7 +75,7 @@ function makeFixture() {
     }));
     params.conductors = [{ id: "trace", kind: "signal" }, { id: "left", kind: "ground_left" }, { id: "right", kind: "ground_right" }];
   }
-  const state = { scene: { revision: 1, scene_revision: 1, scene: { id: "session-antenna-stations-fixture", name: "Fixture", authoring_schema: "fixture", source_of_truth: "fixture" }, objects: [{ id: OBJECT_ID, name: "Microstrip fixture", geometry, notes: "initial" }] } as SceneResource, renderCommits: 0, holdScene: false };
+  const state = { scene: { revision: 1, scene_revision: 1, scene: { id: "restored-authoring-model", name: "Fixture", authoring_schema: "fixture", source_of_truth: "fixture" }, objects: [{ id: OBJECT_ID, name: "Microstrip fixture", geometry, notes: "initial" }] } as SceneResource, renderCommits: 0, holdScene: false };
   const calls: Call[] = [];
   const unexpected: string[] = [];
   const invalidations: { resourceKey: string; revision: unknown }[] = [];
@@ -227,6 +227,7 @@ function makeFixture() {
 function EditorHarness({ control }: { control: FixtureControl }) {
   const selected = useSyncExternalStore(control.subscribeSelection, control.readSelection, () => EMPTY_SELECTION);
   const resource = useSceneResource();
+  const [foreignScope, setForeignScope] = useState(false);
   const created = resource.data?.objects?.findLast((object) => object.id !== OBJECT_ID);
   const routedInspector = new URL(window.location.href).searchParams.has("inspector");
   const studyMode = new URL(window.location.href).searchParams.has("study");
@@ -235,7 +236,8 @@ function EditorHarness({ control }: { control: FixtureControl }) {
   const Panel = selected.kind === "object.antenna.geometry" || selected.kind === "object.antenna.conductor" ? resolveInspectorRoute(selected.kind)?.component : undefined;
   return <div data-testid="antenna-stations-editor" data-resource-status={resource.status} data-scene-revision={resource.data?.revision}>
     {routedInspector && Panel ? <Panel selection={selected} /> : <MicrostripGeometryEditor objectId={OBJECT_ID} scene={resource.data} status={resource.status} refetch={resource.refetch} />}
-    {studyMode && ownerId && solves.length === 1 ? <AntennaStudyStageComposer objectId={ownerId} stageId={solves[0].id} scene={resource.data} status={resource.status} /> : null}
+    {studyMode ? <label><input type="checkbox" aria-label="Use previous-session scene scope" checked={foreignScope} onChange={event => setForeignScope(event.currentTarget.checked)} />Use previous-session scene scope</label> : null}
+    {studyMode && ownerId && solves.length === 1 ? <AntennaStudyStageComposer objectId={ownerId} stageId={solves[0].id} scene={resource.data} sceneScopeKey={foreignScope ? "previous-session-scope" : resource.sessionScopeKey} status={resource.status} /> : null}
     {created ? <div data-testid="antenna-created-details" data-object-id={created.id} style={{ width: 320, maxWidth: "100%" }}>
       <AntennaConductorDetails objectId={created.id} scene={resource.data} />
     </div> : null}

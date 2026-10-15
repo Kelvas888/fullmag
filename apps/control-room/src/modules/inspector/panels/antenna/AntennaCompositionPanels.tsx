@@ -941,7 +941,7 @@ export function AntennaCompositionPanel({
       </> : null}
       {kind === "port" && objectId && resourceId ? <AntennaPortEditor objectId={objectId} portId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "solution" && objectId && resourceId ? <AntennaSolveTargetsEditor key={`targets:${objectId}:${resourceId}`} objectId={objectId} stageId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
-      {kind === "solution" && objectId && resourceId ? <AntennaStudyStageComposer objectId={objectId} stageId={resourceId} scene={scene.data} status={scene.status} /> : null}
+      {kind === "solution" && objectId && resourceId ? <AntennaStudyStageComposer objectId={objectId} stageId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} /> : null}
       {kind === "solution" && ids.stageId ? <AntennaExternalLeadInspectionPanel authoredStageId={ids.stageId} /> : null}
       {kind === "solution" && fieldSolution.data &&
       model.badge === "ready" &&
