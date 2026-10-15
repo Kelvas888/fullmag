@@ -758,6 +758,7 @@ jobs:
           packages/fullmag-py/tests/test_mesh_stl_fallback_owner_binding.py
           packages/fullmag-py/tests/test_execution_profile_authoring_roundtrip.py
           packages/fullmag-py/tests/test_scene_execution_config.py
+          packages/fullmag-py/tests/test_runtime_source_snapshot.py
 
       - name: Run FEM tested/runtime library identity contracts
         run: python scripts/test_fem_modal_library_identity.py -v
