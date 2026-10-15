@@ -33,7 +33,7 @@ export function getTransportAuthoringCapability(
     required.add(reciprocal(resource) ? "m2_reciprocal" : "m1_one_way_steady");
     for (const transport of scene.spin_transports ?? []) {
       const spin = record(transport);
-      if (spin?.current_source_id === resource.name) {
+      if (spin && spin.current_source_id === resource.name) {
         for (const key of spinRequirements(spin, resource)) required.add(key);
       }
     }

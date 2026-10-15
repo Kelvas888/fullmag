@@ -75,7 +75,7 @@ export function buildAntennaResourceTransaction(scene: SceneResource, kind: Ante
       if (!branch.weight.trim()) throw new Error("Every signed branch weight must be authored explicitly.");
       return { id: branch.id.trim(), inlet_terminal_ref: branch.inlet.trim(), outlet_terminal_ref: branch.outlet.trim(), signed_weight: Number(branch.weight) };
     }) };
-    const errors = antennaPortValidationMessages(next);
+    const errors = antennaPortValidationMessages(next, scene);
     if (errors.length) throw new Error(errors.join("; "));
     // Terminal preparation owns observations separately; never silently rename its bound terminals.
     if ((scene.current_transports ?? []).some((transport) => transport.name === port.current_transport_id && transport.external_lead_preparation) && JSON.stringify((next as Port).branches.map((branch) => [branch.id, branch.inlet_terminal_ref, branch.outlet_terminal_ref])) !== JSON.stringify(port.branches.map((branch) => [branch.id, branch.inlet_terminal_ref, branch.outlet_terminal_ref]))) throw new Error("Terminal preparation exists. Edit its observation bindings before changing branch identities or terminal references.");
