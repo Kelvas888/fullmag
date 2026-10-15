@@ -1579,7 +1579,7 @@ fn accepted_stage_step_for_run(
     let application: PreparationReceipt = serde_json::from_value(receipt.payload.clone()).ok()?;
     application.validate().ok()?;
     let source = application.accepted_run_source?;
-    (source.run_id == run_id).then_some(source.step_id)
+    (source.run_id.as_str() == run_id).then_some(source.step_id)
 }
 
 fn validate_live_read_model_binding(
@@ -2071,6 +2071,24 @@ mod tests {
     }
 
     #[test]
+    fn accepted_stage_lookup_uses_typed_run_identity() {
+        let run_id = "run-recovery";
+        let specification = accepted_test_specification(run_id);
+        let application = accepted_test_receipt(&specification, "step-a", "prep-recovery");
+        let receipt = fullmag_session::FmsPreparationReceipt::new(
+            "prep-recovery",
+            run_id,
+            application.plan_fingerprint.clone(),
+            serde_json::to_value(application).unwrap(),
+        );
+        assert_eq!(
+            accepted_stage_step_for_run(&receipt, run_id),
+            Some("step-a".to_owned()),
+        );
+        assert_eq!(accepted_stage_step_for_run(&receipt, "run-other"), None);
+    }
+
+    #[test]
     fn stale_accepted_replacement_requires_previous_preparation_identity() {
         let previous = fullmag_session::FmsPreparationReceipt::new(
             "prep-previous",
@@ -2107,7 +2125,7 @@ mod tests {
 
     #[test]
     fn stale_accepted_replacement_accepts_stage_receipt_beyond_run_anchor() {
-        // The live store keeps the first immutable anchor (stage A), while
+        // The accepted store keeps the first immutable anchor (stage A), while
         // the accepted store keeps the selected later stage (stage B).
         assert!(stale_replacement_durable_evidence_matches(
             "run-previous",
