@@ -1,4 +1,11 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 15.10.2026 — [P8-53CW](p8/53cw-nested-pipeline-and-application-fixtures.md):
+naprawiono rekurencyjną walidację aktywnych etapów i zachowano deklaracje
+scope wyłączonych etapów. Przygotowano sześć napraw fixture batch/RunIntent,
+zachowując FDM/FEM intent, pełne fingerprinty i negatywne assert’y.
+Parser/diff i source review PASS; wykonanie nowych regresji Rust wymaga CI.
+Pełny plan **IN PROGRESS**, procenty bez awansu przed odbiorem.
+
 Checkpoint 15.10.2026 — [P8-53CV](p8/53cv-ci-application-followup.md):
 poprawka meshera opublikowana jako `6b58b6f10`. Starszy CI napraw fixture
 doszedł do wykonania aplikacji: **101 PASS / 9 FAIL**. Trwa diagnoza
