@@ -25,6 +25,8 @@ import {
   type WidthStationDraft,
 } from "./MicrostripGeometryEditorModel";
 
+import { antennaGeometryAcknowledgementError } from "./AntennaGeometryAcknowledgement";
+
 interface LocalDraft {
   key: string;
   sourceGeometry: string;
@@ -102,6 +104,11 @@ export function MicrostripGeometryEditor({ objectId, scene, status, refetch }: P
       if (!committedGeometry || committedGeometry.geometry_kind !== geometry.geometry_kind) {
         refetch();
         throw new Error("Geometry ACK omitted the matching antenna layout. Refetch before saving again.");
+      }
+      const acknowledgementError = antennaGeometryAcknowledgementError(response.committed_scene, objectId, patchedGeometry);
+      if (acknowledgementError) {
+        refetch();
+        throw new Error(acknowledgementError);
       }
       publishCommittedSceneResource(resources, response.committed_scene, committedRevision, undefined, false, sessionScopeKey, api.resourceCacheScope);
       invalidateAuthoringMutationDependents(resources, "geometry", committedRevision);
