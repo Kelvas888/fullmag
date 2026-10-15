@@ -7,10 +7,42 @@ fn inputs() -> (
     StudyProblemCatalog,
     RunIntentAuthoring,
 ) {
-    let fixture: Value = serde_json::from_str(include_str!(
+    let mut fixture: Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/runtime/accepted-fem-preparation-run-v2.json"
     ))
     .unwrap();
+    // The shared fixture intentionally omits generated FEM assets; bind a
+    // small valid mesh here so these tests exercise application materialization.
+    fixture["study_problem_catalog"]["entries"][0]["problem"]["geometry_assets"] = serde_json::json!({
+        "fem_mesh_assets": [{
+            "geometry_name": "strip",
+            "mesh": {
+                "mesh_name": "identity-fixture",
+                "nodes": [
+                    [0.0, 0.0, 0.0],
+                    [1e-9, 0.0, 0.0],
+                    [0.0, 1e-9, 0.0],
+                    [0.0, 0.0, 1e-9]
+                ],
+                "cells": {
+                    "types": ["tet4"],
+                    "offsets": [0, 4],
+                    "nodes": [0, 1, 2, 3],
+                    "global_ordinals": [0],
+                    "mesh_parts": []
+                },
+                "element_markers": [1],
+                "facets": {
+                    "types": [],
+                    "roles": [],
+                    "offsets": [0],
+                    "nodes": [],
+                    "global_ordinals": []
+                },
+                "boundary_markers": []
+            }
+        }]
+    });
     let original: RunIntent = serde_json::from_value(fixture["run_intent"].clone()).unwrap();
     let authored = RunIntentAuthoring {
         run_id: original.specification.run_id,

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    ProjectId, ProjectSnapshot, RequestedExecution, RequestedResourceBudget, StudyId,
+    ProjectId, ProjectSnapshot, RequestedExecution, RequestedResourceBudget, RunId, StudyId,
     StudyReference,
 };
 use fullmag_authoring::{
@@ -9,13 +9,14 @@ use fullmag_authoring::{
     StudyPlan, StudyPlanMigrationDefaults, StudyPrimitiveStageKind, StudySolverConfigReference,
 };
 use fullmag_ir::{
-    EnergyTermIR, InitialMagnetizationIR, OutputStorageIR, ProblemIR, SpinTorqueModuleIR,
+    EnergyTermIR, InitialMagnetizationIR, OutputStorageIR, ProblemIR, RegionRefIR,
+    SpinTorqueModuleIR,
 };
 use fullmag_plan::{StudyProblemCatalog, StudyProblemCatalogEntry};
 use serde_json::{json, Value};
 
 fn template() -> RunSpecification {
-    RunSpecification::new(
+    let mut specification = RunSpecification::new(
         ProjectSnapshot {
             project_id: ProjectId::parse("project-batch").unwrap(),
             definition_revision: 3,
@@ -40,7 +41,10 @@ fn template() -> RunSpecification {
                 storage_bytes: 1024,
             }),
         },
-    )
+    );
+    // Batch expansion fingerprints the complete template; keep this fixture replayable.
+    specification.run_id = RunId::parse("run-batch-template").unwrap();
+    specification
 }
 
 fn axis(name: &str, values: Vec<Value>, join: BatchAxisJoin) -> BatchAxis {
@@ -396,7 +400,7 @@ fn manifest_integrity_rejects_child_or_digest_tampering() {
         .validate_integrity()
         .unwrap_err()
         .to_string()
-        .contains("does not match the axis position"));
+        .contains("does not match its axis position"));
 
     let mut changed_digest = expand_independent_batch(request(vec![axis(
         "field",
@@ -780,16 +784,19 @@ fn materialization_binds_zhang_li_axis_to_named_executable_module() {
     let study = materialization_study();
     let mut problem = ProblemIR::bootstrap_example();
     problem.spin_torque_modules = vec![SpinTorqueModuleIR::ZhangLi {
-        schema_version: None,
+        schema_version: Some("zhang_li_torque.v1".into()),
         id: Some("batch-zl".into()),
-        target: None,
-        formula_version: "zhang_li.legacy_fullmag.v0".into(),
-        operator_version: None,
+        target: Some(RegionRefIR {
+            object_id: "strip".into(),
+            region_id: None,
+        }),
+        formula_version: "zhang_li.fullmag.v1".into(),
+        operator_version: Some("zl_central_reference_v1".into()),
         current_density: Some([1.0e11, 0.0, 0.0]),
         current_source: None,
         degree: 0.4,
         beta: 0.02,
-        lande_g: None,
+        lande_g: Some(2.0),
     }];
     let source_catalog = StudyProblemCatalog::from_entries(
         &study,

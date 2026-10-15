@@ -131,15 +131,29 @@ fn validate_v04_magnetization_constraints(problem: &ProblemIRV04, errors: &mut V
 pub(crate) fn pipeline_stage_ids(
     metadata: &BTreeMap<String, serde_json::Value>,
 ) -> BTreeSet<String> {
-    metadata
+    let mut ids = BTreeSet::new();
+    if let Some(nodes) = metadata
         .get("study_pipeline")
         .and_then(|value| value.get("nodes"))
         .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|node| node.get("id").and_then(serde_json::Value::as_str))
-        .map(str::to_string)
-        .collect()
+    {
+        collect_pipeline_stage_ids(nodes, &mut ids);
+    }
+    ids
+}
+
+fn collect_pipeline_stage_ids(nodes: &[serde_json::Value], ids: &mut BTreeSet<String>) {
+    for node in nodes {
+        let Some(node) = node.as_object() else {
+            continue;
+        };
+        if let Some(id) = node.get("id").and_then(serde_json::Value::as_str) {
+            ids.insert(id.to_string());
+        }
+        if let Some(children) = node.get("children").and_then(serde_json::Value::as_array) {
+            collect_pipeline_stage_ids(children, ids);
+        }
+    }
 }
 
 pub(crate) fn declared_pipeline_stage_ids(

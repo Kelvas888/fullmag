@@ -2296,7 +2296,13 @@ fn active_stage_id_controls_minimizer_drive_validation() {
     ir.problem_meta.runtime_metadata.insert(
         "study_pipeline".into(),
         serde_json::json!({"version":"study_pipeline.v1","nodes":[
-            {"id":"relax","enabled":true}, {"id":"excite","enabled":true}
+            {"node_kind":"group","id":"outer","enabled":true,"children":[
+                {"node_kind":"primitive","id":"relax"},
+                {"node_kind":"group","id":"disabled-group","enabled":false,"children":[
+                    {"node_kind":"primitive","id":"disabled-child","enabled":true}
+                ]},
+                {"node_kind":"primitive","id":"excite"}
+            ]}
         ]}),
     );
     ir.problem_meta
@@ -2336,6 +2342,12 @@ fn active_stage_id_controls_minimizer_drive_validation() {
     });
     ir.validate()
         .expect("inactive dynamic drive must not invalidate relaxation stage");
+    ir.problem_meta.runtime_metadata.insert(
+        "active_stage_id".into(),
+        serde_json::json!("disabled-child"),
+    );
+    ir.validate()
+        .expect("declared disabled IDs retain legacy validation semantics");
     ir.problem_meta
         .runtime_metadata
         .insert("active_stage_id".into(), serde_json::json!("missing"));
