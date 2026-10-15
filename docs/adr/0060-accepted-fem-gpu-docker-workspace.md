@@ -95,6 +95,12 @@ chroniony writer lease; replay zwraca pierwotny grant bez zastępowania autora
 lub czasu. Brak grantu po restarcie nadal oznacza oczekiwanie. Nie jest to
 implementacja Pause ani cofanie już uruchomionego Solve.
 
+Odtworzenie istniejącego claimu `Preparing` sprawdza ten sam exact release
+zarówno w scheduler recovery, jak i w procesie accepted worker przed odczytem
+stanu Study i efektem solvera. Sam utrwalony claim lub wcześniejszy admission
+nie zastępuje jawnego grantu Compute. Regresje obejmują przygotowany FDM task,
+niezależność przygotowania FDM/FEM oraz odtworzony claim bez grantu.
+
 Ten kontrakt nie dodaje browser endpointu ani drugiego modelu viewportu.
 Wdrożenie policy/release w adapterze live i dowód `wait_for_solve` w przeglądarce
 pozostają oddzielnymi bramkami od samego modułu persistence.

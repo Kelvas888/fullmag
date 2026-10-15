@@ -1983,6 +1983,13 @@ pub(crate) fn run_pending_accepted_start(
     if specification.run_id != run_id {
         bail!("accepted worker RunSpec belongs to another run");
     }
+    // A worker process may be restored after its scheduler admitted the task.
+    // Recheck the immutable Compute release immediately before loading the
+    // accepted study or executing a solver. Legacy runs without the optional
+    // manual policy remain permitted by the session gate.
+    if !store.accepted_run_start_permitted(run_id.as_str())? {
+        bail!("accepted worker refuses to execute before explicit Compute release");
+    }
     let accepted = retry_store_writer_busy(|| {
         fullmag_runtime_control::load_accepted_study_snapshot(
             store,
@@ -2879,5 +2886,85 @@ mod accepted_fem_runtime_tests {
             fullmag_session::FmsResourceKind::Cpu,
             true
         ));
+    }
+
+    #[test]
+    fn restored_manual_worker_requires_exact_compute_release_before_claim_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = fullmag_session::SessionStore::open(directory.path().join("store")).unwrap();
+        let run_id = "run-manual-worker-recovery";
+        let task_id = "task-recovered";
+        let intent = fullmag_session::FmsRunIntent::new(
+            run_id,
+            "intent-manual-worker-recovery",
+            serde_json::json!({
+                "schema_version": "run_spec.v2",
+                "run_id": run_id,
+                "snapshot": {
+                    "project_id": "project-manual-worker-recovery",
+                    "definition_revision": 1,
+                    "definition_sha256": "a".repeat(64)
+                },
+                "study": {
+                    "study_id": "study-manual-worker-recovery",
+                    "plan_version": "study_plan.v2",
+                    "plan_sha256": "b".repeat(64)
+                },
+                "study_catalog_sha256": "c".repeat(64),
+                "parameters": {
+                    (fullmag_session::ACCEPTED_RUN_START_POLICY_KEY): {
+                        "schema_version": "accepted_run_start_policy.v1",
+                        "mode": "manual"
+                    }
+                },
+                "seeds": {},
+                "dependencies": [],
+                "immutable_assets": [],
+                "requested_execution": {
+                    "backend": "fdm",
+                    "device": "cpu",
+                    "precision": "double",
+                    "mode": "strict",
+                    "minimum_resources": {
+                        "cpu_millis": 100,
+                        "memory_bytes": 1,
+                        "gpu_memory_bytes": 0,
+                        "storage_bytes": 1
+                    }
+                }
+            }),
+        );
+        store.commit_run_intent(&intent).unwrap();
+        store
+            .commit_run_catalog(&fullmag_session::FmsRunCatalog {
+                schema_version: fullmag_session::FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: run_id.into(),
+                revision: 1,
+                updated_at: chrono::Utc::now(),
+                tasks: vec![fullmag_session::FmsTaskCatalogEntry {
+                    task_id: task_id.into(),
+                    input_fingerprint: "d".repeat(64),
+                    lifecycle: fullmag_session::FmsTaskLifecycle::Preparing,
+                    readiness: fullmag_session::FmsTaskReadiness::Ready,
+                    observation: None,
+                    attempt_id: Some("attempt-recovered".into()),
+                    ownership_epoch: Some(1),
+                    resolved_input_fingerprint: None,
+                    artifact_ids: Vec::new(),
+                    resource_id: Some("resource-cpu".into()),
+                    coordinator_watermark: None,
+                    coordinator_genesis: None,
+                }],
+            })
+            .unwrap();
+
+        let error = match super::run_pending_accepted_start(&store, run_id, task_id) {
+            Ok(_) => panic!("manual worker recovery must not execute without a release"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("explicit Compute release"),
+            "missing exact release must fail before claim recovery: {error:#}"
+        );
     }
 }

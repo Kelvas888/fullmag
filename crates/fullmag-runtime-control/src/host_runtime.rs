@@ -261,7 +261,7 @@ mod recovery_tests {
     }
 
     #[test]
-    fn accepted_recovery_loads_study_assets_only_for_an_exact_preparing_claim() {
+    fn accepted_recovery_requires_release_before_loading_study_assets_for_a_preparing_claim() {
         let fixture = recovery_fixture();
         let run_id = fullmag_application::RunId::parse(&fixture.request.identity.run_id).unwrap();
         let specification: fullmag_application::RunSpecification =
@@ -279,7 +279,12 @@ mod recovery_tests {
                     "plan_sha256": "b".repeat(64)
                 },
                 "study_catalog_sha256": "c".repeat(64),
-                "parameters": {}, "seeds": {}, "dependencies": [], "immutable_assets": [],
+                "parameters": {
+                    (fullmag_session::ACCEPTED_RUN_START_POLICY_KEY): {
+                        "schema_version": "accepted_run_start_policy.v1",
+                        "mode": "manual"
+                    }
+                }, "seeds": {}, "dependencies": [], "immutable_assets": [],
                 "requested_execution": {
                     "backend": "fdm", "device": "cpu", "precision": "double", "mode": "strict",
                     "minimum_resources": {
@@ -289,14 +294,13 @@ mod recovery_tests {
                 }
             }))
             .unwrap();
-        fixture
-            .store
-            .commit_run_intent(&FmsRunIntent::new(
-                run_id.as_str(),
-                "recovery-missing-assets",
-                serde_json::to_value(specification).unwrap(),
-            ))
-            .unwrap();
+        let intent = FmsRunIntent::new(
+            run_id.as_str(),
+            "recovery-missing-assets",
+            serde_json::to_value(specification).unwrap(),
+        );
+        let specification_sha256 = intent.payload_sha256.clone();
+        fixture.store.commit_run_intent(&intent).unwrap();
 
         let catalog_task = |lifecycle, resource_id: Option<&str>| FmsTaskCatalogEntry {
             task_id: fixture.request.identity.task_id.clone(),
@@ -346,6 +350,22 @@ mod recovery_tests {
             Some("compute.cpu"),
         )];
         fixture.store.commit_run_catalog(&catalog).unwrap();
+        let held = crate::scheduler::resume_next_admitted_accepted_task_with_host(
+            &fixture.store,
+            &run_id,
+            "compute.cpu",
+            &fixture.context,
+        )
+        .unwrap();
+        assert!(held.is_none(), "manual recovery must remain held without release");
+        fixture
+            .store
+            .release_accepted_run_start(
+                run_id.as_str(),
+                &specification_sha256,
+                "recovery-compute-release",
+            )
+            .unwrap();
         let error = crate::scheduler::resume_next_admitted_accepted_task_with_host(
             &fixture.store,
             &run_id,
