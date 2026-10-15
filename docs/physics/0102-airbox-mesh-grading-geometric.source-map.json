@@ -349,22 +349,22 @@
       "id": "scoped-source-plane-seeds",
       "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py",
       "symbol": "_embed_mixed_source_face_seed_points",
-      "responsibility": "Projects ComponentRestrictedBox and owner lower-bound composition into source-plane coordinates, filters trimmed surfaces with gmsh.model.isInside, and embeds bounded point targets before 2-D generation without changing CAD boundaries.",
-      "evidence_status": "focused_interpreted_gmsh_passed_runtime_not_verified"
+      "responsibility": "Projects ComponentRestrictedBox and graded Box/Cylinder/Sphere descriptors into exact source-plane coordinates, validates the GeometryName owner, composes owner lower bounds, filters trimmed surfaces with gmsh.model.isInside, rejects malformed source bounding boxes, and embeds bounded point targets before 2-D generation without changing CAD boundaries.",
+      "evidence_status": "focused_real_gmsh_graded_passed_runtime_density_not_verified"
     },
     {
       "id": "graded-source-plane-policy",
       "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_fields.py",
       "symbol": "_add_exact_plane_projected_cap_field",
-      "responsibility": "Intended exact-plane evaluation of graded upper descriptors with the canonical owner/lower composition; source-face integration and density/runtime evidence remain unverified.",
-      "evidence_status": "planned_contract"
+      "responsibility": "Evaluates owner-bound graded upper descriptors on every z-directed exact layer plane with the canonical owner/lower composition; nonparallel exact-cap projections fail closed, while managed runtime and density remain unverified.",
+      "evidence_status": "focused_real_gmsh_graded_passed_runtime_density_not_verified"
     },
     {
       "id": "plane-projected-graded-descriptors",
       "path": "packages/fullmag-py/src/fullmag/meshing/_gmsh_fields.py",
       "symbol": "_PLANE_PROJECTED_UPPER_KINDS",
-      "responsibility": "Existing allowlist for ComponentRestrictedGradedBox, ComponentRestrictedGradedCylinder and ComponentRestrictedGradedSphere; use by the source-face seeder is not yet verified.",
-      "evidence_status": "planned_contract"
+      "responsibility": "Allowlist consumed by the exact-plane cap and swept source-face route for ComponentRestrictedGradedBox, ComponentRestrictedGradedCylinder and ComponentRestrictedGradedSphere; unsupported exact-cap projections fail closed.",
+      "evidence_status": "focused_real_gmsh_graded_passed_runtime_density_not_verified"
     },
     {
       "id": "public-box-cad-air-guard",

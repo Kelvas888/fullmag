@@ -1,7 +1,7 @@
 # Thin-film shared-domain meshing
 
 - Status: implemented scoped candidate; managed runtime, 0105 density and production evidence **NOT VERIFIED**
-- Ostatnia aktualizacja: 2026-10-14
+- Ostatnia aktualizacja: 2026-10-15
 - Decyzje: [ADR 0021](../adr/0021-native-mixed-p1-fem-topology.md), [ADR 0027](../adr/0027-canonical-fem-mesh-policy-and-quality-evidence.md)
 - Gate produkcyjny: [0105](0105-fem-meshing-production-acceptance.md)
 
@@ -52,45 +52,58 @@ h_{\Sigma,k}(x,y)=h_{\mathrm{target}}(x,y,z_k),
 ```
 
 Here $\Sigma_k$ is the 2D cross-section of the exact body-layer GEO volumes
-at the requested plane $z_k$. The intended method keeps the existing
-upper/lower composition and evaluates it at that plane; a shared internal
-plane must be triangulated once and reused by both adjacent slabs. This is a
-testable implementation hypothesis, not evidence that the current Gmsh
-generation path actually evaluates those regional fields there.
+at the requested plane $z_k$. The current source path realizes this policy in
+two stages. Before extrusion, `_embed_mixed_source_face_seed_points` validates
+the owner, projects Box and graded Box/Cylinder/Sphere footprints into the
+source plane, composes the applicable lower bounds and embeds only points that
+`gmsh.model.isInside` accepts. After extrusion,
+`_add_swept_exact_plane_cap_field` calls
+`_add_exact_plane_projected_cap_field` for each exact layer plane and binds the
+same owner-volume tags. This preserves the requested $N_z$ and the canonical
+upper/lower composition at the source and volume stages.
 
-If realized, cross-section-local sizing would let a finite region intersecting
-an exact plane receive local in-plane edges before the adjacent slab
-tetrahedra are formed. It would not change $N_z$, introduce intermediate $z$
-levels, enlarge the ROI, or refine the whole source cap through unrelated air.
-The actual field-evaluation and layer-mesh timing still require GHA evidence.
+This source realization does not introduce intermediate $z$ levels, enlarge
+the ROI or refine the whole source cap through unrelated air. The focused
+interpreted source regression passed; it exercises the owner/shape projection
+and fail-closed bounding-box checks with a test double. Actual Gmsh mesh
+field evaluation, layer timing, density, managed runtime and 0105 qualification
+still require separate evidence. Focused real-Gmsh checks nevertheless passed
+for the graded Box (805 nodes/3456 elements), graded Cylinder (777 nodes/3370
+elements) and existing Box (819 nodes/3577 elements), with the expected
+cell-topology sets. The exact-plane cap is z-directed; nonparallel graded
+projections and unsupported exact-cap variants fail closed.
 
 (thin-film-graded-source-plane-policy)=
-### Graded scoped fields on the source plane — intended realization
+### Graded scoped fields on the source plane — current realization and validation boundary
 
-`ComponentRestrictedGradedBox` and `ComponentRestrictedGradedCylinder` are
-existing scoped upper-target descriptors produced for explicit transition
-policies. On every exact plane $z_k$, the source-face realization must evaluate
-the complete existing $h_{\mathrm{target}}(x,y,z_k)$ on the descriptor's plane
-footprint. It must preserve `VIn`, `VOut` and `TransitionDistance` in the
-scalar field; replacing a graded descriptor with its `VIn`, a global cap or a
-copied source-face triangulation changes the requested sizing semantics.
+`ComponentRestrictedGradedBox`, `ComponentRestrictedGradedCylinder` and
+`ComponentRestrictedGradedSphere` are scoped upper-target descriptors produced
+for explicit transition policies. The current source-face path recognizes all
+three, validates the `GeometryName` owner, and projects each accepted footprint
+onto the exact source-plane axes. It preserves `VIn`, `VOut` and
+`TransitionDistance` in the descriptor passed to the later owner-volume field;
+replacing a graded descriptor with its `VIn`, a global cap or a copied
+source-face triangulation would change the requested sizing semantics.
 
 The projected upper field remains part of the canonical composition
-`Max(Min(upper), Max(lower))`. Its owner restriction must use the exact
-component volume binding (and the source surface for the pre-3D cap), so a
-region that has no owner volume cannot become active through an AABB-only
-fallback. A vertical cylinder projects to its plane disc and a box to its
-plane rectangle; a descriptor that cannot be projected without changing its
-shape must be rejected with a reason before meshing. No unsupported graded
-field may be silently ignored.
+`Max(Min(upper), Max(lower))`. Its owner restriction uses the exact component
+volume binding, while the pre-3D source-face seeds use the same owner and
+source-surface binding. A vertical cylinder projects to its plane disc and a
+box to its plane rectangle. A cylinder whose axis cannot be projected onto the
+source-face normal, malformed shape parameters, missing graded ownership and
+invalid source-surface bounding boxes are rejected with a reason before
+meshing; they are not silently replaced by a global cap.
 
 For Box-minus-Cylinder source faces, candidate seed points are retained only
 when `gmsh.model.isInside` confirms membership in the trimmed source surface.
-The owner mask, lower bounds, holes and the exact layer planes remain
-independent obligations. This method changes neither CAD boundaries nor
-`N_z`; it only makes the existing graded field visible to the 2-D source-face
-sampler. The graded source-face integration and its density/runtime evidence
-remain **NOT VERIFIED** until the focused implementation regression passes.
+The owner mask, lower bounds, holes and exact layer planes remain independent
+obligations. This implementation changes neither CAD boundaries nor $N_z$; it
+only makes the existing graded field visible to the 2-D source-face sampler
+and to the later exact-plane cap. The focused interpreted source regression
+(`test_source_plane_seed_rejects_invalid_surface_bounding_box` and
+`test_source_plane_seed_supports_graded_component_fields`) passed with two
+tests and four subtests. Actual Gmsh mesh runtime, density, managed runtime
+and 0105 qualification remain **NOT VERIFIED**.
 
 (thin-film-mesh-symbols-and-si-units)=
 ## Symbols and SI units
@@ -439,8 +452,9 @@ actual-Gmsh evidence can qualify a transition implementation.
 | Scoped field composition | `packages/fullmag-py/src/fullmag/meshing/_gmsh_fields.py` | `_configure_mesh_size_fields` | składa upper/lower pola; lokalna ewaluacja w layered GEO i density gate pozostają niezakwalifikowane |
 | Owner binding | `packages/fullmag-py/src/fullmag/meshing/_mesh_targets.py` | `_geometry_owner_alias_index` | exact-name-first roster, jednoznaczne aliasy i izolacja polityk obiektów |
 | Ring owner source seed | `packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py` | `_generate_coincident_ring_airbox_mesh` | przypina ringowe powierzchnie `annulus`/`hole` do owner targetu przed utworzeniem objętości 3D; neutralny `VOut`, bez zmiany ścieżki Box |
-| Graded source-plane policy | `packages/fullmag-py/src/fullmag/meshing/_gmsh_fields.py` | `_add_exact_plane_projected_cap_field` | zamierzona realizacja ocenia pełne graded upper fields na exact planes, zachowuje owner restriction i kompozycję lower; source-face integration **NOT VERIFIED** |
-| Plane-projected graded descriptors | `packages/fullmag-py/src/fullmag/meshing/_gmsh_fields.py` | `_PLANE_PROJECTED_UPPER_KINDS` | allowlista istniejących ComponentRestrictedGradedBox/Cylinder/Sphere descriptors; wykorzystanie przez source-face seeder **NOT VERIFIED** |
+| Scoped source-plane seeds | `packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py` | `_embed_mixed_source_face_seed_points` | Projects ComponentRestrictedBox and graded Box/Cylinder/Sphere targets onto the magnetic source plane, validates the GeometryName owner, composes owner lower bounds, excludes trimmed holes with gmsh.model.isInside, rejects malformed bounding boxes, and embeds points before 2-D generation while preserving exact layers and independent exterior-air planes. | focused source regression and real-Gmsh graded Box/Cylinder/existing-Box checks passed; runtime, density and 0105 **NOT VERIFIED** |
+| Graded source-plane policy | `packages/fullmag-py/src/fullmag/meshing/_gmsh_fields.py` | `_add_exact_plane_projected_cap_field` | ocenia owner-bound graded upper fields na każdym z-directed exact plane z kanoniczną kompozycją upper/lower; nonparallel exact-cap projections fail closed | focused real-Gmsh graded checks passed; managed runtime, density i 0105 **NOT VERIFIED** |
+| Plane-projected graded descriptors | `packages/fullmag-py/src/fullmag/meshing/_gmsh_fields.py` | `_PLANE_PROJECTED_UPPER_KINDS` | allowlista używana przez exact-plane cap i swept source-face route dla graded Box/Cylinder/Sphere; unsupported exact-cap projections są odrzucane | focused real-Gmsh graded checks passed; mesh runtime i density **NOT VERIFIED** |
 | Actual density regression | `packages/fullmag-py/tests/test_meshing.py` | `test_direct_layered_box_region_floor_beats_eligible_upper_actual_density` | rzeczywisty ROI/bulk density i dokładne planes; wcześniejszy GHA gate FAILED, świeże evidence po kandydacie **NOT VERIFIED** |
 | Quality | `packages/fullmag-py/src/fullmag/meshing/_gmsh_extraction.py` | `_extract_quality_metrics` | bieżące metryki Gmsh |
 
