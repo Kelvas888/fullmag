@@ -171,7 +171,7 @@ def _interface_balances(payload: Mapping[str, Any], module: Mapping[str, Any]) -
         "absorbed_spin_flux": list(_vector(absorbed, label="interface_balances.absorbed_spin_flux")),
         "torque": list(_vector(torque, label="interface_balances.torque")),
         "charge_closure": _finite(
-            raw.get("charge_closure", 0.0), label="interface_balances.charge_closure"
+            raw.get("charge_closure"), label="interface_balances.charge_closure"
         ),
     }
     for key in ("normal_spin_flux", "ferromagnet_spin_flux", "spin_torque_closure"):
