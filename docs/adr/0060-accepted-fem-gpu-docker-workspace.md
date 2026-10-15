@@ -76,6 +76,29 @@ przez przydział hosta. Żądanie wielu GPU lub innego ordinału jest odrzucane.
 Run/Relax wymagają osobnego accepted admission oraz publikacji do istniejącego
 live read model. Sam helper migracyjny nie potwierdza wykonania tych etapów.
 
+## Przygotowanie bez automatycznego Solve
+
+Oczekiwanie interaktywnego skryptu jest trwałą polityką accepted run, a nie
+pominięciem pojedynczego wywołania kolejki. Scheduler może sam kolejkować
+zadania po opublikowaniu preparation receipt, dlatego `wait_for_solve` zapisuje
+w immutable RunSpec.parameters zarezerwowany klucz
+`fullmag.accepted_run_start` z `schema_version=accepted_run_start_policy.v1`
+i `mode=manual`. Brak tego klucza zachowuje dotychczasowy start automatyczny.
+Niepoprawny zadeklarowany kontrakt jest odrzucany bez automatycznego fallbacku.
+
+Native FEM preparation i publikacja siatki mogą zakończyć się przed Compute.
+Scheduler compute, bezpośrednie kolejkowanie i obie granice admission sprawdzają
+start gate przed claim/allocation. Dopiero jawne Compute po sprawdzeniu
+session/epoch/revision publikuje immutable `start_release.json`, związany
+z run ID, dokładnym SHA-256 specyfikacji i identyfikatorem żądania. Zapis jest
+chroniony writer lease; replay zwraca pierwotny grant bez zastępowania autora
+lub czasu. Brak grantu po restarcie nadal oznacza oczekiwanie. Nie jest to
+implementacja Pause ani cofanie już uruchomionego Solve.
+
+Ten kontrakt nie dodaje browser endpointu ani drugiego modelu viewportu.
+Wdrożenie policy/release w adapterze live i dowód `wait_for_solve` w przeglądarce
+pozostają oddzielnymi bramkami od samego modułu persistence.
+
 ## Granica aktualnej implementacji UI
 
 Durable accepted task i bieżący journal komend live Workspace są odrębnymi

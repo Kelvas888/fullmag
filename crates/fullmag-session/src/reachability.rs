@@ -214,6 +214,7 @@ enum RunPathKind {
 const KNOWN_RUN_RECORDS: &[&str] = &[
     "run_manifest.json",
     "run_intent.json",
+    "start_release.json",
     "run_catalog.json",
     "artifact_catalog.json",
     "preparation_receipt.json",
@@ -1431,6 +1432,19 @@ impl StoreWalker {
             let intent_path = run_entry.path().join("run_intent.json");
             if intent_path.exists() {
                 self.walk_run_intent_file(&intent_path, &run_id)?;
+            }
+            let start_release_path = run_entry.path().join("start_release.json");
+            if start_release_path.exists() {
+                let relative = format!("runs/{run_id}/start_release.json");
+                let data = self.read_file(&start_release_path, &relative)?;
+                let release: crate::AcceptedRunStartRelease = parse_json(&data, &relative)?;
+                let intent_relative = format!("runs/{run_id}/run_intent.json");
+                let intent_data = self.read_file(&intent_path, &intent_relative)?;
+                let intent: FmsRunIntent = parse_json(&intent_data, &intent_relative)?;
+                if intent.run_id != run_id {
+                    bail!("start release owner intent differs from the run path");
+                }
+                release.validate_for(&intent)?;
             }
             let catalog_path = run_entry.path().join("run_catalog.json");
             if catalog_path.exists() {
@@ -2763,6 +2777,28 @@ impl<'a> ArchiveWalker<'a> {
         self.validate_archive_namespace()?;
         self.walk_archive_live_snapshot()?;
         self.walk_archive_solutions()?;
+        // A manual-start grant is control provenance, including before a run
+        // manifest exists. It cannot be imported as an opaque JSON document.
+        let release_names = self.documents.keys().filter(|name| name.ends_with("/start_release.json"))
+            .cloned().collect::<Vec<_>>();
+        for relative in release_names {
+            let run_id = relative.strip_prefix("runs/")
+                .and_then(|name| name.strip_suffix("/start_release.json"))
+                .context("start release path is outside a run namespace")?;
+            validate_component(run_id)?;
+            let bytes = self.documents.read(&relative)?.context("start release disappeared")?;
+            let release: crate::AcceptedRunStartRelease = parse_json(&bytes, &relative)?;
+            let intent_relative = format!("runs/{run_id}/run_intent.json");
+            let intent_bytes = self.documents.read(&intent_relative)?
+                .context("start release requires its immutable owner run intent")?;
+            let intent: FmsRunIntent = parse_json(&intent_bytes, &intent_relative)?;
+            if intent.run_id != run_id {
+                bail!("start release owner intent differs from the archive path");
+            }
+            release.validate_for(&intent)?;
+            self.report.file_refs.insert(relative.clone());
+            self.walk_run_intent(&intent_relative, run_id)?;
+        }
         if let Some(data) = self.documents.read("manifest/session.json")? {
             let session: FmsSessionManifest = parse_json(&data, "manifest/session.json")?;
             validate_session(&session, "manifest/session.json")?;

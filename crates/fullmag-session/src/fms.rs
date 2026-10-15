@@ -658,6 +658,12 @@ fn plan_run_entries(
                 data,
             ))?;
         }
+        let start_release = run_dir.join("start_release.json");
+        if let Some(data) = read_store_file_if_exists(store_root, canonical_root, &start_release)? {
+            entries.push_entry(PackEntry::from_bytes(
+                format!("runs/{run_id}/start_release.json"), data,
+            ))?;
+        }
         let run_catalog = run_dir.join("run_catalog.json");
         if let Some(data) = read_store_file_if_exists(store_root, canonical_root, &run_catalog)? {
             entries.push_entry(PackEntry::from_bytes(
@@ -2802,6 +2808,28 @@ mod tests {
             FmsExportProfile::for_profile(profile),
             documents,
         )
+    }
+
+    #[test]
+    fn accepted_start_gate_roundtrips_through_fms() {
+        let (_directory, store, mut session, workspace, profile, documents) = pack_fixture(SaveProfile::Compact);
+        let intent = FmsRunIntent::new("run-held", "intent-held", serde_json::json!({
+            "run_id":"run-held",
+            "parameters":{(crate::ACCEPTED_RUN_START_POLICY_KEY):{"schema_version":"accepted_run_start_policy.v1","mode":"manual"}}
+        }));
+        store.commit_run_intent(&intent).unwrap();
+        let release = store.release_accepted_run_start("run-held", &intent.payload_sha256, "compute-first").unwrap();
+        store.write_import_document("runs/run-held/run_manifest.json", &serde_json::to_vec(&test_run("run-held")).unwrap()).unwrap();
+        session.run_refs.push("runs/run-held/run_manifest.json".into());
+        let mut archive = Cursor::new(Vec::new());
+        pack_fms(&mut archive, &store, &session, &workspace, &profile, &documents, &PackOptions::default()).unwrap();
+        let restored_directory = tempfile::tempdir().unwrap();
+        let restored = SessionStore::open(restored_directory.path()).unwrap();
+        unpack_fms(Cursor::new(archive.into_inner()), &restored).unwrap();
+        assert!(restored.accepted_run_start_permitted("run-held").unwrap());
+        let bytes = std::fs::read(restored.root().join("runs/run-held/start_release.json")).unwrap();
+        let restored_release: crate::AcceptedRunStartRelease = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored_release, release);
     }
 
     fn portable_solution(object_ref: String, byte_length: u64) -> SolutionSet {

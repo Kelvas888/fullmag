@@ -705,6 +705,11 @@ fn schedule_next_ready_accepted_task_with_admission(
     if specification.run_id != *run_id {
         bail!("accepted scheduler run id differs from the immutable RunSpec");
     }
+    // Preparation remains independent. An explicit-start run must not be
+    // auto-queued or allocated merely because a preparation receipt exists.
+    if !store.accepted_run_start_permitted(run_id.as_str())? {
+        return Ok(None);
+    }
     let accepted =
         crate::load_accepted_study_snapshot(store, run_id, &specification.snapshot.project_id)?;
 

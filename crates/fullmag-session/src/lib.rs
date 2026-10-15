@@ -74,7 +74,10 @@ pub use fms::{
     unpack_fms, unpack_fms_for_visualization, unpack_fms_staged, FmsPreflight,
     FmsStagedPreflight, PackOptions,
 };
-pub use store::{CheckpointStillReferenced, GcPlan, RunBacklogFull, SessionStore};
+pub use store::{
+    AcceptedRunStartRelease, CheckpointStillReferenced, GcPlan, RunBacklogFull, SessionStore,
+    ACCEPTED_RUN_START_POLICY_KEY,
+};
 pub use task_cancellation::{
     FmsTaskCancellationIntent, TaskCancellationIntentCommitDisposition,
     TaskCancellationIntentConflict, FMS_TASK_CANCELLATION_INTENT_SCHEMA,

@@ -504,6 +504,9 @@ pub fn queue_accepted_study_task(
     step_id: &str,
     inputs: std::collections::BTreeMap<String, ResolvedInput>,
 ) -> Result<QueuedAcceptedStudyTask> {
+    if !store.accepted_run_start_permitted(run_id.as_str())? {
+        bail!("accepted run is waiting for explicit Compute release");
+    }
     let accepted = load_accepted_study_snapshot(store, run_id, project_id)?;
     let study_step = accepted
         .study

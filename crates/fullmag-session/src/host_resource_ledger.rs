@@ -2872,6 +2872,11 @@ impl HostResourceLedger {
         let _store_writer = store.write_transaction()?;
         let canonical_store_id = Self::store_id(store.root())?;
         validate_request_matches_store_claim(request, lease, &canonical_store_id)?;
+        if store.read_run_intent(&lease.run_id)?.is_some()
+            && !store.accepted_run_start_permitted(&lease.run_id)?
+        {
+            return Ok(None);
+        }
 
         if store
             .read_task_cancellation_intent(&lease.run_id, &lease.task_id)?

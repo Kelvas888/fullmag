@@ -35,6 +35,9 @@ use crate::writer::{WriteTransaction, Writer};
 
 const MAX_TASK_ADMISSION_RECORD_BYTES: usize = 1024 * 1024;
 
+#[path = "accepted_start_gate.rs"]
+mod accepted_start_gate;
+pub use accepted_start_gate::{AcceptedRunStartRelease, ACCEPTED_RUN_START_POLICY_KEY};
 mod development_commit;
 mod development_completion;
 mod development_fence;
@@ -3429,6 +3432,11 @@ impl SessionStore {
         }
         let _writer_lease = self.write_transaction()?;
         self.ensure_development_admission_open_unlocked()?;
+        if self.read_run_intent(&lease.run_id)?.is_some()
+            && !self.accepted_run_start_permitted(&lease.run_id)?
+        {
+            anyhow::bail!("accepted run is waiting for explicit Compute release");
+        }
         let record_path =
             self.task_admission_path(&lease.run_id, &lease.task_id, &lease.attempt_id)?;
         if record_path.exists() {

@@ -104,6 +104,9 @@ jobs:
                   f"FULLMAG_PROJECT_STORAGE_ROOT={layout['storage_root']}\n"
               )
           PY
+      - name: Run accepted explicit Compute start-gate contracts
+        run: cargo test -p fullmag-session --lib accepted_start_gate
+
       - name: Run complete session reachability and archive contracts
         run: cargo test -p fullmag-session --lib --no-fail-fast
 
