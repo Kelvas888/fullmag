@@ -696,7 +696,6 @@ quadrature provenance in the stage receipt.
 4. FullMag physics contracts: `docs/physics/0600-fem-eigenmodes-linearized-llg.md`, `docs/physics/0830-fem-poisson-airbox-modal-eigen.md`, and `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md`.
 
 (linearized-llg-source-code-index)=
-(source-code-index)=
 ## 13. Source-code index
 
 | Repository path | Stable symbol | Responsibility |

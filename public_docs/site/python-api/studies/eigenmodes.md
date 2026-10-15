@@ -236,7 +236,6 @@ unsupported combinations (`plan_fem_eigen`) without silent fallback.
 2. M. d'Aquino, C. Serpico, G. Miano, and C. Forestiere, “A novel formulation for the numerical computation of magnetization modes in complex micromagnetic systems,” *Journal of Computational Physics*, 228, 6130–6149 (2009).
 
 (python-api-studies-eigenmodes-source-code-index)=
-(source-code-index)=
 ## 13. Source-code index
 
 ### Control Room crosswalk

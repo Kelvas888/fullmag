@@ -230,7 +230,6 @@ study.stages.add_frequency_response(
 2. FullMag physics contract: `docs/physics/0828-fem-frequency-domain-floquet-demag.md`.
 
 (floquet-response-source-code-index)=
-(source-code-index)=
 ## 13. Source-code index
 
 | Repository path | Stable symbol | Responsibility |

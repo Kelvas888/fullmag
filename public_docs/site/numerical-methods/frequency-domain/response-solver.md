@@ -372,7 +372,6 @@ frequency grid, excitation vector/phase, operator flags, and `solver_policy`:
 3. FullMag physics contracts: `docs/physics/0700-frequency-domain-linearized-llg.md` and `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md`.
 
 (response-solver-source-code-index)=
-(source-code-index)=
 ## 13. Source-code index
 
 | Repository path | Stable symbol | Responsibility |

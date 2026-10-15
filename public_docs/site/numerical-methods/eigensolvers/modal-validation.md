@@ -364,7 +364,6 @@ Validation contracts serialize into `runtime_metadata.k0_kittel_validation` and
 3. FullMag physics contracts: `docs/physics/0600-fem-eigenmodes-linearized-llg.md` and `docs/physics/0830-fem-poisson-airbox-modal-eigen.md`.
 
 (modal-validation-source-code-index)=
-(source-code-index)=
 ## 13. Source-code index
 
 | Repository path | Stable symbol | Responsibility |
