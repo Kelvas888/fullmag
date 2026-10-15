@@ -1,5 +1,8 @@
 """Fail before API startup when GPU or durable state storage is unavailable."""
 import ctypes
+import hashlib
+import json
+import re
 import os
 import subprocess
 import sys
@@ -10,10 +13,89 @@ import uuid
 from pathlib import Path
 
 
+def _publish_linux_readback(probe, directory_fd, name, payload):
+    """Publish guest attestations readable by the host's distinct UID."""
+    probe._publish_at(directory_fd, name, payload)
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory_fd)
+    try:
+        os.fchmod(descriptor, 0o644)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def linux_storage_probe(require_restart, root=Path("/state"),
+                        certificate=Path("/run/fullmag/linux-native-host.json")):
+    """Qualify native Linux storage using pinned, no-follow file operations."""
+    import windows_folder_probe as probe
+
+    host = json.loads(probe.read_regular(certificate))
+    image = os.environ.get("FULLMAG_RUNTIME_IMAGE_ID", "")
+    if (not isinstance(host, dict)
+            or host.get("schema") != "fullmag.linux-native-host.v1"
+            or host.get("storage_profile") != "linux-native-v1"
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", image)
+            or host.get("image_id") != image
+            or not isinstance(host.get("owner_token"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", host["owner_token"])
+            or type(host.get("restart_verified")) is not bool):
+        raise RuntimeError("Invalid native Linux host admission")
+    payload = (host["owner_token"] + ":" + image).encode("ascii")
+    expected = hashlib.sha256(payload).hexdigest()
+    if host.get("restart_expected_sha256") != expected:
+        raise RuntimeError("Invalid native Linux restart digest")
+    if require_restart and host["restart_verified"] is not True:
+        raise RuntimeError("Native Linux host has not confirmed restart readback")
+
+    root_fd = probe._open_pinned_directory(root)
+    try:
+        if probe._read_regular_at(root_fd, ".linux-native-sentinel", 256) != payload:
+            raise RuntimeError("Native Linux host sentinel mismatch")
+        restart_name = ".linux-native-restart"
+        existed = probe._exists_at(root_fd, restart_name)
+        if existed:
+            if probe._read_regular_at(root_fd, restart_name, 256) != payload:
+                raise RuntimeError("Restart sentinel changed")
+        elif require_restart:
+            raise RuntimeError("Restart sentinel is missing")
+        else:
+            _publish_linux_readback(probe, root_fd, restart_name, payload)
+
+        directory_fd = probe._ensure_directory_at(root_fd, ".linux-native-probe")
+        try:
+            # Replace a prior value and read back after the durable rename.
+            probe._publish_at(directory_fd, "publication.bin", b"before")
+            probe._publish_at(directory_fd, "publication.bin", payload)
+            if probe._read_regular_at(directory_fd, "publication.bin", 256) != payload:
+                raise RuntimeError("Native Linux atomic publication mismatch")
+            probe._child_lock_probe(directory_fd)
+            probe._sqlite_probe(directory_fd, host["owner_token"])
+        finally:
+            os.close(directory_fd)
+        result = {"schema": "fullmag.linux-native-probe.v1",
+                  "storage_profile": "linux-native-v1", "image_id": image,
+                  "owner_token": host["owner_token"],
+                  "checks": {"file_sync": True, "directory_sync": True,
+                             "atomic_replace": True, "process_lock": True,
+                             "sqlite_transactions": True, "restart_readback": existed}}
+        _publish_linux_readback(probe, root_fd, ".linux-native-probe.json",
+                                json.dumps(result, indent=2).encode("utf-8"))
+        return result
+    finally:
+        os.close(root_fd)
+
+
 def preflight():
     kind = subprocess.check_output(["stat", "-f", "-c", "%t", "/state"], text=True).strip()
-    # Same supported writer filesystem types as the managed browser route.
-    if kind.lower().lstrip("0") == "1021997" and os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") == "windows-folder-v1":
+    profile = os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE")
+    if profile == "linux-native-v1":
+        if kind.lower().lstrip("0") not in {"ef53", "58465342", "9123683e"}:
+            raise RuntimeError(f"Unsupported native Linux durable filesystem 0x{kind}; "
+                               "use ext4, XFS or Btrfs storage")
+        linux_storage_probe(require_restart="--storage-probe" not in sys.argv)
+    # Preserve the Windows operational admission route.
+    elif kind.lower().lstrip("0") == "1021997" and os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") == "windows-folder-v1":
         from windows_folder_probe import run
         run(require_restart="--storage-probe" not in sys.argv)
     elif kind.lower().lstrip("0") not in {"ef53", "58465342", "9123683e", "1021994", "794c7630"}:

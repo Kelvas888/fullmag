@@ -104,6 +104,7 @@ class DockerRuntimeContract(unittest.TestCase):
                 path.mkdir()
             records = [{"worktree": str(main)}, {"worktree": str(task)}]
             with patch("docker_development_inputs.main_checkout", return_value=main), \
+                    patch("docker_development_inputs.local_volume"), \
                     patch.object(runtime.storage, "worktree_records", return_value=records), \
                     patch("docker_development_inputs.local_volume"), \
                     patch.dict(os.environ, {"FULLMAG_SOURCE_ROOT": ""}):
@@ -305,6 +306,97 @@ class DockerRuntimeContract(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "Guest did not expose"):
                     guest.run(True)
 
+    @unittest.skipUnless(os.environ.get("FULLMAG_TEST_COMPOSE_CONFIG") == "1", "Read-only Compose CLI integration gate")
+    def test_linux_compose_uses_native_profile_and_certificate_for_both_modes(self):
+        for development in (False, True):
+            options = {"inputs": {"source_root": "/checkout"}, "inputs_path": Path("/owned/inputs.json"),
+                       "package": Path("/owned/package"), "provenance": Path("/owned/assembly.json")} if development else {}
+            spec = runtime.compose_spec("sha256:" + "a" * 64, Path("/owned/state"), 3197,
+                                        Path("/owned/linux.json"), storage_profile="linux-native-v1", **options)
+            backend = spec["services"]["backend"]
+            self.assertEqual(backend["environment"]["FULLMAG_SESSION_STORAGE_PROFILE"], "linux-native-v1")
+            certificate = next(m for m in backend["volumes"] if m["target"] == "/run/fullmag/linux-native-host.json")
+            self.assertTrue(certificate["read_only"])
+            self.assertFalse(certificate["bind"]["create_host_path"])
+            self.assertNotIn("/run/fullmag/windows-folder-host.json", [m["target"] for m in backend["volumes"]])
+
+    def test_linux_admission_checks_restart_and_host_readback(self):
+        import hashlib
+        import linux_docker_host
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            certificate_path = root / "certificate.json"
+            receipt = {}
+            def call(*args, **kwargs):
+                if args[0] == "wait":
+                    certificate = json.loads(certificate_path.read_text())
+                    sentinel = (certificate["owner_token"] + ":" + certificate["image_id"]).encode()
+                    (state / ".linux-native-restart").write_bytes(sentinel)
+                    (state / ".linux-native-probe.json").write_text(json.dumps({"checks": {
+                        name: True for name in ("file_sync", "directory_sync", "atomic_replace",
+                                                "process_lock", "sqlite_transactions", "restart_readback")}}))
+                    return "0"
+                if "ps" in args:
+                    return "owned-probe"
+                return ""
+            with patch.object(linux_docker_host, "local_volume", return_value={"filesystem": "ext4", "device": 1}), \
+                    patch.object(runtime, "docker", side_effect=call) as docker:
+                runtime.admit_linux_storage(state, certificate_path, "sha256:" + "a" * 64,
+                                            ["compose"], root / "compose.json", {"services": {"backend": {}}}, receipt, root)
+            self.assertTrue(json.loads(certificate_path.read_text())["restart_verified"])
+            self.assertEqual(receipt["restart_probe_exit_code"], "0")
+            self.assertIn(unittest.mock.call("start", "owned-probe"), docker.call_args_list)
+            self.assertEqual(receipt["storage_power_loss"], "NOT VERIFIED")
+            self.assertEqual(hashlib.sha256((state / ".linux-native-restart").read_bytes()).hexdigest(),
+                             json.loads(certificate_path.read_text())["restart_expected_sha256"])
+
+    @unittest.skipIf(os.name == "nt", "Native Linux workspace permissions")
+    def test_seed_is_usable_by_container_uid_under_private_host_umask(self):
+        from docker_development_inputs import seed
+        repo = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            previous = os.umask(0o077)
+            try:
+                inputs = seed(repo, state, 3197)
+            finally:
+                os.umask(previous)
+            self.assertEqual(inputs["source_selection"], "live_linux_selected_checkout")
+            workspace = state / "development/workspace"
+            for path in (state / "development", workspace, *workspace.rglob("*")):
+                if path.is_dir():
+                    self.assertEqual(path.stat().st_mode & 0o007, 0o007, str(path))
+                else:
+                    self.assertTrue(path.stat().st_mode & 0o004, str(path))
+            self.assertTrue((workspace / "apps/control-room/tsconfig.json").stat().st_mode & 0o002)
+
+    @unittest.skipIf(os.name == "nt", "Native Linux container metadata permissions")
+    def test_container_metadata_ignores_private_host_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "inputs.json"
+            previous = os.umask(0o077)
+            try:
+                runtime.publish_container_metadata(path, {"source": "owned"})
+            finally:
+                os.umask(previous)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(json.loads(path.read_text()), {"source": "owned"})
+
+    def test_linux_owned_read_rejects_symlinks_and_oversized_files(self):
+        import linux_docker_host
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target"
+            target.write_bytes(b"owned")
+            self.assertEqual(linux_docker_host.read_owned_regular(target), b"owned")
+            with self.assertRaises(ValueError):
+                linux_docker_host.read_owned_regular(target, maximum=2)
+            link = target.with_name("link")
+            link.symlink_to(target)
+            with self.assertRaises((ValueError, runtime.storage.StorageError, OSError)):
+                linux_docker_host.read_owned_regular(link)
+
     def test_rejects_mutable_image_and_invalid_port(self):
         for image, port in (("fullmag:latest", 3197), ("sha256:" + "a" * 64, 80)):
             with self.assertRaises(ValueError):
@@ -441,6 +533,7 @@ class DockerRuntimeContract(unittest.TestCase):
                     patch.object(runtime.storage, "initialize"), \
                     patch.object(runtime.storage, "build_lock", return_value=nullcontext()), \
                     patch("docker_development_inputs.main_checkout", return_value=main), \
+                    patch("docker_development_inputs.local_volume"), \
                     patch.object(runtime.storage, "worktree_records", return_value=[{"worktree": str(main)}]), \
                     patch("local_runner.build_executor.configured_build"), \
                     patch("local_runner.build_source.native_identity", return_value=native) as identity, \

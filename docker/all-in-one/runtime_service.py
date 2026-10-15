@@ -28,6 +28,8 @@ WORKTREE_ID = TARGET_ID = "docker-all"
 COMPUTE_POOL_ID = "docker-all.compute"
 PREPARATION_POOL_ID = "docker-all.preparation"
 WINDOWS_STORAGE_PROFILE = "windows-folder-v1"
+LINUX_STORAGE_PROFILE = "linux-native-v1"
+LINUX_HOST_CERTIFICATE = Path("/run/fullmag/linux-native-host.json")
 STORAGE_SCHEMA = "fullmag_storage_v1"
 RUNTIME_CONFIG_SCHEMA = "runtime_service_config.v1"
 CONFIG_RELATIVE = Path(".fullmag/runtime-service/docker-all.json")
@@ -249,16 +251,24 @@ def canonical_paths(environment: Mapping[str, str] | None = None) -> RuntimePath
         package=package,
         config=config,
         provenance=IMAGE_ROOT / "provenance.json",
-        host_certificate=HOST_CERTIFICATE,
+        host_certificate=(LINUX_HOST_CERTIFICATE
+                          if environment.get("FULLMAG_SESSION_STORAGE_PROFILE") == LINUX_STORAGE_PROFILE
+                          else HOST_CERTIFICATE),
     )
+
+
+def storage_profile() -> str:
+    profile = os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE")
+    if profile not in (WINDOWS_STORAGE_PROFILE, LINUX_STORAGE_PROFILE):
+        _fail("all-in-Docker storage requires explicit windows-folder-v1 or linux-native-v1 admission")
+    return profile
 
 
 def prepare_storage(paths: RuntimePaths | None = None) -> RuntimePaths:
     """Prepare mapped directories and the fixed project marker only."""
 
     paths = paths or canonical_paths()
-    if os.environ.get("FULLMAG_SESSION_STORAGE_PROFILE") != WINDOWS_STORAGE_PROFILE:
-        _fail("all-in-Docker storage requires explicit windows-folder-v1 admission")
+    storage_profile()
     _ensure_directory(paths.state, "container state")
     _ensure_directory(paths.state_root, "Fullmag state")
     _ensure_directory(paths.runs, "accepted runs root")
@@ -288,7 +298,7 @@ def api_environment(paths: RuntimePaths, config_path: Path | None = None) -> dic
         "FULLMAG_STATE_DIR": str(paths.state_root),
         "FULLMAG_REPO_ROOT": str(paths.source),
         "FULLMAG_RUNTIME_ROOT": str(paths.package),
-        "FULLMAG_SESSION_STORAGE_PROFILE": WINDOWS_STORAGE_PROFILE,
+        "FULLMAG_SESSION_STORAGE_PROFILE": storage_profile(),
         "FULLMAG_RUNTIME_SERVICE_CONFIG": str(config_path),
     }
     image_id = os.environ.get("FULLMAG_RUNTIME_IMAGE_ID")

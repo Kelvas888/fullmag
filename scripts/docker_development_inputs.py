@@ -1,4 +1,4 @@
-"""Seed isolated Linux frontend metadata and bind live Windows source folders."""
+"""Seed isolated Linux frontend metadata and bind selected host source folders."""
 from __future__ import annotations
 
 import hashlib
@@ -7,7 +7,10 @@ from pathlib import Path
 import re
 
 import fullmag_storage as storage
-from windows_folder_host import local_volume, read_owned_regular
+if os.name == "nt":
+    from windows_folder_host import local_volume, read_owned_regular
+else:
+    from linux_docker_host import local_volume, read_owned_regular
 
 DIRECTORIES = ("app", "src", "public", "scripts")
 WORKSPACE = "/state/development/workspace"
@@ -25,18 +28,15 @@ def main_checkout(repo):
 def select_checkout(repo, source_root=None):
     """Choose one Git-registered checkout of this project, never an inferred path."""
     source_root = source_root or os.environ.get("FULLMAG_SOURCE_ROOT")
-    selected = Path(source_root).resolve(strict=True) if source_root else main_checkout(repo)
+    selected = storage.absolute(source_root, "source checkout").resolve(strict=True) if source_root else storage.absolute(main_checkout(repo), "main checkout")
     known = {Path(record["worktree"]).resolve() for record in storage.worktree_records(repo)}
     if selected not in known:
         raise ValueError("Development sources must be a registered checkout of this project")
-    if os.name == "nt":
-        local_volume(selected)
+    local_volume(selected)
     return selected
 
 
 def seed(source, state, port):
-    if os.name != "nt":
-        raise ValueError("Live Docker development sources require native Windows preflight")
     source = source.resolve(strict=True)
     source_volume = local_volume(source)
     initial_commit = storage.git(source, "rev-parse", "HEAD")
@@ -72,8 +72,17 @@ def seed(source, state, port):
         with target.open("xb") as stream:
             stream.write(data)
             stream.flush()
+            if os.name != "nt":
+                os.fchmod(stream.fileno(), 0o666 if relative.as_posix() in {
+                    "apps/control-room/tsconfig.json", "apps/control-room/next-env.d.ts"} else 0o644)
             os.fsync(stream.fileno())
         files.append({"relative": relative.as_posix(), "sha256": hashlib.sha256(data).hexdigest()})
+    if os.name != "nt":
+        # Only this fresh run's generated workspace is writable by container UID
+        # 65532. Never change permissions in the selected source checkout.
+        for directory in (state / "development", destination, *destination.rglob("*")):
+            if directory.is_dir():
+                directory.chmod(0o777)
     commit = storage.git(source, "rev-parse", "HEAD")
     if commit != initial_commit:
         raise ValueError("Main checkout HEAD changed during frontend metadata capture")
@@ -84,7 +93,7 @@ def seed(source, state, port):
     if not re.fullmatch(r"[a-f0-9]{40}", commit):
         raise ValueError("Live source checkout has no full commit identity")
     return {"schema": "fullmag.docker-development-inputs.v1", "source_root": str(source),
-            "source_commit": commit, "source_selection": "live_windows_selected_checkout",
+            "source_commit": commit, "source_selection": "live_windows_selected_checkout" if os.name == "nt" else "live_linux_selected_checkout",
             "source_volume": source_volume, "host_port": port,
             "workspace_root": WORKSPACE, "frontend_root": FRONTEND,
             "live_directories": directories, "files": files,
