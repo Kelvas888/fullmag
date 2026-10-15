@@ -15,6 +15,7 @@ import { KernelContext } from "../KernelContext";
 import { ModuleRegistry } from "../module/ModuleRegistry";
 import { DiagnosticRecorderController } from "../performance/diagnostic-recorder/DiagnosticRecorderController";
 import { RealtimeConnectionController } from "../realtime/RealtimeConnectionController";
+import { statusRefreshIntervalMs } from "../realtime/communicationPolicy";
 import { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import {
@@ -177,6 +178,7 @@ describe("WorkspaceShellClient session collection gate", () => {
   });
 
   it("retains the focused workspace draft when session and status refreshes fail", async () => {
+    vi.useFakeTimers();
     const sessionList = {
       schema_version: "2.0.0",
       sessions: [{
@@ -229,7 +231,11 @@ describe("WorkspaceShellClient session collection gate", () => {
     const { container, dispose } = await mountWorkspace(kernel);
 
     try {
-      await settle();
+      await settleWithFakeTimers();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(statusRefreshIntervalMs() + 1);
+      });
 
       const workspaceBody = findElements(
         container,
@@ -255,7 +261,7 @@ describe("WorkspaceShellClient session collection gate", () => {
         kernel.resources.invalidate(SESSION_STATUS_RESOURCE_KEY, "transport-refresh:1");
         kernel.realtimeConnection.update("disconnected");
       });
-      await settle();
+      await settleWithFakeTimers();
 
       expect(list).toHaveBeenCalledTimes(2);
       expect(currentStatus).toHaveBeenCalledTimes(2);
@@ -281,7 +287,11 @@ describe("WorkspaceShellClient session collection gate", () => {
       expect(container.textContent).toContain("Reconnecting…");
       expect(findByAttribute(container, "aria-modal", "true")).toBeNull();
     } finally {
-      await dispose();
+      try {
+        await dispose();
+      } finally {
+        vi.useRealTimers();
+      }
     }
   });
 
@@ -441,6 +451,14 @@ async function settle(): Promise<void> {
   for (let index = 0; index < 6; index += 1) {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+}
+
+async function settleWithFakeTimers(): Promise<void> {
+  for (let index = 0; index < 6; index += 1) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
     });
   }
 }
