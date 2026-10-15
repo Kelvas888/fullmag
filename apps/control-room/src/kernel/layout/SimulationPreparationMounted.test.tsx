@@ -41,7 +41,6 @@ import { SimulationPreparationLog } from "./SimulationPreparationLog";
 import {
   SimulationStartupOverlay,
   SimulationStartupOverlayView,
-  useSimulationStartupOverlayState,
   type SimulationStartupOverlayState,
 } from "./SimulationStartupOverlay";
 import {
@@ -1136,7 +1135,7 @@ function MountedWorkspace() {
   return (
     <>
       <div data-slot-id="viewport-main">Viewport module</div>
-      <SimulationStartupOverlay state={useSimulationStartupOverlayState()} />
+      <SimulationStartupOverlay />
     </>
   );
 }
