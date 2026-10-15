@@ -1,4 +1,17 @@
 # Status realizacji całego planu refaktoryzacji
+Natywny build 15.10.2026 — [P8-53DA](p8/53da-native-capture-and-runtime-free-browser.md):
+zarządzany Windows dev **PASS, exit 0**, source_identity_check=passed,
+manifest 340c667b3756a46f089338ac9216897598631d674eaef6b72472ea2072678a32.
+Kompilacja zakończona mimo późniejszych commitów checkoutu. Uruchomiono
+rzeczywisty browser lifecycle na tym pakiecie; wynik jeszcze nieznany.
+Pełny plan **IN PROGRESS**, bez awansu bramek solvera lub wydania.
+
+Odbiór CI 15.10.2026 — [P8-53DA](p8/53da-native-capture-and-runtime-free-browser.md):
+Control Room job 116363230322 dla c689caee2 **SUCCESS**: typecheck, lint,
+**8537 PASS / 13 skip / 0 FAIL**, audyt wydajności i produkcyjny build Next.
+Regresja retencji powłoki ma zielony odbiór. Natywny build i rzeczywisty
+browser lifecycle nadal w toku/NOT VERIFIED; pełny plan **IN PROGRESS**.
+
 Checkpoint 15.10.2026 — [P8-53DA](p8/53da-native-capture-and-runtime-free-browser.md):
 utrwalanie natywnych wejść przed długą kopią frontendu/docs: **17/17 PASS**.
 Pięć błędów fixture meshing poprawiono; celowany odbiór **4 PASS + 2 subtesty**.
