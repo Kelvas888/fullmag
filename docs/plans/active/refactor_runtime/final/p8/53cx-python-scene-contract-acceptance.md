@@ -49,3 +49,45 @@ odbiorze nowego CI i trwałym archiwum dowodów. Wolne C: 46720737280 B;
 nie jest to pomiar odzysku. Brak prune, usuwania cache i cudzych buildów.
 Rust CI job `116307821115` nadal aktywny; nie zaliczać nowych regresji IR
 ani całego planu na podstawie sukcesu Python. Pełny plan **IN PROGRESS**.
+
+## Dalszy odbiór tej generacji CI
+
+Poprawki testów opublikowano jako `a16a34aef8367c40e350540511cb385800f489ab`;
+bootstrap `38702215605` jest aktywny. Commit ma rodzica
+`08c633413ae0afab4b0c658eee6e160763059be0`
+(równoległy merge PR #171 dokumentacji). Ponowne porównanie 108 fingerprintów
+z receiptu wykazało brak zmian źródeł Python/testów po tej integracji.
+
+Dla dokładnego wcześniejszego `f4c15a878...` Control Room job `116307821123`
+zakończył się SUCCESS: 828 plików testowych PASS / 1 skip, 8535 testów PASS /
+13 skip, wymagany typecheck i lint. Ten dowód nie obejmuje niezacommitowanego
+compute-policy WIP ani nie znosi obowiązków browser/WebGL i runtime.
+Rust job `116307821115` nadal wykonuje typed active eigen Stop/Pause.
+
+## Aktualizacja odbioru po publikacji
+
+Job Python `116312876046` potwierdził Gmsh 45/45 i sceny 127/127, następnie
+zatrzymał się na starym imporcie `_scene_stage_autosave` w checkerze output
+storage. Naprawiono checker przez publiczny StageAutosave i aktualny renderer
+suffixu, zachowując porównanie z eksportem publicznym. Oczekiwanie quantity `m`
+odpowiada authored fixture i naming freeze ADR-0004; lowerer kopiuje nazwę
+verbatim, nie normalizuje jej do magnetization.
+
+Interpreted checker exit 0, diff check PASS. Commit
+`b7051deb5e4b1a422470d4a37c71ffce4b8cffcf` opublikowany na origin/master.
+Rust/native unit tests lokalnie nie kompilowano. Nowe CI wymagane.
+
+Starszy Rust job `116307821115` zakończył się FAIL: końcowy zestaw API
+1101 PASS / 1 FAIL / 3 ignored. Porażka
+project_batch_submit_replays_and_lists_durable_parent w project_documents.rs:3992
+to progress sequence conflict (expected 0, found 1), a nie błąd kompilacji.
+Nowszy Rust job `116312875986` nadal aktywny przy ostatnim odczycie.
+Nie zaliczać pełnej integracji z wcześniejszych częściowych sukcesów.
+
+Fixture naprawiono w `d3f4d49cf381ab13fe3fbb2b162a1a84fbd05ff5`:
+odczyt checkpointu utworzonego przez POST, asercje total_cases/sequence=1/
+cursor=0/Pending, a następnie niezmienione crash-window child-before-cursor.
+Nie osłabiono produkcyjnego fence ani nie dodano drugiego initial commita.
+Diff check PASS, parser rustfmt stdout PASS także po dodaniu asercji
+total_cases; istniejące globalne różnice formatowania modułu zachowano.
+Wykonanie testu wymaga CI, lokalnie testów Rust nie kompilowano.

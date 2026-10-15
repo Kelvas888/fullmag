@@ -372,6 +372,10 @@ case "${recipe}" in
     exec "${python_cmd}" "${script_dir}/verify_saved_fem_archive_roundtrip.py" --repo-root "${repo_root}"
     ;;
   *"scripts/verify_pinned_dataset_browser.py"*)
+    preparation_workspace_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3268 --scenario preparation-workspace$'
+    if [[ "${recipe}" =~ ${preparation_workspace_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3268 --scenario preparation-workspace
+    fi
     antenna_spectrum_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3265 --scenario antenna-source-spectrum$'
     if [[ "${recipe}" =~ ${antenna_spectrum_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3265 --scenario antenna-source-spectrum

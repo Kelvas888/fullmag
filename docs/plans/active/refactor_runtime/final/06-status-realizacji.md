@@ -1,4 +1,14 @@
 # Status realizacji całego planu refaktoryzacji
+Checkpoint 15.10.2026 — [P8-53CY](p8/53cy-nonblocking-preparation-workspace.md):
+usunięto globalny preparation gate/inert; status jest kompaktowy i nieblokujący.
+Scenariusz komponentów w przeglądarce: 7 kroków PASS, retained draft/focus/canvas,
+WebGL 1000×620 bez utraty kontekstu; wykryto i poprawiono widoczność zwiniętych
+szczegółów. Świeże powtórzenie c7e641e dało cały receipt PASS przy stabilnych
+źródłach. Typecheck wykazał 7 błędów w obcych dirty zmianach compute/batch,
+lint jeden obcy błąd; React Doctor PASS. Review: brak P0–P2 w zakresie poprawki.
+Checker output storage poprawiony i opublikowany jako `b7051deb5`.
+Pełny plan **IN PROGRESS**, procenty bez awansu do zakończenia bramek.
+
 Checkpoint 15.10.2026 — [P8-53CX](p8/53cx-python-scene-contract-acceptance.md):
 CI potwierdziło Gmsh exact-layer airbox SUCCESS. Kolejne 8 porażek testów
 sceny Python poprawiono zgodnie z rendererem i canonical auxiliary identity;

@@ -3,6 +3,10 @@ import { hydrateRoot, createRoot } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type {
+  LiveStatusResource,
+  SimulationPreparationResource,
+} from "../api/apiTypes";
 import { CommandRegistry } from "../commands/CommandRegistry";
 import { EventBus } from "../events/EventBus";
 import type { KernelEventMap } from "../events/eventTypes";
@@ -68,6 +72,69 @@ describe("WorkspaceShellClient session collection gate", () => {
       expect(container.textContent).toContain("Checking for sessions");
       expect(container.textContent).not.toContain("Welcome to Fullmag");
       expect(currentStatus).not.toHaveBeenCalled();
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("keeps the production workspace and editable viewport mounted during first preparation", async () => {
+    const pendingPreparation = deferred<SimulationPreparationResource>();
+    const currentStatus = vi.fn(async () => ({
+      resources: { simulation_preparation_revision: 7 },
+      session: {
+        name: "workspace-shell-test",
+        request_scope_epoch: "api-instance:workspace-shell-test",
+        session_epoch: "workspace-shell-session@1700000000000",
+        session_id: "workspace-shell-session",
+      },
+      solver: { state: "bootstrapping" },
+    }) as LiveStatusResource);
+    const list = vi.fn(async () => ({
+      schema_version: "2.0.0",
+      sessions: [{
+        current: true,
+        name: "workspace-shell-test",
+        session_id: "workspace-shell-session",
+        status: "running",
+      }],
+    }));
+    const { container, dispose } = await mountWorkspace(
+      makeKernel(list, currentStatus, () => pendingPreparation.promise),
+    );
+
+    try {
+      await settle();
+
+      const workspaceBody = findElements(
+        container,
+        (element) =>
+          element
+            .getAttribute("class")
+            ?.split(/\s+/)
+            .includes("fm-workspace-body") === true,
+      )[0];
+      const viewportDraft = findByAttribute(
+        container,
+        "aria-label",
+        "Workspace draft",
+      );
+      const preparationStatus = findElements(
+        container,
+        (element) =>
+          element.getAttribute("class") === "fm-simulation-startup",
+      )[0];
+
+      expect(list).toHaveBeenCalled();
+      expect(currentStatus).toHaveBeenCalled();
+      expect(workspaceBody).toBeTruthy();
+      expect(workspaceBody.hasAttribute("inert")).toBe(false);
+      expect(workspaceBody.hasAttribute("aria-hidden")).toBe(false);
+      expect(
+        findByAttribute(container, "data-slot-id", "viewport-main"),
+      ).toBeTruthy();
+      expect(viewportDraft).toBeTruthy();
+      expect(preparationStatus?.getAttribute("data-state")).toBe("connecting");
+      expect(findByAttribute(container, "aria-modal", "true")).toBeNull();
     } finally {
       await dispose();
     }
@@ -140,11 +207,23 @@ describe("WorkspaceShellClient session collection gate", () => {
 function makeKernel(
   list: () => Promise<{ schema_version: string; sessions: readonly unknown[] }>,
   currentStatus: () => Promise<unknown>,
+  preparation: () => Promise<SimulationPreparationResource> = async () => {
+    throw new Error("simulation preparation is not served in this test");
+  },
 ): KernelApi {
   const bus = new EventBus<KernelEventMap>();
   const commands = new CommandRegistry();
   const modules = new ModuleRegistry();
   modules.register({ ...startScreenManifest, component: async () => ({ default: StartScreen }) });
+  modules.register({
+    id: "workspace-shell-test-viewport",
+    title: "Workspace shell test viewport",
+    version: "0.1.0",
+    slots: ["viewport-main"],
+    component: async () => ({
+      default: () => <input aria-label="Workspace draft" />,
+    }),
+  });
   for (const command of SHELL_COMMANDS) commands.register(command);
   for (const command of startScreenManifest.contributes?.commands ?? []) commands.register(command);
   return {
@@ -168,6 +247,7 @@ function makeKernel(
         thumbnailUrl: (id: string) => `/thumbnail/${id}`,
       },
       sessions: { list, current: { status: currentStatus } },
+      simulation: { preparation },
     },
     bus,
     commands,
