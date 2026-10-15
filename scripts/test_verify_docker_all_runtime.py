@@ -36,6 +36,11 @@ class DockerAllRuntimeVerifierTests(unittest.TestCase):
     def _host_ledger_fixture(self, root: Path):
         import docker_host_ledger as ledger
 
+        # Native Windows may expose TemporaryDirectory through an 8.3 short
+        # alias (for example RUNNER~1).  Resolve it before deriving any
+        # owned paths so the fixture matches the production no-short-path
+        # admission guard.
+        root = root.resolve()
         image = "sha256:" + "a" * 64
         container_id = "b" * 64
         run_root = root / "run"
