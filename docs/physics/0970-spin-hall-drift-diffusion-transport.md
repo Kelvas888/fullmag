@@ -546,6 +546,59 @@ obejmują lokalne tłumienie, zachowanie obserwabli oraz niezależną tożsamoś
 źródło–pole dla Heuna i ARS. Ich stan to **source-only: niekompilowane i
 niewykonane**; nie zamykają bramek powyżej.
 
+(spin-transport-composite-resume-v2)=
+### 2.6.3. Composite checkpoint v2: accepted ARS i durable outputs
+
+**Stan: planned_contract; codec/integracja/runtime NOT VERIFIED.** Dokładny
+schema fullmag.fdm.coupled_m3_checkpoint.v2, required fields i hash są w
+[§13 frozen spec](../specs/frozen-spins-v1.md#frozen-v2-composite-checkpoint).
+Reuse dotyczy pełnego FdmCoupledCheckpoint V1 i jego complete validatora,
+FrozenSpinsCheckpointV1, FrozenSpinsActivationSet oraz AcceptedStateRef.
+Nie zmienia równań, parametrów SpinDriftDiffusion/TransportExecution/solver
+policy ani Python→ProblemIR mapping. Nowe nazwy Composite*V2 są planowane,
+nie istniejącymi konstruktorami publicznymi lub obsługiwanym codec.
+
+| Solver | Device | Composite v2 ExactResume |
+|---|---|---|
+| FDM | CPU | Planned reference FP64 ARS fixed/adaptive; runtime NOT VERIFIED |
+| FDM | GPU | Unsupported tutaj: brak zgodnego composite ownera, bez fallbacku |
+| FEM | CPU | Unsupported tutaj: inne DOF/runtime i brak codec |
+| FEM | GPU | Unsupported tutaj: brak kwalifikacji tej kombinacji |
+
+Outer accepted dt, czas, krok i M muszą bitowo zgadzać się między common,
+nested M3 i obecnym frozen child. Adaptive ARS zachowuje zaakceptowane dwa
+podkroki. TransientSpinState.previous_dt_s jest faktycznym drugim residual dt, a
+previous_spin_potential_v stanem split. Nested previous_magnetization nadal
+wskazuje outer start; error_controller.next_dt nie jest last accepted dt.
+Report/outer accepted_steps liczą jeden krok; transient revisions/telemetry
+zachowują rzeczywistą historię dwóch commitów. Nie wymaga się exact 2*inner=outer
+ani równych inner dt. Wcześniej ustalony trial endpoint musi być osiągnięty
+przed estimator, bez przepisywania timestampów. To nie jest order proof ARS.
+
+Original authored endpoint/grid/waveform/output origins i istniejące schedule
+cursory są required; off-grid pauza nie przesuwa nominalnej siatki ani fazy.
+Hash v2 używa istniejącego canonical_json_bytes, a nested M3 zachowuje własny
+payload digest. Raw strict completeness odrzuca pominięte defaults/unknown
+fields, zamiast dorabiać historię w codec V1. Restore waliduje całość lokalnie
+przed publikacją obu subsystemów i controller/cursor state.
+
+Binding outputs wskazuje faktyczny FmsStudyOutputManifest przez immutable
+published entry/revision w FmsArtifactCatalog; nie jest nowym receiptem.
+ArtifactRecorder enqueue nie dowodzi trwałego scalar/field/default/boundary
+prefixu. SessionStore::commit_checkpoint ma writer lease i marker po common
+state/reachability. Powiązanie prefixu z immutable attempt allow-list oraz
+checkpoint graph pozostaje work itemem istniejącego publication ownera.
+Do czasu jego domknięcia composite_outputs_not_committed odmawia ExactResume,
+nawet przy poprawnych hash/count/cursorach. Bez nowego per-step fsync i timera.
+
+Aktywacja frozen zachowuje źródłowe mask/reference/epoki bez recapture, także
+na inactive→active stage chain; [nota 0996](0996-frozen-spins-constraint.md#frozen-spins-composite-resume-v2)
+opisuje tę granicę. Standalone legacy codecs i ich kwalifikacje nie otrzymują
+nowego claimu, tymczasowe odmowy transport resume nie są znoszone.
+Przyszłe niewykonane gates: composite_v2_ars_history,
+composite_v2_outputs_atomicity, composite_v2_cli_api_roundtrip oraz pełna
+macierz §13.7. Focused docs check nie jest execution/parity proof.
+
 (symbols-and-si-units)=
 ### 2.7 Symbols and SI units
 
@@ -3097,6 +3150,27 @@ a qualified workload without the validation gates above.
 
 | Claim | Path | Symbol | Responsibility | Evidence |
 |---|---|---|---|---|
+| Composite checkpoint v2 | `docs/specs/frozen-spins-v1.md` | `DOC-ANCHOR:frozen-v2-composite-checkpoint` | Dokładny planned schema wrappera i required pola; codec niewdrożony. | planned_contract; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `docs/specs/frozen-spins-v1.md` | `DOC-ANCHOR:frozen-v2-composite-hash` | Strict ingress, kompletność nested codecs i kanoniczny outer hash. | planned_contract; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `docs/specs/frozen-spins-v1.md` | `DOC-ANCHOR:frozen-v2-composite-accepted-history` | Outer accepted dt i rzeczywiste inner ARS history, bez dopisywania timestampów. | planned_contract; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `docs/specs/frozen-spins-v1.md` | `DOC-ANCHOR:frozen-v2-composite-output-commit` | Binding istniejącego committed output manifestu i jawna odmowa braku trwałego prefixu. | planned_contract; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `docs/specs/frozen-spins-v1.md` | `DOC-ANCHOR:frozen-v2-composite-atomic-restore` | Atomowy capture/restore w istniejących ownerach; bez recapture i implicit continuation. | planned_contract; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-runner/src/fdm/cpu/spin_transport.rs` | `FdmCoupledCheckpoint` | Istniejący nested M3 V1, accepted/history/controller i własny payload digest. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-runner/src/fdm/cpu/spin_transport.rs` | `validate_complete_coupled_checkpoint` | Istniejąca pełna walidacja nested M3, bez zastępowania jej wrapperem. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-runner/src/constraints/checkpoint.rs` | `FrozenSpinsCheckpointV1` | Istniejący mask/reference/activation codec i historyczne defaults niedozwolone jako brakujące dane V2. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-runner/src/constraints/activation.rs` | `FrozenSpinsActivationSet` | Reuse istniejącej historycznej mapy epok i active set. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-runner/src/interactive/runtime.rs` | `frozen_spins_activation_set` | Rzeczywisty runtime owner historycznej activation set między etapami. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-cli/src/interactive_runtime_host.rs` | `ensure_interactive_preview_runtime` | Przeniesienie historycznego activation set przy przebudowie stage runtime. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-runner/src/fdm/cpu/reference.rs` | `execute_reference_fdm_with_coupled_checkpoint` | Istniejący adaptive full/two-half acceptance oraz outer dt/history writer; nie dowód runtime. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-runner/src/schedules.rs` | `OutputSchedule` | Istniejący pojedynczy owner next_time i last_sampled_time; brak checkpoint cursorów V2. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-session/src/types.rs` | `canonical_json_bytes` | Istniejąca rekursywna kanonizacja JSON; planowany reuse dla outer digest. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-quantities/src/accepted_state.rs` | `AcceptedStateRef` | Istniejąca tożsamość accepted clocks/state/generation bez nowego modelu. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-session/src/types.rs` | `FmsStudyOutputManifest` | Istniejący CAS-backed manifest z task/attempt/step i accepted-state reference. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-session/src/types.rs` | `FmsArtifactCatalog` | Istniejący katalog revision i immutable published entries, nie nowy receipt. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-runner/src/artifact_pipeline.rs` | `record_scalar` | Enqueue outputu nie potwierdza durable checkpoint prefixu. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-session/src/store.rs` | `commit_checkpoint` | Istniejący writer lease, common state, reachability oraz commit marker. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `crates/fullmag-session/src/capture.rs` | `capture_checkpoint` | Istniejący capture common M/backend payload przed publikacją markeru. | source_only_unqualified; prereg composite_v2_*; runtime NOT VERIFIED |
+| Composite checkpoint v2 | `docs/physics/0970-spin-hall-drift-diffusion-transport.md` | `DOC-ANCHOR:spin-transport-composite-resume-v2` | Granica prerejestracji composite bez rozszerzania kwalifikacji legacy. | planned_contract; prereg composite_v2_*; runtime NOT VERIFIED |
 | Prerejestracja frozen transport | `docs/physics/0996-frozen-spins-constraint.md` | `DOC-ANCHOR:frozen-spins-auxiliary-transport-time` | Prerejestracja no-op M oraz aktywnego transportu w fizycznym czasie; runtime niezweryfikowany. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `planned_contract`; `worktree/uncommitted`; path + symbol |
 | Prerejestracja frozen transport | `docs/specs/frozen-spins-v1.md` | `DOC-ANCHOR:frozen-v1-all-frozen` | Executed steps, czas, pause/cancel i odmowa Relax+M3. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `planned_contract`; `worktree/uncommitted`; path + symbol |
 | Prerejestracja frozen transport | `docs/physics/0970-spin-hall-drift-diffusion-transport.md` | `DOC-ANCHOR:spin-transport-frozen-free-error-support` | Wspólny free-target support outer-error gate; bez zmiany bilansów. | FDM CPU FP64; inne lane niekwalifikowane; gates `frozen-spins-auxiliary-transport-time`; `planned_contract`; `worktree/uncommitted`; path + symbol |
