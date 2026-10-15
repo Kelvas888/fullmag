@@ -289,3 +289,8 @@ Ostatnia etykieta runs-on korzysta z repo variable FULLMAG_FEM_RUNNER_LABEL z do
 ### Checkpoint — zgodność pozostałych fixture materializacji
 
 CI428 Bootstrap38695285731 / Rust116290304934: materializacja106PASS/4FAIL. Pozostałe błędy dotyczą testowych danych: Zhang–Li fullmag/FEM wybrany w FDM oraz fixed_timestep1e-13 ponad limit1.74879e-14 lokalnej siatki. Fixture FDM używa teraz kanonicznego zhang_li.mumax3.v1 i jawnego object_id/target; lokalny fixture FEM ma typowaną siatkę oraz fixed_timestep1e-15. Produkcyjny materializer, katalog capability i guard numeryczny pozostają bez zmian. Wspólny accepted fixture nie jest zmieniany. JSON/source checks, rustfmt parser i native diff check PASS; niezależna implementacja i root review PASS. Kompilacja/testy Rust wyłącznie w kolejnym wymaganym CI. Pakiet managed ba4e pozostaje przypięty do4287801, bo późniejsze zmiany obejmują tylko CI/docs/fixtures.
+
+
+### Checkpoint — kolejka CI i gotowość wykonawcy
+
+Doprecyzowano, że repo variable wybiera etykietę kolejki; gotowość środowiska jest wymagana przed rejestracją/startem wykonawcy. Nie zmieniono bramki ani jej preflightu. GitHub potwierdził0 runnerów i brak zmiennej; ustawienie dedykowanej etykiety pozwoli uruchomić pozostałe CI bez czekania na wolny pierwszy git status przez9p. Actual UID1001 probes Docker29.8.1/RTX4080SUPER/ext4-loop/exact backing PASS; Python bootstrap w toku. Pełna kwalifikacja FEM pozostaje NOT VERIFIED. Doc diff/source check PASS.

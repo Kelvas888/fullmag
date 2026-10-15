@@ -62,8 +62,8 @@ już oczekujące joby. Po wyłączeniu zmiennej workflow wraca do dotychczasoweg
 `fem-managed`; jest to ścieżka rollbacku i nie wymaga anulowania cudzych jobów.
 
 `fem-managed-docker` zachowuje istniejący kontrakt `linux-ext4-loop-v1`
-realizowany w Docker Desktop Linux. Przed ustawieniem zmiennej operator musi
-potwierdzić dokładny zestaw etykiet, profil Docker, ext4 z `findmnt` i
+realizowany w Docker Desktop Linux. Zmienna tylko kieruje job do kolejki;
+przed rejestracją i uruchomieniem runnera operator musi potwierdzić dokładny zestaw etykiet, profil Docker, ext4 z `findmnt` i
 proweniencją loop/backing, `nsenter`, dostępność NVIDIA oraz wszystkie
 prerequisites rzeczywistej bramki CPU/GPU. Sama etykieta ani sonda GPU nie
 świadczą o gotowości runnera. Bramka
