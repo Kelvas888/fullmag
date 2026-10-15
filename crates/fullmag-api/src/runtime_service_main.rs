@@ -1175,10 +1175,10 @@ fn run_service(path: PathBuf) -> Result<()> {
             )
             .await?;
             if let Some(ledger) = host_ledger.as_ref() {
-                host_admission = fullmag_runtime_control::host_runtime::HostRuntimeAdmission::open(
-                    &config,
-                )?
-                .context("host execution requires an initialized runtime admission context")?;
+                host_admission = Some(
+                    fullmag_runtime_control::host_runtime::HostRuntimeAdmission::open(&config)?
+                        .context("host execution requires an initialized runtime admission context")?,
+                );
                 loop {
                     inventory_owner = publish_compute_node_sample(
                         Arc::clone(ledger),
