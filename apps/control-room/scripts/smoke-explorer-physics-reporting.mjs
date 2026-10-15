@@ -237,6 +237,10 @@ try {
     const description = row => row.locator(".fm-explorer-tree-row__description").innerText();
     const configured = row("port:configured-port"), broken = row("port:broken-port"), solve = row("solution:blocked-solve");
     await configured.waitFor();
+    const regional = row("regional");
+    assert.equal(await regional.getAttribute("data-status"), "unavailable");
+    assert.equal(await regional.locator(".fm-explorer-tree-row__badge").innerText(), "not configured");
+    assert.match(await description(regional), /No regional field source is assigned/);
     assert.equal(await configured.getAttribute("aria-describedby"), await configured.locator(".fm-explorer-tree-row__description").getAttribute("id"));
     assert.equal(await configured.getAttribute("data-status"), "ready");
     assert.match(await description(configured), /qualification still require execution/);
@@ -252,6 +256,18 @@ try {
     assert.match(await description(row("spectrum:source-k")), /not a measured magnetization response/);
     await solve.scrollIntoViewIfNeeded();
     await capture("explorer-antenna-readiness.png");
+  });
+
+  await step("regional-source-status-requires-explicit-binding", async () => {
+    await page.getByRole("button", { name: "Explicit regional source bindings", exact: true }).click();
+    for (const [objectId, status, badge] of [["active", "ready", "configured"], ["disabled", "degraded", "disabled"], ["legacy", "warning", "migration required"]]) {
+      const row = tree.locator(`[data-node-id="model:object:${objectId}:antenna:regional"]`);
+      await row.waitFor();
+      assert.equal(await row.getAttribute("data-status"), status);
+      assert.equal(await row.locator(".fm-explorer-tree-row__badge").innerText(), badge);
+      assert.match(await row.getAttribute("title"), objectId === "legacy" ? /migrate it explicitly/ : /does not solve conductor current/);
+    }
+    await capture("explorer-explicit-regional-sources.png");
   });
 
   assert.ok(report.api_requests.some((request) => request.path === "/v2/sessions"));

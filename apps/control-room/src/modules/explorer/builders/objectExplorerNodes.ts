@@ -1,3 +1,4 @@
+import { antennaRegionalSources } from "@/shared/domain/physics/antennaRegionalSource";
 import type {
   ExplorerNode,
   ExplorerNodeStatus,
@@ -70,6 +71,7 @@ export function buildObjectExplorerNode(
   const meshStatus = object.meshStatus ?? "primitive-only";
   const createObjectMonitorInput = planarMonitorObjectCreationInput(resources, objectId);
   if (object.objectRole === "antenna") {
+    const regional = antennaRegionalSources(resources.scene ?? null, objectId);
     return {
       id: parentId,
       kind: "object.root",
@@ -118,11 +120,15 @@ export function buildObjectExplorerNode(
               kind: "object.antenna.regional",
               label: "Regional field drive",
               parentId: `${parentId}:antenna`,
-              badge: "field drive",
+              badge: regional.canonical ? regional.canonical.enabled === false ? "disabled" : "configured"
+                : regional.legacy ? "migration required" : "not configured",
+              statusReason: regional.canonical ? "Explicit prescribed regional magnetic field; it does not solve conductor current or the antenna Oersted field. Configuration is not proof of execution."
+                : regional.legacy ? "Deprecated prescribed Zeeman-mask source; migrate it explicitly in the regional field inspector."
+                : "No regional field source is assigned to this object. Assign an explicit geometry-mask RegionalFieldDrive before editing its waveform; the conductor solve is separate.",
               icon: "wave",
               objectId,
               objectRole: "antenna",
-              status: "ready",
+              status: regional.canonical ? regional.canonical.enabled === false ? "degraded" : "ready" : regional.legacy ? "warning" : "unavailable",
               contextCommands: ["workspace.focus-selection"],
             },
             ...antennaCompositionNodes(parentId, objectId, resources),

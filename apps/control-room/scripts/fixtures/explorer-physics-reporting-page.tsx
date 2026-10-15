@@ -13,7 +13,7 @@ import {
 import { modelTreeSnapshotFromScene } from "@/modules/explorer/builders/sceneModelTreeAdapter";
 import { Button } from "@/shared/ui/Button";
 
-type ScenarioId = "zero-and-missing" | "signed-nonzero" | "explicit-overrides" | "antenna-readiness";
+type ScenarioId = "zero-and-missing" | "signed-nonzero" | "explicit-overrides" | "antenna-readiness" | "antenna-regional";
 
 const subscribeHydration = () => () => {};
 const clientHydrated = () => true;
@@ -21,12 +21,22 @@ const serverHydrated = () => false;
 
 const scenarioLabels: Record<ScenarioId, string> = {
   "antenna-readiness": "Antenna readiness and source spectrum",
+  "antenna-regional": "Explicit regional source bindings",
   "zero-and-missing": "Zero and missing DMI",
   "signed-nonzero": "Positive and negative DMI",
   "explicit-overrides": "Explicit stack and Study overrides",
 };
 
 function sceneForScenario(scenario: ScenarioId): SceneResource {
+  if (scenario === "antenna-regional") {
+    return {
+      objects: ["active", "disabled", "legacy"].map(id => ({ id, name: `Regional ${id}`, role: "antenna", geometry: { geometry_kind: "Box" } })),
+      field_drives: { drives: ["active", "disabled"].map(id => ({ id: `field-${id}`, name: `Field ${id}`, kind: "regional", enabled: id !== "disabled",
+        target: { kind: "global" }, amplitude_B_T: 1e-3, direction: [0, 1, 0], spatial_profile: { kind: "geometry_mask", object_id: id, envelope: { kind: "uniform" } },
+        waveform: { kind: "constant" }, time_origin: "stage_local", activation: { kind: "all_time_evolution" } })) },
+      current_modules: { modules: [{ name: "old-source", kind: "antenna_field_source", model: "prescribed_zeeman_mask", object: "legacy" }] },
+    } as SceneResource;
+  }
   if (scenario === "antenna-readiness") {
     const terminals = ["signal-in", "signal-out", "return-in", "return-out"];
     const port = { id: "configured-port", schema_version: "antenna_port_mode.v2", source_object_id: "antenna", current_transport_id: "transport", normalization_current_a: 1,
