@@ -86,14 +86,49 @@ master, procesy, cache i wyniki pozostają zachowane.
 | --- | --- | --- |
 | Konfigurator nowego hosta | PR #174 scalony do mastera `f9179caf`; skrypt istnieje lokalnie i na GitHub | Pełny bootstrap toolchaina/runnera na czystym hoście pozostaje osobnym etapem |
 | Compose i storage | Wersjonowane definicje, kontrole parsera, host ledger i regresje interpretowane | Realny start dwóch usług, odczyt plików Windows i restart |
-| Toolchain FEM/CUDA | Naprawione CPU SLEPc/PETSC_ARCH, prywatna etykieta wykonawcy CI | Udana managed FEM qualification na poprawionym obrazie |
-| Zgodność źródeł i CI | `eigensolve-method-contracts` i `dispersion-artifact-consumers` przeszły dla `ea2a659` | Wymagane kontrole dla końcowego commita |
-| Polecenia live CPU/auto/GPU | Powstaje adapter accepted i czysta migracja legacy z pełnymi zasobami | Kompilacja w CI, admission, lifecycle i wynik w tym samym Workspace |
-| FEM przygotowanie / wait_for_solve | Trwa podłączenie kanonicznego przygotowania live | Widoczny aktywny model i siatka przed Compute, bez solver side effect |
-| Uruchomienie skryptu | Kontrakt i ograniczenia opisane powyżej | Ścieżka Windows, aktywacja, auto-run oraz wariant wait_for_solve |
+| Toolchain FEM/CUDA | Prywatny run 38755955047: MFEM CPU i manifest DONE; budowanie warstwy developerskiej Python | Udana managed FEM qualification na poprawionym obrazie |
+| Zgodność źródeł i CI | CI e17d56f: build Control Room i dispersion PASS; d2aaac87e: dedykowany krok Compute/recovery PASS | Wymagane kontrole dla końcowego commita |
+| Polecenia live CPU/auto/GPU | Adapter accepted, czysta migracja legacy i Stop z aktualną rewizją katalogu; source review po poprawkach | Kompilacja w CI, admission, lifecycle i wynik w tym samym Workspace |
+| FEM przygotowanie / wait_for_solve | Pinned preparation publikuje typed mesh, materiały i initial m; polling zwalnia transition dla Stop | Widoczny aktywny model i siatka przed Compute, bez solver side effect |
+| Uruchomienie skryptu | Launcher 8e41f9d92: 12 testów startup PASS Linux/Windows, runtime 30 PASS/3 SKIP Linux i 27 PASS/6 SKIP Windows | Internal startup API zachowuje całe Study i manualny gate; końcowa kompilacja/runtime auto-run oraz wait_for_solve wymagane |
 | Frontend HMR i WebGL | Definicja source bind i przygotowane procedury dowodowe | Zapis pliku w Windows widoczny w przeglądarce, zachowanie stanu i żywy WebGL |
 | FDM/FEM GPU | Source admission, worker i receipt nie stanowią runtime proof | Formularz → fizyczny GPU → terminalny wynik, native receipt i zwolnienie lease |
 | Integracja | Pozostałe zmiany w PR #175, master zachowany z cudzym dirty submodule | Review/CI, merge, lokalny fast-forward i qualified cleanup |
 
 Aktualizując tę tabelę, zachowujemy rozdział konfiguracji, kompilacji, runtime,
 przeglądarki i walidacji naukowej. Stan jednej bramki nie promuje pozostałych.
+
+## Bieżący fragment integracji API
+
+Adapter live publikuje RunIntent przed wykonaniem przez istniejące accepted
+workers. Projector odczytuje zwalidowane manifesty i CAS, zachowuje binding
+API/session/epoch/scene/run i jawny manualny gate. Przygotowanie publikuje
+pinned plan przez istniejące zasoby domeny oraz materiałów; początkowe `m`
+jest wejściem planu, bez sfabrykowanych scalar rows lub zdarzeń solvera.
+Stop i zmiana sesji mogą uzyskać transition pomiędzy próbami odczytu receiptu.
+
+W CI dodano osobny krok czterech modułów kontraktowych Docker/API. Lokalnie
+wykonano tylko parser Rust i YAML oraz kontrolę diffu. Kompilacja i runtime
+tego fragmentu pozostają NOT VERIFIED do wyniku CI i kolejnego managed builda.
+Obecny accepted scalar artifact `E_total` aktualizuje terminalne podsumowanie
+run; nie stanowi pełnej historii `ScalarRow`. Publikacja historii i zgodność
+natywnego indeksowania FEM wymagają osobnej weryfikacji przed odbiorem całości.
+
+Trwały receipt przygotowania jest zatwierdzany przed publikacją read modelu.
+Jeżeli publikacja się nie powiedzie, receipt i jego exact immutable identity
+pozostają podstawą retry/replay; nie cofamy durable preparation ani nie
+uruchamiamy drugiego solvera. Brak zgodnego read modelu nadal blokuje zwolnienie
+manualnego gate przez startup.
+
+W tym checkpointcie pole początkowe obejmuje pojedynczy FDM i FEM.
+Multilayer wymaga jeszcze publikacji kanonicznych descriptorów native warstw;
+sama konkatenacja wartości nie może być traktowana jako pole common-grid.
+Ten wariant pozostaje jawnie NOT VERIFIED i nie stanowi zamknięcia celu.
+Przełączenie metadata FEM → fdm_multilayer czyści poprzednią typed siatkę FEM.
+
+Review projectora wykrył jeszcze brak jawnego bindingu późniejszego stanu do
+stage-specific domeny przy zmianie geometrii między krokami Study. Zgodna
+liczba węzłów nie dowodzi zgodnej topologii. Przed odbiorem wymagane są
+publikacja pinned preparation właściwego etapu i regresja dwóch topologii
+o tej samej liczbie węzłów. Ten checkpoint służy kompilacji CI, nie jest
+kwalifikacją poprawnego wykonania całego Study ani zgodą na merge.

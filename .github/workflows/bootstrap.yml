@@ -111,6 +111,15 @@ jobs:
           cargo test -p fullmag-runtime-control --lib accepted_recovery_requires_release
           cargo test -p fullmag-api --bin fullmag-api-accepted-worker restored_manual_worker_requires_exact_compute_release
 
+      - name: Run Docker accepted workspace startup and projection contracts
+        env:
+          RUST_MIN_STACK: 8388608
+        run: |
+          cargo test -p fullmag-api --bin fullmag-api docker_startup::tests
+          cargo test -p fullmag-api --bin fullmag-api live_accepted_execution::tests
+          cargo test -p fullmag-api --bin fullmag-api live_accepted_projection::tests
+          cargo test -p fullmag-api --bin fullmag-api live_scene_preparation::tests
+
       - name: Run complete session reachability and archive contracts
         run: cargo test -p fullmag-session --lib --no-fail-fast
 

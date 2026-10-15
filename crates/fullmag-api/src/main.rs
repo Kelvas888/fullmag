@@ -63,7 +63,10 @@ mod field_render_png;
 mod field_slice;
 mod field_store;
 mod live_command_journal;
+mod live_accepted_execution;
+mod live_accepted_projection;
 mod live_scene_preparation;
+mod docker_startup;
 mod openapi_v2;
 mod orientation_color;
 mod periodic_pairs_binary;
@@ -2514,6 +2517,8 @@ async fn main() {
         .await
         .expect("private development authoring restore must succeed before API startup");
 
+    live_accepted_projection::spawn(state.clone());
+
     let (owner_shutdown_tx, owner_shutdown_rx) = tokio::sync::oneshot::channel();
     let owner_control = development_owner_control::prepare(state.clone(), owner_shutdown_tx)
         .expect("private development owner configuration must be valid before API startup");
@@ -2524,6 +2529,10 @@ async fn main() {
         .route("/healthz", get(healthz))
         .route("/v2/platform/vision", get(vision))
         // ── Internal runner bridge (not part of the public browser contract) ──
+        .route(
+            docker_startup::STARTUP_ENDPOINT,
+            post(docker_startup::activate_current_live_startup),
+        )
         .route(
             "/v1/internal/live/current/display-selection",
             get(read_current_live_display_selection),

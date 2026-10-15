@@ -3,7 +3,7 @@
 use crate::error::ApiError;
 use crate::types::*;
 use fullmag_authoring::{
-    scene_document_problem_projection, scene_document_to_script_builder, SceneDocument,
+    scene_document_problem_projection, scene_document_to_script_builder, SceneDocument, StudyPlan,
     ScriptBuilderState,
 };
 use serde_json::Value;
@@ -620,6 +620,81 @@ pub(crate) fn scene_document_to_authored_problem_ir(
         requested_execution,
         SceneCaptureKind::ProblemIr,
     )
+}
+
+/// Capture the immutable ProblemIR inputs for a canonical StudyPlan.
+///
+/// A live v2 accepted run must preserve the authored stage identity and its
+/// physical study kind.  The legacy `scene_document_to_problem_ir` helper is
+/// intentionally narrower and rejects FEM; accepted execution therefore uses
+/// the shared stage materializer, then binds each authored stage through the
+/// application Study materializer.  No profile or host capability is inferred
+/// here.
+pub(crate) fn scene_document_to_study_execution_inputs(
+    repo_root: &Path,
+    workspace_root: &Path,
+    scene_document: &SceneDocument,
+    requested_execution: &fullmag_application::RequestedExecution,
+    study: &StudyPlan,
+) -> Result<Vec<fullmag_application::StudyStepExecutionInput>, ApiError> {
+    requested_execution
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let stages = scene_document_to_authored_stages(
+        repo_root,
+        workspace_root,
+        scene_document,
+        requested_execution,
+    )?;
+    let enabled_steps = study.steps.iter().filter(|step| step.enabled);
+    enabled_steps
+        .map(|step| {
+            let matches = stages
+                .iter()
+                .filter(|stage| stage.action.is_none())
+                .filter(|stage| {
+                    stage
+                        .provenance
+                        .as_ref()
+                        .is_some_and(|provenance| provenance.authored_step_id == step.step_id)
+                })
+                .collect::<Vec<_>>();
+            let stage = if matches.len() == 1 {
+                matches[0]
+            } else if stages.len() == 1 && matches.is_empty() {
+                // A flat scene has no authored stage provenance.  Its one
+                // solver input is still the canonical source for the one-step
+                // StudyPlan projection.
+                stages.first().ok_or_else(|| {
+                    ApiError::unprocessable(
+                        "accepted study execution has no authored solver stage",
+                    )
+                })?
+            } else if matches.is_empty() {
+                return Err(ApiError::unprocessable(format!(
+                    "accepted study step `{}` has no authored solver stage",
+                    step.step_id
+                )));
+            } else {
+                return Err(ApiError::unprocessable(format!(
+                    "accepted study step `{}` expands to multiple solver stages",
+                    step.step_id
+                )));
+            };
+            stage.ir.validate().map_err(|errors| {
+                ApiError::unprocessable(format!(
+                    "accepted study step `{}` produced invalid ProblemIR: {}",
+                    step.step_id,
+                    errors.join("; ")
+                ))
+            })?;
+            Ok(fullmag_application::StudyStepExecutionInput {
+                step_id: step.step_id.clone(),
+                problem: stage.ir.clone(),
+                layers: scene_document.study.execution_layers.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Capture actual authored stage IR/actions through the same Python helper as
