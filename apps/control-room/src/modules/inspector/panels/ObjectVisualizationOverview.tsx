@@ -13,6 +13,7 @@ export interface VisualizationInspectorOverviewProps {
   advanced: ReactNode;
   camera: ReactNode;
   clipping: ReactNode;
+  clippingSummary?: string;
   dataState: string;
   display: ReactNode;
   enabledPassCount: number;
@@ -26,6 +27,7 @@ export function VisualizationInspectorOverview({
   advanced,
   camera,
   clipping,
+  clippingSummary = "Section: Off",
   context,
   dataState,
   display,
@@ -73,7 +75,7 @@ export function VisualizationInspectorOverview({
             defaultOpen: false,
             icon: <Scissors size={16} strokeWidth={1.75} />,
             id: "clipping",
-            summary: "Section: Off",
+            summary: clippingSummary,
             title: "Clipping & Section",
           },
           {

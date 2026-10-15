@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { verifyAntennaClipping } from "./lib/antenna-clipping-browser-checks.mjs";
 import { verifyClosedLoopVectorDisplay } from "./lib/closed-loop-vector-browser-checks.mjs";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
@@ -27,7 +28,7 @@ try {
     await page.goto(target.href);
     await root.waitFor({ state: "visible", timeout: 60000 });
   };
-  const shot = async (name) => { const path = resolve(directory, `${name}.png`); await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
+  const shot = async (name, viewportOnly = false) => { const path = resolve(directory, `${name}.png`); if (viewportOnly) await page.locator("[data-antenna-field-viewport]").screenshot({ path }); else await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
   const sharedTemplate = async (ready = false) => {
     // A stable Inspector mounts before its asynchronous publication metadata arrives.
     if (ready) await page.waitForFunction(() => document.querySelector('[data-inspector-owner="object.antenna.visualization"] button[aria-label="Toggle Points"]')?.matches(":enabled"));
@@ -40,6 +41,7 @@ try {
     assert.equal(await root.getByRole("checkbox", { name: "Show vectors", exact: true }).isEnabled(), ready);
     assert.ok((await root.innerText()).includes("conductor primitive is never recolored"));
   };
+  checks.push(...await verifyAntennaClipping({ page, root, open, shot }));
   await open("camera-unavailable");
   await root.getByRole("button", { name: /Camera & View/ }).click();
   for (const label of ["Fit scene", "Reset camera", "Camera parameters"]) {

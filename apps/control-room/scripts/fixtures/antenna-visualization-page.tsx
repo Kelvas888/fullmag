@@ -4,14 +4,18 @@ import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { useThree } from "@react-three/fiber";
 import { BufferGeometry, ShaderMaterial, SRGBColorSpace, Vector2, Vector3, WebGLRenderTarget } from "three";
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
-import { DATA_ANTENNA_FIELD_SOLUTION_PATH, DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, MODEL_SCENE_PATH, SESSIONS_PATH, SESSION_STATUS_PATH, SIMULATION_STAGES_EXECUTION_PATH, DATA_QUANTITIES_PATH } from "@/kernel/api/apiPaths";
-import type { AntennaFieldSolutionResource, AntennaExternalLeadInspectionResource, AntennaInspectionDisplayResource, SceneResource, StageExecutionResource } from "@/kernel/api/apiTypes";
+import { DATA_ANTENNA_FIELD_SOLUTION_PATH, DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, VISUALIZATION_STATE_PATH, MODEL_SCENE_PATH, SESSIONS_PATH, SESSION_STATUS_PATH, SIMULATION_STAGES_EXECUTION_PATH, DATA_QUANTITIES_PATH } from "@/kernel/api/apiPaths";
+import type { VisualizationStateResource, VisualizationStatePatch, AntennaFieldSolutionResource, AntennaExternalLeadInspectionResource, AntennaInspectionDisplayResource, SceneResource, StageExecutionResource } from "@/kernel/api/apiTypes";
 import { RequestDiagnosticsController } from "@/kernel/api/RequestDiagnosticsController";
 import { EventBus } from "@/kernel/events/EventBus";
 import type { KernelEventMap } from "@/kernel/events/eventTypes";
 import { KernelContext } from "@/kernel/KernelContext";
 import { CommandRegistry } from "@/kernel/commands/CommandRegistry";
-import { CameraRegistryController } from "@/kernel/visualization/CameraRegistryController";
+import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
+import { VisualizationRegistrySyncController } from "@/kernel/visualization/VisualizationRegistrySyncController";
+import { RIBBON_COMMANDS, RIBBON_VISUALIZATION_PATCH_STATE_COMMAND } from "@/modules/ribbon/ribbonCommands";
+import { ClipPlaneLayer } from "@/modules/viewport-3d/layers/ClipPlaneLayer";
+import { DEFAULT_CAMERA_REGISTRY_STATE, CameraRegistryController } from "@/kernel/visualization/CameraRegistryController";
 import { viewport3dManifest } from "@/modules/viewport-3d/manifest";
 import { viewport3dStore } from "@/modules/viewport-3d/viewport3dStore";
 import { DiagnosticRecorderController } from "@/kernel/performance/diagnostic-recorder/DiagnosticRecorderController";
@@ -21,6 +25,7 @@ import type { KernelApi } from "@/kernel/types";
 import { EMPTY_SELECTION } from "@/kernel/selection/selectionTypes";
 import { SelectionController } from "@/kernel/selection/SelectionController";
 import { ObjectVisualizationController } from "@/kernel/visualization/ObjectVisualizationController";
+import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { useAntennaFieldOverlay } from "@/modules/viewport-3d/hooks/useAntennaFieldOverlay";
 import { Viewport3DCanvas } from "@/modules/viewport-3d/Viewport3DCanvas";
@@ -36,12 +41,13 @@ import { makeClosedLoopBrowserFixture } from "../../scripts/fixtures/closed-loop
 
 const instance = "55555555-5555-4555-8555-555555555555";
 const owner = { session_id: "antenna-viz-fixture", session_epoch: "antenna-viz-fixture@1", request_scope_epoch: `${instance}:1` };
+const scope = () => sessionRequestScopeKey({ sessionId: owner.session_id, sessionEpoch: owner.session_epoch, requestScopeEpoch: owner.request_scope_epoch });
 const digest = `sha256:${"a".repeat(64)}`;
 const subscribe = () => () => {};
 const client = () => true;
 const server = () => false;
-type Call = { path: string; range: string | null; scope: string | null; port: string | null };
-declare global { interface Window { __antennaVisualizationFixture?: { read(): { calls: Call[]; tree: unknown; unexpected: string[] }; selectOther(): void; }; __antennaFieldPixel?: (position: number[]) => number[]; __antennaFieldCanvas?: () => { lost: boolean; width: number; height: number; sampleCount: number; pointCount: number; glyphCount: number; surfaceTriangles: number; wireframeEdges: number; normalization: string; quantity: string; colorMinimum: number; colorMaximum: number; currentVertices: number; currentMaterial: string; currentComponent: number; paletteTextures: number; minimum: number; maximum: number; surfaceUuid: string; wireUuid: string; pointsUuid: string; materialUuid: string; paletteUuid: string; }; } }
+type Call = { method: string; path: string; range: string | null; scope: string | null; port: string | null };
+declare global { interface Window { __antennaVisualizationFixture?: { read(): { calls: Call[]; tree: unknown; unexpected: string[] }; selectOther(): void; }; __antennaFieldPixel?: (position: number[]) => number[]; __antennaFieldCanvas?: () => { clippingPlanes: number; lost: boolean; width: number; height: number; sampleCount: number; pointCount: number; glyphCount: number; surfaceTriangles: number; wireframeEdges: number; normalization: string; quantity: string; colorMinimum: number; colorMaximum: number; currentVertices: number; currentMaterial: string; currentComponent: number; paletteTextures: number; minimum: number; maximum: number; surfaceUuid: string; wireUuid: string; pointsUuid: string; materialUuid: string; paletteUuid: string; }; } }
 
 function makeFixture() {
   const scenario = new URL(window.location.href).searchParams.get("scenario") ?? "ready";
@@ -181,12 +187,18 @@ function makeFixture() {
   })();
   const tree = buildObjectExplorerNode({ id: "antenna", label: "Antenna", objectRole: "antenna" }, { scene });
   const calls: Call[] = [], unexpected: string[] = [];
+  let remote = { revision: 1, overrides: [], layers: {}, camera: DEFAULT_CAMERA_REGISTRY_STATE, clip: { enabled: false, axis: "z", position_percent: 50, flipped: false } } as unknown as VisualizationStateResource;
+  let holdClip = false;
+  const pendingClip: (() => void)[] = [];
   const bus = new EventBus<KernelEventMap>(), resources = new ResourceInvalidationController(bus), diagnostics = new RequestDiagnosticsController();
   const selection = new SelectionController(bus), visualization = new ObjectVisualizationController();
   const commands = new CommandRegistry();
   for (const command of viewport3dManifest.contributes?.commands ?? []) {
     if (scenario !== "camera-unavailable" && ["viewport-3d.fit", "viewport-3d.reset-camera", "viewport-3d.open-camera-dialog"].includes(command.id)) commands.register(command);
   }
+  const clipCommand = RIBBON_COMMANDS.find(command => command.id === RIBBON_VISUALIZATION_PATCH_STATE_COMMAND)!;
+  if (scenario !== "clip-unavailable") commands.register(clipCommand);
+  commands.attachSessionScopeSource({ getScopeKey: () => scope(), subscribe: () => () => {} });
   selection.set({ kind: "object.antenna.visualization", objectId: "antenna" }, "inspector");
   const diagnosticRecorder = new DiagnosticRecorderController({ diagnostics });
   const headers = { "x-api-contract-version": "1.0.0", "x-fullmag-api-instance": instance };
@@ -197,8 +209,24 @@ function makeFixture() {
   const payloadPrefix = path(DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, "solution_id", "solution").split("{payload_kind}")[0];
   const api = new ControlRoomApi({ baseUrl: "http://antenna-visualization.fixture.invalid", expectedApiInstance: instance, diagnostics, maxGetRetries: 0, fetchImpl: async (input, init) => {
     const request = new Request(input, init), url = new URL(request.url);
-    calls.push({ path: url.pathname, range: request.headers.get("range"), scope: request.headers.get("x-fullmag-session-scope"), port: url.searchParams.get("port_mode_id") });
-    if (calls.length > 80 || request.method !== "GET") throw new Error("Fixture budget/method violation");
+    calls.push({ method: request.method, path: url.pathname, range: request.headers.get("range"), scope: request.headers.get("x-fullmag-session-scope"), port: url.searchParams.get("port_mode_id") });
+    if (calls.length > 100) throw new Error("Fixture request budget exceeded");
+    if (url.pathname === VISUALIZATION_STATE_PATH) {
+      if (request.headers.get("x-fullmag-session-scope") !== scope()) throw new Error("Unconfirmed section scope");
+      if (scenario === "clip-unavailable") return new Response("{}", { status: 404, headers });
+      if (request.method === "PATCH") {
+        const patch = await request.json() as VisualizationStatePatch;
+        if (Object.keys(patch).some(key => key !== "clip") || !patch.clip) throw new Error("Unexpected section patch");
+        if (scenario === "clip-reject") return new Response(JSON.stringify({ error: "Section rejected by fixture" }), { status: 409, headers });
+        if (holdClip) await new Promise<void>(resolve => pendingClip.push(resolve));
+        remote = { ...remote, revision: remote.revision + 1, clip: {
+          axis: patch.clip.axis ?? remote.clip.axis, enabled: patch.clip.enabled ?? remote.clip.enabled,
+          flipped: patch.clip.flipped ?? remote.clip.flipped, position_percent: patch.clip.position_percent ?? remote.clip.position_percent,
+        } };
+      } else if (request.method !== "GET") throw new Error("Unexpected section method");
+      return json(remote);
+    }
+    if (request.method !== "GET") throw new Error("Fixture method violation");
     if (url.pathname === SESSIONS_PATH) return json({ schema_version: "1.0", sessions: [{ session_id: owner.session_id, name: "Fixture", current: true, status: "idle" }] });
     if (url.pathname === SESSION_STATUS_PATH) return json({ session: { ...owner, name: "Fixture", created_at: "fixture", workspace_root: "fixture" }, run: { run_id: execution.run_id }, resources: { scene_revision: 1 }, capabilities: {}, lifecycle: { solver: "idle", session_resource: "active", connectivity: "connected", commandability: "writable" } });
     if (url.pathname === DATA_QUANTITIES_PATH && scenario === "tensor-table") return json({ schema_version: "tensor-fixture.v1", quantities: [{ id: "spin_current_tensor", tensor: { rank: 2, shape: [3, 3], layout: "flow_major", axes: ["flow", "spin"], component_labels: ["Q_xx", "Q_xy", "Q_xz", "Q_yx", "Q_yy", "Q_yz", "Q_zx", "Q_zy", "Q_zz"] } }] });
@@ -251,9 +279,10 @@ function makeFixture() {
     }
     unexpected.push(url.pathname); throw new Error(`Unexpected fixture request: ${url.pathname}`);
   } });
+  const visualizationSync = new VisualizationRegistrySyncController({ api: api.visualization, resourceCacheScope: api.resourceCacheScope, resources });
   const cameraRegistry = new CameraRegistryController({ api: api.visualization, idleFlushMs: null, windowTarget: null, documentTarget: null });
   cameraRegistry.patchCamera({ position: [7e-7, 2e-7, 5e-7] });
-  return { kernel: { api, bus, resources, diagnostics, diagnosticRecorder, selection, visualization, commands, cameraRegistry } as unknown as KernelApi, control: { read: () => ({ calls, tree, unexpected, camera: cameraRegistry.getSnapshot(), viewport: viewport3dStore.getSnapshot() }), selectOther: () => selection.set({ objectId: "other", ref: null }, "inspector") } };
+  return { kernel: { api, bus, resources, diagnostics, diagnosticRecorder, selection, visualization, commands, cameraRegistry, visualizationSync } as unknown as KernelApi, control: { read: () => ({ calls, tree, unexpected, camera: cameraRegistry.getSnapshot(), viewport: viewport3dStore.getSnapshot(), clip: remote.clip, clipPending: pendingClip.length }), holdClip: () => { holdClip = true; }, releaseClip: () => { holdClip = false; for (const resolve of pendingClip.splice(0)) resolve(); }, selectOther: () => selection.set({ objectId: "other", ref: null }, "inspector") } };
 }
 
 function FieldCanvasProbe({ tracker }: { tracker: Viewport3DResourceTracker }) {
@@ -265,12 +294,16 @@ function FieldCanvasProbe({ tracker }: { tracker: Viewport3DResourceTracker }) {
       const target = new WebGLRenderTarget(size.x * 2, size.y * 2);
       target.texture.colorSpace = SRGBColorSpace;
       const previous = gl.getRenderTarget(), pixel = new Uint8Array(4);
+      const field = scene.getObjectByName("antenna-scientific-field");
+      const decorations = scene.children.filter(child => child !== field && !child.getObjectByName("antenna-scientific-field"))
+        .map(object => ({ object, visible: object.visible }));
+      for (const { object } of decorations) object.visible = false;
       try {
         gl.setRenderTarget(target); gl.render(scene, camera);
         const projected = new Vector3(position[0], position[1], position[2]).project(camera);
         gl.readRenderTargetPixels(target, Math.floor((projected.x + 1) / 2 * target.width), Math.floor((projected.y + 1) / 2 * target.height), 1, 1, pixel);
         return Array.from(pixel);
-      } finally { gl.setRenderTarget(previous); target.dispose(); }
+      } finally { gl.setRenderTarget(previous); target.dispose(); for (const { object, visible } of decorations) object.visible = visible; }
     };
     window.__antennaFieldCanvas = () => {
       const size = gl.getDrawingBufferSize(new Vector2());
@@ -287,7 +320,7 @@ function FieldCanvasProbe({ tracker }: { tracker: Viewport3DResourceTracker }) {
       }
       const indices = (object: typeof surface) => object && "geometry" in object && object.geometry instanceof BufferGeometry ? object.geometry.index?.count ?? 0 : 0;
       const currentMaterial = surface && "material" in surface && surface.material instanceof ShaderMaterial ? surface.material : null;
-      return { lost: gl.getContext().isContextLost(), width: size.x, height: size.y, sampleCount: field?.userData.sampleCount ?? 0, pointCount: points ? field?.userData.sampleCount ?? 0 : 0, glyphCount, surfaceTriangles: indices(surface) / 3, wireframeEdges: indices(wireframe) / 2, quantity: field?.userData.quantity ?? "", normalization: field?.userData.normalization ?? "", colorMinimum, colorMaximum,
+      return { clippingPlanes: gl.clippingPlanes.length, lost: gl.getContext().isContextLost(), width: size.x, height: size.y, sampleCount: field?.userData.sampleCount ?? 0, pointCount: points ? field?.userData.sampleCount ?? 0 : 0, glyphCount, surfaceTriangles: indices(surface) / 3, wireframeEdges: indices(wireframe) / 2, quantity: field?.userData.quantity ?? "", normalization: field?.userData.normalization ?? "", colorMinimum, colorMaximum,
         currentVertices: geometry instanceof BufferGeometry ? geometry.getAttribute("fmAntennaCurrentVector")?.count ?? 0 : 0,
         currentMaterial: currentMaterial?.name ?? "", currentComponent: currentMaterial?.uniforms.fmAntennaComponent.value ?? -1,
         paletteTextures: tracker.getSnapshot().textures, minimum: field?.userData.minimum ?? 0, maximum: field?.userData.maximum ?? 0,
@@ -303,6 +336,15 @@ function FieldCanvasProbe({ tracker }: { tracker: Viewport3DResourceTracker }) {
 
 function FieldViewport() {
   const model = useAntennaFieldOverlay();
+  const section = useVisualizationStateResource();
+  const positions = model?.wirePositions ?? model?.positions;
+  const bounds = useMemo(() => {
+    if (!positions?.length) return null;
+    const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+    for (let index = 0; index < positions.length; index++) { const axis = index % 3; min[axis] = Math.min(min[axis], positions[index]); max[axis] = Math.max(max[axis], positions[index]); }
+    const size = max.map((value, axis) => value - min[axis]) as [number, number, number];
+    return { center: min.map((value, axis) => value + size[axis] / 2) as [number, number, number], size, radius: Math.hypot(...size) / 2 };
+  }, [positions]);
   const owner = useSessionResourceIdentity();
   const tracker = useMemo(() => new Viewport3DResourceTracker(), []);
   useEffect(() => () => tracker.disposeAll(), [tracker]);
@@ -311,6 +353,8 @@ function FieldViewport() {
       <VectorGlyphDerivedBufferCacheProvider tracker={tracker}>
         <color attach="background" args={["black"]} />
         <FieldCanvasProbe tracker={tracker} />
+        {section.optimisticData?.clip.enabled ? <ClipPlaneLayer bounds={bounds} clip={section.optimisticData.clip} frameRotationDegrees={0} intersectionMarkers={null}
+          colors={{ accent: "white", background: "black", field: "white", mesh: "white", wire: "white" }} tracker={tracker} /> : null}
         <AntennaFieldLayer model={model} colors={{ accent: "white", background: "black", field: "white", mesh: "white", wire: "white" }} tracker={tracker} sessionIdentity={owner} />
       </VectorGlyphDerivedBufferCacheProvider>
     </Viewport3DCanvas>
@@ -325,7 +369,7 @@ function TensorSampleTableFixture() {
 
 function MountedFixture() {
   const fixture = useMemo(() => makeFixture(), []);
-  useEffect(() => { window.__antennaVisualizationFixture = fixture.control; return () => { delete window.__antennaVisualizationFixture; }; }, [fixture]);
+  useEffect(() => { window.__antennaVisualizationFixture = fixture.control; fixture.kernel.visualizationSync.start(); return () => { fixture.kernel.visualizationSync.stop(); delete window.__antennaVisualizationFixture; }; }, [fixture]);
   const legacy = new URL(window.location.href).searchParams.has("legacy");
   const kind = legacy ? "object.visualization" : "object.antenna.visualization";
   const Panel = resolveInspectorRoute(kind)!.component;

@@ -1,6 +1,8 @@
 "use client";
 
 import { useState } from "react";
+import { AntennaClippingControls } from "./AntennaClippingControls";
+import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
 import { AntennaCameraControls } from "./AntennaCameraControls";
 import { closedLoopManifest } from "@/kernel/resources/antennaClosedLoopInspectionModel";
 
@@ -56,6 +58,8 @@ export function AntennaVisualizationView({ selection, scene }: InspectorPanelPro
 }
 
 function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }: { objectId: string | null; stageId: string | null; scene: SceneResource | null; sceneStatus: string }) {
+  const sectionState = useVisualizationStateResource();
+  const clip = sectionState.optimisticData?.clip;
   const ids = resolveAntennaRuntimeIds("solution", stageId, scene);
   const field = useAntennaFieldSolutionResource(ids.solutionId);
   const catalog = useAntennaStageOutputCatalogResource(ids.stageId);
@@ -162,7 +166,8 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
         <FormField label="Show vectors" type="checkbox" disabled={!available || !port || quantitySpec.components === 1} checked={active?.vectors ?? false} onChange={(event) => setDisplay({ vectors: event.target.checked })} hint={quantitySpec.components === 1 ? "Electric potential is scalar; vector glyphs do not apply." : "Full Cartesian glyphs, one global amplitude-preserving display scale derived from carrier bounds, independent of camera."} />
         <FormField label="Vector component" type="select" disabled value={quantitySpec.components === 1 ? "none" : "xyz"}><option value="none">Not applicable (scalar)</option><option value="xyz">Cartesian vector</option></FormField>
       </InspectorGroup>}
-      clipping={<p>Field clipping requires a compatible spatial field carrier. It is unavailable for this numerical preview.</p>}
+      clipping={<AntennaClippingControls resource={sectionState} ownerKey={JSON.stringify(owner)} />}
+      clippingSummary={clip ? clip.enabled ? `On: ${clip.axis.toUpperCase()} ${clip.position_percent.toFixed(1)}%` : "Section: Off" : "Unavailable"}
       camera={<AntennaCameraControls />}
       advanced={<p>{renderReason}</p>}
     />

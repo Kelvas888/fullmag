@@ -11,6 +11,7 @@ export function createAntennaCurrentSurfaceMaterial() {
   palette.generateMipmaps = false; palette.needsUpdate = true;
   const material = new ShaderMaterial({
     name: "FullmagAntennaOwnedCurrentSurface", side: DoubleSide,
+    clipping: true,
     polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
     uniforms: {
       fmAntennaPalette: { value: palette },
@@ -19,20 +20,25 @@ export function createAntennaCurrentSurfaceMaterial() {
       fmAntennaMaximum: { value: 1 },
     },
     vertexShader: `
+      #include <clipping_planes_pars_vertex>
       attribute vec3 fmAntennaCurrentVector;
       varying vec3 vAntennaCurrent;
       void main() {
         vAntennaCurrent = fmAntennaCurrentVector;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        #include <clipping_planes_vertex>
       }`,
     fragmentShader: `
       precision highp float;
+      #include <clipping_planes_pars_fragment>
       uniform sampler2D fmAntennaPalette;
       uniform int fmAntennaComponent;
       uniform float fmAntennaMinimum;
       uniform float fmAntennaMaximum;
       varying vec3 vAntennaCurrent;
       void main() {
+        #include <clipping_planes_fragment>
         float value = fmAntennaComponent == 1 ? vAntennaCurrent.x :
           fmAntennaComponent == 2 ? vAntennaCurrent.y :
           fmAntennaComponent == 3 ? vAntennaCurrent.z : length(vAntennaCurrent);
