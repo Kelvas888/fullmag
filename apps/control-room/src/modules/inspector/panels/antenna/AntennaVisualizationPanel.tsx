@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { AntennaCameraControls } from "./AntennaCameraControls";
 import { closedLoopManifest } from "@/kernel/resources/antennaClosedLoopInspectionModel";
 
 import type { SceneResource } from "@/kernel/api/apiTypes";
@@ -162,7 +163,7 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
         <FormField label="Vector component" type="select" disabled value={quantitySpec.components === 1 ? "none" : "xyz"}><option value="none">Not applicable (scalar)</option><option value="xyz">Cartesian vector</option></FormField>
       </InspectorGroup>}
       clipping={<p>Field clipping requires a compatible spatial field carrier. It is unavailable for this numerical preview.</p>}
-      camera={<p>Camera and conductor geometry display belong to the workspace viewport. This numerical preview does not change either.</p>}
+      camera={<AntennaCameraControls />}
       advanced={<p>{renderReason}</p>}
     />
     <ScientificInspectorContext

@@ -40,8 +40,30 @@ try {
     assert.equal(await root.getByRole("checkbox", { name: "Show vectors", exact: true }).isEnabled(), ready);
     assert.ok((await root.innerText()).includes("conductor primitive is never recolored"));
   };
+  await open("camera-unavailable");
+  await root.getByRole("button", { name: /Camera & View/ }).click();
+  for (const label of ["Fit scene", "Reset camera", "Camera parameters"]) {
+    assert.equal(await root.getByRole("button", { name: label, exact: true }).isEnabled(), false);
+  }
+  checks.push("Missing shared viewport commands keep all antenna camera buttons disabled; no local camera fallback");
   await open("empty");
   await sharedTemplate();
+  await root.getByRole("button", { name: /Camera & View/ }).click();
+  const cameraBefore = await page.evaluate(() => window.__antennaVisualizationFixture.read());
+  const cameraInspector = await root.elementHandle();
+  await root.getByRole("button", { name: "Fit scene", exact: true }).click();
+  await page.waitForFunction(before => window.__antennaVisualizationFixture.read().viewport.fitRevision === before + 1, cameraBefore.viewport.fitRevision);
+  await root.getByRole("button", { name: "Camera parameters", exact: true }).click();
+  await page.waitForFunction(() => window.__antennaVisualizationFixture.read().viewport.widgets.cameraDialogOpen);
+  await root.getByRole("button", { name: "Reset camera", exact: true }).click();
+  const cameraAfter = await page.evaluate(() => window.__antennaVisualizationFixture.read());
+  assert.notDeepEqual(cameraAfter.camera.camera.position, cameraBefore.camera.camera.position);
+  assert.deepEqual(cameraAfter.camera.camera.position, cameraAfter.viewport.camera.position);
+  assert.equal(await cameraInspector.evaluate(element => element === document.querySelector('[data-inspector-owner="object.antenna.visualization"]')), true);
+  assert.equal(cameraAfter.calls.length, cameraBefore.calls.length);
+  await shot("camera-shared-commands");
+  checks.push("Antenna Camera & View dispatches actual shared viewport manifest commands: fit revision, camera parameters widget and reset of the shared camera registry; stable Inspector and zero field requests. Fixture does not qualify full viewport camera binding.");
+  await root.getByRole("button", { name: /Camera & View/ }).click();
   await root.getByRole("button", { name: "Source", exact: true }).click();
   await root.getByText(/No antenna field-solve stage is configured/).waitFor();
   assert.equal(await root.getByRole("combobox", { name: "Antenna quantity", exact: true }).isEnabled(), false);

@@ -10,6 +10,10 @@ import { RequestDiagnosticsController } from "@/kernel/api/RequestDiagnosticsCon
 import { EventBus } from "@/kernel/events/EventBus";
 import type { KernelEventMap } from "@/kernel/events/eventTypes";
 import { KernelContext } from "@/kernel/KernelContext";
+import { CommandRegistry } from "@/kernel/commands/CommandRegistry";
+import { CameraRegistryController } from "@/kernel/visualization/CameraRegistryController";
+import { viewport3dManifest } from "@/modules/viewport-3d/manifest";
+import { viewport3dStore } from "@/modules/viewport-3d/viewport3dStore";
 import { DiagnosticRecorderController } from "@/kernel/performance/diagnostic-recorder/DiagnosticRecorderController";
 import { ResourceInvalidationController } from "@/kernel/resources/ResourceInvalidationController";
 import { antennaFieldPayloadEtag, antennaInspectionPayloadEtag } from "@/kernel/resources/antennaResources";
@@ -179,6 +183,10 @@ function makeFixture() {
   const calls: Call[] = [], unexpected: string[] = [];
   const bus = new EventBus<KernelEventMap>(), resources = new ResourceInvalidationController(bus), diagnostics = new RequestDiagnosticsController();
   const selection = new SelectionController(bus), visualization = new ObjectVisualizationController();
+  const commands = new CommandRegistry();
+  for (const command of viewport3dManifest.contributes?.commands ?? []) {
+    if (scenario !== "camera-unavailable" && ["viewport-3d.fit", "viewport-3d.reset-camera", "viewport-3d.open-camera-dialog"].includes(command.id)) commands.register(command);
+  }
   selection.set({ kind: "object.antenna.visualization", objectId: "antenna" }, "inspector");
   const diagnosticRecorder = new DiagnosticRecorderController({ diagnostics });
   const headers = { "x-api-contract-version": "1.0.0", "x-fullmag-api-instance": instance };
@@ -243,7 +251,9 @@ function makeFixture() {
     }
     unexpected.push(url.pathname); throw new Error(`Unexpected fixture request: ${url.pathname}`);
   } });
-  return { kernel: { api, bus, resources, diagnostics, diagnosticRecorder, selection, visualization } as unknown as KernelApi, control: { read: () => ({ calls, tree, unexpected }), selectOther: () => selection.set({ objectId: "other", ref: null }, "inspector") } };
+  const cameraRegistry = new CameraRegistryController({ api: api.visualization, idleFlushMs: null, windowTarget: null, documentTarget: null });
+  cameraRegistry.patchCamera({ position: [7e-7, 2e-7, 5e-7] });
+  return { kernel: { api, bus, resources, diagnostics, diagnosticRecorder, selection, visualization, commands, cameraRegistry } as unknown as KernelApi, control: { read: () => ({ calls, tree, unexpected, camera: cameraRegistry.getSnapshot(), viewport: viewport3dStore.getSnapshot() }), selectOther: () => selection.set({ objectId: "other", ref: null }, "inspector") } };
 }
 
 function FieldCanvasProbe({ tracker }: { tracker: Viewport3DResourceTracker }) {
