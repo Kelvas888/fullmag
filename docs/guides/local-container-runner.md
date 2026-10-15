@@ -954,3 +954,49 @@ zachowania zgodności źródeł i pakietu; nie wolno nadpisywać działających 
 nowszą albo starszą kopią bez sprawdzenia diffu. GHA wykonuje regresję SQLite,
 testy Node oraz lokalną fixture przeglądarki serwującą `ui_dist`. Fixture nie
 zgłasza prawdziwych buildów ani nie usuwa danych.
+
+### Uzgodnienie desired z już działającą listą profili
+
+`container-reconcile-desired-profiles` jest osobną operacją operatora, wymagającą
+przeglądu przed wykonaniem. Nie aktywuje profilu w procesie i nie rozszerza jego
+uprawnień: ustawia tylko `allowed_profiles` public/secret na dokładny zbiór z
+uwierzytelnionego health atestowanej inkarnacji. Każda nazwa musi należeć do
+`container_client.CATALOG_PROFILES`; obecne desired musi być podzbiorem observed.
+Kolejność zapisu to `ALLOWED_PROFILES`, potem pozostałe nazwy sorted. Nie ma
+wbudowanej listy sześciu profili ani flagi włączającej dodatkowe profile SLEPc.
+
+Przed operacją wymagane są completed pause/drain, trwały marker pauzy, pusty
+aktywny slot/lease, brak innych workerów i pending transakcji. Nie wykonuj jej
+podczas buildu. Przygotuj do przeglądu pełne ID kontenera/obrazu, instance_id z
+health, SHA256 surowych bajtów public config/katalogu oraz observed SHA256:
+`sha256(json.dumps(sorted(observed), separators=(',', ':')).encode('utf-8'))`.
+Odczyty muszą dotyczyć tej samej atestowanej instancji. Nigdy nie publikuj tokenu
+ani zawartości secret; token nie jest argumentem CLI.
+
+```text
+python -B scripts/local_runner_cli.py --worktree <checkout> container-reconcile-desired-profiles --expected-container-id <full-ID> --expected-image-id sha256:<image-ID> --expected-public-sha256 <public-SHA> --expected-catalog-sha256 <catalog-SHA> --expected-observed-sha256 <observed-SHA> --expected-instance-id <health-instance-ID>
+```
+
+Operacja dwa razy sprawdza atestację, completed drain, znany zbiór observed,
+instance_id i niezmienioną kolejkę/inwentarz oraz CAS wszystkich trzech plików.
+Katalog pozostaje identyczny bajtowo; token, port, obraz i pozostałe pola są
+zachowane. Pod istniejącymi lockami zapisuje prywatny journal
+`fullmag.runner.desired-profile-reconcile.v1` w tym samym pending miejscu co
+transakcje BORIS. Journal zawiera sekret i podlega istniejącej ochronie ACL;
+nie publikuj go. Wynik zawiera tylko ID transakcji i hashe public/catalog.
+
+Awaria między zapisami secret/public pozostawia pending, który blokuje zwykłe
+load/start/configure i wykonawców. Przy zwykłym wyjątku operacja próbuje rollback;
+gdy rollback też zawiedzie, pending pozostaje. Istniejący jawny recovery rozpoznaje
+nowy schema i pozwala **wyłącznie `before`**, z exact ID transakcji/kontenera,
+trwałą pauzą, brakiem aktywnych lub niepewnych lease i ochroną przed obcą zmianą plików:
+
+```text
+python -B scripts/local_runner_cli.py --worktree <checkout> container-recover-boris-profile --transaction-id <exact-ID> --direction before
+```
+
+Historyczna nazwa komendy recovery jest współdzielona; `after` dla reconciliation
+jest odrzucane. Recovery starego schema nadal dopuszcza wyłącznie swoją deltę
+usunięcia BORIS. Nie edytuj pending ani pary config ręcznie. Uzgodnienie desired
+nie zastępuje quiesce/frozen-image upgrade, nie osłabia `replace_exited::_delta`
+i nie jest dowodem kwalifikacji buildu ani fizyki.

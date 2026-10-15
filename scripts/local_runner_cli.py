@@ -64,6 +64,9 @@ def main(argv=None):
     profile_activation.add_argument('--enable-slepc-modal', action='store_true')
     profile_activation.add_argument('--enable-slepc-runtime-v2', action='store_true')
     container_config.add_argument('--enable-boris-cpu', action='store_true')
+    reconcile_profiles = sub.add_parser('container-reconcile-desired-profiles')
+    for flag in ('container-id', 'image-id', 'public-sha256', 'catalog-sha256', 'observed-sha256', 'instance-id'):
+        reconcile_profiles.add_argument('--expected-' + flag, required=True)
     disable_boris = sub.add_parser('container-disable-boris-cpu')
     disable_boris.add_argument('--expected-container-sha256', required=True)
     disable_boris.add_argument('--expected-build-config-sha256', required=True)
@@ -173,6 +176,11 @@ def main(argv=None):
                     enable_boris_cpu=args.enable_boris_cpu,
                     enable_slepc_runtime_v2=args.enable_slepc_runtime_v2,
                 )
+            elif args.action == 'container-reconcile-desired-profiles':
+                from local_runner.boris_transition import reconcile_desired
+                result = reconcile_desired(layout, owner, **{
+                    'expected_' + key: getattr(args, 'expected_' + key) for key in
+                    ('container_id', 'image_id', 'public_sha256', 'catalog_sha256', 'observed_sha256', 'instance_id')})
             elif args.action == 'container-disable-boris-cpu':
                 result = container_client.disable_boris_cpu(
                     layout, owner, args.expected_container_sha256,

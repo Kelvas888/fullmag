@@ -13,6 +13,7 @@ from fullmag_storage import file_lock, validate_path
 
 NAMES = ('local-runner-container-secret.json', 'local-runner-container.json', 'local-runner-build-config.json')
 JOURNAL_SCHEMA = 'fullmag.boris.offline-profile-transition.v1'
+RECONCILE_SCHEMA = 'fullmag.runner.desired-profile-reconcile.v1'
 MAX_CONFIG_BYTES = 65536
 
 
@@ -176,7 +177,7 @@ def _apply(storage, journal, direction):
 
 def _finish(storage, journal, direction):
     path = _journal_path(storage)
-    result = {'schema': JOURNAL_SCHEMA, 'transaction_id': journal['transaction_id'], 'state': 'completed',
+    result = {'schema': journal['schema'], 'transaction_id': journal['transaction_id'], 'state': 'completed',
               'direction': direction, 'container_id': journal['container_id'],
               'public_sha256': _sha(_read_bytes(storage / 'index' / NAMES[1])),
               'catalog_sha256': _sha(_read_bytes(storage / 'index' / NAMES[2]))}
@@ -227,6 +228,75 @@ def disable(layout, owner, expected_public_sha256, expected_catalog_sha256, expe
         return _finish(storage, journal, 'after')
 
 
+def reconcile_desired(layout, owner, *, expected_container_id, expected_image_id,
+                      expected_public_sha256, expected_catalog_sha256,
+                      expected_observed_sha256, expected_instance_id,
+                      docker_call=None, health_call=None):
+    """Copy only the exact attested, paused runtime allow-list to desired state."""
+    from local_runner import container_client as client, coordinator_lifecycle as lifecycle
+    owner = client._owner(owner)
+    client._image_id(expected_image_id)
+    if (not client._CONTAINER_ID_RE.fullmatch(expected_container_id or '')
+            or not re.fullmatch('[a-f0-9]{32}', expected_instance_id or '')
+            or any(not re.fullmatch('[a-f0-9]{64}', value or '') for value in
+                   (expected_public_sha256, expected_catalog_sha256, expected_observed_sha256))):
+        raise client.ContainerClientError('Exact reconciliation identity and public digests required')
+    docker_call = docker_call or client.coordinator.docker
+    health_call = health_call or client.request
+    storage = client._storage_root(layout)
+    with _locks(layout):
+        assert_no_pending(storage)
+        paths = [validate_path(storage / 'index' / name, storage) for name in NAMES]
+        before = [_read_bytes(path) for path in paths]
+        secret, public, catalog = _validate_pair(storage, owner, before)
+        if (_sha(before[1]) != expected_public_sha256 or _sha(before[2]) != expected_catalog_sha256
+                or public['image_id'] != expected_image_id):
+            raise client.ContainerClientError('Reconciliation public configuration compare-and-swap failed')
+
+        def guard():
+            observed_health = []
+            def observe(*args):
+                health = health_call(*args)
+                observed_health.append(health)
+                return health
+            state = lifecycle._guard(layout, owner, public, expected_container_id, docker_call, observe)
+            health = observed_health[0]
+            profiles = client._observed_profile_list(health.get('allowed_profiles'))
+            if (profiles is None or health['coordinator'].get('instance_id') != expected_instance_id
+                    or _sha(json.dumps(profiles, separators=(',', ':')).encode()) != expected_observed_sha256
+                    or not set(public['allowed_profiles']).issubset(profiles)):
+                raise client.ContainerClientError('Attested observed profile identity differs from reviewed reconciliation')
+            # _observed_profile_list checks every name against the source-owned CATALOG_PROFILES.
+            ordered = list(client.ALLOWED_PROFILES) + [name for name in profiles if name not in client.ALLOWED_PROFILES]
+            return state, ordered
+
+        initial, profiles = guard()
+        for value in (secret, public):
+            value['allowed_profiles'] = profiles
+        # Preserve the catalogue byte-for-byte, not a reserialized equivalent.
+        after = [(json.dumps(value, indent=2, ensure_ascii=False) + '\n').encode() for value in (secret, public)] + [before[2]]
+        if any(len(blob) > MAX_CONFIG_BYTES for blob in after):
+            raise client.ContainerClientError('Reconciliation output exceeds bound')
+        # Recheck the baseline using its original public contract before journalling.
+        public = json.loads(before[1])
+        final, repeated = guard()
+        if final != initial or repeated != profiles or any(_read_bytes(path) != blob for path, blob in zip(paths, before)):
+            raise client.ContainerClientError('Reconciliation baseline changed')
+        journal = {'schema': RECONCILE_SCHEMA, 'transaction_id': uuid.uuid4().hex, 'operator': owner,
+                   'container_id': expected_container_id,
+                   'files': [{'name': name, 'before': old.hex(), 'after': new.hex()} for name, old, new in zip(NAMES, before, after)]}
+        path = _journal_path(storage)
+        _private_directory(path.parent)
+        _write_bytes(path, (json.dumps(journal, indent=2) + '\n').encode())
+        try:
+            _apply(storage, journal, 'after')
+        except Exception:
+            _apply(storage, journal, 'before')
+            _finish(storage, journal, 'before')
+            raise
+        return _finish(storage, journal, 'after')
+
+
 def recover(layout, owner, transaction_id, direction, *, docker_call=None):
     from local_runner import container_client as client
     owner = client._owner(owner)
@@ -240,7 +310,7 @@ def recover(layout, owner, transaction_id, direction, *, docker_call=None):
             raise client.ContainerClientError('A bounded pending transaction is required')
         journal = json.loads(path.read_bytes())
         if (set(journal) != {'schema', 'transaction_id', 'operator', 'container_id', 'files'}
-                or journal['schema'] != JOURNAL_SCHEMA or journal['transaction_id'] != transaction_id
+                or journal['schema'] not in (JOURNAL_SCHEMA, RECONCILE_SCHEMA) or journal['transaction_id'] != transaction_id
                 or journal['operator'] != owner or not isinstance(journal['files'], list)
                 or len(journal['files']) != len(NAMES)):
             raise client.ContainerClientError('Pending transaction identity mismatch')
@@ -250,6 +320,29 @@ def recover(layout, owner, transaction_id, direction, *, docker_call=None):
             for key in ('before', 'after'):
                 if not isinstance(item[key], str) or len(item[key]) > 2 * MAX_CONFIG_BYTES or not re.fullmatch('[a-f0-9]+', item[key]) or len(item[key]) % 2:
                     raise client.ContainerClientError('Pending transaction config bytes are invalid')
+        if journal['schema'] == RECONCILE_SCHEMA:
+            if direction != 'before':
+                raise client.ContainerClientError('Desired-profile reconciliation recovery permits rollback only')
+            old = _validate_pair(storage, owner, [bytes.fromhex(item['before']) for item in journal['files']])
+            new = _validate_pair(storage, owner, [bytes.fromhex(item['after']) for item in journal['files']])
+            profiles = new[1]['allowed_profiles']
+            expected = [dict(value) for value in old]
+            for value in expected[:2]:
+                value['allowed_profiles'] = profiles
+            if (list(new) != expected or journal['files'][2]['before'] != journal['files'][2]['after']
+                    or not set(old[1]['allowed_profiles']).issubset(profiles)):
+                raise client.ContainerClientError('Reconciliation journal changes protected fields')
+            from local_runner import coordinator_lifecycle as lifecycle
+            current = lifecycle._attested(layout, owner, old[1], journal['container_id'], docker_call)
+            if current['state'] not in ('running', 'exited'):
+                raise client.ContainerClientError('Reconciliation rollback coordinator state is uncertain')
+            lifecycle._inventory(docker_call, journal['container_id'])
+            lifecycle._queue_guard(storage)
+            from local_runner.service import ServicePaths, read_stop_request
+            if read_stop_request(ServicePaths.from_storage(storage)) is None:
+                raise client.ContainerClientError('Reconciliation rollback requires durable pause')
+            _apply(storage, journal, 'before')
+            return _finish(storage, journal, 'before')
         _, original_public, _ = _validate_pair(storage, owner, [bytes.fromhex(item['before']) for item in journal['files']])
         old_secret, old_public, old_catalog = _validate_pair(storage, owner, [bytes.fromhex(item['before']) for item in journal['files']])
         expected = [old_secret, old_public, old_catalog]
