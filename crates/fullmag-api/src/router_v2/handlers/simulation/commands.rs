@@ -213,7 +213,7 @@ async fn submit_structured_command_impl_with_context(
             let _transition = state.current_live_session_transition.lock().await;
             crate::validate_current_live_request_context(&state, &accepted_context).await?;
             return publish_completed_preparation_command_impl_with_context_under_transition(
-                state,
+                Arc::clone(&state),
                 headers,
                 command,
                 &accepted_context,
@@ -233,7 +233,10 @@ async fn submit_structured_command_impl_with_context(
                 run_id: Some(accepted.run_id),
             });
             return publish_accepted_session_command_impl_with_context_under_transition(
-                state, headers, command, context,
+                Arc::clone(&state),
+                headers,
+                command,
+                context,
             )
             .await;
         }
@@ -241,7 +244,7 @@ async fn submit_structured_command_impl_with_context(
             && command.kind == "pause"
         {
             return reject_session_command_impl_with_context(
-                state,
+                Arc::clone(&state),
                 headers,
                 command,
                 "accepted_control_unsupported: Docker accepted workers expose durable Stop; Pause is unavailable until a worker pause command is published.".into(),
@@ -266,7 +269,10 @@ async fn submit_structured_command_impl_with_context(
                     run_id: Some(accepted.run_id),
                 });
                 return publish_accepted_session_command_impl_with_context_under_transition(
-                    state, headers, command, context,
+                    Arc::clone(&state),
+                    headers,
+                    command,
+                    context,
                 )
                 .await;
             }
@@ -696,6 +702,47 @@ fn validate_runtime_command_contract(
     Ok(())
 }
 
+/// Validate an accepted command against the snapshot captured before durable
+/// Run publication. The accepted path must finish this check before it can
+/// bind a command to a RunIntent; the capacity probe is deliberately made on
+/// a clone so a rejected command cannot leave a journal reservation behind.
+fn validate_accepted_command_admission_against_snapshot(
+    snapshot: &SessionStateResponse,
+    ledger: &std::collections::VecDeque<TrackedCommandRecord>,
+    command: &SessionCommand,
+) -> Result<(), ApiError> {
+    if command.kind == "stop" {
+        // Accepted Stop is a durable task cancellation. Its run may still be
+        // waiting for the explicit Compute gate or for FEM preparation, so the
+        // stage-control validator is intentionally narrower than this lane.
+        validate_runtime_command_preconditions(snapshot, ledger, command)?;
+        let run_status = snapshot
+            .run
+            .as_ref()
+            .map(|run| run.status.as_str())
+            .ok_or_else(|| {
+                ApiError::conflict_with_code(
+                    "accepted_control_run_missing",
+                    "accepted Stop requires a durable live run",
+                )
+            })?;
+        if matches!(
+            run_status,
+            "completed" | "succeeded" | "failed" | "cancelled" | "stopped"
+        ) {
+            return Err(ApiError::conflict_with_code(
+                "accepted_control_run_terminal",
+                format!("accepted Stop cannot target terminal run status `{run_status}`"),
+            ));
+        }
+    } else {
+        validate_runtime_command_contract(snapshot, ledger, command)?;
+    }
+    let mut capacity_probe = ledger.clone();
+    reserve_command_ledger_entry(&mut capacity_probe)?;
+    Ok(())
+}
+
 fn validate_runtime_command_preconditions(
     snapshot: &SessionStateResponse,
     ledger: &std::collections::VecDeque<TrackedCommandRecord>,
@@ -831,38 +878,7 @@ pub(crate) async fn accepted_command_admission_snapshot(
             .load(std::sync::atomic::Ordering::Acquire),
     )?;
     let ledger = state.current_command_ledger.lock().await;
-    if command.kind == "stop" {
-        // Accepted Stop is a durable task cancellation.  Its run may still be
-        // waiting for the explicit Compute gate or for FEM preparation, so the
-        // legacy stage-control validator (which only accepts running/paused)
-        // is too narrow for this control-plane lane.  Keep all optimistic
-        // preconditions and ledger capacity checks, then validate the accepted
-        // run lifecycle itself before the durable cancellation is written.
-        validate_runtime_command_preconditions(snapshot, &ledger, command)?;
-        let run_status = snapshot
-            .run
-            .as_ref()
-            .map(|run| run.status.as_str())
-            .ok_or_else(|| {
-                ApiError::conflict_with_code(
-                    "accepted_control_run_missing",
-                    "accepted Stop requires a durable live run",
-                )
-            })?;
-        if matches!(
-            run_status,
-            "completed" | "succeeded" | "failed" | "cancelled" | "stopped"
-        ) {
-            return Err(ApiError::conflict_with_code(
-                "accepted_control_run_terminal",
-                format!("accepted Stop cannot target terminal run status `{run_status}`"),
-            ));
-        }
-    } else {
-        validate_runtime_command_contract(snapshot, &ledger, command)?;
-    }
-    let mut capacity_probe = ledger.clone();
-    reserve_command_ledger_entry(&mut capacity_probe)?;
+    validate_accepted_command_admission_against_snapshot(snapshot, &ledger, command)?;
     Ok(snapshot.clone())
 }
 
@@ -1890,7 +1906,10 @@ async fn publish_accepted_session_command_impl_with_context(
 ) -> Result<CommandResponse, ApiError> {
     let _transition = state.current_live_session_transition.lock().await;
     publish_accepted_session_command_impl_with_context_under_transition(
-        state, headers, command, context,
+        Arc::clone(&state),
+        headers,
+        command,
+        context,
     )
     .await
 }
@@ -2200,6 +2219,35 @@ pub(crate) async fn publish_accepted_live_study_under_transition(
 /// model have been committed. Docker API-only has no legacy queue consumer, so
 /// this command is completed by the preparation adapter itself and remains
 /// visible through the ordinary command journal/realtime resources.
+fn complete_reserved_preparation_command_in_ledger(
+    ledger: &mut std::collections::VecDeque<TrackedCommandRecord>,
+    command_id: &str,
+    completed_at_unix_ms: u128,
+) -> (bool, bool) {
+    let Some(record) = ledger
+        .iter_mut()
+        .find(|record| record.command.command_id == command_id)
+    else {
+        return (false, false);
+    };
+    if matches!(
+        record.status,
+        CommandLifecycleState::Completed
+            | CommandLifecycleState::Failed
+            | CommandLifecycleState::Rejected
+    ) {
+        return (true, false);
+    }
+    record.status = CommandLifecycleState::Completed;
+    record.completed_at_unix_ms = Some(completed_at_unix_ms);
+    record.completion_status = Some(crate::types::CommandCompletionState::Completed);
+    record.error = None;
+    (true, true)
+}
+
+/// Complete only the already-reserved command identified by `command_id`.
+/// Preparation may advance mesh revisions, so this transition intentionally
+/// does not re-run the command's admission preconditions.
 async fn publish_completed_preparation_command_impl_with_context_under_transition(
     state: Arc<AppState>,
     headers: &HeaderMap,
@@ -2231,26 +2279,12 @@ async fn publish_completed_preparation_command_impl_with_context_under_transitio
     let command_id = command.command_id.clone();
     let request_id = command_request_id(headers);
     let completed_at_unix_ms = crate::session::unix_time_millis_now();
-    let (found, _changed) = crate::live_command_journal::mutate(&state, snapshot, |ledger| {
-        let Some(record) = ledger
-            .iter_mut()
-            .find(|record| record.command.command_id == command_id)
-        else {
-            return Ok((false, false));
-        };
-        if matches!(
-            record.status,
-            CommandLifecycleState::Completed
-                | CommandLifecycleState::Failed
-                | CommandLifecycleState::Rejected
-        ) {
-            return Ok((true, false));
-        }
-        record.status = CommandLifecycleState::Completed;
-        record.completed_at_unix_ms = Some(completed_at_unix_ms);
-        record.completion_status = Some(crate::types::CommandCompletionState::Completed);
-        record.error = None;
-        Ok((true, true))
+    let found = crate::live_command_journal::mutate(&state, snapshot, |ledger| {
+        Ok(complete_reserved_preparation_command_in_ledger(
+            ledger,
+            &command_id,
+            completed_at_unix_ms,
+        ))
     })
     .await?;
     if !found {
@@ -2291,6 +2325,38 @@ async fn publish_completed_preparation_command_impl_with_context_under_transitio
     Ok(response)
 }
 
+fn terminalize_reserved_preparation_command_in_ledger(
+    ledger: &mut std::collections::VecDeque<TrackedCommandRecord>,
+    command_id: &str,
+    completion: crate::types::CommandCompletionState,
+    completed_at_unix_ms: u128,
+    error_message: &str,
+) -> bool {
+    let Some(record) = ledger
+        .iter_mut()
+        .find(|record| record.command.command_id == command_id)
+    else {
+        return false;
+    };
+    if matches!(
+        record.status,
+        CommandLifecycleState::Completed
+            | CommandLifecycleState::Failed
+            | CommandLifecycleState::Rejected
+    ) {
+        return false;
+    }
+    record.status = if completion == crate::types::CommandCompletionState::Failed {
+        CommandLifecycleState::Failed
+    } else {
+        CommandLifecycleState::Completed
+    };
+    record.completed_at_unix_ms = Some(completed_at_unix_ms);
+    record.completion_status = Some(completion);
+    record.error = Some(error_message.to_string());
+    true
+}
+
 /// Turn an already-reserved preparation command terminal when the accepted
 /// preparation poll fails. The context fence is checked before the journal
 /// mutation so a replacement session cannot inherit an old command outcome.
@@ -2318,29 +2384,16 @@ async fn mark_reserved_preparation_command_terminal_if_current(
     }
     let completed_at_unix_ms = crate::session::unix_time_millis_now();
     crate::live_command_journal::mutate(state, snapshot, |ledger| {
-        let Some(record) = ledger
-            .iter_mut()
-            .find(|record| record.command.command_id == command_id)
-        else {
-            return Ok(((), false));
-        };
-        if matches!(
-            record.status,
-            CommandLifecycleState::Completed
-                | CommandLifecycleState::Failed
-                | CommandLifecycleState::Rejected
-        ) {
-            return Ok(((), false));
-        }
-        record.status = if completion == crate::types::CommandCompletionState::Failed {
-            CommandLifecycleState::Failed
-        } else {
-            CommandLifecycleState::Completed
-        };
-        record.completed_at_unix_ms = Some(completed_at_unix_ms);
-        record.completion_status = Some(completion);
-        record.error = Some(error_message.to_string());
-        Ok(((), true))
+        Ok((
+            (),
+            terminalize_reserved_preparation_command_in_ledger(
+                ledger,
+                command_id,
+                completion,
+                completed_at_unix_ms,
+                error_message,
+            ),
+        ))
     })
     .await
 }
@@ -2866,6 +2919,176 @@ mod tests {
             .expect("resolved registry fixture");
         registry.source = fullmag_runner::QuantityProviderRegistrySource::CompatibilityProfile;
         capabilities
+    }
+
+    fn journal_command(command_id: &str, kind: &str) -> SessionCommand {
+        serde_json::from_value(serde_json::json!({
+            "seq": 7,
+            "command_id": command_id,
+            "kind": kind,
+            "created_at_unix_ms": 1_700_000_000_000u128
+        }))
+        .expect("minimal journal command fixture should deserialize")
+    }
+
+    fn accepted_preparation_record(command_id: &str, kind: &str) -> TrackedCommandRecord {
+        TrackedCommandRecord {
+            command: journal_command(command_id, kind),
+            request_id: Some(format!("request-{command_id}")),
+            status: CommandLifecycleState::Accepted,
+            dispatched_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            completion_status: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn accepted_preparation_completion_keeps_reserved_record_after_mesh_revision_moves() {
+        let mut command = journal_command("accepted-remesh", "remesh");
+        command.precondition = Some(RuntimeCommandPrecondition {
+            mesh_revision: Some(41),
+            ..RuntimeCommandPrecondition::default()
+        });
+        let mut ledger = std::collections::VecDeque::from([accepted_preparation_record(
+            "accepted-remesh",
+            "remesh",
+        )]);
+        ledger.front_mut().expect("reserved record").command = command.clone();
+
+        let request: CurrentLiveSnapshotRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "preparation-mesh-revision"
+        }))
+        .expect("minimal live snapshot request should deserialize");
+        let mut post_preparation = default_current_live_state(&request);
+        post_preparation.mesh_revision = 42;
+        assert!(validate_runtime_command_preconditions(&post_preparation, &ledger, &command)
+            .expect_err("the old optimistic mesh revision is stale after preparation")
+            .message
+            .contains("mesh_revision precondition failed"));
+
+        let (found, changed) = complete_reserved_preparation_command_in_ledger(
+            &mut ledger,
+            "accepted-remesh",
+            1_700_000_001_000,
+        );
+        assert!((found, changed) == (true, true));
+        let record = ledger.front().expect("reserved record remains present");
+        assert_eq!(record.command.command_id, "accepted-remesh");
+        assert_eq!(
+            record
+                .command
+                .precondition
+                .as_ref()
+                .and_then(|precondition| precondition.mesh_revision),
+            Some(41)
+        );
+        assert_eq!(record.status, CommandLifecycleState::Completed);
+        assert_eq!(
+            record.completion_status,
+            Some(crate::types::CommandCompletionState::Completed)
+        );
+        assert_eq!(record.completed_at_unix_ms, Some(1_700_000_001_000));
+        assert!(record.error.is_none());
+    }
+
+    #[test]
+    fn preparation_failure_and_stop_terminalize_only_their_reserved_records() {
+        let mut ledger = std::collections::VecDeque::from([
+            accepted_preparation_record("preparation-failed", "remesh"),
+            accepted_preparation_record("preparation-stop", "stop"),
+        ]);
+
+        assert!(terminalize_reserved_preparation_command_in_ledger(
+            &mut ledger,
+            "preparation-failed",
+            crate::types::CommandCompletionState::Failed,
+            1_700_000_001_100,
+            "native preparation failed",
+        ));
+        let failed = ledger.front().expect("failed preparation record");
+        assert_eq!(failed.status, CommandLifecycleState::Failed);
+        assert_eq!(
+            failed.completion_status,
+            Some(crate::types::CommandCompletionState::Failed)
+        );
+        assert_eq!(failed.error.as_deref(), Some("native preparation failed"));
+        assert_eq!(
+            ledger
+                .get(1)
+                .expect("stop record must remain reserved")
+                .status,
+            CommandLifecycleState::Accepted
+        );
+
+        assert!(terminalize_reserved_preparation_command_in_ledger(
+            &mut ledger,
+            "preparation-stop",
+            crate::types::CommandCompletionState::Cancelled,
+            1_700_000_001_200,
+            "accepted run stopped",
+        ));
+        let stopped = ledger.get(1).expect("stop record");
+        assert_eq!(stopped.status, CommandLifecycleState::Completed);
+        assert_eq!(
+            stopped.completion_status,
+            Some(crate::types::CommandCompletionState::Cancelled)
+        );
+        assert_eq!(stopped.error.as_deref(), Some("accepted run stopped"));
+        assert_eq!(
+            ledger.front().expect("failure record remains isolated").status,
+            CommandLifecycleState::Failed
+        );
+    }
+
+    #[test]
+    fn old_preparation_terminalization_does_not_mutate_replacement_session_ledger() {
+        let mut replacement_ledger = std::collections::VecDeque::from([accepted_preparation_record(
+            "replacement-remesh",
+            "remesh",
+        )]);
+
+        assert!(!terminalize_reserved_preparation_command_in_ledger(
+            &mut replacement_ledger,
+            "old-session-remesh",
+            crate::types::CommandCompletionState::Failed,
+            1_700_000_001_300,
+            "late receipt from replaced session",
+        ));
+        let replacement = replacement_ledger
+            .front()
+            .expect("replacement command remains present");
+        assert_eq!(replacement.command.command_id, "replacement-remesh");
+        assert_eq!(replacement.status, CommandLifecycleState::Accepted);
+        assert!(replacement.completion_status.is_none());
+        assert!(replacement.error.is_none());
+    }
+
+    #[test]
+    fn rejected_accepted_admission_does_not_reserve_a_run_command() {
+        let request: CurrentLiveSnapshotRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "rejected-pre-admission"
+        }))
+        .expect("minimal live snapshot request should deserialize");
+        let snapshot = default_current_live_state(&request);
+        let mut command = journal_command("rejected-remesh", "remesh");
+        command.precondition = Some(RuntimeCommandPrecondition {
+            mesh_revision: Some(snapshot.mesh_revision.saturating_add(1)),
+            ..RuntimeCommandPrecondition::default()
+        });
+        let mut ledger = std::collections::VecDeque::new();
+
+        let error = validate_accepted_command_admission_against_snapshot(
+            &snapshot,
+            &ledger,
+            &command,
+        )
+        .expect_err("stale pre-admission must fail before accepted Run publication");
+        assert!(error.message.contains("mesh_revision precondition failed"));
+        assert!(
+            ledger.is_empty(),
+            "a rejected pre-admission must not publish an accepted Run journal record"
+        );
     }
 
     #[test]

@@ -119,6 +119,10 @@ jobs:
           cargo test -p fullmag-api --bin fullmag-api live_accepted_execution::tests
           cargo test -p fullmag-api --bin fullmag-api live_accepted_projection::tests
           cargo test -p fullmag-api --bin fullmag-api live_scene_preparation::tests
+          cargo test -p fullmag-api --bin fullmag-api accepted_preparation_completion_keeps_reserved_record_after_mesh_revision_moves
+          cargo test -p fullmag-api --bin fullmag-api preparation_failure_and_stop_terminalize_only_their_reserved_records
+          cargo test -p fullmag-api --bin fullmag-api old_preparation_terminalization_does_not_mutate_replacement_session_ledger
+          cargo test -p fullmag-api --bin fullmag-api rejected_accepted_admission_does_not_reserve_a_run_command
 
       - name: Run complete session reachability and archive contracts
         run: cargo test -p fullmag-session --lib --no-fail-fast

@@ -799,17 +799,12 @@ fn materialize_live_accepted(
             ));
         }
         let profile = fullmag_application::legacy_live_execution_profile();
-        effective_scene.study.execution_profile = Some(
-            fullmag_authoring::StudyExecutionProfileReference {
-                profile_id: profile.profile_id,
-                version: profile.version,
-            },
-        );
+        effective_scene.study.execution_profile = Some(profile);
     }
     let profile = effective_scene
         .study
         .execution_profile
-        .cloned()
+        .clone()
         .ok_or_else(|| {
             ApiError::unprocessable_with_code(
                 "accepted_execution_profile_missing",
@@ -1358,9 +1353,11 @@ fn open_submit_store(
 
 fn exact_catalog_profile(
     catalog: &fullmag_session::execution_profiles::ExecutionProfileCatalog,
-    reference: &fullmag_authoring::StudyExecutionProfileReference,
+    reference: &fullmag_ir::ExecutionProfileIR,
 ) -> Result<fullmag_session::execution_profiles::ExecutionProfileCatalogEntry, ApiError> {
-    catalog
+    let expected_sha256 = reference.canonical_sha256()
+        .map_err(|error| profile_catalog_error(error.to_string()))?;
+    let entry = catalog
         .entries
         .iter()
         .find(|entry| {
@@ -1376,7 +1373,14 @@ fn exact_catalog_profile(
                     reference.profile_id, reference.version
                 ),
             )
-        })
+        })?;
+    if entry.profile_sha256 != expected_sha256 || entry.profile != *reference {
+        return Err(ApiError::conflict_with_code(
+            "execution_profile_hash_conflict",
+            "authored live execution profile differs from its immutable catalogue entry",
+        ));
+    }
+    Ok(entry)
 }
 
 fn ensure_migrated_profile_published(
@@ -1457,6 +1461,29 @@ mod tests {
             coordinator_watermark: None,
             coordinator_genesis: None,
         }
+    }
+
+    #[test]
+    fn authored_profile_requires_exact_published_content_not_only_reference() {
+        use fullmag_session::execution_profiles::{ExecutionProfileCatalog, ExecutionProfileCatalogEntry};
+        let profile = fullmag_application::legacy_live_execution_profile();
+        let entry = ExecutionProfileCatalogEntry {
+            profile_sha256: profile.canonical_sha256().unwrap(),
+            profile: profile.clone(),
+            client_intent_id: "publish-profile".into(),
+            published_at: "2026-10-15T00:00:00Z".into(),
+            revision: 1,
+        };
+        let catalog = ExecutionProfileCatalog {
+            revision: 1,
+            entries: vec![entry.clone()],
+            ..ExecutionProfileCatalog::default()
+        };
+        assert_eq!(super::exact_catalog_profile(&catalog, &profile).unwrap(), entry);
+        let mut changed = profile;
+        changed.description = "different authored profile at the same version".into();
+        let error = super::exact_catalog_profile(&catalog, &changed).unwrap_err();
+        assert_eq!(error.code.as_deref(), Some("execution_profile_hash_conflict"));
     }
 
     #[test]
