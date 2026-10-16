@@ -566,9 +566,13 @@ describe("WorkspaceShellClient session collection gate", () => {
   });
 
   it("hydrates the loading server snapshot before adopting confirmed absence", async () => {
+    // Home's lazy slot is covered by the lifecycle tests above; keep this
+    // resource snapshot assertion's SSR tree synchronous.
     const kernel = makeKernel(
       vi.fn(async () => ({ schema_version: "2.0.0", sessions: [] })),
       vi.fn(),
+      undefined,
+      { includeStartScreen: false },
     );
     const serverHtml = renderToString(
       <KernelContext.Provider value={kernel}>
@@ -610,11 +614,14 @@ function makeKernel(
   preparation: () => Promise<SimulationPreparationResource> = async () => {
     throw new Error("simulation preparation is not served in this test");
   },
+  options: { readonly includeStartScreen?: boolean } = {},
 ): KernelApi {
   const bus = new EventBus<KernelEventMap>();
   const commands = new CommandRegistry();
   const modules = new ModuleRegistry();
-  modules.register({ ...startScreenManifest, component: async () => ({ default: StartScreen }) });
+  if (options.includeStartScreen !== false) {
+    modules.register({ ...startScreenManifest, component: async () => ({ default: StartScreen }) });
+  }
   modules.register({
     id: "workspace-shell-test-viewport",
     title: "Workspace shell test viewport",
