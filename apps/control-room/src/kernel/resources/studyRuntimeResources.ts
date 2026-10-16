@@ -2311,6 +2311,9 @@ function fieldMetaQueryEntries(query: FieldMetaQuery): Array<[string, string]> {
       entries.push([key, value]);
     }
   };
+  push("carrier_id");
+  push("expected_carrier_revision");
+  push("view");
   push("component");
   push("owner_object_id");
   push("scope_id");
@@ -2374,6 +2377,10 @@ export function fieldMetaFreshnessRevision(
 
 export function useFieldMetaResource({
   enabled = true,
+  strictErrors = false,
+  carrier_id = null,
+  expected_carrier_revision = null,
+  view = null,
   component = null,
   owner_object_id = null,
   scope_id = null,
@@ -2381,7 +2388,7 @@ export function useFieldMetaResource({
   snapshot_id = null,
   stage_id = null,
   quantityId,
-}: RuntimeResourceOptions & FieldMetaQuery & { quantityId: string }) {
+}: RuntimeResourceOptions & FieldMetaQuery & { quantityId: string; strictErrors?: boolean }) {
   const { api, bus } = useKernel();
   const resolvedQuantityId = useMemo(
     () => normalizeQuantityIdOrDefault(quantityId),
@@ -2389,6 +2396,7 @@ export function useFieldMetaResource({
   );
   const query = useMemo(
     () => ({
+      carrier_id, expected_carrier_revision, view,
       component,
       ...(owner_object_id ? { owner_object_id } : {}),
       scope_id,
@@ -2396,7 +2404,7 @@ export function useFieldMetaResource({
       snapshot_id,
       stage_id,
     }),
-    [component, owner_object_id, scope_id, scope_kind, snapshot_id, stage_id],
+    [carrier_id, expected_carrier_revision, view, component, owner_object_id, scope_id, scope_kind, snapshot_id, stage_id],
   );
   const unscopedResourceKey = useMemo(
     () => resolveFieldMetaResourceKey(resolvedQuantityId, query),
@@ -2410,13 +2418,13 @@ export function useFieldMetaResource({
       api.data.fields
         .meta(resolvedQuantityId, query, { sessionScopeKey, signal })
         .catch((error: unknown) =>
-          ignoreMissingFieldMetaResource<FieldMetaResource>({
+          strictErrors ? Promise.reject(error) : ignoreMissingFieldMetaResource<FieldMetaResource>({
             bus,
             error,
             resourceKey,
           }),
         ),
-    [api, bus, query, resolvedQuantityId, resourceKey],
+    [api, bus, query, resolvedQuantityId, resourceKey, strictErrors],
   );
 
   return useResource<FieldMetaResource | null>({
