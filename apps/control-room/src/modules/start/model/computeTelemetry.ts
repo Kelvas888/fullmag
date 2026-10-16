@@ -53,12 +53,37 @@ export function describeRuntimeLanes(
   if (!capabilities) return undefined;
   return (["FDM", "FEM"] as const).flatMap((backend) =>
     (["CPU", "GPU"] as const).map((device): ComputeRuntimeLane => {
-      const engines = capabilities.engines.filter(
+      const strictEngines = capabilities.engines.filter(
         (engine) => engine.backend.toUpperCase() === backend &&
-          engine.device.toUpperCase() === device && engine.public &&
-          engine.mode === "strict" && engine.stability === "production",
+          engine.device.toUpperCase() === device && engine.mode === "strict",
+      );
+      const engines = strictEngines.filter(
+        (engine) => engine.public && engine.stability === "production",
+      );
+      const experimentalEngines = strictEngines.filter(
+        (engine) => engine.stability === "experimental",
       );
       const available = engines.filter((engine) => engine.status === "available");
+      const experimentalAvailable = experimentalEngines.some(
+        (engine) => engine.status === "available",
+      );
+      const diagnostic: ComputeRuntimeLane["diagnostic"] = experimentalEngines.length
+        ? {
+            kind: "experimental",
+            state: experimentalAvailable ? "available" : "unavailable",
+            ...(experimentalAvailable
+              ? {}
+              : {
+                  reason: [...new Set(
+                    experimentalEngines.map(
+                      (engine) => engine.status_reason?.trim() ||
+                        engine.status.replaceAll("_", " ") ||
+                        "Experimental runtime is unavailable",
+                    ),
+                  )].join("; "),
+                }),
+          }
+        : undefined;
       return {
         backend,
         device,
@@ -69,6 +94,7 @@ export function describeRuntimeLanes(
           : engines.length
             ? [...new Set(engines.map((engine) => engine.status_reason ?? engine.status.replaceAll("_", " ")))].join("; ")
             : "No runtime has been reported for this lane.",
+        ...(diagnostic ? { diagnostic } : {}),
       };
     }),
   );

@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import type { CpuTelemetryResource, GpuTelemetryResource } from "@/kernel/api/apiTypes";
+import type {
+  CpuTelemetryResource,
+  GpuTelemetryResource,
+  PlatformCapabilitiesResource,
+} from "@/kernel/api/apiTypes";
 
 import {
   computeFromTelemetry,
+  describeRuntimeLanes,
   isTelemetrySampleStale,
   isTelemetrySampleStaleByAge,
 } from "./computeTelemetry";
@@ -24,6 +29,23 @@ const gpuTelemetry = (sampledAt: number): GpuTelemetryResource => ({
   devices: [],
   sample_time_unix_ms: sampledAt,
   status: "available",
+});
+
+type HostEngine = PlatformCapabilitiesResource["engines"][number];
+
+const hostEngine = (overrides: Partial<HostEngine> = {}): HostEngine => ({
+  backend: "FEM",
+  device: "CPU",
+  mode: "strict",
+  precision: "double",
+  public: false,
+  runtime_family: "test",
+  runtime_version: "test",
+  stability: "experimental",
+  status: "available",
+  status_reason: null,
+  worker: "test",
+  ...overrides,
 });
 
 describe("compute telemetry sample time", () => {
@@ -71,5 +93,68 @@ describe("compute telemetry freshness", () => {
     }
 
     expect(isTelemetrySampleStaleByAge(5_000, 0)).toBe(true);
+  });
+});
+
+describe("runtime lane diagnostics", () => {
+  it("keeps experimental availability display-only and preserves production precision", () => {
+    const lanes = describeRuntimeLanes({
+      profile_version: "test",
+      engines: [
+        hostEngine({
+          backend: "FDM",
+          device: "GPU",
+          precision: "single",
+          public: false,
+          stability: "experimental",
+        }),
+        hostEngine({
+          backend: "FDM",
+          device: "GPU",
+          precision: "double",
+          public: true,
+          stability: "production",
+        }),
+        hostEngine({ backend: "FEM", device: "CPU" }),
+      ],
+    });
+
+    const fdmGpu = lanes?.find((lane) => lane.backend === "FDM" && lane.device === "GPU");
+    const femCpu = lanes?.find((lane) => lane.backend === "FEM" && lane.device === "CPU");
+    expect(fdmGpu).toMatchObject({
+      availability: "available",
+      precisions: ["double"],
+      diagnostic: { kind: "experimental", state: "available" },
+    });
+    expect(femCpu).toMatchObject({
+      availability: "unknown",
+      precisions: [],
+      diagnostic: { kind: "experimental", state: "available" },
+    });
+  });
+
+  it("reports an unavailable strict experimental runtime with its status reason", () => {
+    const lanes = describeRuntimeLanes({
+      profile_version: "test",
+      engines: [
+        hostEngine({
+          device: "GPU",
+          status: "missing_driver",
+          status_reason: "Native FEM GPU driver is unavailable",
+        }),
+        hostEngine({ mode: "probe", status: "available" }),
+      ],
+    });
+
+    const femGpu = lanes?.find((lane) => lane.backend === "FEM" && lane.device === "GPU");
+    expect(femGpu).toMatchObject({
+      availability: "unknown",
+      precisions: [],
+      diagnostic: {
+        kind: "experimental",
+        state: "unavailable",
+        reason: "Native FEM GPU driver is unavailable",
+      },
+    });
   });
 });
