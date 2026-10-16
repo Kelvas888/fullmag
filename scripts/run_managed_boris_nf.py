@@ -21,6 +21,10 @@ SCHEMA = "fullmag.boris.managed_run.v1"
 RUNTIME_SCHEMA = "fullmag.boris.runtime.v2"
 TRUSTED = {"context.json", "build_entrypoint.py", "worker_entrypoint.py", "boris_cpu.py"}
 RESOLUTIONS = ("coarse", "medium", "fine")
+HEADLESS_EXIT_PROTOCOL = "fullmag.boris.pinned-headless-exit.v1"
+HEADLESS_EXIT_UPSTREAM = "048503d2ca6475e91b073eb1762ecf9d3634c3e1"
+HEADLESS_EXIT_SOURCE_MEMBER = "Boris/Commands_PythonScripting.cpp"
+HEADLESS_EXIT_SOURCE_SHA256 = "d7e1eaf2e141cbc0c66cf1a7f0a391470760e709d301c880e43457ec504def47"
 RAW_FIELDS = tuple(f"{prefix}_{name}.ovf" for prefix, names in (
     ("n", ("V","S","Jc","Jsx","Jsy","Jsz")),
     ("f", ("V","S","Jc","Jsx","Jsy","Jsz","Ts","Tsi"))) for name in names)
@@ -201,7 +205,8 @@ def output_closure(root):
     entries=[];total=0
     for name in RAW_OUTPUTS:
         p=storage.validate_path(root/name,root)
-        if not p.is_file() or storage.is_link(p) or not 0<p.stat().st_size<=64*1024**2:
+        minimum_size = 0 if name == "solver.stderr.log" else 1
+        if not p.is_file() or storage.is_link(p) or not minimum_size<=p.stat().st_size<=64*1024**2:
             raise ValueError("BORIS required output missing or oversized")
         total+=p.stat().st_size
         if total>256*1024**2:raise ValueError("BORIS aggregate output exceeds bound")
@@ -216,6 +221,41 @@ def require_fixed_m_members(proof, entries):
         ("f_M_before.ovf", "M_before_sha256"), ("f_M_after.ovf", "M_after_sha256")
     )):
         raise ValueError("BORIS fixed-M parsed bytes differ from retained output closure")
+
+
+def verified_headless_outputs(root, scenario, proof):
+    probe = read_json(root / "runtime_probe.json", 4096)
+    raw_exit = probe.get("solver_exit_code")
+    if (probe.get("solver_exit_protocol") != HEADLESS_EXIT_PROTOCOL
+            or type(raw_exit) is not int or raw_exit not in (0, -15)):
+        raise ValueError("BORIS pinned headless exit protocol differs")
+    original = proof.get("original_source", {})
+    files = original.get("files") if isinstance(original, dict) else None
+    normal_exit = [entry.get("sha256") for entry in files
+                   if isinstance(entry, dict) and entry.get("path") == HEADLESS_EXIT_SOURCE_MEMBER] if isinstance(files, list) else []
+    if (boris.PIN != HEADLESS_EXIT_UPSTREAM or not isinstance(original, dict)
+            or original.get("upstream_commit") != HEADLESS_EXIT_UPSTREAM
+            or normal_exit != [HEADLESS_EXIT_SOURCE_SHA256]):
+        raise ValueError("BORIS headless exit requires the pinned normal-exit source")
+    entries = output_closure(root)
+    stdout = (root / "solver.stdout.log").read_text(encoding="utf-8")
+    marker = "BORIS_NF_STAGE_COMPLETE"
+    if [line for line in stdout.splitlines() if marker in line] != [marker]:
+        raise ValueError("BORIS final stage marker is missing, malformed or duplicated")
+    embedded = [json.loads(line.split(":", 1)[1]) for line in stdout.splitlines()
+                if line.startswith("BORIS_EMBEDDED_IDENTITY:")]
+    if (embedded != [{"python_version": probe.get("embedded_python_version")}]
+            or not isinstance(probe.get("embedded_python_version"), str)
+            or not probe["embedded_python_version"]):
+        raise ValueError("BORIS embedded interpreter probe differs")
+    native = read_json(root / "boris_native_samples.json")
+    if (native.get("schema_version") != "fullmag.boris_she_nf.native.v2"
+            or native.get("stage_complete") is not True or native.get("scenario") != scenario):
+        raise ValueError("BORIS native stage/scenario differs")
+    from verify_boris_nf_interface import validate_fixed_m
+    fixed_m = validate_fixed_m(root, scenario, native)
+    require_fixed_m_members(fixed_m, entries)
+    return entries, probe
 
 
 def _worker():
@@ -238,25 +278,18 @@ def _worker():
     with Path("/export/solver.stdout.log").open("x") as out,Path("/export/solver.stderr.log").open("x") as err:
         completed=subprocess.run(["/boris/BorisLin","-s","/input/scenario.py","-g","-1"],
             stdout=out,stderr=err,timeout=180,check=False)
-    if completed.returncode!=0:raise ValueError("BORIS actual solver exit must be zero")
     if Path("/export/solver.stdout.log").stat().st_size>64*1024**2:raise ValueError("BORIS solver log exceeds bound")
     stdout=Path("/export/solver.stdout.log").read_text(encoding="utf-8")
-    if stdout.count("BORIS_NF_STAGE_COMPLETE")!=1:raise ValueError("BORIS stage marker missing/duplicated")
     embedded=[json.loads(line.split(":",1)[1]) for line in stdout.splitlines() if line.startswith("BORIS_EMBEDDED_IDENTITY:")]
-    if len(embedded)!=1 or not isinstance(embedded[0].get("python_version"),str):raise ValueError("BORIS embedded Python identity missing")
+    embedded_python = embedded[0].get("python_version") if len(embedded)==1 and isinstance(embedded[0],dict) else None
     if digest(Path("/boris/BorisLin"))!=proof["binary_sha256"]:raise ValueError("BORIS binary changed during run")
     storage.atomic_json(Path("/export/runtime_probe.json"),dict(binary_sha256=proof["binary_sha256"],
         binary_version=(version.stdout+version.stderr).strip(),external_python_version=sys.version,
-        embedded_python_version=embedded[0]["python_version"],solver_exit_code=completed.returncode,
+        embedded_python_version=embedded_python,solver_exit_code=completed.returncode,
+        solver_exit_protocol=HEADLESS_EXIT_PROTOCOL,
         device="cpu",precision_abi=boris.load_manifest(Path("/boris/cpu_abi_witness.json")),
         numpy_version=numpy.__version__,matplotlib_version=matplotlib.__version__))
-    native=read_json(Path("/export/boris_native_samples.json"))
-    if native.get("schema_version")!="fullmag.boris_she_nf.native.v2" or native.get("stage_complete") is not True or native.get("scenario")!=json.loads(scenario):
-        raise ValueError("BORIS native stage/scenario differs")
-    from verify_boris_nf_interface import validate_fixed_m
-    fixed_m = validate_fixed_m(Path("/export"), json.loads(scenario), native)
-    entries = output_closure(Path("/export"))
-    require_fixed_m_members(fixed_m, entries)
+    entries, _ = verified_headless_outputs(Path("/export"), json.loads(scenario), proof)
     print(json.dumps(dict(schema="fullmag.boris.output_closure.v1",outputs=entries)),flush=True)
 
 
@@ -320,7 +353,18 @@ def verified_outputs(root,receipt,observed):
     state=observed["State"]
     if state.get("Status")!="exited" or state.get("Running") is not False or type(state.get("ExitCode")) is not int or state.get("ExitCode")!=0 or state.get("OOMKilled") is not False or state.get("Error"):
         raise ValueError("BORIS container is not successful terminal")
-    entries=output_closure(root/"export")
+    proof=receipt["binding"]["boris_build_proof"]
+    scenario=json.loads(fixed_inputs(receipt["resolution"])[2])
+    entries, probe = verified_headless_outputs(root/"export", scenario, proof)
+    expected_probe={"binary_sha256","binary_version","external_python_version","embedded_python_version",
+        "solver_exit_code","solver_exit_protocol","device","precision_abi","numpy_version","matplotlib_version"}
+    if set(probe)!=expected_probe or any(not isinstance(probe.get(k),str) or not probe[k] for k in
+        ("binary_version","external_python_version","embedded_python_version","numpy_version","matplotlib_version")) or "BORIS" not in probe["binary_version"]:
+        raise ValueError("BORIS actual runtime version/import probe incomplete")
+    if (probe.get("binary_sha256")!=proof["binary_sha256"] or probe.get("device")!="cpu" or type(probe.get("solver_exit_code")) is not int
+        or not isinstance(probe.get("embedded_python_version"),str) or not probe["embedded_python_version"]
+        or probe.get("precision_abi")!=boris.abi_binding(dict(job_id=receipt["build_job_id"],source_digest=receipt["binding"]["source_digest"],image_digest=receipt["binding"]["image_digest"]),proof["compile_flags_sha256"],proof["cuda_flags_sha256"],boris.ABI_FACTS)):
+        raise ValueError("BORIS actual runtime probe differs")
     logs=docker("logs",receipt["container_id"])
     manifests=[]
     for line in logs.splitlines():
@@ -328,30 +372,6 @@ def verified_outputs(root,receipt,observed):
             manifests.append(json.loads(line))
     if manifests!=[dict(schema="fullmag.boris.output_closure.v1",outputs=entries)]:
         raise ValueError("BORIS outputs differ from actual container manifest")
-    probe=read_json(root/"export/runtime_probe.json",4096)
-    proof=receipt["binding"]["boris_build_proof"]
-    expected_probe={"binary_sha256","binary_version","external_python_version","embedded_python_version",
-        "solver_exit_code","device","precision_abi","numpy_version","matplotlib_version"}
-    if set(probe)!=expected_probe or any(not isinstance(probe.get(k),str) or not probe[k] for k in
-        ("binary_version","external_python_version","embedded_python_version","numpy_version","matplotlib_version")) or "BORIS" not in probe["binary_version"]:
-        raise ValueError("BORIS actual runtime version/import probe incomplete")
-    if (probe.get("binary_sha256")!=proof["binary_sha256"] or probe.get("device")!="cpu" or type(probe.get("solver_exit_code")) is not int or probe.get("solver_exit_code")!=0
-        or not isinstance(probe.get("embedded_python_version"),str) or not probe["embedded_python_version"]
-        or probe.get("precision_abi")!=boris.abi_binding(dict(job_id=receipt["build_job_id"],source_digest=receipt["binding"]["source_digest"],image_digest=receipt["binding"]["image_digest"]),proof["compile_flags_sha256"],proof["cuda_flags_sha256"],boris.ABI_FACTS)):
-        raise ValueError("BORIS actual runtime probe differs")
-    native=read_json(root/"export/boris_native_samples.json")
-    scenario=json.loads(fixed_inputs(receipt["resolution"])[2])
-    if native.get("schema_version")!="fullmag.boris_she_nf.native.v2" or native.get("stage_complete") is not True or native.get("scenario")!=scenario:
-        raise ValueError("BORIS native stage/scenario differs")
-    from verify_boris_nf_interface import validate_fixed_m
-    fixed_m = validate_fixed_m(root / "export", scenario, native)
-    require_fixed_m_members(fixed_m, entries)
-    log=root/"export/solver.stdout.log"
-    if log.stat().st_size>64*1024**2:raise ValueError("BORIS solver log exceeds bound")
-    text=log.read_text(encoding="utf-8")
-    if text.count("BORIS_NF_STAGE_COMPLETE")!=1:raise ValueError("BORIS stage marker missing/duplicated")
-    embedded=[json.loads(line.split(":",1)[1]) for line in text.splitlines() if line.startswith("BORIS_EMBEDDED_IDENTITY:")]
-    if embedded!=[{"python_version":probe["embedded_python_version"]}]:raise ValueError("BORIS embedded interpreter probe differs")
     return entries,probe
 
 
