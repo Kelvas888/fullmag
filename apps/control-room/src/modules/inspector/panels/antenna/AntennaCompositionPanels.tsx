@@ -21,8 +21,7 @@ import { InspectorGroup } from "../../primitives/InspectorGroup";
 import { AntennaSourceSpectrumPayloadView } from "./AntennaSourceSpectrumPayloadView";
 import { AntennaFieldBasisPreview } from "./AntennaFieldBasisPreview";
 import { AntennaExternalLeadInspectionPanel } from "./AntennaExternalLeadInspectionPanel";
-import { AntennaProjectionDriveComposer } from "./AntennaProjectionDriveComposer";
-import { AntennaSolveTargetsEditor } from "./AntennaSolveTargetsEditor";
+import { AntennaFieldSolveAuthoring } from "./AntennaFieldSolveAuthoring";
 import { AntennaStudyStageComposer } from "./AntennaStudyStageComposer";
 import { AntennaConductorMaterialEditor } from "./AntennaConductorMaterialEditor";
 import { AntennaPortEditor } from "./AntennaPortEditor";
@@ -954,7 +953,7 @@ export function AntennaCompositionPanel({
         </InspectorGroup>
       </> : null}
       {kind === "port" && objectId && resourceId ? <AntennaPortEditor objectId={objectId} portId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}
-      {kind === "solution" && objectId && resourceId ? <AntennaSolveTargetsEditor key={`targets:${objectId}:${resourceId}`} objectId={objectId} stageId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}
+      {kind === "solution" && objectId && resourceId ? <AntennaFieldSolveAuthoring key={`authoring:${objectId}:${resourceId}`} objectId={objectId} stageId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "solution" && objectId && resourceId ? <AntennaStudyStageComposer objectId={objectId} stageId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} /> : null}
       {kind === "solution" && ids.stageId ? <AntennaExternalLeadInspectionPanel authoredStageId={ids.stageId} /> : null}
       {kind === "solution" && fieldSolution.data &&
@@ -965,7 +964,6 @@ export function AntennaCompositionPanel({
           solution={fieldSolution.data}
         />
       ) : null}
-      {kind === "solution" && resourceId ? <AntennaProjectionDriveComposer key={`projection:${resourceId}`} stageId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "solution" && resourceId ? <AntennaSpectrumComposer key={`spectrum:${resourceId}`} stageId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {(kind === "port" || kind === "projection" || kind === "spectrum") && resourceId ? <AntennaResourceEditor kind={kind} resourceId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "drive" && resourceId ? <SolvedAntennaDriveEditor driveId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}

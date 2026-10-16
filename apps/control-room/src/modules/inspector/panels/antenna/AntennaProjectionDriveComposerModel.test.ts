@@ -6,6 +6,7 @@ import { composeAntennaProjectionDrive } from "./AntennaProjectionDriveComposerM
 
 const scene = {
   objects: [{ id: "conductor", name: "Conductor" }, { id: "magnet", name: "Magnet" }],
+  current_transports: [{ name: "current" }],
   study: { stages: [{ kind: "relax", stage_id: "relax" }, { kind: "run", stage_id: "run" }] },
   antenna_field_solve_stages: [{
     id: "solve", source_object_id: "conductor", current_transport_id: "current",

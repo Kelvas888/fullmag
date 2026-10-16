@@ -16,7 +16,7 @@ assert.match(target.container_id, /^[0-9a-f]{64}$/);
 const apiBase = new URL(target.api_base);
 assert.equal(apiBase.hostname, "127.0.0.1"); assert.notEqual(apiBase.port, "3197");
 await mkdir(reportRoot, { recursive: true });
-const checks = [], screenshots = [], pageErrors = [], consoleErrors = [], httpErrors = [], writes = [], websockets = [];
+const checks = [], screenshots = [], pageErrors = [], consoleErrors = [], httpErrors = [], writes = [], visualizationAcks = [], websockets = [];
 let browser, page, failure = null, scope = null, sessionId = null;
 const startedAt = new Date().toISOString();
 const headers = () => ({ "x-fullmag-api-instance": target.api_instance, ...(scope ? { "x-fullmag-session-scope": scope } : {}) });
@@ -54,7 +54,11 @@ try {
   page.on("websocket", socket => websockets.push(socket.url()));
   page.on("response", response => { if (response.status() >= 400) httpErrors.push({ status: response.status(), url: response.url() }); });
   page.on("request", request => {
-    if (request.url().startsWith(target.api_base) && !["GET", "OPTIONS"].includes(request.method())) writes.push({ method: request.method(), path: new URL(request.url()).pathname, body: request.postDataJSON(), instance: request.headers()["x-fullmag-api-instance"], scope: request.headers()["x-fullmag-session-scope"] });
+    if (request.url().startsWith(target.api_base) && !["GET", "OPTIONS"].includes(request.method())) {
+      const record = { method: request.method(), path: new URL(request.url()).pathname, body: request.postDataJSON(), instance: request.headers()["x-fullmag-api-instance"], scope: request.headers()["x-fullmag-session-scope"] };
+      if (record.path === "/v2/sessions/current/visualization/client-acks") visualizationAcks.push(record);
+      else writes.push(record);
+    }
   });
   const screenshot = async name => { const path = resolve(reportRoot, `${name}.png`); await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
   await page.goto(workspace.href, { waitUntil: "domcontentloaded", timeout: 90_000 });
@@ -237,6 +241,80 @@ try {
 
   await page.getByTitle("Expand All").click();
   await selectNode(`model:object:${objectId}:antenna:solution:${encodeURIComponent(stage.id)}`);
+  const beforeProjection = await scene(), beforeProjectionWrites = writes.length;
+  const composer = page.getByTestId("antenna-projection-composer");
+  const projectionTarget = composer.getByRole("combobox", { name: "Projection target", exact: true });
+  await page.getByRole("combobox", { name: "Field-sampling domain", exact: true }).selectOption(JSON.stringify(["object", objectId]));
+  await selectNode(`model:object:${objectId}:geometry`);
+  const dirtyGuard = page.getByRole("dialog", { name: "Unapplied Inspector changes" });
+  await dirtyGuard.waitFor();
+  assert.equal(await dirtyGuard.getByRole("button", { name: "Apply and continue", exact: true }).isEnabled(), true);
+  await dirtyGuard.getByRole("button", { name: "Cancel", exact: true }).click();
+  await projectionTarget.selectOption(JSON.stringify(["global"]));
+  await selectNode(`model:object:${objectId}:geometry`);
+  await dirtyGuard.waitFor();
+  assert.equal(await dirtyGuard.getByRole("button", { name: "Apply and continue", exact: true }).isEnabled(), false);
+  await dirtyGuard.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("button", { name: "Revert field-solve settings", exact: true }).click();
+  assert.equal(writes.length, beforeProjectionWrites);
+  checks.push({ name: "A clean projection form cannot hide dirty sampling; two dirty forms block aggregate Apply and retain separate drafts without writes", passed: true });
+
+  assert.equal(await composer.getByRole("combobox", { name: "Run stage", exact: true }).count(), 0);
+  await projectionTarget.focus();
+  await page.evaluate(() => {
+    const root = document.querySelector('[data-testid="antenna-projection-composer"]'), input = document.activeElement, scroll = root.closest(".fm-inspector__body");
+    const controls = [...root.querySelectorAll("input, select")].map(element => ({ element, disabled: element.disabled, opacity: getComputedStyle(element).opacity }));
+    const proof = { root, input, scroll, top: scroll.scrollTop, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 };
+    const sample = () => {
+      proof.samples++;
+      if (document.querySelector('[data-testid="antenna-projection-composer"]') !== root) proof.rootChanges++;
+      for (const saved of controls) {
+        if (!saved.element.isConnected) proof.controlChanges++;
+        if (saved.element.disabled !== saved.disabled) proof.disabledChanges++;
+        if (getComputedStyle(saved.element).opacity !== saved.opacity) proof.opacityChanges++;
+      }
+      proof.opacityAnimations += root.getAnimations({ subtree: true }).filter(animation => (animation.playState === "running" || animation.pending) && animation.effect?.getKeyframes().some(frame => "opacity" in frame)).length;
+    };
+    const observer = new MutationObserver(sample); observer.observe(root, { attributes: true, childList: true, subtree: true }); sample();
+    window.__projectionProof = { proof, observer, sample };
+  });
+  await composer.getByRole("button", { name: "Create projection", exact: true }).evaluate(button => button.click());
+  await composer.getByText("Projection committed without a drive or Run stage.", { exact: false }).waitFor();
+  const projected = await waitScene(s => s.antenna_target_projections?.length === (beforeProjection.antenna_target_projections?.length ?? 0) + 1);
+  assert.deepEqual(projected.solved_antenna_drives, beforeProjection.solved_antenna_drives);
+  assert.deepEqual(projected.study, beforeProjection.study);
+  assert.deepEqual(projected.current_transports, beforeProjection.current_transports);
+  assert.deepEqual(projected.antenna_field_solve_stages, beforeProjection.antenna_field_solve_stages);
+  const projection = projected.antenna_target_projections.at(-1);
+  assert.deepEqual(projection.target, { kind: "global" });
+  assert.equal(projection.solution.stage_id, stage.id);
+  assert.equal(writes.length, beforeProjectionWrites + 1);
+  assert.deepEqual(Object.keys(writes.at(-1).body.merge_patch), ["antenna_target_projections"]);
+  assert.equal(await composer.getByRole("button", { name: "Create projection", exact: true }).isEnabled(), false);
+  const projectionStable = await page.evaluate(() => {
+    const { proof: p, observer, sample } = window.__projectionProof; sample(); observer.disconnect();
+    return { root: document.querySelector('[data-testid="antenna-projection-composer"]') === p.root, focus: document.activeElement === p.input, scroll: p.scroll.scrollTop === p.top, rootChanges: p.rootChanges, controlChanges: p.controlChanges, disabledChanges: p.disabledChanges, opacityChanges: p.opacityChanges, opacityAnimations: p.opacityAnimations, samples: p.samples };
+  });
+  assert.ok(projectionStable.samples > 1 && projectionStable.samples < 100);
+  assert.deepEqual({ ...projectionStable, samples: 0 }, { root: true, focus: true, scroll: true, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 });
+  await screenshot("08-independent-projection");
+  checks.push({ name: "Projection-only creation uses one scoped real transaction, retains Inspector identity and focus, preserves physics and adds no Run or drive", passed: true, stability: projectionStable });
+  await page.getByTitle("Expand All").click();
+  await selectNode(`model:object:${objectId}:antenna:projection:${encodeURIComponent(projection.id)}`);
+  const projectionEditor = page;
+  await projectionEditor.getByRole("combobox", { name: "Target", exact: true }).selectOption(JSON.stringify(["object", objectId]));
+  await projectionEditor.getByRole("button", { name: "Apply projection", exact: true }).click();
+  const rebound = await waitScene(s => s.antenna_target_projections?.find(p => p.id === projection.id)?.target?.object_id === objectId);
+  assert.deepEqual(rebound.antenna_target_projections.find(p => p.id === projection.id).solution, projection.solution);
+  await projectionEditor.getByText("Resource committed.", { exact: false }).waitFor();
+  const removeProjection = projectionEditor.getByRole("button", { name: "Remove projection (no cascade)", exact: true });
+  await removeProjection.click();
+  const removedProjection = await waitScene(s => !s.antenna_target_projections?.some(p => p.id === projection.id));
+  assert.deepEqual(removedProjection.antenna_field_solve_stages, beforeProjection.antenna_field_solve_stages);
+  assert.deepEqual(removedProjection.solved_antenna_drives, beforeProjection.solved_antenna_drives);
+  assert.equal(writes.length, beforeProjectionWrites + 3);
+  checks.push({ name: "Existing typed projection inspector edits the target while preserving source pins and removes the declaration without cascading", passed: true });
+  await selectNode(`model:object:${objectId}:antenna:solution:${encodeURIComponent(stage.id)}`);
   const add = page.getByRole("button", { name: "Add Field Solve to Study", exact: true });
   await add.waitFor(); assert.equal(await add.isEnabled(), true); await add.click();
   const open = page.getByRole("button", { name: "Open Study stage", exact: true });
@@ -258,7 +336,7 @@ try {
   assert.ok(webgl.some(gl => !gl.lost && gl.width > 0 && gl.height > 0)); assert.ok(webgl.every(gl => !gl.lost));
   assert.ok(websockets.some(url => url.startsWith(target.api_base.replace("http:", "ws:"))), "Realtime must use the admitted API");
   assert.ok(writes.length >= 3 && writes.length <= 10);
-  for (const write of writes) { assert.equal(write.instance, target.api_instance); assert.equal(write.scope, scope); assert.ok(!write.path.includes("/simulation/"), "Authoring smoke must not execute a solver"); }
+  for (const write of [...writes, ...visualizationAcks]) { assert.equal(write.instance, target.api_instance); assert.equal(write.scope, scope); assert.ok(!write.path.includes("/simulation/"), "Authoring smoke must not execute a solver"); }
   assert.deepEqual(pageErrors, []); assert.deepEqual(consoleErrors, []);
   assert.deepEqual(httpErrors.filter(error => error.status >= 500), []);
   checks.push({ name: "real workspace has healthy WebGL, correctly routed realtime and scoped writes without solver execution", passed: true, webgl });
@@ -266,7 +344,7 @@ try {
   failure = error.stack ?? String(error);
   if (page) { try { const path = resolve(reportRoot, "failure.png"); await page.screenshot({ path, fullPage: true }); screenshots.push(path); await writeFile(resolve(reportRoot, "failure-dom.txt"), await page.locator("body").innerText()); } catch { /* Preserve original failure. */ } }
 } finally { if (browser) await browser.close(); }
-const report = { schema: "fullmag.antenna-workspace-authoring.v1", state: failure ? "failed" : "passed", qualification: "real_api_workspace_authoring_only_not_solve_science_or_durability", startedAt, finishedAt: new Date().toISOString(), target, sessionId, checks, screenshots, writes, websockets, pageErrors, consoleErrors, httpErrors, error: failure };
+const report = { schema: "fullmag.antenna-workspace-authoring.v1", state: failure ? "failed" : "passed", qualification: "real_api_workspace_authoring_only_not_solve_science_or_durability", startedAt, finishedAt: new Date().toISOString(), target, sessionId, checks, screenshots, writes, visualizationAcks, websockets, pageErrors, consoleErrors, httpErrors, error: failure };
 await writeFile(resolve(reportRoot, "antenna-workspace-authoring.json"), JSON.stringify(report, null, 2));
 console.log(JSON.stringify({ state: report.state, checks: checks.length, error: failure }));
 process.exitCode = failure ? 1 : 0;

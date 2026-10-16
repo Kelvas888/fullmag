@@ -118,8 +118,9 @@ export function createInspectorEditSessionStore(): InspectorEditSessionStore {
   });
 }
 
-export function InspectorEditSessionProvider({ children }: { children: ReactNode }) {
-  const [store] = useState(createInspectorEditSessionStore);
+export function InspectorEditSessionProvider({ children, store: suppliedStore }: { children: ReactNode; store?: InspectorEditSessionStore }) {
+  const [ownedStore] = useState(createInspectorEditSessionStore);
+  const store = suppliedStore ?? ownedStore;
   return (
     <InspectorEditSessionContext.Provider value={store}>
       {children}
