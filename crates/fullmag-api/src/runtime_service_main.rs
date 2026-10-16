@@ -1303,9 +1303,9 @@ fn run_service(path: PathBuf) -> Result<()> {
                 }
                 if heartbeat.elapsed() >= Duration::from_secs(1) {
                     if let Some(admission) = host_admission.as_ref() {
-                        match admission.has_current_compute_snapshot() {
-                            Ok(true) => {}
-                            Ok(false) => {
+                        match admission.compute_snapshot_admission_failure() {
+                            Ok(None) => {}
+                            Ok(Some(reason)) => {
                                 admission_unknown = true;
                                 owner.publish(
                                     RuntimeServiceState::Unknown,
@@ -1313,7 +1313,9 @@ fn run_service(path: PathBuf) -> Result<()> {
                                     generations.map(|p| p.1),
                                     children.describe(),
                                 )?;
-                                bail!("host compute-node freshness or topology admission was lost");
+                                bail!(
+                                    "host compute-node freshness or topology admission was lost: {reason}"
+                                );
                             }
                             Err(error) => {
                                 admission_unknown = true;

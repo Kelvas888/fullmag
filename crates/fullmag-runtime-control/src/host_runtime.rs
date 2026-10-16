@@ -258,6 +258,10 @@ mod recovery_tests {
     fn missing_compute_node_sample_defers_host_admission() {
         let fixture = recovery_fixture_without_sample();
         assert!(!fixture.context.has_current_compute_snapshot().unwrap());
+        assert_eq!(
+            fixture.context.compute_snapshot_admission_failure().unwrap(),
+            Some("compute-node snapshot is missing".into())
+        );
     }
 
     #[test]
@@ -266,6 +270,10 @@ mod recovery_tests {
         assert!(fixture.context.has_current_compute_snapshot().unwrap());
         drop(fixture.inventory_owner);
         assert!(!fixture.context.has_current_compute_snapshot().unwrap());
+        assert_eq!(
+            fixture.context.compute_snapshot_admission_failure().unwrap(),
+            Some("shared host inventory owner is not active".into())
+        );
     }
 
     #[test]
@@ -305,6 +313,14 @@ mod recovery_tests {
             .unwrap();
 
         assert!(!fixture.context.has_current_compute_snapshot().unwrap());
+        let reason = fixture
+            .context
+            .compute_snapshot_admission_failure()
+            .unwrap()
+            .unwrap();
+        assert!(reason.contains("freshness is Stale"));
+        assert!(reason.contains("collected_at="));
+        assert!(reason.contains("observed_at="));
     }
 
     fn seed_ready_queued_catalog(fixture: &RecoveryFixture, ownership_epoch: Option<u64>) {
@@ -861,13 +877,19 @@ impl HostRuntimeAdmission {
     /// that the service process itself is live; its owner/recovery gate remains
     /// an independent prerequisite.
     pub fn has_current_compute_snapshot(&self) -> Result<bool> {
+        Ok(self.compute_snapshot_admission_failure()?.is_none())
+    }
+
+    /// Report the reason from the same observation that gates admission.
+    /// This does not refresh a sample, acquire an inventory owner, or relax freshness.
+    pub fn compute_snapshot_admission_failure(&self) -> Result<Option<String>> {
         if let Some(expected) = self.runtime_generation_sha256.as_deref() {
             crate::retry_store_writer_busy(|| self.ledger.validate_runtime_generation(expected))?;
         }
         let Some(snapshot) =
             crate::retry_store_writer_busy(|| self.ledger.read_compute_node_snapshot())?
         else {
-            return Ok(false);
+            return Ok(Some("compute-node snapshot is missing".into()));
         };
         snapshot.validate()?;
         if snapshot.node_id != self.ledger.node_id()
@@ -878,25 +900,45 @@ impl HostRuntimeAdmission {
         }
 
         if snapshot.schema_version != COMPUTE_NODE_SNAPSHOT_SCHEMA_V2 {
-            return Ok(false);
+            return Ok(Some(format!(
+                "compute-node snapshot schema is {}, expected {}",
+                snapshot.schema_version, COMPUTE_NODE_SNAPSHOT_SCHEMA_V2
+            )));
         }
         let Some(active_owner) =
             crate::retry_store_writer_busy(|| self.ledger.active_inventory_owner())?
         else {
-            return Ok(false);
+            return Ok(Some("shared host inventory owner is not active".into()));
         };
         if snapshot.host_owner_id.as_deref() != Some(active_owner.host_owner_id.as_str())
             || snapshot.host_owner_epoch != Some(active_owner.host_owner_epoch)
         {
-            return Ok(false);
+            return Ok(Some(format!(
+                "compute-node inventory owner differs: sample_id={:?}, sample_epoch={:?}, active_id={}, active_epoch={}",
+                snapshot.host_owner_id,
+                snapshot.host_owner_epoch,
+                active_owner.host_owner_id,
+                active_owner.host_owner_epoch
+            )));
         }
 
         let now = chrono::Utc::now();
         let current_boot_id = crate::compute_node_probe::current_host_boot_id(now.clone())?;
         if snapshot.boot_id != current_boot_id {
-            return Ok(false);
+            return Ok(Some(format!(
+                "compute-node boot differs: sample={}, current={}",
+                snapshot.boot_id, current_boot_id
+            )));
         }
-        snapshot.is_current_at(now)
+        if snapshot.is_current_at(now.clone())? {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "compute-node sample freshness is {:?}: collected_at={}, observed_at={}",
+            snapshot.sample.freshness_at(now.clone()),
+            snapshot.sample.collected_at.to_rfc3339(),
+            now.to_rfc3339()
+        )))
     }
 
     pub fn solver_placement(&self, resource_id: &str) -> Result<&HostTaskPlacement> {
