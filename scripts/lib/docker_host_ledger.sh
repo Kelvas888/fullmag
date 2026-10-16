@@ -184,7 +184,7 @@ read_mount_state() {
   [[ -z "${line}" ]] && return 0
   [[ "${line}" != *$'\n'* ]] || fail "host-ledger mount state returned multiple records"
   local source="" filesystem="" uuid="" extra=""
-  read -r source filesystem uuid extra <<< "${line}"
+  read -r source filesystem uuid extra < <(printf '%s\n' "${line}")
   [[ -n "${source}" && -n "${filesystem}" && -n "${uuid}" && -z "${extra}" ]] || fail "mount record for ${MOUNT_ROOT} is malformed"
   MOUNT_ACTIVE=1
   MOUNT_SOURCE="${source}"
@@ -252,12 +252,12 @@ if str(token) != value["owner_token"] or token.int == 0:
 verify_runtime_directory() {
   local record="" uid="" gid="" mode=""
   record="$(host stat -Lc '%u %g %a' "${MOUNT_ROOT}")" || fail "cannot stat host-ledger mount root"
-  read -r uid gid mode <<< "${record}"
+  read -r uid gid mode < <(printf '%s\n' "${record}")
   [[ "${uid}" == "0" && "${gid}" == "0" && "${mode}" == "755" ]] || fail "host-ledger mount root ownership/mode mismatch"
   host test -d "${LEDGER_ROOT}" || fail "host-ledger runtime child is missing"
   host test ! -L "${LEDGER_ROOT}" || fail "host-ledger runtime child is a symlink"
   record="$(host stat -Lc '%u %g %a' "${LEDGER_ROOT}")" || fail "cannot stat host-ledger runtime child"
-  read -r uid gid mode <<< "${record}"
+  read -r uid gid mode < <(printf '%s\n' "${record}")
   [[ "${uid}" == "${RUNTIME_UID}" && "${gid}" == "${RUNTIME_GID}" && "${mode}" == "770" ]] || fail "host-ledger runtime child ownership/mode mismatch"
 }
 
@@ -271,7 +271,7 @@ inspect_unmounted_mount_root() {
     fi
     while IFS= read -r entry; do
       [[ -z "${entry}" || "${entry}" == "lost+found" ]] || fail "unmounted host-ledger target is not empty: ${entry}"
-    done <<< "${entries}"
+    done < <(printf '%s\n' "${entries}")
   fi
   if host test -e "${OWNER_MARKER}" || host test -L "${OWNER_MARKER}"; then
     fail "unmounted host-ledger target has a stale owner marker"
@@ -357,8 +357,7 @@ write_owner_marker() {
   OWNER_TOKEN="$(python3 -c 'import uuid; print(uuid.uuid4())')"
   [[ "${OWNER_TOKEN}" =~ ^[0-9a-f-]{36}$ ]] || fail "cannot generate owner token"
   local payload temporary
-  payload="$(python3 - "${PROFILE}" "${PROJECT_ID}" "${BACKING_IMAGE}" "${MOUNT_ROOT}" "${FILESYSTEM_UUID}" "${IMAGE_SIZE_BYTES}" "${MOUNT_TARGET}" "${RUNTIME_UID}" "${RUNTIME_GID}" "${OWNER_TOKEN}" <<'PY'
-import json, sys
+  payload="$(python3 -c 'import json, sys
 profile, project, image, mount, fs_uuid, size, target, uid, gid, token = sys.argv[1:]
 print(json.dumps({
     "schema": "fullmag.host-ledger-owner.v1", "profile": profile,
@@ -367,8 +366,7 @@ print(json.dumps({
     "mount_target": target, "runtime_uid": int(uid), "runtime_gid": int(gid),
     "owner_token": token,
 }, separators=(",", ":")))
-PY
-)"
+)' "${PROFILE}" "${PROJECT_ID}" "${BACKING_IMAGE}" "${MOUNT_ROOT}" "${FILESYSTEM_UUID}" "${IMAGE_SIZE_BYTES}" "${MOUNT_TARGET}" "${RUNTIME_UID}" "${RUNTIME_GID}" "${OWNER_TOKEN}")"
   temporary="${OWNER_MARKER}.tmp.$$.${RANDOM}"
   python3 -c 'import os, sys
 path, temporary, payload = sys.argv[1:]
@@ -412,8 +410,7 @@ verify_current_mount() {
 
 emit_receipt() {
   local state="$1" created="$2"
-  python3 - "${state}" "${created}" "${MOUNT_ACTIVE}" "${LOOP_DEVICE}" "${FILESYSTEM_UUID}" "${PROFILE}" "${PROJECT_ID}" "${BACKING_IMAGE}" "${MOUNT_ROOT}" "${MOUNT_TARGET}" "${IMAGE_SIZE_BYTES}" <<'PY'
-import json, sys
+  python3 -c 'import json, sys
 state, created, active, loop, fs_uuid, profile, project, image, mount, target, size = sys.argv[1:]
 print(json.dumps({
     "schema": "fullmag.host-ledger-receipt.v1", "profile": profile,
@@ -424,7 +421,7 @@ print(json.dumps({
     "mount_active": active == "1", "state": state, "created_image": created == "1",
     "qualification": "storage-admission-only",
 }, sort_keys=True))
-PY
+  ' "${state}" "${created}" "${MOUNT_ACTIVE}" "${LOOP_DEVICE}" "${FILESYSTEM_UUID}" "${PROFILE}" "${PROJECT_ID}" "${BACKING_IMAGE}" "${MOUNT_ROOT}" "${MOUNT_TARGET}" "${IMAGE_SIZE_BYTES}"
 }
 
 cleanup() {

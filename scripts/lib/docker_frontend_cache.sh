@@ -86,7 +86,7 @@ mount_state() {
   fi
   [[ -z "$line" ]] && return
   [[ "$line" != *$'\n'* ]] || fail "multiple mount records"
-  read -r source fs uuid extra <<< "$line"
+  read -r source fs uuid extra < <(printf '%s\n' "$line")
   [[ "$source" =~ ^/dev/loop[0-9]+$ && "$fs" == ext4 && "$uuid" =~ ^[0-9A-Fa-f-]{36}$ && -z "$extra" ]] || fail "mount identity invalid"
   MOUNT_ACTIVE=1; MOUNT_SOURCE="$source"; LOOP_DEVICE="$source"; FILESYSTEM_UUID="$uuid"
 }
@@ -125,15 +125,48 @@ if not t.int or str(t)!=v["owner_token"]: raise SystemExit("token")
 }
 verify_children() {
   local rec uid gid mode child path
-  rec="$(host stat -Lc '%u %g %a' "$MOUNT_ROOT")"; read -r uid gid mode <<< "$rec"
+  rec="$(host stat -Lc '%u %g %a' "$MOUNT_ROOT")"; read -r uid gid mode < <(printf '%s\n' "$rec")
   [[ "$uid" == 0 && "$gid" == 0 && "$mode" == 755 ]] || fail "cache root ownership/mode invalid"
   for child in cache pnpm-store workspace-node_modules control-room-node_modules; do
     path="$MOUNT_ROOT/$child"; host test -d "$path" && host test ! -L "$path" || fail "cache child invalid"
-    rec="$(host stat -Lc '%u %g %a' "$path")"; read -r uid gid mode <<< "$rec"
+    rec="$(host stat -Lc '%u %g %a' "$path")"; read -r uid gid mode < <(printf '%s\n' "$rec")
     [[ "$uid" == "$RUNTIME_UID" && "$gid" == "$RUNTIME_GID" && "$mode" == 770 ]] || fail "cache child ownership/mode invalid"
   done
 }
 verify_current() { mount_state; verify_mount; verify_owner; verify_children; }
+
+write_owner_marker() {
+  python3 -c 'import json,os,sys,uuid
+p,profile,project,key,image,mount,fs,size,target,uid,gid=sys.argv[1:]
+v={"schema":"fullmag.frontend-cache-owner.v1","profile":profile,"project_id":project,"cache_key":key,"backing_image":image,"mount_root":mount,"filesystem_uuid":fs,"image_size_bytes":int(size),"mount_target":target,"runtime_uid":int(uid),"runtime_gid":int(gid),"owner_token":str(uuid.uuid4())}
+t=p+".tmp."+str(os.getpid())
+if os.path.lexists(p): raise SystemExit("owner marker exists")
+fd=os.open(t,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o444)
+os.write(fd,(json.dumps(v,separators=(",",":"))+"\n").encode()); os.fsync(fd); os.close(fd)
+os.chown(t,0,0); os.chmod(t,0o444); os.link(t,p,follow_symlinks=False); os.unlink(t)
+' "/proc/$HOST_PID/root$OWNER_MARKER" "$PROFILE" "$PROJECT_ID" "$CACHE_KEY" "$BACKING_IMAGE" "$MOUNT_ROOT" "$FILESYSTEM_UUID" "$IMAGE_SIZE_BYTES" "$MOUNT_TARGET" "$RUNTIME_UID" "$RUNTIME_GID" || fail "cannot create owner marker"
+}
+
+admit_mounted_cache() {
+  if host test -e "$OWNER_MARKER" || host test -L "$OWNER_MARKER"; then
+    verify_current
+    lock_runtime
+    return
+  fi
+  # A previous admission may have mounted the attested image and then exited
+  # before publishing its owner marker. Adopt that mount without reformatting
+  # or replacing any filesystem contents.
+  host chown 0:0 "$MOUNT_ROOT"; host chmod 0755 "$MOUNT_ROOT"
+  local child path
+  for child in cache pnpm-store workspace-node_modules control-room-node_modules; do
+    path="$MOUNT_ROOT/$child"; host mkdir -p "$path"; host test ! -L "$path" || fail "cache child symlink"
+    host chown "$RUNTIME_UID:$RUNTIME_GID" "$path"; host chmod 0770 "$path"
+  done
+  lock_runtime
+  write_owner_marker
+  verify_current
+}
+
 lock_runtime() {
   host test ! -L "$RUNTIME_LOCK" || fail "runtime lock is a symlink"
   if ! host test -e "$RUNTIME_LOCK"; then
@@ -141,7 +174,7 @@ lock_runtime() {
   fi
   host test -f "$RUNTIME_LOCK" && host test ! -L "$RUNTIME_LOCK" || fail "runtime lock is not a regular file"
   local rec uid gid mode
-  rec="$(host stat -Lc '%u %g %a' "$RUNTIME_LOCK")"; read -r uid gid mode <<< "$rec"
+  rec="$(host stat -Lc '%u %g %a' "$RUNTIME_LOCK")"; read -r uid gid mode < <(printf '%s\n' "$rec")
   [[ "$uid" == "$RUNTIME_UID" && "$gid" == "$RUNTIME_GID" && "$mode" == 660 ]] || fail "runtime lock ownership/mode invalid"
   exec 8>>"/proc/$HOST_PID/root$RUNTIME_LOCK"
   flock -x -w "$LOCK_WAIT" 8 || fail "frontend cache is held by an active consumer"
@@ -167,6 +200,10 @@ ensure_cache() {
   if host test -e "$BACKING_IMAGE" || host test -L "$BACKING_IMAGE"; then
     host test ! -L "$BACKING_IMAGE" || fail "cache image symlink"
     [[ "$(host stat -c '%s' "$BACKING_IMAGE")" == "$IMAGE_SIZE_BYTES" ]] || fail "cache image size mismatch"
+    local image_fs image_label
+    image_fs="$(host blkid -s TYPE -o value "$BACKING_IMAGE" 2>/dev/null || true)"
+    image_label="$(host blkid -s LABEL -o value "$BACKING_IMAGE" 2>/dev/null || true)"
+    [[ "$image_fs" == ext4 && "$image_label" == "$IMAGE_LABEL" ]] || fail "cache image filesystem attestation failed"
   else
     host mkdir -p "$BACKING_DIR"; host test ! -L "$BACKING_DIR" || fail "backing directory symlink"
     host truncate -s "$IMAGE_SIZE_BYTES" "$BACKING_IMAGE"; host chmod 0600 "$BACKING_IMAGE"
@@ -183,28 +220,7 @@ ensure_cache() {
   [[ "$LOOP_DEVICE" =~ ^/dev/loop[0-9]+$ ]] || fail "invalid loop device"
   host mount -t ext4 -o rw "$LOOP_DEVICE" "$MOUNT_ROOT"; MOUNTED=1
   mount_state; verify_mount
-  if [[ "$fresh_image" == 0 ]]; then
-    verify_current
-    lock_runtime
-    return
-  fi
-  host chown 0:0 "$MOUNT_ROOT"; host chmod 0755 "$MOUNT_ROOT"
-  local child path
-  for child in cache pnpm-store workspace-node_modules control-room-node_modules; do
-    path="$MOUNT_ROOT/$child"; host mkdir -p "$path"; host test ! -L "$path" || fail "cache child symlink"
-    host chown "$RUNTIME_UID:$RUNTIME_GID" "$path"; host chmod 0770 "$path"
-  done
-  lock_runtime
-  python3 -c 'import json,os,sys,uuid
-p,profile,project,key,image,mount,fs,size,target,uid,gid=sys.argv[1:]
-v={"schema":"fullmag.frontend-cache-owner.v1","profile":profile,"project_id":project,"cache_key":key,"backing_image":image,"mount_root":mount,"filesystem_uuid":fs,"image_size_bytes":int(size),"mount_target":target,"runtime_uid":int(uid),"runtime_gid":int(gid),"owner_token":str(uuid.uuid4())}
-t=p+".tmp."+str(os.getpid())
-if os.path.lexists(p): raise SystemExit("owner marker exists")
-fd=os.open(t,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o444)
-os.write(fd,(json.dumps(v,separators=(",",":"))+"\n").encode()); os.fsync(fd); os.close(fd)
-os.chown(t,0,0); os.chmod(t,0o444); os.link(t,p,follow_symlinks=False); os.unlink(t)
-' "/proc/$HOST_PID/root$OWNER_MARKER" "$PROFILE" "$PROJECT_ID" "$CACHE_KEY" "$BACKING_IMAGE" "$MOUNT_ROOT" "$FILESYSTEM_UUID" "$IMAGE_SIZE_BYTES" "$MOUNT_TARGET" "$RUNTIME_UID" "$RUNTIME_GID"
-  verify_current
+  admit_mounted_cache
 }
 emit() {
   local state="$1" created="$2"
@@ -234,7 +250,7 @@ main() {
   if [[ "$action" == ensure ]]; then lock_cache exclusive; else lock_cache shared; fi
   mount_state
   if [[ "$action" == verify ]]; then verify_current; emit validated 0
-  elif [[ "$MOUNT_ACTIVE" == 1 ]]; then verify_current; lock_runtime; verify_current; emit ready 0
+  elif [[ "$MOUNT_ACTIVE" == 1 ]]; then verify_mount; admit_mounted_cache; emit ready 0
   else ensure_cache; emit ready "$CREATED_IMAGE"
   fi
   SUCCESS=1
