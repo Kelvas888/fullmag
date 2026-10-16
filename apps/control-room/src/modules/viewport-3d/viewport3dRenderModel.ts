@@ -3050,7 +3050,7 @@ function cachedAveragedSurfaceNodeNormals(
   return normals;
 }
 
-function buildAveragedSurfaceNodeNormals(
+export function buildAveragedSurfaceNodeNormals(
   topology: Viewport3DPositionSource,
   triangleIndices: ArrayLike<number> | null | undefined,
 ): Float32Array | null {
@@ -3135,7 +3135,7 @@ function offsetVectorAnchor(
   ];
 }
 
-function resolveVectorSurfaceOffsetDistance(
+export function resolveVectorSurfaceOffsetDistance(
   effectiveScale: number,
   anchorMode: Viewport3DVectorAnchorMode,
   surfaceOffsetEnabled: boolean,

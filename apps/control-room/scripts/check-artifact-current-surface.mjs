@@ -157,4 +157,29 @@ check("pending glyph selection cannot adopt transforms from another budget",()=>
  assert.equal(group(recolored),group(full));assert.equal(cache.resolveVisible({fieldRevision:"2",groupKey:group(recolored),key:"pending-color",lane:"vector-glyph",targetRevision:"1",topologyRevision:"1"}).state,"stale-compatible");
  cache.dispose();
 });
+check("surface lift translates anchors without changing vectors or raw J",()=>{
+ const f=fixture(),base=render({...f,settings:{...f.settings,geometryScope:"surface",vectorCenteringEnabled:true}}),lifted=render({...f,settings:{...f.settings,geometryScope:"surface",vectorCenteringEnabled:true,vectorSurfaceOffsetEnabled:true,vectorSurfaceOffsetScale:0}});
+ assert.ok(lifted.surfaceOffsetDistance>0);assert.notDeepEqual([...lifted.vectorSegments],[...base.vectorSegments]);
+ assert.deepEqual(lifted.scalarValues,base.scalarValues);assert.deepEqual(lifted.geometry.field.values,values);
+ for(let i=0;i<base.glyphCount;i++)for(let axis=0;axis<3;axis++){
+  const start=i*7+axis,end=start+3,delta=lifted.vectorSegments[start]-base.vectorSegments[start];
+  assert.ok(Math.abs(delta-(lifted.vectorSegments[end]-base.vectorSegments[end]))<1e-6);
+  assert.ok(Math.abs(delta-lifted.geometry.surfaceNormals[lifted.vectorSampleIndices[i]*3+axis]*lifted.surfaceOffsetDistance)<1e-6);
+ }
+ assert.deepEqual(lifted.pointSampleIndices,base.pointSampleIndices);assert.deepEqual(lifted.geometry.positions,base.geometry.positions);
+ assert.notEqual(lifted.glyphStyleKey,base.glyphStyleKey);
+});
+check("surface normals share geometry identity without averaging local J values",()=>{
+ const model=render(fixture()),normals=model.geometry.surfaceNormals;
+ for(const [a,b] of [[0,4],[1,6],[2,5]])for(let axis=0;axis<3;axis++)assert.equal(normals[a*3+axis],normals[b*3+axis]);
+ assert.deepEqual([...model.scalarValues],[1,2,3,4,-10,-20,-30,-40]);
+ for(let i=0;i<8;i++)assert.ok(Math.abs(Math.hypot(...normals.subarray(i*3,i*3+3))-1)<1e-6);
+});
+check("lift clearance follows shared center/tail semantics and full scope keeps physical anchors",()=>{
+ const f=fixture(),settings={...f.settings,geometryScope:"surface",vectorSurfaceOffsetEnabled:true,vectorSurfaceOffsetScale:0};
+ const tail=render({...f,settings:{...settings,vectorCenteringEnabled:false}}),center=render({...f,settings:{...settings,vectorCenteringEnabled:true}}),extra=render({...f,settings:{...settings,vectorSurfaceOffsetScale:.5,vectorCenteringEnabled:true}});
+ assert.equal(tail.surfaceOffsetDistance,center.surfaceOffsetDistance*2);assert.equal(extra.surfaceOffsetDistance,tail.surfaceOffsetDistance);
+ const full=render({...f,settings:{...settings,geometryScope:"full"}});assert.equal(full.surfaceOffsetDistance,0);assert.deepEqual(full.vectorSegments,render(fixture()).vectorSegments);
+ assert.throws(()=>render({...f,settings:{...settings,vectorSurfaceOffsetScale:NaN}}),/surface gap/);
+});
 console.log(JSON.stringify({status:"passed",checks,unit_test_compilation:false,browser_qualification:false}));

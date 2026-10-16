@@ -232,6 +232,36 @@ try {
   checks.push("Actual shared viewport-colorbar switch hides and restores both H legends through the production controller without replacing geometry or loading binaries");
   assert.ok(initialLabels.some(label => label.includes("-4") && label.includes("1")));
   assert.ok(initialLabels.some(label => label.includes("0") && label.includes("4")));
+  await page.getByLabel("Fixture geometry scope", { exact: true }).selectOption("surface");
+  await page.waitForFunction(() => window.__artifactOverlayFixture?.read().glyphCount === 4 && window.__artifactOverlayCanvas?.().glyphCounts.every(count => count === 4));
+  const anchored = await read();
+  const liftButton = controls.getByRole("button", { name: "Lift above surface", exact: true });
+  await liftButton.click();
+  await page.waitForFunction(before => {
+    const state = window.__artifactOverlayFixture?.read(), matrices = window.__artifactOverlayCanvas?.().glyphMatrices;
+    return state?.surfaceOffsetDistance > 0 && matrices?.length === before.length && matrices.every((matrix, mesh) => matrix.length === before[mesh].length && matrix.some((value, i) => i % 16 >= 12 && i % 16 <= 14 && Math.abs(value - before[mesh][i]) > 1e-5));
+  }, anchored.canvas.glyphMatrices);
+  const lifted = await read();
+  assert.equal(await controls.getByText("Display offset; field sample positions unchanged", { exact: true }).isVisible(), true);
+  assert.deepEqual(lifted.state.values, anchored.state.values); assert.deepEqual(lifted.canvas.glyphColors, anchored.canvas.glyphColors);
+  assert.deepEqual(lifted.canvas.geometryIds, anchored.canvas.geometryIds); assert.deepEqual(lifted.canvas.pointBufferIds, anchored.canvas.pointBufferIds);
+  for (let mesh = 0; mesh < anchored.canvas.glyphMatrices.length; mesh++) for (let i = 0; i < anchored.canvas.glyphMatrices[mesh].length; i++) if (i % 16 < 12 || i % 16 === 15) assert.ok(Math.abs(lifted.canvas.glyphMatrices[mesh][i] - anchored.canvas.glyphMatrices[mesh][i]) < 1e-6);
+  assert.equal(lifted.state.calls.filter(call => call.binary).length, anchored.state.calls.filter(call => call.binary).length);
+  const gap = controls.getByRole("slider", { name: "Extra surface gap", exact: true });
+  await gap.focus(); await gap.press("End");
+  await page.waitForFunction(distance => window.__artifactOverlayFixture?.read().surfaceOffsetDistance > distance, lifted.state.surfaceOffsetDistance);
+  assert.equal(await gap.getAttribute("aria-valuenow"), "1");
+  await gap.press("Home");
+  await page.waitForFunction(distance => Math.abs(window.__artifactOverlayFixture?.read().surfaceOffsetDistance - distance) < 1e-12, lifted.state.surfaceOffsetDistance);
+  await screenshot("07-owned-surface-lift");
+  await liftButton.click();
+  await page.waitForFunction(before => {
+    const state = window.__artifactOverlayFixture?.read(), matrices = window.__artifactOverlayCanvas?.().glyphMatrices;
+    return state?.surfaceOffsetDistance === 0 && matrices?.length === before.length && matrices.every((matrix, mesh) => matrix.length === before[mesh].length && matrix.every((value, i) => Math.abs(value - before[mesh][i]) < 1e-6));
+  }, anchored.canvas.glyphMatrices);
+  await page.getByLabel("Fixture geometry scope", { exact: true }).selectOption("full");
+  await page.waitForFunction(() => window.__artifactOverlayFixture?.read().glyphCount === 5 && window.__artifactOverlayCanvas?.().glyphCounts.every(count => count === 5));
+  checks.push("Actual shared surface-lift button and keyboard gap control translate GPU glyph anchors only; orientation, size, colors, raw samples, point/surface geometry and binary reads remain unchanged, and disabling restores original transforms");
   const ownerReads = final.state.calls.filter(call => call.component !== "full" && call.path.endsWith("/meta"));
   for (const q of ["H_ant", "J_charge", "V_electric"]) {
     const reads = ownerReads.filter(call => call.path.includes(q)); assert.ok(reads.length > 0, q);

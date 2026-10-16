@@ -1033,6 +1033,7 @@ export function VisualizationVectorsSection({
       settings.vectorSurfaceOffsetEnabled ? (
         <NumberField disabled={vectorsUnavailable || isFieldPending("vectorSurfaceOffsetScale")} label="Extra surface gap" max={1} min={0} step={0.01} value={settings.vectorSurfaceOffsetScale} onChange={(value) => patchNumber("vectorSurfaceOffsetScale", value)} />
       ) : null}
+      {artifactFieldBinding?.historical && settings.geometryScope === "surface" && settings.vectorSurfaceOffsetEnabled ? <FieldRow label="Surface lift" value="Display offset; field sample positions unchanged" /> : null}
       {meshParts && meshParts.length > 1 && onTogglePartVectors && (
         <fieldset className="fm-visualization-part-toggles" aria-label="Object target vector visibility">
           <span className="fm-visualization-part-toggles__label">Object surfaces</span>

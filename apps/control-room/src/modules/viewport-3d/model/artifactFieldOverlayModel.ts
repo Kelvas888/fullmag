@@ -1,3 +1,4 @@
+import { buildAveragedSurfaceNodeNormals, resolveVectorSurfaceOffsetDistance } from "../viewport3dRenderModel";
 import { buildVertexScalarColors } from "../viewport3dFieldMapping";
 import type { StageExecutionResource } from "@/kernel/api/apiTypes";
 import type { ArtifactFieldSelection } from "@/kernel/visualization/artifactFieldSelection";
@@ -35,11 +36,11 @@ export function prepareArtifactFieldOverlay(admitted: ReturnType<typeof admitArt
   const extent = Math.hypot(...high.map((v, axis) => v - low[axis]));
   if (!(extent > 0) || !Number.isFinite(extent)) throw new Error("Owned vector samples require physical extent.");
   const cellCount = topology.cellTypes?.length ?? 0;
-  let surfaceTriangles: Uint32Array | null = null, surfaceEdges: Uint32Array | null = null;
+  let surfaceTriangles: Uint32Array | null = null, surfaceEdges: Uint32Array | null = null, surfaceNormals: Float32Array | null = null;
   if (current) {
     if (cellCount * 4 !== count || !field.artifactMapping) throw new Error("Current surface requires complete cell-local Tet4 mapping.");
     const boundary = artifactCellLocalBoundary(topology.positions, field.artifactMapping.identityIds);
-    surfaceTriangles = boundary.triangles; surfaceEdges = boundary.edges;
+    surfaceTriangles = boundary.triangles; surfaceEdges = boundary.edges; surfaceNormals = boundary.surfaceNormals;
   } else if (cellCount) {
     if (cellCount > MAX_ANTENNA_DISPLAY_CELLS || !topology.cellTypes || !topology.cellOffsets || !topology.cellNodes
       || topology.cellTypes.some(v => v !== 1) || topology.cellNodes.length !== cellCount * 4
@@ -47,6 +48,7 @@ export function prepareArtifactFieldOverlay(admitted: ReturnType<typeof admitArt
     const xyz = new Float64Array(topology.positions), cells = new Uint32Array(topology.cellNodes);
     const boundary = deviceBoundary(xyz.buffer, cells.buffer, count); surfaceTriangles = boundary.triangles; surfaceEdges = boundary.edges;
   }
+  if (!current && !scalar && surfaceTriangles) surfaceNormals = buildAveragedSurfaceNodeNormals(topology, surfaceTriangles);
   const surfaceVectorScale = maximumNorm || 1, surfaceVectorValues = scalar ? new Float32Array(0) : Float32Array.from(field.values, v => v / surfaceVectorScale);
   const surfaceScalarValues = scalar ? buildVertexScalarColors(field, count, MAX_ANTENNA_DISPLAY_SAMPLES, "magnitude", "viridis")?.scalarValues ?? null : null;
   if (scalar && !surfaceScalarValues) throw new Error("Owned potential requires a complete bounded scalar color buffer.");
@@ -55,7 +57,7 @@ export function prepareArtifactFieldOverlay(admitted: ReturnType<typeof admitArt
   const boundaryMask = new Uint8Array(count);
   if (surfaceTriangles) for (const index of surfaceTriangles) boundaryMask[index] = 1;
   const surfaceSampleIndices = surfaceTriangles ? allSampleIndices.filter(index => boundaryMask[index] === 1) : null;
-  return { field, locator, count, current, scalar, surfaceScalarValues, positions, magnitudes, maximumNorm, extent, surfaceTriangles, surfaceEdges, surfaceVectorScale, surfaceVectorValues, allSampleIndices, surfaceSampleIndices };
+  return { field, locator, count, current, scalar, surfaceScalarValues, positions, magnitudes, maximumNorm, extent, surfaceTriangles, surfaceEdges, surfaceVectorScale, surfaceVectorValues, allSampleIndices, surfaceSampleIndices, surfaceNormals };
 }
 
 export function presentArtifactFieldOverlay(data: ReturnType<typeof prepareArtifactFieldOverlay>, settings: VisualizationTargetSettings) {
@@ -78,9 +80,19 @@ export function presentArtifactFieldOverlay(data: ReturnType<typeof prepareArtif
   ]);
   const segments = glyphCount > 0 ? new Float32Array(glyphCount * 6) : null;
   const scale = maximumNorm > 0 ? extent / Math.max(4, Math.cbrt(count)) * .45 * settings.vectorLengthScale / maximumNorm : 0;
-  if (segments) for (let i = 0; i < glyphCount; i++) for (let axis = 0; axis < 3; axis++) {
-    const source = vectorSampleIndices[i], delta = field.values[source * 3 + axis] * scale;
-    segments[i * 6 + axis] = positions[source * 3 + axis] - (settings.vectorCenteringEnabled ? delta / 2 : 0); segments[i * 6 + axis + 3] = segments[i * 6 + axis] + delta;
+  const liftEnabled = glyphCount > 0 && settings.geometryScope === "surface" && settings.vectorSurfaceOffsetEnabled;
+  const extraSurfaceGap = settings.vectorSurfaceOffsetScale ?? 0;
+  if (liftEnabled && (!Number.isFinite(extraSurfaceGap) || extraSurfaceGap < 0)) throw new Error("Extra surface gap must be finite and non-negative.");
+  if (liftEnabled && !data.surfaceNormals) throw new Error("Surface lift requires normals from the owned boundary.");
+  const surfaceOffsetDistance = resolveVectorSurfaceOffsetDistance(maximumNorm * scale, settings.vectorCenteringEnabled ? "center" : "tail", Boolean(liftEnabled), extraSurfaceGap);
+  if (segments) for (let i = 0; i < glyphCount; i++) {
+    const source = vectorSampleIndices[i];
+    if (surfaceOffsetDistance > 0 && data.surfaceNormals && !(Math.hypot(...data.surfaceNormals.subarray(source * 3, source * 3 + 3)) > 0)) throw new Error("Surface sample has no outward display normal; disable surface lift.");
+    for (let axis = 0; axis < 3; axis++) {
+      const delta = field.values[source * 3 + axis] * scale;
+      const lifted = positions[source * 3 + axis] + (surfaceOffsetDistance > 0 ? (data.surfaceNormals?.[source * 3 + axis] ?? 0) * surfaceOffsetDistance : 0);
+      segments[i * 6 + axis] = lifted - (settings.vectorCenteringEnabled ? delta / 2 : 0); segments[i * 6 + axis + 3] = segments[i * 6 + axis] + delta;
+    }
   }
   if (segments?.some(v => !Number.isFinite(v))) throw new Error("Owned vector glyph cannot be represented.");
   const glyphColors = new Float32Array(glyphCount * 3);
@@ -88,9 +100,9 @@ export function presentArtifactFieldOverlay(data: ReturnType<typeof prepareArtif
   const vectorSegments = encodeAntennaGlyphSegments(segments, glyphCount);
   if (vectorSegments) for (let i = 0; i < glyphCount; i++) vectorSegments[i * 7 + 6] = maximumNorm > 0 ? magnitudes[vectorSampleIndices[i]] / maximumNorm : 0;
   const glyphSelectionKey = JSON.stringify([settings.geometryScope ?? "full", glyphCount]);
-  const glyphStyleKey = JSON.stringify([settings.geometryScope, settings.vectorBudget, settings.scalarColorPalette, settings.vectorColorMode, settings.vectorLengthScale, settings.vectorCenteringEnabled]);
+  const glyphStyleKey = JSON.stringify([settings.geometryScope, settings.vectorBudget, settings.scalarColorPalette, settings.vectorColorMode, settings.vectorLengthScale, settings.vectorCenteringEnabled, surfaceOffsetDistance]);
   return { scalar, geometry: data, glyphColors, glyphSelectionKey, glyphStyleKey, key: `${locator.carrier_id}:${field.fieldGenerationId}:${field.sourceRevision}`, quantityId: field.quantityId as "H_ant" | "J_charge" | "V_electric", unit: scalar ? "V" : current ? "A/m^2" : "A/m",
-    status: "historical_inspection" as const, locator, fieldRevision: field.sourceRevision ?? "", positions, scalarValues: scalars, vectorSegments, pointSampleIndices, vectorSampleIndices, glyphCount, availableGlyphCount: pointSampleIndices.length,
+    status: "historical_inspection" as const, locator, fieldRevision: field.sourceRevision ?? "", positions, scalarValues: scalars, vectorSegments, pointSampleIndices, vectorSampleIndices, glyphCount, surfaceOffsetDistance, availableGlyphCount: pointSampleIndices.length,
     surfaceTriangles, surfaceEdges, surfaceVectorValues, surfaceVectorScale, maximumVectorNorm: scalar ? 0 : maximumNorm, minimum: component === "magnitude" ? 0 : minimum, maximum, count,
     intent: { component, palette: settings.scalarColorPalette }, settings };
 }
