@@ -6,6 +6,7 @@ export type WaveformKind = SolvedDrive["waveform"]["kind"];
 
 export interface SolvedDriveDraft {
   peakCurrentA: string;
+  timeOrigin: SolvedDrive["time_origin"];
   waveformKind: WaveformKind;
   frequencyHz: string;
   phaseRad: string;
@@ -77,6 +78,7 @@ export function solvedDriveDraft(drive: SolvedDrive): SolvedDriveDraft {
   const waveform = drive.waveform;
   return {
     peakCurrentA: String(drive.peak_current_a),
+    timeOrigin: drive.time_origin,
     waveformKind: waveform.kind,
     frequencyHz: waveform.kind === "sinusoidal" ? String(waveform.frequency_hz) : waveformDefaults.frequencyHz,
     phaseRad: waveform.kind === "sinusoidal" ? String(waveform.phase_rad ?? 0) : waveformDefaults.phaseRad,
@@ -113,6 +115,7 @@ export function buildSolvedDrive(
   draft: SolvedDriveDraft,
 ): SolvedDrive {
   const peakCurrent = finiteNumber(draft.peakCurrentA, "Peak current");
+  if (draft.timeOrigin !== "stage_local" && draft.timeOrigin !== "absolute") throw new Error("Select a supported time origin");
   let waveform: SolvedDrive["waveform"];
   switch (draft.waveformKind) {
     case "constant":
@@ -185,6 +188,7 @@ export function buildSolvedDrive(
   return {
     ...existing,
     peak_current_a: peakCurrent,
+    time_origin: draft.timeOrigin,
     waveform,
     activation,
     bandwidth_declaration: bandwidthDeclaration,
@@ -200,10 +204,20 @@ export function resolveCommittedSolvedDriveScene(
     !Number.isSafeInteger(result.scene_revision) || result.scene_revision <= baseRevision || matches.length !== 1) {
     throw new Error("Drive ACK did not provide the current committed scene. Refresh before saving again.");
   }
+  for (const key of ["name", "projection_ref", "port_mode_id"] as const) {
+    if (matches[0][key] !== expectedDrive[key]) throw new Error("Drive ACK changed an immutable binding. Refresh before saving again.");
+  }
   const expected = solvedDriveDraft(expectedDrive);
   const actual = solvedDriveDraft(matches[0]);
   if ((Object.keys(expected) as Array<keyof SolvedDriveDraft>).some((field) => expected[field] !== actual[field])) {
     throw new Error("Drive ACK changed the submitted parameters. Refresh before saving again.");
   }
   return committed;
+}
+
+/** Local Save and the workspace transition guard share the same conflict decision. */
+export function solvedDriveSaveBlockReason(validationError: string | null, localConflictCount: number, conflictPhase: string | null | undefined): string | undefined {
+  if (validationError) return validationError;
+  if (localConflictCount > 0 || conflictPhase && conflictPhase !== "rebased") return "Review and rebase the conflicting drive draft.";
+  return undefined;
 }

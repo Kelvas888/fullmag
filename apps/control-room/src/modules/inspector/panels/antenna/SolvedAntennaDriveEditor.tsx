@@ -9,6 +9,8 @@ import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdenti
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { Button } from "@/shared/ui/Button";
 
+import { useRegisterInspectorEditSession } from "../../InspectorEditSession";
+import { AntennaDrivePreview } from "./AntennaDrivePreview";
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
 import { FieldRow } from "../../primitives/FieldRow";
 import { FormField } from "../../primitives/FormField";
@@ -20,6 +22,7 @@ import {
   antennaRunStageIds,
   changeSolvedDriveWaveformKind,
   solvedDriveDraft,
+  solvedDriveSaveBlockReason,
   type SolvedDriveDraft,
   type WaveformKind,
 } from "./SolvedAntennaDriveEditorModel";
@@ -98,14 +101,32 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
     ? local.dirtyKeys.filter((key) =>
         local.editedAgainst[key] !== initial[key] && local.draft[key] !== initial[key])
     : [];
-  const canSave = Boolean(scope && identity && scene?.scene?.id && sceneScopeKey === scope) &&
+  const dirty = Boolean(initial && draft && (Object.keys(initial) as Array<keyof SolvedDriveDraft>).some(key => initial[key] !== draft[key]));
+  let validatedDrive: ReturnType<typeof buildSolvedDrive> | null = null, validationError: string | null = null;
+  try {
+    if (drive && draft) {
+      validatedDrive = buildSolvedDrive(drive, draft);
+      if (validatedDrive.activation.kind === "stage_ids" && validatedDrive.activation.stage_ids.some(id => !runStageIds.includes(id))) {
+        throw new Error("Selected activation stage is not a Run stage in the current study.");
+      }
+    }
+  } catch (error) { validationError = error instanceof Error ? error.message : String(error); }
+  const saveBlockReason = solvedDriveSaveBlockReason(validationError, locallyConflictingKeys.length, conflictPhase);
+  const canSave = dirty && Boolean(validatedDrive && !validationError) && Boolean(scope && identity && scene?.scene?.id && sceneScopeKey === scope) &&
     status === "ready" && validRevision && !pending &&
-    locallyConflictingKeys.length === 0 && (!conflict || conflictPhase === "rebased");
+    !saveBlockReason;
   const comparisonKeys = conflict && initial
     ? (Object.keys(draft ?? initial) as Array<keyof SolvedDriveDraft>).filter((key) =>
         dirtyKeySet.has(key) || initial[key] !== conflict.baseDraft[key])
     : [];
   const selectedStageIds = new Set(draft?.stageIds.split(",").map((value) => value.trim()) ?? []);
+
+  function discard() {
+    if (pending) return;
+    setLocal(null); setConflictState(null); setFeedbackState(null);
+  }
+  useRegisterInspectorEditSession("staged", pending, dirty, canSave, undefined, save, discard,
+    { historyMode: "mutation-owned", applyBlockReason: saveBlockReason });
 
   if (!drive || !draft) return null;
 
@@ -154,14 +175,14 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
     });
   }
 
-  async function save() {
-    if (!drive || !draft || !canSave || typeof revision !== "number" || !scope || !identity || inflight.current) return;
+  async function save(): Promise<boolean> {
+    if (!drive || !draft || !canSave || typeof revision !== "number" || !scope || !identity || inflight.current) return false;
     const operation = {};
     const ownerToken = context.token;
     const historyGeneration = authoringHistory?.getGeneration?.();
     const isCurrent = () => owner.current === ownerToken && commands.getSessionScopeKey() === scope &&
       (historyGeneration === undefined || authoringHistory?.getGeneration?.() === historyGeneration);
-    if (!isCurrent()) return;
+    if (!isCurrent()) return false;
     inflight.current = operation;
     setPending(true);
     setFeedbackState(null);
@@ -184,7 +205,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
         api, authoringHistory, selection, resourceData: { [MODEL_SCENE_PATH]: scene },
         sessionScopeKey: scope, isCurrentSessionScope: isCurrent,
       }, `Edit antenna drive ${driveId}`, () => api.model.commitTransaction(transaction, { sessionScopeKey: scope }), resolveCommitted);
-      if (!isCurrent()) return;
+      if (!isCurrent()) return false;
       const committed = resolveCommitted(response);
       const acknowledged = solvedDriveDraft(committed.solved_antenna_drives!.find((item) => item.id === driveId)!);
       publishCommittedSceneResource(resources, committed, response.scene_revision, undefined, true, scope, api.resourceCacheScope);
@@ -192,8 +213,9 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
       setFeedbackState({ id: driveId, message: "Antenna drive committed." });
       setLocal((current) => acknowledgeSolvedDriveDraft(current, driveId, draft, acknowledged));
       setConflictState(null);
+      return true;
     } catch (error) {
-      if (!isCurrent()) return;
+      if (!isCurrent()) return false;
       const statusCode = (error as { status?: number })?.status;
       if (statusCode === 409) {
         setConflictState({ id: driveId, baseRevision: revision, baseDraft: initial!, phase: "conflict" });
@@ -201,6 +223,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
       } else {
         setFeedbackState({ id: driveId, message: error instanceof Error ? error.message : String(error) });
       }
+      return false;
     } finally {
       if (inflight.current === operation) inflight.current = null;
       if (owner.current === ownerToken && commands.getSessionScopeKey() === scope) setPending(false);
@@ -208,8 +231,8 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
   }
 
   return (
-    <InspectorGroup title="Drive authoring">
-      <FormField label="Peak current" unit="A" value={draft.peakCurrentA} onChange={(event) => update({ peakCurrentA: event.currentTarget.value })} />
+    <div data-testid="antenna-drive-editor"><InspectorGroup title="Drive authoring">
+      <FormField label="Peak current" unit="A" hint="Signed current scale. I(t) = scale × waveform(t); offset or sinc amplitude can change the actual peak. No RMS conversion is applied." value={draft.peakCurrentA} onChange={(event) => update({ peakCurrentA: event.currentTarget.value })} />
       <FormField label="Waveform" type="select" value={draft.waveformKind} onChange={(event) => changeWaveform(event.currentTarget.value as WaveformKind)}>
         <option value="constant">Constant</option>
         <option value="sinusoidal">Sinusoidal</option>
@@ -233,6 +256,9 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
       </> : null}
       {draft.waveformKind === "piecewise_linear" ? <FormField label="Points [time, amplitude]" type="textarea" value={draft.piecewisePoints} onChange={(event) => update({ piecewisePoints: event.currentTarget.value })} /> : null}
       {draft.waveformKind === "pulse" || draft.waveformKind === "piecewise_linear" ? <FormField label="Declared bandwidth" unit="Hz" hint="Optional physical upper frequency; never inferred from pulse duration or knot spacing." value={draft.bandwidthHz} onChange={(event) => update({ bandwidthHz: event.currentTarget.value })} /> : null}
+      <FormField label="Time origin" type="select" value={draft.timeOrigin} onChange={event => update({ timeOrigin: event.currentTarget.value as SolvedDriveDraft["timeOrigin"] })}>
+        <option value="stage_local">Stage-local waveform time</option><option value="absolute">Absolute simulation time</option>
+      </FormField>
       <FormField label="Activation" type="select" value={draft.activationKind} onChange={(event) => update({ activationKind: event.currentTarget.value as SolvedDriveDraft["activationKind"] })}>
         <option value="all_time_evolution">All time-evolution stages</option>
         <option value="stage_ids">Selected stages</option>
@@ -244,6 +270,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
         }} />)}
         <FormField label="Stage IDs" hint="Only Run stages in the current study can be activated." value={draft.stageIds} onChange={(event) => update({ stageIds: event.currentTarget.value })} />
       </> : null}
+      {validationError ? <FeedbackBanner kind="warning" message={validationError} /> : null}
       {feedback ? <FeedbackBanner kind={feedback === "Antenna drive committed." ? "success" : "error"} message={feedback} /> : null}
       {locallyConflictingKeys.length > 0 && !conflict ? <InspectorGroup title="Concurrent drive edit" badge="review required">
         {locallyConflictingKeys.map((key) => <div key={key}>
@@ -264,7 +291,11 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
           <Button type="button" disabled={pending} onClick={() => { setLocal(null); setConflictState(null); setFeedbackState(null); refetch(); }}>Discard Draft</Button>
         </div>
       </InspectorGroup> : null}
-      <Button type="button" disabled={!canSave || Boolean(conflict)} onClick={() => void save()}>Save drive</Button>
-    </InspectorGroup>
+      <div className="fm-inspector-toolbar">
+        <Button type="button" disabled={!dirty || pending} onClick={discard}>Reset drive</Button>
+        <Button type="button" disabled={!canSave || Boolean(conflict)} onClick={() => void save()}>Save drive</Button>
+      </div>
+      <AntennaDrivePreview drive={validatedDrive} revision={validRevision ? revision! : 0} />
+    </InspectorGroup></div>
   );
 }

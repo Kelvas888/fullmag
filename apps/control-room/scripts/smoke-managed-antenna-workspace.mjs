@@ -464,6 +464,89 @@ try {
   assert.equal(await page.getByRole("textbox", { name: "Stage IDs", exact: true }).inputValue(), runNode.id);
   await screenshot("11-pipeline-drive-inspector");
   checks.push({ name: "Real UI-authored receiver and Run, represented by the public pipeline API, bind one atomic antenna drive to the executable queue ID and display it in the existing drive editor", passed: true, setup: "receiver and flat Run via UI; pipeline representation via public API; composition and inspection via UI", queueId: runNode.id, definitionId: runNode.payload.stage_id });
+  const driveEditor = page.getByTestId("antenna-drive-editor"), currentPreview = page.getByTestId("antenna-drive-preview");
+  const drivePeak = driveEditor.getByRole("textbox", { name: "Peak current", exact: true });
+  const driveSave = driveEditor.getByRole("button", { name: "Save drive", exact: true });
+  assert.equal(await driveSave.isEnabled(), false, "A clean drive must not submit another transaction");
+  const beforeDriveEditWrites = writes.length;
+  await driveEditor.getByRole("textbox", { name: "Frequency", exact: true }).fill("0");
+  assert.equal(await driveSave.isEnabled(), false);
+  await selectNode(`model:object:${objectId}:geometry`);
+  await dirtyGuard.waitFor();
+  assert.equal(await dirtyGuard.getByRole("button", { name: "Apply and continue", exact: true }).isEnabled(), false);
+  await dirtyGuard.getByRole("button", { name: "Cancel", exact: true }).click();
+  assert.equal(await driveEditor.getByRole("textbox", { name: "Frequency", exact: true }).inputValue(), "0");
+  await driveEditor.getByRole("textbox", { name: "Frequency", exact: true }).fill("1e9");
+  await drivePeak.fill("-0.02");
+  await driveEditor.getByRole("textbox", { name: "Phase", exact: true }).fill(String(Math.PI / 2));
+  await driveEditor.getByRole("textbox", { name: "Offset", exact: true }).fill("0.5");
+  await driveEditor.getByRole("combobox", { name: "Time origin", exact: true }).selectOption("absolute");
+  await currentPreview.getByRole("textbox", { name: "Preview to", exact: true }).fill("1e-5");
+  await currentPreview.getByRole("alert").filter({ hasText: "Reduce the preview time range" }).last().waitFor();
+  await currentPreview.getByRole("textbox", { name: "Preview to", exact: true }).fill("2e-9");
+  const previewCursor = currentPreview.getByRole("slider", { name: "Preview sample", exact: true });
+  await previewCursor.focus(); await previewCursor.press("Home");
+  await currentPreview.getByText("-3.000000e-2 A", { exact: true }).waitFor();
+  const previewImage = currentPreview.getByRole("img", { name: /Authored antenna current I/ });
+  await previewImage.waitFor();
+  const chartCanvas = currentPreview.locator("canvas");
+  await chartCanvas.waitFor(); assert.equal(await chartCanvas.isVisible(), true);
+  const chartDimensions = await chartCanvas.evaluate(canvas => ({ width: canvas.width, height: canvas.height }));
+  assert.ok(chartDimensions.width > 0 && chartDimensions.height > 0);
+  await screenshot("12-authored-current-preview");
+  await selectNode(`model:object:${objectId}:geometry`);
+  await dirtyGuard.waitFor();
+  assert.equal(await dirtyGuard.getByRole("button", { name: "Apply and continue", exact: true }).isEnabled(), true);
+  await dirtyGuard.getByRole("button", { name: "Cancel", exact: true }).click();
+  assert.equal(writes.length, beforeDriveEditWrites, "Preview and cancelled navigation are read-only");
+  checks.push({ name: "Drive guard preserves invalid and valid drafts on cancelled navigation; bounded I(t) preview exposes SI units, signed phase/offset current, keyboard cursor and a real chart canvas", passed: true, chartDimensions });
+  await drivePeak.focus();
+  await page.evaluate(() => {
+    const root = document.querySelector('[data-testid="antenna-drive-editor"]'), input = document.activeElement, scroll = root.closest(".fm-inspector__body");
+    const controls = [...root.querySelectorAll("input, select")].map(element => ({ element, disabled: element.disabled, opacity: getComputedStyle(element).opacity }));
+    const proof = { root, input, scroll, top: scroll.scrollTop, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 };
+    const sample = () => {
+      proof.samples++;
+      if (document.querySelector('[data-testid="antenna-drive-editor"]') !== root) proof.rootChanges++;
+      for (const saved of controls) {
+        if (!saved.element.isConnected) proof.controlChanges++;
+        if (saved.element.disabled !== saved.disabled) proof.disabledChanges++;
+        if (getComputedStyle(saved.element).opacity !== saved.opacity) proof.opacityChanges++;
+      }
+      proof.opacityAnimations += root.getAnimations({ subtree: true }).filter(animation => (animation.playState === "running" || animation.pending) && animation.effect?.getKeyframes().some(frame => "opacity" in frame)).length;
+    };
+    const observer = new MutationObserver(sample); observer.observe(root, { attributes: true, childList: true, subtree: true }); sample(); window.__driveProof = { proof, observer, sample };
+  });
+  await driveSave.evaluate(button => button.click());
+  const editedDriveScene = await waitScene(s => s.solved_antenna_drives.find(item => item.id === drive.id)?.time_origin === "absolute");
+  await driveEditor.getByText("Antenna drive committed.", { exact: true }).waitFor();
+  const editedDrive = editedDriveScene.solved_antenna_drives.find(item => item.id === drive.id);
+  assert.equal(editedDrive.peak_current_a, -0.02); assert.equal(editedDrive.waveform.phase_rad, Math.PI / 2); assert.equal(editedDrive.waveform.offset, 0.5);
+  assert.equal(editedDrive.projection_ref, drive.projection_ref); assert.equal(editedDrive.port_mode_id, drive.port_mode_id);
+  assert.deepEqual(editedDrive.activation, drive.activation); assert.deepEqual(editedDriveScene.study, driven.study);
+  assert.equal(writes.length, beforeDriveEditWrites + 1);
+  assert.equal(await driveSave.isEnabled(), false);
+  const driveStability = await page.evaluate(() => {
+    const { proof, observer, sample } = window.__driveProof; sample(); observer.disconnect();
+    return { root: proof.root.isConnected, focus: document.activeElement === proof.input, scroll: proof.scroll.scrollTop === proof.top,
+      rootChanges: proof.rootChanges, controlChanges: proof.controlChanges, disabledChanges: proof.disabledChanges, opacityChanges: proof.opacityChanges, opacityAnimations: proof.opacityAnimations, samples: proof.samples };
+  });
+  assert.ok(driveStability.samples > 1 && driveStability.samples < 200);
+  assert.deepEqual({ ...driveStability, samples: 0 }, { root: true, focus: true, scroll: true, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 });
+  await drivePeak.fill("0.7");
+  await driveEditor.getByRole("button", { name: "Reset drive", exact: true }).click();
+  assert.equal(await drivePeak.inputValue(), "-0.02"); assert.equal(writes.length, beforeDriveEditWrites + 1);
+  await currentPreview.scrollIntoViewIfNeeded(); await screenshot("13-current-preview-committed");
+  checks.push({ name: "Drive edits persist signed current and absolute clock through one real API transaction while preserving bindings, root, focus, scroll and unrelated controls; Reset remains local", passed: true, stability: driveStability });
+  await driveEditor.getByRole("combobox", { name: "Time origin", exact: true }).selectOption("stage_local");
+  await selectNode(`model:object:${objectId}:geometry`);
+  await dirtyGuard.waitFor();
+  await dirtyGuard.getByRole("button", { name: "Apply and continue", exact: true }).click();
+  await geometry.waitFor();
+  const appliedDrive = await waitScene(s => s.solved_antenna_drives.find(item => item.id === drive.id)?.time_origin === "stage_local");
+  assert.equal(appliedDrive.solved_antenna_drives.find(item => item.id === drive.id).peak_current_a, -0.02);
+  assert.equal(writes.length, beforeDriveEditWrites + 2);
+  checks.push({ name: "Global Apply and continue awaits the real drive ACK and transitions only after the draft is clean", passed: true });
   const webgl = await page.locator("canvas").evaluateAll(canvases => canvases.map(canvas => {
     const bounds = canvas.getBoundingClientRect(); if (!bounds.width || !bounds.height) return null;
     const gl = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
@@ -471,7 +554,7 @@ try {
   }).filter(Boolean));
   assert.ok(webgl.some(gl => !gl.lost && gl.width > 0 && gl.height > 0)); assert.ok(webgl.every(gl => !gl.lost));
   assert.ok(websockets.some(url => url.startsWith(target.api_base.replace("http:", "ws:"))), "Realtime must use the admitted API");
-  assert.ok(writes.length >= 3 && writes.length <= 17);
+  assert.ok(writes.length >= 3 && writes.length <= 19);
   for (const write of [...writes, ...visualizationAcks]) { assert.equal(write.instance, target.api_instance); assert.equal(write.scope, scope); assert.ok(!write.path.includes("/simulation/"), "Authoring smoke must not execute a solver"); }
   assert.ok(Date.now() - Date.parse(startedAt) > 5000, "The scenario must outlive the adoption timeout");
   assert.deepEqual(visualizationAcks.filter(ack => ack.body.status === "failed"), [], "No nonexistent-buffer adoption may fail during empty/nonmagnetic authoring");
