@@ -62,6 +62,7 @@ const MAX_RELEASE_PROOF_BYTES: usize = 64 * 1024;
 const MAX_COMPUTE_NODE_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HOST_RUNTIME_READINESS_BYTES: usize = 256 * 1024;
 const MAX_HOST_INVENTORY_OWNER_RECORD_BYTES: usize = 4096;
+const MAX_RUNTIME_SNAPSHOT_GC_ENTRIES: usize = 256;
 
 /// Ordinary contention in a validated host ledger. Corruption and fencing
 /// failures remain errors; schedulers may wait only for this admission outcome.
@@ -2109,6 +2110,7 @@ impl HostResourceLedger {
                 if document.policy != ledger.policy {
                     bail!("stored host resource policy differs from explicit ledger configuration");
                 }
+                ledger.gc_unreachable_snapshot_cas_locked(&document)?;
             }
             (false, false) => {
                 ensure_fresh_ledger_root(&ledger.root)?;
@@ -2199,6 +2201,8 @@ impl HostResourceLedger {
                 let existing = ledger.read_runtime_readiness()?;
                 if ledger.runtime_generation_sha256()?.is_none() || existing != readiness {
                     ledger.upgrade_runtime_readiness(readiness)?;
+                } else {
+                    ledger.gc_unreachable_snapshot_cas()?;
                 }
                 return Ok(ledger);
             }
@@ -2274,6 +2278,7 @@ impl HostResourceLedger {
         });
         validate_ledger_document(&document, &self.root)?;
         self.publish_document_locked(&document)?;
+        self.gc_unreachable_snapshot_cas_locked(&document)?;
         Ok(readiness_digest)
     }
 
@@ -3095,6 +3100,84 @@ impl HostResourceLedger {
         self.publish_compute_node_snapshot_locked(snapshot, &bytes)
     }
 
+    fn gc_unreachable_snapshot_cas(&self) -> Result<()> {
+        let _host_writer = self.writer.acquire()?;
+        let document = self.read_document_locked()?;
+        self.gc_unreachable_snapshot_cas_locked(&document)
+    }
+
+    /// Remove a bounded number of stale snapshot CAS files after a durable
+    /// pointer publication. The caller must hold the host writer. Invalid,
+    /// non-regular, linked, and non-CAS entries are preserved for inspection.
+    fn gc_unreachable_snapshot_cas_locked(
+        &self,
+        document: &HostResourceLedgerDocument,
+    ) -> Result<()> {
+        if document.schema_version != HOST_RESOURCE_LEDGER_SCHEMA_V4 {
+            return Ok(());
+        }
+        let current_snapshot_digest = document
+            .runtime_state
+            .as_ref()
+            .and_then(|state| state.snapshot_sha256.as_deref());
+        let directory = checked_path(&self.root, HOST_COMPUTE_NODE_SNAPSHOT_CAS_DIR)?;
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "enumerating compute-node snapshot CAS directory {}",
+                        directory.display()
+                    )
+                })
+            }
+        };
+
+        let mut inspected = 0;
+        let mut removed = 0;
+        for entry in entries {
+            if inspected == MAX_RUNTIME_SNAPSHOT_GC_ENTRIES {
+                break;
+            }
+            inspected += 1;
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() || file_type.is_symlink() {
+                continue;
+            }
+            if reject_link(&path).is_err() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(digest) = file_name.strip_suffix(".json") else {
+                continue;
+            };
+            if validate_runtime_cas_digest(digest, "snapshot CAS filename").is_err()
+                || current_snapshot_digest == Some(digest)
+            {
+                continue;
+            }
+
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("removing stale snapshot CAS {}", path.display()))
+                }
+            }
+        }
+        if removed > 0 {
+            sync_directory(&directory)?;
+        }
+        Ok(())
+    }
+
     fn publish_compute_node_snapshot_locked(
         &self,
         snapshot: &ComputeNodeSnapshot,
@@ -3105,6 +3188,7 @@ impl HostResourceLedger {
         if document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4 {
             if let Some(previous) = self.read_compute_node_snapshot_locked()? {
                 if previous == *snapshot {
+                    self.gc_unreachable_snapshot_cas_locked(&document)?;
                     return Ok(ComputeNodeSnapshotPublicationDisposition::Replayed);
                 }
                 if snapshot.node_id == previous.node_id
@@ -3130,6 +3214,7 @@ impl HostResourceLedger {
                 .context("v4 host resource ledger is missing runtime state")?;
             state.snapshot_sha256 = Some(digest);
             self.publish_document_locked(&document)?;
+            self.gc_unreachable_snapshot_cas_locked(&document)?;
             return Ok(ComputeNodeSnapshotPublicationDisposition::Accepted);
         }
         if let Some(previous) = self.read_compute_node_snapshot_locked()? {
@@ -8488,12 +8573,41 @@ mod tests {
         let ledger =
             HostResourceLedger::initialize_with_readiness(&root, policy.clone(), readiness.clone())
                 .unwrap();
+        let old_generation = ledger.read_runtime_generation_sha256().unwrap();
+        let snapshot_dir = root.join(HOST_COMPUTE_NODE_SNAPSHOT_CAS_DIR);
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        let stale_snapshot = "b".repeat(64);
+        fs::write(
+            snapshot_dir.join(format!("{stale_snapshot}.json")),
+            b"orphaned snapshot",
+        )
+        .unwrap();
+        let malformed_name = snapshot_dir.join(format!("{}.json", "B".repeat(64)));
+        fs::write(&malformed_name, b"preserve malformed name").unwrap();
+        let wrong_extension = snapshot_dir.join(format!("{}.tmp", "c".repeat(64)));
+        fs::write(&wrong_extension, b"preserve wrong extension").unwrap();
+        let non_regular_name = snapshot_dir.join(format!("{}.json", "d".repeat(64)));
+        fs::create_dir(&non_regular_name).unwrap();
+        let legacy_readiness = root.join(HOST_RUNTIME_READINESS_FILE);
+        let legacy_snapshot = root.join(HOST_COMPUTE_NODE_SNAPSHOT_FILE);
+        fs::write(&legacy_readiness, b"legacy readiness evidence").unwrap();
+        fs::write(&legacy_snapshot, b"legacy snapshot evidence").unwrap();
+        let readiness_history = root.join(
+            runtime_cas_relative_path(
+                HOST_RUNTIME_READINESS_CAS_DIR,
+                &"e".repeat(64),
+                "readiness history",
+            )
+            .unwrap(),
+        );
+        fs::write(&readiness_history, b"historical readiness").unwrap();
+
         let owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
         let mut rotated = readiness.clone();
         rotated.runtime_identity_sha256 = "7".repeat(64);
         assert!(ledger.upgrade_runtime_readiness(rotated.clone()).is_err());
         drop(owner);
-        let next_generation = ledger.upgrade_runtime_readiness(rotated).unwrap();
+        let next_generation = ledger.upgrade_runtime_readiness(rotated.clone()).unwrap();
         assert_eq!(
             next_generation,
             ledger.read_runtime_state().unwrap().unwrap().readiness_sha256
@@ -8502,6 +8616,41 @@ mod tests {
             ledger.read_runtime_state().unwrap().unwrap().snapshot_sha256,
             None
         );
+        assert!(!snapshot_dir.join(format!("{stale_snapshot}.json")).exists());
+        assert!(malformed_name.is_file());
+        assert!(wrong_extension.is_file());
+        assert!(non_regular_name.is_dir());
+        assert!(legacy_readiness.is_file());
+        assert!(legacy_snapshot.is_file());
+        assert!(readiness_history.is_file());
+        assert!(root
+            .join(
+                runtime_cas_relative_path(
+                    HOST_RUNTIME_READINESS_CAS_DIR,
+                    &old_generation,
+                    "readiness",
+                )
+                .unwrap(),
+            )
+            .is_file());
+
+        let retry_snapshot = "f".repeat(64);
+        fs::write(
+            snapshot_dir.join(format!("{retry_snapshot}.json")),
+            b"orphaned snapshot for initialization retry",
+        )
+        .unwrap();
+        let reopened = HostResourceLedger::initialize_or_upgrade_with_readiness(
+            &root,
+            policy.clone(),
+            rotated,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.read_runtime_generation_sha256().unwrap(),
+            next_generation
+        );
+        assert!(!snapshot_dir.join(format!("{retry_snapshot}.json")).exists());
 
         let mut next_policy = ledger.read().unwrap().node_policy.unwrap();
         next_policy.revision += 1;
