@@ -1,4 +1,3 @@
-import type { ReactNode } from "react";
 import { useKernel } from "@/kernel/KernelContext";
 import { Button } from "@/shared/ui/Button";
 
@@ -27,6 +26,8 @@ import { AntennaConductorMaterialEditor } from "./AntennaConductorMaterialEditor
 import { AntennaPortEditor } from "./AntennaPortEditor";
 import { AntennaResourceEditor } from "./AntennaResourceEditor";
 import { SolvedAntennaDriveEditor } from "./SolvedAntennaDriveEditor";
+import { AntennaCompositionReadout } from "./AntennaCompositionReadout";
+import { formatAntennaParameter as numberValue, type AntennaReadoutRow as DetailRow } from "./AntennaReadoutModel";
 import { antennaWaveformBandwidthValue } from "./AntennaCompositionModel";
 import {
   antennaFieldSolutionIdentityStatus,
@@ -51,13 +52,6 @@ type AntennaDrive = NonNullable<SceneResource["solved_antenna_drives"]>[number];
 type AntennaSpectrumRequest = NonNullable<
   SceneResource["antenna_spectrum_requests"]
 >[number];
-
-interface DetailRow {
-  label: string;
-  value: ReactNode;
-  mono?: boolean;
-  unit?: string;
-}
 
 interface DetailModel {
   badge: string;
@@ -105,12 +99,6 @@ function recordValue(value: unknown): Record<string, unknown> | null {
 
 function textValue(value: unknown, fallback = "unavailable"): string {
   return typeof value === "string" && value.length > 0 ? value : fallback;
-}
-
-function numberValue(value: unknown, unit = ""): string {
-  return typeof value === "number" && Number.isFinite(value)
-    ? `${value.toExponential(4)}${unit ? ` ${unit}` : ""}`
-    : `unavailable${unit ? ` ${unit}` : ""}`;
 }
 
 function executionValue(value: unknown): string {
@@ -225,7 +213,7 @@ function portDetails(
   }
   const validationMessages = antennaPortValidationMessages(mode, scene);
   return {
-    title: `Antenna port ${mode.id}`,
+    title: "Antenna port",
     badge: `${mode.branches.length} branches${validationMessages.length > 0 ? " · invalid" : ""}`,
     rows: [
       { label: "Validation", value: validationMessages.join("; ") || "valid authoring references" },
@@ -257,7 +245,7 @@ function solutionDetails(
   }
   const validationMessages = antennaStageValidationMessages(stage, scene);
   return {
-    title: `Antenna field solve ${stage.id}`,
+    title: "Antenna field solve",
     badge: validationMessages.length > 0 ? "invalid · result pending" : "configured · result pending",
     rows: [
       { label: "Validation", value: validationMessages.join("; ") || "ready" },
@@ -367,7 +355,7 @@ function projectionDetails(
   }
   const validationMessages = antennaProjectionValidationMessages(projection, scene);
   return {
-    title: `Antenna projection ${projection.id}`,
+    title: "Target projection",
     badge: validationMessages.length > 0 ? "invalid · result pending" : "configured · result pending",
     rows: [
       { label: "Validation", value: validationMessages.join("; ") || "ready" },
@@ -580,7 +568,7 @@ function driveDetails(
       { label: "Projection", value: drive.projection_ref, mono: true },
       { label: "Peak current", value: numberValue(drive.peak_current_a, "A") },
       { label: "Waveform", value: waveformValue(drive.waveform) },
-      { label: "Declared bandwidth", value: antennaWaveformBandwidthValue(drive.bandwidth_declaration) },
+      { label: "Declared bandwidth", value: drive.bandwidth_declaration && Number.isFinite(drive.bandwidth_declaration.f_max_hz) ? numberValue(drive.bandwidth_declaration.f_max_hz, "Hz") : antennaWaveformBandwidthValue(drive.bandwidth_declaration) },
       { label: "Time origin", value: drive.time_origin },
       { label: "Activation", value: activationValue(drive.activation) },
       { label: "Publication", value: "Drive is configured but no qualified target projection is published." },
@@ -823,12 +811,12 @@ function enrichRuntimeModel(
   const rows = [...model.rows];
 
   if (ids.stageId) {
-    rows.push(...stageOutputCatalogRuntimeRows(ids.stageId, stageOutputCatalog));
+    rows.push(...stageOutputCatalogRuntimeRows(ids.stageId, stageOutputCatalog).map(row => ({ ...row, section: "runtime" as const })));
   }
 
   if (kind === "solution") {
     const currentStatus = model.badge.startsWith("invalid") ? "authoring invalid" : fieldStatus;
-    rows.push(...fieldSolutionRuntimeRows(fieldSolution, currentStatus));
+    rows.push(...fieldSolutionRuntimeRows(fieldSolution, currentStatus).map(row => ({ ...row, section: "runtime" as const })));
     return {
       ...model,
       badge: currentStatus === "authoring invalid" ? model.badge : runtimeBadge(model.badge, fieldStatus),
@@ -838,7 +826,7 @@ function enrichRuntimeModel(
   if (kind === "spectrum") {
     const spectrumStatus = antennaSpectrumIdentityStatus(ids, sourceSpectrum, stageOutputCatalog);
     const currentStatus = model.badge.startsWith("invalid") ? "authoring invalid" : spectrumStatus;
-    rows.push(...sourceSpectrumRuntimeRows(sourceSpectrum, currentStatus));
+    rows.push(...sourceSpectrumRuntimeRows(sourceSpectrum, currentStatus).map(row => ({ ...row, section: "runtime" as const })));
     return {
       ...model,
       badge: currentStatus === "authoring invalid" ? model.badge : runtimeBadge(model.badge, spectrumStatus),
@@ -846,7 +834,7 @@ function enrichRuntimeModel(
     };
   }
   if (kind === "projection" || kind === "drive") {
-    rows.push({ label: "Field solution result", value: fieldStatus });
+    rows.push({ label: "Field solution result", value: fieldStatus, section: "runtime" });
     if (fieldSolution.data && fieldStatus === "ready") {
       rows.push({
         label: "Published field digest",
@@ -914,7 +902,7 @@ export function AntennaCompositionPanel({
           spectrum={sourceSpectrum.data}
         />
       ) : null}
-      {kind === "conductor" ? <AntennaConductorDetails objectId={objectId} scene={scene.data} /> : <InspectorGroup title={kind === "spectrum" ? "Configuration and provenance" : model.title} badge={model.badge} collapsible={kind === "spectrum"} defaultOpen={kind !== "spectrum"}>
+      {kind === "conductor" ? <AntennaConductorDetails objectId={objectId} scene={scene.data} /> : kind !== "spectrum" ? <AntennaCompositionReadout key={JSON.stringify([scope, kind, resourceId])} title={model.title} badge={model.badge} rows={model.rows} /> : <InspectorGroup title="Configuration and provenance" badge={model.badge} collapsible defaultOpen={false}>
         {model.rows.map((row) => (
           <FieldRow
             key={row.label}

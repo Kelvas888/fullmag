@@ -716,6 +716,40 @@ try {
   assert.equal(writes.length, beforeRenameWrites + 2);
   await screenshot("17-readable-antenna-explorer");
   checks.push({ name: "Explorer resolves full resource ID searches after selecting another node and reopens the same renamed drive without writes", passed: true });
+  const readout = page.getByTestId("antenna-composition-readout");
+  await readout.getByText("-20 mA", { exact: true }).waitFor();
+  await readout.getByRole("heading", { name: "Execution and publication", exact: true }).waitFor();
+  const identities = readout.getByRole("button", { name: /Identity and provenance/ });
+  assert.equal(await identities.getAttribute("aria-expanded"), "false");
+  assert.equal(await readout.getByText(drive.id, { exact: true }).isVisible(), false);
+  const beforeReadoutWrites = writes.length;
+  await identities.focus(); await identities.press("Enter");
+  assert.equal(await identities.getAttribute("aria-expanded"), "true");
+  await readout.getByText(drive.id, { exact: true }).waitFor();
+  await readout.getByText(drive.projection_ref, { exact: true }).waitFor();
+  const exactIdentity = await readout.getByText(drive.id, { exact: true }).evaluate(element => {
+    const value = element.closest(".fm-inspector-field-row__value");
+    return { text: element.textContent, wrap: getComputedStyle(value).whiteSpace, overflow: value.scrollWidth > value.clientWidth + 1 };
+  });
+  assert.deepEqual(exactIdentity, { text: drive.id, wrap: "normal", overflow: false });
+  await identities.focus(); await identities.press("Enter");
+  assert.equal(await identities.getAttribute("aria-expanded"), "false");
+  await readout.scrollIntoViewIfNeeded(); await screenshot("18-antenna-parameter-readout");
+  // The presentation remains readable in a compact inspector and another theme.
+  assert.equal(await page.locator("html").getAttribute("data-theme"), "light");
+  await publicCommand("Toggle Theme");
+  await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
+  await page.setViewportSize({ width: 1280, height: 1000 });
+  await identities.focus(); await identities.press("Enter");
+  const compactIdentity = await readout.getByText(drive.id, { exact: true }).evaluate(element => {
+    const value = element.closest(".fm-inspector-field-row__value"), root = element.closest('[data-testid="antenna-composition-readout"]');
+    return { valueOverflow: value.scrollWidth > value.clientWidth + 1, panelOverflow: root.scrollWidth > root.clientWidth + 1 };
+  });
+  assert.deepEqual(compactIdentity, { valueOverflow: false, panelOverflow: false });
+  await screenshot("19-antenna-identity-compact");
+  assert.equal(writes.length, beforeReadoutWrites, "Readout disclosure and layout must not write or compute");
+  await page.setViewportSize({ width: 1600, height: 1100 });
+  checks.push({ name: "Parameter readout separates execution from exact identities, preserves signed SI current, supports keyboard disclosure and wraps full IDs without overflow at compact width; disclosure and layout are read-only", passed: true, exactIdentity, compactIdentity });
   const webgl = await page.locator("canvas").evaluateAll(canvases => canvases.map(canvas => {
     const bounds = canvas.getBoundingClientRect(); if (!bounds.width || !bounds.height) return null;
     const gl = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
