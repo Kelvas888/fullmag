@@ -360,8 +360,10 @@ if(FULLMAG_USE_MFEM_STACK)
 endif()
 
 # A managed capsule is identified by content rather than preserved mtimes.
-# Changing this definition forces CMake to rebuild native objects without
-# deleting caches, even when a later snapshot has older source timestamps.
+# Legacy managed-capsule builds keep this definition target-wide: changing it
+# forces CMake to rebuild native objects without deleting caches, even when a
+# later snapshot has older source timestamps. Direct Compose has an explicitly
+# fresh source tree, so it scopes the identity definition to the metadata TU.
 set(FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256 "" CACHE STRING
     "Managed source snapshot bound to the native FEM build")
 if(NOT FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256 STREQUAL "")
@@ -371,10 +373,21 @@ if(NOT FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256 STREQUAL "")
         message(FATAL_ERROR "FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256 must be lowercase SHA-256")
     endif()
 endif()
+set(FULLMAG_DIRECT_COMPOSE "0" CACHE STRING
+    "Use source-specific FEM provenance for direct Compose builds")
+if(NOT FULLMAG_DIRECT_COMPOSE STREQUAL "0" AND
+   NOT FULLMAG_DIRECT_COMPOSE STREQUAL "1")
+    message(FATAL_ERROR "FULLMAG_DIRECT_COMPOSE must be 0 or 1")
+endif()
 add_library(fullmag_fem SHARED ${FEM_SOURCES})
 if(NOT FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256 STREQUAL "")
-    target_compile_definitions(fullmag_fem PRIVATE
-        FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256="${FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256}")
+    if(FULLMAG_DIRECT_COMPOSE STREQUAL "1")
+        set_property(SOURCE cpu/mfem/runtime/runtime_build_info.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+            FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256="${FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256}")
+    else()
+        target_compile_definitions(fullmag_fem PRIVATE
+            FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256="${FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256}")
+    endif()
 endif()
 target_compile_definitions(fullmag_fem PRIVATE FULLMAG_FEM_BUILD_SHARED=1)
 

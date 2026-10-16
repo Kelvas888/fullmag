@@ -93,6 +93,7 @@ fn main() {
     // Capsules preserve source mtimes. A later capture can therefore contain
     // changed C++ older than objects built by an earlier concurrent job.
     println!("cargo:rerun-if-env-changed=FULLMAG_SOURCE_SNAPSHOT_SHA256");
+    println!("cargo:rerun-if-env-changed=FULLMAG_DIRECT_COMPOSE");
     let source_snapshot = std::env::var("FULLMAG_SOURCE_SNAPSHOT_SHA256").unwrap_or_default();
     if !source_snapshot.is_empty()
         && (source_snapshot.len() != 64
@@ -164,6 +165,7 @@ fn main() {
     };
     let use_mfem_stack = env_flag("FULLMAG_USE_MFEM_STACK");
     let require_gpu = env_flag("FULLMAG_FEM_REQUIRE_GPU");
+    let direct_compose = explicit_env_flag("FULLMAG_DIRECT_COMPOSE").unwrap_or(false);
     let native_cuda = explicit_env_flag("FULLMAG_FEM_NATIVE_CUDA");
     let configured_cuda = explicit_env_flag("FULLMAG_FEM_ENABLE_CUDA");
     if let (Some(native), Some(configured)) = (native_cuda, configured_cuda) {
@@ -207,6 +209,10 @@ fn main() {
         .arg(format!(
             "-DFULLMAG_FEM_SOURCE_SNAPSHOT_SHA256={}",
             source_snapshot
+        ))
+        .arg(format!(
+            "-DFULLMAG_DIRECT_COMPOSE={}",
+            if direct_compose { "1" } else { "0" }
         ))
         .arg(format!(
             "-DFULLMAG_ENABLE_CUDA={}",

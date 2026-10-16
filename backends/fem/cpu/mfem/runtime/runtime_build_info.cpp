@@ -7,7 +7,16 @@
 #include <HYPRE.h>
 #endif
 
+#ifndef FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256
+#define FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256 ""
+#endif
+
 namespace fullmag::fem {
+
+const char *runtime_source_snapshot_sha256() noexcept
+{
+    return FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256;
+}
 
 bool runtime_build_info(fullmag_fem_runtime_build_info &out_info)
 {

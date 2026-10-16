@@ -52,6 +52,7 @@ BUILD_ROOT = Path("/build")
 OUTPUT_ROOT = Path("/output")
 PACKAGE_ROOT = Path("/opt/fullmag/package")
 OWNER_MARKER = ".fullmag-direct-backend-owner.json"
+WORKSPACE_INVENTORY_SCHEMA = "fullmag.direct-compose.workspace-inventory.v1"
 RUNTIME_LOCK_NAME = ".fullmag-backend-runtime.lock"
 PERSISTENT_WORKSPACE_DIRS = frozenset(
     {".fullmag-build", ".fullmag-cargo", ".fullmag-rustup"}
@@ -262,10 +263,9 @@ def _prepare_workspace(build_root: Path) -> Path:
         document, _ = _read_json(marker, "backend workspace owner", 16 * 1024)
         if document.get("schema") != "fullmag.direct-compose.backend-workspace.v1":
             _fail("backend workspace owner marker has an unsupported schema")
-        for child in tuple(workspace.iterdir()):
-            if child.name in PERSISTENT_WORKSPACE_DIRS or child.name == OWNER_MARKER:
-                continue
-            _remove_owned_tree(child)
+        state = document.get("state")
+        if state is not None and state not in {"preparing", "ready"}:
+            _fail("backend workspace owner marker has an unsupported state")
     else:
         # A failed first extraction may leave only these newly created empty
         # directories. Never adopt an unknown nonempty workspace or cache.
@@ -278,6 +278,288 @@ def _prepare_workspace(build_root: Path) -> Path:
     for name in PERSISTENT_WORKSPACE_DIRS:
         _ensure_directory(workspace / name, f"persistent workspace directory {name}")
     return workspace
+
+
+def _workspace_tree_inventory(workspace: Path) -> tuple[dict[str, Path], set[str]]:
+    """Inventory owned source entries without traversing persistent mounts."""
+
+    files: dict[str, Path] = {}
+    directories: set[str] = set()
+
+    def visit(directory: Path, relative: PurePosixPath) -> None:
+        try:
+            children = tuple(directory.iterdir())
+        except OSError as error:
+            _fail(f"cannot inventory backend workspace {directory}: {error}")
+        for child in children:
+            metadata = child.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or bool(
+                getattr(metadata, "st_file_attributes", 0) & 0x400
+            ):
+                _fail(f"backend workspace contains a link or reparse point: {child}")
+            child_relative = relative / child.name
+            key = child_relative.as_posix()
+            if stat.S_ISDIR(metadata.st_mode):
+                directories.add(key)
+                visit(child, child_relative)
+            elif stat.S_ISREG(metadata.st_mode):
+                files[key] = child
+            else:
+                _fail(f"backend workspace contains a special file: {child}")
+
+    for child in tuple(workspace.iterdir()):
+        if child.name in PERSISTENT_WORKSPACE_DIRS or child.name == OWNER_MARKER:
+            metadata = child.lstat()
+            if child.name in PERSISTENT_WORKSPACE_DIRS and (
+                stat.S_ISLNK(metadata.st_mode)
+                or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+                or not stat.S_ISDIR(metadata.st_mode)
+            ):
+                _fail(f"persistent workspace mount is unsafe: {child}")
+            continue
+        metadata = child.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or bool(
+            getattr(metadata, "st_file_attributes", 0) & 0x400
+        ):
+            _fail(f"backend workspace contains a link or reparse point: {child}")
+        if stat.S_ISDIR(metadata.st_mode):
+            directories.add(child.name)
+            visit(child, PurePosixPath(child.name))
+        elif stat.S_ISREG(metadata.st_mode):
+            files[child.name] = child
+        else:
+            _fail(f"backend workspace contains a special file: {child}")
+    return files, directories
+
+
+def _source_manifest_inventory(capsule: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    raw_files = capsule.get("files")
+    if not isinstance(raw_files, list):
+        _fail("source manifest files are unavailable for workspace reconciliation")
+    inventory: dict[str, dict[str, Any]] = {}
+    for raw in raw_files:
+        if not isinstance(raw, Mapping):
+            _fail("source manifest file inventory entry is not an object")
+        path = raw.get("path")
+        if not isinstance(path, str) or not path or "\\" in path:
+            _fail("source manifest file inventory path is invalid")
+        relative = PurePosixPath(path)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != path
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            _fail(f"source manifest file inventory path escapes its root: {path}")
+        if relative.parts[0] in PERSISTENT_WORKSPACE_DIRS:
+            _fail(f"source manifest attempts to replace persistent mount: {path}")
+        if relative.parts[0] == ".fullmag":
+            _fail(f"source manifest attempts to replace generated build output: {path}")
+        if relative.parts[0] == OWNER_MARKER:
+            _fail(f"source manifest attempts to replace workspace ownership: {path}")
+        if path in inventory:
+            _fail(f"source manifest contains duplicate file inventory path: {path}")
+        size = raw.get("size")
+        mode = raw.get("mode")
+        digest = raw.get("sha256")
+        if raw.get("type") != "file" or type(size) is not int or size < 0 or not isinstance(mode, str):
+            _fail(f"source manifest file inventory metadata is invalid: {path}")
+        if mode not in {"100644", "100755"} or not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            _fail(f"source manifest file inventory metadata is invalid: {path}")
+        inventory[path] = {"size": size, "mode": mode, "sha256": digest}
+    return inventory
+
+
+def _remove_generated_build_output(workspace: Path) -> None:
+    """Remove only the owned generated tree before source inventorying.
+
+    Make publishes package files and native-library aliases below ``.fullmag``.
+    Those aliases are build output, not source inputs.  The owned-tree remover
+    unlinks aliases without following them and rejects special files.
+    """
+
+    generated = workspace / ".fullmag"
+    if generated.exists() or generated.is_symlink():
+        _remove_owned_tree(generated)
+
+
+def _stage_tree_inventory(stage: Path) -> tuple[set[str], set[str]]:
+    """Inventory the already verified extraction and reject links/specials."""
+
+    files: set[str] = set()
+    directories: set[str] = set()
+
+    def visit(directory: Path, relative: PurePosixPath) -> None:
+        try:
+            children = tuple(directory.iterdir())
+        except OSError as error:
+            _fail(f"cannot inspect extracted source {directory}: {error}")
+        for child in children:
+            metadata = child.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or bool(
+                getattr(metadata, "st_file_attributes", 0) & 0x400
+            ):
+                _fail(f"extracted source contains a link or reparse point: {child}")
+            child_relative = relative / child.name
+            key = child_relative.as_posix()
+            if child_relative.parts[0] in PERSISTENT_WORKSPACE_DIRS:
+                _fail(f"extracted source attempts to replace persistent mount: {key}")
+            if stat.S_ISDIR(metadata.st_mode):
+                directories.add(key)
+                visit(child, child_relative)
+            elif stat.S_ISREG(metadata.st_mode):
+                files.add(key)
+            else:
+                _fail(f"extracted source contains a special file: {child}")
+
+    visit(stage, PurePosixPath())
+    return files, directories
+
+
+def _remove_workspace_relative_entries(
+    workspace: Path, files: Mapping[str, Path], directories: set[str]
+) -> None:
+    """Remove an already validated owned tree, never persistent mounts."""
+
+    for relative in sorted(files, key=lambda value: (value.count("/"), value), reverse=True):
+        path = workspace.joinpath(*PurePosixPath(relative).parts)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            _fail(f"backend workspace entry changed while removing {path}")
+        path.unlink()
+    for relative in sorted(directories, key=lambda value: (value.count("/"), value), reverse=True):
+        path = workspace.joinpath(*PurePosixPath(relative).parts)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            _fail(f"backend workspace directory changed while removing {path}")
+        try:
+            path.rmdir()
+        except OSError as error:
+            _fail(f"cannot remove stale backend workspace directory {path}: {error}")
+
+
+def _replace_workspace_file(source: Path, target: Path, source_mode: int) -> None:
+    parent = target.parent
+    _ensure_directory(parent, f"backend workspace source directory {parent}")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=parent)
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        temporary.unlink()
+        _copy_regular_file(source, temporary, source_mode, "materialized source")
+        os.replace(temporary, target)
+    except OSError as error:
+        _fail(f"cannot publish reconciled source file {target}: {error}")
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            _fail(f"cannot remove temporary source file {temporary}: {error}")
+
+
+def _reconcile_source_tree(
+    stage: Path,
+    workspace: Path,
+    capsule: Mapping[str, Any],
+    archive_hash: str,
+) -> None:
+    """Reconcile verified capsule bytes while preserving unchanged mtimes."""
+
+    expected = _source_manifest_inventory(capsule)
+    stage_files, _ = _stage_tree_inventory(stage)
+    if stage_files != set(expected):
+        _fail("extracted source inventory differs from the source manifest")
+    _remove_generated_build_output(workspace)
+    existing_files, existing_directories = _workspace_tree_inventory(workspace)
+    expected_directories: set[str] = set()
+    for relative in expected:
+        parts = PurePosixPath(relative).parts
+        expected_directories.update(
+            PurePosixPath(*parts[:index]).as_posix() for index in range(1, len(parts))
+        )
+    if set(expected) & existing_directories:
+        _fail("source file-to-directory transition requires a fresh workspace")
+    if expected_directories & set(existing_files):
+        _fail("source directory-to-file transition requires a fresh workspace")
+
+    marker_path = workspace / OWNER_MARKER
+    marker, _ = _read_json(marker_path, "backend workspace owner", 16 * 1024)
+    old_digest = marker.get("source_digest")
+    new_digest = capsule.get("source_digest")
+    if not isinstance(new_digest, str) or not SHA256_RE.fullmatch(new_digest):
+        _fail("source manifest digest is invalid")
+    if old_digest is not None and (
+        not isinstance(old_digest, str) or not SHA256_RE.fullmatch(old_digest)
+    ):
+        _fail("backend workspace owner source digest is invalid")
+    inventory_schema = marker.get("workspace_inventory_schema")
+    inventory_hash = marker.get("workspace_inventory_sha256")
+    if inventory_schema is None and inventory_hash is None:
+        has_inventory = False
+    elif (
+        inventory_schema == WORKSPACE_INVENTORY_SCHEMA
+        and isinstance(inventory_hash, str)
+        and SHA256_RE.fullmatch(inventory_hash)
+        and inventory_hash == old_digest
+    ):
+        has_inventory = True
+    else:
+        _fail("backend workspace owner inventory binding is invalid")
+    if old_digest != new_digest and not has_inventory:
+        # A v1 marker has no inventory. Once its ownership and all entries have
+        # been validated above, a digest change permits one clean migration.
+        _remove_workspace_relative_entries(workspace, existing_files, existing_directories)
+        existing_files = {}
+        existing_directories = set()
+
+    _write_json(
+        marker_path,
+        {
+            "schema": "fullmag.direct-compose.backend-workspace.v1",
+            "state": "preparing",
+            "source_digest": new_digest,
+            "source_tar_sha256": archive_hash,
+            "workspace_inventory_schema": WORKSPACE_INVENTORY_SCHEMA,
+            "workspace_inventory_sha256": new_digest,
+        },
+        "backend workspace owner",
+    )
+    for relative, entry in expected.items():
+        target = workspace.joinpath(*PurePosixPath(relative).parts)
+        source = stage.joinpath(*PurePosixPath(relative).parts)
+        _ensure_directory(target.parent, f"backend workspace source directory {target.parent}")
+        existing = existing_files.get(relative)
+        expected_mode = 0o755 if entry["mode"] == "100755" else 0o644
+        if existing is not None:
+            digest, metadata = _sha256_file(existing, f"backend workspace source {relative}", MAX_SOURCE_BYTES)
+            if digest == entry["sha256"] and metadata.st_size == entry["size"]:
+                if (metadata.st_mode & 0o111) != (expected_mode & 0o111):
+                    os.chmod(existing, expected_mode)
+                continue
+        _replace_workspace_file(source, target, expected_mode)
+
+    stale_files = {relative: path for relative, path in existing_files.items() if relative not in expected}
+    stale_directories = {relative for relative in existing_directories if relative not in expected_directories}
+    _remove_workspace_relative_entries(workspace, stale_files, stale_directories)
+    _write_json(
+        marker_path,
+        {
+            "schema": "fullmag.direct-compose.backend-workspace.v1",
+            "state": "ready",
+            "source_digest": new_digest,
+            "source_tar_sha256": archive_hash,
+            "workspace_inventory_schema": WORKSPACE_INVENTORY_SCHEMA,
+            "workspace_inventory_sha256": new_digest,
+        },
+        "backend workspace owner",
+    )
 
 
 def _copy_tree(source: Path, destination: Path) -> None:
@@ -437,13 +719,7 @@ def _materialize_source(source_tar: Path, manifest_path: Path, build_root: Path)
         )
         if after_manifest_bytes != manifest_bytes or after_document != document:
             _fail("source manifest changed during extraction")
-        _copy_tree(stage, workspace)
-        owner = {
-            "schema": "fullmag.direct-compose.backend-workspace.v1",
-            "source_digest": capsule["source_digest"],
-            "source_tar_sha256": archive_hash,
-        }
-        _write_json(workspace / OWNER_MARKER, owner, "backend workspace owner")
+        _reconcile_source_tree(stage, workspace, capsule, archive_hash)
         return workspace, capsule, native, manifest_hash, archive_hash
     finally:
         _remove_extracted_source(stage)
@@ -535,6 +811,7 @@ def _build_environment(workspace: Path, build_root: Path, native: Mapping[str, A
     environment.update(
         {
             "FULLMAG_WINDOWS_CONTAINER_MANAGED": "1",
+            "FULLMAG_DIRECT_COMPOSE": "1",
             "FULLMAG_RUNNER_WORKSPACE": str(workspace),
             "FULLMAG_CARGO_TARGET_DIR": "/workspace/.fullmag-build/cargo-targets/direct",
             "CARGO_TARGET_DIR": "/workspace/.fullmag-build/cargo-targets/direct",
@@ -619,7 +896,7 @@ def _copy_package(workspace: Path, output: Path) -> list[dict[str, Any]]:
     _ensure_directory(output, "backend output")
     if any(output.iterdir()):
         _fail("backend output must be empty before direct package publication")
-    stage = Path(tempfile.mkdtemp(prefix=".backend-package-", dir=output.parent))
+    stage = Path(tempfile.mkdtemp(prefix=".backend-package-", dir=output))
     try:
         _copy_package_tree(source, stage)
         records = _hash_package(stage)
@@ -693,6 +970,16 @@ def _prepare_locked(
     return_code = _run_canonical_make(command, workspace, environment, build_log)
     if return_code != 0:
         _fail(f"canonical Make target failed with exit code {return_code}")
+    return _publish_completed_build(
+        workspace, output, capsule, native, manifest_hash, archive_hash, toolchain, command
+    )
+
+
+def _publish_completed_build(
+    workspace: Path, output: Path, capsule: Mapping[str, Any], native: Mapping[str, Any],
+    manifest_hash: str, archive_hash: str, toolchain: Mapping[str, Any], command: list[str],
+) -> int:
+    """Publish verified artifacts after the canonical Make invocation succeeded."""
     records = _copy_package(workspace, output)
     receipt: dict[str, Any] = {
         "schema": RECEIPT_SCHEMA,

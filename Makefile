@@ -117,7 +117,11 @@ install-cli-static: FULLMAG_BUILD_INCREMENTAL=0
 
 install-cli install-cli-dev install-cli-static:
 	@set -e
-	python3 scripts/refresh_managed_source_mtimes.py
+	if [ "$${FULLMAG_DIRECT_COMPOSE:-0}" != "1" ]; then \
+		python3 scripts/refresh_managed_source_mtimes.py; \
+	else \
+		echo "Direct Compose source reconciliation owns source freshness; skipping managed mtime refresh."; \
+	fi
 	mkdir -p .fullmag/local
 	@set -e; \
 	cmake_bin=""; \
@@ -167,7 +171,9 @@ install-cli install-cli-dev install-cli-static:
 		echo "Installing Rust launcher with CUDA support..."; \
 		if [ "$${FULLMAG_FORCE_LOCAL_FEM_GPU:-0}" = "1" ]; then \
 			echo "FULLMAG_FORCE_LOCAL_FEM_GPU=1 selects the container-local MFEM/CUDA FEM GPU launcher; managed host export is disabled."; \
+			echo "[backend 1/3] Building CLI (FDM/FEM CPU/GPU)..."; \
 			FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_REQUIRE_GPU=1 FULLMAG_FEM_REQUIRE_CEED=1 FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli --release --features "cuda fem-gpu"; \
+			echo "[backend 2/3] Building API and workers..."; \
 			FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_REQUIRE_GPU=1 FULLMAG_FEM_REQUIRE_CEED=1 FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api --release --no-default-features --features "cuda fem-gpu"; \
 			build_mode="cuda-fem-gpu"; \
 		elif [ "$${FULLMAG_SKIP_MANAGED_FEM_GPU_EXPORT:-0}" = "1" ]; then \
@@ -230,7 +236,7 @@ install-cli install-cli-dev install-cli-static:
 			build_mode="managed-fem-gpu-host"; \
 		fi; \
 	fi; \
-	echo "Building native Python core for mesh certification..."; \
+	echo "[backend 3/3] Building native Python core for mesh certification..."; \
 	CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-py-core --release; \
 	mkdir -p .fullmag/local/lib; \
 	if [ ! -f "$$cargo_target_dir/release/lib_fullmag_core.so" ]; then \
