@@ -11,7 +11,6 @@ import io
 import importlib.util
 import json
 import os
-import runpy
 import signal
 import subprocess
 import sys
@@ -25,13 +24,25 @@ from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "docker" / "all-in-one" / "frontend_dev.py"
-HEALTHCHECK_PATH = MODULE_PATH.with_name("healthcheck.py")
+HEALTHCHECK_MODULE_PATH = MODULE_PATH.with_name("healthcheck.py")
 
 
 def load_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location("fullmag_frontend_dev_test", MODULE_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load frontend_dev.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_healthcheck_module() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "fullmag_frontend_healthcheck_test", HEALTHCHECK_MODULE_PATH
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load healthcheck.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -150,57 +161,97 @@ class FrontendDevContractTests(TestCase):
         self.assertFalse(self.module.enabled({}))
         self.assertEqual(self.module.EXPECTED_PNPM_VERSION, "10.8.1")
 
-    def test_frontend_healthcheck_requires_workspace_2xx_without_redirect(self):
-        import urllib.error
-        import urllib.request
+    def test_frontend_healthcheck_requires_owned_receipt_process_and_tcp(self):
+        healthcheck = load_healthcheck_module()
+        with tempfile.TemporaryDirectory(prefix="fullmag-frontend-health-") as raw:
+            root = Path(raw)
+            proc_root = root / "proc"
+            pid = 4242
+            process_root = proc_root / str(pid)
+            (process_root / "ns").mkdir(parents=True)
+            (process_root / "ns" / "pid").symlink_to("pid:[4026531836]")
+            stat_fields = ["R", "1", str(pid), str(pid)] + ["0"] * 16
+            stat_fields[19] = "123"
+            (process_root / "stat").write_text(
+                f"{pid} (next-server) {' '.join(stat_fields)}\n", encoding="ascii"
+            )
+            receipt_path = root / "frontend-dev-receipt.json"
+            receipt_path.write_text(
+                json.dumps(
+                    {
+                        "schema": healthcheck.FRONTEND_RECEIPT_SCHEMA,
+                        "state": "running",
+                        "internal_port": healthcheck.FRONTEND_INTERNAL_PORT,
+                        "owner_token": "owner-token",
+                        "process_identity_schema": "linux-proc-v1",
+                        "pid": pid,
+                        "pid_namespace": "pid:[4026531836]",
+                        "process_start_time_ticks": 123,
+                        "session_id": pid,
+                        "process_group_id": pid,
+                    }
+                ),
+                encoding="utf-8",
+            )
 
-        class Response:
-            def __init__(self, status):
-                self.status = status
+            class FakeSocket:
+                def __enter__(self):
+                    return self
 
-            def __enter__(self):
-                return self
+                def __exit__(self, *_args):
+                    return False
 
-            def __exit__(self, *_args):
-                return False
+            with patch.object(
+                healthcheck.socket, "create_connection", return_value=FakeSocket()
+            ) as connect:
+                healthcheck._check_frontend_dev_liveness(
+                    receipt_path=receipt_path,
+                    proc_root=proc_root,
+                )
+            connect.assert_called_once_with(("127.0.0.1", 8080), timeout=0.5)
 
-        class Opener:
-            def __init__(self, status):
-                self.status = status
-                self.requests = []
+            stale_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            stale_receipt["process_start_time_ticks"] = 124
+            receipt_path.write_text(json.dumps(stale_receipt), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "identity does not match"):
+                healthcheck._check_frontend_dev_liveness(
+                    receipt_path=receipt_path,
+                    proc_root=proc_root,
+                )
 
-            def open(self, request, timeout):
-                self.requests.append((request, timeout))
-                if self.status != 200:
-                    raise urllib.error.HTTPError(
-                        request.full_url,
-                        self.status,
-                        "mock healthcheck response",
-                        {},
-                        None,
+            stale_receipt["process_start_time_ticks"] = 123
+            stale_receipt["state"] = "starting"
+            receipt_path.write_text(json.dumps(stale_receipt), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "not running"):
+                healthcheck._check_frontend_dev_liveness(
+                    receipt_path=receipt_path,
+                    proc_root=proc_root,
+                )
+
+            stale_receipt["state"] = "running"
+            receipt_path.write_text(json.dumps(stale_receipt), encoding="utf-8")
+            with patch.object(
+                healthcheck.socket,
+                "create_connection",
+                side_effect=OSError("connection refused"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "TCP liveness failed"):
+                    healthcheck._check_frontend_dev_liveness(
+                        receipt_path=receipt_path,
+                        proc_root=proc_root,
                     )
-                return Response(self.status)
 
-        for status in (200, 307, 500):
-            with self.subTest(status=status):
-                opener = Opener(status)
-                with patch.dict(
-                    os.environ,
-                    {"FULLMAG_DOCKER_ROLE": "frontend", "FULLMAG_DOCKER_FRONTEND": "dev"},
-                    clear=False,
-                ):
-                    with patch.object(urllib.request, "build_opener", return_value=opener):
-                        if status == 200:
-                            runpy.run_path(str(HEALTHCHECK_PATH), run_name="__main__")
-                        else:
-                            with self.assertRaises(urllib.error.HTTPError) as raised:
-                                runpy.run_path(str(HEALTHCHECK_PATH), run_name="__main__")
-                            self.assertEqual(raised.exception.code, status)
-                self.assertEqual(len(opener.requests), 1)
-                request, timeout = opener.requests[0]
-                self.assertEqual(request.full_url, "http://127.0.0.1:8080/workspace")
-                self.assertEqual(request.method, "HEAD")
-                self.assertEqual(timeout, 2)
+            with patch.dict(
+                os.environ,
+                {"FULLMAG_DOCKER_ROLE": "frontend", "FULLMAG_DOCKER_FRONTEND": "dev"},
+                clear=False,
+            ), patch.object(healthcheck, "_check_frontend_dev_liveness") as check, patch.object(
+                healthcheck.urllib.request,
+                "urlopen",
+                side_effect=AssertionError("frontend healthcheck must not use HTTP"),
+            ):
+                healthcheck._run()
+            check.assert_called_once_with()
 
     def test_tool_version_logs_bounded_success_with_elapsed_time(self):
         log_stream = io.BytesIO()
