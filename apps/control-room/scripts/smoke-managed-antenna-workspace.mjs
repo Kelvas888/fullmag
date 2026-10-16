@@ -71,7 +71,8 @@ try {
       else writes.push(record);
     }
   });
-  const screenshot = async name => { const path = resolve(reportRoot, `${name}.png`); await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
+  const checkpoint = name => console.log(JSON.stringify({ checkpoint: name, elapsedMs: Date.now() - Date.parse(startedAt) }));
+  const screenshot = async name => { const path = resolve(reportRoot, `${name}.png`); await page.screenshot({ path, fullPage: true, animations: "disabled" }); screenshots.push(path); checkpoint(name); };
   await page.goto(workspace.href, { waitUntil: "domcontentloaded", timeout: 90_000 });
   await page.getByText("Managed antenna workspace authoring", { exact: true }).first().waitFor();
   await page.locator('[data-node-id="model:objects"]').waitFor({ state: "visible" });
@@ -993,6 +994,88 @@ try {
   await waitScene(s => s.solved_antenna_drives.find(item => item.id === drive.id)?.name === "Applied through related navigation");
   await selectNode(`model:object:${objectId}:antenna:drive:${encodeURIComponent(drive.id)}`);
   checks.push({ name: "Apply with an unchanged related binding commits the draft and continues to the canonical Projection after its real ACK", passed: true });
+  const beforeExplorerWrites = writes.length;
+  const explorerPanel = page.locator(".fm-explorer");
+  const originalExplorerWidth = (await explorerPanel.boundingBox()).width;
+  const resizeExplorer = async width => {
+    const handle = page.getByRole("separator", { name: "Resize workspace panels", exact: true }).first();
+    const bounds = await handle.boundingBox(), current = await explorerPanel.boundingBox();
+    await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + Math.min(bounds.height / 2, 100));
+    await page.mouse.down(); await page.mouse.move(bounds.x + bounds.width / 2 + width - current.width, bounds.y + Math.min(bounds.height / 2, 100), { steps: 6 }); await page.mouse.up();
+    await page.waitForFunction(expected => Math.abs(document.querySelector(".fm-explorer").getBoundingClientRect().width - expected) < 2, width);
+  };
+  const explorerCases = [];
+  for (const theme of ["dark", "light"]) {
+    if (await page.locator("html").getAttribute("data-theme") !== theme) { await publicCommand("Toggle Theme"); await page.waitForFunction(expected => document.documentElement.dataset.theme === expected, theme); }
+    for (const width of [280, 319, 320, 366, 480, 481]) {
+      await resizeExplorer(width);
+      const metrics = await explorerPanel.evaluate(root => {
+        const tree = root.querySelector('[role="tree"]');
+        return { width: root.getBoundingClientRect().width, overflow: tree.scrollWidth > tree.clientWidth + 1,
+          rows: [...tree.querySelectorAll('[role="treeitem"]')].map(row => {
+            const label = row.querySelector('.fm-explorer-tree-row__label'), meta = row.querySelector('.fm-explorer-tree-row__metadata');
+            return { name: label.textContent, labelWidth: label.clientWidth, labelScrollWidth: label.scrollWidth, height: row.getBoundingClientRect().height,
+              overlap: label.getBoundingClientRect().right > meta.getBoundingClientRect().left + 1,
+              metaInside: meta.getBoundingClientRect().right <= tree.getBoundingClientRect().right + 1,
+              statusIcon: row.querySelector('.fm-explorer-tree-row__status-icon')?.getBoundingClientRect().width ?? null };
+          }) };
+      });
+      assert.equal(metrics.overflow, false);
+      for (const row of metrics.rows) { assert.equal(row.height, 28); assert.equal(row.overlap, false); assert.ok(row.metaInside); if (row.statusIcon !== null) assert.ok(row.statusIcon > 0); }
+      for (const label of ["Field solve 1", "Field solve 2", "Port 1", "Port 2"]) {
+        const row = metrics.rows.find(row => row.name === label); assert.ok(row, label); assert.ok(row.labelWidth >= row.labelScrollWidth, `${label} is clipped at ${width}px`);
+      }
+      explorerCases.push({ theme, width, ...metrics });
+      if (width === 366) await screenshot(`27-readable-explorer-${theme}`);
+    }
+  }
+  await resizeExplorer(280);
+  const sourceSolveNode = page.locator(`[data-node-id="model:object:${objectId}:antenna:solution:${encodeURIComponent(stage.id)}"]`);
+  await page.mouse.move(700, 200);
+  await sourceSolveNode.focus();
+  const nodeTooltip = page.getByRole("tooltip").filter({ hasText: "Field solve 1" });
+  await nodeTooltip.waitFor();
+  assert.ok((await nodeTooltip.innerText()).includes(stage.id));
+  const accessibleDescription = await sourceSolveNode.evaluate(row => (row.getAttribute("aria-describedby") ?? "").split(/\s+/).map(id => document.getElementById(id)?.textContent ?? "").join(" "));
+  assert.ok(accessibleDescription.includes(stage.id));
+  assert.equal(await sourceSolveNode.getAttribute("aria-label"), "Field solve 1");
+  assert.equal(await driveNode.getAttribute("aria-selected"), "true", "Keyboard focus tooltip cannot change selection");
+  await screenshot("28-explorer-keyboard-description");
+  await sourceSolveNode.press("Escape"); await nodeTooltip.waitFor({ state: "hidden" });
+  const nextNodeId = await sourceSolveNode.evaluate(row => { const rows = [...row.closest('[role="tree"]').querySelectorAll('[role="treeitem"]')]; return rows[rows.indexOf(row) + 1].dataset.nodeId; });
+  await sourceSolveNode.press("ArrowDown");
+  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("data-node-id")), nextNodeId);
+  await page.keyboard.press("Enter");
+  assert.equal(await page.locator(`[data-node-id="${nextNodeId}"]`).getAttribute("aria-selected"), "true");
+  await selectNode(`model:object:${objectId}:antenna:drive:${encodeURIComponent(drive.id)}`);
+  // Clicking dismisses Radix tooltips until a genuine pointer leave/re-entry.
+  await page.mouse.move(700, 200);
+  await driveNode.hover();
+  const driveTooltip = page.getByRole("tooltip").filter({ hasText: "Applied through related navigation" });
+  await driveTooltip.waitFor(); assert.ok((await driveTooltip.innerText()).includes(drive.id));
+  checkpoint("explorer-pointer-description");
+  await page.mouse.move(700, 200); await driveNode.press("Escape");
+  const antennaRoot = page.locator(`[data-node-id="model:object:${objectId}"]`);
+  const branch = antennaRoot.locator(".fm-explorer-tree-row__branch svg");
+  await branch.click();
+  await page.waitForFunction(id => document.querySelector(`[data-node-id="${id}"]`)?.getAttribute("aria-expanded") === "false", `model:object:${objectId}`);
+  for (const theme of ["dark", "light"]) {
+    await publicCommand("Toggle Theme");
+    await page.waitForFunction(expected => document.documentElement.dataset.theme === expected, theme);
+    assert.equal(await antennaRoot.getAttribute("aria-expanded"), "false", "Resource/presentation renders cannot reopen an explicitly collapsed selected path");
+  }
+  checkpoint("explorer-collapse-preserved-through-renders");
+  await branch.click();
+  await page.waitForFunction(id => document.querySelector(`[data-node-id="${id}"]`)?.getAttribute("aria-expanded") === "true", `model:object:${objectId}`);
+  assert.equal(await driveNode.getAttribute("aria-selected"), "true", "Branch SVG toggling must preserve selection");
+  await sourceSolveNode.click({ button: "right" }); await page.getByRole("menu").waitFor();
+  assert.equal(await driveNode.getAttribute("aria-selected"), "true");
+  await page.keyboard.press("Escape");
+  checkpoint("explorer-context-menu");
+  await resizeExplorer(originalExplorerWidth);
+  await publicCommand("Toggle Theme"); await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
+  assert.equal(writes.length, beforeExplorerWrites, "Resizing, descriptions, keyboard selection and menus must not write the model");
+  checks.push({ name: "Explorer prioritizes resource names in twelve real dock/theme layouts, keeps exact 28px rows and status shapes, exposes full keyboard/mouse descriptions, and preserves selection/branch/context-menu behavior without model writes", passed: true, cases: explorerCases });
   const webgl = await page.locator("canvas").evaluateAll(canvases => canvases.map(canvas => {
     const bounds = canvas.getBoundingClientRect(); if (!bounds.width || !bounds.height) return null;
     const gl = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
@@ -1025,7 +1108,8 @@ try {
   const nextOwner = replacementStatus.session;
   scope = `session=${encodeURIComponent(nextOwner.session_id)}&epoch=${encodeURIComponent(nextOwner.session_epoch)}&request_scope_epoch=${encodeURIComponent(nextOwner.request_scope_epoch)}`;
   assert.notEqual(scope, previousScope);
-  await page.getByText("Managed transition replacement", { exact: true }).first().waitFor({ timeout: 60_000 });
+  await page.locator(".fm-header__subtitle:visible").filter({ hasText: /^Managed transition replacement$/ }).waitFor({ timeout: 60_000 });
+  checkpoint("session-transition-visible-header");
   await dirtyGuard.waitFor({ state: "hidden" });
   assert.equal(await page.locator(`[data-node-id="model:object:${objectId}"]`).count(), 0);
   assert.equal(await driveEditor.count(), 0);

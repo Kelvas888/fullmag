@@ -139,6 +139,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
         api_target = managed_browser_target(repo, os.environ.get("FULLMAG_MANAGED_BROWSER_RECEIPT", ""),
             os.environ.get("FULLMAG_MANAGED_BROWSER_RECEIPT_SHA256"), require_fresh=True)
     smoke_name, receipt_schema, fixture_route, report_prefix = SCENARIOS[scenario]
+    browser_timeout_seconds = 360 if scenario == "antenna-workspace-authoring" else 240
     layout = storage.resolve_layout(repo, PROFILE)
     storage.initialize(layout)
     app = repo / "apps/control-room"
@@ -174,6 +175,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
             "managed_api_target": api_target,
             "unit_tests": "not_compiled_not_run", "port": port,
             "browser_channel": BROWSER_CHANNEL or "playwright_chromium",
+            "browser_timeout_seconds": browser_timeout_seconds,
         }
         storage.atomic_json(receipt_path, receipt)
         process = None
@@ -275,7 +277,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                 with (run_root / "browser.log").open("w", encoding="utf-8") as browser_log:
                     fixture_smoke = fixture_app / "scripts" / smoke.name
                     result = subprocess.run([node, str(fixture_smoke)], cwd=fixture_app, env=env,
-                                            stdout=browser_log, stderr=subprocess.STDOUT, timeout=240)
+                                            stdout=browser_log, stderr=subprocess.STDOUT, timeout=browser_timeout_seconds)
                 receipt["exit_code"] = result.returncode
                 receipt["state"] = "passed" if result.returncode == 0 else "failed"
         except BaseException as error:

@@ -244,15 +244,15 @@ try {
     assert.equal(await configured.getAttribute("aria-describedby"), await configured.locator(".fm-explorer-tree-row__description").getAttribute("id"));
     assert.equal(await configured.getAttribute("data-status"), "ready");
     assert.match(await description(configured), /qualification still require execution/);
-    assert.match(await configured.getAttribute("title"), /qualification still require execution/);
     assert.match(await configured.locator(".fm-explorer-tree-row__badge").innerText(), /configured/);
     assert.equal(await broken.getAttribute("data-status"), "warning");
-    assert.equal(await broken.locator(".fm-explorer-tree-row__status").innerText(), "Needs review");
+    assert.equal(await broken.locator(".fm-explorer-tree-row__status").textContent(), "Needs review");
     assert.match(await description(broken), /missing-transport.*missing or ambiguous/);
     assert.equal(await solve.getAttribute("data-status"), "validation-blocked");
-    assert.equal(await solve.locator(".fm-explorer-tree-row__status").innerText(), "Blocked");
-    assert.match(await solve.getAttribute("title"), /missing current transport/);
-    assert.equal(await row("spectrum:source-k").locator(".fm-explorer-tree-row__label").innerText(), "Source spectrum source-k");
+    assert.equal(await solve.locator(".fm-explorer-tree-row__status").textContent(), "Blocked");
+    assert.match(await description(solve), /missing current transport/);
+    assert.equal(await row("spectrum:source-k").locator(".fm-explorer-tree-row__label").innerText(), "Source spectrum 1");
+    assert.match(await description(row("spectrum:source-k")), /Spectrum request ID: source-k/);
     assert.match(await description(row("spectrum:source-k")), /not a measured magnetization response/);
     await solve.scrollIntoViewIfNeeded();
     await capture("explorer-antenna-readiness.png");
@@ -265,7 +265,7 @@ try {
       await row.waitFor();
       assert.equal(await row.getAttribute("data-status"), status);
       assert.equal(await row.locator(".fm-explorer-tree-row__badge").innerText(), badge);
-      assert.match(await row.getAttribute("title"), objectId === "legacy" ? /migrate it explicitly/ : /does not solve conductor current/);
+      assert.match(await row.locator(".fm-explorer-tree-row__description").textContent(), objectId === "legacy" ? /migrate it explicitly/ : /does not solve conductor current/);
     }
     await capture("explorer-explicit-regional-sources.png");
   });
