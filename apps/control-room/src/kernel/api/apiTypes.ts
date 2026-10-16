@@ -59,12 +59,19 @@ export type QuantityCatalogResource = Omit<components["schemas"]["QuantityCatalo
   quantities: (components["schemas"]["QuantityCatalogEntry"] & { tensor?: QuantityTensorDescriptor | null })[];
 };
 export interface FieldAvailabilityQuery {
+  stage_id?: string | null;
+  carrier_id?: string | null;
+  expected_carrier_revision?: string | null;
+  view?: string | null;
   target_id?: string | null;
   scope_kind?: string | null;
   scope_id?: string | null;
   owner_object_id?: string | null;
 }
 export interface FieldMetaQuery {
+  carrier_id?: string | null;
+  expected_carrier_revision?: string | null;
+  view?: string | null;
   component?: string | null;
   owner_object_id?: string | null;
   scope_id?: string | null;
@@ -86,7 +93,15 @@ export type FieldStateInspectResponse =
   components["schemas"]["FieldStateInspectResponse"];
 export type FieldStateTargetRef =
   components["schemas"]["FieldStateTargetRef"];
-export type FieldVectorQuery = components["schemas"]["FieldVectorQuery"];
+export type FieldVectorQuery = components["schemas"]["FieldVectorQuery"] & {
+  carrier_id?: string | null;
+};
+/** Existing provider-owned geometry selector; generated schema follows runtime export. */
+export interface ArtifactCarrierGeometryQuery {
+  carrier_id: string;
+  stage_id?: string;
+  expected_carrier_revision: string;
+}
 export type FieldVectorPendingResponse =
   components["schemas"]["FieldVectorPendingResponse"];
 type FdmFieldVectorQueryBase = Omit<
@@ -1031,6 +1046,9 @@ export interface FieldVectorIdentityIssue {
 }
 
 export interface FieldVectorResponseMetadata {
+  carrierId?: string | null;
+  carrierRevision?: string | null;
+  carrierDigest?: string | null;
   component: string | null;
   domainGenerationId: string | null;
   artifactGenerationId?: string | null;
