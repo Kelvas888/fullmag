@@ -1,3 +1,4 @@
+import { objectMeshPolicyWireRequest } from "./objectMeshPolicyWire";
 import { API_INSTANCE_HEADER, isApiInstanceId, resolveApiInstancePin } from "./apiInstancePin";
 import {
   ANALYSIS_FREQUENCY_DOMAIN_MANIFEST_V1_PATH,
@@ -2279,7 +2280,7 @@ export class ControlRoomApi {
     ) =>
       this.putJson<MeshObjectConfigResource, MeshObjectConfigReplaceRequest>(
         MESHING_OBJECT_POLICY_PATH,
-        request,
+        objectMeshPolicyWireRequest(request),
         options,
         {
           path: { object_id: objectId },

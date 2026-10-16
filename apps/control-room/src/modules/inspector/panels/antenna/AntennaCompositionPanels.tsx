@@ -10,6 +10,8 @@ import {
   useAntennaStageOutputCatalogResource,
   useAntennaSourceSpectrumResource,
 } from "@/kernel/resources/antennaResources";
+import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
+import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { useSceneResource } from "@/kernel/resources/geometryLifecycleResources";
 
 import type { InspectorPanelProps } from "../../inspectorTypes";
@@ -866,7 +868,8 @@ export function AntennaCompositionPanel({
   kind,
   selection,
 }: InspectorPanelProps & { kind: AntennaCompositionKind }) {
-  const { selection: selectionController } = useKernel();
+  const { selection: selectionController, commands } = useKernel();
+  const scope = sessionRequestScopeKey(useSessionResourceIdentity());
   const scene = useSceneResource();
   const objectId = selectedObjectId(selection);
   const resourceId = selectedResourceId(selection);
@@ -940,6 +943,15 @@ export function AntennaCompositionPanel({
           selectionController.set({ kind: "object.antenna.geometry", objectId, nodeId, label: "Geometry",
             ref: { type: "scene-object", kind: "object.antenna.geometry", objectId, nodeId, visualizationTargetId: `object:${objectId}` } }, "inspector");
         }}>Open Geometry</Button>
+        <InspectorGroup title="Conductor mesh" badge="policy and build evidence">
+          <p className="fm-inspector-hint">Configure object sizing and inspect build reports in Mesh. Saving a policy does not build a mesh; antenna field solutions carry their own mesh and source identity.</p>
+          <Button type="button" disabled={!scope || scene.sessionScopeKey !== scope || (scene.data?.objects?.filter(object => object.id === objectId).length ?? 0) !== 1} onClick={() => {
+            if (!scope || commands.getSessionScopeKey() !== scope || scene.sessionScopeKey !== scope) return;
+            const nodeId = `model:object:${objectId}:mesh`;
+            selectionController.set({ kind: "object.mesh", objectId, nodeId, label: "Mesh",
+              ref: { type: "scene-object", kind: "object.mesh", objectId, nodeId, visualizationTargetId: `object:${objectId}` } }, "inspector");
+          }}>Open Mesh Policy</Button>
+        </InspectorGroup>
       </> : null}
       {kind === "port" && objectId && resourceId ? <AntennaPortEditor objectId={objectId} portId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "solution" && objectId && resourceId ? <AntennaSolveTargetsEditor key={`targets:${objectId}:${resourceId}`} objectId={objectId} stageId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}

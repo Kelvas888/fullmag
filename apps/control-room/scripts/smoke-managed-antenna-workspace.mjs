@@ -173,6 +173,67 @@ try {
   assert.deepEqual({ ...stability, samples: 0 }, { root: true, focus: true, scroll: true, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 });
   await screenshot("06-conductor-conductivity-committed");
   checks.push({ name: "Conductor atomically updates layout and charge conductivity while preserving source, solver, port, focus, scroll and input stability", passed: true, stability });
+  const beforeMeshWrites = writes.length;
+  const meshNode = page.locator(`[data-node-id="model:object:${objectId}:mesh"]`);
+  await meshNode.waitFor({ state: "visible" });
+  await page.getByRole("button", { name: "Open Mesh Policy", exact: true }).click();
+  const meshPolicy = page.locator('[data-mesh-policy-draft="object"]');
+  await meshPolicy.getByRole("checkbox", { name: "Use object policy", exact: true }).waitFor();
+  assert.equal(writes.length, beforeMeshWrites, "Opening mesh policy must not build or write");
+  await meshPolicy.getByRole("checkbox", { name: "Use object policy", exact: true }).check();
+  const maximumSize = meshPolicy.getByRole("textbox", { name: "Maximum element size", exact: true });
+  await maximumSize.fill("2e-8");
+  await maximumSize.focus();
+  await page.evaluate(() => {
+    const root = document.querySelector('[data-mesh-policy-draft="object"]'), input = document.activeElement, scroll = root.closest(".fm-inspector__body");
+    const controls = [...root.querySelectorAll("input")].map(element => ({ element, disabled: element.disabled, opacity: getComputedStyle(element).opacity }));
+    const proof = { root, input, scroll, scrollTop: scroll.scrollTop, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 };
+    const sample = () => {
+      proof.samples++;
+      if (document.querySelector('[data-mesh-policy-draft="object"]') !== root) proof.rootChanges++;
+      for (const saved of controls) {
+        if (!saved.element.isConnected) proof.controlChanges++;
+        if (saved.element.disabled !== saved.disabled) proof.disabledChanges++;
+        if (getComputedStyle(saved.element).opacity !== saved.opacity) proof.opacityChanges++;
+      }
+      proof.opacityAnimations += root.getAnimations({ subtree: true }).filter(animation => (animation.playState === "running" || animation.pending) && animation.effect?.getKeyframes().some(frame => "opacity" in frame)).length;
+    };
+    const observer = new MutationObserver(sample); observer.observe(root, { attributes: true, childList: true, subtree: true });
+    sample(); window.__antennaMeshPolicyProof = { proof, observer, sample };
+  });
+  const applyPolicy = meshPolicy.getByRole("button", { name: "Apply Policy", exact: true });
+  assert.equal(await applyPolicy.isEnabled(), true, await meshPolicy.innerText());
+  await applyPolicy.evaluate(button => button.click());
+  await meshPolicy.getByText("Policy saved. Current solver mesh is stale until a mesh build completes.", { exact: true }).waitFor();
+  const meshScene = await waitScene(s => s.objects.find(o => o.id === objectId)?.object_mesh?.maximum_element_size === "2e-8");
+  const meshWrites = writes.slice(beforeMeshWrites);
+  assert.equal(meshWrites.length, 1); assert.equal(meshWrites[0].method, "PUT");
+  assert.ok(meshWrites[0].path.includes(encodeURIComponent(objectId)));
+  const policyRead = await json(await context.request.get(`${target.api_base}${meshWrites[0].path}`, { headers: headers() }));
+  assert.equal(policyRead.object_id, objectId); assert.equal(policyRead.config.maximum_element_size, "2e-8"); assert.equal(policyRead.config.mode, "custom");
+  assert.deepEqual(meshScene.current_transports, materialScene.current_transports);
+  assert.deepEqual(meshScene.antenna_port_modes, materialScene.antenna_port_modes);
+  const meshObject = meshScene.objects.find(o => o.id === objectId), beforeMeshObject = materialScene.objects.find(o => o.id === objectId);
+  assert.deepEqual(meshObject.geometry, beforeMeshObject.geometry); assert.deepEqual(meshObject.transform, beforeMeshObject.transform);
+  assert.equal(meshObject.magnetization_ref ?? null, beforeMeshObject.magnetization_ref ?? null);
+  const meshStability = await page.evaluate(() => {
+    const { proof, observer, sample } = window.__antennaMeshPolicyProof; sample(); observer.disconnect();
+    return { root: proof.root.isConnected, focus: document.activeElement === proof.input, scroll: proof.scroll.scrollTop === proof.scrollTop,
+      rootChanges: proof.rootChanges, controlChanges: proof.controlChanges, disabledChanges: proof.disabledChanges, opacityChanges: proof.opacityChanges, opacityAnimations: proof.opacityAnimations, samples: proof.samples };
+  });
+  assert.ok(meshStability.samples > 1 && meshStability.samples < 100);
+  assert.deepEqual({ ...meshStability, samples: 0 }, { root: true, focus: true, scroll: true, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 });
+  for (const label of ["Report state", "Quality state"]) {
+    await meshPolicy.getByText(label, { exact: true }).locator("..").getByText("not published", { exact: true }).waitFor();
+  }
+  await screenshot("07-antenna-object-mesh-policy");
+  await selectNode(`model:object:${objectId}:antenna:conductor`);
+  await page.locator('[data-inspector-owner="object.antenna.conductor"]').getByText("authored", { exact: true }).waitFor();
+  await selectNode(`model:object:${objectId}:mesh`);
+  await meshPolicy.getByRole("checkbox", { name: "Use object policy", exact: true }).waitFor();
+  assert.equal(await maximumSize.inputValue(), "2e-8");
+  checks.push({ name: "Antenna Mesh node and Conductor link use the canonical object policy, save 20 nm without building, and retain source physics and Inspector stability", passed: true, stability: meshStability });
+
 
   await page.getByTitle("Expand All").click();
   await selectNode(`model:object:${objectId}:antenna:solution:${encodeURIComponent(stage.id)}`);
