@@ -27,6 +27,7 @@ use fullmag_session::{
 };
 
 const NVIDIA_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
+const NVIDIA_NVML_SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
 const NVIDIA_MEMORY_MIB: u64 = 1024 * 1024;
 
 /// Collect one bounded host sample and assign its durable revisions from the
@@ -1603,17 +1604,38 @@ fn discover_nvidia_gpus() -> Result<Vec<GpuDeviceSnapshot>> {
     };
     let stdout = String::from_utf8(output).context("nvidia-smi output is not UTF-8")?;
     let mut devices = parse_nvidia_smi_output(&stdout, includes_mig_mode)?;
+    // NVML is a separate, bounded evidence path. Do not spend the remaining
+    // nvidia-smi budget on a child probe: a slow SMI query must not turn a
+    // valid physical GPU into an unobserved partition.
+    let nvml_deadline = Instant::now() + NVIDIA_NVML_SAMPLE_TIMEOUT;
     for device in &mut devices {
         if matches!(
             &device.partition,
             Reported::Available {
                 value: GpuPartition::Unknown
             }
-        ) && crate::nvml_gpu_partition::full_device_probe(&device.uuid, deadline) == Some(true)
-        {
-            device.partition = Reported::Available {
-                value: GpuPartition::FullDevice,
-            };
+        ) {
+            let report = crate::nvml_gpu_partition::full_device_probe_until(
+                &device.uuid,
+                nvml_deadline,
+            );
+            match report.outcome {
+                crate::nvml_gpu_partition::FullDeviceProbeOutcome::FullDevice => {
+                    device.partition = Reported::Available {
+                        value: GpuPartition::FullDevice,
+                    };
+                }
+                crate::nvml_gpu_partition::FullDeviceProbeOutcome::NotFullDevice => {}
+                crate::nvml_gpu_partition::FullDeviceProbeOutcome::Inconclusive(reason) => {
+                    eprintln!(
+                        "[fullmag-runtime-control] NVML GPU partition probe inconclusive: uuid={} reason={} attempts={} timed_out={}",
+                        device.uuid,
+                        reason.as_str(),
+                        report.attempts,
+                        report.timed_out,
+                    );
+                }
+            }
         }
     }
     Ok(devices)

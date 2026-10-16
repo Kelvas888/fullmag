@@ -107,6 +107,27 @@ async fn publish_compute_node_sample(
                 &snapshot,
                 expected_generation.as_deref(),
             )
+        })
+        .with_context(|| {
+            // Retain the observed identity when publication rejects a sample;
+            // the rejected snapshot is deliberately never written to the CAS.
+            let gpu_inventory = snapshot.gpus.known_value().map(|devices| {
+                devices.iter().map(|gpu| serde_json::json!({
+                    "uuid": gpu.uuid,
+                    "pci_id": gpu.pci_id.known_value(),
+                    "partition": gpu.partition.known_value(),
+                    "topology": gpu.topology.known_value(),
+                })).collect::<Vec<_>>()
+            });
+            format!(
+                "compute-node sample rejected: observed_inventory={}, expected_inventory={}, cpu_topology_matches_previous={:?}, allowed_cpu_ids={:?}, cpu_quota={:?}, gpu_inventory={}",
+                snapshot.inventory_sha256,
+                ledger.policy().topology_sha256,
+                previous.as_ref().map(|old| old.cpu.topology.known_value() == snapshot.cpu.topology.known_value()),
+                snapshot.cpu.os_constraints.allowed_logical_cpu_ids.known_value(),
+                snapshot.cpu.os_constraints.quota.known_value(),
+                serde_json::json!(gpu_inventory),
+            )
         })?;
         Ok(Some(inventory_owner))
     })

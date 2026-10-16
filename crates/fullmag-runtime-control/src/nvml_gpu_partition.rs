@@ -9,7 +9,7 @@
 //! interpreter, loader, and status failures remain inconclusive so callers
 //! keep the fail-closed `Unknown` state.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NvmlMigMode {
@@ -29,19 +29,138 @@ enum NvmlVirtualizationMode {
     Unknown,
 }
 
-/// Return `Some(true)` only for a complete physical-device proof, `Some(false)`
-/// when NVML positively identifies a non-full device, and `None` when the
-/// evidence is unavailable or incomplete. The latter is deliberately not an
-/// error: generic host telemetry must remain usable while strict GPU readiness
-/// rejects an unresolved partition.
-pub(crate) fn full_device_probe(uuid: &str, deadline: Instant) -> Option<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NvmlProbeInconclusive {
+    InvalidUuid,
+    DeadlineExpired,
+    Unavailable,
+    InvalidRecord,
+    IncompleteEvidence,
+    UnsupportedPlatform,
+}
+
+impl NvmlProbeInconclusive {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidUuid => "invalid_uuid",
+            Self::DeadlineExpired => "deadline_expired",
+            Self::Unavailable => "unavailable",
+            Self::InvalidRecord => "invalid_record",
+            Self::IncompleteEvidence => "incomplete_evidence",
+            Self::UnsupportedPlatform => "unsupported_platform",
+        }
+    }
+
+    const fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::DeadlineExpired
+                | Self::Unavailable
+                | Self::InvalidRecord
+                | Self::IncompleteEvidence
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FullDeviceProbeOutcome {
+    FullDevice,
+    NotFullDevice,
+    Inconclusive(NvmlProbeInconclusive),
+}
+
+impl FullDeviceProbeOutcome {
+    fn should_retry(self) -> bool {
+        matches!(self, Self::Inconclusive(reason) if reason.is_retryable())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FullDeviceProbeReport {
+    pub(crate) outcome: FullDeviceProbeOutcome,
+    pub(crate) attempts: u32,
+    pub(crate) timed_out: bool,
+}
+
+/// Retry only inconclusive NVML observations during the caller's independent
+/// budget. A positive non-full result is authoritative and therefore stops
+/// immediately; an inconclusive result never promotes the device.
+pub(crate) fn full_device_probe_until(uuid: &str, deadline: Instant) -> FullDeviceProbeReport {
+    retry_inconclusive_until(
+        || full_device_probe_observation(uuid, deadline),
+        deadline,
+        Instant::now,
+        |duration| std::thread::sleep(duration),
+    )
+}
+
+fn retry_inconclusive_until<Probe, Clock, Wait>(
+    mut probe: Probe,
+    deadline: Instant,
+    mut clock: Clock,
+    mut wait: Wait,
+) -> FullDeviceProbeReport
+where
+    Probe: FnMut() -> FullDeviceProbeOutcome,
+    Clock: FnMut() -> Instant,
+    Wait: FnMut(Duration),
+{
+    let mut attempts = 0_u32;
+
+    loop {
+        if clock() >= deadline {
+            return FullDeviceProbeReport {
+                outcome: FullDeviceProbeOutcome::Inconclusive(
+                    NvmlProbeInconclusive::DeadlineExpired,
+                ),
+                attempts,
+                timed_out: true,
+            };
+        }
+
+        attempts = attempts.saturating_add(1);
+        let outcome = probe();
+        match outcome {
+            FullDeviceProbeOutcome::FullDevice | FullDeviceProbeOutcome::NotFullDevice => {
+                return FullDeviceProbeReport {
+                    outcome,
+                    attempts,
+                    timed_out: false,
+                };
+            }
+            FullDeviceProbeOutcome::Inconclusive(reason) => {
+                if !outcome.should_retry() {
+                    return FullDeviceProbeReport {
+                        outcome: FullDeviceProbeOutcome::Inconclusive(reason),
+                        attempts,
+                        timed_out: false,
+                    };
+                }
+                if clock() >= deadline {
+                    return FullDeviceProbeReport {
+                        outcome: FullDeviceProbeOutcome::Inconclusive(reason),
+                        attempts,
+                        timed_out: true,
+                    };
+                }
+                let remaining = deadline.saturating_duration_since(clock());
+                wait(remaining.min(Duration::from_millis(50)));
+            }
+        }
+    }
+}
+
+fn full_device_probe_observation(
+    uuid: &str,
+    deadline: Instant,
+) -> FullDeviceProbeOutcome {
     if !is_canonical_gpu_uuid(uuid) {
-        return None;
+        return FullDeviceProbeOutcome::Inconclusive(NvmlProbeInconclusive::InvalidUuid);
     }
 
     #[cfg(unix)]
     {
-        return probe_unix(uuid, deadline);
+        probe_unix(uuid, deadline)
     }
 
     #[cfg(not(unix))]
@@ -50,7 +169,7 @@ pub(crate) fn full_device_probe(uuid: &str, deadline: Instant) -> Option<bool> {
         // parser evidence, including an explicit nvidia-smi Disabled value,
         // remains untouched; an Unknown value stays Unknown.
         let _ = (uuid, deadline);
-        None
+        FullDeviceProbeOutcome::Inconclusive(NvmlProbeInconclusive::UnsupportedPlatform)
     }
 }
 
@@ -206,14 +325,19 @@ struct NvmlProbeRecord {
 }
 
 #[cfg(unix)]
-fn probe_unix(uuid: &str, deadline: Instant) -> Option<bool> {
-    let record = run_bounded_probe(uuid, deadline)?;
+fn probe_unix(uuid: &str, deadline: Instant) -> FullDeviceProbeOutcome {
+    let record = match run_bounded_probe(uuid, deadline) {
+        Ok(record) => record,
+        Err(reason) => return FullDeviceProbeOutcome::Inconclusive(reason),
+    };
     if record.uuid != uuid || !is_canonical_gpu_uuid(&record.uuid) {
-        return None;
+        return FullDeviceProbeOutcome::Inconclusive(NvmlProbeInconclusive::InvalidRecord);
     }
 
     let virtualization_mode = if record.virtualization_status != NVML_SUCCESS {
-        return None;
+        return FullDeviceProbeOutcome::Inconclusive(
+            NvmlProbeInconclusive::IncompleteEvidence,
+        );
     } else {
         match record.virtualization_mode {
             NVML_GPU_VIRTUALIZATION_MODE_NONE => NvmlVirtualizationMode::BareMetal,
@@ -230,10 +354,12 @@ fn probe_unix(uuid: &str, deadline: Instant) -> Option<bool> {
             | NvmlVirtualizationMode::HostVgpu
             | NvmlVirtualizationMode::HostVsga
     ) {
-        return Some(false);
+        return FullDeviceProbeOutcome::NotFullDevice;
     }
     if matches!(virtualization_mode, NvmlVirtualizationMode::Unknown) {
-        return None;
+        return FullDeviceProbeOutcome::Inconclusive(
+            NvmlProbeInconclusive::IncompleteEvidence,
+        );
     }
 
     let mig_mode = match record.mig_status {
@@ -246,24 +372,28 @@ fn probe_unix(uuid: &str, deadline: Instant) -> Option<bool> {
         _ => NvmlMigMode::Unknown,
     };
     if matches!(mig_mode, NvmlMigMode::Enabled) {
-        return Some(false);
+        return FullDeviceProbeOutcome::NotFullDevice;
     }
     if matches!(mig_mode, NvmlMigMode::Unknown) {
-        return None;
+        return FullDeviceProbeOutcome::Inconclusive(
+            NvmlProbeInconclusive::IncompleteEvidence,
+        );
     }
 
-    Some(verified_full_device(
-        uuid,
-        &record.uuid,
-        mig_mode,
-        virtualization_mode,
-    ))
+    if verified_full_device(uuid, &record.uuid, mig_mode, virtualization_mode) {
+        FullDeviceProbeOutcome::FullDevice
+    } else {
+        FullDeviceProbeOutcome::Inconclusive(NvmlProbeInconclusive::IncompleteEvidence)
+    }
 }
 
 #[cfg(unix)]
-fn run_bounded_probe(uuid: &str, deadline: Instant) -> Option<NvmlProbeRecord> {
+fn run_bounded_probe(
+    uuid: &str,
+    deadline: Instant,
+) -> Result<NvmlProbeRecord, NvmlProbeInconclusive> {
     if Instant::now() >= deadline {
-        return None;
+        return Err(NvmlProbeInconclusive::DeadlineExpired);
     }
 
     let mut command = std::process::Command::new("python3");
@@ -273,21 +403,26 @@ fn run_bounded_probe(uuid: &str, deadline: Instant) -> Option<NvmlProbeRecord> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    let mut child = command.spawn().ok()?;
+    let mut child = command
+        .spawn()
+        .map_err(|_| NvmlProbeInconclusive::Unavailable)?;
 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let output = child.wait_with_output().ok()?;
+                let output = child
+                    .wait_with_output()
+                    .map_err(|_| NvmlProbeInconclusive::Unavailable)?;
                 if !status.success() {
-                    return None;
+                    return Err(NvmlProbeInconclusive::Unavailable);
                 }
-                return serde_json::from_slice(&output.stdout).ok();
+                return serde_json::from_slice(&output.stdout)
+                    .map_err(|_| NvmlProbeInconclusive::InvalidRecord);
             }
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err(NvmlProbeInconclusive::DeadlineExpired);
             }
             Ok(None) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -296,7 +431,7 @@ fn run_bounded_probe(uuid: &str, deadline: Instant) -> Option<NvmlProbeRecord> {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err(NvmlProbeInconclusive::Unavailable);
             }
         }
     }
@@ -304,7 +439,12 @@ fn run_bounded_probe(uuid: &str, deadline: Instant) -> Option<NvmlProbeRecord> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_canonical_gpu_uuid, verified_full_device, NvmlMigMode, NvmlVirtualizationMode};
+    use super::{
+        is_canonical_gpu_uuid, retry_inconclusive_until, verified_full_device,
+        FullDeviceProbeOutcome, NvmlMigMode, NvmlProbeInconclusive, NvmlVirtualizationMode,
+    };
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
 
     const UUID: &str = "GPU-00112233-4455-6677-8899-aabbccddeeff";
 
@@ -360,5 +500,76 @@ mod tests {
             NvmlMigMode::Unknown,
             NvmlVirtualizationMode::Unknown,
         ));
+    }
+
+    #[test]
+    fn inconclusive_probe_is_retried_until_full_device_is_proven() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let probe_calls = Cell::new(0_u32);
+        let wait_calls = Cell::new(0_u32);
+        let report = retry_inconclusive_until(
+            || {
+                let call = probe_calls.get();
+                probe_calls.set(call + 1);
+                if call == 0 {
+                    FullDeviceProbeOutcome::Inconclusive(NvmlProbeInconclusive::Unavailable)
+                } else {
+                    FullDeviceProbeOutcome::FullDevice
+                }
+            },
+            start + Duration::from_secs(1),
+            || clock.get(),
+            |duration| {
+                wait_calls.set(wait_calls.get() + 1);
+                clock.set(clock.get() + duration);
+            },
+        );
+
+        assert_eq!(report.outcome, FullDeviceProbeOutcome::FullDevice);
+        assert_eq!(report.attempts, 2);
+        assert!(!report.timed_out);
+        assert_eq!(wait_calls.get(), 1);
+    }
+
+    #[test]
+    fn explicit_non_full_probe_stops_without_retry() {
+        let start = Instant::now();
+        let probe_calls = Cell::new(0_u32);
+        let wait_calls = Cell::new(0_u32);
+        let report = retry_inconclusive_until(
+            || {
+                probe_calls.set(probe_calls.get() + 1);
+                FullDeviceProbeOutcome::NotFullDevice
+            },
+            start + Duration::from_secs(1),
+            || start,
+            |_| wait_calls.set(wait_calls.get() + 1),
+        );
+
+        assert_eq!(report.outcome, FullDeviceProbeOutcome::NotFullDevice);
+        assert_eq!(report.attempts, 1);
+        assert!(!report.timed_out);
+        assert_eq!(probe_calls.get(), 1);
+        assert_eq!(wait_calls.get(), 0);
+    }
+
+    #[test]
+    fn inconclusive_probe_budget_expires_without_full_device_promotion() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let report = retry_inconclusive_until(
+            || FullDeviceProbeOutcome::Inconclusive(NvmlProbeInconclusive::Unavailable),
+            start + Duration::from_secs(1),
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+        );
+
+        assert_eq!(
+            report.outcome,
+            FullDeviceProbeOutcome::Inconclusive(NvmlProbeInconclusive::DeadlineExpired)
+        );
+        assert!(report.attempts > 1);
+        assert!(report.timed_out);
     }
 }

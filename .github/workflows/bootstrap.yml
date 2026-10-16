@@ -326,6 +326,7 @@ jobs:
           cargo test -p fullmag-runner --lib fem_gpu_execution_receipt_contract_tests
           cargo test -p fullmag-session --lib host_resource_ledger
           cargo test -p fullmag-runtime-control --lib compute_node_probe
+          cargo test -p fullmag-runtime-control --lib nvml_gpu_partition
           cargo test -p fullmag-runtime-control --lib host_runtime
 
       - name: Run Rust quantity, API and CLI contracts
