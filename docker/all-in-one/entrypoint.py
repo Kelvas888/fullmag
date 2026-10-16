@@ -90,6 +90,39 @@ def _retain_liveness_observation(receipt, error):
         receipt["api_liveness"] = observation
 
 
+def _supervise_once(service, handle, *, full_api_probe, now, degraded_since):
+    """Run one check and bound only typed transient observation failures."""
+
+    try:
+        service.check(handle, full_api_probe=full_api_probe)
+    except service.RuntimeServiceTransient as error:
+        if degraded_since is None:
+            degraded_since = now
+            print(
+                "[fullmag-backend] Runtime observation degraded; retrying for "
+                f"{service.SUPERVISION_GRACE_SECONDS:.0f}s: {str(error)[-2048:]}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if now - degraded_since < service.SUPERVISION_GRACE_SECONDS:
+            return degraded_since
+        unknown = service.RuntimeServiceUnknown(
+            "runtime observation stayed degraded for "
+            f"{now - degraded_since:.0f}s: {error}"
+        )
+        observation = getattr(error, "liveness_observation", None)
+        if isinstance(observation, dict):
+            unknown.liveness_observation = observation
+        raise unknown from error
+    if degraded_since is not None:
+        print(
+            "[fullmag-backend] Runtime observation recovered after "
+            f"{now - degraded_since:.0f}s",
+            flush=True,
+        )
+    return None
+
+
 def serve():
     import runtime_service as service
     stopping = threading.Event()
@@ -114,6 +147,7 @@ def serve():
     receipt_path = paths.state_root / "runtime-service/process-tree.json"
     result = 1
     last_full_api_probe = 0.0
+    degraded_since = None
     try:
         service._atomic_json(receipt_path, receipt, "process tree receipt")
         handle = service.start(paths, api_port=8081, expected_binding=bootstrap["binding"],
@@ -131,7 +165,13 @@ def serve():
                 raise RuntimeError(f"Fullmag API exited unexpectedly ({status})")
             now = time.monotonic()
             full_api_probe = now - last_full_api_probe >= 5.0
-            service.check(handle, full_api_probe=full_api_probe)
+            degraded_since = _supervise_once(
+                service,
+                handle,
+                full_api_probe=full_api_probe,
+                now=now,
+                degraded_since=degraded_since,
+            )
             if full_api_probe:
                 last_full_api_probe = now
         result = 0

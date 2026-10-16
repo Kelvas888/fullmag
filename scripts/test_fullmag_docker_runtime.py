@@ -957,6 +957,118 @@ class DockerRuntimeContract(unittest.TestCase):
         self.load_entrypoint()._retain_liveness_observation(receipt, caught.exception)
         self.assertEqual(receipt["api_liveness"], response)
 
+    def test_supervision_classifies_only_live_probe_failure_as_transient(self):
+        service = self.load_service()
+        transient = service.RuntimeServiceNotReady(
+            configured=True,
+            state="observation_unknown",
+            reason_code="live_probe_failed",
+            reason_message="native probe was temporarily unavailable",
+            retryable=False,
+        )
+        different_reason = service.RuntimeServiceNotReady(
+            configured=True,
+            state="observation_unknown",
+            reason_code="live_identity_changed",
+            reason_message="owner identity changed",
+            retryable=False,
+        )
+        self.assertTrue(service._is_transient_supervision_observation(transient))
+        self.assertFalse(service._is_transient_supervision_observation(different_reason))
+        self.assertFalse(
+            service._is_transient_supervision_observation(
+                service.RuntimeServiceNotReady(
+                    configured=False,
+                    state="observation_unknown",
+                    reason_code="live_probe_failed",
+                    reason_message="native service is not configured",
+                    retryable=False,
+                )
+            )
+        )
+        self.assertFalse(
+            service._is_transient_supervision_observation(
+                service.RuntimeServiceError("API runtime-service liveness schema changed")
+            )
+        )
+
+    def test_supervision_promotes_live_probe_failure_without_native_cli(self):
+        service = self.load_service()
+        identity = {
+            "api_instance_id": "instance",
+            "api_contract_version": "1.0.0",
+            "runtime_store_binding": {"binding": "a" * 64},
+        }
+        owner = {"owner_token": "known", "children": []}
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
+        failure = service.RuntimeServiceNotReady(
+            configured=True,
+            state="observation_unknown",
+            reason_code="live_probe_failed",
+            reason_message="native service could not be verified",
+            retryable=False,
+        )
+        with patch.object(service, "_probe_api_identity", return_value=(identity, {})), \
+                patch.object(service, "_probe_api_liveness", side_effect=failure), \
+                patch.object(service, "_read_json") as read, \
+                patch.object(service, "_run_cli") as cli:
+            with self.assertRaises(service.RuntimeServiceTransient):
+                service.check(handle, full_api_probe=True)
+        read.assert_not_called()
+        cli.assert_not_called()
+
+    def test_supervision_transient_window_recovers_and_expires(self):
+        service = self.load_service()
+        entrypoint = self.load_entrypoint()
+        handle = object()
+        transient = service.RuntimeServiceTransient("live probe temporarily failed")
+        transient.liveness_observation = {
+            "schema_version": "application_service_status.v1",
+            "configured": True,
+            "state": "observation_unknown",
+            "reason": {"code": "live_probe_failed", "message": "probe failed"},
+        }
+        with patch.object(service, "check", side_effect=[transient, None, transient, transient]), \
+                patch.object(entrypoint, "print") as output:
+            degraded = entrypoint._supervise_once(
+                service, handle, full_api_probe=True, now=100.0, degraded_since=None
+            )
+            self.assertEqual(degraded, 100.0)
+            self.assertIsNone(
+                entrypoint._supervise_once(
+                    service, handle, full_api_probe=False, now=110.0,
+                    degraded_since=degraded
+                )
+            )
+            degraded = entrypoint._supervise_once(
+                service, handle, full_api_probe=True, now=200.0, degraded_since=None
+            )
+            with self.assertRaisesRegex(service.RuntimeServiceUnknown, "stayed degraded") as caught:
+                entrypoint._supervise_once(
+                    service, handle, full_api_probe=False,
+                    now=200.0 + service.SUPERVISION_GRACE_SECONDS,
+                    degraded_since=degraded,
+                )
+            self.assertEqual(
+                caught.exception.liveness_observation,
+                transient.liveness_observation,
+            )
+        self.assertEqual(output.call_count, 3)
+
+    def test_supervision_identity_failure_remains_immediate(self):
+        service = self.load_service()
+        entrypoint = self.load_entrypoint()
+        handle = object()
+        failure = service.RuntimeServiceUnknown("API instance identity changed")
+        with patch.object(service, "check", side_effect=failure), \
+                patch.object(entrypoint, "print") as output:
+            with self.assertRaises(service.RuntimeServiceUnknown) as caught:
+                entrypoint._supervise_once(
+                    service, handle, full_api_probe=False, now=100.0, degraded_since=None
+                )
+            self.assertIs(caught.exception, failure)
+        output.assert_not_called()
+
     def test_supervision_rejects_api_binding_change(self):
         service = self.load_service()
         identity = {"api_instance_id": "instance", "api_contract_version": "1.0.0",
@@ -965,11 +1077,12 @@ class DockerRuntimeContract(unittest.TestCase):
         owner = {"owner_token": "known", "children": []}
         handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
         changed = {**identity, "runtime_store_binding": {"binding": "b" * 64}}
-        with patch.object(service, "_probe_api_liveness"), \
+        with patch.object(service, "_probe_api_liveness") as liveness, \
                 patch.object(service, "_probe_api_identity", return_value=(changed, {})), \
                 patch.object(service, "_service_status", return_value=owner):
             with self.assertRaises(service.RuntimeServiceUnknown):
                 service.check(handle)
+        liveness.assert_not_called()
 
     def test_supervision_reads_ready_owner_without_restarting_native_cli(self):
         service = self.load_service()

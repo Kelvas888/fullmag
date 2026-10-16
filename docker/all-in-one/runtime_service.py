@@ -44,6 +44,11 @@ CONFIG_RELATIVE = Path(".fullmag/runtime-service/docker-all.json")
 MAX_JSON_BYTES = 256 * 1024
 MAX_HTTP_BYTES = 4 * 1024 * 1024
 STARTUP_LIVENESS_GRACE_SECONDS = 10.0
+# A live API observation may be temporarily unprovable while the native
+# service is still running.  The API remains fail-closed in that state; this
+# window only prevents one bounded transport/probe blip from killing PID 1.
+SUPERVISION_GRACE_SECONDS = 30.0
+TRANSIENT_LIVENESS_OBSERVATION = ("observation_unknown", "live_probe_failed")
 MAX_LIVENESS_REASON_BYTES = 2048
 RECOVERY_AUTHORIZATION_ENV = "FULLMAG_RUNTIME_RECOVERY_AUTHORIZATION"
 RECOVERY_AUTHORIZATION_SCHEMA = "fullmag.docker-runtime-recovery-authorization.v1"
@@ -86,6 +91,14 @@ class RuntimeServiceUnknown(RuntimeServiceError):
     """A timeout or disconnect left the lifecycle outcome unknown."""
 
 
+class RuntimeServiceTransient(RuntimeServiceUnknown):
+    """A bounded supervision observation could not prove liveness yet."""
+
+
+class RuntimeServiceTransportError(RuntimeServiceError):
+    """The loopback API transport failed before a response was verified."""
+
+
 class RuntimeServiceNotReady(RuntimeServiceError):
     """The API identity is pinned, but the runtime service is not ready yet."""
 
@@ -99,6 +112,9 @@ class RuntimeServiceNotReady(RuntimeServiceError):
         retryable: bool,
     ) -> None:
         self.retryable = retryable
+        self.configured = configured
+        self.state = state
+        self.reason_code = reason_code
         self.liveness_observation = {
             "schema_version": "application_service_status.v1",
             "configured": configured,
@@ -1122,7 +1138,11 @@ def _http_json(
         if not isinstance(value, dict):
             _fail(f"API {path} response must be a JSON object")
         return response.status, response.getheaders(), value
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except OSError as error:
+        raise RuntimeServiceTransportError(
+            f"API loopback probe failed for {path}: {error}"
+        ) from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeServiceError(f"API loopback probe failed for {path}: {error}") from error
     finally:
         connection.close()
@@ -1252,8 +1272,9 @@ def _wait_for_api_liveness(
     """Wait briefly for a pinned service to publish ``ready`` during startup.
 
     Identity, contract, and malformed-observation failures remain fail-closed.
-    Only the native service's explicit ``starting`` state is retried; the normal
-    supervisor continues to perform one strict probe per check cycle.
+    Only the native service's explicit ``starting`` state is retried here;
+    recurring supervision applies its separate bounded grace only to the
+    typed ``observation_unknown/live_probe_failed`` observation.
     """
 
     if timeout <= 0:
@@ -1335,6 +1356,23 @@ def _owner_fingerprint(owner: Mapping[str, Any]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _is_transient_supervision_observation(error: BaseException) -> bool:
+    """Classify only transport and the typed live-probe observation failure.
+
+    Schema, API identity, accepted-store binding, and owner mismatches remain
+    permanent supervision failures.  In particular, ``observation_unknown``
+    is transient only for the native ``live_probe_failed`` reason; other
+    reasons in that state must still fail closed immediately.
+    """
+
+    if isinstance(error, RuntimeServiceNotReady):
+        return (
+            error.configured
+            and (error.state, error.reason_code) == TRANSIENT_LIVENESS_OBSERVATION
+        )
+    return isinstance(error, (RuntimeServiceTransportError, OSError))
 
 
 def _owner_from_cli(result: Mapping[str, Any], operation: str) -> dict[str, Any]:
@@ -1544,25 +1582,32 @@ def check(handle: RuntimeHandle, *, full_api_probe: bool = True) -> None:
     if not isinstance(binding, Mapping) or not isinstance(binding.get("binding"), str):
         raise RuntimeServiceUnknown("runtime handle has no pinned API store binding")
     try:
+        fresh_identity = None
         if full_api_probe:
             fresh_identity, _ = _probe_api_identity(
                 handle.paths, handle.api_port, binding["binding"], timeout=5.0
             )
-        else:
-            _probe_api_liveness(handle.api_port, expected_identity, timeout=2.0)
-            fresh_identity = None
+            if fresh_identity != dict(expected_identity):
+                raise RuntimeServiceUnknown(
+                    "API identity or accepted-store binding changed during supervision"
+                )
+        # A full identity probe is periodic, but the thin native liveness
+        # proof is required on every cycle so a full probe cannot mask a
+        # persistent live_probe_failed observation.
+        _probe_api_liveness(handle.api_port, expected_identity, timeout=2.0)
     except (RuntimeServiceError, OSError) as error:
-        unknown = RuntimeServiceUnknown(
+        error_type = (
+            RuntimeServiceTransient
+            if _is_transient_supervision_observation(error)
+            else RuntimeServiceUnknown
+        )
+        unknown = error_type(
             f"API identity probe failed during supervision: {error}"
         )
         observation = getattr(error, "liveness_observation", None)
         if isinstance(observation, dict):
             unknown.liveness_observation = observation
         raise unknown from error
-    if fresh_identity is not None and fresh_identity != dict(expected_identity):
-        raise RuntimeServiceUnknown(
-            "API identity or accepted-store binding changed during supervision"
-        )
     try:
         owner = _read_ready_owner(handle.paths)
     except (RuntimeServiceError, OSError) as error:
