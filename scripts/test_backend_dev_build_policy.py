@@ -340,3 +340,103 @@ def test_direct_compose_fem_snapshot_header_isolated_from_shared_flags(tmp_path)
     )
     assert "FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256" in legacy_flags
     assert digest_b in legacy_flags
+
+
+@pytest.mark.skipif(os.name == "nt" or shutil.which("bash") is None,
+                    reason="The extracted Makefile helper is a Linux-container regression")
+def test_install_cli_selects_one_package_qualified_cli_api_feature_graph(tmp_path):
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    recipe_start = makefile.index("install-cli install-cli-dev install-cli-static:\n")
+    recipe_end = makefile.index("\nshow-cli-path:", recipe_start)
+    recipe = makefile[recipe_start:recipe_end]
+    helper_start = recipe.index("\tcargo_cli_api_build() { \\\n")
+    helper_end = recipe.index("\n\tbuild_mode=\"cpu\";", helper_start)
+    helper = recipe[helper_start:helper_end].replace("$$", "$")
+    recipe_without_helper = recipe[:helper_start] + recipe[helper_end:]
+    assert not re.search(
+        r"cargo \+nightly build --locked -p fullmag-(?:cli|api)\b",
+        recipe_without_helper,
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_cargo = fake_bin / "cargo"
+    fake_cargo.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\0' \"$@\" > \"$FULLMAG_CAPTURE\"\n"
+        "printf '%s\\0' \"${CARGO_TARGET_DIR-}\" \"${CARGO_INCREMENTAL-}\" "
+        "\"${FULLMAG_USE_MFEM_STACK-}\" \"${FULLMAG_FEM_REQUIRE_GPU-}\" "
+        "\"${FULLMAG_FEM_REQUIRE_CEED-}\" \"${FULLMAG_CMAKE-}\" "
+        "\"${CUDACXX-}\" > \"$FULLMAG_ENV_CAPTURE\"\n",
+        encoding="utf-8",
+    )
+    fake_cargo.chmod(0o755)
+
+    base_environment = os.environ.copy()
+    base_environment["PATH"] = str(fake_bin) + os.pathsep + base_environment["PATH"]
+    for name in (
+        "FULLMAG_USE_MFEM_STACK", "FULLMAG_FEM_REQUIRE_GPU", "FULLMAG_FEM_REQUIRE_CEED",
+        "FULLMAG_CMAKE", "CUDACXX",
+    ):
+        base_environment.pop(name, None)
+
+    def invoke(feature_set, assignments=()):
+        capture = tmp_path / "cargo-args"
+        env_capture = tmp_path / "cargo-env"
+        environment = dict(base_environment)
+        environment["FULLMAG_CAPTURE"] = str(capture)
+        environment["FULLMAG_ENV_CAPTURE"] = str(env_capture)
+        assignment_args = " ".join(shlex.quote(item) for item in assignments)
+        script = "\n".join((
+            "set -eu",
+            f"cargo_target_dir={shlex.quote(str(tmp_path / 'cargo-target'))}",
+            "build_incremental=1",
+            "cargo_profile_args='--profile backend-dev'",
+            helper,
+            f"cargo_cli_api_build {shlex.quote(feature_set)} {assignment_args}",
+        ))
+        result = subprocess.run(
+            ["bash", "-c", script],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        argv = capture.read_bytes().split(b"\0")[:-1]
+        observed_env = env_capture.read_bytes().split(b"\0")[:-1]
+        return [item.decode() for item in argv], [item.decode() for item in observed_env]
+
+    expected_prefix = [
+        "+nightly", "build", "--locked", "-p", "fullmag-cli", "-p", "fullmag-api",
+        "--profile", "backend-dev", "--no-default-features",
+    ]
+    cases = (
+        ("", (), expected_prefix),
+        (
+            "fullmag-cli/fem-gpu fullmag-api/fem-gpu",
+            ("FULLMAG_USE_MFEM_STACK=ON", "FULLMAG_FEM_REQUIRE_GPU=0", "FULLMAG_FEM_REQUIRE_CEED=0"),
+            expected_prefix + ["--features", "fullmag-cli/fem-gpu fullmag-api/fem-gpu"],
+        ),
+        (
+            "fullmag-cli/cuda fullmag-cli/fem-gpu fullmag-api/cuda fullmag-api/fem-gpu",
+            ("FULLMAG_USE_MFEM_STACK=ON", "FULLMAG_FEM_REQUIRE_GPU=1", "FULLMAG_FEM_REQUIRE_CEED=1",
+             "FULLMAG_CMAKE=/opt/cmake", "CUDACXX=/opt/nvcc"),
+            expected_prefix + ["--features", "fullmag-cli/cuda fullmag-cli/fem-gpu fullmag-api/cuda fullmag-api/fem-gpu"],
+        ),
+        (
+            "fullmag-cli/cuda fullmag-api/cuda",
+            ("FULLMAG_CMAKE=/opt/cmake", "CUDACXX=/opt/nvcc"),
+            expected_prefix + ["--features", "fullmag-cli/cuda fullmag-api/cuda"],
+        ),
+    )
+    for feature_set, assignments, expected in cases:
+        argv, observed_env = invoke(feature_set, assignments)
+        assert argv == expected
+        assert observed_env[:2] == [str(tmp_path / "cargo-target"), "1"]
+        assert all(
+            item == "" or item.startswith(("fullmag-cli/", "fullmag-api/"))
+            for item in feature_set.split()
+        )
+    assert "--all-features" not in recipe
+    assert recipe.count("-p fullmag-cli -p fullmag-api") == 2
