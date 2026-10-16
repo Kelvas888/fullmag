@@ -2653,6 +2653,11 @@ fn validate_parallel_execution_workflow(
                     message: "parallel_execution adaptive is unsupported for FEM frequency-response workflows; use serial execution".into(),
                 });
             }
+            BackendPlanIR::AntennaFieldOnly(_) => {
+                return Err(RunError {
+                    message: "parallel_execution adaptive is unsupported for antenna field-only workflows; use serial execution".into(),
+                });
+            }
             BackendPlanIR::AntennaExternalLeadInspection(_) => {
                 return Err(RunError {
                     message: "parallel_execution adaptive is unsupported for antenna external-lead inspection workflows; use serial execution".into(),

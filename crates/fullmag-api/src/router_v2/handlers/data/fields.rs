@@ -2315,6 +2315,9 @@ pub async fn get_field_catalog(
 
 #[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
 pub struct TargetFieldAvailabilityQuery {
+    pub carrier_id: Option<String>,
+    pub stage_id: Option<String>,
+    pub expected_carrier_revision: Option<String>,
     /// Stable canonical frontend target identity. Airbox always uses `airbox`.
     pub target_id: Option<String>,
     /// Field carrier scope. Defaults to the complete domain carrier.
@@ -2345,6 +2348,9 @@ pub async fn get_field_availability(
     AxumPath(quantity_id): AxumPath<String>,
     Query(query): Query<TargetFieldAvailabilityQuery>,
 ) -> Result<Json<FieldAvailabilityResource>, ApiError> {
+    if query.carrier_id.is_some() || query.stage_id.is_some() || query.expected_carrier_revision.is_some() {
+        return Err(ApiError::bad_request("immutable artifact carrier selectors are not supported by this runtime"));
+    }
     let request_context = crate::capture_current_live_request_context(&state).await?;
     let guard = state.current_live_state.read().await;
     let snapshot = guard
@@ -2560,6 +2566,7 @@ pub(crate) fn resolve_target_field_availability(
         None
     } else {
         let field_query = FieldVectorQuery {
+            carrier_id: None,
             component: None,
             scope_kind: Some(scope_kind.clone()),
             scope_id: scope_id.clone(),
@@ -2803,6 +2810,9 @@ pub async fn get_field_meta(
     AxumPath(quantity_id): AxumPath<String>,
     Query(query): Query<FieldMetaQuery>,
 ) -> Result<Json<FieldMeta>, ApiError> {
+    if query.carrier_id.is_some() || query.expected_carrier_revision.is_some() {
+        return Err(ApiError::bad_request("immutable artifact carrier selectors are not supported by this runtime"));
+    }
     let request_context = crate::capture_current_live_request_context(&state).await?;
     let quantity_id = canonical_quantity_id(&quantity_id);
     let quantity_id = quantity_id.as_ref();
@@ -2855,6 +2865,7 @@ pub async fn get_field_meta(
     let airbox_carrier = requested_fdm_multilayer_airbox_carrier(
         snapshot,
         &FieldVectorQuery {
+            carrier_id: None,
             component: query.component.clone(),
             scope_kind: query.scope_kind.clone(),
             scope_id: query.scope_id.clone(),
@@ -2994,6 +3005,7 @@ pub async fn get_field_meta(
         if let Some(status) = materializer_status {
             let freshness = materializer_request_freshness(snapshot, status);
             return Ok(Json(FieldMeta {
+                artifact_field_locator: None,
                 observation_frame: field_observation_frame_ref(
                     snapshot,
                     quantity_id,
@@ -3044,6 +3056,7 @@ pub async fn get_field_meta(
         {
             let freshness = legacy_pending_field_freshness(snapshot);
             return Ok(Json(FieldMeta {
+                artifact_field_locator: None,
                 observation_frame: field_observation_frame_ref(
                     snapshot,
                     quantity_id,
@@ -3094,6 +3107,7 @@ pub async fn get_field_meta(
                 )
             };
             return Ok(Json(FieldMeta {
+                artifact_field_locator: None,
                 observation_frame: field_observation_frame_ref(
                     snapshot,
                     quantity_id,
@@ -3147,6 +3161,7 @@ pub async fn get_field_meta(
         raw_values.len()
     };
     let scope_query = FieldVectorQuery {
+        carrier_id: None,
         component: query.component.clone(),
         scope_kind: query.scope_kind.clone(),
         scope_id: query.scope_id.clone(),
@@ -3209,6 +3224,7 @@ pub async fn get_field_meta(
         });
 
     Ok(Json(FieldMeta {
+        artifact_field_locator: None,
         observation_frame,
         publication_bundle,
         quantity_id: quantity_id.to_string(),
@@ -3281,6 +3297,9 @@ fn field_observation_frame_ref(
 
 #[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
 pub struct FieldMetaQuery {
+    /// Exact immutable artifact carrier; unsupported until its provider is integrated.
+    pub carrier_id: Option<String>,
+    pub expected_carrier_revision: Option<String>,
     /// Optional component projection used for statistics (`x`, `y`, `z`, `magnitude`, `full`).
     pub component: Option<String>,
     /// Optional FEM or FDM scope used for statistics.
@@ -3339,6 +3358,7 @@ fn push_field_descriptor(
     let spec = quantity_spec(quantity_id);
     let n_comp = spec.map(|s| s.n_comp).unwrap_or(3);
     quantities.push(FieldDescriptor {
+        artifact_field_locator: None,
         quantity_id: quantity_id.to_string(),
         label: spec
             .map(|s| s.label.to_string())
@@ -4678,6 +4698,9 @@ pub async fn get_field_vector(
     AxumPath(quantity_id): AxumPath<String>,
     Query(query): Query<FieldVectorQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    if query.carrier_id.is_some() {
+        return Err(ApiError::bad_request("immutable artifact carrier selectors are not supported by this runtime"));
+    }
     let request_context = crate::capture_current_live_request_context(&state).await?;
     crate::validate_current_live_request_context(&state, &request_context).await?;
     let response = get_field_vector_unfenced(
@@ -9148,6 +9171,9 @@ mod tests {
             &snapshot,
             "H_demag",
             &TargetFieldAvailabilityQuery {
+                carrier_id: None,
+                stage_id: None,
+                expected_carrier_revision: None,
                 target_id: Some("fdm-universe-outside-support".to_string()),
                 scope_kind: Some("full".to_string()),
                 scope_id: None,
@@ -9223,6 +9249,9 @@ mod tests {
             &snapshot,
             "H_demag",
             &TargetFieldAvailabilityQuery {
+                carrier_id: None,
+                stage_id: None,
+                expected_carrier_revision: None,
                 target_id: Some("fdm-universe-outside-support".to_string()),
                 scope_kind: Some("full".to_string()),
                 scope_id: None,
@@ -9338,6 +9367,9 @@ mod tests {
             &snapshot,
             "H_demag",
             &TargetFieldAvailabilityQuery {
+                carrier_id: None,
+                stage_id: None,
+                expected_carrier_revision: None,
                 target_id: Some("airbox".to_string()),
                 scope_kind: Some("airbox".to_string()),
                 scope_id: Some("airbox".to_string()),
@@ -9419,6 +9451,9 @@ mod tests {
             &snapshot,
             "m",
             &TargetFieldAvailabilityQuery {
+                carrier_id: None,
+                stage_id: None,
+                expected_carrier_revision: None,
                 target_id: Some("fem-domain".to_string()),
                 scope_kind: Some("full".to_string()),
                 scope_id: None,
@@ -9485,6 +9520,9 @@ mod tests {
             &snapshot,
             "H_demag",
             &TargetFieldAvailabilityQuery {
+                carrier_id: None,
+                stage_id: None,
+                expected_carrier_revision: None,
                 target_id: Some("fdm-universe-outside-support".to_string()),
                 scope_kind: Some("full".to_string()),
                 scope_id: None,
@@ -9627,6 +9665,7 @@ mod tests {
         )
         .expect("Airbox carrier should resolve");
         let query = FieldVectorQuery {
+            carrier_id: None,
             component: None,
             scope_kind: Some("airbox".to_string()),
             scope_id: Some("airbox".to_string()),
@@ -9932,6 +9971,7 @@ mod tests {
 
         let aggregate_scope = resolve_field_scope(
             &FieldVectorQuery {
+                carrier_id: None,
                 component: Some("full".to_string()),
                 geometry_scope: None,
                 max_samples: None,
@@ -9972,6 +10012,7 @@ mod tests {
         assert_eq!(selection.node_indices, vec![4, 5, 6, 7]);
         let scope = resolve_field_scope(
             &FieldVectorQuery {
+                carrier_id: None,
                 component: Some("full".to_string()),
                 geometry_scope: None,
                 max_samples: None,
@@ -10001,6 +10042,7 @@ mod tests {
 
         let magnetic_scope = resolve_field_scope(
             &FieldVectorQuery {
+                carrier_id: None,
                 component: Some("full".to_string()),
                 geometry_scope: None,
                 max_samples: None,
@@ -10105,6 +10147,7 @@ mod tests {
 
         let scope = resolve_field_scope(
             &FieldVectorQuery {
+                carrier_id: None,
                 component: Some("full".to_string()),
                 geometry_scope: None,
                 max_samples: None,

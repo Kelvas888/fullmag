@@ -1664,10 +1664,12 @@ fn fdm_grid_descriptor(snapshot: &SessionStateResponse) -> FdmGridLayout {
     get,
     path = "/v2/sessions/current/data/domain/topology",
     params(
+        crate::schemas::fields::ArtifactCarrierGeometryQuery,
         ("If-None-Match" = Option<String>, Header, description = "Strong ETag from a previous domain topology response"),
         ("Range" = Option<String>, Header, description = "Optional single byte range for chunked FMMT topology reads")
     ),
     responses(
+        (status = 400, description = "Immutable artifact carrier selectors are not supported by this runtime"),
         (status = 200, description = "Binary FEM topology (FMMT v2)", content_type = "application/octet-stream"),
         (status = 206, description = "Partial binary FEM topology range (FMMT v2)", content_type = "application/octet-stream"),
         (status = 304, description = "Domain topology not modified for the supplied ETag"),
@@ -1681,7 +1683,11 @@ fn fdm_grid_descriptor(snapshot: &SessionStateResponse) -> FdmGridLayout {
 pub async fn get_domain_topology(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<crate::schemas::fields::ArtifactCarrierGeometryQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    if query.carrier_id.is_some() || query.stage_id.is_some() || query.expected_carrier_revision.is_some() {
+        return Err(ApiError::bad_request("immutable artifact carrier selectors are not supported by this runtime"));
+    }
     let request_context = crate::capture_current_live_request_context(&state).await?;
     let guard = state.current_live_state.read().await;
     let snapshot = guard

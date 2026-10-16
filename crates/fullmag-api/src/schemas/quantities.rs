@@ -48,6 +48,7 @@ pub enum QuantityPublicationCapability {
 #[serde(rename_all = "snake_case")]
 pub enum FieldPayloadState {
     Current,
+    Historical,
     LegacyUnverified,
     Unmaterialized,
 }
@@ -113,7 +114,7 @@ mirror_enum_from_runner!(fullmag_runner::QuantityPublicationCapability, Quantity
     Interactive, ExportOnly, Hidden
 });
 mirror_enum_from_runner!(fullmag_runner::FieldPayloadState, FieldPayloadState, {
-    Current, LegacyUnverified, Unmaterialized
+    Current, Historical, LegacyUnverified, Unmaterialized
 });
 
 impl From<fullmag_runner::FieldCarrierDescriptor> for FieldCarrierDescriptor {

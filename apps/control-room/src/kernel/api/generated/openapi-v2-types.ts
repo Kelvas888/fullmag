@@ -4881,6 +4881,15 @@ export interface components {
             resource_id: string;
             schema_version: string;
         };
+        /** @description Durable accepted publication identity; epoch remains a lossless decimal string in JSON. */
+        AcceptedInspectionArtifactOwner: {
+            artifact_id: string;
+            attempt_id: string;
+            object_ref: string;
+            ownership_epoch: string;
+            project_id: string;
+            task_id: string;
+        };
         AcceptedObservationFrameRef: {
             domain_generation_id: string;
             observation_frame_id: string;
@@ -5867,10 +5876,52 @@ export interface components {
             request_id?: string | null;
             revision_context?: unknown;
         };
+        ArtifactCarrierGeometryQuery: {
+            carrier_id?: string | null;
+            expected_carrier_revision?: string | null;
+            stage_id?: string | null;
+        };
         ArtifactEntry: {
             kind: string;
             path: string;
             region_owned_provenance?: null | components["schemas"]["RegionOwnedArtifactProvenance"];
+        };
+        ArtifactFieldLocatorResource: {
+            carrier_digest: string;
+            carrier_id: string;
+            /** @description Canonical decimal u64 string; exact across JavaScript JSON readers. */
+            carrier_revision: string;
+            carrier_scope_id?: string | null;
+            carrier_scope_kind: string;
+            coordinate_frame: string;
+            coordinate_unit: string;
+            indexing: components["schemas"]["ArtifactSampleIndexing"];
+            owner: components["schemas"]["ArtifactFieldOwnerBinding"];
+            /** Format: int64 */
+            sample_count: number;
+            topology_binary_schema: string;
+        };
+        /** @description Provider-owned immutable source identity. Stable native mesh IDs are binary-only. */
+        ArtifactFieldOwnerBinding: {
+            accepted_artifact?: null | components["schemas"]["AcceptedInspectionArtifactOwner"];
+            authored_stage_id: string;
+            content_digest: string;
+            historical_inspection: boolean;
+            module_id: string;
+            native_mesh_identity: string;
+            native_topology_identity: string;
+            object_id: string;
+            /** Format: int64 */
+            observation_mesh_revision: number;
+            /** Format: int64 */
+            observation_topology_revision: number;
+            output_id: string;
+            request_scope_epoch: string;
+            run_id: string;
+            runtime_stage_id: string;
+            session_epoch: string;
+            session_id: string;
+            source_digest: string;
         };
         ArtifactResource: {
             kind: string;
@@ -5878,6 +5929,8 @@ export interface components {
             region_owned_provenance?: null | components["schemas"]["RegionOwnedArtifactProvenance"];
             stage_autosave?: null | components["schemas"]["StageAutosaveArtifactMetadata"];
         };
+        /** @enum {string} */
+        ArtifactSampleIndexing: "source_nodes" | "sample_nodes" | "point_samples" | "tet4_cell_local_nodes" | "cell_centers";
         Author: {
             affiliation?: string | null;
             email?: string | null;
@@ -7301,6 +7354,7 @@ export interface components {
         /** @enum {string} */
         FieldComponent: "x" | "y" | "z" | "magnitude";
         FieldDescriptor: {
+            artifact_field_locator?: null | components["schemas"]["ArtifactFieldLocatorResource"];
             available: boolean;
             /** Format: int32 */
             components: number;
@@ -7420,6 +7474,7 @@ export interface components {
             y_size: number;
         };
         FieldMeta: {
+            artifact_field_locator?: null | components["schemas"]["ArtifactFieldLocatorResource"];
             /** Format: int32 */
             components: number;
             domain_generation_id: string;
@@ -7454,7 +7509,7 @@ export interface components {
             unit: string;
         };
         /** @enum {string} */
-        FieldPayloadState: "current" | "legacy_unverified" | "unmaterialized";
+        FieldPayloadState: "current" | "historical" | "legacy_unverified" | "unmaterialized";
         FieldProjectionMaskDescriptor: {
             available: boolean;
             etag?: string | null;
@@ -7784,6 +7839,8 @@ export interface components {
         };
         /** @description Query parameters for the `/fields/{quantity_id}/vector` endpoint. */
         FieldVectorQuery: {
+            /** @description Exact immutable artifact carrier selector; unsupported until its provider is integrated. */
+            carrier_id?: string | null;
             /**
              * @description Component to return.
              *
@@ -11346,7 +11403,7 @@ export interface components {
             padding_m: number;
         };
         /** @enum {string} */
-        PlanarFieldComponent: "x" | "y" | "z" | "u" | "v" | "normal" | "magnitude" | "in_plane_magnitude" | "orientation";
+        PlanarFieldComponent: "c0" | "c1" | "c2" | "c3" | "c4" | "c5" | "c6" | "c7" | "c8" | "frobenius" | "spin_flow_x" | "spin_flow_y" | "spin_flow_z" | "x" | "y" | "z" | "u" | "v" | "normal" | "magnitude" | "in_plane_magnitude" | "orientation";
         PlanarFieldFrameResource: {
             bounds_uv_m: number[];
             normal: number[];
@@ -12214,7 +12271,7 @@ export interface components {
             run_intent: {
                 [key: string]: unknown;
             };
-            /** @description Versioned `study_plan.v2` object with typed steps, references and runner controls. */
+            /** @description Versioned `study_plan.v1/v2/v3/v4`; v4 adds typed inspection operations and captured source. */
             study_plan: {
                 [key: string]: unknown;
             };
@@ -12371,6 +12428,7 @@ export interface components {
             supports_history: boolean;
             supports_preview_2d: boolean;
             supports_preview_3d: boolean;
+            tensor?: null | components["schemas"]["QuantityTensorDescriptor"];
             unit: string;
         };
         QuantityCatalogResponse: {
@@ -12387,6 +12445,14 @@ export interface components {
         QuantityRenderCapability: "renderable" | "unsupported_shape" | "unavailable";
         /** @enum {string} */
         QuantityRequestCapability: "field_vector" | "scalar_resource" | "unsupported_shape" | "unavailable";
+        QuantityTensorDescriptor: {
+            axes: string[];
+            component_labels: string[];
+            layout: string;
+            /** Format: int32 */
+            rank: number;
+            shape: number[];
+        };
         QuantityVisualizationPatch: {
             active_quantity_id?: string | null;
             auto_contrast?: boolean | null;
@@ -13605,9 +13671,12 @@ export interface components {
         /** @enum {string} */
         SceneStructuredCutAxis: "x" | "y" | "z";
         /** @enum {string} */
+        SceneStructuredCutCoordinateFrame: "world" | "object";
+        /** @enum {string} */
         SceneStructuredCutNormal: "positive_axis" | "negative_axis";
         SceneStructuredCutPlane: {
             axis: components["schemas"]["SceneStructuredCutAxis"];
+            coordinate_frame?: null | components["schemas"]["SceneStructuredCutCoordinateFrame"];
             normal: components["schemas"]["SceneStructuredCutNormal"];
             /** Format: double */
             offset_m: number;
@@ -15855,6 +15924,8 @@ export interface components {
             surface_opacity: number;
             surface_projection_mode: components["schemas"]["SurfaceFieldProjectionMode"];
             surface_visible: boolean;
+            /** @description Explicit flow-major tensor projection; absent for scalar/vector fields. */
+            tensor_projection?: string | null;
             /** Format: double */
             vector_alpha: number;
             /** Format: int32 */
@@ -16037,6 +16108,7 @@ export interface components {
             surface_color_source?: null | components["schemas"]["SurfaceColorSource"];
             surface_mono_color?: string | null;
             surface_projection_mode?: null | components["schemas"]["SurfaceFieldProjectionMode"];
+            tensor_projection?: string | null;
             /** Format: double */
             vector_alpha?: number | null;
             /** Format: int32 */
@@ -21113,7 +21185,11 @@ export interface operations {
     };
     data_get_sessions_current_data_domain_topology: {
         parameters: {
-            query?: never;
+            query?: {
+                carrier_id?: string | null;
+                stage_id?: string | null;
+                expected_carrier_revision?: string | null;
+            };
             header?: {
                 /** @description Strong ETag from a previous domain topology response */
                 "If-None-Match"?: string | null;
@@ -21154,6 +21230,13 @@ export interface operations {
             };
             /** @description Domain topology not modified for the supplied ETag */
             304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Immutable artifact carrier selectors are not supported by this runtime */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -21417,6 +21500,9 @@ export interface operations {
     data_get_sessions_current_data_fields_quantity_id_availability: {
         parameters: {
             query?: {
+                carrier_id?: string | null;
+                stage_id?: string | null;
+                expected_carrier_revision?: string | null;
                 /** @description Stable canonical frontend target identity. Airbox always uses `airbox`. */
                 target_id?: string | null;
                 /** @description Field carrier scope. Defaults to the complete domain carrier. */
@@ -21469,6 +21555,9 @@ export interface operations {
     data_get_sessions_current_data_fields_quantity_id_meta: {
         parameters: {
             query?: {
+                /** @description Exact immutable artifact carrier; unsupported until its provider is integrated. */
+                carrier_id?: string | null;
+                expected_carrier_revision?: string | null;
                 /** @description Optional component projection used for statistics (`x`, `y`, `z`, `magnitude`, `full`). */
                 component?: string | null;
                 /** @description Optional FEM or FDM scope used for statistics. */
@@ -23497,6 +23586,8 @@ export interface operations {
     data_get_sessions_current_data_fields_quantity_id_samples_vector: {
         parameters: {
             query?: {
+                /** @description Exact immutable artifact carrier selector; unsupported until its provider is integrated. */
+                carrier_id?: string | null;
                 /**
                  * @description Component to return.
                  *
