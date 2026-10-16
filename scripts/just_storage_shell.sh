@@ -115,6 +115,19 @@ esac
 # Admit this fixed helper before generic diagnostic substring handling, so a
 # composite command cannot use a diagnostic marker to bypass its argument check.
 case "${recipe}" in
+  *"scripts/run_managed_boris_nf_v2.py"*)
+    # Match just's quoted arguments, including escaped checkout apostrophes.
+    boris_runtime_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_boris_nf_v2.py\" --repo-root '([^']|'\\\\'')+' run --job-id '([0-9a-f]{32})' --resolution '(coarse|medium|fine)'$"
+    if [[ "${recipe}" =~ ${boris_runtime_start_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/run_managed_boris_nf_v2.py" --repo-root "${repo_root}" run --job-id "${BASH_REMATCH[2]}" --resolution "${BASH_REMATCH[3]}"
+    fi
+    boris_runtime_observe_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_boris_nf_v2.py\" --repo-root '([^']|'\\\\'')+' observe --runtime-id '([0-9a-f]{32})'$"
+    if [[ "${recipe}" =~ ${boris_runtime_observe_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/run_managed_boris_nf_v2.py" --repo-root "${repo_root}" observe --runtime-id "${BASH_REMATCH[2]}"
+    fi
+    echo "[fullmag just] invalid managed BORIS V2 runtime recipe" >&2
+    exit 2
+    ;;
   *"scripts/run_managed_boris_nf.py"*)
     # Match just's quoted arguments, including escaped checkout apostrophes.
     boris_runtime_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_boris_nf.py\" --repo-root '([^']|'\\\\'')+' start --job-id '([0-9a-f]{32})' --resolution '(coarse|medium|fine)'$"

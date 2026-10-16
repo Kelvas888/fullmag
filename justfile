@@ -180,6 +180,13 @@ run-managed-boris-nf job_id resolution:
 observe-managed-boris-nf runtime_id:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_boris_nf.py" --repo-root {{quote(repo_root)}} observe --runtime-id {{quote(runtime_id)}}
 
+# Separate runtime-tools provenance; reuses an immutable successful BORIS build.
+run-managed-boris-nf-v2 job_id resolution:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_boris_nf_v2.py" --repo-root {{quote(repo_root)}} run --job-id {{quote(job_id)}} --resolution {{quote(resolution)}}
+
+observe-managed-boris-nf-v2 runtime_id:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_boris_nf_v2.py" --repo-root {{quote(repo_root)}} observe --runtime-id {{quote(runtime_id)}}
+
 # Consume one completed managed CPU/SLEPc build; this recipe never builds an
 # image or native target and writes only a new run below canonical storage.
 run-comsol-dispersion-benchmark job_id cases="c0,c1,a1" timeout_seconds="21600":

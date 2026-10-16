@@ -262,6 +262,87 @@ parser oraz validator noty 0970 PASS. Są to dowody źródeł, bez uruchomienia
 BORIS, producenta ABI lub nowego benchmarku. Rzeczywista kwalifikacja nadal
 wymaga terminalnego buildu BORIS i wykonania porównań.
 
+### BORIS: osobne narzędzia runtime V2
+
+`just run-managed-boris-nf-v2 <job-id> coarse|medium|fine` jest oddzielnym,
+synchronicznym konsumentem udanego buildu `boris-cpu-v1`. Nie kompiluje C++,
+nie buduje obrazu, nie instaluje wheels i nie zmienia profili ani stanu kolejki.
+Przed uruchomieniem operator musi ustanowić okno idle/paused bez aktywnych
+jobów, retencji lub innych kontenerów obliczeniowych. Recepta sprawdza to
+przed dispatch, podczas oczekiwania i przed terminalną publikacją; sama nie
+wywołuje pause, resume ani zatrzymania obcych kontenerów.
+
+`run_managed_boris_nf_v2.py::resolve_native_build` niezależnie wiąże managed
+job, aktora/worktree, cztery trusted pliki, pełną niezmienną kapsułę oraz
+`validate_build_receipt` (binarka, upstream, flagi, CPU ABI, obraz i native
+source identity). Nie porównuje nowych narzędzi hosta ze starymi narzędziami
+w kapsule. Nowy manifest `fullmag.boris.runtime-tools.v1` wiąże osobno pełny
+zestaw importowanych narzędzi hosta, w tym publiczny consumer tożsamości;
+`solver_capsule_attribution=false` jawnie rozdziela ich pochodzenie.
+Nie ma fallbacku po odmowie starego guarda `source_hashes`.
+
+Worker nadal jest niezmienionym `_worker` z kapsuły starego buildu pod
+`/source/scripts/run_managed_boris_nf.py`; wejście/scenariusz i jego bramki
+native/ABI/raw output pozostają obowiązkowe. Specyfikacja V2 udostępnia prywatne wheels przez `PYTHONPATH`:
+`/source/scripts:/opt/fullmag-boris/source:/opt/fullmag-boris-python`.
+Ostatni katalog udostępnia prywatne wheels z istniejącego obrazu; pominięcie
+go w V1 zasłaniało zainstalowany Matplotlib. Nie dodaje się pakietów ani
+nie zmienia bibliotek dynamicznych binarki.
+
+Dodatkowa jawna zależność `fullmag.boris.embedded-wrapper-support.v1` wiąże
+`EmbeddedPythonWrapper.py` z original_source dokładnego native buildu.
+Plik pochodzi wyłącznie z jego `execution/boris-cpu-source`, ma przypięty
+upstream/SHA/rozmiar i jest ponownie sprawdzany przed startem, po run oraz
+przez observer. Producent native85 pominął go w paczce siedmiu OUTPUTS;
+nie dopisuje się pliku do starej paczki ani nie zmienia jej receipt/binarki.
+Spec montuje siedem istniejących OUTPUTS osobno RO i wrapper jako osobny
+plik RO pod `/boris/EmbeddedPythonWrapper.py`, bez parent bind `/boris`.
+
+Wrapper upstream nie ma `StdoutCatcher.flush()`, mimo `print(..., flush=True)`
+w stałym scenariuszu. Adapter `fullmag.boris.stdout-flush-noop.v1` dodaje
+wyłącznie pustą metodę flush, zachowując wszystkie pozostałe oryginalne bajty
+CRLF. Dla przypiętej ścieżki GRAPHICS=0 write przechodzi synchronicznie przez
+BPython do `std::cout << text << std::endl`, więc dodatkowego bufora do opróżnienia
+nie ma. Receipt zachowuje osobno oryginalny i wynikowy SHA/rozmiar oraz SHA
+wstawionych bajtów; wynik nie udaje exact original_source. Nie monkeypatchuje
+się scenariusza ani sys.stdout. Worker/scenariusz i wszystkie native/fixed-M/
+headless gates są niezmienione. Runtime identity wiąże runtime_support_sha256.
+Attestation kontenera ma jawny `fullmag.boris.container-attestation.v1`: wszystkie
+pola Id/Image/Config/HostConfig/Mounts/State pozostają związane, a lista Mounts
+jest sortowana kanonicznie, ponieważ Docker zwraca ją w kolejności iteracji mapy.
+Zmiana kolejności nie zmienia znaczenia; zmiana źródła, celu lub RW nadal zmienia
+hash. Dawnych receiptów z hashem niesortowanej listy nie przepisuje się.
+Historyczne failed receipty pozostają bez zmian; nowy tools manifest dotyczy
+wyłącznie nowego run i nie jest fallbackiem po ich odmowie.
+
+Receipt nowej trasy ma `fullmag.boris.managed_run.v2`, a publiczna tożsamość
+`fullmag.boris.runtime.v3` (runtime.v2 jest już zajęte przez starą trasę).
+Wszystkie stare receipty i stary guard pozostają niezmienne. Zmieniony host
+nadal może być odrzucony przez V1; nie wolno przenosić takiego runtime do V2
+przez zmianę JSON. Nowy run musi otrzymać nowe ID i własne tools/input/export.
+Nowy observer rekonstruuje wyłącznie spec V2, ponawia native/tool/container
+bindings, sprawdza surowe wyjścia i niezależnie przelicza summary.
+
+`runtime_package_use` obejmuje cały run aż do terminalnej publikacji.
+Przed dispatch nowy katalog jest rejestrowany przez istniejący mechanizm
+reference roots. Receipt zawiera rozpoznawalne `runtime_job_id`; ponieważ
+nowy schema nie jest jeszcze dopuszczony do automatycznej retencji, istniejący
+planner odmawia usuwania przy takim nieznanym consumerze. Nie rozszerza się
+allowlisty retencji i nie usuwa tej ochrony automatycznie po wieku lub błędzie.
+Po błędzie zatrzymywany może być tylko dokładny własny ID ponownie atestowany
+wobec spec. Błąd atestacji/stop pozostawia zasoby i wymaga przeglądu recovery.
+
+`just observe-managed-boris-nf-v2 <runtime-id>` wyłącznie ponawia weryfikację
+już opublikowanego terminalnego sukcesu; nie uruchamia solve i nie naprawia
+nieukończonej publikacji. Przerwany/nieznany stan zachowuje dane do przeglądu.
+Publiczny `validate_runtime_identity` jawnie kieruje runtime.v3 do nowego
+verifiera; stare wersje zachowują dotychczasowe ścieżki i odmowy.
+
+Kod i interpretowane regresje nie są dowodem rzeczywistego przebiegu N/F.
+Wymagane pozostają rzeczywisty import z poprawionym środowiskiem, wykonanie
+solwera, terminalny wynik, niezależne obserwowanie i porównanie naukowe.
+Status kwalifikacji fizyki pozostaje `NOT VERIFIED`/diagnostic.
+
 ### Zatrzymanie atestowanego koordynatora pod blokadą Linux
 
 `container-quiesce` obsługuje przejście dokładnie wskazanego koordynatora do
