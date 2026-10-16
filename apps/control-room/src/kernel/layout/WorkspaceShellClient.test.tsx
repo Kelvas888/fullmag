@@ -76,7 +76,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("WorkspaceShellClient session collection gate", () => {
+describe("WorkspaceShellClient Home entry surface", () => {
   it("keeps the AppMenu slot and mounts the start screen after a confirmed empty response", async () => {
     const list = vi.fn(async () => ({ schema_version: "2.0.0", sessions: [] }));
     const currentStatus = vi.fn();
@@ -105,8 +105,9 @@ describe("WorkspaceShellClient session collection gate", () => {
     );
 
     try {
-      expect(findByAttribute(container, "data-state", "session-loading")).toBeTruthy();
-      expect(container.textContent).toContain("Checking for sessions");
+      expect(findByAttribute(container, "data-state", "home-session-reconnecting")).toBeTruthy();
+      expect(container.textContent).toContain("Home remains available");
+      expect(container.textContent).not.toContain("Checking for sessions");
       expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeTruthy();
       expect(currentStatus).not.toHaveBeenCalled();
     } finally {
@@ -124,7 +125,10 @@ describe("WorkspaceShellClient session collection gate", () => {
 
     try {
       await settle();
-      expect(findByAttribute(container, "data-state", "session-error")).toBeTruthy();
+      const homeShell = findByAttribute(container, "data-state", "home-session-reconnecting");
+      expect(homeShell).toBeTruthy();
+      expect(container.textContent).toContain("Home remains available");
+      expect(container.textContent).not.toContain("Session list unavailable");
       const home = findByAttribute(container, "data-slot-id", "start-screen");
       expect(home).toBeTruthy();
 
@@ -138,7 +142,7 @@ describe("WorkspaceShellClient session collection gate", () => {
         await settle();
       });
 
-      expect(findByAttribute(container, "data-state", "session-loading")).toBeTruthy();
+      expect(findByAttribute(container, "data-state", "home-session-reconnecting")).toBe(homeShell);
       expect(findByAttribute(container, "data-slot-id", "start-screen")).toBe(home);
 
       retry.resolve({ schema_version: "2.0.0", sessions: [] });
@@ -416,7 +420,7 @@ describe("WorkspaceShellClient session collection gate", () => {
     }
   });
 
-  it("renders transport failure separately from confirmed absence, with the launcher below it", async () => {
+  it("keeps Home usable during a session transport failure", async () => {
     const currentStatus = vi.fn();
     const { container, dispose } = await mountWorkspace(
       makeKernel(vi.fn(async () => { throw new Error("network unavailable"); }), currentStatus),
@@ -424,9 +428,9 @@ describe("WorkspaceShellClient session collection gate", () => {
 
     try {
       await settle();
-      expect(findByAttribute(container, "data-state", "session-error")).toBeTruthy();
-      expect(container.textContent).toContain("Session list unavailable");
-      expect(container.textContent).toContain("Project files remain available independently");
+      expect(findByAttribute(container, "data-state", "home-session-reconnecting")).toBeTruthy();
+      expect(container.textContent).toContain("Home remains available");
+      expect(container.textContent).not.toContain("Session list unavailable");
       expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeTruthy();
       for (const name of LAUNCH_TILE_NAMES) expect(container.textContent).toContain(name);
       // Creating a problem needs confirmed absence of a session; the tile says why.
@@ -441,7 +445,7 @@ describe("WorkspaceShellClient session collection gate", () => {
     }
   });
 
-  it("renders current-session status failure separately and retries the status resource", async () => {
+  it("keeps Home mounted while current-session status retries", async () => {
     const sessionList = {
       schema_version: "2.0.0",
       sessions: [{
@@ -475,10 +479,13 @@ describe("WorkspaceShellClient session collection gate", () => {
 
     try {
       await settle();
-      expect(findByAttribute(container, "data-state", "session-status-error")).toBeTruthy();
-      expect(container.textContent).toContain("Current session status unavailable");
+      const homeShell = findByAttribute(container, "data-state", "home-session-reconnecting");
+      expect(homeShell).toBeTruthy();
+      expect(container.textContent).toContain("Home remains available");
       expect(container.textContent).not.toContain("Checking for sessions");
-      expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeNull();
+      expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeTruthy();
+      expect(launchTile(container, "start.new-fdm")?.getAttribute("disabled")).not.toBeNull();
+      expect(launchTile(container, "start.new-fem")?.getAttribute("disabled")).not.toBeNull();
       expect(currentStatus).toHaveBeenCalledTimes(1);
 
       const retry = findElements(
@@ -492,7 +499,7 @@ describe("WorkspaceShellClient session collection gate", () => {
       });
 
       expect(currentStatus).toHaveBeenCalledTimes(2);
-      expect(findByAttribute(container, "data-state", "session-status-error")).toBeNull();
+      expect(findByAttribute(container, "data-state", "home-session-reconnecting")).toBeNull();
       expect(findByAttribute(container, "data-slot-id", "viewport-main")).toBeTruthy();
     } finally {
       await dispose();
@@ -539,10 +546,13 @@ describe("WorkspaceShellClient session collection gate", () => {
 
     try {
       await settle();
-      expect(findByAttribute(container, "data-state", "session-status-inconsistent")).toBeTruthy();
-      expect(container.textContent).toContain("Current session is out of sync");
+      const homeShell = findByAttribute(container, "data-state", "home-session-reconnecting");
+      expect(homeShell).toBeTruthy();
+      expect(container.textContent).toContain("Home remains available");
       expect(container.textContent).not.toContain("Checking for sessions");
-      expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeNull();
+      expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeTruthy();
+      expect(launchTile(container, "start.new-fdm")?.getAttribute("disabled")).not.toBeNull();
+      expect(launchTile(container, "start.new-fem")?.getAttribute("disabled")).not.toBeNull();
       expect(list).toHaveBeenCalledTimes(1);
       expect(currentStatus).toHaveBeenCalledTimes(1);
 
@@ -558,7 +568,7 @@ describe("WorkspaceShellClient session collection gate", () => {
 
       expect(currentStatus).toHaveBeenCalledTimes(2);
       expect(list).toHaveBeenCalledTimes(2);
-      expect(findByAttribute(container, "data-state", "session-status-inconsistent")).toBeNull();
+      expect(findByAttribute(container, "data-state", "home-session-reconnecting")).toBeNull();
       expect(findByAttribute(container, "data-slot-id", "viewport-main")).toBeTruthy();
     } finally {
       await dispose();
@@ -579,7 +589,7 @@ describe("WorkspaceShellClient session collection gate", () => {
         <WorkspaceShellClient />
       </KernelContext.Provider>,
     );
-    expect(serverHtml).toContain('data-state="session-loading"');
+    expect(serverHtml).toContain('data-state="home-session-reconnecting"');
 
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");

@@ -467,13 +467,7 @@ function NoSessionAppMenuBar({
   return (
     <header className="fm-header">
       <HeaderBrand
-        subtitle={
-          state === "no-session"
-            ? "No active session"
-            : state === "loading"
-              ? "Checking sessions"
-              : "Session list unavailable"
-        }
+        subtitle={resolveNoSessionSubtitle(state)}
       />
       <nav className="fm-header__nav" aria-label="Main menu">
         <StartNavItem
@@ -531,6 +525,17 @@ function NoSessionAppMenuBar({
       </div>
     </header>
   );
+}
+
+/**
+ * Home remains the stable entry surface while the session collection retries.
+ * Do not expose transient transport phases in the header; action enablement
+ * still uses the session resource itself.
+ */
+export function resolveNoSessionSubtitle(
+  state: "error" | "loading" | "no-session",
+): string {
+  return state === "no-session" ? "No active session" : "Home";
 }
 
 function SessionAppMenuBar() {

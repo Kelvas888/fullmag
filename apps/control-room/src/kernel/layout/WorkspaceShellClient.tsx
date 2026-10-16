@@ -56,7 +56,9 @@ export function WorkspaceShellClient() {
       ? refetchStatus
       : sessionState === "status-inconsistent"
         ? retryStatusAndCollection
-        : refetchSessions;
+        : sessionState === "loading" && sessions.state === "ready"
+          ? refetchStatus
+          : refetchSessions;
 
   // The overlay is a visit, not a mode: starting or opening something, or the
   // workspace going away, ends it so it cannot reappear on top of the next one.
@@ -64,36 +66,21 @@ export function WorkspaceShellClient() {
     homeView.close();
   }, [sessionScopeKey, startOwnsPage]);
 
-  const collectionGateState =
-    sessionState === "no-session" || sessionState === "error"
-      ? sessionState
-      : sessionState === "loading" && sessions.state !== "ready"
-        ? "loading"
-        : null;
-
   if (sessionState !== "ready" && project.state === "ready") {
     return <ProjectWorkspaceShell sessionState={sessionState} onRetry={onRetry} />;
   }
 
-  if (sessionState !== "ready") return (
-    <>
-      <SlotHost slotId="app-menu" />
-      {collectionGateState ? (
-        <SessionCollectionGate state={collectionGateState} onRetry={onRetry} />
-      ) : sessionState === "status-error" ? (
-        <SessionStatusError onRetry={onRetry} />
-      ) : sessionState === "status-inconsistent" ? (
-        <SessionStatusError kind="inconsistent" onRetry={onRetry} />
-      ) : (
-        <SessionStatusLoading onRetry={onRetry} />
-      )}
-      {sessionState === "loading" ? null : (
-        <div className="fm-workspace-overlay-host">
-          <SlotHost slotId="overlay" />
-        </div>
-      )}
-    </>
-  );
+  // Home is the entry surface, not a session-loading state. Keep its module
+  // mounted while collection/status requests retry so a backend interruption
+  // cannot replace the page with a full-screen loading/error gate.
+  if (sessionState !== "ready") {
+    return (
+      <>
+        <SlotHost slotId="app-menu" />
+        <HomeShell state={sessionState} onRetry={onRetry} />
+      </>
+    );
+  }
 
   return <ActiveWorkspaceShell />;
 }
@@ -144,103 +131,39 @@ function ProjectWorkspaceShell({
   );
 }
 
-function SessionCollectionGate({
+function HomeShell({
   state,
   onRetry,
 }: {
-  readonly state: "loading" | "error" | "no-session";
+  readonly state:
+    | "loading"
+    | "error"
+    | "status-error"
+    | "status-inconsistent"
+    | "no-session";
   readonly onRetry: () => void;
 }) {
-  const noSession = state === "no-session";
-  const loading = state === "loading";
+  const sessionUnavailable = state !== "no-session";
 
   return (
     <div
       className="fm-start-host"
-      data-state={noSession ? "no-session" : loading ? "session-loading" : "session-error"}
+      data-state={state === "no-session" ? "no-session" : "home-session-reconnecting"}
     >
-      {noSession ? null : (
-        <section
-          className="border-b border-fm-border bg-fm-surface px-6 py-3"
-          role={loading ? "status" : "alert"}
+      {sessionUnavailable ? (
+        <div
+          className="fm-start-session-status"
+          data-session-connection="reconnecting"
+          role="status"
         >
-          <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
-            <div>
-              <h1 className={loading
-                ? "font-fm-ui text-lg font-semibold text-fm-primary"
-                : "font-fm-ui text-lg font-semibold text-fm-danger"}
-              >
-                {loading ? "Checking for sessions" : "Session list unavailable"}
-              </h1>
-              <p className="text-fm-secondary">
-                {loading
-                  ? "Fullmag is checking the local session collection. Project files remain available independently."
-                  : "Fullmag could not confirm whether a local session exists. Project files remain available independently."}
-              </p>
-            </div>
-            <Button type="button" onClick={onRetry}>Retry</Button>
-          </div>
-        </section>
-      )}
+          <span>Session services are reconnecting. Home remains available.</span>
+          <Button size="sm" type="button" variant="ghost" onClick={onRetry}>Retry</Button>
+        </div>
+      ) : null}
       <SlotHost slotId="start-screen" />
-    </div>
-  );
-}
-
-function SessionStatusError({
-  kind = "error",
-  onRetry,
-}: {
-  readonly kind?: "error" | "inconsistent";
-  readonly onRetry: () => void;
-}) {
-  const inconsistent = kind === "inconsistent";
-  return (
-    <div
-      className="fm-start-host"
-      data-state={inconsistent ? "session-status-inconsistent" : "session-status-error"}
-    >
-      <section
-        className="border-b border-fm-border bg-fm-surface px-6 py-3"
-        role="alert"
-      >
-        <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1 className="font-fm-ui text-lg font-semibold text-fm-danger">
-              {inconsistent ? "Current session is out of sync" : "Current session status unavailable"}
-            </h1>
-            <p className="text-fm-secondary">
-              {inconsistent
-                ? "Fullmag received a current status that does not match the session list. Retry before creating or opening a session."
-                : "Fullmag could not confirm the current session. Project files remain available independently."}
-            </p>
-          </div>
-          <Button type="button" onClick={onRetry}>Retry</Button>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function SessionStatusLoading({ onRetry }: { readonly onRetry: () => void }) {
-  return (
-    <div className="fm-start-host" data-state="session-status-loading">
-      <section
-        className="border-b border-fm-border bg-fm-surface px-6 py-3"
-        role="status"
-      >
-        <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1 className="font-fm-ui text-lg font-semibold text-fm-primary">
-              Checking current session
-            </h1>
-            <p className="text-fm-secondary">
-              Fullmag is confirming the active session before enabling workspace actions.
-            </p>
-          </div>
-          <Button type="button" onClick={onRetry}>Retry</Button>
-        </div>
-      </section>
+      <div className="fm-workspace-overlay-host">
+        <SlotHost slotId="overlay" />
+      </div>
     </div>
   );
 }
