@@ -51,4 +51,6 @@ check("projection without a drive does not weaken Run validation", () => assert.
 check("nonfinite amplitude is rejected", () => assert.throws(() => combined(withRun, "solve", "receiver", "run", "Infinity", "1e9")));
 check("nonpositive frequency is rejected", () => assert.throws(() => combined(withRun, "solve", "receiver", "run", "1", "0")));
 check("composition does not mutate source data", () => { const before = JSON.stringify(scene); projection(scene, "solve", target); assert.equal(JSON.stringify(scene), before); });
+check("new drives receive readable names independent of IDs",()=>assert.equal(combined(withRun,"solve","receiver","run","1","1e9").drive.name,"Current drive 1"));
+check("default drive name skips existing authored names",()=>assert.equal(combined({...withRun,solved_antenna_drives:[{id:"foreign",name:" Current drive 1 "},{id:"other",name:"Current drive 2"}]},"solve","receiver","run","1","1e9").drive.name,"Current drive 3"));
 console.log(JSON.stringify({ state: "passed", checks, scope: "interpreted production source; no unit test compilation, field solve or qualification" }));

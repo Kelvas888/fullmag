@@ -647,6 +647,75 @@ try {
   assert.equal(await pointTable.getByRole("textbox",{name:"Point 3 multiplier",exact:true}).inputValue(),"1.25");
   await pointTable.scrollIntoViewIfNeeded();await screenshot("15-piecewise-points-reopened");
   checks.push({name:"Numeric piecewise knots and declared bandwidth persist through real API and inspector reopen while preserving bindings, focus, scroll and every surviving input during ACK",passed:true,stability:pointStability});
+  const driveNodeId = `model:object:${objectId}:antenna:drive:${encodeURIComponent(drive.id)}`;
+  const driveNode = page.locator(`[data-node-id="${driveNodeId}"]`);
+  const driveName = driveEditor.getByRole("textbox", { name: "Drive name", exact: true });
+  assert.equal(finalPointDrive.name, "Current drive 1");
+  await driveNode.getByText("Current drive 1", { exact: true }).waitFor();
+  const beforeRenameWrites = writes.length;
+  await driveName.fill("   ");
+  assert.equal(await driveSave.isEnabled(), false);
+  await selectNode(`model:object:${objectId}:geometry`); await dirtyGuard.waitFor();
+  assert.equal(await dirtyGuard.getByRole("button", { name: "Apply and continue", exact: true }).isEnabled(), false);
+  await dirtyGuard.getByRole("button", { name: "Cancel", exact: true }).click();
+  assert.equal(await driveName.inputValue(), "   "); assert.equal(writes.length, beforeRenameWrites);
+  await driveName.fill("  RF to receiver  ");
+  await driveName.focus();
+  // Start a real request, then change only the local name before its ACK.
+  await driveName.evaluate(input => {
+    const root = input.closest('[data-testid="antenna-drive-editor"]'), scroll = root.closest(".fm-inspector__body");
+    const controls = [...root.querySelectorAll("input, select")].map(element => ({ element, disabled: element.disabled, opacity: getComputedStyle(element).opacity }));
+    const proof = { root, input, scroll, top: scroll.scrollTop, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 };
+    const sample = () => {
+      proof.samples++;
+      if (document.querySelector('[data-testid="antenna-drive-editor"]') !== root) proof.rootChanges++;
+      for (const saved of controls) {
+        if (!saved.element.isConnected) proof.controlChanges++;
+        if (saved.element.disabled !== saved.disabled) proof.disabledChanges++;
+        if (getComputedStyle(saved.element).opacity !== saved.opacity) proof.opacityChanges++;
+      }
+      proof.opacityAnimations += root.getAnimations({ subtree: true }).filter(animation => (animation.playState === "running" || animation.pending) && animation.effect?.getKeyframes().some(frame => "opacity" in frame)).length;
+    };
+    const observer = new MutationObserver(sample); observer.observe(root, { attributes: true, childList: true, subtree: true }); sample(); window.__nameProof = { proof, observer, sample };
+    [...root.querySelectorAll("button")].find(button => button.textContent === "Save drive").click();
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(input, "RF to waveguide");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const renamedScene = await waitScene(s => s.solved_antenna_drives.find(item => item.id === drive.id)?.name === "RF to receiver");
+  await driveEditor.getByText("Antenna drive committed.", { exact: true }).waitFor();
+  assert.deepEqual(renamedScene.solved_antenna_drives.find(item => item.id === drive.id), { ...finalPointDrive, name: "RF to receiver" });
+  await driveNode.getByText("RF to receiver", { exact: true }).waitFor();
+  assert.equal(await driveNode.getAttribute("aria-selected"), "true");
+  assert.equal(await driveName.inputValue(), "RF to waveguide");
+  assert.equal(writes.length, beforeRenameWrites + 1);
+  await page.waitForFunction(() => [...document.querySelectorAll('[data-testid="antenna-drive-editor"] button')].some(button => button.textContent === "Save drive" && !button.disabled));
+  await driveSave.evaluate(button => button.click());
+  const finalNameScene = await waitScene(s => s.solved_antenna_drives.find(item => item.id === drive.id)?.name === "RF to waveguide");
+  await driveEditor.getByText("Antenna drive committed.", { exact: true }).waitFor();
+  await driveNode.getByText("RF to waveguide", { exact: true }).waitFor();
+  assert.deepEqual(finalNameScene.solved_antenna_drives.find(item => item.id === drive.id), { ...finalPointDrive, name: "RF to waveguide" });
+  assert.equal(writes.length, beforeRenameWrites + 2); assert.equal(await driveSave.isEnabled(), false);
+  const nameStability = await page.evaluate(() => {
+    const { proof, observer, sample } = window.__nameProof; sample(); observer.disconnect();
+    return { root: proof.root.isConnected, focus: document.activeElement === proof.input, scroll: proof.scroll.scrollTop === proof.top,
+      rootChanges: proof.rootChanges, controlChanges: proof.controlChanges, disabledChanges: proof.disabledChanges, opacityChanges: proof.opacityChanges, opacityAnimations: proof.opacityAnimations, samples: proof.samples };
+  });
+  assert.ok(nameStability.samples > 1 && nameStability.samples < 200);
+  assert.deepEqual({ ...nameStability, samples: 0 }, { root: true, focus: true, scroll: true, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 });
+  await driveName.scrollIntoViewIfNeeded(); await screenshot("16-readable-drive-name");
+  checks.push({ name: "Display-only rename rejects blank names, trims explicit renames, preserves immutable bindings and selection, and retains a newer local name through the real ACK with stable controls/focus/scroll", passed: true, stability: nameStability });
+  // Select another node before filtering, so the selected-node pin cannot mask a search regression.
+  await selectNode(`model:object:${objectId}:geometry`);
+  const explorerSearch = page.getByPlaceholder("Filter nodes...");
+  await explorerSearch.fill(drive.id);
+  await driveNode.waitFor({ state: "visible" });
+  await driveNode.getByText("RF to waveguide", { exact: true }).waitFor();
+  await driveNode.click(); await driveName.waitFor();
+  assert.equal(await driveName.inputValue(), "RF to waveguide");
+  await explorerSearch.fill("");
+  assert.equal(writes.length, beforeRenameWrites + 2);
+  await screenshot("17-readable-antenna-explorer");
+  checks.push({ name: "Explorer resolves full resource ID searches after selecting another node and reopens the same renamed drive without writes", passed: true });
   const webgl = await page.locator("canvas").evaluateAll(canvases => canvases.map(canvas => {
     const bounds = canvas.getBoundingClientRect(); if (!bounds.width || !bounds.height) return null;
     const gl = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
@@ -654,7 +723,7 @@ try {
   }).filter(Boolean));
   assert.ok(webgl.some(gl => !gl.lost && gl.width > 0 && gl.height > 0)); assert.ok(webgl.every(gl => !gl.lost));
   assert.ok(websockets.some(url => url.startsWith(target.api_base.replace("http:", "ws:"))), "Realtime must use the admitted API");
-  assert.ok(writes.length >= 3 && writes.length <= 21);
+  assert.ok(writes.length >= 3 && writes.length <= 23);
   for (const write of [...writes, ...visualizationAcks]) { assert.equal(write.instance, target.api_instance); assert.equal(write.scope, scope); assert.ok(!write.path.includes("/simulation/"), "Authoring smoke must not execute a solver"); }
   assert.ok(Date.now() - Date.parse(startedAt) > 5000, "The scenario must outlive the adoption timeout");
   assert.deepEqual(visualizationAcks.filter(ack => ack.body.status === "failed"), [], "No nonexistent-buffer adoption may fail during empty/nonmagnetic authoring");

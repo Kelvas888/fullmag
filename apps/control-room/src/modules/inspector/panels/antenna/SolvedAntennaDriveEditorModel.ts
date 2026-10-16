@@ -5,6 +5,7 @@ export type SolvedDrive = NonNullable<SceneResource["solved_antenna_drives"]>[nu
 export type WaveformKind = SolvedDrive["waveform"]["kind"];
 
 export interface SolvedDriveDraft {
+  name: string;
   peakCurrentA: string;
   timeOrigin: SolvedDrive["time_origin"];
   waveformKind: WaveformKind;
@@ -79,6 +80,7 @@ export function antennaRunStageIds(scene: SceneResource | null): string[] {
 export function solvedDriveDraft(drive: SolvedDrive): SolvedDriveDraft {
   const waveform = drive.waveform;
   return {
+    name: drive.name,
     peakCurrentA: String(drive.peak_current_a),
     timeOrigin: drive.time_origin,
     waveformKind: waveform.kind,
@@ -116,6 +118,9 @@ export function buildSolvedDrive(
   existing: SolvedDrive,
   draft: SolvedDriveDraft,
 ): SolvedDrive {
+  const trimmedName = draft.name.trim();
+  if (!trimmedName) throw new Error("Drive name is required");
+  const name = draft.name === existing.name ? existing.name : trimmedName;
   const peakCurrent = finiteNumber(draft.peakCurrentA, "Peak current");
   if (draft.timeOrigin !== "stage_local" && draft.timeOrigin !== "absolute") throw new Error("Select a supported time origin");
   let waveform: SolvedDrive["waveform"];
@@ -176,6 +181,7 @@ export function buildSolvedDrive(
   }
   return {
     ...existing,
+    name,
     peak_current_a: peakCurrent,
     time_origin: draft.timeOrigin,
     waveform,
@@ -193,7 +199,7 @@ export function resolveCommittedSolvedDriveScene(
     !Number.isSafeInteger(result.scene_revision) || result.scene_revision <= baseRevision || matches.length !== 1) {
     throw new Error("Drive ACK did not provide the current committed scene. Refresh before saving again.");
   }
-  for (const key of ["name", "projection_ref", "port_mode_id"] as const) {
+  for (const key of ["projection_ref", "port_mode_id"] as const) {
     if (matches[0][key] !== expectedDrive[key]) throw new Error("Drive ACK changed an immutable binding. Refresh before saving again.");
   }
   const expected = solvedDriveDraft(expectedDrive);

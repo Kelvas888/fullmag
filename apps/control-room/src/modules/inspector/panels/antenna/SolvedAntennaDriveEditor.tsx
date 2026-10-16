@@ -232,6 +232,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
 
   return (
     <div data-testid="antenna-drive-editor"><InspectorGroup title="Drive authoring">
+      <FormField label="Drive name" hint="Display name only. The immutable drive ID and its source bindings stay unchanged." value={draft.name} onChange={event => update({ name: event.currentTarget.value })} />
       <FormField label="Peak current" unit="A" hint="Signed current scale. I(t) = scale × waveform(t); offset or sinc amplitude can change the actual peak. No RMS conversion is applied." value={draft.peakCurrentA} onChange={(event) => update({ peakCurrentA: event.currentTarget.value })} />
       <FormField label="Waveform" type="select" value={draft.waveformKind} onChange={(event) => changeWaveform(event.currentTarget.value as WaveformKind)}>
         <option value="constant">Constant</option>

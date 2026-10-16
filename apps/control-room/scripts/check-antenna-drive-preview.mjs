@@ -22,6 +22,21 @@ const drive = { id: "drive", name: "Drive", projection_ref: "projection", port_m
 const close = (a, b) => assert.ok(Math.abs(a - b) < 1e-12, `${a} != ${b}`);
 let checks = 0;
 const check = (name, run) => { run(); checks++; console.log(`PASS ${name}`); };
+check("user-facing name changes without changing immutable identity", () => {
+  const result=model.buildSolvedDrive(drive,{...model.solvedDriveDraft(drive),name:"  RF to waveguide  "});
+  assert.equal(result.name,"RF to waveguide"); assert.equal(result.id,drive.id); assert.equal(result.projection_ref,drive.projection_ref); assert.equal(result.port_mode_id,drive.port_mode_id);
+});
+check("unrelated edits preserve an existing name verbatim", () => {
+  const legacy={...drive,name:"  Existing display name  "};
+  const result=model.buildSolvedDrive(legacy,{...model.solvedDriveDraft(legacy),peakCurrentA:"0.02"});
+  assert.equal(result.name,legacy.name); assert.equal(result.peak_current_a,0.02);
+});
+check("blank drive name is rejected",()=>assert.throws(()=>model.buildSolvedDrive(drive,{...model.solvedDriveDraft(drive),name:"  "}),/name is required/));
+check("late ACK preserves a newer display name",()=>{
+  const submitted=model.solvedDriveDraft(drive), later={...submitted,name:"Later name"};
+  const result=model.acknowledgeSolvedDriveDraft({id:drive.id,draft:later,dirtyKeys:["name"],editedAgainst:{name:submitted.name}},drive.id,submitted,submitted,2);
+  assert.equal(result.draft.name,"Later name"); assert.equal(JSON.stringify(result.dirtyKeys),'["name"]');
+});
 check("textual point cells compile into canonical numeric pairs", () => {
   const authored = model.buildSolvedDrive(drive, { ...model.solvedDriveDraft(drive), waveformKind: "piecewise_linear", piecewisePoints: '[["0","-1."],["1e-9","2.5"]]' });
   assert.equal(JSON.stringify(authored.waveform.points), "[[0,-1],[1e-9,2.5]]");

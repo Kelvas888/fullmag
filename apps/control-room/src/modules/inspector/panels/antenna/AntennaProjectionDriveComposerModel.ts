@@ -65,13 +65,16 @@ export function composeAntennaProjectionDrive(
   if (!frequencyText.trim() || !Number.isFinite(frequencyHz) || frequencyHz <= 0) {
     throw new Error("Frequency must be finite and > 0 Hz.");
   }
+  const names = new Set(scene.solved_antenna_drives?.map(item => item.name.trim()) ?? []);
+  let nameIndex = 1;
+  while (names.has(`Current drive ${nameIndex}`)) nameIndex += 1;
   const projectionId = projection.id;
   const driveId = nextId(`${stage.id}:drive`, scene.solved_antenna_drives?.map((item) => item.id) ?? []);
   return {
     projection,
     drive: {
       id: driveId,
-      name: `Antenna drive ${driveId}`,
+      name: `Current drive ${nameIndex}`,
       projection_ref: projectionId,
       port_mode_id: stage.port_mode_ids[0],
       peak_current_a: peakCurrentA,
