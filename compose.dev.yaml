@@ -1,10 +1,19 @@
 # Fullmag development on Docker Desktop. Sources stay in the selected checkout.
 # The direct development launcher resolves paths, builds inside the backend
 # service on request, checks Windows storage and records the resolved config.
-name: fullmag
+# Compose project identity is injected by the managed launcher.  The default
+# keeps direct config inspection deterministic; selected worktrees override it.
+name: ${FULLMAG_COMPOSE_PROJECT:-fullmag-master}
+
+x-fullmag-source-labels: &fullmag-source-labels
+  org.fullmag.source.project-id: ${FULLMAG_SOURCE_PROJECT_ID:-unknown}
+  org.fullmag.source.worktree-id: ${FULLMAG_SOURCE_WORKTREE_ID:-unknown}
+  org.fullmag.source.checkout-kind: ${FULLMAG_SOURCE_CHECKOUT_KIND:-unknown}
+  org.fullmag.compose.project: ${FULLMAG_COMPOSE_PROJECT:-fullmag-master}
 
 services:
   backend:
+    labels: *fullmag-source-labels
     image: ${FULLMAG_DEV_IMAGE:?Prepare the development toolchain image}
     build:
       context: ./docker/all-in-one
@@ -61,6 +70,7 @@ services:
     networks: [fullmag]
 
   frontend:
+    labels: *fullmag-source-labels
     image: ${FULLMAG_DEV_IMAGE}
     pull_policy: never
     init: true
@@ -132,4 +142,10 @@ services:
 # A separate project-scoped bridge; no external networks, static IPs or host mode.
 networks:
   fullmag:
+    # The managed launcher supplies the deterministic short alias when the
+    # readable worktree project would exceed Docker's network-name limit.
+    name: ${FULLMAG_COMPOSE_NETWORK:-fullmag-master_fullmag}
+    labels: *fullmag-source-labels
     driver: bridge
+    ipam:
+      driver: default

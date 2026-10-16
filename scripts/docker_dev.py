@@ -35,7 +35,7 @@ import time
 import uuid
 
 
-PROJECT_NAME = "fullmag"
+DEFAULT_COMPOSE_PROJECT = "fullmag-master"
 STORAGE_PROFILE = "docker-all-gpu"
 DEFAULT_IMAGE = "fullmag/fullmag-dev:local"
 DEFAULT_BASE_IMAGE = "fullmag/development-base:local"
@@ -725,6 +725,23 @@ def _select_source(repo: Path, source_root: Path | None) -> tuple[Path, dict[str
     return selected, layout
 
 
+def _compose_identity(layout: Mapping[str, object]) -> dict[str, str]:
+    from docker_compose_identity import compose_project_identity
+
+    return compose_project_identity(layout)
+
+
+def _compose_identity_environment(layout: Mapping[str, object]) -> dict[str, str]:
+    identity = _compose_identity(layout)
+    return {
+        "FULLMAG_COMPOSE_PROJECT": identity["project_name"],
+        "FULLMAG_COMPOSE_NETWORK": identity["network_name"],
+        "FULLMAG_SOURCE_PROJECT_ID": identity["project_id"],
+        "FULLMAG_SOURCE_WORKTREE_ID": identity["worktree_id"],
+        "FULLMAG_SOURCE_CHECKOUT_KIND": identity["checkout_kind"],
+    }
+
+
 def _new_run_root(layout: Mapping[str, object]) -> tuple[str, Path]:
     from fullmag_storage import validate_path
 
@@ -757,7 +774,7 @@ def _direct_compose_files(repo: Path, cache: Mapping[str, object] | None = None)
     return files
 
 
-def _compose_prefix(repo: Path, files: Sequence[Path], project: str = PROJECT_NAME) -> list[str]:
+def _compose_prefix(repo: Path, files: Sequence[Path], project: str = DEFAULT_COMPOSE_PROJECT) -> list[str]:
     arguments: list[str] = [
         "compose", "--project-name", project, "--project-directory", str(repo),
     ]
@@ -766,9 +783,10 @@ def _compose_prefix(repo: Path, files: Sequence[Path], project: str = PROJECT_NA
     return arguments
 
 
-def _compose_config(repo: Path, files: Sequence[Path], environment: Mapping[str, str]) -> dict[str, object]:
+def _compose_config(repo: Path, files: Sequence[Path], environment: Mapping[str, str], *,
+                    project: str = DEFAULT_COMPOSE_PROJECT) -> dict[str, object]:
     raw = _docker_capture(
-        *_compose_prefix(repo, files), "config", "--format", "json",
+        *_compose_prefix(repo, files, project), "config", "--format", "json",
         timeout=120, environment=environment,
     )
     value = _read_json_output(raw, "direct Compose config")
@@ -866,7 +884,8 @@ def _validate_runtime_image(reference: str, expected_toolchain_id: str,
 def _runtime_image_reference(args: argparse.Namespace, repo: Path,
                             environment: dict[str, str], run_root: Path,
                             layout: Mapping[str, object],
-                            base_info: Mapping[str, object]) -> tuple[str, str, dict[str, object], bool]:
+                            base_info: Mapping[str, object],
+                            project: str = DEFAULT_COMPOSE_PROJECT) -> tuple[str, str, dict[str, object], bool]:
     requested = (
         args.image
         or os.environ.get("FULLMAG_DEV_IMAGE")
@@ -937,7 +956,7 @@ def _runtime_image_reference(args: argparse.Namespace, repo: Path,
     )
     _docker_live(
         run_root / "image-build.log",
-        *_compose_prefix(repo, [repo / COMPOSE_RUNTIME_FILE]),
+        *_compose_prefix(repo, [repo / COMPOSE_RUNTIME_FILE], project),
         "build", "--pull=false", "--progress=plain", "backend",
         timeout=4 * 60 * 60,
         environment=build_environment,
@@ -1008,6 +1027,7 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
     (run_root / "development-inputs.json").touch(exist_ok=True)
     package.mkdir(exist_ok=True)
     environment = {
+        **_compose_identity_environment(layout),
         "FULLMAG_DEV_IMAGE": image_ref,
         "FULLMAG_RELEASE_IMAGE": image_ref,
         "FULLMAG_RUNTIME_IMAGE_ID": image_id,
@@ -1191,6 +1211,7 @@ def _compose_stop_hint(container_ids: Sequence[str]) -> str:
     if isinstance(documents, list) and documents:
         configs: tuple[str, ...] | None = None
         working_dir: str | None = None
+        compose_project: str | None = None
         valid = True
         for document in documents:
             if not isinstance(document, dict):
@@ -1203,7 +1224,11 @@ def _compose_stop_hint(container_ids: Sequence[str]) -> str:
                 break
             raw_files = labels.get("com.docker.compose.project.config_files")
             raw_working = labels.get("com.docker.compose.project.working_dir")
-            if not isinstance(raw_files, str) or not raw_files.strip() or not isinstance(raw_working, str):
+            raw_project = labels.get("com.docker.compose.project")
+            if (not isinstance(raw_files, str) or not raw_files.strip()
+                    or not isinstance(raw_working, str)
+                    or not isinstance(raw_project, str)
+                    or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", raw_project)):
                 valid = False
                 break
             # Compose records multiple files as a platform-separated or
@@ -1216,13 +1241,14 @@ def _compose_stop_hint(container_ids: Sequence[str]) -> str:
             if configs is None:
                 configs = files
                 working_dir = raw_working
-            elif configs != files or working_dir != raw_working:
+                compose_project = raw_project
+            elif configs != files or working_dir != raw_working or compose_project != raw_project:
                 valid = False
                 break
-        if (valid and configs and working_dir
+        if (valid and configs and working_dir and compose_project
                 and all(Path(compose_file).suffix.lower() == ".json" for compose_file in configs)):
             parts = [
-                "docker", "compose", "--project-name", PROJECT_NAME,
+                "docker", "compose", "--project-name", compose_project,
                 "--project-directory", working_dir,
             ]
             for compose_file in configs:
@@ -1235,20 +1261,78 @@ def _compose_stop_hint(container_ids: Sequence[str]) -> str:
     return "docker stop " + " ".join(container_ids)
 
 
-def _assert_no_running_fullmag() -> None:
-    raw = _docker_capture(
-        "ps", "--quiet", "--filter", "label=com.docker.compose.project=" + PROJECT_NAME,
-        timeout=60,
-    )
-    running = [line.strip() for line in raw.splitlines() if line.strip()]
-    if running:
+def _assert_no_running_fullmag(project: str) -> None:
+    """Reject all stale containers/networks for the selected Compose group.
+
+    The historical helper name is retained for callers, but the admission
+    fence covers stopped containers and orphaned project networks as well as
+    running services.  Compose must never silently replace an old identity.
+    """
+
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project):
+        raise _fail("Invalid Compose project name")
+    from docker_compose_identity import compose_network_name
+
+    network_name = compose_network_name(project)
+    container_ids: set[str] = set()
+    for label in ("com.docker.compose.project", "org.fullmag.compose.project"):
+        raw = _docker_capture(
+            "ps", "--all", "--quiet", "--filter", "label=" + label + "=" + project,
+            timeout=60,
+        )
+        container_ids.update(line.strip() for line in raw.splitlines() if line.strip())
+    if container_ids:
+        ordered = sorted(container_ids)
         raise _fail(
-            "Fullmag Docker services are already running ("
-            + ", ".join(running)
-            + "); stop them explicitly with the recorded command: `"
-            + _compose_stop_hint(running)
+            "Fullmag Docker containers already exist for project " + project
+            + " (running or stopped): " + ", ".join(ordered)
+            + "; remove them explicitly with the recorded command: `"
+            + _compose_stop_hint(ordered)
             + "` before `up`"
         )
+
+    network_ids: set[str] = set()
+    network_filters = (
+        "label=com.docker.compose.project=" + project,
+        "label=org.fullmag.compose.project=" + project,
+        # Catch a stale/manual network with the deterministic Compose name even
+        # if someone stripped its labels; Compose must not replace it silently.
+        "name=^" + network_name + "$",
+    )
+    for network_filter in network_filters:
+        raw = _docker_capture(
+            "network", "ls", "--quiet", "--filter", network_filter,
+            timeout=60,
+        )
+        network_ids.update(line.strip() for line in raw.splitlines() if line.strip())
+    if not network_ids:
+        return
+    ordered_networks = sorted(network_ids)
+    try:
+        documents = _read_json_output(
+            _docker_capture("network", "inspect", *ordered_networks, timeout=60),
+            "Fullmag Compose network inspection",
+        )
+    except DirectDockerError:
+        raise
+    if not isinstance(documents, list) or len(documents) != len(ordered_networks):
+        raise _fail("Docker network identity inspection returned an incomplete document")
+    names = []
+    for document in documents:
+        if not isinstance(document, dict):
+            raise _fail("Docker network identity inspection returned an invalid document")
+        labels = document.get("Labels")
+        if not isinstance(labels, dict) or not any(
+            labels.get(label) == project
+            for label in ("com.docker.compose.project", "org.fullmag.compose.project")
+        ):
+            raise _fail("Docker network identity labels could not be verified")
+        names.append(str(document.get("Name") or document.get("Id") or "<unknown>"))
+    raise _fail(
+        "Fullmag Docker project network identity already exists for " + project
+        + " (" + ", ".join(names)
+        + "); remove the stale network explicitly before `up`"
+    )
 
 
 def _frozen_source_bundle(manifest_path: Path, layout: Mapping[str, object], selected: Path) -> dict[str, object]:
@@ -1318,6 +1402,7 @@ def build(args: argparse.Namespace) -> Path:
     cargo_profile = _cargo_profile_for_build(build_profile)
     repo = Path(args.repo_root).resolve(strict=True)
     selected, layout = _select_source(repo, args.source_root)
+    compose_project = _compose_identity(layout)["project_name"]
     run_id, run_root = _new_run_root(layout)
     terminal = {
         "schema": "fullmag.direct-compose-build.v1",
@@ -1331,6 +1416,7 @@ def build(args: argparse.Namespace) -> Path:
         "queue": "not-used",
         "build_profile": build_profile,
         "cargo_profile": cargo_profile,
+        "compose_project": compose_project,
     }
     _write_json(run_root / "receipt.json", terminal)
 
@@ -1378,6 +1464,7 @@ def build(args: argparse.Namespace) -> Path:
         # backend cache.  A missing image is built by compose.dev's dedicated
         # Dockerfile.backend; it is never fetched implicitly from a registry.
         placeholder_environment = {
+            **_compose_identity_environment(layout),
             "FULLMAG_DEV_IMAGE": args.image or os.environ.get("FULLMAG_DEV_IMAGE", DEFAULT_IMAGE),
             "FULLMAG_RELEASE_IMAGE": args.image or os.environ.get("FULLMAG_DEV_IMAGE", DEFAULT_IMAGE),
             "FULLMAG_TOOLCHAIN_IMAGE": args.toolchain_image or os.environ.get("FULLMAG_TOOLCHAIN_IMAGE", DEFAULT_BASE_IMAGE),
@@ -1414,6 +1501,7 @@ def build(args: argparse.Namespace) -> Path:
         placeholder_environment["FULLMAG_TOOLCHAIN_IMAGE_ID"] = str(base_info["toolchain_image_id"])
         image_ref, image_id, _image_document, image_built = _runtime_image_reference(
             args, repo, placeholder_environment, run_root, layout, base_info,
+            compose_project,
         )
         toolchain_id = str(base_info["toolchain_image_id"])
         terminal.update(
@@ -1453,7 +1541,7 @@ def build(args: argparse.Namespace) -> Path:
             str(base_info["reference"]),
             cargo_profile,
         )
-        config = _compose_config(repo, files, environment)
+        config = _compose_config(repo, files, environment, project=compose_project)
         backend = config["services"]["backend"]
         if not isinstance(backend, dict):
             raise _fail("direct Compose backend service is malformed")
@@ -1466,7 +1554,7 @@ def build(args: argparse.Namespace) -> Path:
             raise _fail("direct backend Compose service misses mounts: " + ", ".join(sorted(missing_mounts)))
         override = _prepare_override(backend)
         command = [
-            *_compose_prefix(repo, files),
+            *_compose_prefix(repo, files, compose_project),
             "run", "--rm", "--no-deps", "--name", "fullmag-backend-build-" + run_id[:16],
             "backend", *override,
         ]
@@ -1518,12 +1606,13 @@ def build(args: argparse.Namespace) -> Path:
 def up(args: argparse.Namespace) -> None:
     _require_native_windows()
     repo = Path(args.repo_root).resolve(strict=True)
-    _assert_no_running_fullmag()
+    selected, layout = _select_source(repo, args.source_root)
+    compose_project = _compose_identity(layout)["project_name"]
+    _assert_no_running_fullmag(compose_project)
+    from fullmag_docker_runtime import assert_loopback_port_available, start
+    assert_loopback_port_available(args.port, compose_project)
     assembly_receipt = build(args)
-    _assert_no_running_fullmag()
-    from fullmag_docker_runtime import start
-
-    selected, _layout = _select_source(repo, args.source_root)
+    _assert_no_running_fullmag(compose_project)
     # Keep startup_script opaque to this launcher.  The existing startup helper
     # performs the path admission, source containment, hash, and wait_for_solve
     # policy checks against the same selected live checkout.
@@ -1534,16 +1623,15 @@ def up(args: argparse.Namespace) -> None:
         frontend="dev",
         source_root=selected,
         startup_script=args.script,
-        project_name=PROJECT_NAME,
+        project_name=compose_project,
         compose_template=repo / COMPOSE_RUNTIME_FILE,
     )
 
 
 def recreate(args: argparse.Namespace) -> None:
-    """Recreate services from one named run while retaining its state root."""
+    """Recreate one named run, optionally promoting its Compose project."""
     _require_native_windows()
     repo = Path(args.repo_root).resolve(strict=True)
-    _assert_no_running_fullmag()
     from fullmag_docker_runtime import start
 
     # No build or latest-run lookup is allowed here.  The runtime validates the
@@ -1553,10 +1641,11 @@ def recreate(args: argparse.Namespace) -> None:
         "frontend": "dev",
         "source_root": args.source_root,
         "startup_script": args.script,
-        "project_name": PROJECT_NAME,
+        "project_name": None,
         "compose_template": repo / COMPOSE_RUNTIME_FILE,
         "run_receipt": args.run_receipt,
         "previous_config_sha256": args.previous_config_sha256,
+        "migrate_compose_project": getattr(args, "migrate_compose_project", False),
     }
     recovery_authorization = getattr(args, "recover_idle_failure", None)
     if recovery_authorization is not None:
@@ -1608,6 +1697,13 @@ def _parser() -> argparse.ArgumentParser:
     recreate_parser.add_argument(
         "--previous-config-sha256", required=True,
         help="exact raw SHA-256 of the prior runtime service config",
+    )
+    recreate_parser.add_argument(
+        "--migrate-compose-project", action="store_true",
+        help=(
+            "explicitly promote a validated legacy fullmag run to the "
+            "canonical project for the same registered checkout"
+        ),
     )
     recreate_parser.add_argument(
         "--recover-idle-failure", type=Path,

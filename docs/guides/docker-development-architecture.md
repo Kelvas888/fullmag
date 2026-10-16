@@ -351,15 +351,32 @@ użycia niezmienionych wejść, nie dowolnej przyszłej zmiany modułu. Cache
 powiększono z 12 do 24 GiB z zachowaniem UUID i istniejących obiektów.
 Nie usunięto wyników symulacji ani współdzielonego cache.
 
+### Ostatni potwierdzony build i poprawka cache
+
+Build `64815e43fe4b408c9209d7e6c45b00f7` zakończył się `succeeded`, exit 0.
+Obejmuje pełny backend i poprawkę odzyskiwania konfiguracji zewnętrznej.
+Sukces kompilacji nie potwierdza uruchomienia tego pakietu: jego zastosowanie
+pozostaje w toku. Nie jest to pomiar szybkości trybu dev.
+
+Commit `a37e7ab54f5ea11657b7ade4734b499f9090327d` usuwa kolejną przyczynę
+zbędnej kompilacji FEM. Zmienny hash snapshotu trafia do wygenerowanego nagłówka
+używanego tylko przez `runtime_build_info.cpp`. Sprawdzenie configure-only
+potwierdziło, że zmiana snapshotu zmienia nagłówek, zachowując zawartość i mtime
+wspólnego `flags.make`; legacy managed capsule zachowuje swój guard.
+Osobna regresja sprawdza, że pakowanie nie dobiera bibliotek z obcego profilu.
+Nie jest to jeszcze dowód czasu następnej kompilacji ani wykonania GPU.
+
 ## Warunki odbioru
 
-1. Bezpośredni start dwóch usług w projekcie `fullmag`, bez zgłoszenia joba runnera.
+1. Bezpośredni start dwóch usług w projekcie przypisanym do checkoutu: `fullmag-master` albo czytelne `fullmag-worktree-<nazwa>`, bez zgłoszenia joba runnera. Tymczasowy build backendu należy do tego samego projektu Compose.
 2. Pełny backend zbudowany w swoim kontenerze, frontend uruchomiony w swoim.
 3. Home widoczny w przeglądarce oraz działające połączenie z API pod tym samym adresem.
 4. Zapis źródła Windows powoduje HMR; jawna kolejna przebudowa backendu używa cache.
 5. Sesje i wyniki są widoczne w wybranym rzeczywistym storage Windows po restarcie.
 6. Start ze skryptem aktywuje właściwy model i respektuje interaktywny `wait_for_solve`.
 7. Osobne dowody wykonania CPU/GPU; sam build, wykrycie GPU i HTTP 200 nie są takim dowodem.
+8. Dwie grupy mają odrębne porty, sieci, ustawienia i historię projektów; recreate zachowuje dane właściwej grupy. Równoległe działanie różnych generacji nie może omijać wspólnych rezerwacji sprzętu.
+9. Tryb dev nie pakuje całego repozytorium do tar-a przy każdej iteracji; mała zmiana backendu zachowuje niezmienione obiekty i ma zmierzony czas przebudowy. Release zachowuje odrębną ścieżkę dystrybucyjną.
 
 ## Kolejność wdrożenia — stałe numery zadań
 
@@ -370,7 +387,7 @@ Nie usunięto wyników symulacji ani współdzielonego cache.
 5. Uruchomić trwały cache kompilacji backendu.
 6. Zbudować pełny backend: FDM/FEM, CPU/GPU.
 7. Uruchomić frontend Next.js z montowanych źródeł.
-8. Uruchomić oba kontenery w grupie `fullmag`.
+8. Uruchomić oba kontenery w grupie przypisanej do checkoutu, z osobną siecią i portem.
 9. Sprawdzić widoczny Home i komunikację UI–API.
 10. Potwierdzić HMR po edycji pliku w Windows.
 11. Potwierdzić przyrostową przebudowę backendu bez utraty cache.

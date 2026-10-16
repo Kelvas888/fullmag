@@ -25,6 +25,10 @@ from local_runner.worker_entrypoint import verify_source
 from run_managed_browser import digest, host_path, read_json, validate_managed_build
 
 PROFILE = "docker-all-gpu"
+# ``fullmag`` was the project name emitted by the pre-grouped Compose runner.
+# It remains admissible only when an explicitly named, fully validated run is
+# being recreated. Fresh starts must use the checkout-derived identity.
+LEGACY_COMPOSE_PROJECT = "fullmag"
 # Development frontend grace covers both pinned tool probes, the cold pnpm
 # install on the Windows bind, and the bounded Next process startup margin.
 FRONTEND_DEV_READY_TIMEOUT_SECONDS = 3900
@@ -51,6 +55,10 @@ RUNTIME_CONFIG_HISTORY_RELATIVE = Path("state") / RUNTIME_CONFIG_RELATIVE
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _CONFIG_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
+_SOURCE_IDENTITY_FIELDS = (
+    "source_project_id", "source_worktree_id", "source_checkout_kind",
+)
+_SOURCE_LABEL_VALUE_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 _TOOLCHAIN_MANIFEST_PROBE = r'''
 import os
 import stat
@@ -234,6 +242,120 @@ def docker(*args, combined=False, timeout=60, environment=None):
     return (result.stdout + result.stderr if combined else result.stdout).strip()
 
 
+def _published_host_port_conflicts(document, port):
+    host = document.get("HostConfig") if isinstance(document, dict) else None
+    bindings = host.get("PortBindings") if isinstance(host, dict) else None
+    if not isinstance(bindings, dict):
+        return False
+    for entries in bindings.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or str(entry.get("HostPort", "")) != str(port):
+                continue
+            host_ip = str(entry.get("HostIp") or "")
+            if host_ip in {"", "0.0.0.0", "::", "[::]", "127.0.0.1", "::1", "[::1]"}:
+                return True
+    return False
+
+
+def _windows_loopback_port_conflicts(port):
+    """Inspect native Windows listeners; fail closed if the probe is unavailable."""
+
+    if os.name != "nt":
+        return []
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+    if not system_root:
+        raise ValueError("Could not inspect native Windows loopback port ownership: SystemRoot is unset")
+    powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    command = [
+        str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+        (
+            "$ErrorActionPreference='Stop'; "
+            "@(Get-NetTCPConnection -State Listen "
+            "| Where-Object { $_.LocalPort -eq "
+            + str(port)
+            + " } | Select-Object LocalAddress,LocalPort,OwningProcess,@{Name='State';Expression={[string]$_.State}} "
+            + " | ConvertTo-Json -Compress)"
+        ),
+    ]
+    try:
+        result = subprocess.run(
+            command, text=True, capture_output=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        raise ValueError(
+            "Could not inspect native Windows loopback port ownership"
+        ) from error
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise ValueError(
+            "Could not inspect native Windows loopback port ownership: " + detail
+        )
+    raw = result.stdout.strip()
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("Native Windows loopback port probe returned invalid JSON") from error
+    records = value if isinstance(value, list) else [value] if isinstance(value, dict) else None
+    if records is None or any(not isinstance(record, dict) for record in records):
+        raise ValueError("Native Windows loopback port probe returned an invalid record")
+    wildcard_addresses = {
+        "", "*", "0.0.0.0", "::", "[::]", "0:0:0:0:0:0:0:0",
+        "127.0.0.1", "::1", "[::1]", "::ffff:127.0.0.1",
+    }
+    conflicts = []
+    for record in records:
+        if str(record.get("State", "")).lower() != "listen":
+            continue
+        address = str(record.get("LocalAddress") or "").strip().lower()
+        if address not in wildcard_addresses:
+            continue
+        conflicts.append(
+            f"Windows PID {record.get('OwningProcess', '<unknown>')} ({address or '<any>'})"
+        )
+    return conflicts
+
+
+def assert_loopback_port_available(port, project):
+    """Reject host listeners before any runtime state mutation."""
+
+    if not 1024 <= port <= 65535:
+        raise ValueError("Port must be between 1024 and 65535")
+    if not isinstance(project, str) or re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project) is None:
+        raise ValueError("Invalid Compose project name")
+    native_conflicts = _windows_loopback_port_conflicts(port)
+    if native_conflicts:
+        raise ValueError(
+            f"Requested loopback port {port} is already bound by native Windows: "
+            + ", ".join(native_conflicts)
+        )
+    running_ids = [value for value in docker("ps", "--quiet").splitlines() if value.strip()]
+    if not running_ids:
+        return
+    try:
+        documents = json.loads(docker("inspect", *running_ids))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("Could not inspect running Docker containers for port ownership") from error
+    if not isinstance(documents, list):
+        raise ValueError("Docker container port inspection returned an invalid document")
+    conflicts = []
+    for document in documents:
+        if not isinstance(document, dict) or not _published_host_port_conflicts(document, port):
+            continue
+        labels = document.get("Config", {}).get("Labels") if isinstance(document.get("Config"), dict) else {}
+        name = str(document.get("Name") or "<unknown>").lstrip("/")
+        owner = labels.get("com.docker.compose.project", "unknown") if isinstance(labels, dict) else "unknown"
+        conflicts.append(f"{name} (project {owner})")
+    if conflicts:
+        raise ValueError(
+            f"Requested loopback port {port} is already bound by Docker: "
+            + ", ".join(conflicts)
+        )
+
+
 def image_id(value):
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
         raise ValueError("A full immutable image ID is required")
@@ -252,9 +374,37 @@ def validate_workspace_environment(config):
         raise ValueError("Runtime toolchain environment overrides model execution intent")
 
 
+def _compose_source_environment(project, source_identity):
+    from docker_compose_identity import compose_network_name, source_labels
+
+    expected_network = compose_network_name(project)
+    if source_identity is None:
+        return {
+            "FULLMAG_COMPOSE_PROJECT": project,
+            "FULLMAG_COMPOSE_NETWORK": expected_network,
+            "FULLMAG_SOURCE_PROJECT_ID": "unknown",
+            "FULLMAG_SOURCE_WORKTREE_ID": "unknown",
+            "FULLMAG_SOURCE_CHECKOUT_KIND": "unknown",
+        }
+
+    labels = source_labels(source_identity)
+    if labels["org.fullmag.compose.project"] != project:
+        raise ValueError("Compose project does not match the selected source checkout")
+    network_name = source_identity.get("network_name")
+    if network_name != expected_network:
+        raise ValueError("Compose network does not match the selected source checkout")
+    return {
+        "FULLMAG_COMPOSE_PROJECT": project,
+        "FULLMAG_COMPOSE_NETWORK": network_name,
+        "FULLMAG_SOURCE_PROJECT_ID": labels["org.fullmag.source.project-id"],
+        "FULLMAG_SOURCE_WORKTREE_ID": labels["org.fullmag.source.worktree-id"],
+        "FULLMAG_SOURCE_CHECKOUT_KIND": labels["org.fullmag.source.checkout-kind"],
+    }
+
+
 def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs=None,
                  inputs_path=None, package=None, provenance=None, toolchain_image=None,
-                 project="fullmag-config-check", template=None, host_ledger=None,
+                 project="fullmag-config-check", source_identity=None, template=None, host_ledger=None,
                  startup=None, frontend_cache=None, previous_config_sha256=None,
                  recovery=None):
     """Resolve the versioned Compose definition; do not generate service topology."""
@@ -267,6 +417,7 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
     repo = Path(repo or Path(__file__).resolve().parents[1])
     template = Path(template) if template is not None else repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml")
     environment = {
+        **_compose_source_environment(project, source_identity),
         "FULLMAG_RELEASE_IMAGE": image, "FULLMAG_DEV_IMAGE": image,
         "FULLMAG_TOOLCHAIN_IMAGE": toolchain_image or image,
         "FULLMAG_TOOLCHAIN_IMAGE_ID": toolchain_image or image,
@@ -1056,6 +1207,77 @@ def _load_reuse_run(layout, run_receipt, *, project_name, frontend,
     }
 
 
+def _select_reuse_compose_identity(source_identity, expected_project, reuse):
+    """Select the project identity for a fresh start or explicit reuse.
+
+    The checkout-derived project name is mandatory for fresh starts.  A
+    legacy ``fullmag`` name is accepted only after ``_load_reuse_run`` has
+    admitted an explicitly named run and only for that run's recreation.  The
+    adapter does not rename containers, import metadata, or mutate the reuse
+    receipt; it only supplies the recorded labels to the Compose attestation.
+    """
+    if reuse is None:
+        return expected_project, source_identity, None
+
+    project = reuse.get("project")
+    if project == expected_project:
+        return project, source_identity, None
+    if project != LEGACY_COMPOSE_PROJECT:
+        raise ValueError("Reused Compose project does not match the selected source checkout")
+
+    receipt = reuse.get("receipt")
+    if not isinstance(receipt, dict):
+        raise ValueError("Legacy reused run has no validated receipt")
+    recorded = {field: receipt.get(field) for field in _SOURCE_IDENTITY_FIELDS}
+    present = [field in receipt for field in _SOURCE_IDENTITY_FIELDS]
+    if any(present) and not all(present):
+        raise ValueError("Legacy reused run has a partial source identity")
+
+    adapted = dict(source_identity)
+    adapted["project_name"] = LEGACY_COMPOSE_PROJECT
+    adapted["network_name"] = f"{LEGACY_COMPOSE_PROJECT}_fullmag"
+    if all(present):
+        for field in _SOURCE_IDENTITY_FIELDS:
+            value = recorded[field]
+            if not isinstance(value, str) or _SOURCE_LABEL_VALUE_RE.fullmatch(value) is None:
+                raise ValueError("Legacy reused run has an invalid source identity label")
+        if recorded["source_project_id"] != source_identity["project_id"]:
+            raise ValueError("Legacy reused run belongs to another source project")
+        if recorded["source_worktree_id"] != source_identity["worktree_id"]:
+            raise ValueError("Legacy reused run belongs to another registered checkout")
+        # Preserve the label emitted by the retained run. Older receipts may
+        # use ``master`` while the canonical identity now says
+        # ``main-checkout``; this field is provenance, not branch selection.
+        adapted["checkout_kind"] = recorded["source_checkout_kind"]
+    return project, adapted, "legacy-compose-project"
+
+
+def _select_migration_compose_identity(source_identity, expected_project, reuse):
+    """Promote one validated legacy run to the selected checkout's project.
+
+    This is an explicit metadata/Compose identity change only.  The caller
+    keeps ``reuse["root"]`` and ``reuse["state"]`` and must perform the target
+    project absence fence before preserving evidence or publishing a config.
+    """
+    if (reuse is None or reuse.get("project") != LEGACY_COMPOSE_PROJECT
+            or expected_project == LEGACY_COMPOSE_PROJECT):
+        raise ValueError("Compose project migration requires a validated legacy fullmag run")
+    _, legacy_identity, _ = _select_reuse_compose_identity(
+        source_identity, expected_project, reuse
+    )
+    migrated = dict(legacy_identity)
+    migrated["project_name"] = expected_project
+    migrated["network_name"] = source_identity["network_name"]
+    return expected_project, migrated, "legacy-compose-project-migrated"
+
+
+def _assert_compose_project_absent(project):
+    """Reuse the all-state/container and network admission fence for a target."""
+    from docker_dev import _assert_no_running_fullmag
+
+    _assert_no_running_fullmag(project)
+
+
 def _preserve_reuse_evidence(reuse):
     """Copy only owned run metadata before any same-run receipt is replaced."""
     root = reuse["root"]
@@ -1286,7 +1508,7 @@ def _reuse_host_certificate(reuse, assembly, engine_id):
 def start(repo, assembly_receipt, port, frontend="static", source_root=None,
           startup_script=None, *, project_name=None, compose_template=None,
           run_receipt=None, previous_config_sha256=None,
-          recovery_authorization=None):
+          recovery_authorization=None, migrate_compose_project=False):
     if project_name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project_name):
         raise ValueError("Invalid Compose project name")
     if not 1024 <= port <= 65535:
@@ -1294,6 +1516,17 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
     if frontend not in {"static", "dev"}:
         raise ValueError("Frontend mode must be static or dev")
     layout = storage.resolve_layout(repo, PROFILE)
+    # A selected worktree owns its own build/run/history namespace.  For
+    # recreate without --source-root, read the explicitly named receipt only
+    # to discover that registered checkout; _load_reuse_run still validates the
+    # receipt containment, schema, owner and stopped containers below.
+    if source_root is not None:
+        layout = storage.resolve_layout(Path(source_root).resolve(strict=True), PROFILE)
+    elif run_receipt is not None:
+        preliminary = _read_reuse_json(Path(run_receipt), "Docker runtime run receipt")
+        recorded_source = preliminary.get("frontend_source_root") or preliminary.get("source_root")
+        if isinstance(recorded_source, str) and recorded_source:
+            layout = storage.resolve_layout(Path(recorded_source).resolve(strict=True), PROFILE)
     reuse = _load_reuse_run(
         layout,
         run_receipt,
@@ -1335,6 +1568,29 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             source_root = reuse["source_root"]
         elif Path(source_root).resolve(strict=True) != reuse["source_root"]:
             raise ValueError("Requested live source checkout differs from the reused run")
+    source_layout = storage.resolve_layout(Path(source_root).resolve(strict=True) if source_root is not None else repo, PROFILE)
+    if reuse is None:
+        layout = source_layout
+    elif layout["worktree_id"] != source_layout["worktree_id"]:
+        raise ValueError("Reused run storage identity differs from the selected source checkout")
+    from docker_compose_identity import compose_project_identity
+    source_identity = compose_project_identity(source_layout)
+    expected_project = source_identity["project_name"]
+    if project_name is not None:
+        requested_project = reuse["project"] if reuse is not None else expected_project
+        if project_name != requested_project:
+            raise ValueError("Requested Compose project does not match the selected source checkout")
+    project, source_identity, identity_compatibility = _select_reuse_compose_identity(
+        source_identity, expected_project, reuse
+    )
+    if migrate_compose_project:
+        project, source_identity, identity_compatibility = _select_migration_compose_identity(
+            source_identity, expected_project, reuse
+        )
+        # This check covers every container state and the deterministic
+        # project network. It is deliberately read-only: migration never
+        # stops or removes a conflicting target instance.
+        _assert_compose_project_absent(project)
     assembly_receipt = storage.validate_path(assembly_receipt, Path(layout["build_storage_root"]))
     assembly = read_json(assembly_receipt)
     if assembly.get("schema") != "fullmag.docker-all-image.v1" or assembly.get("state") != "succeeded" or assembly.get("exit_code") != 0:
@@ -1361,6 +1617,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             raise ValueError("Mounted backend package changed since image assembly")
     elif assembly.get("runtime_mode") == "development_source_bind":
         raise ValueError("Static mode requires a packaged release image")
+    assert_loopback_port_available(port, project)
     storage.initialize(layout)
     selected_checkout = None
     preflight_inputs = None
@@ -1396,16 +1653,22 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         state = reuse["state"]
         metadata_root = reuse["metadata_root"]
     register_runtime_reference_root(layout, root)
-    project = reuse["project"] if reuse is not None else project_name or "fullmag-all-" + root.name
     spec = root / "compose.json"
     host_certificate = root / "windows-folder-host.json"
     receipt = {"schema": "fullmag.docker-all-run.v1", "state": "starting", "image_id": image,
                "compose_project": project, "compose_file": str(spec), "state_root": str(state),
+               "source_project_id": source_identity["project_id"],
+               "source_worktree_id": source_identity["worktree_id"],
+               "source_checkout_kind": source_identity["checkout_kind"],
                "host_certificate": str(host_certificate),
                "assembly_receipt": str(assembly_receipt), "assembly_receipt_sha256": digest(assembly_receipt),
                "native_source_identity": assembly["native_source_identity"],
                "url": f"http://localhost:{port}/workspace", "qualification": "NOT VERIFIED",
                "frontend_mode": frontend, "container_http_port": 8080 if frontend == "dev" else 8081}
+    if identity_compatibility is not None:
+        receipt["compose_identity_compatibility"] = identity_compatibility
+    if migrate_compose_project:
+        receipt["migrated_from"] = reuse["project"]
     if reuse is not None:
         receipt.update(
             reused_from=str(reuse["receipt_path"]),
@@ -1554,7 +1817,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             return compose_spec(image, state.resolve(), port, host_certificate.resolve(),
                                 repo=repo, inputs=inputs, inputs_path=inputs_path.resolve(),
                                 package=assembly.get("package_root"),
-                                provenance=assembly_receipt, project=project,
+                                provenance=assembly_receipt, project=project, source_identity=source_identity,
                                 toolchain_image=assembly.get("base_image"), template=compose_source_path,
                                 host_ledger=host_ledger, startup=startup,
                                 frontend_cache=frontend_cache, recovery=recovery,
@@ -1684,6 +1947,8 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         container = docker(*args, "ps", "--quiet", "backend")
         receipt["container_id"] = container
         actual = json.loads(docker("inspect", container))[0]
+        from docker_compose_identity import validate_source_labels
+        validate_source_labels(actual, source_identity)
         from docker_host_ledger import validate_container as validate_host_ledger
         receipt["host_ledger_attestation"] = validate_host_ledger(actual, host_ledger, docker)
         bindings = {str(receipt["container_http_port"]) + "/tcp":
@@ -1693,6 +1958,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             frontend_container = docker(*args, "ps", "--quiet", "frontend")
             receipt["frontend_container_id"] = frontend_container
             front = json.loads(docker("inspect", frontend_container))[0]
+            validate_source_labels(front, source_identity)
             attest_mounts(front, inputs, inputs_path)
             front_host = front["HostConfig"]
             if (front["Image"] != image or front_host.get("PortBindings") != bindings
@@ -1714,12 +1980,13 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 raise ValueError("Frontend writable state mount must be its isolated development directory")
             bindings = {}
         from docker_compose_attestation import service_network, network_owner
-        network_id = service_network(actual, project, hostname="fullmag-" + root.name)
-        if inputs is not None and service_network(front, project) != network_id:
+        network_name = source_identity["network_name"]
+        network_id = service_network(actual, project, network_name=network_name, hostname="fullmag-" + root.name)
+        if inputs is not None and service_network(front, project, network_name=network_name) != network_id:
             raise ValueError("Frontend and backend are attached to different networks")
-        network_owner(json.loads(docker("network", "inspect", network_id))[0], project, network_id)
+        network_owner(json.loads(docker("network", "inspect", network_id))[0], project, network_id, network_name=network_name)
         receipt["network_id"] = network_id
-        receipt["network_name"] = project + "_fullmag"
+        receipt["network_name"] = network_name
         host = actual["HostConfig"]
         if actual["Image"] != image or (host.get("PortBindings") or {}) != bindings:
             raise ValueError("Runtime image or loopback port attestation mismatch")
@@ -1832,7 +2099,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 image, state.resolve(), port, host_certificate.resolve(),
                 repo=repo, inputs=inputs, inputs_path=inputs_path.resolve(),
                 package=assembly.get("package_root"), provenance=assembly_receipt,
-                project=project, toolchain_image=assembly.get("base_image"),
+                project=project, source_identity=source_identity, toolchain_image=assembly.get("base_image"),
                 template=compose_source_path, host_ledger=host_ledger,
                 startup=startup, frontend_cache=frontend_cache,
                 recovery=None, previous_config_sha256=previous_config_sha256,

@@ -530,9 +530,10 @@ class DockerDevRecreateContract(unittest.TestCase):
             source_root=None,
             port=3197,
             script=None,
+            migrate_compose_project=False,
         )
         with patch.object(docker_dev, "_require_native_windows"), \
-                patch.object(docker_dev, "_assert_no_running_fullmag"), \
+                patch.object(docker_dev, "_assert_no_running_fullmag") as guard, \
                 patch.dict(sys.modules, {"fullmag_docker_runtime": fake_runtime}):
             docker_dev.recreate(args)
         fake_runtime.start.assert_called_once_with(
@@ -542,11 +543,46 @@ class DockerDevRecreateContract(unittest.TestCase):
             frontend="dev",
             source_root=None,
             startup_script=None,
-            project_name="fullmag",
+            project_name=None,
             compose_template=repo.resolve() / docker_dev.COMPOSE_RUNTIME_FILE,
             run_receipt=args.run_receipt,
             previous_config_sha256=args.previous_config_sha256,
+            migrate_compose_project=False,
         )
+        guard.assert_not_called()
+
+    def test_recreate_forwards_explicit_compose_project_migration(self):
+        fake_runtime = types.ModuleType("fullmag_docker_runtime")
+        fake_runtime.start = Mock()
+        repo = Path(__file__).resolve().parents[1]
+        args = types.SimpleNamespace(
+            repo_root=repo,
+            run_receipt=Path("/owned/receipt.json"),
+            assembly_receipt=Path("/owned/new-assembly.json"),
+            previous_config_sha256="d" * 64,
+            source_root=None,
+            port=3197,
+            script=None,
+            migrate_compose_project=True,
+        )
+        with patch.object(docker_dev, "_require_native_windows"), \
+                patch.object(docker_dev, "_assert_no_running_fullmag") as guard, \
+                patch.dict(sys.modules, {"fullmag_docker_runtime": fake_runtime}):
+            docker_dev.recreate(args)
+        fake_runtime.start.assert_called_once_with(
+            repo.resolve(),
+            args.assembly_receipt,
+            3197,
+            frontend="dev",
+            source_root=None,
+            startup_script=None,
+            project_name=None,
+            compose_template=repo.resolve() / docker_dev.COMPOSE_RUNTIME_FILE,
+            run_receipt=args.run_receipt,
+            previous_config_sha256=args.previous_config_sha256,
+            migrate_compose_project=True,
+        )
+        guard.assert_not_called()
 
     def test_reuse_restart_sentinel_rotates_with_new_image_identity(self):
         with tempfile.TemporaryDirectory() as directory:
