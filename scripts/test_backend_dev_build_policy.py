@@ -1,5 +1,6 @@
 """Exercise build policy without compiling Rust or CUDA unit tests."""
 from pathlib import Path
+import json
 import os
 import re
 import shlex
@@ -143,6 +144,56 @@ def test_install_cli_dev_pins_fdm_package_to_explicit_native_root():
         assert "Failed to copy FDM library" in copy_failure.stderr
 
 
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None,
+    reason="The extracted Makefile recipe is a Linux-container regression",
+)
+def test_native_library_fallback_stays_within_selected_profile():
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    start = makefile.index('\tif [ -n "$${FULLMAG_FDM_NATIVE_BUILD_ROOT:-}" ]; then')
+    end = makefile.index("\tprintf '%s\\n' \"$$build_mode\"", start)
+    recipe = makefile[start:end].replace("$$", "$")
+
+    def run_fragment(case_root):
+        (case_root / ".fullmag/local/lib").mkdir(parents=True, exist_ok=True)
+        environment = os.environ.copy()
+        environment.pop("FULLMAG_FDM_NATIVE_BUILD_ROOT", None)
+        environment.pop("FULLMAG_SOURCE_SNAPSHOT_SHA256", None)
+        script = "\n".join(
+            (
+                "set -eu",
+                f"cargo_target_dir={shlex.quote(str(case_root / 'cargo-target'))}",
+                "cargo_profile_dir=release",
+                "cargo_target_profile_dir=\"$cargo_target_dir/$cargo_profile_dir\"",
+                "build_mode=cuda-fem-gpu",
+                recipe,
+            )
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            cwd=case_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        case_root = Path(directory) / "foreign-only"
+        for family in ("fdm", "fem"):
+            foreign = (
+                case_root
+                / "cargo-target/backend-dev/build"
+                / f"fullmag-{family}-sys-foreign/out/native-build/backends/{family}"
+                / f"libfullmag_{family}.so.9"
+            )
+            foreign.parent.mkdir(parents=True, exist_ok=True)
+            foreign.write_text("foreign", encoding="utf-8")
+
+        result = run_fragment(case_root)
+        assert result.returncode == 0, result.stderr
+        assert not list((case_root / ".fullmag/local/lib").glob("libfullmag_*.so*"))
+
+
 @pytest.mark.skipif(not shutil.which("cmake"), reason="CMake required")
 def test_cuda_source_digest_changes_only_its_consumer_compile_definition(tmp_path):
     source = (ROOT / "backends/fdm/CMakeLists.txt").read_text(encoding="utf-8")
@@ -189,3 +240,103 @@ endif()
                  if p.suffix in (".cu", ".cpp", ".hpp", ".h")
                  and MACRO in p.read_text(encoding="utf-8")]
     assert consumers == [ROOT / "backends/fdm/gpu/cuda/transport/context.cu"]
+
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("cmake") is None or shutil.which("make") is None,
+    reason="Unix CMake generator required for configure-only source contract",
+)
+def test_direct_compose_fem_snapshot_header_isolated_from_shared_flags(tmp_path):
+    cmake_source = (ROOT / "backends/fem/CMakeLists.txt").read_text(encoding="utf-8")
+    function_start = cmake_source.index(
+        "function(fullmag_configure_runtime_source_snapshot target)"
+    )
+    function_end = cmake_source.index("endfunction()", function_start) + len("endfunction()")
+    production_function = cmake_source[function_start:function_end]
+    template = (ROOT / "backends/fem/cpu/mfem/runtime/runtime_build_info_snapshot.hpp.in").read_text(
+        encoding="utf-8"
+    )
+    runtime = tmp_path / "cpu/mfem/runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "runtime_build_info.cpp").write_text(
+        "int runtime_build_info_fixture() { return 0; }\n", encoding="utf-8"
+    )
+    (runtime / "runtime_build_info_snapshot.hpp.in").write_text(template, encoding="utf-8")
+    (runtime.parent / "other.cpp").write_text(
+        "int unrelated_fixture() { return 0; }\n", encoding="utf-8"
+    )
+    (tmp_path / "CMakeLists.txt").write_text(
+        "\n".join(
+            (
+                "cmake_minimum_required(VERSION 3.20)",
+                "project(FullmagFemRuntimeSnapshotScope LANGUAGES CXX)",
+                'set(FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256 "" CACHE STRING "")',
+                'set(FULLMAG_DIRECT_COMPOSE "1" CACHE STRING "")',
+                "add_library(fullmag_fem SHARED cpu/mfem/runtime/runtime_build_info.cpp cpu/mfem/other.cpp)",
+                production_function,
+                "fullmag_configure_runtime_source_snapshot(fullmag_fem)",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    cmake = shutil.which("cmake")
+    build = tmp_path / "build"
+    digest_a = "a" * 64
+    digest_b = "b" * 64
+
+    def configure(digest, direct="1", build_dir=build):
+        result = subprocess.run(
+            [
+                cmake,
+                "-G",
+                "Unix Makefiles",
+                "-S",
+                str(tmp_path),
+                "-B",
+                str(build_dir),
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                f"-DFULLMAG_FEM_SOURCE_SNAPSHOT_SHA256={digest}",
+                f"-DFULLMAG_DIRECT_COMPOSE={direct}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    configure(digest_a)
+    header = build / "generated/fullmag_fem_runtime_source_snapshot.hpp"
+    flags = build / "CMakeFiles/fullmag_fem.dir/flags.make"
+    assert digest_a in header.read_text(encoding="utf-8")
+    header_a_mtime = header.stat().st_mtime_ns
+    flags_a = flags.read_bytes()
+    flags_a_mtime = flags.stat().st_mtime_ns
+    assert digest_a.encode() not in flags_a
+    commands = json.loads((build / "compile_commands.json").read_text(encoding="utf-8"))
+    runtime_command = next(item["command"] for item in commands if item["file"].endswith("runtime_build_info.cpp"))
+    other_command = next(item["command"] for item in commands if item["file"].endswith("other.cpp"))
+    generated_include = str(build / "generated")
+    assert generated_include in runtime_command
+    assert generated_include not in other_command
+
+    configure(digest_a)
+    assert header.read_text(encoding="utf-8")
+    assert header.stat().st_mtime_ns == header_a_mtime
+    assert flags.read_bytes() == flags_a
+    assert flags.stat().st_mtime_ns == flags_a_mtime
+
+    configure(digest_b)
+    assert digest_b in header.read_text(encoding="utf-8")
+    assert digest_a not in header.read_text(encoding="utf-8")
+    assert flags.read_bytes() == flags_a
+    assert flags.stat().st_mtime_ns == flags_a_mtime
+
+    legacy_build = tmp_path / "legacy-build"
+    configure(digest_b, direct="0", build_dir=legacy_build)
+    legacy_flags = (legacy_build / "CMakeFiles/fullmag_fem.dir/flags.make").read_text(
+        encoding="utf-8"
+    )
+    assert "FULLMAG_FEM_SOURCE_SNAPSHOT_SHA256" in legacy_flags
+    assert digest_b in legacy_flags
