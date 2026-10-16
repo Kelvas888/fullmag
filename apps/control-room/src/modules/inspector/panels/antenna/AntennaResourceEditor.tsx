@@ -34,6 +34,8 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
   const context = contextState.key === key ? contextState : { key, token: {} };
   if (contextState.key !== key) setContext(context);
   const [local, setLocal] = useState<AntennaResourceDraft | null>(null);
+  const [acknowledgedBase, setAcknowledgedBase] = useState<AntennaResourceDraft | null>(null);
+  if (acknowledgedBase && acknowledgedBase.key !== key) setAcknowledgedBase(null);
   if (local && local.key !== key) setLocal(null);
   const [pendingState, setPending] = useState<{ token: object } | null>(null);
   const [feedback, setFeedback] = useState<{ key: string; kind: "success" | "error"; message: string } | null>(null);
@@ -41,17 +43,19 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
   const inflight = useRef<object | null>(null);
   useLayoutEffect(() => { owner.current = context.token; return () => { owner.current = null; }; }, [context.token]);
   const resource = antennaEditableResource(scene, kind, resourceId);
-  const initial = scene && resource && typeof scene.revision === "number" ? createAntennaResourceDraft(scene, kind, resourceId, key) : null;
+  const awaitingScene = acknowledgedBase?.key === key && (scene?.revision ?? -1) < acknowledgedBase.baseRevision;
+  const initial = awaitingScene ? acknowledgedBase : scene && resource && typeof scene.revision === "number" ? createAntennaResourceDraft(scene, kind, resourceId, key) : null;
   const draft = local?.key === key ? local : initial;
   const dirty = local?.key === key;
-  const pending = pendingState?.token === context.token;
+  const pending = pendingState?.token === context.token || awaitingScene;
   const revision = typeof scene?.revision === "number" && Number.isSafeInteger(scene.revision) ? scene.revision : null;
-  const conflict = Boolean(dirty && draft?.baseRevision !== revision);
+  const conflict = Boolean(dirty && !awaitingScene && draft?.baseRevision !== revision);
   const scoped = Boolean(scope && scene?.scene?.id && sceneScopeKey === scope && revision !== null);
   const dependents = scene ? antennaResourceDependents(scene, kind, resourceId) : [];
   let transaction: ReturnType<typeof buildAntennaResourceTransaction> | null = null;
   let reason: string | null = null;
   try {
+    if (awaitingScene) throw new Error("Waiting for the committed scene revision.");
     if (!scoped || !scene || !draft || status !== "ready") throw new Error("Current session-scoped scene is required.");
     transaction = buildAntennaResourceTransaction(scene, kind, resourceId, draft);
   } catch (error) { reason = error instanceof Error ? error.message : String(error); }
@@ -89,6 +93,7 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
       () => api.model.commitTransaction(request, { sessionScopeKey: scope }), validateCommittedScene);
       if (!isCurrent()) return false;
       const committed = validateCommittedScene(response);
+      setAcknowledgedBase(remove ? null : createAntennaResourceDraft(committed, kind, resourceId, key));
       publishCommittedSceneResource(resources, committed, response.scene_revision, undefined, false, scope, api.resourceCacheScope);
       invalidateAuthoringMutationDependents(resources, "interaction", response.scene_revision);
       setLocal((current) => acknowledgeAntennaResourceDraft(current, submitted, response.scene_revision));

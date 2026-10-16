@@ -17,6 +17,8 @@ const apiBase = new URL(target.api_base);
 assert.equal(apiBase.hostname, "127.0.0.1"); assert.notEqual(apiBase.port, "3197");
 await mkdir(reportRoot, { recursive: true });
 const checks = [], screenshots = [], pageErrors = [], consoleErrors = [], httpErrors = [], writes = [], visualizationAcks = [], websockets = [];
+const sessionReads = [], pendingSessionReads = new Set();
+let sessionTransition = null;
 let browser, page, failure = null, scope = null, sessionId = null;
 const startedAt = new Date().toISOString();
 const headers = () => ({ "x-fullmag-api-instance": target.api_instance, ...(scope ? { "x-fullmag-session-scope": scope } : {}) });
@@ -52,7 +54,16 @@ try {
   page.on("pageerror", error => pageErrors.push(error.message));
   page.on("console", message => { if (message.type() === "error" && !message.text().startsWith("Failed to load resource:")) consoleErrors.push(message.text()); });
   page.on("websocket", socket => websockets.push(socket.url()));
-  page.on("response", response => { if (response.status() >= 400) httpErrors.push({ status: response.status(), url: response.url() }); });
+  page.on("response", response => {
+    const path = new URL(response.url()).pathname;
+    if (response.status() >= 400) httpErrors.push({ status: response.status(), url: response.url() });
+    if (response.url().startsWith(target.api_base) && response.request().method() === "GET" && ["/v2/sessions", "/v2/sessions/current/status"].includes(path)) {
+      const record = { path, status: response.status(), at: new Date().toISOString() };
+      sessionReads.push(record); if (sessionReads.length > 64) sessionReads.shift();
+      const task = response.json().then(body => { record.data = path === "/v2/sessions" ? body : { session: body.session }; }).catch(error => { record.error = String(error); });
+      pendingSessionReads.add(task); void task.finally(() => pendingSessionReads.delete(task));
+    }
+  });
   page.on("request", request => {
     if (request.url().startsWith(target.api_base) && !["GET", "OPTIONS"].includes(request.method())) {
       const record = { method: request.method(), path: new URL(request.url()).pathname, body: request.postDataJSON(), instance: request.headers()["x-fullmag-api-instance"], scope: request.headers()["x-fullmag-session-scope"] };
@@ -433,16 +444,16 @@ try {
   await editedOriginY.fill("1e-9"); await editedOriginY.focus();
   await editedPlane.evaluate(root => {
     const controls=[...root.querySelectorAll("input,select")].map(element=>({element,value:element.value,disabled:element.disabled,opacity:getComputedStyle(element).opacity})), input=document.activeElement, scroll=root.closest(".fm-inspector__body");
-    const proof={root,input,scroll,top:scroll.scrollTop,changes:0,values:0,disabled:0,opacity:0,samples:0};
-    const sample=()=>{proof.samples++;for(const saved of controls){if(!saved.element.isConnected)proof.changes++;if(saved.element.value!==saved.value)proof.values++;if(saved.element.disabled!==saved.disabled)proof.disabled++;if(getComputedStyle(saved.element).opacity!==saved.opacity)proof.opacity++;}};
+    const proof={root,input,scroll,top:scroll.scrollTop,changes:0,values:0,valueChanges:[],disabled:0,opacity:0,samples:0};
+    const sample=()=>{proof.samples++;for(const saved of controls){if(!saved.element.isConnected)proof.changes++;if(saved.element.value!==saved.value){proof.values++;proof.valueChanges.push({name:saved.element.getAttribute("aria-label"),before:saved.value,after:saved.element.value});}if(saved.element.disabled!==saved.disabled)proof.disabled++;if(getComputedStyle(saved.element).opacity!==saved.opacity)proof.opacity++;}};
     const observer=new MutationObserver(sample);observer.observe(root,{attributes:true,childList:true,subtree:true});sample();window.__planeProof={proof,observer,sample};
   });
   await page.getByRole("button", { name: "Apply spectrum", exact: true }).evaluate(button=>button.click());
   await waitScene(s => s.antenna_spectrum_requests.find(r => r.id === fft.id)?.sampling_plane.origin_m[1] === 1e-9);
   await page.getByText("Resource committed.", { exact: false }).waitFor();
-  const planeStability=await page.evaluate(()=>{const{proof,observer,sample}=window.__planeProof;sample();observer.disconnect();return{root:proof.root.isConnected,focus:document.activeElement===proof.input,scroll:proof.scroll.scrollTop===proof.top,changes:proof.changes,values:proof.values,disabled:proof.disabled,opacity:proof.opacity,samples:proof.samples};});
+  const planeStability=await page.evaluate(()=>{const{proof,observer,sample}=window.__planeProof;sample();observer.disconnect();return{root:proof.root.isConnected,focus:document.activeElement===proof.input,scroll:proof.scroll.scrollTop===proof.top,changes:proof.changes,values:proof.values,valueChanges:proof.valueChanges,disabled:proof.disabled,opacity:proof.opacity,samples:proof.samples};});
   assert.ok(planeStability.samples>0 && planeStability.samples<100);
-  assert.deepEqual({...planeStability,samples:0},{root:true,focus:true,scroll:true,changes:0,values:0,disabled:0,opacity:0,samples:0});
+  assert.deepEqual({...planeStability,samples:0},{root:true,focus:true,scroll:true,changes:0,values:0,valueChanges:[],disabled:0,opacity:0,samples:0});
   await editedPlane.scrollIntoViewIfNeeded(); await screenshot("09b-edited-fft-plane");
   const editedResolution = page.getByTestId("antenna-sampling-resolution");
   await editedResolution.getByRole("button", { name: /Sampling resolution/ }).click();
@@ -897,6 +908,49 @@ try {
   assert.equal(writes.length, beforeRebindWrites + 1);
   await activation.scrollIntoViewIfNeeded(); await screenshot("21-named-run-activation");
   checks.push({ name: "Named Run checkboxes retain executable IDs, reject an empty selection, preserve cancelled edits and need no raw ID input or extra API transaction", passed: true });
+  const beforeTransitionWrites = writes.length;
+  await driveName.fill("Draft to discard");
+  await selectNode(`model:object:${objectId}:geometry`); await dirtyGuard.waitFor();
+  await dirtyGuard.getByRole("button", { name: "Discard", exact: true }).click();
+  await geometry.waitFor();
+  await selectNode(`model:object:${objectId}:antenna:drive:${encodeURIComponent(drive.id)}`);
+  assert.equal(await driveName.inputValue(), "RF to waveguide");
+  assert.equal(writes.length, beforeTransitionWrites);
+  checks.push({ name: "Discard waits for the real form reset, changes selection and preserves the server model without a write", passed: true });
+  await driveName.fill("Acknowledged after Cancel");
+  await selectNode(`model:object:${objectId}:geometry`); await dirtyGuard.waitFor();
+  // Both handlers run before the real asynchronous API write can acknowledge.
+  await dirtyGuard.evaluate(dialog => {
+    const buttons = [...dialog.querySelectorAll("button")];
+    buttons.find(button => button.textContent === "Apply and continue").click();
+    buttons.find(button => button.textContent === "Cancel").click();
+  });
+  await waitScene(s => s.solved_antenna_drives.find(item => item.id === drive.id)?.name === "Acknowledged after Cancel");
+  assert.equal(await driveNode.getAttribute("aria-selected"), "true", "A cancelled transition must not resume after the real API ACK");
+  await driveEditor.getByText("Antenna drive committed.", { exact: true }).waitFor();
+  assert.equal(await dirtyGuard.isVisible(), false);
+  assert.equal(writes.length, beforeTransitionWrites + 1);
+  await screenshot("22-cancelled-transition-after-ack");
+  checks.push({ name: "Cancel invalidates an in-flight Apply transition: its real write may finish but its late ACK cannot navigate", passed: true });
+  await driveName.fill("Committed transition value");
+  const guardedNameInput = await driveName.elementHandle();
+  await selectNode(`model:object:${objectId}:geometry`); await dirtyGuard.waitFor();
+  await guardedNameInput.evaluate(input => {
+    const dialog = [...document.querySelectorAll('[role="dialog"]')].find(element => element.textContent.includes("Unapplied Inspector changes"));
+    [...dialog.querySelectorAll("button")].find(button => button.textContent === "Apply and continue").click();
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(input, "Newer draft during guarded Apply");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await waitScene(s => s.solved_antenna_drives.find(item => item.id === drive.id)?.name === "Committed transition value");
+  await dirtyGuard.getByRole("alert").waitFor();
+  assert.equal(await driveNode.getAttribute("aria-selected"), "true");
+  assert.equal(await guardedNameInput.evaluate(input => input.value), "Newer draft during guarded Apply");
+  assert.equal(writes.length, beforeTransitionWrites + 2);
+  await screenshot("23-newer-draft-retained");
+  await dirtyGuard.getByRole("button", { name: "Cancel", exact: true }).click();
+  await driveEditor.getByRole("button", { name: "Reset drive", exact: true }).click();
+  assert.equal(await driveName.inputValue(), "Committed transition value");
+  checks.push({ name: "Apply does not leave the Inspector when a newer draft was authored before its real ACK; Cancel preserves that draft and Reset remains local", passed: true });
   const webgl = await page.locator("canvas").evaluateAll(canvases => canvases.map(canvas => {
     const bounds = canvas.getBoundingClientRect(); if (!bounds.width || !bounds.height) return null;
     const gl = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
@@ -904,7 +958,7 @@ try {
   }).filter(Boolean));
   assert.ok(webgl.some(gl => !gl.lost && gl.width > 0 && gl.height > 0)); assert.ok(webgl.every(gl => !gl.lost));
   assert.ok(websockets.some(url => url.startsWith(target.api_base.replace("http:", "ws:"))), "Realtime must use the admitted API");
-  assert.ok(writes.length >= 3 && writes.length <= 25);
+  assert.ok(writes.length >= 3 && writes.length <= 27);
   for (const write of [...writes, ...visualizationAcks]) { assert.equal(write.instance, target.api_instance); assert.equal(write.scope, scope); assert.ok(!write.path.includes("/simulation/"), "Authoring smoke must not execute a solver"); }
   assert.ok(Date.now() - Date.parse(startedAt) > 5000, "The scenario must outlive the adoption timeout");
   assert.deepEqual(visualizationAcks.filter(ack => ack.body.status === "failed"), [], "No nonexistent-buffer adoption may fail during empty/nonmagnetic authoring");
@@ -912,11 +966,41 @@ try {
   assert.deepEqual(pageErrors, []); assert.deepEqual(consoleErrors, []);
   assert.deepEqual(httpErrors.filter(error => error.status >= 500), []);
   checks.push({ name: "real workspace has healthy WebGL, correctly routed realtime and scoped writes without solver execution", passed: true, webgl });
+  await driveName.fill("Old session draft");
+  await selectNode(`model:object:${objectId}:geometry`); await dirtyGuard.waitFor();
+  const previousScope = scope;
+  const replacementStartedAt = Date.now();
+  const replacement = await json(await context.request.post(`${target.api_base}/v2/sessions`, {
+    headers: headers(), data: { name: "Managed transition replacement", backend: "fem", device: "cpu", precision: "double", replace_current: true },
+  }));
+  assert.notEqual(replacement.session_id, sessionId);
+  const replacementStatus = await json(await context.request.get(`${target.api_base}/v2/sessions/current/status`, { headers: { "x-fullmag-api-instance": target.api_instance } }));
+  const replacementCollection = await json(await context.request.get(`${target.api_base}/v2/sessions`, { headers: { "x-fullmag-api-instance": target.api_instance } }));
+  sessionTransition = { replacement, status: replacementStatus.session, collection: replacementCollection };
+  assert.equal(replacementCollection.sessions.filter(item => item.current).length, 1);
+  assert.equal(replacementCollection.sessions.find(item => item.current).session_id, replacement.session_id);
+  const nextOwner = replacementStatus.session;
+  scope = `session=${encodeURIComponent(nextOwner.session_id)}&epoch=${encodeURIComponent(nextOwner.session_epoch)}&request_scope_epoch=${encodeURIComponent(nextOwner.request_scope_epoch)}`;
+  assert.notEqual(scope, previousScope);
+  await page.getByText("Managed transition replacement", { exact: true }).first().waitFor({ timeout: 60_000 });
+  await dirtyGuard.waitFor({ state: "hidden" });
+  assert.equal(await page.locator(`[data-node-id="model:object:${objectId}"]`).count(), 0);
+  assert.equal(await driveEditor.count(), 0);
+  const replacementScene = await scene();
+  assert.deepEqual(replacementScene.objects ?? [], []);
+  const collectionReadCount = sessionReads.filter(record => record.path === "/v2/sessions" && Date.parse(record.at) >= replacementStartedAt).length;
+  assert.ok(collectionReadCount >= 1 && collectionReadCount <= 6, `Session recovery must re-read the collection without a request storm: ${collectionReadCount}`);
+  await screenshot("24-session-transition-clears-confirmation");
+  assert.equal(writes.length, beforeTransitionWrites + 2, "Changing session must not submit the old draft");
+  assert.deepEqual(pageErrors, []); assert.deepEqual(consoleErrors, []);
+  assert.deepEqual(httpErrors.filter(error => error.status >= 500), []);
+  checks.push({ name: "Replacing only the owned disposable API session invalidates the old dirty confirmation and Inspector without reusing any old selection or model", passed: true, previousScope, replacementScope: scope, replacementSessionId: replacement.session_id, collectionReadCount });
+
 } catch (error) {
   failure = error.stack ?? String(error);
   if (page) { try { const path = resolve(reportRoot, "failure.png"); await page.screenshot({ path, fullPage: true }); screenshots.push(path); await writeFile(resolve(reportRoot, "failure-dom.txt"), await page.locator("body").innerText()); } catch { /* Preserve original failure. */ } }
-} finally { if (browser) await browser.close(); }
-const report = { schema: "fullmag.antenna-workspace-authoring.v1", state: failure ? "failed" : "passed", qualification: "real_api_workspace_authoring_only_not_solve_science_or_durability", startedAt, finishedAt: new Date().toISOString(), target, sessionId, checks, screenshots, writes, visualizationAcks, websockets, pageErrors, consoleErrors, httpErrors, error: failure };
+} finally { await Promise.allSettled([...pendingSessionReads]); if (browser) await browser.close(); }
+const report = { schema: "fullmag.antenna-workspace-authoring.v1", state: failure ? "failed" : "passed", qualification: "real_api_workspace_authoring_only_not_solve_science_or_durability", startedAt, finishedAt: new Date().toISOString(), target, sessionId, sessionReads, sessionTransition, checks, screenshots, writes, visualizationAcks, websockets, pageErrors, consoleErrors, httpErrors, error: failure };
 await writeFile(resolve(reportRoot, "antenna-workspace-authoring.json"), JSON.stringify(report, null, 2));
 console.log(JSON.stringify({ state: report.state, checks: checks.length, error: failure }));
 process.exitCode = failure ? 1 : 0;

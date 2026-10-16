@@ -128,8 +128,12 @@ export function InspectorEditSessionProvider({ children, store: suppliedStore }:
   );
 }
 
+export function useInspectorEditSessionStore(): InspectorEditSessionStore | null {
+  return useContext(InspectorEditSessionContext);
+}
+
 export function useInspectorEditSession(): InspectorEditSession | null {
-  const store = useContext(InspectorEditSessionContext);
+  const store = useInspectorEditSessionStore();
   useSyncExternalStore(
     store?.subscribe ?? subscribeEmpty,
     store?.getVersion ?? getEmptySnapshot,
