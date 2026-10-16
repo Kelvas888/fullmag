@@ -70,8 +70,9 @@ surowe bajty mają dokładnie wskazany hash. Oba warianty są sprawdzane pod
 pełnym zestawem recovery locków, przed utworzeniem archiwum lub prepared intent.
 
 Manifest bez `application_binding` zachowuje historyczny, bardziej restrykcyjny
-kontrakt i wymaga obecnego `APPLICATION.json`. Pole nie zmienia dokładnej
-dwunastoelementowej listy `archived_files`; jego integralność obejmuje istniejący
+kontrakt i wymaga obecnego `APPLICATION.json`. Brak tego pola zachowuje 12
+obowiązkowych wpisów `archived_files` oraz dopuszcza wyłącznie istniejące logi
+listy producerów opisanej niżej; jego integralność obejmuje istniejący
 `archived_evidence_sha256`. Walidacja konfiguracji i replay pozostają fail-closed.
 
 ## Własność i kolejność
@@ -338,12 +339,17 @@ Publiczny receipt `runtime_service_recovery.v1` wiąże `request_id`,
 `outcome=failed`, `owner_sha256_before`, `owner_state_after=failed` oraz
 `owner_sha256_after`. `archived_evidence_path` i `archived_evidence_sha256`
 przypinają manifest archiwum, a `archived_files` mapuje ograniczony zestaw
-oryginalnych plików na ich raw SHA-256. Inventory ma dokładnie 12 wpisów:
+oryginalnych plików na ich raw SHA-256. Inventory ma 12 obowiązkowych wpisów:
 `OWNER.json`, stabilny owner lock, `LAUNCH.json`, launch lock, startup gate,
 journale stdout obu schedulerów, cztery dokumenty zasobów/stanu przypiętych
-pul oraz `configuration.json`. Klucze dokumentów runtime pozostają ścieżkami
-względem SessionStore; zarezerwowany `configuration.json` oznacza wyłącznie
-plik w archiwum, zawierający dokładne bajty zewnętrznej konfiguracji.
+pul oraz `configuration.json`. Może zawierać także wyłącznie rzeczywiście
+istniejące pliki z zamkniętej listy producerów: stdout i stderr publisherów
+`compute-publisher` i `preparation-publisher` oraz stderr obu schedulerów.
+Każdy taki plik jest regularny, bounded, odczytany bez podążania za linkiem i
+zachowany z raw SHA-256; wildcard ani nieznane nazwy są odrzucane. Klucze
+dokumentów runtime pozostają ścieżkami względem SessionStore; zarezerwowany
+`configuration.json` oznacza wyłącznie plik w archiwum, zawierający dokładne
+bajty zewnętrznej konfiguracji.
 Manifest wymaga `config_sha256` zgodnego z requestem i tym plikiem. Brakujący,
 dodatkowy lub zmieniony wpis odrzuca również replay. Archiwalny owner zawsze
 ma digest `owner_sha256_before`, a jego bieżący odpowiednik może przejść tylko

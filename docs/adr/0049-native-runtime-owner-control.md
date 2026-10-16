@@ -101,8 +101,11 @@ na przypięte surowe `config_sha256`, a `APPLICATION.json` musi pozostać
 nieobecny. W trybie `persisted` plik musi istnieć i mieć dokładnie ten sam hash.
 Stare manifesty bez tego pola zachowują wcześniejszy wymóg obecności pliku.
 Walidacja odbywa się pod recovery lockami przed archiwizacją i prepared intent;
-lista dwunastu archiwizowanych plików oraz trwały hash manifestu pozostają
-niezmienione.
+12 obowiązkowych wpisów archiwum oraz trwały hash manifestu pozostają
+niezmienione. Archiwum może ponadto zawierać wyłącznie rzeczywiście istniejące,
+bounded regular logs z jawnej listy publisherów i schedulerów; każdy wpis jest
+odczytywany bez podążania za linkiem i zachowany z raw SHA-256, a wildcard oraz
+nieznane nazwy pozostają odrzucane.
 
 Dokładny kontrakt: [native-runtime-service-v1](../specs/native-runtime-service-v1.md).
 

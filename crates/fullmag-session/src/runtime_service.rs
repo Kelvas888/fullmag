@@ -193,7 +193,7 @@ impl RuntimeServiceRecoveryReceipt {
         if (self.status == "recovered") != self.completed_at.is_some() {
             bail!("runtime service recovery receipt completion timestamp mismatch");
         }
-        if self.archived_files.len() != RECOVERY_MANDATORY_ARCHIVED_FILES
+        if self.archived_files.len() < RECOVERY_MANDATORY_ARCHIVED_FILES
             || self.archived_files.len() > MAX_RECOVERY_ARCHIVED_FILES
         {
             bail!("runtime service recovery archive evidence has an incomplete inventory");
@@ -1881,6 +1881,70 @@ fn require_scheduler_drained_event(
     Ok(())
 }
 
+fn recovery_log_sources(owner: &RuntimeServiceOwnerDescriptor) -> BTreeSet<String> {
+    let log_relative = format!("runtime-services/{}", owner.owner_token);
+    [
+        "compute.stdout.jsonl",
+        "compute.stderr.log",
+        "preparation.stdout.jsonl",
+        "preparation.stderr.log",
+        "compute-publisher.stdout.jsonl",
+        "compute-publisher.stderr.log",
+        "preparation-publisher.stdout.jsonl",
+        "preparation-publisher.stderr.log",
+    ]
+    .into_iter()
+    .map(|name| format!("{log_relative}/{name}"))
+    .collect()
+}
+
+fn recovery_mandatory_log_sources(owner: &RuntimeServiceOwnerDescriptor) -> BTreeSet<String> {
+    let log_relative = format!("runtime-services/{}", owner.owner_token);
+    [
+        "compute.stdout.jsonl",
+        "preparation.stdout.jsonl",
+    ]
+    .into_iter()
+    .map(|name| format!("{log_relative}/{name}"))
+    .collect()
+}
+
+fn observe_recovery_log_sources(
+    store: &SessionStore,
+    owner: &RuntimeServiceOwnerDescriptor,
+) -> Result<BTreeSet<String>> {
+    let log_relative = format!("runtime-services/{}", owner.owner_token);
+    let log_root = checked_path(store.root(), &log_relative)?;
+    let metadata = fs::symlink_metadata(&log_root)
+        .context("runtime recovery scheduler log directory is missing")?;
+    reject_link(&log_root)?;
+    if !metadata.is_dir() {
+        bail!("runtime recovery scheduler log namespace is not a directory");
+    }
+    let allowed_logs = recovery_log_sources(owner);
+    let mandatory_logs = recovery_mandatory_log_sources(owner);
+    let mut observed_logs = BTreeSet::new();
+    for entry in fs::read_dir(&log_root)? {
+        let entry = entry?;
+        reject_link(&entry.path())?;
+        if !entry.file_type()?.is_file() {
+            bail!("runtime scheduler evidence contains a non-file entry");
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("runtime scheduler evidence file is not UTF-8"))?;
+        let source = format!("{log_relative}/{name}");
+        if !allowed_logs.contains(&source) || !observed_logs.insert(source.clone()) {
+            bail!("runtime scheduler evidence contains an unexpected entry {name}");
+        }
+    }
+    if !observed_logs.is_superset(&mandatory_logs) {
+        bail!("runtime scheduler evidence is missing a mandatory journal");
+    }
+    Ok(observed_logs)
+}
+
 fn recovery_mandatory_sources(owner: &RuntimeServiceOwnerDescriptor) -> Result<BTreeSet<String>> {
     let compute_pool_id = owner
         .compute_pool_id
@@ -2070,40 +2134,11 @@ fn archive_runtime_evidence(
     if crate::hex_sha256(configuration_bytes) != config_sha256 {
         bail!("runtime recovery raw configuration bytes differ from the request pin");
     }
-    let log_relative = format!("runtime-services/{}", owner.owner_token);
-    let log_root = checked_path(store.root(), &log_relative)?;
-    let metadata = fs::symlink_metadata(&log_root)
-        .context("runtime recovery scheduler log directory is missing")?;
-    reject_link(&log_root)?;
-    if !metadata.is_dir() {
-        bail!("runtime recovery scheduler log namespace is not a directory");
-    }
-    let expected_logs = mandatory_sources
-        .iter()
-        .filter(|source| source.starts_with(&format!("{log_relative}/")))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut observed_logs = BTreeSet::new();
-    for entry in fs::read_dir(&log_root)? {
-        let entry = entry?;
-        reject_link(&entry.path())?;
-        if !entry.file_type()?.is_file() {
-            bail!("runtime scheduler evidence contains a non-file entry");
-        }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("runtime scheduler evidence file is not UTF-8"))?;
-        let source = format!("{log_relative}/{name}");
-        if !expected_logs.contains(&source) || !observed_logs.insert(source.clone()) {
-            bail!("runtime scheduler evidence contains an unexpected entry {name}");
-        }
-    }
-    if observed_logs != expected_logs {
-        bail!("runtime scheduler evidence is missing a mandatory journal");
-    }
+    let observed_logs = observe_recovery_log_sources(store, owner)?;
+    let mut archive_sources = mandatory_sources.clone();
+    archive_sources.extend(observed_logs);
     let mut archived = BTreeMap::new();
-    for source in &mandatory_sources {
+    for source in &archive_sources {
         if source == RECOVERY_ARCHIVED_CONFIGURATION_KEY {
             continue;
         }
@@ -2111,7 +2146,7 @@ fn archive_runtime_evidence(
             store.root(),
             &archive_relative,
             source,
-            if source.ends_with(".jsonl") {
+            if source.ends_with(".jsonl") || source.ends_with(".log") {
                 MAX_RECOVERY_LOG_BYTES
             } else {
                 MAX_RECOVERY_REQUEST_BYTES
@@ -2128,7 +2163,8 @@ fn archive_runtime_evidence(
         MAX_RECOVERY_REQUEST_BYTES,
         &mut archived,
     )?;
-    if archived.len() != mandatory_sources.len()
+    if archived.len() != archive_sources.len()
+        || archived.len() < mandatory_sources.len()
         || archived.len() > MAX_RECOVERY_ARCHIVED_FILES
     {
         bail!("runtime recovery evidence has an incomplete inventory");
@@ -2297,13 +2333,27 @@ fn verify_archived_evidence(
         .context("parse runtime recovery owner descriptor for archive inventory")?;
     validate_descriptor(&current_owner)?;
     let mandatory_sources = recovery_mandatory_sources(&current_owner)?;
+    let mut allowed_sources = mandatory_sources.clone();
+    allowed_sources.extend(recovery_log_sources(&current_owner));
     let archived_sources = receipt
         .archived_files
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
-    if archived_sources != mandatory_sources {
+    if !archived_sources.is_superset(&mandatory_sources)
+        || !archived_sources.is_subset(&allowed_sources)
+    {
         bail!("runtime recovery archive inventory is missing or contains unexpected evidence");
+    }
+    let observed_logs = observe_recovery_log_sources(store, &current_owner)?;
+    let log_prefix = format!("runtime-services/{}/", current_owner.owner_token);
+    let archived_logs = archived_sources
+        .iter()
+        .filter(|source| source.starts_with(&log_prefix))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if observed_logs != archived_logs {
+        bail!("runtime recovery archive scheduler evidence inventory differs from the live namespace");
     }
     if receipt.archived_files.get(RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH)
         .map(String::as_str)
@@ -2736,6 +2786,34 @@ mod recovery_contract_tests {
     }
 
     #[test]
+    fn recovery_log_allowlist_covers_all_runtime_service_producers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        let owner = request().expected_owner;
+        let log_root = store
+            .root()
+            .join("runtime-services")
+            .join(&owner.owner_token);
+        std::fs::create_dir_all(&log_root).unwrap();
+        for name in [
+            "compute.stdout.jsonl",
+            "compute.stderr.log",
+            "preparation.stdout.jsonl",
+            "preparation.stderr.log",
+            "compute-publisher.stdout.jsonl",
+            "compute-publisher.stderr.log",
+            "preparation-publisher.stdout.jsonl",
+            "preparation-publisher.stderr.log",
+        ] {
+            std::fs::write(log_root.join(name), b"evidence\n").unwrap();
+        }
+        let observed = observe_recovery_log_sources(&store, &owner).unwrap();
+        assert_eq!(observed, recovery_log_sources(&owner));
+        std::fs::write(log_root.join("publisher-other.log"), b"unexpected\n").unwrap();
+        assert!(observe_recovery_log_sources(&store, &owner).is_err());
+    }
+
+    #[test]
     fn recovery_archive_allows_only_the_pinned_owner_transition() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::open(directory.path().join("store")).unwrap();
@@ -2781,7 +2859,13 @@ mod recovery_contract_tests {
         let mut archived_files = BTreeMap::new();
         archived_files.insert(owner_relative.to_owned(), crate::hex_sha256(&owner_before));
         std::fs::write(archive_root.join("OWNER.json"), &owner_before).unwrap();
-        for source in recovery_mandatory_sources(&owner).unwrap() {
+        let mut evidence_sources = recovery_mandatory_sources(&owner).unwrap();
+        let optional_sources = recovery_log_sources(&owner)
+            .difference(&evidence_sources)
+            .cloned()
+            .collect::<Vec<_>>();
+        evidence_sources.extend(optional_sources);
+        for source in evidence_sources {
             if source == owner_relative || source == RECOVERY_ARCHIVED_CONFIGURATION_KEY {
                 continue;
             }
