@@ -968,10 +968,13 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         let inventory_owner = ledger
             .try_acquire_inventory_owner()?
             .context("Docker host inventory owner became busy during initialization")?;
+        let previous = fullmag_runtime_control::retry_store_writer_busy(|| {
+            ledger.read_compute_node_snapshot()
+        })?;
         let snapshot = fullmag_runtime_control::compute_node_probe::sample_compute_node_for_owner_with_readiness(
             &ledger,
             inventory_owner.descriptor(),
-            None,
+            previous.as_ref(),
             &persisted_readiness,
         )?;
         if snapshot.inventory_sha256 != policy.topology_sha256

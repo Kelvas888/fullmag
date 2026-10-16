@@ -35,14 +35,16 @@ pub fn sample_compute_node(
     ledger: &HostResourceLedger,
     previous: Option<&ComputeNodeSnapshot>,
 ) -> Result<ComputeNodeSnapshot> {
-    sample_compute_node_inner(
-        ledger.node_id(),
-        ledger.owner_id(),
-        ledger.policy().owner_epoch,
-        None,
-        previous,
-        None,
-    )
+    sample_compute_node_with_advanced_timestamp(previous, move || {
+        sample_compute_node_inner(
+            ledger.node_id(),
+            ledger.owner_id(),
+            ledger.policy().owner_epoch,
+            None,
+            previous,
+            None,
+        )
+    })
 }
 
 /// Collect one host observation pinned to the active shared-host inventory owner.
@@ -51,14 +53,16 @@ pub fn sample_compute_node_for_owner(
     owner: &HostInventoryOwnerDescriptor,
     previous: Option<&ComputeNodeSnapshot>,
 ) -> Result<ComputeNodeSnapshot> {
-    sample_compute_node_inner(
-        ledger.node_id(),
-        ledger.owner_id(),
-        ledger.policy().owner_epoch,
-        Some(owner),
-        previous,
-        None,
-    )
+    sample_compute_node_with_advanced_timestamp(previous, move || {
+        sample_compute_node_inner(
+            ledger.node_id(),
+            ledger.owner_id(),
+            ledger.policy().owner_epoch,
+            Some(owner),
+            previous,
+            None,
+        )
+    })
 }
 
 /// Collect a host observation with the typed native FEM/GPU ABI result. The
@@ -69,14 +73,16 @@ pub fn sample_compute_node_for_owner_with_readiness(
     previous: Option<&ComputeNodeSnapshot>,
     readiness: &HostRuntimeReadiness,
 ) -> Result<ComputeNodeSnapshot> {
-    sample_compute_node_inner(
-        ledger.node_id(),
-        ledger.owner_id(),
-        ledger.policy().owner_epoch,
-        Some(owner),
-        previous,
-        Some(readiness),
-    )
+    sample_compute_node_with_advanced_timestamp(previous, move || {
+        sample_compute_node_inner(
+            ledger.node_id(),
+            ledger.owner_id(),
+            ledger.policy().owner_epoch,
+            Some(owner),
+            previous,
+            Some(readiness),
+        )
+    })
 }
 
 /// Probe a host before a ledger exists, using identities supplied by the
@@ -89,14 +95,97 @@ pub fn sample_compute_node_for_identity(
     previous: Option<&ComputeNodeSnapshot>,
     readiness: &HostRuntimeReadiness,
 ) -> Result<ComputeNodeSnapshot> {
-    sample_compute_node_inner(
-        node_id,
-        runtime_owner_id,
-        owner_epoch,
-        Some(host_owner),
-        previous,
-        Some(readiness),
+    sample_compute_node_with_advanced_timestamp(previous, move || {
+        sample_compute_node_inner(
+            node_id.clone(),
+            runtime_owner_id.clone(),
+            owner_epoch,
+            Some(host_owner),
+            previous,
+            Some(readiness),
+        )
+    })
+}
+
+const SAMPLE_TIMESTAMP_RETRY_WINDOW: Duration = Duration::from_secs(5);
+const SAMPLE_TIMESTAMP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+fn sample_compute_node_with_advanced_timestamp(
+    previous: Option<&ComputeNodeSnapshot>,
+    capture: impl FnMut() -> Result<ComputeNodeSnapshot>,
+) -> Result<ComputeNodeSnapshot> {
+    retry_sample_until_timestamp_advances(
+        capture,
+        move |candidate| {
+            let previous = previous?;
+            sample_timestamp_is_non_advancing(
+                Some((
+                    previous.node_id.as_str(),
+                    previous.boot_id.as_str(),
+                    &previous.sample.collected_at,
+                )),
+                (
+                    candidate.node_id.as_str(),
+                    candidate.boot_id.as_str(),
+                    &candidate.sample.collected_at,
+                ),
+            )
+            .then(|| {
+                format!(
+                    "previous_collected_at={}, current_collected_at={}",
+                    previous.sample.collected_at.to_rfc3339(),
+                    candidate.sample.collected_at.to_rfc3339(),
+                )
+            })
+        },
+        Instant::now,
+        thread::sleep,
     )
+}
+
+fn retry_sample_until_timestamp_advances<T, Capture, RetryReason, Clock, Wait>(
+    mut capture: Capture,
+    mut retry_reason: RetryReason,
+    mut now: Clock,
+    mut wait: Wait,
+) -> Result<T>
+where
+    Capture: FnMut() -> Result<T>,
+    RetryReason: FnMut(&T) -> Option<String>,
+    Clock: FnMut() -> Instant,
+    Wait: FnMut(Duration),
+{
+    // This is a retry budget measured between capture attempts. A capture is
+    // not interruptible, so the complete call may outlast the window; an
+    // advancing result from a slow capture remains valid.
+    let deadline = now() + SAMPLE_TIMESTAMP_RETRY_WINDOW;
+    loop {
+        let candidate = capture()?;
+        let Some(reason) = retry_reason(&candidate) else {
+            return Ok(candidate);
+        };
+        if now() >= deadline {
+            bail!(
+                "compute-node sample retry window elapsed after a non-advancing timestamp: {reason}"
+            );
+        }
+        // The timestamp is taken again after a fresh probe. Waiting here
+        // handles a short wall-clock rollback or coarse host clock without
+        // fabricating a timestamp or relaxing the ledger's monotonicity rule.
+        wait(SAMPLE_TIMESTAMP_RETRY_INTERVAL);
+    }
+}
+
+fn sample_timestamp_is_non_advancing(
+    previous: Option<(&str, &str, &DateTime<Utc>)>,
+    candidate: (&str, &str, &DateTime<Utc>),
+) -> bool {
+    let Some((previous_node_id, previous_boot_id, previous_collected_at)) = previous else {
+        return false;
+    };
+    previous_node_id == candidate.0
+        && previous_boot_id == candidate.1
+        && candidate.2 <= previous_collected_at
 }
 
 /// Read and validate the bounded typed native FEM/GPU readiness ABI result.
@@ -1740,6 +1829,117 @@ pub fn current_host_boot_id(_now: DateTime<Utc>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_timestamp_retry_only_applies_to_the_same_node_and_boot() {
+        let previous = Utc::now();
+        assert!(sample_timestamp_is_non_advancing(
+            Some(("node", "boot", &previous)),
+            ("node", "boot", &previous),
+        ));
+        let before = previous - chrono::Duration::milliseconds(1);
+        assert!(sample_timestamp_is_non_advancing(
+            Some(("node", "boot", &previous)),
+            ("node", "boot", &before),
+        ));
+        let after = previous + chrono::Duration::milliseconds(1);
+        assert!(!sample_timestamp_is_non_advancing(
+            Some(("node", "boot", &previous)),
+            ("node", "boot", &after),
+        ));
+        assert!(!sample_timestamp_is_non_advancing(
+            Some(("node", "boot", &previous)),
+            ("node", "new-boot", &before),
+        ));
+        assert!(!sample_timestamp_is_non_advancing(
+            None,
+            ("node", "boot", &before),
+        ));
+    }
+
+    #[test]
+    fn timestamp_retry_reprobes_equal_and_backwards_samples_until_advance() {
+        let previous = Utc::now();
+        let before = previous - chrono::Duration::milliseconds(1);
+        let after = previous + chrono::Duration::milliseconds(1);
+        let mut candidates = std::collections::VecDeque::from([
+            previous.clone(),
+            before,
+            after.clone(),
+        ]);
+        let mut captures = 0;
+        let mut waits = 0;
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+
+        let result = retry_sample_until_timestamp_advances(
+            || {
+                captures += 1;
+                candidates
+                    .pop_front()
+                    .ok_or_else(|| anyhow::anyhow!("candidate sequence exhausted"))
+            },
+            |candidate| {
+                sample_timestamp_is_non_advancing(
+                    Some(("node", "boot", &previous)),
+                    ("node", "boot", candidate),
+                )
+                .then(|| "timestamp did not advance".to_owned())
+            },
+            || clock.get(),
+            |duration| {
+                waits += 1;
+                clock.set(clock.get() + duration);
+            },
+        )
+        .expect("the advancing sample should be returned");
+
+        assert_eq!(result, after);
+        assert_eq!(captures, 3);
+        assert_eq!(waits, 2);
+    }
+
+    #[test]
+    fn timestamp_retry_times_out_without_sleeping() {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let mut captures = 0;
+        let mut waits = 0;
+
+        let error = retry_sample_until_timestamp_advances(
+            || {
+                captures += 1;
+                Ok::<_, anyhow::Error>(0_u8)
+            },
+            |_| Some("timestamp did not advance".to_owned()),
+            || clock.get(),
+            |_| {
+                waits += 1;
+                clock.set(start + SAMPLE_TIMESTAMP_RETRY_WINDOW);
+            },
+        )
+        .expect_err("a permanently non-advancing sample must fail closed");
+
+        assert!(error.to_string().contains("retry window elapsed"));
+        assert_eq!(captures, 2);
+        assert_eq!(waits, 1);
+    }
+
+    #[test]
+    fn timestamp_retry_propagates_capture_error_without_waiting() {
+        let mut waits = 0;
+
+        let error = retry_sample_until_timestamp_advances(
+            || Err::<u8, _>(anyhow::anyhow!("probe failed")),
+            |_| panic!("retry reason must not run after a capture error"),
+            Instant::now,
+            |_: Duration| waits += 1,
+        )
+        .expect_err("capture errors must be returned immediately");
+
+        assert!(error.to_string().contains("probe failed"));
+        assert_eq!(waits, 0);
+    }
 
     #[cfg(all(windows, target_pointer_width = "64"))]
     #[test]
