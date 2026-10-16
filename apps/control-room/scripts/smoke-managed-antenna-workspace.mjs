@@ -315,6 +315,81 @@ try {
   assert.equal(writes.length, beforeProjectionWrites + 3);
   checks.push({ name: "Existing typed projection inspector edits the target while preserving source pins and removes the declaration without cascading", passed: true });
   await selectNode(`model:object:${objectId}:antenna:solution:${encodeURIComponent(stage.id)}`);
+  const beforeFFT = await scene(), beforeFFTWrites = writes.length;
+  const fftComposer = page.getByTestId("antenna-spectrum-composer");
+  await fftComposer.getByRole("combobox", { name: "FFT target object", exact: true }).selectOption(objectId);
+  for (const [name, value] of [["Plane origin", "0 0 0"], ["Axis u", "1 0 0"], ["Axis v", "1 0 0"], ["Extent u", "2e-7"], ["Extent v", "1e-7"], ["Samples u", "16"], ["Samples v", "8"]]) {
+    await fftComposer.getByRole("textbox", { name, exact: true }).fill(value);
+  }
+  await fftComposer.getByRole("combobox", { name: "Window", exact: true }).selectOption("hann");
+  const createFFT = fftComposer.getByRole("button", { name: "Create source FFT request", exact: true });
+  assert.equal(await createFFT.isEnabled(), false);
+  await fftComposer.getByText("Sampling axes must be orthonormal unit vectors.", { exact: true }).waitFor();
+  await fftComposer.getByRole("textbox", { name: "Axis v", exact: true }).fill("0 1 0");
+  await fftComposer.getByRole("textbox", { name: "Samples u", exact: true }).fill("10000000");
+  assert.equal(await createFFT.isEnabled(), false);
+  await fftComposer.getByText("FFT grid exceeds the runtime limit of 10000000 samples.", { exact: true }).waitFor();
+  await fftComposer.getByRole("textbox", { name: "Samples u", exact: true }).fill("16");
+  assert.equal(await createFFT.isEnabled(), true); assert.equal(writes.length, beforeFFTWrites);
+  await selectNode(`model:object:${objectId}:geometry`);
+  await dirtyGuard.waitFor(); assert.equal(await dirtyGuard.getByRole("button", { name: "Apply and continue", exact: true }).isEnabled(), true);
+  await dirtyGuard.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByTestId("antenna-projection-composer").getByRole("combobox", { name: "Projection target", exact: true }).selectOption(JSON.stringify(["global"]));
+  await selectNode(`model:object:${objectId}:geometry`);
+  await dirtyGuard.waitFor(); assert.equal(await dirtyGuard.getByRole("button", { name: "Apply and continue", exact: true }).isEnabled(), false);
+  await dirtyGuard.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("button", { name: "Discard projection draft", exact: true }).click();
+  assert.equal(await fftComposer.getByRole("textbox", { name: "Samples u", exact: true }).inputValue(), "16");
+  const fftSamples = fftComposer.getByRole("textbox", { name: "Samples v", exact: true });
+  await fftSamples.focus();
+  await page.evaluate(() => {
+    const root = document.querySelector('[data-testid="antenna-spectrum-composer"]'), input = document.activeElement, scroll = root.closest(".fm-inspector__body");
+    const controls = [...root.querySelectorAll("input, select")].map(element => ({ element, disabled: element.disabled, opacity: getComputedStyle(element).opacity }));
+    const proof = { root, input, scroll, top: scroll.scrollTop, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 };
+    const sample = () => {
+      proof.samples++;
+      if (document.querySelector('[data-testid="antenna-spectrum-composer"]') !== root) proof.rootChanges++;
+      for (const saved of controls) {
+        if (!saved.element.isConnected) proof.controlChanges++;
+        if (saved.element.disabled !== saved.disabled) proof.disabledChanges++;
+        if (getComputedStyle(saved.element).opacity !== saved.opacity) proof.opacityChanges++;
+      }
+      proof.opacityAnimations += root.getAnimations({ subtree: true }).filter(animation => (animation.playState === "running" || animation.pending) && animation.effect?.getKeyframes().some(frame => "opacity" in frame)).length;
+    };
+    const observer = new MutationObserver(sample); observer.observe(root, { attributes: true, childList: true, subtree: true }); sample(); window.__fftProof = { proof, observer, sample };
+  });
+  await createFFT.evaluate(button => button.click());
+  await fftComposer.getByText("Source FFT request committed. No spectrum was computed;", { exact: false }).waitFor();
+  const fftScene = await waitScene(s => s.antenna_spectrum_requests?.length === (beforeFFT.antenna_spectrum_requests?.length ?? 0) + 1);
+  const fft = fftScene.antenna_spectrum_requests.at(-1);
+  assert.equal(fft.solution_ref.stage_id, stage.id); assert.equal(fft.port_mode_id, stage.port_mode_ids[0]); assert.equal(fft.target.object_id, objectId);
+  assert.equal(fft.transform, "spatial_fft"); assert.equal(fft.window, "hann"); assert.equal(fft.normalization, "integral_si");
+  assert.deepEqual(fft.sampling_plane.origin_m, [0, 0, 0]); assert.deepEqual(fft.sampling_plane.axis_u, [1, 0, 0]); assert.deepEqual(fft.sampling_plane.axis_v, [0, 1, 0]);
+  assert.equal(fft.sampling_plane.sample_count_u, 16); assert.equal(fft.sampling_plane.sample_count_v, 8); assert.equal(fft.sampling_plane.extent_u_m, 2e-7);
+  for (const collection of ["antenna_field_solve_stages", "antenna_port_modes", "current_transports", "solved_antenna_drives", "study"]) assert.deepEqual(fftScene[collection], beforeFFT[collection]);
+  assert.deepEqual(Object.keys(writes.at(-1).body.merge_patch), ["antenna_spectrum_requests"]); assert.equal(writes.length, beforeFFTWrites + 1);
+  assert.equal(await createFFT.isEnabled(), false);
+  const fftStable = await page.evaluate(() => {
+    const { proof: p, observer, sample } = window.__fftProof; sample(); observer.disconnect();
+    return { root: document.querySelector('[data-testid="antenna-spectrum-composer"]') === p.root, focus: document.activeElement === p.input, scroll: p.scroll.scrollTop === p.top, rootChanges: p.rootChanges, controlChanges: p.controlChanges, disabledChanges: p.disabledChanges, opacityChanges: p.opacityChanges, opacityAnimations: p.opacityAnimations, samples: p.samples };
+  });
+  assert.ok(fftStable.samples > 1 && fftStable.samples < 100);
+  assert.deepEqual({ ...fftStable, samples: 0 }, { root: true, focus: true, scroll: true, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 });
+  await screenshot("09-source-fft-request");
+  checks.push({ name: "FFT validates axes and native budget before writes, shares the draft guard, and saves one canonical request with stable focus, scroll and controls", passed: true, stability: fftStable });
+  await page.getByTitle("Expand All").click();
+  await selectNode(`model:object:${objectId}:antenna:spectrum:${encodeURIComponent(fft.id)}`);
+  await page.getByRole("combobox", { name: "Window", exact: true }).selectOption("blackman");
+  await page.getByRole("button", { name: "Apply spectrum", exact: true }).click();
+  const editedFFT = await waitScene(s => s.antenna_spectrum_requests?.find(r => r.id === fft.id)?.window === "blackman");
+  assert.deepEqual(editedFFT.antenna_spectrum_requests.find(r => r.id === fft.id).solution_ref, fft.solution_ref);
+  await page.getByText("Resource committed.", { exact: false }).waitFor();
+  await page.getByRole("button", { name: "Remove spectrum (no cascade)", exact: true }).click();
+  const removedFFT = await waitScene(s => !s.antenna_spectrum_requests?.some(r => r.id === fft.id));
+  assert.deepEqual(removedFFT.antenna_field_solve_stages, beforeFFT.antenna_field_solve_stages);
+  assert.equal(writes.length, beforeFFTWrites + 3);
+  checks.push({ name: "Existing spectrum inspector edits the request without rebinding its source and removes it without cascading or running analysis", passed: true });
+  await selectNode(`model:object:${objectId}:antenna:solution:${encodeURIComponent(stage.id)}`);
   const add = page.getByRole("button", { name: "Add Field Solve to Study", exact: true });
   await add.waitFor(); assert.equal(await add.isEnabled(), true); await add.click();
   const open = page.getByRole("button", { name: "Open Study stage", exact: true });
@@ -335,7 +410,7 @@ try {
   }).filter(Boolean));
   assert.ok(webgl.some(gl => !gl.lost && gl.width > 0 && gl.height > 0)); assert.ok(webgl.every(gl => !gl.lost));
   assert.ok(websockets.some(url => url.startsWith(target.api_base.replace("http:", "ws:"))), "Realtime must use the admitted API");
-  assert.ok(writes.length >= 3 && writes.length <= 10);
+  assert.ok(writes.length >= 3 && writes.length <= 13);
   for (const write of [...writes, ...visualizationAcks]) { assert.equal(write.instance, target.api_instance); assert.equal(write.scope, scope); assert.ok(!write.path.includes("/simulation/"), "Authoring smoke must not execute a solver"); }
   assert.ok(Date.now() - Date.parse(startedAt) > 5000, "The scenario must outlive the adoption timeout");
   assert.deepEqual(visualizationAcks.filter(ack => ack.body.status === "failed"), [], "No nonexistent-buffer adoption may fail during empty/nonmagnetic authoring");

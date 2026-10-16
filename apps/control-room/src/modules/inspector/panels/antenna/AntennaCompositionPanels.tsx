@@ -25,7 +25,6 @@ import { AntennaFieldSolveAuthoring } from "./AntennaFieldSolveAuthoring";
 import { AntennaStudyStageComposer } from "./AntennaStudyStageComposer";
 import { AntennaConductorMaterialEditor } from "./AntennaConductorMaterialEditor";
 import { AntennaPortEditor } from "./AntennaPortEditor";
-import { AntennaSpectrumComposer } from "./AntennaSpectrumComposer";
 import { AntennaResourceEditor } from "./AntennaResourceEditor";
 import { SolvedAntennaDriveEditor } from "./SolvedAntennaDriveEditor";
 import { antennaWaveformBandwidthValue } from "./AntennaCompositionModel";
@@ -964,7 +963,6 @@ export function AntennaCompositionPanel({
           solution={fieldSolution.data}
         />
       ) : null}
-      {kind === "solution" && resourceId ? <AntennaSpectrumComposer key={`spectrum:${resourceId}`} stageId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {(kind === "port" || kind === "projection" || kind === "spectrum") && resourceId ? <AntennaResourceEditor kind={kind} resourceId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "drive" && resourceId ? <SolvedAntennaDriveEditor driveId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}
 

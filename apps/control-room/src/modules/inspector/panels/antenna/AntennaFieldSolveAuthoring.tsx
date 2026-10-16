@@ -3,6 +3,7 @@ import { useState, useSyncExternalStore } from "react";
 import type { SceneResource } from "@/kernel/api/apiTypes";
 import { createInspectorEditSessionStore, InspectorEditSessionProvider, useRegisterInspectorEditSession } from "../../InspectorEditSession";
 import { AntennaProjectionDriveComposer } from "./AntennaProjectionDriveComposer";
+import { AntennaSpectrumComposer } from "./AntennaSpectrumComposer";
 import { AntennaSolveTargetsEditor } from "./AntennaSolveTargetsEditor";
 
 interface Props {
@@ -15,9 +16,11 @@ const serverVersion = () => 0;
 export function AntennaFieldSolveAuthoring(props: Props) {
   const [targets] = useState(createInspectorEditSessionStore);
   const [projection] = useState(createInspectorEditSessionStore);
+  const [spectrum] = useState(createInspectorEditSessionStore);
+  useSyncExternalStore(spectrum.subscribe, spectrum.getVersion, serverVersion);
   useSyncExternalStore(targets.subscribe, targets.getVersion, serverVersion);
   useSyncExternalStore(projection.subscribe, projection.getVersion, serverVersion);
-  const sessions = [targets.getCurrentSession(), projection.getCurrentSession()].filter(session => session !== null);
+  const sessions = [targets.getCurrentSession(), projection.getCurrentSession(), spectrum.getCurrentSession()].filter(session => session !== null);
   const dirty = sessions.filter(session => session.dirty);
   const applying = sessions.some(session => session.applying);
   const single = dirty.length === 1 ? dirty[0] : null;
@@ -31,5 +34,6 @@ export function AntennaFieldSolveAuthoring(props: Props) {
   return <>
     <InspectorEditSessionProvider store={targets}><AntennaSolveTargetsEditor {...props} /></InspectorEditSessionProvider>
     <InspectorEditSessionProvider store={projection}><AntennaProjectionDriveComposer {...props} /></InspectorEditSessionProvider>
+    <InspectorEditSessionProvider store={spectrum}><AntennaSpectrumComposer {...props} /></InspectorEditSessionProvider>
   </>;
 }
