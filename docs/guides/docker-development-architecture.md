@@ -8,7 +8,7 @@ przez Fullmag_build_runner nie jest warunkiem tej ścieżki.
 
 ## Źródła i usługi
 
-Projekt Compose nazywa się `fullmag` i zawiera dwie usługi aplikacji:
+Docelowy projekt Compose jest przypisany do wybranego checkoutu i zawiera dwie usługi aplikacji:
 `backend` oraz `frontend`. Jedna wartość `FULLMAG_SOURCE_ROOT` wybiera główny
 checkout albo konkretne worktree. Obie usługi otrzymują bind mount tego samego
 checkoutu; źródła pozostają na hoście, edytowane zwykłym edytorem Windows.
@@ -29,6 +29,65 @@ Dockerfile `docker/fem-gpu/Dockerfile` opisuje toolchain, nie ograniczenie całe
 aplikacji do FEM. Wymuszone GPU nie może przejść niejawnie na CPU. Obecność
 wszystkich wariantów w buildzie nie potwierdza obsługi dowolnej kombinacji
 fizyki ani poprawności jej wykonania.
+
+## Grupy checkoutów i izolacja
+
+Użytkownik zatwierdził osobne projekty Compose: `fullmag-master` dla głównego
+checkoutu na masterze oraz `fullmag-worktree-<nazwa>` dla wybranego worktree.
+Tożsamość wynika z rzeczywistego zarejestrowanego checkoutu; nazwy muszą być
+poprawne dla Compose i jednoznaczne także przy podobnych nazwach katalogów.
+Profil dev/release jest jawny w receipt i etykietach; równocześnie uruchomione
+warianty nie mogą współdzielić nazwy projektu.
+
+Każda grupa ma własne usługi frontend/backend, osobną sieć bridge i podsieć
+przydzielaną przez Docker IPAM, własny loopback port frontendu oraz osobny
+stan runtime. Nie używamy wspólnej sieci external ani stałej listy adresów IP.
+Backend pozostaje dostępny jako `backend:8081` wyłącznie w sieci swojej grupy.
+Kolizja jawnie wybranego portu kończy się czytelnym błędem; nie zatrzymuje
+innej grupy. Toolchain jest współdzielonym niezmiennym obrazem, a cache
+kompilacji pozostaje przypisany do checkoutu i profilu. Limit ciężkich buildów
+hosta nadal obowiązuje; równoległe działanie grup nie znosi tego limitu.
+
+Ustawienia i lista ostatnich projektów są osobne dla każdej grupy — to jawna
+decyzja użytkownika. Baza ma stały fizyczny katalog Windows w rozwiązanym
+storage, niezależny od identyfikatora runu, pakietu i recreate. Utrwalenie samego
+pliku bazy nie dowodzi dostępności zapisanych ścieżek projektów i wyników;
+mapowanie danych oraz ponowny odczyt po recreate wymagają osobnej weryfikacji.
+
+Istniejąca grupa `fullmag` jest przejściową instancją bieżącego zadania.
+Nie zmieniamy nazw działających kontenerów ani nie przenosimy ich danych
+automatycznie. Migracja do grupy checkoutu wymaga potwierdzonego bezczynnego
+stanu, zachowania danych i sprawdzenia nowej instancji. Nazewnictwo grup,
+izolacja portów/sieci i trwała baza grupy pozostają NOT VERIFIED do czasu
+wdrożenia i rzeczywistego sprawdzenia.
+
+Osobne grupy nie tworzą osobnych fizycznych hostów. Wykrywanie sprzętu oraz
+rezerwacje CPU/GPU muszą pozostać wspólne, aby dwie grupy nie przydzieliły
+tej samej pamięci GPU niezależnie. Bieżący host ledger dopuszcza jedną
+generację readiness; równoległy start różnych buildów wymaga osobnego,
+wersjonowanego rozszerzenia rejestracji generacji. Sama izolacja Compose
+nie jest dowodem obsługi tego scenariusza. Nie obchodzimy tej kontroli przez
+kopiowanie ledgeru ani zmianę tożsamości hosta na nazwę worktree.
+
+## Home i gotowość wykonania
+
+Home jest niezależnym ekranem startowym aplikacji. Jego widoczność, układ oraz
+pozycja nawigacji nie zależą od odpowiedzi listy sesji ani statusu bieżącej
+sesji. Odczyty tych zasobów zasilają historię i warunki dostępności operacji;
+nie przełączają całego Home pomiędzy ładowaniem, błędem i workspace.
+Automatyczny retry nie pokazuje naprzemiennie „Checking for sessions” oraz
+„Session list unavailable”. Informacja o połączeniu ma stałe miejsce i nie
+usuwa treści ani nie przemieszcza układu przy każdym ponowieniu.
+
+Start bez wskazanego skryptu otwiera Home. Samo znalezienie zapisanej sesji nie
+jest jawnym poleceniem jej aktywacji. Jawne otwarcie projektu/sesji lub start ze
+skryptem zachowuje właściwy model i jego interaktywną semantykę.
+
+Frontend uruchamia się po starcie kontenera backendu, bez wymagania zdrowia
+native runtime. Dzięki temu awaria wykonawcy nie blokuje pobrania interfejsu.
+Health/admission backendu nadal odmawia gotowości do symulacji; widoczny Home
+nie jest dowodem sprawnego API ani wykonania GPU. Polecenie kontrolujące
+pełny start może zgłosić błąd backendu mimo dostępnego już frontendu.
 
 ## Cykl edycji i przebudowy
 
@@ -89,6 +148,37 @@ hash kontekstu i receipt; zmiana helpera wymusza nowy kontekst i obraz pochodny.
 Aktualizacja orkiestracji nie podmienia obrazu sama przez się, więc nie ukrywa
 zmiany helpera ani nie udaje jej wdrożenia. Ta kontrola tożsamości obrazu nie
 jest dowodem uruchomienia runtime.
+
+## Oddzielne ścieżki dev i release
+
+Uzgodnienie użytkownika z 16.10.2026: priorytetem trybu developerskiego są
+prostota i szybkie iteracje. Poniższy podział jest zatwierdzonym kontraktem;
+wdrożenie i pomiar kolejnego buildu pozostają w toku.
+
+- `dev` używa istniejącego profilu Cargo `backend-dev`, zachowuje kompilację
+  przyrostową i cache między jawnymi żądaniami buildu. Frontend pracuje z HMR
+  na wybranym checkoutcie Windows.
+- `release` używa zoptymalizowanego profilu release i przygotowuje gotowe
+  artefakty/obrazy dystrybucyjne. Nie jest domyślną ścieżką codziennej edycji.
+- Receipt, ścieżki pakietów i katalogi profili jednoznacznie rozróżniają dev
+  oraz release. Nie wolno oznaczać niezoptymalizowanego buildu jako release.
+- Oba profile zawierają FDM CPU, FDM GPU, FEM CPU i FEM GPU. Profil kompilacji
+  nie zmienia requested/resolved execution ani zakazu cichego fallbacku GPU.
+- Obraz toolchaina CUDA/FEM i przypięte biblioteki są współdzielone. Zmiana
+  kodu aplikacji nie jest powodem przebudowania tego obrazu.
+
+Identyfikacja źródeł musi pozostać w provenance gotowego artefaktu, ale zmiana
+hasza całego repo nie może sama unieważniać wszystkich obiektów C++/CUDA.
+Identyfikacja buildu ma być kompilowana oddzielnie od kodu solverów. To nie
+pozwala użyć starego obiektu po rzeczywistej zmianie jego źródeł, nagłówków,
+kompilatora, zależności lub flag.
+
+Pierwszy build profilu rozgrzewa jego cache. Kryterium szybkości dotyczy
+kolejnego buildu po małej zmianie modułu i wymaga pomiaru czasu oraz listy
+ponownie kompilowanych elementów; nie jest obietnicą stałego czasu dla każdej
+zmiany. Własne archiwum całego repo nie jest wymaganiem docelowego trybu dev.
+Zamrożenie wejść backendu na czas danego buildu można zachować przyrostowo,
+bez przebudowy toolchaina i bez kopiowania kodu frontendu do obrazu.
 
 ## Polecenia trybu developerskiego
 
@@ -193,12 +283,14 @@ commita `56229c9658a08ebecc2f71009774257b8dadfc4a`; późniejsze zmiany helperó
 nie są przedstawiane jako ponowna kompilacja nowszego kodu Rust.
 Build nie dowodzi stabilnego API ani wykonania symulacji GPU.
 
-Home nie może znikać podczas sprawdzania kolekcji sesji i ponawiania połączenia.
-W stanach ładowania i błędu pozostaje zamontowany, a komunikat i Retry pojawiają
-się w jego obrębie. Akcje wymagające potwierdzonej sesji pozostają zablokowane.
-Ten przebieg przeszedł sprawdzenie w Chrome: początkowe ładowanie, HTTP 503,
-ponowienie, ten sam element Home i brak błędów JavaScript. To dowód odporności
-interfejsu na niedostępność API, nie dowód dostępności backendu.
+Poprawka niezależnego Home przeszła rzeczywistą próbę Chrome z niedostępnym
+backendem (HTTP 500, bez mockowania sieci). Home pozostawał widoczny, a Retry
+zachował te same elementy DOM Home, slotu i hosta, bez przesunięć układu,
+chwilowych bramek sesji ani błędów JavaScript/CORS. Dowód dla runu
+`4ae4802036e44cc0a1fcc8b810ee598a`:
+`browser-offline-home-2a14d253fe614eaaae2c555472e94278/receipt.json`.
+Ten test potwierdza zachowanie Home przy awarii połączenia; nie potwierdza
+poprawnego startu API, wykonania GPU ani reguły aktywacji historycznej sesji.
 
 Po kontrolowanym, graceful stopie własnych usług można jawnie odtworzyć ten sam
 run i jego `session-store`, wskazując każdy artefakt:
