@@ -52,6 +52,7 @@ mod recovery_tests {
         ledger: HostResourceLedger,
         inventory_owner: fullmag_session::host_resource_ledger::HostInventoryOwner,
         context: HostRuntimeAdmission,
+        config: RuntimeServiceConfig,
         request: HostReservationRequest,
         budget: FmsResourceBudget,
     }
@@ -176,9 +177,78 @@ mod recovery_tests {
             ledger,
             inventory_owner,
             context,
+            config,
             request,
             budget,
         }
+    }
+
+    #[test]
+    fn host_admission_retries_when_ledger_writer_is_temporarily_busy() {
+        let fixture = recovery_fixture();
+        let config = fixture.config.clone();
+        let binding = config.host_execution.as_ref().unwrap();
+        let ledger_root = binding.ledger_root.clone();
+        let policy = binding.policy.clone();
+
+        // SessionStore exposes the public writer transaction for the same
+        // ledger-root lock used by HostResourceLedger. Keep it in a separate
+        // thread so this test exercises the real native contention path.
+        let holder_store = SessionStore::open(ledger_root.clone()).unwrap();
+        let (acquired_sender, acquired_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let holder = std::thread::spawn(move || {
+            let transaction = holder_store.write_transaction().unwrap();
+            acquired_sender.send(()).unwrap();
+            release_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            drop(transaction);
+        });
+        acquired_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let busy = match HostResourceLedger::open(&ledger_root, policy.clone()) {
+            Ok(_) => false,
+            Err(error) => error
+                .chain()
+                .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>()),
+        };
+        if !busy {
+            release_sender.send(()).unwrap();
+            holder.join().unwrap();
+            panic!("ledger writer fixture did not establish contention");
+        }
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            release_sender.send(()).unwrap();
+        });
+        let opened = HostRuntimeAdmission::open(&config);
+        releaser.join().unwrap();
+        holder.join().unwrap();
+        assert!(opened
+            .expect("admission open should succeed after contention")
+            .is_some());
+
+        let mut corrupt = config;
+        corrupt
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .policy
+            .topology_sha256 = "b".repeat(64);
+        let started = std::time::Instant::now();
+        let error = match HostRuntimeAdmission::open(&corrupt) {
+            Ok(_) => panic!("corrupt host policy unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "permanent host policy error was retried for too long: {error:#}"
+        );
+        assert!(format!("{error:#}").contains("marker differs"));
     }
 
     #[test]
@@ -747,8 +817,10 @@ impl HostRuntimeAdmission {
         let Some(binding) = config.host_execution.as_ref() else {
             return Ok(None);
         };
-        let ledger = HostResourceLedger::open(&binding.ledger_root, binding.policy.clone())
-            .context("open the exact configured physical-host resource ledger")?;
+        let ledger = crate::retry_store_writer_busy(|| {
+            HostResourceLedger::open(&binding.ledger_root, binding.policy.clone())
+        })
+        .context("open the exact configured physical-host resource ledger")?;
         Ok(Some(Self {
             ledger: Arc::new(ledger),
             compute_placements: binding.compute_placements.clone(),
@@ -774,7 +846,9 @@ impl HostRuntimeAdmission {
     /// that the service process itself is live; its owner/recovery gate remains
     /// an independent prerequisite.
     pub fn has_current_compute_snapshot(&self) -> Result<bool> {
-        let Some(snapshot) = self.ledger.read_compute_node_snapshot()? else {
+        let Some(snapshot) =
+            crate::retry_store_writer_busy(|| self.ledger.read_compute_node_snapshot())?
+        else {
             return Ok(false);
         };
         snapshot.validate()?;
@@ -788,7 +862,9 @@ impl HostRuntimeAdmission {
         if snapshot.schema_version != COMPUTE_NODE_SNAPSHOT_SCHEMA_V2 {
             return Ok(false);
         }
-        let Some(active_owner) = self.ledger.active_inventory_owner()? else {
+        let Some(active_owner) =
+            crate::retry_store_writer_busy(|| self.ledger.active_inventory_owner())?
+        else {
             return Ok(false);
         };
         if snapshot.host_owner_id.as_deref() != Some(active_owner.host_owner_id.as_str())

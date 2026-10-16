@@ -92,6 +92,7 @@ def serve():
     paths = service.prepare_storage()
     bootstrap = service.initialize_accepted_store(paths)
     configuration = service.ensure_configuration(paths)
+    print("[fullmag-backend] Starting API and runtime service", flush=True)
     api = subprocess.Popen(["/opt/fullmag/package/bin/fullmag-api"],
                            env=service.process_environment(paths))
     handle = None
@@ -111,6 +112,7 @@ def serve():
             receipt["startup_activation"] = startup_result
         receipt.update(state="ready", service_owner=handle.owner)
         service._atomic_json(receipt_path, receipt, "process tree receipt")
+        print("[fullmag-backend] Ready: API and runtime service", flush=True)
         while not stopping.wait(1):
             status = api.poll()
             if status is not None:
@@ -140,6 +142,8 @@ def serve():
                     "confirmed-owner-awaiting-authenticated-reprobe"
                 )
         receipt.update(state="failed_outcome_retained", error=str(error))
+        print(f"[fullmag-backend] Startup or runtime failed; admission closed: {str(error)[-4096:]}. "
+              f"Process receipt: {receipt_path}", file=sys.stderr, flush=True)
         if api.poll() is None:
             api.terminate()
         try:

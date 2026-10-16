@@ -55,16 +55,28 @@ async fn publish_compute_node_sample(
     tokio::task::spawn_blocking(move || -> Result<Option<Arc<HostInventoryOwner>>> {
         let inventory_owner = match inventory_owner {
             Some(owner) => Some(owner),
-            None => ledger.try_acquire_inventory_owner()?.map(Arc::new),
+            None => {
+                // StoreWriterBusy can occur only while entering the ledger
+                // writer for this operation. Native owner-lock contention is
+                // reported as Ok(None) and must not be turned into a retry.
+                fullmag_runtime_control::retry_store_writer_busy(|| {
+                    ledger.try_acquire_inventory_owner()
+                })?
+                .map(Arc::new)
+            }
         };
         let Some(inventory_owner) = inventory_owner else {
             return Ok(None);
         };
-        let previous = ledger.read_compute_node_snapshot()?;
+        let previous = fullmag_runtime_control::retry_store_writer_busy(|| {
+            ledger.read_compute_node_snapshot()
+        })?;
         let snapshot = if ledger.policy().schema_version
             == fullmag_session::host_resource_ledger::HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2
         {
-            let readiness = ledger.read_runtime_readiness()?;
+            let readiness = fullmag_runtime_control::retry_store_writer_busy(|| {
+                ledger.read_runtime_readiness()
+            })?;
             fullmag_runtime_control::compute_node_probe::validate_native_fem_gpu_readiness(
                 &readiness,
             )?;
@@ -81,7 +93,9 @@ async fn publish_compute_node_sample(
                 previous.as_ref(),
             )?
         };
-        ledger.publish_compute_node_snapshot_with_owner(&inventory_owner, &snapshot)?;
+        fullmag_runtime_control::retry_store_writer_busy(|| {
+            ledger.publish_compute_node_snapshot_with_owner(&inventory_owner, &snapshot)
+        })?;
         Ok(Some(inventory_owner))
     })
     .await
@@ -1123,9 +1137,11 @@ fn run_service(path: PathBuf) -> Result<()> {
         .host_execution
         .as_ref()
         .map(|binding| {
-            HostResourceLedger::open(&binding.ledger_root, binding.policy.clone())
-                .context("open the configured host ledger for compute-node sampling")
-                .map(Arc::new)
+            fullmag_runtime_control::retry_store_writer_busy(|| {
+                HostResourceLedger::open(&binding.ledger_root, binding.policy.clone())
+            })
+            .context("open the configured host ledger for compute-node sampling")
+            .map(Arc::new)
         })
         .transpose()?;
     owner.set_execution_identity(
