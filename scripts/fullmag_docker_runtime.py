@@ -46,6 +46,11 @@ TOOLCHAIN_MANIFEST_SCHEMA = "fullmag.docker.fem-gpu-dependencies.v1"
 TOOLCHAIN_SOURCE_COMMITS = ("mfem", "libceed", "hypre", "petsc", "slepc")
 TOOLCHAIN_PREFLIGHT_TIMEOUT_SECONDS = 60
 TOOLCHAIN_MANIFEST_MAX_BYTES = 2 * 1024 * 1024
+RUNTIME_CONFIG_RELATIVE = Path(".fullmag/runtime-service/docker-all.json")
+RUNTIME_CONFIG_HISTORY_RELATIVE = Path("state") / RUNTIME_CONFIG_RELATIVE
+_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_CONFIG_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
 _TOOLCHAIN_MANIFEST_PROBE = r'''
 import os
 import stat
@@ -250,7 +255,7 @@ def validate_workspace_environment(config):
 def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs=None,
                  inputs_path=None, package=None, provenance=None, toolchain_image=None,
                  project="fullmag-config-check", template=None, host_ledger=None,
-                 startup=None, frontend_cache=None):
+                 startup=None, frontend_cache=None, previous_config_sha256=None):
     """Resolve the versioned Compose definition; do not generate service topology."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("A full immutable image ID is required")
@@ -268,6 +273,10 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
         "FULLMAG_HOST_CERTIFICATE": str(host_certificate),
         "FULLMAG_BACKEND_HOSTNAME": "fullmag-" + state.parent.name,
     }
+    if previous_config_sha256 is not None:
+        if _CONFIG_SHA256_RE.fullmatch(str(previous_config_sha256)) is None:
+            raise ValueError("Previous runtime configuration digest must be a lowercase SHA-256")
+        environment["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"] = str(previous_config_sha256)
     if inputs is not None:
         if package is None or provenance is None or inputs_path is None:
             raise ValueError("Development Compose requires a managed package and provenance")
@@ -300,6 +309,14 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
     configured = json.loads(docker("compose", "--project-name", project,
                                    "--project-directory", str(repo), *definitions,
                                    "config", "--format", "json", environment=environment))
+    if previous_config_sha256 is not None:
+        backend = configured.get("services", {}).get("backend")
+        if not isinstance(backend, dict):
+            raise ValueError("Versioned Compose has no backend service for config rotation")
+        backend_environment = backend.setdefault("environment", {})
+        if not isinstance(backend_environment, dict):
+            raise ValueError("Versioned Compose backend environment is not an object")
+        backend_environment["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"] = str(previous_config_sha256)
     if host_ledger is not None:
         configured.get("services", {}).pop("host-ledger-maintenance", None)
     if frontend_cache is not None:
@@ -714,13 +731,408 @@ def _require_static_source_identity(assembly, selected_source):
     return observed
 
 
+def _read_reuse_json(path, label, maximum=16 * 1024 * 1024):
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} is not a regular file: {path}")
+    if path.stat().st_size <= 0 or path.stat().st_size > maximum:
+        raise ValueError(f"{label} is outside its bounded size: {path}")
+    try:
+        if os.name == "nt":
+            from windows_folder_host import read_owned_regular
+            raw = read_owned_regular(path, maximum=maximum)
+        else:
+            raw = path.read_bytes()
+        value = json.loads(raw)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError(f"{label} is not valid JSON: {path}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must contain an object")
+    return value
+
+
+def _container_inspect(container_id):
+    if not isinstance(container_id, str) or _CONTAINER_ID_RE.fullmatch(container_id) is None:
+        raise ValueError("Reused Docker receipt has an invalid container ID")
+    try:
+        value = json.loads(docker("inspect", container_id))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("Reused Docker container could not be inspected") from error
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        raise ValueError("Reused Docker container inspect returned an unexpected document")
+    document = value[0]
+    actual_id = document.get("Id")
+    if (not isinstance(actual_id, str) or _CONTAINER_ID_RE.fullmatch(actual_id) is None
+            or not actual_id.startswith(container_id)):
+        raise ValueError("Reused Docker container identity changed")
+    return document
+
+
+def _mount_source(source):
+    if not isinstance(source, str) or not source:
+        return None
+    try:
+        return host_path(source)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _paths_overlap(left, right):
+    return left == right or left in right.parents or right in left.parents
+
+
+def _validate_reuse_container(document, *, container_id, project, service, image, state):
+    labels = document.get("Config", {}).get("Labels")
+    if (not isinstance(labels, dict)
+            or labels.get("com.docker.compose.project") != project
+            or labels.get("com.docker.compose.service") != service):
+        raise ValueError(f"Reused {service} container Compose ownership changed")
+    if document.get("Image") != image:
+        raise ValueError(f"Reused {service} container image changed")
+    state_info = document.get("State")
+    if (not isinstance(state_info, dict) or state_info.get("Running") is not False
+            or state_info.get("Status") not in {"created", "exited"}):
+        raise ValueError(f"Reused {service} container is not stopped")
+    mounts = document.get("Mounts")
+    if not isinstance(mounts, list):
+        raise ValueError(f"Reused {service} container has no mount inventory")
+    target = "/state" if service == "backend" else "/state/development"
+    expected_source = state if service == "backend" else state / "development"
+    matches = []
+    for mount in mounts:
+        if not isinstance(mount, dict) or mount.get("Type") != "bind":
+            continue
+        if mount.get("Destination") != target:
+            continue
+        source = _mount_source(mount.get("Source"))
+        if source is not None and source == expected_source.resolve():
+            matches.append(mount)
+    if len(matches) != 1 or matches[0].get("RW") is not True:
+        raise ValueError(f"Reused {service} container state mount changed")
+
+
+def _validate_reuse_containers(reuse, *, project, frontend):
+    """Prove stopped owned services and quiescent state mounts before mutation."""
+    receipt = reuse["receipt"]
+    image = receipt.get("image_id")
+    if not isinstance(image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+        raise ValueError("Reused Docker receipt has no immutable image ID")
+    backend_id = receipt.get("container_id")
+    if backend_id is None:
+        raise ValueError("Reused Docker receipt has no backend container ID")
+    backend = _container_inspect(backend_id)
+    _validate_reuse_container(
+        backend,
+        container_id=backend_id,
+        project=project,
+        service="backend",
+        image=image,
+        state=reuse["state"],
+    )
+    if frontend == "dev":
+        frontend_id = receipt.get("frontend_container_id")
+        if frontend_id is None:
+            raise ValueError("Reused Docker receipt has no frontend container ID")
+        frontend_document = _container_inspect(frontend_id)
+        _validate_reuse_container(
+            frontend_document,
+            container_id=frontend_id,
+            project=project,
+            service="frontend",
+            image=image,
+            state=reuse["state"],
+        )
+    running_raw = docker("ps", "--quiet")
+    running_ids = [value for value in running_raw.splitlines() if value]
+    state = reuse["state"].resolve()
+    for running_id in running_ids:
+        running = _container_inspect(running_id)
+        labels = running.get("Config", {}).get("Labels")
+        if isinstance(labels, dict) and labels.get("com.docker.compose.project") == project:
+            raise ValueError("A running container still belongs to the reused Compose project")
+        for mount in running.get("Mounts", []):
+            if not isinstance(mount, dict) or mount.get("Type") != "bind":
+                continue
+            source = _mount_source(mount.get("Source"))
+            if source is not None and _paths_overlap(source, state):
+                raise ValueError("A running container still mounts the reused session state")
+
+
+def _load_reuse_run(layout, run_receipt, *, project_name, frontend,
+                    previous_config_sha256=None):
+    """Validate one explicitly named stopped run before reusing its state."""
+    if run_receipt is None:
+        return None
+    runs_root = storage.validate_path(
+        Path(layout["runs_root"]) / "docker-all",
+        Path(layout["storage_root"]),
+        "Docker runtime runs root",
+    )
+    receipt_path = storage.validate_path(Path(run_receipt), runs_root,
+                                         "Docker runtime run receipt")
+    root = receipt_path.parent
+    if (receipt_path.name != "receipt.json" or root.parent != runs_root
+            or _RUN_ID_RE.fullmatch(root.name) is None):
+        raise ValueError("--run-receipt must name a direct docker-all run receipt")
+    receipt = _read_reuse_json(receipt_path, "Docker runtime run receipt")
+    if receipt.get("schema") != "fullmag.docker-all-run.v1":
+        raise ValueError("Docker runtime run receipt has an unsupported schema")
+    if receipt.get("state") not in {"running", "stopped"}:
+        raise ValueError("--run-receipt must reference a running or gracefully stopped run")
+    project = receipt.get("compose_project")
+    if (not isinstance(project, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project)
+            or project_name is not None and project != project_name):
+        raise ValueError("Docker runtime run project identity does not match the requested project")
+    if receipt.get("frontend_mode") != frontend:
+        raise ValueError("Reused run frontend mode differs from the requested mode")
+    expected_paths = {
+        "state_root": root / "state",
+        "compose_file": root / "compose.json",
+    }
+    for field, expected in expected_paths.items():
+        value = receipt.get(field)
+        if not isinstance(value, str) or Path(value).resolve() != expected.resolve():
+            raise ValueError(f"Docker runtime receipt has an unexpected {field}")
+    certificate_value = receipt.get("host_certificate")
+    if (not isinstance(certificate_value, str)
+            or Path(certificate_value).resolve() != (root / "windows-folder-host.json").resolve()):
+        raise ValueError("Docker runtime receipt has an unexpected host certificate path")
+    state = storage.validate_path(root / "state", root, "reused runtime state")
+    if not state.is_dir() or state.is_symlink():
+        raise ValueError("Reused runtime state is not a real directory")
+    session_store = state / "runs" / "docker-all" / "session-store"
+    if not session_store.is_dir() or session_store.is_symlink():
+        raise ValueError("Reused runtime session store is missing or not a real directory")
+    host_certificate = root / "windows-folder-host.json"
+    owner_marker = state / ".fullmag-windows-folder-owner.json"
+    for path, label in ((host_certificate, "reused Windows host certificate"),
+                        (owner_marker, "reused Windows storage owner marker")):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"{label} is missing or not a regular file")
+    old_assembly = receipt.get("assembly_receipt")
+    if not isinstance(old_assembly, str):
+        raise ValueError("Reused run has no prior assembly receipt")
+    old_assembly = storage.validate_path(old_assembly, Path(layout["build_storage_root"]),
+                                         "prior assembly receipt")
+    if digest(old_assembly) != receipt.get("assembly_receipt_sha256"):
+        raise ValueError("Prior assembly receipt digest changed")
+    config = state / RUNTIME_CONFIG_RELATIVE
+    if previous_config_sha256 is not None:
+        if _CONFIG_SHA256_RE.fullmatch(str(previous_config_sha256)) is None:
+            raise ValueError("--previous-config-sha256 must be a lowercase SHA-256 digest")
+        if config.is_symlink() or not config.is_file() or digest(config) != previous_config_sha256:
+            raise ValueError("Previous runtime configuration digest does not match the reused state")
+    source_root = receipt.get("frontend_source_root")
+    host_inputs_value = receipt.get("frontend_host_inputs")
+    guest_inputs_value = receipt.get("frontend_inputs")
+    frontend_inputs = None
+    guest_inputs = None
+    if frontend == "dev":
+        if not isinstance(source_root, str) or not Path(source_root).is_dir() or Path(source_root).is_symlink():
+            raise ValueError("Reused development run has no valid live source checkout")
+        if not isinstance(host_inputs_value, str) or not isinstance(guest_inputs_value, str):
+            raise ValueError("Reused development run has no complete frontend input manifests")
+        frontend_inputs = storage.validate_path(host_inputs_value, root,
+                                                 "prior frontend input manifest")
+        guest_inputs = storage.validate_path(guest_inputs_value, root,
+                                             "prior guest frontend input manifest")
+        if (frontend_inputs.is_symlink() or not frontend_inputs.is_file()
+                or guest_inputs.is_symlink() or not guest_inputs.is_file()):
+            raise ValueError("Prior frontend input manifest is not a regular file")
+        for path, field in ((frontend_inputs, "frontend_host_inputs_sha256"),
+                            (guest_inputs, "frontend_inputs_sha256")):
+            expected = receipt.get(field)
+            if not isinstance(expected, str) or not _CONFIG_SHA256_RE.fullmatch(expected):
+                raise ValueError(f"Reused development run has no valid {field}")
+            if digest(path) != expected:
+                raise ValueError(f"Reused development run {field} changed")
+    _validate_reuse_containers(
+        {"receipt": receipt, "state": state},
+        project=project,
+        frontend=frontend,
+    )
+    return {
+        "receipt_path": receipt_path,
+        "receipt": receipt,
+        "root": root,
+        "state": state,
+        "project": project,
+        "host_certificate": host_certificate,
+        "owner_marker": owner_marker,
+        "source_root": Path(source_root).resolve() if isinstance(source_root, str) else None,
+        "frontend_inputs": frontend_inputs,
+        "guest_inputs": guest_inputs,
+        "previous_config_sha256": previous_config_sha256,
+        "reuse_token": uuid.uuid4().hex,
+    }
+
+
+def _preserve_reuse_evidence(reuse):
+    """Copy only owned run metadata before any same-run receipt is replaced."""
+    root = reuse["root"]
+    root_resolved = root.resolve()
+    history = root / "receipt-history" / reuse["reuse_token"]
+    history.mkdir(parents=True, exist_ok=False)
+    relative_paths = [
+        Path("receipt.json"), Path("compose.json"), Path("compose.source.yaml"),
+        Path("windows-folder-host.json"), Path("host-ledger-adapter-receipt.json"),
+        Path("frontend-cache-receipt.json"), Path("development-inputs.json"),
+        Path("development-inputs-host.json"), Path("startup-provenance.json"),
+        Path("compose.startup.json"), Path("state/.fullmag-windows-folder-owner.json"),
+        Path("state/.fullmag-windows-folder-grant.json"),
+        Path("state/.windows-folder-probe/probe-first.json"),
+        Path("state/.windows-folder-probe/probe-restart.json"),
+        Path("state/.windows-folder-probe/restart-sentinel.bin"),
+        RUNTIME_CONFIG_HISTORY_RELATIVE,
+    ]
+    # Later recreates keep their receipts in a tokenized metadata directory.
+    # Preserve every path-valued evidence field from the old receipt as well,
+    # but only when it resolves inside this owned run root.
+    def collect_paths(value):
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from collect_paths(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from collect_paths(item)
+        elif isinstance(value, str):
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                return
+            if (not candidate.exists() and not candidate.is_symlink()) or candidate.is_dir():
+                return
+            try:
+                relative = candidate.resolve().relative_to(root_resolved)
+            except (OSError, ValueError):
+                return
+            if relative != Path("receipt.json"):
+                yield relative
+
+    for relative in collect_paths(reuse["receipt"]):
+        if relative not in relative_paths:
+            relative_paths.append(relative)
+    archived = []
+    for relative in relative_paths:
+        source = root / relative
+        if not source.exists() and not source.is_symlink():
+            continue
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("Reused run evidence is not a regular file: " + str(source))
+        destination = history / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        archived.append({"relative": relative.as_posix(),
+                         "sha256": digest(destination),
+                         "size_bytes": destination.stat().st_size})
+    if not archived or not any(item["relative"] == "receipt.json" for item in archived):
+        raise ValueError("Reused run receipt could not be preserved")
+    storage.atomic_json(history / "manifest.json", {
+        "schema": "fullmag.docker-all-reuse-history.v1",
+        "source_receipt": str(reuse["receipt_path"]),
+        "source_receipt_sha256": digest(reuse["receipt_path"]),
+        "files": archived,
+    })
+    reuse["history_root"] = history
+    reuse["metadata_root"] = root / ".recreate" / reuse["reuse_token"]
+    reuse["metadata_root"].mkdir(parents=True, exist_ok=False)
+    return reuse
+
+
+def _publish_restart_sentinel(state, payload):
+    """Atomically rotate the owned binary restart proof for a new image."""
+    from windows_folder_host import _pinned_no_reparse_ancestors, _replace_write_through
+
+    path = Path(state) / ".windows-folder-probe" / "restart-sentinel.bin"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Reused Windows restart sentinel is missing or not a regular file")
+    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with _pinned_no_reparse_ancestors(path.parent):
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("Reused Windows restart sentinel changed during rotation")
+            with temporary.open("xb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _replace_write_through(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _reuse_host_certificate(reuse, assembly, engine_id):
+    """Rotate only the image fields of the existing owned Windows certificate."""
+    from windows_folder_host import HOST_SCHEMA, local_volume, publish_evidence
+
+    certificate = _read_reuse_json(reuse["host_certificate"], "Windows host certificate")
+    marker = _read_reuse_json(reuse["owner_marker"], "Windows storage owner marker")
+    if certificate != marker or certificate.get("schema") != HOST_SCHEMA:
+        raise ValueError("Reused Windows storage certificate and owner marker differ")
+    if (certificate.get("storage_profile") != "windows-folder-v1"
+            or certificate.get("role") != "session"
+            or certificate.get("owner_scope") != "docker-desktop-linux"):
+        raise ValueError("Reused Windows storage certificate has the wrong ownership scope")
+    owner = certificate.get("owner_token")
+    try:
+        parsed = uuid.UUID(str(owner))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ValueError("Reused Windows storage owner token is invalid") from error
+    if parsed.int == 0 or str(parsed) != owner:
+        raise ValueError("Reused Windows storage owner token is not canonical")
+    native = local_volume(reuse["state"])
+    for field in ("host_root", "host_filesystem", "host_drive_type", "host_volume_serial", "host_root_no_reparse"):
+        if certificate.get(field) != native.get(field):
+            raise ValueError("Reused Windows storage identity changed: " + field)
+    if certificate.get("image_id") != reuse["receipt"].get("image_id"):
+        raise ValueError("Reused Windows certificate image does not match its run receipt")
+    if not isinstance(engine_id, str) or not engine_id or certificate.get("engine_id") != engine_id:
+        raise ValueError("Reused Windows storage certificate belongs to another Docker engine")
+    rotated = dict(certificate)
+    rotated.update(
+        image_id=assembly["image_id"],
+        source_commit=assembly["commit"],
+        binary_hashes=assembly["binary_hashes"],
+        artifact_receipt_sha256=assembly["build_receipt_sha256"],
+        restart_expected_sha256=hashlib.sha256(
+            (owner + ":" + assembly["image_id"]).encode("ascii")
+        ).hexdigest(),
+        restart_verified=False,
+    )
+    _publish_restart_sentinel(
+        reuse["state"],
+        (owner + ":" + assembly["image_id"]).encode("ascii"),
+    )
+    publish_evidence(reuse["host_certificate"], rotated)
+    publish_evidence(reuse["owner_marker"], rotated)
+    return rotated
+
+
 def start(repo, assembly_receipt, port, frontend="static", source_root=None,
-          startup_script=None, *, project_name=None, compose_template=None):
+          startup_script=None, *, project_name=None, compose_template=None,
+          run_receipt=None, previous_config_sha256=None):
     if project_name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project_name):
         raise ValueError("Invalid Compose project name")
     if not 1024 <= port <= 65535:
         raise ValueError("Port must be between 1024 and 65535")
+    if frontend not in {"static", "dev"}:
+        raise ValueError("Frontend mode must be static or dev")
     layout = storage.resolve_layout(repo, PROFILE)
+    reuse = _load_reuse_run(
+        layout,
+        run_receipt,
+        project_name=project_name,
+        frontend=frontend,
+        previous_config_sha256=previous_config_sha256,
+    )
+    if run_receipt is not None and previous_config_sha256 is None:
+        raise ValueError("--run-receipt reuse requires --previous-config-sha256")
+    if previous_config_sha256 is not None and reuse is None:
+        raise ValueError("Previous runtime configuration digest requires --run-receipt reuse")
+    if reuse is not None:
+        if source_root is None:
+            source_root = reuse["source_root"]
+        elif Path(source_root).resolve(strict=True) != reuse["source_root"]:
+            raise ValueError("Requested live source checkout differs from the reused run")
     assembly_receipt = storage.validate_path(assembly_receipt, Path(layout["build_storage_root"]))
     assembly = read_json(assembly_receipt)
     if assembly.get("schema") != "fullmag.docker-all-image.v1" or assembly.get("state") != "succeeded" or assembly.get("exit_code") != 0:
@@ -748,47 +1160,77 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
     elif assembly.get("runtime_mode") == "development_source_bind":
         raise ValueError("Static mode requires a packaged release image")
     storage.initialize(layout)
-    root = storage.validate_path(Path(layout["runs_root"]) / "docker-all" / uuid.uuid4().hex,
-                                 Path(layout["build_storage_root"]))
-    root.mkdir(parents=True, exist_ok=False, mode=0o700)
-    state = root / "state"
-    state.mkdir(mode=0o777)
-    state.chmod(0o777)
+    if reuse is None:
+        root = storage.validate_path(Path(layout["runs_root"]) / "docker-all" / uuid.uuid4().hex,
+                                     Path(layout["build_storage_root"]))
+        root.mkdir(parents=True, exist_ok=False, mode=0o700)
+        state = root / "state"
+        state.mkdir(mode=0o777)
+        state.chmod(0o777)
+        metadata_root = root
+    else:
+        _preserve_reuse_evidence(reuse)
+        root = reuse["root"]
+        state = reuse["state"]
+        metadata_root = reuse["metadata_root"]
     register_runtime_reference_root(layout, root)
-    project = project_name or "fullmag-all-" + root.name
+    project = reuse["project"] if reuse is not None else project_name or "fullmag-all-" + root.name
     spec = root / "compose.json"
     host_certificate = root / "windows-folder-host.json"
     receipt = {"schema": "fullmag.docker-all-run.v1", "state": "starting", "image_id": image,
                "compose_project": project, "compose_file": str(spec), "state_root": str(state),
+               "host_certificate": str(host_certificate),
                "assembly_receipt": str(assembly_receipt), "assembly_receipt_sha256": digest(assembly_receipt),
                "native_source_identity": assembly["native_source_identity"],
                "url": f"http://localhost:{port}/workspace", "qualification": "NOT VERIFIED",
                "frontend_mode": frontend, "container_http_port": 8080 if frontend == "dev" else 8081}
+    if reuse is not None:
+        receipt.update(
+            reused_from=str(reuse["receipt_path"]),
+            reused_from_sha256=digest(reuse["receipt_path"]),
+            reuse_history=str(reuse["history_root"]),
+            reuse_token=reuse["reuse_token"],
+            previous_config_sha256=previous_config_sha256,
+        )
     storage.atomic_json(root / "receipt.json", receipt)
     inputs = None
     host_ledger = None
     frontend_cache = None
     startup = None
-    inputs_path = root / "development-inputs.json"
+    inputs_path = metadata_root / "development-inputs.json"
     try:
-        if frontend not in {"static", "dev"}:
-            raise ValueError("Frontend mode must be static or dev")
         args = ["compose", "-f", str(spec), "--project-name", project]
         if frontend == "dev":
             from docker_development_inputs import guest_manifest, seed, select_checkout
-            inputs = seed(select_checkout(repo, source_root), state, port)
-            host_inputs_path = root / "development-inputs-host.json"
-            storage.atomic_json(host_inputs_path, inputs)
-            storage.atomic_json(inputs_path, guest_manifest(inputs))
+            selected_checkout = select_checkout(repo, source_root)
+            inputs = seed(
+                selected_checkout,
+                state,
+                port,
+                reuse_from=reuse["frontend_inputs"] if reuse is not None else None,
+            )
+            if reuse is not None:
+                # frontend_dev freezes this manifest.  Reuse the original
+                # host and guest bytes instead of creating a new freeze root.
+                host_inputs_path = reuse["frontend_inputs"]
+                inputs_path = reuse["guest_inputs"]
+                receipt["frontend_inputs_reused"] = True
+            else:
+                host_inputs_path = metadata_root / "development-inputs-host.json"
+                storage.atomic_json(host_inputs_path, inputs)
+                storage.atomic_json(inputs_path, guest_manifest(inputs))
             receipt["frontend_host_inputs"] = str(host_inputs_path)
             receipt["frontend_host_inputs_sha256"] = digest(host_inputs_path)
             from local_runner.build_source import native_identity
-            receipt["mounted_source_identity_at_start"] = native_identity(Path(inputs["source_root"]), "snapshot")
+            receipt["mounted_source_identity_at_start"] = native_identity(selected_checkout, "snapshot")
             receipt["source_selection"] = "live_windows_selected_checkout"
             receipt["source_root"] = inputs["source_root"]
             receipt["compiled_source_commit"] = assembly["commit"]
             receipt["frontend_source_root"] = inputs["source_root"]
             receipt["frontend_source_commit"] = inputs["source_commit"]
+            receipt["frontend_observed_source_commit"] = storage.git(
+                selected_checkout, "rev-parse", "HEAD"
+            )
             receipt["frontend_inputs"] = str(inputs_path)
             receipt["frontend_inputs_sha256"] = digest(inputs_path)
 
@@ -818,13 +1260,13 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             )
             if inputs is not None and startup_authorization.source_root != Path(inputs["source_root"]).resolve():
                 raise ValueError("Startup script checkout differs from the mounted development checkout")
-            startup_provenance = root / "startup-provenance.json"
+            startup_provenance = metadata_root / "startup-provenance.json"
             provenance_sha256 = startup_helper.write_provenance(startup_provenance, startup_authorization)
             helper_hashes = assembly.get("startup_helper_hashes", {})
             helper_sha256 = helper_hashes.get("docker_startup_script.py")
             if not re.fullmatch(r"[0-9a-f]{64}", helper_sha256 or ""):
                 raise ValueError("Assembly receipt has no pinned startup helper digest")
-            startup_overlay = root / "compose.startup.json"
+            startup_overlay = metadata_root / "compose.startup.json"
             authorization = startup_authorization.as_dict()
             _write_startup_overlay(
                 startup_overlay,
@@ -853,19 +1295,40 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 "execution_policy": authorization["execution_policy"],
             }
 
+        source_template = (Path(compose_template) if compose_template is not None
+                           else repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml"))
+        compose_source_path = metadata_root / "compose.source.yaml"
+        if compose_source_path.exists() or compose_source_path.is_symlink():
+            if compose_source_path.is_symlink() or compose_source_path.read_bytes() != source_template.read_bytes():
+                raise ValueError("Reused Compose source template differs from the requested version")
+        else:
+            shutil.copyfile(source_template, compose_source_path)
+
         def configured_spec():
             return compose_spec(image, state.resolve(), port, host_certificate.resolve(),
                                 repo=repo, inputs=inputs, inputs_path=inputs_path.resolve(),
                                 package=assembly.get("package_root"),
                                 provenance=assembly_receipt, project=project,
-                                toolchain_image=assembly.get("base_image"), template=root / "compose.source.yaml",
+                                toolchain_image=assembly.get("base_image"), template=compose_source_path,
                                 host_ledger=host_ledger, startup=startup,
-                                frontend_cache=frontend_cache)
+                                frontend_cache=frontend_cache,
+                                previous_config_sha256=previous_config_sha256)
         if os.name != "nt":
             raise ValueError("This Windows-folder launcher requires native Windows host attestation")
         from windows_folder_host import attest, local_volume, publish_evidence, read_owned_regular
         from docker_host_ledger import prepare as prepare_host_ledger
-        host_ledger = prepare_host_ledger(layout, repo, image, root, docker)
+        engine_id = docker("info", "--format", "{{.ID}}")
+        if reuse is not None:
+            certificate = _reuse_host_certificate(reuse, assembly, engine_id)
+        else:
+            certificate = None
+        host_ledger = prepare_host_ledger(
+            layout,
+            repo,
+            image,
+            metadata_root / "host-ledger",
+            docker,
+        )
         receipt["host_ledger"] = host_ledger
         storage.atomic_json(root / "receipt.json", receipt)
         if inputs is not None:
@@ -875,7 +1338,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 layout,
                 repo,
                 image,
-                root,
+                metadata_root / "frontend-cache",
                 docker,
                 source_root=inputs["source_root"],
                 worktree_id=inputs["worktree_id"],
@@ -897,12 +1360,11 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 "receipt_path": frontend_cache["receipt_path"],
             }
             storage.atomic_json(root / "receipt.json", receipt)
-        certificate = attest(state, assembly, docker("info", "--format", "{{.ID}}"), assembly["binary_hashes"])
+        if certificate is None:
+            certificate = attest(state, assembly, engine_id, assembly["binary_hashes"])
         publish_evidence(host_certificate, certificate)
-        source_template = Path(compose_template) if compose_template is not None else repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml")
-        shutil.copyfile(source_template, root / "compose.source.yaml")
-        receipt["compose_source"] = str(root / "compose.source.yaml")
-        receipt["compose_source_sha256"] = digest(root / "compose.source.yaml")
+        receipt["compose_source"] = str(compose_source_path)
+        receipt["compose_source_sha256"] = digest(compose_source_path)
         configured = configured_spec()
         probe_service = configured["services"]["backend"]
         probe_service["command"] = ["--storage-probe"]
@@ -1002,7 +1464,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                               if m["Destination"] == "/run/fullmag/startup-provenance.json"]
             if (len(startup_mounts) != 1 or startup_mounts[0]["Type"] != "bind"
                     or startup_mounts[0]["RW"]
-                    or host_path(startup_mounts[0]["Source"]) != (root / "startup-provenance.json").resolve()):
+                    or host_path(startup_mounts[0]["Source"]) != (metadata_root / "startup-provenance.json").resolve()):
                 raise ValueError("Startup provenance must be a readonly run-owned bind")
             environment = dict(
                 value.split("=", 1)
@@ -1092,6 +1554,10 @@ if __name__ == "__main__":
     launch.add_argument("--source-root", type=Path)
     launch.add_argument("--frontend", choices=("static", "dev"), default="static")
     launch.add_argument("--startup-script", type=Path)
+    launch.add_argument("--run-receipt", type=Path,
+                        help="explicit prior run receipt whose state is reused")
+    launch.add_argument("--previous-config-sha256",
+                        help="exact raw hash of the prior runtime service config for CAS rotation")
     args = parser.parse_args()
     if args.action == "submit":
         submit_build(args.repo_root.resolve(), args.commit)
@@ -1102,4 +1568,6 @@ if __name__ == "__main__":
                     source_digest=args.source_digest, native_snapshot_sha256=args.native_snapshot_sha256, development=args.development, source_root=args.source_root)
     else:
         start(args.repo_root.resolve(), args.assembly_receipt, args.port, args.frontend,
-              args.source_root, args.startup_script)
+              args.source_root, args.startup_script,
+              run_receipt=args.run_receipt,
+              previous_config_sha256=args.previous_config_sha256)

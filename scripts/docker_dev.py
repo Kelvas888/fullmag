@@ -1483,6 +1483,30 @@ def up(args: argparse.Namespace) -> None:
     )
 
 
+def recreate(args: argparse.Namespace) -> None:
+    """Recreate services from one named run while retaining its state root."""
+    _require_native_windows()
+    repo = Path(args.repo_root).resolve(strict=True)
+    _assert_no_running_fullmag()
+    from fullmag_docker_runtime import start
+
+    # No build or latest-run lookup is allowed here.  The runtime validates the
+    # receipt, owner marker, source checkout, config CAS and package receipt
+    # before it mutates the explicitly named run namespace.
+    start(
+        repo,
+        args.assembly_receipt,
+        args.port,
+        frontend="dev",
+        source_root=args.source_root,
+        startup_script=args.script,
+        project_name=PROJECT_NAME,
+        compose_template=repo / COMPOSE_RUNTIME_FILE,
+        run_receipt=args.run_receipt,
+        previous_config_sha256=args.previous_config_sha256,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=_repo_default(),
@@ -1507,6 +1531,31 @@ def _parser() -> argparse.ArgumentParser:
                              help="optional simulation script, relative to the selected checkout or absolute inside it (up only)")
         if name == "build":
             command.set_defaults(port=3197, script=None)
+    recreate_parser = subparsers.add_parser(
+        "recreate",
+        help="recreate the named development run while retaining its state and session store",
+    )
+    recreate_parser.add_argument(
+        "--run-receipt", type=Path, required=True,
+        help="receipt.json of the one existing run to reuse; latest lookup is forbidden",
+    )
+    recreate_parser.add_argument(
+        "--assembly-receipt", type=Path, required=True,
+        help="new successful development assembly receipt to mount",
+    )
+    recreate_parser.add_argument(
+        "--previous-config-sha256", required=True,
+        help="exact raw SHA-256 of the prior runtime service config",
+    )
+    recreate_parser.add_argument(
+        "--source-root", type=Path,
+        help="registered live checkout; omitted means the checkout recorded by the run receipt",
+    )
+    recreate_parser.add_argument("--port", type=int, default=3197)
+    recreate_parser.add_argument(
+        "--script", "--startup-script", dest="script", type=Path,
+        help="optional simulation script relative to the selected checkout",
+    )
     return parser
 
 
@@ -1517,6 +1566,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             build(args)
         elif args.action == "up":
             up(args)
+        elif args.action == "recreate":
+            recreate(args)
         else:
             raise _fail(f"unsupported action: {args.action}")
         return 0

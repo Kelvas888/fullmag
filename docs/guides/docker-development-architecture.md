@@ -177,6 +177,26 @@ zapisanego readiness. Zapis zawiera także tożsamość źródeł/runtime, któr
 zmienia się po przebudowie. Sam brak producenta próbki inventory nie dowodzi,
 że wszystkie usługi korzystające ze wspólnego rejestru są zatrzymane.
 
+Po kontrolowanym, graceful stopie własnych usług można jawnie odtworzyć ten sam
+run i jego `session-store`, wskazując każdy artefakt:
+
+```powershell
+python scripts/docker_dev.py recreate `
+  --run-receipt <old-run>/receipt.json `
+  --assembly-receipt <new-build>/assembly.json `
+  --previous-config-sha256 <old-runtime-config-sha256>
+```
+
+Polecenie nie wyszukuje `latest`, nie zatrzymuje usług i nie tworzy nowego rootu
+sesji. Waliduje właściciela, projekt, ścieżki, checkout źródeł, certyfikat
+Windows oraz CAS konfiguracji; stare receipty i Compose są zachowane w
+`receipt-history`, a frontend korzysta z istniejącego workspace/cache, gdy
+identyfikator zależności się nie zmienił. Zmienna
+`FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256` jest przekazywana do backendu wyłącznie
+w tej jawnej ścieżce. Runtime service dopuszcza wtedy tylko przypiętą zmianę
+generacji po własnym sprawdzeniu zatrzymania i aktualnego readiness; zwykły
+start nadal odrzuca zmianę profilu.
+
 Warunki implementacji tej części trybu developerskiego:
 
 - Zachować wspólny fizyczny rejestr, politykę pojemności, historię rezerwacji,

@@ -1,0 +1,346 @@
+"""Focused source regressions for explicit Docker development-run reuse."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import docker_dev
+import docker_development_inputs as development_inputs
+import fullmag_docker_runtime as runtime
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class DockerDevRecreateContract(unittest.TestCase):
+    def _run_fixture(self):
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name).resolve()
+        storage_root = root / "storage"
+        build_root = storage_root / "build"
+        runs_root = storage_root / "runs" / "task"
+        run_root = runs_root / "docker-all" / ("a" * 32)
+        state = run_root / "state"
+        source = root / "checkout"
+        assembly = build_root / "old-assembly.json"
+        for path in (build_root, state / "runs" / "docker-all" / "session-store",
+                     state / "development", source):
+            path.mkdir(parents=True)
+        assembly.write_text('{"schema":"fullmag.docker-all-image.v1"}\n', encoding="utf-8")
+        host_certificate = {
+            "schema": "fullmag.windows-folder-host.v1",
+            "storage_profile": "windows-folder-v1",
+            "owner_scope": "docker-desktop-linux",
+            "owner_token": "00000000-0000-4000-8000-000000000001",
+        }
+        (run_root / "windows-folder-host.json").parent.mkdir(parents=True, exist_ok=True)
+        (run_root / "windows-folder-host.json").write_text(
+            json.dumps(host_certificate), encoding="utf-8"
+        )
+        (state / ".fullmag-windows-folder-owner.json").write_text(
+            json.dumps(host_certificate), encoding="utf-8"
+        )
+        config = state / ".fullmag" / "runtime-service" / "docker-all.json"
+        config.parent.mkdir(parents=True)
+        config.write_bytes(b'{"schema_version":"runtime_service_config.v2"}\n')
+        frontend_inputs = run_root / "development-inputs-host.json"
+        frontend_inputs.write_text('{"schema":"fullmag.docker-development-inputs.v1"}\n', encoding="utf-8")
+        guest_inputs = run_root / "development-inputs.json"
+        guest_inputs.write_text('{"schema":"fullmag.docker-development-inputs.v1"}\n', encoding="utf-8")
+        backend_id = "1" * 64
+        frontend_id = "2" * 64
+        receipt = {
+            "schema": "fullmag.docker-all-run.v1",
+            "state": "running",
+            "image_id": "sha256:" + "1" * 64,
+            "compose_project": "fullmag",
+            "compose_file": str(run_root / "compose.json"),
+            "state_root": str(state),
+            "host_certificate": str(run_root / "windows-folder-host.json"),
+            "assembly_receipt": str(assembly),
+            "assembly_receipt_sha256": _sha256(assembly),
+            "frontend_mode": "dev",
+            "frontend_source_root": str(source),
+            "frontend_host_inputs": str(frontend_inputs),
+            "frontend_host_inputs_sha256": _sha256(frontend_inputs),
+            "frontend_inputs": str(guest_inputs),
+            "frontend_inputs_sha256": _sha256(guest_inputs),
+            "container_id": backend_id,
+            "frontend_container_id": frontend_id,
+        }
+        receipt_path = run_root / "receipt.json"
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        layout = {
+            "storage_root": str(storage_root),
+            "build_storage_root": str(build_root),
+            "runs_root": str(runs_root),
+        }
+        return temporary, layout, receipt_path, config
+
+    @staticmethod
+    def _fake_docker(state, image, running=()):
+        backend_id = "1" * 64
+        frontend_id = "2" * 64
+        documents = {
+            backend_id: {
+                "Id": backend_id,
+                "Image": image,
+                "Config": {"Labels": {
+                    "com.docker.compose.project": "fullmag",
+                    "com.docker.compose.service": "backend",
+                }},
+                "State": {"Running": False, "Status": "exited"},
+                "Mounts": [{"Type": "bind", "Source": str(state),
+                            "Destination": "/state", "RW": True}],
+            },
+            frontend_id: {
+                "Id": frontend_id,
+                "Image": image,
+                "Config": {"Labels": {
+                    "com.docker.compose.project": "fullmag",
+                    "com.docker.compose.service": "frontend",
+                }},
+                "State": {"Running": False, "Status": "exited"},
+                "Mounts": [{"Type": "bind", "Source": str(state / "development"),
+                            "Destination": "/state/development", "RW": True}],
+            },
+        }
+        running_ids = list(running)
+        for running_id in running_ids:
+            documents[running_id] = {
+                "Id": running_id,
+                "Image": image,
+                "Config": {"Labels": {
+                    "com.docker.compose.project": "foreign",
+                    "com.docker.compose.service": "worker",
+                }},
+                "State": {"Running": True, "Status": "running"},
+                "Mounts": [{"Type": "bind", "Source": str(state),
+                            "Destination": "/state", "RW": True}],
+            }
+
+        def fake(*args, **kwargs):
+            if args[:2] == ("ps", "--quiet"):
+                return "\n".join(running_ids)
+            if args and args[0] == "inspect" and len(args) == 2:
+                return json.dumps([documents[args[1]]])
+            raise AssertionError(f"unexpected Docker read: {args}")
+
+        return fake
+
+    def test_reuse_requires_one_owned_direct_receipt_and_preserves_identity(self):
+        temporary, layout, receipt_path, config = self._run_fixture()
+        try:
+            with patch.object(runtime, "docker", side_effect=self._fake_docker(
+                    receipt_path.parent / "state", "sha256:" + "1" * 64)):
+                loaded = runtime._load_reuse_run(
+                    layout,
+                    receipt_path,
+                    project_name="fullmag",
+                    frontend="dev",
+                    previous_config_sha256=_sha256(config),
+                )
+            self.assertEqual(loaded["root"], receipt_path.parent)
+            self.assertEqual(loaded["state"], receipt_path.parent / "state")
+            self.assertEqual(loaded["project"], "fullmag")
+            with self.assertRaisesRegex(ValueError, "direct docker-all"):
+                runtime._load_reuse_run(
+                    layout,
+                    receipt_path.parent / "nested" / "receipt.json",
+                    project_name="fullmag",
+                    frontend="dev",
+                )
+            with patch.object(runtime, "docker", side_effect=self._fake_docker(
+                    receipt_path.parent / "state", "sha256:" + "1" * 64)):
+                with self.assertRaisesRegex(ValueError, "digest"):
+                    runtime._load_reuse_run(
+                        layout,
+                        receipt_path,
+                        project_name="fullmag",
+                        frontend="dev",
+                        previous_config_sha256="0" * 64,
+                    )
+        finally:
+            temporary.cleanup()
+
+    def test_reuse_rejects_running_state_consumer_before_mutation(self):
+        temporary, layout, receipt_path, config = self._run_fixture()
+        try:
+            fake = self._fake_docker(
+                receipt_path.parent / "state",
+                "sha256:" + "1" * 64,
+                running=("3" * 64,),
+            )
+            with patch.object(runtime, "docker", side_effect=fake):
+                with self.assertRaisesRegex(ValueError, "still mounts"):
+                    runtime._load_reuse_run(
+                        layout,
+                        receipt_path,
+                        project_name="fullmag",
+                        frontend="dev",
+                        previous_config_sha256=_sha256(config),
+                    )
+        finally:
+            temporary.cleanup()
+
+    def test_reuse_archives_receipts_before_same_run_metadata_changes(self):
+        temporary, layout, receipt_path, config = self._run_fixture()
+        try:
+            nested_inputs = receipt_path.parent / ".recreate" / "old-token" / "development-inputs-host.json"
+            nested_inputs.parent.mkdir(parents=True)
+            nested_inputs.write_bytes(b'{"schema":"old"}\n')
+            old_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            old_receipt["frontend_host_inputs"] = str(nested_inputs)
+            old_receipt["frontend_host_inputs_sha256"] = _sha256(nested_inputs)
+            receipt_path.write_text(json.dumps(old_receipt), encoding="utf-8")
+            with patch.object(runtime, "docker", side_effect=self._fake_docker(
+                    receipt_path.parent / "state", "sha256:" + "1" * 64)):
+                reuse = runtime._load_reuse_run(
+                    layout, receipt_path, project_name="fullmag", frontend="dev",
+                )
+            original = receipt_path.read_bytes()
+            runtime._preserve_reuse_evidence(reuse)
+            history = reuse["history_root"]
+            self.assertEqual((history / "receipt.json").read_bytes(), original)
+            self.assertEqual(
+                (history / ".recreate" / "old-token" / "development-inputs-host.json").read_bytes(),
+                b'{"schema":"old"}\n',
+            )
+            self.assertEqual(
+                (history / "state" / ".fullmag" / "runtime-service" / "docker-all.json").read_bytes(),
+                config.read_bytes(),
+            )
+            manifest = json.loads((history / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["source_receipt_sha256"], hashlib.sha256(original).hexdigest())
+            self.assertTrue(reuse["metadata_root"].is_dir())
+        finally:
+            temporary.cleanup()
+
+    def test_compose_spec_passes_config_cas_to_backend(self):
+        document = {"services": {"backend": {"environment": {}}}, "networks": {}}
+
+        def fake_docker(*args, **kwargs):
+            return json.dumps(document)
+
+        with patch.object(runtime, "docker", fake_docker):
+            configured = runtime.compose_spec(
+                "sha256:" + "a" * 64,
+                Path("/state"),
+                3197,
+                Path("/owned/windows-folder-host.json"),
+                repo=Path("/repo"),
+                previous_config_sha256="b" * 64,
+            )
+        self.assertEqual(
+            configured["services"]["backend"]["environment"]["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"],
+            "b" * 64,
+        )
+
+    def test_frontend_workspace_reuse_checks_dependency_bytes_without_reseeding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "workspace"
+            destination.mkdir()
+            metadata = destination / "package.json"
+            metadata.write_bytes(b'{"name":"fullmag"}\n')
+            digest = hashlib.sha256(metadata.read_bytes()).hexdigest()
+            source_metadata = destination / "app.tsx"
+            source_metadata.write_bytes(b"export const value = 1;\n")
+            source_digest = hashlib.sha256(source_metadata.read_bytes()).hexdigest()
+            live_directories = [
+                {"name": name, "source": f"/checkout/apps/control-room/{name}",
+                 "target": f"/state/development/workspace/apps/control-room/{name}"}
+                for name in development_inputs.DIRECTORIES
+            ]
+            for item in live_directories:
+                (destination / "apps" / "control-room" / item["name"]).mkdir(parents=True)
+            old = {
+                "schema": "fullmag.docker-development-inputs.v1",
+                "source_root": "/checkout",
+                "worktree_id": "checkout-1234567890abcdef",
+                "host_port": 3197,
+                "dependency_seed_sha256": "a" * 64,
+                "toolpins_sha256": "b" * 64,
+                "workspace_root": development_inputs.WORKSPACE,
+                "frontend_root": development_inputs.FRONTEND,
+                "live_directories": live_directories,
+                "dependency_seed_files": ["package.json"],
+                "files": [
+                    {"relative": "app.tsx", "sha256": source_digest},
+                    {"relative": "package.json", "sha256": digest},
+                ],
+            }
+            current = {
+                **{key: old[key] for key in (
+                    "source_root", "worktree_id", "host_port",
+                    "dependency_seed_sha256", "toolpins_sha256",
+                    "workspace_root", "frontend_root", "live_directories",
+                )},
+                "dependency_seed_files": ["package.json"],
+                "files": old["files"],
+            }
+            with patch.object(development_inputs, "read_owned_regular",
+                              side_effect=lambda path, maximum: Path(path).read_bytes()):
+                development_inputs._validate_reused_workspace(destination, current, old)
+            metadata.write_bytes(b'{"name":"changed"}\n')
+            with patch.object(development_inputs, "read_owned_regular",
+                              side_effect=lambda path, maximum: Path(path).read_bytes()):
+                with self.assertRaisesRegex(ValueError, "seed metadata was changed"):
+                    development_inputs._validate_reused_workspace(destination, current, old)
+            metadata.write_bytes(b'{"name":"fullmag"}\n')
+            source_metadata.write_bytes(b"export const value = 2;\n")
+            with patch.object(development_inputs, "read_owned_regular",
+                              side_effect=lambda path, maximum: Path(path).read_bytes()):
+                with self.assertRaisesRegex(ValueError, "seed metadata was changed"):
+                    development_inputs._validate_reused_workspace(destination, current, old)
+
+    def test_recreate_does_not_call_build_or_choose_latest(self):
+        fake_runtime = types.ModuleType("fullmag_docker_runtime")
+        fake_runtime.start = Mock()
+        repo = Path(__file__).resolve().parents[1]
+        args = types.SimpleNamespace(
+            repo_root=repo,
+            run_receipt=Path("/owned/receipt.json"),
+            assembly_receipt=Path("/owned/new-assembly.json"),
+            previous_config_sha256="a" * 64,
+            source_root=None,
+            port=3197,
+            script=None,
+        )
+        with patch.object(docker_dev, "_require_native_windows"), \
+                patch.object(docker_dev, "_assert_no_running_fullmag"), \
+                patch.dict(sys.modules, {"fullmag_docker_runtime": fake_runtime}):
+            docker_dev.recreate(args)
+        fake_runtime.start.assert_called_once_with(
+            repo.resolve(),
+            args.assembly_receipt,
+            3197,
+            frontend="dev",
+            source_root=None,
+            startup_script=None,
+            project_name="fullmag",
+            compose_template=repo.resolve() / docker_dev.COMPOSE_RUNTIME_FILE,
+            run_receipt=args.run_receipt,
+            previous_config_sha256=args.previous_config_sha256,
+        )
+
+    def test_reuse_restart_sentinel_rotates_with_new_image_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            probe = state / ".windows-folder-probe"
+            probe.mkdir()
+            sentinel = probe / "restart-sentinel.bin"
+            sentinel.write_bytes(b"old-owner:sha256:old")
+            runtime._publish_restart_sentinel(state, b"old-owner:sha256:new")
+            self.assertEqual(sentinel.read_bytes(), b"old-owner:sha256:new")
+
+
+if __name__ == "__main__":
+    unittest.main()
