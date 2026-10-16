@@ -1405,20 +1405,6 @@ impl RuntimeServiceConfig {
             .as_ref()
             .context("runtime service recovery requires a host execution binding")?;
 
-        let application_path = checked_path(store.root(), "runtime-services/APPLICATION.json")?;
-        let application_bytes = read_stable_regular_path(
-            &application_path,
-            MAX_RECOVERY_REQUEST_BYTES,
-            "persisted runtime service application configuration",
-        )?;
-        let persisted: RuntimeServiceConfig = serde_json::from_slice(&application_bytes)
-            .context("parse persisted runtime service application configuration")?;
-        persisted.validate()?;
-        persisted.require_application_binding(store, &candidate.target_id)?;
-        if persisted != *candidate {
-            bail!("persisted application configuration differs from recovery request");
-        }
-
         let recovery_relative = format!(
             "runtime-services/recovery/{request_sha256}/receipt.json"
         );
@@ -2016,12 +2002,68 @@ fn archive_exact_bytes(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecoveryApplicationBinding {
+    ExternalOnly { raw_sha256: String },
+    Persisted { raw_sha256: String },
+}
+
+fn validate_recovery_application_configuration(
+    store: &SessionStore,
+    candidate: &RuntimeServiceConfig,
+    external_config_sha256: &str,
+) -> Result<RecoveryApplicationBinding> {
+    let application_path = checked_path(store.root(), "runtime-services/APPLICATION.json")?;
+    match fs::symlink_metadata(&application_path) {
+        Ok(_) => {
+            let application_bytes = read_stable_regular_path(
+                &application_path,
+                MAX_RECOVERY_REQUEST_BYTES,
+                "persisted runtime service application configuration",
+            )?;
+            let persisted: RuntimeServiceConfig = serde_json::from_slice(&application_bytes)
+                .context("parse persisted runtime service application configuration")?;
+            persisted.validate()?;
+            persisted.require_application_binding(store, &candidate.target_id)?;
+            if persisted != *candidate {
+                bail!("persisted application configuration differs from recovery request");
+            }
+            Ok(RecoveryApplicationBinding::Persisted {
+                raw_sha256: crate::hex_sha256(&application_bytes),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(RecoveryApplicationBinding::ExternalOnly {
+                raw_sha256: external_config_sha256.into(),
+            })
+        }
+        Err(error) => Err(error)
+            .context("observe persisted runtime service application configuration"),
+    }
+}
+
+fn application_binding_manifest_value(
+    binding: &RecoveryApplicationBinding,
+) -> serde_json::Value {
+    match binding {
+        RecoveryApplicationBinding::ExternalOnly { raw_sha256 } => serde_json::json!({
+            "mode": "external_only",
+            "raw_sha256": raw_sha256,
+        }),
+        RecoveryApplicationBinding::Persisted { raw_sha256 } => serde_json::json!({
+            "mode": "persisted",
+            "raw_sha256": raw_sha256,
+        }),
+    }
+}
+
 fn archive_runtime_evidence(
     store: &SessionStore,
     owner: &RuntimeServiceOwnerDescriptor,
     request_sha256: &str,
     config_sha256: &str,
     configuration_bytes: &[u8],
+    application_binding: &RecoveryApplicationBinding,
 ) -> Result<(String, String, BTreeMap<String, String>)> {
     let archive_relative = format!("runtime-services/recovery/{request_sha256}/archive");
     let mandatory_sources = recovery_mandatory_sources(owner)?;
@@ -2097,6 +2139,7 @@ fn archive_runtime_evidence(
         "schema_version": "runtime_service_recovery_archive.v1",
         "request_sha256": request_sha256,
         "config_sha256": config_sha256,
+        "application_binding": application_binding_manifest_value(application_binding),
         "files": archived.clone(),
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest_value)?;
@@ -2159,6 +2202,66 @@ fn validate_receipt_for_request(
     Ok(())
 }
 
+fn verify_archived_application_binding(
+    store: &SessionStore,
+    receipt: &RuntimeServiceRecoveryReceipt,
+    manifest: &serde_json::Value,
+) -> Result<()> {
+    let application_path = checked_path(store.root(), "runtime-services/APPLICATION.json")?;
+    let Some(binding) = manifest.get("application_binding") else {
+        // Archives written before the binding metadata existed retain the old
+        // strict rule: an application configuration must already be present.
+        require_existing_regular_path(store.root(), "runtime-services/APPLICATION.json")?;
+        return Ok(());
+    };
+    let object = binding
+        .as_object()
+        .context("runtime recovery application binding is not an object")?;
+    if object.len() != 2 {
+        bail!("runtime recovery application binding contains unknown fields");
+    }
+    let mode = object
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .context("runtime recovery application binding mode is missing")?;
+    let raw_sha256 = object
+        .get("raw_sha256")
+        .and_then(serde_json::Value::as_str)
+        .context("runtime recovery application binding raw SHA-256 is missing")?;
+    validate_lower_hex(
+        raw_sha256,
+        "runtime recovery application binding raw SHA-256",
+        64,
+    )?;
+    match mode {
+        "external_only" => {
+            if raw_sha256 != receipt.config_sha256.as_str() {
+                bail!("external-only application binding is not pinned to the recovery configuration");
+            }
+            match fs::symlink_metadata(&application_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => bail!(
+                    "external-only recovery requires APPLICATION.json to remain absent"
+                ),
+                Err(error) => Err(error)
+                    .context("observe external-only application configuration"),
+            }
+        }
+        "persisted" => {
+            let application_bytes = read_stable_regular_path(
+                &application_path,
+                MAX_RECOVERY_REQUEST_BYTES,
+                "persisted runtime service application configuration",
+            )?;
+            if crate::hex_sha256(&application_bytes) != raw_sha256 {
+                bail!("persisted application configuration digest differs from the archive binding");
+            }
+            Ok(())
+        }
+        _ => bail!("unsupported runtime recovery application binding mode"),
+    }
+}
+
 fn verify_archived_evidence(
     store: &SessionStore,
     receipt: &RuntimeServiceRecoveryReceipt,
@@ -2183,6 +2286,7 @@ fn verify_archived_evidence(
     {
         bail!("runtime recovery archive manifest does not match the receipt");
     }
+    verify_archived_application_binding(store, receipt, &manifest)?;
     let owner_path = checked_path(store.root(), RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH)?;
     let current_owner_bytes = read_stable_regular_path(
         &owner_path,
@@ -2425,6 +2529,10 @@ fn recover_unknown_empty_locked(
         .map(serde_json::from_slice::<RuntimeServiceRecoveryReceipt>)
         .transpose()
         .context("parse prepared runtime service recovery receipt")?;
+    // This observation is performed under all recovery guards and the store
+    // writer, before any new archive or prepared intent mutation.
+    let application_binding =
+        validate_recovery_application_configuration(store, candidate, config_sha256)?;
     if let Some(receipt) = &prepared {
         receipt.validate()?;
         validate_receipt_for_request(receipt, request, request_sha256, config_sha256)?;
@@ -2449,6 +2557,7 @@ fn recover_unknown_empty_locked(
             request_sha256,
             config_sha256,
             configuration_bytes,
+            &application_binding,
         )?,
     };
     let historical_build_commit = expected
@@ -2699,6 +2808,10 @@ mod recovery_contract_tests {
             "schema_version": "runtime_service_recovery_archive.v1",
             "request_sha256": request_sha256.clone(),
             "config_sha256": crate::hex_sha256(configuration_bytes),
+            "application_binding": {
+                "mode": "external_only",
+                "raw_sha256": crate::hex_sha256(configuration_bytes),
+            },
             "files": archived_files.clone(),
         }))
         .unwrap();
@@ -2727,6 +2840,25 @@ mod recovery_contract_tests {
         };
         receipt.validate().unwrap();
         verify_archived_evidence(&store, &receipt).unwrap();
+
+        let application_path =
+            create_parent(store.root(), "runtime-services/APPLICATION.json").unwrap();
+        std::fs::write(&application_path, b"foreign application").unwrap();
+        assert!(verify_archived_evidence(&store, &receipt).is_err());
+        std::fs::remove_file(&application_path).unwrap();
+
+        let legacy_manifest_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": "runtime_service_recovery_archive.v1",
+            "request_sha256": request_sha256.clone(),
+            "config_sha256": crate::hex_sha256(configuration_bytes),
+            "files": archived_files.clone(),
+        }))
+        .unwrap();
+        std::fs::write(&manifest_path, &legacy_manifest_bytes).unwrap();
+        let mut legacy_receipt = receipt.clone();
+        legacy_receipt.archived_evidence_sha256 = crate::hex_sha256(&legacy_manifest_bytes);
+        assert!(verify_archived_evidence(&store, &legacy_receipt).is_err());
+        std::fs::write(&manifest_path, &manifest_bytes).unwrap();
 
         std::fs::write(&owner_path, &owner_after).unwrap();
         verify_archived_evidence(&store, &receipt).unwrap();
@@ -3415,6 +3547,112 @@ mod application_configuration_tests {
                 .join("runtime-services/APPLICATION.json")
                 .exists());
         }
+    }
+
+    #[test]
+    fn recovery_rejects_mismatched_or_corrupt_persisted_application() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let candidate = v2_config(&store);
+        let application_path =
+            create_parent(store.root(), "runtime-services/APPLICATION.json").unwrap();
+
+        let mut mismatch = candidate.clone();
+        mismatch
+            .host_execution
+            .as_mut()
+            .unwrap()
+            .policy
+            .revision += 1;
+        std::fs::write(&application_path, serde_json::to_vec(&mismatch).unwrap()).unwrap();
+        assert!(validate_recovery_application_configuration(
+            &store,
+            &candidate,
+            &"a".repeat(64),
+        )
+        .is_err());
+
+        std::fs::write(&application_path, b"not-json").unwrap();
+        assert!(validate_recovery_application_configuration(
+            &store,
+            &candidate,
+            &"a".repeat(64),
+        )
+        .is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn recovery_rejects_persisted_application_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let candidate = v2_config(&store);
+        let target = directory.path().join("foreign-application.json");
+        std::fs::write(&target, serde_json::to_vec(&candidate).unwrap()).unwrap();
+        let application_path =
+            create_parent(store.root(), "runtime-services/APPLICATION.json").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &application_path).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &application_path).unwrap();
+
+        assert!(validate_recovery_application_configuration(
+            &store,
+            &candidate,
+            &"a".repeat(64),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn recovery_application_binding_distinguishes_external_and_persisted_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let candidate = v2_config(&store);
+        let external_sha256 = "a".repeat(64);
+        let external = validate_recovery_application_configuration(
+            &store,
+            &candidate,
+            &external_sha256,
+        )
+        .unwrap();
+        assert_eq!(
+            external,
+            RecoveryApplicationBinding::ExternalOnly {
+                raw_sha256: external_sha256.clone()
+            }
+        );
+        assert_eq!(
+            application_binding_manifest_value(&external)["mode"],
+            "external_only"
+        );
+        assert_eq!(
+            application_binding_manifest_value(&external)["raw_sha256"],
+            external_sha256
+        );
+
+        let application_path =
+            create_parent(store.root(), "runtime-services/APPLICATION.json").unwrap();
+        let application_bytes = serde_json::to_vec(&candidate).unwrap();
+        std::fs::write(&application_path, &application_bytes).unwrap();
+        let persisted =
+            validate_recovery_application_configuration(&store, &candidate, &external_sha256)
+                .unwrap();
+        assert_eq!(
+            persisted,
+            RecoveryApplicationBinding::Persisted {
+                raw_sha256: crate::hex_sha256(&application_bytes)
+            }
+        );
+        assert_eq!(
+            application_binding_manifest_value(&persisted)["mode"],
+            "persisted"
+        );
+        assert_eq!(
+            application_binding_manifest_value(&persisted)["raw_sha256"],
+            crate::hex_sha256(&application_bytes)
+        );
     }
 
     #[test]

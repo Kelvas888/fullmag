@@ -49,6 +49,31 @@ Bezpośredni proces usługi poza service-ensure nie jest objęty tą serializacj
 Generator ofert i podłączenie tej metody do domyślnego packaged startup
 pozostają do implementacji; runtime konkurencji i awarii jest NOT VERIFIED.
 
+### Źródło konfiguracji w recovery
+
+Jawna konfiguracja operatora przekazana do recovery pozostaje źródłem
+konfiguracji usługi. Ścieżka `prepare_application_config(Some(...))` czyta
+przypięte surowe bajty i nie tworzy `runtime-services/APPLICATION.json`;
+recovery nie może wprowadzać drugiego, ukrytego źródła konfiguracji.
+
+Manifest `runtime_service_recovery_archive.v1` zawiera pole
+`application_binding` z dokładnie dwoma kluczami:
+
+```json
+{"mode":"external_only|persisted","raw_sha256":"<64 lowercase hex>"}
+```
+
+`external_only` oznacza, że `raw_sha256` jest równy `config_sha256` receiptu,
+a `APPLICATION.json` ma pozostać nieobecny. Replay odrzuca obecność tego pliku.
+`persisted` oznacza regularny, bezpiecznie odczytany `APPLICATION.json`, którego
+surowe bajty mają dokładnie wskazany hash. Oba warianty są sprawdzane pod
+pełnym zestawem recovery locków, przed utworzeniem archiwum lub prepared intent.
+
+Manifest bez `application_binding` zachowuje historyczny, bardziej restrykcyjny
+kontrakt i wymaga obecnego `APPLICATION.json`. Pole nie zmienia dokładnej
+dwunastoelementowej listy `archived_files`; jego integralność obejmuje istniejący
+`archived_evidence_sha256`. Walidacja konfiguracji i replay pozostają fail-closed.
+
 ## Własność i kolejność
 
 Jedna blokada runtime-services/OWNER.lock obejmuje cały store. Jest stabilnym

@@ -87,6 +87,23 @@ Operational owner/lock/logs są poza naukowym grafem CAS i eksportem FMS;
 import nadal wymaga pustego, izolowanego store. Ten fragment nie uruchamia usługi
 automatycznie z obecnego launchera i nie zmienia działającej sesji 3104.
 
+### Źródło konfiguracji podczas recovery
+
+Jawna konfiguracja operatora pozostaje pojedynczym źródłem prawdy także dla
+kontenerowego recovery. Odczyt przez `prepare_application_config(Some(...))`
+nie publikuje `runtime-services/APPLICATION.json`, dlatego recovery nie tworzy
+tego pliku tylko po to, aby przejąć nieznanego ownera.
+
+Manifest `runtime_service_recovery_archive.v1` zapisuje
+`application_binding.mode` (`external_only` albo `persisted`) oraz
+`application_binding.raw_sha256`. W trybie `external_only` hash musi wskazywać
+na przypięte surowe `config_sha256`, a `APPLICATION.json` musi pozostać
+nieobecny. W trybie `persisted` plik musi istnieć i mieć dokładnie ten sam hash.
+Stare manifesty bez tego pola zachowują wcześniejszy wymóg obecności pliku.
+Walidacja odbywa się pod recovery lockami przed archiwizacją i prepared intent;
+lista dwunastu archiwizowanych plików oraz trwały hash manifestu pozostają
+niezmienione.
+
 Dokładny kontrakt: [native-runtime-service-v1](../specs/native-runtime-service-v1.md).
 
 HTTP API ma osobny UUID procesu. Opcjonalny pin żądania odrzuca replacement
