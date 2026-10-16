@@ -68,7 +68,8 @@ export function antennaFieldSolutionIdentityStatus(
   if (field.status !== "ready") return field.status;
   const data = field.data;
   if (!data) return "missing";
-  if (data.status !== "ready" || data.solution_id !== ids.solutionId || data.quantity !== "H_ant_basis") {
+  if (data.status !== "ready" || data.solution_id !== ids.solutionId || data.quantity !== "H_ant_basis" ||
+      new Set(data.bases.map((basis) => basis.port_mode_id)).size !== data.bases.length) {
     return "identity mismatch";
   }
   if (ids.publishedRef) {
@@ -81,7 +82,8 @@ export function antennaFieldSolutionIdentityStatus(
   if (!ids.stageId || catalog.status !== "ready" || !catalog.data) {
     return "awaiting stage catalog";
   }
-  const output = catalog.data.outputs.find((item) => item.output_id === ids.solutionId);
+  const outputs = catalog.data.outputs.filter((item) => item.output_id === ids.solutionId);
+  const output = outputs.length === 1 ? outputs[0] : null;
   if (
     catalog.data.status !== "ready" ||
     catalog.data.stage_id !== ids.stageId ||
@@ -89,6 +91,8 @@ export function antennaFieldSolutionIdentityStatus(
     catalog.data.session_epoch !== data.session_epoch ||
     catalog.data.request_scope_epoch !== data.request_scope_epoch ||
     !output ||
+    data.stage_id !== ids.stageId ||
+    output.solution_ref.output_id !== ids.solutionId ||
     output.solution_ref.stage_id !== ids.stageId ||
     output.solution_ref.asset_id !== data.asset_id ||
     output.solution_ref.content_digest !== data.content_digest

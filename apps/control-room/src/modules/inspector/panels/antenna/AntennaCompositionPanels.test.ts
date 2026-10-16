@@ -98,6 +98,7 @@ describe("resolveAntennaRuntimeIds", () => {
 
 describe("antennaFieldSolutionIdentityStatus", () => {
   const field = {
+    bases: [],
     asset_id: "asset-1",
     content_digest: "sha256:valid",
     quantity: "H_ant_basis",

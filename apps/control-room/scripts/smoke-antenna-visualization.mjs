@@ -22,7 +22,7 @@ try {
   browser = await playwright.chromium.launch({ headless: true, ...(process.env.FULLMAG_ANTENNA_VISUALIZATION_BROWSER_CHANNEL ? { channel: process.env.FULLMAG_ANTENNA_VISUALIZATION_BROWSER_CHANNEL } : {}) });
   const page = await browser.newPage({ viewport: { width: 1050, height: 1050 } });
   page.on("pageerror", (error) => errors.push(error.message));
-  page.on("console", (message) => { if (message.type() === "error" && /Shader Error|VALIDATE_STATUS|Error compiling/.test(message.text())) errors.push(message.text()); });
+  page.on("console", (message) => { if (message.type() === "error" && /Shader Error|VALIDATE_STATUS|Error compiling|Encountered two children with the same key/.test(message.text())) errors.push(message.text()); });
   const root = page.locator('[data-inspector-owner="object.antenna.visualization"]');
   const open = async (scenario, legacy = false) => {
     const target = new URL(url); target.searchParams.set("scenario", scenario); if (legacy) target.searchParams.set("legacy", "1");
@@ -86,6 +86,15 @@ try {
   }]);
   checks.push("Antenna Explorer has a dedicated visualization node and observation-only Debug child with the same owner; no magnetic/mode children or fabricated results without solve");
   await shot("01-empty");
+  for (const scenario of ["basis-output-ref", "basis-duplicate-output", "basis-duplicate-port"]) {
+    await open(scenario);
+    await page.waitForFunction(() => document.querySelector('[data-inspector-owner="object.antenna.visualization"]')?.textContent.includes("identity mismatch"));
+    assert.equal(await root.getByRole("combobox", { name: "Antenna quantity", exact: true }).isEnabled(), false);
+    assert.equal((await page.evaluate(() => window.__antennaVisualizationFixture.read())).calls.filter(call => call.range).length, 0);
+    const rejected = await page.evaluate(() => window.__antennaFieldCanvas());
+    assert.equal(rejected.sampleCount, 0); assert.equal(rejected.lost, false); assert.ok(rejected.width > 0 && rejected.height > 0);
+    checks.push(`${scenario}: inconsistent or ambiguous published basis rejected before binary reads; healthy empty canvas`);
+  }
   await open("ready");
   await sharedTemplate(true);
   await root.getByText("Sample 8 H/I", { exact: true }).waitFor();

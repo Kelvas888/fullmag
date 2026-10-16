@@ -26,7 +26,7 @@ export function resolveAntennaVisualizationSelection({ objectId, stageId, owner,
   const rawManifest = closed ?? raw?.manifest;
   const inspectionMode = displaySource === "inspection" || (!basisAvailable && rawAvailable);
   const available = inspectionMode ? rawAvailable : basisAvailable;
-  const ports = inspectionMode ? raw ? [raw.port_mode_id] : [] : field?.bases.map((basis) => basis.port_mode_id) ?? [];
+  const ports = inspectionMode ? raw ? [raw.port_mode_id] : [] : basisAvailable ? field?.bases.map((basis) => basis.port_mode_id) ?? [] : [];
   const matchingIntent = requested?.sourceObjectId === objectId && requested.stageId === stageId
     && requested.sessionId === owner?.sessionId && requested.sessionEpoch === owner?.sessionEpoch
     && requested.requestScopeEpoch === owner?.requestScopeEpoch && requested.kind === (inspectionMode ? "inspection" : "basis")

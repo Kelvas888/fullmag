@@ -80,6 +80,7 @@ function makeFixture() {
     bases: [{ port_mode_id: "port", normalization_current_a: 1, measured_positive_terminal_current_a: 1, normalization_scale: 1, current_balance_certificate_digest: "fixture-only", quadrature_diagnostics: {}, electric_potential_per_ampere: ref("node_scalar", "V/A", sampleCount), current_density_per_ampere: ref("sample_xyz_interleaved", "A/m^2/A", sampleCount * 3), magnetic_field_per_ampere: ref(scenario === "malformed" ? "wrong_layout" : "sample_xyz_interleaved", "A/m/A", sampleCount * 3) }],
   };
   if (scenario === "cardinality") solution.bases[0].magnetic_field_per_ampere.value_count = 27;
+  if (scenario === "basis-duplicate-port") solution.bases.push({ ...solution.bases[0] });
   if (scenario === "multiport") solution.bases.push({ ...solution.bases[0], port_mode_id: "port-two" });
   const inspection: AntennaExternalLeadInspectionResource = {
     ...owner, schema_version: "antenna_external_lead_stage_output.v1", resource_id: "fixture-inspection", run_id: "fixture-run", runtime_stage_id: "runtime-solve-001", stage_revision: 1,
@@ -234,7 +235,10 @@ function makeFixture() {
     if (url.pathname === MODEL_SCENE_PATH) return json(scene);
     if (url.pathname === SIMULATION_STAGES_EXECUTION_PATH) return json(execution);
     if (url.pathname === metadataPath) return isInspection ? new Response("{}", { status: 404, headers }) : json(solution);
-    if (url.pathname === catalogPath) return json({ ...owner, stage_id: "solve", status: "ready", outputs: [{ output_id: "solution", solution_ref: { asset_id: solution.asset_id, content_digest: digest, stage_id: "solve" } }] });
+    if (url.pathname === catalogPath) {
+      const output = { output_id: "solution", solution_ref: { output_id: scenario === "basis-output-ref" ? "other" : "solution", asset_id: solution.asset_id, content_digest: digest, stage_id: "solve" } };
+      return json({ ...owner, stage_id: "solve", status: "ready", outputs: scenario === "basis-duplicate-output" ? [output, { ...output }] : [output] });
+    }
     if (url.pathname === path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, "stage_id", "runtime-solve-001")) { if (closedFixture) { const closed = await closedFixture; if (scenario === "inspection-closed-foreign") closed.inspection.run_id = "foreign-run"; return json(closed.inspection); } if (isInspection) await displayMetadata(); return isInspection ? json(inspection) : new Response("{}", { status: 404, headers }); }
     if (url.pathname === path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, "stage_id", "runtime-solve-001")) {
       if (!isInspection || url.searchParams.get("content_digest") !== digest) throw new Error("Unexpected display metadata contract");
