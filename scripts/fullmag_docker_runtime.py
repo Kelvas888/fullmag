@@ -874,6 +874,7 @@ def _load_reuse_run(layout, run_receipt, *, project_name, frontend,
     if (receipt_path.name != "receipt.json" or root.parent != runs_root
             or _RUN_ID_RE.fullmatch(root.name) is None):
         raise ValueError("--run-receipt must name a direct docker-all run receipt")
+    receipt_sha256 = digest(receipt_path)
     receipt = _read_reuse_json(receipt_path, "Docker runtime run receipt")
     if receipt.get("schema") != "fullmag.docker-all-run.v1":
         raise ValueError("Docker runtime run receipt has an unsupported schema")
@@ -951,8 +952,11 @@ def _load_reuse_run(layout, run_receipt, *, project_name, frontend,
         project=project,
         frontend=frontend,
     )
+    if digest(receipt_path) != receipt_sha256:
+        raise ValueError("Reused Docker run receipt changed during admission")
     return {
         "receipt_path": receipt_path,
+        "receipt_sha256": receipt_sha256,
         "receipt": receipt,
         "root": root,
         "state": state,
@@ -971,6 +975,10 @@ def _preserve_reuse_evidence(reuse):
     """Copy only owned run metadata before any same-run receipt is replaced."""
     root = reuse["root"]
     root_resolved = root.resolve()
+    expected_receipt_sha256 = reuse.get("receipt_sha256")
+    if (expected_receipt_sha256 is not None
+            and digest(reuse["receipt_path"]) != expected_receipt_sha256):
+        raise ValueError("Reused run receipt changed before its evidence was preserved")
     history = root / "receipt-history" / reuse["reuse_token"]
     history.mkdir(parents=True, exist_ok=False)
     relative_paths = [
@@ -1026,16 +1034,99 @@ def _preserve_reuse_evidence(reuse):
                          "size_bytes": destination.stat().st_size})
     if not archived or not any(item["relative"] == "receipt.json" for item in archived):
         raise ValueError("Reused run receipt could not be preserved")
+    source_receipt_sha256 = expected_receipt_sha256 or digest(reuse["receipt_path"])
+    if digest(history / "receipt.json") != source_receipt_sha256:
+        raise ValueError("Reused run receipt changed while its evidence was preserved")
     storage.atomic_json(history / "manifest.json", {
         "schema": "fullmag.docker-all-reuse-history.v1",
         "source_receipt": str(reuse["receipt_path"]),
-        "source_receipt_sha256": digest(reuse["receipt_path"]),
+        "source_receipt_sha256": source_receipt_sha256,
         "files": archived,
     })
     reuse["history_root"] = history
     reuse["metadata_root"] = root / ".recreate" / reuse["reuse_token"]
     reuse["metadata_root"].mkdir(parents=True, exist_ok=False)
     return reuse
+
+
+def _record_recreate_preflight_failure(reuse, *, phase, error):
+    """Record a failed reuse preflight without replacing the active receipt.
+
+    A reuse attempt is allowed to create evidence under ``receipt-history``
+    before any runtime state or Compose service is changed.  The direct run
+    receipt remains the last verified pointer, so a later explicit retry can
+    still pass the normal CAS and stopped-container admission checks.
+    """
+    _preserve_reuse_evidence(reuse)
+    history = reuse["history_root"]
+    source_receipt = history / "receipt.json"
+    source_receipt_sha256 = digest(source_receipt)
+    attempt = {
+        "schema": "fullmag.docker-all-recreate-attempt.v1",
+        "state": "failed_preflight",
+        "failure_phase": phase,
+        "error": str(error),
+        "service_mutation": "not_started",
+        "runtime_state_mutation": "not_started",
+        "active_receipt": str(reuse["receipt_path"]),
+        "active_receipt_sha256": source_receipt_sha256,
+        "reused_from": str(reuse["receipt_path"]),
+        "reused_from_sha256": source_receipt_sha256,
+        "preserved_receipt": str(source_receipt),
+        "preserved_receipt_sha256": source_receipt_sha256,
+        "history_root": str(history),
+        "reuse_token": reuse["reuse_token"],
+        "compose_project": reuse["project"],
+        "state_root": str(reuse["state"]),
+        "host_certificate": str(reuse["host_certificate"]),
+        "owner_marker": str(reuse["owner_marker"]),
+        "backend_container_id": reuse["receipt"].get("container_id"),
+        "frontend_container_id": reuse["receipt"].get("frontend_container_id"),
+        "frontend_host_inputs": str(reuse["frontend_inputs"]),
+        "frontend_host_inputs_sha256": digest(reuse["frontend_inputs"]),
+        "frontend_inputs": str(reuse["guest_inputs"]),
+        "frontend_inputs_sha256": digest(reuse["guest_inputs"]),
+        "previous_config_sha256": reuse.get("previous_config_sha256"),
+    }
+    attempt_path = history / "failed-attempt.json"
+    storage.atomic_json(attempt_path, attempt)
+    manifest = read_json(history / "manifest.json")
+    manifest["failed_attempt"] = str(attempt_path)
+    manifest["failed_attempt_sha256"] = digest(attempt_path)
+    manifest["failed_attempt_state"] = "failed_preflight"
+    manifest["service_mutation"] = "not_started"
+    storage.atomic_json(history / "manifest.json", manifest)
+    return attempt
+
+
+def _preflight_reuse_frontend_inputs(repo, reuse, source_root, port):
+    """Validate the reusable frontend seed before replacing its run receipt."""
+    from docker_development_inputs import seed, select_checkout
+
+    try:
+        selected_checkout = select_checkout(repo, source_root)
+        inputs = seed(
+            selected_checkout,
+            reuse["state"],
+            port,
+            reuse_from=reuse["frontend_inputs"],
+        )
+        if not isinstance(inputs, dict):
+            raise ValueError("Frontend reuse seed returned a malformed input manifest")
+    except Exception as error:
+        try:
+            _record_recreate_preflight_failure(
+                reuse,
+                phase="frontend-seed",
+                error=error,
+            )
+        except Exception as evidence_error:
+            raise RuntimeError(
+                "Frontend reuse preflight failed and its evidence could not be preserved: "
+                f"{evidence_error}; original error: {error}"
+            ) from evidence_error
+        raise
+    return selected_checkout, inputs
 
 
 def _publish_restart_sentinel(state, payload):
@@ -1160,6 +1251,20 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
     elif assembly.get("runtime_mode") == "development_source_bind":
         raise ValueError("Static mode requires a packaged release image")
     storage.initialize(layout)
+    selected_checkout = None
+    preflight_inputs = None
+    if reuse is not None and frontend == "dev":
+        # The reusable receipt is the active CAS pointer until the live
+        # frontend metadata has been proven reusable.  In particular, do not
+        # archive it and publish a replacement ``starting`` receipt before
+        # this validation: a failed seed must leave an explicit retryable
+        # stopped run rather than an unreusable failed pointer.
+        selected_checkout, preflight_inputs = _preflight_reuse_frontend_inputs(
+            repo,
+            reuse,
+            source_root,
+            port,
+        )
     if reuse is None:
         root = storage.validate_path(Path(layout["runs_root"]) / "docker-all" / uuid.uuid4().hex,
                                      Path(layout["build_storage_root"]))
@@ -1202,13 +1307,16 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         args = ["compose", "-f", str(spec), "--project-name", project]
         if frontend == "dev":
             from docker_development_inputs import guest_manifest, seed, select_checkout
-            selected_checkout = select_checkout(repo, source_root)
-            inputs = seed(
-                selected_checkout,
-                state,
-                port,
-                reuse_from=reuse["frontend_inputs"] if reuse is not None else None,
-            )
+            if reuse is not None:
+                inputs = preflight_inputs
+            else:
+                selected_checkout = select_checkout(repo, source_root)
+                inputs = seed(
+                    selected_checkout,
+                    state,
+                    port,
+                    reuse_from=None,
+                )
             if reuse is not None:
                 # frontend_dev freezes this manifest.  Reuse the original
                 # host and guest bytes instead of creating a new freeze root.

@@ -171,6 +171,33 @@ class DockerDevRecreateContract(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_reuse_rejects_receipt_changed_during_admission(self):
+        temporary, layout, receipt_path, config = self._run_fixture()
+        try:
+            original = receipt_path.read_bytes()
+            read_json = runtime._read_reuse_json
+
+            def read_and_change(path, label, maximum=16 * 1024 * 1024):
+                value = read_json(path, label, maximum)
+                if Path(path).resolve() == receipt_path.resolve():
+                    receipt_path.write_bytes(original + b"\n")
+                return value
+
+            with patch.object(runtime, "_read_reuse_json", side_effect=read_and_change), \
+                    patch.object(runtime, "docker", side_effect=self._fake_docker(
+                        receipt_path.parent / "state", "sha256:" + "1" * 64)):
+                with self.assertRaisesRegex(ValueError, "changed during admission"):
+                    runtime._load_reuse_run(
+                        layout,
+                        receipt_path,
+                        project_name="fullmag",
+                        frontend="dev",
+                        previous_config_sha256=_sha256(config),
+                    )
+            self.assertEqual(receipt_path.read_bytes(), original + b"\n")
+        finally:
+            temporary.cleanup()
+
     def test_reuse_rejects_running_state_consumer_before_mutation(self):
         temporary, layout, receipt_path, config = self._run_fixture()
         try:
@@ -221,6 +248,63 @@ class DockerDevRecreateContract(unittest.TestCase):
             manifest = json.loads((history / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["source_receipt_sha256"], hashlib.sha256(original).hexdigest())
             self.assertTrue(reuse["metadata_root"].is_dir())
+        finally:
+            temporary.cleanup()
+
+    def test_frontend_seed_preflight_keeps_active_receipt_and_records_attempt(self):
+        temporary, layout, receipt_path, config = self._run_fixture()
+        try:
+            source = Path(json.loads(receipt_path.read_text(encoding="utf-8"))["frontend_source_root"])
+            with patch.object(runtime, "docker", side_effect=self._fake_docker(
+                    receipt_path.parent / "state", "sha256:" + "1" * 64)):
+                reuse = runtime._load_reuse_run(
+                    layout,
+                    receipt_path,
+                    project_name="fullmag",
+                    frontend="dev",
+                    previous_config_sha256=_sha256(config),
+                )
+            original = receipt_path.read_bytes()
+            with patch.object(development_inputs, "select_checkout", return_value=source), \
+                    patch.object(
+                        development_inputs,
+                        "seed",
+                        side_effect=ValueError("Persistent frontend seed metadata was changed"),
+                    ):
+                with self.assertRaisesRegex(ValueError, "Persistent frontend seed metadata"):
+                    runtime._preflight_reuse_frontend_inputs(
+                        Path("/repo"), reuse, source, 3197,
+                    )
+
+            self.assertEqual(receipt_path.read_bytes(), original)
+            histories = sorted((receipt_path.parent / "receipt-history").iterdir())
+            self.assertEqual(len(histories), 1)
+            history = histories[0]
+            self.assertEqual((history / "receipt.json").read_bytes(), original)
+            attempt = json.loads((history / "failed-attempt.json").read_text(encoding="utf-8"))
+            self.assertEqual(attempt["schema"], "fullmag.docker-all-recreate-attempt.v1")
+            self.assertEqual(attempt["state"], "failed_preflight")
+            self.assertEqual(attempt["failure_phase"], "frontend-seed")
+            self.assertEqual(attempt["service_mutation"], "not_started")
+            self.assertEqual(attempt["runtime_state_mutation"], "not_started")
+            self.assertEqual(attempt["active_receipt_sha256"], _sha256(receipt_path))
+            manifest = json.loads((history / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["source_receipt_sha256"], _sha256(receipt_path))
+            self.assertEqual(manifest["failed_attempt_state"], "failed_preflight")
+            self.assertEqual(manifest["service_mutation"], "not_started")
+
+            # The failed preflight did not turn the last verified receipt into
+            # a failed run, so the normal explicit retry admission still works.
+            with patch.object(runtime, "docker", side_effect=self._fake_docker(
+                    receipt_path.parent / "state", "sha256:" + "1" * 64)):
+                retried = runtime._load_reuse_run(
+                    layout,
+                    receipt_path,
+                    project_name="fullmag",
+                    frontend="dev",
+                    previous_config_sha256=_sha256(config),
+                )
+            self.assertEqual(retried["root"], receipt_path.parent)
         finally:
             temporary.cleanup()
 
@@ -301,6 +385,139 @@ class DockerDevRecreateContract(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "seed metadata was changed"):
                     development_inputs._validate_reused_workspace(destination, current, old)
 
+    def test_frontend_workspace_reuse_accepts_only_exact_next_generated_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "workspace"
+            destination.mkdir()
+            repo = Path(__file__).resolve().parents[1]
+            relatives = (
+                "apps/control-room/next-env.d.ts",
+                "apps/control-room/tsconfig.json",
+            )
+            source_files = {
+                relative: (repo / relative).read_bytes() for relative in relatives
+            }
+            next_env_newline = (
+                b"\r\n"
+                if b"\r\n" in source_files["apps/control-room/next-env.d.ts"]
+                else b"\n"
+            )
+            generated = {
+                "apps/control-room/next-env.d.ts": source_files[
+                    "apps/control-room/next-env.d.ts"
+                ].replace(
+                    b'import "./.next/types/routes.d.ts";',
+                    b'import "./.next-control-room-8080/dev/types/routes.d.ts";'
+                    + next_env_newline
+                    + b'import "./.next-control-room-8080/dev/types/root-params.d.ts";',
+                    1,
+                ),
+                "apps/control-room/tsconfig.json": source_files[
+                    "apps/control-room/tsconfig.json"
+                ].replace(b"\r\n", b"\n").replace(
+                    b'    ".next-control-room-3100/dev/types/**/*.ts"\n  ],',
+                    b'    ".next-control-room-3100/dev/types/**/*.ts",\n'
+                    b'    ".next-control-room-8080/types/**/*.ts",\n'
+                    b'    ".next-control-room-8080/dev/types/**/*.ts"\n  ],',
+                    1,
+                ),
+            }
+            for relative in relatives:
+                self.assertNotEqual(
+                    source_files[relative],
+                    generated[relative],
+                    f"fixture generated variant is identical to its source: {relative}",
+                )
+            for relative, data in generated.items():
+                target = destination / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            (destination / "package.json").write_bytes(b'{"name":"fullmag"}\n')
+            for name in development_inputs.DIRECTORIES:
+                (destination / "apps" / "control-room" / name).mkdir(parents=True)
+            files = [
+                {"relative": "package.json", "sha256": _sha256(destination / "package.json")},
+                *[
+                    {"relative": relative, "sha256": hashlib.sha256(data).hexdigest()}
+                    for relative, data in source_files.items()
+                ],
+            ]
+            live_directories = [
+                {"name": name, "source": f"/checkout/apps/control-room/{name}",
+                 "target": f"/state/development/workspace/apps/control-room/{name}"}
+                for name in development_inputs.DIRECTORIES
+            ]
+            identity = {
+                "schema": "fullmag.docker-development-inputs.v1",
+                "source_root": "/checkout",
+                "worktree_id": "checkout-1234567890abcdef",
+                "host_port": 3197,
+                "dependency_seed_sha256": "a" * 64,
+                "toolpins_sha256": "b" * 64,
+                "workspace_root": development_inputs.WORKSPACE,
+                "frontend_root": development_inputs.FRONTEND,
+                "live_directories": live_directories,
+                "dependency_seed_files": ["package.json"],
+                "files": files,
+            }
+            with patch.object(
+                development_inputs,
+                "read_owned_regular",
+                side_effect=lambda path, maximum: Path(path).read_bytes(),
+            ):
+                development_inputs._validate_reused_workspace(
+                    destination,
+                    identity,
+                    identity,
+                    generated_sources=source_files,
+                )
+            unknown_tsconfig = destination / "apps/control-room/tsconfig.json"
+            unknown_tsconfig_bytes = generated["apps/control-room/tsconfig.json"].replace(
+                b".next-control-room-8080/dev/types/**/*.ts",
+                b".next-control-room-9999/dev/types/**/*.ts",
+                1,
+            )
+            self.assertNotEqual(
+                unknown_tsconfig_bytes,
+                generated["apps/control-room/tsconfig.json"],
+            )
+            unknown_tsconfig.write_bytes(unknown_tsconfig_bytes)
+            with patch.object(
+                development_inputs,
+                "read_owned_regular",
+                side_effect=lambda path, maximum: Path(path).read_bytes(),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"Persistent frontend seed metadata was changed: apps/control-room/tsconfig\.json",
+                ):
+                    development_inputs._validate_reused_workspace(
+                        destination,
+                        identity,
+                        identity,
+                        generated_sources=source_files,
+                    )
+            unknown_tsconfig.write_bytes(generated["apps/control-room/tsconfig.json"])
+            tampered = destination / "apps/control-room/next-env.d.ts"
+            tampered.write_bytes(generated["apps/control-room/next-env.d.ts"].replace(
+                b"root-params", b"unexpected", 1
+            ))
+            with patch.object(
+                development_inputs,
+                "read_owned_regular",
+                side_effect=lambda path, maximum: Path(path).read_bytes(),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"Persistent frontend seed metadata was changed: apps/control-room/next-env\.d\.ts",
+                ):
+                    development_inputs._validate_reused_workspace(
+                        destination,
+                        identity,
+                        identity,
+                        generated_sources=source_files,
+                    )
     def test_recreate_does_not_call_build_or_choose_latest(self):
         fake_runtime = types.ModuleType("fullmag_docker_runtime")
         fake_runtime.start = Mock()

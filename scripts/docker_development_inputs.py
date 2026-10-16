@@ -14,6 +14,11 @@ DIRECTORIES = ("app", "src", "public", "scripts")
 WORKSPACE = "/state/development/workspace"
 FRONTEND = "/state/development/cache"
 CONFIG_TARGET = "/run/fullmag/development-inputs.json"
+NEXT_GENERATED_DIST_DIR = ".next-control-room-8080"
+NEXT_GENERATED_RELATIVES = frozenset({
+    "apps/control-room/next-env.d.ts",
+    "apps/control-room/tsconfig.json",
+})
 HOST_CACHE_METADATA_KEYS = frozenset({
     "worktree_id", "dependency_seed_files", "dependency_seed_sha256",
     "toolpins", "toolpins_sha256",
@@ -61,7 +66,38 @@ def _read_json_file(path, label):
     return value
 
 
-def _validate_reused_workspace(destination, inputs, old_inputs):
+def _next_generated_seed_variants(relative, source):
+    """Return the exact Next-generated variants accepted after first startup."""
+    variants = {source}
+    if relative not in NEXT_GENERATED_RELATIVES:
+        return variants
+    newline = b"\r\n" if b"\r\n" in source else b"\n"
+    if relative == "apps/control-room/next-env.d.ts":
+        marker = b'import "./.next/types/routes.d.ts";'
+        replacement = (
+            b'import "./' + NEXT_GENERATED_DIST_DIR.encode() + b'/dev/types/routes.d.ts";'
+            + newline
+            + b'import "./' + NEXT_GENERATED_DIST_DIR.encode() + b'/dev/types/root-params.d.ts";'
+        )
+        if source.count(marker) == 1:
+            variants.add(source.replace(marker, replacement, 1))
+        return variants
+
+    # Next rewrites tsconfig through its JSON writer, so its generated form
+    # uses LF even when the Windows checkout seed uses CRLF.
+    normalized = source.replace(b"\r\n", b"\n")
+    marker = b'    ".next-control-room-3100/dev/types/**/*.ts"\n  ],'
+    replacement = (
+        b'    ".next-control-room-3100/dev/types/**/*.ts",\n'
+        + b'    "' + NEXT_GENERATED_DIST_DIR.encode() + b'/types/**/*.ts",\n'
+        + b'    "' + NEXT_GENERATED_DIST_DIR.encode() + b'/dev/types/**/*.ts"\n  ],'
+    )
+    if normalized.count(marker) == 1:
+        variants.add(normalized.replace(marker, replacement, 1))
+    return variants
+
+
+def _validate_reused_workspace(destination, inputs, old_inputs, *, generated_sources=None):
     """Prove that the persistent Linux metadata is reusable without rewriting it."""
     if not destination.is_dir() or destination.is_symlink():
         raise ValueError("Persistent frontend workspace is missing or a reparse point")
@@ -113,8 +149,12 @@ def _validate_reused_workspace(destination, inputs, old_inputs):
         target = storage.validate_path(destination / relative, destination,
                                        "persistent frontend metadata")
         data = read_owned_regular(target, maximum=16 * 1024 * 1024)
-        if hashlib.sha256(data).hexdigest() != expected:
-            raise ValueError("Persistent frontend seed metadata was changed")
+        if hashlib.sha256(data).hexdigest() == expected:
+            continue
+        source = (generated_sources or {}).get(relative)
+        if source is not None and data in _next_generated_seed_variants(relative, source):
+            continue
+        raise ValueError(f"Persistent frontend seed metadata was changed: {relative}")
 
 
 def seed(source, state, port, *, reuse_from=None):
@@ -148,6 +188,7 @@ def seed(source, state, port, *, reuse_from=None):
         if path.suffix in {".ts", ".tsx", ".json", ".mjs", ".css"} and path.is_file():
             relative_files.add(path.relative_to(source))
     files = []
+    source_files = {}
     dependency_entries = {}
     destination = storage.validate_path(state / "development/workspace", state,
                                         "isolated Docker frontend workspace")
@@ -166,6 +207,7 @@ def seed(source, state, port, *, reuse_from=None):
                 stream.flush()
                 os.fsync(stream.fileno())
         digest = hashlib.sha256(data).hexdigest()
+        source_files[relative.as_posix()] = data
         files.append({"relative": relative.as_posix(), "sha256": digest})
         if relative in dependency_files:
             dependency_entries[relative.as_posix()] = digest
@@ -198,7 +240,12 @@ def seed(source, state, port, *, reuse_from=None):
             "files": files,
         }
         old_inputs = _read_json_file(reuse_from, "persistent frontend inputs")
-        _validate_reused_workspace(destination, current_identity, old_inputs)
+        _validate_reused_workspace(
+            destination,
+            current_identity,
+            old_inputs,
+            generated_sources=source_files,
+        )
         # frontend_dev freezes this exact host manifest, including source
         # commit and manifest digest.  Keep it byte-for-byte unchanged while
         # recording the current checkout identity in the outer run receipt.
