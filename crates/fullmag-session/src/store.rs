@@ -6207,7 +6207,7 @@ mod tests {
         .unwrap();
 
         let error = store.read_run_intent("run-budget").unwrap_err();
-        assert!(error.to_string().contains("metadata budget"));
+        assert!(error.to_string().contains("byte budget"));
     }
 
     #[test]
