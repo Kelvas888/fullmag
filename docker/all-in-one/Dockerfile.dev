@@ -23,8 +23,8 @@ COPY fullmag_storage.py /opt/fullmag/fullmag_storage.py
 
 # The pinned builder already prepared pnpm 10.8.1. Publish that immutable tool
 # for the unprivileged frontend instead of extracting it into Windows per run.
-RUN mkdir -p /opt/fullmag/tooling && \
-    cp -a /root/.cache/node/corepack/v1/pnpm/10.8.1 /opt/fullmag/tooling/pnpm && \
+RUN mkdir -p /opt/fullmag/tooling/pnpm && \
+    cp -a /root/.cache/node/corepack/v1/pnpm/10.8.1/. /opt/fullmag/tooling/pnpm/ && \
     ln -sf /opt/fullmag/tooling/pnpm/bin/pnpm.cjs /usr/local/bin/pnpm && \
     chmod -R a+rX /opt/fullmag/tooling && \
     chmod 755 /opt/fullmag/tooling/pnpm/bin/pnpm.cjs && \

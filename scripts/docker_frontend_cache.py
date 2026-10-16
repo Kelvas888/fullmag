@@ -31,10 +31,18 @@ CACHE_SIZE_BYTES = 8 * 1024 * 1024 * 1024
 MAX_COPY_BYTES = 2 * 1024 * 1024
 DAEMON_HOST_PREFIX = "/run/desktop/mnt/host"
 
+# This is a cache identity/seed contract, not the effective Watchpack runtime
+# setting.  Keep the legacy value so an operator override does not select a
+# new dependency/cache backing image.
+CACHE_IDENTITY_WATCHPACK_POLLING_KEY = "watchpack_polling_ms"
+CACHE_IDENTITY_WATCHPACK_POLLING_MS = "500"
+WATCHPACK_POLLING_MIN_MS = 250
+WATCHPACK_POLLING_MAX_MS = 10000
+
 DEFAULT_TOOLPINS: dict[str, str] = {
     "node": "v24.18.0",
     "pnpm": "10.8.1",
-    "watchpack_polling_ms": "500",
+    CACHE_IDENTITY_WATCHPACK_POLLING_KEY: CACHE_IDENTITY_WATCHPACK_POLLING_MS,
 }
 
 CHILD_TARGETS: dict[str, str] = {
@@ -98,15 +106,44 @@ def _sha256(value: Any) -> str:
 
 
 def default_toolpins() -> dict[str, str]:
-    """Return the tool pins used by the managed frontend launcher."""
+    """Return the stable cache-seed pins used by the managed launcher.
+
+    The guest frontend records its effective Watchpack interval separately in
+    its runtime receipt.  The v1 host cache keeps the legacy seed value.
+    """
 
     return dict(DEFAULT_TOOLPINS)
 
 
-def toolpins_digest(toolpins: Mapping[str, Any] | None = None) -> str:
+def _cache_identity_toolpins(toolpins: Mapping[str, Any] | None = None) -> dict[str, str]:
+    """Normalize tool pins without re-keying v1 for a Watchpack override."""
+
     pins = DEFAULT_TOOLPINS if toolpins is None else {
         str(key): str(value) for key, value in toolpins.items()
     }
+    normalized = dict(pins)
+    watchpack = normalized.get(CACHE_IDENTITY_WATCHPACK_POLLING_KEY)
+    if watchpack is not None:
+        if re.fullmatch(r"[0-9]+", watchpack) is None:
+            raise FrontendCacheError(
+                "watchpack_polling_ms must be an integer polling interval"
+            )
+        polling_ms = int(watchpack, 10)
+        if not WATCHPACK_POLLING_MIN_MS <= polling_ms <= WATCHPACK_POLLING_MAX_MS:
+            raise FrontendCacheError(
+                "watchpack_polling_ms is outside the bounded runtime interval"
+            )
+        # Polling changes watcher behavior only; it does not change pnpm,
+        # node_modules, or Next dependency artifacts.  Keep the v1 identity
+        # at its legacy seed while frontend_dev records the effective value.
+        normalized[CACHE_IDENTITY_WATCHPACK_POLLING_KEY] = (
+            CACHE_IDENTITY_WATCHPACK_POLLING_MS
+        )
+    return normalized
+
+
+def toolpins_digest(toolpins: Mapping[str, Any] | None = None) -> str:
+    pins = _cache_identity_toolpins(toolpins)
     return _sha256(pins)
 
 
@@ -160,9 +197,7 @@ def cache_key(
     if isinstance(host_port, bool) or not isinstance(host_port, int) or not 1 <= host_port <= 65535:
         raise FrontendCacheError("host_port must be a valid TCP port")
     dependency = _require_sha(dependency_seed_sha256, "dependency_seed_sha256")
-    pins = default_toolpins() if toolpins is None else {
-        str(key): str(value) for key, value in toolpins.items()
-    }
+    pins = _cache_identity_toolpins(toolpins)
     if not pins:
         raise FrontendCacheError("toolpins must not be empty")
     pins_sha256 = toolpins_digest(pins)

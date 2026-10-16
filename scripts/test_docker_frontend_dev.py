@@ -351,6 +351,66 @@ else:
             self.assertEqual(environment["COREPACK_ENABLE_PROJECT_SPEC"], "1")
             self.assertEqual(environment["COREPACK_DEFAULT_TO_LATEST"], "0")
 
+    def test_watchpack_polling_default_and_override_are_visible_to_child_receipt_and_log(self):
+        with isolated(self.module) as (_root, _workspace, inputs):
+            with patch.dict(os.environ, {}, clear=True):
+                environment = self.module._safe_environment(inputs)
+                receipt = self.module._receipt_base(inputs, None)
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    self.module._write_lifecycle_log(
+                        "frontend_start",
+                        watchpack_polling_ms=receipt["watchpack_polling_ms"],
+                    )
+            self.assertEqual(environment["WATCHPACK_POLLING"], "2000")
+            self.assertEqual(receipt["watchpack_polling_ms"], 2000)
+            self.assertIn("watchpack_polling_ms=2000", stdout.getvalue())
+
+            with patch.dict(
+                os.environ,
+                {self.module.WATCHPACK_POLLING_ENV: "1500"},
+                clear=True,
+            ):
+                overridden = self.module._safe_environment(inputs)
+                overridden_receipt = self.module._receipt_base(inputs, None)
+            self.assertEqual(overridden["WATCHPACK_POLLING"], "1500")
+            self.assertEqual(overridden_receipt["watchpack_polling_ms"], 1500)
+
+    def test_watchpack_polling_rejects_values_outside_bounded_integer_contract(self):
+        with isolated(self.module) as (_root, _workspace, inputs):
+            for raw in ("", "249", "10001", "1.5", "two"):
+                with self.subTest(raw=raw):
+                    with patch.dict(
+                        os.environ,
+                        {self.module.WATCHPACK_POLLING_ENV: raw},
+                        clear=True,
+                    ):
+                        with self.assertRaisesRegex(
+                            self.module.FrontendDevError,
+                            r"FULLMAG_WATCHPACK_POLLING_MS must be an integer between 250 and 10000 ms",
+                        ):
+                            self.module._safe_environment(inputs)
+
+            for raw in ("250", "10000"):
+                with self.subTest(raw=raw):
+                    with patch.dict(
+                        os.environ,
+                        {self.module.WATCHPACK_POLLING_ENV: raw},
+                        clear=True,
+                    ):
+                        self.assertEqual(
+                            self.module._safe_environment(inputs)["WATCHPACK_POLLING"],
+                            raw,
+                        )
+
+    def test_compose_declares_the_bounded_frontend_polling_override(self):
+        compose = MODULE_PATH.parents[2] / "compose.dev.yaml"
+        text = compose.read_text(encoding="utf-8")
+        self.assertIn(
+            "FULLMAG_WATCHPACK_POLLING_MS: ${FULLMAG_WATCHPACK_POLLING_MS:-2000}",
+            text,
+        )
+
     @skipIf(os.name == "nt", "directory fsync is a Linux container filesystem contract")
     def test_start_publishes_starting_receipt_before_tool_probe_failure(self):
         with isolated(self.module) as (root, workspace, inputs):

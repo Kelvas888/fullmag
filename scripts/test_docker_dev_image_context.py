@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 import shutil
 import sys
@@ -116,6 +117,206 @@ class RuntimeImageContextTests(unittest.TestCase):
                     None,
                     image_id,
                 )
+
+
+class DevelopmentBaseContextTests(unittest.TestCase):
+    def _copy_base_context(self, destination: Path) -> None:
+        for _name, relative_source in docker_dev.BASE_CONTEXT_FILES:
+            source = REPO_ROOT / relative_source
+            target = destination / relative_source
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+    def _context(self, root: Path, toolchain_id: str) -> dict[str, object]:
+        manifest_sha256 = "m" * 64
+        helper_hashes: dict[str, str] = {}
+        identity = {
+            "schema": docker_dev.DEVELOPMENT_BASE_CONTEXT_SCHEMA,
+            "toolchain_image_id": toolchain_id,
+            "toolchain_manifest_sha256": manifest_sha256,
+            "files": helper_hashes,
+        }
+        return {
+            "root": str(root),
+            "toolchain_image_id": toolchain_id,
+            "context_sha256": docker_dev._sha256_bytes(docker_dev._canonical_json(identity)),
+            "toolchain_manifest_sha256": manifest_sha256,
+            "helper_hashes": helper_hashes,
+        }
+
+    def _base(self, reference: str, image_id: str, toolchain_id: str,
+              context: dict[str, object]) -> dict[str, object]:
+        return {
+            "reference": reference,
+            "image_id": image_id,
+            "labels": {
+                "org.fullmag.runtime": "docker-all-gpu-v1",
+                "org.fullmag.development": "source-bind-v1",
+                "org.fullmag.toolchain.image-id": toolchain_id,
+                "org.fullmag.direct-development.context-sha256": context["context_sha256"],
+            },
+            "toolchain_image_id": toolchain_id,
+            "toolchain_manifest": {"schema": docker_dev.TOOLCHAIN_MANIFEST_SCHEMA},
+            "toolchain_manifest_sha256": context["toolchain_manifest_sha256"],
+            "context_sha256": context["context_sha256"],
+            "built": False,
+        }
+
+    def test_frontend_helper_change_changes_development_base_context_digest(self) -> None:
+        toolchain_id = "sha256:" + "0" * 64
+        manifest = {"schema": docker_dev.TOOLCHAIN_MANIFEST_SCHEMA}
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            checkout.mkdir()
+            self._copy_base_context(checkout)
+            first = docker_dev._development_base_context(
+                checkout, Path(temporary) / "first", toolchain_id, manifest,
+            )
+            frontend_helper = checkout / "docker/all-in-one/frontend_dev.py"
+            frontend_helper.write_bytes(frontend_helper.read_bytes() + b"\n# context regression\n")
+            second = docker_dev._development_base_context(
+                checkout, Path(temporary) / "second", toolchain_id, manifest,
+            )
+
+        self.assertNotEqual(first["context_sha256"], second["context_sha256"])
+        self.assertNotEqual(
+            first["helper_hashes"]["frontend_dev.py"],
+            second["helper_hashes"]["frontend_dev.py"],
+        )
+
+    def test_stale_requested_base_derives_current_context_from_selected_toolchain(self) -> None:
+        toolchain_id = "sha256:" + "1" * 64
+        old_base_id = "sha256:" + "2" * 64
+        new_base_id = "sha256:" + "3" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_root = root / "run"
+            context_root = root / "context"
+            run_root.mkdir()
+            context_root.mkdir()
+            context = self._context(context_root, toolchain_id)
+            requested = docker_dev.DEFAULT_BASE_IMAGE
+            derived = docker_dev._direct_image_tag(
+                requested, "base", str(context["context_sha256"]),
+            )
+            stale_context = {**context, "context_sha256": "old-context"}
+            old_base = self._base(requested, old_base_id, toolchain_id, stale_context)
+            old_base["context_sha256"] = "old-context"
+            current_base = self._base(derived, new_base_id, toolchain_id, context)
+            metadata = {
+                "schema": docker_dev.DEVELOPMENT_IMAGE_SCHEMA,
+                "kind": "development-base",
+                "image_id": new_base_id,
+                "base_image_id": toolchain_id,
+                "toolchain_image_id": toolchain_id,
+                "toolchain_manifest_sha256": context["toolchain_manifest_sha256"],
+                "context_sha256": context["context_sha256"],
+                "context": context,
+            }
+            inspect_document = {
+                "Config": {
+                    "Labels": {
+                        "org.fullmag.runtime": "docker-all-gpu-v1",
+                        "org.fullmag.development": "source-bind-v1",
+                        "org.fullmag.toolchain.image-id": toolchain_id,
+                    },
+                },
+            }
+            inspect_calls: list[str] = []
+
+            def inspect(reference: str):
+                inspect_calls.append(reference)
+                if reference == toolchain_id or reference.startswith("fullmag/direct-toolchain:"):
+                    return toolchain_id, inspect_document
+                if reference == requested:
+                    return old_base_id, inspect_document
+                if reference == derived:
+                    return new_base_id, inspect_document
+                raise AssertionError(reference)
+
+            def image_present(reference: str) -> bool:
+                return reference in {requested, derived}
+
+            with patch.object(docker_dev, "_inspect_image", side_effect=inspect), \
+                    patch.object(docker_dev, "_preflight_dependency_image", return_value=(
+                        {"schema": docker_dev.TOOLCHAIN_MANIFEST_SCHEMA},
+                        context["toolchain_manifest_sha256"],
+                    )), \
+                    patch.object(docker_dev, "_development_base_context", return_value=context), \
+                    patch.object(
+                        docker_dev, "_image_reference_present", side_effect=image_present
+                    ), \
+                    patch.object(docker_dev, "_validate_development_base",
+                                 side_effect=lambda reference, **_kwargs:
+                                 {requested: old_base, derived: current_base}[reference]), \
+                    patch.object(
+                        docker_dev,
+                        "_read_image_metadata",
+                        side_effect=lambda _layout, reference: (
+                            None if reference == requested else metadata
+                        ),
+                    ), \
+                    patch.object(docker_dev, "_docker_capture", return_value="") as docker_capture, \
+                    patch.object(docker_dev, "_write_image_metadata"):
+                result = docker_dev._ensure_development_base(
+                    argparse.Namespace(toolchain_image=toolchain_id),
+                    root,
+                    {"storage_root": str(root), "build_storage_root": str(root)},
+                    run_root,
+                )
+
+            self.assertIs(result, current_base)
+            self.assertEqual(result["context_sha256"], context["context_sha256"])
+            self.assertEqual(
+                [call.args[:2] for call in docker_capture.call_args_list],
+                [("tag", toolchain_id)],
+            )
+
+    def test_matching_requested_base_receipt_is_reused(self) -> None:
+        toolchain_id = "sha256:" + "4" * 64
+        base_id = "sha256:" + "5" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_root = root / "run"
+            context_root = root / "context"
+            run_root.mkdir()
+            context_root.mkdir()
+            context = self._context(context_root, toolchain_id)
+            requested = docker_dev.DEFAULT_BASE_IMAGE
+            base = self._base(requested, base_id, toolchain_id, context)
+            metadata = {
+                "schema": docker_dev.DEVELOPMENT_IMAGE_SCHEMA,
+                "kind": "development-base",
+                "image_id": base_id,
+                "base_image_id": toolchain_id,
+                "toolchain_image_id": toolchain_id,
+                "toolchain_manifest_sha256": context["toolchain_manifest_sha256"],
+                "context_sha256": context["context_sha256"],
+                "context": context,
+            }
+            with patch.object(
+                    docker_dev, "_inspect_image", return_value=(toolchain_id, {"Config": {}})), \
+                    patch.object(docker_dev, "_preflight_dependency_image", return_value=(
+                        {"schema": docker_dev.TOOLCHAIN_MANIFEST_SCHEMA},
+                        context["toolchain_manifest_sha256"],
+                    )), \
+                    patch.object(docker_dev, "_development_base_context", return_value=context), \
+                    patch.object(docker_dev, "_image_reference_present", return_value=True), \
+                    patch.object(docker_dev, "_validate_development_base", return_value=base), \
+                    patch.object(docker_dev, "_read_image_metadata", return_value=metadata), \
+                    patch.object(docker_dev, "_docker_capture") as docker_capture, \
+                    patch.object(docker_dev, "_docker_live") as docker_live:
+                result = docker_dev._ensure_development_base(
+                    argparse.Namespace(toolchain_image=toolchain_id),
+                    root,
+                    {"storage_root": str(root), "build_storage_root": str(root)},
+                    run_root,
+                )
+
+            self.assertIs(result, base)
+            self.assertFalse(result["built"])
+            docker_capture.assert_not_called()
+            docker_live.assert_not_called()
 
 
 if __name__ == "__main__":

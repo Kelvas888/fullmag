@@ -143,6 +143,10 @@ STOP_TIMEOUT_SECONDS = 15
 LOG_TAIL_CHUNK_BYTES = 8 * 1024
 LOG_TAIL_POLL_SECONDS = 0.25
 LOG_TAIL_STOP_TIMEOUT_SECONDS = 1.0
+WATCHPACK_POLLING_ENV = "FULLMAG_WATCHPACK_POLLING_MS"
+WATCHPACK_POLLING_DEFAULT_MS = 2000
+WATCHPACK_POLLING_MIN_MS = 250
+WATCHPACK_POLLING_MAX_MS = 10000
 PROCESS_IDENTITY_FIELDS = (
     "pid_namespace",
     "process_start_time_ticks",
@@ -974,8 +978,40 @@ def _tool_version(
     return version
 
 
-def _safe_environment(inputs: DevelopmentInputs) -> dict[str, str]:
+def _validate_watchpack_polling_ms(value: int) -> int:
+    if (
+        type(value) is not int
+        or not WATCHPACK_POLLING_MIN_MS <= value <= WATCHPACK_POLLING_MAX_MS
+    ):
+        _fail(
+            f"{WATCHPACK_POLLING_ENV} must be an integer between "
+            f"{WATCHPACK_POLLING_MIN_MS} and {WATCHPACK_POLLING_MAX_MS} ms; got {value!r}"
+        )
+    return value
+
+
+def _watchpack_polling_ms(environment: Mapping[str, str] | None = None) -> int:
+    source = os.environ if environment is None else environment
+    raw = source.get(WATCHPACK_POLLING_ENV, str(WATCHPACK_POLLING_DEFAULT_MS))
+    if not isinstance(raw, str) or re.fullmatch(r"[0-9]+", raw.strip()) is None:
+        _fail(
+            f"{WATCHPACK_POLLING_ENV} must be an integer between "
+            f"{WATCHPACK_POLLING_MIN_MS} and {WATCHPACK_POLLING_MAX_MS} ms; got {raw!r}"
+        )
+    return _validate_watchpack_polling_ms(int(raw.strip(), 10))
+
+
+def _safe_environment(
+    inputs: DevelopmentInputs,
+    *,
+    watchpack_polling_ms: int | None = None,
+) -> dict[str, str]:
     browser_origin = f"http://localhost:{inputs.host_port}"
+    polling_ms = (
+        _watchpack_polling_ms()
+        if watchpack_polling_ms is None
+        else _validate_watchpack_polling_ms(watchpack_polling_ms)
+    )
     environment = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": str(HOME_ROOT),
@@ -984,7 +1020,7 @@ def _safe_environment(inputs: DevelopmentInputs) -> dict[str, str]:
         "FULLMAG_DOCKER_FRONTEND": "dev",
         "FULLMAG_FRONTEND_ROOT": str(FRONTEND_ROOT),
         "FULLMAG_NEXT_DIST_DIR": NEXT_DIST_DIR,
-        "WATCHPACK_POLLING": "500",
+        "WATCHPACK_POLLING": str(polling_ms),
         "FULLMAG_API_PROXY_TARGET": API_PROXY_TARGET,
         "FULLMAG_API_URL": API_PROXY_TARGET,
         "FULLMAG_WEB_PUBLIC_HOST": "localhost",
@@ -1013,7 +1049,17 @@ def _safe_environment(inputs: DevelopmentInputs) -> dict[str, str]:
     return environment
 
 
-def _receipt_base(inputs: DevelopmentInputs, previous: Mapping[str, Any] | None) -> dict[str, Any]:
+def _receipt_base(
+    inputs: DevelopmentInputs,
+    previous: Mapping[str, Any] | None,
+    *,
+    watchpack_polling_ms: int | None = None,
+) -> dict[str, Any]:
+    polling_ms = (
+        _watchpack_polling_ms()
+        if watchpack_polling_ms is None
+        else _validate_watchpack_polling_ms(watchpack_polling_ms)
+    )
     receipt: dict[str, Any] = {
         "schema": RECEIPT_SCHEMA,
         "source_root": inputs.source_root,
@@ -1029,6 +1075,7 @@ def _receipt_base(inputs: DevelopmentInputs, previous: Mapping[str, Any] | None)
         "generated_paths": sorted(GENERATED_RELATIVES),
         "log_path": str(LOG_PATH),
         "tool_probe_timeout_seconds": TOOL_TIMEOUT_SECONDS,
+        "watchpack_polling_ms": polling_ms,
     }
     failure = _receipt_failure(previous)
     if failure is not None:
@@ -1533,6 +1580,10 @@ def _start_next(
     runtime_lock: Any,
 ) -> FrontendHandle:
     _next_binary(inputs)
+    receipt_polling_ms = receipt.get("watchpack_polling_ms")
+    if type(receipt_polling_ms) is not int:
+        _fail("frontend receipt is missing the bounded Watchpack polling value")
+    watchpack_polling_ms = _validate_watchpack_polling_ms(receipt_polling_ms)
     app_root = inputs.workspace_root / "apps" / "control-room"
     command = [
         str(NODE_BINARY),
@@ -1544,12 +1595,13 @@ def _start_next(
         "--port",
         str(INTERNAL_PORT),
     ]
-    environment = _safe_environment(inputs)
+    environment = _safe_environment(inputs, watchpack_polling_ms=watchpack_polling_ms)
     next_started = time.monotonic()
     _write_lifecycle_log(
         "next_start",
         url=f"http://localhost:{inputs.host_port}",
         internal_port=INTERNAL_PORT,
+        watchpack_polling_ms=watchpack_polling_ms,
         log_path=LOG_PATH,
     )
     try:
@@ -1568,6 +1620,7 @@ def _start_next(
             status="failed",
             elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
             url=f"http://localhost:{inputs.host_port}",
+            watchpack_polling_ms=watchpack_polling_ms,
             error=str(error),
         )
         _fail(f"Next development process could not start: {error}")
@@ -1594,6 +1647,7 @@ def _start_next(
             status="failed",
             elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
             url=f"http://localhost:{inputs.host_port}",
+            watchpack_polling_ms=watchpack_polling_ms,
             error=str(error),
         )
         raise
@@ -1615,6 +1669,7 @@ def _start_next(
         readiness="owned_process",
         elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
         url=f"http://localhost:{inputs.host_port}",
+        watchpack_polling_ms=watchpack_polling_ms,
         log_path=LOG_PATH,
     )
     return handle
@@ -1636,11 +1691,16 @@ def start(stopping_event: Any) -> FrontendHandle:
     _prepare_state_directories()
     _validate_live_directories(inputs)
     _freeze_inputs(inputs, allow_generated=allow_generated)
+    watchpack_polling_ms = _watchpack_polling_ms()
     runtime_lock = _acquire_runtime_lock()
     try:
         node_modules_target = _prepare_managed_frontend(inputs)
-        tool_environment = _safe_environment(inputs)
-        receipt = _receipt_base(inputs, previous)
+        tool_environment = _safe_environment(
+            inputs, watchpack_polling_ms=watchpack_polling_ms
+        )
+        receipt = _receipt_base(
+            inputs, previous, watchpack_polling_ms=watchpack_polling_ms
+        )
         receipt.update(
             state="starting",
             dependency_root=str(node_modules_target),
@@ -1651,6 +1711,7 @@ def start(stopping_event: Any) -> FrontendHandle:
             "frontend_start",
             tool_probe_budget_seconds=TOOL_TIMEOUT_SECONDS,
             install_budget_seconds=INSTALL_TIMEOUT_SECONDS,
+            watchpack_polling_ms=watchpack_polling_ms,
             log_path=LOG_PATH,
             url=f"http://localhost:{inputs.host_port}",
         )

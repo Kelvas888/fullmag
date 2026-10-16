@@ -350,6 +350,7 @@ def _development_base_context(repo: Path, run_root: Path, toolchain_id: str,
     _write_json(run_root / "development-base-context.json", receipt)
     return {
         "root": str(context),
+        "toolchain_image_id": toolchain_id,
         "context_sha256": context_sha256,
         "toolchain_manifest_sha256": manifest_sha256,
         "helper_hashes": files,
@@ -498,8 +499,10 @@ def _validate_development_base(reference: str, *, expected_toolchain_id: str | N
         raise _fail("development base image toolchain label differs from the requested image")
     manifest, manifest_sha256 = _preflight_dependency_image(image_id)
     context_sha256 = labels.get("org.fullmag.direct-development.context-sha256")
-    if expected_context_sha256 is not None and context_sha256 not in {None, expected_context_sha256}:
-        raise _fail("development base image context label differs; the existing image will not be replaced")
+    if expected_context_sha256 is not None and context_sha256 != expected_context_sha256:
+        raise _fail(
+            "development base image context label differs; the existing image will not be replaced"
+        )
     return {
         "reference": reference,
         "image_id": image_id,
@@ -512,47 +515,69 @@ def _validate_development_base(reference: str, *, expected_toolchain_id: str | N
     }
 
 
-def _apply_explicit_toolchain_identity(args: argparse.Namespace,
-                                       base: dict[str, object]) -> dict[str, object]:
-    reference = args.toolchain_image or os.environ.get("FULLMAG_TOOLCHAIN_IMAGE")
-    if not reference:
-        return base
-    try:
-        candidate_id, _document = _inspect_image(str(reference))
-    except DirectDockerOutcomeUnknown:
-        raise
-    except DirectDockerError as error:
-        raise _toolchain_setup_message(
-            f"configured toolchain image is unavailable locally: {reference}"
-        ) from error
-    if candidate_id == base.get("image_id"):
-        # An explicit image ID may be the already assembled development base.
-        # Preserve its identity as the cache/build provenance without retagging
-        # a running image or inventing a second ownership record.
-        base["toolchain_image_id"] = candidate_id
-    return base
+def _development_base_metadata_matches(metadata: Mapping[str, object] | None,
+                                       base: Mapping[str, object],
+                                       toolchain_id: str,
+                                       context: Mapping[str, object]) -> bool:
+    """Require a receipt that describes this exact frozen base context."""
+
+    if not isinstance(metadata, Mapping):
+        return False
+    context_sha256 = context.get("context_sha256")
+    manifest_sha256 = context.get("toolchain_manifest_sha256")
+    helper_hashes = context.get("helper_hashes")
+    recorded_context = metadata.get("context")
+    return (
+        metadata.get("schema") == DEVELOPMENT_IMAGE_SCHEMA
+        and metadata.get("kind") == "development-base"
+        and metadata.get("image_id") == base.get("image_id")
+        and metadata.get("base_image_id") == toolchain_id
+        and metadata.get("toolchain_image_id") == toolchain_id
+        and metadata.get("toolchain_manifest_sha256") == manifest_sha256
+        and metadata.get("context_sha256") == context_sha256
+        and isinstance(recorded_context, Mapping)
+        and recorded_context.get("context_sha256") == context_sha256
+        and recorded_context.get("toolchain_manifest_sha256") == manifest_sha256
+        and recorded_context.get("helper_hashes") == helper_hashes
+    )
+
+
+def _verify_development_base_context(context: Mapping[str, object]) -> None:
+    """Verify the frozen Docker context before publishing an image receipt."""
+
+    root_value = context.get("root")
+    helper_hashes = context.get("helper_hashes")
+    context_sha256 = context.get("context_sha256")
+    manifest_sha256 = context.get("toolchain_manifest_sha256")
+    if (not isinstance(root_value, str) or not isinstance(helper_hashes, Mapping)
+            or not isinstance(context_sha256, str) or not isinstance(manifest_sha256, str)):
+        raise _fail("development base context receipt is incomplete")
+    root = Path(root_value)
+    observed: dict[str, str] = {}
+    for name, expected in helper_hashes.items():
+        if not isinstance(name, str) or not isinstance(expected, str):
+            raise _fail("development base context helper inventory is malformed")
+        observed[name] = _sha256_file(root / name, "development base context helper")
+    if observed != dict(helper_hashes):
+        raise _fail("development base context changed before image receipt publication")
+    identity = {
+        "schema": DEVELOPMENT_BASE_CONTEXT_SCHEMA,
+        "toolchain_image_id": context.get("toolchain_image_id"),
+        "toolchain_manifest_sha256": manifest_sha256,
+        "files": observed,
+    }
+    if _sha256_bytes(_canonical_json(identity)) != context_sha256:
+        raise _fail("development base context digest no longer matches its frozen inputs")
 
 
 def _ensure_development_base(args: argparse.Namespace, repo: Path,
                              layout: Mapping[str, object], run_root: Path) -> dict[str, object]:
-    """Admit an existing base or build one under a unique, immutable tag."""
+    """Admit an exact base context or derive one from the selected toolchain."""
 
     requested = os.environ.get("FULLMAG_DEVELOPMENT_BASE_IMAGE", DEFAULT_BASE_IMAGE)
-    if _image_reference_present(requested):
-        # Never rebuild or retag an existing base: another runtime may own it.
-        base = _apply_explicit_toolchain_identity(args, _validate_development_base(requested))
-        metadata = _read_image_metadata(layout, requested)
-        if metadata is not None:
-            if (metadata.get("image_id") != base["image_id"]
-                    or metadata.get("toolchain_image_id") != base["toolchain_image_id"]):
-                raise _fail("existing development base receipt does not match the image")
-            base["context_sha256"] = metadata.get("context_sha256")
-            base["context"] = metadata.get("context")
-        return base
-
     toolchain_reference = _configured_toolchain_reference(args, layout)
     try:
-        toolchain_id, _toolchain_document = _inspect_image(toolchain_reference)
+        toolchain_id, _ = _inspect_image(toolchain_reference)
     except DirectDockerOutcomeUnknown:
         raise
     except DirectDockerError as error:
@@ -560,28 +585,46 @@ def _ensure_development_base(args: argparse.Namespace, repo: Path,
             f"configured toolchain image is unavailable locally: {toolchain_reference}"
         ) from error
     toolchain_manifest, toolchain_manifest_sha256 = _preflight_dependency_image(toolchain_id)
-    toolchain_labels = _image_labels(_toolchain_document)
-    if (toolchain_labels.get("org.fullmag.runtime") == "docker-all-gpu-v1"
-            and toolchain_labels.get("org.fullmag.development") == "source-bind-v1"):
-        base = _validate_development_base(toolchain_reference)
-        base["toolchain_image_id"] = toolchain_id
-        base["toolchain_manifest"] = toolchain_manifest
-        base["toolchain_manifest_sha256"] = toolchain_manifest_sha256
-        base["built"] = False
-        return base
-    toolchain_base = toolchain_reference
-    if IMAGE_ID_RE.fullmatch(toolchain_reference):
-        # Dockerfile FROM accepts a repository reference, while the operator
-        # is allowed to configure the canonical toolchain by immutable image
-        # ID.  Create only a run-scoped local alias; never retag the supplied
-        # operator reference or a shared release tag.
-        toolchain_base = f"fullmag/direct-toolchain:{run_root.name}"
-        _docker_capture("tag", toolchain_id, toolchain_base, timeout=60)
-        aliased_id, _aliased_document = _inspect_image(toolchain_base)
-        if aliased_id != toolchain_id:
-            raise _fail("run-scoped toolchain alias changed the immutable image identity")
     context_info = _development_base_context(repo, run_root, toolchain_id, toolchain_manifest)
     context_sha256 = str(context_info["context_sha256"])
+
+    # A shared tag may point at an older development base.  It is reusable only
+    # when its image label and durable receipt both describe this exact helper
+    # context.  Otherwise it remains an immutable parent candidate at most;
+    # the requested tag is never retagged or replaced.
+    if _image_reference_present(requested):
+        try:
+            existing = _validate_development_base(
+                requested,
+                expected_toolchain_id=toolchain_id,
+                expected_context_sha256=context_sha256,
+            )
+            metadata = _read_image_metadata(layout, requested)
+        except DirectDockerOutcomeUnknown:
+            raise
+        except DirectDockerError:
+            existing = None
+            metadata = None
+        if (existing is not None
+                and _development_base_metadata_matches(
+                    metadata, existing, toolchain_id, context_info
+                )):
+            existing["context"] = context_info
+            existing["built"] = False
+            existing["toolchain_manifest"] = toolchain_manifest
+            existing["toolchain_manifest_sha256"] = toolchain_manifest_sha256
+            return existing
+
+    # Always build FROM the immutable image selected by the operator or the
+    # bootstrap receipt.  This also covers the case where that image happens
+    # to be an older source-bind development base: the current Dockerfile and
+    # helper context must still be copied into a newly derived image.
+    toolchain_base = f"fullmag/direct-toolchain:{run_root.name}"
+    _docker_capture("tag", toolchain_id, toolchain_base, timeout=60)
+    aliased_id, _aliased_document = _inspect_image(toolchain_base)
+    if aliased_id != toolchain_id:
+        raise _fail("run-scoped toolchain alias changed the immutable image identity")
+
     base_reference = _direct_image_tag(requested, "base", context_sha256)
     if _image_reference_present(base_reference):
         existing = _validate_development_base(
@@ -590,14 +633,11 @@ def _ensure_development_base(args: argparse.Namespace, repo: Path,
             expected_context_sha256=context_sha256,
         )
         metadata = _read_image_metadata(layout, base_reference)
-        if context_sha256 is not None and metadata is None:
-            raise _fail("existing derived development base has no pinned direct-build receipt")
-        if metadata is not None and (
-                metadata.get("image_id") != existing["image_id"]
-                or metadata.get("toolchain_image_id") != toolchain_id
-                or metadata.get("context_sha256") != context_sha256):
+        if not _development_base_metadata_matches(
+                metadata, existing, toolchain_id, context_info):
             raise _fail("existing derived development base receipt does not match the image")
         existing["context"] = context_info
+        existing["toolchain_build_reference"] = toolchain_base
         existing["built"] = False
         return existing
 
@@ -620,6 +660,7 @@ def _ensure_development_base(args: argparse.Namespace, repo: Path,
         raise _fail("development base build did not publish an image ID") from error
     if not IMAGE_ID_RE.fullmatch(built_id):
         raise _fail("development base build published an invalid image ID")
+    _verify_development_base_context(context_info)
     base = _validate_development_base(
         base_reference,
         expected_toolchain_id=toolchain_id,
@@ -627,6 +668,8 @@ def _ensure_development_base(args: argparse.Namespace, repo: Path,
     )
     if base["image_id"] != built_id:
         raise _fail("development base image ID changed after build")
+    if base.get("toolchain_manifest_sha256") != toolchain_manifest_sha256:
+        raise _fail("development base dependency manifest differs from the selected toolchain")
     base["context"] = context_info
     base["toolchain_build_reference"] = toolchain_base
     base["built"] = True

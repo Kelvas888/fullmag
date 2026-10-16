@@ -66,7 +66,7 @@ services:
     user: "65532:65532"
     read_only: true
     cpus: 2
-    mem_limit: 4g
+    mem_limit: 6g
     pids_limit: 512
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -77,6 +77,7 @@ services:
       FULLMAG_DOCKER_ROLE: frontend
       FULLMAG_DOCKER_FRONTEND: dev
       FULLMAG_API_PROXY_TARGET: http://backend:8081
+      FULLMAG_WATCHPACK_POLLING_MS: ${FULLMAG_WATCHPACK_POLLING_MS:-2000}
       HOME: /state/development
       NVIDIA_VISIBLE_DEVICES: void
     ports: ["127.0.0.1:${FULLMAG_HTTP_PORT:-3197}:8080"]

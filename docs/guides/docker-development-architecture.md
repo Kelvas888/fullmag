@@ -40,6 +40,30 @@ Next.js wykrywa zapis i uruchamia HMR. W Docker Desktop wykrywanie zmian wymaga
 właściwej konfiguracji watchera, w razie potrzeby pollingu; rzeczywisty zapis
 pliku Windows musi to potwierdzić.
 
+### Polling Watchpack dla bind mountu Windows
+
+Compose przekazuje frontendowi `FULLMAG_WATCHPACK_POLLING_MS`. Wartość domyślna
+to `2000` ms, a dozwolony zakres to `250`–`10000` ms. Operator może ustawić ją
+lokalnie w `.env`, na przykład:
+
+```dotenv
+FULLMAG_WATCHPACK_POLLING_MS=2000
+```
+
+Polling obserwuje ten sam checkout zamontowany z Windows i podtrzymuje
+automatyczny HMR frontendu, gdy zdarzenia plikowe Docker Desktop nie są
+wystarczające. Zmiana tej wartości dotyczy wyłącznie watchera: nie kopiuje
+źródeł do obrazu, nie odtwarza `node_modules` ani cache Next/pnpm i nie
+unieważnia trwałego cache zależności frontendu. Cache pozostaje oddzielony od
+sesji i wyników.
+
+Watcher frontendu nie uruchamia budowania backendu. Backend kompiluje się na
+jawne żądanie, wewnątrz kontenera, dla FDM CPU, FDM GPU, FEM CPU i FEM GPU;
+wymuszone GPU kończy się błędem, gdy ścieżka GPU nie jest dostępna, bez cichego
+fallbacku do CPU. Ustawienie pollingu opisuje konfigurację ścieżki HMR;
+widoczny Home, działanie HMR i wykonanie GPU pozostają `NOT VERIFIED` do czasu
+odpowiednich dowodów runtime.
+
 Zmiana backendu nie uruchamia kompilacji ani restartu automatycznie. Użytkownik
 jawnie zleca przebudowę backendu. Ta operacja pobiera aktualny stan wybranego
 checkoutu i kompiluje go w kontenerze z zachowaniem cache Cargo i kompilacji
@@ -52,8 +76,60 @@ Obraz narzędziowy i pakiet aplikacji są osobnymi warstwami. Zmiana kodu Rust
 nie powinna wymuszać ponownego budowania CUDA, hypre, MFEM czy libCEED.
 Zwykły restart kontenera nie usuwa cache. Zmiany zależności lub flag mogą
 wymagać szerszej kompilacji; cache nie gwarantuje pominięcia każdego kroku.
-Dokładne polecenia będą opisane po uruchomieniu bezpośredniej ścieżki; starsze
-polecenia oparte na job ID i assembly receipt nie stanowią jej instrukcji.
+Bezpośrednią ścieżkę uruchamiają poniższe recepty. Ich końcowa kwalifikacja
+runtime pozostaje w toku; starsze polecenia oparte na job ID nie są jej częścią.
+
+Bazowy obraz toolchaina i obraz developerski z zaufanym helperem mają osobne
+tożsamości. `FULLMAG_TOOLCHAIN_IMAGE_ID` wskazuje niezmienny obraz narzędziowy,
+a `development-base-context` zapisuje hash manifestu zależności oraz dokładnych
+plików helpera kopiowanych do `Dockerfile.dev`. Launcher może ponownie użyć
+obrazu developerskiego tylko wtedy, gdy zgadzają się obraz bazowy, manifest,
+hash kontekstu i receipt; zmiana helpera wymusza nowy kontekst i obraz pochodny.
+Aktualizacja orkiestracji nie podmienia obrazu sama przez się, więc nie ukrywa
+zmiany helpera ani nie udaje jej wdrożenia. Ta kontrola tożsamości obrazu nie
+jest dowodem uruchomienia runtime.
+
+## Polecenia trybu developerskiego
+
+Polecenia wykonujemy z checkoutu Fullmaga w natywnym terminalu Windows,
+z uruchomionym Docker Desktop w trybie kontenerów Linux i dostępem do NVIDIA.
+Na nowym komputerze najpierw uruchamiamy konfigurator:
+
+```powershell
+python scripts/setup_docker.py
+```
+
+Konfigurator zapisuje lokalną konfigurację hosta, w tym wybrany przez operatora
+storage. Nie buduje ani nie uruchamia aplikacji. Następnie:
+
+```powershell
+just docker-dev-toolchain
+just docker-dev
+```
+
+Pierwsza recepta przygotowuje zależności natywne. Druga przygotowuje obrazy
+pomocnicze, buduje backend w jego kontenerze i uruchamia obie usługi z frontendem
+na `http://127.0.0.1:3197/workspace`. Wynik kompilacji nie zastępuje potwierdzenia
+Home w przeglądarce. Przy istniejącej aktywnej instancji launcher odmawia
+samoczynnego zastąpienia jej i podaje polecenie zatrzymania konkretnego projektu.
+
+Wybór innego zarejestrowanego checkoutu/worktree, portu i skryptu:
+
+```powershell
+just docker-dev "<absolutna-sciezka-checkoutu>" 3197 "examples/skrypt.py"
+```
+
+Samo jawne przebudowanie backendu, bez restartu działającej symulacji:
+
+```powershell
+just docker-dev-build "<absolutna-sciezka-checkoutu>"
+```
+
+Definicje usług są w `compose.dev.yaml`; `compose.backend-build.yaml` nakłada
+wejścia i wyjścia jednorazowego buildu backendu. Nakładki cache i host ledger
+rozwiązują trwałe katalogi przez lokalny resolver. Launcher zapisuje wynikową
+konfigurację Compose, logi oraz receipty w storage. Archiwum źródeł backendu
+powstaje automatycznie; frontend HMR czyta bezpośrednio bind mount checkoutu.
 
 ## Skrypt symulacji jako parametr startu
 

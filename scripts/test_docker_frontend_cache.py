@@ -127,15 +127,192 @@ class FrontendCacheTests(unittest.TestCase):
     def test_existing_image_reuse_only_verifies_and_mountpoint_must_be_empty(self):
         helper = Path(cache.__file__).parents[1] / "scripts" / "lib" / "docker_frontend_cache.sh"
         source = helper.read_text(encoding="utf-8")
-        self.assertIn("local fresh_image=0", source)
-        self.assertIn("fresh_image=1", source)
-        reuse = 'if [[ "$fresh_image" == 0 ]]; then\n    verify_current\n    lock_runtime\n    return\n  fi'
-        self.assertIn(reuse, source)
-        self.assertLess(source.index(reuse), source.index('host chown 0:0 "$MOUNT_ROOT"'))
-        self.assertIn("CREATED_IMAGE=\"$fresh_image\"", source)
-        self.assertIn('emit ready "$CREATED_IMAGE"', source)
-        self.assertIn('find "$MOUNT_ROOT" -mindepth 1 -maxdepth 1 -print -quit', source)
-        self.assertNotIn('lost+found', source)
+        prefix, separator, _ = source.partition("\ntrap cleanup EXIT\n")
+        self.assertTrue(separator, "helper must expose its functions before main/trap")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mount_root = root / "mounted"
+            mount_root.mkdir()
+            for child in (
+                "cache",
+                "pnpm-store",
+                "workspace-node_modules",
+                "control-room-node_modules",
+            ):
+                (mount_root / child).mkdir()
+            backing_image = root / "cache.ext4"
+            backing_image.touch()
+            runtime_lock = mount_root / "cache" / ".fullmag-frontend-runtime.lock"
+            runtime_lock.touch()
+            runtime_lock.chmod(0o660)
+            filesystem_uuid = "11111111-1111-1111-1111-111111111111"
+            cache_key = "a" * 64
+            owner_marker = mount_root / ".fullmag-frontend-cache-owner.json"
+            owner_marker.write_text(
+                json.dumps(
+                    {
+                        "schema": "fullmag.frontend-cache-owner.v1",
+                        "profile": cache.PROFILE,
+                        "project_id": "fullmag-test",
+                        "cache_key": cache_key,
+                        "backing_image": str(backing_image),
+                        "mount_root": str(mount_root),
+                        "filesystem_uuid": filesystem_uuid,
+                        "image_size_bytes": cache.CACHE_SIZE_BYTES,
+                        "mount_target": "/fullmag-frontend-cache",
+                        "runtime_uid": 65532,
+                        "runtime_gid": 65532,
+                        "owner_token": "22222222-2222-2222-2222-222222222222",
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            owner_marker.chmod(0o444)
+
+            scenario = prefix + r'''
+set -Eeuo pipefail
+ROOT="${HARNESS_ROOT:?}"
+LOG="$ROOT/commands.log"
+PROFILE="fullmag-frontend-cache-v1"
+PROJECT_ID="fullmag-test"
+CACHE_KEY="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+BACKING_IMAGE="$ROOT/cache.ext4"
+MOUNT_ROOT="$ROOT/mounted"
+OWNER_MARKER="$MOUNT_ROOT/.fullmag-frontend-cache-owner.json"
+RUNTIME_LOCK="$MOUNT_ROOT/cache/.fullmag-frontend-runtime.lock"
+RUNTIME_IMAGE_ID="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+HOST_PID=$$
+RUNTIME_UID=65532
+RUNTIME_GID=65532
+IMAGE_SIZE_BYTES=8589934592
+MOUNT_TARGET="/fullmag-frontend-cache"
+LOCK_WAIT=1
+
+host() {
+  printf 'host' >> "$LOG"
+  printf ' %q' "$@" >> "$LOG"
+  printf '\n' >> "$LOG"
+  case "$1" in
+    test)
+      shift
+      command test "$@"
+      ;;
+    findmnt)
+      printf '%s\n' '/dev/loop7 ext4 11111111-1111-1111-1111-111111111111'
+      ;;
+    stat)
+      if [[ "$2" == '-c' && "$3" == '%s' ]]; then
+        printf '%s\n' "$IMAGE_SIZE_BYTES"
+      elif [[ "$2" == '-Lc' && "$4" == "$RUNTIME_LOCK" ]]; then
+        printf '%s\n' '65532 65532 660'
+      elif [[ "$2" == '-Lc' && "$4" == "$MOUNT_ROOT" ]]; then
+        printf '%s\n' '0 0 755'
+      else
+        printf '%s\n' '65532 65532 770'
+      fi
+      ;;
+    cat)
+      printf '%s\n' "$BACKING_IMAGE"
+      ;;
+    blkid)
+      if [[ "$3" == 'UUID' ]]; then
+        printf '%s\n' '11111111-1111-1111-1111-111111111111'
+      elif [[ "$3" == 'LABEL' ]]; then
+        printf '%s\n' 'fm-fe-cache-v1'
+      else
+        return 1
+      fi
+      ;;
+    *)
+      printf 'unexpected host operation: %s\n' "$1" >&2
+      return 1
+      ;;
+  esac
+}
+
+admit_mounted_cache
+printf '%s\n' admitted
+'''
+            scenario_path = root / "reuse-scenario.sh"
+            scenario_path.write_text(scenario, encoding="utf-8")
+            scenario_path.chmod(0o700)
+            shim_dir = root / "bin"
+            shim_dir.mkdir()
+            python_shim = shim_dir / "python3"
+            python_shim.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$#\" -ge 2 ] && [ \"$1\" = \"-c\" ]; then\n"
+                "  case \"$2\" in *owner_token*) exit 0;; esac\n"
+                "fi\n"
+                "exec /usr/bin/python3 \"$@\"\n",
+                encoding="utf-8",
+            )
+            python_shim.chmod(0o700)
+            environment = dict(os.environ)
+            environment["HARNESS_ROOT"] = str(root)
+            environment["PATH"] = f"{shim_dir}:{environment['PATH']}"
+            completed = subprocess.run(
+                ["bash", str(scenario_path)],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "admitted")
+            calls = (root / "commands.log").read_text(encoding="utf-8")
+            operations = {line.split()[1] for line in calls.splitlines() if len(line.split()) > 1}
+            self.assertTrue({"findmnt", "stat", "cat", "blkid", "test"} <= operations)
+            self.assertTrue(
+                {
+                    "mkdir",
+                    "chown",
+                    "chmod",
+                    "mkfs.ext4",
+                    "truncate",
+                    "mount",
+                    "losetup",
+                    "rm",
+                    "umount",
+                }.isdisjoint(operations),
+                calls,
+            )
+
+            foreign_root = root / "unmounted"
+            foreign_root.mkdir()
+            (foreign_root / "foreign-entry").write_text("owned elsewhere", encoding="utf-8")
+            reject_scenario = prefix + r'''
+set -Eeuo pipefail
+ROOT="${HARNESS_ROOT:?}"
+LOG="$ROOT/reject-commands.log"
+MOUNT_ROOT="$ROOT/unmounted"
+host() {
+  printf 'host' >> "$LOG"
+  printf ' %q' "$@" >> "$LOG"
+  printf '\n' >> "$LOG"
+  case "$1" in
+    test) shift; command test "$@" ;;
+    find) shift; command find "$@" ;;
+    *) printf 'unexpected host operation: %s\n' "$1" >&2; return 1 ;;
+  esac
+}
+inspect_unmounted
+'''
+            reject_path = root / "reject-scenario.sh"
+            reject_path.write_text(reject_scenario, encoding="utf-8")
+            reject_path.chmod(0o700)
+            rejected = subprocess.run(
+                ["bash", str(reject_path)],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(rejected.returncode, 2, rejected.stdout)
+            self.assertIn("not empty", rejected.stderr)
 
     def test_owner_marker_read_is_bounded_and_no_follow(self):
         helper = Path(cache.__file__).parents[1] / "scripts" / "lib" / "docker_frontend_cache.sh"
@@ -212,6 +389,42 @@ class FrontendCacheTests(unittest.TestCase):
                 first["key"],
                 cache.cache_key(source, "worktree-abc", 32871, "b" * 64)["key"],
             )
+
+    def test_watchpack_runtime_override_preserves_v1_cache_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "checkout"
+            source.mkdir()
+            legacy = cache.default_toolpins()
+            effective = dict(legacy, watchpack_polling_ms="2000")
+
+            legacy_identity = cache.cache_key(
+                source, "worktree-abc", 32871, "a" * 64, toolpins=legacy
+            )
+            effective_identity = cache.cache_key(
+                source, "worktree-abc", 32871, "a" * 64, toolpins=effective
+            )
+
+            self.assertEqual(
+                legacy[cache.CACHE_IDENTITY_WATCHPACK_POLLING_KEY],
+                cache.CACHE_IDENTITY_WATCHPACK_POLLING_MS,
+            )
+            self.assertEqual(legacy_identity["key"], effective_identity["key"])
+            self.assertEqual(
+                effective_identity["toolpins"][cache.CACHE_IDENTITY_WATCHPACK_POLLING_KEY],
+                cache.CACHE_IDENTITY_WATCHPACK_POLLING_MS,
+            )
+            self.assertEqual(
+                cache.toolpins_digest(legacy), cache.toolpins_digest(effective)
+            )
+
+            with self.assertRaisesRegex(cache.FrontendCacheError, "integer polling"):
+                cache.cache_key(
+                    source,
+                    "worktree-abc",
+                    32871,
+                    "a" * 64,
+                    toolpins=dict(legacy, watchpack_polling_ms="not-a-number"),
+                )
 
     def test_prepare_freezes_overlay_and_attests_ext4_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
