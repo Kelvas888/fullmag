@@ -1,4 +1,5 @@
 import type { SceneResource } from "@/kernel/api/apiTypes";
+import { buildAntennaPlaneVector as vector3 } from "./AntennaSamplingPlaneFieldsModel";
 
 export interface AntennaSpectrumDraft {
   targetObjectId: string;
@@ -49,14 +50,6 @@ export function acknowledgeAntennaSpectrumDraft(
 
 // Runtime contract: antenna_spectrum.rs::MAX_ANTENNA_SPECTRUM_SAMPLE_COUNT.
 export const MAX_ANTENNA_SPECTRUM_SAMPLE_COUNT = 10_000_000;
-
-function vector3(text: string, label: string): [number, number, number] {
-  const values = text.split(/[ ,;]+/).filter(Boolean).map(Number);
-  if (values.length !== 3 || values.some((value) => !Number.isFinite(value))) {
-    throw new Error(`${label} requires three finite values.`);
-  }
-  return values as [number, number, number];
-}
 
 function finitePositive(text: string, label: string): number {
   const value = Number(text);

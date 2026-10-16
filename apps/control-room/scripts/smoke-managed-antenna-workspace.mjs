@@ -318,14 +318,29 @@ try {
   const beforeFFT = await scene(), beforeFFTWrites = writes.length;
   const fftComposer = page.getByTestId("antenna-spectrum-composer");
   await fftComposer.getByRole("combobox", { name: "FFT target object", exact: true }).selectOption(objectId);
-  for (const [name, value] of [["Plane origin", "0 0 0"], ["Axis u", "1 0 0"], ["Axis v", "1 0 0"], ["Extent u", "2e-7"], ["Extent v", "1e-7"], ["Samples u", "16"], ["Samples v", "8"]]) {
+  const fillFFTVector = async (owner, label, values) => { for (const [index, axis] of ["X", "Y", "Z"].entries()) await owner.getByRole("textbox", { name: `${label} ${axis}`, exact: true }).fill(values[index]); };
+  await fillFFTVector(fftComposer, "Plane origin", ["0", "0", "0"]);
+  await fftComposer.getByRole("combobox", { name: "Plane orientation", exact: true }).selectOption("xz");
+  assert.equal(await fftComposer.getByRole("textbox", { name: "Axis v Z", exact: true }).inputValue(), "1");
+  assert.equal(await fftComposer.getByRole("textbox", { name: "Plane origin Z", exact: true }).inputValue(), "0");
+  await fftComposer.getByRole("combobox", { name: "Plane orientation", exact: true }).selectOption("yz");
+  await fftComposer.getByRole("combobox", { name: "Plane orientation", exact: true }).selectOption("xy");
+  const originZ = fftComposer.getByRole("textbox", { name: "Plane origin Z", exact: true });
+  await originZ.fill("1e-"); assert.equal(await originZ.inputValue(), "1e-");
+  const originX = fftComposer.getByRole("textbox", { name: "Plane origin X", exact: true });
+  await originX.fill("1,2"); assert.equal(await originX.inputValue(), "1,2");
+  assert.equal(await originX.evaluate(input => input === document.activeElement), true);
+  assert.equal(await fftComposer.getByTestId("antenna-sampling-plane-fields").locator("input").count(), 9);
+  await originX.fill("0"); await originZ.fill("0");
+  await fillFFTVector(fftComposer, "Axis v", ["1", "0", "0"]);
+  for (const [name, value] of [["Extent u", "2e-7"], ["Extent v", "1e-7"], ["Samples u", "16"], ["Samples v", "8"]]) {
     await fftComposer.getByRole("textbox", { name, exact: true }).fill(value);
   }
   await fftComposer.getByRole("combobox", { name: "Window", exact: true }).selectOption("hann");
   const createFFT = fftComposer.getByRole("button", { name: "Create source FFT request", exact: true });
   assert.equal(await createFFT.isEnabled(), false);
   await fftComposer.getByText("Sampling axes must be orthonormal unit vectors.", { exact: true }).waitFor();
-  await fftComposer.getByRole("textbox", { name: "Axis v", exact: true }).fill("0 1 0");
+  await fftComposer.getByRole("combobox", { name: "Plane orientation", exact: true }).selectOption("xy");
   await fftComposer.getByRole("textbox", { name: "Samples u", exact: true }).fill("10000000");
   assert.equal(await createFFT.isEnabled(), false);
   await fftComposer.getByText("FFT grid exceeds the runtime limit of 10000000 samples.", { exact: true }).waitFor();
@@ -380,14 +395,43 @@ try {
   await page.getByTitle("Expand All").click();
   await selectNode(`model:object:${objectId}:antenna:spectrum:${encodeURIComponent(fft.id)}`);
   await page.getByRole("combobox", { name: "Window", exact: true }).selectOption("blackman");
-  await page.getByRole("button", { name: "Apply spectrum", exact: true }).click();
+  const editedPlane = page.getByTestId("antenna-sampling-plane-fields");
+  await editedPlane.getByRole("combobox", { name: "Plane orientation", exact: true }).selectOption("xz");
+  const editedOriginZ = editedPlane.getByRole("textbox", { name: "Plane origin Z", exact: true });
+  await editedOriginZ.fill("2e-9");
+  await page.getByRole("button", { name: "Apply spectrum", exact: true }).evaluate(button => {
+    button.click();
+    const input = document.querySelector('[data-testid="antenna-sampling-plane-fields"] [aria-label="Plane origin Y"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value").set.call(input,"1e-");
+    input.dispatchEvent(new Event("input",{bubbles:true}));
+  });
   const editedFFT = await waitScene(s => s.antenna_spectrum_requests?.find(r => r.id === fft.id)?.window === "blackman");
   assert.deepEqual(editedFFT.antenna_spectrum_requests.find(r => r.id === fft.id).solution_ref, fft.solution_ref);
   await page.getByText("Resource committed.", { exact: false }).waitFor();
+  assert.deepEqual(editedFFT.antenna_spectrum_requests.find(r => r.id === fft.id).sampling_plane.axis_v, [0,0,1]);
+  assert.deepEqual(editedFFT.antenna_spectrum_requests.find(r => r.id === fft.id).sampling_plane.origin_m, [0,0,2e-9]);
+  const editedOriginY = editedPlane.getByRole("textbox", { name: "Plane origin Y", exact: true });
+  assert.equal(await editedOriginY.inputValue(), "1e-");
+  assert.equal(await page.getByRole("button", { name: "Apply spectrum", exact: true }).isEnabled(), false);
+  await editedOriginY.fill("1e-9"); await editedOriginY.focus();
+  await editedPlane.evaluate(root => {
+    const controls=[...root.querySelectorAll("input,select")].map(element=>({element,value:element.value,disabled:element.disabled,opacity:getComputedStyle(element).opacity})), input=document.activeElement, scroll=root.closest(".fm-inspector__body");
+    const proof={root,input,scroll,top:scroll.scrollTop,changes:0,values:0,disabled:0,opacity:0,samples:0};
+    const sample=()=>{proof.samples++;for(const saved of controls){if(!saved.element.isConnected)proof.changes++;if(saved.element.value!==saved.value)proof.values++;if(saved.element.disabled!==saved.disabled)proof.disabled++;if(getComputedStyle(saved.element).opacity!==saved.opacity)proof.opacity++;}};
+    const observer=new MutationObserver(sample);observer.observe(root,{attributes:true,childList:true,subtree:true});sample();window.__planeProof={proof,observer,sample};
+  });
+  await page.getByRole("button", { name: "Apply spectrum", exact: true }).evaluate(button=>button.click());
+  await waitScene(s => s.antenna_spectrum_requests.find(r => r.id === fft.id)?.sampling_plane.origin_m[1] === 1e-9);
+  await page.getByText("Resource committed.", { exact: false }).waitFor();
+  const planeStability=await page.evaluate(()=>{const{proof,observer,sample}=window.__planeProof;sample();observer.disconnect();return{root:proof.root.isConnected,focus:document.activeElement===proof.input,scroll:proof.scroll.scrollTop===proof.top,changes:proof.changes,values:proof.values,disabled:proof.disabled,opacity:proof.opacity,samples:proof.samples};});
+  assert.ok(planeStability.samples>0 && planeStability.samples<100);
+  assert.deepEqual({...planeStability,samples:0},{root:true,focus:true,scroll:true,changes:0,values:0,disabled:0,opacity:0,samples:0});
+  await editedPlane.scrollIntoViewIfNeeded(); await screenshot("09b-edited-fft-plane");
+  checks.push({name:"Shared XYZ plane controls preserve invalid text, explicit orientation and late edits through real FFT API saves with stable controls/values/focus/scroll",passed:true,stability:planeStability});
   await page.getByRole("button", { name: "Remove spectrum (no cascade)", exact: true }).click();
   const removedFFT = await waitScene(s => !s.antenna_spectrum_requests?.some(r => r.id === fft.id));
   assert.deepEqual(removedFFT.antenna_field_solve_stages, beforeFFT.antenna_field_solve_stages);
-  assert.equal(writes.length, beforeFFTWrites + 3);
+  assert.equal(writes.length, beforeFFTWrites + 4);
   checks.push({ name: "Existing spectrum inspector edits the request without rebinding its source and removes it without cascading or running analysis", passed: true });
   await selectNode(`model:object:${objectId}:antenna:solution:${encodeURIComponent(stage.id)}`);
   const add = page.getByRole("button", { name: "Add Field Solve to Study", exact: true });

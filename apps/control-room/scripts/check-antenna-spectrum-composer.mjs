@@ -7,7 +7,9 @@ import vm from "node:vm";
 
 const source = process.argv[2] ? pathToFileURL(resolve(process.argv[2])) : new URL("../src/modules/inspector/panels/antenna/AntennaSpectrumComposerModel.ts", import.meta.url);
 const sourceModule = new vm.SourceTextModule(stripTypeScriptTypes(readFileSync(source, "utf8")));
-await sourceModule.link(() => { throw new Error("Unexpected production model dependency"); }); await sourceModule.evaluate();
+const vectors = new vm.SourceTextModule(stripTypeScriptTypes(readFileSync(new URL("../src/modules/inspector/panels/antenna/AntennaSamplingPlaneFieldsModel.ts", import.meta.url), "utf8")));
+await vectors.link(() => { throw new Error("Unexpected vector-model dependency"); }); await vectors.evaluate();
+await sourceModule.link(name => { assert.equal(name, "./AntennaSamplingPlaneFieldsModel"); return vectors; }); await sourceModule.evaluate();
 const { composeAntennaSpectrumRequest: compose, acknowledgeAntennaSpectrumDraft: acknowledge, emptyAntennaSpectrumDraft, MAX_ANTENNA_SPECTRUM_SAMPLE_COUNT: limit } = sourceModule.namespace;
 const scene = {
   objects: [{ id: "source" }, { id: "receiver" }], current_transports: [{ name: "charge" }],
@@ -17,6 +19,10 @@ const scene = {
 const draft = { ...emptyAntennaSpectrumDraft, targetObjectId: "receiver", originM: "0, 0, 0", axisU: "1 0 0", axisV: "0 1 0", extentUM: "2e-7", extentVM: "1e-7", samplesU: "16", samplesV: "8", windowKind: "hann" };
 let checks = 0;
 const check = (name, run) => { run(); checks++; console.log(`PASS ${name}`); };
+check("textual XYZ fields produce canonical numeric SI vectors",()=>{
+  const result=compose(scene,"solve",{...draft,originM:'["0","1e-9","-2e-9"]',axisU:'["1","0","0"]',axisV:'["0","1","0"]'});
+  assert.equal(JSON.stringify(result.sampling_plane.origin_m),'[0,1e-9,-2e-9]');
+});
 check("oversized FFT is rejected before a transaction reaches the runtime", () => assert.throws(() => compose(scene, "solve", { ...draft, samplesU: "5001", samplesV: "2000" }), /runtime limit/));
 check("frontend sample limit matches the actual native runtime contract", () => {
   const native = readFileSync(new URL("../../../crates/fullmag-runner/src/antenna_spectrum.rs", import.meta.url), "utf8");

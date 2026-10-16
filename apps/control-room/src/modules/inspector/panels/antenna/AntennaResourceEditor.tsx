@@ -13,6 +13,7 @@ import { useRegisterInspectorEditSession } from "../../InspectorEditSession";
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
 import { FieldRow } from "../../primitives/FieldRow";
 import { FormField } from "../../primitives/FormField";
+import { AntennaSamplingPlaneFields } from "./AntennaSamplingPlaneFields";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import { antennaSolveTargetOptions } from "./AntennaSolveTargetsEditorModel";
 import {
@@ -124,7 +125,7 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
       <p className="fm-inspector-hint">Keeping the reference preserves its asset ID and digest. Explicit rebind replaces it with a pending stage-output reference and does not run the stage.</p>
     </>}
     {kind === "spectrum" ? <>
-      {field("originM", "Plane origin", "m")}{field("axisU", "Unit axis u")}{field("axisV", "Unit axis v")}
+      <AntennaSamplingPlaneFields values={{ originM: values.originM ?? "", axisU: values.axisU ?? "", axisV: values.axisV ?? "" }} onChange={frame => update(frame)} />
       {field("extentUM", "Extent u", "m")}{field("extentVM", "Extent v", "m")}{field("samplesU", "Samples u")}{field("samplesV", "Samples v")}
       {choice("windowKind", "Window", ["rectangular", "hann", "hamming", "blackman"].map((value): [string, string] => [value, value]))}
       {choice("normalization", "Normalization", [["integral_si", "Integral SI"], ["unitary_discrete", "Unitary discrete"]])}

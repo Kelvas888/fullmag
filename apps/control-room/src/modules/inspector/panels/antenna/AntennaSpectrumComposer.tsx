@@ -13,6 +13,7 @@ import { Button } from "@/shared/ui/Button";
 import { useRegisterInspectorEditSession } from "../../InspectorEditSession";
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
 import { FormField } from "../../primitives/FormField";
+import { AntennaSamplingPlaneFields } from "./AntennaSamplingPlaneFields";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import { committedAntennaTransactionScene } from "./AntennaTransactionAcknowledgement";
 import {
@@ -102,9 +103,7 @@ export function AntennaSpectrumComposer({ stageId, scene, sceneScopeKey, status,
       <option value="">Select target object</option>
       {(current?.objects ?? []).map((object) => <option key={object.id} value={object.id}>{object.name || object.id} ({object.id})</option>)}
     </FormField>
-    <FormField label="Plane origin" unit="m" hint="Three SI coordinates; centre of the sampled plane." value={values.originM} onChange={(event) => update({ originM: event.currentTarget.value })} />
-    <FormField label="Axis u" hint="Three components of a unit vector." value={values.axisU} onChange={(event) => update({ axisU: event.currentTarget.value })} />
-    <FormField label="Axis v" hint="Unit vector orthogonal to axis u." value={values.axisV} onChange={(event) => update({ axisV: event.currentTarget.value })} />
+    <AntennaSamplingPlaneFields values={values} onChange={frame => update(frame)} />
     <FormField label="Extent u" unit="m" value={values.extentUM} onChange={(event) => update({ extentUM: event.currentTarget.value })} />
     <FormField label="Extent v" unit="m" value={values.extentVM} onChange={(event) => update({ extentVM: event.currentTarget.value })} />
     <FormField label="Samples u" value={values.samplesU} onChange={(event) => update({ samplesU: event.currentTarget.value })} />
