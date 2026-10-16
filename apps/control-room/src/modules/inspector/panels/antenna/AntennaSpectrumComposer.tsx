@@ -14,6 +14,7 @@ import { useRegisterInspectorEditSession } from "../../InspectorEditSession";
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
 import { FormField } from "../../primitives/FormField";
 import { AntennaSamplingPlaneFields } from "./AntennaSamplingPlaneFields";
+import { AntennaSamplingResolution } from "./AntennaSamplingResolution";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import { committedAntennaTransactionScene } from "./AntennaTransactionAcknowledgement";
 import {
@@ -108,6 +109,7 @@ export function AntennaSpectrumComposer({ stageId, scene, sceneScopeKey, status,
     <FormField label="Extent v" unit="m" value={values.extentVM} onChange={(event) => update({ extentVM: event.currentTarget.value })} />
     <FormField label="Samples u" value={values.samplesU} onChange={(event) => update({ samplesU: event.currentTarget.value })} />
     <FormField label="Samples v" value={values.samplesV} onChange={(event) => update({ samplesV: event.currentTarget.value })} />
+    <AntennaSamplingResolution values={values} />
     <FormField label="Window" type="select" value={values.windowKind} onChange={(event) => update({ windowKind: event.currentTarget.value as AntennaSpectrumDraft["windowKind"] })}>
       <option value="rectangular">Rectangular</option><option value="hann">Hann</option><option value="hamming">Hamming</option><option value="blackman">Blackman</option>
     </FormField>

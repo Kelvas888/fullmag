@@ -14,6 +14,7 @@ import { FeedbackBanner } from "../../primitives/FeedbackBanner";
 import { FieldRow } from "../../primitives/FieldRow";
 import { FormField } from "../../primitives/FormField";
 import { AntennaSamplingPlaneFields } from "./AntennaSamplingPlaneFields";
+import { AntennaSamplingResolution } from "./AntennaSamplingResolution";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import { antennaSolveTargetOptions } from "./AntennaSolveTargetsEditorModel";
 import {
@@ -127,6 +128,7 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
     {kind === "spectrum" ? <>
       <AntennaSamplingPlaneFields values={{ originM: values.originM ?? "", axisU: values.axisU ?? "", axisV: values.axisV ?? "" }} onChange={frame => update(frame)} />
       {field("extentUM", "Extent u", "m")}{field("extentVM", "Extent v", "m")}{field("samplesU", "Samples u")}{field("samplesV", "Samples v")}
+      <AntennaSamplingResolution transform={resource && "transform" in resource ? resource.transform : ""} values={{ extentUM: values.extentUM ?? "", extentVM: values.extentVM ?? "", samplesU: values.samplesU ?? "", samplesV: values.samplesV ?? "" }} />
       {choice("windowKind", "Window", ["rectangular", "hann", "hamming", "blackman"].map((value): [string, string] => [value, value]))}
       {choice("normalization", "Normalization", [["integral_si", "Integral SI"], ["unitary_discrete", "Unitary discrete"]])}
       {choice("component", "Component", ["x", "y", "z", "u", "v", "normal", "vector_power"].map((value): [string, string] => [value, value]))}
