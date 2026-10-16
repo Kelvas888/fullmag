@@ -6,6 +6,8 @@ import type { AuthoringTransactionResponse, SceneResource } from "@/kernel/api/a
 import { MODEL_SCENE_PATH } from "@/kernel/api/apiPaths";
 import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
 import { invalidateAuthoringMutationDependents } from "@/kernel/authoring/authoringMutationInvalidation";
+import { antennaTerminalSourceState } from "./AntennaTerminalSourceModel";
+import { AntennaTerminalSourceDetails } from "./AntennaTerminalSourceDetails";
 import { committedAntennaTransactionScene } from "./AntennaTransactionAcknowledgement";
 import { useKernel } from "@/kernel/KernelContext";
 import { useSceneResource, publishCommittedSceneResource } from "@/kernel/resources/geometryLifecycleResources";
@@ -33,7 +35,9 @@ export function AntennaTerminalsPanel({ selection: selected }: InspectorPanelPro
   const identity = useSessionResourceIdentity();
   const scope = sessionRequestScopeKey(identity);
   const objectId = selected.ref?.type === "scene-object" ? selected.ref.objectId : selected.objectId ?? "";
-  const key = JSON.stringify([scope, objectId]);
+  const sourceModel = antennaTerminalSourceState(scene.data, objectId);
+  const preparationAllowed = sourceModel.mode === "preparation";
+  const key = JSON.stringify([scope, objectId, sourceModel.mode]);
   const [contextState, setContext] = useState({ key, token: {} });
   const context = contextState.key === key ? contextState : { key, token: {} };
   if (contextState.key !== key) setContext(context);
@@ -48,7 +52,8 @@ export function AntennaTerminalsPanel({ selection: selected }: InspectorPanelPro
   useLayoutEffect(() => { owner.current = context.token; return () => { owner.current = null; }; }, [context.token]);
   const object = scene.data?.objects?.find((item) => item.id === objectId);
   const ports = (scene.data?.antenna_port_modes ?? []).filter((port) => port.source_object_id === objectId);
-  const editable = Boolean(scope && scene.data?.scene?.id && scene.sessionScopeKey === scope && object && !object.locked);
+  const current = Boolean(scope && scene.data?.scene?.id && scene.sessionScopeKey === scope && object && commands.getSessionScopeKey() === scope);
+  const editable = preparationAllowed && current && !object?.locked;
   const errors = draft && scene.data ? antennaTerminalPreparationErrors(scene.data, objectId, draft) : ["Choose a port and load its terminal surfaces."];
   const canApply = Boolean(editable && scene.status === "ready" && draft?.dirty && !pending && errors.length === 0);
 
@@ -109,13 +114,28 @@ export function AntennaTerminalsPanel({ selection: selected }: InspectorPanelPro
       setPending((current) => current === ownerToken ? null : current);
     }
   }
-  useRegisterInspectorEditSession("staged", pending, Boolean(draft?.dirty), editable && scene.status === "ready" && errors.length === 0, undefined,
+  useRegisterInspectorEditSession("staged", pending, preparationAllowed && Boolean(draft?.dirty), editable && scene.status === "ready" && errors.length === 0, undefined,
     apply, () => setDraft(null), { historyMode: "mutation-owned", applyBlockReason: errors[0] });
+
+  function openSourceDetail(portId?: string) {
+    if (!current || commands.getSessionScopeKey() !== scope) return;
+    const kind = portId ? "object.antenna.port" as const : "object.antenna.geometry" as const;
+    const nodeId = portId ? `model:object:${objectId}:antenna:port:${encodeURIComponent(portId)}` : `model:object:${objectId}:geometry`;
+    selection.set({ kind, objectId, nodeId, label: portId ? `Port ${portId}` : "Geometry",
+      ref: { type: "scene-object", kind, objectId, nodeId, visualizationTargetId: `object:${objectId}`,
+        ...(portId ? { antennaResourceKind: "port" as const, antennaResourceId: portId } : {}) } }, "inspector");
+  }
+
+  if (!preparationAllowed) return <div className="fm-inspector-panel" data-inspector-owner="object.antenna.terminals">
+    <AntennaTerminalSourceDetails model={sourceModel} current={current} onGeometry={() => openSourceDetail()} onPort={openSourceDetail} />
+    {scene.error ? <FeedbackBanner kind="error" message={scene.error.message} /> : null}
+    <Button type="button" onClick={scene.refetch}>Refresh scene</Button>
+  </div>;
 
   return <div className="fm-inspector-panel" data-inspector-owner="object.antenna.terminals">
     <InspectorGroup title="Antenna terminals and external actuators" description="Explicit straight-stub preparation for raw inspection; not a complete qualified circuit." defaultOpen>
       <FeedbackBanner kind="warning" message="Inspection only · external_electrode_truncation. Feed and the omitted external circuit are not qualified. This preparation cannot supply a field basis, source FFT or LLG drive." />
-      <p className="fm-inspector-hint">Apply replaces this transport's legacy boundary conditions and view reference with explicit current-driven preparation. Geometry and port weights are preserved. Directions are world-space outward unit vectors; no orientation is inferred from a transformed preview.</p>
+      <p className="fm-inspector-hint">Apply replaces this transport&apos;s legacy boundary conditions and view reference with explicit current-driven preparation. Geometry and port weights are preserved. Directions are world-space outward unit vectors; no orientation is inferred from a transformed preview.</p>
       <Select value={draft?.portId ?? ""} disabled={!editable || pending || Boolean(draft?.dirty)} onValueChange={load}>
         <SelectTrigger aria-label="Terminal preparation port"><SelectValue placeholder="Select port and load caps" /></SelectTrigger>
         <SelectContent>{ports.map((port) => <SelectItem key={port.id} value={port.id}>{port.id}</SelectItem>)}</SelectContent>

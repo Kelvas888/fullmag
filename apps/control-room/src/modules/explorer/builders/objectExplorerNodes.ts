@@ -274,9 +274,9 @@ function antennaCompositionNodes(
     {
       id: `${antennaParentId}:terminals`,
       kind: "object.antenna.terminals",
-      label: "Terminals and external actuators",
+      label: "Terminals and source",
       parentId: antennaParentId,
-      badge: "inspection preparation",
+      badge: "source definition",
       icon: "activity",
       objectId,
       objectRole: "antenna",
