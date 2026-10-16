@@ -571,9 +571,9 @@ main() {
         admit_existing_mount
       else
         allocate_and_mount
-        write_owner_marker
-        set_runtime_ownership
-        verify_current_mount
+        # A remounted persistent image already owns its marker. Reuse the
+        # complete attestation path instead of attempting to replace it.
+        admit_existing_mount
       fi
       emit_receipt ready "${CREATED_IMAGE}"
       SUCCESS=1
