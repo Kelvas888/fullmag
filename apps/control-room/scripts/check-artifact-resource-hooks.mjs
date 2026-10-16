@@ -36,17 +36,17 @@ await check("availability request uses the same whitespace normalization as its 
 await check("strict immutable metadata errors cannot be converted into missing-resource success",async()=>{fail=true;ignored=0;api.useFieldMetaResource({quantityId:"V_electric",...pins,strictErrors:true});await assert.rejects(lastOptions.load({signal}),e=>e===error);assert.equal(ignored,0);fail=false;});
 await check("ordinary metadata retains its existing missing-resource policy",async()=>{fail=true;ignored=0;api.useFieldMetaResource({quantityId:"V_electric",...pins});assert.equal(await lastOptions.load({signal}),null);assert.equal(ignored,1);fail=false;});
 const viewport=read("modules/viewport-3d/viewport3dResources.ts");
-const entries=new Map();let retained=null,requests=0,notModified=false;
+const entries=new Map(),inflight=new Map();let retained=null,requests=0,notModified=false;
 const cache={get:key=>entries.get(key),peek:key=>entries.get(key),set:(key,value)=>entries.set(key,value),delete:key=>entries.delete(key)};
 Object.assign(context,{sessionScopedResourceKey:api.sessionScopedResourceKey,topologyCache:cache,viewport3DSessionIdentityGeneration:0,
- getInflightBinaryResource:()=>null,retainInflightBinaryResource:()=>{},setInflightBinaryResource:()=>{},clearInflightBinaryResource:()=>{},
+ getInflightBinaryResource:(_cache,key)=>inflight.get(key),retainInflightBinaryResource:()=>{},setInflightBinaryResource:(_cache,key,value)=>inflight.set(key,value),clearInflightBinaryResource:(_cache,key)=>inflight.delete(key),
  recordVisualizationDebugPerformanceMetric:()=>{},AbortController,
  DATA_DOMAIN_TOPOLOGY_PATH:"/v2/sessions/current/data/domain/topology",
  useViewport3DSessionIdentity:()=>identity,
  useResource:options=>{lastOptions=options;return {status:"ready",data:retained};},
  useKernel:()=>({api:{data:{domain:{topology:async()=>{requests++;return notModified?{status:"not-modified"}:{status:"ready",data:{nodes:"immutable"},etag:"revision",responseMetadata:{carrierId:"carrier",carrierRevision:"17"},byteLength:32};}}}}}),
 });
-const topology=await evaluate([declaration(viewport,"loadCachedBinaryResourceEntry"),declaration(viewport,"useViewport3DArtifactTopology")].join("\n"));
+const topology=await evaluate([declaration(viewport,"loadCachedBinaryResource"),declaration(viewport,"loadCachedBinaryResourceEntry"),declaration(viewport,"useViewport3DArtifactTopology")].join("\n")+"\nexport { loadCachedBinaryResourceEntry };" );
 await check("topology retains data, headers and revision after cache eviction without refetch",async()=>{
  const query={carrier_id:"carrier",expected_carrier_revision:"17"};
  topology.useViewport3DArtifactTopology(query);retained=await lastOptions.load({signal});
@@ -59,5 +59,11 @@ await check("topology 304 retains the same atomic geometry envelope",async()=>{
  topology.useViewport3DArtifactTopology({carrier_id:"carrier",expected_carrier_revision:"17"});
  entries.set(lastOptions.resourceKey,retained);notModified=true;
  assert.equal(await lastOptions.load({signal}),retained);assert.equal(requests,2);
+});
+await check("concurrent entry and legacy consumers share one request and retain their public result shapes",async()=>{
+ entries.clear();let calls=0;const data={nodes:"shared"},metadata={carrierId:"shared-carrier"};
+ const request=async()=>{calls++;await Promise.resolve();return {status:"ready",data,responseMetadata:metadata,etag:"shared-revision",byteLength:16};};
+ const [entry,legacy]=await Promise.all([topology.loadCachedBinaryResourceEntry(cache,"shared",request),topology.loadCachedBinaryResource(cache,"shared",request)]);
+ assert.equal(calls,1);assert.equal(entry.data,data);assert.equal(entry.metadata,metadata);assert.equal(legacy,data);assert.equal(inflight.size,0);
 });
 console.log(JSON.stringify({status:"passed",checks,unit_test_compilation:false,scope:"actual production declarations with hook/transport spies; not React lifecycle or HTTP qualification"}));
