@@ -1699,9 +1699,12 @@ def build(args: argparse.Namespace) -> Path:
         if missing_mounts:
             raise _fail("direct backend Compose service misses mounts: " + ", ".join(sorted(missing_mounts)))
         override = _prepare_override(backend, compose_source_mode)
+        build_container_name = f"{compose_project}-backend-build-{run_id[:16]}"
+        terminal["build_container_name"] = build_container_name
+        _write_json(run_root / "receipt.json", terminal)
         command = [
             *_compose_prefix(repo, files, compose_project),
-            "run", "--rm", "--no-deps", "--name", "fullmag-backend-build-" + run_id[:16],
+            "run", "--rm", "--no-deps", "--name", build_container_name,
             "backend", *override,
         ]
         _docker_live(
