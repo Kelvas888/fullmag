@@ -1321,6 +1321,62 @@ class DockerRuntimeContract(unittest.TestCase):
         liveness.assert_not_called()
         cli.assert_not_called()
 
+    def test_owner_read_retries_atomic_publish_gap_then_requires_exact_pin(self):
+        service = self.load_service()
+        owner = {
+            "schema_version": "runtime_service_owner.v1",
+            "state": "ready",
+            "owner_token": "known",
+            "children": [],
+        }
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081)
+        with patch.object(
+            service, "_read_json", side_effect=[FileNotFoundError("OWNER.json"), owner]
+        ) as read, patch.object(service.time, "sleep") as sleep:
+            self.assertEqual(service._assert_pinned_ready_owner(handle), owner)
+        self.assertEqual(read.call_count, 2)
+        sleep.assert_called_once_with(service.READY_OWNER_MISSING_POLL_SECONDS)
+
+    def test_owner_replacement_after_atomic_publish_gap_remains_fatal(self):
+        service = self.load_service()
+        owner = {
+            "schema_version": "runtime_service_owner.v1",
+            "state": "ready",
+            "owner_token": "known",
+            "children": [],
+        }
+        replacement = {**owner, "owner_token": "replacement"}
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081)
+        with patch.object(
+            service,
+            "_read_json",
+            side_effect=[FileNotFoundError("OWNER.json"), replacement],
+        ), patch.object(service.time, "sleep"):
+            with self.assertRaisesRegex(service.RuntimeServiceUnknown, "owner changed"):
+                service._assert_pinned_ready_owner(handle)
+
+    def test_owner_read_persistent_missing_is_bounded(self):
+        service = self.load_service()
+        clock = iter((0.0, 0.1, 1.1))
+        with patch.object(
+            service, "_read_json", side_effect=FileNotFoundError("OWNER.json")
+        ) as read, patch.object(service.time, "monotonic", side_effect=clock), patch.object(
+            service.time, "sleep"
+        ) as sleep:
+            with self.assertRaises(FileNotFoundError):
+                service._read_ready_owner(service.RuntimePaths())
+        self.assertEqual(read.call_count, 2)
+        sleep.assert_called_once_with(service.READY_OWNER_MISSING_POLL_SECONDS)
+
+    def test_owner_schema_failure_is_immediate_without_missing_retry(self):
+        service = self.load_service()
+        with patch.object(service, "_read_json", return_value={"state": "ready"}) as read, \
+                patch.object(service.time, "sleep") as sleep:
+            with self.assertRaisesRegex(service.RuntimeServiceError, "schema"):
+                service._read_ready_owner(service.RuntimePaths())
+        read.assert_called_once()
+        sleep.assert_not_called()
+
     def test_supervision_api_failure_is_fail_closed_with_pinned_owner_proof(self):
         service = self.load_service()
         identity = {

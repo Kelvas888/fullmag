@@ -65,6 +65,11 @@ TRANSIENT_LIVENESS_OBSERVATIONS = frozenset(
     }
 )
 MAX_LIVENESS_REASON_BYTES = 2048
+# OWNER.json is published atomically while the native service starts. A
+# reader may observe the brief absent-name interval, but only for this bounded
+# lookup window; malformed, stale, or mismatched owner data remains fatal.
+READY_OWNER_MISSING_RETRY_SECONDS = 1.0
+READY_OWNER_MISSING_POLL_SECONDS = 0.05
 RECOVERY_AUTHORIZATION_ENV = "FULLMAG_RUNTIME_RECOVERY_AUTHORIZATION"
 RECOVERY_AUTHORIZATION_SCHEMA = "fullmag.docker-runtime-recovery-authorization.v1"
 RECOVERY_REQUEST_SCHEMA = "runtime_service_recovery_request.v1"
@@ -1466,10 +1471,17 @@ def _service_status(paths: RuntimePaths) -> dict[str, Any]:
 def _read_ready_owner(paths: RuntimePaths) -> dict[str, Any]:
     """Read the already-published owner without starting another native CLI."""
 
-    owner = _read_json(
-        paths.store / "runtime-services" / "OWNER.json",
-        "runtime service owner",
-    )
+    owner_path = paths.store / "runtime-services" / "OWNER.json"
+    deadline = time.monotonic() + READY_OWNER_MISSING_RETRY_SECONDS
+    while True:
+        try:
+            owner = _read_json(owner_path, "runtime service owner")
+            break
+        except FileNotFoundError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(READY_OWNER_MISSING_POLL_SECONDS, remaining))
     if owner.get("schema_version") != "runtime_service_owner.v1":
         _fail("runtime service owner schema is unsupported")
     if owner.get("state") != "ready":
