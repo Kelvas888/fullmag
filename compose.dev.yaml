@@ -32,6 +32,11 @@ services:
     security_opt: ["no-new-privileges:true"]
     stop_grace_period: 60s
     hostname: ${FULLMAG_BACKEND_HOSTNAME:?Managed run hostname is required}
+    # Verify the immutable package receipt and artifact hashes before handing
+    # control to the shared all-in-one backend entrypoint.  Keep `serve` in
+    # the entrypoint so the managed storage probe can append its flag as the
+    # Compose command without bypassing receipt validation.
+    entrypoint: ["/usr/local/bin/python3", "/opt/fullmag/backend_dev.py", "serve"]
     environment:
       FULLMAG_DOCKER_ROLE: backend
       FULLMAG_SESSION_STORAGE_PROFILE: windows-folder-v1

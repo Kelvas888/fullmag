@@ -550,6 +550,8 @@ def process_environment(
 ) -> dict[str, str]:
     environment = dict(os.environ)
     environment.update(api_environment(paths, config_path))
+    if "FULLMAG_RUNTIME_PACKAGE_ROOT" in environment:
+        environment["FULLMAG_RUNTIME_PACKAGE_ROOT"] = str(paths.package)
     environment.pop("FULLMAG_ACCEPTED_STORE_SCOPE", None)
     if service:
         for name in SERVICE_MODE_VARIABLES:

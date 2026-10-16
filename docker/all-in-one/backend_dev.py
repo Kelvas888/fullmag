@@ -86,6 +86,17 @@ ALLOWED_EXTERNAL_SOLVER_GITLINKS = frozenset(
 # profiles select the requested lane from that binary; these four entries are
 # part of the receipt so host admission can reject a package missing a lane.
 LANES = ("fdm-cpu", "fdm-gpu", "fem-cpu", "fem-gpu")
+# Keep the direct development package discoverable by the same registry used by
+# the Windows MSI.  These manifests describe runtime selection only; the
+# receipt still binds the copied worker and native libraries to the source and
+# toolchain identity below.
+RUNTIME_MANIFEST_VERSION = "direct-compose-dev"
+RUNTIME_MANIFEST_PATHS = (
+    "runtimes/cpu-reference/manifest.json",
+    "runtimes/fdm-cuda/manifest.json",
+    "runtimes/fem-cpu-native/manifest.json",
+    "runtimes/fem-gpu/manifest.json",
+)
 REQUIRED_PACKAGE_PATHS = (
     "bin/fullmag-bin",
     "bin/fullmag-api",
@@ -101,6 +112,7 @@ REQUIRED_PACKAGE_PATHS = (
     "bin/fullmag-api-preparation-retry",
     "_fullmag_core.so",
     "launcher-build-mode",
+    *RUNTIME_MANIFEST_PATHS,
 )
 
 
@@ -1123,6 +1135,101 @@ def _copy_package_tree(source: Path, destination: Path) -> None:
             _copy_regular_file(source_file, target, source_mode, "package")
 
 
+def _write_runtime_manifests(package_root: Path) -> None:
+    """Publish the local runtime registry entries for the four-lane package.
+
+    The definitions intentionally mirror the Windows MSI generator.  Public
+    status is still computed by RuntimeRegistry from the worker and native
+    availability; FEM remains private and experimental in development.
+    """
+
+    manifests = (
+        (
+            "cpu-reference",
+            {
+                "family": "cpu-reference",
+                "version": RUNTIME_MANIFEST_VERSION,
+                "worker": "../../bin/fullmag-bin",
+                "engines": [
+                    {
+                        "backend": "fdm",
+                        "device": "cpu",
+                        "mode": "strict",
+                        "precision": "double",
+                        "public": True,
+                    }
+                ],
+            },
+        ),
+        (
+            "fdm-cuda",
+            {
+                "family": "fdm-cuda",
+                "version": RUNTIME_MANIFEST_VERSION,
+                "worker": "../../bin/fullmag-bin",
+                "engines": [
+                    {
+                        "backend": "fdm",
+                        "device": "gpu",
+                        "mode": "strict",
+                        "precision": "double",
+                        "public": True,
+                    },
+                    {
+                        "backend": "fdm",
+                        "device": "gpu",
+                        "mode": "strict",
+                        "precision": "single",
+                        "public": False,
+                    },
+                ],
+            },
+        ),
+        (
+            "fem-cpu-native",
+            {
+                "family": "fem-cpu-native",
+                "version": RUNTIME_MANIFEST_VERSION,
+                "worker": "../../bin/fullmag-bin",
+                "engines": [
+                    {
+                        "backend": "fem",
+                        "device": "cpu",
+                        "mode": "strict",
+                        "precision": "double",
+                        "public": False,
+                        "stability": "experimental",
+                    }
+                ],
+            },
+        ),
+        (
+            "fem-gpu",
+            {
+                "family": "fem-gpu",
+                "version": RUNTIME_MANIFEST_VERSION,
+                "worker": "../../bin/fullmag-bin",
+                "engines": [
+                    {
+                        "backend": "fem",
+                        "device": "gpu",
+                        "mode": "strict",
+                        "precision": "double",
+                        "public": False,
+                        "stability": "experimental",
+                    }
+                ],
+            },
+        ),
+    )
+    for family, manifest in manifests:
+        _write_json(
+            package_root / "runtimes" / family / "manifest.json",
+            manifest,
+            f"{family} runtime manifest",
+        )
+
+
 def _remove_extracted_source(path: Path) -> None:
     """Make the helper's read-only extraction removable by its owner."""
 
@@ -1431,6 +1538,7 @@ def _copy_package(workspace: Path, output: Path) -> list[dict[str, Any]]:
     stage = Path(tempfile.mkdtemp(prefix=".backend-package-", dir=output))
     try:
         _copy_package_tree(source, stage)
+        _write_runtime_manifests(stage)
         records = _hash_package(stage)
         for child in stage.iterdir():
             destination = output / child.name
@@ -1606,6 +1714,7 @@ def _serve(extra: list[str]) -> int:
         {
             "FULLMAG_DOCKER_ROLE": "backend",
             "FULLMAG_RUNTIME_ROOT": str(PACKAGE_ROOT),
+            "FULLMAG_RUNTIME_PACKAGE_ROOT": str(PACKAGE_ROOT),
             "FULLMAG_WEB_STATIC_DIR": str(PACKAGE_ROOT / "web"),
             "PATH": f"{PACKAGE_ROOT / 'bin'}:/opt/fullmag-deps/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin",
         }

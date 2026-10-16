@@ -1,10 +1,12 @@
 """Interpreted package publication regressions; no native compilation."""
 import hashlib
+import json
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docker" / "all-in-one"))
 import backend_dev as backend
@@ -42,6 +44,145 @@ class BackendPackageTests(unittest.TestCase):
         workspace = backend._prepare_workspace(root)
         (workspace / ".fullmag-build" / "cargo-fingerprint").write_bytes(b"cache")
         return workspace
+
+    @staticmethod
+    def _package_workspace(root):
+        workspace = root / "package-workspace"
+        source = workspace / ".fullmag" / "local"
+        source.mkdir(parents=True)
+        for relative in backend.REQUIRED_PACKAGE_PATHS:
+            if relative in backend.RUNTIME_MANIFEST_PATHS:
+                continue
+            path = source.joinpath(*relative.split("/"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = "cuda-fem-gpu\n" if relative == "launcher-build-mode" else "package\n"
+            path.write_text(content, encoding="utf-8")
+            if relative.startswith("bin/"):
+                path.chmod(0o755)
+        for relative in ("lib/libfullmag_fdm.so.1", "lib/libfullmag_fem.so.1"):
+            path = source.joinpath(*relative.split("/"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"native-library")
+        return workspace
+
+    def _published_package(self, root):
+        workspace = self._package_workspace(root)
+        output = root / "package"
+        records = backend._copy_package(workspace, output)
+        return output, records
+
+    def test_local_runtime_manifests_are_attested_and_resolve_workers_inside_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, records = self._published_package(Path(directory))
+            self.assertEqual(backend._hash_package(output), records)
+            record_paths = {record["path"] for record in records}
+            self.assertTrue(set(backend.RUNTIME_MANIFEST_PATHS).issubset(record_paths))
+            self.assertEqual(
+                {record["path"] for record in records if record["path"].startswith("runtimes/")},
+                set(backend.RUNTIME_MANIFEST_PATHS),
+            )
+
+            manifests = {}
+            package_root = output.resolve()
+            for relative in backend.RUNTIME_MANIFEST_PATHS:
+                path = output / relative
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+                manifests[manifest["family"]] = manifest
+                worker = (path.parent / manifest["worker"]).resolve(strict=True)
+                self.assertTrue(worker.is_relative_to(package_root))
+                self.assertEqual(worker, (output / "bin/fullmag-bin").resolve())
+                self.assertEqual(manifest["worker"], "../../bin/fullmag-bin")
+
+            self.assertTrue(manifests["cpu-reference"]["engines"][0]["public"])
+            self.assertTrue(manifests["fdm-cuda"]["engines"][0]["public"])
+            for family in ("fem-cpu-native", "fem-gpu"):
+                engine = manifests[family]["engines"][0]
+                self.assertFalse(engine["public"])
+                self.assertEqual(engine["stability"], "experimental")
+
+    def test_tampered_runtime_manifest_is_rejected_by_serve_verifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, records = self._published_package(Path(directory))
+            backend._write_json(
+                output / "backend-build-receipt.json",
+                {
+                    "schema": backend.RECEIPT_SCHEMA,
+                    "state": "succeeded",
+                    "execution_lanes": {lane: {} for lane in backend.LANES},
+                    "artifacts": records,
+                },
+                "test backend build receipt",
+            )
+            manifest = output / "runtimes/fem-gpu/manifest.json"
+            manifest.write_text(manifest.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            original_package_root = backend.PACKAGE_ROOT
+            backend.PACKAGE_ROOT = output
+            try:
+                with self.assertRaisesRegex(
+                    backend.BackendBuildError, "runtime package artifacts differ from the build receipt"
+                ):
+                    backend._serve([])
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
+
+    def test_development_compose_selects_receipt_validated_backend_start(self):
+        repository = Path(__file__).resolve().parents[1]
+        development_compose = (repository / "compose.dev.yaml").read_text(encoding="utf-8")
+        backend_block = development_compose.split("\n  backend:\n", 1)[1].split(
+            "\n  frontend:\n", 1
+        )[0]
+        self.assertIn(
+            'entrypoint: ["/usr/local/bin/python3", "/opt/fullmag/backend_dev.py", "serve"]',
+            backend_block,
+        )
+        static_compose = (repository / "compose.static.yaml").read_text(encoding="utf-8")
+        self.assertNotIn("/opt/fullmag/backend_dev.py", static_compose)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output, records = self._published_package(Path(directory))
+            backend._write_json(
+                output / "backend-build-receipt.json",
+                {
+                    "schema": backend.RECEIPT_SCHEMA,
+                    "state": "succeeded",
+                    "execution_lanes": {lane: {} for lane in backend.LANES},
+                    "artifacts": records,
+                },
+                "test backend build receipt",
+            )
+            original_package_root = backend.PACKAGE_ROOT
+            backend.PACKAGE_ROOT = output
+            try:
+                with patch.object(backend.os, "execvpe") as execvpe:
+                    self.assertEqual(backend.main(["serve"]), 0)
+                    self.assertEqual(backend.main(["serve", "--storage-probe"]), 0)
+                self.assertEqual(execvpe.call_count, 2)
+                self.assertEqual(
+                    execvpe.call_args_list[0].args[1][1:],
+                    ["/opt/fullmag/entrypoint.py"],
+                )
+                self.assertEqual(
+                    execvpe.call_args_list[1].args[1][1:],
+                    ["/opt/fullmag/entrypoint.py", "--storage-probe"],
+                )
+                self.assertEqual(
+                    execvpe.call_args_list[0].args[2]["FULLMAG_RUNTIME_ROOT"],
+                    str(output),
+                )
+                self.assertEqual(
+                    execvpe.call_args_list[0].args[2]["FULLMAG_RUNTIME_PACKAGE_ROOT"],
+                    str(output),
+                )
+
+                manifest = output / "runtimes/fem-gpu/manifest.json"
+                manifest.write_text(
+                    manifest.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+                )
+                with patch.object(backend.os, "execvpe") as tampered_exec:
+                    self.assertEqual(backend.main(["serve"]), 2)
+                    tampered_exec.assert_not_called()
+            finally:
+                backend.PACKAGE_ROOT = original_package_root
 
     def test_native_soname_alias_is_published_as_regular_file(self):
         with tempfile.TemporaryDirectory() as directory:

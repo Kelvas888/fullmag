@@ -175,6 +175,21 @@ granicę zapewnia przypięte archiwum. Checkout nadal pozostaje zamontowany na
 backend build po utworzeniu cienia. Pomyślny build nie może sam zatrzymać
 aktywnej symulacji; zastosowanie nowego pakietu wymaga kontrolowanego restartu.
 
+### Oddzielny root pakietu i storage runtime
+
+`FULLMAG_RUNTIME_ROOT` zachowuje dotychczasowy kontrakt każdego launchera:
+storage runtime resolver dla natywnego Windows i storage worktree, a w all-in-one
+istniejące stałe ustawienie pakietu dla starszych konsumentów usługi. Nie jest to
+zmienna wybierająca package root dla discovery capabilities. API odkrywa
+manifesty pakietu wyłącznie pod prywatnym `FULLMAG_RUNTIME_PACKAGE_ROOT`; proces
+backendu ustawia ją na zweryfikowany katalog pakietu, a brak tej zmiennej
+zachowuje dotychczasowy fallback natywnego Windows do `repo_root`.
+
+Jawnie skonfigurowany package root musi być absolutnym, istniejącym katalogiem
+z czytelnym `runtimes/`. Manifesty są częścią attested receipt i statusu
+RuntimeRegistry; same flagi kompilacji nie tworzą dostępności urządzenia ani
+nie promują eksperymentalnego FEM do publicznego runtime.
+
 Obraz narzędziowy i pakiet aplikacji są osobnymi warstwami. Zmiana kodu Rust
 nie powinna wymuszać ponownego budowania CUDA, hypre, MFEM czy libCEED.
 Zwykły restart kontenera nie usuwa cache. Zmiany zależności lub flag mogą

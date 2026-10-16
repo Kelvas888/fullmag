@@ -493,6 +493,36 @@ class DockerRuntimeContract(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_process_environment_pins_optional_package_root_without_rewriting_source_root(self):
+        service = self.load_service()
+        paths = service.RuntimePaths()
+        with patch.dict(
+            os.environ,
+            {
+                "FULLMAG_RUNTIME_PACKAGE_ROOT": "/foreign/package",
+                "FULLMAG_RUNTIME_ROOT": "/foreign/legacy-package",
+                "FULLMAG_REPO_ROOT": "/foreign/source",
+            },
+            clear=True,
+        ):
+            environment = service.process_environment(paths)
+        self.assertEqual(environment["FULLMAG_RUNTIME_PACKAGE_ROOT"], str(paths.package))
+        self.assertEqual(environment["FULLMAG_RUNTIME_ROOT"], str(paths.package))
+        self.assertEqual(environment["FULLMAG_REPO_ROOT"], str(paths.source))
+
+        with patch.dict(
+            os.environ,
+            {
+                "FULLMAG_RUNTIME_ROOT": "/foreign/legacy-package",
+                "FULLMAG_REPO_ROOT": "/foreign/source",
+            },
+            clear=True,
+        ):
+            legacy_environment = service.process_environment(paths)
+        self.assertNotIn("FULLMAG_RUNTIME_PACKAGE_ROOT", legacy_environment)
+        self.assertEqual(legacy_environment["FULLMAG_RUNTIME_ROOT"], str(paths.package))
+        self.assertEqual(legacy_environment["FULLMAG_REPO_ROOT"], str(paths.source))
+
     def load_entrypoint(self):
         import sys
         path = Path(__file__).resolve().parents[1] / "docker/all-in-one/entrypoint.py"
