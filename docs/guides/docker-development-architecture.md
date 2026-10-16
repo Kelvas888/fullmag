@@ -174,6 +174,16 @@ Readiness oraz snapshot są publikowane jako obiekty CAS przed zmianą wskaźnik
 Te kontrole przeszły sprawdzenia źródeł; migracja i ponowne uruchomienie po
 wykonanej symulacji pozostają `NOT VERIFIED`.
 
+Initializer Docker rozdziela fizyczną tożsamość demona od logicznego `host_id`
+polityki rejestru. `FULLMAG_DOCKER_HOST_ID` pozostaje zweryfikowanym digestem
+demona i jest przekazywany do adaptera razem z profilem
+`FULLMAG_HOST_LEDGER_PROFILE=host-ledger-v1`. Przed wywołaniem natywnej fabryki
+initializer bounded/no-follow odczytuje istniejący
+`/host-ledger/ledger/HOST_RESOURCE_LEDGER.json`: zachowuje wyłącznie historyczne
+`docker-all-host` albo bieżący digest demona, a nowy rejestr dostaje bieżący
+digest. Każdy inny zapis `policy.host_id` kończy się błędem bez mutacji; natywna
+fabryka nadal sprawdza marker, pełną politykę, topologię i readiness pod blokadą.
+
 Ostatni kompletny build `a8e21962f7004d378eb8b11f92232b4e` przeszedł trzy fazy
 i pakowanie. Jego start `147f8e32446842b48d1cfa6ee23af15c` ujawnił brak
 aktualizacji readiness w starszym runtime. Kolejny build z poprawką generacji

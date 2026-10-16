@@ -447,6 +447,171 @@ class DockerRuntimeContract(unittest.TestCase):
         return {"schema_version": service.HOST_PROFILE_SCHEMA, "configuration": config,
                 "runtime_generation_sha256": "a" * 64}
 
+    def _initialize_host_fixture(self, service, stored_host_id, ledger_document=None):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ledger = root / "ledger"
+            ledger.mkdir()
+            if stored_host_id is not None or ledger_document is not None:
+                (ledger / service.HOST_RESOURCE_LEDGER_FILE).write_text(
+                    json.dumps(ledger_document or {
+                        "schema_version": "host_resource_ledger.v4",
+                        "policy": {"host_id": stored_host_id},
+                    }),
+                    encoding="utf-8",
+                )
+            package = root / "package"
+            executable = package / "bin" / "fullmag-runtime-service"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"runtime-service")
+            executable.chmod(0o755)
+            paths = replace(
+                service.RuntimePaths(),
+                state=root,
+                storage=root,
+                runs=root / "runs",
+                store=root / "runs" / "session-store",
+                state_root=root / ".fullmag",
+                package=package,
+                config=root / "runtime.json",
+            )
+            daemon_host_id = "a" * 64
+            environment = {
+                "FULLMAG_DOCKER_HOST_EXECUTION": "1",
+                "FULLMAG_HOST_LEDGER_PROFILE": service.HOST_LEDGER_PROFILE,
+                "FULLMAG_DOCKER_HOST_ID": daemon_host_id,
+            }
+            completed = subprocess.CompletedProcess(
+                [str(executable)], 0, stdout=b"{}", stderr=b""
+            )
+            with patch.object(service, "HOST_LEDGER_ROOT", ledger), \
+                    patch.dict(os.environ, environment, clear=True), \
+                    patch.object(service.subprocess, "run", return_value=completed) as run, \
+                    patch.object(service, "_validate_host_profile", return_value={"ok": True}):
+                service.initialize_host_configuration(paths)
+                return run, daemon_host_id
+
+    def test_initializer_preserves_legacy_policy_id_and_daemon_attestation(self):
+        service = self.load_service()
+        daemon_host_id = "a" * 64
+        for stored_host_id, expected_host_id in (
+            (service.LEGACY_DOCKER_HOST_ID, service.LEGACY_DOCKER_HOST_ID),
+            (daemon_host_id, daemon_host_id),
+            (None, daemon_host_id),
+        ):
+            with self.subTest(stored_host_id=stored_host_id):
+                run, observed_daemon_host_id = self._initialize_host_fixture(
+                    service, stored_host_id
+                )
+                command = run.call_args.args[0]
+                self.assertEqual(command[-2:], ["--host-id", expected_host_id])
+                self.assertEqual(
+                    run.call_args.kwargs["env"]["FULLMAG_DOCKER_HOST_ID"],
+                    observed_daemon_host_id,
+                )
+
+    def test_initializer_accepts_native_ledger_size_above_python_json_default(self):
+        service = self.load_service()
+        gpu_capacity = {
+            f"GPU-00000000-0000-4000-8000-{index:012x}": 2**63
+            for index in range(1, 4097)
+        }
+        document = {
+            "schema_version": "host_resource_ledger.v2",
+            "policy": {
+                "schema_version": "host_resource_ledger_policy.v2",
+                "host_id": service.LEGACY_DOCKER_HOST_ID,
+                "topology_sha256": "a" * 64,
+                "revision": 1,
+                "owner_epoch": 1,
+                "total_budget": {
+                    "cpu_millis": 1000,
+                    "memory_bytes": 1,
+                    "gpu_memory_bytes": 0,
+                    "storage_bytes": 1,
+                },
+                "gpu_vram_bytes_by_uuid": gpu_capacity,
+                "allowed_cpu_ids": [0],
+            },
+            "reservations": [],
+        }
+        encoded = json.dumps(document).encode("utf-8")
+        self.assertGreater(len(encoded), 256 * 1024)
+        self.assertLessEqual(len(encoded), service.MAX_HOST_LEDGER_BYTES)
+        run, _ = self._initialize_host_fixture(
+            service, service.LEGACY_DOCKER_HOST_ID, ledger_document=document
+        )
+        self.assertEqual(run.call_args.args[0][-2:], ["--host-id", service.LEGACY_DOCKER_HOST_ID])
+
+    def test_initializer_rejects_oversized_ledger_before_native_factory(self):
+        from dataclasses import replace
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ledger = root / "ledger"
+            ledger.mkdir()
+            oversized = ledger / service.HOST_RESOURCE_LEDGER_FILE
+            oversized.write_bytes(
+                b'{"policy":{"host_id":"docker-all-host"},"padding":"'
+                + b"x" * service.MAX_HOST_LEDGER_BYTES
+                + b'"}'
+            )
+            package = root / "package"
+            executable = package / "bin" / "fullmag-runtime-service"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"runtime-service")
+            executable.chmod(0o755)
+            paths = replace(service.RuntimePaths(), state=root, storage=root,
+                            package=package, config=root / "runtime.json")
+            with patch.object(service, "HOST_LEDGER_ROOT", ledger), \
+                    patch.dict(os.environ, {
+                        "FULLMAG_DOCKER_HOST_ID": "a" * 64,
+                        "FULLMAG_HOST_LEDGER_PROFILE": service.HOST_LEDGER_PROFILE,
+                    }, clear=True), \
+                    patch.object(service.subprocess, "run") as run:
+                with self.assertRaisesRegex(service.RuntimeServiceError, "bounded regular file"):
+                    service.initialize_host_configuration(paths)
+            run.assert_not_called()
+
+    def test_initializer_rejects_unexpected_policy_id_before_native_factory(self):
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ledger = root / "ledger"
+            ledger.mkdir()
+            (ledger / service.HOST_RESOURCE_LEDGER_FILE).write_text(
+                json.dumps({"schema_version": "host_resource_ledger.v4",
+                            "policy": {"host_id": "foreign-host"}}),
+                encoding="utf-8",
+            )
+            package = root / "package"
+            executable = package / "bin" / "fullmag-runtime-service"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"runtime-service")
+            executable.chmod(0o755)
+            from dataclasses import replace
+            paths = replace(service.RuntimePaths(), state=root, storage=root,
+                            package=package, config=root / "runtime.json")
+            with patch.object(service, "HOST_LEDGER_ROOT", ledger), \
+                    patch.dict(os.environ, {
+                        "FULLMAG_DOCKER_HOST_ID": "a" * 64,
+                        "FULLMAG_HOST_LEDGER_PROFILE": service.HOST_LEDGER_PROFILE,
+                    }, clear=True), \
+                    patch.object(service.subprocess, "run") as run:
+                with self.assertRaisesRegex(service.RuntimeServiceError, "differs"):
+                    service.initialize_host_configuration(paths)
+            run.assert_not_called()
+
+    def test_initializer_requires_canonical_host_ledger_profile(self):
+        service = self.load_service()
+        with patch.dict(os.environ, {
+            "FULLMAG_DOCKER_HOST_ID": "a" * 64,
+            "FULLMAG_HOST_LEDGER_PROFILE": "other-profile",
+        }, clear=True):
+            with self.assertRaisesRegex(service.RuntimeServiceError, "canonical host-ledger-v1"):
+                service._validated_docker_host_id()
+
     def test_native_host_profile_rejects_wrong_store_device_policy_and_overcommit(self):
         import copy
         service = self.load_service()

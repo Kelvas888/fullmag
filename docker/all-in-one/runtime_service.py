@@ -36,6 +36,10 @@ HOST_PROFILE_SCHEMA = "fullmag.docker-host-profile.v1"
 # contract tests are imported by native Windows Python.  PurePosixPath keeps
 # the serialized CLI/profile value stable across host operating systems.
 HOST_LEDGER_ROOT = PurePosixPath("/host-ledger/ledger")
+HOST_LEDGER_PROFILE = "host-ledger-v1"
+HOST_RESOURCE_LEDGER_FILE = "HOST_RESOURCE_LEDGER.json"
+LEGACY_DOCKER_HOST_ID = "docker-all-host"
+MAX_HOST_LEDGER_BYTES = 8 * 1024 * 1024
 CONFIG_RELATIVE = Path(".fullmag/runtime-service/docker-all.json")
 MAX_JSON_BYTES = 256 * 1024
 MAX_HTTP_BYTES = 4 * 1024 * 1024
@@ -213,6 +217,47 @@ def _read_json(path: Path, name: str, maximum: int = MAX_JSON_BYTES) -> dict[str
     if not isinstance(value, dict):
         _fail(f"{name} must contain a JSON object")
     return value
+
+
+def _validated_docker_host_id() -> str:
+    """Return the daemon attestation required by the canonical host-ledger adapter."""
+
+    if os.environ.get("FULLMAG_HOST_LEDGER_PROFILE") != HOST_LEDGER_PROFILE:
+        _fail("Docker host initialization requires the canonical host-ledger-v1 profile")
+    value = os.environ.get("FULLMAG_DOCKER_HOST_ID", "")
+    if HEX64.fullmatch(value) is None:
+        _fail("FULLMAG_DOCKER_HOST_ID must be the verified lowercase Docker daemon SHA-256")
+    return value
+
+
+def _initializer_host_id(daemon_host_id: str) -> str:
+    """Select the logical policy ID without replacing an existing host ledger.
+
+    The adapter's daemon digest remains in the process environment for physical
+    attestation.  The native factory receives the logical ID already persisted by
+    the ledger so a pre-existing legacy ``docker-all-host`` policy stays readable.
+    The native service still validates the complete marker, policy, topology and
+    readiness under its writer lock after this bounded read.
+    """
+
+    ledger_path = Path(HOST_LEDGER_ROOT) / HOST_RESOURCE_LEDGER_FILE
+    try:
+        document = _read_json(
+            ledger_path, "existing host resource ledger", MAX_HOST_LEDGER_BYTES
+        )
+    except FileNotFoundError:
+        # A genuinely fresh ledger is bound to this daemon, never to an arbitrary
+        # fallback ID.  Partial markers are rejected by the native initializer.
+        return daemon_host_id
+    policy = document.get("policy")
+    if not isinstance(policy, dict):
+        _fail("existing host resource ledger has no validated policy")
+    stored_host_id = policy.get("host_id")
+    if not isinstance(stored_host_id, str) or not stored_host_id:
+        _fail("existing host resource ledger policy has no host_id")
+    if stored_host_id not in {LEGACY_DOCKER_HOST_ID, daemon_host_id}:
+        _fail("existing host resource ledger host_id differs from the verified Docker daemon")
+    return stored_host_id
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any], name: str) -> None:
@@ -484,6 +529,8 @@ def _validate_host_profile(value: Mapping[str, Any], paths: RuntimePaths) -> dic
 
 def initialize_host_configuration(paths: RuntimePaths) -> dict[str, Any]:
     """Discover native devices and initialize the exact shared Rust ledger."""
+    daemon_host_id = _validated_docker_host_id()
+    logical_host_id = _initializer_host_id(daemon_host_id)
     executable = paths.package / "bin" / "fullmag-runtime-service"
     _assert_no_links(executable, "runtime service executable")
     if not executable.is_file() or not os.access(executable, os.X_OK):
@@ -491,7 +538,7 @@ def initialize_host_configuration(paths: RuntimePaths) -> dict[str, Any]:
     try:
         result = subprocess.run(
             [str(executable), "--initialize-docker-host", "--ledger-root", str(HOST_LEDGER_ROOT),
-             "--store-root", str(paths.store)],
+             "--store-root", str(paths.store), "--host-id", logical_host_id],
             cwd=str(paths.state), env=process_environment(paths, service=True),
             stdin=subprocess.DEVNULL, capture_output=True, timeout=60,
         )
