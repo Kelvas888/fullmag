@@ -244,9 +244,12 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
 
     loop {
         if let Some(host) = host.as_ref() {
-            retry_store_writer_busy(|| host.reconcile_tentative_store_admissions(&store))?;
-            retry_store_writer_busy(|| host.reconcile_released_store_reservations(&store))?;
-            retry_store_writer_busy(|| host.reconcile_task_cancellations(&store))?;
+            retry_store_writer_busy(|| host.reconcile_tentative_store_admissions(&store))
+                .context("preparation scheduler: reconcile tentative store admissions")?;
+            retry_store_writer_busy(|| host.reconcile_released_store_reservations(&store))
+                .context("preparation scheduler: reconcile released host reservations")?;
+            retry_store_writer_busy(|| host.reconcile_task_cancellations(&store))
+                .context("preparation scheduler: reconcile task cancellations")?;
         }
         reap_finished(
             &store,
@@ -270,7 +273,8 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
         // `active` continue draining even after an offer is withdrawn.
         // Serialize membership and lease adoption with pool/lease publication.
         // Supervisors start in separate threads; never wait for them here.
-        let recovery_transaction = retry_store_writer_busy(|| store.write_transaction())?;
+        let recovery_transaction = retry_store_writer_busy(|| store.write_transaction())
+            .context("preparation scheduler: acquire recovery transaction")?;
         let current_pool =
             retry_store_writer_busy(|| store.read_preparation_resource_pool(&args.pool_id))?;
         if let Some(pool) = &current_pool {

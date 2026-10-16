@@ -400,13 +400,14 @@ fn run_scheduler(
             break;
         }
         if let Some(host_admission) = host_admission.as_ref() {
-            retry_store_writer_busy(|| {
-                host_admission.reconcile_tentative_store_admissions(&store)
-            })?;
+            retry_store_writer_busy(|| host_admission.reconcile_tentative_store_admissions(&store))
+                .context("compute scheduler: reconcile tentative store admissions")?;
             retry_store_writer_busy(|| {
                 host_admission.reconcile_released_store_reservations(&store)
-            })?;
-            retry_store_writer_busy(|| host_admission.reconcile_task_cancellations(&store))?;
+            })
+            .context("compute scheduler: reconcile released host reservations")?;
+            retry_store_writer_busy(|| host_admission.reconcile_task_cancellations(&store))
+                .context("compute scheduler: reconcile task cancellations")?;
         }
         if args.discover_resources {
             let pool_id = args
