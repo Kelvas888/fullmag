@@ -117,6 +117,18 @@ Health/admission backendu nadal odmawia gotowości do symulacji; widoczny Home
 nie jest dowodem sprawnego API ani wykonania GPU. Polecenie kontrolujące
 pełny start może zgłosić błąd backendu mimo dostępnego już frontendu.
 
+Nadzorca korzysta z przypiętej tożsamości API, bezpośredniego odczytu
+ograniczonego `OWNER.json` i natywnego potwierdzenia liveness przez API.
+Odczyt statusu podczas pracy nie uruchamia kolejnego procesu CLI. Natywne
+polecenia nadal odpowiadają za utworzenie usługi i uwierzytelniony drenaż.
+
+Przejściowe błędy transportu oraz `live_probe_failed`, `owner_read_failed`
+i `owner_invalid` mogą odzyskać obserwację w ciągu 30 sekund tylko wtedy,
+gdy niezależny odczyt potwierdza zgodność przypiętego ownera. Błędna tożsamość,
+schemat lub binding kończą nadzór od razu. Okno obserwacji nie zmienia
+healthcheck ani admission: API nadal blokuje obliczenia bez aktualnego
+potwierdzenia gotowości natywnej usługi.
+
 ## Cykl edycji i przebudowy
 
 Pierwszy start przygotowuje obrazy narzędziowe, kompiluje backend oraz instaluje

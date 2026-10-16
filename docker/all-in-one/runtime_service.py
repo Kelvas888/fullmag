@@ -44,6 +44,11 @@ CONFIG_RELATIVE = Path(".fullmag/runtime-service/docker-all.json")
 MAX_JSON_BYTES = 256 * 1024
 MAX_HTTP_BYTES = 4 * 1024 * 1024
 STARTUP_LIVENESS_GRACE_SECONDS = 10.0
+# Process limits for lifecycle calls whose work includes Windows-folder (9p)
+# I/O.  The accepted-store bootstrap and diagnostic service-status call can
+# legitimately outlive the normal API probe on that mount.
+SERVICE_STATUS_CLI_TIMEOUT_SECONDS = 30
+STORE_BOOTSTRAP_CLI_TIMEOUT_SECONDS = 180
 # A live API observation may be temporarily unprovable while the native
 # service is still running.  The API remains fail-closed in that state; this
 # window only prevents one bounded transport/probe blip from killing PID 1.
@@ -1115,7 +1120,10 @@ def initialize_accepted_store(
     paths = paths or canonical_paths()
     prepare_storage(paths)
     result = _run_cli(
-        paths, ("runtime", "initialize-docker-accepted-store"), timeout=60, cli=cli
+        paths,
+        ("runtime", "initialize-docker-accepted-store"),
+        timeout=STORE_BOOTSTRAP_CLI_TIMEOUT_SECONDS,
+        cli=cli,
     )
     if result.get("schema", result.get("schema_version")) != (
         "fullmag.docker-accepted-store-bootstrap.v1"
@@ -1273,14 +1281,20 @@ def _probe_api_liveness(
 
 
 def _wait_for_api_liveness(
-    port: int, expected_identity: Mapping[str, Any], *, timeout: float
+    port: int,
+    expected_identity: Mapping[str, Any],
+    *,
+    timeout: float,
+    handle: RuntimeHandle | None = None,
 ) -> None:
     """Wait briefly for a pinned service to publish ``ready`` during startup.
 
     Identity, contract, and malformed-observation failures remain fail-closed.
-    Only the native service's explicit ``starting`` state is retried here;
-    recurring supervision applies its separate bounded grace only to the
-    typed ``observation_unknown/live_probe_failed`` observation.
+    Only the native service's explicit ``starting`` state is retried without
+    an owner handle.  A pinned startup handle may additionally retry the
+    typed ``observation_unknown`` liveness observations, but only after a
+    fresh exact owner-file proof.  Identity, contract, malformed-owner, and
+    pin failures remain fail-closed.
     """
 
     if timeout <= 0:
@@ -1303,9 +1317,16 @@ def _wait_for_api_liveness(
             )
             return
         except RuntimeServiceNotReady as error:
-            if not error.retryable:
+            if error.retryable:
+                last = error
+            elif handle is not None and _is_transient_supervision_observation(error):
+                # Do not turn an owner-read/live-probe race into a startup
+                # grace period unless the exact pinned native owner is still
+                # readable.  A changed or malformed owner fails immediately.
+                _assert_pinned_ready_owner(handle)
+                last = error
+            else:
                 raise
-            last = error
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             continue
@@ -1419,7 +1440,7 @@ def _service_status(paths: RuntimePaths) -> dict[str, Any]:
             "--timeout-seconds",
             "3",
         ),
-        timeout=10,
+        timeout=SERVICE_STATUS_CLI_TIMEOUT_SECONDS,
     )
     return _owner_from_cli(result, "service-status")
 
@@ -1515,15 +1536,19 @@ def start(
     try:
         _pin_owner(paths, ensured)
         owner_pin_durable = True
-        observed = _service_status(paths)
+        # service-ensure already returned the authoritative owner.  Reusing
+        # the bounded published OWNER.json avoids a second read-only native
+        # CLI, which can time out on Docker Desktop's Windows-folder mount.
+        observed = _read_ready_owner(paths)
         if _owner_fingerprint(ensured) != _owner_fingerprint(observed):
             raise RuntimeServiceUnknown(
-                "runtime owner changed between service-ensure and service-status"
+                "runtime owner changed between service-ensure and startup observation"
             )
         _wait_for_api_liveness(
             port,
             api_identity,
             timeout=min(timeout, STARTUP_LIVENESS_GRACE_SECONDS),
+            handle=RuntimeHandle(paths, configuration, observed, port, api_identity),
         )
     except Exception as error:
         unknown = (
@@ -1565,7 +1590,9 @@ def stop(handle: RuntimeHandle, *, timeout: float = 30.0) -> dict[str, Any]:
     """Drain only the owner attached by start; never kill or take over."""
 
     _wait_api_closed(handle.api_port)
-    observed = _service_status(handle.paths)
+    # The authoritative drain command below validates this same pinned owner;
+    # avoid a second read-only native CLI before issuing it.
+    observed = _read_ready_owner(handle.paths)
     if _owner_fingerprint(observed) != _owner_fingerprint(handle.owner):
         raise RuntimeServiceUnknown(
             "runtime owner changed before shutdown; no drain request was sent"

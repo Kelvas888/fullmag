@@ -845,6 +845,35 @@ class DockerRuntimeContract(unittest.TestCase):
                 service.ensure_configuration(service.RuntimePaths())
             legacy.assert_not_called()
 
+    def test_windows_folder_cli_timeout_budgets_cover_bootstrap_and_status(self):
+        service = self.load_service()
+        paths = service.RuntimePaths()
+        bootstrap = {
+            "schema": "fullmag.docker-accepted-store-bootstrap.v1",
+            "store_root": str(paths.store),
+            "binding": "a" * 64,
+        }
+        with patch.object(service, "prepare_storage"), \
+                patch.object(service, "_run_cli", return_value=bootstrap) as cli:
+            service.initialize_accepted_store(paths)
+            self.assertEqual(
+                cli.call_args.kwargs["timeout"],
+                service.STORE_BOOTSTRAP_CLI_TIMEOUT_SECONDS,
+            )
+
+            status_result = {
+                "schema_version": "runtime_service_discovery.v1",
+                "status": "ready",
+                "owner": {"owner_token": "known", "children": []},
+            }
+            cli.reset_mock(return_value=True, side_effect=True)
+            cli.return_value = status_result
+            service._service_status(paths)
+            self.assertEqual(
+                cli.call_args.kwargs["timeout"],
+                service.SERVICE_STATUS_CLI_TIMEOUT_SECONDS,
+            )
+
     def test_service_shutdown_rejects_changed_owner_without_drain(self):
         service = self.load_service()
         owner = {"owner_token": "old", "children": [{"role": "compute", "pid": 3},
@@ -852,7 +881,7 @@ class DockerRuntimeContract(unittest.TestCase):
         changed = {**owner, "owner_token": "new"}
         handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081)
         with patch.object(service, "_wait_api_closed"), \
-                patch.object(service, "_service_status", return_value=changed), \
+                patch.object(service, "_read_ready_owner", return_value=changed), \
                 patch.object(service, "_run_cli") as cli:
             with self.assertRaises(service.RuntimeServiceUnknown):
                 service.stop(handle)
@@ -865,7 +894,7 @@ class DockerRuntimeContract(unittest.TestCase):
         terminal = {**owner, "children": [{**child, "status": "exited_success"} for child in owner["children"]]}
         handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081)
         with patch.object(service, "_wait_api_closed"), \
-                patch.object(service, "_service_status", return_value=owner), \
+                patch.object(service, "_read_ready_owner", return_value=owner), \
                 patch.object(service, "_pin_owner", return_value=Path("/state/pinned-owner.json")), \
                 patch.object(service, "_run_cli", return_value={"schema_version": "runtime_service_discovery.v1",
                              "status": "drained", "owner": terminal}) as cli:
@@ -882,18 +911,64 @@ class DockerRuntimeContract(unittest.TestCase):
                     "build_identity": {"git_commit": "commit"},
                     "runtime_store_binding": {"binding": "a" * 64}}
         owner = {"owner_token": "known", "children": [{"role": "compute", "pid": 3}]}
-        for failure_at in ("_pin_owner", "_service_status"):
+        for failure_at in ("_pin_owner", "_read_ready_owner"):
             with patch.object(service, "prepare_storage"), \
                     patch.object(service, "ensure_configuration", return_value={}), \
                     patch.object(service, "wait_for_api", return_value=identity), \
                     patch.object(service, "_run_cli", return_value={"schema_version": "runtime_service_discovery.v1",
                                  "status": "ready", "owner": owner}), \
-                    patch.object(service, "_pin_owner"), \
-                    patch.object(service, "_service_status", return_value=owner), \
-                    patch.object(service, failure_at, side_effect=OSError("lost observation")):
+                    patch.object(service, "_pin_owner") as pin, \
+                    patch.object(service, "_read_ready_owner", return_value=owner) as read, \
+                    patch.object(service, "_service_status") as status:
+                (pin if failure_at == "_pin_owner" else read).side_effect = OSError(
+                    "lost observation"
+                )
                 with self.assertRaises(Exception) as caught:
                     service.start(service.RuntimePaths(), expected_binding="a" * 64)
                 self.assertEqual(caught.exception.pinned_handle.owner, owner)
+                status.assert_not_called()
+
+    def test_start_uses_published_owner_without_readonly_status_cli(self):
+        service = self.load_service()
+        identity = {"api_instance_id": "instance", "api_contract_version": "1.0.0",
+                    "build_identity": {"git_commit": "commit"},
+                    "runtime_store_binding": {"binding": "a" * 64}}
+        owner = {"owner_token": "known", "children": [{"role": "compute", "pid": 3}]}
+        with patch.object(service, "prepare_storage"), \
+                patch.object(service, "ensure_configuration", return_value={}), \
+                patch.object(service, "wait_for_api", return_value=identity), \
+                patch.object(service, "_run_cli", return_value={"schema_version": "runtime_service_discovery.v1",
+                             "status": "ready", "owner": owner}), \
+                patch.object(service, "_pin_owner"), \
+                patch.object(service, "_read_ready_owner", return_value=owner) as read, \
+                patch.object(service, "_wait_for_api_liveness") as liveness, \
+                patch.object(service, "_service_status") as status:
+            handle = service.start(service.RuntimePaths(), expected_binding="a" * 64)
+        self.assertEqual(handle.owner, owner)
+        read.assert_called_once()
+        liveness.assert_called_once()
+        status.assert_not_called()
+
+    def test_start_rejects_owner_change_before_startup_liveness(self):
+        service = self.load_service()
+        identity = {"api_instance_id": "instance", "api_contract_version": "1.0.0",
+                    "build_identity": {"git_commit": "commit"},
+                    "runtime_store_binding": {"binding": "a" * 64}}
+        owner = {"owner_token": "known", "children": [{"role": "compute", "pid": 3}]}
+        changed = {**owner, "owner_token": "replaced"}
+        with patch.object(service, "prepare_storage"), \
+                patch.object(service, "ensure_configuration", return_value={}), \
+                patch.object(service, "wait_for_api", return_value=identity), \
+                patch.object(service, "_run_cli", return_value={"schema_version": "runtime_service_discovery.v1",
+                             "status": "ready", "owner": owner}), \
+                patch.object(service, "_pin_owner"), \
+                patch.object(service, "_read_ready_owner", return_value=changed), \
+                patch.object(service, "_wait_for_api_liveness") as liveness, \
+                patch.object(service, "_service_status") as status:
+            with self.assertRaisesRegex(service.RuntimeServiceUnknown, "owner changed"):
+                service.start(service.RuntimePaths(), expected_binding="a" * 64)
+        liveness.assert_not_called()
+        status.assert_not_called()
 
     def test_startup_liveness_grace_accepts_starting_then_ready(self):
         service = self.load_service()
@@ -918,6 +993,31 @@ class DockerRuntimeContract(unittest.TestCase):
             service._wait_for_api_liveness(8081, identity, timeout=1.0)
         self.assertEqual(probe.call_count, 2)
         sleep.assert_called_once()
+
+    def test_startup_liveness_retries_transient_only_with_pinned_owner(self):
+        service = self.load_service()
+        identity = {"api_instance_id": "instance", "api_contract_version": "1.0.0"}
+        owner = {"owner_token": "known", "children": [{"role": "compute", "pid": 3}]}
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
+        transient = service.RuntimeServiceNotReady(
+            configured=True,
+            state="observation_unknown",
+            reason_code="live_probe_failed",
+            reason_message="native control probe raced owner publication",
+            retryable=False,
+        )
+        with patch.object(service, "_probe_api_liveness",
+                          side_effect=[transient, None]) as probe, \
+                patch.object(service, "_assert_pinned_ready_owner") as owner_proof, \
+                patch.object(service, "_run_cli") as cli, \
+                patch.object(service.time, "sleep") as sleep:
+            service._wait_for_api_liveness(
+                8081, identity, timeout=1.0, handle=handle
+            )
+        self.assertEqual(probe.call_count, 2)
+        owner_proof.assert_called_once_with(handle)
+        sleep.assert_called_once()
+        cli.assert_not_called()
 
     def test_startup_liveness_grace_does_not_retry_identity_failure(self):
         service = self.load_service()
