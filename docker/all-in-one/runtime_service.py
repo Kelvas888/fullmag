@@ -1365,6 +1365,21 @@ def _service_status(paths: RuntimePaths) -> dict[str, Any]:
     return _owner_from_cli(result, "service-status")
 
 
+def _read_ready_owner(paths: RuntimePaths) -> dict[str, Any]:
+    """Read the already-published owner without starting another native CLI."""
+
+    owner = _read_json(
+        paths.store / "runtime-services" / "OWNER.json",
+        "runtime service owner",
+    )
+    if owner.get("schema_version") != "runtime_service_owner.v1":
+        _fail("runtime service owner schema is unsupported")
+    if owner.get("state") != "ready":
+        _fail("runtime service owner is not ready")
+    _owner_fingerprint(owner)
+    return owner
+
+
 def _owner_pin_path(paths: RuntimePaths, owner: Mapping[str, Any]) -> Path:
     token = owner.get("owner_token")
     if not isinstance(token, str) or not OWNER_TOKEN_RE.fullmatch(token):
@@ -1548,6 +1563,11 @@ def check(handle: RuntimeHandle, *, full_api_probe: bool = True) -> None:
         raise RuntimeServiceUnknown(
             "API identity or accepted-store binding changed during supervision"
         )
-    owner = _service_status(handle.paths)
+    try:
+        owner = _read_ready_owner(handle.paths)
+    except (RuntimeServiceError, OSError) as error:
+        raise RuntimeServiceUnknown(
+            f"runtime service owner observation failed during supervision: {error}"
+        ) from error
     if _owner_fingerprint(owner) != _owner_fingerprint(handle.owner):
         raise RuntimeServiceUnknown("runtime service owner changed during supervision")

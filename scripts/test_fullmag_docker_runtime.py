@@ -971,6 +971,85 @@ class DockerRuntimeContract(unittest.TestCase):
             with self.assertRaises(service.RuntimeServiceUnknown):
                 service.check(handle)
 
+    def test_supervision_reads_ready_owner_without_restarting_native_cli(self):
+        service = self.load_service()
+        identity = {
+            "api_instance_id": "instance",
+            "api_contract_version": "1.0.0",
+            "runtime_store_binding": {"binding": "a" * 64},
+        }
+        owner = {
+            "schema_version": "runtime_service_owner.v1",
+            "state": "ready",
+            "owner_token": "known",
+            "children": [
+                {"role": "compute", "pid": 3, "status": "running"},
+                {"role": "preparation", "pid": 4, "status": "running"},
+            ],
+        }
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
+        with patch.object(service, "_probe_api_liveness"), \
+                patch.object(service, "_read_json", return_value=owner) as read, \
+                patch.object(service, "_run_cli") as cli, \
+                patch.object(service, "_service_status") as status:
+            service.check(handle, full_api_probe=False)
+        read.assert_called_once()
+        self.assertTrue(str(read.call_args.args[0]).endswith("runtime-services/OWNER.json"))
+        cli.assert_not_called()
+        status.assert_not_called()
+
+    def test_supervision_rejects_changed_owner_without_native_cli(self):
+        service = self.load_service()
+        identity = {
+            "api_instance_id": "instance",
+            "api_contract_version": "1.0.0",
+            "runtime_store_binding": {"binding": "a" * 64},
+        }
+        owner = {
+            "schema_version": "runtime_service_owner.v1",
+            "state": "ready",
+            "owner_token": "known",
+            "children": [
+                {"role": "compute", "pid": 3, "status": "running"},
+                {"role": "preparation", "pid": 4, "status": "running"},
+            ],
+        }
+        changed = {**owner, "owner_token": "replaced"}
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
+        with patch.object(service, "_probe_api_liveness"), \
+                patch.object(service, "_read_json", return_value=changed), \
+                patch.object(service, "_run_cli") as cli, \
+                patch.object(service, "_service_status") as status:
+            with self.assertRaisesRegex(service.RuntimeServiceUnknown, "owner changed"):
+                service.check(handle, full_api_probe=False)
+        cli.assert_not_called()
+        status.assert_not_called()
+
+    def test_supervision_api_failure_is_fail_closed_before_owner_read(self):
+        service = self.load_service()
+        identity = {
+            "api_instance_id": "instance",
+            "api_contract_version": "1.0.0",
+            "runtime_store_binding": {"binding": "a" * 64},
+        }
+        owner = {
+            "schema_version": "runtime_service_owner.v1",
+            "state": "ready",
+            "owner_token": "known",
+            "children": [],
+        }
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
+        with patch.object(
+            service, "_probe_api_liveness", side_effect=service.RuntimeServiceError("API down")
+        ), patch.object(service, "_read_json") as read, \
+                patch.object(service, "_run_cli") as cli, \
+                patch.object(service, "_service_status") as status:
+            with self.assertRaises(service.RuntimeServiceUnknown):
+                service.check(handle, full_api_probe=False)
+        read.assert_not_called()
+        cli.assert_not_called()
+        status.assert_not_called()
+
     @unittest.skipIf(os.name == "nt", "Container metadata fsync/no-follow is tested on Linux")
     def test_service_config_preserves_existing_operator_profile(self):
         service = self.load_service()
