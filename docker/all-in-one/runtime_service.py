@@ -45,6 +45,14 @@ MAX_JSON_BYTES = 256 * 1024
 MAX_HTTP_BYTES = 4 * 1024 * 1024
 STARTUP_LIVENESS_GRACE_SECONDS = 10.0
 MAX_LIVENESS_REASON_BYTES = 2048
+RECOVERY_AUTHORIZATION_ENV = "FULLMAG_RUNTIME_RECOVERY_AUTHORIZATION"
+RECOVERY_AUTHORIZATION_SCHEMA = "fullmag.docker-runtime-recovery-authorization.v1"
+RECOVERY_REQUEST_SCHEMA = "runtime_service_recovery_request.v1"
+MAX_RECOVERY_AUTHORIZATION_BYTES = 512 * 1024
+MAX_RECOVERY_LOG_BYTES = 4 * 1024 * 1024
+MAX_RECOVERY_ARCHIVED_FILES = 32
+RECOVERY_MANDATORY_ARCHIVED_FILES = 12
+RECOVERY_ARCHIVED_CONFIGURATION_KEY = "configuration.json"
 GIB = 1024**3
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -52,6 +60,7 @@ UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 OWNER_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+STORE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 
 SERVICE_MODE_VARIABLES = (
     "FULLMAG_FDM_EXECUTION",
@@ -217,6 +226,129 @@ def _read_json(path: Path, name: str, maximum: int = MAX_JSON_BYTES) -> dict[str
     if not isinstance(value, dict):
         _fail(f"{name} must contain a JSON object")
     return value
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _read_recovery_authorization(paths: RuntimePaths, authorization_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read one host-pinned recovery authorization and its immutable request."""
+
+    authorization = _read_json(
+        authorization_path,
+        "runtime recovery authorization",
+        MAX_RECOVERY_AUTHORIZATION_BYTES,
+    )
+    if authorization.get("schema_version") != RECOVERY_AUTHORIZATION_SCHEMA:
+        _fail("runtime recovery authorization schema is unsupported")
+    request_path_value = authorization.get("native_request_path")
+    request_sha256 = authorization.get("native_request_sha256")
+    request_id = authorization.get("request_id")
+    if (
+        not isinstance(request_path_value, str)
+        or not request_path_value.startswith("/state/")
+        or "/../" in request_path_value
+        or not isinstance(request_sha256, str)
+        or HEX64.fullmatch(request_sha256) is None
+        or not isinstance(request_id, str)
+        or UUID_RE.fullmatch(request_id) is None
+    ):
+        _fail("runtime recovery authorization has an invalid native request pin")
+    request_path = _absolute(Path(request_path_value), "native recovery request")
+    try:
+        request_relative = request_path.relative_to(paths.state)
+    except ValueError:
+        _fail("native recovery request is outside the fixed /state root")
+    if request_path != paths.state / request_relative:
+        _fail("native recovery request is outside the fixed /state root")
+    request_raw = _bounded_regular(
+        request_path, "native recovery request", MAX_RECOVERY_AUTHORIZATION_BYTES
+    )
+    if _sha256_bytes(request_raw) != request_sha256:
+        _fail("native recovery request changed after host authorization")
+    try:
+        request = json.loads(request_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"native recovery request is not valid JSON: {error}")
+    if not isinstance(request, dict):
+        _fail("native recovery request must contain an object")
+    if request.get("schema_version") != RECOVERY_REQUEST_SCHEMA or request.get("request_id") != request_id:
+        _fail("native recovery request identity differs from host authorization")
+    config_raw = _bounded_regular(paths.config, "runtime service configuration")
+    config_sha256 = authorization.get("config_sha256")
+    if not isinstance(config_sha256, str) or HEX64.fullmatch(config_sha256) is None:
+        _fail("runtime recovery authorization has no configuration digest")
+    if _sha256_bytes(config_raw) != config_sha256 or request.get("config_sha256") != config_sha256:
+        _fail("runtime recovery configuration changed after host authorization")
+    owner_raw = _bounded_regular(
+        paths.store / "runtime-services" / "OWNER.json",
+        "runtime service owner",
+        MAX_RECOVERY_AUTHORIZATION_BYTES,
+    )
+    launch_raw = _bounded_regular(
+        paths.store / "runtime-services" / "LAUNCH.json",
+        "runtime service launch record",
+        MAX_RECOVERY_AUTHORIZATION_BYTES,
+    )
+    owner_sha256 = authorization.get("owner_sha256")
+    launch_sha256 = authorization.get("launch_sha256")
+    if (
+        not isinstance(owner_sha256, str)
+        or HEX64.fullmatch(owner_sha256) is None
+        or _sha256_bytes(owner_raw) != owner_sha256
+        or request.get("owner_sha256") != owner_sha256
+        or not isinstance(launch_sha256, str)
+        or HEX64.fullmatch(launch_sha256) is None
+        or _sha256_bytes(launch_raw) != launch_sha256
+        or request.get("launch_sha256") != launch_sha256
+    ):
+        _fail("native owner or launch record changed after host authorization")
+    expected_owner = request.get("expected_owner")
+    if not isinstance(expected_owner, dict):
+        _fail("native recovery request has no typed expected owner")
+    return authorization, request
+
+
+def recover_idle_failure(
+    paths: RuntimePaths | None = None,
+    *,
+    authorization_path: Path | None = None,
+    cli: Path | None = None,
+    timeout: float = 90.0,
+) -> dict[str, Any] | None:
+    """Recover exactly one failed native owner under an explicit host fence.
+
+    This operation never drains or starts a service.  The native command is
+    the sole owner of the locked ledger mutation (unknown/failed -> failed),
+    and its receipt is checked before configuration generation rotation.
+    """
+
+    paths = paths or canonical_paths()
+    if authorization_path is None:
+        configured = os.environ.get(RECOVERY_AUTHORIZATION_ENV)
+        if not configured:
+            return None
+        authorization_path = Path(configured)
+    authorization, request = _read_recovery_authorization(paths, Path(authorization_path))
+    result = _run_cli(
+        paths,
+        (
+            "runtime",
+            "service-recover",
+            "--config",
+            str(paths.config),
+            "--request",
+            str(authorization["native_request_path"]),
+            "--request-sha256",
+            str(authorization["native_request_sha256"]),
+        ),
+        timeout=timeout,
+        cli=cli,
+    )
+    if not isinstance(result, dict):
+        _fail("native runtime recovery returned a non-object")
+    return _validate_native_recovery_result(paths, authorization, result)
 
 
 def _validated_docker_host_id() -> str:
@@ -695,6 +827,175 @@ def _run_cli(
     if not isinstance(value, dict):
         _fail("runtime CLI must return a JSON object")
     return value
+
+
+def _recovery_relative_path(value: Any, name: str) -> PurePosixPath:
+    """Validate a Rust store-relative recovery path without host path rules."""
+
+    if not isinstance(value, str) or not value or value.startswith("/") or "\\" in value:
+        _fail(f"{name} must be a relative store path")
+    parsed = PurePosixPath(value)
+    if any(part in {"", ".", ".."} for part in parsed.parts) or parsed.is_absolute():
+        _fail(f"{name} contains parent or empty path components")
+    return parsed
+
+
+def _recovery_store_id(value: Any, name: str) -> str:
+    """Mirror the native portable store-id boundary for archive paths."""
+
+    if not isinstance(value, str) or STORE_ID_RE.fullmatch(value) is None:
+        _fail(f"{name} is not a native store identifier")
+    if value in {".", ".."} or value.endswith("."):
+        _fail(f"{name} is not a native store identifier")
+    stem = value.split(".", 1)[0].upper()
+    if stem in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} or (
+        len(stem) == 4 and stem[:3] in {"COM", "LPT"} and stem[3] in "123456789"
+    ):
+        _fail(f"{name} is a reserved native store identifier")
+    return value
+
+
+def _recovery_mandatory_sources(owner: Mapping[str, Any]) -> set[str]:
+    """Build the exact twelve-entry inventory emitted by the native helper."""
+
+    owner_token = _recovery_store_id(owner.get("owner_token"), "runtime recovery owner token")
+    compute_pool = _recovery_store_id(
+        owner.get("compute_pool_id"), "runtime recovery compute pool id"
+    )
+    preparation_pool = _recovery_store_id(
+        owner.get("preparation_pool_id"), "runtime recovery preparation pool id"
+    )
+    sources = {
+        "runtime-services/OWNER.json",
+        "runtime-services/OWNER.lock",
+        "runtime-services/LAUNCH.json",
+        "runtime-services/LAUNCH.lock",
+        "runtime-services/STARTUP-GATE.lock",
+        f"runtime-services/{owner_token}/compute.stdout.jsonl",
+        f"runtime-services/{owner_token}/preparation.stdout.jsonl",
+        f"scheduler_pools/{compute_pool}.resources.json",
+        f"scheduler_pools/{preparation_pool}.preparation-resources.json",
+        f"scheduler_pools/{compute_pool}.json",
+        f"scheduler_pools/{preparation_pool}.preparation.json",
+        RECOVERY_ARCHIVED_CONFIGURATION_KEY,
+    }
+    if len(sources) != RECOVERY_MANDATORY_ARCHIVED_FILES:
+        _fail("native runtime recovery archive inventory has duplicate mandatory paths")
+    return sources
+
+
+def _validate_native_recovery_result(
+    paths: RuntimePaths, authorization: Mapping[str, Any], result: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Validate the exact Rust recovery receipt and every archived source file."""
+
+    if (
+        result.get("schema_version") != "runtime_service_recovery.v1"
+        or result.get("status") != "recovered"
+        or result.get("outcome") != "failed"
+        or result.get("request_id") != authorization.get("request_id")
+        or result.get("request_sha256") != authorization.get("native_request_sha256")
+        or result.get("config_sha256") != authorization.get("config_sha256")
+        or result.get("owner_sha256_before") != authorization.get("owner_sha256")
+        or result.get("owner_state_after") != "failed"
+    ):
+        _fail("native runtime recovery receipt is incomplete or not a failed-owner recovery")
+    after = result.get("owner_sha256_after")
+    if not isinstance(after, str) or HEX64.fullmatch(after) is None \
+            or after == authorization.get("owner_sha256"):
+        _fail("native runtime recovery did not publish a new failed-owner descriptor")
+    archive_value = result.get("archived_evidence_path")
+    if not isinstance(archive_value, str):
+        _fail("native runtime recovery omitted its absolute archive manifest path")
+    archive_manifest = _absolute(Path(archive_value), "native recovery archive manifest")
+    try:
+        archive_manifest.relative_to(paths.state)
+    except ValueError:
+        _fail("native runtime recovery archive is outside the fixed state root")
+    expected_archive = paths.store / "runtime-services" / "recovery" / authorization[
+        "native_request_sha256"
+    ] / "archive" / "manifest.json"
+    if archive_manifest != expected_archive:
+        _fail("native runtime recovery archive is not bound to the request")
+    archived_sha = result.get("archived_evidence_sha256")
+    if not isinstance(archived_sha, str) or HEX64.fullmatch(archived_sha) is None:
+        _fail("native runtime recovery archive manifest digest is invalid")
+    manifest_bytes = _bounded_regular(
+        archive_manifest, "native recovery archive manifest", MAX_RECOVERY_AUTHORIZATION_BYTES
+    )
+    if _sha256_bytes(manifest_bytes) != archived_sha:
+        _fail("native runtime recovery archive manifest changed after publication")
+    try:
+        manifest = json.loads(
+            manifest_bytes.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"native runtime recovery archive manifest is not valid JSON: {error}")
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != "runtime_service_recovery_archive.v1"
+        or manifest.get("request_sha256") != authorization.get("native_request_sha256")
+        or manifest.get("config_sha256") != authorization.get("config_sha256")
+    ):
+        _fail("native runtime recovery archive manifest identity differs from the request")
+    archived = result.get("archived_files")
+    if (
+        not isinstance(archived, dict)
+        or len(archived) != RECOVERY_MANDATORY_ARCHIVED_FILES
+        or len(archived) > MAX_RECOVERY_ARCHIVED_FILES
+    ):
+        _fail("native runtime recovery archive inventory is incomplete")
+    if manifest.get("files") != archived:
+        _fail("native runtime recovery archive manifest inventory differs from the receipt")
+    current_owner_path = paths.store / "runtime-services" / "OWNER.json"
+    current_owner_raw = _bounded_regular(
+        current_owner_path, "native recovery current owner", MAX_JSON_BYTES
+    )
+    try:
+        current_owner = json.loads(
+            current_owner_raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"native recovery current owner is not valid JSON: {error}")
+    if not isinstance(current_owner, dict):
+        _fail("native recovery current owner must contain an object")
+    if set(archived) != _recovery_mandatory_sources(current_owner):
+        _fail("native runtime recovery archive inventory is missing or contains unexpected evidence")
+    owner_source = archived.get("runtime-services/OWNER.json")
+    if owner_source != authorization.get("owner_sha256"):
+        _fail("native runtime recovery archive does not pin the pre-recovery owner")
+    archive_root = archive_manifest.parent
+    _assert_no_links(archive_root, "native recovery archive")
+    if not archive_root.is_dir() or archive_root.is_symlink():
+        _fail("native runtime recovery archive is not a directory")
+    for source_value, expected_digest in archived.items():
+        source_relative = _recovery_relative_path(source_value, "native archived source path")
+        if not isinstance(expected_digest, str) or HEX64.fullmatch(expected_digest) is None:
+            _fail("native archived source digest is invalid")
+        maximum = (
+            MAX_RECOVERY_LOG_BYTES
+            if str(source_relative).endswith((".jsonl", ".log"))
+            else MAX_JSON_BYTES
+        )
+        archive_path = archive_root / source_relative.name
+        archive_bytes = _bounded_regular(archive_path, "native recovery archive evidence", maximum)
+        if _sha256_bytes(archive_bytes) != expected_digest:
+            _fail(f"native recovery archive evidence changed: {source_relative}")
+        if source_value == RECOVERY_ARCHIVED_CONFIGURATION_KEY:
+            if expected_digest != authorization.get("config_sha256"):
+                _fail("native recovery raw configuration archive digest is not pinned")
+            continue
+        source_path = paths.store.joinpath(*source_relative.parts)
+        source_bytes = _bounded_regular(source_path, "native recovery source evidence", maximum)
+        if source_value == "runtime-services/OWNER.json":
+            if _sha256_bytes(source_bytes) != after:
+                _fail("native recovery owner descriptor changed outside its pinned transition")
+        else:
+            if _sha256_bytes(source_bytes) != expected_digest:
+                _fail(f"native recovery source evidence changed: {source_relative}")
+            if archive_bytes != source_bytes:
+                _fail(f"native recovery archive evidence differs: {source_relative}")
+    return dict(result)
 
 
 def initialize_accepted_store(

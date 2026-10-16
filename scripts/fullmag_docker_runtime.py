@@ -255,7 +255,8 @@ def validate_workspace_environment(config):
 def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs=None,
                  inputs_path=None, package=None, provenance=None, toolchain_image=None,
                  project="fullmag-config-check", template=None, host_ledger=None,
-                 startup=None, frontend_cache=None, previous_config_sha256=None):
+                 startup=None, frontend_cache=None, previous_config_sha256=None,
+                 recovery=None):
     """Resolve the versioned Compose definition; do not generate service topology."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("A full immutable image ID is required")
@@ -305,6 +306,11 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
         overlay = startup.get("compose_overlay")
         if not isinstance(overlay, str) or not Path(overlay).is_file():
             raise ValueError("Startup script Compose overlay is missing")
+        definitions.extend(["-f", overlay])
+    if recovery is not None:
+        overlay = recovery.get("compose_overlay")
+        if not isinstance(overlay, str) or not Path(overlay).is_file():
+            raise ValueError("Runtime recovery Compose overlay is missing")
         definitions.extend(["-f", overlay])
     configured = json.loads(docker("compose", "--project-name", project,
                                    "--project-directory", str(repo), *definitions,
@@ -574,6 +580,32 @@ def _write_startup_overlay(path, authorization, *, include_source,
     storage.atomic_json(path, overlay)
 
 
+def _write_recovery_overlay(path, authorization_path):
+    """Expose one host-pinned recovery authorization read-only to backend only."""
+
+    authorization_path = Path(authorization_path)
+    if (authorization_path.is_symlink() or not authorization_path.is_file()
+            or not authorization_path.is_absolute()):
+        raise ValueError("Runtime recovery authorization must be an absolute regular file")
+    storage.atomic_json(path, {
+        "services": {
+            "backend": {
+                "environment": {
+                    "FULLMAG_RUNTIME_RECOVERY_AUTHORIZATION":
+                    "/run/fullmag/runtime-recovery-authorization.json",
+                },
+                "volumes": [{
+                    "type": "bind",
+                    "source": str(authorization_path.resolve()),
+                    "target": "/run/fullmag/runtime-recovery-authorization.json",
+                    "read_only": True,
+                    "bind": {"create_host_path": False},
+                }],
+            }
+        }
+    })
+
+
 _STARTUP_HELPERS = ("docker_startup_script.py", "fullmag_storage.py")
 _STARTUP_HELPER_MODULES = {
     "docker_startup_script.py": "docker_startup_script",
@@ -811,16 +843,35 @@ def _validate_reuse_container(document, *, container_id, project, service, image
         raise ValueError(f"Reused {service} container state mount changed")
 
 
-def _validate_reuse_containers(reuse, *, project, frontend):
+def _validate_reuse_containers(reuse, *, project, frontend, retained_container_ids=None):
     """Prove stopped owned services and quiescent state mounts before mutation."""
     receipt = reuse["receipt"]
     image = receipt.get("image_id")
     if not isinstance(image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("Reused Docker receipt has no immutable image ID")
     backend_id = receipt.get("container_id")
-    if backend_id is None:
-        raise ValueError("Reused Docker receipt has no backend container ID")
-    backend = _container_inspect(backend_id)
+    frontend_id = receipt.get("frontend_container_id")
+    documents = {}
+    if retained_container_ids is not None:
+        if frontend != "dev":
+            raise ValueError("Failed retained recovery requires the two-service development run")
+        for retained_id in retained_container_ids:
+            document = _container_inspect(retained_id)
+            labels = document.get("Config", {}).get("Labels")
+            service = labels.get("com.docker.compose.service") if isinstance(labels, dict) else None
+            if service not in {"backend", "frontend"} or service in documents:
+                raise ValueError("Failed retained container service identity is ambiguous")
+            if labels.get("com.docker.compose.project") != project:
+                raise ValueError("Failed retained container Compose ownership changed")
+            documents[service] = (retained_id, document)
+        if set(documents) != {"backend", "frontend"}:
+            raise ValueError("Failed retained run does not contain exactly backend and frontend")
+        backend_id, backend = documents["backend"]
+        frontend_id, frontend_document = documents["frontend"]
+    else:
+        if backend_id is None:
+            raise ValueError("Reused Docker receipt has no backend container ID")
+        backend = _container_inspect(backend_id)
     _validate_reuse_container(
         backend,
         container_id=backend_id,
@@ -830,10 +881,10 @@ def _validate_reuse_containers(reuse, *, project, frontend):
         state=reuse["state"],
     )
     if frontend == "dev":
-        frontend_id = receipt.get("frontend_container_id")
         if frontend_id is None:
             raise ValueError("Reused Docker receipt has no frontend container ID")
-        frontend_document = _container_inspect(frontend_id)
+        if retained_container_ids is None:
+            frontend_document = _container_inspect(frontend_id)
         _validate_reuse_container(
             frontend_document,
             container_id=frontend_id,
@@ -858,9 +909,30 @@ def _validate_reuse_containers(reuse, *, project, frontend):
                 raise ValueError("A running container still mounts the reused session state")
 
 
+def _validate_failed_retained_receipt(receipt, *, allow):
+    """Admit the failed retained state only for an explicit recovery fence."""
+
+    if receipt.get("state") != "failed_resources_retained":
+        return
+    if not allow:
+        raise ValueError("Failed retained run requires --recover-idle-failure authorization")
+    retained = receipt.get("retained_container_ids")
+    if (not isinstance(retained, list) or len(retained) != 2
+            or len(set(retained)) != 2
+            or any(not isinstance(value, str) or not _CONTAINER_ID_RE.fullmatch(value)
+                   for value in retained)):
+        raise ValueError("Failed retained run has no exact two-container retention proof")
+    declared = {receipt.get("container_id"), receipt.get("frontend_container_id")}
+    if None in declared and declared != {None}:
+        raise ValueError("Failed retained run has only a partial service container declaration")
+    if None not in declared and declared != set(retained):
+        raise ValueError("Failed retained run container IDs disagree with retention proof")
+
+
 def _load_reuse_run(layout, run_receipt, *, project_name, frontend,
-                    previous_config_sha256=None):
-    """Validate one explicitly named stopped run before reusing its state."""
+                    previous_config_sha256=None,
+                    allow_failed_resources_retained=False):
+    """Validate one explicitly named run before reuse or fenced recovery."""
     if run_receipt is None:
         return None
     runs_root = storage.validate_path(
@@ -878,8 +950,17 @@ def _load_reuse_run(layout, run_receipt, *, project_name, frontend,
     receipt = _read_reuse_json(receipt_path, "Docker runtime run receipt")
     if receipt.get("schema") != "fullmag.docker-all-run.v1":
         raise ValueError("Docker runtime run receipt has an unsupported schema")
-    if receipt.get("state") not in {"running", "stopped"}:
+    receipt_state = receipt.get("state")
+    allowed_states = {"running", "stopped"}
+    if allow_failed_resources_retained:
+        allowed_states.add("failed_resources_retained")
+    if receipt_state not in allowed_states:
+        if receipt_state == "failed_resources_retained":
+            _validate_failed_retained_receipt(receipt, allow=False)
         raise ValueError("--run-receipt must reference a running or gracefully stopped run")
+    _validate_failed_retained_receipt(
+        receipt, allow=allow_failed_resources_retained
+    )
     project = receipt.get("compose_project")
     if (not isinstance(project, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project)
             or project_name is not None and project != project_name):
@@ -951,6 +1032,10 @@ def _load_reuse_run(layout, run_receipt, *, project_name, frontend,
         {"receipt": receipt, "state": state},
         project=project,
         frontend=frontend,
+        retained_container_ids=(
+            receipt.get("retained_container_ids")
+            if receipt_state == "failed_resources_retained" else None
+        ),
     )
     if digest(receipt_path) != receipt_sha256:
         raise ValueError("Reused Docker run receipt changed during admission")
@@ -983,7 +1068,7 @@ def _preserve_reuse_evidence(reuse):
     history.mkdir(parents=True, exist_ok=False)
     relative_paths = [
         Path("receipt.json"), Path("compose.json"), Path("compose.source.yaml"),
-        Path("windows-folder-host.json"), Path("host-ledger-adapter-receipt.json"),
+        Path("windows-folder-host.json"),
         Path("frontend-cache-receipt.json"), Path("development-inputs.json"),
         Path("development-inputs-host.json"), Path("startup-provenance.json"),
         Path("compose.startup.json"), Path("state/.fullmag-windows-folder-owner.json"),
@@ -1200,7 +1285,8 @@ def _reuse_host_certificate(reuse, assembly, engine_id):
 
 def start(repo, assembly_receipt, port, frontend="static", source_root=None,
           startup_script=None, *, project_name=None, compose_template=None,
-          run_receipt=None, previous_config_sha256=None):
+          run_receipt=None, previous_config_sha256=None,
+          recovery_authorization=None):
     if project_name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project_name):
         raise ValueError("Invalid Compose project name")
     if not 1024 <= port <= 65535:
@@ -1214,11 +1300,36 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         project_name=project_name,
         frontend=frontend,
         previous_config_sha256=previous_config_sha256,
+        allow_failed_resources_retained=recovery_authorization is not None,
     )
     if run_receipt is not None and previous_config_sha256 is None:
         raise ValueError("--run-receipt reuse requires --previous-config-sha256")
     if previous_config_sha256 is not None and reuse is None:
         raise ValueError("Previous runtime configuration digest requires --run-receipt reuse")
+    recovery_info = None
+    if recovery_authorization is not None:
+        if reuse is None:
+            raise ValueError("--recover-idle-failure requires --run-receipt reuse")
+        if previous_config_sha256 is None:
+            raise ValueError("--recover-idle-failure requires --previous-config-sha256")
+        from docker_runtime_recovery import (
+            mount_attestation_path_for_receipt,
+            validate_authorization,
+        )
+
+        recovery_info = validate_authorization(
+            Path(recovery_authorization),
+            run_receipt_path=reuse["receipt_path"],
+            run_receipt=reuse["receipt"],
+            state_root=reuse["state"],
+            config_path=reuse["state"] / RUNTIME_CONFIG_RELATIVE,
+            host_certificate_path=reuse["host_certificate"],
+            mount_attestation_path=mount_attestation_path_for_receipt(
+                reuse["root"], reuse["receipt"]
+            ),
+        )
+        if recovery_info["authorization"].get("config_sha256") != previous_config_sha256:
+            raise ValueError("Recovery authorization configuration pin differs from --previous-config-sha256")
     if reuse is not None:
         if source_root is None:
             source_root = reuse["source_root"]
@@ -1275,6 +1386,12 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         metadata_root = root
     else:
         _preserve_reuse_evidence(reuse)
+        if recovery_info is not None:
+            from docker_runtime_recovery import validate_preserved_evidence
+
+            recovery_info["preserved_evidence"] = validate_preserved_evidence(
+                recovery_info, reuse["history_root"]
+            )
         root = reuse["root"]
         state = reuse["state"]
         metadata_root = reuse["metadata_root"]
@@ -1302,7 +1419,28 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
     host_ledger = None
     frontend_cache = None
     startup = None
+    recovery = None
     inputs_path = metadata_root / "development-inputs.json"
+    if recovery_info is not None:
+        recovery_overlay = metadata_root / "compose.recovery.json"
+        _write_recovery_overlay(recovery_overlay, recovery_info["path"])
+        recovery = {
+            "authorization": recovery_info["authorization"],
+            "authorization_path": str(recovery_info["path"]),
+            "authorization_sha256": recovery_info["authorization_sha256"],
+            "request_sha256": recovery_info["request_sha256"],
+            "compose_overlay": str(recovery_overlay),
+        }
+        receipt["runtime_recovery"] = {
+            "schema": "fullmag.docker-runtime-recovery-authorization.v1",
+            "authorization": str(recovery_info["path"]),
+            "authorization_sha256": recovery_info["authorization_sha256"],
+            "request_id": recovery_info["request_id"],
+            "request_sha256": recovery_info["request_sha256"],
+            "preserved_evidence": recovery_info.get("preserved_evidence", {}),
+            "state": "pending_native_recovery",
+        }
+        storage.atomic_json(root / "receipt.json", receipt)
     try:
         args = ["compose", "-f", str(spec), "--project-name", project]
         if frontend == "dev":
@@ -1419,7 +1557,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                                 provenance=assembly_receipt, project=project,
                                 toolchain_image=assembly.get("base_image"), template=compose_source_path,
                                 host_ledger=host_ledger, startup=startup,
-                                frontend_cache=frontend_cache,
+                                frontend_cache=frontend_cache, recovery=recovery,
                                 previous_config_sha256=previous_config_sha256)
         if os.name != "nt":
             raise ValueError("This Windows-folder launcher requires native Windows host attestation")
@@ -1471,9 +1609,34 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         if certificate is None:
             certificate = attest(state, assembly, engine_id, assembly["binary_hashes"])
         publish_evidence(host_certificate, certificate)
+        if recovery_info is not None:
+            from docker_runtime_recovery import validate_postrotation_identity
+
+            if not isinstance(host_ledger, dict) or not isinstance(host_ledger.get("receipt"), str):
+                raise ValueError("Fresh host-ledger preparation omitted its receipt path")
+            postrotation = validate_postrotation_identity(
+                recovery_info,
+                history_root=reuse["history_root"],
+                current_host_certificate_path=host_certificate,
+                current_mount_attestation_path=Path(host_ledger["receipt"]),
+                binding_path=metadata_root / "recovery-postrotation-binding.json",
+            )
+            recovery_info["postrotation_binding"] = postrotation
+            receipt["runtime_recovery"].update(
+                postrotation_binding_path=postrotation["path"],
+                postrotation_binding_sha256=postrotation["sha256"],
+            )
+            storage.atomic_json(root / "receipt.json", receipt)
         receipt["compose_source"] = str(compose_source_path)
         receipt["compose_source_sha256"] = digest(compose_source_path)
         configured = configured_spec()
+        if recovery_info is not None:
+            if digest(recovery_info["path"]) != recovery_info["authorization_sha256"]:
+                raise ValueError("Runtime recovery authorization changed before Compose publication")
+            binding = recovery_info.get("postrotation_binding")
+            if (not isinstance(binding, dict) or not isinstance(binding.get("path"), str)
+                    or digest(Path(binding["path"])) != binding.get("sha256")):
+                raise ValueError("Post-rotation storage identity binding changed before Compose publication")
         probe_service = configured["services"]["backend"]
         probe_service["command"] = ["--storage-probe"]
         probe_service["healthcheck"] = {"disable": True}
@@ -1507,6 +1670,13 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         publish_evidence(host_certificate, certificate)
         receipt["storage_operational_checks"] = probe["checks"]
         receipt["storage_power_loss"] = "NOT VERIFIED"
+        if recovery_info is not None:
+            if digest(recovery_info["path"]) != recovery_info["authorization_sha256"]:
+                raise ValueError("Runtime recovery authorization changed before service startup")
+            binding = recovery_info.get("postrotation_binding")
+            if (not isinstance(binding, dict) or not isinstance(binding.get("path"), str)
+                    or digest(Path(binding["path"])) != binding.get("sha256")):
+                raise ValueError("Post-rotation storage identity binding changed before service startup")
         storage.atomic_json(spec, configured_spec())
         ready_timeout, docker_client_timeout = _runtime_ready_timeouts(inputs, startup)
         docker(*args, "up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout",
@@ -1567,6 +1737,28 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 if (len(bound) != 1 or bound[0]["Type"] != "bind" or bound[0]["RW"]
                         or host_path(bound[0]["Source"]) != source):
                     raise ValueError("Development readonly bind differs: " + destination)
+        if recovery is not None:
+            recovery_env = dict(
+                value.split("=", 1)
+                for value in actual["Config"].get("Env", [])
+                if "=" in value
+            )
+            if recovery_env.get("FULLMAG_RUNTIME_RECOVERY_AUTHORIZATION") != \
+                    "/run/fullmag/runtime-recovery-authorization.json":
+                raise ValueError("Runtime recovery authorization environment was not pinned")
+            recovery_mounts = [
+                mount for mount in actual["Mounts"]
+                if mount.get("Destination") == "/run/fullmag/runtime-recovery-authorization.json"
+            ]
+            if (
+                len(recovery_mounts) != 1
+                or recovery_mounts[0].get("Type") != "bind"
+                or recovery_mounts[0].get("RW")
+                or host_path(recovery_mounts[0].get("Source"))
+                != Path(recovery["authorization_path"]).resolve()
+            ):
+                raise ValueError("Runtime recovery authorization mount is not readonly and pinned")
+            receipt["runtime_recovery"].update(state="mounted_readonly")
         if startup is not None:
             startup_mounts = [m for m in actual["Mounts"]
                               if m["Destination"] == "/run/fullmag/startup-provenance.json"]
@@ -1614,6 +1806,58 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             startup_helper=startup_helper if startup is not None else None,
             timeout=ready_timeout,
         )
+        if recovery is not None:
+            native_recovery = process_tree_receipt.get("runtime_recovery")
+            if (
+                not isinstance(native_recovery, dict)
+                or native_recovery.get("schema_version")
+                != "runtime_service_recovery.v1"
+                or native_recovery.get("status") != "recovered"
+                or native_recovery.get("request_id")
+                != recovery["authorization"].get("request_id")
+                or native_recovery.get("request_sha256")
+                != recovery["authorization"].get("native_request_sha256")
+            ):
+                raise ValueError("Backend did not publish the pinned native recovery receipt")
+            receipt["runtime_recovery"].update(
+                state="recovered",
+                native_receipt=native_recovery,
+            )
+            # The recovery overlay is a one-shot authorization.  Keep its
+            # immutable file and receipt evidence, but publish the ordinary
+            # Compose definition before this run can be restarted.  A stale
+            # manually reintroduced overlay then still fails the native owner
+            # SHA fence instead of replaying a takeover.
+            normal_configured = compose_spec(
+                image, state.resolve(), port, host_certificate.resolve(),
+                repo=repo, inputs=inputs, inputs_path=inputs_path.resolve(),
+                package=assembly.get("package_root"), provenance=assembly_receipt,
+                project=project, toolchain_image=assembly.get("base_image"),
+                template=compose_source_path, host_ledger=host_ledger,
+                startup=startup, frontend_cache=frontend_cache,
+                recovery=None, previous_config_sha256=previous_config_sha256,
+            )
+            normal_backend_environment = normal_configured.get("services", {}).get(
+                "backend", {}
+            ).get("environment", {})
+            if "FULLMAG_RUNTIME_RECOVERY_AUTHORIZATION" in normal_backend_environment:
+                raise ValueError("Consumed recovery Compose definition still contains its authorization")
+            consumed_path = metadata_root / "runtime-recovery-consumed.json"
+            storage.atomic_json(consumed_path, {
+                "schema": "fullmag.docker-runtime-recovery-consumed.v1",
+                "authorization_sha256": recovery["authorization_sha256"],
+                "request_sha256": recovery["request_sha256"],
+                "native_after_owner_sha256": native_recovery["owner_sha256_after"],
+                "previous_config_sha256": previous_config_sha256,
+            })
+            storage.atomic_json(spec, normal_configured)
+            receipt["runtime_recovery"].update(
+                state="consumed",
+                consumed_authorization_sha256=recovery["authorization_sha256"],
+                consumption_receipt=str(consumed_path),
+                consumption_receipt_sha256=digest(consumed_path),
+            )
+            recovery = None
         receipt["process_tree_receipt"] = str(_startup_process_receipt_path(state))
         receipt["process_tree_receipt_sha256"] = digest(_startup_process_receipt_path(state))
         if startup is not None:
@@ -1666,6 +1910,8 @@ if __name__ == "__main__":
                         help="explicit prior run receipt whose state is reused")
     launch.add_argument("--previous-config-sha256",
                         help="exact raw hash of the prior runtime service config for CAS rotation")
+    launch.add_argument("--recover-idle-failure", type=Path,
+                        help="explicit host authorization for one stopped failed native owner")
     args = parser.parse_args()
     if args.action == "submit":
         submit_build(args.repo_root.resolve(), args.commit)
@@ -1678,4 +1924,5 @@ if __name__ == "__main__":
         start(args.repo_root.resolve(), args.assembly_receipt, args.port, args.frontend,
               args.source_root, args.startup_script,
               run_receipt=args.run_receipt,
-              previous_config_sha256=args.previous_config_sha256)
+              previous_config_sha256=args.previous_config_sha256,
+              recovery_authorization=args.recover_idle_failure)

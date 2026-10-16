@@ -97,6 +97,10 @@ def serve():
         signal.signal(number, lambda *_: stopping.set())
     paths = service.prepare_storage()
     bootstrap = service.initialize_accepted_store(paths)
+    # An explicit host authorization is the only route that may transition a
+    # stale failed owner.  It must complete before configuration generation
+    # rotation; ordinary startup never invokes this path.
+    runtime_recovery = service.recover_idle_failure(paths)
     configuration = service.ensure_configuration(paths)
     print("[fullmag-backend] Starting API and runtime service", flush=True)
     api = subprocess.Popen(["/opt/fullmag/package/bin/fullmag-api"],
@@ -105,6 +109,8 @@ def serve():
     receipt = {"schema": "fullmag.docker-process-tree.v1", "state": "starting",
                "api_pid": api.pid, "accepted_store": str(paths.store),
                "bootstrap": bootstrap, "qualification": "NOT VERIFIED"}
+    if runtime_recovery is not None:
+        receipt["runtime_recovery"] = runtime_recovery
     receipt_path = paths.state_root / "runtime-service/process-tree.json"
     result = 1
     last_full_api_probe = 0.0

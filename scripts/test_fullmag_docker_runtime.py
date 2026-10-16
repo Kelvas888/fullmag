@@ -64,7 +64,7 @@ class DockerRuntimeContract(unittest.TestCase):
         self.assertEqual(frontend["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(frontend["ports"][0]["target"], 8080)
         self.assertEqual(frontend["environment"]["FULLMAG_API_PROXY_TARGET"], "http://backend:8081")
-        self.assertEqual(frontend["depends_on"]["backend"]["condition"], "service_healthy")
+        self.assertEqual(frontend["depends_on"]["backend"]["condition"], "service_started")
         self.assertEqual([m["target"] for m in frontend["volumes"] if not m.get("read_only")],
                          ["/state/development"])
         self.assertNotIn("/state", [m["target"] for m in frontend["volumes"]])
@@ -113,6 +113,11 @@ class DockerRuntimeContract(unittest.TestCase):
         repository = Path(__file__).resolve().parents[1]
         dev_compose = (repository / "compose.dev.yaml").read_text(encoding="utf-8")
         frontend_block = dev_compose.split("\n  frontend:\n", 1)[1]
+        backend_block = dev_compose.split("\n  backend:\n", 1)[1].split("\n  frontend:\n", 1)[0]
+        self.assertRegex(frontend_block, r"(?m)^      backend: \{condition: service_started\}$")
+        self.assertNotIn("service_healthy", frontend_block)
+        self.assertIn("FULLMAG_API_PROXY_TARGET: http://backend:8081", frontend_block)
+        self.assertNotRegex(backend_block, r"(?m)^    ports:")
         health = re.search(r"(?m)^      start_period: (?P<seconds>[0-9]+)s$", frontend_block)
         self.assertIsNotNone(health)
         self.assertEqual(int(health.group("seconds")), runtime.FRONTEND_DEV_READY_TIMEOUT_SECONDS)

@@ -72,7 +72,9 @@ services:
     security_opt: ["no-new-privileges:true"]
     stop_grace_period: 60s
     depends_on:
-      backend: {condition: service_healthy}
+      # The shell must remain reachable while backend admission is closed or
+      # its health probe is failing; API requests still use the private proxy.
+      backend: {condition: service_started}
     environment:
       FULLMAG_DOCKER_ROLE: frontend
       FULLMAG_DOCKER_FRONTEND: dev

@@ -1493,18 +1493,19 @@ def recreate(args: argparse.Namespace) -> None:
     # No build or latest-run lookup is allowed here.  The runtime validates the
     # receipt, owner marker, source checkout, config CAS and package receipt
     # before it mutates the explicitly named run namespace.
-    start(
-        repo,
-        args.assembly_receipt,
-        args.port,
-        frontend="dev",
-        source_root=args.source_root,
-        startup_script=args.script,
-        project_name=PROJECT_NAME,
-        compose_template=repo / COMPOSE_RUNTIME_FILE,
-        run_receipt=args.run_receipt,
-        previous_config_sha256=args.previous_config_sha256,
-    )
+    start_kwargs = {
+        "frontend": "dev",
+        "source_root": args.source_root,
+        "startup_script": args.script,
+        "project_name": PROJECT_NAME,
+        "compose_template": repo / COMPOSE_RUNTIME_FILE,
+        "run_receipt": args.run_receipt,
+        "previous_config_sha256": args.previous_config_sha256,
+    }
+    recovery_authorization = getattr(args, "recover_idle_failure", None)
+    if recovery_authorization is not None:
+        start_kwargs["recovery_authorization"] = recovery_authorization
+    start(repo, args.assembly_receipt, args.port, **start_kwargs)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1546,6 +1547,13 @@ def _parser() -> argparse.ArgumentParser:
     recreate_parser.add_argument(
         "--previous-config-sha256", required=True,
         help="exact raw SHA-256 of the prior runtime service config",
+    )
+    recreate_parser.add_argument(
+        "--recover-idle-failure", type=Path,
+        help=(
+            "explicit host authorization for one stopped failed native owner; "
+            "without this flag recovery/takeover is never attempted"
+        ),
     )
     recreate_parser.add_argument(
         "--source-root", type=Path,
