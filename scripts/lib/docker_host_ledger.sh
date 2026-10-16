@@ -374,7 +374,7 @@ if os.path.lexists(path):
     raise SystemExit("owner marker already exists")
 fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
 try:
-    os.write(fd, (payload + "\\n").encode("utf-8"))
+    os.write(fd, (payload + "\n").encode("utf-8"))
     os.fsync(fd)
 finally:
     os.close(fd)
