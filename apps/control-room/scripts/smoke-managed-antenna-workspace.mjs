@@ -337,6 +337,9 @@ try {
   assert.ok(websockets.some(url => url.startsWith(target.api_base.replace("http:", "ws:"))), "Realtime must use the admitted API");
   assert.ok(writes.length >= 3 && writes.length <= 10);
   for (const write of [...writes, ...visualizationAcks]) { assert.equal(write.instance, target.api_instance); assert.equal(write.scope, scope); assert.ok(!write.path.includes("/simulation/"), "Authoring smoke must not execute a solver"); }
+  assert.ok(Date.now() - Date.parse(startedAt) > 5000, "The scenario must outlive the adoption timeout");
+  assert.deepEqual(visualizationAcks.filter(ack => ack.body.status === "failed"), [], "No nonexistent-buffer adoption may fail during empty/nonmagnetic authoring");
+  checks.push({ name: "Empty and nonmagnetic antenna authoring outlives the adoption timeout without a fabricated failed data ACK", passed: true, visualizationAcks });
   assert.deepEqual(pageErrors, []); assert.deepEqual(consoleErrors, []);
   assert.deepEqual(httpErrors.filter(error => error.status >= 500), []);
   checks.push({ name: "real workspace has healthy WebGL, correctly routed realtime and scoped writes without solver execution", passed: true, webgl });
