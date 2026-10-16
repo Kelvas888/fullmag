@@ -5,6 +5,7 @@ import type { CpuTelemetryResource, GpuTelemetryResource } from "@/kernel/api/ap
 import {
   computeFromTelemetry,
   isTelemetrySampleStale,
+  isTelemetrySampleStaleByAge,
 } from "./computeTelemetry";
 
 const cpuTelemetry = (sampledAt: number): CpuTelemetryResource => ({
@@ -49,5 +50,26 @@ describe("compute telemetry freshness", () => {
 
   it("does not treat a future-dated sample as current", () => {
     expect(isTelemetrySampleStale(60_001, 60_000)).toBe(true);
+  });
+
+  it("ages retained runtime telemetry from receipt regardless of server clock direction", () => {
+    const browserWallClockMs = 1_000_000;
+    const serverSampleTimes = [
+      browserWallClockMs + 5 * 60_000,
+      browserWallClockMs - 5 * 60_000,
+    ];
+
+    for (const serverSampleTime of serverSampleTimes) {
+      expect(
+        isTelemetrySampleStaleByAge(5_000, serverSampleTime),
+        `server sample ${serverSampleTime}`,
+      ).toBe(false);
+      expect(
+        isTelemetrySampleStaleByAge(30_001, serverSampleTime),
+        `server sample ${serverSampleTime}`,
+      ).toBe(true);
+    }
+
+    expect(isTelemetrySampleStaleByAge(5_000, 0)).toBe(true);
   });
 });

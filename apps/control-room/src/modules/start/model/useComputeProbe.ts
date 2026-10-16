@@ -16,6 +16,7 @@ import {
   computeFromTelemetry,
   describeRuntimeLanes,
   isTelemetrySampleStale,
+  isTelemetrySampleStaleByAge,
 } from "./computeTelemetry";
 import {
   parseComputeNodePolicyResource,
@@ -29,6 +30,27 @@ function monotonicNow(): number {
   return typeof performance === "undefined" ? 0 : performance.now();
 }
 
+interface ResourceReceipt<TData> {
+  readonly data: TData | null;
+  readonly receivedAt: number;
+}
+
+function resourceReceipt<TData>(data: TData | null): ResourceReceipt<TData> {
+  return {
+    data,
+    receivedAt: data == null ? 0 : monotonicNow(),
+  };
+}
+
+function elapsedSinceResourceReceipt<TData>(
+  receipt: ResourceReceipt<TData>,
+  data: TData | null,
+  now: number | undefined,
+): number {
+  if (receipt.data !== data || receipt.data == null || now === undefined) return 0;
+  return Math.max(0, now - receipt.receivedAt);
+}
+
 /** One owner for the rail, settings, templates and project compatibility checks. */
 export function useComputeProbe(): ComputeProbeController {
   const { api } = useKernel();
@@ -40,24 +62,38 @@ export function useComputeProbe(): ComputeProbeController {
   const nodeInventoryStatus = nodeInventoryResource.status;
   const nodeInventoryRefreshError = nodeInventoryResource.refreshError;
   const [freshnessNow, setFreshnessNow] = useState<number | undefined>(undefined);
-  const [nodeInventoryClockNow, setNodeInventoryClockNow] = useState<number | undefined>(undefined);
+  const [resourceClockNow, setResourceClockNow] = useState<number | undefined>(undefined);
   // `collected_at` belongs to the server's wall clock. Anchor each response
   // by data identity in the browser's monotonic clock, without extending the
   // shared resource result or introducing another cache. The timestamp is a
   // read performed only when the resource identity changes.
   const nodeInventoryReceipt = useMemo(
-    () => ({
-      data: nodeInventoryData,
-      receivedAt: nodeInventoryData === null ? 0 : monotonicNow(),
-    }),
+    () => resourceReceipt(nodeInventoryData),
     [nodeInventoryData],
   );
-  const nodeInventoryReceivedAt = nodeInventoryReceipt.data === nodeInventoryData
-    ? nodeInventoryReceipt.receivedAt
-    : null;
-  const nodeInventoryElapsedMs = nodeInventoryReceivedAt === null || nodeInventoryClockNow === undefined
-    ? 0
-    : Math.max(0, nodeInventoryClockNow - nodeInventoryReceivedAt);
+  const nodeInventoryElapsedMs = elapsedSinceResourceReceipt(
+    nodeInventoryReceipt,
+    nodeInventoryData,
+    resourceClockNow,
+  );
+  const cpuTelemetryReceipt = useMemo(
+    () => resourceReceipt(cpu.data),
+    [cpu.data],
+  );
+  const gpuTelemetryReceipt = useMemo(
+    () => resourceReceipt(gpu.data),
+    [gpu.data],
+  );
+  const cpuTelemetryElapsedMs = elapsedSinceResourceReceipt(
+    cpuTelemetryReceipt,
+    cpu.data,
+    resourceClockNow,
+  );
+  const gpuTelemetryElapsedMs = elapsedSinceResourceReceipt(
+    gpuTelemetryReceipt,
+    gpu.data,
+    resourceClockNow,
+  );
   const nodeInventory = useMemo(
     () => summarizeComputeNodeInventory({
       data: nodeInventoryData,
@@ -146,7 +182,7 @@ export function useComputeProbe(): ComputeProbeController {
   }, [api, refetchNodeInventory]);
   const refresh = useCallback(() => {
     setFreshnessNow(Date.now());
-    setNodeInventoryClockNow(monotonicNow());
+    setResourceClockNow(monotonicNow());
     refetchCpu();
     refetchGpu();
     refetchCapabilities();
@@ -159,7 +195,7 @@ export function useComputeProbe(): ComputeProbeController {
     const sample = () => {
       if (document.hidden) return;
       setFreshnessNow(Date.now());
-      setNodeInventoryClockNow(monotonicNow());
+      setResourceClockNow(monotonicNow());
       if (cpu.data?.status === "available" && cpu.status === "ready") refetchCpu();
       if (gpu.data?.status === "available" && gpu.status === "ready") refetchGpu();
       refetchNodeInventory();
@@ -199,14 +235,18 @@ export function useComputeProbe(): ComputeProbeController {
   const resources = [cpu, gpu, capabilities];
   const usingDesktop = needsDesktop && Boolean(desktop);
   const observedResources = usingDesktop ? [capabilities] : resources;
-  const sampleTimes = usingDesktop
-    ? [desktop?.sampledAt]
+  const staleByAge = usingDesktop
+    ? freshnessNow !== undefined && [desktop?.sampledAt].some((timestamp) =>
+      isTelemetrySampleStale(timestamp, freshnessNow))
     : [
-        cpu.data?.status === "available" ? cpu.data.sample_time_unix_ms : undefined,
-        gpu.data?.status === "available" ? gpu.data.sample_time_unix_ms : undefined,
-      ];
-  const staleByAge = freshnessNow !== undefined &&
-    sampleTimes.some((timestamp) => isTelemetrySampleStale(timestamp, freshnessNow));
+        cpu.data?.status === "available"
+          ? { elapsedMs: cpuTelemetryElapsedMs, timestamp: cpu.data.sample_time_unix_ms }
+          : undefined,
+        gpu.data?.status === "available"
+          ? { elapsedMs: gpuTelemetryElapsedMs, timestamp: gpu.data.sample_time_unix_ms }
+          : undefined,
+      ].some((sample) => sample !== undefined &&
+        isTelemetrySampleStaleByAge(sample.elapsedMs, sample.timestamp));
   const stale = staleByAge ||
     observedResources.some((resource) => resource.data &&
       (resource.status === "error" || resource.refreshError)) || (usingDesktop && desktopFailed);

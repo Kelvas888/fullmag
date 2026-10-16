@@ -21,6 +21,21 @@ export function isTelemetrySampleStale(
   return timestamp > now || now - timestamp > COMPUTE_TELEMETRY_MAX_AGE_MS;
 }
 
+/**
+ * Runtime telemetry is stamped by the server wall clock. Age a retained
+ * browser resource from its monotonic receipt instead of comparing clocks.
+ */
+export function isTelemetrySampleStaleByAge(
+  elapsedSinceReceiptMs: number | undefined,
+  timestamp: number | undefined,
+): boolean {
+  if (timestamp !== undefined &&
+    (!Number.isFinite(timestamp) || timestamp <= 0)) return true;
+  if (elapsedSinceReceiptMs === undefined) return false;
+  if (!Number.isFinite(elapsedSinceReceiptMs) || elapsedSinceReceiptMs < 0) return true;
+  return elapsedSinceReceiptMs > COMPUTE_TELEMETRY_MAX_AGE_MS;
+}
+
 export function formatTelemetrySampleTime(timestamp: number | undefined): {
   readonly dateTime: string;
   readonly label: string;
