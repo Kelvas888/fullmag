@@ -160,7 +160,42 @@ try {
   await screenshot("04-foreign-owner-cleared");
   checks.push("Foreign immutable run selection refuses nearest-result fallback, removes the old scene group and releases geometry/material/texture ownership");
   await page.getByRole("button", { name: "Clear owner selection", exact: true }).click();
-  const final = await ready("H_ant"); assert.deepEqual(final.state.unexpected, []); assert.deepEqual(errors, []);
+  const final = await ready("H_ant"); assert.deepEqual(final.state.unexpected, []);
+  const controls = page.getByRole("complementary", { name: "Shared inspection controls", exact: true });
+  await controls.getByRole("button", { name: /Surface Coloring/ }).click();
+  await controls.getByRole("button", { name: /^Vectors/ }).click();
+  const rangeLabels = controls.locator('[aria-label^="Scalar color range:"]');
+  await page.waitForFunction(() => document.querySelectorAll('aside[aria-label="Shared inspection controls"] [aria-label^="Scalar color range:"]').length === 2);
+  const initialLabels = await rangeLabels.evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label")));
+  assert.ok(initialLabels.some(label => label.includes("-4") && label.includes("1")));
+  assert.ok(initialLabels.some(label => label.includes("0") && label.includes("4")));
+  const ownerReads = final.state.calls.filter(call => call.component !== "full" && call.path.endsWith("/meta"));
+  for (const q of ["H_ant", "J_charge", "V_electric"]) {
+    const reads = ownerReads.filter(call => call.path.includes(q)); assert.ok(reads.length > 0, q);
+    assert.ok(reads.every(call => call.stage === "execution-inspect" && call.carrier && call.revision), q);
+  }
+  checks.push("Shared surface and vector controls request H/J/V ranges with the selected runtime stage, carrier and revision; surface component and vector norm remain distinct");
+  await page.evaluate(() => { window.__sharedControlsRoot = document.querySelector('aside[aria-label="Shared inspection controls"]'); });
+  for (const name of ["Return foreign range owner", "Return malformed range owner"]) {
+    const before = await read();
+    await controls.getByRole("button", { name, exact: true }).click();
+    await page.waitForFunction(() => document.querySelectorAll('aside[aria-label="Shared inspection controls"] [aria-label^="Scalar color range:"]').length === 0);
+    await page.waitForFunction(() => [...document.querySelectorAll('aside[aria-label="Shared inspection controls"] [role="alert"]')].filter(node => node.textContent.includes("immutable inspection")).length === 2);
+    assert.equal(await page.evaluate(() => window.__sharedControlsRoot === document.querySelector('aside[aria-label="Shared inspection controls"]')), true);
+    const after = await read(); assert.equal(after.state.model, true); assert.equal(after.state.calls.filter(call => call.binary).length, before.state.calls.filter(call => call.binary).length);
+    assert.ok(after.state.calls.length - before.state.calls.length <= 2);
+    assert.equal(after.canvas.lost, false);
+    checks.push(`${name}: controlled error replaces both ranges, no cached/live fallback, Inspector remount or binary reload`);
+  }
+  await screenshot("05-shared-controls-rejected-metadata");
+  await controls.getByRole("button", { name: "Restore valid range owner", exact: true }).click();
+  await page.waitForFunction(() => document.querySelectorAll('aside[aria-label="Shared inspection controls"] [aria-label^="Scalar color range:"]').length === 2);
+  assert.deepEqual(await rangeLabels.evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label"))), initialLabels);
+  await screenshot("06-shared-controls-owned-ranges");
+  const settled = await read(); await page.waitForTimeout(300);
+  assert.equal((await read()).state.calls.length, settled.state.calls.length);
+  assert.deepEqual((await read()).state.unexpected, []); assert.deepEqual(errors, []);
+  checks.push("Valid owner restores both exact ranges and controls remain idle without repeat requests");
 } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); }
 finally {
   await browser?.close();

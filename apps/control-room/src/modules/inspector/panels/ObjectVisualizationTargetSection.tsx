@@ -38,6 +38,8 @@ import type { Viewport3DRenderedScalarRangeQuery } from "@/modules/viewport-3d/p
 import {
   useFieldMetaResource,
 } from "@/kernel/resources/studyRuntimeResources";
+import { useVisualizationFieldMeta } from "@/kernel/resources/useVisualizationFieldMeta";
+import type { ArtifactInspectorFieldBinding } from "@/kernel/visualization/artifactFieldSelection";
 import { useViewport3DRenderedScalarRange } from "@/modules/viewport-3d/public";
 import {
   buildVisualizationPanelSections,
@@ -284,6 +286,7 @@ export function VisualizationRenderModeSection({
 
 
 export function VisualizationSurfaceColoringSection({
+  artifactFieldBinding,
   airboxFieldCarrierIdentity,
   patch,
   patchColor,
@@ -297,6 +300,7 @@ export function VisualizationSurfaceColoringSection({
   settings,
   target,
 }: {
+  artifactFieldBinding?: ArtifactInspectorFieldBinding;
   airboxFieldCarrierIdentity?: VisualizationVectorScopeIdentity | null;
   patch: PatchVisualizationTarget;
   patchColor: (
@@ -343,6 +347,7 @@ export function VisualizationSurfaceColoringSection({
     colorbarComponent ?? "none",
     fieldMetaScopeQuery.scope_kind ?? "full",
     fieldMetaScopeQuery.scope_id ?? "full",
+    artifactFieldBinding?.identityKey ?? "",
   ].join(":");
   const renderedRange = useViewport3DRenderedScalarRange({
     component: colorbarComponent,
@@ -350,7 +355,8 @@ export function VisualizationSurfaceColoringSection({
     scopeId: fieldMetaScopeQuery.scope_id,
     scopeKind: viewportRenderedRangeScopeKind(fieldMetaScopeQuery.scope_kind),
   });
-  const fieldMeta = useFieldMetaResource({
+  const fieldMeta = useVisualizationFieldMeta({
+    binding: artifactFieldBinding,
     component: colorbarComponent ?? null,
     enabled: showFieldMeta,
     quantityId: settings.activeQuantityId,
@@ -420,7 +426,8 @@ export function VisualizationSurfaceColoringSection({
           patch={patch}
           quantityId={settings.activeQuantityId}
           rangeIdentity={colorbarRangeIdentity}
-          renderedRange={renderedRange}
+          renderedRange={artifactFieldBinding?.historical ? null : renderedRange}
+          allowCachedRange={!artifactFieldBinding?.historical}
         />
       ) : null}
       {showFieldMeta ? (
@@ -467,6 +474,7 @@ export function VisualizationSurfaceColoringSection({
 }
 
 export function ScalarColorbarControl({
+  allowCachedRange = true,
   disabled,
   fieldMeta,
   palette,
@@ -475,6 +483,7 @@ export function ScalarColorbarControl({
   rangeIdentity,
   renderedRange,
 }: {
+  allowCachedRange?: boolean;
   disabled: boolean;
   fieldMeta: ReturnType<typeof useFieldMetaResource>;
   palette: string;
@@ -495,7 +504,7 @@ export function ScalarColorbarControl({
       rememberScalarColorbarRange(rangeIdentity, fieldMeta.data);
     }
   }, [fieldMeta.data, rangeIdentity]);
-  const visibleMeta = fieldMeta.data ?? cachedRange;
+  const visibleMeta = fieldMeta.data ?? (allowCachedRange ? cachedRange : null);
   const stats = renderedRange ?? visibleMeta?.stats;
   const unit =
     visibleMeta?.unit?.trim() ||
@@ -526,6 +535,8 @@ export function ScalarColorbarControl({
   const dataRange =
     minLabel && maxLabel
       ? `${minLabel} to ${maxLabel}`
+      : fieldMeta.error || fieldMeta.refreshError
+        ? "field range unavailable"
       : fieldMeta.status === "ready"
         ? "range unavailable"
         : "loading field range";
@@ -584,6 +595,7 @@ export function ScalarColorbarControl({
         </span>
       </div>
       <FieldRow label="Data range" value={dataRange} />
+      {fieldMeta.error || fieldMeta.refreshError ? <FeedbackBanner kind="error" message={(fieldMeta.error ?? fieldMeta.refreshError)?.message ?? "Field range unavailable"} /> : null}
     </div>
   );
 }
@@ -754,6 +766,7 @@ export function VisualizationWireframeSection({
 }
 
 export function VisualizationVectorsSection({
+  artifactFieldBinding,
   airboxFieldCarrierIdentity,
   fieldCatalog,
   fieldCatalogLoading,
@@ -775,6 +788,7 @@ export function VisualizationVectorsSection({
   visualizationRevision,
   vectorTopologyHash,
 }: {
+  artifactFieldBinding?: ArtifactInspectorFieldBinding;
   airboxFieldCarrierIdentity?: VisualizationVectorScopeIdentity | null;
   fieldCatalog: { data: FieldCatalogResource | null; status: string };
   fieldCatalogLoading: boolean;
@@ -836,7 +850,8 @@ export function VisualizationVectorsSection({
     showColorbar &&
     !regionFieldMetaUnavailable &&
     fieldMetaQuantityAvailable;
-  const fieldMeta = useFieldMetaResource({
+  const fieldMeta = useVisualizationFieldMeta({
+    binding: artifactFieldBinding,
     component: colorbarComponent ?? null,
     enabled: showFieldMeta,
     quantityId: settings.activeQuantityId,
@@ -848,6 +863,7 @@ export function VisualizationVectorsSection({
     colorbarComponent ?? "none",
     fieldMetaScopeQuery.scope_kind ?? "full",
     fieldMetaScopeQuery.scope_id ?? "full",
+    artifactFieldBinding?.identityKey ?? "",
   ].join(":");
   const renderedRange = useViewport3DRenderedScalarRange({
     component: colorbarComponent,
@@ -914,7 +930,8 @@ export function VisualizationVectorsSection({
           patch={patch}
           quantityId={settings.activeQuantityId}
           rangeIdentity={colorbarRangeIdentity}
-          renderedRange={renderedRange}
+          renderedRange={artifactFieldBinding?.historical ? null : renderedRange}
+          allowCachedRange={!artifactFieldBinding?.historical}
         />
       ) : null}
       {showFieldMeta ? (

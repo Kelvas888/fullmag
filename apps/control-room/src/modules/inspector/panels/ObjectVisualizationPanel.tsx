@@ -1,7 +1,7 @@
 "use client";
 import { isScalarSpatialQuantityId } from "@/kernel/api/quantityIds";
 
-import { artifactSelectionMatchesSession, artifactInspectionQuantity } from "@/kernel/visualization/artifactFieldSelection";
+import { artifactInspectorFieldBinding } from "@/kernel/visualization/artifactFieldSelection";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { Eye } from "lucide-react";
 import React, {
@@ -574,8 +574,6 @@ function useObjectVisualizationPanelState(
   );
   const artifactSelection = useObjectVisualizationSelector(snapshot => snapshot.artifactFieldSelection ?? null);
   const artifactSession = useSessionResourceIdentity();
-  const artifactQuantity = quantityCatalog.status === "ready" && !quantityCatalog.refreshError &&
-    artifactInspectionQuantity(quantityCatalog.data, settings?.activeQuantityId ?? "");
   const fieldAvailabilityQuery = useMemo(
     () =>
       fieldAvailabilityQueryForVisualizationTarget(
@@ -584,12 +582,20 @@ function useObjectVisualizationPanelState(
       ),
     [airboxFieldCarrierIdentity, resolvedTarget],
   );
-  const artifactOwnerReady = artifactSelection?.quantityId === settings?.activeQuantityId && artifactSelectionMatchesSession(artifactSelection, artifactSession) && Boolean(artifactSelection?.runtimeStageId && artifactSelection.carrierId && artifactSelection.carrierRevision) &&
-    (artifactSelection?.carrierScopeKind === "full" || (artifactSelection?.carrierScopeKind === "object" && artifactSelection.carrierScopeId === fieldAvailabilityQuery?.scope_id));
+  const artifactFieldBinding = artifactInspectorFieldBinding({
+    catalog: quantityCatalog.data,
+    catalogReady: quantityCatalog.status === "ready" && !quantityCatalog.refreshError,
+    quantityId: settings?.activeQuantityId ?? "",
+    selection: artifactSelection,
+    sessionIdentity: artifactSession,
+    targetScope: fieldAvailabilityQuery ? { scopeKind: fieldAvailabilityQuery.scope_kind ?? "full", scopeId: fieldAvailabilityQuery.scope_id ?? null } : null,
+  });
+  const artifactQuantity = artifactFieldBinding.historical;
+  const artifactOwnerReady = Boolean(artifactFieldBinding.query);
   const airboxFieldCarrierReady =
     resolvedTarget?.kind !== "airbox" || airboxFieldCarrierIdentity !== null;
   const fieldAvailability = useFieldAvailabilityResource({
-    ...(artifactQuantity ? { stage_id: artifactOwnerReady ? artifactSelection?.runtimeStageId : undefined, carrier_id: artifactOwnerReady ? artifactSelection?.carrierId : undefined, expected_carrier_revision: artifactOwnerReady ? artifactSelection?.carrierRevision : undefined, view: "full", scope_kind: artifactSelection?.carrierScopeKind ?? "full", scope_id: artifactSelection?.carrierScopeId ?? null } : fieldAvailabilityQuery),
+    ...(artifactQuantity ? artifactFieldBinding.query : fieldAvailabilityQuery),
     enabled: Boolean(
       resolvedTarget && requiresFieldData && airboxFieldCarrierReady && (!artifactQuantity || artifactOwnerReady),
     ),
@@ -1056,6 +1062,7 @@ function useObjectVisualizationPanelState(
   }
 
   return {
+    artifactFieldBinding,
     artifactQuantity,
     artifactOwnerReady,
     appliedBaseline,
@@ -1373,6 +1380,7 @@ function ObjectVisualizationPanelView({
     visualizationResourceRevision,
     vectorMeshParts,
     vectorTopologyHash,
+    artifactFieldBinding,
     artifactQuantity,
     artifactOwnerReady,
   } = panel;
@@ -1507,6 +1515,7 @@ function ObjectVisualizationPanelView({
             }
             surfaceColoring={!capabilities.supportsFieldData || target.kind === "airbox" || isFdmUniverseOutsideSupportTarget(target) ? null : (
               <VisualizationSurfaceColoringSection
+              artifactFieldBinding={analysisFieldShown ? undefined : artifactFieldBinding}
               airboxFieldCarrierIdentity={airboxFieldCarrierIdentity}
               patch={patch}
               patchColor={patchColor}
@@ -1523,6 +1532,7 @@ function ObjectVisualizationPanelView({
             )}
             vectors={capabilities.supportsVectors && !isScalarSpatialQuantityId(settings.activeQuantityId) ? (
               <VisualizationVectorsSection
+              artifactFieldBinding={analysisFieldShown ? undefined : artifactFieldBinding}
               airboxFieldCarrierIdentity={airboxFieldCarrierIdentity}
               fieldCatalog={fieldCatalog}
               fieldCatalogLoading={fieldCatalogLoading}

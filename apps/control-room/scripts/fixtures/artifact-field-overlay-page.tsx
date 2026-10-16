@@ -16,6 +16,10 @@ import type { KernelApi } from "@/kernel/types";
 import { ResourceInvalidationController } from "@/kernel/resources/ResourceInvalidationController";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { ObjectVisualizationController, resolveGlobalObjectVisualizationSettings } from "@/kernel/visualization/ObjectVisualizationController";
+import { artifactInspectorFieldBinding } from "@/kernel/visualization/artifactFieldSelection";
+import { useObjectVisualizationSelector } from "@/kernel/visualization/useObjectVisualization";
+import { VisualizationDebugController } from "@/kernel/visualization/VisualizationDebugController";
+import { VisualizationSurfaceColoringSection, VisualizationVectorsSection } from "@/modules/inspector/panels/ObjectVisualizationTargetSection";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
 import { useArtifactFieldOverlay } from "@/modules/viewport-3d/hooks/useArtifactFieldOverlay";
 import { resolveArtifactFieldColorbars, Viewport3DColorbar } from "@/modules/viewport-3d/Viewport3DModule";
@@ -35,7 +39,7 @@ const local = [0, 1, 2, 3, 0, 2, 1, 4];
 const stable = physical.map((_, i) => BigInt("9007199254740993") + BigInt(i));
 const subscribe = () => () => {};
 type Quantity = "H_ant" | "J_charge" | "V_electric";
-type FixtureRead = { quantity: Quantity; unit: string | null; model: boolean; count: number; triangles: number; minimum: number | null; maximum: number | null; values: number[]; glyphCount: number; calls: { path: string; binary: boolean; carrier: string | null }[]; unexpected: string[]; historical: boolean; error: string | null; resources: ReturnType<Viewport3DResourceTracker["getSnapshot"]> };
+type FixtureRead = { quantity: Quantity; unit: string | null; model: boolean; count: number; triangles: number; minimum: number | null; maximum: number | null; values: number[]; glyphCount: number; calls: { path: string; binary: boolean; carrier: string | null; component: string | null; stage: string | null; revision: string | null }[]; unexpected: string[]; historical: boolean; error: string | null; resources: ReturnType<Viewport3DResourceTracker["getSnapshot"]> };
 declare global { interface Window { __artifactOverlayFixture?: { read(): FixtureRead }; __artifactOverlayCanvas?: () => { lost: boolean; width: number; height: number; groups: number; surfaceTriangles: number; geometryIds: string[]; materialIds: string[]; paletteIds: string[]; surfaceOpacity: number; paletteName: string; surfacePresentation: Array<{ mode: string; color: string }>; scalarSurface: { normalized: number[]; opacity: number; paletteId: number; materialId: string } | null; auxiliaryMaterials: Array<{ id: string; version: number; opacity: number; transparent: boolean }>; frame: number; glyphCounts: number[]; glyphInstances: number }; } }
 
 function carrier(q: Quantity) {
@@ -99,11 +103,13 @@ function makeFixture() {
   const calls: FixtureRead["calls"] = [], unexpected: string[] = [];
   const bus = new EventBus<KernelEventMap>(), resources = new ResourceInvalidationController(bus), diagnostics = new RequestDiagnosticsController(), visualization = new ObjectVisualizationController();
   const diagnosticRecorder = new DiagnosticRecorderController({ diagnostics });
+  const visualizationDebug = new VisualizationDebugController();
+  let rangeMode: "valid" | "foreign" | "malformed" = "valid", rangeRevision = 1;
   const common = { "x-api-contract-version": "1.0.0", "x-fullmag-api-instance": instance };
   const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { ...common, "content-type": "application/json" } });
   const api = new ControlRoomApi({ baseUrl: "http://artifact-overlay.fixture.invalid", expectedApiInstance: instance, diagnostics, maxGetRetries: 0, fetchImpl: async (input, init) => {
     const request = new Request(input, init), url = new URL(request.url), binary = url.pathname.includes("/samples/vector") || url.pathname === DATA_DOMAIN_TOPOLOGY_PATH;
-    calls.push({ path: url.pathname, binary, carrier: url.searchParams.get("carrier_id") });
+    calls.push({ path: url.pathname, binary, carrier: url.searchParams.get("carrier_id"), component: url.searchParams.get("component"), stage: url.searchParams.get("stage_id"), revision: url.searchParams.get("expected_carrier_revision") });
     if (calls.length > 100 || request.method !== "GET") throw new Error("Fixture request/method budget exceeded");
     if (url.pathname === SESSIONS_PATH) return json({ schema_version: "1.0", sessions: [{ session_id: owner.session_id, name: "Fixture", current: true, status: "idle" }] });
     if (url.pathname === SESSION_STATUS_PATH) return json({ session: { ...owner, name: "Fixture", created_at: "fixture", workspace_root: "fixture" }, run: { run_id: runId }, resources: { scene_revision: 1 }, capabilities: {}, lifecycle: { solver: "idle", session_resource: "active", connectivity: "connected", commandability: "writable" } });
@@ -114,7 +120,12 @@ function makeFixture() {
     const metaPath = DATA_FIELD_META_PATH.replace("{quantity_id}", q), vectorPath = DATA_FIELD_VECTOR_PATH.replace("{quantity_id}", q);
     if (url.pathname === metaPath) {
       const pin = url.searchParams.get("carrier_id"); if (pin && pin !== c.carrier_id) throw new Error("Stale carrier leaked across quantities");
-      return json({ quantity_id: q, unit: q === "V_electric" ? "V" : q === "H_ant" ? "A/m" : "A/m^2", components: q === "V_electric" ? 1 : 3, state: "stale_complete", materialization_reason_code: "historical_inspection_read_only", resolved_capability: capability(q), artifact_field_locator: c });
+      const component = url.searchParams.get("component");
+      const isRange = component !== "full";
+      if (isRange && (pin !== c.carrier_id || url.searchParams.get("stage_id") !== runtimeStageId || url.searchParams.get("expected_carrier_revision") !== c.carrier_revision)) throw new Error("Inspector range request has no exact result pins");
+      const samples = values(q), projected = q === "V_electric" ? samples : component === "magnitude" ? Array.from({ length: c.sample_count }, (_, i) => Math.hypot(...samples.slice(i * 3, i * 3 + 3))) : samples.filter((_, i) => i % 3 === (component === "y" ? 1 : component === "z" ? 2 : 0));
+      const locator = isRange && rangeMode === "malformed" ? {} : isRange && rangeMode === "foreign" ? { ...c, owner: { ...c.owner, run_id: "foreign-run" } } : c;
+      return json({ quantity_id: q, unit: q === "V_electric" ? "V" : q === "H_ant" ? "A/m" : "A/m^2", components: q === "V_electric" ? 1 : 3, state: "stale_complete", materialization_reason_code: "historical_inspection_read_only", resolved_capability: capability(q), artifact_field_locator: locator, stats: { min: component === "magnitude" ? 0 : Math.min(...projected), max: Math.max(...projected) } });
     }
     if (url.pathname === vectorPath || url.pathname === DATA_DOMAIN_TOPOLOGY_PATH) {
       if (url.searchParams.get("carrier_id") !== c.carrier_id || url.searchParams.get("expected_carrier_revision") !== c.carrier_revision || url.searchParams.get("stage_id") !== runtimeStageId) throw new Error("Unpinned artifact binary request");
@@ -128,7 +139,8 @@ function makeFixture() {
     }
     unexpected.push(url.pathname); throw new Error(`Unexpected artifact fixture request: ${url.pathname}`);
   } });
-  return { kernel: { api, resources, bus, diagnostics, diagnosticRecorder, visualization } as unknown as KernelApi, calls, unexpected, visualization };
+  return { kernel: { api, resources, bus, diagnostics, diagnosticRecorder, visualization, visualizationDebug } as unknown as KernelApi, calls, unexpected, visualization,
+    setRangeMode(mode: typeof rangeMode) { rangeMode = mode; resources.invalidateMatching(key => key.includes("/meta") && !key.includes("component=full"), ++rangeRevision); } };
 }
 function Probe() {
   const { gl, scene } = useThree();
@@ -155,9 +167,14 @@ function Probe() {
 function View({ fixture }: { fixture: ReturnType<typeof makeFixture> }) {
   const [quantity, setQuantity] = useState<Quantity>("H_ant"), [live, setLive] = useState(false), [vectors, setVectors] = useState(false), [presentation, setPresentation] = useState(false), [solid, setSolid] = useState(false);
   const tracker = useMemo(() => new Viewport3DResourceTracker(), []), session = useSessionResourceIdentity();
-  const settings = useMemo(() => ({ ...resolveGlobalObjectVisualizationSettings(null), visible: true, shaderVisible: true, wireframeVisible: true, pointsVisible: true, vectorsVisible: vectors, surfaceColorSource: solid ? "solid" as const : "colormap" as const, scalarColorPalette: presentation ? "magma" : "viridis", surfaceOpacityPercent: presentation ? 45 : 100, pointOpacityPercent: presentation ? 45 : 100, wireframeOpacityPercent: presentation ? 45 : 100, vectorColorMode: "magnitude" as const, shaderColorMode: "x" as const, shaderMonoColor: "#12ab34" }), [vectors, presentation, solid]);
+  const settings = useMemo(() => ({ ...resolveGlobalObjectVisualizationSettings(null), visible: true, shaderVisible: true, wireframeVisible: true, pointsVisible: true, vectorsVisible: vectors, activeQuantityId: quantity, surfaceColorSource: solid ? "solid" as const : quantity === "V_electric" ? "colormap" as const : "component_x" as const, scalarColorPalette: presentation ? "magma" : "viridis", surfaceOpacityPercent: presentation ? 45 : 100, pointOpacityPercent: presentation ? 45 : 100, wireframeOpacityPercent: presentation ? 45 : 100, vectorColorMode: "magnitude" as const, shaderColorMode: "x" as const, shaderMonoColor: "#12ab34" }), [vectors, presentation, solid, quantity]);
   const quantities = useMemo(() => catalog(live), [live]);
   const result = useArtifactFieldOverlay(quantity, "antenna", settings, false, definitions, quantities);
+  const selected = useObjectVisualizationSelector(snapshot => snapshot.artifactFieldSelection ?? null);
+  const binding = artifactInspectorFieldBinding({ catalog: quantities, quantityId: quantity, selection: selected, sessionIdentity: session, targetScope: { scopeKind: "object", scopeId: "antenna" } });
+  const target = { id: "antenna", kind: "object" as const };
+  const controls = { artifactFieldBinding: binding, fieldCatalog: { data: null, status: "ready" }, fieldCatalogLoading: false, fieldMetaTarget: target,
+    patch: async () => {}, patchColor: () => {}, patchNumber: () => {}, isFieldPending: () => false, sectionDisabled: () => false, settings, target };
   useEffect(() => {
     window.__artifactOverlayFixture = { read: () => ({ quantity, unit: result.model?.unit ?? null, model: Boolean(result.model), count: result.model?.count ?? 0, triangles: (result.model?.surfaceTriangles?.length ?? 0) / 3,
       minimum: result.model?.minimum ?? null, maximum: result.model?.maximum ?? null, values: Array.from(result.model?.scalarValues ?? []), glyphCount: (result.model?.vectorSegments?.length ?? 0) / 7, calls: fixture.calls, unexpected: fixture.unexpected, historical: result.historical, error: result.error, resources: { ...tracker.getSnapshot() } }) };
@@ -173,7 +190,14 @@ function View({ fixture }: { fixture: ReturnType<typeof makeFixture> }) {
     <p role="status">{result.error ?? (result.model ? `${quantity}: historical inspection · ${result.model.count} samples` : "No historical model")}</p>
     <div data-artifact-field-viewport style={{ height: 480, width: "100%", position: "relative" }}><Viewport3DCanvas camera={{ position: [2.4, 1.7, 1.3], fov: 45, near: .01, far: 100 }} frameloop="demand">
       <VectorGlyphDerivedBufferCacheProvider tracker={tracker}><Probe /><ArtifactFieldLayer model={result.model} tracker={tracker} sessionIdentity={session} colors={{ accent: "white", background: "black", field: "white", mesh: "white", wire: "white" }} /></VectorGlyphDerivedBufferCacheProvider>
-    </Viewport3DCanvas><div className="fm-viewport-3d__colorbar-stack">{resolveArtifactFieldColorbars(result.model).map(({ key, legend }) => <Viewport3DColorbar key={key} legend={legend} />)}</div></div></main>;
+    </Viewport3DCanvas><div className="fm-viewport-3d__colorbar-stack">{resolveArtifactFieldColorbars(result.model).map(({ key, legend }) => <Viewport3DColorbar key={key} legend={legend} />)}</div></div>
+    {!live ? <aside aria-label="Shared inspection controls" className="fm-inspector-panel">
+      <VisualizationSurfaceColoringSection {...controls} onFieldCatalogRequest={() => {}} />
+      {quantity !== "V_electric" ? <VisualizationVectorsSection {...controls} targetKind="object" vectorBudgetRange={{ availableNodeCount: carrier(quantity).sample_count, max: carrier(quantity).sample_count, min: 0, step: 1, exact: true }} vectorCapacity={null} sceneCap={100000} visualizationRevision={1} vectorTopologyHash={carrier(quantity).carrier_digest} /> : null}
+      <button onClick={() => fixture.setRangeMode("foreign")}>Return foreign range owner</button>
+      <button onClick={() => fixture.setRangeMode("malformed")}>Return malformed range owner</button>
+      <button onClick={() => fixture.setRangeMode("valid")}>Restore valid range owner</button>
+    </aside> : null}</main>;
 }
 export default function Page() {
   const hydrated = useSyncExternalStore(subscribe, () => true, () => false);

@@ -1,4 +1,4 @@
-import type { QuantityCatalogResource } from "../api/apiTypes";
+import type { FieldMetaResource, QuantityCatalogResource } from "../api/apiTypes";
 import { quantityCatalogEntrySupportsSpatialVisualization } from "../api/quantityIds";
 import type { SessionResourceIdentity } from "../resources/sessionResourceIdentity";
 
@@ -37,4 +37,76 @@ export function artifactSelectionForQuantity(selection: ArtifactFieldSelection |
   if (!selection || selection.quantityId === quantityId) return selection;
   return { identity: selection.identity, runId: selection.runId, runtimeStageId: selection.runtimeStageId,
     authoredStageId: selection.authoredStageId, sourceObjectId: selection.sourceObjectId, quantityId };
+}
+
+export interface ArtifactInspectorFieldQuery {
+  stage_id: string;
+  carrier_id: string;
+  expected_carrier_revision: string;
+  view: "full";
+  scope_kind: "object" | "full";
+  scope_id: string | null;
+}
+export interface ArtifactInspectorFieldBinding {
+  historical: boolean;
+  query: ArtifactInspectorFieldQuery | null;
+  identityKey: string | null;
+  expectedOwner: {
+    session_id: string; session_epoch: string; request_scope_epoch: string;
+    run_id: string; authored_stage_id: string; runtime_stage_id: string; object_id: string;
+    quantityId: string;
+  } | null;
+}
+
+/** A historical lane never falls back to an unpinned current-field request. */
+export function artifactInspectorFieldBinding({ catalog, catalogReady = true, quantityId, selection, sessionIdentity, targetScope }: {
+  catalog: QuantityCatalogResource | null;
+  catalogReady?: boolean;
+  quantityId: string;
+  selection: ArtifactFieldSelection | null;
+  sessionIdentity: SessionResourceIdentity | null;
+  targetScope: { scopeKind: string; scopeId: string | null } | null;
+}): ArtifactInspectorFieldBinding {
+  const historical = Boolean(catalog?.quantities.some(entry => entry.id === quantityId && entry.resolved_capability?.lane === "artifact_inspection_read_only"));
+  const blocked = { historical, query: null, identityKey: null, expectedOwner: null };
+  if (!historical || !catalogReady || !artifactInspectionQuantity(catalog, quantityId) || !selection || !sessionIdentity || !artifactSelectionMatchesSession(selection, sessionIdentity) || selection.quantityId !== quantityId) return blocked;
+  const nonempty = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+  if (![sessionIdentity.sessionId, sessionIdentity.sessionEpoch, sessionIdentity.requestScopeEpoch, selection.runId, selection.authoredStageId, selection.runtimeStageId, selection.sourceObjectId, selection.carrierId, selection.carrierRevision].every(nonempty)) return blocked;
+  const scopeKind = selection.carrierScopeKind, scopeId = selection.carrierScopeId;
+  if (scopeKind === "object") {
+    if (!nonempty(scopeId) || targetScope?.scopeKind !== "object" || targetScope.scopeId !== scopeId) return blocked;
+  } else if (scopeKind !== "full" || scopeId !== null) return blocked;
+  const query: ArtifactInspectorFieldQuery = {
+    stage_id: selection.runtimeStageId, carrier_id: selection.carrierId!, expected_carrier_revision: selection.carrierRevision!,
+    view: "full", scope_kind: scopeKind, scope_id: scopeId,
+  };
+  const expectedOwner = {
+    session_id: sessionIdentity.sessionId, session_epoch: sessionIdentity.sessionEpoch, request_scope_epoch: sessionIdentity.requestScopeEpoch,
+    run_id: selection.runId, authored_stage_id: selection.authoredStageId, runtime_stage_id: selection.runtimeStageId, object_id: selection.sourceObjectId, quantityId,
+  };
+  const identityKey = JSON.stringify([expectedOwner.session_id, expectedOwner.session_epoch, expectedOwner.request_scope_epoch, quantityId,
+    selection.runId, selection.authoredStageId, selection.runtimeStageId, selection.sourceObjectId, query.carrier_id, query.expected_carrier_revision,
+    scopeKind, scopeId, targetScope?.scopeKind ?? null, targetScope?.scopeId ?? null]);
+  return { historical, query, identityKey, expectedOwner };
+}
+
+/** A successful response still has to belong to the exact pinned inspection. */
+export function artifactInspectorMetadataMatchesBinding(metadata: FieldMetaResource | null, binding: ArtifactInspectorFieldBinding): boolean {
+  const { query, expectedOwner: expected } = binding;
+  if (!binding.historical || !query || !expected || !metadata?.artifact_field_locator) return false;
+  const locator = metadata.artifact_field_locator;
+  if (typeof locator !== "object" || Array.isArray(locator) || !locator.owner || typeof locator.owner !== "object" || Array.isArray(locator.owner)) return false;
+  const owner = locator.owner, capability = metadata.resolved_capability;
+  const quantityId = expected.quantityId, components = quantityId === "V_electric" ? 1 : 3;
+  const unit = quantityId === "V_electric" ? "V" : quantityId === "J_charge" ? "A/m^2" : "A/m";
+  return metadata.quantity_id === quantityId && metadata.unit === unit && metadata.components === components &&
+    metadata.state === "stale_complete" && metadata.materialization_reason_code === "historical_inspection_read_only" &&
+    capability?.quantity_id === quantityId && capability.lane === "artifact_inspection_read_only" && capability.provider === "available" &&
+    capability.request === "field_vector" && capability.render === "renderable" && capability.publication === "interactive" && capability.materialization === "materialized" &&
+    owner.historical_inspection === true && owner.session_id === expected.session_id && owner.session_epoch === expected.session_epoch &&
+    owner.request_scope_epoch === expected.request_scope_epoch && owner.run_id === expected.run_id && owner.authored_stage_id === expected.authored_stage_id &&
+    owner.runtime_stage_id === expected.runtime_stage_id && owner.object_id === expected.object_id &&
+    locator.carrier_id === query.carrier_id && locator.carrier_revision === query.expected_carrier_revision &&
+    locator.carrier_scope_kind === query.scope_kind && (locator.carrier_scope_id ?? null) === query.scope_id &&
+    (quantityId === "V_electric" ? locator.indexing === "source_nodes" : quantityId === "J_charge" ? locator.indexing === "tet4_cell_local_nodes" : ["sample_nodes", "point_samples"].includes(locator.indexing));
 }
