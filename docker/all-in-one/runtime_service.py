@@ -48,7 +48,13 @@ STARTUP_LIVENESS_GRACE_SECONDS = 10.0
 # service is still running.  The API remains fail-closed in that state; this
 # window only prevents one bounded transport/probe blip from killing PID 1.
 SUPERVISION_GRACE_SECONDS = 30.0
-TRANSIENT_LIVENESS_OBSERVATION = ("observation_unknown", "live_probe_failed")
+TRANSIENT_LIVENESS_OBSERVATIONS = frozenset(
+    {
+        ("observation_unknown", "live_probe_failed"),
+        ("observation_unknown", "owner_read_failed"),
+        ("observation_unknown", "owner_invalid"),
+    }
+)
 MAX_LIVENESS_REASON_BYTES = 2048
 RECOVERY_AUTHORIZATION_ENV = "FULLMAG_RUNTIME_RECOVERY_AUTHORIZATION"
 RECOVERY_AUTHORIZATION_SCHEMA = "fullmag.docker-runtime-recovery-authorization.v1"
@@ -1363,16 +1369,31 @@ def _is_transient_supervision_observation(error: BaseException) -> bool:
 
     Schema, API identity, accepted-store binding, and owner mismatches remain
     permanent supervision failures.  In particular, ``observation_unknown``
-    is transient only for the native ``live_probe_failed`` reason; other
-    reasons in that state must still fail closed immediately.
+    is transient only for the native ``live_probe_failed``,
+    ``owner_read_failed``, or evidence-backed ``owner_invalid`` reasons;
+    other reasons in that state must still fail closed immediately.
     """
 
     if isinstance(error, RuntimeServiceNotReady):
         return (
             error.configured
-            and (error.state, error.reason_code) == TRANSIENT_LIVENESS_OBSERVATION
+            and (error.state, error.reason_code) in TRANSIENT_LIVENESS_OBSERVATIONS
         )
     return isinstance(error, (RuntimeServiceTransportError, OSError))
+
+
+def _assert_pinned_ready_owner(handle: RuntimeHandle) -> dict[str, Any]:
+    """Require the bounded owner record to match the attached service pin."""
+
+    try:
+        owner = _read_ready_owner(handle.paths)
+    except (RuntimeServiceError, OSError) as error:
+        raise RuntimeServiceUnknown(
+            f"runtime service owner observation failed during supervision: {error}"
+        ) from error
+    if _owner_fingerprint(owner) != _owner_fingerprint(handle.owner):
+        raise RuntimeServiceUnknown("runtime service owner changed during supervision")
+    return owner
 
 
 def _owner_from_cli(result: Mapping[str, Any], operation: str) -> dict[str, Any]:
@@ -1591,11 +1612,19 @@ def check(handle: RuntimeHandle, *, full_api_probe: bool = True) -> None:
                 raise RuntimeServiceUnknown(
                     "API identity or accepted-store binding changed during supervision"
                 )
+        # Prove the exact pinned owner before accepting a transient API
+        # observation. A Rust-side owner-read failure is transient only when
+        # this bounded, no-CLI proof is currently healthy.
+        _assert_pinned_ready_owner(handle)
         # A full identity probe is periodic, but the thin native liveness
         # proof is required on every cycle so a full probe cannot mask a
         # persistent live_probe_failed observation.
         _probe_api_liveness(handle.api_port, expected_identity, timeout=2.0)
     except (RuntimeServiceError, OSError) as error:
+        if isinstance(error, RuntimeServiceUnknown):
+            raise
+        if _is_transient_supervision_observation(error):
+            _assert_pinned_ready_owner(handle)
         error_type = (
             RuntimeServiceTransient
             if _is_transient_supervision_observation(error)
@@ -1608,11 +1637,6 @@ def check(handle: RuntimeHandle, *, full_api_probe: bool = True) -> None:
         if isinstance(observation, dict):
             unknown.liveness_observation = observation
         raise unknown from error
-    try:
-        owner = _read_ready_owner(handle.paths)
-    except (RuntimeServiceError, OSError) as error:
-        raise RuntimeServiceUnknown(
-            f"runtime service owner observation failed during supervision: {error}"
-        ) from error
-    if _owner_fingerprint(owner) != _owner_fingerprint(handle.owner):
-        raise RuntimeServiceUnknown("runtime service owner changed during supervision")
+    # Recheck after the liveness request so a pin change during the request
+    # cannot be mistaken for a healthy observation on the next cycle.
+    _assert_pinned_ready_owner(handle)

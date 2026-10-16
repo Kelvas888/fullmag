@@ -973,8 +973,16 @@ class DockerRuntimeContract(unittest.TestCase):
             reason_message="owner identity changed",
             retryable=False,
         )
+        invalid_reason = service.RuntimeServiceNotReady(
+            configured=True,
+            state="observation_unknown",
+            reason_code="owner_invalid",
+            reason_message="owner metadata is invalid",
+            retryable=False,
+        )
         self.assertTrue(service._is_transient_supervision_observation(transient))
         self.assertFalse(service._is_transient_supervision_observation(different_reason))
+        self.assertTrue(service._is_transient_supervision_observation(invalid_reason))
         self.assertFalse(
             service._is_transient_supervision_observation(
                 service.RuntimeServiceNotReady(
@@ -999,23 +1007,29 @@ class DockerRuntimeContract(unittest.TestCase):
             "api_contract_version": "1.0.0",
             "runtime_store_binding": {"binding": "a" * 64},
         }
-        owner = {"owner_token": "known", "children": []}
+        owner = {
+            "schema_version": "runtime_service_owner.v1",
+            "state": "ready",
+            "owner_token": "known",
+            "children": [],
+        }
         handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
-        failure = service.RuntimeServiceNotReady(
-            configured=True,
-            state="observation_unknown",
-            reason_code="live_probe_failed",
-            reason_message="native service could not be verified",
-            retryable=False,
-        )
-        with patch.object(service, "_probe_api_identity", return_value=(identity, {})), \
-                patch.object(service, "_probe_api_liveness", side_effect=failure), \
-                patch.object(service, "_read_json") as read, \
-                patch.object(service, "_run_cli") as cli:
-            with self.assertRaises(service.RuntimeServiceTransient):
-                service.check(handle, full_api_probe=True)
-        read.assert_not_called()
-        cli.assert_not_called()
+        for reason_code in ("live_probe_failed", "owner_read_failed", "owner_invalid"):
+            failure = service.RuntimeServiceNotReady(
+                configured=True,
+                state="observation_unknown",
+                reason_code=reason_code,
+                reason_message="native service could not be verified",
+                retryable=False,
+            )
+            with patch.object(service, "_probe_api_identity", return_value=(identity, {})), \
+                    patch.object(service, "_probe_api_liveness", side_effect=failure), \
+                    patch.object(service, "_read_json", return_value=owner) as read, \
+                    patch.object(service, "_run_cli") as cli:
+                with self.assertRaises(service.RuntimeServiceTransient):
+                    service.check(handle, full_api_probe=True)
+            self.assertGreaterEqual(read.call_count, 1)
+            cli.assert_not_called()
 
     def test_supervision_transient_window_recovers_and_expires(self):
         service = self.load_service()
@@ -1106,7 +1120,7 @@ class DockerRuntimeContract(unittest.TestCase):
                 patch.object(service, "_run_cli") as cli, \
                 patch.object(service, "_service_status") as status:
             service.check(handle, full_api_probe=False)
-        read.assert_called_once()
+        self.assertGreaterEqual(read.call_count, 1)
         self.assertTrue(str(read.call_args.args[0]).endswith("runtime-services/OWNER.json"))
         cli.assert_not_called()
         status.assert_not_called()
@@ -1138,7 +1152,24 @@ class DockerRuntimeContract(unittest.TestCase):
         cli.assert_not_called()
         status.assert_not_called()
 
-    def test_supervision_api_failure_is_fail_closed_before_owner_read(self):
+    def test_supervision_rejects_malformed_owner_before_transient_grace(self):
+        service = self.load_service()
+        identity = {
+            "api_instance_id": "instance",
+            "api_contract_version": "1.0.0",
+            "runtime_store_binding": {"binding": "a" * 64},
+        }
+        owner = {"owner_token": "known", "children": []}
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
+        with patch.object(service, "_probe_api_liveness") as liveness, \
+                patch.object(service, "_read_json", return_value={"state": "ready"}), \
+                patch.object(service, "_run_cli") as cli:
+            with self.assertRaisesRegex(service.RuntimeServiceUnknown, "schema"):
+                service.check(handle, full_api_probe=False)
+        liveness.assert_not_called()
+        cli.assert_not_called()
+
+    def test_supervision_api_failure_is_fail_closed_with_pinned_owner_proof(self):
         service = self.load_service()
         identity = {
             "api_instance_id": "instance",
@@ -1154,12 +1185,12 @@ class DockerRuntimeContract(unittest.TestCase):
         handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
         with patch.object(
             service, "_probe_api_liveness", side_effect=service.RuntimeServiceError("API down")
-        ), patch.object(service, "_read_json") as read, \
+        ), patch.object(service, "_read_json", return_value=owner) as read, \
                 patch.object(service, "_run_cli") as cli, \
                 patch.object(service, "_service_status") as status:
             with self.assertRaises(service.RuntimeServiceUnknown):
                 service.check(handle, full_api_probe=False)
-        read.assert_not_called()
+        self.assertGreaterEqual(read.call_count, 1)
         cli.assert_not_called()
         status.assert_not_called()
 
