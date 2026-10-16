@@ -163,6 +163,42 @@ Deklaracje wersji bibliotek natywnych pozostają w kanonicznym
 przypiętych wersji narzędzi i lockfile. Nowy tryb nie tworzy drugiej,
 niezależnej listy wersji.
 
+## Przebudowa backendu a trwały rejestr GPU
+
+Stan z 16.10.2026: kontrolowana aktualizacja generacji runtime wymaga
+implementacji. Build backendu `a8e21962f7004d378eb8b11f92232b4e` przeszedł
+wszystkie trzy fazy oraz pakowanie. Start `147f8e32446842b48d1cfa6ee23af15c`
+zatrzymał się na `existing host runtime readiness differs from the requested ABI result`.
+To dowód braku ścieżki aktualizacji istniejącego rejestru po zmianie backendu;
+ponowienie tego samego buildu nie usuwa tej przyczyny.
+
+Obecne `HostResourceLedger::initialize_with_readiness` wymaga identycznego
+zapisanego readiness. Zapis zawiera także tożsamość źródeł/runtime, która
+zmienia się po przebudowie. Sam brak producenta próbki inventory nie dowodzi,
+że wszystkie usługi korzystające ze wspólnego rejestru są zatrzymane.
+
+Warunki implementacji tej części trybu developerskiego:
+
+- Zachować wspólny fizyczny rejestr, politykę pojemności, historię rezerwacji,
+  sesje, wyniki i provenance. Nowa generacja buildu nie otrzymuje osobnej,
+  niezależnej puli tego samego GPU.
+- Aktualizować generację tylko w kontrolowanym stanie bez aktywnych zadań,
+  workerów i rezerwacji. `Tentative`, `Committed` lub `Quarantined` blokują
+  aktualizację; nie wolno uznawać ich za zakończone na podstawie wieku.
+- Przed przyjęciem nowej generacji wykonać jej rzeczywisty probe oraz
+  zweryfikować zgodność fizycznego hosta i GPU z przypiętą polityką.
+- Trwale odgrodzić stare binaria, konfiguracje i pozwolenia od admission nowej
+  generacji, również dla usług innego store korzystających z tego hosta.
+- Zapewnić atomową publikację albo jawny trwały fence dla przerwanej zmiany.
+  Nieznany wynik pozostawia admission zamknięte i zachowuje dowody odzyskania.
+- Potwierdzić kolejną przebudowę/start po wykonanej symulacji i restart z
+  zachowaniem zapisanych wyników. Sama pierwsza inicjalizacja pustego rejestru
+  nie dowodzi poprawnej aktualizacji.
+
+Szczegółowa decyzja o formacie generacji i procedurze migracji musi uzupełnić
+ADR 0052 oraz kontrakt compute-resource execution przed implementacją. Ta
+sekcja określa wymagania; nie deklaruje gotowej migracji ani działającego GPU.
+
 ## Warunki odbioru
 
 1. Bezpośredni start dwóch usług w projekcie `fullmag`, bez zgłoszenia joba runnera.
