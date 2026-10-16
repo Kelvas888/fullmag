@@ -37,7 +37,7 @@ declare global { interface Window { __antennaSolveTargetsFixture?: FixtureContro
 
 function makeFixture() {
   const makeScene = (name: string): SceneResource => ({
-    revision: 1, scene_revision: 1, scene: { id: `session-${name}`, name: `Fixture ${name}`, authoring_schema: "fixture", source_of_truth: "fixture" },
+    revision: 1, scene_revision: 1, scene: { id: `restored-model-${name}`, name: `Fixture ${name}`, authoring_schema: "fixture", source_of_truth: "fixture" },
     objects: [{ id: sourceId, name: "Golden antenna", role: "antenna" }, {
       id: "immutable-waveguide", name: "Guide", role: "magnet", regions: [{ region_id: "core", name: "Core", owner_object: "immutable-waveguide", shape: { kind: "box", center: [0, 0, 0], size: [1, 1, 1] } }],
     }],
@@ -115,7 +115,7 @@ function EditorOwner() {
   return <>
     <output data-testid="solve-owner">{scene.data?.scene?.id}</output>
     <output data-testid="solve-dirty">{String(session?.dirty ?? false)}</output>
-    <div data-testid="solve-editor"><AntennaSolveTargetsEditor objectId={sourceId} stageId={solveId} scene={scene.data} status={scene.status} refetch={scene.refetch} /></div>
+    <div data-testid="solve-editor"><AntennaSolveTargetsEditor objectId={sourceId} stageId={solveId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /></div>
     <div style={{ height: 550 }} aria-hidden="true" />
   </>;
 }

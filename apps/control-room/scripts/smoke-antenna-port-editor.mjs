@@ -176,7 +176,7 @@ try {
   await wait(() => document.querySelector('[data-testid="port-dirty"]')?.textContent === "false");
   checks.push({ name: "HTTP409 preserves draft without implicit retry", passed: true }); await budget("HTTP409");
 
-  for (const malformed of ["normalization", "scene_revision"]) {
+  for (const malformed of ["normalization", "scene_revision", "scene_id"]) {
     await boot(); await field("Branch 1 ID").fill("bad-ack-draft");
     await page.evaluate((kind) => window.__antennaPortEditorFixture.malformedNext(kind), malformed); await apply(); await release();
     await button("Rebase port").waitFor({ timeout });
@@ -197,9 +197,9 @@ try {
 
   await boot(); await field("Branch 1 ID").fill("old-owner-draft"); await apply();
   await page.evaluate(() => window.__antennaPortEditorFixture.switchSession("B"));
-  await page.getByTestId("port-owner").filter({ hasText: "session-B" }).waitFor({ timeout });
+  await page.getByTestId("port-owner").filter({ hasText: "restored-model-B" }).waitFor({ timeout });
   await page.evaluate(() => window.__antennaPortEditorFixture.switchSession("A"));
-  await page.getByTestId("port-owner").filter({ hasText: "session-A" }).waitFor({ timeout });
+  await page.getByTestId("port-owner").filter({ hasText: "restored-model-A" }).waitFor({ timeout });
   await field("Branch 1 ID").fill("new-owner-draft"); const abaBefore = await read();
   await release(); await page.waitForTimeout(350); const abaAfter = await read();
   assert.equal(abaAfter.invalidations, abaBefore.invalidations); assert.equal(abaAfter.canUndo, false);

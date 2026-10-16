@@ -26,7 +26,7 @@ import {
 
 interface Props {
   driveId: string;
-  scene: SceneResource | null;
+  scene: SceneResource | null; sceneScopeKey: string | null;
   status: string;
   refetch: () => void;
 }
@@ -45,7 +45,7 @@ interface RevisionConflict {
   phase: "conflict" | "refreshing" | "rebased";
 }
 
-export function SolvedAntennaDriveEditor({ driveId, scene, status, refetch }: Props) {
+export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status, refetch }: Props) {
   const { api, resources, commands, authoringHistory, selection } = useKernel();
   const identity = useSessionResourceIdentity();
   const scope = sessionRequestScopeKey(identity);
@@ -98,7 +98,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, status, refetch }: Pr
     ? local.dirtyKeys.filter((key) =>
         local.editedAgainst[key] !== initial[key] && local.draft[key] !== initial[key])
     : [];
-  const canSave = Boolean(scope && identity && scene?.scene?.id === identity.sessionId) &&
+  const canSave = Boolean(scope && identity && scene?.scene?.id && sceneScopeKey === scope) &&
     status === "ready" && validRevision && !pending &&
     locallyConflictingKeys.length === 0 && (!conflict || conflictPhase === "rebased");
   const comparisonKeys = conflict && initial
@@ -179,7 +179,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, status, refetch }: Pr
         merge_patch: { solved_antenna_drives: drives as unknown as JsonObject[] },
       };
       const resolveCommitted = (result: AuthoringTransactionResponse) =>
-        resolveCommittedSolvedDriveScene(result, updated, identity.sessionId, revision);
+        resolveCommittedSolvedDriveScene(result, updated, scene?.scene?.id ?? "", revision);
       const response = await runAuthoringMutationWithHistory({
         api, authoringHistory, selection, resourceData: { [MODEL_SCENE_PATH]: scene },
         sessionScopeKey: scope, isCurrentSessionScope: isCurrent,

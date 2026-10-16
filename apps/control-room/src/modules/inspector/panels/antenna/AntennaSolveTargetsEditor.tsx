@@ -24,12 +24,12 @@ import {
 interface Props {
   objectId: string;
   stageId: string;
-  scene: SceneResource | null;
+  scene: SceneResource | null; sceneScopeKey: string | null;
   status: string;
   refetch: () => void;
 }
 
-export function AntennaSolveTargetsEditor({ objectId, stageId, scene, status, refetch }: Props) {
+export function AntennaSolveTargetsEditor({ objectId, stageId, scene, sceneScopeKey, status, refetch }: Props) {
   const { api, resources, commands, authoringHistory, selection } = useKernel();
   const identity = useSessionResourceIdentity();
   const scope = sessionRequestScopeKey(identity);
@@ -64,7 +64,7 @@ export function AntennaSolveTargetsEditor({ objectId, stageId, scene, status, re
   let request: ReturnType<typeof buildAntennaSolveTargetsTransaction> | null = null;
   let reason: string | null = null;
   try {
-    if (!scene || !scope || scene.scene?.id !== identity?.sessionId || status !== "ready" || revision === null) {
+    if (!scene || !scope || !scene.scene?.id || sceneScopeKey !== scope || status !== "ready" || revision === null) {
       throw new Error("Current session-scoped scene is required to edit field-solve targets.");
     }
     request = buildAntennaSolveTargetsTransaction(scene, objectId, stageId, dirty && draft ? draft.baseRevision : revision, targets, samplingDomain);
@@ -98,7 +98,7 @@ export function AntennaSolveTargetsEditor({ objectId, stageId, scene, status, re
       if (!isCurrent()) return false;
       const committed = response.committed_scene;
       const acknowledged = committed?.antenna_field_solve_stages?.find((item) => item.id === stageId && item.source_object_id === objectId);
-      if (!committed || committed.scene?.id !== identity?.sessionId || committed.revision !== response.scene_revision ||
+      if (!committed || committed.scene?.id !== scene.scene?.id || committed.revision !== response.scene_revision ||
           !acknowledged || JSON.stringify(acknowledged.target_refs.map(antennaSolveTargetKey)) !== JSON.stringify(draft.targets.map(antennaSolveTargetKey)) ||
           draft.samplingDomain && antennaSolveTargetKey(acknowledged.field_sampling_domain) !== antennaSolveTargetKey(draft.samplingDomain)) {
         refetch();
@@ -124,7 +124,7 @@ export function AntennaSolveTargetsEditor({ objectId, stageId, scene, status, re
 
   useRegisterInspectorEditSession("staged", pending, dirty, Boolean(request && !conflict), undefined,
     apply, () => setDraft(null), { historyMode: "mutation-owned", applyBlockReason: reason ?? undefined });
-  const editable = Boolean(stage && scope && scene?.scene?.id === identity?.sessionId && revision !== null && !scene?.objects?.find((object) => object.id === objectId)?.locked);
+  const editable = Boolean(stage && scope && scene?.scene?.id && sceneScopeKey === scope && revision !== null && !scene?.objects?.find((object) => object.id === objectId)?.locked);
   return <InspectorGroup title="Field-solve sampling and targets" collapsible defaultOpen>
     <FieldRow label="Solve stage" value={stageId} mono />
     <FormField type="select" label="Field-sampling domain" value={samplingKey} disabled={!editable} onChange={(event) => {

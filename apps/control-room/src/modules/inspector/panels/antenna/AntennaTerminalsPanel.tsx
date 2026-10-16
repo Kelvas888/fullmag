@@ -46,7 +46,7 @@ export function AntennaTerminalsPanel({ selection: selected }: InspectorPanelPro
   useLayoutEffect(() => { owner.current = context.token; return () => { owner.current = null; }; }, [context.token]);
   const object = scene.data?.objects?.find((item) => item.id === objectId);
   const ports = (scene.data?.antenna_port_modes ?? []).filter((port) => port.source_object_id === objectId);
-  const editable = Boolean(scope && scene.data?.scene?.id === identity?.sessionId && object && !object.locked);
+  const editable = Boolean(scope && scene.data?.scene?.id && scene.sessionScopeKey === scope && object && !object.locked);
   const errors = draft && scene.data ? antennaTerminalPreparationErrors(scene.data, objectId, draft) : ["Choose a port and load its terminal surfaces."];
   const canApply = Boolean(editable && scene.status === "ready" && draft?.dirty && !pending && errors.length === 0);
 
@@ -89,7 +89,7 @@ export function AntennaTerminalsPanel({ selection: selected }: InspectorPanelPro
       const expected = (request.merge_patch?.current_transports as unknown as { name: string; external_lead_preparation?: unknown }[]).find((item) => item.name === port.current_transport_id);
       const actual = committed?.current_transports?.find((item) => item.name === port.current_transport_id);
       const stages = committed?.antenna_field_solve_stages?.filter((stage) => stage.current_transport_id === port.current_transport_id) ?? [];
-      if (!committed || committed.scene?.id !== identity?.sessionId || committed.revision !== response.scene_revision || !actual ||
+      if (!committed || committed.scene?.id !== sourceScene.scene?.id || committed.revision !== response.scene_revision || !actual ||
         (actual.boundaries != null && (!Array.isArray(actual.boundaries) || actual.boundaries.length > 0)) || actual.conservative_current_view || antennaPreparationIdentity(actual.external_lead_preparation) !== antennaPreparationIdentity(expected?.external_lead_preparation) ||
         stages.length !== sourceScene.antenna_field_solve_stages?.filter((stage) => stage.current_transport_id === port.current_transport_id).length ||
         stages.some((stage) => stage.conservative_current_view_ref) || antennaTerminalGeometryBinding(committed, objectId) !== submitted.geometryBinding) {

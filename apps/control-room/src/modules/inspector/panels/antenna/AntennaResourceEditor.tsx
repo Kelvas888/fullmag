@@ -20,14 +20,14 @@ import {
   type AntennaEditableKind, type AntennaResourceDraft,
 } from "./AntennaResourceEditorModel";
 
-interface Props { kind: AntennaEditableKind; resourceId: string; scene: SceneResource | null; status: string; refetch: () => void }
+interface Props { kind: AntennaEditableKind; resourceId: string; scene: SceneResource | null; sceneScopeKey: string | null; status: string; refetch: () => void }
 function canonical(value: unknown): string {
   const sort = (item: unknown): unknown => Array.isArray(item) ? item.map(sort) : item && typeof item === "object"
     ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)).map(([key, entry]) => [key, sort(entry)])) : item;
   return JSON.stringify(sort(value));
 }
 
-export function AntennaResourceEditor({ kind, resourceId, scene, status, refetch }: Props) {
+export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, status, refetch }: Props) {
   const { api, resources, commands, authoringHistory, selection } = useKernel();
   const identity = useSessionResourceIdentity();
   const scope = sessionRequestScopeKey(identity);
@@ -49,7 +49,7 @@ export function AntennaResourceEditor({ kind, resourceId, scene, status, refetch
   const pending = pendingState?.token === context.token;
   const revision = typeof scene?.revision === "number" && Number.isSafeInteger(scene.revision) ? scene.revision : null;
   const conflict = Boolean(dirty && draft?.baseRevision !== revision);
-  const scoped = Boolean(scope && scene?.scene?.id === identity?.sessionId && revision !== null);
+  const scoped = Boolean(scope && scene?.scene?.id && sceneScopeKey === scope && revision !== null);
   const dependents = scene ? antennaResourceDependents(scene, kind, resourceId) : [];
   let transaction: ReturnType<typeof buildAntennaResourceTransaction> | null = null;
   let reason: string | null = null;
@@ -86,7 +86,7 @@ export function AntennaResourceEditor({ kind, resourceId, scene, status, refetch
       if (!isCurrent()) return false;
       const committed = response.committed_scene;
       const collection = antennaCollection[kind];
-      if (!committed || committed.scene?.id !== identity?.sessionId || committed.revision !== response.scene_revision ||
+      if (!committed || committed.scene?.id !== scene.scene?.id || committed.revision !== response.scene_revision ||
           canonical(committed[collection]) !== canonical(request.merge_patch?.[collection])) {
         throw new Error("Antenna resource ACK omitted or changed the submitted collection. Refresh before retrying.");
       }

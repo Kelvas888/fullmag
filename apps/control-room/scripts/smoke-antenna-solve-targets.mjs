@@ -173,9 +173,9 @@ try {
 
   await boot(); await add(objectKey); await apply();
   await page.evaluate(() => window.__antennaSolveTargetsFixture.switchSession("B"));
-  await page.getByTestId("solve-owner").filter({ hasText: "session-B" }).waitFor({ timeout }); await ready();
+  await page.getByTestId("solve-owner").filter({ hasText: "restored-model-B" }).waitFor({ timeout }); await ready();
   await page.evaluate(() => window.__antennaSolveTargetsFixture.switchSession("A"));
-  await page.getByTestId("solve-owner").filter({ hasText: "session-A" }).waitFor({ timeout }); await ready();
+  await page.getByTestId("solve-owner").filter({ hasText: "restored-model-A" }).waitFor({ timeout }); await ready();
   await add(regionKey);
   const abaBefore = await read();
   await release(); await page.waitForTimeout(350);

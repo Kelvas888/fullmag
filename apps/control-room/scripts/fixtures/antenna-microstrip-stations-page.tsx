@@ -76,6 +76,11 @@ function makeFixture() {
     params.conductors = [{ id: "trace", kind: "signal" }, { id: "left", kind: "ground_left" }, { id: "right", kind: "ground_right" }];
   }
   const state = { scene: { revision: 1, scene_revision: 1, scene: { id: "restored-authoring-model", name: "Fixture", authoring_schema: "fixture", source_of_truth: "fixture" }, objects: [{ id: OBJECT_ID, name: "Microstrip fixture", geometry, notes: "initial" }] } as SceneResource, renderCommits: 0, holdScene: false };
+  const placementMode = typeof window !== "undefined" && new URL(window.location.href).searchParams.has("placement");
+  if (placementMode) {
+    state.scene.objects!.push({ id: "placement-target", name: "Explicit magnetic target", magnetization_ref: "authored-magnetization", geometry: { geometry_kind: "Box", geometry_params: {} } });
+    if (new URL(window.location.href).searchParams.has("placement_missing_id")) state.scene.scene!.id = "";
+  }
   const calls: Call[] = [];
   const unexpected: string[] = [];
   const invalidations: { resourceKey: string; revision: unknown }[] = [];
@@ -112,7 +117,7 @@ function makeFixture() {
         if (!state.holdScene) return json(snapshot);
         return new Promise<Response>((resolve) => pendingSceneReads.push(() => resolve(json(snapshot))));
       }
-      if (request.method === "GET" && path === MODEL_GEOMETRY_REALIZATION_CURRENT_PATH) return json({ source_scene_revision: state.scene.revision, bodies: [] });
+      if (request.method === "GET" && path === MODEL_GEOMETRY_REALIZATION_CURRENT_PATH) return json({ source_scene_revision: state.scene.revision, bodies: placementMode ? [{ object_id: "placement-target", status: "ready", bounds_min: [-1e-6, -5e-7, -1e-8], bounds_max: [1e-6, 5e-7, 1e-8] }] : [] });
       if (request.method === "POST" && path === MODEL_TRANSACTIONS_PATH) {
         const transaction = body as AuthoringTransactionRequest;
         if (transaction.kind === "merge_patch" && transaction.base_revision === state.scene.revision) {
@@ -125,6 +130,13 @@ function makeFixture() {
               acknowledged.antenna_port_modes = acknowledged.antenna_port_modes?.map(port => ({ ...port, normalization: null }));
             }
             resolve(json({ scene_revision: revision, transaction_kind: transaction.kind, committed_scene: acknowledged }));
+          }));
+        }
+        if (transaction.kind === "commit_object_transform" && transaction.object_id === OBJECT_ID && transaction.base_revision === state.scene.revision) {
+          return new Promise<Response>((resolve) => pendingWrites.push(() => {
+            const revision = Number(state.scene.revision) + 1;
+            state.scene = { ...state.scene, revision, scene_revision: revision, objects: state.scene.objects?.map(object => object.id === OBJECT_ID ? { ...object, transform: { ...object.transform, ...structuredClone(transaction.transform) } } : object) };
+            resolve(json({ scene_revision: revision, transaction_kind: transaction.kind, committed_scene: structuredClone(state.scene) }));
           }));
         }
         if (transaction.kind !== "patch_object_geometry" || transaction.object_id !== OBJECT_ID || transaction.base_revision !== state.scene.revision) {
@@ -228,7 +240,7 @@ function EditorHarness({ control }: { control: FixtureControl }) {
   const selected = useSyncExternalStore(control.subscribeSelection, control.readSelection, () => EMPTY_SELECTION);
   const resource = useSceneResource();
   const [foreignScope, setForeignScope] = useState(false);
-  const created = resource.data?.objects?.findLast((object) => object.id !== OBJECT_ID);
+  const created = resource.data?.objects?.findLast((object) => object.id !== OBJECT_ID && object.role === "antenna");
   const routedInspector = new URL(window.location.href).searchParams.has("inspector");
   const studyMode = new URL(window.location.href).searchParams.has("study");
   const ownerId = selected.ref?.type === "scene-object" ? selected.ref.objectId : null;

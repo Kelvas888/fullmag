@@ -184,11 +184,11 @@ export function buildSolvedDrive(
 }
 
 export function resolveCommittedSolvedDriveScene(
-  result: AuthoringTransactionResponse, expectedDrive: SolvedDrive, sessionId: string, baseRevision: number,
+  result: AuthoringTransactionResponse, expectedDrive: SolvedDrive, expectedSceneId: string, baseRevision: number,
 ): SceneResource {
   const committed = result.committed_scene;
   const matches = committed?.solved_antenna_drives?.filter((item) => item.id === expectedDrive.id) ?? [];
-  if (!committed || committed.scene?.id !== sessionId || committed.revision !== result.scene_revision ||
+  if (!expectedSceneId.trim() || !committed || committed.scene?.id !== expectedSceneId || committed.revision !== result.scene_revision ||
     !Number.isSafeInteger(result.scene_revision) || result.scene_revision <= baseRevision || matches.length !== 1) {
     throw new Error("Drive ACK did not provide the current committed scene. Refresh before saving again.");
   }

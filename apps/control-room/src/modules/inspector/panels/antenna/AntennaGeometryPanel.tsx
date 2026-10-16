@@ -72,7 +72,7 @@ export function AntennaGeometryPanel({ selection }: InspectorPanelProps) {
     </InspectorGroup> : null}
     {objectId ? <>
       <MicrostripGeometryEditor key={`geometry:${objectId}`} objectId={objectId} scene={scene.data} status={scene.status} refetch={scene.refetch} />
-      <AntennaPlacementEditor key={`placement:${objectId}`} objectId={objectId} scene={scene.data} status={scene.status} refetch={scene.refetch} />
+      <AntennaPlacementEditor key={`placement:${objectId}`} objectId={objectId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} />
     </> : null}
   </div>;
 }

@@ -604,6 +604,10 @@ verify-antenna-external-lead-inspection-browser:
 verify-antenna-cpw-viewport-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3260 --scenario antenna-cpw-viewport
 
+# Sampling/targets on a confirmed restored model; no solver or unit build.
+verify-antenna-solve-targets-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3256 --scenario antenna-solve-targets
+
 # Production microstrip/CPW draft transactions in an isolated browser fixture.
 verify-antenna-microstrip-stations-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3253 --scenario antenna-microstrip-stations
