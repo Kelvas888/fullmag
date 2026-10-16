@@ -5,7 +5,7 @@ import type { VisualizationStatePatch } from "@/kernel/api/apiTypes";
 import { useKernel } from "@/kernel/KernelContext";
 import { createCommandContext } from "@/kernel/commands/commandContext";
 import type { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
-import { RIBBON_VISUALIZATION_PATCH_STATE_COMMAND, visualizationStateCommandInput } from "@/modules/ribbon/ribbonCommands";
+import { RIBBON_VISUALIZATION_PATCH_STATE_COMMAND, visualizationStateCommandInput } from "@/modules/ribbon/public";
 import { Slider } from "@/shared/ui/Slider";
 import { Switch } from "@/shared/ui/Switch";
 import { FieldRow } from "../../primitives/FieldRow";
