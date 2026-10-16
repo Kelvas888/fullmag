@@ -29,8 +29,12 @@ MAINTENANCE_SERVICE = "backend-cache-maintenance"
 CONSUMER_PROFILE_LABEL = "com.fullmag.backend-cache.profile"
 CONSUMER_KEY_LABEL = "com.fullmag.backend-cache.key"
 IMAGE_LABEL = "fm-be-cache-v1"
-CACHE_SIZE_BYTES = 12 * 1024 * 1024 * 1024
+LEGACY_CACHE_SIZE_BYTES = 12 * 1024 * 1024 * 1024
+CACHE_SIZE_BYTES = 24 * 1024 * 1024 * 1024
+SUPPORTED_CACHE_SIZE_BYTES = frozenset({LEGACY_CACHE_SIZE_BYTES, CACHE_SIZE_BYTES})
 NEW_BACKING_FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024
+GROWTH_FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024
+GROWTH_SCHEMA = "fullmag.backend-build-cache-growth.v1"
 MOUNT_TARGET = "/fullmag-backend-cache"
 GUEST_TARGET = "/build"
 DAEMON_HOST_PREFIX = "/run/desktop/mnt/host"
@@ -224,7 +228,31 @@ def _cache_paths(layout: Mapping[str, Any], key: str) -> dict[str, Any]:
     }
 
 
-def _guard_new_backing_space(backing: Path, storage_root: Path) -> None:
+def _require_cache_size(value: Any, label: str = "cache size") -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value not in SUPPORTED_CACHE_SIZE_BYTES:
+        raise BackendCacheError(f"{label} must be exactly 12 GiB or 24 GiB")
+    return value
+
+
+def _existing_backing_size(backing: Path) -> int:
+    if backing.is_symlink():
+        raise BackendCacheError(f"backend cache backing image is a symlink: {backing}")
+    if not backing.exists():
+        return CACHE_SIZE_BYTES
+    if not backing.is_file():
+        raise BackendCacheError(f"backend cache backing image is not a regular file: {backing}")
+    try:
+        size = backing.stat().st_size
+    except OSError as exc:
+        raise BackendCacheError(f"cannot inspect backend cache backing image: {backing}") from exc
+    return _require_cache_size(size, "existing backend cache backing size")
+
+
+def _guard_new_backing_space(
+    backing: Path,
+    storage_root: Path,
+    size_bytes: int = CACHE_SIZE_BYTES,
+) -> None:
     """Reject a new backing when native allocation would exhaust storage.
 
     Existing backings are already accounted for by the cache identity and are
@@ -234,7 +262,8 @@ def _guard_new_backing_space(backing: Path, storage_root: Path) -> None:
 
     if backing.exists() or backing.is_symlink():
         return
-    required = CACHE_SIZE_BYTES + NEW_BACKING_FREE_SPACE_MARGIN_BYTES
+    size_bytes = _require_cache_size(size_bytes)
+    required = size_bytes + NEW_BACKING_FREE_SPACE_MARGIN_BYTES
     try:
         free = shutil.disk_usage(storage_root).free
     except OSError as exc:
@@ -246,6 +275,51 @@ def _guard_new_backing_space(backing: Path, storage_root: Path) -> None:
             "insufficient free space for new backend cache backing: "
             f"{free} bytes free, {required} required"
         )
+
+
+def _guard_growth_space(backing: Path, storage_root: Path) -> None:
+    """Require room for only the 12 GiB growth delta plus a safety margin."""
+
+    if backing.is_symlink() or not backing.exists():
+        raise BackendCacheError("cannot grow a missing or symlinked backend cache backing")
+    current = _existing_backing_size(backing)
+    if current != LEGACY_CACHE_SIZE_BYTES:
+        raise BackendCacheError("backend cache growth requires an exact 12 GiB backing")
+    required = CACHE_SIZE_BYTES - LEGACY_CACHE_SIZE_BYTES + GROWTH_FREE_SPACE_MARGIN_BYTES
+    try:
+        free = shutil.disk_usage(storage_root).free
+    except OSError as exc:
+        raise BackendCacheError(
+            f"cannot inspect free space for backend cache growth: {storage_root}"
+        ) from exc
+    if free < required:
+        raise BackendCacheError(
+            "insufficient free space for backend cache growth: "
+            f"{free} bytes free, {required} required"
+        )
+
+
+def _growth_journal_is_present(backing: Path, cache_key_value: str) -> bool:
+    """Allow a 24 GiB retry only when the helper left an attested journal."""
+
+    journal = Path(str(backing) + ".growth-v1.json")
+    if journal.is_symlink() or not journal.exists() or not journal.is_file():
+        return False
+    try:
+        if journal.stat().st_size > 16 * 1024:
+            return False
+        value = json.loads(journal.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(value, Mapping)
+        and value.get("schema") == GROWTH_SCHEMA
+        and value.get("operation") == "grow"
+        and value.get("state") in {"started", "succeeded"}
+        and value.get("cache_key") == cache_key_value
+        and value.get("previous_size_bytes") == LEGACY_CACHE_SIZE_BYTES
+        and value.get("size_bytes") == CACHE_SIZE_BYTES
+    )
 
 
 def _copy_immutable(source: Path, destination: Path) -> str:
@@ -354,6 +428,33 @@ def _assert_no_active_consumers(docker: Callable[..., Any], cache_key_value: str
         raise BackendCacheError(f"backend cache {cache_key_value} is already held by container {container_id}")
 
 
+def _assert_no_mount_consumers(docker: Callable[..., Any], mount_root: str) -> None:
+    """Reject every Docker container that still declares the exact cache bind."""
+
+    raw = docker("ps", "--all", "--quiet", timeout=60)
+    if not isinstance(raw, str):
+        raise BackendCacheError("Docker mount consumer guard returned a non-text result")
+    ids = [item.strip() for item in raw.splitlines() if item.strip()]
+    for container_id in ids:
+        if _CONTAINER_ID.fullmatch(container_id) is None:
+            raise BackendCacheError("Docker mount consumer guard returned an invalid container ID")
+        document = _read_json_output(docker("inspect", container_id, timeout=60))
+        if not isinstance(document, list) or len(document) != 1 or not isinstance(document[0], Mapping):
+            raise BackendCacheError("Docker mount consumer inspect returned no container")
+        mounts = document[0].get("Mounts")
+        if not isinstance(mounts, list):
+            raise BackendCacheError("Docker mount consumer has no mount inventory")
+        if any(
+            isinstance(mount, Mapping)
+            and mount.get("Type") == "bind"
+            and str(mount.get("Source")) == mount_root
+            for mount in mounts
+        ):
+            raise BackendCacheError(
+                f"backend cache mount is still declared by Docker container {container_id}"
+            )
+
+
 def _mount_entries(service: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     mounts = service.get("volumes")
     if not isinstance(mounts, list):
@@ -409,7 +510,14 @@ def _render_maintenance_config(destination: Path, document: Mapping[str, Any]) -
     )
 
 
-def _validate_host_receipt(receipt: Mapping[str, Any], values: Mapping[str, Any], image_id: str, toolchain_image: str) -> None:
+def _validate_host_receipt(
+    receipt: Mapping[str, Any],
+    values: Mapping[str, Any],
+    image_id: str,
+    toolchain_image: str,
+    *,
+    expected_size: int | None = None,
+) -> None:
     required = {
         "schema", "profile", "state", "project_id", "cache_key", "backing_image",
         "mount_root", "mount_target", "filesystem", "filesystem_label", "filesystem_uuid",
@@ -431,10 +539,51 @@ def _validate_host_receipt(receipt: Mapping[str, Any], values: Mapping[str, Any]
         raise BackendCacheError("backend cache filesystem is not attested ext4")
     if not _LOOP_DEVICE.fullmatch(str(receipt["loop_device"])) or receipt["mount_active"] is not True:
         raise BackendCacheError("backend cache loop mount is not active")
-    if (receipt["size_bytes"] != CACHE_SIZE_BYTES
+    receipt_size = _require_cache_size(receipt["size_bytes"], "host receipt size")
+    if (expected_size is not None and receipt_size != _require_cache_size(expected_size)
             or receipt["runtime_image_id"] != image_id
             or receipt["toolchain_image_id"] != toolchain_image):
         raise BackendCacheError("backend cache size or image attestation mismatch")
+
+
+def _validate_growth_receipt(
+    receipt: Mapping[str, Any],
+    values: Mapping[str, Any],
+    image_id: str,
+    toolchain_image: str,
+) -> None:
+    required = {
+        "schema", "profile", "state", "project_id", "cache_key", "backing_image",
+        "mount_root", "mount_target", "filesystem", "filesystem_label", "filesystem_uuid",
+        "loop_device", "mount_active", "previous_size_bytes", "size_bytes",
+        "runtime_image_id", "toolchain_image_id", "owner_token", "growth_receipt",
+    }
+    if not required.issubset(receipt):
+        raise BackendCacheError("backend cache growth receipt is incomplete")
+    if receipt["schema"] != SCHEMA or receipt["profile"] != PROFILE or receipt["state"] != "grown":
+        raise BackendCacheError("backend cache growth receipt schema/state mismatch")
+    if receipt["project_id"] != values["project_id"] or receipt["cache_key"] != values["cache_key"]:
+        raise BackendCacheError("backend cache growth project or key changed")
+    if receipt["backing_image"] != _daemon_path(values["backing_image"], "backing_image"):
+        raise BackendCacheError("backend cache growth backing image mismatch")
+    if receipt["mount_root"] != values["mount_root"] or receipt["mount_target"] != values["mount_target"]:
+        raise BackendCacheError("backend cache growth mount identity mismatch")
+    if (receipt["filesystem"] != "ext4" or receipt["filesystem_label"] != IMAGE_LABEL
+            or not isinstance(receipt["filesystem_uuid"], str)
+            or _UUID.fullmatch(receipt["filesystem_uuid"]) is None
+            or receipt["mount_active"] is not True):
+        raise BackendCacheError("backend cache growth filesystem is not attested")
+    if (receipt["previous_size_bytes"] != LEGACY_CACHE_SIZE_BYTES
+            or receipt["size_bytes"] != CACHE_SIZE_BYTES
+            or receipt["runtime_image_id"] != image_id
+            or receipt["toolchain_image_id"] != toolchain_image
+            or not isinstance(receipt["owner_token"], str)
+            or _UUID.fullmatch(receipt["owner_token"]) is None):
+        raise BackendCacheError("backend cache growth size, image, or owner attestation mismatch")
+    if receipt["growth_receipt"] != _daemon_path(
+        str(values["backing_image"]) + ".growth-v1.json", "growth_receipt"
+    ):
+        raise BackendCacheError("backend cache growth journal path mismatch")
 
 
 def prepare(
@@ -462,7 +611,8 @@ def prepare(
             worktree_id = hashlib.sha256(str(repo_path).encode("utf-8")).hexdigest()[:16]
     identity = cache_key(source, str(worktree_id), toolchain_image)
     paths = _cache_paths(layout, identity["key"])
-    _guard_new_backing_space(paths["backing_image"], paths["storage_root"])
+    capacity = _existing_backing_size(paths["backing_image"])
+    _guard_new_backing_space(paths["backing_image"], paths["storage_root"], capacity)
     _require_image_id(image, "runtime image")
     _require_image_id(toolchain_image, "toolchain image")
     run_path = Path(runroot)
@@ -490,7 +640,7 @@ def prepare(
         ENV_LOCK_PATH: _daemon_path(paths["lock_path"], "lock_path"),
         ENV_MOUNT_ROOT: paths["mount_root"],
         ENV_OWNER_MARKER: paths["owner_marker"],
-        ENV_SIZE_BYTES: str(CACHE_SIZE_BYTES),
+        ENV_SIZE_BYTES: str(capacity),
         ENV_MOUNT_TARGET: paths["mount_target"],
         ENV_FILESYSTEM_UUID: "",
         ENV_RUNTIME_IMAGE_ID: image,
@@ -520,7 +670,7 @@ def prepare(
     receipt = _read_json_output(output)
     if not isinstance(receipt, Mapping):
         raise BackendCacheError("backend cache maintenance returned no receipt")
-    _validate_host_receipt(receipt, values, image, toolchain_image)
+    _validate_host_receipt(receipt, values, image, toolchain_image, expected_size=capacity)
     environment[ENV_FILESYSTEM_UUID] = str(receipt["filesystem_uuid"])
     receipt_path = run_path / "backend-cache-receipt.json"
     _atomic_json(
@@ -530,6 +680,7 @@ def prepare(
             "cache_key": identity["key"], "identity": identity,
             "project_id": paths["project_id"], "runtime_image": runtime,
             "toolchain_image": toolchain, "host_receipt": dict(receipt),
+            "size_bytes": capacity,
             "helper_sha256": helper_sha256, "compose_overlay_sha256": overlay_sha256,
             "environment": environment,
         },
@@ -539,6 +690,145 @@ def prepare(
         "cache_key": identity["key"], "identity": identity,
         "project_id": paths["project_id"], "image_id": image,
         "toolchain_image_id": toolchain_image,
+        "size_bytes": capacity,
+        "filesystem_uuid": environment[ENV_FILESYSTEM_UUID],
+        "mount_root": paths["mount_root"], "guest_target": GUEST_TARGET,
+        "environment": environment, "compose_overlay": str(overlay_copy),
+        "maintenance_compose": str(maintenance_config),
+        "helper_sha256": helper_sha256, "compose_overlay_sha256": overlay_sha256,
+        "receipt": dict(receipt), "receipt_path": str(receipt_path),
+    }
+
+
+def grow(
+    layout: Mapping[str, Any],
+    repo: str | os.PathLike[str],
+    image: str,
+    runroot: str | os.PathLike[str],
+    docker: Callable[..., Any],
+    *,
+    source_root: str | os.PathLike[str],
+    toolchain_image: str,
+) -> dict[str, Any]:
+    """Grow one attested legacy 12 GiB cache to 24 GiB under exclusive locks.
+
+    This is deliberately separate from :func:`prepare`: an existing backing is
+    never resized as a side effect of normal cache admission.  The maintenance
+    helper writes a durable started/succeeded journal and fails closed on an
+    incomplete or foreign journal.
+    """
+
+    repo_path = Path(repo).resolve(strict=True)
+    source = _source_root(source_root)
+    worktree_id = layout.get("worktree_id")
+    if worktree_id is None:
+        worktree_id = layout.get("project_id")
+    if worktree_id is None:
+        try:
+            import fullmag_storage
+            worktree_id = fullmag_storage.identifier(repo_path)
+        except (ImportError, AttributeError, TypeError, ValueError):
+            worktree_id = hashlib.sha256(str(repo_path).encode("utf-8")).hexdigest()[:16]
+    identity = cache_key(source, str(worktree_id), toolchain_image)
+    paths = _cache_paths(layout, identity["key"])
+    capacity = _existing_backing_size(paths["backing_image"])
+    if capacity == LEGACY_CACHE_SIZE_BYTES:
+        _guard_growth_space(paths["backing_image"], paths["storage_root"])
+    elif capacity == CACHE_SIZE_BYTES:
+        if not _growth_journal_is_present(paths["backing_image"], identity["key"]):
+            raise BackendCacheError(
+                "24 GiB backend cache can only be resumed with its attested growth journal"
+            )
+    else:  # pragma: no cover - _existing_backing_size rejects other capacities.
+        raise BackendCacheError("backend cache grow requires a supported existing capacity")
+    _require_image_id(image, "runtime image")
+    _require_image_id(toolchain_image, "toolchain image")
+    run_path = Path(runroot)
+    if not run_path.is_absolute() or run_path.is_symlink():
+        raise BackendCacheError("backend cache growth run root must be an absolute real path")
+    run_path.mkdir(parents=True, exist_ok=True)
+
+    helper_source = repo_path / "scripts" / "lib" / "docker_backend_cache.sh"
+    overlay_source = repo_path / "compose.backend-cache.yaml"
+    helper_copy = run_path / "docker_backend_cache.grow.sh"
+    overlay_copy = run_path / "compose.backend-cache.grow.yaml"
+    helper_sha256 = _copy_immutable(helper_source, helper_copy)
+    overlay_sha256 = _copy_immutable(overlay_source, overlay_copy)
+    runtime = _image_attestation(docker, image, "runtime")
+    toolchain = _image_attestation(docker, toolchain_image, "toolchain")
+    values = {
+        **paths,
+        "cache_key": identity["key"],
+        "image_id": image,
+        "toolchain_image_id": toolchain_image,
+    }
+    project_name = f"fullmag-backend-cache-grow-{paths['project_id']}-{identity['key'][:16]}"
+    environment: dict[str, str] = {
+        ENV_SCHEMA: SCHEMA,
+        ENV_PROFILE: PROFILE,
+        ENV_PROJECT_ID: paths["project_id"],
+        ENV_KEY: identity["key"],
+        ENV_STORAGE_ROOT: _daemon_path(paths["storage_root"], "storage_root"),
+        ENV_BACKING_IMAGE: _daemon_path(paths["backing_image"], "backing_image"),
+        ENV_LOCK_PATH: _daemon_path(paths["lock_path"], "lock_path"),
+        ENV_MOUNT_ROOT: paths["mount_root"],
+        ENV_OWNER_MARKER: paths["owner_marker"],
+        ENV_SIZE_BYTES: str(CACHE_SIZE_BYTES),
+        ENV_MOUNT_TARGET: paths["mount_target"],
+        ENV_FILESYSTEM_UUID: "",
+        ENV_RUNTIME_IMAGE_ID: image,
+        ENV_HELPER_IMAGE: image,
+        ENV_HELPER_PATH: _daemon_path(helper_copy, "helper_copy"),
+        ENV_HOST_PID: "1",
+        ENV_UID: "65532",
+        ENV_GID: "65532",
+        ENV_SOURCE_ROOT: source,
+        ENV_WORKTREE_ID: str(worktree_id),
+        ENV_TOOLCHAIN_IMAGE: toolchain_image,
+        ENV_LOCK_WAIT: "120",
+    }
+
+    _assert_no_active_consumers(docker, identity["key"], paths["mount_root"])
+    _assert_no_mount_consumers(docker, paths["mount_root"])
+    configured = _compose_config(docker, overlay_copy, project_name, environment)
+    _validate_overlay_config(configured, environment)
+    maintenance_config = run_path / "compose.backend-cache-growth-maintenance.json"
+    _render_maintenance_config(maintenance_config, configured)
+    maintenance_name = f"fullmag-backend-cache-growth-{identity['key'][:16]}"
+    output = docker(
+        "compose", "--project-name", project_name, "-f", str(maintenance_config),
+        "--profile", MAINTENANCE_PROFILE, "run", "--rm", "--no-deps", "--name",
+        maintenance_name, "--label", f"{CONSUMER_PROFILE_LABEL}={PROFILE}",
+        "-e", f"FULLMAG_BACKEND_CACHE_GROW_FROM_BYTES={LEGACY_CACHE_SIZE_BYTES}",
+        "-e", f"FULLMAG_BACKEND_CACHE_GROW_TO_BYTES={CACHE_SIZE_BYTES}",
+        MAINTENANCE_SERVICE, "grow", timeout=300, environment=environment,
+    )
+    receipt = _read_json_output(output)
+    if not isinstance(receipt, Mapping):
+        raise BackendCacheError("backend cache growth returned no receipt")
+    _validate_growth_receipt(receipt, values, image, toolchain_image)
+    environment[ENV_FILESYSTEM_UUID] = str(receipt["filesystem_uuid"])
+    receipt_path = run_path / "backend-cache-growth-receipt.json"
+    _atomic_json(
+        receipt_path,
+        {
+            "schema": SCHEMA, "profile": PROFILE, "state": "grown",
+            "cache_key": identity["key"], "identity": identity,
+            "project_id": paths["project_id"], "runtime_image": runtime,
+            "toolchain_image": toolchain, "host_receipt": dict(receipt),
+            "previous_size_bytes": LEGACY_CACHE_SIZE_BYTES,
+            "size_bytes": CACHE_SIZE_BYTES,
+            "helper_sha256": helper_sha256, "compose_overlay_sha256": overlay_sha256,
+            "environment": environment,
+        },
+    )
+    return {
+        "schema": SCHEMA, "profile": PROFILE, "state": "grown",
+        "cache_key": identity["key"], "identity": identity,
+        "project_id": paths["project_id"], "image_id": image,
+        "toolchain_image_id": toolchain_image,
+        "previous_size_bytes": LEGACY_CACHE_SIZE_BYTES,
+        "size_bytes": CACHE_SIZE_BYTES,
         "filesystem_uuid": environment[ENV_FILESYSTEM_UUID],
         "mount_root": paths["mount_root"], "guest_target": GUEST_TARGET,
         "environment": environment, "compose_overlay": str(overlay_copy),
@@ -608,5 +898,6 @@ def validate_container(document: Mapping[str, Any], profile: Mapping[str, Any]) 
         raise BackendCacheError("backend container /build bind is read-only")
     return {
         "schema": SCHEMA, "state": "attested", "cache_key": profile["cache_key"],
-        "filesystem_uuid": profile["filesystem_uuid"], "target": GUEST_TARGET,
+        "filesystem_uuid": profile["filesystem_uuid"],
+        "target": GUEST_TARGET,
     }
