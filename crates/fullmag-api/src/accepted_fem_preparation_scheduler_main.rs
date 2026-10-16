@@ -243,14 +243,6 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
     let mut consecutive_idle_polls = 0usize;
 
     loop {
-        if let Some(host) = host.as_ref() {
-            retry_store_writer_busy(|| host.reconcile_tentative_store_admissions(&store))
-                .context("preparation scheduler: reconcile tentative store admissions")?;
-            retry_store_writer_busy(|| host.reconcile_released_store_reservations(&store))
-                .context("preparation scheduler: reconcile released host reservations")?;
-            retry_store_writer_busy(|| host.reconcile_task_cancellations(&store))
-                .context("preparation scheduler: reconcile task cancellations")?;
-        }
         reap_finished(
             &store,
             &args.pool_id,
@@ -267,6 +259,40 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
             .is_some_and(|limit| completed.len() >= limit && active.is_empty())
         {
             break;
+        }
+
+        let mut reconciliation_deferred = false;
+        if let Some(host) = host.as_ref() {
+            let reconciliation = (|| -> Result<()> {
+                retry_store_writer_busy(|| host.reconcile_tentative_store_admissions(&store))
+                    .context("preparation scheduler: reconcile tentative store admissions")?;
+                retry_store_writer_busy(|| host.reconcile_released_store_reservations(&store))
+                    .context("preparation scheduler: reconcile released host reservations")?;
+                retry_store_writer_busy(|| host.reconcile_task_cancellations(&store))
+                    .context("preparation scheduler: reconcile task cancellations")?;
+                Ok(())
+            })();
+            match reconciliation {
+                Ok(()) => {}
+                Err(error) if is_store_writer_busy(&error) => {
+                    tracing::warn!(
+                        error = ?error,
+                        "preparation scheduler deferred host reconciliation while the session store writer is busy"
+                    );
+                    reconciliation_deferred = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if reconciliation_deferred {
+            // Existing supervisors remain observable and are reaped at the
+            // next iteration; no recovery or new preparation admission starts
+            // while the host ledger fence is unresolved.
+            if shutdown_requested.load(Ordering::Acquire) && active.is_empty() {
+                break;
+            }
+            std::thread::sleep(args.idle_poll_interval);
+            continue;
         }
 
         // New recovery is scoped to the current pool. Already owned handles in
@@ -744,6 +770,12 @@ fn spawn_supervisor(
 
 fn retry_store_writer_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
     fullmag_runtime_control::retry_store_writer_busy(&mut operation)
+}
+
+fn is_store_writer_busy(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
 }
 
 fn sibling_preparer_executable() -> Result<PathBuf> {

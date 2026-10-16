@@ -135,6 +135,25 @@ async fn publish_compute_node_sample(
     .context("compute-node sampling worker failed")?
 }
 
+const MAX_CONSECUTIVE_SAMPLE_STORE_WRITER_BUSY: u32 = 5;
+const HOST_ADMISSION_DEFERRAL_BUDGET: Duration = Duration::from_secs(60);
+
+fn is_store_writer_busy(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
+}
+
+fn sample_store_writer_busy_within_budget(consecutive: &mut u32) -> bool {
+    *consecutive = consecutive.saturating_add(1);
+    *consecutive <= MAX_CONSECUTIVE_SAMPLE_STORE_WRITER_BUSY
+}
+
+fn host_admission_deferral_within_budget(deferred_at: &mut Option<Instant>, now: Instant) -> bool {
+    let started_at = deferred_at.get_or_insert(now);
+    now.duration_since(*started_at) < HOST_ADMISSION_DEFERRAL_BUDGET
+}
+
 impl SchedulerChild {
     fn request_drain(&mut self) -> Result<()> {
         if let Some(mut input) = self.input.take() {
@@ -1359,6 +1378,8 @@ fn run_service(path: PathBuf) -> Result<()> {
             let mut heartbeat = Instant::now();
             let mut last_compute_node_sample = Instant::now();
             let mut pending_compute_node_sample: Option<ComputeNodeSampleFuture> = None;
+            let mut consecutive_busy_samples = 0_u32;
+            let mut admission_deferred_at = None;
             // A drain or control error observed while a sample is in flight
             // cannot make us leave the loop: doing so would drop the future
             // while its spawn_blocking worker continued to own the ledger.
@@ -1373,7 +1394,7 @@ fn run_service(path: PathBuf) -> Result<()> {
                             pending_compute_node_sample = Some(Box::pin(
                                 publish_compute_node_sample(
                                     Arc::clone(ledger),
-                                    inventory_owner.take(),
+                                    inventory_owner.clone(),
                                     config.host_execution.as_ref().and_then(|binding| {
                                         binding.runtime_generation_sha256.clone()
                                     }),
@@ -1435,8 +1456,35 @@ fn run_service(path: PathBuf) -> Result<()> {
                     };
 
                     match sample_result {
-                        Ok(sample_owner) => inventory_owner = sample_owner,
+                        Ok(sample_owner) => {
+                            consecutive_busy_samples = 0;
+                            inventory_owner = sample_owner;
+                        }
                         Err(error) => {
+                            if is_store_writer_busy(&error)
+                                && sample_store_writer_busy_within_budget(
+                                    &mut consecutive_busy_samples,
+                                )
+                            {
+                                tracing::warn!(
+                                    error = ?error,
+                                    consecutive_busy_samples,
+                                    "compute-node sample deferred while the host ledger writer is busy"
+                                );
+                                last_compute_node_sample = Instant::now();
+                                if let Some(control_error) = deferred_control_error.take() {
+                                    return Err(control_error).context(
+                                        "service control request failed while compute-node sampling was in flight",
+                                    );
+                                }
+                                if let Some(ControlObservation::Drain(confirmation)) =
+                                    deferred_control.take()
+                                {
+                                    drain_confirmation = confirmation;
+                                    break;
+                                }
+                                continue;
+                            }
                             admission_unknown = true;
                             owner.publish(
                                 RuntimeServiceState::Unknown,
@@ -1477,18 +1525,43 @@ fn run_service(path: PathBuf) -> Result<()> {
                 if heartbeat.elapsed() >= Duration::from_secs(1) {
                     if let Some(admission) = host_admission.as_ref() {
                         match admission.compute_snapshot_admission_failure() {
-                            Ok(None) => {}
+                            Ok(None) => admission_deferred_at = None,
                             Ok(Some(reason)) => {
-                                admission_unknown = true;
-                                owner.publish(
-                                    RuntimeServiceState::Unknown,
-                                    generations.map(|p| p.0),
-                                    generations.map(|p| p.1),
-                                    children.describe(),
-                                )?;
-                                bail!(
-                                    "host compute-node freshness or topology admission was lost: {reason}"
-                                );
+                                if !host_admission_deferral_within_budget(
+                                    &mut admission_deferred_at,
+                                    Instant::now(),
+                                ) {
+                                    admission_unknown = true;
+                                    owner.publish(
+                                        RuntimeServiceState::Unknown,
+                                        generations.map(|p| p.0),
+                                        generations.map(|p| p.1),
+                                        children.describe(),
+                                    )?;
+                                    bail!(
+                                        "host compute-node freshness or topology admission was lost: {reason}"
+                                    );
+                                }
+                                // The ledger still refuses reservations. Continue
+                                // pool validation and owner heartbeat so a live
+                                // service is not mistaken for an expired owner.
+                                tracing::debug!(%reason, "host compute-node admission deferred");
+                            }
+                            Err(error) if is_store_writer_busy(&error) => {
+                                if !host_admission_deferral_within_budget(
+                                    &mut admission_deferred_at,
+                                    Instant::now(),
+                                ) {
+                                    admission_unknown = true;
+                                    owner.publish(
+                                        RuntimeServiceState::Unknown,
+                                        generations.map(|p| p.0),
+                                        generations.map(|p| p.1),
+                                        children.describe(),
+                                    )?;
+                                    bail!("host compute-node admission observation failed: {error:#}");
+                                }
+                                tracing::warn!(error = ?error, "host admission observation deferred while the ledger writer is busy");
                             }
                             Err(error) => {
                                 admission_unknown = true;
@@ -1653,6 +1726,43 @@ fn run_service(path: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_writer_busy_budget_allows_five_cycles_only() {
+        let mut consecutive = 0;
+        for _ in 0..MAX_CONSECUTIVE_SAMPLE_STORE_WRITER_BUSY {
+            assert!(sample_store_writer_busy_within_budget(&mut consecutive));
+        }
+        assert!(!sample_store_writer_busy_within_budget(&mut consecutive));
+    }
+
+    #[test]
+    fn admission_deferral_uses_a_monotonic_sixty_second_budget() {
+        let started = Instant::now();
+        let mut deferred_at = None;
+        assert!(host_admission_deferral_within_budget(
+            &mut deferred_at,
+            started,
+        ));
+        assert!(host_admission_deferral_within_budget(
+            &mut deferred_at,
+            started + HOST_ADMISSION_DEFERRAL_BUDGET - Duration::from_nanos(1),
+        ));
+        assert!(!host_admission_deferral_within_budget(
+            &mut deferred_at,
+            started + HOST_ADMISSION_DEFERRAL_BUDGET,
+        ));
+    }
+
+    #[test]
+    fn only_typed_store_writer_busy_is_classified_as_transient() {
+        let busy = anyhow::Error::new(fullmag_session::StoreWriterBusy).context("wrapped");
+        assert!(is_store_writer_busy(&busy));
+        assert!(!is_store_writer_busy(&anyhow::anyhow!(
+            "session store writer is busy"
+        )));
+    }
+
     #[test]
     fn drain_is_owner_scoped_and_versioned() {
         let request = br#"{"schema_version":"runtime_service_control.v1","owner_token":"owner-a","command":"drain"}"#;

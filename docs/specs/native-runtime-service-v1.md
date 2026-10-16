@@ -204,7 +204,30 @@ przejściowy zachowuje politykę ponawiania z tym samym pin. Close unieważnia
 oczekujący preflight i zapobiega otwarciu socketu po unmount.
 
 Oba admissions zamyka się przed oczekiwaniem na procesy. Aktywne workery kończą
-się według supervisor/lease/receipt. Błąd jednego schedulera drenuje drugi,
+się według supervisor/lease/receipt. Wyczerpanie 5-sekundowego retry dla
+konkretnego `StoreWriterBusy` podczas okresowego uzgadniania host ledgeru
+odracza discovery, recovery adoption i nowe admission w tej iteracji. Nie
+zwalnia rezerwacji, nie omija dowodów ani nie kończy procesu schedulera.
+Już nadzorowane workery zachowują własny nadzór; pętla nadal odbiera ich
+zakończenia i obsługuje drain. Kolejna iteracja ponawia idempotentne
+uzgadnianie. Odroczenie nie zużywa limitu pustych iteracji schedulera.
+Inne błędy uzgadniania pozostają fatalne; nie są zamieniane w pusty ledger
+ani zgodę na nowe obliczenia. Ten wyjątek nie obejmuje błędów zapisów
+checkpointu lub zakończenia aktywnego workera.
+
+W fazie pracy cykliczny sampler zachowuje istniejący lease inventory także
+przy błędzie próbkowania. Wyłącznie typowany konflikt `StoreWriterBusy` może
+pominąć najwyżej pięć kolejnych cykli; szósty kończy się dotychczasową ścieżką
+Unknown/drain. Pierwsza próbka wymagana do startu pozostaje fail-closed.
+Odmowa admission przez ledger lub typowany konflikt przy jej obserwacji
+może być tolerowany przez najwyżej 60 sekund czasu monotonicznego. Nie
+przedłuża to ważności snapshotu: ledger nadal odmawia nowych rezerwacji na
+podstawie starej lub niezgodnej próbki. Błędy schematu, danych i generacji
+zwracane jako błędy pozostają fatalne. Wznowienie poprawnej obserwacji zeruje
+budżet odroczenia. Drain i błędy kanału sterowania nadal wymagają dołączenia
+trwającego samplera przed zakończeniem pętli.
+
+Błąd jednego schedulera drenuje drugi,
 lecz owner kończy jako failed/unknown, nigdy jako poprawny drained.
 
 ## Eksport i dowody
