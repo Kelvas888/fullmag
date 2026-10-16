@@ -122,3 +122,31 @@ obserwacja, nie pełny lease; brak runtime proof nie pozwala ogłosić cutover.
 Tauri `api_sidecar.rs` i `main.rs`. Source/parser/review nie zastępują buildu,
 prób fault/shutdown ani Windows bez Docker/WSL. Regresje Rust pozostają
 NOT COMPILED/NOT RUN zgodnie z aktualną instrukcją operatora.
+
+## Jawne odzyskanie pustego, zakończonego runtime — Docker development
+
+Stan 16.10.2026: kontrakt wymagany dla trasy Docker; implementacja i runtime
+pozostają NOT VERIFIED do osobnych dowodów. Zwykłe `service-ensure` nadal
+odmawia przejęcia `unknown`. Nie usuwamy ownera, blokad, sesji ani wyników.
+
+Dopuszczamy jawną lokalną operację operatora wyłącznie dla pustego store,
+którego poprzedni owner ma dokładnie przypiętą tożsamość i oba schedulery
+zakończyły pracę z potwierdzonymi eventami `drained` oraz `exited_success`.
+Operacja wymaga wolnej natywnej blokady ownera, serializacji startup/launch,
+transakcji writera store i właściwego host ledgeru. Brak pracy musi zostać
+udowodniony z bieżącego store i ledgeru, a nie z wieku heartbeat lub numeru PID.
+
+Wszystkie piny konfiguracji, ownera, jego procesu, targetu, historycznego
+buildu i generacji pozostają zgodne. Nowy program wykonujący recovery ma
+odrębną zapisaną tożsamość; nie udaje poprzedniego buildu. Przed mutacją
+zachowujemy oryginalne bajty i trwały intent z digestem żądania. Wynikiem
+jest `Failed`, nigdy syntetyczne `Drained` ani `Ready`. Identyczne ponowienie
+może odczytać lub dokończyć swój własny wynik; mismatch pozostawia admission
+zamknięte. Niepewna publikacja wymaga odczytu dowodów pod tymi samymi blokadami.
+
+To nie jest odzyskiwanie trwających zadań ani zgoda na automatyczny restart.
+Store zawierający pracę, aktywne lease lub rezerwacje wymaga właściwego
+recovery tej pracy. Po zakończeniu tej operacji nowy start nadal przechodzi
+pełne probe/readiness i kontrole generacji z ADR 0052. Szczegóły oraz bramki
+są w kontrakcie native-runtime-service-v1. Publiczny OpenAPI i fizyka solverów
+nie zmieniają się przez tę lokalną operację.

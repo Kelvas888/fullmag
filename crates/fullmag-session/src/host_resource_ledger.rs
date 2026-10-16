@@ -3303,6 +3303,38 @@ impl HostResourceLedger {
         })
     }
 
+    /// Run a controlled runtime-recovery operation while the complete host
+    /// ledger is quiescent.  The host writer remains held through `operation`,
+    /// so a direct ledger caller cannot publish a reservation or acquire the
+    /// inventory owner between the proof and the recovery publication.
+    ///
+    /// This is intentionally stricter than ordinary admission: a recovery of
+    /// an unknown runtime owner is allowed only for a ledger with no durable
+    /// reservations at all and without an active inventory owner.  Historical
+    /// owner metadata may remain after a clean release; the native lock, not
+    /// its timestamp or record, decides whether the owner is active.
+    pub fn with_runtime_recovery_quiescence<T>(
+        &self,
+        operation: impl FnOnce(&HostResourceLedgerSnapshot) -> Result<T>,
+    ) -> Result<T> {
+        let _host_writer = self.writer.acquire()?;
+        let document = self.read_document_locked()?;
+        if !document.reservations.is_empty() {
+            bail!("runtime service recovery requires a host ledger with no reservations");
+        }
+        if self.active_inventory_owner_locked()?.is_some() {
+            bail!(
+                "runtime service recovery requires the host inventory owner to be absent"
+            );
+        }
+        let snapshot = HostResourceLedgerSnapshot {
+            policy: document.policy,
+            reservations: document.reservations,
+            node_policy: document.node_policy,
+        };
+        operation(&snapshot)
+    }
+
     /// Reserve capacity tentatively. Exact retries return the existing record;
     /// changed identities or request contents are rejected.
     pub fn reserve(&self, request: &HostReservationRequest) -> Result<HostResourceReservation> {

@@ -251,3 +251,89 @@ transaction SessionStore. Drained wymaga istniejących pul o zgodnym ID, generac
 i pełnym zestawie zasobów. Znany brak/mismatch daje failed, błąd obserwacji daje
 unknown; oba stany kończą proces usługi błędem. Status dziecka unknown oznacza
 brak potwierdzonej obserwacji i nie jest deklaracją running ani exited.
+
+## Kontrolowane recovery pustego store — wymagany kontrakt
+
+Stan 16.10.2026: wymaganie implementacyjne; runtime NOT VERIFIED. Jawna lokalna
+komenda `fullmag runtime service-recover` ma osobny zakres od `service-ensure`.
+Nie wolno wywoływać jej automatycznie po timeout ani błędzie healthchecka.
+
+Operacja przypina dokładny SHA-256 konfiguracji i oryginalnych bajtów
+`OWNER.json`, owner token, process-start token, target, historyczny commit,
+snapshot oraz obie tożsamości i generacje pul. Wymaga zgodnego poprzedniego
+zapisu launch, a nowy lub niepewny launch blokuje odzyskanie. Tożsamość programu
+wykonującego recovery jest odnotowana osobno od tożsamości starego ownera.
+
+Kolejność blokad musi być zgodna z istniejącymi startup/launch/store/host-ledger
+transakcjami. Pod nimi trzeba potwierdzić jednocześnie:
+
+- wolną stabilną natywną blokadę starego ownera; nie wystarcza brak PID ani
+  stary heartbeat;
+- dokładnie dwa zgodne schedulery compute/preparation z terminalnym
+  `exited_success` oraz ograniczonymi, przypiętymi journalami `stdin-v1 drained`;
+- brak runów, batch intentów (również bez utworzonych runów), zadań recovery,
+  kolejek, manifestów, pinów i aktywnych lease;
+- zgodność aktualnych pul z przypiętymi generacjami;
+- brak aktywnego host inventory writera oraz brak rezerwacji hosta, również
+  tentative, committed i quarantined; odmowa nie zwalnia ich automatycznie.
+
+Przed publikacją zachowujemy niezmienione bytes konfiguracji, ownera, launch
+oraz dowodów quiescence w operacyjnym namespace `runtime-services`. Nie są
+one naukowym CAS ani nowym store. Trwały intent wiąże digest żądania ze starymi
+pinami i oczekiwanym terminalnym wynikiem. Publikacja zmienia wyłącznie stan
+potwierdzonego starego ownera na `Failed` i zachowuje jego tożsamość. Nie kasuje
+ani nie zastępuje owner locka i nie tworzy nowej puli CPU/GPU.
+
+Powtórzenie identycznego żądania jest idempotentne. Po niepewnej publikacji
+odczyt pod tymi samymi blokadami rozstrzyga wyłącznie zgodny intent i dokładny
+oczekiwany wynik; każdy inny owner, config, launch lub digest blokuje operację.
+Udane recovery nie jest readiness: dopiero osobny zwykły start może utworzyć
+nowego ownera i wykonać rzeczywisty probe dla jego generacji.
+
+Wymagane dowody obejmują: odmowę przy aktywnych blokadach i pracy, mismatch
+pinów, brak lub niezgodność journali, awarie przed i po publikacji ownera,
+identyczny replay, zachowanie wszystkich starych dowodów oraz rzeczywisty
+start i wykonanie GPU po odzyskaniu. Zielony source check nie potwierdza tych
+bramek runtime.
+
+Jawny interfejs CLI (implementacja i runtime nadal wymagają kwalifikacji):
+
+```text
+fullmag runtime service-recover --config <absolute-config> \
+  --request <readonly-request.json> --request-sha256 <raw-sha256>
+```
+
+Żądanie `runtime_service_recovery_request.v1` zawiera `request_id`,
+`config_sha256`, `owner_sha256`, `launch_sha256` oraz pełny typowany
+`expected_owner`. Digesty przypinają oryginalne bajty plików; porównanie
+semantyczne konfiguracji jest dodatkowym warunkiem, nie zamiennikiem tego pinu.
+
+Publiczny receipt `runtime_service_recovery.v1` wiąże `request_id`,
+`request_sha256`, `config_sha256`, `target_id`, `status=recovered`,
+`outcome=failed`, `owner_sha256_before`, `owner_state_after=failed` oraz
+`owner_sha256_after`. `archived_evidence_path` i `archived_evidence_sha256`
+przypinają manifest archiwum, a `archived_files` mapuje ograniczony zestaw
+oryginalnych plików na ich raw SHA-256. Inventory ma dokładnie 12 wpisów:
+`OWNER.json`, stabilny owner lock, `LAUNCH.json`, launch lock, startup gate,
+journale stdout obu schedulerów, cztery dokumenty zasobów/stanu przypiętych
+pul oraz `configuration.json`. Klucze dokumentów runtime pozostają ścieżkami
+względem SessionStore; zarezerwowany `configuration.json` oznacza wyłącznie
+plik w archiwum, zawierający dokładne bajty zewnętrznej konfiguracji.
+Manifest wymaga `config_sha256` zgodnego z requestem i tym plikiem. Brakujący,
+dodatkowy lub zmieniony wpis odrzuca również replay. Archiwalny owner zawsze
+ma digest `owner_sha256_before`, a jego bieżący odpowiednik może przejść tylko
+do dokładnie przypiętego `owner_sha256_after`.
+
+Osobne pola
+`historical_build_commit`/`historical_build_snapshot` oraz
+`executor_build_commit`/`executor_build_snapshot` zachowują rozdział starego
+ownera i programu odzyskującego. `created_at` i `completed_at` opisują operację.
+Stan `prepared` jest wyłącznie trwałym etapem wewnętrznego intentu; helper
+Docker nie uznaje go za zakończone recovery.
+
+Autoryzacja hosta `fullmag.docker-runtime-recovery-authorization.v1` dodaje
+piny runu, dokładnych kontenerów i obrazów, certyfikatu storage i attestation
+mountów. Natywna komenda nie interpretuje pochodzenia Docker: pozostaje jedynym
+właścicielem blokad i mutacji SessionStore. Tylko jawny tryb
+`recreate --recover-idle-failure <authorization.json>` przekazuje ten request;
+zwykły start i `service-ensure` nie wykonują recovery.
