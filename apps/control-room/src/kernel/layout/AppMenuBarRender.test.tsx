@@ -9,14 +9,12 @@ import { KernelProvider } from "@/kernel/KernelProvider";
 
 const appMenuBarSourceUrl = new URL("./AppMenuBar.tsx", import.meta.url);
 
-import {
-  AppMenuBar,
-  resolveNoSessionSubtitle,
-} from "./AppMenuBar";
+import { AppMenuBar } from "./AppMenuBar";
 import {
   resolveApiConnectionErrorDetails,
   resolveHeaderSessionDisplay,
   resolveHydrationSafeHeaderSessionSource,
+  resolveNoSessionSubtitle,
 } from "./AppMenuBarHeaderModel";
 
 describe("AppMenuBar", () => {
