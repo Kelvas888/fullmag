@@ -2830,7 +2830,7 @@ mod recovery_contract_tests {
             owner_sha256_after: crate::hex_sha256(&owner_after),
             archived_evidence_path: manifest_path.to_str().unwrap().into(),
             archived_evidence_sha256: crate::hex_sha256(&manifest_bytes),
-            archived_files,
+            archived_files: archived_files.clone(),
             historical_build_commit: "a".repeat(40),
             historical_build_snapshot: "b".repeat(64),
             executor_build_commit: "c".repeat(40),
