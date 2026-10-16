@@ -652,6 +652,14 @@ Receipt oznacza ten wariant jako `session_storage: disposable_tmpfs` i `durable_
 
 Sesja RAM nie spełnia istniejącego wyjątku koordynatora pozwalającego na build przy działającym managed browser z hostowym bindem stanu. Przed kolejnym buildem należy zakończyć wyłącznie tę własną sesję, sprawdzając container ID i projekt Compose z receipt; nie zmieniać współdzielonego koordynatora ani cudzych kontenerów. Weryfikacja startu tego wariantu z rzeczywistym pakietem pozostaje **NOT VERIFIED** do czasu zachowania udanego receipt uruchomienia.
 
+### Bieżący frontend z przypiętym API RAM
+
+`just verify-antenna-workspace-browser` uruchamia niezmienną kopię bieżącego frontendu na porcie 3274. Wymaga `FULLMAG_MANAGED_BROWSER_RECEIPT` wskazującego udany receipt własnego `run-managed-browser-snapshot-ram` oraz jawnego `FULLMAG_MANAGED_BROWSER_RECEIPT_SHA256`. Zależności frontendu podlegają istniejącej walidacji własności; dla przypiętego etapu instalacji trzeba przekazać również `FULLMAG_BROWSER_DEPENDENCY_BINDING` i `FULLMAG_BROWSER_DEPENDENCY_BINDING_SHA256`. Recepta niczego nie instaluje ani nie buduje solvera.
+
+Guard ponownie sprawdza pakiet, kapsułę źródeł, obraz, dokładny kontener, projekt Compose, loopback, mounty, limity i tmpfs. Pierwsza sesja musi być pusta; smoke używa `replace_current: false`. HTTP i WebSocket kierowane są do tej API, a każde żądanie jest przypięte identyfikatorem jej procesu. Po przebiegu następuje ponowna atestacja. Bieżący frontend oraz pakiet API mają osobno zapisane tożsamości źródeł; pakietowany statyczny UI nie jest dowodem dla nowszych zmian frontendu.
+
+Scenariusz korzysta z prawdziwego workspace, klienta API i Inspectora, bez podmieniania odpowiedzi: tworzy mikrostrip, zapisuje pełny obwód z oboma mostkami i źródłem napięcia, dodaje referencję do Study oraz osobno otwiera jej Inspector. Sprawdza również WebGL i zakres żądań. Nie wykonuje Prepare/Start ani solve; nie kwalifikuje V/J/H, fizyki lub trwałości danych. Runner kończy wyłącznie własny Next i przeglądarkę. Kontener API pozostaje zasobem jego właściciela, który po zachowaniu dowodów kończy dokładnie ten kontener przed następnym buildem.
+
 ### Eksport OpenAPI z dokładnego snapshotu
 
 `just export-runner-openapi <job-id> <pełny-commit>` pozostaje trasą dla

@@ -125,6 +125,10 @@ function makeFixture() {
             const revision = Number(state.scene.revision) + 1;
             state.scene = { ...state.scene, ...structuredClone(transaction.merge_patch), revision, scene_revision: revision } as SceneResource;
             const acknowledged = structuredClone(state.scene);
+            // Match the real API's skip_serializing_if = Vec::is_empty contract.
+            for (const current of acknowledged.current_transports ?? []) {
+              if (Array.isArray(current.boundaries) && current.boundaries.length === 0) delete current.boundaries;
+            }
             if (corruptCircuitAck) {
               corruptCircuitAck = false;
               acknowledged.antenna_port_modes = acknowledged.antenna_port_modes?.map(port => ({ ...port, normalization: null }));

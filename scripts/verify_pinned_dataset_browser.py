@@ -25,6 +25,7 @@ from verify_control_room_sources import fingerprint, timestamp
 PROFILE = "windows-control-room-browser-fixture"
 BROWSER_CHANNEL = "chrome" if os.name == "nt" else None
 SCENARIOS = {
+    "antenna-workspace-authoring": ("smoke-managed-antenna-workspace.mjs", "fullmag.antenna-workspace-authoring-browser.v1", None, "FULLMAG_ANTENNA_WORKSPACE"),
     "antenna-regional-drive": ("smoke-antenna-regional-drive.mjs", "fullmag_antenna_regional_drive_browser_fixture_v1", "antenna-regional-drive", "FULLMAG_ANTENNA_REGIONAL"),
     "inspector-actions": ("smoke-inspector-actions.mjs", "fullmag_inspector_actions_browser_fixture_v1", "inspector-actions", "FULLMAG_INSPECTOR_ACTIONS"),
     "explorer-physics-reporting": ("smoke-explorer-physics-reporting.mjs", "fullmag_explorer_physics_reporting_browser_fixture_v1", "explorer-physics-reporting", "FULLMAG_EXPLORER_PHYSICS_REPORTING"),
@@ -130,6 +131,13 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
         raise storage.StorageError("Inspector actions browser fixture uses fixed port 3257")
     if scenario == "explorer-physics-reporting" and port != 3259:
         raise storage.StorageError("Explorer physics reporting browser fixture uses fixed port 3259")
+    api_target = None
+    if scenario == "antenna-workspace-authoring":
+        if port != 3274:
+            raise storage.StorageError("Managed antenna workspace uses fixed port 3274")
+        from managed_browser_target import managed_browser_target
+        api_target = managed_browser_target(repo, os.environ.get("FULLMAG_MANAGED_BROWSER_RECEIPT", ""),
+            os.environ.get("FULLMAG_MANAGED_BROWSER_RECEIPT_SHA256"), require_fresh=True)
     smoke_name, receipt_schema, fixture_route, report_prefix = SCENARIOS[scenario]
     layout = storage.resolve_layout(repo, PROFILE)
     storage.initialize(layout)
@@ -162,7 +170,8 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
             "source_digest_before": before, "started_at": timestamp(),
             "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "justfile_sha256": hashlib.sha256((repo / "justfile").read_bytes()).hexdigest(),
-            "qualification": "fixture_only_not_backend_runtime_or_science",
+            "qualification": "real_api_workspace_authoring_not_solve_science_or_durability" if api_target else "fixture_only_not_backend_runtime_or_science",
+            "managed_api_target": api_target,
             "unit_tests": "not_compiled_not_run", "port": port,
             "browser_channel": BROWSER_CHANNEL or "playwright_chromium",
         }
@@ -236,6 +245,10 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                 env["CONTROL_ROOM_URL"] = f"http://127.0.0.1:{port}/{fixture_route}"
                 if scenario in {"execution-profiles", "study-execution-profile", "inspector-actions", "explorer-physics-reporting"}:
                     env["CONTROL_ROOM_URL"] += "?fullmag_api_instance=11111111-1111-4111-8111-111111111111"
+            if api_target:
+                env["NEXT_PUBLIC_CONTROL_ROOM_API_BASE_URL"] = api_target["api_base"]
+                env["FULLMAG_MANAGED_BROWSER_TARGET"] = json.dumps(api_target)
+                env["CONTROL_ROOM_URL"] += "?fullmag_api_instance=" + api_target["api_instance"]
             receipt["source_view"] = str(fixture_app)
             receipt["dependency_root"] = str(real_dependencies)
             with (run_root / "next.log").open("w", encoding="utf-8") as next_log:
@@ -299,6 +312,14 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                         })
                 receipt["browser_artifact_root"] = str(browser_root)
                 receipt["browser_artifacts"] = artifacts
+            if api_target:
+                try:
+                    after_target = managed_browser_target(repo, api_target["receipt"], api_target["receipt_sha256"])
+                    if after_target != api_target:
+                        raise ValueError("Managed API process identity changed during browser verification")
+                    receipt["managed_api_target_revalidated"] = True
+                except (OSError, ValueError, KeyError, storage.StorageError) as error:
+                    receipt.update(state="failed", exit_code=1, managed_api_target_error=str(error))
             receipt["finished_at"] = timestamp()
             storage.atomic_json(receipt_path, receipt)
         if scenario in {"inspector-actions", "explorer-physics-reporting"} and receipt["state"] != "passed":

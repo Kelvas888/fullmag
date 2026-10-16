@@ -159,6 +159,43 @@ def docker(*args):
     return result.stdout.strip()
 
 
+def attest_browser_container(container, spec, project, port):
+    """Read-only attestation shared by the launcher and real-API browser checks."""
+    if not re.fullmatch(r"[0-9a-f]{64}", container):
+        raise ValueError("Full browser container ID required")
+    observed = json.loads(docker("inspect", container))[0]
+    expected_mounts = {(m["target"], str(Path(m["source"]).resolve()).lower(),
+                        not m["read_only"]) for m in spec["services"]["browser"]["volumes"]}
+    actual_mounts = {(m["Destination"], str(host_path(m["Source"])).lower(), m["RW"])
+                     for m in observed["Mounts"] if m["Type"] == "bind"
+                     and m["Destination"] not in SYSTEM_MOUNT_TARGETS}
+    if observed["Image"] != spec["services"]["browser"]["image"] or actual_mounts != expected_mounts \
+            or any(m["Type"] == "volume" for m in observed["Mounts"]):
+        raise ValueError("Running container image or mount attestation mismatch")
+    bindings = observed["HostConfig"]["PortBindings"]
+    if bindings != {"8081/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]}:
+        raise ValueError("Running container loopback binding mismatch")
+    host_config = observed["HostConfig"]
+    if not host_config.get("ReadonlyRootfs") or host_config.get("Privileged") \
+            or set(host_config.get("CapDrop", [])) != {"ALL"} \
+            or "no-new-privileges:true" not in host_config.get("SecurityOpt", []) \
+            or observed["Config"].get("User") != "65532:65532" \
+            or host_config.get("Memory") != 2 * 1024**3 \
+            or host_config.get("NanoCpus") != 4 * 10**9 \
+            or host_config.get("PidsLimit") != 128:
+        raise ValueError("Running container isolation mismatch")
+    if host_config.get("NetworkMode") != "bridge":
+        raise ValueError("Running container network mode mismatch")
+    labels = observed.get("Config", {}).get("Labels", {})
+    expected_tmpfs = dict(item.split(":", 1) for item in spec["services"]["browser"]["tmpfs"])
+    if observed.get("Id") != container or observed.get("State", {}).get("Running") is not True \
+            or labels.get("com.docker.compose.project") != project \
+            or labels.get("com.docker.compose.service") != "browser" \
+            or host_config.get("Tmpfs") != expected_tmpfs:
+        raise ValueError("Running browser owner or tmpfs mismatch")
+    return observed
+
+
 def run(repo, job_id, commit, port, *, source_digest=None, native_snapshot_sha256=None, ephemeral=False):
     if not re.fullmatch(r"[0-9a-f]{32}", job_id):
         raise ValueError("Full managed job ID required")
@@ -203,7 +240,7 @@ def _run_protected(layout, job_id, commit, port, *, source_digest=None, native_s
     storage.atomic_json(spec_path, spec)
     receipt = {"schema": "fullmag.managed-browser.v1", "state": "starting",
                "qualification": "NOT VERIFIED", "profile": PROFILE,
-               "compose_project": project,
+               "compose_project": project, "repo_root": layout["repo_root"], "worktree_id": layout["worktree_id"],
                "managed_job_id": job_id, "native_source_identity": built["native_source_identity"],
                "source_mode": source_mode, "source_digest": context["source_digest"],
                "image_digest": context["image_digest"], "url": f"http://localhost:{port}/workspace",
@@ -220,29 +257,8 @@ def _run_protected(layout, job_id, commit, port, *, source_digest=None, native_s
         docker(*args, "up", "--detach", "--no-build", "--pull", "never")
         container = docker(*args, "ps", "--quiet", "browser")
         receipt["container_id"] = container
-        observed = json.loads(docker("inspect", container))[0]
-        expected_mounts = {(m["target"], str(Path(m["source"]).resolve()).lower(),
-                            not m["read_only"]) for m in spec["services"]["browser"]["volumes"]}
-        actual_mounts = {(m["Destination"], str(host_path(m["Source"])).lower(), m["RW"])
-                         for m in observed["Mounts"] if m["Type"] == "bind"
-                         and m["Destination"] not in SYSTEM_MOUNT_TARGETS}
-        if observed["Image"] != context["image_digest"] or actual_mounts != expected_mounts \
-                or any(m["Type"] == "volume" for m in observed["Mounts"]):
-            raise ValueError("Running container image or mount attestation mismatch")
-        bindings = observed["HostConfig"]["PortBindings"]
-        if bindings != {"8081/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]}:
-            raise ValueError("Running container loopback binding mismatch")
+        observed = attest_browser_container(container, spec, project, port)
         host_config = observed["HostConfig"]
-        if not host_config.get("ReadonlyRootfs") or host_config.get("Privileged") \
-                or set(host_config.get("CapDrop", [])) != {"ALL"} \
-                or "no-new-privileges:true" not in host_config.get("SecurityOpt", []) \
-                or observed["Config"].get("User") != "65532:65532" \
-                or host_config.get("Memory") != 2 * 1024**3 \
-                or host_config.get("NanoCpus") != 4 * 10**9 \
-                or host_config.get("PidsLimit") != 128:
-            raise ValueError("Running container isolation mismatch")
-        if host_config.get("NetworkMode") != "bridge":
-            raise ValueError("Running container network mode mismatch")
         receipt["attestation"] = {"image_and_mounts": "PASS", "loopback_binding": "PASS"}
         filesystem = docker("exec", container, "stat", "-f", "-c", "%t", "/state")
         receipt["session_filesystem_magic"] = filesystem

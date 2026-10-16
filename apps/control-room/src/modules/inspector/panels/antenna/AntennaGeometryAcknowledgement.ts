@@ -38,7 +38,10 @@ export function antennaGeometryAcknowledgementError(
   if (currents.length !== 1) return "Circuit ACK cannot be verified without one submitted charge transport.";
   const expectedCurrent = currents[0]!;
   const current = unique(scene?.current_transports, "name", expectedCurrent.name);
-  if (!current || !includesAuthored(current, expectedCurrent)
+  // KnownSceneCurrentTransport omits its empty boundary list during serialization.
+  const comparableCurrent = current && current.boundaries === undefined && Array.isArray(expectedCurrent.boundaries) && expectedCurrent.boundaries.length === 0
+    ? { ...current, boundaries: [] } : current;
+  if (!current || !includesAuthored(comparableCurrent, expectedCurrent)
     || ["external_lead_preparation", "conservative_current_source", "conservative_current_view", "closure_receipts"].some(key => current[key] != null)) {
     return "Circuit ACK omitted or changed submitted materials, source cut or charge model, or retained stale preparation. Refetch before saving again.";
   }
