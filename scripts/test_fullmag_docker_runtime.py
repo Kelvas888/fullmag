@@ -523,6 +523,31 @@ class DockerRuntimeContract(unittest.TestCase):
         self.assertEqual(legacy_environment["FULLMAG_RUNTIME_ROOT"], str(paths.package))
         self.assertEqual(legacy_environment["FULLMAG_REPO_ROOT"], str(paths.source))
 
+    def test_prepare_storage_creates_current_live_workspace(self):
+        from dataclasses import replace
+
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paths = replace(
+                service.RuntimePaths(),
+                state=root,
+                storage=root,
+                runs=root / "runs" / service.WORKTREE_ID,
+                store=root / "runs" / service.WORKTREE_ID / "session-store",
+                state_root=root / ".fullmag",
+                config=root / "runtime.json",
+            )
+            with patch.dict(
+                os.environ,
+                {"FULLMAG_SESSION_STORAGE_PROFILE": service.WINDOWS_STORAGE_PROFILE},
+                clear=True,
+            ):
+                self.assertEqual(service.prepare_storage(paths), paths)
+            self.assertTrue(
+                (paths.state_root / "local-live" / "current").is_dir()
+            )
+
     def load_entrypoint(self):
         import sys
         path = Path(__file__).resolve().parents[1] / "docker/all-in-one/entrypoint.py"

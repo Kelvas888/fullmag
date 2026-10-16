@@ -509,6 +509,10 @@ def prepare_storage(paths: RuntimePaths | None = None) -> RuntimePaths:
         _fail("all-in-Docker storage requires explicit windows-folder-v1 admission")
     _ensure_directory(paths.state, "container state")
     _ensure_directory(paths.state_root, "Fullmag state")
+    _ensure_directory(
+        paths.state_root / "local-live" / "current",
+        "current live workspace",
+    )
     _ensure_directory(paths.runs, "accepted runs root")
     _ensure_directory(paths.store.parent, "accepted store parent")
     marker = {"schema": STORAGE_SCHEMA, "project_root": str(IMAGE_ROOT)}
