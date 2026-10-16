@@ -266,8 +266,15 @@ def _prepare_workspace(build_root: Path) -> Path:
             if child.name in PERSISTENT_WORKSPACE_DIRS or child.name == OWNER_MARKER:
                 continue
             _remove_owned_tree(child)
-    elif any(workspace.iterdir()):
-        _fail("backend workspace is nonempty without an owned marker")
+    else:
+        # A failed first extraction may leave only these newly created empty
+        # directories. Never adopt an unknown nonempty workspace or cache.
+        for child in workspace.iterdir():
+            if (child.name not in PERSISTENT_WORKSPACE_DIRS or child.is_symlink()
+                    or not child.is_dir() or any(child.iterdir())):
+                _fail("backend workspace is nonempty without an owned marker")
+        _write_json(marker, {"schema": "fullmag.direct-compose.backend-workspace.v1",
+                             "state": "preparing"}, "backend workspace owner")
     for name in PERSISTENT_WORKSPACE_DIRS:
         _ensure_directory(workspace / name, f"persistent workspace directory {name}")
     return workspace

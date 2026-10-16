@@ -46,6 +46,7 @@ TOOLCHAIN_MANIFEST_PATH = "/opt/fullmag-deps/share/fullmag/dependency-versions.j
 TOOLCHAIN_MANIFEST_SCHEMA = "fullmag.docker.fem-gpu-dependencies.v1"
 DEVELOPMENT_BASE_CONTEXT_SCHEMA = "fullmag.direct-compose.development-base-context.v1"
 DEVELOPMENT_IMAGE_SCHEMA = "fullmag.direct-compose.development-image.v1"
+RUNTIME_IMAGE_CONTEXT_SCHEMA = "fullmag.direct-compose.runtime-image-context.v1"
 BASE_CONTEXT_FILES = (
     ("Dockerfile.dev", "docker/all-in-one/Dockerfile.dev"),
     ("entrypoint.py", "docker/all-in-one/entrypoint.py"),
@@ -55,6 +56,11 @@ BASE_CONTEXT_FILES = (
     ("healthcheck.py", "docker/all-in-one/healthcheck.py"),
     ("docker_startup_script.py", "scripts/docker_startup_script.py"),
     ("fullmag_storage.py", "scripts/fullmag_storage.py"),
+)
+RUNTIME_IMAGE_CONTEXT_FILES = (
+    ("Dockerfile.backend", "docker/all-in-one/Dockerfile.backend"),
+    ("backend_dev.py", "docker/all-in-one/backend_dev.py"),
+    ("backend_source.py", "docker/all-in-one/backend_source.py"),
 )
 REQUIRED_LANES = ("fdm-cpu", "fdm-gpu", "fem-cpu", "fem-gpu")
 REQUIRED_STARTUP_HELPERS = (
@@ -349,6 +355,31 @@ def _development_base_context(repo: Path, run_root: Path, toolchain_id: str,
         "helper_hashes": files,
         "receipt": str(run_root / "development-base-context.json"),
     }
+
+
+def _runtime_image_context(repo: Path) -> dict[str, object]:
+    """Hash the files copied by Dockerfile.backend before reusing an image."""
+
+    files: dict[str, str] = {}
+    for name, relative_source in RUNTIME_IMAGE_CONTEXT_FILES:
+        source = repo / relative_source
+        if source.is_symlink() or not source.is_file():
+            raise _fail(f"runtime image context input is not a regular file: {source}")
+        before = source.lstat()
+        digest = hashlib.sha256()
+        with source.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        after = source.lstat()
+        signature = lambda metadata: (
+            metadata.st_dev, metadata.st_ino, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns,
+        )
+        if signature(before) != signature(after):
+            raise _fail(f"runtime image context input changed during capture: {source}")
+        files[name] = digest.hexdigest()
+    identity = {"schema": RUNTIME_IMAGE_CONTEXT_SCHEMA, "files": files}
+    return {**identity, "context_sha256": _sha256_bytes(_canonical_json(identity))}
 
 
 def _image_labels(document: Mapping[str, object]) -> dict[str, str]:
@@ -711,7 +742,7 @@ def _mount_targets(service: Mapping[str, object]) -> set[str]:
 
 def _prepare_override(service: Mapping[str, object]) -> list[str]:
     tokens = _service_tokens(service)
-    expected = {"/input/source.tar", "/input/manifest.json"}
+    expected = {"/input/backend-source.tar", "/input/manifest.json"}
     output_targets = {"/output", "/opt/fullmag/package"}
     if "prepare" in tokens and expected.issubset(set(tokens)) and output_targets.intersection(tokens):
         # The versioned compose file owns the worker's positional contract.
@@ -721,7 +752,7 @@ def _prepare_override(service: Mapping[str, object]) -> list[str]:
     # command or alter the CUDA/FEM feature set.
     return [
         "prepare",
-        "--source-tar", "/input/source.tar",
+        "--source-tar", "/input/backend-source.tar",
         "--manifest", "/input/manifest.json",
         "--output", "/opt/fullmag/package",
         "--build-root", "/build",
@@ -731,7 +762,10 @@ def _prepare_override(service: Mapping[str, object]) -> list[str]:
 def _validate_runtime_image(reference: str, expected_toolchain_id: str,
                             layout: Mapping[str, object], expected_context_sha256: str | None,
                             expected_base_id: str,
-                            expected_label_ids: Sequence[str] = ()) -> tuple[str, dict[str, object]]:
+                            expected_label_ids: Sequence[str] = (),
+                            expected_backend_context_sha256: str | None = None,
+                            expected_runtime_context_sha256: str | None = None,
+                            require_receipt: bool = True) -> tuple[str, dict[str, object]]:
     image_id, document = _inspect_image(reference)
     labels = _image_labels(document)
     if labels.get("org.fullmag.runtime") != "docker-all-gpu-v1":
@@ -747,13 +781,18 @@ def _validate_runtime_image(reference: str, expected_toolchain_id: str,
         raise _fail("development image toolchain label differs from the admitted base")
     _image_file(reference, "/opt/fullmag/backend_dev.py")
     metadata = _read_image_metadata(layout, reference)
-    if expected_context_sha256 is not None and metadata is None:
-        raise _fail("development image has no pinned direct-build receipt for this base context")
-    if metadata is not None and (
+    if metadata is None:
+        if require_receipt:
+            raise _fail("development image has no pinned direct-build receipt")
+    elif (
             metadata.get("image_id") != image_id
             or metadata.get("toolchain_image_id") != expected_toolchain_id
             or metadata.get("base_image_id") != expected_base_id
-            or metadata.get("context_sha256") != expected_context_sha256):
+            or metadata.get("context_sha256") != expected_context_sha256
+            or (expected_backend_context_sha256 is not None
+                and metadata.get("backend_context_sha256") != expected_backend_context_sha256)
+            or (expected_runtime_context_sha256 is not None
+                and metadata.get("runtime_context_sha256") != expected_runtime_context_sha256)):
         raise _fail("development image receipt does not match the admitted base")
     return image_id, document
 
@@ -777,12 +816,23 @@ def _runtime_image_reference(args: argparse.Namespace, repo: Path,
     expected_label_ids = (inherited_label,) if isinstance(inherited_label, str) else ()
     context_sha256 = base_info.get("context_sha256")
     context_sha256 = context_sha256 if isinstance(context_sha256, str) else None
+    backend_context = _runtime_image_context(repo)
+    backend_context_sha256 = str(backend_context["context_sha256"])
+    runtime_context_identity = {
+        "schema": RUNTIME_IMAGE_CONTEXT_SCHEMA,
+        "base_context_sha256": context_sha256,
+        "base_image_id": base_id,
+        "backend_context_sha256": backend_context_sha256,
+        "toolchain_image_id": toolchain_id,
+    }
+    runtime_context_sha256 = _sha256_bytes(_canonical_json(runtime_context_identity))
     existing = _image_reference_present(requested)
     if existing:
         try:
             image_id, document = _validate_runtime_image(
                 requested, toolchain_id, layout, context_sha256, base_id,
                 expected_label_ids,
+                backend_context_sha256, runtime_context_sha256,
             )
         except DirectDockerOutcomeUnknown:
             raise
@@ -791,7 +841,7 @@ def _runtime_image_reference(args: argparse.Namespace, repo: Path,
             document = None
         else:
             return requested, image_id, document, False
-        tag_seed = context_sha256 or _sha256_bytes(base_id.encode("utf-8"))
+        tag_seed = runtime_context_sha256
         image_reference = _direct_image_tag(requested, "runtime", tag_seed)
     else:
         image_reference = requested
@@ -801,6 +851,7 @@ def _runtime_image_reference(args: argparse.Namespace, repo: Path,
             image_id, document = _validate_runtime_image(
                 image_reference, toolchain_id, layout, context_sha256, base_id,
                 expected_label_ids,
+                backend_context_sha256, runtime_context_sha256,
             )
         except DirectDockerOutcomeUnknown:
             raise
@@ -825,9 +876,13 @@ def _runtime_image_reference(args: argparse.Namespace, repo: Path,
         timeout=4 * 60 * 60,
         environment=build_environment,
     )
+    if _runtime_image_context(repo) != backend_context:
+        raise _fail("backend image helpers changed while Docker was building; image retained without receipt")
     image_id, document = _validate_runtime_image(
         image_reference, toolchain_id, layout, context_sha256, base_id,
         expected_label_ids,
+        backend_context_sha256, runtime_context_sha256,
+        require_receipt=False,
     )
     _preflight_dependency_image(image_id)
     metadata = {
@@ -840,6 +895,11 @@ def _runtime_image_reference(args: argparse.Namespace, repo: Path,
         "toolchain_manifest_sha256": base_info.get("toolchain_manifest_sha256"),
         "context_sha256": context_sha256,
         "context": base_info.get("context"),
+        "backend_context_schema": RUNTIME_IMAGE_CONTEXT_SCHEMA,
+        "backend_context_sha256": backend_context_sha256,
+        "backend_context": backend_context,
+        "runtime_context_sha256": runtime_context_sha256,
+        "runtime_context_identity": runtime_context_identity,
     }
     metadata_path = _write_image_metadata(layout, image_reference, metadata)
     _write_json(run_root / "development-image-receipt.json", {
@@ -1102,6 +1162,67 @@ def _assert_no_running_fullmag() -> None:
         )
 
 
+def _frozen_source_bundle(manifest_path: Path, layout: Mapping[str, object], selected: Path) -> dict[str, object]:
+    """Explicitly resume immutable inputs; later checkout edits are not included."""
+    from fullmag_storage import validate_path
+    from windows_folder_host import read_owned_regular
+    from docker_backend_inputs import (
+        ARCHIVE_FILENAME, ARCHIVE_MANIFEST_SCHEMA, CAPTURE_ID_RE, MAX_ARCHIVE_BYTES,
+        BackendInputError, _validate_source_manifest,
+        _validate_native_identity, _canonical_bytes,
+    )
+    manifest = validate_path(Path(manifest_path), Path(str(layout["build_storage_root"])),
+                             "frozen backend source manifest")
+    try:
+        def unique_object(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError(f"duplicate frozen manifest key: {key}")
+                value[key] = item
+            return value
+        value = json.loads(read_owned_regular(manifest, maximum=64 * 1024 * 1024),
+                           object_pairs_hook=unique_object)
+        required = {
+            "schema", "capture_id", "source_mode", "source_root", "resolved_commit", "source_digest",
+            "backend_source_sha256", "source_snapshot_sha256", "native_source_identity", "source_manifest",
+            "source_manifest_sha256", "archive_filename", "archive_sha256", "archive_bytes", "created_at",
+        }
+        if (not isinstance(value, dict) or set(value) != required
+                or value.get("schema") != ARCHIVE_MANIFEST_SCHEMA):
+            raise ValueError("unsupported frozen source manifest")
+        if (not isinstance(value["capture_id"], str)
+                or not CAPTURE_ID_RE.fullmatch(value["capture_id"])
+                or not isinstance(value["created_at"], str) or not value["created_at"]
+                or not isinstance(value["source_root"], str) or not value["source_root"]
+                or isinstance(value["archive_bytes"], bool)
+                or not isinstance(value["archive_bytes"], int)
+                or not 0 < value["archive_bytes"] <= MAX_ARCHIVE_BYTES
+                or not isinstance(value["archive_sha256"], str)
+                or not SHA256_RE.fullmatch(value["archive_sha256"])):
+            raise ValueError("invalid frozen source manifest metadata")
+        if Path(value["source_root"]).resolve(strict=True) != selected:
+            raise ValueError("frozen source checkout differs from selected live checkout")
+        source, _ = _validate_source_manifest(value["source_manifest"])
+        _validate_native_identity(value["native_source_identity"], source["resolved_commit"])
+        if (value.get("source_digest") != source["source_digest"]
+                or value.get("backend_source_sha256") != source["source_digest"]
+                or value.get("source_mode") != source["source_mode"]
+                or value.get("source_snapshot_sha256") != value["native_source_identity"]["source_snapshot_sha256"]
+                or value.get("resolved_commit") != source["resolved_commit"]
+                or value.get("source_manifest_sha256") != _sha256_bytes(_canonical_bytes(source))
+                or value.get("archive_filename") != ARCHIVE_FILENAME):
+            raise ValueError("frozen source manifest identity differs")
+        archive = validate_path(manifest.parent / ARCHIVE_FILENAME,
+                                Path(str(layout["build_storage_root"])), "frozen backend source archive")
+        if (archive.stat().st_size != value.get("archive_bytes")
+                or _sha256_file(archive, "frozen source archive") != value.get("archive_sha256")):
+            raise ValueError("frozen source archive differs from its manifest")
+        return {**value, "archive_path": str(archive), "manifest_path": str(manifest)}
+    except (OSError, ValueError, KeyError, TypeError, BackendInputError) as error:
+        raise _fail(f"Cannot resume frozen backend inputs: {error}") from error
+
+
 def build(args: argparse.Namespace) -> Path:
     _require_native_windows()
     repo = Path(args.repo_root).resolve(strict=True)
@@ -1155,6 +1276,11 @@ def build(args: argparse.Namespace) -> Path:
         raise
 
     try:
+        frozen_bundle = None
+        if getattr(args, "source_manifest", None) is not None:
+            if args.include_untracked:
+                raise _fail("Frozen inputs cannot include additional untracked files")
+            frozen_bundle = _frozen_source_bundle(args.source_manifest, layout, selected)
         # Resolve the existing versioned development image before creating any
         # backend cache.  A missing image is built by compose.dev's dedicated
         # Dockerfile.backend; it is never fetched implicitly from a registry.
@@ -1205,16 +1331,20 @@ def build(args: argparse.Namespace) -> Path:
 
         from docker_backend_inputs import capture_backend_source
 
-        source_bundle = capture_backend_source(
-            repo,
-            source_root=selected,
-            mode="snapshot",
-            include_untracked=tuple(args.include_untracked),
-            output_dir=run_root / "source",
-            capture_id=run_id,
-            profile=STORAGE_PROFILE,
-            require_windows=True,
-        )
+        if frozen_bundle is not None:
+            source_bundle = frozen_bundle
+            terminal["source_input_policy"] = "explicit_frozen_inputs; later checkout edits not included"
+        else:
+            source_bundle = capture_backend_source(
+                repo,
+                source_root=selected,
+                mode="snapshot",
+                include_untracked=tuple(args.include_untracked),
+                output_dir=run_root / "source",
+                capture_id=run_id,
+                profile=STORAGE_PROFILE,
+                require_windows=True,
+            )
         terminal.update(
             source_digest=source_bundle["source_digest"],
             source_archive_sha256=source_bundle["archive_sha256"],
@@ -1233,7 +1363,7 @@ def build(args: argparse.Namespace) -> Path:
         if not isinstance(backend, dict):
             raise _fail("direct Compose backend service is malformed")
         mount_targets = _mount_targets(backend)
-        required_mounts = {"/input/source.tar", "/input/manifest.json", "/build"}
+        required_mounts = {"/input/backend-source.tar", "/input/manifest.json", "/build"}
         missing_mounts = required_mounts - mount_targets
         if "/opt/fullmag/package" not in mount_targets:
             missing_mounts.add("/opt/fullmag/package")
@@ -1324,6 +1454,8 @@ def _parser() -> argparse.ArgumentParser:
                              help="registered checkout/worktree mounted live by both services")
         command.add_argument("--image", help="existing/buildable development image/tag; default: FULLMAG_DEV_IMAGE or fullmag/fullmag-dev:local")
         command.add_argument("--toolchain-image", help="immutable toolchain image ID/tag; default: image label or configured value")
+        command.add_argument("--source-manifest", type=Path,
+                             help="absolute manifest path to resume verified frozen backend inputs; later checkout edits are not included")
         command.add_argument("--include-untracked", action="append", default=[],
                              help="relative untracked source path to include in the frozen backend archive (repeatable)")
         command.add_argument("--port", type=int, default=3197,

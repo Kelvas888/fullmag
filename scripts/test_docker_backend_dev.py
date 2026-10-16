@@ -34,6 +34,28 @@ class BackendPackageTests(unittest.TestCase):
                 backend._copy_package_tree(source, root / "package")
             self.assertEqual((root / "outside").read_bytes(), b"retained")
 
+    def test_empty_first_attempt_workspace_is_recoverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            for name in backend.PERSISTENT_WORKSPACE_DIRS:
+                (workspace / name).mkdir()
+            self.assertEqual(backend._prepare_workspace(root), workspace)
+            self.assertTrue((workspace / backend.OWNER_MARKER).is_file())
+            self.assertEqual(backend._prepare_workspace(root), workspace)
+
+    def test_unowned_nonempty_workspace_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            retained = workspace / "unknown"
+            retained.write_bytes(b"keep")
+            with self.assertRaises(backend.BackendBuildError):
+                backend._prepare_workspace(root)
+            self.assertEqual(retained.read_bytes(), b"keep")
+
     def test_cleanup_unlinks_owned_alias_without_touching_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

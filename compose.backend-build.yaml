@@ -6,7 +6,7 @@ services:
     command:
       - prepare
       - --source-tar
-      - /input/source.tar
+      - /input/backend-source.tar
       - --manifest
       - /input/manifest.json
       - --output
@@ -19,7 +19,7 @@ services:
     volumes:
       - type: bind
         source: ${FULLMAG_BACKEND_SOURCE_TAR:?Capture the selected checkout first}
-        target: /input/source.tar
+        target: /input/backend-source.tar
         read_only: true
         bind: {create_host_path: false}
       - type: bind
