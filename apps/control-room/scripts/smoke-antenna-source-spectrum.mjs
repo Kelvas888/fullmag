@@ -23,6 +23,14 @@ try {
   if (channel && !["chrome", "msedge"].includes(channel)) throw new Error("Unsupported managed channel");
   browser = await playwright.chromium.launch({ headless: true, ...(channel ? { channel } : {}) });
   page = await browser.newPage({ viewport: { width: 1280, height: 1000 } });
+  await page.addInitScript(() => {
+    window.__spectrumDecodeReads = 0;
+    const readFloat64 = DataView.prototype.getFloat64;
+    DataView.prototype.getFloat64 = function (...args) {
+      window.__spectrumDecodeReads++;
+      return Reflect.apply(readFloat64, this, args);
+    };
+  });
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
   const readyScenarios = ["ready", "ready-vector", "ready-unitary", "ready-large"];
@@ -82,6 +90,16 @@ try {
     }
     if (scenario === "oversized-grid") assert.ok(text.includes("64 MiB interactive display budget"), "The large manifest must be refused before binary reads");
     if (scenario === "ready") {
+      const decodeReads = await page.evaluate(() => window.__spectrumDecodeReads);
+      assert.ok(decodeReads > 0, "The counter must observe actual float64 payload decoding");
+      for (const version of [1, 2, 3]) {
+        await page.getByRole("button", { name: "Rerender Inspector", exact: true }).click();
+        await page.waitForFunction(version => document.querySelector('output[aria-label="Fixture render version"]')?.textContent === String(version), version);
+        const reads = await page.evaluate(() => window.__spectrumDecodeReads);
+        assert.equal(reads, decodeReads, "Unrelated Inspector renders must not decode the binary spectrum again");
+      }
+      assert.equal((await page.evaluate(() => window.__antennaSpectrumFixture.read())).calls.length, before.calls.length);
+      checks.push({ name: "Three unrelated production Inspector renders reuse decoded spectrum data without binary reads or resource requests", passed: true, decodeReads });
       const grid = page.getByRole("grid");
       await page.evaluate(() => { window.__spectrumKeyboardGrid = document.querySelector('[role="grid"]'); });
       const mouseCell = grid.getByRole("gridcell").nth(1);

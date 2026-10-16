@@ -36,9 +36,14 @@ interface HeatmapCell {
   power: number;
 }
 
-type SpectrumPayloadResource = ResourceResult<
-  BinaryResourceResult<ArrayBuffer> | null
+type SpectrumPayloadResource = Pick<
+  ResourceResult<BinaryResourceResult<ArrayBuffer> | null>,
+  "data" | "error" | "refreshError" | "status"
 >;
+
+function useSpectrumPayloadSnapshot({ data, error, refreshError, status }: SpectrumPayloadResource) {
+  return useMemo(() => ({ data, error, refreshError, status }), [data, error, refreshError, status]);
+}
 
 export function AntennaSourceSpectrumPayloadView({
   outputId,
@@ -63,17 +68,17 @@ export function AntennaSourceSpectrumPayloadView({
         error: error instanceof Error ? error : new Error("spectrum manifest validation failed") };
     }
   }, [spectrum]);
-  const kU = useAntennaSourceSpectrumPayloadResource(outputId, "k_u_rad_per_m", {
+  const kU = useSpectrumPayloadSnapshot(useAntennaSourceSpectrumPayloadResource(outputId, "k_u_rad_per_m", {
     enabled: manifest.kind === "ready",
     expectedEtag: manifest.kind === "ready" ? manifest.etags.k_u_rad_per_m : undefined,
     maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.k_u_rad_per_m : undefined,
-  });
-  const kV = useAntennaSourceSpectrumPayloadResource(outputId, "k_v_rad_per_m", {
+  }));
+  const kV = useSpectrumPayloadSnapshot(useAntennaSourceSpectrumPayloadResource(outputId, "k_v_rad_per_m", {
     enabled: manifest.kind === "ready",
     expectedEtag: manifest.kind === "ready" ? manifest.etags.k_v_rad_per_m : undefined,
     maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.k_v_rad_per_m : undefined,
-  });
-  const amplitudes = useAntennaSourceSpectrumPayloadResource(
+  }));
+  const amplitudes = useSpectrumPayloadSnapshot(useAntennaSourceSpectrumPayloadResource(
     outputId,
     "amplitudes_re_im",
     {
@@ -81,18 +86,26 @@ export function AntennaSourceSpectrumPayloadView({
       expectedEtag: manifest.kind === "ready" ? manifest.etags.amplitudes_re_im : undefined,
       maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.amplitudes_re_im : undefined,
     },
-  );
-  const power = useAntennaSourceSpectrumPayloadResource(outputId, "power", {
+  ));
+  const power = useSpectrumPayloadSnapshot(useAntennaSourceSpectrumPayloadResource(outputId, "power", {
     enabled: manifest.kind === "ready",
     expectedEtag: manifest.kind === "ready" ? manifest.etags.power : undefined,
     maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.power : undefined,
-  });
-  const payloads = useMemo(
-    () => manifest.kind === "ready"
-      ? decodePayloads(kU, kV, amplitudes, power)
-      : { kind: "pending" as const },
-    [amplitudes, kU, kV, manifest, power],
-  );
+  }));
+  const payloads = useMemo(() => {
+    if (manifest.kind !== "ready") return { kind: "pending" as const };
+    const decoded = decodePayloads(kU, kV, amplitudes, power);
+    if (decoded.kind !== "ready") return decoded;
+    const integrityError = validatePayloads(decoded.value, spectrum);
+    if (integrityError) return { kind: "integrity-error" as const, error: integrityError };
+    return {
+      ...decoded,
+      cells: heatmapCells(decoded.value.kU, decoded.value.kV, decoded.value.power),
+      extrema: spectrumPowerExtrema(decoded.value.power),
+      rangeU: spectrumPowerExtrema(decoded.value.kU),
+      rangeV: spectrumPowerExtrema(decoded.value.kV),
+    };
+  }, [amplitudes, kU, kV, manifest, power, spectrum]);
 
   if (manifest.kind === "error") {
     return (
@@ -123,20 +136,17 @@ export function AntennaSourceSpectrumPayloadView({
     );
   }
 
-  const validation = validatePayloads(payloads.value, spectrum);
-  if (validation) {
+  if (payloads.kind === "integrity-error") {
     return (
       <section className="fm-antenna-spectrum" aria-label="Antenna source spectrum payload">
         <p className="fm-antenna-spectrum__status fm-antenna-spectrum__status--error" role="alert">
-          FFT payload integrity error: {validation}
+          FFT payload integrity error: {payloads.error}
         </p>
       </section>
     );
   }
 
-  const cells = heatmapCells(payloads.value.kU, payloads.value.kV, payloads.value.power);
-  const extrema = spectrumPowerExtrema(payloads.value.power);
-  const rangeU = spectrumPowerExtrema(payloads.value.kU), rangeV = spectrumPowerExtrema(payloads.value.kV);
+  const { cells, extrema, rangeU, rangeV } = payloads;
   const peak = extrema ? { index: extrema.peakIndex, value: extrema.maximum } : null;
   const peakKU = peak ? payloads.value.kU[peak.index % payloads.value.kU.length] : null;
   const peakKV = peak

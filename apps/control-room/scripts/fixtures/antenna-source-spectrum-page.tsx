@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
 import { DATA_ANTENNA_SOURCE_SPECTRUM_PATH, DATA_ANTENNA_SOURCE_SPECTRUM_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, MODEL_SCENE_PATH, SESSION_STATUS_PATH, SESSIONS_PATH } from "@/kernel/api/apiPaths";
 import type { AntennaSourceSpectrumResource } from "@/kernel/api/apiTypes";
@@ -16,6 +16,7 @@ import { antennaSpectrumPayloadEtag } from "@/kernel/resources/antennaResources"
 import { sessionRequestScopeKey, sessionScopedResourceKey } from "@/kernel/resources/sessionResourceIdentity";
 import { EMPTY_SELECTION } from "@/kernel/selection/selectionTypes";
 import type { KernelApi } from "@/kernel/types";
+import { Button } from "@/shared/ui/Button";
 import { AntennaCompositionPanel } from "@/modules/inspector/panels/antenna/AntennaCompositionPanels";
 
 const SCENARIOS = ["ready", "ready-vector", "ready-unitary", "ready-large", "oversized-grid", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"] as const;
@@ -145,8 +146,9 @@ function makeFixture() {
 
 function MountedFixture() {
   const fixture = useMemo(() => makeFixture(), []);
+  const [renderVersion, setRenderVersion] = useState(0);
   useEffect(() => { window.__antennaSpectrumFixture = fixture.control; return () => { delete window.__antennaSpectrumFixture; }; }, [fixture]);
-  return <KernelContext.Provider value={fixture.kernel}><AntennaCompositionPanel kind="spectrum" selection={{ ...EMPTY_SELECTION, kind: "object.antenna.spectrum", objectId: "antenna", ref: { type: "scene-object", kind: "object.antenna.spectrum", objectId: "antenna", nodeId: "fixture-spectrum", visualizationTargetId: "object:antenna", antennaResourceId: "request", antennaResourceKind: "spectrum" } }} /></KernelContext.Provider>;
+  return <KernelContext.Provider value={fixture.kernel}><Button type="button" onClick={() => setRenderVersion(value => value + 1)}>Rerender Inspector</Button><output aria-label="Fixture render version">{renderVersion}</output><AntennaCompositionPanel kind="spectrum" selection={{ ...EMPTY_SELECTION, kind: "object.antenna.spectrum", objectId: "antenna", ref: { type: "scene-object", kind: "object.antenna.spectrum", objectId: "antenna", nodeId: "fixture-spectrum", visualizationTargetId: "object:antenna", antennaResourceId: "request", antennaResourceKind: "spectrum" } }} /></KernelContext.Provider>;
 }
 
 export default function SpectrumFixturePage() {
