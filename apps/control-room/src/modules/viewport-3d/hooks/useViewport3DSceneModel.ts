@@ -3151,7 +3151,7 @@ export function useViewport3DSceneModel({
   const quantityCatalog = useQuantityCatalogResource({
     enabled: Boolean(
       liveViewportResourcesEnabled &&
-        (fdmLaneActive || femLaneActive),
+        (fdmLaneActive || femLaneActive || (scene.data?.antenna_field_solve_stages?.length ?? 0) > 0),
     ),
   });
   const availableFieldQuantityIds = useMemo(
@@ -7089,6 +7089,8 @@ export function useViewport3DSceneModel({
   };
 
   return {
+    artifactInspectionCatalog: quantityCatalog.status === "ready" && !quantityCatalog.refreshError && !savedSelectionActive ? quantityCatalog.data : null,
+    artifactInspectionDefinitions: scene.status === "ready" ? scene.data?.antenna_field_solve_stages ?? [] : [],
     airboxSettings,
     availableQuantityIds: savedSelectionActive
       ? SAVED_VIEWPORT_AVAILABLE_QUANTITIES

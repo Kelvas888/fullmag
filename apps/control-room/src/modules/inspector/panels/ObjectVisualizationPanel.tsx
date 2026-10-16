@@ -1,5 +1,8 @@
 "use client";
+import { isScalarSpatialQuantityId } from "@/kernel/api/quantityIds";
 
+import { artifactSelectionMatchesSession, artifactInspectionQuantity } from "@/kernel/visualization/artifactFieldSelection";
+import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { Eye } from "lucide-react";
 import React, {
   useCallback,
@@ -569,6 +572,10 @@ function useObjectVisualizationPanelState(
       (settings.vectorsVisible ||
         (settings.shaderVisible && settings.surfaceColorSource !== "solid")),
   );
+  const artifactSelection = useObjectVisualizationSelector(snapshot => snapshot.artifactFieldSelection ?? null);
+  const artifactSession = useSessionResourceIdentity();
+  const artifactQuantity = quantityCatalog.status === "ready" && !quantityCatalog.refreshError &&
+    artifactInspectionQuantity(quantityCatalog.data, settings?.activeQuantityId ?? "");
   const fieldAvailabilityQuery = useMemo(
     () =>
       fieldAvailabilityQueryForVisualizationTarget(
@@ -577,17 +584,19 @@ function useObjectVisualizationPanelState(
       ),
     [airboxFieldCarrierIdentity, resolvedTarget],
   );
+  const artifactOwnerReady = artifactSelection?.quantityId === settings?.activeQuantityId && artifactSelectionMatchesSession(artifactSelection, artifactSession) && Boolean(artifactSelection?.runtimeStageId && artifactSelection.carrierId && artifactSelection.carrierRevision) &&
+    (artifactSelection?.carrierScopeKind === "full" || (artifactSelection?.carrierScopeKind === "object" && artifactSelection.carrierScopeId === fieldAvailabilityQuery?.scope_id));
   const airboxFieldCarrierReady =
     resolvedTarget?.kind !== "airbox" || airboxFieldCarrierIdentity !== null;
   const fieldAvailability = useFieldAvailabilityResource({
-    ...fieldAvailabilityQuery,
+    ...(artifactQuantity ? { stage_id: artifactOwnerReady ? artifactSelection?.runtimeStageId : undefined, carrier_id: artifactOwnerReady ? artifactSelection?.carrierId : undefined, expected_carrier_revision: artifactOwnerReady ? artifactSelection?.carrierRevision : undefined, view: "full", scope_kind: artifactSelection?.carrierScopeKind ?? "full", scope_id: artifactSelection?.carrierScopeId ?? null } : fieldAvailabilityQuery),
     enabled: Boolean(
-      resolvedTarget && requiresFieldData && airboxFieldCarrierReady,
+      resolvedTarget && requiresFieldData && airboxFieldCarrierReady && (!artifactQuantity || artifactOwnerReady),
     ),
     quantityId: settings?.activeQuantityId ?? "H_demag",
   });
   const fieldAvailabilityEnabled = Boolean(
-    resolvedTarget && requiresFieldData && airboxFieldCarrierReady,
+    resolvedTarget && requiresFieldData && airboxFieldCarrierReady && (!artifactQuantity || artifactOwnerReady),
   );
   const targetFieldCarrier =
     resolvedTarget && settings
@@ -1047,6 +1056,8 @@ function useObjectVisualizationPanelState(
   }
 
   return {
+    artifactQuantity,
+    artifactOwnerReady,
     appliedBaseline,
     airboxFieldCarrierIdentity,
     displaySettings,
@@ -1362,6 +1373,8 @@ function ObjectVisualizationPanelView({
     visualizationResourceRevision,
     vectorMeshParts,
     vectorTopologyHash,
+    artifactQuantity,
+    artifactOwnerReady,
   } = panel;
   // While a mode field is the viewport quantity on magnetic targets (ADR 0054),
   // coloring, colorbar and vectors describe the mode rather than the model quantity.
@@ -1422,6 +1435,7 @@ function ObjectVisualizationPanelView({
       className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group"
       data-visualization-revision={revision}
     >
+      {artifactQuantity && !artifactOwnerReady ? <p role="status" className="fm-artifact-inspection-owner-required">Select the field inspection source and execution in the viewport.</p> : null}
       <ObjectVisualizationOverview
             advanced={
               <p className="m-0 text-fm-help leading-snug text-fm-muted">
@@ -1507,7 +1521,7 @@ function ObjectVisualizationPanelView({
               target={target}
               />
             )}
-            vectors={capabilities.supportsVectors ? (
+            vectors={capabilities.supportsVectors && !isScalarSpatialQuantityId(settings.activeQuantityId) ? (
               <VisualizationVectorsSection
               airboxFieldCarrierIdentity={airboxFieldCarrierIdentity}
               fieldCatalog={fieldCatalog}

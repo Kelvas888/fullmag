@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -34,6 +35,7 @@ SCENARIOS = {
     "antenna-source-spectrum": ("smoke-antenna-source-spectrum.mjs", "fullmag_antenna_source_spectrum_browser_fixture_v1", "antenna-source-spectrum", "FULLMAG_ANTENNA_SOURCE_SPECTRUM"),
     "antenna-port-editor": ("smoke-antenna-port-editor.mjs", "fullmag_antenna_port_editor_browser_fixture_v1", "antenna-port-editor", "FULLMAG_ANTENNA_PORT_EDITOR"),
     "antenna-port-diagnostics": ("smoke-antenna-port-diagnostics.mjs", "fullmag_antenna_port_diagnostics_browser_fixture_v1", "antenna-port-diagnostics", "FULLMAG_ANTENNA_PORT_DIAGNOSTICS"),
+    "artifact-field-overlay": ("smoke-artifact-field-overlay.mjs", "fullmag_artifact_field_overlay_browser_fixture_v1", "artifact-field-overlay", "FULLMAG_ARTIFACT_FIELD_OVERLAY"),
     "antenna-visualization": ("smoke-antenna-visualization.mjs", "fullmag_antenna_visualization_browser_fixture_v1", "antenna-visualization", "FULLMAG_ANTENNA_VISUALIZATION"),
     "inspector-routing": ("smoke-inspector.mjs", "fullmag_inspector_routing_browser_fixture_v1", None, "CONTROL_ROOM_INSPECTOR"),
     "antenna-cpw-viewport": ("smoke-antenna-cpw-viewport.mjs", "fullmag_antenna_cpw_viewport_browser_fixture_v1", "antenna-cpw-viewport", "FULLMAG_ANTENNA_CPW_VIEWPORT"),
@@ -110,9 +112,125 @@ def print_fixture_log_tails(run_root: Path):
                   file=sys.stderr, flush=True)
 
 
+def stage_dependency_roots(repo, layout, binding_path, expected_sha256, source_digest):
+    """Admit only an explicitly pinned, installed stage of this worktree."""
+    namespace = Path(layout["build_storage_root"]) / "builds" / layout["worktree_id"]
+
+    def checked_path(value, root, label):
+        return storage.validate_path(Path(value), root, label)
+
+    def file_sha(path):
+        if not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+            raise storage.StorageError(f"Missing or oversized dependency input: {path}")
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def load(path, expected):
+        if not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+            raise storage.StorageError(f"Missing or oversized dependency input: {path}")
+        raw = path.read_bytes()
+        if len(raw) > 16 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != expected:
+            raise storage.StorageError(f"Dependency input hash changed: {path}")
+        return json.loads(raw)
+
+    binding_file = checked_path(binding_path, namespace, "owned dependency binding")
+    binding = load(binding_file, expected_sha256)
+    if (binding.get("schema") != "fullmag.browser.dependency-stage-binding.v1"
+            or Path(binding.get("repo_root", "")).resolve() != repo.resolve()
+            or binding.get("worktree_id") != layout["worktree_id"]
+            or binding.get("source_digest") != source_digest):
+        raise storage.StorageError("Dependency binding owner or current source changed")
+    receipt_file = checked_path(binding["install_receipt"], namespace, "owned install receipt")
+    receipt = load(receipt_file, binding["install_receipt_sha256"])
+    if (receipt.get("schema") != "fullmag.antenna.ui.dependency-diagnostic.v1"
+            or receipt.get("state") != "INSTALLED_DEPENDENCIES_ONLY"
+            or receipt.get("exit_code") != 0
+            or "--frozen-lockfile" not in receipt.get("command", [])):
+        raise storage.StorageError("Dependency stage has no successful frozen install")
+    plan, stage = receipt["plan"], receipt["stage"]
+    profile, stage_id = plan["profile"], stage["stage_id"]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,95}", profile) or not re.fullmatch(r"[0-9a-f]{32}", stage_id):
+        raise storage.StorageError("Invalid dependency profile or stage ID")
+    build = namespace / profile
+    stage_root = build / "frontend-sources" / stage_id
+    workspace = stage_root / "workspace"
+    app = workspace / "apps/control-room"
+    if (Path(plan["repo_root"]).resolve() != repo.resolve()
+            or Path(plan["build_root"]).resolve() != build.resolve()
+            or stage.get("schema") != "fullmag.native-workspace-frontend-source.v1"
+            or stage.get("mode") != "static"
+            or Path(stage["source_root"]).resolve() != repo.resolve()
+            or Path(stage["build_root"]).resolve() != build.resolve()
+            or Path(stage["stage_root"]).resolve() != stage_root.resolve()
+            or Path(stage["workspace_root"]).resolve() != workspace.resolve()
+            or Path(stage["app_root"]).resolve() != app.resolve()):
+        raise storage.StorageError("Dependency stage does not belong to this worktree profile")
+    checked_path(build, namespace, "owned dependency profile")
+    checked_path(stage_root, build, "owned dependency stage")
+    checked_path(workspace, namespace, "owned dependency workspace")
+    manifest_file = checked_path(stage["manifest_path"], stage_root, "stage manifest")
+    if manifest_file != (stage_root / "frontend-source-manifest.json").resolve():
+        raise storage.StorageError("Unexpected stage manifest path")
+    manifest = load(manifest_file, stage["manifest_sha256"])
+    for key in ("schema", "stage_id", "mode", "source_root", "build_root", "stage_root", "workspace_root", "app_root"):
+        if manifest.get(key) != stage.get(key):
+            raise storage.StorageError(f"Stage manifest identity mismatch: {key}")
+    selected = {entry["path"]: entry for entry in manifest["source_files"]}
+    metadata = {"package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "apps/control-room/package.json"}
+    metadata.update(entry["path"] for entry in manifest["source_files"] if entry["mode"] == "app-package-manifest")
+    absent = set()
+    for importer in manifest["lock_importers"]:
+        relative = Path(importer)
+        if relative.is_absolute() or ".." in relative.parts or relative.parts[:1] != ("apps",):
+            raise storage.StorageError("Invalid stage lock importer")
+        package_relative = (relative / "package.json").as_posix()
+        if package_relative in selected:
+            metadata.add(package_relative)
+        else:
+            absent.add(package_relative)
+    if set(binding["metadata_sha256"]) != metadata or set(binding["absent_importer_manifests"]) != absent:
+        raise storage.StorageError("Incomplete dependency metadata binding")
+    for relative in absent:
+        for root in (repo, workspace):
+            path = checked_path(root / relative, root, "absent importer manifest")
+            if path.exists() or path.is_symlink():
+                raise storage.StorageError(f"Previously absent importer appeared: {relative}")
+    for relative, expected in binding["metadata_sha256"].items():
+        original = checked_path(repo / relative, repo, "root package metadata")
+        staged = checked_path(workspace / relative, workspace, "stage package metadata")
+        if selected.get(relative, {}).get("sha256") != expected or file_sha(original) != expected or file_sha(staged) != expected:
+            raise storage.StorageError(f"Package/lock metadata changed: {relative}")
+    app_dependencies = checked_path(app / "node_modules", workspace, "owned app dependencies")
+    root_dependencies = checked_path(workspace / "node_modules", workspace, "owned root dependencies")
+    if not app_dependencies.is_dir() or not root_dependencies.is_dir():
+        raise storage.StorageError("Installed stage dependencies are missing")
+    if set(binding["packages"]) != {"next", "react", "react-dom"}:
+        raise storage.StorageError("Incomplete renderer package binding")
+    for name, pin in binding["packages"].items():
+        package_file = checked_path((app_dependencies / name / "package.json").resolve(), workspace, "owned renderer package")
+        package = load(package_file, pin["sha256"])
+        if package.get("name") != name or package.get("version") != pin["version"]:
+            raise storage.StorageError(f"Renderer package changed: {name}")
+    installed_lock = checked_path(root_dependencies / ".pnpm/lock.yaml", workspace, "installed pnpm lock")
+    if file_sha(installed_lock) != binding["installed_lock_sha256"]:
+        raise storage.StorageError("Installed dependency lock changed")
+    next_cli = checked_path((app_dependencies / "next/dist/bin/next").resolve(), workspace, "owned Next CLI")
+    if file_sha(next_cli) != binding["next_cli_sha256"]:
+        raise storage.StorageError("Installed Next CLI changed")
+    return app_dependencies, root_dependencies, {
+        "binding": str(binding_file), "binding_sha256": expected_sha256,
+        "install_receipt_sha256": binding["install_receipt_sha256"],
+        "manifest_sha256": stage["manifest_sha256"], "stage_id": stage_id,
+        "dependency_profile": profile, "packages": binding["packages"],
+        "metadata_sha256": binding["metadata_sha256"], "absent_importer_manifests": sorted(absent),
+        "source_digest": source_digest,
+    }
+
+
 def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
     if scenario not in SCENARIOS:
         raise storage.StorageError("Unknown fixed browser fixture scenario")
+    if scenario == "artifact-field-overlay" and port != 3276:
+        raise storage.StorageError("Artifact field overlay browser fixture uses fixed port 3276")
     if scenario == "antenna-regional-drive" and port != 3272:
         raise storage.StorageError("Antenna regional drive browser fixture uses fixed port 3272")
     if scenario == "object-material-editor" and port != 3266:
@@ -145,12 +263,15 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
     app = repo / "apps/control-room"
     smoke = app / "scripts" / smoke_name
     node = shutil.which("node")
-    next_cli = app / "node_modules/next/dist/bin/next"
-    if not node or not next_cli.is_file() or not smoke.is_file():
-        raise storage.StorageError("Existing Node, Next and scenario smoke are required; no bootstrap")
+    binding_path = os.environ.get("FULLMAG_BROWSER_DEPENDENCY_BINDING")
+    binding_sha256 = os.environ.get("FULLMAG_BROWSER_DEPENDENCY_BINDING_SHA256")
+    if bool(binding_path) != bool(binding_sha256):
+        raise storage.StorageError("A dependency binding requires its explicit SHA256; no fallback")
+    if not node or not smoke.is_file():
+        raise storage.StorageError("Existing Node and pinned dataset smoke are required; no bootstrap")
     dependencies = app / "node_modules"
     real_dependencies = dependencies.resolve()
-    if not (real_dependencies == dependencies or
+    if not binding_path and not (real_dependencies == dependencies or
             storage.inside(real_dependencies, Path(layout["frontend_root"]).resolve())):
         raise storage.StorageError("Frontend dependencies belong to a different checkout")
     with socket.socket() as probe:
@@ -162,6 +283,15 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
         )
         run_root.mkdir(parents=True)
         before = fingerprint(repo, False)
+        stage_root_dependencies = None
+        dependency_stage_proof = None
+        if binding_path:
+            real_dependencies, stage_root_dependencies, dependency_stage_proof = stage_dependency_roots(
+                repo, layout, binding_path, binding_sha256, before,
+            )
+        next_cli = real_dependencies / "next/dist/bin/next"
+        if not next_cli.is_file():
+            raise storage.StorageError("Existing Next is required; no bootstrap")
         receipt_path = run_root / "receipt.json"
         receipt = {
             "schema": receipt_schema, "state": "running",
@@ -176,6 +306,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
             "unit_tests": "not_compiled_not_run", "port": port,
             "browser_channel": BROWSER_CHANNEL or "playwright_chromium",
             "browser_timeout_seconds": browser_timeout_seconds,
+            "dependency_stage": dependency_stage_proof,
         }
         storage.atomic_json(receipt_path, receipt)
         process = None
@@ -197,7 +328,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                     shutil.copytree(source, target)
                 else:
                     shutil.copy2(source, target)
-            for name in ("package.json", "pnpm-workspace.yaml"):
+            for name in ("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"):
                 if (repo / name).is_file():
                     shutil.copy2(repo / name, snapshot / name)
             if fingerprint(repo, False) != before:
@@ -212,10 +343,10 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                 target_page.parent.mkdir(parents=True, exist_ok=False)
                 shutil.copy2(fixture_page, target_page)
             link_directory(fixture_app / "node_modules", real_dependencies)
-            root_dependencies = repo / "node_modules"
+            root_dependencies = stage_root_dependencies if stage_root_dependencies is not None else repo / "node_modules"
             if root_dependencies.is_dir():
                 root_real_dependencies = root_dependencies.resolve()
-                if not (root_real_dependencies == root_dependencies or
+                if stage_root_dependencies is None and not (root_real_dependencies == root_dependencies or
                         storage.inside(root_real_dependencies, Path(layout["frontend_root"]).resolve())):
                     raise storage.StorageError("Root dependencies belong to a different checkout")
                 link_directory(snapshot / "node_modules", root_real_dependencies)
@@ -314,6 +445,12 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                         })
                 receipt["browser_artifact_root"] = str(browser_root)
                 receipt["browser_artifacts"] = artifacts
+            if binding_path:
+                try:
+                    stage_dependency_roots(repo, layout, binding_path, binding_sha256, before)
+                    receipt["dependency_stage_revalidated"] = True
+                except (OSError, ValueError, KeyError, storage.StorageError) as error:
+                    receipt.update(state="failed", exit_code=1, dependency_stage_error=str(error))
             if api_target:
                 try:
                     after_target = managed_browser_target(repo, api_target["receipt"], api_target["receipt_sha256"])

@@ -605,6 +605,10 @@ verify-explorer-physics-reporting-browser:
 verify-antenna-source-spectrum-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3265 --scenario antenna-source-spectrum
 
+# Immutable artifact carriers through production binary transport and WebGL.
+verify-artifact-field-overlay-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3276 --scenario artifact-field-overlay
+
 verify-antenna-visualization-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3262 --scenario antenna-visualization
 

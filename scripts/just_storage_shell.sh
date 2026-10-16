@@ -487,6 +487,10 @@ case "${recipe}" in
     if [[ "${recipe}" =~ ${antenna_spectrum_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3265 --scenario antenna-source-spectrum
     fi
+    artifact_field_overlay_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3276 --scenario artifact-field-overlay$'
+    if [[ "${recipe}" =~ ${artifact_field_overlay_browser_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3276 --scenario artifact-field-overlay
+    fi
     antenna_visualization_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3262 --scenario antenna-visualization$'
     if [[ "${recipe}" =~ ${antenna_visualization_browser_pattern} ]]; then
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3262 --scenario antenna-visualization
