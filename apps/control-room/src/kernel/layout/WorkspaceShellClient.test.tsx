@@ -97,7 +97,7 @@ describe("WorkspaceShellClient session collection gate", () => {
     }
   });
 
-  it("renders loading separately and mounts no current-session subscriptions", async () => {
+  it("keeps Home mounted while the initial session collection is loading", async () => {
     const pending = deferred<{ schema_version: string; sessions: never[] }>();
     const currentStatus = vi.fn();
     const { container, dispose } = await mountWorkspace(
@@ -107,8 +107,45 @@ describe("WorkspaceShellClient session collection gate", () => {
     try {
       expect(findByAttribute(container, "data-state", "session-loading")).toBeTruthy();
       expect(container.textContent).toContain("Checking for sessions");
-      expect(container.textContent).not.toContain("Welcome to Fullmag");
+      expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeTruthy();
       expect(currentStatus).not.toHaveBeenCalled();
+    } finally {
+      await dispose();
+    }
+  });
+
+  it("keeps Home mounted while a failed collection retries and recovers", async () => {
+    const retry = deferred<{ schema_version: string; sessions: never[] }>();
+    const list = vi.fn()
+      .mockRejectedValueOnce(new Error("session collection unavailable"))
+      .mockImplementationOnce(() => retry.promise);
+    const currentStatus = vi.fn();
+    const { container, dispose } = await mountWorkspace(makeKernel(list, currentStatus));
+
+    try {
+      await settle();
+      expect(findByAttribute(container, "data-state", "session-error")).toBeTruthy();
+      const home = findByAttribute(container, "data-slot-id", "start-screen");
+      expect(home).toBeTruthy();
+
+      const retryButton = findElements(
+        container,
+        (element) => element.tagName === "BUTTON" && element.textContent === "Retry",
+      )[0];
+      expect(retryButton).toBeTruthy();
+      await act(async () => {
+        retryButton!.click();
+        await settle();
+      });
+
+      expect(findByAttribute(container, "data-state", "session-loading")).toBeTruthy();
+      expect(findByAttribute(container, "data-slot-id", "start-screen")).toBe(home);
+
+      retry.resolve({ schema_version: "2.0.0", sessions: [] });
+      await settle();
+
+      expect(findByAttribute(container, "data-state", "no-session")).toBeTruthy();
+      expect(findByAttribute(container, "data-slot-id", "start-screen")).toBe(home);
     } finally {
       await dispose();
     }

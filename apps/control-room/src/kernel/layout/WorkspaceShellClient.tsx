@@ -64,6 +64,13 @@ export function WorkspaceShellClient() {
     homeView.close();
   }, [sessionScopeKey, startOwnsPage]);
 
+  const collectionGateState =
+    sessionState === "no-session" || sessionState === "error"
+      ? sessionState
+      : sessionState === "loading" && sessions.state !== "ready"
+        ? "loading"
+        : null;
+
   if (sessionState !== "ready" && project.state === "ready") {
     return <ProjectWorkspaceShell sessionState={sessionState} onRetry={onRetry} />;
   }
@@ -71,18 +78,14 @@ export function WorkspaceShellClient() {
   if (sessionState !== "ready") return (
     <>
       <SlotHost slotId="app-menu" />
-      {sessionState === "no-session" ? (
-        <div className="fm-start-host" data-state="no-session">
-          <SlotHost slotId="start-screen" />
-        </div>
-      ) : sessionState === "error" ? (
-        <SessionCollectionError onRetry={sessions.resource.refetch} />
+      {collectionGateState ? (
+        <SessionCollectionGate state={collectionGateState} onRetry={onRetry} />
       ) : sessionState === "status-error" ? (
         <SessionStatusError onRetry={onRetry} />
       ) : sessionState === "status-inconsistent" ? (
         <SessionStatusError kind="inconsistent" onRetry={onRetry} />
       ) : (
-        <SessionCollectionLoading />
+        <SessionStatusLoading onRetry={onRetry} />
       )}
       {sessionState === "loading" ? null : (
         <div className="fm-workspace-overlay-host">
@@ -141,42 +144,44 @@ function ProjectWorkspaceShell({
   );
 }
 
-function SessionCollectionLoading() {
-  return (
-    <main
-      className="grid min-h-0 flex-1 place-items-center p-8"
-      id="fm-main-content" tabIndex={-1} data-state="session-loading"
-      role="status"
-    >
-      <section className="grid max-w-md gap-2 text-center">
-        <h1 className="font-fm-ui text-lg font-semibold text-fm-primary">
-          Checking for sessions
-        </h1>
-        <p className="text-fm-secondary">Reading the local session collection.</p>
-      </section>
-    </main>
-  );
-}
+function SessionCollectionGate({
+  state,
+  onRetry,
+}: {
+  readonly state: "loading" | "error" | "no-session";
+  readonly onRetry: () => void;
+}) {
+  const noSession = state === "no-session";
+  const loading = state === "loading";
 
-function SessionCollectionError({ onRetry }: { readonly onRetry: () => void }) {
   return (
-    <div className="fm-start-host" data-state="session-error">
-      <section
-        className="border-b border-fm-border bg-fm-surface px-6 py-3"
-        role="alert"
-      >
-        <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1 className="font-fm-ui text-lg font-semibold text-fm-danger">
-              Session list unavailable
-            </h1>
-            <p className="text-fm-secondary">
-              Fullmag could not confirm whether a local session exists. Project files remain available independently.
-            </p>
+    <div
+      className="fm-start-host"
+      data-state={noSession ? "no-session" : loading ? "session-loading" : "session-error"}
+    >
+      {noSession ? null : (
+        <section
+          className="border-b border-fm-border bg-fm-surface px-6 py-3"
+          role={loading ? "status" : "alert"}
+        >
+          <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
+            <div>
+              <h1 className={loading
+                ? "font-fm-ui text-lg font-semibold text-fm-primary"
+                : "font-fm-ui text-lg font-semibold text-fm-danger"}
+              >
+                {loading ? "Checking for sessions" : "Session list unavailable"}
+              </h1>
+              <p className="text-fm-secondary">
+                {loading
+                  ? "Fullmag is checking the local session collection. Project files remain available independently."
+                  : "Fullmag could not confirm whether a local session exists. Project files remain available independently."}
+              </p>
+            </div>
+            <Button type="button" onClick={onRetry}>Retry</Button>
           </div>
-          <Button type="button" onClick={onRetry}>Retry</Button>
-        </div>
-      </section>
+        </section>
+      )}
       <SlotHost slotId="start-screen" />
     </div>
   );
@@ -208,6 +213,29 @@ function SessionStatusError({
               {inconsistent
                 ? "Fullmag received a current status that does not match the session list. Retry before creating or opening a session."
                 : "Fullmag could not confirm the current session. Project files remain available independently."}
+            </p>
+          </div>
+          <Button type="button" onClick={onRetry}>Retry</Button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function SessionStatusLoading({ onRetry }: { readonly onRetry: () => void }) {
+  return (
+    <div className="fm-start-host" data-state="session-status-loading">
+      <section
+        className="border-b border-fm-border bg-fm-surface px-6 py-3"
+        role="status"
+      >
+        <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
+          <div>
+            <h1 className="font-fm-ui text-lg font-semibold text-fm-primary">
+              Checking current session
+            </h1>
+            <p className="text-fm-secondary">
+              Fullmag is confirming the active session before enabling workspace actions.
             </p>
           </div>
           <Button type="button" onClick={onRetry}>Retry</Button>
