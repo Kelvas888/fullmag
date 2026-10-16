@@ -136,6 +136,11 @@ class BackendPackageTests(unittest.TestCase):
             backend._reconcile_source_tree(
                 self._stage(root, first), workspace, self._capsule("a" * 64, first), "b" * 64
             )
+            marker_path = workspace / backend.OWNER_MARKER
+            marker, _ = backend._read_json(marker_path, "test backend workspace owner")
+            marker.pop("workspace_inventory_schema")
+            marker.pop("workspace_inventory_sha256")
+            backend._write_json(marker_path, marker, "test backend workspace owner")
             stable = workspace / "crates/example/src/stable.rs"
             stable_time = 1_600_000_000_000_000_000
             os.utime(stable, ns=(stable_time, stable_time))

@@ -512,9 +512,11 @@ def _reconcile_source_tree(
         has_inventory = True
     else:
         _fail("backend workspace owner inventory binding is invalid")
-    if old_digest != new_digest and not has_inventory:
-        # A v1 marker has no inventory. Once its ownership and all entries have
-        # been validated above, a digest change permits one clean migration.
+    if old_digest is None and not has_inventory:
+        # A marker without a source digest can only describe an incomplete
+        # first attempt. A valid legacy v1 digest is sufficient ownership
+        # evidence after the complete tree and per-file checks above, so it
+        # must take the normal incremental path even when the digest changes.
         _remove_workspace_relative_entries(workspace, existing_files, existing_directories)
         existing_files = {}
         existing_directories = set()
