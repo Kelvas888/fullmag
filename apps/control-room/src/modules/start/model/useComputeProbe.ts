@@ -25,6 +25,10 @@ import type { ComputeProbeController, ComputeProbeState } from "./types";
 
 export const COMPUTE_POLL_MS = 5000;
 
+function monotonicNow(): number {
+  return typeof performance === "undefined" ? 0 : performance.now();
+}
+
 /** One owner for the rail, settings, templates and project compatibility checks. */
 export function useComputeProbe(): ComputeProbeController {
   const { api } = useKernel();
@@ -36,13 +40,31 @@ export function useComputeProbe(): ComputeProbeController {
   const nodeInventoryStatus = nodeInventoryResource.status;
   const nodeInventoryRefreshError = nodeInventoryResource.refreshError;
   const [freshnessNow, setFreshnessNow] = useState<number | undefined>(undefined);
+  const [nodeInventoryClockNow, setNodeInventoryClockNow] = useState<number | undefined>(undefined);
+  // `collected_at` belongs to the server's wall clock. Anchor each response
+  // by data identity in the browser's monotonic clock, without extending the
+  // shared resource result or introducing another cache. The timestamp is a
+  // read performed only when the resource identity changes.
+  const nodeInventoryReceipt = useMemo(
+    () => ({
+      data: nodeInventoryData,
+      receivedAt: nodeInventoryData === null ? 0 : monotonicNow(),
+    }),
+    [nodeInventoryData],
+  );
+  const nodeInventoryReceivedAt = nodeInventoryReceipt.data === nodeInventoryData
+    ? nodeInventoryReceipt.receivedAt
+    : null;
+  const nodeInventoryElapsedMs = nodeInventoryReceivedAt === null || nodeInventoryClockNow === undefined
+    ? 0
+    : Math.max(0, nodeInventoryClockNow - nodeInventoryReceivedAt);
   const nodeInventory = useMemo(
     () => summarizeComputeNodeInventory({
       data: nodeInventoryData,
       status: nodeInventoryStatus,
       refreshError: nodeInventoryRefreshError,
-    }, freshnessNow),
-    [freshnessNow, nodeInventoryData, nodeInventoryRefreshError, nodeInventoryStatus],
+    }, nodeInventoryElapsedMs),
+    [nodeInventoryData, nodeInventoryElapsedMs, nodeInventoryRefreshError, nodeInventoryStatus],
   );
   const [desktop, setDesktop] = useState<ComputeProbeState>(undefined);
   const [desktopRefreshing, setDesktopRefreshing] = useState(false);
@@ -124,6 +146,7 @@ export function useComputeProbe(): ComputeProbeController {
   }, [api, refetchNodeInventory]);
   const refresh = useCallback(() => {
     setFreshnessNow(Date.now());
+    setNodeInventoryClockNow(monotonicNow());
     refetchCpu();
     refetchGpu();
     refetchCapabilities();
@@ -136,6 +159,7 @@ export function useComputeProbe(): ComputeProbeController {
     const sample = () => {
       if (document.hidden) return;
       setFreshnessNow(Date.now());
+      setNodeInventoryClockNow(monotonicNow());
       if (cpu.data?.status === "available" && cpu.status === "ready") refetchCpu();
       if (gpu.data?.status === "available" && gpu.status === "ready") refetchGpu();
       refetchNodeInventory();
