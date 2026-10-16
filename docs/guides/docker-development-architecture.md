@@ -165,17 +165,22 @@ niezależnej listy wersji.
 
 ## Przebudowa backendu a trwały rejestr GPU
 
-Stan z 16.10.2026: kontrolowana aktualizacja generacji runtime wymaga
-implementacji. Build backendu `a8e21962f7004d378eb8b11f92232b4e` przeszedł
-wszystkie trzy fazy oraz pakowanie. Start `147f8e32446842b48d1cfa6ee23af15c`
-zatrzymał się na `existing host runtime readiness differs from the requested ABI result`.
-To dowód braku ścieżki aktualizacji istniejącego rejestru po zmianie backendu;
-ponowienie tego samego buildu nie usuwa tej przyczyny.
+Stan z 16.10.2026: implementacja kontrolowanej aktualizacji generacji jest
+zapisana na branchu zadania. Inicjalizacja API wykonuje rzeczywisty probe
+readiness i przypina generację konfiguracji, żądań i pozwoleń. Rejestr V4
+odgradza stare generacje od nowych przyjęć zadań; zmiana generacji wymaga
+braku aktywnego właściciela inventory i zwolnienia wszystkich rezerwacji.
+Readiness oraz snapshot są publikowane jako obiekty CAS przed zmianą wskaźnika.
+Te kontrole przeszły sprawdzenia źródeł; migracja i ponowne uruchomienie po
+wykonanej symulacji pozostają `NOT VERIFIED`.
 
-Obecne `HostResourceLedger::initialize_with_readiness` wymaga identycznego
-zapisanego readiness. Zapis zawiera także tożsamość źródeł/runtime, która
-zmienia się po przebudowie. Sam brak producenta próbki inventory nie dowodzi,
-że wszystkie usługi korzystające ze wspólnego rejestru są zatrzymane.
+Ostatni kompletny build `a8e21962f7004d378eb8b11f92232b4e` przeszedł trzy fazy
+i pakowanie. Jego start `147f8e32446842b48d1cfa6ee23af15c` ujawnił brak
+aktualizacji readiness w starszym runtime. Kolejny build z poprawką generacji
+`b7f3120b7d3a4f8b8af6d1a7cebccbf8` zakończył się podczas kompilacji API,
+gdy 12-GiB cache backendu został zapełniony. CLI skompilowało się poprawnie,
+lecz pakiet tej próby nie powstał; cache i logi zachowano. Nie jest to dowód
+wdrożenia poprawki generacji.
 
 Po kontrolowanym, graceful stopie własnych usług można jawnie odtworzyć ten sam
 run i jego `session-store`, wskazując każdy artefakt:
@@ -215,9 +220,23 @@ Warunki implementacji tej części trybu developerskiego:
   zachowaniem zapisanych wyników. Sama pierwsza inicjalizacja pustego rejestru
   nie dowodzi poprawnej aktualizacji.
 
-Szczegółowa decyzja o formacie generacji i procedurze migracji musi uzupełnić
-ADR 0052 oraz kontrakt compute-resource execution przed implementacją. Ta
-sekcja określa wymagania; nie deklaruje gotowej migracji ani działającego GPU.
+Format generacji i procedurę migracji opisują ADR 0052 oraz kontrakt
+compute-resource execution. Wdrożenie wymaga udanego buildu i rzeczywistego
+sprawdzenia uruchomienia, wykonania GPU oraz odtworzenia usług z wynikami.
+
+### Trwały cache kompilacji natywnej
+
+Bezpośredni build wskazuje osobne, stałe katalogi CMake dla FDM i FEM wewnątrz
+cache `/build`. Nie są one zależne od zmieniającego się fingerprintu Cargo
+`OUT_DIR`. Klucz cache nadal rozdziela checkout/worktree oraz toolchain;
+zmiana tych wejść nie może użyć niezgodnego katalogu. Pakowanie FDM korzysta
+z jawnie wskazanego katalogu i odrzuca brak biblioteki lub błąd kopiowania.
+FEM zachowuje sprawdzenie tożsamości snapshotu biblioteki.
+
+Pierwsze użycie stałych katalogów może wymagać ponownej kompilacji bibliotek
+natywnych. Przyrostowość kolejnej przebudowy wymaga osobnego dowodu runtime;
+same testy wyboru ścieżek tego nie potwierdzają. Naprawa pojemności cache jest
+w toku; nie usuwa dotychczasowych obiektów kompilacji ani wyników symulacji.
 
 ## Warunki odbioru
 
