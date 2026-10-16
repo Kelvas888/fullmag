@@ -1,7 +1,8 @@
 # Architektura developerska Fullmaga w Docker Compose
 
 Uzgodnienie użytkownika: 16.10.2026. Status: kontrakt docelowy; bezpośredni
-build/start obu usług jest w implementacji, runtime NOT VERIFIED.
+build pełnego backendu jest potwierdzony; stabilny start i kwalifikacja runtime
+pozostają NOT VERIFIED.
 Ten dokument określa nowy tryb developerski. Wcześniejsza procedura budowania
 przez Fullmag_build_runner nie jest warunkiem tej ścieżki.
 
@@ -184,13 +185,20 @@ initializer bounded/no-follow odczytuje istniejący
 digest. Każdy inny zapis `policy.host_id` kończy się błędem bez mutacji; natywna
 fabryka nadal sprawdza marker, pełną politykę, topologię i readiness pod blokadą.
 
-Ostatni kompletny build `a8e21962f7004d378eb8b11f92232b4e` przeszedł trzy fazy
-i pakowanie. Jego start `147f8e32446842b48d1cfa6ee23af15c` ujawnił brak
-aktualizacji readiness w starszym runtime. Kolejny build z poprawką generacji
-`b7f3120b7d3a4f8b8af6d1a7cebccbf8` zakończył się podczas kompilacji API,
-gdy 12-GiB cache backendu został zapełniony. CLI skompilowało się poprawnie,
-lecz pakiet tej próby nie powstał; cache i logi zachowano. Nie jest to dowód
-wdrożenia poprawki generacji.
+Pełny pakiet FDM/FEM CPU/GPU został zbudowany w bezpośredniej ścieżce Compose.
+Build `49d57aec5e25404a9771032f92558f9c` zakończył się `succeeded`, exit 0,
+i obejmuje nowy helper frontendu z proxy API pod adresem przeglądarki.
+Backend w tym pakiecie używa jawnie ponownie wybranych zamrożonych źródeł
+commita `56229c9658a08ebecc2f71009774257b8dadfc4a`; późniejsze zmiany helperów
+nie są przedstawiane jako ponowna kompilacja nowszego kodu Rust.
+Build nie dowodzi stabilnego API ani wykonania symulacji GPU.
+
+Home nie może znikać podczas sprawdzania kolekcji sesji i ponawiania połączenia.
+W stanach ładowania i błędu pozostaje zamontowany, a komunikat i Retry pojawiają
+się w jego obrębie. Akcje wymagające potwierdzonej sesji pozostają zablokowane.
+Ten przebieg przeszedł sprawdzenie w Chrome: początkowe ładowanie, HTTP 503,
+ponowienie, ten sam element Home i brak błędów JavaScript. To dowód odporności
+interfejsu na niedostępność API, nie dowód dostępności backendu.
 
 Po kontrolowanym, graceful stopie własnych usług można jawnie odtworzyć ten sam
 run i jego `session-store`, wskazując każdy artefakt:
@@ -244,9 +252,12 @@ z jawnie wskazanego katalogu i odrzuca brak biblioteki lub błąd kopiowania.
 FEM zachowuje sprawdzenie tożsamości snapshotu biblioteki.
 
 Pierwsze użycie stałych katalogów może wymagać ponownej kompilacji bibliotek
-natywnych. Przyrostowość kolejnej przebudowy wymaga osobnego dowodu runtime;
-same testy wyboru ścieżek tego nie potwierdzają. Naprawa pojemności cache jest
-w toku; nie usuwa dotychczasowych obiektów kompilacji ani wyników symulacji.
+natywnych. Przyrostowość potwierdziła kolejna kompilacja z tymi samymi zamrożonymi
+źródłami: build `5bcbce5785b14ad583d539baaa763e37` zakończył fazy CLI, API
+i Python odpowiednio w 15,07 s, 35,75 s i 1,08 s. Pomiar dotyczy ponownego
+użycia niezmienionych wejść, nie dowolnej przyszłej zmiany modułu. Cache
+powiększono z 12 do 24 GiB z zachowaniem UUID i istniejących obiektów.
+Nie usunięto wyników symulacji ani współdzielonego cache.
 
 ## Warunki odbioru
 
