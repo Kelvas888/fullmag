@@ -1,4 +1,5 @@
 import type { AuthoringTransactionResponse, SceneResource } from "@/kernel/api/apiTypes";
+import { readStudyStageSource } from "@/shared/domain/study/studyStageSource";
 
 export type SolvedDrive = NonNullable<SceneResource["solved_antenna_drives"]>[number];
 export type WaveformKind = SolvedDrive["waveform"]["kind"];
@@ -57,9 +58,16 @@ export const waveformDefaults = {
 };
 
 export function antennaRunStageIds(scene: SceneResource | null): string[] {
-  const stages = scene?.study && Array.isArray(scene.study.stages) ? scene.study.stages : [];
-  return stages.flatMap((stage) => {
-    if (!stage || typeof stage !== "object" || Array.isArray(stage) || stage.kind !== "run") return [];
+  const source = readStudyStageSource(scene?.study);
+  if (source.kind === "invalid") return [];
+  return source.entries.flatMap((entry) => {
+    if (!entry.enabled) return [];
+    if (source.kind === "pipeline") {
+      // Activation follows executable queue identity, never a definition ID.
+      return entry.stageKind === "run" && entry.queueId ? [entry.queueId] : [];
+    }
+    const stage = entry.payload;
+    if (stage.kind !== "run") return [];
     const id = typeof stage.stage_id === "string" ? stage.stage_id : stage.id;
     return typeof id === "string" && id.trim() ? [id] : [];
   });

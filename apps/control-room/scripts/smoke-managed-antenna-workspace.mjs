@@ -403,6 +403,67 @@ try {
   const references = [...flat.filter(s => s.kind === "antenna_field_solve" && s.stage_id === stage.id), ...pipeline.filter(n => n.stage_kind === "antenna_field_solve" && n.payload?.stage_id === stage.id)];
   assert.equal(references.length, 1);
   checks.push({ name: "Add and Open Field Solve reaches the actual Study inspector with one canonical definition reference", passed: true });
+  const beforeReceiver = await scene();
+  async function publicCommand(title) {
+    await page.getByRole("button", { name: /command search/i }).first().click();
+    await page.getByPlaceholder("Search commands").fill(title);
+    await page.getByRole("option").filter({ hasText: title }).first().click();
+  }
+  await publicCommand("Add Box");
+  await page.getByText("Primitive Geometry", { exact: true }).first().waitFor();
+  for (const [name, value] of [["Name", "Antenna drive receiver"], ["Region", "antenna-drive-receiver"], ["Size X", "1e-7"], ["Size Y", "2e-7"], ["Size Z", "1e-8"], ["Translation Z", "1e-7"]]) {
+    await page.getByRole("textbox", { name, exact: true }).fill(value);
+  }
+  await page.getByRole("button", { name: "Apply Draft", exact: true }).click();
+  const withReceiver = await waitScene(s => s.objects.length === beforeReceiver.objects.length + 1);
+  const receiver = withReceiver.objects.find(o => !beforeReceiver.objects.some(old => old.id === o.id));
+  assert.ok(receiver?.id && receiver.id !== objectId);
+  await page.locator(`[data-node-id="model:object:${receiver.id}"]`).waitFor({ state: "visible" });
+  await publicCommand("Add Run Stage");
+  const withRun = await waitScene(s => s.study?.stages?.some(item => item.kind === "run"));
+  const runInstructions = withRun.study.stages.filter(item => item.kind === "run"); assert.equal(runInstructions.length, 1);
+  // The pipeline editor is read-only. Seed its canonical representation through
+  // the public transaction API while retaining the real UI-authored payloads.
+  const pipelineNodes = withRun.study.stages.map((payload, index) => ({ id: `activation-node-${index + 1}`, label: `${payload.kind} ${index + 1}`, node_kind: "primitive", stage_kind: payload.kind, enabled: true, payload }));
+  const runNode = pipelineNodes.find(node => node.stage_kind === "run");
+  assert.notEqual(runNode.id, runNode.payload.stage_id);
+  const pipelineRequest = { base_revision: withRun.revision, kind: "merge_patch", merge_patch: { study: { study_pipeline: { version: "study_pipeline.v1", nodes: pipelineNodes } } } };
+  await json(await context.request.post(`${target.api_base}/v2/sessions/current/model/transactions`, { headers: headers(), data: pipelineRequest }));
+  writes.push({ method: "POST", path: "/v2/sessions/current/model/transactions", body: pipelineRequest, instance: target.api_instance, scope, source: "public_api_pipeline_setup" });
+  const pipelineScene = await waitScene(s => s.study?.study_pipeline?.nodes?.some(node => node.id === runNode.id));
+  assert.deepEqual(pipelineScene.study.stages, withRun.study.stages, "Dormant flat instructions remain intact");
+  await page.getByTitle("Expand All").click();
+  await selectNode(`model:object:${objectId}:antenna:solution:${encodeURIComponent(stage.id)}`);
+  const driveComposer = page.getByTestId("antenna-projection-composer");
+  await driveComposer.getByRole("combobox", { name: "Projection composition", exact: true }).selectOption("drive");
+  await driveComposer.getByRole("combobox", { name: "Projection target", exact: true }).selectOption(JSON.stringify(["object", receiver.id]));
+  const runChoice = driveComposer.getByRole("combobox", { name: "Run stage", exact: true });
+  await runChoice.selectOption(runNode.id);
+  const runOptions = await runChoice.locator("option").evaluateAll(options => options.map(option => option.value).filter(Boolean));
+  assert.deepEqual(runOptions, [runNode.id]); assert.ok(!runOptions.includes(runNode.payload.stage_id));
+  await driveComposer.getByRole("textbox", { name: "Peak current", exact: true }).fill("0.01");
+  await driveComposer.getByRole("textbox", { name: "Frequency", exact: true }).fill("1e9");
+  const beforeDrive = await scene(), beforeDriveWrites = writes.length;
+  await driveComposer.getByRole("button", { name: "Create projection and drive", exact: true }).click();
+  await driveComposer.getByText("Projection and drive committed.", { exact: false }).waitFor();
+  const driven = await waitScene(s => (s.solved_antenna_drives?.length ?? 0) === (beforeDrive.solved_antenna_drives?.length ?? 0) + 1);
+  const drive = driven.solved_antenna_drives.at(-1);
+  assert.deepEqual(drive.activation, { kind: "stage_ids", stage_ids: [runNode.id] });
+  assert.equal(drive.peak_current_a, 0.01); assert.equal(drive.time_origin, "stage_local");
+  assert.deepEqual(drive.waveform, { kind: "sinusoidal", frequency_hz: 1e9, phase_rad: 0, offset: 0 });
+  assert.equal(driven.antenna_target_projections.find(p => p.id === drive.projection_ref)?.target?.object_id, receiver.id);
+  assert.equal(drive.port_mode_id, stage.port_mode_ids[0]);
+  assert.deepEqual(driven.study, beforeDrive.study); assert.deepEqual(driven.current_transports, beforeDrive.current_transports);
+  assert.equal(writes.length, beforeDriveWrites + 1);
+  assert.deepEqual(Object.keys(writes.at(-1).body.merge_patch).sort(), ["antenna_target_projections", "solved_antenna_drives"]);
+  await screenshot("10-pipeline-drive-composition");
+  await page.getByTitle("Expand All").click();
+  await selectNode(`model:object:${objectId}:antenna:drive:${encodeURIComponent(drive.id)}`);
+  const activation = page.getByRole("checkbox", { name: `Run ${runNode.id}`, exact: true });
+  await activation.waitFor(); assert.equal(await activation.isChecked(), true);
+  assert.equal(await page.getByRole("textbox", { name: "Stage IDs", exact: true }).inputValue(), runNode.id);
+  await screenshot("11-pipeline-drive-inspector");
+  checks.push({ name: "Real UI-authored receiver and Run, represented by the public pipeline API, bind one atomic antenna drive to the executable queue ID and display it in the existing drive editor", passed: true, setup: "receiver and flat Run via UI; pipeline representation via public API; composition and inspection via UI", queueId: runNode.id, definitionId: runNode.payload.stage_id });
   const webgl = await page.locator("canvas").evaluateAll(canvases => canvases.map(canvas => {
     const bounds = canvas.getBoundingClientRect(); if (!bounds.width || !bounds.height) return null;
     const gl = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
@@ -410,7 +471,7 @@ try {
   }).filter(Boolean));
   assert.ok(webgl.some(gl => !gl.lost && gl.width > 0 && gl.height > 0)); assert.ok(webgl.every(gl => !gl.lost));
   assert.ok(websockets.some(url => url.startsWith(target.api_base.replace("http:", "ws:"))), "Realtime must use the admitted API");
-  assert.ok(writes.length >= 3 && writes.length <= 13);
+  assert.ok(writes.length >= 3 && writes.length <= 17);
   for (const write of [...writes, ...visualizationAcks]) { assert.equal(write.instance, target.api_instance); assert.equal(write.scope, scope); assert.ok(!write.path.includes("/simulation/"), "Authoring smoke must not execute a solver"); }
   assert.ok(Date.now() - Date.parse(startedAt) > 5000, "The scenario must outlive the adoption timeout");
   assert.deepEqual(visualizationAcks.filter(ack => ack.body.status === "failed"), [], "No nonexistent-buffer adoption may fail during empty/nonmagnetic authoring");

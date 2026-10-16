@@ -7,7 +7,7 @@ const root = new URL("../src/modules/inspector/panels/antenna/", import.meta.url
 const cache = new Map();
 async function load(name) {
   if (cache.has(name)) return cache.get(name);
-  const sourceModule = new vm.SourceTextModule(stripTypeScriptTypes(readFileSync(new URL(`${name}.ts`, root), "utf8")));
+  const sourceModule = new vm.SourceTextModule(stripTypeScriptTypes(readFileSync(name.startsWith("@/") ? new URL(`../src/${name.slice(2)}.ts`, import.meta.url) : new URL(`${name}.ts`, root), "utf8")));
   cache.set(name, sourceModule);
   await sourceModule.link(specifier => load(specifier.replace(/^\.\//, "")));
   await sourceModule.evaluate(); return sourceModule;
