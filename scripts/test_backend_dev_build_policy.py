@@ -1,8 +1,11 @@
 """Exercise build policy without compiling Rust or CUDA unit tests."""
 from pathlib import Path
+import os
 import re
+import shlex
 import shutil
 import subprocess
+import tempfile
 import tomllib
 
 import pytest
@@ -20,6 +23,79 @@ def test_backend_dev_keeps_incremental_compilation_and_optimized_cpu_kernels():
     assert profile["opt-level"] == 1
     assert profile["package"]["fullmag-engine"]["opt-level"] == 3
     assert profile["package"]["fullmag-fdm-demag"]["opt-level"] == 3
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None,
+    reason="The extracted Makefile recipe is a Linux-container regression",
+)
+def test_install_cli_dev_pins_fdm_package_to_explicit_native_root():
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    start = makefile.index('\tif [ -n "$${FULLMAG_FDM_NATIVE_BUILD_ROOT:-}" ]; then')
+    end = makefile.index('\tif [ "$$build_mode"', start)
+    # Execute the recipe fragment itself after undoing Make's dollar escaping.
+    recipe = makefile[start:end].replace("$$", "$")
+
+    def run_fragment(case_root, configured_root=None, create_destination=True):
+        (case_root / ".fullmag/local").mkdir(parents=True, exist_ok=True)
+        if create_destination:
+            (case_root / ".fullmag/local/lib").mkdir()
+        environment = os.environ.copy()
+        environment.pop("FULLMAG_FDM_NATIVE_BUILD_ROOT", None)
+        if configured_root is not None:
+            environment["FULLMAG_FDM_NATIVE_BUILD_ROOT"] = str(configured_root)
+        script = "\n".join(
+            (
+                "set -eu",
+                f"cargo_target_dir={shlex.quote(str(case_root / 'cargo-target'))}",
+                recipe,
+            )
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            cwd=case_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        selected_case = root / "selected"
+        selected = selected_case / "native/backends/fdm/libfullmag_fdm.so.1"
+        selected.parent.mkdir(parents=True)
+        selected.write_text("selected", encoding="utf-8")
+        foreign = selected_case / "cargo-target/release/build/fullmag-fdm-sys-new/out/native-build/backends/fdm/libfullmag_fdm.so.9"
+        foreign.parent.mkdir(parents=True)
+        foreign.write_text("foreign", encoding="utf-8")
+
+        result = run_fragment(selected_case, selected_case / "native")
+        assert result.returncode == 0, result.stderr
+        assert (selected_case / ".fullmag/local/lib/libfullmag_fdm.so.1").read_text(encoding="utf-8") == "selected"
+
+        missing_case = root / "missing"
+        missing_result = run_fragment(missing_case, missing_case / "does-not-exist")
+        assert missing_result.returncode == 2
+        assert "no regular libfullmag_fdm.so*" in missing_result.stderr
+
+        relative_case = root / "relative"
+        relative_result = run_fragment(relative_case, Path("relative-root"))
+        assert relative_result.returncode == 2
+        assert "must be absolute" in relative_result.stderr
+
+        copy_failure_case = root / "copy-failure"
+        copy_failure_selected = copy_failure_case / "native/backends/fdm/libfullmag_fdm.so.1"
+        copy_failure_selected.parent.mkdir(parents=True)
+        copy_failure_selected.write_text("selected", encoding="utf-8")
+        (copy_failure_case / ".fullmag/local").mkdir(parents=True)
+        (copy_failure_case / ".fullmag/local/lib").write_text("destination-is-not-a-directory", encoding="utf-8")
+        copy_failure = run_fragment(
+            copy_failure_case,
+            copy_failure_case / "native",
+            create_destination=False,
+        )
+        assert copy_failure.returncode == 2
+        assert "Failed to copy FDM library" in copy_failure.stderr
 
 
 @pytest.mark.skipif(not shutil.which("cmake"), reason="CMake required")

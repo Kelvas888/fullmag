@@ -241,6 +241,39 @@ class BackendPackageTests(unittest.TestCase):
             self.assertEqual(environment["FULLMAG_DIRECT_COMPOSE"], "1")
             self.assertEqual(environment["FULLMAG_RUNNER_WORKSPACE"], str(workspace))
 
+    def test_direct_build_native_cache_roots_are_stable_and_cache_scoped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            first_native = {
+                "head_commit_full": "a" * 40,
+                "source_snapshot_dirty": False,
+                "source_snapshot_sha256": "b" * 64,
+            }
+            second_native = {**first_native, "source_snapshot_sha256": "c" * 64}
+            first_environment = backend._build_environment(workspace, root, first_native, 1)
+            second_environment = backend._build_environment(workspace, root, second_native, 1)
+
+            other_root = root / "other-cache"
+            other_workspace = other_root / "workspace"
+            other_environment = backend._build_environment(
+                other_workspace, other_root, first_native, 1
+            )
+
+            names = ("FULLMAG_FDM_NATIVE_BUILD_ROOT", "FULLMAG_FEM_NATIVE_BUILD_ROOT")
+            for name in names:
+                first = Path(first_environment[name])
+                self.assertEqual(first, Path(second_environment[name]))
+                self.assertNotEqual(first, Path(other_environment[name]))
+                self.assertTrue(first.is_relative_to(workspace))
+                self.assertTrue(first.is_relative_to(root))
+                self.assertIn(".fullmag-build", first.parts)
+                self.assertIn("native-build", first.parts)
+            self.assertNotEqual(
+                Path(first_environment["FULLMAG_FDM_NATIVE_BUILD_ROOT"]),
+                Path(first_environment["FULLMAG_FEM_NATIVE_BUILD_ROOT"]),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -94,6 +94,7 @@ fn main() {
     // changed C++ older than objects built by an earlier concurrent job.
     println!("cargo:rerun-if-env-changed=FULLMAG_SOURCE_SNAPSHOT_SHA256");
     println!("cargo:rerun-if-env-changed=FULLMAG_DIRECT_COMPOSE");
+    println!("cargo:rerun-if-env-changed=FULLMAG_FEM_NATIVE_BUILD_ROOT");
     let source_snapshot = std::env::var("FULLMAG_SOURCE_SNAPSHOT_SHA256").unwrap_or_default();
     if !source_snapshot.is_empty()
         && (source_snapshot.len() != 64
@@ -152,7 +153,10 @@ fn main() {
 
     let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let native_root = manifest_dir.join("../../native");
-    let build_dir = out_dir.join("native-build");
+    // Direct Compose supplies a stable, cache-key-scoped root so Cargo
+    // fingerprint changes do not create a fresh CMake tree. Standalone
+    // callers keep the historical OUT_DIR fallback.
+    let build_dir = native_build_dir(&out_dir, "FULLMAG_FEM_NATIVE_BUILD_ROOT");
 
     std::fs::create_dir_all(&build_dir).expect("creating native build dir should succeed");
 
@@ -308,4 +312,11 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=fullmag_fem");
     emit_unix_runtime_rpath("$ORIGIN/../lib");
     emit_unix_runtime_rpath(&native_lib_dir.to_string_lossy());
+}
+
+fn native_build_dir(out_dir: &std::path::Path, env_name: &str) -> std::path::PathBuf {
+    std::env::var_os(env_name)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| out_dir.join("native-build"))
 }

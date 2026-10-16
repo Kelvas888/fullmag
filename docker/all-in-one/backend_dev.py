@@ -809,6 +809,29 @@ def _toolchain_identity() -> tuple[str, dict[str, Any]]:
 
 
 def _build_environment(workspace: Path, build_root: Path, native: Mapping[str, Any], jobs: int) -> dict[str, str]:
+    # Keep native CMake state in the already cache-key-scoped Cargo target
+    # volume.  The stable crate-shaped directories preserve Makefile's
+    # existing library discovery globs while keeping FDM and FEM caches
+    # separate.  The Rust build scripts retain OUT_DIR/native-build as their
+    # standalone fallback when this direct Compose environment is absent.
+    native_target_build_root = (
+        workspace
+        / ".fullmag-build"
+        / "cargo-targets"
+        / "direct"
+        / "release"
+        / "build"
+    )
+    native_build_roots = {
+        "FULLMAG_FDM_NATIVE_BUILD_ROOT": native_target_build_root
+        / "fullmag-fdm-sys-stable"
+        / "out"
+        / "native-build",
+        "FULLMAG_FEM_NATIVE_BUILD_ROOT": native_target_build_root
+        / "fullmag-fem-sys-stable"
+        / "out"
+        / "native-build",
+    }
     environment = dict(os.environ)
     environment.update(
         {
@@ -839,6 +862,7 @@ def _build_environment(workspace: Path, build_root: Path, native: Mapping[str, A
                 "dirty" if native["source_snapshot_dirty"] else "clean"
             ),
             "FULLMAG_SOURCE_SNAPSHOT_SHA256": str(native["source_snapshot_sha256"]),
+            **{name: str(path) for name, path in native_build_roots.items()},
             "CARGO_BUILD_JOBS": str(jobs),
             "CMAKE_BUILD_PARALLEL_LEVEL": str(jobs),
             "CARGO_INCREMENTAL": "1",

@@ -245,11 +245,27 @@ install-cli install-cli-dev install-cli-static:
 	cp "$$cargo_target_dir/release/lib_fullmag_core.so" .fullmag/local/_fullmag_core.so.new; \
 	mv -f .fullmag/local/_fullmag_core.so.new .fullmag/local/_fullmag_core.so; \
 	rm -f .fullmag/local/lib/libfullmag_fdm.so* .fullmag/local/lib/libfullmag_fem.so*; \
-	fdm_dir=$$(find "$$cargo_target_dir/release/build" -path '*fullmag-fdm-sys*/out/native-build/backends/fdm/libfullmag_fdm.so.*' -type f -printf '%T@ %h\n' 2>/dev/null | sort -nr | awk 'NR==1 { print $$2 }'); \
-	if [ -z "$$fdm_dir" ]; then \
-		fdm_dir=$$(find "$$cargo_target_dir" -path '*native-build/backends/fdm/libfullmag_fdm.so.*' -type f -printf '%T@ %h\n' 2>/dev/null | sort -nr | awk 'NR==1 { print $$2 }'); \
+	if [ -n "$${FULLMAG_FDM_NATIVE_BUILD_ROOT:-}" ]; then \
+		fdm_root="$${FULLMAG_FDM_NATIVE_BUILD_ROOT}"; \
+		case "$$fdm_root" in \
+			/*) ;; \
+			*) echo "FULLMAG_FDM_NATIVE_BUILD_ROOT must be absolute" >&2; exit 2 ;; \
+		esac; \
+		fdm_dir="$$fdm_root/backends/fdm"; \
+		fdm_library="$$(find "$$fdm_dir" -maxdepth 1 -type f -name 'libfullmag_fdm.so*' -print -quit 2>/dev/null || true)"; \
+		if [ -z "$$fdm_library" ]; then \
+			echo "Configured FULLMAG_FDM_NATIVE_BUILD_ROOT has no regular libfullmag_fdm.so*" >&2; exit 2; \
+		fi; \
+		if ! cp -a "$$fdm_dir"/libfullmag_fdm.so* .fullmag/local/lib/; then \
+			echo "Failed to copy FDM library from FULLMAG_FDM_NATIVE_BUILD_ROOT" >&2; exit 2; \
+		fi; \
+	else \
+		fdm_dir=$$(find "$$cargo_target_dir/release/build" -path '*fullmag-fdm-sys*/out/native-build/backends/fdm/libfullmag_fdm.so.*' -type f -printf '%T@ %h\n' 2>/dev/null | sort -nr | awk 'NR==1 { print $$2 }'); \
+		if [ -z "$$fdm_dir" ]; then \
+			fdm_dir=$$(find "$$cargo_target_dir" -path '*native-build/backends/fdm/libfullmag_fdm.so.*' -type f -printf '%T@ %h\n' 2>/dev/null | sort -nr | awk 'NR==1 { print $$2 }'); \
+		fi; \
+		if [ -n "$$fdm_dir" ]; then cp -a "$$fdm_dir"/libfullmag_fdm.so* .fullmag/local/lib/ 2>/dev/null || true; fi; \
 	fi; \
-	if [ -n "$$fdm_dir" ]; then cp -a "$$fdm_dir"/libfullmag_fdm.so* .fullmag/local/lib/ 2>/dev/null || true; fi; \
 	if [ "$$build_mode" = "cuda-fem-gpu" ] || [ "$$build_mode" = "fem-cpu" ]; then \
 		if [ -n "$${FULLMAG_SOURCE_SNAPSHOT_SHA256:-}" ]; then \
 			fem_dir=$$(python3 scripts/select_managed_fem_library.py --cargo-target "$$cargo_target_dir" --snapshot "$${FULLMAG_SOURCE_SNAPSHOT_SHA256}"); \
