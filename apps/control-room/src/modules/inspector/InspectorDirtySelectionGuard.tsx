@@ -9,6 +9,8 @@ import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdenti
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import type { SelectionController } from "@/kernel/selection/SelectionController";
 import { selectionRefEquals, type Selection } from "@/kernel/selection/selectionTypes";
+import { antennaNavigationLinks } from "@/modules/explorer/public";
+import { antennaNavigationScene, antennaNavigationSceneState, observeAntennaNavigationScene } from "./panels/antenna/AntennaNavigationScene";
 import { Button } from "@/shared/ui/Button";
 import {
   Dialog,
@@ -50,6 +52,7 @@ interface PendingTransition {
   from: Selection;
   generation: number | undefined;
   next: Selection | null;
+  relatedLinkKey?: string;
   resolveBuild?: (confirmed: boolean) => void;
   running: boolean;
   scope: string | null;
@@ -67,7 +70,8 @@ export function InspectorDirtySelectionGuard({
 }) {
   const session = useInspectorEditSession();
   const editSessions = useInspectorEditSessionStore();
-  const { authoringHistory, bus, commands } = useKernel();
+  const kernel = useKernel();
+  const { authoringHistory, bus, commands } = kernel;
   const scope = sessionRequestScopeKey(useSessionResourceIdentity());
   const sessionRef = useRef(session);
   useLayoutEffect(() => { sessionRef.current = session; }, [session]);
@@ -102,12 +106,27 @@ export function InspectorDirtySelectionGuard({
       return;
     }
     if (!transition.acknowledged || transition.session.applying) return;
-    transition.acknowledged = false;
-    setBusy(false);
     if (transition.session.dirty) {
+      transition.acknowledged = false;
+      setBusy(false);
       setError("The Inspector still has unapplied changes. Review the draft before continuing.");
       return;
     }
+    if (transition.relatedLinkKey) {
+      const { scene, error: sceneError } = antennaNavigationSceneState(kernel, transition.scope);
+      if (!scene && !sceneError) { setBusy(true); return; }
+      transition.acknowledged = false;
+      setBusy(false);
+      if (sceneError) { setError(`The current scene could not be confirmed: ${sceneError}`); return; }
+      const target = scene ? antennaNavigationLinks(scene, transition.from).find(link => link.key === transition.relatedLinkKey)?.selection : null;
+      if (!target || !transition.next || target.objectId !== transition.next.objectId || !selectionRefEquals(target.ref, transition.next.ref)) {
+        setError("The related resource changed or disappeared while saving. The selection was kept; cancel and choose its current binding.");
+        return;
+      }
+      transition.next = target;
+    }
+    transition.acknowledged = false;
+    setBusy(false);
     pendingRef.current = null;
     setPending(null);
     transition.resolveBuild?.(true);
@@ -116,13 +135,20 @@ export function InspectorDirtySelectionGuard({
       try { controller.set(transition.next, "inspector"); }
       finally { bypass.current = null; }
     }
-  }, [controller, dismiss, isCurrent]);
+  }, [controller, dismiss, isCurrent, kernel]);
 
   // The form owns both its draft and its post-ACK scene synchronization.
   useEffect(() => editSessions?.subscribe(() => {
     const transition = pendingRef.current;
     if (transition) continueWhenReady(transition);
   }), [continueWhenReady, editSessions]);
+
+  useEffect(() => {
+    if (!pending?.relatedLinkKey) return;
+    return observeAntennaNavigationScene(kernel, pending.scope, () => {
+      if (pendingRef.current === pending) continueWhenReady(pending);
+    });
+  }, [continueWhenReady, kernel, pending]);
 
   useEffect(() => authoringHistory?.subscribe(() => {
     const transition = pendingRef.current;
@@ -136,7 +162,7 @@ export function InspectorDirtySelectionGuard({
     if (transition && !isCurrent(transition)) dismiss();
   }, [dismiss, isCurrent, selection, session]);
 
-  const begin = useCallback((next: Selection | null, resolveBuild?: (confirmed: boolean) => void) => {
+  const begin = useCallback((next: Selection | null, resolveBuild?: (confirmed: boolean) => void, fromRelatedLink = false) => {
     dismiss();
     const owner = sessionRef.current;
     if (!owner || (commands.getSessionScopeKey?.() ?? null) !== scope) {
@@ -147,14 +173,18 @@ export function InspectorDirtySelectionGuard({
       acknowledged: false, from: controller.get(), generation: authoringHistory?.getGeneration?.(),
       next, resolveBuild, running: false, scope, session: owner,
     };
+    if (fromRelatedLink && next) {
+      const scene = antennaNavigationScene(kernel, scope);
+      transition.relatedLinkKey = scene ? antennaNavigationLinks(scene, transition.from).find(link => link.selection && selectionRefEquals(link.selection.ref, next.ref) && link.selection.objectId === next.objectId)?.key : undefined;
+    }
     pendingRef.current = transition;
     setPending(transition);
-  }, [authoringHistory, commands, controller, dismiss, scope]);
+  }, [authoringHistory, commands, controller, dismiss, kernel, scope]);
 
-  useEffect(() => controller.addChangeGuard((next) => {
+  useEffect(() => controller.addChangeGuard((next, _previous, source) => {
     if (bypass.current && sameSelectionTarget(bypass.current, next)) return true;
     if (!shouldGuardInspectorSelection(sessionRef.current)) return true;
-    begin(next);
+    begin(next, undefined, source === "inspector");
     return false;
   }), [begin, controller]);
 
@@ -196,7 +226,7 @@ export function InspectorDirtySelectionGuard({
       else if (pendingRef.current === transition) dismiss();
     } finally {
       transition.running = false;
-      if (pendingRef.current === transition) setBusy(false);
+      if (pendingRef.current === transition && !transition.acknowledged) setBusy(false);
     }
   }
 

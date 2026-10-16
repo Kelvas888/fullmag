@@ -26,6 +26,7 @@ import { AntennaConductorMaterialEditor } from "./AntennaConductorMaterialEditor
 import { AntennaPortEditor } from "./AntennaPortEditor";
 import { AntennaResourceEditor } from "./AntennaResourceEditor";
 import { SolvedAntennaDriveEditor } from "./SolvedAntennaDriveEditor";
+import { AntennaRelatedResources } from "./AntennaRelatedResources";
 import { AntennaCompositionReadout } from "./AntennaCompositionReadout";
 import { formatAntennaParameter as numberValue, type AntennaReadoutRow as DetailRow } from "./AntennaReadoutModel";
 import { antennaWaveformBandwidthValue } from "./AntennaCompositionModel";
@@ -888,6 +889,7 @@ export function AntennaCompositionPanel({
 
   return (
     <div className="fm-inspector-panel" data-inspector-owner={kind === "conductor" ? "object.antenna.conductor" : undefined}>
+      {kind !== "conductor" ? <AntennaRelatedResources key={JSON.stringify(["related", scope, kind, resourceId])} scene={scene.data} selection={selection} scope={scope} available={scene.status === "ready" && scene.sessionScopeKey === scope && Boolean(scope)} /> : null}
       {kind === "spectrum" ? <InspectorGroup title={model.title} badge={model.badge}>
         {model.rows.filter(row => ["Validation", "Runtime result", "Runtime error", "Stage catalog error"].includes(row.label)).map(row => <FieldRow key={row.label} label={row.label} value={row.value} />)}
         <p className="fm-inspector-hint">Spatial spectrum of the antenna source field. Magnetic response and excited modes require separate analysis.</p>
