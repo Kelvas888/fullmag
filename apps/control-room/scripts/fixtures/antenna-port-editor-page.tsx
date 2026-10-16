@@ -42,7 +42,7 @@ function makeScene(name: string): SceneResource {
     branches: [{ id: "signal", inlet_terminal_ref: terminals[0], outlet_terminal_ref: terminals[1], signed_weight: 1 },
       { id: "return", inlet_terminal_ref: terminals[2], outlet_terminal_ref: terminals[3], signed_weight: -1 }],
   };
-  return { revision: 1, scene_revision: 1,
+  const scene: SceneResource = { revision: 1, scene_revision: 1,
     scene: { id: `restored-model-${name}`, name, authoring_schema: "fixture", source_of_truth: "fixture" },
     objects: [{ id: sourceId, name: "Antenna signal", role: "antenna" }, { id: returnId, name: "Return", role: "conductor" }],
     current_transports: ["transport", "alternative"].map((name) => ({ name, kind: "current_transport", model: "ohmic_poisson",
@@ -51,6 +51,15 @@ function makeScene(name: string): SceneResource {
         surfaces: [{ object_id: id.startsWith("signal") ? sourceId : returnId, surface_id: id, orientation: [1, 0, 0] }] })),
     })), antenna_port_modes: [port, { ...structuredClone(port), id: "unrelated-port" }],
   };
+  const scenario = typeof window === "undefined" ? null : new URL(window.location.href).searchParams.get("scenario");
+  if (scenario === "malformed-source") Object.assign(scene.current_transports![0], { conservative_current_source: {} });
+  if (scenario === "structured-v3") {
+    Object.assign(scene.antenna_port_modes![0], { schema_version: "antenna_port_mode.v3",
+      normalization: { kind: "source_cut_rt0", source_cut_ref: "cut", orientation: "minus_outward" } });
+    Object.assign(scene.current_transports![0], { structured_current_closure: { schema_version: "structured_current_closure.v2", kind: "closed_geometry",
+      source_cuts: [{ source_cut_id: "cut", region: { object_id: sourceId } }] } });
+  }
+  return scene;
 }
 
 function makeFixture() {

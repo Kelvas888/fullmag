@@ -116,6 +116,120 @@ function closedLoopReferenceMessages(mode: AntennaPortModeResource, transport: R
   return messages;
 }
 
+function terminalInventory(mode: AntennaPortModeResource, transport: RecordValue) {
+  const messages: string[] = [];
+  const terminals = new Map<string, { objectId: string | null; valid: boolean }>();
+  let inventory: unknown[];
+  let inventoryKind: string;
+  let observationKey: "id" | "observation_id" | null = null;
+
+  // Match fullmag-ir::validate_v2_port_structure: never fall back from a
+  // present authored source to preparation or unrelated boundary IDs.
+  const hasSource = transport.conservative_current_source != null;
+  const hasPreparation = transport.external_lead_preparation != null;
+  if (hasSource || hasPreparation) {
+    inventoryKind = hasSource ? "current-source terminal_observations" : "lead-preparation extensions";
+    const authored = record(hasSource ? transport.conservative_current_source : transport.external_lead_preparation);
+    const expectedKind = hasSource ? "external_lead_current" : "isolated_branch_straight_stubs";
+    const expectedSchema = hasSource ? "conservative_current_source.v1" : "antenna_external_lead_preparation.v1";
+    const entries = authored?.[hasSource ? "terminal_observations" : "extensions"];
+    const drives = authored?.drives;
+    observationKey = hasSource ? "id" : "observation_id";
+    if (!authored || authored.kind !== expectedKind || authored.schema_version !== expectedSchema ||
+        !Array.isArray(entries) || entries.length === 0 || !Array.isArray(drives) ||
+        entries.some((entry) => !text(record(entry)?.[observationKey!]) || !text(record(entry)?.object_id)) ||
+        drives.some((drive) => !text(record(drive)?.id) || !text(record(drive)?.port_mode_ref))) {
+      messages.push(`${inventoryKind} is unsupported or malformed; boundary fallback is not allowed`);
+      return { terminals, inventoryKind, messages, available: false };
+    }
+    if (drives.filter((drive) => record(drive)?.port_mode_ref === mode.id).length !== 1) {
+      messages.push(`port '${mode.id}' requires exactly one explicitly authored current-source drive`);
+    }
+    inventory = entries;
+  } else {
+    inventoryKind = "CurrentTransport boundaries";
+    if (!Array.isArray(transport.boundaries)) {
+      messages.push(`current transport '${mode.current_transport_id}' boundaries are unavailable`);
+      return { terminals, inventoryKind, messages, available: false };
+    }
+    inventory = transport.boundaries;
+  }
+
+  for (const entry of inventory) {
+    const item = record(entry);
+    const id = item?.[observationKey ?? "id"];
+    if (!item || !text(id)) {
+      messages.push(`${inventoryKind} contains a malformed terminal identity`);
+      continue;
+    }
+    if (terminals.has(id)) {
+      messages.push(`terminal '${id}' is ambiguous in ${inventoryKind}`);
+      terminals.set(id, { objectId: null, valid: false });
+      continue;
+    }
+    if (observationKey) {
+      terminals.set(id, { objectId: item.object_id as string, valid: true });
+    } else {
+      const surfaces = item.surfaces;
+      const objectIds = Array.isArray(surfaces) && surfaces.every((surface) => text(record(surface)?.object_id))
+        ? new Set(surfaces.map((surface) => record(surface)!.object_id as string)) : new Set<string>();
+      const valid = ["equipotential_current_terminal", "voltage_electrode", "normal_current_electrode"].includes(String(item.kind))
+        && objectIds.size === 1;
+      terminals.set(id, { objectId: objectIds.size === 1 ? [...objectIds][0] : null, valid });
+    }
+  }
+  return { terminals, inventoryKind, messages, available: true };
+}
+
+export interface AntennaPortTerminalChoice {
+  id: string;
+  label: string;
+}
+
+/** Resolve existing terminal identities from the same inventory used by validation. */
+export function antennaPortTerminalChoices(
+  scene: SceneResource | null, mode: AntennaPortModeResource,
+): AntennaPortTerminalChoice[] {
+  const matches = (scene?.current_transports ?? []).filter(item => item.name === mode.current_transport_id);
+  if (!scene || matches.length !== 1) return [];
+  const transport = record(matches[0]);
+  if (!transport || transport.kind !== "current_transport" || transport.model !== "ohmic_poisson" ||
+      (transport.coupling !== undefined && transport.coupling !== "one_way") || transport.time_envelope != null ||
+      (transport.structured_current_closure != null && transport.conservative_current_source != null)) return [];
+  const objects = scene.objects ?? [];
+  const domain = transport.domain;
+  if (!Array.isArray(domain) || domain.length === 0 || domain.some(region => !text(record(region)?.object_id))) return [];
+  const domainIds = new Set(domain.map(region => record(region)!.object_id));
+  let terminals: Map<string, { objectId: string | null; valid: boolean }>;
+  const observationLabels = new Map<string, string>();
+  if (mode.schema_version === "antenna_port_mode.v3") {
+    const source = record(transport.conservative_current_source);
+    if (transport.structured_current_closure != null || source?.schema_version !== "conservative_current_source.v2" ||
+        source.kind !== "closed_geometry_potential_jump" || source.object_id !== mode.source_object_id ||
+        !Array.isArray(source.terminal_observations)) return [];
+    terminals = new Map();
+    for (const value of source.terminal_observations) {
+      const item = record(value);
+      if (!text(item?.id)) continue;
+      observationLabels.set(item.id, `${item.part_id} · ${item.selector}`);
+      const duplicate = terminals.has(item.id);
+      terminals.set(item.id, { objectId: mode.source_object_id, valid: !duplicate && text(item.part_id) &&
+        (item.selector === "local_u_min" || item.selector === "local_u_max") });
+    }
+  } else if (mode.schema_version === "antenna_port_mode.v2") {
+    const inventory = terminalInventory(mode, transport);
+    if (!inventory.available) return [];
+    terminals = inventory.terminals;
+  } else return [];
+  const choices: AntennaPortTerminalChoice[] = [];
+  for (const [id, terminal] of terminals) {
+    const owners = objects.filter(object => object.id === terminal.objectId);
+    if (!terminal.valid || !terminal.objectId || !domainIds.has(terminal.objectId) || owners.length !== 1) continue;
+    choices.push({ id, label: `${id} · ${owners[0].name || terminal.objectId}${observationLabels.has(id) ? ` · ${observationLabels.get(id)}` : ""}` });
+  }
+  return choices;
+}
+
 /** Only reference authoring is checked here; native mesh/source validation remains authoritative. */
 function portReferenceMessages(mode: AntennaPortModeResource, scene: SceneResource | null): string[] {
   if (!scene) return ["scene is unavailable; port references cannot be validated"];
@@ -153,66 +267,9 @@ function portReferenceMessages(mode: AntennaPortModeResource, scene: SceneResour
     if (!domainObjects.has(mode.source_object_id)) messages.push("v3 source object is outside the transport domain");
     return [...messages, ...closedLoopReferenceMessages(mode, transport)];
   }
-  const terminals = new Map<string, { objectId: string | null; valid: boolean }>();
-  let inventory: unknown[];
-  let inventoryKind: string;
-  let observationKey: "id" | "observation_id" | null = null;
-
-  // Match fullmag-ir::validate_v2_port_structure: never fall back from a
-  // present authored source to preparation or unrelated boundary IDs.
-  const hasSource = transport.conservative_current_source != null;
-  const hasPreparation = transport.external_lead_preparation != null;
-  if (hasSource || hasPreparation) {
-    inventoryKind = hasSource ? "current-source terminal_observations" : "lead-preparation extensions";
-    const authored = record(hasSource ? transport.conservative_current_source : transport.external_lead_preparation);
-    const expectedKind = hasSource ? "external_lead_current" : "isolated_branch_straight_stubs";
-    const expectedSchema = hasSource ? "conservative_current_source.v1" : "antenna_external_lead_preparation.v1";
-    const entries = authored?.[hasSource ? "terminal_observations" : "extensions"];
-    const drives = authored?.drives;
-    observationKey = hasSource ? "id" : "observation_id";
-    if (!authored || authored.kind !== expectedKind || authored.schema_version !== expectedSchema ||
-        !Array.isArray(entries) || entries.length === 0 || !Array.isArray(drives) ||
-        entries.some((entry) => !text(record(entry)?.[observationKey!]) || !text(record(entry)?.object_id)) ||
-        drives.some((drive) => !text(record(drive)?.id) || !text(record(drive)?.port_mode_ref))) {
-      messages.push(`${inventoryKind} is unsupported or malformed; boundary fallback is not allowed`);
-      return messages;
-    }
-    if (drives.filter((drive) => record(drive)?.port_mode_ref === mode.id).length !== 1) {
-      messages.push(`port '${mode.id}' requires exactly one explicitly authored current-source drive`);
-    }
-    inventory = entries;
-  } else {
-    inventoryKind = "CurrentTransport boundaries";
-    if (!Array.isArray(transport.boundaries)) {
-      messages.push(`current transport '${mode.current_transport_id}' boundaries are unavailable`);
-      return messages;
-    }
-    inventory = transport.boundaries;
-  }
-
-  for (const entry of inventory) {
-    const item = record(entry);
-    const id = item?.[observationKey ?? "id"];
-    if (!item || !text(id)) {
-      messages.push(`${inventoryKind} contains a malformed terminal identity`);
-      continue;
-    }
-    if (terminals.has(id)) {
-      messages.push(`terminal '${id}' is ambiguous in ${inventoryKind}`);
-      terminals.set(id, { objectId: null, valid: false });
-      continue;
-    }
-    if (observationKey) {
-      terminals.set(id, { objectId: item.object_id as string, valid: true });
-    } else {
-      const surfaces = item.surfaces;
-      const objectIds = Array.isArray(surfaces) && surfaces.every((surface) => text(record(surface)?.object_id))
-        ? new Set(surfaces.map((surface) => record(surface)!.object_id as string)) : new Set<string>();
-      const valid = ["equipotential_current_terminal", "voltage_electrode", "normal_current_electrode"].includes(String(item.kind))
-        && objectIds.size === 1;
-      terminals.set(id, { objectId: objectIds.size === 1 ? [...objectIds][0] : null, valid });
-    }
-  }
+  const { terminals, inventoryKind, messages: inventoryMessages, available } = terminalInventory(mode, transport);
+  messages.push(...inventoryMessages);
+  if (!available) return messages;
   for (const branch of mode.branches) {
     const branchObjects: string[] = [];
     for (const [role, reference] of [["inlet", branch.inlet_terminal_ref], ["outlet", branch.outlet_terminal_ref]]) {

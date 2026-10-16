@@ -21,12 +21,13 @@ try {
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error" && !message.text().startsWith("Failed to load resource:")) consoleErrors.push(message.text()); });
   const editor = page.getByTestId("port-editor"), field = (name) => editor.getByRole("textbox", { name, exact: true });
+  const terminal = name => editor.getByRole("combobox", { name, exact: true });
   const button = (name) => editor.getByRole("button", { name, exact: true });
   const click = (name) => button(name).evaluate((element) => element.click());
   const read = () => page.evaluate(() => window.__antennaPortEditorFixture.read());
   const writes = (value) => value.calls.filter((call) => call.method === "POST");
   const wait = (predicate) => page.waitForFunction(predicate, undefined, { timeout });
-  const boot = async () => { await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  const boot = async (scenario = "") => { const location = new URL(url); if (scenario) location.searchParams.set("scenario", scenario); await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await wait(() => Boolean(window.__antennaPortEditorFixture)); await field("Branch 1 ID").waitFor({ timeout });
     await wait(() => [...document.querySelectorAll('[data-testid="port-editor"] input')].some((input) => !input.disabled)); };
   const apply = async () => { assert.equal(await button("Apply port").isDisabled(), false); await click("Apply port");
@@ -39,23 +40,50 @@ try {
     for (const call of value.calls.filter((call) => call.method === "POST" || call.path.endsWith("/model/scene"))) assert.ok(call.scope?.includes("request_scope_epoch="), "Missing confirmed scope");
     workflows.push({ label, ...value }); };
 
+  for (const scenario of ["malformed-source", "structured-v3"]) {
+    await boot(scenario);
+    const inlet = terminal("Branch 1 inlet terminal");
+    assert.equal(await inlet.inputValue(), "signal-in");
+    assert.equal(await inlet.locator('option[value="signal-in"]').isDisabled(), true);
+    assert.equal(await inlet.locator("option:not([disabled])").count(), 0, "Unavailable observations must never borrow valid boundary IDs");
+    assert.ok((await editor.innerText()).includes("No selectable terminal inventory"));
+    assert.equal(writes(await read()).length, 0);
+    if (scenario === "malformed-source") {
+      await field("Branch 1 ID").fill("invalid-source-draft");
+      assert.equal(await button("Apply port").isDisabled(), true);
+    }
+    checks.push({ name: `${scenario}: selected reference is preserved without borrowing boundary terminals`, passed: true });
+    await screenshot(scenario);
+  }
   await boot();
   const original = await read(), unrelated = original.scene.antenna_port_modes[1];
   await field("Branch 1 signed weight").fill("0");
   assert.equal(await button("Apply port").isDisabled(), true);
   assert.equal(writes(await read()).length, 0);
   await field("Branch 1 signed weight").fill("1");
-  await field("Branch 1 inlet terminal").fill("missing");
+  const inlet = terminal("Branch 1 inlet terminal");
+  assert.equal(await inlet.inputValue(), "signal-in");
+  assert.equal(await inlet.locator('option[value="missing"]').count(), 0);
+  assert.equal(await inlet.locator('option[value="return2-in"]').textContent(), "return2-in · Return");
+  await inlet.selectOption("return2-in");
   assert.equal(await button("Apply port").isDisabled(), true);
-  await field("Branch 1 inlet terminal").fill("signal-in");
+  await inlet.selectOption("signal-in");
+  const outlet = terminal("Branch 2 outlet terminal");
+  await outlet.selectOption("return2-out");
+  assert.equal(await button("Apply port").isDisabled(), false);
+  await outlet.selectOption("return-out");
+  checks.push({ name: "Terminal pickers list existing IDs with object labels; mismatched conductor endpoints block writes", passed: true });
   await click("Add branch");
   assert.equal(await field("Branch 3 ID").inputValue(), "");
-  assert.equal(await field("Branch 3 inlet terminal").inputValue(), "");
+  assert.equal(await terminal("Branch 3 inlet terminal").inputValue(), "");
   assert.equal(await field("Branch 3 signed weight").inputValue(), "");
   assert.equal(await button("Apply port").isDisabled(), true);
   await click("Remove port branch 3");
   await field("Current transport").fill("missing-transport");
   assert.equal(await button("Apply port").isDisabled(), true);
+  assert.equal(await inlet.inputValue(), "signal-in", "Missing inventory must not rewrite the draft");
+  assert.equal(await inlet.locator('option[value="signal-in"]').isDisabled(), true);
+  assert.ok((await inlet.locator('option[value="signal-in"]').textContent()).includes("unavailable"));
   await field("Current transport").fill("alternative");
   checks.push({ name: "invalid weights/missing terminals/explicit empty branch block writes", passed: true });
 
@@ -123,8 +151,8 @@ try {
   const beforeBranches = await read();
   await field("Branch 2 signed weight").fill("-0.5"); await click("Add branch");
   await field("Branch 3 ID").fill("return2");
-  await field("Branch 3 inlet terminal").fill("return2-in");
-  await field("Branch 3 outlet terminal").fill("return2-out");
+  await terminal("Branch 3 inlet terminal").selectOption("return2-in");
+  await terminal("Branch 3 outlet terminal").selectOption("return2-out");
   await field("Branch 3 signed weight").fill("-0.5"); await apply();
   const addedWrite = writes(await read())[0].body;
   assert.equal(addedWrite.base_revision, 1);
