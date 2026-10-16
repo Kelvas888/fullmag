@@ -26,11 +26,12 @@ export function antennaNavigationScene(kernel: KernelApi, scope: string | null):
   return antennaNavigationSceneState(kernel, scope).scene;
 }
 
-/** Observe the current cache snapshot and later changes; never initiate HTTP. */
+/** Observe both inputs to readiness without initiating another HTTP loader. */
 export function observeAntennaNavigationScene(kernel: KernelApi, scope: string | null, listener: () => void): () => void {
   const key = sceneKey(kernel, scope);
   if (!key) return () => {};
-  const unsubscribe = sharedResourceRuntimeStore.subscribe(key, listener);
+  const unsubscribeCache = sharedResourceRuntimeStore.subscribe(key, listener);
+  const unsubscribeRevision = kernel.resources.subscribe(`${scope}|${MODEL_SCENE_PATH}`, listener);
   listener();
-  return unsubscribe;
+  return () => { unsubscribeCache(); unsubscribeRevision(); };
 }
