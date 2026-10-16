@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import http.client
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -396,6 +397,11 @@ def _validate_host_profile(value: Mapping[str, Any], paths: RuntimePaths) -> dic
         _fail("native Docker host profile must bind the managed /host-ledger/ledger")
     if host.get("schema_version") != "runtime_service_host_execution.v1":
         _fail("native Docker host execution schema is unsupported")
+    generation = value.get("runtime_generation_sha256")
+    if (not isinstance(generation, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", generation)
+            or host.get("runtime_generation_sha256") != generation):
+        _fail("Docker host profile must pin the exact native runtime generation")
     if host.get("compute_max_concurrency") != 1 or host.get("preparation_max_concurrency") != 1:
         _fail("Docker host profile requires one compute and one preparation worker")
     policy = host.get("policy")
@@ -479,19 +485,93 @@ def initialize_host_configuration(paths: RuntimePaths) -> dict[str, Any]:
     return _validate_host_profile(value, paths)
 
 
+def _retain_previous_configuration(path: Path, raw: bytes) -> None:
+    """Retain exact previous bytes before an explicitly authorized rotation."""
+    _assert_no_links(path, "previous runtime configuration")
+    try:
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o440
+        )
+    except FileExistsError:
+        if _bounded_regular(path, "previous runtime configuration") != raw:
+            _fail("previous runtime configuration backup differs from its digest")
+        return
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                _fail("short write retaining previous runtime configuration")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    if _bounded_regular(path, "previous runtime configuration") != raw:
+        _fail("previous runtime configuration backup verification failed")
+
+
+def _rotate_configuration_generation(
+    paths: RuntimePaths, current: dict[str, Any], expected: dict[str, Any], previous_sha256: str
+) -> None:
+    """Change only the generation after the launcher verified an owned stop."""
+    old_host, new_host = current.get("host_execution"), expected.get("host_execution")
+    if not isinstance(old_host, dict) or not isinstance(new_host, dict):
+        _fail("runtime configuration rotation requires the same native host profile")
+    old_generation, new_generation = (
+        old_host.get("runtime_generation_sha256"), new_host.get("runtime_generation_sha256")
+    )
+    if (not isinstance(new_generation, str) or not HEX64.fullmatch(new_generation)
+            or (old_generation is not None
+                and (not isinstance(old_generation, str) or not HEX64.fullmatch(old_generation)))):
+        _fail("runtime configuration rotation has an invalid generation")
+    old_profile, new_profile = dict(old_host), dict(new_host)
+    old_profile.pop("runtime_generation_sha256", None)
+    new_profile.pop("runtime_generation_sha256", None)
+    if ({**current, "host_execution": old_profile}
+            != {**expected, "host_execution": new_profile}):
+        _fail("runtime configuration rotation cannot change the operator profile")
+    raw = _bounded_regular(paths.config, "runtime configuration before rotation")
+    if hashlib.sha256(raw).hexdigest() != previous_sha256:
+        _fail("runtime configuration changed since the authorized recreate")
+    if json.loads(raw, object_pairs_hook=_reject_duplicate_keys) != current:
+        _fail("runtime configuration changed during rotation validation")
+    backup = paths.config.with_name(f"docker-all.previous-{previous_sha256}.json")
+    _retain_previous_configuration(backup, raw)
+    if _bounded_regular(paths.config, "runtime configuration before publication") != raw:
+        _fail("runtime configuration changed before generation publication")
+    _atomic_json(paths.config, expected, "runtime configuration generation")
+    if _read_json(paths.config, "runtime configuration after rotation") != expected:
+        _fail("runtime configuration generation publication did not retain the expected profile")
+
+
 def ensure_configuration(paths: RuntimePaths | None = None) -> dict[str, Any]:
     paths = paths or canonical_paths()
     host_mode = os.environ.get("FULLMAG_DOCKER_HOST_EXECUTION", "0")
     if host_mode not in {"0", "1"}:
         _fail("FULLMAG_DOCKER_HOST_EXECUTION must be 0 or 1")
+    previous_sha256 = os.environ.get("FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256")
+    if previous_sha256 is not None and (
+        host_mode != "1" or not HEX64.fullmatch(previous_sha256)
+    ):
+        _fail("FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256 requires native host mode and a lowercase SHA-256")
     expected = initialize_host_configuration(paths) if host_mode == "1" else build_configuration(paths)
     try:
         current = _read_json(paths.config, "runtime service configuration")
     except FileNotFoundError:
+        if previous_sha256 is not None:
+            _fail("authorized recreate runtime configuration is missing")
         _atomic_json(paths.config, expected, "runtime service configuration")
         return expected
     if current != expected:
-        _fail("stable runtime service configuration differs from the operator profile")
+        if previous_sha256 is None:
+            _fail("stable runtime service configuration differs from the operator profile")
+        _rotate_configuration_generation(paths, current, expected, previous_sha256)
+        return expected
     return current
 
 

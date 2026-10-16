@@ -172,7 +172,11 @@ pub fn schedule_next_ready_accepted_task_with_host(
                 return Ok(None);
             }
             let request = crate::host_allocation::host_request_for_task_claim(
-                store, ledger, claim, placement,
+                store,
+                ledger,
+                claim,
+                placement,
+                host.expected_runtime_generation_sha256(),
             )?;
             crate::try_commit_claimed_task_admission_with_host(
                 store, task, claim, ledger, &request, inputs,
@@ -287,7 +291,8 @@ pub fn resume_next_admitted_accepted_task_with_host(
         )?
         .context("preparing accepted task has no durable task-admission record")?;
     validate_admission_matches_claim(&admission, durable_task, &claim)?;
-    if admission.lease.host_launch_binding.as_ref() != Some(&host.ledger().worker_launch_binding())
+    let current_binding = crate::retry_store_writer_busy(|| host.ledger().worker_launch_binding())?;
+    if admission.lease.host_launch_binding.as_ref() != Some(&current_binding)
     {
         bail!("task admission host binding differs from the configured host ledger");
     }

@@ -584,7 +584,9 @@ fn admit_candidate(
             if !host.has_current_compute_snapshot()? {
                 return Ok(None);
             }
-            lease.host_launch_binding = Some(host.ledger().worker_launch_binding());
+            lease.host_launch_binding = Some(retry_store_writer_busy(|| {
+                host.ledger().worker_launch_binding()
+            })?);
             let cpu_ids = host.preparation_cpu_ids(&lease.resource_id)?;
             let request =
                 fullmag_runtime_control::host_allocation::host_request_for_preparation_lease(

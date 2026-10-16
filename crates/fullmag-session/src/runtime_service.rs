@@ -1379,6 +1379,7 @@ mod application_configuration_tests {
                 gpu_vram_bytes_by_uuid: [(GPU_A.into(), 4096)].into_iter().collect(),
                 allowed_cpu_ids: [0, 1, 2, 3].into_iter().collect(),
             },
+            runtime_generation_sha256: None,
             compute_max_concurrency: 2,
             preparation_max_concurrency: 1,
             compute_placements: config

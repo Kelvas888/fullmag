@@ -80,6 +80,14 @@ pub(crate) fn prepare_accepted_fem_task(
             &binding.ledger_root,
             binding.policy.clone(),
         )?;
+        if binding.policy.schema_version
+            == fullmag_session::host_resource_ledger::HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2
+        {
+            let expected_generation = binding.require_runtime_generation_sha256()?;
+            fullmag_runtime_control::retry_store_writer_busy(|| {
+                ledger.validate_runtime_generation(expected_generation)
+            })?;
+        }
         ledger.validate_preparation_launch(store, &preparation_lease, &token)?;
     }
 

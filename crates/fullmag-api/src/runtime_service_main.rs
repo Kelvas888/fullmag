@@ -51,8 +51,14 @@ struct SchedulerChild {
 async fn publish_compute_node_sample(
     ledger: Arc<HostResourceLedger>,
     inventory_owner: Option<Arc<HostInventoryOwner>>,
+    expected_generation: Option<String>,
 ) -> Result<Option<Arc<HostInventoryOwner>>> {
     tokio::task::spawn_blocking(move || -> Result<Option<Arc<HostInventoryOwner>>> {
+        if let Some(expected) = expected_generation.as_deref() {
+            fullmag_runtime_control::retry_store_writer_busy(|| {
+                ledger.validate_runtime_generation(expected)
+            })?;
+        }
         let inventory_owner = match inventory_owner {
             Some(owner) => Some(owner),
             None => {
@@ -94,7 +100,11 @@ async fn publish_compute_node_sample(
             )?
         };
         fullmag_runtime_control::retry_store_writer_busy(|| {
-            ledger.publish_compute_node_snapshot_with_owner(&inventory_owner, &snapshot)
+            ledger.publish_compute_node_snapshot_with_owner_for_generation(
+                &inventory_owner,
+                &snapshot,
+                expected_generation.as_deref(),
+            )
         })?;
         Ok(Some(inventory_owner))
     })
@@ -725,6 +735,7 @@ struct DockerHostProfile {
     configuration: ServiceConfig,
     host_identity: DockerHostIdentity,
     readiness: HostRuntimeReadiness,
+    runtime_generation_sha256: String,
 }
 
 struct DockerHostInitArgs {
@@ -935,11 +946,16 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     }
     persisted_readiness.inventory_sha256 = Some(provisional.inventory_sha256.clone());
     persisted_readiness.capabilities_sha256 = Some(capabilities_sha256.clone());
-    let ledger = HostResourceLedger::initialize_with_readiness(
-        &args.ledger_root,
-        policy.clone(),
-        persisted_readiness.clone(),
-    )?;
+    let ledger = fullmag_runtime_control::retry_store_writer_busy(|| {
+        HostResourceLedger::initialize_or_upgrade_with_readiness(
+            &args.ledger_root,
+            policy.clone(),
+            persisted_readiness.clone(),
+        )
+    })?;
+    let runtime_generation_sha256 = fullmag_runtime_control::retry_store_writer_busy(|| {
+        ledger.read_runtime_generation_sha256()
+    })?;
     let snapshot = if let Some(active_owner) = ledger.active_inventory_owner()? {
         let snapshot = ledger
             .read_compute_node_snapshot()?
@@ -963,7 +979,13 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
         {
             bail!("current host probe changed while initializing the Docker ledger");
         }
-        ledger.publish_compute_node_snapshot_with_owner(&inventory_owner, &snapshot)?;
+        fullmag_runtime_control::retry_store_writer_busy(|| {
+            ledger.publish_compute_node_snapshot_with_owner_for_generation(
+                &inventory_owner,
+                &snapshot,
+                Some(&runtime_generation_sha256),
+            )
+        })?;
         snapshot
     };
     let cpu_offer_id = "docker-all.compute.cpu".to_owned();
@@ -1020,6 +1042,7 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
     let host_execution = RuntimeServiceHostExecution {
         schema_version: RUNTIME_SERVICE_HOST_EXECUTION_SCHEMA_V1.into(),
         ledger_root: args.ledger_root.clone(),
+        runtime_generation_sha256: Some(runtime_generation_sha256.clone()),
         policy,
         compute_max_concurrency: 1,
         preparation_max_concurrency: 1,
@@ -1069,6 +1092,7 @@ fn initialize_docker_host(args: impl Iterator<Item = OsString>) -> Result<()> {
             gpu_uuids,
         },
         readiness: persisted_readiness,
+        runtime_generation_sha256,
     };
     let bytes = serde_json::to_vec(&profile)?;
     if bytes.len() > 256 * 1024 {
@@ -1199,6 +1223,9 @@ fn run_service(path: PathBuf) -> Result<()> {
                     inventory_owner = publish_compute_node_sample(
                         Arc::clone(ledger),
                         inventory_owner.take(),
+                        config.host_execution.as_ref().and_then(|binding| {
+                            binding.runtime_generation_sha256.clone()
+                        }),
                     )
                     .await
                     .context("initial compute-node sample is required before releasing host schedulers")?;
@@ -1242,6 +1269,9 @@ fn run_service(path: PathBuf) -> Result<()> {
                         match publish_compute_node_sample(
                             Arc::clone(ledger),
                             inventory_owner.take(),
+                            config.host_execution.as_ref().and_then(|binding| {
+                                binding.runtime_generation_sha256.clone()
+                            }),
                         )
                         .await
                         {

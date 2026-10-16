@@ -25,6 +25,7 @@ pub struct HostRuntimeAdmission {
     preparation_cpu_ids: BTreeMap<String, BTreeSet<u32>>,
     compute_pool: (String, Vec<fullmag_session::FmsSchedulerResourceOffer>),
     preparation_pool: (String, Vec<fullmag_session::FmsPreparationResourceOffer>),
+    runtime_generation_sha256: Option<String>,
     cuda_device_uuids: Arc<OnceLock<std::result::Result<Vec<String>, String>>>,
 }
 
@@ -127,6 +128,7 @@ mod recovery_tests {
                 schema_version: RUNTIME_SERVICE_HOST_EXECUTION_SCHEMA_V1.into(),
                 ledger_root,
                 policy: policy.clone(),
+                runtime_generation_sha256: None,
                 compute_max_concurrency: 1,
                 preparation_max_concurrency: 1,
                 compute_placements: BTreeMap::from([(
@@ -162,6 +164,7 @@ mod recovery_tests {
                 inventory_owner.descriptor().host_owner_epoch,
             ),
             expected_topology_sha256: policy.topology_sha256.clone(),
+            runtime_generation_sha256: None,
             budget: budget.clone(),
             cpu_ids: BTreeSet::new(),
             exclusive_gpu_uuids: BTreeSet::new(),
@@ -636,7 +639,7 @@ mod recovery_tests {
         assert_eq!(active_lease.state, FmsResourceLeaseState::Active);
         assert_eq!(
             active_lease.host_launch_binding.as_ref(),
-            Some(&fixture.ledger.worker_launch_binding())
+            Some(&fixture.ledger.worker_launch_binding().unwrap())
         );
 
         let application_claim = crate::load_current_task_claim(
@@ -821,6 +824,13 @@ impl HostRuntimeAdmission {
             HostResourceLedger::open(&binding.ledger_root, binding.policy.clone())
         })
         .context("open the exact configured physical-host resource ledger")?;
+        if let Some(expected) = binding.runtime_generation_sha256.as_deref() {
+            crate::retry_store_writer_busy(|| ledger.validate_runtime_generation(expected))?;
+        } else if binding.policy.schema_version
+            == fullmag_session::host_resource_ledger::HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2
+        {
+            bail!("v2 host runtime service has no pinned runtime_generation_sha256");
+        }
         Ok(Some(Self {
             ledger: Arc::new(ledger),
             compute_placements: binding.compute_placements.clone(),
@@ -833,6 +843,7 @@ impl HostRuntimeAdmission {
                 config.preparation_pool_id.clone(),
                 config.preparation_resources.clone(),
             ),
+            runtime_generation_sha256: binding.runtime_generation_sha256.clone(),
             cuda_device_uuids: Arc::new(OnceLock::new()),
         }))
     }
@@ -841,11 +852,18 @@ impl HostRuntimeAdmission {
         &self.ledger
     }
 
+    pub fn expected_runtime_generation_sha256(&self) -> Option<&str> {
+        self.runtime_generation_sha256.as_deref()
+    }
+
     /// Defer new admissions unless the persisted sample is current for this
     /// boot and the exact configured host ledger owner. This does not prove
     /// that the service process itself is live; its owner/recovery gate remains
     /// an independent prerequisite.
     pub fn has_current_compute_snapshot(&self) -> Result<bool> {
+        if let Some(expected) = self.runtime_generation_sha256.as_deref() {
+            crate::retry_store_writer_busy(|| self.ledger.validate_runtime_generation(expected))?;
+        }
         let Some(snapshot) =
             crate::retry_store_writer_busy(|| self.ledger.read_compute_node_snapshot())?
         else {
@@ -1381,8 +1399,18 @@ impl HostRuntimeAdmission {
                 claim.lease.lease_token.as_str(),
             )?
             .context("host solver claim has no durable local lease")?;
-        if lease.host_launch_binding.as_ref() != Some(&self.ledger.worker_launch_binding()) {
+        let current_binding = crate::retry_store_writer_busy(|| self.ledger.worker_launch_binding())?;
+        if lease.host_launch_binding.as_ref() != Some(&current_binding) {
             bail!("host solver claim is missing its exact durable launch binding");
+        }
+        if let Some(expected) = self.runtime_generation_sha256.as_deref() {
+            let actual = lease
+                .host_launch_binding
+                .as_ref()
+                .and_then(|binding| binding.runtime_generation_sha256.as_deref());
+            if actual != Some(expected) {
+                bail!("host solver claim has a stale or missing runtime generation");
+            }
         }
         if claim.lease.kind == fullmag_application::ResourceKind::Gpu {
             let intent = store
@@ -1419,6 +1447,7 @@ impl HostRuntimeAdmission {
             self.ledger(),
             claim,
             self.solver_placement(&claim.lease.resource_id)?,
+            self.expected_runtime_generation_sha256(),
         )?;
         self.ensure_committed_request(&request)
     }
@@ -1428,8 +1457,18 @@ impl HostRuntimeAdmission {
         store: &SessionStore,
         lease: &FmsPreparationResourceLease,
     ) -> Result<()> {
-        if lease.host_launch_binding.as_ref() != Some(&self.ledger.worker_launch_binding()) {
+        let current_binding = crate::retry_store_writer_busy(|| self.ledger.worker_launch_binding())?;
+        if lease.host_launch_binding.as_ref() != Some(&current_binding) {
             bail!("host preparation claim is missing its exact durable launch binding");
+        }
+        if let Some(expected) = self.runtime_generation_sha256.as_deref() {
+            let actual = lease
+                .host_launch_binding
+                .as_ref()
+                .and_then(|binding| binding.runtime_generation_sha256.as_deref());
+            if actual != Some(expected) {
+                bail!("host preparation claim has a stale or missing runtime generation");
+            }
         }
         let request = crate::host_allocation::host_request_for_preparation_lease(
             store,
@@ -1461,8 +1500,12 @@ impl HostRuntimeAdmission {
             || reservation.cpu_ids != request.cpu_ids
             || reservation.exclusive_gpu_uuids != request.exclusive_gpu_uuids
             || reservation.gpu_vram_bytes_by_uuid != request.gpu_vram_bytes_by_uuid
+            || self.runtime_generation_sha256.as_deref().is_some_and(|expected| {
+                reservation.runtime_generation_sha256.as_deref() != Some(expected)
+                    || request.runtime_generation_sha256.as_deref() != Some(expected)
+            })
         {
-            bail!("process spawn requires a committed reservation matching the pinned allocation");
+            bail!("process spawn requires a committed reservation matching the pinned allocation and runtime generation");
         }
         Ok(())
     }

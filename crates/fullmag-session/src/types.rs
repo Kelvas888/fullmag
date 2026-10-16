@@ -3140,6 +3140,11 @@ pub struct FmsHostLaunchBinding {
     pub schema_version: String,
     pub ledger_root: PathBuf,
     pub policy: crate::host_resource_ledger::HostResourceLedgerPolicy,
+    /// Canonical digest of the immutable host-readiness blob for the strict
+    /// runtime generation that admitted this lease. Legacy bindings may omit
+    /// it and remain readable, but new v2 launch paths require it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_generation_sha256: Option<String>,
 }
 
 impl FmsHostLaunchBinding {
@@ -3164,7 +3169,20 @@ impl FmsHostLaunchBinding {
             bail!("host launch binding ledger_root must name a dedicated directory");
         }
         self.policy.validate()?;
+        if let Some(digest) = self.runtime_generation_sha256.as_deref() {
+            validate_runtime_generation_sha256(digest)?;
+        }
         Ok(())
+    }
+
+    /// Return the generation carried by a strict host binding. This separate
+    /// accessor preserves readability of legacy bindings while preventing a
+    /// v2 worker from treating a missing generation as an admission proof.
+    pub fn require_runtime_generation_sha256(&self) -> Result<&str> {
+        self.validate()?;
+        self.runtime_generation_sha256
+            .as_deref()
+            .context("host launch binding is missing runtime_generation_sha256")
     }
 }
 
@@ -3611,6 +3629,10 @@ pub fn canonical_json_bytes(value: &Value) -> Vec<u8> {
 
 pub fn canonical_json_sha256(value: &Value) -> String {
     format!("{:x}", Sha256::digest(canonical_json_bytes(value)))
+}
+
+pub(crate) fn validate_runtime_generation_sha256(value: &str) -> Result<()> {
+    validate_sha256(value, "runtime_generation_sha256")
 }
 
 fn validate_sha256(value: &str, field: &str) -> Result<()> {
@@ -4063,6 +4085,7 @@ mod host_launch_binding_tests {
                 gpu_vram_bytes_by_uuid: BTreeMap::new(),
                 allowed_cpu_ids: BTreeSet::new(),
             },
+            runtime_generation_sha256: None,
         }
     }
 

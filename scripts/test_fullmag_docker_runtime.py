@@ -424,6 +424,7 @@ class DockerRuntimeContract(unittest.TestCase):
         config["host_execution"] = {
             "schema_version": "runtime_service_host_execution.v1",
             "ledger_root": "/host-ledger/ledger",
+            "runtime_generation_sha256": "a" * 64,
             "compute_max_concurrency": 1,
             "preparation_max_concurrency": 1,
             "policy": {"schema_version": "host_resource_ledger_policy.v2",
@@ -434,7 +435,8 @@ class DockerRuntimeContract(unittest.TestCase):
             },
             "preparation_cpu_ids": {"docker-all.preparation.cpu": [3]},
         }
-        return {"schema_version": service.HOST_PROFILE_SCHEMA, "configuration": config}
+        return {"schema_version": service.HOST_PROFILE_SCHEMA, "configuration": config,
+                "runtime_generation_sha256": "a" * 64}
 
     def test_native_host_profile_rejects_wrong_store_device_policy_and_overcommit(self):
         import copy
@@ -459,6 +461,107 @@ class DockerRuntimeContract(unittest.TestCase):
             mutate(changed["configuration"])
             with self.subTest(profile=changed), self.assertRaises(service.RuntimeServiceError):
                 service._validate_host_profile(changed, service.RuntimePaths())
+
+    def test_native_host_profile_requires_matching_runtime_generation(self):
+        import copy
+        service = self.load_service()
+        value = self.host_profile_fixture(service)
+        for generation in (None, "", "a" * 63, "A" * 64, "b" * 64):
+            changed = copy.deepcopy(value)
+            changed["configuration"]["host_execution"]["runtime_generation_sha256"] = generation
+            with self.subTest(generation=generation), self.assertRaisesRegex(
+                    service.RuntimeServiceError, "runtime generation"):
+                service._validate_host_profile(changed, service.RuntimePaths())
+        for generation in (None, "", "a" * 63, "A" * 64, "b" * 64):
+            changed = copy.deepcopy(value)
+            changed["runtime_generation_sha256"] = generation
+            with self.subTest(profile_generation=generation), self.assertRaisesRegex(
+                    service.RuntimeServiceError, "runtime generation"):
+                service._validate_host_profile(changed, service.RuntimePaths())
+
+    @unittest.skipIf(os.name == "nt", "Guest publication fsync is qualified on Linux")
+    def test_authorized_recreate_rotates_only_generation_and_retains_exact_config(self):
+        import copy
+        import hashlib
+        from dataclasses import replace
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paths = replace(service.RuntimePaths(), config=root / "runtime.json")
+            old = self.host_profile_fixture(service)["configuration"]
+            expected = copy.deepcopy(old)
+            expected["host_execution"]["runtime_generation_sha256"] = "b" * 64
+            service._atomic_json(paths.config, old, "test config")
+            original = paths.config.read_bytes()
+            old_sha = hashlib.sha256(original).hexdigest()
+            sentinel = root / "saved-session.json"
+            sentinel.write_bytes(b"user session remains intact")
+            environment = {"FULLMAG_DOCKER_HOST_EXECUTION": "1",
+                           "FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256": old_sha}
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                    service, "initialize_host_configuration", return_value=expected):
+                self.assertEqual(service.ensure_configuration(paths), expected)
+                self.assertEqual(service.ensure_configuration(paths), expected)
+            self.assertEqual(json.loads(paths.config.read_bytes()), expected)
+            self.assertEqual((root / f"docker-all.previous-{old_sha}.json").read_bytes(), original)
+            self.assertEqual(sentinel.read_bytes(), b"user session remains intact")
+
+    @unittest.skipIf(os.name == "nt", "Guest publication fsync is qualified on Linux")
+    def test_recreate_rejects_missing_wrong_hash_or_operator_profile_changes(self):
+        import copy
+        import hashlib
+        from dataclasses import replace
+        service = self.load_service()
+        for scenario in ("no_authorization", "wrong_hash", "profile_change", "corrupt_backup"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                paths = replace(service.RuntimePaths(), config=root / "runtime.json")
+                old = self.host_profile_fixture(service)["configuration"]
+                expected = copy.deepcopy(old)
+                expected["host_execution"]["runtime_generation_sha256"] = "b" * 64
+                service._atomic_json(paths.config, old, "test config")
+                original = paths.config.read_bytes()
+                old_sha = hashlib.sha256(original).hexdigest()
+                environment = {"FULLMAG_DOCKER_HOST_EXECUTION": "1"}
+                if scenario != "no_authorization":
+                    environment["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"] = (
+                        "f" * 64 if scenario == "wrong_hash" else old_sha
+                    )
+                if scenario == "profile_change":
+                    expected["heartbeat_interval_milliseconds"] += 1
+                if scenario == "corrupt_backup":
+                    (root / f"docker-all.previous-{old_sha}.json").write_bytes(b"different history")
+                with patch.dict(os.environ, environment, clear=True), patch.object(
+                        service, "initialize_host_configuration", return_value=expected):
+                    with self.assertRaises(service.RuntimeServiceError):
+                        service.ensure_configuration(paths)
+                self.assertEqual(paths.config.read_bytes(), original)
+
+    @unittest.skipIf(os.name == "nt", "Guest publication fsync is qualified on Linux")
+    def test_recreate_requires_existing_config_and_can_pin_legacy_generation(self):
+        import copy
+        import hashlib
+        from dataclasses import replace
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paths = replace(service.RuntimePaths(), config=root / "runtime.json")
+            expected = self.host_profile_fixture(service)["configuration"]
+            environment = {"FULLMAG_DOCKER_HOST_EXECUTION": "1",
+                           "FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256": "f" * 64}
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                    service, "initialize_host_configuration", return_value=expected):
+                with self.assertRaisesRegex(service.RuntimeServiceError, "configuration is missing"):
+                    service.ensure_configuration(paths)
+            self.assertFalse(paths.config.exists())
+            legacy = copy.deepcopy(expected)
+            legacy["host_execution"].pop("runtime_generation_sha256")
+            service._atomic_json(paths.config, legacy, "legacy config")
+            original = paths.config.read_bytes()
+            environment["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"] = hashlib.sha256(original).hexdigest()
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                    service, "initialize_host_configuration", return_value=expected):
+                self.assertEqual(service.ensure_configuration(paths), expected)
 
     def test_requested_host_mode_never_falls_back_to_cpu_profile(self):
         service = self.load_service()
