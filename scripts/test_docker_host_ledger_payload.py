@@ -2,15 +2,150 @@
 """Focused regression for host-ledger owner-marker publication bytes."""
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 from pathlib import Path
 
 
 HELPER = Path(__file__).with_name("lib") / "docker_host_ledger.sh"
+
+
+def _inline_python_snippets() -> list[str]:
+    source = HELPER.read_text(encoding="utf-8")
+    marker = "python3 -c '"
+    snippets = re.findall(r"python3 -c '([^']*)'", source, flags=re.DOTALL)
+    if len(snippets) != source.count(marker):
+        raise AssertionError("could not extract every inline python3 -c snippet")
+    if len(snippets) < 7:
+        raise AssertionError(f"unexpectedly few inline python snippets: {len(snippets)}")
+    return snippets
+
+
+def _assert_inline_python_parses() -> None:
+    for index, snippet in enumerate(_inline_python_snippets(), start=1):
+        try:
+            ast.parse(snippet, filename=f"docker_host_ledger.sh:inline-python-{index}")
+        except SyntaxError as error:
+            raise AssertionError(f"inline Python snippet {index} does not parse: {error}") from error
+
+
+def _shell_function(source: str, name: str, next_name: str) -> str:
+    start = source.index(f"{name}() {{")
+    end = source.index(f"\n{next_name}() {{", start)
+    return source[start:end]
+
+
+def _run_mount_receipt_probe() -> None:
+    source = HELPER.read_text(encoding="utf-8")
+    read_mount_state = _shell_function(source, "read_mount_state", "verify_image_file")
+    emit_receipt = _shell_function(source, "emit_receipt", "cleanup")
+    probe = textwrap.dedent(
+        f"""
+        set -Eeuo pipefail
+        host() {{
+            [[ "$1" == "findmnt" ]] || {{ echo "unexpected host command: $*" >&2; return 99; }}
+            printf '%s\\n' '/dev/loop5 ext4 11111111-1111-1111-1111-111111111111'
+        }}
+        MOUNT_ROOT='/mnt/fullmag-host-ledger-fullmag-test'
+        MOUNT_ACTIVE=0
+        MOUNT_SOURCE=''
+        LOOP_DEVICE=''
+        FILESYSTEM_UUID=''
+        MOUNT_TARGET='/host-ledger'
+        IMAGE_SIZE_BYTES=134217728
+        PROFILE='host-ledger-v1'
+        PROJECT_ID='fullmag-test'
+        BACKING_IMAGE='/storage/build-volumes/fullmag-host-ledger-v1.ext4'
+        {read_mount_state}
+        {emit_receipt}
+        read_mount_state
+        emit_receipt validated 0
+        """
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        script = Path(directory) / "host-ledger-loop-receipt-probe.sh"
+        script.write_text(probe, encoding="utf-8")
+        result = subprocess.run(
+            ["bash", str(script)], check=True, text=True, capture_output=True
+        )
+    receipt = json.loads(result.stdout)
+    if receipt.get("loop_device") != "/dev/loop5":
+        raise AssertionError(f"receipt lost the full loop device path: {receipt!r}")
+    if receipt.get("mount_active") is not True or receipt.get("state") != "validated":
+        raise AssertionError(f"mount-state probe did not produce a validated receipt: {receipt!r}")
+
+
+def _run_recovery_probe(root: Path, expected_success: bool) -> None:
+    source = HELPER.read_text(encoding="utf-8")
+    inspect_recovery_mount_root = _shell_function(
+        source, "inspect_recovery_mount_root", "admit_existing_mount"
+    )
+    probe = textwrap.dedent(
+        f"""
+        set -Eeuo pipefail
+        fail() {{ echo "$*" >&2; exit 2; }}
+        host() {{ "$@"; }}
+        MOUNT_ROOT="$1"
+        LEDGER_CHILD_NAME='ledger'
+        LEDGER_ROOT="$MOUNT_ROOT/ledger"
+        {inspect_recovery_mount_root}
+        inspect_recovery_mount_root
+        """
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        script = Path(directory) / "host-ledger-recovery-probe.sh"
+        script.write_text(probe, encoding="utf-8")
+        result = subprocess.run(
+            ["bash", str(script), str(root)], text=True, capture_output=True
+        )
+    actual_success = result.returncode == 0
+    if actual_success != expected_success:
+        raise AssertionError(
+            f"recovery probe result mismatch for {root!r}: "
+            f"expected success={expected_success}, returncode={result.returncode}, "
+            f"stderr={result.stderr!r}"
+        )
+
+
+def _assert_recovery_mount_guards() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        parent = Path(directory)
+
+        empty = parent / "empty"
+        (empty / "lost+found").mkdir(parents=True)
+        (empty / "ledger").mkdir()
+        _run_recovery_probe(empty, True)
+
+        unexpected = parent / "unexpected"
+        (unexpected / "lost+found").mkdir(parents=True)
+        (unexpected / "ledger").mkdir()
+        (unexpected / "extra").touch()
+        _run_recovery_probe(unexpected, False)
+
+        newline_name = parent / "newline"
+        (newline_name / "lost+found").mkdir(parents=True)
+        (newline_name / "ledger").mkdir()
+        (newline_name / "unexpected\nentry").touch()
+        _run_recovery_probe(newline_name, False)
+
+        real_root = parent / "real-root"
+        (real_root / "lost+found").mkdir(parents=True)
+        (real_root / "ledger").mkdir()
+        root_symlink = parent / "root-symlink"
+        root_symlink.symlink_to(real_root, target_is_directory=True)
+        _run_recovery_probe(root_symlink, False)
+
+        nonempty_child = parent / "nonempty-child"
+        (nonempty_child / "lost+found").mkdir(parents=True)
+        (nonempty_child / "ledger").mkdir()
+        (nonempty_child / "ledger" / "data\nentry").touch()
+        _run_recovery_probe(nonempty_child, False)
 
 
 def _owner_marker_writer() -> str:
@@ -40,6 +175,9 @@ def _run_writer(command: str, marker: Path, temporary: Path, payload: str) -> No
 
 
 def main() -> int:
+    _assert_inline_python_parses()
+    _run_mount_receipt_probe()
+    _assert_recovery_mount_guards()
     command = _owner_marker_writer()
     payload = json.dumps(
         {

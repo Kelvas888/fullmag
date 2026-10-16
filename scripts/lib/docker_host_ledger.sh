@@ -191,7 +191,7 @@ read_mount_state() {
   [[ "${filesystem}" == "ext4" ]] || fail "host ledger mount is not ext4: ${filesystem}"
   [[ "${source}" =~ ^/dev/loop[0-9]+$ ]] || fail "host ledger mount is not a loop device: ${source}"
   [[ "${uuid}" =~ ^[0-9A-Fa-f-]{36}$ ]] || fail "host ledger mount has no filesystem UUID"
-  LOOP_DEVICE="${source#/dev/}"
+  LOOP_DEVICE="${source}"
   FILESYSTEM_UUID="${uuid}"
 }
 
@@ -205,10 +205,11 @@ verify_image_file() {
 
 verify_loop_identity() {
   [[ "${MOUNT_ACTIVE}" == "1" ]] || fail "host ledger is not mounted at ${MOUNT_ROOT}"
-  local backing observed_uuid observed_label sysfs_path
-  backing="$(host cat "/sys/block/${LOOP_DEVICE}/loop/backing_file" 2>/dev/null || true)"
+  local backing observed_uuid observed_label sysfs_path loop_name
+  loop_name="${LOOP_DEVICE#/dev/}"
+  backing="$(host cat "/sys/block/${loop_name}/loop/backing_file" 2>/dev/null || true)"
   [[ "${backing}" == "${BACKING_IMAGE}" ]] || fail "loop backing mismatch: expected ${BACKING_IMAGE}, observed ${backing:-missing}"
-  sysfs_path="/sys/block/${LOOP_DEVICE}/loop/backing_file"
+  sysfs_path="/sys/block/${loop_name}/loop/backing_file"
   host test -f "${sysfs_path}" || fail "loop backing sysfs evidence is missing: ${sysfs_path}"
   observed_uuid="$(host blkid -s UUID -o value "${MOUNT_SOURCE}" 2>/dev/null || true)"
   [[ "${observed_uuid}" == "${FILESYSTEM_UUID}" ]] || fail "loop filesystem UUID changed during verification"
@@ -276,6 +277,47 @@ inspect_unmounted_mount_root() {
   if host test -e "${OWNER_MARKER}" || host test -L "${OWNER_MARKER}"; then
     fail "unmounted host-ledger target has a stale owner marker"
   fi
+}
+
+inspect_recovery_mount_root() {
+  host test -d "${MOUNT_ROOT}" || fail "mounted host-ledger target is not a directory"
+  host test ! -L "${MOUNT_ROOT}" || fail "mounted host-ledger target is a symlink"
+  local unexpected
+  if ! unexpected="$(host find "${MOUNT_ROOT}" -mindepth 1 -maxdepth 1 \
+      ! -name 'lost+found' ! -name "${LEDGER_CHILD_NAME}" -printf x -quit 2>/dev/null)"; then
+    fail "cannot inspect mounted host-ledger target for recovery"
+  fi
+  [[ -z "${unexpected}" ]] || fail "mounted host-ledger target contains an unexpected entry"
+
+  local child nested
+  for child in "${MOUNT_ROOT}/lost+found" "${LEDGER_ROOT}"; do
+    host test -d "${child}" || fail "mounted host-ledger recovery child is missing: ${child}"
+    host test ! -L "${child}" || fail "mounted host-ledger recovery child is a symlink: ${child}"
+    if ! nested="$(host find "${child}" -mindepth 1 -maxdepth 1 -printf x -quit 2>/dev/null)"; then
+      fail "cannot inspect mounted host-ledger recovery child: ${child}"
+    fi
+    [[ -z "${nested}" ]] || fail "mounted host-ledger recovery child is not empty: ${child}"
+  done
+}
+
+admit_existing_mount() {
+  # These identity checks must precede any attempt to adopt a mount without an
+  # owner marker.  They bind the recovery decision to the expected image,
+  # loop device, filesystem UUID, and label.
+  verify_image_file
+  read_mount_state
+  verify_loop_identity
+  if host test -e "${OWNER_MARKER}" || host test -L "${OWNER_MARKER}"; then
+    # An existing marker is never replaced.  Invalid or foreign markers fail
+    # through the normal attestation path.
+    verify_owner_marker
+    verify_runtime_directory
+    return 0
+  fi
+  inspect_recovery_mount_root
+  write_owner_marker
+  set_runtime_ownership
+  verify_current_mount
 }
 
 acquire_lock() {
@@ -366,7 +408,7 @@ print(json.dumps({
     "mount_target": target, "runtime_uid": int(uid), "runtime_gid": int(gid),
     "owner_token": token,
 }, separators=(",", ":")))
-)' "${PROFILE}" "${PROJECT_ID}" "${BACKING_IMAGE}" "${MOUNT_ROOT}" "${FILESYSTEM_UUID}" "${IMAGE_SIZE_BYTES}" "${MOUNT_TARGET}" "${RUNTIME_UID}" "${RUNTIME_GID}" "${OWNER_TOKEN}")"
+' "${PROFILE}" "${PROJECT_ID}" "${BACKING_IMAGE}" "${MOUNT_ROOT}" "${FILESYSTEM_UUID}" "${IMAGE_SIZE_BYTES}" "${MOUNT_TARGET}" "${RUNTIME_UID}" "${RUNTIME_GID}" "${OWNER_TOKEN}")"
   temporary="${OWNER_MARKER}.tmp.$$.${RANDOM}"
   python3 -c 'import os, sys
 path, temporary, payload = sys.argv[1:]
@@ -526,7 +568,7 @@ main() {
       create_backing_image_if_needed
       read_mount_state
       if [[ "${MOUNT_ACTIVE}" == "1" ]]; then
-        verify_current_mount
+        admit_existing_mount
       else
         allocate_and_mount
         write_owner_marker

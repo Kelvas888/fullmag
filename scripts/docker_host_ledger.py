@@ -788,7 +788,17 @@ def _run_owned_container(*, args: list[str], name: str, image_id: str, label_val
 
 def _probe_host_python(run_root: Path, image_id: str, docker_callable: Callable[..., Any], receipt: dict[str, Any]) -> None:
     name = _container_name("python", run_root)
-    script = "set -eu; command -v nsenter >/dev/null; nsenter -t 1 -m -- python3 -c 'print(\"fullmag-host-ledger-host-python3-v1\")'"
+    # Maintenance executes Python in the image and accesses the daemon mount
+    # namespace through /proc/1/root; LinuxKit does not ship a full Python stdlib.
+    script = (
+        "set -eu; command -v nsenter >/dev/null; nsenter -t 1 -m -- true; "
+        "/usr/local/bin/python3 -I -c 'import encodings, os, stat; "
+        'assert stat.S_ISDIR(os.stat("/proc/1/root").st_mode); '
+        'print("fullmag-host-ledger-host-python3-v1")' + "'"
+    )
+    receipt["host_python_probe_scope"] = "image-python-accesses-host-root"
+    receipt["host_python_probe_interpreter"] = "/usr/local/bin/python3"
+
     label_key = "org.fullmag.host-ledger.owner"
     args = ["run", "--name", name, "--user", "0:0", "--privileged", "--pid", "host", "--network", "none",
             "--read-only", "--entrypoint", "/bin/sh", "--label", f"{label_key}={receipt['run_id']}", image_id, "-c", script]
