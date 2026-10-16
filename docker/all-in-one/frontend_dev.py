@@ -1008,7 +1008,6 @@ def _safe_environment(
     *,
     watchpack_polling_ms: int | None = None,
 ) -> dict[str, str]:
-    browser_origin = f"http://localhost:{inputs.host_port}"
     polling_ms = (
         _watchpack_polling_ms()
         if watchpack_polling_ms is None
@@ -1031,10 +1030,11 @@ def _safe_environment(
         "FULLMAG_API_URL": API_PROXY_TARGET,
         "FULLMAG_WEB_PUBLIC_HOST": "localhost",
         "FULLMAG_WEB_PUBLIC_PORT": str(inputs.host_port),
-        "NEXT_PUBLIC_API_URL": browser_origin,
-        "NEXT_PUBLIC_CONTROL_ROOM_API_BASE_URL": browser_origin,
-        "NEXT_PUBLIC_FULLMAG_API_URL": browser_origin,
-        "NEXT_PUBLIC_RUNTIME_HTTP_BASE": browser_origin,
+        # Leave the browser API-base variables unset.  The control-room
+        # resolver then uses window.location.origin, so a host browser that
+        # reaches the published port through either localhost or 127.0.0.1
+        # stays same-origin and uses the Next proxy.  The server-side proxy
+        # remains pinned separately by FULLMAG_API_PROXY_TARGET above.
         "PNPM_HOME": str(PNPM_HOME),
         "COREPACK_HOME": str(COREPACK_HOME),
         # Keep Corepack on the exact packageManager selected by the seeded

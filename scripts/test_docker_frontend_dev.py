@@ -393,12 +393,19 @@ else:
             )
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
-    def test_browser_origin_and_internal_api_target_are_separate(self):
+    def test_browser_api_uses_same_origin_proxy_and_internal_target_is_separate(self):
         with isolated(self.module) as (root, workspace, inputs):
             environment = self.module._safe_environment(inputs)
             self.assertEqual(environment["FULLMAG_API_PROXY_TARGET"], "http://backend:8081")
             self.assertEqual(environment["FULLMAG_API_URL"], "http://backend:8081")
-            self.assertEqual(environment["NEXT_PUBLIC_API_URL"], "http://localhost:3197")
+            for name in (
+                "NEXT_PUBLIC_API_URL",
+                "NEXT_PUBLIC_CONTROL_ROOM_API_BASE_URL",
+                "NEXT_PUBLIC_FULLMAG_API_URL",
+                "NEXT_PUBLIC_RUNTIME_HTTP_BASE",
+            ):
+                with self.subTest(name=name):
+                    self.assertNotIn(name, environment)
             self.assertEqual(environment["COREPACK_ENABLE_PROJECT_SPEC"], "1")
             self.assertEqual(environment["COREPACK_DEFAULT_TO_LATEST"], "0")
 
