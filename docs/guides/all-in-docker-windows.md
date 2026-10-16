@@ -187,22 +187,31 @@ toolchaina i obrazu aplikacji pozostaje **VERIFICATION PENDING**.
 ## CI: routowanie managed FEM
 
 Workflow `.github/workflows/frontend-3d-managed-fem.yml` zachowuje ten sam
-job, środowisko i rzeczywistą bramkę kwalifikacji. Używa dokładnie czterech
-etykiet runnera:
+job, środowisko i rzeczywistą bramkę kwalifikacji. Dla `push` i
+`pull_request` używa dokładnie czterech etykiet runnera, a czwarta jest
+prywatna i unikalna dla konkretnego runu:
 
 ```text
-self-hosted, linux, x64, ${{ vars.FULLMAG_FEM_RUNNER_LABEL || 'fem-managed' }}
+self-hosted, linux, x64, fullmag-fem-private-${{ github.run_id }}
 ```
 
-Operator może skierować nowy run do lokalnego, ephemeral runnera przez zmienną
-repozytorium `FULLMAG_FEM_RUNNER_LABEL=fem-managed-docker`. Taki runner musi
-mieć wyłącznie etykiety `self-hosted`, `linux`, `x64` i `fem-managed-docker`;
-nie wolno dodawać mu generycznej `fem-managed`, ponieważ przejąłby starsze,
-już oczekujące joby. Po wyłączeniu zmiennej workflow wraca do dotychczasowego
-`fem-managed`; jest to ścieżka rollbacku i nie wymaga anulowania cudzych jobów.
+Workflow rozwija ją przez
+`${{ format('fullmag-fem-private-{0}', github.run_id) }}`. Istniejący operator
+akceptuje taki label przez regex `^fullmag-fem-private-[a-z0-9][a-z0-9-]{0,63}$`,
+w tym jedenastocyfrowy `github.run_id`. Konfiguracja JIT musi zawierać dokładny
+label bieżącego runu; nie wolno używać samego prefixu ani labela z innego runu.
 
-`fem-managed-docker` zachowuje istniejący kontrakt `linux-ext4-loop-v1`
-realizowany w Docker Desktop Linux. Zmienna tylko kieruje job do kolejki;
+Dla `pull_request` operator nadal wymaga trusted ref
+`refs/pull/<nr>/(merge|head)`, pełnego `expected_head`, nazwy tego workflow i
+dokładnego `run_id`. Per-run label izoluje kolejkę bez anulowania innych
+queued jobs i bez zmiany required check, branch protection albo repo variables.
+`FULLMAG_FEM_RUNNER_LABEL` pozostaje niezmieniona, ale nie wyznacza labela dla
+`push` ani `pull_request`.
+`workflow_dispatch` zachowuje wymagane wejście `inputs.runner_label`; operator
+musi wtedy zweryfikować jego prywatny label przed rejestracją.
+
+Runner z prywatnym per-run label zachowuje istniejący kontrakt `linux-ext4-loop-v1`
+realizowany w Docker Desktop Linux. Etykieta tylko kieruje job do kolejki;
 przed rejestracją i uruchomieniem runnera operator musi potwierdzić dokładny zestaw etykiet, profil Docker, ext4 z `findmnt` i
 proweniencją loop/backing, `nsenter`, dostępność NVIDIA oraz wszystkie
 prerequisites rzeczywistej bramki CPU/GPU. Sama etykieta ani sonda GPU nie
