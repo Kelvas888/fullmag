@@ -2606,13 +2606,13 @@ mod recovery_contract_tests {
 
     #[test]
     fn recovery_request_requires_canonical_lowercase_pins() {
-        let mut request = request();
-        assert!(request.validate().is_ok());
-        request.config_sha256 = "A".repeat(64);
-        assert!(request.validate().is_err());
-        let mut request = request();
-        request.request_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_uppercase();
-        assert!(request.validate().is_err());
+        let mut request_with_bad_pin = request();
+        assert!(request_with_bad_pin.validate().is_ok());
+        request_with_bad_pin.config_sha256 = "A".repeat(64);
+        assert!(request_with_bad_pin.validate().is_err());
+        let mut uppercase_request = request();
+        uppercase_request.request_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_uppercase();
+        assert!(uppercase_request.validate().is_err());
     }
 
     #[test]
@@ -2682,7 +2682,8 @@ mod recovery_contract_tests {
             std::fs::write(&source_path, bytes).unwrap();
             let archive_name = Path::new(&source).file_name().unwrap();
             std::fs::write(archive_root.join(archive_name), bytes).unwrap();
-            archived_files.insert(source, crate::hex_sha256(bytes));
+            let source_digest = crate::hex_sha256(bytes);
+            archived_files.insert(source, source_digest);
         }
         let configuration_bytes = br#"{"schema_version":"runtime_service_config.v2"}"#;
         std::fs::write(

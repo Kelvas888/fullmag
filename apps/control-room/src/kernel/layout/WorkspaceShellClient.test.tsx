@@ -470,9 +470,13 @@ describe("WorkspaceShellClient Home entry surface", () => {
       new Error("current status unavailable"),
       { status: 409 },
     );
-    const currentStatus = vi.fn()
-      .mockRejectedValueOnce(statusFailure)
-      .mockResolvedValueOnce(liveStatus);
+    // Home mounts StartScreen, which also selects the canonical status
+    // resource. Keep the transport failure persistent until the explicit
+    // Retry so an additional consumer cannot consume the recovery response.
+    let statusReady = false;
+    const currentStatus = vi.fn(() =>
+      statusReady ? Promise.resolve(liveStatus) : Promise.reject(statusFailure),
+    );
     const { container, dispose } = await mountWorkspace(
       makeKernel(list, currentStatus),
     );
@@ -486,19 +490,21 @@ describe("WorkspaceShellClient Home entry surface", () => {
       expect(findByAttribute(container, "data-slot-id", "start-screen")).toBeTruthy();
       expect(launchTile(container, "start.new-fdm")?.getAttribute("disabled")).not.toBeNull();
       expect(launchTile(container, "start.new-fem")?.getAttribute("disabled")).not.toBeNull();
-      expect(currentStatus).toHaveBeenCalledTimes(1);
+      const initialStatusCalls = currentStatus.mock.calls.length;
+      expect(initialStatusCalls).toBeGreaterThanOrEqual(1);
 
       const retry = findElements(
         container,
         (element) => element.tagName === "BUTTON" && element.textContent === "Retry",
       )[0];
       expect(retry).toBeTruthy();
+      statusReady = true;
       await act(async () => {
         retry!.click();
         await settle();
       });
 
-      expect(currentStatus).toHaveBeenCalledTimes(2);
+      expect(currentStatus).toHaveBeenCalledTimes(initialStatusCalls + 1);
       expect(findByAttribute(container, "data-state", "home-session-reconnecting")).toBeNull();
       expect(findByAttribute(container, "data-slot-id", "viewport-main")).toBeTruthy();
     } finally {
