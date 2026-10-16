@@ -127,6 +127,9 @@ jobs:
           cargo test -p fullmag-api --bin fullmag-api old_preparation_terminalization_does_not_mutate_replacement_session_ledger
           cargo test -p fullmag-api --bin fullmag-api rejected_accepted_admission_does_not_reserve_a_run_command
 
+      - name: Run runtime service sampler and control contracts
+        run: cargo test -p fullmag-api --bin fullmag-runtime-service --no-fail-fast
+
       - name: Run complete session reachability and archive contracts
         run: cargo test -p fullmag-session --lib --no-fail-fast
 
