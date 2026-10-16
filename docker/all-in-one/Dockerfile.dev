@@ -76,5 +76,5 @@ USER 65532:65532
 RUN test "$(id -u)" = "65532" && test "$(/usr/local/bin/pnpm --version)" = "10.8.1"
 EXPOSE 8080 8081
 ENTRYPOINT ["/usr/local/bin/python3", "/opt/fullmag/entrypoint.py"]
-HEALTHCHECK --interval=5s --timeout=5s --start-period=30s --retries=6 \
+HEALTHCHECK --interval=5s --timeout=10s --start-period=390s --retries=6 \
     CMD /usr/local/bin/python3 /opt/fullmag/healthcheck.py

@@ -10,6 +10,12 @@ import urllib.request
 from typing import Any, Mapping
 
 
+BACKEND_RECEIPT_PATH = Path("/state/.fullmag/runtime-service/process-tree.json")
+MAX_BACKEND_RECEIPT_BYTES = 512 * 1024
+# The native control probe may use three seconds before Windows-folder I/O.
+BACKEND_LIVENESS_TIMEOUT_SECONDS = 5.0
+
+
 FRONTEND_RECEIPT_PATH = Path("/state/development/frontend-dev-receipt.json")
 FRONTEND_RECEIPT_SCHEMA = "fullmag.docker-frontend-development-receipt.v1"
 FRONTEND_INTERNAL_HOST = "127.0.0.1"
@@ -193,13 +199,31 @@ def _check_frontend_dev_liveness(
         raise RuntimeError(f"frontend TCP liveness failed: {error}") from error
 
 
+def _check_backend_readiness(receipt_path: Path = BACKEND_RECEIPT_PATH) -> None:
+    receipt = _read_bounded_json(
+        receipt_path, "backend process-tree receipt", MAX_BACKEND_RECEIPT_BYTES
+    )
+    if (receipt.get("schema") != "fullmag.docker-process-tree.v1"
+            or receipt.get("state") != "ready"):
+        raise RuntimeError("backend supervisor has not confirmed startup readiness")
+    with urllib.request.urlopen("http://127.0.0.1:8081/healthz", timeout=2) as response:
+        if response.status != 200:
+            raise RuntimeError("backend API is unavailable")
+    with urllib.request.urlopen(
+        "http://127.0.0.1:8081/v2/platform/runtime-service",
+        timeout=BACKEND_LIVENESS_TIMEOUT_SECONDS,
+    ) as response:
+        status = json.load(response)
+        if (response.status != 200
+                or status.get("schema_version") != "application_service_status.v1"
+                or status.get("state") != "ready"
+                or status.get("configured") is not True):
+            raise RuntimeError("native backend readiness is not confirmed")
+
+
 def _run() -> None:
     if os.environ.get("FULLMAG_DOCKER_ROLE") != "frontend":
-        with urllib.request.urlopen("http://127.0.0.1:8081/healthz", timeout=2) as response:
-            assert response.status == 200
-        with urllib.request.urlopen("http://127.0.0.1:8081/v2/platform/runtime-service", timeout=2) as response:
-            status = json.load(response)
-            assert status["state"] == "ready" and status["configured"] is True
+        _check_backend_readiness()
     if os.environ.get("FULLMAG_DOCKER_FRONTEND") == "dev":
         _check_frontend_dev_liveness()
 

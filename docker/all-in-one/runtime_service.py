@@ -43,7 +43,11 @@ MAX_HOST_LEDGER_BYTES = 8 * 1024 * 1024
 CONFIG_RELATIVE = Path(".fullmag/runtime-service/docker-all.json")
 MAX_JSON_BYTES = 256 * 1024
 MAX_HTTP_BYTES = 4 * 1024 * 1024
-STARTUP_LIVENESS_GRACE_SECONDS = 10.0
+# The native control probe is bounded at three seconds.  Keep the Python
+# request budget above that limit so Windows-folder I/O cannot turn a healthy
+# native probe into a transport timeout at the API boundary.
+API_LIVENESS_TIMEOUT_SECONDS = 5.0
+STARTUP_LIVENESS_GRACE_SECONDS = 30.0
 # Process limits for lifecycle calls whose work includes Windows-folder (9p)
 # I/O.  The accepted-store bootstrap and diagnostic service-status call can
 # legitimately outlive the normal API probe on that mount.
@@ -1236,7 +1240,10 @@ def _probe_api_identity(
 
 
 def _probe_api_liveness(
-    port: int, expected_identity: Mapping[str, Any], *, timeout: float = 2.0
+    port: int,
+    expected_identity: Mapping[str, Any],
+    *,
+    timeout: float = API_LIVENESS_TIMEOUT_SECONDS,
 ) -> None:
     """Check the thin authoritative runtime resource and immutable API headers."""
 
@@ -1300,7 +1307,7 @@ def _wait_for_api_liveness(
     if timeout <= 0:
         _fail("API liveness startup grace must be positive")
     deadline = time.monotonic() + timeout
-    last: RuntimeServiceNotReady | None = None
+    last: BaseException | None = None
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1309,11 +1316,15 @@ def _wait_for_api_liveness(
             unknown = RuntimeServiceUnknown(
                 f"API runtime-service did not become ready during startup grace: {last}"
             )
-            unknown.liveness_observation = last.liveness_observation
+            observation = getattr(last, "liveness_observation", None)
+            if isinstance(observation, dict):
+                unknown.liveness_observation = observation
             raise unknown from last
         try:
             _probe_api_liveness(
-                port, expected_identity, timeout=min(2.0, remaining)
+                port,
+                expected_identity,
+                timeout=min(API_LIVENESS_TIMEOUT_SECONDS, remaining),
             )
             return
         except RuntimeServiceNotReady as error:
@@ -1327,6 +1338,13 @@ def _wait_for_api_liveness(
                 last = error
             else:
                 raise
+        except (RuntimeServiceTransportError, OSError) as error:
+            if handle is None:
+                raise
+            # A transport timeout is retryable only while the exact pinned
+            # native owner remains readable.  Otherwise startup fails closed.
+            _assert_pinned_ready_owner(handle)
+            last = error
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             continue
@@ -1646,7 +1664,11 @@ def check(handle: RuntimeHandle, *, full_api_probe: bool = True) -> None:
         # A full identity probe is periodic, but the thin native liveness
         # proof is required on every cycle so a full probe cannot mask a
         # persistent live_probe_failed observation.
-        _probe_api_liveness(handle.api_port, expected_identity, timeout=2.0)
+        _probe_api_liveness(
+            handle.api_port,
+            expected_identity,
+            timeout=API_LIVENESS_TIMEOUT_SECONDS,
+        )
     except (RuntimeServiceError, OSError) as error:
         if isinstance(error, RuntimeServiceUnknown):
             raise

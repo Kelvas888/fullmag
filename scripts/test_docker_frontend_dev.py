@@ -151,6 +151,43 @@ def isolated(module):
                 setattr(module, name, value)
 
 
+class BackendHealthcheckContractTests(TestCase):
+    def test_native_ready_cannot_bypass_unconfirmed_supervisor_startup(self):
+        health = load_healthcheck_module()
+        with tempfile.TemporaryDirectory(prefix="fullmag-backend-health-") as raw:
+            receipt = Path(raw) / "process-tree.json"
+            for state in ("starting", "failed_outcome_retained"):
+                receipt.write_text(json.dumps({
+                    "schema": "fullmag.docker-process-tree.v1", "state": state,
+                }), encoding="utf-8")
+                with patch.object(health.urllib.request, "urlopen") as request:
+                    with self.assertRaisesRegex(RuntimeError, "supervisor"):
+                        health._check_backend_readiness(receipt)
+                request.assert_not_called()
+
+    def test_confirmed_supervisor_still_requires_live_native_readiness(self):
+        health = load_healthcheck_module()
+        with tempfile.TemporaryDirectory(prefix="fullmag-backend-health-") as raw:
+            receipt = Path(raw) / "process-tree.json"
+            receipt.write_text(json.dumps({
+                "schema": "fullmag.docker-process-tree.v1", "state": "ready",
+            }), encoding="utf-8")
+            for state in ("ready", "observation_unknown"):
+                responses = [io.BytesIO(b""), io.BytesIO(json.dumps({
+                    "schema_version": "application_service_status.v1",
+                    "configured": True, "state": state,
+                }).encode())]
+                for response in responses:
+                    response.status = 200
+                with patch.object(health.urllib.request, "urlopen", side_effect=responses) as request:
+                    if state == "ready":
+                        health._check_backend_readiness(receipt)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "native backend"):
+                            health._check_backend_readiness(receipt)
+                self.assertGreater(request.call_args.kwargs["timeout"], 3)
+
+
 class FrontendDevContractTests(TestCase):
     def setUp(self):
         self.module = load_module()

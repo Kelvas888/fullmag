@@ -947,6 +947,10 @@ class DockerRuntimeContract(unittest.TestCase):
         self.assertEqual(handle.owner, owner)
         read.assert_called_once()
         liveness.assert_called_once()
+        self.assertEqual(
+            liveness.call_args.kwargs["timeout"],
+            service.STARTUP_LIVENESS_GRACE_SECONDS,
+        )
         status.assert_not_called()
 
     def test_start_rejects_owner_change_before_startup_liveness(self):
@@ -1018,6 +1022,49 @@ class DockerRuntimeContract(unittest.TestCase):
         owner_proof.assert_called_once_with(handle)
         sleep.assert_called_once()
         cli.assert_not_called()
+
+    def test_startup_liveness_retries_transport_only_with_pinned_owner(self):
+        service = self.load_service()
+        identity = {"api_instance_id": "instance", "api_contract_version": "1.0.0"}
+        owner = {"owner_token": "known", "children": [{"role": "compute", "pid": 3}]}
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
+        transport = service.RuntimeServiceTransportError("API probe timed out")
+        with patch.object(service, "_probe_api_liveness",
+                          side_effect=[transport, None]) as probe, \
+                patch.object(service, "_assert_pinned_ready_owner") as owner_proof, \
+                patch.object(service, "_run_cli") as cli, \
+                patch.object(service.time, "sleep") as sleep:
+            service._wait_for_api_liveness(
+                8081, identity, timeout=service.STARTUP_LIVENESS_GRACE_SECONDS,
+                handle=handle,
+            )
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(
+            probe.call_args_list[0].kwargs["timeout"],
+            service.API_LIVENESS_TIMEOUT_SECONDS,
+        )
+        owner_proof.assert_called_once_with(handle)
+        sleep.assert_called_once()
+        cli.assert_not_called()
+
+    def test_startup_transport_expiry_is_unknown_without_liveness_observation(self):
+        service = self.load_service()
+        identity = {"api_instance_id": "instance", "api_contract_version": "1.0.0"}
+        owner = {"owner_token": "known", "children": [{"role": "compute", "pid": 3}]}
+        handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
+        clock = iter((0.0, 0.0, 2.0, 2.0))
+        with patch.object(service, "_probe_api_liveness",
+                          side_effect=service.RuntimeServiceTransportError("API probe timed out")) as probe, \
+                patch.object(service, "_assert_pinned_ready_owner") as owner_proof, \
+                patch.object(service.time, "monotonic", side_effect=clock), \
+                patch.object(service.time, "sleep"):
+            with self.assertRaisesRegex(service.RuntimeServiceUnknown, "timed out") as caught:
+                service._wait_for_api_liveness(
+                    8081, identity, timeout=1.0, handle=handle
+                )
+        probe.assert_called_once()
+        owner_proof.assert_called_once_with(handle)
+        self.assertFalse(hasattr(caught.exception, "liveness_observation"))
 
     def test_startup_liveness_grace_does_not_retry_identity_failure(self):
         service = self.load_service()
@@ -1215,13 +1262,18 @@ class DockerRuntimeContract(unittest.TestCase):
             ],
         }
         handle = service.RuntimeHandle(service.RuntimePaths(), {}, owner, 8081, identity)
-        with patch.object(service, "_probe_api_liveness"), \
+        with patch.object(service, "_probe_api_liveness") as liveness, \
                 patch.object(service, "_read_json", return_value=owner) as read, \
                 patch.object(service, "_run_cli") as cli, \
                 patch.object(service, "_service_status") as status:
             service.check(handle, full_api_probe=False)
         self.assertGreaterEqual(read.call_count, 1)
         self.assertTrue(str(read.call_args.args[0]).endswith("runtime-services/OWNER.json"))
+        liveness.assert_called_once_with(
+            8081,
+            identity,
+            timeout=service.API_LIVENESS_TIMEOUT_SECONDS,
+        )
         cli.assert_not_called()
         status.assert_not_called()
 

@@ -77,13 +77,14 @@ services:
     tmpfs: ["/tmp:rw,nosuid,nodev,size=512m"]
     healthcheck:
       # Backend startup is bounded by accepted-store bootstrap (180s), API
-      # binding (60s), service-ensure (90s), and pinned API liveness (10s).
-      # Keep a 20s scheduling margin without weakening the readiness command
-      # or its retry policy.
+      # binding (60s), service-ensure (90s), and pinned API liveness (30s).
+      # Keep a 30s scheduling margin without weakening the readiness command
+      # or its retry policy. The command covers healthz (2s), native status
+      # (5s), and Python/receipt overhead within its 10s deadline.
       test: ["CMD", "/usr/local/bin/python3", "/opt/fullmag/healthcheck.py"]
       interval: 5s
-      timeout: 5s
-      start_period: 360s
+      timeout: 10s
+      start_period: 390s
       retries: 6
     networks: [fullmag]
 

@@ -62,5 +62,5 @@ WORKDIR /state
 USER 65532:65532
 EXPOSE 8080 8081
 ENTRYPOINT ["/usr/local/bin/python3", "/opt/fullmag/entrypoint.py"]
-HEALTHCHECK --interval=5s --timeout=5s --start-period=30s --retries=6 \
+HEALTHCHECK --interval=5s --timeout=10s --start-period=390s --retries=6 \
     CMD /usr/local/bin/python3 /opt/fullmag/healthcheck.py
