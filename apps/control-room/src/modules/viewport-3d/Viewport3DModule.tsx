@@ -1,4 +1,5 @@
 "use client";
+import { artifactRenderedSurfaceRanges } from "./model/artifactFieldOverlayModel";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/Select";
 import { artifactInspectionQuantity } from "@/kernel/visualization/artifactFieldSelection";
 import type { ArtifactFieldOverlayModel } from "./model/artifactFieldOverlayModel";
@@ -2338,7 +2339,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   );
   const displayedColorbarLegends = artifactField.historical ? resolveArtifactFieldColorbars(artifactField.model) : colorbarLegends;
   const renderedScalarRanges = useMemo(
-    () =>
+    () => artifactField.historical ? artifactRenderedSurfaceRanges(artifactField.model) :
       initialColorbarPlans.flatMap((plan) => {
         const range = colorbarRangeStates.get(plan.groupKey)?.range;
         if (!range) return [];
@@ -2358,7 +2359,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             : null,
         });
       }),
-    [colorbarParts, colorbarRangeStates, initialColorbarPlans],
+    [artifactField.historical, artifactField.model, colorbarParts, colorbarRangeStates, initialColorbarPlans],
   );
   useEffect(() => {
     setRetainedViewport3DColorbarPlans(

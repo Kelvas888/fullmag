@@ -63,4 +63,35 @@ check("failed refresh cannot expose a retained historical range",()=>{currentRes
 check("ordinary reader keeps its previous resource contract",()=>{const value=readMeta({historical:false,query:null,identityKey:null,expectedOwner:null});assert.strictEqual(value,currentResource);assert.equal(lastQuery.scope_kind,"object");assert.equal(lastQuery.strictErrors,false);});
 check("invalid advertised historical contract never enables an ordinary reader",()=>{for(const mutate of [c=>{c.quantities[0].unit="1/m";},c=>{c.quantities[0].n_comp=1;},c=>{c.quantities[0].resolved_capability.carriers=[];},c=>{c.quantities[0].resolved_capability.provider="unavailable";},c=>{c.quantities.push(structuredClone(c.quantities[0]));}]){const c=catalog("H_ant");mutate(c);const binding=bind({catalog:c,quantityId:"H_ant",selection:pin,sessionIdentity:pin.identity,targetScope});assert.equal(binding.historical,true);assert.equal(binding.query,null);const value=readMeta(binding);assert.equal(lastQuery.enabled,false);assert.equal(value.data,null);assert.equal(value.status,"idle");}});
 check("catalog refresh failure keeps retained historical identity and blocks requests",()=>{const input={catalog:catalog("H_ant"),quantityId:"H_ant",selection:pin,sessionIdentity:pin.identity,targetScope};const ready=bind(input);assert.ok(ready.query);for(const state of ["loading","refreshError"]){const blocked=bind({...input,catalogReady:false});assert.equal(blocked.historical,true,state);assert.equal(blocked.query,null);assert.equal(blocked.identityKey,null);const value=readMeta(blocked);assert.equal(lastQuery.enabled,false);assert.equal(value.data,null);assert.equal(value.status,"idle");}assert.equal(bind(input).identityKey,ready.identityKey);});
+
+const rangeKey=entry.namespace.artifactSurfaceRangeKey;
+check("rendered surface identity separates projection and every immutable owner pin",()=>{
+ const b=bindPin(), key=rangeKey(b.expectedOwner,b.query,"raw_nodal");
+ assert.equal(key,rangeKey(b.expectedOwner,b.query,undefined));assert.notEqual(key,rangeKey(b.expectedOwner,b.query,"surface_faces"));
+ for(const field of Object.keys(b.expectedOwner))assert.notEqual(key,rangeKey({...b.expectedOwner,[field]:"changed"},b.query,"raw_nodal"),field);
+ for(const field of ["carrier_id","expected_carrier_revision","scope_kind","scope_id"])assert.notEqual(key,rangeKey(b.expectedOwner,{...b.query,[field]:"changed"},"raw_nodal"),field);
+ assert.equal(rangeKey(null,b.query,"raw_nodal"),null);assert.equal(rangeKey(b.expectedOwner,null,"raw_nodal"),null);
+});
+const storeModule=load(new URL("modules/viewport-3d/viewport3dStore.ts",root));
+await storeModule.link((name,parent)=>{
+ if(name==="react")return new vm.SyntheticModule(["useCallback","useSyncExternalStore"],function(){this.setExport("useCallback",fn=>fn);this.setExport("useSyncExternalStore",(_subscribe,snapshot)=>snapshot());});
+ // Visual-profile initialization is unrelated to range selection; no WebGL dependency is loaded.
+ if(name==="./viewport3dVisualProfile")return new vm.SyntheticModule(["DEFAULT_VIEWPORT_3D_VISUAL_PROFILE_ID"],function(){this.setExport("DEFAULT_VIEWPORT_3D_VISUAL_PROFILE_ID","interactive");});
+ return load(name.startsWith("@/")?new URL(`${name.slice(2)}.ts`,root):new URL(`${name}.ts`,parent.identifier));
+});await storeModule.evaluate();
+check("rendered range store isolates live, owner and projection identities",()=>{
+ const b=bindPin(),inspectionKey=rangeKey(b.expectedOwner,b.query,"surface_faces"), range={min:-2,max:3};
+ const query={quantityId:"H_ant",component:"x",scopeKind:"full",scopeId:null,inspectionKey};
+ const row={...query,range}, resolve=storeModule.namespace.resolveViewport3DRenderedScalarRange;
+ assert.strictEqual(resolve([row],query),range);
+ for(const key of [undefined,"foreign",rangeKey(b.expectedOwner,b.query,"raw_nodal")])assert.equal(resolve([row],{...query,inspectionKey:key}),null);
+ assert.equal(resolve([{...row,inspectionKey:undefined}],query),null);
+ assert.strictEqual(resolve([{...row,inspectionKey:undefined}],{...query,inspectionKey:undefined}),range);
+});
+check("owner-only range change notifies subscribers even with identical numeric bounds",()=>{
+ const store=storeModule.namespace.viewport3dStore;let calls=0;const stop=store.subscribe(()=>calls++);
+ const row={quantityId:"H_ant",component:"x",scopeKind:"full",scopeId:null,inspectionKey:"owner-a",range:{min:0,max:1}};
+ store.setRenderedScalarRanges([row]);const before=calls;store.setRenderedScalarRanges([{...row}]);assert.equal(calls,before);
+ store.setRenderedScalarRanges([{...row,inspectionKey:"owner-b"}]);assert.equal(calls,before+1);stop();store.setRenderedScalarRanges([]);
+});
 console.log(JSON.stringify({status:"passed",checks,unit_test_compilation:false}));

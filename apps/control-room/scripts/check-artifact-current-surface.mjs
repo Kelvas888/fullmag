@@ -204,4 +204,13 @@ check("unsupported thickness projection is explicit only when a surface is reque
  const f=fixture();f.settings.surfaceProjectionMode="thickness_average_z";assert.throws(()=>render(f),/Thickness projection/);
  f.settings.shaderVisible=false;assert.equal(render(f).surface.values,f.field.values);
 });
+check("published surface range carries projected bounds and exact immutable owner",()=>{
+ const f=fixture();f.settings.visible=true;f.settings.surfaceProjectionMode="surface_faces";const model=render(f);
+ const [row]=entry.namespace.artifactRenderedSurfaceRanges(model);assert.equal(row.range.min,model.minimum);assert.equal(row.range.max,model.maximum);
+ assert.equal(row.component,"x");assert.equal(row.scopeKind,"object");assert.equal(row.scopeId,"object_id");
+ const key=cache.get(new URL("kernel/visualization/artifactFieldSelection.ts",root).href).namespace.artifactSurfaceRangeKey;
+ assert.equal(row.inspectionKey,key({...model.locator.owner,quantityId:"J_charge"},{carrier_id:model.locator.carrier_id,expected_carrier_revision:model.locator.carrier_revision,scope_kind:"object",scope_id:"object_id"},"surface_faces"));
+ for(const settings of [{...f.settings,visible:false},{...f.settings,shaderVisible:false},{...f.settings,surfaceColorSource:"solid"}])assert.deepEqual(entry.namespace.artifactRenderedSurfaceRanges(build(carrier.admitArtifactFieldCarrier(f.locator,f.field,f.headers,f.topology,f.geometry),settings)),[]);
+ assert.deepEqual(entry.namespace.artifactRenderedSurfaceRanges(null),[]);
+});
 console.log(JSON.stringify({status:"passed",checks,unit_test_compilation:false,browser_qualification:false}));

@@ -110,3 +110,15 @@ export function artifactInspectorMetadataMatchesBinding(metadata: FieldMetaResou
     locator.carrier_scope_kind === query.scope_kind && (locator.carrier_scope_id ?? null) === query.scope_id &&
     (quantityId === "V_electric" ? locator.indexing === "source_nodes" : quantityId === "J_charge" ? locator.indexing === "tet4_cell_local_nodes" : ["sample_nodes", "point_samples"].includes(locator.indexing));
 }
+
+/** Presentation identity is pinned to the same immutable owner as Inspector metadata. */
+export function artifactSurfaceRangeKey(
+  owner: ArtifactInspectorFieldBinding["expectedOwner"],
+  carrier: Pick<ArtifactInspectorFieldQuery, "carrier_id" | "expected_carrier_revision" | "scope_kind" | "scope_id"> | null,
+  projectionMode: string | undefined,
+): string | null {
+  if (!owner || !carrier) return null;
+  return JSON.stringify(["artifact-surface", owner.session_id, owner.session_epoch, owner.request_scope_epoch,
+    owner.run_id, owner.authored_stage_id, owner.runtime_stage_id, owner.object_id, owner.quantityId,
+    carrier.carrier_id, carrier.expected_carrier_revision, carrier.scope_kind, carrier.scope_id, projectionMode ?? "raw_nodal"]);
+}

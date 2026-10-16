@@ -267,6 +267,13 @@ try {
   await projectionControl.selectOption("surface_faces");
   await page.waitForFunction(() => window.__artifactOverlayCanvas?.().surfaceVertexCounts.every(count => count === 12));
   const faceSurface = await read();
+  await page.waitForFunction(() => {
+    const ranges = [...document.querySelectorAll('aside[aria-label="Shared inspection controls"] [aria-label^="Scalar color range:"]')].map(node => node.getAttribute("aria-label"));
+    return ranges.some(label => label.includes("-1.333") && label.includes("0.3333"));
+  });
+  const projectedInspectorLabels = await rangeLabels.evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label")));
+  assert.ok(projectedInspectorLabels.some(label => label.includes("0") && label.includes("4")));
+
   assert.equal(faceSurface.canvas.lost, false); assert.ok(faceSurface.canvas.width > 0 && faceSurface.canvas.height > 0);
   assert.deepEqual(faceSurface.state.values, rawSurface.state.values);
   assert.deepEqual(faceSurface.canvas.pointBufferIds, rawSurface.canvas.pointBufferIds);
@@ -276,7 +283,22 @@ try {
   await screenshot("08-owned-face-projection");
   await projectionControl.selectOption("raw_nodal");
   await page.waitForFunction(() => window.__artifactOverlayCanvas?.().surfaceVertexCounts.every(count => count === 5));
+  await page.waitForFunction(expected => JSON.stringify([...document.querySelectorAll('aside[aria-label="Shared inspection controls"] [aria-label^="Scalar color range:"]')].map(node => node.getAttribute("aria-label"))) === JSON.stringify(expected), initialLabels);
+  checks.push("Historical Inspector surface scale follows the owned projection and restores raw bounds; the independent vector range remains unchanged");
   checks.push("Shared face projection expands only the owned H surface, preserves point buffers, vector transforms, raw values and materials, and restores raw nodal display without binary reads");
+  await page.evaluate(() => { window.__sharedRangeOwnerRoot = document.querySelector('aside[aria-label="Shared inspection controls"]'); });
+  const beforeForeignScale = await read();
+  for (const mode of ["foreign", "live"]) {
+    await page.evaluate(mode => window.__artifactOverlayFixture.replaceSurfaceRangeOwner(mode), mode);
+    await page.waitForFunction(() => document.querySelectorAll('aside[aria-label="Shared inspection controls"] [aria-label^="Scalar color range:"]').length === 1);
+    assert.equal(await page.evaluate(() => window.__sharedRangeOwnerRoot === document.querySelector('aside[aria-label="Shared inspection controls"]')), true);
+    assert.equal(await controls.getByText(/9999/).count(), 0);
+    await page.evaluate(() => window.__artifactOverlayFixture.replaceSurfaceRangeOwner("restore"));
+    await page.waitForFunction(() => document.querySelectorAll('aside[aria-label="Shared inspection controls"] [aria-label^="Scalar color range:"]').length === 2);
+  }
+  assert.deepEqual(await rangeLabels.evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label"))), initialLabels);
+  assert.equal((await read()).state.calls.length, beforeForeignScale.state.calls.length);
+  checks.push("Foreign-owner and unpinned live ranges are rejected by the actual historical Inspector without raw fallback, remount or network reads; exact owner restores the scale");
   const ownerReads = final.state.calls.filter(call => call.component !== "full" && call.path.endsWith("/meta"));
   for (const q of ["H_ant", "J_charge", "V_electric"]) {
     const reads = ownerReads.filter(call => call.path.includes(q)); assert.ok(reads.length > 0, q);

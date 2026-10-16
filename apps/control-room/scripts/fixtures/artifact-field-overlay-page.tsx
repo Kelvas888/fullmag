@@ -22,6 +22,8 @@ import { VisualizationDebugController } from "@/kernel/visualization/Visualizati
 import { VisualizationSurfaceColoringSection, VisualizationVectorsSection } from "@/modules/inspector/panels/ObjectVisualizationTargetSection";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
 import { useArtifactFieldOverlay } from "@/modules/viewport-3d/hooks/useArtifactFieldOverlay";
+import { artifactRenderedSurfaceRanges } from "@/modules/viewport-3d/model/artifactFieldOverlayModel";
+import { viewport3dStore } from "@/modules/viewport-3d/viewport3dStore";
 import { resolveArtifactFieldColorbars, Viewport3DColorbar } from "@/modules/viewport-3d/Viewport3DModule";
 import { ArtifactFieldLayer } from "@/modules/viewport-3d/layers/ArtifactFieldLayer";
 import { VectorGlyphDerivedBufferCacheProvider } from "@/modules/viewport-3d/layers/vectorGlyphDerivedBufferRuntime";
@@ -41,7 +43,7 @@ const subscribe = () => () => {};
 const fixtureTarget = { id: "antenna", kind: "object" as const };
 type Quantity = "H_ant" | "J_charge" | "V_electric";
 type FixtureRead = { quantity: Quantity; unit: string | null; model: boolean; count: number; triangles: number; minimum: number | null; maximum: number | null; values: number[]; glyphCount: number; pointCount: number; availableGlyphCount: number; surfaceOffsetDistance: number; scope: string; calls: { path: string; binary: boolean; carrier: string | null; component: string | null; stage: string | null; revision: string | null }[]; unexpected: string[]; historical: boolean; error: string | null; resources: ReturnType<Viewport3DResourceTracker["getSnapshot"]> };
-declare global { interface Window { __artifactOverlayFixture?: { read(): FixtureRead }; __artifactOverlayCanvas?: () => { lost: boolean; width: number; height: number; groups: number; surfaceTriangles: number; geometryIds: string[]; materialIds: string[]; paletteIds: string[]; surfaceOpacity: number; paletteName: string; surfacePresentation: Array<{ mode: string; color: string }>; scalarSurface: { normalized: number[]; opacity: number; paletteId: number; materialId: string } | null; auxiliaryMaterials: Array<{ id: string; version: number; opacity: number; transparent: boolean }>; frame: number; pointCounts: number[]; pointBufferIds: string[]; glyphCounts: number[]; glyphMatrices: number[][]; glyphColors: number[][]; glyphInstances: number }; } }
+declare global { interface Window { __artifactOverlayFixture?: { read(): FixtureRead; replaceSurfaceRangeOwner(mode: "foreign" | "live" | "restore"): void }; __artifactOverlayCanvas?: () => { lost: boolean; width: number; height: number; groups: number; surfaceTriangles: number; geometryIds: string[]; materialIds: string[]; paletteIds: string[]; surfaceOpacity: number; paletteName: string; surfacePresentation: Array<{ mode: string; color: string }>; surfaceVertexCounts: number[]; scalarSurface: { normalized: number[]; opacity: number; paletteId: number; materialId: string } | null; auxiliaryMaterials: Array<{ id: string; version: number; opacity: number; transparent: boolean }>; frame: number; pointCounts: number[]; pointBufferIds: string[]; glyphCounts: number[]; glyphMatrices: number[][]; glyphColors: number[][]; glyphInstances: number }; } }
 
 function carrier(q: Quantity) {
   const digest = (q === "V_electric" ? "a" : q === "H_ant" ? "b" : "c").repeat(64);
@@ -185,9 +187,13 @@ function View({ fixture }: { fixture: ReturnType<typeof makeFixture> }) {
   const target = fixtureTarget;
   const controls = { artifactFieldBinding: binding, fieldCatalog: { data: null, status: "ready" }, fieldCatalogLoading: false, fieldMetaTarget: target,
     patch, patchColor: (field: string, value: string) => { void patch({ [field]: value }); }, patchNumber: (field: string, value: number) => { void patch({ [field]: value }); }, isFieldPending: () => false, sectionDisabled: () => false, settings, target };
+  useEffect(() => { viewport3dStore.setRenderedScalarRanges(artifactRenderedSurfaceRanges(result.model)); return () => viewport3dStore.setRenderedScalarRanges([]); }, [result.model]);
   useEffect(() => {
     window.__artifactOverlayFixture = { read: () => ({ quantity, unit: result.model?.unit ?? null, model: Boolean(result.model), count: result.model?.count ?? 0, triangles: (result.model?.surfaceTriangles?.length ?? 0) / 3,
-      minimum: result.model?.minimum ?? null, maximum: result.model?.maximum ?? null, values: Array.from(result.model?.scalarValues ?? []), glyphCount: result.model?.glyphCount ?? 0, pointCount: result.model?.pointSampleIndices.length ?? 0, availableGlyphCount: result.model?.availableGlyphCount ?? 0, surfaceOffsetDistance: result.model?.surfaceOffsetDistance ?? 0, scope: settings.geometryScope, calls: fixture.calls, unexpected: fixture.unexpected, historical: result.historical, error: result.error, resources: { ...tracker.getSnapshot() } }) };
+      minimum: result.model?.minimum ?? null, maximum: result.model?.maximum ?? null, values: Array.from(result.model?.scalarValues ?? []), glyphCount: result.model?.glyphCount ?? 0, pointCount: result.model?.pointSampleIndices.length ?? 0, availableGlyphCount: result.model?.availableGlyphCount ?? 0, surfaceOffsetDistance: result.model?.surfaceOffsetDistance ?? 0, scope: settings.geometryScope, calls: fixture.calls, unexpected: fixture.unexpected, historical: result.historical, error: result.error, resources: { ...tracker.getSnapshot() } }), replaceSurfaceRangeOwner: mode => {
+      const ranges = artifactRenderedSurfaceRanges(result.model);
+      viewport3dStore.setRenderedScalarRanges(mode === "restore" ? ranges : ranges.map(row => ({ ...row, inspectionKey: mode === "live" ? undefined : "foreign-owner", range: { min: -9999, max: 9999 } })));
+    } };
   }, [quantity, result, fixture, tracker, settings.geometryScope]);
   useEffect(() => () => { tracker.disposeAll(); delete window.__artifactOverlayFixture; }, [tracker]);
   return <main><h1>Artifact field overlay · controlled transport</h1><label>Quantity<select aria-label="Fixture quantity" value={quantity} onChange={e => setQuantity(e.target.value as Quantity)}><option>H_ant</option><option>J_charge</option><option>V_electric</option></select></label>

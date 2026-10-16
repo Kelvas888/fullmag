@@ -3,7 +3,7 @@ import { buildAveragedSurfaceNodeNormals, resolveVectorSurfaceOffsetDistance } f
 import { buildVertexScalarColors } from "../viewport3dFieldMapping";
 import type { StageExecutionResource } from "@/kernel/api/apiTypes";
 import type { ArtifactFieldSelection } from "@/kernel/visualization/artifactFieldSelection";
-import { artifactSelectionMatchesSession } from "@/kernel/visualization/artifactFieldSelection";
+import { artifactSurfaceRangeKey, artifactSelectionMatchesSession } from "@/kernel/visualization/artifactFieldSelection";
 import { scalarColorRgb } from "@/shared/visualization/scalarColorPalette";
 import type { VisualizationTargetSettings } from "@/kernel/visualization/ObjectVisualizationController";
 import { deviceBoundary, MAX_ANTENNA_DISPLAY_SAMPLES, MAX_ANTENNA_DISPLAY_CELLS, MAX_ANTENNA_DISPLAY_PAYLOAD_BYTES } from "./antennaFieldOverlayModel";
@@ -160,4 +160,17 @@ export function artifactInspectionOwnerPlan(definitions: ReadonlyArray<{ id?: st
   }
   if (candidates.length === 1) return { candidates, selected: candidates[0], error: null };
   return { candidates, selected: null, error: candidates.length > 1 ? "Multiple inspection owners exist. Select a source and execution." : null };
+}
+
+/** Historical presentation never aliases an unpinned live-field scale. */
+export function artifactRenderedSurfaceRanges(model: ArtifactFieldOverlayModel | null) {
+  if (!model || !model.settings.visible || !model.settings.shaderVisible || model.settings.surfaceColorSource === "solid") return [];
+  const locator = model.locator;
+  const inspectionKey = artifactSurfaceRangeKey({ ...locator.owner, quantityId: model.quantityId }, {
+    carrier_id: locator.carrier_id, expected_carrier_revision: locator.carrier_revision,
+    scope_kind: locator.carrier_scope_kind, scope_id: locator.carrier_scope_id,
+  }, model.settings.surfaceProjectionMode);
+  return [{ component: model.intent.component, quantityId: model.quantityId, inspectionKey,
+    scopeKind: locator.carrier_scope_kind, scopeId: locator.carrier_scope_id,
+    range: { min: model.minimum, max: model.maximum } }];
 }

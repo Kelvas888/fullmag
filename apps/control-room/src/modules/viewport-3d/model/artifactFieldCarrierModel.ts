@@ -5,7 +5,7 @@ interface ArtifactFieldLocator {
   carrier_scope_kind: "object" | "full"; carrier_scope_id: string | null;
   carrier_id: string; carrier_digest: string; carrier_revision: string;
   indexing: string; sample_count: number; coordinate_frame: "world"; coordinate_unit: "m"; topology_binary_schema: "FMMT.v2";
-  owner: Record<string, unknown> & { runtime_stage_id: string; object_id: string; source_digest: string; content_digest: string; historical_inspection: true };
+  owner: Record<string, unknown> & Record<"session_id" | "session_epoch" | "request_scope_epoch" | "run_id" | "runtime_stage_id" | "authored_stage_id" | "module_id" | "object_id" | "output_id" | "source_digest" | "content_digest" | "native_mesh_identity" | "native_topology_identity", string> & { historical_inspection: true };
 }
 const record = (value: unknown): Record<string, unknown> => {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Artifact carrier requires typed metadata.");

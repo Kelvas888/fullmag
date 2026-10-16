@@ -48,6 +48,7 @@ interface Viewport3DScalarColorbarLegend {
 }
 
 export interface Viewport3DRenderedScalarRange {
+  inspectionKey?: string | null;
   component: string;
   quantityId: string;
   range: { max: number; min: number };
@@ -56,6 +57,7 @@ export interface Viewport3DRenderedScalarRange {
 }
 
 export interface Viewport3DRenderedScalarRangeQuery {
+  inspectionKey?: string | null;
   component: string | null | undefined;
   quantityId: string;
   scopeId: string | null | undefined;
@@ -585,7 +587,7 @@ export function useViewport3DCommandState(): Viewport3DCommandState {
 export function useViewport3DRenderedScalarRange(
   query: Viewport3DRenderedScalarRangeQuery,
 ): Viewport3DRenderedScalarRange["range"] | null {
-  const { component, quantityId, scopeId, scopeKind } = query;
+  const { component, quantityId, scopeId, scopeKind, inspectionKey } = query;
   const getSnapshot = useCallback(
     () =>
       viewport3dStore.getRenderedScalarRange({
@@ -593,8 +595,9 @@ export function useViewport3DRenderedScalarRange(
         quantityId,
         scopeId,
         scopeKind,
+        inspectionKey,
       }),
-    [component, quantityId, scopeId, scopeKind],
+    [component, quantityId, scopeId, scopeKind, inspectionKey],
   );
   return useSyncExternalStore(
     (onStoreChange) => viewport3dStore.subscribe(onStoreChange),
@@ -614,6 +617,7 @@ export function resolveViewport3DRenderedScalarRange(
   const match = ranges.find(
     (range) =>
       range.component === query.component &&
+      (range.inspectionKey ?? null) === (query.inspectionKey ?? null) &&
       resolveCanonicalQuantityId(range.quantityId) === quantityId &&
       range.scopeKind === scopeKind &&
       range.scopeId === scopeId,
@@ -650,6 +654,7 @@ function sameViewport3DRenderedScalarRanges(
     return (
       other !== undefined &&
       range.component === other.component &&
+      (range.inspectionKey ?? null) === (other.inspectionKey ?? null) &&
       range.quantityId === other.quantityId &&
       range.range.min === other.range.min &&
       range.range.max === other.range.max &&
