@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <set>
@@ -355,6 +357,12 @@ std::shared_ptr<const ChargeTraceSolution> ChargeTraceWorkspace::Impl::solve(
     mfem::Vector rhs(free_count), solution(free_count);
     rhs = 0.0;
     solution = 0.0;
+    // Diagnostics only: CG's internal norm is not the independent component norm.
+    bool cg_was_run = false;
+    int cg_iterations = 0;
+    double cg_initial_norm = std::numeric_limits<double>::quiet_NaN();
+    double cg_final_norm = std::numeric_limits<double>::quiet_NaN();
+    double global_rhs_l2_a = 0.0;
     if (free_count > 0) {
         mfem::SparseMatrix reduced_matrix(free_count);
         mfem::Array<int> columns;
@@ -373,6 +381,7 @@ std::shared_ptr<const ChargeTraceSolution> ChargeTraceWorkspace::Impl::solve(
         }
         reduced_matrix.Finalize();
         const double rhs_norm = rhs.Norml2();
+        global_rhs_l2_a = rhs_norm;
         if (!std::isfinite(rhs_norm)) {
             throw std::runtime_error("charge trace right-hand-side norm overflow");
         }
@@ -386,6 +395,10 @@ std::shared_ptr<const ChargeTraceSolution> ChargeTraceWorkspace::Impl::solve(
             solver.SetMaxIter(request.maximum_iterations);
             solver.SetPrintLevel(0);
             solver.Mult(rhs, solution);
+            cg_was_run = true;
+            cg_iterations = solver.GetNumIterations();
+            cg_initial_norm = solver.GetInitialNorm();
+            cg_final_norm = solver.GetFinalNorm();
             if (!solver.GetConverged()) throw std::runtime_error("charge trace H1 solve did not converge");
         }
         for (int dof = 0; dof < count; ++dof) {
@@ -447,6 +460,25 @@ std::shared_ptr<const ChargeTraceSolution> ChargeTraceWorkspace::Impl::solve(
         const long double relative = std::sqrt(norms.first) /
             std::max(std::sqrt(norms.second), 1.0e-30L);
         if (!std::isfinite(relative) || relative > request.algebraic_relative_tolerance) {
+            // The C ABI error buffer is 256 bytes; retain all numbers in stderr.
+            std::fprintf(stderr,
+                "charge trace component failed the independent H1 residual gate; "
+                "component_root=%d; stable_vertex_id=%llu; full_dofs=%d; quotient_dofs=%d; "
+                "free_dofs=%d; trace_relations=%zu; electrical_components=%zu; "
+                "component_residual_l2_a=%.21Le; component_rhs_l2_a=%.21Le; "
+                "denominator_floor_a=1e-30; denominator_a=%.21Le; relative_residual=%.21Le; "
+                "algebraic_relative_tolerance=%.17e; global_rhs_l2_a=%.17e; "
+                "cg_was_run=%d; cg_iterations=%d; cg_initial_norm=%.17e; cg_final_norm=%.17e; "
+                "maximum_iterations=%d\n",
+                component, static_cast<unsigned long long>(
+                    result->stable_vertex_identities.local_to_stable[
+                        static_cast<std::size_t>(dof_vertices[static_cast<std::size_t>(dof)])]),
+                count, trace.reduced_size, free_count, request.trace_relations.size(),
+                component_gauge_dof.size(), std::sqrt(norms.first), std::sqrt(norms.second),
+                std::max(std::sqrt(norms.second), 1.0e-30L), relative,
+                request.algebraic_relative_tolerance, global_rhs_l2_a, static_cast<int>(cg_was_run),
+                cg_iterations, cg_initial_norm, cg_final_norm, request.maximum_iterations);
+            std::fflush(stderr);
             throw std::runtime_error("charge trace component failed the independent H1 residual gate");
         }
         result->component_relative_residuals.push_back(static_cast<double>(relative));
