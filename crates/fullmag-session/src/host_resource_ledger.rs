@@ -8320,7 +8320,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_policy_rejects_ownerless_admission_in_legacy_v3_document() {
+    fn v2_policy_rejects_new_admission_in_legacy_v3_document() {
         let directory = tempfile::tempdir().unwrap();
         let root = ledger_root(directory.path());
         let mut policy = policy();
@@ -8362,7 +8362,7 @@ mod tests {
         let error = legacy.reserve(&request).unwrap_err();
         assert!(error
             .to_string()
-            .contains("host admission requires a pinned compute-node owner ID and epoch"));
+            .contains("v2 host admission requires a v4 runtime generation"));
     }
 
     #[test]
