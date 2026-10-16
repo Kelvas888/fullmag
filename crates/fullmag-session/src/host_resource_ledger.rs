@@ -3195,7 +3195,19 @@ impl HostResourceLedger {
                     && snapshot.boot_id == previous.boot_id
                     && snapshot.sample.collected_at <= previous.sample.collected_at
                 {
-                    bail!("compute-node snapshot sample time must advance within one boot");
+                    bail!(
+                        "compute-node snapshot sample time must advance within one boot: previous_collected_at={}, candidate_collected_at={}, previous_node_id={:?}, candidate_node_id={:?}, previous_boot_id={:?}, candidate_boot_id={:?}, previous_owner_epoch={}, candidate_owner_epoch={}, previous_host_owner_epoch={:?}, candidate_host_owner_epoch={:?}",
+                        previous.sample.collected_at,
+                        snapshot.sample.collected_at,
+                        previous.node_id,
+                        snapshot.node_id,
+                        previous.boot_id,
+                        snapshot.boot_id,
+                        previous.owner_epoch,
+                        snapshot.owner_epoch,
+                        previous.host_owner_epoch,
+                        snapshot.host_owner_epoch,
+                    );
                 }
                 snapshot.validate_successor_of(&previous)?;
             } else if snapshot.inventory_revision != 1 || snapshot.capabilities_revision != 1 {
@@ -3225,7 +3237,19 @@ impl HostResourceLedger {
                 && snapshot.boot_id == previous.boot_id
                 && snapshot.sample.collected_at <= previous.sample.collected_at
             {
-                bail!("compute-node snapshot sample time must advance within one boot");
+                bail!(
+                    "compute-node snapshot sample time must advance within one boot: previous_collected_at={}, candidate_collected_at={}, previous_node_id={:?}, candidate_node_id={:?}, previous_boot_id={:?}, candidate_boot_id={:?}, previous_owner_epoch={}, candidate_owner_epoch={}, previous_host_owner_epoch={:?}, candidate_host_owner_epoch={:?}",
+                    previous.sample.collected_at,
+                    snapshot.sample.collected_at,
+                    previous.node_id,
+                    snapshot.node_id,
+                    previous.boot_id,
+                    snapshot.boot_id,
+                    previous.owner_epoch,
+                    snapshot.owner_epoch,
+                    previous.host_owner_epoch,
+                    snapshot.host_owner_epoch,
+                );
             }
             snapshot.validate_successor_of(&previous)?;
         } else if snapshot.inventory_revision != 1 || snapshot.capabilities_revision != 1 {

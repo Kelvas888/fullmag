@@ -412,10 +412,26 @@ Nie usunięto wyników symulacji ani współdzielonego cache.
 
 ### Ostatni potwierdzony build i poprawka cache
 
-Build `64815e43fe4b408c9209d7e6c45b00f7` zakończył się `succeeded`, exit 0.
-Obejmuje pełny backend i poprawkę odzyskiwania konfiguracji zewnętrznej.
-Sukces kompilacji nie potwierdza uruchomienia tego pakietu: jego zastosowanie
-pozostaje w toku. Nie jest to pomiar szybkości trybu dev.
+Build release `dd1e867a397f4ba48c2e8b8db811c7e7` ze źródeł `291d736` zakończył
+się `succeeded`, exit 0; zbudował CLI, API i rozszerzenie Python. Nowy run
+`093108f2bcd14b75a103c8931961fa37` uruchomił dwie stałe usługi w projekcie
+`fullmag-worktree-docker-all-windows-20261014-f009a6a0b6d6e110`, na wspólnej
+prywatnej sieci. Frontend publikuje wyłącznie loopback `32871`; backend nie
+publikuje portów hosta. Poprzedni pusty store techniczny i jego receipt
+zachowano oraz sprawdzono hashami przed i po nowym starcie.
+
+Obie usługi osiągnęły początkowo `healthy`, lecz późniejsza publikacja próbki
+sprzętu została odrzucona: czas próbki nie wyprzedzał poprzedniej w obrębie
+jednego bootu. Nadzór zamknął API po `live_probe_failed`. Początkowy receipt
+`running/PASS` jest dowodem startu w danym momencie; bieżąca gotowość wymaga
+aktualnej obserwacji usługi. Działające połączenie UI–API nadal pozostaje
+`NOT VERIFIED`; samo grupowanie kontenerów jest potwierdzone.
+
+Commity `e9beea1` i `c81f298` zawierają live inputs, scoped bazę grupy oraz
+obsługę legalnie nieutworzonego checkpointu schedulera. Są zapisane na branchu
+zadania, ale pakiet binarny `291d736` ich nie zawiera. Build `backend-dev`,
+pomiar małej zmiany, trwałość scoped DB i wykonanie GPU wymagają osobnych
+dowodów. Wynik release nie jest pomiarem szybkości trybu dev.
 
 Commit `a37e7ab54f5ea11657b7ade4734b499f9090327d` usuwa kolejną przyczynę
 zbędnej kompilacji FEM. Zmienny hash snapshotu trafia do wygenerowanego nagłówka
