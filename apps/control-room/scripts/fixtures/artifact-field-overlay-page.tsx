@@ -1,11 +1,23 @@
 "use client";
 
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { Profiler, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { AntennaVisualizationPanel } from "@/modules/inspector/panels/antenna/AntennaVisualizationPanel";
+import { InspectorEditSessionProvider } from "@/modules/inspector/InspectorEditSession";
+import { VisualizationRegistrySyncController } from "@/kernel/visualization/VisualizationRegistrySyncController";
+import { CameraRegistryController, DEFAULT_CAMERA_REGISTRY_STATE } from "@/kernel/visualization/CameraRegistryController";
+import { AnalysisFieldOverlayController } from "@/kernel/visualization/AnalysisFieldOverlayController";
+import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
+import { LayoutController } from "@/kernel/layout/LayoutController";
+import { SelectionController } from "@/kernel/selection/SelectionController";
+import type { Selection } from "@/kernel/selection/selectionTypes";
+import { CommandRegistry } from "@/kernel/commands/CommandRegistry";
+import { AuthoringHistoryController } from "@/kernel/authoring/AuthoringHistoryController";
+import { VISUALIZATION_TARGET_COMMANDS } from "@/kernel/visualization/visualizationCommandContributions";
 import { useThree } from "@react-three/fiber";
 import { BufferGeometry, InstancedMesh, LineBasicMaterial, Mesh, MeshBasicMaterial, PointsMaterial, ShaderMaterial, Vector2 } from "three";
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
-import { DATA_DOMAIN_TOPOLOGY_PATH, DATA_FIELD_META_PATH, DATA_FIELD_VECTOR_PATH, SESSION_STATUS_PATH, SESSIONS_PATH, SIMULATION_STAGES_EXECUTION_PATH } from "@/kernel/api/apiPaths";
-import type { QuantityCatalogResource } from "@/kernel/api/apiTypes";
+import { DATA_DOMAIN_TOPOLOGY_PATH, DATA_FIELD_META_PATH, DATA_FIELD_VECTOR_PATH, DATA_FIELDS_PATH, DATA_QUANTITIES_PATH, DATA_FIELD_AVAILABILITY_PATH, MODEL_SCENE_PATH, VISUALIZATION_STATE_PATH, SESSION_STATUS_PATH, SESSIONS_PATH, SIMULATION_STAGES_EXECUTION_PATH } from "@/kernel/api/apiPaths";
+import type { QuantityCatalogResource, VisualizationStateResource, VisualizationStatePatch, SceneResource } from "@/kernel/api/apiTypes";
 import { decodeTopologyHeader, topologyByteLayout } from "@/kernel/api/codecs/topologyCodec";
 import { DiagnosticRecorderController } from "@/kernel/performance/diagnostic-recorder/DiagnosticRecorderController";
 import { RequestDiagnosticsController } from "@/kernel/api/RequestDiagnosticsController";
@@ -15,7 +27,7 @@ import { KernelContext } from "@/kernel/KernelContext";
 import type { KernelApi } from "@/kernel/types";
 import { ResourceInvalidationController } from "@/kernel/resources/ResourceInvalidationController";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
-import { ObjectVisualizationController, resolveGlobalObjectVisualizationSettings, visualizationTargetKey, type VisualizationTargetPatch } from "@/kernel/visualization/ObjectVisualizationController";
+import { ObjectVisualizationController, resolveGlobalObjectVisualizationSettings, resolveTargetVisualization, mergeVisualizationStateTargetOverride, visualizationTargetKey, type VisualizationTargetPatch } from "@/kernel/visualization/ObjectVisualizationController";
 import { artifactInspectorFieldBinding } from "@/kernel/visualization/artifactFieldSelection";
 import { useObjectVisualizationSelector } from "@/kernel/visualization/useObjectVisualization";
 import { VisualizationDebugController } from "@/kernel/visualization/VisualizationDebugController";
@@ -29,6 +41,7 @@ import { ArtifactFieldLayer } from "@/modules/viewport-3d/layers/ArtifactFieldLa
 import { VectorGlyphDerivedBufferCacheProvider } from "@/modules/viewport-3d/layers/vectorGlyphDerivedBufferRuntime";
 import { Viewport3DCanvas } from "@/modules/viewport-3d/Viewport3DCanvas";
 import { Viewport3DResourceTracker } from "@/modules/viewport-3d/viewport3dDiagnostics";
+import { createViewport3DRenderAdoptionRegistry } from "@/modules/viewport-3d/model/viewport3DRenderAdoptionRegistry";
 
 const instance = "66666666-6666-4666-8666-666666666666";
 const owner = { session_id: "artifact-overlay-fixture", session_epoch: "artifact-overlay-fixture@1", request_scope_epoch: `${instance}:1` };
@@ -42,6 +55,8 @@ const stable = physical.map((_, i) => BigInt("9007199254740993") + BigInt(i));
 const subscribe = () => () => {};
 const fixtureTarget = { id: "antenna", kind: "object" as const };
 type Quantity = "H_ant" | "J_charge" | "V_electric";
+const inspectorSelection: Selection = { kind: "object.antenna.visualization", objectId: "antenna", nodeId: "model:object:antenna:visualization", label: "Fixture antenna", moduleSource: "fixture", ref: { type: "scene-object", kind: "object.antenna.visualization", objectId: "antenna", nodeId: "model:object:antenna:visualization", visualizationTargetId: "object:antenna", objectRole: "antenna" } };
+declare global { interface Window { __artifactDedicatedFixture?: { holdWrites(): void; releaseWrites(): void; read(): { pending: boolean; pendingWrites: number; writes: number; renders: number; revision: number; legacyIntent: unknown } }; } }
 type FixtureRead = { quantity: Quantity; unit: string | null; model: boolean; count: number; triangles: number; minimum: number | null; maximum: number | null; values: number[]; glyphCount: number; pointCount: number; availableGlyphCount: number; surfaceOffsetDistance: number; scope: string; calls: { path: string; binary: boolean; carrier: string | null; component: string | null; stage: string | null; revision: string | null }[]; unexpected: string[]; historical: boolean; error: string | null; resources: ReturnType<Viewport3DResourceTracker["getSnapshot"]> };
 declare global { interface Window { __artifactOverlayFixture?: { read(): FixtureRead; replaceSurfaceRangeOwner(mode: "foreign" | "live" | "restore"): void }; __artifactOverlayCanvas?: () => { lost: boolean; width: number; height: number; groups: number; surfaceTriangles: number; geometryIds: string[]; materialIds: string[]; paletteIds: string[]; surfaceOpacity: number; paletteName: string; surfacePresentation: Array<{ mode: string; color: string }>; surfaceVertexCounts: number[]; scalarSurface: { normalized: number[]; opacity: number; paletteId: number; materialId: string } | null; auxiliaryMaterials: Array<{ id: string; version: number; opacity: number; transparent: boolean }>; frame: number; pointCounts: number[]; pointBufferIds: string[]; glyphCounts: number[]; glyphMatrices: number[][]; glyphColors: number[][]; glyphInstances: number }; } }
 
@@ -65,7 +80,7 @@ function capability(q: Quantity, live = false) {
     carriers: [{ carrier_id: c.carrier_id, carrier_fingerprint: c.carrier_digest, scope_kind: "object", scope_id: "antenna", payload_state: live ? "current" : "historical", payload_version: "FMVP.v6", components: q === "V_electric" ? 1 : 3, indexing: c.indexing }] };
 }
 function catalog(live: boolean): QuantityCatalogResource {
-  return { schema_version: "fixture", quantities: (["H_ant", "J_charge", "V_electric"] as const).map(q => ({ id: q, unit: q === "V_electric" ? "V" : q === "H_ant" ? "A/m" : "A/m^2", n_comp: q === "V_electric" ? 1 : 3, resolved_capability: capability(q, live) })) } as unknown as QuantityCatalogResource;
+  return { schema_version: "fixture", quantities: (["H_ant", "J_charge", "V_electric"] as const).map(q => ({ id: q, label: q, unit: q === "V_electric" ? "V" : q === "H_ant" ? "A/m" : "A/m^2", n_comp: q === "V_electric" ? 1 : 3, resolved_capability: capability(q, live) })) } as unknown as QuantityCatalogResource;
 }
 function vectorBytes(q: Quantity) {
   const c = carrier(q), code = q === "V_electric" ? 4 : q === "H_ant" ? 5 : 7, stride = code === 7 ? 24 : 8;
@@ -108,19 +123,42 @@ function makeFixture() {
   const bus = new EventBus<KernelEventMap>(), resources = new ResourceInvalidationController(bus), diagnostics = new RequestDiagnosticsController(), visualization = new ObjectVisualizationController();
   const diagnosticRecorder = new DiagnosticRecorderController({ diagnostics });
   const visualizationDebug = new VisualizationDebugController();
+  const scope = () => sessionRequestScopeKey(identity);
+  const pendingWrites: (() => void)[] = [];
+  const fullState = { hold: false, writes: 0, renders: 0 };
+  const scene = { revision: 1, scene_revision: 1, scene: { id: "artifact-fixture", name: "Artifact fixture", authoring_schema: "fixture", source_of_truth: "fixture" }, objects: [{ id: "antenna", name: "Fixture antenna", role: "antenna", geometry: { kind: "Box", size: [1, 1, 1], center: [0, 0, 0] } }], antenna_field_solve_stages: definitions } as unknown as SceneResource;
+  let remote = { revision: 1, overrides: mergeVisualizationStateTargetOverride([], fixtureTarget, { visible: true, activeQuantityId: "H_ant", shaderVisible: true, pointsVisible: true, wireframeVisible: true, vectorsVisible: false, surfaceColorSource: "component_x", surfaceProjectionMode: "raw_nodal", viewportColorbarVisible: true, vectorBudget: 100, shaderMonoColor: "#12ab34" }), camera: DEFAULT_CAMERA_REGISTRY_STATE, layers: { airbox: { visible: false, surface: { visible: false, opacity: .2 }, wireframe: { visible: false }, points: { visible: false }, vectors: { visible: false } } } } as unknown as VisualizationStateResource;
   let rangeMode: "valid" | "foreign" | "malformed" = "valid", rangeRevision = 1;
   const common = { "x-api-contract-version": "1.0.0", "x-fullmag-api-instance": instance };
   const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { ...common, "content-type": "application/json" } });
   const api = new ControlRoomApi({ baseUrl: "http://artifact-overlay.fixture.invalid", expectedApiInstance: instance, diagnostics, maxGetRetries: 0, fetchImpl: async (input, init) => {
     const request = new Request(input, init), url = new URL(request.url), binary = url.pathname.includes("/samples/vector") || url.pathname === DATA_DOMAIN_TOPOLOGY_PATH;
     calls.push({ path: url.pathname, binary, carrier: url.searchParams.get("carrier_id"), component: url.searchParams.get("component"), stage: url.searchParams.get("stage_id"), revision: url.searchParams.get("expected_carrier_revision") });
-    if (calls.length > 100 || request.method !== "GET") throw new Error("Fixture request/method budget exceeded");
+    if (calls.length > 220) throw new Error("Fixture request budget exceeded");
+    if (url.pathname === VISUALIZATION_STATE_PATH && request.method === "PATCH") {
+      if (request.headers.get("x-fullmag-session-scope") !== scope()) throw new Error("Unconfirmed visualization mutation");
+      const patch = await request.json() as VisualizationStatePatch;
+      if (Object.keys(patch).some(key => key !== "overrides")) throw new Error("Unexpected dedicated Inspector patch");
+      fullState.writes++;
+      if (fullState.hold) await new Promise<void>(resolve => pendingWrites.push(resolve));
+      remote = { ...remote, ...(patch.overrides ? { overrides: patch.overrides } : {}), revision: remote.revision + 1 };
+      return json(remote);
+    }
+    if (request.method !== "GET") { unexpected.push(`${request.method} ${url.pathname}`); throw new Error("Unexpected fixture mutation"); }
     if (url.pathname === SESSIONS_PATH) return json({ schema_version: "1.0", sessions: [{ session_id: owner.session_id, name: "Fixture", current: true, status: "idle" }] });
     if (url.pathname === SESSION_STATUS_PATH) return json({ session: { ...owner, name: "Fixture", created_at: "fixture", workspace_root: "fixture" }, run: { run_id: runId }, resources: { scene_revision: 1 }, capabilities: {}, lifecycle: { solver: "idle", session_resource: "active", connectivity: "connected", commandability: "writable" } });
     if (url.pathname === SIMULATION_STAGES_EXECUTION_PATH) return json({ ...owner, run_id: runId, revision: 1, runtime_state: "completed", total_stages: 1, stage_statuses: ["completed"], completed_stage_indexes: [0], stages: [{ stage_id: runtimeStageId, antenna_solve_stage_id: authoredStageId, status: "completed", stage_index: 0 }] });
     const q: Quantity = url.pathname.includes("V_electric") || url.searchParams.get("carrier_id")?.includes(":source_nodes") ? "V_electric" : url.pathname.includes("J_charge") || url.searchParams.get("carrier_id")?.includes(":tet4_cell_local_nodes") ? "J_charge" : "H_ant";
     const c = carrier(q), scoped = request.headers.get("x-fullmag-session-scope");
     if (scoped !== sessionRequestScopeKey(identity)) throw new Error("Unconfirmed fixture session scope");
+    if (url.pathname === VISUALIZATION_STATE_PATH) return json(remote);
+    if (url.pathname === MODEL_SCENE_PATH) return json(scene);
+    if (url.pathname === DATA_QUANTITIES_PATH) return json(catalog(false));
+    if (url.pathname === DATA_FIELDS_PATH) return json({ domain_generation_id: "fixture", quantities: (["H_ant", "J_charge", "V_electric"] as const).map(quantity => ({ quantity_id: quantity, label: quantity, unit: quantity === "V_electric" ? "V" : quantity === "H_ant" ? "A/m" : "A/m^2", components: quantity === "V_electric" ? 1 : 3, ui_exposed: true, spatial: true, kind: quantity === "V_electric" ? "scalar" : "vector", domain: "spatial", available: true, state: "stale_complete", location: carrier(quantity).indexing, artifact_field_locator: carrier(quantity), resolved_capability: capability(quantity), field_revision: 1, domain_generation_id: carrier(quantity).carrier_digest })) });
+    if (url.pathname === DATA_FIELD_AVAILABILITY_PATH.replace("{quantity_id}", q)) {
+      if (url.searchParams.get("carrier_id") !== c.carrier_id || url.searchParams.get("stage_id") !== runtimeStageId || url.searchParams.get("expected_carrier_revision") !== c.carrier_revision) throw new Error("Unpinned dedicated Inspector availability");
+      return json({ quantity_id: q, target_id: "antenna", scope_kind: "object", scope_id: "antenna", supported: true, materialized: true, pending: false, state: "stale", carrier_id: c.carrier_id, generation: c.carrier_digest, revision: 1, reason_code: "historical_inspection_read_only" });
+    }
     const metaPath = DATA_FIELD_META_PATH.replace("{quantity_id}", q), vectorPath = DATA_FIELD_VECTOR_PATH.replace("{quantity_id}", q);
     if (url.pathname === metaPath) {
       const pin = url.searchParams.get("carrier_id"); if (pin && pin !== c.carrier_id) throw new Error("Stale carrier leaked across quantities");
@@ -143,7 +181,15 @@ function makeFixture() {
     }
     unexpected.push(url.pathname); throw new Error(`Unexpected artifact fixture request: ${url.pathname}`);
   } });
-  return { kernel: { api, resources, bus, diagnostics, diagnosticRecorder, visualization, visualizationDebug } as unknown as KernelApi, calls, unexpected, visualization,
+  const visualizationSync = new VisualizationRegistrySyncController({ api: api.visualization, resourceCacheScope: api.resourceCacheScope, resources });
+  const commands = new CommandRegistry(); commands.attach(bus); commands.attachSessionScopeSource({ getScopeKey: scope, subscribe: () => () => {} });
+  for (const command of VISUALIZATION_TARGET_COMMANDS) commands.register(command);
+  const layout = new LayoutController(bus); layout.setActiveTab("geometry"); layout.setActiveViewportMainModule("viewport-3d");
+  const selection = new SelectionController(bus); selection.set(inspectorSelection, "inspector");
+  const cameraRegistry = new CameraRegistryController({ api: api.visualization, getSessionScopeKey: scope, idleFlushMs: null });
+  return { kernel: { api, resources, bus, diagnostics, diagnosticRecorder, visualization, visualizationDebug, visualizationSync, commands, layout, selection, cameraRegistry, analysisFieldOverlay: new AnalysisFieldOverlayController(), authoringHistory: new AuthoringHistoryController(api, resources) } as unknown as KernelApi, calls, unexpected, visualization, fullState,
+    enterDedicated() { visualization.clearTarget(fixtureTarget); },
+    dedicated: { holdWrites() { fullState.hold = true; }, releaseWrites() { fullState.hold = false; if (!pendingWrites.length) throw new Error("No pending dedicated Inspector PATCH"); for (const release of pendingWrites.splice(0)) release(); }, read: () => ({ pending: Boolean(visualizationSync.getSnapshot().pendingPatch || visualizationSync.getSnapshot().inflightPatch), pendingWrites: pendingWrites.length, writes: fullState.writes, renders: fullState.renders, revision: remote.revision, legacyIntent: visualization.getSnapshot().antennaFieldIntent }) },
     setRangeMode(mode: typeof rangeMode) { rangeMode = mode; resources.invalidateMatching(key => key.includes("/meta") && !key.includes("component=full"), ++rangeRevision); } };
 }
 function Probe() {
@@ -174,12 +220,18 @@ function Probe() {
   }, [gl, scene]);
   return null;
 }
-function View({ fixture }: { fixture: ReturnType<typeof makeFixture> }) {
-  const [quantity, setQuantity] = useState<Quantity>("H_ant"), [live, setLive] = useState(false), [vectors, setVectors] = useState(false), [presentation, setPresentation] = useState(false), [solid, setSolid] = useState(false);
+function View({ fixture, dedicated = false }: { fixture: ReturnType<typeof makeFixture>; dedicated?: boolean }) {
+  const [fixtureQuantity, setQuantity] = useState<Quantity>("H_ant"), [live, setLive] = useState(false), [vectors, setVectors] = useState(false), [presentation, setPresentation] = useState(false), [solid, setSolid] = useState(false);
+  const canonical = useVisualizationStateResource({ enabled: dedicated });
+  const canonicalSnapshot = useObjectVisualizationSelector(snapshot => snapshot);
   const tracker = useMemo(() => new Viewport3DResourceTracker(), []), session = useSessionResourceIdentity();
+  const adoptionRegistry = useMemo(() => createViewport3DRenderAdoptionRegistry(), []);
+  adoptionRegistry.setSessionIdentity(session);
   const preferences = useObjectVisualizationSelector(snapshot => snapshot.overrides[visualizationTargetKey(fixtureTarget)]);
   const patch = async (value: VisualizationTargetPatch) => { fixture.visualization.patchTarget(fixtureTarget, value); };
-  const settings = useMemo(() => ({ ...resolveGlobalObjectVisualizationSettings(null), visible: true, viewportColorbarVisible: true, geometryScope: "full" as const, shaderVisible: true, wireframeVisible: true, pointsVisible: true, vectorsVisible: vectors, activeQuantityId: quantity, surfaceColorSource: solid ? "solid" as const : quantity === "V_electric" ? "colormap" as const : "component_x" as const, scalarColorPalette: presentation ? "magma" : "viridis", surfaceOpacityPercent: presentation ? 45 : 100, pointOpacityPercent: presentation ? 45 : 100, wireframeOpacityPercent: presentation ? 45 : 100, vectorColorMode: "magnitude" as const, shaderColorMode: "x" as const, shaderMonoColor: "#12ab34", ...preferences }), [vectors, presentation, solid, quantity, preferences]);
+  const sharedSettings = useMemo(() => ({ ...resolveGlobalObjectVisualizationSettings(null), visible: true, viewportColorbarVisible: true, geometryScope: "full" as const, shaderVisible: true, wireframeVisible: true, pointsVisible: true, vectorsVisible: vectors, activeQuantityId: fixtureQuantity, surfaceColorSource: solid ? "solid" as const : fixtureQuantity === "V_electric" ? "colormap" as const : "component_x" as const, scalarColorPalette: presentation ? "magma" : "viridis", surfaceOpacityPercent: presentation ? 45 : 100, pointOpacityPercent: presentation ? 45 : 100, wireframeOpacityPercent: presentation ? 45 : 100, vectorColorMode: "magnitude" as const, shaderColorMode: "x" as const, shaderMonoColor: "#12ab34", ...preferences }), [vectors, presentation, solid, fixtureQuantity, preferences]);
+  const settings = dedicated ? resolveTargetVisualization({ snapshot: canonicalSnapshot, target: fixtureTarget, visualizationState: canonical.optimisticData ?? canonical.data }).settings : sharedSettings;
+  const quantity = (dedicated ? settings.activeQuantityId : fixtureQuantity) as Quantity;
   const quantities = useMemo(() => catalog(live), [live]);
   const result = useArtifactFieldOverlay(quantity, "antenna", settings, false, definitions, quantities);
   const selected = useObjectVisualizationSelector(snapshot => snapshot.artifactFieldSelection ?? null);
@@ -196,7 +248,7 @@ function View({ fixture }: { fixture: ReturnType<typeof makeFixture> }) {
     } };
   }, [quantity, result, fixture, tracker, settings.geometryScope]);
   useEffect(() => () => { tracker.disposeAll(); delete window.__artifactOverlayFixture; }, [tracker]);
-  return <main><h1>Artifact field overlay · controlled transport</h1><label>Quantity<select aria-label="Fixture quantity" value={quantity} onChange={e => setQuantity(e.target.value as Quantity)}><option>H_ant</option><option>J_charge</option><option>V_electric</option></select></label>
+  return <main><h1>Artifact field overlay · controlled transport</h1>{!dedicated ? <><label>Quantity<select aria-label="Fixture quantity" value={quantity} onChange={e => setQuantity(e.target.value as Quantity)}><option>H_ant</option><option>J_charge</option><option>V_electric</option></select></label>
     <label><input aria-label="Fixture live lane" type="checkbox" checked={live} onChange={e => setLive(e.target.checked)} /> Live solver lane</label>
     <button onClick={() => fixture.visualization.setArtifactFieldSelection({ identity, runId: "foreign-run", runtimeStageId, authoredStageId, sourceObjectId: "antenna" })}>Select foreign owner</button>
     <button onClick={() => fixture.visualization.setArtifactFieldSelection(null)}>Clear owner selection</button>
@@ -204,12 +256,16 @@ function View({ fixture }: { fixture: ReturnType<typeof makeFixture> }) {
     <button aria-pressed={presentation} onClick={() => setPresentation(value => !value)}>Toggle fixture presentation</button>
     <button aria-pressed={solid} onClick={() => setSolid(value => !value)}>Toggle fixture solid surface</button>
     <label>Geometry scope<select aria-label="Fixture geometry scope" value={settings.geometryScope} onChange={event => { void patch({ geometryScope: event.target.value as "full" | "surface" }); }}><option value="full">Full</option><option value="surface">Surface</option></select></label>
-    <label>Glyph budget<input aria-label="Fixture glyph budget" type="number" min={0} value={settings.vectorBudget} onChange={event => { void patch({ vectorBudget: Number(event.target.value) }); }} /></label>
+    <label>Glyph budget<input aria-label="Fixture glyph budget" type="number" min={0} value={settings.vectorBudget} onChange={event => { void patch({ vectorBudget: Number(event.target.value) }); }} /></label></> : null}
     <p role="status">{result.error ?? (result.model ? `${quantity}: historical inspection · ${result.model.count} samples` : "No historical model")}</p>
     <div data-artifact-field-viewport style={{ height: 480, width: "100%", position: "relative" }}><Viewport3DCanvas camera={{ position: [2.4, 1.7, 1.3], fov: 45, near: .01, far: 100 }} frameloop="demand">
-      <VectorGlyphDerivedBufferCacheProvider tracker={tracker}><Probe /><ArtifactFieldLayer model={result.model} tracker={tracker} sessionIdentity={session} colors={{ accent: "white", background: "black", field: "white", mesh: "white", wire: "white" }} /></VectorGlyphDerivedBufferCacheProvider>
+      <VectorGlyphDerivedBufferCacheProvider tracker={tracker}><Probe /><ArtifactFieldLayer model={result.model} tracker={tracker} sessionIdentity={session} adoptionRegistry={adoptionRegistry} colors={{ accent: "white", background: "black", field: "white", mesh: "white", wire: "white" }} /></VectorGlyphDerivedBufferCacheProvider>
     </Viewport3DCanvas><div className="fm-viewport-3d__colorbar-stack">{resolveArtifactFieldColorbars(result.model).map(({ key, legend }) => <Viewport3DColorbar key={key} legend={legend} />)}</div></div>
-    {!live ? <aside aria-label="Shared inspection controls" className="fm-inspector-panel">
+    {dedicated ? <aside aria-label="Dedicated antenna Inspector" data-testid="dedicated-inspector-scroll" style={{ height: 600, overflow: "auto" }}>
+      <label>Persistent unrelated draft<input aria-label="Dedicated unrelated draft" defaultValue="untouched" /></label>
+      <Profiler id="dedicated-antenna-inspector" onRender={() => { fixture.fullState.renders++; }}><AntennaVisualizationPanel selection={inspectorSelection} /></Profiler>
+      <div style={{ height: 500 }} aria-hidden="true" />
+    </aside> : !live ? <aside aria-label="Shared inspection controls" className="fm-inspector-panel">
       <VisualizationSurfaceColoringSection {...controls} onFieldCatalogRequest={() => {}} />
       {quantity !== "V_electric" ? <VisualizationVectorsSection {...controls} targetKind="object" vectorBudgetRange={{ availableNodeCount: carrier(quantity).sample_count, max: carrier(quantity).sample_count, min: 0, step: 1, exact: true }} vectorCapacity={null} sceneCap={100000} visualizationRevision={1} vectorTopologyHash={carrier(quantity).carrier_digest} /> : null}
       <button onClick={() => fixture.setRangeMode("foreign")}>Return foreign range owner</button>
@@ -220,5 +276,15 @@ function View({ fixture }: { fixture: ReturnType<typeof makeFixture> }) {
 export default function Page() {
   const hydrated = useSyncExternalStore(subscribe, () => true, () => false);
   const fixture = useMemo(() => hydrated ? makeFixture() : null, [hydrated]);
-  return fixture ? <KernelContext.Provider value={fixture.kernel}><View fixture={fixture} /></KernelContext.Provider> : <p>Loading controlled fixture…</p>;
+  const [dedicated, setDedicated] = useState(false);
+  useEffect(() => {
+    if (!fixture) return;
+    fixture.kernel.visualizationSync.start();
+    window.__artifactDedicatedFixture = fixture.dedicated;
+    return () => { fixture.kernel.visualizationSync.stop(); delete window.__artifactDedicatedFixture; };
+  }, [fixture]);
+  return fixture ? <KernelContext.Provider value={fixture.kernel}><InspectorEditSessionProvider>
+    {!dedicated ? <button onClick={() => { fixture.enterDedicated(); setDedicated(true); }}>Mount dedicated antenna Inspector</button> : null}
+    <View key={dedicated ? "dedicated" : "shared"} fixture={fixture} dedicated={dedicated} />
+  </InspectorEditSessionProvider></KernelContext.Provider> : <p>Loading controlled fixture…</p>;
 }

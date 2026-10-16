@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import vm from "node:vm";
 const root=new URL("../src/",import.meta.url),cache=new Map();
-function load(url){if(!cache.has(url.href))cache.set(url.href,new vm.SourceTextModule(stripTypeScriptTypes(readFileSync(url,"utf8")),{identifier:url.href}));return cache.get(url.href);}
+function load(url){if(!cache.has(url.href)){const resolved=existsSync(url)?url:new URL(url.href.replace(/\.ts$/,"/index.ts"));cache.set(url.href,new vm.SourceTextModule(stripTypeScriptTypes(readFileSync(resolved,"utf8")),{identifier:resolved.href}));}return cache.get(url.href);}
 const entry=load(new URL("kernel/visualization/artifactFieldSelection.ts",root));
 await entry.link((name,parent)=>load(name.startsWith("@/")?new URL(`${name.slice(2)}.ts`,root):new URL(`${name}.ts`,parent.identifier)));await entry.evaluate();
 const {artifactInspectionQuantity:gate,artifactSelectionForQuantity:select}=entry.namespace;
@@ -93,5 +93,44 @@ check("owner-only range change notifies subscribers even with identical numeric 
  const row={quantityId:"H_ant",component:"x",scopeKind:"full",scopeId:null,inspectionKey:"owner-a",range:{min:0,max:1}};
  store.setRenderedScalarRanges([row]);const before=calls;store.setRenderedScalarRanges([{...row}]);assert.equal(calls,before);
  store.setRenderedScalarRanges([{...row,inspectionKey:"owner-b"}]);assert.equal(calls,before+1);stop();store.setRenderedScalarRanges([]);
+});
+check("dedicated inspection blocks ordinary metadata while its catalog is missing or invalid",()=>{
+ for(const c of [null,{quantities:[]},catalog("H_ant")]){
+  const binding=bind({catalog:c,catalogReady:false,inspectionOnly:true,quantityId:"H_ant",selection:pin,sessionIdentity:pin.identity,targetScope});
+  assert.equal(binding.historical,true);assert.equal(binding.query,null);const value=readMeta(binding);assert.equal(lastQuery.enabled,false);assert.equal(value.data,null);
+ }
+ const binding=bind({catalog:catalog("H_ant"),inspectionOnly:true,quantityId:"H_eff",selection:pin,sessionIdentity:pin.identity,targetScope});assert.equal(binding.historical,true);assert.equal(binding.query,null);
+});
+check("owned accounting rejects stale owner/build adoption and clears without touching a newer owner",()=>{
+ const store=storeModule.namespace.viewport3dStore;
+ const value={key:"owner-a",fieldBufferId:"field",vectorBuildKey:"build-a",capacity:{fullCount:5,surfaceCount:4},decodedSampleCount:5,availableGlyphCount:4,expectedGlyphCount:2,adoptedGlyphCount:null};
+ store.setArtifactInspectionPresentation(value);assert.equal(store.getArtifactInspectionPresentation("foreign"),null);
+ for(const [key,build,count] of [["foreign","build-a",2],["owner-a","old-build",2],["owner-a","build-a",3]])store.updateArtifactGlyphAdoption(key,build,count);
+ assert.equal(store.getArtifactInspectionPresentation("owner-a").adoptedGlyphCount,null);
+ store.updateArtifactGlyphAdoption("owner-a","build-a",2);assert.equal(store.getArtifactInspectionPresentation("owner-a").adoptedGlyphCount,2);
+ store.setArtifactInspectionPresentation({...value});assert.equal(store.getArtifactInspectionPresentation("owner-a").adoptedGlyphCount,2);
+ store.setArtifactInspectionPresentation({...value,vectorBuildKey:"build-b"});assert.equal(store.getArtifactInspectionPresentation("owner-a").adoptedGlyphCount,null);
+ store.clearArtifactInspectionPresentation("owner-a","build-a");assert.ok(store.getArtifactInspectionPresentation("owner-a"));
+ store.setArtifactInspectionPresentation({...value,key:"owner-b"});store.clearArtifactInspectionPresentation("owner-a","build-b");assert.ok(store.getArtifactInspectionPresentation("owner-b"));
+ store.clearArtifactInspectionPresentation("owner-b","build-a");assert.equal(store.getArtifactInspectionPresentation("owner-b"),null);
+});
+const adoptionModule=load(new URL("modules/viewport-3d/model/viewport3DRenderAdoptionRegistry.ts",root));await adoptionModule.link((name,parent)=>load(new URL(`${name}.ts`,parent.identifier)));await adoptionModule.evaluate();
+check("GPU receipt selection matches exact carrier, field, build and request-scope epoch",()=>{
+ const registry=adoptionModule.namespace.createViewport3DRenderAdoptionRegistry();const session={sessionId:"s",sessionEpoch:"e",requestScopeEpoch:"r"};registry.setSessionIdentity(session);
+ const receipt={ownerId:"a",carrierId:"carrier",fieldBufferId:"field",vectorBuildKey:"build",resourceKey:"resource",sessionIdentity:session,itemCount:2,byteLength:128};
+ assert.equal(registry.recordVectorAdoption(receipt).status,"adopted");
+ const query={...session,carrierId:"carrier",fieldBufferId:"field",vectorBuildKey:"build"};assert.equal(registry.latestActiveAdoption(query).itemCount,2);
+ for(const key of ["carrierId","fieldBufferId","vectorBuildKey","requestScopeEpoch"])assert.equal(registry.latestActiveAdoption({...query,[key]:"foreign"}),null,key);
+});
+const panelModel=load(new URL("modules/inspector/panels/ObjectVisualizationPanelModel.ts",root));await panelModel.link((name,parent)=>load(name.startsWith("@/")?new URL(`${name.slice(2)}.ts`,root):new URL(`${name}.ts`,parent.identifier)));await panelModel.evaluate();
+check("standalone artifact Inspector resolves only an explicit object without a magnetic backend",()=>{
+ const target={kind:"object",id:"object:antenna"},selection={kind:"object.antenna.visualization"};
+ for(const lane of ["unresolved","fdm","fem"]){assert.strictEqual(panelModel.namespace.resolveObjectVisualizationTargetForLane({artifactInspection:true,lane,selection,selectionTarget:target}),target);assert.deepEqual(panelModel.namespace.resolveObjectVisualizationResourceGates({artifactInspection:true,lane,target}),{fdm:false,fem:false});}
+ assert.equal(panelModel.namespace.resolveObjectVisualizationTargetForLane({lane:"unresolved",selection,selectionTarget:target}),null);
+ for(const kind of ["region","fdm-domain","fdm-native-layer","airbox"])assert.equal(panelModel.namespace.resolveObjectVisualizationTargetForLane({artifactInspection:true,lane:"fem",selection,selectionTarget:{kind,id:"foreign"}}),null);
+});
+check("admitted historical result never appears as live magnetic materialization",()=>{
+ const ready={catalogReady:true,catalogError:false,quantityAvailable:true,ownerReady:true,presentationReady:true},resolve=panelModel.namespace.resolveArtifactInspectionDataState;
+ assert.equal(resolve(ready),"Historical snapshot");assert.equal(resolve({...ready,presentationReady:false}),"Loading historical result");assert.equal(resolve({...ready,ownerReady:false}),"Select execution");assert.equal(resolve({...ready,quantityAvailable:false}),"Select raw SI quantity");assert.equal(resolve({...ready,catalogReady:false}),"Loading catalog");assert.equal(resolve({...ready,catalogError:true}),"Unavailable");
 });
 console.log(JSON.stringify({status:"passed",checks,unit_test_compilation:false}));

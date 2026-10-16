@@ -286,6 +286,7 @@ export function VisualizationRenderModeSection({
 
 
 export function VisualizationSurfaceColoringSection({
+  fieldMetaOverride,
   artifactFieldBinding,
   airboxFieldCarrierIdentity,
   patch,
@@ -300,6 +301,7 @@ export function VisualizationSurfaceColoringSection({
   settings,
   target,
 }: {
+  fieldMetaOverride?: ReturnType<typeof useVisualizationFieldMeta>;
   artifactFieldBinding?: ArtifactInspectorFieldBinding;
   airboxFieldCarrierIdentity?: VisualizationVectorScopeIdentity | null;
   patch: PatchVisualizationTarget;
@@ -357,13 +359,14 @@ export function VisualizationSurfaceColoringSection({
     scopeKind: historicalSurface ? artifactFieldBinding?.query?.scope_kind : viewportRenderedRangeScopeKind(fieldMetaScopeQuery.scope_kind),
     inspectionKey: historicalSurface ? artifactSurfaceRangeKey(artifactFieldBinding?.expectedOwner ?? null, artifactFieldBinding?.query ?? null, settings.surfaceProjectionMode) ?? "unavailable-artifact-owner" : null,
   });
-  const fieldMeta = useVisualizationFieldMeta({
+  const ownFieldMeta = useVisualizationFieldMeta({
     binding: artifactFieldBinding,
     component: colorbarComponent ?? null,
-    enabled: showFieldMeta,
+    enabled: showFieldMeta && !fieldMetaOverride,
     quantityId: settings.activeQuantityId,
     ...fieldMetaScopeQuery,
   });
+  const fieldMeta = fieldMetaOverride ?? ownFieldMeta;
   const surfaceSummary = settings.surfaceColorSource === "solid"
     ? "Solid color"
     : `By Quantity • ${settings.activeQuantityId ?? "H_eff"} (Auto)`;
@@ -773,6 +776,8 @@ export function VisualizationWireframeSection({
 }
 
 export function VisualizationVectorsSection({
+  fieldMetaOverride,
+  inspectionPresentation,
   artifactFieldBinding,
   airboxFieldCarrierIdentity,
   fieldCatalog,
@@ -795,6 +800,7 @@ export function VisualizationVectorsSection({
   visualizationRevision,
   vectorTopologyHash,
 }: {
+  fieldMetaOverride?: ReturnType<typeof useVisualizationFieldMeta>;
   artifactFieldBinding?: ArtifactInspectorFieldBinding;
   airboxFieldCarrierIdentity?: VisualizationVectorScopeIdentity | null;
   fieldCatalog: { data: FieldCatalogResource | null; status: string };
@@ -826,6 +832,7 @@ export function VisualizationVectorsSection({
   target: VisualizationTargetRef;
   targetKind: VisualizationTargetKind;
   vectorBudgetRange: VisualizationVectorBudgetRange;
+  inspectionPresentation?: import("@/modules/viewport-3d/public").Viewport3DArtifactInspectionPresentation | null;
   vectorCapacity: import("@/kernel/visualization/visualizationVectorCapacity").VisualizationVectorCapacityDescriptor | null;
   visualizationRevision: string | number | null;
   vectorTopologyHash: string | null;
@@ -857,13 +864,14 @@ export function VisualizationVectorsSection({
     showColorbar &&
     !regionFieldMetaUnavailable &&
     fieldMetaQuantityAvailable;
-  const fieldMeta = useVisualizationFieldMeta({
+  const ownFieldMeta = useVisualizationFieldMeta({
     binding: artifactFieldBinding,
     component: colorbarComponent ?? null,
-    enabled: showFieldMeta,
+    enabled: showFieldMeta && !fieldMetaOverride,
     quantityId: settings.activeQuantityId,
     ...fieldMetaScopeQuery,
   });
+  const fieldMeta = fieldMetaOverride ?? ownFieldMeta;
   const colorbarRangeIdentity = [
     "vectors",
     settings.activeQuantityId,
@@ -979,6 +987,7 @@ export function VisualizationVectorsSection({
       </div>
       <div className="fm-viz-vector-accounting">
         <VisualizationVectorAccountingRows
+          ownedCounts={inspectionPresentation}
           anchorKind={vectorBudgetRange.anchorKind}
           availableAnchorCount={availableVectorAnchorCount(vectorBudgetRange)}
           capacity={vectorCapacity}

@@ -3,6 +3,7 @@
 import { useCallback, useSyncExternalStore } from "react";
 
 import { resolveCanonicalQuantityId } from "@/kernel/api/quantityIds";
+import type { VisualizationVectorCapacityDescriptor } from "@/kernel/visualization/visualizationVectorCapacity";
 import type { VisualizationStateResource } from "@/kernel/api/apiTypes";
 import { DEFAULT_CAMERA_REGISTRY_STATE } from "@/kernel/visualization/CameraRegistryController";
 import {
@@ -18,7 +19,19 @@ export interface Viewport3DCameraState {
   up: [number, number, number];
 }
 
+export interface Viewport3DArtifactInspectionPresentation {
+  key: string;
+  fieldBufferId: string;
+  vectorBuildKey: string;
+  capacity: VisualizationVectorCapacityDescriptor;
+  decodedSampleCount: number;
+  availableGlyphCount: number;
+  expectedGlyphCount: number;
+  adoptedGlyphCount: number | null;
+}
+
 export interface Viewport3DCommandState {
+  artifactInspectionPresentation: Viewport3DArtifactInspectionPresentation | null;
   activeScalarColorbarLegends: Viewport3DScalarColorbarLegend[];
   camera: Viewport3DCameraState;
   captureReturnProfileId: Viewport3DVisualProfileId | null;
@@ -139,6 +152,7 @@ export const DEFAULT_VIEWPORT_3D_CAMERA_STATE: Viewport3DCameraState = {
 };
 
 const DEFAULT_VIEWPORT_3D_STATE: Viewport3DCommandState = {
+  artifactInspectionPresentation: null,
   activeScalarColorbarLegends: [],
   camera: {
     ...DEFAULT_VIEWPORT_3D_CAMERA_STATE,
@@ -247,6 +261,32 @@ class Viewport3DStore {
       activeScalarColorbarLegends: legends,
     };
     this.notify();
+  }
+
+  getArtifactInspectionPresentation(key: string | null): Viewport3DArtifactInspectionPresentation | null {
+    const value = this.snapshot.artifactInspectionPresentation;
+    return key && value?.key === key ? value : null;
+  }
+
+  setArtifactInspectionPresentation(value: Viewport3DArtifactInspectionPresentation): void {
+    const current = this.snapshot.artifactInspectionPresentation;
+    const next = current?.key === value.key && current.vectorBuildKey === value.vectorBuildKey && current.expectedGlyphCount === value.expectedGlyphCount && value.expectedGlyphCount > 0
+      ? { ...value, adoptedGlyphCount: current.adoptedGlyphCount } : value;
+    if (JSON.stringify(current) === JSON.stringify(next)) return;
+    this.snapshot = { ...this.snapshot, artifactInspectionPresentation: next }; this.notify();
+  }
+
+  clearArtifactInspectionPresentation(key: string, vectorBuildKey: string): void {
+    const current = this.snapshot.artifactInspectionPresentation;
+    if (current?.key !== key || current.vectorBuildKey !== vectorBuildKey) return;
+    this.snapshot = { ...this.snapshot, artifactInspectionPresentation: null }; this.notify();
+  }
+
+  updateArtifactGlyphAdoption(key: string, vectorBuildKey: string, count: number | null): void {
+    const current = this.snapshot.artifactInspectionPresentation;
+    if (current?.key !== key || current.vectorBuildKey !== vectorBuildKey || current.adoptedGlyphCount === count) return;
+    if (count !== null && (!Number.isSafeInteger(count) || count < 0 || count > current.expectedGlyphCount)) return;
+    this.snapshot = { ...this.snapshot, artifactInspectionPresentation: { ...current, adoptedGlyphCount: count } }; this.notify();
   }
 
   getRenderedScalarRange(
@@ -751,4 +791,10 @@ function normalizeOrthographicScale(value: number | null | undefined): number | 
 
 function normalizeFdmTopographyAmplitudeCells(value: number): number {
   return Number.isFinite(value) ? Math.max(-16, Math.min(16, value)) : 0;
+}
+
+/** Own immutable carrier only; never returns another target's last presentation. */
+export function useViewport3DArtifactInspectionPresentation(key: string | null): Viewport3DArtifactInspectionPresentation | null {
+  const getSnapshot = useCallback(() => viewport3dStore.getArtifactInspectionPresentation(key), [key]);
+  return useSyncExternalStore(listener => viewport3dStore.subscribe(listener), getSnapshot, () => null);
 }

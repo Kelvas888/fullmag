@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { AntennaArtifactVisualization } from "./AntennaArtifactVisualization";
 import { AntennaClippingControls } from "./AntennaClippingControls";
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
 import { AntennaCameraControls } from "./AntennaCameraControls";
@@ -38,7 +39,24 @@ export function AntennaVisualizationPanel(props: InspectorPanelProps) {
   return <AntennaVisualizationView {...props} scene={scene} />;
 }
 
-export function AntennaVisualizationView({ selection, scene }: InspectorPanelProps & { scene: SceneRead }) {
+export function AntennaVisualizationView(props: InspectorPanelProps & { scene: SceneRead }) {
+  const activeBasis = useObjectVisualizationSelector(snapshot => Boolean(snapshot.antennaFieldIntent));
+  const [preferredRepresentation, setRepresentation] = useState<string | null>(null);
+  const representation = preferredRepresentation ?? (activeBasis ? "basis" : "inspection");
+  const visualization = useObjectVisualizationController();
+  return <div data-antenna-visualization-root>
+    <FormField label="Result representation" type="select" value={representation} onChange={event => {
+      setRepresentation(event.target.value);
+      if (event.target.value === "inspection") visualization.setAntennaFieldIntent(null);
+    }}>
+      <option value="inspection">Raw SI results (H / J / V)</option>
+      <option value="basis">Published per-ampere basis</option>
+    </FormField>
+    {representation === "inspection" ? <AntennaArtifactVisualization {...props} /> : <AntennaLegacyVisualizationView {...props} />}
+  </div>;
+}
+
+function AntennaLegacyVisualizationView({ selection, scene }: InspectorPanelProps & { scene: SceneRead }) {
   const visualization = useObjectVisualizationController();
   const objectId = selection.ref?.type === "scene-object" ? selection.ref.objectId : selection.objectId;
   const stages = (scene.data?.antenna_field_solve_stages ?? []).filter((stage) => stage.source_object_id === objectId);

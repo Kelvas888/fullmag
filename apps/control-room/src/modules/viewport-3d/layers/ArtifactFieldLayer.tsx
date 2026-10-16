@@ -3,6 +3,9 @@ import { useEffect, useMemo } from "react";
 import { BufferAttribute, BufferGeometry, Color, LineBasicMaterial, PointsMaterial, MeshBasicMaterial, DoubleSide, type ShaderMaterial } from "three";
 import { pointColorFromSettings, surfaceMaterialColorFromSettings, vectorStyleFromSettings, wireframeColorFromSettings } from "./viewport3DLayerSettings";
 import type { SessionResourceIdentity } from "@/kernel/resources/sessionResourceIdentity";
+import { artifactInspectionPresentation } from "../model/artifactFieldOverlayModel";
+import { viewport3dStore } from "../viewport3dStore";
+import type { Viewport3DRenderAdoptionRegistry } from "../model/viewport3DRenderAdoptionRegistry";
 import type { ArtifactFieldOverlayModel } from "../model/artifactFieldOverlayModel";
 import type { Viewport3DColors } from "../viewport3dTypes";
 import type { Viewport3DResourceTracker } from "../viewport3dDiagnostics";
@@ -58,9 +61,25 @@ function updateArtifactPointScope(owned: { geometry: BufferGeometry; pointSelect
 }
 
 /** Positions already belong to world coordinates; this root group has identity transform. */
-export function ArtifactFieldLayer({ model, colors, tracker, sessionIdentity }: { model: ArtifactFieldOverlayModel | null; colors: Viewport3DColors; tracker: Viewport3DResourceTracker; sessionIdentity: SessionResourceIdentity | null }) {
+export function ArtifactFieldLayer({ model, colors, tracker, sessionIdentity, adoptionRegistry }: { adoptionRegistry?: Viewport3DRenderAdoptionRegistry; model: ArtifactFieldOverlayModel | null; colors: Viewport3DColors; tracker: Viewport3DResourceTracker; sessionIdentity: SessionResourceIdentity | null }) {
   const invalidate = useBatchedInvalidate();
   const data = model?.geometry;
+  const presentation = useMemo(() => artifactInspectionPresentation(model), [model]);
+  const carrierId = model?.locator.carrier_id;
+  useEffect(() => {
+    if (!presentation) return;
+    viewport3dStore.setArtifactInspectionPresentation(presentation);
+    const update = () => {
+      if (!adoptionRegistry || !sessionIdentity || presentation.expectedGlyphCount === 0) return;
+      const receipt = adoptionRegistry.latestActiveAdoption({ ...sessionIdentity, carrierId,
+        fieldBufferId: presentation.fieldBufferId, vectorBuildKey: presentation.vectorBuildKey });
+      viewport3dStore.updateArtifactGlyphAdoption(presentation.key, presentation.vectorBuildKey, receipt?.itemCount ?? null);
+    };
+    update();
+    const unsubscribe = adoptionRegistry?.subscribeActive(update);
+    return () => { unsubscribe?.(); viewport3dStore.clearArtifactInspectionPresentation(presentation.key, presentation.vectorBuildKey); };
+  }, [presentation, adoptionRegistry, carrierId, sessionIdentity]);
+
   const owned = useMemo(() => {
     if (!data) return null;
     const geometry = new BufferGeometry(); geometry.setAttribute("position", new BufferAttribute(data.positions, 3)); geometry.setIndex(new BufferAttribute(data.allSampleIndices.slice(), 1)); geometry.setDrawRange(0, data.count); geometry.computeBoundingSphere();
@@ -112,6 +131,6 @@ export function ArtifactFieldLayer({ model, colors, tracker, sessionIdentity }: 
     {model.settings.shaderVisible && surface && (owned.fieldSurface || owned.scalarSurface) ? <mesh geometry={surface} material={model.scalar && model.settings.surfaceColorSource === "solid" ? owned.scalarSolid! : owned.scalarSurface ?? owned.fieldSurface!.material} dispose={null} /> : null}
     {model.settings.wireframeVisible && owned.wire ? <lineSegments geometry={owned.wire} material={owned.wireMaterial} dispose={null} /> : null}
     {model.settings.pointsVisible ? <points geometry={owned.geometry} material={owned.points} dispose={null} /> : null}
-    {!model.scalar && model.settings.vectorsVisible && model.vectorSegments ? <VectorFieldLayer segments={model.vectorSegments} buildReference={reference} carrierId={model.locator.carrier_id} fieldBufferId={model.key} colors={colors} colorMode={model.settings.vectorColorMode} glyphColorsOverride={model.settings.vectorColorMode === "magnitude" ? model.glyphColors : null} opacity={model.settings.vectorAlphaPercent / 100} style={vectorStyle} tracker={tracker} sessionIdentity={sessionIdentity} renderOnTop={false} /> : null}
+    {!model.scalar && model.settings.vectorsVisible && model.vectorSegments ? <VectorFieldLayer adoptionRegistry={adoptionRegistry} segments={model.vectorSegments} buildReference={reference} carrierId={model.locator.carrier_id} fieldBufferId={model.key} colors={colors} colorMode={model.settings.vectorColorMode} glyphColorsOverride={model.settings.vectorColorMode === "magnitude" ? model.glyphColors : null} opacity={model.settings.vectorAlphaPercent / 100} style={vectorStyle} tracker={tracker} sessionIdentity={sessionIdentity} renderOnTop={false} /> : null}
   </group>;
 }

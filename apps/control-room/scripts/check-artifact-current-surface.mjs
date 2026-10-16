@@ -128,7 +128,7 @@ for(const count of [7,14])check(`${count} samples keep exact renderer glyph card
   f.settings.geometryScope="surface";assert.throws(()=>render(f),/owned boundary/);
 });
 check("surface scope excludes interior H samples and preserves global values and scale",()=>{
- const f=fixture(),indexing="sample_nodes",cells=[0,1,2,4,0,1,4,3,0,4,2,3,4,1,2,3];
+ const f=fixture();f.settings.visible=true;const indexing="sample_nodes",cells=[0,1,2,4,0,1,4,3,0,4,2,3,4,1,2,3];
  f.locator.indexing=indexing;f.locator.sample_count=5;f.locator.carrier_id=`artifact:${digest}:${indexing}`;
  Object.assign(f.field,{quantityId:"H_ant",pointCount:5,indexing,values:Float64Array.from([1,0,0,0,2,0,0,0,3,-4,0,0,0,0,2]),artifactMapping:{indexing,identityIds:BigUint64Array.from([0n,1n,2n,3n,4n]),elementOrdinals:null,localVertexIndices:null}});
  Object.assign(f.topology,{positions:Float64Array.from([0,0,0,1,0,0,0,1,0,0,0,1,.2,.2,.2]),nodeCount:5,cellTypes:Uint32Array.from([1,1,1,1]),cellOffsets:Uint32Array.from([0,4,8,12,16]),cellNodes:Uint32Array.from(cells)});
@@ -136,6 +136,9 @@ check("surface scope excludes interior H samples and preserves global values and
  const full=render({...f,settings:{...f.settings,geometryScope:"full"}}),surface=render({...f,settings:{...f.settings,geometryScope:"surface"}});
  assert.deepEqual([...full.pointSampleIndices],[0,1,2,3,4]);assert.deepEqual([...surface.pointSampleIndices],[0,1,2,3]);
  assert.equal(full.glyphCount,5);assert.equal(surface.glyphCount,4);assert.equal(surface.surfaceTriangles.length,12);
+ const counts=entry.namespace.artifactInspectionPresentation(surface);assert.equal(counts.capacity.fullCount,5);assert.equal(counts.capacity.surfaceCount,4);assert.equal(counts.decodedSampleCount,5);assert.equal(counts.adoptedGlyphCount,null);
+ const faces=render({...f,settings:{...f.settings,geometryScope:"surface",surfaceProjectionMode:"surface_faces"}});assert.equal(entry.namespace.artifactInspectionPresentation(faces).key,counts.key);assert.equal(entry.namespace.artifactInspectionPresentation(faces).capacity.surfaceCount,4);
+
  assert.deepEqual(surface.scalarValues,full.scalarValues);assert.equal(surface.maximumVectorNorm,full.maximumVectorNorm);
  for(let i=0;i<4;i++)for(let axis=0;axis<7;axis++)assert.equal(surface.vectorSegments[i*7+axis],full.vectorSegments[i*7+axis]);
 });
@@ -144,7 +147,7 @@ check("surface J keeps original boundary-local slots and distinct values",()=>{
  f.locator.sample_count=16;Object.assign(f.field,{pointCount:16,values:Float64Array.from(cells.flatMap((_,i)=>[i+1,0,0])),artifactMapping:{indexing:"tet4_cell_local_nodes",identityIds:BigUint64Array.from(cells.map(i=>first+BigInt(i))),elementOrdinals:BigUint64Array.from(cells.map((_,i)=>BigInt(Math.floor(i/4)))),localVertexIndices:Uint8Array.from(cells.map((_,i)=>i%4))}});
  Object.assign(f.topology,{positions:Float64Array.from(cells.flatMap(i=>corners[i])),nodeCount:16,cellTypes:Uint32Array.from([1,1,1,1]),cellOffsets:Uint32Array.from([0,4,8,12,16]),cellNodes:Uint32Array.from(cells.map((_,i)=>i))});
  const full=render({...f,settings:{...f.settings,vectorBudget:16,geometryScope:"full"}}),surface=render({...f,settings:{...f.settings,vectorBudget:16,geometryScope:"surface"}});
- assert.equal(full.glyphCount,16);assert.equal(surface.glyphCount,12);assert.deepEqual([...surface.vectorSampleIndices],[0,1,2,4,5,7,8,10,11,13,14,15]);
+ assert.equal(full.glyphCount,16);assert.equal(surface.glyphCount,12);const counts=entry.namespace.artifactInspectionPresentation(surface);assert.equal(counts.capacity.fullCount,16);assert.equal(counts.capacity.surfaceCount,12);assert.equal(counts.decodedSampleCount,16);assert.deepEqual([...surface.vectorSampleIndices],[0,1,2,4,5,7,8,10,11,13,14,15]);
  assert.deepEqual([...surface.scalarValues],Array.from({length:16},(_,i)=>i+1));
  assert.equal(surface.surfaceTriangles.length,12);
 });
@@ -212,5 +215,24 @@ check("published surface range carries projected bounds and exact immutable owne
  assert.equal(row.inspectionKey,key({...model.locator.owner,quantityId:"J_charge"},{carrier_id:model.locator.carrier_id,expected_carrier_revision:model.locator.carrier_revision,scope_kind:"object",scope_id:"object_id"},"surface_faces"));
  for(const settings of [{...f.settings,visible:false},{...f.settings,shaderVisible:false},{...f.settings,surfaceColorSource:"solid"}])assert.deepEqual(entry.namespace.artifactRenderedSurfaceRanges(build(carrier.admitArtifactFieldCarrier(f.locator,f.field,f.headers,f.topology,f.geometry),settings)),[]);
  assert.deepEqual(entry.namespace.artifactRenderedSurfaceRanges(null),[]);
+});
+check("source inspection accepts its own separate sampling carrier without adopting a foreign source",()=>{
+ const quantity="H_ant",target="sampling-target", sourceObject="source-antenna";
+ const h={...locator,carrier_scope_id:target,indexing:"sample_nodes",owner:{...owner,object_id:sourceObject}};
+ const c={quantity_id:quantity,provider:"available",request:"field_vector",materialization:"materialized",render:"renderable",publication:"interactive",reason_code:"historical_inspection_read_only",lane:"artifact_inspection_read_only",carriers:[{carrier_id:h.carrier_id,carrier_fingerprint:digest,scope_kind:"object",scope_id:target,payload_state:"historical",payload_version:"FMVP.v6",components:3,indexing:"sample_nodes"}]};
+ h.carrier_id=`artifact:${digest}:sample_nodes`;c.carriers[0].carrier_id=h.carrier_id;
+ const m={quantity_id:quantity,unit:"A/m",components:3,state:"stale_complete",materialization_reason_code:"historical_inspection_read_only",resolved_capability:c,artifact_field_locator:h};
+ const session={sessionId:owner.session_id,sessionEpoch:owner.session_epoch,requestScopeEpoch:owner.request_scope_epoch};
+ assert.throws(()=>entry.namespace.artifactOverlayLocator(m,session,sourceObject,"H_ant"));
+ assert.equal(entry.namespace.artifactOverlayLocator(m,session,sourceObject,"H_ant",sourceObject).carrier_scope_id,target);
+ assert.throws(()=>entry.namespace.artifactOverlayLocator(m,session,"foreign-source","H_ant",sourceObject));
+ assert.throws(()=>entry.namespace.artifactOverlayLocator({...m,artifact_field_locator:{...h,owner:{...h.owner,object_id:"foreign-source"}}},session,sourceObject,"H_ant",sourceObject));
+ assert.equal(entry.namespace.artifactOverlayLocator(m,session,target,"H_ant").carrier_scope_id,target);
+});
+check("carrier accounting never labels requested glyphs as GPU adoption",()=>{
+ const f=fixture();f.settings.visible=true;const model=render(f),counts=entry.namespace.artifactInspectionPresentation(model);assert.equal(counts.expectedGlyphCount,8);assert.equal(counts.adoptedGlyphCount,null);
+ assert.equal(entry.namespace.artifactInspectionPresentation(render({...f,settings:{...f.settings,vectorBudget:0}})).adoptedGlyphCount,0);
+ assert.equal(entry.namespace.artifactInspectionPresentation(render({...f,settings:{...f.settings,visible:false}})).expectedGlyphCount,0);
+ assert.equal(entry.namespace.artifactInspectionPresentation(null),null);
 });
 console.log(JSON.stringify({status:"passed",checks,unit_test_compilation:false,browser_qualification:false}));

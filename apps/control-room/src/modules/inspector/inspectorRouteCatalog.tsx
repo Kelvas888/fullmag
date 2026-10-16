@@ -82,7 +82,7 @@ import {
   ObjectRegionOverviewPanel,
   ObjectRegionVisualizationPanel,
 } from "./panels/ObjectRegionsPanel";
-import { ObjectVisualizationPanel } from "./panels/ObjectVisualizationPanel";
+import { ObjectVisualizationPanel } from "./panels/ObjectVisualizationEntryPanel";
 import { PhysicsInteractionPanel } from "./panels/PhysicsInteractionPanel";
 import { PhysicsGraphModuleInspectorPanel } from "./panels/PhysicsGraphModuleInspectorPanel";
 import { PlanarMonitorDraftInspectorPanel } from "./panels/PlanarMonitorDraftInspectorPanel";

@@ -1,4 +1,4 @@
-import type { FieldMetaResource, QuantityCatalogResource } from "../api/apiTypes";
+import type { FieldMetaResource, QuantityCatalogResource, StageExecutionResource } from "../api/apiTypes";
 import { quantityCatalogEntrySupportsSpatialVisualization } from "../api/quantityIds";
 import type { SessionResourceIdentity } from "../resources/sessionResourceIdentity";
 
@@ -59,15 +59,16 @@ export interface ArtifactInspectorFieldBinding {
 }
 
 /** A historical lane never falls back to an unpinned current-field request. */
-export function artifactInspectorFieldBinding({ catalog, catalogReady = true, quantityId, selection, sessionIdentity, targetScope }: {
+export function artifactInspectorFieldBinding({ catalog, catalogReady = true, inspectionOnly = false, quantityId, selection, sessionIdentity, targetScope }: {
   catalog: QuantityCatalogResource | null;
   catalogReady?: boolean;
+  inspectionOnly?: boolean;
   quantityId: string;
   selection: ArtifactFieldSelection | null;
   sessionIdentity: SessionResourceIdentity | null;
   targetScope: { scopeKind: string; scopeId: string | null } | null;
 }): ArtifactInspectorFieldBinding {
-  const historical = Boolean(catalog?.quantities.some(entry => entry.id === quantityId && entry.resolved_capability?.lane === "artifact_inspection_read_only"));
+  const historical = inspectionOnly || Boolean(catalog?.quantities.some(entry => entry.id === quantityId && entry.resolved_capability?.lane === "artifact_inspection_read_only"));
   const blocked = { historical, query: null, identityKey: null, expectedOwner: null };
   if (!historical || !catalogReady || !artifactInspectionQuantity(catalog, quantityId) || !selection || !sessionIdentity || !artifactSelectionMatchesSession(selection, sessionIdentity) || selection.quantityId !== quantityId) return blocked;
   const nonempty = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
@@ -112,13 +113,40 @@ export function artifactInspectorMetadataMatchesBinding(metadata: FieldMetaResou
 }
 
 /** Presentation identity is pinned to the same immutable owner as Inspector metadata. */
+export function artifactCarrierPresentationKey(
+  owner: ArtifactInspectorFieldBinding["expectedOwner"],
+  carrier: Pick<ArtifactInspectorFieldQuery, "carrier_id" | "expected_carrier_revision" | "scope_kind" | "scope_id"> | null,
+): string | null {
+  if (!owner || !carrier) return null;
+  return JSON.stringify(["artifact-surface", owner.session_id, owner.session_epoch, owner.request_scope_epoch,
+    owner.run_id, owner.authored_stage_id, owner.runtime_stage_id, owner.object_id, owner.quantityId,
+    carrier.carrier_id, carrier.expected_carrier_revision, carrier.scope_kind, carrier.scope_id]);
+}
+
+export function artifactInspectionOwnerPlan(definitions: ReadonlyArray<{ id?: string; source_object_id?: string }>, execution: StageExecutionResource | null, identity: { sessionId: string; sessionEpoch: string; requestScopeEpoch: string } | null, selection: ArtifactFieldSelection | null) {
+  const candidates: Array<ArtifactFieldSelection & { status: string }> = [];
+  if (!identity || !execution) return { candidates, selected: null, error: null };
+  if (execution.session_id !== identity.sessionId || execution.session_epoch !== identity.sessionEpoch || execution.request_scope_epoch !== identity.requestScopeEpoch || !execution.run_id) return { candidates, selected: null, error: "Inspection execution belongs to another session." };
+  for (const stage of execution.stages) {
+    if (!stage.antenna_solve_stage_id) continue;
+    const matches = definitions.filter(d => d.id === stage.antenna_solve_stage_id);
+    if (matches.length !== 1 || !matches[0].source_object_id || !stage.stage_id || candidates.some(c => c.runtimeStageId === stage.stage_id)) return { candidates: [], selected: null, error: "Inspection definition/source is missing or ambiguous; no nearest result is adopted." };
+    candidates.push({ identity, runId: execution.run_id, runtimeStageId: stage.stage_id, authoredStageId: stage.antenna_solve_stage_id, sourceObjectId: matches[0].source_object_id, status: stage.status });
+  }
+  if (selection) {
+    const found = artifactSelectionMatchesSession(selection, identity) && selection.runId === execution.run_id && candidates.find(c => c.runtimeStageId === selection.runtimeStageId && c.authoredStageId === selection.authoredStageId && c.sourceObjectId === selection.sourceObjectId);
+    if (!found) return { candidates, selected: null, error: "Selected inspection owner is no longer available; select an execution explicitly." };
+    return { candidates, selected: selection, error: null };
+  }
+  if (candidates.length === 1) return { candidates, selected: candidates[0], error: null };
+  return { candidates, selected: null, error: candidates.length > 1 ? "Multiple inspection owners exist. Select a source and execution." : null };
+}
+
 export function artifactSurfaceRangeKey(
   owner: ArtifactInspectorFieldBinding["expectedOwner"],
   carrier: Pick<ArtifactInspectorFieldQuery, "carrier_id" | "expected_carrier_revision" | "scope_kind" | "scope_id"> | null,
   projectionMode: string | undefined,
 ): string | null {
-  if (!owner || !carrier) return null;
-  return JSON.stringify(["artifact-surface", owner.session_id, owner.session_epoch, owner.request_scope_epoch,
-    owner.run_id, owner.authored_stage_id, owner.runtime_stage_id, owner.object_id, owner.quantityId,
-    carrier.carrier_id, carrier.expected_carrier_revision, carrier.scope_kind, carrier.scope_id, projectionMode ?? "raw_nodal"]);
+  const key = artifactCarrierPresentationKey(owner, carrier);
+  return key ? JSON.stringify([key, projectionMode ?? "raw_nodal"]) : null;
 }

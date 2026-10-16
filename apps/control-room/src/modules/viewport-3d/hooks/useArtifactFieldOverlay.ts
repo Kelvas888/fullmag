@@ -24,7 +24,7 @@ export function useArtifactFieldOverlay(quantityId: string, targetId: string | n
     if (!enabled) return { locator: null, error: null };
     const error = owner.error ?? execution.error?.message ?? execution.refreshError?.message ?? metadata.error?.message ?? metadata.refreshError?.message;
     if (error || metadata.status !== "ready" || !chosen) return { locator: null, error: error ?? null };
-    try { const locator = artifactOverlayLocator(metadata.data, session, targetId, quantityId === "V_electric" ? "V_electric" : quantityId === "J_charge" ? "J_charge" : "H_ant");
+    try { const locator = artifactOverlayLocator(metadata.data, session, targetId, quantityId === "V_electric" ? "V_electric" : quantityId === "J_charge" ? "J_charge" : "H_ant", chosen.sourceObjectId);
       if (!locator) throw new Error("Selected inspection owner has no immutable field metadata.");
       if (locator && (locator.owner.runtime_stage_id !== chosen.runtimeStageId || locator.owner.run_id !== chosen.runId || locator.owner.authored_stage_id !== chosen.authoredStageId || locator.owner.object_id !== chosen.sourceObjectId || (chosen.carrierId && chosen.carrierId !== locator.carrier_id) || (chosen.carrierRevision && chosen.carrierRevision !== locator.carrier_revision))) throw new Error("Inspection metadata differs from the selected immutable owner.");
       return { locator, error: null }; }

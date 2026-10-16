@@ -1,9 +1,8 @@
 import { artifactSurfaceProjection } from "./artifactSurfaceProjection";
 import { buildAveragedSurfaceNodeNormals, resolveVectorSurfaceOffsetDistance } from "../viewport3dRenderModel";
 import { buildVertexScalarColors } from "../viewport3dFieldMapping";
-import type { StageExecutionResource } from "@/kernel/api/apiTypes";
-import type { ArtifactFieldSelection } from "@/kernel/visualization/artifactFieldSelection";
-import { artifactSurfaceRangeKey, artifactSelectionMatchesSession } from "@/kernel/visualization/artifactFieldSelection";
+import type { Viewport3DArtifactInspectionPresentation } from "../viewport3dStore";
+import { artifactCarrierPresentationKey, artifactSurfaceRangeKey } from "@/kernel/visualization/artifactFieldSelection";
 import { scalarColorRgb } from "@/shared/visualization/scalarColorPalette";
 import type { VisualizationTargetSettings } from "@/kernel/visualization/ObjectVisualizationController";
 import { deviceBoundary, MAX_ANTENNA_DISPLAY_SAMPLES, MAX_ANTENNA_DISPLAY_CELLS, MAX_ANTENNA_DISPLAY_PAYLOAD_BYTES } from "./antennaFieldOverlayModel";
@@ -122,7 +121,7 @@ export function buildArtifactFieldOverlayModel(admitted: ReturnType<typeof admit
 export type ArtifactFieldOverlayModel = ReturnType<typeof buildArtifactFieldOverlayModel>;
 
 /** Strict immutable carrier admission before reading any historical field payload. */
-export function artifactOverlayLocator(metadata: unknown, session: { sessionId: string; sessionEpoch: string; requestScopeEpoch: string } | null, targetId: string | null, quantityId: "H_ant" | "J_charge" | "V_electric" = "H_ant") {
+export function artifactOverlayLocator(metadata: unknown, session: { sessionId: string; sessionEpoch: string; requestScopeEpoch: string } | null, targetId: string | null, quantityId: "H_ant" | "J_charge" | "V_electric" = "H_ant", sourceInspectionObjectId: string | null = null) {
   if (!session || !metadata || typeof metadata !== "object") return null;
   const m = metadata as Record<string, unknown>, capability = m.resolved_capability as Record<string, unknown> | undefined;
   const scalar = quantityId === "V_electric", components = scalar ? 1 : 3;
@@ -134,7 +133,7 @@ export function artifactOverlayLocator(metadata: unknown, session: { sessionId: 
   const locator = parseArtifactFieldLocator(m.artifact_field_locator);
   if (!(scalar ? locator.indexing === "source_nodes" : quantityId === "J_charge" ? locator.indexing === "tet4_cell_local_nodes" : ["sample_nodes", "point_samples"].includes(locator.indexing))) throw new Error("Inspection quantity has an incompatible owned indexing.");
   if (locator.owner.session_id !== session.sessionId || locator.owner.session_epoch !== session.sessionEpoch || locator.owner.request_scope_epoch !== session.requestScopeEpoch
-    || (locator.carrier_scope_kind === "object" && locator.carrier_scope_id !== targetId)) throw new Error("Vector inspection target/session ownership mismatch.");
+    || (locator.carrier_scope_kind === "object" && locator.carrier_scope_id !== targetId && !(sourceInspectionObjectId === targetId && locator.owner.object_id === sourceInspectionObjectId))) throw new Error("Vector inspection target/session ownership mismatch.");
   const carriers = capability.carriers;
   if (!Array.isArray(carriers) || carriers.length !== 1) throw new Error("Vector inspection requires one immutable carrier.");
   const c = carriers[0];
@@ -143,24 +142,7 @@ export function artifactOverlayLocator(metadata: unknown, session: { sessionId: 
   return locator;
 }
 
-export function artifactInspectionOwnerPlan(definitions: ReadonlyArray<{ id?: string; source_object_id?: string }>, execution: StageExecutionResource | null, identity: { sessionId: string; sessionEpoch: string; requestScopeEpoch: string } | null, selection: ArtifactFieldSelection | null) {
-  const candidates: Array<ArtifactFieldSelection & { status: string }> = [];
-  if (!identity || !execution) return { candidates, selected: null, error: null };
-  if (execution.session_id !== identity.sessionId || execution.session_epoch !== identity.sessionEpoch || execution.request_scope_epoch !== identity.requestScopeEpoch || !execution.run_id) return { candidates, selected: null, error: "Inspection execution belongs to another session." };
-  for (const stage of execution.stages) {
-    if (!stage.antenna_solve_stage_id) continue;
-    const matches = definitions.filter(d => d.id === stage.antenna_solve_stage_id);
-    if (matches.length !== 1 || !matches[0].source_object_id || !stage.stage_id || candidates.some(c => c.runtimeStageId === stage.stage_id)) return { candidates: [], selected: null, error: "Inspection definition/source is missing or ambiguous; no nearest result is adopted." };
-    candidates.push({ identity, runId: execution.run_id, runtimeStageId: stage.stage_id, authoredStageId: stage.antenna_solve_stage_id, sourceObjectId: matches[0].source_object_id, status: stage.status });
-  }
-  if (selection) {
-    const found = artifactSelectionMatchesSession(selection, identity) && selection.runId === execution.run_id && candidates.find(c => c.runtimeStageId === selection.runtimeStageId && c.authoredStageId === selection.authoredStageId && c.sourceObjectId === selection.sourceObjectId);
-    if (!found) return { candidates, selected: null, error: "Selected inspection owner is no longer available; select an execution explicitly." };
-    return { candidates, selected: selection, error: null };
-  }
-  if (candidates.length === 1) return { candidates, selected: candidates[0], error: null };
-  return { candidates, selected: null, error: candidates.length > 1 ? "Multiple inspection owners exist. Select a source and execution." : null };
-}
+export { artifactInspectionOwnerPlan } from "@/kernel/visualization/artifactFieldSelection";
 
 /** Historical presentation never aliases an unpinned live-field scale. */
 export function artifactRenderedSurfaceRanges(model: ArtifactFieldOverlayModel | null) {
@@ -173,4 +155,22 @@ export function artifactRenderedSurfaceRanges(model: ArtifactFieldOverlayModel |
   return [{ component: model.intent.component, quantityId: model.quantityId, inspectionKey,
     scopeKind: locator.carrier_scope_kind, scopeId: locator.carrier_scope_id,
     range: { min: model.minimum, max: model.maximum } }];
+}
+
+export function artifactInspectionPresentation(model: ArtifactFieldOverlayModel | null): Viewport3DArtifactInspectionPresentation | null {
+  if (!model) return null;
+  const locator = model.locator;
+  const key = artifactCarrierPresentationKey({ ...locator.owner, quantityId: model.quantityId }, {
+    carrier_id: locator.carrier_id, expected_carrier_revision: locator.carrier_revision,
+    scope_kind: locator.carrier_scope_kind, scope_id: locator.carrier_scope_id,
+  });
+  if (!key) return null;
+  const expectedGlyphCount = model.settings.visible ? model.glyphCount : 0;
+  return { key, fieldBufferId: model.key, vectorBuildKey: `${model.key}:glyphs:${model.glyphStyleKey}`,
+    decodedSampleCount: model.count, availableGlyphCount: model.availableGlyphCount, expectedGlyphCount,
+    adoptedGlyphCount: expectedGlyphCount === 0 ? 0 : null,
+    capacity: { anchorKind: "node", carrierId: locator.carrier_id, generation: locator.carrier_digest,
+      revision: locator.carrier_revision, topologyHash: locator.carrier_digest, targetId: `object:${locator.owner.object_id}`,
+      fullCount: model.count, surfaceCount: model.geometry.surfaceSampleIndices?.length ?? 0,
+      exact: Boolean(model.geometry.surfaceSampleIndices), fullExact: true, surfaceExact: Boolean(model.geometry.surfaceSampleIndices) } };
 }

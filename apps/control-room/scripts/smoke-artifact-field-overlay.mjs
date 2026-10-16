@@ -12,12 +12,12 @@ if (!inside(await realpath(storage), await realpath(dirname(directory)))) throw 
 await mkdir(directory, { recursive: true });
 if (!inside(await realpath(storage), await realpath(directory))) throw new Error("Artifact fixture output escaped storage");
 const checks = [], screenshots = [], errors = [];
-let browser, failure;
+let browser, failure, page;
 try {
   let playwright;
   try { playwright = await import("playwright"); } catch { playwright = await import("@playwright/test"); }
   browser = await playwright.chromium.launch({ headless: true, ...(process.env.FULLMAG_ARTIFACT_FIELD_OVERLAY_BROWSER_CHANNEL ? { channel: process.env.FULLMAG_ARTIFACT_FIELD_OVERLAY_BROWSER_CHANNEL } : {}) });
-  const page = await browser.newPage({ viewport: { width: 1100, height: 850 } });
+  page = await browser.newPage({ viewport: { width: 1100, height: 850 } });
   page.on("pageerror", error => errors.push(error.message));
   page.on("console", message => { if (message.type() === "error" || /THREE.Color: Unknown color/.test(message.text())) errors.push(message.text()); });
   await page.addInitScript(() => {
@@ -326,7 +326,122 @@ try {
   assert.equal((await read()).state.calls.length, settled.state.calls.length);
   assert.deepEqual((await read()).state.unexpected, []); assert.deepEqual(errors, []);
   checks.push("Valid owner restores both exact ranges and controls remain idle without repeat requests");
-} catch (error) { failure = error instanceof Error ? error : new Error(String(error)); }
+  await page.getByRole("button", { name: "Mount dedicated antenna Inspector", exact: true }).click();
+  const dedicated = page.getByRole("complementary", { name: "Dedicated antenna Inspector", exact: true });
+  await dedicated.locator('[data-inspector-owner="object.antenna.visualization"]').waitFor();
+  const quantitySource = dedicated.getByRole("combobox", { name: "Quantity Source", exact: true });
+  await quantitySource.waitFor();
+  await ready("H_ant");
+  assert.equal(await dedicated.getByRole("combobox", { name: "Result representation", exact: true }).inputValue(), "inspection");
+  const forbidden = calls => calls.filter(call => /antenna|\/mesh\/|shared-domain|membership|multilayer|\/domain\/(?!topology$)/.test(call.path) || (call.path.endsWith("/domain/topology") && !call.carrier));
+  assert.deepEqual(forbidden((await read()).state.calls), []);
+  checks.push("Actual dedicated AntennaVisualizationPanel mounts the shared Inspector in raw SI mode with genuine Kernel controllers and no legacy or magnetic-resource requests");
+  for (const quantity of ["H_ant", "J_charge", "V_electric"]) {
+    await page.waitForFunction(() => window.__artifactDedicatedFixture && !window.__artifactDedicatedFixture.read().pending);
+    if (await quantitySource.inputValue() !== quantity) await quantitySource.selectOption(quantity);
+    const field = await ready(quantity);
+    assert.equal(field.state.unit, quantity === "V_electric" ? "V" : quantity === "J_charge" ? "A/m^2" : "A/m");
+    assert.equal(field.canvas.lost, false); assert.ok(field.canvas.width > 0 && field.canvas.height > 0);
+    assert.equal(await dedicated.getByRole("combobox", { name: "Result representation", exact: true }).inputValue(), "inspection");
+    const geometryGroup = dedicated.getByRole("button", { name: /^Geometry Scope/ });
+    if (await geometryGroup.count() && !await dedicated.getByRole("radiogroup", { name: "Geometry scope", exact: true }).isVisible()) await geometryGroup.click();
+    const scope = dedicated.getByRole("radiogroup", { name: "Geometry scope", exact: true });
+    if (await scope.isVisible()) {
+      await scope.getByRole("radio", { name: "Surface", exact: true }).click();
+      await page.waitForFunction(() => window.__artifactOverlayFixture?.read().scope === "surface");
+      await scope.getByRole("radio", { name: "Full", exact: true }).click();
+      await page.waitForFunction(() => window.__artifactOverlayFixture?.read().scope === "full");
+    }
+    if (quantity === "V_electric") assert.equal(await dedicated.getByRole("button", { name: /^Vectors/ }).count(), 0);
+    else {
+      const surfaceSection = dedicated.getByRole("button", { name: /^Surface Coloring/ });
+      const projection = dedicated.getByRole("combobox", { name: "Projection", exact: true });
+      if (!await projection.isVisible()) await surfaceSection.click();
+      await projection.selectOption("raw_nodal");
+    }
+    assert.deepEqual(forbidden((await read()).state.calls), []);
+  }
+  checks.push("Actual dedicated shared groups select H/J/V with canonical units, raw projection and available full/surface scopes; scalar V exposes no vector controls and WebGL remains live");
+  await quantitySource.selectOption("H_ant"); await ready("H_ant");
+  await page.waitForFunction(() => window.__artifactDedicatedFixture && !window.__artifactDedicatedFixture.read().pending);
+  const vectorToggle = dedicated.getByRole("button", { name: "Toggle vector field arrows", exact: true });
+  if (await vectorToggle.getAttribute("aria-pressed") !== "true") await vectorToggle.click();
+  const vectorSection = dedicated.getByRole("button", { name: /^Vectors/ });
+  const arrowBudget = dedicated.getByRole("slider", { name: "Arrow budget", exact: true });
+  if (!await arrowBudget.isVisible()) await vectorSection.click();
+  await arrowBudget.focus(); await arrowBudget.press("End");
+  const waitCounts = async (available, adopted) => page.waitForFunction(({ available, adopted }) => {
+    const root = document.querySelector('aside[aria-label="Dedicated antenna Inspector"]');
+    const rows = [...root.querySelectorAll('.fm-inspector-field-row')];
+    const value = label => rows.find(row => row.querySelector('.fm-inspector-field-row__label')?.textContent === label)?.querySelector('.fm-inspector-field-row__value')?.textContent;
+    return value("Decoded field samples") === "5" && value("Available vector anchors") === `${available} samples` && value("Adopted arrows") === String(adopted);
+  }, { available, adopted });
+  await waitCounts(5, 5);
+  const ownedScope = dedicated.getByRole("radiogroup", { name: "Geometry scope", exact: true });
+  await ownedScope.getByRole("radio", { name: "Surface", exact: true }).click(); await waitCounts(4, 4);
+  await ownedScope.getByRole("radio", { name: "Full", exact: true }).click(); await waitCounts(5, 5);
+  await page.waitForFunction(() => window.__artifactDedicatedFixture && !window.__artifactDedicatedFixture.read().pending);
+  await page.waitForFunction(() => {
+    const root = document.querySelector('aside[aria-label="Dedicated antenna Inspector"]');
+    return root.textContent.includes("Historical snapshot") && !root.textContent.includes("Materializing");
+  });
+  const actualCounts = await read(); assert.ok(actualCounts.canvas.glyphCounts.every(count => count === 5));
+  checks.push("Actual dedicated Inspector reports five decoded H samples, exact full/surface anchors 5/4 and actual GPU-adopted arrows 5/4; historical readiness never becomes live Materializing");
+  const surface = dedicated.getByRole("combobox", { name: "Color source", exact: true });
+  if (!await surface.isVisible()) await dedicated.getByRole("button", { name: /^Surface Coloring/ }).click();
+  const opacity = dedicated.getByRole("slider", { name: "Surface opacity", exact: true });
+  await opacity.waitFor();
+  const draft = dedicated.getByRole("textbox", { name: "Dedicated unrelated draft", exact: true });
+  await draft.fill("retained during real ACK");
+  await page.evaluate(() => {
+    const root = document.querySelector('[data-antenna-visualization-root]');
+    const scroll = document.querySelector('[data-testid="dedicated-inspector-scroll"]');
+    window.__dedicatedRoot = root;
+    window.__dedicatedUnrelated = [...root.querySelectorAll('button,input,select,[role="switch"],[role="slider"]')].filter(node => node.getAttribute("aria-label") !== "Surface opacity").map(node => ({ node, disabled: node.disabled ?? false, ariaDisabled: node.getAttribute("aria-disabled"), opacity: getComputedStyle(node).opacity }));
+    scroll.scrollTop = 160;
+    window.__artifactDedicatedFixture.holdWrites();
+  });
+  const beforeWrite = await page.evaluate(() => window.__artifactDedicatedFixture.read());
+  assert.equal(beforeWrite.pending, false, "Pending/ACK stability starts only after prior scope transactions settle");
+  const beforeMutation = await read();
+  await opacity.focus(); await opacity.press("ArrowLeft");
+  await page.waitForFunction(() => window.__artifactDedicatedFixture?.read().pendingWrites === 1);
+  await draft.focus();
+  await page.evaluate(() => { const scroll = document.querySelector('[data-testid="dedicated-inspector-scroll"]'); scroll.scrollTop = 160; window.__dedicatedScroll = scroll.scrollTop; });
+  const assertStable = async () => {
+    const state = await page.evaluate(() => {
+      const root = document.querySelector('[data-antenna-visualization-root]'), scroll = document.querySelector('[data-testid="dedicated-inspector-scroll"]');
+      return { root: root === window.__dedicatedRoot, focused: document.activeElement?.getAttribute("aria-label"), scroll: scroll.scrollTop, expectedScroll: window.__dedicatedScroll,
+        changed: window.__dedicatedUnrelated.filter(row => !row.node.isConnected || (row.node.disabled ?? false) !== row.disabled || row.node.getAttribute("aria-disabled") !== row.ariaDisabled || getComputedStyle(row.node).opacity !== row.opacity).map(row => ({ label: row.node.getAttribute("aria-label") ?? row.node.textContent, connected: row.node.isConnected, beforeDisabled: row.disabled, disabled: row.node.disabled ?? false, beforeAriaDisabled: row.ariaDisabled, ariaDisabled: row.node.getAttribute("aria-disabled"), beforeOpacity: row.opacity, opacity: getComputedStyle(row.node).opacity })),
+        opacityAnimations: root.getAnimations({ subtree: true }).filter(animation => animation.effect?.getKeyframes().some(frame => Object.hasOwn(frame, "opacity"))).length };
+    });
+    assert.equal(state.root, true); assert.equal(state.focused, "Dedicated unrelated draft"); assert.equal(state.scroll, state.expectedScroll);
+    assert.deepEqual(state.changed, []); assert.equal(state.opacityAnimations, 0); assert.equal(await draft.inputValue(), "retained during real ACK");
+    const frame = await read(); assert.equal(frame.canvas.lost, false); assert.ok(frame.canvas.width > 0 && frame.canvas.height > 0);
+    assert.deepEqual(frame.canvas.geometryIds, beforeMutation.canvas.geometryIds);
+    assert.equal(frame.state.calls.filter(call => call.binary).length, beforeMutation.state.calls.filter(call => call.binary).length);
+  };
+  await assertStable();
+  await page.evaluate(() => window.__artifactDedicatedFixture.releaseWrites());
+  await page.waitForFunction(revision => window.__artifactDedicatedFixture?.read().revision > revision, beforeWrite.revision);
+  await page.waitForFunction(() => window.__artifactDedicatedFixture && !window.__artifactDedicatedFixture.read().pending);
+  await page.waitForTimeout(250);
+  await assertStable();
+  const afterWrite = await page.evaluate(() => window.__artifactDedicatedFixture.read());
+  assert.equal(afterWrite.writes, beforeWrite.writes + 1);
+  assert.ok(afterWrite.renders - beforeWrite.renders <= 30);
+  assert.ok((await read()).state.calls.length - beforeMutation.state.calls.length <= 5);
+  assert.deepEqual(forbidden((await read()).state.calls), []);
+  await screenshot("09-full-dedicated-inspector-ack");
+  checks.push("Genuine VisualizationRegistrySyncController PATCH pending/ACK preserves the dedicated Inspector root, unrelated controls, focus, scroll and draft with no opacity animation, geometry replacement or binary reload and bounded requests/renders");
+  assert.deepEqual((await read()).state.unexpected, []); assert.deepEqual(errors, []);
+} catch (error) {
+  failure = error instanceof Error ? error : new Error(String(error));
+  if (page) {
+    await page.screenshot({ path: resolve(directory, "failure.png"), fullPage: true }).catch(() => {});
+    await writeFile(resolve(directory, "failure-state.json"), JSON.stringify({ text: await page.locator("body").innerText().catch(() => "unavailable"), fixture: await page.evaluate(() => window.__artifactDedicatedFixture?.read()).catch(() => null) }, null, 2));
+  }
+}
 finally {
   await browser?.close();
   await writeFile(resolve(directory, "artifact-field-overlay.json"), JSON.stringify({ schema_version: "fullmag_artifact_field_overlay_browser_v1", status: failure ? "failed" : "passed", scope: "controlled production frontend transport fixture; no solver or actual HTTP/CAS qualification", checks, screenshots, errors, failure: failure?.stack ?? null }, null, 2));

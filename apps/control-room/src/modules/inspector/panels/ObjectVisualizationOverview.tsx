@@ -18,6 +18,7 @@ export interface VisualizationInspectorOverviewProps {
   display: ReactNode;
   enabledPassCount: number;
   meshState: string;
+  meshStateLabel?: string;
   quantitySource: string;
   surfaceColoring: ReactNode;
   vectors: ReactNode;
@@ -33,6 +34,7 @@ export function VisualizationInspectorOverview({
   display,
   enabledPassCount,
   meshState,
+  meshStateLabel = "Mesh Readiness",
   quantitySource,
   surfaceColoring,
   vectors,
@@ -55,7 +57,7 @@ export function VisualizationInspectorOverview({
           },
           { label: "Quantity Source", value: quantitySource },
           {
-            label: "Mesh Readiness",
+            label: meshStateLabel,
             tone: meshState === "Ready" ? "success" : "degraded",
             value: meshState,
           },
