@@ -361,10 +361,14 @@ else:
                     self.module._write_lifecycle_log(
                         "frontend_start",
                         watchpack_polling_ms=receipt["watchpack_polling_ms"],
+                        uv_threadpool_size=receipt["uv_threadpool_size"],
                     )
             self.assertEqual(environment["WATCHPACK_POLLING"], "2000")
             self.assertEqual(receipt["watchpack_polling_ms"], 2000)
+            self.assertEqual(environment["UV_THREADPOOL_SIZE"], "16")
+            self.assertEqual(receipt["uv_threadpool_size"], 16)
             self.assertIn("watchpack_polling_ms=2000", stdout.getvalue())
+            self.assertIn("uv_threadpool_size=16", stdout.getvalue())
 
             with patch.dict(
                 os.environ,
@@ -375,6 +379,20 @@ else:
                 overridden_receipt = self.module._receipt_base(inputs, None)
             self.assertEqual(overridden["WATCHPACK_POLLING"], "1500")
             self.assertEqual(overridden_receipt["watchpack_polling_ms"], 1500)
+
+    def test_node_filesystem_threads_are_pinned_and_uncontrolled_node_options_do_not_leak(self):
+        with isolated(self.module) as (_root, _workspace, inputs):
+            with patch.dict(
+                os.environ,
+                {
+                    "UV_THREADPOOL_SIZE": "4",
+                    "NODE_OPTIONS": "--require=/tmp/untrusted.js",
+                },
+                clear=False,
+            ):
+                environment = self.module._safe_environment(inputs)
+            self.assertEqual(environment["UV_THREADPOOL_SIZE"], "16")
+            self.assertNotIn("NODE_OPTIONS", environment)
 
     def test_watchpack_polling_rejects_values_outside_bounded_integer_contract(self):
         with isolated(self.module) as (_root, _workspace, inputs):

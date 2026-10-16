@@ -147,6 +147,8 @@ WATCHPACK_POLLING_ENV = "FULLMAG_WATCHPACK_POLLING_MS"
 WATCHPACK_POLLING_DEFAULT_MS = 2000
 WATCHPACK_POLLING_MIN_MS = 250
 WATCHPACK_POLLING_MAX_MS = 10000
+NODE_FS_THREADS_ENV = "UV_THREADPOOL_SIZE"
+NODE_FS_THREADS = 16
 PROCESS_IDENTITY_FIELDS = (
     "pid_namespace",
     "process_start_time_ticks",
@@ -1021,6 +1023,10 @@ def _safe_environment(
         "FULLMAG_FRONTEND_ROOT": str(FRONTEND_ROOT),
         "FULLMAG_NEXT_DIST_DIR": NEXT_DIST_DIR,
         "WATCHPACK_POLLING": str(polling_ms),
+        # Keep Node's filesystem worker pool explicit for the Windows bind
+        # mount.  This is deliberately independent of NODE_OPTIONS and is not
+        # inherited from the container/operator environment.
+        NODE_FS_THREADS_ENV: str(NODE_FS_THREADS),
         "FULLMAG_API_PROXY_TARGET": API_PROXY_TARGET,
         "FULLMAG_API_URL": API_PROXY_TARGET,
         "FULLMAG_WEB_PUBLIC_HOST": "localhost",
@@ -1076,6 +1082,7 @@ def _receipt_base(
         "log_path": str(LOG_PATH),
         "tool_probe_timeout_seconds": TOOL_TIMEOUT_SECONDS,
         "watchpack_polling_ms": polling_ms,
+        "uv_threadpool_size": NODE_FS_THREADS,
     }
     failure = _receipt_failure(previous)
     if failure is not None:
@@ -1584,6 +1591,8 @@ def _start_next(
     if type(receipt_polling_ms) is not int:
         _fail("frontend receipt is missing the bounded Watchpack polling value")
     watchpack_polling_ms = _validate_watchpack_polling_ms(receipt_polling_ms)
+    if receipt.get("uv_threadpool_size") != NODE_FS_THREADS:
+        _fail("frontend receipt is missing the pinned Node filesystem thread count")
     app_root = inputs.workspace_root / "apps" / "control-room"
     command = [
         str(NODE_BINARY),
@@ -1602,6 +1611,7 @@ def _start_next(
         url=f"http://localhost:{inputs.host_port}",
         internal_port=INTERNAL_PORT,
         watchpack_polling_ms=watchpack_polling_ms,
+        uv_threadpool_size=NODE_FS_THREADS,
         log_path=LOG_PATH,
     )
     try:
@@ -1621,6 +1631,7 @@ def _start_next(
             elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
             url=f"http://localhost:{inputs.host_port}",
             watchpack_polling_ms=watchpack_polling_ms,
+            uv_threadpool_size=NODE_FS_THREADS,
             error=str(error),
         )
         _fail(f"Next development process could not start: {error}")
@@ -1648,6 +1659,7 @@ def _start_next(
             elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
             url=f"http://localhost:{inputs.host_port}",
             watchpack_polling_ms=watchpack_polling_ms,
+            uv_threadpool_size=NODE_FS_THREADS,
             error=str(error),
         )
         raise
@@ -1670,6 +1682,7 @@ def _start_next(
         elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
         url=f"http://localhost:{inputs.host_port}",
         watchpack_polling_ms=watchpack_polling_ms,
+        uv_threadpool_size=NODE_FS_THREADS,
         log_path=LOG_PATH,
     )
     return handle
