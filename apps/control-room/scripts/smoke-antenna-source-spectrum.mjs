@@ -24,6 +24,7 @@ try {
   browser = await playwright.chromium.launch({ headless: true, ...(channel ? { channel } : {}) });
   page = await browser.newPage({ viewport: { width: 1280, height: 1000 } });
   await page.addInitScript(() => {
+    Object.defineProperty(window, "showSaveFilePicker", { value: undefined, writable: true, configurable: true });
     window.__spectrumDecodeReads = 0;
     const readFloat64 = DataView.prototype.getFloat64;
     DataView.prototype.getFloat64 = function (...args) {
@@ -129,6 +130,36 @@ try {
         assert.deepEqual(JSON.parse(await readFile(retryPath, "utf8")).data, data);
         assert.equal(await page.getByRole("alert").filter({ hasText: "Spectrum export failed. Try again." }).count(), 0);
         checks.push({ name: "Download failure exposes an accessible error; retry downloads identical data and clears it", passed: true });
+        const countBeforeStream = downloads.length;
+        await page.evaluate(() => {
+          const state = window.__spectrumWriter = { chunks: [], active: 0, maximum: 0, closed: 0, aborted: 0, activated: false, filename: null };
+          window.showSaveFilePicker = async options => {
+            state.activated = navigator.userActivation.isActive;
+            state.filename = options.suggestedName;
+            return { createWritable: async () => ({
+              async write(chunk) { state.active++; state.maximum = Math.max(state.maximum, state.active); await new Promise(resolve => setTimeout(resolve, 0)); state.chunks.push(chunk); state.active--; },
+              async close() { state.closed++; }, async abort() { state.aborted++; },
+            }) };
+          };
+        });
+        await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).click();
+        await page.waitForFunction(() => window.__spectrumWriter.closed === 1);
+        const stream = await page.evaluate(() => window.__spectrumWriter);
+        assert.equal(stream.activated, true); assert.equal(stream.filename, "antenna-spectrum-fft.json");
+        assert.equal(stream.maximum, 1); assert.equal(stream.aborted, 0);
+        assert.deepEqual(JSON.parse(stream.chunks.join("")), exported); assert.equal(downloads.length, countBeforeStream);
+        await page.evaluate(() => { window.showSaveFilePicker = async () => { throw new DOMException("Canceled", "AbortError"); }; });
+        await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).click();
+        await page.waitForFunction(() => [...document.querySelectorAll("button")].some(button => button.textContent === "Export full spectrum (JSON)" && !button.disabled));
+        assert.equal(await page.getByRole("alert").filter({ hasText: "Spectrum export failed. Try again." }).count(), 0);
+        assert.equal(downloads.length, countBeforeStream);
+        await page.evaluate(() => { window.showSaveFilePicker = async () => ({ createWritable: async () => { throw new DOMException("Controlled write rejection", "AbortError"); } }); });
+        await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).click();
+        await page.getByRole("alert").filter({ hasText: "Spectrum export failed. Try again." }).waitFor();
+        assert.equal(downloads.length, countBeforeStream);
+        await page.evaluate(() => { window.showSaveFilePicker = undefined; });
+        checks.push({ name: "Streaming sink receives exact full JSON with click activation and serialized writes; picker cancellation is quiet while write AbortError is visible", passed: true });
+
       }
       const decodeReads = await page.evaluate(() => window.__spectrumDecodeReads);
       const peakButton = page.getByRole("button", { name: "Inspect peak", exact: true });

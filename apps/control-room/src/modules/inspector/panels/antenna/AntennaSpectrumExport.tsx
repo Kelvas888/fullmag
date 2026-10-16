@@ -2,45 +2,24 @@
 
 import { useLayoutEffect, useRef, useState } from "react";
 
-import type { AntennaSourceSpectrumResource } from "@/kernel/api/apiTypes";
 import { downloadChartBlob } from "@/shared/analysis-charts/chartExport";
 import { Button } from "@/shared/ui/Button";
 
-interface SpectrumExportProps {
-  spectrum: AntennaSourceSpectrumResource;
-  amplitudes: readonly number[];
-  kU: readonly number[];
-  kV: readonly number[];
-  power: readonly number[];
-}
+import { spectrumExportChunks, writeSpectrumExport, type SpectrumExportData } from "./AntennaSpectrumExportModel";
 
-/** Exports validated full-resolution carriers, never the pooled display cells. */
-async function spectrumExportBlob(source: SpectrumExportProps, signal: AbortSignal): Promise<Blob> {
-  const parts: BlobPart[] = [
-    '{"export_schema":"fullmag_source_spectrum_export.v1","manifest":',
-    JSON.stringify(source.spectrum),
-    ',"data":{',
-  ];
-  const arrays = [
-    ["k_u_rad_per_m", source.kU], ["k_v_rad_per_m", source.kV],
-    ["amplitudes_re_im", source.amplitudes], ["power", source.power],
-  ] as const;
-  for (const [arrayIndex, [name, values]] of arrays.entries()) {
-    parts.push(`${arrayIndex ? "," : ""}"${name}":[`);
-    for (let offset = 0; offset < values.length; offset += 4096) {
-      await new Promise<void>(resolve => setTimeout(resolve, 0));
-      signal.throwIfAborted();
-      const chunk = JSON.stringify(values.slice(offset, offset + 4096));
-      parts.push(new Blob([`${offset ? "," : ""}${chunk.slice(1, -1)}`]));
-    }
-    parts.push("]");
-  }
+/** Compatibility download when a direct file writer is unavailable. */
+async function spectrumExportBlob(source: SpectrumExportData, signal: AbortSignal): Promise<Blob> {
+  const parts: BlobPart[] = [];
+  for await (const chunk of spectrumExportChunks(source, signal)) parts.push(new Blob([chunk]));
   signal.throwIfAborted();
-  parts.push("}}\n");
   return new Blob(parts, { type: "application/json" });
 }
 
-export function AntennaSpectrumExport(props: SpectrumExportProps) {
+type SpectrumSaveWindow = Window & {
+  showSaveFilePicker?: (options: { suggestedName: string; types: Array<{ description: string; accept: Record<string, string[]> }> }) => Promise<FileSystemFileHandle>;
+};
+
+export function AntennaSpectrumExport(props: SpectrumExportData) {
   const { spectrum, amplitudes, kU, kV, power } = props;
   const job = useRef<AbortController | null>(null);
   const [pending, setPending] = useState(false);
@@ -54,11 +33,25 @@ export function AntennaSpectrumExport(props: SpectrumExportProps) {
     setPending(true);
     setFailed(false);
     try {
-      const content = await spectrumExportBlob(props, controller.signal);
-      controller.signal.throwIfAborted();
       const id = spectrum.output_id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "output";
-      if (!downloadChartBlob({ content, filename: `antenna-spectrum-${id}.json`, mimeType: "application/json" })) {
-        setFailed(true);
+      const filename = `antenna-spectrum-${id}.json`;
+      const picker = (window as SpectrumSaveWindow).showSaveFilePicker;
+      if (picker) {
+        // Invoke before yielding so the browser retains the click activation.
+        let handle: FileSystemFileHandle;
+        try {
+          handle = await picker.call(window, { suggestedName: filename, types: [{ description: "Spectrum JSON", accept: { "application/json": [".json"] } }] });
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") return;
+          throw error;
+        }
+        controller.signal.throwIfAborted();
+        const writable = await handle.createWritable();
+        await writeSpectrumExport(props, writable, controller.signal);
+      } else {
+        const content = await spectrumExportBlob(props, controller.signal);
+        controller.signal.throwIfAborted();
+        if (!downloadChartBlob({ content, filename, mimeType: "application/json" })) setFailed(true);
       }
     } catch {
       if (!controller.signal.aborted) setFailed(true);
