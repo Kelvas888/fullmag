@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useMemo, useState } from "react";
+import { useId, useMemo, useRef, useState } from "react";
 
 import type {
   AntennaSourceSpectrumResource,
@@ -13,6 +13,7 @@ import {
   useAntennaSourceSpectrumPayloadResource,
 } from "@/kernel/resources/antennaResources";
 import type { ResourceResult } from "@/kernel/resources/resourceTypes";
+import { Button } from "@/shared/ui/Button";
 
 const MAX_AXIS_CELLS = 64;
 const MAX_DISPLAY_PAYLOAD_BYTES = 64 * 1024 * 1024;
@@ -172,7 +173,7 @@ export function AntennaSourceSpectrumPayloadView({
         </span>
       </div>
       <SpectrumPowerGrid cells={cells} kU={payloads.value.kU} kV={payloads.value.kV}
-        waveVectorUnit={spectrum.wave_vector_unit} powerUnit={powerUnit} isBinned={isBinned} />
+        waveVectorUnit={spectrum.wave_vector_unit} powerUnit={powerUnit} isBinned={isBinned} peakIndex={extrema?.peakIndex ?? -1} />
       {extrema ? <SpectrumPowerScale minimum={extrema.minimum} maximum={extrema.maximum} unit={powerUnit} /> : null}
       <div className="fm-antenna-spectrum__axes" aria-label="Source spectrum axes">
         <span>u: {Math.min(MAX_AXIS_CELLS, payloads.value.kU.length)} / {payloads.value.kU.length} · {spectrum.wave_vector_unit}</span>
@@ -232,22 +233,30 @@ function spectrumGridTarget(key: string, index: number, columns: number, count: 
 }
 
 /** Selection stays local: keyboard inspection never redecodes payloads or refetches resources. */
-function SpectrumPowerGrid({ cells, kU, kV, waveVectorUnit, powerUnit, isBinned }: {
+function SpectrumPowerGrid({ cells, kU, kV, waveVectorUnit, powerUnit, isBinned, peakIndex }: {
   cells: readonly HeatmapCell[]; kU: readonly number[]; kV: readonly number[];
-  waveVectorUnit: string; powerUnit: string; isBinned: boolean;
+  waveVectorUnit: string; powerUnit: string; isBinned: boolean; peakIndex: number;
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
   const helpId = useId();
+  const gridRef = useRef<HTMLDivElement>(null);
+  const peakCellIndex = useMemo(() => cells.findIndex(cell =>
+    cell.kVIndex * kU.length + cell.kUIndex === peakIndex), [cells, kU.length, peakIndex]);
   const columns = Math.min(MAX_AXIS_CELLS, kU.length);
   const rows = Math.ceil(cells.length / columns);
   const selectedIndex = Math.min(activeIndex, cells.length - 1);
   const selected = cells[selectedIndex];
   return <>
+    <div className="fm-antenna-spectrum__axes">
+      <Button size="sm" variant="secondary" disabled={peakCellIndex < 0} onClick={() => {
+        gridRef.current?.querySelector<HTMLElement>(`[data-spectrum-cell-index="${peakCellIndex}"]`)?.focus();
+      }}>Inspect peak</Button>
+    </div>
     <p id={helpId} className="fm-antenna-spectrum__subtitle">
       Arrow keys inspect cells. Home/End move within a row; Ctrl+Home/End move to the grid edges.
       Cells follow the published k-grid order. Cell spacing represents sample indices, not k-distance; pooled cells report their strongest sample.
     </p>
-    <div className="fm-antenna-spectrum__heatmap" role="grid"
+    <div ref={gridRef} className="fm-antenna-spectrum__heatmap" role="grid"
       aria-label={`${cells.length} source-spectrum power cells`} aria-describedby={helpId}
       aria-rowcount={rows} aria-colcount={columns}
       style={{ gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))` }}>

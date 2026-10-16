@@ -19,7 +19,7 @@ import type { KernelApi } from "@/kernel/types";
 import { Button } from "@/shared/ui/Button";
 import { AntennaCompositionPanel } from "@/modules/inspector/panels/antenna/AntennaCompositionPanels";
 
-const SCENARIOS = ["ready", "ready-vector", "ready-unitary", "ready-large", "oversized-grid", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"] as const;
+const SCENARIOS = ["ready", "ready-tied-peak", "ready-vector", "ready-unitary", "ready-large", "oversized-grid", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"] as const;
 const subscribe = () => () => {};
 type RefreshKind = "metadata" | "catalog" | "power";
 interface Evidence { scenario: string; calls: { path: string; scope: string | null }[]; unexpected: string[]; pending: number; streamCancelled: boolean; snapshots: Record<RefreshKind, { status: string; hasData: boolean; error: string | null }>; }
@@ -40,6 +40,10 @@ function makeFixture() {
   const scene = { revision: 1, objects: [], antenna_port_modes: [{ id: "port" }], antenna_field_solve_stages: [{ id: "solve", port_mode_ids: ["port"], outputs: [{ id: "basis", quantity: "H_ant_basis" }] }], antenna_spectrum_requests: [{ id: "request", output_id: "fft", solution_ref: ref, target: { kind: "global" }, component: scenario === "invalid-authoring" ? "transverse" : vector ? "vector_power" : "x", transform: "spatial_fft", window: "rectangular", normalization, port_mode_id: "port", sampling_plane: plane, nonuniform_k_grid: null }] };
   const componentAmplitudes = Array.from({ length: cellCount * 2 }, (_, index) => index % 2 ? 0 : Math.floor(index / 2) + 1);
   const payloadValues = { k_u_rad_per_m: uCount === 2 ? [-1, 1] : Array.from({ length: uCount }, (_, index) => index - 32), k_v_rad_per_m: vCount === 2 ? [-1, 1] : Array.from({ length: vCount }, (_, index) => index - 33), amplitudes_re_im: vector ? [...componentAmplitudes, ...componentAmplitudes, ...componentAmplitudes] : componentAmplitudes, power: Array.from({ length: cellCount }, (_, index) => (index + 1) ** 2 * (vector ? 3 : 1)) };
+  if (scenario === "ready-tied-peak") {
+    payloadValues.amplitudes_re_im = [1, 0, 3, 0, 3, 0, 2, 0];
+    payloadValues.power = [1, 9, 9, 4];
+  }
   type PayloadKind = keyof typeof payloadValues;
   const layouts = { k_u_rad_per_m: "axis_u_1d", k_v_rad_per_m: "axis_v_1d", amplitudes_re_im: "component_kv_ku_complex_re_im", power: "kv_ku_power" };
   const descriptor = (kind: PayloadKind) => ({ path: `antenna/source_spectra/fft/${kind}.f64le`, sha256: `sha256:${"b".repeat(64)}`, value_count: payloadValues[kind].length, scalar_type: "float64_le", layout: layouts[kind], unit: kind.startsWith("k_") ? "rad/m" : kind === "power" ? `(${amplitudeUnit})^2` : amplitudeUnit });

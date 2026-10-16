@@ -33,7 +33,7 @@ try {
   });
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
-  const readyScenarios = ["ready", "ready-vector", "ready-unitary", "ready-large"];
+  const readyScenarios = ["ready", "ready-tied-peak", "ready-vector", "ready-unitary", "ready-large"];
   const malformedMetadata = ["oversized-grid", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha"];
   const malformedBytes = ["truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"];
   const readyScenarioSet = new Set(readyScenarios);
@@ -72,9 +72,23 @@ try {
       assert.ok(gridBox && Math.abs(gridBox.x + gridBox.width / 2 - payloadBox.x - payloadBox.width / 2) < 2, "The bounded source map must remain centered in the Inspector");
       assert.equal(await page.getByRole("button", { name: /Configuration and provenance/ }).getAttribute("aria-expanded"), "false");
       const unit = scenario === "ready-unitary" ? "(A/m/A)^2" : "(A*m/A)^2";
-      assert.ok(text.includes(`Peak ${scenario === "ready-vector" ? "4.800e+1" : scenario === "ready-large" ? "1.897e+7" : "1.600e+1"} ${unit}`), "Peak power or normalization unit differs from controlled complex amplitudes");
+      assert.ok(text.includes(`Peak ${scenario === "ready-tied-peak" ? "9.000e+0" : scenario === "ready-vector" ? "4.800e+1" : scenario === "ready-large" ? "1.897e+7" : "1.600e+1"} ${unit}`), "Peak power or normalization unit differs from controlled complex amplitudes");
       assert.ok((await page.getByRole("gridcell").first().getAttribute("aria-label"))?.includes(unit), "Scientific cell tooltip lost power SI unit");
       assert.ok((await page.getByRole("group", { name: "Source spectrum color scale" }).innerText()).includes(unit), "Color scale lost its physical power unit");
+      const decodeReads = await page.evaluate(() => window.__spectrumDecodeReads);
+      const peakButton = page.getByRole("button", { name: "Inspect peak", exact: true });
+      await peakButton.focus();
+      await page.keyboard.press("Enter");
+      const peakCell = page.getByRole("gridcell").nth(scenario === "ready-large" ? 4095 : scenario === "ready-tied-peak" ? 1 : 3);
+      assert.equal(await peakCell.evaluate(cell => document.activeElement === cell), true, "Inspect peak must focus the exact maximum representative");
+      assert.equal(await peakCell.getAttribute("aria-selected"), "true");
+      assert.equal(await page.getByRole("grid").locator('[role="gridcell"][tabindex="0"]').count(), 1);
+      const sample = await page.getByRole("group", { name: "Selected source spectrum sample" }).innerText();
+      assert.ok(sample.includes(unit));
+      if (scenario === "ready-tied-peak") assert.ok(sample.includes("k_u 1.000e+0 rad/m") && sample.includes("k_v -1.000e+0 rad/m") && sample.includes("9.000e+0"));
+      assert.equal(await page.evaluate(() => window.__spectrumDecodeReads), decodeReads);
+      assert.equal((await page.evaluate(() => window.__antennaSpectrumFixture.read())).calls.length, before.calls.length);
+      checks.push({ name: `${scenario}: peak action focuses the exact maximum, preserves one grid tab stop and avoids decoding/requests`, passed: true });
     }
     if (scenario === "ready-large") {
       const grid = page.getByRole("grid");
