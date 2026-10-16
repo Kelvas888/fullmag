@@ -14,7 +14,7 @@ import { createScalarSurfaceShaderMaterial, updateScalarSurfaceShaderMaterial, V
 import type { ScalarColorBuffer } from "../viewport3dFieldMapping";
 
 function potentialColorBuffer(model: ArtifactFieldOverlayModel): ScalarColorBuffer {
-  return { colors: new Float32Array(0), scalarValues: model.geometry.surfaceScalarValues ?? undefined, colorMode: "magnitude", colorPalette: model.settings.scalarColorPalette, range: { min: model.minimum, max: model.maximum }, quantityId: model.quantityId };
+  return { colors: new Float32Array(0), scalarValues: model.surface.scalarValues ?? undefined, colorMode: "magnitude", colorPalette: model.settings.scalarColorPalette, range: { min: model.minimum, max: model.maximum }, quantityId: model.quantityId };
 }
 
 /** Three resources are mutable renderer-owned objects, independent of React snapshots. */
@@ -64,24 +64,38 @@ export function ArtifactFieldLayer({ model, colors, tracker, sessionIdentity }: 
   const owned = useMemo(() => {
     if (!data) return null;
     const geometry = new BufferGeometry(); geometry.setAttribute("position", new BufferAttribute(data.positions, 3)); geometry.setIndex(new BufferAttribute(data.allSampleIndices.slice(), 1)); geometry.setDrawRange(0, data.count); geometry.computeBoundingSphere();
-    const surface = data.surfaceTriangles ? new BufferGeometry() : null;
-    if (surface) { surface.setAttribute("position", new BufferAttribute(data.positions, 3)); if (data.scalar && data.surfaceScalarValues) surface.setAttribute(VIEWPORT_3D_SCALAR_VALUE_ATTRIBUTE, new BufferAttribute(data.surfaceScalarValues, 1)); else surface.setAttribute("fmAntennaCurrentVector", new BufferAttribute(data.surfaceVectorValues, 3)); surface.setIndex(new BufferAttribute(data.surfaceTriangles!, 1)); surface.computeVertexNormals(); surface.computeBoundingSphere(); }
     const wire = data.surfaceEdges ? new BufferGeometry() : null;
     if (wire) { wire.setAttribute("position", new BufferAttribute(data.positions, 3)); wire.setIndex(new BufferAttribute(data.surfaceEdges!, 1)); wire.computeBoundingSphere(); }
     const points = new PointsMaterial({ size: 5, sizeAttenuation: false, vertexColors: false });
-    const fieldSurface = surface && !data.scalar ? createAntennaCurrentSurfaceMaterial() : null;
-    const scalarSurface = surface && data.scalar && data.surfaceScalarValues ? createScalarSurfaceShaderMaterial({ colors: new Float32Array(0), scalarValues: data.surfaceScalarValues, range: { min: 0, max: 1 } }, { depthTest: true, depthWrite: true, opacity: 1, transparent: false, side: DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1, shadeStrength: 0 }) : null;
-    const scalarSolid = surface && data.scalar ? new MeshBasicMaterial({ side: DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1, toneMapped: false }) : null;
+    const fieldSurface = data.surfaceTriangles && !data.scalar ? createAntennaCurrentSurfaceMaterial() : null;
+    const scalarSurface = data.surfaceTriangles && data.scalar && data.surfaceScalarValues ? createScalarSurfaceShaderMaterial({ colors: new Float32Array(0), scalarValues: data.surfaceScalarValues, range: { min: 0, max: 1 } }, { depthTest: true, depthWrite: true, opacity: 1, transparent: false, side: DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1, shadeStrength: 0 }) : null;
+    const scalarSolid = data.surfaceTriangles && data.scalar ? new MeshBasicMaterial({ side: DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1, toneMapped: false }) : null;
     const wireMaterial = new LineBasicMaterial();
-    return { geometry, pointSelection: data.allSampleIndices, surface, wire, points, fieldSurface, scalarSurface, scalarSolid, wireMaterial };
+    return { geometry, pointSelection: data.allSampleIndices, wire, points, fieldSurface, scalarSurface, scalarSolid, wireMaterial };
   }, [data]);
+  const projection = model?.surface;
+  const surface = useMemo(() => {
+    if (!projection?.triangles) return null;
+    const geometry = new BufferGeometry();
+    geometry.setAttribute("position", new BufferAttribute(projection.positions, 3));
+    if (projection.scalarValues) geometry.setAttribute(VIEWPORT_3D_SCALAR_VALUE_ATTRIBUTE, new BufferAttribute(projection.scalarValues, 1));
+    else geometry.setAttribute("fmAntennaCurrentVector", new BufferAttribute(projection.vectorValues, 3));
+    geometry.setIndex(new BufferAttribute(projection.triangles, 1)); geometry.computeBoundingSphere();
+    return geometry;
+  }, [projection]);
+  useEffect(() => {
+    if (!surface) return;
+    tracker.track("geometry", surface, { byteLength: Object.values(surface.attributes).reduce((n, a) => n + a.array.byteLength, surface.index?.array.byteLength ?? 0), owner: "artifact-field" });
+    invalidate();
+    return () => { tracker.release("geometry", surface); invalidate(); };
+  }, [surface, tracker, invalidate]);
   useEffect(() => {
     if (!owned) { invalidate(); return; }
-    for (const geometry of [owned.geometry, owned.surface, owned.wire]) if (geometry) tracker.track("geometry", geometry, { byteLength: Object.values(geometry.attributes).reduce((n, a) => n + a.array.byteLength, geometry.index?.array.byteLength ?? 0), owner: "artifact-field" });
+    for (const geometry of [owned.geometry, owned.wire]) if (geometry) tracker.track("geometry", geometry, { byteLength: Object.values(geometry.attributes).reduce((n, a) => n + a.array.byteLength, geometry.index?.array.byteLength ?? 0), owner: "artifact-field" });
     for (const material of [owned.points, owned.fieldSurface?.material, owned.scalarSurface, owned.scalarSolid, owned.wireMaterial]) if (material) tracker.track("material", material, { owner: "artifact-field" });
     if (owned.fieldSurface) tracker.track("texture", owned.fieldSurface.palette, { byteLength: 1024, owner: "artifact-field" });
     invalidate();
-    return () => { for (const geometry of [owned.geometry, owned.surface, owned.wire]) if (geometry) tracker.release("geometry", geometry); for (const material of [owned.points, owned.fieldSurface?.material, owned.scalarSurface, owned.scalarSolid, owned.wireMaterial]) if (material) tracker.release("material", material); if (owned.fieldSurface) tracker.release("texture", owned.fieldSurface.palette); invalidate(); };
+    return () => { for (const geometry of [owned.geometry, owned.wire]) if (geometry) tracker.release("geometry", geometry); for (const material of [owned.points, owned.fieldSurface?.material, owned.scalarSurface, owned.scalarSolid, owned.wireMaterial]) if (material) tracker.release("material", material); if (owned.fieldSurface) tracker.release("texture", owned.fieldSurface.palette); invalidate(); };
   }, [owned, tracker, invalidate]);
   useEffect(() => {
     if (!owned || !model) return;
@@ -95,7 +109,7 @@ export function ArtifactFieldLayer({ model, colors, tracker, sessionIdentity }: 
   const vectorStyle = useMemo(() => model ? vectorStyleFromSettings(model.settings, { monoColor: new Color(colors.field).getStyle() }) : undefined, [model, colors.field]);
   if (!model || !owned || !model.settings.visible) return null;
   return <group name={`artifact-historical-${model.quantityId}`} userData={{ quantity: model.quantityId, unit: model.unit, status: "historical_inspection", carrierId: model.locator.carrier_id, availableGlyphCount: model.availableGlyphCount, glyphCount: model.glyphCount, geometryScope: model.settings.geometryScope }}>
-    {model.settings.shaderVisible && owned.surface && (owned.fieldSurface || owned.scalarSurface) ? <mesh geometry={owned.surface} material={model.scalar && model.settings.surfaceColorSource === "solid" ? owned.scalarSolid! : owned.scalarSurface ?? owned.fieldSurface!.material} dispose={null} /> : null}
+    {model.settings.shaderVisible && surface && (owned.fieldSurface || owned.scalarSurface) ? <mesh geometry={surface} material={model.scalar && model.settings.surfaceColorSource === "solid" ? owned.scalarSolid! : owned.scalarSurface ?? owned.fieldSurface!.material} dispose={null} /> : null}
     {model.settings.wireframeVisible && owned.wire ? <lineSegments geometry={owned.wire} material={owned.wireMaterial} dispose={null} /> : null}
     {model.settings.pointsVisible ? <points geometry={owned.geometry} material={owned.points} dispose={null} /> : null}
     {!model.scalar && model.settings.vectorsVisible && model.vectorSegments ? <VectorFieldLayer segments={model.vectorSegments} buildReference={reference} carrierId={model.locator.carrier_id} fieldBufferId={model.key} colors={colors} colorMode={model.settings.vectorColorMode} glyphColorsOverride={model.settings.vectorColorMode === "magnitude" ? model.glyphColors : null} opacity={model.settings.vectorAlphaPercent / 100} style={vectorStyle} tracker={tracker} sessionIdentity={sessionIdentity} renderOnTop={false} /> : null}

@@ -1,3 +1,4 @@
+import { artifactSurfaceProjection } from "./artifactSurfaceProjection";
 import { buildAveragedSurfaceNodeNormals, resolveVectorSurfaceOffsetDistance } from "../viewport3dRenderModel";
 import { buildVertexScalarColors } from "../viewport3dFieldMapping";
 import type { StageExecutionResource } from "@/kernel/api/apiTypes";
@@ -57,7 +58,8 @@ export function prepareArtifactFieldOverlay(admitted: ReturnType<typeof admitArt
   const boundaryMask = new Uint8Array(count);
   if (surfaceTriangles) for (const index of surfaceTriangles) boundaryMask[index] = 1;
   const surfaceSampleIndices = surfaceTriangles ? allSampleIndices.filter(index => boundaryMask[index] === 1) : null;
-  return { field, locator, count, current, scalar, surfaceScalarValues, positions, magnitudes, maximumNorm, extent, surfaceTriangles, surfaceEdges, surfaceVectorScale, surfaceVectorValues, allSampleIndices, surfaceSampleIndices, surfaceNormals };
+  const rawSurface = { positions, triangles: surfaceTriangles, values: field.values, scalarValues: surfaceScalarValues, vectorValues: surfaceVectorValues };
+  return { rawSurface, field, locator, count, current, scalar, surfaceScalarValues, positions, magnitudes, maximumNorm, extent, surfaceTriangles, surfaceEdges, surfaceVectorScale, surfaceVectorValues, allSampleIndices, surfaceSampleIndices, surfaceNormals };
 }
 
 export function presentArtifactFieldOverlay(data: ReturnType<typeof prepareArtifactFieldOverlay>, settings: VisualizationTargetSettings) {
@@ -69,6 +71,14 @@ export function presentArtifactFieldOverlay(data: ReturnType<typeof prepareArtif
   for (let i = 0; i < count; i++) {
     scalars[i] = scalar ? field.values[i] : component === "magnitude" ? magnitudes[i] : field.values[i * 3 + (component === "x" ? 0 : component === "y" ? 1 : 2)];
     minimum = Math.min(minimum, scalars[i]); maximum = Math.max(maximum, scalars[i]);
+  }
+  const surface = artifactSurfaceProjection(data, settings.surfaceProjectionMode, settings.shaderVisible);
+  if (settings.shaderVisible && settings.surfaceProjectionMode === "surface_faces") {
+    minimum = Infinity; maximum = -Infinity;
+    for (let i = 0; i < surface.values.length / (scalar ? 1 : 3); i++) {
+      const value = scalar ? surface.values[i] : component === "magnitude" ? Math.hypot(...surface.values.subarray(i * 3, i * 3 + 3)) : surface.values[i * 3 + (component === "x" ? 0 : component === "y" ? 1 : 2)];
+      minimum = Math.min(minimum, value); maximum = Math.max(maximum, value);
+    }
   }
   if (settings.geometryScope === "surface" && !data.surfaceSampleIndices && (settings.pointsVisible || settings.vectorsVisible)) throw new Error("Surface scope requires an owned boundary; choose full scope for point samples.");
   const pointSampleIndices = settings.geometryScope === "surface" ? data.surfaceSampleIndices ?? new Uint32Array(0) : data.allSampleIndices;
@@ -102,8 +112,8 @@ export function presentArtifactFieldOverlay(data: ReturnType<typeof prepareArtif
   const glyphSelectionKey = JSON.stringify([settings.geometryScope ?? "full", glyphCount]);
   const glyphStyleKey = JSON.stringify([settings.geometryScope, settings.vectorBudget, settings.scalarColorPalette, settings.vectorColorMode, settings.vectorLengthScale, settings.vectorCenteringEnabled, surfaceOffsetDistance]);
   return { scalar, geometry: data, glyphColors, glyphSelectionKey, glyphStyleKey, key: `${locator.carrier_id}:${field.fieldGenerationId}:${field.sourceRevision}`, quantityId: field.quantityId as "H_ant" | "J_charge" | "V_electric", unit: scalar ? "V" : current ? "A/m^2" : "A/m",
-    status: "historical_inspection" as const, locator, fieldRevision: field.sourceRevision ?? "", positions, scalarValues: scalars, vectorSegments, pointSampleIndices, vectorSampleIndices, glyphCount, surfaceOffsetDistance, availableGlyphCount: pointSampleIndices.length,
-    surfaceTriangles, surfaceEdges, surfaceVectorValues, surfaceVectorScale, maximumVectorNorm: scalar ? 0 : maximumNorm, minimum: component === "magnitude" ? 0 : minimum, maximum, count,
+    status: "historical_inspection" as const, surface, locator, fieldRevision: field.sourceRevision ?? "", positions, scalarValues: scalars, vectorSegments, pointSampleIndices, vectorSampleIndices, glyphCount, surfaceOffsetDistance, availableGlyphCount: pointSampleIndices.length,
+    surfaceTriangles, surfaceEdges, surfaceVectorValues, surfaceVectorScale, maximumVectorNorm: scalar ? 0 : maximumNorm, minimum: component === "magnitude" && settings.surfaceProjectionMode !== "surface_faces" ? 0 : minimum, maximum, count,
     intent: { component, palette: settings.scalarColorPalette }, settings };
 }
 export function buildArtifactFieldOverlayModel(admitted: ReturnType<typeof admitArtifactFieldCarrier>, settings: VisualizationTargetSettings) {

@@ -154,17 +154,19 @@ function Probe() {
       scene.traverse(object => { if ("material" in object && (object.material instanceof PointsMaterial || object.material instanceof LineBasicMaterial)) { const m = object.material; auxiliaryMaterials.push({ id: m.uuid, version: m.version, opacity: m.opacity, transparent: m.transparent }); } if (object.name.startsWith("artifact-historical-")) groups++; if (object instanceof InstancedMesh) { glyphInstances += object.count; glyphCounts.push(object.count); } if (object.type === "Mesh" && "geometry" in object && object.geometry instanceof BufferGeometry && (object.geometry.getAttribute("fmAntennaCurrentVector") || object.geometry.getAttribute("fmScalarValue"))) { surfaceTriangles += (object.geometry.index?.count ?? 0) / 3; geometryIds.push(object.geometry.uuid); const material = (object as unknown as { material: { uuid: string; uniforms: { fmAntennaOpacity: { value: number }; fmAntennaPalette: { value: { uuid: string; userData: { antennaPalette: string } } } } } }).material; materialIds.push(material.uuid); if (object.geometry.getAttribute("fmScalarValue")) { const m = (object as unknown as { material: { uuid: string; uniforms?: { fmOpacity: { value: number }; fmPaletteId: { value: number } } } }).material; if (m.uniforms) scalarSurface = { normalized: Array.from(object.geometry.getAttribute("fmScalarValue").array), opacity: m.uniforms.fmOpacity.value, paletteId: m.uniforms.fmPaletteId.value, materialId: m.uuid }; } if (object.geometry.getAttribute("fmAntennaCurrentVector")) { paletteIds.push(material.uniforms.fmAntennaPalette.value.uuid); surfaceOpacity = material.uniforms.fmAntennaOpacity.value; paletteName = material.uniforms.fmAntennaPalette.value.userData.antennaPalette; } } });
       const glyphMatrices: number[][] = [], glyphColors: number[][] = [];
       scene.traverse(object => { if (object instanceof InstancedMesh) { glyphMatrices.push(Array.from(object.instanceMatrix.array.slice(0, object.count * 16))); glyphColors.push(Array.from(object.instanceColor?.array.slice(0, object.count * 3) ?? [])); } });
+      const surfaceVertexCounts: number[] = [];
       const surfacePresentation: Array<{ mode: string; color: string }> = [];
       const pointCounts: number[] = [], pointBufferIds: string[] = [];
       scene.traverse(object => { if (object.type === "Points" && "geometry" in object && object.geometry instanceof BufferGeometry) { pointCounts.push(object.geometry.drawRange.count); pointBufferIds.push(String(object.geometry.index?.id)); } });
       scene.traverse(object => {
         if (!(object instanceof Mesh) || (!object.geometry.getAttribute("fmAntennaCurrentVector") && !object.geometry.getAttribute("fmScalarValue"))) return;
+        surfaceVertexCounts.push(object.geometry.getAttribute("position").count);
         const material = object.material;
         if (material instanceof MeshBasicMaterial) surfacePresentation.push({ mode: "solid", color: material.color.getHexString() });
         else if (material instanceof ShaderMaterial && material.uniforms.fmAntennaColorMode) surfacePresentation.push({ mode: material.uniforms.fmAntennaColorMode.value === 2 ? "solid" : "field", color: material.uniforms.fmAntennaMonoColor.value.getHexString() });
         else surfacePresentation.push({ mode: "field", color: "" });
       });
-      return { lost: gl.getContext().isContextLost(), width: size.x, height: size.y, groups, surfaceTriangles, geometryIds, materialIds, paletteIds, surfaceOpacity, paletteName, surfacePresentation, scalarSurface, auxiliaryMaterials, pointCounts, pointBufferIds, glyphInstances, glyphCounts, glyphMatrices, glyphColors, frame: gl.info.render.frame };
+      return { lost: gl.getContext().isContextLost(), width: size.x, height: size.y, groups, surfaceTriangles, geometryIds, materialIds, paletteIds, surfaceOpacity, paletteName, surfacePresentation, surfaceVertexCounts, scalarSurface, auxiliaryMaterials, pointCounts, pointBufferIds, glyphInstances, glyphCounts, glyphMatrices, glyphColors, frame: gl.info.render.frame };
     };
     return () => { delete window.__artifactOverlayCanvas; };
   }, [gl, scene]);

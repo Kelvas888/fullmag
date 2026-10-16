@@ -108,6 +108,10 @@ check("signed V uses source-node scalar interpolation and never creates vector g
   f.headers.carrierId=f.locator.carrier_id;f.geometry.carrierId=f.locator.carrier_id;f.settings.vectorBudget=0;
   const m=render(f);assert.equal(m.scalar,true);assert.equal(m.unit,"V");assert.equal(m.minimum,-2);assert.equal(m.maximum,4);assert.deepEqual([...m.scalarValues],[-2,0,1,4]);assert.equal(m.vectorSegments,null);assert.equal(m.surfaceVectorValues.length,0);assert.equal(m.surfaceTriangles.length,12);
   const normalized=m.geometry.surfaceScalarValues;assert.equal(normalized[0],0);assert.equal(normalized[3],1);assert.ok(Math.abs(normalized[1]-1/3)<1e-7);assert.equal(normalized[2],.5);
+  f.settings.surfaceProjectionMode="surface_faces";const face=render(f);
+  assert.equal(face.surface.scalarValues.length,12);assert.ok(Math.abs(face.minimum+1/3)<1e-12);assert.ok(Math.abs(face.maximum-5/3)<1e-12);
+  assert.deepEqual([...face.scalarValues],[-2,0,1,4]);
+  assert.equal(Math.min(...face.surface.scalarValues),0);assert.equal(Math.max(...face.surface.scalarValues),1);
   f.field.nComp=3;assert.throws(()=>render(f));
 });
 const glyphRenderer=load(new URL("modules/viewport-3d/layers/vectorGlyphGeometry.ts",root));
@@ -181,5 +185,23 @@ check("lift clearance follows shared center/tail semantics and full scope keeps 
  assert.equal(tail.surfaceOffsetDistance,center.surfaceOffsetDistance*2);assert.equal(extra.surfaceOffsetDistance,tail.surfaceOffsetDistance);
  const full=render({...f,settings:{...settings,geometryScope:"full"}});assert.equal(full.surfaceOffsetDistance,0);assert.deepEqual(full.vectorSegments,render(fixture()).vectorSegments);
  assert.throws(()=>render({...f,settings:{...settings,vectorSurfaceOffsetScale:NaN}}),/surface gap/);
+});
+check("face projection preserves separate local J traces and averages components before norm",()=>{
+ const f=fixture();f.settings.surfaceProjectionMode="surface_faces";f.settings.shaderColorMode="magnitude";
+ const m=render(f);assert.equal(m.surface.positions.length,54);assert.equal(m.surface.triangles.length,18);
+ const norms=[];
+ for(let face=0;face<m.surfaceTriangles.length;face+=3){
+  const mean=[0,0,0];for(let c=0;c<3;c++)for(let a=0;a<3;a++)mean[a]+=f.field.values[m.surfaceTriangles[face+c]*3+a]/3;
+  norms.push(Math.hypot(...mean));
+  for(let c=0;c<3;c++)for(let a=0;a<3;a++)assert.ok(Math.abs(m.surface.values[(face+c)*3+a]-mean[a])<1e-12);
+ }
+ assert.ok(Math.abs(m.minimum-Math.min(...norms))<1e-12);assert.ok(Math.abs(m.maximum-Math.max(...norms))<1e-12);
+ assert.deepEqual(f.field.values,values);assert.deepEqual(m.vectorSegments,render(fixture()).vectorSegments);
+ const data=entry.namespace.prepareArtifactFieldOverlay(carrier.admitArtifactFieldCarrier(f.locator,f.field,f.headers,f.topology,f.geometry));
+ const a=entry.namespace.presentArtifactFieldOverlay(data,f.settings),b=entry.namespace.presentArtifactFieldOverlay(data,{...f.settings,scalarColorPalette:"plasma"});assert.strictEqual(a.surface,b.surface);
+});
+check("unsupported thickness projection is explicit only when a surface is requested",()=>{
+ const f=fixture();f.settings.surfaceProjectionMode="thickness_average_z";assert.throws(()=>render(f),/Thickness projection/);
+ f.settings.shaderVisible=false;assert.equal(render(f).surface.values,f.field.values);
 });
 console.log(JSON.stringify({status:"passed",checks,unit_test_compilation:false,browser_qualification:false}));

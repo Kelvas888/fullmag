@@ -262,6 +262,21 @@ try {
   await page.getByLabel("Fixture geometry scope", { exact: true }).selectOption("full");
   await page.waitForFunction(() => window.__artifactOverlayFixture?.read().glyphCount === 5 && window.__artifactOverlayCanvas?.().glyphCounts.every(count => count === 5));
   checks.push("Actual shared surface-lift button and keyboard gap control translate GPU glyph anchors only; orientation, size, colors, raw samples, point/surface geometry and binary reads remain unchanged, and disabling restores original transforms");
+  const rawSurface = await read();
+  const projectionControl = controls.getByRole("combobox", { name: "Projection", exact: true });
+  await projectionControl.selectOption("surface_faces");
+  await page.waitForFunction(() => window.__artifactOverlayCanvas?.().surfaceVertexCounts.every(count => count === 12));
+  const faceSurface = await read();
+  assert.equal(faceSurface.canvas.lost, false); assert.ok(faceSurface.canvas.width > 0 && faceSurface.canvas.height > 0);
+  assert.deepEqual(faceSurface.state.values, rawSurface.state.values);
+  assert.deepEqual(faceSurface.canvas.pointBufferIds, rawSurface.canvas.pointBufferIds);
+  assert.deepEqual(faceSurface.canvas.materialIds, rawSurface.canvas.materialIds);
+  assert.deepEqual(faceSurface.canvas.glyphMatrices, rawSurface.canvas.glyphMatrices);
+  assert.equal(faceSurface.state.calls.filter(call => call.binary).length, rawSurface.state.calls.filter(call => call.binary).length);
+  await screenshot("08-owned-face-projection");
+  await projectionControl.selectOption("raw_nodal");
+  await page.waitForFunction(() => window.__artifactOverlayCanvas?.().surfaceVertexCounts.every(count => count === 5));
+  checks.push("Shared face projection expands only the owned H surface, preserves point buffers, vector transforms, raw values and materials, and restores raw nodal display without binary reads");
   const ownerReads = final.state.calls.filter(call => call.component !== "full" && call.path.endsWith("/meta"));
   for (const q of ["H_ant", "J_charge", "V_electric"]) {
     const reads = ownerReads.filter(call => call.path.includes(q)); assert.ok(reads.length > 0, q);
