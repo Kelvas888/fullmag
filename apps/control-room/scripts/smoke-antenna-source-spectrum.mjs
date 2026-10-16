@@ -16,6 +16,28 @@ if (!inside(directory, reportPath)) throw new Error("Report file escaped directo
 const checks = [], screenshots = [], evidence = [], pageErrors = [], consoleErrors = [], downloads = [];
 let browser, page, failure = null;
 const startedAt = new Date().toISOString();
+async function installNativeSpectrumWriter(page, blockFirstWrite = false) {
+  await page.evaluate(async block => {
+    const root = await navigator.storage.getDirectory();
+    const name = `fullmag-spectrum-check-${crypto.randomUUID()}.json`;
+    const handle = await root.getFileHandle(name, { create: true });
+    if (block) { const initial = await handle.createWritable(); await initial.write("previous complete file"); await initial.close(); }
+    const state = window.__spectrumNative = { root, name, handle, writes: 0, closed: 0, aborted: 0, reject: null, activated: false, filename: null };
+    window.showSaveFilePicker = async options => {
+      state.activated = navigator.userActivation.isActive;
+      state.filename = options.suggestedName;
+      return { createWritable: async () => {
+        const writer = await handle.createWritable();
+        return {
+          async write(chunk) { await writer.write(chunk); state.writes++; if (block && state.writes === 1) await new Promise((_resolve, reject) => { state.reject = reject; }); },
+          async close() { await writer.close(); state.closed++; },
+          async abort(reason) { try { await writer.abort(reason); } finally { state.aborted++; state.reject?.(reason ?? new DOMException("Aborted", "AbortError")); } },
+        };
+      } };
+    };
+  }, blockFirstWrite);
+}
+
 try {
   let playwright;
   try { playwright = await import("playwright"); } catch { playwright = await import("@playwright/test"); }
@@ -157,6 +179,19 @@ try {
         await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).click();
         await page.getByRole("alert").filter({ hasText: "Spectrum export failed. Try again." }).waitFor();
         assert.equal(downloads.length, countBeforeStream);
+        await installNativeSpectrumWriter(page);
+        await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).click();
+        await page.waitForFunction(() => window.__spectrumNative.closed === 1);
+        const native = await page.evaluate(async () => {
+          const state = window.__spectrumNative;
+          const text = await (await state.handle.getFile()).text();
+          await state.root.removeEntry(state.name);
+          return { text, activated: state.activated, filename: state.filename, writes: state.writes, aborted: state.aborted };
+        });
+        assert.deepEqual(JSON.parse(native.text), exported); assert.equal(native.activated, true);
+        assert.equal(native.filename, "antenna-spectrum-fft.json"); assert.ok(native.writes > 1); assert.equal(native.aborted, 0);
+        assert.equal(downloads.length, countBeforeStream);
+        checks.push({ name: "Real browser filesystem writer commits an exact full JSON file; owned temporary file removed after read", passed: true });
         await page.evaluate(() => { window.showSaveFilePicker = undefined; });
         checks.push({ name: "Streaming sink receives exact full JSON with click activation and serialized writes; picker cancellation is quiet while write AbortError is visible", passed: true });
 
@@ -298,19 +333,31 @@ try {
     for (const fail of [true, false]) {
       const before = await page.evaluate(() => window.__antennaSpectrumFixture.read());
       const downloadCount = downloads.length;
-      await page.evaluate(fail => {
-        if (fail) {
-          const button = [...document.querySelectorAll("button")].find(button => button.textContent === "Export full spectrum (JSON)");
-          if (!button || button.disabled) throw new Error("Ready export action is missing before cancellation regression");
-          button.click();
-        }
+      if (fail) await installNativeSpectrumWriter(page, true);
+      if (fail) {
+        await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).click();
+        await page.waitForFunction(() => window.__spectrumNative.writes === 1);
+      }
+      await page.evaluate(() => {
         window.__antennaSpectrumFixture.refresh("power");
-      }, fail);
+      });
       await page.waitForFunction(() => window.__antennaSpectrumFixture.read().pending === 1, undefined, { timeout: 60_000 });
       await page.waitForFunction(() => !document.querySelector('[role="gridcell"]'), undefined, { timeout: 60_000 });
       assert.equal(await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).count(), 0);
       await page.waitForTimeout(100);
       assert.equal(downloads.length, downloadCount, "Invalidation must abort an in-flight export before any download");
+      if (fail) {
+        await page.waitForFunction(() => window.__spectrumNative.aborted >= 1);
+        const nativeAbort = await page.evaluate(async () => {
+          const state = window.__spectrumNative;
+          const text = await (await state.handle.getFile()).text();
+          await state.root.removeEntry(state.name); window.showSaveFilePicker = undefined;
+          return { text, closed: state.closed, aborted: state.aborted };
+        });
+        assert.equal(nativeAbort.text, "previous complete file"); assert.equal(nativeAbort.closed, 0);
+        checks.push({ name: "Resource invalidation aborts a real pending file write and preserves the previous complete file", passed: true });
+      }
+
       const pending = await page.evaluate(() => window.__antennaSpectrumFixture.read());
       assert.equal(pending.snapshots.power.hasData, true, "Power refresh must retain the last-good cache");
       assert.equal(pending.calls.length, before.calls.length + 1, "Power refresh must issue exactly one GET");
