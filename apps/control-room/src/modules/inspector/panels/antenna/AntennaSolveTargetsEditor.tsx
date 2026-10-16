@@ -18,7 +18,7 @@ import { FormField } from "../../primitives/FormField";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import {
   acknowledgeAntennaSolveTargetsDraft, antennaSolveTargetKey, antennaSolveTargetLabel,
-  antennaSolveTargetOptions, antennaSamplingDomainOptions, buildAntennaSolveTargetsTransaction,
+  antennaSolveTargetOptions, antennaSamplingDomainOptions, antennaVectorPotentialSelectable, buildAntennaSolveTargetsTransaction,
   type AntennaSolveTarget, type AntennaSolveTargetsDraft,
 } from "./AntennaSolveTargetsEditorModel";
 
@@ -55,6 +55,8 @@ export function AntennaSolveTargetsEditor({ objectId, stageId, scene, sceneScope
   const dirty = draft?.dirty === true;
   const targets = dirty ? draft.targets : stage?.target_refs ?? draft?.targets ?? [];
   const samplingDomain = dirty ? draft.samplingDomain ?? stage?.field_sampling_domain : stage?.field_sampling_domain;
+  const vectorPotentialSelectable = antennaVectorPotentialSelectable(scene, stage);
+  const oerstedRealization = dirty ? draft.oerstedRealization ?? stage?.oersted_realization : stage?.oersted_realization;
   const samplingOptions = antennaSamplingDomainOptions(scene);
   const samplingKey = samplingDomain ? antennaSolveTargetKey(samplingDomain) : "";
   const pending = pendingState?.token === context.token;
@@ -68,15 +70,15 @@ export function AntennaSolveTargetsEditor({ objectId, stageId, scene, sceneScope
     if (!scene || !scope || !scene.scene?.id || sceneScopeKey !== scope || status !== "ready" || revision === null) {
       throw new Error("Current session-scoped scene is required to edit field-solve targets.");
     }
-    request = buildAntennaSolveTargetsTransaction(scene, objectId, stageId, dirty && draft ? draft.baseRevision : revision, targets, samplingDomain);
+    request = buildAntennaSolveTargetsTransaction(scene, objectId, stageId, dirty && draft ? draft.baseRevision : revision, targets, samplingDomain, oerstedRealization);
   } catch (error) {
     reason = error instanceof Error ? error.message : String(error);
   }
   const canApply = Boolean(dirty && request && !pending && !conflict);
 
-  function update(next: AntennaSolveTarget[], domain = samplingDomain) {
+  function update(next: AntennaSolveTarget[], domain = samplingDomain, realization = oerstedRealization) {
     if (revision === null || !stage || scene?.objects?.find((object) => object.id === objectId)?.locked) return;
-    setDraft({ key, baseRevision: dirty && draft ? draft.baseRevision : revision, dirty: true, targets: next, samplingDomain: domain });
+    setDraft({ key, baseRevision: dirty && draft ? draft.baseRevision : revision, dirty: true, targets: next, samplingDomain: domain, oerstedRealization: realization });
     setFeedback(null);
   }
 
@@ -133,8 +135,17 @@ export function AntennaSolveTargetsEditor({ objectId, stageId, scene, sceneScope
     </FormField>
     <FieldRow label="Declared mesh policy" value={stage?.conductor_mesh_policy ?? "unavailable"} mono />
     <FieldRow label="Declared solver policy" value={stage?.solver_policy ?? "unavailable"} mono />
-    <FieldRow label="Declared Oersted realization" value={stage?.oersted_realization ?? "unavailable"} mono />
-    <p className="fm-inspector-hint">The sampling domain owns the published H carrier. Targets select field destinations. Policy identifiers are preserved; runtime validation decides availability. Editing these inputs does not activate LLG, projections or drives.</p>
+    <FieldRow label="Physical model" value={stage?.model ?? "unavailable"} mono />
+    <FormField type="select" label="Oersted realization" value={oerstedRealization ?? ""} disabled={!editable}
+      onChange={event => update([...targets], samplingDomain, event.currentTarget.value)}
+      hint="Requested numerical realization. Planner and runtime capability checks still apply; changing it requires recomputing the field basis.">
+      {oerstedRealization !== "direct_tetra_quadrature" && oerstedRealization !== "vector_potential_solver"
+        ? <option value={oerstedRealization ?? ""} disabled>{oerstedRealization || "Select an explicit realization"} · unavailable</option> : null}
+      <option value="direct_tetra_quadrature">Direct tetrahedral quadrature (3D)</option>
+      <option value="vector_potential_solver" disabled={!vectorPotentialSelectable}>FEM vector potential (3D){vectorPotentialSelectable ? "" : " · unavailable for this source"}</option>
+    </FormField>
+    {!vectorPotentialSelectable ? <p className="fm-inspector-hint">Current-driven or unresolved source definitions require an explicit direct realization. Vector potential is not available for these sources; no fallback is applied.</p> : null}
+    <p className="fm-inspector-hint">The sampling domain owns the published H carrier. Targets select field destinations. Policy identifiers are preserved and may impose source-specific admission requirements. Configure the actual charge solver in CurrentTransport and the conductor mesh in Geometry / Mesh; runtime validation decides availability. Editing these inputs does not activate LLG, projections or drives.</p>
     {targets.map((target, index) => <div className="fm-microstrip-station-actions" key={antennaSolveTargetKey(target)}>
       <FieldRow label={`Target ${index + 1}`} value={antennaSolveTargetLabel(target)} />
       <Button type="button" disabled={!editable} aria-label={`Remove field-solve target ${index + 1}`} onClick={() => update(targets.filter((_, itemIndex) => itemIndex !== index))}>Remove target</Button>

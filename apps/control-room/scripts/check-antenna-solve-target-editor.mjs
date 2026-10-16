@@ -36,7 +36,7 @@ const scene = {
   ],
   antenna_field_solve_stages: [solve, { ...solve, id: "untouched-solve", target_refs: [global] }],
   antenna_target_projections: [{ id: "projection-fixed" }], solved_antenna_drives: [{ id: "drive-fixed" }],
-  current_transports: [{ id: "transport-fixed" }], study: { stages: [{ stage_id: "run-fixed", kind: "run", until_seconds: "1e-12" }] },
+  current_transports: [{ name: "transport-fixed", kind: "current_transport", model: "ohmic_poisson" }], study: { stages: [{ stage_id: "run-fixed", kind: "run", until_seconds: "1e-12" }] },
 };
 const original = JSON.stringify(scene);
 check("explicit global/object/region options use canonical immutable identities, no inferred physics", () => {
@@ -96,6 +96,23 @@ check("sampling and targets share one transaction while preserving policies, pin
   assert.throws(() => build(scene, "immutable-antenna", "solve-basis", 3, [object], region), /point-cloud/);
   assert.throws(() => build(scene, "immutable-antenna", "solve-basis", 3, [object], { kind: "object", object_id: "missing" }), /existing/);
 });
+check("current-driven and unresolved sources refuse vector potential without fallback", () => {
+  for (const property of ["conservative_current_source", "external_lead_preparation", "structured_current_closure"]) {
+    const copy = structuredClone(scene); copy.current_transports[0][property] = {};
+    assert.throws(() => build(copy, "immutable-antenna", "solve-basis", 3, [object], undefined, "vector_potential_solver"), /no automatic fallback/);
+    assert.equal(build(copy, "immutable-antenna", "solve-basis", 3, [object], undefined, "direct_tetra_quadrature").merge_patch.antenna_field_solve_stages[0].oersted_realization, "direct_tetra_quadrature");
+  }
+  assert.throws(() => build({ ...scene, current_transports: [] }, "immutable-antenna", "solve-basis", 3, [object], undefined, "vector_potential_solver"), /unresolved/);
+});
+check("explicit Oersted choice persists without rewriting policies, targets or other stages", () => {
+  const result = build(scene, "immutable-antenna", "solve-basis", 3, solve.target_refs, undefined, "vector_potential_solver");
+  assert.deepEqual(result.merge_patch.antenna_field_solve_stages[0], { ...solve, oersted_realization: "vector_potential_solver" });
+  assert.strictEqual(result.merge_patch.antenna_field_solve_stages[1], scene.antenna_field_solve_stages[1]);
+  assert.equal(JSON.stringify(scene), original);
+  for (const realization of ["", "automatic", "2p5d", "unknown"]) {
+    assert.throws(() => build(scene, "immutable-antenna", "solve-basis", 3, [object], undefined, realization), /explicit Oersted/);
+  }
+});
 const submitted = { key: "session-epoch|source|solve", baseRevision: 3, dirty: true, targets: [region] };
 check("ACK clears only the exact submitted draft and advances its revision", () => {
   assert.deepEqual(ack(submitted, submitted, 4), { ...submitted, baseRevision: 4, dirty: false });
@@ -117,5 +134,9 @@ check("sampling-only in-flight edit survives the older targets ACK", () => {
   const next = ack(newer, submitted, 4);
   assert.deepEqual(next, { ...newer, baseRevision: 4, dirty: true });
   assert.strictEqual(next.samplingDomain, object);
+});
+check("Oersted edit made in flight survives an earlier ACK", () => {
+  const newer = { ...submitted, oerstedRealization: "vector_potential_solver" };
+  assert.deepEqual(ack(newer, submitted, 4), { ...newer, baseRevision: 4, dirty: true });
 });
 console.log(`PASS ${checks} actual-model checks; browser lifecycle and runtime solve NOT VERIFIED.`);

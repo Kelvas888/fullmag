@@ -26,6 +26,7 @@ try {
   page.on("console", (message) => { if (message.type() === "error" && !message.text().startsWith("Failed to load resource:")) consoleErrors.push(message.text()); });
   const editor = page.getByTestId("solve-editor"), select = editor.getByRole("combobox", { name: "Add field-solve target", exact: true });
   const sampling = editor.getByRole("combobox", { name: "Field-sampling domain", exact: true });
+  const realization = editor.getByRole("combobox", { name: "Oersted realization", exact: true });
   const globalKey = JSON.stringify(["global"]);
   const button = (name) => editor.getByRole("button", { name, exact: true });
   const click = (name) => button(name).evaluate((element) => element.click());
@@ -34,7 +35,7 @@ try {
   const wait = (predicate) => page.waitForFunction(predicate, undefined, { timeout });
   const screenshot = async (name) => { const path = resolve(reportDirectory, `${name}.png`); await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
   const ready = async () => { await select.waitFor({ timeout }); await page.waitForFunction(() => !document.querySelector('[data-testid="solve-editor"] select')?.disabled, undefined, { timeout }); };
-  const boot = async (samplingKind = "", ack = "") => { const target = new URL(url); if (ack) target.searchParams.set("ack", ack); if (samplingKind) target.searchParams.set("sampling", samplingKind); await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 60_000 }); await wait(() => Boolean(window.__antennaSolveTargetsFixture)); await ready(); };
+  const boot = async (samplingKind = "", ack = "", source = "", persistedRealization = "") => { const target = new URL(url); if (source) target.searchParams.set("source", source); if (persistedRealization) target.searchParams.set("realization", persistedRealization); if (ack) target.searchParams.set("ack", ack); if (samplingKind) target.searchParams.set("sampling", samplingKind); await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 60_000 }); await wait(() => Boolean(window.__antennaSolveTargetsFixture)); await ready(); };
   const add = async (value) => { await select.selectOption(value); await click("Add target"); };
   const apply = async () => { await button("Apply field-solve settings").waitFor(); assert.equal(await button("Apply field-solve settings").isDisabled(), false); await click("Apply field-solve settings"); await wait(() => window.__antennaSolveTargetsFixture.read().pending === 1); };
   const release = async () => { await page.evaluate(() => window.__antennaSolveTargetsFixture.release()); await wait(() => window.__antennaSolveTargetsFixture.read().pending === 0); };
@@ -48,6 +49,7 @@ try {
   };
 
   await boot();
+  await realization.selectOption("vector_potential_solver");
   assert.equal(await sampling.locator(`option[value='${regionKey}']`).count(), 0);
   await sampling.selectOption(objectKey);
   await add(objectKey);
@@ -83,7 +85,9 @@ try {
   assert.deepEqual(Object.keys(writes(pending)[0].body.merge_patch), ["antenna_field_solve_stages"]);
   assert.deepEqual(writes(pending)[0].body.merge_patch.antenna_field_solve_stages[0].target_refs, [{ kind: "global" }, { kind: "object", object_id: "immutable-waveguide" }]);
   assert.deepEqual(writes(pending)[0].body.merge_patch.antenna_field_solve_stages[0].field_sampling_domain, { kind: "object", object_id: "immutable-waveguide" });
+  assert.equal(writes(pending)[0].body.merge_patch.antenna_field_solve_stages[0].oersted_realization, "vector_potential_solver");
   assert.equal(await sampling.isEnabled(), true);
+  await realization.selectOption("direct_tetra_quadrature");
   await sampling.selectOption(globalKey);
   await click("Add target");
   await screenshot("02-pending-newer-region-draft");
@@ -92,6 +96,7 @@ try {
   assert.equal(await editor.getByRole("button", { name: /^Remove field-solve target/ }).count(), 3);
   assert.equal(await select.inputValue(), regionKey);
   assert.equal(await sampling.inputValue(), globalKey, "ACK erased the newer sampling draft");
+  assert.equal(await realization.inputValue(), "direct_tetra_quadrature", "ACK erased the newer realization draft");
   assert.equal(await button("Rebase field-solve settings").count(), 0);
   const proof = await page.evaluate(() => {
     const { proof, sample, observer } = window.__solveStability; sample(); observer.disconnect();
@@ -106,6 +111,7 @@ try {
   await apply();
   const second = writes(await read())[1];
   assert.equal(second.body.base_revision, 2);
+  assert.equal(second.body.merge_patch.antenna_field_solve_stages[0].oersted_realization, "direct_tetra_quadrature");
   assert.deepEqual(second.body.merge_patch.antenna_field_solve_stages[0].field_sampling_domain, { kind: "global" });
   assert.deepEqual(second.body.merge_patch.antenna_field_solve_stages[0].target_refs[2], { kind: "region", object_id: "immutable-waveguide", region_id: "core" });
   await release();
@@ -131,7 +137,39 @@ try {
   await screenshot("04-sampling-only-ack");
   await budget("sampling-only ACK and explicit revert");
 
-  for (const ack of ["foreign-model", "changed-targets", "changed-sampling", "duplicate-stage", "changed-policy", "stale-revision", "revision-mismatch", "missing-scene"]) {
+  await boot();
+  const originalStage = (await read()).scene.antenna_field_solve_stages[0];
+  await realization.selectOption("vector_potential_solver"); await apply();
+  const realizationOnly = writes(await read())[0].body.merge_patch.antenna_field_solve_stages[0];
+  assert.deepEqual(realizationOnly, { ...originalStage, oersted_realization: "vector_potential_solver" });
+  await realization.selectOption("direct_tetra_quadrature"); await release();
+  await wait(() => [...document.querySelectorAll('[data-testid="solve-editor"] button')].some(button => button.textContent === "Apply field-solve settings" && !button.disabled));
+  assert.equal(await realization.inputValue(), "direct_tetra_quadrature");
+  await click("Revert field-solve settings");
+  assert.equal(await realization.inputValue(), "vector_potential_solver");
+  await realization.selectOption("direct_tetra_quadrature");
+  await page.evaluate(() => window.__antennaSolveTargetsFixture.conflict());
+  await button("Rebase field-solve settings").waitFor({ timeout });
+  await click("Rebase field-solve settings");
+  assert.equal(await realization.inputValue(), "direct_tetra_quadrature");
+  assert.equal(await button("Apply field-solve settings").isEnabled(), true);
+  checks.push({ name: "realization-only write preserves every other stage field; newer realization survives ACK, Revert and Rebase remain explicit", passed: true });
+  await screenshot("realization-only-rebase"); await budget("realization-only lifecycle");
+
+  for (const persisted of ["vector_potential_solver", "unknown-method"]) {
+    await boot("", "", "current-driven", persisted);
+    assert.equal(await realization.inputValue(), persisted, "Unsupported persisted method must remain visible");
+    assert.equal(await realization.locator('option[value="vector_potential_solver"]').isDisabled(), true);
+    assert.equal(await button("Apply field-solve settings").isDisabled(), true);
+    assert.ok((await editor.innerText()).includes("no fallback"));
+    await realization.selectOption("direct_tetra_quadrature");
+    assert.equal(await button("Apply field-solve settings").isEnabled(), true);
+    assert.equal(writes(await read()).length, 0, "Choosing an explicit repair must not submit implicitly");
+    checks.push({ name: `${persisted}: current-driven restriction is explicit and requires a deliberate direct selection`, passed: true });
+    await screenshot(`unsupported-${persisted}`); await budget(`unsupported ${persisted}`);
+  }
+
+  for (const ack of ["foreign-model", "changed-targets", "changed-sampling", "duplicate-stage", "changed-policy", "changed-realization", "stale-revision", "revision-mismatch", "missing-scene"]) {
     await boot("", ack);
     await sampling.selectOption(objectKey); await add(objectKey); await apply();
     assert.equal((await read()).canUndo, false);
