@@ -8,6 +8,7 @@ OWNER_SCHEMA="fullmag.backend-build-cache-owner.v1"
 IMAGE_LABEL="fm-be-cache-v1"
 LEGACY_IMAGE_SIZE_BYTES=12884901888
 IMAGE_SIZE_BYTES=25769803776
+EXTENDED_IMAGE_SIZE_BYTES=42949672960
 GROW_FROM_BYTES=12884901888
 GROW_TO_BYTES=25769803776
 MOUNT_TARGET="/fullmag-backend-cache"
@@ -29,6 +30,7 @@ HOST_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 SIZE_VALUE="${FULLMAG_BACKEND_CACHE_SIZE_BYTES-$IMAGE_SIZE_BYTES}"
 GROW_FROM_VALUE="${FULLMAG_BACKEND_CACHE_GROW_FROM_BYTES-$GROW_FROM_BYTES}"
 GROW_TO_VALUE="${FULLMAG_BACKEND_CACHE_GROW_TO_BYTES-$GROW_TO_BYTES}"
+GROWTH_RECEIPT_VALUE="${FULLMAG_BACKEND_CACHE_GROWTH_RECEIPT-}"
 TARGET_VALUE="${FULLMAG_BACKEND_CACHE_MOUNT_TARGET-$MOUNT_TARGET}"
 LOCK_WAIT="${FULLMAG_BACKEND_CACHE_LOCK_WAIT_SECONDS-120}"
 MOUNT_ACTIVE=0 LOOP_DEVICE="" FILESYSTEM_UUID="" MOUNT_SOURCE=""
@@ -64,8 +66,12 @@ validate() {
   [[ "$RUNTIME_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "runtime image is not immutable"
   [[ "$TOOLCHAIN_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "toolchain image is not immutable"
   [[ "$HOST_PID" =~ ^[0-9]+$ && "$HOST_PID" -gt 0 ]] || fail "invalid host pid"
-  [[ "$SIZE_VALUE" == "$LEGACY_IMAGE_SIZE_BYTES" || "$SIZE_VALUE" == "$IMAGE_SIZE_BYTES" ]] || fail "unsupported cache capacity"
-  [[ "$GROW_FROM_VALUE" == "$LEGACY_IMAGE_SIZE_BYTES" && "$GROW_TO_VALUE" == "$IMAGE_SIZE_BYTES" ]] || fail "unsupported growth target"
+  [[ "$SIZE_VALUE" == "$LEGACY_IMAGE_SIZE_BYTES" || "$SIZE_VALUE" == "$IMAGE_SIZE_BYTES" || "$SIZE_VALUE" == "$EXTENDED_IMAGE_SIZE_BYTES" ]] || fail "unsupported cache capacity"
+  case "$GROW_FROM_VALUE:$GROW_TO_VALUE" in
+    "$LEGACY_IMAGE_SIZE_BYTES:$IMAGE_SIZE_BYTES") EXPECTED_GROWTH_RECEIPT_SUFFIX=".growth-v1.json" ;;
+    "$IMAGE_SIZE_BYTES:$EXTENDED_IMAGE_SIZE_BYTES") EXPECTED_GROWTH_RECEIPT_SUFFIX=".growth-v2.json" ;;
+    *) fail "unsupported growth target" ;;
+  esac
   [[ "$TARGET_VALUE" == "$MOUNT_TARGET" ]] || fail "fixed cache contract changed"
   safe_path storage "$STORAGE_ROOT"; [[ "$STORAGE_ROOT" != "/" ]] || fail "storage root cannot be /"
   local prefix image mount lock marker
@@ -78,7 +84,8 @@ validate() {
   [[ -z "$LOCK_PATH" || "$LOCK_PATH" == "$lock" ]] || fail "lock path mismatch"
   [[ -z "$OWNER_MARKER_VALUE" || "$OWNER_MARKER_VALUE" == "$marker" ]] || fail "owner marker mismatch"
   BACKING_IMAGE="$image"; MOUNT_ROOT="$mount"; LOCK_PATH="$lock"; OWNER_MARKER="$marker"
-  GROWTH_RECEIPT="$BACKING_IMAGE.growth-v1.json"
+  GROWTH_RECEIPT="$BACKING_IMAGE$EXPECTED_GROWTH_RECEIPT_SUFFIX"
+  [[ -z "$GROWTH_RECEIPT_VALUE" || "$GROWTH_RECEIPT_VALUE" == "$GROWTH_RECEIPT" ]] || fail "growth receipt mismatch"
   EXPECTED_IMAGE_SIZE_BYTES="$SIZE_VALUE"
   EXPECTED_OWNER_SIZE_BYTES="$SIZE_VALUE"
   RUNTIME_LOCK="$MOUNT_ROOT/.fullmag-backend-runtime.lock"
@@ -184,7 +191,7 @@ if len(raw)>16384: raise SystemExit("owner marker size")
 v=json.loads(raw.decode())
 if set(v)!={"schema","profile","project_id","cache_key","backing_image","mount_root","filesystem_uuid","image_size_bytes","mount_target","runtime_uid","runtime_gid","toolchain_image_id","owner_token"}: raise SystemExit("owner marker schema")
 size=v.get("image_size_bytes")
-if size not in {12884901888,25769803776}: raise SystemExit("owner marker capacity")
+if size not in {12884901888,25769803776,42949672960}: raise SystemExit("owner marker capacity")
 print(size)
 ' "/proc/$HOST_PID/root$OWNER_MARKER" || fail "cannot inspect owner marker capacity"
 }
@@ -400,8 +407,11 @@ ensure_cache() {
 }
 
 grow_cache() {
-  [[ "$SIZE_VALUE" == "$GROW_TO_BYTES" ]] || fail "growth requires the 24 GiB target capacity"
-  [[ "$GROW_FROM_VALUE" == "$LEGACY_IMAGE_SIZE_BYTES" ]] || fail "growth source capacity is not the legacy 12 GiB cache"
+  [[ "$SIZE_VALUE" == "$GROW_TO_VALUE" ]] || fail "growth target capacity does not match its transition"
+  case "$GROW_FROM_VALUE:$GROW_TO_VALUE" in
+    "$LEGACY_IMAGE_SIZE_BYTES:$IMAGE_SIZE_BYTES"|"$IMAGE_SIZE_BYTES:$EXTENDED_IMAGE_SIZE_BYTES") ;;
+    *) fail "growth source and target are not an adjacent supported transition" ;;
+  esac
   host test -e "$BACKING_IMAGE" && host test ! -L "$BACKING_IMAGE" || fail "growth backing image is missing or a symlink"
   local image_fs image_label associated status token after_token uuid_before
   local journal_state="none" journal_token="-" marker_size backing_size journal_line
@@ -440,9 +450,9 @@ grow_cache() {
     [[ "$backing_size" == "$GROW_FROM_VALUE" || "$journal_state" == started ]] || fail "unjournaled 24 GiB backing is not admissible"
     [[ "$marker_size" == "$GROW_FROM_VALUE" ]] || fail "growth owner marker is not at the legacy capacity"
   else
-    [[ "$backing_size" == "$GROW_TO_BYTES" ]] || fail "succeeded growth journal has a short backing"
+    [[ "$backing_size" == "$GROW_TO_VALUE" ]] || fail "succeeded growth journal has a short backing"
     [[ "$marker_size" == "$GROW_FROM_VALUE" || "$marker_size" == "$GROW_TO_VALUE" ]] || fail "growth owner marker capacity invalid"
-    [[ "$marker_size" != "$GROW_TO_BYTES" || "$backing_size" == "$GROW_TO_BYTES" ]] || fail "24 GiB owner marker has a short backing"
+    [[ "$marker_size" != "$GROW_TO_VALUE" || "$backing_size" == "$GROW_TO_VALUE" ]] || fail "growth owner marker has a short backing"
   fi
   verify_mount; EXPECTED_OWNER_SIZE_BYTES="$marker_size"; verify_owner; verify_root
   token="$(owner_token)"
@@ -463,8 +473,8 @@ grow_cache() {
   host resize2fs "$LOOP_DEVICE" >/dev/null
 
   # Publish the durable growth result before changing the marker's capacity
-  # field. If marker publication then fails, the old marker still rejects a
-  # 24 GiB admission and the journal identifies the repair that is required.
+  # field. If marker publication then fails, the old marker still rejects the
+  # target-sized admission and the journal identifies the repair required.
   growth_journal succeeded "$GROW_FROM_VALUE" "$GROW_TO_VALUE" "$token"
   EXPECTED_IMAGE_SIZE_BYTES="$GROW_TO_VALUE"
   if [[ "$marker_size" == "$GROW_FROM_VALUE" ]]; then

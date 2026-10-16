@@ -31,10 +31,17 @@ CONSUMER_KEY_LABEL = "com.fullmag.backend-cache.key"
 IMAGE_LABEL = "fm-be-cache-v1"
 LEGACY_CACHE_SIZE_BYTES = 12 * 1024 * 1024 * 1024
 CACHE_SIZE_BYTES = 24 * 1024 * 1024 * 1024
-SUPPORTED_CACHE_SIZE_BYTES = frozenset({LEGACY_CACHE_SIZE_BYTES, CACHE_SIZE_BYTES})
+EXTENDED_CACHE_SIZE_BYTES = 40 * 1024 * 1024 * 1024
+SUPPORTED_CACHE_SIZE_BYTES = frozenset({
+    LEGACY_CACHE_SIZE_BYTES,
+    CACHE_SIZE_BYTES,
+    EXTENDED_CACHE_SIZE_BYTES,
+})
 NEW_BACKING_FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024
 GROWTH_FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024
 GROWTH_SCHEMA = "fullmag.backend-build-cache-growth.v1"
+GROWTH_V1_SUFFIX = ".growth-v1.json"
+GROWTH_V2_SUFFIX = ".growth-v2.json"
 MOUNT_TARGET = "/fullmag-backend-cache"
 GUEST_TARGET = "/build"
 DAEMON_HOST_PREFIX = "/run/desktop/mnt/host"
@@ -230,7 +237,7 @@ def _cache_paths(layout: Mapping[str, Any], key: str) -> dict[str, Any]:
 
 def _require_cache_size(value: Any, label: str = "cache size") -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value not in SUPPORTED_CACHE_SIZE_BYTES:
-        raise BackendCacheError(f"{label} must be exactly 12 GiB or 24 GiB")
+        raise BackendCacheError(f"{label} must be exactly 12 GiB, 24 GiB, or 40 GiB")
     return value
 
 
@@ -277,15 +284,29 @@ def _guard_new_backing_space(
         )
 
 
-def _guard_growth_space(backing: Path, storage_root: Path) -> None:
-    """Require room for only the 12 GiB growth delta plus a safety margin."""
+def _guard_growth_space(
+    backing: Path,
+    storage_root: Path,
+    previous_size: int = LEGACY_CACHE_SIZE_BYTES,
+    target_size: int = CACHE_SIZE_BYTES,
+) -> None:
+    """Require room for one explicit adjacent cache-capacity transition."""
 
     if backing.is_symlink() or not backing.exists():
         raise BackendCacheError("cannot grow a missing or symlinked backend cache backing")
+    previous_size = _require_cache_size(previous_size, "growth source size")
+    target_size = _require_cache_size(target_size, "growth target size")
+    if (previous_size, target_size) not in {
+        (LEGACY_CACHE_SIZE_BYTES, CACHE_SIZE_BYTES),
+        (CACHE_SIZE_BYTES, EXTENDED_CACHE_SIZE_BYTES),
+    }:
+        raise BackendCacheError("backend cache growth requires an adjacent supported capacity")
     current = _existing_backing_size(backing)
-    if current != LEGACY_CACHE_SIZE_BYTES:
-        raise BackendCacheError("backend cache growth requires an exact 12 GiB backing")
-    required = CACHE_SIZE_BYTES - LEGACY_CACHE_SIZE_BYTES + GROWTH_FREE_SPACE_MARGIN_BYTES
+    if current != previous_size:
+        raise BackendCacheError(
+            f"backend cache growth requires an exact {previous_size // (1024 ** 3)} GiB backing"
+        )
+    required = target_size - previous_size + GROWTH_FREE_SPACE_MARGIN_BYTES
     try:
         free = shutil.disk_usage(storage_root).free
     except OSError as exc:
@@ -299,10 +320,32 @@ def _guard_growth_space(backing: Path, storage_root: Path) -> None:
         )
 
 
-def _growth_journal_is_present(backing: Path, cache_key_value: str) -> bool:
-    """Allow a 24 GiB retry only when the helper left an attested journal."""
+def _growth_journal_path(backing: Path, previous_size: int, target_size: int) -> Path:
+    transition = (previous_size, target_size)
+    suffixes = {
+        (LEGACY_CACHE_SIZE_BYTES, CACHE_SIZE_BYTES): GROWTH_V1_SUFFIX,
+        (CACHE_SIZE_BYTES, EXTENDED_CACHE_SIZE_BYTES): GROWTH_V2_SUFFIX,
+    }
+    try:
+        suffix = suffixes[transition]
+    except KeyError as exc:
+        raise BackendCacheError("unsupported backend cache growth transition") from exc
+    return Path(str(backing) + suffix)
 
-    journal = Path(str(backing) + ".growth-v1.json")
+
+def _growth_journal_is_present(
+    backing: Path,
+    cache_key_value: str,
+    previous_size: int = LEGACY_CACHE_SIZE_BYTES,
+    target_size: int = CACHE_SIZE_BYTES,
+    state: str | None = None,
+) -> bool:
+    """Admit only an attested journal for the requested capacity transition."""
+
+    try:
+        journal = _growth_journal_path(backing, previous_size, target_size)
+    except BackendCacheError:
+        return False
     if journal.is_symlink() or not journal.exists() or not journal.is_file():
         return False
     try:
@@ -316,9 +359,10 @@ def _growth_journal_is_present(backing: Path, cache_key_value: str) -> bool:
         and value.get("schema") == GROWTH_SCHEMA
         and value.get("operation") == "grow"
         and value.get("state") in {"started", "succeeded"}
+        and (state is None or value.get("state") == state)
         and value.get("cache_key") == cache_key_value
-        and value.get("previous_size_bytes") == LEGACY_CACHE_SIZE_BYTES
-        and value.get("size_bytes") == CACHE_SIZE_BYTES
+        and value.get("previous_size_bytes") == previous_size
+        and value.get("size_bytes") == target_size
     )
 
 
@@ -551,6 +595,9 @@ def _validate_growth_receipt(
     values: Mapping[str, Any],
     image_id: str,
     toolchain_image: str,
+    *,
+    expected_previous_size: int = LEGACY_CACHE_SIZE_BYTES,
+    expected_size: int = CACHE_SIZE_BYTES,
 ) -> None:
     required = {
         "schema", "profile", "state", "project_id", "cache_key", "backing_image",
@@ -573,15 +620,20 @@ def _validate_growth_receipt(
             or _UUID.fullmatch(receipt["filesystem_uuid"]) is None
             or receipt["mount_active"] is not True):
         raise BackendCacheError("backend cache growth filesystem is not attested")
-    if (receipt["previous_size_bytes"] != LEGACY_CACHE_SIZE_BYTES
-            or receipt["size_bytes"] != CACHE_SIZE_BYTES
+    expected_previous_size = _require_cache_size(expected_previous_size, "growth source size")
+    expected_size = _require_cache_size(expected_size, "growth target size")
+    if (receipt["previous_size_bytes"] != expected_previous_size
+            or receipt["size_bytes"] != expected_size
             or receipt["runtime_image_id"] != image_id
             or receipt["toolchain_image_id"] != toolchain_image
             or not isinstance(receipt["owner_token"], str)
             or _UUID.fullmatch(receipt["owner_token"]) is None):
         raise BackendCacheError("backend cache growth size, image, or owner attestation mismatch")
+    expected_growth_receipt = _growth_journal_path(
+        Path(str(values["backing_image"])), expected_previous_size, expected_size,
+    )
     if receipt["growth_receipt"] != _daemon_path(
-        str(values["backing_image"]) + ".growth-v1.json", "growth_receipt"
+        str(expected_growth_receipt), "growth_receipt"
     ):
         raise BackendCacheError("backend cache growth journal path mismatch")
 
@@ -709,13 +761,19 @@ def grow(
     *,
     source_root: str | os.PathLike[str],
     toolchain_image: str,
+    target_size: int | None = None,
 ) -> dict[str, Any]:
-    """Grow one attested legacy 12 GiB cache to 24 GiB under exclusive locks.
+    """Grow one attested cache by one supported capacity step.
 
     This is deliberately separate from :func:`prepare`: an existing backing is
     never resized as a side effect of normal cache admission.  The maintenance
     helper writes a durable started/succeeded journal and fails closed on an
     incomplete or foreign journal.
+
+    A legacy 12 GiB cache keeps its historical default transition to 24 GiB.
+    Growing an existing 24 GiB cache requires the caller to explicitly pass
+    ``target_size=EXTENDED_CACHE_SIZE_BYTES``; ordinary cache preparation never
+    performs this migration implicitly.
     """
 
     repo_path = Path(repo).resolve(strict=True)
@@ -732,15 +790,64 @@ def grow(
     identity = cache_key(source, str(worktree_id), toolchain_image)
     paths = _cache_paths(layout, identity["key"])
     capacity = _existing_backing_size(paths["backing_image"])
-    if capacity == LEGACY_CACHE_SIZE_BYTES:
-        _guard_growth_space(paths["backing_image"], paths["storage_root"])
-    elif capacity == CACHE_SIZE_BYTES:
-        if not _growth_journal_is_present(paths["backing_image"], identity["key"]):
+    previous_size: int
+    resuming = False
+    if target_size is None:
+        if capacity == LEGACY_CACHE_SIZE_BYTES:
+            target_size = CACHE_SIZE_BYTES
+        elif capacity == CACHE_SIZE_BYTES and _growth_journal_is_present(
+            paths["backing_image"], identity["key"],
+            LEGACY_CACHE_SIZE_BYTES, CACHE_SIZE_BYTES,
+        ):
+            # The legacy transition may have resized the backing before its
+            # owner marker was published. Resume that exact journal only.
+            target_size = CACHE_SIZE_BYTES
+            previous_size = LEGACY_CACHE_SIZE_BYTES
+            resuming = True
+        elif capacity == EXTENDED_CACHE_SIZE_BYTES and _growth_journal_is_present(
+            paths["backing_image"], identity["key"],
+            CACHE_SIZE_BYTES, EXTENDED_CACHE_SIZE_BYTES,
+        ):
+            target_size = EXTENDED_CACHE_SIZE_BYTES
+            previous_size = CACHE_SIZE_BYTES
+            resuming = True
+        else:
             raise BackendCacheError(
-                "24 GiB backend cache can only be resumed with its attested growth journal"
+                "growing an existing 24 GiB backend cache requires explicit "
+                "target_size=EXTENDED_CACHE_SIZE_BYTES"
             )
-    else:  # pragma: no cover - _existing_backing_size rejects other capacities.
-        raise BackendCacheError("backend cache grow requires a supported existing capacity")
+    target_size = _require_cache_size(target_size, "growth target size")
+    if capacity == target_size:
+        if target_size == CACHE_SIZE_BYTES:
+            previous_size = LEGACY_CACHE_SIZE_BYTES
+        elif target_size == EXTENDED_CACHE_SIZE_BYTES:
+            previous_size = CACHE_SIZE_BYTES
+        else:  # pragma: no cover - _require_cache_size rejects other targets.
+            raise BackendCacheError("backend cache growth target is unsupported")
+        if not _growth_journal_is_present(
+            paths["backing_image"], identity["key"],
+            previous_size, target_size,
+        ):
+            raise BackendCacheError(
+                "backend cache growth found a target-sized backing without an "
+                "attested started journal"
+            )
+        resuming = True
+    else:
+        previous_size = capacity
+    transitions = {
+        (LEGACY_CACHE_SIZE_BYTES, CACHE_SIZE_BYTES),
+        (CACHE_SIZE_BYTES, EXTENDED_CACHE_SIZE_BYTES),
+    }
+    if (previous_size, target_size) not in transitions:
+        raise BackendCacheError(
+            "backend cache growth requires an adjacent supported capacity "
+            f"(current={capacity}, target={target_size})"
+        )
+    if not resuming:
+        _guard_growth_space(
+            paths["backing_image"], paths["storage_root"], previous_size, target_size,
+        )
     _require_image_id(image, "runtime image")
     _require_image_id(toolchain_image, "toolchain image")
     run_path = Path(runroot)
@@ -773,7 +880,7 @@ def grow(
         ENV_LOCK_PATH: _daemon_path(paths["lock_path"], "lock_path"),
         ENV_MOUNT_ROOT: paths["mount_root"],
         ENV_OWNER_MARKER: paths["owner_marker"],
-        ENV_SIZE_BYTES: str(CACHE_SIZE_BYTES),
+        ENV_SIZE_BYTES: str(target_size),
         ENV_MOUNT_TARGET: paths["mount_target"],
         ENV_FILESYSTEM_UUID: "",
         ENV_RUNTIME_IMAGE_ID: image,
@@ -795,18 +902,29 @@ def grow(
     maintenance_config = run_path / "compose.backend-cache-growth-maintenance.json"
     _render_maintenance_config(maintenance_config, configured)
     maintenance_name = f"fullmag-backend-cache-growth-{identity['key'][:16]}"
+    growth_receipt = _growth_journal_path(
+        paths["backing_image"], previous_size, target_size,
+    )
     output = docker(
         "compose", "--project-name", project_name, "-f", str(maintenance_config),
         "--profile", MAINTENANCE_PROFILE, "run", "--rm", "--no-deps", "--name",
         maintenance_name, "--label", f"{CONSUMER_PROFILE_LABEL}={PROFILE}",
-        "-e", f"FULLMAG_BACKEND_CACHE_GROW_FROM_BYTES={LEGACY_CACHE_SIZE_BYTES}",
-        "-e", f"FULLMAG_BACKEND_CACHE_GROW_TO_BYTES={CACHE_SIZE_BYTES}",
+        "-e", f"FULLMAG_BACKEND_CACHE_GROW_FROM_BYTES={previous_size}",
+        "-e", f"FULLMAG_BACKEND_CACHE_GROW_TO_BYTES={target_size}",
+        "-e", f"FULLMAG_BACKEND_CACHE_GROWTH_RECEIPT={_daemon_path(str(growth_receipt), 'growth_receipt')}",
         MAINTENANCE_SERVICE, "grow", timeout=300, environment=environment,
     )
     receipt = _read_json_output(output)
     if not isinstance(receipt, Mapping):
         raise BackendCacheError("backend cache growth returned no receipt")
-    _validate_growth_receipt(receipt, values, image, toolchain_image)
+    _validate_growth_receipt(
+        receipt,
+        values,
+        image,
+        toolchain_image,
+        expected_previous_size=previous_size,
+        expected_size=target_size,
+    )
     environment[ENV_FILESYSTEM_UUID] = str(receipt["filesystem_uuid"])
     receipt_path = run_path / "backend-cache-growth-receipt.json"
     _atomic_json(
@@ -816,8 +934,8 @@ def grow(
             "cache_key": identity["key"], "identity": identity,
             "project_id": paths["project_id"], "runtime_image": runtime,
             "toolchain_image": toolchain, "host_receipt": dict(receipt),
-            "previous_size_bytes": LEGACY_CACHE_SIZE_BYTES,
-            "size_bytes": CACHE_SIZE_BYTES,
+            "previous_size_bytes": previous_size,
+            "size_bytes": target_size,
             "helper_sha256": helper_sha256, "compose_overlay_sha256": overlay_sha256,
             "environment": environment,
         },
@@ -827,8 +945,8 @@ def grow(
         "cache_key": identity["key"], "identity": identity,
         "project_id": paths["project_id"], "image_id": image,
         "toolchain_image_id": toolchain_image,
-        "previous_size_bytes": LEGACY_CACHE_SIZE_BYTES,
-        "size_bytes": CACHE_SIZE_BYTES,
+        "previous_size_bytes": previous_size,
+        "size_bytes": target_size,
         "filesystem_uuid": environment[ENV_FILESYSTEM_UUID],
         "mount_root": paths["mount_root"], "guest_target": GUEST_TARGET,
         "environment": environment, "compose_overlay": str(overlay_copy),
