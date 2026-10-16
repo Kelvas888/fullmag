@@ -22,6 +22,7 @@ import { AntennaExternalLeadInspectionPanel } from "./AntennaExternalLeadInspect
 import { AntennaProjectionDriveComposer } from "./AntennaProjectionDriveComposer";
 import { AntennaSolveTargetsEditor } from "./AntennaSolveTargetsEditor";
 import { AntennaStudyStageComposer } from "./AntennaStudyStageComposer";
+import { AntennaConductorMaterialEditor } from "./AntennaConductorMaterialEditor";
 import { AntennaPortEditor } from "./AntennaPortEditor";
 import { AntennaSpectrumComposer } from "./AntennaSpectrumComposer";
 import { AntennaResourceEditor } from "./AntennaResourceEditor";
@@ -932,6 +933,7 @@ export function AntennaCompositionPanel({
         ) : null}
       </InspectorGroup>}
       {kind === "conductor" && objectId ? <>
+        <AntennaConductorMaterialEditor objectId={objectId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} />
         <p className="fm-inspector-hint">Layout conductivity is an authored geometry value. Charge-material assignments above describe the current model; this view does not certify a solve.</p>
         <Button type="button" disabled={!scene.data?.objects?.some(object => object.id === objectId)} onClick={() => {
           const nodeId = `model:object:${objectId}:geometry`;

@@ -119,6 +119,61 @@ try {
   await page.getByText("Port terminal pairs", { exact: true }).waitFor();
   assert.equal(writes.length, writesBeforeNavigation, "Source navigation must not mutate the scene");
   checks.push({ name: "closed circuit presents its voltage source and observations with scoped read-only Geometry/Port navigation", passed: true });
+  await selectNode(`model:object:${objectId}:antenna:conductor`);
+  const materialEditor = page.getByTestId("antenna-conductor-material-editor");
+  const conductivity = materialEditor.getByRole("textbox", { name: "Layout conductor conductivity", exact: true });
+  await conductivity.waitFor();
+  const beforeConductivityWrites = writes.length;
+  await conductivity.fill("0");
+  assert.equal(await materialEditor.getByRole("button", { name: "Apply conductivity", exact: true }).isEnabled(), false);
+  assert.equal(writes.length, beforeConductivityWrites);
+  await conductivity.fill("41000000");
+  await materialEditor.getByRole("textbox", { name: "Inlet bridge conductivity", exact: true }).fill("32000000");
+  await materialEditor.getByRole("textbox", { name: "Outlet bridge conductivity", exact: true }).fill("27000000");
+  await conductivity.focus();
+  await page.evaluate(() => {
+    const root = document.querySelector('[data-testid="antenna-conductor-material-editor"]'), input = document.activeElement;
+    const scroll = root.closest(".fm-inspector__body");
+    const controls = [...root.querySelectorAll("input")].map(element => ({ element, disabled: element.disabled, opacity: getComputedStyle(element).opacity }));
+    const proof = { root, input, scroll, scrollTop: scroll.scrollTop, controls, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 };
+    const sample = () => {
+      proof.samples++;
+      if (document.querySelector('[data-testid="antenna-conductor-material-editor"]') !== root) proof.rootChanges++;
+      for (const saved of controls) {
+        if (!saved.element.isConnected) proof.controlChanges++;
+        if (saved.element.disabled !== saved.disabled) proof.disabledChanges++;
+        if (getComputedStyle(saved.element).opacity !== saved.opacity) proof.opacityChanges++;
+      }
+      proof.opacityAnimations += root.getAnimations({ subtree: true }).filter(animation => (animation.playState === "running" || animation.pending) && animation.effect?.getKeyframes().some(frame => "opacity" in frame)).length;
+    };
+    const observer = new MutationObserver(sample); observer.observe(root, { attributes: true, childList: true, subtree: true });
+    sample(); window.__antennaConductivityProof = { proof, observer, sample };
+  });
+  assert.equal(await materialEditor.getByRole("button", { name: "Apply conductivity", exact: true }).isEnabled(), true);
+  // DOM activation exercises the actual Apply handler without moving the input focus under inspection.
+  await materialEditor.getByRole("button", { name: "Apply conductivity", exact: true }).evaluate(button => button.click());
+  const materialScene = await waitScene(s => s.objects.find(o => o.id === objectId)?.geometry?.geometry_params?.conductivity_s_per_m === 41000000);
+  await materialEditor.getByText("Conductivity committed to geometry and charge materials.", { exact: false }).waitFor();
+  const materialTransport = materialScene.current_transports.find(c => c.name === stage.current_transport_id);
+  const params = materialScene.objects.find(o => o.id === objectId).geometry.geometry_params;
+  assert.equal(params.loop.inlet_connection_conductivity_s_per_m, 32000000);
+  assert.equal(params.loop.outlet_connection_conductivity_s_per_m, 27000000);
+  for (const assignment of materialTransport.materials) assert.equal(assignment.material.sigma_Spm,
+    assignment.region.region_id === params.loop.inlet_connection_part_id ? 32000000 : assignment.region.region_id === params.loop.outlet_connection_part_id ? 27000000 : 41000000);
+  assert.deepEqual(materialTransport.structured_current_closure, current.structured_current_closure);
+  assert.deepEqual(materialTransport.solver, current.solver);
+  assert.deepEqual(materialScene.antenna_port_modes, closed.antenna_port_modes);
+  assert.equal(writes.length, beforeConductivityWrites + 1);
+  const stability = await page.evaluate(() => {
+    const { proof, observer, sample } = window.__antennaConductivityProof; sample(); observer.disconnect();
+    return { root: proof.root.isConnected, focus: document.activeElement === proof.input, scroll: proof.scroll.scrollTop === proof.scrollTop,
+      rootChanges: proof.rootChanges, controlChanges: proof.controlChanges, disabledChanges: proof.disabledChanges, opacityChanges: proof.opacityChanges, opacityAnimations: proof.opacityAnimations, samples: proof.samples };
+  });
+  assert.ok(stability.samples > 1 && stability.samples < 100);
+  assert.deepEqual({ ...stability, samples: 0 }, { root: true, focus: true, scroll: true, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 });
+  await screenshot("06-conductor-conductivity-committed");
+  checks.push({ name: "Conductor atomically updates layout and charge conductivity while preserving source, solver, port, focus, scroll and input stability", passed: true, stability });
+
   await page.getByTitle("Expand All").click();
   await selectNode(`model:object:${objectId}:antenna:solution:${encodeURIComponent(stage.id)}`);
   const add = page.getByRole("button", { name: "Add Field Solve to Study", exact: true });
