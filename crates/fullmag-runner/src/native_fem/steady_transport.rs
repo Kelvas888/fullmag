@@ -1331,7 +1331,19 @@ fn solve_rt0_common(request:Rt0NumericInput<'_>,view:Rt0InputView<'_>,oersted_me
                         ffi::FULLMAG_FEM_STEADY_TRANSPORT_RT0_BOUNDARY_CLOSURE_INTERFACE
                     }
                 },
-                circuit_id: circuit.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
+                circuit_id: circuit.as_ref().map_or_else(
+                    || {
+                        if prepared.is_some()
+                            && matches!(face.role, ConservativeCurrentBoundaryRoleIR::InsulatingOuter)
+                        {
+                            // Prepared v2 hashes an absent insulating circuit as empty text.
+                            b"\0".as_ptr().cast()
+                        } else {
+                            ptr::null()
+                        }
+                    },
+                    |value| value.as_ptr(),
+                ),
             },
         )
         .collect::<Vec<_>>();
