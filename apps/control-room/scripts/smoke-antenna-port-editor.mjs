@@ -27,8 +27,8 @@ try {
   const read = () => page.evaluate(() => window.__antennaPortEditorFixture.read());
   const writes = (value) => value.calls.filter((call) => call.method === "POST");
   const wait = (predicate) => page.waitForFunction(predicate, undefined, { timeout });
-  const boot = async (scenario = "") => { const location = new URL(url); if (scenario) location.searchParams.set("scenario", scenario); await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await wait(() => Boolean(window.__antennaPortEditorFixture)); await field("Branch 1 ID").waitFor({ timeout });
+  const boot = async (scenario = "", creator = false) => { const location = new URL(url); if (creator) location.searchParams.set("creator", "1"); if (scenario) location.searchParams.set("scenario", scenario); await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await wait(() => Boolean(window.__antennaPortEditorFixture)); await field(creator ? "New port ID" : "Branch 1 ID").waitFor({ timeout });
     await wait(() => [...document.querySelectorAll('[data-testid="port-editor"] input')].some((input) => !input.disabled)); };
   const apply = async () => { assert.equal(await button("Apply port").isDisabled(), false); await click("Apply port");
     await wait(() => window.__antennaPortEditorFixture.read().pending === 1); };
@@ -233,6 +233,123 @@ try {
   assert.equal(abaAfter.invalidations, abaBefore.invalidations); assert.equal(abaAfter.canUndo, false);
   assert.equal(await field("Branch 1 ID").inputValue(), "new-owner-draft");
   checks.push({ name: "session ABA fences old owner despite same IDs", passed: true }); await budget("session ABA");
+  const composer = editor.getByTestId("antenna-port-composer");
+  const newField = name => composer.getByRole("textbox", { name, exact: true });
+  const newSelect = name => composer.getByRole("combobox", { name, exact: true });
+  const newButton = name => composer.getByRole("button", { name, exact: true });
+  const fillPort = async (id = "created-port") => {
+    await newField("New port ID").fill(id);
+    await newSelect("New port transport").selectOption("transport");
+    for (const [index, branch, inlet, outlet, weight] of [[1, "signal", "signal-in", "signal-out", "1"], [2, "return", "return-in", "return-out", "-1"]]) {
+      await newField(`New port branch ${index} ID`).fill(branch);
+      await newSelect(`New port branch ${index} inlet terminal`).selectOption(inlet);
+      await newSelect(`New port branch ${index} outlet terminal`).selectOption(outlet);
+      await newField(`New port branch ${index} signed weight`).fill(weight);
+    }
+  };
+  const createPort = async () => { assert.equal(await newButton("Create port").isEnabled(), true); await newButton("Create port").evaluate(button => button.click()); await wait(() => window.__antennaPortEditorFixture.read().pending === 1); };
+
+  await boot("", true);
+  const material = field("Layout conductor conductivity");
+  await material.fill("59000000");
+  await wait(() => document.querySelector('[data-testid="port-global-valid"]')?.textContent === "true");
+  await newField("New port ID").fill("creator-draft");
+  await wait(() => document.querySelector('[data-testid="port-global-valid"]')?.textContent === "false");
+  assert.ok((await page.getByTestId("port-global-reason").innerText()).includes("each edited form"));
+  await newButton("Discard new port draft").click();
+  assert.equal(await material.inputValue(), "59000000");
+  await wait(() => document.querySelector('[data-testid="port-global-valid"]')?.textContent === "true");
+  await page.getByRole("button", { name: "Discard conductor changes", exact: true }).click();
+  assert.equal(await material.inputValue(), "58000000");
+  assert.equal(writes(await read()).length, 0);
+  checks.push({ name: "Material and new-port drafts share one global guard without hiding or discarding each other", passed: true });
+
+  await fillPort(); await material.fill("59000000");
+  const creatorBefore = await read();
+  await page.evaluate(() => {
+    const root = document.querySelector('[data-testid="antenna-port-composer"]');
+    const input = root.querySelector("input"), material = document.querySelector('[data-testid="port-editor"] input');
+    const scroll = document.querySelector('[data-testid="port-scroll"]');
+    input.focus({ preventScroll: true });
+    const proof = { root, input, scroll, scrollTop: scroll.scrollTop, material, disabled: material.disabled, opacity: getComputedStyle(material).opacity,
+      rootChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0 };
+    const sample = () => {
+      if (root !== document.querySelector('[data-testid="antenna-port-composer"]')) proof.rootChanges++;
+      if (material.disabled !== proof.disabled) proof.disabledChanges++;
+      if (getComputedStyle(material).opacity !== proof.opacity) proof.opacityChanges++;
+      proof.opacityAnimations += root.getAnimations({ subtree: true }).filter(animation => (animation.playState === "running" || animation.pending) && animation.effect?.getKeyframes().some(frame => "opacity" in frame)).length;
+    };
+    const observer = new MutationObserver(sample); observer.observe(root, { subtree: true, childList: true, attributes: true }); observer.observe(material, { attributes: true });
+    window.__portCreatorStability = { proof, sample, observer };
+  });
+  await screenshot("creator-before"); await createPort();
+  const submittedPorts = writes(await read())[0].body.merge_patch.antenna_port_modes;
+  assert.deepEqual(submittedPorts.slice(0, -1), creatorBefore.scene.antenna_port_modes);
+  assert.equal(submittedPorts.at(-1).id, "created-port");
+  assert.equal(submittedPorts.at(-1).normalization_current_a, 1);
+  await newField("New port ID").fill("newer-port-draft");
+  await page.evaluate(() => { const { proof } = window.__portCreatorStability; proof.scroll.scrollTop = proof.scrollTop; proof.input.focus({ preventScroll: true }); });
+  await release();
+  await wait(() => [...document.querySelectorAll('[data-testid="antenna-port-composer"] button')].some(button => button.textContent === "Create port" && !button.disabled));
+  assert.equal(await newField("New port ID").inputValue(), "newer-port-draft");
+  assert.equal(await material.inputValue(), "59000000");
+  const created = await read();
+  assert.equal(created.canUndo, true);
+  assert.deepEqual(created.scene.objects, creatorBefore.scene.objects);
+  assert.deepEqual(created.scene.current_transports, creatorBefore.scene.current_transports);
+  assert.equal(created.scene.antenna_port_modes.length, creatorBefore.scene.antenna_port_modes.length + 1);
+  const creatorProof = await page.evaluate(() => { const { proof, sample, observer } = window.__portCreatorStability; sample(); observer.disconnect(); return {
+    rootChanges: proof.rootChanges, disabledChanges: proof.disabledChanges, opacityChanges: proof.opacityChanges, opacityAnimations: proof.opacityAnimations,
+    focus: document.activeElement === proof.input, scroll: proof.scroll.scrollTop === proof.scrollTop,
+  }; });
+  assert.deepEqual(creatorProof, { rootChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, focus: true, scroll: true });
+  assert.equal(await page.getByTestId("port-global-valid").textContent(), "false");
+  checks.push({ name: "Create port appends only the new port; held ACK preserves newer creator/material drafts, root, focus, scroll and unrelated control state", passed: true, creatorProof });
+  await screenshot("creator-ack"); await budget("creator ACK and aggregate guard");
+
+  for (const malformed of ["normalization", "scene_revision", "scene_id"]) {
+    await boot("", true); await fillPort();
+    await page.evaluate(kind => window.__antennaPortEditorFixture.malformedNext(kind), malformed);
+    await createPort(); await release();
+    await newButton("Rebase new port draft explicitly").waitFor({ timeout });
+    assert.equal((await read()).canUndo, false);
+    assert.equal(await newField("New port ID").inputValue(), "created-port");
+    assert.equal(await composer.getByText(/Port 'created-port' committed/).count(), 0);
+    checks.push({ name: `creator malformed ${malformed} ACK is rejected before history/publication`, passed: true });
+    await budget(`creator malformed ${malformed}`);
+  }
+
+  await boot("", true); await fillPort();
+  await page.evaluate(() => window.__antennaPortEditorFixture.conflict());
+  await newButton("Rebase new port draft explicitly").waitFor({ timeout });
+  assert.equal(await newButton("Create port").isDisabled(), true);
+  await newButton("Rebase new port draft explicitly").click();
+  await createPort(); assert.equal(writes(await read())[0].body.base_revision, 2); await release();
+  await wait(() => document.querySelector('[data-testid="port-dirty"]')?.textContent === "false");
+  checks.push({ name: "Creator external revision requires explicit rebase and writes the current base", passed: true });
+
+  await boot("structured-v3", true);
+  await newField("New port ID").fill("refused-closed-loop-port");
+  await newSelect("New port transport").selectOption("transport");
+  assert.equal(await newButton("Create port").isDisabled(), true);
+  assert.ok((await composer.innerText()).includes("Closed-loop sources require their explicit v3 port"));
+  assert.equal(writes(await read()).length, 0);
+  checks.push({ name: "Creator refuses an additional closed-loop port without source/cut fallback or writes", passed: true });
+  await screenshot("creator-closed-loop-refused");
+
+  await boot("", true); await fillPort("old-owner-port"); await createPort();
+  await page.evaluate(() => window.__antennaPortEditorFixture.switchSession("B"));
+  await page.getByTestId("port-owner").filter({ hasText: "restored-model-B" }).waitFor({ timeout });
+  await page.evaluate(() => window.__antennaPortEditorFixture.switchSession("A"));
+  await page.getByTestId("port-owner").filter({ hasText: "restored-model-A" }).waitFor({ timeout });
+  await newField("New port ID").fill("current-owner-draft");
+  const creatorAbaBefore = await read(); await release(); await page.waitForTimeout(350);
+  const creatorAbaAfter = await read();
+  assert.equal(creatorAbaAfter.canUndo, false); assert.equal(creatorAbaAfter.invalidations, creatorAbaBefore.invalidations);
+  assert.equal(await newField("New port ID").inputValue(), "current-owner-draft");
+  assert.equal(await composer.getByText(/old-owner-port.*committed/).count(), 0);
+  checks.push({ name: "Creator session ABA fences old ACK and preserves the new owner's draft", passed: true });
+  await budget("creator session ABA");
   const beforeIdle = await read(); await page.waitForTimeout(700); const afterIdle = await read();
   assert.equal(afterIdle.calls.length, beforeIdle.calls.length); assert.equal(afterIdle.renders, beforeIdle.renders);
   assert.deepEqual(pageErrors, []); assert.deepEqual(consoleErrors, []);

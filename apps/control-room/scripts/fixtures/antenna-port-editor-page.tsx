@@ -17,6 +17,7 @@ import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdenti
 import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus";
 import type { KernelApi } from "@/kernel/types";
 import { InspectorEditSessionProvider, useInspectorEditSession } from "@/modules/inspector/InspectorEditSession";
+import { AntennaConductorAuthoring } from "@/modules/inspector/panels/antenna/AntennaConductorAuthoring";
 import { AntennaPortEditor } from "@/modules/inspector/panels/antenna/AntennaPortEditor";
 
 const API_INSTANCE = "66666666-6666-4666-8666-666666666666";
@@ -58,6 +59,16 @@ function makeScene(name: string): SceneResource {
       normalization: { kind: "source_cut_rt0", source_cut_ref: "cut", orientation: "minus_outward" } });
     Object.assign(scene.current_transports![0], { structured_current_closure: { schema_version: "structured_current_closure.v2", kind: "closed_geometry",
       source_cuts: [{ source_cut_id: "cut", region: { object_id: sourceId } }] } });
+  }
+  if (typeof window !== "undefined" && new URL(window.location.href).searchParams.get("creator") === "1") {
+    Object.assign(scene.objects![0], { geometry: { geometry_kind: "MicrostripAntennaLayout", geometry_params: {
+      conductivity_s_per_m: 58000000, conductors: [{ id: "signal" }, { id: "return" }],
+    } } });
+    scene.current_transports = [scene.current_transports![0]];
+    Object.assign(scene.current_transports[0], { coupling: "one_way", domain: [{ object_id: sourceId }],
+      materials: [{ region: { object_id: sourceId }, material: { kind: "ohmic", sigma_Spm: 58000000 } }] });
+    const boundaries = scene.current_transports[0].boundaries;
+    for (const boundary of Array.isArray(boundaries) ? boundaries : []) Object.assign(boundary, { surfaces: [{ object_id: sourceId, surface_id: boundary.id, orientation: [1, 0, 0] }] });
   }
   return scene;
 }
@@ -131,10 +142,17 @@ function makeFixture() {
 
 function EditorOwner() {
   const scene = useSceneResource(), session = useInspectorEditSession();
+  const creator = new URL(window.location.href).searchParams.get("creator") === "1";
   return <>
     <output data-testid="port-owner">{scene.data?.scene?.id}</output>
     <output data-testid="port-dirty">{String(session?.dirty ?? false)}</output>
-    <section data-testid="port-editor"><AntennaPortEditor objectId={sourceId} portId={portId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /></section>
+    <output data-testid="port-global-valid">{String(session?.valid ?? false)}</output>
+    <output data-testid="port-global-reason">{session?.applyBlockReason}</output>
+    {creator ? <>
+      <button type="button" disabled={!session?.dirty || !session?.valid || session?.applying} onClick={() => { void session?.apply(); }}>Apply conductor changes</button>
+      <button type="button" disabled={!session?.dirty || session?.applying} onClick={() => { void session?.reset(); }}>Discard conductor changes</button>
+    </> : null}
+    <section data-testid="port-editor">{creator ? <AntennaConductorAuthoring objectId={sourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : <AntennaPortEditor objectId={sourceId} portId={portId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} />}</section>
     <div style={{ height: 550 }} aria-hidden="true" />
   </>;
 }
