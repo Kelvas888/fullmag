@@ -59,8 +59,8 @@ export function AntennaTerminalSourceDetails({ model, current, onGeometry, onPor
       </> : null}
       {source.ports.map((port, index) => <InspectorGroup key={`${port.id}:${index}`} title={`Observation port ${index + 1}`}>
         <FieldRow label="Port ID" value={value(port.id)} mono />
-        <FieldRow label="Source cut reference" value={value(record(port.normalization)?.source_cut_ref)} mono />
-        <FieldRow label="Normalization orientation" value={value(record(port.normalization)?.orientation)} mono />
+        <FieldRow label="Source cut reference" value={value(record(record(port)?.normalization)?.source_cut_ref)} mono />
+        <FieldRow label="Normalization orientation" value={value(record(record(port)?.normalization)?.orientation)} mono />
         {(Array.isArray(port.branches) ? port.branches : []).filter(branch => branch != null).map((branch, ordinal) => <InspectorGroup key={`${branch.id}:${ordinal}`} title={`Observed branch ${ordinal + 1}`}>
           <FieldRow label="Branch ID" value={value(branch.id)} mono />
           <FieldRow label="Inlet observation" value={value(branch.inlet_terminal_ref)} mono />
