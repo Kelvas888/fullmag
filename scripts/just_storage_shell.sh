@@ -442,6 +442,14 @@ case "${recipe}" in
     exit 2
     ;;
   *"scripts/run_managed_browser.py"*)
+    managed_browser_snapshot_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_browser.py\" --repo-root \"[^\"]+\" --job-id '([0-9a-f]{32})' --commit '([0-9a-f]{40})' --source-digest '([0-9a-f]{64})' --native-snapshot-sha256 '([0-9a-f]{64})' --port '([0-9]{4,5})'( --ephemeral)?$"
+    if [[ "${recipe}" =~ ${managed_browser_snapshot_pattern} ]]; then
+      managed_browser_args=(--repo-root "${repo_root}" --job-id "${BASH_REMATCH[1]}" --commit "${BASH_REMATCH[2]}" --source-digest "${BASH_REMATCH[3]}" --native-snapshot-sha256 "${BASH_REMATCH[4]}" --port "${BASH_REMATCH[5]}")
+      if [[ -n "${BASH_REMATCH[6]}" ]]; then
+        managed_browser_args+=(--ephemeral)
+      fi
+      exec "${python_cmd}" "${script_dir}/run_managed_browser.py" "${managed_browser_args[@]}"
+    fi
     managed_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/run_managed_browser.py" --repo-root "[^"]+" --job-id ([0-9a-f]{32}) --commit ([0-9a-f]{40}) --port ([0-9]{4,5})$'
     if [[ ! "${recipe}" =~ ${managed_browser_pattern} ]]; then
       echo "[fullmag just] invalid managed browser recipe" >&2
