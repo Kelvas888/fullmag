@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import shutil
 import sys
@@ -117,6 +118,114 @@ class RuntimeImageContextTests(unittest.TestCase):
                     None,
                     image_id,
                 )
+
+
+class BackendBuildReceiptProfileTests(unittest.TestCase):
+    def test_build_profile_aliases_are_explicit(self):
+        self.assertEqual(docker_dev._cargo_profile_for_build("dev"), "backend-dev")
+        self.assertEqual(docker_dev._cargo_profile_for_build("release"), "release")
+        with self.assertRaises(docker_dev.DirectDockerError):
+            docker_dev._cargo_profile_for_build("backend-dev")
+
+    def test_build_parser_defaults_to_dev_and_accepts_release(self):
+        self.assertEqual(docker_dev._parser().parse_args(["build"]).profile, "dev")
+        self.assertEqual(
+            docker_dev._parser().parse_args(["up", "--profile", "release"]).profile,
+            "release",
+        )
+
+    @staticmethod
+    def _fixture(profile="backend-dev", target_profile_dir=None):
+        temporary = tempfile.TemporaryDirectory()
+        package = Path(temporary.name) / "package"
+        package.mkdir()
+        source_bundle = {
+            "source_digest": "d" * 64,
+            "resolved_commit": "e" * 40,
+            "archive_sha256": "f" * 64,
+            "native_source_identity": {
+                "head_commit_full": "e" * 40,
+                "source_snapshot_dirty": False,
+                "source_snapshot_sha256": "a" * 64,
+            },
+        }
+        toolchain_id = "sha256:" + "1" * 64
+        receipt = {
+            "schema": "fullmag.direct-compose.backend-build-receipt.v1",
+            "state": "succeeded",
+            "operation": "direct-compose-build",
+            "source": {
+                "source_digest": source_bundle["source_digest"],
+                "resolved_commit": source_bundle["resolved_commit"],
+                "source_tar_sha256": source_bundle["archive_sha256"],
+            },
+            "native_source_identity": source_bundle["native_source_identity"],
+            "toolchain": {"image_id": toolchain_id},
+            "execution_lanes": {
+                lane: {"status": "compiled"} for lane in docker_dev.REQUIRED_LANES
+            },
+            "build": {
+                "cargo_profile": profile,
+                "cargo_target_profile_dir": target_profile_dir or profile,
+            },
+        }
+        (package / "backend-build-receipt.json").write_bytes(
+            json.dumps(receipt, sort_keys=True).encode("utf-8")
+        )
+        return temporary, package, source_bundle, toolchain_id
+
+    def test_backend_dev_profile_is_required_by_prepare_receipt(self):
+        temporary, package, source_bundle, toolchain_id = self._fixture()
+        try:
+            receipt, raw = docker_dev._validate_prepare_receipt(
+                package, source_bundle, toolchain_id, "backend-dev"
+            )
+            self.assertEqual(receipt["build"]["cargo_profile"], "backend-dev")
+            self.assertEqual(receipt["build"]["cargo_target_profile_dir"], "backend-dev")
+            self.assertTrue(raw)
+        finally:
+            temporary.cleanup()
+
+    def test_release_profile_is_accepted_when_requested(self):
+        temporary, package, source_bundle, toolchain_id = self._fixture(
+            profile="release", target_profile_dir="release"
+        )
+        try:
+            receipt, raw = docker_dev._validate_prepare_receipt(
+                package, source_bundle, toolchain_id, "release"
+            )
+            self.assertEqual(receipt["build"]["cargo_profile"], "release")
+            self.assertTrue(raw)
+        finally:
+            temporary.cleanup()
+
+    def test_release_profile_is_rejected_when_dev_was_requested(self):
+        temporary, package, source_bundle, toolchain_id = self._fixture(
+            profile="release", target_profile_dir="release"
+        )
+        try:
+            with self.assertRaisesRegex(
+                docker_dev.DirectDockerError, "backend-dev cargo profile"
+            ):
+                docker_dev._validate_prepare_receipt(
+                    package, source_bundle, toolchain_id, "backend-dev"
+                )
+        finally:
+            temporary.cleanup()
+
+    def test_mismatched_profile_directory_is_rejected_by_prepare_receipt(self):
+        temporary, package, source_bundle, toolchain_id = self._fixture(
+            profile="backend-dev", target_profile_dir="release"
+        )
+        try:
+            with self.assertRaisesRegex(
+                docker_dev.DirectDockerError, "backend-dev cargo profile"
+            ):
+                docker_dev._validate_prepare_receipt(
+                    package, source_bundle, toolchain_id, "backend-dev"
+                )
+        finally:
+            temporary.cleanup()
 
 
 class DevelopmentBaseContextTests(unittest.TestCase):

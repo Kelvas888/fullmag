@@ -25,6 +25,49 @@ def test_backend_dev_keeps_incremental_compilation_and_optimized_cpu_kernels():
     assert profile["package"]["fullmag-fdm-demag"]["opt-level"] == 3
 
 
+def test_docker_backend_build_selects_backend_dev_profile_and_separate_target_tree():
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    start = makefile.index("install-cli install-cli-dev install-cli-static:\n")
+    end = makefile.index("\nshow-cli-path:", start)
+    recipe = makefile[start:end]
+    backend = (ROOT / "docker/all-in-one/backend_dev.py").read_text(encoding="utf-8")
+    assert 'BACKEND_CARGO_PROFILE = "backend-dev"' in backend
+    assert 'SUPPORTED_CARGO_PROFILES = frozenset({"backend-dev", "release"})' in backend
+    assert '"FULLMAG_BACKEND_CARGO_PROFILE": cargo_profile' in backend
+    assert 'make_target = "install-cli-dev" if cargo_profile == "backend-dev" else "install-cli"' in backend
+    assert 'cargo_profile = _validate_cargo_profile(cargo_profile)' in backend
+    assert '"cargo_profile": cargo_profile' in backend
+    assert '"cargo_target_profile_dir": cargo_profile' in backend
+    assert 'backend-dev) cargo_profile_args="--profile backend-dev"' in recipe
+    assert 'cargo_target_profile_dir="$$cargo_target_dir/$$cargo_profile_dir"' in recipe
+    assert '"$$cargo_target_profile_dir/fullmag-api"' in recipe
+    assert '"$$cargo_target_dir/release/' not in recipe
+    assert '"$$cargo_target_profile_dir/build"' in recipe
+    assert 'if [ "$$cargo_profile_dir" = "backend-dev" ]; then' in recipe
+    assert 'backend-dev FEM source snapshot is required' in recipe
+    assert 'select_managed_fem_library.py --cargo-target \"$$cargo_target_dir\" --snapshot \"$$fem_snapshot\" --profile \"$$cargo_profile_dir\"' in recipe
+    assert 'backend-dev FEM native root is required' not in recipe
+    compose = (ROOT / "compose.dev.yaml").read_text(encoding="utf-8")
+    assert 'FULLMAG_BACKEND_CARGO_PROFILE: ${FULLMAG_BACKEND_CARGO_PROFILE:-backend-dev}' in compose
+
+
+def test_direct_compose_keeps_native_fem_release_for_backend_dev():
+    build_script = (ROOT / "crates/fullmag-fem-sys/build.rs").read_text(encoding="utf-8")
+    assert "fn native_cmake_build_type(cargo_profile: &str, direct_compose: bool) -> &'static str" in build_script
+    assert 'if direct_compose || cargo_profile == "release" {' in build_script
+    assert (
+        'let direct_compose = explicit_env_flag("FULLMAG_DIRECT_COMPOSE").unwrap_or(false);'
+        in build_script
+    )
+    assert (
+        'let cmake_build_type = native_cmake_build_type(&cargo_profile, direct_compose);'
+        in build_script
+    )
+    assert '"FULLMAG_DIRECT_COMPOSE": "1"' in (
+        ROOT / "docker/all-in-one/backend_dev.py"
+    ).read_text(encoding="utf-8")
+
+
 @pytest.mark.skipif(
     os.name == "nt" or shutil.which("bash") is None,
     reason="The extracted Makefile recipe is a Linux-container regression",
@@ -48,6 +91,8 @@ def test_install_cli_dev_pins_fdm_package_to_explicit_native_root():
             (
                 "set -eu",
                 f"cargo_target_dir={shlex.quote(str(case_root / 'cargo-target'))}",
+                "cargo_profile_dir=release",
+                "cargo_target_profile_dir=\"$cargo_target_dir/$cargo_profile_dir\"",
                 recipe,
             )
         )

@@ -27,6 +27,7 @@ services:
       FULLMAG_DOCKER_ROLE: backend
       FULLMAG_SESSION_STORAGE_PROFILE: windows-folder-v1
       FULLMAG_RUNTIME_IMAGE_ID: ${FULLMAG_DEV_IMAGE}
+      FULLMAG_BACKEND_CARGO_PROFILE: ${FULLMAG_BACKEND_CARGO_PROFILE:-backend-dev}
     expose: ["8081"]
     volumes:
       # One source selection for both services: the main checkout or a worktree.

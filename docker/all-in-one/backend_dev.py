@@ -10,7 +10,7 @@ entrypoint.
 
 This command deliberately has no public build-command option.  The source
 archive is data, never a shell script supplied by the caller, and the only
-native build command is the canonical ``make install-cli-dev`` target.
+native build command is the canonical ``make install-cli-dev`` or ``make install-cli`` target selected by the validated Cargo profile.
 """
 
 from __future__ import annotations
@@ -42,6 +42,8 @@ from backend_source import (
 
 
 RECEIPT_SCHEMA = "fullmag.direct-compose.backend-build-receipt.v1"
+BACKEND_CARGO_PROFILE = "backend-dev"
+SUPPORTED_CARGO_PROFILES = frozenset({"backend-dev", "release"})
 
 MAX_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_SOURCE_BYTES = 16 * 1024 * 1024 * 1024
@@ -808,7 +810,18 @@ def _toolchain_identity() -> tuple[str, dict[str, Any]]:
     }
 
 
-def _build_environment(workspace: Path, build_root: Path, native: Mapping[str, Any], jobs: int) -> dict[str, str]:
+def _validate_cargo_profile(value: str) -> str:
+    if value not in SUPPORTED_CARGO_PROFILES:
+        allowed = ", ".join(sorted(SUPPORTED_CARGO_PROFILES))
+        _fail(f"FULLMAG_BACKEND_CARGO_PROFILE must be one of: {allowed}")
+    return value
+
+
+def _build_environment(
+    workspace: Path, build_root: Path, native: Mapping[str, Any], jobs: int,
+    cargo_profile: str = BACKEND_CARGO_PROFILE,
+) -> dict[str, str]:
+    cargo_profile = _validate_cargo_profile(cargo_profile)
     # Keep native CMake state in the already cache-key-scoped Cargo target
     # volume.  The stable crate-shaped directories preserve Makefile's
     # existing library discovery globs while keeping FDM and FEM caches
@@ -819,7 +832,7 @@ def _build_environment(workspace: Path, build_root: Path, native: Mapping[str, A
         / ".fullmag-build"
         / "cargo-targets"
         / "direct"
-        / "release"
+        / cargo_profile
         / "build"
     )
     native_build_roots = {
@@ -837,6 +850,7 @@ def _build_environment(workspace: Path, build_root: Path, native: Mapping[str, A
         {
             "FULLMAG_WINDOWS_CONTAINER_MANAGED": "1",
             "FULLMAG_DIRECT_COMPOSE": "1",
+            "FULLMAG_BACKEND_CARGO_PROFILE": cargo_profile,
             "FULLMAG_RUNNER_WORKSPACE": str(workspace),
             "FULLMAG_CARGO_TARGET_DIR": "/workspace/.fullmag-build/cargo-targets/direct",
             "CARGO_TARGET_DIR": "/workspace/.fullmag-build/cargo-targets/direct",
@@ -989,23 +1003,30 @@ def _prepare_locked(
     workspace, capsule, native, manifest_hash, archive_hash = _materialize_source(
         Path(args.source_tar), Path(args.manifest), build_root
     )
-    environment = _build_environment(workspace, build_root, native, jobs)
+    cargo_profile = _validate_cargo_profile(
+        os.environ.get("FULLMAG_BACKEND_CARGO_PROFILE", BACKEND_CARGO_PROFILE)
+    )
+    environment = _build_environment(workspace, build_root, native, jobs, cargo_profile)
     build_log = workspace / ".fullmag" / "local" / "direct-backend-build.log"
     _ensure_directory(build_log.parent, "backend build log parent")
-    command = [shutil.which("make") or "/usr/bin/make", "install-cli-dev"]
+    make_target = "install-cli-dev" if cargo_profile == "backend-dev" else "install-cli"
+    command = [shutil.which("make") or "/usr/bin/make", make_target]
     return_code = _run_canonical_make(command, workspace, environment, build_log)
     if return_code != 0:
         _fail(f"canonical Make target failed with exit code {return_code}")
     return _publish_completed_build(
-        workspace, output, capsule, native, manifest_hash, archive_hash, toolchain, command
+        workspace, output, capsule, native, manifest_hash, archive_hash, toolchain, command,
+        cargo_profile,
     )
 
 
 def _publish_completed_build(
     workspace: Path, output: Path, capsule: Mapping[str, Any], native: Mapping[str, Any],
     manifest_hash: str, archive_hash: str, toolchain: Mapping[str, Any], command: list[str],
+    cargo_profile: str,
 ) -> int:
     """Publish verified artifacts after the canonical Make invocation succeeded."""
+    cargo_profile = _validate_cargo_profile(cargo_profile)
     records = _copy_package(workspace, output)
     receipt: dict[str, Any] = {
         "schema": RECEIPT_SCHEMA,
@@ -1033,6 +1054,8 @@ def _publish_completed_build(
             for lane in LANES
         },
         "build": {
+            "cargo_profile": cargo_profile,
+            "cargo_target_profile_dir": cargo_profile,
             "mode": "cuda-fem-gpu",
             "features": ["cuda", "fem-gpu"],
             "fullmag_build_cpu_only": False,

@@ -63,6 +63,13 @@ RUNTIME_IMAGE_CONTEXT_FILES = (
     ("backend_source.py", "docker/all-in-one/backend_source.py"),
 )
 REQUIRED_LANES = ("fdm-cpu", "fdm-gpu", "fem-cpu", "fem-gpu")
+BUILD_PROFILE_TO_CARGO_PROFILE = {
+    "dev": "backend-dev",
+    "release": "release",
+}
+DEFAULT_BUILD_PROFILE = "dev"
+SUPPORTED_CARGO_PROFILES = frozenset(BUILD_PROFILE_TO_CARGO_PROFILE.values())
+BACKEND_CARGO_PROFILE = BUILD_PROFILE_TO_CARGO_PROFILE[DEFAULT_BUILD_PROFILE]
 REQUIRED_STARTUP_HELPERS = (
     "docker_startup_script.py",
     "fullmag_storage.py",
@@ -82,6 +89,22 @@ class DirectDockerOutcomeUnknown(DirectDockerError):
 
 def _fail(message: str) -> DirectDockerError:
     return DirectDockerError(message)
+
+
+def _cargo_profile_for_build(profile: str) -> str:
+    try:
+        cargo_profile = BUILD_PROFILE_TO_CARGO_PROFILE[profile]
+    except (KeyError, TypeError) as error:
+        allowed = ", ".join(sorted(BUILD_PROFILE_TO_CARGO_PROFILE))
+        raise _fail(f"build profile must be one of: {allowed}") from error
+    return cargo_profile
+
+
+def _validate_cargo_profile(profile: str) -> str:
+    if profile not in SUPPORTED_CARGO_PROFILES:
+        allowed = ", ".join(sorted(SUPPORTED_CARGO_PROFILES))
+        raise _fail(f"backend Cargo profile must be one of: {allowed}")
+    return profile
 
 
 def _repo_default() -> Path:
@@ -974,7 +997,8 @@ def _prepare_backend_cache(layout: Mapping[str, object], repo: Path, image_id: s
 def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
                  source_bundle: Mapping[str, object], package: Path, image_ref: str,
                  image_id: str, toolchain_id: str, cache: Mapping[str, object],
-                 base_reference: str) -> dict[str, str]:
+                 base_reference: str, cargo_profile: str) -> dict[str, str]:
+    cargo_profile = _validate_cargo_profile(cargo_profile)
     archive = Path(str(source_bundle["archive_path"]))
     manifest = Path(str(source_bundle["manifest_path"]))
     state = run_root / "state"
@@ -989,6 +1013,7 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
         "FULLMAG_RUNTIME_IMAGE_ID": image_id,
         "FULLMAG_TOOLCHAIN_IMAGE": toolchain_id,
         "FULLMAG_TOOLCHAIN_IMAGE_ID": toolchain_id,
+        "FULLMAG_BACKEND_CARGO_PROFILE": cargo_profile,
         "FULLMAG_SOURCE_ROOT": str(selected),
         "FULLMAG_BACKEND_SOURCE_TAR": str(archive),
         "FULLMAG_BACKEND_SOURCE_MANIFEST": str(manifest),
@@ -1019,18 +1044,28 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
         "FULLMAG_SOURCE_ROOT": str(selected),
         "FULLMAG_RUNTIME_IMAGE_ID": image_id,
         "FULLMAG_TOOLCHAIN_IMAGE_ID": toolchain_id,
+        "FULLMAG_BACKEND_CARGO_PROFILE": cargo_profile,
     })
     return environment
 
 
 def _validate_prepare_receipt(package: Path, source_bundle: Mapping[str, object],
-                              toolchain_id: str) -> tuple[dict[str, object], bytes]:
+                              toolchain_id: str,
+                              expected_cargo_profile: str) -> tuple[dict[str, object], bytes]:
     receipt_path = package / "backend-build-receipt.json"
     receipt, raw = _read_json(receipt_path, "backend build receipt")
     if receipt.get("schema") != "fullmag.direct-compose.backend-build-receipt.v1":
         raise _fail("backend worker returned an unsupported build receipt schema")
     if receipt.get("state") != "succeeded" or receipt.get("operation") != "direct-compose-build":
         raise _fail("backend worker did not publish a successful direct build receipt")
+    expected_cargo_profile = _validate_cargo_profile(expected_cargo_profile)
+    build = receipt.get("build")
+    if (not isinstance(build, dict)
+            or build.get("cargo_profile") != expected_cargo_profile
+            or build.get("cargo_target_profile_dir") != expected_cargo_profile):
+        raise _fail(
+            f"backend build receipt is not a {expected_cargo_profile} cargo profile build"
+        )
     source = receipt.get("source")
     if not isinstance(source, dict):
         raise _fail("backend build receipt has no source identity")
@@ -1059,8 +1094,11 @@ def _validate_prepare_receipt(package: Path, source_bundle: Mapping[str, object]
 def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
               selected: Path, source_bundle: Mapping[str, object], package: Path,
               image_id: str, toolchain_id: str, prepare_receipt: Mapping[str, object],
-              prepare_receipt_bytes: bytes,
-              base_info: Mapping[str, object]) -> Path:
+              prepare_receipt_bytes: bytes, base_info: Mapping[str, object],
+              build_profile: str, expected_cargo_profile: str) -> Path:
+    expected_cargo_profile = _validate_cargo_profile(expected_cargo_profile)
+    if _cargo_profile_for_build(build_profile) != expected_cargo_profile:
+        raise _fail("assembly build profile does not match its Cargo profile")
     from fullmag_docker_runtime import REQUIRED_BINARIES
     from fullmag_storage import atomic_json, validate_path
 
@@ -1081,6 +1119,11 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
     build_receipt = package / "backend-build-receipt.json"
     if _sha256_bytes(prepare_receipt_bytes) != _sha256_file(build_receipt, "backend build receipt"):
         raise _fail("backend build receipt changed while assembling provenance")
+    build = prepare_receipt.get("build")
+    if (not isinstance(build, dict)
+            or build.get("cargo_profile") != expected_cargo_profile
+            or build.get("cargo_target_profile_dir") != expected_cargo_profile):
+        raise _fail("backend build receipt profile changed while assembling provenance")
     assembly = {
         "schema": "fullmag.docker-all-image.v1",
         "state": "succeeded",
@@ -1116,6 +1159,9 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
         "development_base_labels": base_info.get("labels", {}),
         "runtime_image_labels": runtime_labels,
         "runtime_mode": "development_source_bind",
+        "build_profile": build_profile,
+        "cargo_profile": build["cargo_profile"],
+        "cargo_target_profile_dir": build["cargo_target_profile_dir"],
         "package_root": str(validate_path(package, Path(str(layout["build_storage_root"])), "backend package")),
         "binary_hashes": binary_hashes,
         "startup_helper_hashes": helper_hashes,
@@ -1268,6 +1314,8 @@ def _frozen_source_bundle(manifest_path: Path, layout: Mapping[str, object], sel
 
 def build(args: argparse.Namespace) -> Path:
     _require_native_windows()
+    build_profile = getattr(args, "profile", DEFAULT_BUILD_PROFILE)
+    cargo_profile = _cargo_profile_for_build(build_profile)
     repo = Path(args.repo_root).resolve(strict=True)
     selected, layout = _select_source(repo, args.source_root)
     run_id, run_root = _new_run_root(layout)
@@ -1281,6 +1329,8 @@ def build(args: argparse.Namespace) -> Path:
         "image_log": str(run_root / "image-build.log"),
         "development_base_log": str(run_root / "development-base-build.log"),
         "queue": "not-used",
+        "build_profile": build_profile,
+        "cargo_profile": cargo_profile,
     }
     _write_json(run_root / "receipt.json", terminal)
 
@@ -1332,6 +1382,7 @@ def build(args: argparse.Namespace) -> Path:
             "FULLMAG_RELEASE_IMAGE": args.image or os.environ.get("FULLMAG_DEV_IMAGE", DEFAULT_IMAGE),
             "FULLMAG_TOOLCHAIN_IMAGE": args.toolchain_image or os.environ.get("FULLMAG_TOOLCHAIN_IMAGE", DEFAULT_BASE_IMAGE),
             "FULLMAG_TOOLCHAIN_IMAGE_ID": args.toolchain_image or os.environ.get("FULLMAG_TOOLCHAIN_IMAGE_ID", "pending"),
+            "FULLMAG_BACKEND_CARGO_PROFILE": cargo_profile,
             "FULLMAG_DEVELOPMENT_BASE_IMAGE": os.environ.get(
                 "FULLMAG_DEVELOPMENT_BASE_IMAGE", DEFAULT_BASE_IMAGE
             ),
@@ -1400,6 +1451,7 @@ def build(args: argparse.Namespace) -> Path:
         environment = _environment(
             layout, selected, run_root, source_bundle, package, image_ref, image_id, toolchain_id, cache,
             str(base_info["reference"]),
+            cargo_profile,
         )
         config = _compose_config(repo, files, environment)
         backend = config["services"]["backend"]
@@ -1424,10 +1476,12 @@ def build(args: argparse.Namespace) -> Path:
             timeout=4 * 60 * 60,
             environment=environment,
         )
-        prepare_receipt, prepare_receipt_bytes = _validate_prepare_receipt(package, source_bundle, toolchain_id)
+        prepare_receipt, prepare_receipt_bytes = _validate_prepare_receipt(
+            package, source_bundle, toolchain_id, cargo_profile
+        )
         assembly_receipt = _assembly(
             layout, run_id, run_root, selected, source_bundle, package, image_id, toolchain_id,
-            prepare_receipt, prepare_receipt_bytes, base_info,
+            prepare_receipt, prepare_receipt_bytes, base_info, build_profile, cargo_profile,
         )
         terminal.update(state="succeeded", exit_code=0, assembly_receipt=str(assembly_receipt))
         _write_json(run_root / "receipt.json", terminal)
@@ -1438,6 +1492,8 @@ def build(args: argparse.Namespace) -> Path:
             "source_root": str(selected),
             "image_id": image_id,
             "toolchain_image_id": toolchain_id,
+            "build_profile": build_profile,
+            "cargo_profile": cargo_profile,
             "run_root": str(run_root),
         }, indent=2))
         return assembly_receipt
@@ -1520,6 +1576,11 @@ def _parser() -> argparse.ArgumentParser:
         ))
         command.add_argument("--source-root", type=Path,
                              help="registered checkout/worktree mounted live by both services")
+        command.add_argument(
+            "--profile", choices=sorted(BUILD_PROFILE_TO_CARGO_PROFILE),
+            default=DEFAULT_BUILD_PROFILE,
+            help="backend build profile: dev (Cargo backend-dev) or release",
+        )
         command.add_argument("--image", help="existing/buildable development image/tag; default: FULLMAG_DEV_IMAGE or fullmag/fullmag-dev:local")
         command.add_argument("--toolchain-image", help="immutable toolchain image ID/tag; default: image label or configured value")
         command.add_argument("--source-manifest", type=Path,

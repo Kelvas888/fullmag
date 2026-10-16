@@ -145,6 +145,13 @@ install-cli install-cli-dev install-cli-static:
 	cpu_only="$${FULLMAG_BUILD_CPU_ONLY:-0}"; \
 	build_incremental="$(FULLMAG_BUILD_INCREMENTAL)"; \
 	cargo_target_dir="$${FULLMAG_CARGO_TARGET_DIR:?storage resolver did not provide FULLMAG_CARGO_TARGET_DIR}"; \
+	backend_cargo_profile="$${FULLMAG_BACKEND_CARGO_PROFILE:-release}"; \
+	case "$$backend_cargo_profile" in \
+		release) cargo_profile_args="--release"; cargo_profile_dir="release" ;; \
+		backend-dev) cargo_profile_args="--profile backend-dev"; cargo_profile_dir="backend-dev" ;; \
+		*) echo "FULLMAG_BACKEND_CARGO_PROFILE must be release or backend-dev" >&2; exit 2 ;; \
+	esac; \
+	cargo_target_profile_dir="$$cargo_target_dir/$$cargo_profile_dir"; \
 	mkdir -p "$$cargo_target_dir"; \
 	if [ ! -w "$$cargo_target_dir" ]; then echo "Fullmag Cargo target directory is not writable: $$cargo_target_dir" >&2; exit 2; fi; \
 	cargo_target_fstype="$$(findmnt -no FSTYPE -T "$$cargo_target_dir" 2>/dev/null || true)"; \
@@ -160,37 +167,37 @@ install-cli install-cli-dev install-cli-static:
 	if [ "$$cpu_only" = "1" ]; then \
 		echo "FULLMAG_BUILD_CPU_ONLY=1 forces CPU-only launcher build; skipping CUDA and managed FEM GPU export."; \
 		echo "Installing Rust launcher without CUDA support..."; \
-		CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli --release; \
-		CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api --release --no-default-features; \
+		CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli $$cargo_profile_args; \
+		CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api $$cargo_profile_args --no-default-features; \
 	elif [ "$${FULLMAG_FORCE_LOCAL_FEM_CPU:-0}" = "1" ]; then \
 		echo "FULLMAG_FORCE_LOCAL_FEM_CPU=1 selects the container-local MFEM FEM CPU launcher."; \
-		FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_ENABLE_CUDA=OFF FULLMAG_FEM_WITH_SLEPC="$${FULLMAG_FEM_WITH_SLEPC:-OFF}" FULLMAG_FEM_REQUIRE_GPU=0 FULLMAG_FEM_REQUIRE_CEED=0 CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli --release --features "fem-gpu"; \
-		FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_ENABLE_CUDA=OFF FULLMAG_FEM_WITH_SLEPC="$${FULLMAG_FEM_WITH_SLEPC:-OFF}" FULLMAG_FEM_REQUIRE_GPU=0 FULLMAG_FEM_REQUIRE_CEED=0 CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api --release --no-default-features --features "fem-gpu"; \
+		FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_ENABLE_CUDA=OFF FULLMAG_FEM_WITH_SLEPC="$${FULLMAG_FEM_WITH_SLEPC:-OFF}" FULLMAG_FEM_REQUIRE_GPU=0 FULLMAG_FEM_REQUIRE_CEED=0 CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli $$cargo_profile_args --features "fem-gpu"; \
+		FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_ENABLE_CUDA=OFF FULLMAG_FEM_WITH_SLEPC="$${FULLMAG_FEM_WITH_SLEPC:-OFF}" FULLMAG_FEM_REQUIRE_GPU=0 FULLMAG_FEM_REQUIRE_CEED=0 CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api $$cargo_profile_args --no-default-features --features "fem-gpu"; \
 		build_mode="fem-cpu"; \
 	elif [ -n "$$nvcc_bin" ] && [ -n "$$cmake_bin" ]; then \
 		echo "Installing Rust launcher with CUDA support..."; \
 		if [ "$${FULLMAG_FORCE_LOCAL_FEM_GPU:-0}" = "1" ]; then \
 			echo "FULLMAG_FORCE_LOCAL_FEM_GPU=1 selects the container-local MFEM/CUDA FEM GPU launcher; managed host export is disabled."; \
 			echo "[backend 1/3] Building CLI (FDM/FEM CPU/GPU)..."; \
-			FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_REQUIRE_GPU=1 FULLMAG_FEM_REQUIRE_CEED=1 FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli --release --features "cuda fem-gpu"; \
+			FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_REQUIRE_GPU=1 FULLMAG_FEM_REQUIRE_CEED=1 FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli $$cargo_profile_args --features "cuda fem-gpu"; \
 			echo "[backend 2/3] Building API and workers..."; \
-			FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_REQUIRE_GPU=1 FULLMAG_FEM_REQUIRE_CEED=1 FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api --release --no-default-features --features "cuda fem-gpu"; \
+			FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_REQUIRE_GPU=1 FULLMAG_FEM_REQUIRE_CEED=1 FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api $$cargo_profile_args --no-default-features --features "cuda fem-gpu"; \
 			build_mode="cuda-fem-gpu"; \
 		elif [ "$${FULLMAG_SKIP_MANAGED_FEM_GPU_EXPORT:-0}" = "1" ]; then \
 			echo "FULLMAG_SKIP_MANAGED_FEM_GPU_EXPORT=1 disables managed FEM GPU export; building a CUDA-only launcher without the 'fem-gpu' feature."; \
-			FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli --release --features cuda; \
-			FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api --release --no-default-features --features cuda; \
+			FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli $$cargo_profile_args --features cuda; \
+			FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api $$cargo_profile_args --no-default-features --features cuda; \
 			build_mode="cuda"; \
-		elif FULLMAG_USE_MFEM_STACK=ON FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli --release --features "cuda fem-gpu" >"$$build_log" 2>&1 \
-				&& FULLMAG_USE_MFEM_STACK=ON FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api --release --no-default-features --features "cuda fem-gpu" >>"$$build_log" 2>&1; then \
+		elif FULLMAG_USE_MFEM_STACK=ON FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli $$cargo_profile_args --features "cuda fem-gpu" >"$$build_log" 2>&1 \
+				&& FULLMAG_USE_MFEM_STACK=ON FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api $$cargo_profile_args --no-default-features --features "cuda fem-gpu" >>"$$build_log" 2>&1; then \
 			echo "Host FEM GPU backend available; installing launcher with CUDA + FEM GPU support..."; \
 			build_mode="cuda-fem-gpu"; \
 		else \
 			echo "Host FEM GPU backend not available; falling back to CUDA-only launcher."; \
 			echo "Probe log: $(PWD)/.fullmag/local/install-cli-build.log"; \
 			CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL=0 cargo +nightly clean -p fullmag-fem-sys >/dev/null 2>&1 || true; \
-				FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli --release --features cuda; \
-				FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api --release --no-default-features --features cuda; \
+				FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli $$cargo_profile_args --features cuda; \
+				FULLMAG_CMAKE="$$cmake_bin" CUDACXX="$$nvcc_bin" CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api $$cargo_profile_args --no-default-features --features cuda; \
 				build_mode="cuda"; \
 				managed_runtime_ready="0"; \
 				if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then \
@@ -230,19 +237,19 @@ install-cli install-cli-dev install-cli-static:
 		fi; \
 	else \
 		echo "Installing Rust launcher without CUDA support..."; \
-		CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli --release; \
-		CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api --release --no-default-features; \
+		CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-cli $$cargo_profile_args; \
+		CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-api $$cargo_profile_args --no-default-features; \
 		if [ -x "$$managed_runtime_bin" ]; then \
 			build_mode="managed-fem-gpu-host"; \
 		fi; \
 	fi; \
 	echo "[backend 3/3] Building native Python core for mesh certification..."; \
-	CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-py-core --release; \
+	CARGO_TARGET_DIR="$$cargo_target_dir" CARGO_INCREMENTAL="$$build_incremental" cargo +nightly build --locked -p fullmag-py-core $$cargo_profile_args; \
 	mkdir -p .fullmag/local/lib; \
-	if [ ! -f "$$cargo_target_dir/release/lib_fullmag_core.so" ]; then \
+	if [ ! -f "$$cargo_target_profile_dir/lib_fullmag_core.so" ]; then \
 		echo "Native Python core build did not produce lib_fullmag_core.so" >&2; exit 2; \
 	fi; \
-	cp "$$cargo_target_dir/release/lib_fullmag_core.so" .fullmag/local/_fullmag_core.so.new; \
+	cp "$$cargo_target_profile_dir/lib_fullmag_core.so" .fullmag/local/_fullmag_core.so.new; \
 	mv -f .fullmag/local/_fullmag_core.so.new .fullmag/local/_fullmag_core.so; \
 	rm -f .fullmag/local/lib/libfullmag_fdm.so* .fullmag/local/lib/libfullmag_fem.so*; \
 	if [ -n "$${FULLMAG_FDM_NATIVE_BUILD_ROOT:-}" ]; then \
@@ -260,18 +267,22 @@ install-cli install-cli-dev install-cli-static:
 			echo "Failed to copy FDM library from FULLMAG_FDM_NATIVE_BUILD_ROOT" >&2; exit 2; \
 		fi; \
 	else \
-		fdm_dir=$$(find "$$cargo_target_dir/release/build" -path '*fullmag-fdm-sys*/out/native-build/backends/fdm/libfullmag_fdm.so.*' -type f -printf '%T@ %h\n' 2>/dev/null | sort -nr | awk 'NR==1 { print $$2 }'); \
+		fdm_dir=$$(find "$$cargo_target_profile_dir/build" -path '*fullmag-fdm-sys*/out/native-build/backends/fdm/libfullmag_fdm.so.*' -type f -printf '%T@ %h\n' 2>/dev/null | sort -nr | awk 'NR==1 { print $$2 }'); \
 		if [ -z "$$fdm_dir" ]; then \
 			fdm_dir=$$(find "$$cargo_target_dir" -path '*native-build/backends/fdm/libfullmag_fdm.so.*' -type f -printf '%T@ %h\n' 2>/dev/null | sort -nr | awk 'NR==1 { print $$2 }'); \
 		fi; \
 		if [ -n "$$fdm_dir" ]; then cp -a "$$fdm_dir"/libfullmag_fdm.so* .fullmag/local/lib/ 2>/dev/null || true; fi; \
 	fi; \
 	if [ "$$build_mode" = "cuda-fem-gpu" ] || [ "$$build_mode" = "fem-cpu" ]; then \
-		if [ -n "$${FULLMAG_SOURCE_SNAPSHOT_SHA256:-}" ]; then \
-			fem_dir=$$(python3 scripts/select_managed_fem_library.py --cargo-target "$$cargo_target_dir" --snapshot "$${FULLMAG_SOURCE_SNAPSHOT_SHA256}"); \
+		if [ "$$cargo_profile_dir" = "backend-dev" ]; then \
+			fem_snapshot="$${FULLMAG_SOURCE_SNAPSHOT_SHA256:?backend-dev FEM source snapshot is required}"; \
+			fem_dir=$$(python3 scripts/select_managed_fem_library.py --cargo-target "$$cargo_target_dir" --snapshot "$$fem_snapshot" --profile "$$cargo_profile_dir"); \
+			cp -a "$$fem_dir"/libfullmag_fem.so* .fullmag/local/lib/; \
+		elif [ -n "$${FULLMAG_SOURCE_SNAPSHOT_SHA256:-}" ]; then \
+			fem_dir=$$(python3 scripts/select_managed_fem_library.py --cargo-target "$$cargo_target_dir" --snapshot "$${FULLMAG_SOURCE_SNAPSHOT_SHA256}" --profile "$$cargo_profile_dir"); \
 			cp -a "$$fem_dir"/libfullmag_fem.so* .fullmag/local/lib/; \
 		else \
-			fem_dir=$$(find "$$cargo_target_dir/release/build" -path '*fullmag-fem-sys*/out/native-build/backends/fem/libfullmag_fem.so.*' -type f -printf '%T@ %h\n' 2>/dev/null | sort -nr | awk 'NR==1 { print $$2 }'); \
+			fem_dir=$$(find "$$cargo_target_profile_dir/build" -path '*fullmag-fem-sys*/out/native-build/backends/fem/libfullmag_fem.so.*' -type f -printf '%T@ %h\n' 2>/dev/null | sort -nr | awk 'NR==1 { print $$2 }'); \
 			if [ -z "$$fem_dir" ]; then \
 				fem_dir=$$(find "$$cargo_target_dir" -path '*native-build/backends/fem/libfullmag_fem.so.*' -type f -printf '%T@ %h\n' 2>/dev/null | sort -nr | awk 'NR==1 { print $$2 }'); \
 			fi; \
@@ -280,16 +291,16 @@ install-cli install-cli-dev install-cli-static:
 	fi; \
 	printf '%s\n' "$$build_mode" > .fullmag/local/launcher-build-mode
 	@mkdir -p .fullmag/local/bin
-	@cp "$${cargo_target_dir}/release/fullmag" .fullmag/local/bin/fullmag-bin.new
+	@cp "$$cargo_target_profile_dir/fullmag" .fullmag/local/bin/fullmag-bin.new
 	@mv -f .fullmag/local/bin/fullmag-bin.new .fullmag/local/bin/fullmag-bin
-	@cp "$${cargo_target_dir}/release/fullmag-api" .fullmag/local/bin/fullmag-api.new
+	@cp "$$cargo_target_profile_dir/fullmag-api" .fullmag/local/bin/fullmag-api.new
 	@mv -f .fullmag/local/bin/fullmag-api.new .fullmag/local/bin/fullmag-api
-	@cp "$${cargo_target_dir}/release/fullmag-api-accepted-worker" .fullmag/local/bin/fullmag-api-accepted-worker.new
+	@cp "$$cargo_target_profile_dir/fullmag-api-accepted-worker" .fullmag/local/bin/fullmag-api-accepted-worker.new
 	@mv -f .fullmag/local/bin/fullmag-api-accepted-worker.new .fullmag/local/bin/fullmag-api-accepted-worker
-	@cp "$${cargo_target_dir}/release/fullmag-api-accepted-supervisor" .fullmag/local/bin/fullmag-api-accepted-supervisor.new
+	@cp "$$cargo_target_profile_dir/fullmag-api-accepted-supervisor" .fullmag/local/bin/fullmag-api-accepted-supervisor.new
 	@mv -f .fullmag/local/bin/fullmag-api-accepted-supervisor.new .fullmag/local/bin/fullmag-api-accepted-supervisor
 	@for binary in fullmag-api-accepted-scheduler fullmag-runtime-service fullmag-api-resource-pool fullmag-api-accepted-fem-preparer fullmag-api-accepted-fem-preparation-supervisor fullmag-api-accepted-fem-preparation-scheduler fullmag-api-preparation-resource-pool fullmag-api-preparation-retry; do \
-		cp "$${cargo_target_dir}/release/$$binary" ".fullmag/local/bin/$$binary.new" || exit $$?; \
+		cp "$$cargo_target_profile_dir/$$binary" ".fullmag/local/bin/$$binary.new" || exit $$?; \
 		mv -f ".fullmag/local/bin/$$binary.new" ".fullmag/local/bin/$$binary" || exit $$?; \
 	done
 	@if command -v patchelf >/dev/null 2>&1; then \

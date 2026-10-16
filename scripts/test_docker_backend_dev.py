@@ -239,7 +239,22 @@ class BackendPackageTests(unittest.TestCase):
             }
             environment = backend._build_environment(workspace, root, native, 1)
             self.assertEqual(environment["FULLMAG_DIRECT_COMPOSE"], "1")
+            self.assertEqual(environment["FULLMAG_BACKEND_CARGO_PROFILE"], "backend-dev")
             self.assertEqual(environment["FULLMAG_RUNNER_WORKSPACE"], str(workspace))
+
+    def test_release_profile_uses_separate_native_target_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            native = {
+                "head_commit_full": "a" * 40,
+                "source_snapshot_dirty": False,
+                "source_snapshot_sha256": "b" * 64,
+            }
+            environment = backend._build_environment(workspace, root, native, 1, "release")
+            self.assertEqual(environment["FULLMAG_BACKEND_CARGO_PROFILE"], "release")
+            self.assertIn("/direct/release/build/", environment["FULLMAG_FEM_NATIVE_BUILD_ROOT"])
+            self.assertNotIn("backend-dev", environment["FULLMAG_FEM_NATIVE_BUILD_ROOT"])
 
     def test_direct_build_native_cache_roots_are_stable_and_cache_scoped(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -268,6 +283,7 @@ class BackendPackageTests(unittest.TestCase):
                 self.assertTrue(first.is_relative_to(workspace))
                 self.assertTrue(first.is_relative_to(root))
                 self.assertIn(".fullmag-build", first.parts)
+                self.assertIn("backend-dev", first.parts)
                 self.assertIn("native-build", first.parts)
             self.assertNotEqual(
                 Path(first_environment["FULLMAG_FDM_NATIVE_BUILD_ROOT"]),

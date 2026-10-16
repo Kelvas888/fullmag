@@ -21,6 +21,14 @@ fn explicit_env_flag(name: &str) -> Option<bool> {
     }
 }
 
+fn native_cmake_build_type(cargo_profile: &str, direct_compose: bool) -> &'static str {
+    if direct_compose || cargo_profile == "release" {
+        "Release"
+    } else {
+        "Debug"
+    }
+}
+
 fn rerun_if_changed_tree(path: impl AsRef<std::path::Path>) {
     let path = path.as_ref();
     println!("cargo:rerun-if-changed={}", path.display());
@@ -162,14 +170,10 @@ fn main() {
 
     let cmake = std::env::var("FULLMAG_CMAKE").unwrap_or_else(|_| "cmake".to_string());
     let cargo_profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
-    let cmake_build_type = if cargo_profile == "release" {
-        "Release"
-    } else {
-        "Debug"
-    };
+    let direct_compose = explicit_env_flag("FULLMAG_DIRECT_COMPOSE").unwrap_or(false);
+    let cmake_build_type = native_cmake_build_type(&cargo_profile, direct_compose);
     let use_mfem_stack = env_flag("FULLMAG_USE_MFEM_STACK");
     let require_gpu = env_flag("FULLMAG_FEM_REQUIRE_GPU");
-    let direct_compose = explicit_env_flag("FULLMAG_DIRECT_COMPOSE").unwrap_or(false);
     let native_cuda = explicit_env_flag("FULLMAG_FEM_NATIVE_CUDA");
     let configured_cuda = explicit_env_flag("FULLMAG_FEM_ENABLE_CUDA");
     if let (Some(native), Some(configured)) = (native_cuda, configured_cuda) {
