@@ -744,6 +744,10 @@ export function resolveObjectVisualizationTargetForLane({
   selectionTarget: VisualizationTargetRef | null;
 }): VisualizationTargetRef | null {
   if (lane === "unresolved") return null;
+  if (selection.kind === "object.antenna.visualization") {
+    // The conductor owns its result carriers; never substitute a magnetic layer.
+    return selectionTarget?.kind === "object" ? selectionTarget : null;
+  }
   if (selection.ref?.type === "fdm-cell") {
     return lane === "fdm"
       ? { id: "fdm-domain", kind: "fdm-domain", label: selection.label }
