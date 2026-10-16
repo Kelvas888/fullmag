@@ -2,9 +2,11 @@
 
 import { useLayoutEffect, useRef, useState } from "react";
 
+import type { AuthoringTransactionResponse, SceneResource } from "@/kernel/api/apiTypes";
 import { MODEL_SCENE_PATH } from "@/kernel/api/apiPaths";
 import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
 import { invalidateAuthoringMutationDependents } from "@/kernel/authoring/authoringMutationInvalidation";
+import { committedAntennaTransactionScene } from "./AntennaTransactionAcknowledgement";
 import { useKernel } from "@/kernel/KernelContext";
 import { useSceneResource, publishCommittedSceneResource } from "@/kernel/resources/geometryLifecycleResources";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
@@ -20,7 +22,7 @@ import { FieldRow } from "../../primitives/FieldRow";
 import { FormField } from "../../primitives/FormField";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import {
-  acknowledgeAntennaTerminalPreparationDraft, antennaPreparationIdentity, antennaTerminalGeometryBinding, antennaTerminalPreparationErrors,
+  acknowledgeAntennaTerminalPreparationDraft, antennaTerminalGeometryBinding, antennaTerminalPreparationErrors,
   buildAntennaTerminalPreparationTransaction, createAntennaTerminalPreparationDraft,
   type AntennaTerminalPreparationDraft, type AntennaTerminalLeadRow,
 } from "./AntennaTerminalPreparationModel";
@@ -79,23 +81,19 @@ export function AntennaTerminalsPanel({ selection: selected }: InspectorPanelPro
     try {
       const request = await buildAntennaTerminalPreparationTransaction(sourceScene, objectId, submitted);
       if (!isCurrent()) return false;
+      function validateCommittedScene(response: AuthoringTransactionResponse): SceneResource {
+        const committed = committedAntennaTransactionScene(response, request, sourceScene.scene?.id ?? "");
+        if (antennaTerminalGeometryBinding(committed, objectId) !== submitted.geometryBinding) {
+          throw new Error("Terminal preparation ACK changed the source geometry. Refresh before retrying.");
+        }
+        return committed;
+      }
       const response = await runAuthoringMutationWithHistory({
         api, authoringHistory, selection, resourceData: { [MODEL_SCENE_PATH]: sourceScene },
         sessionScopeKey: scope, isCurrentSessionScope: isCurrent,
-      }, `Edit antenna terminal preparation ${objectId}`, () => api.model.commitTransaction(request, { sessionScopeKey: scope }), (result) => result.committed_scene ?? null);
+      }, `Edit antenna terminal preparation ${objectId}`, () => api.model.commitTransaction(request, { sessionScopeKey: scope }), validateCommittedScene);
       if (!isCurrent()) return false;
-      const committed = response.committed_scene;
-      const port = sourceScene.antenna_port_modes!.find((item) => item.id === submitted.portId)!;
-      const expected = (request.merge_patch?.current_transports as unknown as { name: string; external_lead_preparation?: unknown }[]).find((item) => item.name === port.current_transport_id);
-      const actual = committed?.current_transports?.find((item) => item.name === port.current_transport_id);
-      const stages = committed?.antenna_field_solve_stages?.filter((stage) => stage.current_transport_id === port.current_transport_id) ?? [];
-      if (!committed || committed.scene?.id !== sourceScene.scene?.id || committed.revision !== response.scene_revision || !actual ||
-        (actual.boundaries != null && (!Array.isArray(actual.boundaries) || actual.boundaries.length > 0)) || actual.conservative_current_view || antennaPreparationIdentity(actual.external_lead_preparation) !== antennaPreparationIdentity(expected?.external_lead_preparation) ||
-        stages.length !== sourceScene.antenna_field_solve_stages?.filter((stage) => stage.current_transport_id === port.current_transport_id).length ||
-        stages.some((stage) => stage.conservative_current_view_ref) || antennaTerminalGeometryBinding(committed, objectId) !== submitted.geometryBinding) {
-        throw new Error("Terminal preparation ACK omitted or changed the submitted source. Refresh before retrying.");
-      }
-      acknowledgeAntennaTerminalPreparationDraft(submitted, submitted, response.scene_revision);
+      const committed = validateCommittedScene(response);
       publishCommittedSceneResource(resources, committed, response.scene_revision, undefined, false, scope, api.resourceCacheScope);
       invalidateAuthoringMutationDependents(resources, "interaction", response.scene_revision);
       setDraft((current) => acknowledgeAntennaTerminalPreparationDraft(current, submitted, response.scene_revision));

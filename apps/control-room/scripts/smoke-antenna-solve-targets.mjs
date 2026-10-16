@@ -34,7 +34,7 @@ try {
   const wait = (predicate) => page.waitForFunction(predicate, undefined, { timeout });
   const screenshot = async (name) => { const path = resolve(reportDirectory, `${name}.png`); await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
   const ready = async () => { await select.waitFor({ timeout }); await page.waitForFunction(() => !document.querySelector('[data-testid="solve-editor"] select')?.disabled, undefined, { timeout }); };
-  const boot = async (samplingKind = "") => { const target = new URL(url); if (samplingKind) target.searchParams.set("sampling", samplingKind); await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 60_000 }); await wait(() => Boolean(window.__antennaSolveTargetsFixture)); await ready(); };
+  const boot = async (samplingKind = "", ack = "") => { const target = new URL(url); if (ack) target.searchParams.set("ack", ack); if (samplingKind) target.searchParams.set("sampling", samplingKind); await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 60_000 }); await wait(() => Boolean(window.__antennaSolveTargetsFixture)); await ready(); };
   const add = async (value) => { await select.selectOption(value); await click("Add target"); };
   const apply = async () => { await button("Apply field-solve settings").waitFor(); assert.equal(await button("Apply field-solve settings").isDisabled(), false); await click("Apply field-solve settings"); await wait(() => window.__antennaSolveTargetsFixture.read().pending === 1); };
   const release = async () => { await page.evaluate(() => window.__antennaSolveTargetsFixture.release()); await wait(() => window.__antennaSolveTargetsFixture.read().pending === 0); };
@@ -130,6 +130,23 @@ try {
   checks.push({ name: "sampling-only write preserves targets and policies, held ACK retains newer domain, explicit revert restores acknowledged domain without extra writes", passed: true });
   await screenshot("04-sampling-only-ack");
   await budget("sampling-only ACK and explicit revert");
+
+  for (const ack of ["foreign-model", "changed-targets", "changed-sampling", "duplicate-stage", "changed-policy", "stale-revision", "revision-mismatch", "missing-scene"]) {
+    await boot("", ack);
+    await sampling.selectOption(objectKey); await add(objectKey); await apply();
+    assert.equal((await read()).canUndo, false);
+    await release();
+    await editor.getByText(/ACK/).waitFor({ timeout });
+    const rejected = await read();
+    assert.equal(rejected.canUndo, false, `${ack}: rejected ACK leaked into semantic Undo history`);
+    assert.equal(await page.getByTestId("solve-dirty").textContent(), "true", `${ack}: rejected ACK cleared draft`);
+    assert.equal(await editor.getByText(/Field-solve settings committed/).count(), 0);
+    assert.equal(writes(rejected).length, 1, `${ack}: implicit mutation retry`);
+    assert.equal(await sampling.inputValue(), objectKey);
+    await screenshot(`rejected-ack-${ack}`);
+    checks.push({ name: `${ack} ACK rejected before history, draft clearing or success publication`, passed: true });
+    await budget(`rejected ACK ${ack}`);
+  }
 
   await boot("region");
   assert.equal(await sampling.inputValue(), regionKey);

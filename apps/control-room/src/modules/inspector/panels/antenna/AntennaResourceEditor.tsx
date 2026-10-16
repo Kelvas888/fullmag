@@ -1,8 +1,9 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { MODEL_SCENE_PATH } from "@/kernel/api/apiPaths";
-import type { SceneResource } from "@/kernel/api/apiTypes";
+import type { AuthoringTransactionResponse, SceneResource } from "@/kernel/api/apiTypes";
 import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
 import { invalidateAuthoringMutationDependents } from "@/kernel/authoring/authoringMutationInvalidation";
+import { committedAntennaTransactionScene } from "./AntennaTransactionAcknowledgement";
 import { useKernel } from "@/kernel/KernelContext";
 import { publishCommittedSceneResource } from "@/kernel/resources/geometryLifecycleResources";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
@@ -15,17 +16,12 @@ import { FormField } from "../../primitives/FormField";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import { antennaSolveTargetOptions } from "./AntennaSolveTargetsEditorModel";
 import {
-  acknowledgeAntennaResourceDraft, antennaCollection, antennaEditableResource,
+  acknowledgeAntennaResourceDraft, antennaEditableResource,
   antennaResourceDependents, buildAntennaResourceTransaction, createAntennaResourceDraft,
   type AntennaEditableKind, type AntennaResourceDraft,
 } from "./AntennaResourceEditorModel";
 
 interface Props { kind: AntennaEditableKind; resourceId: string; scene: SceneResource | null; sceneScopeKey: string | null; status: string; refetch: () => void }
-function canonical(value: unknown): string {
-  const sort = (item: unknown): unknown => Array.isArray(item) ? item.map(sort) : item && typeof item === "object"
-    ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)).map(([key, entry]) => [key, sort(entry)])) : item;
-  return JSON.stringify(sort(value));
-}
 
 export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, status, refetch }: Props) {
   const { api, resources, commands, authoringHistory, selection } = useKernel();
@@ -70,6 +66,8 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
     try { request = remove ? buildAntennaResourceTransaction(scene, kind, resourceId, submitted, true) : transaction; }
     catch (error) { setFeedback({ key, kind: "error", message: error instanceof Error ? error.message : String(error) }); return false; }
     if (!request || (!remove && !dirty)) return false;
+    const submittedRequest = request;
+    const submittedSceneId = scene.scene?.id ?? "";
     const ownerToken = context.token;
     const operation = {};
     const historyGeneration = authoringHistory?.getGeneration?.();
@@ -78,19 +76,17 @@ export function AntennaResourceEditor({ kind, resourceId, scene, sceneScopeKey, 
     inflight.current = operation;
     setPending({ token: ownerToken });
     setFeedback(null);
+    function validateCommittedScene(response: AuthoringTransactionResponse): SceneResource {
+      const committed = committedAntennaTransactionScene(response, submittedRequest, submittedSceneId);
+      return committed;
+    }
     try {
       const response = await runAuthoringMutationWithHistory({ api, authoringHistory, selection,
         resourceData: { [MODEL_SCENE_PATH]: scene }, sessionScopeKey: scope, isCurrentSessionScope: isCurrent },
       `${remove ? "Remove" : "Edit"} antenna ${kind} ${resourceId}`,
-      () => api.model.commitTransaction(request, { sessionScopeKey: scope }), (result) => result.committed_scene ?? null);
+      () => api.model.commitTransaction(request, { sessionScopeKey: scope }), validateCommittedScene);
       if (!isCurrent()) return false;
-      const committed = response.committed_scene;
-      const collection = antennaCollection[kind];
-      if (!committed || committed.scene?.id !== scene.scene?.id || committed.revision !== response.scene_revision ||
-          canonical(committed[collection]) !== canonical(request.merge_patch?.[collection])) {
-        throw new Error("Antenna resource ACK omitted or changed the submitted collection. Refresh before retrying.");
-      }
-      acknowledgeAntennaResourceDraft(submitted, submitted, response.scene_revision);
+      const committed = validateCommittedScene(response);
       publishCommittedSceneResource(resources, committed, response.scene_revision, undefined, false, scope, api.resourceCacheScope);
       invalidateAuthoringMutationDependents(resources, "interaction", response.scene_revision);
       setLocal((current) => acknowledgeAntennaResourceDraft(current, submitted, response.scene_revision));

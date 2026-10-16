@@ -88,7 +88,17 @@ function makeFixture() {
           const revision = (before.revision ?? 0) + 1;
           const after: SceneResource = { ...before, revision, scene_revision: revision, antenna_field_solve_stages: submitted as SceneResource["antenna_field_solve_stages"] };
           state.scenes[ownName] = after;
-          resolve(json({ transaction_kind: "merge_patch", scene_revision: revision, committed_scene: after }));
+          const acknowledged = structuredClone(after);
+          const ack = typeof window !== "undefined" ? new URL(window.location.href).searchParams.get("ack") : null;
+          if (ack === "foreign-model") acknowledged.scene!.id = "foreign-model";
+          if (ack === "changed-targets") acknowledged.antenna_field_solve_stages![0]!.target_refs = [{ kind: "global" }];
+          if (ack === "changed-sampling") acknowledged.antenna_field_solve_stages![0]!.field_sampling_domain = { kind: "global" };
+          if (ack === "duplicate-stage") acknowledged.antenna_field_solve_stages!.push(structuredClone(acknowledged.antenna_field_solve_stages![0]!));
+          if (ack === "changed-policy") acknowledged.antenna_field_solve_stages![0]!.solver_policy = "foreign-policy";
+          if (ack === "stale-revision") acknowledged.revision = acknowledged.scene_revision = before.revision;
+          if (ack === "revision-mismatch") acknowledged.scene_revision = revision + 1;
+          resolve(json({ transaction_kind: "merge_patch", scene_revision: ack === "stale-revision" ? before.revision : revision,
+            committed_scene: ack === "missing-scene" ? null : acknowledged }));
         }));
       }
       unexpected.push(`${request.method} ${path}`);

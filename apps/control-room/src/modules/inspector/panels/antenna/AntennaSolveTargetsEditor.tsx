@@ -1,9 +1,10 @@
 import { useLayoutEffect, useRef, useState } from "react";
 
 import { MODEL_SCENE_PATH } from "@/kernel/api/apiPaths";
-import type { SceneResource } from "@/kernel/api/apiTypes";
+import type { AuthoringTransactionResponse, SceneResource } from "@/kernel/api/apiTypes";
 import { invalidateAuthoringMutationDependents } from "@/kernel/authoring/authoringMutationInvalidation";
 import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
+import { committedAntennaTransactionScene } from "./AntennaTransactionAcknowledgement";
 import { useKernel } from "@/kernel/KernelContext";
 import { publishCommittedSceneResource } from "@/kernel/resources/geometryLifecycleResources";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
@@ -82,6 +83,7 @@ export function AntennaSolveTargetsEditor({ objectId, stageId, scene, sceneScope
   async function apply(): Promise<boolean> {
     if (!canApply || !draft || !request || !scene || !scope || inflight.current?.ownerToken === context.token) return false;
     const transaction = request;
+    const submittedSceneId = scene.scene?.id ?? "";
     const operation = {};
     const ownerToken = context.token;
     const historyGeneration = authoringHistory?.getGeneration?.();
@@ -90,22 +92,17 @@ export function AntennaSolveTargetsEditor({ objectId, stageId, scene, sceneScope
     inflight.current = { ownerToken, operation };
     setPending({ token: ownerToken });
     setFeedback(null);
+    function validateCommittedScene(response: AuthoringTransactionResponse): SceneResource {
+      const committed = committedAntennaTransactionScene(response, transaction, submittedSceneId);
+      return committed;
+    }
     try {
       const response = await runAuthoringMutationWithHistory({
         api, authoringHistory, selection, resourceData: { [MODEL_SCENE_PATH]: scene },
         sessionScopeKey: scope, isCurrentSessionScope: isCurrent,
-      }, `Edit antenna field-solve sampling and targets ${stageId}`, () => api.model.commitTransaction(transaction, { sessionScopeKey: scope }), (result) => result.committed_scene ?? null);
+      }, `Edit antenna field-solve sampling and targets ${stageId}`, () => api.model.commitTransaction(transaction, { sessionScopeKey: scope }), validateCommittedScene);
       if (!isCurrent()) return false;
-      const committed = response.committed_scene;
-      const acknowledged = committed?.antenna_field_solve_stages?.find((item) => item.id === stageId && item.source_object_id === objectId);
-      if (!committed || committed.scene?.id !== scene.scene?.id || committed.revision !== response.scene_revision ||
-          !acknowledged || JSON.stringify(acknowledged.target_refs.map(antennaSolveTargetKey)) !== JSON.stringify(draft.targets.map(antennaSolveTargetKey)) ||
-          draft.samplingDomain && antennaSolveTargetKey(acknowledged.field_sampling_domain) !== antennaSolveTargetKey(draft.samplingDomain)) {
-        refetch();
-        throw new Error("Field-solve targets ACK omitted or changed the submitted scene. Refresh before applying again.");
-      }
-      // Validate the revision before publishing any cache or draft transition.
-      acknowledgeAntennaSolveTargetsDraft(draft, draft, response.scene_revision);
+      const committed = validateCommittedScene(response);
       publishCommittedSceneResource(resources, committed, response.scene_revision, undefined, false, scope, api.resourceCacheScope);
       invalidateAuthoringMutationDependents(resources, "interaction", response.scene_revision);
       setDraft((current) => acknowledgeAntennaSolveTargetsDraft(current, draft, response.scene_revision));
