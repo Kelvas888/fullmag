@@ -84,6 +84,12 @@ def activate_startup_script():
         raise RuntimeError("Docker startup-script helper is missing from the image") from error
 
 
+def _retain_liveness_observation(receipt, error):
+    observation = getattr(error, "liveness_observation", None)
+    if isinstance(observation, dict):
+        receipt["api_liveness"] = observation
+
+
 def serve():
     import runtime_service as service
     stopping = threading.Event()
@@ -141,6 +147,7 @@ def serve():
                 receipt["owner_pin_state"] = (
                     "confirmed-owner-awaiting-authenticated-reprobe"
                 )
+        _retain_liveness_observation(receipt, error)
         receipt.update(state="failed_outcome_retained", error=str(error))
         print(f"[fullmag-backend] Startup or runtime failed; admission closed: {str(error)[-4096:]}. "
               f"Process receipt: {receipt_path}", file=sys.stderr, flush=True)

@@ -395,6 +395,15 @@ class DockerRuntimeContract(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def load_entrypoint(self):
+        import sys
+        path = Path(__file__).resolve().parents[1] / "docker/all-in-one/entrypoint.py"
+        spec = importlib.util.spec_from_file_location("all_docker_entrypoint_test", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
     def test_service_budget_is_cpu_only_and_fits_container(self):
         service = self.load_service()
         config = service.build_configuration(service.RuntimePaths(), {})
@@ -622,6 +631,68 @@ class DockerRuntimeContract(unittest.TestCase):
                 with self.assertRaises(Exception) as caught:
                     service.start(service.RuntimePaths(), expected_binding="a" * 64)
                 self.assertEqual(caught.exception.pinned_handle.owner, owner)
+
+    def test_startup_liveness_grace_accepts_starting_then_ready(self):
+        service = self.load_service()
+        identity = {"api_instance_id": "instance", "api_contract_version": "1.0.0"}
+        headers = [("x-api-contract-version", "1.0.0"),
+                   ("x-fullmag-api-instance", "instance")]
+        starting = {
+            "schema_version": "application_service_status.v1",
+            "configured": True,
+            "state": "starting",
+            "reason": {"code": "owner_starting", "message": "startup is in progress"},
+        }
+        ready = {
+            "schema_version": "application_service_status.v1",
+            "configured": True,
+            "state": "ready",
+            "reason": {"code": "service_ready", "message": "ready"},
+        }
+        with patch.object(service, "_http_json",
+                          side_effect=[(200, headers, starting), (200, headers, ready)]) as probe, \
+                patch.object(service.time, "sleep") as sleep:
+            service._wait_for_api_liveness(8081, identity, timeout=1.0)
+        self.assertEqual(probe.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_startup_liveness_grace_does_not_retry_identity_failure(self):
+        service = self.load_service()
+        identity = {"api_instance_id": "instance", "api_contract_version": "1.0.0"}
+        headers = [("x-api-contract-version", "1.0.0"),
+                   ("x-fullmag-api-instance", "other-instance")]
+        response = {
+            "schema_version": "application_service_status.v1",
+            "configured": True,
+            "state": "starting",
+            "reason": {"code": "owner_starting", "message": "startup is in progress"},
+        }
+        with patch.object(service, "_http_json", return_value=(200, headers, response)) as probe, \
+                patch.object(service.time, "sleep") as sleep:
+            with self.assertRaisesRegex(service.RuntimeServiceError, "instance identity changed"):
+                service._wait_for_api_liveness(8081, identity, timeout=1.0)
+        probe.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_liveness_failure_retains_reason_for_process_receipt(self):
+        service = self.load_service()
+        identity = {"api_instance_id": "instance", "api_contract_version": "1.0.0"}
+        headers = [("x-api-contract-version", "1.0.0"),
+                   ("x-fullmag-api-instance", "instance")]
+        response = {
+            "schema_version": "application_service_status.v1",
+            "configured": True,
+            "state": "observation_unknown",
+            "reason": {"code": "live_probe_failed", "message": "control probe failed"},
+        }
+        with patch.object(service, "_http_json", return_value=(200, headers, response)):
+            with self.assertRaises(service.RuntimeServiceNotReady) as caught:
+                service._wait_for_api_liveness(8081, identity, timeout=1.0)
+        self.assertEqual(caught.exception.liveness_observation, response)
+        self.assertFalse(caught.exception.retryable)
+        receipt = {}
+        self.load_entrypoint()._retain_liveness_observation(receipt, caught.exception)
+        self.assertEqual(receipt["api_liveness"], response)
 
     def test_supervision_rejects_api_binding_change(self):
         service = self.load_service()

@@ -39,6 +39,8 @@ HOST_LEDGER_ROOT = PurePosixPath("/host-ledger/ledger")
 CONFIG_RELATIVE = Path(".fullmag/runtime-service/docker-all.json")
 MAX_JSON_BYTES = 256 * 1024
 MAX_HTTP_BYTES = 4 * 1024 * 1024
+STARTUP_LIVENESS_GRACE_SECONDS = 10.0
+MAX_LIVENESS_REASON_BYTES = 2048
 GIB = 1024**3
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -68,6 +70,32 @@ class RuntimeServiceError(RuntimeError):
 
 class RuntimeServiceUnknown(RuntimeServiceError):
     """A timeout or disconnect left the lifecycle outcome unknown."""
+
+
+class RuntimeServiceNotReady(RuntimeServiceError):
+    """The API identity is pinned, but the runtime service is not ready yet."""
+
+    def __init__(
+        self,
+        *,
+        configured: bool,
+        state: str,
+        reason_code: str,
+        reason_message: str,
+        retryable: bool,
+    ) -> None:
+        self.retryable = retryable
+        self.liveness_observation = {
+            "schema_version": "application_service_status.v1",
+            "configured": configured,
+            "state": state,
+            "reason": {"code": reason_code, "message": reason_message},
+        }
+        super().__init__(
+            "API runtime-service liveness is not ready: "
+            f"state={state}, reason.code={reason_code}, "
+            f"reason.message={reason_message}"
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -754,12 +782,72 @@ def _probe_api_liveness(
         _fail("API runtime-service liveness contract changed")
     if _single_header(headers, "x-fullmag-api-instance") != expected_instance:
         _fail("API instance identity changed during supervision")
+    if document.get("schema_version") != "application_service_status.v1":
+        _fail("API runtime-service liveness schema changed")
+    configured = document.get("configured")
+    state = document.get("state")
+    reason = document.get("reason")
     if (
-        document.get("schema_version") != "application_service_status.v1"
-        or document.get("configured") is not True
-        or document.get("state") != "ready"
+        type(configured) is not bool
+        or not isinstance(state, str)
+        or not isinstance(reason, dict)
+        or not isinstance(reason.get("code"), str)
+        or not isinstance(reason.get("message"), str)
+        or len(reason["message"].encode("utf-8")) > MAX_LIVENESS_REASON_BYTES
     ):
-        _fail("API runtime-service liveness is not ready")
+        _fail("API runtime-service liveness document is invalid")
+    if configured is True and state == "ready":
+        return
+    raise RuntimeServiceNotReady(
+        configured=configured,
+        state=state,
+        reason_code=reason["code"],
+        reason_message=reason["message"],
+        retryable=(
+            configured is True
+            and state == "starting"
+            and reason["code"] == "owner_starting"
+        ),
+    )
+
+
+def _wait_for_api_liveness(
+    port: int, expected_identity: Mapping[str, Any], *, timeout: float
+) -> None:
+    """Wait briefly for a pinned service to publish ``ready`` during startup.
+
+    Identity, contract, and malformed-observation failures remain fail-closed.
+    Only the native service's explicit ``starting`` state is retried; the normal
+    supervisor continues to perform one strict probe per check cycle.
+    """
+
+    if timeout <= 0:
+        _fail("API liveness startup grace must be positive")
+    deadline = time.monotonic() + timeout
+    last: RuntimeServiceNotReady | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if last is None:
+                _fail("API runtime-service startup grace ended without an observation")
+            unknown = RuntimeServiceUnknown(
+                f"API runtime-service did not become ready during startup grace: {last}"
+            )
+            unknown.liveness_observation = last.liveness_observation
+            raise unknown from last
+        try:
+            _probe_api_liveness(
+                port, expected_identity, timeout=min(2.0, remaining)
+            )
+            return
+        except RuntimeServiceNotReady as error:
+            if not error.retryable:
+                raise
+            last = error
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            continue
+        time.sleep(min(0.2, remaining))
 
 
 def wait_for_api(
@@ -923,6 +1011,11 @@ def start(
             raise RuntimeServiceUnknown(
                 "runtime owner changed between service-ensure and service-status"
             )
+        _wait_for_api_liveness(
+            port,
+            api_identity,
+            timeout=min(timeout, STARTUP_LIVENESS_GRACE_SECONDS),
+        )
     except Exception as error:
         unknown = (
             error
@@ -931,6 +1024,9 @@ def start(
                 f"runtime owner outcome after service-ensure is unknown: {error}"
             )
         )
+        observation = getattr(error, "liveness_observation", None)
+        if isinstance(observation, dict):
+            unknown.liveness_observation = observation
         _attach_pinned_handle(
             unknown, pinned, owner_pin_durable=owner_pin_durable
         )
@@ -1006,9 +1102,13 @@ def check(handle: RuntimeHandle, *, full_api_probe: bool = True) -> None:
             _probe_api_liveness(handle.api_port, expected_identity, timeout=2.0)
             fresh_identity = None
     except (RuntimeServiceError, OSError) as error:
-        raise RuntimeServiceUnknown(
+        unknown = RuntimeServiceUnknown(
             f"API identity probe failed during supervision: {error}"
-        ) from error
+        )
+        observation = getattr(error, "liveness_observation", None)
+        if isinstance(observation, dict):
+            unknown.liveness_observation = observation
+        raise unknown from error
     if fresh_identity is not None and fresh_identity != dict(expected_identity):
         raise RuntimeServiceUnknown(
             "API identity or accepted-store binding changed during supervision"
