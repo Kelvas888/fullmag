@@ -1513,7 +1513,21 @@ fn discover_nvidia_gpus() -> Result<Vec<GpuDeviceSnapshot>> {
         Err(error) => return Err(error),
     };
     let stdout = String::from_utf8(output).context("nvidia-smi output is not UTF-8")?;
-    parse_nvidia_smi_output(&stdout, includes_mig_mode)
+    let mut devices = parse_nvidia_smi_output(&stdout, includes_mig_mode)?;
+    for device in &mut devices {
+        if matches!(
+            &device.partition,
+            Reported::Available {
+                value: GpuPartition::Unknown
+            }
+        ) && crate::nvml_gpu_partition::full_device_probe(&device.uuid, deadline) == Some(true)
+        {
+            device.partition = Reported::Available {
+                value: GpuPartition::FullDevice,
+            };
+        }
+    }
+    Ok(devices)
 }
 
 fn query_nvidia_smi(query: &str, deadline: Instant) -> Result<Vec<u8>> {
