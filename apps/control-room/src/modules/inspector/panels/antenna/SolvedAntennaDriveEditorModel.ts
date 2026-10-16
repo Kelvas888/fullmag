@@ -27,22 +27,24 @@ export interface SolvedDriveLocalDraft {
   draft: SolvedDriveDraft;
   dirtyKeys: Array<keyof SolvedDriveDraft>;
   editedAgainst: Partial<SolvedDriveDraft>;
+  acknowledgedBase?: { revision: number; draft: SolvedDriveDraft };
 }
 
 /** Preserve edits made after submission and rebase them onto acknowledged values. */
 export function acknowledgeSolvedDriveDraft(
   current: SolvedDriveLocalDraft | null, driveId: string,
-  submitted: SolvedDriveDraft, acknowledged: SolvedDriveDraft,
+  submitted: SolvedDriveDraft, acknowledged: SolvedDriveDraft, revision?: number,
 ): SolvedDriveLocalDraft | null {
   if (!current || current.id !== driveId) return current;
   const dirtyKeys = current.dirtyKeys.filter((key) =>
     current.draft[key] !== submitted[key] && current.draft[key] !== acknowledged[key]);
-  if (!dirtyKeys.length) return null;
+  if (!dirtyKeys.length && revision === undefined) return null;
   return {
     ...current,
     draft: { ...acknowledged, ...Object.fromEntries(dirtyKeys.map((key) => [key, current.draft[key]])) },
     dirtyKeys,
     editedAgainst: Object.fromEntries(dirtyKeys.map((key) => [key, acknowledged[key]])),
+    ...(revision === undefined ? {} : { acknowledgedBase: { revision, draft: acknowledged } }),
   };
 }
 
@@ -152,20 +154,7 @@ export function buildSolvedDrive(
       break;
     }
     case "piecewise_linear": {
-      let points: unknown;
-      try {
-        points = JSON.parse(draft.piecewisePoints);
-      } catch {
-        throw new Error("Piecewise points must be valid JSON pairs");
-      }
-      if (
-        !Array.isArray(points) || points.length < 2 ||
-        points.some((point) => !Array.isArray(point) || point.length !== 2 || point.some((value) => typeof value !== "number" || !Number.isFinite(value))) ||
-        points.some((point, index) => index > 0 && point[0] <= points[index - 1][0])
-      ) {
-        throw new Error("Piecewise points require finite pairs and strictly increasing times");
-      }
-      waveform = { kind: "piecewise_linear", points: points as number[][] };
+      waveform = { kind: "piecewise_linear", points: buildPiecewiseDrivePoints(draft.piecewisePoints) };
       break;
     }
   }
@@ -220,4 +209,47 @@ export function solvedDriveSaveBlockReason(validationError: string | null, local
   if (validationError) return validationError;
   if (localConflictCount > 0 || conflictPhase && conflictPhase !== "rebased") return "Review and rebase the conflicting drive draft.";
   return undefined;
+}
+
+export type PiecewiseDrivePointDraft = [string, string];
+
+/** Text belongs to the local draft; the canonical waveform always contains numbers. */
+export function readPiecewiseDrivePoints(value: string): PiecewiseDrivePointDraft[] {
+  let points: unknown;
+  try { points = JSON.parse(value); } catch { throw new Error("The point draft is malformed. Reset the drive to restore its committed points."); }
+  if (!Array.isArray(points) || points.some(point => !Array.isArray(point) || point.length !== 2 || point.some(cell => typeof cell !== "string" && typeof cell !== "number"))) {
+    throw new Error("The point draft must contain time/multiplier pairs. Reset the drive to restore its committed points.");
+  }
+  return points.map(point => [String(point[0]), String(point[1])]);
+}
+
+export function piecewiseDrivePointErrors(points: readonly PiecewiseDrivePointDraft[]): Array<[string | undefined, string | undefined]> {
+  return points.map((point, index) => {
+    const errors: [string | undefined, string | undefined] = [undefined, undefined];
+    for (const column of [0, 1] as const) {
+      try { finiteNumber(point[column], column === 0 ? "Time" : "Multiplier"); }
+      catch (error) { errors[column] = error instanceof Error ? error.message : String(error); }
+    }
+    if (!errors[0] && index > 0 && points[index - 1][0].trim() && Number.isFinite(Number(points[index - 1][0])) && Number(point[0]) <= Number(points[index - 1][0])) {
+      errors[0] = "Times must be strictly increasing.";
+    }
+    return errors;
+  });
+}
+
+export function buildPiecewiseDrivePoints(value: string): number[][] {
+  const points = readPiecewiseDrivePoints(value);
+  if (points.length < 2) throw new Error("At least two waveform points are required.");
+  const errors = piecewiseDrivePointErrors(points);
+  for (let index = 0; index < errors.length; index++) {
+    const error = errors[index][0] ?? errors[index][1];
+    if (error) throw new Error(`Point ${index + 1}: ${error}`);
+  }
+  return points.map(([time, multiplier]) => [Number(time), Number(multiplier)]);
+}
+
+/** Keep the acknowledged draft base until the scene hook observes that revision. */
+export function resolvedSolvedDriveDraftBase(server: SolvedDriveDraft | null, local: SolvedDriveLocalDraft | null, revision: number | null | undefined): SolvedDriveDraft | null {
+  return local?.acknowledgedBase && (revision == null || revision < local.acknowledgedBase.revision)
+    ? local.acknowledgedBase.draft : server;
 }

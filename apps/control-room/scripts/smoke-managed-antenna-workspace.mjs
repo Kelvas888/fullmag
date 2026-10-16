@@ -547,6 +547,106 @@ try {
   assert.equal(appliedDrive.solved_antenna_drives.find(item => item.id === drive.id).peak_current_a, -0.02);
   assert.equal(writes.length, beforeDriveEditWrites + 2);
   checks.push({ name: "Global Apply and continue awaits the real drive ACK and transitions only after the draft is clean", passed: true });
+  await selectNode(`model:object:${objectId}:antenna:drive:${encodeURIComponent(drive.id)}`);
+  const waveformChoice = driveEditor.getByRole("combobox", { name: "Waveform", exact: true });
+  await waveformChoice.selectOption("piecewise_linear");
+  const pointTable = page.getByTestId("antenna-piecewise-points"), addPoint = pointTable.getByRole("button", { name: "Add waveform point", exact: true });
+  assert.equal(await driveEditor.getByRole("textbox", { name: "Points [time, amplitude]", exact: true }).count(), 0);
+  for (let count = 0; count < 11; count++) await addPoint.click();
+  await pointTable.getByText("13–13 of 13 points", { exact: true }).waitFor();
+  assert.equal(await pointTable.locator("tbody tr").count(), 1);
+  await pointTable.getByRole("button", { name: "Remove point 13", exact: true }).click();
+  assert.equal(await pointTable.getByRole("textbox", { name: "Point 12 time", exact: true }).evaluate(input => input === document.activeElement), true);
+  await addPoint.click();
+  await pointTable.getByText("13–13 of 13 points", { exact: true }).waitFor();
+  await pointTable.getByRole("button", { name: "Previous points", exact: true }).click();
+  assert.equal(await pointTable.locator("tbody tr").count(), 12);
+  await pointTable.getByText("1–12 of 13 points", { exact: true }).waitFor();
+  await pointTable.getByRole("button", { name: "Next points", exact: true }).click();
+  await pointTable.getByRole("textbox", { name: "Point 13 time", exact: true }).waitFor();
+  assert.equal(writes.length, beforeDriveEditWrites + 2, "Point pagination and incomplete drafts must not write");
+  await driveEditor.getByRole("button", { name: "Reset drive", exact: true }).click();
+  await waveformChoice.selectOption("piecewise_linear");
+  await addPoint.click();
+  await pointTable.getByRole("textbox", { name: "Point 3 time", exact: true }).fill("2e-9");
+  await pointTable.getByRole("textbox", { name: "Point 3 multiplier", exact: true }).fill("-1");
+  await addPoint.click();
+  await pointTable.getByRole("textbox", { name: "Point 4 time", exact: true }).fill("3e-9");
+  await pointTable.getByRole("textbox", { name: "Point 4 multiplier", exact: true }).fill("0.5");
+  await page.evaluate(() => {
+    const root=document.querySelector('[data-testid="antenna-piecewise-points"]');
+    window.__thirdPoint=root.querySelector('[aria-label="Point 3 time"]'); window.__fourthPoint=root.querySelector('[aria-label="Point 4 time"]');
+  });
+  await pointTable.getByRole("button", { name: "Remove point 1", exact: true }).click();
+  assert.equal(await pointTable.getByRole("textbox", { name: "Point 2 time", exact: true }).evaluate(input => input === window.__thirdPoint), true);
+  await pointTable.getByRole("button", { name: "Remove point 2", exact: true }).click();
+  assert.equal(await pointTable.getByRole("textbox", { name: "Point 2 time", exact: true }).evaluate(input => input === window.__fourthPoint && document.activeElement === input), true);
+  assert.equal(await pointTable.getByRole("button", { name: "Remove point 1", exact: true }).isEnabled(), false);
+  const secondTime = pointTable.getByRole("textbox", { name: "Point 2 time", exact: true });
+  await secondTime.fill("1e-");
+  assert.equal(await secondTime.inputValue(), "1e-"); assert.equal(await secondTime.getAttribute("aria-invalid"), "true");
+  assert.equal(await driveSave.isEnabled(), false);
+  await selectNode(`model:object:${objectId}:geometry`); await dirtyGuard.waitFor();
+  assert.equal(await dirtyGuard.getByRole("button", { name: "Apply and continue", exact: true }).isEnabled(), false);
+  await dirtyGuard.getByRole("button", { name: "Cancel", exact: true }).click();
+  assert.equal(await secondTime.inputValue(), "1e-");
+  await secondTime.fill("1e-9"); assert.equal(await secondTime.getAttribute("aria-invalid"), "true");
+  await pointTable.getByText("Times must be strictly increasing.", { exact: true }).waitFor();
+  await secondTime.fill("3e-9");
+  const firstMultiplier = pointTable.getByRole("textbox", { name: "Point 1 multiplier", exact: true });
+  await firstMultiplier.fill("1."); assert.equal(await firstMultiplier.inputValue(), "1.");
+  await pointTable.getByRole("textbox", { name: "Point 2 multiplier", exact: true }).fill("-0.5");
+  await driveEditor.getByRole("textbox", { name: "Declared bandwidth", exact: true }).fill("5e9");
+  await pointTable.scrollIntoViewIfNeeded(); await screenshot("14-piecewise-point-table");
+  checks.push({ name: "Piecewise table replaces JSON, paginates explicitly, preserves incomplete text and cancelled navigation, rejects duplicate times and preserves surviving control identity/focus when removing first and middle knots", passed: true });
+  const beforePointsWrites = writes.length;
+  // Both real UI handlers run in the same browser task: the new row is authored
+  // after fetch starts and before its real HTTP ACK can be handled. No route mocks.
+  await driveSave.evaluate(button => {
+    button.click();
+    [...document.querySelectorAll('[data-testid="antenna-piecewise-points"] button')].find(item => item.textContent === "Add waveform point").click();
+  });
+  const savedPointsScene = await waitScene(s => s.solved_antenna_drives.find(item => item.id === drive.id)?.waveform?.kind === "piecewise_linear");
+  await driveEditor.getByText("Antenna drive committed.", { exact: true }).waitFor();
+  assert.deepEqual(savedPointsScene.solved_antenna_drives.find(item => item.id === drive.id).waveform.points, [[1e-9, 1], [3e-9, -0.5]]);
+  assert.equal(writes.length, beforePointsWrites + 1);
+  const thirdTime = pointTable.getByRole("textbox", { name: "Point 3 time", exact: true });
+  await thirdTime.waitFor(); assert.equal(await thirdTime.inputValue(), "");
+  assert.equal(await driveSave.isEnabled(), false, "Late ACK must retain the new incomplete row");
+  checks.push({ name: "A row added by the real UI after submission remains in the draft after the real API ACK; the canonical waveform contains only the submitted numeric pairs", passed: true });
+  await thirdTime.fill("4e-9");
+  await pointTable.getByRole("textbox", { name: "Point 3 multiplier", exact: true }).fill("1.25");
+  await thirdTime.focus();
+  await page.evaluate(() => {
+    const root=document.querySelector('[data-testid="antenna-piecewise-points"]'), input=document.activeElement, scroll=root.closest(".fm-inspector__body");
+    const controls=[...root.querySelectorAll("input")].map(element=>({element,disabled:element.disabled,opacity:getComputedStyle(element).opacity}));
+    const proof={root,input,scroll,top:scroll.scrollTop,controls,rootChanges:0,controlChanges:0,disabledChanges:0,opacityChanges:0,opacityAnimations:0,samples:0};
+    const sample=()=>{
+      proof.samples++;
+      if(document.querySelector('[data-testid="antenna-piecewise-points"]')!==root)proof.rootChanges++;
+      for(const saved of controls){if(!saved.element.isConnected)proof.controlChanges++;if(saved.element.disabled!==saved.disabled)proof.disabledChanges++;if(getComputedStyle(saved.element).opacity!==saved.opacity)proof.opacityChanges++;}
+      proof.opacityAnimations+=root.getAnimations({subtree:true}).filter(animation=>(animation.playState==="running"||animation.pending)&&animation.effect?.getKeyframes().some(frame=>"opacity" in frame)).length;
+    };
+    const observer=new MutationObserver(sample);observer.observe(root,{attributes:true,childList:true,subtree:true});sample();window.__pointsProof={proof,observer,sample};
+  });
+  await driveSave.evaluate(button => button.click());
+  const finalPointScene = await waitScene(s => s.solved_antenna_drives.find(item => item.id === drive.id)?.waveform?.points?.length === 3);
+  await driveEditor.getByText("Antenna drive committed.", { exact: true }).waitFor();
+  const finalPointDrive = finalPointScene.solved_antenna_drives.find(item => item.id === drive.id);
+  assert.deepEqual(finalPointDrive.waveform.points, [[1e-9,1],[3e-9,-0.5],[4e-9,1.25]]);
+  assert.equal(finalPointDrive.bandwidth_declaration.f_max_hz, 5e9); assert.equal(finalPointDrive.time_origin,"stage_local");
+  assert.equal(finalPointDrive.peak_current_a,-0.02); assert.equal(finalPointDrive.projection_ref,drive.projection_ref); assert.equal(finalPointDrive.port_mode_id,drive.port_mode_id); assert.deepEqual(finalPointDrive.activation,drive.activation);
+  const pointStability=await page.evaluate(()=>{
+    const{proof,observer,sample}=window.__pointsProof;sample();observer.disconnect();return{root:proof.root.isConnected,focus:document.activeElement===proof.input,scroll:proof.scroll.scrollTop===proof.top,rootChanges:proof.rootChanges,controlChanges:proof.controlChanges,disabledChanges:proof.disabledChanges,opacityChanges:proof.opacityChanges,opacityAnimations:proof.opacityAnimations,samples:proof.samples};
+  });
+  assert.ok(pointStability.samples>1 && pointStability.samples<200);
+  assert.deepEqual({...pointStability,samples:0},{root:true,focus:true,scroll:true,rootChanges:0,controlChanges:0,disabledChanges:0,opacityChanges:0,opacityAnimations:0,samples:0});
+  assert.equal(writes.length,beforePointsWrites+2); assert.equal(await driveSave.isEnabled(),false);
+  await selectNode(`model:object:${objectId}:geometry`);
+  await selectNode(`model:object:${objectId}:antenna:drive:${encodeURIComponent(drive.id)}`);
+  assert.equal(await pointTable.getByRole("textbox",{name:"Point 3 multiplier",exact:true}).inputValue(),"1.25");
+  await pointTable.scrollIntoViewIfNeeded();await screenshot("15-piecewise-points-reopened");
+  checks.push({name:"Numeric piecewise knots and declared bandwidth persist through real API and inspector reopen while preserving bindings, focus, scroll and every surviving input during ACK",passed:true,stability:pointStability});
   const webgl = await page.locator("canvas").evaluateAll(canvases => canvases.map(canvas => {
     const bounds = canvas.getBoundingClientRect(); if (!bounds.width || !bounds.height) return null;
     const gl = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
@@ -554,7 +654,7 @@ try {
   }).filter(Boolean));
   assert.ok(webgl.some(gl => !gl.lost && gl.width > 0 && gl.height > 0)); assert.ok(webgl.every(gl => !gl.lost));
   assert.ok(websockets.some(url => url.startsWith(target.api_base.replace("http:", "ws:"))), "Realtime must use the admitted API");
-  assert.ok(writes.length >= 3 && writes.length <= 19);
+  assert.ok(writes.length >= 3 && writes.length <= 21);
   for (const write of [...writes, ...visualizationAcks]) { assert.equal(write.instance, target.api_instance); assert.equal(write.scope, scope); assert.ok(!write.path.includes("/simulation/"), "Authoring smoke must not execute a solver"); }
   assert.ok(Date.now() - Date.parse(startedAt) > 5000, "The scenario must outlive the adoption timeout");
   assert.deepEqual(visualizationAcks.filter(ack => ack.body.status === "failed"), [], "No nonexistent-buffer adoption may fail during empty/nonmagnetic authoring");

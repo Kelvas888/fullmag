@@ -22,6 +22,10 @@ const drive = { id: "drive", name: "Drive", projection_ref: "projection", port_m
 const close = (a, b) => assert.ok(Math.abs(a - b) < 1e-12, `${a} != ${b}`);
 let checks = 0;
 const check = (name, run) => { run(); checks++; console.log(`PASS ${name}`); };
+check("textual point cells compile into canonical numeric pairs", () => {
+  const authored = model.buildSolvedDrive(drive, { ...model.solvedDriveDraft(drive), waveformKind: "piecewise_linear", piecewisePoints: '[["0","-1."],["1e-9","2.5"]]' });
+  assert.equal(JSON.stringify(authored.waveform.points), "[[0,-1],[1e-9,2.5]]");
+});
 check("time origin survives draft and authored update", () => { const draft = { ...model.solvedDriveDraft(drive), timeOrigin: "absolute" }; assert.equal(model.buildSolvedDrive(drive, draft).time_origin, "absolute"); });
 check("unknown clock is rejected", () => assert.throws(() => model.buildSolvedDrive(drive, { ...model.solvedDriveDraft(drive), timeOrigin: "guess" }), /time origin/));
 check("zero current remains a valid disabled drive", () => close(model.buildSolvedDrive(drive, { ...model.solvedDriveDraft(drive), peakCurrentA: "0" }).peak_current_a, 0));
@@ -53,5 +57,30 @@ check("409 conflict blocks both save paths until explicit rebase", () => {
   assert.equal(model.solvedDriveSaveBlockReason(null,0,"rebased"),undefined);
   assert.ok(model.solvedDriveSaveBlockReason(null,1,"rebased"));
   assert.equal(model.solvedDriveSaveBlockReason("Invalid frequency",0,"rebased"),"Invalid frequency");
+});
+check("incomplete numeric text survives the draft reader", () => assert.equal(JSON.stringify(model.readPiecewiseDrivePoints('[["0","1."],["1e-","-"]]')), '[["0","1."],["1e-","-"]]'));
+check("numeric legacy point drafts remain supported", () => assert.equal(JSON.stringify(model.buildPiecewiseDrivePoints('[[0,0],[1e-9,1]]')), '[[0,0],[1e-9,1]]'));
+for (const [name, raw] of [["null cell", '[[null,0],[1,1]]'], ["boolean cell", '[[false,0],[1,1]]'], ["object cell", '[[{},0],[1,1]]'], ["missing cell", '[[0],[1,1]]'], ["malformed point data", 'not-json']]) check(name, () => assert.throws(() => model.readPiecewiseDrivePoints(raw), /draft/));
+for (const [name, raw] of [["blank time", '[["","0"],["1","1"]]'], ["blank multiplier", '[["0",""],["1","1"]]'], ["incomplete exponent", '[["0","0"],["1e-","1"]]'], ["infinite multiplier", '[["0","0"],["1","Infinity"]]'], ["duplicate times", '[["0","0"],["0","1"]]'], ["reversed times", '[["1","0"],["0","1"]]'], ["too few points", '[["0","0"]]']]) check(name, () => assert.throws(() => model.buildPiecewiseDrivePoints(raw)));
+check("per-cell errors identify the order violation without sorting", () => {
+  const rows=model.readPiecewiseDrivePoints('[["1","0"],["0","1"]]'); const before=JSON.stringify(rows);
+  assert.match(model.piecewiseDrivePointErrors(rows)[1][0], /strictly increasing/); assert.equal(JSON.stringify(rows),before);
+});
+check("preview knot limit never limits authored waveform size", () => assert.equal(model.buildPiecewiseDrivePoints(JSON.stringify(Array.from({length:513},(_,i)=>[String(i),"1"]))).length,513));
+check("late ACK preserves a newly added incomplete point", () => {
+  const submitted={...model.solvedDriveDraft(drive),waveformKind:"piecewise_linear",piecewisePoints:'[["0","0"],["1","1"]]'};
+  const later={...submitted,piecewisePoints:'[["0","0"],["1","1"],["1e-","0"]]'};
+  const ack=model.acknowledgeSolvedDriveDraft({id:drive.id,draft:later,dirtyKeys:["waveformKind","piecewisePoints"],editedAgainst:{piecewisePoints:submitted.piecewisePoints}},drive.id,submitted,{...submitted,piecewisePoints:'[[0,0],[1,1]]'});
+  assert.equal(ack.draft.piecewisePoints,later.piecewisePoints); assert.equal(JSON.stringify(ack.dirtyKeys),'["piecewisePoints"]');
+});
+check("ACK base prevents a point-count rollback while the resource hook catches up", () => {
+  const old={...model.solvedDriveDraft(drive),waveformKind:"piecewise_linear",piecewisePoints:'[[0,0],[1,1]]'};
+  const submitted={...old,piecewisePoints:'[["0","0"],["1","1"],["2","0"]]'}, committed={...submitted,piecewisePoints:'[[0,0],[1,1],[2,0]]'};
+  const local=model.acknowledgeSolvedDriveDraft({id:drive.id,draft:submitted,dirtyKeys:["piecewisePoints"],editedAgainst:{piecewisePoints:old.piecewisePoints}},drive.id,submitted,committed,10);
+  assert.equal(local.dirtyKeys.length,0);
+  assert.equal(model.resolvedSolvedDriveDraftBase(old,local,9).piecewisePoints,committed.piecewisePoints);
+  assert.equal(model.resolvedSolvedDriveDraftBase(old,local,null).piecewisePoints,committed.piecewisePoints);
+  const newer={...committed,piecewisePoints:'[[0,1],[1,1],[2,1]]'};
+  assert.equal(model.resolvedSolvedDriveDraftBase(newer,local,11),newer);
 });
 console.log(JSON.stringify({ state: "passed", checks, scope: "interpreted production drive/preview/evaluator; no unit test compilation or solver qualification" }));

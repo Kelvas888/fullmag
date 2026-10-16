@@ -11,6 +11,7 @@ import { Button } from "@/shared/ui/Button";
 
 import { useRegisterInspectorEditSession } from "../../InspectorEditSession";
 import { AntennaDrivePreview } from "./AntennaDrivePreview";
+import { AntennaPiecewisePointsEditor } from "./AntennaPiecewisePointsEditor";
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
 import { FieldRow } from "../../primitives/FieldRow";
 import { FormField } from "../../primitives/FormField";
@@ -23,6 +24,8 @@ import {
   changeSolvedDriveWaveformKind,
   solvedDriveDraft,
   solvedDriveSaveBlockReason,
+  resolvedSolvedDriveDraftBase,
+  type SolvedDriveLocalDraft as LocalDraft,
   type SolvedDriveDraft,
   type WaveformKind,
 } from "./SolvedAntennaDriveEditorModel";
@@ -32,13 +35,6 @@ interface Props {
   scene: SceneResource | null; sceneScopeKey: string | null;
   status: string;
   refetch: () => void;
-}
-
-interface LocalDraft {
-  id: string;
-  draft: SolvedDriveDraft;
-  dirtyKeys: Array<keyof SolvedDriveDraft>;
-  editedAgainst: Partial<SolvedDriveDraft>;
 }
 
 interface RevisionConflict {
@@ -62,9 +58,12 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
     return () => { owner.current = null; };
   }, [context.token]);
   const drive = scene?.solved_antenna_drives?.find((item) => item.id === driveId);
-  const initial = drive ? solvedDriveDraft(drive) : null;
   const [local, setLocal] = useState<LocalDraft | null>(null);
-  const [pending, setPending] = useState(false);
+  const currentLocal = local?.id === driveId ? local : null;
+  const initial = resolvedSolvedDriveDraftBase(drive ? solvedDriveDraft(drive) : null, currentLocal, scene?.revision);
+  const [requestPending, setPending] = useState(false);
+  const awaitingScene = Boolean(currentLocal?.acknowledgedBase && (scene?.revision == null || scene.revision < currentLocal.acknowledgedBase.revision));
+  const pending = requestPending || awaitingScene;
   const [conflictState, setConflictState] = useState<RevisionConflict | null>(null);
   const [feedbackState, setFeedbackState] = useState<{ id: string; message: string } | null>(null);
   if (ownerState.key !== key) {
@@ -143,6 +142,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
       draft: { ...draft!, ...patch },
       dirtyKeys: [...new Set([...(local?.id === driveId ? local.dirtyKeys : []), ...patchKeys])],
       editedAgainst,
+      acknowledgedBase: currentLocal?.acknowledgedBase,
     });
     setFeedbackState(null);
   }
@@ -208,10 +208,10 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
       if (!isCurrent()) return false;
       const committed = resolveCommitted(response);
       const acknowledged = solvedDriveDraft(committed.solved_antenna_drives!.find((item) => item.id === driveId)!);
-      publishCommittedSceneResource(resources, committed, response.scene_revision, undefined, true, scope, api.resourceCacheScope);
+      publishCommittedSceneResource(resources, committed, response.scene_revision, undefined, false, scope, api.resourceCacheScope);
       resources.invalidate(MODEL_READINESS_PATH, response.scene_revision);
       setFeedbackState({ id: driveId, message: "Antenna drive committed." });
-      setLocal((current) => acknowledgeSolvedDriveDraft(current, driveId, draft, acknowledged));
+      setLocal((current) => acknowledgeSolvedDriveDraft(current, driveId, draft, acknowledged, response.scene_revision));
       setConflictState(null);
       return true;
     } catch (error) {
@@ -254,7 +254,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
         <FormField label="Pulse on" unit="s" value={draft.pulseOn} onChange={(event) => update({ pulseOn: event.currentTarget.value })} />
         <FormField label="Pulse off" unit="s" value={draft.pulseOff} onChange={(event) => update({ pulseOff: event.currentTarget.value })} />
       </> : null}
-      {draft.waveformKind === "piecewise_linear" ? <FormField label="Points [time, amplitude]" type="textarea" value={draft.piecewisePoints} onChange={(event) => update({ piecewisePoints: event.currentTarget.value })} /> : null}
+      {draft.waveformKind === "piecewise_linear" ? <AntennaPiecewisePointsEditor key={key} value={draft.piecewisePoints} onChange={piecewisePoints => update({ piecewisePoints })} /> : null}
       {draft.waveformKind === "pulse" || draft.waveformKind === "piecewise_linear" ? <FormField label="Declared bandwidth" unit="Hz" hint="Optional physical upper frequency; never inferred from pulse duration or knot spacing." value={draft.bandwidthHz} onChange={(event) => update({ bandwidthHz: event.currentTarget.value })} /> : null}
       <FormField label="Time origin" type="select" value={draft.timeOrigin} onChange={event => update({ timeOrigin: event.currentTarget.value as SolvedDriveDraft["timeOrigin"] })}>
         <option value="stage_local">Stage-local waveform time</option><option value="absolute">Absolute simulation time</option>
