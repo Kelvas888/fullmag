@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, realpath, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 const url = process.env.CONTROL_ROOM_URL ?? "http://127.0.0.1:3265/antenna-source-spectrum";
@@ -13,7 +13,7 @@ await mkdir(directory, { recursive: true });
 if (!inside(realStorage, await realpath(directory))) throw new Error("Report escaped storage");
 const reportPath = resolve(process.env.FULLMAG_ANTENNA_SOURCE_SPECTRUM_REPORT ?? resolve(directory, "antenna-source-spectrum.json"));
 if (!inside(directory, reportPath)) throw new Error("Report file escaped directory");
-const checks = [], screenshots = [], evidence = [], pageErrors = [], consoleErrors = [];
+const checks = [], screenshots = [], evidence = [], pageErrors = [], consoleErrors = [], downloads = [];
 let browser, page, failure = null;
 const startedAt = new Date().toISOString();
 try {
@@ -31,6 +31,7 @@ try {
       return Reflect.apply(readFloat64, this, args);
     };
   });
+  page.on("download", download => downloads.push(download.suggestedFilename()));
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
   const readyScenarios = ["ready", "ready-tied-peak", "ready-vector", "ready-unitary", "ready-large"];
@@ -64,6 +65,7 @@ try {
     const text = await page.locator("main").textContent();
     const gridCells = await page.getByRole("gridcell").count();
     const ready = readyScenarioSet.has(scenario), bytesFailure = malformedBytesSet.has(scenario);
+    if (!ready) assert.equal(await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).count(), 0);
     if (bytesFailure) assert.ok(text.includes(binaryDiagnostics[scenario]), `${scenario} did not report the intended rejection: ${text}`);
     if (ready) {
       const payloadBox = await page.locator('section[aria-label="Antenna source spectrum payload"]').boundingBox();
@@ -75,6 +77,59 @@ try {
       assert.ok(text.includes(`Peak ${scenario === "ready-tied-peak" ? "9.000e+0" : scenario === "ready-vector" ? "4.800e+1" : scenario === "ready-large" ? "1.897e+7" : "1.600e+1"} ${unit}`), "Peak power or normalization unit differs from controlled complex amplitudes");
       assert.ok((await page.getByRole("gridcell").first().getAttribute("aria-label"))?.includes(unit), "Scientific cell tooltip lost power SI unit");
       assert.ok((await page.getByRole("group", { name: "Source spectrum color scale" }).innerText()).includes(unit), "Color scale lost its physical power unit");
+      const actionGroup = page.getByRole("group", { name: "Source spectrum actions", exact: true });
+      assert.equal(await actionGroup.getByRole("button").count(), 2);
+      const exportBox = await actionGroup.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).boundingBox();
+      const peakBox = await actionGroup.getByRole("button", { name: "Inspect peak", exact: true }).boundingBox();
+      assert.ok(exportBox && peakBox && Math.abs(exportBox.y - peakBox.y) < 2, "Wide Inspector actions should share one wrapping toolbar");
+      const exportReads = await page.evaluate(() => window.__spectrumDecodeReads);
+      const downloadEvent = page.waitForEvent("download");
+      await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).click();
+      const download = await downloadEvent;
+      assert.equal(download.suggestedFilename(), "antenna-spectrum-fft.json");
+      const exportPath = resolve(directory, `${scenario}-export.json`);
+      await download.saveAs(exportPath);
+      const exported = JSON.parse(await readFile(exportPath, "utf8"));
+      assert.equal(exported.export_schema, "fullmag_source_spectrum_export.v1");
+      const manifest = exported.manifest, data = exported.data;
+      assert.equal(manifest.output_id, "fft"); assert.equal(manifest.request_id, "request");
+      assert.equal(manifest.content_digest, "fft-digest"); assert.equal(manifest.solution_content_digest, "basis-digest");
+      assert.equal(manifest.wave_vector_unit, "rad/m"); assert.equal(manifest.payloads.power.unit, unit);
+      assert.equal(manifest.normalization, scenario === "ready-unitary" ? "unitary_discrete" : "integral_si");
+      assert.equal(data.k_u_rad_per_m.length, manifest.k_u_count);
+      assert.equal(data.k_v_rad_per_m.length, manifest.k_v_count);
+      assert.deepEqual(data.k_u_rad_per_m, scenario === "ready-large" ? Array.from({ length: 65 }, (_, i) => i - 32) : [-1, 1]);
+      assert.deepEqual(data.k_v_rad_per_m, scenario === "ready-large" ? Array.from({ length: 67 }, (_, i) => i - 33) : [-1, 1]);
+      assert.equal(data.power.length, manifest.power_count);
+      assert.equal(data.amplitudes_re_im.length, manifest.amplitude_count * 2);
+      const count = scenario === "ready-large" ? 65 * 67 : 4;
+      assert.equal(data.power.length, count, "Export must preserve every original sample, including those hidden by pooling");
+      for (let i = 0; i < count; i++) {
+        const amplitude = scenario === "ready-tied-peak" ? [1, 3, 3, 2][i] : i + 1;
+        assert.equal(data.power[i], amplitude ** 2 * (scenario === "ready-vector" ? 3 : 1));
+        for (let component = 0; component < manifest.component_labels.length; component++) {
+          assert.equal(data.amplitudes_re_im[2 * (component * count + i)], amplitude);
+          assert.equal(data.amplitudes_re_im[2 * (component * count + i) + 1], 0);
+        }
+      }
+      assert.equal(await page.evaluate(() => window.__spectrumDecodeReads), exportReads);
+      assert.equal((await page.evaluate(() => window.__antennaSpectrumFixture.read())).calls.length, before.calls.length);
+      checks.push({ name: `${scenario}: downloaded full-resolution JSON preserves all amplitudes, power, SI metadata and provenance without requests/decoding`, passed: true, exportPath });
+      if (scenario === "ready") {
+        await page.evaluate(() => { window.__spectrumCreateURL = URL.createObjectURL; URL.createObjectURL = () => { throw new Error("Controlled download rejection"); }; });
+        await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).click();
+        await page.getByRole("alert").filter({ hasText: "Spectrum export failed. Try again." }).waitFor();
+        await page.evaluate(() => { URL.createObjectURL = window.__spectrumCreateURL; });
+        assert.equal(await page.getByRole("gridcell").count(), 4);
+        const retryEvent = page.waitForEvent("download");
+        await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).click();
+        const retry = await retryEvent;
+        const retryPath = resolve(directory, "ready-retry-export.json");
+        await retry.saveAs(retryPath);
+        assert.deepEqual(JSON.parse(await readFile(retryPath, "utf8")).data, data);
+        assert.equal(await page.getByRole("alert").filter({ hasText: "Spectrum export failed. Try again." }).count(), 0);
+        checks.push({ name: "Download failure exposes an accessible error; retry downloads identical data and clears it", passed: true });
+      }
       const decodeReads = await page.evaluate(() => window.__spectrumDecodeReads);
       const peakButton = page.getByRole("button", { name: "Inspect peak", exact: true });
       await peakButton.focus();
@@ -177,6 +232,7 @@ try {
         evidence.push({ ...current, phase: `${kind}-${phase}`, panelText });
         const screenshot = resolve(directory, `${kind}-${phase}.png`); await page.screenshot({ path: screenshot, fullPage: true }); screenshots.push(screenshot);
       };
+      assert.equal(await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).count(), 0);
       await inspect(fail ? "pending-before-error" : "pending");
       await page.evaluate((fail) => window.__antennaSpectrumFixture.release(fail), fail);
       await page.waitForFunction(() => window.__antennaSpectrumFixture.read().pending === 0, undefined, { timeout: 60_000 });
@@ -210,9 +266,20 @@ try {
     assert.equal(await page.evaluate(() => Boolean(window.__spectrumRetainedRoot)), true, "Inspector root is missing");
     for (const fail of [true, false]) {
       const before = await page.evaluate(() => window.__antennaSpectrumFixture.read());
-      await page.evaluate(() => window.__antennaSpectrumFixture.refresh("power"));
+      const downloadCount = downloads.length;
+      await page.evaluate(fail => {
+        if (fail) {
+          const button = [...document.querySelectorAll("button")].find(button => button.textContent === "Export full spectrum (JSON)");
+          if (!button || button.disabled) throw new Error("Ready export action is missing before cancellation regression");
+          button.click();
+        }
+        window.__antennaSpectrumFixture.refresh("power");
+      }, fail);
       await page.waitForFunction(() => window.__antennaSpectrumFixture.read().pending === 1, undefined, { timeout: 60_000 });
       await page.waitForFunction(() => !document.querySelector('[role="gridcell"]'), undefined, { timeout: 60_000 });
+      assert.equal(await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).count(), 0);
+      await page.waitForTimeout(100);
+      assert.equal(downloads.length, downloadCount, "Invalidation must abort an in-flight export before any download");
       const pending = await page.evaluate(() => window.__antennaSpectrumFixture.read());
       assert.equal(pending.snapshots.power.hasData, true, "Power refresh must retain the last-good cache");
       assert.equal(pending.calls.length, before.calls.length + 1, "Power refresh must issue exactly one GET");

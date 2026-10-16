@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useMemo, useRef, useState } from "react";
+import { useId, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type {
   AntennaSourceSpectrumResource,
@@ -14,6 +14,8 @@ import {
 } from "@/kernel/resources/antennaResources";
 import type { ResourceResult } from "@/kernel/resources/resourceTypes";
 import { Button } from "@/shared/ui/Button";
+
+import { AntennaSpectrumExport } from "./AntennaSpectrumExport";
 
 const MAX_AXIS_CELLS = 64;
 const MAX_DISPLAY_PAYLOAD_BYTES = 64 * 1024 * 1024;
@@ -173,7 +175,10 @@ export function AntennaSourceSpectrumPayloadView({
         </span>
       </div>
       <SpectrumPowerGrid cells={cells} kU={payloads.value.kU} kV={payloads.value.kV}
-        waveVectorUnit={spectrum.wave_vector_unit} powerUnit={powerUnit} isBinned={isBinned} peakIndex={extrema?.peakIndex ?? -1} />
+        waveVectorUnit={spectrum.wave_vector_unit} powerUnit={powerUnit} isBinned={isBinned} peakIndex={extrema?.peakIndex ?? -1}>
+        <AntennaSpectrumExport spectrum={spectrum} amplitudes={payloads.value.amplitudes}
+          kU={payloads.value.kU} kV={payloads.value.kV} power={payloads.value.power} />
+      </SpectrumPowerGrid>
       {extrema ? <SpectrumPowerScale minimum={extrema.minimum} maximum={extrema.maximum} unit={powerUnit} /> : null}
       <div className="fm-antenna-spectrum__axes" aria-label="Source spectrum axes">
         <span>u: {Math.min(MAX_AXIS_CELLS, payloads.value.kU.length)} / {payloads.value.kU.length} · {spectrum.wave_vector_unit}</span>
@@ -233,9 +238,9 @@ function spectrumGridTarget(key: string, index: number, columns: number, count: 
 }
 
 /** Selection stays local: keyboard inspection never redecodes payloads or refetches resources. */
-function SpectrumPowerGrid({ cells, kU, kV, waveVectorUnit, powerUnit, isBinned, peakIndex }: {
+function SpectrumPowerGrid({ cells, kU, kV, waveVectorUnit, powerUnit, isBinned, peakIndex, children }: {
   cells: readonly HeatmapCell[]; kU: readonly number[]; kV: readonly number[];
-  waveVectorUnit: string; powerUnit: string; isBinned: boolean; peakIndex: number;
+  waveVectorUnit: string; powerUnit: string; isBinned: boolean; peakIndex: number; children: ReactNode;
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
   const helpId = useId();
@@ -247,7 +252,8 @@ function SpectrumPowerGrid({ cells, kU, kV, waveVectorUnit, powerUnit, isBinned,
   const selectedIndex = Math.min(activeIndex, cells.length - 1);
   const selected = cells[selectedIndex];
   return <>
-    <div className="fm-antenna-spectrum__axes">
+    <div className="fm-antenna-spectrum__axes" role="group" aria-label="Source spectrum actions">
+      {children}
       <Button size="sm" variant="secondary" disabled={peakCellIndex < 0} onClick={() => {
         gridRef.current?.querySelector<HTMLElement>(`[data-spectrum-cell-index="${peakCellIndex}"]`)?.focus();
       }}>Inspect peak</Button>
