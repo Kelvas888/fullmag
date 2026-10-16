@@ -672,6 +672,24 @@ def _validate_maintenance_service(
         raise HostLedgerError("maintenance bind mount set is incomplete")
 
 
+def _validate_overlay_config(document: Mapping[str, Any], environment: Mapping[str, str]) -> None:
+    """Require the backend to carry the daemon identity used by the receipt."""
+    services = document.get("services")
+    if not isinstance(services, Mapping):
+        raise HostLedgerError("resolved host-ledger overlay has no services mapping")
+    backend = services.get("backend")
+    if not isinstance(backend, Mapping):
+        raise HostLedgerError("resolved host-ledger overlay has no backend service")
+    backend_environment = backend.get("environment")
+    if not isinstance(backend_environment, Mapping):
+        raise HostLedgerError("host-ledger backend environment is not a mapping")
+    expected = environment.get("FULLMAG_DOCKER_HOST_ID")
+    if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        raise HostLedgerError("resolved Docker daemon identity is not a SHA-256 digest")
+    if backend_environment.get("FULLMAG_DOCKER_HOST_ID") != expected:
+        raise HostLedgerError("host-ledger backend Docker daemon identity differs from the resolved daemon")
+
+
 
 def _render_maintenance(
     source: Path,
@@ -714,6 +732,7 @@ def _render_maintenance(
     services = document["services"]
     if set(services) != {"backend", "host-ledger-maintenance"}:
         raise HostLedgerError("host-ledger overlay service topology changed")
+    _validate_overlay_config(document, values)
     maintenance = services["host-ledger-maintenance"]
     if not isinstance(maintenance, dict):
         raise HostLedgerError("resolved maintenance service is not an object")

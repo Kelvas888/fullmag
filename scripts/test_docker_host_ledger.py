@@ -69,7 +69,12 @@ class FakeDocker:
             return json.dumps({
                 "name": "fullmag-host-ledger-test",
                 "services": {
-                    "backend": {"image": "incomplete-backend"},
+                    "backend": {
+                        "image": "incomplete-backend",
+                        "environment": {
+                            "FULLMAG_DOCKER_HOST_ID": environment["FULLMAG_DOCKER_HOST_ID"],
+                        },
+                    },
                     "host-ledger-maintenance": maintenance,
                 },
             })
@@ -252,6 +257,31 @@ class HostLedgerTests(unittest.TestCase):
     def test_render_maintenance_has_no_host_yaml_dependency(self):
         source = Path(ledger.__file__).read_text(encoding="utf-8")
         self.assertNotIn("import yaml", source)
+
+    def test_overlay_passes_daemon_identity_to_backend(self):
+        digest = "c" * 64
+        environment = {"FULLMAG_DOCKER_HOST_ID": digest}
+        document = {
+            "services": {
+                "backend": {"environment": {"FULLMAG_DOCKER_HOST_ID": digest}},
+                "host-ledger-maintenance": {},
+            }
+        }
+        ledger._validate_overlay_config(document, environment)
+        for backend_environment in (
+            {},
+            {"FULLMAG_DOCKER_HOST_ID": "d" * 64},
+        ):
+            document["services"]["backend"]["environment"] = backend_environment
+            with self.assertRaises(ledger.HostLedgerError):
+                ledger._validate_overlay_config(document, environment)
+
+        compose = Path(ledger.__file__).parents[1] / "compose.host-ledger.yaml"
+        compose_source = compose.read_text(encoding="utf-8")
+        self.assertIn(
+            "FULLMAG_DOCKER_HOST_ID: ${FULLMAG_DOCKER_HOST_ID:?Resolved Docker daemon identity is required}",
+            compose_source,
+        )
 
     def test_helper_uses_container_python_and_host_root_filesystem_paths(self):
         helper = Path(ledger.__file__).parents[1] / "scripts" / "lib" / ledger.HELPER_COPY_NAME

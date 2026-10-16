@@ -7,6 +7,7 @@ services:
   backend:
     environment:
       FULLMAG_DOCKER_HOST_EXECUTION: "1"
+      FULLMAG_DOCKER_HOST_ID: ${FULLMAG_DOCKER_HOST_ID:?Resolved Docker daemon identity is required}
       FULLMAG_HOST_LEDGER_PROFILE: ${FULLMAG_HOST_LEDGER_PROFILE:?Resolve host-ledger-v1 first}
       FULLMAG_HOST_LEDGER_PROJECT_ID: ${FULLMAG_HOST_LEDGER_PROJECT_ID:?Resolved project id is required}
       FULLMAG_HOST_LEDGER_STORAGE_ROOT: ${FULLMAG_HOST_LEDGER_STORAGE_ROOT:?Resolved storage root is required}
