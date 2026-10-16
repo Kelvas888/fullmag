@@ -26,9 +26,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
+    future::Future,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    pin::Pin,
     process::{Child, ChildStdin, Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
@@ -570,6 +572,76 @@ struct DrainConfirmation {
 enum ControlObservation {
     Continue,
     Drain(Option<DrainConfirmation>),
+}
+
+enum RuntimeLoopEvent<T, U> {
+    SampleCompleted { sample: T, control: U },
+    ControlCompleted(U),
+}
+
+type ComputeNodeSampleFuture =
+    Pin<Box<dyn Future<Output = Result<Option<Arc<HostInventoryOwner>>>> + Send>>;
+
+/// Keep both operations pinned while one wins the race. In particular, a
+/// control future may already own an accepted socket when the sample future
+/// completes; dropping it would reset that status/drain request.
+async fn select_sample_and_control<S, C>(
+    mut sample: Pin<&mut S>,
+    mut control: Pin<&mut C>,
+) -> RuntimeLoopEvent<S::Output, C::Output>
+where
+    S: Future + ?Sized,
+    C: Future + ?Sized,
+{
+    tokio::select! {
+        sample_result = sample.as_mut() => {
+            let control_result = control.as_mut().await;
+            RuntimeLoopEvent::SampleCompleted {
+                sample: sample_result,
+                control: control_result,
+            }
+        }
+        control_result = control.as_mut() => RuntimeLoopEvent::ControlCompleted(control_result),
+    }
+}
+
+async fn select_pending_sample_with_control(
+    sample: Pin<&mut (dyn Future<Output = Result<Option<Arc<HostInventoryOwner>>>> + Send)>,
+    listener: &TcpListener,
+    owner: &RuntimeServiceOwner,
+    config: &ServiceConfig,
+    store: &SessionStore,
+) -> RuntimeLoopEvent<
+    Result<Option<Arc<HostInventoryOwner>>>,
+    Result<ControlObservation>,
+> {
+    // The control future is scoped to this helper. If sampling wins, the
+    // generic selector joins it before returning, so this scope never drops
+    // an accepted control socket. If control wins, it is already complete.
+    let mut control = Box::pin(drain_requested(listener, owner, config, store));
+    select_sample_and_control(sample, control.as_mut()).await
+}
+
+async fn join_compute_node_sample(
+    sample: ComputeNodeSampleFuture,
+) -> Result<Option<Arc<HostInventoryOwner>>> {
+    // This is the only exit from the control-first branch. Keeping the join
+    // explicit makes it impossible to detach the spawn_blocking publisher.
+    sample.await
+}
+
+fn defer_control_result(
+    result: Result<ControlObservation>,
+    deferred_control: &mut Option<ControlObservation>,
+    deferred_control_error: &mut Option<anyhow::Error>,
+) {
+    match result {
+        Ok(ControlObservation::Continue) => {}
+        Ok(observation @ ControlObservation::Drain(_)) => {
+            *deferred_control = Some(observation);
+        }
+        Err(error) => *deferred_control_error = Some(error),
+    }
 }
 
 fn control_command(bytes: &[u8], owner: &str) -> Option<ControlCommand> {
@@ -1265,37 +1337,114 @@ fn run_service(path: PathBuf) -> Result<()> {
             )?;
             let mut heartbeat = Instant::now();
             let mut last_compute_node_sample = Instant::now();
+            let mut pending_compute_node_sample: Option<ComputeNodeSampleFuture> = None;
+            // A drain or control error observed while a sample is in flight
+            // cannot make us leave the loop: doing so would drop the future
+            // while its spawn_blocking worker continued to own the ledger.
+            // Keep the observation until that one future has joined.
+            let mut deferred_control = None;
+            let mut deferred_control_error: Option<anyhow::Error> = None;
             loop {
-                children.poll()?;
-                if last_compute_node_sample.elapsed() >= Duration::from_secs(5) {
-                    if let Some(ledger) = host_ledger.as_ref() {
-                        match publish_compute_node_sample(
-                            Arc::clone(ledger),
-                            inventory_owner.take(),
-                            config.host_execution.as_ref().and_then(|binding| {
-                                binding.runtime_generation_sha256.clone()
-                            }),
-                        )
-                        .await
-                        {
-                            Ok(owner) => inventory_owner = owner,
-                            Err(error) => {
-                                admission_unknown = true;
-                                owner.publish(
-                                    RuntimeServiceState::Unknown,
-                                    generations.map(|p| p.0),
-                                    generations.map(|p| p.1),
-                                    children
-                                        .describe()
-                                        .into_iter()
-                                        .chain(unknown_publishers.iter().cloned())
-                                        .collect(),
-                                )?;
-                                bail!("compute-node sample publication failed; host admission is unknown: {error:#}");
+                if pending_compute_node_sample.is_none() {
+                    children.poll()?;
+                    if last_compute_node_sample.elapsed() >= Duration::from_secs(5) {
+                        if let Some(ledger) = host_ledger.as_ref() {
+                            pending_compute_node_sample = Some(Box::pin(
+                                publish_compute_node_sample(
+                                    Arc::clone(ledger),
+                                    inventory_owner.take(),
+                                    config.host_execution.as_ref().and_then(|binding| {
+                                        binding.runtime_generation_sha256.clone()
+                                    }),
+                                ),
+                            ));
+                        } else {
+                            last_compute_node_sample = Instant::now();
+                        }
+                    }
+                }
+
+                if pending_compute_node_sample.is_some() {
+                    let event = select_pending_sample_with_control(
+                        pending_compute_node_sample
+                            .as_mut()
+                            .expect("pending compute-node sample disappeared")
+                            .as_mut(),
+                        &listener,
+                        &owner,
+                        &config,
+                        &store,
+                    )
+                    .await;
+                    let sample_result = match event {
+                        RuntimeLoopEvent::SampleCompleted {
+                            sample,
+                            control,
+                        } => {
+                            // The helper has joined the control future before
+                            // returning, so an accepted status/drain socket is
+                            // never cancelled when the sample wins the race.
+                            pending_compute_node_sample = None;
+                            defer_control_result(
+                                control,
+                                &mut deferred_control,
+                                &mut deferred_control_error,
+                            );
+                            sample
+                        }
+                        RuntimeLoopEvent::ControlCompleted(control) => {
+                            defer_control_result(
+                                control,
+                                &mut deferred_control,
+                                &mut deferred_control_error,
+                            );
+                            if deferred_control.is_none() && deferred_control_error.is_none() {
+                                continue;
                             }
+                            // An authenticated drain or control error must
+                            // wait for this exact sample to join before the
+                            // outer loop can act on it.
+                            join_compute_node_sample(
+                                pending_compute_node_sample
+                                    .take()
+                                    .expect("pending compute-node sample disappeared"),
+                            )
+                            .await
+                        }
+                    };
+
+                    match sample_result {
+                        Ok(sample_owner) => inventory_owner = sample_owner,
+                        Err(error) => {
+                            admission_unknown = true;
+                            owner.publish(
+                                RuntimeServiceState::Unknown,
+                                generations.map(|p| p.0),
+                                generations.map(|p| p.1),
+                                children
+                                    .describe()
+                                    .into_iter()
+                                    .chain(unknown_publishers.iter().cloned())
+                                    .collect(),
+                            )?;
+                            if let Some(control_error) = deferred_control_error.take() {
+                                bail!("compute-node sample publication failed; host admission is unknown: {error:#}; deferred control request also failed: {control_error:#}");
+                            }
+                            bail!("compute-node sample publication failed; host admission is unknown: {error:#}");
                         }
                     }
                     last_compute_node_sample = Instant::now();
+                    if let Some(control_error) = deferred_control_error.take() {
+                        return Err(control_error).context(
+                            "service control request failed while compute-node sampling was in flight",
+                        );
+                    }
+                    if let Some(ControlObservation::Drain(confirmation)) = deferred_control.take()
+                    {
+                        drain_confirmation = confirmation;
+                        break;
+                    }
+                    continue;
                 }
                 match drain_requested(&listener, &owner, &config, &store).await? {
                     ControlObservation::Continue => {}
@@ -1529,6 +1678,165 @@ mod tests {
             );
         }
     }
+
+    #[derive(Clone, Copy)]
+    enum PendingControlOutcome {
+        Continue,
+        Drain,
+        Error,
+    }
+
+    struct PendingControl {
+        gate: tokio::sync::oneshot::Receiver<()>,
+        outcome: PendingControlOutcome,
+        serviced: std::sync::Arc<tokio::sync::Notify>,
+        completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        dropped_before_completion: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Future for PendingControl {
+        type Output = Result<ControlObservation>;
+
+        fn poll(
+            mut self: Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.serviced.notify_one();
+            match Pin::new(&mut self.gate).poll(context) {
+                std::task::Poll::Ready(Ok(())) => {
+                    self.completed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    match self.outcome {
+                        PendingControlOutcome::Continue => {
+                            std::task::Poll::Ready(Ok(ControlObservation::Continue))
+                        }
+                        PendingControlOutcome::Drain => {
+                            std::task::Poll::Ready(Ok(ControlObservation::Drain(None)))
+                        }
+                        PendingControlOutcome::Error => std::task::Poll::Ready(Err(
+                            anyhow::anyhow!("control request failed after acceptance"),
+                        )),
+                    }
+                }
+                std::task::Poll::Ready(Err(_)) => {
+                    std::task::Poll::Ready(Err(anyhow::anyhow!("control gate closed")))
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    impl Drop for PendingControl {
+        fn drop(&mut self) {
+            if !self.completed.load(std::sync::atomic::Ordering::SeqCst) {
+                self.dropped_before_completion
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sampling_keeps_status_control_pinned_until_completion() {
+        let (sample_sender, sample_receiver) = tokio::sync::oneshot::channel();
+        let (control_sender, control_receiver) = tokio::sync::oneshot::channel();
+        let serviced = std::sync::Arc::new(tokio::sync::Notify::new());
+        let sample_completed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_before_completion =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serviced_by_task = std::sync::Arc::clone(&serviced);
+        let sample_completed_by_task = std::sync::Arc::clone(&sample_completed);
+        let completed_by_task = std::sync::Arc::clone(&completed);
+        let dropped_by_task = std::sync::Arc::clone(&dropped_before_completion);
+        let serviced_wait = serviced.notified();
+        let sample_completed_wait = sample_completed.notified();
+        let task = tokio::spawn(async move {
+            let mut sample = Box::pin(async move {
+                sample_receiver
+                    .await
+                    .map_err(|_| anyhow::anyhow!("sample gate closed"))?;
+                sample_completed_by_task.notify_one();
+                Ok::<Option<Arc<HostInventoryOwner>>, anyhow::Error>(None)
+            });
+            let mut control = Box::pin(PendingControl {
+                gate: control_receiver,
+                outcome: PendingControlOutcome::Continue,
+                serviced: serviced_by_task,
+                completed: completed_by_task,
+                dropped_before_completion: dropped_by_task,
+            });
+            select_sample_and_control(sample.as_mut(), control.as_mut()).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), serviced_wait)
+            .await
+            .expect("control future was not polled while sampling was pending");
+        assert!(!task.is_finished());
+        sample_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), sample_completed_wait)
+            .await
+            .expect("sample future did not complete");
+        // The sample is complete, but the accepted control request is still
+        // being serviced and must keep the join pending.
+        assert!(!task.is_finished());
+        assert!(!dropped_before_completion.load(std::sync::atomic::Ordering::SeqCst));
+        control_sender.send(()).unwrap();
+        match task.await.unwrap() {
+            RuntimeLoopEvent::SampleCompleted {
+                sample: Ok(None),
+                control: Ok(ControlObservation::Continue),
+            } => {}
+            _ => panic!("sample/control completion order changed"),
+        }
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!dropped_before_completion.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn control_first_drain_or_error_joins_the_pending_sample() {
+        for outcome in [PendingControlOutcome::Drain, PendingControlOutcome::Error] {
+            let (sample_sender, sample_receiver) = tokio::sync::oneshot::channel();
+            let (control_sender, control_receiver) = tokio::sync::oneshot::channel();
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let dropped_before_completion =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut sample: ComputeNodeSampleFuture = Box::pin(async move {
+                sample_receiver
+                    .await
+                    .map_err(|_| anyhow::anyhow!("sample gate closed"))?;
+                Ok::<Option<Arc<HostInventoryOwner>>, anyhow::Error>(None)
+            });
+            let mut control = Box::pin(PendingControl {
+                gate: control_receiver,
+                outcome,
+                serviced: std::sync::Arc::new(tokio::sync::Notify::new()),
+                completed: std::sync::Arc::clone(&completed),
+                dropped_before_completion: std::sync::Arc::clone(&dropped_before_completion),
+            });
+            control_sender.send(()).unwrap();
+            let event = select_sample_and_control(sample.as_mut(), control.as_mut()).await;
+            match outcome {
+                PendingControlOutcome::Drain => {
+                    assert!(matches!(
+                        event,
+                        RuntimeLoopEvent::ControlCompleted(Ok(ControlObservation::Drain(None)))
+                    ));
+                }
+                PendingControlOutcome::Error => {
+                    assert!(matches!(event, RuntimeLoopEvent::ControlCompleted(Err(_))));
+                }
+                PendingControlOutcome::Continue => unreachable!(),
+            }
+            // This is the same join required by the production control-first
+            // branch: authenticated drain and control errors cannot detach
+            // the in-flight sample publisher.
+            sample_sender.send(()).unwrap();
+            assert!(join_compute_node_sample(sample).await.unwrap().is_none());
+            assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!dropped_before_completion.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
     #[test]
     #[cfg(any(windows, target_os = "linux"))]
     fn child_ignoring_drain_remains_unknown_after_deadline() {
