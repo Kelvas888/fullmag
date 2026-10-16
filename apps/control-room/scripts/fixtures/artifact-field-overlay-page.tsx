@@ -15,7 +15,7 @@ import { KernelContext } from "@/kernel/KernelContext";
 import type { KernelApi } from "@/kernel/types";
 import { ResourceInvalidationController } from "@/kernel/resources/ResourceInvalidationController";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
-import { ObjectVisualizationController, resolveGlobalObjectVisualizationSettings } from "@/kernel/visualization/ObjectVisualizationController";
+import { ObjectVisualizationController, resolveGlobalObjectVisualizationSettings, visualizationTargetKey, type VisualizationTargetPatch } from "@/kernel/visualization/ObjectVisualizationController";
 import { artifactInspectorFieldBinding } from "@/kernel/visualization/artifactFieldSelection";
 import { useObjectVisualizationSelector } from "@/kernel/visualization/useObjectVisualization";
 import { VisualizationDebugController } from "@/kernel/visualization/VisualizationDebugController";
@@ -38,9 +38,10 @@ const physical = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, -1]];
 const local = [0, 1, 2, 3, 0, 2, 1, 4];
 const stable = physical.map((_, i) => BigInt("9007199254740993") + BigInt(i));
 const subscribe = () => () => {};
+const fixtureTarget = { id: "antenna", kind: "object" as const };
 type Quantity = "H_ant" | "J_charge" | "V_electric";
-type FixtureRead = { quantity: Quantity; unit: string | null; model: boolean; count: number; triangles: number; minimum: number | null; maximum: number | null; values: number[]; glyphCount: number; calls: { path: string; binary: boolean; carrier: string | null; component: string | null; stage: string | null; revision: string | null }[]; unexpected: string[]; historical: boolean; error: string | null; resources: ReturnType<Viewport3DResourceTracker["getSnapshot"]> };
-declare global { interface Window { __artifactOverlayFixture?: { read(): FixtureRead }; __artifactOverlayCanvas?: () => { lost: boolean; width: number; height: number; groups: number; surfaceTriangles: number; geometryIds: string[]; materialIds: string[]; paletteIds: string[]; surfaceOpacity: number; paletteName: string; surfacePresentation: Array<{ mode: string; color: string }>; scalarSurface: { normalized: number[]; opacity: number; paletteId: number; materialId: string } | null; auxiliaryMaterials: Array<{ id: string; version: number; opacity: number; transparent: boolean }>; frame: number; glyphCounts: number[]; glyphInstances: number }; } }
+type FixtureRead = { quantity: Quantity; unit: string | null; model: boolean; count: number; triangles: number; minimum: number | null; maximum: number | null; values: number[]; glyphCount: number; pointCount: number; availableGlyphCount: number; scope: string; calls: { path: string; binary: boolean; carrier: string | null; component: string | null; stage: string | null; revision: string | null }[]; unexpected: string[]; historical: boolean; error: string | null; resources: ReturnType<Viewport3DResourceTracker["getSnapshot"]> };
+declare global { interface Window { __artifactOverlayFixture?: { read(): FixtureRead }; __artifactOverlayCanvas?: () => { lost: boolean; width: number; height: number; groups: number; surfaceTriangles: number; geometryIds: string[]; materialIds: string[]; paletteIds: string[]; surfaceOpacity: number; paletteName: string; surfacePresentation: Array<{ mode: string; color: string }>; scalarSurface: { normalized: number[]; opacity: number; paletteId: number; materialId: string } | null; auxiliaryMaterials: Array<{ id: string; version: number; opacity: number; transparent: boolean }>; frame: number; pointCounts: number[]; pointBufferIds: string[]; glyphCounts: number[]; glyphInstances: number }; } }
 
 function carrier(q: Quantity) {
   const digest = (q === "V_electric" ? "a" : q === "H_ant" ? "b" : "c").repeat(64);
@@ -48,14 +49,14 @@ function carrier(q: Quantity) {
   const revision = new DataView(hash.buffer).getBigUint64(0, true).toString();
   const indexing = q === "V_electric" ? "source_nodes" : q === "H_ant" ? "sample_nodes" : "tet4_cell_local_nodes";
   return { carrier_id: `artifact:${digest}:${indexing}`, carrier_digest: digest, carrier_revision: revision,
-    carrier_scope_kind: "object", carrier_scope_id: "antenna", indexing, sample_count: q === "J_charge" ? 8 : 4,
+    carrier_scope_kind: "object", carrier_scope_id: "antenna", indexing, sample_count: q === "J_charge" ? 8 : q === "H_ant" ? 5 : 4,
     coordinate_frame: "world", coordinate_unit: "m", topology_binary_schema: "FMMT.v2",
     owner: { ...owner, run_id: runId, runtime_stage_id: runtimeStageId, authored_stage_id: authoredStageId,
       module_id: "transport", object_id: "antenna", output_id: "inspection", source_digest: sourceDigest,
       content_digest: contentDigest, native_mesh_identity: "source-mesh", native_topology_identity: "source-topology", historical_inspection: true } };
 }
-function values(q: Quantity) { return q === "V_electric" ? [-2, 0, 1, 4] : q === "H_ant" ? [1, 0, 0, 0, 2, 0, 0, 0, 3, -4, 0, 0] : [1, 0, 0, 0, 2, 0, 0, 0, 3, -4, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 30, -40, 0, 0]; }
-function positions(q: Quantity) { return (q === "J_charge" ? local : [0, 1, 2, 3]).flatMap(i => physical[i]); }
+function values(q: Quantity) { return q === "V_electric" ? [-2, 0, 1, 4] : q === "H_ant" ? [1, 0, 0, 0, 2, 0, 0, 0, 3, -4, 0, 0, 0, 0, 2] : [1, 0, 0, 0, 2, 0, 0, 0, 3, -4, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 30, -40, 0, 0]; }
+function positions(q: Quantity) { return q === "H_ant" ? [...physical.slice(0, 4).flat(), .2, .2, .2] : (q === "J_charge" ? local : [0, 1, 2, 3]).flatMap(i => physical[i]); }
 function capability(q: Quantity, live = false) {
   const c = carrier(q);
   return { quantity_id: q, lane: live ? "fdm_cpu" : "artifact_inspection_read_only", provider: "available", request: "field_vector", render: "renderable", publication: "interactive", materialization: "materialized", reason_code: "historical_inspection_read_only",
@@ -86,7 +87,7 @@ function vectorBytes(q: Quantity) {
   return buffer;
 }
 function topologyBytes(q: Quantity) {
-  const n = carrier(q).sample_count, cells = q === "J_charge" ? 2 : 1;
+  const n = carrier(q).sample_count, cells = q === "J_charge" ? 2 : q === "H_ant" ? 4 : 1;
   const header = new ArrayBuffer(64), view = new DataView(header);
   new Uint8Array(header, 0, 4).set(new TextEncoder().encode("FMMT")); view.setUint8(4, 2); view.setUint8(5, 1);
   view.setUint32(8, n, true); view.setUint32(12, cells, true); view.setUint32(20, cells * 4, true); view.setUint32(36, 64, true);
@@ -96,7 +97,8 @@ function topologyBytes(q: Quantity) {
   positions(q).forEach((v, i) => data.setFloat64(layout.positions.start + i * 8, v, true));
   for (let i = 0; i < cells; i++) data.setUint32(layout.cellTypes!.start + i * 4, 1, true);
   for (let i = 0; i <= cells; i++) data.setUint32(layout.cellOffsets!.start + i * 4, i * 4, true);
-  for (let i = 0; i < n; i++) data.setUint32(layout.cellNodes.start + i * 4, i, true);
+  const cellNodes = q === "H_ant" ? [0, 1, 2, 4, 0, 1, 4, 3, 0, 4, 2, 3, 4, 1, 2, 3] : Array.from({ length: cells * 4 }, (_, i) => i);
+  cellNodes.forEach((value, i) => data.setUint32(layout.cellNodes.start + i * 4, value, true));
   return buffer;
 }
 function makeFixture() {
@@ -151,6 +153,8 @@ function Probe() {
       const auxiliaryMaterials: Array<{ id: string; version: number; opacity: number; transparent: boolean }> = [];
       scene.traverse(object => { if ("material" in object && (object.material instanceof PointsMaterial || object.material instanceof LineBasicMaterial)) { const m = object.material; auxiliaryMaterials.push({ id: m.uuid, version: m.version, opacity: m.opacity, transparent: m.transparent }); } if (object.name.startsWith("artifact-historical-")) groups++; if (object instanceof InstancedMesh) { glyphInstances += object.count; glyphCounts.push(object.count); } if (object.type === "Mesh" && "geometry" in object && object.geometry instanceof BufferGeometry && (object.geometry.getAttribute("fmAntennaCurrentVector") || object.geometry.getAttribute("fmScalarValue"))) { surfaceTriangles += (object.geometry.index?.count ?? 0) / 3; geometryIds.push(object.geometry.uuid); const material = (object as unknown as { material: { uuid: string; uniforms: { fmAntennaOpacity: { value: number }; fmAntennaPalette: { value: { uuid: string; userData: { antennaPalette: string } } } } } }).material; materialIds.push(material.uuid); if (object.geometry.getAttribute("fmScalarValue")) { const m = (object as unknown as { material: { uuid: string; uniforms?: { fmOpacity: { value: number }; fmPaletteId: { value: number } } } }).material; if (m.uniforms) scalarSurface = { normalized: Array.from(object.geometry.getAttribute("fmScalarValue").array), opacity: m.uniforms.fmOpacity.value, paletteId: m.uniforms.fmPaletteId.value, materialId: m.uuid }; } if (object.geometry.getAttribute("fmAntennaCurrentVector")) { paletteIds.push(material.uniforms.fmAntennaPalette.value.uuid); surfaceOpacity = material.uniforms.fmAntennaOpacity.value; paletteName = material.uniforms.fmAntennaPalette.value.userData.antennaPalette; } } });
       const surfacePresentation: Array<{ mode: string; color: string }> = [];
+      const pointCounts: number[] = [], pointBufferIds: string[] = [];
+      scene.traverse(object => { if (object.type === "Points" && "geometry" in object && object.geometry instanceof BufferGeometry) { pointCounts.push(object.geometry.drawRange.count); pointBufferIds.push(String(object.geometry.index?.id)); } });
       scene.traverse(object => {
         if (!(object instanceof Mesh) || (!object.geometry.getAttribute("fmAntennaCurrentVector") && !object.geometry.getAttribute("fmScalarValue"))) return;
         const material = object.material;
@@ -158,7 +162,7 @@ function Probe() {
         else if (material instanceof ShaderMaterial && material.uniforms.fmAntennaColorMode) surfacePresentation.push({ mode: material.uniforms.fmAntennaColorMode.value === 2 ? "solid" : "field", color: material.uniforms.fmAntennaMonoColor.value.getHexString() });
         else surfacePresentation.push({ mode: "field", color: "" });
       });
-      return { lost: gl.getContext().isContextLost(), width: size.x, height: size.y, groups, surfaceTriangles, geometryIds, materialIds, paletteIds, surfaceOpacity, paletteName, surfacePresentation, scalarSurface, auxiliaryMaterials, glyphInstances, glyphCounts, frame: gl.info.render.frame };
+      return { lost: gl.getContext().isContextLost(), width: size.x, height: size.y, groups, surfaceTriangles, geometryIds, materialIds, paletteIds, surfaceOpacity, paletteName, surfacePresentation, scalarSurface, auxiliaryMaterials, pointCounts, pointBufferIds, glyphInstances, glyphCounts, frame: gl.info.render.frame };
     };
     return () => { delete window.__artifactOverlayCanvas; };
   }, [gl, scene]);
@@ -167,18 +171,20 @@ function Probe() {
 function View({ fixture }: { fixture: ReturnType<typeof makeFixture> }) {
   const [quantity, setQuantity] = useState<Quantity>("H_ant"), [live, setLive] = useState(false), [vectors, setVectors] = useState(false), [presentation, setPresentation] = useState(false), [solid, setSolid] = useState(false);
   const tracker = useMemo(() => new Viewport3DResourceTracker(), []), session = useSessionResourceIdentity();
-  const settings = useMemo(() => ({ ...resolveGlobalObjectVisualizationSettings(null), visible: true, shaderVisible: true, wireframeVisible: true, pointsVisible: true, vectorsVisible: vectors, activeQuantityId: quantity, surfaceColorSource: solid ? "solid" as const : quantity === "V_electric" ? "colormap" as const : "component_x" as const, scalarColorPalette: presentation ? "magma" : "viridis", surfaceOpacityPercent: presentation ? 45 : 100, pointOpacityPercent: presentation ? 45 : 100, wireframeOpacityPercent: presentation ? 45 : 100, vectorColorMode: "magnitude" as const, shaderColorMode: "x" as const, shaderMonoColor: "#12ab34" }), [vectors, presentation, solid, quantity]);
+  const preferences = useObjectVisualizationSelector(snapshot => snapshot.overrides[visualizationTargetKey(fixtureTarget)]);
+  const patch = async (value: VisualizationTargetPatch) => { fixture.visualization.patchTarget(fixtureTarget, value); };
+  const settings = useMemo(() => ({ ...resolveGlobalObjectVisualizationSettings(null), visible: true, viewportColorbarVisible: true, geometryScope: "full" as const, shaderVisible: true, wireframeVisible: true, pointsVisible: true, vectorsVisible: vectors, activeQuantityId: quantity, surfaceColorSource: solid ? "solid" as const : quantity === "V_electric" ? "colormap" as const : "component_x" as const, scalarColorPalette: presentation ? "magma" : "viridis", surfaceOpacityPercent: presentation ? 45 : 100, pointOpacityPercent: presentation ? 45 : 100, wireframeOpacityPercent: presentation ? 45 : 100, vectorColorMode: "magnitude" as const, shaderColorMode: "x" as const, shaderMonoColor: "#12ab34", ...preferences }), [vectors, presentation, solid, quantity, preferences]);
   const quantities = useMemo(() => catalog(live), [live]);
   const result = useArtifactFieldOverlay(quantity, "antenna", settings, false, definitions, quantities);
   const selected = useObjectVisualizationSelector(snapshot => snapshot.artifactFieldSelection ?? null);
   const binding = artifactInspectorFieldBinding({ catalog: quantities, quantityId: quantity, selection: selected, sessionIdentity: session, targetScope: { scopeKind: "object", scopeId: "antenna" } });
-  const target = { id: "antenna", kind: "object" as const };
+  const target = fixtureTarget;
   const controls = { artifactFieldBinding: binding, fieldCatalog: { data: null, status: "ready" }, fieldCatalogLoading: false, fieldMetaTarget: target,
-    patch: async () => {}, patchColor: () => {}, patchNumber: () => {}, isFieldPending: () => false, sectionDisabled: () => false, settings, target };
+    patch, patchColor: (field: string, value: string) => { void patch({ [field]: value }); }, patchNumber: (field: string, value: number) => { void patch({ [field]: value }); }, isFieldPending: () => false, sectionDisabled: () => false, settings, target };
   useEffect(() => {
     window.__artifactOverlayFixture = { read: () => ({ quantity, unit: result.model?.unit ?? null, model: Boolean(result.model), count: result.model?.count ?? 0, triangles: (result.model?.surfaceTriangles?.length ?? 0) / 3,
-      minimum: result.model?.minimum ?? null, maximum: result.model?.maximum ?? null, values: Array.from(result.model?.scalarValues ?? []), glyphCount: (result.model?.vectorSegments?.length ?? 0) / 7, calls: fixture.calls, unexpected: fixture.unexpected, historical: result.historical, error: result.error, resources: { ...tracker.getSnapshot() } }) };
-  }, [quantity, result, fixture, tracker]);
+      minimum: result.model?.minimum ?? null, maximum: result.model?.maximum ?? null, values: Array.from(result.model?.scalarValues ?? []), glyphCount: result.model?.glyphCount ?? 0, pointCount: result.model?.pointSampleIndices.length ?? 0, availableGlyphCount: result.model?.availableGlyphCount ?? 0, scope: settings.geometryScope, calls: fixture.calls, unexpected: fixture.unexpected, historical: result.historical, error: result.error, resources: { ...tracker.getSnapshot() } }) };
+  }, [quantity, result, fixture, tracker, settings.geometryScope]);
   useEffect(() => () => { tracker.disposeAll(); delete window.__artifactOverlayFixture; }, [tracker]);
   return <main><h1>Artifact field overlay · controlled transport</h1><label>Quantity<select aria-label="Fixture quantity" value={quantity} onChange={e => setQuantity(e.target.value as Quantity)}><option>H_ant</option><option>J_charge</option><option>V_electric</option></select></label>
     <label><input aria-label="Fixture live lane" type="checkbox" checked={live} onChange={e => setLive(e.target.checked)} /> Live solver lane</label>
@@ -187,6 +193,8 @@ function View({ fixture }: { fixture: ReturnType<typeof makeFixture> }) {
     <button aria-pressed={vectors} onClick={() => setVectors(value => !value)}>Toggle fixture vectors</button>
     <button aria-pressed={presentation} onClick={() => setPresentation(value => !value)}>Toggle fixture presentation</button>
     <button aria-pressed={solid} onClick={() => setSolid(value => !value)}>Toggle fixture solid surface</button>
+    <label>Geometry scope<select aria-label="Fixture geometry scope" value={settings.geometryScope} onChange={event => { void patch({ geometryScope: event.target.value as "full" | "surface" }); }}><option value="full">Full</option><option value="surface">Surface</option></select></label>
+    <label>Glyph budget<input aria-label="Fixture glyph budget" type="number" min={0} value={settings.vectorBudget} onChange={event => { void patch({ vectorBudget: Number(event.target.value) }); }} /></label>
     <p role="status">{result.error ?? (result.model ? `${quantity}: historical inspection · ${result.model.count} samples` : "No historical model")}</p>
     <div data-artifact-field-viewport style={{ height: 480, width: "100%", position: "relative" }}><Viewport3DCanvas camera={{ position: [2.4, 1.7, 1.3], fov: 45, near: .01, far: 100 }} frameloop="demand">
       <VectorGlyphDerivedBufferCacheProvider tracker={tracker}><Probe /><ArtifactFieldLayer model={result.model} tracker={tracker} sessionIdentity={session} colors={{ accent: "white", background: "black", field: "white", mesh: "white", wire: "white" }} /></VectorGlyphDerivedBufferCacheProvider>

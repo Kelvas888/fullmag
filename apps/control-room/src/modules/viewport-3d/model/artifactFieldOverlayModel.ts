@@ -51,7 +51,11 @@ export function prepareArtifactFieldOverlay(admitted: ReturnType<typeof admitArt
   const surfaceScalarValues = scalar ? buildVertexScalarColors(field, count, MAX_ANTENNA_DISPLAY_SAMPLES, "magnitude", "viridis")?.scalarValues ?? null : null;
   if (scalar && !surfaceScalarValues) throw new Error("Owned potential requires a complete bounded scalar color buffer.");
   if (surfaceScalarValues?.some(v => !Number.isFinite(v))) throw new Error("Owned scalar values cannot be represented for rendering.");
-  return { field, locator, count, current, scalar, surfaceScalarValues, positions, magnitudes, maximumNorm, extent, surfaceTriangles, surfaceEdges, surfaceVectorScale, surfaceVectorValues };
+  const allSampleIndices = Uint32Array.from({ length: count }, (_, index) => index);
+  const boundaryMask = new Uint8Array(count);
+  if (surfaceTriangles) for (const index of surfaceTriangles) boundaryMask[index] = 1;
+  const surfaceSampleIndices = surfaceTriangles ? allSampleIndices.filter(index => boundaryMask[index] === 1) : null;
+  return { field, locator, count, current, scalar, surfaceScalarValues, positions, magnitudes, maximumNorm, extent, surfaceTriangles, surfaceEdges, surfaceVectorScale, surfaceVectorValues, allSampleIndices, surfaceSampleIndices };
 }
 
 export function presentArtifactFieldOverlay(data: ReturnType<typeof prepareArtifactFieldOverlay>, settings: VisualizationTargetSettings) {
@@ -64,20 +68,29 @@ export function presentArtifactFieldOverlay(data: ReturnType<typeof prepareArtif
     scalars[i] = scalar ? field.values[i] : component === "magnitude" ? magnitudes[i] : field.values[i * 3 + (component === "x" ? 0 : component === "y" ? 1 : 2)];
     minimum = Math.min(minimum, scalars[i]); maximum = Math.max(maximum, scalars[i]);
   }
-  // Reuse the existing presentation bound; never silently decimate immutable samples.
-  if (!scalar && settings.vectorsVisible && count > settings.vectorBudget) throw new Error("Owned vector samples exceed the authored vector budget; increase it explicitly.");
-  const segments = !scalar && settings.vectorsVisible ? new Float32Array(count * 6) : null;
+  if (settings.geometryScope === "surface" && !data.surfaceSampleIndices && (settings.pointsVisible || settings.vectorsVisible)) throw new Error("Surface scope requires an owned boundary; choose full scope for point samples.");
+  const pointSampleIndices = settings.geometryScope === "surface" ? data.surfaceSampleIndices ?? new Uint32Array(0) : data.allSampleIndices;
+  if (!scalar && settings.vectorsVisible && (!Number.isFinite(settings.vectorBudget) || settings.vectorBudget < 0)) throw new Error("Owned vector budget must be finite and non-negative.");
+  const glyphCount = scalar || !settings.vectorsVisible ? 0 : Math.min(pointSampleIndices.length, Math.floor(settings.vectorBudget));
+  // An explicit display budget samples immutable slots; it never alters source values or surface data.
+  const vectorSampleIndices = Uint32Array.from({ length: glyphCount }, (_, index) => pointSampleIndices[
+    glyphCount === 1 ? Math.floor((pointSampleIndices.length - 1) / 2) : Math.floor(index * (pointSampleIndices.length - 1) / (glyphCount - 1))
+  ]);
+  const segments = glyphCount > 0 ? new Float32Array(glyphCount * 6) : null;
   const scale = maximumNorm > 0 ? extent / Math.max(4, Math.cbrt(count)) * .45 * settings.vectorLengthScale / maximumNorm : 0;
-  if (segments) for (let i = 0; i < count; i++) for (let axis = 0; axis < 3; axis++) {
-    const delta = field.values[i * 3 + axis] * scale;
-    segments[i * 6 + axis] = positions[i * 3 + axis] - (settings.vectorCenteringEnabled ? delta / 2 : 0); segments[i * 6 + axis + 3] = segments[i * 6 + axis] + delta;
+  if (segments) for (let i = 0; i < glyphCount; i++) for (let axis = 0; axis < 3; axis++) {
+    const source = vectorSampleIndices[i], delta = field.values[source * 3 + axis] * scale;
+    segments[i * 6 + axis] = positions[source * 3 + axis] - (settings.vectorCenteringEnabled ? delta / 2 : 0); segments[i * 6 + axis + 3] = segments[i * 6 + axis] + delta;
   }
   if (segments?.some(v => !Number.isFinite(v))) throw new Error("Owned vector glyph cannot be represented.");
-  const glyphColors = new Float32Array(count * 3);
-  for (let i = 0; i < count; i++) glyphColors.set(scalarColorRgb(maximumNorm > 0 ? magnitudes[i] / maximumNorm : .5, settings.scalarColorPalette), i * 3);
-  const glyphStyleKey = JSON.stringify([settings.scalarColorPalette, settings.vectorColorMode, settings.vectorLengthScale, settings.vectorCenteringEnabled]);
-  return { scalar, geometry: data, glyphColors, glyphStyleKey, key: `${locator.carrier_id}:${field.fieldGenerationId}:${field.sourceRevision}`, quantityId: field.quantityId as "H_ant" | "J_charge" | "V_electric", unit: scalar ? "V" : current ? "A/m^2" : "A/m",
-    status: "historical_inspection" as const, locator, fieldRevision: field.sourceRevision ?? "", positions, scalarValues: scalars, vectorSegments: encodeAntennaGlyphSegments(segments, count),
+  const glyphColors = new Float32Array(glyphCount * 3);
+  for (let i = 0; i < glyphCount; i++) glyphColors.set(scalarColorRgb(maximumNorm > 0 ? magnitudes[vectorSampleIndices[i]] / maximumNorm : .5, settings.scalarColorPalette), i * 3);
+  const vectorSegments = encodeAntennaGlyphSegments(segments, glyphCount);
+  if (vectorSegments) for (let i = 0; i < glyphCount; i++) vectorSegments[i * 7 + 6] = maximumNorm > 0 ? magnitudes[vectorSampleIndices[i]] / maximumNorm : 0;
+  const glyphSelectionKey = JSON.stringify([settings.geometryScope ?? "full", glyphCount]);
+  const glyphStyleKey = JSON.stringify([settings.geometryScope, settings.vectorBudget, settings.scalarColorPalette, settings.vectorColorMode, settings.vectorLengthScale, settings.vectorCenteringEnabled]);
+  return { scalar, geometry: data, glyphColors, glyphSelectionKey, glyphStyleKey, key: `${locator.carrier_id}:${field.fieldGenerationId}:${field.sourceRevision}`, quantityId: field.quantityId as "H_ant" | "J_charge" | "V_electric", unit: scalar ? "V" : current ? "A/m^2" : "A/m",
+    status: "historical_inspection" as const, locator, fieldRevision: field.sourceRevision ?? "", positions, scalarValues: scalars, vectorSegments, pointSampleIndices, vectorSampleIndices, glyphCount, availableGlyphCount: pointSampleIndices.length,
     surfaceTriangles, surfaceEdges, surfaceVectorValues, surfaceVectorScale, maximumVectorNorm: scalar ? 0 : maximumNorm, minimum: component === "magnitude" ? 0 : minimum, maximum, count,
     intent: { component, palette: settings.scalarColorPalette }, settings };
 }

@@ -20,6 +20,25 @@ try {
   const page = await browser.newPage({ viewport: { width: 1100, height: 850 } });
   page.on("pageerror", error => errors.push(error.message));
   page.on("console", message => { if (message.type() === "error" || /THREE.Color: Unknown color/.test(message.text())) errors.push(message.text()); });
+  await page.addInitScript(() => {
+    window.__artifactWorkerDelayMs = 0; window.__artifactDelayedWorkerMessages = 0;
+    const NativeWorker = window.Worker;
+    window.Worker = class extends NativeWorker {
+      constructor(url, options) { super(url, options); this.glyph = options?.name === "fullmag-viewport3d-vector-glyph-build"; this.wrapped = new Map(); this.timers = new Set(); }
+      addEventListener(type, listener, options) {
+        if (!this.glyph || type !== "message") return super.addEventListener(type, listener, options);
+        const receive = event => {
+          const deliver = () => typeof listener === "function" ? listener.call(this, event) : listener.handleEvent(event);
+          if (!window.__artifactWorkerDelayMs) return deliver();
+          window.__artifactDelayedWorkerMessages++;
+          const timer = setTimeout(() => { this.timers.delete(timer); deliver(); }, window.__artifactWorkerDelayMs); this.timers.add(timer);
+        };
+        this.wrapped.set(listener, receive); return super.addEventListener(type, receive, options);
+      }
+      removeEventListener(type, listener, options) { const receive = this.wrapped?.get(listener) ?? listener; this.wrapped?.delete(listener); return super.removeEventListener(type, receive, options); }
+      terminate() { for (const timer of this.timers) clearTimeout(timer); this.timers.clear(); return super.terminate(); }
+    };
+  });
   await page.goto(url);
   const read = () => page.evaluate(() => ({ state: window.__artifactOverlayFixture?.read(), canvas: window.__artifactOverlayCanvas?.() }));
   const ready = async q => {
@@ -47,10 +66,10 @@ try {
     checks.push(`${quantity} solid honors the custom color with retained x mode, hides only its surface legend and preserves geometry/binary reads`);
   };
   const h = await ready("H_ant");
-  assert.equal(h.state.unit, "A/m"); assert.equal(h.state.count, 4); assert.equal(h.state.triangles, 4); assert.deepEqual(h.state.values, [1, 0, 0, -4]);
+  assert.equal(h.state.unit, "A/m"); assert.equal(h.state.count, 5); assert.equal(h.state.triangles, 4); assert.deepEqual(h.state.values, [1, 0, 0, -4, 0]);
   assert.equal(h.state.minimum, -4); assert.equal(h.state.maximum, 1);
   await screenshot("01-historical-H");
-  checks.push("Production facade/hooks and FMVP6/FMMT2 codecs render historical H on its separate four-node Tet4 carrier; live WebGL context and nonzero buffer");
+  checks.push("Production facade/hooks and FMVP6/FMMT2 codecs render historical H on its separate five-node Tet4 carrier with an interior sample; live WebGL context and nonzero buffer");
   await assertSolid("H_ant", h);
   await page.getByLabel("Fixture quantity", { exact: true }).selectOption("J_charge");
   const j = await ready("J_charge");
@@ -104,9 +123,43 @@ try {
   checks.push("Settled J display performs zero idle binary reads or renderer frames");
   await page.getByLabel("Fixture quantity", { exact: true }).selectOption("H_ant");
   const restored = await ready("H_ant"); assert.deepEqual(restored.state.values, h.state.values);
-  assert.deepEqual(restored.canvas.glyphCounts.sort((a,b)=>a-b), [4,4]);
+  assert.deepEqual(restored.canvas.glyphCounts.sort((a,b)=>a-b), [5,5]);
   await screenshot("03-H-restored");
   checks.push("H to J to H preserves execution owner while replacing quantity-specific carrier pins; transport rejects stale pins");
+  const hBinaryReads = restored.state.calls.filter(call => call.binary).length;
+  for (const [budget, glyphs] of [[2, 2], [0, 0], [1200, 5]]) {
+    const delayedBefore = await page.evaluate(() => window.__artifactDelayedWorkerMessages);
+    if (budget === 2) await page.evaluate(() => { window.__artifactWorkerDelayMs = 1200; });
+    await page.getByLabel("Fixture glyph budget", { exact: true }).fill(String(budget));
+    if (budget === 2) {
+      await page.waitForFunction(before => window.__artifactDelayedWorkerMessages > before, delayedBefore);
+      await page.waitForFunction(() => window.__artifactOverlayFixture?.read().glyphCount === 2 && window.__artifactOverlayCanvas?.().glyphInstances === 0);
+      const waiting = await read(); assert.equal(waiting.state.model, true); assert.equal(waiting.canvas.surfaceTriangles, 4);
+      checks.push("Delayed real glyph worker cannot expose old five-sample transforms with the new two-sample colors; the complete surface remains visible");
+      await page.evaluate(() => { window.__artifactWorkerDelayMs = 0; });
+    }
+    await page.waitForFunction(glyphs => window.__artifactOverlayFixture?.read().glyphCount === glyphs && (window.__artifactOverlayCanvas?.().glyphCounts.every(count => count === glyphs) ?? false), glyphs);
+    const limited = await ready("H_ant");
+    assert.equal(limited.state.count, 5); assert.equal(limited.state.triangles, 4); assert.equal(limited.state.pointCount, 5);
+    assert.deepEqual(limited.canvas.geometryIds, restored.canvas.geometryIds); assert.deepEqual(limited.canvas.materialIds, restored.canvas.materialIds);
+    assert.equal(limited.state.calls.filter(call => call.binary).length, hBinaryReads);
+    assert.equal(await page.getByRole("complementary", { name: /Color range:/ }).count(), glyphs ? 2 : 1);
+  }
+  checks.push("Production controller glyph budgets 2/0/full preserve the complete H surface, five raw samples, scale, geometry/material identity and binary reads; zero budget hides only glyphs and their legend");
+  const fullPoints = await read();
+  assert.ok(fullPoints.canvas.pointBufferIds.length > 0 && fullPoints.canvas.pointBufferIds.every(id => /^\d+$/.test(id)));
+  await page.getByLabel("Fixture geometry scope", { exact: true }).selectOption("surface");
+  await page.waitForFunction(() => window.__artifactOverlayFixture?.read().glyphCount === 4 && window.__artifactOverlayCanvas?.().pointCounts[0] === 4);
+  const surfaceScope = await ready("H_ant");
+  assert.equal(surfaceScope.state.availableGlyphCount, 4); assert.equal(surfaceScope.state.pointCount, 4);
+  assert.deepEqual(surfaceScope.state.values, restored.state.values); assert.deepEqual(surfaceScope.canvas.geometryIds, fullPoints.canvas.geometryIds);
+  assert.deepEqual(surfaceScope.canvas.pointBufferIds, fullPoints.canvas.pointBufferIds);
+  assert.equal(surfaceScope.state.calls.filter(call => call.binary).length, hBinaryReads);
+  await screenshot("03a-owned-boundary-scope");
+  await page.getByLabel("Fixture geometry scope", { exact: true }).selectOption("full");
+  await page.waitForFunction(() => window.__artifactOverlayFixture?.read().glyphCount === 5 && window.__artifactOverlayCanvas?.().pointCounts[0] === 5);
+  assert.deepEqual((await read()).canvas.pointBufferIds, fullPoints.canvas.pointBufferIds);
+  checks.push("Surface scope excludes the actual interior H sample from points and glyphs; full restores it without replacing geometry, index buffers, physical values or carrier reads");
   await page.getByLabel("Fixture quantity", { exact: true }).selectOption("V_electric");
   const potential = await ready("V_electric");
   assert.equal(potential.state.unit, "V"); assert.equal(potential.state.count, 4);
@@ -132,7 +185,7 @@ try {
   checks.push("Signed source-node V uses the shared scalar surface shader, retains negative volts and source carrier, and renders no glyphs despite previous vector settings");
   await page.getByLabel("Fixture quantity", { exact: true }).selectOption("H_ant");
   const afterPotential = await ready("H_ant"); assert.deepEqual(afterPotential.state.values, h.state.values);
-  await page.waitForFunction(() => window.__artifactOverlayCanvas?.().glyphInstances === 8);
+  await page.waitForFunction(() => window.__artifactOverlayCanvas?.().glyphInstances === 10);
   await page.getByLabel("Fixture live lane", { exact: true }).check();
   await page.waitForFunction(() => { const state = window.__artifactOverlayFixture?.read(); return state && !state.model && !state.historical; });
   await page.waitForFunction(() => window.__artifactOverlayCanvas?.().groups === 0);
@@ -167,6 +220,16 @@ try {
   const rangeLabels = controls.locator('[aria-label^="Scalar color range:"]');
   await page.waitForFunction(() => document.querySelectorAll('aside[aria-label="Shared inspection controls"] [aria-label^="Scalar color range:"]').length === 2);
   const initialLabels = await rangeLabels.evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label")));
+  const beforeLegends = await read();
+  const surfaceLegendSwitch = controls.getByRole("switch", { name: "Add colorbar to viewport", exact: true });
+  await surfaceLegendSwitch.uncheck();
+  await page.waitForFunction(() => document.querySelectorAll('[aria-label^="Color range:"]').length === 0);
+  assert.equal((await read()).state.model, true);
+  await surfaceLegendSwitch.check();
+  await page.waitForFunction(() => document.querySelectorAll('[aria-label^="Color range:"]').length === 2);
+  assert.deepEqual((await read()).canvas.geometryIds, beforeLegends.canvas.geometryIds);
+  assert.equal((await read()).state.calls.filter(call => call.binary).length, beforeLegends.state.calls.filter(call => call.binary).length);
+  checks.push("Actual shared viewport-colorbar switch hides and restores both H legends through the production controller without replacing geometry or loading binaries");
   assert.ok(initialLabels.some(label => label.includes("-4") && label.includes("1")));
   assert.ok(initialLabels.some(label => label.includes("0") && label.includes("4")));
   const ownerReads = final.state.calls.filter(call => call.component !== "full" && call.path.endsWith("/meta"));

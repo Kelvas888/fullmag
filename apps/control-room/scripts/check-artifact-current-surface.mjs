@@ -43,6 +43,15 @@ check("presentation reuses immutable geometry preparation and raw field arrays",
   assert.deepEqual(updated.scalarValues, original.scalarValues);
   assert.deepEqual(f.field.values, values);
 });
+check("authored glyph budget selects exact local samples without deleting the surface",()=>{
+ const f=fixture();f.settings.vectorBudget=3;const model=render(f);
+ assert.equal(model.surfaceTriangles.length,18);assert.equal(model.count,8);
+ assert.deepEqual([...model.vectorSampleIndices],[0,3,7]);assert.equal(model.vectorSegments.length,21);
+ assert.deepEqual([...model.scalarValues],[1,2,3,4,-10,-20,-30,-40]);
+ const full=render(fixture());for(let i=0;i<3;i++)for(let axis=0;axis<6;axis++)assert.equal(model.vectorSegments[i*7+axis],full.vectorSegments[model.vectorSampleIndices[i]*7+axis]);
+ assert.deepEqual([...render(f).vectorSampleIndices],[0,3,7]);
+});
+check("zero glyph budget preserves surfaces and raw fields",()=>{const f=fixture();f.settings.vectorBudget=0;const model=render(f);assert.equal(model.vectorSegments,null);assert.equal(model.vectorSampleIndices.length,0);assert.equal(model.surfaceTriangles.length,18);assert.equal(model.maximum,4);});
 for (const [name, mutate] of [
   ["same stable ID has other geometry", f=>{f.topology.positions[12]=0.01;}],
   ["same stable ID has different signed zero", f=>{f.topology.positions[12]=-0;}],
@@ -51,7 +60,7 @@ for (const [name, mutate] of [
   ["degenerate cell", f=>{f.topology.positions[11]=0;}],
   ["trace count mismatch", f=>{f.field.artifactMapping.identityIds=ids.slice(0,7);}],
   ["local topology merges values", f=>{f.topology.cellNodes[4]=0;}],
-  ["vector budget is explicit", f=>{f.settings.vectorBudget=7;}],
+  ["invalid vector budget is rejected", f=>{f.settings.vectorBudget=NaN;}],
   ["non-finite J", f=>{f.field.values[0]=Infinity;}],
 ]) check(name, ()=>{const f=fixture();mutate(f);assert.throws(()=>render(f));});
 check("equal coordinates with different IDs do not merge", ()=>{const f=fixture();for(let i=4;i<8;i++)f.field.artifactMapping.identityIds[i]+=100n; assert.equal(render(f).surfaceTriangles.length,24);});
@@ -112,5 +121,40 @@ for(const count of [7,14])check(`${count} samples keep exact renderer glyph card
   const model=render(f),transforms=glyphRenderer.namespace.buildVectorGlyphTransforms(model.vectorSegments);
   assert.equal(transforms.count,count);
   for(let i=0;i<count;i++)assert.deepEqual([...transforms.directions.subarray(i*3,i*3+3)],[1,0,0]);
+  f.settings.geometryScope="surface";assert.throws(()=>render(f),/owned boundary/);
+});
+check("surface scope excludes interior H samples and preserves global values and scale",()=>{
+ const f=fixture(),indexing="sample_nodes",cells=[0,1,2,4,0,1,4,3,0,4,2,3,4,1,2,3];
+ f.locator.indexing=indexing;f.locator.sample_count=5;f.locator.carrier_id=`artifact:${digest}:${indexing}`;
+ Object.assign(f.field,{quantityId:"H_ant",pointCount:5,indexing,values:Float64Array.from([1,0,0,0,2,0,0,0,3,-4,0,0,0,0,2]),artifactMapping:{indexing,identityIds:BigUint64Array.from([0n,1n,2n,3n,4n]),elementOrdinals:null,localVertexIndices:null}});
+ Object.assign(f.topology,{positions:Float64Array.from([0,0,0,1,0,0,0,1,0,0,0,1,.2,.2,.2]),nodeCount:5,cellTypes:Uint32Array.from([1,1,1,1]),cellOffsets:Uint32Array.from([0,4,8,12,16]),cellNodes:Uint32Array.from(cells)});
+ f.headers.carrierId=f.locator.carrier_id;f.geometry.carrierId=f.locator.carrier_id;
+ const full=render({...f,settings:{...f.settings,geometryScope:"full"}}),surface=render({...f,settings:{...f.settings,geometryScope:"surface"}});
+ assert.deepEqual([...full.pointSampleIndices],[0,1,2,3,4]);assert.deepEqual([...surface.pointSampleIndices],[0,1,2,3]);
+ assert.equal(full.glyphCount,5);assert.equal(surface.glyphCount,4);assert.equal(surface.surfaceTriangles.length,12);
+ assert.deepEqual(surface.scalarValues,full.scalarValues);assert.equal(surface.maximumVectorNorm,full.maximumVectorNorm);
+ for(let i=0;i<4;i++)for(let axis=0;axis<7;axis++)assert.equal(surface.vectorSegments[i*7+axis],full.vectorSegments[i*7+axis]);
+});
+check("surface J keeps original boundary-local slots and distinct values",()=>{
+ const f=fixture(),corners=[[0,0,0],[1,0,0],[0,1,0],[0,0,1],[.2,.2,.2]],cells=[0,1,2,4,0,1,4,3,0,4,2,3,4,1,2,3];
+ f.locator.sample_count=16;Object.assign(f.field,{pointCount:16,values:Float64Array.from(cells.flatMap((_,i)=>[i+1,0,0])),artifactMapping:{indexing:"tet4_cell_local_nodes",identityIds:BigUint64Array.from(cells.map(i=>first+BigInt(i))),elementOrdinals:BigUint64Array.from(cells.map((_,i)=>BigInt(Math.floor(i/4)))),localVertexIndices:Uint8Array.from(cells.map((_,i)=>i%4))}});
+ Object.assign(f.topology,{positions:Float64Array.from(cells.flatMap(i=>corners[i])),nodeCount:16,cellTypes:Uint32Array.from([1,1,1,1]),cellOffsets:Uint32Array.from([0,4,8,12,16]),cellNodes:Uint32Array.from(cells.map((_,i)=>i))});
+ const full=render({...f,settings:{...f.settings,vectorBudget:16,geometryScope:"full"}}),surface=render({...f,settings:{...f.settings,vectorBudget:16,geometryScope:"surface"}});
+ assert.equal(full.glyphCount,16);assert.equal(surface.glyphCount,12);assert.deepEqual([...surface.vectorSampleIndices],[0,1,2,4,5,7,8,10,11,13,14,15]);
+ assert.deepEqual([...surface.scalarValues],Array.from({length:16},(_,i)=>i+1));
+ assert.equal(surface.surfaceTriangles.length,12);
+});
+const derivedCacheModule=load(new URL("modules/viewport-3d/build-engine/cache/viewport3dDerivedBufferCache.ts",root));
+await derivedCacheModule.link((name,parent)=>load(new URL(`${name}.ts`,parent.identifier)));await derivedCacheModule.evaluate();
+check("pending glyph selection cannot adopt transforms from another budget",()=>{
+ const f=fixture(),full=render(f),small=render({...f,settings:{...f.settings,vectorBudget:3}}),cache=derivedCacheModule.namespace.createViewport3DDerivedBufferCache({maxBytes:1024,maxEntries:4});
+ const group=model=>`${model.key}:${model.glyphSelectionKey}`;
+ cache.putReady({buffer:{sourceIndices:full.vectorSampleIndices},estimatedBytes:32,fieldRevision:"2",groupKey:group(full),key:"full",lane:"vector-glyph",targetRevision:"1",topologyRevision:"1"});
+ assert.equal(cache.resolveVisible({fieldRevision:"2",groupKey:group(small),key:"pending-small",lane:"vector-glyph",targetRevision:"1",topologyRevision:"1"}).state,"invalid");
+ const nextField=fixture();nextField.field.fieldGenerationId=`sha256:${"e".repeat(64)}`;nextField.locator.owner.content_digest=nextField.field.fieldGenerationId;const nextPhysical=render(nextField);
+ assert.equal(cache.resolveVisible({fieldRevision:"2",groupKey:group(nextPhysical),key:"pending-physical",lane:"vector-glyph",targetRevision:"1",topologyRevision:"1"}).state,"invalid");
+ const recolored=render({...f,settings:{...f.settings,scalarColorPalette:"plasma"}});
+ assert.equal(group(recolored),group(full));assert.equal(cache.resolveVisible({fieldRevision:"2",groupKey:group(recolored),key:"pending-color",lane:"vector-glyph",targetRevision:"1",topologyRevision:"1"}).state,"stale-compatible");
+ cache.dispose();
 });
 console.log(JSON.stringify({status:"passed",checks,unit_test_compilation:false,browser_qualification:false}));

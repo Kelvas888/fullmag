@@ -595,7 +595,7 @@ export function resolveViewport3DMeshQualityLegend(
 
 /** Each historical pass uses its own actual projection and finite payload range. */
 export function resolveArtifactFieldColorbars(model: ArtifactFieldOverlayModel | null): Viewport3DScopedColorbarLegend[] {
-  if (!model || !model.settings.visible) return [];
+  if (!model || !model.settings.visible || !model.settings.viewportColorbarVisible) return [];
   const result: Viewport3DScopedColorbarLegend[] = [];
   const append = (pass: string, mode: string, min: number, max: number) => {
     const legend = resolveViewport3DColorbarLegend({ colorMode: mode, colorPalette: model.settings.scalarColorPalette,
@@ -603,7 +603,7 @@ export function resolveArtifactFieldColorbars(model: ArtifactFieldOverlayModel |
     if (legend) result.push({ key: `${model.key}:${pass}`, legend: { ...legend, labelPrefix: `Historical ${pass}: ` } });
   };
   if (model.settings.shaderVisible && model.settings.surfaceColorSource !== "solid") append("surface", model.scalar ? "scalar" : model.settings.shaderColorMode, model.minimum, model.maximum);
-  if (!model.scalar && model.settings.vectorsVisible && model.settings.vectorColorMode === "magnitude") append("vectors", "magnitude", 0, model.maximumVectorNorm);
+  if (!model.scalar && model.settings.vectorsVisible && model.glyphCount > 0 && model.settings.vectorColorMode === "magnitude") append("vectors", "magnitude", 0, model.maximumVectorNorm);
   return result;
 }
 
