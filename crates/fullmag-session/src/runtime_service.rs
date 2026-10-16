@@ -62,6 +62,15 @@ pub enum RuntimeServiceState {
     Unknown,
 }
 
+/// A scheduler checkpoint may be absent when the scheduler drained before
+/// publishing its first completed-worker checkpoint. This is an attested
+/// state, never a synthetic file or digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeServiceRecoveryAbsentSourceReason {
+    SchedulerCheckpointNotPublished,
+}
+
 /// Operator authorization for recovering one specific runtime owner whose
 /// outcome is still unknown.  The request is intentionally a complete typed
 /// snapshot of the old owner; a PID, timestamp, or age is never sufficient.
@@ -121,6 +130,8 @@ pub struct RuntimeServiceRecoveryReceipt {
     pub archived_evidence_path: String,
     pub archived_evidence_sha256: String,
     pub archived_files: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub archived_absent_sources: BTreeMap<String, RuntimeServiceRecoveryAbsentSourceReason>,
     pub historical_build_commit: String,
     pub historical_build_snapshot: String,
     pub executor_build_commit: String,
@@ -193,10 +204,22 @@ impl RuntimeServiceRecoveryReceipt {
         if (self.status == "recovered") != self.completed_at.is_some() {
             bail!("runtime service recovery receipt completion timestamp mismatch");
         }
-        if self.archived_files.len() < RECOVERY_MANDATORY_ARCHIVED_FILES
-            || self.archived_files.len() > MAX_RECOVERY_ARCHIVED_FILES
+        if self.archived_files.len() + self.archived_absent_sources.len()
+            < RECOVERY_MANDATORY_ARCHIVED_FILES
+            || self.archived_files.len() + self.archived_absent_sources.len()
+                > MAX_RECOVERY_ARCHIVED_FILES
         {
             bail!("runtime service recovery archive evidence has an incomplete inventory");
+        }
+        if self
+            .archived_files
+            .keys()
+            .any(|source| self.archived_absent_sources.contains_key(source))
+        {
+            bail!("runtime recovery archive source is both present and absent");
+        }
+        for source in self.archived_absent_sources.keys() {
+            validate_recovery_absent_source_path(source)?;
         }
         if !self
             .archived_files
@@ -205,7 +228,7 @@ impl RuntimeServiceRecoveryReceipt {
             bail!("runtime service recovery archive is missing raw configuration bytes");
         }
         for (relative, digest) in &self.archived_files {
-            validate_relative_path(relative)?;
+            validate_recovery_archived_source_path(relative)?;
             validate_lower_hex(digest, "runtime service archived file SHA-256", 64)?;
         }
         Ok(())
@@ -1971,15 +1994,215 @@ fn recovery_mandatory_sources(owner: &RuntimeServiceOwnerDescriptor) -> Result<B
         ),
         format!("scheduler_pools/{compute_pool_id}.resources.json"),
         format!("scheduler_pools/{preparation_pool_id}.preparation-resources.json"),
-        format!("scheduler_pools/{compute_pool_id}.json"),
-        format!("scheduler_pools/{preparation_pool_id}.preparation.json"),
         RECOVERY_ARCHIVED_CONFIGURATION_KEY.to_owned(),
     ] {
         if !sources.insert(source.clone()) {
             bail!("runtime recovery mandatory archive source is duplicated: {source}");
         }
     }
+    sources.extend(recovery_checkpoint_sources(owner)?);
     Ok(sources)
+}
+
+fn validate_recovery_absent_source_path(source: &str) -> Result<()> {
+    validate_relative_path(source)?;
+    let name = source
+        .strip_prefix("scheduler_pools/")
+        .context("runtime recovery absent source is not a scheduler checkpoint")?;
+    if name.is_empty()
+        || name.ends_with(".resources.json")
+        || name.ends_with(".preparation-resources.json")
+    {
+        bail!("runtime recovery absent source is not a checkpoint path: {source}");
+    }
+    let pool_id = name
+        .strip_suffix(".preparation.json")
+        .or_else(|| name.strip_suffix(".json"))
+        .filter(|value| !value.is_empty())
+        .context("runtime recovery absent source is not a checkpoint path")?;
+    validate_store_id(pool_id)
+}
+
+fn validate_recovery_archived_source_path(source: &str) -> Result<()> {
+    validate_relative_path(source)?;
+    if source == RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH
+        || source == RUNTIME_SERVICE_OWNER_LOCK_PATH
+        || source == "runtime-services/LAUNCH.json"
+        || source == "runtime-services/LAUNCH.lock"
+        || source == "runtime-services/STARTUP-GATE.lock"
+        || source == RECOVERY_ARCHIVED_CONFIGURATION_KEY
+    {
+        return Ok(());
+    }
+    if let Some(rest) = source.strip_prefix("runtime-services/") {
+        let mut components = rest.split('/');
+        let owner_token = components
+            .next()
+            .context("runtime recovery archived log is missing its owner token")?;
+        let name = components
+            .next()
+            .context("runtime recovery archived log is missing its file name")?;
+        if components.next().is_some() {
+            bail!("runtime recovery archived log has unexpected path components: {source}");
+        }
+        validate_store_id(owner_token)?;
+        if matches!(
+            name,
+            "compute.stdout.jsonl"
+                | "compute.stderr.log"
+                | "preparation.stdout.jsonl"
+                | "preparation.stderr.log"
+                | "compute-publisher.stdout.jsonl"
+                | "compute-publisher.stderr.log"
+                | "preparation-publisher.stdout.jsonl"
+                | "preparation-publisher.stderr.log"
+        ) {
+            return Ok(());
+        }
+        bail!("runtime recovery archived log is not on the producer allowlist: {source}");
+    }
+    if let Some(name) = source.strip_prefix("scheduler_pools/") {
+        let pool_id = name
+            .strip_suffix(".preparation-resources.json")
+            .or_else(|| name.strip_suffix(".resources.json"))
+            .or_else(|| name.strip_suffix(".preparation.json"))
+            .or_else(|| name.strip_suffix(".json"))
+            .filter(|value| !value.is_empty())
+            .context("runtime recovery scheduler source is not a recognized file")?;
+        validate_store_id(pool_id)?;
+        return Ok(());
+    }
+    bail!("runtime recovery archived source is not on the allowlist: {source}");
+}
+
+fn recovery_checkpoint_sources(owner: &RuntimeServiceOwnerDescriptor) -> Result<BTreeSet<String>> {
+    let compute_pool_id = owner
+        .compute_pool_id
+        .as_deref()
+        .context("runtime recovery owner is missing its compute pool id")?;
+    let preparation_pool_id = owner
+        .preparation_pool_id
+        .as_deref()
+        .context("runtime recovery owner is missing its preparation pool id")?;
+    let sources = [
+        format!("scheduler_pools/{compute_pool_id}.json"),
+        format!("scheduler_pools/{preparation_pool_id}.preparation.json"),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    for source in &sources {
+        validate_recovery_absent_source_path(source)?;
+    }
+    Ok(sources)
+}
+
+fn scheduler_checkpoint_sequence(bytes: &[u8], role: &str, pool_id: &str) -> Result<u64> {
+    let mut sequence = None;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("pool_checkpoint_sequence").is_none()
+            || value.get("pool_id").and_then(serde_json::Value::as_str) != Some(pool_id)
+        {
+            continue;
+        }
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("drained")
+            || value
+                .get("shutdown_requested")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            bail!("runtime recovery scheduler {role} summary is not a terminal drain");
+        }
+        let current = value
+            .get("pool_checkpoint_sequence")
+            .and_then(serde_json::Value::as_u64)
+            .context("runtime recovery scheduler summary has no checkpoint sequence")?;
+        if current == 0
+            && (value
+                .get("scheduled_count")
+                .and_then(serde_json::Value::as_u64)
+                != Some(0)
+                || value
+                    .get("executed")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(true, |executed| !executed.is_empty()))
+        {
+            bail!(
+                "runtime recovery scheduler {role} zero-checkpoint summary reports completed work"
+            );
+        }
+        if sequence.replace(current).is_some() {
+            bail!("runtime recovery scheduler {role} emitted duplicate summaries");
+        }
+    }
+    sequence.with_context(|| {
+        format!(
+            "runtime recovery scheduler {role} emitted no terminal checkpoint summary"
+        )
+    })
+}
+
+fn observe_recovery_checkpoint_absences(
+    store: &SessionStore,
+    owner: &RuntimeServiceOwnerDescriptor,
+) -> Result<BTreeMap<String, RuntimeServiceRecoveryAbsentSourceReason>> {
+    let compute_pool_id = owner
+        .compute_pool_id
+        .as_deref()
+        .context("runtime recovery owner is missing its compute pool id")?;
+    let preparation_pool_id = owner
+        .preparation_pool_id
+        .as_deref()
+        .context("runtime recovery owner is missing its preparation pool id")?;
+    let observations = [
+        (
+            RUNTIME_SERVICE_COMPUTE_ROLE,
+            compute_pool_id,
+            format!("scheduler_pools/{compute_pool_id}.json"),
+        ),
+        (
+            RUNTIME_SERVICE_PREPARATION_ROLE,
+            preparation_pool_id,
+            format!("scheduler_pools/{preparation_pool_id}.preparation.json"),
+        ),
+    ];
+    let mut absent = BTreeMap::new();
+    for (role, pool_id, checkpoint_relative) in observations {
+        let log_relative = format!(
+            "runtime-services/{}/{}.stdout.jsonl",
+            owner.owner_token, role
+        );
+        let log = read_stable_regular_path(
+            &checked_path(store.root(), &log_relative)?,
+            MAX_RECOVERY_LOG_BYTES,
+            "runtime recovery scheduler summary",
+        )?;
+        let sequence = scheduler_checkpoint_sequence(&log, role, pool_id)?;
+        let checkpoint = checked_path(store.root(), &checkpoint_relative)?;
+        match fs::symlink_metadata(&checkpoint) {
+            Ok(metadata) => {
+                reject_link(&checkpoint)?;
+                if !metadata.is_file() {
+                    bail!("runtime recovery scheduler checkpoint is not a regular file");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if sequence != 0 {
+                    bail!(
+                        "runtime recovery scheduler {role} omitted checkpoint sequence {sequence}"
+                    );
+                }
+                absent.insert(
+                    checkpoint_relative,
+                    RuntimeServiceRecoveryAbsentSourceReason::SchedulerCheckpointNotPublished,
+                );
+            }
+            Err(error) => return Err(error).context("observe runtime recovery checkpoint"),
+        }
+    }
+    Ok(absent)
 }
 
 fn archive_exact_file(
@@ -2128,14 +2351,25 @@ fn archive_runtime_evidence(
     config_sha256: &str,
     configuration_bytes: &[u8],
     application_binding: &RecoveryApplicationBinding,
-) -> Result<(String, String, BTreeMap<String, String>)> {
+) -> Result<(
+    String,
+    String,
+    BTreeMap<String, String>,
+    BTreeMap<String, RuntimeServiceRecoveryAbsentSourceReason>,
+)> {
     let archive_relative = format!("runtime-services/recovery/{request_sha256}/archive");
     let mandatory_sources = recovery_mandatory_sources(owner)?;
     if crate::hex_sha256(configuration_bytes) != config_sha256 {
         bail!("runtime recovery raw configuration bytes differ from the request pin");
     }
     let observed_logs = observe_recovery_log_sources(store, owner)?;
+    let absent_sources = observe_recovery_checkpoint_absences(store, owner)?;
     let mut archive_sources = mandatory_sources.clone();
+    for source in absent_sources.keys() {
+        if !archive_sources.remove(source) {
+            bail!("runtime recovery absent source is not mandatory: {source}");
+        }
+    }
     archive_sources.extend(observed_logs);
     let mut archived = BTreeMap::new();
     for source in &archive_sources {
@@ -2164,8 +2398,8 @@ fn archive_runtime_evidence(
         &mut archived,
     )?;
     if archived.len() != archive_sources.len()
-        || archived.len() < mandatory_sources.len()
-        || archived.len() > MAX_RECOVERY_ARCHIVED_FILES
+        || archived.len() + absent_sources.len() < mandatory_sources.len()
+        || archived.len() + absent_sources.len() > MAX_RECOVERY_ARCHIVED_FILES
     {
         bail!("runtime recovery evidence has an incomplete inventory");
     }
@@ -2177,6 +2411,7 @@ fn archive_runtime_evidence(
         "config_sha256": config_sha256,
         "application_binding": application_binding_manifest_value(application_binding),
         "files": archived.clone(),
+        "absent_sources": absent_sources.clone(),
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest_value)?;
     if manifest_bytes.len() > MAX_RECOVERY_RECEIPT_BYTES {
@@ -2204,6 +2439,7 @@ fn archive_runtime_evidence(
         archive_path,
         crate::hex_sha256(&published_manifest),
         archived,
+        absent_sources,
     ))
 }
 
@@ -2313,12 +2549,19 @@ fn verify_archived_evidence(
     }
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
         .context("parse runtime recovery archive manifest")?;
+    let manifest_absent_sources = manifest
+        .get("absent_sources")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     if manifest["schema_version"] != "runtime_service_recovery_archive.v1"
         || manifest["request_sha256"] != receipt.request_sha256
         || manifest["config_sha256"] != receipt.config_sha256
         || manifest["files"]
             != serde_json::to_value(&receipt.archived_files)
                 .context("serialize runtime recovery archive inventory")?
+        || manifest_absent_sources
+            != serde_json::to_value(&receipt.archived_absent_sources)
+                .context("serialize runtime recovery absent-source inventory")?
     {
         bail!("runtime recovery archive manifest does not match the receipt");
     }
@@ -2340,12 +2583,39 @@ fn verify_archived_evidence(
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
-    if !archived_sources.is_superset(&mandatory_sources)
+    let absent_sources = receipt
+        .archived_absent_sources
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let checkpoint_sources = recovery_checkpoint_sources(&current_owner)?;
+    let coverage = archived_sources
+        .union(&absent_sources)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !absent_sources.is_subset(&checkpoint_sources)
+        || !archived_sources.is_disjoint(&absent_sources)
         || !archived_sources.is_subset(&allowed_sources)
+        || !coverage.is_superset(&mandatory_sources)
+        || !coverage.is_subset(&allowed_sources)
     {
         bail!("runtime recovery archive inventory is missing or contains unexpected evidence");
     }
     let observed_logs = observe_recovery_log_sources(store, &current_owner)?;
+    let observed_absent_sources = observe_recovery_checkpoint_absences(store, &current_owner)?
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if observed_absent_sources != absent_sources {
+        bail!("runtime recovery absent checkpoint inventory differs from the live namespace");
+    }
+    let expected_sources = mandatory_sources
+        .union(&observed_logs)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if coverage != expected_sources {
+        bail!("runtime recovery archive inventory is incomplete or contains unexpected evidence");
+    }
     let log_prefix = format!("runtime-services/{}/", current_owner.owner_token);
     let archived_logs = archived_sources
         .iter()
@@ -2595,11 +2865,17 @@ fn recover_unknown_empty_locked(
         bail!("failed runtime owner has no prepared recovery receipt");
     }
 
-    let (archived_evidence_path, archived_evidence_sha256, archived_files) = match prepared.as_ref() {
+    let (
+        archived_evidence_path,
+        archived_evidence_sha256,
+        archived_files,
+        archived_absent_sources,
+    ) = match prepared.as_ref() {
         Some(receipt) => (
             receipt.archived_evidence_path.clone(),
             receipt.archived_evidence_sha256.clone(),
             receipt.archived_files.clone(),
+            receipt.archived_absent_sources.clone(),
         ),
         None => archive_runtime_evidence(
             store,
@@ -2644,6 +2920,7 @@ fn recover_unknown_empty_locked(
         archived_evidence_path,
         archived_evidence_sha256,
         archived_files,
+        archived_absent_sources,
         historical_build_commit,
         historical_build_snapshot,
         executor_build_commit: recovery_build_commit.into(),
@@ -2814,6 +3091,23 @@ mod recovery_contract_tests {
     }
 
     #[test]
+    fn recovery_checkpoint_absence_requires_terminal_zero_summary() {
+        let drained_without_checkpoint = br#"{"status":"drained","shutdown_requested":true,"pool_id":"compute","pool_checkpoint_sequence":0,"scheduled_count":0,"executed":[]}"#;
+        assert_eq!(
+            scheduler_checkpoint_sequence(drained_without_checkpoint, "compute", "compute")
+                .unwrap(),
+            0
+        );
+        let drained_after_work = br#"{"status":"drained","shutdown_requested":true,"pool_id":"compute","pool_checkpoint_sequence":1,"scheduled_count":1,"executed":[{}]}"#;
+        assert_eq!(
+            scheduler_checkpoint_sequence(drained_after_work, "compute", "compute").unwrap(),
+            1
+        );
+        let idle = br#"{"status":"idle","shutdown_requested":false,"pool_id":"compute","pool_checkpoint_sequence":0,"scheduled_count":0,"executed":[]}"#;
+        assert!(scheduler_checkpoint_sequence(idle, "compute", "compute").is_err());
+    }
+
+    #[test]
     fn recovery_archive_allows_only_the_pinned_owner_transition() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::open(directory.path().join("store")).unwrap();
@@ -2871,11 +3165,17 @@ mod recovery_contract_tests {
             }
             let source_path = store.root().join(&source);
             std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
-            let bytes = source.as_bytes();
-            std::fs::write(&source_path, bytes).unwrap();
+            let bytes = if source == "runtime-services/00000000-0000-4000-8000-000000000002/compute.stdout.jsonl" {
+                br#"{"status":"drained","shutdown_requested":true,"pool_id":"compute","pool_checkpoint_sequence":0,"scheduled_count":0,"executed":[]}"#.to_vec()
+            } else if source == "runtime-services/00000000-0000-4000-8000-000000000002/preparation.stdout.jsonl" {
+                br#"{"status":"drained","shutdown_requested":true,"pool_id":"preparation","pool_checkpoint_sequence":0,"scheduled_count":0,"executed":[]}"#.to_vec()
+            } else {
+                source.as_bytes().to_vec()
+            };
+            std::fs::write(&source_path, &bytes).unwrap();
             let archive_name = Path::new(&source).file_name().unwrap();
-            std::fs::write(archive_root.join(archive_name), bytes).unwrap();
-            let source_digest = crate::hex_sha256(bytes);
+            std::fs::write(archive_root.join(archive_name), &bytes).unwrap();
+            let source_digest = crate::hex_sha256(&bytes);
             archived_files.insert(source, source_digest);
         }
         let configuration_bytes = br#"{"schema_version":"runtime_service_config.v2"}"#;
@@ -2915,6 +3215,7 @@ mod recovery_contract_tests {
             archived_evidence_path: manifest_path.to_str().unwrap().into(),
             archived_evidence_sha256: crate::hex_sha256(&manifest_bytes),
             archived_files: archived_files.clone(),
+            archived_absent_sources: BTreeMap::new(),
             historical_build_commit: "a".repeat(40),
             historical_build_snapshot: "b".repeat(64),
             executor_build_commit: "c".repeat(40),

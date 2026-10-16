@@ -53,6 +53,7 @@ MAX_RECOVERY_LOG_BYTES = 4 * 1024 * 1024
 MAX_RECOVERY_ARCHIVED_FILES = 32
 RECOVERY_MANDATORY_ARCHIVED_FILES = 12
 RECOVERY_ARCHIVED_CONFIGURATION_KEY = "configuration.json"
+RECOVERY_ABSENT_SOURCE_REASON = "scheduler_checkpoint_not_published"
 GIB = 1024**3
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -884,6 +885,65 @@ def _recovery_mandatory_sources(owner: Mapping[str, Any]) -> set[str]:
     return sources
 
 
+def _recovery_checkpoint_sources(owner: Mapping[str, Any]) -> set[str]:
+    compute_pool = _recovery_store_id(
+        owner.get("compute_pool_id"), "runtime recovery compute pool id"
+    )
+    preparation_pool = _recovery_store_id(
+        owner.get("preparation_pool_id"), "runtime recovery preparation pool id"
+    )
+    return {
+        f"scheduler_pools/{compute_pool}.json",
+        f"scheduler_pools/{preparation_pool}.preparation.json",
+    }
+
+
+def _recovery_log_sources(owner: Mapping[str, Any]) -> set[str]:
+    owner_token = _recovery_store_id(owner.get("owner_token"), "runtime recovery owner token")
+    prefix = f"runtime-services/{owner_token}/"
+    return {
+        prefix + name
+        for name in (
+            "compute.stdout.jsonl",
+            "compute.stderr.log",
+            "preparation.stdout.jsonl",
+            "preparation.stderr.log",
+            "compute-publisher.stdout.jsonl",
+            "compute-publisher.stderr.log",
+            "preparation-publisher.stdout.jsonl",
+            "preparation-publisher.stderr.log",
+        )
+    }
+
+
+def _observe_recovery_log_sources(paths: RuntimePaths, owner: Mapping[str, Any]) -> set[str]:
+    owner_token = _recovery_store_id(owner.get("owner_token"), "runtime recovery owner token")
+    log_dir = paths.store / "runtime-services" / owner_token
+    _assert_no_links(log_dir, "native recovery scheduler evidence")
+    if not log_dir.is_dir() or log_dir.is_symlink():
+        _fail("native recovery scheduler evidence directory is missing")
+    allowed = _recovery_log_sources(owner)
+    observed: set[str] = set()
+    try:
+        entries = list(log_dir.iterdir())
+    except OSError as error:
+        _fail(f"cannot enumerate native recovery scheduler evidence: {error}")
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            _fail("native recovery scheduler evidence contains a non-regular entry")
+        relative = f"runtime-services/{owner_token}/{entry.name}"
+        if relative not in allowed:
+            _fail(f"native recovery scheduler evidence contains an unexpected entry {entry.name}")
+        observed.add(relative)
+    mandatory = {
+        f"runtime-services/{owner_token}/compute.stdout.jsonl",
+        f"runtime-services/{owner_token}/preparation.stdout.jsonl",
+    }
+    if not mandatory.issubset(observed):
+        _fail("native recovery scheduler evidence is missing a mandatory journal")
+    return observed
+
+
 def _validate_native_recovery_result(
     paths: RuntimePaths, authorization: Mapping[str, Any], result: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -939,14 +999,18 @@ def _validate_native_recovery_result(
     ):
         _fail("native runtime recovery archive manifest identity differs from the request")
     archived = result.get("archived_files")
+    absent = result.get("archived_absent_sources", {})
     if (
         not isinstance(archived, dict)
-        or len(archived) != RECOVERY_MANDATORY_ARCHIVED_FILES
-        or len(archived) > MAX_RECOVERY_ARCHIVED_FILES
+        or not isinstance(absent, dict)
+        or len(archived) + len(absent) < RECOVERY_MANDATORY_ARCHIVED_FILES
+        or len(archived) + len(absent) > MAX_RECOVERY_ARCHIVED_FILES
     ):
         _fail("native runtime recovery archive inventory is incomplete")
     if manifest.get("files") != archived:
         _fail("native runtime recovery archive manifest inventory differs from the receipt")
+    if manifest.get("absent_sources", {}) != absent:
+        _fail("native runtime recovery absent-source inventory differs from the receipt")
     current_owner_path = paths.store / "runtime-services" / "OWNER.json"
     current_owner_raw = _bounded_regular(
         current_owner_path, "native recovery current owner", MAX_JSON_BYTES
@@ -959,8 +1023,25 @@ def _validate_native_recovery_result(
         _fail(f"native recovery current owner is not valid JSON: {error}")
     if not isinstance(current_owner, dict):
         _fail("native recovery current owner must contain an object")
-    if set(archived) != _recovery_mandatory_sources(current_owner):
+    mandatory_sources = _recovery_mandatory_sources(current_owner)
+    checkpoint_sources = _recovery_checkpoint_sources(current_owner)
+    absent_sources = set(absent)
+    if not all(
+        isinstance(source, str) and reason == RECOVERY_ABSENT_SOURCE_REASON
+        for source, reason in absent.items()
+    ):
+        _fail("native runtime recovery absent-source reason is invalid")
+    if not absent_sources.issubset(checkpoint_sources):
+        _fail("native runtime recovery marked a non-checkpoint source absent")
+    if set(archived).intersection(absent_sources):
+        _fail("native runtime recovery source is both present and absent")
+    observed_logs = _observe_recovery_log_sources(paths, current_owner)
+    allowed_sources = mandatory_sources | _recovery_log_sources(current_owner)
+    coverage = set(archived) | absent_sources
+    if not coverage.issuperset(mandatory_sources) or not coverage.issubset(allowed_sources):
         _fail("native runtime recovery archive inventory is missing or contains unexpected evidence")
+    if coverage != mandatory_sources | observed_logs:
+        _fail("native runtime recovery archive inventory differs from the live namespace")
     owner_source = archived.get("runtime-services/OWNER.json")
     if owner_source != authorization.get("owner_sha256"):
         _fail("native runtime recovery archive does not pin the pre-recovery owner")
@@ -995,6 +1076,12 @@ def _validate_native_recovery_result(
                 _fail(f"native recovery source evidence changed: {source_relative}")
             if archive_bytes != source_bytes:
                 _fail(f"native recovery archive evidence differs: {source_relative}")
+    for source_value in absent_sources:
+        source_relative = _recovery_relative_path(source_value, "native absent source path")
+        source_path = paths.store.joinpath(*source_relative.parts)
+        _assert_no_links(source_path.parent, "native absent source parent")
+        if os.path.lexists(source_path):
+            _fail(f"native recovery absent source exists: {source_relative}")
     return dict(result)
 
 

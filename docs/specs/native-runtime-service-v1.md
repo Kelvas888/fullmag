@@ -339,10 +339,17 @@ Publiczny receipt `runtime_service_recovery.v1` wiąże `request_id`,
 `outcome=failed`, `owner_sha256_before`, `owner_state_after=failed` oraz
 `owner_sha256_after`. `archived_evidence_path` i `archived_evidence_sha256`
 przypinają manifest archiwum, a `archived_files` mapuje ograniczony zestaw
-oryginalnych plików na ich raw SHA-256. Inventory ma 12 obowiązkowych wpisów:
+oryginalnych plików na ich raw SHA-256. Logiczny inventory ma 12 obowiązkowych wpisów:
 `OWNER.json`, stabilny owner lock, `LAUNCH.json`, launch lock, startup gate,
 journale stdout obu schedulerów, cztery dokumenty zasobów/stanu przypiętych
-pul oraz `configuration.json`. Może zawierać także wyłącznie rzeczywiście
+pul oraz `configuration.json`. Jeżeli scheduler zakończył się z
+`status=drained`, `shutdown_requested=true` i `pool_checkpoint_sequence=0`,
+checkpoint może nie istnieć: dokładna ścieżka trafia wtedy do
+`archived_absent_sources` z powodem `scheduler_checkpoint_not_published`,
+bez tworzenia pliku lub syntetycznego hasha. Natywna walidacja wiąże tę
+nieobecność z właściwym journalem i odrzuca brak po opublikowaniu checkpointu;
+suma `archived_files` i `archived_absent_sources` nadal musi pokrywać cały
+logiczny inventory. Archiwum może zawierać także wyłącznie rzeczywiście
 istniejące pliki z zamkniętej listy producerów: stdout i stderr publisherów
 `compute-publisher` i `preparation-publisher` oraz stderr obu schedulerów.
 Każdy taki plik jest regularny, bounded, odczytany bez podążania za linkiem i
