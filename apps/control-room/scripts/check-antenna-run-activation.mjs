@@ -31,4 +31,8 @@ check("malformed enabled state cannot silently enable a Run", () => equal(ids(pi
 check("legacy flat Run IDs and fallback ID remain supported", () => equal(ids({ study: { stages: [{ kind: "relax", stage_id: "relax" }, { kind: "run", stage_id: "run" }, { kind: "run", id: "legacy" }, { kind: "run" }] } }), ["run", "legacy"]));
 check("missing study yields no fabricated activation", () => equal(ids(null), []));
 check("activation resolution never rewrites the source", () => { const scene = pipeline([run]), before = JSON.stringify(scene); ids(scene); assert.equal(JSON.stringify(scene), before); });
+const options=sourceModule.namespace.antennaRunStageOptions;
+check("pipeline label uses its authored name with the executable identity",()=>equal(options(pipeline([{...run,label:"Propagation"}])),[{id:"queue-run",label:"Propagation"}]));
+check("duplicate display names retain distinct executable IDs",()=>equal(options(pipeline([{...run,label:"Run"},{...run,id:"queue-run-2",label:"Run"}])),[{id:"queue-run",label:"Run [queue-run]"},{id:"queue-run-2",label:"Run [queue-run-2]"}]));
+check("duplicate flat IDs are never offered as ambiguous checkboxes",()=>equal(ids({study:{stages:[{kind:"run",stage_id:"same"},{kind:"run",stage_id:"same"}]}}),[]));
 console.log(JSON.stringify({ state: "passed", checks, scope: "interpreted production activation and canonical study-source reader; nested backend acceptance not qualified; no unit test compilation" }));

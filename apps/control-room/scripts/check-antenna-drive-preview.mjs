@@ -31,6 +31,15 @@ check("unrelated edits preserve an existing name verbatim", () => {
   const result=model.buildSolvedDrive(legacy,{...model.solvedDriveDraft(legacy),peakCurrentA:"0.02"});
   assert.equal(result.name,legacy.name); assert.equal(result.peak_current_a,0.02);
 });
+check("projection and port are authored together while drive ID stays immutable",()=>{
+  const result=model.buildSolvedDrive(drive,{...model.solvedDriveDraft(drive),projectionRef:"other-projection",portModeId:"other-port"});
+  assert.equal(result.id,drive.id);assert.equal(result.projection_ref,"other-projection");assert.equal(result.port_mode_id,"other-port");
+});
+check("late ACK preserves a newer projection/port pair",()=>{
+  const submitted=model.solvedDriveDraft(drive),later={...submitted,projectionRef:"later-projection",portModeId:"later-port"};
+  const ack=model.acknowledgeSolvedDriveDraft({id:drive.id,draft:later,dirtyKeys:["projectionRef","portModeId"],editedAgainst:{projectionRef:submitted.projectionRef,portModeId:submitted.portModeId}},drive.id,submitted,submitted,2);
+  assert.equal(ack.draft.projectionRef,later.projectionRef);assert.equal(ack.draft.portModeId,later.portModeId);
+});
 check("blank drive name is rejected",()=>assert.throws(()=>model.buildSolvedDrive(drive,{...model.solvedDriveDraft(drive),name:"  "}),/name is required/));
 check("late ACK preserves a newer display name",()=>{
   const submitted=model.solvedDriveDraft(drive), later={...submitted,name:"Later name"};
@@ -64,7 +73,7 @@ check("oversized frequency range is rejected instead of aliased", () => assert.t
 check("sample budget is explicit and enforced", () => assert.ok(preview.sampleAntennaDrive(drive, 0, 16e-9).length <= preview.MAX_DRIVE_PREVIEW_POINTS));
 check("too many piecewise knots do not get silently truncated", () => assert.throws(() => preview.sampleAntennaDrive({ ...drive, waveform: { kind: "piecewise_linear", points: Array.from({length:513},(_,i)=>[i,1]) } }, 0, 512), /512 authored knots/));
 check("overflowing current is rejected", () => assert.throws(() => preview.sampleAntennaDrive({ ...drive, peak_current_a: 1e308, waveform: { kind: "sinusoidal", frequency_hz: 1e9, phase_rad: Math.PI / 2, offset: 10 } }, 0, 1e-9), /overflow/));
-check("ACK cannot change the projection binding", () => assert.throws(() => model.resolveCommittedSolvedDriveScene({ scene_revision: 2, committed_scene: { revision: 2, scene: { id: "scene" }, solved_antenna_drives: [{ ...drive, projection_ref: "foreign" }] } }, drive, "scene", 1), /immutable binding/));
+check("ACK cannot change the projection binding", () => assert.throws(() => model.resolveCommittedSolvedDriveScene({ scene_revision: 2, committed_scene: { revision: 2, scene: { id: "scene" }, solved_antenna_drives: [{ ...drive, projection_ref: "foreign" }] } }, drive, "scene", 1), /submitted binding/));
 check("ACK cannot change the time origin", () => assert.throws(() => model.resolveCommittedSolvedDriveScene({ scene_revision: 2, committed_scene: { revision: 2, scene: { id: "scene" }, solved_antenna_drives: [{ ...drive, time_origin: "absolute" }] } }, drive, "scene", 1), /parameters/));
 check("ACK preserves later unsaved clock edits", () => { const draft=model.solvedDriveDraft(drive); const ack=model.acknowledgeSolvedDriveDraft({id:drive.id,draft:{...draft,timeOrigin:"absolute"},dirtyKeys:["timeOrigin"],editedAgainst:{timeOrigin:"stage_local"}},drive.id,draft,draft); assert.equal(ack.draft.timeOrigin,"absolute"); });
 check("409 conflict blocks both save paths until explicit rebase", () => {

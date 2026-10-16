@@ -459,9 +459,10 @@ try {
   await screenshot("10-pipeline-drive-composition");
   await page.getByTitle("Expand All").click();
   await selectNode(`model:object:${objectId}:antenna:drive:${encodeURIComponent(drive.id)}`);
-  const activation = page.getByRole("checkbox", { name: `Run ${runNode.id}`, exact: true });
+  const activation = page.getByRole("checkbox", { name: runNode.label, exact: true });
   await activation.waitFor(); assert.equal(await activation.isChecked(), true);
-  assert.equal(await page.getByRole("textbox", { name: "Stage IDs", exact: true }).inputValue(), runNode.id);
+  assert.equal(await page.getByRole("textbox", { name: "Stage IDs", exact: true }).count(), 0);
+  await page.getByText(`Executable stage ID: ${runNode.id}`, { exact: true }).waitFor();
   await screenshot("11-pipeline-drive-inspector");
   checks.push({ name: "Real UI-authored receiver and Run, represented by the public pipeline API, bind one atomic antenna drive to the executable queue ID and display it in the existing drive editor", passed: true, setup: "receiver and flat Run via UI; pipeline representation via public API; composition and inspection via UI", queueId: runNode.id, definitionId: runNode.payload.stage_id });
   const driveEditor = page.getByTestId("antenna-drive-editor"), currentPreview = page.getByTestId("antenna-drive-preview");
@@ -750,6 +751,77 @@ try {
   assert.equal(writes.length, beforeReadoutWrites, "Readout disclosure and layout must not write or compute");
   await page.setViewportSize({ width: 1600, height: 1100 });
   checks.push({ name: "Parameter readout separates execution from exact identities, preserves signed SI current, supports keyboard disclosure and wraps full IDs without overflow at compact width; disclosure and layout are read-only", passed: true, exactIdentity, compactIdentity });
+  await identities.focus(); await identities.press("Enter");
+  assert.equal(await identities.getAttribute("aria-expanded"), "false");
+  const beforeBindingSetup = await scene();
+  const alternatePort = { ...beforeBindingSetup.antenna_port_modes.find(item => item.id === drive.port_mode_id), id: `${drive.port_mode_id}:alternate` };
+  const originalStage = beforeBindingSetup.antenna_field_solve_stages.find(item => item.id === stage.id);
+  const alternateStage = { ...originalStage, id: `${stage.id}:alternate`, port_mode_ids: [alternatePort.id], outputs: originalStage.outputs.map((output, index) => ({ ...output, id: `${stage.id}:alternate:output:${index + 1}` })) };
+  const originalProjection = beforeBindingSetup.antenna_target_projections.find(item => item.id === drive.projection_ref);
+  const alternateProjection = { ...originalProjection, id: `${drive.projection_ref}:alternate`, output_id: `${drive.projection_ref}:alternate:field`, solution: { kind: "stage_output", stage_id: alternateStage.id, output_id: alternateStage.outputs.find(output => output.quantity === "H_ant_basis").id } };
+  const bindingSetup = { base_revision: beforeBindingSetup.revision, kind: "merge_patch", merge_patch: {
+    antenna_port_modes: [...beforeBindingSetup.antenna_port_modes, alternatePort], antenna_field_solve_stages: [...beforeBindingSetup.antenna_field_solve_stages, alternateStage], antenna_target_projections: [...beforeBindingSetup.antenna_target_projections, alternateProjection],
+  } };
+  await json(await context.request.post(`${target.api_base}/v2/sessions/current/model/transactions`, { headers: headers(), data: bindingSetup }));
+  writes.push({ method: "POST", path: "/v2/sessions/current/model/transactions", body: bindingSetup, instance: target.api_instance, scope, source: "public_api_alternate_binding_setup" });
+  await waitScene(s => s.antenna_target_projections.some(item => item.id === alternateProjection.id));
+  const bindingChoice = driveEditor.getByRole("combobox", { name: "Field projection and port", exact: true });
+  const alternativeKey = JSON.stringify([alternateProjection.id, alternatePort.id]);
+  await page.waitForFunction(key => [...document.querySelectorAll('[data-testid="antenna-drive-editor"] option')].some(option => option.value === key), alternativeKey);
+  const beforeRebindWrites = writes.length;
+  await bindingChoice.selectOption(alternativeKey);
+  assert.equal(writes.length, beforeRebindWrites);
+  await driveEditor.getByRole("button", { name: "Reset drive", exact: true }).click();
+  assert.equal(await bindingChoice.inputValue(), JSON.stringify([drive.projection_ref, drive.port_mode_id]));
+  await bindingChoice.selectOption(alternativeKey);
+  await selectNode(`model:object:${objectId}:geometry`); await dirtyGuard.waitFor();
+  await dirtyGuard.getByRole("button", { name: "Cancel", exact: true }).click();
+  assert.equal(await bindingChoice.inputValue(), alternativeKey);
+  await bindingChoice.focus();
+  await page.evaluate(() => {
+    const root = document.querySelector('[data-testid="antenna-drive-editor"]'), input = document.activeElement, scroll = root.closest(".fm-inspector__body");
+    const controls = [...root.querySelectorAll("input, select")].map(element => ({ element, disabled: element.disabled, opacity: getComputedStyle(element).opacity }));
+    const proof = { root, input, scroll, top: scroll.scrollTop, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 };
+    const sample = () => {
+      proof.samples++;
+      if (document.querySelector('[data-testid="antenna-drive-editor"]') !== root) proof.rootChanges++;
+      for (const saved of controls) {
+        if (!saved.element.isConnected) proof.controlChanges++;
+        if (saved.element.disabled !== saved.disabled) proof.disabledChanges++;
+        if (getComputedStyle(saved.element).opacity !== saved.opacity) proof.opacityChanges++;
+      }
+      proof.opacityAnimations += root.getAnimations({ subtree: true }).filter(animation => (animation.playState === "running" || animation.pending) && animation.effect?.getKeyframes().some(frame => "opacity" in frame)).length;
+    };
+    const observer = new MutationObserver(sample); observer.observe(root, { attributes: true, childList: true, subtree: true }); sample(); window.__bindingProof = { proof, observer, sample };
+  });
+  await driveSave.evaluate(button => button.click());
+  const reboundDriveScene = await waitScene(s => s.solved_antenna_drives.find(item => item.id === drive.id)?.projection_ref === alternateProjection.id);
+  await driveEditor.getByText("Antenna drive committed.", { exact: true }).waitFor();
+  const reboundDrive = reboundDriveScene.solved_antenna_drives.find(item => item.id === drive.id);
+  assert.deepEqual(reboundDrive, { ...beforeBindingSetup.solved_antenna_drives.find(item => item.id === drive.id), projection_ref: alternateProjection.id, port_mode_id: alternatePort.id });
+  assert.deepEqual(reboundDriveScene.antenna_target_projections, bindingSetup.merge_patch.antenna_target_projections);
+  assert.equal(writes.length, beforeRebindWrites + 1); assert.deepEqual(Object.keys(writes.at(-1).body.merge_patch), ["solved_antenna_drives"]);
+  const bindingStability = await page.evaluate(() => {
+    const { proof, observer, sample } = window.__bindingProof; sample(); observer.disconnect();
+    return { root: proof.root.isConnected, focus: document.activeElement === proof.input, scroll: proof.scroll.scrollTop === proof.top,
+      rootChanges: proof.rootChanges, controlChanges: proof.controlChanges, disabledChanges: proof.disabledChanges, opacityChanges: proof.opacityChanges, opacityAnimations: proof.opacityAnimations, samples: proof.samples };
+  });
+  assert.ok(bindingStability.samples > 1 && bindingStability.samples < 200);
+  assert.deepEqual({ ...bindingStability, samples: 0 }, { root: true, focus: true, scroll: true, rootChanges: 0, controlChanges: 0, disabledChanges: 0, opacityChanges: 0, opacityAnimations: 0, samples: 0 });
+  assert.equal(await driveNode.getAttribute("aria-selected"), "true");
+  await bindingChoice.scrollIntoViewIfNeeded(); await screenshot("20-explicit-projection-port-binding");
+  checks.push({ name: "Existing drive rebinds one explicit projection/port pair through real UI/API, preserves immutable drive and antenna identity, retains cancelled drafts and local Reset, and does not edit projections or execute a solver", passed: true, stability: bindingStability, setup: "alternate compatible definitions via public API; selection, Reset, cancelled navigation and save via real UI" });
+  await activation.uncheck();
+  assert.equal(await driveSave.isEnabled(), false, "At least one selected Run is required");
+  await selectNode(`model:object:${objectId}:geometry`); await dirtyGuard.waitFor();
+  assert.equal(await dirtyGuard.getByRole("button", { name: "Apply and continue", exact: true }).isEnabled(), false);
+  await dirtyGuard.getByRole("button", { name: "Cancel", exact: true }).click();
+  assert.equal(await activation.isChecked(), false);
+  await activation.check();
+  await page.getByText(`Executable stage ID: ${runNode.id}`, { exact: true }).waitFor();
+  assert.equal(writes.length, beforeRebindWrites + 1);
+  await activation.scrollIntoViewIfNeeded(); await screenshot("21-named-run-activation");
+  checks.push({ name: "Named Run checkboxes retain executable IDs, reject an empty selection, preserve cancelled edits and need no raw ID input or extra API transaction", passed: true });
   const webgl = await page.locator("canvas").evaluateAll(canvases => canvases.map(canvas => {
     const bounds = canvas.getBoundingClientRect(); if (!bounds.width || !bounds.height) return null;
     const gl = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
@@ -757,7 +829,7 @@ try {
   }).filter(Boolean));
   assert.ok(webgl.some(gl => !gl.lost && gl.width > 0 && gl.height > 0)); assert.ok(webgl.every(gl => !gl.lost));
   assert.ok(websockets.some(url => url.startsWith(target.api_base.replace("http:", "ws:"))), "Realtime must use the admitted API");
-  assert.ok(writes.length >= 3 && writes.length <= 23);
+  assert.ok(writes.length >= 3 && writes.length <= 25);
   for (const write of [...writes, ...visualizationAcks]) { assert.equal(write.instance, target.api_instance); assert.equal(write.scope, scope); assert.ok(!write.path.includes("/simulation/"), "Authoring smoke must not execute a solver"); }
   assert.ok(Date.now() - Date.parse(startedAt) > 5000, "The scenario must outlive the adoption timeout");
   assert.deepEqual(visualizationAcks.filter(ack => ack.body.status === "failed"), [], "No nonexistent-buffer adoption may fail during empty/nonmagnetic authoring");

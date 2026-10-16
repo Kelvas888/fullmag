@@ -10,6 +10,7 @@ import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus"
 import { Button } from "@/shared/ui/Button";
 
 import { useRegisterInspectorEditSession } from "../../InspectorEditSession";
+import { antennaDriveBindingKey, antennaDriveBindingOptions, validateAntennaDriveBinding } from "./AntennaDriveBindingsModel";
 import { AntennaDrivePreview } from "./AntennaDrivePreview";
 import { AntennaPiecewisePointsEditor } from "./AntennaPiecewisePointsEditor";
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
@@ -20,7 +21,7 @@ import {
   buildSolvedDrive,
   resolveCommittedSolvedDriveScene,
   acknowledgeSolvedDriveDraft,
-  antennaRunStageIds,
+  antennaRunStageOptions,
   changeSolvedDriveWaveformKind,
   solvedDriveDraft,
   solvedDriveSaveBlockReason,
@@ -80,7 +81,9 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
       } as SolvedDriveDraft
     : initial;
   const revision = scene?.revision;
-  const runStageIds = antennaRunStageIds(scene);
+  const runOptions = antennaRunStageOptions(scene);
+  const runStageIds = runOptions.map(option => option.id);
+  const bindingOptions = antennaDriveBindingOptions(scene, drive);
   const conflict = conflictState?.id === driveId ? conflictState : null;
   const validRevision = typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0;
   const conflictPhase = conflict?.phase === "refreshing"
@@ -105,6 +108,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
   try {
     if (drive && draft) {
       validatedDrive = buildSolvedDrive(drive, draft);
+      validateAntennaDriveBinding(scene, drive, validatedDrive);
       if (validatedDrive.activation.kind === "stage_ids" && validatedDrive.activation.stage_ids.some(id => !runStageIds.includes(id))) {
         throw new Error("Selected activation stage is not a Run stage in the current study.");
       }
@@ -118,7 +122,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
     ? (Object.keys(draft ?? initial) as Array<keyof SolvedDriveDraft>).filter((key) =>
         dirtyKeySet.has(key) || initial[key] !== conflict.baseDraft[key])
     : [];
-  const selectedStageIds = new Set(draft?.stageIds.split(",").map((value) => value.trim()) ?? []);
+  const selectedStageIds = new Set(draft?.stageIds.split(",").map((value) => value.trim()).filter(Boolean) ?? []);
 
   function discard() {
     if (pending) return;
@@ -188,6 +192,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
     setFeedbackState(null);
     try {
       const updated = buildSolvedDrive(drive, draft);
+      validateAntennaDriveBinding(scene, drive, updated);
       const availableRunIds = new Set(runStageIds);
       if (updated.activation.kind === "stage_ids" &&
         updated.activation.stage_ids.some((id) => !availableRunIds.has(id))) {
@@ -233,6 +238,16 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
   return (
     <div data-testid="antenna-drive-editor"><InspectorGroup title="Drive authoring">
       <FormField label="Drive name" hint="Display name only. The immutable drive ID and its source bindings stay unchanged." value={draft.name} onChange={event => update({ name: event.currentTarget.value })} />
+      <FormField label="Field projection and port" type="select" value={antennaDriveBindingKey(draft.projectionRef, draft.portModeId)}
+        hint="Choose an existing projection and its matching port. Saving changes the binding; it does not compute or qualify a field."
+        onChange={event => {
+          const option = bindingOptions.find(item => item.key === event.currentTarget.value);
+          if (option) update({ projectionRef: option.projectionRef, portModeId: option.portModeId });
+        }}>
+        {!bindingOptions.some(option => option.projectionRef === draft.projectionRef && option.portModeId === draft.portModeId)
+          ? <option value={antennaDriveBindingKey(draft.projectionRef, draft.portModeId)} disabled>Unavailable binding · {draft.projectionRef} / {draft.portModeId}</option> : null}
+        {bindingOptions.map(option => <option key={option.key} value={option.key} title={option.description}>{option.label}</option>)}
+      </FormField>
       <FormField label="Peak current" unit="A" hint="Signed current scale. I(t) = scale × waveform(t); offset or sinc amplitude can change the actual peak. No RMS conversion is applied." value={draft.peakCurrentA} onChange={(event) => update({ peakCurrentA: event.currentTarget.value })} />
       <FormField label="Waveform" type="select" value={draft.waveformKind} onChange={(event) => changeWaveform(event.currentTarget.value as WaveformKind)}>
         <option value="constant">Constant</option>
@@ -265,11 +280,12 @@ export function SolvedAntennaDriveEditor({ driveId, scene, sceneScopeKey, status
         <option value="stage_ids">Selected stages</option>
       </FormField>
       {draft.activationKind === "stage_ids" ? <>
-        {runStageIds.map((id) => <FormField key={id} label={`Run ${id}`} type="checkbox" checked={selectedStageIds.has(id)} onChange={(event) => {
-          const selected = draft.stageIds.split(",").map((value) => value.trim()).filter(Boolean);
-          update({ stageIds: (event.currentTarget.checked ? [...new Set([...selected, id])] : selected.filter((value) => value !== id)).join(", ") });
+        {runOptions.map(({ id, label }) => <FormField key={id} label={label} hint={`Executable stage ID: ${id}`} type="checkbox" checked={selectedStageIds.has(id)} onChange={(event) => {
+          const selected = [...selectedStageIds];
+          update({ stageIds: (event.currentTarget.checked ? [...new Set([...selected, id])] : selected.filter(value => value !== id)).join(", ") });
         }} />)}
-        <FormField label="Stage IDs" hint="Only Run stages in the current study can be activated." value={draft.stageIds} onChange={(event) => update({ stageIds: event.currentTarget.value })} />
+        {[...selectedStageIds].filter(id => !runStageIds.includes(id)).map(id => <FormField key={id} label="Unavailable Run" hint={`Stored stage ID: ${id}. Remove explicitly or restore this Run in the study.`} type="checkbox" checked onChange={() => update({ stageIds: [...selectedStageIds].filter(value => value !== id).join(", ") })} />)}
+        {!runOptions.length ? <p className="fm-inspector-hint">No enabled Run stages are available in this study.</p> : null}
       </> : null}
       {validationError ? <FeedbackBanner kind="warning" message={validationError} /> : null}
       {feedback ? <FeedbackBanner kind={feedback === "Antenna drive committed." ? "success" : "error"} message={feedback} /> : null}

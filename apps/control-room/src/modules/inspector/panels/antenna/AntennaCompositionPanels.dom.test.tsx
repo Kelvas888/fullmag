@@ -295,7 +295,7 @@ describe("AntennaCompositionPanel runtime results", () => {
     try {
       await act(async () => root.render(<AntennaCompositionPanel kind="drive" selection={driveSelection()} />));
       visit(container);
-      expect(container.textContent).toContain("Run run-1");
+      expect(container.textContent).toContain("Executable stage ID: run-1");
       expect(container.textContent).not.toContain("Run relax-1");
       await act(async () => buttons[0]?.dispatchEvent(new TestEvent("click", { bubbles: true })));
       expect(container.textContent).toContain("not a Run stage");

@@ -6,6 +6,8 @@ export type WaveformKind = SolvedDrive["waveform"]["kind"];
 
 export interface SolvedDriveDraft {
   name: string;
+  projectionRef: string;
+  portModeId: string;
   peakCurrentA: string;
   timeOrigin: SolvedDrive["time_origin"];
   waveformKind: WaveformKind;
@@ -61,26 +63,32 @@ export const waveformDefaults = {
   piecewisePoints: "[[0,0],[1e-9,1]]",
 };
 
-export function antennaRunStageIds(scene: SceneResource | null): string[] {
+export function antennaRunStageOptions(scene: SceneResource | null): Array<{ id: string; label: string }> {
   const source = readStudyStageSource(scene?.study);
   if (source.kind === "invalid") return [];
-  return source.entries.flatMap((entry) => {
+  const options = source.entries.flatMap((entry, index) => {
     if (!entry.enabled) return [];
-    if (source.kind === "pipeline") {
-      // Activation follows executable queue identity, never a definition ID.
-      return entry.stageKind === "run" && entry.queueId ? [entry.queueId] : [];
-    }
     const stage = entry.payload;
-    if (stage.kind !== "run") return [];
-    const id = typeof stage.stage_id === "string" ? stage.stage_id : stage.id;
-    return typeof id === "string" && id.trim() ? [id] : [];
+    const id = source.kind === "pipeline"
+      ? entry.stageKind === "run" ? entry.queueId : null
+      : stage.kind === "run" ? typeof stage.stage_id === "string" ? stage.stage_id : stage.id : null;
+    if (typeof id !== "string" || !id.trim()) return [];
+    const name = entry.label ?? stage.name ?? stage.label;
+    return [{ id, label: typeof name === "string" && name.trim() ? name.trim() : `Run ${index + 1}` }];
   });
+  return options.filter(option => options.filter(item => item.id === option.id).length === 1).map(option => ({ ...option, label: options.filter(item => item.label === option.label).length > 1 ? `${option.label} [${option.id}]` : option.label }));
+}
+
+export function antennaRunStageIds(scene: SceneResource | null): string[] {
+  return antennaRunStageOptions(scene).map(option => option.id);
 }
 
 export function solvedDriveDraft(drive: SolvedDrive): SolvedDriveDraft {
   const waveform = drive.waveform;
   return {
     name: drive.name,
+    projectionRef: drive.projection_ref,
+    portModeId: drive.port_mode_id,
     peakCurrentA: String(drive.peak_current_a),
     timeOrigin: drive.time_origin,
     waveformKind: waveform.kind,
@@ -182,6 +190,8 @@ export function buildSolvedDrive(
   return {
     ...existing,
     name,
+    projection_ref: draft.projectionRef,
+    port_mode_id: draft.portModeId,
     peak_current_a: peakCurrent,
     time_origin: draft.timeOrigin,
     waveform,
@@ -200,7 +210,7 @@ export function resolveCommittedSolvedDriveScene(
     throw new Error("Drive ACK did not provide the current committed scene. Refresh before saving again.");
   }
   for (const key of ["projection_ref", "port_mode_id"] as const) {
-    if (matches[0][key] !== expectedDrive[key]) throw new Error("Drive ACK changed an immutable binding. Refresh before saving again.");
+    if (matches[0][key] !== expectedDrive[key]) throw new Error("Drive ACK changed the submitted binding. Refresh before saving again.");
   }
   const expected = solvedDriveDraft(expectedDrive);
   const actual = solvedDriveDraft(matches[0]);
