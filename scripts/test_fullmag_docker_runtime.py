@@ -37,23 +37,37 @@ class DockerRuntimeContract(unittest.TestCase):
                     runtime.start(None, None, 3197, project_name=name)
             resolve.assert_not_called()
 
+    def test_workspace_user_data_is_stable_and_scoped_to_compose_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = {"storage_root": directory}
+            path = runtime._workspace_user_data_root(layout, "fullmag-worktree-alpha")
+            self.assertEqual(path, Path(directory) / "user-data" / "fullmag-worktree-alpha")
+            self.assertTrue(path.is_dir())
+            again = runtime._workspace_user_data_root(layout, "fullmag-worktree-alpha")
+            self.assertEqual(again, path)
+            with self.assertRaisesRegex(ValueError, "Invalid Compose project name"):
+                runtime._workspace_user_data_root(layout, "../other")
+
     @unittest.skipUnless(os.environ.get("FULLMAG_TEST_COMPOSE_CONFIG") == "1", "Read-only Compose CLI integration gate")
     def test_workspace_uses_one_loopback_port_and_explicit_gpu(self):
         service = runtime.compose_spec("sha256:" + "a" * 64, Path("/state-host"), 3197,
-                                       Path("/owned/host.json"))["services"]["backend"]
+                                       Path("/owned/host.json"),
+                                       workspace_state_root=Path("/owned/user-data"))["services"]["backend"]
         self.assertEqual(service["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(service["ports"][0]["published"], "3197")
         self.assertEqual(service["ports"][0]["target"], 8081)
         self.assertEqual(service["gpus"][0]["count"], -1)
         self.assertTrue(service["read_only"])
         self.assertEqual([m["target"] for m in service["volumes"]],
-                         ["/state", "/run/fullmag/windows-folder-host.json"])
+                         ["/user-data", "/state", "/run/fullmag/windows-folder-host.json"])
+        self.assertEqual(service["environment"]["FULLMAG_WORKSPACE_STATE_DIR"], "/user-data")
 
     @unittest.skipUnless(os.environ.get("FULLMAG_TEST_COMPOSE_CONFIG") == "1", "Read-only Compose CLI integration gate")
     def test_development_separates_live_frontend_from_session_writer(self):
         inputs = {"source_root": "/checkout"}
         spec = runtime.compose_spec("sha256:" + "a" * 64, Path("/owned/state"), 3197,
-                                    Path("/owned/host.json"), inputs=inputs,
+                                    Path("/owned/host.json"), workspace_state_root=Path("/owned/user-data"),
+                                    inputs=inputs,
                                     inputs_path=Path("/owned/inputs.json"),
                                     package=Path("/owned/package"), provenance=Path("/owned/assembly.json"))
         self.assertEqual(set(spec["services"]), {"backend", "frontend"})
@@ -68,6 +82,10 @@ class DockerRuntimeContract(unittest.TestCase):
         self.assertEqual([m["target"] for m in frontend["volumes"] if not m.get("read_only")],
                          ["/state/development"])
         self.assertNotIn("/state", [m["target"] for m in frontend["volumes"]])
+        self.assertNotIn("/user-data", [m["target"] for m in frontend["volumes"]])
+        self.assertEqual(backend["environment"]["FULLMAG_WORKSPACE_STATE_DIR"], "/user-data")
+        user_data_mount = next(m for m in backend["volumes"] if m["target"] == "/user-data")
+        self.assertEqual(user_data_mount["source"], "/owned/user-data")
         source = next(m for m in backend["volumes"] if m["target"] == "/opt/fullmag/source")
         self.assertTrue(source["read_only"])
         self.assertEqual(source["source"], "/checkout")
@@ -186,6 +204,81 @@ class DockerRuntimeContract(unittest.TestCase):
             with patch("local_runner.build_source.native_identity", return_value={**expected, "source_snapshot_dirty": True}):
                 with self.assertRaisesRegex(ValueError, "assembled native source identity"):
                     runtime._require_static_source_identity(assembly, selected)
+
+    def test_compose_migration_forwards_resolved_source_identity_to_network_guard(self):
+        identity = {
+            "project_name": "fullmag-worktree-network-test",
+            "network_name": "fullmag-worktree-network-test_fullmag",
+            "project_id": "project-test",
+            "worktree_id": "worktree-test",
+            "checkout_kind": "worktree",
+        }
+        with patch("docker_dev._assert_no_running_fullmag") as guard:
+            runtime._assert_compose_project_absent(identity["project_name"], identity)
+        guard.assert_called_once_with(identity["project_name"], identity)
+
+    def test_live_shadow_source_provenance_is_dev_only_and_has_no_archive(self):
+        commit = "a" * 40
+        native = {
+            "head_commit_full": commit,
+            "source_snapshot_sha256": "b" * 64,
+            "source_snapshot_dirty": True,
+        }
+        assembly = {
+            "source_mode": "live-shadow-v1",
+            "runtime_mode": "development_source_bind",
+            "commit": commit,
+            "source_digest": "c" * 64,
+            "source_snapshot_sha256": native["source_snapshot_sha256"],
+            "native_source_identity": native,
+            "source_manifest": "/owned/live-manifest.json",
+            "live_manifest_sha256": "d" * 64,
+            "source_git_common_dir": "/owned/.git",
+        }
+        observed = runtime._validate_assembly_source_provenance(assembly, frontend="dev")
+        self.assertEqual(observed["source_mode"], "live-shadow-v1")
+        self.assertEqual(observed["live_manifest_sha256"], "d" * 64)
+        with self.assertRaisesRegex(ValueError, "development runtime"):
+            runtime._validate_assembly_source_provenance(assembly, frontend="static")
+        with self.assertRaisesRegex(ValueError, "must not claim a source archive"):
+            runtime._validate_assembly_source_provenance(
+                {**assembly, "source_archive": {"path": "/owned/source.tar"}}, frontend="dev"
+            )
+        with self.assertRaisesRegex(ValueError, "canonical live manifest"):
+            runtime._validate_assembly_source_provenance(
+                {key: value for key, value in assembly.items() if key != "live_manifest_sha256"},
+                frontend="dev",
+            )
+
+    def test_legacy_archive_provenance_stays_strict_without_live_fields(self):
+        commit = "e" * 40
+        assembly = {
+            "source_mode": "snapshot",
+            "runtime_mode": "packaged_release",
+            "commit": commit,
+            "source_digest": "f" * 64,
+            "native_source_identity": {
+                "head_commit_full": commit,
+                "source_snapshot_sha256": "1" * 64,
+            },
+            "source_archive": {
+                "path": "/owned/source.tar",
+                "manifest_path": "/owned/source.json",
+                "sha256": "2" * 64,
+                "bytes": 17,
+            },
+        }
+        observed = runtime._validate_assembly_source_provenance(assembly, frontend="static")
+        self.assertEqual(observed["source_mode"], "snapshot")
+        with self.assertRaisesRegex(ValueError, "live-only provenance"):
+            runtime._validate_assembly_source_provenance(
+                {**assembly, "live_manifest_sha256": "3" * 64}, frontend="static"
+            )
+        with self.assertRaisesRegex(ValueError, "archive provenance is invalid"):
+            runtime._validate_assembly_source_provenance(
+                {**assembly, "source_archive": {**assembly["source_archive"], "bytes": True}},
+                frontend="static",
+            )
 
     def test_startup_helper_inventory_uses_frozen_assembly_bytes_on_crlf_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -913,10 +1006,11 @@ class DockerRuntimeContract(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("FULLMAG_TEST_COMPOSE_CONFIG") == "1", "Read-only Compose CLI integration gate")
     def test_windows_certificate_is_read_only_and_profile_is_explicit(self):
         service = runtime.compose_spec("sha256:" + "a" * 64, Path("C:/owned/state"), 3197,
-                                       Path("C:/owned/host.json"))["services"]["backend"]
+                                       Path("C:/owned/host.json"),
+                                       workspace_state_root=Path("/owned/user-data"))["services"]["backend"]
         self.assertEqual(service["environment"]["FULLMAG_SESSION_STORAGE_PROFILE"], "windows-folder-v1")
-        self.assertTrue(service["volumes"][1]["read_only"])
-        self.assertEqual(service["volumes"][1]["target"], "/run/fullmag/windows-folder-host.json")
+        certificate = next(m for m in service["volumes"] if m["target"] == "/run/fullmag/windows-folder-host.json")
+        self.assertTrue(certificate["read_only"])
 
     @unittest.skipIf(os.name == "nt", "Guest probes require Linux no-follow and flock")
     def test_guest_probes_require_restart_before_grant_and_reject_junction(self):

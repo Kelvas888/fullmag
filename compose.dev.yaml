@@ -37,6 +37,8 @@ services:
       FULLMAG_SESSION_STORAGE_PROFILE: windows-folder-v1
       FULLMAG_RUNTIME_IMAGE_ID: ${FULLMAG_DEV_IMAGE}
       FULLMAG_BACKEND_CARGO_PROFILE: ${FULLMAG_BACKEND_CARGO_PROFILE:-backend-dev}
+      # Durable workspace metadata is isolated per Compose source group.
+      FULLMAG_WORKSPACE_STATE_DIR: /user-data
     expose: ["8081"]
     volumes:
       # One source selection for both services: the main checkout or a worktree.
@@ -55,6 +57,12 @@ services:
         source: ${FULLMAG_PACKAGE_PROVENANCE:?Backend build provenance is required}
         target: /opt/fullmag/provenance.json
         read_only: true
+        bind: {create_host_path: false}
+      # Per-group durable user data: workspace.db and related settings only.
+      # Runtime sessions/results remain in the per-run /state bind below.
+      - type: bind
+        source: ${FULLMAG_WORKSPACE_STATE_ROOT:?Managed group user-data namespace is required}
+        target: /user-data
         bind: {create_host_path: false}
       # Real Windows storage: sessions, results, logs and the CUDA disk cache.
       - type: bind

@@ -1,9 +1,10 @@
-"""Create one immutable backend source archive for direct Docker Compose builds.
+"""Prepare immutable backend source inputs for direct Docker Compose builds.
 
 This path deliberately does not submit a managed-runner job.  Native Windows
-captures the selected Git source and writes one tar plus its provenance
-manifest under the resolver-owned build root.  The Linux container verifies the
-tar and extracts it atomically with :mod:`docker.all-in-one.backend_source`.
+can capture either the existing archive input or a compact live-shadow
+manifest under the resolver-owned build root.  The Linux container verifies
+the selected contract and synchronizes the live checkout into its own
+read-only build shadow before invoking the canonical Make target.
 """
 
 from __future__ import annotations
@@ -28,10 +29,27 @@ from typing import Any, BinaryIO, Mapping
 
 import fullmag_storage as storage
 from local_runner.build_source import bind_identity, native_identity
-from local_runner.source import SourceError, _read_git_blobs, _tree_records, capture_source
+from local_runner.source import (
+    SourceError,
+    _current_entry,
+    _expand_explicit_paths,
+    _git_check_lfs_attributes,
+    _index_records,
+    _looks_like_lfs_pointer,
+    _manifest,
+    _normalise_excluded,
+    _parse_untracked,
+    _read_git_blobs,
+    _reject_policy,
+    _tree_records,
+    _working_tree_dirty,
+    capture_source,
+)
 
 
 ARCHIVE_MANIFEST_SCHEMA = "fullmag.docker-backend-source.v1"
+LIVE_MANIFEST_SCHEMA = "fullmag.docker-backend-live-source.v1"
+LIVE_SOURCE_MODE = "live-shadow-v1"
 SOURCE_MANIFEST_SCHEMA = "fullmag.source-capsule.v1"
 ARCHIVE_FILENAME = "backend-source.tar"
 EMBEDDED_MANIFEST_FILENAME = "backend-source-manifest.json"
@@ -579,6 +597,206 @@ def _cleanup_owned_source_staging(staging: Path) -> None:
     shutil.rmtree(staging, onerror=remove_readonly)
 
 
+
+def _git_common_directory(repo: Path) -> Path:
+    raw = _git_bytes(repo, "rev-parse", "--git-common-dir").decode("utf-8", errors="strict").strip()
+    if not raw:
+        raise BackendInputError("Git did not return a common object directory")
+    common = Path(raw)
+    if not common.is_absolute():
+        common = repo / common
+    try:
+        common = common.resolve(strict=True)
+    except OSError as error:
+        raise BackendInputError("Git common object directory is unavailable") from error
+    if not common.is_dir():
+        raise BackendInputError("Git common object directory is not a directory")
+    return common
+
+
+def _compact_live_source_manifest(
+    repo: Path,
+    *,
+    include_untracked: tuple[str, ...],
+) -> tuple[dict[str, Any], dict[str, str], Path]:
+    """Describe the live checkout without copying its bytes into a tar.
+
+    Committed bytes are hashed from Git objects.  Only dirty files that are
+    present in the checkout are read from the Windows tree.  A missing
+    skip-worktree file is represented by its pinned Git object id so the
+    Linux worker can read that object from the read-only common Git mount.
+    """
+
+    try:
+        head = _git_bytes(repo, "rev-parse", "--verify", "HEAD").decode("ascii").strip()
+    except (UnicodeDecodeError, BackendInputError) as error:
+        raise BackendInputError("Git HEAD is unavailable for live source manifest") from error
+    if not SHA40_RE.fullmatch(head):
+        raise BackendInputError("Git HEAD is not a full commit SHA")
+
+    tree_excluded: list[object] = []
+    tree = _tree_records(repo, head, tree_excluded)
+    index_excluded: list[object] = []
+    index = _index_records(repo, index_excluded)
+    explicit = _expand_explicit_paths(repo, include_untracked)
+    tracked = set(tree) | set(index)
+    for relative in sorted(tracked | set(explicit)):
+        _reject_policy(relative)
+    _git_check_lfs_attributes(repo, tuple(sorted(tracked)), None)
+
+    # The index is authoritative for staged additions/mode changes.  HEAD is
+    # retained for sparse paths that have no index entry.
+    records: dict[str, tuple[str, str, str]] = {}
+    for relative, values in index.items():
+        if len(values) != 1 or values[0][2] != 0:
+            raise BackendInputError(f"unmerged Git index entry at {relative}")
+        mode, object_id, _stage = values[0]
+        if mode == "120000":
+            raise BackendInputError(f"UNSAFE_SYMLINK: indexed symlink at {relative}")
+        records[relative] = (mode, "blob", object_id)
+    for relative, record in tree.items():
+        records.setdefault(relative, record)
+
+    skip_paths = _skip_worktree_paths(repo)
+    sparse_records: dict[str, tuple[str, str, str]] = {}
+    entries: list[dict[str, Any]] = []
+    deleted: list[str] = []
+    for relative in sorted(set(records) | set(explicit)):
+        try:
+            current = _current_entry(repo, relative)
+        except SourceError as error:
+            raise BackendInputError(f"live source entry is invalid: {error}") from error
+        record = records.get(relative)
+        if current.get("type") == "deleted":
+            if relative in skip_paths and record is not None and record[0] in {"100644", "100755"}:
+                sparse_records[relative] = record
+                continue
+            if relative in tracked:
+                deleted.append(relative)
+                continue
+            raise BackendInputError(f"explicit untracked source disappeared: {relative}")
+        if current.get("type") != "file":
+            raise BackendInputError(f"live source entry is not a regular file: {relative}")
+        entries.append(dict(current))
+
+    git_object_ids: dict[str, str] = {}
+    if sparse_records:
+        try:
+            blobs = _read_git_blobs(repo, sparse_records)
+        except SourceError as error:
+            raise BackendInputError(f"cannot read sparse Git objects: {error}") from error
+        for relative, (mode, _kind, object_id) in sorted(sparse_records.items()):
+            content = blobs.get(relative)
+            if content is None:
+                raise BackendInputError(f"Git object is missing for sparse source: {relative}")
+            if _looks_like_lfs_pointer(content):
+                raise BackendInputError(f"UNSUPPORTED_LFS: Git-LFS pointer at {relative}")
+            git_object_ids[relative] = object_id
+            entries.append({
+                "path": relative,
+                "type": "file",
+                "mode": mode,
+                "size": len(content),
+                "sha256": _sha256_bytes(content),
+            })
+
+    untracked = set(_parse_untracked(repo))
+    excluded = [
+        *tree_excluded,
+        *index_excluded,
+        *(relative for relative in sorted(untracked) if relative not in set(explicit)),
+    ]
+    try:
+        source_manifest = _manifest(
+            mode="snapshot",
+            repo=repo,
+            common=_git_common_directory(repo),
+            requested_ref=None,
+            resolved_commit=head,
+            head_commit=head,
+            entries=entries,
+            dirty=True,
+            working_tree_dirty=_working_tree_dirty(repo),
+            included_untracked=explicit,
+            deleted=deleted,
+            excluded=_normalise_excluded(excluded),
+        )
+    except SourceError as error:
+        raise BackendInputError(f"cannot create live source manifest: {error}") from error
+    return source_manifest, git_object_ids, _git_common_directory(repo)
+
+
+def capture_backend_live_manifest(
+    repo_root: Path,
+    *,
+    source_root: Path | None = None,
+    output_dir: Path | None = None,
+    capture_id: str | None = None,
+    profile: str = "docker-all-gpu",
+    include_untracked: tuple[str, ...] = (),
+    require_windows: bool = True,
+) -> dict[str, Any]:
+    """Write a compact live-source manifest; never create a source archive."""
+
+    if require_windows and os.name != "nt":
+        raise BackendInputError("live backend source capture must run with native Windows Python")
+    selected = (Path(source_root) if source_root is not None else Path(repo_root)).resolve(strict=True)
+    layout = storage.resolve_layout(selected, profile)
+    storage.initialize(layout)
+    capture_id = capture_id or uuid.uuid4().hex
+    if not CAPTURE_ID_RE.fullmatch(capture_id):
+        raise BackendInputError("capture_id is not a safe immutable bundle identifier")
+    build_root = Path(layout["build_root"])
+    default_parent = storage.validate_path(build_root / "direct-backend-inputs", build_root)
+    default_parent.mkdir(parents=True, exist_ok=True)
+    final_output = Path(output_dir) if output_dir is not None else default_parent / capture_id
+    final_output = storage.validate_path(final_output, build_root, "live backend manifest output")
+    if final_output.exists():
+        raise BackendInputError(f"live backend manifest output already exists: {final_output}")
+    final_output.mkdir(parents=True)
+
+    before = native_identity(selected, "snapshot")
+    source_manifest, git_object_ids, common = _compact_live_source_manifest(
+        selected, include_untracked=include_untracked
+    )
+    after = native_identity(selected, "snapshot")
+    if before != after:
+        raise BackendInputError("selected checkout changed while creating live source manifest")
+    checked_source, _ = _validate_source_manifest(source_manifest)
+    try:
+        # Bind the native snapshot to the exact compact capsule.  Without this
+        # check a dirty/untracked native input could be observed by the host
+        # probe and silently omitted from the live worker input.
+        native = bind_identity(after, checked_source)
+    except (KeyError, ValueError) as error:
+        raise BackendInputError(
+            "selected checkout contains native inputs missing from live source manifest"
+        ) from error
+    source_manifest_sha256 = _sha256_bytes(_canonical_bytes(checked_source))
+    document: dict[str, Any] = {
+        "schema": LIVE_MANIFEST_SCHEMA,
+        "capture_id": capture_id,
+        "source_mode": LIVE_SOURCE_MODE,
+        "source_root": str(selected),
+        "git_common_dir": str(common),
+        "resolved_commit": checked_source["resolved_commit"],
+        "source_digest": checked_source["source_digest"],
+        "source_snapshot_sha256": native["source_snapshot_sha256"],
+        "native_source_identity": native,
+        "source_manifest": checked_source,
+        "source_manifest_sha256": source_manifest_sha256,
+        "git_object_ids": git_object_ids,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    document["live_manifest_sha256"] = _sha256_bytes(_canonical_bytes(document))
+    manifest_path = final_output / "manifest.json"
+    _write_readonly_json(manifest_path, document)
+    return {
+        **document,
+        "manifest_path": str(manifest_path),
+        "output_dir": str(final_output),
+    }
+
 def capture_backend_source(
     repo_root: Path,
     *,
@@ -668,6 +886,8 @@ def _receipt_summary(result: Mapping[str, Any]) -> dict[str, Any]:
         "archive_bytes": result.get("archive_bytes"),
         "archive_path": result.get("archive_path"),
         "manifest_path": result.get("manifest_path"),
+        "live_manifest_sha256": result.get("live_manifest_sha256"),
+        "git_common_dir": result.get("git_common_dir"),
         "output_dir": result.get("output_dir"),
         "file_count": len(source_manifest.get("files", [])) if isinstance(source_manifest, Mapping) else None,
         "deleted_count": len(source_manifest.get("deleted", [])) if isinstance(source_manifest, Mapping) else None,

@@ -4,9 +4,10 @@
 The launcher has two deliberately separate phases:
 
 ``build``
-    Selects one registered Windows checkout, freezes it into the verified
-    backend source archive, runs the four-lane backend build in a Compose
-    build container, and records a development assembly receipt.
+    Selects one registered Windows checkout, records a compact live manifest
+    for the dev profile (or an immutable archive for release/frozen input),
+    runs the four-lane backend build in a Compose build container, and records
+    a development assembly receipt.
 
 ``up``
     Performs ``build`` and hands the resulting receipt to the existing runtime
@@ -40,6 +41,7 @@ STORAGE_PROFILE = "docker-all-gpu"
 DEFAULT_IMAGE = "fullmag/fullmag-dev:local"
 DEFAULT_BASE_IMAGE = "fullmag/development-base:local"
 COMPOSE_BUILD_FILE = "compose.backend-build.yaml"
+COMPOSE_LIVE_BUILD_FILE = "compose.backend-build-live.yaml"
 COMPOSE_RUNTIME_FILE = "compose.dev.yaml"
 TOOLCHAIN_BOOTSTRAP_RECEIPT = "index/docker-toolchain-bootstrap.json"
 TOOLCHAIN_MANIFEST_PATH = "/opt/fullmag-deps/share/fullmag/dependency-versions.json"
@@ -742,6 +744,28 @@ def _compose_identity_environment(layout: Mapping[str, object]) -> dict[str, str
     }
 
 
+def _workspace_state_root(layout: Mapping[str, object], project: str) -> Path:
+    """Resolve the durable per-Compose user-data root through the runtime guard."""
+
+    from fullmag_docker_runtime import _workspace_user_data_root
+
+    return _workspace_user_data_root(layout, project)
+
+
+def _backend_build_state_root(layout: Mapping[str, object], run_root: Path) -> Path:
+    """Return the run-owned scratch state root used by backend-only builds."""
+
+    from fullmag_storage import validate_path
+
+    build_storage_root = Path(str(layout["build_storage_root"]))
+    scratch = validate_path(
+        run_root / "backend-build-state", build_storage_root,
+        "direct backend build scratch state root",
+    )
+    scratch.mkdir(parents=True, exist_ok=True)
+    return validate_path(scratch, build_storage_root, "direct backend build scratch state root")
+
+
 def _new_run_root(layout: Mapping[str, object]) -> tuple[str, Path]:
     from fullmag_storage import validate_path
 
@@ -755,8 +779,16 @@ def _new_run_root(layout: Mapping[str, object]) -> tuple[str, Path]:
     return run_id, root
 
 
-def _direct_compose_files(repo: Path, cache: Mapping[str, object] | None = None) -> list[Path]:
-    backend = repo / COMPOSE_BUILD_FILE
+def _direct_compose_files(
+    repo: Path,
+    cache: Mapping[str, object] | None = None,
+    *,
+    source_mode: str = "archive",
+) -> list[Path]:
+    if source_mode not in {"archive", "live-shadow-v1"}:
+        raise _fail(f"unsupported direct backend source mode: {source_mode}")
+    backend_name = COMPOSE_LIVE_BUILD_FILE if source_mode == "live-shadow-v1" else COMPOSE_BUILD_FILE
+    backend = repo / backend_name
     runtime = repo / COMPOSE_RUNTIME_FILE
     if backend.is_file() and runtime.is_file():
         # The versioned backend-build overlay is the direct topology.  It is
@@ -824,8 +856,28 @@ def _mount_targets(service: Mapping[str, object]) -> set[str]:
     return result
 
 
-def _prepare_override(service: Mapping[str, object]) -> list[str]:
+def _prepare_override(service: Mapping[str, object], source_mode: str = "archive") -> list[str]:
     tokens = _service_tokens(service)
+    if source_mode == "live-shadow-v1":
+        expected_tokens = {
+            "prepare", "--manifest", "/input/manifest.json", "--source-root",
+            "/opt/fullmag/source", "--git-common-root", "/opt/fullmag/source-git",
+            "--output", "/opt/fullmag/package", "--build-root", "/build",
+        }
+        if expected_tokens.issubset(set(tokens)):
+            # The live overlay owns the complete worker command.  Keep the
+            # host override empty when Compose has resolved that contract.
+            mounts = _mount_targets(service)
+            if {"/input/manifest.json", "/opt/fullmag/source-git"}.issubset(mounts):
+                return []
+        return [
+            "prepare",
+            "--manifest", "/input/manifest.json",
+            "--source-root", "/opt/fullmag/source",
+            "--git-common-root", "/opt/fullmag/source-git",
+            "--output", "/opt/fullmag/package",
+            "--build-root", "/build",
+        ]
     expected = {"/input/backend-source.tar", "/input/manifest.json"}
     output_targets = {"/output", "/opt/fullmag/package"}
     if "prepare" in tokens and expected.issubset(set(tokens)) and output_targets.intersection(tokens):
@@ -1018,14 +1070,19 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
                  image_id: str, toolchain_id: str, cache: Mapping[str, object],
                  base_reference: str, cargo_profile: str) -> dict[str, str]:
     cargo_profile = _validate_cargo_profile(cargo_profile)
-    archive = Path(str(source_bundle["archive_path"]))
     manifest = Path(str(source_bundle["manifest_path"]))
+    source_mode = str(source_bundle.get("source_mode", "archive"))
+    if source_mode not in {"archive", "commit", "snapshot", "live-shadow-v1"}:
+        raise _fail(f"unsupported backend source mode: {source_mode}")
     state = run_root / "state"
     state.mkdir(exist_ok=True)
     (run_root / "host-certificate.json").touch(exist_ok=True)
     (run_root / "provenance.json").touch(exist_ok=True)
     (run_root / "development-inputs.json").touch(exist_ok=True)
     package.mkdir(exist_ok=True)
+    compose_project = _compose_identity(layout)["project_name"]
+    workspace_state_root = _workspace_state_root(layout, compose_project)
+    build_state_root = _backend_build_state_root(layout, run_root)
     environment = {
         **_compose_identity_environment(layout),
         "FULLMAG_DEV_IMAGE": image_ref,
@@ -1035,7 +1092,6 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
         "FULLMAG_TOOLCHAIN_IMAGE_ID": toolchain_id,
         "FULLMAG_BACKEND_CARGO_PROFILE": cargo_profile,
         "FULLMAG_SOURCE_ROOT": str(selected),
-        "FULLMAG_BACKEND_SOURCE_TAR": str(archive),
         "FULLMAG_BACKEND_SOURCE_MANIFEST": str(manifest),
         "FULLMAG_BACKEND_PACKAGE": str(package),
         "FULLMAG_DEVELOPMENT_BASE_IMAGE": base_reference,
@@ -1048,6 +1104,8 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
         "FULLMAG_BUILD_ROOT": str(layout["build_root"]),
         "FULLMAG_CACHE_ROOT": str(layout["cache_root"]),
         "FULLMAG_RUNTIME_ROOT": str(layout["runtime_root"]),
+        "FULLMAG_WORKSPACE_STATE_ROOT": str(workspace_state_root),
+        "FULLMAG_BACKEND_BUILD_STATE_ROOT": str(build_state_root),
         "FULLMAG_CARGO_TARGET_DIR": "/build/workspace/.fullmag-build/cargo-targets/direct",
         "FULLMAG_CARGO_TARGET_ROOT": "/build/workspace/.fullmag-build/cargo-targets",
         "CARGO_TARGET_DIR": "/build/workspace/.fullmag-build/cargo-targets/direct",
@@ -1058,14 +1116,24 @@ def _environment(layout: Mapping[str, object], selected: Path, run_root: Path,
     # Keep the source/package identities after the helper environment so the
     # backend-build overlay cannot accidentally inherit a stale host setting.
     environment.update({
-        "FULLMAG_BACKEND_SOURCE_TAR": str(archive),
         "FULLMAG_BACKEND_SOURCE_MANIFEST": str(manifest),
         "FULLMAG_BACKEND_PACKAGE": str(package),
         "FULLMAG_SOURCE_ROOT": str(selected),
         "FULLMAG_RUNTIME_IMAGE_ID": image_id,
         "FULLMAG_TOOLCHAIN_IMAGE_ID": toolchain_id,
         "FULLMAG_BACKEND_CARGO_PROFILE": cargo_profile,
+        # Reassert the validated roots after cache overlay interpolation so a
+        # stale helper environment cannot redirect the build into history.
+        "FULLMAG_WORKSPACE_STATE_ROOT": str(workspace_state_root),
+        "FULLMAG_BACKEND_BUILD_STATE_ROOT": str(build_state_root),
     })
+    if source_mode != "live-shadow-v1":
+        environment["FULLMAG_BACKEND_SOURCE_TAR"] = str(source_bundle["archive_path"])
+    else:
+        git_common = source_bundle.get("git_common_dir")
+        if not isinstance(git_common, str) or not git_common:
+            raise _fail("live backend source bundle has no Git common directory")
+        environment["FULLMAG_SOURCE_GIT_COMMON"] = git_common
     return environment
 
 
@@ -1089,16 +1157,25 @@ def _validate_prepare_receipt(package: Path, source_bundle: Mapping[str, object]
     source = receipt.get("source")
     if not isinstance(source, dict):
         raise _fail("backend build receipt has no source identity")
-    for key, expected in (
+    source_mode = str(source_bundle.get("source_mode", "archive"))
+    expected_mode = "live-shadow-v1" if source_mode == "live-shadow-v1" else "archive"
+    if source.get("source_mode") != expected_mode:
+        raise _fail("backend build receipt source mode differs")
+    expected_fields = [
         ("source_digest", source_bundle.get("source_digest")),
         ("resolved_commit", source_bundle.get("resolved_commit")),
-        ("source_tar_sha256", source_bundle.get("archive_sha256")),
-    ):
+        ("source_snapshot_sha256", source_bundle.get("source_snapshot_sha256")),
+    ]
+    if expected_mode == "live-shadow-v1":
+        expected_fields.append(("live_manifest_sha256", source_bundle.get("live_manifest_sha256")))
+    else:
+        expected_fields.append(("source_tar_sha256", source_bundle.get("archive_sha256")))
+    for key, expected in expected_fields:
         if source.get(key) != expected:
             raise _fail(f"backend build receipt source identity differs: {key}")
     native = receipt.get("native_source_identity")
     if native != source_bundle.get("native_source_identity"):
-        raise _fail("backend build receipt native source identity differs from the archive")
+        raise _fail("backend build receipt native source identity differs from the source bundle")
     toolchain = receipt.get("toolchain")
     if not isinstance(toolchain, dict) or toolchain.get("image_id") != toolchain_id:
         raise _fail("backend build receipt toolchain image identity differs")
@@ -1144,26 +1221,26 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
             or build.get("cargo_profile") != expected_cargo_profile
             or build.get("cargo_target_profile_dir") != expected_cargo_profile):
         raise _fail("backend build receipt profile changed while assembling provenance")
+    source_mode = str(source_bundle.get("source_mode", "snapshot"))
     assembly = {
         "schema": "fullmag.docker-all-image.v1",
         "state": "succeeded",
         "exit_code": 0,
         "qualification": "NOT VERIFIED",
         "build_kind": "direct-compose",
-        "direct_source_provenance": "fullmag.docker-backend-source.v1",
+        "direct_source_provenance": (
+            "fullmag.docker-backend-live-source.v1"
+            if source_mode == "live-shadow-v1"
+            else "fullmag.docker-backend-source.v1"
+        ),
         "direct_build_id": run_id,
         "commit": source_commit,
-        "source_mode": str(source_bundle.get("source_mode", "snapshot")),
+        "source_mode": source_mode,
         "source_root": str(selected),
         "source_digest": str(source_bundle["source_digest"]),
         "source_snapshot_sha256": str(source_bundle["source_snapshot_sha256"]),
         "native_source_identity": source_bundle["native_source_identity"],
-        "source_archive": {
-            "path": str(source_bundle["archive_path"]),
-            "manifest_path": str(source_bundle["manifest_path"]),
-            "sha256": str(source_bundle["archive_sha256"]),
-            "bytes": source_bundle["archive_bytes"],
-        },
+        "source_manifest": str(source_bundle["manifest_path"]),
         # Keep the final runtime image separate from the immutable toolchain
         # base.  The runtime launcher consumes image_id; base_image is the
         # provenance identity passed as the toolchain image to Compose.
@@ -1191,6 +1268,16 @@ def _assembly(layout: Mapping[str, object], run_id: str, run_root: Path,
         "output": str(run_root),
         "context": str(context),
     }
+    if source_mode == "live-shadow-v1":
+        assembly["live_manifest_sha256"] = str(source_bundle["live_manifest_sha256"])
+        assembly["source_git_common_dir"] = str(source_bundle["git_common_dir"])
+    else:
+        assembly["source_archive"] = {
+            "path": str(source_bundle["archive_path"]),
+            "manifest_path": str(source_bundle["manifest_path"]),
+            "sha256": str(source_bundle["archive_sha256"]),
+            "bytes": source_bundle["archive_bytes"],
+        }
     receipt_path = validate_path(run_root / "assembly.json", Path(str(layout["build_storage_root"])), "direct assembly receipt")
     atomic_json(receipt_path, assembly)
     # The runtime binds this exact receipt as /opt/fullmag/provenance.json.
@@ -1261,7 +1348,7 @@ def _compose_stop_hint(container_ids: Sequence[str]) -> str:
     return "docker stop " + " ".join(container_ids)
 
 
-def _assert_no_running_fullmag(project: str) -> None:
+def _assert_no_running_fullmag(project: str, source_identity: Mapping[str, object]) -> None:
     """Reject all stale containers/networks for the selected Compose group.
 
     The historical helper name is retained for callers, but the admission
@@ -1271,9 +1358,21 @@ def _assert_no_running_fullmag(project: str) -> None:
 
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project):
         raise _fail("Invalid Compose project name")
-    from docker_compose_identity import compose_network_name
+    from docker_compose_identity import compose_network_name, source_labels
 
-    network_name = compose_network_name(project)
+    if not isinstance(source_identity, Mapping):
+        raise _fail("Resolved Compose source identity is required for network admission")
+    if source_identity.get("project_name") != project:
+        raise _fail("Compose source identity does not match the selected project")
+    network_name = source_identity.get("network_name")
+    if (not isinstance(network_name, str)
+            or network_name != compose_network_name(project)):
+        raise _fail("Compose source identity has an invalid network name")
+    try:
+        expected_labels = source_labels(source_identity)
+    except (TypeError, ValueError) as error:
+        raise _fail(f"Compose source identity labels are invalid: {error}") from error
+
     container_ids: set[str] = set()
     for label in ("com.docker.compose.project", "org.fullmag.compose.project"):
         raw = _docker_capture(
@@ -1317,22 +1416,33 @@ def _assert_no_running_fullmag(project: str) -> None:
         raise
     if not isinstance(documents, list) or len(documents) != len(ordered_networks):
         raise _fail("Docker network identity inspection returned an incomplete document")
+    if len(documents) != 1:
+        raise _fail("More than one Fullmag project network matches the selected source")
     names = []
     for document in documents:
         if not isinstance(document, dict):
             raise _fail("Docker network identity inspection returned an invalid document")
+        if document.get("Name") != network_name:
+            raise _fail("Fullmag network name differs from the selected source checkout")
+        if document.get("Driver") != "bridge" or document.get("Scope") != "local":
+            raise _fail("Fullmag network driver or scope differs from the selected Compose network")
+        containers = document.get("Containers")
+        if not isinstance(containers, dict) or containers:
+            raise _fail("Fullmag project network has attached containers")
         labels = document.get("Labels")
-        if not isinstance(labels, dict) or not any(
-            labels.get(label) == project
-            for label in ("com.docker.compose.project", "org.fullmag.compose.project")
-        ):
+        if not isinstance(labels, dict):
             raise _fail("Docker network identity labels could not be verified")
+        if any(labels.get(key) != value for key, value in expected_labels.items()):
+            raise _fail("Docker network source labels do not match the selected checkout")
+        if (labels.get("com.docker.compose.project") != project
+                or labels.get("com.docker.compose.network") != "fullmag"):
+            raise _fail("Docker Compose network ownership labels could not be verified")
         names.append(str(document.get("Name") or document.get("Id") or "<unknown>"))
-    raise _fail(
-        "Fullmag Docker project network identity already exists for " + project
-        + " (" + ", ".join(names)
-        + "); remove the stale network explicitly before `up`"
-    )
+    # A build may legitimately leave this exact, empty Compose bridge behind.
+    # It is safe to reuse only after every identity and ownership field above
+    # has matched; any endpoint or foreign label failed closed earlier.
+    if names:
+        return
 
 
 def _frozen_source_bundle(manifest_path: Path, layout: Mapping[str, object], selected: Path) -> dict[str, object]:
@@ -1463,6 +1573,8 @@ def build(args: argparse.Namespace) -> Path:
         # Resolve the existing versioned development image before creating any
         # backend cache.  A missing image is built by compose.dev's dedicated
         # Dockerfile.backend; it is never fetched implicitly from a registry.
+        workspace_state_root = _workspace_state_root(layout, compose_project)
+        build_state_root = _backend_build_state_root(layout, run_root)
         placeholder_environment = {
             **_compose_identity_environment(layout),
             "FULLMAG_DEV_IMAGE": args.image or os.environ.get("FULLMAG_DEV_IMAGE", DEFAULT_IMAGE),
@@ -1478,6 +1590,8 @@ def build(args: argparse.Namespace) -> Path:
             "FULLMAG_BACKEND_SOURCE_TAR": str(run_root / "placeholder-source.tar"),
             "FULLMAG_BACKEND_SOURCE_MANIFEST": str(run_root / "placeholder-source-manifest.json"),
             "FULLMAG_STATE_ROOT": str(run_root / "state"),
+            "FULLMAG_WORKSPACE_STATE_ROOT": str(workspace_state_root),
+            "FULLMAG_BACKEND_BUILD_STATE_ROOT": str(build_state_root),
             "FULLMAG_HOST_CERTIFICATE": str(run_root / "host-certificate.json"),
             "FULLMAG_PACKAGE_PROVENANCE": str(run_root / "provenance.json"),
             "FULLMAG_DEVELOPMENT_INPUTS": str(run_root / "development-inputs.json"),
@@ -1511,11 +1625,33 @@ def build(args: argparse.Namespace) -> Path:
         )
         _write_json(run_root / "receipt.json", terminal)
 
-        from docker_backend_inputs import capture_backend_source
+        from docker_backend_inputs import capture_backend_live_manifest, capture_backend_source
 
         if frozen_bundle is not None:
             source_bundle = frozen_bundle
-            terminal["source_input_policy"] = "explicit_frozen_inputs; later checkout edits not included"
+            terminal.update(
+                source_mode="archive",
+                source_input_policy="explicit_frozen_inputs; later checkout edits not included",
+                source_digest=source_bundle["source_digest"],
+                source_archive_sha256=source_bundle["archive_sha256"],
+                source_manifest=str(source_bundle["manifest_path"]),
+            )
+        elif build_profile == "dev":
+            source_bundle = capture_backend_live_manifest(
+                repo,
+                source_root=selected,
+                output_dir=run_root / "source",
+                capture_id=run_id,
+                profile=STORAGE_PROFILE,
+                include_untracked=tuple(args.include_untracked),
+                require_windows=True,
+            )
+            terminal.update(
+                source_mode="live-shadow-v1",
+                source_digest=source_bundle["source_digest"],
+                live_manifest_sha256=source_bundle["live_manifest_sha256"],
+                source_manifest=str(source_bundle["manifest_path"]),
+            )
         else:
             source_bundle = capture_backend_source(
                 repo,
@@ -1527,15 +1663,21 @@ def build(args: argparse.Namespace) -> Path:
                 profile=STORAGE_PROFILE,
                 require_windows=True,
             )
-        terminal.update(
-            source_digest=source_bundle["source_digest"],
-            source_archive_sha256=source_bundle["archive_sha256"],
-            source_manifest=str(source_bundle["manifest_path"]),
-        )
+            terminal.update(
+                source_mode="archive",
+                source_digest=source_bundle["source_digest"],
+                source_archive_sha256=source_bundle["archive_sha256"],
+                source_manifest=str(source_bundle["manifest_path"]),
+            )
         _write_json(run_root / "receipt.json", terminal)
         package = run_root / "package"
         cache = _prepare_backend_cache(layout, repo, image_id, run_root, selected, toolchain_id)
-        files = _direct_compose_files(repo, cache)
+        compose_source_mode = (
+            "live-shadow-v1"
+            if source_bundle.get("source_mode") == "live-shadow-v1"
+            else "archive"
+        )
+        files = _direct_compose_files(repo, cache, source_mode=compose_source_mode)
         environment = _environment(
             layout, selected, run_root, source_bundle, package, image_ref, image_id, toolchain_id, cache,
             str(base_info["reference"]),
@@ -1546,13 +1688,17 @@ def build(args: argparse.Namespace) -> Path:
         if not isinstance(backend, dict):
             raise _fail("direct Compose backend service is malformed")
         mount_targets = _mount_targets(backend)
-        required_mounts = {"/input/backend-source.tar", "/input/manifest.json", "/build"}
+        required_mounts = {"/input/manifest.json", "/build"}
+        if compose_source_mode == "live-shadow-v1":
+            required_mounts.update({"/opt/fullmag/source", "/opt/fullmag/source-git"})
+        else:
+            required_mounts.add("/input/backend-source.tar")
         missing_mounts = required_mounts - mount_targets
         if "/opt/fullmag/package" not in mount_targets:
             missing_mounts.add("/opt/fullmag/package")
         if missing_mounts:
             raise _fail("direct backend Compose service misses mounts: " + ", ".join(sorted(missing_mounts)))
-        override = _prepare_override(backend)
+        override = _prepare_override(backend, compose_source_mode)
         command = [
             *_compose_prefix(repo, files, compose_project),
             "run", "--rm", "--no-deps", "--name", "fullmag-backend-build-" + run_id[:16],
@@ -1607,12 +1753,13 @@ def up(args: argparse.Namespace) -> None:
     _require_native_windows()
     repo = Path(args.repo_root).resolve(strict=True)
     selected, layout = _select_source(repo, args.source_root)
-    compose_project = _compose_identity(layout)["project_name"]
-    _assert_no_running_fullmag(compose_project)
+    source_identity = _compose_identity(layout)
+    compose_project = source_identity["project_name"]
+    _assert_no_running_fullmag(compose_project, source_identity)
     from fullmag_docker_runtime import assert_loopback_port_available, start
     assert_loopback_port_available(args.port, compose_project)
     assembly_receipt = build(args)
-    _assert_no_running_fullmag(compose_project)
+    _assert_no_running_fullmag(compose_project, source_identity)
     # Keep startup_script opaque to this launcher.  The existing startup helper
     # performs the path admission, source containment, hash, and wait_for_solve
     # policy checks against the same selected live checkout.

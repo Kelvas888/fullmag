@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Direct Compose builder and server for the all-in-one backend image.
 
-The host submits an immutable source capsule and an attested manifest.  This
-entrypoint materializes the capsule in the image-owned build volume, invokes
-the repository Make target with the complete CUDA/FEM feature set, and
-publishes one package receipt.  The server only consumes a receipt-validated
-package and then hands process ownership to the existing all-in-one
-entrypoint.
+The host submits either the existing immutable source archive or an attested
+compact live-source manifest.  This entrypoint materializes the selected
+contract in the image-owned build volume, synchronizes live inputs into an
+immutable shadow when requested, invokes the repository Make target with the
+complete CUDA/FEM feature set, and publishes one package receipt.  The server
+only consumes a receipt-validated package and then hands process ownership to
+the existing all-in-one entrypoint.
 
 This command deliberately has no public build-command option.  The source
-archive is data, never a shell script supplied by the caller, and the only
+contract is data, never a shell script supplied by the caller, and the only
 native build command is the canonical ``make install-cli-dev`` or ``make install-cli`` target selected by the validated Cargo profile.
 """
 
@@ -42,6 +43,8 @@ from backend_source import (
 
 
 RECEIPT_SCHEMA = "fullmag.direct-compose.backend-build-receipt.v1"
+LIVE_MANIFEST_SCHEMA = "fullmag.docker-backend-live-source.v1"
+LIVE_SOURCE_MODE = "live-shadow-v1"
 BACKEND_CARGO_PROFILE = "backend-dev"
 SUPPORTED_CARGO_PROFILES = frozenset({"backend-dev", "release"})
 
@@ -49,6 +52,8 @@ MAX_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_SOURCE_BYTES = 16 * 1024 * 1024 * 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{40}$")
+CAPTURE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
 
 BUILD_ROOT = Path("/build")
 OUTPUT_ROOT = Path("/output")
@@ -58,6 +63,23 @@ WORKSPACE_INVENTORY_SCHEMA = "fullmag.direct-compose.workspace-inventory.v1"
 RUNTIME_LOCK_NAME = ".fullmag-backend-runtime.lock"
 PERSISTENT_WORKSPACE_DIRS = frozenset(
     {".fullmag-build", ".fullmag-cargo", ".fullmag-rustup"}
+)
+# Only these children are produced by the canonical Make install targets.
+# The .fullmag root itself is retained across retries so an unexpected entry
+# cannot be silently discarded as disposable build output.
+OWNED_GENERATED_OUTPUT_DIRS = frozenset({"local", "runtimes"})
+# Keep the worker-side source policy in lockstep with local_runner.source.
+# String exclusions disclose omitted safe paths (for example ordinary
+# untracked files); gitlink disclosures are restricted to this exact set.
+ALLOWED_EXTERNAL_SOLVER_GITLINKS = frozenset(
+    {
+        "external_solvers/3",
+        "external_solvers/amumax",
+        "external_solvers/neuralmag",
+        "external_solvers/oommf",
+        "external_solvers/plus",
+        "external_solvers/tetmag",
+    }
 )
 
 # ``install-cli-dev`` emits one CUDA-capable binary.  Runtime execution
@@ -310,7 +332,7 @@ def _workspace_tree_inventory(workspace: Path) -> tuple[dict[str, Path], set[str
                 _fail(f"backend workspace contains a special file: {child}")
 
     for child in tuple(workspace.iterdir()):
-        if child.name in PERSISTENT_WORKSPACE_DIRS or child.name == OWNER_MARKER:
+        if child.name in PERSISTENT_WORKSPACE_DIRS or child.name in {OWNER_MARKER, ".fullmag"}:
             metadata = child.lstat()
             if child.name in PERSISTENT_WORKSPACE_DIRS and (
                 stat.S_ISLNK(metadata.st_mode)
@@ -318,6 +340,12 @@ def _workspace_tree_inventory(workspace: Path) -> tuple[dict[str, Path], set[str
                 or not stat.S_ISDIR(metadata.st_mode)
             ):
                 _fail(f"persistent workspace mount is unsafe: {child}")
+            if child.name == ".fullmag" and (
+                stat.S_ISLNK(metadata.st_mode)
+                or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+                or not stat.S_ISDIR(metadata.st_mode)
+            ):
+                _fail(f"generated build output root is unsafe: {child}")
             continue
         metadata = child.lstat()
         if stat.S_ISLNK(metadata.st_mode) or bool(
@@ -371,17 +399,448 @@ def _source_manifest_inventory(capsule: Mapping[str, Any]) -> dict[str, dict[str
     return inventory
 
 
+
+def _validate_native_identity(value: object, resolved_commit: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        _fail("live manifest native_source_identity must be an object")
+    if value.get("schema") != "fullmag.source-snapshot.v2":
+        _fail("live manifest native identity schema is unsupported")
+    if value.get("head_commit_full") != resolved_commit:
+        _fail("live manifest native source commit differs from its manifest")
+    for name in ("head_tree_sha256", "dirty_content_sha256", "source_snapshot_sha256"):
+        value_for_name = value.get(name)
+        if not isinstance(value_for_name, str) or not SHA256_RE.fullmatch(value_for_name):
+            _fail(f"live manifest native identity field is invalid: {name}")
+    if type(value.get("source_snapshot_dirty")) is not bool or type(value.get("ignored_non_runtime_dirty")) is not bool:
+        _fail("live manifest native dirty flags are invalid")
+    if not isinstance(value.get("git_status_porcelain_v1"), list) or not isinstance(value.get("dirty_path_content"), list):
+        _fail("live manifest native status fields are invalid")
+    return dict(value)
+
+
+def _validate_source_relative_path(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        _fail(f"{label} is not a safe relative source path")
+    relative = PurePosixPath(value)
+    if relative.is_absolute() or relative.as_posix() != value or any(part in {"", ".", ".."} for part in relative.parts):
+        _fail(f"{label} escapes the source root: {value!r}")
+    return value
+
+
+def _validate_live_capsule_classes(capsule: Mapping[str, Any], files: Mapping[str, Any]) -> None:
+    file_paths = set(files)
+    classes: dict[str, set[str]] = {}
+    for field in ("deleted", "included_untracked"):
+        raw = capsule.get(field)
+        if not isinstance(raw, list):
+            _fail(f"live source capsule field is invalid: {field}")
+        checked = [_validate_source_relative_path(item, f"live source capsule {field}") for item in raw]
+        if checked != sorted(set(checked)):
+            _fail(f"live source capsule field is not canonically sorted: {field}")
+        classes[field] = set(checked)
+    if (
+        not classes["included_untracked"] <= file_paths
+        or classes["deleted"] & file_paths
+        or classes["deleted"] & classes["included_untracked"]
+    ):
+        _fail("live source capsule path classes overlap")
+    raw_excluded = capsule.get("excluded")
+    if not isinstance(raw_excluded, list):
+        _fail("live source capsule excluded field is invalid")
+    for item in raw_excluded:
+        if isinstance(item, str):
+            path = _validate_source_relative_path(item, "live source capsule exclusion")
+            if any(
+                file_path == path or file_path.startswith(path + "/")
+                for file_path in file_paths
+            ):
+                _fail(f"live source capsule exclusion overlaps a source file: {path}")
+        elif isinstance(item, dict):
+            path = _validate_source_relative_path(item.get("path"), "live source capsule Gitlink exclusion")
+            if (
+                path not in ALLOWED_EXTERNAL_SOLVER_GITLINKS
+                or item.get("type") != "gitlink"
+                or not isinstance(item.get("pinned_commit"), str)
+                or not re.fullmatch(r"[0-9a-f]{40}", item["pinned_commit"])
+            ):
+                _fail(f"live source capsule Gitlink exclusion is invalid: {path}")
+        else:
+            _fail("live source capsule exclusion is invalid")
+
+
+def _source_manifest_digest(capsule: Mapping[str, Any]) -> str:
+    try:
+        material = {
+            "schema_version": capsule["schema_version"],
+            "source_mode": capsule["source_mode"],
+            "resolved_commit": capsule["resolved_commit"],
+            "files": capsule["files"],
+            "deleted": capsule["deleted"],
+            "included_untracked": capsule["included_untracked"],
+            "excluded": capsule["excluded"],
+        }
+    except KeyError as error:
+        _fail(f"live source manifest is missing {error.args[0]}")
+    return _sha256_bytes(_canonical(material))
+
+
+def _validate_live_manifest(document: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, str], str]:
+    if document.get("schema") != LIVE_MANIFEST_SCHEMA or document.get("source_mode") != LIVE_SOURCE_MODE:
+        _fail("source manifest is not a live-shadow manifest")
+    required = {
+        "schema", "capture_id", "source_mode", "source_root", "git_common_dir",
+        "resolved_commit", "source_digest", "source_snapshot_sha256",
+        "native_source_identity", "source_manifest", "source_manifest_sha256",
+        "git_object_ids", "created_at", "live_manifest_sha256",
+    }
+    if set(document) != required:
+        _fail("live source manifest fields are incomplete or unexpected")
+    capture_id = document.get("capture_id")
+    if not isinstance(capture_id, str) or not CAPTURE_ID_RE.fullmatch(capture_id):
+        _fail("live source manifest capture id is invalid")
+    if not isinstance(document.get("source_root"), str) or not document["source_root"]:
+        _fail("live source manifest source_root is invalid")
+    if not isinstance(document.get("git_common_dir"), str) or not document["git_common_dir"]:
+        _fail("live source manifest git_common_dir is invalid")
+    resolved_commit = document.get("resolved_commit")
+    if not isinstance(resolved_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", resolved_commit):
+        _fail("live source manifest resolved_commit is invalid")
+    capsule_value = document.get("source_manifest")
+    if not isinstance(capsule_value, dict):
+        _fail("live source manifest source_manifest is not an object")
+    capsule = dict(capsule_value)
+    if capsule.get("schema") != "fullmag.source-capsule.v1" or capsule.get("schema_version") != "fullmag.source-capsule.v1":
+        _fail("live source capsule schema is unsupported")
+    if capsule.get("source_mode") != "snapshot" or capsule.get("resolved_commit") != resolved_commit:
+        _fail("live source capsule is not the requested snapshot")
+    for field in ("deleted", "included_untracked", "excluded"):
+        if not isinstance(capsule.get(field), list):
+            _fail(f"live source capsule field is invalid: {field}")
+    files = _source_manifest_inventory(capsule)
+    _validate_live_capsule_classes(capsule, files)
+    source_digest = capsule.get("source_digest")
+    if not isinstance(source_digest, str) or not SHA256_RE.fullmatch(source_digest) or source_digest != _source_manifest_digest(capsule):
+        _fail("live source capsule digest does not match its content")
+    if document.get("source_digest") != source_digest:
+        _fail("live source manifest source digest differs from its capsule")
+    nested_hash = _sha256_bytes(_canonical(capsule))
+    if document.get("source_manifest_sha256") != nested_hash:
+        _fail("live source manifest capsule hash differs")
+    native = _validate_native_identity(document.get("native_source_identity"), resolved_commit)
+    if document.get("source_snapshot_sha256") != native["source_snapshot_sha256"]:
+        _fail("live source manifest native snapshot differs")
+    raw_git_objects = document.get("git_object_ids")
+    if not isinstance(raw_git_objects, dict):
+        _fail("live source manifest git_object_ids is not an object")
+    git_objects: dict[str, str] = {}
+    for relative, object_id in raw_git_objects.items():
+        _validate_source_relative_path(relative, "live source Git object path")
+        if relative not in files or not isinstance(object_id, str) or not GIT_OBJECT_RE.fullmatch(object_id):
+            _fail(f"live source manifest Git object disclosure is invalid: {relative}")
+        git_objects[relative] = object_id
+    unsigned = dict(document)
+    live_digest = unsigned.pop("live_manifest_sha256", None)
+    if not isinstance(live_digest, str) or not SHA256_RE.fullmatch(live_digest) or live_digest != _sha256_bytes(_canonical(unsigned)):
+        _fail("live source manifest digest does not match its bytes")
+    return capsule, native, git_objects, live_digest
+
+
+def _read_git_blobs(git_common_root: Path, object_ids: Mapping[str, str]) -> dict[str, bytes]:
+    """Read all sparse checkout fallbacks through one Git batch process."""
+
+    if not object_ids:
+        return {}
+    git_common_root = _absolute(git_common_root, "source Git common root")
+    _assert_no_links(git_common_root, "source Git common root")
+    unique_ids = tuple(dict.fromkeys(object_ids.values()))
+    if any(not GIT_OBJECT_RE.fullmatch(object_id) for object_id in unique_ids):
+        _fail("source Git object id is invalid")
+    environment = os.environ.copy()
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        process = subprocess.Popen(
+            ("git", "--git-dir", str(git_common_root), "cat-file", "--batch"),
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        _fail(f"cannot read sparse source Git objects: {error}")
+    assert process.stdin is not None and process.stdout is not None
+    by_object: dict[str, bytes] = {}
+    try:
+        for object_id in unique_ids:
+            process.stdin.write((object_id + "\n").encode("ascii"))
+            process.stdin.flush()
+            header = process.stdout.readline().rstrip(b"\n").split(b" ")
+            if len(header) != 3 or header[0].decode("ascii", "replace") != object_id:
+                _fail("source Git object response is malformed")
+            if header[1] != b"blob":
+                _fail("source Git object is not a blob")
+            try:
+                size = int(header[2])
+            except ValueError:
+                _fail("source Git object size is invalid")
+            if size < 0 or size > MAX_SOURCE_BYTES:
+                _fail("source Git object exceeds its size bound")
+            content = process.stdout.read(size)
+            if len(content) != size or process.stdout.read(1) != b"\n":
+                _fail("source Git object is truncated")
+            by_object[object_id] = content
+    except BaseException:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait()
+        raise
+    finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+        process.stdout.close()
+    assert process.stderr is not None
+    detail = process.stderr.read().decode("utf-8", errors="replace").strip()
+    process.stderr.close()
+    returncode = process.wait()
+    if returncode:
+        _fail(f"source Git object read failed: {detail or 'Git error'}")
+    return {relative: by_object[object_id] for relative, object_id in object_ids.items()}
+
+
+def _live_source_path(source_root: Path, relative: str) -> Path:
+    path = source_root.joinpath(*PurePosixPath(relative).parts)
+    _assert_no_links(path.parent, f"live source parent {relative}")
+    return path
+
+
+def _hash_live_regular(path: Path, relative: str, entry: Mapping[str, Any]) -> None:
+    descriptor = _open_regular(path, f"live source {relative}", MAX_SOURCE_BYTES)
+    try:
+        before = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            total += len(block)
+            digest.update(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if total != entry["size"] or digest.hexdigest() != entry["sha256"] or _file_signature(before) != _file_signature(after):
+        _fail(f"live source changed or differs from manifest: {relative}")
+
+
+def _publish_shadow_bytes(target: Path, data: bytes, mode: int, label: str) -> None:
+    _ensure_directory(target.parent, f"shadow source directory {target.parent}")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    except OSError as error:
+        _fail(f"cannot publish {label}: {error}")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _copy_live_regular_file(source: Path, target: Path, relative: str, entry: Mapping[str, Any]) -> None:
+    _ensure_directory(target.parent, f"shadow source directory {target.parent}")
+    source_descriptor = _open_regular(source, f"live source {relative}", MAX_SOURCE_BYTES)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temporary = Path(temporary_name)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        before = os.fstat(source_descriptor)
+        with os.fdopen(descriptor, "wb") as output:
+            while True:
+                block = os.read(source_descriptor, 1024 * 1024)
+                if not block:
+                    break
+                total += len(block)
+                digest.update(block)
+                output.write(block)
+            output.flush()
+            os.fsync(output.fileno())
+        after = os.fstat(source_descriptor)
+        if total != entry["size"] or digest.hexdigest() != entry["sha256"] or _file_signature(before) != _file_signature(after):
+            _fail(f"live source changed while synchronizing: {relative}")
+        os.chmod(temporary, 0o555 if entry["mode"] == "100755" else 0o444)
+        os.replace(temporary, target)
+    except OSError as error:
+        _fail(f"cannot synchronize live source {entry['path']}: {error}")
+    finally:
+        os.close(source_descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _make_shadow_source_read_only(workspace: Path, expected: Mapping[str, Mapping[str, Any]]) -> None:
+    directories: set[Path] = set()
+    for relative in expected:
+        parts = PurePosixPath(relative).parts
+        directories.update(workspace.joinpath(*parts[:index]) for index in range(1, len(parts)))
+        path = workspace.joinpath(*parts)
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            _fail(f"shadow source entry is unsafe: {relative}")
+        os.chmod(path, 0o555 if expected[relative]["mode"] == "100755" else 0o444)
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        os.chmod(directory, 0o555)
+
+
+def _sync_live_source_tree(
+    source_root: Path,
+    git_common_root: Path,
+    workspace: Path,
+    capsule: Mapping[str, Any],
+    git_object_ids: Mapping[str, str],
+    live_manifest_sha256: str,
+) -> None:
+    source_root = _absolute(source_root, "live source root")
+    _assert_no_links(source_root, "live source root")
+    expected = _source_manifest_inventory(capsule)
+    _remove_generated_build_output(workspace)
+    existing_files, existing_directories = _workspace_tree_inventory(workspace)
+    for relative in existing_directories:
+        if relative.split("/", 1)[0] not in PERSISTENT_WORKSPACE_DIRS:
+            os.chmod(workspace.joinpath(*PurePosixPath(relative).parts), 0o700)
+    expected_directories: set[str] = set()
+    for relative in expected:
+        parts = PurePosixPath(relative).parts
+        expected_directories.update(PurePosixPath(*parts[:index]).as_posix() for index in range(1, len(parts)))
+    if set(expected) & existing_directories or expected_directories & set(existing_files):
+        _fail("live source file/directory transition requires a fresh owned workspace")
+
+    marker_path = workspace / OWNER_MARKER
+    marker, _ = _read_json(marker_path, "backend workspace owner", 16 * 1024)
+    old_digest = marker.get("source_digest")
+    if old_digest is not None and (not isinstance(old_digest, str) or not SHA256_RE.fullmatch(old_digest)):
+        _fail("backend workspace owner source digest is invalid")
+    inventory_schema = marker.get("workspace_inventory_schema")
+    inventory_hash = marker.get("workspace_inventory_sha256")
+    if old_digest is not None and (inventory_schema != WORKSPACE_INVENTORY_SCHEMA or inventory_hash != old_digest):
+        _fail("backend workspace owner inventory binding is invalid")
+    if old_digest is None and (existing_files or existing_directories):
+        _remove_workspace_relative_entries(workspace, existing_files, existing_directories)
+        existing_files, existing_directories = {}, set()
+    new_digest = capsule.get("source_digest")
+    if not isinstance(new_digest, str) or not SHA256_RE.fullmatch(new_digest):
+        _fail("live source capsule digest is invalid")
+    _write_json(marker_path, {
+        "schema": "fullmag.direct-compose.backend-workspace.v1",
+        "state": "preparing",
+        "source_mode": LIVE_SOURCE_MODE,
+        "source_digest": new_digest,
+        "live_manifest_sha256": live_manifest_sha256,
+        "workspace_inventory_schema": WORKSPACE_INVENTORY_SCHEMA,
+        "workspace_inventory_sha256": new_digest,
+    }, "backend workspace owner")
+
+    sparse_object_ids: dict[str, str] = {}
+    for relative, entry in expected.items():
+        target = workspace.joinpath(*PurePosixPath(relative).parts)
+        _ensure_directory(target.parent, f"shadow source directory {target.parent}")
+        existing = existing_files.get(relative)
+        if existing is not None:
+            digest, metadata = _sha256_file(existing, f"shadow source {relative}", MAX_SOURCE_BYTES)
+            if digest == entry["sha256"] and metadata.st_size == entry["size"]:
+                continue
+        source = _live_source_path(source_root, relative)
+        try:
+            source.lstat()
+        except FileNotFoundError:
+            object_id = git_object_ids.get(relative)
+            if object_id is None:
+                _fail(f"live source is missing manifest file: {relative}")
+            sparse_object_ids[relative] = object_id
+        else:
+            _hash_live_regular(source, relative, entry)
+            _copy_live_regular_file(source, target, relative, entry)
+
+    sparse_blobs = _read_git_blobs(git_common_root, sparse_object_ids)
+    for relative, object_id in sparse_object_ids.items():
+        entry = expected[relative]
+        target = workspace.joinpath(*PurePosixPath(relative).parts)
+        content = sparse_blobs[relative]
+        if len(content) != entry["size"] or _sha256_bytes(content) != entry["sha256"]:
+            _fail(f"sparse Git object differs from live source manifest: {relative}")
+        _publish_shadow_bytes(
+            target,
+            content,
+            0o555 if entry["mode"] == "100755" else 0o444,
+            f"sparse source {relative}",
+        )
+
+    stale_files = {relative: path for relative, path in existing_files.items() if relative not in expected}
+    stale_directories = {relative for relative in existing_directories if relative not in expected_directories}
+    _remove_workspace_relative_entries(workspace, stale_files, stale_directories)
+    _make_shadow_source_read_only(workspace, expected)
+    _write_json(marker_path, {
+        "schema": "fullmag.direct-compose.backend-workspace.v1",
+        "state": "ready",
+        "source_mode": LIVE_SOURCE_MODE,
+        "source_digest": new_digest,
+        "live_manifest_sha256": live_manifest_sha256,
+        "workspace_inventory_schema": WORKSPACE_INVENTORY_SCHEMA,
+        "workspace_inventory_sha256": new_digest,
+    }, "backend workspace owner")
+
+
+def _verify_shadow_source(workspace: Path, capsule: Mapping[str, Any]) -> None:
+    expected = _source_manifest_inventory(capsule)
+    files, directories = _workspace_tree_inventory(workspace)
+    source_files = {path: value for path, value in files.items() if not path.startswith(".fullmag/")}
+    source_directories = {path for path in directories if not path.startswith(".fullmag")}
+    expected_directories: set[str] = set()
+    for relative in expected:
+        parts = PurePosixPath(relative).parts
+        expected_directories.update(PurePosixPath(*parts[:index]).as_posix() for index in range(1, len(parts)))
+    if set(source_files) != set(expected) or source_directories != expected_directories:
+        _fail("shadow source inventory changed during Make")
+    for relative, entry in expected.items():
+        digest, metadata = _sha256_file(source_files[relative], f"shadow source {relative}", MAX_SOURCE_BYTES)
+        if digest != entry["sha256"] or metadata.st_size != entry["size"]:
+            _fail(f"shadow source changed during Make: {relative}")
+
 def _remove_generated_build_output(workspace: Path) -> None:
-    """Remove only the owned generated tree before source inventorying.
+    """Remove owned generated children while preserving the output root.
 
     Make publishes package files and native-library aliases below ``.fullmag``.
-    Those aliases are build output, not source inputs.  The owned-tree remover
-    unlinks aliases without following them and rejects special files.
+    Those aliases are build output, not source inputs.  Only the two known
+    Make-owned children are removed; an unexpected child fails closed rather
+    than being treated as disposable user data.
     """
 
     generated = workspace / ".fullmag"
-    if generated.exists() or generated.is_symlink():
-        _remove_owned_tree(generated)
+    if not generated.exists() and not generated.is_symlink():
+        return
+    metadata = generated.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+        or not stat.S_ISDIR(metadata.st_mode)
+    ):
+        _fail(f"generated build output root is unsafe: {generated}")
+    children = tuple(generated.iterdir())
+    unexpected = sorted(
+        child.name for child in children if child.name not in OWNED_GENERATED_OUTPUT_DIRS
+    )
+    if unexpected:
+        _fail(
+            "generated build output contains unowned entries: "
+            + ", ".join(unexpected)
+        )
+    for child in children:
+        _remove_owned_tree(child)
 
 
 def _stage_tree_inventory(stage: Path) -> tuple[set[str], set[str]]:
@@ -690,9 +1149,42 @@ def _remove_extracted_source(path: Path) -> None:
     _remove_owned_tree(path)
 
 
-def _materialize_source(source_tar: Path, manifest_path: Path, build_root: Path) -> tuple[Path, dict[str, Any], dict[str, Any], str, str]:
-    source_tar = _absolute(source_tar, "source archive")
+def _materialize_live_source(
+    manifest_path: Path,
+    source_root: Path,
+    git_common_root: Path,
+    build_root: Path,
+) -> tuple[Path, dict[str, Any], dict[str, Any], str, None, str]:
+    document, manifest_bytes = _read_json(manifest_path, "live source manifest", 64 * 1024 * 1024)
+    capsule, native, git_object_ids, live_manifest_sha256 = _validate_live_manifest(document)
+    manifest_hash = _sha256_bytes(manifest_bytes)
+    workspace = _prepare_workspace(build_root)
+    _sync_live_source_tree(
+        source_root, git_common_root, workspace, capsule, git_object_ids, live_manifest_sha256
+    )
+    after_document, after_bytes = _read_json(manifest_path, "live source manifest", 64 * 1024 * 1024)
+    if after_bytes != manifest_bytes or after_document != document:
+        _fail("live source manifest changed during synchronization")
+    capsule = dict(capsule)
+    capsule["_live_manifest_sha256"] = live_manifest_sha256
+    return workspace, capsule, native, manifest_hash, None, LIVE_SOURCE_MODE
+
+
+def _materialize_source(
+    source_tar: Path | None,
+    manifest_path: Path,
+    build_root: Path,
+    *,
+    source_root: Path,
+    git_common_root: Path,
+) -> tuple[Path, dict[str, Any], dict[str, Any], str, str | None, str]:
     manifest_path = _absolute(manifest_path, "source manifest")
+    document, _manifest_bytes = _read_json(manifest_path, "source manifest", 64 * 1024 * 1024)
+    if document.get("schema") == LIVE_MANIFEST_SCHEMA:
+        return _materialize_live_source(manifest_path, source_root, git_common_root, build_root)
+    if source_tar is None:
+        _fail("archive source manifest requires --source-tar")
+    source_tar = _absolute(source_tar, "source archive")
     document, manifest_bytes = _read_json(manifest_path, "source manifest", 64 * 1024 * 1024)
     capsule_value = document.get("source_manifest")
     native_value = document.get("native_source_identity")
@@ -724,7 +1216,7 @@ def _materialize_source(source_tar: Path, manifest_path: Path, build_root: Path)
         if after_manifest_bytes != manifest_bytes or after_document != document:
             _fail("source manifest changed during extraction")
         _reconcile_source_tree(stage, workspace, capsule, archive_hash)
-        return workspace, capsule, native, manifest_hash, archive_hash
+        return workspace, capsule, native, manifest_hash, archive_hash, "archive"
     finally:
         _remove_extracted_source(stage)
         try:
@@ -1000,8 +1492,13 @@ def _prepare_locked(
     jobs: int,
     toolchain: Mapping[str, Any],
 ) -> int:
-    workspace, capsule, native, manifest_hash, archive_hash = _materialize_source(
-        Path(args.source_tar), Path(args.manifest), build_root
+    source_tar = Path(args.source_tar) if args.source_tar is not None else None
+    workspace, capsule, native, manifest_hash, archive_hash, source_mode = _materialize_source(
+        source_tar,
+        Path(args.manifest),
+        build_root,
+        source_root=Path(args.source_root),
+        git_common_root=Path(args.git_common_root),
     )
     cargo_profile = _validate_cargo_profile(
         os.environ.get("FULLMAG_BACKEND_CARGO_PROFILE", BACKEND_CARGO_PROFILE)
@@ -1014,33 +1511,41 @@ def _prepare_locked(
     return_code = _run_canonical_make(command, workspace, environment, build_log)
     if return_code != 0:
         _fail(f"canonical Make target failed with exit code {return_code}")
+    if source_mode == LIVE_SOURCE_MODE:
+        _verify_shadow_source(workspace, capsule)
     return _publish_completed_build(
-        workspace, output, capsule, native, manifest_hash, archive_hash, toolchain, command,
-        cargo_profile,
+        workspace, output, capsule, native, manifest_hash, archive_hash, source_mode,
+        toolchain, command, cargo_profile,
     )
 
 
 def _publish_completed_build(
     workspace: Path, output: Path, capsule: Mapping[str, Any], native: Mapping[str, Any],
-    manifest_hash: str, archive_hash: str, toolchain: Mapping[str, Any], command: list[str],
+    manifest_hash: str, archive_hash: str | None, source_mode: str,
+    toolchain: Mapping[str, Any], command: list[str],
     cargo_profile: str,
 ) -> int:
     """Publish verified artifacts after the canonical Make invocation succeeded."""
     cargo_profile = _validate_cargo_profile(cargo_profile)
     records = _copy_package(workspace, output)
+    source_record: dict[str, Any] = {
+        "manifest_sha256": manifest_hash,
+        "source_mode": source_mode,
+        "source_snapshot_sha256": native["source_snapshot_sha256"],
+        "source_digest": capsule["source_digest"],
+        "resolved_commit": capsule["resolved_commit"],
+    }
+    if archive_hash is not None:
+        source_record["source_tar_sha256"] = archive_hash
+    else:
+        source_record["live_manifest_sha256"] = capsule.get("_live_manifest_sha256", manifest_hash)
     receipt: dict[str, Any] = {
         "schema": RECEIPT_SCHEMA,
         "state": "succeeded",
         "qualification": "NOT VERIFIED",
         "operation": "direct-compose-build",
         "command": command,
-        "source": {
-            "manifest_sha256": manifest_hash,
-            "source_snapshot_sha256": native["source_snapshot_sha256"],
-            "source_digest": capsule["source_digest"],
-            "resolved_commit": capsule["resolved_commit"],
-            "source_tar_sha256": archive_hash,
-        },
+        "source": source_record,
         "native_source_identity": native,
         "native_source_identity_sha256": _sha256_bytes(_canonical(native)),
         "toolchain": toolchain,
@@ -1115,8 +1620,14 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="operation", required=True)
     for name in ("prepare", "build"):
         subparser = subparsers.add_parser(name, help="build the direct four-lane package")
-        subparser.add_argument("--source-tar", required=True, type=Path)
+        subparser.add_argument("--source-tar", type=Path)
         subparser.add_argument("--manifest", required=True, type=Path)
+        subparser.add_argument("--source-root", default=Path("/opt/fullmag/source"), type=Path)
+        subparser.add_argument(
+            "--git-common-root",
+            default=Path(os.environ.get("FULLMAG_SOURCE_GIT_COMMON", "/opt/fullmag/source-git")),
+            type=Path,
+        )
         subparser.add_argument("--output", default=OUTPUT_ROOT, type=Path)
         subparser.add_argument("--build-root", default=BUILD_ROOT, type=Path)
         subparser.add_argument("--jobs", default=int(os.environ.get("CARGO_BUILD_JOBS", "2")), type=int)

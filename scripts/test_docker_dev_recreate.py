@@ -320,6 +320,7 @@ class DockerDevRecreateContract(unittest.TestCase):
                 Path("/state"),
                 3197,
                 Path("/owned/windows-folder-host.json"),
+                workspace_state_root=Path("/owned/user-data"),
                 repo=Path("/repo"),
                 previous_config_sha256="b" * 64,
             )
@@ -327,6 +328,140 @@ class DockerDevRecreateContract(unittest.TestCase):
             configured["services"]["backend"]["environment"]["FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256"],
             "b" * 64,
         )
+
+    def test_backend_build_environment_uses_validated_userdata_and_scratch_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            storage_root = root / "storage"
+            build_root = storage_root / "build"
+            cache_root = storage_root / "cache"
+            runtime_root = storage_root / "runtime"
+            for path in (storage_root, build_root, cache_root, runtime_root):
+                path.mkdir(parents=True)
+            selected = root / "checkout"
+            selected.mkdir()
+            run_root = build_root / "direct-compose" / ("a" * 32)
+            run_root.mkdir(parents=True)
+            package = run_root / "package"
+            source_manifest = run_root / "source.json"
+            source_archive = run_root / "source.tar"
+            layout = {
+                "storage_root": str(storage_root),
+                "build_root": str(build_root),
+                "build_storage_root": str(build_root),
+                "cache_root": str(cache_root),
+                "runtime_root": str(runtime_root),
+                "repo_root": str(selected),
+                "worktree_id": "worktree-test",
+                "env": {"FULLMAG_PROJECT_ID": "project-test"},
+            }
+            identity = {
+                "project_name": "fullmag-worktree-worktree-test",
+                "network_name": "fullmag-worktree-worktree-test_fullmag",
+                "project_id": "project-test",
+                "worktree_id": "worktree-test",
+                "checkout_kind": "worktree",
+            }
+            source_bundle = {
+                "source_mode": "archive",
+                "manifest_path": str(source_manifest),
+                "archive_path": str(source_archive),
+            }
+            with patch.object(docker_dev, "_compose_identity", return_value=identity):
+                environment = docker_dev._environment(
+                    layout, selected, run_root, source_bundle, package,
+                    "fullmag-dev:local", "sha256:" + "a" * 64,
+                    "sha256:" + "b" * 64, {"environment": {}},
+                    "fullmag/development-base:local", "backend-dev",
+                )
+            expected_user_data = storage_root / "user-data" / identity["project_name"]
+            expected_scratch = run_root / "backend-build-state"
+            self.assertEqual(Path(environment["FULLMAG_WORKSPACE_STATE_ROOT"]), expected_user_data)
+            self.assertEqual(Path(environment["FULLMAG_BACKEND_BUILD_STATE_ROOT"]), expected_scratch)
+            self.assertTrue(expected_user_data.is_dir())
+            self.assertTrue(expected_scratch.is_dir())
+            for filename in ("compose.backend-build.yaml", "compose.backend-build-live.yaml"):
+                overlay = (Path(__file__).resolve().parents[1] / filename).read_text(encoding="utf-8")
+                self.assertIn("FULLMAG_WORKSPACE_STATE_ROOT", overlay)
+                self.assertIn("target: /user-data", overlay)
+                self.assertIn("read_only: true", overlay)
+                self.assertIn("FULLMAG_BACKEND_BUILD_STATE_ROOT", overlay)
+                self.assertIn("target: /state", overlay)
+
+    def test_empty_owned_network_is_reusable_but_foreign_or_attached_is_rejected(self):
+        project = "fullmag-worktree-network-test"
+        identity = {
+            "project_name": project,
+            "network_name": project + "_fullmag",
+            "project_id": "project-test",
+            "worktree_id": "worktree-test",
+            "checkout_kind": "worktree",
+        }
+        network_id = "a" * 64
+        labels = {
+            "org.fullmag.source.project-id": identity["project_id"],
+            "org.fullmag.source.worktree-id": identity["worktree_id"],
+            "org.fullmag.source.checkout-kind": identity["checkout_kind"],
+            "org.fullmag.compose.project": project,
+            "com.docker.compose.project": project,
+            "com.docker.compose.network": "fullmag",
+        }
+        document = {
+            "Name": identity["network_name"],
+            "Id": network_id,
+            "Driver": "bridge",
+            "Scope": "local",
+            "Containers": {},
+            "Labels": labels,
+        }
+
+        def fake_docker(*args, **kwargs):
+            if args and args[0] == "ps":
+                return ""
+            if args[:2] == ("network", "ls"):
+                return network_id
+            if args[:2] == ("network", "inspect"):
+                return json.dumps([document])
+            raise AssertionError(f"unexpected Docker read: {args}")
+
+        with patch.object(docker_dev, "_docker_capture", side_effect=fake_docker):
+            docker_dev._assert_no_running_fullmag(project, identity)
+            document["Containers"] = {"endpoint": {}}
+            with self.assertRaisesRegex(docker_dev.DirectDockerError, "attached containers"):
+                docker_dev._assert_no_running_fullmag(project, identity)
+            document["Containers"] = {}
+            document["Labels"] = {**labels, "org.fullmag.source.worktree-id": "foreign"}
+            with self.assertRaisesRegex(docker_dev.DirectDockerError, "source labels"):
+                docker_dev._assert_no_running_fullmag(project, identity)
+
+    def test_up_passes_resolved_source_identity_to_both_network_fences(self):
+        repo = Path(__file__).resolve().parents[1]
+        layout = {"repo_root": str(repo)}
+        identity = {
+            "project_name": "fullmag-worktree-network-test",
+            "network_name": "fullmag-worktree-network-test_fullmag",
+            "project_id": "project-test",
+            "worktree_id": "worktree-test",
+            "checkout_kind": "worktree",
+        }
+        args = types.SimpleNamespace(
+            repo_root=repo,
+            source_root=None,
+            port=3197,
+            script=None,
+        )
+        calls = []
+        with patch.object(docker_dev, "_require_native_windows"), \
+                patch.object(docker_dev, "_select_source", return_value=(repo, layout)), \
+                patch.object(docker_dev, "_compose_identity", return_value=identity), \
+                patch.object(docker_dev, "_assert_no_running_fullmag", side_effect=lambda *value: calls.append(value)), \
+                patch.object(docker_dev, "_docker_capture", return_value=""), \
+                patch.object(docker_dev, "build", return_value=repo / "assembly.json"), \
+                patch.object(runtime, "assert_loopback_port_available"), \
+                patch.object(runtime, "start"):
+            docker_dev.up(args)
+        self.assertEqual(calls, [(identity["project_name"], identity),
+                                 (identity["project_name"], identity)])
 
     def test_frontend_workspace_reuse_checks_dependency_bytes_without_reseeding(self):
         with tempfile.TemporaryDirectory() as directory:

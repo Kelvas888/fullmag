@@ -30,6 +30,34 @@ aplikacji do FEM. Wymuszone GPU nie może przejść niejawnie na CPU. Obecność
 wszystkich wariantów w buildzie nie potwierdza obsługi dowolnej kombinacji
 fizyki ani poprawności jej wykonania.
 
+### Kontrakt wejść developerskich
+
+Tryb `dev` używa jawnego `source_mode=live-shadow-v1`. `compose.dev.yaml`
+opisuje topologię usług działających, a jednorazowy build backendu korzysta z
+nakładki `compose.backend-build-live.yaml`. Launcher przekazuje do kontenera:
+
+- wybrany checkout Windows jako `/opt/fullmag/source`, tylko do odczytu;
+- odpowiadający mu wspólny katalog Git jako `/opt/fullmag/source-git`, tylko do
+  odczytu, aby manifest mógł zweryfikować także pliki nieobecne lokalnie, ale
+  obecne jako dozwolone obiekty Git;
+- kompaktowy manifest z digestem źródeł, natywną tożsamością checkoutu i
+  polityką dozwolonych plików.
+
+Kontener synchronizuje zweryfikowane wejścia do niezmiennego cienia w
+linuxowym cache ext4 pod `/build` (workspace buildu). Po synchronizacji pliki
+cienia są tylko do odczytu, a ich inwentarz i digest są sprawdzane ponownie po
+wykonaniu `Make`. Tryb dev nie tworzy ani nie montuje archiwum TAR źródeł przy
+każdej iteracji. Cargo, CMake, CUDA i pozostałe wyjścia kompilacji pozostają w
+kontenerze i utrwalonym cache; późniejsza edycja checkoutu Windows nie zmienia
+już uruchomionego buildu, tylko staje się wejściem następnego jawnego buildu.
+
+`release` oraz jawny build `frozen` zachowują oddzielną ścieżkę z
+`compose.backend-build.yaml`: manifest jest przypięty do niezmiennego archiwum
+źródeł, a hash archiwum jest częścią provenance. Nie wolno wypełniać pól
+archiwum sztucznymi wartościami dla trybu `live-shadow-v1`. Frontend dev nadal
+czyta wybrany bind mount checkoutu i może używać HMR; cień ext4 dotyczy wejść
+kompilacji backendu.
+
 ## Grupy checkoutów i izolacja
 
 Użytkownik zatwierdził osobne projekty Compose: `fullmag-master` dla głównego
@@ -127,10 +155,13 @@ odpowiednich dowodów runtime.
 Zmiana backendu nie uruchamia kompilacji ani restartu automatycznie. Użytkownik
 jawnie zleca przebudowę backendu. Ta operacja pobiera aktualny stan wybranego
 checkoutu i kompiluje go w kontenerze z zachowaniem cache Cargo i kompilacji
-natywnej. Build używa zamrożonych wejść danego żądania, aby edycje podczas
-kompilacji nie mieszały wersji. Checkout nadal pozostaje zamontowany na żywo.
-Pomyślny build nie może sam zatrzymać aktywnej symulacji; zastosowanie nowego
-pakietu wymaga kontrolowanego restartu.
+natywnej. W trybie `live-shadow-v1` manifest jest zamykany przed wejściem do
+kompilatora, a zweryfikowane wejścia są kopiowane do niezmiennego cienia ext4;
+edycje podczas kompilacji nie mieszają wersji. W trybie release/frozen tę samą
+granicę zapewnia przypięte archiwum. Checkout nadal pozostaje zamontowany na
+żywo dla usług developerskich, ale nie jest źródłem odczytywanym przez aktywny
+backend build po utworzeniu cienia. Pomyślny build nie może sam zatrzymać
+aktywnej symulacji; zastosowanie nowego pakietu wymaga kontrolowanego restartu.
 
 Obraz narzędziowy i pakiet aplikacji są osobnymi warstwami. Zmiana kodu Rust
 nie powinna wymuszać ponownego budowania CUDA, hypre, MFEM czy libCEED.
@@ -177,8 +208,10 @@ Pierwszy build profilu rozgrzewa jego cache. Kryterium szybkości dotyczy
 kolejnego buildu po małej zmianie modułu i wymaga pomiaru czasu oraz listy
 ponownie kompilowanych elementów; nie jest obietnicą stałego czasu dla każdej
 zmiany. Własne archiwum całego repo nie jest wymaganiem docelowego trybu dev.
-Zamrożenie wejść backendu na czas danego buildu można zachować przyrostowo,
-bez przebudowy toolchaina i bez kopiowania kodu frontendu do obrazu.
+Zamrożenie wejść backendu na czas danego buildu odbywa się przyrostowo przez
+manifest i niezmienny cień ext4, bez przebudowy toolchaina, bez TAR-u i bez
+kopiowania kodu frontendu do obrazu. Release/frozen pozostaje osobną ścieżką
+archiwum.
 
 ## Polecenia trybu developerskiego
 
@@ -216,11 +249,25 @@ Samo jawne przebudowanie backendu, bez restartu działającej symulacji:
 just docker-dev-build "<absolutna-sciezka-checkoutu>"
 ```
 
-Definicje usług są w `compose.dev.yaml`; `compose.backend-build.yaml` nakłada
-wejścia i wyjścia jednorazowego buildu backendu. Nakładki cache i host ledger
-rozwiązują trwałe katalogi przez lokalny resolver. Launcher zapisuje wynikową
-konfigurację Compose, logi oraz receipty w storage. Archiwum źródeł backendu
-powstaje automatycznie; frontend HMR czyta bezpośrednio bind mount checkoutu.
+Definicje usług runtime są jawnie w `compose.dev.yaml`.
+Developerski build bez TAR-u korzysta z `compose.backend-build-live.yaml`,
+natomiast `compose.backend-build.yaml` jest nakładką wyłącznie dla źródeł
+release/frozen. Obie nakładki rozwiązują cache, output i host ledger przez
+lokalny resolver. Launcher zapisuje wynikową konfigurację Compose, logi oraz
+receipty w storage; frontend HMR czyta bezpośrednio bind mount checkoutu.
+
+### Zakres dowodów dla tej konfiguracji
+
+Sprawdzenia źródłowe obejmują walidację manifestu i trybu `live-shadow-v1`,
+kontrolę montowań obu nakładek Compose, parser konfiguracji YAML, AST skryptów
+launchera oraz interpretowane regresje resolvera i odtwarzania konfiguracji.
+Potwierdzają one kontrakt wejść i fail-closed, nie działanie usług.
+
+Nadal `NOT VERIFIED` pozostają: rzeczywisty `docker compose up` z live shadow,
+stabilny start API, dev-warm po kolejnym buildzie, HMR potwierdzony w
+przeglądarce, odczyt/zapis i recreate `workspace.db`, roundtrip sesji/wyników
+oraz wykonanie FDM/FEM na GPU. Dowód wcześniejszego builda lub offline Home nie
+zastępuje tych bramek.
 
 ## Skrypt symulacji jako parametr startu
 
@@ -242,6 +289,18 @@ Sesje, modele, wyniki oraz logi pozostają w rzeczywistym storage Windows,
 wybranym w lokalnym `.env` przez `FULLMAG_PROJECT_STORAGE_ROOT` i bind mount.
 Nie zastępujemy tego storage ukrytym wolumenem Docker Desktop. Zachowujemy
 walidację dostępu i trwałości zapisu Windows.
+
+Trwałe dane workspace mają osobną, stabilną przestrzeń per projekt Compose.
+Resolver mapuje hostowy katalog `storage/user-data/<compose-project>/` do
+kontenera jako `/user-data`, a backend otrzymuje
+`FULLMAG_WORKSPACE_STATE_DIR=/user-data`; kanoniczna baza workspace znajduje
+się w `storage/user-data/<compose-project>/workspace.db`. Ten katalog nie zależy
+od identyfikatora runu ani recreate. Nakładki buildu montują `/user-data` tylko
+do odczytu i używają oddzielnego `/state` jako scratch; `/state` pozostaje
+rzeczywistym Windows storage dla sesji, wyników, logów i receiptów runu.
+Obecność mapowania i ochrony przed zapisem buildu jest sprawdzana źródłowo;
+rzeczywisty zapis, odczyt i odtworzenie `workspace.db` po recreate pozostają
+`NOT VERIFIED`.
 
 Cache zależności i buildów jest trwały, oddzielony od wyników i jawnie
 zdefiniowany w konfiguracji. Może używać natywnego systemu plików Linux dla

@@ -402,11 +402,28 @@ def _compose_source_environment(project, source_identity):
     }
 
 
+def _workspace_user_data_root(layout, project):
+    """Create the durable user-data namespace for one validated Compose group."""
+
+    if not isinstance(project, str) or re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project) is None:
+        raise ValueError("Invalid Compose project name for workspace user data")
+    storage_root = storage.validate_path(
+        Path(layout["storage_root"]), Path(layout["storage_root"]), "storage root"
+    )
+    candidate = storage.validate_path(
+        storage_root / "user-data" / project, storage_root, "workspace user-data root"
+    )
+    candidate.mkdir(parents=True, exist_ok=True)
+    # Revalidate after creation so a concurrent junction/symlink substitution is
+    # rejected before the host path is handed to Docker Desktop.
+    return storage.validate_path(candidate, storage_root, "workspace user-data root")
+
+
 def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs=None,
                  inputs_path=None, package=None, provenance=None, toolchain_image=None,
-                 project="fullmag-config-check", source_identity=None, template=None, host_ledger=None,
-                 startup=None, frontend_cache=None, previous_config_sha256=None,
-                 recovery=None):
+                 project="fullmag-config-check", source_identity=None, workspace_state_root=None,
+                 template=None, host_ledger=None, startup=None, frontend_cache=None,
+                 previous_config_sha256=None, recovery=None):
     """Resolve the versioned Compose definition; do not generate service topology."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("A full immutable image ID is required")
@@ -414,6 +431,11 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
         raise ValueError("Port must be between 1024 and 65535")
     if host_certificate is None:
         raise ValueError("Windows host certificate is required")
+    if workspace_state_root is None:
+        raise ValueError("Durable workspace user-data host root is required")
+    workspace_state_root = Path(workspace_state_root)
+    if not workspace_state_root.is_absolute():
+        raise ValueError("Durable workspace user-data host root must be absolute")
     repo = Path(repo or Path(__file__).resolve().parents[1])
     template = Path(template) if template is not None else repo / ("compose.dev.yaml" if inputs is not None else "compose.static.yaml")
     environment = {
@@ -422,6 +444,7 @@ def compose_spec(image, state, port, host_certificate=None, *, repo=None, inputs
         "FULLMAG_TOOLCHAIN_IMAGE": toolchain_image or image,
         "FULLMAG_TOOLCHAIN_IMAGE_ID": toolchain_image or image,
         "FULLMAG_STATE_ROOT": str(state), "FULLMAG_HTTP_PORT": str(port),
+        "FULLMAG_WORKSPACE_STATE_ROOT": str(workspace_state_root),
         "FULLMAG_HOST_CERTIFICATE": str(host_certificate),
         "FULLMAG_BACKEND_HOSTNAME": "fullmag-" + state.parent.name,
     }
@@ -914,6 +937,91 @@ def _require_static_source_identity(assembly, selected_source):
     return observed
 
 
+def _validate_assembly_source_provenance(assembly, *, frontend):
+    """Validate the source contract before any runtime state is mutated.
+
+    A live development image is backed by the selected checkout and its
+    immutable shadow manifest; it deliberately has no source archive.  The
+    archive/commit/snapshot forms remain the strict legacy contract used by
+    packaged and previously assembled images.  This check is intentionally
+    receipt-only: it does not inspect or recapture a mutable checkout.
+    """
+
+    if not isinstance(assembly, dict):
+        raise ValueError("Assembly receipt source provenance is not an object")
+    mode = assembly.get("source_mode")
+    if mode not in {"archive", "commit", "snapshot", "live-shadow-v1"}:
+        raise ValueError("Assembly receipt has an unsupported source mode")
+    commit = assembly.get("commit")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("Assembly receipt has no canonical source commit")
+    source_digest = assembly.get("source_digest")
+    if not isinstance(source_digest, str) or not _CONFIG_SHA256_RE.fullmatch(source_digest):
+        raise ValueError("Assembly receipt has no canonical source digest")
+    native = assembly.get("native_source_identity")
+    if not isinstance(native, dict):
+        raise ValueError("Assembly receipt has no native source identity")
+    if native.get("head_commit_full") != commit:
+        raise ValueError("Assembly receipt native source identity differs from its commit")
+    native_snapshot = native.get("source_snapshot_sha256")
+    if not isinstance(native_snapshot, str) or not _CONFIG_SHA256_RE.fullmatch(native_snapshot):
+        raise ValueError("Assembly receipt native source identity has no snapshot digest")
+    if "source_snapshot_sha256" in assembly:
+        if assembly["source_snapshot_sha256"] != native_snapshot:
+            raise ValueError("Assembly receipt source snapshot differs from native source identity")
+    runtime_mode = assembly.get("runtime_mode")
+    if not isinstance(runtime_mode, str) or runtime_mode not in {
+        "development_source_bind", "packaged_release",
+    }:
+        raise ValueError("Assembly receipt has an unsupported runtime mode")
+
+    if mode == "live-shadow-v1":
+        if frontend != "dev" or runtime_mode != "development_source_bind":
+            raise ValueError("Live source provenance is allowed only for development runtime")
+        live_manifest = assembly.get("live_manifest_sha256")
+        if not isinstance(live_manifest, str) or not _CONFIG_SHA256_RE.fullmatch(live_manifest):
+            raise ValueError("Live source assembly has no canonical live manifest digest")
+        source_manifest = assembly.get("source_manifest")
+        git_common = assembly.get("source_git_common_dir")
+        if (not isinstance(source_manifest, str) or not source_manifest
+                or not isinstance(git_common, str) or not git_common):
+            raise ValueError("Live source assembly has incomplete manifest provenance")
+        if "source_archive" in assembly or "source_tar_sha256" in assembly:
+            raise ValueError("Live source assembly must not claim a source archive")
+        return {
+            "source_mode": mode,
+            "source_digest": source_digest,
+            "source_snapshot_sha256": native_snapshot,
+            "live_manifest_sha256": live_manifest,
+        }
+
+    # A legacy/archive assembly may carry an immutable archive descriptor.  If
+    # present, validate its complete shape; do not synthesize one for managed
+    # receipts that predate the descriptor.
+    archive = assembly.get("source_archive")
+    if archive is not None:
+        if not isinstance(archive, dict):
+            raise ValueError("Assembly source archive provenance is not an object")
+        required = {"path", "manifest_path", "sha256", "bytes"}
+        if not required.issubset(archive):
+            raise ValueError("Assembly source archive provenance is incomplete")
+        if (not isinstance(archive["path"], str) or not archive["path"]
+                or not isinstance(archive["manifest_path"], str) or not archive["manifest_path"]
+                or not isinstance(archive["sha256"], str)
+                or not _CONFIG_SHA256_RE.fullmatch(archive["sha256"])
+                or isinstance(archive["bytes"], bool)
+                or not isinstance(archive["bytes"], int)
+                or archive["bytes"] <= 0):
+            raise ValueError("Assembly source archive provenance is invalid")
+    if "live_manifest_sha256" in assembly or "source_git_common_dir" in assembly:
+        raise ValueError("Static source assembly contains live-only provenance")
+    return {
+        "source_mode": mode,
+        "source_digest": source_digest,
+        "source_snapshot_sha256": native_snapshot,
+    }
+
+
 def _read_reuse_json(path, label, maximum=16 * 1024 * 1024):
     path = Path(path)
     if path.is_symlink() or not path.is_file():
@@ -1271,11 +1379,11 @@ def _select_migration_compose_identity(source_identity, expected_project, reuse)
     return expected_project, migrated, "legacy-compose-project-migrated"
 
 
-def _assert_compose_project_absent(project):
+def _assert_compose_project_absent(project, source_identity):
     """Reuse the all-state/container and network admission fence for a target."""
     from docker_dev import _assert_no_running_fullmag
 
-    _assert_no_running_fullmag(project)
+    _assert_no_running_fullmag(project, source_identity)
 
 
 def _preserve_reuse_evidence(reuse):
@@ -1590,11 +1698,12 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         # This check covers every container state and the deterministic
         # project network. It is deliberately read-only: migration never
         # stops or removes a conflicting target instance.
-        _assert_compose_project_absent(project)
+        _assert_compose_project_absent(project, source_identity)
     assembly_receipt = storage.validate_path(assembly_receipt, Path(layout["build_storage_root"]))
     assembly = read_json(assembly_receipt)
     if assembly.get("schema") != "fullmag.docker-all-image.v1" or assembly.get("state") != "succeeded" or assembly.get("exit_code") != 0:
         raise ValueError("A successful all-in-Docker assembly receipt is required")
+    source_provenance = _validate_assembly_source_provenance(assembly, frontend=frontend)
     image = assembly.get("image_id", "")
     observed = image_id(image)
     validate_workspace_environment(observed["Config"])
@@ -1619,6 +1728,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         raise ValueError("Static mode requires a packaged release image")
     assert_loopback_port_available(port, project)
     storage.initialize(layout)
+    workspace_state_root = _workspace_user_data_root(layout, project)
     selected_checkout = None
     preflight_inputs = None
     if reuse is not None and frontend == "dev":
@@ -1661,10 +1771,23 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                "source_worktree_id": source_identity["worktree_id"],
                "source_checkout_kind": source_identity["checkout_kind"],
                "host_certificate": str(host_certificate),
+               "workspace_state_root": str(workspace_state_root),
                "assembly_receipt": str(assembly_receipt), "assembly_receipt_sha256": digest(assembly_receipt),
                "native_source_identity": assembly["native_source_identity"],
+               "source_mode": source_provenance["source_mode"],
+               "source_digest": source_provenance["source_digest"],
+               "source_snapshot_sha256": source_provenance["source_snapshot_sha256"],
                "url": f"http://localhost:{port}/workspace", "qualification": "NOT VERIFIED",
                "frontend_mode": frontend, "container_http_port": 8080 if frontend == "dev" else 8081}
+    if "live_manifest_sha256" in source_provenance:
+        receipt["live_manifest_sha256"] = source_provenance["live_manifest_sha256"]
+        receipt["source_manifest"] = assembly["source_manifest"]
+        receipt["source_git_common_dir"] = assembly["source_git_common_dir"]
+    elif isinstance(assembly.get("source_archive"), dict):
+        # Preserve the immutable legacy descriptor when one exists.  Live
+        # source runs intentionally take the branch above and never invent a
+        # tar/archive field.
+        receipt["source_archive"] = assembly["source_archive"]
     if identity_compatibility is not None:
         receipt["compose_identity_compatibility"] = identity_compatibility
     if migrate_compose_project:
@@ -1818,6 +1941,7 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                                 repo=repo, inputs=inputs, inputs_path=inputs_path.resolve(),
                                 package=assembly.get("package_root"),
                                 provenance=assembly_receipt, project=project, source_identity=source_identity,
+                                workspace_state_root=workspace_state_root,
                                 toolchain_image=assembly.get("base_image"), template=compose_source_path,
                                 host_ledger=host_ledger, startup=startup,
                                 frontend_cache=frontend_cache, recovery=recovery,
@@ -2062,7 +2186,9 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         provenance = json.loads(docker("exec", container, "cat", "/opt/fullmag/provenance.json"))
         if any(provenance.get(key) != assembly.get(key) for key in
                ("commit", "job_id", "source_digest", "base_image", "native_source_identity",
-                "binary_hashes", "startup_helper_hashes", "build_receipt_sha256")):
+                "source_mode", "source_snapshot_sha256", "live_manifest_sha256",
+                "source_git_common_dir", "binary_hashes", "startup_helper_hashes",
+                "build_receipt_sha256")):
             raise ValueError("Runtime image provenance differs from assembly receipt")
         for name, expected in helper_hashes.items():
             observed_helper = docker("exec", container, "sha256sum", "/opt/fullmag/" + name).split()[0]
@@ -2099,7 +2225,8 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 image, state.resolve(), port, host_certificate.resolve(),
                 repo=repo, inputs=inputs, inputs_path=inputs_path.resolve(),
                 package=assembly.get("package_root"), provenance=assembly_receipt,
-                project=project, source_identity=source_identity, toolchain_image=assembly.get("base_image"),
+                project=project, source_identity=source_identity,
+                workspace_state_root=workspace_state_root, toolchain_image=assembly.get("base_image"),
                 template=compose_source_path, host_ledger=host_ledger,
                 startup=startup, frontend_cache=frontend_cache,
                 recovery=None, previous_config_sha256=previous_config_sha256,

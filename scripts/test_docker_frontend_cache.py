@@ -520,6 +520,7 @@ inspect_unmounted
             with mock.patch.object(runtime, "docker", side_effect=compose):
                 configured = runtime.compose_spec(
                     IMAGE, root / "state", 32871, root / "certificate.json",
+                    workspace_state_root=root / "user-data",
                     repo=repo, inputs={"source_root": str(source)},
                     inputs_path=root / "inputs.json", package=root / "package",
                     provenance=root / "assembly.json", frontend_cache=profile,
