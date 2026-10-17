@@ -21,6 +21,11 @@ W trybie dev dokładnie dwie stałe usługi aplikacji należą do projektu
 - `backend` przy starcie wykonuje zweryfikowany, przyrostowy build, a następnie
   w tym samym kontenerze uruchamia API i nadzorowany native runtime.
 
+Decyzja użytkownika z 17.10.2026: frontend DEV domyślnie uruchamia Node Inspector
+na loopback wewnątrz kontenera. Nie publikuje portu debuggera na hoście i nie czeka
+na podłączenie klienta przed startem aplikacji. Log wskazuje adres właściwego
+procesu Next.js. Ten tryb dotyczy serwera Node.js; release pozostaje bez Inspectora.
+
 Docker Desktop i `docker logs` pokazują pełen przebieg backendu: przygotowanie
 źródeł, kompilację, publikację wyniku i uruchomienie usług. Tryb dev nie tworzy
 osobnego `backend-build` i nie przenosi dużego pakietu między kontenerami przez

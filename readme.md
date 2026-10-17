@@ -223,6 +223,11 @@ just docker-dev-toolchain
 just docker-dev "$worktree" 3197
 ```
 
+The development frontend enables the Node Inspector on container loopback,
+without publishing a host debug port or waiting for a debugger to attach. The
+frontend log reports the Inspector address. Release processes keep it disabled;
+see the [development debugger guide](docs/guides/docker-development-architecture.md#debugger-frontendu-dev).
+
 The equivalent native Python commands are useful when `just` is unavailable:
 
 ```powershell

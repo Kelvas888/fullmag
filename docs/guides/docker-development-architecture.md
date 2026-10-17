@@ -150,6 +150,19 @@ oraz native runtime. Błąd buildu zachowuje log i receipt; nie uruchamia API
 z częściowo opublikowanym pakietem. Home może być dostępny podczas budowania.
 Stan `ready` wymaga rzeczywistego health/readiness, nie samego otwartego portu.
 
+### Debugger frontendu DEV
+
+Frontend DEV domyślnie włącza Node Inspector, a jego adres zapisuje w logu
+kontenera. Debugger nasłuchuje wyłącznie na loopback wewnątrz frontendu; Compose
+nie publikuje dodatkowego portu na Windows. Uruchomienie Next.js nie czeka na
+podłączenie debuggera. HMR działa również bez podłączonego klienta.
+
+Inspector służy do diagnostyki serwera Node.js/Next.js: stosu wywołań, zmiennych,
+CPU i pamięci. Klient debuggera musi mieć dostęp do wnętrza kontenera. Kod
+działający w przeglądarce można niezależnie sprawdzać przez F12. Debugowanie
+solverów Rust/CUDA jest osobną ścieżką. Obrazy i procesy release nie włączają
+Inspectora. Kontrakt wymaga jeszcze potwierdzenia na uruchomionym obrazie DEV.
+
 ### Pierwszy start i następne restarty
 
 Przy pierwszym starcie backend po buildzie czeka na wydanie hostowego certyfikatu

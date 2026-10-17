@@ -195,8 +195,59 @@ class FrontendDevContractTests(TestCase):
     def test_enabled_requires_exact_dev_mode(self):
         self.assertTrue(self.module.enabled({"FULLMAG_DOCKER_FRONTEND": "dev"}))
         self.assertFalse(self.module.enabled({"FULLMAG_DOCKER_FRONTEND": "DEV"}))
+        self.assertFalse(self.module.enabled({"FULLMAG_DOCKER_FRONTEND": "static"}))
         self.assertFalse(self.module.enabled({}))
         self.assertEqual(self.module.EXPECTED_PNPM_VERSION, "10.8.1")
+
+    def test_dev_next_command_uses_local_ephemeral_inspector_without_node_options(self):
+        command = self.module._next_command()
+        self.assertIn(self.module.INSPECTOR_FLAG, command)
+        self.assertEqual(self.module.INSPECTOR_FLAG, "--inspect=127.0.0.1:0")
+        self.assertNotIn("--inspect-brk", command)
+        self.assertEqual(command[2:4], ["dev", "--webpack"])
+        self.assertEqual(command[-4:], ["--hostname", "0.0.0.0", "--port", "8080"])
+
+        with isolated(self.module) as (_root, _workspace, inputs):
+            with patch.dict(
+                os.environ,
+                {"NODE_OPTIONS": "--inspect=0.0.0.0:9229"},
+                clear=False,
+            ):
+                environment = self.module._safe_environment(inputs)
+            self.assertEqual(environment["FULLMAG_DOCKER_FRONTEND"], "dev")
+            self.assertEqual(environment["NODE_ENV"], "development")
+            self.assertNotIn("NODE_OPTIONS", environment)
+            inspector = self.module._receipt_base(inputs, None)["inspector"]
+            self.assertEqual(inspector["profile"], "next-dev")
+            self.assertEqual(inspector["bind_host"], "127.0.0.1")
+            self.assertEqual(inspector["bind_port"], 0)
+
+    def test_inspector_output_rejects_non_loopback_and_records_exact_endpoint(self):
+        observed = self.module._parse_inspector_output(
+            b"Debugger listening on ws://127.0.0.1:43127/7c7b9d0a-1\n"
+        )
+        self.assertEqual(
+            observed,
+            {
+                "address": "ws://127.0.0.1:43127/7c7b9d0a-1",
+                "host": "127.0.0.1",
+                "port": 43127,
+            },
+        )
+        latest = self.module._parse_inspector_output(
+            b"Debugger listening on ws://127.0.0.1:43127/old-target\n"
+            b"Debugger listening on ws://127.0.0.1:43128/new-target\n"
+        )
+        self.assertEqual(latest["address"], "ws://127.0.0.1:43128/new-target")
+        self.assertEqual(latest["port"], 43128)
+        with self.assertRaisesRegex(self.module.FrontendDevError, "loopback"):
+            self.module._parse_inspector_output(
+                b"Debugger listening on ws://0.0.0.0:43127/7c7b9d0a-1\n"
+            )
+        with self.assertRaisesRegex(self.module.FrontendDevError, "invalid Node inspector"):
+            self.module._parse_inspector_output(
+                b"Debugger listening on http://127.0.0.1:43127/7c7b9d0a-1\n"
+            )
 
     def test_frontend_healthcheck_requires_owned_receipt_process_and_tcp(self):
         healthcheck = load_healthcheck_module()
@@ -515,6 +566,112 @@ else:
                             self.module._safe_environment(inputs)["WATCHPACK_POLLING"],
                             raw,
                         )
+
+    @skipIf(os.name == "nt", "directory fsync is a Linux container filesystem contract")
+    def test_check_records_exact_next_inspector_endpoint_for_owned_pid(self):
+        with isolated(self.module) as (root, workspace, inputs):
+            self.module._prepare_state_directories()
+            self.module._prepare_managed_frontend(inputs)
+            self.module._freeze_inputs(inputs, allow_generated=False)
+            self.module.LOG_PATH.write_bytes(
+                b"Debugger listening on ws://127.0.0.1:43127/owned-target\n"
+            )
+            process = _RunningProcess()
+            identity = {
+                "pid": process.pid,
+                "pid_namespace": "pid:[4026531836]",
+                "process_start_time_ticks": 18,
+                "session_id": process.pid,
+                "process_group_id": process.pid,
+            }
+            handle = self.module.FrontendHandle(
+                process=process,
+                inputs=inputs,
+                stopping_event=object(),
+                kind="next",
+                pid=process.pid,
+                owner_token="owner-token",
+                log_path=self.module.LOG_PATH,
+                process_group_id=process.pid,
+                process_identity=identity,
+                inspector_log_offset=0,
+            )
+            receipt = self.module._receipt_base(inputs, None)
+            receipt.update(
+                state="running",
+                pid=process.pid,
+                owner_token=handle.owner_token,
+                **{field: identity[field] for field in self.module.PROCESS_IDENTITY_FIELDS},
+            )
+            receipt["inspector"].update(state="pending", launcher_pid=process.pid)
+            self.module._atomic_json(
+                self.module.RECEIPT_PATH,
+                receipt,
+                "receipt",
+            )
+            with patch.object(self.module, "_confirmed_live_identity", return_value=identity):
+                self.module.check(handle)
+            saved = json.loads(self.module.RECEIPT_PATH.read_text(encoding="utf-8"))
+            self.assertEqual(saved["inspector"]["state"], "ready")
+            self.assertEqual(saved["inspector"]["launcher_pid"], process.pid)
+            self.assertNotIn("pid", saved["inspector"])
+            self.assertEqual(
+                saved["inspector"]["address"],
+                "ws://127.0.0.1:43127/owned-target",
+            )
+            self.assertEqual(saved["inspector"]["port"], 43127)
+
+            self.module.LOG_PATH.write_bytes(
+                b"Debugger listening on ws://127.0.0.1:43127/owned-target\n"
+                b"Debugger listening on ws://127.0.0.1:43128/restarted-target\n"
+            )
+            with patch.object(self.module, "_confirmed_live_identity", return_value=identity):
+                self.module.check(handle)
+            saved = json.loads(self.module.RECEIPT_PATH.read_text(encoding="utf-8"))
+            self.assertEqual(saved["inspector"]["address"], "ws://127.0.0.1:43128/restarted-target")
+            self.assertEqual(saved["inspector"]["launcher_pid"], process.pid)
+
+    def test_inspector_observation_errors_are_warning_only(self):
+        with isolated(self.module) as (_root, _workspace, inputs):
+            receipt = self.module._receipt_base(inputs, None)
+            with patch.object(
+                self.module,
+                "_read_log_region",
+                side_effect=self.module.FrontendDevError("inspector log is unavailable"),
+            ), redirect_stdout(io.StringIO()) as stdout:
+                self.assertFalse(
+                    self.module._refresh_inspector_receipt(
+                        receipt,
+                        pid=49153,
+                        log_path=self.module.LOG_PATH,
+                        log_offset=0,
+                        publish=True,
+                    )
+                )
+            self.assertEqual(receipt["inspector"]["state"], "configured")
+            self.assertIn("status=observation-warning", stdout.getvalue())
+            self.assertIn("inspector log is unavailable", stdout.getvalue())
+
+            self.module.LOG_PATH.write_bytes(
+                b"Debugger listening on ws://127.0.0.1:43127/owned-target\n"
+            )
+            with patch.object(
+                self.module,
+                "_publish_receipt",
+                side_effect=self.module.FrontendDevError("receipt fsync failed"),
+            ), redirect_stdout(io.StringIO()) as stdout:
+                self.assertFalse(
+                    self.module._refresh_inspector_receipt(
+                        receipt,
+                        pid=49153,
+                        log_path=self.module.LOG_PATH,
+                        log_offset=0,
+                        publish=True,
+                    )
+                )
+            self.assertEqual(receipt["inspector"]["state"], "ready")
+            self.assertIn("status=observation-warning", stdout.getvalue())
+            self.assertIn("receipt fsync failed", stdout.getvalue())
 
     def test_compose_declares_the_bounded_frontend_polling_override(self):
         compose = MODULE_PATH.parents[2] / "compose.dev.yaml"

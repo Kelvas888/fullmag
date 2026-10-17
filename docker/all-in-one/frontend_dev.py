@@ -86,6 +86,15 @@ INTERNAL_PORT = 8080
 API_PROXY_TARGET = "http://backend:8081"
 NEXT_DIST_DIR = ".next-control-room-8080"
 NEXT_RELATIVE = Path("node_modules/next/dist/bin/next")
+INSPECTOR_SCHEMA = "fullmag.node-inspector.v1"
+INSPECTOR_PROFILE = "next-dev"
+INSPECTOR_BIND_HOST = "127.0.0.1"
+INSPECTOR_BIND_PORT = 0
+INSPECTOR_FLAG = f"--inspect={INSPECTOR_BIND_HOST}:{INSPECTOR_BIND_PORT}"
+INSPECTOR_LOG_SCAN_BYTES = 64 * 1024
+INSPECTOR_OUTPUT_RE = re.compile(
+    rb"Debugger listening on (?P<address>ws://(?P<host>[^:/\s]+):(?P<port>[0-9]+)/(?P<target>[^\s]+))"
+)
 LIVE_DIRECTORY_NAMES = ("app", "src", "public", "scripts")
 LIVE_DIRECTORY_PATHS = tuple(f"apps/control-room/{name}" for name in LIVE_DIRECTORY_NAMES)
 REQUIRED_MANIFEST_KEYS = frozenset(
@@ -205,6 +214,7 @@ class FrontendHandle:
     stopped: bool = False
     process_group_id: int | None = None
     process_identity: Mapping[str, Any] | None = None
+    inspector_log_offset: int | None = None
 
 
 def enabled(environment: Mapping[str, str] | None = None) -> bool:
@@ -1087,6 +1097,13 @@ def _receipt_base(
         "tool_probe_timeout_seconds": TOOL_TIMEOUT_SECONDS,
         "watchpack_polling_ms": polling_ms,
         "uv_threadpool_size": NODE_FS_THREADS,
+        "inspector": {
+            "schema": INSPECTOR_SCHEMA,
+            "profile": INSPECTOR_PROFILE,
+            "state": "configured",
+            "bind_host": INSPECTOR_BIND_HOST,
+            "bind_port": INSPECTOR_BIND_PORT,
+        },
     }
     failure = _receipt_failure(previous)
     if failure is not None:
@@ -1163,6 +1180,135 @@ def _log_stream() -> Any:
         if descriptor is not None:
             os.close(descriptor)
         _fail(f"cannot open frontend development log: {error}")
+
+
+def _log_file_offset(log_stream: Any) -> int | None:
+    """Return the append-log boundary before a new Next child is spawned."""
+
+    try:
+        return int(os.fstat(log_stream.fileno()).st_size)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _read_log_region(log_path: Path, offset: int | None) -> bytes:
+    """Read this child's bounded log tail without following links."""
+
+    if offset is None:
+        return b""
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        _fail("frontend inspector log offset is invalid")
+    _assert_no_links(log_path.parent, "frontend development log parent")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            log_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            _fail("frontend development log is not a regular file")
+        if metadata.st_size < offset:
+            return b""
+        start = max(offset, metadata.st_size - INSPECTOR_LOG_SCAN_BYTES)
+        os.lseek(descriptor, start, os.SEEK_SET)
+        return os.read(descriptor, INSPECTOR_LOG_SCAN_BYTES)
+    except FileNotFoundError:
+        return b""
+    except OSError as error:
+        _fail(f"cannot read frontend development log for inspector address: {error}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _parse_inspector_output(data: bytes) -> dict[str, Any] | None:
+    """Parse the local Node inspector endpoint emitted by the Next child."""
+
+    if not isinstance(data, bytes):
+        _fail("frontend inspector output must be bytes")
+    marker = b"Debugger listening on "
+    observed: dict[str, Any] | None = None
+    for line in data.splitlines():
+        if marker not in line:
+            continue
+        match = INSPECTOR_OUTPUT_RE.search(line)
+        if match is None:
+            _fail("Next emitted an invalid Node inspector address")
+        try:
+            address = match.group("address").decode("ascii")
+            host = match.group("host").decode("ascii")
+            port = int(match.group("port"))
+            target = match.group("target").decode("ascii")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise FrontendDevError("Next emitted an undecodable Node inspector address") from error
+        if host != INSPECTOR_BIND_HOST:
+            _fail("Next Node inspector must bind to the container loopback address")
+        if not 1 <= port <= 65535 or not target:
+            _fail("Next emitted an invalid Node inspector port or target")
+        observed = {
+            "address": address,
+            "host": host,
+            "port": port,
+        }
+    return observed
+
+
+def _inspector_observation_warning(pid: int, error: Exception) -> None:
+    """Report bounded inspector telemetry failures without affecting Next."""
+
+    message = str(error).strip() or error.__class__.__name__
+    _write_lifecycle_log(
+        "next_inspector",
+        status="observation-warning",
+        launcher_pid=pid,
+        error=message[-512:],
+    )
+
+
+def _refresh_inspector_receipt(
+    receipt: dict[str, Any],
+    *,
+    pid: int,
+    log_path: Path,
+    log_offset: int | None,
+    publish: bool,
+) -> bool:
+    """Publish the endpoint when available; never gate the owned Next process."""
+
+    try:
+        observed = _parse_inspector_output(_read_log_region(log_path, log_offset))
+        if observed is None:
+            return False
+        configured = receipt.get("inspector")
+        if not isinstance(configured, dict):
+            _fail("frontend receipt is missing the Next inspector configuration")
+        recorded_launcher_pid = configured.get("launcher_pid")
+        if (
+            recorded_launcher_pid not in (None, pid)
+            or configured.get("profile") != INSPECTOR_PROFILE
+        ):
+            _fail("frontend receipt Node inspector identity differs from the owned process")
+        previous_address = configured.get("address")
+        if previous_address == observed["address"] and configured.get("state") == "ready":
+            return False
+        inspector = dict(configured)
+        inspector.pop("pid", None)
+        inspector.update(state="ready", launcher_pid=pid, **observed)
+        receipt["inspector"] = inspector
+        _write_lifecycle_log(
+            "next_inspector",
+            status="ready",
+            launcher_pid=pid,
+            address=observed["address"],
+            bind_host=INSPECTOR_BIND_HOST,
+        )
+        if publish:
+            _publish_receipt(receipt)
+        return True
+    except Exception as error:
+        _inspector_observation_warning(pid, error)
+        return False
 
 
 def _write_lifecycle_log(event: str, **fields: Any) -> None:
@@ -1463,6 +1609,7 @@ def _new_handle(
     log_stream: Any,
     log_tailer: _LogTailer | None = None,
     runtime_lock: Any | None = None,
+    inspector_log_offset: int | None = None,
 ) -> FrontendHandle:
     handle = FrontendHandle(
         process=process,
@@ -1475,6 +1622,7 @@ def _new_handle(
         log_stream=log_stream,
         log_tailer=log_tailer,
         runtime_lock=runtime_lock,
+        inspector_log_offset=inspector_log_offset,
     )
     try:
         identity = _read_process_identity(process.pid)
@@ -1582,6 +1730,22 @@ def _assert_not_stopping(stopping_event: Any) -> None:
         raise FrontendDevUnknown("frontend startup was cancelled during shutdown")
 
 
+def _next_command() -> list[str]:
+    """Run the pinned Next CLI with a local, ephemeral Node inspector."""
+
+    return [
+        str(NODE_BINARY),
+        str(NEXT_RELATIVE),
+        "dev",
+        "--webpack",
+        INSPECTOR_FLAG,
+        "--hostname",
+        "0.0.0.0",
+        "--port",
+        str(INTERNAL_PORT),
+    ]
+
+
 def _start_next(
     inputs: DevelopmentInputs,
     stopping_event: Any,
@@ -1598,22 +1762,28 @@ def _start_next(
     if receipt.get("uv_threadpool_size") != NODE_FS_THREADS:
         _fail("frontend receipt is missing the pinned Node filesystem thread count")
     app_root = inputs.workspace_root / "apps" / "control-room"
-    command = [
-        str(NODE_BINARY),
-        str(NEXT_RELATIVE),
-        "dev",
-        "--webpack",
-        "--hostname",
-        "0.0.0.0",
-        "--port",
-        str(INTERNAL_PORT),
-    ]
+    command = _next_command()
     environment = _safe_environment(inputs, watchpack_polling_ms=watchpack_polling_ms)
+    inspector_log_offset = _log_file_offset(log_stream)
+    inspector = receipt.get("inspector")
+    inspector_configuration_error: FrontendDevError | None = None
+    if not isinstance(inspector, dict):
+        inspector_configuration_error = FrontendDevError(
+            "frontend receipt is missing the Next inspector configuration"
+        )
+        inspector = {
+            "schema": INSPECTOR_SCHEMA,
+            "profile": INSPECTOR_PROFILE,
+            "state": "configured",
+            "bind_host": INSPECTOR_BIND_HOST,
+            "bind_port": INSPECTOR_BIND_PORT,
+        }
     next_started = time.monotonic()
     _write_lifecycle_log(
         "next_start",
         url=f"http://localhost:{inputs.host_port}",
         internal_port=INTERNAL_PORT,
+        inspector_bind=f"{INSPECTOR_BIND_HOST}:{INSPECTOR_BIND_PORT}",
         watchpack_polling_ms=watchpack_polling_ms,
         uv_threadpool_size=NODE_FS_THREADS,
         log_path=LOG_PATH,
@@ -1628,12 +1798,19 @@ def _start_next(
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        inspector = dict(inspector)
+        inspector.pop("pid", None)
+        inspector.update(state="pending", launcher_pid=process.pid)
+        receipt["inspector"] = inspector
+        if inspector_configuration_error is not None:
+            _inspector_observation_warning(process.pid, inspector_configuration_error)
     except OSError as error:
         _write_lifecycle_log(
             "next_result",
             status="failed",
             elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
             url=f"http://localhost:{inputs.host_port}",
+            inspector_bind=f"{INSPECTOR_BIND_HOST}:{INSPECTOR_BIND_PORT}",
             watchpack_polling_ms=watchpack_polling_ms,
             uv_threadpool_size=NODE_FS_THREADS,
             error=str(error),
@@ -1648,6 +1825,7 @@ def _start_next(
             log_stream,
             log_tailer,
             runtime_lock=runtime_lock,
+            inspector_log_offset=inspector_log_offset,
         )
     except Exception as error:
         owned_handle = getattr(error, "frontend_handle", None)
@@ -1662,11 +1840,19 @@ def _start_next(
             status="failed",
             elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
             url=f"http://localhost:{inputs.host_port}",
+            inspector_bind=f"{INSPECTOR_BIND_HOST}:{INSPECTOR_BIND_PORT}",
             watchpack_polling_ms=watchpack_polling_ms,
             uv_threadpool_size=NODE_FS_THREADS,
             error=str(error),
         )
         raise
+    _refresh_inspector_receipt(
+        receipt,
+        pid=handle.pid,
+        log_path=handle.log_path,
+        log_offset=handle.inspector_log_offset,
+        publish=False,
+    )
     receipt.update(
         state="running",
         command=command,
@@ -1685,6 +1871,7 @@ def _start_next(
         readiness="owned_process",
         elapsed_seconds=f"{time.monotonic() - next_started:.3f}",
         url=f"http://localhost:{inputs.host_port}",
+        inspector_bind=f"{INSPECTOR_BIND_HOST}:{INSPECTOR_BIND_PORT}",
         watchpack_polling_ms=watchpack_polling_ms,
         uv_threadpool_size=NODE_FS_THREADS,
         log_path=LOG_PATH,
@@ -1873,6 +2060,13 @@ def check(handle: FrontendHandle) -> None:
                     f"{error}; publishing unknown owner receipt failed: {publish_error}"
                 ) from publish_error
             raise
+        _refresh_inspector_receipt(
+            receipt,
+            pid=handle.pid,
+            log_path=handle.log_path,
+            log_offset=handle.inspector_log_offset,
+            publish=True,
+        )
         return
     if receipt is None:
         receipt = _receipt_base(handle.inputs, None)
