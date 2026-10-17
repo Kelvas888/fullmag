@@ -2224,11 +2224,18 @@ async fn internal_idle_heartbeat_restores_connectivity_without_resource_revision
             snapshot.field_samples_revision,
         )
     };
+    let publisher_scope = {
+        let current = state.current_live_state.read().await;
+        crate::current_live_publisher_scope_header(&state, current.as_ref().expect("live session"))
+    };
     let app = axum::Router::new()
         .route(
             "/heartbeat",
             axum::routing::post(crate::sync_current_live_heartbeat),
         )
+        .route_layer(axum::middleware::from_fn(
+            crate::router_v2::middleware::session_scope::session_scope_middleware,
+        ))
         .with_state(state.clone());
     let response = app
         .oneshot(
@@ -2236,6 +2243,10 @@ async fn internal_idle_heartbeat_restores_connectivity_without_resource_revision
                 .method("POST")
                 .uri("/heartbeat")
                 .header("content-type", "application/json")
+                .header(
+                    crate::router_v2::middleware::session_scope::HEADER_NAME,
+                    publisher_scope,
+                )
                 .body(Body::from(
                     serde_json::json!({ "session_id": "test-session" }).to_string(),
                 ))
