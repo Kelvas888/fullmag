@@ -179,6 +179,7 @@ export function AntennaSourceSpectrumPayloadView({
         </span>
       </div>
       <SpectrumPowerGrid cells={cells} kU={payloads.value.kU} kV={payloads.value.kV}
+        amplitudes={payloads.value.amplitudes} componentLabels={spectrum.component_labels} amplitudeUnit={spectrum.amplitude_unit}
         waveVectorUnit={spectrum.wave_vector_unit} powerUnit={powerUnit} componentLabel={componentLabel} isBinned={isBinned} peakIndex={extrema?.peakIndex ?? -1}>
         <AntennaSpectrumExport spectrum={spectrum} amplitudes={payloads.value.amplitudes}
           kU={payloads.value.kU} kV={payloads.value.kV} power={payloads.value.power} />
@@ -242,8 +243,9 @@ function spectrumGridTarget(key: string, index: number, columns: number, count: 
 }
 
 /** Selection stays local: keyboard inspection never redecodes payloads or refetches resources. */
-function SpectrumPowerGrid({ cells, kU, kV, waveVectorUnit, powerUnit, componentLabel, isBinned, peakIndex, children }: {
+function SpectrumPowerGrid({ cells, kU, kV, amplitudes, componentLabels, amplitudeUnit, waveVectorUnit, powerUnit, componentLabel, isBinned, peakIndex, children }: {
   cells: readonly HeatmapCell[]; kU: readonly number[]; kV: readonly number[];
+  amplitudes: readonly number[]; componentLabels: readonly string[]; amplitudeUnit: string;
   waveVectorUnit: string; powerUnit: string; componentLabel: string; isBinned: boolean; peakIndex: number; children: ReactNode;
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
@@ -298,6 +300,30 @@ function SpectrumPowerGrid({ cells, kU, kV, waveVectorUnit, powerUnit, component
       <span>k_v {formatScientific(selected ? kV[selected.kVIndex] : undefined)} {waveVectorUnit}</span>
       <span>Power {formatScientific(selected?.power)} {powerUnit}</span>
     </div>
+    {selected ? <div className="fm-antenna-spectrum__complex-sample">
+      <table>
+        <caption>Complex source amplitudes at selected sample</caption>
+        <thead><tr>
+          <th scope="col">Component</th>
+          <th scope="col">Re [{amplitudeUnit}]</th>
+          <th scope="col">Im [{amplitudeUnit}]</th>
+          <th scope="col">Amplitude [{amplitudeUnit}]</th>
+          <th scope="col">Phase [rad]</th>
+        </tr></thead>
+        <tbody>{componentLabels.map((label, component) => {
+          const sample = selected.kVIndex * kU.length + selected.kUIndex;
+          const offset = 2 * (component * kU.length * kV.length + sample);
+          const re = amplitudes[offset]!, im = amplitudes[offset + 1]!;
+          return <tr key={label}>
+            <th scope="row">H_{label}</th>
+            <td>{formatScientific(re)}</td><td>{formatScientific(im)}</td>
+            <td>{formatScientific(Math.hypot(re, im))}</td>
+            <td>{re === 0 && im === 0 ? "undefined (zero amplitude)" : Math.atan2(im, re).toFixed(4)}</td>
+          </tr>;
+        })}</tbody>
+      </table>
+      <p className="fm-antenna-spectrum__subtitle">Phase is arg(Re + i Im) in the published Fourier convention; undefined at zero amplitude. Values use the same per-ampere basis and normalization as the map.</p>
+    </div> : null}
   </>;
 }
 

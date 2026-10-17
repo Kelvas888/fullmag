@@ -461,6 +461,47 @@ try {
       checks.push({ name: `${field}: changed FFT configuration hides historical samples/export with no binary reads; exact restoration recovers the chart without polling`, passed: true });
     }
   }
+  {
+    const location = new URL(url); location.searchParams.set("scenario", "ready-complex-vector");
+    await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    const table = page.getByRole("table", { name: "Complex source amplitudes at selected sample", exact: true });
+    await table.waitFor();
+    const cells = page.getByRole("gridcell");
+    const rows = () => table.locator("tbody tr").evaluateAll(rows => rows.map(row => [...row.querySelectorAll("th, td")].map(cell => cell.textContent)));
+    const before = await page.evaluate(() => ({ reads: window.__spectrumDecodeReads, calls: window.__antennaSpectrumFixture.read().calls.length }));
+    assert.equal(await table.getByRole("columnheader", { name: "Amplitude [A*m/A]", exact: true }).count(), 1);
+    assert.equal(await table.getByRole("columnheader", { name: "Phase [rad]", exact: true }).count(), 1);
+    await cells.first().focus();
+    assert.deepEqual(await rows(), [
+      ["H_x", "0.000e+0", "0.000e+0", "0.000e+0", "undefined (zero amplitude)"],
+      ["H_y", "1.000e+0", "0.000e+0", "1.000e+0", "0.0000"],
+      ["H_z", "-1.000e+0", "0.000e+0", "1.000e+0", "3.1416"],
+    ]);
+    await page.keyboard.press("ArrowRight");
+    assert.deepEqual(await rows(), [
+      ["H_x", "0.000e+0", "2.000e+0", "2.000e+0", "1.5708"],
+      ["H_y", "0.000e+0", "-2.000e+0", "2.000e+0", "-1.5708"],
+      ["H_z", "2.000e+0", "0.000e+0", "2.000e+0", "0.0000"],
+    ]);
+    await page.keyboard.press("ArrowDown");
+    assert.deepEqual(await rows(), [
+      ["H_x", "3.000e+0", "4.000e+0", "5.000e+0", "0.9273"],
+      ["H_y", "-4.000e+0", "3.000e+0", "5.000e+0", "2.4981"],
+      ["H_z", "-3.000e+0", "-4.000e+0", "5.000e+0", "-2.2143"],
+    ]);
+    assert.equal(await cells.nth(3).getAttribute("aria-selected"), "true");
+    assert.deepEqual(await page.evaluate(() => ({ reads: window.__spectrumDecodeReads, calls: window.__antennaSpectrumFixture.read().calls.length })), before);
+    const screenshot = resolve(directory, "complex-amplitudes-phase.png");
+    await table.screenshot({ path: screenshot }); screenshots.push(screenshot);
+    await page.setViewportSize({ width: 480, height: 1000 });
+    const narrowShot = resolve(directory, "complex-amplitudes-narrow.png");
+    await page.screenshot({ path: narrowShot, fullPage: true }); screenshots.push(narrowShot);
+    const bounds = await table.evaluate(table => { const owner = table.parentElement; return { scrollable: owner.scrollWidth > owner.clientWidth, contained: owner.getBoundingClientRect().right <= window.innerWidth }; });
+    assert.equal(bounds.contained, true);
+    assert.deepEqual(await page.evaluate(() => window.__antennaSpectrumFixture.read().unexpected), []);
+    await page.setViewportSize({ width: 1280, height: 1000 });
+    checks.push({ name: "Complex vector sample: component-major Re/Im, amplitudes, signed phase and undefined zero phase; keyboard selection needs no transport or decoding; narrow table stays contained", passed: true });
+  }
   assert.deepEqual(pageErrors, []);
   assert.deepEqual(consoleErrors, []);
   assert.ok(checks.every((check) => check.passed), "Unconfirmed or invalid source FFT mounted/read binary payloads");

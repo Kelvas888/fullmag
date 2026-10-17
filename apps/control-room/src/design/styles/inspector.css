@@ -1024,6 +1024,36 @@
   overflow-wrap: anywhere;
 }
 
+.fm-antenna-spectrum__complex-sample {
+  min-width: 0;
+  overflow-x: auto;
+  font-size: var(--fm-font-size-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.fm-antenna-spectrum__complex-sample table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.fm-antenna-spectrum__complex-sample caption {
+  padding: var(--fm-space-2) 0;
+  text-align: left;
+  color: var(--fm-text-primary);
+  font-weight: 600;
+}
+
+.fm-antenna-spectrum__complex-sample th,
+.fm-antenna-spectrum__complex-sample td {
+  padding: var(--fm-space-2);
+  border-bottom: 1px solid var(--fm-border-subtle);
+  text-align: right;
+}
+
+.fm-antenna-spectrum__complex-sample th:first-child {
+  text-align: left;
+}
+
 .fm-antenna-spectrum__scale {
   display: flex;
   flex-wrap: wrap;
