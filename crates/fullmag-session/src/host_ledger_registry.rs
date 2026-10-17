@@ -289,7 +289,8 @@ mod tests {
             &conflicting_root,
             host,
         )
-        .unwrap_err();
+        .err()
+        .expect("conflicting host-ledger initialization must fail");
         assert!(error.to_string().contains("operator reconciliation"));
         assert!(!conflicting_root.exists());
 
@@ -298,7 +299,8 @@ mod tests {
             &conflicting_root,
             policy("host:shared"),
         )
-        .unwrap_err();
+        .err()
+        .expect("conflicting host-ledger open must fail");
         assert!(error.to_string().contains("operator reconciliation"));
         assert!(!conflicting_root.exists());
     }
@@ -316,7 +318,8 @@ mod tests {
             &ledger_root,
             policy("host:shared"),
         )
-        .unwrap_err();
+        .err()
+        .expect("opening without a host-ledger pin must fail");
 
         assert!(error.to_string().contains("not been initialized"));
         assert!(!state_root
