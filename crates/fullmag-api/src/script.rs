@@ -1499,12 +1499,13 @@ study.relax(algorithm="projected_gradient_bb", max_steps=1, tolA=1e-30)
             &requested_execution,
         )
         .expect("prepared helper should resolve the immutable source root");
-        let shared_assets = config
-            .shared_geometry_assets
+        let root_assets = config
+            .ir
+            .geometry_assets
             .as_ref()
-            .expect("prepared config should publish shared geometry assets");
+            .expect("prepared pipeline config should publish root geometry assets");
         assert!(
-            shared_assets.fem_domain_mesh_asset.is_some(),
+            root_assets.fem_domain_mesh_asset.is_some(),
             "prepared config must materialize the imported FEM domain mesh"
         );
         assert!(
