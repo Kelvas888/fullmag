@@ -833,7 +833,28 @@ def ensure_configuration(paths: RuntimePaths | None = None) -> dict[str, Any]:
                 assert_owner_lock()
                 _rotate_configuration_generation(paths, current, expected, previous_sha256)
         else:
-            _rotate_configuration_generation(paths, current, expected, previous_sha256)
+            # A direct recreate pin is one-shot.  After its first successful
+            # rotation, the same Compose environment can survive a later
+            # restart while still carrying the old digest.  Do not treat a
+            # stale pin as authorization for the new current bytes: require
+            # the same authenticated terminal drain used by an ordinary
+            # restart, then derive the exact digest while holding its owner
+            # lock.  Failed/unknown owners cannot satisfy that fence.
+            current_raw = _bounded_regular(
+                paths.config, "runtime configuration before stale-pin check"
+            )
+            if hashlib.sha256(current_raw).hexdigest() != previous_sha256:
+                with _authenticated_terminal_drain(paths) as assert_owner_lock:
+                    previous_sha256 = hashlib.sha256(
+                        _bounded_regular(
+                            paths.config,
+                            "runtime configuration before stale-pin rotation",
+                        )
+                    ).hexdigest()
+                    assert_owner_lock()
+                    _rotate_configuration_generation(paths, current, expected, previous_sha256)
+            else:
+                _rotate_configuration_generation(paths, current, expected, previous_sha256)
         return expected
     return current
 

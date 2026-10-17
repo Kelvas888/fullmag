@@ -1239,6 +1239,89 @@ class DockerRuntimeContract(unittest.TestCase):
             self.assertEqual(sentinel.read_bytes(), b"user session remains intact")
 
     @unittest.skipIf(os.name == "nt", "Guest owner lock is qualified on Linux")
+    def test_stale_recreate_pin_requires_authenticated_drain(self):
+        import copy
+        import hashlib
+        from dataclasses import replace
+
+        service = self.load_service()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            paths = replace(
+                service.RuntimePaths(),
+                state=root,
+                storage=root,
+                runs=root / "runs" / service.WORKTREE_ID,
+                store=root / "runs" / service.WORKTREE_ID / "session-store",
+                state_root=root / ".fullmag",
+                config=root / "runtime.json",
+            )
+            old = self.host_profile_fixture(service)["configuration"]
+            expected = copy.deepcopy(old)
+            expected["host_execution"]["runtime_generation_sha256"] = "b" * 64
+            service._atomic_json(paths.config, old, "test config")
+            original = paths.config.read_bytes()
+            current_sha = hashlib.sha256(original).hexdigest()
+            stale_sha = "f" * 64
+            self.assertNotEqual(stale_sha, current_sha)
+            self._write_authenticated_drain_fixture(
+                service, paths, include_service_owner=False
+            )
+            environment = {
+                "FULLMAG_DOCKER_HOST_EXECUTION": "1",
+                "FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256": stale_sha,
+            }
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                    service, "initialize_host_configuration", return_value=expected):
+                self.assertEqual(service.ensure_configuration(paths), expected)
+            self.assertEqual(json.loads(paths.config.read_bytes()), expected)
+            self.assertEqual(
+                (root / f"docker-all.previous-{current_sha}.json").read_bytes(),
+                original,
+            )
+            self.assertFalse((root / f"docker-all.previous-{stale_sha}.json").exists())
+
+    @unittest.skipIf(os.name == "nt", "Guest owner lock is qualified on Linux")
+    def test_stale_recreate_pin_rejects_failed_or_unknown_owner(self):
+        import copy
+        from dataclasses import replace
+
+        service = self.load_service()
+        for owner_state in ("failed", "unknown"):
+            with self.subTest(owner_state=owner_state), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                paths = replace(
+                    service.RuntimePaths(),
+                    state=root,
+                    storage=root,
+                    runs=root / "runs" / service.WORKTREE_ID,
+                    store=root / "runs" / service.WORKTREE_ID / "session-store",
+                    state_root=root / ".fullmag",
+                    config=root / "runtime.json",
+                )
+                old = self.host_profile_fixture(service)["configuration"]
+                expected = copy.deepcopy(old)
+                expected["host_execution"]["runtime_generation_sha256"] = "b" * 64
+                service._atomic_json(paths.config, old, "test config")
+                original = paths.config.read_bytes()
+                self._write_authenticated_drain_fixture(
+                    service, paths, include_service_owner=False
+                )
+                terminal_path = paths.store / "runtime-services/OWNER.json"
+                terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+                terminal["state"] = owner_state
+                service._atomic_json(terminal_path, terminal, "test invalid terminal owner")
+                environment = {
+                    "FULLMAG_DOCKER_HOST_EXECUTION": "1",
+                    "FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256": "f" * 64,
+                }
+                with patch.dict(os.environ, environment, clear=True), patch.object(
+                        service, "initialize_host_configuration", return_value=expected):
+                    with self.assertRaises(service.RuntimeServiceError):
+                        service.ensure_configuration(paths)
+                self.assertEqual(paths.config.read_bytes(), original)
+
+    @unittest.skipIf(os.name == "nt", "Guest owner lock is qualified on Linux")
     def test_ordinary_host_restart_rotates_generation_after_authenticated_drain(self):
         import copy
         import hashlib
