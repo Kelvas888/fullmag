@@ -156,6 +156,32 @@ class DockerRuntimeContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source group"):
             runtime._validate_backend_start_source_group(backend_start, source_identity)
 
+    def test_compiled_receipt_identity_rejects_building_placeholder(self):
+        with self.assertRaisesRegex(ValueError, "successful compiled receipt"):
+            runtime._backend_assembly_receipt_identity({
+                "state": "building",
+                "image_id": "sha256:" + "a" * 64,
+            })
+        assembly = {
+            "state": "succeeded",
+            "exit_code": 0,
+            "commit": "b" * 40,
+            "native_source_identity": {"head_commit_full": "b" * 40},
+            "source_digest": "c" * 64,
+            "source_snapshot_sha256": "d" * 64,
+            "live_manifest_sha256": "e" * 64,
+        }
+        self.assertEqual(
+            runtime._backend_assembly_receipt_identity(assembly),
+            {
+                "compiled_source_commit": "b" * 40,
+                "native_source_identity": assembly["native_source_identity"],
+                "source_digest": "c" * 64,
+                "source_snapshot_sha256": "d" * 64,
+                "live_manifest_sha256": "e" * 64,
+            },
+        )
+
     def test_compose_service_container_id_requires_one_valid_service(self):
         compose_args = ["compose", "--project-name", "fullmag-test"]
         with patch.object(runtime, "docker", return_value="a" * 64 + "\n") as docker_call:

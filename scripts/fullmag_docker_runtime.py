@@ -2089,6 +2089,32 @@ def _assembly_from_backend_start(inputs, receipt, provenance, *, container_id=No
     return assembly
 
 
+def _backend_assembly_receipt_identity(assembly):
+    """Return compiled source fields only from a succeeded backend assembly."""
+
+    if not isinstance(assembly, dict) or assembly.get("state") != "succeeded" \
+            or assembly.get("exit_code") != 0:
+        raise ValueError("Backend assembly is not a successful compiled receipt")
+    commit = assembly.get("commit")
+    native = assembly.get("native_source_identity")
+    source_digest = assembly.get("source_digest")
+    source_snapshot = assembly.get("source_snapshot_sha256")
+    live_manifest = assembly.get("live_manifest_sha256")
+    if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+            or not isinstance(native, dict)
+            or not isinstance(source_digest, str) or not _CONFIG_SHA256_RE.fullmatch(source_digest)
+            or not isinstance(source_snapshot, str) or not _CONFIG_SHA256_RE.fullmatch(source_snapshot)
+            or not isinstance(live_manifest, str) or not _CONFIG_SHA256_RE.fullmatch(live_manifest)):
+        raise ValueError("Backend assembly has incomplete compiled source identity")
+    return {
+        "compiled_source_commit": commit,
+        "native_source_identity": native,
+        "source_digest": source_digest,
+        "source_snapshot_sha256": source_snapshot,
+        "live_manifest_sha256": live_manifest,
+    }
+
+
 def _provisional_development_certificate(inputs, source_identity):
     """Return the pre-build certificate and delegation for the backend gate.
 
@@ -2577,7 +2603,8 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
             receipt["mounted_source_identity_at_start"] = native_identity(selected_checkout, "snapshot")
             receipt["source_selection"] = "live_windows_selected_checkout"
             receipt["source_root"] = inputs["source_root"]
-            receipt["compiled_source_commit"] = assembly["commit"]
+            if backend_start is None:
+                receipt["compiled_source_commit"] = assembly["commit"]
             receipt["frontend_source_root"] = inputs["source_root"]
             receipt["frontend_source_commit"] = inputs["source_commit"]
             receipt["frontend_observed_source_commit"] = storage.git(
@@ -2788,6 +2815,8 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
                 backend_start, backend_receipt, backend_provenance,
                 container_id=container,
             )
+            receipt.update(_backend_assembly_receipt_identity(assembly))
+            receipt["source_git_common_dir"] = assembly["source_git_common_dir"]
             storage.atomic_json(assembly_receipt, assembly)
             receipt["assembly_receipt_sha256"] = digest(assembly_receipt)
             receipt["backend_build_state"] = "succeeded"
