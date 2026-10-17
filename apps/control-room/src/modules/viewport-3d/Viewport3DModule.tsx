@@ -80,6 +80,7 @@ import {
   type VisualizationDataAdoptionIdentity,
 } from "@/kernel/visualization/useVisualizationClientAck";
 import { Button } from "@/shared/ui/Button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/Popover";
 import {
   displayUnitItemsForSourceUnit,
   formatDisplayUnitValue,
@@ -2904,7 +2905,16 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           </fieldset>
         ) : null}
         <Viewport3DFieldRefreshCountdown refresh={fieldRefresh} />
-        {!savedViewportActive ? <span>{diagnostics}</span> : null}
+        {!savedViewportActive ? (
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button className="fm-viewport-3d__render-details-trigger" size="sm" type="button" variant="secondary">Render details</Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" aria-label="Render diagnostics" className="fm-viewport-3d__render-details">
+              {diagnostics}
+            </PopoverContent>
+          </Popover>
+        ) : null}
       </div>
       {clientReady && colors ? (
         <Viewport3DCanvas

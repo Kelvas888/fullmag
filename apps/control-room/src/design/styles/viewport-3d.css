@@ -53,6 +53,15 @@
   backdrop-filter: blur(4px);
 }
 
+.fm-viewport-3d__render-details-trigger {
+  pointer-events: auto;
+}
+
+.fm-viewport-3d__render-details {
+  overflow-wrap: anywhere;
+  font-size: var(--fm-font-size-xs);
+}
+
 /* Empty HUD spans (e.g. undefined status) are hidden */
 .fm-viewport-3d__hud > span:empty {
   display: none;
