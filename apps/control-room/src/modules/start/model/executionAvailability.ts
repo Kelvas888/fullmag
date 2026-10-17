@@ -82,9 +82,10 @@ export function resolveExecutionAvailability(
 export function useExecutionAvailability(
   input: ExecutionAvailabilityInput,
 ): ExecutionAvailability {
+  const { compute, error, nodeInventory, refreshing, stale } = input;
   return useMemo(
-    () => resolveExecutionAvailability(input),
-    [input.compute, input.error, input.nodeInventory, input.refreshing, input.stale],
+    () => resolveExecutionAvailability({ compute, error, nodeInventory, refreshing, stale }),
+    [compute, error, nodeInventory, refreshing, stale],
   );
 }
 

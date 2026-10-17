@@ -138,7 +138,8 @@ fn prepared_fem_mesh(
         fullmag_ir::BackendPlanIR::FemFrequencyResponse(plan) => {
             Some(fullmag_runner::FemMeshPayload::from(plan))
         }
-        fullmag_ir::BackendPlanIR::Fdm(_)
+        fullmag_ir::BackendPlanIR::AntennaFieldOnly(_)
+        | fullmag_ir::BackendPlanIR::Fdm(_)
         | fullmag_ir::BackendPlanIR::FdmMultilayer(_)
         | fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(_) => None,
     }
