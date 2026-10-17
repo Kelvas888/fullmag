@@ -279,7 +279,7 @@ mod tests {
 
     // A framing fixture only: it intentionally does not satisfy the physical verifier.
     fn fixture() -> (Vec<u8>, BTreeMap<String, Vec<u8>>) {
-        let mut payloads = BTreeMap::new();
+        let mut payloads: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         payloads.insert("antenna/field_solutions/output/a.bin".into(), vec![1, 2, 3]);
         payloads.insert("antenna/field_solutions/output/b.bin".into(), vec![4, 5]);
         let refs: BTreeMap<_, _> = payloads
