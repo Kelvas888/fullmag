@@ -71,7 +71,7 @@ try {
     "oversized-body": "byte budget",
     "oversized-stream": "byte budget",
   };
-  for (const scenario of [...readyScenarios, "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", ...malformedMetadata, ...malformedBytes]) {
+  for (const scenario of [...readyScenarios, "stale-window", "missing-window", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", ...malformedMetadata, ...malformedBytes]) {
     const location = new URL(url); location.searchParams.set("scenario", scenario);
     await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForFunction(() => window.__antennaSpectrumFixture?.read().calls.some((call) => call.path.endsWith("/output-catalog")) && window.__antennaSpectrumFixture.read().calls.some((call) => call.path.endsWith("/source-spectra/fft")), undefined, { timeout: 60_000 });
@@ -88,6 +88,7 @@ try {
     const text = await page.locator("main").textContent();
     const gridCells = await page.getByRole("gridcell").count();
     const ready = readyScenarioSet.has(scenario), bytesFailure = malformedBytesSet.has(scenario);
+    if (scenario === "stale-window" || scenario === "missing-window") assert.ok(text.includes("configuration mismatch — recompute spectrum"), "Valid request must reject historical or absent window provenance");
     if (!ready) assert.equal(await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).count(), 0);
     if (bytesFailure) assert.ok(text.includes(binaryDiagnostics[scenario]), `${scenario} did not report the intended rejection: ${text}`);
     if (ready) {
@@ -430,6 +431,35 @@ try {
     await page.waitForTimeout(300);
     assert.equal((await page.evaluate(() => window.__antennaSpectrumFixture.read())).calls.length, restored.calls.length);
     checks.push({ name: "Source ownership change blocks stale Inspector fields and editors; restoring the owner revalidates six scoped resources without polling", passed: true });
+  }
+  {
+    const location = new URL(url); location.searchParams.set("scenario", "ready");
+    for (const field of ["component", "normalization", "window", "sampling", "target"]) {
+      location.searchParams.set("scenario", field === "window" ? "ready-large" : "ready");
+      await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await page.getByRole("grid").waitFor({ timeout: 60_000 });
+      await page.evaluate(() => { window.__spectrumConfigurationRoot = document.querySelector(".fm-inspector-panel"); });
+      const before = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+      const binaryReads = value => value.calls.filter(call => call.path.includes("/payloads/")).length;
+      await page.evaluate(field => window.__antennaSpectrumFixture.changeRequest(field), field);
+      await page.locator('[data-slot="inspector-group-content"]:visible').getByText("configuration mismatch — recompute spectrum", { exact: true }).waitFor();
+      assert.equal(await page.getByRole("gridcell").count(), 0);
+      assert.equal(await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).count(), 0);
+      const changed = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+      assert.equal(binaryReads(changed), binaryReads(before), "Changed FFT configuration must not fetch historical payloads");
+      assert.equal(await page.evaluate(() => window.__spectrumConfigurationRoot === document.querySelector(".fm-inspector-panel")), true);
+      if (field === "window") {
+        const screenshot = resolve(directory, "changed-window-stale.png");
+        await page.screenshot({ path: screenshot, fullPage: true }); screenshots.push(screenshot);
+      }
+      await page.evaluate(field => window.__antennaSpectrumFixture.changeRequest(field, true), field);
+      await page.getByRole("grid").waitFor({ timeout: 60_000 });
+      const restored = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+      assert.ok(binaryReads(restored) - binaryReads(changed) <= 4, "Restoring exact FFT configuration permits only four released payloads");
+      await page.waitForTimeout(150);
+      assert.equal((await page.evaluate(() => window.__antennaSpectrumFixture.read())).calls.length, restored.calls.length);
+      checks.push({ name: `${field}: changed FFT configuration hides historical samples/export with no binary reads; exact restoration recovers the chart without polling`, passed: true });
+    }
   }
   assert.deepEqual(pageErrors, []);
   assert.deepEqual(consoleErrors, []);

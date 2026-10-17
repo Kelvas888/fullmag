@@ -663,6 +663,7 @@ function runtimeBadge(
     case "error":
       return "result error";
     case "identity mismatch":
+    case "configuration mismatch — recompute spectrum":
       return "stale result";
     default:
       return baseBadge;

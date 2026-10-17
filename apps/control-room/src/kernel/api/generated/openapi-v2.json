@@ -3983,6 +3983,12 @@
           },
           "target": {
             "$ref": "#/components/schemas/AntennaFieldTargetResource"
+          },
+          "transform": {
+            "type": "string"
+          },
+          "window": {
+            "type": "string"
           }
         },
         "required": [
@@ -3999,6 +4005,8 @@
           "sample_count_u",
           "sample_count_v",
           "interpolation",
+          "transform",
+          "window",
           "realization",
           "outside_policy",
           "outside_count",

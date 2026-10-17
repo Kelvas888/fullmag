@@ -1118,6 +1118,16 @@ uwzględnia inkarnację. Wszystkie cztery koperty metadanych antenowych
 (field solution, source spectrum, stage catalog i inspection) jawnie zwracają
 wymagane `request_scope_epoch`; owner recheck obejmuje go również po pracy I/O.
 
+Metadane source spectrum zachowują `sampling.transform` i `sampling.window`
+z opublikowanego manifestu. Inspector porównuje je z bieżącym requestem,
+wraz z komponentem, normalizacją, portem, targetem i parametrami płaszczyzny
+próbkowania. Zachowanie tych samych request/output ID po edycji nie oznacza,
+że wcześniejszy wynik odpowiada nowej konfiguracji. Rozbieżność blokuje
+montowanie payload view i eksport; dokładne przywrócenie konfiguracji może
+ponownie udostępnić zgodny wynik bez uruchamiania obliczeń. Brak wymaganych
+metadanych nie jest dowodem zgodności. Kontrola nie zastępuje naukowej
+kwalifikacji solvera ani zgodności źródłowego rozwiązania.
+
 Control Room odczytuje tę rodzinę wyłącznie przez typowaną fasadę
 `ControlRoomApi.data.antenna` i wspólne resource hooks. Siedem hooków
 używa `useSessionScopedResourceKey`: bez potwierdzonej tożsamości sesji

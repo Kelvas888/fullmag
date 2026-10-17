@@ -19,11 +19,11 @@ import type { KernelApi } from "@/kernel/types";
 import { Button } from "@/shared/ui/Button";
 import { AntennaCompositionPanel } from "@/modules/inspector/panels/antenna/AntennaCompositionPanels";
 
-const SCENARIOS = ["ready", "ready-tied-peak", "ready-vector", "ready-unitary", "ready-large", "oversized-grid", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"] as const;
+const SCENARIOS = ["ready", "ready-tied-peak", "ready-vector", "ready-unitary", "ready-large", "stale-window", "missing-window", "oversized-grid", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"] as const;
 const subscribe = () => () => {};
 type RefreshKind = "metadata" | "catalog" | "power";
 interface Evidence { scenario: string; calls: { path: string; scope: string | null }[]; unexpected: string[]; pending: number; streamCancelled: boolean; snapshots: Record<RefreshKind, { status: string; hasData: boolean; error: string | null }>; }
-declare global { interface Window { __antennaSpectrumFixture?: { read(): Evidence; refresh(kind: RefreshKind): void; release(fail?: boolean): void; rebindSource(foreign: boolean): void; }; } }
+declare global { interface Window { __antennaSpectrumFixture?: { read(): Evidence; refresh(kind: RefreshKind): void; release(fail?: boolean): void; rebindSource(foreign: boolean): void; changeRequest(field: "component" | "normalization" | "window" | "sampling" | "target", restore?: boolean): void; }; } }
 
 function makeFixture() {
   const scenario = new URL(window.location.href).searchParams.get("scenario") ?? "ready";
@@ -31,7 +31,7 @@ function makeFixture() {
   const calls: Evidence["calls"] = [], unexpected: string[] = [];
   const owner = { session_id: "spectrum-fixture", session_epoch: "spectrum-fixture@1:tombstone:0", request_scope_epoch: "11111111-1111-4111-8111-111111111111:1" };
   const vector = scenario === "ready-vector";
-  const uCount = scenario === "ready-large" ? 65 : 2, vCount = scenario === "ready-large" ? 67 : 2;
+  const uCount = scenario === "ready-large" ? 65 : scenario === "stale-window" ? 3 : 2, vCount = scenario === "ready-large" ? 67 : scenario === "stale-window" ? 3 : 2;
   const cellCount = uCount * vCount;
   const normalization = scenario === "ready-unitary" ? "unitary_discrete" : "integral_si";
   const amplitudeUnit = normalization === "integral_si" ? "A*m/A" : "A/m/A";
@@ -51,8 +51,10 @@ function makeFixture() {
     ...owner, schema_version: "antenna_source_spectrum_artifact.v2", resource_id: "fixture", output_id: "fft", request_id: scenario === "foreign-request" ? "foreign" : "request", solution_id: "basis", solution_content_digest: scenario === "foreign-digest" ? "foreign-digest" : "basis-digest", content_digest: "fft-digest", source_object_id: "antenna", port_mode_id: "port", quantity: "H_ant_source_spectrum", component: vector ? "vector_power" : "x", component_labels: vector ? ["x", "y", "z"] : ["x"], amplitude_unit: amplitudeUnit, wave_vector_unit: "rad/m", normalization, coherent_gain: 1, equivalent_noise_bandwidth_bins: 1, field_signature: "fixture", k_u_count: uCount, k_v_count: vCount, amplitude_count: cellCount * (vector ? 3 : 1), power_count: cellCount,
     payload: { content_type: "application/octet-stream", format: "fixture", path: "fixture" },
     payloads: { k_u_rad_per_m: descriptor("k_u_rad_per_m"), k_v_rad_per_m: descriptor("k_v_rad_per_m"), amplitudes_re_im: descriptor("amplitudes_re_im"), power: descriptor("power") },
-    sampling: { ...plane, schema_version: "fixture", target: { kind: "global" }, solution_id: "basis", source_object_id: "antenna", port_mode_id: "port", source_sample_count: cellCount, realization: "fixture", mapping_digest: "fixture", outside_count: 0, fourier_origin_uv_m: [0, 0], fourier_phase_convention: "fixture" },
+    sampling: { ...plane, transform: "spatial_fft", window: "rectangular", schema_version: "fixture", target: { kind: "global" }, solution_id: "basis", source_object_id: "antenna", port_mode_id: "port", source_sample_count: cellCount, realization: "fixture", mapping_digest: "fixture", outside_count: 0, fourier_origin_uv_m: [0, 0], fourier_phase_convention: "fixture" },
   };
+  if (scenario === "stale-window") scene.antenna_spectrum_requests[0]!.window = "hann";
+  if (scenario === "missing-window") Reflect.deleteProperty(spectrum.sampling, "window");
   if (scenario === "oversized-grid") {
     spectrum.k_u_count = 4096; spectrum.k_v_count = 4096;
     spectrum.power_count = 4096 ** 2; spectrum.amplitude_count = spectrum.power_count;
@@ -145,6 +147,16 @@ function makeFixture() {
       resources.invalidate(kind === "power" ? powerKey : heldPath, ++refreshRevision);
     },
     release: (fail = false) => { if (!pending) throw new Error("No held refresh to release"); pending.release(fail); },
+    changeRequest: (field: "component" | "normalization" | "window" | "sampling" | "target", restore = false) => {
+      const request = scene.antenna_spectrum_requests[0]!;
+      if (field === "component") request.component = restore ? "x" : "y";
+      if (field === "normalization") request.normalization = restore ? normalization : "unitary_discrete";
+      if (field === "window") request.window = restore ? "rectangular" : "hann";
+      if (field === "sampling") request.sampling_plane = { ...plane, extent_u_m: restore ? plane.extent_u_m : 2 * plane.extent_u_m };
+      if (field === "target") request.target = restore ? { kind: "global" } : { kind: "object", object_id: "other" } as typeof request.target;
+      scene.revision++;
+      resources.invalidate(MODEL_SCENE_PATH, ++refreshRevision);
+    },
     rebindSource: (foreign: boolean) => {
       scene.antenna_field_solve_stages[0]!.source_object_id = foreign ? "other" : "antenna";
       scene.revision++;

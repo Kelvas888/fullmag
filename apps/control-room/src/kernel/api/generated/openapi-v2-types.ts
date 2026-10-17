@@ -5807,6 +5807,8 @@ export interface components {
             source_object_id: string;
             source_sample_count: number;
             target: components["schemas"]["AntennaFieldTargetResource"];
+            transform: string;
+            window: string;
         };
         /** @enum {string} */
         AntennaSpectrumTransformResource: "spatial_fft" | "nonuniform_spatial_fft";

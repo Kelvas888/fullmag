@@ -30,6 +30,7 @@ export interface AntennaRuntimeIds {
   spectrumRequestId: string | null;
   stageId: string | null;
   publishedRef: { assetId: string; contentDigest: string; stageId: string } | null;
+  spectrumRequest?: AntennaSpectrumRequest;
 }
 
 function fieldSolutionOutputId(stage: AntennaSolveStage | undefined): string | null {
@@ -102,6 +103,25 @@ export function antennaFieldSolutionIdentityStatus(
   return "ready";
 }
 
+function spectrumConfigurationMatches(request: AntennaSpectrumRequest, data: AntennaSourceSpectrumResource): boolean {
+  const plane = request.sampling_plane;
+  const sampling = data.sampling;
+  const targetKey = (target: AntennaSpectrumRequest["target"]) => target.kind === "global"
+    ? [target.kind] : target.kind === "object" ? [target.kind, target.object_id]
+      : [target.kind, target.object_id, target.region_id];
+  const sameVector = (a: number[], b: number[]) => a.length === b.length && a.every((value, index) => value === b[index]);
+  return request.component === data.component && request.normalization === data.normalization &&
+    request.transform === sampling.transform && request.window === sampling.window &&
+    (!request.port_mode_id || request.port_mode_id === data.port_mode_id) &&
+    sampling.port_mode_id === data.port_mode_id && sampling.source_object_id === data.source_object_id &&
+    JSON.stringify(targetKey(request.target)) === JSON.stringify(targetKey(sampling.target)) &&
+    sameVector(plane.origin_m, sampling.origin_m) && sameVector(plane.axis_u, sampling.axis_u) &&
+    sameVector(plane.axis_v, sampling.axis_v) && plane.extent_u_m === sampling.extent_u_m &&
+    plane.extent_v_m === sampling.extent_v_m && plane.sample_count_u === sampling.sample_count_u &&
+    plane.sample_count_v === sampling.sample_count_v && plane.interpolation === sampling.interpolation &&
+    plane.outside_policy === sampling.outside_policy;
+}
+
 export function antennaSpectrumIdentityStatus(
   ids: AntennaRuntimeIds,
   spectrum: { data: AntennaSourceSpectrumResource | null; status: string },
@@ -111,6 +131,9 @@ export function antennaSpectrumIdentityStatus(
   if (spectrum.status !== "ready") return spectrum.status;
   const data = spectrum.data;
   if (!data) return "missing";
+  if (!ids.spectrumRequest || !spectrumConfigurationMatches(ids.spectrumRequest, data)) {
+    return "configuration mismatch — recompute spectrum";
+  }
   if (
     data.output_id !== ids.spectrumOutputId ||
     data.request_id !== ids.spectrumRequestId ||
@@ -200,6 +223,7 @@ export function resolveAntennaRuntimeIds(
         solutionId: request?.solution_ref.output_id ?? null,
         spectrumOutputId: request?.output_id ?? null,
         spectrumRequestId: request?.id ?? null,
+        spectrumRequest: request,
         stageId: authoredStageId(request?.solution_ref),
         publishedRef: publishedReference(request?.solution_ref),
       };

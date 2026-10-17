@@ -887,12 +887,19 @@ describe("AntennaCompositionPanel runtime results", () => {
       expect(container.textContent).not.toContain("Stage catalog result");
       expect(findGroupBadge(container, "configured · result pending")).toBeDefined();
       mocks.sourceSpectrum.status = "ready";
+      const request = (mocks.scene.data as SceneResource).antenna_spectrum_requests![0];
       mocks.sourceSpectrum.data = {
+        component: request.component,
+        normalization: request.normalization,
+        port_mode_id: request.port_mode_id,
+        source_object_id: "antenna-1",
         output_id: "fft-1",
         request_id: "spectrum-1",
         solution_id: "h-ant-1",
         solution_content_digest: "other-digest",
-        sampling: { solution_id: "h-ant-1" },
+        sampling: { ...request.sampling_plane, target: request.target,
+          transform: request.transform, window: request.window,
+          solution_id: "h-ant-1", source_object_id: "antenna-1", port_mode_id: request.port_mode_id },
       } as AntennaSourceSpectrumResource;
       await act(async () => root.render(
         <AntennaCompositionPanel kind="spectrum" selection={spectrumSelection()} />,
