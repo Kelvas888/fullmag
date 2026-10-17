@@ -324,6 +324,7 @@ jobs:
         run: |
           cargo test -p fullmag-api --bin fullmag-api accepted_fem_
           cargo test -p fullmag-api --bin fullmag-api-accepted-worker accepted_fem_
+          cargo test -p fullmag-api --bin fullmag-api-accepted-fem-preparation-scheduler typed_writer_busy_retry_preserves_preparation_launch_identity
           cargo test -p fullmag-api --bin fullmag-api common_host_launch_gate_
           cargo test -p fullmag-api --bin fullmag-api-accepted-worker common_host_launch_gate_
           cargo test -p fullmag-runner --lib fem_gpu_execution_receipt_contract_tests
