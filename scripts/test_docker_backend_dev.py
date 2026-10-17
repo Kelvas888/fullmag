@@ -66,6 +66,12 @@ class BackendPackageTests(unittest.TestCase):
             path = source.joinpath(*relative.split("/"))
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"native-library")
+        launcher = source / "bin/fullmag"
+        launcher.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        (source / "direct-backend-build.log").write_text(
+            "direct build fixture\n", encoding="utf-8"
+        )
         return workspace
 
     def _published_package(self, root):
@@ -755,7 +761,12 @@ class BackendPackageTests(unittest.TestCase):
             for archive in archives:
                 self.assertEqual(
                     {path.name for path in archive.iterdir()},
-                    {"backend-build-receipt.json", "rotation.json", "retention.json"},
+                    {
+                        "backend-build-receipt.json",
+                        "rotation.json",
+                        "direct-backend-build.log",
+                        "retention.json",
+                    },
                 )
             backend._validate_retention_archives(
                 control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME
@@ -1037,6 +1048,37 @@ class BackendPackageTests(unittest.TestCase):
                 ),
                 0,
             )
+
+    def test_retention_rejects_unrecorded_nested_backup_entries(self):
+        for relative, is_directory in (
+            ("bin/foreign-result.dat", False),
+            ("unexpected-empty", True),
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                package, control, _toolchain = self._rotated_package_fixture(
+                    Path(directory), versions=3
+                )
+                backups_root = control / backend.PACKAGE_BACKUPS_DIRNAME
+                backups = sorted(backups_root.glob(".backend-package-backup-*"))
+                target = backups[0] / relative
+                if is_directory:
+                    target.mkdir()
+                else:
+                    target.write_bytes(b"foreign result\n")
+                current = backend._validated_package(
+                    package, "retention fixture current", exclude_development_control=True
+                )
+                before = {backup.name for backup in backups}
+                with self.assertRaises(backend.BackendBuildError):
+                    backend._retain_package_backups(package, control, current[0], current[1])
+                self.assertEqual(
+                    {backup.name for backup in backups_root.glob(".backend-package-backup-*")},
+                    before,
+                )
+                self.assertTrue(target.exists())
+                self.assertEqual(
+                    list((control / backend.PACKAGE_RETENTION_ARCHIVE_DIRNAME).iterdir()), []
+                )
 
     def test_retention_preserves_corrupt_backup_and_does_not_touch_current_package(self):
         with tempfile.TemporaryDirectory() as directory:

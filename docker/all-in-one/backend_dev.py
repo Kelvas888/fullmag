@@ -1766,6 +1766,33 @@ def _validated_package(
     )
 
 
+def _assert_exact_backup_inventory(
+    root: Path, receipt: Mapping[str, Any], name: str
+) -> None:
+    """Reject unrecorded package files before an obsolete backup is removed."""
+
+    artifacts = receipt.get("artifacts")
+    if not isinstance(artifacts, list):
+        _fail(f"{name} receipt artifact inventory is invalid")
+    allowed_files = {"backend-build-receipt.json", "rotation.json", "bin/fullmag"}
+    for index, artifact in enumerate(artifacts):
+        if not isinstance(artifact, Mapping) or not isinstance(artifact.get("path"), str):
+            _fail(f"{name} receipt artifact {index} has no safe path")
+        allowed_files.add(str(artifact["path"]))
+    build_log = root / "direct-backend-build.log"
+    if build_log.exists() or build_log.is_symlink():
+        allowed_files.add("direct-backend-build.log")
+    actual_files, actual_directories = _stage_tree_inventory(root)
+    allowed_directories: set[str] = set()
+    for relative in allowed_files:
+        parts = PurePosixPath(relative).parts
+        allowed_directories.update(
+            PurePosixPath(*parts[:index]).as_posix() for index in range(1, len(parts))
+        )
+    if actual_files != allowed_files or actual_directories != allowed_directories:
+        _fail(f"{name} has an unrecognized file or directory inventory")
+
+
 def _preflight_candidate_storage(build_root: Path, receipt: Mapping[str, Any]) -> None:
     """Reject a known-too-small cache before starting an expensive rebuild.
 
@@ -2356,6 +2383,9 @@ def _retain_package_backups(
         _assert_safe_tree(backup, f"backend package backup {backup.name}")
         receipt, receipt_bytes, children = _validated_package(
             backup, f"backend package backup {backup.name}"
+        )
+        _assert_exact_backup_inventory(
+            backup, receipt, f"backend package backup {backup.name}"
         )
         mode, build, toolchain = _retention_receipt_identity(
             receipt, f"backend package backup {backup.name}"
