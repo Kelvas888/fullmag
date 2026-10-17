@@ -32,16 +32,19 @@ IMAGE_LABEL = "fm-be-cache-v1"
 LEGACY_CACHE_SIZE_BYTES = 12 * 1024 * 1024 * 1024
 CACHE_SIZE_BYTES = 24 * 1024 * 1024 * 1024
 EXTENDED_CACHE_SIZE_BYTES = 40 * 1024 * 1024 * 1024
+MAX_CACHE_SIZE_BYTES = 50 * 1024 * 1024 * 1024
 SUPPORTED_CACHE_SIZE_BYTES = frozenset({
     LEGACY_CACHE_SIZE_BYTES,
     CACHE_SIZE_BYTES,
     EXTENDED_CACHE_SIZE_BYTES,
+    MAX_CACHE_SIZE_BYTES,
 })
 NEW_BACKING_FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024
 GROWTH_FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024
 GROWTH_SCHEMA = "fullmag.backend-build-cache-growth.v1"
 GROWTH_V1_SUFFIX = ".growth-v1.json"
 GROWTH_V2_SUFFIX = ".growth-v2.json"
+GROWTH_V3_SUFFIX = ".growth-v3.json"
 MOUNT_TARGET = "/fullmag-backend-cache"
 GUEST_TARGET = "/build"
 DAEMON_HOST_PREFIX = "/run/desktop/mnt/host"
@@ -242,7 +245,7 @@ def _cache_paths(layout: Mapping[str, Any], key: str) -> dict[str, Any]:
 
 def _require_cache_size(value: Any, label: str = "cache size") -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value not in SUPPORTED_CACHE_SIZE_BYTES:
-        raise BackendCacheError(f"{label} must be exactly 12 GiB, 24 GiB, or 40 GiB")
+        raise BackendCacheError(f"{label} must be exactly 12 GiB, 24 GiB, 40 GiB, or 50 GiB")
     return value
 
 
@@ -304,6 +307,7 @@ def _guard_growth_space(
     if (previous_size, target_size) not in {
         (LEGACY_CACHE_SIZE_BYTES, CACHE_SIZE_BYTES),
         (CACHE_SIZE_BYTES, EXTENDED_CACHE_SIZE_BYTES),
+        (EXTENDED_CACHE_SIZE_BYTES, MAX_CACHE_SIZE_BYTES),
     }:
         raise BackendCacheError("backend cache growth requires an adjacent supported capacity")
     current = _existing_backing_size(backing)
@@ -330,6 +334,7 @@ def _growth_journal_path(backing: Path, previous_size: int, target_size: int) ->
     suffixes = {
         (LEGACY_CACHE_SIZE_BYTES, CACHE_SIZE_BYTES): GROWTH_V1_SUFFIX,
         (CACHE_SIZE_BYTES, EXTENDED_CACHE_SIZE_BYTES): GROWTH_V2_SUFFIX,
+        (EXTENDED_CACHE_SIZE_BYTES, MAX_CACHE_SIZE_BYTES): GROWTH_V3_SUFFIX,
     }
     try:
         suffix = suffixes[transition]
@@ -790,8 +795,9 @@ def grow(
 
     A legacy 12 GiB cache keeps its historical default transition to 24 GiB.
     Growing an existing 24 GiB cache requires the caller to explicitly pass
-    ``target_size=EXTENDED_CACHE_SIZE_BYTES``; ordinary cache preparation never
-    performs this migration implicitly.
+    ``target_size=EXTENDED_CACHE_SIZE_BYTES``.  Growing an existing 40 GiB
+    cache likewise requires ``target_size=MAX_CACHE_SIZE_BYTES``; ordinary
+    cache preparation never performs either migration implicitly.
     """
 
     repo_path = Path(repo).resolve(strict=True)
@@ -829,10 +835,23 @@ def grow(
             target_size = EXTENDED_CACHE_SIZE_BYTES
             previous_size = CACHE_SIZE_BYTES
             resuming = True
+        elif capacity == MAX_CACHE_SIZE_BYTES and _growth_journal_is_present(
+            paths["backing_image"], identity["key"],
+            EXTENDED_CACHE_SIZE_BYTES, MAX_CACHE_SIZE_BYTES,
+        ):
+            target_size = MAX_CACHE_SIZE_BYTES
+            previous_size = EXTENDED_CACHE_SIZE_BYTES
+            resuming = True
         else:
+            if capacity == CACHE_SIZE_BYTES:
+                required_target = "target_size=EXTENDED_CACHE_SIZE_BYTES"
+            elif capacity == EXTENDED_CACHE_SIZE_BYTES:
+                required_target = "target_size=MAX_CACHE_SIZE_BYTES"
+            else:
+                required_target = "an explicit adjacent target_size"
             raise BackendCacheError(
-                "growing an existing 24 GiB backend cache requires explicit "
-                "target_size=EXTENDED_CACHE_SIZE_BYTES"
+                "growing an existing backend cache requires explicit "
+                f"{required_target}"
             )
     target_size = _require_cache_size(target_size, "growth target size")
     if capacity == target_size:
@@ -840,6 +859,8 @@ def grow(
             previous_size = LEGACY_CACHE_SIZE_BYTES
         elif target_size == EXTENDED_CACHE_SIZE_BYTES:
             previous_size = CACHE_SIZE_BYTES
+        elif target_size == MAX_CACHE_SIZE_BYTES:
+            previous_size = EXTENDED_CACHE_SIZE_BYTES
         else:  # pragma: no cover - _require_cache_size rejects other targets.
             raise BackendCacheError("backend cache growth target is unsupported")
         if not _growth_journal_is_present(
@@ -856,6 +877,7 @@ def grow(
     transitions = {
         (LEGACY_CACHE_SIZE_BYTES, CACHE_SIZE_BYTES),
         (CACHE_SIZE_BYTES, EXTENDED_CACHE_SIZE_BYTES),
+        (EXTENDED_CACHE_SIZE_BYTES, MAX_CACHE_SIZE_BYTES),
     }
     if (previous_size, target_size) not in transitions:
         raise BackendCacheError(

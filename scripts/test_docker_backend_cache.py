@@ -40,8 +40,17 @@ class BackendCacheCapacityTests(unittest.TestCase):
             Path, "is_symlink", return_value=False
         ), mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(
             Path, "stat", return_value=SimpleNamespace(st_size=13 * 1024 * 1024 * 1024)
-        ), self.assertRaisesRegex(cache.BackendCacheError, "12 GiB, 24 GiB, or 40 GiB"):
+        ), self.assertRaisesRegex(cache.BackendCacheError, "12 GiB, 24 GiB, 40 GiB, or 50 GiB"):
             cache._existing_backing_size(backing)
+
+    def test_50_gib_capacity_is_accepted(self):
+        backing = Path("/storage/build-volumes/cache.ext4")
+        with mock.patch.object(Path, "exists", return_value=True), mock.patch.object(
+            Path, "is_symlink", return_value=False
+        ), mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(
+            Path, "stat", return_value=SimpleNamespace(st_size=cache.MAX_CACHE_SIZE_BYTES)
+        ):
+            self.assertEqual(cache._existing_backing_size(backing), cache.MAX_CACHE_SIZE_BYTES)
 
     def test_growth_requires_delta_plus_margin(self):
         backing = Path("/storage/build-volumes/cache.ext4")
@@ -64,6 +73,33 @@ class BackendCacheCapacityTests(unittest.TestCase):
                 Path("/storage"),
                 cache.CACHE_SIZE_BYTES,
                 cache.EXTENDED_CACHE_SIZE_BYTES,
+            )
+
+    def test_max_growth_requires_delta_plus_margin(self):
+        backing = Path("/storage/build-volumes/cache.ext4")
+        with mock.patch.object(Path, "exists", return_value=True), mock.patch.object(
+            Path, "is_symlink", return_value=False
+        ), mock.patch.object(cache, "_existing_backing_size", return_value=cache.EXTENDED_CACHE_SIZE_BYTES), mock.patch.object(
+            cache.shutil, "disk_usage", return_value=SimpleNamespace(free=cache.GROWTH_FREE_SPACE_MARGIN_BYTES)
+        ), self.assertRaisesRegex(cache.BackendCacheError, "growth"):
+            cache._guard_growth_space(
+                backing,
+                Path("/storage"),
+                cache.EXTENDED_CACHE_SIZE_BYTES,
+                cache.MAX_CACHE_SIZE_BYTES,
+            )
+
+    def test_growth_rejects_skipping_the_40_gib_step(self):
+        backing = Path("/storage/build-volumes/cache.ext4")
+        with mock.patch.object(Path, "exists", return_value=True), mock.patch.object(
+            Path, "is_symlink", return_value=False
+        ), mock.patch.object(cache, "_existing_backing_size", return_value=cache.CACHE_SIZE_BYTES), \
+                self.assertRaisesRegex(cache.BackendCacheError, "adjacent"):
+            cache._guard_growth_space(
+                backing,
+                Path("/storage"),
+                cache.CACHE_SIZE_BYTES,
+                cache.MAX_CACHE_SIZE_BYTES,
             )
 
     def test_partial_growth_journal_allows_24_gib_resume(self):
@@ -126,6 +162,35 @@ class BackendCacheCapacityTests(unittest.TestCase):
                 state="started",
             ))
 
+    def test_partial_growth_journal_for_max_capacity_uses_v3_suffix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            backing = Path(temporary) / "cache.ext4"
+            backing.touch()
+            journal = cache._growth_journal_path(
+                backing, cache.EXTENDED_CACHE_SIZE_BYTES, cache.MAX_CACHE_SIZE_BYTES,
+            )
+            self.assertEqual(journal.name, "cache.ext4" + cache.GROWTH_V3_SUFFIX)
+            journal.write_text(json.dumps({
+                "schema": cache.GROWTH_SCHEMA,
+                "operation": "grow",
+                "state": "started",
+                "cache_key": "c" * 64,
+                "previous_size_bytes": cache.EXTENDED_CACHE_SIZE_BYTES,
+                "size_bytes": cache.MAX_CACHE_SIZE_BYTES,
+            }))
+            self.assertTrue(cache._growth_journal_is_present(
+                backing,
+                "c" * 64,
+                cache.EXTENDED_CACHE_SIZE_BYTES,
+                cache.MAX_CACHE_SIZE_BYTES,
+            ))
+            self.assertFalse(cache._growth_journal_is_present(
+                backing,
+                "c" * 64,
+                cache.CACHE_SIZE_BYTES,
+                cache.EXTENDED_CACHE_SIZE_BYTES,
+            ))
+
 
 class BackendCacheAdmissionTests(unittest.TestCase):
     class PrepareDocker:
@@ -180,6 +245,18 @@ class BackendCacheAdmissionTests(unittest.TestCase):
             self.calls.append((args, kwargs))
             if args[0] == "compose" and "run" in args:
                 env = kwargs["environment"]
+                options = {}
+                for index, value in enumerate(args[:-1]):
+                    if value == "-e" and "=" in args[index + 1]:
+                        name, item = args[index + 1].split("=", 1)
+                        options[name] = item
+                previous_size = int(options["FULLMAG_BACKEND_CACHE_GROW_FROM_BYTES"])
+                target_size = int(options["FULLMAG_BACKEND_CACHE_GROW_TO_BYTES"])
+                growth_suffix = {
+                    (cache.LEGACY_CACHE_SIZE_BYTES, cache.CACHE_SIZE_BYTES): cache.GROWTH_V1_SUFFIX,
+                    (cache.CACHE_SIZE_BYTES, cache.EXTENDED_CACHE_SIZE_BYTES): cache.GROWTH_V2_SUFFIX,
+                    (cache.EXTENDED_CACHE_SIZE_BYTES, cache.MAX_CACHE_SIZE_BYTES): cache.GROWTH_V3_SUFFIX,
+                }[(previous_size, target_size)]
                 return json.dumps({
                     "schema": cache.SCHEMA, "profile": cache.PROFILE, "state": "grown",
                     "project_id": env[cache.ENV_PROJECT_ID], "cache_key": env[cache.ENV_KEY],
@@ -188,12 +265,12 @@ class BackendCacheAdmissionTests(unittest.TestCase):
                     "mount_target": env[cache.ENV_MOUNT_TARGET], "filesystem": "ext4",
                     "filesystem_uuid": UUID, "filesystem_label": cache.IMAGE_LABEL,
                     "loop_device": "/dev/loop7", "mount_active": True,
-                    "previous_size_bytes": cache.CACHE_SIZE_BYTES,
-                    "size_bytes": cache.EXTENDED_CACHE_SIZE_BYTES,
+                    "previous_size_bytes": previous_size,
+                    "size_bytes": target_size,
                     "runtime_image_id": env[cache.ENV_RUNTIME_IMAGE_ID],
                     "toolchain_image_id": env[cache.ENV_TOOLCHAIN_IMAGE],
                     "owner_token": TOKEN,
-                    "growth_receipt": env[cache.ENV_BACKING_IMAGE] + cache.GROWTH_V2_SUFFIX,
+                    "growth_receipt": env[cache.ENV_BACKING_IMAGE] + growth_suffix,
                 })
             return super().__call__(*args, **kwargs)
 
@@ -243,6 +320,24 @@ class BackendCacheAdmissionTests(unittest.TestCase):
                 str(cache.EXTENDED_CACHE_SIZE_BYTES),
             )
 
+    def test_prepare_admits_existing_50_gib_capacity_without_resizing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "storage").mkdir()
+            with mock.patch.object(cache, "_existing_backing_size", return_value=cache.MAX_CACHE_SIZE_BYTES), \
+                    mock.patch.object(cache, "_guard_new_backing_space") as guard:
+                profile = cache.prepare(
+                    {"project_id": "fullmag-test", "storage_root": str(root / "storage")},
+                    SCRIPTS.parent, IMAGE, root / "run", self.PrepareDocker(),
+                    source_root=root, toolchain_image=TOOLCHAIN,
+                )
+            self.assertEqual(profile["size_bytes"], cache.MAX_CACHE_SIZE_BYTES)
+            self.assertEqual(
+                profile["environment"][cache.ENV_SIZE_BYTES],
+                str(cache.MAX_CACHE_SIZE_BYTES),
+            )
+            guard.assert_called_once()
+
     def test_grow_explicitly_selects_24_to_40_transition(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -277,6 +372,58 @@ class BackendCacheAdmissionTests(unittest.TestCase):
                 f"FULLMAG_BACKEND_CACHE_GROW_TO_BYTES={cache.EXTENDED_CACHE_SIZE_BYTES}",
                 run_calls[0],
             )
+
+    def test_grow_explicitly_selects_40_to_50_transition(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "storage").mkdir()
+            docker = self.GrowthDocker()
+            with mock.patch.object(cache, "_existing_backing_size", return_value=cache.EXTENDED_CACHE_SIZE_BYTES), \
+                    mock.patch.object(cache, "_guard_growth_space") as guard:
+                profile = cache.grow(
+                    {"project_id": "fullmag-test", "storage_root": str(root / "storage")},
+                    SCRIPTS.parent,
+                    IMAGE,
+                    root / "run",
+                    docker,
+                    source_root=root,
+                    toolchain_image=TOOLCHAIN,
+                    target_size=cache.MAX_CACHE_SIZE_BYTES,
+                )
+            self.assertEqual(profile["size_bytes"], cache.MAX_CACHE_SIZE_BYTES)
+            guard.assert_called_once_with(
+                mock.ANY,
+                mock.ANY,
+                cache.EXTENDED_CACHE_SIZE_BYTES,
+                cache.MAX_CACHE_SIZE_BYTES,
+            )
+            run_calls = [args for args, _kwargs in docker.calls if args[0] == "compose" and "run" in args]
+            self.assertEqual(len(run_calls), 1)
+            self.assertIn(
+                f"FULLMAG_BACKEND_CACHE_GROW_FROM_BYTES={cache.EXTENDED_CACHE_SIZE_BYTES}",
+                run_calls[0],
+            )
+            self.assertIn(
+                f"FULLMAG_BACKEND_CACHE_GROW_TO_BYTES={cache.MAX_CACHE_SIZE_BYTES}",
+                run_calls[0],
+            )
+            self.assertTrue(any(cache.GROWTH_V3_SUFFIX in str(arg) for arg in run_calls[0]))
+
+    def test_grow_40_gib_requires_an_explicit_50_gib_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "storage").mkdir()
+            with mock.patch.object(cache, "_existing_backing_size", return_value=cache.EXTENDED_CACHE_SIZE_BYTES), \
+                    self.assertRaisesRegex(cache.BackendCacheError, "target_size=MAX_CACHE_SIZE_BYTES"):
+                cache.grow(
+                    {"project_id": "fullmag-test", "storage_root": str(root / "storage")},
+                    SCRIPTS.parent,
+                    IMAGE,
+                    root / "run",
+                    self.GrowthDocker(),
+                    source_root=root,
+                    toolchain_image=TOOLCHAIN,
+                )
 
     def test_growth_receipt_attests_size_uuid_owner_and_exact_journal(self):
         values = {
@@ -352,6 +499,46 @@ class BackendCacheAdmissionTests(unittest.TestCase):
             TOOLCHAIN,
             expected_previous_size=cache.CACHE_SIZE_BYTES,
             expected_size=cache.EXTENDED_CACHE_SIZE_BYTES,
+        )
+
+    def test_growth_receipt_attests_40_to_50_transition_and_v3_journal(self):
+        values = {
+            "project_id": "fullmag-test",
+            "cache_key": "c" * 64,
+            "backing_image": "/storage/build-volumes/cache.ext4",
+            "mount_root": "/mnt/fullmag-backend-cache-fullmag-test-cccccccccccccccc",
+            "package_root": "/mnt/fullmag-backend-cache-fullmag-test-cccccccccccccccc/package",
+            "mount_target": cache.MOUNT_TARGET,
+        }
+        receipt = {
+            "schema": cache.SCHEMA,
+            "profile": cache.PROFILE,
+            "state": "grown",
+            "project_id": values["project_id"],
+            "cache_key": values["cache_key"],
+            "backing_image": values["backing_image"],
+            "mount_root": values["mount_root"],
+            "package_root": values["mount_root"] + "/package",
+            "mount_target": values["mount_target"],
+            "filesystem": "ext4",
+            "filesystem_label": cache.IMAGE_LABEL,
+            "filesystem_uuid": UUID,
+            "loop_device": "/dev/loop7",
+            "mount_active": True,
+            "previous_size_bytes": cache.EXTENDED_CACHE_SIZE_BYTES,
+            "size_bytes": cache.MAX_CACHE_SIZE_BYTES,
+            "runtime_image_id": IMAGE,
+            "toolchain_image_id": TOOLCHAIN,
+            "owner_token": TOKEN,
+            "growth_receipt": values["backing_image"] + cache.GROWTH_V3_SUFFIX,
+        }
+        cache._validate_growth_receipt(
+            receipt,
+            values,
+            IMAGE,
+            TOOLCHAIN,
+            expected_previous_size=cache.EXTENDED_CACHE_SIZE_BYTES,
+            expected_size=cache.MAX_CACHE_SIZE_BYTES,
         )
 
     def test_mount_consumer_guard_rejects_exact_bind_even_without_cache_label(self):
@@ -475,7 +662,10 @@ admit_mounted_cache
         self.assertIn("growth_journal_state", source)
         self.assertIn('journal_line="$(growth_journal_state)"', source)
         self.assertIn("EXTENDED_IMAGE_SIZE_BYTES=42949672960", source)
+        self.assertIn("MAX_IMAGE_SIZE_BYTES=53687091200", source)
         self.assertIn(".growth-v2.json", source)
+        self.assertIn(".growth-v3.json", source)
+        self.assertIn("EXTENDED_IMAGE_SIZE_BYTES:$MAX_IMAGE_SIZE_BYTES", source)
         self.assertIn('"$GROW_TO_VALUE"', source)
         self.assertNotIn("<<<", source)
         self.assertNotIn("growth requires the cache mount to be inactive", source)
