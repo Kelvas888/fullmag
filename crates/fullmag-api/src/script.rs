@@ -1375,7 +1375,7 @@ study.relax(algorithm="projected_gradient_bb", max_steps=4, tolA=1e-30)
         };
         let study = fullmag_authoring::scene_document_to_study_plan(
             &scene,
-            "study:accepted-geometry-regression".into(),
+            "study:accepted-geometry-regression".to_owned(),
             scene.revision,
             &defaults,
         )
