@@ -360,6 +360,63 @@ class DockerRuntimeContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fence"):
             runtime._validate_startup_process_receipt(changed, authorization, startup_helper)
 
+    def test_startup_receipt_preserves_fenced_unknown_activation_diagnostic(self):
+        import docker_startup_script as startup_helper
+
+        authorization = {
+            "schema": "fullmag.docker-startup-script.v1",
+            "authorization": "explicit_startup_script",
+            "request_id": "startup-unknown-receipt-test",
+            "source_sha256": "a" * 64,
+            "source_relative": "models/scene.py",
+        }
+        diagnostic = {
+            "schema": startup_helper.STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA,
+            "state": "unknown",
+            "request_id": authorization["request_id"],
+            "source_sha256": authorization["source_sha256"],
+            "source_relative": authorization["source_relative"],
+            "durable_state": "started",
+            "error": "startup activation returned HTTP 409: session store writer is busy",
+        }
+        receipt = {
+            "schema": "fullmag.docker-process-tree.v1",
+            "state": "ready",
+            "startup_activation": diagnostic,
+        }
+
+        with self.assertRaises(runtime.StartupActivationOutcomeUnknown) as caught:
+            runtime._validate_startup_process_receipt(
+                receipt, authorization, startup_helper
+            )
+        self.assertEqual(caught.exception.diagnostic, diagnostic)
+        self.assertIn("HTTP 409", str(caught.exception))
+        self.assertEqual(
+            caught.exception.operation,
+            ["startup-activation", authorization["request_id"]],
+        )
+
+        for key, value in (
+            ("request_id", "other-request"),
+            ("source_sha256", "b" * 64),
+            ("source_relative", "other/scene.py"),
+            ("durable_state", "completed"),
+            ("error", ""),
+        ):
+            malformed = json.loads(json.dumps(receipt))
+            malformed["startup_activation"][key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "fence"):
+                runtime._validate_startup_process_receipt(
+                    malformed, authorization, startup_helper
+                )
+
+        with self.assertRaisesRegex(ValueError, "fence"):
+            runtime._validate_startup_process_receipt(receipt, authorization, None)
+        missing_schema = json.loads(json.dumps(receipt))
+        missing_schema["startup_activation"].pop("schema")
+        with self.assertRaisesRegex(ValueError, "fence"):
+            runtime._validate_startup_process_receipt(missing_schema, authorization, None)
+
     def test_static_startup_bind_requires_assembled_native_identity(self):
         expected = {"head_commit_full": "a" * 40,
                     "source_snapshot_sha256": "b" * 64,

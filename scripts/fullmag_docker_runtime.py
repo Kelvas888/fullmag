@@ -180,6 +180,19 @@ class StartupScriptRejected(RuntimeError):
         super().__init__(f"Startup script rejected; runtime remains ready: {detail['message']}")
 
 
+class StartupActivationOutcomeUnknown(RuntimeError):
+    """The API outcome is unknown after a durable started marker was published."""
+
+    def __init__(self, diagnostic):
+        self.diagnostic = dict(diagnostic)
+        request_id = self.diagnostic["request_id"]
+        self.operation = ["startup-activation", request_id]
+        super().__init__(
+            f"Startup activation {request_id!r} has an unknown outcome: "
+            f"{self.diagnostic['error']}"
+        )
+
+
 def _startup_process_receipt_path(state):
     return Path(state) / ".fullmag/runtime-service/process-tree.json"
 
@@ -194,6 +207,32 @@ def _validate_startup_process_receipt(value, authorization=None, startup_helper=
     activation = value.get("startup_activation")
     if not isinstance(activation, dict):
         raise ValueError("Runtime process-tree receipt has no startup activation")
+    diagnostic_schema = (
+        getattr(startup_helper, "STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA", None)
+        if startup_helper is not None
+        else None
+    )
+    if (
+        isinstance(diagnostic_schema, str)
+        and diagnostic_schema
+        and activation.get("schema") == diagnostic_schema
+    ):
+        if (
+            activation.get("state") != "unknown"
+            or activation.get("durable_state") != "started"
+            or not isinstance(activation.get("request_id"), str)
+            or activation.get("request_id") != authorization.get("request_id")
+            or not isinstance(activation.get("source_sha256"), str)
+            or activation.get("source_sha256") != authorization.get("source_sha256")
+            or not isinstance(activation.get("source_relative"), str)
+            or activation.get("source_relative") != authorization.get("source_relative")
+            or not isinstance(activation.get("error"), str)
+            or not activation["error"].strip()
+            or len(activation["error"]) > 4096
+            or "response" in activation
+        ):
+            raise ValueError("Runtime startup activation diagnostic fence differs from the host authorization")
+        raise StartupActivationOutcomeUnknown(activation)
     if activation.get("state") == "rejected":
         if startup_helper is None:
             raise ValueError("Startup rejection validation requires the attested helper module")
@@ -3103,6 +3142,10 @@ def start(repo, assembly_receipt, port, frontend="static", source_root=None,
         elif isinstance(error, StartupScriptRejected):
             receipt.update(startup_activation_outcome="rejected",
                            startup_activation=error.activation,
+                           runtime_state="ready", health="PASS")
+        elif isinstance(error, StartupActivationOutcomeUnknown):
+            receipt.update(startup_activation_outcome="unknown",
+                           startup_activation=error.diagnostic,
                            runtime_state="ready", health="PASS")
         elif isinstance(error, StartupOutcomeUnknown):
             receipt.update(startup_activation_outcome="unknown",
