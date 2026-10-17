@@ -453,8 +453,12 @@ def _inspect(client: Callable[..., Any], container_id: str) -> dict[str, Any]:
 
 def _engine(client: Callable[..., Any]) -> dict[str, Any]:
     engine_id = _docker_call(client, "info", "--format", "{{.ID}}", timeout=30).strip()
-    if not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", engine_id):
-        raise RecoveryAborted("Docker engine did not return an immutable ID")
+    from docker_orphan_recovery import OrphanRecoveryError, validate_engine_id
+
+    try:
+        validate_engine_id(engine_id)
+    except OrphanRecoveryError as error:
+        raise RecoveryAborted("Docker engine did not return an immutable ID") from error
     return {"ID": engine_id}
 
 

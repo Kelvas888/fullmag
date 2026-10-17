@@ -275,6 +275,27 @@ class OrphanRecoveryContractTests(unittest.TestCase):
         self.assertEqual(self.request["containers"][0]["device_requests"][0]["Count"], -1)
         self.assertEqual(validate_orphan_request(self.request)["run_id"], self.run_id)
 
+    def test_uuid_engine_identity_is_hashed_without_rewriting(self) -> None:
+        self.engine_id = "81a2002d-4c88-48aa-b4da-fed771788cfa"
+        self.engine = {"ID": self.engine_id}
+        self.request = build_orphan_request(self.pins, self.engine, self.before)
+        self.assertEqual(
+            self.request["docker_engine_id_sha256"],
+            hashlib.sha256(self.engine_id.encode("utf-8")).hexdigest(),
+        )
+        attestation = self._attestation()
+        self.assertEqual(
+            validate_teardown_attestation(self.request, attestation)["result"],
+            "authoritative_teardown",
+        )
+
+    def test_engine_identity_rejects_noncanonical_or_placeholder_values(self) -> None:
+        for value in ("", "unknown", "00000000-0000-0000-0000-000000000000",
+                      "81A2002D-4C88-48AA-B4DA-FED771788CFA", "0" * 64,
+                      "sha256:" + "0" * 64):
+            with self.subTest(value=value), self.assertRaises(OrphanRecoveryError):
+                build_orphan_request(self.pins, {"ID": value}, self.before)
+
     def test_attestation_binds_exact_request_and_factual_exit(self) -> None:
         attestation = self._attestation()
         self.assertEqual(attestation["schema_version"], TEARDOWN_ATTESTATION_SCHEMA)

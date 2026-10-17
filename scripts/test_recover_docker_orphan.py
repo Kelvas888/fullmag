@@ -542,6 +542,19 @@ class RecoveryRunnerTests(unittest.TestCase):
 
 
 class RecoveryExecutionBoundaryTests(unittest.TestCase):
+    def test_engine_probe_preserves_canonical_uuid_identity(self):
+        value = "81a2002d-4c88-48aa-b4da-fed771788cfa"
+        with mock.patch.object(recovery, "_docker_call", return_value=value + "\n"):
+            self.assertEqual(recovery._engine(lambda *a, **kw: None), {"ID": value})
+
+    def test_engine_probe_rejects_placeholder_identity(self):
+        for value in ("unknown", "00000000-0000-0000-0000-000000000000",
+                      "0" * 64, "sha256:" + "0" * 64):
+            with self.subTest(value=value), mock.patch.object(
+                recovery, "_docker_call", return_value=value
+            ), self.assertRaises(recovery.RecoveryAborted):
+                recovery._engine(lambda *a, **kw: None)
+
     def _created_maintenance_document(self, *, tamper_mount=False,
                                       tamper_tmpfs=False, runtime="runc"):
         service = recovery.maintenance_compose(

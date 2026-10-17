@@ -103,10 +103,18 @@ def _container(value: Any, label: str) -> str:
     return value
 
 
-def _engine(value: Any, label: str) -> str:
-    if not isinstance(value, str) or ENGINE_RE.fullmatch(value) is None:
+def validate_engine_id(value: Any, label: str = "Docker engine ID") -> str:
+    """Preserve Docker's canonical UUID or legacy digest identity verbatim."""
+    if not isinstance(value, str):
         _fail(f"{label} must be an immutable Docker engine ID")
-    return value
+    if ENGINE_RE.fullmatch(value) is not None:
+        _sha(value.removeprefix("sha256:"), label, nonzero=True)
+        return value
+    return _uuid_text(value, label)
+
+
+def _engine(value: Any, label: str) -> str:
+    return validate_engine_id(value, label)
 
 
 def _portable_id(value: Any, label: str) -> str:
