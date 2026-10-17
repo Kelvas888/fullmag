@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
 import { DATA_ANTENNA_SOURCE_SPECTRUM_PATH, DATA_ANTENNA_SOURCE_SPECTRUM_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, MODEL_SCENE_PATH, SESSION_STATUS_PATH, SESSIONS_PATH } from "@/kernel/api/apiPaths";
-import type { AntennaSourceSpectrumResource } from "@/kernel/api/apiTypes";
+import type { AntennaSourceSpectrumResource, SceneResource } from "@/kernel/api/apiTypes";
 import { RequestDiagnosticsController } from "@/kernel/api/RequestDiagnosticsController";
 import { EventBus } from "@/kernel/events/EventBus";
 import type { KernelEventMap } from "@/kernel/events/eventTypes";
@@ -19,11 +19,11 @@ import type { KernelApi } from "@/kernel/types";
 import { Button } from "@/shared/ui/Button";
 import { AntennaCompositionPanel } from "@/modules/inspector/panels/antenna/AntennaCompositionPanels";
 
-const SCENARIOS = ["ready-nonuniform", "stale-nonuniform", "missing-nonuniform", "wrong-nonuniform-body", "ready-complex-vector", "ready", "ready-tied-peak", "ready-vector", "ready-unitary", "ready-large", "stale-window", "missing-window", "oversized-grid", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"] as const;
+const SCENARIOS = ["ready-equilibrium-stage", "ready-equilibrium-artifact", "ready-equilibrium-legacy", "stale-equilibrium-stage", "stale-equilibrium-output", "stale-equilibrium-asset", "stale-equilibrium-id", "stale-equilibrium-digest", "stale-equilibrium-legacy", "missing-equilibrium-binding", "unrequested-equilibrium", "legacy-equilibrium-metadata", "foreign-equilibrium-schema", "ready-nonuniform", "stale-nonuniform", "missing-nonuniform", "wrong-nonuniform-body", "ready-complex-vector", "ready", "ready-tied-peak", "ready-vector", "ready-unitary", "ready-large", "stale-window", "missing-window", "oversized-grid", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"] as const;
 const subscribe = () => () => {};
 type RefreshKind = "metadata" | "catalog" | "power";
 interface Evidence { scenario: string; calls: { path: string; scope: string | null }[]; unexpected: string[]; pending: number; streamCancelled: boolean; snapshots: Record<RefreshKind, { status: string; hasData: boolean; error: string | null }>; }
-declare global { interface Window { __antennaSpectrumFixture?: { read(): Evidence; refresh(kind: RefreshKind): void; release(fail?: boolean): void; rebindSource(foreign: boolean): void; changeRequest(field: "component" | "normalization" | "window" | "sampling" | "target" | "grid", restore?: boolean): void; }; } }
+declare global { interface Window { __antennaSpectrumFixture?: { read(): Evidence; refresh(kind: RefreshKind): void; release(fail?: boolean): void; rebindSource(foreign: boolean): void; changeRequest(field: "component" | "normalization" | "window" | "sampling" | "target" | "grid" | "equilibrium", restore?: boolean): void; }; } }
 
 function makeFixture() {
   const scenario = new URL(window.location.href).searchParams.get("scenario") ?? "ready";
@@ -31,14 +31,15 @@ function makeFixture() {
   const calls: Evidence["calls"] = [], unexpected: string[] = [];
   const owner = { session_id: "spectrum-fixture", session_epoch: "spectrum-fixture@1:tombstone:0", request_scope_epoch: "11111111-1111-4111-8111-111111111111:1" };
   const nonuniform = scenario.includes("nonuniform");
-  const vector = scenario === "ready-vector" || scenario === "ready-complex-vector";
+  const equilibriumScenario = scenario.includes("equilibrium");
+  const vector = equilibriumScenario || scenario === "ready-vector" || scenario === "ready-complex-vector";
   const uCount = scenario === "ready-large" ? 65 : scenario === "stale-window" ? 3 : 2, vCount = scenario === "ready-large" ? 67 : scenario === "stale-window" ? 3 : 2;
   const cellCount = uCount * vCount;
   const normalization = scenario === "ready-unitary" ? "unitary_discrete" : "integral_si";
   const amplitudeUnit = normalization === "integral_si" ? "A*m/A" : "A/m/A";
   const plane = { origin_m: [0, 0, 0], axis_u: [1, 0, 0], axis_v: [0, 1, 0], extent_u_m: 1e-6, extent_v_m: 1e-6, sample_count_u: uCount, sample_count_v: vCount, interpolation: "fem_element", outside_policy: "error" as const };
   const ref = { kind: "stage_output", stage_id: "solve", output_id: "basis" };
-  const scene = { revision: 1, objects: [{ id: "antenna", name: "Antenna", role: "antenna" }, { id: "other", name: "Other antenna", role: "antenna" }], antenna_port_modes: [{ id: "port", source_object_id: "antenna", schema_version: "antenna_port_mode.v2", branches: [] }], antenna_field_solve_stages: [{ id: "solve", source_object_id: "antenna", port_mode_ids: ["port"], outputs: [{ id: "basis", quantity: "H_ant_basis" }] }], antenna_spectrum_requests: [{ id: "request", output_id: "fft", solution_ref: ref, target: { kind: "global" }, component: scenario === "invalid-authoring" ? "transverse" : vector ? "vector_power" : "x", transform: nonuniform ? "nonuniform_spatial_fft" : "spatial_fft", window: "rectangular", normalization, port_mode_id: "port", sampling_plane: plane, nonuniform_k_grid: nonuniform && scenario !== "missing-nonuniform" ? { k_u_rad_per_m: scenario === "stale-nonuniform" ? [-2, 1] : [-1, 1], k_v_rad_per_m: [-1, 1] } : null }] };
+  const scene = { revision: 1, objects: [{ id: "antenna", name: "Antenna", role: "antenna" }, { id: "other", name: "Other antenna", role: "antenna" }], antenna_port_modes: [{ id: "port", source_object_id: "antenna", schema_version: "antenna_port_mode.v2", branches: [] }], antenna_field_solve_stages: [{ id: "solve", source_object_id: "antenna", port_mode_ids: ["port"], outputs: [{ id: "basis", quantity: "H_ant_basis" }] }], antenna_spectrum_requests: [{ id: "request", output_id: "fft", solution_ref: ref, target: { kind: "global" }, component: scenario === "invalid-authoring" ? "transverse" : equilibriumScenario ? "transverse" : vector ? "vector_power" : "x", transform: nonuniform ? "nonuniform_spatial_fft" : "spatial_fft", window: "rectangular", normalization, port_mode_id: "port", sampling_plane: plane, equilibrium_ref: null as NonNullable<SceneResource["antenna_spectrum_requests"]>[number]["equilibrium_ref"], nonuniform_k_grid: nonuniform && scenario !== "missing-nonuniform" ? { k_u_rad_per_m: scenario === "stale-nonuniform" ? [-2, 1] : [-1, 1], k_v_rad_per_m: [-1, 1] } : null }] };
   const componentAmplitudes = Array.from({ length: cellCount * 2 }, (_, index) => index % 2 ? 0 : Math.floor(index / 2) + 1);
   const payloadValues = { k_u_rad_per_m: uCount === 2 ? [-1, 1] : Array.from({ length: uCount }, (_, index) => index - 32), k_v_rad_per_m: vCount === 2 ? [-1, 1] : Array.from({ length: vCount }, (_, index) => index - 33), amplitudes_re_im: vector ? [...componentAmplitudes, ...componentAmplitudes, ...componentAmplitudes] : componentAmplitudes, power: Array.from({ length: cellCount }, (_, index) => (index + 1) ** 2 * (vector ? 3 : 1)) };
   if (scenario === "ready-tied-peak") {
@@ -53,11 +54,36 @@ function makeFixture() {
   const layouts = { k_u_rad_per_m: "axis_u_1d", k_v_rad_per_m: "axis_v_1d", amplitudes_re_im: "component_kv_ku_complex_re_im", power: "kv_ku_power" };
   const descriptor = (kind: PayloadKind) => ({ path: `antenna/source_spectra/fft/${kind}.f64le`, sha256: nonuniform && kind.startsWith("k_") ? "sha256:723f1c3eac1d2c306857db9f4466b219af88d13fb056836892154fcd058c55d5" : `sha256:${"b".repeat(64)}`, value_count: payloadValues[kind].length, scalar_type: "float64_le", layout: layouts[kind], unit: kind.startsWith("k_") ? "rad/m" : kind === "power" ? `(${amplitudeUnit})^2` : amplitudeUnit });
   const spectrum: AntennaSourceSpectrumResource = {
-    ...owner, schema_version: "antenna_source_spectrum_artifact.v2", resource_id: "fixture", output_id: "fft", request_id: scenario === "foreign-request" ? "foreign" : "request", solution_id: "basis", solution_content_digest: scenario === "foreign-digest" ? "foreign-digest" : "basis-digest", content_digest: "fft-digest", source_object_id: "antenna", port_mode_id: "port", quantity: "H_ant_source_spectrum", component: vector ? "vector_power" : "x", component_labels: vector ? ["x", "y", "z"] : ["x"], amplitude_unit: amplitudeUnit, wave_vector_unit: "rad/m", normalization, coherent_gain: 1, equivalent_noise_bandwidth_bins: 1, field_signature: "fixture", k_u_count: uCount, k_v_count: vCount, amplitude_count: cellCount * (vector ? 3 : 1), power_count: cellCount,
+    ...owner, schema_version: "antenna_source_spectrum_artifact.v2", resource_id: "fixture", output_id: "fft", request_id: scenario === "foreign-request" ? "foreign" : "request", solution_id: "basis", solution_content_digest: scenario === "foreign-digest" ? "foreign-digest" : "basis-digest", content_digest: "fft-digest", source_object_id: "antenna", port_mode_id: "port", quantity: "H_ant_source_spectrum", component: equilibriumScenario ? "transverse" : vector ? "vector_power" : "x", component_labels: vector ? ["x", "y", "z"] : ["x"], amplitude_unit: amplitudeUnit, wave_vector_unit: "rad/m", normalization, coherent_gain: 1, equivalent_noise_bandwidth_bins: 1, field_signature: "fixture", k_u_count: uCount, k_v_count: vCount, amplitude_count: cellCount * (vector ? 3 : 1), power_count: cellCount,
     payload: { content_type: "application/octet-stream", format: "fixture", path: "fixture" },
     payloads: { k_u_rad_per_m: descriptor("k_u_rad_per_m"), k_v_rad_per_m: descriptor("k_v_rad_per_m"), amplitudes_re_im: descriptor("amplitudes_re_im"), power: descriptor("power") },
     sampling: { ...plane, transform: nonuniform ? "nonuniform_spatial_fft" : "spatial_fft", window: "rectangular", schema_version: "fixture", target: { kind: "global" }, solution_id: "basis", source_object_id: "antenna", port_mode_id: "port", source_sample_count: cellCount, realization: "fixture", mapping_digest: "fixture", outside_count: 0, fourier_origin_uv_m: [0, 0], fourier_phase_convention: "fixture" },
   };
+  if (scenario.includes("equilibrium")) {
+    const binding: NonNullable<AntennaSourceSpectrumResource["equilibrium_binding"]> = {
+      schema_version: "antenna_equilibrium_binding.v1", producer_contract: "fixture", resolved_execution_engine: "fixture",
+      asset_id: "a".repeat(64), equilibrium_id: `antenna_accepted_equilibrium.v1:${"b".repeat(64)}`, content_digest: `sha256:${"c".repeat(64)}`, source_run_id: "eq-run", source_stage_id: "eq-runtime-stage", authored_stage_id: "relax",
+      completion_sha256: "fixture", acceptance_certificate_sha256: "fixture", recomputed_certificate_sha256: "fixture", certified_fields_sha256: "fixture", equilibrium_content_sha256: "fixture",
+      mesh_generation_id: "fixture", mesh_topology_sha256: "fixture", indexing_sha256: "fixture", part_registry_sha256: "fixture", owning_plan_sha256: "fixture",
+      material_signature: "fixture", static_physics_signature: "fixture", boundary_signature: "fixture", static_demag_sha256: "fixture", source_carrier_sha256: "fixture",
+      source_solution_ref: null, target: { kind: "global" }, mapping_digest: "fixture", normalization: "fixture", norm_floor: 1e-12, projection_version: "fixture",
+    };
+    spectrum.schema_version = scenario === "legacy-equilibrium-metadata" ? "antenna_source_spectrum_artifact.v2" : "antenna_source_spectrum_artifact.v3";
+    spectrum.equilibrium_binding = scenario === "missing-equilibrium-binding" ? null : binding;
+    if (scenario === "foreign-equilibrium-schema") binding.schema_version = "unsupported";
+    const request = scene.antenna_spectrum_requests[0]!;
+    request.equilibrium_ref = scenario.endsWith("legacy") ? binding.equilibrium_id
+      : ["ready-equilibrium-artifact", "stale-equilibrium-asset", "stale-equilibrium-id", "stale-equilibrium-digest"].includes(scenario)
+        ? { kind: "artifact", asset_id: "a".repeat(64), equilibrium_id: `antenna_accepted_equilibrium.v1:${"b".repeat(64)}`, content_digest: `sha256:${"c".repeat(64)}` }
+        : { kind: "stage_output", stage_id: "relax", output_id: "accepted_equilibrium" };
+    if (scenario === "stale-equilibrium-stage") request.equilibrium_ref = { kind: "stage_output", stage_id: "other", output_id: "accepted_equilibrium" };
+    if (scenario === "stale-equilibrium-output") request.equilibrium_ref = { kind: "stage_output", stage_id: "relax", output_id: "other" };
+    if (scenario === "stale-equilibrium-legacy") binding.equilibrium_id = `antenna_accepted_equilibrium.v1:${"d".repeat(64)}`;
+    if (scenario === "stale-equilibrium-asset") binding.asset_id = "other";
+    if (scenario === "stale-equilibrium-id") binding.equilibrium_id = "other";
+    if (scenario === "stale-equilibrium-digest") binding.content_digest = "other";
+    if (scenario === "unrequested-equilibrium") { request.equilibrium_ref = null; request.component = "x"; }
+  }
   if (scenario === "stale-window") scene.antenna_spectrum_requests[0]!.window = "hann";
   if (scenario === "missing-window") Reflect.deleteProperty(spectrum.sampling, "window");
   if (scenario === "oversized-grid") {
@@ -153,8 +179,9 @@ function makeFixture() {
       resources.invalidate(kind === "power" ? powerKey : heldPath, ++refreshRevision);
     },
     release: (fail = false) => { if (!pending) throw new Error("No held refresh to release"); pending.release(fail); },
-    changeRequest: (field: "component" | "normalization" | "window" | "sampling" | "target" | "grid", restore = false) => {
+    changeRequest: (field: "component" | "normalization" | "window" | "sampling" | "target" | "grid" | "equilibrium", restore = false) => {
       const request = scene.antenna_spectrum_requests[0]!;
+      if (field === "equilibrium") request.equilibrium_ref = { kind: "stage_output", stage_id: restore ? "relax" : "other", output_id: "accepted_equilibrium" };
       if (field === "grid") request.nonuniform_k_grid = { k_u_rad_per_m: restore ? [-1, 1] : [-2, 1], k_v_rad_per_m: [-1, 1] };
       if (field === "component") request.component = restore ? "x" : "y";
       if (field === "normalization") request.normalization = restore ? normalization : "unitary_discrete";

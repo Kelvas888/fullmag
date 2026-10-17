@@ -5398,7 +5398,57 @@ export interface components {
             /** @description Field of the run's validation intent that bounds the compared |k| [rad/m]. */
             wavevector_limit_source: string;
         };
+        AntennaClosedLoopInspectionDisplayResource: {
+            capabilities: components["schemas"]["AntennaInspectionDisplayCapabilities"];
+            closed_loop_display: unknown;
+            content_digest: string;
+            normalization: string;
+            record_content_digest: string;
+            request_scope_epoch: string;
+            resource_id: string;
+            run_id: string;
+            runtime_stage_id: string;
+            schema_version: string;
+            session_epoch: string;
+            session_id: string;
+            /** Format: int64 */
+            stage_revision: number;
+        };
+        AntennaEquilibriumBindingResource: {
+            acceptance_certificate_sha256: string;
+            asset_id: string;
+            authored_stage_id: string;
+            boundary_signature: string;
+            certified_fields_sha256: string;
+            completion_sha256: string;
+            content_digest: string;
+            equilibrium_content_sha256: string;
+            equilibrium_id: string;
+            indexing_sha256: string;
+            mapping_digest: string;
+            material_signature: string;
+            mesh_generation_id: string;
+            mesh_topology_sha256: string;
+            /** Format: double */
+            norm_floor: number;
+            normalization: string;
+            owning_plan_sha256: string;
+            part_registry_sha256: string;
+            producer_contract: string;
+            projection_version: string;
+            recomputed_certificate_sha256: string;
+            resolved_execution_engine: string;
+            schema_version: string;
+            source_carrier_sha256: string;
+            source_run_id: string;
+            source_solution_ref?: null | components["schemas"]["AntennaFieldSolutionRefResource"];
+            source_stage_id: string;
+            static_demag_sha256: string;
+            static_physics_signature: string;
+            target: components["schemas"]["FieldTargetResource"];
+        };
         AntennaExternalLeadInspectionResource: components["schemas"]["AntennaInspectionStageRecordResource"] & {
+            closed_loop_manifest?: unknown;
             manifest?: null | components["schemas"]["AntennaInspectionManifestResource"];
             record_content_digest: string;
             request_scope_epoch: string;
@@ -5556,6 +5606,7 @@ export interface components {
             source_object_id: string;
             status: string;
         };
+        AntennaInspectionDisplayFamilyResource: components["schemas"]["AntennaInspectionDisplayResource"] | components["schemas"]["AntennaClosedLoopInspectionDisplayResource"];
         AntennaInspectionDisplayResource: {
             capabilities: components["schemas"]["AntennaInspectionDisplayCapabilities"];
             content_digest: string;
@@ -5610,13 +5661,15 @@ export interface components {
             validation_scope: string;
         };
         AntennaInspectionOutputResource: {
+            content_digest?: string | null;
             inspection_ref: components["schemas"]["AntennaInspectionReferenceResource"];
             kind: string;
             manifest_ref: string;
             payload_units: {
                 [key: string]: string;
             };
-            reused_existing: boolean;
+            reused_existing?: boolean;
+            source?: unknown;
         };
         AntennaInspectionPayloadResource: {
             /** Format: int64 */
@@ -5651,6 +5704,7 @@ export interface components {
             qualification: string;
             resolved_action: string;
             schema_version: string;
+            source_object_id?: string | null;
             stage_id: string;
             stage_kind: string;
             status: string;
@@ -5708,6 +5762,7 @@ export interface components {
             component: string;
             component_labels: string[];
             content_digest: string;
+            equilibrium_binding?: null | components["schemas"]["AntennaEquilibriumBindingResource"];
             /** Format: double */
             equivalent_noise_bandwidth_bins: number;
             field_signature: string;
@@ -5754,7 +5809,7 @@ export interface components {
         };
         AntennaSpectrumRequestResource: {
             component: string;
-            equilibrium_ref?: string | null;
+            equilibrium_ref?: null | components["schemas"]["EquilibriumRefResource"];
             id: string;
             mode_basis_ref?: string | null;
             nonuniform_k_grid?: null | components["schemas"]["AntennaSpectrumKGridResource"];
@@ -6947,6 +7002,19 @@ export interface components {
             revision: number;
             total: number;
         };
+        EquilibriumRefResource: components["schemas"]["EquilibriumReferenceResource"] | string;
+        EquilibriumReferenceResource: {
+            /** @enum {string} */
+            kind: "stage_output";
+            output_id: string;
+            stage_id: string;
+        } | {
+            asset_id: string;
+            content_digest: string;
+            equilibrium_id: string;
+            /** @enum {string} */
+            kind: "artifact";
+        };
         /** @enum {string} */
         ExecutionBackendSchema: "auto" | "fdm" | "fem" | "hybrid";
         /** @enum {string} */
@@ -7590,6 +7658,7 @@ export interface components {
             value: number;
         };
         FieldPublicationBinding: {
+            artifact_field_locator?: null | components["schemas"]["ArtifactFieldLocatorResource"];
             carrier_fingerprint: string;
             carrier_id: string;
             component: string;
@@ -7841,7 +7910,7 @@ export interface components {
         };
         /** @description Query parameters for the `/fields/{quantity_id}/vector` endpoint. */
         FieldVectorQuery: {
-            /** @description Exact immutable artifact carrier selector; unsupported until its provider is integrated. */
+            /** @description Exact immutable artifact carrier selector. */
             carrier_id?: string | null;
             /**
              * @description Component to return.
@@ -20521,7 +20590,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Inspection record and manifest-only metadata; never a drive basis */
+            /** @description Inspection record; external-lead manifest metadata or fully verified closed-loop thin metadata; never a drive basis */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -20530,7 +20599,7 @@ export interface operations {
                     "application/json": components["schemas"]["AntennaExternalLeadInspectionResource"];
                 };
             };
-            /** @description Unchanged manifest-only resource */
+            /** @description Unchanged inspection resource after family validation */
             304: {
                 headers: {
                     [name: string]: unknown;
@@ -20601,7 +20670,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AntennaInspectionDisplayResource"];
+                    "application/json": components["schemas"]["AntennaInspectionDisplayFamilyResource"];
                 };
             };
             /** @description Unchanged after integrity validation */
@@ -21238,13 +21307,6 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Immutable artifact carrier selectors are not supported by this runtime */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
             /** @description No active workspace */
             404: {
                 headers: {
@@ -21505,8 +21567,13 @@ export interface operations {
     data_get_sessions_current_data_fields_quantity_id_availability: {
         parameters: {
             query?: {
-                carrier_id?: string | null;
+                /** @description Exact runtime stage that owns the immutable inspection. */
                 stage_id?: string | null;
+                /** @description Exact immutable carrier selected from field metadata. */
+                carrier_id?: string | null;
+                /** @description Optional inspection view: full or explicit J_charge cell_centers. */
+                view?: string | null;
+                /** @description Canonical nonzero decimal u64 precondition for the immutable carrier. */
                 expected_carrier_revision?: string | null;
                 /** @description Stable canonical frontend target identity. Airbox always uses `airbox`. */
                 target_id?: string | null;
@@ -21555,13 +21622,20 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Ambiguous owner, immutable carrier mismatch, or changed observation */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     data_get_sessions_current_data_fields_quantity_id_meta: {
         parameters: {
             query?: {
-                /** @description Exact immutable artifact carrier; unsupported until its provider is integrated. */
                 carrier_id?: string | null;
+                view?: string | null;
                 expected_carrier_revision?: string | null;
                 /** @description Optional component projection used for statistics (`x`, `y`, `z`, `magnitude`, `full`). */
                 component?: string | null;
@@ -23591,7 +23665,7 @@ export interface operations {
     data_get_sessions_current_data_fields_quantity_id_samples_vector: {
         parameters: {
             query?: {
-                /** @description Exact immutable artifact carrier selector; unsupported until its provider is integrated. */
+                /** @description Exact immutable artifact carrier selector. */
                 carrier_id?: string | null;
                 /**
                  * @description Component to return.
@@ -23700,16 +23774,22 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Binary FMVP field vector. Analysis response and eigen-mode vectors use FMVP v5 metadata with the full quantity ID and domain generation identity; when a mesh carrier is available they also include topology, scope, and indexing metadata. Analysis vectors without a mesh use the explicit legacy_count_only absent-topology sentinel and cannot establish topology-bound overlay compatibility. Other scoped FEM and FDM payloads use FMVP v3 metadata with domain_generation_id, carrier topology revision/hash, scope kind/id, indexing, and optional node_indices. Multilayer FDM layer/object scopes identify their native grid carrier. Full-domain regular-grid FDM uses FMVP v3 sampled indices when max_samples is supplied and may use FMVP v2 for an uncapped complete payload. */
+            /** @description Binary FMVP field vector. Immutable artifact inspections use separate FMVP v6 metadata with lossless u64 sample identities, source ownership and carrier revision/digest; this does not change the generic v5 full-quantity-ID layout. Analysis response and eigen-mode vectors use FMVP v5 metadata with the full quantity ID and domain generation identity; when a mesh carrier is available they also include topology, scope, and indexing metadata. Analysis vectors without a mesh use the explicit legacy_count_only absent-topology sentinel and cannot establish topology-bound overlay compatibility. Other scoped FEM and FDM payloads use FMVP v3 metadata with domain_generation_id, carrier topology revision/hash, scope kind/id, indexing, and optional node_indices. Multilayer FDM layer/object scopes identify their native grid carrier. Full-domain regular-grid FDM uses FMVP v3 sampled indices when max_samples is supplied and may use FMVP v2 for an uncapped complete payload. */
             200: {
                 headers: {
                     /** @description Committed analysis artifact generation identity; present only when the served field member is verified */
                     "x-fullmag-artifact-generation-id"?: string;
+                    /** @description Bare lowercase SHA256 artifact carrier digest; present for FMVP v6 */
+                    "x-fullmag-carrier-digest"?: string;
+                    /** @description Immutable artifact carrier ID; present for FMVP v6 */
+                    "x-fullmag-carrier-id"?: string;
+                    /** @description Lossless decimal u64 artifact carrier revision; present for FMVP v6 */
+                    "x-fullmag-carrier-revision"?: string;
                     /** @description Resolved component projection */
                     "x-fullmag-component"?: string;
                     /** @description Domain generation identity */
                     "x-fullmag-domain-generation-id"?: string;
-                    /** @description FMVP encoding and version */
+                    /** @description FMVP encoding and version, including FMVP;version=6 for immutable artifact inspections */
                     "x-fullmag-encoding"?: string;
                     /** @description Optional FMVP v3/v5 field indexing */
                     "x-fullmag-field-indexing"?: string;

@@ -44,6 +44,13 @@ pub struct ArtifactFieldOwnerBinding {
 pub enum ArtifactSampleIndexing {
     SourceNodes, SampleNodes, PointSamples, Tet4CellLocalNodes, CellCenters,
 }
+impl ArtifactSampleIndexing {
+    pub(crate) fn code(self) -> u32 { match self { Self::SourceNodes => 4, Self::SampleNodes => 5,
+        Self::PointSamples => 6, Self::Tet4CellLocalNodes => 7, Self::CellCenters => 8 } }
+    pub(crate) fn as_str(self) -> &'static str { match self { Self::SourceNodes => "source_nodes",
+        Self::SampleNodes => "sample_nodes", Self::PointSamples => "point_samples",
+        Self::Tet4CellLocalNodes => "tet4_cell_local_nodes", Self::CellCenters => "cell_centers" } }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ArtifactFieldLocatorResource {
@@ -205,7 +212,7 @@ pub struct FieldStats {
 /// Query parameters for the `/fields/{quantity_id}/vector` endpoint.
 #[derive(Debug, Clone, Deserialize, utoipa::IntoParams, ToSchema)]
 pub struct FieldVectorQuery {
-    /// Exact immutable artifact carrier selector; unsupported until its provider is integrated.
+    /// Exact immutable artifact carrier selector.
     pub carrier_id: Option<String>,
     /// Component to return.
     ///
@@ -454,4 +461,11 @@ pub struct FieldProjectionProfileSample {
     pub normal_coord: f64,
     pub value: f64,
     pub measure: f64,
+}
+
+
+/// An exact execution catalog. Omission retains the ordinary live solver catalog.
+#[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams, ToSchema)]
+pub struct ArtifactFieldCatalogQuery {
+    pub stage_id: Option<String>,
 }

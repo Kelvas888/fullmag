@@ -13,6 +13,8 @@ from .antenna import (
     AntennaSourceCutRt0,
     AntennaSpectrumKGrid,
     AntennaSpectrumRequest,
+    EquilibriumStageOutputRef,
+    EquilibriumArtifactRef,
     AntennaSpectrumSamplingPlane,
     AntennaTargetProjection,
     CPWAntenna,

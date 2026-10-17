@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 pub mod accepted_store;
 pub mod study_inspection;
 mod study_inspection_integrity;
-pub use study_inspection_integrity::verify_saved_inspection;
+pub use study_inspection_integrity::{load_saved_inspection, verify_saved_inspection};
 pub mod application_attach;
 pub mod application_service_status;
 pub mod compute_node_probe;

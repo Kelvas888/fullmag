@@ -40,6 +40,7 @@ mod antenna_spectrum;
 mod antenna_stage;
 pub use antenna_field_solution::{
     execute_antenna_closed_loop_inspection, verify_antenna_closed_loop_inspection_bytes,
+    load_antenna_closed_loop_inspection_bytes,
     load_published_antenna_closed_loop_inspection, LoadedAntennaClosedLoopInspection,
     load_antenna_field_solution_samples, load_antenna_field_solution_samples_for_spectrum,
     load_solved_antenna_drive_basis_projected,
@@ -58,6 +59,8 @@ pub use antenna_spectrum::{
     reusable_antenna_source_spectrum_output,
     compute_antenna_source_spectrum_artifact,
     compute_antenna_source_spectrum_artifact_interruptible,
+    compute_antenna_source_spectrum_with_equilibrium,
+    verify_antenna_source_spectrum_equilibrium_binding,
     compute_nonuniform_k_antenna_source_spectrum,
     compute_structured_antenna_source_spectrum, sample_antenna_field_on_plane,
     AntennaSourceSpectrum2D, AntennaSourceSpectrumArtifact, AntennaSourceSpectrumManifest,
@@ -550,6 +553,7 @@ pub use fem_eigen::{
     FemRelaxationProducerPayloads, FemRelaxationProducerPlanSnapshot,
     FemRelaxationProducerProvenance, FEM_RELAXATION_PRODUCER_PLAN_NAMESPACE_V1,
     FEM_RELAXATION_PRODUCER_PROVENANCE_RELATIVE_PATH, FEM_RELAXATION_PRODUCER_PROVENANCE_V1,
+    accepted_antenna_equilibrium_artifacts, publish_accepted_antenna_equilibrium, load_verified_antenna_equilibrium, AntennaEquilibriumBinding, VerifiedAntennaEquilibriumContext,
 };
 pub use interactive::backend::BackendGeometry;
 pub use interactive::checkpoints::RunOutcome;

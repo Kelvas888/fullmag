@@ -5371,9 +5371,27 @@ def _render_antenna_spectrum_request_expr(request: dict[str, object]) -> str:
             + _py_literal(_normalize_mapping(request["nonuniform_k_grid"]))
             + ")"
         )
-    for field in ("port_mode_id", "equilibrium_ref", "mode_basis_ref"):
+    for field in ("port_mode_id", "mode_basis_ref"):
         if field in request:
             args.append(f"{field}={_py_literal(request[field])}")
+    if "equilibrium_ref" in request:
+        reference = request["equilibrium_ref"]
+        if isinstance(reference, dict):
+            kind = reference.get("kind")
+            if kind == "stage_output":
+                allowed = {"kind", "stage_id", "output_id"}
+                constructor = "EquilibriumStageOutputRef"
+            elif kind == "artifact":
+                allowed = {"kind", "asset_id", "equilibrium_id", "content_digest"}
+                constructor = "EquilibriumArtifactRef"
+            else:
+                raise ValueError("unknown equilibrium reference kind")
+            if set(reference) != allowed:
+                raise ValueError("equilibrium reference has missing or unknown fields")
+            arguments = ", ".join(f"{key}={_py_literal(reference[key])}" for key in reference if key != "kind")
+            args.append(f"equilibrium_ref=fm.{constructor}({arguments})")
+        else:
+            args.append(f"equilibrium_ref={_py_literal(reference)}")
     return f"fm.AntennaSpectrumRequest({', '.join(args)})"
 
 

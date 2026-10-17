@@ -57,6 +57,24 @@ pub fn load_published_antenna_closed_loop_inspection(
     let mut artifacts = Vec::new();
     for (path, length) in lengths { artifacts.push(AuxiliaryArtifact { bytes: read(&root, &path, length)?, relative_path: path }); }
     closed_loop_v2::verify(&bytes, &artifacts, true)?;
+    inspection_view(manifest, artifacts)
+}
+
+/// Build the same bounded field view from an accepted CAS bundle without extraction.
+/// The caller must bind the operation owner and its admitted transport budget.
+pub fn load_antenna_closed_loop_inspection_bytes(
+    manifest_bytes: &[u8], artifacts: Vec<AuxiliaryArtifact>, stage_id: &str,
+    output_id: &str, port_mode_id: &str, content_digest: &str, max_bytes: usize,
+) -> Result<LoadedAntennaClosedLoopInspection, RunError> {
+    verify_antenna_closed_loop_inspection_bytes(manifest_bytes, &artifacts, stage_id,
+        output_id, port_mode_id, content_digest, max_bytes)?;
+    let manifest: Value = serde_json::from_slice(manifest_bytes)
+        .map_err(|e| closed_loop_v2::invalid(&e.to_string()))?;
+    inspection_view(manifest, artifacts)
+}
+
+fn inspection_view(manifest: Value, artifacts: Vec<AuxiliaryArtifact>)
+    -> Result<LoadedAntennaClosedLoopInspection, RunError> {
     let mut metadata = serde_json::Map::new();
     for key in ["schema_version", "status", "content_digest", "asset_id", "solution_id", "source_object_id", "current_transport_id", "stage_id", "port_mode_id", "source", "requested_intent", "resolved_execution", "sample_carrier", "vertex_count", "cell_count", "face_count", "weak_reaction_count", "target_count", "sample_cell_count", "signed_normalization_a", "scale_per_a", "direct_evidence_schema", "payloads"] {
         metadata.insert(key.into(), manifest[key].clone());

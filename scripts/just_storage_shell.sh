@@ -479,8 +479,12 @@ case "${recipe}" in
     exec "${python_cmd}" "${script_dir}/verify_saved_fem_archive_roundtrip.py" --repo-root "${repo_root}"
     ;;
   *"scripts/verify_pinned_dataset_browser.py"*)
-    antenna_workspace_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3274 --scenario antenna-workspace-authoring$'
+    antenna_workspace_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3274 --scenario antenna-workspace-authoring( --dependency-workspace "([^"]+)")?[[:space:]]*$'
     if [[ "${recipe}" =~ ${antenna_workspace_browser_pattern} ]]; then
+      dependency_workspace="${BASH_REMATCH[2]}"
+      if [[ -n "${dependency_workspace}" ]]; then
+        exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3274 --scenario antenna-workspace-authoring --dependency-workspace "${dependency_workspace}"
+      fi
       exec "${python_cmd}" "${script_dir}/verify_pinned_dataset_browser.py" --repo-root "${repo_root}" --port 3274 --scenario antenna-workspace-authoring
     fi
     antenna_spectrum_browser_pattern='^[^[:space:]]+ "[^"]+/scripts/verify_pinned_dataset_browser.py" --repo-root "[^"]+" --port 3265 --scenario antenna-source-spectrum( --dependency-workspace "([^"]+)")?[[:space:]]*$'

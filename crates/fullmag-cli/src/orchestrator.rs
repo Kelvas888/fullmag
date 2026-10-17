@@ -4249,7 +4249,7 @@ fn publish_antenna_spectrum_artifacts_atomically_with_hook(
 ) -> Result<()> {
     publish_antenna_artifacts_atomically(
         current_stage_artifact_dir, output_id, "source_spectra",
-        &["spectrum.v2.json"], artifacts, interrupt_requested, before_rename,
+        &["spectrum.v2.json", "spectrum.v3.json"], artifacts, interrupt_requested, before_rename,
     )
 }
 
@@ -4499,7 +4499,13 @@ fn execute_antenna_spectrum_requests(
         let output_dir = current_stage_artifact_dir
             .join("antenna/source_spectra")
             .join(&request.output_id);
-        if fullmag_runner::reusable_antenna_source_spectrum_output(
+        let equilibrium = request.equilibrium_ref.as_ref().map(|reference|
+            fullmag_runner::load_verified_antenna_equilibrium(artifact_dir, reference)
+                .map_err(|error| anyhow!("load accepted equilibrium for '{}': {}", request.id, error.message))
+        ).transpose()?;
+        // Transverse reuse is checked by the atomic publisher after recomputing
+        // with the canonical full binding; the Cartesian cache remains v2.
+        if equilibrium.is_none() && fullmag_runner::reusable_antenna_source_spectrum_output(
             &output_dir,
             request,
             &reference.output_id,
@@ -4527,13 +4533,11 @@ fn execute_antenna_spectrum_requests(
                 error.message
             )
         })?;
-        let spectrum =
-            fullmag_runner::compute_antenna_source_spectrum_artifact_interruptible(
-                request,
-                &samples,
-                None,
-                interrupt_requested,
-            )
+        let spectrum = if let Some(context) = equilibrium.as_ref() {
+            fullmag_runner::compute_antenna_source_spectrum_with_equilibrium(request, &samples, context, interrupt_requested)
+        } else {
+            fullmag_runner::compute_antenna_source_spectrum_artifact_interruptible(request, &samples, None, interrupt_requested)
+        }
                 .map_err(|error| {
                     anyhow!(
                         "compute antenna source spectrum request '{}': {}",
@@ -12212,6 +12216,21 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             )?,
             _ => None,
         };
+        let accepted_equilibrium_artifact_refs = if let (
+            Some(receipt), Some(certificate), BackendPlanIR::Fem(plan),
+        ) = (next_relax_handoff.as_ref(), next_continuation_recomputed_certificate.as_ref(), &execution_plan.backend_plan) {
+            let engine = fullmag_runner::resolve_planned_runtime_engine(&stage.ir, &execution_plan)
+                .map_err(|error| anyhow!("accepted equilibrium execution owner: {}", error.message))?;
+            if stage_result.status == fullmag_runner::RunStatus::Completed && !stage_failed
+                && engine.engine_id == "fem_cpu_native" && plan.precision == fullmag_ir::ExecutionPrecision::Double && plan.fe_order == 1 {
+                let authored_stage_id = stage.ir.problem_meta.runtime_metadata.get("active_stage_id")
+                    .and_then(serde_json::Value::as_str).filter(|id| !id.trim().is_empty()).unwrap_or(&current_stage_id);
+                let artifacts = fullmag_runner::accepted_antenna_equilibrium_artifacts(plan, receipt, certificate, &engine.engine_id, authored_stage_id)
+                    .map_err(|error| anyhow!("accepted equilibrium producer: {}", error.message))?;
+                fullmag_runner::publish_accepted_antenna_equilibrium(&artifact_dir, &artifacts)
+                    .map_err(|error| anyhow!("publish accepted equilibrium: {}", error.message))?
+            } else { Vec::new() }
+        } else { Vec::new() };
         continuation_magnetization = Some(next_continuation_magnetization);
         continuation_completion = next_continuation_completion;
         continuation_accepted_fields = next_continuation_accepted_fields;
@@ -12433,6 +12452,11 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             );
             if interactive_requested && is_session_final_stage && !stage_failed {
                 publish_scripted_stages_awaiting_command(&mut next_stage_execution);
+            }
+            if let Some(record) = next_stage_execution.stages.get_mut(stage_index) {
+                for reference in &accepted_equilibrium_artifact_refs {
+                    push_unique_artifact_ref(&mut record.artifact_refs, reference.clone());
+                }
             }
             state.stage_execution = Some(next_stage_execution);
             if stage_failed {

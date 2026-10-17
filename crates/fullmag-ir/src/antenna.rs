@@ -602,6 +602,45 @@ pub struct AntennaSpectrumKGridIR {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EquilibriumReferenceIR {
+    StageOutput { stage_id: String, output_id: String },
+    Artifact { asset_id: String, equilibrium_id: String, content_digest: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum EquilibriumRefIR {
+    Reference(EquilibriumReferenceIR),
+    LegacyId(String),
+}
+
+impl From<String> for EquilibriumRefIR {
+    fn from(value: String) -> Self { Self::LegacyId(value) }
+}
+
+impl EquilibriumRefIR {
+    pub fn is_valid(&self) -> bool {
+        let digest = |value: &str| value.strip_prefix("sha256:").is_some_and(|hex| {
+            hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+        let identity = |value: &str| value.split_once(':').is_some_and(|(schema, hex)| {
+            matches!(schema, "antenna_accepted_equilibrium.v1" | "equilibrium_artifact.v7")
+                && digest(&format!("sha256:{hex}"))
+        });
+        match self {
+            Self::LegacyId(value) => identity(value),
+            Self::Reference(EquilibriumReferenceIR::StageOutput { stage_id, output_id }) => {
+                nonempty(stage_id) && nonempty(output_id)
+            },
+            Self::Reference(EquilibriumReferenceIR::Artifact { asset_id, equilibrium_id, content_digest }) => {
+                digest(&format!("sha256:{asset_id}")) && identity(equilibrium_id) && digest(content_digest)
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AntennaSpectrumRequestIR {
     pub id: String,
@@ -619,7 +658,7 @@ pub struct AntennaSpectrumRequestIR {
     pub nonuniform_k_grid: Option<AntennaSpectrumKGridIR>,
     pub component: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub equilibrium_ref: Option<String>,
+    pub equilibrium_ref: Option<EquilibriumRefIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_basis_ref: Option<String>,
     pub output_id: String,
@@ -691,15 +730,12 @@ fn validate_mode_basis_ref(
     }
 }
 
-/// `equilibrium_ref` is intentionally fail-closed until the source-spectrum
-/// workflow can resolve, verify, and project a certified equilibrium resource
-/// onto the exact sampling lattice.  Accepting the reference while the runner
-/// supplies no equilibrium samples would silently turn `transverse` into an
-/// invalid projection.
+/// Transverse authoring requires an explicit immutable identity or typed stage dependency.
+/// Execution and read boundaries independently reconstruct the canonical producer.
 fn validate_transverse_equilibrium_ref(
     prefix: &str,
     component: &str,
-    equilibrium_ref: Option<&str>,
+    equilibrium_ref: Option<&EquilibriumRefIR>,
     errors: &mut Vec<String>,
 ) -> bool {
     if component != "transverse" {
@@ -718,18 +754,13 @@ fn validate_transverse_equilibrium_ref(
             ));
             false
         }
-        Some(value) if !nonempty(value) => {
+        Some(value) if !value.is_valid() => {
             errors.push(format!(
                 "{prefix}.equilibrium_ref must be non-empty for component='transverse'"
             ));
             false
         }
-        Some(_) => {
-            errors.push(format!(
-                "{prefix}.component='transverse' is unsupported until a verified equilibrium resource loader and projection are implemented"
-            ));
-            false
-        }
+        Some(_) => true,
     }
 }
 
@@ -1383,7 +1414,7 @@ pub(crate) fn validate_antenna_composition(problem: &ProblemIRV04, errors: &mut 
         let valid_equilibrium = validate_transverse_equilibrium_ref(
             &prefix,
             request.component.as_str(),
-            request.equilibrium_ref.as_deref(),
+            request.equilibrium_ref.as_ref(),
             errors,
         );
         let valid_mode_basis =
@@ -1730,7 +1761,7 @@ pub(crate) fn validate_antenna_composition_v03(problem: &ProblemIR, errors: &mut
         let valid_equilibrium = validate_transverse_equilibrium_ref(
             &prefix,
             request.component.as_str(),
-            request.equilibrium_ref.as_deref(),
+            request.equilibrium_ref.as_ref(),
             errors,
         );
         let valid_mode_basis =
@@ -2421,18 +2452,15 @@ mod tests {
     }
 
     #[test]
-    fn transverse_spectrum_is_rejected_until_equilibrium_projection_exists() {
+    fn transverse_spectrum_requires_a_canonical_equilibrium_reference() {
         let mut errors = Vec::new();
-        assert!(!validate_transverse_equilibrium_ref(
-            "antenna_spectrum_requests[0]",
-            "transverse",
-            Some("equilibrium_1"),
-            &mut errors,
+        assert!(validate_transverse_equilibrium_ref(
+            "antenna_spectrum_requests[0]", "transverse",
+            Some(&EquilibriumRefIR::Reference(EquilibriumReferenceIR::StageOutput {
+                stage_id: "relax_1".into(), output_id: "accepted_equilibrium".into(),
+            })), &mut errors,
         ));
-        assert!(errors.iter().any(|error| {
-            error.contains("component='transverse'")
-                && error.contains("verified equilibrium resource loader")
-        }));
+        assert!(errors.is_empty());
 
         let mut errors = Vec::new();
         assert!(!validate_transverse_equilibrium_ref(
@@ -2449,7 +2477,7 @@ mod tests {
         assert!(!validate_transverse_equilibrium_ref(
             "antenna_spectrum_requests[0]",
             "x",
-            Some("equilibrium_1"),
+            Some(&EquilibriumRefIR::LegacyId("equilibrium_1".into())),
             &mut errors,
         ));
         assert!(errors

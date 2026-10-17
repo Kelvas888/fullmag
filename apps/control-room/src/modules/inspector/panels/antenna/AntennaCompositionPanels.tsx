@@ -33,7 +33,7 @@ import { SolvedAntennaDriveEditor } from "./SolvedAntennaDriveEditor";
 import { AntennaRelatedResources } from "./AntennaRelatedResources";
 import { AntennaCompositionReadout } from "./AntennaCompositionReadout";
 import { formatAntennaParameter as numberValue, type AntennaReadoutRow as DetailRow } from "./AntennaReadoutModel";
-import { antennaWaveformBandwidthValue } from "./AntennaCompositionModel";
+import { antennaEquilibriumReferenceIsValid, antennaEquilibriumReferenceValue, antennaWaveformBandwidthValue } from "./AntennaCompositionModel";
 import {
   antennaFieldSolutionIdentityStatus,
   antennaSpectrumIdentityStatus,
@@ -537,11 +537,13 @@ function antennaSpectrumValidationMessages(
     messages.push(`unsupported spectrum component '${request.component}'`);
   }
   if (request.component === "transverse") {
-    if (!request.equilibrium_ref?.trim()) {
+    if (!request.equilibrium_ref) {
       messages.push("transverse spectrum requires equilibrium_ref");
-    } else {
-      messages.push("transverse spectrum is unsupported until equilibrium projection is implemented");
+    } else if (!antennaEquilibriumReferenceIsValid(request.equilibrium_ref)) {
+      messages.push("transverse spectrum requires a valid equilibrium_ref");
     }
+  } else if (request.equilibrium_ref !== null && request.equilibrium_ref !== undefined) {
+    messages.push("equilibrium_ref is only valid for transverse spectrum");
   }
   if (request.mode_basis_ref !== null && request.mode_basis_ref !== undefined) {
     messages.push(request.mode_basis_ref.trim()
@@ -603,7 +605,7 @@ function spectrumDetails(
       { label: "Solve stage", value: request.solution_ref.stage_id, mono: true },
       { label: "Transform", value: request.transform },
       { label: "Component", value: request.component },
-      { label: "Equilibrium", value: request.equilibrium_ref || "none", mono: true },
+      { label: "Equilibrium", value: antennaEquilibriumReferenceValue(request.equilibrium_ref), mono: true },
       { label: "Modal basis", value: request.mode_basis_ref || "none", mono: true },
       { label: "Target", value: targetValue(request.target) },
       { label: "Plane", value: `${plane.sample_count_u} × ${plane.sample_count_v}, ${plane.interpolation}` },

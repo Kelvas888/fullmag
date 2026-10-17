@@ -18,6 +18,37 @@ pub fn verify_saved_inspection(
     store: &SessionStore, project: &ProjectId, run: &RunId, task_id: &str,
     attempt_id: &str, epoch: u64, expected_object: &str,
 ) -> Result<serde_json::Value> {
+    read_saved_inspection(store, project, run, task_id, attempt_id, epoch,
+        expected_object, |evidence, _, _, _| Ok(evidence))
+}
+
+/// Same durable cold-read fence, returning verified field data without filesystem extraction.
+pub fn load_saved_inspection(
+    store: &SessionStore, project: &ProjectId, run: &RunId, task_id: &str,
+    attempt_id: &str, epoch: u64, expected_object: &str,
+) -> Result<(serde_json::Value, fullmag_runner::LoadedAntennaClosedLoopInspection)> {
+    read_saved_inspection(store, project, run, task_id, attempt_id, epoch,
+        expected_object, |evidence, bytes, maximum, step| {
+            let fullmag_authoring::StudyStepKind::ClosedLoopInspection {
+                stage_id, port_mode_id, output_id,
+            } = &step.kind else { bail!("verified inspection lost its typed operation"); };
+            let bundle = fullmag_application::decode_antenna_inspection_bundle(bytes, maximum)?;
+            let manifest: serde_json::Value = serde_json::from_slice(&bundle.manifest_bytes)?;
+            let digest = manifest["content_digest"].as_str().context("verified inspection content digest absent")?;
+            let artifacts = bundle.payloads.into_iter().map(|(relative_path, bytes)|
+                fullmag_runner::AuxiliaryArtifact { relative_path, bytes }).collect();
+            let loaded = fullmag_runner::load_antenna_closed_loop_inspection_bytes(
+                &bundle.manifest_bytes, artifacts, stage_id, output_id, port_mode_id, digest, maximum)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            Ok((evidence, loaded))
+        })
+}
+
+fn read_saved_inspection<T>(
+    store: &SessionStore, project: &ProjectId, run: &RunId, task_id: &str,
+    attempt_id: &str, epoch: u64, expected_object: &str,
+    build: impl FnOnce(serde_json::Value, &[u8], usize, &fullmag_authoring::StudyStep) -> Result<T>,
+) -> Result<T> {
     let lock_path = store.root().join("WRITER.lock");
     let metadata = std::fs::symlink_metadata(&lock_path)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -85,11 +116,12 @@ pub fn verify_saved_inspection(
         .context("inspection pinned CAS object missing")?;
     let entry = accepted.catalog.entries().iter().find(|entry| entry.step_id() == step.step_id).context("inspection ProblemIR missing")?;
     crate::study_inspection::validate_accepted_inspection_bytes(entry.problem(), step, &bytes, crate::study_inspection::inspection_bundle_budget(&claim)?)?;
-    Ok(serde_json::json!({"schema":"fullmag.saved_inspection_integrity.v1","status":"pass",
+    build(serde_json::json!({"schema":"fullmag.saved_inspection_integrity.v1","status":"pass",
         "project_id":project.as_str(),"run_id":run.as_str(),"task_id":task_id,"attempt_id":attempt_id,
         "ownership_epoch":epoch,"object_ref":expected_object,"byte_count":bytes.len(),
         "artifact_id":output.artifact_id,"preparation_id":preparation.preparation_id,
-        "publication":"inspection_only","qualification":"not_verified","read_only":true}))
+        "publication":"inspection_only","qualification":"not_verified","read_only":true}),
+        &bytes, crate::study_inspection::inspection_bundle_budget(&claim)?, step)
 }
 
 #[cfg(test)]

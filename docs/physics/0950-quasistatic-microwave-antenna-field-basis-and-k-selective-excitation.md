@@ -1013,6 +1013,18 @@ skale residualu w weighted KKT nadal wymagają oddzielnej analizy
 conditioning oraz dowodu wykonania w SI. Zmiana shape preflight nie
 kwalifikuje sama solvera dla dowolnej skali lub kontrastu przewodności.
 
+Dla rzadkiej projekcji RT0 sparse MINRES nie używa stałego progu
+bezwzględnego: `SetAbsTol(0.0)` zachowuje względne kryterium `1e-12`.
+Poprzedni próg `1e-14` mógł zakończyć iteracje przed spełnieniem lokalnego
+bilansu strumienia w amperach. Ta zmiana dotyczy wyłącznie zakończenia
+rozwiązania algebraicznego; nie zmienia więzów KKT ani niezależnego
+certyfikatu fizycznego `1e-18 A + 1e-10 * scale_A`. Zerowy RHS nadal
+podlega istniejącej obsłudze solvera. Globalna norma KKT nie zastępuje
+certyfikatu każdego elementu, również wiersza pominiętego jako zależny.
+Kompilacja i zarządzana próba pełnego obwodu po tej zmianie pozostają
+NOT VERIFIED; wcześniejszy przebieg odrzucił publikację przed V/J/H.
+
+
 | Prywatne wejście | Typ/default | Jednostka SI | Walidacja |
 |---|---|---|---|
 | `AcceptedTerminalChargeRequest.mesh` | `mfem::Mesh*`, wymagany | współrzędne w $\mathrm m$ | borrowed tylko podczas snapshotu, serial straight conforming tet4 |
@@ -1649,9 +1661,7 @@ If no equilibrium resource is supplied, only explicit Cartesian or local-frame
 components are legal; `transverse` must fail closed.
 `equilibrium_ref` is only meaningful for `transverse` and is rejected for every
 other component, rather than silently ignored. Even with a reference,
-`transverse` remains unsupported until a certified equilibrium is loaded and
-projected onto the exact sampling lattice. Python authoring and both ProblemIR
-validators reject it even when an equilibrium reference is present. Python also
+`transverse` wymaga certyfikowanego equilibrium i projekcji na dokładną sampling lattice. Python i oba walidatory ProblemIR akceptują wyłącznie jawne poprawne referencje; runtime FEM CPU pozostaje source-only i niekwalifikowany, zgodnie z E9b poniżej. Python also
 rejects `mode_basis_ref` until a verified modal analysis exists. The publishable
 runner entry point
 also rejects manually supplied equilibrium arrays and ignored mode references;
@@ -3013,8 +3023,8 @@ pozostaje **NOT VERIFIED** do odrębnego uruchomienia właściwych bramek.
 | `SolvedAntennaDrive.peak_current_a` | `float` | required | `$\mathrm A$` | finite; zero disables the drive without invalidating the spatial basis | signed peak multiplying the immutable per-ampere field basis | lane-specific artifact consumer | `solved_antenna_drives[].peak_current_a` |
 | `AntennaSpectrumRequest.sampling_plane` | `AntennaSpectrumSamplingPlane` | required | m for origin/extents; 1 for counts and frame | orthonormal in-plane axes, positive extents, at least two samples per axis; current executable lane requires valid tet4 P1 topology or unique identity-coordinate carrier matches and fails closed for unsupported interpolation | centred physical lattice on which the per-ampere source field is sampled before the spatial Fourier transform | immutable FEM antenna asset with tet4 P1 or legacy identity sampling; FDM trilinear, direct RT0 evaluation, mixed topology, and native MFEM transfer remain explicitly unsupported | `antenna_spectrum_requests[].sampling_plane` |
 | `AntennaSpectrumRequest.port_mode_id` | `str | None` | `None` | `$1$` | when present, nonempty and bound to the solve stage; omission is valid only when the solve has exactly one port | selects the immutable per-ampere field basis used by source-spectrum analysis | immutable FEM antenna asset; multi-port assets require explicit selection | `antenna_spectrum_requests[].port_mode_id` |
-| `AntennaSpectrumRequest.component` | `str` | required | `$1$` | one of `x`, `y`, `z`, `u`, `v`, `normal`, `vector_power`, `transverse`; Python and ProblemIR reject `transverse` until certified equilibrium loading and projection exist | selects the analysed field component or vector power | Cartesian/local-frame source spectra supported for certified FEM carrier; `transverse` unsupported | `antenna_spectrum_requests[].component` |
-| `AntennaSpectrumRequest.equilibrium_ref` | `str | None` | `None` | `$1$` | valid only for `component="transverse"`; Python and ProblemIR reject that component until certified equilibrium loading and projection exist | identifies the equilibrium needed for the pointwise transverse source-field projection | unsupported in executable spectrum lane | `antenna_spectrum_requests[].equilibrium_ref` |
+| `AntennaSpectrumRequest.component` | `str` | required | `$1$` | one of `x`, `y`, `z`, `u`, `v`, `normal`, `vector_power`, `transverse`; transverse requires an explicit valid equilibrium reference; runtime requires canonical verified owner context | selects the analysed field component or vector power | Cartesian/local-frame source spectra supported for certified FEM carrier; transverse source-only FEM CPU Tet4/double; native qualification NOT VERIFIED | `antenna_spectrum_requests[].component` |
+| `AntennaSpectrumRequest.equilibrium_ref` | `EquilibriumStageOutputRef \| EquilibriumArtifactRef \| str \| None` | `None` | `$1$` | valid only for `component="transverse"`; typed stage_output/artifact or immutable legacy identity; v7 runtime refuses without canonical owner context | identifies the equilibrium needed for the pointwise transverse source-field projection | source-only FEM CPU Tet4/double; other lanes unsupported | `antenna_spectrum_requests[].equilibrium_ref` |
 | `AntennaSpectrumRequest.mode_basis_ref` | `str | None` | `None` | `$1$` | any nonempty value is rejected by Python and ProblemIR until verified modal analysis exists | reserved identity of a future modal basis, not a source-field spectrum coefficient | unsupported in executable spectrum lane | `antenna_spectrum_requests[].mode_basis_ref` |
 
 (The optional `AntennaSpectrumRequest.port_mode_id` selects the immutable
@@ -7237,8 +7247,360 @@ The source index distinguishes executable evidence from planned composition
 contracts. A documentation anchor marked `planned_contract` is not runtime
 evidence and cannot promote a capability lane.
 
+(antenna-accepted-equilibrium-transverse-contract)=
+### E9b: publiczny accepted Relax → transverse source spectrum — implementacja źródłowa
+
+**Stan bieżący: implementacja zintegrowana; kompilacja pakietu Windows i 50
+kontroli integracji API VERIFIED. Publiczny native FEM Relax→source→transverse,
+połączenie przeglądarki z rzeczywistym wynikiem, cold reopen oraz scientific
+qualification NOT VERIFIED.** Typed Python references, IR, canonical accepted
+Relax wrapper/context, projekcja P1, manifest v3 i API readers mają implementacje
+źródłowe w wydzielonym pakiecie. Build Windows API/CLI/desktop potwierdza
+kompilację tego pakietu, nie build ani wykonanie natywnego solvera FEM.
+Archive inventory nie jest częścią tego pakietu. Nie wykonano publicznego
+native FEM Relax→source→transverse benchmarku ani kwalifikacji wydania. Istniejący source_not_qualified gate nadal odmawia niekwalifikowanej
+bazie; samo poprawne autorstwo reference nie odblokowuje basis ani LLG.
+
+Celem jest podpisane źródłowe widmo pola jednej zaakceptowanej per-ampere
+bazy anteny, poprzeczne do rzeczywistej zaakceptowanej równowagi magnetycznego
+targetu. Nie jest to odpowiedź magnetyzacji, susceptibility, eigenmode overlap,
+LLG ani certyfikat pełnego obwodu. Zachowane zostają istniejące source basis,
+port selection, units, window, phase i bounded FFT/direct-k gates.
+
+#### Canonical owner, akceptacja i publication boundary
+
+Bezpośredni Relax → spectrum korzysta z rzeczywistego
+`AcceptedFemRelaxStageHandoff.v3`, kompletnego
+`CertifiedFemEquilibriumFields.v1` i
+`RecomputedFemLinearizationCertificate.v1`, utworzonych z wykonanego
+zaakceptowanego Relax i owning `FemPlanIR`/`StageFemMeshAsset`.
+Istniejący source-only publisher wytwarza immutable wrapper
+`antenna_accepted_equilibrium.v1` z własnym domain-separated content digest;
+nie nadaje mu `accepted_for_linearization` ani schematu v7. Wrapper zachowuje
+oryginalne source run/stage/kind, completion, acceptance, m0 i field digests,
+recompute provider, pełne podpisy owning physics i actual mesh association.
+Ciężkie m0, certified fields, mesh i plan input pozostają w immutable artifact
+data plane; wrapper/reference metadata nie zawierają tablic numerycznych.
+
+Niezależność pól sprzed i po odświeżeniu jest warunkiem naukowym E9b.
+V3 receipt przechowuje refreshed `certified_fields`; te same dane podane
+ponownie jako accepted baseline nie stanowią niezależnego replay. Istniejący
+`AcceptedFemRelaxStageHandoff.verified_replay` zachowuje accepted snapshot
+oraz jego dokładne bajty `accepted_fields_json` z provenance producenta.
+`accepted_antenna_equilibrium_artifacts` wymaga tego replay, strict-dekoduje
+baseline, porównuje go z typed accepted fields oraz wiąże refreshed fields
+i recomputed certificate z tym samym receiptem. Brak replay, puste bajty,
+przekroczenie 256 MiB lub rozbieżne wartości oznaczają odmowę publikacji;
+nie ma baseline odtwarzanego z refreshed fields ani implicit defaultu.
+
+W unpublished wrapperze `antenna_accepted_equilibrium.v1` pole
+`AcceptedEquilibriumManifest.accepted_fields` jest **wymaganym czwartym**
+`InputRef`: `path="accepted_fields.json"`, `sha256` oraz `byte_count`.
+Payload zachowuje dokładne bajty producenta z `replay.accepted_fields_json`,
+bez ich ponownej serializacji. SHA i count obejmują właśnie te bajty; manifest
+wiąże wszystkie cztery input refs własnym domain-separated content digest.
+Strict `deny_unknown_fields` i wymagane pole nie dopuszczają starego wrappera
+pozbawionego baseline przez zgadywanie lub domyślne uzupełnienie.
+
+Canonical `validate_inputs` przekazuje do
+`validate_recomputed_fem_linearization_certificate` sześć osobnych argumentów:
+owning plan, actual mesh, equilibrium M, accepted baseline, refreshed certified
+fields i recomputed certificate. Walidator sprawdza obydwa content digests,
+shape/schema, owning signatures oraz zapisane różnice pól przez niezależne
+porównanie w istniejących tolerancjach. Odbudowa całego v3 receipt pozostaje
+dodatkową bramką. Ten kontrakt nie dodaje fizyki, publicznego API ani nowych
+progów akceptacji; implementacja źródłowa nie jest runtime qualification.
+
+Legacy składnia `equilibrium_artifact.v7` pozostaje dopuszczona w authoringu,
+ale loader transverse jawnie odmawia jej do dostarczenia canonical owner
+validation context. Taki input może być użyty tylko wtedy,
+gdy pochodzi z rzeczywistego kanonicznego ownera v7. Loader
+`load_certified_equilibrium_artifact` jest kanonicznym parserem v7/v8;
+obsługa v8 w parserze nie dopuszcza jej automatycznie do transverse.
+Pełną zgodność planu, pól, static-demag, materiału i boundaries potwierdza
+kanoniczna walidacja wykorzystująca owning plan/mesh; sam hash pliku,
+`accepted_for_linearization=true` lub liczba m0 nie wystarczają. Wydzielenie
+shared publisher/validator nie może stworzyć pozornego `FemEigenPlanIR`,
+dodatkowego solvera, ukrytego Eigen stage ani surowego JSON parsera m0.
+
+Istniejący `VerifiedAntennaEquilibriumContext` jest prywatnym execution inputem
+z prywatnym konstruktorem dostępnym wyłącznie canonical loaderowi/validatorowi.
+Retains producer contract, exact receipt/content identity, owning plan,
+static-demag certificate i pola, magnetic membership oraz pełny mesh binding.
+Nie można go skonstruować z ręcznej tablicy ani ostatniego live m.
+`execute_antenna_spectrum_requests` rozwiązuje context **przed cache lookup**;
+przekazanie surowego `Option<&[[f64;3]]>` nie autoryzuje publikacji transverse.
+
+Tolerancje pozostają własnością producenta: native Relax recompute używa
+absolute H $10^{-6}\,\mathrm{A\,m^{-1}}$, relative $10^{-8}$ i absolute phi
+$10^{-12}\,\mathrm{A}$ oraz relative $10^{-8}$ razy
+max(amplituda phi, $1\,\mathrm{A}$), dokładnie jak istniejący producent.
+Nie jest to absolute-only phi comparison. Owner
+v7/eigen ma odrębne comparison gates: m0 $10^{-12}$, H
+$10^{-8}\,\mathrm{A\,m^{-1}}$, phi $10^{-10}\,\mathrm A$.
+Adapter zachowuje konkretny typ certyfikatu i wartości; nie ujednolica tych
+progów i nie wystawia akceptacji na podstawie nowych łagodniejszych limitów.
+Nodal m0 w magnetycznym domain spełnia istniejący norm gate $10^{-8}$.
+
+#### Publiczny Python, ProblemIR i pending-stage lifecycle
+
+Poniższe typed referencje istnieją w publicznym Python i round-trip. Pełne obecne
+parametry `AntennaSpectrumRequest`, plane, window i k-grid pozostają w tabelach
+API tej noty; poniższa tabela podaje wyłącznie zmianę referencji equilibrium.
+
+| Python (source implemented) | Typ | Default | SI | Validation/failure | Znaczenie | Backend | ProblemIR |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| AntennaSpectrumRequest.equilibrium_ref | EquilibriumStageOutputRef \| EquilibriumArtifactRef \| str \| None | None | $1$ | required only for transverse; exact typed dependency or immutable registered identity; unresolved, blank and ignored refs rejected | jawnie wybrane zaakceptowane equilibrium; niekwalifikowana source basis nadal odrzucona | source-only FEM CPU Tet4/double; other lanes unsupported; no runtime qualification | antenna_spectrum_requests[].equilibrium_ref; typed tagged reference or exact immutable legacy ID |
+| EquilibriumStageOutputRef.stage_id | str | required | $1$ | nonempty; executable spectrum materialization requires one uniquely identified earlier Relax with matching authored stage identity; runtime resolves the published accepted_equilibrium pin; target and producer eligibility require separate validation | tożsamość producenta accepted equilibrium | source-only FEM CPU; other lanes unsupported | antenna_spectrum_requests[].equilibrium_ref.stage_id |
+| EquilibriumStageOutputRef.output_id | str | accepted_equilibrium | $1$ | constructor and IR require a nonempty string; executable spectrum materialization and runtime loader accept only accepted_equilibrium and reject other output names | symboliczny output rozwiązywany dopiero po akceptacji Relax | source-only FEM CPU; other lanes unsupported | antenna_spectrum_requests[].equilibrium_ref.output_id |
+| EquilibriumArtifactRef.asset_id | str | required | $1$ | exact 64 lowercase hex; managed artifact registry entry; not a filesystem path | jawny istniejący asset equilibrium | source-only FEM CPU; other lanes unsupported | antenna_spectrum_requests[].equilibrium_ref.asset_id |
+| EquilibriumArtifactRef.equilibrium_id | str | required | $1$ | canonical antenna_accepted_equilibrium.v1 or equilibrium_artifact.v7 prefix plus 64 lowercase hex; v7 runtime refusal without owner context | niezmienna tożsamość equilibrium, odrębna od nazwy stage | source-only FEM CPU; other lanes unsupported | antenna_spectrum_requests[].equilibrium_ref.equilibrium_id |
+| EquilibriumArtifactRef.content_digest | str | required | $1$ | sha256 prefix and 64 lowercase hex digits; exact verified canonical manifest digest | pin zawartości assetu i receiptu | source-only FEM CPU; other lanes unsupported | antenna_spectrum_requests[].equilibrium_ref.content_digest |
+
+
+Istniejący tag `stage_output` zawiera stage_id/output_id i zachowuje symboliczną
+referencję podczas authoringu oraz eksportu. Nie planuje ani nie uruchamia Relax
+niejawnie. Obecne Python i ProblemIR sprawdzają składnię referencji oraz wymagają
+jej wyłącznie dla transverse. Runtime rozwiązuje opublikowane powiązanie etapu,
+wymaga output_id=`accepted_equilibrium` i weryfikuje authored stage identity oraz
+pełny kontekst zaakceptowanego Relax. Materializer wykonawczy
+`crates/fullmag-application/src/script_stage_materialization.rs::validate_antenna_equilibrium_dependencies`
+weryfikuje rzeczywistą akcję widma i jej jednoznaczny request, nazwę outputu
+`accepted_equilibrium`, dokładnie jednego wykonawczego producenta Relax o zgodnym
+authored stage identity oraz jego pozycję przed konsumentem. Inherited inventory
+nie aktywuje tej kontroli; odwołania artifact i legacy nadal podlegają swoim
+weryfikatorom runtime. Helper nie kwalifikuje magnetycznego targetu, domeny,
+siatki, materiałów ani eligibility producenta FEM CPU/Tet4/P1/double. Te bramki
+pozostają wymagane; nie należy przedstawiać kontroli kolejności jako pełnej
+walidacji fizycznej ani jako kwalifikacji plannera.
+Dopiero ukończony i zbieżny Relax z zaakceptowanym kryterium zatrzymania publikuje
+niezmienny wrapper. Przy materializacji referencja zachowuje authored stage pin
+oraz dodaje dokładną tożsamość asset/content/equilibrium. Ponowne powiązanie jest jawne.
+
+Stan weryfikacji integracji: natywny build Windows API/CLI/desktop zakończył się
+powodzeniem; managed API check `7f68d6fab11f4eedab639473b8e71339` zakończył się
+exit 0 i 50 kontrolami, w tym odrzucaniem niepoprawnego selektora etapu w katalogach
+pól i wielkości. To dowód integracji pakietu i badanego kontraktu HTTP, a nie
+wykonania poprawnej ścieżki accepted Relax → transverse, kwalifikacji naukowej,
+pozytywnego odczytu rzeczywistych V/J/H ani cold reopen. Sama kompilacja helpera
+nie zastępuje wykonanych regresji jego odmów i poprawnego przepływu.
+
+Istniejący tag `artifact` wymaga asset_id/equilibrium_id/content_digest.
+Dotychczasowy `str` może oznaczać jedynie dokładną immutable identity
+zasobu w canonical registry; ścieżka pliku i stage label nie są autoryzacją.
+Brak reference dla transverse oraz reference przy innym komponencie to
+validation errors. `mode_basis_ref` pozostaje unsupported combination.
+Python export i UI import odtwarzają tę samą typed reference; symbolic input
+nie zostaje po eksporcie przypadkowo przywiązany do innego ostatniego m0.
+Requested intent i resolved execution są zapisane osobno. Wymuszony GPU
+nie powoduje cichego CPU fallbacku; niedostępna lane jest jawnie odrzucana.
+
+Python→IR→script export→eval→IR wymaga dowodu przypiętego do wydzielonego pakietu; wcześniejsze wyniki szerokiego WIP nie są dowodem jego kwalifikacji. Nie zastępuje to prawdziwego
+publicznego stage-first Relax → qualified source solve →
+`add_antenna_spectrum_request` z actual native runtime. Ten benchmark,
+canonical generated OpenAPI/TypeScript, browser readback i cold archive reopen
+pozostają NOT VERIFIED; nie publikujemy niewykonanego solver example jako PASS.
+
+#### Actual target cells, mesh identity i transform frames
+
+Target resolution używa `FieldTargetIR` i immutable object_id/region_id,
+nie nazw/type. Reference wiąże generation/topology, node indexing i part
+registry z owning StageFemMeshAsset oraz geometry/domain-frame/rigid-transform
+identity. `mesh_revision` UI nie zastępuje tych digestów. Zmiana material,
+static physics, boundary, static demag albo mesh/indexing odrzuca receipt.
+
+Istniejący `resolve_fem_antenna_transverse_cell_mask` rozwiązuje Object przez
+actual element segments i Region przez volume selector, przecinając scope z
+Ms > 0. Nodal `resolve_fem_antenna_projection_mask` nie zastępuje tej bramki:
+wybrany punkt musi leżeć w rzeczywistej magnetycznej komórce objętościowej
+należącej do targetu. Komórka częściowo wybrana tylko przez wspólne węzły,
+boundary-only selector lub niejednoznaczne membership powoduje odmowę.
+`global` również wymaga, aby każda próbka miała equilibrium w magnetic domain.
+Air-node extension stosowane przez eigen nie jest equilibrium powietrza.
+Próbka poza ROI jest błędem **także przy outside_policy=zero i zerowym H**.
+
+H i m0 mają osobne immutable carriers. Oba interpolujemy w identycznych
+world-space punktach existing centered lattice; nie wymagamy identycznych
+numerów węzłów obu siatek. Rozwiązane transforms stosujemy dokładnie raz:
+translację wyłącznie do pozycji, proper rotation do pozycji i wektorów.
+No nearest-node, extrapolation, silently filled air m0 ani stored preview reuse.
+Pierwszy scope to rzeczywiste Tet4/P1; mixed prism/hex nie są automatycznie
+zamieniane na Tet4. Samplery zachowują istniejący deterministic cell locator,
+coordinate-resolution, degeneracy, overflow, cancellation i budget gates.
+
+#### Dyskretna projekcja i signed vector Fourier transform
+
+| Symbol | Znaczenie | SI |
+| --- | --- | --- |
+| $p,q,K,a$ | indeksy lattice, rzeczywistej komórki Tet4 i lokalnego węzła $a=0,1,2,3$ | $1$ |
+| $\mathbf r_{pq},\mathbf x_a$ | world-space punkt lattice i rzeczywisty węzeł equilibrium mesh | $\mathrm m$ |
+| $\lambda_a(\mathbf r_{pq})$ | podpisane barycentryczne funkcje P1 należącej do ROI komórki | $1$ |
+| $\mathbf m_{0,a},\mathbf m_{pq}^{\mathrm{P1}},\widehat{\mathbf m}_{0,pq},n_{pq}$ | zaakceptowane nodal m0, interpolant, jego kierunek jednostkowy i norma | $1$ |
+| $n_{\min}$ | prerejestrowany próg odmowy normalizacji, dokładnie $10^{-12}$ | $1$ |
+| $\mathbf h_{pq},\mathbf h_{\perp,pq}$ | podpisane per-ampere pole źródła przed i po projekcji | $\mathrm{m^{-1}}$ |
+| $w_{pq}$ | jawne próbki istniejącego okna przestrzennego | $1$ |
+| $k_u,k_v$ | angular wave numbers w lokalnej płaszczyźnie u/v | $\mathrm{rad\,m^{-1}}$ |
+| $\Delta u,\Delta v,u_p,v_q$ | rozstaw lattice i lokalne współrzędne przy centered phase | $\mathrm m$ |
+| $\widetilde h_{\perp,b},W_{\perp},b$ | zespolona amplituda integral_si, suma jej mocy oraz indeks $b=x,y,z$ | odpowiednio $\mathrm m$, $\mathrm{m^2}$ i $1$ |
+
+
+```{math}
+:label: antenna-transverse-receipt-interpolation
+\mathbf m_{pq}^{\mathrm{P1}}
+ =\sum_{a=0}^{3}\lambda_a(\mathbf r_{pq})\mathbf m_{0,a},\qquad
+n_{pq}=\lVert\mathbf m_{pq}^{\mathrm{P1}}\rVert_2,\qquad
+\widehat{\mathbf m}_{0,pq}=\mathbf m_{pq}^{\mathrm{P1}}/n_{pq},\qquad
+n_{pq}>n_{\min}=10^{-12}.
+```
+
+Próg $n_{\min}$ jest prerejestrowany dla tego adaptera. Niefinitywna próbka
+lub $n_{pq}\leq n_{\min}$ odmawia przed FFT; nie wybieramy zastępczego kierunku.
+Normalizacja dotyczy interpolowanego kierunku, nie certyfikowanych nodal m0.
+Interpolacja unit vectors może mieć normę mniejszą od jeden i nie jest sama
+w sobie błędem. Normalized sample musi spełnić existing kernel gate
+$\lvert\widehat{\mathbf m}_{0,pq}\cdot\widehat{\mathbf m}_{0,pq}-1\rvert\leq10^{-8}$.
+
+```{math}
+:label: antenna-transverse-receipt-projection
+\mathbf h_{\perp,pq}=\mathbf h_{pq}
+ -(\mathbf h_{pq}\cdot\widehat{\mathbf m}_{0,pq})\widehat{\mathbf m}_{0,pq}.
+```
+
+```{math}
+:label: antenna-transverse-receipt-fourier
+\widetilde h_{\perp,b}(k_u,k_v)
+ =\Delta u\Delta v\sum_{p,q}w_{pq}h_{\perp,b,pq}
+   \exp[-i(k_uu_p+k_vv_q)],\qquad
+W_{\perp}=\sum_{b\in\{x,y,z\}}\lvert\widetilde h_{\perp,b}\rvert^2.
+```
+
+Ostatnie równanie pokazuje `integral_si`. Existing `unitary_discrete` stosuje
+własną existing DFT normalization; jej amplituda ma $\mathrm{m^{-1}}$, moc
+$\mathrm{m^{-2}}$. Obie realizacje zachowują trzy podpisane komponenty i ich
+zespoloną fazę. FFT scalar magnitude lub sumy mocy przed FFT jest zabronione.
+Local u/v frame określa k i fazę; global xyz labels określają komponenty H.
+
+#### Manifest, read API i cache
+
+Source-only publikacja transverse używa `antenna_source_spectrum_artifact.v3`;
+Cartesian v2 zachowuje reader i semantykę. Thin v3 ma typed equilibrium
+binding: producer contract, asset/equilibrium/content identity, source run/stage,
+completion/acceptance/recompute digests, owning mesh generation/topology/indexing/
+part-registry/transform digests, material/static-physics/boundary/static-demag
+identity, target, equilibrium interpolation/mapping digest, normalization rule
+`p1_direction_normalized.v1`, norm floor i projection version. Wszystkie
+numeryczne payloady i ich SHA/layout/count/unit pozostają binary data plane.
+
+Canonical verifier wymaga kompletnego binding przy transverse i zabrania go
+przy Cartesian. API reader wykonuje ten sam verifier oraz payload integrity;
+nie wyprowadza equilibrium z shape ani component label. Readback nie aktywuje
+solver capabilities i nie kwalifikuje native execution.
+
+Nie dodano nowego transverse fast cache. Istniejący fast cache pozostaje
+wyłącznie Cartesian v2; transverse ponownie rozwiązuje verified context,
+actual projection i FFT, a następnie sprawdza immutable publication collision.
+Canonical binding zachowuje verified source solution/content/port, oba
+carriers/mapping digests, target/frame/lattice/window/normalization/transform/
+k-grid. Inny m0, revision, receipt, indexing, transform lub brak pinned
+dependency odrzuca binding; identyczny request_id nie wystarcza. Inspection source jest odrzucany przez
+istniejący source_not_qualified gate **przed** equilibrium interpolation/FFT.
+
+
+Source-only immutable namespace `antenna/accepted_equilibria/<asset>/` zachowuje
+cztery inputy: owning_plan.json, relax_receipt.v3.json,
+recomputed_certificate.v1.json i accepted_fields.json, oraz manifest.v1.json.
+Zamknięty zestaw publish ma dokładnie sześć artefaktów w kolejności:
+`0` owning plan, `1` v3 receipt, `2` recomputed certificate,
+`3` exact accepted baseline, `4` manifest, `5` stage pin identycznego
+manifestu. Atomic directory publication obejmuje indeksy `0`, `1`, `2`, `3` i `4`.
+Stage pin `stage_outputs/<sha256(authored_stage_id)>.v1.json` powstaje
+**na końcu**, po canonical reopen całego ownera; reference trafia do completed
+stage_execution. Reopen wymaga osobnego accepted_fields.json, sprawdza jego
+nazwę, SHA, byte count i bound 256 MiB, strict-dekoduje baseline oraz ponawia
+niezależny accepted-versus-refreshed replay i rebuild v3 receipt. Brak,
+przekroczenie budżetu lub korupcja baseline odmawiają execution authority;
+sam manifest digest ani odtworzenie refreshed jako baseline nie wystarczają.
+Session inventory i archive reachability są osobną zależnością poza wydzielonym pakietem. Ich integracja i cold reopen pozostają NOT VERIFIED.
+Authored active_stage_id i producer stage-000 są odrębnymi
+zapisanymi tożsamościami. Source-ref StageOutput pozostaje symbolic pending;
+Published/ResolvedAsset wymaga exact existing basis inventory owner closure.
+API metadata i binary reader ponownie otwierają pełny equilibrium i source
+owning closure oraz porównują pełny binding; raw arrays nie są authority.
+Pełny archive typed inventory, SHA/count oraz cold reopen wymagają oddzielnej integracji session ownera; bieżący pakiet nie dowodzi ich obsługi.
+
+#### Oddzielne realizacje i prerejestrowana walidacja
+
+| Solver | Device | Zakres tego kontraktu | Stan |
+|---|---|---|---|
+| FEM | CPU | native double, actual accepted Relax owner, rzeczywiste Tet4/P1 i magnetic ROI | source-only implemented; runtime/native/science NOT VERIFIED |
+| FEM | GPU | bieżący accepted-equilibrium publisher wymaga fem_cpu_native; brak GPU realizacji i dowodu nowego adaptera | unsupported until explicit qualification; no silent fallback |
+| FDM | CPU | brak certified equilibrium grid/interpolator/binding dla tego adaptera | unsupported |
+| FDM | GPU | brak powyższego oraz device evidence | unsupported |
+
+Wymagany, nadal niewykonany gate obejmuje również actual producer z odrębnymi
+accepted/refreshed polami w canonical tolerancji, zachowanie exact baseline
+bytes, odmowę missing/corrupt/oversized baseline i digest mismatch, wszystkie
+sześć pozycji publication, cold reopen oraz store/archive inventory SHA+count.
+Parser i source guards z poprawki integracji kompilatora nie uruchamiają tych
+funkcji Rust ani nie zastępują native dowodu niezależnego replay.
+
+RED→GREEN musi obejmować cały publiczny Relax workflow, typed reference round
+trip i cache invalidation, H parallel → zero, H perpendicular → unchanged,
+niejednorodne m0/P1 normalization, rigid-transform covariance, norm floor,
+outside ROI (także zero H), nonfinite/degenerate samples, oraz tampering
+mesh/index/part/material/physics/boundary/static-demag/receipt/payload.
+Actual native source basis musi przejść własną wcześniejszą kwalifikację;
+nie zastępujemy jej syntetycznymi samples. Wykonane source FFT/direct parity
+sprawdza complex signed amplitudes i power, nie odpowiedź magnetyzacji.
+Managed runtime, exact receipts i API readback pozostają osobnymi bramkami.
+
+Completeness: równania/SI, parametry/Python→IR, lifecycle, owner certificates,
+backend separation, cache/API i failure semantics mają source implementation;
+Bramki dokumentacji, source-map i build wydzielonego pakietu nie były uruchamiane przez autora tego kandydata.
+Wykonany publiczny native benchmark, browser i cold archive proof pozostają
+NOT VERIFIED. Deferred: FDM grid,
+GPU FFT, mixed-cell interpolation, mode overlap i magnetic response; żadna z
+tych funkcji nie uzyskuje capability przez niniejszy kontrakt.
+
+
 (antenna-source-code-index)=
 ### 13.1 Source-code index
+
+Uzupełnienie E9b (mapping implementacji; build Windows i API50 nie stanowią kwalifikacji naukowej ani pełnego przepływu runtime):
+
+| Path | Symbol / anchor | Responsibility / evidence |
+|---|---|---|
+| `crates/fullmag-application/src/script_stage_materialization.rs` | `validate_antenna_equilibrium_dependencies` | jednoznaczny wcześniejszy wykonawczy Relax i accepted_equilibrium; skompilowane w natywnym Windows, regresje wykonania helpera oraz target/eligibility NOT VERIFIED |
+| `packages/fullmag-py/src/fullmag/model/antenna.py` | `class EquilibriumStageOutputRef` | Istniejąca typed symbolic accepted Relax reference; public round-trip sprawdzony, runtime NOT VERIFIED. |
+| `packages/fullmag-py/src/fullmag/model/antenna.py` | `class EquilibriumArtifactRef` | Istniejący exact asset/equilibrium/content pin; v7 runtime wymaga canonical owner context. |
+| `packages/fullmag-py/src/fullmag/runtime/script_builder.py` | `_render_antenna_spectrum_request_expr` | Typed reference export i odmowa unknown keys; source-only. |
+| `crates/fullmag-ir/src/antenna.rs` | `EquilibriumReferenceIR` | Tagged deny-unknown typed refs; source-only. |
+| `crates/fullmag-ir/src/antenna.rs` | `validate_transverse_equilibrium_ref` | Required transverse ref i Cartesian ignored-ref refusal; source-only. |
+| `crates/fullmag-runner/src/fem/antenna_equilibrium.rs` | `VerifiedAntennaEquilibriumContext` | Prywatny verified accepted Relax/owning-plan context; nie raw m0 authority. |
+| `crates/fullmag-runner/src/fem/antenna_equilibrium.rs` | `AcceptedEquilibriumManifest` | Required fourth accepted_fields InputRef; exact-byte SHA/count closure; source-only, unqualified. |
+| `crates/fullmag-runner/src/fem/antenna_equilibrium.rs` | `validate_inputs` | Independent accepted baseline versus refreshed fields through six-argument canonical validator and v3 rebuild; runtime NOT VERIFIED. |
+| `crates/fullmag-runner/src/fem/antenna_equilibrium.rs` | `accepted_antenna_equilibrium_artifacts` | Actual CPU native accepted Relax wrapper; required verified replay and exact accepted_fields_json baseline retained with SHA/count, bounded at 256 MiB; runtime NOT VERIFIED. |
+| `crates/fullmag-runner/src/fem/antenna_equilibrium.rs` | `publish_accepted_antenna_equilibrium` | Closed six-artifact publication: four inputs, manifest index4, stage pin index5 last after full canonical reopen; cold runtime NOT VERIFIED. |
+| `crates/fullmag-runner/src/fem/antenna_equilibrium.rs` | `load_verified_antenna_equilibrium` | Full owner closure including required accepted baseline SHA/count and independent replay versus refreshed fields; v3 rebuild and explicit v7 refusal; runtime NOT VERIFIED. |
+| `crates/fullmag-plan/src/antenna_projection.rs` | `resolve_fem_antenna_transverse_cell_mask` | Actual volume cell Object/Region membership intersect Ms>0; source-only. |
+| `crates/fullmag-runner/src/antenna_spectrum.rs` | `compute_antenna_source_spectrum_with_equilibrium` | Private-context public dispatch, qualified source gate; source-only. |
+| `crates/fullmag-runner/src/antenna_spectrum.rs` | `compute_spectrum_artifact` | Actual P1/projection/FFT, transverse v3 and Cartesian v2; no transverse fast cache. |
+| `crates/fullmag-runner/src/antenna_spectrum.rs` | `verify_antenna_source_spectrum_equilibrium_binding` | Full canonical equilibrium/source binding on readback; source-only. |
+| `crates/fullmag-runner/src/antenna_spectrum.rs` | `validate_antenna_source_spectrum_manifest_semantics` | v3 required transverse binding, Cartesian v2 unchanged; source-only. |
+| `crates/fullmag-api/src/schemas/authoring.rs` | `EquilibriumReferenceResource` | Typed API authoring refs; generated OpenAPI/TS NOT VERIFIED. |
+| `crates/fullmag-api/src/router_v2/handlers/data/antenna.rs` | `get_antenna_source_spectrum` | Metadata reopens owner closure and checks binding; API runtime NOT VERIFIED. |
+| `crates/fullmag-api/src/router_v2/handlers/data/antenna.rs` | `get_antenna_source_spectrum_payload` | Binary read repeats canonical binding and payload integrity; browser NOT VERIFIED. |
+| `docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md` | `DOC-ANCHOR:antenna-accepted-equilibrium-transverse-contract` | Historyczny prerejestrowany E9b contract; typed Relax/P1/manifestv3 source-only implemented, runtime/native/browser/cold/science NOT VERIFIED. |
+| `crates/fullmag-runner/src/fem/eigen_equilibrium_contract.rs` | `AcceptedFemRelaxStageHandoff` | Istniejący canonical accepted Relax v3 używany przez source-only transverse adapter, bez fake eigen plan. |
+| `crates/fullmag-runner/src/fem_eigen.rs` | `validate_recomputed_fem_linearization_certificate` | Istniejąca walidacja native recompute receiptu związana z actual FemPlanIR. |
+| `crates/fullmag-runner/src/fem/eigen_equilibrium.rs` | `load_certified_equilibrium_artifact` | Kanoniczny ścisły parser v7/v8; samo parsowanie v7 nie dowodzi target binding ani dopuszczenia v8 do transverse. |
+| `crates/fullmag-runner/src/fem/eigen_shared_domain.rs` | `build_shared_domain_linearization_state` | Istniejące pełne podpisy i comparison gates v7; planned shared validation boundary zachowuje ownera. |
+| `crates/fullmag-runner/src/fem/eigen_native_artifacts.rs` | `native_modal_artifacts` | Obecna publikacja v7 wyłącznie z rzeczywistego accepted linearization state. |
+| `crates/fullmag-plan/src/antenna_projection.rs` | `resolve_fem_antenna_projection_mask` | Istniejące nodal membership; actual transverse używa osobnego volume-cell gate resolve_fem_antenna_transverse_cell_mask. |
+| `crates/fullmag-runner/src/antenna_spectrum.rs` | `selected_components` | Istniejąca pointwise projekcja trzech komponentów; nie publiczny certificate. |
+| `crates/fullmag-cli/src/orchestrator.rs` | `execute_antenna_spectrum_requests` | Istniejący dispatch rozwiązuje canonical verified context i completed-stage pins; runtime NOT VERIFIED. |
+
+
 
 | Ścieżka | Symbol / anchor | Odpowiedzialność i dowód |
 |---|---|---|
@@ -7559,8 +7921,8 @@ evidence and cannot promote a capability lane.
 | `packages/fullmag-py/src/fullmag/world.py` | `declare_antenna_field_solve` | publiczna deklaracja bez action; odpowiadające projection/drive/spectrum używają tego samego oddzielnego ownera |
 | `packages/fullmag-py/src/fullmag/runtime/script_builder.py` | `_render_antenna_inventory_declarations` | zachowanie niewykorzystanych deklaracji w skrypcie, bez syntetycznego wykonania |
 | `packages/fullmag-py/tests/test_antenna_authoring_inventory.py` | `class AntennaAuthoringInventoryTests` | 11 interpretowanych kontroli authoringu, nie naukowa kwalifikacja pola lub LLG |
-| `packages/fullmag-py/src/fullmag/model/antenna.py` | `class AntennaSpectrumRequest` | current source-spectrum authoring fields and Python validation, including rejection of `equilibrium_ref` outside `transverse`, and fail-closed `transverse` and `mode_basis_ref` |
-| `crates/fullmag-ir/src/antenna.rs` | `validate_transverse_equilibrium_ref` | both IR versions reject ignored equilibrium references and keep `transverse` unsupported until certified projection exists |
+| `packages/fullmag-py/src/fullmag/model/antenna.py` | `class AntennaSpectrumRequest` | current source-spectrum authoring fields and Python validation, including rejection of `equilibrium_ref` outside `transverse`, explicit typed transverse equilibrium references and fail-closed `mode_basis_ref` |
+| `crates/fullmag-ir/src/antenna.rs` | `validate_transverse_equilibrium_ref` | both IR versions reject ignored equilibrium references and require an explicit valid transverse equilibrium reference; runtime requires canonical verified context |
 | `packages/fullmag-py/tests/test_antenna_stage_workflow.py` | `test_antenna_solve_returns_symbolic_output_and_preserves_authoring_intent` | stage-first symbolic-reference round trip; not a field-solve runtime gate |
 | `crates/fullmag-runner/src/antenna_spectrum.rs` | `coordinate_tolerance` | lokalna tolerancja próbkowania i odmowa pracy poniżej rozdzielczości współrzędnych; regresje `identity_plane_sampling_distinguishes_micrometre_samples_far_from_origin` i `identity_plane_sampling_rejects_spacing_below_coordinate_resolution` nieuruchomione z powodu zakazu testów w worktree |
 | `crates/fullmag-runner/src/antenna_spectrum.rs` | `compute_nonuniform_k_antenna_source_spectrum_interruptible` | odrzucenie przepełnionej fazy oraz niefinitywnej amplitudy/mocy; regresja `spectrum_rejects_overflow_from_finite_inputs` pozostaje nieuruchomiona z powodu zakazu testów |

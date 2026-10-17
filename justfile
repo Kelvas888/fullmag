@@ -590,8 +590,8 @@ verify-study-execution-profile-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3256 --scenario study-execution-profile
 
 # Full current workspace against an explicitly pinned disposable managed API.
-verify-antenna-workspace-browser:
-    @{{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3274 --scenario antenna-workspace-authoring
+verify-antenna-workspace-browser dependency_workspace="":
+    @{{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3274 --scenario antenna-workspace-authoring{{if dependency_workspace != "" { ' --dependency-workspace "' + dependency_workspace + '"' } else { "" }}}
 
 # Regional source creation through production Inspectors and controlled HTTP.
 verify-antenna-regional-drive-browser:

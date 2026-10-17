@@ -103,6 +103,21 @@ export function antennaFieldSolutionIdentityStatus(
   return "ready";
 }
 
+function spectrumEquilibriumMatches(request: AntennaSpectrumRequest, data: AntennaSourceSpectrumResource): boolean {
+  const reference = request.equilibrium_ref;
+  const binding = data.equilibrium_binding;
+  if (reference == null) {
+    return binding == null && request.component !== "transverse" && data.schema_version !== "antenna_source_spectrum_artifact.v3";
+  }
+  if (request.component !== "transverse" || !binding || data.schema_version !== "antenna_source_spectrum_artifact.v3" || binding.schema_version !== "antenna_equilibrium_binding.v1") return false;
+  if (typeof reference === "string") return reference.length > 0 && reference === binding.equilibrium_id;
+  if (reference.kind === "stage_output") {
+    return reference.stage_id.length > 0 && reference.stage_id === binding.authored_stage_id && reference.output_id === "accepted_equilibrium";
+  }
+  return reference.asset_id.length > 0 && reference.equilibrium_id.length > 0 && reference.content_digest.length > 0 &&
+    reference.asset_id === binding.asset_id && reference.equilibrium_id === binding.equilibrium_id && reference.content_digest === binding.content_digest;
+}
+
 function spectrumConfigurationMatches(request: AntennaSpectrumRequest, data: AntennaSourceSpectrumResource): boolean {
   const plane = request.sampling_plane;
   const sampling = data.sampling;
@@ -110,7 +125,7 @@ function spectrumConfigurationMatches(request: AntennaSpectrumRequest, data: Ant
     ? [target.kind] : target.kind === "object" ? [target.kind, target.object_id]
       : [target.kind, target.object_id, target.region_id];
   const sameVector = (a: number[], b: number[]) => a.length === b.length && a.every((value, index) => value === b[index]);
-  return request.component === data.component && request.normalization === data.normalization &&
+  return spectrumEquilibriumMatches(request, data) && request.component === data.component && request.normalization === data.normalization &&
     request.transform === sampling.transform && request.window === sampling.window &&
     (!request.port_mode_id || request.port_mode_id === data.port_mode_id) &&
     sampling.port_mode_id === data.port_mode_id && sampling.source_object_id === data.source_object_id &&

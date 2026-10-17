@@ -1012,6 +1012,66 @@
       "latex": "$\\mathbf J_c$",
       "meaning": "zaakceptowana objętościowa gęstość prądu RT0",
       "si_unit": "$\\mathrm{A}\\,\\mathrm{m}^{-2}$"
+    },
+    {
+      "id": "transverse_receipt_indices",
+      "latex": "$p,q,K,a$",
+      "meaning": "indeksy lattice, rzeczywistej komórki Tet4 i lokalnego węzła $a=0,1,2,3$",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "transverse_receipt_position",
+      "latex": "$\\mathbf r_{pq},\\mathbf x_a$",
+      "meaning": "world-space punkt lattice i rzeczywisty węzeł equilibrium mesh",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "transverse_receipt_weights",
+      "latex": "$\\lambda_a(\\mathbf r_{pq})$",
+      "meaning": "podpisane barycentryczne funkcje P1 należącej do ROI komórki",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "transverse_receipt_m",
+      "latex": "$\\mathbf m_{0,a},\\mathbf m_{pq}^{\\mathrm{P1}},\\widehat{\\mathbf m}_{0,pq},n_{pq}$",
+      "meaning": "zaakceptowane nodal m0, interpolant, jego kierunek jednostkowy i norma",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "transverse_receipt_floor",
+      "latex": "$n_{\\min}$",
+      "meaning": "prerejestrowany próg odmowy normalizacji, dokładnie $10^{-12}$",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "transverse_receipt_h",
+      "latex": "$\\mathbf h_{pq},\\mathbf h_{\\perp,pq}$",
+      "meaning": "podpisane per-ampere pole źródła przed i po projekcji",
+      "si_unit": "$\\mathrm{m^{-1}}$"
+    },
+    {
+      "id": "transverse_receipt_window",
+      "latex": "$w_{pq}$",
+      "meaning": "jawne próbki istniejącego okna przestrzennego",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "transverse_receipt_k",
+      "latex": "$k_u,k_v$",
+      "meaning": "angular wave numbers w lokalnej płaszczyźnie u/v",
+      "si_unit": "$\\mathrm{rad\\,m^{-1}}$"
+    },
+    {
+      "id": "transverse_receipt_measure",
+      "latex": "$\\Delta u,\\Delta v,u_p,v_q$",
+      "meaning": "rozstaw lattice i lokalne współrzędne przy centered phase",
+      "si_unit": "$\\mathrm m$"
+    },
+    {
+      "id": "transverse_receipt_fft",
+      "latex": "$\\widetilde h_{\\perp,b},W_{\\perp},b$",
+      "meaning": "zespolona amplituda integral_si, suma jej mocy oraz indeks $b=x,y,z$",
+      "si_unit": "odpowiednio $\\mathrm m$, $\\mathrm{m^2}$ i $1$"
     }
   ],
   "equations": [
@@ -1728,6 +1788,47 @@
       "sources": [
         "antenna-coincident-loop-design",
         "antenna-coincident-loop-result-v1"
+      ]
+    },
+    {
+      "id": "antenna-transverse-receipt-interpolation",
+      "symbols": [
+        "transverse_receipt_indices",
+        "transverse_receipt_position",
+        "transverse_receipt_weights",
+        "transverse_receipt_m",
+        "transverse_receipt_floor"
+      ],
+      "sources": [
+        "antenna-transverse-receipt-contract",
+        "antenna-transverse-relax-handoff"
+      ]
+    },
+    {
+      "id": "antenna-transverse-receipt-projection",
+      "symbols": [
+        "transverse_receipt_h",
+        "transverse_receipt_m",
+        "transverse_receipt_indices"
+      ],
+      "sources": [
+        "antenna-transverse-receipt-contract",
+        "antenna-transverse-projector"
+      ]
+    },
+    {
+      "id": "antenna-transverse-receipt-fourier",
+      "symbols": [
+        "transverse_receipt_fft",
+        "transverse_receipt_h",
+        "transverse_receipt_window",
+        "transverse_receipt_k",
+        "transverse_receipt_measure",
+        "transverse_receipt_indices"
+      ],
+      "sources": [
+        "antenna-transverse-receipt-contract",
+        "antenna-transverse-projector"
       ]
     }
   ],
@@ -5332,6 +5433,209 @@
       "symbol": "DOC-ANCHOR:antenna-current-source-fixture-native-v-j-h-20261011",
       "responsibility": "Pełne tożsamości buildu/runu i zamrożone tolerancje rzeczywistego odbioru V/J/H wraz z granicami dowodu.",
       "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-e9b-implemented-0",
+      "path": "packages/fullmag-py/src/fullmag/model/antenna.py",
+      "symbol": "class EquilibriumStageOutputRef",
+      "responsibility": "Istniejąca typed symbolic accepted Relax reference; public round-trip sprawdzony, runtime NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-1",
+      "path": "packages/fullmag-py/src/fullmag/model/antenna.py",
+      "symbol": "class EquilibriumArtifactRef",
+      "responsibility": "Istniejący exact asset/equilibrium/content pin; v7 runtime wymaga canonical owner context.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-2",
+      "path": "packages/fullmag-py/src/fullmag/runtime/script_builder.py",
+      "symbol": "_render_antenna_spectrum_request_expr",
+      "responsibility": "Typed reference export i odmowa unknown keys; source-only.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-3",
+      "path": "crates/fullmag-ir/src/antenna.rs",
+      "symbol": "EquilibriumReferenceIR",
+      "responsibility": "Tagged deny-unknown typed refs; source-only.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-4",
+      "path": "crates/fullmag-ir/src/antenna.rs",
+      "symbol": "validate_transverse_equilibrium_ref",
+      "responsibility": "Required transverse ref i Cartesian ignored-ref refusal; source-only.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-5",
+      "path": "crates/fullmag-runner/src/fem/antenna_equilibrium.rs",
+      "symbol": "VerifiedAntennaEquilibriumContext",
+      "responsibility": "Prywatny verified accepted Relax/owning-plan context; nie raw m0 authority.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-independent-baseline-0",
+      "path": "crates/fullmag-runner/src/fem/antenna_equilibrium.rs",
+      "symbol": "AcceptedEquilibriumManifest",
+      "responsibility": "Required fourth accepted_fields InputRef; exact-byte SHA/count closure; source-only, unqualified.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-independent-baseline-1",
+      "path": "crates/fullmag-runner/src/fem/antenna_equilibrium.rs",
+      "symbol": "validate_inputs",
+      "responsibility": "Independent accepted baseline versus refreshed fields through six-argument canonical validator and v3 rebuild; runtime NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-6",
+      "path": "crates/fullmag-runner/src/fem/antenna_equilibrium.rs",
+      "symbol": "accepted_antenna_equilibrium_artifacts",
+      "responsibility": "Actual CPU native accepted Relax wrapper; required verified replay and exact accepted_fields_json baseline retained with SHA/count, bounded at 256 MiB; runtime NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-7",
+      "path": "crates/fullmag-runner/src/fem/antenna_equilibrium.rs",
+      "symbol": "publish_accepted_antenna_equilibrium",
+      "responsibility": "Closed six-artifact publication: four inputs, manifest index4, stage pin index5 last after full canonical reopen; cold runtime NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-8",
+      "path": "crates/fullmag-runner/src/fem/antenna_equilibrium.rs",
+      "symbol": "load_verified_antenna_equilibrium",
+      "responsibility": "Full owner closure including required accepted baseline SHA/count and independent replay versus refreshed fields; v3 rebuild and explicit v7 refusal; runtime NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-9",
+      "path": "crates/fullmag-plan/src/antenna_projection.rs",
+      "symbol": "resolve_fem_antenna_transverse_cell_mask",
+      "responsibility": "Actual volume cell Object/Region membership intersect Ms>0; source-only.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-10",
+      "path": "crates/fullmag-runner/src/antenna_spectrum.rs",
+      "symbol": "compute_antenna_source_spectrum_with_equilibrium",
+      "responsibility": "Private-context public dispatch, qualified source gate; source-only.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-11",
+      "path": "crates/fullmag-runner/src/antenna_spectrum.rs",
+      "symbol": "compute_spectrum_artifact",
+      "responsibility": "Actual P1/projection/FFT, transverse v3 and Cartesian v2; no transverse fast cache.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-12",
+      "path": "crates/fullmag-runner/src/antenna_spectrum.rs",
+      "symbol": "verify_antenna_source_spectrum_equilibrium_binding",
+      "responsibility": "Full canonical equilibrium/source binding on readback; source-only.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-13",
+      "path": "crates/fullmag-runner/src/antenna_spectrum.rs",
+      "symbol": "validate_antenna_source_spectrum_manifest_semantics",
+      "responsibility": "v3 required transverse binding, Cartesian v2 unchanged; source-only.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-14",
+      "path": "crates/fullmag-api/src/schemas/authoring.rs",
+      "symbol": "EquilibriumReferenceResource",
+      "responsibility": "Typed API authoring refs; generated OpenAPI/TS NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-15",
+      "path": "crates/fullmag-api/src/router_v2/handlers/data/antenna.rs",
+      "symbol": "get_antenna_source_spectrum",
+      "responsibility": "Metadata reopens owner closure and checks binding; API runtime NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-e9b-implemented-16",
+      "path": "crates/fullmag-api/src/router_v2/handlers/data/antenna.rs",
+      "symbol": "get_antenna_source_spectrum_payload",
+      "responsibility": "Binary read repeats canonical binding and payload integrity; browser NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-transverse-receipt-contract",
+      "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md",
+      "symbol": "DOC-ANCHOR:antenna-accepted-equilibrium-transverse-contract",
+      "responsibility": "Historyczny prerejestrowany E9b contract; typed Relax/P1/manifestv3 source-only implemented, runtime/native/browser/cold/science NOT VERIFIED.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "antenna-transverse-relax-handoff",
+      "path": "crates/fullmag-runner/src/fem/eigen_equilibrium_contract.rs",
+      "symbol": "AcceptedFemRelaxStageHandoff",
+      "responsibility": "Istniejący canonical accepted Relax v3 używany przez source-only transverse adapter, bez fake eigen plan.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-transverse-native-recompute",
+      "path": "crates/fullmag-runner/src/fem_eigen.rs",
+      "symbol": "validate_recomputed_fem_linearization_certificate",
+      "responsibility": "Istniejąca walidacja native recompute receiptu związana z actual FemPlanIR.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-transverse-v7-loader",
+      "path": "crates/fullmag-runner/src/fem/eigen_equilibrium.rs",
+      "symbol": "load_certified_equilibrium_artifact",
+      "responsibility": "Kanoniczny ścisły parser v7/v8; samo parsowanie v7 nie dowodzi target binding ani dopuszczenia v8 do transverse.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-transverse-v7-owner",
+      "path": "crates/fullmag-runner/src/fem/eigen_shared_domain.rs",
+      "symbol": "build_shared_domain_linearization_state",
+      "responsibility": "Istniejące pełne podpisy i comparison gates v7; planned shared validation boundary zachowuje ownera.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-transverse-v7-publisher",
+      "path": "crates/fullmag-runner/src/fem/eigen_native_artifacts.rs",
+      "symbol": "native_modal_artifacts",
+      "responsibility": "Obecna publikacja v7 wyłącznie z rzeczywistego accepted linearization state.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-transverse-target-mask",
+      "path": "crates/fullmag-plan/src/antenna_projection.rs",
+      "symbol": "resolve_fem_antenna_projection_mask",
+      "responsibility": "Istniejące nodal membership; actual transverse używa osobnego volume-cell gate resolve_fem_antenna_transverse_cell_mask.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-transverse-projector",
+      "path": "crates/fullmag-runner/src/antenna_spectrum.rs",
+      "symbol": "selected_components",
+      "responsibility": "Istniejąca pointwise projekcja trzech komponentów; nie publiczny certificate.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-transverse-cli-boundary",
+      "path": "crates/fullmag-cli/src/orchestrator.rs",
+      "symbol": "execute_antenna_spectrum_requests",
+      "responsibility": "Istniejący dispatch rozwiązuje canonical verified context i completed-stage pins; runtime NOT VERIFIED.",
+      "evidence_status": "source_only"
+    },
+    {
+      "id": "antenna-transverse-stage-order-preflight",
+      "path": "crates/fullmag-application/src/script_stage_materialization.rs",
+      "symbol": "validate_antenna_equilibrium_dependencies",
+      "responsibility": "Kontrola rzeczywistej akcji widma, jednoznacznego requestu, accepted_equilibrium i jednego wcześniejszego Relax; nie kwalifikuje targetu, materiałów ani eligibility backendu.",
+      "evidence_status": "source_only"
     }
   ],
   "public_api": {
@@ -5955,6 +6259,66 @@
         "meaning": "górna granica przekrojów, None oznacza inferencję domeny",
         "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported",
         "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.analysis_x_max_m"
+      },
+      {
+        "python": "AntennaSpectrumRequest.equilibrium_ref",
+        "type": "EquilibriumStageOutputRef | EquilibriumArtifactRef | str | None",
+        "default": "None",
+        "si_unit": "$1$",
+        "validation": "required only for transverse; exact typed dependency or immutable registered identity; unresolved, blank and ignored refs rejected",
+        "meaning": "jawnie wybrane zaakceptowane equilibrium; niekwalifikowana source basis nadal odrzucona",
+        "backend_support": "source-only FEM CPU Tet4/double; other lanes unsupported; no runtime qualification",
+        "problem_ir": "antenna_spectrum_requests[].equilibrium_ref; typed tagged reference or exact immutable legacy ID"
+      },
+      {
+        "python": "EquilibriumStageOutputRef.stage_id",
+        "type": "str",
+        "default": "required",
+        "si_unit": "$1$",
+        "validation": "nonempty; executable spectrum materialization requires one uniquely identified earlier Relax with matching authored stage identity; runtime resolves the published accepted_equilibrium pin; target and producer eligibility require separate validation",
+        "meaning": "tożsamość producenta accepted equilibrium",
+        "backend_support": "source-only FEM CPU; other lanes unsupported",
+        "problem_ir": "antenna_spectrum_requests[].equilibrium_ref.stage_id"
+      },
+      {
+        "python": "EquilibriumStageOutputRef.output_id",
+        "type": "str",
+        "default": "accepted_equilibrium",
+        "si_unit": "$1$",
+        "validation": "constructor and IR require a nonempty string; executable spectrum materialization and runtime loader accept only accepted_equilibrium and reject other output names",
+        "meaning": "symboliczny output rozwiązywany dopiero po akceptacji Relax",
+        "backend_support": "source-only FEM CPU; other lanes unsupported",
+        "problem_ir": "antenna_spectrum_requests[].equilibrium_ref.output_id"
+      },
+      {
+        "python": "EquilibriumArtifactRef.asset_id",
+        "type": "str",
+        "default": "required",
+        "si_unit": "$1$",
+        "validation": "exact 64 lowercase hex; managed artifact registry entry; not a filesystem path",
+        "meaning": "jawny istniejący asset equilibrium",
+        "backend_support": "source-only FEM CPU; other lanes unsupported",
+        "problem_ir": "antenna_spectrum_requests[].equilibrium_ref.asset_id"
+      },
+      {
+        "python": "EquilibriumArtifactRef.equilibrium_id",
+        "type": "str",
+        "default": "required",
+        "si_unit": "$1$",
+        "validation": "canonical antenna_accepted_equilibrium.v1 or equilibrium_artifact.v7 prefix plus 64 lowercase hex; v7 runtime refusal without owner context",
+        "meaning": "niezmienna tożsamość equilibrium, odrębna od nazwy stage",
+        "backend_support": "source-only FEM CPU; other lanes unsupported",
+        "problem_ir": "antenna_spectrum_requests[].equilibrium_ref.equilibrium_id"
+      },
+      {
+        "python": "EquilibriumArtifactRef.content_digest",
+        "type": "str",
+        "default": "required",
+        "si_unit": "$1$",
+        "validation": "sha256 prefix and 64 lowercase hex digits; exact verified canonical manifest digest",
+        "meaning": "pin zawartości assetu i receiptu",
+        "backend_support": "source-only FEM CPU; other lanes unsupported",
+        "problem_ir": "antenna_spectrum_requests[].equilibrium_ref.content_digest"
       }
     ]
   }

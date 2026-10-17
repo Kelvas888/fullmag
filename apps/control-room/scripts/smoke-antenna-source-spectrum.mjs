@@ -64,7 +64,8 @@ try {
   page.on("download", download => downloads.push(download.suggestedFilename()));
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
-  const readyScenarios = ["ready-nonuniform", "ready", "ready-tied-peak", "ready-vector", "ready-unitary", "ready-large"];
+  const readyScenarios = ["ready-equilibrium-stage", "ready-equilibrium-artifact", "ready-equilibrium-legacy", "ready-nonuniform", "ready", "ready-tied-peak", "ready-vector", "ready-unitary", "ready-large"];
+  const equilibriumFailures = ["stale-equilibrium-stage", "stale-equilibrium-output", "stale-equilibrium-asset", "stale-equilibrium-id", "stale-equilibrium-digest", "stale-equilibrium-legacy", "missing-equilibrium-binding", "unrequested-equilibrium", "legacy-equilibrium-metadata", "foreign-equilibrium-schema"];
   const malformedMetadata = ["oversized-grid", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha"];
   const gridFailures = new Set(["stale-nonuniform"]);
   const malformedBytes = ["wrong-nonuniform-body", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"];
@@ -80,7 +81,7 @@ try {
     "oversized-body": "byte budget",
     "oversized-stream": "byte budget",
   };
-  for (const scenario of [...readyScenarios, ...gridFailures, "missing-nonuniform", "stale-window", "missing-window", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", ...malformedMetadata, ...malformedBytes]) {
+  for (const scenario of [...readyScenarios, ...equilibriumFailures, ...gridFailures, "missing-nonuniform", "stale-window", "missing-window", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", ...malformedMetadata, ...malformedBytes]) {
     const location = new URL(url); location.searchParams.set("scenario", scenario);
     await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForFunction(() => window.__antennaSpectrumFixture?.read().calls.some((call) => call.path.endsWith("/output-catalog")) && window.__antennaSpectrumFixture.read().calls.some((call) => call.path.endsWith("/source-spectra/fft")), undefined, { timeout: 60_000 });
@@ -98,6 +99,7 @@ try {
     const text = await page.locator("main").textContent();
     const gridCells = await page.getByRole("gridcell").count();
     const ready = readyScenarioSet.has(scenario), bytesFailure = malformedBytesSet.has(scenario);
+    if (equilibriumFailures.includes(scenario)) assert.ok(text.includes("configuration mismatch — recompute spectrum"), "Equilibrium identity must match before binary reads");
     if (scenario === "missing-nonuniform") assert.ok(text.includes("nonuniform_spatial_fft requires a finite nonuniform k-grid"));
     if (scenario === "stale-window" || scenario === "missing-window") assert.ok(text.includes("configuration mismatch — recompute spectrum"), "Valid request must reject historical or absent window provenance");
     if (!ready) assert.equal(await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).count(), 0);
@@ -109,12 +111,19 @@ try {
       assert.ok(gridBox && Math.abs(gridBox.x + gridBox.width / 2 - payloadBox.x - payloadBox.width / 2) < 2, "The bounded source map must remain centered in the Inspector");
       assert.equal(await page.getByRole("button", { name: /Configuration and provenance/ }).getAttribute("aria-expanded"), "false");
       const unit = scenario === "ready-unitary" ? "(A/m/A)^2" : "(A*m/A)^2";
-      const component = scenario === "ready-vector" ? "H vector (x, y, z)" : "H_x";
+      const transverse = scenario.startsWith("ready-equilibrium-");
+      const vector = transverse || scenario === "ready-vector";
+      if (transverse) {
+        const componentEditor = page.getByRole("combobox", { name: "Component", exact: true });
+        assert.equal(await componentEditor.inputValue(), "transverse", "Editor must preserve the authored transverse component instead of displaying x");
+        assert.equal(await componentEditor.locator("option:checked").textContent(), "Transverse (equilibrium projection)");
+      }
+      const component = transverse ? "H transverse (x, y, z)" : scenario === "ready-vector" ? "H vector (x, y, z)" : "H_x";
       assert.equal(await page.getByRole("heading", { name: `Source FFT power · ${component}`, exact: true }).count(), 1);
       assert.ok(text.includes(`${scenario === "ready-unitary" ? "Unitary discrete" : "Integral SI"} normalization`), "Chart must name the verified normalization");
       assert.ok((await page.getByRole("group", { name: "Selected source spectrum sample", exact: true }).innerText()).includes(component), "Selected sample lost component identity");
-      assert.ok(text.includes(scenario === "ready-vector" ? "|H_x|² + |H_y|² + |H_z|²" : "|H_x|²"), "Power expression must match the manifest components");
-      assert.ok(text.includes(`Peak ${scenario === "ready-tied-peak" ? "9.000e+0" : scenario === "ready-vector" ? "4.800e+1" : scenario === "ready-large" ? "1.897e+7" : "1.600e+1"} ${unit}`), "Peak power or normalization unit differs from controlled complex amplitudes");
+      assert.ok(text.includes(transverse ? "|H\u22a5_x|² + |H\u22a5_y|² + |H\u22a5_z|²" : scenario === "ready-vector" ? "|H_x|² + |H_y|² + |H_z|²" : "|H_x|²"), "Power expression must match the manifest components");
+      assert.ok(text.includes(`Peak ${scenario === "ready-tied-peak" ? "9.000e+0" : vector ? "4.800e+1" : scenario === "ready-large" ? "1.897e+7" : "1.600e+1"} ${unit}`), "Peak power or normalization unit differs from controlled complex amplitudes");
       assert.ok((await page.getByRole("gridcell").first().getAttribute("aria-label"))?.includes(unit), "Scientific cell tooltip lost power SI unit");
       assert.ok((await page.getByRole("group", { name: "Source spectrum color scale" }).innerText()).includes(unit), "Color scale lost its physical power unit");
       const actionGroup = page.getByRole("group", { name: "Source spectrum actions", exact: true });
@@ -146,7 +155,7 @@ try {
       assert.equal(data.power.length, count, "Export must preserve every original sample, including those hidden by pooling");
       for (let i = 0; i < count; i++) {
         const amplitude = scenario === "ready-tied-peak" ? [1, 3, 3, 2][i] : i + 1;
-        assert.equal(data.power[i], amplitude ** 2 * (scenario === "ready-vector" ? 3 : 1));
+        assert.equal(data.power[i], amplitude ** 2 * (vector ? 3 : 1));
         for (let component = 0; component < manifest.component_labels.length; component++) {
           assert.equal(data.amplitudes_re_im[2 * (component * count + i)], amplitude);
           assert.equal(data.amplitudes_re_im[2 * (component * count + i) + 1], 0);
@@ -445,8 +454,8 @@ try {
   }
   {
     const location = new URL(url); location.searchParams.set("scenario", "ready");
-    for (const field of ["component", "normalization", "window", "sampling", "target", "grid"]) {
-      location.searchParams.set("scenario", field === "grid" ? "ready-nonuniform" : field === "window" ? "ready-large" : "ready");
+    for (const field of ["component", "normalization", "window", "sampling", "target", "grid", "equilibrium"]) {
+      location.searchParams.set("scenario", field === "equilibrium" ? "ready-equilibrium-stage" : field === "grid" ? "ready-nonuniform" : field === "window" ? "ready-large" : "ready");
       await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
       await page.getByRole("grid").waitFor({ timeout: 60_000 });
       await page.evaluate(() => { window.__spectrumConfigurationRoot = document.querySelector(".fm-inspector-panel"); });

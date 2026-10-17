@@ -1091,6 +1091,85 @@ try {
   assert.deepEqual(pageErrors, []); assert.deepEqual(consoleErrors, []);
   assert.deepEqual(httpErrors.filter(error => error.status >= 500), []);
   checks.push({ name: "real workspace has healthy WebGL, correctly routed realtime and scoped writes without solver execution", passed: true, webgl });
+  {
+  // Cross-antenna ownership uses real authored declarations and real API ACKs.
+  const beforeSecondAntenna = await scene();
+  await publicCommand("Add Microstrip Antenna");
+  const twoAntennaScene = await waitScene(s => s.objects.filter(o => o.role === "antenna").length === 2);
+  const secondAntenna = twoAntennaScene.objects.find(o => o.role === "antenna" && o.id !== objectId);
+  assert.ok(secondAntenna);
+  const secondStages = twoAntennaScene.antenna_field_solve_stages.filter(s => s.source_object_id === secondAntenna.id);
+  assert.equal(secondStages.length, 1);
+  const secondStage = secondStages[0];
+  assert.notEqual(secondStage.id, stage.id);
+  assert.deepEqual(twoAntennaScene.objects.find(o => o.id === objectId), beforeSecondAntenna.objects.find(o => o.id === objectId));
+  const rebindProjection = { ...projection, id: `${projection.id}:cross-owner`, output_id: `${projection.output_id}:cross-owner` };
+  const rebindSpectrum = { ...fft, id: `${fft.id}:cross-owner`, output_id: `${fft.output_id}:cross-owner` };
+  const setup = { base_revision: twoAntennaScene.revision, kind: "merge_patch", merge_patch: {
+    antenna_target_projections: [...twoAntennaScene.antenna_target_projections, rebindProjection],
+    antenna_spectrum_requests: [...twoAntennaScene.antenna_spectrum_requests, rebindSpectrum],
+  } };
+  await json(await context.request.post(`${target.api_base}/v2/sessions/current/model/transactions`, { headers: headers(), data: setup }));
+  writes.push({ method: "POST", path: "/v2/sessions/current/model/transactions", body: setup, instance: target.api_instance, scope, source: "public_api_two_antenna_declarations_setup" });
+  const setupScene = await waitScene(s => s.antenna_spectrum_requests.some(r => r.id === rebindSpectrum.id) && s.antenna_target_projections.some(p => p.id === rebindProjection.id));
+  await page.getByTitle("Expand All").click();
+  const payloadReadsDuringRebind = [];
+  const recordRebindPayload = request => {
+    if (request.method() === "GET" && request.url().startsWith(`${target.api_base}/v2/sessions/current/data/antenna/`) && new URL(request.url()).pathname.includes("/payloads/")) payloadReadsDuringRebind.push(request.url());
+  };
+  page.on("request", recordRebindPayload);
+  const beforeRebindWrites = writes.length;
+  const ownerNode = (owner, kind, id) => `model:object:${owner}:antenna:${kind}:${encodeURIComponent(id)}`;
+  for (const [kind, collection, declaration, referenceKey] of [
+    ["projection", "antenna_target_projections", rebindProjection, "solution"],
+    ["spectrum", "antenna_spectrum_requests", rebindSpectrum, "solution_ref"],
+  ]) {
+    let oldOwner = objectId;
+    await selectNode(ownerNode(oldOwner, kind, declaration.id));
+    for (const [nextOwner, nextStage] of [[secondAntenna.id, secondStage], [objectId, stage]]) {
+      const before = await scene(), previous = before[collection].find(r => r.id === declaration.id);
+      const sourceChoice = page.getByRole("combobox", { name: "Source binding", exact: true });
+      await sourceChoice.selectOption(nextStage.id);
+      const apply = page.getByRole("button", { name: `Apply ${kind}`, exact: true });
+      assert.equal(await apply.isEnabled(), true);
+      const beforeApplyWrites = writes.length;
+      const ack = page.waitForResponse(response => response.url() === `${target.api_base}/v2/sessions/current/model/transactions` && response.request().method() === "POST");
+      await apply.click();
+      const response = await ack;
+      await json(response);
+      const after = await waitScene(s => s[collection].find(r => r.id === declaration.id)?.[referenceKey]?.stage_id === nextStage.id);
+      const current = after[collection].find(r => r.id === declaration.id);
+      const outputs = nextStage.outputs.filter(output => output.quantity === "H_ant_basis");
+      assert.equal(outputs.length, 1);
+      const expected = { ...previous, [referenceKey]: { kind: "stage_output", stage_id: nextStage.id, output_id: outputs[0].id }, ...(kind === "spectrum" ? { port_mode_id: nextStage.port_mode_ids[0] } : {}) };
+      assert.deepEqual(current, expected, "Rebind must preserve target, immutable IDs and scientific request settings");
+      assert.deepEqual(after.objects, before.objects);
+      assert.deepEqual(after.antenna_field_solve_stages, before.antenna_field_solve_stages);
+      assert.deepEqual(after.antenna_port_modes, before.antenna_port_modes);
+      assert.deepEqual(after.solved_antenna_drives, before.solved_antenna_drives);
+      assert.equal(writes.length, beforeApplyWrites + 1);
+      assert.deepEqual(Object.keys(writes.at(-1).body.merge_patch), [collection]);
+      const staleNode = ownerNode(oldOwner, kind, declaration.id), currentNode = ownerNode(nextOwner, kind, declaration.id);
+      await page.waitForFunction(id => !document.querySelector(`[data-node-id="${id}"]`), staleNode);
+      await page.getByTitle("Expand All").click();
+      await selectNode(currentNode);
+      assert.equal(await page.locator(`[data-node-id="${currentNode}"]`).getAttribute("aria-selected"), "true");
+      assert.equal(await page.getByRole("combobox", { name: "Source binding", exact: true }).inputValue(), "");
+      assert.equal(await page.getByRole("button", { name: `Apply ${kind}`, exact: true }).isEnabled(), false, "Reselection must use committed resource rather than the old draft");
+      await screenshot(`29-${kind}-owner-${nextOwner === objectId ? "restored" : "second"}`);
+      oldOwner = nextOwner;
+    }
+  }
+  page.off("request", recordRebindPayload);
+  assert.equal(writes.length, beforeRebindWrites + 4);
+  assert.deepEqual(payloadReadsDuringRebind, [], "Unpublished declarations cannot authorize binary payload reads");
+  const afterRebind = await scene();
+  assert.deepEqual(afterRebind.antenna_target_projections, setupScene.antenna_target_projections);
+  assert.deepEqual(afterRebind.antenna_spectrum_requests, setupScene.antenna_spectrum_requests);
+  for (const write of writes.slice(beforeRebindWrites)) { assert.equal(write.instance, target.api_instance); assert.equal(write.scope, scope); assert.equal(write.path, "/v2/sessions/current/model/transactions"); }
+  checks.push({ name: "Projection and source Spectrum rebind A to B to A through real forms and real transaction ACKs, move canonical Explorer ownership, retain immutable settings and reselect clean committed Inspectors", passed: true, secondAntennaId: secondAntenna.id, payloadReadsDuringRebind, qualification: "unpublished authoring declarations only; no published stale-payload or solver qualification" });
+  await selectNode(`model:object:${objectId}:antenna:drive:${encodeURIComponent(drive.id)}`);
+  }
   const beforeSessionReplacementWrites = writes.length;
   await driveName.fill("Old session draft");
   await selectNode(`model:object:${objectId}:geometry`); await dirtyGuard.waitFor();

@@ -58,7 +58,7 @@ pub use antenna_field_solve::{
     plan_antenna_external_lead_inspection, plan_antenna_field_solve_execution,
     AntennaFieldSolveExecutionPlan,
 };
-pub use antenna_projection::resolve_fem_antenna_projection_mask;
+pub use antenna_projection::{resolve_fem_antenna_projection_mask, resolve_fem_antenna_transverse_cell_mask};
 pub use antenna_validity::{
     antenna_validity_notes, antenna_waveform_bandwidth_aggregate_note,
     antenna_waveform_bandwidth_notes, classify_antenna_waveform_bandwidth,

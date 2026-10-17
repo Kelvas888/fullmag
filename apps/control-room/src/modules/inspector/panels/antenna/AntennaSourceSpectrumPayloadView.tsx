@@ -172,8 +172,9 @@ export function AntennaSourceSpectrumPayloadView({
   const isBinned = payloads.value.kU.length > MAX_AXIS_CELLS ||
     payloads.value.kV.length > MAX_AXIS_CELLS;
   const powerUnit = spectrum.payloads?.power.unit ?? `(${spectrum.amplitude_unit})^2`;
-  const componentLabel = spectrum.component === "vector_power" ? "H vector (x, y, z)" : `H_${spectrum.component}`;
-  const powerExpression = spectrum.component === "vector_power"
+  const transverse = spectrum.component === "transverse";
+  const componentLabel = transverse ? "H transverse (x, y, z)" : spectrum.component === "vector_power" ? "H vector (x, y, z)" : `H_${spectrum.component}`;
+  const powerExpression = transverse ? "|H\u22a5_x|² + |H\u22a5_y|² + |H\u22a5_z|²" : spectrum.component === "vector_power"
     ? "|H_x|² + |H_y|² + |H_z|²" : `|H_${spectrum.component}|²`;
   const normalizationLabel = spectrum.normalization === "integral_si" ? "Integral SI" : "Unitary discrete";
 
@@ -193,7 +194,7 @@ export function AntennaSourceSpectrumPayloadView({
       </div>
       <SpectrumPowerGrid cells={cells} kU={payloads.value.kU} kV={payloads.value.kV}
         amplitudes={payloads.value.amplitudes} componentLabels={spectrum.component_labels} amplitudeUnit={spectrum.amplitude_unit}
-        waveVectorUnit={spectrum.wave_vector_unit} powerUnit={powerUnit} componentLabel={componentLabel} isBinned={isBinned} peakIndex={extrema?.peakIndex ?? -1}>
+        waveVectorUnit={spectrum.wave_vector_unit} powerUnit={powerUnit} componentPrefix={transverse ? "H\u22a5" : "H"} componentLabel={componentLabel} isBinned={isBinned} peakIndex={extrema?.peakIndex ?? -1}>
         <AntennaSpectrumExport spectrum={spectrum} amplitudes={payloads.value.amplitudes}
           kU={payloads.value.kU} kV={payloads.value.kV} power={payloads.value.power} />
       </SpectrumPowerGrid>
@@ -256,10 +257,10 @@ function spectrumGridTarget(key: string, index: number, columns: number, count: 
 }
 
 /** Selection stays local: keyboard inspection never redecodes payloads or refetches resources. */
-function SpectrumPowerGrid({ cells, kU, kV, amplitudes, componentLabels, amplitudeUnit, waveVectorUnit, powerUnit, componentLabel, isBinned, peakIndex, children }: {
+function SpectrumPowerGrid({ cells, kU, kV, amplitudes, componentLabels, amplitudeUnit, waveVectorUnit, powerUnit, componentPrefix, componentLabel, isBinned, peakIndex, children }: {
   cells: readonly HeatmapCell[]; kU: readonly number[]; kV: readonly number[];
   amplitudes: readonly number[]; componentLabels: readonly string[]; amplitudeUnit: string;
-  waveVectorUnit: string; powerUnit: string; componentLabel: string; isBinned: boolean; peakIndex: number; children: ReactNode;
+  waveVectorUnit: string; powerUnit: string; componentPrefix: string; componentLabel: string; isBinned: boolean; peakIndex: number; children: ReactNode;
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
   const helpId = useId();
@@ -328,7 +329,7 @@ function SpectrumPowerGrid({ cells, kU, kV, amplitudes, componentLabels, amplitu
           const offset = 2 * (component * kU.length * kV.length + sample);
           const re = amplitudes[offset]!, im = amplitudes[offset + 1]!;
           return <tr key={label}>
-            <th scope="row">H_{label}</th>
+            <th scope="row">{componentPrefix}_{label}</th>
             <td>{formatScientific(re)}</td><td>{formatScientific(im)}</td>
             <td>{formatScientific(Math.hypot(re, im))}</td>
             <td>{re === 0 && im === 0 ? "undefined (zero amplitude)" : Math.atan2(im, re).toFixed(4)}</td>

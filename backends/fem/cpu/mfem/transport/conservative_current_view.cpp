@@ -824,33 +824,53 @@ PhysicalCertificate integrate_physical_certificate(
             physical_relative_gate * std::max(scale, 1.0e-30),
             roundoff_floor});
     };
+    std::string first_failed_gate;
+    const auto checked_gate = [&](const char *family, double value, double scale) {
+        const bool ok = gate(value, scale);
+        if (!ok && first_failed_gate.empty()) {
+            std::ostringstream detail;
+            detail << std::setprecision(17) << family
+                   << " value_a=" << value << " scale_a=" << scale;
+            first_failed_gate = detail.str();
+        }
+        return ok;
+    };
     bool elements_ok = true;
     for (const auto &row : result.elements) {
-        elements_ok = elements_ok && gate(row.residual_a, row.denominator_a);
+        elements_ok = elements_ok && checked_gate("element", row.residual_a, row.denominator_a);
     }
     bool faces_ok = true;
     for (const auto &row : result.faces) {
         if (row.side_count == 2) {
             const double scale = std::abs(row.side1_flux_a) +
                 std::abs(row.side2_flux_a);
-            const bool ok = gate(row.canonical_jump_a, scale);
+            const bool ok = checked_gate("internal_face", row.canonical_jump_a, scale);
             faces_ok = faces_ok && ok;
         }
     }
     bool pairs_ok = true;
     for (const auto &row : result.circuits) {
         if (row.kind == 2 || row.kind == 3) {
-            pairs_ok = pairs_ok && gate(row.mismatch_a,
+            pairs_ok = pairs_ok && checked_gate("paired_face", row.mismatch_a,
                 std::abs(row.flux_a) + std::abs(row.paired_flux_a));
         } else if (strict_local_gates && row.kind == 4) {
-            pairs_ok = pairs_ok && gate(row.flux_a, std::abs(row.flux_a));
+            pairs_ok = pairs_ok && checked_gate("outer_face", row.flux_a, std::abs(row.flux_a));
         }
     }
-    const bool terminals_ok = gate(terminal_net_flux, terminal_scale);
+    const bool terminals_ok = checked_gate("terminal", terminal_net_flux, terminal_scale);
     result.summary.closure_complete =
         elements_ok && faces_ok && pairs_ok && terminals_ok;
-    require(result.summary.closure_complete,
-        "physical Piola current certificate failed closed");
+    if (!result.summary.closure_complete) {
+        std::ostringstream message;
+        message << std::setprecision(17)
+                << "physical Piola current certificate failed closed: " << first_failed_gate
+                << "; strict_local_gates=" << strict_local_gates
+                << " physical_absolute_gate_a=" << physical_absolute_gate_a
+                << " physical_relative_gate=" << physical_relative_gate
+                << " elements_ok=" << elements_ok << " faces_ok=" << faces_ok
+                << " pairs_ok=" << pairs_ok << " terminals_ok=" << terminals_ok;
+        reject(message.str());
+    }
     return result;
 }
 
@@ -2120,7 +2140,8 @@ WeightedRt0Result solve_weighted_rt0_projection(
             solver.SetPreconditioner(preconditioner);
             solver.SetOperator(kkt);
             solver.SetRelTol(1.0e-12);
-            solver.SetAbsTol(1.0e-14);
+            // A fixed absolute stop can exceed the local physical flux gate.
+            solver.SetAbsTol(0.0);
             solver.SetMaxIter(static_cast<int>(max_iterations));
             solver.SetPrintLevel(-1);
             solver.Mult(kkt_rhs, kkt_solution);

@@ -2,7 +2,7 @@ use crate::antenna_spectrum::FieldTetraBvh;
 pub(crate) mod direct_quadrature;
 pub(crate) mod closed_loop_v2;
 mod closed_loop_public_inspection;
-pub use closed_loop_public_inspection::{load_published_antenna_closed_loop_inspection, verify_antenna_closed_loop_inspection_bytes, LoadedAntennaClosedLoopInspection};
+pub use closed_loop_public_inspection::{load_antenna_closed_loop_inspection_bytes, load_published_antenna_closed_loop_inspection, verify_antenna_closed_loop_inspection_bytes, LoadedAntennaClosedLoopInspection};
 pub(crate) mod closed_loop_execution;
 pub use closed_loop_execution::execute_antenna_closed_loop_inspection;
 pub(crate) mod direct_quadrature_v2;
