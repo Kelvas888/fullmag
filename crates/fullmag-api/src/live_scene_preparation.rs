@@ -127,6 +127,23 @@ fn prepared_multilayer_initial_state(
     Ok((values, layout))
 }
 
+fn prepared_fem_mesh(
+    execution_plan: &fullmag_ir::ExecutionPlanIR,
+) -> Option<fullmag_runner::FemMeshPayload> {
+    match &execution_plan.backend_plan {
+        fullmag_ir::BackendPlanIR::Fem(plan) => Some(fullmag_runner::FemMeshPayload::from(plan)),
+        fullmag_ir::BackendPlanIR::FemEigen(plan) => {
+            Some(fullmag_runner::FemMeshPayload::from(plan))
+        }
+        fullmag_ir::BackendPlanIR::FemFrequencyResponse(plan) => {
+            Some(fullmag_runner::FemMeshPayload::from(plan))
+        }
+        fullmag_ir::BackendPlanIR::Fdm(_)
+        | fullmag_ir::BackendPlanIR::FdmMultilayer(_)
+        | fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(_) => None,
+    }
+}
+
 /// Project the pinned preparation plan through the existing live metadata and
 /// mesh consumers. The mesh workspace envelope alone is diagnostic state: the
 /// binary topology resources require the solver-domain FemMeshPayload.
@@ -139,12 +156,10 @@ fn prepared_domain_publication(
         Some(Value::Object(metadata)) => metadata.clone(),
         Some(_) => return Err(ApiError::conflict("live metadata must be an object")),
     };
-    metadata.insert(
-        "execution_plan".into(),
-        serde_json::to_value(&read_model.execution_plan).map_err(|error| {
-            ApiError::internal(format!("failed to encode prepared execution plan: {error}"))
-        })?,
-    );
+    let execution_plan_metadata = serde_json::to_value(&read_model.execution_plan).map_err(
+        |error| ApiError::internal(format!("failed to encode prepared execution plan: {error}")),
+    )?;
+    metadata.insert("execution_plan".into(), execution_plan_metadata);
     if matches!(
         &read_model.execution_plan.backend_plan,
         fullmag_ir::BackendPlanIR::FdmMultilayer(_)
@@ -156,7 +171,10 @@ fn prepared_domain_publication(
         metadata.insert("artifact_layout".into(), layout);
     }
     let metadata = Value::Object(metadata);
-    let fem_mesh = crate::quantities::extract_fem_mesh_from_metadata(&metadata);
+    // Keep the typed pinned plan as the authority for the binary topology.
+    // The metadata JSON is a transport projection and must not replace the
+    // already validated typed plan.
+    let fem_mesh = prepared_fem_mesh(&read_model.execution_plan);
     if matches!(
         &read_model.execution_plan.backend_plan,
         fullmag_ir::BackendPlanIR::Fem(_)
@@ -2702,6 +2720,14 @@ mod tests {
         let mut snapshot = crate::session::default_current_live_state(&request);
         snapshot.metadata = request.metadata.clone();
         let model = prepared_fem_read_model(true);
+        assert_eq!(
+            match &model.execution_plan.backend_plan {
+                fullmag_ir::BackendPlanIR::Fem(plan) => plan.mesh.cells.len(),
+                _ => 0,
+            },
+            1,
+            "the pinned typed FEM plan must carry solver topology before publication"
+        );
         let (metadata, mesh) = prepared_domain_publication(&snapshot, &model).unwrap();
         assert_eq!(metadata["docker_startup"]["request_id"], "startup-domain");
         let mesh = mesh.expect("prepared FEM topology must be published before Compute");
