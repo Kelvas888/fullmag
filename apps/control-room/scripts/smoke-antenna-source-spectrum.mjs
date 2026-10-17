@@ -47,6 +47,13 @@ try {
   page = await browser.newPage({ viewport: { width: 1280, height: 1000 } });
   await page.addInitScript(() => {
     Object.defineProperty(window, "showSaveFilePicker", { value: undefined, writable: true, configurable: true });
+    window.__spectrumDigestGate = { hold: false, pending: [], completed: 0 };
+    const nativeDigest = crypto.subtle.digest.bind(crypto.subtle);
+    crypto.subtle.digest = (...args) => nativeDigest(...args).then(result => {
+      const gate = window.__spectrumDigestGate;
+      if (!gate.hold) return result;
+      return new Promise(resolve => gate.pending.push(() => { gate.completed++; resolve(result); }));
+    });
     window.__spectrumDecodeReads = 0;
     const readFloat64 = DataView.prototype.getFloat64;
     DataView.prototype.getFloat64 = function (...args) {
@@ -57,13 +64,15 @@ try {
   page.on("download", download => downloads.push(download.suggestedFilename()));
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
-  const readyScenarios = ["ready", "ready-tied-peak", "ready-vector", "ready-unitary", "ready-large"];
+  const readyScenarios = ["ready-nonuniform", "ready", "ready-tied-peak", "ready-vector", "ready-unitary", "ready-large"];
   const malformedMetadata = ["oversized-grid", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha"];
-  const malformedBytes = ["truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"];
+  const gridFailures = new Set(["stale-nonuniform"]);
+  const malformedBytes = ["wrong-nonuniform-body", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"];
   const readyScenarioSet = new Set(readyScenarios);
   const malformedMetadataSet = new Set(malformedMetadata);
   const malformedBytesSet = new Set(malformedBytes);
   const binaryDiagnostics = {
+    "wrong-nonuniform-body": "nonuniform k-grid payload differs from the authored axes",
     "truncated-payload": "power count 3 ≠ manifest 4",
     "nonfinite-payload": "amplitude payload contains a non-finite value",
     "inconsistent-power": "power payload disagrees with complex amplitudes at k-grid cell 0",
@@ -71,7 +80,7 @@ try {
     "oversized-body": "byte budget",
     "oversized-stream": "byte budget",
   };
-  for (const scenario of [...readyScenarios, "stale-window", "missing-window", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", ...malformedMetadata, ...malformedBytes]) {
+  for (const scenario of [...readyScenarios, ...gridFailures, "missing-nonuniform", "stale-window", "missing-window", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", ...malformedMetadata, ...malformedBytes]) {
     const location = new URL(url); location.searchParams.set("scenario", scenario);
     await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForFunction(() => window.__antennaSpectrumFixture?.read().calls.some((call) => call.path.endsWith("/output-catalog")) && window.__antennaSpectrumFixture.read().calls.some((call) => call.path.endsWith("/source-spectra/fft")), undefined, { timeout: 60_000 });
@@ -82,12 +91,14 @@ try {
     }
     if (readyScenarioSet.has(scenario)) await page.getByRole("grid").waitFor({ timeout: 60_000 });
     if (malformedBytesSet.has(scenario)) await page.locator('section[aria-label="Antenna source spectrum payload"]').getByRole("alert").waitFor({ timeout: 60_000 });
+    if (gridFailures.has(scenario)) await page.locator('section[aria-label="Antenna source spectrum payload"]').getByRole("alert").waitFor({ timeout: 60_000 });
     const before = await page.evaluate(() => window.__antennaSpectrumFixture.read());
     const sectionCount = await page.locator('section[aria-label="Antenna source spectrum payload"]').count();
     const payloads = before.calls.filter((call) => call.path.includes("/payloads/"));
     const text = await page.locator("main").textContent();
     const gridCells = await page.getByRole("gridcell").count();
     const ready = readyScenarioSet.has(scenario), bytesFailure = malformedBytesSet.has(scenario);
+    if (scenario === "missing-nonuniform") assert.ok(text.includes("nonuniform_spatial_fft requires a finite nonuniform k-grid"));
     if (scenario === "stale-window" || scenario === "missing-window") assert.ok(text.includes("configuration mismatch — recompute spectrum"), "Valid request must reject historical or absent window provenance");
     if (!ready) assert.equal(await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).count(), 0);
     if (bytesFailure) assert.ok(text.includes(binaryDiagnostics[scenario]), `${scenario} did not report the intended rejection: ${text}`);
@@ -267,7 +278,7 @@ try {
     }
     const passed = ready ? payloads.length === 4 && sectionCount === 1 && gridCells === (scenario === "ready-large" ? 4096 : 4)
       : bytesFailure ? payloads.length > 0 && payloads.length <= 4 && gridCells === 0 && text.includes("FFT payload")
-        : payloads.length === 0 && gridCells === 0 && (malformedMetadataSet.has(scenario) ? text.includes("Antenna spectrum") : sectionCount === 0);
+        : payloads.length === 0 && gridCells === 0 && (malformedMetadataSet.has(scenario) ? text.includes("Antenna spectrum") : gridFailures.has(scenario) ? sectionCount === 1 && text.includes("FFT configuration unavailable") : sectionCount === 0);
     checks.push({ name: `${scenario}: ${ready ? "matched metadata renders four scoped carriers" : bytesFailure ? "refuses corrupt binary grid" : "refuses binary reads and payload view"}`, passed, payloadRequests: payloads.length, sectionCount, gridCells });
     if (scenario === "oversized-body" || scenario === "oversized-stream") assert.ok(text.includes("byte budget"), "Oversized response was not rejected by transport before decoding");
     if (scenario === "oversized-stream") assert.equal(before.streamCancelled, true, "Over-budget stream was not cancelled");
@@ -434,15 +445,16 @@ try {
   }
   {
     const location = new URL(url); location.searchParams.set("scenario", "ready");
-    for (const field of ["component", "normalization", "window", "sampling", "target"]) {
-      location.searchParams.set("scenario", field === "window" ? "ready-large" : "ready");
+    for (const field of ["component", "normalization", "window", "sampling", "target", "grid"]) {
+      location.searchParams.set("scenario", field === "grid" ? "ready-nonuniform" : field === "window" ? "ready-large" : "ready");
       await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
       await page.getByRole("grid").waitFor({ timeout: 60_000 });
       await page.evaluate(() => { window.__spectrumConfigurationRoot = document.querySelector(".fm-inspector-panel"); });
       const before = await page.evaluate(() => window.__antennaSpectrumFixture.read());
       const binaryReads = value => value.calls.filter(call => call.path.includes("/payloads/")).length;
       await page.evaluate(field => window.__antennaSpectrumFixture.changeRequest(field), field);
-      await page.locator('[data-slot="inspector-group-content"]:visible').getByText("configuration mismatch — recompute spectrum", { exact: true }).waitFor();
+      if (field === "grid") await page.getByRole("alert").filter({ hasText: "Nonuniform k-grid differs" }).waitFor();
+      else await page.locator('[data-slot="inspector-group-content"]:visible').getByText("configuration mismatch — recompute spectrum", { exact: true }).waitFor();
       assert.equal(await page.getByRole("gridcell").count(), 0);
       assert.equal(await page.getByRole("button", { name: "Export full spectrum (JSON)", exact: true }).count(), 0);
       const changed = await page.evaluate(() => window.__antennaSpectrumFixture.read());
@@ -460,6 +472,33 @@ try {
       assert.equal((await page.evaluate(() => window.__antennaSpectrumFixture.read())).calls.length, restored.calls.length);
       checks.push({ name: `${field}: changed FFT configuration hides historical samples/export with no binary reads; exact restoration recovers the chart without polling`, passed: true });
     }
+  }
+  {
+    const location = new URL(url); location.searchParams.set("scenario", "ready-nonuniform");
+    await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.getByRole("grid").waitFor();
+    const reads = () => page.evaluate(() => window.__antennaSpectrumFixture.read().calls.filter(call => call.path.includes("/payloads/")).length);
+    const baseline = await reads();
+    await page.evaluate(() => {
+      window.__spectrumDigestGate.hold = true;
+      window.__antennaSpectrumFixture.changeRequest("grid");
+    });
+    await page.waitForFunction(() => window.__spectrumDigestGate.pending.length === 2);
+    await page.evaluate(() => window.__antennaSpectrumFixture.changeRequest("grid", true));
+    await page.waitForFunction(() => window.__spectrumDigestGate.pending.length === 4);
+    assert.equal(await page.getByRole("gridcell").count(), 0);
+    assert.equal(await reads(), baseline);
+    // New valid axes finish first; the older mismatch must never replace them.
+    await page.evaluate(() => window.__spectrumDigestGate.pending.splice(2, 2).forEach(release => release()));
+    await page.getByRole("grid").waitFor();
+    const restoredReads = await reads();
+    await page.evaluate(() => window.__spectrumDigestGate.pending.splice(0).forEach(release => release()));
+    await page.waitForTimeout(200);
+    assert.equal(await page.getByRole("gridcell").count(), 4);
+    assert.equal(await page.getByRole("alert").filter({ hasText: "Nonuniform k-grid differs" }).count(), 0);
+    assert.equal(await reads(), restoredReads);
+    assert.ok(restoredReads - baseline <= 4);
+    checks.push({ name: "Out-of-order SHA completion cannot replace the restored nonuniform chart or trigger extra binary reads", passed: true });
   }
   {
     const location = new URL(url); location.searchParams.set("scenario", "ready-complex-vector");

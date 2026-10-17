@@ -915,6 +915,7 @@ export function AntennaCompositionPanel({
         <AntennaSourceSpectrumPayloadView
           outputId={ids.spectrumOutputId}
           spectrum={sourceSpectrum.data}
+          expectedKGrid={ids.spectrumRequest?.nonuniform_k_grid}
         />
       ) : null}
       {kind === "conductor" ? <AntennaConductorDetails objectId={objectId} scene={scene.data} /> : kind !== "spectrum" ? <AntennaCompositionReadout key={JSON.stringify([scope, kind, resourceId])} title={model.title} badge={model.badge} rows={model.rows} /> : <InspectorGroup title="Configuration and provenance" badge={model.badge} collapsible defaultOpen={false}>

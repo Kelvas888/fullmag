@@ -15,6 +15,7 @@ import {
 import type { ResourceResult } from "@/kernel/resources/resourceTypes";
 import { Button } from "@/shared/ui/Button";
 
+import { useAntennaSpectrumGridCompatibility, type AntennaSpectrumKGrid } from "./useAntennaSpectrumGridCompatibility";
 import { AntennaSpectrumExport } from "./AntennaSpectrumExport";
 
 const MAX_AXIS_CELLS = 64;
@@ -23,6 +24,7 @@ const MAX_DISPLAY_PAYLOAD_BYTES = 64 * 1024 * 1024;
 interface SpectrumPayloadViewProps {
   outputId: string;
   spectrum: AntennaSourceSpectrumResource;
+  expectedKGrid?: AntennaSpectrumKGrid;
 }
 
 interface DecodedPayloads {
@@ -51,6 +53,7 @@ function useSpectrumPayloadSnapshot({ data, error, refreshError, status }: Spect
 export function AntennaSourceSpectrumPayloadView({
   outputId,
   spectrum,
+  expectedKGrid,
 }: SpectrumPayloadViewProps) {
   const manifest = useMemo(() => {
     try {
@@ -71,13 +74,15 @@ export function AntennaSourceSpectrumPayloadView({
         error: error instanceof Error ? error : new Error("spectrum manifest validation failed") };
     }
   }, [spectrum]);
+  const gridCompatibility = useAntennaSpectrumGridCompatibility(spectrum, expectedKGrid, manifest.kind === "ready");
+  const payloadsEnabled = manifest.kind === "ready" && gridCompatibility.kind === "ready";
   const kU = useSpectrumPayloadSnapshot(useAntennaSourceSpectrumPayloadResource(outputId, "k_u_rad_per_m", {
-    enabled: manifest.kind === "ready",
+    enabled: payloadsEnabled,
     expectedEtag: manifest.kind === "ready" ? manifest.etags.k_u_rad_per_m : undefined,
     maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.k_u_rad_per_m : undefined,
   }));
   const kV = useSpectrumPayloadSnapshot(useAntennaSourceSpectrumPayloadResource(outputId, "k_v_rad_per_m", {
-    enabled: manifest.kind === "ready",
+    enabled: payloadsEnabled,
     expectedEtag: manifest.kind === "ready" ? manifest.etags.k_v_rad_per_m : undefined,
     maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.k_v_rad_per_m : undefined,
   }));
@@ -85,21 +90,21 @@ export function AntennaSourceSpectrumPayloadView({
     outputId,
     "amplitudes_re_im",
     {
-      enabled: manifest.kind === "ready",
+      enabled: payloadsEnabled,
       expectedEtag: manifest.kind === "ready" ? manifest.etags.amplitudes_re_im : undefined,
       maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.amplitudes_re_im : undefined,
     },
   ));
   const power = useSpectrumPayloadSnapshot(useAntennaSourceSpectrumPayloadResource(outputId, "power", {
-    enabled: manifest.kind === "ready",
+    enabled: payloadsEnabled,
     expectedEtag: manifest.kind === "ready" ? manifest.etags.power : undefined,
     maxResponseBytes: manifest.kind === "ready" ? manifest.lengths.payloads.power : undefined,
   }));
   const payloads = useMemo(() => {
-    if (manifest.kind !== "ready") return { kind: "pending" as const };
+    if (!payloadsEnabled) return { kind: "pending" as const };
     const decoded = decodePayloads(kU, kV, amplitudes, power);
     if (decoded.kind !== "ready") return decoded;
-    const integrityError = validatePayloads(decoded.value, spectrum);
+    const integrityError = validatePayloads(decoded.value, spectrum, expectedKGrid);
     if (integrityError) return { kind: "integrity-error" as const, error: integrityError };
     return {
       ...decoded,
@@ -108,7 +113,7 @@ export function AntennaSourceSpectrumPayloadView({
       rangeU: spectrumPowerExtrema(decoded.value.kU),
       rangeV: spectrumPowerExtrema(decoded.value.kV),
     };
-  }, [amplitudes, kU, kV, manifest, power, spectrum]);
+  }, [amplitudes, kU, kV, payloadsEnabled, power, spectrum, expectedKGrid]);
 
   if (manifest.kind === "error") {
     return (
@@ -118,6 +123,14 @@ export function AntennaSourceSpectrumPayloadView({
         </p>
       </section>
     );
+  }
+
+  if (gridCompatibility.kind !== "ready") {
+    return <section className="fm-antenna-spectrum" aria-label="Antenna source spectrum payload">
+      <p className={gridCompatibility.kind === "error" ? "fm-antenna-spectrum__status fm-antenna-spectrum__status--error" : "fm-antenna-spectrum__status"} role={gridCompatibility.kind === "error" ? "alert" : "status"}>
+        {gridCompatibility.kind === "error" ? `FFT configuration unavailable: ${gridCompatibility.error}` : "Verifying authored wave-vector grid…"}
+      </p>
+    </section>;
   }
 
   if (payloads.kind === "pending") {
@@ -400,10 +413,18 @@ function decodeF64LE(buffer: ArrayBuffer | undefined): number[] {
   return values;
 }
 
+function sameAxis(a: readonly number[], b: readonly number[]): boolean {
+  return a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
+}
+
 function validatePayloads(
   payloads: DecodedPayloads,
   spectrum: AntennaSourceSpectrumResource,
+  expectedKGrid?: AntennaSpectrumKGrid,
 ): string | null {
+  if (expectedKGrid && (!sameAxis(payloads.kU, expectedKGrid.k_u_rad_per_m) || !sameAxis(payloads.kV, expectedKGrid.k_v_rad_per_m))) {
+    return "nonuniform k-grid payload differs from the authored axes";
+  }
   if (payloads.kU.length !== spectrum.k_u_count) {
     return `k_u count ${payloads.kU.length} ≠ manifest ${spectrum.k_u_count}`;
   }
