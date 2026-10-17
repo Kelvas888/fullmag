@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 import docker_dev
 import docker_development_inputs as development_inputs
+import docker_frontend_cache as frontend_cache
 import fullmag_docker_runtime as runtime
 
 
@@ -25,6 +26,126 @@ class DockerDevRecreateContract(unittest.TestCase):
         parsed = docker_dev._parser().parse_args(["build", "--port", "4242"])
         self.assertEqual(parsed.port, 4242)
         self.assertIsNone(parsed.script)
+
+    def test_pnpm_patch_paths_are_bounded_checkout_relative_inputs(self):
+        package = json.dumps({
+            "pnpm": {
+                "patchedDependencies": {
+                    "next@16.3.8": "patches/next@16.3.8.patch",
+                },
+            },
+        }).encode()
+        self.assertEqual(
+            development_inputs._pnpm_patch_relatives(package),
+            (Path("patches/next@16.3.8.patch"),),
+        )
+        for raw_path in (
+            "../outside.patch",
+            "/tmp/next.patch",
+            "patches\\next.patch",
+            "patches/../next.patch",
+            "vendor/next.patch",
+        ):
+            with self.subTest(raw_path=raw_path), self.assertRaises(ValueError):
+                development_inputs._pnpm_patch_relatives(json.dumps({
+                    "pnpm": {"patchedDependencies": {"next@16.3.8": raw_path}},
+                }).encode())
+
+    def test_frontend_seed_freezes_declared_pnpm_patch_and_rejects_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "checkout"
+            app = source / "apps" / "control-room"
+            state = root / "state"
+            for name in development_inputs.DIRECTORIES:
+                (app / name).mkdir(parents=True)
+            (app / "package.json").write_text('{"name":"control-room"}\n', encoding="utf-8")
+            (app / "next.config.ts").write_text("export default {};\n", encoding="utf-8")
+            (source / "package.json").write_text(json.dumps({
+                "name": "fullmag",
+                "pnpm": {
+                    "patchedDependencies": {
+                        "next@16.3.8": "patches/next@16.3.8.patch",
+                    },
+                },
+            }), encoding="utf-8")
+            (source / "pnpm-lock.yaml").write_text(
+                "lockfileVersion: '9.0'\nimporters:\n  apps/control-room:\n    specifiers: {}\n",
+                encoding="utf-8",
+            )
+            (source / "pnpm-workspace.yaml").write_text(
+                "packages:\n  - apps/*\n", encoding="utf-8"
+            )
+            patch_path = source / "patches" / "next@16.3.8.patch"
+            patch_path.parent.mkdir()
+            patch_data = b"diff --git a/router.js b/router.js\n+patched\n"
+            patch_path.write_bytes(patch_data)
+            native_test_os = types.SimpleNamespace(name="nt", fsync=development_inputs.os.fsync)
+
+            with patch.object(development_inputs, "os", native_test_os), \
+                    patch.object(development_inputs, "local_volume", side_effect=lambda path: str(path)), \
+                    patch.object(development_inputs, "read_owned_regular",
+                                 side_effect=lambda path, maximum: Path(path).read_bytes()), \
+                    patch.object(development_inputs.storage, "git", return_value="a" * 40):
+                inputs = development_inputs.seed(source, state, 3197)
+
+            patch_record = next(
+                item for item in inputs["files"]
+                if item["relative"] == "patches/next@16.3.8.patch"
+            )
+            self.assertEqual(
+                patch_record["sha256"], hashlib.sha256(patch_data).hexdigest()
+            )
+            self.assertIn("patches/next@16.3.8.patch", inputs["dependency_seed_files"])
+            dependency_entries = {
+                item["relative"]: item["sha256"]
+                for item in inputs["files"]
+                if item["relative"] in inputs["dependency_seed_files"]
+            }
+            self.assertEqual(
+                inputs["dependency_seed_sha256"],
+                frontend_cache.dependency_seed_digest(dependency_entries),
+            )
+            self.assertEqual(
+                (state / "development" / "workspace" / "patches" / "next@16.3.8.patch").read_bytes(),
+                patch_data,
+            )
+
+            readme_path = source / "patches" / "README.md"
+            unknown_path = source / "patches" / "unregistered.patch"
+            readme_path.write_text("local notes\n", encoding="utf-8")
+            unknown_path.write_bytes(b"unexpected\n")
+            unknown_state = root / "unknown-state"
+            with patch.object(development_inputs, "os", native_test_os), \
+                    patch.object(development_inputs, "local_volume", side_effect=lambda path: str(path)), \
+                    patch.object(development_inputs, "read_owned_regular",
+                                 side_effect=lambda path, maximum: Path(path).read_bytes()), \
+                    patch.object(development_inputs.storage, "git", return_value="a" * 40):
+                unreferenced_inputs = development_inputs.seed(source, unknown_state, 3197)
+            self.assertEqual(
+                unreferenced_inputs["dependency_seed_sha256"],
+                inputs["dependency_seed_sha256"],
+            )
+            self.assertNotIn("patches/README.md", {
+                item["relative"] for item in unreferenced_inputs["files"]
+            })
+            self.assertNotIn("patches/unregistered.patch", {
+                item["relative"] for item in unreferenced_inputs["files"]
+            })
+            self.assertNotIn("patches/README.md", unreferenced_inputs["dependency_seed_files"])
+            self.assertNotIn("patches/unregistered.patch", unreferenced_inputs["dependency_seed_files"])
+            readme_path.unlink()
+            unknown_path.unlink()
+
+            patch_path.unlink()
+            missing_state = root / "missing-state"
+            with patch.object(development_inputs, "os", native_test_os), \
+                    patch.object(development_inputs, "local_volume", side_effect=lambda path: str(path)), \
+                    patch.object(development_inputs, "read_owned_regular",
+                                 side_effect=lambda path, maximum: Path(path).read_bytes()), \
+                    patch.object(development_inputs.storage, "git", return_value="a" * 40):
+                with self.assertRaisesRegex(ValueError, "Declared pnpm patch file is missing"):
+                    development_inputs.seed(source, missing_state, 3197)
 
     def test_live_service_rejects_frozen_source_options_explicitly(self):
         base = types.SimpleNamespace(

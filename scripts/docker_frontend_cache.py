@@ -148,7 +148,8 @@ def toolpins_digest(toolpins: Mapping[str, Any] | None = None) -> str:
 
 
 def dependency_seed_digest(entries: Mapping[str, str]) -> str:
-    """Hash only dependency manifests, excluding source and generated files."""
+    """Hash dependency manifests and declared package-manager patch files,
+    excluding authored source and generated files."""
 
     normalized = {str(key).replace("\\", "/"): str(value) for key, value in entries.items()}
     return _sha256(normalized)

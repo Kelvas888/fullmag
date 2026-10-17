@@ -1,10 +1,15 @@
-"""Seed isolated Linux frontend metadata and bind live Windows source folders."""
+"""Seed isolated Linux frontend metadata and bind live Windows source folders.
+
+The selected checkout's root package manifest and its declared pnpm patch files
+are immutable dependency inputs.  The application source directories remain
+live readonly mounts.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 
 import fullmag_storage as storage
@@ -64,6 +69,77 @@ def _read_json_file(path, label):
     if not isinstance(value, dict):
         raise ValueError(f"{label} must contain an object")
     return value
+
+
+def _pnpm_patch_relatives(package_data):
+    """Return declared, bounded pnpm patch paths below the checkout's patches/."""
+    try:
+        manifest = json.loads(package_data)
+    except (UnicodeError, ValueError) as error:
+        raise ValueError("Root package.json is not valid JSON") from error
+    if not isinstance(manifest, dict):
+        raise ValueError("Root package.json must contain an object")
+    pnpm = manifest.get("pnpm")
+    if pnpm is None:
+        return ()
+    if not isinstance(pnpm, dict):
+        raise ValueError("Root package.json pnpm field must contain an object")
+    patched = pnpm.get("patchedDependencies")
+    if patched is None:
+        return ()
+    if not isinstance(patched, dict):
+        raise ValueError("pnpm.patchedDependencies must contain an object")
+    if len(patched) > 128:
+        raise ValueError("pnpm.patchedDependencies has too many entries")
+
+    relatives = set()
+    for package_name, raw_path in patched.items():
+        if (not isinstance(package_name, str) or not package_name
+                or len(package_name.encode("utf-8")) > 512):
+            raise ValueError("pnpm patch package key must be a bounded non-empty string")
+        if (not isinstance(raw_path, str) or not raw_path
+                or len(raw_path.encode("utf-8")) > 512
+                or "\x00" in raw_path
+                or any(ord(character) < 32 for character in raw_path)
+                or any(character in '<>:"|?*' for character in raw_path)
+                or "\\" in raw_path):
+            raise ValueError("pnpm patch path must be a bounded POSIX relative path")
+        path = PurePosixPath(raw_path)
+        if (path.is_absolute()
+                or raw_path != path.as_posix()
+                or len(path.parts) < 2
+                or path.parts[0] != "patches"
+                or not path.name.endswith(".patch")
+                or any(part in {"", ".", "..", ".git", "node_modules"} for part in path.parts)):
+            raise ValueError("pnpm patch path must stay below patches/")
+        relatives.add(Path(*path.parts))
+    return tuple(sorted(relatives, key=str))
+
+
+def _pnpm_patch_inventory(source, declared):
+    """Check only declared patch paths, without scanning unrelated files."""
+    observed = set()
+    for relative in declared:
+        parts = relative.parts
+        for count in range(1, len(parts)):
+            parent = source.joinpath(*parts[:count])
+            try:
+                if storage.is_link(parent) or not parent.is_dir():
+                    raise ValueError(
+                        f"Declared pnpm patch parent is missing or a reparse point: {parent}"
+                    )
+            except OSError as error:
+                raise ValueError(f"Cannot inspect pnpm patch parent: {parent}") from error
+        candidate = source / relative
+        try:
+            if storage.is_link(candidate) or not candidate.is_file():
+                raise ValueError(
+                    f"Declared pnpm patch file is missing or not regular: {relative}"
+                )
+        except OSError as error:
+            raise ValueError(f"Cannot inspect pnpm patch file: {relative}") from error
+        observed.add(relative.as_posix().casefold())
+    return frozenset(observed)
 
 
 def _next_generated_seed_variants(relative, source):
@@ -172,8 +248,17 @@ def seed(source, state, port, *, reuse_from=None):
         local_volume(path)
         directories.append({"name": name, "source": str(path),
                             "target": WORKSPACE + "/apps/control-room/" + name})
-    relative_files = {Path(name) for name in ("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml")}
+    package_relative = Path("package.json")
+    package_data = read_owned_regular(source / package_relative, maximum=16 * 1024 * 1024)
+    patch_relatives = _pnpm_patch_relatives(package_data)
+    patch_inventory = _pnpm_patch_inventory(source, patch_relatives)
+    relative_files = {
+        Path(name) for name in ("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml")
+    }
+    relative_files.update(patch_relatives)
     dependency_files = set(relative_files)
+    # Pnpm patch files are frozen dependency inputs, while app dirs remain live
+    # readonly mounts.
     # The lockfile can contain other workspace importers. Copy their manifests,
     # while only Control Room sources become live container inputs.
     from windows.stage_workspace_frontend import _parse_lock_importers, _direct_app_package_manifests
@@ -198,7 +283,15 @@ def seed(source, state, port, *, reuse_from=None):
     else:
         destination.mkdir(parents=True, exist_ok=False)
     for relative in sorted(relative_files, key=str):
-        data = read_owned_regular(source / relative, maximum=16 * 1024 * 1024)
+        try:
+            data = (package_data if relative == package_relative else
+                    read_owned_regular(source / relative, maximum=16 * 1024 * 1024))
+        except OSError as error:
+            if relative in patch_relatives:
+                raise ValueError(
+                    f"Declared pnpm patch file is missing or unavailable: {relative}"
+                ) from error
+            raise
         target = storage.validate_path(destination / relative, destination, "frontend metadata")
         if reuse_from is None:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -218,6 +311,8 @@ def seed(source, state, port, *, reuse_from=None):
         current = read_owned_regular(source / file["relative"], maximum=16 * 1024 * 1024)
         if hashlib.sha256(current).hexdigest() != file["sha256"]:
             raise ValueError("Frontend configuration changed during metadata capture: " + file["relative"])
+    if _pnpm_patch_inventory(source, patch_relatives) != patch_inventory:
+        raise ValueError("Pnpm patch inventory changed during metadata capture")
     if not re.fullmatch(r"[a-f0-9]{40}", commit):
         raise ValueError("Live source checkout has no full commit identity")
     from docker_frontend_cache import default_toolpins, dependency_seed_digest, toolpins_digest
