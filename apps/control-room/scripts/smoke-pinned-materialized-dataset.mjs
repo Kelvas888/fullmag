@@ -487,7 +487,16 @@ async function main() {
       }
       assert.equal(liveResourceRequestCount(state), liveBeforeSaved, `Saved ${field.quantity} fetched live data.`);
       assert.equal(state.cameraMutationRequests.length, cameraMutationsBeforeSaved, `Saved ${field.quantity} mutated live visualization.`);
+      await assertSavedLegendLayout(page, state, field.variant);
       await captureScreenshot(page, state, `saved-${field.variant}.png`);
+      if (field.components === 1) {
+        await page.setViewportSize({ height: 1100, width: 1024 });
+        await page.waitForTimeout(250);
+        await assertSavedLegendLayout(page, state, "potential-narrow", true);
+        await captureScreenshot(page, state, "saved-potential-narrow.png");
+        await page.setViewportSize({ height: 1100, width: 1440 });
+        await page.waitForTimeout(250);
+      }
     }
 
     state.savedGeometryMode = "mismatch";
@@ -653,6 +662,7 @@ function isHostTelemetryRead(method, path) {
 function createFixtureState() {
   return {
     currentProjectId: null,
+    savedLegendLayouts: [],
     forgeManifestForArtifact: null,
     projectCreateCount: 0,
     requests: [],
@@ -1007,6 +1017,27 @@ async function assertSavedViewportRendered(page, state, variant, auditBefore = n
   assert.equal(proof.active_node_count, 3, `Saved ${variant} viewport did not preserve its inactive support mask.`);
   assert.equal(proof.active_color_mask_seen, true, `Saved ${variant} viewport did not upload distinct active-node colors with the support mask applied.`);
   return proof;
+}
+
+async function assertSavedLegendLayout(page, state, phase, narrow = false) {
+  const proof = await page.locator(".fm-viewport-3d").evaluate((viewport) => {
+    const legend = viewport.querySelector(".fm-viewport-3d__colorbar-stack");
+    if (!legend) throw new Error("Saved field legend is missing.");
+    const view = viewport.getBoundingClientRect();
+    const rect = legend.getBoundingClientRect();
+    const reserve = 12 * parseFloat(getComputedStyle(document.documentElement).fontSize);
+    const canvas = viewport.querySelector("canvas");
+    const gl = canvas?.getContext("webgl2") ?? canvas?.getContext("webgl");
+    return { width: view.width, legendWidth: rect.width,
+      inside: rect.left >= view.left && rect.right <= view.right && rect.top >= view.top && rect.bottom <= view.bottom,
+      overlapsOrientation: rect.left < view.left + reserve && rect.bottom > view.bottom - reserve,
+      webglReady: Boolean(canvas && gl && !gl.isContextLost() && gl.drawingBufferWidth > 0 && gl.drawingBufferHeight > 0) };
+  });
+  assert.ok(proof.inside && proof.legendWidth > 0, "Saved legend is clipped by its viewport.");
+  assert.equal(proof.overlapsOrientation, false, "Saved legend overlaps the direction reference area.");
+  assert.equal(proof.webglReady, true, "Saved legend layout lost the WebGL drawing buffer.");
+  if (narrow) assert.ok(proof.width <= 512, `Narrow legend case did not exercise its container breakpoint: ${proof.width}px.`);
+  state.savedLegendLayouts.push({ phase, ...proof });
 }
 
 async function readViewportCameraSnapshot(page) {
@@ -2518,6 +2549,7 @@ async function writeReport({
     workspace_url: url,
     screenshots: state.screenshots,
     viewport_proofs: state.viewportProofs,
+    saved_legend_layouts: state.savedLegendLayouts,
     camera_snapshots: state.cameraSnapshots,
     screenshot_error: state.screenshotError ?? null,
     proof,
