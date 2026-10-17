@@ -39,6 +39,9 @@ mod antenna_field_solution;
 mod antenna_spectrum;
 mod antenna_stage;
 pub use antenna_field_solution::{
+    execute_antenna_closed_loop_inspection, verify_antenna_closed_loop_inspection_bytes,
+    load_antenna_closed_loop_inspection_bytes,
+    load_published_antenna_closed_loop_inspection, LoadedAntennaClosedLoopInspection,
     load_antenna_field_solution_samples, load_antenna_field_solution_samples_for_spectrum,
     load_solved_antenna_drive_basis_projected,
     materialize_fdm_solved_antenna_drives, materialize_fdm_solved_antenna_drives_v03,
@@ -46,7 +49,7 @@ pub use antenna_field_solution::{
     verify_antenna_field_solution_asset, verify_antenna_field_solution_signatures,
     verify_antenna_field_solution_referenced_data, AntennaQuadratureEvidenceRef,
     AntennaDependencySignatures, AntennaFieldSolutionAsset, AntennaFieldSolutionSamples,
-    AntennaFieldSolutionSignatures,
+    AntennaFieldSolutionSignatures, AntennaSampleCarrier,
 };
 pub use antenna_spectrum::{
     antenna_source_spectrum_auxiliary_artifact, antenna_source_spectrum_auxiliary_artifacts,
@@ -56,6 +59,8 @@ pub use antenna_spectrum::{
     reusable_antenna_source_spectrum_output,
     compute_antenna_source_spectrum_artifact,
     compute_antenna_source_spectrum_artifact_interruptible,
+    compute_antenna_source_spectrum_with_equilibrium,
+    verify_antenna_source_spectrum_equilibrium_binding,
     compute_nonuniform_k_antenna_source_spectrum,
     compute_structured_antenna_source_spectrum, sample_antenna_field_on_plane,
     AntennaSourceSpectrum2D, AntennaSourceSpectrumArtifact, AntennaSourceSpectrumManifest,
@@ -499,6 +504,7 @@ pub fn frozen_spins_runtime_status_for_backend_plan(
     backend_plan: &BackendPlanIR,
 ) -> Result<Option<constraints::FrozenSpinsRuntimeStatus>, RunError> {
     let (frozen_plan, active_mask, initial_magnetization) = match backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => return Ok(None),
         BackendPlanIR::Fdm(plan) => (
             plan.frozen_spins.as_ref(),
             plan.active_mask.clone(),
@@ -547,6 +553,7 @@ pub use fem_eigen::{
     FemRelaxationProducerPayloads, FemRelaxationProducerPlanSnapshot,
     FemRelaxationProducerProvenance, FEM_RELAXATION_PRODUCER_PLAN_NAMESPACE_V1,
     FEM_RELAXATION_PRODUCER_PROVENANCE_RELATIVE_PATH, FEM_RELAXATION_PRODUCER_PROVENANCE_V1,
+    accepted_antenna_equilibrium_artifacts, publish_accepted_antenna_equilibrium, load_verified_antenna_equilibrium, AntennaEquilibriumBinding, VerifiedAntennaEquilibriumContext,
 };
 pub use interactive::backend::BackendGeometry;
 pub use interactive::checkpoints::RunOutcome;
@@ -1804,6 +1811,7 @@ fn require_supported_fem_topology(
     plan: &fullmag_ir::ExecutionPlanIR,
 ) -> Result<(), RunError> {
     let (mesh, build_report, precision, study_kind, fem_plan) = match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => return Ok(()),
         BackendPlanIR::Fem(fem) => (
             &fem.mesh,
             fem.mesh_build_report.as_ref(),
@@ -2263,10 +2271,21 @@ fn require_tetrahedral_fem_plan_mesh(
     })
 }
 
+pub(crate) fn field_only_plan_not_executable_as_llg() -> RunError {
+    RunError {
+        message: "field_only_plan_not_executable_as_llg: execute the selected resolved antenna action; no magnetic state or fallback is available".to_string(),
+    }
+}
+
 pub(crate) fn require_resolved_runtime_sampling(
     problem: &ProblemIR,
     plan: &fullmag_ir::ExecutionPlanIR,
 ) -> Result<(), RunError> {
+    if matches!(plan.backend_plan, BackendPlanIR::AntennaFieldOnly(_))
+        || matches!(problem.study, fullmag_ir::StudyIR::FieldOnly { .. })
+    {
+        return Err(field_only_plan_not_executable_as_llg());
+    }
     require_supported_fem_topology(problem, plan)?;
     schedules::require_resolved_periodic_outputs(&plan.output_plan.outputs)
         .map_err(|message| RunError { message })?;
@@ -2638,6 +2657,11 @@ fn validate_parallel_execution_workflow(
                     message: "parallel_execution adaptive is unsupported for FEM frequency-response workflows; use serial execution".into(),
                 });
             }
+            BackendPlanIR::AntennaFieldOnly(_) => {
+                return Err(RunError {
+                    message: "parallel_execution adaptive is unsupported for antenna field-only workflows; use serial execution".into(),
+                });
+            }
             BackendPlanIR::AntennaExternalLeadInspection(_) => {
                 return Err(RunError {
                     message: "parallel_execution adaptive is unsupported for antenna external-lead inspection workflows; use serial execution".into(),
@@ -2679,6 +2703,9 @@ fn append_parallel_execution_provenance(
 pub fn study_magnetization_layout_for_plan(
     plan: &fullmag_ir::ExecutionPlanIR,
 ) -> Result<serde_json::Value, RunError> {
+    if matches!(plan.backend_plan, BackendPlanIR::AntennaFieldOnly(_)) {
+        return Err(field_only_plan_not_executable_as_llg());
+    }
     let layout = artifacts::field_layout(plan);
     let backend = layout
         .get("backend")
@@ -2906,6 +2933,7 @@ fn run_planned_problem_with_artifact_context(
 
     let cpu_threads = configured_control_pool_threads(problem, plan);
     let executed_result = with_cpu_parallelism(cpu_threads, || match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => Err(crate::field_only_plan_not_executable_as_llg()),
         BackendPlanIR::Fdm(fdm) => {
             let resolution = dispatch::resolve_fdm_engine_for_plan_with_trail(problem, fdm)?;
             let mut executed = dispatch::execute_fdm_in_mode(
@@ -3480,6 +3508,7 @@ fn run_planned_problem_with_callback_artifact_context(
 
     let cpu_threads = configured_control_pool_threads(problem, plan);
     let executed_result = with_cpu_parallelism(cpu_threads, || match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => Err(crate::field_only_plan_not_executable_as_llg()),
         BackendPlanIR::Fdm(fdm) => {
             let grid = fdm.grid.cells;
             let resolution = dispatch::resolve_fdm_engine_for_plan_with_trail(problem, fdm)?;
@@ -3673,6 +3702,7 @@ fn run_planned_problem_with_callback_artifact_context(
         ..StepStats::default()
     });
     let final_m = match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => None,
         BackendPlanIR::Fem(_) => None,
         _ => Some(
             executed
@@ -3684,6 +3714,7 @@ fn run_planned_problem_with_callback_artifact_context(
         ),
     };
     let final_grid = match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => [0, 0, 0],
         BackendPlanIR::Fdm(fdm) => [fdm.grid.cells[0], fdm.grid.cells[1], fdm.grid.cells[2]],
         BackendPlanIR::FdmMultilayer(fdm) => [
             fdm.common_cells[0],
@@ -4037,6 +4068,7 @@ fn run_planned_problem_with_live_preview_artifact_context(
     let live_display_selection = (field_every_n != u64::MAX).then_some(display_selection);
     let mut terminal_fdm_fields = None;
     let executed_result = with_cpu_parallelism(cpu_threads, || match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => Err(crate::field_only_plan_not_executable_as_llg()),
         BackendPlanIR::Fdm(fdm) => {
             let grid = fdm.grid.cells;
             let resolution = dispatch::resolve_fdm_engine_for_plan_with_trail(problem, fdm)?;
@@ -4227,6 +4259,7 @@ fn run_planned_problem_with_live_preview_artifact_context(
         ..StepStats::default()
     });
     let final_grid = match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => [0, 0, 0],
         BackendPlanIR::Fdm(fdm) => [fdm.grid.cells[0], fdm.grid.cells[1], fdm.grid.cells[2]],
         BackendPlanIR::FdmMultilayer(fdm) => [
             fdm.common_cells[0],
@@ -4239,6 +4272,7 @@ fn run_planned_problem_with_live_preview_artifact_context(
         | BackendPlanIR::FemFrequencyResponse(_) => [0, 0, 0],
     };
     let final_m = match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => None,
         BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => Some(
             executed
                 .result
@@ -4864,6 +4898,7 @@ pub fn snapshot_planned_problem_preview(
 ) -> Result<LivePreviewField, RunError> {
     require_physics_graph_runtime_provenance(problem, plan)?;
     match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => Err(crate::field_only_plan_not_executable_as_llg()),
         BackendPlanIR::Fdm(fdm) => {
             let engine = dispatch::resolve_fdm_engine_for_plan_with_trail(problem, fdm)?.engine;
             dispatch::snapshot_fdm_preview(engine, fdm, request)
@@ -4917,6 +4952,7 @@ pub fn snapshot_planned_problem_vector_fields(
 ) -> Result<Vec<LivePreviewField>, RunError> {
     require_physics_graph_runtime_provenance(problem, plan)?;
     match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => Err(crate::field_only_plan_not_executable_as_llg()),
         BackendPlanIR::Fdm(fdm) => {
             let engine = dispatch::resolve_fdm_engine_for_plan_with_trail(problem, fdm)?.engine;
             dispatch::snapshot_fdm_vector_fields(engine, fdm, quantities, request)
@@ -5243,6 +5279,7 @@ pub fn resolve_planned_runtime_engine(
 ) -> Result<RuntimeEngineInfo, RunError> {
     require_supported_fem_topology(problem, plan)?;
     match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => Err(crate::field_only_plan_not_executable_as_llg()),
         BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
             solver_runtime::registry::resolve_antenna_inspection_runtime(inspection, None)?;
             Ok(RuntimeEngineInfo {
@@ -5443,6 +5480,7 @@ pub fn resolve_planned_runtime_capabilities(
 ) -> Result<BackendCapabilities, RunError> {
     require_supported_fem_topology(problem, plan)?;
     match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => Err(crate::field_only_plan_not_executable_as_llg()),
         BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
             solver_runtime::registry::resolve_antenna_inspection_runtime(inspection, None)?;
             // V/J/H are published by the owned inspection resource, not by the

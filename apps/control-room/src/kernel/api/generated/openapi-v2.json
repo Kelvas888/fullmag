@@ -142,6 +142,39 @@
         ],
         "type": "object"
       },
+      "AcceptedInspectionArtifactOwner": {
+        "additionalProperties": false,
+        "description": "Durable accepted publication identity; epoch remains a lossless decimal string in JSON.",
+        "properties": {
+          "artifact_id": {
+            "type": "string"
+          },
+          "attempt_id": {
+            "type": "string"
+          },
+          "object_ref": {
+            "type": "string"
+          },
+          "ownership_epoch": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "task_id",
+          "attempt_id",
+          "ownership_epoch",
+          "artifact_id",
+          "object_ref"
+        ],
+        "type": "object"
+      },
       "AcceptedObservationFrameRef": {
         "properties": {
           "domain_generation_id": {
@@ -2284,6 +2317,200 @@
         ],
         "type": "object"
       },
+      "AntennaClosedLoopInspectionDisplayResource": {
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/AntennaInspectionDisplayCapabilities"
+          },
+          "closed_loop_display": {},
+          "content_digest": {
+            "type": "string"
+          },
+          "normalization": {
+            "type": "string"
+          },
+          "record_content_digest": {
+            "type": "string"
+          },
+          "request_scope_epoch": {
+            "type": "string"
+          },
+          "resource_id": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "runtime_stage_id": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "session_epoch": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "stage_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_version",
+          "resource_id",
+          "session_id",
+          "session_epoch",
+          "request_scope_epoch",
+          "run_id",
+          "runtime_stage_id",
+          "stage_revision",
+          "record_content_digest",
+          "content_digest",
+          "capabilities",
+          "normalization",
+          "closed_loop_display"
+        ],
+        "type": "object"
+      },
+      "AntennaEquilibriumBindingResource": {
+        "additionalProperties": false,
+        "properties": {
+          "acceptance_certificate_sha256": {
+            "type": "string"
+          },
+          "asset_id": {
+            "type": "string"
+          },
+          "authored_stage_id": {
+            "type": "string"
+          },
+          "boundary_signature": {
+            "type": "string"
+          },
+          "certified_fields_sha256": {
+            "type": "string"
+          },
+          "completion_sha256": {
+            "type": "string"
+          },
+          "content_digest": {
+            "type": "string"
+          },
+          "equilibrium_content_sha256": {
+            "type": "string"
+          },
+          "equilibrium_id": {
+            "type": "string"
+          },
+          "indexing_sha256": {
+            "type": "string"
+          },
+          "mapping_digest": {
+            "type": "string"
+          },
+          "material_signature": {
+            "type": "string"
+          },
+          "mesh_generation_id": {
+            "type": "string"
+          },
+          "mesh_topology_sha256": {
+            "type": "string"
+          },
+          "norm_floor": {
+            "format": "double",
+            "type": "number"
+          },
+          "normalization": {
+            "type": "string"
+          },
+          "owning_plan_sha256": {
+            "type": "string"
+          },
+          "part_registry_sha256": {
+            "type": "string"
+          },
+          "producer_contract": {
+            "type": "string"
+          },
+          "projection_version": {
+            "type": "string"
+          },
+          "recomputed_certificate_sha256": {
+            "type": "string"
+          },
+          "resolved_execution_engine": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "source_carrier_sha256": {
+            "type": "string"
+          },
+          "source_run_id": {
+            "type": "string"
+          },
+          "source_solution_ref": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaFieldSolutionRefResource"
+              }
+            ]
+          },
+          "source_stage_id": {
+            "type": "string"
+          },
+          "static_demag_sha256": {
+            "type": "string"
+          },
+          "static_physics_signature": {
+            "type": "string"
+          },
+          "target": {
+            "$ref": "#/components/schemas/FieldTargetResource"
+          }
+        },
+        "required": [
+          "schema_version",
+          "producer_contract",
+          "resolved_execution_engine",
+          "asset_id",
+          "equilibrium_id",
+          "content_digest",
+          "source_run_id",
+          "source_stage_id",
+          "authored_stage_id",
+          "completion_sha256",
+          "acceptance_certificate_sha256",
+          "recomputed_certificate_sha256",
+          "certified_fields_sha256",
+          "equilibrium_content_sha256",
+          "mesh_generation_id",
+          "mesh_topology_sha256",
+          "indexing_sha256",
+          "part_registry_sha256",
+          "owning_plan_sha256",
+          "material_signature",
+          "static_physics_signature",
+          "boundary_signature",
+          "static_demag_sha256",
+          "source_carrier_sha256",
+          "target",
+          "mapping_digest",
+          "normalization",
+          "norm_floor",
+          "projection_version"
+        ],
+        "type": "object"
+      },
       "AntennaExternalLeadInspectionResource": {
         "allOf": [
           {
@@ -2291,6 +2518,7 @@
           },
           {
             "properties": {
+              "closed_loop_manifest": {},
               "manifest": {
                 "oneOf": [
                   {
@@ -2940,6 +3168,16 @@
         ],
         "type": "object"
       },
+      "AntennaInspectionDisplayFamilyResource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AntennaInspectionDisplayResource"
+          },
+          {
+            "$ref": "#/components/schemas/AntennaClosedLoopInspectionDisplayResource"
+          }
+        ]
+      },
       "AntennaInspectionDisplayResource": {
         "properties": {
           "capabilities": {
@@ -3151,6 +3389,12 @@
       "AntennaInspectionOutputResource": {
         "additionalProperties": false,
         "properties": {
+          "content_digest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "inspection_ref": {
             "$ref": "#/components/schemas/AntennaInspectionReferenceResource"
           },
@@ -3171,14 +3415,14 @@
           },
           "reused_existing": {
             "type": "boolean"
-          }
+          },
+          "source": {}
         },
         "required": [
           "kind",
           "inspection_ref",
           "manifest_ref",
-          "payload_units",
-          "reused_existing"
+          "payload_units"
         ],
         "type": "object"
       },
@@ -3302,6 +3546,12 @@
           },
           "schema_version": {
             "type": "string"
+          },
+          "source_object_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "stage_id": {
             "type": "string"
@@ -3536,6 +3786,16 @@
           "content_digest": {
             "type": "string"
           },
+          "equilibrium_binding": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaEquilibriumBindingResource"
+              }
+            ]
+          },
           "equivalent_noise_bandwidth_bins": {
             "format": "double",
             "type": "number"
@@ -3738,9 +3998,13 @@
             "type": "string"
           },
           "equilibrium_ref": {
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EquilibriumRefResource"
+              }
             ]
           },
           "id": {
@@ -3950,6 +4214,12 @@
           },
           "target": {
             "$ref": "#/components/schemas/AntennaFieldTargetResource"
+          },
+          "transform": {
+            "type": "string"
+          },
+          "window": {
+            "type": "string"
           }
         },
         "required": [
@@ -3966,6 +4236,8 @@
           "sample_count_u",
           "sample_count_v",
           "interpolation",
+          "transform",
+          "window",
           "realization",
           "outside_policy",
           "outside_count",
@@ -4241,6 +4513,29 @@
         ],
         "type": "object"
       },
+      "ArtifactCarrierGeometryQuery": {
+        "properties": {
+          "carrier_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_carrier_revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stage_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ArtifactEntry": {
         "properties": {
           "kind": {
@@ -4263,6 +4558,148 @@
         "required": [
           "path",
           "kind"
+        ],
+        "type": "object"
+      },
+      "ArtifactFieldLocatorResource": {
+        "properties": {
+          "carrier_digest": {
+            "type": "string"
+          },
+          "carrier_id": {
+            "type": "string"
+          },
+          "carrier_revision": {
+            "description": "Canonical decimal u64 string; exact across JavaScript JSON readers.",
+            "type": "string"
+          },
+          "carrier_scope_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "carrier_scope_kind": {
+            "type": "string"
+          },
+          "coordinate_frame": {
+            "type": "string"
+          },
+          "coordinate_unit": {
+            "type": "string"
+          },
+          "indexing": {
+            "$ref": "#/components/schemas/ArtifactSampleIndexing"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/ArtifactFieldOwnerBinding"
+          },
+          "sample_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "topology_binary_schema": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner",
+          "carrier_scope_kind",
+          "carrier_id",
+          "carrier_digest",
+          "carrier_revision",
+          "indexing",
+          "sample_count",
+          "coordinate_frame",
+          "coordinate_unit",
+          "topology_binary_schema"
+        ],
+        "type": "object"
+      },
+      "ArtifactFieldOwnerBinding": {
+        "description": "Provider-owned immutable source identity. Stable native mesh IDs are binary-only.",
+        "properties": {
+          "accepted_artifact": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AcceptedInspectionArtifactOwner"
+              }
+            ]
+          },
+          "authored_stage_id": {
+            "type": "string"
+          },
+          "content_digest": {
+            "type": "string"
+          },
+          "historical_inspection": {
+            "type": "boolean"
+          },
+          "module_id": {
+            "type": "string"
+          },
+          "native_mesh_identity": {
+            "type": "string"
+          },
+          "native_topology_identity": {
+            "type": "string"
+          },
+          "object_id": {
+            "type": "string"
+          },
+          "observation_mesh_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "observation_topology_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_id": {
+            "type": "string"
+          },
+          "request_scope_epoch": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "runtime_stage_id": {
+            "type": "string"
+          },
+          "session_epoch": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "source_digest": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "session_epoch",
+          "request_scope_epoch",
+          "run_id",
+          "runtime_stage_id",
+          "authored_stage_id",
+          "module_id",
+          "object_id",
+          "output_id",
+          "source_digest",
+          "content_digest",
+          "observation_mesh_revision",
+          "observation_topology_revision",
+          "historical_inspection",
+          "native_mesh_identity",
+          "native_topology_identity"
         ],
         "type": "object"
       },
@@ -4300,6 +4737,16 @@
           "kind"
         ],
         "type": "object"
+      },
+      "ArtifactSampleIndexing": {
+        "enum": [
+          "source_nodes",
+          "sample_nodes",
+          "point_samples",
+          "tet4_cell_local_nodes",
+          "cell_centers"
+        ],
+        "type": "string"
       },
       "Author": {
         "properties": {
@@ -8730,6 +9177,68 @@
         ],
         "type": "object"
       },
+      "EquilibriumRefResource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/EquilibriumReferenceResource"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "EquilibriumReferenceResource": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "stage_output"
+                ],
+                "type": "string"
+              },
+              "output_id": {
+                "type": "string"
+              },
+              "stage_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "stage_id",
+              "output_id",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "asset_id": {
+                "type": "string"
+              },
+              "content_digest": {
+                "type": "string"
+              },
+              "equilibrium_id": {
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "artifact"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "asset_id",
+              "equilibrium_id",
+              "content_digest",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ExecutionBackendSchema": {
         "enum": [
           "auto",
@@ -10341,6 +10850,16 @@
       },
       "FieldDescriptor": {
         "properties": {
+          "artifact_field_locator": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArtifactFieldLocatorResource"
+              }
+            ]
+          },
           "available": {
             "type": "boolean"
           },
@@ -10824,6 +11343,16 @@
       },
       "FieldMeta": {
         "properties": {
+          "artifact_field_locator": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArtifactFieldLocatorResource"
+              }
+            ]
+          },
           "components": {
             "format": "int32",
             "minimum": 0,
@@ -10957,6 +11486,7 @@
       "FieldPayloadState": {
         "enum": [
           "current",
+          "historical",
           "legacy_unverified",
           "unmaterialized"
         ],
@@ -11240,6 +11770,16 @@
       },
       "FieldPublicationBinding": {
         "properties": {
+          "artifact_field_locator": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArtifactFieldLocatorResource"
+              }
+            ]
+          },
           "carrier_fingerprint": {
             "type": "string"
           },
@@ -12031,6 +12571,13 @@
       "FieldVectorQuery": {
         "description": "Query parameters for the `/fields/{quantity_id}/vector` endpoint.",
         "properties": {
+          "carrier_id": {
+            "description": "Exact immutable artifact carrier selector.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "component": {
             "description": "Component to return.\n\nAccepted values: `full` (default), `magnitude`, `x`, `y`, `z`, `c0`, `c1`, …, `cN-1`.\n\n- `full` → full interleaved vector (nComp unchanged)\n- `magnitude` → per-point L2 norm (nComp=1)\n- `x`/`y`/`z`/`cN` → single component by index (nComp=1)",
             "type": [
@@ -25060,30 +25607,49 @@
         "type": "object"
       },
       "ObjectEnergySummary": {
+        "description": "Per-energy availability is explicit: null is missing, while Some(0.0) is an observed zero.",
         "properties": {
           "anisotropy": {
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "demag": {
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "dmi": {
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "exchange": {
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "total": {
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "zeeman": {
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
@@ -26418,6 +26984,19 @@
       },
       "PlanarFieldComponent": {
         "enum": [
+          "c0",
+          "c1",
+          "c2",
+          "c3",
+          "c4",
+          "c5",
+          "c6",
+          "c7",
+          "c8",
+          "frobenius",
+          "spin_flow_x",
+          "spin_flow_y",
+          "spin_flow_z",
           "x",
           "y",
           "z",
@@ -29709,7 +30288,7 @@
           },
           "study_plan": {
             "additionalProperties": {},
-            "description": "Versioned `study_plan.v2` object with typed steps, references and runner controls.",
+            "description": "Versioned `study_plan.v1/v2/v3/v4`; v4 adds typed inspection operations and captured source.",
             "propertyNames": {
               "type": "string"
             },
@@ -30287,6 +30866,16 @@
           "supports_preview_3d": {
             "type": "boolean"
           },
+          "tensor": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/QuantityTensorDescriptor"
+              }
+            ]
+          },
           "unit": {
             "type": "string"
           }
@@ -30376,6 +30965,46 @@
           "unavailable"
         ],
         "type": "string"
+      },
+      "QuantityTensorDescriptor": {
+        "properties": {
+          "axes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "component_labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "layout": {
+            "type": "string"
+          },
+          "rank": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shape": {
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "rank",
+          "shape",
+          "layout",
+          "axes",
+          "component_labels"
+        ],
+        "type": "object"
       },
       "QuantityVisualizationPatch": {
         "properties": {
@@ -35258,6 +35887,13 @@
         ],
         "type": "string"
       },
+      "SceneStructuredCutCoordinateFrame": {
+        "enum": [
+          "world",
+          "object"
+        ],
+        "type": "string"
+      },
       "SceneStructuredCutNormal": {
         "enum": [
           "positive_axis",
@@ -35266,9 +35902,21 @@
         "type": "string"
       },
       "SceneStructuredCutPlane": {
+        "additionalProperties": false,
         "properties": {
           "axis": {
             "$ref": "#/components/schemas/SceneStructuredCutAxis"
+          },
+          "coordinate_frame": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SceneStructuredCutCoordinateFrame",
+                "description": "An omitted frame retains the legacy world-frame contract."
+              }
+            ]
           },
           "normal": {
             "$ref": "#/components/schemas/SceneStructuredCutNormal"
@@ -44132,6 +44780,13 @@
           "surface_visible": {
             "type": "boolean"
           },
+          "tensor_projection": {
+            "description": "Explicit flow-major tensor projection; absent for scalar/vector fields.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "vector_alpha": {
             "format": "double",
             "type": "number"
@@ -44851,6 +45506,12 @@
               {
                 "$ref": "#/components/schemas/SurfaceFieldProjectionMode"
               }
+            ]
+          },
+          "tensor_projection": {
+            "type": [
+              "string",
+              "null"
             ]
           },
           "vector_alpha": {
@@ -51960,10 +52621,10 @@
                 }
               }
             },
-            "description": "Inspection record and manifest-only metadata; never a drive basis"
+            "description": "Inspection record; external-lead manifest metadata or fully verified closed-loop thin metadata; never a drive basis"
           },
           "304": {
-            "description": "Unchanged manifest-only resource"
+            "description": "Unchanged inspection resource after family validation"
           },
           "404": {
             "content": {
@@ -52066,7 +52727,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AntennaInspectionDisplayResource"
+                  "$ref": "#/components/schemas/AntennaInspectionDisplayFamilyResource"
                 }
               }
             },
@@ -52759,6 +53420,39 @@
         "operationId": "data_get_sessions_current_data_domain_topology",
         "parameters": [
           {
+            "in": "query",
+            "name": "carrier_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "stage_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_carrier_revision",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "Strong ETag from a previous domain topology response",
             "in": "header",
             "name": "If-None-Match",
@@ -53083,6 +53777,17 @@
         "operationId": "data_get_sessions_current_data_fields",
         "parameters": [
           {
+            "in": "query",
+            "name": "stage_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "$ref": "#/components/parameters/FullmagSessionScope"
           }
         ],
@@ -53117,6 +53822,54 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Exact runtime stage that owns the immutable inspection.",
+            "in": "query",
+            "name": "stage_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Exact immutable carrier selected from field metadata.",
+            "in": "query",
+            "name": "carrier_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional inspection view: full or explicit J_charge cell_centers.",
+            "in": "query",
+            "name": "view",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Canonical nonzero decimal u64 precondition for the immutable carrier.",
+            "in": "query",
+            "name": "expected_carrier_revision",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -53187,6 +53940,9 @@
           },
           "404": {
             "description": "No active workspace or unknown quantity"
+          },
+          "409": {
+            "description": "Ambiguous owner, immutable carrier mismatch, or changed observation"
           }
         },
         "tags": [
@@ -53205,6 +53961,39 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "carrier_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "view",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_carrier_revision",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -58291,6 +59080,18 @@
             }
           },
           {
+            "description": "Exact immutable artifact carrier selector.",
+            "in": "query",
+            "name": "carrier_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "Component to return.\n\nAccepted values: `full` (default), `magnitude`, `x`, `y`, `z`, `c0`, `c1`, …, `cN-1`.\n\n- `full` → full interleaved vector (nComp unchanged)\n- `magnitude` → per-point L2 norm (nComp=1)\n- `x`/`y`/`z`/`cN` → single component by index (nComp=1)",
             "in": "query",
             "name": "component",
@@ -58458,10 +59259,28 @@
             "content": {
               "application/octet-stream": {}
             },
-            "description": "Binary FMVP field vector. Analysis response and eigen-mode vectors use FMVP v5 metadata with the full quantity ID and domain generation identity; when a mesh carrier is available they also include topology, scope, and indexing metadata. Analysis vectors without a mesh use the explicit legacy_count_only absent-topology sentinel and cannot establish topology-bound overlay compatibility. Other scoped FEM and FDM payloads use FMVP v3 metadata with domain_generation_id, carrier topology revision/hash, scope kind/id, indexing, and optional node_indices. Multilayer FDM layer/object scopes identify their native grid carrier. Full-domain regular-grid FDM uses FMVP v3 sampled indices when max_samples is supplied and may use FMVP v2 for an uncapped complete payload.",
+            "description": "Binary FMVP field vector. Immutable artifact inspections use separate FMVP v6 metadata with lossless u64 sample identities, source ownership and carrier revision/digest; this does not change the generic v5 full-quantity-ID layout. Analysis response and eigen-mode vectors use FMVP v5 metadata with the full quantity ID and domain generation identity; when a mesh carrier is available they also include topology, scope, and indexing metadata. Analysis vectors without a mesh use the explicit legacy_count_only absent-topology sentinel and cannot establish topology-bound overlay compatibility. Other scoped FEM and FDM payloads use FMVP v3 metadata with domain_generation_id, carrier topology revision/hash, scope kind/id, indexing, and optional node_indices. Multilayer FDM layer/object scopes identify their native grid carrier. Full-domain regular-grid FDM uses FMVP v3 sampled indices when max_samples is supplied and may use FMVP v2 for an uncapped complete payload.",
             "headers": {
               "x-fullmag-artifact-generation-id": {
                 "description": "Committed analysis artifact generation identity; present only when the served field member is verified",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-fullmag-carrier-digest": {
+                "description": "Bare lowercase SHA256 artifact carrier digest; present for FMVP v6",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-fullmag-carrier-id": {
+                "description": "Immutable artifact carrier ID; present for FMVP v6",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-fullmag-carrier-revision": {
+                "description": "Lossless decimal u64 artifact carrier revision; present for FMVP v6",
                 "schema": {
                   "type": "string"
                 }
@@ -58479,7 +59298,7 @@
                 }
               },
               "x-fullmag-encoding": {
-                "description": "FMVP encoding and version",
+                "description": "FMVP encoding and version, including FMVP;version=6 for immutable artifact inspections",
                 "schema": {
                   "type": "string"
                 }
@@ -59119,6 +59938,17 @@
       "get": {
         "operationId": "data_get_sessions_current_data_quantities",
         "parameters": [
+          {
+            "in": "query",
+            "name": "stage_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
           {
             "$ref": "#/components/parameters/FullmagSessionScope"
           }

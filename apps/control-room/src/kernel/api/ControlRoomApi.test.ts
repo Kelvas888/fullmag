@@ -3541,12 +3541,12 @@ describe("ControlRoomApi", () => {
         observedUrl = String(url);
         return jsonResponse({
           energies: {
-            anisotropy: 0,
-            demag: 0,
-            dmi: 0,
-            exchange: 0,
-            total: 0,
-            zeeman: 0,
+            anisotropy: null,
+            demag: null,
+            dmi: null,
+            exchange: null,
+            total: null,
+            zeeman: null,
           },
           has_solver_sample: false,
           magnetization_average: { mx: 1, my: 0, mz: 0 },
@@ -3567,6 +3567,7 @@ describe("ControlRoomApi", () => {
     expect(result).toMatchObject({
       has_solver_sample: false,
       object_id: "arch_Waveguide",
+      energies: { anisotropy: null, demag: null, dmi: null, exchange: null, total: null, zeeman: null },
     });
   });
 
@@ -6347,7 +6348,7 @@ describe("ControlRoomApi", () => {
         url: "http://127.0.0.1:8765/v2/sessions/current/meshing/policies/objects/free%20layer",
       },
       {
-        body: { config: { maximum_element_size: 5e-9 } },
+        body: { config: { maximum_element_size: "5e-9" } },
         method: "PUT",
         url: "http://127.0.0.1:8765/v2/sessions/current/meshing/policies/objects/free%20layer",
       },

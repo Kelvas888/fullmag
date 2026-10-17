@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   AntennaSourceSpectrumResource,
   BinaryResourceResult,
+  AntennaSpectrumPayloadKind,
 } from "@/kernel/api/apiTypes";
 import { ControlRoomApiError } from "@/kernel/api/ControlRoomApi";
 import type { ResourceResult } from "@/kernel/resources/resourceTypes";
@@ -18,6 +19,7 @@ type PayloadResource = ResourceResult<BinaryResourceResult<ArrayBuffer> | null>;
 
 const mocks = vi.hoisted(() => ({
   payloads: {} as Record<string, PayloadResource>,
+  calls: [] as { kind: string; options: { enabled?: boolean; expectedEtag?: string; maxResponseBytes?: number } }[],
 }));
 
 vi.mock("@/kernel/resources/antennaResources", async (importOriginal) => ({
@@ -25,16 +27,83 @@ vi.mock("@/kernel/resources/antennaResources", async (importOriginal) => ({
   useAntennaSourceSpectrumPayloadResource: (
     _outputId: string,
     payloadKind: string,
-  ) => mocks.payloads[payloadKind] ?? loadingPayload(),
+    options: { enabled?: boolean; expectedEtag?: string; maxResponseBytes?: number },
+  ) => {
+    mocks.calls.push({ kind: payloadKind, options });
+    return mocks.payloads[payloadKind] ?? loadingPayload();
+  },
 }));
 
 import { AntennaSourceSpectrumPayloadView } from "./AntennaSourceSpectrumPayloadView";
 
 afterEach(() => {
   mocks.payloads = {};
+  mocks.calls = [];
 });
 
 describe("AntennaSourceSpectrumPayloadView", () => {
+  it.each([
+    ["missing descriptor", () => spectrumFixture({ payloads: null })],
+    ["inconsistent counts", () => spectrumFixture({ amplitude_count: 2 })],
+    ["unsafe k-grid", () => spectrumFixture({ k_u_count: Number.MAX_SAFE_INTEGER })],
+    ["interactive memory budget", () => spectrumFixture({ k_u_count: 4096, k_v_count: 4096, power_count: 4096 ** 2, amplitude_count: 4096 ** 2 })],
+    ["wrong layout", () => {
+      const spectrum = spectrumFixture();
+      spectrum.payloads!.power.layout = "scalar";
+      return spectrum;
+    }],
+  ] as const)("disables all four hooks for %s without throwing in render", async (_label, fixture) => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <AntennaSourceSpectrumPayloadView outputId="spectrum-1" spectrum={fixture()} />,
+      ));
+      expect(mocks.calls).toHaveLength(4);
+      expect(mocks.calls.map(({ kind }) => kind)).toEqual([
+        "k_u_rad_per_m", "k_v_rad_per_m", "amplitudes_re_im", "power",
+      ]);
+      for (const { options } of mocks.calls) {
+        expect(options.enabled).toBe(false);
+        expect(options.expectedEtag).toBeUndefined();
+        expect(options.maxResponseBytes).toBeUndefined();
+      }
+      expect(container.textContent).toContain("FFT manifest unavailable:");
+      expect(countByRole(container as unknown as TestNode, "gridcell")).toBe(0);
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it.each([
+    [spectrumFixture(), { k_u_rad_per_m: 16, k_v_rad_per_m: 16, amplitudes_re_im: 64, power: 32 }],
+    [spectrumFixture({ component: "vector_power", component_labels: ["x", "y", "z"], amplitude_count: 12 }),
+      { k_u_rad_per_m: 16, k_v_rad_per_m: 16, amplitudes_re_im: 192, power: 32 }],
+    [spectrumFixture({ k_u_count: 129, power_count: 258, amplitude_count: 258 }),
+      { k_u_rad_per_m: 1032, k_v_rad_per_m: 16, amplitudes_re_im: 4128, power: 2064 }],
+  ])("pins the exact manifest byte limit for every enabled payload", async (spectrum, limits) => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <AntennaSourceSpectrumPayloadView outputId="spectrum-1" spectrum={spectrum} />,
+      ));
+      expect(mocks.calls).toHaveLength(4);
+      for (const { kind, options } of mocks.calls) {
+        expect(options.enabled).toBe(true);
+        expect(options.maxResponseBytes).toBe(limits[kind as AntennaSpectrumPayloadKind]);
+        expect(options.expectedEtag).toContain(`:${kind}:`);
+        expect(options.expectedEtag).toContain(spectrum.payloads![kind as AntennaSpectrumPayloadKind].sha256);
+      }
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
   it("decodes little-endian payloads and renders a bounded heatmap", async () => {
     mocks.payloads = {
       k_u_rad_per_m: readyPayload([0, 1], "etag-ku"),
@@ -89,7 +158,7 @@ describe("AntennaSourceSpectrumPayloadView", () => {
       await act(async () => root.render(
         <AntennaSourceSpectrumPayloadView
           outputId="spectrum-1"
-          spectrum={{ ...spectrumFixture(), k_u_count: 129, power_count: 258, amplitude_count: 258 }}
+          spectrum={spectrumFixture({ k_u_count: 129, power_count: 258, amplitude_count: 258 })}
         />,
       ));
       expect(countByRole(container as unknown as TestNode, "gridcell")).toBe(128);
@@ -218,11 +287,11 @@ describe("AntennaSourceSpectrumPayloadView", () => {
       await act(async () => root.render(
         <AntennaSourceSpectrumPayloadView
           outputId="spectrum-1"
-          spectrum={{ ...spectrumFixture(), amplitude_count: 2 }}
+          spectrum={spectrumFixture()}
         />,
       ));
       expect(container.textContent).toContain(
-        "complex amplitudes do not match the component and k-grid counts",
+        "amplitude scalar count 4 ≠ manifest 8",
       );
       expect(countByRole(container as unknown as TestNode, "gridcell")).toBe(0);
     } finally {
@@ -273,7 +342,7 @@ describe("AntennaSourceSpectrumPayloadView", () => {
       await act(async () => root.render(
         <AntennaSourceSpectrumPayloadView
           outputId="spectrum-1"
-          spectrum={{ ...spectrumFixture(), component: "vector_power", component_labels: ["x", "y", "z"], amplitude_count: 12 }}
+          spectrum={spectrumFixture({ component: "vector_power", component_labels: ["x", "y", "z"], amplitude_count: 12 })}
         />,
       ));
       expect(container.textContent).toContain("Peak 5.000e+0");
@@ -359,7 +428,10 @@ function errorPayload(error: Error | string): PayloadResource {
   };
 }
 
-function spectrumFixture(): AntennaSourceSpectrumResource {
+function spectrumFixture(overrides: Partial<AntennaSourceSpectrumResource> = {}): AntennaSourceSpectrumResource {
+  const u = overrides.k_u_count ?? 2;
+  const v = overrides.k_v_count ?? 2;
+  const amplitudes = overrides.amplitude_count ?? 4;
   return {
     amplitude_count: 4,
     amplitude_unit: "A/m/A",
@@ -379,10 +451,10 @@ function spectrumFixture(): AntennaSourceSpectrumResource {
       path: "antenna/source_spectra/spectrum-1/spectrum.v1.json",
     },
     payloads: {
-      amplitudes_re_im: binaryRef("A/m/A"),
-      k_u_rad_per_m: binaryRef("rad/m"),
-      k_v_rad_per_m: binaryRef("rad/m"),
-      power: binaryRef("(A/m/A)^2"),
+      amplitudes_re_im: binaryRef("A/m/A", "component_kv_ku_complex_re_im", 2 * amplitudes),
+      k_u_rad_per_m: binaryRef("rad/m", "axis_u_1d", u),
+      k_v_rad_per_m: binaryRef("rad/m", "axis_v_1d", v),
+      power: binaryRef("(A/m/A)^2", "kv_ku_power", overrides.power_count ?? 4),
     },
     port_mode_id: "mode-1",
     power_count: 4,
@@ -398,17 +470,18 @@ function spectrumFixture(): AntennaSourceSpectrumResource {
     solution_id: "solution-1",
     source_object_id: "antenna-1",
     wave_vector_unit: "rad/m",
+    ...overrides,
   };
 }
 
-function binaryRef(unit: string) {
+function binaryRef(unit: string, layout: string, count: number) {
   return {
-    layout: "scalar",
+    layout,
     path: "payload.f64le",
     scalar_type: "float64_le",
-    sha256: "sha256:payload",
+    sha256: `sha256:${"a".repeat(64)}`,
     unit,
-    value_count: 1,
+    value_count: count,
   };
 }
 

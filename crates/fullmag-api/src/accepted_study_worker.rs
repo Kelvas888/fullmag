@@ -516,6 +516,10 @@ fn expected_output_binding(
     port: &StudyOutputPort,
 ) -> Result<(&'static str, &'static str, &'static str)> {
     match port.data_kind {
+        StudyPortDataKind::Artifact if port.port_id == "inspection" => Ok((
+            "artifact", fullmag_application::ANTENNA_INSPECTION_BUNDLE_CODEC_ID,
+            fullmag_application::ANTENNA_INSPECTION_BUNDLE_CODEC_VERSION,
+        )),
         StudyPortDataKind::InitialState => Ok((
             "initial_state",
             fullmag_application::STUDY_MAGNETIZATION_CODEC_ID,
@@ -765,6 +769,17 @@ fn recover_completed_worker_execution(
     }
     let mut seen = BTreeSet::new();
     let mut unique_object_sizes = BTreeMap::new();
+    let mut planned_bytes=0u64;
+    let mut planned_objects=BTreeSet::new();
+    for output in &completed.outputs {
+        if planned_objects.insert(&output.object_ref) { planned_bytes=planned_bytes.checked_add(output.byte_count).context("receipt bytes overflow")?; }
+    }
+    if let Some(source)=&completed.observation_source {
+        for (hash,size) in [(&source.snapshot_object_ref,source.snapshot_byte_count),(&source.state_object_ref,source.state_byte_count)] {
+            if planned_objects.insert(hash) { planned_bytes=planned_bytes.checked_add(size).context("receipt observation bytes overflow")?; }
+        }
+    }
+    if planned_bytes>max_output_bytes { bail!("completed receipt exceeds caller artifact byte budget"); }
     let mut outputs = Vec::with_capacity(completed.outputs.len());
     for output in &completed.outputs {
         if !seen.insert(output.port_id.as_str()) {
@@ -1098,6 +1113,9 @@ pub(crate) fn execute_accepted_worker_start(
         .validate_execution_for_problem(specification, immutable_problem)
         .context("validate accepted task execution before dispatch")?;
     let request = &accepted_step.resolved_input.requested_execution;
+    if matches!(study_step.kind, fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. }) {
+        return execute_accepted_closed_loop_worker_start(store, &accepted, start, accepted_step, study_step, case_id, interrupt_requested);
+    }
     if matches!(
         &accepted_step.execution_plan.backend_plan,
         fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(_)
@@ -1112,6 +1130,9 @@ pub(crate) fn execute_accepted_worker_start(
             case_id,
             interrupt_requested,
         );
+    }
+    if study_step.outputs.iter().any(|port| port.data_kind == StudyPortDataKind::Artifact) {
+        bail!("legacy solver steps cannot publish an inspection artifact");
     }
     if request.backend == "fem" {
         crate::accepted_fem_study_worker::validate_declared_outputs(&study_step.outputs)
@@ -1361,6 +1382,92 @@ pub(crate) fn execute_accepted_worker_start(
             _ => {}
         }
         storage.finish(success, &storage_attempt_dir)?;
+    }
+    execution
+}
+
+/// Same supervised Start/Stop/receipt owner as solver tasks; the physical effect remains in the canonical runner.
+fn execute_accepted_closed_loop_worker_start(
+    store:&SessionStore, accepted:&fullmag_runtime_control::AcceptedStudySnapshot,
+    start:&fullmag_application::WorkerCommandEnvelope, accepted_step:&AcceptedWorkerStep,
+    study_step:&fullmag_authoring::StudyStep, case_id:&str, interrupt_requested:Option<&AtomicBool>,
+) -> Result<AcceptedRunnerExecution> {
+    let request=&accepted_step.resolved_input.requested_execution;
+    if start.schema_version!=fullmag_application::CLOSED_LOOP_WORKER_PROTOCOL_SCHEMA
+        || accepted_step.resolved_input.schema_version!=fullmag_application::CLOSED_LOOP_RESOLVED_TASK_INPUT_SCHEMA
+        || request.backend!="fem" || !matches!(request.device.as_str(),"cpu"|"auto") || request.precision!="double" || request.mode!="strict"
+        || accepted_step.until_seconds.is_some() || !accepted_step.resolved_input.inputs.is_empty()
+        || study_step.outputs.len()!=1 || study_step.outputs[0].port_id!="inspection" || study_step.outputs[0].data_kind!=StudyPortDataKind::Artifact
+        || !accepted.run.specification.parameters.as_object().is_some_and(|values|values.is_empty())
+        || !accepted.run.specification.seeds.is_empty() || !accepted_step.problem.problem_meta.seeds.is_empty() {
+        bail!("accepted inspection requires v4 FEM CPU/auto strict double, one artifact, no horizon/state/parameters/seeds");
+    }
+    let maximum=fullmag_runtime_control::study_inspection::inspection_bundle_budget(&accepted_step.claim)?;
+    let receipt=accepted.read_task_preparation(store, accepted_step.claim.task_id.as_str())?;
+    if !matches!(&receipt, fullmag_application::AcceptedPreparationReceipt::ClosedLoop(_)) || receipt.binding()?!=accepted_step.resolved_input.preparation {
+        bail!("accepted inspection lacks exact source-mesh native readiness");
+    }
+    let fullmag_authoring::StudyStepKind::ClosedLoopInspection {stage_id,port_mode_id,output_id}=&study_step.kind else { bail!("inspection kind missing"); };
+    let operation=fullmag_plan::validate_closed_loop_operation(&accepted_step.problem,stage_id,port_mode_id,output_id)?;
+    let fullmag_plan::AntennaFieldSolveExecutionPlan::ClosedLoopInspection {input,requested_execution,output_id}=operation else { bail!("inspection operation mismatch"); };
+    let identity=worker_execution_receipt_identity(start,accepted_step,case_id)?;
+    let recover=|path:&Path| -> Result<AcceptedRunnerExecution> {
+        let result=recover_completed_worker_execution(store,path,&identity,&study_step.outputs,maximum as u64,None,None)?;
+        if result.completed_step_count!=1 || result.outputs.len()!=1 { bail!("inspection receipt has another execution shape"); }
+        fullmag_runtime_control::study_inspection::validate_accepted_inspection_bytes(&accepted_step.problem,study_step,&result.outputs[0].bytes,maximum)?;
+        Ok(result)
+    };
+    match existing_private_attempt_output_dir(store,&accepted_step.claim) {
+        Ok(path)=>return recover(&path).context("recover inspection without repeating native side effect"),
+        Err(error) if is_not_found_error(&error)=>{},
+        Err(error)=>return Err(error).context("inspect owned inspection attempt"),
+    }
+    crate::accepted_project_storage::AcceptedProjectStorage::preflight(&accepted_step.problem,store,&accepted_step.claim,&accepted_step.step_id)?;
+    let attempt=match retry_store_writer_busy(||create_private_attempt_output_dir(store,&accepted_step.claim)) {
+        Ok(path)=>path,
+        Err(error)=>match existing_private_attempt_output_dir(store,&accepted_step.claim) {
+            Ok(path)=>return recover(&path),
+            Err(_)=>return Err(error).context("reserve inspection attempt before native side effect"),
+        },
+    };
+    write_immutable_attempt_receipt(&attempt,WORKER_EXECUTION_STARTED_RECEIPT,&WorkerExecutionStartedReceipt {identity:identity.clone()})?;
+    let mut storage=prepare_accepted_project_storage(&accepted_step.problem,store,accepted,accepted_step,&identity,&attempt)?;
+    let execution:Result<AcceptedRunnerExecution>=(|| {
+        let artifacts=match fullmag_runner::execute_antenna_closed_loop_inspection(&input,&requested_execution,&output_id,interrupt_requested) {
+            Ok(artifacts)=>artifacts,
+            Err(_error) if interrupt_requested.is_some_and(|flag|flag.load(Ordering::Acquire))=>return Ok(AcceptedRunnerExecution {status:RunStatus::Cancelled,completed_step_count:0,outputs:vec![],attempt_output_dir:attempt.clone(),recovered_from_receipt:false,accepted_state_ref:None,observation_source:None}),
+            Err(error)=>return Err(anyhow::anyhow!(error.to_string())).context("execute canonical full-volume inspection"),
+        };
+        let manifest_path=format!("antenna/field_solutions/{output_id}/manifest.v2.json");
+        let mut manifest=None;let mut payloads=BTreeMap::new();let mut total=0usize;
+        for artifact in artifacts {
+            total=total.checked_add(artifact.bytes.len()).context("inspection output byte overflow")?;
+            if total>maximum { bail!("inspection output exceeds admitted byte reserve"); }
+            if artifact.relative_path==manifest_path {
+                if manifest.replace(artifact.bytes).is_some() { bail!("inspection manifest duplicated"); }
+            } else if payloads.insert(artifact.relative_path,artifact.bytes).is_some() { bail!("inspection payload duplicated"); }
+        }
+        let manifest=manifest.context("canonical inspection manifest absent")?;
+        let bytes=fullmag_application::encode_antenna_inspection_bundle(&manifest,&payloads,maximum)?;
+        drop(payloads);drop(manifest);
+        fullmag_runtime_control::study_inspection::validate_accepted_inspection_bytes(&accepted_step.problem,study_step,&bytes,maximum)?;
+        if interrupt_requested.is_some_and(|flag|flag.load(Ordering::Acquire)) {
+            return Ok(AcceptedRunnerExecution {status:RunStatus::Cancelled,completed_step_count:0,outputs:vec![],attempt_output_dir:attempt.clone(),recovered_from_receipt:false,accepted_state_ref:None,observation_source:None});
+        }
+        let output=StudyOutputPayload {port_id:"inspection".into(),case_id:case_id.into(),codec_id:fullmag_application::ANTENNA_INSPECTION_BUNDLE_CODEC_ID.into(),codec_version:fullmag_application::ANTENNA_INSPECTION_BUNDLE_CODEC_VERSION.into(),bytes};
+        let root=storage.as_ref().map(|value|value.data_root()).unwrap_or(&attempt);
+        // One owned framing file; no untrusted payload path is extracted to the filesystem.
+        let mut file=OpenOptions::new().write(true).create_new(true).open(root.join("antenna-inspection.bundle"))?;
+        file.write_all(&output.bytes)?;file.sync_all()?;drop(file);
+        #[cfg(unix)]
+        std::fs::File::open(root)?.sync_all()?;
+        if let Some(storage)=&mut storage { storage.finish(true,&attempt)?; }
+        persist_completed_worker_execution(store,&attempt,&identity,&study_step.outputs,RunStatus::Completed,1,std::slice::from_ref(&output),None,None)?;
+        Ok(AcceptedRunnerExecution {status:RunStatus::Completed,completed_step_count:1,outputs:vec![output],attempt_output_dir:attempt.clone(),recovered_from_receipt:false,accepted_state_ref:None,observation_source:None})
+    })();
+    if let Some(storage)=&mut storage {
+        match &execution { Ok(result) if result.status==RunStatus::Cancelled=>storage.note_outcome("cancelled",None),Err(error)=>storage.note_outcome("failed",Some(format!("{error:#}"))),_=>{} }
+        storage.finish(execution.as_ref().is_ok_and(|result|result.status==RunStatus::Completed),&attempt)?;
     }
     execution
 }

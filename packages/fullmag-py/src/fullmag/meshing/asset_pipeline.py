@@ -1298,6 +1298,7 @@ def realize_fem_mesh_asset(
     per_object_recipes: dict[str, PerObjectMeshRecipe] | None = None,
     _owner_geometry_names: Sequence[str] | None = None,
     object_id: str | None = None,
+    _coincident_closure: object | None = None,
 ) -> MeshData:
     """Resolve a FEM mesh asset from either a prebuilt mesh or geometry source.
 
@@ -1330,6 +1331,15 @@ def realize_fem_mesh_asset(
         owner_geometry_names=_owner_geometry_names,
         per_object_recipes=per_object_recipes,
     )
+
+    if _coincident_closure is not None:
+        if hints.mesh is not None or target.order != 1 or mesh_options.periodic_pair_ids:
+            raise ValueError("coincident source requires generated nonperiodic P1 geometry mesh")
+        from ._antenna_coincident_cut import realize_antenna_coincident_loop_mesh
+        return realize_antenna_coincident_loop_mesh(
+            _coincident_closure, geometry=geometry, object_id=object_id,
+            hmax_m=target.hmax, mesh_options=mesh_options,
+        )
 
     preview = build_surface_preview_payload(geometry)
     if preview is not None:

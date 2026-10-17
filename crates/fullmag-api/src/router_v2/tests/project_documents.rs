@@ -707,7 +707,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         PrimitiveStageNode, StudyDiscretizationReference, StudyExecutionProfileReference,
         StudyModelReference, StudyOutputPort, StudyPipelineDocument, StudyPipelineNode,
         StudyPipelineNodeSource, StudyPlan, StudyPlanMigrationDefaults, StudyPortDataKind,
-        StudyPrimitiveStageKind, StudySolverConfigReference, STUDY_PLAN_SCHEMA_VERSION,
+        StudyPrimitiveStageKind, StudySolverConfigReference, STUDY_PLAN_SCHEMA_VERSION_V2,
     };
     use fullmag_ir::ProblemIR;
     use fullmag_plan::{
@@ -814,7 +814,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         ProjectSnapshot::from_envelope(&definition).unwrap(),
         StudyReference {
             study_id: StudyId::parse("study-submit").unwrap(),
-            plan_version: STUDY_PLAN_SCHEMA_VERSION.into(),
+            plan_version: STUDY_PLAN_SCHEMA_VERSION_V2.into(),
             plan_sha256: study.canonical_sha256().unwrap(),
         },
         fullmag_session::canonical_json_sha256(&catalog_value),
@@ -3779,7 +3779,6 @@ async fn project_batch_submit_replays_and_lists_durable_parent() {
         PrimitiveStageNode, StudyDiscretizationReference, StudyExecutionProfileReference,
         StudyModelReference, StudyPipelineDocument, StudyPipelineNode, StudyPipelineNodeSource,
         StudyPlan, StudyPlanMigrationDefaults, StudyPrimitiveStageKind, StudySolverConfigReference,
-        STUDY_PLAN_SCHEMA_VERSION,
     };
     use fullmag_ir::ProblemIR;
     use fullmag_plan::{StudyProblemCatalog, StudyProblemCatalogEntry};
@@ -3863,7 +3862,7 @@ async fn project_batch_submit_replays_and_lists_durable_parent() {
         ProjectSnapshot::from_envelope(&definition).unwrap(),
         StudyReference {
             study_id: StudyId::parse(study.study_id.clone()).unwrap(),
-            plan_version: STUDY_PLAN_SCHEMA_VERSION.into(),
+            plan_version: study.schema_version.clone(),
             plan_sha256: study.canonical_sha256().unwrap(),
         },
         fullmag_session::canonical_json_sha256(&catalog_value),
@@ -3928,8 +3927,9 @@ async fn project_batch_submit_replays_and_lists_durable_parent() {
         .oneshot(submit(body.to_string()))
         .await
         .unwrap();
-    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_status = first.status();
     let accepted = body_json(first).await;
+    assert_eq!(first_status, StatusCode::CREATED, "batch submit: {accepted}");
     assert_eq!(accepted["disposition"], "accepted");
     assert_eq!(accepted["batch_id"], "batch-http");
     assert_eq!(accepted["case_count"], 2);
