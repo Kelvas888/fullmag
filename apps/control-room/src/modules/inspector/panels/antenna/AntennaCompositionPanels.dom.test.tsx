@@ -104,6 +104,12 @@ vi.mock("@/kernel/resources/antennaResources", () => ({
   useAntennaSourceSpectrumResource: () => mocks.sourceSpectrum,
 }));
 
+// Related-resource navigation has its own real-browser ownership proof.
+// Keep these composition fixtures independent of the complete Explorer graph.
+vi.mock("./AntennaRelatedResources", () => ({
+  AntennaRelatedResources: () => null,
+}));
+
 // The inspection panel has its own real-browser resource/identity proof.
 vi.mock("./AntennaExternalLeadInspectionPanel", () => ({
   AntennaExternalLeadInspectionPanel: ({ authoredStageId }: { authoredStageId: string }) => (
@@ -274,6 +280,7 @@ describe("AntennaCompositionPanel runtime results", () => {
   });
   it("rejects activation on a Relax stage before the scene transaction", async () => {
     mocks.scene.data = {
+      ...ownedDriveSceneFixture(),
       scene: { id: "session-1" },
       revision: 3,
       study: { stages: [{ kind: "relax", stage_id: "relax-1" }, { kind: "run", stage_id: "run-1" }] },
@@ -307,6 +314,7 @@ describe("AntennaCompositionPanel runtime results", () => {
   });
   it("commits the edited drive with the scene revision and preserves other drives", async () => {
     mocks.scene.data = {
+      ...ownedDriveSceneFixture(),
       scene: { id: "session-1" },
       revision: 7,
       solved_antenna_drives: [
@@ -360,6 +368,7 @@ describe("AntennaCompositionPanel runtime results", () => {
 
   it("preserves only edited drive fields on refresh and blocks a same-field overwrite", async () => {
     mocks.scene.data = {
+      ...ownedDriveSceneFixture(),
       scene: { id: "session-1" },
       revision: 7,
       solved_antenna_drives: [
@@ -451,6 +460,7 @@ describe("AntennaCompositionPanel runtime results", () => {
 
   it("keeps the drive draft and blocks another save after a scene revision conflict", async () => {
     mocks.scene.data = {
+      ...ownedDriveSceneFixture(),
       scene: { id: "session-1" },
       revision: 4,
       solved_antenna_drives: [{
@@ -509,6 +519,7 @@ describe("AntennaCompositionPanel runtime results", () => {
 
   it("rebases only edited drive fields after refetch and retries with the new revision", async () => {
     mocks.scene.data = {
+      ...ownedDriveSceneFixture(),
       scene: { id: "session-1" },
       revision: 4,
       solved_antenna_drives: [{
@@ -583,6 +594,7 @@ describe("AntennaCompositionPanel runtime results", () => {
   });
   it("shows missing transport and port references for an incomplete solve stage", async () => {
     mocks.scene.data = {
+      objects: [{ id: "antenna-1" }],
       antenna_field_solve_stages: [{
         id: "solve-1",
         source_object_id: "antenna-1",
@@ -646,7 +658,7 @@ describe("AntennaCompositionPanel runtime results", () => {
     }
   });
 
-  it("shows missing solve and target references for an incomplete projection", async () => {
+  it("blocks an unowned projection before reporting target errors in an owned scene", async () => {
     mocks.scene.data = {
       antenna_target_projections: [{
         id: "projection-1",
@@ -666,8 +678,15 @@ describe("AntennaCompositionPanel runtime results", () => {
           <AntennaCompositionPanel kind="projection" selection={projectionSelection()} />,
         ),
       );
+      expect(container.textContent).toContain("Select the resource again in Explorer.");
+      expect(container.textContent).not.toContain("Validation");
+      expect(mocks.commitTransaction).not.toHaveBeenCalled();
+      mocks.scene.data = {
+        ...mocks.scene.data!, objects: [{ id: "antenna-1" }],
+        antenna_field_solve_stages: [{ ...sceneFixture().antenna_field_solve_stages![0], id: "missing-stage" }],
+      } as SceneResource;
+      await act(async () => root.render(<AntennaCompositionPanel kind="projection" selection={projectionSelection()} />));
       expect(container.textContent).toContain("Validation");
-      expect(container.textContent).toContain("missing solve stage");
       expect(container.textContent).toContain("missing target object");
       expect(findGroupBadge(container, "invalid · result pending")).toBeDefined();
     } finally {
@@ -678,6 +697,7 @@ describe("AntennaCompositionPanel runtime results", () => {
 
   it("accepts a symbolic stage output without requiring a published asset", async () => {
     mocks.scene.data = {
+      objects: [{ id: "antenna-1" }],
       antenna_target_projections: [{
         id: "projection-1",
         output_id: "field-1",
@@ -685,7 +705,7 @@ describe("AntennaCompositionPanel runtime results", () => {
         target: { kind: "global" },
       }],
       antenna_field_solve_stages: [{
-        id: "solve-1",
+        id: "solve-1", source_object_id: "antenna-1",
         outputs: [{ id: "field-1", quantity: "H_ant_basis" }],
       }],
     } as unknown as SceneResource;
@@ -708,7 +728,7 @@ describe("AntennaCompositionPanel runtime results", () => {
     }
   });
 
-  it("shows missing references and invalid drive parameters without inventing a stage catalog", async () => {
+  it("blocks an unowned drive before reporting invalid parameters in an owned scene", async () => {
     mocks.scene.data = {
       solved_antenna_drives: [{
         id: "drive-1",
@@ -733,9 +753,16 @@ describe("AntennaCompositionPanel runtime results", () => {
           <AntennaCompositionPanel kind="drive" selection={driveSelection()} />,
         ),
       );
+      expect(container.textContent).toContain("Select the resource again in Explorer.");
+      expect(container.textContent).not.toContain("Validation");
+      expect(mocks.commitTransaction).not.toHaveBeenCalled();
+      mocks.scene.data = {
+        ...mocks.scene.data!, ...ownedDriveSceneFixture(),
+        solved_antenna_drives: mocks.scene.data!.solved_antenna_drives!.map(drive => ({ ...drive, projection_ref: "projection-1" })),
+      } as SceneResource;
+      await act(async () => root.render(<AntennaCompositionPanel kind="drive" selection={driveSelection()} />));
       expect(container.textContent).toContain("Validation");
       expect(container.textContent).toContain("missing port mode");
-      expect(container.textContent).toContain("missing projection");
       expect(container.textContent).toContain("sinusoidal frequency must be finite and > 0 Hz");
       expect(container.textContent).toContain("activation stage ids must be non-empty and unique");
       expect(container.textContent).not.toContain("missing activation stage");
@@ -746,7 +773,7 @@ describe("AntennaCompositionPanel runtime results", () => {
     }
   });
 
-  it("shows invalid references and sampling parameters for a spectrum request", async () => {
+  it("blocks an unowned spectrum before reporting invalid sampling in an owned scene", async () => {
     mocks.scene.data = {
       antenna_spectrum_requests: [{
         id: "spectrum-1",
@@ -789,8 +816,15 @@ describe("AntennaCompositionPanel runtime results", () => {
           <AntennaCompositionPanel kind="spectrum" selection={spectrumSelection()} />,
         ),
       );
+      expect(container.textContent).toContain("Select the resource again in Explorer.");
+      expect(container.textContent).not.toContain("Validation");
+      expect(mocks.commitTransaction).not.toHaveBeenCalled();
+      mocks.scene.data = {
+        ...mocks.scene.data!, objects: [{ id: "antenna-1" }],
+        antenna_field_solve_stages: [{ ...sceneFixture().antenna_field_solve_stages![0], id: "missing-stage" }],
+      } as SceneResource;
+      await act(async () => root.render(<AntennaCompositionPanel kind="spectrum" selection={spectrumSelection()} />));
       expect(container.textContent).toContain("Validation");
-      expect(container.textContent).toContain("missing solve stage");
       expect(container.textContent).toContain("missing target object");
       expect(container.textContent).toContain("missing port mode");
       expect(container.textContent).toContain("invalid sampling frame");
@@ -803,6 +837,7 @@ describe("AntennaCompositionPanel runtime results", () => {
 
   it("keeps a valid structured spectrum request explicitly pending", async () => {
     mocks.scene.data = {
+      objects: [{ id: "antenna-1" }],
       antenna_spectrum_requests: [{
         id: "spectrum-1",
         component: "x",
@@ -832,9 +867,9 @@ describe("AntennaCompositionPanel runtime results", () => {
         },
         nonuniform_k_grid: null,
       }],
-      antenna_port_modes: [{ id: "port-1" }],
+      antenna_port_modes: [{ id: "port-1", source_object_id: "antenna-1" }],
       antenna_field_solve_stages: [{
-        id: "solve-1",
+        id: "solve-1", source_object_id: "antenna-1",
         port_mode_ids: ["port-1"],
         outputs: [{ id: "h-ant-1", quantity: "H_ant_basis" }],
       }],
@@ -873,6 +908,7 @@ describe("AntennaCompositionPanel runtime results", () => {
 
   it("marks unsupported transverse and modal spectra invalid before execution", async () => {
     mocks.scene.data = {
+      objects: [{ id: "antenna-1" }],
       antenna_spectrum_requests: [{
         id: "spectrum-1",
         component: "transverse",
@@ -891,10 +927,10 @@ describe("AntennaCompositionPanel runtime results", () => {
         },
       }],
       antenna_field_solve_stages: [{
-        id: "solve-1", port_mode_ids: ["port-1"],
+        id: "solve-1", source_object_id: "antenna-1", port_mode_ids: ["port-1"],
         outputs: [{ id: "basis", quantity: "H_ant_basis" }],
       }],
-      antenna_port_modes: [{ id: "port-1" }],
+      antenna_port_modes: [{ id: "port-1", source_object_id: "antenna-1" }],
     } as unknown as SceneResource;
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
@@ -927,6 +963,7 @@ describe("AntennaCompositionPanel runtime results", () => {
 
   it("shows concrete port validation diagnostics", async () => {
     mocks.scene.data = {
+      objects: [{ id: "antenna-1" }],
       antenna_port_modes: [{
         id: "invalid-port",
         schema_version: "antenna_port_mode.v2",
@@ -1187,13 +1224,26 @@ describe("AntennaCompositionPanel runtime results", () => {
 
 function sceneFixture(): SceneResource {
   return {
+    objects: [{ id: "antenna-1" }],
     antenna_field_solve_stages: [
       {
-        id: "solve-1",
+        id: "solve-1", source_object_id: "antenna-1",
         outputs: [{ id: "solution-1", quantity: "H_ant_basis" }],
       },
     ],
   } as unknown as SceneResource;
+}
+
+/** Explicit source graph for drive-edit tests; invalid-reference cases author their own graph. */
+function ownedDriveSceneFixture(): Partial<SceneResource> {
+  return {
+    ...sceneFixture(),
+    antenna_target_projections: [{
+      id: "projection-1", output_id: "field-1",
+      solution: { kind: "stage_output", stage_id: "solve-1", output_id: "solution-1" },
+      target: { kind: "global" },
+    }],
+  };
 }
 
 function fieldSolutionFixture(): AntennaFieldSolutionResource {
