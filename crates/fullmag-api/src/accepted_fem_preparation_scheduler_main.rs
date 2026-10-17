@@ -58,6 +58,18 @@ struct CompletedPreparation {
     next_run_id: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HostAdmissionOperation<T> {
+    Completed(T),
+    Deferred,
+}
+
+enum CandidateAdmission {
+    Admitted(FmsPreparationResourceLease),
+    Deferred,
+    Unavailable,
+}
+
 #[derive(Default)]
 struct ActivePreparations(BTreeMap<String, ActivePreparation>);
 
@@ -392,16 +404,18 @@ fn run_scheduler(args: SchedulerArgs, shutdown_requested: Arc<AtomicBool>) -> Re
                     if active.contains_key(&offer.resource_id) {
                         continue;
                     }
-                    let Some(lease) = admit_candidate(
+                    let admission = admit_candidate(
                         &store,
                         &args.pool_id,
                         pool.generation,
                         offer,
                         &candidates,
                         host.as_ref(),
-                    )?
-                    else {
-                        continue;
+                    )?;
+                    let lease = match admission {
+                        CandidateAdmission::Admitted(lease) => lease,
+                        CandidateAdmission::Deferred => break,
+                        CandidateAdmission::Unavailable => continue,
                     };
                     let resource_id = lease.resource_id.clone();
                     let next_after_admission =
@@ -583,10 +597,10 @@ fn admit_candidate(
     offer: &FmsPreparationResourceOffer,
     candidates: &[PreparationCandidate],
     host: Option<&fullmag_runtime_control::host_runtime::HostRuntimeAdmission>,
-) -> Result<Option<FmsPreparationResourceLease>> {
+) -> Result<CandidateAdmission> {
     if let Some(host) = host {
         if !preparation_admission_snapshot_ready(|| host.has_current_compute_snapshot())? {
-            return Ok(None);
+            return Ok(CandidateAdmission::Deferred);
         }
     }
     for candidate in candidates {
@@ -612,30 +626,67 @@ fn admit_candidate(
         };
         let disposition = if let Some(host) = host {
             if !preparation_admission_snapshot_ready(|| host.has_current_compute_snapshot())? {
-                return Ok(None);
+                return Ok(CandidateAdmission::Deferred);
             }
-            lease.host_launch_binding = Some(retry_store_writer_busy(|| {
-                host.ledger().worker_launch_binding()
-            })?);
-            let cpu_ids = host.preparation_cpu_ids(&lease.resource_id)?;
-            let request =
-                fullmag_runtime_control::host_allocation::host_request_for_preparation_lease(
-                    store,
-                    host.ledger(),
-                    &lease,
-                    cpu_ids,
-                )?;
-            retry_store_writer_busy(|| {
-                host.ledger()
-                    .try_commit_preparation_resource_lease_from_pool(
-                        &request,
-                        store,
-                        pool_id,
-                        pool_generation,
-                        candidate.authorization_sequence,
-                        &lease,
+            let binding = match retry_host_admission_writer_busy(
+                || host.ledger().worker_launch_binding(),
+                || {
+                    format!(
+                        "preparation admission: read host worker launch binding for resource `{}`",
+                        offer.resource_id
                     )
-            })?
+                },
+            )? {
+                HostAdmissionOperation::Completed(binding) => binding,
+                HostAdmissionOperation::Deferred => return Ok(CandidateAdmission::Deferred),
+            };
+            lease.host_launch_binding = Some(binding);
+            let cpu_ids = host.preparation_cpu_ids(&lease.resource_id)?;
+            let request = match retry_host_admission_writer_busy(
+                || {
+                    fullmag_runtime_control::host_allocation::host_request_for_preparation_lease(
+                        store,
+                        host.ledger(),
+                        &lease,
+                        cpu_ids,
+                    )
+                },
+                || {
+                    format!(
+                        "preparation admission: read host policy and compute-node owner for run {} task {} resource {}",
+                        candidate.run_id, candidate.task_id, offer.resource_id
+                    )
+                },
+            )? {
+                HostAdmissionOperation::Completed(request) => request,
+                HostAdmissionOperation::Deferred => return Ok(CandidateAdmission::Deferred),
+            };
+            // The ledger method acquires both the host and session writers
+            // before it reads or publishes a tentative reservation. A typed
+            // busy result therefore cannot represent a partial lease commit;
+            // ordinary validation/publication errors remain fatal below.
+            match retry_host_admission_writer_busy(
+                || {
+                    host.ledger()
+                        .try_commit_preparation_resource_lease_from_pool(
+                            &request,
+                            store,
+                            pool_id,
+                            pool_generation,
+                            candidate.authorization_sequence,
+                            &lease,
+                        )
+                },
+                || {
+                    format!(
+                        "preparation admission: commit host reservation and session lease for run `{}` task `{}` resource `{}`",
+                        candidate.run_id, candidate.task_id, offer.resource_id
+                    )
+                },
+            )? {
+                HostAdmissionOperation::Completed(disposition) => disposition,
+                HostAdmissionOperation::Deferred => return Ok(CandidateAdmission::Deferred),
+            }
         } else {
             retry_store_writer_busy(|| {
                 store.try_commit_preparation_resource_lease_from_pool(
@@ -647,10 +698,10 @@ fn admit_candidate(
             })?
         };
         if disposition.is_some() {
-            return Ok(Some(lease));
+            return Ok(CandidateAdmission::Admitted(lease));
         }
     }
-    Ok(None)
+    Ok(CandidateAdmission::Unavailable)
 }
 
 fn validate_pool_progress(
@@ -770,6 +821,23 @@ fn spawn_supervisor(
 
 fn retry_store_writer_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
     fullmag_runtime_control::retry_store_writer_busy(&mut operation)
+}
+
+fn retry_host_admission_writer_busy<T>(
+    operation: impl FnMut() -> Result<T>,
+    context: impl FnOnce() -> String,
+) -> Result<HostAdmissionOperation<T>> {
+    match retry_store_writer_busy(operation).with_context(context) {
+        Ok(value) => Ok(HostAdmissionOperation::Completed(value)),
+        Err(error) if is_store_writer_busy(&error) => {
+            tracing::warn!(
+                error = ?error,
+                "preparation scheduler deferred host admission while the shared host writer was busy"
+            );
+            Ok(HostAdmissionOperation::Deferred)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn is_store_writer_busy(error: &anyhow::Error) -> bool {
@@ -976,8 +1044,11 @@ fn parse_usize(flag: &str, value: std::ffi::OsString) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        preparation_admission_snapshot_ready, retry_host_admission_writer_busy,
+        HostAdmissionOperation,
+    };
     use anyhow::Context;
-    use super::preparation_admission_snapshot_ready;
 
     #[test]
     fn pre_admission_snapshot_deferral_classifies_only_typed_busy() {
@@ -997,5 +1068,35 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(text_only_busy.to_string(), "session store writer is busy");
+    }
+
+    #[test]
+    fn host_admission_writer_busy_defers_only_typed_busy() {
+        assert_eq!(
+            retry_host_admission_writer_busy::<u8>(
+                || { Err(anyhow::Error::new(fullmag_session::StoreWriterBusy).context("wrapped")) },
+                || "preparation admission: read host worker launch binding".to_owned(),
+            )
+            .unwrap(),
+            HostAdmissionOperation::Deferred
+        );
+
+        let completed = retry_host_admission_writer_busy::<u8>(
+            || Ok::<_, anyhow::Error>(7_u8),
+            || "commit host reservation and session lease".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(completed, HostAdmissionOperation::Completed(7));
+
+        let ordinary = retry_host_admission_writer_busy::<u8>(
+            || Err(anyhow::anyhow!("host launch binding identity mismatch")),
+            || "preparation admission: read host worker launch binding".to_owned(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            ordinary.to_string(),
+            "preparation admission: read host worker launch binding"
+        );
+        assert!(format!("{ordinary:#}").contains("host launch binding identity mismatch"));
     }
 }
