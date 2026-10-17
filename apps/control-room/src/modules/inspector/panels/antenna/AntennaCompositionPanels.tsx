@@ -1,6 +1,9 @@
+import { useState } from "react";
 import { antennaResourceOwner } from "@/shared/domain/physics/antennaResourceOwner";
 import { useKernel } from "@/kernel/KernelContext";
 import { Button } from "@/shared/ui/Button";
+import { antennaNavigationLinks } from "@/modules/explorer/public";
+import { antennaNavigationScene } from "./AntennaNavigationScene";
 
 import type { SceneResource } from "@/kernel/api/apiTypes";
 import { antennaPortValidationMessages } from "@/shared/domain/physics/antennaPortValidation";
@@ -857,7 +860,8 @@ export function AntennaCompositionPanel({
   kind,
   selection,
 }: InspectorPanelProps & { kind: AntennaCompositionKind }) {
-  const { selection: selectionController, commands } = useKernel();
+  const kernel = useKernel();
+  const [navigationError, setNavigationError] = useState<string | null>(null);
   const scope = sessionRequestScopeKey(useSessionResourceIdentity());
   const scene = useSceneResource();
   const objectId = selectedObjectId(selection);
@@ -892,6 +896,19 @@ export function AntennaCompositionPanel({
     stageOutputCatalog,
     sourceSpectrum,
   );
+
+  const conductorLinks = kind === "conductor" && scene.data ? antennaNavigationLinks(scene.data, selection) : [];
+  const navigationAvailable = scene.status === "ready" && Boolean(scope) && scene.sessionScopeKey === scope && !scene.error && !scene.refreshError;
+  function openConductorResource(key: "geometry" | "mesh") {
+    const current = antennaNavigationScene(kernel, scope);
+    const target = current ? antennaNavigationLinks(current, selection).find(link => link.key === key) : null;
+    if (!target?.selection) {
+      setNavigationError("The conductor resource changed or is unavailable. Refresh the Inspector before navigating.");
+      return;
+    }
+    setNavigationError(null);
+    kernel.selection.set(target.selection, "inspector");
+  }
 
   if (!selectionOwned) return <div className="fm-inspector-panel">
     <InspectorGroup title="Antenna resource unavailable">
@@ -940,19 +957,11 @@ export function AntennaCompositionPanel({
       {kind === "conductor" && objectId ? <>
         <AntennaConductorAuthoring objectId={objectId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} />
         <p className="fm-inspector-hint">Layout conductivity is an authored geometry value. Charge-material assignments above describe the current model; this view does not certify a solve.</p>
-        <Button type="button" disabled={!scene.data?.objects?.some(object => object.id === objectId)} onClick={() => {
-          const nodeId = `model:object:${objectId}:geometry`;
-          selectionController.set({ kind: "object.antenna.geometry", objectId, nodeId, label: "Geometry",
-            ref: { type: "scene-object", kind: "object.antenna.geometry", objectId, nodeId, visualizationTargetId: `object:${objectId}` } }, "inspector");
-        }}>Open Geometry</Button>
+        {navigationError ? <FeedbackBanner kind="warning" message={navigationError} /> : null}
+        <Button type="button" disabled={!navigationAvailable || !conductorLinks.find(link => link.key === "geometry")?.selection} onClick={() => openConductorResource("geometry")}>Open Geometry</Button>
         <InspectorGroup title="Conductor mesh" badge="policy and build evidence">
           <p className="fm-inspector-hint">Configure object sizing and inspect build reports in Mesh. Saving a policy does not build a mesh; antenna field solutions carry their own mesh and source identity.</p>
-          <Button type="button" disabled={!scope || scene.sessionScopeKey !== scope || (scene.data?.objects?.filter(object => object.id === objectId).length ?? 0) !== 1} onClick={() => {
-            if (!scope || commands.getSessionScopeKey() !== scope || scene.sessionScopeKey !== scope) return;
-            const nodeId = `model:object:${objectId}:mesh`;
-            selectionController.set({ kind: "object.mesh", objectId, nodeId, label: "Mesh",
-              ref: { type: "scene-object", kind: "object.mesh", objectId, nodeId, visualizationTargetId: `object:${objectId}` } }, "inspector");
-          }}>Open Mesh Policy</Button>
+          <Button type="button" disabled={!navigationAvailable || !conductorLinks.find(link => link.key === "mesh")?.selection} onClick={() => openConductorResource("mesh")}>Open Mesh Policy</Button>
         </InspectorGroup>
       </> : null}
       {kind === "port" && objectId && resourceId ? <AntennaPortEditor objectId={objectId} portId={resourceId} scene={scene.data} sceneScopeKey={scene.sessionScopeKey} status={scene.status} refetch={scene.refetch} /> : null}

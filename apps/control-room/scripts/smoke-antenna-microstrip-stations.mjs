@@ -469,6 +469,29 @@ try {
   assert.ok(!conductorText.includes("Station 1") && !conductorText.includes("Return width"));
   await screenshot("18-conductor-materials");
   const navigationBefore = await read();
+  const conductorSelection = await page.evaluate(() => window.__antennaStationsFixture.readSelection());
+  for (const name of ["Open Geometry", "Open Mesh Policy"]) {
+    // Exercise the click-time guard before React can disable the stale button.
+    const race = await page.evaluate((buttonName) => {
+      const button = [...document.querySelectorAll('[data-inspector-owner="object.antenna.conductor"] button')].find(item => item.textContent === buttonName);
+      if (!button || button.disabled) throw new Error("Expected an enabled conductor navigation button");
+      window.__antennaStationsFixture.refreshUnrelated();
+      button.click();
+      return window.__antennaStationsFixture.readSelection();
+    }, name);
+    assert.deepEqual(race, conductorSelection, `${name} must reject invalidation before React rerenders`);
+    await page.waitForFunction(() => window.__antennaStationsFixture.read().pendingSceneReads > 0, undefined, { timeout });
+    for (const target of ["Open Geometry", "Open Mesh Policy"]) {
+      assert.equal(await conductor.getByRole("button", { name: target, exact: true }).isDisabled(), true, `${target} must remain unavailable during a held scene GET`);
+    }
+    assert.ok((await conductor.innerText()).includes("The conductor resource changed or is unavailable."));
+    assert.deepEqual(await page.evaluate(() => window.__antennaStationsFixture.readSelection()), conductorSelection);
+    assert.equal((await read()).calls.filter(call => call.method === "POST").length, navigationBefore.calls.filter(call => call.method === "POST").length);
+    await page.evaluate(() => window.__antennaStationsFixture.releaseScene());
+    await ready();
+    assert.equal(await conductor.getByRole("button", { name, exact: true }).isEnabled(), true);
+  }
+  checks.push({ name: `${layout} conductor Geometry and Mesh navigation reject invalidated scene revisions before render and during held GET without changing selection or writing`, passed: true });
   await conductor.getByRole("button", { name: "Open Geometry", exact: true }).click();
   const routedGeometry = page.locator('[data-inspector-owner="object.antenna.geometry"]'); await routedGeometry.waitFor({ timeout });
   assert.equal(await routedGeometry.getByRole("textbox", { name: "Conductor length", exact: true }).count(), 1);
@@ -480,6 +503,15 @@ try {
   assert.deepEqual((await read()).unexpected, []);
   await screenshot("19-conductor-to-geometry");
   checks.push({ name: `${layout} dedicated Conductor separates authored layout conductivity from explicit charge materials and navigates to Geometry without duplicate editors or writes`, passed: true });
+
+  await page.goto(conductorUrl.href, { waitUntil: "domcontentloaded", timeout }); await ready();
+  await conductor.getByRole("button", { name: "Open Mesh Policy", exact: true }).click();
+  const meshSelection = await page.evaluate(() => window.__antennaStationsFixture.readSelection());
+  assert.equal(meshSelection.kind, "object.mesh");
+  assert.equal(meshSelection.ref.objectId, "fixture-microstrip-conductor");
+  assert.equal(meshSelection.nodeId, "model:object:fixture-microstrip-conductor:mesh");
+  assert.deepEqual((await read()).unexpected, []);
+  checks.push({ name: `${layout} conductor Mesh Policy navigation resolves the canonical Explorer route after the scene is ready`, passed: true });
 
   for (const [charge, message] of [["none", "No explicit current module is assigned to this object."], ["empty", "No explicit charge-material assignment for this object."]]) {
     const missingUrl = new URL(conductorUrl); missingUrl.searchParams.set("charge", charge);

@@ -229,3 +229,23 @@ korzysta z `antennaNavigationLinks` w
 `apps/control-room/src/modules/explorer/antennaNavigation.ts`;
 `AntennaResourceEditor` i jego prywatny `AntennaResourceEditSession` zachowują
 jednego właściciela sesji edycji portu.
+
+
+## Nawigacja przewodnika podczas odświeżania — 17.10.2026
+
+Przyciski Open Geometry i Open Mesh Policy korzystają z kanonicznych tras
+Explorera. Handler ponownie sprawdza bieżącą scenę i scope; unieważniona
+rewizja nie pozwala przejść do zachowanego celu przed potwierdzeniem GET.
+Nie dodano osobnego loadera ani modelu selekcji.
+
+Regresja CPW/microstrip zakończyła się 49 kontrolami PASS:
+`windows-control-room-browser-fixture/antenna-microstrip-stations-browser/2499e328e47445c39c3d832e10b6c164/receipt.json`
+w tym samym storage worktree co dowody powyżej. Nowe przypadki obejmują
+kliknięcie bezpośrednio po invalidacji przed renderem React, blokadę obu
+przycisków podczas wstrzymanego GET, niezmienioną selekcję i brak POST,
+a następnie działającą nawigację Geometry oraz kanoniczny wybór Mesh.
+To kontrolowany transport, bez dowodu rzeczywistej zmiany sesji ani solvera.
+
+Produkcyjne typy: `windows-control-room-source-check/production-source/07f4590399eb46c1a042a0500a5100e1/receipt.json`
+— PASS. Ukierunkowany ESLint panelu na bajtowo zgodnej kopii źródeł: exit 0,
+zero ostrzeżeń; testów jednostkowych nie kompilowano.
