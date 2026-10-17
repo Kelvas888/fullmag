@@ -610,7 +610,7 @@ describe("WorkspaceShellClient Home entry surface", () => {
       });
 
       expect(currentStatus).toHaveBeenCalledTimes(2);
-      expect(list).toHaveBeenCalledTimes(3);
+      expect(list).toHaveBeenCalledTimes(2);
       expect(findByAttribute(container, "data-state", "home-session-reconnecting")).toBeNull();
       expect(findByAttribute(container, "data-slot-id", "viewport-main")).toBeTruthy();
     } finally {
