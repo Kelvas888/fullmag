@@ -705,6 +705,15 @@ describe("viewport smoke projection round-trip", () => {
     expect(femTopologyAuditScript).toContain("await assertNoFixtureResourceFailures(page)");
     expect(femTopologyAuditScript).toContain('text.includes("resource:load-failed")');
     expect(femTopologyAuditScript).toContain("response.status() >= 400");
+    expect(femTopologyAuditScript).toContain('document.querySelectorAll("output.fm-notifications__toast")');
+    expect(femTopologyAuditScript).toContain('toast.getAttribute("data-kind") === "error"');
+    expect(femTopologyAuditScript).toContain("await verifyFixtureResourceFailureGuard(browser)");
+    expect(femTopologyAuditScript).toContain("retainedAfterRemoval: true");
+    const notificationsSource = readFileSync(new URL("../overlay/NotificationsSurface.tsx", import.meta.url), "utf8");
+    expect(notificationsSource).toContain('className="fm-notifications__toast"');
+    expect(notificationsSource).toContain("data-kind={notification.kind}");
+    expect(femTopologyAuditScript).toContain('requestPath === "/v2/sessions/current/model/readiness"');
+    expect(femTopologyAuditScript).toContain('requestPath === "/v2/sessions/current/visualization/mode-compositions/active"');
   });
 
   it("browser-proves semantic picks and keeps outer boundary under Universe", () => {

@@ -51,6 +51,7 @@ const measurements = [];
 
 try {
   await mkdir(auditArtifactsDirectory, { recursive: true });
+  const resourceFailureGuardProof = await verifyFixtureResourceFailureGuard(browser);
   for (const passConfig of semanticOnly || preCanvasOnly ? [] : PASS_CONFIGS) {
     for (const partCount of FEM_PART_COUNTS) {
       const measurement = await measureFemTopologyUploads({
@@ -80,7 +81,7 @@ try {
   });
   await writeFile(
     path.join(auditArtifactsDirectory, "fem-topology-upload-metrics.json"),
-    `${JSON.stringify({ measurements, preCanvasErrorBoundaryProof, rawPerformanceTrace: measurements.map((measurement) => measurement.rawPerformanceTrace), semanticTargetExplorerProof }, null, 2)}\n`,
+    `${JSON.stringify({ measurements, preCanvasErrorBoundaryProof, resourceFailureGuardProof, rawPerformanceTrace: measurements.map((measurement) => measurement.rawPerformanceTrace), semanticTargetExplorerProof }, null, 2)}\n`,
   );
   console.log("FEM topology upload audit passed:", `measurements=${measurements.length}`);
 } finally {
@@ -876,6 +877,47 @@ function makeFemTopologyBuffer(partCount) {
   return buffer;
 }
 
+async function verifyFixtureResourceFailureGuard(browser) {
+  const page = await browser.newPage();
+  const errors = [];
+  await installFixtureResourceFailureAudit(page, errors);
+  try {
+    await page.goto("data:text/html,<html><body></body></html>");
+    await assertNoRecordedFixtureResourceFailures(page);
+    await page.evaluate(() => {
+      // Match NotificationsView's rendered output, independently of the real
+      // measurement pages; never clear their recorded failures.
+      const notification = document.createElement("output");
+      notification.className = "fm-notifications__toast";
+      notification.setAttribute("data-kind", "error");
+      const title = document.createElement("strong");
+      title.textContent = "Resource load failed";
+      const detail = document.createElement("span");
+      detail.textContent = "Injected guard control. Log resource:load-failed resource-hook.";
+      notification.append(title, detail);
+      document.body.appendChild(notification);
+    });
+    await page.locator('output.fm-notifications__toast[data-kind="error"]').waitFor({ state: "visible" });
+    await page.waitForFunction(() => window.__FM_FEM_AUDIT_RESOURCE_FAILURES__?.length === 1);
+    const assertRejected = async () => {
+      try {
+        await assertNoRecordedFixtureResourceFailures(page);
+      } catch (error) {
+        if (String(error).includes("Injected guard control")) return;
+        throw error;
+      }
+      throw new Error("Fixture resource failure guard accepted the injected notification.");
+    };
+    await assertRejected();
+    await page.locator("output.fm-notifications__toast").evaluate((notification) => notification.remove());
+    await assertRejected();
+    if (errors.length) throw new Error(`Resource failure guard control emitted API errors: ${errors.join("\n")}`);
+    return { detectedNotificationCount: 1, rejectedWhileVisible: true, retainedAfterRemoval: true };
+  } finally {
+    await page.close();
+  }
+}
+
 async function installFixtureResourceFailureAudit(page, errors) {
   const abortedRequests = [];
   page.on("response", (response) => {
@@ -900,15 +942,14 @@ async function installFixtureResourceFailureAudit(page, errors) {
     const failures = [];
     window.__FM_FEM_AUDIT_RESOURCE_FAILURES__ = failures;
     new MutationObserver(() => {
-      for (const toast of document.querySelectorAll(".fm-toast")) {
+      for (const toast of document.querySelectorAll("output.fm-notifications__toast")) {
         const text = toast.textContent ?? "";
-        const title = toast.querySelector(".fm-toast__title")?.textContent;
-        const failed = title === "Resource load failed" || title === "Quantity data unavailable" || text.includes("resource:load-failed");
+        const failed = toast.getAttribute("data-kind") === "error" || text.includes("resource:load-failed");
         if (failed && !failures.includes(text) && failures.length < 16) {
           failures.push(text);
         }
       }
-    }).observe(document, { childList: true, subtree: true, characterData: true });
+    }).observe(document, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["data-kind"] });
   });
   return abortedRequests;
 }
@@ -924,6 +965,10 @@ async function assertNoFixtureResourceFailures(page) {
     15_000,
     "FEM fixture did not load its canonical empty field and quantity catalogs.",
   );
+  await assertNoRecordedFixtureResourceFailures(page);
+}
+
+async function assertNoRecordedFixtureResourceFailures(page) {
   const failures = await page.evaluate(() => window.__FM_FEM_AUDIT_RESOURCE_FAILURES__);
   if (!Array.isArray(failures)) throw new Error("Fixture resource failure observer was not installed.");
   if (failures.length > 0) {
@@ -962,6 +1007,39 @@ async function installFemFixtureApi(page, fixture) {
     }
     if (requestPath === "/v2/sessions/current/status") return fulfillJson(route, femStatusFixture());
     if (requestPath === "/v2/sessions/current/visualization/state") return fulfillJson(route, fixture.visualizationState);
+    if (requestPath === "/v2/sessions/current/visualization/mode-compositions/active") {
+      return fulfillJson(route, {
+        artifact_revision: "",
+        composition_id: "active",
+        layers: [],
+        lifecycle: {
+          artifact_revision: 0,
+          mesh_revision: fixture.manifest.revision,
+          run_id: null,
+          session_id: "fem-topology-upload-fixture",
+        },
+        phase_clock: { master_rate_hz: 1, synchronized: true },
+        revision: 0,
+        run_id: "",
+        schema_version: "mode-composition.v1",
+        stage_id: "",
+      });
+    }
+    if (requestPath === "/v2/sessions/current/model/readiness") {
+      const reason = "Topology-only fixture has no authored simulation study.";
+      return fulfillJson(route, {
+        blockers: [reason],
+        capabilities: {
+          move: { available: false, reason },
+          rotate: { available: false, reason },
+          scale: { available: false, reason },
+        },
+        checks: [{ id: "study", label: "Study", state: "blocked", reason, target_resource: "model/study" }],
+        ready_to_export: false,
+        ready_to_run: false,
+        scene_revision: fixture.scene.revision,
+      });
+    }
     if (requestPath === "/v2/sessions/current/data/fields") {
       return fulfillJson(route, {
         domain_generation_id: fixture.manifest.generation_id,
