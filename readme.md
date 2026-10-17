@@ -239,11 +239,54 @@ Backend edits require a deliberate cached build:
 just docker-dev-build "$worktree"
 ```
 
-This command does not restart the active services or simulation. Apply a new
-package only through a later controlled `docker_dev.py up` start after the
-selected group is safely stopped and has no active compute. The launcher rejects
-an active group or a port collision; it never silently restarts, takes over, or
-resets another group.
+This command does not restart the active services or simulation. To apply
+its package without a second build, use the controlled `recreate` flow below
+after the selected group is safely stopped and has no active compute. `up`
+remains the build-and-start path; the launcher rejects an active group or a port
+collision and never silently restarts, takes over, or resets another group.
+
+### Apply an existing backend package without rebuilding
+
+`docker_dev.py up` always performs another backend build. When a successful
+backend package already exists, apply it with `recreate` instead. The successful
+`docker_dev.py build` output contains the exact `assembly_receipt` path and
+`run_root`; pass that printed `assembly.json` path unchanged. The existing runtime
+start receipt is the `receipt.json` beside the exact `state_root` reported by that run,
+with the usual shape
+`<storage>\runs\<worktree-id>\docker-all\<run-id>\receipt.json`. Do not
+search for a latest run or select a receipt by directory ordering.
+
+After the selected group has been gracefully stopped and verified idle, compute
+the previous configuration digest from that same run root and reuse its state:
+
+```powershell
+$runRoot = "C:\path\to\storage\runs\<worktree-id>\docker-all\<run-id>"
+$runReceipt = Join-Path $runRoot "receipt.json"
+$assemblyReceipt = "C:\path\to\storage\builds\<worktree-id>\docker-all-gpu\direct-compose\<build-id>\assembly.json"
+$previousConfigSha256 = (Get-FileHash -Algorithm SHA256 `
+  -LiteralPath "$runRoot\state\.fullmag\runtime-service\docker-all.json").Hash.ToLowerInvariant()
+
+python -B "$main\scripts\docker_dev.py" --repo-root $main recreate `
+  --run-receipt $runReceipt `
+  --assembly-receipt $assemblyReceipt `
+  --previous-config-sha256 $previousConfigSha256 `
+  --source-root $worktree `
+  --port 3197
+```
+
+Use the literal `assembly_receipt` path printed by the build and the literal run
+receipt derived from that run's output. The `recreate` command does not build,
+publish a second package, choose `latest`, or create a new session root. It
+validates both receipts and the old configuration hash, then preserves the run
+state, sessions, results, workspace database, and `receipt-history` while
+applying the already-built package.
+
+If the launcher reports that the selected group still owns containers, first
+confirm that the exact run receipt is yours and that the host ledger has no
+active compute or reservation. Run only the exact `docker compose ... down`
+command printed by the launcher for that project, working directory, and
+resolved JSON files. Do not replace it with a generic project, wildcard, or
+`--volumes` command; preserve the storage, receipts, state, and history.
 
 An optional third `just docker-dev` argument selects a Python startup script
 inside the same checkout. The path is contained, hashed, and recorded in

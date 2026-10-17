@@ -444,25 +444,51 @@ chwilowych bramek sesji ani błędów JavaScript/CORS. Dowód dla runu
 Ten test potwierdza zachowanie Home przy awarii połączenia; nie potwierdza
 poprawnego startu API, wykonania GPU ani reguły aktywacji historycznej sesji.
 
-Po kontrolowanym, graceful stopie własnych usług można jawnie odtworzyć ten sam
-run i jego `session-store`, wskazując każdy artefakt:
+`docker_dev.py up` zawsze wykonuje kolejny backend build. Jeżeli pakiet backendu
+został już zbudowany, po kontrolowanym graceful stopie własnych usług można
+odtworzyć ten sam run i jego `session-store` przez `recreate`, bez drugiej
+kompilacji. Udany `docker_dev.py build` wypisuje JSON z dokładnym polem
+`assembly_receipt` oraz `run_root`; do odtworzenia należy użyć wskazanego tam
+`assembly.json`. Start istniejącego runtime wypisuje `state_root`; jego sąsiadujący
+`receipt.json` jest właściwym receipt runu, o kształcie
+`<storage>\runs\<worktree-id>\docker-all\<run-id>\receipt.json`.
+Nie wyszukuj `latest` ani nie wybieraj pliku przez sortowanie katalogu.
+
+Hash konfiguracji trzeba policzyć z dokładnego, wskazanego runu:
 
 ```powershell
-python scripts/docker_dev.py recreate `
-  --run-receipt <old-run>/receipt.json `
-  --assembly-receipt <new-build>/assembly.json `
-  --previous-config-sha256 <old-runtime-config-sha256>
+$runRoot = "C:\path\to\storage\runs\<worktree-id>\docker-all\<run-id>"
+$runReceipt = Join-Path $runRoot "receipt.json"
+$assemblyReceipt = "C:\path\to\storage\builds\<worktree-id>\docker-all-gpu\direct-compose\<build-id>\assembly.json"
+$previousConfigSha256 = (Get-FileHash -Algorithm SHA256 `
+  -LiteralPath "$runRoot\state\.fullmag\runtime-service\docker-all.json").Hash.ToLowerInvariant()
+
+python -B "<main-checkout>\scripts\docker_dev.py" --repo-root "<main-checkout>" recreate `
+  --run-receipt $runReceipt `
+  --assembly-receipt $assemblyReceipt `
+  --previous-config-sha256 $previousConfigSha256 `
+  --source-root "<registered-checkout-or-worktree>" `
+  --port 3197
 ```
 
-Polecenie nie wyszukuje `latest`, nie zatrzymuje usług i nie tworzy nowego rootu
-sesji. Waliduje właściciela, projekt, ścieżki, checkout źródeł, certyfikat
-Windows oraz CAS konfiguracji; stare receipty i Compose są zachowane w
-`receipt-history`, a frontend korzysta z istniejącego workspace/cache, gdy
-identyfikator zależności się nie zmienił. Zmienna
-`FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256` jest przekazywana do backendu wyłącznie
-w tej jawnej ścieżce. Runtime service dopuszcza wtedy tylko przypiętą zmianę
-generacji po własnym sprawdzeniu zatrzymania i aktualnego readiness; zwykły
-start nadal odrzuca zmianę profilu.
+Użyj literalnych ścieżek `assembly_receipt` i run receipt z tych konkretnych
+wyjść. `recreate` waliduje właściciela, projekt, checkout, oba receipty i CAS
+konfiguracji, ale nie buduje, nie publikuje drugiego pakietu, nie szuka
+`latest` i nie tworzy nowego rootu sesji. Zachowuje state, `session-store`,
+sesje, wyniki, bazę workspace oraz historię w `receipt-history`; zmienia tylko
+przypięty pakiet zgodnie z kontrolą runtime.
+
+Jeżeli launcher zgłosi, że wybrana grupa nadal ma kontenery, najpierw potwierdź
+właściwy run receipt oraz brak aktywnego compute i rezerwacji w host ledgerze.
+Uruchom wyłącznie dokładną komendę `docker compose ... down` wypisaną przez
+launcher dla tego projektu, katalogu roboczego i rozstrzygniętych plików JSON.
+Nie zastępuj jej ogólnym projektem, wildcardem ani `--volumes`; storage,
+receipty, state i historia muszą pozostać.
+
+Zmienna `FULLMAG_DOCKER_PREVIOUS_CONFIG_SHA256` jest przekazywana do backendu
+wyłącznie w tej jawnej ścieżce. Runtime service dopuszcza wtedy tylko przypiętą
+zmianę generacji po własnym sprawdzeniu zatrzymania i aktualnego readiness;
+zwykły start nadal odrzuca zmianę profilu.
 
 Warunki implementacji tej części trybu developerskiego:
 
