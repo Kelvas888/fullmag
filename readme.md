@@ -149,6 +149,12 @@ Platform-specific setup is documented in the
 
 ## Docker development workspace
 
+Recipes are defined in [`justfile`](justfile); run `just --list` from the
+selected checkout to list them. The two-service topology, mounts, and network
+are defined in [`compose.dev.yaml`](compose.dev.yaml). See the
+[Docker development guide](docs/guides/docker-development-architecture.md)
+for the detailed architecture and lifecycle contract.
+
 Daily FullMag development uses the direct Docker Compose workspace. Run the
 launcher from native Windows PowerShell with Docker Desktop using Linux
 containers and NVIDIA support. WSL is suitable for reading and editing the
