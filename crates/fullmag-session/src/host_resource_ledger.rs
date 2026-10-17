@@ -1117,7 +1117,14 @@ impl HostResourceLedger {
         Ok(binding)
     }
 
-    fn worker_launch_index(
+    /// Validate the exact active local lease and immutable host reservation
+    /// identity shared by launch and capacity-reducing cancellation paths.
+    ///
+    /// This deliberately stops before compute-node inventory admission. A
+    /// cancellation may run after the inventory owner has gone away, while
+    /// the lease, runtime generation, policy, and reservation binding remain
+    /// authoritative under the host→store writer locks.
+    fn exact_worker_launch_index(
         &self,
         document: &HostResourceLedgerDocument,
         store: &SessionStore,
@@ -1147,10 +1154,6 @@ impl HostResourceLedger {
             .context("worker launch has no exact host reservation")?;
         let pinned_request = reservation_request(&document.reservations[index]);
         self.validate_runtime_generation_request_locked(document, &pinned_request)?;
-        self.validate_compute_node_request_locked(
-            &pinned_request,
-            document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4,
-        )?;
         validate_reservation_matches_worker_lease(
             &document.reservations[index],
             &document.policy,
@@ -1158,6 +1161,33 @@ impl HostResourceLedger {
             &current,
         )?;
         Ok(index)
+    }
+
+    fn worker_launch_index(
+        &self,
+        document: &HostResourceLedgerDocument,
+        store: &SessionStore,
+        lease: &FmsResourceLease,
+    ) -> Result<usize> {
+        let index = self.exact_worker_launch_index(document, store, lease)?;
+        let pinned_request = reservation_request(&document.reservations[index]);
+        self.validate_compute_node_request_locked(
+            &pinned_request,
+            document.schema_version == HOST_RESOURCE_LEDGER_SCHEMA_V4,
+        )?;
+        Ok(index)
+    }
+
+    /// Capacity-reducing no-spawn closure keeps the exact lease and runtime
+    /// fences but does not require a live inventory owner. The normal launch
+    /// path must continue using `worker_launch_index` above.
+    fn worker_launch_index_for_no_spawn_closure(
+        &self,
+        document: &HostResourceLedgerDocument,
+        store: &SessionStore,
+        lease: &FmsResourceLease,
+    ) -> Result<usize> {
+        self.exact_worker_launch_index(document, store, lease)
     }
 
     /// Consume once before calling process creation. Publication uncertainty
@@ -1266,7 +1296,7 @@ impl HostResourceLedger {
         let _host_writer = self.writer.acquire()?;
         let _store_writer = store.write_transaction()?;
         let mut document = self.read_document_locked()?;
-        let index = self.worker_launch_index(&document, store, lease)?;
+        let index = self.worker_launch_index_for_no_spawn_closure(&document, store, lease)?;
         if document.reservations[index].state == HostResourceReservationState::Released {
             bail!("released reservation cannot close a launch permit");
         }
@@ -1319,7 +1349,7 @@ impl HostResourceLedger {
             &store_id,
             &lease,
         )?;
-        self.worker_launch_index(&document, store, &lease)?;
+        self.worker_launch_index_for_no_spawn_closure(&document, store, &lease)?;
         let catalog = store
             .read_run_catalog(&identity.run_id)?
             .context("cancelled worker recovery requires a durable run catalog")?;
@@ -7008,6 +7038,139 @@ mod tests {
         }
     }
 
+    struct V4WorkerLaunchFixture {
+        _directory: tempfile::TempDir,
+        store: SessionStore,
+        ledger: HostResourceLedger,
+        inventory_owner: Option<HostInventoryOwner>,
+        request: HostReservationRequest,
+        lease: FmsResourceLease,
+    }
+
+    fn v4_worker_launch_fixture(task_id: &str) -> V4WorkerLaunchFixture {
+        let directory = tempfile::tempdir().unwrap();
+        let mut policy = policy();
+        policy.schema_version = HOST_RESOURCE_LEDGER_POLICY_SCHEMA_V2.into();
+        let mut template = compute_node_snapshot(
+            &policy,
+            HostResourceLedger::node_id_for_host_id(&policy.host_id),
+            chrono::Utc::now(),
+            1,
+            1,
+        );
+        template.capabilities = Reported::Available {
+            value: vec!["fem.gpu".into()],
+        };
+        if let Reported::Available { value } = &mut template.gpus {
+            for device in value {
+                device.runtime_compatibility = Reported::Available {
+                    value: vec!["fem.gpu".into()],
+                };
+            }
+        }
+        template.enforcement.gpu_visibility = EnforcementStatus::Supported;
+        policy.topology_sha256 = template.inventory_sha256.clone();
+        let mut readiness = v4_readiness(&policy, &"1".repeat(64), &"2".repeat(64));
+        readiness.capabilities_sha256 = Some(template.computed_capabilities_sha256().unwrap());
+        let ledger_root = ledger_root(directory.path());
+        let ledger = HostResourceLedger::initialize_with_readiness(
+            &ledger_root,
+            policy.clone(),
+            readiness,
+        )
+        .unwrap();
+        let inventory_owner = ledger.try_acquire_inventory_owner().unwrap().unwrap();
+        template.schema_version = crate::compute_node_snapshot::COMPUTE_NODE_SNAPSHOT_SCHEMA_V2.into();
+        template.runtime_owner_id = ledger.owner_id();
+        template.host_owner_id = Some(inventory_owner.descriptor().host_owner_id.clone());
+        template.host_owner_epoch = Some(inventory_owner.descriptor().host_owner_epoch);
+        template.sample.boot_monotonic_ns = Some(10);
+        ledger
+            .publish_compute_node_snapshot_with_owner(&inventory_owner, &template)
+            .unwrap();
+
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        let store_id = HostResourceLedger::store_id(store.root()).unwrap();
+        let mut request = request(
+            &policy,
+            &store_id,
+            task_id,
+            budget(1000, 1024, 0),
+            &[GPU_A],
+            &[(GPU_A.to_string(), 2048)],
+            &[0],
+        );
+        request.runtime_generation_sha256 = Some(ledger.read_runtime_generation_sha256().unwrap());
+        request.expected_compute_node_owner_id = Some(inventory_owner.descriptor().host_owner_id.clone());
+        request.expected_compute_node_owner_epoch = Some(inventory_owner.descriptor().host_owner_epoch);
+        request.validate(&policy).unwrap();
+        let mut reservation = HostResourceReservation::from_request(&request).unwrap();
+        reservation.state = HostResourceReservationState::Committed;
+
+        let now = chrono::Utc::now();
+        let lease = FmsResourceLease {
+            schema_version: crate::types::FMS_RESOURCE_LEASE_SCHEMA.to_string(),
+            resource_id: request.identity.resource_id.clone(),
+            kind: FmsResourceKind::Gpu,
+            budget: FmsResourceBudget {
+                cpu_millis: request.budget.cpu_millis,
+                memory_bytes: request.budget.memory_bytes,
+                gpu_memory_bytes: 2048,
+                storage_bytes: request.budget.storage_bytes,
+            },
+            run_id: request.identity.run_id.clone(),
+            task_id: request.identity.task_id.clone(),
+            attempt_id: "attempt-1".into(),
+            ownership_epoch: 1,
+            lease_token: request.identity.lease_token.clone(),
+            state: FmsResourceLeaseState::Active,
+            acquired_at: now,
+            heartbeat_at: now,
+            heartbeat_sequence: 0,
+            released_at: None,
+            host_launch_binding: Some(ledger.worker_launch_binding().unwrap()),
+        };
+        store
+            .commit_run_catalog(&crate::FmsRunCatalog {
+                schema_version: crate::FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: lease.run_id.clone(),
+                revision: 1,
+                updated_at: now,
+                tasks: vec![crate::FmsTaskCatalogEntry {
+                    task_id: lease.task_id.clone(),
+                    input_fingerprint: "a".repeat(64),
+                    lifecycle: crate::FmsTaskLifecycle::Preparing,
+                    readiness: crate::FmsTaskReadiness::Ready,
+                    observation: None,
+                    attempt_id: Some(lease.attempt_id.clone()),
+                    ownership_epoch: Some(lease.ownership_epoch),
+                    resolved_input_fingerprint: None,
+                    artifact_ids: Vec::new(),
+                    resource_id: Some(lease.resource_id.clone()),
+                    coordinator_watermark: None,
+                    coordinator_genesis: None,
+                }],
+            })
+            .unwrap();
+        store.commit_resource_lease(&lease).unwrap();
+        {
+            let _writer = ledger.writer.acquire().unwrap();
+            let mut document = ledger.read_document_locked().unwrap();
+            document.reservations.push(reservation);
+            validate_ledger_document(&document, &ledger.root).unwrap();
+            ledger.publish_document_locked(&document).unwrap();
+        }
+
+        V4WorkerLaunchFixture {
+            _directory: directory,
+            store,
+            ledger,
+            inventory_owner: Some(inventory_owner),
+            request,
+            lease,
+        }
+    }
+
     fn ledger_root(base: &Path) -> PathBuf {
         base.join("shared-host-ledger")
     }
@@ -9151,6 +9314,79 @@ mod tests {
         assert!(error
             .to_string()
             .contains("nonreleased v4 reservation has a stale runtime generation"));
+    }
+
+    #[test]
+    fn v4_no_spawn_closure_releases_after_inventory_owner_drop_but_rejects_consumed_gate() {
+        let mut pending = v4_worker_launch_fixture("worker-close-after-owner-drop");
+        pending.inventory_owner.take();
+        assert_eq!(pending.ledger.active_inventory_owner().unwrap(), None);
+        assert!(pending
+            .ledger
+            .authorize_worker_launch(&pending.store, &pending.lease)
+            .is_err());
+
+        pending
+            .ledger
+            .close_worker_launch_before_spawn(&pending.store, &pending.lease)
+            .unwrap();
+        let closed = pending
+            .ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity == pending.request.identity)
+            .unwrap();
+        assert_eq!(closed.state, HostResourceReservationState::Committed);
+        assert_eq!(closed.worker_launch_gate, Some(HostWorkerLaunchGate::Closed));
+
+        let mut cancelled_catalog = pending
+            .store
+            .read_run_catalog(&pending.lease.run_id)
+            .unwrap()
+            .unwrap();
+        cancelled_catalog.revision += 1;
+        cancelled_catalog.updated_at = chrono::Utc::now();
+        cancelled_catalog.tasks[0].lifecycle = crate::FmsTaskLifecycle::Cancelled;
+        pending.store.commit_run_catalog(&cancelled_catalog).unwrap();
+        assert!(pending
+            .ledger
+            .reconcile_closed_cancelled_worker(&pending.store, &pending.request.identity)
+            .unwrap());
+        let released = pending
+            .ledger
+            .release_worker_without_spawn(&pending.store, &pending.request.identity)
+            .unwrap();
+        assert_eq!(released.state, HostResourceReservationState::Released);
+
+        let mut consumed = v4_worker_launch_fixture("worker-consumed-after-owner-drop");
+        let launch_token = consumed
+            .ledger
+            .authorize_worker_launch(&consumed.store, &consumed.lease)
+            .unwrap();
+        consumed.inventory_owner.take();
+        let error = consumed
+            .ledger
+            .close_worker_launch_before_spawn(&consumed.store, &consumed.lease)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no-spawn closure requires an unused durable launch permit"));
+        let retained = consumed
+            .ledger
+            .read()
+            .unwrap()
+            .reservations
+            .into_iter()
+            .find(|reservation| reservation.identity == consumed.request.identity)
+            .unwrap();
+        assert_eq!(
+            retained.worker_launch_gate,
+            Some(HostWorkerLaunchGate::Consumed {
+                token: launch_token,
+            })
+        );
     }
 
     #[test]
