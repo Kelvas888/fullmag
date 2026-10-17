@@ -148,7 +148,11 @@ WATCHPACK_POLLING_DEFAULT_MS = 2000
 WATCHPACK_POLLING_MIN_MS = 250
 WATCHPACK_POLLING_MAX_MS = 10000
 NODE_FS_THREADS_ENV = "UV_THREADPOOL_SIZE"
-NODE_FS_THREADS = 64
+# Keep asynchronous filesystem work bounded for the two-CPU frontend.  The
+# live Windows source mount is backed by Docker Desktop's 9p bridge, where a
+# large libuv pool turns metadata latency into host kernel contention instead
+# of improving cold compilation.
+NODE_FS_THREADS = 8
 PROCESS_IDENTITY_FIELDS = (
     "pid_namespace",
     "process_start_time_ticks",

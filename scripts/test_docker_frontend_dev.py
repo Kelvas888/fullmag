@@ -460,10 +460,10 @@ else:
                     )
             self.assertEqual(environment["WATCHPACK_POLLING"], "2000")
             self.assertEqual(receipt["watchpack_polling_ms"], 2000)
-            self.assertEqual(environment["UV_THREADPOOL_SIZE"], "64")
-            self.assertEqual(receipt["uv_threadpool_size"], 64)
+            self.assertEqual(environment["UV_THREADPOOL_SIZE"], "8")
+            self.assertEqual(receipt["uv_threadpool_size"], 8)
             self.assertIn("watchpack_polling_ms=2000", stdout.getvalue())
-            self.assertIn("uv_threadpool_size=64", stdout.getvalue())
+            self.assertIn("uv_threadpool_size=8", stdout.getvalue())
 
             with patch.dict(
                 os.environ,
@@ -486,7 +486,7 @@ else:
                 clear=False,
             ):
                 environment = self.module._safe_environment(inputs)
-            self.assertEqual(environment["UV_THREADPOOL_SIZE"], "64")
+            self.assertEqual(environment["UV_THREADPOOL_SIZE"], "8")
             self.assertNotIn("NODE_OPTIONS", environment)
 
     def test_watchpack_polling_rejects_values_outside_bounded_integer_contract(self):
