@@ -33,6 +33,8 @@ import { useObjectVisualizationSelector } from "@/kernel/visualization/useObject
 import { VisualizationDebugController } from "@/kernel/visualization/VisualizationDebugController";
 import { VisualizationSurfaceColoringSection, VisualizationVectorsSection } from "@/modules/inspector/panels/ObjectVisualizationTargetSection";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
+import { buildViewport3DFieldRenderModel, type Viewport3DTopologyRenderModel, type Viewport3DFieldVector } from "@/modules/viewport-3d/viewport3dRenderModel";
+import { hasViewport3DQuantityData } from "@/modules/viewport-3d/model/viewport3DQuantityData";
 import { Viewport3DFieldLabel } from "@/modules/viewport-3d/Viewport3DFieldLabel";
 import { useArtifactFieldOverlay } from "@/modules/viewport-3d/hooks/useArtifactFieldOverlay";
 import { artifactRenderedSurfaceRanges } from "@/modules/viewport-3d/model/artifactFieldOverlayModel";
@@ -43,6 +45,20 @@ import { VectorGlyphDerivedBufferCacheProvider } from "@/modules/viewport-3d/lay
 import { Viewport3DCanvas } from "@/modules/viewport-3d/Viewport3DCanvas";
 import { Viewport3DResourceTracker } from "@/modules/viewport-3d/viewport3dDiagnostics";
 import { createViewport3DRenderAdoptionRegistry } from "@/modules/viewport-3d/model/viewport3DRenderAdoptionRegistry";
+
+const hudTopology: Viewport3DTopologyRenderModel = {
+  positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]), nodeCount: 4,
+  fallbackSurfaceIndices: new Uint32Array([0, 1, 2, 0, 3, 1, 0, 2, 3, 1, 3, 2]),
+  fallbackSurfaceNodeIndices: new Uint32Array([0, 1, 2, 3]), fallbackSurfaceEdgeIndices: null,
+  fallbackVolumeEdgeIndices: new Uint32Array(), magneticParts: [], airboxParts: [],
+  meshGenerationId: null, meshRevision: null, meshTopologyHash: null,
+};
+const hudVector: Viewport3DFieldVector = {
+  dtype: "float64", grid: [4, 1, 1], nComp: 3, pointCount: 4, quantityId: "m", valueCount: 12,
+  values: new Float64Array([1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0]),
+};
+const hudVectorsOnlyModel = buildViewport3DFieldRenderModel(hudTopology, hudVector, .1, { scalarColorsVisible: false });
+const hudIntentOnlyModel = buildViewport3DFieldRenderModel(hudTopology, hudVector, .1, { scalarColorsVisible: false, analysisFieldIntentActive: true, analysisOverlayActive: true });
 
 const instance = "66666666-6666-4666-8666-666666666666";
 const owner = { session_id: "artifact-overlay-fixture", session_epoch: "artifact-overlay-fixture@1", request_scope_epoch: `${instance}:1` };
@@ -280,6 +296,13 @@ function View({ fixture, dedicated = false }: { fixture: ReturnType<typeof makeF
     <label>Glyph budget<input aria-label="Fixture glyph budget" type="number" min={0} value={settings.vectorBudget} onChange={event => { void patch({ vectorBudget: Number(event.target.value) }); }} /></label></> : null}
     <p role="status">{result.error ?? (result.model ? `${quantity}: historical inspection · ${result.model.count} samples` : "No historical model")}</p>
     <div data-artifact-field-hud><Viewport3DFieldLabel quantityId="m" label="m" historical={result.historical} model={result.model} error={result.error} /></div>
+    <div data-quantity-data-probes>
+      <div data-probe="vectors-only"><Viewport3DFieldLabel quantityId="m" label="m" historical={false} model={null} error={null} liveDataAvailable={hasViewport3DQuantityData("m", { fieldModel: hudVectorsOnlyModel })} /></div>
+      <div data-probe="intent-only"><Viewport3DFieldLabel quantityId="m" label="m" historical={false} model={null} error={null} liveDataAvailable={hasViewport3DQuantityData("m", { fieldModel: hudIntentOnlyModel })} /></div>
+      <div data-probe="payload"><Viewport3DFieldLabel quantityId={quantity} label={quantity} historical={false} model={null} error={null} liveDataAvailable={hasViewport3DQuantityData(quantity, { fieldVectors: [result.model?.geometry.field] })} /></div>
+      <div data-probe="different-quantity"><Viewport3DFieldLabel quantityId="m" label="m" historical={false} model={null} error={null} liveDataAvailable={hasViewport3DQuantityData("m", { fieldVectors: [result.model?.geometry.field] })} /></div>
+      <div data-probe="absent"><Viewport3DFieldLabel quantityId={quantity} label={quantity} historical={false} model={null} error={null} liveDataAvailable={hasViewport3DQuantityData(quantity, {})} /></div>
+    </div>
     <div data-artifact-field-viewport style={{ height: 480, width: "100%", position: "relative" }}><Viewport3DCanvas camera={{ position: [2.4, 1.7, 1.3], fov: 45, near: .01, far: 100 }} frameloop="demand">
       <VectorGlyphDerivedBufferCacheProvider tracker={tracker}><Probe /><ArtifactFieldLayer model={result.model} tracker={tracker} sessionIdentity={session} adoptionRegistry={adoptionRegistry} colors={{ accent: "white", background: "black", field: "white", mesh: "white", wire: "white" }} /></VectorGlyphDerivedBufferCacheProvider>
     </Viewport3DCanvas><div className="fm-viewport-3d__colorbar-stack">{resolveArtifactFieldColorbars(result.model).map(({ key, legend }) => <Viewport3DColorbar key={key} legend={legend} />)}</div></div>

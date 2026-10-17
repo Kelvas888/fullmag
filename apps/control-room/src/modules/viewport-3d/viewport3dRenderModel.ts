@@ -145,6 +145,8 @@ export interface Viewport3DTopologyRenderModelOptions {
 }
 
 export interface Viewport3DFieldRenderModel {
+  /** Accepted real/phase-projected samples, independent of enabled display layers. */
+  quantityData?: { quantityId: string; pointCount: number; valueCount: number } | null;
   /**
    * Analysis overlay intent is active even while its binary payload is still
    * loading. Mesh layers use this to suppress authored magnetization previews
@@ -1292,6 +1294,11 @@ export function buildViewport3DFieldRenderModel(
   });
 
   return {
+    quantityData: renderFieldVector && (fullFieldVector || magneticFieldNodeIndices) ? {
+      quantityId: renderFieldVector.quantityId,
+      pointCount: renderFieldVector.pointCount,
+      valueCount: renderFieldVector.values.length,
+    } : null,
     analysisOverlayActive: Boolean(options.analysisOverlayActive),
     legacyResponseOverlayActive: Boolean(options.legacyResponseOverlayActive),
     complexFieldVector: options.complexFieldVector ?? null,

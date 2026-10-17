@@ -52,6 +52,15 @@ try {
     assert.equal(await fieldLabel.getAttribute("data-quantity-id"), q);
     assert.equal(await fieldLabel.getAttribute("data-field-state"), "ready");
     assert.equal(await fieldLabel.textContent(), `${q} [${result.state.unit}]`);
+    assert.equal(await page.locator('[data-probe="vectors-only"] span').getAttribute("data-field-state"), "data-ready");
+    assert.equal(await page.locator('[data-probe="intent-only"] span').getAttribute("data-field-state"), "no-data");
+    const payloadLabel = page.locator('[data-probe="payload"] span');
+    assert.equal(await payloadLabel.getAttribute("data-field-state"), "data-ready");
+    assert.equal(await payloadLabel.textContent(), q);
+    const differentQuantity = page.locator('[data-probe="different-quantity"] span');
+    assert.equal(await differentQuantity.getAttribute("data-field-state"), "no-data");
+    assert.equal(await differentQuantity.textContent(), "m · no field data");
+    assert.equal(await page.locator('[data-probe="absent"] span').getAttribute("data-field-state"), "no-data");
     return result;
   };
   const screenshot = async name => { const path = resolve(directory, `${name}.png`); await page.screenshot({ path, fullPage: true }); screenshots.push(path); };

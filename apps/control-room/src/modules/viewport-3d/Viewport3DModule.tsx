@@ -1,4 +1,5 @@
 "use client";
+import { hasViewport3DQuantityData } from "./model/viewport3DQuantityData";
 import { Viewport3DFieldLabel } from "./Viewport3DFieldLabel";
 import { artifactRenderedSurfaceRanges } from "./model/artifactFieldOverlayModel";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/Select";
@@ -2050,6 +2051,15 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   const artifactTarget = sceneProps.primitiveModel?.objects.find(object => object.objectId === sceneProps.selectedObjectId);
   const artifactSettings = artifactTarget ? sceneProps.getObjectSettings(artifactTarget) : sceneProps.fdmSettings;
   const artifactField = useArtifactFieldOverlay(quantityId, sceneProps.selectedObjectId, artifactSettings, Boolean(antennaFieldOverlay), artifactInspectionDefinitions);
+  const liveQuantityDataAvailable = hasViewport3DQuantityData(quantityId, {
+    fieldModel: sceneProps.fieldModel,
+    fieldVectors: [visualizationDebugSource.fullFieldVector, sceneProps.fdmAirboxFieldVector, sceneProps.fdmMultilayerAirboxView?.fieldVector,
+      ...sceneProps.fdmTargetViews.map(view => view.fieldVector), ...sceneProps.fdmNativeLayerViews.map(view => view.fieldVector)],
+    fieldBuffers: [sceneProps.fdmMultilayerAirboxView?.fieldBuffer, ...sceneProps.fdmTargetViews.map(view => view.fieldBuffer)],
+    scalarColors: [sceneProps.fdmSurfaceColors, sceneProps.fdmVectorColors, sceneProps.fdmVectorGlyphColors,
+      sceneProps.fdmMultilayerAirboxView?.surfaceColors, ...sceneProps.fdmTargetViews.map(view => view.surfaceColors),
+      ...sceneProps.fdmNativeLayerViews.map(view => view.surfaceColors)],
+  });
   const antennaFieldSourceLabel = antennaFieldOverlay
     ? sceneProps.primitiveModel?.objects.find(
         (object) => object.objectId === antennaFieldOverlay.intent.sourceObjectId,
@@ -2735,7 +2745,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             </Button>
           </fieldset>
         ) : null}
-        <Viewport3DFieldLabel quantityId={antennaFieldOverlay?.intent.quantity ?? quantityId} label={antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityLabel} historical={!antennaFieldOverlay && artifactField.historical} model={artifactField.model} error={artifactField.error} />
+        <Viewport3DFieldLabel quantityId={antennaFieldOverlay?.intent.quantity ?? quantityId} label={antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityLabel} historical={!antennaFieldOverlay && artifactField.historical} model={artifactField.model} error={artifactField.error} liveDataAvailable={antennaFieldOverlay ? undefined : liveQuantityDataAvailable} />
         <span>{antennaFieldSourceLabel ?? selectedLabel}</span>
         {hysteresisReplayLabel ? <span>{hysteresisReplayLabel}</span> : null}
         <span>{artifactField.model ? `${artifactField.model.count} owned samples · historical inspection · ${artifactField.model.unit}` : antennaFieldOverlay ? `${antennaFieldOverlay.count} samples` : domainSummary}</span>
