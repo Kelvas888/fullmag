@@ -6093,6 +6093,7 @@ mod tests {
                 };
             }
         }
+        template.enforcement.gpu_visibility = EnforcementStatus::Supported;
         let capabilities_sha256 = template.computed_capabilities_sha256().unwrap();
         policy.topology_sha256 = template.inventory_sha256.clone();
         let mut readiness = v4_readiness(&policy, &"1".repeat(64), &"2".repeat(64));
@@ -6107,7 +6108,6 @@ mod tests {
         first.runtime_owner_id = ledger.owner_id();
         first.host_owner_id = Some(owner.descriptor().host_owner_id.clone());
         first.host_owner_epoch = Some(owner.descriptor().host_owner_epoch);
-        first.enforcement.gpu_visibility = EnforcementStatus::Supported;
         first.sample = first.sample.with_boot_monotonic_ns(10);
         first.validate().unwrap();
         assert_eq!(
