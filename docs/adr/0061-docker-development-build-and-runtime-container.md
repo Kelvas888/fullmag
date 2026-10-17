@@ -75,6 +75,14 @@ Opcjonalny plik `.py` pozostaje wejściem startowym tego samego launchera:
 publikuje aktywny model i zachowuje automatyczne Solve albo trwałe oczekiwanie
 `wait_for_solve`. Restart backendu nie jest nowym, niejawnym poleceniem Solve.
 
+Dostępność API/native runtime i wynik opcjonalnej aktywacji skryptu są odrębne.
+Po atestacji i trwałym markerze `started`, konflikt HTTP `409`, błąd serwera lub
+utrata transportu pozostawiają wynik `unknown` i blokują ponowienie POST/Solve.
+Nadzorca zachowuje działające API i native ownera, publikując osobną diagnostykę.
+Launcher nie uznaje takiej aktywacji za udaną kwalifikację. Błędy integralności,
+provenance, polityki i kontraktu odpowiedzi pozostają fatalne. Zmiana nie
+poszerza listy znanych odrzuceń fizyki i nie resetuje ownera ani historii.
+
 ## Admission storage Windows po przebudowie dev
 
 ADR 0059 pozostaje kontraktem filesystemu, ownera i grantów. Dla live dev host

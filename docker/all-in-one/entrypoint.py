@@ -12,6 +12,17 @@ import uuid
 from pathlib import Path
 
 
+STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA = "fullmag.startup-activation-diagnostic.v1"
+
+
+class StartupActivationOutcome(Exception):
+    """A typed activation outcome after the durable started marker exists."""
+
+    def __init__(self, diagnostic):
+        self.diagnostic = diagnostic
+        super().__init__(diagnostic.get("error", "startup activation outcome is unknown"))
+
+
 def preflight():
     kind = subprocess.check_output(["stat", "-f", "-c", "%t", "/state"], text=True).strip()
     # Same supported writer filesystem types as the managed browser route.
@@ -79,9 +90,35 @@ def activate_startup_script():
         docker_startup_script = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = docker_startup_script
         spec.loader.exec_module(docker_startup_script)
-        return docker_startup_script.run_from_environment()
+        try:
+            return docker_startup_script.run_from_environment()
+        except Exception as error:
+            diagnostic = _startup_activation_failure(docker_startup_script, error)
+            if diagnostic is not None:
+                raise StartupActivationOutcome(diagnostic) from error
+            raise
     except (ImportError, OSError, RuntimeError) as error:
         raise RuntimeError("Docker startup-script helper is missing from the image") from error
+
+
+def _startup_activation_failure(helper, error):
+    """Return only the helper's typed, post-marker unknown diagnostic."""
+
+    unknown_error = getattr(helper, "StartupActivationOutcomeUnknown", None)
+    if not isinstance(unknown_error, type) or not isinstance(error, unknown_error):
+        return None
+    diagnostic = getattr(error, "diagnostic", None)
+    if not isinstance(diagnostic, dict):
+        return None
+    if (diagnostic.get("schema") != STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA
+            or diagnostic.get("state") != "unknown"
+            or diagnostic.get("durable_state") != "started"
+            or not isinstance(diagnostic.get("request_id"), str)
+            or not isinstance(diagnostic.get("source_sha256"), str)
+            or not isinstance(diagnostic.get("source_relative"), str)
+            or not isinstance(diagnostic.get("error"), str)):
+        return None
+    return dict(diagnostic)
 
 
 def _retain_liveness_observation(receipt, error):
@@ -158,7 +195,20 @@ def serve():
         receipt["service_owner"] = handle.owner
         service._atomic_json(receipt_path, receipt, "process tree receipt")
         last_full_api_probe = time.monotonic()
-        startup_result = activate_startup_script()
+        try:
+            startup_result = activate_startup_script()
+        except StartupActivationOutcome as outcome:
+            # The helper has already validated the durable started marker. A
+            # server/transport outcome may have committed the run, so keep
+            # the API and native owner supervised and never retry the POST.
+            startup_result = outcome.diagnostic
+            print(
+                "[fullmag-backend] Startup activation outcome is unknown; "
+                "API and runtime remain available: "
+                + startup_result["error"],
+                file=sys.stderr,
+                flush=True,
+            )
         if startup_result is not None:
             receipt["startup_activation"] = startup_result
             if startup_result.get("state") == "rejected":

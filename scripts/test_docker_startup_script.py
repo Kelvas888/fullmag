@@ -404,6 +404,32 @@ class StartupRejectionTests(unittest.TestCase):
                     startup.activate(self.authorization())
                 self.assertEqual(isinstance(caught.exception, startup.StartupScriptRejected), known)
 
+    def test_http_error_body_read_keeps_client_failures_fatal(self):
+        import urllib.error
+
+        class BrokenBody:
+            def read(self, _maximum):
+                raise OSError("response pipe closed")
+
+            def close(self):
+                pass
+
+        for status, transport_unknown in ((401, False), (403, False), (409, True)):
+            error = urllib.error.HTTPError(
+                "http://127.0.0.1:8081", status, "error", {}, BrokenBody()
+            )
+            opener = mock.Mock()
+            opener.open.side_effect = error
+            with self.subTest(status=status), mock.patch.object(
+                startup.urllib.request, "build_opener", return_value=opener,
+            ):
+                with self.assertRaises(startup.StartupScriptError) as caught:
+                    startup.activate(self.authorization())
+                self.assertEqual(
+                    isinstance(caught.exception, startup._StartupActivationTransportUnknown),
+                    transport_unknown,
+                )
+
     def test_rejection_is_durable_bounded_and_fenced_without_activation(self):
         authorization = self.authorization()
         with self.run_environment(), mock.patch.object(
@@ -432,9 +458,11 @@ class StartupRejectionTests(unittest.TestCase):
         with self.run_environment(), mock.patch.object(
             startup, "_load_provenance_with_digest", return_value=(authorization, "a" * 64),
         ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
-            startup, "activate", side_effect=startup.StartupScriptError("HTTP 500"),
+            startup, "activate", side_effect=startup.StartupScriptError(
+                "startup activation response schema mismatch"
+            ),
         ):
-            with self.assertRaisesRegex(startup.StartupScriptError, "HTTP 500"):
+            with self.assertRaisesRegex(startup.StartupScriptError, "response schema mismatch"):
                 startup.run_from_environment()
         self.receipt_path.unlink()
         with self.run_environment(), mock.patch.object(
@@ -582,18 +610,33 @@ class ActivationReceiptTests(unittest.TestCase):
         with self.environment(), mock.patch.object(
             startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
         ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
-            startup, "activate", side_effect=startup.StartupScriptError("HTTP 500"),
+            startup, "activate", side_effect=startup._StartupActivationTransportUnknown("HTTP 500"),
         ) as activate:
-            with self.assertRaisesRegex(startup.StartupScriptError, "HTTP 500"):
+            with self.assertRaises(startup.StartupActivationOutcomeUnknown) as caught:
                 startup.run_from_environment()
+        self.assertEqual(caught.exception.diagnostic["state"], "unknown")
+        self.assertEqual(caught.exception.diagnostic["durable_state"], "started")
+        self.assertEqual(caught.exception.diagnostic["request_id"], self.authorization["request_id"])
         activate.assert_called_once()
         with self.environment(), mock.patch.object(
             startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
         ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
             startup, "activate",
         ) as activate:
-            with self.assertRaisesRegex(startup.StartupScriptError, "prevents a retry"):
+            with self.assertRaises(startup.StartupActivationOutcomeUnknown) as replay:
                 startup.run_from_environment()
+        self.assertIn("prevents a retry", replay.exception.diagnostic["error"])
+        activate.assert_not_called()
+
+    def test_marker_fsync_failure_is_fatal_without_post_or_unknown(self):
+        with self.environment(), mock.patch.object(
+            startup, "_load_provenance_with_digest", return_value=(self.authorization, self.provenance_sha256),
+        ), mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), mock.patch.object(
+            startup.os, "fsync", side_effect=OSError("marker fsync failed"),
+        ), mock.patch.object(startup, "activate") as activate:
+            with self.assertRaisesRegex(startup.StartupScriptError, "cannot publish startup activation receipt"):
+                startup.run_from_environment()
+        self.assertTrue(self.receipt_path.exists())
         activate.assert_not_called()
 
     def test_rejected_terminal_result_replays_without_posting(self):

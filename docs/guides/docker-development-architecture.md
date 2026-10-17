@@ -194,7 +194,15 @@ nowego polecenia Solve.
 
 Typowane odrzucenie modelu przez API (`400`/`422`) zostawia API/runtime gotowe,
 a polecenie startowe kończy błędem i zapisuje wynik `rejected` z provenance.
-Błąd transportu lub niezgodność tożsamości nie są takim odrzuceniem.
+Po poprawnej atestacji i trwałym zapisaniu markera `started`, HTTP `409`,
+błąd serwera lub utrata transportu oznaczają wynik aktywacji `unknown`.
+API i native runtime pozostają nadzorowane; marker blokuje ponowny POST i Solve.
+Stan skryptu oraz jego diagnostyka trafiają osobno do receipt procesu i logu.
+Launcher nadal zgłasza nieudaną kwalifikację skryptu: gotowe API nie dowodzi
+wykonania symulacji. Nie wolno usuwać markera ani powtarzać nieznanej aktywacji.
+
+Niezgodność źródeł, provenance, polityki, tożsamości lub kontraktu odpowiedzi
+pozostaje błędem startupu. Nie jest traktowana jako zwykłe odrzucenie modelu.
 
 `examples/permalloy_layer_cofeb_rings_relax_300nm.py` pozostaje odrzucony kodem
 `material_count_not_one`: obecna ścieżka nie obsługuje tego dwumateriałowego

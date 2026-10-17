@@ -784,6 +784,69 @@ class DockerRuntimeContract(unittest.TestCase):
         self.assertEqual(receipts[-1]["terminal_service_owner"], terminal)
         self.assertEqual(receipts[-1]["error"], "startup activation failed")
 
+    def test_startup_activation_unknown_keeps_runtime_supervised_without_retry(self):
+        import copy
+        from types import SimpleNamespace
+        from unittest import mock
+
+        service_module = self.load_service()
+        entrypoint = self.load_entrypoint()
+        owner = {"owner_token": "known", "state": "ready"}
+        terminal = {"owner_token": "known", "state": "drained"}
+        handle = service_module.RuntimeHandle(
+            service_module.RuntimePaths(), {}, owner, 8081
+        )
+        diagnostic = {
+            "schema": entrypoint.STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA,
+            "state": "unknown",
+            "request_id": "startup-runtime-test",
+            "source_sha256": "a" * 64,
+            "source_relative": "models/scene.py",
+            "durable_state": "started",
+            "error": "startup activation returned HTTP 409: session store writer is busy",
+        }
+        paths = SimpleNamespace(
+            state_root=Path("/state/.fullmag"),
+            store=Path("/state/runs/docker-all/session-store"),
+        )
+        receipts = []
+        api = mock.Mock(pid=123)
+        api.poll.return_value = None
+        api.wait.return_value = 0
+        service = SimpleNamespace(
+            RuntimeHandle=service_module.RuntimeHandle,
+            RuntimeServiceTransient=service_module.RuntimeServiceTransient,
+            prepare_storage=mock.Mock(return_value=paths),
+            initialize_accepted_store=mock.Mock(return_value={"binding": "test"}),
+            recover_idle_failure=mock.Mock(return_value=None),
+            ensure_configuration=mock.Mock(return_value={}),
+            process_environment=mock.Mock(return_value={}),
+            start=mock.Mock(return_value=handle),
+            check=mock.Mock(return_value=None),
+            stop=mock.Mock(return_value=terminal),
+            _atomic_json=lambda _path, value, _label: receipts.append(copy.deepcopy(value)),
+        )
+        event = mock.Mock()
+        event.wait.side_effect = [False, True]
+        unknown = entrypoint.StartupActivationOutcome(diagnostic)
+        activation = mock.Mock(side_effect=unknown)
+        with patch.dict(sys.modules, {"runtime_service": service}), \
+                patch.object(entrypoint.threading, "Event", return_value=event), \
+                patch.object(entrypoint.signal, "signal"), \
+                patch.object(entrypoint.subprocess, "Popen", return_value=api), \
+                patch.object(entrypoint, "activate_startup_script", activation):
+            self.assertEqual(entrypoint.serve(), 0)
+
+        activation.assert_called_once_with()
+        service.check.assert_called_once_with(handle, full_api_probe=False)
+        service.stop.assert_called_once_with(handle, timeout=30)
+        api.terminate.assert_called_once_with()
+        ready = next(receipt for receipt in receipts if receipt.get("state") == "ready")
+        self.assertEqual(ready["startup_activation"], diagnostic)
+        self.assertEqual(receipts[-1]["state"], "drained")
+        self.assertEqual(receipts[-1]["startup_activation"], diagnostic)
+        self.assertEqual(receipts[-1]["terminal_service_owner"], terminal)
+
     def test_service_budget_is_cpu_only_and_fits_container(self):
         service = self.load_service()
         config = service.build_configuration(service.RuntimePaths(), {})

@@ -29,6 +29,7 @@ AUTHORIZATION_SCHEMA = "fullmag.docker-startup-script.v1"
 REQUEST_SCHEMA = "fullmag.startup-script-activation-request.v1"
 RESPONSE_SCHEMA = "fullmag.startup-script-activation.v1"
 ACTIVATION_RECEIPT_SCHEMA = "fullmag.docker-startup-activation-receipt.v1"
+STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA = "fullmag.startup-activation-diagnostic.v1"
 AUTHORIZATION_KIND = "explicit_startup_script"
 # The existing script importer and Python helper both use a 1 MiB source
 # boundary.  Startup must not create a larger, parallel script transport.
@@ -71,6 +72,35 @@ class StartupScriptRejected(StartupScriptError):
         self.code = code
         self.message = message[:2048]
         super().__init__(f"startup script rejected (HTTP {http_status}, {code}): {self.message}")
+
+
+class _StartupActivationTransportUnknown(StartupScriptError):
+    """The activation request may have reached the API without a result."""
+
+
+class _StartupActivationReceiptExists(StartupScriptError):
+    """The exclusive marker open lost a create race with another starter."""
+
+
+class StartupActivationOutcomeUnknown(StartupScriptError):
+    """A POST may have reached the API; its durable marker forbids retry."""
+
+    def __init__(self, started: Mapping[str, Any], message: str):
+        authorization = started.get("authorization")
+        self.started = dict(started)
+        self.diagnostic = {
+            "schema": STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA,
+            "state": "unknown",
+            "request_id": started.get("request_id"),
+            "source_sha256": started.get("source_sha256"),
+            "source_relative": (
+                authorization.get("source_relative")
+                if isinstance(authorization, Mapping) else None
+            ),
+            "durable_state": "started",
+            "error": str(message)[-4096:],
+        }
+        super().__init__(self.diagnostic["error"])
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -315,17 +345,25 @@ def _exclusive_json(
         with _pinned_parent(parent):
             if os.name != "nt" and hasattr(os, "O_DIRECTORY"):
                 parent_fd = os.open(str(parent), os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
-                descriptor = os.open(path.name, flags, 0o660, dir_fd=parent_fd)
+                try:
+                    descriptor = os.open(path.name, flags, 0o660, dir_fd=parent_fd)
+                except FileExistsError as error:
+                    raise _StartupActivationReceiptExists(
+                        f"{label} destination already exists"
+                    ) from error
             else:
-                descriptor = os.open(str(parent / path.name), flags, 0o660)
+                try:
+                    descriptor = os.open(str(parent / path.name), flags, 0o660)
+                except FileExistsError as error:
+                    raise _StartupActivationReceiptExists(
+                        f"{label} destination already exists"
+                    ) from error
             offset = 0
             while offset < len(payload):
                 offset += os.write(descriptor, payload[offset:])
             os.fsync(descriptor)
             if parent_fd is not None:
                 os.fsync(parent_fd)
-    except FileExistsError as error:
-        raise StartupScriptError(f"{label} destination already exists") from error
     except OSError as error:
         raise StartupScriptError(f"cannot publish {label}: {error}") from error
     finally:
@@ -589,13 +627,28 @@ def activate(
         opener = urllib.request.build_opener(_NoRedirect())
         with opener.open(request, timeout=timeout) as result:
             if result.status < 200 or result.status >= 300:
-                raise StartupScriptError(f"startup activation returned HTTP {result.status}")
+                error_type = (
+                    _StartupActivationTransportUnknown
+                    if result.status == 409 or result.status >= 500
+                    else StartupScriptError
+                )
+                raise error_type(f"startup activation returned HTTP {result.status}")
             body = result.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
-        body = error.read(MAX_RESPONSE_BYTES + 1)
+        try:
+            body = error.read(MAX_RESPONSE_BYTES + 1)
+        except (OSError, urllib.error.URLError, TimeoutError) as read_error:
+            error_type = (
+                _StartupActivationTransportUnknown
+                if error.code == 409 or error.code >= 500
+                else StartupScriptError
+            )
+            raise error_type(
+                f"startup activation HTTP {error.code} response read failed: {read_error}"
+            ) from read_error
         # Only a well-formed validation response is a known command rejection.
-        # Authentication, transport, malformed responses and server failures
-        # retain their existing fail-closed startup behavior.
+        # Authentication and malformed/client responses remain fatal; 409 and
+        # server failures become outcome-unknown after the durable marker.
         if error.code in {400, 422} and len(body) <= MAX_RESPONSE_BYTES:
             try:
                 rejection = json.loads(body.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
@@ -610,11 +663,18 @@ def activate(
                     error.code, rejection["code"], rejection["message"],
                 ) from error
         detail = body[:4096].decode("utf-8", errors="replace")
-        raise StartupScriptError(
+        error_type = (
+            _StartupActivationTransportUnknown
+            if error.code == 409 or error.code >= 500
+            else StartupScriptError
+        )
+        raise error_type(
             f"startup activation returned HTTP {error.code}: {detail}"
         ) from error
     except (OSError, urllib.error.URLError, TimeoutError) as error:
-        raise StartupScriptError(f"startup activation outcome is unknown: {error}") from error
+        raise _StartupActivationTransportUnknown(
+            f"startup activation outcome is unknown: {error}"
+        ) from error
     if len(body) > MAX_RESPONSE_BYTES:
         raise StartupScriptError("startup activation response exceeds its size bound")
     try:
@@ -738,8 +798,9 @@ def _replay_or_reject_existing_receipt(
     if not _receipt_identity_matches(receipt, authorization, provenance_sha256):
         raise StartupScriptError("startup activation receipt belongs to a different request")
     if receipt.get("state") == "started":
-        raise StartupScriptError(
-            "startup activation outcome is unknown; durable started receipt prevents a retry"
+        raise StartupActivationOutcomeUnknown(
+            receipt,
+            "startup activation outcome is unknown; durable started receipt prevents a retry",
         )
     result = receipt.get("result")
     if not isinstance(result, dict):
@@ -817,15 +878,23 @@ def run_from_environment() -> dict[str, Any] | None:
             label="startup activation receipt",
             maximum=MAX_ACTIVATION_RECEIPT_BYTES,
         )
-    except StartupScriptError:
-        if not os.path.lexists(receipt_path):
-            raise
+    except _StartupActivationReceiptExists:
         raced = _load_activation_receipt(receipt_path)
         if raced is None:
-            raise
+            raise StartupScriptError(
+                "startup activation receipt disappeared after an exclusive-create race"
+            )
         return _replay_or_reject_existing_receipt(raced, authorization, provenance_sha256)
     try:
         response = activate(authorization, api_base=values["api"])
+    except _StartupActivationTransportUnknown as error:
+        # Only the transport/server-outcome class is non-terminal here.  The
+        # marker must still be byte-for-byte unchanged; malformed provenance,
+        # response contracts, policy, and receipt publication remain fatal.
+        current = _load_activation_receipt(receipt_path)
+        if current != started or current.get("state") != "started":
+            raise error
+        raise StartupActivationOutcomeUnknown(started, str(error)) from error
     except StartupScriptRejected as error:
         result = {
             "schema": RESPONSE_SCHEMA,
@@ -883,6 +952,8 @@ __all__ = [
     "StartupScriptAuthorization",
     "StartupScriptError",
     "StartupScriptRejected",
+    "StartupActivationOutcomeUnknown",
+    "STARTUP_ACTIVATION_DIAGNOSTIC_SCHEMA",
     "STARTUP_ACTIVATION_TIMEOUT_SECONDS",
     "activate",
     "build_activation_request",
