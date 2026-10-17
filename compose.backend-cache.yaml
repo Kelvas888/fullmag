@@ -53,6 +53,7 @@ services:
       FULLMAG_BACKEND_CACHE_UID: "${FULLMAG_BACKEND_CACHE_UID:-65532}"
       FULLMAG_BACKEND_CACHE_GID: "${FULLMAG_BACKEND_CACHE_GID:-65532}"
       FULLMAG_BACKEND_CACHE_LOCK_WAIT_SECONDS: "${FULLMAG_BACKEND_CACHE_LOCK_WAIT_SECONDS:-120}"
+      FULLMAG_BACKEND_PACKAGE: "${FULLMAG_BACKEND_PACKAGE:?Resolved backend package root is required}"
     volumes:
       - type: bind
         source: "${FULLMAG_BACKEND_CACHE_HELPER_PATH:?Bind the versioned helper read-only}"

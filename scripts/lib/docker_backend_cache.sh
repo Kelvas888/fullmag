@@ -19,6 +19,8 @@ CACHE_KEY="${FULLMAG_BACKEND_CACHE_KEY-}"
 STORAGE_ROOT="${FULLMAG_BACKEND_CACHE_STORAGE_ROOT-}"
 BACKING_IMAGE="${FULLMAG_BACKEND_CACHE_BACKING_IMAGE-}"
 MOUNT_ROOT="${FULLMAG_BACKEND_CACHE_MOUNT_ROOT-}"
+PACKAGE_ROOT_VALUE="${FULLMAG_BACKEND_PACKAGE-}"
+PACKAGE_ROOT=""
 LOCK_PATH="${FULLMAG_BACKEND_CACHE_LOCK_PATH-}"
 OWNER_MARKER_VALUE="${FULLMAG_BACKEND_CACHE_OWNER_MARKER-}"
 RUNTIME_IMAGE_ID="${FULLMAG_BACKEND_CACHE_RUNTIME_IMAGE_ID-}"
@@ -74,23 +76,25 @@ validate() {
   esac
   [[ "$TARGET_VALUE" == "$MOUNT_TARGET" ]] || fail "fixed cache contract changed"
   safe_path storage "$STORAGE_ROOT"; [[ "$STORAGE_ROOT" != "/" ]] || fail "storage root cannot be /"
-  local prefix image mount lock marker
+  local prefix image mount package lock marker
   prefix="$(printf %.16s "$CACHE_KEY")"
   image="$STORAGE_ROOT/build-volumes/fullmag-backend-build-cache-v1-$CACHE_KEY.ext4"
   mount="/mnt/fullmag-backend-cache-$PROJECT_ID-$prefix"
+  package="$mount/package"
   lock="$image.lock"; marker="$mount/.fullmag-backend-cache-owner.json"
   [[ -z "$BACKING_IMAGE" || "$BACKING_IMAGE" == "$image" ]] || fail "backing image mismatch"
   [[ -z "$MOUNT_ROOT" || "$MOUNT_ROOT" == "$mount" ]] || fail "mount root mismatch"
+  [[ -z "$PACKAGE_ROOT_VALUE" || "$PACKAGE_ROOT_VALUE" == "$package" ]] || fail "backend package root mismatch"
   [[ -z "$LOCK_PATH" || "$LOCK_PATH" == "$lock" ]] || fail "lock path mismatch"
   [[ -z "$OWNER_MARKER_VALUE" || "$OWNER_MARKER_VALUE" == "$marker" ]] || fail "owner marker mismatch"
-  BACKING_IMAGE="$image"; MOUNT_ROOT="$mount"; LOCK_PATH="$lock"; OWNER_MARKER="$marker"
+  BACKING_IMAGE="$image"; MOUNT_ROOT="$mount"; PACKAGE_ROOT="$package"; LOCK_PATH="$lock"; OWNER_MARKER="$marker"
   GROWTH_RECEIPT="$BACKING_IMAGE$EXPECTED_GROWTH_RECEIPT_SUFFIX"
   [[ -z "$GROWTH_RECEIPT_VALUE" || "$GROWTH_RECEIPT_VALUE" == "$GROWTH_RECEIPT" ]] || fail "growth receipt mismatch"
   EXPECTED_IMAGE_SIZE_BYTES="$SIZE_VALUE"
   EXPECTED_OWNER_SIZE_BYTES="$SIZE_VALUE"
   RUNTIME_LOCK="$MOUNT_ROOT/.fullmag-backend-runtime.lock"
   BACKING_DIR="$(dirname -- "$BACKING_IMAGE")"
-  safe_path image "$BACKING_IMAGE"; safe_path mount "$MOUNT_ROOT"; safe_path lock "$LOCK_PATH"; safe_path marker "$OWNER_MARKER"
+  safe_path image "$BACKING_IMAGE"; safe_path mount "$MOUNT_ROOT"; safe_path package "$PACKAGE_ROOT"; safe_path lock "$LOCK_PATH"; safe_path marker "$OWNER_MARKER"
   host test "$(host id -u)" = 0 || fail "host namespace is not root"
   local c
   for c in cat chmod chown find findmnt flock losetup mount mkfs.ext4 blkid mkdir rm stat test truncate umount; do
@@ -281,7 +285,32 @@ verify_root() {
   [[ "$uid" == "$RUNTIME_UID" && "$gid" == "$RUNTIME_GID" && "$mode" == 1770 ]] || fail "backend cache root ownership/mode invalid"
 }
 
-verify_current() { mount_state; verify_mount; verify_owner; verify_root; }
+verify_package() {
+  local rec uid gid mode
+  host test -d "$PACKAGE_ROOT" && host test ! -L "$PACKAGE_ROOT" || fail "backend package root is not a regular directory"
+  rec="$(host stat -Lc '%u %g %a' "$PACKAGE_ROOT")"; read -r uid gid mode < <(printf '%s\n' "$rec")
+  [[ "$uid" == "$RUNTIME_UID" && "$gid" == "$RUNTIME_GID" && "$mode" == 770 ]] || fail "backend package root ownership/mode invalid"
+}
+
+ensure_package() {
+  if host test -e "$PACKAGE_ROOT" || host test -L "$PACKAGE_ROOT"; then
+    host test -d "$PACKAGE_ROOT" && host test ! -L "$PACKAGE_ROOT" || fail "backend package root is not a directory"
+    local rec uid gid mode
+    rec="$(host stat -Lc '%u %g %a' "$PACKAGE_ROOT")"; read -r uid gid mode < <(printf '%s\n' "$rec")
+    [[ "$uid" == "$RUNTIME_UID" && "$gid" == "$RUNTIME_GID" ]] || fail "backend package root ownership changed"
+    [[ "$mode" == 770 ]] || host chmod 0770 "$PACKAGE_ROOT"
+  else
+    # The owner marker and runtime lock have already admitted this mounted
+    # filesystem. Create only this fixed child; never adopt an arbitrary host
+    # directory as a writable package root.
+    host mkdir "$PACKAGE_ROOT"
+    host chown "$RUNTIME_UID:$RUNTIME_GID" "$PACKAGE_ROOT"
+    host chmod 0770 "$PACKAGE_ROOT"
+  fi
+  verify_package
+}
+
+verify_current() { mount_state; verify_mount; verify_owner; verify_root; verify_package; }
 
 write_owner_marker() {
   python3 -c 'import json,os,sys,uuid
@@ -329,8 +358,9 @@ finally: os.close(dirfd)
 
 admit_mounted_cache() {
   if host test -e "$OWNER_MARKER" || host test -L "$OWNER_MARKER"; then
-    verify_current
+    mount_state; verify_mount; verify_owner; verify_root
     lock_runtime
+    ensure_package
   else
     # Only a filesystem created by this invocation may receive its first
     # owner marker. An existing unmarked image is unidentified and must fail
@@ -339,6 +369,7 @@ admit_mounted_cache() {
     host chown "$RUNTIME_UID:$RUNTIME_GID" "$MOUNT_ROOT"; host chmod 1770 "$MOUNT_ROOT"
     lock_runtime
     write_owner_marker
+    ensure_package
     verify_current
   fi
 }
@@ -460,6 +491,7 @@ grow_cache() {
     [[ "$token" == "$journal_token" ]] || fail "growth owner token does not match its journal"
   fi
   lock_runtime
+  ensure_package
   uuid_before="$FILESYSTEM_UUID"
 
   if [[ "$journal_state" == none ]]; then
@@ -491,15 +523,15 @@ grow_cache() {
 emit() {
   local state="$1" created="$2"
   python3 -c 'import json,sys
-s,c,a,l,u,p,pr,k,i,m,t,z,r,tc=sys.argv[1:]
-print(json.dumps({"schema":"fullmag.backend-build-cache.v1","profile":p,"project_id":pr,"cache_key":k,"backing_image":i,"mount_root":m,"mount_target":t,"filesystem":"ext4","filesystem_label":"fm-be-cache-v1","filesystem_uuid":u or None,"size_bytes":int(z),"loop_device":l or None,"mount_active":a=="1","state":s,"created_image":c=="1","runtime_image_id":r,"toolchain_image_id":tc,"qualification":"backend-cache-admission-only"},sort_keys=True))' "$state" "$created" "$MOUNT_ACTIVE" "$LOOP_DEVICE" "$FILESYSTEM_UUID" "$PROFILE" "$PROJECT_ID" "$CACHE_KEY" "$BACKING_IMAGE" "$MOUNT_ROOT" "$MOUNT_TARGET" "$SIZE_VALUE" "$RUNTIME_IMAGE_ID" "$TOOLCHAIN_IMAGE_ID"
+s,c,a,l,u,p,pr,k,i,m,package,t,z,r,tc=sys.argv[1:]
+print(json.dumps({"schema":"fullmag.backend-build-cache.v1","profile":p,"project_id":pr,"cache_key":k,"backing_image":i,"mount_root":m,"package_root":package,"mount_target":t,"filesystem":"ext4","filesystem_label":"fm-be-cache-v1","filesystem_uuid":u or None,"size_bytes":int(z),"loop_device":l or None,"mount_active":a=="1","state":s,"created_image":c=="1","runtime_image_id":r,"toolchain_image_id":tc,"qualification":"backend-cache-admission-only"},sort_keys=True))' "$state" "$created" "$MOUNT_ACTIVE" "$LOOP_DEVICE" "$FILESYSTEM_UUID" "$PROFILE" "$PROJECT_ID" "$CACHE_KEY" "$BACKING_IMAGE" "$MOUNT_ROOT" "$PACKAGE_ROOT" "$MOUNT_TARGET" "$SIZE_VALUE" "$RUNTIME_IMAGE_ID" "$TOOLCHAIN_IMAGE_ID"
 }
 
 emit_growth() {
   local state="$1" old_size="$2" new_size="$3" token="$4"
   python3 -c 'import json,sys
-s,o,n,l,u,p,pr,k,i,m,t,r,tc,token,j=sys.argv[1:]
-print(json.dumps({"schema":"fullmag.backend-build-cache.v1","profile":p,"project_id":pr,"cache_key":k,"backing_image":i,"mount_root":m,"mount_target":t,"filesystem":"ext4","filesystem_label":"fm-be-cache-v1","filesystem_uuid":u,"previous_size_bytes":int(o),"size_bytes":int(n),"loop_device":l,"mount_active":True,"state":s,"runtime_image_id":r,"toolchain_image_id":tc,"owner_token":token,"growth_receipt":j,"qualification":"backend-cache-growth-admission-only"},sort_keys=True))' "$state" "$old_size" "$new_size" "$LOOP_DEVICE" "$FILESYSTEM_UUID" "$PROFILE" "$PROJECT_ID" "$CACHE_KEY" "$BACKING_IMAGE" "$MOUNT_ROOT" "$MOUNT_TARGET" "$RUNTIME_IMAGE_ID" "$TOOLCHAIN_IMAGE_ID" "$token" "$GROWTH_RECEIPT"
+s,o,n,l,u,p,pr,k,i,m,package,t,r,tc,token,j=sys.argv[1:]
+print(json.dumps({"schema":"fullmag.backend-build-cache.v1","profile":p,"project_id":pr,"cache_key":k,"backing_image":i,"mount_root":m,"package_root":package,"mount_target":t,"filesystem":"ext4","filesystem_label":"fm-be-cache-v1","filesystem_uuid":u,"previous_size_bytes":int(o),"size_bytes":int(n),"loop_device":l,"mount_active":True,"state":s,"runtime_image_id":r,"toolchain_image_id":tc,"owner_token":token,"growth_receipt":j,"qualification":"backend-cache-growth-admission-only"},sort_keys=True))' "$state" "$old_size" "$new_size" "$LOOP_DEVICE" "$FILESYSTEM_UUID" "$PROFILE" "$PROJECT_ID" "$CACHE_KEY" "$BACKING_IMAGE" "$MOUNT_ROOT" "$PACKAGE_ROOT" "$MOUNT_TARGET" "$RUNTIME_IMAGE_ID" "$TOOLCHAIN_IMAGE_ID" "$token" "$GROWTH_RECEIPT"
 }
 
 cleanup() {

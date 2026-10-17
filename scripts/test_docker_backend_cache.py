@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -150,7 +151,8 @@ class BackendCacheAdmissionTests(unittest.TestCase):
                             "volumes": [{"type": "bind", "source": env[cache.ENV_MOUNT_ROOT], "target": cache.GUEST_TARGET, "read_only": False}],
                         },
                         cache.MAINTENANCE_SERVICE: {
-                            "image": env[cache.ENV_HELPER_IMAGE], "privileged": True, "network_mode": "none"
+                            "image": env[cache.ENV_HELPER_IMAGE], "privileged": True, "network_mode": "none",
+                            "environment": {cache.ENV_BACKEND_PACKAGE: env[cache.ENV_BACKEND_PACKAGE]},
                         },
                     },
                 })
@@ -160,6 +162,7 @@ class BackendCacheAdmissionTests(unittest.TestCase):
                     "schema": cache.SCHEMA, "profile": cache.PROFILE, "state": "ready",
                     "project_id": env[cache.ENV_PROJECT_ID], "cache_key": env[cache.ENV_KEY],
                     "backing_image": env[cache.ENV_BACKING_IMAGE], "mount_root": env[cache.ENV_MOUNT_ROOT],
+                    "package_root": env[cache.ENV_BACKEND_PACKAGE],
                     "mount_target": env[cache.ENV_MOUNT_TARGET], "filesystem": "ext4",
                     "filesystem_uuid": UUID, "filesystem_label": cache.IMAGE_LABEL,
                     "loop_device": "/dev/loop7", "mount_active": True,
@@ -181,6 +184,7 @@ class BackendCacheAdmissionTests(unittest.TestCase):
                     "schema": cache.SCHEMA, "profile": cache.PROFILE, "state": "grown",
                     "project_id": env[cache.ENV_PROJECT_ID], "cache_key": env[cache.ENV_KEY],
                     "backing_image": env[cache.ENV_BACKING_IMAGE], "mount_root": env[cache.ENV_MOUNT_ROOT],
+                    "package_root": env[cache.ENV_BACKEND_PACKAGE],
                     "mount_target": env[cache.ENV_MOUNT_TARGET], "filesystem": "ext4",
                     "filesystem_uuid": UUID, "filesystem_label": cache.IMAGE_LABEL,
                     "loop_device": "/dev/loop7", "mount_active": True,
@@ -204,6 +208,10 @@ class BackendCacheAdmissionTests(unittest.TestCase):
             )
             self.assertEqual(profile["size_bytes"], cache.CACHE_SIZE_BYTES)
             self.assertEqual(profile["environment"][cache.ENV_SIZE_BYTES], str(cache.CACHE_SIZE_BYTES))
+            self.assertEqual(profile["package_root"], "/mnt/fullmag-backend-cache-fullmag-test-" + profile["cache_key"][:16] + "/package")
+            self.assertEqual(profile["environment"][cache.ENV_BACKEND_PACKAGE], profile["package_root"])
+            self.assertTrue(profile["package_root"].startswith("/mnt/"))
+            self.assertNotRegex(profile["package_root"], r"^[A-Za-z]:")
 
     def test_prepare_preserves_existing_12_gib_capacity(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -276,6 +284,7 @@ class BackendCacheAdmissionTests(unittest.TestCase):
             "cache_key": "c" * 64,
             "backing_image": "/storage/build-volumes/cache.ext4",
             "mount_root": "/mnt/fullmag-backend-cache-fullmag-test-cccccccccccccccc",
+            "package_root": "/mnt/fullmag-backend-cache-fullmag-test-cccccccccccccccc/package",
             "mount_target": cache.MOUNT_TARGET,
         }
         receipt = {
@@ -286,6 +295,7 @@ class BackendCacheAdmissionTests(unittest.TestCase):
             "cache_key": values["cache_key"],
             "backing_image": values["backing_image"],
             "mount_root": values["mount_root"],
+            "package_root": values["mount_root"] + "/package",
             "mount_target": values["mount_target"],
             "filesystem": "ext4",
             "filesystem_label": cache.IMAGE_LABEL,
@@ -310,6 +320,7 @@ class BackendCacheAdmissionTests(unittest.TestCase):
             "cache_key": "c" * 64,
             "backing_image": "/storage/build-volumes/cache.ext4",
             "mount_root": "/mnt/fullmag-backend-cache-fullmag-test-cccccccccccccccc",
+            "package_root": "/mnt/fullmag-backend-cache-fullmag-test-cccccccccccccccc/package",
             "mount_target": cache.MOUNT_TARGET,
         }
         receipt = {
@@ -320,6 +331,7 @@ class BackendCacheAdmissionTests(unittest.TestCase):
             "cache_key": values["cache_key"],
             "backing_image": values["backing_image"],
             "mount_root": values["mount_root"],
+            "package_root": values["mount_root"] + "/package",
             "mount_target": values["mount_target"],
             "filesystem": "ext4",
             "filesystem_label": cache.IMAGE_LABEL,
@@ -357,9 +369,103 @@ class BackendCacheAdmissionTests(unittest.TestCase):
 
 
 class BackendCacheSourceChecks(unittest.TestCase):
+    def test_existing_owned_cache_adds_only_package_child_and_rejects_foreign_child(self):
+        helper = SCRIPTS / "lib" / "docker_backend_cache.sh"
+        source = helper.read_text(encoding="utf-8")
+        prefix, separator, _ = source.partition("\ntrap cleanup EXIT\n")
+        self.assertTrue(separator, "helper must expose its functions before main/trap")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mounted = root / "mounted"
+            mounted.mkdir()
+
+            create_scenario = prefix + r'''
+set -Eeuo pipefail
+ROOT="${HARNESS_ROOT:?}"
+MOUNT_ROOT="$ROOT/mounted"
+PACKAGE_ROOT="$MOUNT_ROOT/package"
+RUNTIME_UID=65532
+RUNTIME_GID=65532
+host() {
+  case "$1" in
+    test) shift; command test "$@" ;;
+    mkdir) shift; command mkdir "$@" ;;
+    chown|chmod) return 0 ;;
+    stat) printf '%s\n' '65532 65532 770' ;;
+    *) printf 'unexpected host operation: %s\n' "$1" >&2; return 1 ;;
+  esac
+}
+ensure_package
+test -d "$PACKAGE_ROOT"
+printf '%s\n' created
+'''
+            create_path = root / "create-package.sh"
+            create_path.write_text(create_scenario, encoding="utf-8")
+            create_path.chmod(0o700)
+            environment = dict(os.environ)
+            environment["HARNESS_ROOT"] = str(root)
+            created = subprocess.run(
+                ["bash", str(create_path)], env=environment, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            self.assertEqual(created.stdout.strip(), "created")
+            self.assertTrue((mounted / "package").is_dir())
+
+            foreign_scenario = prefix + r'''
+set -Eeuo pipefail
+ROOT="${HARNESS_ROOT:?}"
+MOUNT_ROOT="$ROOT/mounted"
+PACKAGE_ROOT="$MOUNT_ROOT/package"
+RUNTIME_UID=65532
+RUNTIME_GID=65532
+host() {
+  case "$1" in
+    test) shift; command test "$@" ;;
+    stat) printf '%s\n' '0 0 755' ;;
+    *) printf 'unexpected host operation: %s\n' "$1" >&2; return 1 ;;
+  esac
+}
+ensure_package
+'''
+            foreign_path = root / "foreign-package.sh"
+            foreign_path.write_text(foreign_scenario, encoding="utf-8")
+            foreign_path.chmod(0o700)
+            rejected = subprocess.run(
+                ["bash", str(foreign_path)], env=environment, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(rejected.returncode, 2, rejected.stdout)
+            self.assertIn("ownership changed", rejected.stderr)
+
+            unowned_scenario = prefix + r'''
+set -Eeuo pipefail
+ROOT="${HARNESS_ROOT:?}"
+MOUNT_ROOT="$ROOT/unowned"
+OWNER_MARKER="$MOUNT_ROOT/.fullmag-backend-cache-owner.json"
+CREATED_IMAGE=0
+host() {
+  case "$1" in
+    test) shift; command test "$@" ;;
+    *) printf 'unexpected host operation: %s\n' "$1" >&2; return 1 ;;
+  esac
+}
+mkdir -p "$MOUNT_ROOT"
+admit_mounted_cache
+'''
+            unowned_path = root / "unowned-cache.sh"
+            unowned_path.write_text(unowned_scenario, encoding="utf-8")
+            unowned_path.chmod(0o700)
+            unowned = subprocess.run(
+                ["bash", str(unowned_path)], env=environment, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(unowned.returncode, 2, unowned.stdout)
+            self.assertIn("no owner marker", unowned.stderr)
+            self.assertFalse((root / "unowned" / "package").exists())
+
     def test_shell_growth_path_is_parseable_and_does_not_clear_or_format(self):
         helper = SCRIPTS / "lib" / "docker_backend_cache.sh"
         source = helper.read_text(encoding="utf-8")
+        overlay = SCRIPTS.parent / "compose.backend-cache.yaml"
+        overlay_source = overlay.read_text(encoding="utf-8")
         self.assertEqual(subprocess.run(["bash", "-n", str(helper)], check=False).returncode, 0)
         self.assertIn("losetup --set-capacity", source)
         self.assertIn("resize2fs", source)
@@ -374,6 +480,11 @@ class BackendCacheSourceChecks(unittest.TestCase):
         self.assertNotIn("<<<", source)
         self.assertNotIn("growth requires the cache mount to be inactive", source)
         self.assertIn("existing backend cache has no owner marker", source)
+        self.assertIn("backend package root ownership changed", source)
+        self.assertIn('host mkdir "$PACKAGE_ROOT"', source)
+        self.assertIn('"package_root":package', source)
+        self.assertIn("FULLMAG_BACKEND_PACKAGE", overlay_source)
+        self.assertIn("Resolved backend package root is required", overlay_source)
         self.assertNotIn("rm -rf", source)
         self.assertNotIn("resize2fs -f", source)
 

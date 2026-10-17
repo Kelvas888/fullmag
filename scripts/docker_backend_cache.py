@@ -68,6 +68,7 @@ ENV_SOURCE_ROOT = "FULLMAG_BACKEND_CACHE_SOURCE_ROOT"
 ENV_WORKTREE_ID = "FULLMAG_BACKEND_CACHE_WORKTREE_ID"
 ENV_TOOLCHAIN_IMAGE = "FULLMAG_BACKEND_CACHE_TOOLCHAIN_IMAGE_ID"
 ENV_LOCK_WAIT = "FULLMAG_BACKEND_CACHE_LOCK_WAIT_SECONDS"
+ENV_BACKEND_PACKAGE = "FULLMAG_BACKEND_PACKAGE"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -230,6 +231,10 @@ def _cache_paths(layout: Mapping[str, Any], key: str) -> dict[str, Any]:
         "backing_image": backing,
         "lock_path": lock,
         "mount_root": mount,
+        # This is a Docker-daemon path inside the managed ext4 mount.  Keep it
+        # as a PurePosixPath-derived string: resolving it through Windows would
+        # silently turn the bind source into a host path on the wrong volume.
+        "package_root": str(mount_root / "package"),
         "mount_target": MOUNT_TARGET,
         "owner_marker": f"{mount}/.fullmag-backend-cache-owner.json",
     }
@@ -541,6 +546,10 @@ def _validate_overlay_config(document: Mapping[str, Any], environment: Mapping[s
         raise BackendCacheError("backend cache maintenance image mismatch")
     if maintenance.get("privileged") is not True or maintenance.get("network_mode") != "none":
         raise BackendCacheError("backend cache maintenance isolation changed")
+    maintenance_environment = maintenance.get("environment")
+    if (not isinstance(maintenance_environment, Mapping)
+            or str(maintenance_environment.get(ENV_BACKEND_PACKAGE)) != environment[ENV_BACKEND_PACKAGE]):
+        raise BackendCacheError("backend cache maintenance has no attested package root")
 
 
 def _render_maintenance_config(destination: Path, document: Mapping[str, Any]) -> None:
@@ -566,6 +575,7 @@ def _validate_host_receipt(
         "schema", "profile", "state", "project_id", "cache_key", "backing_image",
         "mount_root", "mount_target", "filesystem", "filesystem_label", "filesystem_uuid",
         "loop_device", "mount_active", "size_bytes", "runtime_image_id", "toolchain_image_id",
+        "package_root",
     }
     if not required.issubset(receipt):
         raise BackendCacheError("backend cache maintenance receipt is incomplete")
@@ -577,6 +587,8 @@ def _validate_host_receipt(
         raise BackendCacheError("backend cache backing image mismatch")
     if receipt["mount_root"] != values["mount_root"] or receipt["mount_target"] != values["mount_target"]:
         raise BackendCacheError("backend cache mount identity mismatch")
+    if receipt["package_root"] != values["package_root"]:
+        raise BackendCacheError("backend cache package root mismatch")
     if (receipt["filesystem"] != "ext4" or receipt["filesystem_label"] != IMAGE_LABEL
             or not isinstance(receipt["filesystem_uuid"], str)
             or _UUID.fullmatch(receipt["filesystem_uuid"]) is None):
@@ -604,6 +616,7 @@ def _validate_growth_receipt(
         "mount_root", "mount_target", "filesystem", "filesystem_label", "filesystem_uuid",
         "loop_device", "mount_active", "previous_size_bytes", "size_bytes",
         "runtime_image_id", "toolchain_image_id", "owner_token", "growth_receipt",
+        "package_root",
     }
     if not required.issubset(receipt):
         raise BackendCacheError("backend cache growth receipt is incomplete")
@@ -615,6 +628,8 @@ def _validate_growth_receipt(
         raise BackendCacheError("backend cache growth backing image mismatch")
     if receipt["mount_root"] != values["mount_root"] or receipt["mount_target"] != values["mount_target"]:
         raise BackendCacheError("backend cache growth mount identity mismatch")
+    if receipt["package_root"] != values["package_root"]:
+        raise BackendCacheError("backend cache growth package root mismatch")
     if (receipt["filesystem"] != "ext4" or receipt["filesystem_label"] != IMAGE_LABEL
             or not isinstance(receipt["filesystem_uuid"], str)
             or _UUID.fullmatch(receipt["filesystem_uuid"]) is None
@@ -691,6 +706,7 @@ def prepare(
         ENV_BACKING_IMAGE: _daemon_path(paths["backing_image"], "backing_image"),
         ENV_LOCK_PATH: _daemon_path(paths["lock_path"], "lock_path"),
         ENV_MOUNT_ROOT: paths["mount_root"],
+        ENV_BACKEND_PACKAGE: paths["package_root"],
         ENV_OWNER_MARKER: paths["owner_marker"],
         ENV_SIZE_BYTES: str(capacity),
         ENV_MOUNT_TARGET: paths["mount_target"],
@@ -733,6 +749,7 @@ def prepare(
             "project_id": paths["project_id"], "runtime_image": runtime,
             "toolchain_image": toolchain, "host_receipt": dict(receipt),
             "size_bytes": capacity,
+            "package_root": paths["package_root"],
             "helper_sha256": helper_sha256, "compose_overlay_sha256": overlay_sha256,
             "environment": environment,
         },
@@ -745,6 +762,7 @@ def prepare(
         "size_bytes": capacity,
         "filesystem_uuid": environment[ENV_FILESYSTEM_UUID],
         "mount_root": paths["mount_root"], "guest_target": GUEST_TARGET,
+        "package_root": paths["package_root"],
         "environment": environment, "compose_overlay": str(overlay_copy),
         "maintenance_compose": str(maintenance_config),
         "helper_sha256": helper_sha256, "compose_overlay_sha256": overlay_sha256,
@@ -879,6 +897,7 @@ def grow(
         ENV_BACKING_IMAGE: _daemon_path(paths["backing_image"], "backing_image"),
         ENV_LOCK_PATH: _daemon_path(paths["lock_path"], "lock_path"),
         ENV_MOUNT_ROOT: paths["mount_root"],
+        ENV_BACKEND_PACKAGE: paths["package_root"],
         ENV_OWNER_MARKER: paths["owner_marker"],
         ENV_SIZE_BYTES: str(target_size),
         ENV_MOUNT_TARGET: paths["mount_target"],
@@ -936,6 +955,7 @@ def grow(
             "toolchain_image": toolchain, "host_receipt": dict(receipt),
             "previous_size_bytes": previous_size,
             "size_bytes": target_size,
+            "package_root": paths["package_root"],
             "helper_sha256": helper_sha256, "compose_overlay_sha256": overlay_sha256,
             "environment": environment,
         },
@@ -949,6 +969,7 @@ def grow(
         "size_bytes": target_size,
         "filesystem_uuid": environment[ENV_FILESYSTEM_UUID],
         "mount_root": paths["mount_root"], "guest_target": GUEST_TARGET,
+        "package_root": paths["package_root"],
         "environment": environment, "compose_overlay": str(overlay_copy),
         "maintenance_compose": str(maintenance_config),
         "helper_sha256": helper_sha256, "compose_overlay_sha256": overlay_sha256,
