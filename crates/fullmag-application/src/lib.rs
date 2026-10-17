@@ -15,6 +15,7 @@ mod execution;
 mod execution_profile;
 mod execution_profile_binding;
 mod file_repository;
+mod legacy_live_execution;
 mod preparation;
 mod closed_loop_preparation;
 mod script_pipeline_acceptance;
@@ -69,6 +70,11 @@ pub use execution_profile::{
     validate_execution_materialization,
 };
 pub use execution_profile_binding::bind_materialized_execution;
+pub use legacy_live_execution::{
+    legacy_live_execution_profile, migrate_legacy_live_execution,
+    LegacyLiveExecutionMigration, LEGACY_LIVE_EXECUTION_PROFILE_ID,
+    LEGACY_LIVE_EXECUTION_PROFILE_VERSION,
+};
 pub use file_repository::{FileProjectRepository, FileRepositoryError};
 pub use closed_loop_preparation::{AcceptedPreparationProof, AcceptedPreparationReceipt, ClosedLoopPreparationPlan, ClosedLoopPreparationReceipt, CLOSED_LOOP_PREPARATION_SCHEMA, CLOSED_LOOP_PREPARATION_BINDING_SCHEMA};
 pub use script_pipeline_acceptance::{compile_accepted_closed_loop_pipeline, validate_accepted_script_pipeline_source, validate_script_source_assets, AcceptedScriptPipeline, SCRIPT_PIPELINE_SOURCE_ASSET_ID, SCRIPT_PIPELINE_SOURCE_SCHEMA};

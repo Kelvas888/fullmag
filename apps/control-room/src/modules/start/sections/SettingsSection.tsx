@@ -7,6 +7,7 @@ import { SegmentedControl } from "@/shared/ui/SegmentedControl";
 
 import { startSettings, type RecentView } from "../model/startSettings";
 import type { RecentIndexController } from "../model/useRecentIndex";
+import type { ExecutionAvailability } from "../model/executionAvailability";
 import type { WorkspaceItemsController } from "../model/useWorkspaceItems";
 import type { ComputeNodeInventorySummary, ComputeProbeController, ComputeProbeState, ScannedLocation } from "../model/types";
 
@@ -39,6 +40,7 @@ interface SettingsSectionProps {
   readonly stale?: boolean;
   readonly computeError?: string | null;
   readonly onRefreshCompute?: () => void;
+  readonly executionAvailability?: ExecutionAvailability;
 }
 
 export function SettingsSection({
@@ -52,6 +54,7 @@ export function SettingsSection({
   stale = false,
   computeError = null,
   onRefreshCompute,
+  executionAvailability,
 }: SettingsSectionProps) {
   const [computeView, setComputeView] = useState<ComputeSettingsView>("overview");
   const settings = useSyncExternalStore(
@@ -98,7 +101,7 @@ export function SettingsSection({
           />
         </div>
         <div hidden={computeView !== "profiles"}>
-          <ExecutionProfilesSettings />
+          <ExecutionProfilesSettings executionAvailability={executionAvailability} />
         </div>
       </section>
 
