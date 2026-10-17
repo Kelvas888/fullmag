@@ -105,8 +105,10 @@ describe("SpinInterfaceInspectorPanel", () => {
 
   it("renders a known mixing interface as model-specific typed SI fields", () => {
     const html = renderToStaticMarkup(<KernelContext.Provider value={kernel}><SpinInterfaceInspectorPanel selection={selection(0, "nf")} /></KernelContext.Provider>);
-    expect(html).toContain("Normal-metal object");
-    expect(html).toContain("Ferromagnet region");
+    expect(html).toContain("Normal-metal scope");
+    expect(html).toContain('value="[&quot;stack&quot;,&quot;n&quot;]" selected=""');
+    expect(html).toContain('value="[&quot;stack&quot;,&quot;f&quot;]" selected=""');
+    expect(html).toContain("Ferromagnet scope");
     expect(html).toContain("S/m²");
     expect(html).toContain("magnetoelectronic.fullmag.v2");
     expect(html).toContain("0, 0, 1");
@@ -129,7 +131,9 @@ describe("SpinInterfaceInspectorPanel", () => {
     };
     const html = renderToStaticMarkup(<KernelContext.Provider value={kernel}><SpinInterfaceInspectorPanel selection={graphSelection} /></KernelContext.Provider>);
     expect(html).toContain("magnetoelectronic.fullmag.v2");
-    expect(html).toContain("Normal-metal object");
+    expect(html).toContain("Normal-metal scope");
+    expect(html).toContain('value="[&quot;stack&quot;,&quot;n&quot;]" selected=""');
+    expect(html).toContain('value="[&quot;stack&quot;,&quot;f&quot;]" selected=""');
   });
 
   it("renders an unknown interface losslessly without mutation controls", () => {
